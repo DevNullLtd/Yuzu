@@ -1,0 +1,38 @@
+{
+  "_provenance": "SYNTHETIC -- Alex sign-off 2026-09-21 (run-context.md Phase-0 item 2); shape mirrors tests/unit/fixtures/wave10/browser_inventory/edge/Local State's real capture (profile.info_cache + profile.last_used + browser.* version scalars), values fabricated. Not a real Chrome install.",
+  "profile": {
+    "info_cache": {
+      "Default": {
+        "active_time": 1758000000.0,
+        "avatar_icon": "chrome://theme/IDR_PROFILE_AVATAR_GENERIC",
+        "background_apps": false,
+        "gaia_id": "999999999999999999999",
+        "gaia_name": "Not A Real Person",
+        "is_ephemeral": false,
+        "is_using_default_avatar": true,
+        "is_using_default_name": true,
+        "name": "Person 1",
+        "user_name": "not-a-real-person@example.invalid"
+      },
+      "Profile 2": {
+        "active_time": 1750000000.0,
+        "avatar_icon": "chrome://theme/IDR_PROFILE_AVATAR_2",
+        "background_apps": false,
+        "gaia_id": "",
+        "gaia_name": "",
+        "is_ephemeral": true,
+        "is_using_default_avatar": false,
+        "is_using_default_name": false,
+        "name": "Work (synthetic)",
+        "user_name": ""
+      }
+    },
+    "last_active_profiles": [],
+    "last_used": "Default",
+    "profiles_order": ["Default", "Profile 2"]
+  },
+  "browser": {
+    "browser_build_version": "128.0.6613.120",
+    "browser_version_of_last_seen_whats_new": "128.0.6613.120"
+  }
+}

@@ -44,17 +44,19 @@ Per CLAUDE.md standing rule 2: a finding BLOCKS when its **derived** band is CRI
 
 ### First: confirm you are running the current pipeline
 
-This skill and **all three** routed-concern tables (`.claude/routed-concerns.md`,
-`.claude/routed-concerns-access-control.md` and `.claude/routed-concerns-security-posture.md`)
-are read **from your working tree**, so a branch
-that predates a change to either silently runs the old pipeline. At the time #2604
-merged, 81 of 81 local branches predated it.
+This skill and **all four** routed-concern tables (`.claude/routed-concerns.md`,
+`.claude/routed-concerns-access-control.md`, `.claude/routed-concerns-security-posture.md` and
+`.claude/routed-concerns-software-estate.md`) are read **from your working tree**, so a branch
+that predates a change to any of them silently runs the old pipeline. At the time #2604 merged,
+81 of 81 local branches predated it.
 
 ```bash
 git fetch origin dev -q || echo "WARNING: fetch failed - origin/dev may itself be stale"
 for f in .claude/skills/governance/SKILL.md .claude/routed-concerns.md \
          .claude/routed-concerns-access-control.md \
-         .claude/routed-concerns-security-posture.md CLAUDE.md; do
+         .claude/routed-concerns-security-posture.md \
+         .claude/routed-concerns-software-estate.md \
+         CLAUDE.md; do
   git diff --quiet origin/dev -- "$f" \
     && echo "  ok       $f" \
     || echo "  DIFFERS  $f   ($(git diff --shortstat origin/dev -- "$f" | sed 's/^ *//'))"
@@ -119,23 +121,25 @@ Check existing memory that might apply — at minimum:
 - `feedback_test_quality.md` — fixture leaks, test code standards
 - `feedback_claude_md_scope.md` — which areas are cipher to you / still churning
 
-### Load and MATCH all three routed-concern tables — do not rely on memory
+### Load and MATCH all four routed-concern tables — do not rely on memory
 
 ```bash
 # Every changed path, against every routed-concern row.
 git diff --name-only <range>
 ```
 
-Open **ALL THREE** `.claude/routed-concerns.md`, `.claude/routed-concerns-access-control.md`
-**and** `.claude/routed-concerns-security-posture.md` and walk them row by row against that
-path list. There are THREE files — the table was split when the first hit CLAUDE.md's
-40k-character ceiling and a new catastrophic-invariant row physically would not fit, and
-split again in Wave 8 into a security-posture sibling so `routed-concerns.md` stops growing.
-Walking only the first silently skips every access-control and request-admission
-chokepoint, which is where the highest-severity rows live: the authz-topology floor,
-dispatch confinement, dispatch targeting, the pre-auth body cap, and the ADR-1005
-spine — and every read-only security-posture plugin invariant. A row that is never opened
-routes nobody, which defeats the row's only job.
+Open **ALL FOUR** `.claude/routed-concerns.md`, `.claude/routed-concerns-access-control.md`,
+`.claude/routed-concerns-security-posture.md` **and** `.claude/routed-concerns-software-estate.md`
+and walk them row by row against that path list. There are FOUR files — the table was split when
+the first hit CLAUDE.md's 40k-character ceiling and a new catastrophic-invariant row physically
+would not fit (three times: once for access-control/request-admission, again in Wave 8 for the
+read-only security-posture plugin rows, again for Forensics/per-user-software-data). Walking only
+the first silently skips every access-control and request-admission chokepoint, which is where the
+highest-severity rows live: the authz-topology floor, dispatch confinement, dispatch targeting, the
+pre-auth body cap, and the ADR-1005 spine; skipping the third silently skips every read-only
+security-posture plugin invariant; skipping the fourth silently skips the Forensics-class plugin
+rows (e.g. `browser_inventory`'s privacy contract). A row that is never opened routes nobody,
+which defeats the row's only job.
 Each row names the files/change-types it covers and the agents that MUST load on
 them. Those agents are selected **unconditionally** — see the standing rule under
 the Gate 3 decision matrix. Write the matched rows into your Gate 1 summary so the
@@ -333,7 +337,7 @@ IMPACT/EXPOSURE and they always gate:
     tuning doc
   - a violation of an explicit MUST / never / catastrophic-if-violated invariant.
     CLOSED to three sources, so floor membership is not a judgement call: a
-    catastrophic-if-violated clause in a row of any of the three `.claude/routed-concerns*.md` tables; a
+    catastrophic-if-violated clause in a row of any of the four `.claude/routed-concerns*.md` tables; a
     CLAUDE.md sentence inside a standing-rule or invariant block; an accepted
     ADR's normative requirements. NARRATIVE prose does not qualify — an ADR
     saying a thing "never landed" is history, not a contract. If you cannot
@@ -429,7 +433,7 @@ and nothing else:
   4. `CLAUDE.md` or a routed-concern row, for a new architectural invariant, store,
      ABI pattern or release gate
   5. an audit-action, permission or error-code table the change's contract touches
-  6. a doc a row of any of the three `.claude/routed-concerns*.md` tables names as an **update obligation for
+  6. a doc a row of any of the four `.claude/routed-concerns*.md` tables names as an **update obligation for
      the changed surface** — whether operator-facing (a user-manual page for a
      changed feature) or author-facing (a migration ladder, a capability registry,
      a per-surface invariants doc that records each change as it lands). What it is
@@ -1414,9 +1418,10 @@ only.** It carries its own text for standing rules 1 and 4:
 
 - **Rule 1:** there is **no routed-concerns walk at all** on that leg — its
   `## Domain Routing` is an independently-authored heuristic list, and none of
-  `.claude/routed-concerns.md`, `.claude/routed-concerns-access-control.md` or
-  `.claude/routed-concerns-security-posture.md` is referenced anywhere in that file. Tracked as
-  **#2684**. This is the only record of that gap in the tree.
+  `.claude/routed-concerns.md`, `.claude/routed-concerns-access-control.md`,
+  `.claude/routed-concerns-security-posture.md` or `.claude/routed-concerns-software-estate.md`
+  is referenced anywhere in that file. Tracked as **#2684**. This is the only record of that
+  gap in the tree.
 - **Rule 4:** a weaker Gate 8 phrasing ("re-run affected gates") — precisely the
   formulation that shipped the broken macOS leg on #2580.
 
@@ -1431,10 +1436,12 @@ to close rather than a contradiction to adjudicate.
    that agent raised nothing in round 1**.
 
    Concretely, against the **fix diff** (not the original):
-   - **Gate 3** — re-run the decision matrix, including **all three** routed-concern
-     tables: `.claude/routed-concerns.md`, `.claude/routed-concerns-access-control.md`
-     AND `.claude/routed-concerns-security-posture.md`. Opening only the first misses
-     every auth, access-control, request-admission and read-only security-posture invariant.
+   - **Gate 3** — re-run the decision matrix, including **all four** routed-concern
+     tables: `.claude/routed-concerns.md`, `.claude/routed-concerns-access-control.md`,
+     `.claude/routed-concerns-security-posture.md` AND `.claude/routed-concerns-software-estate.md`.
+     Opening only the first misses every auth, access-control and request-admission invariant;
+     skipping the third misses every read-only security-posture invariant; skipping the fourth
+     misses every Forensics/per-user-software-data invariant.
    - **Gate 2** — `security-guardian` always; `docs-writer` whenever the fix touches
      a doc, a changelog fragment, a user-facing string, or in-code prose.
    - **Gates 4 and 6** — re-run an agent when the fix changes behaviour in its
@@ -2055,8 +2062,8 @@ procedure:
 1. **Draft the candidate list** — one actionable outcome per candidate; split multi-finding bundles; type each honestly (`bug` / `task` / `decision` / `spike` — a choice-to-be-made is a `decision`, not a code task).
 2. **Dedupe every candidate (mandatory — dedupe is the only inflow filter):**
    ```bash
-   gh issue list --repo Tr3kkR/Yuzu --state open --search "<file-or-symbol>" --json number,title
-   gh search issues --repo Tr3kkR/Yuzu --state open "<title keywords>" --json number,title --limit 20
+   gh issue list --repo DevNullLtd/Yuzu --state open --search "<file-or-symbol>" --json number,title
+   gh search issues --repo DevNullLtd/Yuzu --state open "<title keywords>" --json number,title --limit 20
    ```
    An existing issue covers it → comment the new evidence there instead of filing. Related but a distinct outcome → file with `Relates to #N` in the body.
 
@@ -2074,7 +2081,7 @@ procedure:
    free-text disposition note.
 3. **File survivors** with the four body sections (Context / Evidence with `file:line` against current `origin/dev` / Acceptance criteria / Origin naming this governance run plus the dedupe probes and their results):
    ```bash
-   gh issue create --repo Tr3kkR/Yuzu --title "..." \
+   gh issue create --repo DevNullLtd/Yuzu --title "..." \
      --label <type> --label governance-deferred --label <P0|P1|P2> --label ready-for-agent \
      --body-file <candidate>.md
    ```
@@ -2086,7 +2093,7 @@ procedure:
    phrasing is what a previous round of this runbook mistakenly acted on — so the park
    branch carries NEITHER:
    ```bash
-   gh issue create --repo Tr3kkR/Yuzu --title "..." \
+   gh issue create --repo DevNullLtd/Yuzu --title "..." \
      --label <type> --label governance-deferred --label roadmap \
      --body-file <candidate>.md
    ```

@@ -86,6 +86,7 @@ constexpr std::string_view kApprovals[] = {"list_pending_approvals",
 constexpr std::string_view kDexSignals[] = {
     "list_dex_signals",       "get_dex_signal_scope",     "get_dex_signal_detail",
     "get_dex_device_score",   "get_dex_app",              "list_dex_apps",
+    "get_dex_catalogue",      // ADR-0031 WS-A4 PR-1
     "get_dex_catalogue_group", "get_dex_device_history",  "get_dex_observation",
     "get_dex_health",         "get_dex_trends",           "get_dex_overview"};
 constexpr std::string_view kDexPerf[] = {"get_dex_perf_fleet",   "get_dex_perf_cohorts",
@@ -232,6 +233,26 @@ constexpr std::string_view kFleetVisualization[] = {"get_fleet_topology", "get_h
 // whole catalog + role grid) and from Engine principals' assign/unassign/
 // list_engine_roles (grant AUTHORING, not a self-check).
 constexpr std::string_view kRbacCheck[] = {"check_permission"};
+// A2 (delivery plan §2) — global human role assignment/unassignment. Own
+// family, distinct from RBAC self-check above (a read, not an authoring
+// action) and from Engine principals' assign/unassign_engine_role (a
+// different principal class — engine, not human — with its own structural
+// "no admin, ever" bar these tools deliberately do NOT carry).
+// A1 (RBAC enforcement toggle) folds set_rbac_enforcement into A2's family
+// rather than creating a second one-tool family — same Administrator gate,
+// same "not a plain permission check" story.
+constexpr std::string_view kRbacAdministration[] = {"assign_rbac_role", "unassign_rbac_role",
+                                                    "set_rbac_enforcement"};
+// Fleet-wide RBAC role assignment LISTING — own family, distinct from all
+// three RBAC-adjacent families above/below: "RBAC self-check" answers "can I
+// do X" for the CALLING principal only; "RBAC administration" AUTHORS a
+// grant (is_rbac_administrator-gated, not a plain permission check); "Access
+// Reviews" expands the SAME underlying grant table into a frozen,
+// per-campaign attestation artifact (AccessReview:Attest lifecycle). This
+// family is a stateless, read-only, perm_fn(AccessReview:Read)-gated read of
+// the grant table itself — every (principal_type, principal_id, role_name)
+// row on record, fleet-wide, right now.
+constexpr std::string_view kRbacAssignmentsList[] = {"list_rbac_role_assignments"};
 // B4 — no existing family covers local-account lockout lifecycle; own family,
 // distinct from Directory & identity (AD/Entra sync, a different identity
 // axis) and from Engine principals (a different principal class entirely).
@@ -259,7 +280,7 @@ constexpr std::string_view kSoftwareDeployments[] = {
     "list_software_deployments", "create_software_deployment",
     "rollback_software_deployment", "cancel_software_deployment"};
 
-constexpr std::array<ToolFamily, 38> kFamilies{{
+constexpr std::array<ToolFamily, 40> kFamilies{{
     {"Fleet & agents", "connected agents, their OS/arch/version, and details", kFleet},
     {"Tags", "read and write agent tags, and find agents by tag", kTags},
     {"Instructions & schedules", "instruction definitions, their full export, and recurring "
@@ -338,6 +359,13 @@ constexpr std::array<ToolFamily, 38> kFamilies{{
     {"RBAC self-check", "check whether the calling principal itself holds a specific RBAC "
                         "permission",
      kRbacCheck},
+    {"RBAC administration", "grant or revoke one of the 6 fleet-wide-assignable built-in RBAC "
+                            "roles to a human user, and switch RBAC enforcement on/off "
+                            "(Administrator-gated, not a plain permission check)",
+     kRbacAdministration},
+    {"RBAC role assignments", "fleet-wide listing of every current RBAC role assignment -- "
+                              "who currently holds which role, across every principal type",
+     kRbacAssignmentsList},
     {"Account lockout", "clear a local account's failed-login lockout counter (SOC 2 CC6.3)",
      kAccountLockout},
     {"Offload targets", "configure event-forwarding webhook targets and inspect their delivery "

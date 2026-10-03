@@ -767,7 +767,8 @@ void warn_on_san_drift(const fs::path& representative_leaf,
 // on every boot that needs default-cert generation, with zero racers
 // required (unhappy-path, Gate 8 narrow re-verify, 2026-08-21). It fails
 // CLOSED and LOUDLY either way (a nested acquire timeout surfaces as a normal
-// record_issued/delete_issued_by failure → "Refusing to start"), never a
+// record_issued failure → "Refusing to start"; a delete_issued_by failure is
+// only logged — the purge is best-effort), never a
 // hang or silent corruption — so this is a documented constraint, not a
 // defect requiring a code fix.
 constexpr std::chrono::milliseconds kBootstrapLockAcquireTimeout{5000};

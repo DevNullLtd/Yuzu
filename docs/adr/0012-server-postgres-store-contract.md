@@ -199,3 +199,75 @@ itself, and the 264:16 ratio driving it, are unchanged by this fix). The differe
 this widening adds to already-tracked fire-and-forget audit-write sites (#950, #3185, #4007,
 #4526 -- pre-existing, not introduced here) is a separate, disclosed follow-up concern, not a
 reason to withhold or narrow this fix.
+
+## Update (2026-09-26) -- the cross-store query-owner seam exists
+
+Section 3 and its Consequences describe the query-owner seam as unbuilt until vuln-graph scoring.
+That is no longer accurate: `AppPerfRollup` (`app_perf_rollup.{hpp,cpp}`) is a dedicated query owner
+that takes one pool lease and issues schema-qualified SQL across two store schemas, and
+`RbacAdminAuthorityOwner` (`rbac_admin_authority_owner.{hpp,cpp}`, PR #4985) is one for the
+last-Administrator guard, which needs the `rbac_store` grants and the `auth.users` account state
+inside one transaction. The "until then" condition in section 3 (the seam's first consumer) has
+therefore run out, since `AppPerfRollup` is that consumer. The rule itself is unchanged: per-store
+classes stay single-schema owners, cross-schema work lives in a query owner, and
+`RbacStore::unassign_role` delegates to the owner rather than issuing `auth` SQL itself.
+
+## Update (2026-09-30) -- a third consumer, and a named exception for a shared-fragment predicate
+
+A third query owner: `CommandDeliveryFinalizationOwner` (`command_delivery_finalization_owner.{hpp,cpp}`,
+#4982), which owns the cross-schema write `CommandOutboxStore::mark_sent_with_target` delegates to —
+the fenced `command_outbox_store.outbox` `pending -> sent` transition and
+`execution_tracker.executions.agents_targeted` commit in one transaction, on one lease, exactly the
+section 3 shape. Nothing about that write needs a new rule; it is recorded here only to keep this
+ADR's consumer list current.
+
+The same class also introduces a second SHAPE this ADR had not previously named:
+`kPendingOutboxNotExistsClause`, a `static constexpr` SQL fragment (not an owner-executed method)
+that spells out, once, what "still owned by the delivery loop" means for a
+`command_outbox_store.outbox` row. `ExecutionTracker::reap_stuck_running_executions` embeds this
+fragment, verbatim, into its own `WHERE` clauses — including the final atomic
+`UPDATE ... WHERE ... RETURNING id` that re-evaluates the full cancel-candidate predicate — and
+executes it on `ExecutionTracker`'s OWN transaction/connection. No `CommandDeliveryFinalizationOwner`
+instance is constructed to use it.
+
+This is a deliberate, narrow exception to section 3's default shape (an owner that takes its OWN
+lease and executes the cross-schema query itself), not a violation of it. The precondition that
+makes it correct: the caller needs the predicate evaluated as part of its OWN atomic check-and-act —
+here, the reaper's cancel-candidate re-check must be evaluated AS PART OF the cancelling `UPDATE`
+itself — on the same connection, inside the same transaction, under the same advisory lock — not as
+a separate read whose answer could go stale before the write commits. (This is evaluation-order
+atomicity, not a shared MVCC snapshot: Postgres READ COMMITTED gives each statement its own
+snapshot, so the predicate's `NOT EXISTS` subqueries still see the data as of the UPDATE's own start,
+not a snapshot shared with any earlier read — the `EvalPlanQual` re-check that protects the UPDATE's
+locked TARGET row does not extend to those subqueries. See `execution_tracker.cpp`'s own comment on
+the atomic cancel UPDATE for the resulting narrow residual.) Answering the predicate on a
+separately-leased owner connection first (the normal section-3 shape) would reopen exactly the TOCTOU
+the atomic re-check exists to close — a row could flip to outbox-pending between the owner's read and
+the reaper's own `UPDATE` committing. A shared text fragment the caller embeds in its own statement
+closes that specific window, because it is evaluated by the SAME statement, on the SAME connection,
+under the SAME advisory lock as the write it gates.
+
+This shape is not new to the codebase: `LeaderElector::epoch_fence_sql()` (`leader_elector.hpp`) is
+the shipped precedent — also "a pure string builder (no connection)" (that header's own words) whose
+SQL executes on a caller's own pooled connection, inside the caller's own claim statement, for the
+identical reason (a standalone fence read would race a handover between the read and the claim
+commit). `kPendingOutboxNotExistsClause` is the second instance of that same pattern.
+
+**When this exception applies, precisely, so a future author cannot cite it as a general escape
+hatch:** ONLY when a caller needs the predicate as one conjunct of its OWN atomic check-and-act
+statement, where a separately-leased read would introduce a check-then-act race the caller's
+transaction is specifically structured to avoid — OR as one conjunct of a preparatory `SELECT` that
+runs inside that SAME transaction, under the SAME lock, directly selecting or counting candidates for
+that same check-and-act, PROVIDED the predicate text is byte-identical to the one the final
+check-and-act re-evaluates atomically. `ExecutionTracker::reap_stuck_running_executions`'s
+candidate-count and candidate-select queries are this second case: preparatory reads under the same
+advisory lock and transaction as the atomic cancel `UPDATE` that re-checks the identical clause (not
+a shared MVCC snapshot — see the note above on READ COMMITTED). It does NOT license a cross-schema
+`SELECT` embedded for convenience, run outside the
+check-and-act's own transaction/lock, or against a predicate the final mutation does not itself
+re-evaluate — nor a fragment a caller could just as well obtain by calling an owner method on its own
+lease. The default in section 3 is still owner-executed, and this exception is for the one case that
+default cannot serve: a predicate that must be evaluated INSIDE somebody else's transaction, not its
+own. Adding a third instance of this shape should point back to this paragraph, not merely to
+`kPendingOutboxNotExistsClause`'s doc comment, so the precondition is re-checked each time rather than
+copied as a template.

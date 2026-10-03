@@ -83,14 +83,11 @@
 ///     above in ONE translation unit, so a `policy_admin_routes.hpp`-style
 ///     carve-out would be needed before it could be fully enforced; that
 ///     carve-out is a separate, disclosed follow-up, not done here.
-///   - `device_lens_routes.cpp`'s `/fragments/device/guardian` fragment
-///     keeps its existing direct `GuaranteedStateStore*` access
-///     (`list_rules()` + `agent_rule_statuses()`, C++-post-filtered to one
-///     agent) — mirrors the `dex` family's OWN device-lens deferral
-///     (ISSUE #4576): that file's banner already commits it to staying
-///     store-coupled until DEX *and* Guardian both have a seam AND someone
-///     does the rewire as its own change, not silently as a side effect of
-///     landing the seam itself.
+///
+/// `device_lens_routes.cpp`'s `/fragments/device/guardian` fragment IS
+/// wrapped by this seam (`device_guards`, mirroring the `dex` family's own
+/// ISSUE #4576 rewire) and is enforced via the `device` family's TU set in
+/// `check-seam-closure.py` (that fragment's OWN file, not this seam's).
 
 #include "guardian_types.hpp"
 

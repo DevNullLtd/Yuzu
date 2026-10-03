@@ -352,7 +352,9 @@ enum class SparkCoverage : std::uint8_t {
 /// reported `Notification` coverage for the CURRENT incarnation (unset while
 /// still pending, or while coverage has never reached `Notification` — e.g. a
 /// mechanism that only ever offers `Poll`), and `coverage` is the mechanism's
-/// most recently reported tri-state for this key. RECOVERY DOES NOT RE-STAMP:
+/// most recently reported tri-state for this key, except that the engine answers
+/// `None` while the type's mechanism reports itself inert (a conservative, not
+/// coherent, snapshot; `established_at` is unchanged). RECOVERY DOES NOT RE-STAMP:
 /// once `established_at` is set for an incarnation it stays set, even if
 /// `coverage` later drops to `None` and comes back — first-wins, not
 /// last-transition. Meaningless fields read as their defaults (`coverage`

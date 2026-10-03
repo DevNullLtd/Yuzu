@@ -90,13 +90,14 @@ classifies a capability; it never grants one.
 
 ### Seed catalogue
 
-`kSeedCatalogue` is five representative rows, not a full mirror of `RbacStore`'s 23 securables × 7
+`kSeedCatalogue` is eight representative rows, not a full mirror of `RbacStore`'s 38 securables × 8
 operations — it exists so PR1.9 has real rows to migrate and so this header's own tests exercise
 `is_valid`, not to be the registry itself. It includes an ordinary CRUD read (`Response:Read`), a
 `Tag:Write` (mirrors `mcp_policy.hpp`'s existing Tag special-case), `Execution:Execute` (the
 combination the #1788 fix below narrows), the Guardian-only `Push` narrow op
-(`GuaranteedState:Push`), and — required by this PR's spec — `AccessReview:Attest`, deliberately
-outside every CRUD loop, exactly as seeded in `rbac_store.cpp`.
+(`GuaranteedState:Push`), — required by this PR's spec — `AccessReview:Attest`, deliberately
+outside every CRUD loop, exactly as seeded in `rbac_store.cpp`, and three later additions:
+`PluginConfig:Write`, `PluginSecret:Write` and `UploadGrant:Write`.
 
 ### Composition with the frozen #1715 lattice
 
@@ -324,14 +325,14 @@ Administrator-only, unlike `PluginConfig`/`UploadGrant` where Operator gets read
 day-to-day triage. No other role (Viewer, ITServiceOwner, ApiTokenManager, Reviewer) is touched by
 this PR.
 
-## 4. Wave 7 PR7.2: `Forensics` and `Decommission` (34th/35th securables)
+## 4. Wave 7 PR7.2: `Forensics` and `Decommission` (37th/38th securables)
 
-Two more securables appended to `rbac_store.cpp`'s `types[]` (33→35) and its `mcp_server.cpp`
+Two more securables appended to `rbac_store.cpp`'s `types[]` (36→38) and its `mcp_server.cpp`
 mirror (`kRbacSecurables`):
 
 | Securable | Purpose | Consumed operations | Roles |
 |---|---|---|---|
-| `Forensics` | Read-only forensic artefact reads (ShimCache/AmCache/Prefetch, application usage). Every catalogue row on it is `ExecuteGate::AdminOrApproval` AND single-target (below) — Administrator only. | `Read`, plus the unused CRUD-loop ops (harmless, keeps the loop uniform) | Administrator (CRUD via the loop); deliberately ABSENT from the Viewer read-list — a forensic read is never a Viewer-tier operation |
+| `Forensics` | Read-only forensic artefact reads (ShimCache/AmCache/Prefetch, application usage, per-app privacy-permission grants). Every catalogue row on it is `ExecuteGate::AdminOrApproval` AND single-target (below) — Administrator by default; the stored rows of a dispatched read follow `Response:Read`. | `Read`, plus the unused CRUD-loop ops (harmless, keeps the loop uniform) | Administrator (CRUD via the loop); deliberately ABSENT from the Viewer read-list — dispatching a forensic read is never a Viewer-tier operation (the stored results, though, follow `Response:Read`, which Viewer holds) |
 | `Decommission` | The whole-device erasure cascade (`DELETE /api/v1/sle/agents/{id}`). Replaces the three-way `SoftwareLicensing`∧`Inventory`∧`GuaranteedState:Delete` conjunction ADR-0024 Decision 9 originally rejected promoting a dedicated securable for. | `Delete` is the ONLY consumed operation — `Read`/`Write`/`Execute`/`Approve` are meaningless on this securable and are never widened onto it | Administrator (CRUD via the loop, PowerManagement/PluginConfig precedent); ITServiceOwner gets a TARGETED `Decommission:Delete` grant only (preserves the population that could decommission under the old conjunction — ITServiceOwner held CRUD on all three of its members) |
 
 `Decommission` has **no MCP consumer by design** — the erasure verb is REST-only (ADR-1005

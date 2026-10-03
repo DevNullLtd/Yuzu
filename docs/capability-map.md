@@ -31,7 +31,7 @@ Each capability is rated on two axes:
 > outside its own domain, and each entry counts once against its `T1`/`T2`/`T3` tier label.
 > Reproduce with:
 > `awk '/^### [0-9]+\.[0-9]+/ { if ($0 ~ /:white_check_mark:/) d++; else if ($0 ~ /:large_orange_diamond:/) p++; else if ($0 ~ /:x:/) n++ } END { print d, p, n, d+p+n }' docs/capability-map.md`
-> → `194 25 50 269`. Tier tallies (`Foundation`=T1, `Advanced`=T2, `Future`=T3) add the same
+> → `194 26 49 269`. Tier tallies (`Foundation`=T1, `Advanced`=T2, `Future`=T3) add the same
 > awk pattern filtered on `` `T1` ``/`` `T2` ``/`` `T3` ``. The former "New (Ph 8-16)" interim
 > row is retired — those phases are now ordinary domains 25-31, and 2026 additions land as
 > domains 32-39 rather than an undifferentiated bucket. **Domains 32-39 were verified for
@@ -64,14 +64,10 @@ Each capability is rated on two axes:
 
 ```
 Foundation   [==============================--]  55/59 done  (93%) (1 partial)
-Advanced     [========================--------]  129/172 done (75%) (21 partial)
-Future       [=========-----------------------]  10/34 done  (29%) (4 partial)
+Advanced     [========================--------]  129/175 done  (74%) (21 partial)
+Future       [=========-----------------------]  10/35 done  (29%) (4 partial)
 ─────────────────────────────────────────────────────────────────
-Overall      [=======================---------]  194/265 done (73%) (26 partial)
-Advanced     [========================--------]  129/175 done (74%) (21 partial)
-Future       [=========-----------------------]  10/35 done  (29%) (3 partial)
-─────────────────────────────────────────────────────────────────
-Overall      [=======================---------]  194/269 done (72%) (25 partial)
+Overall      [=======================---------]  194/269 done  (72%) (26 partial)
 ```
 
 | Domain | Total | Done | Partial | Not Started |
@@ -115,9 +111,9 @@ Overall      [=======================---------]  194/269 done (72%) (25 partial)
 | 37. Internal PKI / Certificate Authority | 5 | 5 | 0 | 0 |
 | 38. Server Storage Substrate — PostgreSQL | 4 | 4 | 0 | 0 |
 | 39. Headless Platform — Engine Principals & On-Behalf-Of (ADR-1005) | 3 | 3 | 0 | 0 |
-| **TOTAL** | **265** | **194** | **26** | **45** |
+| **Subtotal (domains 1–39)** | **265** | **194** | **26** | **45** |
 | 40. Reflex — Agent-Local Automated Response | 4 | 0 | 0 | 4 |
-| **TOTAL** | **269** | **194** | **25** | **50** |
+| **TOTAL** | **269** | **194** | **26** | **49** |
 
 > **Scaffolded vs production-quality.** The percentages above measure feature presence, not enterprise hardening. "Done" means "implemented and functional" — not "hardened, observable, and proven at large-fleet scale" on every domain. Known gaps at the §-level (e.g. configurable heartbeat in §1.2, unified diagnostics bundle in §1.3, runtime plugin install in §1.5) remain even where a domain is marked Done. The `docs/capability-agentic-audit-2026-05.md` audit (figures as of 2026-05 — its counts predate this v4.0 tally) is the source for the production-quality dimension; subsequent reviews should keep it current.
 
@@ -1627,11 +1623,14 @@ verbs, SOC 2 evidence rows, REST + MCP CRUD, and an HTMX `/reflex` dashboard rou
 | discovery | Y | Y | Y | Network |
 | netprobe | Y | Y | Y | Network |
 | installed_apps | Y | Y | Y | Software |
+| runtimes | - | Y | - | Software |
 | msi_packages | Y | - | Y | Software |
+| pkg_inventory | - | - | Y | Software |
 | windows_updates | Y | Y | Y | Patch |
 | software_actions | Y | Y | Y | Software |
 | sccm | Y | - | - | Software |
 | license_scan | Y | Y | Y | Software |
+| browser_policy | - | Y | - | Software |
 | antivirus | Y | Y | Y | Security |
 | firewall | Y | Y | Y | Security |
 | bitlocker | Y | Y | Y | Security |
@@ -1645,6 +1644,12 @@ verbs, SOC 2 evidence rows, REST + MCP CRUD, and an HTMX `/reflex` dashboard rou
 | app_usage | Y | Y | Y | Security |
 | execution_artifacts | Y | - | - | Security |
 | app_control | Y | - | - | Security |
+| firmware_posture | Y | Y | Y | Security |
+| platform_security | Y | Y | Y | Security |
+| browser_inventory | - | Y | - | Security |
+| local_security_policy | Y | Y | Y | Security |
+| privacy_permissions | Y | Y | Y | Security |
+| system_hardening | Y | Y | Y | Security |
 | filesystem | Y | Y | Y | File System |
 | filesystem_posture | Y | Y | Y | File System |
 | registry | Y | - | - | System Config |
@@ -1658,6 +1663,7 @@ verbs, SOC 2 evidence rows, REST + MCP CRUD, and an HTMX `/reflex` dashboard rou
 | asset_tags | Y | Y | Y | Device Mgmt |
 | tags | Y | Y | Y | Device Mgmt |
 | printing | Y | Y | Y | Device Mgmt |
+| update_source_trust | - | Y | - | Security |
 | agent_logging | Y | Y | Y | Agent Mgmt |
 | agent_actions | Y | Y | Y | Agent Mgmt |
 | diagnostics | Y | Y | Y | Agent Mgmt |
@@ -1667,7 +1673,7 @@ verbs, SOC 2 evidence rows, REST + MCP CRUD, and an HTMX `/reflex` dashboard rou
 
 | software_usage | Y | Y | Y | Software | *Planned (Phase 12)* |
 
-**56 plugins** (+ 1 planned) — covering hardware, peripherals, network, security, filesystem, registry, WMI, WiFi, WoL, IOC, quarantine, certificates, content distribution, user interaction, and more. Includes cross-platform and Windows-only plugins; the two test/debug plugins (`chargen`, `example`) appear in the table but are excluded from the headline count. Per-OS cells follow `docs/os-capability-matrix.md` (2026-09-07; a partial 🟡 leg is shown as Y — the matrix carries the per-action detail). Recount verified 2026-09-18 (`ls -d agents/plugins/*/` = 57 directories, minus `example` + `chargen` = 55; `app_control` then added by Wave 8 PR8.6 = 56). This recount also catches up three plugins the 2026-09-15 recount (51) never added despite already being on `dev` at that point — `app_usage`, `autoruns`, `execution_artifacts` — plus `peripherals`. `software_usage` remains aspirational — confirmed no such directory exists under `agents/plugins/` as of this baseline.
+**66 plugins** (+ 1 planned) — covering hardware, peripherals, network, security, filesystem, registry, WMI, WiFi, WoL, IOC, quarantine, certificates, content distribution, user interaction, and more. Includes cross-platform and Windows-only plugins; the two test/debug plugins (`chargen`, `example`) appear in the table but are excluded from the headline count. Per-OS cells follow `docs/os-capability-matrix.md` (2026-09-07; a partial 🟡 leg is shown as Y — the matrix carries the per-action detail). Recount verified after merging `origin/dev` (`ls -d agents/plugins/*/` = 68 directories, minus `example` + `chargen` = 66). This recount adds `update_source_trust` (Wave 10 PR10.1-d, Linux apt leg only this PR — macOS, Windows and rpm/dnf follow as their own PRs) on top of the previous recount (65), which itself added both `local_security_policy` (Wave 8 PR8.3, Linux+macOS legs first; its Windows leg and `sudoers` action are added in a follow-up PR) and `privacy_permissions` (Wave 8 PR8.5, Linux leg only this PR — macOS/Windows follow as their own PR), landing together on top of the 2026-09-27 recount (`ls -d agents/plugins/*/` = 65 directories, minus `example` + `chargen` = 63), which itself added `browser_policy` (Wave 10 PR10.2-b, Linux leg only that wave), `system_hardening` (Wave 8 PR8.1-b) and `pkg_inventory` (Wave 10 PR10.1-c) on top of the 2026-09-22 recount (60), which itself caught up `firmware_posture` (Wave 8 PR8.4), `runtimes` (Wave 10 PR10.1-b), `platform_security` (Wave 8 PR8.1-a1), `browser_inventory` (Wave 10 P2a-3, Linux leg only that wave) and `app_control` (Wave 8 PR8.6) on top of the 2026-09-18 recount (55), which itself caught up three plugins the 2026-09-15 recount (51) never added despite already being on `dev` at that point — `app_usage`, `autoruns`, `execution_artifacts` — plus `peripherals`. The `privacy_permissions` macOS leg (Wave 8 PR8.5 macOS, TCC.db grant inventory) and Windows leg (ConsentStore registry walk) land separately from this recount — an existing plugin gaining a leg, not a new plugin, so the count stays 66. `software_usage` remains aspirational — confirmed no such directory exists under `agents/plugins/` as of this baseline.
 
 ---
 

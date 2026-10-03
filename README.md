@@ -1,8 +1,8 @@
 # Yuzu
 
-[![OpenSSF Scorecard](https://api.securityscorecards.dev/projects/github.com/Tr3kkR/Yuzu/badge)](https://scorecard.dev/viewer/?uri=github.com/Tr3kkR/Yuzu)
+[![OpenSSF Scorecard](https://api.securityscorecards.dev/projects/github.com/DevNullLtd/Yuzu/badge)](https://scorecard.dev/viewer/?uri=github.com/DevNullLtd/Yuzu)
 [![OpenSSF Best Practices](https://www.bestpractices.dev/projects/12582/badge)](https://www.bestpractices.dev/projects/12582)
-[![Zizmor](https://github.com/Tr3kkR/Yuzu/actions/workflows/zizmor.yml/badge.svg?branch=main)](https://github.com/Tr3kkR/Yuzu/actions/workflows/zizmor.yml)
+[![Zizmor](https://github.com/DevNullLtd/Yuzu/actions/workflows/zizmor.yml/badge.svg?branch=main)](https://github.com/DevNullLtd/Yuzu/actions/workflows/zizmor.yml)
 
 **Enterprise endpoint management platform.** Real-time visibility, orchestration, and compliance across Windows, Linux, and macOS fleets — built from the ground up in modern C++23.
 
@@ -57,7 +57,7 @@ See [`docs/Instruction-Engine.md`](docs/Instruction-Engine.md) for the full arch
                         │  ┌────────────┐  ┌─────────────┐  └──────────────────┘  │
                         │  │  HTMX      │  │  Response    │  ┌──────────────────┐  │
                         │  │  Dashboard │  │  Store       │  │  RBAC / Auth     │  │
-                        │  └────────────┘  │  (SQLite)    │  │  OIDC · API Keys │  │
+                        │  └────────────┘  │  (Postgres)  │  │  OIDC · API Keys │  │
                         │  ┌────────────┐  └─────────────┘  └──────────────────┘  │
                         │  │  Metrics   │  ┌─────────────┐  ┌──────────────────┐  │
   Prometheus ◄───────── │  │  /metrics  │  │  Audit Log  │  │  Scheduler       │  │
@@ -115,7 +115,7 @@ Response data is typed (bool, int32, int64, string, datetime, CLOB) and schemati
 | Transport | gRPC + Protobuf | Bidirectional streaming, strongly typed, TLS built-in, language-neutral. |
 | Plugin ABI | Stable C ABI | Binary-stable across compiler versions. Language-agnostic. `dlopen`/`LoadLibrary` safe. |
 | Web UI | HTMX + server-rendered HTML | No JavaScript framework. Server renders fragments. Minimal client complexity. |
-| Storage | SQLite (embedded) | Zero-config, single-file, fast. Agent uses it for KV storage and identity. Server uses it for responses, audit, and config. |
+| Storage | PostgreSQL (server) + SQLite (agent) | Server stores (responses, audit, auth, config, and the rest) share one PostgreSQL substrate (ADR-0006); the NVD cache is the one remaining server SQLite store, a recorded deferral. Agent uses embedded SQLite for KV storage and identity — zero-config, single-file, fast. |
 | Auth | PBKDF2 + RBAC + OIDC | Session cookies for browsers, API tokens for automation, OIDC for enterprise SSO. |
 | Platforms | Windows, Linux, macOS (ARM64), ARM | Enterprise + edge coverage. Cross-compiled from CI. macOS Intel (x64) is not currently built or tested — only Apple Silicon (ARM64) is supported. |
 
@@ -144,16 +144,16 @@ Yuzu/
 
 Prebuilt artifacts are published with every tagged release. If you just want to run Yuzu, start here — you do not need to build from source.
 
-- **Release binaries & installers** (server/agent for Linux, Windows, macOS; Compose Wizard zip): [GitHub Releases](https://github.com/Tr3kkR/Yuzu/releases). Latest stable is v0.12.0.
+- **Release binaries & installers** (server/agent for Linux, Windows, macOS; Compose Wizard zip): [GitHub Releases](https://github.com/DevNullLtd/Yuzu/releases). Latest stable is v0.12.0.
 - **Container images** (published to GHCR on every tag):
-  - `ghcr.io/tr3kkr/yuzu-server:<version>`
-  - `ghcr.io/tr3kkr/yuzu-agent:<version>`
-  - `ghcr.io/tr3kkr/yuzu-gateway:<version>`
+  - `ghcr.io/devnullltd/yuzu-server:<version>`
+  - `ghcr.io/devnullltd/yuzu-agent-chisel:<version>`
+  - `ghcr.io/devnullltd/yuzu-gateway:<version>`
 - **Docker Compose** quickstart: [`deploy/docker/docker-compose.yml`](deploy/docker/docker-compose.yml) stands up the full server + gateway + agent stack. Reference wiring for UAT is [`deploy/docker/docker-compose.reference.yml`](deploy/docker/docker-compose.reference.yml).
 
 ```bash
 # Pull and run the latest stable release via compose
-curl -fsSL https://raw.githubusercontent.com/Tr3kkR/Yuzu/main/deploy/docker/docker-compose.yml -o docker-compose.yml
+curl -fsSL https://raw.githubusercontent.com/DevNullLtd/Yuzu/main/deploy/docker/docker-compose.yml -o docker-compose.yml
 YUZU_VERSION=0.12.0 docker compose up -d
 ```
 
@@ -163,7 +163,7 @@ Open `http://localhost:8080` and sign in with the credentials set during first-r
 
 ### Prerequisites
 
-- Meson 1.9.2, Ninja
+- Meson 1.12.0 (the CI pin in `requirements-ci.txt`), Ninja
 - CMake (required by Meson's cmake dependency method)
 - C++23 compiler: GCC 13+, Clang 18+, MSVC 19.38+, or Apple Clang 15+
 - [vcpkg](https://github.com/microsoft/vcpkg) with `VCPKG_ROOT` set
@@ -180,6 +180,8 @@ Open `http://localhost:8080` and sign in with the credentials set during first-r
 - **RHEL / Rocky / AlmaLinux 9:** the system GCC (11) cannot build C++23 — see
   [`docs/rhel9-build-setup.md`](docs/rhel9-build-setup.md) for the verified
   recipe, or run `bash scripts/setup-rhel9.sh`.
+  The 0.14.0 release packages do not run there either; see the native-package
+  floor under *Supported Platforms* in [`docs/user-manual/README.md`](docs/user-manual/README.md).
 
 ### Quick Start
 
@@ -254,14 +256,14 @@ See [`docs/capability-map.md`](docs/capability-map.md) for the live capability i
 
 Pull requests welcome. Start with [CONTRIBUTING.md](CONTRIBUTING.md) — it covers the build, branch naming (`feature/*`, `fix/*`), the governance-gated PR workflow, C++23 coding standards, observability conventions, and the plugin SDK. Architectural and release context lives in [CLAUDE.md](CLAUDE.md). All participants are expected to follow our [Code of Conduct](CODE_OF_CONDUCT.md).
 
-Good first issues are labelled [`good first issue`](https://github.com/Tr3kkR/Yuzu/labels/good%20first%20issue); broader backlogs are grouped by area (`enterprise-readiness`, `security`, `docs`, `compliance`).
+Good first issues are labelled [`good first issue`](https://github.com/DevNullLtd/Yuzu/labels/good%20first%20issue); broader backlogs are grouped by area (`enterprise-readiness`, `security`, `docs`, `compliance`).
 
 ## Reporting Issues
 
-- **Bugs** — open a [bug report](https://github.com/Tr3kkR/Yuzu/issues/new?template=bug_report.md). Include version (`yuzu-server --version`), OS, and reproduction steps.
-- **Feature requests** — open a [feature request](https://github.com/Tr3kkR/Yuzu/issues/new?template=feature_request.md). Tie it to a use case so scope stays concrete.
-- **Security vulnerabilities** — do **not** file a public issue. Follow [SECURITY.md](SECURITY.md) and submit via [GitHub's private vulnerability reporting](https://github.com/Tr3kkR/Yuzu/security/advisories/new). Acknowledgement within 48 hours.
-- **Questions & discussion** — [GitHub Discussions](https://github.com/Tr3kkR/Yuzu/discussions) for usage questions; use issues for anything actionable.
+- **Bugs** — open a [bug report](https://github.com/DevNullLtd/Yuzu/issues/new?template=bug_report.md). Include version (`yuzu-server --version`), OS, and reproduction steps.
+- **Feature requests** — open a [feature request](https://github.com/DevNullLtd/Yuzu/issues/new?template=feature_request.md). Tie it to a use case so scope stays concrete.
+- **Security vulnerabilities** — do **not** file a public issue. Follow [SECURITY.md](SECURITY.md) and submit via [GitHub's private vulnerability reporting](https://github.com/DevNullLtd/Yuzu/security/advisories/new). Acknowledgement within 48 hours.
+- **Questions & discussion** — [GitHub Discussions](https://github.com/DevNullLtd/Yuzu/discussions) for usage questions; use issues for anything actionable.
 
 ## License
 

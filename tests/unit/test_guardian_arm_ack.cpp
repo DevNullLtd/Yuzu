@@ -1613,15 +1613,16 @@ TEST_CASE("GuardianSparkRuntime::receipt_status_wedge_aware(): a real concurrent
     REQUIRE(rt->receipt_status(receipt) == GuardianSparkRuntime::ReceiptStatus::Wedged);
     REQUIRE(rt->receipt_wedge_k_eligible(receipt));
 
-    // Second barrier (#4851, macOS CI flake investigation): the eligible->settled
-    // straddle can only be sampled if the poller observes the Wedged-and-eligible
-    // state BEFORE the release below settles it. Under CPU contention the poller can
-    // go unscheduled for the whole expire -> release window (reproduced: 71/100 runs
-    // under a 32-process `yes` load on a 16-core host), so the settled-ineligible
-    // state is the only one it ever sees and the straddle flag stays false with no
-    // code defect involved. Same idiom as the poll_count barrier above. Eligibility
-    // cannot narrow before release (the claim stays parked, FIFO-front), so waiting
-    // here observes the state the test already asserts, it does not weaken it.
+    // Second barrier (#4661): the eligible->settled-ineligible straddle can only be
+    // sampled if the poller observes the Wedged-and-eligible state BEFORE the release
+    // below settles it. Under CPU contention the poller can go unscheduled for the
+    // whole expire -> release window, so the settled-ineligible state is the only one
+    // it ever sees and the straddle flag stays false with no code defect involved
+    // (the final spin_until then times out: it waits on a flag that can no longer be
+    // set). Waiting on this latched flag instead of sampling the transient state is
+    // the same idiom as the poll_count barrier above. Eligibility cannot narrow before
+    // the release (the claim stays parked and FIFO-front), so this waits for a state
+    // the test already asserts above; it does not weaken any check.
     REQUIRE(yuzu::test::spin_until(
         [&] { return poller_saw_eligible_wedged.load(std::memory_order_relaxed); },
         std::chrono::seconds(10)));

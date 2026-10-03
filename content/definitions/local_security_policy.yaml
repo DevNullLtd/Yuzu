@@ -1,0 +1,366 @@
+## Local Security Policy Definitions
+## Reports local password, lockout and audit policy posture and sudoers
+## content, read-only. Plugin: local_security_policy
+## Actions: password_policy, lockout_policy, audit_policy, sudoers
+##
+## Sources: Linux bounded config-file reads (login.defs, pwquality.conf,
+## faillock.conf, /etc/pam.d, audit.rules, sudoers); macOS `pwpolicy
+## -getaccountpolicies` (rung-2 argv leaf, parsed with CFPropertyList),
+## audit_control and sudoers; Windows one `secedit.exe /export` (rung-2 argv
+## leaf, staged in an agent.data_dir scratch file) parsed from its UTF-16LE
+## INI. A source the OS reports missing is `absent`; a refused or failed read
+## is `unreadable`, never absent. In a container the Linux files are the
+## image's, not the host's. See agents/plugins/local_security_policy/README.md.
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: crossplatform.local_security_policy.password_policy
+  displayName: Local Password Policy
+  version: 1.0.0
+  description: >
+    Reports the local password policy as one row per setting: which
+    setting, its value and where it was read. Linux reads login.defs,
+    pwquality.conf and the password-type lines of the pam_pwquality,
+    pam_pwhistory, pam_cracklib and pam_unix modules in
+    /etc/pam.d/common-password, system-auth and password-auth (in a
+    container these are the image's files, not the host's); macOS reads the global
+    account policies from `pwpolicy -getaccountpolicies`; Windows reads
+    MinimumPasswordAge, MaximumPasswordAge, MinimumPasswordLength,
+    PasswordComplexity, PasswordHistorySize and ClearTextPassword from one
+    `secedit /export` staged under agent.data_dir and removed on return. It
+    reports what the configuration states, not the live PAM or LSA decision;
+    on Windows that is the LOCAL security database only (no /mergedpolicy), so
+    on a domain-joined host the GPO-effective policy is not reported, and it
+    has been measured only as LocalSystem on a standalone host.
+    A source the OS reports missing reads `absent`; one that could not be
+    read reads `unreadable` with a reason and downgrades the result to
+    CONSTRAINED (PERMISSION_DENIED only when every read was refused and
+    nothing was readable), never an empty success. Keys are each OS's own vocabulary and are deliberately NOT normalised across platforms (Windows MinimumPasswordLength, Linux PASS_MIN_LEN or pwquality minlen, macOS minimum_length all state a minimum length), so a fleet-wide comparison must branch per OS.
+  tags: [local_security_policy, password, policy, compliance, security, posture]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: local_security_policy
+    action: password_policy
+    concurrency: per-device
+
+  result:
+    # password_policy|<key>|<value>|<source>
+    # (a Windows-leg failure, or an exception contained on any OS, writes one
+    # `constrained|<reason>` row instead)
+    columns:
+      - name: row_kind
+        type: string
+        description: 'Fixed row tag, always the action name. Two cases write a two-field constrained|<reason> row instead, whose second field is the reason: every Windows-leg failure (scratch directory, secedit run or export), and an exception contained on any OS (constrained|internal_error). Linux and macOS read failures stay in this four-field shape as source_state or status rows.'
+        values: [password_policy, constrained]
+        example: password_policy
+        platforms: [windows, linux, darwin]
+      - name: key
+        type: string
+        description: 'Setting name: a login.defs / pwquality key or a pam.<type>.<module> stack line (Linux), a pwpolicy item (macOS: policy_content, minimum_length, a policyAttribute* name, unmodelled_category, unmodelled_parameter, policies), a secedit key (Windows), source_state when a whole source is absent or unreadable (also a macOS pwpolicy item not in the documented plist shape, and the row-cap marker), or status when a non-OK outcome produced no rows at all (only a failed macOS pwpolicy run).'
+        example: PASS_MAX_DAYS
+        platforms: [windows, linux, darwin]
+      - name: value
+        type: string
+        description: 'The setting value; present when a key has no value; absent for a Windows key the export does not carry; for a pam.<type>.<module> row, the control followed by the module arguments; for unmodelled_parameter (macOS), <name>=<value>. For source_state, absent or unreadable:<reason> (a macOS pwpolicy defect is unreadable:malformed_category, malformed_policy, malformed_identifier, malformed_content, malformed_parameters, malformed_parameter_value, non_string_key, unconvertible_key or missing_content; a file holding a NUL byte is unreadable:embedded_nul; the row-cap marker is unreadable:row_cap). For status, constrained -- the only state any leg reaches today.'
+        example: "99999"
+        platforms: [windows, linux, darwin]
+      - name: source
+        type: string
+        description: 'Where the row was read: a file path, or /etc/pam.d when every PAM file of the action is absent (Linux); pwpolicy:<policy identifier>, pwpolicy:<category> when the policy has no identifier, or pwpolicy (macOS); secedit (Windows). The row-cap marker carries the action name. On a status row this field carries the failure reason token instead, not a source.'
+        example: /etc/login.defs
+        platforms: [windows, linux, darwin]
+    aggregation:
+      groupBy:
+        - source
+      operations:
+        - count
+
+  readablePayload: "Report local password policy posture"
+
+  gather:
+    ttlSeconds: 300
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator, security-admin]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 1.0.0
+    requiredPlugins: [local_security_policy]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: crossplatform.local_security_policy.lockout_policy
+  displayName: Local Lockout Policy
+  version: 1.0.0
+  description: >
+    Reports the local account lockout policy as one row per setting. Linux
+    reads the lockout keys of login.defs, faillock.conf and the auth- and
+    account-type lines of the pam_faillock, pam_tally2 and pam_tally modules
+    in /etc/pam.d/common-auth, common-account, system-auth and password-auth
+    (in a container these are the image's files, not the host's); macOS
+    reads the authentication policies from `pwpolicy -getaccountpolicies` (no
+    authentication policy reports `policies|none`, the default); Windows
+    reads LockoutBadCount, ResetLockoutCount and LockoutDuration from one
+    `secedit /export` staged under agent.data_dir and removed on return. It
+    reports configuration, not live lockout counters; on Windows that is the
+    LOCAL security database only (no /mergedpolicy), so on a domain-joined
+    host the GPO-effective policy is not reported, and it has been measured
+    only as LocalSystem on a standalone host. A source the OS reports
+    missing reads `absent`; one that could not be read reads `unreadable` with
+    a reason and downgrades the result, never an empty success. Keys are each OS's own vocabulary and are deliberately NOT normalised across platforms, so a fleet-wide comparison must branch per OS.
+  tags: [local_security_policy, lockout, policy, compliance, security, posture]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: local_security_policy
+    action: lockout_policy
+    concurrency: per-device
+
+  result:
+    # lockout_policy|<key>|<value>|<source>
+    # (a Windows-leg failure, or an exception contained on any OS, writes one
+    # `constrained|<reason>` row instead)
+    columns:
+      - name: row_kind
+        type: string
+        description: 'Fixed row tag, always the action name. Two cases write a two-field constrained|<reason> row instead, whose second field is the reason: every Windows-leg failure (scratch directory, secedit run or export), and an exception contained on any OS (constrained|internal_error). Linux and macOS read failures stay in this four-field shape as source_state or status rows.'
+        values: [lockout_policy, constrained]
+        example: lockout_policy
+        platforms: [windows, linux, darwin]
+      - name: key
+        type: string
+        description: 'Setting name: a login.defs / faillock.conf key or a pam.<type>.<module> stack line (Linux), a pwpolicy item (macOS: policy_content, a policyAttribute* name, unmodelled_category, unmodelled_parameter, policies), a secedit key (Windows), source_state when a whole source is absent or unreadable (also a macOS pwpolicy item not in the documented plist shape, and the row-cap marker), or status when a non-OK outcome produced no rows at all (only a failed macOS pwpolicy run).'
+        example: LOGIN_RETRIES
+        platforms: [windows, linux, darwin]
+      - name: value
+        type: string
+        description: 'The setting value; present when a key has no value; absent for a Windows key the export does not carry; for a pam.<type>.<module> row, the control followed by the module arguments; for unmodelled_parameter (macOS), <name>=<value>. For source_state, absent or unreadable:<reason> (a macOS pwpolicy defect is unreadable:malformed_category, malformed_policy, malformed_identifier, malformed_content, malformed_parameters, malformed_parameter_value, non_string_key, unconvertible_key or missing_content; a file holding a NUL byte is unreadable:embedded_nul; the row-cap marker is unreadable:row_cap). For status, constrained -- the only state any leg reaches today.'
+        example: "5"
+        platforms: [windows, linux, darwin]
+      - name: source
+        type: string
+        description: 'Where the row was read: a file path, or /etc/pam.d when every PAM file of the action is absent (Linux); pwpolicy:<policy identifier>, pwpolicy:<category> when the policy has no identifier, or pwpolicy (macOS); secedit (Windows). The row-cap marker carries the action name. On a status row this field carries the failure reason token instead, not a source.'
+        example: /etc/login.defs
+        platforms: [windows, linux, darwin]
+    aggregation:
+      groupBy:
+        - source
+      operations:
+        - count
+
+  readablePayload: "Report local account lockout policy posture"
+
+  gather:
+    ttlSeconds: 300
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator, security-admin]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 1.0.0
+    requiredPlugins: [local_security_policy]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: crossplatform.local_security_policy.audit_policy
+  displayName: Local Audit Policy
+  version: 1.0.0
+  description: >
+    Reports the local audit policy. Linux reads /etc/audit/audit.rules and
+    reports rule, watch-rule and syscall-rule counts, lines it does not
+    model, and the -e state (enabled, disabled, immutable or unset), from the
+    rule file only, not the live kernel rules; macOS reads
+    /etc/security/audit_control, which is absent by default on current
+    macOS (reported `absent`, not a failure); Windows reports every [Event
+    Audit] category from one `secedit /export` as none, success, failure or
+    success_failure. Those are the LEGACY audit categories: where Advanced
+    Audit Policy subcategories are in force -- the Windows 10/11 default and
+    the norm under GPO -- they are not the effective audit state, so a
+    category reading none means the legacy category is unset, NOT that the
+    host is not auditing, and a legacy category reading success_failure may be
+    ignored by the OS when the "Force audit policy subcategory settings"
+    override (SCENoApplyLegacyAuditPolicy) is set, as many baselines do.
+    `auditpol /get /category:*` is the effective state and is not read. audit.rules is 0640 root, so an unprivileged Linux
+    agent reports `unreadable` and PERMISSION_DENIED. In a container the
+    Linux file is the image's, not the host's.
+  tags: [local_security_policy, audit, policy, compliance, security, posture]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: local_security_policy
+    action: audit_policy
+    concurrency: per-device
+
+  result:
+    # audit_policy|<key>|<value>|<source>
+    # (a Windows-leg failure, or an exception contained on any OS, writes one
+    # `constrained|<reason>` row instead)
+    columns:
+      - name: row_kind
+        type: string
+        description: 'Fixed row tag, always the action name. Two cases write a two-field constrained|<reason> row instead, whose second field is the reason: every Windows-leg failure (scratch directory, secedit run or export), and an exception contained on any OS (constrained|internal_error). Linux and macOS read failures stay in this four-field shape as source_state or status rows.'
+        values: [audit_policy, constrained]
+        example: audit_policy
+        platforms: [windows, linux, darwin]
+      - name: key
+        type: string
+        description: 'Setting name: rules, watch_rules, syscall_rules, unmodelled_lines, control_lines or enabled (Linux), an audit_control key (macOS), an [Event Audit] category name (Windows -- one row per category the export carries; a category the export omits has no row), or source_state when the source is absent or unreadable (and on the row-cap marker).'
+        example: watch_rules
+        platforms: [windows, linux, darwin]
+      - name: value
+        type: string
+        description: 'The setting value: a count (Linux -- rules is the RULE count, equal to watch_rules + syscall_rules + unmodelled_lines; control_lines counts the lines that configure auditd rather than add a rule, exactly -D, -b, -f, -r, -i, -c, -e, --backlog_wait_time and --loginuid-immutable), the audit_control value (macOS), none/success/failure/success_failure or unmodelled:<raw> (Windows), or, for the Linux enabled row, enabled/disabled/immutable for -e 1/0/2, unset with no -e line, or unmodelled:<raw> for any other -e value. For source_state, absent or unreadable:<reason> (unreadable:row_cap on the row-cap marker).'
+        example: "12"
+        platforms: [windows, linux, darwin]
+      - name: source
+        type: string
+        description: 'Where the row was read: /etc/audit/audit.rules (Linux), /etc/security/audit_control (macOS) or secedit (Windows). The row-cap marker carries audit_policy.'
+        example: /etc/audit/audit.rules
+        platforms: [windows, linux, darwin]
+    aggregation:
+      groupBy:
+        - source
+      operations:
+        - count
+
+  readablePayload: "Report local audit policy posture"
+
+  gather:
+    ttlSeconds: 300
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator, security-admin]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 1.0.0
+    requiredPlugins: [local_security_policy]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: crossplatform.local_security_policy.sudoers
+  displayName: Sudoers Content
+  version: 1.0.0
+  description: >
+    Reports the parsed content of /etc/sudoers and every file in
+    /etc/sudoers.d, one row per Defaults line, alias, include directive or
+    user spec. Include directives are listed, not followed; a line the
+    parser does not recognise is kind `unmodelled` with the raw line, never
+    dropped; a file sudo would skip by name is kind `ignored`. Aliases and
+    includes are not resolved, and `nopasswd` reflects the NOPASSWD tag only.
+    The sources are opened without following symlinks and must be root-owned
+    and not group/other-writable (else `unreadable` with symlink_refused or
+    insecure_owner_or_mode, so a symlinked sudoers file, as on NixOS, is not
+    read). Reading /etc/sudoers needs root or the file's group (0440), so an
+    unprivileged agent reports kind `unreadable` and PERMISSION_DENIED when
+    nothing else was readable (CONSTRAINED otherwise), never an empty list.
+    Values pass the shared output escaper, which renders a literal backslash
+    as `/` (so `%domain\ admins` reads `%domain/ admins`). A User_List,
+    Host_List or run-as over 4 KiB, or a line expanding to more than 256
+    rows, is not decoded and is one `unmodelled` row with its raw text. In a
+    container these are the image's files, not the host's. Linux and macOS
+    only; Windows has no sudoers.
+  tags: [local_security_policy, sudoers, privilege, compliance, security, posture]
+
+spec:
+  type: question
+  platforms: [linux, darwin]
+
+  execution:
+    plugin: local_security_policy
+    action: sudoers
+    concurrency: per-device
+
+  result:
+    # sudoers|<file>|<kind>|<subject>|<runas>|<nopasswd>|<commands>
+    # (only an exception contained in the plugin writes one
+    # `constrained|internal_error` row instead)
+    columns:
+      - name: row_kind
+        type: string
+        description: 'Fixed row tag, always sudoers. Read failures stay in this seven-field shape (kind absent or unreadable); only an exception contained in the plugin writes a two-field constrained|internal_error row instead.'
+        values: [sudoers, constrained]
+        example: sudoers
+        platforms: [linux, darwin]
+      - name: file
+        type: string
+        description: 'The file the entry was read from; /etc/sudoers.d on a row about the directory listing itself; a dash on the row-cap marker.'
+        example: /etc/sudoers
+        platforms: [linux, darwin]
+      - name: kind
+        type: string
+        description: 'Entry kind. defaults, alias, include, includedir, user_spec: a recognised line. unmodelled: a line the parser has no interpretation for (raw line in commands); one that still carries a NOPASSWD: or PASSWD: tag the parser could not decode also adds the failure token <file>:undecoded_passwd_tag (CONSTRAINED). A user spec becomes one row per clause AND per change of run-as or NOPASSWD tag within a clause. Lines are lexed as sudo 1.9.16 lexes them (checked against sudo -ll), so a colon in a quoted value, an IPv6 host or a digest never splits a clause; the nopasswd column is the tag alone, and a line sudo itself rejects is best-effort. ignored: a sudoers.d file sudo skips by name (commands name_ignored_by_sudo). absent: the file or the /etc/sudoers.d directory does not exist. unreadable: the read failed (bare reason token in commands, e.g. permission_denied; truncated on the /etc/sudoers.d row when the listing hit its 256-entry cap; row_cap, with file -, on the marker row once output reaches 4096 rows). The plugin also emits kind unsupported on Windows (reason windows_has_no_sudoers in commands), which this definition cannot surface because it does not run there.'
+        values: [defaults, alias, include, includedir, user_spec, unmodelled, ignored, absent, unreadable]
+        example: user_spec
+        platforms: [linux, darwin]
+      - name: subject
+        type: string
+        description: 'Who the entry applies to. A user spec carries <user>@<host> -- the user, group or alias joined to the host list the spec applies on; each colon-separated Host_List clause of one line is its own row. An alias row carries <Alias_Type>:<name>. A scoped Defaults line carries its scope (user:, host:, cmnd:, runas:). A dash when not applicable.'
+        example: '%sudo@ALL'
+        platforms: [linux, darwin]
+      - name: runas
+        type: string
+        description: 'Run-as user/group of a user spec; a dash when not applicable.'
+        example: ALL
+        platforms: [linux, darwin]
+      - name: nopasswd
+        type: string
+        description: 'Whether a user spec carries the NOPASSWD tag: true or false; a dash on a row that is not a user spec. It reflects the tag only: a Defaults row with !authenticate (kind defaults) also makes matching grants passwordless and must be read alongside it.'
+        values: ['true', 'false', '-']
+        example: 'false'
+        platforms: [linux, darwin]
+      - name: commands
+        type: string
+        description: 'The command list of a user spec (any tag other than NOPASSWD/PASSWD, e.g. SETENV:, is kept in front of its command as TAG: , and any Option_Spec such as CWD=/tmp or TIMEOUT=5m verbatim), the Defaults or alias body, an include path, the raw text of an unmodelled line, the reason on an ignored or unreadable row, or a dash on an absent row.'
+        example: ALL
+        platforms: [linux, darwin]
+    aggregation:
+      groupBy:
+        - kind
+      operations:
+        - count
+
+  readablePayload: "Report sudoers content"
+
+  gather:
+    ttlSeconds: 300
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator, security-admin]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 1.0.0
+    requiredPlugins: [local_security_policy]
+
+status:
+  phase: active

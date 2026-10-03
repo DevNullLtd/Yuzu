@@ -25,7 +25,6 @@
 // reuse discipline as kek_routes.hpp above. Also brings in UploadGrantStore
 // fully defined, so no separate include is needed for that.
 #include "file_retrieval_routes.hpp"
-#include "dex_app_perf_model.hpp"
 #include "dex_perf_model.hpp"
 #include "network_api.hpp" // ADR-0031 WS-A4: the public in-process /network API seam
 #include "verify_api.hpp" // ADR-0031 WS-A4 #4250: the public in-process VERIFY API seam
@@ -60,6 +59,7 @@
 #include "result_set_model.hpp" // #2146 Batch B2: ResultSetStore (fwd-declared only otherwise) + shared JSON builder
 #include "schedule_api.hpp" // ADR-0031 WS-A4 (seventh family): the public in-process schedule-read API seam
 #include "schedule_engine.hpp" // still needed for the ScheduleEngine* build_handler param -- see set_schedule_api's doc comment
+#include "scope_eval_error.hpp" // #4981 PR-2: ScopeEvalError — ScopeEvaluateFn's typed failure surface
 #include "scope_engine.hpp"
 #include "tag_store.hpp"
 #include "workflow_api.hpp" // ADR-0031 WS-A4 (eighth family): the public in-process workflow-read API seam
@@ -604,6 +604,24 @@ public:
                                                   const std::string& operation)>;
     void set_list_read_fn(ListReadFn fn) { list_read_fn_ = std::move(fn); }
 
+    /// #4981 PR-2 — `preview_scope_targets`'s SOLE scope-evaluation callback:
+    /// a thin closure over `AgentRegistry::evaluate_scope` with the caller's
+    /// tag/custom-properties/result-set stores already bound (the SAME
+    /// binding shape `command_routes.cpp`'s Scope arm and
+    /// `wire_and_dispatch_confined`, dispatch_scope_ladder.hpp, already use —
+    /// see `scope_preview.hpp`'s identically-shaped `yuzu::server::ScopeEvaluateFn`
+    /// for the full contract this mirrors, independently declared per this
+    /// class's own `Fn`-alias convention rather than a shared type import).
+    /// Injected rather than threading `AgentRegistry*`/`CustomPropertiesStore*`
+    /// raw pointers into this class (matches `set_result_set_store`'s "one
+    /// setter per borrowed dependency" idiom). MUST be called BEFORE
+    /// `build_handler()`. Unset (`{}`, the default) makes
+    /// `preview_scope_targets` answer `kInternalError` (misconfigured call
+    /// site), same posture as `fleet_read_fn_` unwired.
+    using ScopeEvaluateFn = std::function<std::expected<std::vector<std::string>, ScopeEvalError>(
+        const yuzu::scope::Expression&, const std::string& principal)>;
+    void set_scope_evaluate_fn(ScopeEvaluateFn fn) { scope_evaluate_fn_ = std::move(fn); }
+
     /// #2146 Batch B1 — the injected-callback twin of `RestApiV1::GuardianPushFn`
     /// (rest_api_v1.hpp), backing `push_guardian_rules`. Same shape (scope +
     /// full_sync in, agents-reached count out, with -1 = unparseable scope and
@@ -681,25 +699,25 @@ public:
     /// (never null) — each backing store pointer is checked individually
     /// inside the impl, matching the old per-lambda null-checks; the tools'
     /// `!dex_perf_api_` readiness guard is defense-in-depth, never expected to
-    /// fire. Additive alongside `app_perf_providers` (still wired, still used
-    /// by the dashboard fragments) until every consumer migrates.
+    /// fire. `AppPerfProviders` (the pre-seam bundle) is retired (#4626) — the
+    /// dashboard fragments now route through this same seam too.
     void set_dex_perf_api(std::shared_ptr<const DexPerfApi> a) { dex_perf_api_ = std::move(a); }
 
-    /// #4035 hardening (governance): the SAME username-keyed visible-agent-set
-    /// resolver `RestApiV1::DexVisibleFn` receives (see its doc comment,
-    /// rest_api_v1.hpp) — server.cpp wires the IDENTICAL lambda
-    /// (`visible_set_fn`) into the dashboard fragment, the REST twin, and this
-    /// MCP twin, so `get_dex_app`/`get_dex_overview` confine their
-    /// devices/top_devices lists to the caller's management-group scope
-    /// (ADR-0017 World A) exactly like `/fragments/dex/app` and
-    /// `/fragments/dex/overview` already do. This is a SECOND, independent
-    /// belt alongside `deny_fleet_wide_service_scoped` — that closes the
-    /// service-scoped-token axis, this closes the confined-OPERATOR axis.
-    /// Unset (default-constructed) degrades to "no confinement" (matching the
-    /// fragment's own unwired-`visible_set_fn_` posture), never a crash.
-    using DexVisibleFn =
-        std::function<std::optional<std::set<std::string>>(const std::string& username)>;
-    void set_dex_visible_fn(DexVisibleFn fn) { dex_visible_fn_ = std::move(fn); }
+    // #4035 hardening (governance) introduced a bespoke `DexVisibleFn`
+    // resolver for `get_dex_app`/`get_dex_overview`/`get_dex_signal_detail` —
+    // retired (WS-A4 PR-1 fix round, sec-1/sec-2): see
+    // `RestApiV1::DexVisibleFn`'s retirement comment (rest_api_v1.hpp) for
+    // the full rationale — the bare `perm_fn`/`tier_allows` gate in front of
+    // it resolved GLOBAL roles only, so this resolver's confinement was
+    // dormant on every admitted call. Per the WS-A4 PR-1 decision (see the
+    // same rest_api_v1.hpp comment) all three tools REVERTED to base
+    // gating instead of moving onto `fleet_read_fn_`: every value they
+    // return is a fleet-wide aggregate (an ADR-0017 INV-3 concern, not a
+    // per-caller-confinement one), so they gate on the bare
+    // `perm_fn`/`tier_allows` (`GuaranteedState:Read`: a global grant, or with
+    // RBAC off any authenticated non-service/non-engine session) plus the base MCP `ServiceScopeClass`
+    // service-token deny — no per-caller confinement resolver, dormant or
+    // otherwise, on any of the three.
 
     /// ADR-0031 WS-A4 (seventh family): the SAME in-process schedule-read API
     /// seam the REST `GET /api/v1/schedules` handler and the dashboard
@@ -806,7 +824,6 @@ public:
                             ResponseScopeFn response_scope_fn = {},
                             SoftwareInventoryStore* software_inventory_store = nullptr,
                             yuzu::MetricsRegistry* metrics = nullptr,
-                            AppPerfProviders app_perf_providers = {},
                             QuarantineStore* quarantine_store = nullptr,
                             TagPushFn tag_push_fn = {},
                             // A2 discovery (roadmap Issue 17.1): backs discover_plugins.
@@ -1012,7 +1029,6 @@ public:
                          ResponseScopeFn response_scope_fn = {},
                          SoftwareInventoryStore* software_inventory_store = nullptr,
                          yuzu::MetricsRegistry* metrics = nullptr,
-                         AppPerfProviders app_perf_providers = {},
                          QuarantineStore* quarantine_store = nullptr,
                          TagPushFn tag_push_fn = {},
                          yuzu::server::detail::AgentRegistry* agent_registry = nullptr,
@@ -1104,7 +1120,6 @@ public:
                          ResponseScopeFn response_scope_fn = {},
                          SoftwareInventoryStore* software_inventory_store = nullptr,
                          yuzu::MetricsRegistry* metrics = nullptr,
-                         AppPerfProviders app_perf_providers = {},
                          QuarantineStore* quarantine_store = nullptr,
                          TagPushFn tag_push_fn = {},
                          yuzu::server::detail::AgentRegistry* agent_registry = nullptr,
@@ -1189,6 +1204,8 @@ private:
     PreflightRunStore* preflight_run_store_{nullptr};
     // #2146 Batch B2 — see set_result_set_store above.
     ResultSetStore* result_set_store_{nullptr};
+    // #4981 PR-2 — see set_scope_evaluate_fn above.
+    ScopeEvaluateFn scope_evaluate_fn_;
     // #2146 Batch B1 — see set_baseline_store above.
     BaselineStore* baseline_store_{nullptr};
     // #2146 Batch B1 — see set_guardian_push_fn above.
@@ -1205,8 +1222,6 @@ private:
     // ADR-0031 WS-A4 (fifth family) — see set_dex_api above.
     std::shared_ptr<const DexApi> dex_api_;
     std::shared_ptr<const DexPerfApi> dex_perf_api_;
-    // #4035 hardening (governance) — see set_dex_visible_fn above.
-    DexVisibleFn dex_visible_fn_;
     // ADR-0031 WS-A4 (seventh family) — see set_schedule_api above.
     std::shared_ptr<const ScheduleApi> schedule_api_;
     // ADR-0031 WS-A4 (eighth family) — see set_workflow_api above.

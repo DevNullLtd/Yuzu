@@ -18,6 +18,30 @@ namespace yuzu {
 class MetricsRegistry;
 }
 namespace yuzu::server {
+
+/// Typed failure of the enrollment-token / pending-agent store surface
+/// (WS-6 slice 6.2), shared by `AuthDB` (the store) and `auth::AuthManager`
+/// (which routes every enrollment call to it). Defined here, not in
+/// auth_db.hpp, so this header stays free of store headers. Deliberately
+/// three-valued and distinct from "not found"/"rejected"/"absent", which are
+/// SUCCESSFUL outcomes carried in the value channel: a caller can never read a
+/// store outage as an empty result.
+enum class StoreError : std::uint8_t {
+    /// The store could not be reached: pool lease not acquired, OR no AuthDB is
+    /// attached to the AuthManager (shutdown / never wired) — fail CLOSED.
+    Unavailable,
+    /// A statement or transaction ran (or the connection broke) and failed.
+    QueryFailed,
+    /// A caller-supplied value violated a bound (empty/oversize/embedded NUL/
+    /// out-of-range). Not a store outage — maps to INVALID_ARGUMENT / 400.
+    InvalidInput,
+};
+
+/// True iff `e` is a store outage (fail-closed UNAVAILABLE/503), not bad input.
+[[nodiscard]] inline bool is_store_unavailable(StoreError e) noexcept {
+    return e != StoreError::InvalidInput;
+}
+
 class AuthDB;
 class SessionStore;       // HA WS-1/1a — durable operator sessions (Postgres, ADR-2002 §4)
 struct SessionRow;        // session_store.hpp — the durable row shape
@@ -343,12 +367,14 @@ struct EnrollmentToken {
     /// every successful consume so the lost-race audit detail can name the
     /// winner ("already_consumed_by=<agent_id>"). Empty on a freshly-created
     /// token or on a multi-use token before its first consume. Never the
-    /// raw token — only the agent_id presented to consume_enrollment_token.
+    /// raw token — only the agent_id presented to `consume_and_enroll`.
     std::string last_consumed_by_agent_id;
 };
 
-/// Typed rejection reason for `AuthManager::consume_enrollment_token`
-/// (W1.4 / #827). Naming style matches W1.2's `DeviceTokenValidateError`
+/// Typed rejection reason for `AuthManager::consume_and_enroll` (the token-half
+/// of its outcome; W1.4 / #827, folded into the atomic consume-and-enroll by
+/// WS-6 6.2 — see `ConsumeEnrollResult` below). Naming style matches W1.2's
+/// `DeviceTokenValidateError`
 /// (snake_case variants) so SIEM filters can grep across both. Variants
 /// are operator-facing — they surface in audit `detail` rows and as
 /// Prometheus label values; the public wire shape is uniform ("invalid,
@@ -375,8 +401,9 @@ enum class EnrollmentTokenError {
     internal_error,
 };
 
-/// Successful claim returned from `AuthManager::consume_enrollment_token`.
-/// Carries enough context for the success-path audit row and for telling
+/// Successful claim, carried in `ConsumeEnrollResult::claim` on the `enrolled`
+/// outcome of `AuthManager::consume_and_enroll`. Carries enough context for
+/// the success-path audit row and for telling
 /// "this consume won an actual race" from "this consume was uncontested".
 /// `prior_use_count` is the use_count BEFORE this consume — when it's > 0
 /// for a max_uses > 1 token, this consume shared the token with prior
@@ -387,6 +414,33 @@ struct EnrollmentClaim {
     int max_uses{0};        // 0 = unlimited
     int use_count_after{0}; // After this consume
     bool single_use{false}; // max_uses == 1 → token is now exhausted
+};
+
+/// Result of a successful `create_enrollment_token`. `raw_token` is shown once;
+/// `token_id` (8 hex chars of the hash) is the admin-facing handle.
+struct CreatedEnrollmentToken {
+    std::string raw_token;
+    std::string token_id;
+};
+
+/// Outcome of the atomic `consume_and_enroll` (WS-6 6.2). Exactly one of:
+///  - `enrolled`       : the token use was counted AND the agent row approved,
+///                       in one store transaction. `claim` is populated.
+///  - `token_rejected` : the token did not admit; `token_error` is the
+///                       audit/metric reason (the WIRE message stays uniform)
+///                       and `already_consumed_by` names the last consumer when
+///                       `token_error == already_consumed`.
+///  - `admin_denied`   : the token was valid but an administrator has denied
+///                       this agent_id. The whole txn rolled back — the token's
+///                       use_count is unchanged (closes #1135).
+/// A store outage is NOT a value here — it is the `StoreError` on the outer
+/// `std::expected`.
+struct ConsumeEnrollResult {
+    enum class Kind : std::uint8_t { enrolled, token_rejected, admin_denied };
+    Kind kind{Kind::token_rejected};
+    EnrollmentClaim claim{};                                        ///< enrolled only
+    EnrollmentTokenError token_error{EnrollmentTokenError::not_found}; ///< token_rejected only
+    std::string already_consumed_by;                                ///< token_rejected only
 };
 
 /// Maximum raw enrollment token length accepted at handler entry. Raw
@@ -410,6 +464,13 @@ inline constexpr std::size_t kMaxEnrollmentTokenLength = 256;
 /// hostname-derived or UUID-derived agent_id fits in well under 100 chars.
 inline constexpr std::size_t kMaxAgentIdLength = 256;
 
+/// Maximum length of any free-text field the enrollment/pending store accepts
+/// (label, hostname, os, arch, agent_version, acting principal). The store
+/// REJECTS longer values (`StoreError::InvalidInput`); the Register/ProxyRegister
+/// handlers TRUNCATE agent-supplied descriptive fields to this cap first
+/// (`sanitize_enrollment_text`), so an over-long hostname never strands an agent.
+inline constexpr std::size_t kMaxEnrollmentTextLength = 256;
+
 // ── Pending agents (Tier 1) ─────────────────────────────────────────────────
 
 enum class PendingStatus { pending, approved, denied };
@@ -422,6 +483,22 @@ struct PendingAgent {
     std::string agent_version;
     std::chrono::system_clock::time_point requested_at;
     PendingStatus status;
+};
+
+/// Outcome of `AuthDB::remove_pending`/`AuthManager::remove_pending_agent` (a hard
+/// delete). A plain bool cannot distinguish "no such row" from "a row exists but
+/// isn't `pending`" — and that distinction is load-bearing: the store only ever
+/// hard-deletes a row whose status is `pending`, so a caller (and the audit row)
+/// must be able to tell a refused reversal of an admin decision apart from a
+/// plain not-found. Removing a `denied` row would delete the very guard
+/// `kEnrollUpsertSql`'s `WHERE status <> 'denied'` depends on (the agent's
+/// still-valid token could then re-enroll it with no audit trail explaining the
+/// reversal); removing an `approved` row would silently deregister an enrolled
+/// agent with no admin decision behind it.
+enum class RemovePendingOutcome : std::uint8_t {
+    removed,      ///< The row existed, was `pending`, and was deleted.
+    not_found,    ///< No row exists for this agent_id.
+    wrong_status, ///< A row exists but is `approved`/`denied` — refused, not deleted.
 };
 
 class AuthManager {
@@ -872,122 +949,86 @@ public:
 
     const std::filesystem::path& config_path() const { return cfg_path_; }
 
-    /// Set an explicit data directory for runtime state files (enrollment
-    /// tokens, pending agents). If not set, defaults to cfg_path_ parent.
-    void set_data_dir(const std::filesystem::path& dir) { data_dir_ = dir; }
+    // -- Enrollment tokens + pending agents (WS-6 slice 6.2, ADR-2002 §8) --------
+    //
+    // Every method below routes to the attached `AuthDB` (Postgres, shared by
+    // every replica) and FAILS CLOSED: with no AuthDB attached (shutdown calls
+    // `set_auth_db(nullptr)`; or never wired) or on any store error the result
+    // is the typed `StoreError` — NEVER an empty list, a `0`, "absent" or
+    // "rejected". There is deliberately no in-memory or file fallback (the
+    // pre-6.2 per-replica .cfg mode was deleted): a fall-through-to-memory on a
+    // store error would let a denied agent re-enroll or a spent token replay.
+    // Each store-side failure bumps `yuzu_auth_enrollment_store_degrade_total`.
+    // `by`/`created_by`/`principal` are the acting principal recorded on the row.
 
-    /// Re-load enrollment tokens and pending agents from the current state_dir().
-    /// Call after set_data_dir() to pick up files from the new location.
-    void reload_state() {
-        load_tokens();
-        load_pending();
-    }
+    /// Create a token. `max_uses` 0 = unlimited; `ttl` 0 = never expires.
+    [[nodiscard]] std::expected<CreatedEnrollmentToken, StoreError>
+    create_enrollment_token(const std::string& label, int max_uses, std::chrono::seconds ttl,
+                            const std::string& created_by);
 
-    // -- Enrollment tokens (Tier 2) ---------------------------------------
+    /// THE atomic enrollment claim (one store transaction): count a token use,
+    /// then approve the agent unless an admin denied it (a denial rolls the use
+    /// back). See `ConsumeEnrollResult`.
+    [[nodiscard]] std::expected<ConsumeEnrollResult, StoreError>
+    consume_and_enroll(std::string_view raw_token, const std::string& agent_id,
+                       const std::string& hostname, const std::string& os,
+                       const std::string& arch, const std::string& agent_version);
 
-    /// Create a new enrollment token. Returns the raw token string (show once).
-    std::string create_enrollment_token(const std::string& label, int max_uses,
-                                        std::chrono::seconds ttl);
+    /// All enrollment tokens, newest first (admin UI).
+    [[nodiscard]] std::expected<std::vector<EnrollmentToken>, StoreError>
+    list_enrollment_tokens();
 
-    /// Create multiple enrollment tokens at once for batch deployment.
-    /// Returns a vector of raw token strings (each shown once).
-    std::vector<std::string> create_enrollment_tokens_batch(const std::string& label_prefix,
-                                                            int count, int max_uses_each,
-                                                            std::chrono::seconds ttl);
-
-    /// Read-only validity check for a raw enrollment token. Returns true
-    /// iff the token exists, is not revoked, is not expired, and still has
-    /// at least one use remaining. Does NOT mutate `use_count` and does
-    /// NOT update `last_consumed_by_agent_id` — call
-    /// `consume_enrollment_token` for the atomic check-and-consume.
-    ///
-    /// W1.4 R2 / UP-H2 semantic restoration: pre-W1.4 R2 this wrapper
-    /// silently delegated to `consume_enrollment_token`, meaning any
-    /// "is this token usable" probe would burn a use. That broke the
-    /// caller's stated intent (name says "validate") and made
-    /// `max_uses=1` tokens unreachable to any caller that wanted to
-    /// observe-before-act. Restored to true read-only semantics. The
-    /// only callers in-tree are tests; production Register / ProxyRegister
-    /// handlers call `consume_enrollment_token` directly so they can
-    /// emit the lost-race audit row.
-    bool validate_enrollment_token(const std::string& raw_token);
-
-    /// Atomic check-and-consume of an enrollment token (W1.4 / #827).
-    ///
-    /// **The race the function closes.** The prior `validate_enrollment_
-    /// token` returned a bare bool. A second concurrent Register that
-    /// presented the same token could pass the validity check before the
-    /// first call's `++use_count` landed, allowing a single-use token to
-    /// enroll N agents in the race window. This function does the validity
-    /// check and the use-count increment under the SAME `unique_lock` so
-    /// no second consumer can interleave. The token's `last_consumed_by_
-    /// agent_id` is written under the same lock, giving the lost-race
-    /// audit row enough context to name the winner.
-    ///
-    /// **Why an `EnrollmentClaim` on success.** The handler needs the
-    /// public token_id (for audit detail), the new use_count (so a
-    /// successful multi-use consume can still emit a "M of N uses
-    /// remaining" log line), and `single_use` so the response can
-    /// summarise the token's lifecycle.
-    ///
-    /// **Why a typed error on failure.** Audit/metric variant lives in the
-    /// typed error; public wire response uniformly says "invalid, expired,
-    /// or exhausted enrollment token" so the response shape is the same
-    /// regardless of variant. This is the same wire-collapse rule that
-    /// W1.3 enforces for `DeviceTokenValidateError` — a presenter cannot
-    /// discriminate `not_found` from `already_consumed` (which would tell
-    /// them the token existed and someone beat them to it). Operator-
-    /// visible variance lives in audit rows + Prometheus counters.
-    ///
-    /// `consuming_agent_id` is the agent_id presented to Register. It is
-    /// written into the token's `last_consumed_by_agent_id` on a winning
-    /// consume so a subsequent loser can audit `already_consumed_by=<id>`.
-    [[nodiscard]] std::expected<EnrollmentClaim, EnrollmentTokenError>
-    consume_enrollment_token(std::string_view raw_token, std::string_view consuming_agent_id);
-
-    /// Look up the most-recent consumer's agent_id for a token (hash-keyed).
-    /// Used by the Register handler's lost-race audit emission so the
-    /// "already_consumed_by=<X>" detail can name the winning agent without
-    /// requiring a second locked traversal in the consume path.
-    /// Returns empty string if no record / token not found / never consumed.
-    std::string last_consumer_for_token_hash(std::string_view token_hash) const;
-
-    /// List all enrollment tokens (for admin UI).
-    std::vector<EnrollmentToken> list_enrollment_tokens() const;
-
-    /// Revoke a token by its token_id.
-    bool revoke_enrollment_token(const std::string& token_id);
+    /// Revoke a token by its token_id. `true` = the token exists (idempotent).
+    [[nodiscard]] std::expected<bool, StoreError> revoke_enrollment_token(const std::string& token_id);
 
     // -- Pending agents (Tier 1) ------------------------------------------
 
-    /// Add an agent to the pending approval queue.
-    void add_pending_agent(const std::string& agent_id, const std::string& hostname,
-                           const std::string& os, const std::string& arch,
-                           const std::string& agent_version);
+    /// Queue an unenrolled agent as pending. `true` = NEWLY added (gates the
+    /// analytics event + SSE publish); `false` = a row already existed.
+    [[nodiscard]] std::expected<bool, StoreError>
+    add_pending_agent(const std::string& agent_id, const std::string& hostname,
+                      const std::string& os, const std::string& arch,
+                      const std::string& agent_version);
 
-    /// Mark an agent as enrolled (approved). Creates the entry if it doesn't
-    /// exist, or sets an existing entry to approved. This ensures reconnecting
-    /// agents are recognized without re-enrollment.
-    /// Returns false if the agent has been explicitly denied by an admin —
-    /// tokens do not override admin denials.
-    bool ensure_enrolled(const std::string& agent_id, const std::string& hostname,
-                         const std::string& os, const std::string& arch,
-                         const std::string& agent_version);
+    /// Mark an agent as enrolled (approved), creating the row if absent.
+    /// `true` = enrolled; `false` = the agent was explicitly denied by an admin
+    /// (tokens and auto-approve never override an admin denial). `by` is
+    /// recorded as the row's `status_changed_by`.
+    [[nodiscard]] std::expected<bool, StoreError>
+    ensure_enrolled(const std::string& agent_id, const std::string& hostname,
+                    const std::string& os, const std::string& arch,
+                    const std::string& agent_version, const std::string& by);
 
-    /// Check if an agent_id is pending, approved, or denied.
-    std::optional<PendingStatus> get_pending_status(const std::string& agent_id) const;
+    /// Five-state lookup: a value = pending/approved/denied; `nullopt` = absent;
+    /// `unexpected(StoreError)` = ERROR. A caller MUST NOT treat the error as
+    /// "absent" (an unreadable denied row would fall through to add/consume).
+    [[nodiscard]] std::expected<std::optional<PendingStatus>, StoreError>
+    get_pending_status(const std::string& agent_id);
 
-    /// List all pending agents (for admin UI).
-    std::vector<PendingAgent> list_pending_agents() const;
+    /// All pending-agent rows (any status), newest first (admin UI).
+    [[nodiscard]] std::expected<std::vector<PendingAgent>, StoreError> list_pending_agents();
 
-    /// Approve a pending agent.
-    bool approve_pending_agent(const std::string& agent_id);
+    /// Approve / deny a pending agent. `true` = the row existed.
+    [[nodiscard]] std::expected<bool, StoreError>
+    approve_pending_agent(const std::string& agent_id, const std::string& principal);
+    [[nodiscard]] std::expected<bool, StoreError>
+    deny_pending_agent(const std::string& agent_id, const std::string& principal);
 
-    /// Deny a pending agent.
-    bool deny_pending_agent(const std::string& agent_id);
+    /// Bulk approve / deny: every row that is `pending` AT THE TIME OF THE
+    /// STATEMENT moves in one atomic `UPDATE .. WHERE status='pending' RETURNING`,
+    /// so a row a concurrent admin denied/approved (or another replica moved) is
+    /// never overwritten. Returns the agent_ids THIS call transitioned — the
+    /// authoritative count and audit set.
+    [[nodiscard]] std::expected<std::vector<std::string>, StoreError>
+    approve_all_pending_agents(const std::string& principal);
+    [[nodiscard]] std::expected<std::vector<std::string>, StoreError>
+    deny_all_pending_agents(const std::string& principal);
 
-    /// Remove a pending agent entry (cleanup after enrollment or denial).
-    bool remove_pending_agent(const std::string& agent_id);
+    /// Remove a pending agent entry (hard delete). Only a `pending` row is ever
+    /// deleted — see `RemovePendingOutcome`'s doc comment for why an
+    /// `approved`/`denied` row must be REFUSED, not silently reversed.
+    [[nodiscard]] std::expected<RemovePendingOutcome, StoreError>
+    remove_pending_agent(const std::string& agent_id);
 
     // -- Crypto primitives (platform-abstracted) --------------------------
 
@@ -1265,24 +1306,16 @@ private:
     /// a store. Takes `session_gen_mtx_`; caller must NOT hold it.
     [[nodiscard]] bool session_generation_view_stale() const;
 
-    /// Persist enrollment tokens to disk.
-    bool save_tokens() const;
-    /// Load enrollment tokens from disk.
-    bool load_tokens();
-
-    /// Persist pending agents to disk.
-    bool save_pending() const;
-    /// Load pending agents from disk.
-    bool load_pending();
-
-    /// Returns the directory for runtime state files.
-    std::filesystem::path state_dir() const {
-        return data_dir_.empty() ? cfg_path_.parent_path() : data_dir_;
-    }
+    /// Shared body of every enrollment/pending store call: resolves the attached
+    /// AuthDB (null => `StoreError::Unavailable`, fail closed) and counts a
+    /// degrade (`yuzu_auth_enrollment_store_degrade_total{op,reason}`) on any
+    /// store-side failure. `op` is a short literal.
+    template <typename R, typename Fn>
+    [[nodiscard]] std::expected<R, StoreError> enrollment_store_call(const char* op, Fn&& fn);
+    void note_enrollment_store_degrade(const char* op, const char* reason) const;
 
     mutable std::shared_mutex mu_;
     std::filesystem::path cfg_path_;
-    std::filesystem::path data_dir_;
     std::unordered_map<std::string, UserEntry> users_;
     // Keyed by the token HASH when a durable store is configured (it is the
     // store row key too), by the raw token in the legacy in-memory-only mode.
@@ -1319,12 +1352,6 @@ private:
 
     // Non-owning pointer to MetricsRegistry; null in tests/CLI tools.
     yuzu::MetricsRegistry* metrics_ = nullptr;
-
-    // Enrollment tokens keyed by token_id
-    std::unordered_map<std::string, EnrollmentToken> enrollment_tokens_;
-
-    // Pending agents keyed by agent_id
-    std::unordered_map<std::string, PendingAgent> pending_agents_;
 };
 
 // OS-appropriate default paths.

@@ -5,14 +5,14 @@
 # before the first agent filing: `task`/`decision` become filing-valid types the moment
 # the issue standard lands, and a filing that names a nonexistent label fails at create.
 # Verify afterwards:
-#   gh label list --repo Tr3kkR/Yuzu --limit 100 | grep -E 'task|decision|do-not-close|fixed-on-dev|automation-broken|triage-sweep'
+#   gh label list --repo DevNullLtd/Yuzu --limit 100 | grep -E 'task|decision|do-not-close|fixed-on-dev|automation-broken|triage-sweep'
 #
 # Deliberately NOT a migration: the parallel priority-p* scheme was deleted in the
 # 2026-07-14 consolidation, so there is nothing to migrate -- only these six labels
 # are genuinely missing. See docs/adr/3001-issue-lifecycle-guardrails.md, Amendment A1.
 set -euo pipefail
 
-repo="Tr3kkR/Yuzu"
+repo="DevNullLtd/Yuzu"
 
 gh label create "task" --repo "$repo" --force \
     --description "Concrete engineering chore (type label)" --color "1d76db"

@@ -19,6 +19,7 @@
  * exists to let a test assert. See `tar.yaml` and `docs/user-manual/tar.md`.
  */
 
+#include <cstdint>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -49,6 +50,15 @@ format_storage_offline_lines(bool query_engine_available) {
             .append(" Restart the agent to recover."),
         "storage_state|offline",
     };
+}
+
+/// `db_health|<ok|quarantined>|<epoch>` (#1567). `quarantined` iff THIS open
+/// quarantined a corrupt tar.db (epoch = when); otherwise `ok` with the epoch of
+/// the last persisted quarantine (0 = never).
+[[nodiscard]] inline std::string format_db_health_line(bool quarantined_this_open,
+                                                       int64_t last_epoch) {
+    return std::string{"db_health|"} + (quarantined_this_open ? "quarantined|" : "ok|") +
+           std::to_string(last_epoch);
 }
 
 } // namespace yuzu::tar

@@ -13,7 +13,9 @@
 /// no place in a core API impl. `dex_routes.hpp` and `dex_view_types.hpp` now
 /// `#include` THIS header and keep re-declaring these symbols transitively, so
 /// every existing caller is unaffected (ODR-safe relocation, same pattern as
-/// `dex_types.hpp`). The definitions live in the dashboard TU unchanged.
+/// `dex_types.hpp`). The definitions live in the core-only `dex_window.cpp`
+/// (relocated from the dashboard TU, ADR-0031 WS-A4 PR-1 F1 fix, closing the
+/// #4579 link residual's DEX half).
 
 #include <string>
 

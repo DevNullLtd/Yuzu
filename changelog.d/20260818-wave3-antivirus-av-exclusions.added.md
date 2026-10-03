@@ -1,1 +1,0 @@
-- **`antivirus.av_exclusions` action.** Reads Windows Defender's exclusion lists (`HKLM\SOFTWARE\Microsoft\Windows Defender\Exclusions\{Paths,Processes,Extensions}`) directly from the registry and reports each excluded path, process, and extension. Windows-only; a key ACL'd against the reading account reports a typed `permission_denied` row rather than a silent empty list.

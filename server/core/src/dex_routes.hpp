@@ -30,16 +30,23 @@
 
 #include "authz_gates.hpp" // authz::FleetReadGate -- the version-devices fragment's gate
 #include "dex_app_perf_ui.hpp" // DexGroupOption + the app-perf render decls
+#include "dex_perf_api.hpp" // ADR-0031 WS-A4 (sixth family): the public in-process DEX app-perf-over-time API seam (#4626)
 #include "dex_perf_model.hpp"
 #include "dex_types.hpp" // ADR-0031 WS-A4: DexFleet/DexSignalGroup + DEX leaf value types (pure)
 #include "dex_window.hpp" // ADR-0031 WS-A4: dex_window_to_days/dex_iso_since/dex_normalize_os_filter (pure)
-#include "dex_read_builders.hpp" // PR #4582 FIX 4: re-export dex_device_score (relocated here) to this header's callers
+// `dex_read_builders.hpp` (`dex_device_score` + the `build_dex_*_model` builders)
+// is DELIBERATELY NOT included here (ADR-0031 WS-A4 PR-1 F1 fix, Fable review
+// 2026-09-28): it is CORE-ONLY (its own doc comment), and re-exporting it
+// transitively through this httplib-coupled presentation header defeated the
+// whole point of that split — any TU that needs `dex_device_score` or a
+// `build_dex_*_model` builder now includes `dex_read_builders.hpp` directly.
 
 #include <httplib.h>
 
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <optional>
 #include <set>
 #include <string>
@@ -54,19 +61,23 @@ class HttpRouteSink;
 
 // `DexFleet`/`DexSignalGroup` and the signal-catalogue accessors
 // (`dex_signal_groups` / `dex_catalogued_type_count` / `dex_family_index`) were
-// relocated to the pure `dex_types.hpp` (included above) for the ADR-0031 WS-A4
-// DexApi seam (PR #4582 FIX 4) — re-exported here transitively, so every
-// existing caller is unaffected while dex_read_model.cpp can call them without
-// this httplib-coupled header.
+// relocated (DECLARATIONS) to the pure `dex_types.hpp` (included above) for
+// the ADR-0031 WS-A4 DexApi seam (PR #4582 FIX 4); their DEFINITIONS moved out
+// of this TU's own `dex_routes.cpp` into `dex_types.cpp` in PR-1's F1 fix
+// (Fable review 2026-09-28). Still re-exported here transitively (via the
+// `dex_types.hpp` include above), so every existing caller of THIS header is
+// unaffected, while `dex_read_model.cpp` (core) can now link against them
+// without ever including this httplib-coupled header at all.
 
 /// Friendly display label for an obs_type — hoisted to `dex_view_types.hpp`
 /// (store-free; see that header for the doc comment).
 
 // `dex_window_to_days` / `dex_iso_since` / `dex_normalize_os_filter` — the shared
-// window-selector + OS-filter resolvers — are now declared in the pure
-// `dex_window.hpp` (included above), so the core `DexApi` impl can resolve a
-// window/os token without pulling this httplib-coupled header. Re-exported here
-// transitively; every existing caller is unaffected.
+// window-selector + OS-filter resolvers — are declared in the pure
+// `dex_window.hpp` (included above) and, since PR-1's F1 fix, also DEFINED
+// there (`dex_window.cpp`), so the core `DexApi` impl can both resolve AND
+// link a window/os token without pulling this httplib-coupled header.
+// Re-exported here transitively; every existing caller is unaffected.
 
 /// Render the DEX overview fragment (the content hx-get'd into the page shell):
 /// headline rate + coverage + crash facts + top apps / modules / devices + per-OS
@@ -81,12 +92,20 @@ std::string render_dex_overview_fragment(const GuaranteedStateStore* store,
 
 // The PURE catalogue/health helpers `dex_obs_platforms`, `dex_family_rollup`
 // (+ `DexFamilyRollup`), `dex_family_health_deduction`, and `dex_compute_health`
-// (+ `DexHealthResult`) — plus the store-reaching `dex_device_score` — were
-// relocated (PR #4582 FIX 4): the pure ones to `dex_types.hpp`, `dex_device_score`
-// to the core-only `dex_read_builders.hpp` (both included above), so
-// dex_read_model.cpp can call them without this httplib-coupled header. They are
-// re-exported here transitively, so this header's existing callers are
-// unaffected; the definitions are unchanged in their .cpp.
+// (+ `DexHealthResult`) were relocated (PR #4582 FIX 4) to the pure
+// `dex_types.hpp` (included above, so still re-exported here transitively —
+// this header's existing callers are unaffected). The store-reaching
+// `dex_device_score` relocated (PR #4582 FIX 4) to the core-only
+// `dex_read_builders.hpp` instead — that header is DELIBERATELY NOT included
+// here (see the comment by this file's `#include` block); a caller of THIS
+// header that also needs `dex_device_score` now includes
+// `dex_read_builders.hpp` directly (`dex_routes.cpp`, `server.cpp`, and the
+// test files that call it all do). PR-1's F1 fix (Fable review 2026-09-28)
+// moved every one of these DEFINITIONS too — out of this TU's own
+// `dex_routes.cpp` into `dex_types.cpp` (the pure ones) and
+// `dex_read_model.cpp` (`dex_device_score`) — closing the
+// core-links-against-presentation gap those declaration-only relocations left
+// open.
 
 /// Catalogue View 1 — the 13 family cards (mockup dex-catalogue-coverage.html).
 /// COVERAGE-first: a family lights when a CONNECTED platform (scoped by `os_filter`:
@@ -199,18 +218,11 @@ std::string render_dex_perf_panel(const std::vector<DexPerfPoint>& points);
 
 // ── F2a PR2: device drill perf extensions ────────────────────────────────────
 
-/// One per-application row out of the device's `$ProcPerf_Hourly` edge tier
-/// (A2 — names only, NEVER command lines; opt-in `procperf_enabled`).
-struct DexProcPerfRow {
-    std::string name; ///< image name — agent bytes, HTML-escape at render
-    std::int64_t samples{0};
-    std::int64_t instances_max{0};
-    double cpu_avg{0.0}; ///< % share of total capacity, clamped 0..100
-    double cpu_max{0.0};
-    double ws_avg_bytes{0.0};
-    double ws_max_bytes{0.0};
-    std::int64_t hours{0}; ///< distinct hourly rollups the app appeared in
-};
+// `DexProcPerfRow` — relocated to the pure `dex_perf_model.hpp` (#4626 Concern
+// B) so `dex_perf_ui.cpp` can include that header alone instead of this
+// httplib-coupled one. Re-exported here transitively (dex_perf_model.hpp is
+// already included above), so every existing caller of THIS header is
+// unaffected.
 
 /// PURE: parse the canned per-app `tar.sql` output (same defensive contract as
 /// parse_dex_perf_output: columns by NAME from the `__schema__|…` line,
@@ -319,10 +331,17 @@ public:
     /// includer, with ONE definition.
     using ResponsesFn = DexResponsesFn;
 
-    /// F2a: resolve the fleet perf snapshot for a cohort tag key (assembled in
-    /// server.cpp from AgentHealthStore + AgentRegistry + TagStore). May be
-    /// empty → the Performance tab renders an honest "unavailable" placeholder.
-    using PerfFn = DexPerfFn;
+    /// ADR-0031 WS-A4 (sixth family): the public in-process DEX app-perf-over-
+    /// time API seam (`dex_perf_api.hpp`) — backs BOTH the F2a heartbeat-now
+    /// fragments (`fleet_snapshot`) and the F2b over-time fragments (`apps`/
+    /// `app_fleet_trend`/`app_version_devices`/`group_trend`/`tag_trend`/
+    /// `device_app_perf_json`/`device_app_summaries`), replacing `PerfFn`/
+    /// `AppPerfProviders` (#4626). `nullptr` (the default) degrades every
+    /// consuming fragment to an honest "unavailable" placeholder — matching
+    /// server.cpp's own posture of constructing `dex_perf_api` UNCONDITIONALLY
+    /// and letting each method collapse a null/degraded backing store to
+    /// `nullopt` individually (see `dex_perf_api.hpp`'s own doc comment).
+    using DexPerfApiPtr = std::shared_ptr<const DexPerfApi>;
 
     /// F2b: the management groups offered in the app-perf scope selector (id +
     /// name + member count), sourced from ManagementGroupStore::list_groups. May
@@ -359,8 +378,8 @@ public:
     void register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn perm_fn,
                          GuaranteedStateStore* store, FleetFn fleet_fn, AuditFn audit_fn,
                          DispatchFn dispatch_fn = {}, ResponsesFn responses_fn = {},
-                         PerfFn perf_fn = {}, ScopedPermFn scoped_perm_fn = {},
-                         VisibleSetFn visible_set_fn = {}, AppPerfProviders app_perf_providers = {},
+                         ScopedPermFn scoped_perm_fn = {},
+                         VisibleSetFn visible_set_fn = {}, DexPerfApiPtr dex_perf_api = {},
                          GroupListFn group_list_fn = {}, FleetReadFn fleet_read_fn = {});
 
     /// HttpRouteSink overload — same registration against the polymorphic seam so
@@ -369,8 +388,8 @@ public:
     void register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_fn,
                          GuaranteedStateStore* store, FleetFn fleet_fn, AuditFn audit_fn,
                          DispatchFn dispatch_fn = {}, ResponsesFn responses_fn = {},
-                         PerfFn perf_fn = {}, ScopedPermFn scoped_perm_fn = {},
-                         VisibleSetFn visible_set_fn = {}, AppPerfProviders app_perf_providers = {},
+                         ScopedPermFn scoped_perm_fn = {},
+                         VisibleSetFn visible_set_fn = {}, DexPerfApiPtr dex_perf_api = {},
                          GroupListFn group_list_fn = {}, FleetReadFn fleet_read_fn = {});
 
 private:
@@ -401,8 +420,7 @@ private:
     AuditFn audit_fn_;
     DispatchFn dispatch_fn_;
     ResponsesFn responses_fn_;
-    PerfFn perf_fn_;
-    AppPerfProviders app_perf_providers_;
+    DexPerfApiPtr dex_perf_api_;
     GroupListFn group_list_fn_;
     FleetReadFn fleet_read_fn_;
 };

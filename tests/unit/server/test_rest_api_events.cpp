@@ -225,7 +225,6 @@ struct RestEventsHarness {
                             /*scoped_perm_fn=*/{},
                             /*software_inventory_store=*/nullptr,
                             /*response_scope_fn=*/{},
-                            /*app_perf_providers=*/{},
                             /*engine_principal_store=*/nullptr,
                             /*access_review_store=*/nullptr, /*auth_db=*/nullptr,
                             /*directory_sync=*/nullptr, stream_budget,

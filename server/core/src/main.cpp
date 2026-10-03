@@ -8,11 +8,14 @@
 
 #include "gateway_mgmt_stub_pool.hpp" // parse_gateway_cluster_addrs
 #include "gateway_service_impl.hpp"   // detail::kMaxClusterIdLen
+#include "guardian_ingest.hpp"        // detail::create_t_server_logger / set_t_server_logger (#4666 PR-4)
 #include "insecure_tls_gate.hpp"
 #include "kek_rotate_control.hpp" // detail::kKekMaxLiveVersionsDefault / kek_ceiling_is_risk_acceptance
 #include "key_provider.hpp"
+#include "pg/multi_host_dsn.hpp" // HA WS-8: multi-host DSN must use target_session_attrs=read-write
 #include "pg/pg_pool.hpp"
 #include "pg/secret_codec.hpp"
+#include "rbac_store.hpp" // fresh-start Administrator bootstrap (RbacStore::provision_first_admin)
 #include "scim_routes.hpp"
 #include "security_headers.hpp"
 #include "sso_boot_guard.hpp" // sso_only_boot_guard_ok / *_config_complete (CC6.3)
@@ -20,6 +23,7 @@
 #include <CLI/CLI.hpp>
 
 #include "server_ota_options.hpp"
+#include "shutdown_drain_rules.hpp" // HA WS-8: --shutdown-drain-seconds bound
 #include "stream_budget.hpp" // detail::kMaxHttpWorkerThreads (pool ceiling)
 #include "web_utils.hpp"     // normalise_trusted_origins (#2537 CSRF allowlist)
 #include <spdlog/sinks/rotating_file_sink.h>
@@ -328,6 +332,14 @@ int main(int argc, char* argv[]) {
         ->default_val(16)
         ->check(CLI::PositiveNumber)
         ->envname("YUZU_POSTGRES_POOL_SIZE");
+    app.add_option("--shutdown-drain-seconds", cfg.shutdown_drain_seconds,
+                   "On shutdown, keep serving for at least this many seconds after /readyz "
+                   "starts answering 503, so a load balancer stops routing here before the "
+                   "listener closes (default 0; 0-60). Set it to at least the load balancer's "
+                   "health-check interval x unhealthy threshold, plus one interval.")
+        ->default_val(0)
+        ->check(CLI::Range(0, yuzu::server::shutdown_drain::kMaxShutdownDrainSeconds))
+        ->envname("YUZU_SHUTDOWN_DRAIN_SECONDS");
     app.add_option("--listen", cfg.listen_address, "Agent gRPC address (host:port)")
         ->default_val("0.0.0.0:50051")
         ->envname("YUZU_LISTEN_ADDRESS");
@@ -1083,13 +1095,19 @@ int main(int argc, char* argv[]) {
     // through without re-prompting. The helper itself doesn't log on
     // every skip (too noisy), so we surface it once at startup so the
     // operator sees the disabled state in journald and an auditor
-    // reading the boot log can spot a misconfigured deployment.
+    // reading the boot log can spot a misconfigured deployment. The JIT
+    // elevation handlers are the exception: AuthRoutes substitutes a 300 s window
+    // for them when this flag is <= 0 (auth_routes.cpp, kElevationStepUpWindow),
+    // so they keep prompting and keep emitting their audit rows.
     if (cfg.mfa_step_up_window_secs <= 0) {
         spdlog::warn(
-            "--mfa-step-up-window-secs={} disables the MFA step-up gate entirely. High-risk "
-            "REST + Settings endpoints will NOT re-prompt for MFA proof. SOC 2 CC6.6 evidence "
-            "rows (`mfa.step_up.required`) will not be emitted. Set to a positive value "
-            "(default 300) to re-enable.",
+            "--mfa-step-up-window-secs={} disables the MFA step-up gate on every high-risk "
+            "REST + Settings endpoint except the JIT-elevation endpoints (POST /api/v1/elevate "
+            "and the elevation-eligibility routes), which still require an MFA-enrolled "
+            "caller's proof (local TOTP or IdP `amr`) to be no older than 300s. The "
+            "disabled endpoints will NOT re-prompt for MFA proof and emit no SOC 2 CC6.6 "
+            "`mfa.step_up.required` evidence rows. Set to a positive value (default 300) "
+            "to re-enable.",
             cfg.mfa_step_up_window_secs);
     }
 
@@ -1213,6 +1231,37 @@ int main(int argc, char* argv[]) {
         logger->set_level(spdlog::level::from_str(log_level));
         spdlog::set_default_logger(logger);
     }
+
+    // #4666 PR-4: dedicated bounded async logger for the Guardian T_server diagnostic line
+    // (guardian_ingest.cpp), so a stalled log sink can never block the gRPC ingest thread the
+    // same way the synchronous default logger above still can for every OTHER server log line.
+    // Built over COPIES of the (just-finalised) default logger's own sinks — owned shared_ptrs,
+    // so this stays valid even if the default logger is replaced later — which is also why its
+    // formatter/pattern need no separate wiring here: they reach this logger through those
+    // shared sinks once set_formatter()/set_pattern() run below. Registration is what needs to
+    // happen here, between the default-logger-set step above and the formatter/pattern calls
+    // below: it is what lets a runtime `--log-level` override reach this logger too (see
+    // guardian_ingest.hpp's own comment on create_t_server_logger() for why registration and
+    // formatting are NOT the same reason). Best-effort by construction — neither failure surface
+    // below (pool/thread construction, or a duplicate logger name on register_logger()) ever
+    // fails server boot; each just leaves the T_server line silently skipped.
+    try {
+        std::vector<spdlog::sink_ptr> t_server_sinks(spdlog::default_logger()->sinks());
+        if (auto t_server_logger = yuzu::server::detail::create_t_server_logger(
+                std::move(t_server_sinks), spdlog::level::from_str(log_level))) {
+            spdlog::register_logger(t_server_logger);
+            yuzu::server::detail::set_t_server_logger(std::move(t_server_logger));
+        }
+    } catch (const std::exception& e) {
+        spdlog::warn("Guardian T_server: failed to register dedicated async logger ({}); the "
+                     "T_server diagnostic line will be skipped until the next restart",
+                     e.what());
+    } catch (...) {
+        spdlog::warn("Guardian T_server: failed to register dedicated async logger (unknown "
+                     "exception); the T_server diagnostic line will be skipped until the next "
+                     "restart");
+    }
+
     if (log_format == "json") {
         spdlog::set_formatter(std::make_unique<yuzu::JsonLogFormatter>("server"));
     } else {
@@ -1220,6 +1269,29 @@ int main(int argc, char* argv[]) {
     }
 
     spdlog::info("Yuzu Server v{} ({})", yuzu::kFullVersionString, yuzu::kGitCommitHash);
+
+    // ── Multi-host Postgres DSN guard (HA WS-8) ──
+    // A multi-host DSN without target_session_attrs=read-write lets libpq put the
+    // pool's connections on a standby, and /readyz cannot see them all. Add
+    // read-write when the attribute is absent; refuse a weaker explicit value, and
+    // refuse load_balance_hosts. Done after logging is configured (so the line
+    // reaches --log-file and --log-format json) and before the auth bootstrap
+    // pool and Server::create, so every connection — both pools, the leader
+    // elector and the readiness probe — uses the same normalised DSN. See
+    // pg/multi_host_dsn.hpp.
+    if (auto guarded = yuzu::server::pg::enforce_multi_host_read_write(cfg.postgres_dsn);
+        guarded.has_value()) {
+        if (guarded->appended)
+            spdlog::warn("Postgres connection names {} hosts{} without target_session_attrs; "
+                         "using target_session_attrs=read-write so the server only connects to "
+                         "a writable primary (set it explicitly to silence this)",
+                         guarded->hosts,
+                         guarded->hosts_from_env ? " (from PGHOST/PGHOSTADDR)" : "");
+        cfg.postgres_dsn = std::move(guarded->dsn);
+    } else {
+        spdlog::critical("Invalid --postgres-dsn: {}", guarded.error());
+        return EXIT_FAILURE;
+    }
 
     // ── TLS cipher policy self-check (#4722) ─────────────────────────────────
     // Refuse to start rather than silently serve on an OpenSSL build where our
@@ -1291,6 +1363,30 @@ int main(int argc, char* argv[]) {
     auto cfg_path =
         config_file.empty() ? auth::default_config_path() : std::filesystem::path(config_file);
 
+    // Canonicalize to an absolute path up front (PR #5107 review finding). A
+    // bare relative `--config yuzu-server.cfg` left `cfg_path.parent_path()`
+    // empty; `Locations{data_dir, auth_config_path.parent_path()}` (server.cpp)
+    // then skipped the config-dir probe for the one-time legacy enrollment
+    // import entirely (WS-6 6.2) — the pre-6.2 code implicitly resolved that
+    // same empty parent against the CWD via plain path concatenation
+    // (`"" / "enrollment-tokens.cfg"`), so this is a silent regression, not a
+    // pre-existing gap: an operator's earlier approve/deny decisions could be
+    // dropped on upgrade with no import ever attempted, no error, and no
+    // log line. `default_config_path()` is always absolute; only an explicit
+    // relative `--config` can hit this. Absolutize before anything derives a
+    // directory from it (`load_config`, `first_run_setup`, `state_dir()`-style
+    // callers, the importer) rather than patching one consumer.
+    {
+        std::error_code ec;
+        auto absolute = std::filesystem::absolute(cfg_path, ec);
+        if (ec) {
+            spdlog::warn("Could not absolutize --config path '{}' ({}); using it as given",
+                         cfg_path.string(), ec.message());
+        } else {
+            cfg_path = std::move(absolute);
+        }
+    }
+
     auth::AuthManager auth_mgr;
     // Idle (inactivity) session timeout — SOC 2 CC6.3. In-memory feature, set
     // unconditionally (works with or without auth.db). 0 = disabled.
@@ -1322,11 +1418,14 @@ int main(int argc, char* argv[]) {
     //
     // main.cpp DOES still need its own short-lived AuthDB here, for two
     // reasons that both run BEFORE Server::create() exists to ask:
-    //   1. Fresh-start admin seeding (below) — auth.users is empty on a
+    //   1. Fresh-start admin bootstrap (below) — auth.users is empty on a
     //      brand-new Postgres database, so the config-file admin (loaded
-    //      into auth_mgr above) must be persisted once via
-    //      seed_admin_if_empty(), which is TOCTOU-free against a second
-    //      server instance racing first boot.
+    //      into auth_mgr above) must be persisted once, atomically with its
+    //      Administrator RBAC grant, via RbacStore::provision_first_admin()
+    //      (TOCTOU-free against a second server instance racing first
+    //      boot); AuthDB::seed_admin_if_empty() is NOT called here at all
+    //      (a redundant second no-op call was removed — see its own header
+    //      comment for why it stays exported regardless).
     //   2. The host-CLI one-shots (--mfa-reset / --break-glass-arm) and the
     //      --auth-mode=sso-only break-glass validation, all of which run
     //      (and may exit) before Server::create() is ever called.
@@ -1360,6 +1459,25 @@ int main(int argc, char* argv[]) {
                           auth_pg_pool->last_error());
             return EXIT_FAILURE;
         }
+        // HA WS-8: the multi-host guard above sees only the DSN and PG* env; a
+        // service file (service= / PGSERVICE) is applied by libpq at connect time.
+        // Check what libpq actually resolved on a live connection, and refuse to
+        // start on load_balance_hosts or a host list without read-write (Gate 8
+        // round 7). libpq re-reads a service file on every connect; the readiness
+        // probe repeats this check on each connection IT makes, so a later edit
+        // shows on /readyz only at the probe's next reconnect (contract residual
+        // (2), pg_reachability_probe.hpp) — restart the server after editing it.
+        {
+            auto lease = auth_pg_pool->acquire();
+            if (!lease) {
+                spdlog::error("Cannot connect to PostgreSQL to check the connection settings");
+                return EXIT_FAILURE;
+            }
+            if (auto ok = yuzu::server::pg::check_effective_connection(lease.get()); !ok) {
+                spdlog::critical("Invalid Postgres connection settings: {}", ok.error());
+                return EXIT_FAILURE;
+            }
+        }
         const std::filesystem::path key_dir =
             cfg.ca_dir.empty() ? yuzu::server::auth::default_cert_dir() : cfg.ca_dir;
         auth_key_provider.emplace(key_dir);
@@ -1387,11 +1505,22 @@ int main(int argc, char* argv[]) {
             }
         }
 
-        // Fresh-start seed (ADR-0006 cutover): seed the configured admin
-        // (loaded into auth_mgr above via load_config()/first_run_setup())
-        // iff auth.users is genuinely empty. A seed ERROR is FATAL — never
-        // warning-only (a boot that silently fails to seed leaves an
-        // operator locked out of a brand-new deployment with no diagnosis).
+        // Fresh-start bootstrap (RBAC-safe-by-default + ADR-0006 cutover):
+        // provision the configured admin's account, and a durable fleet-wide
+        // Administrator grant, iff auth.users is genuinely empty (a
+        // brand-new Postgres database), via `RbacStore::provision_first_admin`
+        // (`WHERE NOT EXISTS (SELECT 1 FROM auth.users)`, so it can only ever
+        // fire once — the account+grant land in ONE transaction so a crash
+        // between the two can never strand an account with no grant, and
+        // every later boot then sees a non-empty table and cleanly no-ops).
+        // `AuthDB::seed_admin_if_empty` is NOT called here — it would be a
+        // redundant second no-op by the time this runs (it stays exported
+        // for its own tests and API completeness; see its header doc
+        // comment). A bootstrap failure is FATAL — never warning-only (a
+        // boot that silently fails to provision leaves an operator locked
+        // out of a brand-new deployment with no diagnosis — and once RBAC
+        // defaults to enabled, with no route left able to authorize the fix
+        // either).
         const auto cfg_users = auth_mgr.list_users();
         const yuzu::server::auth::UserEntry* seed_user = nullptr;
         for (const auto& u : cfg_users) {
@@ -1401,31 +1530,148 @@ int main(int argc, char* argv[]) {
             }
         }
         if (!seed_user && !cfg_users.empty()) {
-            seed_user = &cfg_users.front();
+            // A non-admin-role config entry must never be silently promoted
+            // to Administrator (this used to fall back to cfg_users.front()
+            // and provision whatever the first entry was). The interactive
+            // first_run_setup flow (auth.cpp) always creates the admin
+            // account with Role::admin explicitly, so this is reachable
+            // only via a hand-edited config file — but it must still fail
+            // loudly here, not silently provision the wrong identity as the
+            // fleet's first Administrator.
+            //
+            // Deliberately unconditional — this refusal fires on EVERY boot
+            // that reaches this shape, including a database that already
+            // has admins and where nothing would actually be provisioned
+            // (seed_user's only use is passing an identity to
+            // provision_first_admin below, which no-ops harmlessly on a
+            // non-empty auth.users regardless). Gating the refusal on
+            // auth.users emptiness would need a new read before this point;
+            // kept simple and fail-loud instead — an operator who hand-edits
+            // config to remove the admin-role entry (e.g. moving fully to
+            // SSO) gets a clear, immediately recoverable boot error rather
+            // than a config file that quietly stops doing what it used to
+            // do. SEE docs/user-manual/server-admin.md "Upgrade Notes" for
+            // the operator-facing version of this paragraph — this fires on
+            // an EXISTING deployment's next restart too, not only first
+            // boot, if its config carries this shape.
+            spdlog::error(
+                "Fatal: the loaded config lists {} local user(s) but none has role=admin; "
+                "refusing to provision a non-admin account as Administrator. Fix: either mark "
+                "one config entry role=admin, or (if this fleet is SSO-only) remove all local "
+                "user entries from the config so this check is skipped entirely.",
+                cfg_users.size());
+            return EXIT_FAILURE;
         }
         if (seed_user != nullptr) {
-            auto seeded = auth_db->seed_admin_if_empty(seed_user->username, seed_user->hash_hex,
-                                                        seed_user->salt_hex);
-            if (!seeded) {
+            // Short-lived, scoped to this block only — never referenced
+            // again below, so a plain local destructs it (default dtor, no
+            // background thread) well before auth_pg_pool.reset() further
+            // down; no explicit teardown needed. Constructing a second,
+            // independent RbacStore/PgPool pairing here is safe for the
+            // same reason the comment above auth_pg_pool.emplace() gives for
+            // AuthDB: schema migration and default-seeding are idempotent —
+            // ServerImpl's own RbacStore, built moments later against the
+            // same database, just re-verifies an already-migrated schema.
+            yuzu::server::RbacStore bootstrap_rbac_store(*auth_pg_pool);
+            if (!bootstrap_rbac_store.is_open()) {
                 spdlog::error(
-                    "Fatal: failed to seed the admin user into the Postgres auth store "
-                    "(error={}) — refusing to start rather than boot into an unusable auth "
-                    "store.",
-                    static_cast<int>(seeded.error()));
+                    "Fatal: failed to open the Postgres RBAC store for the fresh-start "
+                    "Administrator bootstrap — refusing to start rather than boot into an "
+                    "unusable authorization substrate.");
                 return EXIT_FAILURE;
             }
-            if (*seeded) {
+
+            // Audit pre-flight (compliance Gate 6 finding, governance round
+            // 2026-09-28): mirrors --mfa-reset/--break-glass-arm's own
+            // "audit is MANDATORY" posture (main.cpp's open_one_shot_audit,
+            // above) — verify the audit store is WRITABLE *before* minting
+            // the fleet's single most privileged account, so a durable
+            // record of this event is never silently impossible. This is
+            // the ONE case where log-and-continue (used below, after the
+            // mutation commits) would be wrong: WHERE NOT EXISTS guarantees
+            // provision_first_admin never gets a second chance to try, so an
+            // audit-store outage at exactly this boot would otherwise
+            // PERMANENTLY forfeit the evidence row for the one event that
+            // most needs one.
+            //
+            // Known residual, deliberately not chased further here (Gate 5
+            // chaos finding): if the account+grant commit succeeds
+            // server-side but the client never observes the COMMIT ack
+            // (network fault between PG processing COMMIT and the reply),
+            // provision_first_admin returns ok=false and this whole block
+            // never reaches the post-write audit call below — yet the
+            // mutation is live. A restart then sees a non-empty table and
+            // cleanly no-ops, so the account+grant are safe, but that one
+            // narrow window can still lose the audit row despite the
+            // pre-flight passing. Accepted: closing it needs either a
+            // same-transaction audit write (AuditStore::log() always
+            // self-acquires its own lease, no connection-scoped write API
+            // exists to fold into provision_first_admin's transaction) or a
+            // durable pre-commit marker, both disproportionate to this
+            // narrow, self-healing-for-the-mutation residual.
+            auto audit = open_one_shot_audit(
+                *auth_pg_pool, cfg.audit_retention_days, "fresh-start bootstrap",
+                "provision the fleet's first Administrator",
+                " Check --postgres-dsn reachability and retry.");
+            if (!audit)
+                return EXIT_FAILURE;
+
+            auto provisioned = bootstrap_rbac_store.provision_first_admin(
+                seed_user->username, seed_user->hash_hex, seed_user->salt_hex);
+            if (!provisioned) {
+                spdlog::error(
+                    "Fatal: failed to provision the first Administrator grant into the "
+                    "Postgres RBAC store (error={}) — refusing to start rather than boot into "
+                    "an unusable authorization substrate.",
+                    provisioned.error());
+                return EXIT_FAILURE;
+            }
+            if (*provisioned) {
                 spdlog::warn(
-                    "AUTH DATA RESET ON POSTGRES CUTOVER — admin user '{}' was re-seeded into "
-                    "the Postgres auth store because it was empty. Any prior local accounts, "
-                    "roles, and MFA enrollments (from a legacy auth.db / a different Postgres "
-                    "database) are GONE. This warning is logged once, only when a seed actually "
-                    "occurs.",
+                    "RBAC BOOTSTRAP — admin user '{}' was provisioned into the Postgres auth "
+                    "store (it was empty) and granted a durable fleet-wide Administrator role. "
+                    "This warning is logged once, only when a fresh-start provision actually "
+                    "occurs. If this database previously held a legacy SQLite auth.db or a "
+                    "different Postgres database's auth data, that prior data is NOT migrated "
+                    "and is gone — see docs/auth-architecture.md \"fresh-start cutover\" if that "
+                    "applies to this deployment.",
                     seed_user->username);
                 // Threaded into ServerImpl via Config (metrics_ doesn't exist
                 // yet at this point — Server::create() hasn't run) — see
                 // Config::auth_fresh_start_seeded doc comment.
                 cfg.auth_fresh_start_seeded = true;
+
+                const std::string os_user = resolve_os_principal();
+                yuzu::server::AuditEvent ev;
+                ev.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
+                                   std::chrono::system_clock::now().time_since_epoch())
+                                   .count();
+                ev.principal = "system";
+                ev.principal_role = "system";
+                ev.action = "rbac.bootstrap.first_admin";
+                ev.target_type = "User";
+                ev.target_id = seed_user->username;
+                ev.result = "success";
+                ev.detail = std::format(
+                    "reason=fresh_install_bootstrap account+Administrator grant provisioned "
+                    "atomically at boot (os_identity={})",
+                    os_user);
+                if (!audit->log(ev)) {
+                    // The pre-flight passed but the write itself failed
+                    // (e.g. disk filled between the check and the write) —
+                    // a narrow TOCTOU, not the ack-loss residual documented
+                    // above. The mutation already committed and is
+                    // non-retriable (WHERE NOT EXISTS), so failing boot here
+                    // would strand an otherwise-healthy install for no
+                    // benefit — log-and-continue, loudly, distinctly (no
+                    // Prometheus counter exists this early in boot to carry
+                    // this signal — the log line IS the only one).
+                    spdlog::error(
+                        "RBAC BOOTSTRAP: admin '{}' was provisioned but the audit row failed to "
+                        "persist — record this bootstrap event manually in your change-"
+                        "management system NOW.",
+                        seed_user->username);
+                }
             }
         }
     }
@@ -1462,12 +1708,6 @@ int main(int argc, char* argv[]) {
             }
         }
         std::filesystem::remove(probe, ec); // best-effort cleanup
-
-        auth_mgr.set_data_dir(cfg.data_dir);
-        // Re-load tokens and pending agents from the new data directory.
-        // The initial load_config() loaded them from cfg_path_ parent (the old
-        // location) because set_data_dir() hadn't been called yet.
-        auth_mgr.reload_state();
 
         spdlog::info("Data directory: {}", cfg.data_dir.string());
     }
@@ -1681,11 +1921,104 @@ int main(int argc, char* argv[]) {
     // -- Batch token generation mode (exits without starting server) ----------
 
     if (generate_tokens > 0) {
-        auto ttl = gen_ttl_hours > 0 ? std::chrono::seconds(gen_ttl_hours * 3600)
-                                     : std::chrono::seconds(0);
+        // int64 cast: gen_ttl_hours * 3600 can overflow a 32-bit int for a
+        // maliciously/accidentally huge --token-ttl-hours (signed overflow is UB,
+        // not just wrong) — same class of fix as settings_routes.cpp's enrollment
+        // handlers (WS-6 6.2 commit 4). AuthDB::create_token rejects an
+        // out-of-bounds ttl regardless (kMaxEnrollmentTtlSeconds), so this is
+        // belt-and-braces, not a behaviour change for any realistic value.
+        auto ttl = gen_ttl_hours > 0
+                       ? std::chrono::seconds(static_cast<std::int64_t>(gen_ttl_hours) * 3600)
+                       : std::chrono::seconds(0);
 
-        auto tokens =
-            auth_mgr.create_enrollment_tokens_batch(gen_label, generate_tokens, gen_max_uses, ttl);
+        // WS-6 6.2: tokens live in Postgres (shared by every replica), so mint
+        // through the same auth store the server uses. No auth store => fail
+        // closed, like --mfa-reset (a token minted to a per-host file would be
+        // invisible to the running server).
+        if (!auth_db) {
+            spdlog::error("--generate-tokens requires the Postgres auth store; --postgres-dsn is "
+                          "not configured (or could not be opened above).");
+            std::cerr << "error: auth store unavailable\n";
+            return EXIT_FAILURE;
+        }
+        // A privileged mint with no audit trail (PR #5107 review, Should-fix):
+        // the merge-base --generate-tokens path was equally unaudited, so this
+        // doesn't regress prior behaviour, but this block was rewritten in this
+        // PR and open_one_shot_audit is 200 lines away, so fix it here rather
+        // than file a follow-up. Verify the audit store is WRITABLE before
+        // minting anything — same fail-closed posture as --mfa-reset — rather
+        // than minting first and discovering the store is dead afterward.
+        auto audit = open_one_shot_audit(*auth_pg_pool, cfg.audit_retention_days,
+                                         "--generate-tokens", "mint enrollment tokens");
+        if (!audit)
+            return EXIT_FAILURE;
+        const std::string created_by = "cli:" + resolve_os_principal();
+        std::vector<std::string> tokens;
+        std::vector<std::string> token_ids;
+        tokens.reserve(static_cast<size_t>(generate_tokens));
+        token_ids.reserve(static_cast<size_t>(generate_tokens));
+        for (int i = 0; i < generate_tokens; ++i) {
+            const auto label = gen_label.empty() ? std::format("batch-{}", i + 1)
+                                                 : std::format("{}-{}", gen_label, i + 1);
+            auto created = auth_db->create_token(label, gen_max_uses, ttl, created_by);
+            if (!created) {
+                spdlog::error("--generate-tokens: token {} of {} failed to persist ({} minted "
+                              "before the failure remain valid; revoke via the dashboard)",
+                              i + 1, generate_tokens, tokens.size());
+                std::cerr << "error: enrollment token could not be persisted\n";
+                return EXIT_FAILURE;
+            }
+            token_ids.push_back(created->token_id);
+            tokens.push_back(std::move(created->raw_token));
+        }
+        spdlog::info("Batch created {} enrollment tokens (prefix='{}')", tokens.size(), gen_label);
+
+        // One batch audit event, never the raw tokens — only the 8-hex ids
+        // (same `count=N ids=<first 20>` shape settings_routes.cpp's REST twin
+        // uses; capped so a huge --generate-tokens count can't bloat one row).
+        // Same action name as the REST/dashboard batch-create path
+        // (enrollment.bulk_token_create) — one action per semantic operation,
+        // regardless of which entry point minted it.
+        {
+            constexpr std::size_t kMaxListed = 20;
+            std::string detail = "by=" + created_by + " max_uses=" + std::to_string(gen_max_uses) +
+                                 " count=" + std::to_string(token_ids.size());
+            if (!token_ids.empty()) {
+                detail += " ids=";
+                for (std::size_t i = 0; i < token_ids.size() && i < kMaxListed; ++i) {
+                    if (i)
+                        detail += ',';
+                    detail += token_ids[i];
+                }
+                if (token_ids.size() > kMaxListed)
+                    detail += ",...";
+            }
+            yuzu::server::AuditEvent ev;
+            ev.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
+                               std::chrono::system_clock::now().time_since_epoch())
+                               .count();
+            ev.principal = created_by;
+            ev.principal_role = "cli";
+            ev.action = "enrollment.bulk_token_create";
+            ev.target_type = "EnrollmentToken";
+            ev.target_id = "";
+            ev.result = "success";
+            ev.detail = detail;
+            if (!audit->log(ev)) {
+                // The tokens already persisted and their raw values may already
+                // be about to reach stdout — matching --mfa-reset's H-1
+                // posture, fail loudly and non-zero so the operator/automation
+                // knows the evidence row is missing, rather than silently
+                // shipping unaudited credentials.
+                spdlog::error("--generate-tokens: {} token(s) minted but the audit row failed to "
+                              "persist — record this batch manually in your change-management "
+                              "system NOW",
+                              tokens.size());
+                std::cerr << "error: tokens minted but audit row failed to persist; record this "
+                             "batch manually\n";
+                return EXIT_FAILURE;
+            }
+        }
 
         // Output JSON to stdout for scripting (Ansible, etc.)
         std::cout << "{\"count\":" << tokens.size() << ",\"tokens\":[\n";

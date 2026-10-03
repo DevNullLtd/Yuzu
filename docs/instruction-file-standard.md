@@ -4,7 +4,7 @@ How to decide **where a rule belongs** — and why the answer is usually "not in
 
 ## Why this exists
 
-Five files load into every agent session before any work starts:
+Six files load into every agent session before any work starts:
 
 | File | Read by | Budget | Hard cap |
 |---|---|---|---|
@@ -13,14 +13,22 @@ Five files load into every agent session before any work starts:
 | `.claude/routed-concerns.md` | Claude (`@`-imported by CLAUDE.md) | 40,000 | 48,000 |
 | `.claude/routed-concerns-access-control.md` | Claude (`@`-imported by CLAUDE.md) | 40,000 | 48,000 |
 | `.claude/routed-concerns-security-posture.md` | Claude (`@`-imported by CLAUDE.md) | 40,000 | 48,000 |
+| `.claude/routed-concerns-software-estate.md` | Claude (`@`-imported by CLAUDE.md) | 40,000 | 48,000 |
 
 Every character in them is paid on every session, whether or not the work touches that subject. A
 `docs/` file costs nothing until something reads it.
 
-This ceiling has been hit three times. #2147 closed the first (44.6k → 23.1k, by moving the
+This ceiling has been hit four times. #2147 closed the first (44.6k → 23.1k, by moving the
 routed-concerns table into an `@`-imported file). The second was found at **39,996 of 40,000 bytes —
-four bytes free** — and split the table again. Both fixes were splits. **Splitting is now exhausted:
-another file adds no capacity, and the total context cost is unchanged by splitting anyway.** (Wave 8 nonetheless added `.claude/routed-concerns-security-posture.md` as a third table file, so the security-posture plugin rows land there and `routed-concerns.md` gains none — a stopgap, not a new capacity.)
+four bytes free** — and split the table again. **Splitting is now exhausted: another file adds no
+capacity, and the total context cost is unchanged by splitting anyway.** Two more splits landed
+regardless, independently and around the same time: Wave 8 added `routed-concerns-security-posture.md`
+(a third table file, so the security-posture plugin rows land there and `routed-concerns.md` gains
+none) and Wave 10 P2a-3 added `routed-concerns-software-estate.md` (a fourth, for a Forensics/
+per-user-software-data row that would not fit the remaining headroom either) — both stopgaps, not
+new capacity. **A further split needs its own justification: each split buys headroom but leaves
+the total context cost across all always-loaded files unchanged, so it is a deferral, not a fix,
+and each new file is itself a fixed cost paid by every session.**
 
 The failure was never a single bad commit. It was ~235 characters a day of individually reasonable
 additions, each one cheaper to put in CLAUDE.md than to route properly.

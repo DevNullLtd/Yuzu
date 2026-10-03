@@ -4,8 +4,8 @@ and the instruction-file standard (docs/instruction-file-standard.md).
 
 Invariants that must hold on every platform:
 
-1. The five ALWAYS-LOADED instruction files -- CLAUDE.md, AGENTS.md, and the
-   three routed-concern tables CLAUDE.md @-imports -- each stay under a 40,000
+1. The six ALWAYS-LOADED instruction files -- CLAUDE.md, AGENTS.md, and the
+   four routed-concern tables CLAUDE.md @-imports -- each stay under a 40,000
    character budget, behind the 48,000 hard cap. Counted UTF-8-decoded in
    Python deliberately: these files are dense with multi-byte punctuation, so
    byte counts (`wc -c`, and `wc -m` on Windows Git Bash, which degrades to
@@ -18,7 +18,7 @@ Invariants that must hold on every platform:
    routed-concern tables had independently reached 38,545 and 37,808 while
    AGENTS.md sat 25% over a cap nothing applied to it.
 
-   Also enforced on those five files:
+   Also enforced on those six files:
      - EXPIRES: markers -- a temporary section whose date has passed fails the
        build. A workstreams block outlived its stated window by four weeks,
        with its own teardown procedure already written, because nothing checked.
@@ -63,11 +63,11 @@ CLAUDE_MD_CHAR_CAP = 48_000
 INSTRUCTION_FILE_BUDGET = 40_000
 
 # Every file here loads into an agent session before any work starts: CLAUDE.md
-# and AGENTS.md directly, the three routed-concern tables via CLAUDE.md's
+# and AGENTS.md directly, the four routed-concern tables via CLAUDE.md's
 # @-imports. Only CLAUDE.md was measured before; the routed-concern tables had
 # reached 38,545 and 37,808 unmeasured, and AGENTS.md 49,859 -- already 25% over
 # the cap nothing was applying to it.
-# The three routed-concern tables, checked for column structure as well as size.
+# The four routed-concern tables, checked for column structure as well as size.
 # A cell containing an unescaped "|" silently shifts every column to its right,
 # which is how a CATASTROPHIC row's "Loaded by" agent list was once overwritten
 # by a copy of its own "Doc" column -- leaving a credential-revocation surface
@@ -76,6 +76,7 @@ ROUTED_CONCERN_FILES = (
     ".claude/routed-concerns.md",
     ".claude/routed-concerns-access-control.md",
     ".claude/routed-concerns-security-posture.md",
+    ".claude/routed-concerns-software-estate.md",
 )
 
 INSTRUCTION_FILES = (
@@ -84,6 +85,7 @@ INSTRUCTION_FILES = (
     ".claude/routed-concerns.md",
     ".claude/routed-concerns-access-control.md",
     ".claude/routed-concerns-security-posture.md",
+    ".claude/routed-concerns-software-estate.md",
 )
 
 # <!-- EXPIRES: YYYY-MM-DD owner:@who -->

@@ -299,12 +299,16 @@ rollup_by_rule(const std::vector<yuzu::server::GuardianAgentRuleStatus>& rows,
 //    exclusion, used by all 3 synthetic-notimpl fold sites in this file ──────
 
 // Composite key for one (agent, rule) pair. A real struct + hash functor, NOT a
-// delimiter-joined string: neither agent_id nor rule_id has a charset restriction
-// that would make a separator byte unambiguous. agent_id is client-supplied at
-// Register (length-checked only, agent_service_impl.cpp) and rule_id is
-// operator free text on the REST create path (no shape validation,
-// rest_api_v1.cpp) — governance Gate 2/3/6 independently confirmed a crafted
-// "\x1f"-containing agent_id or rule_id collided the prior delimited-string key
+// delimiter-joined string — and its correctness never leans on either field's
+// charset, which is why it stays correct even though only one of the two now
+// carries a guarantee: agent_id is client-supplied at Register (length-checked
+// only, agent_service_impl.cpp), still charset-unrestricted; rule_id created
+// via REST/MCP now IS charset-restricted (is_valid_rule_id, #4665), but a
+// rule_id predating that check, or one reaching this struct via any other,
+// non-charset-checked path, is not guaranteed charset-safe either — a
+// delimiter would still be ambiguous for either field. Governance Gate 2/3/6
+// independently confirmed a crafted "\x1f"-containing agent_id or rule_id
+// collided the prior delimited-string key
 // (`agentA\x1fextra` + `ruleX` == `agentA` + `extra\x1fruleX`), silently
 // dropping a real status row from every fold. A struct key has no delimiter to
 // collide on, for any byte content, by construction — this is the fix, not a
@@ -425,17 +429,21 @@ void note_platform_matrix_stale(yuzu::MetricsRegistry* metrics, std::string_view
             .increment();
     const std::uint64_t n = g_matrix_stale_count.fetch_add(1, std::memory_order_relaxed) + 1;
     if (n % kMatrixStaleLogSample == 1)
-        // log_safe (web_utils.hpp): agent_id/rule_id are operator/agent-controlled with
-        // no charset restriction (the same fact that motivated PairStatusKey above) —
-        // interpolating them raw would let a crafted id forge a fake multi-line log
-        // entry (e.g. an embedded '\n'). Neutralise control bytes before they reach the
-        // format string, same as every other log/audit site in this codebase that
-        // touches untrusted identifiers.
+        // #4665 governance-external-review finding (fjarvis, PR #4979): this line is
+        // "agent={} rule={} spark_type={}" -- a k=v k=v shape, so the threat here is
+        // not just a forged extra PHYSICAL line (log_safe's control-byte-only fold
+        // closes that much) but a forged ADJACENT FIELD on this same line via a
+        // space or '=' in an operator/agent-controlled value (e.g. a crafted
+        // rule_id like "x result=success"). audit_token (web_utils.hpp, forwards to
+        // yuzu::log_token) folds space/'='/',' too -- the correct neutraliser for a
+        // k=v-shaped line, not log_safe, which this site used before this fix and
+        // which the #4665 tripwire's own allowlist of "log_safe(" as safe made
+        // invisible to the regression net. Do not revert to log_safe here.
         spdlog::info("guardian: platform support-matrix stale vs. agent-observed reality — "
                      "agent={} rule={} spark_type={} (metric_label={}) already reports real "
                      "status; suppressed a synthetic not-implemented double-count (occurrence {})",
-                     log_safe(std::string(agent_id)), log_safe(std::string(rule_id)),
-                     spark_type.empty() ? "<empty>" : log_safe(std::string(spark_type)),
+                     audit_token(agent_id), audit_token(rule_id),
+                     spark_type.empty() ? "<empty>" : audit_token(spark_type),
                      label, n);
 }
 

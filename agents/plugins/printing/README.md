@@ -189,5 +189,4 @@ job|ipp://localhost:631/printers/yuzu_test|1|-|-|pending|2026-09-14T17:27:40Z|10
 - Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_printing.hpp`
 - Tests: `tests/unit/server/test_printing_clear_queue_gate.cpp` · `tests/unit/test_printing_local_dispatcher.cpp` · `tests/unit/test_printing_parsers.cpp`
 - Privilege row: `docs/agent-privilege-model.md`
-- Changelog: `changelog.d/wave9-pr91b-printing.added.md` · `changelog.d/wave9-pr91b2-printing-clear-queue.added.md`
 <!-- END GENERATED -->

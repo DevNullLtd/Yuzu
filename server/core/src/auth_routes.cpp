@@ -717,49 +717,15 @@ bool AuthRoutes::require_permission(const httplib::Request& req, httplib::Respon
     // fall through to the standard RBAC/role check using the creator's actual role.
     // The tier is the primary MCP access control boundary; RBAC is a secondary layer.
     // Tier enforcement applies on all transports (MCP JSON-RPC and REST API) so
-    // a token cannot bypass the tier by switching endpoints.
-    if (!session->mcp_tier.empty()) {
-        if (!mcp::tier_allows(session->mcp_tier, securable_type, operation)) {
-            audit_log(req, "auth.permission_required", "denied", "", "",
-                      "MCP token tier '" + session->mcp_tier + "' does not allow " +
-                          securable_type + ":" + operation);
-            res.status = 403;
-            // A4 unified envelope (#1470) — the kPermissionDenied specialisation
-            // names the missing grant in the structured `permission` field.
-            const std::string perm = securable_type + ":" + operation;
-            res.set_content(
-                detail::a4_denial(res, 403, "MCP token tier does not allow " + perm,
-                                  detail::A4ErrorOpts{.permission = perm}),
-                "application/json");
-            return false;
-        }
-        // Approval-gated operations (supervised tier on destructive ops).
-        // On the MCP JSON-RPC transport (`/mcp/v1/`) the C8 gate in
-        // mcp_server.cpp is the AUTHORITATIVE approval gate: it mints a ticket,
-        // and on a recall it verifies + consumes a valid approval before the
-        // per-tool handler ever calls this function (#289 ticket-then-recall).
-        // Re-denying here would break that recall (consume-then-deny) — so skip
-        // it on the MCP endpoint. Keep the denial for EVERY OTHER transport: a
-        // REST route hit by an MCP token must not bypass the ticket flow (#520).
-        if (req.path != "/mcp/v1/" &&
-            mcp::requires_approval(session->mcp_tier, securable_type, operation)) {
-            audit_log(req, "auth.approval_required", "denied", "", "",
-                      "MCP token tier '" + session->mcp_tier + "' requires approval for " +
-                          securable_type + ":" + operation + " on a non-MCP transport");
-            res.status = 403;
-            const std::string perm = securable_type + ":" + operation;
-            res.set_content(
-                detail::a4_denial(
-                    res, 403,
-                    "operation requires approval for this MCP tier on this transport",
-                    detail::A4ErrorOpts{.remediation = "this operation is approval-gated for the "
-                                               "supervised MCP tier; use the MCP ticket-then-recall "
-                                               "flow (POST /mcp/v1/) or the dashboard",
-                                .permission = perm}),
-                "application/json");
-            return false;
-        }
-    }
+    // a token cannot bypass the tier by switching endpoints. Extracted to
+    // `require_tier_policy` (#5047) so a non-RBAC-gated route (e.g. the
+    // result-set write routes, owner-scoped only) can apply the SAME belt.
+    // true: this path is RBAC-gated (the caller reached here via
+    // require_permission), so holding securable_type:operation WOULD admit
+    // the caller -- naming it in a denial is accurate, not a false claim.
+    if (!require_tier_policy(req, res, *session, securable_type, operation,
+                             /*actionable_permission=*/true))
+        return false;
 
     // Service-scoped tokens (PR 3 — the flip, #2298 durable fix): ITServiceOwner
     // remains the AUTHORITY CEILING (a service token can never exceed what that
@@ -900,6 +866,89 @@ bool AuthRoutes::require_permission(const httplib::Request& req, httplib::Respon
         return false;
     }
     return true;
+}
+
+bool AuthRoutes::require_tier_policy(const httplib::Request& req, httplib::Response& res,
+                                     const auth::Session& session,
+                                     const std::string& securable_type,
+                                     const std::string& operation,
+                                     bool actionable_permission) {
+    if (session.mcp_tier.empty())
+        return true; // Not an MCP token — nothing this belt enforces (#4309).
+
+    if (!mcp::tier_allows(session.mcp_tier, securable_type, operation)) {
+        audit_log(req, "auth.permission_required", "denied", "", "",
+                  "MCP token tier '" + session.mcp_tier + "' does not allow " + securable_type +
+                      ":" + operation);
+        res.status = 403;
+        // A4 unified envelope (#1470) — the kPermissionDenied specialisation
+        // names the missing grant in the structured `permission` field, but
+        // ONLY when holding it would actually admit the caller (clause 5,
+        // docs/auth-architecture.md) — a gate-less caller (actionable_permission
+        // == false) gets the message without the field, since no RBAC grant
+        // here would self-remediate the denial. That caller instead gets a
+        // `.remediation` string naming the actual fix (a higher MCP tier),
+        // so the response isn't just "not X" with no next step (#5047
+        // governance fix round — an integration hitting this cold otherwise
+        // has nothing but the bare label to go on).
+        const std::string perm = securable_type + ":" + operation;
+        // Named local, not a temporary embedded in the initializer below —
+        // same reasoning as `perm` itself: its lifetime must cover the
+        // synchronous `a4_denial` call this same statement makes.
+        const std::string gateless_remediation =
+            "this operation requires a higher MCP token tier; " + perm +
+            " is a tier-bucketing label here, not an RBAC grant, and cannot be requested or "
+            "self-remediated";
+        res.set_content(
+            detail::a4_denial(
+                res, 403, "MCP token tier does not allow " + perm,
+                actionable_permission
+                    ? detail::A4ErrorOpts{.permission = perm}
+                    : detail::A4ErrorOpts{.remediation = gateless_remediation}),
+            "application/json");
+        return false;
+    }
+    // Approval-gated operations (supervised tier on destructive ops).
+    // On the MCP JSON-RPC transport (`/mcp/v1/`) the C8 gate in mcp_server.cpp
+    // is the AUTHORITATIVE approval gate: it mints a ticket, and on a recall
+    // it verifies + consumes a valid approval before the per-tool handler
+    // ever calls this function (#289 ticket-then-recall). Re-denying here
+    // would break that recall (consume-then-deny) — so skip it on the MCP
+    // endpoint. Keep the denial for EVERY OTHER transport: a REST route hit
+    // by an MCP token must not bypass the ticket flow (#520).
+    if (req.path != "/mcp/v1/" && mcp::requires_approval(session.mcp_tier, securable_type, operation)) {
+        audit_log(req, "auth.approval_required", "denied", "", "",
+                  "MCP token tier '" + session.mcp_tier + "' requires approval for " +
+                      securable_type + ":" + operation + " on a non-MCP transport");
+        res.status = 403;
+        const std::string perm = securable_type + ":" + operation;
+        // Same clause-5 rule as the tier_allows() denial above — omit
+        // `.permission` for a gate-less caller (actionable_permission ==
+        // false), keep `.remediation` unconditionally (it correctly steers to
+        // the ticket-then-recall flow regardless of whether an RBAC grant
+        // would separately admit the caller).
+        res.set_content(
+            detail::a4_denial(
+                res, 403, "operation requires approval for this MCP tier on this transport",
+                detail::A4ErrorOpts{.remediation = "this operation is approval-gated "
+                                             "for the supervised MCP tier; use the MCP "
+                                             "ticket-then-recall flow (POST /mcp/v1/) or "
+                                             "the dashboard",
+                            .permission = actionable_permission ? std::string_view(perm)
+                                                                : std::string_view{}}),
+            "application/json");
+        return false;
+    }
+    return true;
+}
+
+TierPolicyFn AuthRoutes::gateless_tier_policy_fn() {
+    return [this](const httplib::Request& req, httplib::Response& res,
+                  const auth::Session& session, const std::string& securable_type,
+                  const std::string& operation) -> bool {
+        return require_tier_policy(req, res, session, securable_type, operation,
+                                   /*actionable_permission=*/false);
+    };
 }
 
 bool AuthRoutes::require_scoped_permission(const httplib::Request& req, httplib::Response& res,
@@ -1959,21 +2008,24 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
             res.set_content(
                 detail::error_json_a4(
                     403, "break-glass account requires an enrolled second factor", cid,
-                    "the break-glass account has no enrolled second factor; enroll MFA for it "
-                    "(Settings -> Multi-Factor Authentication, reachable by an admin via SSO) "
-                    "before using it under --auth-mode=sso-only"),
+                    "the break-glass account has no enrolled second factor, and no admin can "
+                    "enroll it on its behalf. Recover by restarting with --auth-mode=standard, "
+                    "enrolling as the break-glass account, then restoring sso-only; standard "
+                    "mode re-enables local-password login for every account. Full sequence: "
+                    "docs/ops-runbooks/auth-db-recovery.md (break-glass section)"),
                 "application/json");
             audit_log_for_principal(
                 req, "auth.breakglass.denied", "denied", username,
                 auth::role_to_string(*role_opt), "User", username,
-                "break-glass login refused: no MFA enrolled (enrollment not offered — re-enroll "
-                "out of band)");
+                "break-glass login refused: no MFA enrolled (enrollment not offered — see the "
+                "break-glass section of docs/ops-runbooks/auth-db-recovery.md)");
             emit_event("auth.breakglass.denied", req,
                        {{"source_ip", req.remote_addr}, {"username", username}}, {},
                        Severity::kCritical);
             spdlog::error("BREAK-GLASS login DENIED for '{}' (source {}): no MFA enrolled — "
                           "refusing to offer enrollment (would defeat the second factor). "
-                          "Re-enroll the break-glass account out of band.",
+                          "Re-enroll it per the break-glass section of "
+                          "docs/ops-runbooks/auth-db-recovery.md.",
                           username, req.remote_addr);
             return;
         }
@@ -4138,8 +4190,10 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
             },
             label, cfg_.mfa_enforcement, auth_mgr_.metrics_registry());
     };
-    // Default step-up window for the elevation surfaces; floored to 300 s when the
-    // global gate is disabled so the privilege boundary keeps a fresh-proof check.
+    // Step-up window for the elevation surfaces: the global window when it is
+    // positive, else 300 s. So disabling the global gate (<= 0) does not disable
+    // it here, and the privilege boundary keeps a fresh-proof check. A positive
+    // window below 300 is used as-is; this substitutes, it does not floor.
     const int kElevationStepUpWindow =
         cfg_.mfa_step_up_window_secs > 0 ? cfg_.mfa_step_up_window_secs : 300;
 
@@ -4498,8 +4552,8 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
             }
         }
         // High-risk: require a fresh MFA proof (step-up) before granting admin.
-        // window floored to kElevationStepUpWindow so a globally-disabled gate
-        // can't skip the proof for the privilege boundary.
+        // kElevationStepUpWindow (the global window when positive, else 300 s) so
+        // a globally-disabled gate can't skip the proof for the privilege boundary.
         if (!elevation_step_up(req, res, *session, "POST /api/v1/elevate",
                                kElevationStepUpWindow)) {
             // The shared gate set the 401 challenge + audited mfa.step_up; add the

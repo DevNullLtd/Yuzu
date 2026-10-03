@@ -15,12 +15,152 @@ This guide covers upgrading Yuzu components (server, agent, gateway) between ver
 | 0.15.x (next) | 0.12.0 | 0.12.0 | **Fleet visualization three-tier layout + talking sockets + curved tube wires (PR 12).** `/viz/fleet` no longer renders machines on a single flat grid. Cubes now stack into three architectural tiers: frontend on the top Y plane, applications in the middle, databases on the bottom. Classification is heuristic — `classifyTier` reads listener-port hints (DB/web port sets) and process category, priority `db > web > app`. **Behavioural break for automation consumers:** if you scripted SIEM rules or dashboards that filter by "where a cube falls in the canvas", expect tier reassignments after upgrade. The wire change is *additive* — `schema_minor` bumps `3 → 4` with a new optional `local_addr` field on `ListenerSocket` carrying the kernel-reported bind address (server-side bounded at 64 bytes per field). Strict-validating consumers pinned to `schema_minor == 3` should relax their validator to `minimum: 3`. **Loopback-only listeners (`127.x`, `::1`, `[::1]`, `::ffff:127.x`) no longer appear on cube surfaces** — they're not reachable from other instances. **New talking-socket primitive:** each cube grows a ring of cool-blue dots on its BOTTOM face, one per unique outbound `(proto, dst_ip, dst_port)`; hover surfaces `talking: tcp → ip:port`. **Wire geometry changed:** cross-machine connections render as `THREE.TubeGeometry` along a `CubicBezierCurve3` with vertical end-tangents instead of 1px `THREE.Line` — wires drop straight down out of the source cube floor, run mostly-straight through space, and dock straight up into the destination's listener sphere. Screen-scrapers that parsed wire colour or geometry need updating. **Origin RGB `AxesHelper` removed** from the empty-scene scaffold — the three tier planes replace it as the orientation cue. **Default camera reframed** to `(45, 60, 45)` looking at the middle tier (was `(35, 30, 35)` looking at origin); bookmarked URLs will land on the new framing. Bundle size ~70 → ~84 KB. **Known limitation:** databases on non-standard ports (Postgres on 5431, etc.) misclassify as `app` tier unless their process is identified as `database` by the agent's process classifier. **Rolling-upgrade behaviour:** during a staged agent rollout, agents on a build older than the `tar.fleet_snapshot` action have no topology to push and appear in `/viz/fleet` as dimmed `stale` cubes until their agent is upgraded — this is expected, not a regression (previously such agents vanished from the visualization entirely once any agent pushed). **Kill-switch change:** `--viz-disable` now also `503`s the `/viz/fleet` and `/viz/host/<id>` page shells, not just the REST endpoints — an operator who sets the flag no longer sees a half-working page; it also writes a `server.viz_disabled` audit event at boot. **Governance Gate 7 hardening (no operator action required):** parser field caps on all agent-controlled strings, an IP-claim reclaim window so a crashed agent no longer strands its IPs forever, CAP-1 eviction keyed on the server clock, per-entry isolation in gateway `BatchHeartbeat` ingest, and a fix for a registration-replay storm under upstream flapping. **Scope-walking YAML `fromResultSet:` DSL (PR-E).** Policies whose `spec.scope:` used a `selector:` mapping block previously stored an empty scope (matched all devices — the selector was silently ignored). Existing rows are not migrated, but **re-creating or re-importing** such a policy after upgrade applies the selector as a real predicate and may narrow targeting — review the intended scope before re-import. Inline flow-mapping scope (`scope: {fromResultSet: x}`) is now rejected; use the block form. Result-set aliases referenced from `fromResultSet:` must be drawn from the `[A-Za-z0-9_.:*-]` charset (no spaces/quotes). **Inventory freshness gauge now server-clock-stamped (#1685).** `yuzu_inventory_stale_agents` keys on the server's receipt time, not the agent-supplied `collected_at`. A one-time migration (v3) at first 0.15.x startup clamps any `inventory_state` row whose `last_seen`/`first_seen` was stamped from a future-skewed agent clock back down to now. **Operator-visible:** if any agents had future-skewed clocks, the gauge may show a one-time *increase* post-upgrade as previously-hidden endpoints re-enter the staleness window with a fresh ~48h grace — genuinely active agents fall back out within two daily sync cycles; this is the intended security correction, not an incident. No operator action required (the `YuzuInventoryStaleAgents` alert ships disabled). **Rollback note:** downgrading the server below 0.15.x after v3 has run is data-safe (schema unchanged) but new inventory syncs revert to stamping `last_seen` from agent time, silently re-opening the clock-skew gap for those rows. **DEX application performance over time (opt-in).** New per-app, per-version CPU/working-set trend views (DEX → Performance → "Application performance over time"; REST `/api/v1/dex/perf/{apps,app,group}` + the `list_dex_perf_apps`/`get_dex_app_perf`/`get_dex_group_app_perf` MCP tools; per-device drill `GET /api/v1/dex/devices/{id}/app-perf`). **No action is required to upgrade, but the views are EMPTY until you opt in:** per-application sampling ships **off by default** (`procperf_enabled=false`) because it is usage-class telemetry (works-council-relevant). Enable `procperf_enabled=true` on the target devices via `tar.configure` (and leave the daily-sync master switch `--inventory-disable` unset). Data appears **after the first completed UTC midnight** on each opted-in device (the agent ships a daily summary, not immediately), and the trends lengthen as days accumulate (fleet ≤180 days, group ≤31 days). A freshly-enrolled or non-opted-in device shows an honest empty state ("no application performance history yet"), not a bug. The per-device drill is also reachable from a dashboard panel on the `/device` DEX lens ("Application performance over time" — same retained data, no live query, no `Execute` permission; no upgrade action needed). The per-device drill is behavioural PII — scoped + audited (`dex.device.app_perf.view`, fail-closed); the fleet and group aggregates suppress any app/version on fewer than 10 devices to a count only (no singling-out). **Response/execution reads fail closed on a corrupt RBAC store (#1634, partial).** The response readers (`query_responses` + `aggregate_responses` MCP tools, `GET /api/v1/executions/{id}/visualization`, `GET /api/responses/{id}` / `/aggregate` / `/export`) route through a per-agent management-group filter. **The only operator-visible change in this release** is fail-closed behavior under a **corrupt/load-failed `rbac.db`**: these surfaces now return zero rows (the legacy `/api/responses/{id}/aggregate` returns `503`) instead of exposing the whole fleet via the legacy read fallback. **Not yet changed:** under normal RBAC operation these reads are **not** management-group-scoped — a holder of global `Response:Read` still sees all agents' responses (the filter is inert under the current global gate; the gate change that makes scoping effective is tracked under #1634). RBAC explicitly disabled is unchanged. No operator action required. **MCP agentic write surface + A2 discovery + A4 error-shape (R2, #289 / #1794).** Five MCP write tools (`set_tag`/`delete_tag`/`approve_request`/`reject_request`/`quarantine_device`) ship with a ticket-then-recall approval flow, plus the `/api/v1/discover/*` discovery family. The approvals store gains additive `consumed_at` + `consumed_by` columns (auto-migrated at first startup; no operator action). **Breaking wire-shape change:** many `/api/v1` error bodies that were previously `{"error":"<string>"}` are now the nested A4 object `{"error":{"code","message","correlation_id",…}}` — a REST client that read `error` as a *string* must migrate to `error.code` / `error.message` (see `rest-api.md` §Error envelope). The MCP write surface is gated behind the existing tier model + a maker-checker approval workflow; audit `mcp.<tool>` covers every write. **NVD CVE-store schema migration (v1→v2) + full CPE version-range matching.** The server-side NVD store is reshaped on first startup (flat `cve` → normalized `cve` + `cve_match`); `/api/nvd/match` now evaluates real CPE version ranges. **Operator-visible on upgrade:** (a) the migration **drops and rebuilds the local CVE mirror** — vulnerability-matching coverage is reduced until the next NVD sync completes (rate-limited; up to a few hours without an API key), self-healing and logged with a warning at migration time; (b) `GET /api/nvd/status` `total_cves` now counts **distinct CVEs** (was one row per affected product) so it reads **lower** after upgrade even once fully synced, and near-zero during the rebuild window — **expected, not data loss**. Any SIEM/dashboard alerting on the `total_cves` magnitude should be re-baselined. No config change or action required. **NVD CVE sync now actually runs (was dormant).** A `rate_limit()` integer overflow meant the server-side NVD sync slept ~292 years before its first request, so it never populated on any prior deployment (`/api/nvd/status` `total_cves` stayed at the built-in seed). It now runs on startup. **Operator-visible:** (a) the server makes **new outbound HTTPS requests to `services.nvd.nist.gov`** — restricted-egress / air-gapped deployments that silently never reached it before may now log connection failures (set `--no-nvd-sync` to disable, or `--nvd-proxy`); (b) `total_cves` grows from the seed as the sync populates. No config change required to benefit. **NVD sync now builds the FULL CVE catalog (newest-first), not ~20 keywords.** The sync backfills every CVE published within a configurable window — `--nvd-backfill-years` / `YUZU_NVD_BACKFILL_YEARS` (default **8 years**; `0` = full history) — newest-first and **resumable across restarts**, then settles into a periodic last-modified freshness re-check. **Operator-visible:** the server makes sustained HTTPS requests to `services.nvd.nist.gov`, the local NVD DB grows into the hundreds of MB, and `/api/nvd/status` `total_cves` climbs continuously while `backfill_complete` stays `false` until the backfill floor is first reached — `last_sync_time` advances after every successful fetch window and is **not** a completion signal (use the new `backfill_complete` + `backfill_oldest_published` fields, and the `yuzu_nvd_total_cves` / `yuzu_nvd_backfill_complete` metrics, for progress). **`/api/nvd/status` `enabled` semantics corrected:** it now reflects whether sync is configured on, so under `--no-nvd-sync` it reports `enabled:false` (was `true`); a monitor keying on `enabled` to mean "mirror usable" should check `total_cves` instead. The initial backfill is NVD-rate-limited (hours without an `--nvd-api-key`, minutes with one) and resumes where it left off if interrupted. Set `--no-nvd-sync` to disable, `--nvd-proxy` for restricted egress. Product matching stays name-based (vendor-precise CPE identity pending ADR-0018). **Certificate inventory now reads System/SystemRoot keychains and Linux `/etc/ssl/certs` natively (no more `openssl`/`security` CLI shell-out for those stores).** The `certificates` plugin's `list`/`details`/`delete` actions are unchanged in output shape (same pipe-delimited columns, same field values) — this is a collection-mechanism change only, verified byte-parity against the prior CLI-based output. The macOS login keychain is unchanged (still reads via the existing governed-shell path, a deliberate exception — see `docs/agent-spawn-sink-manifest.md`). No operator action required; mixed old/new-agent fleets and rollback are safe (no server-side or schema change). |
 | 0.15.x (next) | 0.12.0 | 0.12.0 | **`PatchManager` now runs on PostgreSQL (ADR-0062).** `/api/patches/*` (patch inventory + deployment tracking) moved off its own `patches.db` SQLite file onto the shared Postgres substrate (schema `patch_manager`). **No data carries over from a pre-Postgres install** (fresh-start-by-default, ADR-0009) — any deployment record that existed before upgrade is gone and must be re-created via `POST /api/patches/deploy`. Server startup now fails closed if the `patch_manager` schema can't be created/opened — a posture upgrade from the SQLite era, where construction was unconditional/best-effort and no caller ever checked whether the store had actually opened; confirm success via `/readyz` (`patch_manager` is now reported by both `/readyz` and `/healthz`, absent from both before this release). **Removed: automatic patch-deployment orchestration.** `PatchManager::execute_deployment()` (the scan → install → verify → reboot workflow) had zero production callers on any released build — nothing ever wired a dispatch/OS-lookup callback to it — and is deleted, not ported; `POST /api/patches/deploy` still creates a deployment + per-target rows, but nothing in the server drives them through that workflow automatically (see #3669, filed alongside this change, and `docs/capability-map.md` §8.3/§8.4/§8.6). **Patch inventory (`GET /api/patches`) is separately unwired**: `record_patches()`, the only method that writes it, also has no production caller — this predates the migration and is not something upgrading changes — so `GET /api/patches` returns empty in every real deployment today; see `docs/capability-map.md` §8.5/§8.7 and #3676. No operator action required beyond re-creating any in-flight deployment after upgrade. |
 | 0.15.x (next) | 0.12.0 | 0.12.0 | **`WorkflowEngine` now runs on PostgreSQL (ADR-0064).** `/api/workflows*` and `/api/workflow-executions/*` moved off `workflows.db` SQLite onto the shared Postgres substrate (schema `workflow_engine`). **No data carries over from a pre-Postgres install** (fresh-start-by-default, ADR-0009) — any workflow definition and its execution history that existed before upgrade is gone; re-create workflows via `POST /api/workflows` (or product-pack re-install). Server startup now fails closed if the `workflow_engine` schema can't be created/opened — a posture upgrade from the SQLite era, where construction was unconditional/best-effort and no caller ever checked whether the store had actually opened; confirm success via `/readyz` (already reported before this release) and `/healthz` (newly reported — was absent before this release). **Delete semantics changed: `DELETE /api/workflows/:id` now soft-deletes.** The response shape is unchanged (`{"deleted": true|false}`), but a deleted workflow's row and its execution history are now retained internally rather than orphaned — this is not operator-visible today (no "show deleted workflows" surface exists), but a deleted workflow's `id` can never be reused. No operator action required. |
-| 0.15.x (next) | 0.12.0 | 0.12.0 | **Guardian file-hash `max_bytes` now has a hard ceiling (#2233).** An authored `file-hash-equals` rule's `max_bytes` (the hashing-DoS cap) was previously accepted unbounded from the authoring API. It is now clamped to 1 GiB (`kMaxFileHashBytes`) on the agent, and the server rejects a new/edited rule authoring a value above that ceiling in either JSON wire form (400). **Operator-visible only if you have a PRE-EXISTING `file-hash-equals` rule authored (before this release) with `max_bytes` above 1 GiB, watching a file at or above that size:** after upgrade, that file reports `<oversize>` instead of being hashed — a compliance-verdict change with no authoring-time signal (the rule already exists, so the new server-side reject cannot retroactively catch it). List your rules via `GET /api/v1/guaranteed-state/rules` (the route returns every rule; there is no server-side filter), check any `file-hash-equals` rule for `max_bytes` over 1073741824, and re-author within the ceiling if the larger cap was intentional. No operator action required otherwise. |
-| 0.14.x | 0.12.0 | 0.12.0 | **Fleet visualization intra-cube edges (PR 8).** `/viz/fleet` now draws faint white lines (opacity `0.3`) inside each machine cube connecting process dots that are reciprocal ends of a loopback TCP socket (127.0.0.1 / ::1). Two operator-visible changes: (a) **wire shape** — `/api/v1/viz/fleet/topology` `schema_minor` bumps `1 → 2` and a new optional `dst_pid` field appears on `scope: local` connection edges. Renderers that ignore unknown keys per the contract see no break; strict-validating consumers pinned to `schema_minor == 1` should relax their validator to `minimum: 1`. (b) **dropped unmatched halves** — unpaired Local-scope edges (kernel snapshot race during teardown, agent's 4096-connection cap cutting a partner) are now dropped server-side before serialisation. Integrations counting `connections` array length per machine as a proxy for active IPC pairs should re-baseline after upgrade; the count trends marginally lower. Lines appear only when the host has active loopback flows (e.g. Prometheus scraping node_exporter, a client talking to local Redis / Postgres); a fresh agent with no inter-process loopback shows process dots but no lines — expected, not a regression. |
+| 0.15.x (next) | 0.12.0 | 0.12.0 | **Guardian file-hash `max_bytes` now has a hard ceiling (#2233).** An authored `file-hash-equals` rule's `max_bytes` (the hashing-DoS cap) was previously accepted unbounded from the authoring API. It is now clamped to 1 GiB (`kMaxFileHashBytes`) on the agent, and the server rejects a new/edited rule authoring a value above that ceiling in either JSON wire form (400). **Operator-visible only if you have a PRE-EXISTING `file-hash-equals` rule authored (before this release) with `max_bytes` above 1 GiB, watching a file at or above that size:** after upgrade, that file reports `<oversize>` instead of being hashed — a compliance-verdict change with no authoring-time signal (the rule already exists, so the new server-side reject cannot retroactively catch it). List your rules via `GET /api/v1/guaranteed-state/rules` (the route returns every rule; there is no server-side filter), check any `file-hash-equals` rule for `max_bytes` over 1073741824, and re-author within the ceiling if the larger cap was intentional. No operator action required otherwise. **DEX and management-group reads now fail closed on a degraded read instead of answering a healthy/empty result (#4855, #1762)** — see "Behaviour change: DEX device score and management-group member reads now fail closed on a degraded read (#4855, #1762)" below. |
+| 0.15.x (next) | 0.12.0 | 0.12.0 | **`BatchHeartbeatResponse` gains `unknown_session_ids` and `unknown_session_ids_truncated` (#1197) - no operator action.** The server now lists, per `BatchHeartbeat`, the session ids it does not hold. The gateway does not read the new fields yet (the gateway-side replay is tracked in #1197), so nothing visible changes in either skew: a new server with an OLD gateway is safe because the old gateway ignores the added response fields (proto3 unknown fields, field numbers 2 and 3); an OLD server with a NEW gateway is safe because the old server never sends the fields and the gateway does not act on them. The one operator-visible change is a new `yuzu_server_gateway_route_desync_total{op="batch_heartbeat",outcome="malformed_session_id"}` series (pre-seeded at 0, expected to stay 0, no alert): over-length (more than 64 bytes) unknown session ids in a `BatchHeartbeat` are now counted under that series, per entry, instead of under `op="renew_leases", outcome="unknown_session"`. This release does NOT fix the post-server-restart symptom described in the Known limitation under [Server-Side Setup](gateway.md#server-side-setup). |
+| 0.15.x (next) | 0.12.0 | 0.12.0 | **Gateway heartbeat admission is now bound to the connection that opened the session (gateway restart required; breaking for L7-fronted gateways).** The gateway admits an agent `Heartbeat` only on the HTTP/2 connection that opened the session's `Subscribe` stream; any other heartbeat is answered `NOT_FOUND` and not forwarded. Deploy with a gateway restart, and check for an HTTP/2-terminating hop in front of `:50051` first. A rejected agent recovers by re-registering. That logic exists from v0.13.0, but the released v0.13.0 and v0.14.0-rc6 agents wedge in their reconnect path with default settings (bug #2182, fixed by PR #5183, in no release yet) and recover only with `--no-auto-update`; v0.12.0 never recovers by itself (observed; older versions were not tested). Upgrade the agents first, then the gateway, with a build that includes the #2182 fix once released; until then restart an agent that stays rejected. Agents that do not connect through the gateway are not affected by this requirement (see Older agents). No wire or server change. See the section "Breaking: gateways fronted by an HTTP/2-terminating proxy or mesh sidecar" below and [Heartbeat admission](gateway.md#heartbeat-admission). |
+| 0.14.x | 0.12.0 | 0.12.0 | **Fleet visualization intra-cube edges (PR 8).** `/viz/fleet` now draws faint white lines (opacity `0.3`) inside each machine cube connecting process dots that are reciprocal ends of a loopback TCP socket (127.0.0.1 / ::1). Two operator-visible changes: (a) **wire shape** — `/api/v1/viz/fleet/topology` `schema_minor` bumps `1 → 2` and a new optional `dst_pid` field appears on `scope: local` connection edges. Renderers that ignore unknown keys per the contract see no break; strict-validating consumers pinned to `schema_minor == 1` should relax their validator to `minimum: 1`. (b) **dropped unmatched halves** — unpaired Local-scope edges (kernel snapshot race during teardown, agent's 4096-connection cap cutting a partner) are now dropped server-side before serialisation. Integrations counting `connections` array length per machine as a proxy for active IPC pairs should re-baseline after upgrade; the count trends marginally lower. Lines appear only when the host has active loopback flows (e.g. Prometheus scraping node_exporter, a client talking to local Redis / Postgres); a fresh agent with no inter-process loopback shows process dots but no lines — expected, not a regression. **Windows agent (#5196):** set update-signing options in the `YuzuAgent` service's `Environment` registry value, not its binary path. Every installer run rewrites the binary path and silently drops them, and uninstalling deletes the `Environment` value, so a deployment that uninstalls first must set it again (*Windows: the service's `Environment` value* in `server-admin.md`). Agent installers from 0.14.0-rc1 to rc5 also stop with exit code 7 wherever PowerShell runs in Constrained Language Mode; use this release's. **Before upgrading Windows agents:** this installer stops with exit code 7, naming the reason in its `/LOG=` file, if `C:\ProgramData\Yuzu\agent-certs` exists but is not secured (for example a folder created or pre-staged by hand, or one a Group Policy adds permissions to), if a file in it is not owned by Administrators or SYSTEM, or if it or anything in it is a junction, symbolic link, hard link or subdirectory (a backup subfolder, say). The agent service is left running when it stops. Provision the bundle after installing, by copying it in as an administrator. The trust-anchor procedure block in `server-admin.md` stops on the same conditions, naming the reason (and on a healthy or rc1–rc5 endpoint completes, repairing rc files, as long as each file in it is owned by Administrators or SYSTEM; `icacls "<file>" /setowner *S-1-5-32-544 /L` fixes one you placed yourself): run it on a few endpoints first, and pilot the upgrade before a fleet-wide push. **Linux native packages need a recent distribution:** the server needs Ubuntu 26.04 or Fedora 42 class, the agent Ubuntu 24.04 class or newer; Ubuntu 22.04, Debian 12 and RHEL/Rocky 9 are not supported by the native packages. Check before upgrading older hosts, or use the container images (*Supported Platforms* in the user manual README, #5143). |
 | 0.13.x | 0.12.0 | 0.12.0 | **Fleet visualization process layer.** `/viz/fleet` now renders interior process dots inside each machine cube, coloured by category (system/browser/database/web/runtime/other) — no operator action required, but operators upgrading from a 0.12.x build will see the dashboard suddenly populated with thousands of small spheres on next page load. Process data was already collected via `tar.fleet_snapshot` since 0.12.x; PR 7 only renders it. To suppress process visibility for specific agents (privacy-sensitive hosts, regulated workloads), set `process_enabled=false` on those agents via `tar.configure` — this also suppresses their dots on the visualization. Hover a dot to see pid/name/user/category; agent-controlled string fields are HTML-escaped and length-clamped before render. Per-cube dot count is soft-capped at 1000 for graceful degradation on heavily-threaded hosts; the cube tooltip still shows the true reported count. |
 | 0.12.x | 0.12.0 | 0.12.0 | **Build-time content auto-import.** All YAML files in `content/definitions/` (217 InstructionDefinitions) and `content/packs/` (10 InstructionSets at this version) are now embedded in the server binary and auto-imported on every startup. Existing operator-customised definitions with matching IDs are NEVER overwritten — conflicts are silently skipped. **Behaviour change for upgrades:** definitions that an operator previously DELETED via the REST API or dashboard will reappear after upgrade because the auto-import treats a missing row as "needs creation". To permanently suppress a shipped definition, set `enabled: false` via the dashboard or `PATCH /api/v1/definitions/{id}` rather than DELETE-ing the row. Each auto-import write emits an `audit_events.action="content.bundled_import"` row with `principal=system` so operators can audit which definitions were inserted at boot. **Yuzu dark navy palette + Inter webfont** (visual change every operator sees) and **Apache ECharts chart renderer** (replaces bespoke SVG; same payload contract — no operator migration required) ship in the same release. |
 
-**Rule of thumb:** agents and gateway should be the same minor version as the server, or one minor version behind. The server is always upgraded first.
+**Rule of thumb:** agents and gateway should be the same minor version as the server, or one minor version behind. The server is always upgraded first. Upgrading the server first restarts it while gateways stay connected, which is the scenario in the known limitation under [Server-Side Setup](gateway.md#server-side-setup). That limitation was observed on one local rig after a SIGKILL restart (graceful upgrade restarts were not tested): agents behind a gateway can read offline, and dispatch worked only for the remaining route lease (up to about 90 s). The gateway-side fix is tracked in #1197.
+
+## Operator note: the software-inventory store migration (v7) is a hard cutover (#5172)
+
+Schema v7 of the software-inventory store adds `package_id` and `source` columns and a row id to
+`installed_software`. The row id is added with a table rewrite under an exclusive lock, so the first
+start after upgrade takes time that grows with the table (about 10-20 s at 4M rows). A rolling upgrade is
+not supported for this migration at this stage: above about 2 million rows stop every server replica,
+then start one and let it finish; below that, start one replica first. The procedure, the row-count query
+and the free-space guidance are in [Installed-Software Inventory](inventory.md) (Upgrading).
+
+## Behaviour change: DEX device score and management-group member reads now fail closed on a degraded read (#4855, #1762)
+
+**Not a Breaking lead for the DEX routes and the management-group MEMBER-read path** — those already documented a `503` response before this release; what changes for them is when it fires, not the documented contract. **This does NOT hold for `GET /api/v1/management-groups/{id}`'s own GROUP-ROW read or its MCP twin `get_management_group`** (governance round-2, #1762): before this release, a degraded group-row read answered the SAME flat, undocumented `404 "group not found"` a genuinely nonexistent group id gets — there was no `503` contract for that case at all. This release adds a NEWLY DOCUMENTED, additive `503`/retryable error path for a degraded group-row read specifically; the `404` contract for a genuine not-found is unchanged. A client that already treats any `503` from these routes as retryable per the A4 contract needs no code change; a client that inferred "management group not found" purely from a `404` status code should note that `404` now unambiguously means "no such group" (never "could not tell") — narrower, not wider, than before.
+
+**Operator-visible behaviour change (fail-closed reads).** Two previously fail-soft read paths now surface a degraded Postgres read as a retryable error instead of a healthy-looking or empty result:
+
+- **Per-device DEX experience score (#4855).** `GET /api/v1/dex/devices/{id}` and MCP `get_dex_device_score` now answer `503`/a retryable MCP error when the per-device signal-summary read degrades, instead of the previous fabricated healthy score of 100 with no signals. The device-page DEX lens shows a "DEX store degraded." placeholder in the same case. `GET /api/v1/dex/overview` (and its dashboard/MCP twins) gains a new `unscored` field counting connected devices whose per-device score could not be computed — a non-zero `unscored` means `great`/`fair`/`poor`/`overall_experience` cover fewer devices than are actually connected, not a healthier fleet than reported.
+- **Management-group reads (#1762).** The `/dex/perf/app` group-trend read (`GET /api/v1/dex/perf/group` and its dashboard/MCP twins), `/auto` VERIFY's before/after compare, and `GET /api/v1/management-groups/{id}` (+ MCP `get_management_group`) now report a member-lookup degrade as `503`/a retryable error, instead of rendering it as "0 members" or "no member reported". As of governance round-2, `GET /api/v1/management-groups/{id}` and `get_management_group` ALSO report a degrade in the GROUP ROW's own read the same way (`503`/retryable), instead of the flat `404` that previously made a store outage indistinguishable from a genuinely nonexistent group.
+
+**Counters/alerts to watch during and after upgrade:** `yuzu_server_guardian_read_degrade_total` (alert `YuzuGuardianReadDegraded`; this release adds a new `source="guardian_rules"` value alongside the pre-existing `source="guardian_state"`, both now pre-seeded to 0 at boot across all three `reason` values) and `yuzu_server_mgmt_group_read_degrade_total` (alert `YuzuMgmtGroupReadDegraded`, now also counting the `get_members_checked` member-read degrade). A sustained non-zero rate on either during the upgrade window means the affected reads are answering retryable errors, not that devices or groups actually shrank.
+
+No config or data migration is required.
+
+## Informational: internal-CA CRL publish/audit/observability follow-ups (HA WS-6, #4828–#4830)
+
+No schema, config, or wire-shape change — this is documentation of behaviour that already
+shipped with HA WS-6 slice 6.1 (`ca_crl_versions` migrations v3/v4, PR #4126) plus additive
+audit/metrics coverage.
+
+**Migration v3/v4 boot-time lock window (informational, applies to any upgrade crossing them).**
+`ca_crl_versions` migration v3 (`revoked_count` column) and v4 (the `ca_issued_keep_revoked`
+append-only trigger) each take a schema-level lock guarded by a 30 s `lock_timeout` — long
+enough to outlast a legitimate in-flight CRL publish (which holds `SHARE ROW EXCLUSIVE` on the
+same table for at most its own 5 s lock wait plus signing time), but a rolling upgrade that has
+one replica already on the new schema while an older replica is still publishing can see up to
+~30 s of the migrating replica's readers/writers queueing behind the older replica's lock. This
+is a one-time cost on first contact with each version and does not recur.
+
+**`ca.crl.published` is now audited on every publish path, not only operator revoke (#4829).**
+Every CRL publish — the boot pre-publish, the leader-gated freshness re-publish, the
+count-compare self-heal re-publish, and the two operator-triggered paths (revoke, subordinate-CA
+import on REST/MCP/dashboard) — now writes a `ca.crl.published` audit row. The three paths with
+no live operator request (boot, freshness, self-heal) audit under `principal=system`; every row
+carries a `reason=` token (`startup`/`freshness`/`self_heal`/`revoke`/`import_chain`) so a
+self-heal republish that resolves an earlier revoke-triggered failure leaves its own
+`result=success reason=self_heal` row as the resolution, rather than the silence a prior gap left
+here. See `docs/user-manual/audit-log.md`.
+
+**New Prometheus counters (#4830):** `yuzu_server_ca_crl_publish_failure_reason_total{reason}`
+(a bounded, closed cause breakdown alongside the existing
+`yuzu_server_ca_crl_publish_failures_total`) and
+`yuzu_server_ca_unpublished_revocation_check_failures_total` (the freshness pass's own
+self-heal *check* failing — distinct from a publish failing outright). See
+`docs/user-manual/metrics.md`. No operator action required; both are additive.
+
+## ⚠️ Breaking: gateways fronted by an HTTP/2-terminating proxy or mesh sidecar (#3869)
+
+Affects you only if you run the Erlang gateway and agents reach it through something that terminates
+HTTP/2: an HTTP/2-aware reverse proxy (for example nginx `grpc_pass`), an L7 load balancer, or a
+service-mesh sidecar. Agents that connect to `:50051` directly, or through an L4 / TLS-passthrough
+path that keeps one TCP connection per agent, are not affected by the proxy requirement; see Older
+agents and the registry restart note below.
+
+**Minimum agent version.** An agent rejected by the gateway recovers by re-registering through its
+`NOT_FOUND` handling. That logic exists from v0.13.0, but the released v0.13.0 and v0.14.0-rc6 agents
+wedge in their reconnect path with default settings (bug #2182, fixed by PR #5183, which is in no
+release yet) and recover only with `--no-auto-update` (observed with v0.13.0 and v0.14.0-rc6), or on a
+build that includes the fix. v0.12.0 never recovers by itself (observed; older versions were not tested). Upgrade the
+agents first, then the gateway, using a build that includes the #2182 fix once released; until then,
+restart an agent that stays rejected (restarting the agent service re-registers it). Agents that do
+not connect through the gateway are not affected by this requirement.
+
+The gateway now admits an agent `Heartbeat` only on the HTTP/2 connection that opened the session's
+`Subscribe` stream, and only for a session that gateway node holds. A heartbeat that arrives on any
+other connection is answered `NOT_FOUND` (`unknown session`), counted and not forwarded.
+HTTP/2-terminating proxies are unsupported: they may cause repeated heartbeat rejection or share
+gateway-side connections across agents, removing the per-agent connection separation this check
+requires. Observed in a test with nginx `grpc_pass` in front of two agents: every heartbeat was
+rejected, agents still enrolled and received commands, no heartbeat reached the server and the
+server's online count flickered; an L4 TCP forwarder (nginx `stream`) caused no rejections. Each rejection raises
+`yuzu_gw_heartbeat_session_mismatch_total{event="security"}` or `yuzu_gw_heartbeat_rejected_total{reason}`
+and appears in a rate-limited gateway summary log line (the `connection_mismatch=` count). The
+agent-facing message is the same `unknown session` for every reason, so diagnose from the counters
+and that log line.
+
+**Check before upgrading.** Look for an HTTP/2-terminating hop between the agents and `:50051`
+(reverse proxy, L7 load balancer, mesh sidecar). If there is one, move agents to an L4 or
+TLS-passthrough path first, or exempt `:50051` from the proxy. Also check the agent versions of
+your fleet (the Hardware list at `/hardware` shows each device's agent version) and upgrade every
+agent older than 0.13.0 that connects through the gateway before you deploy the new gateway, and
+plan to restart any released 0.13.0 or rc6 agent that stays rejected; see Older agents below.
+
+**Restart requirement.** Deploy the new gateway with a restart. The session index is created when the
+gateway registry starts and hot code upgrade is not supported for this change. A node that had the
+new code loaded without a restart has no index table, rejects every heartbeat as
+`registry_unavailable`, and reports `sessions_index` in `/readyz` (503 while the table is missing).
+
+**Rollback.** Redeploy the previous gateway release. The only new state is the in-memory session index,
+and there is no wire, agent or server change, so nothing needs migrating; agents with the reconnect
+fix re-register on their own (released agents may need a restart, see the next paragraph for older
+agents), and a rollback removes the connection check. This path
+is derived from the change and was not run.
+
+**Older agents.** A rejected agent recovers by re-registering through its `NOT_FOUND` handling
+(escalating cooldown, 2 s doubling to a 300 s cap). That logic exists from v0.13.0 (checked in the
+agent source), but in the released v0.13.0 and v0.14.0-rc6 agents it is blocked by bug #2182 (the
+update-check thread join wedges the reconnect teardown; inferred cause), fixed by PR #5183, which is
+in no release yet. With default settings those agents log `(#1894)` and `Heartbeat thread stopped`
+and then never re-register (observed, 19 minutes, reproduced on a second agent); with
+`--no-auto-update` they re-registered 20 to 21 s after a gateway registry restart (observed with
+v0.13.0 and v0.14.0-rc6; it is a command-line flag with no environment variable). Agent v0.12.0 only logs `Heartbeat failed` and never re-registers by itself (older versions were not tested)
+(observed with v0.12.0, 29 failures in 14.5 minutes with default settings; a `--no-auto-update` run was watched for only about 2 minutes and behaved the same; older than v0.12.0 was not tested), so for persistent missing state they stay
+rejected until restarted or upgraded (such agents were still counted online by the server's `/health` `agents.online` in the rig, so check the rejection counters and the agent log, not the online count; a heartbeat that falls in the short gap between the session
+leaving the pending table and its agent process registering can succeed later without
+re-registration). Upgrade the agents first, then the gateway, with a build that includes the #2182
+fix once released; until then, restart an agent that stays rejected (restarting the agent service
+re-registers it). Agents that do not connect through the gateway are not affected. This matters
+only when heartbeats are rejected, which happens in four cases:
+
+- a topology that breaks the one-connection assumption;
+- a gateway running without the session index;
+- a gateway registry process restart or crash while agent connections stay up. The registry
+  recreates its tables empty, so every heartbeat for the agents it held is rejected until they
+  re-register. A node failover that leaves the session not held by the surviving node is expected
+  to behave the same way (inferred, not tested);
+- for released agents, a gateway process restart. In a graceful SIGTERM and restart run the
+  released agents tested (v0.14.0-rc6, v0.13.0, v0.12.0, default settings) did not notice the lost
+  `Subscribe` stream, sent their next heartbeats over a re-established channel to the new gateway
+  and got `NOT_FOUND`; v0.14.0-rc6 and v0.13.0 then wedged (no re-register through the 1 minute
+  40 s the run watched them) and v0.12.0 kept logging failures. The agent built from the branch
+  tree noticed the lost stream and re-registered in 11 to 12 s with no rejections (observed).
+  Restart released agents after a gateway restart if they stay rejected.
+
+The registry-restart recovery in 17 to 37 s was observed with agents built from the branch tree
+(version 0.14.0, which includes the #2182 fix). Released agents were observed as described above.
+
+See [Heartbeat admission](gateway.md#heartbeat-admission) for the supported topologies, counters and
+runbook.
 
 ## ⚠️ Breaking: `GET /api/v1/openapi.json` now requires authentication (#2057)
 
@@ -171,6 +311,109 @@ a reviewed runbook rather than summarised here. Until that lands, see
 [`authentication.md`](authentication.md) ("OIDC Single Sign-On") for the durable and non-durable ways to
 configure OIDC.
 
+## ⚠️ Breaking: a multi-host `--postgres-dsn` now needs `target_session_attrs=read-write`, and `load_balance_hosts` is refused (HA WS-8)
+
+Affects you only if the server's Postgres connection names **more than one host** — `host=n1,n2,n3`,
+`postgresql://n1,n2/yuzu`, a `PGHOST`/`PGHOSTADDR` list in the server's environment, or a host list in
+the `pg_service.conf` entry a `service=` DSN or `PGSERVICE` names — or sets `load_balance_hosts` (in
+the DSN, `PGLOADBALANCEHOSTS` or that service entry). A single host without `load_balance_hosts`,
+including a proxy or managed endpoint (RDS, Azure Flexible Server, Cloud SQL, the shipped HAProxy
+compose), is unaffected.
+
+Check before upgrading — look for a host list or load balancing in the DSN and the server's environment:
+
+```bash
+grep -rnE 'YUZU_POSTGRES_DSN|postgres-dsn|PGHOST|PGHOSTADDR|PGLOADBALANCEHOSTS|PGSERVICE' \
+  /etc/yuzu/ /etc/systemd/system/yuzu-server.service* <your compose/env files> 2>/dev/null
+```
+
+If that shows `service=` or `PGSERVICE`, also read the named entry in the service file libpq uses
+(`PGSERVICEFILE`, else `~/.pg_service.conf` of the server's user, else `pg_service.conf` in
+`PGSYSCONFDIR`) for `host`, `hostaddr`, `load_balance_hosts` and `target_session_attrs`.
+
+- **No `target_session_attrs` set:** the server adds `target_session_attrs=read-write` and logs a
+  warning at startup (`... using target_session_attrs=read-write ...`). It will no longer connect to a
+  standby, which it previously could do silently whenever a standby was listed first. The DSN is
+  rebuilt from libpq's own parse — the same settings in keyword form — and checked option by option
+  before use. Set the attribute yourself to silence the warning.
+- **`read-write` or `primary`:** unchanged.
+- **Any other value** (`any`, `read-only`, `standby`, `prefer-standby`, or an unrecognised one): **the
+  server refuses to start** with `Invalid --postgres-dsn: ...`. Change it to `read-write` (or remove it)
+  before upgrading.
+- **`load_balance_hosts` set to anything but `disable`** (in the DSN or `PGLOADBALANCEHOSTS`), with any
+  number of hosts: **the server refuses to start**. Remove it (or set `disable`) before upgrading. The
+  server writes to one primary, so with read-write the shuffle balances nothing — and `/readyz` holds
+  one connection, so it cannot see a host that fails only some of the pool's shuffled connections.
+- **A `service=` entry or `PGSERVICE`:** libpq applies the service file only when it connects, so
+  the server checks what libpq resolved on its first Postgres connection at startup, and refuses to
+  start (`Invalid Postgres connection settings: ...`) if the resolved settings set
+  `load_balance_hosts`, or list several hosts without `target_session_attrs=read-write` (or
+  `primary`) — it cannot add the attribute to a service file, so set it there yourself. The readiness
+  probe repeats the check each time it opens a connection, but it keeps a healthy one open, so a
+  later edit that breaks these rules shows on `/readyz` only at its next reconnect — **restart the
+  server after editing the service file**.
+- **Not checked — set `target_session_attrs=read-write` yourself:** one host *name* that resolves to
+  several servers (DNS round-robin, a Kubernetes headless service).
+
+## Behaviour change: `/readyz` now goes red when Postgres is unreachable, and shutdown can hold for a drain grace (HA WS-8, ADR-2002 §12)
+
+`/readyz` gains a gating `pg_reachable` row, fed by a small probe on its own Postgres connection. Before
+this change, `/readyz` stayed **200** through a Postgres outage whenever the server had idle pooled
+connections or no traffic (the pool's connect breaker only notices a failed *new* connection, and every
+store's row only reports whether it opened at startup). A load balancer health-checking `/readyz` kept
+sending traffic to a server that could not serve it.
+
+What you may observe after upgrading:
+
+- **`/readyz` answers 503 during a database outage or failover**, with `"failed_stores":["pg_reachable"]`
+  and a `"pg"` reason (`unreachable`, `stale`, `read_only`, `not_yet_probed`). During a Postgres failover
+  every replica goes red at once, for roughly the failover time. If an orchestrator's **liveness** probe
+  points at `/readyz`, move it to `/livez` before upgrading — otherwise a database blip restarts every
+  server.
+- **One more Postgres connection per server** (the probe). Budget `N_servers × 2` connections beyond the
+  pool against `max_connections` (the other extra one is the leader-election connection) — the full
+  formula is in `server-admin.md`, "Sizing `max_connections`".
+- **The shipped `yuzu-postgres` images now reserve connection slots for the app role** (#4943):
+  `reserved_connections = 40` (env `YUZU_PG_RESERVED_CONNECTIONS`) and `GRANT pg_use_reserved_connections`
+  to the app role, applied at **first boot only** (PostgreSQL 16 or newer). Three cases:
+  - **A fresh install or reinstall** (a new, empty data volume) picks up the new default **silently, with no
+    action needed** — but it also reduces headroom for third-party tooling (a backup job, a monitoring agent)
+    sized against `max_connections` alone with no margin by up to 40 connections versus a deployment built
+    before this release.
+  - **An in-place upgrade of an existing database does NOT pick this up** — the new default only applies at
+    first boot, and an existing data volume already had its first boot. Without action, a backup job or
+    ad-hoc session can still take the slot the `/readyz` probe needs to reconnect, same as before this release.
+  - **To apply it to that existing database**, run the `ALTER SYSTEM` (restart) and the `GRANT` by hand as
+    "Sizing `max_connections`" above shows.
+
+  **A new boot-time failure mode on the Postgres container itself**, not just the server binary: both
+  `yuzu-postgres` images now refuse to start if `YUZU_PG_RESERVED_CONNECTIONS` is set at or past
+  `max_connections − superuser_reserved_connections` — that value would leave zero connection slots any
+  other client could ever use. Only reachable by explicitly setting the env var too high; the shipped
+  default (40) never triggers it. On the single-node image this refusal happens after the role/database/grant
+  already exist, so restarting the same container with a corrected value does not retroactively apply
+  anything — see the note in "Sizing `max_connections`" above.
+- **A new alert, `YuzuServerPostgresUnreachable`**, and three `yuzu_server_pg_reachab*` metrics — see
+  `docs/user-manual/metrics.md`.
+- **New flag `--shutdown-drain-seconds`** (`YUZU_SHUTDOWN_DRAIN_SECONDS`, default **0**, max 60). On
+  `SIGTERM` the server keeps serving for at least that long after `/readyz` turns `503 draining`, so a load
+  balancer stops routing to it before the listener closes. The default 0 keeps today's shutdown timing;
+  set it for any deployment behind a load balancer, **and raise your orchestrator's stop timeout by the
+  same amount** (guidance in `docs/user-manual/server-admin.md`, "Load balancers and shutdown drain"). The
+  execution-drain wait it sits alongside is now timed in wall-clock seconds (at most 30 s) rather than
+  counted as 30 polls.
+- **`/readyz` also goes red on a primary that refuses writes** (`default_transaction_read_only` on — some
+  managed Postgres services do this when storage fills), reported as `"pg":"read_only"`.
+- **Multi-host `--postgres-dsn` now requires `target_session_attrs=read-write`** — a breaking change
+  with its own section above.
+- **Docker healthchecks.** The demo and viz-UAT composes healthcheck `/readyz`; that is right for
+  readiness, but under Docker Swarm or an auto-heal sidecar an outage longer than the healthcheck's
+  retry window marks the container unhealthy and restarts it. Point restart-driving checks at `/livez`.
+
+**What to do:** point liveness probes at `/livez`, readiness at `/readyz`; size `max_connections` by the
+formula and apply the reserved-slot grant on an existing database; set `--shutdown-drain-seconds` and the
+recommended health-check thresholds if a load balancer fronts the server.
+
 ## Behaviour change: legacy `/api/executions*` routes are now management-group confined (#3789)
 
 The legacy pre-v1 `GET /api/executions` (list), `/{id}` (detail), `/{id}/summary`, `/{id}/agents`,
@@ -225,7 +468,9 @@ section has the per-route reference including the `503` shape and the `rerun` es
 `tar.rollup`, `filesystem.delete_lines`, `registry.delete_value`, `registry.delete_key`,
 `storage.clear`, `content_dist.stage`, `content_dist.execute_staged`, `content_dist.cleanup`,
 `content_dist.upload_file`, `tags.clear`, `script_exec.exec`, `script_exec.powershell`,
-`script_exec.bash`, `http_client.download`, `certificates.delete`, and `quarantine.quarantine`.
+`script_exec.bash`, `http_client.download`, `certificates.delete`, and `quarantine.quarantine`
+(19 as of this writing — `power_health.set_power_plan` and `printing.clear_queue` have since joined
+them, under the same rule).
 Dispatching any of them without explicit, non-empty `agent_ids` — an omitted/empty target, or a
 `scope` (including `"__all__"`, even alongside `agent_ids`) — is now refused with `400`
 (`"destructive action requires explicit in-scope agent_ids; broadcast and scope fan-out are
@@ -1060,7 +1305,10 @@ it was never in `ca.db` and stays a local file behind `KeyProvider` (`--ca-dir`)
   error on a genuine database error**, instead of a silently-empty or
   silently-false result.
 - Every other CA behavior — revocation semantics, CRL numbering, the single
-  `sign_agent_csr` chokepoint — is unchanged. Detail: `docs/pki-architecture.md`,
+  `sign_agent_csr` chokepoint — was unchanged by that migration. CRL numbering and
+  publication were later reworked for multiple server replicas (HA WS-6 slice 6.1):
+  see `docs/user-manual/server-admin.md` "vNEXT — CRL publishing is serialised in
+  Postgres". Detail: `docs/pki-architecture.md`,
   `docs/adr/0053-ca-store-postgres-migration.md`.
 - **Rollback caution:** see the InventoryStore section's "Rollback caution" note above — the
   same unconditional rollback-refusal applies to this store (its own dropped marker table).
@@ -1611,7 +1859,8 @@ a rollback is genuinely needed.
 - **Shutdown grace bounds now stack; raise your orchestrator's termination
   grace period, but understand what that does and does not buy you.** A
   graceful `SIGTERM` walks several independently-bounded waits — up to 30 s
-  draining in-flight executions, up to 5 s on the gRPC shutdown deadline
+  draining in-flight executions (plus any `--shutdown-drain-seconds` grace, HA WS-8, which runs
+  before everything listed here and adds to it — raise your stop timeout by the same amount), up to 5 s on the gRPC shutdown deadline
   (moved up by #3495 to run earlier in the sequence, ahead of the four
   joins below and several other quick housekeeping joins not separately
   listed here, though still after the execution drain — see below),
@@ -2768,11 +3017,100 @@ matching correctly treats as "must re-request" rather than a corruption state.
 There is no flag to disable the new gate. An admin caller, or a caller dispatching via the
 governed path with a redeemed approval ticket, is not subject to it.
 
+## Behaviour change: a `rule_id` outside the documented charset is now rejected at creation (#4665)
+
+`POST /api/v1/guaranteed-state/rules` and MCP `create_guardian_rule` now enforce the documented
+`rule_id` charset (`[A-Za-z0-9._-]+`, at most 256 bytes) at creation — a request whose `rule_id`
+violates it now gets `400` (REST) or an error (MCP), audited as `guaranteed_state.rule.create`
+`denied`, instead of being accepted on any non-empty string. This closes an operator-authored
+log-injection exposure (#4665): log lines across the Guardian/Spark subsystem now also neutralise
+a rule id or Spark key before printing it, but a `rule_id` that never conformed to the documented
+shape (a space, a newline, or any other disallowed byte) could previously still be created.
+
+**Who this affects:** almost nobody — the charset was already documented before this release, just
+not enforced, so create requests generated by the dashboard, the REST/MCP tooling, or any client
+following the documented contract are unaffected. This only changes behaviour for a caller that was
+relying on the previously-permissive accept-anything-non-empty behaviour to create a `rule_id`
+outside `[A-Za-z0-9._-]+` or longer than 256 bytes.
+
+**What to do — this is a hard cutover, not a migration, by deliberate decision:** enforcement at
+the server is create-only, so an existing rule whose `rule_id` predates this release and doesn't
+conform to the charset is never torn down *by the creation check itself*. But the server-side push
+builder now **excludes** any such row from every push it builds (logged at `error` with a sampled
+rate limit as `Guardian push: rule ... has a rule_id that fails the .../256-byte charset check
+(#4665) — excluding it from this push`, and counted in
+`yuzu_guardian_push_rule_excluded_total{reason="invalid_rule_id"}`), the same way an over-depth
+`spec_json` is already excluded — and the agent's `full_sync` path unconditionally tears down and
+rebuilds its ENTIRE active rule set from whatever the push actually contains. Put together: **the
+first `full_sync` an upgraded agent receives permanently disarms every rule with a non-conforming
+`rule_id`** (logged at `warn` on the agent, matching `full_sync is disarming N rule(s) with a
+rule_id outside the [A-Za-z0-9._-]+/256-byte charset (#4665) -- hard cutover, not preserved`). This
+is not silent — the server-side exclusion is both logged AND metered
+(`yuzu_guardian_push_rule_excluded_total`); the agent-side disarm is logged only, with no metric of
+its own yet — but it IS a real, one-time loss of a previously-enforcing control if you don't act
+first. Every OTHER rule in scope is unaffected either way — this only ever touches rows that were
+already unenforceable by the documented contract.
+
+**Finding a non-conforming legacy `rule_id` — do this BEFORE upgrading, not after:** `GET
+/api/v1/guaranteed-state/rules` returns every rule regardless of its `rule_id`'s shape; filter the
+response for any `rule_id` that doesn't match `^[A-Za-z0-9._-]{1,256}$` — that's the same predicate
+the server now enforces at creation. For each one you find, either delete it (see below) and
+recreate it under a conforming `rule_id`, or accept the loss consciously — there is no third option
+that preserves it under its existing id.
+
+**Removing a non-conforming `rule_id`:** the two delete surfaces have DIFFERENT restrictions, not
+a simple REST-restricted/MCP-unrestricted split. REST `DELETE
+/guaranteed-state/rules/{rule_id}` routes on the same charset regex the create path now enforces
+(`[A-Za-z0-9._-]+`, no length bound), so it **can't** reach a `rule_id` containing a byte outside
+that charset, but it has no length cap of its own and so **can** reach one that's charset-clean but
+over 256 bytes (a shape only possible pre-#4665, when creation had no length bound either). MCP
+`delete_guardian_rule`'s own input schema caps at `maxLength: 256` with no charset `pattern`, so it
+has the exact opposite gap: it **can** reach a charset-violating id (any length up to 256), but
+**can't** reach one that's charset-clean and over 256 bytes — the request is rejected by schema
+validation before the handler's own logic ever runs. A `rule_id` that violates BOTH (wrong charset
+AND over-length) is reachable by neither REST nor MCP; fall back to a direct database delete
+(`guaranteed_state_store.guaranteed_state_rules`) for that case.
+
+## Behaviour change: `preview_scope_targets` / `scope/preview` now resolve `from_result_set:`/`props.` atoms correctly (#4981)
+
+`POST /api/v1/scope/preview` and MCP `preview_scope_targets` previously evaluated a scope
+expression against a bespoke attribute resolver that only understood
+`ostype`/`arch`/`hostname`/`agent_version`/`tag:<key>` — a `from_result_set:<id>` or
+`props.<key>` atom silently resolved to unset, so the atom's comparison was always false, and
+`NOT from_result_set:<id>` inverted that to match every agent the caller could see regardless
+of the referenced set's real membership. Both surfaces now route through the same
+fail-closed evaluation ladder a real dispatch uses.
+
+**Who this affects:** anyone who has called either surface with an expression containing
+`from_result_set:` or `props.`. If you relied on the old (incorrect) match set for either atom
+kind, re-check any automation built on that response before upgrading — the direction of the
+correction depends on how the atom was used: a negated `NOT from_result_set:<id>` was, in
+practice, matching your whole visible fleet, and the corrected match set will generally be
+narrower and more accurate to what a real dispatch of the same expression would actually
+target; a plain (non-negated) `from_result_set:`/`props.<key>` atom always evaluated false under
+the old resolver, so its match set was previously stuck at 0 and the corrected set will
+generally be broader, now actually populated with real members.
+
+**New error responses a strict client should handle:**
+- **403 (REST only)** — a service-scoped API token calling `POST /api/v1/scope/preview` now gets
+  denied outright, rather than admitted with a silently narrowed match set (closing the same
+  cross-service-reach gap #4980 closed on a sibling result-set route). MCP `preview_scope_targets`
+  is unaffected by this change — it already denied a service-scoped token outright before this
+  release.
+- **404** `RESULT_SET_NOT_FOUND` (REST) / `kInvalidParams` (MCP) — a `from_result_set:<id>`
+  referencing a result set that is absent, expired, or not owned by the caller now aborts,
+  instead of silently matching nothing (or, negated, everything).
+- **503**, with a `retry_after_ms` hint — a degraded backend store or presence read now aborts
+  instead of under- or over-reporting the match set.
+
+A preview call no longer extends a referenced result set's TTL as a side effect — it is now a
+genuine read-only dry run, matching its documented `readOnlyHint: true`.
+
 ## Upgrade Order
 
 Always upgrade in this order:
 
-1. **Server** -- new server versions accept connections from older agents
+1. **Server** -- new server versions accept connections from older agents. Restarting the server while a gateway stays connected has a known limitation: see [Server-Side Setup](gateway.md#server-side-setup) (a gateway-only restart as a remedy was not tested)
 2. **Gateway** -- updated to match server protocol changes
 3. **Agents** -- can be upgraded via OTA or manually, in batches
 
@@ -2782,10 +3120,30 @@ Never upgrade agents before the server -- the server must understand the agent's
 
 Before upgrading any component:
 
-- [ ] Back up all data (see [Server Administration](server-administration.md))
-  - `yuzu-server.cfg`, `enrollment-tokens.cfg`, `pending-agents.cfg`
-  - All `.db` files (response store, audit, policies, **auth.db**, etc.) — use `sqlite3 <path> ".backup ..."` rather than `cp` against live WAL databases
-  - The **PostgreSQL database**, once your deployment carries one (ADR-0006 — bundled in the composes; provisioned natively by `install-server-postgres.sh`) — use `pg_dump --format=custom`; see [Server Administration § PostgreSQL Substrate](server-admin.md#postgresql-substrate) for the full backup/restore procedure and the ADR-0010 restore-pairing invariant (DB and `KeyProvider` keys-dir backups restore **together**)
+- [ ] Back up all data (see [Server Administration](server-admin.md))
+  - `yuzu-server.cfg`, `auto-approve.cfg` — enrollment tokens and pending agents are PostgreSQL-authoritative since HA WS-6 6.2 (`auth.enrollment_tokens` / `auth.pending_agents`); back them up as part of the `pg_dump` below, not as local files. A pre-6.2 install's `enrollment-tokens.cfg` / `pending-agents.cfg` are still worth including in a manual backup **taken before that upgrade** — they are the one-time import source at the first 6.2 boot (see the rolling-upgrade note below)
+  - The NVD cache `nvd_cves.db` in `--data-dir` (the one remaining server SQLite store) — use `sqlite3 <path> ".backup ..."` rather than `cp` against a live database
+  - The blob directories `agent-updates/` (or your `--update-dir`) and `upload-blobs/` in `--data-dir` — the database holds only the OTA-package and completed-upload records that point into them, so a restored dump without these directories leaves records with no files
+  - The **PostgreSQL database** (ADR-0006 — bundled in the composes; provisioned natively by `install-server-postgres.sh`) **and the whole `--ca-dir`**, taken at the same point in time — use `pg_dump --format=custom`; see [Server Administration § PostgreSQL Substrate](server-admin.md#postgresql-substrate) for the full backup/restore procedure and the ADR-0010 restore-pairing invariant (DB and `KeyProvider` keys-dir backups restore **together**)
+- [ ] **Upgrading to HA WS-6 6.2 or later, running more than one server replica?** Stop
+  every pre-6.2 replica before starting the first 6.2+ one. The one-time `enrollment-tokens.cfg`
+  / `pending-agents.cfg` import runs at boot on whichever replica starts first and stamps a
+  content-fingerprint marker in `auth.import_meta`; a second pre-6.2 replica started afterwards
+  against the same `--data-dir` files would only ever match or mismatch that already-consumed
+  marker, never contribute new state — its own `.cfg` files are simply skipped or, if they differ,
+  refused (never merged). A restored pre-6.2 backup with a fingerprint that no longer matches the
+  live `auth.import_meta` row is likewise **refused, not merged** — look for a `CRITICAL` log line
+  naming the mismatched file and the `yuzu_server_enrollment_import_total{outcome="fingerprint_mismatch"}`
+  metric; see [ADR-2002 §8](../adr/2002-high-availability-architecture.md#8-pki--ca-high-availability-q8) for the marker/fingerprint mechanics.
+  **A fingerprint mismatch does NOT block boot** — unlike a PG error or read failure with the file
+  present (which refuses to start, the same posture as the first-boot admin seed), a mismatch is
+  logged and the server starts normally with whatever enrollment state is already in Postgres; the
+  stale `.cfg` file's rows are simply never imported, and the file itself is left in place under its
+  original name (not renamed to `.imported`, since nothing was imported). Recover by comparing the
+  stale file's rows against the current `auth.enrollment_tokens`/`auth.pending_agents` (dashboard, or
+  `psql`), manually recreating anything genuinely missing (mint a new token / re-add the pending
+  agent), then archiving or deleting the leftover `enrollment-tokens.cfg` / `pending-agents.cfg` once
+  you've confirmed nothing in it is needed.
 - [ ] **Verify the server's clock before upgrading** (`timedatectl status` or
   `chronyc tracking`; under Docker it is the host's clock that matters). Rows
   already stamped cannot be protected retroactively by any setting, and a server
@@ -2893,6 +3251,28 @@ Before upgrading any component:
   `SERVICE_STOPPED` report doesn't trigger the recovery actions above
   either). See *Stopping a wedged agent* in
   [Server Administration](server-admin.md).
+- [ ] **Agent logging is now asynchronous, with a new self-exit code 5 (#4666
+  PR-2):** on upgrade, the agent stops writing log lines synchronously on the
+  thread that produced them and instead hands them off to a dedicated
+  logging worker thread over a fixed-size, pre-allocated 8192-slot queue
+  (3.34 MB of RSS, paid regardless of how much is actually logged). Under
+  sustained overload the queue drops the oldest still-queued lines
+  (`overrun_oldest`) rather than blocking or growing; there is no
+  `--log-sync` opt-out. Not a breaking change: same log format, same
+  `--log-file`/rotation behaviour, no new flags, with one exception: the
+  "Received signal, shutting down..." line on `SIGINT`/`SIGTERM`/Ctrl-C used
+  to be a raw stderr-only write and now goes through the same configured
+  logger as everything else, so it also lands in `--log-file` and picks up
+  JSON formatting under `--log-format json` — and, since it's now an
+  ordinary `info`-level line rather than an unconditional raw write, it is
+  silently **absent entirely** at `--log-level warn` or above (previously it
+  always printed regardless of level). The other new operator-visible
+  surface is a fifth self-exit code: tearing down the async logger during
+  shutdown either times out on a 2-second internal watchdog or fails
+  outright, and either cause self-terminates with **exit code 5**, distinct
+  from the existing 1, 3, and 4. A supervisor script or alert keyed to a
+  fixed exit-code set should widen it to include 5. See *Stopping a wedged
+  agent* in [Server Administration](server-admin.md).
 - [ ] **Changed server signal handling (Linux/macOS, #3007):** the identical fix
   as above, now applied to the server — graceful shutdown runs on a dedicated
   watcher thread (fixes the same abort/hang class on `SIGTERM`, previously
@@ -2954,7 +3334,7 @@ curl -s http://localhost:8080/livez
 
 ### Docker
 
-The reference deployment template lives at `deploy/docker/docker-compose.reference.yml` — copy it into your deployment directory next to a `.env` file, set `YUZU_VERSION`, and harden per the inline TLS checklist in the file header **before** exposing the stack to any untrusted network. The compose file declares a named volume (`server-data`) that survives container replacement and holds every piece of mutable state: `yuzu-server.cfg`, all SQLite databases, `enrollment-tokens.cfg`, `pending-agents.cfg`, `auto-approve.cfg`, and OTA binaries.
+The reference deployment template lives at `deploy/docker/docker-compose.reference.yml` — copy it into your deployment directory next to a `.env` file, set `YUZU_VERSION`, and harden per the inline TLS checklist in the file header **before** exposing the stack to any untrusted network. The compose file declares a named volume (`server-data`) that survives container replacement and holds the remaining piece of mutable state kept on disk: `yuzu-server.cfg`, `auto-approve.cfg`, the NVD cache SQLite database, and OTA binaries. Enrollment tokens and pending agents are PostgreSQL-authoritative (HA WS-6 6.2, `auth.enrollment_tokens` / `auth.pending_agents`) — a pre-6.2 volume's `enrollment-tokens.cfg` / `pending-agents.cfg` are imported once, automatically, at the first 6.2+ container's boot, then renamed to `<name>.cfg.imported`.
 
 An upgrade is a pull-and-restart:
 
@@ -3034,6 +3414,8 @@ Start-Service yuzu-server  # or start manually
 ```
 
 ## Upgrading the Gateway
+
+If the server was restarted while this gateway stayed connected, see the known limitation under [Server-Side Setup](gateway.md#server-side-setup) first; whether restarting only the gateway recovers it was not tested.
 
 ### Linux (systemd)
 
@@ -3494,6 +3876,7 @@ overridden.
 | Symptom | Diagnose | Fix |
 |---|---|---|
 | `systemctl status yuzu-gateway` shows `start-limit-hit` / `failed` | `journalctl -t yuzu-gateway \| grep -i cookie` shows "insecure distribution cookie" (for manual/`foreground` or container runs, check stdout / `gateway.log` instead) | Create `/etc/yuzu/gateway.env` with `YUZU_GW_COOKIE=$(openssl rand -hex 32)` (see above), then `systemctl reset-failed yuzu-gateway && systemctl start yuzu-gateway`. **Do not** use `YUZU_GW_ALLOW_DEFAULT_COOKIE=1` in production. |
+| Gateway container restarts at boot on an AMX-capable Intel host (Sapphire Rapids+, AWS c7i/m7i/r7i) | Container log has `sys_sigaltstack(): Internal error: Failed to set alternate signal stack`; image is 0.13.0 through 0.14.0-rc4 (#2150) | Pull an image that carries the #2150 fix (0.14.0-rc5 or later). Until then, run the gateway on a host without AMX. A single-node gateway may use `yuzu-gateway-chisel` instead; a clustered one may not (it never joins the cluster). Do not roll back to 0.13.0 on that host: it is affected too. |
 
 > The generated `/etc/yuzu/gateway.env` is intentionally **preserved across
 > `apt purge` / `rpm -e`** (the `/etc/yuzu` directory may be shared with other
@@ -3667,6 +4050,73 @@ every enrolled agent.
 on the install path (`POST /api/product-packs`). List, get, and
 uninstall paths do not re-verify, so already-installed unsigned packs
 remain queryable and uninstallable after upgrade.
+
+### vNEXT — Access-review CSV export gains a leading metadata line (breaking for fixed-column-index CSV consumers)
+
+`GET /api/v1/access-reviews/export?format=csv` (SOC 2 CC6.2 evidence) now
+emits one new line before the existing header row:
+
+```
+# rbac_enforcement=enabled
+principal_type,principal_id,display_name,owner_or_email,roles,effective_permission_count,last_activity_ms,last_activity_kind,classification,lifecycle_state,source
+user,alice,...
+```
+
+This line is unconditional — present even when the grant population is
+empty — so it stamps whether RBAC was actually enforced when the file was
+pulled, travelling with the retained/offline copy an auditor keeps (see
+`rest-api.md`'s `rbac_enforcement` section for what the three values mean).
+
+**This breaks any consumer that assumes row 1 is the header.** Verified
+empirically against this exact output shape (not a blanket claim about "CSV
+tools" — the actual split matters):
+
+- **Silently WRONG output, no error, no warning:** Python's `csv.DictReader`
+  reads the new line 1 as a single-column header, then feeds the REAL header
+  row (line 2) into the result set as if it were data — every field name and
+  every row is now misaligned. The `awk -F, 'NR>1'` idiom (and any hand-rolled
+  "skip the first line" loop in another language) does the same thing: it now
+  emits the real header row as a spurious first "data" row, ahead of the
+  genuine data rows, which otherwise parse correctly.
+- **Also silently WRONG, not a loud failure:** `pandas.read_csv(path)` with
+  its default settings does **not** raise `ParserError` on this shape — do
+  not rely on pandas to "fail loud" here. Because every row past line 1 is
+  uniformly wider than the 1-field metadata line, pandas' documented
+  "extra leading columns become an implicit index" heuristic kicks in: it
+  silently produces a 1-column, tuple-indexed `DataFrame` with the metadata
+  line as the sole column name and the leading fields folded into a
+  `MultiIndex`, leaving only the last field (`source`) as the actual,
+  mislabeled `DataFrame` column — wrong, but no exception. (Verified
+  directly against pandas 3.0.6, both the `c` and `python` engines; on that
+  version, neither engine's default settings raise instead of silently
+  misparsing — untested against older pandas majors, so treat "on 3.0.6"
+  as the scope of this claim, not a guarantee for every pandas release.)
+
+**The fix is the same for every consumer class: skip exactly one line before
+treating the next line as the header**, verified working against each tool
+above:
+
+```python
+# csv.DictReader
+with open(path, newline="") as f:
+    next(f)                      # skip the metadata line
+    reader = csv.DictReader(f)   # now reads the real header correctly
+```
+
+```bash
+# awk (was NR>1 under the old format; now NR>2)
+awk -F, 'NR>2' access-review.csv
+```
+
+```python
+# pandas
+df = pd.read_csv(path, skiprows=1)
+```
+
+A consumer that already treats the file as free-form text and looks for the
+`# rbac_enforcement=` prefix, or that reads the `rbac_enforcement` field from
+the sibling **JSON** export (`GET .../export` without `?format=csv`, or the
+frozen campaign row's `rbac_enforcement` field), is unaffected either way.
 
 ### Executions-history PR 2 — `responses.execution_id` exact correlation
 

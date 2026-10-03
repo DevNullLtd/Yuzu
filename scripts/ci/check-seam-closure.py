@@ -208,9 +208,14 @@ IMPL_TUS = [
     # hoisting the last symbols it needed (dex_signal_groups → dex_types.hpp,
     # dex_device_score → dex_read_builders.hpp). NOTE: this check is INCLUDE-purity
     # (no presentation/httplib header in the TU's include closure), NOT link-purity
-    # — dex_read_model.cpp still CALLS symbols whose definitions live in the
-    # presentation dex_routes.cpp, a core→presentation LINK residual tracked in
-    # #4579 (only meaningful at the WS-B2 physical split; inert in today's monolith).
+    # — dex_read_model.cpp used to still CALL symbols whose definitions lived in
+    # the presentation dex_routes.cpp, a core→presentation LINK residual tracked
+    # in #4579. That residual is now CLOSED (ADR-0031 WS-A4 PR-1 F1 fix,
+    # 2026-09-28: the definitions moved into dex_types.cpp/dex_window.cpp/
+    # dex_read_model.cpp) and enforced by the LINK-level twin this include-purity
+    # check cannot be — scripts/ci/check_core_presentation_link.py, wired as the
+    # meson test() `dex link no presentation symbols` (suite:server) since it
+    # needs compiled objects, unlike this pure source-tree walk.
     "server/core/src/dex_read_model.cpp",
     # dex_app_perf_model.cpp backs the same LocalDexPerfApi (it defines
     # app_perf_fleet_trend/app_perf_group_trend/app_perf_device_summaries +
@@ -305,10 +310,11 @@ EXTRA_STORE_TYPE_TOKENS = ["AppPerfDailyRow", "AppPerfFleetRow", "AuthDB",
 IMPL_HTTPLIB_ALLOWED = {"server/core/src/event_bus.hpp"}  # root-relative, exact file only
 
 # ── Family definitions ────────────────────────────────────────────────────
-# Five families so far: `network` (WS-A4 item 1's pilot), `verify` (WS-A4
+# Nine families so far: `network` (WS-A4 item 1's pilot), `verify` (WS-A4
 # #4250, the SECOND family), `compliance` (the THIRD, #4337), `device`
-# (the FOURTH, #4484) and `dex` (the FIFTH — the DEX signals seam). Each set
-# covers the
+# (the FOURTH, #4484), `dex` (the FIFTH — the DEX signals seam), `dex_perf`
+# (the SIXTH — the DEX app-perf-over-time seam), `schedule` (the SEVENTH),
+# `workflow` (the EIGHTH) and `guardian` (the NINTH). Each set covers the
 # presentation-side TUs plus BOTH halves of the seam header pair: the
 # abstract `*_api.hpp` and the core-only `*_api_local.hpp` (#4249). Enforcing
 # the local header pins its own purity (forward decls only); it cannot
@@ -334,6 +340,16 @@ FAMILIES = {
             "server/core/src/device_ui.cpp",
             "server/core/src/device_api.hpp",
             "server/core/src/device_api_local.hpp",
+            # device_lens_routes.{cpp,hpp} — the DEX/Guardian device-page lens
+            # fragments, split out of device_routes.cpp in the SAME wave but
+            # left outside this enforced set until their own rewire (issue
+            # #4576 + the guardian-lens deferral). Now onto the DexApi/
+            # GuardianApi abstract seams (see device_lens_routes.hpp's own
+            # banner) — enrolled here alongside device_routes.cpp/device_ui.cpp
+            # rather than as a standalone family, since it is this family's
+            # own presentation surface, just a second TU.
+            "server/core/src/device_lens_routes.cpp",
+            "server/core/src/device_lens_routes.hpp",
         ],
     },
     "network": {
@@ -385,11 +401,14 @@ FAMILIES = {
     # `dex_read_builders.hpp`'s other includers are OUTSIDE this set: they
     # legitimately reach the store (core side of the seam), like every other
     # family's `*_api.cpp`. The CONSUMERS `rest_api_v1.cpp` / `mcp_server.cpp` /
-    # `dex_routes.cpp` / `device_lens_routes.cpp` are multi-family / mixed TUs
-    # and stay INSPECTED-NOT-ENFORCED (reviewed by hand), same posture as the
-    # other families' twin-registration files. REST and MCP both route through
-    # `DexApi`; the dashboard fragments and the /fragments/device/dex lens are
-    # deferred (follow-up).
+    # `dex_routes.cpp` are multi-family / mixed TUs and stay
+    # INSPECTED-NOT-ENFORCED (reviewed by hand), same posture as the other
+    # families' twin-registration files. REST and MCP both route through
+    # `DexApi`; `device_lens_routes.cpp`'s `/fragments/device/dex` lens is ALSO
+    # now rewired onto `DexApi` (issue #4576) and is enforced too — but via the
+    # `device` family's TU set above (it is that family's own second
+    # presentation TU), not this one, since `dex`'s enforced set here is
+    # header-only.
     "dex": {
         "tus": [
             "server/core/src/dex_types.hpp",
@@ -401,11 +420,17 @@ FAMILIES = {
     # dex_perf: the SIXTH family — DexPerfApi, the DEX app-perf-over-time
     # sequel to `dex` (DEX signals). REST and MCP ARE rewired through this
     # seam (zero remaining direct AppPerfProviders/DexPerfFn calls in
-    # rest_api_v1.cpp/mcp_server.cpp) — same header-only posture as `dex` for
-    # a DIFFERENT reason: those two consumer TUs are multi-family and stay
-    # inspected-not-enforced (same as every family), not because the rewire is
-    # outstanding. Only the dashboard (dex_app_perf_ui.*, dex_perf_ui.cpp) is
-    # unrewired, tracked #4626 (mirroring `dex`'s #4576).
+    # rest_api_v1.cpp/mcp_server.cpp). #4626 additionally rewired and ENROLLED
+    # the dashboard consumer TUs (`dex_perf_ui.cpp`, `dex_app_perf_ui.hpp`,
+    # `dex_app_perf_ui.cpp`) — the retired `AppPerfProviders` bundle's last
+    # production consumer — so this family now enforces its UI TUs too,
+    # narrowing the gap to `network`'s five-consumer-enforced posture.
+    # `dex_routes.cpp`/`.hpp` (the ROUTE-registration half) stay OUTSIDE this
+    # set, same as `dex`'s own `dex_routes.cpp` — that TU also registers the
+    # still-store-coupled DEX-SIGNALS fragments (GuaranteedStateStore-backed,
+    # out of scope for both `dex` and `dex_perf`'s own seam builds), so
+    # enforcing it would require splitting the DEX-signals dashboard rewire
+    # (tracked #4576) into this family's scope, which it is not.
     "dex_perf": {
         "tus": [
             "server/core/src/app_perf_types.hpp",
@@ -413,6 +438,9 @@ FAMILIES = {
             "server/core/src/dex_perf_model.hpp",
             "server/core/src/dex_perf_api.hpp",
             "server/core/src/dex_perf_api_local.hpp",
+            "server/core/src/dex_perf_ui.cpp",
+            "server/core/src/dex_app_perf_ui.hpp",
+            "server/core/src/dex_app_perf_ui.cpp",
         ],
     },
     # `schedule` (ADR-0031 WS-A4, the SEVENTH family through the seam) — the
@@ -501,10 +529,11 @@ FAMILIES = {
     # structs relocated out of `guardian_model.hpp` (that header itself
     # forward-declares `GuaranteedStateStore`/`BaselineStore` and so cannot
     # sit in this family's enforced set — see its own file banner).
-    # `device_lens_routes.cpp`'s `/fragments/device/guardian` fragment is
-    # NOT rewired onto this seam — mirrors the `dex` family's OWN
-    # device-lens deferral (ISSUE #4576) verbatim, tracked as its own
-    # follow-up.
+    # `device_lens_routes.cpp`'s `/fragments/device/guardian` fragment IS now
+    # rewired onto this seam (`GuardianApi::device_guards`, mirroring the
+    # `dex` family's own ISSUE #4576 rewire) and enforced — but via the
+    # `device` family's TU set, not this one, since `guardian`'s own enforced
+    # set here is header-only (see the `device` family entry above).
     "guardian": {
         "tus": [
             "server/core/src/guardian_types.hpp",

@@ -114,6 +114,25 @@
 ///   - GET sidebar/detail: never audited (pure reads), matching every prior
 ///     extraction's read/write audit split.
 ///
+/// #4983 (added after the initial extraction) — `POST
+/// /fragments/result-sets/create`'s parsed `device_ids` (the CSV-paste
+/// import) is now additionally checked for existence + scope, mirroring the
+/// identical fix on `POST /api/v1/result-sets` (REST) and MCP
+/// `create_result_set` from the same PR: a non-empty `device_ids` is gated
+/// through `deps.fleet_read_fn` (`Infrastructure:Read`, ADR-0017) and checked
+/// against `deps.all_agent_ids_fn()`'s presence-merged universe (called ONCE
+/// per request, not per id). Unlike REST's `rs_err`/A4-envelope 400 and MCP's
+/// JSON-RPC error, this fragment reports the rejection via THIS file's own
+/// existing idiom — the same audited-"denied" + error-toast +
+/// sidebar-re-render shape the `created.error()` failure branch just below
+/// already uses — never a JSON body, since this route serves an HTMX
+/// fragment. `deps.fleet_read_fn` itself, when NOT admitted, writes its own
+/// (JSON, non-HTML) 401/403/503 body directly onto `res` — the SAME accepted
+/// shape `dashboard_routes.cpp`'s `/fragments/results` already lives with for
+/// an HTMX consumer (see that route's own comment). A request that omits
+/// `device_ids` (or supplies an empty array) is completely unaffected — the
+/// gate, the registry read, and the audit call are all skipped.
+///
 /// Routes (6) — every route gates on `deps.deny_service_scoped_fn` (target
 /// varies per-route below) THEN `deps.auth_fn`; none uses `perm_fn`/
 /// `scoped_perm_fn` (this is an owner-scoped surface, not an RBAC-securable
@@ -126,6 +145,8 @@
 ///   POST /fragments/result-sets/(rs_[0-9a-f]+)/delete  (target_type="ResultSet", target_id=id)
 ///   POST /fragments/result-sets/create                 (target_type="ResultSet", no target_id)
 
+#include "authz_gates.hpp" // #4983 -- authz::FleetReadGate, the create route's device_ids gate result
+
 #include <yuzu/metrics.hpp>
 #include <yuzu/server/auth.hpp>
 
@@ -134,6 +155,7 @@
 #include <functional>
 #include <optional>
 #include <string>
+#include <vector>
 
 namespace yuzu::server {
 class HttpRouteSink;
@@ -169,10 +191,55 @@ struct Deps {
     using AuditFn = std::function<bool(const httplib::Request&, const std::string& action,
                                        const std::string& result, const std::string& target_type,
                                        const std::string& target_id, const std::string& detail)>;
+    /// #4983 — same shape as `RestApiV1::FleetReadFn` / the `fleet_read_fn`
+    /// closure server.cpp already threads into several other `Deps`-based
+    /// route modules (`dashboard_routes.cpp`'s `set_fleet_read_fn`,
+    /// `TarTreeRoutes::set_fleet_read_fn`). This module's `POST
+    /// /fragments/result-sets/create` (the dashboard CSV-paste import) had
+    /// the identical unchecked-`device_ids` gap `POST /api/v1/result-sets`
+    /// (REST) and MCP `create_result_set` were fixed for in the same PR —
+    /// this closure supplies the same admit-then-filter `Infrastructure:Read`
+    /// chokepoint (ADR-0017) for this fragment's `device_ids`. Wired to the
+    /// SAME `fleet_read_fn` lambda those other modules receive (server.cpp),
+    /// not a new one. Empty/default `{}` = the create route answers with its
+    /// own misconfiguration toast whenever `device_ids` is non-empty (see the
+    /// route body) — a request without `device_ids` is unaffected either way.
+    using FleetReadFn =
+        std::function<authz::FleetReadGate(const httplib::Request&, httplib::Response&,
+                                           const std::string& securable_type,
+                                           const std::string& operation)>;
+    /// #4983 — same shape/contract as `RestApiV1::AllAgentIdsFn` (see that
+    /// type's doc comment in rest_api_v1.hpp for the full presence-merged-
+    /// vs-local-only rationale): backed by `AgentRegistry::all_ids()`, called
+    /// ONCE per request and cached by the caller, never per supplied id.
+    /// Empty/default `{}` = the create route answers with its own
+    /// misconfiguration toast whenever `device_ids` is non-empty.
+    using AllAgentIdsFn = std::function<std::vector<std::string>()>;
+    /// #5047: same shape/contract as `yuzu::server::TierPolicyFn` (auth_routes.hpp)
+    /// — a local typedef, not a reused one, matching this struct's own
+    /// AuthFn/DenyServiceScopedFn/AuditFn convention (no auth_routes.hpp
+    /// include). Applied to the 4 mutating fragments (pin/unpin/delete/
+    /// create) right after `auth_fn`, closing the same cross-transport
+    /// MCP-tier bypass their `/api/v1/result-sets` JSON twins close — these
+    /// dashboard fragments are plain HTTP endpoints reachable with any
+    /// Bearer token, not cookie-session-only. `{}` unwired fails closed
+    /// (503) for a TIERED session, passes through for an untiered one — see
+    /// `TierPolicyFn`'s own doc comment for the rationale.
+    using TierPolicyFn =
+        std::function<bool(const httplib::Request&, httplib::Response&, const auth::Session&,
+                           const std::string& securable_type, const std::string& operation)>;
 
     AuthFn auth_fn;
     DenyServiceScopedFn deny_service_scoped_fn;
     AuditFn audit_fn;
+    /// #4983 — see `FleetReadFn`'s doc comment above. Consulted ONLY by
+    /// `POST /fragments/result-sets/create`, and only when its `device_ids`
+    /// is non-empty.
+    FleetReadFn fleet_read_fn;
+    /// #4983 — see `AllAgentIdsFn`'s doc comment above. Same consultation
+    /// scope as `fleet_read_fn` above.
+    AllAgentIdsFn all_agent_ids_fn;
+    TierPolicyFn tier_policy_fn;
     /// `ServerImpl::result_set_store_`. Null -> every route degrades per
     /// this file's "THREE-WAY DEGRADE ASYMMETRY" doc comment above (there is
     /// no `is_open()` check anywhere in this module — matches the original

@@ -134,7 +134,13 @@ T2_RE = re.compile(
     r"Guardian spark: arm committed for rule '([^']+)' \(epoch=(\d+), "
     r"incarnation=(\d+), type=([\w-]+), via=([\w-]+), attach_to_commit_ms=(\d+)\)"
 )
-ARM_LEGACY_RE = re.compile(r"(?:file|service|registry) guard armed for rule '([^']+)'")
+# #4665: the "Guardian: " prefix is REQUIRED in the pattern text itself, unlike the other
+# five anchored regexes below - the real emitter (guardian_engine.cpp's file/service/registry
+# guard-armed spdlog::info calls) writes `msg` as "Guardian: file guard armed for rule '...'
+# (...)", so the defining phrase does NOT start at msg's position 0 without it. Every call
+# site now uses `.match()` (position-0-anchored); dropping this prefix would silently break
+# every genuine legacy-arm match, not just close the forgery this anchoring exists to close.
+ARM_LEGACY_RE = re.compile(r"Guardian: (?:file|service|registry) guard armed for rule '([^']+)'")
 ARM_SPARK_RE = re.compile(r"SparkEngine: armed '([^']+)'")
 BACKEND_RE = re.compile(r"detection backend = (\w+)")
 NETWORK_CONNECTED_RE = re.compile(r"Guardian engine network-connected")
@@ -703,12 +709,18 @@ def _fetch_window(window_start_ts):
 
 
 def _find_first(events, regex, at_or_after=None, strictly_after=None):
+    # #4665: anchored (`.match()`, not `.search()`) for the identical reason the direct
+    # T0_RE/T0D_RE/T1_RE call sites are anchored below - this helper is the indirect path
+    # those three regexes (plus PUSH_CMD_RE, whose own literal prefix also sits at msg's
+    # start) reach _fetch_window()'s events through, and an unanchored search here would
+    # leave every live-measurement caller (observe_t0/observe_t0d/observe_t1) exploitable
+    # even after the direct sites were fixed.
     for p in events:
         if at_or_after is not None and p["ts"] < at_or_after:
             continue
         if strictly_after is not None and p["ts"] <= strictly_after:
             continue
-        m = regex.search(p["msg"])
+        m = regex.match(p["msg"])
         if m:
             return p, m
     return None, None
@@ -720,7 +732,7 @@ def find_own_push_cmd_raw(events, t0_ts):
     accounting by RAW LINE CONTENT (not timestamp value), so a genuinely
     distinct second push command landing at the identical millisecond (F9)
     is still counted."""
-    candidates = [p for p in events if p["ts"] <= t0_ts and PUSH_CMD_RE.search(p["msg"])]
+    candidates = [p for p in events if p["ts"] <= t0_ts and PUSH_CMD_RE.match(p["msg"])]
     return candidates[-1]["raw"] if candidates else None
 
 
@@ -744,7 +756,7 @@ def classify_t2(events, epoch, floor, expected_rule_ids, own_push_raw, backend, 
     for p in sorted(events, key=lambda p: p["ts"]):
         if p["ts"] < t0_ts:
             continue
-        m0d = T0D_RE.search(p["msg"])
+        m0d = T0D_RE.match(p["msg"])
         if m0d:
             epoch2 = int(m0d.group(1))
             if epoch2 != epoch and p["ts"] > t0d_ts:
@@ -753,7 +765,7 @@ def classify_t2(events, epoch, floor, expected_rule_ids, own_push_raw, backend, 
                 continue
         if next_t0d_ts is not None and p["ts"] >= next_t0d_ts:
             continue
-        mpush = PUSH_CMD_RE.search(p["msg"])
+        mpush = PUSH_CMD_RE.match(p["msg"])
         if mpush:
             if not own_excluded and own_push_raw is not None and p["raw"] == own_push_raw:
                 own_excluded = True
@@ -761,7 +773,7 @@ def classify_t2(events, epoch, floor, expected_rule_ids, own_push_raw, backend, 
             push_lines.append(p)
             continue
         if backend == "spark":
-            m2 = T2_RE.search(p["msg"])
+            m2 = T2_RE.match(p["msg"])
             if not m2:
                 continue
             rid, epoch_s, inc_s, typ, via, ms_s = m2.groups()
@@ -786,7 +798,7 @@ def classify_t2(events, epoch, floor, expected_rule_ids, own_push_raw, backend, 
                               "reobserved_adopt": inc_v <= floor and via == "callback-adopt"}
             remaining.discard(rid)
         else:
-            mL = ARM_LEGACY_RE.search(p["msg"])
+            mL = ARM_LEGACY_RE.match(p["msg"])
             if not mL:
                 continue
             rid = mL.group(1)
@@ -1477,7 +1489,7 @@ def run_repeat(op, phase, backend, trigger_kind, cohort_ids, exp_rule_ids, repea
     row["legacy_lines_before_t0d"] = result["legacy_before_t0d"]
     row["n_reobserved_adopt"] = sum(1 for v in result["selected"].values() if v.get("reobserved_adopt"))
     row["n_arm_lines"] = (
-        sum(1 for p in last_events if p["ts"] >= t0["ts"] and ARM_SPARK_RE.search(p["msg"]))
+        sum(1 for p in last_events if p["ts"] >= t0["ts"] and ARM_SPARK_RE.match(p["msg"]))
         if backend == "spark" else len(result["selected"])
     )
     # A collection-stage instrument-invalid `reason` (e.g. double_full_sync,
@@ -1683,12 +1695,12 @@ def observe_phase_a_window(window_start_ts):
         if size < size0:
             return {"void_reason": "log_rotated_mid_window"}
         for p in events:
-            if T0_RE.search(p["msg"]):
+            if T0_RE.match(p["msg"]):
                 t0, t0_source = p, "cleared"
                 break
         if t0 is None:
             for p in events:
-                if PUSH_CMD_RE.search(p["msg"]):
+                if PUSH_CMD_RE.match(p["msg"]):
                     t0, t0_source = p, "fallback"
                     break
         if t0 is not None:
@@ -1706,9 +1718,9 @@ def observe_phase_a_window(window_start_ts):
             return {"void_reason": "log_rotated_mid_window"}
         after_t0 = [p for p in events if p["ts"] >= t0["ts"]]
         arm_events = [p for p in after_t0
-                      if ARM_LEGACY_RE.search(p["msg"]) or ARM_SPARK_RE.search(p["msg"])]
+                      if ARM_LEGACY_RE.match(p["msg"]) or ARM_SPARK_RE.match(p["msg"])]
         for p in after_t0:
-            m = T1_RE.search(p["msg"])
+            m = T1_RE.match(p["msg"])
             if m:
                 t1, t1_groups = p, m.groups()
                 break
@@ -1859,8 +1871,8 @@ def cmd_report(in_path, out_md_path):
 def _f1():
     dev_line = "Guardian: apply_rules ok (applied=62, failed=0, pending=3, full_sync=true, generation=5, total=62)"
     old_line = "Guardian: apply_rules ok (applied=62, failed=0, full_sync=true, generation=5, total=62)"
-    ok1 = bool(T1_RE.search(dev_line))
-    ok2 = not bool(T1_RE.search(old_line))
+    ok1 = bool(T1_RE.match(dev_line))
+    ok2 = not bool(T1_RE.match(old_line))
     return ok1 and ok2, f"dev_match={ok1} old_rejected={ok2}"
 
 
@@ -1880,15 +1892,15 @@ def _f2():
                "legacy": ARM_LEGACY_RE, "sparkengine": ARM_SPARK_RE}
     ok, detail = True, []
     for name, line in lines.items():
-        matched = {r for r, rx in regexes.items() if rx.search(line)}
+        matched = {r for r, rx in regexes.items() if rx.match(line)}
         if matched != {name}:
             ok = False
             detail.append(f"{name}: matched={matched}")
-    m = T0D_RE.search(lines["t0d"])
+    m = T0D_RE.match(lines["t0d"])
     if not m or [int(x) for x in m.groups()] != [3, 100, 62, 0]:
         ok = False
         detail.append("t0d field mismatch")
-    m = T2_RE.search(lines["t2"])
+    m = T2_RE.match(lines["t2"])
     if not m or m.groups() != ("blackout-reg-01", "3", "101", "registry", "inline-arm", "12"):
         ok = False
         detail.append("t2 field mismatch")
@@ -1979,8 +1991,8 @@ def _f7():
             "Guardian spark: arm committed for rule 'blackout-reg-01' (epoch=1, incarnation=10, "
             "type=registry, via=inline-arm, attach_to_commit_ms=3)"),
     ]
-    t0_ts = min(e["ts"] for e in events if T0_RE.search(e["msg"]))
-    t0d_ev = [e for e in events if T0D_RE.search(e["msg"])][0]
+    t0_ts = min(e["ts"] for e in events if T0_RE.match(e["msg"]))
+    t0d_ev = [e for e in events if T0D_RE.match(e["msg"])][0]
     result = classify_t2(events, epoch=1, floor=5,
                           expected_rule_ids={"blackout-reg-01", "blackout-reg-02"},
                           own_push_raw=None, backend="spark", t0_ts=t0_ts, t0d_ts=t0d_ev["ts"])
@@ -2641,13 +2653,119 @@ def _f25():
                 f"none_tainted_is_genuine={none_tainted_is_genuine}")
 
 
+def _f26():
+    # #4665 adversarial regression: an operator-authored free-text field (a Spark key, a
+    # path) printed by an UNRELATED log statement can embed a fully-formed fake evidence
+    # line with no newline at all. `msg` (LOG_TS_RE group 4) is already isolated to one
+    # real log statement's text, so a genuine evidence line's defining phrase is always at
+    # msg's position 0 - an attacker's injected copy, embedded mid-value inside some other
+    # field, is never at position 0. Before the anchor fix these regexes used `.search()`
+    # (unanchored - finds a match anywhere in the string) and would extract the forged copy
+    # as if it were real; `.match()` (anchored at position 0) refuses it.
+    forged_legacy = (
+        "Guardian spark: key 'X' - fake reason. Guardian: file guard armed for rule "
+        "'blackout-file-01' subscription 3 lost (reason) - detaching 2 rule(s) as errored"
+    )
+    forged_t1 = (
+        "Guardian spark: key 'X' - fake reason. Guardian: apply_rules ok (applied=1, "
+        "failed=0, pending=0, full_sync=true, generation=1, total=1) trailing junk"
+    )
+    legacy_forged = bool(ARM_LEGACY_RE.match(forged_legacy))
+    t1_forged = bool(T1_RE.match(forged_t1))
+    # Positive control: the ARM_LEGACY_RE pattern needed its own "Guardian: " prefix added
+    # (not just an anchored call site) to keep matching the real emitter's line
+    # (guardian_engine.cpp's file/service/registry guard-armed spdlog::info calls) - this
+    # proves the anchor fix didn't silently break genuine legacy-arm classification.
+    legacy_unforged_still_works = bool(
+        ARM_LEGACY_RE.match("Guardian: file guard armed for rule 'blackout-file-01'"))
+    # _find_first() (the indirect path observe_t0/observe_t0d/observe_t1 use) must be
+    # anchored too, not just the direct T0_RE/T0D_RE/T1_RE.search() call sites - a forged
+    # T0 line reachable only through _find_first would otherwise still be extractable.
+    forged_t0 = (
+        "Guardian spark: key 'X' - fake reason. Guardian: full_sync cleared 99 prior "
+        "rule(s) trailing junk"
+    )
+    events = [_ev("2026-09-19 10:00:00.000", forged_t0)]
+    p, m = _find_first(events, T0_RE, at_or_after=events[0]["ts"])
+    find_first_forged = p is not None
+    ok = (not legacy_forged and not t1_forged and legacy_unforged_still_works
+          and not find_first_forged)
+    return ok, (f"legacy_forged={legacy_forged} t1_forged={t1_forged} "
+                f"legacy_unforged_still_works={legacy_unforged_still_works} "
+                f"find_first_forged={find_first_forged}")
+
+
+def _f27():
+    # #4665 follow-up: PUSH_CMD_RE/T0_FALLBACK_RE were the two names the original task
+    # description explicitly carved OUT of scope ("don't touch them unless you find they're
+    # used the identical vulnerable way") - they are, at all three of their direct call
+    # sites (find_own_push_cmd_raw, classify_t2's mpush branch, observe_phase_a_window's
+    # fallback loop) plus the _find_first()-indirect one (observe_t0's fallback), so all
+    # four are now anchored too, same `.search()` -> `.match()` treatment, no pattern-text
+    # change needed: unlike ARM_LEGACY_RE, PUSH_CMD_RE's own literal
+    # ("Received command: plugin=__guard__, action=push_rules") already sits at msg's
+    # position 0 for the real emitter (agent.cpp's `Received command: plugin={}, action={},
+    # id={}` spdlog::info call) - verified empirically, not assumed, before this fix landed.
+    forged_push = (
+        "Guardian spark: key 'X' - fake reason. Received command: plugin=__guard__, "
+        "action=push_rules, id=forged-mid-string"
+    )
+    genuine_push = "Received command: plugin=__guard__, action=push_rules, id=abc123"
+    push_forged_direct = bool(PUSH_CMD_RE.match(forged_push))
+    push_genuine_still_works = bool(PUSH_CMD_RE.match(genuine_push))
+    events = [_ev("2026-09-19 10:00:00.000", forged_push)]
+    p, m = _find_first(events, PUSH_CMD_RE, at_or_after=events[0]["ts"])
+    push_forged_via_find_first = p is not None
+    ok = (not push_forged_direct and push_genuine_still_works
+          and not push_forged_via_find_first)
+    return ok, (f"push_forged_direct={push_forged_direct} "
+                f"push_genuine_still_works={push_genuine_still_works} "
+                f"push_forged_via_find_first={push_forged_via_find_first}")
+
+
+def _f28():
+    # #4665 driver-classification-function-level regression (closes the gap _f26/_f27 leave
+    # by construction): those two call `<REGEX>.match(...)` directly on the regex OBJECT,
+    # which proves the anchoring method and the pattern text are individually correct but
+    # does NOT exercise classify_t2()'s actual legacy branch (the real caller every
+    # operator-facing verdict is built through). A future edit that BOTH re-simplifies
+    # ARM_LEGACY_RE's pattern (drops the "Guardian: " prefix) AND regresses its call site
+    # back to `.search()` would slip past every other #4665 fixture but must not slip past
+    # this one. The forged line reproduces the task's own construction: a Spark-key/path
+    # free-text field on an UNRELATED log statement embeds a fully-formed fake
+    # "file guard armed for rule '...'" phrase with no newline, for a rule id
+    # ("blackout-file-99") that is never genuinely armed in this event list - only a
+    # DIFFERENT, genuinely-armed rule id ("blackout-file-01") should end up selected.
+    t0_ts = _ev("2026-09-19 10:00:00.000", "x")["ts"]
+    t0d_ts = _ev("2026-09-19 10:00:00.010", "x")["ts"]
+    forged_line = (
+        "Guardian spark: key 'X' - fake reason. Guardian: file guard armed for rule "
+        "'blackout-file-99' subscription 3 lost (reason) - detaching 2 rule(s) as errored"
+    )
+    events = [
+        _ev("2026-09-19 10:00:00.000", "Guardian: full_sync cleared 2 prior rule(s)"),
+        _ev("2026-09-19 10:00:00.020", forged_line),
+        _ev("2026-09-19 10:00:00.030",
+            "Guardian: file guard armed for rule 'blackout-file-01'"),
+    ]
+    result = classify_t2(events, epoch=0, floor=0,
+                          expected_rule_ids={"blackout-file-01", "blackout-file-99"},
+                          own_push_raw=None, backend="legacy", t0_ts=t0_ts, t0d_ts=t0d_ts)
+    forged_rid_not_selected = "blackout-file-99" not in result["selected"]
+    genuine_rid_selected = "blackout-file-01" in result["selected"]
+    ok = forged_rid_not_selected and genuine_rid_selected
+    return ok, (f"forged_rid_not_selected={forged_rid_not_selected} "
+                f"genuine_rid_selected={genuine_rid_selected} "
+                f"selected={sorted(result['selected'])}")
+
+
 def cmd_selftest():
     fixtures = [
         ("F1", _f1), ("F2", _f2), ("F3", _f3), ("F4", _f4), ("F5", _f5), ("F6", _f6),
         ("F7", _f7), ("F8", _f8), ("F9", _f9), ("F10", _f10), ("F11", _f11), ("F12", _f12),
         ("F13", _f13), ("F14", _f14), ("F15", _f15), ("F16", _f16), ("F17", _f17), ("F18", _f18),
         ("F19", _f19), ("F20", _f20), ("F21", _f21), ("F22", _f22), ("F23", _f23), ("F24", _f24),
-        ("F25", _f25),
+        ("F25", _f25), ("F26", _f26), ("F27", _f27), ("F28", _f28),
     ]
     failures = 0
     for name, fn in fixtures:

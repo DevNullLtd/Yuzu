@@ -1,0 +1,17 @@
+captured: windows Windows 10.0.26200 x86_64 · bare-metal · 2026-09-21 · LocalSystem (elevated) · leg-hash 9cf003de2f97
+== action=secure_boot
+secure_boot|windows|UEFISecureBootEnabled|1|enabled
+[result_status] OK / FULL / 
+
+== action=code_integrity
+code_integrity|windows|ci_policy.EmodePolicyRequired|0|unmodelled
+code_integrity|windows|ci_policy.SAC_PreviousState|4294967295|unmodelled
+code_integrity|windows|ci_policy.SkuPolicyRequired|0|unmodelled
+code_integrity|windows|ci_policy.VerifiedAndReputablePolicyState|0|disabled
+code_integrity|windows|deviceguard.EnableVirtualizationBasedSecurity|-|absent
+code_integrity|windows|deviceguard.HypervisorEnforcedCodeIntegrity|-|absent
+code_integrity|windows|deviceguard.RequirePlatformSecurityFeatures|-|absent
+code_integrity|windows|deviceguard.hvci_scenario_enabled|-|absent
+code_integrity|windows|lsa.LsaCfgFlags|-|absent
+[result_status] OK / FULL / 
+

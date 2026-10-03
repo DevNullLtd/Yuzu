@@ -12,4 +12,9 @@ if [ -f "${PLIST}" ] && launchctl list com.yuzu.agent &>/dev/null; then
     sleep 2
 fi
 
+# Packages before #5144 installed the core dylib in /usr/local/lib; it now
+# sits beside the binary. An upgrade does not remove files the new payload
+# lacks, so delete the old copy rather than leave a stale library behind.
+rm -f /usr/local/lib/libyuzu_agent_core.dylib
+
 exit 0

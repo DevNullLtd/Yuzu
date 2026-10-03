@@ -13,8 +13,8 @@ Runbook for the Yuzu `/test` pipeline. This skill is a **bash-first orchestrator
 /test                  — default mode (~30-45 min): build + upgrade test + standard gates
 /test --quick          — sanity check (~10 min): build + unit + EUnit + dialyzer (no live stack)
 /test --full           — pre-tag (~60-120 min): adds OTA, sanitizers, perf measurement, coverage enforce
-/test --instructions   — content-suite gate (~5-15 min): exercises all 184 safe + mutating
-                         InstructionDefinitions against a live UAT stack via REST.
+/test --instructions   — content-suite gate (~5-15 min): exercises the safe + mutating
+                         InstructionDefinitions (the runner prints the count) against a live UAT stack via REST.
                          Standalone: brings up Phase 4 stack + the new Phase 5 instructions gate
                          only. Skips build/upgrade/sanitizers/coverage. Use when content
                          changes (yaml under `content/definitions/`) or after touching the
@@ -24,7 +24,7 @@ Runbook for the Yuzu `/test` pipeline. This skill is a **bash-first orchestrator
                          cluster (isolate / release / status / whitelist) with the
                          self-disconnect/auto-resume dance. DO NOT RUN ON A REMOTE / SSH-ONLY
                          HOST — see safety section below. PR C will add hand-written
-                         semantic-correctness tests for the 25 destructive instructions
+                         semantic-correctness tests for the destructive instructions
                          (`--instructions-destructive`).
 /test --force-cleanup  — tear down THIS RUN's dangling test containers before starting
 /test --keep-stack     — leave docker stacks running after the run (debugging)
@@ -42,12 +42,14 @@ The skill runs on both **Linux** (CI, WSL2) and **macOS** (operator dev box). Th
 - Stack stand-up (Phase 4) calls `scripts/start-UAT.sh` — cross-platform; the historical `start-UAT.sh` name is a back-compat shim.
 - Port checks, disk-free, loadavg/CPU/mem fingerprints all go through `scripts/test/_portable.sh` (lsof + sysctl on macOS, ss + /proc on Linux).
 
+**Security E2E prerequisite:** curl >= 7.68 (>= 7.84 for the Retry-After check; an older curl skips that one assertion, below 7.68 the gate fails with an explicit message).
+
 **macOS prerequisites:** GNU bash 5+ (`brew install bash` — stock /bin/bash 3.2 doesn't support `mapfile`/`declare -A`), kerl-installed Erlang, vcpkg with `VCPKG_ROOT` set, OrbStack or Docker Desktop installed (and launched once so its CLI symlinks populate `~/.orbstack/bin`).
 
 **What skips on macOS without a running Docker daemon:**
 - Phase 1 docker-image-build → SKIP (operator can build locally only what they need)
 - Phase 2 upgrade-test → SKIP via `test-upgrade-stack.sh`'s `docker_available` early-out, gate row records SKIP with operator-readable note
-- Phase 6 sanitizers → still dispatches to the `yuzu-wsl2-linux` self-hosted runner, unaffected by local Docker availability
+- Phase 6 sanitizers → still dispatches to the `yuzu-bigtam-linux` self-hosted pool, unaffected by local Docker availability
 
 Everything else (Phase 0 preflight, Phase 1 C++ + Erlang build, Phase 4 native stack, Phase 5 unit/EUnit/dialyzer/CT/integration/e2e/synthetic-UAT/puppeteer, Phase 7a perf, Phase 7b coverage, Phase 8 teardown) runs natively on macOS.
 
@@ -67,9 +69,10 @@ Phase 4 — Fresh Stack Stand-up  (full-uat at HEAD + native agent — STAYS UP
                                  through Phase 8 so humans can poke at the
                                  stack before /release)
 Phase 5 — Test Gates (parallel) (unit / EUnit / dialyzer / CT / integration /
-                                 e2e-api / e2e-mcp / e2e-security /
-                                 synthetic UAT / puppeteer / instructions)
-Phase 6 — Sanitizers            (--full only — dispatched to yuzu-wsl2-linux runner)
+                                 e2e-api / e2e-mcp / synthetic UAT /
+                                 puppeteer / instructions; e2e-security runs
+                                 alone after the fan-out)
+Phase 6 — Sanitizers            (--full only — dispatched to yuzu-bigtam-linux pool)
 Phase 7b — Coverage             (--full only — enforces tests/coverage-baseline.json)
 Phase 8 — Teardown + Summary    (cleans Phase 2 compose projects + scratch dir,
                                  finalises run row; LEAVES THE UAT ALIVE on
@@ -222,7 +225,7 @@ if [[ "$MODE" != "quick" ]]; then
         elif docker build \
             --platform "linux/${HOST_DOCKER_ARCH}" \
             --build-arg "TRIPLET=${HOST_VCPKG_TRIPLET}" \
-            -t "ghcr.io/tr3kkr/yuzu-server:0.10.1-test-${RUN_ID}" \
+            -t "ghcr.io/devnullltd/yuzu-server:0.10.1-test-${RUN_ID}" \
             --label "yuzu.commit=$(git rev-parse HEAD)" \
             -f deploy/docker/Dockerfile.server . \
             > "$LOG_DIR/build-images.log" 2>&1; then
@@ -281,7 +284,7 @@ bash scripts/test/test-upgrade-stack.sh \
 ```
 
 `--old-version` is omitted so the script resolves it from GitHub's current
-"Latest release" at runtime (`gh api repos/Tr3kkR/Yuzu/releases/latest`).
+"Latest release" at runtime (`gh api repos/DevNullLtd/Yuzu/releases/latest`).
 This keeps the upgrade baseline tracking whatever the last published stable
 tag is without needing a pipeline edit each release. Pass `--old-version
 X.Y.Z` to pin an older baseline for debugging.
@@ -451,9 +454,6 @@ gate_run "REST API E2E" "e2e-api.log" \
 gate_run "MCP E2E" "e2e-mcp.log" \
     "bash scripts/e2e-mcp-test.sh"
 
-gate_run "Security E2E" "e2e-security.log" \
-    "bash scripts/e2e-security-test.sh"
-
 # Synthetic UAT — Phase 4's start-UAT.sh already ran its own 6
 # tests; this gate runs them again standalone with timing capture into
 # the test-runs DB. Skip if Phase 4 was the source.
@@ -465,25 +465,34 @@ gate_run "Synthetic UAT" "synthetic-uat.log" \
         --gateway-metrics http://localhost:9568 \
         --run-id $RUN_ID --gate-name phase5-synthetic-uat"
 
-# Puppeteer is warn-only — flaky on first run
+# Puppeteer is warn-only — flaky on first run. Its npm dependency is never installed by
+# the pipeline (tests/puppeteer/node_modules is gitignored), so a missing install is
+# recorded as SKIP with the fix, not as a permanent WARN; a WARN means it ran and failed.
 (
     start=$(date +%s)
-    if node tests/puppeteer/dashboard-help-test.mjs > "$LOG_DIR/puppeteer.log" 2>&1; then
-        STATUS=PASS
+    if [[ ! -d tests/puppeteer/node_modules/puppeteer ]]; then
+        bash scripts/test/test-db-write.sh gate \
+            --run-id "$RUN_ID" --phase 5 --gate "Puppeteer" \
+            --status SKIP --duration 0 \
+            --notes "puppeteer not installed; run: (cd tests/puppeteer && npm ci)"
     else
-        STATUS=WARN  # not FAIL — puppeteer is best-effort
+        if node tests/puppeteer/dashboard-help-test.mjs > "$LOG_DIR/puppeteer.log" 2>&1; then
+            STATUS=PASS
+        else
+            STATUS=WARN  # not FAIL — puppeteer is best-effort
+        fi
+        DUR=$(( $(date +%s) - start ))
+        bash scripts/test/test-db-write.sh gate \
+            --run-id "$RUN_ID" --phase 5 --gate "Puppeteer" \
+            --status "$STATUS" --duration "$DUR" --log "puppeteer.log"
     fi
-    DUR=$(( $(date +%s) - start ))
-    bash scripts/test/test-db-write.sh gate \
-        --run-id "$RUN_ID" --phase 5 --gate "Puppeteer" \
-        --status "$STATUS" --duration "$DUR" --log "puppeteer.log"
 ) &
 
 # Instructions content-suite gate — schema-driven REST exerciser.
-# Drives every safe + mutating InstructionDefinition (184 of 217) and
+# Drives every default-risk (safe + mutating) InstructionDefinition and
 # records per-instruction pass/fail/timing into the test-runs DB.
-# Destructive (25), interactive (5), and network-disrupting (3) classes
-# are opt-in via --risks; default-mode invocation excludes them.
+# The destructive, forensic, server-internal, interactive and network-disrupt
+# classes are opt-in via --risks; default-mode invocation excludes them.
 gate_run "Instructions" "instructions.log" \
     "bash scripts/test/instructions-tests.sh \
         --dashboard http://localhost:8080 \
@@ -491,6 +500,13 @@ gate_run "Instructions" "instructions.log" \
         --run-id $RUN_ID --gate-name phase5-instructions \
         --output $LOG_DIR/instructions-outcomes.json"
 
+wait
+
+# Security E2E runs AFTER the fan-out, alone. Its Category 7 probe deliberately empties the
+# shared 127.0.0.1 login bucket (start-UAT.sh passes --login-rate-limit 200), which would 429
+# the login of any gate still running. Do not move it back into the fan-out above.
+gate_run "Security E2E" "e2e-security.log" \
+    "bash scripts/e2e-security-test.sh"
 wait
 ```
 
@@ -504,7 +520,7 @@ When the operator runs `/test --instructions`, the orchestration is **truncated*
 - The instruction-engine dispatch path (`workflow_routes.cpp` `POST /api/instructions/:id/execute`, `agent_service_impl.cpp` `cmd_execution_ids_`, response store) was touched.
 - Investigating a content regression flagged by the trend tooling.
 
-Wall clock is dominated by Phase 4 (~60-90s) and the gate itself (5-15 min for 184 instructions at parallelism=4). The gate writes per-instruction timings to `test_timings` so `bash scripts/test/test-db-query.sh --trend timing=phase5-instructions.<id>` shows latency drift over time.
+Wall clock is dominated by Phase 4 (~60-90s) and the gate itself (5-15 min for the runnable instructions at parallelism=4). The gate writes per-instruction timings to `test_timings` so `bash scripts/test/test-db-query.sh --trend timing=phase5-instructions.<id>` shows latency drift over time.
 
 ```bash
 # In --instructions mode:
@@ -512,16 +528,24 @@ if [[ "$MODE" == "instructions" ]]; then
     # Run only Phase 0, 4, the Instructions gate, and Phase 8.
     # Build is not gated — operator should already have $BUILDDIR populated;
     # if not, the start-UAT.sh in Phase 4 will surface the missing binary.
-    bash scripts/test/instructions-tests.sh \
+    start=$(date +%s)
+    if bash scripts/test/instructions-tests.sh \
         --dashboard http://localhost:8080 \
         --user admin --password 'YuzuUatAdmin1!' \
         --run-id "$RUN_ID" --gate-name instructions \
-        --output "$LOG_DIR/instructions-outcomes.json"
+        --output "$LOG_DIR/instructions-outcomes.json" > "$LOG_DIR/instructions.log" 2>&1; then
+        STATUS=PASS
+    else
+        STATUS=FAIL
+    fi
+    bash scripts/test/test-db-write.sh gate \
+        --run-id "$RUN_ID" --phase 5 --gate "Instructions" \
+        --status "$STATUS" --duration $(( $(date +%s) - start )) --log "instructions.log"
     # then jump straight to Phase 8 teardown
 fi
 ```
 
-The gate's exit code is the run's overall_status: 0 → PASS, 1 → FAIL (one or more instruction fail/error), 2 → ABORTED (login or content-dir error).
+The runner's exit code is recorded as the `Instructions` gate row above, and that row sets the run's overall_status: 0 → PASS; 1 (one or more instruction fail/error) or 2 (login or content-dir error) → FAIL.
 
 ### `--instructions-quarantine` mode (the self-disconnect ceremony)
 
@@ -572,7 +596,7 @@ The results document each phase, every probe (with TCP latency), the agent's res
 
 ## Phase 6 — Sanitizers (PR2)
 
-Sanitizer rebuilds are dispatched to the `yuzu-wsl2-linux` self-hosted runner via `workflow_dispatch`. Running them locally would pin the dev box for ~15 min of compile time each; the always-on runner absorbs that cost while the operator continues Phase 5 gates locally.
+Sanitizer rebuilds are dispatched to the `yuzu-bigtam-linux` self-hosted pool via `workflow_dispatch`. Running them locally would pin the dev box for ~15 min of compile time each; the always-on runner absorbs that cost while the operator continues Phase 5 gates locally.
 
 ```bash
 if [[ "$MODE" == "full" ]]; then
@@ -587,7 +611,7 @@ The gate script:
 4. Parses each sanitizer log for `ERROR: AddressSanitizer`, `ERROR: LeakSanitizer`, `WARNING: ThreadSanitizer`, `ThreadSanitizer: data race`, `runtime error:`
 5. Writes two Phase 6 rows to `test_gates`: `Sanitizers (ASan+UBSan)` and `Sanitizers (TSan)`
 
-**Runner-offline path (WARN, not FAIL).** If `yuzu-wsl2-linux` is offline or the dispatch times out, both gates record `WARN` with notes explaining the operator retry path. The skill continues with the rest of the run rather than blocking on CI infrastructure that's out of reach.
+**Runner-offline path (WARN, not FAIL).** If the `yuzu-bigtam-linux` pool is offline or the dispatch times out, both gates record `WARN` with notes explaining the operator retry path. The skill continues with the rest of the run rather than blocking on CI infrastructure that's out of reach.
 
 **Workflow-file requirement.** `workflow_dispatch` evaluates the workflow file on the target ref. If you're dispatching against a commit that doesn't have `sanitizer-tests.yml` yet (e.g. running /test from an older branch), the dispatch will fail hard. The gate treats that as WARN per the offline-runner path.
 
@@ -762,7 +786,7 @@ After a successful run, the operator typically wants to:
 
 1. **Commit and push** — the green run is the gate. Reference `RUN_ID` in the commit message for traceability.
 2. **Compare to the prior run** — `test-db-query.sh --diff <prev> <current>` shows what changed in gate status and timings.
-3. **Investigate WARN gates** — these don't block but accumulate as tech debt. If a pattern emerges across runs, file an issue per `docs/agents/issue-standard.md`: dedupe first with both mandatory probes (`gh issue list --repo Tr3kkR/Yuzu --state open --search "<gate name>" --json number,title` and `gh search issues --repo Tr3kkR/Yuzu --state open "<gate keywords>" --json number,title --limit 20`), four body sections, one type label + one of `P1`/`P2` + `ready-for-agent`, and an Origin section citing the `RUN_ID`s that show the pattern.
+3. **Investigate WARN gates** — these don't block but accumulate as tech debt. If a pattern emerges across runs, file an issue per `docs/agents/issue-standard.md`: dedupe first with both mandatory probes (`gh issue list --repo DevNullLtd/Yuzu --state open --search "<gate name>" --json number,title` and `gh search issues --repo DevNullLtd/Yuzu --state open "<gate keywords>" --json number,title --limit 20`), four body sections, one type label + one of `P1`/`P2` + `ready-for-agent`, and an Origin section citing the `RUN_ID`s that show the pattern.
 4. **Bump the coverage baseline** if a legitimate drop or trade-off is intentional — `coverage-gate.sh --capture-baselines` and commit the updated `tests/coverage-baseline.json`. Perf has no enforced baseline as of 2026-05-03; perf movement is reviewed by the operator against `tests/perf-baseline-provenance-N300.{jsonl,json}` and is not blocking.
 
 After a failed run:

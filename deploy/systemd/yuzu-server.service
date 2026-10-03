@@ -1,6 +1,6 @@
 [Unit]
 Description=Yuzu Endpoint Management Server
-Documentation=https://github.com/Tr3kkR/Yuzu
+Documentation=https://github.com/DevNullLtd/Yuzu
 # postgresql.service ordering is SOFT (Wants=, not Requires=): a missing
 # unit in Wants= is silently ignored, so installs without a local Postgres
 # — including those pointing YUZU_POSTGRES_DSN at an external/managed
@@ -20,10 +20,8 @@ Wants=network-online.target postgresql.service
 # behind log noise. Operators reading `systemctl status yuzu-server` see
 # a clean failure instead. For a Postgres auth-substrate failure, check
 # `journalctl -u yuzu-server` for the PG connection error and verify
-# YUZU_POSTGRES_DSN / the postgresql.service dependency below; for a
-# remaining-SQLite-store failure see
-# docs/ops-runbooks/auth-db-recovery.md (now SQLite-era/superseded for
-# auth specifically — see its banner). Keys live in [Unit] in
+# YUZU_POSTGRES_DSN / the postgresql.service dependency below (auth
+# recovery: docs/ops-runbooks/auth-db-recovery.md). Keys live in [Unit] in
 # systemd >= 230; older releases ignore them here, which is acceptable.
 StartLimitIntervalSec=60
 StartLimitBurst=3
@@ -38,15 +36,19 @@ Group=yuzu
 # external DSNs are first-class, just edit the file. Mode 0600 yuzu:yuzu
 # (the DSN embeds a credential).
 EnvironmentFile=-/etc/yuzu/yuzu-server.env
-# --data-dir points the remaining server-side SQLite stores (response,
-# audit, RBAC, Guardian/guaranteed-state, tag, policy, and others still on
-# ADR-0006's migration ladder — see docs/postgres-migration-ladder.md) at a
-# writable directory, plus runtime state files. Authentication itself is
-# no longer here: AuthDB/ScimStore moved to the Postgres substrate
-# (YUZU_POSTGRES_DSN / EnvironmentFile above; ADR-0006) and account lockout
-# / session state now live there, not in a local auth.db. /var/lib/yuzu
-# matches StateDirectory, WorkingDirectory, and the ReadWritePaths grant
-# below.
+# --data-dir holds the server's runtime state files (auto-approve.cfg — still
+# per-replica; a pre-6.2 install's enrollment-tokens.cfg/pending-agents.cfg are
+# read here exactly ONCE by the HA WS-6 6.2 importer, then renamed aside and
+# never read again — enrollment/pending state itself is Postgres-authoritative,
+# see docs/adr/2002-high-availability-architecture.md §8), agent-updates/ (when
+# --update-dir is unset), upload-blobs/, and the NVD cache nvd_cves.db — the
+# one remaining server SQLite store, a recorded deferral on ADR-0006's ladder
+# (docs/postgres-migration-ladder.md). Every other server store, including
+# auth, sessions and account lockout, lives in the Postgres substrate
+# (YUZU_POSTGRES_DSN / EnvironmentFile above); legacy *.db files left here
+# by older releases are only probed at startup to warn, never read.
+# /var/lib/yuzu matches StateDirectory, WorkingDirectory, and the
+# ReadWritePaths grant below.
 ExecStart=/usr/local/bin/yuzu-server \
     --listen 0.0.0.0:50051 \
     --gateway-upstream 0.0.0.0:50055 \
@@ -65,7 +67,10 @@ RestartSec=5
 # drain is ~156s (120s response cap + pump ticks + the 30s socket write timeout, see
 # docs/user-manual/server-admin.md "Sizing"). The two constraints share this one value by
 # coincidence, not by design — raising it for the rollup budget alone still covers MCP;
-# don't LOWER it without checking both.
+# don't LOWER it without checking both. A THIRD, independent reason this value must not drop
+# below a few seconds (#4666 PR-4): the T_server dedicated async logger's exit-time worker
+# join has no self-armed watchdog, so a stalled log sink leaves it bounded ONLY by a second
+# SIGTERM or this deadline — see guardian_ingest.hpp's own header banner.
 TimeoutStopSec=210
 
 # File-descriptor headroom. The default 1024 soft limit is comfortably

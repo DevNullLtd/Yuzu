@@ -34,6 +34,7 @@
 #include <yuzu/agent/guard_registry.hpp>
 
 #include <spdlog/spdlog.h>
+#include <yuzu/log_token.hpp>
 
 #include <chrono>
 
@@ -243,7 +244,8 @@ RegistryGuard::~RegistryGuard() { stop(); }
 
 bool RegistryGuard::start() {
     if (!parse_hive(cfg_.hive)) {
-        spdlog::warn("Guardian RegistryGuard[{}]: invalid hive '{}'", cfg_.rule_id, cfg_.hive);
+        spdlog::warn("Guardian RegistryGuard[{}]: invalid hive '{}'", log_id_token(cfg_.rule_id),
+                     log_key_token(cfg_.hive));
         return false;
     }
     HANDLE evt = CreateEventW(nullptr, /*manualReset=*/FALSE, /*initial=*/FALSE, nullptr);
@@ -279,7 +281,8 @@ void RegistryGuard::run() try {
     detail::EventHandle target_event(CreateEventW(nullptr, /*manualReset=*/FALSE, /*initial=*/FALSE, nullptr));
     detail::EventHandle ancestor_event(CreateEventW(nullptr, /*manualReset=*/FALSE, /*initial=*/FALSE, nullptr));
     if (!target_event || !ancestor_event) {
-        spdlog::error("Guardian RegistryGuard[{}]: event creation failed", cfg_.rule_id);
+        spdlog::error("Guardian RegistryGuard[{}]: event creation failed",
+                      log_id_token(cfg_.rule_id));
         return; // RAII closes whichever event was created
     }
 
@@ -387,21 +390,25 @@ void RegistryGuard::run() try {
                 d.remediation_success = ok;
                 if (ok)
                     spdlog::info("Guardian RegistryGuard[{}]: {} {}\\{} [{}] {} -> {} ({}us)",
-                                 cfg_.rule_id, d.remediation_action, cfg_.hive, cfg_.key,
-                                 cfg_.value_name, detected, cfg_.expected, d.remediation_latency_us);
+                                 log_id_token(cfg_.rule_id), d.remediation_action,
+                                 log_key_token(cfg_.hive), log_key_token(cfg_.key),
+                                 log_key_token(cfg_.value_name), log_key_token(detected),
+                                 log_key_token(cfg_.expected), d.remediation_latency_us);
                 else
                     spdlog::warn("Guardian RegistryGuard[{}]: enforce {} FAILED for {}\\{} [{}] "
                                  "(detected={}, type={}{})",
-                                 cfg_.rule_id, d.remediation_action, cfg_.hive, cfg_.key,
-                                 cfg_.value_name, detected, cfg_.value_type,
-                                 target.get() ? "" : ", key absent");
+                                 log_id_token(cfg_.rule_id), d.remediation_action,
+                                 log_key_token(cfg_.hive), log_key_token(cfg_.key),
+                                 log_key_token(cfg_.value_name), log_key_token(detected),
+                                 log_key_token(cfg_.value_type), target.get() ? "" : ", key absent");
             } else {
                 // Backoff window or Bounded give-up: drift detected + reported (this
                 // event is the alert) but the fix is withheld this cycle.
                 spdlog::info("Guardian RegistryGuard[{}]: drift {}\\{} [{}] detected={} -- "
                              "{}, not remediating",
-                             cfg_.rule_id, cfg_.hive, cfg_.key, cfg_.value_name, detected,
-                             dec.gave_up ? "given up (alert)" : "backing off");
+                             log_id_token(cfg_.rule_id), log_key_token(cfg_.hive),
+                             log_key_token(cfg_.key), log_key_token(cfg_.value_name),
+                             log_key_token(detected), dec.gave_up ? "given up (alert)" : "backing off");
             }
         }
         // A successful write-back restored `expected`: the self-write's notify will
@@ -440,7 +447,8 @@ void RegistryGuard::run() try {
             if (!ro_fallback_warned) {
                 spdlog::warn("Guardian RegistryGuard[{}]: write-access open of {}\\{} failed "
                              "(rc={}) — read-only watch; enforcement will report failures",
-                             cfg_.rule_id, cfg_.hive, cfg_.key, rc);
+                             log_id_token(cfg_.rule_id), log_key_token(cfg_.hive),
+                             log_key_token(cfg_.key), rc);
                 ro_fallback_warned = true;
             }
             rc = RegOpenKeyExW(root, wkey.c_str(), 0, read_access, &h);
@@ -506,13 +514,16 @@ void RegistryGuard::run() try {
             // degraded re-arm so the guard self-heals instead of blocking forever.
             spdlog::warn("Guardian RegistryGuard[{}]: could not arm any watch for {}\\{} — "
                          "degraded re-arm retry in {}ms",
-                         cfg_.rule_id, cfg_.hive, cfg_.key, kArmFailRetryMs);
+                         log_id_token(cfg_.rule_id), log_key_token(cfg_.hive),
+                         log_key_token(cfg_.key), kArmFailRetryMs);
             next_wake_ms = kArmFailRetryMs;
         }
     };
 
     spdlog::info("Guardian RegistryGuard[{}]: watching {}\\{} [{}] (expect {}={}) [resilient]",
-                 cfg_.rule_id, cfg_.hive, cfg_.key, cfg_.value_type, cfg_.value_name, cfg_.expected);
+                 log_id_token(cfg_.rule_id), log_key_token(cfg_.hive), log_key_token(cfg_.key),
+                 log_key_token(cfg_.value_type), log_key_token(cfg_.value_name),
+                 log_key_token(cfg_.expected));
 
     reconcile(); // initial compare + initial arm
 
@@ -539,10 +550,10 @@ void RegistryGuard::run() try {
     // on scope exit, including an exception unwind.
 } catch (const std::exception& e) {
     spdlog::error("Guardian RegistryGuard[{}]: watch thread exception: {} — watch stopping",
-                  cfg_.rule_id, e.what());
+                  log_id_token(cfg_.rule_id), e.what());
 } catch (...) {
     spdlog::error("Guardian RegistryGuard[{}]: watch thread unknown exception — watch stopping",
-                  cfg_.rule_id);
+                  log_id_token(cfg_.rule_id));
 }
 
 } // namespace yuzu::agent

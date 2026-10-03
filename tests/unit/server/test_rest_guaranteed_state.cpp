@@ -21,7 +21,7 @@
 
 #include "auth_routes.hpp"
 #include "baseline_store.hpp"
-#include "dex_app_perf_model.hpp" // AppPerfProviders (slice-2 app-perf read seams)
+#include "dex_app_perf_model.hpp" // the app-perf read types (slice-2)
 #include "guaranteed_state_store.hpp"
 #include "management_group_store.hpp"
 #include "oidc_provider.hpp"
@@ -242,6 +242,21 @@ struct RestGsHarness {
     // this file is unaffected.
     bool wire_real_gs_scoped_perm_{false};
 
+    // sec8r3-2: when true, a bare `perm_fn(req, res, "GuaranteedState", "Read")`
+    // call from GET /api/v1/dex/app or GET /api/v1/dex/overview (the ONLY two
+    // routes this checks by `req.path` — every other one of this file's ~35
+    // other GuaranteedState-securable call sites is unaffected, so the
+    // hundreds of pre-existing `grant_perms`-stub tests elsewhere keep their
+    // meaning) delegates to the REAL `AuthRoutes::require_permission` instead
+    // of the plain `grant_perms` stand-in below. Mirrors
+    // `wire_real_gs_scoped_perm_`'s pattern: the stub's `grant_perms` bool
+    // cannot distinguish "admitted via elevation" from "admitted via a stub
+    // that always says yes", which is exactly what let the three "elevated
+    // session is admitted unfiltered" tests below pass for the wrong reason
+    // (the stub, not elevation) — see those tests' own comments. Default
+    // false: every pre-existing test in this file is unaffected.
+    bool wire_real_dex_perm_{false};
+
     std::vector<AuditRecord> audit_log;
 
     yuzu::MetricsRegistry metrics;
@@ -250,7 +265,7 @@ struct RestGsHarness {
     // Slice-2 DEX app-perf read seams. Wired with present-but-empty doubles by
     // default (so the audit/scope/render paths are reachable); left empty when
     // wire_app_perf is false so a test can prove the provider-absent → 503 branch.
-    yuzu::server::AppPerfProviders app_perf_providers_;
+    yuzu::server::test::FnDexPerfApi::Providers app_perf_providers_;
     // ADR-0031 WS-A4 #4250: the shared VerifyApi seam backing GET
     // /api/v1/dex/perf/compare (replaces the retired AppPerfCohortFn-in-
     // AppPerfProviders ad-hoc cohort provider). Left null when wire_app_perf is
@@ -286,14 +301,20 @@ struct RestGsHarness {
     // at request time, letting a test mutate it after construction.
     yuzu::server::DexFleet dex_fleet_override_;
 
-    // #4035 hardening (governance): the visible-agent-set resolver for GET
-    // /api/v1/dex/app and GET /api/v1/dex/overview (ADR-0017 World A
-    // confinement — ind. of the service-scoped-token deny belt above).
-    // nullopt (default) = unfiltered, matching every EXISTING test in this
-    // file (and matching an unwired dex_visible_fn / RBAC-off / global-read
-    // production posture). A test proving confinement sets this to a
-    // specific agent set before issuing the request.
-    std::optional<std::set<std::string>> dex_visible_override_;
+    // #4035 hardening (governance)'s bespoke DexVisibleFn resolver + its
+    // `dex_visible_override_`/`wire_dex_visible_fn_` test knobs, and the
+    // WS-A4 PR-1 first/second fix rounds' attempt to migrate GET
+    // /api/v1/dex/app, GET /api/v1/dex/overview, and GET
+    // /api/v1/dex/signals/{obs_type} onto `fleet_read_fn` as their sole
+    // gate, are ALL RETIRED (reverted to
+    // base gating — bare `perm_fn` + `deny_fleet_wide_service_scoped`, no
+    // per-caller `visible` resolver at all). A test proving confinement/
+    // elevation now drives the REAL rbac_/mgmt_ bundles +
+    // `status_route_headers()` family exactly like the /status route's own
+    // [adr0017] tests. `fleet_read_fn` below is still real production
+    // plumbing this harness wires — GET /dex/perf/devices, GET
+    // /executions, GET /responses/*, and several others gate on it — the
+    // three DEX routes above simply no longer are among its callers.
 
     // What the wired VERIFY cohort provider returns (default = present-but-empty
     // CohortRead → the compare reads "insufficient"). A test sets member_count +
@@ -314,6 +335,13 @@ struct RestGsHarness {
     /// false → register the fleet /status route with an EMPTY ListReadFn,
     /// exercising its fail-closed-503 path (mirrors wire_scoped_perm above).
     bool wire_list_read_fn_{true};
+
+    /// ADR-0031 WS-A4 PR-1: false → leave `dex_api_local` null even when the
+    /// store is open, exercising GET /api/v1/dex/catalogue's (and every
+    /// sibling DEX route's) "!dex_api -> 503" guard — the SAME guard a null
+    /// store already exercises in test_dex_api.cpp at the seam level; this
+    /// toggle proves the REST handler's OWN null check, independent of that.
+    bool wire_dex_api_{true};
 
     // Declared LAST (was first): sink's registered handlers capture `this` and
     // dereference owner members (auth_routes_, rbac_/mgmt_ bundles, api, ...)
@@ -344,9 +372,13 @@ struct RestGsHarness {
                            // still constructed and REQUIRE'd open either way, so a
                            // revert-to-raw-store still finds a live, answerable store at
                            // the SAME id but a DIFFERENT answer than the double gives.
-                           std::shared_ptr<yuzu::server::GuardianApi> guardian_api_override = nullptr)
+                           std::shared_ptr<yuzu::server::GuardianApi> guardian_api_override = nullptr,
+                           // ADR-0031 WS-A4 PR-1: false -> dex_api_local stays null even
+                           // with a live store, exercising every DEX REST route's own
+                           // "!dex_api -> 503" guard (see wire_dex_api_'s doc comment).
+                           bool wire_dex_api = true)
         : wire_live_deps(live_deps), wire_exec_visible(with_exec_visible),
-          wire_list_read_fn_(wire_list_read_fn) {
+          wire_list_read_fn_(wire_list_read_fn), wire_dex_api_(wire_dex_api) {
         if (yuzu::test::pg_admin_dsn_env() == nullptr) {
             SKIP("YUZU_TEST_POSTGRES_DSN not set - Postgres test skipped");
         }
@@ -421,8 +453,17 @@ struct RestGsHarness {
 
         // perm_fn grants unless grant_perms is flipped off (then 403, mirroring
         // the production perm_fn) — RBAC proper is exercised in test_rbac_store.cpp.
-        auto perm_fn = [this](const httplib::Request&, httplib::Response& res, const std::string&,
-                              const std::string&) -> bool {
+        // sec8r3-2: EXCEPT for GET /api/v1/dex/app / GET /api/v1/dex/overview when
+        // wire_real_dex_perm_ is set (see that field's own comment) — those two
+        // delegate to the REAL AuthRoutes::require_permission so a test can
+        // actually observe elevation/RBAC composition, not just this stub.
+        auto perm_fn = [this](const httplib::Request& req, httplib::Response& res,
+                              const std::string& securable_type,
+                              const std::string& operation) -> bool {
+            if (wire_real_dex_perm_ && securable_type == "GuaranteedState" &&
+                operation == "Read" &&
+                (req.path == "/api/v1/dex/app" || req.path == "/api/v1/dex/overview"))
+                return auth_routes_->require_permission(req, res, securable_type, operation);
             if (grant_perms)
                 return true;
             res.status = 403;
@@ -472,6 +513,21 @@ struct RestGsHarness {
                                    const std::string& type,
                                    const std::string& op) -> yuzu::server::ListReadGate {
             return auth_routes_->require_list_read(req, res, type, op);
+        };
+
+        // WS-A4 PR-1 fix round: GET /api/v1/dex/app, GET
+        // /api/v1/dex/overview, and GET /api/v1/dex/signals/{obs_type}'s
+        // SOLE gate — a REAL AuthRoutes::require_fleet_read call (same
+        // auth_routes_ instance the fleet /status route's list_read_fn
+        // already uses), mirroring ServerImpl::require_fleet_read's own
+        // std::expected -> FleetReadGate translation exactly (server.cpp).
+        auto fleet_read_fn = [this](const httplib::Request& req, httplib::Response& res,
+                                    const std::string& type,
+                                    const std::string& op) -> yuzu::server::authz::FleetReadGate {
+            auto result = auth_routes_->require_fleet_read(req, res, type, op);
+            if (!result)
+                return {}; // admitted=false, res already written
+            return {true, result->visible_for_query()};
         };
 
         // PR W1.1 UP-H1: AuditFn typedef → std::function<bool(...)>. Returns
@@ -534,7 +590,7 @@ struct RestGsHarness {
         // exercise the SEAM path (production wires it identically). Gated on
         // store presence exactly like server.cpp — null store → null api → 503.
         std::shared_ptr<yuzu::server::DexApi> dex_api_local;
-        if (store)
+        if (store && wire_dex_api_)
             dex_api_local = yuzu::server::make_local_dex_api(
                 store.get(), [this]() { return dex_fleet_override_; });
 
@@ -597,7 +653,7 @@ struct RestGsHarness {
                             wire_scoped_perm ? RestApiV1::ScopedPermFn{scoped_perm_fn}
                                              : RestApiV1::ScopedPermFn{},
                             /*software_inventory_store=*/nullptr,
-                            /*response_scope_fn=*/{}, app_perf_providers_,
+                            /*response_scope_fn=*/{},
                             /*engine_principal_store=*/nullptr, /*access_review_store=*/nullptr,
                             /*auth_db=*/nullptr, /*directory_sync=*/nullptr,
                             /*stream_budget=*/nullptr,
@@ -614,7 +670,12 @@ struct RestGsHarness {
                                 : RestApiV1::ExecVisibleFn{},
                             wire_list_read_fn_ ? RestApiV1::ListReadFn{list_read_fn}
                                                : RestApiV1::ListReadFn{},
-                            /*fleet_read_fn=*/{},
+                            // Always wired: several routes gate on this in
+                            // production (GET /dex/perf/devices, GET
+                            // /executions, GET /responses/*, ...) — see this
+                            // struct's own comment on why the DEX routes are
+                            // NOT among its callers.
+                            RestApiV1::FleetReadFn{fleet_read_fn},
                             // #4033: this harness doesn't exercise GET
                             // /api/v1/devices or the agent-count preview —
                             // unwired defaults (fail-closed / legacy-open
@@ -624,13 +685,6 @@ struct RestGsHarness {
                             // register_routes param is retired — the DEX handlers
                             // get the fleet via the DexApi seam (dex_api_local
                             // above, wired with dex_fleet_override_).
-                            // #4035 hardening (governance): reads
-                            // dex_visible_override_ LIVE at request time
-                            // (ignores `username` — this stub doesn't model
-                            // per-username resolution, only whether the
-                            // caller's set is engaged).
-                            RestApiV1::DexVisibleFn{
-                                [this](const std::string&) { return dex_visible_override_; }},
                             // ADR-0031 WS-A4 #4250: the shared VerifyApi seam backing
                             // GET /api/v1/dex/perf/compare (see verify_api_'s doc
                             // comment above).
@@ -643,14 +697,16 @@ struct RestGsHarness {
                             guardian_api_local);
     }
 
-    // The fleet /status route's real AuthRoutes::require_list_read gate needs
-    // an actual authenticated request — unlike every other route in this
-    // harness, still gated by the stub auth_fn/perm_fn above (the
-    // session_user stub field does NOT reach this route). Mints a cookie
-    // session for the CURRENT session_user/session_role and returns headers
-    // carrying it; a test that reassigns session_user before calling this
-    // (the DenyAll/AdmitAll/AdmitScoped [adr0017] cases) gets a session for
-    // the new principal.
+    // The fleet /status route's real AuthRoutes::require_list_read gate (and,
+    // since the WS-A4 PR-1 fix round, GET /api/v1/dex/app, GET
+    // /api/v1/dex/overview, and GET /api/v1/dex/signals/{obs_type}'s real
+    // AuthRoutes::require_fleet_read gate) needs an actual authenticated
+    // request — unlike every other route in this harness, still gated by the
+    // stub auth_fn/perm_fn above (the session_user stub field does NOT reach
+    // either gate). Mints a cookie session for the CURRENT
+    // session_user/session_role and returns headers carrying it; a test that
+    // reassigns session_user before calling this (the DenyAll/AdmitAll/
+    // AdmitScoped [adr0017] cases) gets a session for the new principal.
     std::unordered_map<std::string, std::string> status_route_headers() {
         REQUIRE(!session_user.empty());
         REQUIRE(auth_mgr_.upsert_user(session_user, "password1234", session_role));
@@ -824,7 +880,48 @@ TEST_CASE("REST gs.rules: missing required fields → 400",
     REQUIRE(res);
     CHECK(res->status == 400);
     CHECK(res->body.find("required") != std::string::npos);
-    CHECK(h.audit_log.empty());
+    // #4665: this combined validation reject now audits (previously it was the
+    // one create-reject branch that didn't, an asymmetric-audit-coverage gap
+    // matching the UP-R1 PUT-malformed-body precedent above).
+    REQUIRE(h.audit_log.size() == 1);
+    CHECK(h.audit_log[0].action == "guaranteed_state.rule.create");
+    CHECK(h.audit_log[0].result == "denied");
+    CHECK(h.audit_log[0].target_id == "r-bad");
+}
+
+TEST_CASE("REST gs.rules: charset-invalid rule_id → 400 with the updated error message (#4665)",
+          "[pg][rest][guaranteed_state][create][validation]") {
+    RestGsHarness h;
+    for (const std::string& bad_id :
+         {std::string("has space"), std::string("has=eq"), std::string("has\nnewline"),
+          std::string("has\xC3\xA9" "byte")}) {
+        INFO("bad_id = " << bad_id);
+        auto res = h.sink.Post("/api/v1/guaranteed-state/rules",
+                               RestGsHarness::make_rule_body(bad_id, "n"));
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        CHECK(res->body.find("[A-Za-z0-9._-]+") != std::string::npos);
+    }
+    REQUIRE(h.audit_log.size() == 4);
+    for (const auto& rec : h.audit_log)
+        CHECK(rec.result == "denied");
+}
+
+TEST_CASE("REST gs.rules: rule_id at the 256-byte boundary (#4665)",
+          "[pg][rest][guaranteed_state][create][validation]") {
+    RestGsHarness h;
+    const std::string id256(256, 'a');
+    auto ok = h.sink.Post("/api/v1/guaranteed-state/rules",
+                          RestGsHarness::make_rule_body(id256, "n256"));
+    REQUIRE(ok);
+    CHECK(ok->status == 201);
+    CHECK(ok->body.find("\"rule_id\":\"" + id256 + "\"") != std::string::npos);
+
+    const std::string id257(257, 'a');
+    auto bad = h.sink.Post("/api/v1/guaranteed-state/rules",
+                           RestGsHarness::make_rule_body(id257, "n257"));
+    REQUIRE(bad);
+    CHECK(bad->status == 400);
 }
 
 TEST_CASE("REST gs.rules: duplicate name → 409 via kConflictPrefix",
@@ -1200,25 +1297,96 @@ TEST_CASE("REST gs.events: a service-scoped token MAY still read its own agent v
 // /network/devices all served fleet-wide identity-linked per-agent rows under
 // a bare global gate, confining nothing for a service-scoped token. ──────────
 
-TEST_CASE("REST dex/signals/{obs_type}: service-scoped token → 403, denial audited",
+// WS-A4 PR-1 Gate 7 fix round: the route's OWN `deny_fleet_wide_service_scoped` call is the
+// gate here, reading the harness's stub `auth_fn` (which answers from
+// `session_token_scope_service`, not real request headers) — same pattern
+// as the sibling GET /api/v1/dex/perf/devices test right below this one, NOT
+// `service_scoped_token_headers()` (that helper is for routes resolving
+// their session through the REAL `AuthRoutes` instance, which this route no
+// longer does).
+TEST_CASE("REST dex/signals/{obs_type}: service-scoped token → 403, no data",
           "[pg][rest][dex][signals][rbac]") {
     RestGsHarness h;
     h.session_token_scope_service = "printers";
     auto res = h.sink.Get("/api/v1/dex/signals/process.crashed");
     REQUIRE(res);
     CHECK(res->status == 403);
+    CHECK(res->body.find("devices") == std::string::npos);
     REQUIRE(h.audit_log.size() == 1);
     CHECK(h.audit_log[0].action == "dex.signal.view");
     CHECK(h.audit_log[0].result == "denied");
-    CHECK(h.audit_log[0].target_id.empty()); // unvalidated obs_type never embedded
 }
 
 TEST_CASE("REST dex/signals/{obs_type}: ordinary session still reaches the route",
           "[pg][rest][dex][signals]") {
     RestGsHarness h;
-    auto res = h.sink.Get("/api/v1/dex/signals/process.crashed");
+    auto res = h.sink.Get("/api/v1/dex/signals/process.crashed", h.status_route_headers());
     REQUIRE(res);
     CHECK(res->status == 200);
+}
+
+// WS-A4 PR-1 Gate 7 fix round: the route gates SOLELY on a bare `perm_fn`. Production's
+// `AuthRoutes::require_permission` resolves a caller's role through DIRECT
+// user grants and RBAC-native "group" grants ONLY (rbac_store.cpp's
+// `roles_for_user`) — a `ManagementGroup`-scoped role assignment (a
+// DIFFERENT table, `management_group_store.management_group_roles`) is
+// invisible to it entirely, so in production a management-group-confined-
+// only operator is denied before the handler body ever runs. THIS harness's
+// `perm_fn` is a plain `grant_perms` stand-in (line ~441's own comment:
+// "RBAC proper is exercised in test_rbac_store.cpp") that cannot
+// distinguish a global grant from a management-group-scoped one — driving
+// real `rbac_`/`mgmt_` composition through it, as the retired
+// `fleet_read_fn`-gated design allowed, is no longer possible for this
+// route (`fleet_read_fn` still exists in this harness, but is no longer one
+// of this route's callers — see the struct's own comment). The closest
+// available proof of the denial path is `grant_perms = false`, the SAME
+// stand-in the sibling GET /api/v1/dex/catalogue "permission denied" test
+// uses. (sec8r3-2: unlike GET /api/v1/dex/app / GET /api/v1/dex/overview,
+// this route's `perm_fn` call sits behind a REGEX path registration —
+// `/api/v1/dex/signals/([^/]+)` — so wiring it through the real
+// `AuthRoutes::require_permission` the way `wire_real_dex_perm_` does for
+// the other two needs a prefix match on `req.path` instead of an exact one;
+// left as a follow-up rather than folded into this round, so the test right
+// below states plainly what it does and does NOT prove.)
+TEST_CASE("REST dex/signals/{obs_type}: permission denied -> 403 before any audit",
+          "[pg][rest][dex][signals][scope]") {
+    RestGsHarness h;
+    h.grant_perms = false;
+    auto res = h.sink.Get("/api/v1/dex/signals/process.crashed");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    CHECK(h.audit_log.empty());
+}
+
+// sec8r3-2: this test's name previously claimed to prove elevation admits a
+// zero-RBAC-grant caller. It does not — `perm_fn` here is still the plain
+// `grant_perms` stand-in (default true), which admits this request
+// regardless of whether the session is elevated, so the 200 below is
+// unconditional on `grant_perms`, not on the `elevated_status_route_headers()`
+// cookie. What this DOES prove: an admitted caller gets the SAME unfiltered
+// device list every other admitted caller on this route gets — a structural
+// fact (DexApi::signal_detail has no `visible` parameter to filter on at
+// all, per the WS-A4 PR-1 Gate 7 fix round), not an elevation-specific one.
+// GET /api/v1/dex/app and GET /api/v1/dex/overview have the real,
+// elevation-observing version of this coverage (`wire_real_dex_perm_`,
+// see their own tests) — this route's equivalent is the follow-up noted on
+// the sibling "permission denied" test just above.
+TEST_CASE("REST dex/signals/{obs_type}: an admitted caller sees the unfiltered device list "
+          "(no per-caller visible filter to observe; NOT an elevation-specific proof)",
+          "[pg][rest][dex][signals][scope]") {
+    RestGsHarness h;
+    h.rbac_.set_rbac_enabled(true);
+    h.session_user = "elevated_user";
+    h.seed_obs("e1", "WS-1", "process.crashed", "chrome.exe", "windows", "2026-06-10T10:00:00Z");
+    h.seed_obs("e2", "WS-2", "process.crashed", "chrome.exe", "windows", "2026-06-10T11:00:00Z");
+
+    auto res = h.sink.Get("/api/v1/dex/signals/process.crashed?window=all",
+                          h.elevated_status_route_headers());
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto j = nlohmann::json::parse(res->body);
+    REQUIRE(j["data"]["devices"].is_array());
+    CHECK(j["data"]["devices"].size() == 2);
 }
 
 TEST_CASE("REST dex/perf/devices: service-scoped token → 403, denial audited",
@@ -2211,6 +2379,37 @@ TEST_CASE("REST dex/devices/{id}: per-device read model — score + THIS device'
     CHECK(audited);
 }
 
+// #4855: a degraded signal-summary read must 503, never render a fabricated
+// healthy score of 100 with no signals. DROP TABLE on a second connection
+// forces a genuine query-level failure while the store stays open (same
+// technique the guard/baseline degrade tests in test_guardian_routes.cpp
+// use). The audit fires BEFORE the read (unchanged fail-closed ordering), so
+// it still records "success" here.
+TEST_CASE("REST dex/devices/{id}: a degraded signal-summary read → 503, never a fabricated "
+          "healthy score",
+          "[pg][rest][dex][device][degraded]") {
+    RestGsHarness h;
+    h.seed_obs("o1", "WS-1", "process.crashed", "chrome.exe", "windows", "2026-06-10T10:00:00Z");
+
+    {
+        yuzu::server::pg::PgConn conn{PQconnectdb(h.gs_db_pg->dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        yuzu::server::pg::PgResult d{
+            PQexec(conn.get(), "DROP TABLE guaranteed_state_store.guardian_observations")};
+        REQUIRE(d.ok());
+    }
+
+    auto res = h.sink.Get("/api/v1/dex/devices/WS-1?window=all");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    CHECK(res->body.find("\"score\"") == std::string::npos); // never a score at all
+    bool audited = false;
+    for (const auto& a : h.audit_log)
+        if (a.action == "dex.device.view" && a.target_id == "WS-1")
+            audited = true;
+    CHECK(audited);
+}
+
 TEST_CASE("OpenAPI lists /dex/devices/{id} and the whole spec still parses",
           "[pg][rest][dex][device][a2]") {
     RestGsHarness h;
@@ -2231,7 +2430,8 @@ TEST_CASE("REST dex/app: blast-radius drill, audited, service-scoped token denie
     h.seed_obs("a1", "WS-1", "process.crashed", "chrome.exe", "windows", "2026-06-10T10:00:00Z");
     h.seed_obs("a2", "WS-2", "process.crashed", "chrome.exe", "windows", "2026-06-10T11:00:00Z");
 
-    auto res = h.sink.Get("/api/v1/dex/app?name=chrome.exe&window=all");
+    auto res =
+        h.sink.Get("/api/v1/dex/app?name=chrome.exe&window=all", h.status_route_headers());
     REQUIRE(res);
     CHECK(res->status == 200);
     auto j = nlohmann::json::parse(res->body);
@@ -2247,11 +2447,14 @@ TEST_CASE("REST dex/app: blast-radius drill, audited, service-scoped token denie
     CHECK(audited);
 
     // missing required name -> 400
-    auto missing = h.sink.Get("/api/v1/dex/app?window=all");
+    auto missing = h.sink.Get("/api/v1/dex/app?window=all", h.status_route_headers());
     REQUIRE(missing);
     CHECK(missing->status == 400);
 
-    // service-scoped token -> 403, denied audit only
+    // WS-A4 PR-1 Gate 7 fix round: the route's OWN
+    // `deny_fleet_wide_service_scoped` call is the gate — see GET
+    // /api/v1/dex/signals/{obs_type}'s equivalent test for why this is
+    // `session_token_scope_service`, not `service_scoped_token_headers()`.
     RestGsHarness h2;
     h2.session_token_scope_service = "printers";
     auto denied = h2.sink.Get("/api/v1/dex/app?name=chrome.exe");
@@ -2259,53 +2462,94 @@ TEST_CASE("REST dex/app: blast-radius drill, audited, service-scoped token denie
     CHECK(denied->status == 403);
 }
 
-// #4035 hardening (governance): closure evidence for the ADR-0017 World A
-// confinement gap — GET /api/v1/dex/app's devices[] list previously ALWAYS
-// passed visible=nullptr to the shared builder regardless of the caller's
-// management-group scope, unlike its own /fragments/dex/app dashboard
-// fragment (which confines via resolve_visible). A management-group-confined
-// operator could read affected agent_ids fleet-wide through this route even
-// though the equivalent dashboard fragment would have hidden them.
-TEST_CASE("REST dex/app: devices[] confined to the caller's visible set "
-          "(ADR-0017 World A — regression coverage for the governance fix)",
+// WS-A4 PR-1 Gate 7 fix round — see GET /api/v1/dex/signals/{obs_type}'s equivalent test
+// for the full rationale: this harness's `perm_fn` cannot distinguish a
+// global grant from a management-group-scoped one, so the closest
+// available proof of the denial path is `grant_perms = false`.
+TEST_CASE("REST dex/app: permission denied -> 403 before any audit",
           "[pg][rest][dex][app][scope]") {
     RestGsHarness h;
-    h.seed_obs("s1", "WS-1", "process.crashed", "chrome.exe", "windows", "2026-06-10T10:00:00Z");
-    h.seed_obs("s2", "WS-2", "process.crashed", "chrome.exe", "windows", "2026-06-10T11:00:00Z");
+    h.grant_perms = false;
+    auto res = h.sink.Get("/api/v1/dex/app?name=chrome.exe");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    CHECK(h.audit_log.empty());
+}
 
-    // Unconfined (default, matches production RBAC-off / global-read): both
-    // devices are visible.
-    auto unconfined = h.sink.Get("/api/v1/dex/app?name=chrome.exe&window=all");
-    REQUIRE(unconfined);
-    CHECK(unconfined->status == 200);
-    auto uj = nlohmann::json::parse(unconfined->body);
-    CHECK(uj["data"]["devices"].size() == 2);
+// sec8r3-2: `wire_real_dex_perm_` routes this route's `perm_fn` through the
+// REAL `AuthRoutes::require_permission` so this actually OBSERVES elevation
+// — the previous version of this test passed with `perm_fn` still the plain
+// `grant_perms` stub (default true), which admits every request regardless
+// of the session's elevation state; it proved "an admitted caller gets the
+// unfiltered device list" (DexApi::app has no `visible` param to filter on,
+// so that much was never in doubt — that closure is structural, not this
+// test) but NOT that elevation is what admitted a caller holding zero RBAC
+// grants. With the real gate wired, RBAC enabled and zero grants anywhere,
+// elevation is the ONLY thing that can admit this session — see the sibling
+// negative tests directly below for the same session with RBAC on but not
+// elevated (403) and with an RBAC grant but only management-group-scoped
+// (still 403, since `require_permission` never consults
+// `ManagementGroupStore` — N-3).
+TEST_CASE("REST dex/app: an elevated session is admitted unfiltered without any RBAC grant",
+          "[pg][rest][dex][app][scope][adr0017]") {
+    RestGsHarness h;
+    h.wire_real_dex_perm_ = true;
+    h.rbac_.set_rbac_enabled(true);
+    h.session_user = "elevated_user";
+    h.seed_obs("e1", "WS-1", "process.crashed", "chrome.exe", "windows", "2026-06-10T10:00:00Z");
+    h.seed_obs("e2", "WS-2", "process.crashed", "chrome.exe", "windows", "2026-06-10T11:00:00Z");
+    auto res = h.sink.Get("/api/v1/dex/app?name=chrome.exe&window=all",
+                          h.elevated_status_route_headers());
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto j = nlohmann::json::parse(res->body);
+    // Elevation is unfiltered fleet-wide, despite zero RBAC grants — ALL
+    // seeded devices are present, none dropped by any confinement.
+    CHECK(j["data"]["devices"].size() == 2);
+}
 
-    // Confined to WS-1 only (simulating a management-group-scoped operator):
-    // WS-2 must NEVER appear, even though the aggregate crash COUNT still
-    // reflects the whole fleet (the SCOPING NOTE's tracked, separate,
-    // aggregate-numerator follow-up — not this fix's scope).
-    h.dex_visible_override_ = std::set<std::string>{"WS-1"};
-    auto confined = h.sink.Get("/api/v1/dex/app?name=chrome.exe&window=all");
-    REQUIRE(confined);
-    CHECK(confined->status == 200);
-    auto cj = nlohmann::json::parse(confined->body);
-    REQUIRE(cj["data"]["devices"].is_array());
-    CHECK(cj["data"]["devices"].size() == 1);
-    CHECK(cj["data"]["devices"][0]["agent_id"].get<std::string>() == "WS-1");
-    for (const auto& d : cj["data"]["devices"])
-        CHECK(d["agent_id"].get<std::string>() != "WS-2");
+// sec8r3-2: the same session as above (real `require_permission`, RBAC
+// enabled, zero grants anywhere) but WITHOUT elevation -> denied. Proves
+// the previous test's 200 genuinely depends on elevation, not on a stub
+// that always grants.
+TEST_CASE("REST dex/app: RBAC on, no grant, not elevated -> 403 (real require_permission)",
+          "[pg][rest][dex][app][scope][adr0017]") {
+    RestGsHarness h;
+    h.wire_real_dex_perm_ = true;
+    h.rbac_.set_rbac_enabled(true);
+    h.session_user = "plain_user";
+    auto res = h.sink.Get("/api/v1/dex/app?name=chrome.exe", h.status_route_headers());
+    REQUIRE(res);
+    CHECK(res->status == 403);
+}
 
-    // Confined to a DISJOINT set (simulating an operator with no visibility
-    // into either device): devices[] is empty, never a 403/404 — matching
-    // the fragment's own admit-then-filter posture (ADR-0017 INV-2: engaged-
-    // empty is a legitimate, distinct outcome from "unfiltered").
-    h.dex_visible_override_ = std::set<std::string>{};
-    auto empty_scope = h.sink.Get("/api/v1/dex/app?name=chrome.exe&window=all");
-    REQUIRE(empty_scope);
-    CHECK(empty_scope->status == 200);
-    auto ej = nlohmann::json::parse(empty_scope->body);
-    CHECK(ej["data"]["devices"].empty());
+// sec8r3-2 / N-3: a management-group-SCOPED grant (never a global
+// RbacStore::assign_role) is not elevation and does not admit here — this
+// route's `perm_fn` is a bare `AuthRoutes::require_permission` call, which
+// (unlike `require_list_read`/`require_fleet_read`) never consults
+// `ManagementGroupStore`; a group-only grantee is denied exactly like a
+// grant-less caller. Pins the regression `dispatch_confined_arms`/
+// `authz_topology_floor`'s own "never assume a narrower-looking gate
+// composes with confinement" lesson applies to THIS gate too.
+TEST_CASE("REST dex/app: a management-group-scoped grant (not global, not elevated) -> 403",
+          "[pg][rest][dex][app][scope][adr0017]") {
+    RestGsHarness h;
+    h.wire_real_dex_perm_ = true;
+    h.rbac_.set_rbac_enabled(true);
+    REQUIRE(h.rbac_.create_role({"DexReader", "", false, 0}).has_value());
+    REQUIRE(
+        h.rbac_.set_permission({"DexReader", "GuaranteedState", "Read", "allow"}).has_value());
+    ManagementGroup g;
+    g.name = "RegionA";
+    g.membership_type = "static";
+    auto gid = h.mgmt_.create_group(g);
+    REQUIRE(gid.has_value());
+    REQUIRE(h.mgmt_.add_member(*gid, "WS-1").has_value());
+    REQUIRE(h.mgmt_.assign_role({*gid, "user", "carol", "DexReader"}).has_value());
+    h.session_user = "carol";
+    auto res = h.sink.Get("/api/v1/dex/app?name=chrome.exe", h.status_route_headers());
+    REQUIRE(res);
+    CHECK(res->status == 403);
 }
 
 TEST_CASE("REST dex/apps: app-centric stability list, no audit (aggregate)",
@@ -2350,6 +2594,92 @@ TEST_CASE("REST dex/catalogue/group: family drill, unknown family -> 404, no aud
     CHECK(missing->status == 400);
 }
 
+// ADR-0031 WS-A4 PR-1: GET /api/v1/dex/catalogue -- the
+// Catalogue View 1 family cards. Same aggregate posture as apps/catalogue-
+// group/health/trends above (no audit, no per-device confinement -- it emits
+// no agent_ids at all, asserted below).
+TEST_CASE("REST dex/catalogue: family cards, 200 shape, no agent_id anywhere, no audit",
+          "[pg][rest][dex][catalogue]") {
+    RestGsHarness h;
+    h.seed_obs("e1", "WS-1", "process.crashed", "chrome.exe", "windows", "2026-06-10T10:00:00Z");
+    h.dex_fleet_override_.windows_online = 1;
+    h.dex_fleet_override_.connected_os = {"windows"};
+
+    auto res = h.sink.Get("/api/v1/dex/catalogue?window=all");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto j = nlohmann::json::parse(res->body);
+    CHECK(j["data"]["os"].get<std::string>() == "all");
+    CHECK(j["data"]["window"].get<std::string>() == "all");
+    CHECK(j["data"]["total_types"].get<int>() > 0);
+    REQUIRE(j["data"]["families"].is_array());
+    bool saw_app_reliability = false;
+    for (const auto& f : j["data"]["families"])
+        if (f["name"].get<std::string>() == "App reliability") {
+            saw_app_reliability = true;
+            CHECK(f["events"].get<int64_t>() >= 1);
+        }
+    CHECK(saw_app_reliability);
+    // Aggregate exemption: no per-agent identity anywhere in the response.
+    CHECK(res->body.find("agent_id") == std::string::npos);
+    CHECK(res->body.find("WS-1") == std::string::npos);
+    CHECK(h.audit_log.empty());
+}
+
+TEST_CASE("REST dex/catalogue: invalid os / window -> 400, missing dex_api -> 503",
+          "[pg][rest][dex][catalogue]") {
+    {
+        RestGsHarness h;
+        auto bad_os = h.sink.Get("/api/v1/dex/catalogue?os=solaris");
+        REQUIRE(bad_os);
+        CHECK(bad_os->status == 400);
+
+        auto bad_window = h.sink.Get("/api/v1/dex/catalogue?window=banana");
+        REQUIRE(bad_window);
+        CHECK(bad_window->status == 400);
+    }
+    {
+        // wire_dex_api=false -- dex_api_local stays null even with a live store.
+        RestGsHarness h(/*live_deps=*/true, /*wire_scoped_perm=*/true, /*wire_app_perf=*/true,
+                        /*with_exec_visible=*/true, /*resp_pool=*/nullptr,
+                        /*wire_list_read_fn=*/true, /*guardian_api_override=*/nullptr,
+                        /*wire_dex_api=*/false);
+        auto res = h.sink.Get("/api/v1/dex/catalogue");
+        REQUIRE(res);
+        CHECK(res->status == 503);
+    }
+}
+
+TEST_CASE("REST dex/catalogue: permission denied -> 403 before any audit",
+          "[pg][rest][dex][catalogue]") {
+    RestGsHarness h;
+    h.grant_perms = false;
+    auto res = h.sink.Get("/api/v1/dex/catalogue");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    CHECK(h.audit_log.empty());
+}
+
+// Fix 2 (WS-A4 PR-1 fix round, sec-5): a degraded fleet signal-summary read
+// must never render as a healthy, zero-event catalogue (health 100) -- 503,
+// mirroring GET /api/v1/dex/devices/{id}'s #4855 degrade posture. DROP TABLE
+// forces the fleet-wide read to degrade while the store itself stays open.
+TEST_CASE("REST dex/catalogue: degraded fleet signal-summary read -> 503, never a "
+          "healthy zero-event catalogue",
+          "[pg][rest][dex][catalogue][degraded]") {
+    RestGsHarness h;
+    {
+        yuzu::server::pg::PgConn conn{PQconnectdb(h.gs_db_pg->dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        yuzu::server::pg::PgResult d{
+            PQexec(conn.get(), "DROP TABLE guaranteed_state_store.guardian_observations")};
+        REQUIRE(d.ok());
+    }
+    auto res = h.sink.Get("/api/v1/dex/catalogue");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+}
+
 TEST_CASE("REST dex/health: composite score suppressed with no reporting agents, no audit",
           "[pg][rest][dex][health]") {
     RestGsHarness h;
@@ -2390,7 +2720,7 @@ TEST_CASE("REST dex/overview: fleet summary, audited, service-scoped token denie
     h.seed_obs("f1", "WS-1", "process.crashed", "chrome.exe", "windows", "2026-06-10T10:00:00Z");
     h.seed_obs("f2", "WS-2", "process.crashed", "chrome.exe", "windows", "2026-06-10T11:00:00Z");
 
-    auto res = h.sink.Get("/api/v1/dex/overview?window=all");
+    auto res = h.sink.Get("/api/v1/dex/overview?window=all", h.status_route_headers());
     REQUIRE(res);
     CHECK(res->status == 200);
     auto j = nlohmann::json::parse(res->body);
@@ -2406,6 +2736,10 @@ TEST_CASE("REST dex/overview: fleet summary, audited, service-scoped token denie
             audited = true;
     CHECK(audited);
 
+    // WS-A4 PR-1 Gate 7 fix round: the route's OWN
+    // `deny_fleet_wide_service_scoped` call is the gate — see GET
+    // /api/v1/dex/signals/{obs_type}'s equivalent test for why this is
+    // `session_token_scope_service`, not `service_scoped_token_headers()`.
     RestGsHarness h2;
     h2.session_token_scope_service = "printers";
     auto denied = h2.sink.Get("/api/v1/dex/overview");
@@ -2413,33 +2747,80 @@ TEST_CASE("REST dex/overview: fleet summary, audited, service-scoped token denie
     CHECK(denied->status == 403);
 }
 
-// #4035 hardening (governance): closure evidence for the ADR-0017 World A
-// confinement gap on GET /api/v1/dex/overview's top_devices[] — same defect
-// class and same fix as GET /api/v1/dex/app above.
-TEST_CASE("REST dex/overview: top_devices[] confined to the caller's visible set "
-          "(ADR-0017 World A — regression coverage for the governance fix)",
+// WS-A4 PR-1 Gate 7 fix round — see GET /api/v1/dex/app's equivalent test for the full
+// rationale: this harness's `perm_fn` cannot distinguish a global grant
+// from a management-group-scoped one, so the closest available proof of
+// the denial path is `grant_perms = false`.
+TEST_CASE("REST dex/overview: permission denied -> 403 before any audit",
           "[pg][rest][dex][overview][scope]") {
     RestGsHarness h;
-    h.seed_obs("t1", "WS-1", "process.crashed", "chrome.exe", "windows", "2026-06-10T10:00:00Z");
-    h.seed_obs("t2", "WS-2", "process.crashed", "chrome.exe", "windows", "2026-06-10T11:00:00Z");
+    h.grant_perms = false;
+    auto res = h.sink.Get("/api/v1/dex/overview");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    CHECK(h.audit_log.empty());
+}
 
-    auto unconfined = h.sink.Get("/api/v1/dex/overview?window=all");
-    REQUIRE(unconfined);
-    CHECK(unconfined->status == 200);
-    auto uj = nlohmann::json::parse(unconfined->body);
-    REQUIRE(uj["data"]["top_devices"].is_array());
-    CHECK(uj["data"]["top_devices"].size() == 2);
+// sec8r3-2: `wire_real_dex_perm_` routes this route's `perm_fn` through the
+// REAL `AuthRoutes::require_permission` so this actually OBSERVES elevation
+// — see GET /api/v1/dex/app's identical-shape test above for the full
+// rationale (DexApi::overview also has no `visible` param, so the
+// unfiltered-list closure is structural; this test's job is proving
+// elevation is what admitted a zero-grant caller). Sibling negative tests
+// directly below cover RBAC-on-not-elevated (403) and management-group-
+// scoped-only (403, N-3).
+TEST_CASE("REST dex/overview: an elevated session is admitted unfiltered without any RBAC grant",
+          "[pg][rest][dex][overview][scope][adr0017]") {
+    RestGsHarness h;
+    h.wire_real_dex_perm_ = true;
+    h.rbac_.set_rbac_enabled(true);
+    h.session_user = "elevated_user";
+    h.seed_obs("e1", "WS-1", "process.crashed", "chrome.exe", "windows", "2026-06-10T10:00:00Z");
+    h.seed_obs("e2", "WS-2", "process.crashed", "chrome.exe", "windows", "2026-06-10T11:00:00Z");
+    auto res = h.sink.Get("/api/v1/dex/overview?window=all", h.elevated_status_route_headers());
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto j = nlohmann::json::parse(res->body);
+    // Elevation is unfiltered fleet-wide, despite zero RBAC grants — ALL
+    // seeded devices are present, none dropped by any confinement.
+    CHECK(j["data"]["top_devices"].size() == 2);
+}
 
-    h.dex_visible_override_ = std::set<std::string>{"WS-1"};
-    auto confined = h.sink.Get("/api/v1/dex/overview?window=all");
-    REQUIRE(confined);
-    CHECK(confined->status == 200);
-    auto cj = nlohmann::json::parse(confined->body);
-    REQUIRE(cj["data"]["top_devices"].is_array());
-    CHECK(cj["data"]["top_devices"].size() == 1);
-    CHECK(cj["data"]["top_devices"][0]["agent_id"].get<std::string>() == "WS-1");
-    for (const auto& d : cj["data"]["top_devices"])
-        CHECK(d["agent_id"].get<std::string>() != "WS-2");
+// sec8r3-2: the same session as above (real `require_permission`, RBAC
+// enabled, zero grants anywhere) but WITHOUT elevation -> denied.
+TEST_CASE("REST dex/overview: RBAC on, no grant, not elevated -> 403 (real require_permission)",
+          "[pg][rest][dex][overview][scope][adr0017]") {
+    RestGsHarness h;
+    h.wire_real_dex_perm_ = true;
+    h.rbac_.set_rbac_enabled(true);
+    h.session_user = "plain_user";
+    auto res = h.sink.Get("/api/v1/dex/overview", h.status_route_headers());
+    REQUIRE(res);
+    CHECK(res->status == 403);
+}
+
+// sec8r3-2 / N-3: a management-group-SCOPED grant (never a global
+// RbacStore::assign_role) is not elevation and does not admit here — see
+// GET /api/v1/dex/app's identical-shape test above for the full rationale.
+TEST_CASE("REST dex/overview: a management-group-scoped grant (not global, not elevated) -> 403",
+          "[pg][rest][dex][overview][scope][adr0017]") {
+    RestGsHarness h;
+    h.wire_real_dex_perm_ = true;
+    h.rbac_.set_rbac_enabled(true);
+    REQUIRE(h.rbac_.create_role({"DexReader", "", false, 0}).has_value());
+    REQUIRE(
+        h.rbac_.set_permission({"DexReader", "GuaranteedState", "Read", "allow"}).has_value());
+    ManagementGroup g;
+    g.name = "RegionA";
+    g.membership_type = "static";
+    auto gid = h.mgmt_.create_group(g);
+    REQUIRE(gid.has_value());
+    REQUIRE(h.mgmt_.add_member(*gid, "WS-1").has_value());
+    REQUIRE(h.mgmt_.assign_role({*gid, "user", "carol", "DexReader"}).has_value());
+    h.session_user = "carol";
+    auto res = h.sink.Get("/api/v1/dex/overview", h.status_route_headers());
+    REQUIRE(res);
+    CHECK(res->status == 403);
 }
 
 TEST_CASE("REST dex/devices/{id}/history: per-device signal history, audited dex.device.view "
@@ -3533,7 +3914,8 @@ TEST_CASE("REST dex/signals/{obs_type}: audit failure → 503, no device list, S
     RestGsHarness h;
     h.seed_obs("o1", "WS-1", "process.crashed", "chrome.exe", "windows", "2026-06-10T10:00:00Z");
     h.audit_succeeds = false;
-    auto res = h.sink.Get("/api/v1/dex/signals/process.crashed?window=all");
+    auto res = h.sink.Get("/api/v1/dex/signals/process.crashed?window=all",
+                          h.status_route_headers());
     REQUIRE(res);
     CHECK(res->status == 503);
     CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
@@ -3551,7 +3933,8 @@ TEST_CASE("REST dex/signals/{obs_type}: throwing audit → 503, A4, Sec-Audit-Fa
     RestGsHarness h;
     h.seed_obs("o1", "WS-1", "process.crashed", "chrome.exe", "windows", "2026-06-10T10:00:00Z");
     h.audit_throws = true; // caught by the shared helper, must still fail closed
-    auto res = h.sink.Get("/api/v1/dex/signals/process.crashed?window=all");
+    auto res = h.sink.Get("/api/v1/dex/signals/process.crashed?window=all",
+                          h.status_route_headers());
     REQUIRE(res);
     CHECK(res->status == 503);
     CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
@@ -3585,7 +3968,8 @@ TEST_CASE("REST dex.signals/{type}: drill-down fires dex.signal.view audit + ret
     h.seed_obs("o1", "WS-1", "process.crashed", "chrome.exe", "windows", "2026-06-10T10:00:00Z");
     h.seed_obs("o2", "WS-2", "process.crashed", "chrome.exe", "windows", "2026-06-10T11:00:00Z");
 
-    auto res = h.sink.Get("/api/v1/dex/signals/process.crashed?window=all");
+    auto res = h.sink.Get("/api/v1/dex/signals/process.crashed?window=all",
+                          h.status_route_headers());
     REQUIRE(res);
     CHECK(res->status == 200);
     auto j = nlohmann::json::parse(res->body);
@@ -3615,7 +3999,8 @@ TEST_CASE("REST dex.signals/{type}: os filter scopes subjects/devices/by_day (A1
     h.seed_obs("m1", "MAC-1", "process.crashed", "Safari", "macos", "2026-06-10T12:00:00Z");
 
     // Windows lens: subjects/devices/by_day all Windows-only, never MAC-1/Safari.
-    auto win = h.sink.Get("/api/v1/dex/signals/process.crashed?window=all&os=windows");
+    auto win = h.sink.Get("/api/v1/dex/signals/process.crashed?window=all&os=windows",
+                          h.status_route_headers());
     REQUIRE(win);
     CHECK(win->status == 200);
     auto jw = nlohmann::json::parse(win->body);
@@ -3632,7 +4017,8 @@ TEST_CASE("REST dex.signals/{type}: os filter scopes subjects/devices/by_day (A1
     CHECK(jw["data"]["by_os"].size() == 2);      // by_os stays cross-OS even under a filter
 
     // macOS lens: subjects/devices/by_day all macOS-only.
-    auto mac = h.sink.Get("/api/v1/dex/signals/process.crashed?window=all&os=macos");
+    auto mac = h.sink.Get("/api/v1/dex/signals/process.crashed?window=all&os=macos",
+                          h.status_route_headers());
     REQUIRE(mac);
     auto jm = nlohmann::json::parse(mac->body);
     CHECK(jm["data"]["os"].get<std::string>() == "macos");
@@ -3644,7 +4030,8 @@ TEST_CASE("REST dex.signals/{type}: os filter scopes subjects/devices/by_day (A1
     CHECK(jm["data"]["by_day"][0]["count"].get<int64_t>() == 1);
 
     // No os param = all-OS (backward compatible).
-    auto all = h.sink.Get("/api/v1/dex/signals/process.crashed?window=all");
+    auto all = h.sink.Get("/api/v1/dex/signals/process.crashed?window=all",
+                          h.status_route_headers());
     REQUIRE(all);
     auto ja = nlohmann::json::parse(all->body);
     CHECK(ja["data"]["os"].get<std::string>() == "all");
@@ -3654,7 +4041,8 @@ TEST_CASE("REST dex.signals/{type}: os filter scopes subjects/devices/by_day (A1
 TEST_CASE("REST dex.signals/{type}: well-formed but absent type → 200 empty arrays (still audited)",
           "[pg][rest][dex][signals]") {
     RestGsHarness h; // empty store
-    auto res = h.sink.Get("/api/v1/dex/signals/process.crashed?window=all");
+    auto res = h.sink.Get("/api/v1/dex/signals/process.crashed?window=all",
+                          h.status_route_headers());
     REQUIRE(res);
     CHECK(res->status == 200);
     auto j = nlohmann::json::parse(res->body);
@@ -3668,7 +4056,10 @@ TEST_CASE("REST dex.signals/{type}: well-formed but absent type → 200 empty ar
 
 TEST_CASE("REST dex.signals/{type}: malformed obs_type → 400, no audit", "[pg][rest][dex][signals]") {
     RestGsHarness h;
-    auto res = h.sink.Get("/api/v1/dex/signals/foo!bar?window=all");
+    // require_fleet_read runs BEFORE the obs_type charset/length validation
+    // (WS-A4 PR-1 fix round) — a real session is needed to reach that 400
+    // at all now, exactly like the fleet /status route's own gate.
+    auto res = h.sink.Get("/api/v1/dex/signals/foo!bar?window=all", h.status_route_headers());
     REQUIRE(res);
     CHECK(res->status == 400);
     // Validation precedes audit — a rejected malformed request leaves no trace
@@ -3678,23 +4069,19 @@ TEST_CASE("REST dex.signals/{type}: malformed obs_type → 400, no audit", "[pg]
 
 TEST_CASE("REST dex.signals/{type}: invalid limit → 400", "[pg][rest][dex][signals]") {
     RestGsHarness h;
-    auto res = h.sink.Get("/api/v1/dex/signals/process.crashed?limit=-3");
+    auto res = h.sink.Get("/api/v1/dex/signals/process.crashed?limit=-3",
+                          h.status_route_headers());
     REQUIRE(res);
     CHECK(res->status == 400);
     CHECK(h.audit_log.empty());
 }
 
-TEST_CASE("REST dex: permission gate runs before audit on the per-signal view",
-          "[pg][rest][dex][rbac]") {
-    RestGsHarness h;
-    h.grant_perms = false; // perm_fn denies → 403
-    auto res = h.sink.Get("/api/v1/dex/signals/process.crashed?window=all");
-    REQUIRE(res);
-    CHECK(res->status == 403);
-    // No audit emission on a denied request — the permission check is the first
-    // statement in the handler, before the dex.signal.view audit.
-    CHECK(h.audit_log.empty());
-}
+// WS-A4 PR-1 Gate 7 fix round: superseded by "REST
+// dex/signals/{obs_type}: permission denied -> 403 before any audit" above
+// — this route reverted off `require_fleet_read`/real RBAC gating back onto
+// the harness's bare `perm_fn` stand-in (`grant_perms`), so the real
+// `rbac_.set_rbac_enabled` composition this test exercised no longer
+// applies to it.
 
 // ── Name-anchored, device-applicable Guardian compliance ─────────────────────
 // GET /api/v1/guaranteed-state/device-compliance?baseline={name}&agent_id={id}

@@ -2,7 +2,7 @@
 
 **This file is a contents page, not a knowledge base.** Before adding anything, read
 `docs/instruction-file-standard.md` — it defines where a rule belongs and why the default is *not
-here*. This file, `CLAUDE.md`, and the three routed-concern tables load into every session; each is
+here*. This file, `CLAUDE.md`, and the four routed-concern tables load into every session; each is
 budgeted at 40,000 characters and capped at 48,000 (`tests/test_issue_docs.py`).
 
 This file is the Codex/Kimi twin of `CLAUDE.md` and deliberately carries the same content. **Where
@@ -78,7 +78,7 @@ addressed → iterate.
 merely POINT at them are defined ONCE — in `.claude/skills/governance/SKILL.md`.** This file loses on
 conflict, and so does `.codex/skills/governance/SKILL.md`, which defers there for severity and the
 ledger. That runner does carry its own text for rules 1 and 4: it performs **no routed-concerns walk
-at all** (tracked as **#2684** — which is why the instruction above to open all three tables by hand is
+at all** (tracked as **#2684** — which is why the instruction above to open all four tables by hand is
 load-bearing on this leg), and its Gate 8 phrasing is the weaker "affected gates" wording that
 shipped a broken macOS leg on #2580. The skill is read from your **working tree**, so a branch predating a change to it, or to
 the routed-concern tables, silently runs the old pipeline; Step 0 opens with a per-file currency
@@ -88,15 +88,17 @@ with `git show origin/dev:<path>`, never a working-tree `ls`.
 ## Routed concerns (read the doc, not this file)
 
 One row per concern — catastrophic-if-violated invariants, routed doc, loading agents. Split across
-three files solely for the per-file ceiling: the first holds platform/product/data/observability
+four files solely for the per-file ceiling: the first holds platform/product/data/observability
 concerns, the second auth, access-control, and request-admission chokepoints, the third the
-security-posture plugins (the Wave 8 split). Same authority as this file.
+security-posture plugins (the Wave 8 split), the fourth Forensics / per-user-software-data concerns
+(the Wave 10 split). Same authority as this file.
 
-**OPEN AND READ ALL THREE FILES — they are not auto-loaded on this leg:**
+**OPEN AND READ ALL FOUR FILES — they are not auto-loaded on this leg:**
 
 - `.claude/routed-concerns.md`
 - `.claude/routed-concerns-access-control.md`
 - `.claude/routed-concerns-security-posture.md`
+- `.claude/routed-concerns-software-estate.md`
 
 Match them row by row against the paths your change touches. **This file deliberately does NOT carry
 its own copy of the tables.** It used to, and that copy drifted badly — it still described `CaStore`

@@ -70,6 +70,27 @@
 ///    empty is at least visible on `/metrics` even though the return type
 ///    does not yet distinguish it. None of these reads feeds an
 ///    enforce/target decision (playbook's deny-or-benign class).
+///    **Named exception (#4855):** `dex_device_signal_summary` now ALSO has a
+///    type-distinguishable `dex_device_signal_summary_checked` twin
+///    (`std::optional`, `dex_read_checked<>`) — the per-device DEX
+///    experience-score surfaces (dashboard lens, REST
+///    `GET /api/v1/dex/devices/{id}`, MCP `get_dex_device_score`, and the pure
+///    per-device `dex_device_score()` helper they all route through) fail
+///    closed on a degrade instead of rendering it as a healthy, signal-free
+///    100. The plain `dex_device_signal_summary` above stays on the store as
+///    a documented, still-empty-on-degrade form (unchanged signature/
+///    behaviour, kept for any caller that only wants the #2659 posture) —
+///    this widens ONE read for ONE consumer class, not the #2659 fleet-wide
+///    set; every other `dex_*` read above is still deferred.
+///    **Second named exception (WS-A4 PR-1 fix round, sec-5):**
+///    `dex_signal_summary` — the FLEET-wide twin of the read above — now ALSO
+///    has a type-distinguishable `dex_signal_summary_checked` twin, for the
+///    same reason: `build_dex_catalogue_model` (the `GET /api/v1/dex/catalogue`
+///    + MCP `get_dex_catalogue` resource) must not render a degraded read as
+///    a healthy, zero-event fleet catalogue (previously an empty vector on
+///    degrade collapsed to exactly that — health 100, `total events: 0`).
+///    The plain `dex_signal_summary` stays a thin `.value_or({})` wrapper for
+///    every other, still-deferred (#2659) caller.
 
 #include <atomic>
 #include <cstdint>
@@ -265,6 +286,18 @@ public:
     std::vector<DexDayCrashCount> dex_crashes_by_day(const std::string& since = "") const;
     std::vector<DexSignalCount> dex_signal_summary(const std::string& since = "",
                                                     const std::string& platform = "") const;
+    /// Type-distinguishable twin of the above (Fix 2, WS-A4 PR-1 fix round):
+    /// `std::nullopt` on a degraded read (store-not-open / pool-timeout /
+    /// query-error), never collapsed into an empty vector — the fleet
+    /// catalogue builder (`build_dex_catalogue_model`) needs this to avoid
+    /// rendering a degraded read as a healthy fleet with zero events (the
+    /// same #4855 shape `dex_device_signal_summary_checked` closes for the
+    /// per-device read below). Still bumps
+    /// `yuzu_server_guardian_read_degrade_total{reason}` on a degrade, same
+    /// as the plain form (which is now a thin `.value_or({})` over this).
+    std::optional<std::vector<DexSignalCount>>
+    dex_signal_summary_checked(const std::string& since = "",
+                               const std::string& platform = "") const;
     DexBootStats dex_boot_stats(const std::string& since = "") const;
     std::vector<DexDeviceBoot> dex_slowest_boots(const std::string& since = "",
                                                  int limit = 10) const;
@@ -304,6 +337,15 @@ public:
     std::optional<GuardianObservationRow> dex_observation(const std::string& event_id) const;
     std::vector<DexSignalCount> dex_device_signal_summary(const std::string& agent_id,
                                                           const std::string& since = "") const;
+    /// Type-distinguishable twin of the above (#4855): `std::nullopt` on a
+    /// degraded read (store-not-open / pool-timeout / query-error), never
+    /// collapsed into an empty vector — the device-score builders need this to
+    /// avoid rendering a degraded read as a healthy, signal-free device. Still
+    /// bumps `yuzu_server_guardian_read_degrade_total{reason}` on a degrade,
+    /// same as the plain form (which is now a thin `.value_or({})` over this).
+    std::optional<std::vector<DexSignalCount>>
+    dex_device_signal_summary_checked(const std::string& agent_id,
+                                      const std::string& since = "") const;
 
     std::vector<GuardianRuleActivity> rule_activity(const std::string& since = "") const;
     std::vector<GuardianDayCount> daily_remediations(const std::string& since = "") const;

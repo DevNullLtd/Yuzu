@@ -51,6 +51,18 @@ curl -s -X DELETE http://localhost:8080/api/settings/pending-agents/agent-001 \
   -b "$COOKIE"
 ```
 
+`DELETE` only succeeds against a row that is still `pending` — it returns `409` if the agent has
+already been approved or denied, refusing to silently reverse that admin decision (WS-6 6.2). A
+Tier 1 agent removed while genuinely pending simply re-enters the pending queue on its next
+reconnect attempt, same as if it had never been seen. Before this guard, removing an already-
+*approved* row (typically a Tier 2, token-enrolled agent) deleted the row backing its enrollment
+with no admin decision behind it and no audit trail — that specific gap is now closed, since an
+approved row can no longer be removed via this endpoint at all. There is no remaining asymmetry for
+the remove-then-reconnect case: a still-`pending` agent (Tier 1 or Tier 2, before it has presented a
+valid token) behaves identically either way, and a Tier 2 agent's token-based enrollment
+(`consume_and_enroll`) creates a fresh `approved` row on the next successful token presentation
+regardless of whether a prior pending row existed.
+
 ### Tier 2: Pre-Shared Enrollment Tokens
 
 For automated deployments, administrators generate **enrollment tokens** -- time-limited and use-limited secrets that agents present at registration for immediate enrollment without manual approval.
@@ -116,7 +128,7 @@ curl -s -X DELETE http://localhost:8080/api/settings/enrollment-tokens/tok_a1b2c
   -b "$COOKIE"
 ```
 
-Tokens are persisted in `enrollment-tokens.cfg` alongside the server configuration file. They survive server restarts.
+Tokens are persisted in the PostgreSQL `auth.enrollment_tokens` table (WS-6 6.2) — shared by every server replica, not a per-replica file. They survive server restarts and image swaps. A pre-6.2 install's `enrollment-tokens.cfg` is imported once, automatically, at the first 6.2 boot (see `docs/adr/2002-high-availability-architecture.md` §8).
 
 ### Tier 3: Platform Trust (Planned)
 
@@ -219,6 +231,8 @@ Every per-device route is scoped to the device's management group (a global gran
 | **Device info** | Identity (agent ID, OS, arch, version), tags, group membership. | `Infrastructure:Read`, scoped to the device |
 | **DEX** | Per-device DEX score + a summary of recent signal observations, with a link to the full DEX drill-down (which carries an *Application performance over time* panel — retained daily per-app-version CPU/memory from the central store, no live query, no `Execute`). | `GuaranteedState:Read`, scoped to the device. Signal-history view audited as `dex.device.view`; the app-perf panel audited as `dex.device.app_perf.view` (separate verb) |
 | **Guardian** | Per-guard compliance state for the device (guard, state, last evaluated). | `GuaranteedState:Read`, scoped to the device (audited as `guardian.device.view`) |
+
+A device with zero reported guards renders "No guards evaluated" even if the fleet-wide rule catalogue read is itself degraded — the per-device read no longer depends on the catalogue's own health for a zero-row device (a small, disclosed rendering delta from the ADR-0031 WS-A4 seam rewire).
 
 #### Get live info
 
@@ -327,11 +341,13 @@ The full set of agent command-line flags:
 | `--cert-thumbprint` | SHA-1 thumbprint for cert store lookup (hex) | (none) |
 | `--cert-dir` | Directory for the auto-provisioned per-agent mTLS credential (env `YUZU_CERT_DIR`) | `<data-dir>/certs` |
 | `--no-auto-provision-cert` | Disable PKI auto-provisioning (do not request a per-agent client certificate at enrollment) | (enabled) |
-| `--plugin-dir` | Directory containing plugin shared libraries | `./plugins` |
+| `--plugin-dir` | Directory containing plugin shared libraries (env `YUZU_PLUGIN_DIR`). The default is `<exe_dir>/../plugins`, where `<exe_dir>` is the directory part of the path the agent was started by (`argv[0]`), not resolved through `PATH` or symlinks. Started by absolute path, as the published agent image (`yuzu-agent-chisel`, `ENTRYPOINT ["/usr/local/bin/yuzu-agent"]`) does, it is `/usr/local/plugins`. Nothing is installed there: the image's default `CMD` passes `--plugin-dir /usr/lib/yuzu/plugins`. Started by bare name through `PATH`, `argv[0]` has no directory part, so the default resolves against the working directory (`<cwd>/../plugins`). A compose `command:` (or `docker run` argument) override replaces the image's `CMD`, so it must restate `--plugin-dir` | `<exe_dir>/../plugins` |
 | `--log-level` | Logging verbosity (`trace`, `debug`, `info`, `warn`, `error`; lowercase and case sensitive, and an unrecognised value, including `WARN`, is treated as `off`; `--verbose` forces `trace` whatever this says). The `agent_actions` plugin's `set_log_level` action (needs `Infrastructure:Write` and, through the REST command dispatch, `Execution:Execute`) changes it at runtime but does not persist it, so it reverts when the agent restarts (env `YUZU_LOG_LEVEL`) | `info` |
 | `--log-file` | Path for an on-disk log file, written in addition to the console. A Windows service agent has no console, so it defaults to `yuzu-agent.log` under its data directory (env `YUZU_LOG_FILE`) | (none) |
 | `--log-max-size` | Size in bytes at which the agent's log file rotates. Applies whenever the agent writes a log file (`--log-file`, or the Windows-service default above), otherwise ignored (env `YUZU_LOG_MAX_SIZE`) | `52428800` (50 MB) |
 | `--log-max-files` | Number of rotated log files kept. Applies whenever the agent writes a log file, otherwise ignored (env `YUZU_LOG_MAX_FILES`) | `5` |
+
+Agent logging is asynchronous (#4666 PR-2): a producer thread enqueues a formatted line onto a fixed-size 8192-slot queue and returns; one dedicated worker thread does the actual sink I/O, so a stalled log destination no longer blocks the agent. Under sustained overload the queue silently drops the oldest still-queued lines (`overrun_oldest`) rather than growing or blocking. There is no `--log-sync` flag to opt back into synchronous logging. A shutdown that cannot tear this logger down within an internal 2-second grace, or that fails outright while doing so, self-exits with a new code, 5 (distinct from the existing 1/3/4); see "Stopping a wedged agent" in [Server Administration](server-admin.md) for the full exit-code reference and the async-logging behavior details, and "If log volume matters" in the same page for the level-gating consequence for the SIGINT/SIGTERM shutdown log line (it goes silent at `--log-level warn` or above).
 
 ### Per-agent mTLS auto-provisioning (PKI)
 

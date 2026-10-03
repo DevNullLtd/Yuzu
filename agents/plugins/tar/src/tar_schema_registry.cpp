@@ -1306,6 +1306,43 @@ std::vector<std::string> accepted_capture_methods_for_os(std::string_view source
     return methods;
 }
 
+std::optional<OsSupportStatus> os_support_status(std::string_view source_name,
+                                                 std::string_view os) {
+    const auto rank = [](OsSupportStatus s) {
+        switch (s) {
+            case OsSupportStatus::kSupported: return 3;
+            case OsSupportStatus::kSupportedConstrained: return 2;
+            case OsSupportStatus::kPlanned: return 1;
+            default: return 0;
+        }
+    };
+    std::optional<OsSupportStatus> best;
+    for (const auto& src : capture_sources()) {
+        if (src.name != source_name)
+            continue;
+        for (const auto& sup : src.os_support) {
+            if (sup.os != os)
+                continue;
+            if (!best || rank(sup.status) > rank(*best))
+                best = sup.status;
+        }
+    }
+    return best;
+}
+
+std::string_view supported_capture_method(std::string_view source_name, std::string_view os) {
+    for (const auto& src : capture_sources()) {
+        if (src.name != source_name)
+            continue;
+        for (const auto& sup : src.os_support) {
+            if (sup.os == os && (sup.status == OsSupportStatus::kSupported ||
+                                 sup.status == OsSupportStatus::kSupportedConstrained))
+                return sup.capture_method;
+        }
+    }
+    return "none";
+}
+
 std::string effective_network_capture_method([[maybe_unused]] std::string_view configured) {
     // The collect_fast NETWORK leg — `enumerate_connections()` — always polls,
     // regardless of the stored `network_capture_method`: the per-OS platform

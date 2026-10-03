@@ -16,6 +16,17 @@
  * still allocate there, and that claim was false and untested. These cases turn
  * the allocation census into an assertion that runs in CI.
  *
+ * MUTATION EVIDENCE, THE CENSUS'S OWN LIMIT (#4665): hoisting
+ * `log_key_token(key)` to a local declared ABOVE the `try` (so it allocates
+ * before entering the block the site comments call "contained") leaves every
+ * CHECK below unchanged - the count only sees allocations IN the window, not
+ * whether the allocating expression sits lexically inside the try. Containment
+ * of that fold (a throw from it costs nothing worse than the throws already
+ * handled at each site) is therefore review territory, the same limit the log
+ * call itself always had under QuietLog: this file was never able to prove
+ * WHERE inside the window an allocation happens, only THAT one does. Not
+ * closed here with a throwing-allocator seam - stated plainly instead.
+ *
  * PORTABILITY, STATED PLAINLY. Executable-side replacement of operator new
  * interposes for libyuzu_agent_core.so on this ELF/libstdc++ build — MEASURED,
  * after an earlier review round asserted it could not. That is not a portable
@@ -275,7 +286,8 @@ TEST_CASE("arm_impl: the failed-watch path allocates nothing after the commit (#
     // The window round 3 got wrong. Counting is armed from the phase-1 fault seam,
     // which fires immediately BEFORE sub_keys_.emplace, and stops when arm() returns
     // — so the window is that emplace plus everything after it: the publish, the
-    // contained "armed" log, the mechanism's return, the defensive unwatch() +
+    // contained "armed" log (which itself allocates once, post-#4665 — see the
+    // budget breakdown below), the mechanism's return, the defensive unwatch() +
     // Lost-notification snapshot/delivery (#2818), drop_key_locked, the error
     // completion, and the return itself. (An earlier version of this comment said
     // counting started inside the mechanism's watch(); it does not, and the sibling
@@ -327,7 +339,13 @@ TEST_CASE("arm_impl: the failed-watch path allocates nothing after the commit (#
     // SSO throughout and contributes nothing. The defensive `mech->unwatch(key)` this
     // fix also adds contributes nothing here — CountingMechanism's unwatch() only
     // locks + erases from an empty set (`record_` is off in this test).
-    CHECK(post_commit == 6);
+    //
+    // #4665 raised this from 6 to 7: the contained "armed" log fires on THIS path
+    // too — insertion always logs "armed" before the watch is even attempted, so
+    // the later watch failure doesn't skip it — and it pays the same
+    // log_key_token(key) fold cost as the fresh-SUCCESS-path test below. See that
+    // test's comment for exactly why it's one allocation here, not two.
+    CHECK(post_commit == 7);
     CHECK(engine.stats().armed_sparks == 0);
     engine.stop();
 }
@@ -383,7 +401,8 @@ TEST_CASE("arm_impl: the fresh SUCCESS path allocates nothing after the commit (
     // THE SHAPE AN ADVERSARIAL REVIEWER PROVED WAS UNPINNED. The two cases above cover
     // the failed-watch and dedup shapes; a fresh event-driven arm whose watch SUCCEEDS
     // traverses a different post-commit stretch - the publish tail, the contained
-    // "armed" log, the mechanism's watch(), the M1 consumer re-check, and the return of
+    // "armed" log (one allocation of its own, post-#4665 - see the budget comment
+    // below), the mechanism's watch(), the M1 consumer re-check, and the return of
     // the id. Inserting `std::string x(key);` immediately after watch_guarded() returns
     // left the whole budget binary GREEN, because nothing counted that stretch.
     //
@@ -419,9 +438,25 @@ TEST_CASE("arm_impl: the fresh SUCCESS path allocates nothing after the commit (
     REQUIRE(sub.has_value()); // the whole point: this is the SUCCESS path
     REQUIRE(armed_counter);
     REQUIRE(mech->watch_calls() == 1);
-    // Same budget as the other two shapes: the sub_keys_ emplace (map node + heap
-    // buffer for the over-SSO key) and nothing after it.
-    CHECK(post_commit == 2);
+    // Same sub_keys_-emplace budget as the other two shapes (map node + heap buffer
+    // for the over-SSO key), PLUS ONE new allocation from #4665: the contained
+    // "armed" log now folds `key` through ::yuzu::log_key_token() before spdlog is
+    // even entered (QuietLog silences spdlog's OWN formatting, never a caller
+    // expression evaluated ahead of it — see this file's top-of-file "MUTATION
+    // EVIDENCE, THE CENSUS'S OWN LIMIT" note).
+    //
+    // Exactly ONE, not two: log_key_token's fold (log_token.hpp) allocates once for
+    // any key over this standard library's SSO threshold — this test's key is a
+    // "file|..." prefix over kPath, ~71 bytes, always over SSO — and a SECOND time
+    // only if the FOLDED result still exceeds kGuardianLogIdMaxBytes (256 bytes),
+    // which forces a second heap buffer for the <head>~<tail> shortened form. This
+    // key is nowhere near 256 bytes, so the fold returns its single heap buffer
+    // directly (NRVO/move on return, no copy-with-reallocation — MEASURED here at
+    // exactly +1, not inferred from reading log_key_token's source) and the cost
+    // stops at one. The other two windowed sites (teardown_arm_race's and
+    // disarm()'s own "disarmed" logs) pay the identical one-allocation cost for the
+    // identical reason.
+    CHECK(post_commit == 3);
     CHECK(engine.stats().armed_sparks == 1);
     engine.stop();
 }
@@ -434,10 +469,13 @@ TEST_CASE("disarm: the in-lock teardown allocates nothing (#2270)", "[spark][all
     // where the twin contains. Three governance rounds retired findings on that
     // sink because its caller had been deleted; nothing pinned the sink itself.
     //
-    // What a throw in that window costs, which is why zero is the budget: it
-    // escapes a void function after erase_if has already emptied `subs`, leaving
-    // an armed_ entry with no subscribers and a dangling sub_keys_ row - a dedup
-    // target that hands the next equal-spec arm a SUCCESS with no watcher.
+    // What a throw in that window would cost if it escaped uncontained (it does
+    // not - the log call below has its own try/catch): it would escape a void
+    // function after erase_if has already emptied `subs`, leaving an armed_ entry
+    // with no subscribers and a dangling sub_keys_ row - a dedup target that hands
+    // the next equal-spec arm a SUCCESS with no watcher. That is why the budget
+    // stays as small and as fully NAMED as possible - #4665 below is the one
+    // addition, and it is accounted for, not merely tolerated.
     SparkEngine engine;
     CountingMechanism* mech = wire(engine);
     auto c = engine.register_consumer("c", [](const SparkEvent&) {});
@@ -459,11 +497,17 @@ TEST_CASE("disarm: the in-lock teardown allocates nothing (#2270)", "[spark][all
     engine.disarm(*sub); // last subscriber -> whole-key teardown + unwatch
     g_counting = false;
 
-    // ZERO, not a small number. The key is MOVED out of the sub_keys_ entry that
-    // is erased on the next line rather than copied, both erases only free, and
-    // the log is contained. Mutation-check this by restoring `const std::string
-    // key = ki->second;` in SparkEngine::disarm - that alone reddens this.
-    CHECK(g_allocs == 0);
+    // ONE, not zero, and not an unaccounted-for small number. The key is MOVED out
+    // of the sub_keys_ entry that is erased on the next line rather than copied,
+    // both erases only free, and the log's OWN spdlog formatting is contained and
+    // silenced by QuietLog. The single allocation that remains is
+    // log_key_token(key)'s fold (#4665) at the "disarmed" log site — the same
+    // one-not-two shape as the fresh-SUCCESS-path test above (over-SSO key, under
+    // kGuardianLogIdMaxBytes, so the fold's NRVO'd single buffer is all it costs).
+    // Mutation-check the MOVE-not-copy claim by restoring `const std::string key =
+    // ki->second;` in SparkEngine::disarm - that still reddens this (2, not 1;
+    // measured, not inferred).
+    CHECK(g_allocs == 1);
     CHECK(engine.stats().armed_sparks == 0);
     engine.stop();
 }

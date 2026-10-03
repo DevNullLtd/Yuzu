@@ -583,7 +583,8 @@ alert-rule halves** (#4 RE-SCOPED, not closed — see its bullet):**
   one: a heartbeat for a session this replica doesn't locally know is excluded from the renew batch
   (surfaced via `yuzu_server_gateway_route_desync_total{op="renew_leases",outcome="unknown_session"}`,
   new in this slice, rather than silently dropped) and stays that way until the #4246 #3 durable
-  cross-replica session lookup lands under WS-5. Unreachable on today's single-replica monolith.
+  cross-replica session lookup lands under WS-5. Reached after a server-only restart (observed on one
+  rig; see the known limitation under Server-Side Setup in `docs/user-manual/gateway.md`).
 - **Ship the write-failure fail-closed posture + alert rule** (#4246 #1 — **CLOSED, 4.2b**). The flip
   landed as a **per-site contract, not a uniform flip**: `record_route_store_failure`'s six call sites
   keep DIFFERENT postures by design — `register_fresh` (ProxyRegister's fresh-registration branch), the
@@ -1124,6 +1125,184 @@ WS-4 gate exists because "commands can't reach agents" (`docs/ha-delivery-matrix
 peer health/rebalancing is a capacity/load-balancing feature, not a reachability one. Tracked separately,
 not a WS-4 gate item.
 
+**Update (2026-10-01, #1197 - server-side unknown-session verdict; INERT until the gateway consumes it).**
+`BatchHeartbeatResponse` gained `repeated string unknown_session_ids = 2` and
+`bool unknown_session_ids_truncated = 3` (`proto/yuzu/gateway/v1/gateway.proto` and its two gateway
+mirrors; field 4 left free), and `GatewayUpstreamServiceImpl::BatchHeartbeat` now fills them. **No
+gateway code reads them yet** - the consumer (replaying the sessions the gateway holds locally through
+the existing replay drip) is a separate change tracked in #1197, so this change does not fix #1197: a
+server that restarts and loses its in-memory `gateway_sessions_` still does not learn the gateway's
+sessions until the gateway-side replay lands. An old gateway ignores the new fields (proto3 unknown
+fields), so the wire is unchanged in behaviour. There is deliberately no presence marker: a server that
+predates the fields and a server with nothing unknown are indistinguishable, and the gateway's only
+correct action in both cases is today's behaviour (no replay).
+- **What the list means.** It is the per-replica "I do not hold this session" verdict: the distinct
+  session ids in this batch that THIS replica's in-memory `gateway_sessions_` does not hold. It says
+  nothing about the other replicas or about the durable `GatewayRouteStore` directory. It is reported
+  whether or not a route store is wired.
+- **Bounds.** At most `kMaxUnknownSessionIdsPerResponse` = 4096 ids are listed (about 260 KiB at 64
+  bytes each); past that `unknown_session_ids_truncated` is set and one warn names listed/total. The
+  listed subset is unordered-set order, deliberately not sorted, so an omitted id is typically reported
+  again when that agent next heartbeats (30 s by default), not on the next gateway flush; that is not
+  guaranteed when a batch carries a very large number of distinct unknown ids (only 4096 are listed per
+  response, an arbitrary subset; the gateway forwards agent heartbeats verbatim, so one agent can
+  contribute many ids). The 64-byte per-id cap
+  (`kMaxGatewaySessionIdLen`) is applied only AFTER the `gateway_sessions_` lookup misses: a
+  reclaim-absent `ProxyRegister` adopts a gateway-presented id of any length, so capping first would
+  silently stop ingesting a known session. An empty unknown id is skipped; an over-length unknown id is
+  never listed and is counted per entry under
+  `yuzu_server_gateway_route_desync_total{op="batch_heartbeat",outcome="malformed_session_id"}`. A
+  session that legitimately holds a longer-than-64-byte presented id is therefore counted malformed and
+  never listed after a server restart (by design; ids this server mints are 43 bytes).
+- **Multi-replica statement (design intent, inferred from code reading; no multi-replica run exists;
+  not verified until the gateway-side replay ships).** The verdict-then-replay reconcile is intended to
+  be correct and bounded on one core replica. On several replicas it would converge in one round only if
+  the gateway's `BatchHeartbeat`, the replay `ProxyRegister` and the reannounce `NotifyStreamStatus` all
+  reach the SAME replica during the reconcile. The shipped gateway uses ONE gRPC channel and therefore
+  one HTTP/2 connection per upstream endpoint, so behind a layer-4 VIP it is connection-sticky; but
+  stickiness lasts only for the lifetime of that HTTP/2 connection (a reconnect mid-reconcile, a GOAWAY
+  or a load-balancer idle timeout can move the stream to another replica). Behind a multi-endpoint node
+  list (the channel then picks an endpoint per RPC, round-robin) or a layer-7 per-RPC balancer it would
+  converge only probabilistically: the replica that lacks the session keeps listing it, an arbitrary
+  replica receives each replay, and a replica that ALREADY holds the session re-installs it through
+  `register_agent` and wipes its placement until its own reannounce lands on it. A per-session replay
+  guard planned for the gateway-side change bounds the replay RATE, not the NUMBER of rounds. Expected
+  signature: `renew_leases`/`unknown_session` desync not decaying on some replica after both sides are
+  upgraded. The durable cross-replica session lookup (WS-5, `#4246` #3) is the real multi-replica fix;
+  until it lands the safe-to-scale gate still forbids a second replica.
+- **Lease window (observed on one local development rig with one agent, dev `3c8ac2c0c`; not
+  reproducible from the repo; tracker #1197).** After a server-only restart a single-target command to
+  an agent the new server does not know was still delivered while the lease and presence rows written
+  when the OLD server last ingested that agent's heartbeat were unexpired (remaining = 90 s, minus the
+  age of that heartbeat at the moment of the kill, minus the downtime); heartbeats the new server
+  receives for an unknown session extend neither, and an agent with no heartbeat ingested before the
+  kill was refused from the first probe. Delivery was observed at 20, 50 and 80 s after the last
+  ingested heartbeat and refusal at 125 s; the exact edge between 80 s and 125 s was not probed. The
+  directory-fallback and presence-row mechanism is inferred from the forwarding log line, not traced.
+  `/health` `agents.online` read 0 throughout, and the server did not recover in the observed windows
+  (to about 125 s). An early successful command is therefore not evidence the reconcile is unnecessary.
+
+**Update (2026-10-02, gateway heartbeat admission bound to the session's connection).** A gateway
+session is bound to the connection whose `Subscribe` stream created it; `heartbeat/2` admits a heartbeat
+only on that connection and only for a session the node holds. The `unknown_session_ids` verdict
+(2026-10-01 note) therefore names only sessions the node held at admission time; it remains an advisory
+snapshot (`gateway.proto`: it may be stale) and the replay keeps its own liveness, dedupe and pacing
+rules. No wire or server change, and no agent change for the supported topologies; this change does not fix #1197.
+A rejected agent re-registers through its `NOT_FOUND` recovery (cooldown from 2 s doubling to 300 s). That logic
+exists from agent v0.13.0 (checked in the agent source at the v0.12.0 and v0.13.0 tags), but the released v0.13.0
+and v0.14.0-rc6 agents wedge in their reconnect path with default settings (bug #2182, fixed by PR #5183, in no
+release yet) and recover only with `--no-auto-update` (observed with both) or on a build that includes the fix;
+v0.12.0 never re-registers by itself (observed; older versions were not tested). Upgrade the agents first, then the gateway, with a
+build that includes the #2182 fix once released; until then restart an agent that stays rejected. Agents that do
+not connect through the gateway are not affected. An older agent only
+logs `Heartbeat failed` and, for persistent missing state, stays rejected until it is restarted or upgraded (a heartbeat
+in the short take_pending to register_agent gap can succeed later without re-registration); that matters only when its
+heartbeats are rejected: under a topology that breaks the one-connection assumption, against a gateway
+running without the session index, after a gateway registry process restart or crash while connections
+stay up (the registry recreates its tables empty; a node failover that leaves the session not held by the
+surviving node is expected to behave the same, inferred, not tested), or, for released agents, after a
+gateway process restart (observed in a graceful SIGTERM run with rc6, v0.13.0 and v0.12.0: the released agents did not notice the
+lost `Subscribe` stream and got `NOT_FOUND` on the new gateway, and v0.14.0-rc6 and v0.13.0 then wedged; the
+branch agent re-registered in 11 to 12 s with no rejections). Rollback is redeploying the
+previous gateway (the only new state is the in-memory index; derived from the change, not run).
+- **Connection key.** The key is the pid of the HTTP/2 connection process that carries the call, read
+  through a typed accessor added to the vendored grpcbox as its third `YUZU PATCH` site
+  (`grpcbox_stream:connection_pid/1`, `connection_pid_from_ctx/1`; `YUZU_PATCH.md`), wrapped by
+  `yuzu_gw_conn` (the only module the handlers call for keys). Every stream of one connection reports
+  the same key. A call without a key (`undefined`) never matches, not even a session registered without
+  one.
+- **Admission.** `yuzu_gw_heartbeat_admission` decides from node-local state only (never `pg`, never the
+  upstream server's view): the session index `yuzu_gw_sessions` (`{SessionId, AgentId, Pid, ConnKey}`,
+  created by the registry in `init/1` beside the routing and pending tables), then, on a miss, the
+  pending table. A pending session (Register done, `Subscribe` not yet admitted) is held to the
+  connection that sent the Register (`conn_key` in the pending row; `lookup_pending_session/1` does not
+  consume the row and treats an expired row as absent). Every rejection is the same gRPC `NOT_FOUND`
+  `unknown session` and the heartbeat is never queued; the reason appears only in counters:
+  `yuzu_gw_heartbeat_rejected_total{reason=unknown_session|no_connection|registry_unavailable}` and
+  `yuzu_gw_heartbeat_session_mismatch_total{event="security"}`, all pre-seeded to 0 and ASCII-HELP, plus
+  one rate-limited summary log line that never carries a session id. A rejected heartbeat has no resolved
+  principal, so the observability carve-out applies (metric and a rate-limited summary log, no audit row). No alert rule
+  ships yet.
+- **Lookup primitive.** `yuzu_gw_registry:lookup_session/1` returns `{ok, #{agent_id, pid, conn_key}}`,
+  `error` (not held on this node, or the process is no longer alive) or `{error, unavailable}` (the
+  index table does not exist, for example while the registry restarts). Callers must treat
+  `{error, unavailable}` as "not admitted", never as "no filter"; admission answers it with the same
+  `NOT_FOUND`. A future consumer (the gateway-side replay) must handle all three shapes, and must not
+  read `error` as "gone": it also covers a session that is only pending and the brief gap between
+  `take_pending` and `register_agent`. `{ok, #{conn_key := undefined}}` means the session is held but
+  never admits (it was registered without a connection key), not "not held". A consumer should use one
+  lookup consistently: `lookup_session/1` is session-keyed and checks that the process is local and
+  alive, while `lookup_local_session/1` is agent-keyed and has no node check. The server's
+  `unknown_session_ids` verdict stays an advisory snapshot whatever a consumer does with this function.
+  `error` also covers a pending session and the gap between `take_pending` and `register_agent`;
+  `lookup_pending_session/1` distinguishes a pending session from that gap, but it does not distinguish
+  the gap from an unknown or expired session (both lookups return `error` for each). The two also differ
+  on age: `lookup_pending_session/1` treats a row older than the 120 s TTL as absent, while `take_pending`
+  ignores the stored timestamp and still admits it until the 60 s sweep removes it, so a `Subscribe` can
+  succeed on a row the lookup reports as absent. An `{ok, Map}` result can go stale before the caller
+  acts, so a consumer treats it as advisory and re-checks at the act.
+- **Lifecycle, as implemented.**
+
+| Event | Index row |
+|---|---|
+| `register/2` succeeds upstream | pending row written with the Register connection's key (TTL 120 s, swept every 60 s) |
+| `subscribe/2`: `take_pending`, then `start_agent` | pending row consumed; for the short interval before the agent process registers neither row exists and a heartbeat gets `NOT_FOUND` (accepted; the agent recovers through its existing re-register path) |
+| `yuzu_gw_agent:init/1` calls `register_agent/7` | row inserted with the Subscribe connection's key; `maybe_cleanup` also removes the superseded process's row; `/5` and `/6` registrations carry `undefined` and admit nothing; an `undefined` session id is not indexed |
+| agent process cleanup | `deregister_agent/3` is fenced on the caller's own pid and session: it always removes that session's row, and removes the routing row and `pg` memberships only while that pid still owns the agent id, so a process superseded by a newer registration cannot remove it. The unfenced `deregister_agent/1` remains (it removes whichever process holds the agent id, with that row's session entry) |
+| registry `DOWN` for an agent pid | the session row goes only if the agent's routing row still names that pid |
+| registry restart | all of its tables (routing, pending and sessions) are recreated empty; lookups answer `{error, unavailable}` while the table is absent and `error` afterwards, so heartbeats get `NOT_FOUND` and agents with the reconnect fix recover through their re-register path. Observed on a rig by killing the registry process with 4 real agents attached: `unknown_session` rose by 4 (one per agent), `registry_unavailable` stayed 0, and all 4 agents were admitted again within about 25 s without a manual restart |
+| gateway restart | everything is gone and every connection is dropped; agents with the reconnect fix reconnect with fresh sessions (observed with the branch agent); released agents did not notice the lost `Subscribe` stream in a graceful SIGTERM run and need a restart if they stay rejected |
+| upstream replay and `reannounce/2` | replay never writes the index directly; a forced disconnect of a superseded replay ends that agent process, and the fenced cleanup then removes its row |
+| server-only restart | untouched: admission does not consult the server, so heartbeats are still admitted and the server's verdict stays advisory |
+
+- **Supported topologies.** Agents connect to `:50051` directly, or through an L4 / TLS-passthrough path
+  that keeps one TCP connection per agent. An HTTP/2-terminating or HTTP/2-multiplexing proxy between
+  agents and the gateway is not supported for this check: it may cause repeated heartbeat rejection or share
+  gateway-side connections across agents, removing the per-agent connection separation the check requires. It can
+  spread one agent's calls over several connections (connection mismatches, counted by `yuzu_gw_heartbeat_session_mismatch_total` and shown
+  as the `connection_mismatch=` count in the gateway summary log line, plus repeated re-registration)
+  and removes the per-agent separation the check relies on. There is no topology knob and no
+  `sys.config` change. Observed with a real C++ agent and two agents per run: behind an
+  HTTP/2-terminating proxy (nginx `grpc_pass`, two agents) every heartbeat was rejected as a connection mismatch
+  and none reached the server, while the agents still enrolled and received commands and re-registered
+  on their back-off ladder (2 s doubling to a 300 s cap); behind an L4 TCP forwarder (nginx `stream`)
+  there were no rejections. The agent-facing message is the same `unknown session` for every reason, so
+  operators diagnose from the counters and the summary log. Not tested with a real agent: a multi-node
+  gateway (a two-node registry unit test, `yuzu_gw_registry_multinode_tests`, exists) and a listener that
+  requires client certificates (a test-client mutual TLS leg exists in
+  `yuzu_gw_heartbeat_conn_rpc_tests`; the shipped listener does not require client certificates). Not
+  tested at all: a multiplexing HTTP/2 proxy with upstream keepalive, fleet-scale storms, Windows service
+  mode, a macOS agent, a real hot code load and a GOAWAY that the gateway itself originates (an injected one was run). The rig runs used
+  gateway commit `1c145d78a` (the first plaintext run used `2e884bb9b`, which differs only in tests and
+  docs); later fix commits (`605f117d2` index guard, `3431d20ea` `/readyz` `sessions_index`,
+  `026830cd9` summary log state created at boot, and the round-2 code commits `e139c5e86` boot test and
+  two comments, `9ad473534` counter HELP wording, `942fe5770` and `c2d040a66` test changes, `ab3986ec1`
+  comments, and the round-3 code commit `21125cc3b` comment, HELP and test changes) were covered by eunit only
+  (fix-agent runs) until a plaintext rig run at `1e9c9784d` exercised the boot path of the final gateway source. The
+  commits after `1e9c9784d` are test, documentation and HELP text changes only (covered by eunit, not rig-run). The run record is
+  [gateway-heartbeat-connection-binding-2026-10-03](../security-reviews/gateway-heartbeat-connection-binding-2026-10-03.md).
+- **Connection close and GOAWAY.** Observed in the gateway's own tests with a test HTTP/2 client: the
+  gateway's HTTP/2 server closes a connection as soon as it sends GOAWAY, so a `Subscribe` stream and
+  its binding end with the connection (there is no drain period). A heartbeat that reaches the gateway
+  on a different connection while the old `Subscribe` is still bound is rejected (`NOT_FOUND`,
+  connection mismatch) and an agent with the reconnect fix recovers by re-registering. With the real C++ agent (a branch build) a
+  graceful GOAWAY injected on the gateway-side connection by the tester (the gateway did not originate one) moved the
+  next heartbeat to a new connection: the mismatch counter rose by one and the agent re-registered 16 s later.
+- **Deploying.** The index table is created at registry init, so deployment needs a gateway restart;
+  hot code upgrade is not supported for this change. Code loaded into a running node has no table: the
+  registry guards its index calls (`catch error:badarg`), so it survives and keeps its routing rows and
+  `pg` groups, logs one warning, and every heartbeat on that node is rejected as `registry_unavailable`
+  until the gateway is restarted (covered by a unit test that deletes the table inside the registry; a
+  real hot code load was not run). `/readyz` reports `sessions_index` and answers 503 while the table is
+  missing. `yuzu_gw_sessions` is a protected table written only by the registry process.
+- **Limits.** `Subscribe` admission is unchanged by this change. Some log lines still include session
+  ids; two gateway info lines no longer do. The node-local rule also applies to a multi-node gateway: one
+  agent's `Heartbeat` must reach the node that holds its `Subscribe` stream (per-connection sticky L4,
+  no per-RPC balancing). Planned agent-side endpoint failover (WS-13) must keep one channel per agent to
+  one node for the life of a session; a failover that re-registers on a new channel mints a new session and
+  is compatible. A future heartbeat-forwarding slice cannot reuse the connection pid as its key, because a pid
+  is meaningful only on the node that owns the connection.
+
 ### 7d. Cross-cluster gateway fan-out — "rest of 4.3" (WS-4, 2026-09-21)
 
 **Status: CLOSED.** The last named WS-4 4.3 gap: 4.3a (§ above) built INTRA-cluster routing (agent on a
@@ -1407,10 +1586,13 @@ FortitudeEtc/Codex+Kimi, SHOULD, 2026-09-22). One path remains genuinely open, n
 every branch this PR's own scope covers, not that one.
 
 ### 8. PKI / CA high availability (Q8)
-Collapse CA HA into the KEK problem, with the versioning/rollout gaps review surfaced:
-- **CA root key → `SecretCodec`-wrapped blob in Postgres** (ADR-0010); distributing the key reduces
-  to **KEK availability**.
-- **`CaStore` → Postgres**; **durable CRL numbering** via a Postgres sequence — but numbering alone
+Collapse CA HA into the KEK problem, with the versioning/rollout gaps review surfaced *(the
+"collapse into the KEK problem" framing and the first two bullets are superseded — see the Update
+below)*:
+- ~~**CA root key → `SecretCodec`-wrapped blob in Postgres** (ADR-0010); distributing the key reduces
+  to **KEK availability**.~~ *Superseded 2026-09-23: the key stays behind `KeyProvider`.*
+- **`CaStore` → Postgres**; **durable CRL numbering** via a Postgres sequence *(superseded
+  2026-09-23: a table lock, not a sequence)* — but numbering alone
   is insufficient: **CRL publication becomes an explicit durable state machine** (allocate → sign →
   store → make-current) with a fencing rule, since a sequence prevents collisions yet can leave gaps
   and does not make publication atomic (`ca_store.cpp:605`).
@@ -1420,6 +1602,75 @@ Collapse CA HA into the KEK problem, with the versioning/rollout gaps review sur
   includes KEK **version rollout, rollback, and node-admission** semantics (an instance without the
   current version must not silently produce unverifiable material). KMS/HSM via the existing seam is
   optional (SaaS / high-security).
+
+**Update (2026-09-23, WS-6 planning + slice 6.1).** Three points above are resolved as follows:
+- **The CA root key does NOT become a `SecretCodec` blob in Postgres.** The first bullet conflicted
+  with ADR-0010 Decision 6 (the CA root key stays behind `KeyProvider`; "no future store migration
+  may" move it) and ADR-0053 §Secrets. ADR-0010 governs. Putting the key under the secrets KEK would
+  make database + KEK sufficient to hold the CA, while saving little operationally, because the KEK
+  files must be distributed to every replica anyway. WS-6 instead uses **shared key custody**: the
+  CA key and KEK files are provisioned to every replica, and a replica must prove it can resolve
+  every required key before it is admitted (slice 6.3, with `/readyz`).
+- **`CaStore` → Postgres** was already done by ADR-0053 before WS-6 began.
+- **CRL publication (slice 6.1, closes #4126)** is one Postgres transaction:
+  `LOCK TABLE ca_store.ca_crl_versions IN SHARE ROW EXCLUSIVE MODE` → read `MAX(version)+1` → read
+  the revoked set → sign → `INSERT` → `COMMIT` (`CaStore::publish_next_crl`). Allocate, store and
+  make-current happen together at the commit ("current" is the highest committed version), a
+  rollback consumes no number, so there are no gaps and no sequence is needed. The table lock is
+  the fencing rule — in a different sense from §3's fencing token: there is no leadership to lose,
+  because the lock and the CRL write are one transaction, so a paused publisher cannot hold a
+  silently transferred right. It serialises every publisher on every replica, is released by the
+  commit, and is deliberately not a leader epoch, because the operator revoke path publishes
+  synchronously (the two-dispatch-planes rule). A table lock rather than the codebase's usual
+  `pg_advisory_xact_lock` because it also blocks writers that do not opt in (any other INSERT into
+  `ca_crl_versions`, including an older binary's during a rolling upgrade) — do not "harmonise" it
+  to an advisory lock. The lock wait is bounded per transaction (`set_config('lock_timeout', …)`),
+  and a process-local mutex keeps each replica to one pool connection waiting on it. Reading the
+  revoked set after acquiring the lock makes each CRL a superset of the one before it; re-reading
+  `ca_root`'s fingerprint under the lock stops a publish that raced a subordinate import from
+  landing a CRL under the superseded issuer. The CA key is loaded before the lock is taken; only
+  signing runs under it. A publish that fails (e.g. lock timeout) is healed by the leader's
+  freshness pass, which republishes whenever the latest CRL's recorded `revoked_count` differs from
+  the current revoked count — a count comparison, never cross-replica timestamps, which holds
+  because the revoked set is append-only (`delete_issued_by()` keeps revoked rows, and a migration-v4
+  row trigger rejects deleting or updating a revoked `ca_issued` row). A publisher
+  frozen mid-transaction is cut off by a transaction-scoped `idle_in_transaction_session_timeout`.
+- **Enrollment → Postgres** (slice 6.2) imports the existing `enrollment-tokens.cfg` /
+  `pending-agents.cfg` once at first boot rather than starting fresh.
+
+**Update (2026-09-29, slice 6.2 done — commits 97e24ec6e..a81938ada; no PR number yet).** Enrollment
+tokens and pending-agent approvals are now PG-authoritative, mirroring 6.1's shape:
+- **`AuthDB` migration v2** replaces the dead v1 `enrollment_tokens`/`pending_agents` tables with the
+  live shape (`token_id`/`token_hash` UNIQUE, `max_uses`/`use_count` CHECK, `revoked`, `expires_at`
+  NULL=never; `agent_id` UNIQUE, five-state-ready `status` CHECK) plus `auth.import_meta`. The v1 step
+  is untouched — those tables never had a production writer, so there was nothing to carry.
+- **File mode is deleted, not deprecated.** `AuthManager`'s `save_/load_tokens`, `save_/load_pending`,
+  `reload_state` and the two in-memory maps are gone; every enrollment/pending call routes to
+  `AuthDB` and fails CLOSED (a typed `StoreError`, never `accepted=false`) with no store attached —
+  the case `server.cpp`'s `set_auth_db(nullptr)` at shutdown creates for an in-flight `Register`,
+  mirroring the existing #3401 fail-closed-on-a-failed-dependency-call precedent (`register_agent`'s
+  own fail-closed behaviour on a failed device-token revoke sweep), not a scenario #3401 itself
+  tracks.
+- **`consume_and_enroll` is one guarded-UPDATE transaction**: the token-use count and the
+  admin-denial check happen in the SAME transaction, so a denied agent's use is rolled back rather
+  than refunded (closing #1135) — the exact shape §8's original slice-6.1-era design note anticipated
+  for enrollment, one transaction rather than a check-then-act pair.
+- **One-time `.cfg` import**, structurally identical to 6.1's shared-custody stance: a pre-6.2
+  install's `enrollment-tokens.cfg`/`pending-agents.cfg` are imported exactly once, under a dedicated
+  advisory-lock key, with a per-file content-fingerprint marker stamped in the SAME transaction as the
+  imported rows — never on file absence. A marker whose fingerprint matches skips (idempotent,
+  including after a same-bytes restore of an already-removed/denied/revoked row — nothing is
+  resurrected); a mismatched fingerprint is REFUSED, not merged (the restored-old-backup case),
+  logged CRITICAL and counted, never failing boot; a genuine store error with the file present DOES
+  fail boot closed. Runs from `Server::create` right after `set_auth_db`, before any listener binds —
+  never from a main.cpp one-shot.
+- **WS-9 evidence**: `scripts/ha/ha-enrollment-concurrent-register.sh` races concurrent Register RPCs
+  from two real, separate `yuzu-server` processes against one shared max_uses=1 token — exactly one
+  accepted, Postgres itself settling at `use_count=1` — the first WS-9 proof this posture holds
+  across processes, not just pooled connections in one (see `docs/ha-delivery-matrix.md`'s WS-9 row).
+- **Rolling-upgrade note**: stop every old-version server before starting the first 6.2 replica (a
+  running old-version replica would keep writing the `.cfg` files the importer has already renamed
+  aside, and its own writes would never be seen by the PG-authoritative new replicas).
 
 ### 9. SQLite tail migration (Q9)
 ADR-0006 Update already mandates every server store migrate to Postgres; HA makes the remaining tail
@@ -1525,6 +1776,112 @@ Yuzu ships Postgres, so HA Postgres is a delivery artifact we own.
   buffering; health targets `/readyz`; draining; optional stickiness (locality only); TLS stance.
   Owned by `docs-writer` + `release-deploy`.
 
+**Update (2026-09-24, WS-8 readyz — monolith).** The monolith's single `/readyz` plays the core role and
+is what the operator LB targets (the tier split is a no-op until ADR-1005's split lands, §1c). Two
+gaps closed:
+- **"Red when core cannot reach `yuzu`" is now true at runtime.** Every store's `is_open()` is latched
+  at construction (#3061) and the pool's connect breaker arms only on a failed *new* connect, so
+  `/readyz` used to stay green through an outage. A dedicated-connection probe
+  (`PgReachabilityProbe`, never a pool lease) now feeds a gating `pg_reachable` row: not ready after
+  two failed probes, immediately on reaching a server that refuses writes (`pg_is_in_recovery()` or
+  `transaction_read_only` — core is the sole writer, so a replica pointed at a standby, or at a primary
+  in read-only mode, cannot serve), or after 15 s without a success. Every libpq socket wait runs under a
+  client-side deadline via the non-blocking API (a host-name lookup is bounded by the system
+  resolver instead), because a blocking query against a frozen backend was
+  measured at 101 s; libpq walks a multi-host DSN itself with the pool's exact connection parameters, and the
+  probe only gives each host its own deadline (the pool's effective `connect_timeout`, timed as the
+  linked libpq's blocking connect times it),
+  restarting the walk over the untried hosts when one goes silent — and not moving on at all when that
+  timeout is unlimited, because the pool does not either (libpq's non-blocking
+  connect never advances past a silent host); and a read-only answer drops the
+  connection so the next probe re-resolves, rather than staying on a standby that a proxy, DNS name
+  or read-any port routed a new connection to. Consequence, accepted: a Postgres failover
+  turns **every** replica red for the failover window — truthful, since nothing can serve writes.
+  Leadership is deliberately not a readiness condition.
+- **Multi-host DSNs.** libpq walks the host list for the probe exactly as for the pool (order, which
+  failures move on and which end the attempt, the pool's connection parameters), so the probe
+  measures the host the pool reaches — every re-implementation of that walk diverged (governance
+  rounds 2–5); and a multi-host DSN must carry
+  `target_session_attrs=read-write` (added when absent, a weaker value refuses boot) and may not set
+  `load_balance_hosts` (refused at boot: the pool would shuffle per connection while the probe holds one),
+  because without
+  it libpq puts pool connections on standbys that no single probe connection can observe. Residual: the
+  pool does not re-validate connections it holds, so a server that turns read-only in place (without the
+  restart a demotion implies, or behind a per-node pooler that keeps server connections open) keeps
+  failing those connections. `/readyz` goes red too when a new connection reaches that server; it stays
+  green only when a new connection reaches a different, writable host.
+- **The contract, and a freeze (governance round 9, architecture review adopted by the operator).**
+  Nine review rounds each found a new divergence between the probe and the pool, all one class: the pool
+  holds N connections opened at N moments under N resolved settings and never re-validates them, so no
+  single probe connection can represent them. The promise is therefore stated precisely:
+  `pg_reachable` is a one-session signal — red when the probe's most recent connect, made with the pool's
+  own parameters (a single host capped at 5 s), could not establish a session to a server that accepts
+  writes, or when the probe's held session stops answering or turns read-only. It keeps a healthy session
+  open, so it does not observe the pool's other held connections, nor anything that changed after the
+  probe last connected. Named residuals: held pool connections to a server demoted in place (#4942);
+  anything that changes whether a new connection would succeed — service-file/environment edits, a
+  password rotation or expiry, a pg_hba or certificate change — until the probe's next reconnect (#4956);
+  a multi-address host name with one silent address (#4954); `max_connections` exhaustion (#4943); and,
+  accepted and untracked, timing — about ±1 s against the pool's connect, a single host capped at 5 s
+  (red-only). Freeze rule: no further emulation of libpq/pool behaviour in
+  the probe; a newly found divergence is an issue against this contract unless it produces a false green
+  for a fresh connect on a single-endpoint or read-write multi-host DSN, which stays blocking. The durable
+  fix for held connections is pool-side (validate on acquire / maximum lifetime), not more probe
+  emulation.
+- **Draining.** `--shutdown-drain-seconds` (0–60, default 0) holds the listener open after `/readyz`
+  turns `503 draining`, so the fronting layer drains before the socket closes.
+The BYO-LB documentation deliverable above remains open (P2, not in the safe-to-scale gate).
+
+**Decision (2026-09-26, #4943 + #4944 — the two whole-tier-eviction shapes).** Both were recorded by the
+WS-8 governance run as decisions to take before a second replica fronts a load balancer, because each can
+red every replica at once while the database still serves. Both are decided on one principle, already
+applied to the store rows above: **a shared-substrate condition must not drive per-replica eviction** —
+moving traffic to another replica of the same database cannot help, and taking the whole tier out of a
+fail-closed LB turns a degradation into an outage.
+
+- **#4943 — the probe is the connection refused first at `max_connections`.** Decided: the probe stays
+  pool-faithful and the *substrate* is sized and protected; no probe-only privilege, no 53300 special case.
+  (a) A reserved slot for the probe alone is rejected: it would connect as a different role from the pool,
+  which is precisely the false green the contract above forbids (probe ready while fresh pool connects are
+  refused). (b) A distinct non-gating reason for 53300 is rejected: libpq exposes no SQLSTATE for a
+  connection-phase failure (only message text, whose format depends on verbosity), so it would mean
+  matching localisable server messages — the emulation the freeze rule forbids. (c) The server's footprint
+  is static and small — `pool_size + 2` per replica (the pool is hard-capped, one leader-election
+  connection, one probe; no other connect site) — so `max_connections ≥ N × (pool_size + 2) +
+  superuser_reserved_connections + every other client` makes self-exhaustion impossible; the runbook
+  states that formula. (d) Foreign clients are kept out of the server's share with a Postgres mechanism that
+  keeps probe/pool fidelity: the shipped images set `reserved_connections` (default 40, env
+  `YUZU_PG_RESERVED_CONNECTIONS`, PG 16+) and grant `pg_use_reserved_connections` to the app role, so the
+  pool **and** the probe draw from the same reserve ahead of a backup job or an ad-hoc `psql` — the app is
+  privileged over other clients, not the probe over the pool. Both scripts refuse to boot if
+  `YUZU_PG_RESERVED_CONNECTIONS` reaches `max_connections − superuser_reserved_connections` (Gate 2 finding
+  #1, added in the same PR before merge) — that value would leave zero ordinary slots any non-privileged
+  client could ever use, not merely under load, which is a self-inflicted version of the exact failure this
+  decision closes. WS-9 scenario N reproduces both halves:
+  with every unreserved slot held by foreign sessions, a killed probe backend reconnects into the reserve
+  and `/readyz` stays 200; with the grant revoked the same kill leaves the probe refused and `/readyz` reads
+  `503 unreachable` — the failure the default prevents. Accepted residual: exhaustion by other *privileged*
+  clients reds a replica on its next probe reconnect, truthfully (its fresh pool connects fail too); in
+  steady state the probe holds its slot and reconnects only after a failure, so this is uncorrelated across
+  replicas outside a failover, during which every replica is red by design anyway.
+- **#4944 — Postgres overload flaps every replica together.** Decided: **no server-side hysteresis**; the
+  rule stays 2 s query deadline / 2 consecutive failures / 15 s stale / one success recovers, and the LB's
+  `healthy_threshold` is the anti-flap lever, with recommended values in the runbook (`interval 5 s,
+  unhealthy 2, healthy 3`: eviction needs ≥ 10 s continuously red, so a single stall never evicts;
+  re-admission needs ≥ 15 s continuously green, so a marginal database does not re-enter and drop out
+  every few seconds, which is what turns slowness into a reconnect storm). The considered alternative — a
+  query *timeout* as a "slow, not unreachable" class that does not strike and is caught only by the 15 s
+  stale backstop — moves the threshold (about 6 s → 15 s) without adding hysteresis: sustained overload
+  still reds and still flaps, and frozen-primary detection slows from ~11 s to 15 s. A second knob set on
+  the server would stack on the LB's (the Q5 decision that the constants are not flags stands). Sustained
+  overload taking the tier red is accepted as **truthful**: a one-row, no-table `SELECT` that misses a 2 s
+  deadline twice in four seconds means the database cannot serve real operator requests within their
+  deadlines either (session validate plus an audit write on nearly every request), and a frozen backend is
+  indistinguishable from it client-side without more emulation. Operators are told to check their LB's
+  all-unhealthy behaviour (route-anyway vs fail-closed) in the runbook now rather than waiting for the P2
+  BYO-LB document. WS-9 scenarios L (CPU-starved primary under load: red while starved, back within one
+  probe of lifting the limit) and M (a 3 s stall never reds) demonstrate the chosen behaviour.
+
 ### 13. HA guarantees — RTO/RPO (Q12)
 Proposed targets for the team to ratify:
 - **Presentation-replica loss:** RTO ≈ 0 (operator LB removes it on `/readyz`; sessions/streams are
@@ -1569,8 +1926,8 @@ This ADR records the model and principles. Each area becomes a child ADR/issue:
 4. **Gateway routing + multi-cluster topology** — fenced agent→cluster directory **and net-new
    distributed intra-cluster agent→node routing** (§7).
 5. **Shared agent presence / health / scope population** (§7a).
-6. **PKI/CA HA** — CA key to `SecretCodec`, CRL publication state machine, KEK versioning/rollout,
-   enrollment to PG (§8).
+6. **PKI/CA HA** — shared CA key custody + node admission (not `SecretCodec`; §8 Update
+   2026-09-23), CRL publication state machine, KEK versioning/rollout, enrollment to PG (§8).
 7. **HA-PG delivery** — Patroni+etcd+HAProxy profile with **selectable durability (3-node quorum
    default)** + operator-plane LB (§11).
 8. **Health contract + BYO-LB doc** (§12).

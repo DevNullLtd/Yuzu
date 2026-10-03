@@ -156,8 +156,8 @@ public:
     /// shape). `version` is matched AS SUPPLIED — the caller canonicalizes it
     /// first (same convention as `AppPerfCohortReader::get_cohort_rows`); `""` is
     /// the valid "unknown version" bucket, NOT an "all versions" wildcard (unlike
-    /// `AppPerfFleetFn`'s `version` convention) — this drill is always scoped to
-    /// one exact version.
+    /// `DexPerfApi::app_fleet_trend`'s `version` convention) — this drill is
+    /// always scoped to one exact version.
     ///
     /// `visible_agent_ids` mirrors the ADR-0017 admit-then-filter contract:
     /// `nullopt` = no SQL filter (every reporting device); engaged (INCLUDING

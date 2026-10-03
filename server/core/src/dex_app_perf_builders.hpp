@@ -20,19 +20,21 @@
 /// include this header at all. It is NEVER included by `dex_perf_api.hpp` or
 /// any presentation TU.
 ///
-/// `AppPerfProviders` (the pre-seam callback-bundle interface) is KEPT HERE
-/// UNCHANGED — DexPerfApi does not reuse or expose it (a Fable review of the
-/// plan found its `.cohort`/`CohortRead`/`AppPerfCohortFn` members are
-/// VerifyApi's own input shape, dead in production, and would drag VerifyApi's
-/// types into this seam's closure if formalized). Its REST/MCP handler
-/// call sites are GONE (both rewired onto `DexPerfApi` in the same change that
-/// built this seam) — its remaining live consumers are `server.cpp`'s
-/// assembly, the dashboard fragments (`dex_app_perf_ui.*`, `dex_perf_ui.cpp`,
-/// deliberately deferred this round, mirroring DexApi's own #4576 dashboard
-/// deferral), and VerifyApi's own test doubles (`.cohort` only). Deleting
-/// `AppPerfProviders` entirely needs the dashboard's own migration first —
-/// tracked as a named follow-up alongside that deferral (see the
-/// delivery-matrix WS-A4 row).
+/// `AppPerfProviders` (the pre-seam callback-bundle interface) is RETIRED
+/// (#4626) — DexPerfApi never reused or exposed it (a Fable review of the
+/// original seam-build plan found its `.cohort`/`CohortRead`/`AppPerfCohortFn`
+/// members are VerifyApi's OWN test-double input shape — `verify_api.cpp`'s
+/// real production wiring takes an `AppPerfCohortReader*` instead, a
+/// different shape entirely — so formalizing `AppPerfProviders` would have
+/// dragged a test-only type into this seam's closure). The individual
+/// `AppPerfXxxFn` provider typedefs below are now ALSO production-orphaned
+/// (no production caller builds one — `AppPerfProviders` was their only
+/// consumer, and it is retired): they, plus `CohortRead`/`AppPerfCohortFn`,
+/// have been relocated to `tests/unit/server/test_dex_perf_api_double.hpp`
+/// (`AppPerfXxxFn`, reused by `FnDexPerfApi::Providers`) and
+/// `tests/unit/server/test_verify_api_double.hpp` (`CohortRead`/
+/// `AppPerfCohortFn`, `FnVerifyApi`'s own input shape) — see those files for
+/// the live definitions.
 
 #include "app_perf_compare.hpp"     // AppPerfCohortRow (the VERIFY compare input shape)
 #include "app_perf_daily_store.hpp" // AppPerfDailyRow (per-device drill)
@@ -106,64 +108,23 @@ app_perf_device_summaries(const std::vector<AppPerfDailyRow>& rows);
 //    handler and mcp_server.cpp's get_dex_device_app_perf reach it only
 //    transitively, through DexPerfApi::device_app_perf_json, not directly.
 /// Shared JSON serializer for the per-device B1 app-perf drill. `rows` is
-/// whatever `AppPerfProviders::device(agent_id)` returned; empty `app_filter`
-/// means "every app". `audit_persisted` per `dex_device_score_json`'s contract
-/// (dex_read_model.hpp) — omitted (default true) on success, set false only
-/// when the MCP caller's own audit write is known to have failed.
+/// whatever `DexPerfApi`'s device backing read returned (`LocalDexPerfApi`'s
+/// `device_rows()`, `FnDexPerfApi::Providers::device` in tests); empty
+/// `app_filter` means "every app". `audit_persisted` per
+/// `dex_device_score_json`'s contract (dex_read_model.hpp) — omitted (default
+/// true) on success, set false only when the MCP caller's own audit write is
+/// known to have failed.
 std::string dex_device_app_perf_json(const std::string& agent_id, const std::string& app_filter,
                                      const std::vector<AppPerfDailyRow>& rows,
                                      bool audit_persisted = true);
 
-// ── Provider seams (wired in server.cpp over the B1/B2 stores) ────────────────
-//
-// UNCHANGED from the pre-seam shape (see the file banner above for why
-// AppPerfProviders is not folded into DexPerfApi this slice).
-
-using AppPerfFleetFn = std::function<std::optional<std::vector<AppPerfFleetRow>>(
-    std::string_view app_name, std::string_view version)>;
-
-using AppPerfAppListFn =
-    std::function<std::optional<std::vector<AppPerfAppSummary>>(bool& truncated)>;
-
-using AppPerfDeviceFn =
-    std::function<std::optional<std::vector<AppPerfDailyRow>>(std::string_view agent_id)>;
-
-using AppPerfGroupFn = std::function<std::optional<std::vector<AppPerfFleetRow>>(
-    std::string_view group_id, std::string_view app_name, std::string_view version)>;
-
-using AppPerfTagCohortFn = std::function<std::optional<std::vector<AppPerfFleetRow>>(
-    std::string_view tag_key, std::string_view tag_value, std::string_view app_name,
-    std::string_view version)>;
-
-using AppPerfTagValuesFn =
-    std::function<std::optional<std::vector<std::string>>(std::string_view tag_key)>;
-
-/// What the `/auto` VERIFY cohort provider returns — VerifyApi's own input
-/// shape (dead as an AppPerfProviders field in production; still used by
-/// VerifyApi's test doubles). Kept here unchanged for this slice.
-struct CohortRead {
-    std::int64_t member_count{0};
-    std::vector<AppPerfCohortRow> rows;
-    bool truncated{false};
-};
-
-using AppPerfCohortFn = std::function<std::optional<CohortRead>(
-    std::string_view group_id, std::string_view app_name, std::string_view baseline_version,
-    std::string_view candidate_version, int window_days)>;
-
-using AppPerfVersionDevicesFn = std::function<std::optional<std::vector<AppPerfVersionDeviceRow>>(
-    std::string_view app_name, std::string_view version,
-    const std::optional<std::vector<std::string>>& visible_agent_ids, bool& truncated)>;
-
-struct AppPerfProviders {
-    AppPerfFleetFn fleet;
-    AppPerfAppListFn apps;
-    AppPerfDeviceFn device;
-    AppPerfGroupFn group;
-    AppPerfCohortFn cohort; ///< VERIFY before/after compare (cohort-paired); dead in production
-    AppPerfVersionDevicesFn version_devices; ///< the version-row "which devices" drill
-    AppPerfTagCohortFn tag_cohort;   ///< the trend page's device-model filter
-    AppPerfTagValuesFn tag_values;   ///< populates the device-model selector
-};
+// `AppPerfProviders` (the pre-seam callback-bundle interface DexRoutes/
+// RestApiV1/McpServer used to build these providers into) is RETIRED (#4626)
+// — every production consumer now routes through `DexPerfApi`/
+// `make_local_dex_perf_api` (dex_perf_api_local.hpp) instead. The individual
+// `AppPerfXxxFn` provider typedefs (+ `CohortRead`/`AppPerfCohortFn`) that
+// used to live here are now production-orphaned and have been relocated to
+// `tests/unit/server/test_dex_perf_api_double.hpp` / `test_verify_api_double.hpp`
+// respectively — see this file's own banner above.
 
 } // namespace yuzu::server

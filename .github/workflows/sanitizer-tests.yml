@@ -229,12 +229,16 @@ jobs:
           PKG_CONFIG_PATH: ${{ github.workspace }}/vcpkg_installed/x64-linux-asan/lib/pkgconfig
         run: |
           rm -rf build-linux-asan
+          # -fno-sanitize=null,alignment: same flag and rationale as the ASan configure
+          # in nightly.yml (the full UBSan set makes yuzu_server_tests fail to link;
+          # #5167). Null and alignment UB are not detected in this leg.
           meson setup build-linux-asan \
             --native-file meson/native/linux-gcc15.ini \
             --buildtype=debug \
             -Dcmake_prefix_path=${{ github.workspace }}/vcpkg_installed/x64-linux-asan \
             -Dbuild_tests=true \
-            -Db_sanitize=address,undefined
+            -Db_sanitize=address,undefined \
+            -Dcpp_args=-fno-sanitize=null,alignment
           python3 scripts/ci/assert-gateway-tests.py build-linux-asan
 
       - name: Build (ASan+UBSan)

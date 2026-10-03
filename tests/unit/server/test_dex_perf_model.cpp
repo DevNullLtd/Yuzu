@@ -24,6 +24,7 @@
 #include "tag_store.hpp"
 #include "test_dex_perf_api_double.hpp"
 #include "test_route_sink.hpp"
+#include "../../../agents/plugins/tar/src/tar_schema_registry.hpp" // registry tripwire only
 
 #include "../test_helpers.hpp"
 
@@ -181,6 +182,10 @@ TEST_CASE("fleet_now: per-OS online + reporting denominators", "[dex][perf][mode
     CHECK(now.reporting_windows == 1);
     CHECK(now.reporting_linux == 1);
     CHECK(now.reporting_macos == 0);
+    // OS-aware denominator (#1845): Windows + Linux only; macOS and the
+    // unrecognized OS are online but have no collector. windows_online unchanged.
+    CHECK(now.perf_capable_online == 3);
+    CHECK(now.perf_capable_online == now.windows_online + now.linux_online);
 }
 
 TEST_CASE("fleet_now: partial reporters count once, per-metric n varies",
@@ -252,7 +257,7 @@ TEST_CASE("device_list: worst-first, cohort filter, untagged, limit",
     CHECK(rows[0].agent_id == "u-1");
 }
 
-TEST_CASE("device_list: not-reporting complement is Windows-only", "[dex][perf][model][devices]") {
+TEST_CASE("device_list: not-reporting complement excludes a non-collecting OS", "[dex][perf][model][devices]") {
     DexPerfSnapshot snap;
     snap.devices.push_back(dev("w-quiet", std::nullopt, std::nullopt, std::nullopt));
     snap.devices.push_back(dev("w-loud", 10.0, 50.0, 1.0));
@@ -296,6 +301,7 @@ TEST_CASE("perf fragment: real aggregations, suppression text, Performance tab",
     CHECK(html.find("Performance") != std::string::npos); // the 5th subnav tab
     CHECK(html.find("n too small") != std::string::npos); // cohort "b" suppressed
     CHECK(html.find("Windows and Linux") != std::string::npos); // coverage honesty (C1)
+    CHECK(html.find("of 16 perf-capable online") != std::string::npos);
     CHECK(html.find("/fragments/dex/perf/devices?metric=cpu") != std::string::npos); // drill
 }
 
@@ -364,7 +370,7 @@ TEST_CASE("perf routes: perm gating + provider degradation", "[dex][perf][routes
     };
     auto fleet = []() { return DexFleet{}; };
     std::string requested_key;
-    DexRoutes::PerfFn perf = [&](const std::string& key) {
+    DexPerfFn perf = [&](const std::string& key) {
         requested_key = key;
         return two_cohorts(12, 4);
     };
@@ -372,7 +378,10 @@ TEST_CASE("perf routes: perm gating + provider degradation", "[dex][perf][routes
     SECTION("permitted: tab + devices drill render through the provider") {
         yuzu::server::test::TestRouteSink sink;
         DexRoutes routes;
-        routes.register_routes(sink, okAuth, okPerm, nullptr, fleet, {}, {}, {}, perf);
+        auto dex_perf_api = std::make_shared<yuzu::server::test::FnDexPerfApi>(
+            perf, yuzu::server::test::FnDexPerfApi::Providers{});
+        routes.register_routes(sink, okAuth, okPerm, nullptr, fleet, {}, {}, {}, {}, {},
+                               dex_perf_api);
         auto tab = sink.Get("/fragments/dex/perf");
         REQUIRE(tab);
         CHECK(tab->status == 200);
@@ -399,7 +408,10 @@ TEST_CASE("perf routes: perm gating + provider degradation", "[dex][perf][routes
     SECTION("an invalid ?key= falls back to the default, never reaches the provider") {
         yuzu::server::test::TestRouteSink sink;
         DexRoutes routes;
-        routes.register_routes(sink, okAuth, okPerm, nullptr, fleet, {}, {}, {}, perf);
+        auto dex_perf_api = std::make_shared<yuzu::server::test::FnDexPerfApi>(
+            perf, yuzu::server::test::FnDexPerfApi::Providers{});
+        routes.register_routes(sink, okAuth, okPerm, nullptr, fleet, {}, {}, {}, {}, {},
+                               dex_perf_api);
         auto tab = sink.Get("/fragments/dex/perf?key=not%20a%20valid%20key%21");
         REQUIRE(tab);
         CHECK(tab->status == 200);
@@ -409,7 +421,10 @@ TEST_CASE("perf routes: perm gating + provider degradation", "[dex][perf][routes
     SECTION("denied without GuaranteedState:Read") {
         yuzu::server::test::TestRouteSink sink;
         DexRoutes routes;
-        routes.register_routes(sink, okAuth, noPerm, nullptr, fleet, {}, {}, {}, perf);
+        auto dex_perf_api = std::make_shared<yuzu::server::test::FnDexPerfApi>(
+            perf, yuzu::server::test::FnDexPerfApi::Providers{});
+        routes.register_routes(sink, okAuth, noPerm, nullptr, fleet, {}, {}, {}, {}, {},
+                               dex_perf_api);
         auto tab = sink.Get("/fragments/dex/perf");
         REQUIRE(tab);
         CHECK(tab->status == 403);
@@ -721,20 +736,19 @@ struct RestPerfHarness {
         std::shared_ptr<const yuzu::server::DexPerfApi> dex_perf_api_local;
         if (perf)
             dex_perf_api_local = std::make_shared<yuzu::server::test::FnDexPerfApi>(
-                perf, yuzu::server::AppPerfProviders{});
+                perf, yuzu::server::test::FnDexPerfApi::Providers{});
         api.register_routes(sink, auth_fn, perm_fn, audit_fn, nullptr, nullptr, nullptr, nullptr,
                             nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, {}, {},
                             nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, {},
                             nullptr, nullptr, {}, {}, {}, std::move(perf),
                             /*network_api=*/nullptr, /*lockout_clear_fn=*/{},
                             /*baseline_store=*/nullptr, /*scoped_perm_fn=*/{},
-                            /*software_inventory_store=*/nullptr, /*response_scope_fn=*/{},
-                            /*app_perf_providers=*/{}, /*engine_principal_store=*/nullptr,
+                            /*software_inventory_store=*/nullptr, /*response_scope_fn=*/{}, /*engine_principal_store=*/nullptr,
                             /*access_review_store=*/nullptr, /*auth_db=*/nullptr,
                             /*directory_sync=*/nullptr, /*stream_budget=*/nullptr,
                             /*exec_visible_fn=*/{}, /*list_read_fn=*/{}, /*fleet_read_fn=*/{},
                             /*agents_fn=*/{}, /*response_visible_set_fn=*/{},
-                            /*dex_visible_fn=*/{}, /*verify_api=*/nullptr,
+                            /*verify_api=*/nullptr,
                             /*device_api=*/nullptr, /*dex_api=*/nullptr, dex_perf_api_local);
     }
 };
@@ -767,6 +781,29 @@ TEST_CASE("REST /dex/perf/fleet: stats + denominators, absent metric is null",
     CHECK(j["data"]["reporting_windows"] == 2);
     CHECK(j["data"]["reporting_linux"] == 0);
     CHECK(j["data"]["reporting_macos"] == 0);
+    // OS-aware denominator (#1845); windows_online above stays byte-identical.
+    CHECK(j["data"]["perf_capable_online"] == 3);
+}
+
+TEST_CASE("dex_perf_os_collects is pinned to the tar registry's perf rows (#1845 tripwire)",
+          "[dex][perf][rules][registry]") {
+    // The server keeps detail::dex_perf_os_collects as its runtime fact; this pins
+    // it to the plugin's declared capture support. A collector landing for a new
+    // OS in the registry fails here until dex_perf_rules.hpp is flipped too.
+    bool saw_perf = false;
+    for (const auto& src : yuzu::tar::capture_sources()) {
+        if (src.name != "perf")
+            continue;
+        saw_perf = true;
+        for (const auto& row : src.os_support) {
+            const bool collects = row.status == yuzu::tar::OsSupportStatus::kSupported ||
+                                  row.status == yuzu::tar::OsSupportStatus::kSupportedConstrained;
+            INFO("os=" << row.os);
+            CHECK(rules::dex_perf_os_collects(std::string{row.os}) == collects);
+        }
+    }
+    CHECK(saw_perf);
+    CHECK_FALSE(rules::dex_perf_os_collects(""));
 }
 
 TEST_CASE("REST /dex/perf/* A4 error bodies carry retry_after_ms + X-Correlation-Id (#1470)",
@@ -1079,14 +1116,16 @@ TEST_CASE("the route's valid_tag_key copy AGREES with TagStore::validate_key (C-
     auto okPerm = [](const httplib::Request&, httplib::Response&, const std::string&,
                      const std::string&) { return true; };
     std::string requested_key;
-    DexRoutes::PerfFn perf = [&](const std::string& key) {
+    DexPerfFn perf = [&](const std::string& key) {
         requested_key = key;
         return DexPerfSnapshot{};
     };
     yuzu::server::test::TestRouteSink sink;
     DexRoutes routes;
+    auto dex_perf_api = std::make_shared<yuzu::server::test::FnDexPerfApi>(
+        perf, yuzu::server::test::FnDexPerfApi::Providers{});
     routes.register_routes(sink, okAuth, okPerm, nullptr, []() { return DexFleet{}; }, {}, {},
-                           {}, perf);
+                           {}, {}, {}, dex_perf_api);
 
     struct Case {
         const char* raw;     // urlencoded query value
@@ -1275,12 +1314,15 @@ TEST_CASE("cohort_diff route: served comparison + perm gate + degraded provider"
         return false;
     };
     auto fleet = []() { return DexFleet{}; };
-    DexRoutes::PerfFn perf = [](const std::string&) { return diff_snap(12, 12); };
+    DexPerfFn perf = [](const std::string&) { return diff_snap(12, 12); };
 
     SECTION("permitted: serves the A-vs-B comparison with a populated delta") {
         yuzu::server::test::TestRouteSink sink;
         DexRoutes routes;
-        routes.register_routes(sink, okAuth, okPerm, nullptr, fleet, {}, {}, {}, perf);
+        auto dex_perf_api = std::make_shared<yuzu::server::test::FnDexPerfApi>(
+            perf, yuzu::server::test::FnDexPerfApi::Providers{});
+        routes.register_routes(sink, okAuth, okPerm, nullptr, fleet, {}, {}, {}, {}, {},
+                               dex_perf_api);
         auto r = sink.Get("/fragments/dex/perf/cohort-diff?key=model&a=a&b=b");
         REQUIRE(r);
         CHECK(r->status == 200);
@@ -1289,7 +1331,10 @@ TEST_CASE("cohort_diff route: served comparison + perm gate + degraded provider"
     SECTION("denied without GuaranteedState:Read") {
         yuzu::server::test::TestRouteSink sink;
         DexRoutes routes;
-        routes.register_routes(sink, okAuth, noPerm, nullptr, fleet, {}, {}, {}, perf);
+        auto dex_perf_api = std::make_shared<yuzu::server::test::FnDexPerfApi>(
+            perf, yuzu::server::test::FnDexPerfApi::Providers{});
+        routes.register_routes(sink, okAuth, noPerm, nullptr, fleet, {}, {}, {}, {}, {},
+                               dex_perf_api);
         auto r = sink.Get("/fragments/dex/perf/cohort-diff?key=model&a=a&b=b");
         REQUIRE(r);
         CHECK(r->status == 403);

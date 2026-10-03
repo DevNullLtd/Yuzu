@@ -90,7 +90,7 @@
 services:
   # ── Yuzu Server ──────────────────────────────────────────────────────
   server:
-    image: ghcr.io/tr3kkr/yuzu-server:${YUZU_VERSION:-0.13.0}
+    image: ghcr.io/devnullltd/yuzu-server:${YUZU_VERSION:-0.14.0}
     container_name: yuzu-server
     restart: unless-stopped
     # MCP streamed POST ships ON by default (docs/user-manual/server-admin.md
@@ -155,7 +155,7 @@ services:
   # instead is first-class — point YUZU_POSTGRES_DSN at it and remove this
   # service.
   postgres:
-    image: ghcr.io/tr3kkr/yuzu-postgres:${YUZU_VERSION:-0.13.0}
+    image: ghcr.io/devnullltd/yuzu-postgres:${YUZU_VERSION:-0.14.0}
     container_name: yuzu-postgres
     restart: unless-stopped
     environment:

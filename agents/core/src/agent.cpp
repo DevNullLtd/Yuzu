@@ -38,7 +38,10 @@ __declspec(allocate(".CRT$XCB"))
 
 // Local-only helper, exposed for unit testing.
 #include "plugin_config_sync.hpp"
+#include "plugin_heartbeat_tags.hpp" // #1567 plugin heartbeat.* KV -> status tags
 #include "local_dispatcher.hpp"
+#include "ctx_slot.hpp"         // CtxSlot / cancel_ctx_slot (unit-tested, #2182)
+#include "ota_update_thread.hpp" // OTA update thread lifecycle (unit-tested, #2182)
 #include "shutdown_deadline_guard.hpp" // #2233 item 3: end-to-end stop() deadline
 #include "sync_now_decision.hpp"               // __sync__.now decision core (pure, unit-tested)
 #include "sync_scheduler.hpp"                 // ADR-0016 daily-sync framework
@@ -59,6 +62,7 @@ __declspec(allocate(".CRT$XCB"))
 #include "guardian_health_heartbeat.hpp"  // emit_guardian_health_heartbeat_tags (M1)
 #include "guardian_io_ceiling_heartbeat.hpp" // emit_guardian_io_ceiling_heartbeat_tags (rung 9c PR-3)
 #include "guardian_journal_heartbeat.hpp" // emit_guardian_journal_heartbeat_tags (item 7 PR-Ag)
+#include "guardian_legacy_sink_executor.hpp" // #4783: LegacySendOutcome (EventSink's return type)
 #include "guardian_unsupported_heartbeat.hpp" // emit_guardian_unsupported_heartbeat_tags (F7)
 #include "spark_heartbeat.hpp" // emit_spark_heartbeat_tags — spark fleet telemetry
 #include "spark_mechanism.hpp" // make_{file,registry,service}_mechanism factories
@@ -507,7 +511,12 @@ int dispatch_with_capture(const YuzuPluginDescriptor* descriptor, const char* ac
 // this TU's private type.
 StandalonePluginContext::StandalonePluginContext(std::string plugin_name,
                                                  std::unordered_map<std::string, std::string> config)
-    : impl_(new PluginContextImpl{std::move(config), nullptr, nullptr, std::move(plugin_name)},
+    : StandalonePluginContext(std::move(plugin_name), std::move(config), nullptr) {}
+
+StandalonePluginContext::StandalonePluginContext(std::string plugin_name,
+                                                 std::unordered_map<std::string, std::string> config,
+                                                 KvStore* kv)
+    : impl_(new PluginContextImpl{std::move(config), kv, nullptr, std::move(plugin_name)},
             [](void* p) { delete static_cast<PluginContextImpl*>(p); }) {}
 
 YuzuPluginContext* StandalonePluginContext::get() const noexcept {
@@ -997,6 +1006,7 @@ public:
                     record_module(descriptor->name, descriptor->version,
                                   std::format("{} (init rc={})", descriptor->description, rc),
                                   "init_failed");
+                    plugins_failed_.emplace_back(descriptor->name); // #1567: yuzu.plugins_failed
                     continue;
                 }
             }
@@ -1707,7 +1717,9 @@ public:
                 // than left to justify a bound nobody measured.
                 // (governance: cpp-safety BLOCKING, unhappy-path UP-C11/C12, enterprise C1.)
                 ctx.set_deadline(std::chrono::system_clock::now() + kRegisterTimeout);
-                CtxSlot register_slot{ctx_mu_, register_ctx_, &ctx};
+                CtxSlot register_slot{ctx_mu_, register_ctx_, &ctx, [this] {
+                                          return stop_requested_.load(std::memory_order_acquire);
+                                      }};
 
                 // PUBLISH, THEN RE-CHECK. The loop tested stop_requested_ above, but a stop()
                 // landing in the window between that test and the publish above finds
@@ -1716,7 +1728,9 @@ public:
                 // SIGKILLs us mid-teardown. The window is a few instructions wide; the fix is one
                 // line, and it closes it structurally rather than by argument.
                 // (governance: security-guardian, cpp-safety — independently, this PR.)
-                if (stop_requested_.load(std::memory_order_acquire))
+                // The re-check is CtxSlot's predicate ctor (unit-tested, #2182): it evaluates
+                // stop_requested_ under ctx_mu_ right after publishing.
+                if (register_slot.stop_seen())
                     break;
                 pb::RegisterRequest req;
                 auto* info = req.mutable_info();
@@ -2023,7 +2037,9 @@ public:
                 // context whose stream is already gone. That is safe — gRPC's ClientContext
                 // owns the underlying call ref, so TryCancel after the stream dies is a no-op,
                 // not a UAF — and `sub_ctx` outlives every moment it is published.
-                CtxSlot sub_slot{ctx_mu_, subscribe_ctx_, &sub_ctx};
+                CtxSlot sub_slot{ctx_mu_, subscribe_ctx_, &sub_ctx, [this] {
+                                     return stop_requested_.load(std::memory_order_acquire);
+                                 }};
                 // PUBLISH-THEN-RE-CHECK, the register_slot pattern's SIBLING SITE. A stop()
                 // that ran to completion in the window between Register success and this
                 // publish — a WIDE window: CSR/TLS handling, Updater construction,
@@ -2039,7 +2055,7 @@ public:
                 // stream's own lifecycle as backstop. The original hand-split applied the
                 // re-check to register_slot only and orphaned this sibling.
                 // (governance gate round: cpp-safety BLOCKING, this branch.)
-                if (stop_requested_.load(std::memory_order_acquire))
+                if (sub_slot.stop_seen())
                     break;
 
                 std::shared_ptr<SubscribeStream> stream{stub->Subscribe(&sub_ctx)};
@@ -2069,8 +2085,15 @@ public:
                         std::lock_guard lock(stream_write_mu_);
                         guardian_sink_stream_ = stream;
                     }
+                    // #4783: this lambda now runs on GuardianLegacySinkExecutor's own detached
+                    // worker, never on a guard's own thread — `this` stays valid across that
+                    // because the executor's orphan-exit contract (active_io_workers()'s
+                    // fourth term, guardian_engine.cpp) is what keeps main.cpp/service_win.cpp
+                    // from tearing this AgentImpl down while a send is still detached and
+                    // running, exactly like send_guardian_outbox_entry's own capture below.
                     guardian_->set_event_sink([this](const gpb::GuaranteedStateEvent& ev) {
-                        const bool sent = emit_guardian_event(ev);
+                        const auto outcome = emit_guardian_event(ev);
+                        const bool sent = (outcome == LegacySendOutcome::Sent);
                         // #4606 criterion-10 T_wire (legacy non-Spark drift-sink path only — the
                         // DEX observer's call to this same method stays uninstrumented, see
                         // emit_guardian_event's own comment).
@@ -2084,6 +2107,7 @@ public:
                             spdlog::info("{}", format_send_timing_line(r));
                         } catch (...) { // best-effort diagnostic; never propagate
                         }
+                        return outcome;
                     });
                     // Replay the durable lifecycle journal into the send window now that the
                     // sink is live on the new stream (item 7 PR-Ag). The drain worker sends the
@@ -2098,30 +2122,20 @@ public:
                     // every iteration: run() may publish a new Updater on the next reconnect,
                     // and this thread would then be using a different object mid-flight (and,
                     // with a unique_ptr, a freed one).
-                    update_thread_ = std::thread([this, raw_stub,
-                                                  updater = updater()]() {
-                        spdlog::info("OTA update checker started (interval={}s)",
-                                     cfg_.update_check_interval.count());
-                        while (!stop_requested_.load(std::memory_order_acquire)) {
-                            auto result = updater->check_and_apply(raw_stub);
-                            if (result.has_value() && result.value()) {
-                                spdlog::info("OTA update applied - agent will restart");
-                                stop();
-                                return;
-                            }
-                            if (!result.has_value()) {
-                                spdlog::warn("OTA update check failed: {}", result.error().message);
-                            }
-                            // Sleep in small increments so we can respond to stop quickly
-                            auto remaining = cfg_.update_check_interval;
-                            while (remaining.count() > 0 &&
-                                   !stop_requested_.load(std::memory_order_acquire)) {
-                                auto sleep_time = std::min(remaining, std::chrono::seconds{5});
-                                std::this_thread::sleep_for(sleep_time);
-                                remaining -= sleep_time;
-                            }
-                        }
-                    });
+                    // Waits on the UPDATER's stop state, not AgentImpl::stop_requested_:
+                    // the reconnect teardown calls only Updater::stop() (#2182).
+                    update_thread_.start(
+                        updater(), raw_stub, cfg_.update_check_interval,
+                        [this]() {
+                            spdlog::info("OTA update checker started (interval={}s)",
+                                         yuzu::agent::Updater::effective_check_interval(
+                                             cfg_.update_check_interval)
+                                             .count());
+                        },
+                        [this]() {
+                            spdlog::info("OTA update applied - agent will restart");
+                            stop();
+                        });
                 }
 
                 // 4b-sync. Spawn the daily-sync thread (ADR-0016). Per-connection,
@@ -2217,7 +2231,20 @@ public:
                             // lock at all, so a teardown cancel could TryCancel this frame's
                             // `ctx` after it had been destroyed. Retracted under ctx_mu_ by the
                             // dtor, on the early `return std::nullopt` below too.
-                            CtxSlot sync_slot{ctx_mu_, sync_ctx_, &ctx};
+                            // Teardown sets stop_requested_ / sync_stop_ BEFORE cancel_ctx(sync_ctx_),
+                            // so the predicate (evaluated under ctx_mu_ after publishing) either
+                            // sees the flag or the canceller saw the published slot. Without it a
+                            // stop between the sync thread's should_stop() poll and this publish
+                            // ran an un-cancelled RPC, bounded only by the 30s deadline. The
+                            // predicate captures `this` only (not the thread's should_stop), as the
+                            // sender may outlive that frame via the scheduler.
+                            CtxSlot sync_slot{ctx_mu_, sync_ctx_, &ctx, [this] {
+                                                  return stop_requested_.load(
+                                                             std::memory_order_acquire) ||
+                                                         sync_stop_.load(std::memory_order_acquire);
+                                              }};
+                            if (sync_slot.stop_seen())
+                                return std::nullopt;
                             pb::InventoryAck ack;
                             auto status = sync_stub->ReportInventory(&ctx, report, &ack);
                             if (!status.ok()) {
@@ -2374,7 +2401,17 @@ public:
                             grpc::ClientContext ctx;
                             // Per-iteration: the dtor retracts it under ctx_mu_ at the end of
                             // this loop body, before `ctx` is destroyed.
-                            CtxSlot hb_slot{ctx_mu_, heartbeat_ctx_, &ctx};
+                            CtxSlot hb_slot{ctx_mu_, heartbeat_ctx_, &ctx,
+                                            [&should_stop] { return should_stop(); }};
+                            // Re-check after publishing. cancel_ctx() takes the same ctx_mu_ the
+                            // CtxSlot ctor publishes under, and teardown sets heartbeat_stop_ /
+                            // stop_requested_ BEFORE calling it, so either cancel_ctx() saw the
+                            // published slot and cancelled, or this re-check sees the flag. Without
+                            // it a teardown landing between the check above and the publish cancels
+                            // nothing, and the deadline-less Heartbeat RPC (#3989) wedges the join.
+                            // The break leaves the loop; ~CtxSlot retracts the slot (ctx dies after).
+                            if (hb_slot.stop_seen())
+                                break;
                             pb::HeartbeatRequest req;
                             req.set_session_id(session_id_);
                             auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -2390,6 +2427,27 @@ public:
                             tags["yuzu.commands_executed"] = std::to_string(static_cast<int64_t>(
                                 metrics_.counter("yuzu_agent_commands_executed_total").value()));
                             tags["yuzu.plugins_loaded"] = std::to_string(plugins_.size());
+                            // #1567: plugins that failed init (vs merely not installed),
+                            // and each plugin's bounded `heartbeat.*` KV facts. Own
+                            // try/catch: the heartbeat loop has no enclosing one, and a
+                            // KV throw must never kill the heartbeat thread.
+                            try {
+                                yuzu::agent::emit_plugins_failed_tag(tags, plugins_failed_);
+                                if (kv_store_) {
+                                    yuzu::agent::emit_plugin_heartbeat_tags(
+                                        tags, plugin_names_,
+                                        [this](std::string_view p, std::string_view prefix) {
+                                            return kv_store_->list(p, prefix);
+                                        },
+                                        [this](std::string_view p, std::string_view k) {
+                                            return kv_store_->get(p, k);
+                                        });
+                                }
+                            } catch (const std::exception& e) {
+                                spdlog::warn("Heartbeat plugin-tag bridge failed: {}", e.what());
+                            } catch (...) {
+                                spdlog::warn("Heartbeat plugin-tag bridge failed");
+                            }
                             // HA WS-0 dedup safety-net signals, emitted every
                             // heartbeat (the agent has no /metrics; the server-side
                             // yuzu_fleet_* derivation + alert land with WS-11).
@@ -2462,6 +2520,15 @@ public:
                                 // an acknowledgment this tick produces is visible on THIS
                                 // heartbeat rather than one late.
                                 guardian_->journal_maintenance_tick();
+                                // #4783 commit 4: legacy-sink loss visibility. Deliberately
+                                // NOT inside journal_maintenance_tick()'s prefer_spark_ gate
+                                // (nor any other prefer_spark_ conditional in this block) -
+                                // the legacy IGuard sink is the LIVE production path
+                                // regardless of the Spark flip state, so a stranded worker
+                                // or an open integrity gap must be observed and repaired on
+                                // every heartbeat, not only when Spark is preferred. See
+                                // GuardianEngine::legacy_sink_kick()'s own doc comment.
+                                guardian_->legacy_sink_kick();
                                 tags["yuzu.guardian_generation"] =
                                     std::to_string(guardian_->policy_generation());
                                 // Sparse durable-journal telemetry (item 7 PR-Ag §8): only
@@ -2512,7 +2579,20 @@ public:
                                         .unhealthy_refreshed = guardian_->unhealthy_refreshed(),
                                         .priority_demoted = guardian_->priority_demoted(),
                                         .outbox_backpressure_drops =
-                                            guardian_->outbox_backpressure_drops()});
+                                            guardian_->outbox_backpressure_drops(),
+                                        // #4783 commit 4: never gated on prefer_spark_ -
+                                        // legacy_sink_executor_ is always live, so these
+                                        // three report truthfully whichever backend is
+                                        // actually enforcing. legacy_sink_dropped_unwired
+                                        // (governance follow-up) is the third: the
+                                        // pre-network-arm drop, previously counted
+                                        // in-process only with no fleet visibility.
+                                        .legacy_sink_events_lost =
+                                            guardian_->legacy_sink_events_lost(),
+                                        .legacy_sink_gap_rules =
+                                            guardian_->legacy_sink_gap_rules(),
+                                        .legacy_sink_dropped_unwired =
+                                            guardian_->legacy_sink_dropped_unwired()});
                                 // F7 (#2298 rung 2): per-type CURRENT count of rules classified
                                 // Unsupported (neither backend enforces them) - fleet-loud via
                                 // mech_unsupported_total, sparse (0 omits its tag).
@@ -3267,11 +3347,14 @@ public:
 
                 // Detach the Guardian event-sink from this (now broken) stream BEFORE
                 // it is torn down (H4 / #1209). Taking stream_write_mu_ waits for any
-                // in-flight sink Write to finish, then nulls the holder so a guard
-                // worker firing during teardown drops the event instead of writing to
-                // a cancelled stream. Guards keep running across the reconnect; the
-                // next iteration republishes the new stream and the heartbeat reconcile
-                // (M5) catches up any generation missed while the link was down.
+                // in-flight sink Write to finish, then nulls the holder so a send firing
+                // during teardown drops the event instead of writing to a cancelled
+                // stream. #4783: that send no longer runs on a guard's own thread - it
+                // is legacy_sink_executor_'s own detached worker (or the DEX observer's
+                // still-synchronous OS-callback thread) that can be mid-Write here, never
+                // a guard. Guards keep running across the reconnect; the next iteration
+                // republishes the new stream and the heartbeat reconcile (M5) catches up
+                // any generation missed while the link was down.
                 {
                     std::lock_guard lock(stream_write_mu_);
                     guardian_sink_stream_.reset();
@@ -3283,12 +3366,9 @@ public:
                 thread_pool_.reset();
 
                 // Stop and join the OTA update thread
-                if (auto u = updater()) {
-                    u->stop(); // local copy keeps it alive even if run() swaps the slot
-                }
-                if (update_thread_.joinable()) {
-                    update_thread_.join();
-                }
+                // stop() THEN join, in one tested place (#2182); the local copy keeps the
+                // Updater alive even if run() swaps the slot.
+                update_thread_.stop_and_join(updater());
 
                 // Signal heartbeat thread to exit and cancel any in-flight RPC.
                 // cancel_ctx() holds ctx_mu_ across the load+TryCancel, so the heartbeat
@@ -3488,16 +3568,31 @@ public:
         stop_requested_.store(true, std::memory_order_release);
         yuzu::agent::request_subprocess_cancel(true);
         heartbeat_stop_.store(true, std::memory_order_release);
-        // Cancel the Subscribe stream FIRST. The Guardian drift workers and the DEX
-        // observer both emit through emit_guardian_event(), whose synchronous gRPC
-        // Write() BLOCKS on a stalled-but-not-dead stream (gateway up, not draining).
-        // guardian_->stop() / dex_observer_->stop() below DRAIN those emitters with an
-        // unbounded wait, so cancelling only after the drain lets an in-flight signal
-        // Write during shutdown wedge stop() forever (cpp-safety BLOCKING). TryCancel
-        // aborts the blocked Write; it does NOT tear the stream down — the stream holder
-        // and stream_write_mu_ are members destroyed AFTER guardian_/dex_observer_, so
-        // they stay live through both drains and emit_guardian_event's null-check under
-        // the lock remains UAF-safe.
+        // Cancel the Subscribe stream FIRST — best-effort, not a guaranteed completion
+        // time (#4783). Until #4783, the Guardian drift workers AND the DEX observer
+        // both emitted through emit_guardian_event()'s synchronous gRPC Write() on
+        // their OWN thread, so an in-flight Write during a stalled-but-not-dead
+        // stream (gateway up, not draining) could wedge guardian_->stop()'s /
+        // dex_observer_->stop()'s unbounded drain forever unless cancelled first
+        // (cpp-safety BLOCKING). #4783 routes the Guardian drift-sink path through
+        // GuardianLegacySinkExecutor's detached worker instead, so guardian_->stop()
+        // below now joins the guard threads promptly — they never enter Write()
+        // themselves, they only enqueue — and only stops the executor from admitting
+        // NEW sends; it does not join whatever send is already in flight. Cancelling
+        // the stream FIRST is still load-bearing for two reasons: (1) the DEX
+        // observer still emits SYNCHRONOUSLY on its own OS-callback thread, and
+        // dex_observer_->stop() below still drains that with an unbounded wait, so
+        // cancelling only afterward would reopen the exact same wedge for DEX signals
+        // alone; and (2) it is a best-effort means of unblocking a legacy-sink send
+        // that is already mid-stall on the executor's detached worker, giving
+        // active_io_workers() a better chance of reaching 0 before OrphanExitGuard's
+        // grace expires — NOT a guaranteed bound: if the cancelled Write does not
+        // return promptly, the worker stays counted and OrphanExitGuard hard_exit()s
+        // after kOrphanDrainGrace instead of wedging. Either way, TryCancel does NOT
+        // tear the stream down — the stream holder and stream_write_mu_ are members
+        // destroyed AFTER guardian_/dex_observer_, so they stay live through both
+        // drains and emit_guardian_event's null-check under the lock remains
+        // UAF-safe.
         // Cancel under ctx_mu_ — see the member's note. The context is a STACK object owned
         // by run()'s reconnect frame, and this runs on the watcher / SCM thread.
         cancel_ctx(subscribe_ctx_);
@@ -3563,14 +3658,17 @@ private:
     // it through the current Subscribe stream. Shared by the GuardianEngine drift
     // sink and the (ruleless) DEX signal observer. Drops the event if the link is
     // down between reconnects (guardian_sink_stream_ null) — durable buffering is A3.
-    // Returns Write()'s outcome so a caller can log it (#4606 criterion-10 T_wire) —
-    // deliberately instrumented ONLY at the drift-sink call site (set_event_sink's
-    // lambda), never here and never at the DEX observer's call site: DEX signal
-    // telemetry is a different kind of traffic than the Guardian-violation latency
-    // this benchmark measures, and instrumenting it here would flood the log at DEX
-    // observation volume. A new caller of this method should make the same choice
-    // deliberately rather than copy whichever pattern it happens to see first.
-    bool emit_guardian_event(const gpb::GuaranteedStateEvent& ev) {
+    // Returns the delivery outcome (LegacySendOutcome, #4783: LinkDown when the
+    // stream is null, WriteFailed when Write() itself returns false, Sent otherwise)
+    // so a caller can distinguish those two failure shapes and log it (#4606
+    // criterion-10 T_wire) — deliberately instrumented ONLY at the drift-sink call
+    // site (set_event_sink's lambda), never here and never at the DEX observer's
+    // call site: DEX signal telemetry is a different kind of traffic than the
+    // Guardian-violation latency this benchmark measures, and instrumenting it here
+    // would flood the log at DEX observation volume. A new caller of this method
+    // should make the same choice deliberately rather than copy whichever pattern it
+    // happens to see first.
+    LegacySendOutcome emit_guardian_event(const gpb::GuaranteedStateEvent& ev) {
         pb::CommandResponse resp;
         resp.set_plugin("__guard__");
         resp.set_action("event");
@@ -3578,8 +3676,9 @@ private:
         resp.set_payload(ev.SerializeAsString());
         std::lock_guard lock(stream_write_mu_);
         if (!guardian_sink_stream_)
-            return false;
-        return guardian_sink_stream_->Write(resp, grpc::WriteOptions());
+            return LegacySendOutcome::LinkDown;
+        return guardian_sink_stream_->Write(resp, grpc::WriteOptions()) ? LegacySendOutcome::Sent
+                                                                        : LegacySendOutcome::WriteFailed;
     }
 
     // The send callback the Guardian spark outbox drain worker uses (rung 7.7a). It
@@ -4008,8 +4107,7 @@ private:
         cancel_ctx(sync_ctx_); // unblock an in-flight ReportInventory before joining
         if (sync_thread_.joinable())
             sync_thread_.join();
-        if (update_thread_.joinable())
-            update_thread_.join();
+        update_thread_.join();
     }
 
     Config cfg_;
@@ -4143,44 +4241,30 @@ private:
     /// heartbeat thread's own ~CtxSlot needs ctx_mu_ to exit. Hold the lock for the slot's
     /// lifetime (e.g. "optimise" these lock_guards into a unique_lock member) and run() would
     /// deadlock against the very thread it is joining, on every reconnect. Do not.
-    class CtxSlot {
-    public:
-        CtxSlot(std::mutex& mu, std::atomic<grpc::ClientContext*>& slot,
-                grpc::ClientContext* ctx) noexcept
-            : mu_{mu}, slot_{slot} {
-            std::lock_guard lk(mu_);
-            slot_.store(ctx, std::memory_order_release);
-        }
-        ~CtxSlot() {
-            std::lock_guard lk(mu_);
-            slot_.store(nullptr, std::memory_order_release);
-        }
-        CtxSlot(const CtxSlot&) = delete;
-        CtxSlot& operator=(const CtxSlot&) = delete;
-
-    private:
-        std::mutex& mu_;
-        std::atomic<grpc::ClientContext*>& slot_;
-    };
+    using CtxSlot = ::yuzu::agent::CtxSlot;
 
     /// The ONLY way to cancel one of the three contexts. Loads AND TryCancel()s under ctx_mu_
     /// so the owning frame's ~CtxSlot cannot retire the context in between. Safe on a slot
     /// that is already null (the common case — the RPC has finished).
     void cancel_ctx(std::atomic<grpc::ClientContext*>& slot) noexcept {
-        std::lock_guard lk(ctx_mu_);
-        if (auto* c = slot.load(std::memory_order_acquire))
-            c->TryCancel();
+        cancel_ctx_slot(ctx_mu_, slot);
     }
     std::vector<PluginHandle> plugins_;
     std::vector<std::string> plugin_names_;
+    std::vector<std::string> plugins_failed_; // plugins whose init() failed (#1567)
     std::mutex stream_write_mu_;
     // Current Subscribe stream the Guardian event-sink writes through (H4 / #1209).
-    // Guarded by stream_write_mu_. Guard worker threads outlive any single stream
-    // and fire asynchronously, so the sink must NOT capture a specific stream: it
+    // Guarded by stream_write_mu_. The sink must NOT capture a specific stream: it
     // reads this holder under the lock and drops the event if it is null (link down
     // between reconnects). Set on stream open, reset on read-loop exit BEFORE the
-    // stream is torn down, so a guard firing mid-teardown can never write to a
-    // cancelled stream.
+    // stream is torn down, so a writer firing mid-teardown can never write to a
+    // cancelled stream. #4783: legacy guard worker threads no longer touch this at
+    // all — they only enqueue onto GuardianEngine's legacy_sink_executor_, which
+    // never captures a specific stream either. The things that CAN still write here
+    // after this AgentImpl instance has moved on to a new stream (or is tearing
+    // down) are (1) legacy_sink_executor_'s own detached worker — orphan-accounted
+    // via active_io_workers()/hard_exit.hpp, same contract as (2) the DEX observer's
+    // OS-callback threads, still synchronous and drained by dex_observer_->stop().
     std::shared_ptr<SubscribeStream> guardian_sink_stream_;
     // Fleet-wide DEX signal observer (multi-signal). Declared AFTER stream_write_mu_
     // + guardian_sink_stream_ (same reasoning as guardian_): its OS-callbacks emit
@@ -4327,7 +4411,7 @@ private:
             updater_ = std::move(u);
         }
     }
-    std::thread update_thread_;
+    OtaUpdateThread update_thread_;
     std::thread heartbeat_thread_;
     std::thread sync_thread_; // ADR-0016 daily-sync thread (per-connection)
 

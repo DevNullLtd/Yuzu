@@ -8,11 +8,13 @@ The gateway (`gateway/`) is a standalone rebar3 project. It compiles independent
 ```bash
 cd gateway
 rebar3 compile                               # compile
-rebar3 eunit --dir apps/yuzu_gw/test         # unit tests (324 on Linux / 300 on Windows as of #4800)
+rebar3 eunit --dir apps/yuzu_gw/test         # unit tests (403 tests as of the heartbeat connection-binding change)
 rebar3 dialyzer                              # type analysis — must be warning-free
 rebar3 ct --dir apps/yuzu_gw/test/ct --suite <name>  # Common Test (ct does not recurse: --dir apps/yuzu_gw/test finds no suites)
 bash scripts/check-proto-codegen.sh          # F-3 (#1243): committed *_pb.erl in sync with priv/proto
 ```
+
+**TLS test legs and `YUZU_REQUIRE_TLS_TESTS`.** The one-way-TLS and mutual-TLS legs of `yuzu_gw_heartbeat_conn_rpc_tests` mint throwaway certificates with the `openssl` CLI under `$TMPDIR`. The certificate tests in `yuzu_gw_authz_tests` and `yuzu_gw_authz_rpc_tests` mint theirs under `/tmp`. `yuzu_gw_mtls_tests` keeps its own setup (also under `/tmp`) and ignores `YUZU_REQUIRE_TLS_TESTS`: without `openssl` it substitutes placeholder tests that always pass, named `mTLS handshake skipped: <reason>` and `one-way handshake skipped (openssl unavailable)`. By default an unavailable or failing `openssl` makes the legs of the other three modules (`yuzu_gw_heartbeat_conn_rpc_tests`, `yuzu_gw_authz_tests`, `yuzu_gw_authz_rpc_tests`) contribute no tests and print `SKIPPED <module>: openssl certificates unavailable: ...` on the console, so a run without `openssl` can still report all tests passed. Set `YUZU_REQUIRE_TLS_TESTS=1` in the environment to turn that skip into a failing test in those three modules (`yuzu_gw_authz_tests:certs_unavailable/2` implements the switch). Use it on any machine that is expected to have `openssl`. It is optional and unset by default; the `linux` job of `ci.yml` sets it, and no other workflow or job does.
 
 **Proto codegen drift (`check-proto-codegen.sh`).** The gateway carries its own gpb-generated `apps/yuzu_gw/src/*_pb.erl` (separate from the server's protoc output). gpb modules are self-contained: change a `.proto` field but forget to regenerate and the gateway silently drops that field in transit (the PR5 enrollment-CSR field-drop bug). The guard regenerates with rebar.config's own pinned `gpb_opts` (read via `file:consult`, so it cannot drift from the build) into a temp dir and byte-diffs against the committed modules. It runs after `rebar3 compile` (needs `_build/gpb`) and is wired into the release workflow's gateway job. gpb is version-pinned (4.21.7) + `target_erlang_version` fixed, so the output is deterministic. To fix a drift failure: regenerate the modules and commit them.
 
@@ -35,6 +37,35 @@ command -v erl >/dev/null || { echo "Erlang missing"; exit 1; }
 OTP 28 is the only supported toolchain for the gateway test gates: `scripts/test_gateway.py` no longer carries the old OTP-25 CT teardown-race override (removed in #4800 because it could pass a run with an auto-skipped suite), so an OTP 25 run that hits that race now fails closed. The helper probes kerl → asdf → Homebrew (macOS) → MSYS2 installer (Windows) and **always returns 0** so it can't trip the caller's `set -e`. Callers MUST verify `command -v erl` themselves. Default version tracks `release.yml`'s `erlef/setup-beam` `otp-version` — bump both together. Native `cmd.exe`/PowerShell is out of scope; documented Windows build path is MSYS2 bash.
 
 ## Standing Erlang pitfalls
+
+**Windows IDE builds: invalid handle / no Erlang output.** An IDE-launched
+Ninja (CLion) can hand its children stdio handles the Erlang VM cannot use. The
+VM then dies on its first write (`Writer crashed ('The handle is invalid.')`,
+exit 127; console-mode errors such as `SetConsoleModeInitIn` have also been
+reported) before printing anything, so the IDE shows a failed step with no
+Erlang output. On Windows both gateway wrappers therefore never give the child
+an inherited stdio handle: its stdout+stderr go to a pipe the wrapper owns (the
+part that actually fixes this), and its stdin is null on a private hidden
+console (`CREATE_NO_WINDOW`) — those two shared through
+`scripts/erlang_toolchain.py`'s `windows_stdio_isolation()`.
+`build_gateway.py` relays the pipe to its own stdout and tees it to
+`<build dir>/meson-logs/yuzu_gateway_build.log`, which `ci.yml`'s Windows leg
+uploads with the rest of `meson-logs/` on failure. (If that file is held open
+by something that blocks deleting it, the run logs to a fresh
+`yuzu_gateway_build.<random>.log` beside it instead; the failure message
+always names the file actually written.) On a nonzero exit or a timeout
+(`YUZU_GATEWAY_BUILD_TIMEOUT`, default 900 s) it names the command, the exit
+code and that log. **If a CLion gateway build fails with no Erlang output, read
+that log first.**
+
+Two consequences to know. Because the child's console is invisible, git
+credential prompts are disabled (`GIT_TERMINAL_PROMPT=0`,
+`GCM_INTERACTIVE=never`): a cold `_build` fetching a git dependency behind an
+authenticating proxy or with missing credentials fails fast with git's error
+instead of prompting — set up credentials or proxy config beforehand. And do
+**not** add `-noinput` to `ERL_FLAGS` for these wrappers: `ERL_FLAGS` reaches
+every VM rebar3 starts, and `-noinput` breaks the `standard_io` `peer` nodes
+the multinode eunit suite uses.
 
 | Area | Issue |
 |---|---|

@@ -71,7 +71,7 @@ These commercial-peer features have functional equivalents in Yuzu that are as g
 | Rerun/cancel | ExecutionTracker rerun + cancel with user attribution |
 | Scope expressions | ScopeEngine (10 operators, AND/OR/NOT, regex) |
 | Target estimation | `/api/scope/estimate` preview |
-| Response persistence | ResponseStore (SQLite, TTL cleanup) |
+| Response persistence | ResponseStore (PostgreSQL, TTL cleanup) |
 | Response aggregation | COUNT/SUM/AVG/MIN/MAX with GROUP BY |
 | Response export | CSV/JSON export endpoints |
 | RBAC | 6 roles, 14 securable types, deny-override |

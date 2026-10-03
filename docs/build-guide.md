@@ -12,7 +12,9 @@ comment carries the same usage block).
 Meson is the sole build system. **Every time you add, remove, or rename a source file, update `meson.build` in the affected directory** and verify the build compiles.
 
 ### Prerequisites
-- Meson 1.11.1, Ninja
+- Meson 1.12.0 (the pin in `requirements-ci.txt`, used by the Linux CI legs; the Windows runner
+  contract `deploy/windows/toolchain-contract.json` pins 1.11.1; the build's hard floor is
+  `meson_version: '>=1.3.0'`), Ninja
 - CMake (required by Meson's cmake dependency method — not used as a build system)
 - C++23 compiler: GCC 13+, Clang 18+, MSVC 19.38+, or Apple Clang 15+
 - vcpkg (set `VCPKG_ROOT`)

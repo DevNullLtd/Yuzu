@@ -1,0 +1,15 @@
+captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-23 · euid 0 · leg-hash e678758a486f
+== action=posture
+posture|linux|kernel.randomize_va_space|2|enabled
+posture|linux|kernel.kptr_restrict|0|disabled
+posture|linux|kernel.yama.ptrace_scope|-|absent
+posture|linux|kernel.dmesg_restrict|1|enabled
+posture|linux|kernel.unprivileged_bpf_disabled|0|disabled
+posture|linux|kernel.sysrq|1|disabled
+posture|linux|fs.protected_hardlinks|1|enabled
+posture|linux|fs.protected_symlinks|1|enabled
+posture|linux|fs.protected_fifos|0|disabled
+posture|linux|fs.protected_regular|0|disabled
+posture|linux|fs.suid_dumpable|0|enabled
+[result_status] OK / FULL / 
+

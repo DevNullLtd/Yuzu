@@ -107,26 +107,42 @@ Run each component under its own system user:
 
 ## Gateway TLS (if you deploy the Erlang gateway)
 
-> **⚠ The gateway agent listener (`:50051`) is plaintext in the *shipped* composes.**
+> **⚠ The gateway agent listener (`:50051`) is plaintext in every shipped compose except the reference gateway compose.**
 > The gateway is the command fan-out plane — a plaintext, untrusted-network-reachable
 > agent listener lets an on-path attacker inject commands (fleet RCE).
 > **One-way (server-authenticated) TLS now exists for it (PKI PR5c)** — enable it on
 > the agent listener (`transport_opts` with `verify => verify_none`,
 > `fail_if_no_peer_cert => false`; see `gateway/config/sys.config.prod`) and ship the
-> CA to your agents. It is not on by default in the deployed composes until PR5b.
+> CA to your agents. `docker-compose.reference-gateway.yml` ships it (#1314); the
+> cluster compose boots the image default `sys.config` and the demo and UAT composes use their own UAT/demo `sys.config`; all of those listen in plaintext.
 
 If you deploy the gateway, you **must** protect the agent edge — either enable the
 PR5c one-way TLS above (and distribute the CA), **or** at the network layer:
-- **Terminate TLS in front** of the gateway (reverse proxy / L7 LB doing TLS on
-  `:50051`, forwarding only over loopback or a trusted segment), **or**
-- keep `:50051` on a **trusted network** (VPN / private subnet / service mesh) — never
+- **Front the gateway at L4 or with TLS passthrough only** (a plain TCP load balancer,
+  an L4 virtual IP or a TLS-passthrough proxy that keeps one TCP connection per agent
+  end to end), with the gateway agent listener itself running the one-way TLS above.
+  A reverse proxy or L7 load balancer that terminates TLS or HTTP/2 in front of
+  `:50051` is no longer a supported way to protect this edge: the gateway binds each
+  agent's heartbeats to the connection that opened its session, and such a proxy can
+  spread one agent's calls over several connections (see
+  [Heartbeat admission](gateway.md#heartbeat-admission)), **or**
+- keep `:50051` on a **trusted network** (VPN / private subnet / a mesh policy that does not
+  terminate HTTP/2; see [Heartbeat admission](gateway.md#heartbeat-admission)), never
   directly internet-exposed.
 
 The gateway→server **upstream** hop supports mutual TLS (`gateway/config/sys.config.prod`
 `{https,...}`), and the gateway **fails closed** if that channel is configured `https`
-without `verify_peer`. Direct agent→server connections (no gateway) are already full
-mTLS over any network. Full detail + the deployment runbook: `docs/user-manual/gateway.md`
+without `verify_peer`. Direct agent→server connections (no gateway) use TLS. Full detail + the deployment runbook: `docs/user-manual/gateway.md`
 "TLS posture" and `docs/pki-architecture.md` "Gateway TLS".
+
+The agent listener authenticates the gateway to agents, not agents to the gateway.
+The gateway admits an agent `Heartbeat` only on the connection that opened the
+session's `Subscribe` stream, and only for a session that gateway node holds
+(a rejected heartbeat is answered `NOT_FOUND`, counted, and not forwarded).
+`Subscribe` admission is unchanged, and the binding relies on one connection per
+agent between the agent and the gateway (see the supported topologies above). The
+same change removes the session id from two gateway log lines, which reduces the
+disclosure of session ids in logs; some log lines still include session ids.
 
 The gateway **management plane** (`:50063`) — the port the server's command
 forwarding dials — is the highest-value gateway surface: whoever it admits can
@@ -540,13 +556,13 @@ Two consequences worth planning for:
   `whitelist` still reach a contained device, so release stays possible. The exemption is keyed on
   the action, not the plugin, so a future fifth action would be gated until it is deliberately
   added.
-- **Three server-internal pushes are also exempt, and you should know they exist.** The TAR
+- **Four server-internal pushes are also exempt, and you should know they exist.** The TAR
   fleet-topology snapshot request (`tar.fleet_snapshot`), the Guardian rule push
-  (`__guard__.push_rules`) and the asset-tag sync (`asset_tags.sync`) continue to reach a
-  contained device. This is deliberate — gating the Guardian push would stop a quarantined device
+  (`__guard__.push_rules`), the asset-tag sync (`asset_tags.sync`) and the on-demand inventory
+  sync (`__sync__.now`) continue to reach a contained device. This is deliberate — gating the Guardian push would stop a quarantined device
   receiving the enforcement rules that make containment meaningful — but it means the containment
   boundary is not total, and a security review of the containment surface has to account for
-  those three channels. They are a closed set in code (`SystemReservedPush`) and are counted by
+  those four channels. They are a closed set in code (`SystemReservedPush`) and are counted by
   `yuzu_server_system_reserved_push_total{capability,result}`; a new one cannot be added without
   appearing in that set. **They are counted, not audited** — there is no per-event row saying a
   particular push reached a particular contained device, so this is a fleet-level signal rather
@@ -559,6 +575,7 @@ Two consequences worth planning for:
   |---|---|
   | `tar.fleet_snapshot` | Requests a read-only topology/process snapshot. No state change. |
   | `asset_tags.sync` | Writes device tags. No code execution. |
+  | `__sync__.now` | Requests an on-demand inventory sync — it arms the agent's existing sync scheduler and nothing else. No code execution beyond the plugin's existing daily-sync path. |
   | `__guard__.push_rules` | Delivers Guardian baseline rules, which the agent may *enforce*. Enforcement is **not arbitrary command execution**: the assertion vocabulary is a closed five-value set — file present/absent, file hash, registry value, service running, service stopped — and dangerous registry keys and service names are refused at the `dangerous_enforce_in_spec` chokepoint before a push is ever built. So an operator with Guardian deploy rights can still change *typed, bounded* state on a contained device while their `execute_instruction` is refused. That is deliberate — enforcing a security baseline on a compromised host is the point — but it is the one exempt channel that mutates the endpoint, so scope it accordingly. |
 - **If containment state becomes unreadable, dispatch fails closed** — the server refuses *every*
   target rather than guess who is contained. A short store outage is absorbed by a 60-second

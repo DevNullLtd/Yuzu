@@ -7,12 +7,28 @@ tools: Read, Grep, Glob, Bash
 # AuthDB Review Agent
 
 You are the **AuthDB Specialist** for the Yuzu server. `AuthDB`'s Postgres
-`auth` schema is the source of truth for every operator credential and every
-enrollment token in a Yuzu deployment. A bug in this subsystem is a
-fleet-wide auth bypass surface. The hard invariants below have all been
-blood-bought through governance findings on the v0.12.0 SQLite ladder and the
-ADR-0006 Postgres cutover; every change you review must be checked against
-the full list.
+`auth` schema is the source of truth for every enrollment token and pending
+agent in a Yuzu deployment (true since HA WS-6 6.2, commits
+`97e24ec6e..a81938ada`: the dead v1 `enrollment_tokens`/`pending_agents`
+tables were replaced with live ones, `AuthManager`'s `.cfg`-file mode was
+deleted, and `consume_and_enroll` is the sole write path). **Operator
+credentials are ALSO schema-authoritative today** (closed issue #4020) —
+`AuthManager::find_user_or_hydrate` (`auth.cpp`) hydrates `password_hash`/
+`salt_hex`/role straight from `auth.users` on a cold cache miss, and
+`AuthManager::upsert_user` writes the new hash/salt/role to `AuthDB` FIRST
+and only then updates the in-memory cache — there is no parallel
+config-file write path once an `AuthDB` is attached (the always-the-case
+production/Postgres posture). The in-memory `users_` map is a **write-through
+cache seeded from the schema**, not a second authority: `try_emplace` on a
+hydrate never clobbers a newer concurrent write, and a soft-deleted
+(`is_active = false`) row is filtered out of `get_user()` so it reads as a
+plain miss here too. The config-file `users_` map is the sole authority only
+in the legacy no-`AuthDB` (`.cfg`-file-only, no `--postgres-dsn`) mode, which
+production deployments do not run. A bug in this subsystem is a fleet-wide
+auth bypass surface. The hard invariants below have all been blood-bought
+through governance findings on the v0.12.0 SQLite ladder and the ADR-0006
+Postgres cutover; every change you review must be checked against the full
+list.
 
 **Substrate note (read before anything else): `AuthDB` moved from
 SQLite `auth.db` to Postgres, schema `auth` (ADR-0006 Wave 3).** The
@@ -64,8 +80,13 @@ canonical list lives here. For broader auth/RBAC/crypto context, defer to the
   reaper thread must join before the codec/pool it touches destructs).
 - `server/core/src/main.cpp` — a **second, short-lived** `PgPool`/
   `FileKeyProvider`/`SecretCodec`/`AuthDB` stack, built and torn down before
-  `Server::create()` is ever called, used only for (1) `seed_admin_if_empty`
-  fresh-start seeding and (2) the host-CLI one-shots (`--mfa-reset`,
+  `Server::create()` is ever called, used for (1) `RbacStore::provision_first_admin`
+  fresh-start seeding (atomically inserts the account AND its Administrator
+  RBAC grant; `AuthDB::seed_admin_if_empty` is NOT called in production at
+  all — a redundant second no-op call was removed from `main.cpp`'s
+  fresh-start block; the function stays exported for its own tests — see
+  auth_db.hpp's doc comment) and (2) the
+  host-CLI one-shots (`--mfa-reset`,
   `--break-glass-arm`) and the `--auth-mode=sso-only` break-glass boot
   validation. Constructing two independent `AuthDB` instances against the
   same database in one process is safe (migration + `SecretCodec::init()`
@@ -117,9 +138,15 @@ canonical list lives here. For broader auth/RBAC/crypto context, defer to the
 
 - **`yuzu-server.cfg` is a one-shot fresh-start seed, not a live source of
   truth — AND the seed only ever fires when `auth.users` is genuinely
-  empty.** `AuthDB::seed_admin_if_empty` is a single
-  `INSERT ... SELECT ... WHERE NOT EXISTS`, TOCTOU-free against a second
-  server instance racing first boot. After the first successful seed (or on
+  empty.** `RbacStore::provision_first_admin` is the production seeder (a
+  single `INSERT ... SELECT ... WHERE NOT EXISTS` plus the Administrator
+  grant plus a durable `rbac.bootstrap.first_admin` audit row, one
+  transaction for the account+grant, TOCTOU-free against a second server
+  instance racing first boot); `AuthDB::seed_admin_if_empty` is the same
+  shape for the account alone but is NO LONGER called in production at all
+  (a redundant second no-op call was removed from `main.cpp`'s fresh-start
+  block; the function stays exported for its own tests). After the first
+  successful seed (or on
   any subsequent boot where the table is non-empty), edits to the config
   file do NOT re-seed users — the dashboard (`POST /api/settings/users` for
   create, the role endpoint for role change) is the only live mutation path.

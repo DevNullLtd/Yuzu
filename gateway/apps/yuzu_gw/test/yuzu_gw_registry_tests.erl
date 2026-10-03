@@ -239,7 +239,7 @@ pending_take_concurrent_single_winner() ->
 
 pending_sweep_expired() ->
     %% Directly insert an expired entry into the ETS table.
-    ExpiredTime = erlang:system_time(millisecond) - 200000,  %% 200s ago (TTL is 120s)
+    ExpiredTime = erlang:monotonic_time(millisecond) - 200000,  %% 200s ago (TTL is 120s)
     ets:insert(yuzu_gw_pending, {<<"sweep-expired-1">>, #{agent_id => <<"x">>}, ExpiredTime}),
 
     %% Trigger sweep.
@@ -251,11 +251,11 @@ pending_sweep_expired() ->
 
 pending_sweep_preserves_fresh() ->
     %% Insert a fresh entry.
-    FreshTime = erlang:system_time(millisecond),
+    FreshTime = erlang:monotonic_time(millisecond),
     ets:insert(yuzu_gw_pending, {<<"sweep-fresh-1">>, #{agent_id => <<"y">>}, FreshTime}),
 
     %% Also insert an expired one.
-    ExpiredTime = erlang:system_time(millisecond) - 200000,
+    ExpiredTime = erlang:monotonic_time(millisecond) - 200000,
     ets:insert(yuzu_gw_pending, {<<"sweep-expired-2">>, #{agent_id => <<"z">>}, ExpiredTime}),
 
     %% Trigger sweep.

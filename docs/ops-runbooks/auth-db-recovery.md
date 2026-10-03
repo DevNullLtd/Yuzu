@@ -83,8 +83,9 @@ exhausted (`FATAL: sorry, too many clients already`).
 
 Yuzu restarts cleanly once Postgres is reachable — no Yuzu-side repair is
 needed, and **no auth data is lost by the outage itself**. Sessions are
-in-memory (see [Sessions](#sessions-are-in-memory-only)), so every operator
-must sign in again after the restart; that is expected, not damage.
+durable rows in Postgres (see [Sessions](#sessions-are-durable)), so an
+operator whose session did not reach its absolute lifetime or idle timeout
+during the outage does not need to sign in again after the restart.
 
 ### `auth` schema migration failure
 
@@ -221,20 +222,23 @@ Step 3 is the one people skip. It is the only cheap check that distinguishes
 "restored correctly" from "restored, and every MFA user will be locked out the
 moment they try to log in".
 
-## Sessions are in-memory only
+## Sessions are durable
 
-There is no sessions table. `AuthManager` holds sessions in memory
-(`sessions_`), so:
+Operator sessions are rows in the Postgres `session_store.sessions` table
+(`SessionStore`, HA WS-1/1a, ADR-2002 §4). `AuthManager`'s in-memory
+`sessions_` map is only a per-replica validate cache in front of those rows:
+on a cache miss the server re-reads the row and rebuilds the session from it.
+So:
 
-- **A server restart revokes every session, fleet-wide.** That is the fastest
-  emergency revocation there is, and it needs no database access.
-- Nothing about a session survives a crash, a restart, or a failover.
-- The old "verify persistence after Revoke sessions" procedure no longer
-  applies — there is nothing to verify and nothing that can resurrect a
-  revoked session.
+- **A server restart is NOT a revocation.** The restart empties the cache, and
+  the next request rebuilds each session from its row. The same holds for a
+  crash or a failover to another replica.
+- A row is removed only by an explicit revoke (sign-out, or the REST calls
+  below, which delete by token or by username) or by the reaper once the
+  session passes its absolute lifetime (8 hours). An idle-timed-out session
+  is refused on every replica, but its row stays until the reaper removes it.
 
-For targeted revocation while the server is running, use the REST surface
-rather than a restart:
+To revoke sessions, use the REST surface:
 
 ```bash
 # Revoke every session for one operator (admin).
@@ -246,8 +250,52 @@ curl -fsS -X DELETE https://yuzu.internal/api/v1/sessions/me \
      -H "Authorization: Bearer $TOKEN"
 ```
 
-API tokens are a separate credential class and are **not** revoked by either
-of those, nor by a restart — revoke them explicitly via the token endpoints.
+**Check that the revoke persisted.** Both calls delete the durable rows first,
+then clear this replica's cache. If the response body reports
+`db_persisted: false` (the audit row shows `result=partial` with
+`db_error=true`), only this replica's cache was cleared. The rows survive, and
+any replica that misses its cache, including this one after a restart, will
+rebuild those sessions from them. Retry the revoke once the database is
+healthy.
+
+API tokens are a separate credential class. The admin `?username=` call does
+**not** revoke them, and neither does a restart. `/sessions/me` ("Sign out
+everywhere") revokes the caller's API tokens as well as their sessions (check
+`api_tokens_db_persisted` in its response). Otherwise revoke tokens explicitly
+via the token endpoints.
+
+**Emergency fleet-wide revocation.** There is no single admin route that
+revokes every operator's sessions. The audited path is the admin
+`?username=` call above, once per operator. If that is not practical, delete
+the rows directly in Postgres. This is a direct database operation: it
+bypasses the server, **writes no audit row** (record it manually), and signs
+out every operator including you. Take a backup first (see
+[Backup — the KEK pairing rule](#backup--the-kek-pairing-rule)).
+
+```bash
+psql -v ON_ERROR_STOP=1 "$YUZU_POSTGRES_DSN" <<'SQL'
+BEGIN;
+DELETE FROM session_store.sessions;
+-- Bump the write-generation exactly as SessionStore does, so every
+-- replica drops its cached sessions on its next generation poll (~1s).
+INSERT INTO session_store.session_meta (key, value) VALUES ('write_generation', '1')
+ON CONFLICT (key) DO UPDATE SET value = (session_store.session_meta.value::bigint + 1)::text;
+COMMIT;
+SQL
+```
+
+The generation bump is required. A running replica serves a cached session
+without re-reading its row, and clears its cache only when it sees the
+write-generation advance. A bare `DELETE` therefore leaves every cached
+session valid on the replica that holds it, until some later session change
+advances the generation, the session expires, or that replica restarts.
+
+`ON_ERROR_STOP` makes `psql` exit non-zero if any statement fails, in which
+case the whole transaction has rolled back and nothing changed. Afterwards,
+confirm `SELECT count(*) FROM session_store.sessions;` returns 0 and that
+`write_generation` in `session_store.session_meta` went up. This revokes
+sessions only: API tokens stay valid and must be revoked through the token
+endpoints.
 
 ## Account lockout recovery
 
@@ -309,7 +357,6 @@ sudo -u _yuzu yuzu-server \
   --config /etc/yuzu/yuzu-server.cfg \
   --postgres-dsn "$YUZU_POSTGRES_DSN" \
   --ca-dir /etc/yuzu/certs \
-  --data-dir /var/lib/yuzu \
   --mfa-reset alice
 # {"status":"ok","user":"alice","action":"mfa.reset.breakglass"}
 ```
@@ -321,23 +368,11 @@ sudo -u _yuzu yuzu-server \
   anymore. Point `--postgres-dsn` at the real production database or the row
   lands somewhere nobody is looking (SOC 2 CC6.6), same risk as before, wrong
   flag.
-- `--data-dir` is still required, but for a narrower reason than it used to
-  be: it is where this one-shot looks for a **legacy** `audit.db` to migrate
-  from (`<data-dir>/audit.db`), not where it writes to. Pass the same
-  directory the running service uses so the one-shot sees the same legacy
-  file (or its absence) that a real boot would.
-- **One-shot lockout on a never-booted host.** This command refuses — it does
-  NOT silently skip the check — if the mandatory legacy backfill has not
-  completed on `--postgres-dsn` yet (no `backfill_complete` marker in
-  `audit_store.audit_retention_meta`). A one-shot is deliberately not trusted
-  to declare "no legacy trail exists" on its own (ADR-0040: only a server
-  boot may do that), so on a database that has never seen a successful server
-  boot, `--mfa-reset` and `--break-glass-arm` both fail with "refusing to
-  declare the backfill complete from this entry point... Start the server
-  once, then retry." That IS the remediation: start `yuzu-server` normally
-  once (it completes the backfill — real migration or fresh-install stamp —
-  on its own boot path, which this one-shot deliberately cannot do), stop it,
-  then re-run the one-shot command.
+- `--data-dir` is not needed. There is no legacy `audit.db` backfill gate any
+  more (retired by the ADR-0009 hard cutover, 2026-09-04), so the one-shot also
+  works on a database that has never seen a server boot. If a data directory
+  is set (`--data-dir` or `YUZU_DATA_DIR`), it is still created and checked
+  writable, and a failure there aborts the command.
 - `--ca-dir` is required whenever the KEK is not in the platform default
   location, because the command builds the full auth stack (pool → key
   provider → codec → AuthDB) exactly as the server does.
@@ -406,7 +441,6 @@ sudo -u _yuzu yuzu-server \
   --config /etc/yuzu/yuzu-server.cfg \
   --postgres-dsn "$YUZU_POSTGRES_DSN" \
   --ca-dir /etc/yuzu/certs \
-  --data-dir /var/lib/yuzu \
   --break-glass-user alice \
   --break-glass-arm
 # → arms the named --break-glass-user for --break-glass-window-secs
@@ -421,13 +455,13 @@ whatever the running service passes in its unit file. Omit it and the command
 exits non-zero with `error: --break-glass-arm requires --break-glass-user`,
 arming nothing.
 
-Arming is fail-closed on audit: the store is checked writable *before* the
-mutate, and if the row fails to persist afterwards the arm is rolled back
-(the account ends up NOT armed). That makes the `--postgres-dsn` note above
+Arming is fail-closed on audit: the audit store is checked reachable and
+migrated *before* the mutate, and if the row fails to persist afterwards the
+arm is rolled back (the account ends up NOT armed). If the rollback also fails,
+the command exits non-zero and says so on stderr: the account may still be
+armed, with no audit row. That makes the `--postgres-dsn` note above
 load-bearing here too — point it at the real production database, or you
-will arm the glass and record it somewhere nobody is looking. The one-shot
-lockout note above applies here identically: `--break-glass-arm` refuses on
-a never-booted host the same way `--mfa-reset` does, for the same reason.
+will arm the glass and record it somewhere nobody is looking.
 
 Same flag requirements and the same threat model as `--mfa-reset` above. The
 arm is audited at `kCritical` as `auth.breakglass.armed`, attributed to the OS
@@ -439,6 +473,36 @@ The break-glass account **must** have MFA enrolled: boot fails closed if it
 does not, and an un-enrolled break-glass account is hard-denied at login
 (enrolment is never offered on that path, since that would defeat the second
 factor).
+
+To enrol the break-glass account, restart the server with `--auth-mode=standard`
+and sign in as that account. This re-enables local-password login for every local
+account, so keep the window short: on bare metal consider `--web-address
+127.0.0.1`; in a container, restrict the published port instead (the image binds
+0.0.0.0). The break-glass lockout exemption does not apply in standard mode, so
+failed password attempts can lock the account for `--auth-lockout-window-secs`.
+Only with the listener restricted as above, consider `--auth-lockout-threshold=0`
+for the window (it disables throttling for every local account); otherwise an SSO
+admin, if the IdP is up, can clear a lock with `POST /api/v1/users/{name}/unlock`.
+Under
+`--mfa-enforcement=required` the sign-in itself enrols MFA; otherwise enrol at
+Settings → Multi-Factor Authentication, which needs the admin role. For a
+non-admin break-glass account, also pass `--mfa-enforcement=required` for that
+restart, and note that it applies to every user for the window: un-enrolled local
+users are enrolled at login, and SSO users whose IdP sends no `amr` cannot pass
+step-up. Then restore `--auth-mode=sso-only` and your usual `--mfa-enforcement`.
+If the arm has lapsed by then and you still need break-glass access (the IdP is
+still down), re-run `--break-glass-arm`; do not re-arm for a planned rotation.
+The mode switch itself writes no audit row, so record the window in a change
+ticket; the evidence is the startup WARN that `--break-glass-user` is ignored under
+standard mode, the missing sso-only boot banner, the
+`auth.login` and `mfa.enroll.verified` rows inside the window, and the banner
+returning on the final restart.
+
+To rotate the break-glass TOTP, clear it first with `--mfa-reset <user>` (an
+enrolled account gets a challenge at sign-in, not enrolment, and cannot re-enrol
+from Settings), then follow the enrolment sequence above. Do not restart under
+sso-only between the reset and the re-enrolment: boot refuses until the account
+is enrolled again.
 
 ## Locked out by MFA enforcement misconfiguration
 

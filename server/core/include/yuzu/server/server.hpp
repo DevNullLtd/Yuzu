@@ -135,12 +135,27 @@ struct Config {
     // --postgres-pool-size / YUZU_POSTGRES_POOL_SIZE.
     int postgres_pool_size{16};
 
-    // Set by main.cpp iff `AuthDB::seed_admin_if_empty` actually seeded the
-    // sole admin user this boot (a genuinely-empty `auth.users` — fresh
-    // start / Postgres cutover). Threaded through Config rather than set
-    // directly on a metrics registry because the seed happens before
-    // `Server::create()` constructs `ServerImpl` (and therefore before
-    // `metrics_` exists) — ServerImpl's ctor reads this once to pre-seed
+    // HA WS-8 (ADR-2002 §12): minimum seconds stop() keeps the listener open
+    // after /readyz starts answering 503 `draining`, so a load balancer stops
+    // routing here before the socket closes. 0 = no minimum (the single-node
+    // default). Range [0, 60] — see shutdown_drain_rules.hpp for why 60. Wired
+    // via --shutdown-drain-seconds / YUZU_SHUTDOWN_DRAIN_SECONDS.
+    int shutdown_drain_seconds{0};
+
+    // Set by main.cpp iff `RbacStore::provision_first_admin` actually
+    // provisioned the sole admin user + their fleet-wide Administrator
+    // grant this boot (a genuinely-empty `auth.users` — fresh start /
+    // Postgres cutover). Sourced from `provision_first_admin`'s outcome,
+    // NOT `AuthDB::seed_admin_if_empty`'s — `provision_first_admin` is the
+    // SOLE production seeder now (main.cpp's fresh-start bootstrap block
+    // performs the fresh-start INSERT there; `seed_admin_if_empty` has no
+    // production caller at all); the flag's own meaning ("did this boot
+    // seed the sole admin user into an empty auth.users table") is
+    // unchanged, only which call detects it. Threaded through Config rather
+    // than set directly on a
+    // metrics registry because this happens before `Server::create()`
+    // constructs `ServerImpl` (and therefore before `metrics_` exists) —
+    // ServerImpl's ctor reads this once to pre-seed
     // `yuzu_auth_fresh_start_reset_total`.
     bool auth_fresh_start_seeded{false};
 

@@ -1,0 +1,188 @@
+## Platform Security Definitions
+## Reports Secure Boot and code-integrity enforcement posture. Read-only.
+## Plugin: platform_security | Actions: secure_boot, code_integrity
+##
+## Sources by platform:
+##   Windows: registry reads (rung 1) under HKLM\SYSTEM\CurrentControlSet\Control:
+##            SecureBoot\State (secure_boot); CI\Policy, DeviceGuard,
+##            DeviceGuard\Scenarios\HypervisorEnforcedCodeIntegrity and
+##            Lsa\LsaCfgFlags (code_integrity). Configured policy, not proof of
+##            what is running.
+##   macOS:   secure_boot is unsupported (no public API); code_integrity runs
+##            `spctl --status` (Gatekeeper) and `csrutil status` (SIP) as
+##            declared rung-2 argv leaves.
+##   Linux:   efivarfs SecureBoot-* / SetupMode-* (secure_boot); securityfs
+##            /sys/kernel/security/lsm and /sys/kernel/security/lockdown
+##            (code_integrity). All rung 1.
+##
+## Every read distinguishes `absent` (the OS definitively says it is not
+## there) from `unreadable` (the read failed). Measured boot ships as a
+## separate plugin, measured_boot.
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: crossplatform.platform_security.secure_boot
+  displayName: Secure Boot State
+  version: 1.0.0
+  description: >
+    Reports whether UEFI Secure Boot is enforced. Linux reads the efivarfs
+    SecureBoot and SetupMode variables (two rows); Windows reads
+    UEFISecureBootEnabled under Control\SecureBoot\State (one row); macOS has
+    no public API and reports one `unsupported` row. A host with no efivars
+    (BIOS or CSM boot) reads `absent`, which is a normal answer and not a
+    failure; a variable that exists but could not be read reads `unreadable`
+    and downgrades the result to CONSTRAINED/PARTIAL (PERMISSION_DENIED/PARTIAL
+    when the read was refused) rather than failing the command.
+  tags: [platform_security, security, posture]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: platform_security
+    action: secure_boot
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    # secure_boot|<os>|<key>|<raw>|<state>   (also: constrained|internal_error on an internal error)
+    columns:
+      - name: row_kind
+        type: string
+        description: 'Row family: `secure_boot` (one per key read) or `constrained` (an internal-error row: the two-field row `constrained|internal_error`, which carries no os, key, raw or state).'
+        values: [secure_boot, constrained]
+        example: secure_boot
+        platforms: [windows, linux, darwin]
+      - name: os
+        type: string
+        description: 'The leg that produced the row.'
+        values: [linux, macos, windows]
+        example: linux
+        platforms: [windows, linux, darwin]
+      - name: key
+        type: string
+        description: 'Value read: secure_boot and setup_mode (Linux efivars), secure_boot (macOS, unsupported row), UEFISecureBootEnabled (Windows).'
+        example: secure_boot
+        platforms: [windows, linux, darwin]
+      - name: raw
+        type: string
+        description: 'The raw value read (the efivar data byte, or the registry DWORD as a number); "-" when nothing was read (absent, unreadable or unsupported).'
+        example: "1"
+        platforms: [windows, linux, darwin]
+      - name: state
+        type: string
+        description: 'enabled = Secure Boot enforcing (for setup_mode: User Mode, a Platform Key is enrolled); disabled = Secure Boot off (for setup_mode: Setup Mode, no Platform Key, any image may load). The state describes the protection, not the raw number. unmodelled = a value was read that this table has no interpretation for (raw keeps it). absent = the OS definitively says it is not there (a BIOS/CSM boot has no efivars or SecureBoot\State), a normal answer and not a failure. unreadable = the read failed. unsupported = no mechanism on this OS (macOS).'
+        values: [enabled, disabled, unmodelled, absent, unreadable, unsupported]
+        example: enabled
+        platforms: [windows, linux, darwin]
+    aggregation:
+      groupBy:
+        - state
+      operations:
+        - count
+
+  readablePayload: "Secure Boot State"
+
+  gather:
+    ttlSeconds: 300
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator, security-admin]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 1.0.0
+    requiredPlugins: [platform_security]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: crossplatform.platform_security.code_integrity
+  displayName: Code Integrity Posture
+  version: 1.0.0
+  description: >
+    Reports code-signing enforcement posture. Linux reads the active LSM list
+    and the kernel lockdown mode; macOS runs `spctl --status` (Gatekeeper) and
+    `csrutil status` (SIP); Windows reads the Code Integrity policy, Device
+    Guard, HVCI and Credential Guard (LsaCfgFlags) registry values, plus every
+    value under CI\Policy. A value the OS definitively lacks reads `absent`,
+    which is not a failure; a read that failed reads `unreadable` and
+    downgrades the result to CONSTRAINED/PARTIAL (PERMISSION_DENIED/PARTIAL when
+    refused) rather than failing the command.
+  tags: [platform_security, security, posture]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: platform_security
+    action: code_integrity
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    # code_integrity|<os>|<key>|<raw>|<state>   (also: constrained|internal_error on an internal error)
+    columns:
+      - name: row_kind
+        type: string
+        description: 'Row family: `code_integrity` (one per key read) or `constrained` (an internal-error row: the two-field row `constrained|internal_error`, which carries no os, key, raw or state).'
+        values: [code_integrity, constrained]
+        example: code_integrity
+        platforms: [windows, linux, darwin]
+      - name: os
+        type: string
+        description: 'The leg that produced the row.'
+        values: [linux, macos, windows]
+        example: linux
+        platforms: [windows, linux, darwin]
+      - name: key
+        type: string
+        description: 'Value read: lsm and lockdown (Linux); gatekeeper and sip (macOS); ci_policy.<value name> for every value under CI\Policy, deviceguard.EnableVirtualizationBasedSecurity, deviceguard.RequirePlatformSecurityFeatures, deviceguard.HypervisorEnforcedCodeIntegrity, deviceguard.hvci_scenario_enabled and lsa.LsaCfgFlags (Windows; LsaCfgFlags lives under Control\Lsa, not DeviceGuard).'
+        example: lsm
+        platforms: [windows, linux, darwin]
+      - name: raw
+        type: string
+        description: 'The raw text or number read (the LSM list, the lockdown line with its bracketed active mode, the first line of tool output, or the registry value); "-" when nothing was read (absent or unreadable).'
+        example: "capability,landlock,yama,apparmor"
+        platforms: [windows, linux, darwin]
+      - name: state
+        type: string
+        description: 'enabled, disabled and partial describe the PROTECTION, not the raw value (Linux lockdown integrity is partial, confidentiality is enabled; macOS SIP with a custom configuration is partial). evaluation (Smart App Control in evaluation mode) and enabled_locked (Credential Guard with a UEFI lock) are Windows-only. unmodelled = a value was read that this table has no interpretation for (raw keeps it). absent = the OS definitively says it is not there (no lockdown LSM, no DeviceGuard values on a default Windows install), a normal answer and not a failure. unreadable = the read failed.'
+        values: [enabled, disabled, partial, evaluation, enabled_locked, unmodelled, absent, unreadable]
+        example: enabled
+        platforms: [windows, linux, darwin]
+    aggregation:
+      groupBy:
+        - state
+      operations:
+        - count
+
+  readablePayload: "Code Integrity Posture"
+
+  gather:
+    ttlSeconds: 300
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator, security-admin]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 1.0.0
+    requiredPlugins: [platform_security]
+
+status:
+  phase: active

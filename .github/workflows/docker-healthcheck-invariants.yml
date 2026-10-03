@@ -121,16 +121,17 @@ jobs:
           # gate to run and a human to look.
           #
           # KEEP IN SYNC with the healthcheck list in
-          # scripts/ci/verify-healthcheck-invariants.sh. The last two patterns are
-          # easy to forget: scripts/test/ and the compose heredocs inlined in
-          # pre-release.yml both healthcheck yuzu-server with bash + /dev/tcp.
+          # scripts/ci/verify-healthcheck-invariants.sh. scripts/test/ is the
+          # easy one to forget: it healthchecks yuzu-server with bash + /dev/tcp.
+          # pre-release.yml is not listed: it inlines no compose stack any more
+          # and runs docker-compose.reference-gateway.yml (matched by the
+          # deploy/docker pattern) through scripts/ci/qa-stack.sh.
           if echo "$FILES" | grep -qE \
             -e '^deploy/docker/Dockerfile\.(server|gateway)(\.chisel)?$' \
             -e '^deploy/docker/Dockerfile\.agent\.chisel$' \
             -e '^deploy/docker/docker-compose.*\.ya?ml$' \
             -e '^docker-compose\.uat\.yml$' \
             -e '^scripts/test/docker-compose\.upgrade-test\.yml$' \
-            -e '^\.github/workflows/pre-release\.yml$' \
             -e '^scripts/ci/verify-healthcheck-invariants\.sh$' \
             -e '^\.github/workflows/docker-healthcheck-invariants\.yml$'; then
             echo "Image surface touched -- verifying."
@@ -146,8 +147,8 @@ jobs:
     if: needs.changes.outputs.images_touched == 'true'
     runs-on: [self-hosted, Linux, X64, yuzu-bigtam-linux]
     # Cold-cache worst case is a full vcpkg-from-source compile for the server /
-    # agent chisel images (release.yml allows 360 min for those, but that budget
-    # covered a QEMU-emulated arm64 leg this gate does not build). In the normal
+    # agent chisel images (release.yml allows 120 min for those since the QEMU
+    # arm64 leg was dropped; this gate builds amd64 only too). In the normal
     # case the release job's local buildcache is warm and only the runtime stage
     # -- the part that actually carries the invariant -- rebuilds.
     timeout-minutes: 120
@@ -189,10 +190,10 @@ jobs:
           persist-credentials: false
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       - name: Build image (load, do not push)
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: ${{ matrix.dockerfile }}

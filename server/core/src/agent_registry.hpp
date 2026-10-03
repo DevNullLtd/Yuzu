@@ -30,6 +30,7 @@
 #include "dispatch_caller.hpp"
 #include "event_bus.hpp"
 #include "offline_endpoint_store.hpp" // HA WS-5: PresenceIdentity is a value member (presence_cache_)
+#include "scope_eval_error.hpp" // #4981 PR-1: ScopeEvalError, evaluate_scope's typed failure surface
 #include "scope_engine.hpp"
 
 // Forward declarations
@@ -1034,18 +1035,26 @@ public:
     // then; documented at the call site, not re-litigated per caller.
     std::unordered_set<std::string> ids_missing_plugin(std::string_view plugin) const;
 
-    // Evaluate a scope expression against all agents, return matching agent IDs.
-    // `rs_store` resolves the `from_result_set:<id>` scope kind (capability §30)
-    // to per-device membership, scoped to `principal`: a referenced set that
-    // `principal` does not own resolves to an empty membership and never matches
-    // (no cross-operator targeting — review finding B1). Pass the dispatching
+    // Evaluate a scope expression against all agents (local + cross-replica
+    // presence), return matching agent IDs. `rs_store` resolves the
+    // `from_result_set:<id>` scope kind (capability §30) to per-device
+    // membership, scoped to `principal`: a referenced set that `principal`
+    // does not own now ABORTS the whole evaluation (#4981 PR-1 Finding A/A3 —
+    // see the Kind list below; it no longer silently resolves to an empty,
+    // non-matching membership, closing the TOCTOU window a fail-open
+    // "not-owned == not-found" collapse left between a caller's own
+    // pre-dispatch ownership gate and this preload). Pass the dispatching
     // operator as `principal` on every command path. Leaving `rs_store` null
     // (with `principal` empty) is safe ONLY for a scope expression that
     // contains NO from_result_set: atom — that is a CALLER OBLIGATION, not an
     // invariant this function can supply: nothing filters the atom out of a
     // parsed expression, so a no-store call site whose expression might carry
-    // one (e.g. an operator-authored rule scope) must treat nullopt as
-    // "unresolvable here — match nothing" (governance H1, 2026-07-29).
+    // one (e.g. an operator-authored rule scope) must treat an error as
+    // "unresolvable here — match nothing" (governance H1, 2026-07-29). A
+    // caller that never wires a ResultSetStore/principal by design (the
+    // Guardian push paths) should call `evaluate_scope_local` below instead,
+    // which shares this resolver but is guaranteed never to fail for a
+    // presence reason.
     // Aliases must be pre-resolved
     // to canonical ids by the caller. A genuinely offline/decommissioned
     // agent (absent from BOTH the local live registry and — HA WS-5,
@@ -1054,39 +1063,77 @@ public:
     // replica no longer drops merely for that reason — see
     // configure_presence's doc comment.
     //
-    // Returns std::nullopt (ADR-0036 + 2026-07-26 B2 fail-closed contract,
-    // widened per governance H1 2026-07-29, and again per ADR-0045) in FIVE
-    // cases, all load-bearing:
-    //   1. The from_result_set: membership preload hits a Postgres error
-    //      mid-scan — NEVER a partial/degraded membership map.
-    //   2. The expression references a from_result_set: atom but `principal`
-    //      is empty — e.g. a dispatch path that recovers the principal from
-    //      an execution row's `dispatched_by` and that lookup missed. A real
-    //      store exists but there is no owner to resolve against.
-    //   3. The expression references a from_result_set: atom but `rs_store`
-    //      is null — the atom cannot be resolved AT ALL at this call site.
-    //      (Previously this case silently evaluated the atom false; under a
-    //      NOT combinator that inverted to a fleet-wide match — for a
-    //      Guardian rule arming an enforcing guard, a fleet-wide arm.)
-    //   4. The expression references a props.<key> atom but `props_store`
-    //      is null (ADR-0045) — same "cannot resolve at all here" shape as
-    //      case 3.
-    //   5. The expression references a props.<key> atom and the bulk
-    //      get_values_for_keys preload hits a Postgres error (ADR-0045) —
-    //      same shape as case 1, for CustomPropertiesStore instead of
-    //      ResultSetStore.
+    // Returns `std::unexpected<ScopeEvalError>` (ADR-0036 + 2026-07-26 B2
+    // fail-closed contract, widened per governance H1 2026-07-29, again per
+    // ADR-0045, and again per #4981 PR-1 Findings A+B) — see
+    // `scope_eval_error.hpp`'s `ScopeEvalError::Kind` for the authoritative
+    // case list (this comment used to enumerate five nullopt cases directly;
+    // that list is now the enum, so it cannot drift from the code):
+    //   - Kind::Unresolvable — a from_result_set:/props.<key> atom is present
+    //     but the respective store (`rs_store`/`props_store`) is null: the
+    //     atom cannot be resolved AT ALL here. (Previously this silently
+    //     evaluated the atom false; under a NOT combinator that inverted to a
+    //     fleet-wide match.)
+    //   - Kind::PrincipalUnresolved — a from_result_set: atom is present but
+    //     `principal` is empty (e.g. a dispatch path that recovers the
+    //     principal from an execution row's `dispatched_by` and that lookup
+    //     missed). A real store exists but there is no owner to resolve
+    //     against.
+    //   - Kind::StoreDegraded — a wired store's preload hit a genuine
+    //     Postgres error mid-scan (`member_set_owned`, tag/props bulk
+    //     `get_values_for_keys`) — NEVER a partial/degraded membership map.
+    //   - Kind::OwnerCheckFailed — a referenced result set is absent,
+    //     expired, or not owned by `principal` (#4981 PR-1 A1/A3 — collapsed
+    //     from `ResultSetError::NotFound`/`NotOwner` so a caller can never
+    //     distinguish the two). `detail` carries the failing result-set id.
+    //   - Kind::PresenceDegraded — the cross-replica presence read
+    //     (`live_presence()`) could not answer (#4981 PR-1 Finding B). Never
+    //     produced by `evaluate_scope_local`, which never consults presence.
     // All five are the same fail-open shape: under a NOT combinator, an atom
     // that resolves "no match" silently INVERTS to "matches every agent" — a
     // fleet-wide dispatch/arm, not a theoretical hardening gap. Every caller
-    // that dispatches/enforces/targets on this result MUST treat nullopt as
+    // that dispatches/enforces/targets on this result MUST treat an error as
     // "abort — do not proceed" (dispatch paths) or "match nothing" (push
     // paths, where arming nothing is the safe direction). NARROW: a scope
     // with NEITHER a from_result_set: NOR a props.<key> atom is completely
     // unaffected — value_or({}) is safe there.
-    std::optional<std::vector<std::string>>
+    // `touch_referenced_result_sets` (#4981 PR-3, defaulted so every existing
+    // call site compiles unchanged with zero behavior change): every OTHER
+    // real dispatch/enforcement caller (command_routes.cpp's Scope arm,
+    // wire_and_dispatch_confined, PolicyEvaluator::resolve_targets) leaves
+    // this at its default `true`, preserving the existing
+    // `rs_store->touch(rsid)` TTL-keep-alive side effect on every owned
+    // `from_result_set:` reference this evaluation resolves (see the
+    // from_result_set: preload block in the .cpp for the touch itself). The
+    // ONE caller that passes `false` is the shared `preview_scope_targets`
+    // evaluation closure (server.cpp's `scope_evaluate_fn`, bound into both
+    // REST `POST /api/v1/scope/preview` and MCP `preview_scope_targets`) —
+    // a read-only preview must not extend a result set's TTL merely for
+    // being referenced in a dry-run scope check.
+    std::expected<std::vector<std::string>, ScopeEvalError>
     evaluate_scope(const yuzu::scope::Expression& expr, const TagStore* tag_store,
                    const CustomPropertiesStore* props_store = nullptr,
-                   ResultSetStore* rs_store = nullptr, std::string_view principal = {}) const;
+                   ResultSetStore* rs_store = nullptr, std::string_view principal = {},
+                   bool touch_referenced_result_sets = true) const;
+
+    // #4981 PR-1 (Finding B, regression-prevention step B4): a sibling entry
+    // point for a caller that by DESIGN never wires a ResultSetStore or a
+    // principal — today the three Guardian push/reconcile call sites
+    // (server.cpp: the heartbeat reconcile path and the two toggle-push
+    // paths), which dispatch LOCAL-ONLY via send_system_reserved/send_to and
+    // converge agents to exactly the pushed set on every full_sync push (see
+    // guardian_push_builder.hpp), so presence was never relevant to them.
+    // Shares the SAME resolver body as evaluate_scope (ONE implementation,
+    // per the DRIFT CONTRACT discipline in the .cpp — never a second copy),
+    // parameterized to skip the presence merge entirely: this can never
+    // return `Kind::PresenceDegraded`, so a sustained presence-store outage
+    // can never make this function silently disarm/re-arm a scoped Guardian
+    // rule on every heartbeat. Matches every OTHER `Kind` exactly as
+    // evaluate_scope does (from_result_set:/props.<key> atoms with no store
+    // wired still abort `Unresolvable`, etc).
+    std::expected<std::vector<std::string>, ScopeEvalError>
+    evaluate_scope_local(const yuzu::scope::Expression& expr, const TagStore* tag_store,
+                        const CustomPropertiesStore* props_store = nullptr) const;
 
 private:
     mutable std::mutex mu_;
@@ -1122,16 +1169,49 @@ private:
     /// correctness class. `live_presence()` is the ONLY caller of
     /// `presence_store_->query_live_ids`; all_ids()/evaluate_scope() must
     /// route through it, never call query_live_ids directly.
+    ///
+    /// #4981 PR-1 (Finding B2): the cache holds the `std::expected` itself,
+    /// negative-caching a degraded read for the SAME `kPresenceCacheTtl`
+    /// window a success is cached for. Without this, a SUSTAINED
+    /// presence-store outage would make every single `evaluate_scope`/
+    /// `all_ids()` call within the outage pay the full query-acquire-timeout
+    /// cost (`kQueryAcquireTimeout`, offline_endpoint_store.cpp) — e.g. the
+    /// policy evaluator's per-tick sweep over N policies would pay N × that
+    /// timeout, every tick, for the whole outage.
     static constexpr std::chrono::seconds kPresenceCacheTtl{3};
     mutable std::mutex presence_cache_mu_;
-    mutable std::vector<PresenceIdentity> presence_cache_;
+    mutable std::expected<std::vector<PresenceIdentity>, PresenceReadError> presence_cache_{
+        std::vector<PresenceIdentity>{}};
     mutable std::chrono::steady_clock::time_point presence_cache_at_{};
 
     /// Returns the cached (or freshly-fetched, if stale/first-call) live
-    /// presence set. Empty immediately, no lock taken, when presence is
-    /// unconfigured (`presence_store_ == nullptr`) — the common single-
-    /// replica case pays only the pointer check.
-    std::vector<PresenceIdentity> live_presence() const;
+    /// presence set — or the cached/fresh `PresenceReadError` on a degraded
+    /// read (#4981 PR-1 Finding B). Success-empty immediately, no lock taken,
+    /// when presence is unconfigured (`presence_store_ == nullptr`) — the
+    /// common single-replica case pays only the pointer check, and can never
+    /// fail this way.
+    std::expected<std::vector<PresenceIdentity>, PresenceReadError> live_presence() const;
+
+    // #4981 PR-1 (Finding B4): which agent population evaluate_scope_impl
+    // considers. `LocalOnly` skips the live_presence() call AND the
+    // presence-merge loop entirely — it is the reason evaluate_scope_local
+    // can never return Kind::PresenceDegraded. Kept file-private (not part of
+    // the public evaluate_scope/evaluate_scope_local split callers see).
+    enum class ScopePopulation { Fleet, LocalOnly };
+
+    // Shared resolver body for evaluate_scope/evaluate_scope_local — see the
+    // DRIFT CONTRACT comment in agent_registry.cpp just above the local
+    // per-agent resolver lambda: this is the ONE implementation the two
+    // public entry points wrap, never a second copy. `touch_referenced_result_sets`
+    // is an ORTHOGONAL axis to `population` (#4981 PR-3) — see evaluate_scope's
+    // own doc comment above; evaluate_scope_local always passes `true` here,
+    // which is a no-op in practice since it also always passes a null
+    // `rs_store`, so the touch call site can never execute for LocalOnly.
+    std::expected<std::vector<std::string>, ScopeEvalError>
+    evaluate_scope_impl(const yuzu::scope::Expression& expr, const TagStore* tag_store,
+                        const CustomPropertiesStore* props_store, ResultSetStore* rs_store,
+                        std::string_view principal, ScopePopulation population,
+                        bool touch_referenced_result_sets) const;
 
     std::mutex gw_pending_mu_;
     std::vector<GatewayPendingCmd> gw_pending_;
@@ -1227,6 +1307,25 @@ public:
     void upsert(const std::string& agent_id,
                 const google::protobuf::Map<std::string, std::string>& tags);
 
+    /// #1567: receives a tar.db corruption CANDIDATE `(agent_id, corruption_total,
+    /// quarantine_last)` when a heartbeat carries a valid
+    /// `yuzu.plugin.tar.db_corruption_total` (> 0) and `db_quarantine_last`, and
+    /// on EVERY such heartbeat. The store deliberately does NOT dedup (its
+    /// memory is per-process and pruned every ~90 s): the sink
+    /// (TarCorruptionAuditGate) owns durable dedup and its own rate limit; a
+    /// failed write is retried after the gate's degraded window, and a
+    /// candidate skipped only because the gate's slot was busy is retried on
+    /// the next heartbeat -- see tar_corruption_audit.hpp for the distinction.
+    /// This is the store's first plugin-specific side-effecting hook -- a
+    /// second consumer of the same "surface a candidate, let an injected sink
+    /// durably dedup it" shape should generalize this to a small named-sink
+    /// registry rather than adding a second `set_<plugin>_sink`. Invoked
+    /// OUTSIDE mu_.
+    using CorruptionSink =
+        std::function<void(const std::string& agent_id, int64_t corruption_total,
+                           const std::string& quarantine_last)>;
+    void set_corruption_sink(CorruptionSink sink);
+
     void remove(const std::string& agent_id);
 
     void recompute_metrics(yuzu::MetricsRegistry& metrics, std::chrono::seconds staleness);
@@ -1250,6 +1349,7 @@ public:
 private:
     mutable std::mutex mu_;
     std::unordered_map<std::string, AgentHealthSnapshot> snapshots_;
+    CorruptionSink corruption_sink_;
 
     /// C1: per-OS twin of recompute_metrics' four yuzu_fleet_perf_* exports —
     /// yuzu_fleet_perf_os_{reporting,cpu_pct,commit_pct,disk_lat_ms}{os[,stat]},

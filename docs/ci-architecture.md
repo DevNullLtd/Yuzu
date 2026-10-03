@@ -162,6 +162,49 @@ code.
 
 ## Gates outside the tier ladder
 
+### Release artifact gate (`scripts/check-release-artifacts.sh`, release job)
+
+Runs in `release.yml`'s `release` job after the artifacts are downloaded and
+flattened, and before `SHA256SUMS`, signing, the `.intoto.jsonl` bundles and
+`gh release create`. When it fails, no GitHub release, `SHA256SUMS` or
+signature exists yet, but **the container images are already published**:
+the `release` job needs `docker-publish`, `docker-publish-postgres` and
+`docker-publish-chisel`, which push `:X.Y.Z` (and, on a stable tag, `:X.Y` and
+`:latest`) first (the agent-bundle image needs `release`, so it is not
+published), and the build jobs' provenance attestations are already recorded.
+`docker-publish-chisel` joined the release's needs in #5242, so the release
+waits for the chisel builds (minutes with a warm cache, much longer cold) and
+the three chisel images' SBOMs are always release assets, inside `SHA256SUMS`;
+before that they were attached only when those jobs finished first, and rc2,
+rc4 and rc6 shipped without some of them. On a stable tag `:latest` therefore points
+at a release that does not exist until the release is fixed. It fails the
+release when:
+
+- an expected archive, installer glob or SBOM is missing or empty (#362/#408);
+- an asset name contains a character GitHub rewrites on upload (anything but
+  letters, digits, `.`, `_`, `-`, or a name not starting with a letter or
+  digit), which would make `SHA256SUMS` and the provenance name an asset that
+  does not exist (#5141);
+- a `.deb`/`.rpm`/`.exe`/`.pkg` does not carry the tag's version in the form
+  its builder writes; the error prints the expected pattern (#5141). The usual
+  cause is a package left in a reused self-hosted workspace by an earlier
+  build of another version.
+
+Recovery: find the offending file in the error. For a stale file, clear the
+runner workspace and start a fresh run of the same tag with
+`gh workflow run release.yml --ref vX.Y.Z`, following the release skill's
+Recovery steps (no release exists for the tag, no other run for it is queued
+or running). Never use "Re-run failed jobs" on a release run: an older run can
+be superseded by a newer one and push images over a published release (#5242).
+For a builder naming defect, a fresh run builds the tag's original commit
+again, so fix the builder, then delete and re-push the tag at the fixed commit.
+Either way the images are rebuilt and re-pushed under the same tags.
+
+If the release cannot be fixed promptly on a stable tag, move `:latest` back
+to the previous release's images. The gate has no override; the naming forms
+it checks are a second copy of the builders' naming, and its header lists
+where each lives.
+
 ### Plugin spawn lexical gate (`plugin-spawn-gate.yml`, ADR-3002 decision 10a)
 
 A per-PR grep over `agents/plugins/*` and `agents/core` for a raw
@@ -340,9 +383,12 @@ is gated **pre-emptively**: no compose healthchecks an agent image today.
 
 The probes are a hard-coded copy of the healthcheck commands, so both the script
 and the workflow's change-filter carry a **KEEP IN SYNC** list of every file that
-defines one — including the two easy-to-miss ones,
-`scripts/test/docker-compose.upgrade-test.yml` and the compose heredocs inlined in
-`pre-release.yml`.
+defines one — including the easy-to-miss
+`scripts/test/docker-compose.upgrade-test.yml`. `pre-release.yml` no longer
+inlines a compose stack: its integration, soak and upgrade jobs run the shipped
+`deploy/docker/docker-compose.reference-gateway.yml` through
+`scripts/ci/qa-stack.sh`, so that template's server healthcheck is the one they
+exercise.
 
 `scripts/ci/verify-healthcheck-invariants.sh` is the gate. It runs each image's
 real healthcheck probe **against a live HTTP listener** in a shared network
@@ -381,6 +427,105 @@ with no `cache-to`), so it never evicts release layers and adds no cache directo
 likewise has no `cache-to`: it shares one buildkitd instance with the push build,
 so the push hits BuildKit's own solver cache and rebuilds nothing.
 
+### Pre-release QA (`pre-release.yml`)
+
+**Trigger.** `workflow_run` on a completed `Release` run whose head is a `v*` tag
+and whose conclusion is `success`, or by hand: `gh workflow run pre-release.yml
+-f tag=v0.14.0-rc3`. A `workflow_run` trigger always runs the copy of this
+file on `main`, whatever branch the release was cut from.
+
+**Detective, not preventive.** It starts after the release is already
+published and never blocks one. A red run says the published release has a
+defect to fix in the next one.
+
+**Jobs.** `resolve` finds the tag, verifies `SHA256SUMS`, and picks the previous
+stable release: the highest non-draft, non-prerelease `vX.Y.Z` strictly lower
+than the tag under test (#5150). The other jobs check the following:
+
+- **integration**: the reference stack starts, the dashboard answers over
+  HTTPS against the install CA, the gateway is ready, the connected-agent
+  gauges (server and gateway) are at least 1, an `os_info` command
+  round-trips, and no service has restarted.
+- **install-deb / install-rpm**: for each of server, agent and gateway, exactly
+  one package is in the release. It installs, ships its systemd unit, and
+  removes cleanly. It must also run: `--version` for server and agent. The
+  gateway is started the way its systemd unit starts it: as the unit's
+  `User=`, with its `Environment=` and its `EnvironmentFile=`
+  (`/etc/yuzu/gateway.env`, the distribution cookie). The `yuzu_gw`
+  application must be running within 30s, the node must still answer 10s
+  later, and `stop` must succeed. A bare `ping` is not enough: it answers
+  once Erlang distribution is up, even when the application refuses to
+  start. The legs are ubuntu:22.04/24.04/26.04 and debian:12 for .deb, and
+  fedora:42 and rockylinux:9 for .rpm (installed with `dnf`). If a leg's libc
+  or libstdc++ is older than the build's, the job fails and names the glibc
+  floor (#5143). A gateway whose crypto NIF cannot load is named as #5171. A
+  missing package fails; it is not skipped (#5151).
+- **install-windows**: two install/uninstall passes. With `/NOTLS` the service
+  must start and stay Running. With the default TLS posture the agent must
+  fail closed because no CA is pinned. The uninstall wait is bounded (#5145).
+- **install-macos**: the `.pkg` is present and installs, `--version` runs, the
+  launchd plist is in place, and at least 5 plugins are installed.
+- **artifact-verify**: checks the archive contents and ELF hardening (a
+  missing NX fails; PIE, RELRO and stack canaries only warn), and that each
+  `.deb` control `Version` equals the tag's Debian spelling (`0.14.0~rc3`); a
+  mismatch fails. The RPM metadata step only prints. The ARM64 archive is checked only when the
+  release ships one (#5135).
+- **security-scan**: Trivy scans the server and gateway images. Its findings
+  are informational and do not fail the run, but an image that cannot be
+  pulled fails the job.
+- **soak-test**: ten minutes on the stack. Every 30s it checks that all four
+  services are running with 0 restarts, at least one agent is connected, and
+  the gateway is ready. About once a minute it also round-trips a command. At
+  the end the registration counters (`yuzu_agents_registered_total`,
+  `yuzu_gw_agents_connected_total`, read once the gateway shows the agent's
+  stream) must be unchanged: an agent that reconnected between samples, or a
+  gateway that replayed registrations, fails the soak. A failed metric fetch
+  fails its sample and is reported as a fetch failure, not as 0. Memory
+  growth over 2x, measured from the first successful round-trip (after
+  warm-up), is a warning only. Crash signatures in the server, agent and
+  gateway logs fail the job. For the gateway that includes OTP process crashes
+  (`crasher: initial call`) and supervisor restarts (`Supervisor: ...
+  Context: child_terminated`), in the header-less format the reference
+  `sys.config` logger writes. It also includes the VM dying outright: an ERTS
+  abort (`<file>.c:<line>:<func>(): Internal error`), a failed boot
+  (`Kernel pid terminated`) and a crash dump (`GW_CRASH_PAT` in
+  `scripts/ci/qa-stack.sh`, locked by `tests/test_qa_stack_crash_pat.py`).
+  Postgres logs are not checked.
+- **upgrade-test**: brings up the previous stable release and upgrades every
+  service in place, keeping the Postgres volume, CA and agent data dir. The
+  same agent must reconnect running the new version. All services must be
+  running with 0 restarts, and a command must round-trip.
+
+**What the stack jobs run.** Integration, soak and upgrade use
+`scripts/ci/qa-stack.sh` to run the **checkout's** reference template
+(`deploy/docker/docker-compose.reference-gateway.yml`, #5134). The images are
+the tag's own, pinned by `YUZU_VERSION`. The gateway `sys.config`, and the path
+it is mounted at, come from the tag. Any difference between the tag's template
+and the checkout's is printed as a warning and diffed in the job summary.
+
+**Reporting.** In the `QA Report` job, a cell reads PASS only when that suite
+ran and passed. The upgrade reads NOT TESTED when the previous release predates
+the reference template, or when there is no previous stable release. A suite
+that did not run reads NOT RUN, with the reason. With any such gap, the
+headline is `PASSED WITH GAPS (<n> not tested)` and the run still exits 0. Any
+failure or cancellation makes it `FAILED`. If no successful release triggered
+the run, it reads `NOT RUN`. `has-stack` separates "predates" (exit 3) from
+"could not reach GitHub" (exit 1), so an outage fails the upgrade job instead
+of reading as NOT TESTED.
+
+**Expected failures.** These reds are intended, not flakes.
+
+- Artifacts from the v0.13.0 era fail the rpm install (#5142), the macOS
+  install (#5144) and the Windows install (#5147, #1468). Those defects are
+  fixed from 0.14.0-rc3 on.
+- From 0.14.0-rc3 on, until the glibc/libstdc++ floor (#5143) is decided,
+  these legs stay red: install-deb on ubuntu:22.04 and debian:12, the
+  ubuntu:24.04 server (GLIBCXX_3.4.34), and install-rpm on rockylinux:9 (the
+  gateway's bundled ERTS needs GLIBC_2.38 too).
+- The gateway stays red on fedora:42 until #5171 is fixed: its bundled OTP
+  crypto NIF needs OpenSSL SM4 symbols that Red Hat's OpenSSL lacks. The
+  same defect is waiting behind #5143 on rockylinux:9.
+
 ## Self-hosted runner topology
 
 | Runner | Host | Jobs |
@@ -389,11 +534,15 @@ so the push hits BuildKit's own solver cache and rebuilds nothing.
 | `yuzu-weetam-windows-{0..3}` | Wee Tam 9970X native Windows 11 — 4 CCD-pinned runners, shared label `yuzu-weetam-windows` | **all self-hosted Windows**: ci.yml `windows`, nightly `windows-asan`, codeql Windows leg, release `build-windows`, instructions-windows-validate, cache-prune-windows. Provisioned from [`deploy/windows/`](../deploy/windows/README.md). |
 | `yuzu-bigmags-macos-{0,1}` | BigMags Mac Mini (Apple M4 Pro, 24 GiB, macOS 26) — 2 runners as headless LaunchDaemons, shared label `yuzu-bigmags-macos` | **self-hosted macOS**: ci.yml `macos` matrix + `release.yml` build-macos. Only pre-release `install-macos` stays GitHub-hosted (`macos-14`, an install-to-root smoke test). Release **signing/notarization is deferred** — macOS releases currently ship UNSIGNED (Phase B = on-token `rcodesign`). Provisioned from [`deploy/macos/`](../deploy/macos/README.md). |
 
-**Retired 2026-06-21:** `yuzu-wsl2-linux` (Shulgi WSL2 Ubuntu 24.04, label
+**Retired 2026-06-21** (removed from the inventory afterwards): `yuzu-wsl2-linux` (Shulgi WSL2 Ubuntu 24.04, label
 `yuzu-shulgi`) and `yuzu-local-windows` (Shulgi native Windows) — superseded by
-Big Tam and Wee Tam. Remove them from `.github/runner-inventory.json` to silence
-the inventory sentinel. `proto-compat` and `cache-prune-linux` use the bare
-`[self-hosted, Linux, X64]` label (no compiler), so they resolve to Big Tam.
+Big Tam and Wee Tam, and removed from `.github/runner-inventory.json`.
+`proto-compat` and `cache-prune-linux` are pinned to `yuzu-bigtam-linux`; they
+previously used the bare `[self-hosted, Linux, X64]` label, which Shulgi's WSL2
+runner also carried, so they could land there instead of on Big Tam. The runners
+were deregistered on the GitHub side on 2026-10-03 (per the repo admin). With the pin, `proto-compat` queues (it does not fail) while all four
+Big Tam slots are busy. When no Big Tam runner is online, the preflight job
+fails (required pool `bigtam`) and `proto-compat` is skipped.
 
 ### Ubuntu 26.04 migration (Big Tam) — COMPLETE
 
@@ -443,7 +592,7 @@ for fast, download-free builds:
 - **mold** linker (`apt install mold`), wired via `-fuse-ld=mold` in the gcc-15 /
   clang-21 native files — large cut in link time on the big `yuzu-server` /
   `yuzu-agent` binaries and the release LTO link.
-- **meson** 1.11.1 + the rest of `requirements-ci.txt` persist in the runner
+- **meson** 1.12.0 + the rest of `requirements-ci.txt` persist in the runner
   user's `~/.local`, so the per-job `pip install --user --require-hashes` is a
   no-op (no re-download).
 - **rpm** (rpmbuild) installed for release.yml's packaging step — absent on a
@@ -955,9 +1104,9 @@ a runner for a concurrently-queued PR job. Fix: `ci.yml`'s Linux job's
 concurrently, leaving at least one Big Tam runner unclaimed by it — a no-op
 on `pull_request` events (already a single-leg matrix via the existing
 `exclude`). This is a mitigation, not a guarantee: the freed runner is not
-reserved for any specific job. `proto-compat` (this same workflow) targets
-the bare `[self-hosted, Linux, X64]` label every Big Tam Linux runner also
-carries and runs on the same push trigger — it can claim the freed runner
+reserved for any specific job. `proto-compat` (this same workflow) is pinned
+to the same `yuzu-bigtam-linux` label, so it draws on the same four runners,
+and runs on the same push trigger — it can claim the freed runner
 itself before a queued PR job does (its own `timeout-minutes: 5` means it
 self-frees quickly, but it is a real same-push competitor, not just the
 already-named nightly-overlap case). A stacked nightly run, another
@@ -1476,6 +1625,48 @@ to `known-flaky.json`), grep the junit failure text for
 `[EpIntegShared]`, `[AccRevShared]`, `acc_rev_reset`) — a cluster of those in
 one file is one PG-instance event, not a test bug.
 
+## Agent unit-test shards (#5073)
+
+The agent suite's single `agent unit tests` entry (one serial Catch2 process,
+240 s budget) is three entries over the same `yuzu_agent_tests` binary:
+`agent unit tests shard A`, `shard B`, `shard C`, each `suite: ['agent',
+'agent-shard']`, one positional tag spec, `timeout: 240` (unchanged per shard,
+and conservative headroom rather than a measured need: the only measured
+contention figure is for the server `~[pg]` suite, 289 s with no other test
+phase running (c0) to 603 s with four overlapping (c4), about 2.1x, across jobs on
+the pre-#3443 combined step, per "Windows test-phase
+concurrency gate"; it has not been re-measured for the agent shards) and
+`--allow-running-no-tests`. That flag is what stops the zero-match shard C from
+failing when `meson test --suite agent --test-args '[tag]'` appends a second
+positional spec. It does not make that a targeted run: Catch2 binds the extra
+spec to the LAST comma-separated OR term only, so it is exact only for shard C,
+it widens shards A and B, and a mistyped tag is no longer loud. Run the binary
+directly for a targeted run (`build-*/tests/yuzu_agent_tests '[tag]'`, see
+`docs/build-guide.md` "Direct binary invocation"). Repro (2026-10-01, Linux
+`build-linux/tests/yuzu_agent_tests`, `<shard spec> '[nonexistent_zzz]'
+--list-tests --allow-running-no-tests`): shard A lists 319 cases, B 437, C 0.
+Every CI leg selects the shards by `--suite agent` (ci.yml Linux step and Windows step,
+nightly.yml windows-asan) or runs `meson test` unfiltered (macOS, nightly and
+sanitizer legs); none selects the old entry name. `agent tsan-heavy checkpoints`
+is unsharded and unchanged.
+
+Partition rule and measured balance live in the comment above the entries in
+`tests/meson.build`: a case runs in the lowest-numbered shard holding any of its
+tags, shard C is the AND-NOT complement so new tests land there, and every
+inclusion term ends `~[.]~[tsan-heavy]~[flaky-4086]` because an inclusion term
+does not drop hidden cases by itself. `'agent shard partition invariant'`
+(`suite: ['agent', 'agent-checks']`, defined outside `if build_server`) runs
+`scripts/ci/check-pg-shard-partition.py --family agent`, the same script and
+`check_partition()` as the server shards: it proves against the real binary that
+every case of `~[.]~[tsan-heavy]~[flaky-4086]` is in exactly one shard. It also
+fails if a shard spec term does not end with that suffix (the meson
+`agent_shard_suffix` and the script literal are hand-synced), if a spec is not a
+shape flake-retry's isolated retry can strip, or if two shard entry names are
+equal or one contains another. It proves exactness, not balance: it prints per-shard case counts as an informational
+notice, and the drift signal is the 80%-of-budget table above. Per-entry history
+in `test-runs.db` / `ci_test_suites` is keyed by entry name, so it restarts under
+the new names.
+
 ## Workflow-PR canary
 
 `ci.yml`'s `detect-ci-changes` + `canary` jobs run when a PR, or a push to
@@ -1559,15 +1750,14 @@ databases (thresholds and semantics: "Test-database lifecycle" above).
 ## Chiselled demo images + agent bundle (release-time)
 
 `docker-publish-chisel` (in `release.yml`) builds the server/gateway/agent
-`*.chisel` images multi-arch — linux/amd64 native + linux/arm64 via **QEMU**
-— on the self-hosted Linux runner. The emulated arm64 vcpkg-from-source
-compile can hold that single runner slot up to its 360-min timeout, so the
-job carries a `cancel-in-progress: true` concurrency group (a re-tagged
-release supersedes a stale build instead of queueing behind it). It is
-**not** in the `release` job's `needs:`, so a slow/failed demo-image build
-never blocks the actual release. The sustainable fix for the QEMU cost is a
-native arm64 runner — the open decision tracked in `docs/demo-environment.md`
-("Publishing").
+`*.chisel` images for linux/amd64 on the self-hosted Linux runner (the
+QEMU-emulated arm64 leg was dropped; re-adding arm64 is the open decision in
+`docs/demo-environment.md`, "Publishing"). It carries a
+`cancel-in-progress: true` concurrency group, so a re-tagged release supersedes
+a stale build instead of queueing behind it, and a 120-min timeout. Since
+#5242 it **is** in the `release` job's `needs:`: the release waits for it
+(1–16 min on rc1–rc6) so the chisel SBOMs are always in `SHA256SUMS`, and a
+failed or cancelled chisel leg skips the release.
 
 `docker-publish-agent-bundle` runs **after** `release` (it repackages the
 release's own signed agent archives) on a GitHub-hosted runner — no

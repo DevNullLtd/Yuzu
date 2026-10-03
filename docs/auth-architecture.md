@@ -505,10 +505,11 @@ auto-reverts — so a compromised everyday session is not a standing admin sessi
 - **`--mfa-step-up-window-secs` governs the OIDC-elevation proof-freshness
   bound too.** The elevate route's shared `elevation_step_up` gate (which
   every session — local and OIDC — must additionally clear after the
-  unconditional enrolled/amr checks above) floors its window to
-  `cfg.mfa_step_up_window_secs` (default 300 s; floored to 300 s even if the
-  operator has globally disabled step-up via `<= 0`, so the privilege
-  boundary always requires a fresh proof). For an OIDC session this is the
+  unconditional enrolled/amr checks above) uses
+  `cfg.mfa_step_up_window_secs` as its window when it is positive (default
+  300 s), and 300 s when the operator has globally disabled step-up via
+  `<= 0`, so the privilege boundary always requires a fresh proof. A positive
+  value below 300 is used as-is; this is a substitution, not a floor. For an OIDC session this is the
   same `Session::mfa_verified_at` freshness check the local branch uses —
   there is no separate OIDC-specific timer; an operator narrows the window
   operator-wide with the one flag.
@@ -1265,7 +1266,7 @@ applies to these two flags).
 ### MFA enforcement with SAML
 
 **MFA step-up is not supported for SAML sessions in this release.** A SAML
-session hitting any of the 11 step-up-gated endpoints (token mint/revoke,
+session hitting any of the 24 step-up-gated endpoints (token mint/revoke,
 session revoke, Guardian rule write, software deploy, user delete/role change)
 receives a `403` with `"MFA step-up is not available for SAML sessions in this
 release"` — regardless of `--mfa-enforcement` mode. The gate (`require_mfa_step_up`
@@ -2496,7 +2497,7 @@ counter registrations). Tests: `tests/unit/server/test_saml_scim_link.cpp`,
 
 ## Granular RBAC (Phase 3)
 
-- 6 roles, 23 securable types, per-operation permissions, deny-override logic.
+- 7 roles, 38 securable types, per-operation permissions, deny-override logic.
 - **OIDC SSO** — Full PKCE flow, Entra ID discovery, JWT validation, group-to-role mapping.
 - **AD/Entra integration** — Microsoft Graph API for user/group import.
 
@@ -2853,7 +2854,7 @@ A **service-scoped API token** is bound to one IT service's agents (`session->to
 
 **Explicit denies for gate-less routes (§3e).** A route that never calls `require_permission`/`require_scoped_permission`/C8 at all is untouched by the flip regardless of how the flip itself is tuned — these needed their own deny. `AuthRoutes::deny_service_scoped_session` is `server.cpp`'s shared gate for this shape (health-summary fragment, the legacy `/events` SSE stream, the instructions-list fragment, and the six result-set HTMX fragments); `ComplianceRoutes` and `WorkflowRoutes` carry their own file-local equivalents for the same reason every other route-owner class in this list does (below). A residual grep sweep of every `auth_fn`/`perm_fn` call site in `rest_api_v1.cpp` (74 sites) and `mcp_server.cpp` (3 sites) found four more real instances — three sharing one shape (`management-groups/{id}/roles` GET/POST/DELETE, plus the `POST /api/v1/tokens` service-scope minting check, all bypassing `require_permission` via a **direct** `rbac_store->check_permission` call) and the eight-route `/api/v1/result-sets*` REST family (the twin of the HTMX fragments above) — plus one **distinct, more severe, not service-scope-specific** bug in the same pass: `POST /api/v1/result-sets/from-inventory-query` had no authorization check of any kind (CWE-862), missed by an earlier fix that gated its three dispatch siblings. Full inventory, including document-only dispositions and the sweep's own accounting: `docs/security-reviews/service-scope-flip-route-inventory-2026-08.md`.
 
-**The per-file `deny_service_scoped_*`/`deny_fleet_wide_service_scoped` helpers are now a SECOND, largely-redundant layer, not the primary defense.** For any route that also calls `require_permission`/`require_scoped_permission` (the vast majority), the flip above already denies a service-scoped token structurally — five of the seven original in-handler deny sites (`list_schedules`, `get_dex_signal_detail`, `list_dex_perf_devices`, `compare_app_perf_versions`, `list_network_devices`) are still double-denies, kept for now and scheduled for Phase 2 retirement. Two are retired: `query_installed_software`'s in the first Phase 2 migration (below), and `get_dex_group_app_perf`'s in #3290 Phase 2 bucket 1a — both were provably dead (fired after their route's own `perm_fn`), unlike the five that remain, which are live-but-redundant (their deny fires BEFORE `perm_fn`, so retiring them changes the observable response, not just deletes unreachable code — a different, more cautious backlog item). Same bucket-1a pass also retired `deny_service_scoped_schedule` (`schedule_routes.{hpp,cpp}`) entirely — its four call sites (`schedule.create`/`.list`/`.delete`/`.enable`) all fired after their route's own `require_permission`. The remaining per-file helpers (below) stay in place; they remain load-bearing **only** for routes with no other RBAC gate call at all (the §3e class above) — `EXTEND the pattern, do not fork a new copy` still applies to *that* subset. Current call sites, including this PR's additions: `deny_service_scoped_`/`deny_service_scoped_mutation_` (`guardian_routes.{hpp,cpp}`), `deny_service_scoped_` (`dex_routes.{hpp,cpp}`, `deployment_routes.{hpp,cpp}`, `preflight_routes.{hpp,cpp}`, and the new `compliance_routes.{hpp,cpp}`), `deny_service_scoped_schedule_list` + the new `deny_service_scoped_scope_estimate` (both local lambdas in `workflow_routes.cpp`), the shared `deny_fleet_wide_service_scoped` lambda in `rest_api_v1.cpp` (now covering the result-set REST family too) and `mcp_server.cpp`, the new `AuthRoutes::deny_service_scoped_session` (`server.cpp`'s shared gate for its own gate-less routes), plus inline checks in `device_routes.cpp` / `network_routes.cpp` / `inventory_routes.cpp` / `tar_tree_routes.cpp`.
+**The per-file `deny_service_scoped_*`/`deny_fleet_wide_service_scoped` helpers are now a SECOND, largely-redundant layer, not the primary defense.** For any route that also calls `require_permission`/`require_scoped_permission` (the vast majority), the flip above already denies a service-scoped token structurally — four of the remaining original in-handler deny sites (`list_schedules`, `list_dex_perf_devices`, `compare_app_perf_versions`, `list_network_devices`) are still double-denies, kept for now and scheduled for Phase 2 retirement. Two are retired: `query_installed_software`'s in the first Phase 2 migration (below) and `get_dex_group_app_perf`'s in #3290 Phase 2 bucket 1a (both were provably dead, fired after their route's own `perm_fn`). A THIRD group — `GET /api/v1/dex/signals/{obs_type}`+`GET /api/v1/dex/app`+`GET /api/v1/dex/overview` (REST) and their MCP twins `get_dex_signal_detail`/`get_dex_app`/`get_dex_overview` — stays on `perm_fn` + `deny_fleet_wide_service_scoped` (WS-A4 PR-1): these three routes' fields are all fleet-wide aggregates not yet confined per caller (ADR-0017 INV-3), so they stay global-only rather than moving onto `AuthRoutes::require_fleet_read` — see `docs/presentation-core-split-delivery-matrix.md`'s WS-A4 row; their `deny_fleet_wide_service_scoped` call sites are therefore LIVE again, fired BEFORE `perm_fn`/`tier_allows`, same class as the four sites below. The four sites that remain are live-but-redundant (their deny fires BEFORE `perm_fn`, so retiring them changes the observable response, not just deletes unreachable code — a different, more cautious backlog item). Same bucket-1a pass also retired `deny_service_scoped_schedule` (`schedule_routes.{hpp,cpp}`) entirely — its four call sites (`schedule.create`/`.list`/`.delete`/`.enable`) all fired after their route's own `require_permission`. The remaining per-file helpers (below) stay in place; they remain load-bearing **only** for routes with no other RBAC gate call at all (the §3e class above) — `EXTEND the pattern, do not fork a new copy` still applies to *that* subset. Current call sites, including this PR's additions: `deny_service_scoped_`/`deny_service_scoped_mutation_` (`guardian_routes.{hpp,cpp}`), `deny_service_scoped_` (`dex_routes.{hpp,cpp}`, `deployment_routes.{hpp,cpp}`, `preflight_routes.{hpp,cpp}`, and the new `compliance_routes.{hpp,cpp}`), `deny_service_scoped_schedule_list` + the new `deny_service_scoped_scope_estimate` (both local lambdas in `workflow_routes.cpp`), the shared `deny_fleet_wide_service_scoped` lambda in `rest_api_v1.cpp` (now covering the result-set REST family too) and `mcp_server.cpp`, the new `AuthRoutes::deny_service_scoped_session` (`server.cpp`'s shared gate for its own gate-less routes), plus inline checks in `device_routes.cpp` / `network_routes.cpp` / `inventory_routes.cpp` / `tar_tree_routes.cpp`.
 
 **Phase 2 progress (#3290).** The first migration landed: `GET /api/v1/inventory/software` + its MCP twin `query_installed_software` are now on `require_fleet_read` — both surfaces' `deny_fleet_wide_service_scoped`/blanket-deny call sites are retired for this tool pair (the REST call was already provably dead, firing after `perm_fn`; the MCP call was live and is now gone). `require_fleet_read` itself gained the elevated/engine/mcp_tier caller-class branches it was missing at Phase 0 (mirroring `require_list_read`'s ladder — see its own doc comment). Prioritization for this and future migrations is **documented reasoning, not the metric** — no production fleet exists yet, so `yuzu_auth_service_scope_default_denied_total` has no real traffic to rank by; the criterion-1 substitute and the ranked backlog live in `docs/security-reviews/service-scope-phase2-migrations-2026-08.md`. The §3d `authorize_list_read` supersede→intersect migration (below) is a separate, not-yet-started stream.
 
@@ -3040,7 +3041,15 @@ unfiltered.**
    its 4 call sites (each already passed a correctly-typed permission per operation — the defect was
    unactionability, not a wrong permission TYPE, a claim the routed row previously made in error), and
    the inline checks in `device_routes.cpp`/`network_routes.cpp`/`inventory_routes.cpp` (×2)/
-   `tar_tree_routes.cpp` (×2).
+   `tar_tree_routes.cpp` (×2). #5047 added `AuthRoutes::require_tier_policy`'s
+   `actionable_permission` parameter — a THIRD shape, not a fourth call-site-by-call-site migration:
+   a single production factory, `AuthRoutes::gateless_tier_policy_fn()`, is the ONE place all 8
+   gate-less-route call sites (the 4 result-set REST write routes plus their 4 dashboard-fragment
+   twins) source their `TierPolicyFn` from, with `actionable_permission=false` baked in there once —
+   `require_permission`'s own call (RBAC-gated, the grant WOULD admit the caller) passes `true`
+   explicitly at its one call site. `actionable_permission` deliberately carries no default value,
+   so a future 9th gate-less caller cannot inherit `true` by omission the way the original violation
+   this clause exists to prevent did.
 
    **One known, tracked exception, not retroactively bound:** pre-existing
    `deny_fleet_wide_service_scoped` call sites that fire AFTER the route's own `perm_fn` already
@@ -3048,8 +3057,11 @@ unfiltered.**
    demonstrably already has — a different, informational claim. `GET /api/v1/inventory/software` no
    longer illustrates this (#3290 retired its after-gate deny entirely, migrating the route onto
    `require_fleet_read`). **NO LIVE EXAMPLE CURRENTLY EXISTS:** an exhaustive check of every remaining
-   `deny_fleet_wide_service_scoped` call site — all 20 in `rest_api_v1.cpp` and, as of #3290 Phase 2
-   bucket 1a, all 5 remaining in `mcp_server.cpp` — found every REST site fires BEFORE its route's
+   `deny_fleet_wide_service_scoped` call site — 27 in `rest_api_v1.cpp` and 14 in `mcp_server.cpp`
+   (live counts measured by grep `deny_fleet_wide_service_scoped(` against each file, excluding the
+   shared lambda's own definition and comment mentions — these counts drift as routes are added or
+   migrated onto `require_fleet_read`, and are not a maintained invariant) — found every REST site
+   fires BEFORE its route's
    `perm_fn`, not after (see `docs/security-reviews/service-scope-phase2-migrations-2026-08.md`'s
    migration checklist). `deny_service_scoped_schedule` (previously 4 sites, `permission` param
    defaulting empty) and the one MCP site whose surrounding `perm_fn` fired first
@@ -3522,7 +3534,7 @@ this section does not restate them.
 - **Tier 1 (manual approval)** — agents without a token enter a pending queue; admin approves/denies via Settings page. Agents retry and are accepted once approved.
 - **Tier 2 (pre-shared tokens)** — admin generates time/use-limited enrollment tokens via the dashboard; agents pass `--enrollment-token <token>` at startup for auto-enrollment.
 - **Tier 3 (platform trust)** — proto fields reserved (`machine_certificate`, `attestation_signature`, `attestation_provider`) for future Windows cert store / cloud attestation enrollment.
-- **Enrollment token persistence** — tokens stored in `enrollment-tokens.cfg`, pending agents in `pending-agents.cfg` (same directory as `yuzu-server.cfg`).
+- **Enrollment token persistence** — Postgres-authoritative since HA WS-6 6.2 (`auth.enrollment_tokens` / `auth.pending_agents`, shared by every server replica), not per-replica `.cfg` files. `AuthManager`'s file mode is deleted, not deprecated: `consume_and_enroll` is a single guarded-UPDATE transaction (exactly-N winners across pooled connections AND across separate server processes — a max_uses=1 token race never double-accepts), and every enrollment/pending call fails CLOSED with no `AuthDB` attached. A pre-6.2 install's `enrollment-tokens.cfg` / `pending-agents.cfg` are imported exactly once, at the first 6.2 boot, under a per-file content-fingerprint marker (`auth.import_meta`) that never resurrects an already-removed/denied/revoked row and refuses (never merges) a mismatched-fingerprint file; see `docs/adr/2002-high-availability-architecture.md` §8.
 - **Agent `--enrollment-token` CLI flag** — passes token in `RegisterRequest.enrollment_token`.
 
 ## Per-session peer binding and NAT-aware relaxation
@@ -3874,11 +3886,15 @@ operator sessions (HA WS-1/1a, ADR-2002 §4)") and `auth_kv`
 see "Storage" under SCIM v2 provisioning above.
 
 **This was a fresh-start cutover — NOT a backfill.** On first boot against a
-Postgres database whose `auth.users` table is empty, `main.cpp` seeds
-exactly the config-file admin via `AuthDB::seed_admin_if_empty` (a single
-`INSERT ... SELECT ... WHERE NOT EXISTS`, TOCTOU-free against a second
-instance racing first boot) and logs a loud "AUTH DATA RESET ON POSTGRES
-CUTOVER" warning. **A legacy SQLite `auth.db` is never read** — any prior
+Postgres database whose `auth.users` table is empty, `main.cpp` seeds the
+config-file admin AND grants it a durable fleet-wide Administrator role, in
+one transaction, via `RbacStore::provision_first_admin` (docs/adr/1008-rbac-management-groups-target-architecture.md,
+"Delivery note (fresh-install bootstrap)") — `AuthDB::seed_admin_if_empty`'s
+own `INSERT ... SELECT ... WHERE NOT EXISTS` is the same TOCTOU-free shape
+but is no longer called in production at all (a redundant second call was
+removed; it stays exported for its own tests) — and logs a loud "RBAC
+BOOTSTRAP" warning plus a durable `rbac.bootstrap.first_admin` audit row.
+**A legacy SQLite `auth.db` is never read** — any prior
 local accounts, roles, and MFA enrollments that existed only in a pre-cutover
 `auth.db` are gone on upgrade; SCIM self-heals on the IdP's next sync cycle;
 humans re-enroll MFA. This is a breaking upgrade by design, matching the

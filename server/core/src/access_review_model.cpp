@@ -281,13 +281,20 @@ std::string csv_join_roles(const std::vector<std::string>& roles) {
 
 } // namespace
 
-std::string to_csv(const std::vector<AccessReviewRow>& rows) {
+std::string to_csv(const std::vector<AccessReviewRow>& rows, const std::string& rbac_enforcement) {
     std::ostringstream ss;
     // Locale-independent numeric formatting (cpp-expert NICE): under a
     // grouping locale (e.g. "de_DE"), the default-imbued stream would emit
     // thousands separators into effective_permission_count/last_activity_ms
     // — corrupting the CSV's numeric columns for any downstream parser.
     ss.imbue(std::locale::classic());
+    // A3 (RBAC delivery plan): unconditional leading metadata line — present
+    // even for an empty `rows` population, so "no grants" is never ambiguous
+    // with "the stamp was omitted". Emitted verbatim: `rbac_enforcement` is
+    // always one of the three fixed literals the caller derived via
+    // `access_review_rbac_enforcement()`, never externally influenced, so
+    // csv_field's RFC-4180/CWE-1236 handling does not apply here.
+    ss << "# rbac_enforcement=" << rbac_enforcement << "\r\n";
     ss << "principal_type,principal_id,display_name,owner_or_email,roles,"
           "effective_permission_count,last_activity_ms,last_activity_kind,"
           "classification,lifecycle_state,source\r\n";
@@ -300,6 +307,10 @@ std::string to_csv(const std::vector<AccessReviewRow>& rows) {
            << csv_field(r.source) << "\r\n";
     }
     return ss.str();
+}
+
+std::string access_review_rbac_enforcement(const RbacStore* rbac) {
+    return std::string(to_string(rbac_enforcement_label(rbac)));
 }
 
 } // namespace yuzu::server

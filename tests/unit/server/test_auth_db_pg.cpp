@@ -34,6 +34,7 @@
 
 #include <libpq-fe.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <stdexcept>
@@ -597,62 +598,600 @@ TEST_CASE("AuthDB find_reserved_prefix_users scans active and soft-deleted rows"
     CHECK_FALSE(guarded.has_value());
 }
 
-// ── enrollment tokens ──────────────────────────────────────────────────────
+// ── enrollment tokens + pending agents (WS-6 slice 6.2) ─────────────────────
 
-TEST_CASE("AuthDB enrollment token lifecycle", "[pg][auth_db]") {
-    YUZU_REQUIRE_PG_DB_TPL(db, auth_db_tpl);
-    Harness h{db.dsn()};
+namespace {
 
-    auto token = h.db.create_enrollment_token("admin", std::chrono::seconds(3600));
-    REQUIRE(token.has_value());
-    CHECK_FALSE(token->empty());
+using yuzu::server::StoreError;
+using CEK = yuzu::server::AuthDB::ConsumeEnrollResult::Kind;
+using yuzu::server::auth::EnrollmentTokenError;
+using yuzu::server::auth::PendingAgent;
+using yuzu::server::auth::PendingStatus;
+using yuzu::server::auth::RemovePendingOutcome;
 
-    CHECK(h.db.validate_enrollment_token(*token).value());
-    auto consumed = h.db.consume_enrollment_token(*token, "agent-1");
-    REQUIRE(consumed.has_value());
-    CHECK(*consumed == true);
-
-    // Reuse is rejected — already consumed.
-    CHECK_FALSE(h.db.validate_enrollment_token(*token).value());
-    auto second = h.db.consume_enrollment_token(*token, "agent-2");
-    REQUIRE(second.has_value());
-    CHECK(*second == false);
-
-    CHECK_FALSE(h.db.validate_enrollment_token("not-a-real-token").value());
+PendingAgent mk_agent(const std::string& id, const std::string& host = "host") {
+    PendingAgent a;
+    a.agent_id = id;
+    a.hostname = host;
+    a.os = "linux";
+    a.arch = "x86_64";
+    a.agent_version = "1.0.0";
+    a.status = PendingStatus::pending;
+    return a;
 }
 
-// ── pending agents ─────────────────────────────────────────────────────────
+/// Runs one param-less/param'd statement on the harness' side connection and
+/// returns the first cell ("" for NULL / no rows).
+std::string scalar(PGconn* conn, const char* sql, const std::vector<std::string>& params = {}) {
+    std::vector<const char*> v;
+    for (const auto& p : params)
+        v.push_back(p.c_str());
+    PgResult res{PQexecParams(conn, sql, static_cast<int>(v.size()), nullptr,
+                              v.empty() ? nullptr : v.data(), nullptr, nullptr, 0)};
+    REQUIRE(res.status() == PGRES_TUPLES_OK);
+    if (PQntuples(res.get()) == 0 || PQgetisnull(res.get(), 0, 0))
+        return {};
+    return PQgetvalue(res.get(), 0, 0);
+}
 
-TEST_CASE("AuthDB pending agent approve/reject", "[pg][auth_db]") {
+std::string make_token(AuthDB& db, int max_uses, std::chrono::seconds ttl = std::chrono::seconds(3600),
+                       const std::string& label = "t") {
+    auto t = db.create_token(label, max_uses, ttl, "admin");
+    REQUIRE(t.has_value());
+    return t->raw_token;
+}
+
+} // namespace
+
+TEST_CASE("AuthDB enrollment token lifecycle: create, consume, exhaust, list", "[pg][auth_db][enrollment]") {
     YUZU_REQUIRE_PG_DB_TPL(db, auth_db_tpl);
     Harness h{db.dsn()};
 
-    yuzu::server::auth::PendingAgent agent;
-    agent.agent_id = "agent-xyz";
-    agent.hostname = "host1";
-    agent.os = "linux";
-    agent.arch = "x86_64";
-    agent.agent_version = "1.0.0";
-    REQUIRE(h.db.add_pending_agent(agent).has_value());
+    auto created = h.db.create_token("NYC rollout", 1, std::chrono::seconds(3600), "admin");
+    REQUIRE(created.has_value());
+    CHECK(created->raw_token.size() == 64);
+    CHECK(created->token_id.size() == 8);
 
-    auto pending = h.db.list_pending_agents();
-    REQUIRE(pending.has_value());
-    REQUIRE(pending->size() == 1);
-    CHECK((*pending)[0].agent_id == "agent-xyz");
+    // Only the hash is stored — never the raw token.
+    CHECK(scalar(h.conn.get(), "SELECT count(*) FROM auth.enrollment_tokens WHERE token_hash = $1",
+                 {created->raw_token}) == "0");
 
-    REQUIRE(h.db.approve_agent("agent-xyz", "admin").has_value());
-    auto after_approve = h.db.list_pending_agents();
-    REQUIRE(after_approve.has_value());
-    CHECK(after_approve->empty()); // no longer 'pending'
+    auto first = h.db.consume_and_enroll(created->raw_token, "agent-1", "host1", "linux", "x86_64", "1.0");
+    REQUIRE(first.has_value());
+    REQUIRE(first->kind == CEK::enrolled);
+    CHECK(first->claim.token_id == created->token_id);
+    CHECK(first->claim.max_uses == 1);
+    CHECK(first->claim.use_count_after == 1);
+    CHECK(first->claim.single_use);
 
-    yuzu::server::auth::PendingAgent agent2;
-    agent2.agent_id = "agent-abc";
-    agent2.hostname = "host2";
-    REQUIRE(h.db.add_pending_agent(agent2).has_value());
-    REQUIRE(h.db.reject_agent("agent-abc").has_value());
-    auto after_reject = h.db.list_pending_agents();
-    REQUIRE(after_reject.has_value());
-    CHECK(after_reject->empty());
+    auto st = h.db.pending_status("agent-1");
+    REQUIRE(st.has_value());
+    REQUIRE(st->has_value());
+    CHECK(**st == PendingStatus::approved);
+    CHECK(scalar(h.conn.get(), "SELECT status_changed_by FROM auth.pending_agents WHERE agent_id='agent-1'") ==
+          "token:" + created->token_id);
+
+    // Exhausted: classified already_consumed and names the winner.
+    auto second = h.db.consume_and_enroll(created->raw_token, "agent-2", "host2", "linux", "x86_64", "1.0");
+    REQUIRE(second.has_value());
+    CHECK(second->kind == CEK::token_rejected);
+    CHECK(second->token_error == EnrollmentTokenError::already_consumed);
+    CHECK(second->already_consumed_by == "agent-1");
+    // The loser was NOT enrolled.
+    auto st2 = h.db.pending_status("agent-2");
+    REQUIRE(st2.has_value());
+    CHECK_FALSE(st2->has_value());
+
+    auto tokens = h.db.list_tokens();
+    REQUIRE(tokens.has_value());
+    REQUIRE(tokens->size() == 1);
+    CHECK((*tokens)[0].label == "NYC rollout");
+    CHECK((*tokens)[0].use_count == 1);
+    CHECK((*tokens)[0].last_consumed_by_agent_id == "agent-1");
+    CHECK_FALSE((*tokens)[0].revoked);
+    CHECK((*tokens)[0].expires_at > std::chrono::system_clock::now());
+}
+
+TEST_CASE("AuthDB enrollment token: unlimited uses and never-expires", "[pg][auth_db][enrollment]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, auth_db_tpl);
+    Harness h{db.dsn()};
+    auto created = h.db.create_token("forever", 0, std::chrono::seconds(0), "admin");
+    REQUIRE(created.has_value());
+    for (int i = 0; i < 5; ++i) {
+        auto r = h.db.consume_and_enroll(created->raw_token, "a" + std::to_string(i), "h", "", "", "");
+        REQUIRE(r.has_value());
+        CHECK(r->kind == CEK::enrolled);
+        CHECK_FALSE(r->claim.single_use);
+    }
+    auto tokens = h.db.list_tokens();
+    REQUIRE(tokens.has_value());
+    CHECK((*tokens)[0].use_count == 5);
+    CHECK((*tokens)[0].expires_at == (std::chrono::system_clock::time_point::max)());
+    CHECK(scalar(h.conn.get(), "SELECT expires_at IS NULL FROM auth.enrollment_tokens") == "t");
+}
+
+TEST_CASE("AuthDB consume_and_enroll classifies each miss reason", "[pg][auth_db][enrollment]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, auth_db_tpl);
+    Harness h{db.dsn()};
+
+    // not_found
+    auto nf = h.db.consume_and_enroll(std::string(64, 'a'), "agent-x", "h", "", "", "");
+    REQUIRE(nf.has_value());
+    CHECK(nf->kind == CEK::token_rejected);
+    CHECK(nf->token_error == EnrollmentTokenError::not_found);
+
+    // revoked
+    auto rev = h.db.create_token("r", 1, std::chrono::seconds(3600), "admin");
+    REQUIRE(rev.has_value());
+    CHECK(h.db.revoke_token(rev->token_id).value());
+    CHECK(h.db.revoke_token(rev->token_id).value()); // idempotent
+    CHECK_FALSE(h.db.revoke_token("deadbeef").value());
+    auto r1 = h.db.consume_and_enroll(rev->raw_token, "agent-r", "h", "", "", "");
+    REQUIRE(r1.has_value());
+    CHECK(r1->token_error == EnrollmentTokenError::revoked);
+
+    // expired — evaluated by the DB clock in SQL: push expires_at into the PG past.
+    auto exp = h.db.create_token("e", 1, std::chrono::seconds(3600), "admin");
+    REQUIRE(exp.has_value());
+    scalar(h.conn.get(),
+           "WITH u AS (UPDATE auth.enrollment_tokens SET expires_at = now() - interval '1 second' "
+           "WHERE token_id = $1 RETURNING 1) SELECT count(*) FROM u",
+           {exp->token_id});
+    auto e1 = h.db.consume_and_enroll(exp->raw_token, "agent-e", "h", "", "", "");
+    REQUIRE(e1.has_value());
+    CHECK(e1->kind == CEK::token_rejected);
+    CHECK(e1->token_error == EnrollmentTokenError::expired);
+
+    // No miss enrolled anyone.
+    auto all = h.db.list_pending();
+    REQUIRE(all.has_value());
+    CHECK(all->empty());
+}
+
+TEST_CASE("AuthDB consume_and_enroll: admin-denied agent rolls the token use back",
+          "[pg][auth_db][enrollment]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, auth_db_tpl);
+    Harness h{db.dsn()};
+
+    auto tok = h.db.create_token("t", 1, std::chrono::seconds(3600), "admin");
+    REQUIRE(tok.has_value());
+    REQUIRE(h.db.add_pending(mk_agent("evil")).value());
+    REQUIRE(h.db.deny_pending("evil", "alice").value());
+
+    // An attempted removal of the denied row is REFUSED (Fix 1) — the denial
+    // holds, so the token below still cannot re-enroll the agent.
+    CHECK(h.db.remove_pending("evil").value() == RemovePendingOutcome::wrong_status);
+    CHECK(**h.db.pending_status("evil") == PendingStatus::denied);
+
+    auto r = h.db.consume_and_enroll(tok->raw_token, "evil", "h", "", "", "");
+    REQUIRE(r.has_value());
+    CHECK(r->kind == CEK::admin_denied);
+
+    // ROLLBACK, not a refund: use_count and last_consumer are exactly as created.
+    auto tokens = h.db.list_tokens();
+    REQUIRE(tokens.has_value());
+    CHECK((*tokens)[0].use_count == 0);
+    CHECK((*tokens)[0].last_consumed_by_agent_id.empty());
+    CHECK(scalar(h.conn.get(), "SELECT last_used_at IS NULL FROM auth.enrollment_tokens") == "t");
+    // The denied row stays denied.
+    CHECK(**h.db.pending_status("evil") == PendingStatus::denied);
+
+    // The single use is still available to a legitimate agent.
+    auto ok = h.db.consume_and_enroll(tok->raw_token, "good", "h", "", "", "");
+    REQUIRE(ok.has_value());
+    CHECK(ok->kind == CEK::enrolled);
+}
+
+namespace {
+/// Fires `threads` concurrent consume_and_enroll calls (each its own agent_id and
+/// its own pooled connection) at ONE token and returns {enrolled, rejected, other}.
+struct RaceTally {
+    int enrolled{0};
+    int rejected{0};
+    int other{0};
+};
+RaceTally race(AuthDB& db, const std::string& raw, int threads) {
+    std::atomic<bool> go{false};
+    std::vector<int> outcome(static_cast<std::size_t>(threads), -1);
+    std::vector<std::thread> pool;
+    for (int i = 0; i < threads; ++i) {
+        pool.emplace_back([&, i] {
+            while (!go.load()) {
+                std::this_thread::yield();
+            }
+            auto r = db.consume_and_enroll(raw, "race-" + std::to_string(i), "h", "", "", "");
+            outcome[static_cast<std::size_t>(i)] =
+                !r.has_value() ? 2 : (r->kind == CEK::enrolled ? 0 : 1);
+        });
+    }
+    go.store(true);
+    for (auto& t : pool)
+        t.join();
+    RaceTally t;
+    for (int o : outcome)
+        (o == 0 ? t.enrolled : o == 1 ? t.rejected : t.other)++;
+    return t;
+}
+} // namespace
+
+TEST_CASE("AuthDB consume_and_enroll: exactly one winner for max_uses=1 across connections",
+          "[pg][auth_db][enrollment][concurrency]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, auth_db_tpl);
+    yuzu::test::TempDir keys;
+    FileKeyProvider provider(keys.path);
+    SecretCodec codec(provider);
+    PgConn conn = connect(db.dsn());
+    REQUIRE(codec.init(conn.get()).has_value());
+    PgPool pool{PgPool::Options{.conninfo = db.dsn(), .size = 16}};
+    AuthDB adb(pool, codec);
+    REQUIRE(adb.is_open());
+
+    const std::string raw = make_token(adb, 1);
+    const auto t = race(adb, raw, 16);
+    CHECK(t.other == 0);
+    CHECK(t.enrolled == 1);
+    CHECK(t.rejected == 15);
+    CHECK(adb.list_tokens().value()[0].use_count == 1);
+    CHECK(adb.list_pending(PendingStatus::approved).value().size() == 1);
+}
+
+TEST_CASE("AuthDB consume_and_enroll: exactly N winners for max_uses=N across connections",
+          "[pg][auth_db][enrollment][concurrency]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, auth_db_tpl);
+    yuzu::test::TempDir keys;
+    FileKeyProvider provider(keys.path);
+    SecretCodec codec(provider);
+    PgConn conn = connect(db.dsn());
+    REQUIRE(codec.init(conn.get()).has_value());
+    PgPool pool{PgPool::Options{.conninfo = db.dsn(), .size = 16}};
+    AuthDB adb(pool, codec);
+    REQUIRE(adb.is_open());
+
+    const std::string raw = make_token(adb, 5);
+    const auto t = race(adb, raw, 16);
+    CHECK(t.other == 0);
+    CHECK(t.enrolled == 5);
+    CHECK(t.rejected == 11);
+    CHECK(adb.list_tokens().value()[0].use_count == 5);
+    CHECK(adb.list_pending(PendingStatus::approved).value().size() == 5);
+}
+
+TEST_CASE("AuthDB create_token regenerates on a token_id collision, never overwriting",
+          "[pg][auth_db][enrollment]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, auth_db_tpl);
+    Harness h{db.dsn()};
+
+    const std::vector<std::uint8_t> fixed(32, 0x11);
+    const std::vector<std::uint8_t> other(32, 0x22);
+    auto a = h.db.create_token_with_entropy("first", 3, std::chrono::seconds(60), "admin",
+                                            [&] { return fixed; });
+    REQUIRE(a.has_value());
+
+    // Second call is handed the SAME entropy first (=> identical hash/token_id,
+    // a 23505), then fresh entropy: it must regenerate, not fail and not clobber.
+    int calls = 0;
+    auto b = h.db.create_token_with_entropy("second", 7, std::chrono::seconds(60), "admin", [&] {
+        return (calls++ == 0) ? fixed : other;
+    });
+    REQUIRE(b.has_value());
+    CHECK(calls == 2);
+    CHECK(b->raw_token != a->raw_token);
+    CHECK(b->token_id != a->token_id);
+
+    auto tokens = h.db.list_tokens();
+    REQUIRE(tokens.has_value());
+    REQUIRE(tokens->size() == 2);
+    for (const auto& t : *tokens) {
+        if (t.token_id == a->token_id) {
+            CHECK(t.label == "first");
+            CHECK(t.max_uses == 3);
+        } else {
+            CHECK(t.label == "second");
+            CHECK(t.max_uses == 7);
+        }
+    }
+
+    // Persistent collision (entropy never changes) fails closed after bounded attempts.
+    auto c = h.db.create_token_with_entropy("third", 1, std::chrono::seconds(60), "admin",
+                                            [&] { return fixed; });
+    REQUIRE_FALSE(c.has_value());
+    CHECK(c.error() == StoreError::QueryFailed);
+    CHECK(h.db.list_tokens().value().size() == 2);
+}
+
+TEST_CASE("AuthDB enrollment store rejects out-of-bounds input", "[pg][auth_db][enrollment]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, auth_db_tpl);
+    Harness h{db.dsn()};
+    const auto secs = std::chrono::seconds(60);
+    const std::string nul{"a\0b", 3};
+    const std::string big(yuzu::server::AuthDB::kMaxEnrollmentTextLength + 1, 'x');
+
+    auto bad = [](const auto& r) { return !r.has_value() && r.error() == StoreError::InvalidInput; };
+    CHECK(bad(h.db.create_token(nul, 1, secs, "admin")));
+    CHECK(bad(h.db.create_token(big, 1, secs, "admin")));
+    CHECK(bad(h.db.create_token("l", -1, secs, "admin")));
+    CHECK(bad(h.db.create_token("l", 1, std::chrono::seconds(-1), "admin")));
+    CHECK(bad(h.db.create_token("l", 1, std::chrono::seconds(yuzu::server::AuthDB::kMaxEnrollmentTtlSeconds + 1), "admin")));
+    CHECK(bad(h.db.create_token("l", 1, secs, "")));
+
+    const std::string tok(64, 'a');
+    CHECK(bad(h.db.consume_and_enroll("", "a", "h", "", "", "")));
+    CHECK(bad(h.db.consume_and_enroll(std::string(300, 'a'), "a", "h", "", "", "")));
+    CHECK(bad(h.db.consume_and_enroll(std::string{"ab\0cd", 5}, "a", "h", "", "", "")));
+    CHECK(bad(h.db.consume_and_enroll(tok, "", "h", "", "", "")));
+    CHECK(bad(h.db.consume_and_enroll(tok, std::string(yuzu::server::auth::kMaxAgentIdLength + 1, 'a'), "h", "", "", "")));
+    CHECK(bad(h.db.consume_and_enroll(tok, nul, "h", "", "", "")));
+    CHECK(bad(h.db.consume_and_enroll(tok, "a", nul, "", "", "")));
+    CHECK(bad(h.db.consume_and_enroll(tok, "a", "h", big, "", "")));
+    CHECK(bad(h.db.add_pending(mk_agent("a", nul))));
+    CHECK(bad(h.db.add_pending(mk_agent(""))));
+    CHECK(bad(h.db.pending_status(nul)));
+    CHECK(bad(h.db.approve_pending("a", "")));
+    CHECK(bad(h.db.deny_pending("a", nul)));
+    CHECK(bad(h.db.approve_all_pending("")));
+    CHECK(bad(h.db.remove_pending("")));
+    CHECK(bad(h.db.revoke_token("")));
+
+    // agent_id charset (Fix 3, #compliance-officer Finding 2 / UP-3): a comma
+    // would corrupt the comma-joined bulk_audit_detail list; \n/\r could forge
+    // additional lines in a plain-string audit detail. Rejected everywhere
+    // agent_id reaches the store, not just at one call site.
+    CHECK(bad(h.db.add_pending(mk_agent("agent,evil"))));
+    CHECK(bad(h.db.add_pending(mk_agent("agent\nevil"))));
+    CHECK(bad(h.db.add_pending(mk_agent("agent\revil"))));
+    CHECK(bad(h.db.pending_status("agent,evil")));
+    CHECK(bad(h.db.approve_pending("agent,evil", "alice")));
+    CHECK(bad(h.db.deny_pending("agent\nevil", "alice")));
+    CHECK(bad(h.db.remove_pending("agent,evil")));
+    CHECK(bad(h.db.consume_and_enroll(tok, "agent,evil", "h", "", "", "")));
+    CHECK(bad(h.db.consume_and_enroll(tok, "agent\nevil", "h", "", "", "")));
+
+    // Legitimate agent_id shapes (UUID, hostname-derived with dots/hyphens)
+    // still pass — the guard is not over-restrictive.
+    REQUIRE(h.db.add_pending(mk_agent("550e8400-e29b-41d4-a716-446655440000")).value());
+    REQUIRE(h.db.add_pending(mk_agent("host-01.example.com")).value());
+
+    // None of the rejected calls reached the tables (beyond the two valid
+    // adds just made above).
+    CHECK(h.db.list_tokens().value().empty());
+    CHECK(h.db.list_pending().value().size() == 2);
+}
+
+TEST_CASE("AuthDB pending agents: add, five-state lookup, approve/deny/remove, ensure_enrolled",
+          "[pg][auth_db][enrollment]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, auth_db_tpl);
+    Harness h{db.dsn()};
+
+    // absent
+    auto none = h.db.pending_status("agent-xyz");
+    REQUIRE(none.has_value());
+    CHECK_FALSE(none->has_value());
+
+    // add_pending: newly-added bool
+    CHECK(h.db.add_pending(mk_agent("agent-xyz", "host1")).value() == true);
+    CHECK(h.db.add_pending(mk_agent("agent-xyz", "OTHER")).value() == false); // unchanged
+    CHECK(scalar(h.conn.get(), "SELECT hostname FROM auth.pending_agents WHERE agent_id='agent-xyz'") == "host1");
+    CHECK(**h.db.pending_status("agent-xyz") == PendingStatus::pending);
+
+    // approve records the principal
+    CHECK(h.db.approve_pending("agent-xyz", "alice").value());
+    CHECK(**h.db.pending_status("agent-xyz") == PendingStatus::approved);
+    CHECK(scalar(h.conn.get(), "SELECT status_changed_by FROM auth.pending_agents WHERE agent_id='agent-xyz'") == "alice");
+    CHECK_FALSE(h.db.approve_pending("ghost", "alice").value());
+
+    // deny
+    REQUIRE(h.db.add_pending(mk_agent("agent-abc", "host2")).value());
+    CHECK(h.db.deny_pending("agent-abc", "bob").value());
+    CHECK(**h.db.pending_status("agent-abc") == PendingStatus::denied);
+    CHECK_FALSE(h.db.deny_pending("ghost", "bob").value());
+
+    // list + filter (newest first, status carried)
+    auto all = h.db.list_pending();
+    REQUIRE(all.has_value());
+    CHECK(all->size() == 2);
+    auto only_denied = h.db.list_pending(PendingStatus::denied);
+    REQUIRE(only_denied.has_value());
+    REQUIRE(only_denied->size() == 1);
+    CHECK((*only_denied)[0].agent_id == "agent-abc");
+    CHECK((*only_denied)[0].hostname == "host2");
+    CHECK((*only_denied)[0].status == PendingStatus::denied);
+    CHECK(h.db.list_pending(PendingStatus::pending).value().empty());
+
+    // ensure_enrolled: never overrides a denial; upserts otherwise; keeps the existing row's metadata.
+    CHECK_FALSE(h.db.ensure_enrolled(mk_agent("agent-abc"), "system").value());
+    CHECK(**h.db.pending_status("agent-abc") == PendingStatus::denied);
+    CHECK(h.db.ensure_enrolled(mk_agent("brand-new", "hN"), "system").value());
+    CHECK(**h.db.pending_status("brand-new") == PendingStatus::approved);
+    REQUIRE(h.db.add_pending(mk_agent("was-pending", "hP")).value());
+    CHECK(h.db.ensure_enrolled(mk_agent("was-pending", "IGNORED"), "system").value());
+    CHECK(**h.db.pending_status("was-pending") == PendingStatus::approved);
+    CHECK(scalar(h.conn.get(), "SELECT hostname FROM auth.pending_agents WHERE agent_id='was-pending'") == "hP");
+
+    // remove: hard delete, but ONLY a still-`pending` row.
+    REQUIRE(h.db.add_pending(mk_agent("to-remove", "hR")).value());
+    CHECK(h.db.remove_pending("to-remove").value() == RemovePendingOutcome::removed);
+    CHECK(h.db.remove_pending("to-remove").value() == RemovePendingOutcome::not_found);
+    CHECK_FALSE(h.db.pending_status("to-remove").value().has_value());
+
+    // remove REFUSES a denied row — the denial holds, no silent reversal
+    // (governance Finding 1: removing it would delete the very guard
+    // kEnrollUpsertSql's `WHERE status <> 'denied'` depends on).
+    CHECK(h.db.remove_pending("agent-abc").value() == RemovePendingOutcome::wrong_status);
+    CHECK(**h.db.pending_status("agent-abc") == PendingStatus::denied);
+
+    // remove REFUSES an approved row too — no silent deregistration.
+    CHECK(h.db.remove_pending("agent-xyz").value() == RemovePendingOutcome::wrong_status);
+    CHECK(**h.db.pending_status("agent-xyz") == PendingStatus::approved);
+}
+
+TEST_CASE("AuthDB bulk approve/deny transitions only currently-pending rows",
+          "[pg][auth_db][enrollment]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, auth_db_tpl);
+    Harness h{db.dsn()};
+    for (const char* id : {"p1", "p2", "p3", "d1", "a1"})
+        REQUIRE(h.db.add_pending(mk_agent(id)).value());
+    REQUIRE(h.db.deny_pending("d1", "admin").value());
+    REQUIRE(h.db.approve_pending("a1", "admin").value());
+
+    auto approved = h.db.approve_all_pending("carol");
+    REQUIRE(approved.has_value());
+    std::sort(approved->begin(), approved->end());
+    CHECK(*approved == std::vector<std::string>{"p1", "p2", "p3"});
+    CHECK(**h.db.pending_status("d1") == PendingStatus::denied); // untouched
+    CHECK(scalar(h.conn.get(), "SELECT status_changed_by FROM auth.pending_agents WHERE agent_id='p2'") == "carol");
+    CHECK(h.db.approve_all_pending("carol").value().empty()); // nothing left
+
+    REQUIRE(h.db.add_pending(mk_agent("q1")).value());
+    REQUIRE(h.db.add_pending(mk_agent("q2")).value());
+    auto denied = h.db.deny_all_pending("dave");
+    REQUIRE(denied.has_value());
+    CHECK(denied->size() == 2);
+    CHECK(**h.db.pending_status("q1") == PendingStatus::denied);
+    CHECK(**h.db.pending_status("p1") == PendingStatus::approved); // earlier approvals untouched
+}
+
+TEST_CASE("AuthDB enrollment store degrade surfaces a typed error, never absent/empty",
+          "[pg][auth_db][enrollment]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, auth_db_tpl);
+    Harness h{db.dsn()};
+    REQUIRE(h.db.add_pending(mk_agent("agent-1")).value());
+
+    // Break the store underneath the live AuthDB (a query that RUNS and errors).
+    PgResult drop{PQexec(h.conn.get(), "DROP TABLE auth.pending_agents")};
+    REQUIRE(drop.ok());
+
+    auto st = h.db.pending_status("agent-1");
+    REQUIRE_FALSE(st.has_value()); // ERROR — not nullopt/"absent"
+    CHECK(st.error() == StoreError::QueryFailed);
+    CHECK(yuzu::server::is_store_unavailable(st.error()));
+    CHECK_FALSE(h.db.list_pending().has_value());
+    CHECK_FALSE(h.db.add_pending(mk_agent("agent-2")).has_value());
+    CHECK_FALSE(h.db.approve_all_pending("admin").has_value());
+
+    // A consume whose step 2 fails must not leave the use counted (txn rolled back).
+    auto tok = h.db.create_token("t", 1, std::chrono::seconds(60), "admin");
+    REQUIRE(tok.has_value());
+    auto c = h.db.consume_and_enroll(tok->raw_token, "agent-3", "h", "", "", "");
+    REQUIRE_FALSE(c.has_value());
+    CHECK(c.error() == StoreError::QueryFailed);
+    CHECK(h.db.list_tokens().value()[0].use_count == 0);
+}
+
+// ── v1 -> v2 migration (WS-6 6.2) ───────────────────────────────────────────
+
+// Hand-seeds the v1 `auth` schema (users + the dead v1 enrollment_tokens /
+// pending_agents shapes + mfa_recovery_codes) exactly as migrations()[0] created
+// it, stamps schema_meta at 1 with a populated v1 row in each dead table, then
+// hands the database to a real AuthDB construction. Proves the v2 step drops the
+// v1 shapes and creates the clean ones + import_meta, keeps unrelated v1 data,
+// and that the resulting store works end-to-end.
+TEST_CASE("AuthDB migrates v1 -> v2: clean enrollment/pending shape + import_meta",
+          "[pg][auth_db][migration]") {
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
+    {
+        PgConn conn = connect(db.dsn());
+        PgResult meta{PQexec(conn.get(), "CREATE TABLE public.schema_meta ("
+                                         "  store TEXT PRIMARY KEY, version INTEGER NOT NULL,"
+                                         "  upgraded_at BIGINT NOT NULL)")};
+        REQUIRE(meta.ok());
+        PgResult schema{PQexec(conn.get(), "CREATE SCHEMA auth")};
+        REQUIRE(schema.ok());
+        PgResult v1{PQexec(
+            conn.get(),
+            "CREATE TABLE auth.users ("
+            "  id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY, username TEXT NOT NULL UNIQUE,"
+            "  password_hash TEXT NOT NULL DEFAULT '', salt_hex TEXT NOT NULL DEFAULT '',"
+            "  role TEXT NOT NULL DEFAULT 'user', created_at TIMESTAMPTZ NOT NULL DEFAULT now(),"
+            "  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(), last_login_at TIMESTAMPTZ,"
+            "  is_active BOOLEAN NOT NULL DEFAULT TRUE, mfa_totp_secret BYTEA,"
+            "  mfa_enrolled_at TIMESTAMPTZ, mfa_disabled_at TIMESTAMPTZ,"
+            "  mfa_last_counter BIGINT NOT NULL DEFAULT 0, failed_login_count INTEGER NOT NULL DEFAULT 0,"
+            "  last_failed_login_at TIMESTAMPTZ, locked_until TIMESTAMPTZ,"
+            "  break_glass_armed_until TIMESTAMPTZ, elevation_eligible BOOLEAN NOT NULL DEFAULT FALSE,"
+            "  identity_source TEXT NOT NULL DEFAULT 'local', external_iss TEXT, external_sub TEXT,"
+            "  display_name TEXT, last_seen_at TIMESTAMPTZ,"
+            "  provisioning_source TEXT NOT NULL DEFAULT 'local');"
+            "CREATE INDEX users_active_idx ON auth.users (is_active) WHERE is_active;"
+            "CREATE TABLE auth.enrollment_tokens ("
+            "  id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY, token_hash TEXT NOT NULL UNIQUE,"
+            "  created_by TEXT NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT now(),"
+            "  expires_at TIMESTAMPTZ NOT NULL, is_used BOOLEAN NOT NULL DEFAULT FALSE,"
+            "  used_at TIMESTAMPTZ, used_by_agent_id TEXT);"
+            "CREATE INDEX enrollment_tokens_expires_idx ON auth.enrollment_tokens (expires_at);"
+            "CREATE TABLE auth.pending_agents ("
+            "  id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY, agent_id TEXT NOT NULL UNIQUE,"
+            "  hostname TEXT NOT NULL, os TEXT, arch TEXT, agent_version TEXT,"
+            "  requested_at TIMESTAMPTZ NOT NULL DEFAULT now(), approved_at TIMESTAMPTZ,"
+            "  approved_by TEXT, status TEXT NOT NULL DEFAULT 'pending');"
+            "CREATE INDEX pending_agents_status_idx ON auth.pending_agents (status);"
+            "CREATE TABLE auth.mfa_recovery_codes ("
+            "  id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY, username TEXT NOT NULL,"
+            "  code_hash TEXT NOT NULL, code_salt TEXT NOT NULL, consumed_at TIMESTAMPTZ,"
+            "  created_at TIMESTAMPTZ NOT NULL DEFAULT now());"
+            "CREATE INDEX mfa_recovery_username_idx ON auth.mfa_recovery_codes (username);"
+            "CREATE INDEX mfa_recovery_unconsumed_idx ON auth.mfa_recovery_codes (username) "
+            "  WHERE consumed_at IS NULL;"
+            "INSERT INTO public.schema_meta (store, version, upgraded_at) "
+            "  VALUES ('auth', 1, extract(epoch FROM now())::bigint);"
+            "INSERT INTO auth.users (username, password_hash, salt_hex, role) "
+            "  VALUES ('legacy-admin', 'h', 's', 'admin');"
+            "INSERT INTO auth.enrollment_tokens (token_hash, created_by, expires_at) "
+            "  VALUES ('v1-dead-row', 'x', now() + interval '1 day');"
+            "INSERT INTO auth.pending_agents (agent_id, hostname) VALUES ('v1-dead-agent', 'h');")};
+        REQUIRE(v1.ok());
+    }
+
+    yuzu::test::TempDir keys;
+    FileKeyProvider provider(keys.path);
+    SecretCodec codec(provider);
+    {
+        PgConn conn = connect(db.dsn());
+        REQUIRE(codec.init(conn.get()).has_value());
+    }
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AuthDB adb{pool, codec};
+    REQUIRE(adb.is_open()); // the v2 step applied
+
+    PgConn conn = connect(db.dsn());
+    CHECK(scalar(conn.get(), "SELECT version FROM public.schema_meta WHERE store='auth'") == "2");
+
+    // v1 dead shapes gone, clean shape present (no `is_used`, has `max_uses`/`token_id`).
+    CHECK(scalar(conn.get(), "SELECT count(*) FROM auth.enrollment_tokens") == "0");
+    CHECK(scalar(conn.get(), "SELECT count(*) FROM auth.pending_agents") == "0");
+    CHECK(scalar(conn.get(),
+                 "SELECT count(*) FROM information_schema.columns WHERE table_schema='auth' "
+                 "AND table_name='enrollment_tokens' AND column_name IN "
+                 "('token_id','label','max_uses','use_count','revoked','last_used_at',"
+                 " 'last_consumed_by_agent_id')") == "7");
+    CHECK(scalar(conn.get(),
+                 "SELECT count(*) FROM information_schema.columns WHERE table_schema='auth' "
+                 "AND table_name='enrollment_tokens' AND column_name IN ('is_used','used_at')") == "0");
+    CHECK(scalar(conn.get(),
+                 "SELECT count(*) FROM information_schema.columns WHERE table_schema='auth' "
+                 "AND table_name='pending_agents' AND column_name IN "
+                 "('status_changed_at','status_changed_by')") == "2");
+    CHECK(scalar(conn.get(),
+                 "SELECT count(*) FROM information_schema.columns WHERE table_schema='auth' "
+                 "AND table_name='import_meta' AND column_name IN "
+                 "('key','fingerprint','imported_at','imported_by')") == "4");
+    // Unrelated v1 data survives.
+    CHECK(scalar(conn.get(), "SELECT role FROM auth.users WHERE username='legacy-admin'") == "admin");
+
+    // DB-level guards on the clean shape.
+    PgResult neg{PQexec(conn.get(), "INSERT INTO auth.enrollment_tokens (token_id, token_hash, max_uses) "
+                                    "VALUES ('x','y',-1)")};
+    CHECK_FALSE(neg.ok());
+    PgResult bad_status{PQexec(conn.get(), "INSERT INTO auth.pending_agents (agent_id, status) "
+                                           "VALUES ('z','rejected')")};
+    CHECK_FALSE(bad_status.ok());
+
+    // And the migrated store works end to end.
+    auto tok = adb.create_token("post-upgrade", 1, std::chrono::seconds(60), "admin");
+    REQUIRE(tok.has_value());
+    auto r = adb.consume_and_enroll(tok->raw_token, "agent-up", "h", "", "", "");
+    REQUIRE(r.has_value());
+    CHECK(r->kind == CEK::enrolled);
 }
 
 // ── recovery codes ─────────────────────────────────────────────────────────

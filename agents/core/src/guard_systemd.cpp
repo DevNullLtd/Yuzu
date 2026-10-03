@@ -22,6 +22,8 @@
 
 #include <yuzu/agent/guard_systemd.hpp>
 
+#include <yuzu/log_token.hpp>
+
 #include <spdlog/spdlog.h>
 
 #include <cctype>
@@ -236,8 +238,8 @@ SystemdServiceGuard::~SystemdServiceGuard() { stop(); }
 
 bool SystemdServiceGuard::start() {
     if (!valid_unit_name(cfg_.service_name)) {
-        spdlog::warn("Guardian SystemdServiceGuard[{}]: invalid unit name '{}'", cfg_.rule_id,
-                     cfg_.service_name);
+        spdlog::warn("Guardian SystemdServiceGuard[{}]: invalid unit name '{}'",
+                     yuzu::log_id_token(cfg_.rule_id), yuzu::log_key_token(cfg_.service_name));
         return false;
     }
     sd_bus* bus = nullptr;
@@ -247,7 +249,8 @@ bool SystemdServiceGuard::start() {
         // unarmed (detect-only requires the /proc fallback, a later slice).
         spdlog::warn("Guardian SystemdServiceGuard[{}]: system bus unavailable ({}) — unit '{}' "
                      "unwatched (non-systemd host?)",
-                     cfg_.rule_id, (r < 0 ? err_str(-r) : std::string("no bus")), cfg_.service_name);
+                     yuzu::log_id_token(cfg_.rule_id), (r < 0 ? err_str(-r) : std::string("no bus")),
+                     yuzu::log_key_token(cfg_.service_name));
         if (bus)
             sd_bus_unref(bus);
         return false;
@@ -293,7 +296,7 @@ void SystemdServiceGuard::run() try {
     if (cfg_.enforce)
         spdlog::warn("Guardian SystemdServiceGuard[{}]: enforce-mode not yet supported on Linux — "
                      "observing unit '{}' only (drift reported, not remediated)",
-                     cfg_.rule_id, unit);
+                     yuzu::log_id_token(cfg_.rule_id), yuzu::log_key_token(unit));
 
     int bus_fd = sd_bus_get_fd(bus);
     bool bus_ok = true; // false after a transport failure, until reopen_bus() succeeds
@@ -329,7 +332,8 @@ void SystemdServiceGuard::run() try {
         drift.detection_latency_us = 0; // v1: not measured (sd-bus gives no kernel event time)
         drift.collapsed_count = d.collapsed_count;
         spdlog::info("Guardian SystemdServiceGuard[{}]: drift unit '{}' detected={} expected={}",
-                     cfg_.rule_id, unit, drift.detected_value, expected_token);
+                     yuzu::log_id_token(cfg_.rule_id), yuzu::log_key_token(unit),
+                     drift.detected_value, expected_token);
         if (sink_)
             sink_(drift);
     };
@@ -346,7 +350,7 @@ void SystemdServiceGuard::run() try {
         if (sd_bus_call_method(bus, kDest, kMgrPath, kMgrIface, "Subscribe", &err, &reply, "") < 0)
             spdlog::warn("Guardian SystemdServiceGuard[{}]: Subscribe failed ({}) — losing the "
                          "PropertiesChanged event stream, falling back to bounded reconcile only",
-                         cfg_.rule_id, err.message ? err.message : "(none)");
+                         yuzu::log_id_token(cfg_.rule_id), err.message ? err.message : "(none)");
         if (reply)
             sd_bus_message_unref(reply);
         sd_bus_error_free(&err);
@@ -374,7 +378,8 @@ void SystemdServiceGuard::run() try {
             }
         } else if (systemd_error_name_is_absence(err.name ? err.name : "")) {
             spdlog::debug("Guardian SystemdServiceGuard[{}]: unit '{}' absent (name='{}')",
-                          cfg_.rule_id, unit, err.name ? err.name : "(none)");
+                          yuzu::log_id_token(cfg_.rule_id), yuzu::log_key_token(unit),
+                          err.name ? err.name : "(none)");
             res = ResolveResult::NotFound;
         } else {
             // A named-but-transient error (AccessDenied/NoReply/TimedOut/…) or a bare
@@ -382,7 +387,8 @@ void SystemdServiceGuard::run() try {
             // fabricate a false Absent drift (fjarvis #2 / UP-4).
             spdlog::warn("Guardian SystemdServiceGuard[{}]: LoadUnit '{}' transient error "
                          "(name='{}', {}) — reopening, no false Absent",
-                         cfg_.rule_id, unit, err.name ? err.name : "(none)",
+                         yuzu::log_id_token(cfg_.rule_id), yuzu::log_key_token(unit),
+                         err.name ? err.name : "(none)",
                          err.message ? err.message : err_str(r < 0 ? -r : 0));
             res = ResolveResult::BusError;
         }
@@ -416,7 +422,8 @@ void SystemdServiceGuard::run() try {
             // failure — reopen, never a false "stopped" (fjarvis #2 / UP-4).
             spdlog::warn("Guardian SystemdServiceGuard[{}]: ActiveState read transient error "
                          "(name='{}', {}) — reopening, no false drift",
-                         cfg_.rule_id, err.name ? err.name : "(none)", err_str(r < 0 ? -r : 0));
+                         yuzu::log_id_token(cfg_.rule_id), err.name ? err.name : "(none)",
+                         err_str(r < 0 ? -r : 0));
             // leave nullopt → caller flips bus_ok and reopens
         }
         if (s)
@@ -446,7 +453,7 @@ void SystemdServiceGuard::run() try {
                                     "PropertiesChanged", &on_props_changed, &dirty);
         if (r < 0) {
             spdlog::warn("Guardian SystemdServiceGuard[{}]: match arm failed for '{}': {}",
-                         cfg_.rule_id, unit, err_str(-r));
+                         yuzu::log_id_token(cfg_.rule_id), yuzu::log_key_token(unit), err_str(-r));
             if (auto st = read_state())
                 emit(*st);
             else
@@ -489,8 +496,8 @@ void SystemdServiceGuard::run() try {
         return true;
     };
 
-    spdlog::info("Guardian SystemdServiceGuard[{}]: watching unit '{}' (expect {})", cfg_.rule_id,
-                 unit, expected_token);
+    spdlog::info("Guardian SystemdServiceGuard[{}]: watching unit '{}' (expect {})",
+                 yuzu::log_id_token(cfg_.rule_id), yuzu::log_key_token(unit), expected_token);
 
     subscribe();
     std::uint64_t backstop_ms = reconcile();
@@ -504,7 +511,7 @@ void SystemdServiceGuard::run() try {
                 int r = sd_bus_process(bus, nullptr);
                 if (r < 0) {
                     spdlog::warn("Guardian SystemdServiceGuard[{}]: bus lost ({}) — reconnecting",
-                                 cfg_.rule_id, err_str(-r));
+                                 yuzu::log_id_token(cfg_.rule_id), err_str(-r));
                     bus_ok = false;
                     next_backstop = std::chrono::steady_clock::now(); // reopen promptly
                     break;
@@ -562,7 +569,8 @@ void SystemdServiceGuard::run() try {
         if (pr < 0) {
             if (errno == EINTR)
                 continue;
-            spdlog::warn("Guardian SystemdServiceGuard[{}]: poll: {}", cfg_.rule_id, err_str(errno));
+            spdlog::warn("Guardian SystemdServiceGuard[{}]: poll: {}", yuzu::log_id_token(cfg_.rule_id),
+                         err_str(errno));
             break;
         }
         if (fds[wake_idx].revents & POLLIN)
@@ -573,7 +581,7 @@ void SystemdServiceGuard::run() try {
                 if (reopen_bus()) {
                     bus_ok = true;
                     spdlog::info("Guardian SystemdServiceGuard[{}]: system bus reconnected",
-                                 cfg_.rule_id);
+                                 yuzu::log_id_token(cfg_.rule_id));
                     backstop_ms = reconcile();
                 } else {
                     backstop_ms = kAbsentRetryMs; // retry reopen next tick
@@ -593,10 +601,10 @@ void SystemdServiceGuard::run() try {
     // join — so the slot's bus ref is always dropped first, on every path incl. throw.
 } catch (const std::exception& e) {
     spdlog::error("Guardian SystemdServiceGuard[{}]: watch thread exception: {} — watch stopping",
-                  cfg_.rule_id, e.what());
+                  yuzu::log_id_token(cfg_.rule_id), e.what());
 } catch (...) {
     spdlog::error("Guardian SystemdServiceGuard[{}]: watch thread unknown exception — stopping",
-                  cfg_.rule_id);
+                  yuzu::log_id_token(cfg_.rule_id));
 }
 
 } // namespace yuzu::agent

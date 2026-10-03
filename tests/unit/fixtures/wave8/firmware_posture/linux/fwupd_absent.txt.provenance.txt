@@ -1,0 +1,10 @@
+host: braga (Mac, Docker Desktop) running debian:12 --platform linux/amd64 (x86_64 emulated)
+packages: dbus 1.14.10-1~deb12u1, systemd 252.39-1~deb12u2 (busctl); fwupd NOT installed
+identity: root (euid 0) inside the container
+setup: dbus-daemon --system --fork
+command: busctl --system call org.freedesktop.fwupd / org.freedesktop.fwupd GetDevices  (exit 1, stderr)
+date: 2026-09-21
+status: REAL CAPTURE
+notes: on-the-wire error name is org.freedesktop.DBus.Error.ServiceUnknown (dbus-send shows it
+  for an unowned name). With NO system bus at all the same call prints
+  "Failed to connect to bus: No such file or directory" (exit 1): sd_bus_open_system -> -ENOENT.

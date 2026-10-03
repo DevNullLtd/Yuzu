@@ -8,11 +8,15 @@
 # delegates. Argument shape mirrors scripts/test/synthetic-uat-tests.sh
 # so /test orchestration treats it like any other Phase 5 gate.
 #
-# Defaults run only the 184 safe+mutating definitions (no destructive,
-# no interactive, no network-disrupt). The 25 destructive instructions
-# are the candidate pool for PR C's hand-written semantic-correctness
-# overrides; the 3 network-disrupt instructions belong to the quarantine
-# ceremony (PR B).
+# Defaults run only the safe+mutating definitions the runner can dispatch (it
+# prints the exact counts). Opt-in classes, via --risks: destructive and forensic
+# (the server refuses a broadcast for these and the runner broadcasts),
+# server-internal (catalog-only definitions the dispatch chokepoint denies),
+# interactive, and network-disrupt (the quarantine ceremony, PR B). The runner
+# supplies no explicit targets, so selecting destructive, forensic or server-internal
+# is expected to fail (HTTP 400/503) until it can. The destructive
+# instructions are the candidate pool for PR C's hand-written semantic-correctness
+# overrides. scripts/test/instructions-risk-classification.json is the authority.
 #
 # Usage:
 #   bash scripts/test/instructions-tests.sh \
@@ -58,7 +62,10 @@ Optional:
   --gate-name NAME         gate name to scope timings under (default: instructions)
   --risks LIST             comma-separated risk classes to run
                            (default: safe,mutating; choices: safe, mutating,
-                           destructive, network-disrupt, interactive)
+                           destructive, forensic, server-internal,
+                           network-disrupt, interactive; destructive,
+                           forensic and server-internal cannot pass yet:
+                           the runner sends no explicit targets)
   --match REGEX            run only definition ids matching this regex
   --only-id ID             run exactly one definition (debugging)
   --parallelism N          concurrent dispatches (default: 4)
@@ -105,8 +112,9 @@ fi
 # PyYAML is a hard requirement — embed_content.py also depends on it, so
 # the project's existing build prereqs already cover it.
 if ! python3 -c "import yaml" 2>/dev/null; then
-    echo "error: PyYAML missing. install with 'pip install pyyaml' "\
-"(or 'pacman -S python-yaml' on MSYS2)." >&2
+    echo "error: PyYAML missing for 'python3'. On a developer machine, install it "\
+"with 'pip install pyyaml' (or 'pacman -S python-yaml' on MSYS2). On a shared "\
+"self-hosted CI runner, do not install it here: fix the runner's provisioning." >&2
     exit 2
 fi
 

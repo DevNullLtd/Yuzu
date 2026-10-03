@@ -306,6 +306,44 @@ than silently building a CRL over a wrong number or a possibly-incomplete revoke
 fix class as the production path's own hardening above, applied so the untested-in-production
 method does not carry a latent version of the identical bug.
 
+### Update (2026-09-23): cross-instance CRL numbering delivered by HA WS-6 slice 6.1
+
+Point 3 above and the "zero production callers" section are superseded. `publish_next_crl` is now
+the ONLY production CRL publish path: `server.cpp`'s `publish_crl()` loads the CA key, then calls
+it with a pure signing callback. `ServerImpl::crl_publish_mu_` is removed; `CaStore`'s old mutex
+is replaced by a bounded `std::timed_mutex` taken before the lease, so one process parks at most
+one pool connection on the lock. `record_crl()` became `record_crl_for_test()` (test seeding
+only), and `next_crl_number()` is a read-only peek. The method runs one transaction that sets a
+transaction-scoped `lock_timeout`/`statement_timeout` (so the bound survives a DSN whose
+`options=` suppresses the pool's), takes `LOCK TABLE ca_store.ca_crl_versions IN SHARE ROW
+EXCLUSIVE MODE`, re-checks `ca_root`'s fingerprint against the one the caller loaded (a
+subordinate import in between returns `RootChanged`; the caller retries once), reads
+`MAX(version)+1` and the revoked set on the same connection, signs, inserts and commits. The lock
+serialises publishers across every replica sharing the database, so numbering is strictly
+increasing with no duplicates, and a CRL never omits a revocation its predecessor carried.
+
+**Migration v3** adds a nullable `ca_crl_versions.revoked_count` — how many revoked certs the CRL
+was built from — with no backfill (NULL reads as "not covered"). `has_unpublished_revocations()`
+compares it with the current revoked count in one statement, and the leader's freshness pass
+republishes when they differ, so a revoke whose own publish failed reaches the CRL without a
+second revoke. That comparison relies on the revoked set being append-only, so
+`delete_issued_by()` now keeps revoked rows, and **migration v4** adds a `BEFORE DELETE OR
+UPDATE` row trigger (`ca_issued_keep_revoked`) rejecting any change to a revoked row — the
+guarantee holds against an older binary during a rolling upgrade, not just in this code — before this change, regenerating the default certs
+deleted a revoked default leaf's row, which also made `is_revoked()` accept it again. The v3 DDL
+runs under `SET LOCAL lock_timeout = '30s'`, and each publish also sets
+`idle_in_transaction_session_timeout` so a frozen holder cannot keep the lock.
+
+ADR-0012 §2(b) forbids holding a lease across "network, disk, or other external work". Loading
+the key is disk work and happens before the lease is taken; signing a key already in memory is
+in-process CPU work, so running it under the lease is not a departure from §2(b). A future
+`KeyProvider` backed by a KMS, HSM or PKCS#11 would turn signing into network work under the lease
+and needs a redesign (or an ADR-0012 exception) before it lands — the `CrlBuilder` "pure CPU work"
+contract in `ca_store.hpp` is where that shows. Points 1 and 2 (no default number on a read
+failure; no clobbering) still hold. Residual limits — point-in-time restore, async-failover commit
+loss and the runbook clear of `ca_crl_versions` restart numbering at the surviving MAX+1 — are
+listed in `docs/pki-architecture.md`. See ADR-2002 §8 "Update (2026-09-23)".
+
 ### Backfill (ADR-0009)
 
 **Mandatory, three-table, fingerprint-verified** — extends `LicenseStore`'s (ADR-0048) two-table
@@ -387,7 +425,8 @@ here.
   call sites (see "Adversarial review" below) — a warning comment narrows the class of mistake, it
   does not substitute for checking every call site against it.
 - **Solving cross-instance CRL numbering (auto-retry-on-conflict) as part of this migration.**
-  Rejected as scope creep beyond "migrate the persistence layer" — it is a pre-existing, already-
+  (Since delivered by HA WS-6 slice 6.1 with a table lock rather than a retry loop — see "Update
+  (2026-09-23)" above.) Rejected as scope creep beyond "migrate the persistence layer" — it is a pre-existing, already-
   tracked (#1240 UP-4) limitation this migration does not worsen (a collision was always refused
   loudly, never silently), and building the retry loop correctly requires re-running the CA-key-
   load-and-sign step, which crosses into `server.cpp`'s signing orchestration, not this store.

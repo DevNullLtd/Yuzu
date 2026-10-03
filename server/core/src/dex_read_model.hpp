@@ -45,6 +45,16 @@ struct DexDeviceScoreModel {
     std::string window; ///< echoes the validated "24h"|"7d"|"30d"|"all" token
     int score{-1};
     std::vector<DexSignalCount> signals;
+    /// #4855: true when the underlying signal-summary read DEGRADED (store
+    /// closed / pool-acquire timeout / query error) rather than genuinely
+    /// finding no signals — `score` stays -1 and `signals` stays empty in
+    /// this case too, but a caller MUST check this field first: a degraded
+    /// model must never be served/rendered as a healthy "no data" result.
+    /// Deliberately NOT serialized by `dex_device_score_json` (see its own
+    /// comment) — callers translate it into their own surface's degrade
+    /// response (lens placeholder / REST 503 / MCP retryable error) BEFORE
+    /// ever reaching the serializer.
+    bool degraded{false};
 };
 
 /// (`build_dex_device_score_model` — the store-reaching builder — is declared in
@@ -60,6 +70,14 @@ struct DexDeviceScoreModel {
 /// fails closed (503) before reaching this call at all; the field is omitted
 /// entirely when `true` (default), matching `get_dex_signal_detail`'s
 /// established shape ("absent on success — consumers key on absence").
+///
+/// #4855 guard: `model.degraded` is NEVER a JSON key here (a degraded read
+/// has no honest wire shape to serve — every caller must translate it into
+/// its own surface's degrade response before ever calling this). Debug-mode
+/// asserts a caller never reaches this serializer with a degraded model;
+/// release builds fall through to the plain score/signals fields (which are
+/// already -1/empty on a degraded model, so the worst a release build can
+/// do is the pre-#4855 "unavailable" shape — never a fabricated 100).
 std::string dex_device_score_json(const DexDeviceScoreModel& model, bool audit_persisted = true);
 
 // (MCP-only gap #2: the per-device app-perf drill serializer
@@ -78,9 +96,9 @@ struct DexAppModel {
     DexEntitySummary summary; ///< crashes/hangs/signals/distinct_devices/first_seen/last_seen
     std::vector<DexModuleCrashCount> modules;
     std::vector<DexExceptionCount> exceptions;
-    /// Affected devices, ALREADY confined to `visible` when non-null (an
-    /// out-of-scope device's id is never present — not merely filtered client
-    /// side) — same admit-then-filter posture as the fragment's own loop.
+    /// Affected devices (top 20). When the builder's `visible` is non-null the
+    /// rows are filtered AFTER the LIMIT — a post-LIMIT row filter, NOT
+    /// ADR-0017 INV-3 confinement: every other field stays fleet-wide.
     std::vector<DexDeviceCrashCount> devices;
 };
 
@@ -125,6 +143,11 @@ struct DexCatalogueGroupModel {
     double health_score{-1.0}; ///< -1 = suppressed (nothing monitored, or the scoped denominator is 0)
     int64_t active_events{0};
     int64_t max_signal_devices{0}; ///< largest single signal's distinct-device count (#1374, not the union)
+    /// True for the one family (`dex_family_is_benign`) whose window activity is
+    /// routine reports, not incidents — the fragment shows "Reports (window)"
+    /// instead of "Events (window)" on this flag alone (ADR-0031 WS-A4 PR-1: added
+    /// so a future renderer can reproduce that label from the model alone).
+    bool benign{false};
     std::vector<DexCatalogueGroupTypeRow> types;
 };
 
@@ -249,17 +272,33 @@ struct DexOverviewDayCrash {
 };
 
 /// The fleet-overview read model — the `/dex` landing page's fleet summary.
-/// `top_devices` is ALREADY confined to `visible` when non-null (an
-/// out-of-scope device's id is never present), same admit-then-filter
-/// posture as the fragment's own loop; every other field is a fleet
-/// aggregate carrying no per-agent identity.
+/// `top_devices` is filtered by the builder's `visible` (when non-null)
+/// AFTER the top-N cut — a post-LIMIT row filter, NOT ADR-0017 INV-3
+/// confinement; every other field is a fleet aggregate over ALL agents.
 struct DexOverviewModel {
     std::string window;
     // Experience (per-device score distribution + Device/App/Network composite).
     int overall_experience{-1}; ///< median of scoreable connected devices; -1 = none
     int device_score{-1}, app_score{-1}, network_score{-1};
     int great{0}, fair{0}, poor{0}; ///< per-device experience bucket counts
+    /// #4855: connected devices whose per-device score came back -1 — either
+    /// no store, or (the case this counter exists for) a degraded read on
+    /// that specific device. Counted so a fleet-wide read hiccup surfaces as
+    /// "N device(s) could not be scored" instead of silently thinning the
+    /// `great`/`fair`/`poor`/median population, which would read as a
+    /// healthier fleet than is actually known.
+    int unscored{0};
     int64_t coverage_monitored{0}, coverage_total{0};
+    /// ADR-0031 WS-A4 PR-1: distinct connected-OS tokens in scope for the
+    /// coverage tile's "N platform(s)" caption (`cscope.size()` in the
+    /// fragment) — additive so the REST/MCP twin can reproduce that exact text.
+    int64_t connected_platforms{0};
+    /// ADR-0031 WS-A4 PR-1: the Explore card's busiest-family teaser
+    /// (`render_dex_overview_fragment`'s "busiest <b>NAME</b>" text) — empty
+    /// when no family has fired in-window (mirrors the fragment's own
+    /// `busiest_ev > 0` guard), additive.
+    std::string busiest_family;
+    int64_t busiest_family_events{0};
     std::vector<DexOverviewSegment> segments; ///< by normalised OS
     // Reliability -- measured.
     double crash_free_pct{-1.0}; ///< -1 when windows_reporting == 0
@@ -281,5 +320,56 @@ struct DexOverviewModel {
 
 /// (`build_dex_overview_model` — the store-reaching builder — is in `dex_read_builders.hpp`.)
 std::string dex_overview_json(const DexOverviewModel& model, bool audit_persisted = true);
+
+// ── New twin #9: catalogue / family cards (/fragments/dex/catalogue, GET /api/v1/dex/catalogue) ──
+
+/// One family's card in the Catalogue grid (View 1) — mirrors
+/// `render_dex_catalogue_fragment`'s per-card computation exactly (Rule 1
+/// refactor target, ADR-0031 WS-A4 PR-1). `monitored == 0`
+/// is the fragment's "dark" state (not collected on any in-scope platform);
+/// `monitored > 0 && health_score < 0` is its "no_data" state (monitored, but
+/// the scoped online denominator is 0) — both are DERIVABLE from these two
+/// fields, so no separate flag is carried.
+struct DexCatalogueFamilyRow {
+    std::string name;
+    int monitored{0};
+    int total{0};
+    double health_score{-1.0}; ///< -1 = not scored (dark, or no online denominator)
+    int64_t events{0};
+    /// The busiest member signal's obs_type, empty when nothing fired
+    /// (mirrors the fragment's `r.events > 0 && r.top` guard) — never a raw
+    /// pointer/reference into the builder's transient signal-summary vector.
+    std::string top_obs_type;
+};
+
+/// The signal-catalogue read model — the `/dex` Catalogue landing grid (View
+/// 1). No per-agent identity — a fleet aggregate, same posture as the sibling
+/// `catalogue_group`/`health`/`trends` twins (no confinement, no audit).
+/// `uncatalogued` mirrors the fragment's "Other (uncatalogued)" section: any
+/// obs_type seen on the wire that isn't in any curated family yet, so a newer
+/// agent's signal is never silently hidden from this resource either.
+struct DexCatalogueModel {
+    std::string os;     ///< resolved scope token: "all"|"windows"|"linux"|"macos"
+    std::string window;
+    int monitored_types{0};
+    int total_types{0};
+    std::vector<DexCatalogueFamilyRow> families; ///< dex_signal_groups() order
+    std::vector<DexSignalCount> uncatalogued;
+    /// Fix 2 (WS-A4 PR-1 fix round, sec-5): true when the underlying
+    /// fleet signal-summary read DEGRADED (store closed / pool-acquire
+    /// timeout / query error) rather than genuinely finding zero events —
+    /// `families`/`uncatalogued` stay empty in this case too, but a caller
+    /// MUST check this field first: a degraded model must never be
+    /// served/rendered as a healthy, zero-event catalogue (the same
+    /// #4855 shape `DexDeviceScoreModel::degraded` closes for the
+    /// per-device read). Deliberately NOT serialized by `dex_catalogue_json`
+    /// (see its own comment) — callers translate it into their own
+    /// surface's degrade response (REST 503 / MCP retryable error) BEFORE
+    /// ever reaching the serializer.
+    bool degraded{false};
+};
+
+/// (`build_dex_catalogue_model` — the store-reaching builder — is in `dex_read_builders.hpp`.)
+std::string dex_catalogue_json(const DexCatalogueModel& model);
 
 } // namespace yuzu::server

@@ -57,6 +57,7 @@ TEST_CASE("BoundedQueryResult default-constructs to an unset, non-truncated resu
     REQUIRE(result.rows.empty());
     REQUIRE_FALSE(result.truncated);
     REQUIRE_FALSE(result.error.has_value());
+    REQUIRE(result.rows_before_error == 0); // no error, so no rows lost to one
 }
 
 TEST_CASE("WmiRow supports the map operations callers rely on (row_get-style lookup)") {

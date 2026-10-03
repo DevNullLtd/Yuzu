@@ -26,7 +26,7 @@ You inherit the **Darwin compatibility guardian** role and extend it to all plat
 - **Build system** — Maintain `meson/cross/` cross-compilation files, `meson/native/` native files, and `setup_msvc_env.sh`.
 - **CI matrix** — Ensure `.github/workflows/ci.yml` covers all 4 targets with correct toolchain configuration.
 - **vcpkg platform filters** — Maintain platform filters in `vcpkg.json` (e.g., Catch2 `x64 | arm64`). OpenSSL is explicitly **not** platform-filtered — it is a required dep on every platform including Windows (vcpkg's gRPC port compiles TLS / JWT / PEM code paths against OpenSSL headers regardless of any schannel aspiration, so `grpc.lib` needs `libssl` + `libcrypto` at final link time; see #375).
-- **Windows-specific** — Windows certificate store integration (system cert trust for mTLS). Windows service APIs. OpenSSL links just like every other platform — the "gRPC uses SChannel on Windows" story was aspirational and never wired up upstream; see CLAUDE.md `## vcpkg` and `.claude/agents/build-ci.md` "Windows MSVC static-link history and #375".
+- **Windows-specific** — Windows certificate store integration (the agent's mTLS client identity). Windows service APIs. OpenSSL links just like every other platform — the "gRPC uses SChannel on Windows" story was aspirational and never wired up upstream; see CLAUDE.md `## vcpkg` and `.claude/agents/build-ci.md` "Windows MSVC static-link history and #375".
 - **macOS-specific** — `fs::canonical()` for path comparisons. SQLite mutex requirements. Erlang rebar3 ct `--dir` requirement.
 - **ARM64** — Cross-compilation works. Tests intentionally skipped on ARM64 cross-compile.
 
@@ -39,7 +39,8 @@ You inherit the **Darwin compatibility guardian** role and extend it to all plat
 - `agents/plugins/*/src/*.cpp` — Plugin source (often platform-specific)
 - `vcpkg.json` — Package manifest with platform filters
 - `.github/workflows/ci.yml` — CI matrix definition
-- `server/core/src/cert_store.cpp` — Windows cert store integration
+- `agents/core/src/cert_store.cpp` — Agent mTLS client identity from the Windows cert store (macOS and Linux are fail-closed stubs that point at PEM files)
+- `agents/core/src/cert_discovery.cpp` — Per-OS CA install paths and certificate discovery
 
 ## Standing Platform Pitfalls
 

@@ -55,6 +55,17 @@ const std::vector<pg::PgMigration>& migrations() {
          "  justification   TEXT NOT NULL DEFAULT '',"
          "  grant_snapshot  TEXT NOT NULL DEFAULT '',"
          "  PRIMARY KEY (campaign_id, principal_type, principal_id, role_name));"},
+        // A3 (RBAC delivery plan): stamp each campaign with the fleet's RBAC
+        // enforcement state at open. DEFAULT '' is honest-empty for every row
+        // that predates this column — never '' -> 'degraded' backfill, and
+        // never a value a live open_campaign() call may pass (validated in
+        // C++ before the insert, mirroring record_attestation's decision
+        // check). CHECK mirrors the other closed-vocabulary columns on this
+        // table (status, decision) — an empty string is the ONLY value the
+        // check allows without also being one open_campaign() itself accepts.
+        {2,
+         "ALTER TABLE access_review_campaign ADD COLUMN rbac_enforcement TEXT NOT NULL DEFAULT '' "
+         "CHECK (rbac_enforcement IN ('', 'enabled', 'disabled', 'degraded'));"},
     };
     return kMigrations;
 }
@@ -96,11 +107,12 @@ AccessReviewCampaignRow read_campaign(PGresult* res, int i) {
     c.created_at_ms = to_i64(PQgetvalue(res, i, col++));
     c.closed_by = PQgetvalue(res, i, col++);
     c.closed_at_ms = to_i64(PQgetvalue(res, i, col++));
+    c.rbac_enforcement = PQgetvalue(res, i, col++);
     return c;
 }
 
-constexpr const char* kCampaignCols =
-    "campaign_id, title, status, created_by, created_at_ms, closed_by, closed_at_ms";
+constexpr const char* kCampaignCols = "campaign_id, title, status, created_by, created_at_ms, "
+                                      "closed_by, closed_at_ms, rbac_enforcement";
 
 AccessReviewAttestationRow read_attestation(PGresult* res, int i) {
     AccessReviewAttestationRow a;
@@ -141,13 +153,17 @@ AccessReviewStore::AccessReviewStore(pg::PgPool& pool) : pool_(pool) {
 
 std::expected<std::string, std::string>
 AccessReviewStore::open_campaign(std::string title, std::string created_by,
-                                 const std::vector<GrantRef>& frozen_population) {
+                                 const std::vector<GrantRef>& frozen_population,
+                                 std::string rbac_enforcement) {
     if (!open_)
         return std::unexpected("database not open");
     if (title.empty())
         return std::unexpected("title cannot be empty");
     if (created_by.empty())
         return std::unexpected("created_by cannot be empty");
+    if (rbac_enforcement != "enabled" && rbac_enforcement != "disabled" &&
+        rbac_enforcement != "degraded")
+        return std::unexpected("rbac_enforcement must be 'enabled', 'disabled', or 'degraded'");
 
     const std::string campaign_id = generate_campaign_id();
     const std::int64_t created_at = now_ms();
@@ -172,10 +188,10 @@ AccessReviewStore::open_campaign(std::string title, std::string created_by,
         pg::PgResult r1 = pg::exec_params(
             conn,
             "INSERT INTO access_review_store.access_review_campaign "
-            "(campaign_id, title, status, created_by, created_at_ms) "
-            "VALUES ($1,$2,'open',$3,$4::bigint) RETURNING campaign_id",
+            "(campaign_id, title, status, created_by, created_at_ms, rbac_enforcement) "
+            "VALUES ($1,$2,'open',$3,$4::bigint,$5) RETURNING campaign_id",
             std::vector<std::string>{campaign_id, title, created_by,
-                                     std::to_string(created_at)});
+                                     std::to_string(created_at), rbac_enforcement});
         if (r1.status() != PGRES_TUPLES_OK || PQntuples(r1.get()) == 0) {
             error_msg = std::string("campaign insert failed: ") + PQerrorMessage(conn);
             return false;

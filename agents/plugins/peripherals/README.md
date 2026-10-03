@@ -239,5 +239,4 @@ thunderbolt|none
 - Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_peripherals.hpp`
 - Tests: `tests/unit/test_peripherals_linux_parsers.cpp` · `tests/unit/test_peripherals_local_dispatcher.cpp` · `tests/unit/test_peripherals_macos_parsers.cpp` · `tests/unit/test_peripherals_parsers.cpp` · `tests/unit/test_peripherals_win_parsers.cpp`
 - Privilege row: `docs/agent-privilege-model.md`
-- Changelog: `changelog.d/wave9-pr91a-peripherals-bus.added.md` · `changelog.d/wave9-pr91a2-peripherals-windows.added.md`
 <!-- END GENERATED -->

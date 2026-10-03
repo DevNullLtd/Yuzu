@@ -3517,9 +3517,7 @@
     "capability_rows": [
       "server/core/src/capability_decls/plugin_action_catalogue_a.hpp"
     ],
-    "changelog": [
-      "changelog.d/wave6-pr61b-filesystem-posture.added.md"
-    ],
+    "changelog": [],
     "definitions": [
       "content/definitions/filesystem.yaml",
       "content/definitions/t2_capabilities.yaml",

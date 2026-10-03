@@ -205,6 +205,39 @@ const std::vector<pg::PgMigration>& migrations() {
          // white-box schema_meta rewind, matching migration v4's style.
          "CREATE INDEX IF NOT EXISTS inventory_state_source_agent_idx "
          "ON inventory_state (source, agent_id);"},
+        {7,
+         // Extended row: package_id / source, plus install_id for keyset paging. The
+         // install_location / uninstall_string wire slots (13-14) are reserved and not
+         // stored until ADR-0016 §8 is re-opened (#5186). The two TEXT columns follow the
+         // v5 precedent (constant '' defaults are metadata-only, no rewrite). install_id BIGSERIAL
+         // backfills existing rows via a table REWRITE under ACCESS EXCLUSIVE — one
+         // sequential pass at server start over a table bounded at agents x kMaxEntries
+         // (20000, inventory_ingestion.cpp) rows. The rewrite rebuilds every existing
+         // index, so the old name index is DROPPED FIRST (measured at 4M rows: rewrite
+         // 32 s with it, 4-8 s without; the re-create is 6.5-10 s; two runs) and
+         // re-created as (name, agent_id, install_id) at the end. IF [NOT] EXISTS keeps
+         // a white-box schema_meta rewind idempotent (a re-run adds no second sequence;
+         // the column drop cascades the index, so DROP IF EXISTS no-ops). install_id
+         // churns on every full replace (DELETE + INSERT) — it is a TIEBREAK inside
+         // (name, agent_id), never the page order on its own.
+         // The pool injects a 30 s statement_timeout on every connection and this
+         // migration runs inside the runner's txn, so SET LOCAL lifts it for this txn
+         // only (it cannot leak to the pool). lock_timeout (10 s) still bounds lock
+         // acquisition; only the finite rewrite work is uncapped, because a cancelled
+         // boot migration is a permanently fail-closed server, not a protection.
+         // Accepted risk (docs/postgres-migration-ladder.md, SoftwareInventoryStore row):
+         // the ACCESS EXCLUSIVE lock is held for the whole rewrite plus index build,
+         // extrapolated at 2.6-4.5 us/row: once the hold passes lock_timeout (10 s), from
+         // about 2-4M rows, statements queued behind it time out; about 10 minutes near
+         // 130-230M rows. Tolerated only while no deployment holds a table of that size;
+         // any later change here that rewrites the table or builds an index must be online.
+         "SET LOCAL statement_timeout = 0;"
+         "DROP INDEX IF EXISTS installed_software_name_idx;"
+         "ALTER TABLE installed_software ADD COLUMN IF NOT EXISTS package_id       TEXT NOT NULL DEFAULT '';"
+         "ALTER TABLE installed_software ADD COLUMN IF NOT EXISTS source           TEXT NOT NULL DEFAULT '';"
+         "ALTER TABLE installed_software ADD COLUMN IF NOT EXISTS install_id       BIGSERIAL;"
+         "CREATE INDEX IF NOT EXISTS installed_software_name_idx "
+         "ON installed_software (name, agent_id, install_id);"},
     };
     return kMigrations;
 }
@@ -233,10 +266,14 @@ std::string sha256_hex(const std::string& in) {
     return out;
 }
 
-// Sort/dedup key walks ALL v2 fields in blob order (name..distro_version) so
-// two entries differing only in a v2 field are distinct rows, not duplicates.
-// MUST mirror the agent's entry_less/entry_equal (sync_source_installed_software.cpp)
-// or the two sides' canonical hashes diverge → permanent always-full.
+// Sort/dedup key walks every STORED field in blob order (name..source; wire slots 13-14
+// are reserved and not stored) so two entries differing only in one field are distinct
+// rows, not duplicates.
+// The agent sorts and dedups on its 12 fields (sync_source_installed_software.cpp); this
+// adds package_id and source, which no shipped agent fills, so the two agree today. The
+// agent change (#5186) must extend its key the same way, or the canonical hashes diverge
+// → permanent always-full. Records differing only in the reserved slots 13-14 collapse
+// to one row here.
 bool entry_less(const SoftwareEntry& a, const SoftwareEntry& b) {
     if (a.name != b.name)
         return a.name < b.name;
@@ -260,7 +297,11 @@ bool entry_less(const SoftwareEntry& a, const SoftwareEntry& b) {
         return a.signature_status < b.signature_status;
     if (a.distro_id != b.distro_id)
         return a.distro_id < b.distro_id;
-    return a.distro_version < b.distro_version;
+    if (a.distro_version != b.distro_version)
+        return a.distro_version < b.distro_version;
+    if (a.package_id != b.package_id)
+        return a.package_id < b.package_id;
+    return a.source < b.source;
 }
 
 bool entry_equal(const SoftwareEntry& a, const SoftwareEntry& b) {
@@ -268,7 +309,8 @@ bool entry_equal(const SoftwareEntry& a, const SoftwareEntry& b) {
            a.install_date == b.install_date && a.kind == b.kind && a.ecosystem == b.ecosystem &&
            a.epoch == b.epoch && a.release == b.release && a.arch == b.arch &&
            a.signature_status == b.signature_status && a.distro_id == b.distro_id &&
-           a.distro_version == b.distro_version;
+           a.distro_version == b.distro_version && a.package_id == b.package_id &&
+           a.source == b.source;
 }
 
 // Sort + dedup in place so both the canonical hash and the persisted rows are
@@ -344,11 +386,15 @@ DegradeLog note_read_degrade(yuzu::MetricsRegistry* metrics, const char* reason,
 
 std::string SoftwareInventoryStore::canonical_hash(std::vector<SoftwareEntry> entries) {
     normalize(entries);
-    // Blob contract v2: 12 fields, 0x1F-separated, in this exact order, record-
-    // terminated 0x1E — byte-identical to the agent's canonical blob builder
-    // (installed_software_canonical_blob). The v1→v2 reformat is the one-time
-    // rekey herd: even all-empty new fields add separators, so every stored v1
-    // hash mismatches on the first post-upgrade report (need_full, self-heals).
+    // Blob contract v2 + extended tail: 12 fields always; the 4-field tail (slots 13-16:
+    // install_location, uninstall_string, package_id, source) is appended (all four)
+    // ONLY when package_id or source is non-empty; slots 13-14 are reserved and written
+    // empty (see below). A v2 agent's records therefore hash
+    // to exactly the pre-extension bytes, so its stored content_hash keeps matching
+    // (no permanent need_full loop). The agent side (installed_software_canonical_blob
+    // in agents/core/src/sync_source_installed_software.cpp) MUST mirror this rule;
+    // parse_software_blob accepts both shapes. Fields 0x1F-separated, records 0x1E-
+    // terminated.
     std::string canon;
     canon.reserve(entries.size() * 96);
     for (const auto& e : entries) {
@@ -375,6 +421,16 @@ std::string SoftwareInventoryStore::canonical_hash(std::vector<SoftwareEntry> en
         canon += e.distro_id;
         canon += '\x1f';
         canon += e.distro_version;
+        if (!e.package_id.empty() || !e.source.empty()) {
+            // Slots 13-14 (install_location, uninstall_string) are reserved: always empty
+            // here, so an agent that hashes real values gets need_full until the server
+            // accepts them (ADR-0016 §8 re-classification, #5186).
+            canon += "\x1f\x1f";
+            canon += '\x1f';
+            canon += e.package_id;
+            canon += '\x1f';
+            canon += e.source;
+        }
         canon += '\x1e';
     }
     return sha256_hex(canon);
@@ -392,6 +448,42 @@ SoftwareInventoryStore::SoftwareInventoryStore(pg::PgPool& pool) : pool_(pool) {
         spdlog::error("SoftwareInventoryStore: schema migration failed — software inventory "
                       "persistence disabled");
         return;
+    }
+
+    // Post-migration projection check (postgres-store-playbook "Runner guards"; ApiTokenStore
+    // is the reference shape). run() skips any migration whose id is at or below the stored
+    // high-water mark, so a schema_meta stamped by a different binary can leave a column
+    // missing while run() still reports success. One LIMIT 0 SELECT per table, over every
+    // column the runtime uses, touches no rows and fails the store closed here, not as
+    // `undefined column` on whichever request runs first. Keep each list equal to its
+    // table's columns: the projection test renames every column away in turn and fails if
+    // one is missing here. Column presence only: types, defaults and the keys ON CONFLICT
+    // relies on are invisible to a projection.
+    struct Projection {
+        const char* table;
+        const char* columns;
+    };
+    static constexpr Projection kProjections[] = {
+        {"installed_software",
+         "agent_id, name, version, publisher, install_date, kind, ecosystem, epoch, release, "
+         "arch, signature_status, distro_id, distro_version, package_id, source, install_id"},
+        {"inventory_state", "agent_id, source, content_hash, first_seen, last_seen"},
+        {"catalog_rollup", "name, publisher, device_count, version_count"},
+        {"version_rollup", "name, version, device_count"},
+        {"catalog_rollup_meta", "id, refreshed_at, total_titles, total_devices"},
+    };
+    for (const auto& p : kProjections) {
+        const std::string sql = std::string("SELECT ") + p.columns +
+                                " FROM software_inventory_store." + p.table + " LIMIT 0";
+        pg::PgResult probe = pg::exec_params(lease.get(), sql.c_str(), std::vector<std::string>{});
+        if (probe.status() != PGRES_TUPLES_OK) {
+            spdlog::error("SoftwareInventoryStore: post-migration schema projection check failed "
+                          "on {} — an expected column is missing (hypothesis: a skipped or "
+                          "partial migration; could also be a dropped connection or other "
+                          "transient failure) — software inventory persistence disabled: {}",
+                          p.table, PQresultErrorMessage(probe.get()));
+            return;
+        }
     }
     open_ = true;
 }
@@ -488,9 +580,9 @@ InventoryIngestOutcome SoftwareInventoryStore::apply_installed_software(
         if (del.status() != PGRES_COMMAND_OK)
             return false;
         // Batched insert (#1664): one statement carrying the per-row columns as
-        // four parallel text[] arrays — agent_id is the scalar $1, so the param
-        // count is a constant 5 regardless of row count. A multi-row VALUES would
-        // hit libpq's 65535-parameter ceiling at ~13k rows (5 params/row); up to
+        // fourteen parallel text[] arrays — agent_id is the scalar $1, so the param
+        // count is a constant 15 regardless of row count. A multi-row VALUES would
+        // hit libpq's 65535-parameter ceiling at ~4.3k rows (15 params/row); up to
         // kMaxEntries (20k) rows arrive here. unnest() pairs the arrays
         // positionally and they are equal-length by construction. Collapsing up
         // to 20k single-row INSERTs into one statement shrinks the transaction's
@@ -499,8 +591,8 @@ InventoryIngestOutcome SoftwareInventoryStore::apply_installed_software(
         // touched→full) this change targets. Skip entirely when empty (a
         // legitimate empty inventory): the DELETE above already cleared the rows.
         if (!entries.empty()) {
-            // One parallel text[] per column (blob-order, v2 = 12 columns).
-            std::vector<std::string_view> cols[12];
+            // One parallel text[] per stored column (blob-order, 14 columns).
+            std::vector<std::string_view> cols[14];
             for (auto& col : cols)
                 col.reserve(entries.size());
             for (const auto& e : entries) {
@@ -516,14 +608,16 @@ InventoryIngestOutcome SoftwareInventoryStore::apply_installed_software(
                 cols[9].emplace_back(e.signature_status);
                 cols[10].emplace_back(e.distro_id);
                 cols[11].emplace_back(e.distro_version);
+                cols[12].emplace_back(e.package_id);
+                cols[13].emplace_back(e.source);
             }
             // push_back (not a braced init-list) so each large to_text_array
             // prvalue is MOVED into params, not copied — an init_list's backing
             // array is `const std::string[]`, forcing copies of these up-to-MB
             // literals on the hot path (cpp-expert). Param count is a constant
-            // 13 ($1 scalar agent_id + 12 arrays) regardless of row count.
+            // 15 ($1 scalar agent_id + 14 arrays) regardless of row count.
             std::vector<std::string> params;
-            params.reserve(13);
+            params.reserve(15);
             params.push_back(agent_id_s);
             for (const auto& col : cols)
                 params.push_back(pg::to_text_array(col));
@@ -531,11 +625,13 @@ InventoryIngestOutcome SoftwareInventoryStore::apply_installed_software(
                 c,
                 "INSERT INTO software_inventory_store.installed_software "
                 "(agent_id, name, version, publisher, install_date, kind, ecosystem, epoch, "
-                "release, arch, signature_status, distro_id, distro_version) "
-                "SELECT $1, n, v, p, d, k, e, ep, r, a, s, di, dv "
+                "release, arch, signature_status, distro_id, distro_version, "
+                "package_id, source) "
+                "SELECT $1, n, v, p, d, k, e, ep, r, a, s, di, dv, pk, so "
                 "FROM unnest($2::text[], $3::text[], $4::text[], $5::text[], $6::text[], "
                 "$7::text[], $8::text[], $9::text[], $10::text[], $11::text[], $12::text[], "
-                "$13::text[]) AS t(n, v, p, d, k, e, ep, r, a, s, di, dv)",
+                "$13::text[], $14::text[], $15::text[]) "
+                "AS t(n, v, p, d, k, e, ep, r, a, s, di, dv, pk, so)",
                 params);
             if (ins.status() != PGRES_COMMAND_OK)
                 return false;
@@ -630,7 +726,7 @@ SoftwareInventoryStore::get_agent_software(std::string_view agent_id) {
     pg::PgResult res = pg::exec_params(
         lease.get(),
         "SELECT name, version, publisher, install_date, kind, ecosystem, epoch, release, "
-        "arch, signature_status, distro_id, distro_version "
+        "arch, signature_status, distro_id, distro_version, package_id, source "
         "FROM software_inventory_store.installed_software "
         "WHERE agent_id = $1 ORDER BY name, version LIMIT $2::bigint",
         std::vector<std::string>{std::string(agent_id), std::to_string(kFleetQueryRowCap)});
@@ -658,6 +754,8 @@ SoftwareInventoryStore::get_agent_software(std::string_view agent_id) {
         e.signature_status = PQgetvalue(res.get(), i, 9);
         e.distro_id = PQgetvalue(res.get(), i, 10);
         e.distro_version = PQgetvalue(res.get(), i, 11);
+        e.package_id = PQgetvalue(res.get(), i, 12);
+        e.source = PQgetvalue(res.get(), i, 13);
         out.push_back(std::move(e));
     }
     return out;
@@ -685,13 +783,15 @@ SoftwareInventoryStore::query_software(const SoftwareFleetQuery& q) {
                          pool_.last_error(), d.occurrence);
         return std::nullopt;
     }
+    // limit is clamped silently — callers page until an EMPTY page, never a short one.
     int limit = q.limit > 0 ? q.limit : 1000;
     if (limit > kFleetQueryRowCap)
         limit = kFleetQueryRowCap;
 
     std::string sql =
         "SELECT agent_id, name, version, publisher, install_date, kind, ecosystem, epoch, "
-        "release, arch, signature_status, distro_id, distro_version "
+        "release, arch, signature_status, distro_id, distro_version, package_id, source, "
+        "install_id "
         "FROM software_inventory_store.installed_software WHERE 1=1";
     std::vector<std::string> params;
     int p = 0;
@@ -703,11 +803,42 @@ SoftwareInventoryStore::query_software(const SoftwareFleetQuery& q) {
         sql += " AND name = $" + std::to_string(++p);
         params.push_back(q.name);
     }
-    sql += " ORDER BY name, agent_id LIMIT $" + std::to_string(++p) + "::bigint";
+    if (!q.q.empty()) {
+        // One bind reused across the four columns (software_catalog's idiom). `%`/`_`
+        // in q act as wildcards, exactly like name_filter there.
+        // Known ceiling: four seq-scan ILIKEs — fine to ~50k rows; add a pg_trgm GIN
+        // (CREATE EXTENSION is an operator decision) when the fleet passes that.
+        const std::string ph = "$" + std::to_string(++p);
+        sql += " AND (name ILIKE '%' || " + ph + " || '%' OR publisher ILIKE '%' || " + ph +
+               " || '%' OR ecosystem ILIKE '%' || " + ph + " || '%' OR source ILIKE '%' || " +
+               ph + " || '%')";
+        params.push_back(q.q);
+    }
+    if (!q.kind.empty()) {
+        sql += " AND kind = $" + std::to_string(++p);
+        params.push_back(q.kind);
+    }
+    if (!q.ecosystem.empty()) {
+        sql += " AND ecosystem = $" + std::to_string(++p);
+        params.push_back(q.ecosystem);
+    }
+    if (!q.source.empty()) {
+        sql += " AND source = $" + std::to_string(++p);
+        params.push_back(q.source);
+    }
+    if (q.after) {
+        // Row-value keyset over the stable sort tuple. install_id alone would reorder on
+        // every full replace (DELETE + INSERT), so it is only the tiebreak.
+        const int a = p + 1;
+        sql += " AND (name, agent_id, install_id) > ($" + std::to_string(a) + ", $" +
+               std::to_string(a + 1) + ", $" + std::to_string(a + 2) + "::bigint)";
+        p += 3;
+        params.push_back(q.after->name);
+        params.push_back(q.after->agent_id);
+        params.push_back(std::to_string(q.after->install_id));
+    }
+    sql += " ORDER BY name, agent_id, install_id LIMIT $" + std::to_string(++p) + "::bigint";
     params.push_back(std::to_string(limit));
-    // No OFFSET: offset-paging over a fleet table that mutates on sync cadence, with
-    // the scope filter applied after LIMIT, yields unstable/duplicating windows
-    // (gov consistency N1). Complete >cap collection is the keyset follow-up (#1634).
 
     pg::PgResult res = pg::exec_params(lease.get(), sql.c_str(), params);
     if (res.status() != PGRES_TUPLES_OK) {
@@ -736,6 +867,9 @@ SoftwareInventoryStore::query_software(const SoftwareFleetQuery& q) {
         row.entry.signature_status = PQgetvalue(res.get(), i, 10);
         row.entry.distro_id = PQgetvalue(res.get(), i, 11);
         row.entry.distro_version = PQgetvalue(res.get(), i, 12);
+        row.entry.package_id = PQgetvalue(res.get(), i, 13);
+        row.entry.source = PQgetvalue(res.get(), i, 14);
+        row.install_id = result_i64(res, i, 15);
         out.push_back(std::move(row));
     }
     return out;

@@ -195,6 +195,174 @@ cross-store transactional check, and the audit event described above have no cod
 them yet, precisely because no enable path exists -- they are binding on whatever implements D2,
 not a claim about current behavior.
 
+**Delivery note (A1, 2026-09).** The `#388` non-conformance above is now CLOSED for the enable
+path: `PUT /api/v1/rbac/enforcement` + the `set_rbac_enforcement` MCP tool ship an atomic,
+same-transaction, row-locked enable/disable toggle (`RbacStore::set_rbac_enforcement`), and
+`set_rbac_enabled` now returns `std::expected<void, std::string>` (kept as a deliberately
+UNGUARDED seed/test primitive for the ~70 existing test call sites that need it, never called
+from a route or MCP handler). The cross-store transactional check this decision calls for is
+built: the guard runs inside `RbacStore`'s own transaction, over the SAME row-locked
+`principal_roles JOIN auth.users` set (`FOR UPDATE OF pr`) `unassign_role`'s (D3's) own
+last-Administrator guard takes -- one shared fragment, not two copies -- closing exactly the
+race this section's Gate-4 finding describes for the checked-Administrator-account case. Three
+narrow, deliberate deviations from the literal decision text above, each with its own tracked
+follow-up rather than silently left unstated:
+
+1. **No self-grant bootstrap.** The shipped guard is *caller-inclusive* (the transition is
+   refused unless the CALLER would remain a durable administrator under the destination regime)
+   rather than *self-granting* (minting a fresh Administrator grant for an `admin`-session
+   caller who lacks one). A caller who fails the guard is refused with a remediation naming the
+   exact assignment call (`assign_rbac_role` / `POST .../roles/Administrator/assignments`) rather
+   than having standing authority minted on their behalf. This is a stricter posture than D2's
+   self-grant branch, not a weaker one -- it never mints authority nobody asked for -- but it is
+   a genuine deviation from the literal text above; the self-grant branch (and the fresh
+   staleness/precondition hazards Gate-5 raised against it) is not built.
+2. **No `auth.users` row lock under the toggle's own transaction.** D2's "same transaction, same
+   isolation" requirement is satisfied for the `principal_roles` side (the `FOR UPDATE OF pr`
+   lock above); the disable direction's `auth.users.role='admin'` read is a single, lock-free
+   snapshot, matching `unassign_role`'s own no-lock parity with `auth.users` (locking it would
+   serialize unrelated logins/role-changes). The residual -- a concurrent deactivation/demotion
+   of the checked account landing between the read and the toggle's commit -- is the SAME ongoing
+   case D2's own "cannot produce zero active Administrators... not only at enable time" clause
+   flags, tracked as [#4966](https://github.com/Tr3kkR/Yuzu/issues/4966) and Priority C item 4.1
+   (a joint-transaction primitive), not closed by this delivery.
+3. **MFA step-up is the existing `require_mfa_step_up` policy, not a fresh, uniform proof.** The
+   REST route calls `step_up_fn` exactly where A2's role-assignment route does; the MCP tool
+   carries no step-up call at all (supervised-tier approval instead). Because `api_token`/
+   `mcp_token` sessions are exempt from `require_mfa_step_up` (token issuance is treated as the
+   step-up moment) and approval is an authorization control, not an MFA proof, the toggle is not
+   uniformly MFA-gated across every principal class today -- tracked as Priority C item 4.1 ("MFA
+   step-up design for admin actions"), not a defect introduced by this delivery.
+
+**Delivery note (fresh-install bootstrap, 2026-09-28).** A second, narrower gap closes alongside
+A1's, and is a NEW DECISION, not a deviation from A1's delivery note above -- it supersedes
+nothing there. A1's delivery closed the enable-path escalation guard for an OPERATOR who is
+already authenticated and holds a session. It did not, and could not, address a genuinely FRESH
+install: `rbac_enabled` seeds `'false'` today, and before this delivery there was no way for a
+fresh install's first operator to end up with a durable RBAC Administrator grant, so flipping the
+seeded default to `'true'` would have locked out the first admin entirely -- every RBAC-gated
+route, including the assignment routes A1 ships, requires a durable grant that nothing existed to
+create at that point.
+
+This delivery closes that. `RbacAdminAuthorityOwner::provision_first_admin`
+(`rbac_admin_authority_owner.hpp:130-163`, `.cpp:596-671` -- the THIRD `RbacAdminAuthorityOwner`
+consumer, same delegation shape as `unassign_role`/`set_enforcement` above) inserts the
+configured admin's `auth.users` row -- the exact `WHERE NOT EXISTS (SELECT 1 FROM auth.users)`
+shape `AuthDB::seed_admin_if_empty` uses, under the SAME `kSeedAdminLockSql` advisory lock
+(auth_db.cpp:154) -- and grants that account `Administrator`, atomically in one transaction, ONLY
+when `auth.users` is genuinely empty; `RbacStore::provision_first_admin`
+(`rbac_store.hpp:472-489`, `.cpp:2156-2179`) is the thin public wrapper, mirroring
+`unassign_role`'s/`set_rbac_enforcement`'s own delegation pattern exactly. `main.cpp`'s
+fresh-start seed block calls this and no longer also calls `AuthDB::seed_admin_if_empty`
+-- the account+grant land in ONE transaction, so a crash between account-creation and
+grant-creation can never strand an account with no grant and no later boot able to fix it (the
+table would no longer be empty). `seed_admin_if_empty` is NO LONGER called from `main.cpp`'s
+fresh-start block at all (round 2, governance-round fix, 2026-09-28) -- calling it again
+immediately after `provision_first_admin` succeeded would have been a redundant second no-op with
+its own independent failure mode (a transient PG blip in the no-op call could fatal an
+already-successful, non-retriable bootstrap for no benefit -- a chaos-injector finding from the
+same round). `seed_admin_if_empty` itself is UNCHANGED, stays exported on `AuthDB`'s public API,
+and keeps its own unit test coverage -- it simply has no production caller left after this change.
+
+**Residual: mixed-version first boot is NOT covered by a same-version-fleet guarantee.** Both
+functions still share the same advisory lock
+(`kSeedAdminLockSql`/`kProvisionFirstAdminLockSql`, byte-identical), which serializes ordering but
+not WHICH one wins IF an old-binary replica (pre-dating this change) is still running a version
+that calls `seed_admin_if_empty` in its own boot path. If such a replica races a new-binary
+replica against the same genuinely-empty database, the old binary's `seed_admin_if_empty` can win
+the lock first and commit the account with NO Administrator grant
+-- `provision_first_admin` then sees a non-empty table on its own turn and cleanly no-ops,
+permanently (the table is never empty again). This delivery ships with `rbac_enabled` still
+seeded `'false'` (see below), so a stranded account of this shape still authenticates via the
+legacy `role='admin'` field and can self-heal by assigning itself Administrator through the
+ordinary A2 route before RBAC enforcement is ever turned on -- but the guarantee above is
+explicitly scoped to a same-version fleet, and a version-skew-safe repair protocol (or an
+explicit refusal to first-boot under version skew) is required work before the deferred
+seeded-default flip ships, tracked alongside it in #5055.
+
+**The seeded-default flip itself is DEFERRED, not shipped in this delivery.** The bootstrap above
+makes flipping `rbac_store.cpp`'s seeded-default literal from `'false'` to `'true'`
+MECHANICALLY safe on its own (`ON CONFLICT (key) DO NOTHING`, `rbac_store.cpp` ~532-548, means it
+would only ever take effect on a database that has never run this code before -- an
+existing/upgrading install's row is already written and untouched by this INSERT, structurally
+unaffected either way). Attempting the flip surfaced that a large, separately-scoped swath of the
+EXISTING test suite implicitly depends on a freshly constructed `RbacStore` seeding `'false'`,
+rather than setting the flag explicitly where a test actually needs it off -- 64 of 331 test
+cases (115 of 6260 assertions) failed across `test_rbac_role_assignment.cpp`,
+`test_rbac_store.cpp`, `test_rbac_enforcement_toggle.cpp`, `test_engine_principal_integration.cpp`
+and `test_list_read_confinement.cpp` with the flip applied, in at least two distinct shapes: (1) a
+harness gap -- `RbacRoleHarness::make_caller_admin(bool rbac_on)`
+(`tests/unit/server/test_rbac_admin_surface_harness.hpp:366-389`) sets `rbac_enabled` explicitly
+only on its `rbac_on=true` branch, silently relying on the (now-wrong) seeded default for
+`rbac_on=false`; and (2) at least one test whose entire premise IS the invariant this delivery
+changes -- `tests/unit/server/test_rbac_store.cpp:524-527`, literally named
+`"RbacStore: RBAC disabled by default"`. Bringing that suite up to date -- and deciding, test by
+test, which of those two shapes (or another) each failure is -- is its own scoped, reviewed
+change, deliberately not absorbed into this delivery; `rbac_store.cpp`'s seeded-default literal
+stays `'false'` until that follow-up lands.
+
+D2's own original text already anticipated exactly this shape -- "that self-grant is itself an
+audited, named bootstrap event distinct from an ordinary assignment" (paragraph above) -- but the
+two are materially different mechanisms, not two readings of the same one, and this delivery does
+not reopen A1's own deviation 1 ("No self-grant bootstrap"). A1's self-grant, had it been built,
+would be a RUNTIME grant tied to an already-authenticated operator's OWN session and their own
+toggle action, carrying that path's session-cache-staleness hazards -- the exact ones Gate-5
+raised against it (paragraphs above, "The self-grant branch's own precondition needs the same
+discipline..."). This delivery is a BOOT-TIME, SESSION-LESS, single-transaction mechanism that
+runs before the server ever accepts a request -- no session, no cache, no caller to stale-read,
+and no toggle action at all (RBAC is never switched on by an operator here; the seeded-default
+flip, when it lands -- deferred in this delivery, see above -- will ship a fresh database already
+on with no operator toggle involved). A1's three deviations above (no self-grant bootstrap; no `auth.users` row
+lock under the toggle's own transaction; MFA step-up posture) all stand exactly as A1 left them,
+unaffected by this delivery.
+
+Observability: a fresh-install provision is logged once, at `spdlog::warn` level; `Config::auth_fresh_start_seeded` (and the
+`yuzu_auth_fresh_start_reset_total` counter it drives, `server.cpp:3130-3163`) is sourced from
+`provision_first_admin`'s outcome, since that is the operation that actually performs the
+fresh-start INSERT in production -- the counter's own documented contract ("1 iff this boot seeded
+the sole admin user into an empty auth.users table") is unchanged, only which call detects the
+event.
+
+**A durable `audit_store` row IS written for this event (round 2, governance-round fix,
+2026-09-28).** An earlier version of this note claimed no `AuditFn` callback is available this
+early in boot -- that was factually wrong: `main.cpp`'s `open_one_shot_audit` (the SAME helper
+the `--mfa-reset`/`--break-glass-arm` one-shot CLI paths already use, also pre-`Server::create()`)
+opens a short-lived `AuditStore` against `auth_pg_pool` for exactly this case. The fix mirrors
+break-glass's own two-phase posture: a PRE-FLIGHT check (fail boot fatally if the audit store
+isn't writable, BEFORE calling `provision_first_admin` -- since `WHERE NOT EXISTS` means this
+event gets exactly one chance ever, an audit-store outage at precisely this boot would otherwise
+permanently forfeit the row) followed by a POST-COMMIT write (action `rbac.bootstrap.first_admin`,
+principal/`principal_role` `"system"`, target the provisioned username) that log-and-continues
+rather than fails boot if the write itself fails after the pre-flight passed -- unlike break-glass,
+the mutation here is already durably committed and non-retriable by that point, so failing boot
+would strand an otherwise-healthy install for no benefit. **Known residual, not closed by the
+pre-flight:** if the account+grant transaction commits server-side but the client never observes
+the COMMIT acknowledgement (a network fault between PG processing COMMIT and the reply reaching
+the client), `provision_first_admin` reports failure and this code path never reaches the
+post-commit audit write, yet the mutation is live -- a restart then sees a non-empty table and
+cleanly no-ops, so the account+grant are safe, but that narrow window can still lose the audit row
+despite the pre-flight having passed. Closing it needs either a same-transaction audit write
+(`AuditStore::log()` always self-acquires its own lease, no connection-scoped write API exists to
+fold into `provision_first_admin`'s transaction) or a durable pre-commit marker, both
+disproportionate to this narrow, mutation-safe residual -- accepted as-is, documented here and at
+the call site rather than silently shipped.
+
+Also fixed in passing, in the same code path this note describes: `main.cpp`'s config-loaded
+identity-selection loop previously fell back to `cfg_users.front()` (silently promoting whatever
+the FIRST config entry was to Administrator) when no `Role::admin`-tagged entry was found in a
+hand-edited config file. That fallback is now a fatal boot refusal instead (`main.cpp`'s
+fresh-start seed block, the `!seed_user && !cfg_users.empty()` branch)
+-- the interactive `first_run_setup` flow (`auth.cpp`) always creates the admin account with
+`Role::admin` explicitly, so the fallback was reachable only via a hand-edited config, but it must
+still fail loudly rather than silently provision the wrong identity as the fleet's first
+Administrator.
+
+Explicitly out of scope for this delivery (Phase 1): the seeded-default flip itself (deferred, see
+above -- `rbac_enabled` still seeds `'false'`); `docs/user-manual/rbac.md` and any dashboard-facing
+documentation of a new default, which has no meaning to document until the flip actually ships;
+the dashboard itself; any new REST/MCP route (this is boot-time-only, with no API surface of its
+own).
+
 ### D3 -- One assignment chokepoint for every principal type and scope; deny at assignment level is a decided, not silent, extension of the frozen lattice
 
 **The decision is one write CHOKEPOINT, not one table.** Every role assignment or revocation --

@@ -11,8 +11,17 @@
 /// absent metrics render "—" (never 0), aggregates carry their reporting
 /// population, sub-floor cohorts render "n too small", untagged devices are
 /// an explicit residual row.
+///
+/// #4626 Concern B: includes the PURE `dex_perf_model.hpp` directly rather
+/// than the httplib-coupled `dex_routes.hpp` (which still transitively pulls
+/// store headers via its own `#include "dex_read_builders.hpp"`; the former
+/// `dex_app_perf_ui.hpp` -> `dex_app_perf_model.hpp` chain was severed in
+/// #4626). This TU's include-closure store-freedom is enforced by
+/// `scripts/ci/check-seam-closure.py`'s `dex_perf` family — a header-closure
+/// check over include basenames; it does not scan this file's text for store
+/// type names.
 
-#include "dex_routes.hpp"
+#include "dex_perf_model.hpp"
 
 #include "web_utils.hpp"
 
@@ -263,12 +272,11 @@ std::string render_dex_perf_fragment(const DexPerfSnapshot& snap, int window_day
             h += fleet_card("Disk I/O latency (avg)", fmt_lat(now.disk_lat->avg),
                             stat_strip(*now.disk_lat, true), "metric=disk_lat&window=" + w,
                             "worst devices by disk latency");
-        const int64_t collecting_online = now.windows_online + now.linux_online + now.macos_online;
         h += fleet_card("Reporting", std::to_string(now.reporting),
-                        "of " + std::to_string(collecting_online) + " online (Windows " +
-                            std::to_string(now.windows_online) + " &middot; Linux " +
-                            std::to_string(now.linux_online) + " &middot; macOS " +
-                            std::to_string(now.macos_online) + ")",
+                        "of " + std::to_string(now.perf_capable_online) +
+                            " perf-capable online (Windows " + std::to_string(now.windows_online) +
+                            " &middot; Linux " + std::to_string(now.linux_online) + "; macOS " +
+                            std::to_string(now.macos_online) + " online, no collector yet)",
                         "filter=not_reporting&window=" + w, "devices not reporting");
         h += "</div>";
         h += "<div class=\"gp-note\">Perf telemetry is collected on <b>Windows and Linux</b> "

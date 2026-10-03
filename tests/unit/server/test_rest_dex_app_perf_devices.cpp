@@ -110,7 +110,7 @@ struct Harness {
             };
         }
 
-        AppPerfProviders providers;
+        yuzu::server::test::FnDexPerfApi::Providers providers;
         if (wire_provider) {
             providers.version_devices =
                 [this](std::string_view, std::string_view,
@@ -148,13 +148,13 @@ struct Harness {
                             /*dex_perf_fn=*/{}, /*network_api=*/{}, /*lockout_clear_fn=*/{},
                             /*baseline_store=*/nullptr, /*scoped_perm_fn=*/{},
                             /*software_inventory_store=*/nullptr,
-                            /*response_scope_fn=*/{}, providers,
+                            /*response_scope_fn=*/{},
                             /*engine_principal_store=*/nullptr, /*access_review_store=*/nullptr,
                             /*auth_db=*/nullptr, /*directory_sync=*/nullptr,
                             /*stream_budget=*/nullptr, /*exec_visible_fn=*/{},
                             /*list_read_fn=*/{}, std::move(fleet_read_fn),
                             /*agents_fn=*/{}, /*response_visible_set_fn=*/{},
-                            /*dex_visible_fn=*/{}, /*verify_api=*/nullptr,
+                            /*verify_api=*/nullptr,
                             /*device_api=*/nullptr, /*dex_api=*/nullptr, dex_perf_api_local);
     }
 

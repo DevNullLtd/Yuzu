@@ -334,10 +334,13 @@ TEST_CASE("render_dex_app_perf_trend: device-model cohort filter — selector, "
         CHECK_FALSE(has(h, "devices modeled"));
     }
 
-    SECTION("no model values available — selector omitted entirely") {
+    SECTION("no model values available — selector omitted, honest disclosure note shown "
+            "instead (#4857 D1: fleet_snapshot has no degrade channel)") {
         const auto h =
             render_dex_app_perf_trend("chrome.exe", {v1}, "", groups, 10, 30, "", {}, "");
         CHECK_FALSE(has(h, "name=\"model\""));
+        CHECK(has(h, "no device-model values in the current fleet snapshot"));
+        CHECK_FALSE(has(h, "degraded"));
     }
 
     SECTION("model cohort with zero versions — honest empty state names the model scope") {

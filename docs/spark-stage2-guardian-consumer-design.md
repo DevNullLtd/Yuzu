@@ -60,6 +60,25 @@ history:
     `guardian_io_executor.hpp` reword (the sentence's physical-stuck clause moved
     off the word "wedge", leaving "wedge marking" its only wedge-rooted term)
     folded in directly as a same-round hardening commit.
+  - 2026-09-21 - #4659, R5.7 consumer preconditions - (b) records the inert overlay on
+    `subscription_establishment()`, its two stale windows and the first reader's counter rule;
+    (c) replaces "not verified" with the measured rename, move, remove and SMB outcomes (the
+    resolution is tracked in #4676; raw probe transcripts in
+    `docs/spark-rebuild-baselines/raw/4659-file-rename-probe.txt`); (e), (f) and (g) verified
+    already consistent with the corrected (b) and left unchanged (an earlier draft of (b),
+    written before #4658 landed on this branch, narrowed the check to Registry-only and
+    contradicted them — caught and fixed in adversarial review before merge, see the counter
+    rule's `pass_failed` fix too).
+  - 2026-09-27 - #4704, R5.7 (g)(4) - the Registry sweeper's three pass-outcome lines (`pass
+    failed`, `failing persistently`, `pass recovered`) now use File's `PassOutcome` /
+    `log_pass_outcome()` shape and are written after `mu_` is released (they ran under `mu_`
+    before, stalling `arm()`/`disarm()` on a blocked sink). (g)(4)'s blocked-sink bullet
+    rewritten from "the two mechanisms are not the same shape" to the shared shape, with
+    Registry's remaining under-`mu_` per-key warn sites named as the residual (#4999); (g)(3)'s
+    deadline-stamp bullet gains the matching clause. The operator manual's "Diagnosing an inert
+    File worker or Registry sweeper" bullet is corrected the same way; `docs/spark-flip-gate.md`
+    gains a closed-by-fix #4704 entry in section 5 and section 7's #4704 precondition is marked
+    fixed. PR #5004, merged `063885c9e`, full `/governance` (Spark row).
 ---
 
 # Spark Stage 2 — Guardian as the first SparkEngine consumer
@@ -197,10 +216,13 @@ Verified safe to change now:
   inspection, the one documented inert case shows no delta - legacy fails identically
   there too - but the guarantee is narrower than this bullet's original wording
   implied). A runtime-inert File worker or Registry sweeper (R5.7 (b)/(g), #4658) is a
-  second inert case and it DOES show a delta: the legacy File guard does not depend on
-  Spark's `inert`, while under `prefer_spark_` a rule reconciled during the episode is
-  classified `Unsupported` and stays disarmed after recovery until the next reconcile or
-  restart (R5.7 (g)(1)).
+  second inert case, and PRE-#4685 it DID show a delta: the legacy File guard does not depend on
+  Spark's `inert`, while under `prefer_spark_` a rule reconciled during the episode was
+  classified `Unsupported` and stayed disarmed after recovery until the next reconcile or
+  restart (R5.7 (g)(1)). **FIXED (#4685):** Guardian's capability filter now keys off the
+  additive `boot_inert` field rather than the union `inert`, so a rule reconciled during a
+  transient runtime-degraded episode stays Arm/Committed instead - the delta this bullet used to
+  document no longer exists for that case.
 - **Nothing server-side breaks.** The Guardian status surface is still mock/placeholder
   (§Health/status surface), so no server code validates status tokens yet. This is the
   cheapest moment to introduce one; rung 4 owns its wiring.
@@ -455,10 +477,13 @@ bookkeeping guards (a committed claim is a `rules_` entry, never a pending one).
 
 **Three distinct non-success outcomes, named once (PR-1 doc pass, 2026-09-08; an
 earlier version of this section used "expired" for two of them).** (1) **Admission
-rejection**: the executor refuses the operation synchronously (`CapacityExhausted`,
-`CeilingExhausted`, `AlreadyRunning`, `LaunchFailed`); no backend call was attempted.
-(2) **Queue-wait expiry**: a queued sibling's own wait ends before its key's in-flight
-claim resolves; it was never dispatched. (3) **Dispatched-operation timeout**: a
+rejection**: a TERMINAL synchronous refusal (`AlreadyRunning`, `LaunchFailed`,
+`Stopped`); no backend call was attempted. Since #5168 a CONGESTION refusal of a clean
+arm claim (`CapacityExhausted`, `CeilingExhausted`, or the compensating-disarm
+reservation pool exhausted) is not an outcome at all: the claim is parked (see the
+amendment below) until it is admitted or ends as (2). (2) **Queue-wait expiry**: a
+queued sibling's, or a parked arm's, own wait ends before it is dispatched - its
+claim deadline elapses; it was never dispatched. (3) **Dispatched-operation timeout**: a
 dispatched operation has not returned by its deadline, location unknown - it may be
 inside the real OS call, or parked on `SparkEngine`'s per-type lock (`arm_impl()`
 takes `mech_ops_mu_by_type_` before `watch_guarded()`, `spark_engine.cpp`), and the
@@ -467,7 +492,7 @@ runtime cannot tell which. Only (3) is bounded by a deadline and marks the key
 attempt until the original worker's call completes (if ever) and clears the marker.
 The two stuck states, side by side so they are never conflated: **wedged** =
 dispatched, timed out, K-waivable (R5.3), recoverable when its late result arrives
-(ruling 14(b) below); **congestion-expired** = outcome (1) or (2), never dispatched,
+(ruling 14(b) below); **congestion-expired** = outcome (2), never dispatched,
 NOT K-waivable (ruling 14(a) below), recovers only on the next successful re-apply.
 This
 per-key wedge marker is distinct from — and not wired to — the existing
@@ -475,11 +500,47 @@ per-mechanism `mech_quarantined_total` counter (a fleet-alerting signal expected
 stay at 0); this design's wedge is the ordinary, K-bounded, non-alerting outcome
 of a single wedged key, not a mechanism-wide fault.
 
+**Amended for #5168 - a congestion refusal is PARKED, not failed.** This applies to the
+spark arm path only, which is dormant in shipped agents until the ADR-0021 F14 flip
+(`prefer_spark_` is false in production, so no rule reaches this runtime). A CONGESTION
+refusal at dispatch (the compensating-disarm reservation pool exhausted, or the
+executor's `CapacityExhausted` / `CeilingExhausted`) is no longer an immediate terminal
+outcome. A claim that is still clean (no outcome, not withdrawn, not abandoned, runtime
+not stopping) is handed back to `Queued` and marked parked; it holds no permit and no
+executor quota, and it never reaches backend `arm()` without first reserving its
+compensating-disarm permit, so the up-3 guarantee is unchanged. It is redriven (a) when
+a compensation permit frees (the permit-release hook in the arm-completion callbacks),
+(b) when a class's executor quota frees (the disarm-completion hook), (c) once
+immediately if an executor refusal raced a completion, (d) by a same-key attach that
+lands on the parked head, and (e) by the convergence scheduler's
+`redrive_parked_arms()`, a last-resort sweep on the priority lane's ~5 s cadence (it also
+adopts any clean Queued arm head that is parked nowhere). ("Parked" is deliberate: "retained" already names a disarm held after a
+refusal and a wedge held after a timeout.) The claim keeps its attach-time deadline,
+`cfg.backend_op_deadline` (5 s by default), and that deadline is NOT reset when the
+claim is redriven. A parked arm that is never admitted therefore ends as
+congestion-expired, exactly as before this amendment, but only after the deadline is
+observed by the maintenance pass that runs `expire_overdue_claims()` (the heartbeat
+tick, `heartbeat_interval` 30 s by default), not at the 5 s mark itself: its effective
+wait is the deadline plus up to one heartbeat interval. An arm redriven after its
+deadline but before that pass can be abandoned in flight and is then reported as
+dispatched-timeout (Wedged) until its late result lands; that result is still applied
+(ruling 14(b)). What changes is the size of the surplus that survives: with quota `q` and per-arm latency
+`t`, roughly `q` arms are admitted per `t`, so `N` same-class rules arm only if about
+`ceil(N/q) * t` fits inside the deadline plus that heartbeat window; rules beyond that
+still end congestion-expired and recover on the next successful re-apply. Real
+`watch()` latency was not measured. A terminal refusal (`Stopped`,
+`AlreadyRunning`, `LaunchFailed`) and every dirty claim (the PR-5c Dispatching-window
+race shapes) keep the immediate-failure path unchanged. Before this amendment a pushed
+or cached policy with more rules of one I/O class than that class's reservation
+capacity (Service 3, File 4, Registry 3) had its surplus refused at dispatch, so those
+rules were not enforced until a later push, including at pre-network boot.
+
 **Resolved (ruling 14, 2026-09-08 - routed to Astra via `/codex opine`, then Fable as
 advisor, ruled by Dave; previously flagged open by round 7's adversarial review; closes
 #4148):** (a) **Congestion-only outcomes are EXCLUDED from K.** Neither a queued
-waiter's own expiry nor an admission-time `CapacityExhausted` (a push that never
-reached the per-key queue) is K-qualifying; only a dispatched-and-timed-out operation
+waiter's own expiry nor a congestion refusal at dispatch (since #5168 parked as a
+Queued head and redriven, ending as a queue-wait expiry if it is never admitted) is
+K-qualifying; only a dispatched-and-timed-out operation
 whose claim is still retained is. Both congestion outcomes therefore hold the
 acknowledgment, exactly as R5.3's "genuine refusal" list already did for "arm queue
 full" - the two sections now agree. Accepted cost, stated as a load consequence rather
@@ -521,8 +582,12 @@ post-flip package. **Consequence under ruling 14(a), stated explicitly:** a same
 stall can no longer K-waive healthy sibling keys, because admission congestion is not
 K-qualifying; the consequence is instead that the affected generation's acknowledgment
 is HELD, with the server's 25 s `full_sync` retry re-applying the whole push until the
-contention clears. `yuzu.guardian_arm_failed` therefore carries a reason/phase
-(admission-expiry / admission-rejection / dispatched-timeout, R5.3), so an operator
+contention clears. `yuzu.guardian_arm_failed` is therefore intended to carry a reason/phase
+(admission-expiry / admission-rejection / dispatched-timeout, R5.3; since #5168 a
+congestion refusal that is parked and never admitted is logged as
+`status=CongestionExpired`, and admission-rejection is the terminal refusals only. The
+reason/phase breakdown itself is still unbuilt (see the PR-5e "Explicit narrowing"
+bullet further down), so an operator
 paged on it can tell a genuinely dead target from a key queued behind a slow sibling of
 the same mechanism type. PR-B1 (#2012/#3840, Registry) and PR-B2 (#2012/#3840, File) have since landed - see the landed-in notes below. **PR-B3 (Service) merged 2026-09-12 as PR #4302, closing this series** (corrected 2026-09-13, superseding the prior "in review" wording) - **with one correction found during PR-B3's own delivery**: Service never actually had the per-type-lock stall this paragraph describes (`watch()`/`unwatch()` were already O(1) queue pushes before any of PR-B1/B2/B3). Service's real, structurally different gap was `OpenServiceW` running head-of-line on its own dedicated worker thread, stalling sibling watches sharing that thread rather than the engine-wide per-type lock. #3840's issue text carries the full correction. PR-B3 isolates `OpenServiceW` onto a probe-only lane; `NotifyServiceStatusChangeW`'s registration stays on the mechanism thread by design (Win32 thread-affinity requirement) - an accepted residual, not a gap this fix claims to close.
 
@@ -593,12 +658,16 @@ default first action without first checking whether the target is transient or
 permanently dead**); a later policy change re-evaluates the rule but cannot by itself
 re-attempt the arm. A genuine refusal
 (a DISPATCHED call that returned a failure - backend refused or worker threw - or an
-admission rejection such as `CapacityExhausted`, where no call was attempted) or a
+admission rejection that is TERMINAL - `AlreadyRunning`, `LaunchFailed` or
+`Stopped` - where no call was attempted; a congestion rejection is parked and redriven
+per #5168, so it holds the acknowledgment while it is Pending and, if it is never
+admitted before its claim deadline, as congestion-expired) or a
 queue-wait expiry is a different case and holds the acknowledgment indefinitely - K
 only bounds the wedged case, never a live refusal and never a congestion-only
 outcome. **K is not a generation-wide liveness bound** (ruling 14(a)): a single wedged
 worker that exhausts its class quota pushes its siblings into non-K-qualifying
-`CapacityExhausted`, and those held rules keep the generation unacknowledged past the
+`CapacityExhausted` (parked and redriven since #5168, congestion-expired at their
+claim deadline if never admitted), and those held rules keep the generation unacknowledged past the
 wedged key's own K; do not read K as a promise that every generation acknowledges
 within three re-applies. **Zero-accepted push:** a push whose every rule is refused at
 admission has nothing pending and nothing armed; its generation does NOT advance
@@ -1171,7 +1240,8 @@ wait) is fixed in the same PR that adds this stamp.
 including a rule whose guard failed to start — that rule is silently stranded `Inert`,
 logged but not held against the generation. Spark's acknowledgment holds on a genuine
 refusal, and is K-bounded (never unconditional) on a wedged key only - a
-congestion-expired or admission-rejected rule holds it (ruling 14(a)). This is a
+congestion-expired or terminally admission-rejected rule holds it (ruling 14(a);
+a congestion refusal that is still parked under #5168 is Pending, and holds it the same way). This is a
 deliberate, documented delta (`docs/spark-legacy-delta-registry.md` row A3), not an
 oversight to reconcile — spark's stricter acknowledgment is the point of this design,
 and legacy's asymmetry pre-dates it and is out of scope to change here.
@@ -1308,17 +1378,54 @@ Fault callback, or the engine's own pre-start replay failure), so
 once a deleted target's re-arm has resolved to the ancestor the watch is Healthy, `inert` is
 false, and the cache can still read `Notification` if the `None` report was dropped (the
 Registry test that characterises exactly this drops every `None` and deletes the target). A
-Registry sweeper or File worker in persistent failure also leaves a stale `Notification`, unflagged
-until it flips `inert` after three consecutive failed passes. Checking
+Registry sweeper or File worker in persistent failure also leaves a stale `Notification`,
+unflagged until it flips `inert` after `kSweeperInertAfterFailures` / `kFileWorkerInertAfterFailures`
+(3 for either, the latter added by #4658 — see (g)) consecutive failed passes. Checking
 `!stats_by_type()[type].inert` alongside `subscription_health() == Healthy` narrows the Registry
-sweeper-failure and File worker-failure cases, and only once the flag has flipped (three
-consecutive failed passes for either, `kSweeperInertAfterFailures` /
-`kFileWorkerInertAfterFailures`); it does not cover a dropped report.
-(c) `Notification` means the mechanism holds the
+sweeper-failure and File worker-failure cases, and only once the flag has flipped for either; it
+does not cover a dropped report. `subscription_establishment()` itself reports
+`coverage = None` while the type's mechanism `stats().inert` is true; `established_at` is left
+untouched. That overlay is a conservative snapshot, not a coherent one: `inert` is read beside the
+cached value, so `None` can coexist with a newer staged `Notification`, and a stale `Notification`
+can be read once `inert` has cleared. It leaves two windows open. Before the flip, at the default
+50 ms sweep cadence, Registry retries back off 50 ms then 100 ms and `inert` flips on the third
+consecutive failed pass, so a stale `Notification` can be read for that long plus the pass
+durations. After recovery, `inert` clears on the first good pass but each sweep pass visits a
+bounded subset of watches, so a cached value can stay stale until its watch is next visited. The
+first reader closes both with a counter rule (decided 2026-09-21): it snapshots the mechanism's
+debug counters (`sweep_pass_failed` and `established_failed` for Registry, `pass_failed` and
+`established_failed` for File — `pass_failed` is the complete File failure detector per (g)
+below; `established_failed` alone misses an alternating failure/success pattern that never flips
+`inert`) and `stats().inert` before arming, requires `inert` to be false, and re-reads them when the
+measurement ends (any movement, or `inert`, invalidates the sample, recorded as a per-attempt
+reliability failure and never silently excluded); it uses fresh keys
+in isolated directories (no adopted or joined keys, no writes to a File watch's directory during
+an episode); it censors Ancestor-mode subscriptions; it reads only while `is_running()`; and it
+runs in-process, because the counters are `_for_test` accessors that exist on Windows only
+(`nullopt` elsewhere). Log lines are diagnostic only, never the closure. (c) `Notification`
+means the mechanism holds the
 watch and issued the read (Registry: the key exists and the notify is armed; File: the parent
 directory handle is watched, even when the file itself is absent). It is a probe result, NOT an
-end-to-end detection guarantee; whether File's handle-based watch reports the rename of the
-watched directory as a loss is not verified. (d) `coverage == None` with `established_at` unset
+end-to-end detection guarantee. A standalone probe that opens the directory as File does measured
+its handle-based watch on 2026-09-21 (Windows 11 Pro 25H2 build 26200.9457, local NTFS, three
+runs per case, 30 s windows). A rename or move of the watched directory gives no completion: the
+read follows the directory object, writes under the new path are detected, and writes under a
+recreated original path are not. `RemoveDirectory` gives an immediate failed completion
+(`ERROR_ACCESS_DENIED`, `STATUS_DELETE_PENDING`), which is the mechanism's `!ok` branch. A rename
+of the PARENT is refused while the watch handle is open. A change to the watched directory itself
+is not reported. On an SMB share (Samba 4.23.10 in a container, not a Windows file server; the
+silent-drop case was not measured), a hung server fails the read after about 64 s
+(`STATUS_IO_TIMEOUT`, one run) and a gone server fails it at once
+(`STATUS_CONNECTION_DISCONNECTED`, one run). A server-side rename of the watched directory gives
+no completion in 30 s, and a server-side delete gives only the child's REMOVED record, no failed
+completion in 30 s. After a failed completion the old handle stays dead until reopened. The real
+File mechanism was not run against a rename: its outcome is inferred from these results and
+`process_completion_locked`. So a local rename or move, and a rename or delete on a share, leave
+coverage at `Notification` while the target path is unwatched; #4676 tracks the resolution. Until
+it lands, a reader must treat File `Notification` as unconfirmed for a target that could be
+renamed, and a post-establishment write to the original path is only a point-in-time liveness
+check. Raw transcripts: `docs/spark-rebuild-baselines/raw/4659-file-rename-probe.txt`. (d)
+`coverage == None` with `established_at` unset
 means never confirmed (an absent target, a pending arm or a failed arm; NOT necessarily deaf).
 With `established_at` set it means one of: the Registry one-shot flap (brief, on the order of
 one re-arm); a Registry target that has since been deleted (Target -> Ancestor: the watch now
@@ -1341,29 +1448,38 @@ cap), logs at failures 1, 2, 4, 8, ... and flips `inert` after three consecutive
 clearing on the next success. Two residuals remain: a real directory notification during an
 episode still runs a (failing) pass, so the pass rate is bounded by the kernel's notification rate
 rather than the backoff; and a single poison obligation fails the whole pass, starving the others
-until it clears (same as Registry). A third, the Guardian re-reconcile gap, is KNOWN and open
-(#4685). The list below sets out that gap, the contract a consumer of `inert` needs and two
-further recorded limits.
+until it clears (same as Registry). A third, the Guardian re-reconcile gap, was tracked as open
+and is now FIXED (#4685, see (g)(1) below). The list below sets out the fix, the contract a
+consumer of `inert` needs and two further recorded limits.
 
 **R5.7 (g), continued: the File worker-failure contract (#4658).**
 
-1. KNOWN open gap, a precondition for the F14 flip. Tracked as issue #4685, with an entry in the
-   flip-gate risk-accept register (`docs/spark-flip-gate.md` section 5). While File is
-   runtime-inert, a Guardian reconcile (a full-sync policy push, for example) builds its capability
-   set without File (`GuardianEngine::reconcile_rule_locked()`), so `classify()` places every File
-   rule it touches `Unsupported`. That branch (`RulePlacement::Unsupported`) also DETACHES a rule
-   already armed through Spark and withdraws its legacy guard, and a full sync tears both backends
-   down first (`stop_all_guards_locked()` and `spark_runtime_->detach_all()` in `apply_rules()`).
-   Live File rules are therefore disarmed for the episode. Clearing `inert` notifies no consumer, so
-   they stay disarmed (enforced by neither backend, recorded in `unsupported_rules_`) until the next
-   reconcile or an agent restart. Dormant while `prefer_spark_` is false. A Registry sweeper flip
-   has the same shape and predates #4658. `guardian_engine.cpp` is unchanged by #4658, so it is
-   cited by symbol.
+1. **FIXED (#4685).** While File is runtime-inert, a Guardian reconcile (a full-sync policy push,
+   for example) used to build its capability set from the UNION `inert` bit
+   (`GuardianEngine::reconcile_rule_locked()`), so `classify()` placed every File rule it touched
+   `Unsupported` for the whole episode. That branch (`RulePlacement::Unsupported`) also DETACHES a
+   rule already armed through Spark and withdraws its legacy guard, and a full sync tears both
+   backends down first (`stop_all_guards_locked()` and `spark_runtime_->detach_all()` in
+   `apply_rules()`), so live File rules were disarmed for the episode and clearing `inert` notified
+   no consumer - they stayed disarmed (enforced by neither backend, recorded in
+   `unsupported_rules_`) until the next reconcile or an agent restart. The fix adds an additive
+   `boot_inert` field to `SparkMechanismStats` (see (2) below) and moves Guardian's capability
+   filter onto `!boot_inert` instead of `!inert`: a mechanism mid a transient runtime-degraded
+   episode now stays in the capability set, so it Arms (not Unsupported) and the runtime's own
+   `subscription_establishment()` overlay (already reading the union `inert`, untouched by this
+   fix) reports `coverage == None` for the episode's duration and recovers on the mechanism's next
+   successful pass with no push or restart needed. A Registry sweeper flip has the same shape and
+   the same fix (predates #4658, R5.7 (b)). The flip-gate risk-accept register entry
+   (`docs/spark-flip-gate.md` section 5) is closed, not deleted.
 2. `inert` is a polled bit, not an event. Read it through `stats_by_type()`: it is not latched,
    nothing announces a flip or a clear, and a heartbeat only sees an episode it happens to sample.
-   `SparkMechanismStats` cannot tell a boot-time inert (`start()` could not bind its OS facility,
-   so every `watch()` is refused) from a runtime one (watches are accepted but cannot be served
-   until a pass succeeds).
+   `SparkMechanismStats` now DOES tell a boot-time inert (`start()` could not bind its OS facility,
+   so every `watch()` is refused) apart from a runtime one (watches are accepted but cannot be
+   served until a pass succeeds) - told apart via the additive `boot_inert` field (#4685), which is
+   TRUE only for the boot-time case. `inert` itself is unchanged: still the polled union both
+   `emit_spark_heartbeat_tags` (the CSV) and `subscription_establishment()`'s coverage overlay read,
+   since either kind of gap means "not currently serviceable" for their purposes; only Guardian's
+   own capability filter narrows to `!boot_inert`.
 3. File and Registry differ:
    - Retry wake. File's wake IS its retry: an open episode always has a retry scheduled, at the
      backoff deadline or at once if that deadline has already passed, so an otherwise idle worker
@@ -1372,13 +1488,14 @@ further recorded limits.
    - Deadline stamp. File stamps the deadline in `note_pass_outcome_locked()`, before the pass's
      off-lock tail (the log line and `FilePassWork` destruction), so it can already be stale when
      the wait is computed; `wait_timeout_locked()` treats a passed deadline as retry-due-now.
-     Registry starts its backoff wait after its tail.
+     Registry starts its backoff wait after its tail (since #4704 the same tail as File's: the
+     pass-outcome line, then `SweepWork` destruction).
    - Completion passes. A File pass run for a real IOCP completion counts toward the three
      failures and is never throttled or absorbed; a successful one ends the episode.
-   - Clearing `inert`. File clears it on the first successful pass with no equivalent of
+   - Clearing `degraded_`. File clears it on the first successful pass with no equivalent of
      Registry's `if (core_)` check (Registry clears it only while its thread pool exists). The
-     File worker is the only writer of `inert` while it runs, so a recovery cannot clear a
-     boot-time inert.
+     File worker is the only writer of `degraded_` while it runs (`boot_inert_` is written only
+     by `start()`, #4685), so a recovery pass cannot clear a boot-time `boot_inert_`.
 4. Latency and limits, at the default 50 ms cadence:
    - `inert` flips after three consecutive failed passes, about 150 ms of backoff (50 ms, then
      100 ms) after the first failure, and clears at the next successful pass. After the cause is
@@ -1403,25 +1520,41 @@ further recorded limits.
    - Known limit: a blocked or slow log sink stalls the mechanism's own worker thread while it
      runs, for as long as the sink blocks; only agent shutdown is bounded (the 20 s
      `ShutdownDeadlineGuard`, `kShutdownDeadlineGrace`, armed in `AgentImpl::stop()` and in
-     `run()`'s teardown, ends in `hard_exit(4)` rather than an indefinite hang). The two
-     mechanisms are not the same shape: File's `log_pass_outcome()` runs OFF `mu_`
-     (`spark_file.cpp:3297`/`:3352`, after `lk.unlock()`), so a stalled sink there stalls only
-     IOCP draining and the worker join in `stop()` - `arm()`/`disarm()`/`stats()` keep working.
-     Registry's equivalent lines run WHILE `mu_` IS HELD: the recovery log
-     (`spark_registry.cpp:1895`) is released at `:1901` on the recovery path, and the failure and
-     inert-transition logs (`:1912`, `:1916`) are released at `:1919` on the failure path - two
-     different unlock points, neither reached from the other branch in the same pass. Either way
-     a stalled sink there stalls every other caller of
-     `mu_` (`arm()`, `disarm()`, `apply_test_controls()`) too, not only this worker's own
-     draining. Tracked as its own issue, #4704 (not folded into this design record's own
-     acceptance, since it needs a fix decision of its own).
+     `run()`'s teardown, ends in `hard_exit(4)` rather than an indefinite hang). Since #4704 the
+     two mechanisms share one shape for their pass-outcome lines (`pass failed`, `failing
+     persistently`, `pass recovered`): each is written OFF `mu_`, after the pass's bookkeeping
+     has released the lock. File: `log_pass_outcome()` (`spark_file.cpp:2941-2956`), called
+     after `lk.unlock()` at `:3316-3317` and `:3371-3372`. Registry: its own `PassOutcome` /
+     `log_pass_outcome()` (`spark_registry.cpp:1883-1912`), called after the `lk.unlock()` on
+     each of `sweeper_main()`'s two branches (recovery, and failure with the inert transition).
+     Before #4704 those three Registry lines ran while `mu_` was held, so a stalled sink there
+     also stalled every other `mu_` caller (`arm()`, `disarm()`, `apply_test_controls()`), a
+     strictly worse consequence than File's; the fix mirrored File's shape, not a shared async
+     primitive (ruled 2026-09-24). What a stalled sink still stalls, on either mechanism, is
+     that worker's own loop (File: IOCP draining; Registry: the next sweeper pass and any
+     re-arm or establishment report it owes) and the worker join in `stop()`;
+     `arm()`/`disarm()`/`stats()` keep working for a stall on one of the three pass-outcome
+     lines above. Registry's per-key `warn` lines (`fail_backend_locked()`,
+     `resolve_probe_locked()`, `park_lost_locked()`) are still written under `mu_`; they were
+     outside #4704's ruled scope and are tracked as #4999 (amended post-filing to correct a
+     stale citation and add `publish_locked()`'s own two sites, 5 total). File has its own
+     analogous per-key sites still under its own lock (e.g.
+     `defer_backend_retry_locked()`/`fail_backend_locked()` reached from `watch_incarnation()`),
+     tracked separately as #5002. Both issues are currently E6-capped by the same
+     `prefer_spark_=false` compensating control and are likely superseded once #4666's async log
+     hand-off is wired in as the process's default logger (#4666's own PR-2, already a blocking
+     F14 precondition here for unrelated reasons) - re-check whether either issue's fix is still
+     needed once that lands, rather than assuming per-site surgery is still required.
 5. The `pass_failed`, `pass_failures_consecutive` and `pass_backoff_ms` counters are readable only
    through the test seam (`file_debug_counters_for_test`, Windows only). The operator-visible
    signals are the log lines `spark_file: worker pass failed (consecutive #N) - retrying in M ms`,
    `spark_file: worker failing persistently - file sparks reported inert until a pass succeeds`
    and `spark_file: worker pass recovered after N failure(s)`, and the exclusion of `file` from
-   `yuzu.spark_mechs`. The fleet series cannot tell a boot-time inert from a runtime one, and no
-   alert on `yuzu_fleet_spark_mechanisms` ships today. A per-OS, per-mechanism alert is an F14
+   `yuzu.spark_mechs`. The fleet series STILL cannot tell a boot-time inert from a runtime one even
+   after #4685: `boot_inert` is agent-local only (Guardian's own in-process capability filter),
+   never serialised onto the wire or into the heartbeat - this fix does not give fleet telemetry a
+   way to distinguish startup refusal from runtime degradation - and no alert on
+   `yuzu_fleet_spark_mechanisms` ships today. A per-OS, per-mechanism alert is an F14
    precondition: it needs a `for:` hold of at least two heartbeats so a self-clearing episode does
    not fire it, a paging alert wants at least 10 minutes, tuned on fleet data, and it compares
    `_reporting` with the one mechanism's series, not the sum over mechanisms (see

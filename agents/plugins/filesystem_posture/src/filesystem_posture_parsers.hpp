@@ -10,6 +10,8 @@
  */
 #pragma once
 
+#include <network_fstype.hpp> // yuzu::shared::is_network_fstype (agents/shared)
+
 #include <cstddef> // std::size_t, std::byte -- previously transitive via <span>/<vector>
 #include <cstdint>
 #include <cstring>
@@ -444,35 +446,9 @@ inline std::string normalize_mount_flags(std::string_view options_csv) {
 /// after which no command reaches the host at all. A name this list misses is
 /// therefore an availability risk, not a missing number.
 ///
-/// This is a DENY-list by name and is inherently incomplete -- the durable fix
-/// is to invert it to a known-local allowlist. Until then it covers the network
-/// and paravirtualised/cluster types whose backing store is remote: nfs*, cifs,
-/// smb3, smbfs, afs, ceph, glusterfs, 9p, virtiofs, lustre, beegfs, gfs2,
-/// ocfs2, autofs (a direct-map trigger point blocks on traversal), and any
-/// "fuse.<suffix>" that is network-backed.
-inline bool is_network_fstype(std::string_view fstype) {
-    constexpr std::string_view kExact[] = {
-        "nfs",   "nfs3",     "nfs4",   "cifs",   "smb3",  "smbfs", "afs",
-        "ceph",  "glusterfs",
-        // G4-04 additions -- remote or cluster-backed, all able to block:
-        "9p",    "virtiofs", "lustre", "beegfs", "gfs2",  "ocfs2", "autofs"};
-    for (auto s : kExact) {
-        if (fstype == s)
-            return true;
-    }
-    constexpr std::string_view kFusePrefix = "fuse.";
-    if (fstype.rfind(kFusePrefix, 0) == 0) {
-        auto suffix = fstype.substr(kFusePrefix.size());
-        constexpr std::string_view kFuseSuffixes[] = {"sshfs",  "s3fs",   "davfs",
-                                                     "rclone", "cephfs", "glusterfs",
-                                                     "nfs",    "smb"};
-        for (auto s : kFuseSuffixes) {
-            if (suffix == s)
-                return true;
-        }
-    }
-    return false;
-}
+/// The deny-list itself (and its known gaps) lives in agents/shared/network_fstype.hpp, shared
+/// with the runtimes plugin's directory walk.
+using yuzu::shared::is_network_fstype;
 
 // ── snapshot enumeration decoders ───────────────────────────────────────
 

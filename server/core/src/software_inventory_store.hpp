@@ -49,11 +49,15 @@ class PgPool;
 
 namespace yuzu::server {
 
-/// One installed-software entry. **Machine-wide scope only** — no per-user /
-/// username / SID / user-path (ADR-0016: no PII, no works-council trigger).
+/// One installed-software entry. **Machine-scope collection only** (see
+/// ADR-0016 §8): no per-user rows and no username/SID fields. The wire tail's
+/// `install_location` and `uninstall_string` slots (13-14) are reserved: the server
+/// neither stores nor hashes them until §8 is re-opened for them (#5186).
 ///
-/// Blob contract v2: member order == the wire/hash field order (append-only —
-/// the canonical hash and the agent's blob builder walk this exact sequence).
+/// Blob contract v2 + extended tail: member order == the wire/hash field order (append-only —
+/// the canonical hash walks this exact sequence, except that wire slots 13-14 have no member
+/// and are hashed as empty; the agent's blob builder walks the first 12 today, the tail rule
+/// is the agent's to mirror).
 /// Fields an ecosystem does not store are EMPTY, never synthesised: NEVRA +
 /// signature populate on Linux package managers per their capability (rpm =
 /// full; deb = no signature; apk/pacman = name/EVR only); Windows/macOS rows
@@ -72,12 +76,25 @@ struct SoftwareEntry {
     std::string signature_status; // "signed"|"unsigned" (rpm stored tags only)
     std::string distro_id;        // /etc/os-release ID
     std::string distro_version;   // /etc/os-release VERSION_ID
+    // Extended tail (wire slots 15-16; 13-14 are reserved and have no member): enters the
+    // canonical hash ONLY when package_id or source is non-empty — a v2 agent's 12-field
+    // bytes are unchanged.
+    std::string package_id;
+    std::string source; // <plugin>.<action> that produced the row
 };
 
 /// One fleet-query row: which agent carries which entry.
 struct SoftwareFleetRow {
     std::string agent_id;
     SoftwareEntry entry;
+    std::int64_t install_id{0}; ///< row id (BIGSERIAL); keyset tiebreak, churns on full replace
+};
+
+/// Keyset position for `SoftwareFleetQuery::after`: the last row of the previous page.
+struct SoftwareCursor {
+    std::string name;
+    std::string agent_id;
+    std::int64_t install_id{0};
 };
 
 /// One fleet-catalogue row — a software title rolled up across the WHOLE fleet
@@ -121,19 +138,33 @@ struct CatalogRollupMeta {
     std::int64_t total_devices{0};
 };
 
-/// Fleet-wide software query. Empty filters match all; results are capped.
+/// Fleet-wide software query. Empty filters match all; results are ordered by
+/// (name, agent_id, install_id).
 struct SoftwareFleetQuery {
     std::string agent_id; ///< exact agent filter ("" = all agents)
     std::string name;     ///< exact software-name filter ("" = all names)
+    /// Page size. Silently clamped to kFleetQueryRowCap by the store, so a
+    /// short page is NOT proof of exhaustion: page until an EMPTY page.
     int limit{1000};
-    // No offset: see query_software (gov consistency N1) — keyset is the #1634 follow-up.
+    std::string q;         ///< case-insensitive substring over name|publisher|ecosystem|source
+    std::string kind;      ///< exact kind filter
+    std::string ecosystem; ///< exact ecosystem filter
+    std::string source;    ///< exact source filter
+    /// Resume strictly after this (name, agent_id, install_id) in result order. Page with
+    /// `after = {last.entry.name, last.agent_id, last.install_id}` until an empty page.
+    /// install_id churns when an agent's list is fully replaced, so a walk concurrent with
+    /// one agent's resync can repeat or skip that agent's same-name rows.
+    std::optional<SoftwareCursor> after;
 };
 
 class SoftwareInventoryStore {
 public:
     /// Borrows the shared pool and runs the `software_inventory_store` schema
-    /// migration on a pinned lease. `is_open()` is false if the lease was empty
-    /// or the migration failed (the server fails closed before reaching here).
+    /// migration on a pinned lease. `is_open()` is false if the lease was empty,
+    /// the migration failed, or the post-migration LIMIT 0 projection failed
+    /// (typically a column the queries use is missing although schema_meta is
+    /// current; the guard refuses on any probe error); the server fails closed
+    /// before reaching here.
     explicit SoftwareInventoryStore(pg::PgPool& pool);
 
     SoftwareInventoryStore(const SoftwareInventoryStore&) = delete;
@@ -150,11 +181,12 @@ public:
     /// emit site is null-guarded.
     void set_metrics(yuzu::MetricsRegistry* m) noexcept { metrics_ = m; }
 
-    /// Canonical content hash over a machine-scope software list — the SAME
-    /// algorithm the agent uses (sorted+deduplicated; fields unit-separated
-    /// 0x1F, entries record-separated 0x1E; SHA-256 hex), so the agent's
-    /// claimed hash and the server's recomputed/stored hash are comparable
-    /// (ADR-0016 §4). Pure/deterministic; takes its argument by value.
+    /// Canonical content hash over a machine-scope software list (sorted +
+    /// deduplicated; fields unit-separated 0x1F, entries record-separated 0x1E;
+    /// SHA-256 hex). The agent's builder walks the first 12 fields today; the
+    /// tail rule is the agent's to mirror, so the agent's claimed hash and the
+    /// server's recomputed/stored hash stay comparable (ADR-0016 §4).
+    /// Pure/deterministic; takes its argument by value.
     [[nodiscard]] static std::string canonical_hash(std::vector<SoftwareEntry> entries);
 
     /// Hash-skip ingest for the `installed_software` source (ADR-0016 §4).

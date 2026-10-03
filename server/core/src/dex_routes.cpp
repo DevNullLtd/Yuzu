@@ -1,5 +1,6 @@
 #include "dex_routes.hpp"
 
+#include "dex_read_builders.hpp" // dex_device_score -- dex_routes.hpp no longer re-exports it (WS-A4 PR-1 F1 fix)
 #include "guaranteed_state_store.hpp"
 #include "http_route_sink.hpp"
 #include "rest_a4_envelope_http.hpp" // detail::a4_denial (deny_service_scoped_) — mints/reuses
@@ -57,135 +58,16 @@ std::string num(int64_t n) { return std::to_string(n); }
 } // namespace — the catalogue accessors below are PUBLIC (declared in
   // dex_routes.hpp) since F1: the Settings → DEX alerts panel renders the
   // routable-type list from the same single source of truth.
-
-// The catalogued signal types (114 today), GROUPED for display — the server-side mirror
-// of the agent catalogue (dex_signal_catalog.cpp; keep in sync when adding a
-// signal). The All-signals panel renders EVERY entry, fired or not, so
-// operators see what the fleet is monitoring — not just what happened to fire
-// in the window. Types present in the DB but absent here (a newer agent's
-// signal) are appended under "Other" with the raw-label fallback, so the panel
-// never hides data.
-
-const std::vector<DexSignalGroup>& dex_signal_groups() {
-    static const std::vector<DexSignalGroup> kGroups = {
-        {"App reliability",
-         {"process.crashed", "process.hung", "process.crashed_managed",
-          "process.file_access_failure", "app.sxs_error", "app.activation_failed",
-          "app.com_failed", "app.error_popup", "app.shutdown_blocked",
-          "app.push_notification_error", "app.file_association_reset", "app.staterepo_error"}},
-        {"Boot, start-up & shutdown",
-         {"os.boot", "boot.degraded_app", "boot.degraded_driver", "boot.degraded_service",
-          "boot.degraded_device", "boot.fast_startup_failed", "os.shutdown",
-          "shutdown.degraded", "os.restart_initiated", "os.standby", "os.standby_degraded",
-          "os.modern_standby_exit", "os.resume_report", "os.uptime_report"}},
-        {"Service health",
-         {"service.crashed", "service.start_failed", "service.start_timeout", "service.hung",
-          "service.unresponsive", "service.logon_failed", "service.recovery_failed",
-          "service.shutdown_failed", "service.dependency_failed"}},
-        {"System stability",
-         {"os.bugcheck", "os.power_loss", "os.dirty_shutdown", "os.time_unsynced",
-          "os.activation_failed", "os.vss_error", "os.shadow_copies_lost",
-          "os.crashdump_disabled", "display.driver_reset", "display.dwm_exited",
-          "memory.exhausted"}},
-        {"Hardware & storage",
-         {"hw.error", "hw.device_start_failed", "hw.driver_load_failed", "hw.user_driver_error",
-          "hw.cpu_throttled", "hw.battery_error", "hw.tpm_error", "disk.error",
-          "disk.smart_failure", "disk.port_reset", "storage.low"}},
-        {"Performance",
-         {"perf.cpu_sustained", "perf.memory_pressure", "perf.disk_latency_high"}},
-        {"File system",
-         {"fs.corruption", "fs.write_lost", "fs.flush_failed", "fs.database_corrupt",
-          "fs.hive_recovered", "fs.autochk_ran"}},
-        {"Network",
-         {"network.wifi_drop", "network.wifi_connect_failed", "network.adapter_driver_dump",
-          "network.adapter_reset", "network.dns_timeout", "network.dns_register_failed",
-          "network.dhcp_failed",
-          "network.vpn_failed", "network.smb_failed", "network.smb_write_lost",
-          "network.ip_conflict", "network.name_conflict", "network.port_exhaustion",
-          "session.rdp_disconnected"}},
-        {"Identity & logon",
-         {"logon.temp_profile", "logon.profile_locked", "logon.slow_subscriber",
-          "logon.folder_redirect_failed", "logon.no_dc", "logon.winlogon_terminated",
-          "logon.machine_trust_failed", "logon.biometric_error", "logon.hello_error",
-          "logon.aad_token_error", "security.kerberos_error", "security.auth_error"}},
-        {"Security & protection",
-         {"security.rtp_disabled", "security.rtp_error", "security.threat_detected",
-          "security.threat_action_failed", "security.av_update_failed",
-          "security.tamper_blocked", "security.tls_alert", "security.bitlocker_error",
-          "security.cert_enroll_failed"}},
-        {"Updates & installs",
-         {"update.failed", "update.check_failed", "update.download_failed",
-          "update.transfer_failed", "app_install.failed", "app_uninstall.failed",
-          "app_install.appx_failed"}},
-        {"Policy & management",
-         {"gpo.failed", "gpo.cse_failed", "mgmt.mdm_error"}},
-        {"Printing",
-         {"print.failed", "print.driver_install_failed", "print.plugin_failed"}},
-    };
-    return kGroups;
-}
-
-std::size_t dex_catalogued_type_count() {
-    std::size_t n = 0;
-    for (const auto& g : dex_signal_groups())
-        n += g.types.size();
-    return n;
-}
-
-// Per-obs_type platform coverage — which OSes collect a signal type today. Windows
-// is the whole EvtSubscribe catalogue; Linux (dex_linux_*) and macOS (dex_macos_*)
-// collect the subsets below. THIN explicit map (the one bit of new grouping) — keep
-// in sync with the agent collectors; a schema↔catalogue cross-check test guards it.
-std::vector<std::string> dex_obs_platforms(const std::string& obs_type) {
-    static const char* const kLinux[] = {
-        // poll_perf: /proc/stat + /proc/meminfo + /proc/diskstats breaches (all three
-        // via the SAME win::breach_update used on Windows) + statvfs storage + uptime
-        "perf.cpu_sustained", "perf.memory_pressure", "perf.disk_latency_high", "storage.low",
-        "os.uptime_report",
-        // poll_throttle: sysfs thermal-throttle counter (dex_linux_sysfs → dex_linux_collector)
-        "hw.cpu_throttled",
-        // systemd-structured journal records (dex_linux_journal)
-        "process.crashed", "service.crashed", "service.hung", "os.time_unsynced",
-        // kernel-transport journal lines, classified by dex_linux_kmsg
-        // (classify_kernel_message, delegated from parse_journal_line)
-        "memory.exhausted", "os.bugcheck", "os.dirty_shutdown", "disk.error", "fs.corruption",
-        "hw.error", "process.hung"};
-    // The Linux DEX observer (dex_linux_collector) drives all of the above: poll_perf
-    // (the /proc CPU + memory + diskstats breach trio — perf.disk_latency_high is the
-    // /proc/diskstats await breach, as live as cpu/mem on any ordinary sd*/nvme*/mmcblk
-    // disk; only exotic/fabric storage is excluded, dex_linux_proc.hpp is_whole_disk) +
-    // statvfs storage + the sysfs throttle counter + the journald poll, whose every
-    // `_TRANSPORT=kernel` line is delegated to dex_linux_kmsg's classify_kernel_message
-    // (so the kmsg-classified types ARE emitted at runtime via journald, not a separate
-    // unwired reader). Keep this map and the drift-net test in test_dex_routes.cpp in
-    // lockstep with the collectors — they are hand-maintained because the server suite
-    // can't introspect the agent (durable fix: generate from the collector registries).
-    static const char* const kMac[] = {
-        "process.crashed", "process.hung",  "os.bugcheck",     "memory.exhausted",
-        "os.uptime_report", "disk.smart_failure", "hw.error",  "storage.low",
-        "hw.cpu_throttled", "service.crashed",    "network.wifi_drop", "update.failed",
-        "print.failed",     "mgmt.mdm_error",     "logon.no_dc",       "fs.corruption"};
-    auto in = [&](const char* const* arr, std::size_t n) {
-        for (std::size_t i = 0; i < n; ++i)
-            if (obs_type == arr[i])
-                return true;
-        return false;
-    };
-    std::vector<std::string> out;
-    out.emplace_back("windows"); // the catalogue IS the Windows EvtSubscribe set
-    if (in(kLinux, std::size(kLinux)))
-        out.emplace_back("linux");
-    if (in(kMac, std::size(kMac)))
-        out.emplace_back("macos");
-    return out;
-}
-
-// One family's slice of the canonical health composite — the SAME formula as
-// dex_compute_health (severity × default-preset × device-impact), for one family.
-// Forward-declared here (used by the Catalogue above its definition); defined just
-// after dex_compute_health below so it shares the family-weights helpers.
-double dex_family_health_deduction(const DexSignalGroup& g,
-                                   const std::vector<DexSignalCount>& signals, int64_t N);
+  //
+  // `dex_signal_groups`, `dex_catalogued_type_count`, `dex_obs_platforms`,
+  // `dex_family_health_deduction`, `dex_family_rollup`, `dex_compute_health`
+  // and `dex_family_index` are declared in `dex_types.hpp` and now DEFINED in
+  // `dex_types.cpp` (ADR-0031 WS-A4 PR-1 F1 fix, Fable review 2026-09-28) — the
+  // definitions used to live here despite the pure-header declaration, so core
+  // TUs (`dex_read_model.cpp`) linked against this presentation TU, invisible
+  // to the include-closure seam gate. This file's own renderers below call the
+  // exact same declarations, now satisfied from `dex_types.cpp` instead
+  // (ODR-safe relocation, not a duplication; no logic changes).
 
 // Friendly display label for an obs_type — the ONE place the catalogue taxonomy
 // meets the UI. Unknown types fall back to the escaped raw obs_type, so a signal
@@ -372,31 +254,17 @@ std::string back_to_overview(const std::string& window) {
            "style=\"cursor:pointer;\">&larr; Reliability overview</a>";
 }
 
-// ISO-8601 UTC cutoff for "N days ago"; "" for days<=0 (the "all" window, where a
-// per-device-days rate is ill-defined). Mirrors guardian_ingest's ts_to_iso8601.
-std::string iso_days_ago(int days) {
-    if (days <= 0)
-        return {};
-    const auto t = std::chrono::system_clock::now() - std::chrono::hours(24 * days);
-    std::time_t tt = std::chrono::system_clock::to_time_t(t);
-    std::tm tm{};
-#if defined(_WIN32)
-    gmtime_s(&tm, &tt);
-#else
-    gmtime_r(&tt, &tm);
-#endif
-    char buf[32];
-    std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", &tm);
-    return buf;
-}
-
-// Map the window selector value to a day count (0 = "all").
-int window_to_days(const std::string& w) {
-    if (w == "24h") return 1;
-    if (w == "30d") return 30;
-    if (w == "all") return 0;
-    return 7; // "7d" / default
-}
+// ISO-8601 UTC cutoff for "N days ago" / the window→day-count map — the REAL
+// logic now lives in `dex_window.cpp` as `dex_iso_since`/`dex_window_to_days`
+// (declared in the pure `dex_window.hpp`, ADR-0031 WS-A4 PR-1 F1 fix, Fable
+// review 2026-09-28): this file used to define BOTH the public wrappers below
+// AND these file-local helpers with duplicated bodies, so a core TU
+// (`dex_api.cpp`) linked against this presentation TU's object file for the
+// public names, invisible to the include-closure seam gate. These two names
+// stay (used at ~20 call sites across this file's route handlers below) but
+// now simply forward — one implementation, no logic changes.
+std::string iso_days_ago(int days) { return dex_iso_since(days); }
+int window_to_days(const std::string& w) { return dex_window_to_days(w); }
 
 // CANONICAL window token for a day count — the inverse of window_to_days. This
 // is the XSS chokepoint (governance Gate-8 HIGH): the window value is
@@ -505,14 +373,11 @@ std::string history_detail(const GuardianObservationRow& r) {
 
 } // namespace
 
-// Public wrappers over the internal window helpers (declared in dex_window.hpp) so
-// the /api/v1/dex REST surface resolves the window token through the exact same
-// logic as the dashboard fragments — no second copy of the 24h/7d/30d/all mapping.
-int dex_window_to_days(const std::string& window) { return window_to_days(window); }
-std::string dex_iso_since(int days) { return iso_days_ago(days); }
-std::string dex_normalize_os_filter(const std::string& os) {
-    return (os == "windows" || os == "linux" || os == "macos") ? os : std::string{};
-}
+// `dex_window_to_days`/`dex_iso_since`/`dex_normalize_os_filter` are declared in
+// `dex_window.hpp` and DEFINED in `dex_window.cpp` (see the comment above
+// `iso_days_ago`/`window_to_days`) — this file's own `since`/`window_days`
+// locals below call the exact same declarations, transitively via those two
+// file-local forwarders.
 
 // Canonical window token from the (already-validated) window_days — safe to put
 // into hx-get attributes (no raw param reaches markup; Gate-8 XSS discipline).
@@ -559,35 +424,11 @@ std::string dex_window_chips(const char* frag, int window_days) {
            chip("30d", "30d") + chip("all", "All") + "</div>";
 }
 
-// One family's rollup over the window (events, active count, blast radius, leader).
-// #4035: DexFamilyRollup itself moved to dex_routes.hpp (external linkage, no
-// longer inside this TU's anonymous namespace below) so dex_read_model.cpp can
-// build the same rollup without a second copy (Rule 1) — this stays the ONE definition
-// of the function, now implementing the header's declared struct.
-DexFamilyRollup dex_family_rollup(const DexSignalGroup& g,
-                                  const std::vector<DexSignalCount>& signals) {
-    DexFamilyRollup r;
-    r.total = static_cast<int>(g.types.size());
-    r.benign = std::string(g.name) == "Boot, start-up & shutdown";
-    for (const char* t : g.types) {
-        const DexSignalCount* c = nullptr;
-        for (const auto& s : signals)
-            if (s.obs_type == t) {
-                c = &s;
-                break;
-            }
-        if (!c)
-            continue;
-        r.events += c->count;
-        if (c->count > 0)
-            ++r.active;
-        if (c->distinct_devices > r.max_signal_devices)
-            r.max_signal_devices = c->distinct_devices; // #1374: max, not union (see field doc)
-        if (!r.top || c->count > r.top->count)
-            r.top = c;
-    }
-    return r;
-}
+// `dex_family_rollup` (events, active count, blast radius, leader for one family
+// over the window) is declared in `dex_types.hpp` and now DEFINED in
+// `dex_types.cpp` alongside its sibling pure catalogue/health functions (see the
+// note above `dex_signal_groups`) — the renderers below call the exact same
+// declaration.
 
 // DEX Catalogue — View 1: the 13 family cards (mockup dex-catalogue.html). Replaces
 // the flat All-signals table with a card grid that drills into a family, then a
@@ -1145,125 +986,16 @@ std::string render_dex_catalogue_signal_fragment(const GuaranteedStateStore* sto
     return h;
 }
 
-// The composite-score weighting policy (mockup dex-health-score.html). Names MUST
-// match dex_signal_groups(). `severity` = how much a failure of this family hurts
-// experience; the four multipliers are the server-chosen weighting PRESETS. This
-// is policy (transparent + shown), not data — the DATA is the measured impact rate.
-struct DexFamilyWeight {
-    const char* name;
-    const char* severity; // "high" | "med" | "low"
-    double m_default, m_stability, m_productivity, m_security;
-};
-const std::vector<DexFamilyWeight>& dex_family_weights() {
-    static const std::vector<DexFamilyWeight> w = {
-        {"App reliability", "high", 1.0, 1.3, 1.1, 0.8},
-        {"System stability", "high", 1.0, 1.6, 0.9, 0.9},
-        {"Network", "med", 1.0, 0.8, 1.5, 0.9},
-        {"Service health", "med", 1.0, 1.2, 1.0, 0.9},
-        {"Updates & installs", "med", 1.0, 1.0, 1.1, 1.0},
-        {"Security & protection", "high", 1.0, 0.8, 0.7, 2.2},
-        {"Identity & logon", "med", 1.0, 0.9, 1.2, 1.6},
-        {"Hardware & storage", "med", 1.0, 1.4, 0.8, 0.9},
-        {"Performance", "med", 1.0, 1.1, 1.5, 0.7},
-        {"Printing", "low", 1.0, 0.6, 1.6, 0.6},
-        {"Boot, start-up & shutdown", "low", 1.0, 0.9, 1.5, 0.7},
-        {"Policy & management", "low", 1.0, 0.9, 0.9, 1.3},
-        {"File system", "low", 1.0, 1.3, 0.7, 0.9},
-    };
-    return w;
-}
-double dex_severity_points(const std::string& sev) {
-    return sev == "high" ? 12.0 : (sev == "med" ? 6.0 : 2.0);
-}
-double dex_preset_mult(const DexFamilyWeight& fw, const std::string& preset) {
-    if (preset == "stability")
-        return fw.m_stability;
-    if (preset == "productivity")
-        return fw.m_productivity;
-    if (preset == "security")
-        return fw.m_security;
-    return fw.m_default;
-}
-
-// The composite-health computation, shared by the Health page and the Overview
-// hub's health teaser. score = 100 − Σ deductions; -1 when N<=0 (suppressed, no
-// reporting agents → no fabricated 100).
-// #4035: DexHealthResult moved to dex_routes.hpp (same rationale as
-// DexFamilyRollup above) so dex_read_model.cpp's health-score builder shares
-// this exact computation instead of a second copy (Rule 1).
-DexHealthResult dex_compute_health(const std::vector<DexSignalCount>& signals, int64_t N,
-                                   const std::string& preset) {
-    DexHealthResult r;
-    if (N <= 0)
-        return r;
-    double total = 0.0;
-    for (const auto& fw : dex_family_weights()) {
-        const DexSignalGroup* g = nullptr;
-        for (const auto& grp : dex_signal_groups())
-            if (std::string(grp.name) == fw.name) {
-                g = &grp;
-                break;
-            }
-        const DexFamilyRollup rr = g ? dex_family_rollup(*g, signals) : DexFamilyRollup{};
-        // #1374: largest single-signal device radius, not the family union (see field doc).
-        double impact = static_cast<double>(rr.max_signal_devices) / static_cast<double>(N);
-        if (impact > 1.0)
-            impact = 1.0;
-        const double ded = dex_severity_points(fw.severity) * dex_preset_mult(fw, preset) * impact;
-        r.deds.push_back({fw.name, fw.severity, ded});
-        total += ded;
-    }
-    r.score = std::clamp(100.0 - total, 0.0, 100.0);
-    return r;
-}
-
-// One family's deduction — the per-family term of dex_compute_health above, factored
-// out so the Catalogue's per-card score is provably the SAME number (default preset).
-double dex_family_health_deduction(const DexSignalGroup& g,
-                                   const std::vector<DexSignalCount>& signals, int64_t N) {
-    if (N <= 0)
-        return 0.0;
-    const DexFamilyRollup rr = dex_family_rollup(g, signals);
-    // #1374: impact uses the largest single-signal device radius, not the family
-    // union — documented in the methodology so the number and label agree. A union
-    // would deduct more for disjoint-device families; this stays the (intentionally
-    // approximate, cross-family-overlapping) secondary composite.
-    double impact = static_cast<double>(rr.max_signal_devices) / static_cast<double>(N);
-    if (impact > 1.0)
-        impact = 1.0;
-    for (const auto& fw : dex_family_weights())
-        if (std::string(fw.name) == g.name)
-            return dex_severity_points(fw.severity) * dex_preset_mult(fw, "default") * impact;
-    return 0.0;
-}
-
-int dex_device_score(const GuaranteedStateStore* store, const std::string& agent_id,
-                     const std::string& since) {
-    if (!store)
-        return -1;
-    const auto device_signals = store->dex_device_signal_summary(agent_id, since);
-    double total = 0.0;
-    for (const auto& fw : dex_family_weights()) {
-        const DexSignalGroup* g = nullptr;
-        for (const auto& grp : dex_signal_groups())
-            if (std::string(grp.name) == fw.name) {
-                g = &grp;
-                break;
-            }
-        if (!g)
-            continue;
-        const DexFamilyRollup rr = dex_family_rollup(*g, device_signals);
-        if (rr.benign || rr.events <= 0) // benign reports (boot/uptime) never deduct
-            continue;
-        // Per-device impact: this device's events in the family, gently scaled
-        // (1 event = partial; kCap+ events = full severity). Illustrative cap,
-        // pending calibration (like the perf baseline).
-        constexpr double kCap = 5.0;
-        const double impact = std::min(1.0, static_cast<double>(rr.events) / kCap);
-        total += dex_severity_points(fw.severity) * dex_preset_mult(fw, "default") * impact;
-    }
-    return static_cast<int>(std::clamp(100.0 - total, 0.0, 100.0) + 0.5);
-}
+// `DexFamilyWeight`/`dex_family_weights`/`dex_severity_points`/`dex_preset_mult`
+// and `dex_compute_health`/`dex_family_health_deduction` are declared in
+// `dex_types.hpp` and now DEFINED in `dex_types.cpp` (see the note above
+// `dex_signal_groups`, ADR-0031 WS-A4 PR-1 F1 fix, Fable review 2026-09-28).
+//
+// `dex_score_from_signals`/`dex_device_score` are declared in the core-only
+// `dex_read_builders.hpp` and now DEFINED in `dex_read_model.cpp` (core),
+// closing the WS-B2 "LINK RESIDUAL" #4579 that header's own doc comment
+// flagged for both — `dex_device_score` is still called by the Overview
+// renderer below via that exact declaration.
 
 // DEX Health score — the derived/SECONDARY composite (mockup dex-health-score.html).
 // score = 100 − Σ deductions; deduction(family) = severity points × preset
@@ -1414,17 +1146,11 @@ std::string render_dex_health_fragment(const GuaranteedStateStore* store, const 
     return h;
 }
 
-// obs_type → family index (into dex_signal_groups), or -1.
-int dex_family_index(const std::string& obs_type) {
-    int fi = 0;
-    for (const auto& g : dex_signal_groups()) {
-        for (const char* t : g.types)
-            if (obs_type == t)
-                return fi;
-        ++fi;
-    }
-    return -1;
-}
+// `dex_family_index` (obs_type → family index into dex_signal_groups, or -1) is
+// declared in `dex_types.hpp` and now DEFINED in `dex_types.cpp` (see the note
+// above `dex_signal_groups`) — the Trends renderer below calls the exact same
+// declaration.
+
 // Inline-SVG sparkline from a daily series.
 std::string dex_sparkline(const std::vector<int64_t>& series, const char* color) {
     if (series.empty())
@@ -1675,10 +1401,13 @@ std::string render_dex_overview_fragment(const GuaranteedStateStore* store,
             seg_sum.push_back(0);
             return seg_os.size() - 1;
         };
+        int unscored = 0;
         for (const auto& [id, os] : fleet.connected_agents) {
             const int s = dex_device_score(store, id, since);
-            if (s < 0)
+            if (s < 0) {
+                ++unscored; // #4855: null store OR a degraded per-device read
                 continue;
+            }
             ds.push_back(s);
             const std::size_t i = seg_idx(os.empty() ? std::string("unknown") : os);
             ++seg_n[i];
@@ -1740,7 +1469,7 @@ std::string render_dex_overview_fragment(const GuaranteedStateStore* store,
         h += "<div class=\"gp-sech\">Experience</div>";
         h += "<div class=\"gp-tiles\">";
         h += stile(overall, "Overall experience",
-                   ds.empty() ? "no devices reporting"
+                   ds.empty() ? (unscored > 0 ? "scores unavailable" : "no devices reporting")
                               : "median of " + num(static_cast<int64_t>(ds.size())) + " devices");
         h += stile(dev, "Device", "stability &middot; perf &middot; hardware");
         h += stile(app, "App", "crashes &amp; hangs");
@@ -1751,6 +1480,12 @@ std::string render_dex_overview_fragment(const GuaranteedStateStore* store,
                       : "types monitored &middot; " +
                             num(static_cast<int64_t>(cscope.size())) + " platform(s)");
         h += "</div>";
+        // #4855: a degraded per-device read must never silently thin the
+        // scored population -- surface the count so "N great/fair/poor"
+        // reads as "of the devices we could read", not "of the fleet".
+        if (unscored > 0)
+            h += "<div class=\"gp-note\">" + num(unscored) +
+                 " device(s) could not be scored (DEX store read degraded).</div>";
         if (!ds.empty()) {
             auto seg = [](int n, const char* color) {
                 return n <= 0 ? std::string()
@@ -2641,25 +2376,25 @@ bool DexRoutes::deny_service_scoped_(const httplib::Request& req, httplib::Respo
 
 void DexRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn perm_fn,
                                 GuaranteedStateStore* store, FleetFn fleet_fn, AuditFn audit_fn,
-                                DispatchFn dispatch_fn, ResponsesFn responses_fn, PerfFn perf_fn,
+                                DispatchFn dispatch_fn, ResponsesFn responses_fn,
                                 ScopedPermFn scoped_perm_fn, VisibleSetFn visible_set_fn,
-                                AppPerfProviders app_perf_providers, GroupListFn group_list_fn,
+                                DexPerfApiPtr dex_perf_api, GroupListFn group_list_fn,
                                 FleetReadFn fleet_read_fn) {
     // Production adapter: wrap the httplib server in the route-sink seam and
     // delegate to the testable overload (mirrors GuardianRoutes / RestApiV1).
     HttplibRouteSink sink(svr);
     register_routes(sink, std::move(auth_fn), std::move(perm_fn), store, std::move(fleet_fn),
                     std::move(audit_fn), std::move(dispatch_fn), std::move(responses_fn),
-                    std::move(perf_fn), std::move(scoped_perm_fn), std::move(visible_set_fn),
-                    std::move(app_perf_providers), std::move(group_list_fn),
+                    std::move(scoped_perm_fn), std::move(visible_set_fn),
+                    std::move(dex_perf_api), std::move(group_list_fn),
                     std::move(fleet_read_fn));
 }
 
 void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_fn,
                                 GuaranteedStateStore* store, FleetFn fleet_fn, AuditFn audit_fn,
-                                DispatchFn dispatch_fn, ResponsesFn responses_fn, PerfFn perf_fn,
+                                DispatchFn dispatch_fn, ResponsesFn responses_fn,
                                 ScopedPermFn scoped_perm_fn, VisibleSetFn visible_set_fn,
-                                AppPerfProviders app_perf_providers, GroupListFn group_list_fn,
+                                DexPerfApiPtr dex_perf_api, GroupListFn group_list_fn,
                                 FleetReadFn fleet_read_fn) {
     auth_fn_ = std::move(auth_fn);
     perm_fn_ = std::move(perm_fn);
@@ -2670,8 +2405,7 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
     audit_fn_ = std::move(audit_fn);
     dispatch_fn_ = std::move(dispatch_fn);
     responses_fn_ = std::move(responses_fn);
-    perf_fn_ = std::move(perf_fn);
-    app_perf_providers_ = std::move(app_perf_providers);
+    dex_perf_api_ = std::move(dex_perf_api);
     fleet_read_fn_ = std::move(fleet_read_fn);
     group_list_fn_ = std::move(group_list_fn);
 
@@ -2900,9 +2634,15 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
                                             "Agent", id, "DEX per-device signal history");
         // PR2: feed the percentile strips from the perf snapshot (default
         // cohort key — the strips compare against the conventional cohort).
+        // A null dex_perf_api_ (unwired) omits the strips section entirely; a
+        // wired-but-empty dex_perf_fn inside instead collapses to an all-empty
+        // DexPerfSnapshot{}, so the strips section renders (an accepted,
+        // disclosed delta — see the split delivery matrix's WS-A4 row — the
+        // strips section already renders an honest "no comparison data" over
+        // an empty snapshot, so this is not a "fake empty").
         std::optional<DexPerfSnapshot> snap;
-        if (perf_fn_)
-            snap = perf_fn_(kDexDefaultCohortKey);
+        if (dex_perf_api_)
+            snap = dex_perf_api_->fleet_snapshot(kDexDefaultCohortKey);
         res.set_content(render_dex_device_fragment(store_, id, w, snap ? &*snap : nullptr),
                         "text/html; charset=utf-8");
     });
@@ -2974,7 +2714,10 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
             return;
         const int window_days =
             window_to_days(req.has_param("window") ? req.get_param_value("window") : "7d");
-        if (!perf_fn_) {
+        // server.cpp constructs dex_perf_api_ UNCONDITIONALLY in production; a
+        // null value here is a test-only/misconfigured-deployment case, never
+        // "no data".
+        if (!dex_perf_api_) {
             res.set_content(placeholder("Fleet performance unavailable",
                                         "This server has no perf snapshot provider wired."),
                             "text/html; charset=utf-8");
@@ -2987,7 +2730,7 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
             req.has_param("key") ? req.get_param_value("key") : kDexDefaultCohortKey;
         if (!valid_tag_key(key))
             key = kDexDefaultCohortKey;
-        res.set_content(render_dex_perf_fragment(perf_fn_(key), window_days),
+        res.set_content(render_dex_perf_fragment(dex_perf_api_->fleet_snapshot(key), window_days),
                         "text/html; charset=utf-8");
     });
 
@@ -2997,7 +2740,7 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
             return;
         const int window_days =
             window_to_days(req.has_param("window") ? req.get_param_value("window") : "7d");
-        if (!perf_fn_) {
+        if (!dex_perf_api_) { // #4626: see /fragments/dex/perf's own comment above
             res.set_content(placeholder("Fleet performance unavailable",
                                         "This server has no perf snapshot provider wired."),
                             "text/html; charset=utf-8");
@@ -3010,7 +2753,8 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
         // residual, and the pure model reports found=false for an unknown one.
         const std::string a = req.has_param("a") ? req.get_param_value("a") : "";
         const std::string b = req.has_param("b") ? req.get_param_value("b") : "";
-        res.set_content(render_dex_perf_cohort_diff_fragment(perf_fn_(key), a, b, window_days),
+        res.set_content(render_dex_perf_cohort_diff_fragment(dex_perf_api_->fleet_snapshot(key), a,
+                                                             b, window_days),
                         "text/html; charset=utf-8");
     });
 
@@ -3030,7 +2774,7 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
             return;
         const int window_days =
             window_to_days(req.has_param("window") ? req.get_param_value("window") : "7d");
-        if (!perf_fn_) {
+        if (!dex_perf_api_) { // #4626: see /fragments/dex/perf's own comment above
             res.set_content(placeholder("Fleet performance unavailable",
                                         "This server has no perf snapshot provider wired."),
                             "text/html; charset=utf-8");
@@ -3067,9 +2811,9 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
         (void)detail::try_persist_audit(audit_fn_, req, "dex.perf.device.view", "success",
                                         "GuaranteedState", "",
                                         "fleet-wide DEX perf device list via dashboard fragment");
-        res.set_content(render_dex_perf_devices_fragment(perf_fn_(cohort_key), metric,
-                                                         not_reporting, cohort_filter, limit,
-                                                         window_days, vis ? &*vis : nullptr),
+        res.set_content(render_dex_perf_devices_fragment(
+                            dex_perf_api_->fleet_snapshot(cohort_key), metric, not_reporting,
+                            cohort_filter, limit, window_days, vis ? &*vis : nullptr),
                         "text/html; charset=utf-8");
     });
 
@@ -3088,21 +2832,23 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
                      return;
                  const int window_days = window_to_days(
                      req.has_param("window") ? req.get_param_value("window") : "7d");
-                 if (!app_perf_providers_.apps) {
-                     res.set_content(placeholder("Application performance unavailable",
-                                                 "This server has no app-perf store wired."),
-                                     "text/html; charset=utf-8");
-                     return;
-                 }
+                 // #4626: dex_perf_api_ replaces app_perf_providers_ — server.cpp
+                 // constructs it UNCONDITIONALLY, collapsing "no store wired" and
+                 // "the store degraded" to the SAME nullopt from apps() (Concern
+                 // A), so both cases now render ONE honest wording instead of the
+                 // old two-message split (a null dex_perf_api_ itself is the
+                 // test-only/misconfigured-deployment case, same as the fragments
+                 // above).
                  bool truncated = false;
-                 const auto apps = app_perf_providers_.apps(truncated);
-                 if (!apps) { // nullopt = a real read error → honest degrade, not empty
+                 const auto apps = dex_perf_api_ ? dex_perf_api_->apps(truncated) : std::nullopt;
+                 if (!apps) { // nullopt = unwired OR a real read error → honest degrade, not empty
                      // Render the note at 200, not 503: the dashboard htmx drops
                      // 4xx/5xx bodies (responseHandling swap:false), so a 503 would
                      // swap nothing. The store already counted the degrade
                      // (yuzu_app_perf_read_degrade_total) before returning nullopt.
                      res.set_content(placeholder("Application performance unavailable",
-                                                 "The app-perf store could not be read right now."),
+                                                 "App performance data unavailable (not "
+                                                 "configured or degraded) — retry shortly."),
                                      "text/html; charset=utf-8");
                      return;
                  }
@@ -3166,78 +2912,80 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
         const std::vector<DexGroupOption> groups =
             group_list_fn_ ? group_list_fn_() : std::vector<DexGroupOption>{};
 
-        // group set → the named-group on-the-fly B1 aggregate
-        // (app_perf_group_trend, sub-floor suppression at the SAME
-        // kDexCohortFloor the REST group endpoint uses); else model set → the
-        // SAME B1-aggregate shape via the device-model tag cohort (identical
-        // floor treatment — it is the same "named set of specific devices"
-        // case the floor exists for, see AppPerfTagCohortFn's own doc comment);
-        // else fleet B2 (app_perf_fleet_trend). group and model are mutually
+        // group set → the named-group on-the-fly B1 aggregate (DexPerfApi::
+        // group_trend, sub-floor suppression at the SAME kDexCohortFloor the
+        // REST group endpoint uses, applied INSIDE the seam); else model set →
+        // the SAME B1-aggregate shape via the device-model tag cohort
+        // (DexPerfApi::tag_trend, identical floor treatment — it is the same
+        // "named set of specific devices" case the floor exists for); else
+        // fleet B2 (DexPerfApi::app_fleet_trend). group and model are mutually
         // exclusive — group wins if a caller supplies both (matches
-        // render_dex_app_perf_trend's own precedence comment).
-        std::optional<std::vector<AppPerfFleetRow>> rows;
+        // render_dex_app_perf_trend's own precedence comment). #4626: each
+        // branch now calls DexPerfApi directly (already floor-applied
+        // AppPerfTrendPoint output) instead of app_perf_providers_'s raw-row
+        // provider + the app_perf_group_trend/app_perf_fleet_trend transform —
+        // the seam applies the SAME transform+floor internally, so this route
+        // and the REST/MCP twins can never disagree. A null dex_perf_api_ AND
+        // a read degrade now collapse to the SAME nullopt (Concern A) — ONE
+        // honest wording per scope, not the old two-message "not wired" vs
+        // "degraded" split.
+        std::optional<std::vector<AppPerfTrendPoint>> trend;
         std::vector<AppPerfVersionSummary> versions;
         if (!group.empty()) {
-            if (!app_perf_providers_.group) {
+            trend = dex_perf_api_ ? dex_perf_api_->group_trend(group, app, version) : std::nullopt;
+            if (!trend) {
+                // 200 not 503 — dashboard htmx drops 4xx/5xx bodies; the seam
+                // already counted the degrade.  (REST twin stays fail-closed.)
                 res.set_content(placeholder("Group performance unavailable",
-                                            "This server has no group app-perf reader wired."),
+                                            "App performance data unavailable (not configured "
+                                            "or degraded) — retry shortly."),
                                 "text/html; charset=utf-8");
                 return;
             }
-            rows = app_perf_providers_.group(group, app, version);
-            if (!rows) {
-                // 200 not 503 — dashboard htmx drops 4xx/5xx bodies; the group
-                // reader already counted the degrade. (REST twin stays fail-closed.)
-                res.set_content(placeholder("Group performance unavailable",
-                                            "The app-perf store could not be read right now."),
-                                "text/html; charset=utf-8");
-                return;
-            }
-            versions = app_perf_version_summaries(app_perf_group_trend(*rows, kDexCohortFloor));
+            versions = app_perf_version_summaries(*trend);
         } else if (!model.empty()) {
-            if (!app_perf_providers_.tag_cohort) {
+            trend = dex_perf_api_ ? dex_perf_api_->tag_trend(kDexDefaultCohortKey, model, app,
+                                                             version)
+                                  : std::nullopt;
+            if (!trend) {
                 res.set_content(placeholder("Model performance unavailable",
-                                            "This server has no device-model cohort reader wired."),
+                                            "App performance data unavailable (not configured "
+                                            "or degraded) — retry shortly."),
                                 "text/html; charset=utf-8");
                 return;
             }
-            rows = app_perf_providers_.tag_cohort(kDexDefaultCohortKey, model, app, version);
-            if (!rows) {
-                // 200 not 503 — dashboard htmx drops 4xx/5xx bodies; the tag
-                // cohort provider already counted the degrade (a failed
-                // TagStore read fails the whole lookup closed).
-                res.set_content(placeholder("Model performance unavailable",
-                                            "The app-perf store could not be read right now."),
-                                "text/html; charset=utf-8");
-                return;
-            }
-            versions = app_perf_version_summaries(app_perf_group_trend(*rows, kDexCohortFloor));
+            versions = app_perf_version_summaries(*trend);
         } else {
-            if (!app_perf_providers_.fleet) {
+            trend = dex_perf_api_ ? dex_perf_api_->app_fleet_trend(app, version) : std::nullopt;
+            if (!trend) {
                 res.set_content(placeholder("Application performance unavailable",
-                                            "This server has no fleet app-perf store wired."),
+                                            "App performance data unavailable (not configured "
+                                            "or degraded) — retry shortly."),
                                 "text/html; charset=utf-8");
                 return;
             }
-            rows = app_perf_providers_.fleet(app, version);
-            if (!rows) {
-                // 200 not 503 — dashboard htmx drops 4xx/5xx bodies; the store
-                // already counted the degrade. (REST twin stays fail-closed.)
-                res.set_content(placeholder("Application performance unavailable",
-                                            "The app-perf store could not be read right now."),
-                                "text/html; charset=utf-8");
-                return;
-            }
-            versions = app_perf_version_summaries(app_perf_fleet_trend(*rows));
+            versions = app_perf_version_summaries(*trend);
         }
-        // Model-selector values — best-effort: an unwired/degraded tag_values
-        // provider just hides the selector (empty vector), same convention as
-        // an empty `groups` list above; it never blocks the page render.
-        const std::vector<std::string> model_values =
-            app_perf_providers_.tag_values
-                ? app_perf_providers_.tag_values(kDexDefaultCohortKey).value_or(
-                      std::vector<std::string>{})
-                : std::vector<std::string>{};
+        // GAP-1 CLOSED (#4857, architect D1 ruling): model-selector values now
+        // come from THIS seam's own `fleet_snapshot(kDexDefaultCohortKey)`,
+        // via the SAME `dex_perf_cohorts()` helper the public
+        // `GET /api/v1/dex/perf/cohorts` resource uses — the dashboard picker
+        // and that resource read the identical cohort population and can
+        // never drift. The untagged residual (cohort == "") is excluded: it
+        // is not a selectable model value. `fleet_snapshot` has no degrade
+        // channel (dex_perf_api.hpp), so a genuine zero-cohort-population
+        // read is never claimed as a "degrade". `dex_perf_api_` is
+        // GUARANTEED non-null by this point — all three trend branches above
+        // return the "unavailable" placeholder and `return` early whenever
+        // `dex_perf_api_` is null (each assigns `trend = dex_perf_api_ ? ...
+        // : std::nullopt` then bails on `!trend`) — so an unguarded call here
+        // is safe and an unwired API never reaches this note at all.
+        std::vector<std::string> model_values;
+        // dex_perf_api_ is non-null here: every trend branch above returns
+        // the unavailable placeholder when it is null.
+        for (const auto& c : dex_perf_cohorts(dex_perf_api_->fleet_snapshot(kDexDefaultCohortKey)))
+            if (!c.cohort.empty())
+                model_values.push_back(c.cohort);
         res.set_content(render_dex_app_perf_trend(app, versions, group, groups, kDexCohortFloor,
                                                   window_days, version, model_values, model),
                         "text/html; charset=utf-8");
@@ -3315,21 +3063,21 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
         if (!gate.admitted)
             return; // the gate already wrote 401/403/503 (not a <tr> — the accepted
                     // denial shape for this gate everywhere else it's used)
-        if (!app_perf_providers_.version_devices) {
+        if (!dex_perf_api_) { // #4626: replaces app_perf_providers_.version_devices
             res.set_content(row("<div class=\"gp-note\">Device list unavailable on this server "
                                 "(no app-perf device provider wired).</div>"),
                             "text/html; charset=utf-8");
             return;
         }
         // gate.scope: nullopt = unfiltered; engaged (incl. empty) = restrict to
-        // exactly these agent_ids. Converted to the provider's vector shape —
-        // still pushed into the STORE query by the provider, never post-filtered
+        // exactly these agent_ids. Converted to the seam's vector shape —
+        // still pushed into the STORE query by DexPerfApi, never post-filtered
         // here.
         std::optional<std::vector<std::string>> visible_ids;
         if (gate.scope)
             visible_ids = std::vector<std::string>(gate.scope->begin(), gate.scope->end());
         bool truncated = false;
-        auto rows = app_perf_providers_.version_devices(app, version, visible_ids, truncated);
+        auto rows = dex_perf_api_->app_version_devices(app, version, visible_ids, truncated);
         if (!rows) {
             // Store degrade — audit the attempted access (CC7.2), set-and-proceed
             // (this fragment is not the fail-closed surface; the REST twin is).
@@ -3641,9 +3389,9 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
              });
 
     // B1 per-device app-perf-over-time drill — the retained-daily companion to the
-    // live procperf query above. Reads the CENTRAL Postgres B1 store
-    // (app_perf_providers_.device → AppPerfDailyStore::get_agent_app_perf): NO
-    // dispatch, NO Execute probe (it does not touch the device). Per-device
+    // live procperf query above. Reads the CENTRAL Postgres B1 store via
+    // DexPerfApi::device_app_summaries (→ AppPerfDailyStore::get_agent_app_perf,
+    // #4626): NO dispatch, NO Execute probe (it does not touch the device). Per-device
     // behavioural PII, so it is scoped-Read gated AND audited per access; the HTML
     // fragment posture is set-and-proceed (flag via Sec-Audit-Failed, still render)
     // — the REST twin GET /dex/devices/{id}/app-perf is the fail-closed 503 surface.
@@ -3666,38 +3414,43 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
                                      "text/html; charset=utf-8");
                      return;
                  }
-                 if (!app_perf_providers_.device) {
-                     res.set_content(
-                         "<div class=\"gp-note\">Application performance history is unavailable on "
-                         "this server (no app-perf store wired).</div>",
-                         "text/html; charset=utf-8");
-                     return;
-                 }
-                 // Audit the behavioural-PII access before serving (provider-null
-                 // checked first, so a no-store server does not log a read that
-                 // returns nothing — matches the REST twin's ordering). result=success
-                 // records that access was GRANTED + attempted (the established
-                 // pre-read convention, same as the REST twin); a subsequent store
-                 // degrade still carries this row — it over-audits, never under-audits.
+                 // #4626 Concern A: audit the behavioural-PII access BEFORE checking
+                 // dex_perf_api_ — server.cpp constructs it UNCONDITIONALLY in
+                 // production, so there is no longer a separate "provider never
+                 // wired" signal distinct from "the read degraded" to check first;
+                 // this handler now emits the audit even on the rare
+                 // null-dex_perf_api_ (test-only/misconfigured-deployment) path —
+                 // it OVER-audits, never UNDER-audits. result=success records that
+                 // access was GRANTED + attempted (the established pre-read
+                 // convention, same as the REST twin); a subsequent degrade still
+                 // carries this row.
                  (void)detail::emit_behavioral_audit(
                      audit_fn_, req, res, "dex.device.app_perf.view", "success", "Agent", id,
                      "device app-perf-over-time drill (B1 retained)");
-                 const auto rows = app_perf_providers_.device(id);
-                 if (!rows) {
-                     // nullopt = a real read degrade. Render the honest note at status
-                     // 200, NOT 503: the dashboard htmx config drops 4xx/5xx bodies
-                     // (responseHandling swap:false), so a 503 here would render
+                 // Note (#4626): DexPerfApi::device_app_summaries derives from the
+                 // SAME raw B1 read device_app_perf_json (the REST/MCP drill) uses,
+                 // never a second independent reduction.
+                 const auto summaries =
+                     dex_perf_api_ ? dex_perf_api_->device_app_summaries(id) : std::nullopt;
+                 if (!summaries) {
+                     // nullopt = unwired OR a real read degrade. Render the honest note
+                     // at status 200, NOT 503: the dashboard htmx config drops 4xx/5xx
+                     // bodies (responseHandling swap:false), so a 503 here would render
                      // nothing — the exact "fake empty" we mean to avoid. The store
                      // already counted the degrade (yuzu_app_perf_read_degrade_total)
                      // before returning nullopt, so monitoring is unaffected. The REST
                      // twin keeps its fail-closed 503 (its JSON consumer reads status).
-                     res.set_content(
-                         "<div class=\"gp-note\">Application performance history could not be read "
-                         "right now &mdash; the store degraded. Retry shortly.</div>",
-                         "text/html; charset=utf-8");
+                     // SAME unified F2b wording the trend/app-list fragments use
+                     // (/fragments/dex/perf/apps + /fragments/dex/perf/app) — one
+                     // consistent message across every unwired-or-degraded app-perf
+                     // fragment, not a bespoke per-fragment string.
+                     res.set_content(placeholder("Application performance unavailable",
+                                                 "App performance data unavailable (not "
+                                                 "configured or degraded) — retry shortly."),
+                                     "text/html; charset=utf-8");
                      return;
                  }
-                 res.set_content(render_dex_device_app_perf(app_perf_device_summaries(*rows)),
+                 res.set_content(render_dex_device_app_perf(*summaries),
                                  "text/html; charset=utf-8");
              });
 }
