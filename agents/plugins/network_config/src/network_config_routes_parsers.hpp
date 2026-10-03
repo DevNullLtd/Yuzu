@@ -27,6 +27,7 @@
  */
 #pragma once
 
+#include <algorithm>
 #include <charconv>
 #include <cstddef>
 #include <cstdint>
@@ -61,7 +62,7 @@ inline std::string lookup_name(const NameEntry (&table)[N], int id, const char* 
     for (const auto& e : table)
         if (e.id == id)
             return e.name;
-    return fallback_prefix + std::to_string(id);
+    return std::format("{}{}", fallback_prefix, id);
 }
 
 } // namespace routes_detail
@@ -72,7 +73,7 @@ struct RouteRow {
     std::string destination; // formatted address; never empty on a real row
     unsigned prefix_len = 0;
     std::string gateway;     // empty = on-link
-    std::string interface;   // empty = unknown
+    std::string ifname;      // empty = unknown
     // Every text field below is rendered `-` when empty (format_route_row): the one "absent" convention.
     std::string metric;
     std::string table;
@@ -89,7 +90,7 @@ inline std::string format_route_row(const RouteRow& r) {
                          : yuzu::util::safe_output_field(yuzu::util::sanitize_utf8(v));
     };
     return std::format("route|{}|{}|{}|{}|{}|{}|{}|{}|{}", r.ipv6 ? "ipv6" : "ipv4",
-                       field(r.destination), r.prefix_len, field(r.gateway), field(r.interface),
+                       field(r.destination), r.prefix_len, field(r.gateway), field(r.ifname),
                        field(r.metric), field(r.table), field(r.type), field(r.origin));
 }
 
@@ -106,7 +107,7 @@ struct WinRoute {
     std::string destination;
     unsigned prefix_len = 0;
     std::string next_hop;     // empty = on-link (an unspecified next hop)
-    std::string interface;    // ConvertInterfaceLuidToAlias, or `if<index>`
+    std::string ifname;       // ConvertInterfaceLuidToAlias, or `if<index>`
     unsigned long metric = 0; // the ROUTE metric; the interface metric is NOT added
     int protocol = 0;         // NL_ROUTE_PROTOCOL
 };
@@ -156,7 +157,7 @@ inline RouteRow win_route_to_row(const WinRoute& r) {
     row.destination = r.destination;
     row.prefix_len = r.prefix_len;
     row.gateway = r.next_hop;
-    row.interface = r.interface;
+    row.ifname = r.ifname;
     row.metric = std::to_string(r.metric);
     row.origin = win_protocol_name(r.protocol);
     return row;
@@ -317,8 +318,22 @@ inline RtRoutesParse parse_rtnetlink_routes_chunk(std::span<const unsigned char>
         // Sequence check FIRST — see parse_rtnetlink_link_chunk().
         if (h->nlmsg_seq != expected_seq)
             continue;
+        // The kernel flags the message that follows a change to the table made while the dump was
+        // in progress (on a record or on DONE). The rows may then repeat or be missing, so the
+        // read is incomplete — kept, but never reported as the whole table.
+        if ((h->nlmsg_flags & NLM_F_DUMP_INTR) != 0)
+            out.truncated = true;
         if (h->nlmsg_type == NLMSG_DONE) {
-            out.done = true;
+            // Since Linux 4.13 DONE carries the dump's errno: a dump the kernel aborted part-way
+            // (e.g. -ENOMEM) still ends in DONE, with a short table behind it. A DONE with no
+            // payload (an older kernel, or a test) is a plain completion.
+            int dump_errno = 0;
+            if (h->nlmsg_len >= NLMSG_LENGTH(sizeof(int)))
+                std::memcpy(&dump_errno, NLMSG_DATA(h), sizeof(dump_errno));
+            if (dump_errno != 0)
+                out.error = true;
+            else
+                out.done = true;
             break;
         }
         if (h->nlmsg_type == NLMSG_ERROR) {
@@ -399,7 +414,7 @@ inline RtRoutesParse parse_rtnetlink_routes_chunk(std::span<const unsigned char>
                 else
                     malformed = true;
                 break;
-            case RTA_NH_ID:
+            case RTA_NH_ID: // needs linux-libc-dev >= 5.3; every supported build leg ships 6.x
                 if (routes_detail::rta_u32(rta, v)) {
                     rec.has_nh_id = true;
                     rec.nh_id = v;
@@ -411,7 +426,9 @@ inline RtRoutesParse parse_rtnetlink_routes_chunk(std::span<const unsigned char>
                 int nh_len = static_cast<int>(RTA_PAYLOAD(rta));
                 const auto* nh = static_cast<const struct rtnexthop*>(RTA_DATA(rta));
                 int count = 0;
-                while (RTNH_OK(nh, nh_len)) {
+                // RTNH_OK reads rtnh_len before it looks at the remaining length, so a payload
+                // shorter than a header must be refused here, not by the macro.
+                while (nh_len >= static_cast<int>(sizeof(struct rtnexthop)) && RTNH_OK(nh, nh_len)) {
                     if (count++ == 0) {
                         rec.ifindex = nh->rtnh_ifindex;
                         int sub_len = static_cast<int>(nh->rtnh_len) -
@@ -469,15 +486,15 @@ inline RtRoutesParse parse_rtnetlink_routes_chunk(std::span<const unsigned char>
     return out;
 }
 
-/// Reduce a decoded Linux route to the cross-OS row. `interface` is the name the
+/// Reduce a decoded Linux route to the cross-OS row. `ifname` is the name the
 /// caller resolved from `ifindex` (empty when it could not).
-inline RouteRow linux_route_to_row(const RtRouteFull& r, std::string interface) {
+inline RouteRow linux_route_to_row(const RtRouteFull& r, std::string ifname) {
     RouteRow row;
     row.ipv6 = r.is_ipv6;
     row.destination = r.destination;
     row.prefix_len = r.prefix_len;
-    row.gateway = nexthop_unresolved(r) ? "nhid:" + std::to_string(r.nh_id) : r.gateway;
-    row.interface = std::move(interface);
+    row.gateway = nexthop_unresolved(r) ? std::format("nhid:{}", r.nh_id) : r.gateway;
+    row.ifname = std::move(ifname);
     row.metric = std::to_string(r.metric);
     row.table = routes_detail::table_name(r.table);
     row.type = routes_detail::type_name(r.type);
@@ -729,13 +746,13 @@ inline MacRoutesParse parse_route_table_dump(std::span<const unsigned char> blob
 /// Reduce a decoded macOS route to the cross-OS row. macOS has no route metric
 /// and no table id, and its only provenance is the RTF_STATIC / RTF_DYNAMIC bits:
 /// `origin` says `static` or `dynamic` when the kernel set one, else `other`.
-inline RouteRow mac_route_to_row(const MacRoute& r, std::string interface) {
+inline RouteRow mac_route_to_row(const MacRoute& r, std::string ifname) {
     RouteRow row;
     row.ipv6 = r.is_ipv6;
     row.destination = r.destination;
     row.prefix_len = r.prefix_len;
     row.gateway = r.gateway;
-    row.interface = std::move(interface);
+    row.ifname = std::move(ifname);
     row.type = (r.flags & RTF_BLACKHOLE) ? "blackhole" : (r.flags & RTF_REJECT) ? "reject" : "unicast";
     row.origin = (r.flags & RTF_STATIC)                        ? "static"
                  : (r.flags & (RTF_DYNAMIC | RTF_MODIFIED)) ? "dynamic"

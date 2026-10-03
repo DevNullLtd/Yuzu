@@ -78,7 +78,7 @@ TEST_CASE("format_route_row renders the ten-field row", "[network_config][routes
     r.destination = "192.0.2.0";
     r.prefix_len = 24;
     r.gateway = "10.77.0.1";
-    r.interface = "dummy0";
+    r.ifname = "dummy0";
     r.metric = "50";
     r.table = "main";
     r.type = "unicast";
@@ -109,7 +109,7 @@ TEST_CASE("format_route_row cannot be split by an interface name containing the 
     RouteRow r;
     r.destination = "10.0.0.0";
     r.prefix_len = 8;
-    r.interface = "ev|il\nname\\x";
+    r.ifname = "ev|il\nname\\x";
     const std::string row = format_route_row(r);
     CHECK(row.find('\n') == std::string::npos);
     CHECK(row == "route|ipv4|10.0.0.0|8|-|ev\\|il name/x|-|-|unicast|-");
@@ -224,7 +224,7 @@ std::vector<WinRoute> read_windows_fixture(const fs::path& p) {
         r.destination = c[1];
         r.prefix_len = static_cast<unsigned>(std::stoul(c[2]));
         r.next_hop = win_next_hop(c[3], c[3] == "0.0.0.0" || c[3] == "::");
-        r.interface = c[4];
+        r.ifname = c[4];
         r.metric = std::stoul(c[6]);
         r.protocol = std::stoi(c[7]);
         out.push_back(std::move(r));
@@ -343,7 +343,7 @@ TEST_CASE("windows row keeps the route metric and renders an on-link next hop as
     WinRoute r;
     r.destination = "198.51.100.0";
     r.prefix_len = 24;
-    r.interface = "Ethernet";
+    r.ifname = "Ethernet";
     r.metric = 281;
     r.protocol = 3;
     CHECK(format_route_row(win_route_to_row(r)) ==
@@ -849,6 +849,103 @@ TEST_CASE("netlink dump reports NLMSG_ERROR as incomplete", "[network_config][ro
     const auto r = run_dump(FakeIo{{FakeStep{err}}});
     CHECK_FALSE(r.ok);
     CHECK(r.records.empty());
+}
+
+namespace {
+
+// NLMSG_DONE as modern kernels send it: a 4-byte payload holding the dump's errno (0 = clean).
+std::vector<unsigned char> done_msg(std::uint32_t seq, int dump_errno, unsigned short flags = 0) {
+    std::vector<unsigned char> buf;
+    struct nlmsghdr nlh {};
+    nlh.nlmsg_len = static_cast<std::uint32_t>(NLMSG_LENGTH(sizeof(int)));
+    nlh.nlmsg_type = NLMSG_DONE;
+    nlh.nlmsg_flags = static_cast<unsigned short>(NLM_F_MULTI | flags);
+    nlh.nlmsg_seq = seq;
+    append_bytes(buf, &nlh, sizeof(nlh));
+    append_bytes(buf, &dump_errno, sizeof(dump_errno));
+    return buf;
+}
+
+// Mark the FIRST message of a datagram as sent from an interrupted dump.
+void set_dump_intr_on_first(std::vector<unsigned char>& dg) {
+    auto* h = reinterpret_cast<struct nlmsghdr*>(dg.data());
+    h->nlmsg_flags = static_cast<unsigned short>(h->nlmsg_flags | NLM_F_DUMP_INTR);
+}
+
+} // namespace
+
+TEST_CASE("netlink dump: rows then NLMSG_DONE carrying an errno is incomplete, never OK",
+          "[network_config][routes][netlink_dump]") {
+    // The kernel aborts a dump part-way (e.g. -ENOMEM) and closes it with DONE(-errno). That is a
+    // SHORT table: it must not read as a clean, complete one (ok), though the rows are kept.
+    auto steps = capture_steps();
+    steps.pop_back(); // the clean DONE
+    steps.push_back(FakeStep{done_msg(kDumpSeq, -12)});
+    const auto r = run_dump(FakeIo{steps});
+    CHECK_FALSE(r.ok);
+    CHECK(r.records.size() == 16);
+}
+
+TEST_CASE("netlink dump: NLMSG_DONE(-errno) before any row is incomplete with no rows",
+          "[network_config][routes][netlink_dump]") {
+    const auto r = run_dump(FakeIo{{FakeStep{done_msg(kDumpSeq, -12)}}});
+    CHECK_FALSE(r.ok);
+    CHECK(r.records.empty());
+}
+
+TEST_CASE("netlink dump: a clean NLMSG_DONE(0), and a payload-less DONE, still complete",
+          "[network_config][routes][netlink_dump]") {
+    CHECK(run_dump(FakeIo{{FakeStep{done_msg(kDumpSeq, 0)}}}).ok);
+    CHECK(run_dump(FakeIo{{FakeStep{control_msg(kDumpSeq, NLMSG_DONE)}}}).ok);
+}
+
+TEST_CASE("netlink dump: NLM_F_DUMP_INTR on a record means the table changed mid-read",
+          "[network_config][routes][netlink_dump]") {
+    // Route churn between the datagrams of one dump makes the kernel flag the next message; the
+    // rows may be duplicated or missing, so the read is incomplete (rows kept) — never OK/FULL.
+    auto steps = capture_steps();
+    set_dump_intr_on_first(steps.front().bytes);
+    const auto r = run_dump(FakeIo{steps});
+    CHECK_FALSE(r.ok);
+    CHECK(r.records.size() == 16);
+}
+
+TEST_CASE("netlink dump: NLM_F_DUMP_INTR on NLMSG_DONE is incomplete too",
+          "[network_config][routes][netlink_dump]") {
+    auto steps = capture_steps();
+    steps.pop_back();
+    steps.push_back(FakeStep{done_msg(kDumpSeq, 0, NLM_F_DUMP_INTR)});
+    const auto r = run_dump(FakeIo{steps});
+    CHECK_FALSE(r.ok);
+    CHECK(r.records.size() == 16);
+}
+
+TEST_CASE("netlink dump: a malformed record followed by a clean DONE is not complete",
+          "[network_config][routes][netlink_dump]") {
+    // `ok = !truncated`: a dropped record must never be laundered into OK/FULL by the DONE after it.
+    auto bad = route_msg(kDumpSeq, AF_INET, 24, RT_TABLE_MAIN, RTN_UNICAST, 3, 0,
+                         {{RTA_DST, {10, 0}}}); // an IPv4 destination of 2 bytes
+    const auto r = run_dump(FakeIo{{FakeStep{bad}, FakeStep{done_msg(kDumpSeq, 0)}}});
+    CHECK_FALSE(r.ok);
+    CHECK(r.records.empty());
+}
+
+TEST_CASE("routes decode: a truncated multipath attribute is flagged, not read past its payload",
+          "[network_config][routes][rtnetlink]") {
+    constexpr std::uint32_t kSeq = 7;
+    // A 1-byte RTA_MULTIPATH payload is shorter than an rtnexthop header (and than the 2-byte
+    // rtnh_len field itself). The walk must stop on the length, not on a value read past the end.
+    auto m = route_msg(kSeq, AF_INET, 16, RT_TABLE_MAIN, RTN_UNICAST, 3, 0,
+                       {{RTA_DST, v4(172, 22, 0, 0)}, {RTA_MULTIPATH, {0x01}}});
+    const auto out = parse_rtnetlink_routes_chunk(m, kSeq);
+    CHECK(out.truncated);
+    CHECK(out.records.empty());
+}
+
+TEST_CASE("route table names: the documented 253 table is `default`",
+          "[network_config][routes][rtnetlink]") {
+    CHECK(routes_detail::table_name(253) == "default");
+    CHECK(routes_detail::table_name(254) == "main");
 }
 
 TEST_CASE("netlink dump fails closed when it cannot open or send",

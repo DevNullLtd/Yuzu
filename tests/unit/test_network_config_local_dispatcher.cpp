@@ -307,6 +307,30 @@ TEST_CASE("network_config plugin: routes exercises the real native leg and repor
     const auto rows = rows_with_prefix(result.captured, "route|");
     if (result.result_status == YUZU_RESULT_STATUS_UNAVAILABLE)
         CHECK(rows.empty()); // an unreadable table is never reported as rows
+
+    // A leg that is broken outright (a dump that always fails, a decoder that skips everything,
+    // a zero cap) yields UNAVAILABLE or zero rows and would pass every check above, so compare
+    // against an independent oracle for "this host has routes". macOS: every workstation and CI
+    // runner has at least a loopback route. Linux: /proc/net/route lists the IPv4 main table
+    // after a one-line header; skip the oracle only when it cannot be read or is empty (a
+    // `--network none` container).
+#if defined(__APPLE__)
+    CHECK(result.result_status == YUZU_RESULT_STATUS_OK);
+    CHECK_FALSE(rows.empty());
+#elif defined(__linux__)
+    {
+        std::ifstream in("/proc/net/route");
+        std::string line;
+        int lines = 0;
+        while (std::getline(in, line))
+            ++lines;
+        if (lines > 1) { // header + at least one IPv4 route
+            CHECK(result.result_status != YUZU_RESULT_STATUS_UNAVAILABLE);
+            CHECK(std::any_of(rows.begin(), rows.end(),
+                              [](const std::string& r) { return r.rfind("route|ipv4|", 0) == 0; }));
+        }
+    }
+#endif
     const std::set<std::string> families{"ipv4", "ipv6"};
     const std::set<std::string> types{"unicast", "blackhole", "unreachable", "prohibit", "throw",
                                       "reject",  "nat",       "xresolve"};

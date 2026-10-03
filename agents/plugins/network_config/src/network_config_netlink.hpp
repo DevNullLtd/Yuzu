@@ -29,8 +29,10 @@
 #include <cstddef>
 #include <cstdint>
 #include <iterator>
+#include <limits>
 #include <span>
 #include <type_traits>
+#include <utility>
 #include <vector>
 
 #include <linux/netlink.h>
@@ -137,7 +139,12 @@ public:
         do {
             n = ::recvmsg(fd_.get(), &rm, 0);
         } while (n < 0 && errno == EINTR);
-        from_pid = rsa.nl_pid;
+        // The portid is only meaningful when the kernel actually filled the source address in.
+        // A runtime that leaves msg_name untouched would read as pid 0 — the kernel — so anything
+        // short of a full AF_NETLINK address is reported as a foreign sender (the same predicate
+        // as the firewall plugin's nft socket). This is the one place FakeIo cannot reach.
+        const bool addr_filled = rm.msg_namelen >= sizeof(rsa) && rsa.nl_family == AF_NETLINK;
+        from_pid = addr_filled ? rsa.nl_pid : std::numeric_limits<std::uint32_t>::max();
         msg_flags = rm.msg_flags;
         return n;
     }

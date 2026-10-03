@@ -30,6 +30,7 @@
 
 #include <win_str.hpp> // yuzu::win::from_wide (#1681)
 
+#include <algorithm>
 #include <cstdint>
 #include <format>
 #include <string>
@@ -105,8 +106,11 @@ int collect_routes_win(yuzu::CommandContext& ctx) {
     }
     ForwardTableGuard guard{table}; // FreeMibTable on every path below
 
+    // The cap counts KEPT routes, so the host's own entries are dropped here, before the (costly)
+    // alias lookup, and unpacking stops one past the cap: a huge table bounds the work done, not
+    // just the rows emitted. win_routes_to_rows() applies the same filter and reports the cap.
     std::vector<WinRoute> routes;
-    routes.reserve(table->NumEntries);
+    routes.reserve(std::min<std::size_t>(table->NumEntries, kRoutesRowCap + 1));
     bool unformattable = false;
     for (ULONG i = 0; i < table->NumEntries; ++i) {
         const MIB_IPFORWARD_ROW2& r = table->Table[i];
@@ -122,10 +126,14 @@ int collect_routes_win(yuzu::CommandContext& ctx) {
         // An AF_UNSPEC hop formats to empty text with `unspecified` false: still on-link.
         const SockText hop = sockaddr_text(r.NextHop);
         w.next_hop = win_next_hop(hop.text, hop.unspecified);
-        w.interface = interface_alias(r.InterfaceLuid, r.InterfaceIndex);
         w.metric = r.Metric;
         w.protocol = static_cast<int>(r.Protocol);
+        if (win_route_is_host_local(w))
+            continue;
+        w.ifname = interface_alias(r.InterfaceLuid, r.InterfaceIndex);
         routes.push_back(std::move(w));
+        if (routes.size() > kRoutesRowCap)
+            break; // one past the cap is enough for win_routes_to_rows() to report it
     }
 
     // The host-local filter, the cap-after-filter and the row mapping are the pure
