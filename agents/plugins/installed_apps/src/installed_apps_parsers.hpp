@@ -391,7 +391,7 @@ constexpr unsigned long kRegExpandSz = 2;
     return type == kRegSz || (accept_expand_sz && type == kRegExpandSz);
 }
 
-// ── Degraded-acquisition contract (every OS) ────────────────────────────────
+// ── Degraded-acquisition contract (every OS; wired on Linux/macOS here) ─────
 // ONE place declares what a degraded acquisition looks like to the caller, so
 // list / query / list_per_user / list_inventory cannot drift. Templated on the
 // context so a unit test drives it with a recording fake instead of a plugin
@@ -406,7 +406,8 @@ template <class Ctx> void declare_acquisition_degraded(Ctx& ctx) {
 // What a degraded Linux/macOS acquisition means (the wording in docs/samples).
 inline constexpr std::string_view kSubprocessCauses =
     "tool timed out, was killed, failed to start, exited nonzero, or its output was truncated";
-// The Windows registry-walk equivalent (Uninstall root/app key unreadable).
+// The Windows registry-walk equivalent (Uninstall root/app key unreadable); declared
+// for the Windows leg, not wired on this branch.
 inline constexpr std::string_view kRegistryCauses =
     "an Uninstall registry key could not be fully read";
 

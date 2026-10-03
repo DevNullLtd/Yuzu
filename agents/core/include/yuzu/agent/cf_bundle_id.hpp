@@ -24,7 +24,10 @@ namespace yuzu::agent {
 inline constexpr std::size_t kMaxCFStringBytes = 4096;
 
 /// UTF-8 copy of `s` cut at kMaxCFStringBytes on a character boundary, or "" for
-/// null/empty/unconvertible.
+/// null/empty/unconvertible. When CF stops with fewer than 4 bytes free the
+/// whole-character prefix is returned; that includes an unconvertible (lone
+/// surrogate) character within the last 3 bytes of the buffer, which also yields
+/// the in-bound prefix rather than "" (a valid UTF-8 prefix of the same id).
 inline std::string cfstring_to_utf8(CFStringRef s) {
     if (!s)
         return {};
@@ -40,14 +43,19 @@ inline std::string cfstring_to_utf8(CFStringRef s) {
         s, CFRangeMake(0, len), kCFStringEncodingUTF8, /*lossByte=*/0,
         /*isExternalRepresentation=*/false, reinterpret_cast<UInt8*>(out.data()),
         static_cast<CFIndex>(out.size()), &used);
-    // Stopped short with room for one more character (a UTF-8 character is at most
-    // 4 bytes, so < 4 bytes free means the next one did not fit): the bound was not
-    // the reason, so an unconvertible character is -- empty, as before.
+    // Stopped short with room for a whole 4-byte character (a UTF-8 character is at
+    // most 4 bytes): the bound was not the reason, so an unconvertible character is
+    // -- empty, as before. With < 4 bytes free CF's stop is not attributable (a 4-byte
+    // character did not fit, or a lone surrogate sits in those last bytes), so the
+    // whole-character prefix is returned; for the lone-surrogate residual that is a
+    // benign valid prefix of the same id, cut again by list_field at 4096 and by the
+    // inventory clamp at 1024.
     constexpr CFIndex kMaxUtf8CharBytes = 4;
     if (converted < len && used + kMaxUtf8CharBytes <= static_cast<CFIndex>(out.size()))
         return {};
     out.resize(static_cast<std::size_t>(used));
     out.resize(std::char_traits<char>::length(out.c_str())); // interior NUL cuts, as before
+    out.shrink_to_fit(); // release the 4 KiB working capacity: State keeps right-sized ids
     return out;
 }
 

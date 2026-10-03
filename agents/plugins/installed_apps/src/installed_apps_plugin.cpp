@@ -98,6 +98,9 @@ namespace parsers = yuzu::installed_apps::parsers;
 #ifdef __APPLE__
 namespace macos_receipts = yuzu::installed_apps::macos_receipts;
 namespace bundle_ids = yuzu::installed_apps::bundle_ids;
+// The agent-core CFString cap must equal the `list` field cap (bytes stay identical).
+static_assert(yuzu::agent::kMaxCFStringBytes == parsers::kMaxListFieldBytes,
+              "cfstring_to_utf8 cap must equal installed_apps kMaxListFieldBytes");
 #endif
 
 // ── subprocess helper (Linux / macOS) ──────────────────────────────────────

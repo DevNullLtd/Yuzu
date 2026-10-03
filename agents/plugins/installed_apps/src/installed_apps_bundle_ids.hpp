@@ -73,6 +73,8 @@ collect_bundle_id_paths(const std::vector<parsers::AppRowFields>& apps) {
 }
 
 // ids[i] belongs to the app at index_map[i]; absent stays "" (rendered "-").
+// Precondition: index_map came from collect_bundle_id_paths over this same `apps`,
+// and `apps` is not mutated between collect and apply (indices are unchecked).
 inline void apply_bundle_ids(std::vector<parsers::AppRowFields>& apps,
                              const yuzu::agent::BundleIdPassResult& r,
                              const std::vector<std::size_t>& index_map) {

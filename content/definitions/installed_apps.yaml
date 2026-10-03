@@ -91,7 +91,7 @@ spec:
         platforms: [windows, darwin]
       - name: bundle_id
         type: string
-        description: "The macOS CFBundleIdentifier read in-process from the bundle at install_location (reverse-DNS form). Always \"-\" on Windows and Linux, which have no bundle identifier concept; \"-\" on macOS when the location is not a bundle or carries no identifier, and for rows the bounded bundle-id pass did not reach (30 s deadline, at most 5000 applications submitted, one pass in flight per device) -- a cut-short or capped pass is reported by a leading warning|bundle_id_* row and a CONSTRAINED / PARTIAL status, never silently. An identifier is cut at 4 KiB at read. The value is as reported by the OS: untrusted, as reported by the local bundle — a local user can plant a bundle whose identifier is any string. Values: bundle identifier or \"-\"."
+        description: "The macOS CFBundleIdentifier read in-process from the bundle at install_location (reverse-DNS form). Always \"-\" on Windows and Linux, which have no bundle identifier concept; \"-\" on macOS when the location is not a bundle or carries no identifier, and for rows the bounded bundle-id pass did not reach (30 s deadline, at most 5000 applications submitted, one pass in flight per agent process (one per device)) -- a cut-short or capped pass is reported by a leading warning|bundle_id_* row and a CONSTRAINED / PARTIAL status, never silently. An identifier is cut at 4 KiB at read. The value is as reported by the OS: untrusted, as reported by the local bundle — a local user can plant a bundle whose identifier is any string. Values: bundle identifier or \"-\"."
         example: "com.apple.ActivityMonitor"
         platforms: [darwin]
     aggregation:

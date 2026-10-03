@@ -240,4 +240,39 @@ TEST_CASE("cfstring_to_utf8 bounds a hostile identifier at 4 KiB on a UTF-8 boun
     REQUIRE(bad);
     CHECK(yuzu::agent::cfstring_to_utf8(bad.get()).empty());
 }
+
+// Near-cap boundary (kMaxCFStringBytes == 4096). With < 4 bytes free CF's stop is not
+// attributable to a bad character, so the whole-character prefix is returned.
+TEST_CASE("cfstring_to_utf8 near the 4 KiB cap", "[bundle_id][agent]") {
+    const auto convert = [](const std::string& utf8) {
+        yuzu::agent::ScopedCFRef<CFStringRef> s(CFStringCreateWithCString(
+            nullptr, utf8.c_str(), kCFStringEncodingUTF8));
+        REQUIRE(s);
+        return yuzu::agent::cfstring_to_utf8(s.get());
+    };
+    // 'a' x n then one lone surrogate.
+    const auto with_lone_surrogate = [](std::size_t n) {
+        std::vector<UniChar> chars(n, 'a');
+        chars.push_back(0xD800);
+        yuzu::agent::ScopedCFRef<CFStringRef> s(CFStringCreateWithCharacters(
+            nullptr, chars.data(), static_cast<CFIndex>(chars.size())));
+        REQUIRE(s);
+        return yuzu::agent::cfstring_to_utf8(s.get());
+    };
+
+    // Exact fit.
+    CHECK(convert(std::string(4096, 'a')).size() == 4096);
+
+    // A 4-byte character with 3 bytes free does not fit: the 4093-byte prefix, not "".
+    const auto emoji = convert(std::string(4093, 'a') + "\xF0\x9F\x98\x80"); // U+1F600
+    CHECK(emoji.size() == 4093);
+    CHECK(emoji == std::string(4093, 'a'));
+
+    // Lone surrogate with >= 4 bytes free is unconvertible, not the bound: "".
+    CHECK(with_lone_surrogate(4090).empty());
+    CHECK(with_lone_surrogate(4092).empty());
+    // Documented residual: with < 4 bytes free it is indistinguishable from the bound,
+    // so the in-bound prefix comes back (valid UTF-8, cut again by list_field/the clamp).
+    CHECK(with_lone_surrogate(4093).size() == 4093);
+}
 #endif

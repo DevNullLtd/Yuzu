@@ -10,7 +10,7 @@
  * installed_apps_parsers.hpp accept a fixture string.
  *
  * `list` is the fast, local, always-available action (no params; on macOS one
- * bounded in-process CFBundle read per listed app for bundle_id, inside the noise
+ * bounded in-process CFBundle pass for all listed apps for bundle_id, inside the noise
  * of the single system_profiler call on this Mac, 2026-09-21) -- assertions are on
  * rc and output SHAPE (every emitted line matches the `app|` wire prefix), never
  * on specific app names/counts, which are host-dependent, with ONE deliberate
