@@ -2646,6 +2646,15 @@ test('capability catalogue completeness',
   timeout: 30,
 )
 
+# Wave 11 PR11.2-a: the network_config `routes` instruction definition exists and matches the
+# row the plugin emits (id, dispatch pair, approval mode, platforms, ordered columns). Hermetic.
+test('network_config routes definition',
+  _python3_test,
+  args: [files('test_network_config_routes_definition.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
 # #1398 data-gate: every capability-catalogue row's authored ExecuteGate
 # matches the strictest approval.mode any shipped InstructionDefinition
 # declares for that plugin.action pair, and a content-declared pair with no

@@ -16,6 +16,7 @@
  * attributes, an out-of-range prefix length, a crafted rtnh_len, a truncated
  * datagram) — the cases where a hand-built packed struct is the point.
  */
+#include "network_config_routes_legs.hpp"
 #include "network_config_routes_parsers.hpp"
 #if defined(__linux__)
 #include "network_config_netlink.hpp"
@@ -114,6 +115,81 @@ TEST_CASE("format_route_row cannot be split by an interface name containing the 
     CHECK(row == "route|ipv4|10.0.0.0|8|-|ev\\|il name/x|-|-|unicast|-");
 }
 
+
+// ── emit_routes: the status contract every leg shares ─────────────────────────────────────
+
+namespace {
+
+struct RecordingCtx {
+    std::vector<std::string> rows;
+    int status_calls = 0;
+    YuzuResultStatus status = YUZU_RESULT_STATUS_UNDECLARED;
+    YuzuResultCompleteness completeness = YUZU_RESULT_COMPLETENESS_UNKNOWN;
+    std::string provenance;
+    void write_output(std::string_view row) { rows.emplace_back(row); }
+    void set_result_status(YuzuResultStatus s, YuzuResultCompleteness c, std::string_view p = {}) {
+        ++status_calls;
+        status = s;
+        completeness = c;
+        provenance = std::string{p};
+    }
+};
+
+RouteRow sample_row() {
+    RouteRow r;
+    r.destination = "192.0.2.0";
+    r.prefix_len = 24;
+    r.origin = "static";
+    return r;
+}
+
+} // namespace
+
+TEST_CASE("emit_routes: a clean read is OK/FULL and an empty table is a clean answer",
+          "[network_config][routes][routes_status]") {
+    RecordingCtx ctx;
+    yuzu::shared::ConstraintAccumulator acc;
+    emit_routes(ctx, {sample_row(), sample_row()}, acc, false);
+    CHECK(ctx.rows.size() == 2);
+    CHECK(ctx.rows[0].starts_with("route|ipv4|192.0.2.0|24|"));
+    CHECK(ctx.status == YUZU_RESULT_STATUS_OK);
+    CHECK(ctx.completeness == YUZU_RESULT_COMPLETENESS_FULL);
+    CHECK(ctx.provenance.empty());
+    CHECK(ctx.status_calls == 1); // exactly one status per run
+
+    RecordingCtx empty;
+    emit_routes(empty, {}, acc, false); // a host with no routes: zero rows, still OK/FULL
+    CHECK(empty.rows.empty());
+    CHECK(empty.status == YUZU_RESULT_STATUS_OK);
+    CHECK(empty.completeness == YUZU_RESULT_COMPLETENESS_FULL);
+}
+
+TEST_CASE("emit_routes: a reduced read is CONSTRAINED/PARTIAL with every token, rows still sent",
+          "[network_config][routes][routes_status]") {
+    RecordingCtx ctx;
+    yuzu::shared::ConstraintAccumulator acc;
+    acc.add_failure(kTokRowCap);
+    acc.add_failure("network_config:routes_multipath_first_nexthop_only");
+    acc.add_failure(kTokRowCap); // a repeated token is recorded once
+    emit_routes(ctx, {sample_row()}, acc, false);
+    CHECK(ctx.rows.size() == 1);
+    CHECK(ctx.status == YUZU_RESULT_STATUS_CONSTRAINED);
+    CHECK(ctx.completeness == YUZU_RESULT_COMPLETENESS_PARTIAL);
+    CHECK(ctx.provenance ==
+          "network_config:routes_row_cap_reached,network_config:routes_multipath_first_nexthop_only");
+}
+
+TEST_CASE("emit_routes: an unreadable table is UNAVAILABLE/PARTIAL, never an OK empty table",
+          "[network_config][routes][routes_status]") {
+    RecordingCtx ctx;
+    yuzu::shared::ConstraintAccumulator acc;
+    acc.add_failure("network_config:routes_table_unavailable");
+    emit_routes(ctx, {}, acc, true);
+    CHECK(ctx.rows.empty());
+    CHECK(ctx.status == YUZU_RESULT_STATUS_UNAVAILABLE);
+    CHECK(ctx.completeness == YUZU_RESULT_COMPLETENESS_PARTIAL);
+    CHECK(ctx.provenance == "network_config:routes_table_unavailable");
+}
 
 // ── Windows mapping (portable: pure logic over a plain struct) ────────────
 //

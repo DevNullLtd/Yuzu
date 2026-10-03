@@ -37,7 +37,12 @@ inline constexpr const char* kTokRowCap = "network_config:routes_row_cap_reached
 /// an unresolved nexthop object) is CONSTRAINED/PARTIAL with every accumulated
 /// token as the reason; otherwise OK/FULL. An empty row set with OK/FULL is a
 /// genuinely empty routing table, never a failed read.
-inline void emit_routes(yuzu::CommandContext& ctx, const std::vector<RouteRow>& rows,
+///
+/// Templated over the context so a test can pass a recording fake: the status mapping is the
+/// result contract every leg shares, and nothing else exercises it off-host. Production passes
+/// yuzu::CommandContext.
+template <typename Ctx>
+inline void emit_routes(Ctx& ctx, const std::vector<RouteRow>& rows,
                         const yuzu::shared::ConstraintAccumulator& acc, bool unavailable) {
     for (const auto& r : rows)
         ctx.write_output(format_route_row(r));

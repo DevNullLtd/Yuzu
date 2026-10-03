@@ -37,6 +37,8 @@
 
 #include "local_dispatcher.hpp"
 
+#include <algorithm>
+#include <cctype>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -279,6 +281,48 @@ TEST_CASE("network_config plugin: arp exercises the real native leg without erro
     const auto rows = rows_with_prefix(result.captured, "arp|");
     std::set<std::string> unique(rows.begin(), rows.end());
     CHECK(unique.size() == rows.size());
+}
+
+TEST_CASE("network_config plugin: routes exercises the real native leg and reports a typed status",
+          "[network_config][posix_actions]") {
+    auto plugin = load_network_config_plugin();
+    if (!plugin) {
+        require_plugin_or_skip();
+        return;
+    }
+
+    yuzu::agent::LocalDispatcher dispatcher;
+    auto result = dispatcher.run(plugin->descriptor, "routes");
+    CHECK(result.rc == 0);
+
+    // The leg ALWAYS declares a status (the plugin reports every data-level outcome through it),
+    // so UNDECLARED would mean the action never reached the leg. A host with no routes at all is
+    // legitimate (a `--network none` container), so row COUNT is not asserted; row SHAPE is.
+    CHECK(result.result_status != YUZU_RESULT_STATUS_UNDECLARED);
+    if (result.result_status == YUZU_RESULT_STATUS_OK)
+        CHECK(result.result_completeness == YUZU_RESULT_COMPLETENESS_FULL);
+    else
+        CHECK(result.result_provenance.rfind("network_config:", 0) == 0);
+
+    const auto rows = rows_with_prefix(result.captured, "route|");
+    if (result.result_status == YUZU_RESULT_STATUS_UNAVAILABLE)
+        CHECK(rows.empty()); // an unreadable table is never reported as rows
+    const std::set<std::string> families{"ipv4", "ipv6"};
+    const std::set<std::string> types{"unicast", "blackhole", "unreachable", "prohibit", "throw",
+                                      "reject",  "nat",       "xresolve"};
+    for (const auto& r : rows) {
+        const auto f = split_fields(r);
+        // route|family|destination|prefix_len|gateway|interface|metric|table|type|origin
+        REQUIRE(f.size() == 10);
+        CHECK(families.count(f[1]) == 1);
+        CHECK_FALSE(f[2].empty());
+        CHECK_FALSE(f[3].empty());
+        CHECK(std::all_of(f[3].begin(), f[3].end(), [](unsigned char c) { return std::isdigit(c); }));
+        CHECK_FALSE(f[4].empty()); // `-` when on-link, never empty
+        CHECK_FALSE(f[5].empty());
+        CHECK((types.count(f[8]) == 1 || f[8].rfind("type", 0) == 0));
+        CHECK_FALSE(f[9].empty());
+    }
 }
 
 #endif // !_WIN32
