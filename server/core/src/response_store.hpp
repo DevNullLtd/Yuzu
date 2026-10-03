@@ -272,7 +272,9 @@ public:
     /// PGresult nor the parsed vector ever holds more than roughly `max_payload_bytes` of
     /// `output`+`error_detail` (plus one final row of up to about 4 MiB for text output, about 12 MiB for
     /// output dense in invalid bytes or NULs: each field is cut to 2 MiB at ingest before invalid bytes
-    /// and NULs become 3-byte U+FFFD):
+    /// and NULs become 3-byte U+FFFD; the one uncut field is the `error_detail` that
+    /// `finalize_terminal_status` writes for a terminal frame, bounded only by the gRPC receive
+    /// message limit, so a row can exceed these figures):
     ///   1. a sizing pass over the (at most limit+1) candidate rows reads only
     ///      `octet_length(output)+octet_length(error_detail)` -- Postgres answers that
     ///      from the TOAST pointer without detoasting (measured: 0.05 ms vs 207 ms for

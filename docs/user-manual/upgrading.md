@@ -129,7 +129,7 @@ carries an `X-Result-Truncated-By-Cap: true` header (CSV) and a download name
 `responses-<id>-truncated.json` or `.csv`; a plain `curl -o out.csv ...` keeps neither, `curl -sS -D
 - -o out.csv ...` shows the header and `curl -OJ` keeps the name. The 50 MiB cap counts payload
 bytes, the last row kept can run past it by up to its own size (about 4 MiB for text output, up to
-about 12 MiB for output dense in invalid bytes or NULs), and a result under 50 MiB of raw payload can
+about 12 MiB for output dense in invalid bytes or NULs; a terminal frame's `error_detail` is not cut at ingest and can add more), and a result under 50 MiB of raw payload can
 still be cut when its escaped serialized form crosses the cap. A legacy export of an id containing a
 character outside `[A-Za-z0-9._-]` is now downloaded under a name with that character written as `_`.
 A quoted CSV cell can contain text that looks like the trailer, so read the file as CSV and take the

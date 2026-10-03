@@ -5098,7 +5098,7 @@ and `rest_v1` each get their own one-a-minute allowance).
 MiB of payload plus one final row while it is fetched. The cap is on whole rows, so the last row
 kept can run past it by up to its own size (each of `output` and `error_detail` is cut to 2 MiB at
 ingest before invalid bytes and NULs become the 3-byte U+FFFD, so a row is about 4 MiB for text
-output and up to about 12 MiB for output dense in invalid bytes or NULs). The serialization-time
+output and up to about 12 MiB for output dense in invalid bytes or NULs; the exception is the `error_detail` written when a terminal frame closes a running row, which is sanitised but not cut at ingest and is bounded only by the gRPC receive message limit, so a row can exceed these figures). The serialization-time
 backstop counts escaped bytes (the whole body so far for CSV, each serialized row object for JSON),
 so a result under 50 MiB of raw payload can still be cut and reported as `byte_cap`. One measurement, 400 rows
 of 512 KiB: the store query's peak resident memory rose by 99 MiB with the bounded fetch, against
@@ -5106,11 +5106,12 @@ of 512 KiB: the store query's peak resident memory rose by 99 MiB with the bound
 afterwards is additional. These named routes are not covered by the byte cap: the plain list
 routes (`GET /api/v1/responses/{id}`, the legacy `GET /api/responses/{id}`, MCP `query_responses`,
 `GET /api/v1/executions/{id}/responses`) are capped by row count only, at most 1000 rows of up to
-2 MiB of raw bytes per field, and the execution visualization route and the dashboard results
+2 MiB of raw bytes per field (plus the uncut terminal-frame `error_detail`), and the execution visualization route and the dashboard results
 fragment and scan page read up to 10,000 rows with no byte bound; this change does not bound their
-memory. Two internal reads also have no byte bound and take their limit from something other than a
-request parameter: the fleet visualization snapshot's collect poll (the number of agents it
-dispatched to, plus 16) and the deployment poll (a fixed 50,000).
+memory. Other internal reads also have no byte bound and take their limit from something other than a
+request parameter; for example (not an exhaustive list), the fleet visualization snapshot's collect poll (the number of agents it
+dispatched to, plus 16), the deployment poll (a fixed 50,000), the pre-flight per-check read (a fixed 50,000),
+a bundle execution's result read (1000) and an execution-detail page read (500).
 
 **Pool sizing.** An export holds one connection from the server's shared Postgres pool for the
 fetch and the parse. The pool is sized by `--postgres-pool-size` (default 16) and is shared by

@@ -132,7 +132,10 @@ inline constexpr int kQueryRowLimitCap = 1000;
 ///      (a row is kept while the rows BEFORE it are under the cap, so the last kept row
 ///      can run past it by up to its own size: about 4 MiB for text output, up to about
 ///      12 MiB for output dense in invalid bytes or NULs, because each of the two fields
-///      is cut to 2 MiB at ingest BEFORE invalid bytes and NULs become 3-byte U+FFFD) and
+///      is cut to 2 MiB at ingest BEFORE invalid bytes and NULs become 3-byte U+FFFD; the
+///      one exception is the `error_detail` that `finalize_terminal_status` writes when a
+///      terminal frame closes a running row, which is sanitised but NOT cut and is bounded
+///      only by the gRPC receive message limit, so a row can exceed even these figures) and
 ///      never materialises the rest; and
 ///   2. at serialization (`append_rows_until_byte_cap`) as a backstop, because CSV
 ///      escaping and JSON framing make the SERIALIZED row larger than its raw payload.
@@ -141,10 +144,12 @@ inline constexpr int kQueryRowLimitCap = 1000;
 /// `GET /api/v1/executions/{id}/responses`: each at most 1000 rows, no byte bound), the
 /// execution visualization route (`query()` with a 10,000-row limit), and the dashboard
 /// `/fragments/results` and scan-page fetches (`query()` with limit 10,000); none of
-/// those goes through `query_bounded`. Two internal reads (server.cpp: the fleet
-/// visualization snapshot's collect poll, limit = dispatched agents + 16, and the
-/// deployment poll, a fixed 50,000) are likewise unbounded by bytes and take their limit
-/// from something other than a request parameter.
+/// those goes through `query_bounded`. Other internal reads are likewise unbounded by
+/// bytes and take their limit from something other than a request parameter; for example
+/// (not an exhaustive list) server.cpp's fleet visualization snapshot collect poll
+/// (limit = dispatched agents + 16) and deployment poll (a fixed 50,000), the pre-flight
+/// per-check read (`preflight_eval.cpp`, a fixed 50,000), the bundle orchestrator's result
+/// read (1000) and an execution-detail page read (`workflow_routes.cpp`, 500).
 /// A flat constant local to the export surface -- NOT the ingest cap, which bounds a
 /// different thing -- and not operator-tunable. Well above any realistic export (a
 /// 10,000-row export of typical command output is a few MiB).

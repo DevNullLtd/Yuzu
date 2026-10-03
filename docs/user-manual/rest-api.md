@@ -6112,14 +6112,14 @@ a different order on each call; the export routes order ties by `id` descending.
 **Export body size cap (#4703).** Both export routes (this family's `GET /api/v1/responses/{id}/export`
 and the legacy `GET /api/responses/{id}/export`) also stop once the rows served carry 50 MiB of
 payload (`output` plus `error_detail`, as stored), on top of the row-count cap: each response's
-`output`/`error_detail` is cut to only 2 MiB of raw bytes at ingest, so a row-count cap alone still let a
+`output`/`error_detail` is cut to only 2 MiB of raw bytes at ingest (one exception, below), so a row-count cap alone still let a
 10,000-row export serialize to tens of GB. The cut is made **inside the store query**: the database
 keeps rows while the payload of the rows before them is under the cap, so the fetch holds about 50
 MiB of payload plus one final row, not every row up to `limit`. The cap is on whole rows, so the
 last row kept can run past it by up to its own size. Each of `output` and `error_detail` is cut to
 2 MiB of raw bytes at ingest, and only afterwards is each invalid byte or NUL replaced by the 3-byte
 U+FFFD, so a row is about 4 MiB for text output and can reach about 12 MiB for output dense in
-invalid bytes or NULs. At least one row is always served, so a single row larger than the cap is
+invalid bytes or NULs. The exception is the `error_detail` written when a terminal frame closes a running row, which is sanitised but not cut at ingest and is bounded only by the gRPC receive message limit (4 MiB by default; the server does not override it), so a row can exceed these figures. At least one row is always served, so a single row larger than the cap is
 still returned. A second check while serializing counts what each format builds (CSV quoting and
 JSON framing make the serialized row larger than its raw payload): for JSON it is the serialized
 size of each row object, which excludes the commas between rows, the envelope and the legacy
@@ -6131,12 +6131,13 @@ with the unbounded `query()` fetch; other row shapes were not measured, and the 
 built afterwards is additional. These named routes are **not** covered by the byte cap: the plain
 list routes (`GET /api/v1/responses/{id}`, the legacy `GET /api/responses/{id}`, MCP
 `query_responses` and `GET /api/v1/executions/{id}/responses`) are capped by row count only (at
-most 1000 rows of up to 2 MiB of raw bytes per field, before the U+FFFD growth described above);
+most 1000 rows of up to 2 MiB of raw bytes per field, before the U+FFFD growth and the uncut terminal-frame `error_detail` described above);
 the execution visualization route and the two dashboard result fetches (the results fragment and
-the scan page) read up to 10,000 rows through the same unbounded `query()`. Two internal reads
-also bypass it and take their limit from something other than a request parameter: the fleet
+the scan page) read up to 10,000 rows through the same unbounded `query()`. Other internal reads
+also bypass it and take their limit from something other than a request parameter; for example (not an exhaustive list), the fleet
 visualization snapshot's collect poll sizes it from the number of agents it dispatched to
-(`dispatched.size() + 16`), and the deployment poll uses a fixed 50,000. The cap is not
+(`dispatched.size() + 16`), the deployment poll uses a fixed 50,000, the pre-flight per-check read uses a fixed 50,000,
+a bundle execution's result read uses 1000 and an execution-detail page read uses 500. The cap is not
 operator-tunable.
 
 **Detecting a cut export.** A cut is marked on both export routes and both formats. JSON carries
