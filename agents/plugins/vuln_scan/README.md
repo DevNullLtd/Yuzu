@@ -85,12 +85,19 @@ a different, 3-field shape: a literal `summary` discriminator, then a severity n
 literal `TOTAL`), then a count — one field more than the two result columns (`severity`, `count`)
 the definition declares. `inventory` emits raw `name|version` pairs with no discriminator.
 
+A Linux config check whose file read fails (EACCES, EIO, ...) emits `UNREADABLE|config|<title>|<path>: <cause>`
+(for example `eacces`) rather than a finding about an empty value. `UNREADABLE` means the check
+could not run; it is not an issue, so `summary` leaves it out of the `TOTAL` row's issue count and
+reports it on its own `summary|UNREADABLE|<n>` row after `summary|INFO|<n>`. An absent
+`/etc/ssh/sshd_config` is not a weak setting: both SSH checks emit `INFO` with
+"/etc/ssh/sshd_config not present; check not applicable".
+
 <!-- BEGIN GENERATED: plugin-doc-gen outputs -->
 **`security.vuln_scan.config_scan` — `severity|category|title|detail`**
 
 | Field | Type | Values | Available | Example | Description |
 |---|---|---|---|---|---|
-| `severity` | string | `CRITICAL` `HIGH` `MEDIUM` `LOW` `INFO` | Windows, Linux, macOS | `HIGH` | Finding severity assigned by the compliance check that produced this row. |
+| `severity` | string | `CRITICAL` `HIGH` `MEDIUM` `LOW` `INFO` `UNREADABLE` | Windows, Linux, macOS | `HIGH` | Finding severity assigned by the compliance check that produced this row. UNREADABLE means the check could not run; not an issue. |
 | `category` | string | `config` `scan` | Windows, Linux, macOS | `config` | Always "config" for this action; "scan" only on the placeholder row emitted when there is nothing to report. |
 | `title` | string | - | Windows, Linux, macOS | `SMBv1 Protocol` | The name of the compliance check, e.g. the setting it inspects. Values: free text. |
 | `detail` | string | - | Windows, Linux, macOS | `Enabled - vulnerable to EternalBlue/WannaCry (MS17-010)` | The check's human-readable result text, including why a failing check failed. Values: free text. |
@@ -115,7 +122,7 @@ the definition declares. `inventory` emits raw `name|version` pairs with no disc
 
 | Field | Type | Values | Available | Example | Description |
 |---|---|---|---|---|---|
-| `severity` | string | `CRITICAL` `HIGH` `MEDIUM` `LOW` `INFO` | Windows, Linux, macOS | `CRITICAL` | Finding severity assigned by the check that produced this row. |
+| `severity` | string | `CRITICAL` `HIGH` `MEDIUM` `LOW` `INFO` `UNREADABLE` | Windows, Linux, macOS | `CRITICAL` | Finding severity assigned by the check that produced this row. UNREADABLE means the check could not run; not an issue. |
 | `category` | string | `cve` `config` `scan` | Windows, Linux, macOS | `cve` | Which half of the scan produced this row. |
 | `title` | string | - | Windows, Linux, macOS | `CVE-2021-34527: PrintNightmare: RCE via Windows Print Spooler` | For a cve row, "<CVE-ID>: <description>" from the matched rule; for a config row, the name of the compliance check; "No vulnerabilities" on the single placeholder row emitted when a run finds nothing. Values: free text. |
 | `detail` | string | - | Windows, Linux, macOS | `Microsoft Windows Desktop Runtime - 6.0.11 (x64) 6.0.11.31823 (fixed in KB5004945)` | For a cve row, "<installed product> <version> (fixed in <fixed_ver>)"; for a config row, the check's human-readable result text. Values: free text. |
@@ -124,7 +131,7 @@ the definition declares. `inventory` emits raw `name|version` pairs with no disc
 
 | Field | Type | Values | Available | Example | Description |
 |---|---|---|---|---|---|
-| `severity` | string | `TOTAL` `CRITICAL` `HIGH` `MEDIUM` `LOW` `INFO` | Windows, Linux, macOS | `CRITICAL` | The severity this row counts, or the literal "TOTAL" for the first row emitted by every run. |
+| `severity` | string | `TOTAL` `CRITICAL` `HIGH` `MEDIUM` `LOW` `INFO` `UNREADABLE` | Windows, Linux, macOS | `CRITICAL` | The severity this row counts, or the literal "TOTAL" for the first row emitted by every run. |
 | `count` | int32 | - | Windows, Linux, macOS | `17` | The number of findings at this severity. The TOTAL row is an exception: despite the declared int32 type, that row's cell holds the formatted string "<n> findings (<n> issues)", not an integer. Values: integer, except a formatted string on the TOTAL row. |
 <!-- END GENERATED -->
 
@@ -354,10 +361,11 @@ bsdutils|1:2.41.5-0+deb13u1
    pipe fields per row (`summary|<severity-or-TOTAL>|<count>`), but the definition YAML declares
    only 2 result columns, `severity` and `count`. The `TOTAL` row's `count` cell is also a
    formatted string (`"<n> findings (<n> issues)"`), not the declared `int32`.
-3. **A denied or missing read never surfaces as an explicit error — it becomes the check's
-   negative/default branch.** A failed Windows registry read returns an empty string, read as
-   "key not present"; a failed `popen` on Linux/macOS returns empty output, read as "command
-   absent" or "feature disabled". No sample capture observed an actual permission denial, so
+3. **On Windows and macOS, and for Linux `popen` probes, a denied or missing read never surfaces
+   as an explicit error — it becomes the check's negative/default branch.** A failed Windows
+   registry read returns an empty string, read as "key not present"; a failed `popen` on
+   Linux/macOS returns empty output, read as "command absent" or "feature disabled". The Linux
+   file-backed checks (SSH, ASLR, `suid_dumpable`) are the exception: a failed read is `UNREADABLE`. No sample capture observed an actual permission denial, so
    this is a code-path claim, not a measured one.
 4. **`inventory` and `installed_apps` are two collectors for overlapping data.** They already
    share the same "installed, held" package-presence convention on Linux without being merged —

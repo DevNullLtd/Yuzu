@@ -423,6 +423,7 @@ void output_summary(yuzu::CommandContext& ctx, const std::vector<Finding>& findi
     counts["MEDIUM"] = 0;
     counts["LOW"] = 0;
     counts["INFO"] = 0;
+    counts["UNREADABLE"] = 0; // the check could not run; not an issue
 
     for (const auto& f : findings) {
         counts[f.severity]++;
@@ -433,13 +434,13 @@ void output_summary(yuzu::CommandContext& ctx, const std::vector<Finding>& findi
     int issues = 0;
     for (const auto& [sev, count] : counts) {
         total += count;
-        if (sev != "INFO")
+        if (sev != "INFO" && sev != "UNREADABLE")
             issues += count;
     }
 
     ctx.write_output(std::format("summary|TOTAL|{} findings ({} issues)", total, issues));
 
-    for (const auto& sev : {"CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"}) {
+    for (const auto& sev : {"CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO", "UNREADABLE"}) {
         ctx.write_output(std::format("summary|{}|{}", sev, counts[sev]));
     }
 }
