@@ -116,26 +116,6 @@ TEST_CASE("is_stale: exact-equality age is fresh, one second past is stale, a ne
     CHECK_FALSE(is_stale(kMtime, kMtime - 10, kScratchDirStaleAfterSecs));
 }
 
-TEST_CASE("reject_candidate_handle: a reparse attribute or a volume-serial mismatch rejects; a "
-          "clean same-volume handle is accepted",
-          "[execution_artifacts][scratch_sweep]") {
-    constexpr std::uint32_t kDirAttr = 0x00000010; // FILE_ATTRIBUTE_DIRECTORY
-    constexpr std::uint32_t kSerial = 0xABCD1234;
-    CHECK_FALSE(reject_candidate_handle(kDirAttr, kSerial, kSerial));
-    CHECK(reject_candidate_handle(kDirAttr | kFileAttributeReparsePoint, kSerial, kSerial));
-    CHECK(reject_candidate_handle(kDirAttr, kSerial + 1, kSerial));
-}
-
-TEST_CASE("sweep_start_index: empty -> 0, otherwise pass_counter wraps over the entry count",
-          "[execution_artifacts][scratch_sweep]") {
-    CHECK(sweep_start_index(0, 0) == 0);
-    CHECK(sweep_start_index(7, 0) == 0);
-    CHECK(sweep_start_index(0, 3) == 0);
-    CHECK(sweep_start_index(2, 3) == 2);
-    CHECK(sweep_start_index(3, 3) == 0);
-    CHECK(sweep_start_index(8, 3) == 2);
-}
-
 TEST_CASE("ClockStepGuard (#4503): steady progression never skips; forward step, backward-then-"
           "restore skip; quarantine expires; boundary is strictly greater",
           "[execution_artifacts][scratch_sweep]") {

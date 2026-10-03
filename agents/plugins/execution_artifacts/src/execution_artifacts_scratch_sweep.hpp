@@ -42,7 +42,7 @@
  *     non-startup pass. A forward wall-clock step larger than
  *     kScratchSweepClockStepToleranceSecs between two samples quarantines
  *     sweeping for kScratchDirStaleAfterSecs of MONOTONIC time (the pass is
- *     skipped and reported via ScratchSweepResult::skipped_clock_step). After
+ *     skipped and logged at warn). After
  *     that, every directory created before the step has a real age beyond
  *     the stale threshold, so cleanup resumes with no restart. Consecutive
  *     comparison (not startup-relative) is deliberate: a backward step that
@@ -65,8 +65,8 @@
  *     -- not preemptive mid-candidate, since one candidate's own bounded
  *     file-unlink loop is never interrupted once started), and never trusts
  *     more than max_dir_entries entries inside one candidate.
- *   - Rotation (#4504): each pass starts its walk at sweep_start_index(
- *     pass_counter, n) and wraps, so a persistently failing run of early
+ *   - Rotation (#4504): each pass starts its walk at index
+ *     pass_counter % n and wraps, so a persistently failing run of early
  *     entries cannot starve later ones across passes. STATED LIMIT: rotation
  *     guarantees eventual coverage of every entry WITHIN the first
  *     max_root_entries the root enumeration returns; a data_dir holding more
@@ -162,13 +162,6 @@ struct SweepLimits {
     std::size_t max_dir_entries = kScratchSweepMaxDirEntries;
 };
 
-/// Index at which pass number `pass_counter` starts walking `entry_count`
-/// root entries (wrapping): 0 when empty, else pass_counter % entry_count.
-[[nodiscard]] constexpr std::size_t sweep_start_index(std::uint64_t pass_counter,
-                                                      std::size_t entry_count) noexcept {
-    return entry_count == 0 ? 0 : static_cast<std::size_t>(pass_counter % entry_count);
-}
-
 /// Outcome of one sweep pass. Every count defaults to zero; `enumerate_error`
 /// + `os_error` are set only when the root itself could not be opened/
 /// enumerated at all (the pass then did nothing, rather than guessing).
@@ -180,9 +173,6 @@ struct ScratchSweepResult {
     std::size_t deferred{0};
     bool enumerate_error{false};
     int os_error{0};
-    /// Set by the caller (not the sweep) when a pass was skipped entirely
-    /// because the wall clock stepped forward (quarantine, part 3).
-    bool skipped_clock_step{false};
 };
 
 /// True only for the exact prefix followed by exactly
@@ -216,27 +206,19 @@ struct ScratchSweepResult {
     return (now_unix_s - mtime_unix_s) > stale_after_s;
 }
 
-/// Open-time rejection of a candidate directory handle, from the plain fields
-/// of BY_HANDLE_FILE_INFORMATION (dwFileAttributes, dwVolumeSerialNumber) and
-/// the pinned root's volume serial: true for a reparse point (a mid-walk swap)
-/// or a volume mismatch. Pure so it is unit-testable off Windows; the header
-/// stays OS-header-free, hence plain integers and the literal reparse bit.
-inline constexpr std::uint32_t kFileAttributeReparsePoint = 0x00000400; // FILE_ATTRIBUTE_REPARSE_POINT
-
-[[nodiscard]] constexpr bool reject_candidate_handle(std::uint32_t file_attributes,
-                                                     std::uint32_t volume_serial,
-                                                     std::uint32_t root_volume_serial) noexcept {
-    return (file_attributes & kFileAttributeReparsePoint) != 0 ||
-           volume_serial != root_volume_serial;
-}
-
 #ifdef _WIN32
 /// Sweep `data_dir` for stale execution_artifacts scratch directories and
 /// remove them, using confined_fs's handle-relative, ownership-verified
 /// primitives (execution_artifacts_scratch_sweep_win.cpp). Never throws;
 /// never removes anything whose name fails is_scratch_dir_name, whose type
 /// is not a directory, whose age (per is_stale) is not past `stale_after_s`,
-/// X
+/// or whose owner is not this process's own token owner. `limits` caps the
+/// pass (part 5); `pass_counter` picks the rotated start index (#4504).
+[[nodiscard]] ScratchSweepResult
+sweep_stale_scratch_dirs(const std::wstring& data_dir, std::int64_t now_unix_s,
+                         std::int64_t stale_after_s = kScratchDirStaleAfterSecs,
+                         const SweepLimits& limits = {},
+                         std::uint64_t pass_counter = 0) noexcept;
 #endif
 
 } // namespace yuzu::execution_artifacts

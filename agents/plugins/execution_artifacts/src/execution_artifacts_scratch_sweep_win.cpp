@@ -213,7 +213,8 @@ ScratchSweepResult sweep_stale_scratch_dirs(const std::wstring& data_dir,
         // once, but a persistent early failure cannot starve later entries
         // across passes.
         const std::size_t n_entries = root_entries.entries.size();
-        const std::size_t start = sweep_start_index(pass_counter, n_entries);
+        const std::size_t start =
+            n_entries == 0 ? 0 : static_cast<std::size_t>(pass_counter % n_entries);
         for (std::size_t visited = 0; visited < n_entries; ++visited) {
             const auto& entry = root_entries.entries[(start + visited) % n_entries];
             if (!is_scratch_dir_name(entry.name))
@@ -282,8 +283,11 @@ ScratchSweepResult sweep_stale_scratch_dirs(const std::wstring& data_dir,
             // mid-walk swap), and reject a volume mismatch against the
             // pinned root -- both mirror confined_fs's own open_dir_at
             // checks.
-            if (reject_candidate_handle(info.dwFileAttributes, info.dwVolumeSerialNumber,
-                                        root.identity().volume_serial)) {
+            if ((info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
+                ++res.failed;
+                continue;
+            }
+            if (info.dwVolumeSerialNumber != root.identity().volume_serial) {
                 ++res.failed;
                 continue;
             }
