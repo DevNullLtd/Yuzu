@@ -130,6 +130,7 @@ inline bool directive_present(const std::vector<std::string>& lines, std::string
 inline constexpr std::string_view kAslrPath = "/proc/sys/kernel/randomize_va_space";
 inline constexpr std::string_view kSuidPath = "/proc/sys/fs/suid_dumpable";
 inline constexpr std::string_view kSshdConfigPath = "/etc/ssh/sshd_config";
+inline constexpr std::string_view kMountsPath = "/proc/mounts";
 
 // An absent sshd_config means no SSH server config to weaken -- not a finding.
 inline ConfigCheckResult sshd_not_applicable(std::string_view title) {
@@ -194,6 +195,24 @@ inline std::optional<ConfigCheckResult> ssh_password_auth_check(const LinesResul
     if (detail::directive_present(*r, "PasswordAuthentication yes"))
         return ConfigCheckResult{"MEDIUM", title,
                                  "Enabled - consider using key-based authentication only", false};
+    return std::nullopt;
+}
+
+// nullopt when /proc/mounts has no separate /tmp mount: no row is emitted (unchanged).
+inline std::optional<ConfigCheckResult> tmp_noexec_check(const LinesResult& r) {
+    constexpr std::string_view title = "/tmp noexec";
+    if (!r)
+        return detail::unreadable(title, detail::kMountsPath, r.error());
+    for (const auto& line : *r) {
+        if (line.find(" /tmp ") == std::string::npos)
+            continue;
+        const bool has_noexec = line.find("noexec") != std::string::npos;
+        return ConfigCheckResult{
+            has_noexec ? "INFO" : "MEDIUM", title,
+            has_noexec ? "/tmp is mounted with noexec"
+                       : "/tmp is not mounted with noexec - executables can run from /tmp",
+            has_noexec};
+    }
     return std::nullopt;
 }
 
@@ -397,29 +416,8 @@ inline std::vector<ConfigCheckResult> run_linux_checks() {
     results.push_back(aslr_check(detail::read_proc_value(detail::kAslrPath.data())));
     results.push_back(suid_dumpable_check(detail::read_proc_value(detail::kSuidPath.data())));
 
-    // /tmp mounted noexec
-    {
-        std::ifstream mounts("/proc/mounts");
-        bool found_tmp = false;
-        bool has_noexec = false;
-        if (mounts.is_open()) {
-            std::string line;
-            while (std::getline(mounts, line)) {
-                if (line.find(" /tmp ") != std::string::npos) {
-                    found_tmp = true;
-                    has_noexec = line.find("noexec") != std::string::npos;
-                    break;
-                }
-            }
-        }
-        if (found_tmp) {
-            results.push_back(
-                {has_noexec ? "INFO" : "MEDIUM", "/tmp noexec",
-                 has_noexec ? "/tmp is mounted with noexec"
-                            : "/tmp is not mounted with noexec - executables can run from /tmp",
-                 has_noexec});
-        }
-    }
+    if (auto t = tmp_noexec_check(detail::read_lines(detail::kMountsPath.data())))
+        results.push_back(std::move(*t));
 
     // Firewall (iptables/nftables)
     {

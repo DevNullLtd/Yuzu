@@ -66,6 +66,37 @@ TEST_CASE("aslr_check: read values keep today's rows", "[vuln][config]") {
     CHECK_FALSE(empty.passed);
 }
 
+// ── /tmp noexec ─────────────────────────────────────────────────────────────
+
+TEST_CASE("tmp_noexec_check: unreadable, no /tmp mount, noexec and exec", "[vuln][config]") {
+    auto unreadable = tmp_noexec_check(LinesResult(std::unexpected(EACCES)));
+    REQUIRE(unreadable.has_value());
+    CHECK(unreadable->severity == "UNREADABLE");
+    CHECK(unreadable->title == "/tmp noexec");
+    CHECK(unreadable->detail == "/proc/mounts: eacces");
+    CHECK_FALSE(unreadable->passed);
+
+    CHECK_FALSE(tmp_noexec_check(lines({"proc /proc proc rw,nosuid,nodev,noexec 0 0",
+                                        "/dev/sda1 / ext4 rw,relatime 0 0"}))
+                    .has_value());
+
+    auto noexec = tmp_noexec_check(
+        lines({"/dev/sda1 / ext4 rw,relatime 0 0",
+               "tmpfs /tmp tmpfs rw,nosuid,nodev,noexec,relatime 0 0"}));
+    REQUIRE(noexec.has_value());
+    CHECK(noexec->severity == "INFO");
+    CHECK(noexec->title == "/tmp noexec");
+    CHECK(noexec->detail == "/tmp is mounted with noexec");
+    CHECK(noexec->passed);
+
+    auto exec = tmp_noexec_check(lines({"tmpfs /tmp tmpfs rw,nosuid,nodev,relatime 0 0"}));
+    REQUIRE(exec.has_value());
+    CHECK(exec->severity == "MEDIUM");
+    CHECK(exec->title == "/tmp noexec");
+    CHECK(exec->detail == "/tmp is not mounted with noexec - executables can run from /tmp");
+    CHECK_FALSE(exec->passed);
+}
+
 // ── suid_dumpable ───────────────────────────────────────────────────────────
 
 TEST_CASE("suid_dumpable_check: unreadable is UNREADABLE with path and cause", "[vuln][config]") {

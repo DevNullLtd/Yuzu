@@ -7,7 +7,7 @@
 ## GetSystemFirmwareTable('RSMB'); Linux sysfs DMI (/sys/class/dmi/id/bios_*)
 ## plus fwupd (org.freedesktop.fwupd GetDevices/GetUpgrades over the sd-bus
 ## system bus); macOS IOKit IODeviceTree (/rom, /chosen, root) plus
-## sysctlbyname hw.model.
+## sysctlbyname hw.model and hw.optional.arm64 (Apple Silicon gate).
 ##
 ## Wire rows lead with a fixed tag: `firmware|<field>|<value>|<source>` (the
 ## data rows) or, only when the action's one exception handler fires,

@@ -30,7 +30,7 @@ flowchart LR
   SRV -- gRPC mTLS --> HOST[Agent plugin host] --> EX[firmware_posture.execute]
   EX --> WIN[Windows leg<br/>Win32_BIOS WMI + GetSystemFirmwareTable RSMB]
   EX --> LIN[Linux leg<br/>sysfs DMI + fwupd sd-bus GetDevices]
-  EX --> MAC[macOS leg<br/>IODeviceTree rom/chosen + hw.model]
+  EX --> MAC[macOS leg<br/>IODeviceTree rom/chosen + hw.model/hw.optional.arm64]
   WIN & LIN & MAC --> ROWS[rows + typed result status] --> RS[(ResponseStore)] --> API[REST /api/responses]
 ```
 
@@ -39,7 +39,7 @@ flowchart LR
 <!-- BEGIN GENERATED: plugin-doc-gen capability -->
 | Action | Windows | macOS | Linux |
 |---|---|---|---|
-| `firmware` | ✅ supported · rung 1 · WMI Win32_BIOS via wmi_bounded run_bounded_wmi_query + GetSystemFirmwareTable('RSMB') SMBIOS type 0 | 🟡 constrained · rung 1 · IOKit IORegistryEntryFromPath IODeviceTree:/rom then IODeviceTree:/chosen, IORegistryEntryCreateCFProperty under ScopedIOObject/ScopedCFRef, plus sysctlbyname hw.model | 🟡 constrained · rung 1 · /sys/class/dmi/id/{bios_vendor,bios_version,bios_date,bios_release} + fwupd org.freedesktop.fwupd GetDevices/GetUpgrades over the sd-bus system bus |
+| `firmware` | ✅ supported · rung 1 · WMI Win32_BIOS via wmi_bounded run_bounded_wmi_query + GetSystemFirmwareTable('RSMB') SMBIOS type 0 | 🟡 constrained · rung 1 · IOKit IORegistryEntryFromPath IODeviceTree:/rom then IODeviceTree:/chosen, IORegistryEntryCreateCFProperty under ScopedIOObject/ScopedCFRef, plus sysctlbyname hw.model and hw.optional.arm64 (the Apple Silicon gate for the /rom lookup) | 🟡 constrained · rung 1 · /sys/class/dmi/id/{bios_vendor,bios_version,bios_date,bios_release} + fwupd org.freedesktop.fwupd GetDevices/GetUpgrades over the sd-bus system bus |
 
 **Declared limits per leg** (descriptor fallback text, verbatim):
 
@@ -101,7 +101,7 @@ Any status other than `OK` makes the action return 1, which the agent core repor
 ## Sample output
 
 <!-- BEGIN GENERATED: plugin-doc-gen samples -->
-**Windows** — captured: windows Windows 10.0.26200 x86_64 · bare-metal · 2026-09-21 · LocalSystem (elevated) · leg-hash e3b945e9e6db
+**Windows** — captured: windows Windows 10.0.26200 x86_64 · bare-metal · 2026-09-21 · LocalSystem (elevated) · leg-hash 35cf8bb6e007
 
 ```
 == action=firmware
@@ -116,7 +116,7 @@ firmware|bios_release|5.17|smbios
 [result_status] OK / FULL
 ```
 
-**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-21 · euid 501 · leg-hash e3b945e9e6db
+**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-10-03 · euid 501 · leg-hash 35cf8bb6e007
 
 ```
 == action=firmware
@@ -128,7 +128,7 @@ firmware|model|Mac16,10|sysctl
 [result_status] OK / FULL
 ```
 
-**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-24 · euid 0 · leg-hash e3b945e9e6db
+**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-24 · euid 0 · leg-hash 35cf8bb6e007
 
 ```
 == action=firmware

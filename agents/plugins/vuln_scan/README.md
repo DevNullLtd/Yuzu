@@ -365,8 +365,10 @@ bsdutils|1:2.41.5-0+deb13u1
    as an explicit error — it becomes the check's negative/default branch.** A failed Windows
    registry read returns an empty string, read as "key not present"; a failed `popen` on
    Linux/macOS returns empty output, read as "command absent" or "feature disabled". The Linux
-   file-backed checks (SSH, ASLR, `suid_dumpable`) are the exception: a failed read is `UNREADABLE`. No sample capture observed an actual permission denial, so
-   this is a code-path claim, not a measured one.
+   file-backed checks (SSH, ASLR, `suid_dumpable`, `/tmp noexec`) are the exception: a failed read
+   is `UNREADABLE`. The world-writable-PATH walk still skips a PATH entry whose `stat()` fails, so
+   a refused entry reads as not-a-directory (tracked as a follow-up issue). No sample capture
+   observed an actual permission denial, so this is a code-path claim, not a measured one.
 4. **`inventory` and `installed_apps` are two collectors for overlapping data.** They already
    share the same "installed, held" package-presence convention on Linux without being merged —
    a caller working from installed-software identity has two plugins to reconcile.

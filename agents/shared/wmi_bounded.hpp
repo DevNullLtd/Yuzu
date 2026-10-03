@@ -102,8 +102,9 @@ inline constexpr const char* kWmiQueryFailedNoInSignature = "wmi_query_failed_no
 inline constexpr const char* kWmiDeadlineExceeded = "wmi_deadline_exceeded";
 inline constexpr const char* kWmiNextFailedPrefix = "wmi_next_failed_";
 inline constexpr const char* kWmiPutParamFailedPrefix = "wmi_put_param_failed_";
-// A FAILED BeginEnumeration()/Next() while reading one object's properties (extract_row). Carries
-// the HRESULT; never an `absent` answer (wmi_error_token.hpp: it matches no absent stage).
+// A FAILED or undocumented-success BeginEnumeration()/Next() result while reading one object's
+// properties (extract_row). Carries the HRESULT; never an `absent` answer (wmi_error_token.hpp: it
+// matches no absent stage).
 inline constexpr const char* kWmiPropertyEnumFailedPrefix = "wmi_property_enum_failed_";
 } // namespace error_tokens
 
@@ -195,7 +196,10 @@ inline std::string variant_to_string(const VARIANT& v) {
 // EndEnumeration() is NOT called) or of Next() (EndEnumeration() IS called; `row` holds the
 // properties read before the fault). The caller must fail the whole query on a FAILED return: a
 // setup or per-property fault never yields a row with a silently dropped column.
-// WBEM_S_NO_MORE_DATA (or any other success code) ends the enumeration normally.
+// Only WBEM_S_NO_MORE_DATA ends the enumeration normally; any other non-S_NO_ERROR return (FAILED
+// or an undocumented success code) is returned so the caller fails the query (#4895 AC3).
+// EndEnumeration()'s own result is ignored: it runs after every property was read and releases the
+// object's cursor only, so it cannot lose data.
 template <class Obj>
 [[nodiscard]] HRESULT extract_row(Obj* obj, WmiRow& row) {
     HRESULT hr = obj->BeginEnumeration(WBEM_FLAG_NONSYSTEM_ONLY);
@@ -212,18 +216,18 @@ template <class Obj>
             row.emplace(yuzu::win::from_wide(prop_name.b), std::move(value));
     }
     obj->EndEnumeration();
-    return FAILED(hr) ? hr : S_OK;
+    return hr == WBEM_S_NO_MORE_DATA ? S_OK : hr;
 }
 
-// extract_row + append: the single place a FAILED extract_row becomes a failed query. On success
-// the row is appended to result.rows and this returns true; on a FAILED HRESULT it calls
+// extract_row + append: the single place a non-S_OK extract_row becomes a failed query. On success
+// the row is appended to result.rows and this returns true; on a non-S_OK HRESULT it calls
 // fail_enumeration with `wmi_property_enum_failed_<hr>` (so rows_before_error is recorded before
 // the rows are cleared) and returns false, and the caller returns `result` immediately.
 template <class Obj>
 [[nodiscard]] bool commit_row(Obj* obj, BoundedQueryResult& result) {
     WmiRow row;
     const HRESULT hr = extract_row(obj, row);
-    if (FAILED(hr)) {
+    if (hr != S_OK) {
         fail_enumeration(result, error_tokens::kWmiPropertyEnumFailedPrefix + hr_hex(hr));
         return false;
     }

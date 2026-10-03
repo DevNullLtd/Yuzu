@@ -203,6 +203,33 @@ TEST_CASE("extract_row returns Next's FAILED HRESULT after ending the enumeratio
     REQUIRE(obj.end_calls == 1);
 }
 
+TEST_CASE("an undocumented success code from Next() is returned as-is and fails the query, never "
+          "collapsed to S_OK") {
+    // Pins `hr == WBEM_S_NO_MORE_DATA ? S_OK : hr` in extract_row and `hr != S_OK` in commit_row:
+    // the old `FAILED(hr) ? hr : S_OK` collapse turns WBEM_S_FALSE into a clean (false-clean) row.
+    constexpr HRESULT kUndocumentedSuccess = static_cast<HRESULT>(WBEM_S_FALSE);
+    FakeWbemObject obj;
+    obj.add_i4(L"Count", 7);
+    obj.end_hr = kUndocumentedSuccess;
+    WmiRow row;
+    REQUIRE(extract_row(&obj, row) == kUndocumentedSuccess);
+    REQUIRE(row == WmiRow{{"Count", "7"}});
+    REQUIRE(obj.end_calls == 1);
+
+    BoundedQueryResult r;
+    FakeWbemObject good;
+    good.add_i4(L"Count", 6);
+    REQUIRE(commit_row(&good, r));
+    FakeWbemObject obj2;
+    obj2.add_i4(L"Count", 7);
+    obj2.end_hr = kUndocumentedSuccess;
+    REQUIRE_FALSE(commit_row(&obj2, r));
+    REQUIRE(r.error.has_value());
+    REQUIRE(*r.error == "wmi_property_enum_failed_0x00000001");
+    REQUIRE(r.rows.empty());
+    REQUIRE(r.rows_before_error == 1);
+}
+
 TEST_CASE("extract_row on a clean run returns S_OK with every non-null property") {
     FakeWbemObject obj;
     obj.add_i4(L"Count", 7);

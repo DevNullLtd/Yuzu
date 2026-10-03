@@ -14,7 +14,7 @@
         },
         "macos": {
           "fallback": "verified on Apple Silicon only (Mac16,10, macOS 26.6.2): there IODeviceTree:/rom does not exist and the version is IODeviceTree:/chosen system-firmware-version (an iBoot tag such as mBoot-18000.161.10, not a BIOS date); the Intel /rom version/release-date/vendor keys are UNVERIFIED on hardware. release_date reads absent on Apple Silicon and update_pending is not reported",
-          "mechanism": "IOKit IORegistryEntryFromPath IODeviceTree:/rom then IODeviceTree:/chosen, IORegistryEntryCreateCFProperty under ScopedIOObject/ScopedCFRef, plus sysctlbyname hw.model",
+          "mechanism": "IOKit IORegistryEntryFromPath IODeviceTree:/rom then IODeviceTree:/chosen, IORegistryEntryCreateCFProperty under ScopedIOObject/ScopedCFRef, plus sysctlbyname hw.model and hw.optional.arm64 (the Apple Silicon gate for the /rom lookup)",
           "rung": "1",
           "support": "constrained"
         },
@@ -66,7 +66,7 @@
     "gathered": true,
     "mutating": false
   },
-  "leg_hash": "e3b945e9e6db",
+  "leg_hash": "35cf8bb6e007",
   "manifest_version": 1,
   "name": "firmware_posture",
   "outputs": [
@@ -228,7 +228,7 @@
       "stamp": {
         "date": "2026-09-24",
         "host_class": "container",
-        "leg_hash": "e3b945e9e6db",
+        "leg_hash": "35cf8bb6e007",
         "os": "linux",
         "os_version": "Debian GNU/Linux 13 (trixie) aarch64",
         "privilege": "euid 0"
@@ -258,9 +258,9 @@
         }
       ],
       "stamp": {
-        "date": "2026-09-21",
+        "date": "2026-10-03",
         "host_class": "bare-metal",
-        "leg_hash": "e3b945e9e6db",
+        "leg_hash": "35cf8bb6e007",
         "os": "macos",
         "os_version": "macOS 26.6.2 arm64",
         "privilege": "euid 501"
@@ -292,7 +292,7 @@
       "stamp": {
         "date": "2026-09-21",
         "host_class": "bare-metal",
-        "leg_hash": "e3b945e9e6db",
+        "leg_hash": "35cf8bb6e007",
         "os": "windows",
         "os_version": "Windows 10.0.26200 x86_64",
         "privilege": "LocalSystem (elevated)"
