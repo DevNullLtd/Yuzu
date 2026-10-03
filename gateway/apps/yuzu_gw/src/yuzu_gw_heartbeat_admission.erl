@@ -25,7 +25,7 @@
 -module(yuzu_gw_heartbeat_admission).
 
 -export([admit/2, check/2]).
--export([reset_summary_state/0]).
+-export([init_summary_state/0, reset_summary_state/0]).
 -export_type([reason/0]).
 
 -type reason() :: unknown_session | no_connection | registry_unavailable
@@ -76,11 +76,19 @@ check(Ctx, SessionId) ->
             end
     end.
 
-%% @doc Forget the summary-log state (tests).
+%% @doc Create the summary-log state. Called once at boot, before any
+%% heartbeat can be rejected: creating it lazily on the first rejection is
+%% racy when the first rejections arrive together (each concurrent first
+%% caller would create its own state and log its own line).
+-spec init_summary_state() -> ok.
+init_summary_state() ->
+    _ = new_summary_state(),
+    ok.
+
+%% @doc Replace the summary-log state with a fresh one (tests).
 -spec reset_summary_state() -> ok.
 reset_summary_state() ->
-    _ = persistent_term:erase(?STATE_KEY),
-    ok.
+    init_summary_state().
 
 %%--------------------------------------------------------------------
 %% Internal
@@ -137,20 +145,22 @@ slot(Reason) ->
 slot(Reason, [Reason | _], N) -> N;
 slot(Reason, [_ | Rest], N)   -> slot(Reason, Rest, N + 1).
 
-%% Created lazily on the first rejection. A concurrent first call may create
-%% it twice; the loser's counts are dropped, which only affects a log line.
+%% Normally created at boot by init_summary_state/0. The lazy path only
+%% covers a caller that runs before that (unit tests): a concurrent first call
+%% may create the state more than once, which only affects the log lines.
 summary_state() ->
     case persistent_term:get(?STATE_KEY, undefined) of
-        undefined ->
-            Ref = atomics:new(?LAST_SLOT, [{signed, true}]),
-            %% First rejection logs immediately.
-            atomics:put(Ref, ?LAST_SLOT,
-                        erlang:monotonic_time(millisecond) - summary_interval_ms()),
-            persistent_term:put(?STATE_KEY, Ref),
-            Ref;
-        Ref ->
-            Ref
+        undefined -> new_summary_state();
+        Ref       -> Ref
     end.
+
+new_summary_state() ->
+    Ref = atomics:new(?LAST_SLOT, [{signed, true}]),
+    %% First rejection logs immediately.
+    atomics:put(Ref, ?LAST_SLOT,
+                erlang:monotonic_time(millisecond) - summary_interval_ms()),
+    persistent_term:put(?STATE_KEY, Ref),
+    Ref.
 
 summary_interval_ms() ->
     application:get_env(yuzu_gw, telemetry_gauge_interval_ms,

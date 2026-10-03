@@ -61,6 +61,9 @@ do_start() ->
 do_start_services() ->
     %% Attach telemetry/prometheus handlers.
     yuzu_gw_telemetry:setup(),
+    %% Heartbeat-rejection summary log state: created before any heartbeat is
+    %% admitted, so a burst of first rejections shares one rate limit.
+    ok = yuzu_gw_heartbeat_admission:init_summary_state(),
 
     %% Start Prometheus HTTP exporter for /metrics endpoint.
     Port = application:get_env(yuzu_gw, prometheus_port, 9568),
