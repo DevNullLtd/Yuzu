@@ -194,7 +194,7 @@ TEST_CASE("installed_apps plugin: list executes real dpkg-query/rpm/pacman/syste
     std::istringstream iss(result.captured);
     std::string line;
     std::size_t rows = 0, bad_field_count = 0, empty_field = 0;
-    [[maybe_unused]] std::size_t abs_location_rows = 0, system_app_rows = 0, bundle_rows = 0,
+    [[maybe_unused]] std::size_t abs_location_rows = 0, system_app_rows = 0,
                                  non_dash_trailing = 0;
     while (std::getline(iss, line)) {
         if (line.empty())
@@ -215,8 +215,6 @@ TEST_CASE("installed_apps plugin: list executes real dpkg-query/rpm/pacman/syste
             ++abs_location_rows;
         if (fields[5].starts_with("/System/Applications/") && fields[6].starts_with("com.apple."))
             ++system_app_rows;
-        if (fields[6] != "-")
-            ++bundle_rows;
 #elif defined(__linux__)
         if (fields[5] != "-" || fields[6] != "-")
             ++non_dash_trailing;
@@ -233,11 +231,7 @@ TEST_CASE("installed_apps plugin: list executes real dpkg-query/rpm/pacman/syste
     // Every Mac lists /System/Applications/*.app with a com.apple.* bundle id.
 #if defined(__APPLE__)
     CHECK(abs_location_rows > 0);
-#ifdef YUZU_HAVE_SECURITY_FRAMEWORK
-    CHECK(system_app_rows > 0);
-#else
-    CHECK(bundle_rows == 0); // no Security framework: the stub yields "-" for every row
-#endif
+    CHECK(system_app_rows > 0); // bundle ids come from agent-core's CoreFoundation reader, Security or not
 #elif defined(__linux__)
     // Linux has no install location or bundle id concept: both columns are "-" by design.
     CHECK(non_dash_trailing == 0);

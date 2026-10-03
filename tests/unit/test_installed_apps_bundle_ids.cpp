@@ -36,6 +36,19 @@ TEST_CASE("apply_bundle_ids writes ids through the index map; absent stays empty
     CHECK(apps[3].bundle_id.empty());
 }
 
+TEST_CASE("apply_bundle_ids with an empty result leaves every bundle_id empty",
+          "[installed_apps][bundle_ids]") {
+    std::vector<AppRowFields> apps(2);
+    apps[0].install_location = "/Applications/A.app";
+    apps[1].install_location = "/Applications/B.app";
+    // The allocation-failure Rejected shape: no ids, yet a non-empty index map.
+    BundleIdPassResult r;
+    r.status = BundleIdPassStatus::Rejected;
+    bi::apply_bundle_ids(apps, r, {0, 1}); // min() clamp: must not index past r.ids
+    CHECK(apps[0].bundle_id.empty());
+    CHECK(apps[1].bundle_id.empty());
+}
+
 TEST_CASE("bundle-id warning rows and status: one per non-Completed outcome",
           "[installed_apps][bundle_ids]") {
     const auto timeout = outcome(BundleIdPassStatus::TimedOut, 10, 10, 4);
@@ -46,13 +59,14 @@ TEST_CASE("bundle-id warning rows and status: one per non-Completed outcome",
 
     const auto busy = outcome(BundleIdPassStatus::Busy, 10, 10);
     CHECK(bi::bundle_id_warning_row(busy).value() ==
-          "warning|bundle_id_busy: another bundle-id pass is in flight on this device; rows "
-          "carry -");
+          "warning|bundle_id_busy: another bundle-id pass is in flight on this device (a "
+          "concurrent list or an earlier abandoned pass); rows carry -");
     CHECK(bi::bundle_id_status(busy).provenance == "installed_apps:bundle_id_busy");
 
     const auto rejected = outcome(BundleIdPassStatus::Rejected, 10, 10);
     CHECK(bi::bundle_id_warning_row(rejected).value() ==
-          "warning|bundle_id_rejected: bounded-call budget exhausted; rows carry -");
+          "warning|bundle_id_rejected: bounded-call ceiling refused the pass or its admission "
+          "allocation failed; rows carry -");
     CHECK(bi::bundle_id_status(rejected).provenance == "installed_apps:bundle_id_rejected");
 
     const auto capped = outcome(BundleIdPassStatus::Completed, 5001, 5000, 5000);

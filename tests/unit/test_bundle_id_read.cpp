@@ -15,6 +15,10 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <yuzu/agent/bundle_id_read.hpp>
+#if defined(__APPLE__)
+#include <yuzu/agent/cf_bundle_id.hpp>
+#include <yuzu/agent/scoped_cfref.hpp>
+#endif
 
 #include "test_helpers.hpp"
 
@@ -23,6 +27,7 @@
 #include <filesystem>
 #include <fstream>
 #include <future>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
@@ -166,6 +171,28 @@ TEST_CASE("a Rejected admission releases the in-flight flag", "[bundle_id][agent
     CHECK(ok.ids[0] == "com.x./a");
 }
 
+TEST_CASE("a throwing reader records no identifier, the pass completes and the flag is released",
+          "[bundle_id][agent]") {
+    static std::atomic_flag flag; // static: outlives any worker, like agent-core's own
+    const std::vector<std::string> paths{"/a", "/b"};
+    const auto throwing = [](const std::string& p) -> std::string {
+        if (p == "/b")
+            throw std::runtime_error("reader failed");
+        return "com.x." + p;
+    };
+    const auto r = yuzu::agent::detail::bounded_bundle_id_pass(flag, paths, 5000ms, throwing);
+    REQUIRE(r.status == BundleIdPassStatus::Completed);
+    REQUIRE(r.ids.size() == 2);
+    CHECK(r.ids[0] == "com.x./a");
+    CHECK(r.ids[1].empty());
+    CHECK(r.read_count == 2);
+
+    // The Releaser ran: a Busy here means the flag stayed set after the throw.
+    const auto again = yuzu::agent::detail::bounded_bundle_id_pass(
+        flag, paths, 5000ms, [](const std::string& p) { return "com.x." + p; });
+    CHECK(again.status == BundleIdPassStatus::Completed);
+}
+
 #if defined(__APPLE__)
 // A minimal fixture bundle (Contents/Info.plist only) keeps the case independent
 // of which system apps this macOS release ships.
@@ -186,5 +213,31 @@ TEST_CASE("real reader resolves a fixture bundle's identifier", "[bundle_id][age
     REQUIRE(r.status == BundleIdPassStatus::Completed);
     REQUIRE(r.ids.size() == 1);
     CHECK(r.ids[0] == "com.yuzu.test.fixture");
+}
+
+TEST_CASE("cfstring_to_utf8 bounds a hostile identifier at 4 KiB on a UTF-8 boundary",
+          "[bundle_id][agent]") {
+    const auto convert = [](const std::string& utf8) {
+        yuzu::agent::ScopedCFRef<CFStringRef> s(CFStringCreateWithCString(
+            nullptr, utf8.c_str(), kCFStringEncodingUTF8));
+        REQUIRE(s);
+        return yuzu::agent::cfstring_to_utf8(s.get());
+    };
+    CHECK(convert(std::string(10000, 'a')).size() == yuzu::agent::kMaxCFStringBytes);
+
+    std::string euros;
+    for (int i = 0; i < 3000; ++i)
+        euros += "\xE2\x82\xAC"; // U+20AC, 3 bytes: 4096 cuts mid-character
+    const auto cut = convert(euros);
+    CHECK(cut.size() == 4095);
+    CHECK(cut == euros.substr(0, 4095));
+
+    CHECK(convert("com.x.y") == "com.x.y");
+
+    // Unconvertible (a lone surrogate) stays "": stopping there is not the bound.
+    const UniChar lone[] = {'a', 0xD800, 'b'};
+    yuzu::agent::ScopedCFRef<CFStringRef> bad(CFStringCreateWithCharacters(nullptr, lone, 3));
+    REQUIRE(bad);
+    CHECK(yuzu::agent::cfstring_to_utf8(bad.get()).empty());
 }
 #endif

@@ -40,6 +40,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 #include <bounded_wait.hpp> // yuzu::shared::bounded_call_ex (agents/shared)
@@ -71,6 +72,8 @@ template <typename Reader>
 BundleIdPassResult bounded_bundle_id_pass(std::atomic_flag& in_flight,
                                           const std::vector<std::string>& app_paths,
                                           std::chrono::milliseconds deadline, Reader reader) {
+    static_assert(std::is_nothrow_move_constructible_v<Reader>,
+                  "a throwing Reader move would escape with the in-flight flag set and no Releaser");
     BundleIdPassResult out;
     // Admission first: a call during an active pass is Busy even with a spent
     // budget (Busy is the more informative answer).

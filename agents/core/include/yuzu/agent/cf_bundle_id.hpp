@@ -10,29 +10,44 @@
 
 #include <CoreFoundation/CoreFoundation.h>
 
+#include <cstddef>
 #include <string>
 
 #include <yuzu/agent/scoped_cfref.hpp>
 
 namespace yuzu::agent {
 
-/// UTF-8 copy of `s`, or "" for null/empty/unconvertible.
+/// Cap on one converted CFString: equal to installed_apps_parsers.hpp
+/// kMaxListFieldBytes, so `list` bytes are identical, and a hostile multi-MiB
+/// CFBundleIdentifier costs at most this in State/out.ids/the apps vector (the
+/// inv| sync clamps at 1024 B after this).
+inline constexpr std::size_t kMaxCFStringBytes = 4096;
+
+/// UTF-8 copy of `s` cut at kMaxCFStringBytes on a character boundary, or "" for
+/// null/empty/unconvertible.
 inline std::string cfstring_to_utf8(CFStringRef s) {
     if (!s)
         return {};
     const CFIndex len = CFStringGetLength(s);
     if (len <= 0)
         return {};
-    const CFIndex raw_max = CFStringGetMaximumSizeForEncoding(len, kCFStringEncodingUTF8);
-    // Documented to return kCFNotFound (-1) if the size cannot be computed; +1
-    // would then make a 0-sized buffer handed to CFStringGetCString.
-    if (raw_max <= 0)
+    std::string out(kMaxCFStringBytes, '\0');
+    CFIndex used = 0;
+    // reinterpret_cast char* -> UInt8*: byte-type aliasing (the strict-aliasing
+    // exemption); `out` is a local that outlives the call and maxBufLen bounds the
+    // write (docs/cpp-conventions.md: casts need a local proof).
+    const CFIndex converted = CFStringGetBytes(
+        s, CFRangeMake(0, len), kCFStringEncodingUTF8, /*lossByte=*/0,
+        /*isExternalRepresentation=*/false, reinterpret_cast<UInt8*>(out.data()),
+        static_cast<CFIndex>(out.size()), &used);
+    // Stopped short with room for one more character (a UTF-8 character is at most
+    // 4 bytes, so < 4 bytes free means the next one did not fit): the bound was not
+    // the reason, so an unconvertible character is -- empty, as before.
+    constexpr CFIndex kMaxUtf8CharBytes = 4;
+    if (converted < len && used + kMaxUtf8CharBytes <= static_cast<CFIndex>(out.size()))
         return {};
-    const CFIndex max_bytes = raw_max + 1;
-    std::string out(static_cast<std::size_t>(max_bytes), '\0');
-    if (!CFStringGetCString(s, out.data(), max_bytes, kCFStringEncodingUTF8))
-        return {};
-    out.resize(std::char_traits<char>::length(out.c_str()));
+    out.resize(static_cast<std::size_t>(used));
+    out.resize(std::char_traits<char>::length(out.c_str())); // interior NUL cuts, as before
     return out;
 }
 

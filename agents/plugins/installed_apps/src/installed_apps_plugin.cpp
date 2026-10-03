@@ -129,11 +129,11 @@ constexpr std::size_t kToolOutputCap = 8u * 1024u * 1024u;
 // KNOWN RESIDUAL, accepted deliberately: this is checked BETWEEN items, never
 // mid-item, so the true worst case is the budget plus one item -- a 20 s child
 // deadline, or one synchronous CFBundle/SecStaticCode call, which has no
-// cancellation or deadline facility at all. Bounding a native CF read would
-// mean moving enrichment onto its own cancellable thread, a structural change
-// well beyond this PR. The hours-scale exposure is closed; a single stalled
-// native read remains theoretically unbounded and is recorded here rather than
-// papered over.
+// cancellation or deadline facility at all. Bounding this path needs the
+// agent-core bounded-pass shape `list` now uses (bundle_id_read.hpp) plus a
+// bounded SecStaticCode leg; not done here. The hours-scale exposure is closed;
+// a single stalled native read remains theoretically unbounded and is recorded
+// here rather than papered over.
 constexpr std::chrono::seconds kCollectionBudget{120};
 
 // An operator reading a log cannot decode `reason=3`.
@@ -1073,7 +1073,8 @@ int do_list(yuzu::CommandContext& ctx) {
     const auto bundle_status = bundle_ids::bundle_id_status(bundle_outcome);
     ctx.set_result_status(bundle_status.status, bundle_status.completeness,
                           bundle_status.provenance);
-    // Warning row BEFORE the app rows (a prefix, like list_per_user's warning rows).
+    // Warning row BEFORE the app rows: a prefix, so a consumer reading sequentially
+    // sees the caveat first (list_per_user's warning rows are trailing, by contrast).
     if (const auto row = bundle_ids::bundle_id_warning_row(bundle_outcome))
         ctx.write_output(*row);
 #endif

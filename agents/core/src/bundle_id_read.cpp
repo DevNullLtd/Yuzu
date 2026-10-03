@@ -22,6 +22,11 @@ std::atomic_flag g_pass_in_flight;
 
 std::string bundle_id_for(const std::string& app_path) {
     ScopedCFRef<CFURLRef> url(CFURLCreateFromFileSystemRepresentation(
+        // reinterpret_cast char* -> const UInt8*: byte-type aliasing is the
+        // explicit exemption to the strict-aliasing rule, and `app_path` is a
+        // caller-owned lvalue that outlives this call, so the buffer stays valid
+        // for the whole of CFURLCreateFromFileSystemRepresentation (which copies
+        // it).
         nullptr, reinterpret_cast<const UInt8*>(app_path.c_str()),
         static_cast<CFIndex>(app_path.size()), /*isDirectory=*/true));
     if (!url)

@@ -90,10 +90,11 @@ inline void apply_bundle_ids(std::vector<parsers::AppRowFields>& apps,
                std::to_string(o.submitted) + " submitted apps read before the " +
                std::to_string(o.deadline.count()) + " s deadline; remaining rows carry -";
     case S::Busy:
-        return "warning|bundle_id_busy: another bundle-id pass is in flight on this device; "
-               "rows carry -";
+        return "warning|bundle_id_busy: another bundle-id pass is in flight on this device (a "
+               "concurrent list or an earlier abandoned pass); rows carry -";
     case S::Rejected:
-        return "warning|bundle_id_rejected: bounded-call budget exhausted; rows carry -";
+        return "warning|bundle_id_rejected: bounded-call ceiling refused the pass or its "
+               "admission allocation failed; rows carry -";
     case S::Completed:
         break;
     }
