@@ -1405,16 +1405,18 @@ SubprocessResult run_bounded_subprocess(const std::vector<std::string>& argv,
             if (take > 0)
                 result.output.append(buf.data(), take);
 
-            // #5298: with stop_after_max_lines, bytes drained AFTER the
-            // line-cap latch (the max_lines-th stored line) are discarded
-            // drain, never part of the result the caller asked for, so they
-            // must not flag output_truncated: the documented contract is that
-            // reaching max_lines is a clean bounded stop. `pre_latch_n` is the
-            // count of bytes of THIS read at or before the latch point
-            // (everything when the latch does not fire here, nothing when it
-            // already fired on an earlier read). Without stop_after_max_lines
-            // line_cap_stop never latches, so this is byte-for-byte the
-            // previous behaviour.
+            // #5298: with stop_after_max_lines, reaching max_lines is a clean
+            // bounded stop (see subprocess_runner.hpp). The runner kills the
+            // child at the latch but keeps draining to EOF; bytes drained
+            // AFTER the latch (the max_lines-th stored line) are not what the
+            // caller asked for, so they must never set output_truncated. They
+            // are NOT discarded: they still land in result.output up to
+            // output_cap and still reach on_line; only the truncation FLAG
+            // ignores them. `pre_latch_n` is the count of bytes of THIS read
+            // at or before the latch point (everything when the latch does not
+            // fire here, nothing when it already fired on an earlier read).
+            // Without stop_after_max_lines line_cap_stop never latches, so
+            // this is byte-for-byte the previous behaviour.
             std::size_t pre_latch_n = line_cap_stop ? std::size_t{0} : static_cast<std::size_t>(n);
 
             // CDX-P2-005: materialize lines over EVERY drained byte (all `n`,
@@ -2226,7 +2228,8 @@ SubprocessResult run_bounded_subprocess(const std::vector<std::string>& argv,
                 if (take > 0)
                     result.output.append(buf.data(), take);
                 // #5298: bytes drained after the stop_after_max_lines latch
-                // are discarded drain, not truncation (see the POSIX twin).
+                // still land in result.output (up to output_cap) and reach
+                // on_line, but never set output_truncated (see the POSIX twin).
                 std::size_t pre_latch_n = line_cap_stop ? std::size_t{0} : static_cast<std::size_t>(n);
                 // CDX-P2-005: materialize over every drained byte (all `n`, not
                 // the `take` blob prefix) so on_line keeps streaming past the

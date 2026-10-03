@@ -697,11 +697,11 @@ TEST_CASE("run_bounded_subprocess with stop_after_max_lines cleanly stops at exa
 }
 
 namespace {
-// #5298: awk program that emits `head` then `flood` bytes of a single atomic
-// (< PIPE_BUF) write, so the very first 512-byte runner read starts with the
-// head lines and carries post-head bytes in the SAME read. No dependence on
-// how quickly the runner's line-cap kill lands: the post-latch bytes are
-// already in that first read.
+// #5298: awk program that emits `head` then `flood` as ONE write() of about 3 KB
+// (awk buffers it and flushes at exit), so the runner's first 512-byte read
+// starts with the head lines and carries flood bytes in the SAME read, and the
+// rest of the flood arrives in the following reads. Nothing here depends on how
+// quickly the runner's line-cap kill lands: the flood is already in the pipe.
 std::string awk_head_then_flood(const std::string& head_printf, const std::string& flood_unit,
                                 int flood_reps) {
     return "BEGIN{s=\"" + head_printf + "\"; for(i=0;i<" + std::to_string(flood_reps) +
@@ -713,14 +713,15 @@ TEST_CASE("run_bounded_subprocess with stop_after_max_lines does not flag output
           "bytes drained after the line-cap latch (#5298)",
           "[subprocess][deadline][macos][linux]") {
     // Contract (subprocess_runner.hpp stop_after_max_lines): reaching max_lines
-    // is a clean bounded success, "output_truncated=false". The runner kills
-    // the child at the latch but keeps draining to EOF; bytes drained after
-    // the latch are discarded drain, not the caller's result, and used to trip
-    // output_truncated once they exceeded the output cap (the Big Tam CI
-    // failure: `yes` filled the 1,000,000-byte capture before the SIGKILL
-    // landed). Deterministic: a single atomic write whose first 512-byte read
-    // holds the 3 lines AND >cap post-latch bytes, so the post-latch bytes are
-    // in the same read as the latch whatever the kill latency.
+    // is a clean bounded stop. The runner kills the child at the latch but keeps
+    // draining to EOF. Bytes drained after the latch are not part of what the
+    // caller asked for (they may still land in result.output up to the cap and
+    // reach on_line), and they used to trip output_truncated once they exceeded
+    // the output cap (the Big Tam CI failure: `yes` filled the 1,000,000-byte
+    // capture before the SIGKILL landed). Now they never set it. Deterministic:
+    // the first 512-byte read holds the 3 lines AND more than `cap` post-latch
+    // bytes, and the rest of the flood arrives in later reads (latch read and
+    // post-latch reads both), whatever the kill latency.
     constexpr std::size_t kLines = 3;
     constexpr std::size_t kCap = 100;
     // (a) newline-free flood: trips the line accumulator's per-line cap and
@@ -753,9 +754,13 @@ TEST_CASE("run_bounded_subprocess with stop_after_max_lines does not flag output
 TEST_CASE("run_bounded_subprocess: truncation BEFORE the line-cap latch still flags output_truncated "
           "under stop_after_max_lines (#5298)",
           "[subprocess][deadline][macos][linux]") {
-    // Everything before the latch behaves as before: an over-long first line
-    // (300 bytes vs a 100-byte cap) is dropped by the line accumulator before
-    // the third line latches the stop, so the result genuinely is truncated.
+    // Intentionally a guard, not a mutation killer: everything BEFORE the latch
+    // behaves as before. An over-long first line (300 bytes vs a 100-byte cap)
+    // precedes the third line that latches the stop, so the result genuinely is
+    // truncated. The blob-cap check alone flags it (the line accumulator's
+    // overflow flag is redundant here, since a line longer than the cap also
+    // overflows the blob); the exact-boundary test below is what pins the
+    // blob check's pre-latch byte count.
     SubprocessResult result = run_bounded_subprocess(
         {"/usr/bin/awk", "BEGIN{s=\"\"; for(i=0;i<300;++i) s=s \"y\"; "
                          "printf \"%s\\na\\nb\\nc\\n\", s}"},
@@ -768,6 +773,89 @@ TEST_CASE("run_bounded_subprocess: truncation BEFORE the line-cap latch still fl
     CHECK(result.output_truncated);
     REQUIRE(result.lines.size() == 3);
     CHECK(result.lines[0] == "a");
+}
+
+TEST_CASE("run_bounded_subprocess: a blob cap one byte short of the pre-latch bytes still flags "
+          "output_truncated under stop_after_max_lines (#5298)",
+          "[subprocess][deadline][macos][linux]") {
+    // Pins the exact pre-latch byte count. The child emits three CRLF lines
+    // (9 bytes; the runner strips the CR before storing, so the line byte
+    // budget counts 2 per line and all three are stored while the blob counts
+    // 3 per line). The latch fires on the 9th byte; with output_cap_bytes = 8
+    // the blob is one byte short of the pre-latch bytes, so it IS truncated
+    // before the latch. An off-by-one in the pre-latch count (`i` instead of
+    // `i + 1`) or dropping the blob check would let this through.
+    SubprocessResult result = run_bounded_subprocess(
+        {"/usr/bin/awk", "BEGIN{printf \"a\\r\\nb\\r\\nc\\r\\n\"}"},
+        SubprocessOptions{.deadline = 10000ms,
+                          .max_lines = 3,
+                          .stop_after_max_lines = true,
+                          .output_cap_bytes = 8});
+    CHECK(result.tool_ran);
+    CHECK_FALSE(result.timed_out);
+    REQUIRE(result.lines.size() == 3);
+    CHECK(result.output.size() == 8);
+    CHECK(result.output_truncated);
+}
+
+TEST_CASE("run_bounded_subprocess with stop_after_max_lines does not flag output_truncated for a "
+          "flood drained in reads AFTER the line-cap latch read (#5298, cross-read)",
+          "[subprocess][deadline][macos][linux]") {
+    // Deterministic cross-read proof, no timing and no kill-latency dependence.
+    // The latch fires inside the on_line call for the max_lines-th line; that
+    // callback blocks until the child has written a marker file AFTER its whole
+    // flood, so the flood is guaranteed to be sitting in the pipe and is
+    // drained entirely in reads that come after the latch read. Total child
+    // output stays below 4096 bytes (the smallest pipe a constrained host
+    // gives), so the child can never block on a full pipe while the runner is
+    // parked in the callback; the wait is bounded, so a broken child fails the
+    // test via waited_ok instead of hanging it.
+    constexpr std::size_t kLines = 500;
+    constexpr std::size_t kCap = 2000;
+    yuzu::test::TempDir dir("yuzu_test_5298_marker_");
+    std::error_code mk_ec;
+    std::filesystem::create_directories(dir.path, mk_ec);
+    const std::string marker = (dir.path / "flood_done").string();
+
+    std::size_t calls = 0;
+    bool waited_ok = true;
+    SubprocessOptions opts{.deadline = 20000ms,
+                           .max_lines = kLines,
+                           .stop_after_max_lines = true,
+                           .output_cap_bytes = kCap};
+    opts.on_line = [&](const std::string&) {
+        if (++calls != kLines)
+            return;
+        const auto t0 = std::chrono::steady_clock::now();
+        std::error_code ec;
+        while (!std::filesystem::exists(marker, ec)) {
+            if (std::chrono::steady_clock::now() - t0 > 10s) {
+                waited_ok = false;
+                break;
+            }
+            std::this_thread::sleep_for(1ms);
+        }
+    };
+    // 600 one-byte lines (1200 bytes), then a 2500-byte newline-free flood
+    // (more than the 2000-byte cap, so it also overflows the line accumulator
+    // after the latch), then the marker.
+    SubprocessResult result = run_bounded_subprocess(
+        {"/bin/sh", "-c",
+         "/usr/bin/awk 'BEGIN{for(i=0;i<600;++i)printf \"x\\n\"; "
+         "for(i=0;i<2500;++i)printf \"y\"}'; : > \"$0\"",
+         marker},
+        opts);
+
+    CHECK(waited_ok);
+    CHECK(result.tool_ran);
+    CHECK_FALSE(result.timed_out);
+    CHECK_FALSE(result.output_truncated);
+    CHECK(result.lines.size() == kLines);
+    CHECK(result.output.size() <= kCap);
+    // The child has usually exited by the time the callback returns (exited);
+    // otherwise our kill ends it (line_limit). Both are legitimate.
+    CHECK((result.termination_reason == TerminationReason::line_limit ||
+           result.termination_reason == TerminationReason::exited));
 }
 
 TEST_CASE("run_bounded_subprocess WITHOUT stop_after_max_lines still flags output_truncated for a "

@@ -101,21 +101,27 @@ struct SubprocessOptions {
                                 // stderr merged into the same captured
                                 // stream as stdout (codesign/plutil write
                                 // their diagnostics to stderr).
-    // When true AND max_lines > 0: stop reading as soon as max_lines lines
-    // have been stored, kill+reap the child's process group, and report a
-    // NORMAL success (timed_out=false, output_truncated=false) rather than
-    // running the child to opts.deadline. For a caller that only ever wants
-    // the first N lines (e.g. `log show`), this turns "N lines available in
-    // a huge stream" into a clean bounded success instead of a partial
-    // result that looks like a timeout/truncation. False (default) keeps
-    // the previous behaviour: max_lines only caps what's stored, the runner
-    // keeps draining/discarding until the child exits or the deadline hits.
+    // When true AND max_lines > 0: as soon as max_lines lines have been
+    // stored, kill+reap the child's process group (the runner then finishes
+    // draining the pipe to EOF), and report a NORMAL success (timed_out=false,
+    // output_truncated=false) rather than running the child to opts.deadline.
+    // For a caller that only ever wants the first N lines (e.g. `log show`),
+    // this turns "N lines available in a huge stream" into a clean bounded
+    // success instead of a partial result that looks like a timeout/truncation.
+    // False (default) keeps the previous behaviour: max_lines only caps what's
+    // stored, the runner keeps draining/discarding until the child exits or the
+    // deadline hits.
     // The resulting run's termination_reason is line_limit, and exit_code is
     // left at whatever the child's own reap produced (see SubprocessResult::
     // exit_code) -- it is NEVER fabricated to 0 for a signal-killed child.
-    // Bytes the runner drains AFTER the max_lines-th line (while the kill
-    // lands and the pipe empties) are discarded drain: they never set
-    // output_truncated, however late the kill lands (#5298).
+    // Bytes drained AFTER the max_lines-th line (while the kill lands and the
+    // pipe empties) never set output_truncated, however late the kill lands
+    // (#5298). They are not otherwise hidden: they can still land in `output`
+    // (up to output_cap_bytes) and reach on_line. A caller that parses
+    // `output` rather than `lines` (users' `last` runs with max_lines=200 do)
+    // therefore sees a kill-latency-dependent tail past the Nth line and no
+    // longer a truncation flag for it; truncation BEFORE the Nth line is
+    // still flagged.
     bool stop_after_max_lines = false;
 
     // Per-invocation cancel (see CancellationToken above). Left null (the
@@ -442,7 +448,10 @@ struct SubprocessResult {
     // child, not a feature callers configure for its own sake. When true,
     // `output` and possibly the tail of `lines` reflect only what was
     // captured before the cap -- capture stopped early, nothing here is
-    // fabricated past that point.
+    // fabricated past that point. Exemption: under stop_after_max_lines, bytes
+    // drained after the max_lines-th line never set this (see
+    // stop_after_max_lines), so it stays false for a clean line_limit stop even
+    // if the child kept writing past the cap.
     bool output_truncated = false;
 
     // B4: child resource usage, captured on reap (POSIX: wait4()'s rusage;
