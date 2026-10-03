@@ -2,9 +2,14 @@
 # upgrade-erlang-linux.sh — bring a self-hosted Linux GitHub Actions runner
 # to a specified Erlang/OTP release globally.
 #
-# Works for any runner installed via the standard /opt/actions-runner layout
-# (e.g. yuzu-wsl2-linux). Detects the runner directory,
+# Written for runners installed via the standard /opt/actions-runner layout;
+# it was last used on the retired yuzu-wsl2-linux runner and has not been
+# checked against Big Tam's per-agent layout. Detects the runner directory,
 # the systemd User=, and the runner home automatically.
+#
+# The runner-ops-upgrade-erlang.yml dispatch workflow that wrapped this script
+# was removed when the Shulgi runners were retired (see #5300); run it by hand
+# on the host.
 #
 # What it does:
 #   1. Installs Erlang/OTP $OTP_VERSION + rebar3 $REBAR3_VERSION under the
