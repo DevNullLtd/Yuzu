@@ -219,9 +219,14 @@ lookup_remote(AgentId) ->
 %% "the live pid, if any, is not actually alive" (mirrors `lookup/1`'s own
 %% local liveness check, without its remote `pg` fallback — a replay is
 %% only ever meaningful against a LOCAL process).
--spec lookup_local_session(binary()) -> {ok, {pid(), binary() | undefined}} | error.
+%%
+%% `{error, unavailable}' means the agents table does not exist (the registry
+%% is not running or is restarting, which takes its tables with it); the
+%% drip treats it as "stop", never as "agent gone" (#1197 PR-C).
+-spec lookup_local_session(binary()) ->
+    {ok, {pid(), binary() | undefined}} | error | {error, unavailable}.
 lookup_local_session(AgentId) ->
-    case ets:lookup(?TABLE, AgentId) of
+    try ets:lookup(?TABLE, AgentId) of
         [{_, Pid, _, SessionId, _, _, _, _}] ->
             case is_process_alive(Pid) of
                 true  -> {ok, {Pid, SessionId}};
@@ -229,6 +234,8 @@ lookup_local_session(AgentId) ->
             end;
         [] ->
             error
+    catch
+        error:badarg -> {error, unavailable}
     end.
 
 %% @doc The session this node holds under SessionId, for heartbeat admission.
@@ -295,10 +302,42 @@ all_agent_pids() ->
     pg:get_members(?PG_SCOPE, all_agents).
 
 %% @doc The replay entries for the sessions this node holds (#1197 PR-C).
-%% Placeholder seam: exported so the red tests compile, no behaviour yet.
+%%
+%% Resolves each id through the node-local session index
+%% (`lookup_session/1'), then reads the agent's row once and requires it to
+%% agree with the index: element 2 must be the indexed pid and element 4 the
+%% session id. A row that has moved on (the agent re-registered under another
+%% session, or its process died) is dropped. Returns the same
+%% `{AgentId, SessionId, RegisterRequest}' tuple as `all_register_reqs/0', in
+%% the order of `SessionIds', so a replay queue holds one shape whichever way
+%% it was seeded.
+%%
+%% Ids this node does not hold are dropped, as is every id when either table
+%% is missing (`badarg'); the caller counts the difference as "not local".
+%% Read-only: neither table is ever written. Cost is O(k) ETS lookups for k
+%% ids, never a table scan.
+%%
+%% Two keys on purpose. The caller enqueues by session (the server names
+%% sessions) and pops by agent (`lookup_local_session/1' re-checks liveness
+%% right before each send): two decisions, two keys.
 -spec entries_for_sessions([binary()]) -> [{binary(), binary() | undefined, map()}].
-entries_for_sessions(_SessionIds) ->
-    [].
+entries_for_sessions(SessionIds) ->
+    lists:filtermap(fun entry_for_session/1, SessionIds).
+
+entry_for_session(SessionId) ->
+    case lookup_session(SessionId) of
+        {ok, #{agent_id := AgentId, pid := Pid}} ->
+            try ets:lookup(?TABLE, AgentId) of
+                [{_, Pid, _, SessionId, _, _, _, RegisterReq}] ->
+                    {true, {AgentId, SessionId, RegisterReq}};
+                _ ->
+                    false
+            catch
+                error:badarg -> false
+            end;
+        _ ->
+            false
+    end.
 
 %% @doc Return {AgentId, SessionId, RegisterRequest} for every
 %% currently-registered agent. Used by yuzu_gw_upstream to re-proxy
