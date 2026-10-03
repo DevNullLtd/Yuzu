@@ -64,6 +64,19 @@ std::vector<fs::path> unexpected_entries(const fs::path& dir, const fs::path& de
 
 } // namespace
 
+TEST_CASE("asset_tags store: missing parent directories are created",
+          "[agent][asset_tags_store]") {
+    yuzu::test::TempDir dir{"yuzu_test_asset_tags_"};
+    const auto dest = dir.path / "nested" / "deeper" / "state.json";
+
+    REQUIRE(wrote_clean(write_state_file_atomic(dest, "{\"a\":1}")));
+    CHECK(fs::is_directory(dest.parent_path()));
+    auto text = read_state_file(dest);
+    REQUIRE(text.has_value());
+    REQUIRE(text->has_value());
+    CHECK(**text == "{\"a\":1}");
+}
+
 TEST_CASE("asset_tags store: first write creates the file", "[agent][asset_tags_store]") {
     yuzu::test::TempDir dir{"yuzu_test_asset_tags_"};
     const auto dest = dir.path / "sub" / "asset_tags.json";
@@ -342,7 +355,7 @@ struct FdRec {
     int dir_fsync_n = 0, dir_close_n = 0, stray_n = 0;
     mode_t open_mode = 0;
     bool fail_fchmod = false, fail_file_fsync = false, fail_dir_fsync = false;
-    bool fail_dir_close = false, fail_dir_open = false;
+    bool fail_dir_close = false, fail_dir_open = false, fail_file_close = false;
     fs::path dest;
     bool dest_final_at_dir_fsync = false; // rename done + temp gone when the dir fsync ran
 } g;
@@ -400,6 +413,7 @@ yuzu::shared::PosixFdOps recording_ops() {
             g.file_close_seq = ++g.seq;
             ++g.file_close_n;
             g.file_fd = -1;
+            if (g.fail_file_close) { errno = EIO; return -1; }
         } else if (fd == g.dir_fd) {
             g.dir_close_seq = ++g.seq;
             ++g.dir_close_n;
@@ -502,11 +516,33 @@ TEST_CASE("asset_tags store: creation mode follows owner_only_mode (R1)",
           "[agent][asset_tags_store]") {
     yuzu::test::TempDir dir{"yuzu_test_asset_tags_"};
     const auto ops = recording_ops();
-    REQUIRE(yuzu::shared::write_file_atomic(dir.path / "a", "x", {true, {}, &ops}).has_value());
+    REQUIRE(yuzu::shared::write_file_atomic(dir.path / "a", "x", {.owner_only_mode = true, .fd_ops = &ops}).has_value());
     CHECK(g.open_mode == 0600);
     const auto ops2 = recording_ops();
-    REQUIRE(yuzu::shared::write_file_atomic(dir.path / "b", "x", {false, {}, &ops2}).has_value());
+    REQUIRE(yuzu::shared::write_file_atomic(dir.path / "b", "x", {.owner_only_mode = false, .fd_ops = &ops2}).has_value());
     CHECK(g.open_mode == 0666);
     CHECK(g.file_fchmod_n == 0); // no fchmod when the policy is not owner-only
+}
+
+TEST_CASE("asset_tags store: a failed file close is an IoError and leaves no temp",
+          "[agent][asset_tags_store]") {
+    yuzu::test::TempDir dir{"yuzu_test_asset_tags_"};
+    const auto dest = dir.path / "s.json";
+    std::error_code mk_ec;
+    fs::create_directories(dir.path, mk_ec); // TempDir only reserves the name
+    REQUIRE_FALSE(mk_ec);
+    {
+        std::ofstream(dest, std::ios::binary) << "ORIGINAL";
+    }
+    REQUIRE(fs::file_size(dest) == 8);
+    const auto ops = recording_ops();
+    g.fail_file_close = true;
+    auto r = write_state_file_atomic(dest, "REPLACEMENT", {}, &ops);
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error().message.find("close of") != std::string::npos);
+    std::ifstream in(dest, std::ios::binary);
+    std::string content((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    CHECK(content == "ORIGINAL");
+    CHECK(unexpected_entries(dir.path, dest).empty());
 }
 #endif

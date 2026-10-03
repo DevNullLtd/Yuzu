@@ -555,3 +555,35 @@ TEST_CASE("asset_tags sync: typed WriteWarning flags escalate the result status 
     CHECK(r.result_completeness == YUZU_RESULT_COMPLETENESS_FULL);
     CHECK(r.result_provenance.empty());
 }
+
+TEST_CASE("asset_tags status: last_persist_error is escaped by safe_output_field",
+          "[agent][asset_tags_actions]") {
+    yuzu::test::TempDir dir{"yuzu_test_asset_tags_escape_"};
+    {
+        std::lock_guard<std::mutex> lock(g_mu);
+        g_state = {};
+        g_store_path = dir.path / "asset_tags.json";
+        g_persist_failures = 0;
+        g_last_persist_error.clear();
+    }
+    yuzu::test::ScopeExit reset_globals{[] {
+        std::lock_guard<std::mutex> lock(g_mu);
+        g_state = {};
+        g_store_path.clear();
+        g_persist_failures = 0;
+        g_last_persist_error.clear();
+        g_injected_warning.reset();
+    }};
+
+    // Pipe, backslash and CR/LF are the bytes the row grammar cannot carry raw.
+    g_injected_warning = WriteWarning{"a|b\\c\r\nd", false, true};
+    const std::array<YuzuParam, 1> params{{{"role", "r-esc"}}};
+    yuzu::agent::LocalDispatcher dispatcher;
+    CHECK(dispatcher.run(&kTuDescriptor, "sync", params).rc == 0);
+
+    auto rows = captured_rows(dispatcher.run(&kTuDescriptor, "status", {}).captured);
+    auto err = row_with_prefix(rows, "last_persist_error|");
+    REQUIRE(err.has_value());
+    // '|' -> "\|", '\' -> '/', CR and LF -> one space each.
+    CHECK(*err == "last_persist_error|dir_fsync_failed: a\\|b/c  d");
+}

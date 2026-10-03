@@ -397,7 +397,7 @@ bool atomic_write_file(const fs::path& target, std::string_view content) {
         spdlog::warn("filesystem: atomic write failed: {}", r.error().message);
         return false;
     }
-    if (*r) spdlog::debug("filesystem: atomic write: {}", (*r)->message);
+    if (*r) spdlog::warn("filesystem: atomic write: {}", (*r)->message);
     return true;
 }
 

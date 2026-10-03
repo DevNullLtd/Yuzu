@@ -20,6 +20,8 @@
  * on a later failure is armed only AFTER that exclusive create succeeds, so a
  * failed create never deletes a path this process did not create. Once
  * written, the temp is renamed over `dest`.
+ * Missing parent directories of dest are created first (the asset_tags
+ * contract; a no-op for callers that validate or create the parent themselves).
  *
  * Creation mode is policy-dependent (AtomicWriteOptions::owner_only_mode):
  *   - true  (default): POSIX creates the temp at 0600 — no umask window — and
@@ -56,7 +58,11 @@
  * the temp and replant something else before the rename resolves it. Bounded:
  * the payload this process wrote is never corrupted, no partially-written
  * file ever lands at `dest`, and the next successful write self-heals it.
- * Tracked in #4723 — not fixed here.
+ * #4723 decision: option 3 — accept and document, with ONE shared
+ * implementation (asset_tags, agent_csr, filesystem, tags) so the shape cannot
+ * diverge. Declined: O_TMPFILE+linkat (Linux-only) and a pre-write directory
+ * ownership/mode check (an agents/core data_dir decision, deferred). The
+ * Windows dangling-reparse-point CREATE_NEW question stays open under #4723.
  *
  * PosixFdOps / `forced_temp_suffix` are TEST SEAMS ONLY: production callers
  * pass neither. The suffix's unpredictability is not itself the security
@@ -170,6 +176,10 @@ private:
 /// Owns an open descriptor so an allocation that throws between open and the
 /// explicit close cannot leak it. close() routes through the injected seam and
 /// disowns the fd (the destructor then does nothing).
+/// Not yuzu::agent::ScopedFd: agents/shared is a zero-dependency leaf
+/// (docs/cpp-conventions.md, 'What belongs in agents/shared/') and cannot
+/// include agents/core, and close() must route through the injected PosixFdOps
+/// seam so the #4726 ordering test can observe it.
 class FdOwner {
 public:
     FdOwner(const PosixFdOps& ops, int fd) noexcept : ops_(ops), fd_(fd) {}

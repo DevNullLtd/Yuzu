@@ -21,6 +21,10 @@
 #include <fstream>
 #include <string>
 
+#ifndef _WIN32
+#include <sys/stat.h>
+#endif
+
 namespace fs = std::filesystem;
 using namespace yuzu::agent;
 using namespace std::chrono_literals;
@@ -137,6 +141,12 @@ TEST_CASE("persist + inspect round-trips and keys are 0600", "[agent_csr][pki]")
     const auto dperms = fs::status(dir).permissions();
     REQUIRE((dperms & fs::perms::group_all) == fs::perms::none);
     REQUIRE((dperms & fs::perms::others_all) == fs::perms::none);
+    // The public artifacts are NOT narrowed to 0600: owner_only_mode=false, so
+    // the process umask applies (a regression passing true would fail here).
+    const mode_t u = ::umask(0);
+    ::umask(u);
+    CHECK((fs::status(paths.cert_path).permissions() & fs::perms::mask) ==
+          static_cast<fs::perms>(0666 & ~u));
 #endif
 
     // A fresh 1-year leaf is Valid.

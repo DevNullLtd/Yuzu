@@ -14,7 +14,7 @@
 
 ## How it works
 
-All 7 actions are pure in-process reads/writes of a flat `<data_dir>/tags.json` object (tags_plugin.cpp:13,80-104); `load_tags()`/`save_tags()` re-serialize the whole file on every mutating call (tags_plugin.cpp:36-76). `set` validates the key (≤64 chars, `^[a-zA-Z0-9_.:\-]+$` by convention) and value (≤448 bytes) before writing (tags_plugin.cpp:166-189); `get`/`check`/`delete` look a single key up in the in-memory map, and `get_all`/`count` walk the whole map (tags_plugin.cpp:191-251). `clear` wipes every tag in one call and is classified Destructive/Irreversible (capdecls `plugin_action_catalogue_d.hpp:107-120`) rather than the Mutating/Reversible tier `set`/`delete` carry, and is the only action gated `AdminOrApproval` and restricted to `endpoint-admin` (`tags.yaml` `device.tags.clear`).
+All 7 actions are pure in-process reads/writes of a flat `<data_dir>/tags.json` object (tags_plugin.cpp:13,76-100); `load_tags()`/`save_tags()` re-serialize the whole file on every mutating call (tags_plugin.cpp:39-72). `set` validates the key (≤64 chars, `^[a-zA-Z0-9_.:\-]+$` by convention) and value (≤448 bytes) before writing (tags_plugin.cpp:162-185); `get`/`check`/`delete` look a single key up in the in-memory map, and `get_all`/`count` walk the whole map (tags_plugin.cpp:187-247). `clear` wipes every tag in one call and is classified Destructive/Irreversible (capdecls `plugin_action_catalogue_d.hpp:107-120`) rather than the Mutating/Reversible tier `set`/`delete` carry, and is the only action gated `AdminOrApproval` and restricted to `endpoint-admin` (`tags.yaml` `device.tags.clear`).
 
 It is deliberately not the channel that reaches the server. `tags.json` is separately read verbatim by the agent's Register RPC path (`agent.cpp:1701-1725`), independent of this plugin's own load path, and the server drops any self-reported `service` key at ingest (`agent_registry.cpp:56-67`, #3295) before persisting the rest to the Postgres-backed TagStore (`tag_store.cpp` `sync_agent_tags:345-433`). It is also not the structured 4-category tag store — that role belongs to the sibling `asset_tags` plugin (see Siblings below).
 
@@ -71,7 +71,7 @@ No external binaries, no subprocesses, no network access — every action is an 
 
 ### Outputs
 
-Every action writes one or more pipe-delimited lines via `ctx.write_output`; there is no shared discriminator across actions — each uses its own literal prefix (`tag_set`, `tag`, `tag_deleted`, `tag_exists`, `tags_cleared`, `count`) rather than the field names declared below. A missing/unset value reports as an empty string (a trailing empty field), never a `-` placeholder (`tags_plugin.cpp:200`; see the macOS sample's `get`). A validation failure returns `rc=1` and a distinct `error|<message>` line instead of the success row (`tags_plugin.cpp:169-172,180-183,193-196,217-220,230-233`).
+Every action writes one or more pipe-delimited lines via `ctx.write_output`; there is no shared discriminator across actions — each uses its own literal prefix (`tag_set`, `tag`, `tag_deleted`, `tag_exists`, `tags_cleared`, `count`) rather than the field names declared below. A missing/unset value reports as an empty string (a trailing empty field), never a `-` placeholder (`tags_plugin.cpp:196`; see the macOS sample's `get`). A validation failure returns `rc=1` and a distinct `error|<message>` line instead of the success row (`tags_plugin.cpp:165-168,176-179,189-192,213-216,226-229`).
 
 <!-- BEGIN GENERATED: plugin-doc-gen outputs -->
 **`device.tags.check` — `key|exists`**
@@ -238,10 +238,10 @@ count|0
 
 ## Caveats and known gaps
 
-1. **The capture harness never calls `init()`, so every sample reflects a fresh, path-less store.** `load_tags()`/`save_tags()` both no-op when `g_tags_path` is empty (`tags_plugin.cpp:38-39,62-63`), and only `init()` sets that path from `agent.data_dir` (`tags_plugin.cpp:132-137`) — the plugin-capture driver's `PluginHandle::load` + `LocalDispatcher::run` path never calls it (confirmed against `agent.cpp:971-982`, which calls `init()` only from the agent's own boot loop). `set`'s `tag_set` line is a real in-memory write, but nothing lands on disk, so the very next `get`/`check`/`get_all`/`count` in the same sample sees an empty store. This is a harness artifact, not evidence that `set` fails to persist in production.
-2. **A persistence failure is silent.** `save_tags()`'s `ofstream` open and write are unchecked (`tags_plugin.cpp:72-75`); an unwritable `data_dir` or a full disk drops the write with no error returned to the caller or the operator.
+1. **The capture harness never calls `init()`, so every sample reflects a fresh, path-less store.** `load_tags()`/`save_tags()` both no-op when `g_tags_path` is empty (`tags_plugin.cpp:41-42,65-66`), and only `init()` sets that path from `agent.data_dir` (`tags_plugin.cpp:128-133`) — the plugin-capture driver's `PluginHandle::load` + `LocalDispatcher::run` path never calls it (confirmed against `agent.cpp:971-982`, which calls `init()` only from the agent's own boot loop). `set`'s `tag_set` line is a real in-memory write, but nothing lands on disk, so the very next `get`/`check`/`get_all`/`count` in the same sample sees an empty store. This is a harness artifact, not evidence that `set` fails to persist in production.
+2. **A persistence failure is logged, not reported.** `save_tags()` logs `tags: state not persisted: ...` at warn (`tags_plugin.cpp:69-71`) and the action still returns `rc=0` with its normal row; an unwritable `data_dir` or a full disk is visible only in the agent log.
 3. **`clear` was never executed on a live host.** All three samples show `[not captured]` for `clear` — the mutator capture policy withholds Destructive/Irreversible actions. It is also the one action in this plugin whose dashboard dispatch now requires an explicit, in-scope target rather than a fleet broadcast (#3885).
-4. **The `tests/unit` files matching "tags" are not this plugin's tests.** `test_guardian_health_fleet_tags.cpp`, `test_guardian_journal_fleet_tags.cpp`, and `test_spark_fleet_tags.cpp` bind Prometheus heartbeat *label* keys for Guardian/Spark telemetry — none load `TagsPlugin` or reference `tags_plugin.cpp`. No dedicated unit test exercises this plugin's `execute()`.
+4. **The `tests/unit` files matching "tags" are not this plugin's tests.** `test_guardian_health_fleet_tags.cpp`, `test_guardian_journal_fleet_tags.cpp`, and `test_spark_fleet_tags.cpp` bind Prometheus heartbeat *label* keys for Guardian/Spark telemetry — none load `TagsPlugin` or reference `tags_plugin.cpp`. `tests/unit/test_tags_plugin.cpp` includes the TU and drives `save_tags()`/`load_tags()` directly (atomic write, round-trip, no leftover temp, creation mode); nothing exercises `execute()`.
 5. **`service` is the one key this plugin can set locally that the server will never honor.** A `tags.json` `service` entry is dropped both at Register ingest (`agent_registry.cpp:56-67`) and at TagStore sync (`tag_store.cpp:374-379`) — see #3289/#3295. Every other key set here reaches `tag:<key>` scope-DSL evaluation normally.
 
 ## Source and tests
@@ -250,6 +250,6 @@ count|0
 - Plugin: `agents/plugins/tags/src/tags_plugin.cpp`
 - Definitions: `content/definitions/tags.yaml`
 - Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_d.hpp`
-- Tests: none found by name
+- Tests: `tests/unit/test_tags_plugin.cpp`
 - Privilege row: `docs/agent-privilege-model.md` (no row yet)
 <!-- END GENERATED -->

@@ -58,7 +58,7 @@ read_state_file(const std::filesystem::path& p) {
 write_state_file_atomic(const std::filesystem::path& dest, std::string_view bytes,
                         std::string_view forced_temp_suffix = {},
                         const yuzu::shared::PosixFdOps* ops = nullptr) {
-    return yuzu::shared::write_file_atomic(dest, bytes, {true, forced_temp_suffix, ops});
+    return yuzu::shared::write_file_atomic(dest, bytes, {.owner_only_mode = true, .forced_temp_suffix = forced_temp_suffix, .fd_ops = ops});
 }
 
 } // namespace yuzu::asset_tags

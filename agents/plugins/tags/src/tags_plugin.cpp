@@ -65,12 +65,6 @@ void save_tags() {
     if (g_tags_path.empty())
         return;
 
-    std::error_code ec;
-    auto parent = g_tags_path.parent_path();
-    if (!parent.empty()) {
-        fs::create_directories(parent, ec);
-    }
-
     nlohmann::json j = g_tags;
     auto r = yuzu::shared::write_file_atomic(g_tags_path, j.dump(2), {.owner_only_mode = false});
     if (!r)
