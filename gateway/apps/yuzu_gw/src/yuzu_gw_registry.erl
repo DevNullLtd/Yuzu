@@ -71,11 +71,13 @@ start_link() ->
 %% @doc Register an agent with no stashed RegisterRequest.
 %%
 %% Back-compat entry point: production registration goes through
-%% register_agent/6 (yuzu_gw_agent:init/1 always has the verbatim
-%% request). This /5 form is for callers — chiefly routing-focused
-%% tests — that do not exercise the upstream-reconnect replay path; it
-%% records an empty request, so such an agent is simply skipped by the
-%% replay drip.
+%% register_agent/7 (yuzu_gw_agent:init/1 always has the verbatim request
+%% and the connection key). The /5 and /6 forms register with an undefined
+%% connection key, so they admit no heartbeats; they are for tests and
+%% legacy callers only. This /5 form is for callers - chiefly
+%% routing-focused tests - that do not exercise the upstream-reconnect
+%% replay path; it records an empty request, so such an agent is simply
+%% skipped by the replay drip.
 -spec register_agent(binary(), pid(), binary() | undefined,
                      [binary()], binary()) -> ok.
 register_agent(AgentId, Pid, SessionId, Plugins, Hostname) ->
@@ -429,6 +431,10 @@ take_pending(SessionId) ->
 
 init([]) ->
     ets:new(?TABLE, [named_table, set, public, {read_concurrency, true}]),
+    %% public (unlike the session index below): handler processes write
+    %% pending rows directly. protected on the session index guards against
+    %% accidental writes; it is not a trust boundary, any code in the node can
+    %% still call the registry.
     ets:new(?PENDING_TABLE, [named_table, set, public]),
     %% protected: only this process writes the session index; heartbeat
     %% handler processes read it.
