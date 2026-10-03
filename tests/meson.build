@@ -653,6 +653,11 @@ agent_test_exe = executable(
              # CAPTURE tree manifest via this same define.
              '-DYUZU_TEST_FIXTURE_DIR="' +
              (meson.project_source_root() / 'tests' / 'unit' / 'fixtures').replace('\\', '/') +
+             '"',
+             # M.1: test_inventory_sync.cpp reads the plugins' REAL CAPTURE samples
+             # (agents/plugins/*/docs/samples/*.txt) at run time via this define.
+             '-DYUZU_PLUGIN_SRC_DIR="' +
+             (meson.project_source_root() / 'agents' / 'plugins').replace('\\', '/') +
              '"'] +
             # /bigobj: test_spark_mechanism.cpp (15k lines) and test_guardian_spark_runtime.cpp
             # hit MSVC's hard C1128 limit (65,279 sections per object) in the nightly

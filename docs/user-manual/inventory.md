@@ -10,10 +10,19 @@ cadences.
 ## What is collected
 
 - **Machine-wide installed software** (blob contract v2): name, version,
-  publisher, install date, plus the package-manager fields below. Collected by
-  the `installed_apps` plugin via its `list_inventory` action (Windows: `HKLM` +
-  the agent service account's own `HKCU`; Linux: `dpkg`/`rpm`/`pacman`/`apk`;
-  macOS: `system_profiler`). The operator-facing `list` action keeps its
+  publisher, install date, plus the package-manager fields below. The daily
+  sync calls four inventory actions in-process and merges their rows:
+  `installed_apps` `list_inventory` (Windows: `HKLM` + the agent service
+  account's own `HKCU`; Linux: `dpkg`/`rpm`/`pacman`/`apk`; macOS:
+  `system_profiler`), `pkg_inventory` `packages` and `managers` (Homebrew), and
+  `windows_optional_features` `list`. An action whose plugin is not loaded, or
+  that answers "unsupported on this OS", is skipped; an action that fails (non-zero
+  exit, truncated output, a constrained or unavailable answer, or no
+  applications at all from `installed_apps`) skips that day's report and keeps
+  the last good state — nothing is deleted. Every row's `source` names the
+  producing action (`installed_apps.list_inventory`, `pkg_inventory.packages`,
+  `pkg_inventory.managers`, `windows_optional_features.list`); `package_id` is
+  empty for these producers. The operator-facing `list` action keeps its
   original four columns (`name`, `version`, `publisher`, `install_date`) in
   the same order and appends two trailing columns, `install_location` and
   `bundle_id` (ADR-0028). A response's raw `output` holds many rows joined by
@@ -65,10 +74,24 @@ cadences.
   the rpmdb (is a signature recorded), never a live `rpm -K` cryptographic
   verification. `distro_id`/`distro_version` are host-level (`/etc/os-release`
   `ID`/`VERSION_ID`), stamped on every Linux row. deb rows include **held**
-  packages (they are installed). `homebrew` is a reserved `ecosystem` value —
-  not collected yet (per-user Homebrew stores are out of scope; the sync is machine-scope). The
-  `pkg_inventory` plugin reads the machine-scope Homebrew prefix on demand
-  (an instruction result, not a daily-sync source).
+  packages (they are installed). Machine-scope Homebrew
+  is collected through `pkg_inventory` with `ecosystem` `brew`: each formula is
+  `kind` `pkg`, each cask `kind` `app` (`source` `pkg_inventory.packages`), plus
+  one `kind` `app` row named `homebrew` with `source` `pkg_inventory.managers`
+  that records Homebrew itself is present — one row however many prefixes
+  exist (`/opt/homebrew` and `/usr/local` on one Mac collapse to one). Per-user
+  Homebrew stores are out of scope; the sync is machine-scope. Only Homebrew is
+  mapped today; other package managers `pkg_inventory` may report are not
+  collected here.
+
+  **Windows optional features** are collected with `ecosystem`
+  `optional_feature` and `kind` `feat`, every feature the host knows, enabled or
+  not. For these rows `version` carries the DISM feature state verbatim
+  (`enabled`, `disabled`, `pending_enable`, `pending_disable`, `superseded`,
+  `partially_installed`, `unknown`) because a feature has no version of its own;
+  `publisher` is empty. A host with a disabled feature therefore still lists
+  it, so the `/software` catalogue count (grouped by name) counts a host with a
+  DISABLED feature as having it — read `version` to tell them apart.
 
   **macOS `app` rows** carry `publisher` and `signature_status` read natively
   through CoreFoundation + Security.framework (`CFBundleCreate`,
@@ -182,8 +205,8 @@ The data lands in the Postgres schema **`software_inventory_store`**:
   — one row per installed package per device. Every column except `agent_id`,
   `name` and `install_id` may be empty (`''`) per the honest-empty contract above; rows
   synced by a pre-v2 agent carry `''` in all eight v2 columns until that
-  agent's next full resend. Rows from agents that do not yet emit the extended
-  tail carry `''` in `package_id` and `source`; `install_id` (a row id, reassigned
+  agent's next full resend. Rows from agents older than this release
+  carry `''` in `package_id` and `source`; `install_id` (a row id, reassigned
   on each full report) is always populated.
 - `inventory_state(agent_id, source, content_hash, first_seen, last_seen)` — per
   device sync bookkeeping. `first_seen`/`last_seen` are **server receipt times**

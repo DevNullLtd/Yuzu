@@ -3,15 +3,23 @@
 /// @file sync_source_installed_software.hpp
 /// The `installed_software` daily-sync source (ADR-0016) — source #1 of the
 /// agent sync framework. Collects the machine-wide installed-software inventory
-/// by invoking the existing `installed_apps` plugin in-process (`LocalDispatcher`,
-/// action `list_inventory` — blob contract v2) and renders it into the canonical
-/// wire form the server expects. NO per-user data (machine scope only — no PII).
+/// by invoking the inventory actions in-process (`LocalDispatcher`) and renders
+/// them into the canonical wire form the server expects. The actions (one table
+/// in the .cpp; M.3/M.7/M.8 add a row + a pure adapter):
+///   installed_apps.list_inventory           blob contract v2 rows
+///   pkg_inventory.packages                  Homebrew formulae/casks (ecosystem `brew`)
+///   pkg_inventory.managers                  one `homebrew` presence row
+///   windows_optional_features.list          every DISM feature, state in `version`
+/// Every row carries `source` = "<plugin>.<action>". NO per-user data (machine
+/// scope only — no PII).
 
 #include "sync_scheduler.hpp"
 
 #include <yuzu/plugin.h> // YuzuPluginDescriptor (C ABI) — typedef, so include not fwd-decl
 
+#include <map>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace yuzu::agent {
@@ -33,6 +41,21 @@ struct SwEntry {
     std::string signature_status; // "signed"|"unsigned" (rpm stored tags only)
     std::string distro_id;        // /etc/os-release ID
     std::string distro_version;   // /etc/os-release VERSION_ID
+    // Extended tail (mirrors the server's SoftwareEntry). Wire slots 13-14
+    // (install_location, uninstall_string) are reserved: no member, always sent
+    // empty, never hashed (ADR-0016 §8, #5186).
+    std::string package_id;
+    std::string source; // "<plugin>.<action>" that produced the row
+};
+
+/// Result of a pure action adapter. `ok` with zero entries is a legitimate
+/// answer ("brew present, no formulae"); `unsupported` = the action answered
+/// "not on this OS" (skipped silently); `failed` = skip the whole cycle.
+struct AdaptedRows {
+    enum class Status { ok, unsupported, failed };
+    Status status{Status::ok};
+    std::vector<SwEntry> entries;
+    std::string reason; // failed: why (logged)
 };
 
 /// Parse `installed_apps` `list_inventory` output (pipe-delimited
@@ -43,6 +66,29 @@ struct SwEntry {
 /// beyond the 12th field are dropped (fields never shift).
 YUZU_EXPORT std::vector<SwEntry> parse_installed_apps_output(const std::string& out);
 
+/// Adapt `pkg_inventory` `managers` output (`status|managers|<level>|...` plus
+/// `manager|<name>|<present|unavailable>|<version or ->|...` rows). HOMEBREW
+/// ONLY today: one presence row {name=homebrew, kind=app, ecosystem=brew} per
+/// `present` homebrew row (the collector's dedup collapses a dual-prefix Mac to
+/// one); any other manager name is dropped. The Linux/Windows managers legs must
+/// add their own mapping deliberately (manager facts belong to facet rows).
+YUZU_EXPORT AdaptedRows parse_pkg_inventory_managers_output(const std::string& out);
+
+/// Adapt `pkg_inventory` `packages` output (`status|packages|<level>|...` plus
+/// `package|homebrew|<id>|<version>|<formula|cask>`): formula -> kind `pkg`,
+/// cask -> kind `app`, ecosystem `brew`.
+YUZU_EXPORT AdaptedRows parse_pkg_inventory_packages_output(const std::string& out);
+
+/// Adapt `windows_optional_features` `list` output (`feature|<name>|<state>|<0/1>`):
+/// EVERY feature becomes {kind=feat, ecosystem=optional_feature} with the DISM
+/// state token verbatim in `version` (a labelled overload — a real state slot is
+/// #5186 territory). `feature|unsupported|...` -> unsupported;
+/// `feature|unavailable|<token>` or no feature rows at all -> failed.
+YUZU_EXPORT AdaptedRows parse_windows_optional_features_output(const std::string& out);
+
+/// Sort + dedup in the server's comparator order (one copy, shared with the blob).
+YUZU_EXPORT void normalize_installed_software(std::vector<SwEntry>& entries);
+
 /// Canonical wire blob: sorted + deduped; fields unit-separated (0x1F), entries
 /// record-separated (0x1E); fields truncated to the server's cap. MUST be
 /// byte-identical to the server's reconstruction (ADR-0016 §4 /
@@ -50,10 +96,11 @@ YUZU_EXPORT std::vector<SwEntry> parse_installed_apps_output(const std::string& 
 /// this source's. Takes its argument by value (it sorts a copy).
 YUZU_EXPORT std::string installed_software_canonical_blob(std::vector<SwEntry> entries);
 
-/// Build the `installed_software` SyncSource. `descriptor` is the loaded
-/// `installed_apps` plugin descriptor; when null (plugin not built/loaded — e.g.
-/// `build_agent=false`) the source's collect returns std::nullopt and the
-/// scheduler no-ops it.
-YUZU_EXPORT SyncSource make_installed_software_source(const YuzuPluginDescriptor* descriptor);
+/// Build the `installed_software` SyncSource. `plugins` maps `descriptor->name`
+/// to the loaded descriptor; an absent key = plugin not loaded on this OS (e.g.
+/// `build_agent=false`, or windows_optional_features on macOS) -> that action is
+/// skipped. A failing action skips the cycle (nothing is deleted).
+YUZU_EXPORT SyncSource make_installed_software_source(
+    std::map<std::string, const YuzuPluginDescriptor*, std::less<>> plugins);
 
 } // namespace yuzu::agent

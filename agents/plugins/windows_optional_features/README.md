@@ -109,8 +109,8 @@ Pipe-delimited rows via `write_output()`. `list` writes one `feature|` row per f
 
 ### Where the data goes
 
-- **Instruction result only.** Rows travel over the agent's mTLS gRPC channel as the command response and land in the ResponseStore (`response_retention_days`, default 90 days), queryable at `/api/responses/{id}` and aggregatable (`list` groups by `state`, counted).
-- **Not consumed by** daily-sync inventory, the TAR warehouse, DEX, or metrics. `gather.ttlSeconds: 300` only caps how often a repeat dispatch is served from cache; nothing runs on a schedule.
+- **Instruction result AND daily-sync inventory.** Rows travel over the agent's mTLS gRPC channel as the command response and land in the ResponseStore (`response_retention_days`, default 90 days), queryable at `/api/responses/{id}` and aggregatable (`list` groups by `state`, counted).
+- **Also consumed by** the `installed_software` daily-sync source (`agents/core/src/sync_source_installed_software.cpp`), which calls `list` in-process on the agent's 24 h schedule: every feature becomes a `feat` row with ecosystem `optional_feature` and its DISM state in `version`. Not consumed by the TAR warehouse, DEX, or metrics. `gather.ttlSeconds: 300` only caps how often a repeat dispatch is served from cache.
 - **Sensitivity.** Rows name which built-in Windows OS features are enabled on the device (e.g. `SMB1Protocol`, `TelnetClient`) — a security-relevant configuration signal, but no username, hostname, serial number or file path appears in any field.
 - **Siblings:** `msi_packages` (installed third-party/MSI software, not OS features), `windows_updates` (patch history, not feature toggles), `registry`/`wmi` (general-purpose Windows reads this plugin's narrow DISM surface deliberately does not replace) — none join with this plugin's output.
 - **MCP / REST.** Discover: `discover_plugins` (summary) → `yuzu://plugin-docs` (this page as data) → `discover_instructions` / `get_definition("windows.features.list")`. Run: `execute_instruction {definition_id, parameters}`. Read: `/api/responses/{id}`.

@@ -2144,7 +2144,9 @@ public:
                 // persists in kv_store_ namespace "__sync__" across reconnects, so a
                 // flap does not lose or duplicate a daily push.
                 {
-                    const YuzuPluginDescriptor* ia_descriptor = nullptr;
+                    // installed_software (ADR-0016): every loaded plugin by name; the source
+                    // picks the inventory actions it needs and skips absent ones.
+                    std::map<std::string, const YuzuPluginDescriptor*, std::less<>> sync_plugins;
                     const YuzuPluginDescriptor* tar_descriptor = nullptr;
                     // device_ci source plugins (ADR-0016): hardware / device_identity /
                     // os_info / network_config, reused in-process via LocalDispatcher.
@@ -2159,9 +2161,8 @@ public:
                     const YuzuPluginDescriptor* app_usage_descriptor = nullptr;
                     for (const auto& handle : plugins_) {
                         const std::string_view pname{handle.descriptor()->name};
-                        if (pname == "installed_apps")
-                            ia_descriptor = handle.descriptor();
-                        else if (pname == "tar")
+                        sync_plugins.emplace(std::string(pname), handle.descriptor());
+                        if (pname == "tar")
                             tar_descriptor = handle.descriptor();
                         else if (pname == "hardware")
                             hw_descriptor = handle.descriptor();
@@ -2187,7 +2188,7 @@ public:
                     } else {
                     sync_stop_.store(false, std::memory_order_release);
                     auto sync_stub = pb::AgentService::NewStub(channel);
-                    sync_thread_ = std::thread([this, ia_descriptor, tar_descriptor, hw_descriptor,
+                    sync_thread_ = std::thread([this, sync_plugins, tar_descriptor, hw_descriptor,
                                                 devid_descriptor, osinfo_descriptor,
                                                 netcfg_descriptor, license_descriptor,
                                                 app_usage_descriptor,
@@ -2319,7 +2320,7 @@ public:
                         // Registration order carries NO persisted meaning (KV keys and
                         // request_now()'s name match are both name-keyed, per
                         // sync_scheduler.hpp's own contract), so this reorder is safe.
-                        scheduler.add_source(make_installed_software_source(ia_descriptor));
+                        scheduler.add_source(make_installed_software_source(sync_plugins));
                         // Publish AFTER the last add_source: request_now() reads sources_
                         // without the mutex on the append-only-before-publication contract.
                         {
