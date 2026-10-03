@@ -325,12 +325,120 @@ class AssertGatewayTests(unittest.TestCase):
                     # sibling whose intro-tests.json could be stale.
                     self.assertEqual(a.group(1).strip('"'), m.group(1).strip('"'))
 
+    # `meson test` / `meson  test` / `meson \<newline> test`, or the flake-retry
+    # wrapper that runs it.
+    TEST_RE = re.compile(r'\bmeson(?:\s|\\\n)+test\b|flake-retry\.py')
+    ASSERT_RE = re.compile(r'scripts/ci/assert-gateway-tests\.py')
+    # `|| true`, `|| :` or `|| exit 0` on the assert's own command line.
+    MASKED_RE = re.compile(r'\|\|\s*(?:true\b|:(?=\s|$|;)|exit\s+0\b)')
+
+    @staticmethod
+    def _truthy(value):
+        v = str(value).strip().lower()
+        if v.startswith('${{') and v.endswith('}}'):
+            v = v[3:-2].strip()
+        return v in ('true', '1')
+
+    @staticmethod
+    def _falsey(value):
+        v = str(value).strip().lower()
+        if v.startswith('${{') and v.endswith('}}'):
+            v = v[3:-2].strip()
+        return v in ('false', '0')
+
+    @classmethod
+    def _gateway_assert_problem(cls, steps):
+        """None if `steps` (one job) either runs no tests or asserts the
+        gateway tests registered STRICTLY before the first test invocation,
+        by a step that can actually fail; else a one-line reason.
+
+        Order is judged by source position: (step index, char offset in the
+        comment-stripped `run:` text), so an assert placed after `meson test`
+        inside one `run:` block is still late. An assert that cannot fail
+        (`|| true`, `continue-on-error: true`, an `if:` that is literally
+        false) does not count."""
+        first_test = None
+        asserts = []
+        for i, step in enumerate(steps or []):
+            run = '\n'.join(l for l in str(step.get('run') or '').split('\n')
+                            if not l.lstrip().startswith('#'))
+            m = cls.TEST_RE.search(run)
+            if m and first_test is None:
+                first_test = (i, m.start())
+            neutral = None
+            if cls._truthy(step.get('continue-on-error', False)):
+                neutral = 'continue-on-error: true'
+            elif 'if' in step and cls._falsey(step['if']):
+                neutral = 'a false if:'
+            for a in cls.ASSERT_RE.finditer(run):
+                lo = max((k.end() for k in re.finditer(r'(?<!\\)\n', run[:a.start()])), default=0)
+                nl = re.search(r'(?<!\\)\n', run[a.end():])
+                line = run[lo:a.end() + nl.start()] if nl else run[lo:]
+                why = neutral or ('|| true on the assert line' if cls.MASKED_RE.search(line) else None)
+                asserts.append(((i, a.start()), why))
+        if first_test is None:
+            return None
+        if not asserts:
+            return 'runs tests but never asserts the gateway tests registered'
+        live = [pos for pos, why in asserts if why is None]
+        if not live:
+            return 'the assertion cannot fail (%s)' % asserts[0][1]
+        if min(live) >= first_test:
+            return 'the assertion does not run strictly before the first test invocation'
+        return None
+
+    def test_assert_ordering_rule_rejects_each_weakening(self):
+        # The rule itself, on synthetic jobs: each mutant of a good job must
+        # be rejected, and the good shapes accepted.
+        good = [{'run': 'python3 scripts/ci/assert-gateway-tests.py b'},
+                {'run': 'meson test -C b'}]
+        problem = self._gateway_assert_problem
+        self.assertIsNone(problem(good))
+        self.assertIsNone(problem([{'run': 'x'}]))   # no tests, nothing to assert
+        self.assertIsNone(problem([{'run': 'python3 scripts/ci/assert-gateway-tests.py b\n'
+                                           'meson test -C b'}]))
+        self.assertIsNone(problem([{'run': 'python3 scripts/ci/assert-gateway-tests.py b'},
+                                   {'run': 'python3 scripts/ci/flake-retry.py -- x'}]))
+        bad = {
+            'assert after the test step': [good[1], good[0]],
+            'assert after meson test in one run': [{'run': 'meson test -C b\n'
+                                                           'python3 scripts/ci/assert-gateway-tests.py b'}],
+            'assert after meson<2 spaces>test in one run': [{'run': 'meson  test -C b\n'
+                                                                    'python3 scripts/ci/assert-gateway-tests.py b'}],
+            'assert after meson<tab>test in one run': [{'run': 'meson\ttest -C b\n'
+                                                               'python3 scripts/ci/assert-gateway-tests.py b'}],
+            'assert after a continued meson test': [{'run': 'meson \\\n  test -C b\n'
+                                                            'python3 scripts/ci/assert-gateway-tests.py b'}],
+            'assert after flake-retry in one run': [{'run': 'python3 scripts/ci/flake-retry.py -- x\n'
+                                                            'python3 scripts/ci/assert-gateway-tests.py b'}],
+            'assert on the test line itself, after': [{'run': 'meson test -C b; '
+                                                              'python3 scripts/ci/assert-gateway-tests.py b'}],
+            'no assert at all': [good[1]],
+            'assert only in a comment': [{'run': '# python3 scripts/ci/assert-gateway-tests.py b'}, good[1]],
+            '|| true': [{'run': 'python3 scripts/ci/assert-gateway-tests.py b || true'}, good[1]],
+            '|| true after a continuation': [{'run': 'python3 scripts/ci/assert-gateway-tests.py \\\n b || true'},
+                                             good[1]],
+            '|| :': [{'run': 'python3 scripts/ci/assert-gateway-tests.py b || :'}, good[1]],
+            'continue-on-error: true': [dict(good[0], **{'continue-on-error': True}), good[1]],
+            "continue-on-error: 'true'": [dict(good[0], **{'continue-on-error': 'true'}), good[1]],
+            "continue-on-error: ${{ true }}": [dict(good[0], **{'continue-on-error': '${{ true }}'}), good[1]],
+            'if: false': [dict(good[0], **{'if': False}), good[1]],
+            "if: ${{ false }}": [dict(good[0], **{'if': '${{ false }}'}), good[1]],
+            "if: 'false'": [dict(good[0], **{'if': 'false'}), good[1]],
+            'only a dead assert before, a live one after': [dict(good[0], **{'if': False}), good[1],
+                                                            {'run': 'python3 scripts/ci/assert-gateway-tests.py b'}],
+        }
+        for why, steps in bad.items():
+            with self.subTest(mutant=why):
+                self.assertIsNotNone(problem(steps), why)
+
     def test_every_job_that_runs_tests_asserts_the_gateway(self):
         # The per-`meson setup` check above only sees the files it names and
         # only a literal `meson setup`. This one discovers EVERY workflow
         # (glob, so a new or renamed file is covered) and, for each job that
         # runs tests (`meson test`, or flake-retry.py which wraps it), requires
-        # an assert-gateway-tests.py step at or before the first test step.
+        # an assert-gateway-tests.py that runs strictly before the first test
+        # invocation and can fail (see _gateway_assert_problem).
         # fork-dynamic-review.yml configures through scripts/setup.sh and
         # ran `meson test` with no Erlang and no assertion until this check
         # existed. Comment lines are ignored.
@@ -341,21 +449,14 @@ class AssertGatewayTests(unittest.TestCase):
             with open(path, encoding='utf-8') as f:
                 doc = yaml.safe_load(f)
             for job, body in (doc.get('jobs') or {}).items():
-                tests, asserts = [], []
-                for i, step in enumerate(body.get('steps') or []):
-                    run = '\n'.join(l for l in str(step.get('run') or '').split('\n')
-                                    if not l.lstrip().startswith('#'))
-                    if re.search(r'\bmeson test\b|flake-retry\.py', run):
-                        tests.append(i)
-                    if 'scripts/ci/assert-gateway-tests.py' in run:
-                        asserts.append(i)
-                if not tests:
+                steps = body.get('steps') or []
+                if not any(self.TEST_RE.search('\n'.join(
+                        l for l in str(st.get('run') or '').split('\n')
+                        if not l.lstrip().startswith('#'))) for st in steps):
                     continue
                 found.add((wf, job))
                 with self.subTest(workflow=wf, job=job):
-                    self.assertTrue(asserts, 'runs tests but never asserts the gateway tests registered')
-                    self.assertLessEqual(min(asserts), min(tests),
-                                         'the assertion runs after the first test step')
+                    self.assertIsNone(self._gateway_assert_problem(steps))
         # Guard the discovery itself: it must still see the legs the doc names.
         for want in (('ci.yml', 'linux'), ('ci.yml', 'windows'), ('ci.yml', 'macos'),
                      ('fork-dynamic-review.yml', 'linux'), ('nightly.yml', 'coverage')):
