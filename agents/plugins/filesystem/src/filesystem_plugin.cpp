@@ -391,7 +391,8 @@ bool glob_match(std::string_view pattern, std::string_view text) {
 // ── Atomic file write helper ───────────────────────────────────────────
 // Delegates to the shared exclusive-create temp + fsync + rename helper.
 bool atomic_write_file(const fs::path& target, std::string_view content) {
-    // owner_only_mode=false: ordinary files keep the 0666 & ~umask creation mode.
+    // owner_only_mode=false: a new file is created at 0666 & ~umask; an existing
+    // regular file keeps its rwx bits (POSIX).
     auto r = yuzu::shared::write_file_atomic(target, content, {.owner_only_mode = false});
     if (!r) {
         spdlog::warn("filesystem: atomic write failed: {}", r.error().message);

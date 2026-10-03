@@ -39,7 +39,8 @@
  * On Windows owner_only_mode has no effect: the DACL is not tightened here
  * (documented follow-up).
  *
- * POSIX call order: write loop -> fchmod(fd) [owner_only_mode] -> fsync(fd)
+ * POSIX call order: [fchmod(fd) carry-over of an existing file's rwx bits, when
+ * !owner_only_mode] -> write loop -> fchmod(fd) [owner_only_mode] -> fsync(fd)
  * (F_FULLFSYNC, then fsync, on macOS) -> close(fd) -> rename -> open/fsync/close
  * of the parent directory (same flush).
  *   - A failed file fsync is an IoError (#4727 decision: fsync adopted on

@@ -249,7 +249,8 @@ bool persist_provisioned_cert(const fs::path& cert_dir, const std::string& key_p
     // PRIVATE key: 0600 from creation, re-asserted on the open fd (no umask window).
     if (!write_atomic(paths.key_path, key_pem, /*owner_only=*/true))
         return false;
-    // PUBLIC artifacts (leaf / chain): default perms (umask) are fine - not secrets.
+    // PUBLIC artifacts (leaf / chain): not secrets, so no owner-only mode (a new file
+    // takes 0666 & ~umask, a replaced one keeps its rwx bits on POSIX).
     if (!write_atomic(paths.cert_path, leaf_pem, /*owner_only=*/false))
         return false;
     if (!ca_chain_pem.empty() && !write_atomic(paths.ca_path, ca_chain_pem, /*owner_only=*/false))
