@@ -268,7 +268,7 @@ counters and the summary line.
 - `yuzu_gw_heartbeat_rejected_total{reason="unknown_session"}` rises by about one per
   agent after a gateway registry restart. Observed: after killing the registry process
   with 4 agents attached the counter rose by 4, and all 4 agents were admitted again
-  within about 25 s (observed with agents 0.14.0-rc6 or newer; an agent older than
+  within about 25 s (observed with agents built from the branch tree, which carries the 0.13.0 recovery; an agent older than
   0.13.0 only logs the rejection and stays rejected until it is restarted). It is also expected to rise around a node failover, but that was
   not observed in testing (multi-node was not tested).
 - `yuzu_gw_heartbeat_rejected_total{reason="no_connection"}` rises when the call, or

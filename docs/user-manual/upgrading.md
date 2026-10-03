@@ -127,7 +127,7 @@ three cases:
   to behave the same way (inferred, not tested).
 
 The registry-restart recovery in about 25 s was observed with agents built from the branch
-(0.14.0-rc6 or newer); an agent older than 0.13.0 was not run through it.
+(version 0.14.0 in the tree, which carries the 0.13.0 recovery); an agent older than 0.13.0 was not run through it.
 
 See [Heartbeat admission](gateway.md#heartbeat-admission) for the supported topologies, counters and
 runbook.
