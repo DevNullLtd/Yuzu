@@ -342,8 +342,12 @@ unbound_registrations_never_admit() ->
     ok = yuzu_gw_registry:register_agent(uid(<<"a6">>), P6, S6, [], <<>>, #{}),
     ?assertEqual(rejected(), beat(conn_a, S5)),
     ?assertEqual(rejected(), beat(conn_a, S6)),
+    %% A call without a connection key never matches a session without one
+    %% either: two missing keys are not "the same connection".
+    ?assertEqual(rejected(), beat(undefined, S5)),
+    ?assertEqual(rejected(), beat(undefined, S6)),
     ?assertEqual(0, queued()),
-    ?assertEqual([reject_event(no_connection), reject_event(no_connection)],
+    ?assertEqual(lists:duplicate(4, reject_event(no_connection)),
                  [{E, M, maps:with([reason], Meta)} || {E, M, Meta} <- events()]),
     exit(P5, kill),
     exit(P6, kill).
