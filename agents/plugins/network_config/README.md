@@ -61,7 +61,7 @@ flowchart LR
 - **`proxy` / macOS** — reports the HTTP proxy and PAC URL, checking the primary network service first and then each scoped per-interface service; HTTPS/SOCKS/FTP proxies are not reported, so a host configured with only those reads as none
 - **`proxy` / Linux** — reads the *_proxy variables from the agent process's own environment only; a system-wide, desktop-session or package-manager proxy the agent did not inherit is not reported
 - **`routes` / Windows** — IPv4 and IPv6; the host's own and broadcast addresses (Protocol Local, full-length prefix) and the multicast prefixes are not reported, connected-subnet routes are; the metric is the route metric alone, without the interface metric
-- **`routes` / macOS** — IPv4 and IPv6; macOS has no route metric or table id, so those fields are '-', and the origin is only the RTF_STATIC/RTF_DYNAMIC bit; entries flagged as neighbour (RTF_LLINFO), cloned, multicast, broadcast or own-address (RTF_LOCAL) are not reported (the limited-broadcast 255.255.255.255/32 route carries none of those flags and is)
+- **`routes` / macOS** — IPv4 and IPv6; macOS has no route metric or table id, so those fields are '-', and the origin is only the RTF_STATIC bit (static, which also covers connected-interface routes), else RTF_DYNAMIC/RTF_MODIFIED (dynamic), else other; entries flagged as neighbour (RTF_LLINFO), cloned, multicast, broadcast or own-address (RTF_LOCAL) are not reported (the limited-broadcast 255.255.255.255/32 route carries none of those flags and is); interface-scoped routes (RTF_IFSCOPE) are listed like any other
 - **`routes` / Linux** — main and custom routing tables, IPv4 and IPv6; the local table, cloned entries and host-local route types are not reported; a multipath route reports its first nexthop only and an `ip nexthop` object route carries no resolved gateway (both flagged in the result status)
 <!-- END GENERATED -->
 
@@ -157,11 +157,11 @@ distinguished from failure by the typed result status).
 | `destination` | string | - | Windows, Linux, macOS | `192.0.2.0` | Destination network address; the default route is 0.0.0.0 or ::. Values: IPv4 or IPv6 literal. |
 | `prefix_len` | int32 | - | Windows, Linux, macOS | `24` | Destination prefix length in bits; 0 is the default route, 32 or 128 a host route. Values: 0-32 (ipv4), 0-128 (ipv6). |
 | `gateway` | string | - | Windows, Linux, macOS | `192.0.2.1` | Next-hop address; '-' when the route is on-link (directly attached). Linux reports 'nhid:<n>' for a route that references an `ip nexthop` object whose gateway is not resolved, and the first nexthop's gateway for a multipath route. Values: IPv4 or IPv6 literal, 'nhid:<n>' (Linux only), or '-'. |
-| `interface` | string | - | Windows, Linux, macOS | `eth0` | Outgoing interface name; '-' when the interface index no longer resolves (or, for a Linux blackhole/unreachable/prohibit/throw route, when the route has none). Values: interface name, or '-'. |
+| `interface` | string | - | Windows, Linux, macOS | `eth0` | Outgoing interface name; '-' when the interface index no longer resolves on Linux and macOS (or, for a Linux blackhole/unreachable/prohibit/throw route or an `ip nexthop` object route, when the route carries none); Windows renders `if<index>` when the alias lookup fails. Values: interface name, `if<index>` (Windows), or '-'. |
 | `metric` | string | - | Windows, Linux, macOS | `100` | Route metric (the Linux priority; the Windows route metric, without the interface metric); '-' on macOS, which has no route metric. Values: decimal integer, or '-' (macOS, always). |
 | `table` | string | - | Windows, Linux, macOS | `main` | Linux routing table; '-' on Windows and macOS, which have a single table. Values: main, default, or a decimal table id (Linux); '-' (Windows, macOS). |
 | `route_type` | string | - | Windows, Linux, macOS | `unicast` | Kind of route. Values: unicast, blackhole, unreachable, prohibit, throw, nat, xresolve, or type<N> for an unknown Linux rtm_type (Linux); unicast, blackhole, reject (macOS); unicast (Windows, always). |
-| `origin` | string | - | Windows, Linux, macOS | `kernel` | Who installed the route. Linux: the rtm_protocol name (kernel, boot, static, dhcp, ra, bgp, ospf, ...) or proto<N>. Windows: the NL_ROUTE_PROTOCOL name (local, netmgmt, dhcp, ...) or proto<N>. macOS: static or dynamic when the kernel set RTF_STATIC/RTF_DYNAMIC, else other (the routing socket carries no protocol field). Values: protocol name, or proto<N>. |
+| `origin` | string | - | Windows, Linux, macOS | `kernel` | Who installed the route. Linux: the rtm_protocol name (kernel, boot, static, dhcp, ra, bgp, ospf, ...) or proto<N>. Windows: the NL_ROUTE_PROTOCOL name (local, netmgmt, dhcp, ...) or proto<N>. macOS: static when the kernel set RTF_STATIC (the kernel sets it on connected-interface routes too, which Linux calls kernel and Windows calls local), dynamic for RTF_DYNAMIC or RTF_MODIFIED, else other (the routing socket carries no protocol field). Values: protocol name, or proto<N>. |
 <!-- END GENERATED -->
 
 **`proxy` — not one row per record.** Each configured value is its own row: `proxy_type|<value>`,
@@ -274,29 +274,29 @@ unavailable table, an unformattable row). No action on any OS ever sets
 ```
 == action=adapters
 adapter|Tailscale|-|100000|up
-adapter|Ethernet|FC:34:97:65:1E:0A|1000|up
-adapter|OpenVPN Data Channel Offload for NordVPN|-|1000|down
-adapter|Local Area Connection|00:FF:C1:08:92:E3|1000|down
-adapter|WiFi|84:1B:77:2B:DC:FC|18446744073709|down
-adapter|Local Area Connection* 1|84:1B:77:2B:DC:FD|18446744073709|down
-adapter|Local Area Connection* 2|86:1B:77:2B:DC:FC|18446744073709|down
-adapter|Bluetooth Network Connection|84:1B:77:2B:DD:00|3|down
-adapter|Ethernet 2|FC:34:97:65:1E:0B|0|down
+adapter|Ethernet|00:00:5e:00:53:01|1000|up
+adapter|VPN Adapter|-|1000|down
+adapter|Local Area Connection|00:00:5e:00:53:02|1000|down
+adapter|WiFi|00:00:5e:00:53:03|18446744073709|down
+adapter|Local Area Connection* 1|00:00:5e:00:53:04|18446744073709|down
+adapter|Local Area Connection* 2|00:00:5e:00:53:05|18446744073709|down
+adapter|Bluetooth Network Connection|00:00:5e:00:53:06|3|down
+adapter|Ethernet 2|00:00:5e:00:53:07|0|down
 [result_status] UNDECLARED / UNKNOWN
 
 == action=ip_addresses
 ip|Tailscale|fd7a:115c:a1e0::77|128|-
-ip|Tailscale|fe80::c5b0:bd45:79bc:bd97|64|-
+ip|Tailscale|fe80::200:5eff:fe00:5381|64|-
 ip|Tailscale|198.51.100.121|32|-
-ip|Ethernet|fe80::d459:2883:492c:f3fc|64|203.0.113.1
+ip|Ethernet|fe80::200:5eff:fe00:5382|64|203.0.113.1
 ip|Ethernet|203.0.113.131|24|203.0.113.1
-ip|OpenVPN Data Channel Offload for NordVPN|fe80::c5b0:bd45:79bc:bd97|64|-
-ip|OpenVPN Data Channel Offload for NordVPN|169.254.133.126|16|-
-ip|Local Area Connection|fe80::669f:e4fb:4130:c7de|64|-
+ip|VPN Adapter|fe80::200:5eff:fe00:5381|64|-
+ip|VPN Adapter|169.254.133.126|16|-
+ip|Local Area Connection|fe80::200:5eff:fe00:5383|64|-
 ip|Local Area Connection|169.254.70.46|16|-
-ip|WiFi|fe80::72f7:7266:9da0:e23c|64|-
+ip|WiFi|fe80::200:5eff:fe00:5384|64|-
 ip|WiFi|169.254.225.27|16|-
-ip|Local Area Connection* 1|fe80::a60d:9224:f8d0:abf7|64|-
+ip|Local Area Connection* 1|fe80::200:5eff:fe00:5385|64|-
 … 12 of 19 rows shown
 [result_status] UNDECLARED / UNKNOWN
 
@@ -304,15 +304,15 @@ ip|Local Area Connection* 1|fe80::a60d:9224:f8d0:abf7|64|-
 dns|Tailscale|fec0:0:0:ffff::1|IPv6
 dns|Tailscale|fec0:0:0:ffff::2|IPv6
 dns|Tailscale|fec0:0:0:ffff::3|IPv6
-dns|Ethernet|194.168.4.100|IPv4
-dns|Ethernet|194.168.8.100|IPv4
-dns|OpenVPN Data Channel Offload for NordVPN|fec0:0:0:ffff::1|IPv6
-dns|OpenVPN Data Channel Offload for NordVPN|fec0:0:0:ffff::2|IPv6
-dns|OpenVPN Data Channel Offload for NordVPN|fec0:0:0:ffff::3|IPv6
+dns|Ethernet|192.0.2.100|IPv4
+dns|Ethernet|192.0.2.101|IPv4
+dns|VPN Adapter|fec0:0:0:ffff::1|IPv6
+dns|VPN Adapter|fec0:0:0:ffff::2|IPv6
+dns|VPN Adapter|fec0:0:0:ffff::3|IPv6
 dns|Local Area Connection|fec0:0:0:ffff::1|IPv6
 dns|Local Area Connection|fec0:0:0:ffff::2|IPv6
 dns|Local Area Connection|fec0:0:0:ffff::3|IPv6
-dns|WiFi|194.168.4.100|IPv4
+dns|WiFi|192.0.2.100|IPv4
 … 12 of 24 rows shown
 [result_status] UNDECLARED / UNKNOWN
 
@@ -328,8 +328,8 @@ dns_cache|not_available|query failed
 arp|Loopback Pseudo-Interface 1|224.0.0.22|-|static
 arp|Loopback Pseudo-Interface 1|224.0.0.252|-|static
 arp|Loopback Pseudo-Interface 1|239.255.255.250|-|static
-arp|OpenVPN Data Channel Offload for NordVPN|224.0.0.22|-|static
-arp|OpenVPN Data Channel Offload for NordVPN|224.0.0.252|-|static
+arp|VPN Adapter|224.0.0.22|-|static
+arp|VPN Adapter|224.0.0.252|-|static
 arp|WiFi|224.0.0.22|01:00:5e:00:00:16|static
 arp|WiFi|224.0.0.252|01:00:5e:00:00:fc|static
 arp|Local Area Connection|224.0.0.22|01:00:5e:00:00:16|static
@@ -337,7 +337,7 @@ arp|Local Area Connection|224.0.0.252|01:00:5e:00:00:fc|static
 arp|Tailscale|100.100.100.100|-|incomplete
 arp|Tailscale|198.51.100.77|-|dynamic
 arp|Tailscale|224.0.0.22|-|static
-… 12 of 100 rows shown
+… 12 of 101 rows shown
 [result_status] UNDECLARED / UNKNOWN
 
 == action=routes
@@ -350,7 +350,7 @@ route|ipv4|127.0.0.0|8|-|Loopback Pseudo-Interface 1|256|-|unicast|local
 route|ipv4|203.0.113.0|24|-|Ethernet|256|-|unicast|local
 route|ipv6|fd7a:115c:a1e0::|48|fd7a:115c:a1e0::53|Tailscale|0|-|unicast|netmgmt
 route|ipv6|fd7a:115c:a1e0::53|128|-|Tailscale|0|-|unicast|netmgmt
-route|ipv6|fe80::|64|-|OpenVPN Data Channel Offload for NordVPN|256|-|unicast|local
+route|ipv6|fe80::|64|-|VPN Adapter|256|-|unicast|local
 route|ipv6|fe80::|64|-|Local Area Connection|256|-|unicast|local
 route|ipv6|fe80::|64|-|Ethernet 2|256|-|unicast|local
 … 12 of 17 rows shown
@@ -377,16 +377,16 @@ adapter|en3|00:00:5e:00:53:09|0|up
 [result_status] UNDECLARED / UNKNOWN
 
 == action=ip_addresses
-ip|en0|fe80::200:5eff:fe00:5301|64|203.0.113.1
+ip|en0|fe80::200:5eff:fe00:5381|64|203.0.113.1
 ip|en0|203.0.113.66|24|203.0.113.1
-ip|llw0|fe80::200:5eff:fe00:5302|64|203.0.113.1
-ip|utun0|fe80::200:5eff:fe00:5303|64|203.0.113.1
-ip|utun1|fe80::200:5eff:fe00:5304|64|203.0.113.1
-ip|utun2|fe80::200:5eff:fe00:5305|64|203.0.113.1
-ip|utun3|fe80::200:5eff:fe00:5306|64|203.0.113.1
-ip|utun4|fe80::200:5eff:fe00:5307|64|203.0.113.1
-ip|utun5|fe80::200:5eff:fe00:5308|64|203.0.113.1
-ip|utun6|fe80::200:5eff:fe00:5309|64|203.0.113.1
+ip|llw0|fe80::200:5eff:fe00:5382|64|203.0.113.1
+ip|utun0|fe80::200:5eff:fe00:5383|64|203.0.113.1
+ip|utun1|fe80::200:5eff:fe00:5384|64|203.0.113.1
+ip|utun2|fe80::200:5eff:fe00:5385|64|203.0.113.1
+ip|utun3|fe80::200:5eff:fe00:5386|64|203.0.113.1
+ip|utun4|fe80::200:5eff:fe00:5387|64|203.0.113.1
+ip|utun5|fe80::200:5eff:fe00:5388|64|203.0.113.1
+ip|utun6|fe80::200:5eff:fe00:5389|64|203.0.113.1
 ip|utun6|198.51.100.77|32|203.0.113.1
 ip|utun6|fd7a:115c:a1e0::e032:b14f|48|203.0.113.1
 [result_status] UNDECLARED / UNKNOWN
@@ -394,8 +394,8 @@ ip|utun6|fd7a:115c:a1e0::e032:b14f|48|203.0.113.1
 == action=dns_servers
 dns|system|100.100.100.100|IPv4
 dns|system|fd7a:115c:a1e0::53|IPv6
-dns|system|194.168.4.100|IPv4
-dns|system|194.168.8.100|IPv4
+dns|system|192.0.2.100|IPv4
+dns|system|192.0.2.101|IPv4
 [result_status] UNDECLARED / UNKNOWN
 
 == action=proxy
@@ -410,17 +410,17 @@ dns_cache|unsupported|macOS does not expose DNS resolver cache contents
 == action=arp
 arp|-|203.0.113.1|00:00:5e:00:53:0e|-
 arp|-|203.0.113.30|00:00:5e:00:53:0f|-
-arp|-|203.0.113.61|00:00:5e:00:53:10|-
+arp|-|203.0.113.60|00:00:5e:00:53:10|-
+arp|-|203.0.113.61|00:00:5e:00:53:11|-
 arp|-|203.0.113.66|00:00:5e:00:53:04|-
-arp|-|203.0.113.71|00:00:5e:00:53:11|-
-arp|-|203.0.113.131|00:00:5e:00:53:12|-
-arp|-|203.0.113.140|00:00:5e:00:53:13|-
-arp|-|203.0.113.197|00:00:5e:00:53:14|-
-arp|-|203.0.113.210|00:00:5e:00:53:15|-
-arp|-|203.0.113.238|00:00:5e:00:53:16|-
-arp|-|203.0.113.246|00:00:5e:00:53:17|-
-arp|-|203.0.113.255|ff:ff:ff:ff:ff:ff|-
-… 12 of 14 rows shown
+arp|-|203.0.113.71|00:00:5e:00:53:12|-
+arp|-|203.0.113.131|00:00:5e:00:53:13|-
+arp|-|203.0.113.140|00:00:5e:00:53:14|-
+arp|-|203.0.113.197|00:00:5e:00:53:15|-
+arp|-|203.0.113.210|00:00:5e:00:53:16|-
+arp|-|203.0.113.237|00:00:5e:00:53:17|-
+arp|-|203.0.113.238|00:00:5e:00:53:18|-
+… 12 of 16 rows shown
 [result_status] UNDECLARED / UNKNOWN
 
 == action=routes
@@ -453,7 +453,7 @@ adapter|ip6_vti0|-|0|down
 adapter|sit0|-|0|down
 adapter|ip6tnl0|-|0|down
 adapter|ip6gre0|-|0|down
-adapter|eth0|a6:a7:66:e2:7d:f6|10000|up
+adapter|eth0|00:00:5e:00:53:01|10000|up
 [result_status] UNDECLARED / UNKNOWN
 
 == action=ip_addresses

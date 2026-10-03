@@ -12,7 +12,7 @@ status: REAL CAPTURE. Routes were created in the container with iproute2 6.1.0 b
           ip route add 10.88.0.0/16 via inet6 fd00:77::9 dev dummy0       (RTA_VIA)
           ip -6 route add 2001:db8:1::/48 via fd00:77::1 dev dummy0 metric 100 ; ip -6 route add default via fd00:77::1 dev dummy0
         The dump also holds the kernel's own table-255 (local) routes: 7 IPv4, 4 IPv6 (two local/anycast host routes per address, broadcast routes, ::1, and ff00::/8 multicast), which the decoder must skip.
-        The addresses are RFC 5737 / RFC 3849 / RFC 4193 documentation and private ranges plus the container's own 172.17.0.0/16 bridge; nothing here identifies a real host.
+        The addresses are RFC 5737 / RFC 3849 / RFC 4193 documentation and private ranges plus the container's own 172.17.0.0/16 bridge. The one other identifier in the capture, the fe80:: address of dummy0 (a random EUI-64 the kernel gave a throwaway interface created for the capture), names no real host.
 expected: 16 rows after filtering (12 IPv4: 2 in table 100, 10 in main; 4 IPv6, all main); 27 route messages total (19 IPv4, 8 IPv6) in the dump before filtering.
 ----- ground truth: iproute2's own rendering of the same table state, captured immediately before the dump -----
 # uname -r: 7.0.12-linuxkit

@@ -9,7 +9,7 @@ adapter|ip6_vti0|-|0|down
 adapter|sit0|-|0|down
 adapter|ip6tnl0|-|0|down
 adapter|ip6gre0|-|0|down
-adapter|eth0|a6:a7:66:e2:7d:f6|10000|up
+adapter|eth0|00:00:5e:00:53:01|10000|up
 [result_status] UNDECLARED / UNKNOWN /
 
 == action=ip_addresses

@@ -28,16 +28,16 @@ adapter|utun6|-|0|up
 [result_status] UNDECLARED / UNKNOWN /
 
 == action=ip_addresses
-ip|en0|fe80::200:5eff:fe00:5301|64|203.0.113.1
+ip|en0|fe80::200:5eff:fe00:5381|64|203.0.113.1
 ip|en0|203.0.113.66|24|203.0.113.1
-ip|llw0|fe80::200:5eff:fe00:5302|64|203.0.113.1
-ip|utun0|fe80::200:5eff:fe00:5303|64|203.0.113.1
-ip|utun1|fe80::200:5eff:fe00:5304|64|203.0.113.1
-ip|utun2|fe80::200:5eff:fe00:5305|64|203.0.113.1
-ip|utun3|fe80::200:5eff:fe00:5306|64|203.0.113.1
-ip|utun4|fe80::200:5eff:fe00:5307|64|203.0.113.1
-ip|utun5|fe80::200:5eff:fe00:5308|64|203.0.113.1
-ip|utun6|fe80::200:5eff:fe00:5309|64|203.0.113.1
+ip|llw0|fe80::200:5eff:fe00:5382|64|203.0.113.1
+ip|utun0|fe80::200:5eff:fe00:5383|64|203.0.113.1
+ip|utun1|fe80::200:5eff:fe00:5384|64|203.0.113.1
+ip|utun2|fe80::200:5eff:fe00:5385|64|203.0.113.1
+ip|utun3|fe80::200:5eff:fe00:5386|64|203.0.113.1
+ip|utun4|fe80::200:5eff:fe00:5387|64|203.0.113.1
+ip|utun5|fe80::200:5eff:fe00:5388|64|203.0.113.1
+ip|utun6|fe80::200:5eff:fe00:5389|64|203.0.113.1
 ip|utun6|198.51.100.77|32|203.0.113.1
 ip|utun6|fd7a:115c:a1e0::e032:b14f|48|203.0.113.1
 [result_status] UNDECLARED / UNKNOWN /
@@ -45,8 +45,8 @@ ip|utun6|fd7a:115c:a1e0::e032:b14f|48|203.0.113.1
 == action=dns_servers
 dns|system|100.100.100.100|IPv4
 dns|system|fd7a:115c:a1e0::53|IPv6
-dns|system|194.168.4.100|IPv4
-dns|system|194.168.8.100|IPv4
+dns|system|192.0.2.100|IPv4
+dns|system|192.0.2.101|IPv4
 [result_status] UNDECLARED / UNKNOWN /
 
 == action=proxy
@@ -61,15 +61,17 @@ dns_cache|unsupported|macOS does not expose DNS resolver cache contents
 == action=arp
 arp|-|203.0.113.1|00:00:5e:00:53:0e|-
 arp|-|203.0.113.30|00:00:5e:00:53:0f|-
-arp|-|203.0.113.61|00:00:5e:00:53:10|-
+arp|-|203.0.113.60|00:00:5e:00:53:10|-
+arp|-|203.0.113.61|00:00:5e:00:53:11|-
 arp|-|203.0.113.66|00:00:5e:00:53:04|-
-arp|-|203.0.113.71|00:00:5e:00:53:11|-
-arp|-|203.0.113.131|00:00:5e:00:53:12|-
-arp|-|203.0.113.140|00:00:5e:00:53:13|-
-arp|-|203.0.113.197|00:00:5e:00:53:14|-
-arp|-|203.0.113.210|00:00:5e:00:53:15|-
-arp|-|203.0.113.238|00:00:5e:00:53:16|-
-arp|-|203.0.113.246|00:00:5e:00:53:17|-
+arp|-|203.0.113.71|00:00:5e:00:53:12|-
+arp|-|203.0.113.131|00:00:5e:00:53:13|-
+arp|-|203.0.113.140|00:00:5e:00:53:14|-
+arp|-|203.0.113.197|00:00:5e:00:53:15|-
+arp|-|203.0.113.210|00:00:5e:00:53:16|-
+arp|-|203.0.113.237|00:00:5e:00:53:17|-
+arp|-|203.0.113.238|00:00:5e:00:53:18|-
+arp|-|203.0.113.246|00:00:5e:00:53:19|-
 arp|-|203.0.113.255|ff:ff:ff:ff:ff:ff|-
 arp|-|224.0.0.251|01:00:5e:00:00:fb|-
 arp|-|239.255.255.250|01:00:5e:7f:ff:fa|-
@@ -94,16 +96,16 @@ route|ipv6|::|0|fe80::|utun3|-|-|unicast|other
 route|ipv6|::|0|fe80::|utun4|-|-|unicast|other
 route|ipv6|::|0|fe80::|utun5|-|-|unicast|other
 route|ipv6|::|0|fd7a:115c:a1e0::|utun6|-|-|unicast|other
-route|ipv6|fd7a:115c:a1e0::|48|fe80::200:5eff:fe00:5309|utun6|-|-|unicast|other
+route|ipv6|fd7a:115c:a1e0::|48|fe80::200:5eff:fe00:5389|utun6|-|-|unicast|other
 route|ipv6|fd7a:115c:a1e0::53|128|-|utun6|-|-|unicast|static
 route|ipv6|fe80::|64|fe80::1|lo0|-|-|unicast|other
 route|ipv6|fe80::|64|-|en0|-|-|unicast|other
-route|ipv6|fe80::|64|fe80::200:5eff:fe00:5303|utun0|-|-|unicast|other
-route|ipv6|fe80::|64|fe80::200:5eff:fe00:5304|utun1|-|-|unicast|other
-route|ipv6|fe80::|64|fe80::200:5eff:fe00:5305|utun2|-|-|unicast|other
-route|ipv6|fe80::|64|fe80::200:5eff:fe00:5306|utun3|-|-|unicast|other
-route|ipv6|fe80::|64|fe80::200:5eff:fe00:5307|utun4|-|-|unicast|other
-route|ipv6|fe80::|64|fe80::200:5eff:fe00:5308|utun5|-|-|unicast|other
-route|ipv6|fe80::|64|fe80::200:5eff:fe00:5309|utun6|-|-|unicast|other
+route|ipv6|fe80::|64|fe80::200:5eff:fe00:5383|utun0|-|-|unicast|other
+route|ipv6|fe80::|64|fe80::200:5eff:fe00:5384|utun1|-|-|unicast|other
+route|ipv6|fe80::|64|fe80::200:5eff:fe00:5385|utun2|-|-|unicast|other
+route|ipv6|fe80::|64|fe80::200:5eff:fe00:5386|utun3|-|-|unicast|other
+route|ipv6|fe80::|64|fe80::200:5eff:fe00:5387|utun4|-|-|unicast|other
+route|ipv6|fe80::|64|fe80::200:5eff:fe00:5388|utun5|-|-|unicast|other
+route|ipv6|fe80::|64|fe80::200:5eff:fe00:5389|utun6|-|-|unicast|other
 [result_status] OK / FULL /
 
