@@ -200,10 +200,10 @@ only when heartbeats are rejected, which happens in four cases: a topology that 
 the one-connection assumption, a gateway running without the session index, a
 gateway registry process restart or crash while agent connections stay up (the registry
 recreates its tables empty, so every heartbeat for the agents it held is rejected until
-they re-register), and, for released agents, a gateway process restart (observed in two
-graceful SIGTERM runs: the released agents tested did not notice the lost `Subscribe`
-stream and got `NOT_FOUND` on the new gateway, rc6 and v0.13.0 then wedged, and the
-branch agent re-registered in 11 to 12 s with no rejections; see Connection drain). A
+they re-register), and, for released agents, a gateway process restart (observed in a graceful SIGTERM run with rc6, v0.13.0 and v0.12.0 together: the released agents did not
+notice the lost `Subscribe` stream and got `NOT_FOUND` on the new gateway, rc6 and v0.13.0 then wedged;
+in the earlier run v0.12.0 was rejected and v0.13.0 was already wedged from the registry kills; the
+branch agent re-registered in 11 to 12 s with no rejections both times; see Connection drain). A
 node failover that leaves the session not held by the surviving node is expected to
 behave the same way (inferred, not tested).
 
@@ -250,7 +250,7 @@ the counters and the gateway summary log line, not from the agent log.
 sends `GOAWAY`, so a `Subscribe` stream and its binding end with the connection;
 there is no drain period. A heartbeat that reaches the gateway on a different
 connection while the old `Subscribe` is still bound is rejected (`NOT_FOUND`,
-connection mismatch), and the agent recovers by re-registering. This is what the
+connection mismatch), and an agent with the reconnect fix recovers by re-registering. This is what the
 gateway's own tests observed with a test HTTP/2 client. With the real C++ agent (a build
 from the branch tree) a graceful `GOAWAY` injected by the tester on the gateway-side
 connection (the gateway itself did not send one) moved the agent's next heartbeat to a
@@ -258,7 +258,7 @@ new connection: the mismatch counter rose by one, the agent logged `(#1894)` and
 re-registered 16 s after the `GOAWAY`, and acked heartbeats resumed about 30 s later. An
 abrupt close of just that agent's connection made it re-register in 9 s with the
 counters unchanged. A graceful gateway SIGTERM and restart (observed twice) showed the
-branch agent reconnecting in about 11 to 12 s with no rejections; the released agents
+branch agent reconnecting in about 11 to 12 s with no rejections; in the second run the released agents
 tested (v0.14.0-rc6, v0.13.0, v0.12.0, default settings) did not notice the lost
 `Subscribe` stream across that restart, their heartbeats got `NOT_FOUND`, and rc6 and
 v0.13.0 then wedged as described above (restart them). A `GOAWAY` originating from the
@@ -304,7 +304,7 @@ counters and the summary line.
   within about 25 s (a four-agent run; observed with agents built from the branch tree,
   which includes the #2182 fix). Over four later registry kills with one branch agent,
   that agent was admitted again 17 to 37 s after each kill. The released v0.13.0
-  and v0.14.0-rc6 agents wedge with default settings and v0.12.0 and older only log the
+  and v0.14.0-rc6 agents wedge with default settings and v0.12.0 only logs the
   rejection (see Heartbeat admission above); restart such an agent. It is also expected
   to rise around a node failover, but that was not observed in testing (multi-node was
   not tested).
