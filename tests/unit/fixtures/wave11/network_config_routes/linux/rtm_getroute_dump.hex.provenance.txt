@@ -20,27 +20,27 @@ expected: 16 rows after filtering (12 IPv4: 2 in table 100, 10 in main; 4 IPv6, 
 # dummy0 ifindex: 12
 # lo ifindex: 1
 # ---- ip -d -4 route show table all
-unicast default via 10.77.0.1 dev dummy0 table 100 proto boot scope global 
-throw 203.0.113.192/26 table 100 proto boot scope global 
-unicast default via 172.17.0.1 dev eth0 table main proto boot scope global 
-unicast 10.77.0.0/24 dev dummy0 table main proto kernel scope link src 10.77.0.2 
-unicast 10.88.0.0/16 via inet6 fd00:77::9 dev dummy0 table main proto boot scope global 
-unicast 172.16.0.0/16 table main proto boot scope global 
-	nexthop via 10.77.0.1 dev dummy0 weight 1 
-	nexthop via 10.77.0.3 dev dummy0 weight 1 
-unicast 172.17.0.0/16 dev eth0 table main proto kernel scope link src 172.17.0.3 
-unicast 192.0.2.0/24 via 10.77.0.1 dev dummy0 table main proto static scope global metric 50 
-unicast 198.51.100.0/24 dev dummy0 table main proto boot scope link 
-blackhole 203.0.113.0/26 table main proto boot scope global 
-unreachable 203.0.113.64/26 table main proto boot scope global 
-prohibit 203.0.113.128/26 table main proto boot scope global 
-local 10.77.0.2 dev dummy0 table local proto kernel scope host src 10.77.0.2 
-broadcast 10.77.0.255 dev dummy0 table local proto kernel scope link src 10.77.0.2 
-local 127.0.0.0/8 dev lo table local proto kernel scope host src 127.0.0.1 
-local 127.0.0.1 dev lo table local proto kernel scope host src 127.0.0.1 
-broadcast 127.255.255.255 dev lo table local proto kernel scope link src 127.0.0.1 
-local 172.17.0.3 dev eth0 table local proto kernel scope host src 172.17.0.3 
-broadcast 172.17.255.255 dev eth0 table local proto kernel scope link src 172.17.0.3 
+unicast default via 10.77.0.1 dev dummy0 table 100 proto boot scope global
+throw 203.0.113.192/26 table 100 proto boot scope global
+unicast default via 172.17.0.1 dev eth0 table main proto boot scope global
+unicast 10.77.0.0/24 dev dummy0 table main proto kernel scope link src 10.77.0.2
+unicast 10.88.0.0/16 via inet6 fd00:77::9 dev dummy0 table main proto boot scope global
+unicast 172.16.0.0/16 table main proto boot scope global
+	nexthop via 10.77.0.1 dev dummy0 weight 1
+	nexthop via 10.77.0.3 dev dummy0 weight 1
+unicast 172.17.0.0/16 dev eth0 table main proto kernel scope link src 172.17.0.3
+unicast 192.0.2.0/24 via 10.77.0.1 dev dummy0 table main proto static scope global metric 50
+unicast 198.51.100.0/24 dev dummy0 table main proto boot scope link
+blackhole 203.0.113.0/26 table main proto boot scope global
+unreachable 203.0.113.64/26 table main proto boot scope global
+prohibit 203.0.113.128/26 table main proto boot scope global
+local 10.77.0.2 dev dummy0 table local proto kernel scope host src 10.77.0.2
+broadcast 10.77.0.255 dev dummy0 table local proto kernel scope link src 10.77.0.2
+local 127.0.0.0/8 dev lo table local proto kernel scope host src 127.0.0.1
+local 127.0.0.1 dev lo table local proto kernel scope host src 127.0.0.1
+broadcast 127.255.255.255 dev lo table local proto kernel scope link src 127.0.0.1
+local 172.17.0.3 dev eth0 table local proto kernel scope host src 172.17.0.3
+broadcast 172.17.255.255 dev eth0 table local proto kernel scope link src 172.17.0.3
 # ---- ip -d -6 route show table all
 unicast 2001:db8:1::/48 via fd00:77::1 dev dummy0 table main proto boot scope global metric 100 pref medium
 unicast fd00:77::/64 dev dummy0 table main proto kernel scope global metric 256 pref medium

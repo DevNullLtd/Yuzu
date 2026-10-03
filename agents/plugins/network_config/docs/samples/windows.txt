@@ -9,7 +9,7 @@ adapter|Local Area Connection* 1|84:1B:77:2B:DC:FD|18446744073709|down
 adapter|Local Area Connection* 2|86:1B:77:2B:DC:FC|18446744073709|down
 adapter|Bluetooth Network Connection|84:1B:77:2B:DD:00|3|down
 adapter|Ethernet 2|FC:34:97:65:1E:0B|0|down
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN /
 
 == action=ip_addresses
 ip|Tailscale|fd7a:115c:a1e0::77|128|-
@@ -31,7 +31,7 @@ ip|Bluetooth Network Connection|fe80::4551:9b1a:5ad9:83a|64|-
 ip|Bluetooth Network Connection|169.254.75.142|16|-
 ip|Ethernet 2|fe80::24d2:a5ae:f55b:9132|64|-
 ip|Ethernet 2|169.254.54.245|16|-
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN /
 
 == action=dns_servers
 dns|Tailscale|fec0:0:0:ffff::1|IPv6
@@ -58,15 +58,15 @@ dns|Bluetooth Network Connection|fec0:0:0:ffff::2|IPv6
 dns|Bluetooth Network Connection|fec0:0:0:ffff::3|IPv6
 dns|Ethernet 2|194.168.4.100|IPv4
 dns|Ethernet 2|194.168.8.100|IPv4
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN /
 
 == action=proxy
 proxy_type|auto_detect
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN /
 
 == action=dns_cache
 dns_cache|not_available|query failed
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN /
 
 == action=arp
 arp|Loopback Pseudo-Interface 1|224.0.0.22|-|static
@@ -169,7 +169,7 @@ arp|Ethernet 2|ff02::1:2|33:33:00:01:00:02|static
 arp|Ethernet 2|ff02::1:3|33:33:00:01:00:03|static
 arp|Ethernet 2|ff02::c:c|33:33:00:0c:00:0c|static
 arp|Ethernet 2|ff05::c0c|33:33:00:00:0c:0c|static
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN /
 
 == action=routes
 route|ipv4|0.0.0.0|0|203.0.113.1|Ethernet|0|-|unicast|netmgmt
@@ -189,5 +189,5 @@ route|ipv6|fe80::|64|-|Bluetooth Network Connection|256|-|unicast|local
 route|ipv6|fe80::|64|-|WiFi|256|-|unicast|local
 route|ipv6|fe80::|64|-|Local Area Connection* 1|256|-|unicast|local
 route|ipv6|fe80::|64|-|Local Area Connection* 2|256|-|unicast|local
-[result_status] OK / FULL / 
+[result_status] OK / FULL /
 
