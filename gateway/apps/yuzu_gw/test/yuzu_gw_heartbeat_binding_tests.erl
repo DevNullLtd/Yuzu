@@ -59,6 +59,8 @@ binding_test_() ->
        fun replacement_binding/0},
       {"cleanup of a superseded process leaves the newer session bound",
        fun superseded_cleanup_is_fenced/0},
+      {"cleanup by a process that does not own the session leaves it indexed",
+       fun non_owner_cleanup_keeps_session/0},
       {"cleanup of the owning process removes exactly its own session",
        fun owner_cleanup_removes_row/0},
       {"legacy deregister_agent/1 also removes the session row",
@@ -308,6 +310,20 @@ superseded_cleanup_is_fenced() ->
     exit(P1, kill),
     exit(P2, kill).
 
+%% The index entry is removed only when it belongs to the calling pid: a
+%% second live process naming the same session id must not unindex it.
+non_owner_cleanup_keeps_session() ->
+    A = uid(<<"a">>),
+    S = uid(<<"s">>),
+    P = bind(A, S, conn_a),
+    Other = holder(),
+    ok = yuzu_gw_registry:deregister_agent(uid(<<"other">>), Other, S),
+    sync_registry(),
+    ?assertMatch({ok, #{pid := P}}, yuzu_gw_registry:lookup_session(S)),
+    ?assertMatch({ok, _, _}, beat(conn_a, S)),
+    exit(Other, kill),
+    exit(P, kill).
+
 owner_cleanup_removes_row() ->
     A = uid(<<"a">>),
     S = uid(<<"s">>),
@@ -524,9 +540,9 @@ register_records_conn_key() ->
 rejection_log_is_rate_limited_and_id_free() ->
     yuzu_gw_heartbeat_admission:reset_summary_state(),
     Ids = [uid(<<"rej">>) || _ <- lists:seq(1, 5)],
-    Lines = capture_logs(fun() ->
+    Lines = rejection_lines(capture_logs(fun() ->
         lists:foreach(fun(Id) -> beat(conn_a, Id) end, Ids)
-    end),
+    end)),
     %% Five rejections inside one interval produce exactly one summary line.
     ?assertEqual(1, length(Lines)),
     [Line] = Lines,
@@ -544,7 +560,7 @@ rejection_storm_is_counted_and_logs_once() ->
     N = 500,
     Ctx = ctx_with(conn_a),
     flush(),
-    Lines = capture_logs(fun() ->
+    Lines = rejection_lines(capture_logs(fun() ->
         Self = self(),
         Workers = [spawn_link(fun() ->
                        receive go -> ok end,
@@ -555,7 +571,7 @@ rejection_storm_is_counted_and_logs_once() ->
         Results = [receive {admitted, W, R} -> R after 10000 -> timeout end
                    || W <- Workers],
         ?assertEqual(lists:duplicate(N, rejected), Results)
-    end),
+    end)),
     Counted = [R || {[yuzu, gw, heartbeat, rejected], #{count := 1}, #{reason := R}}
                         <- events()],
     ?assertEqual(lists:duplicate(N, unknown_session), Counted),
@@ -694,6 +710,12 @@ capture_logs(Fun) ->
         logger:remove_handler(?LOG_HANDLER),
         logger:set_primary_config(level, Prev)
     end.
+
+%% The capturing handler is VM-wide, so keep only the rejection summary lines:
+%% an unrelated info log must not change a count.
+rejection_lines(Lines) ->
+    [L || L <- Lines,
+          binary:match(L, <<"Heartbeat admission rejected">>) =/= nomatch].
 
 collect_logs(Acc) ->
     receive {captured_log, Text} -> collect_logs([Text | Acc])
