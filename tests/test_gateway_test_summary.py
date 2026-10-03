@@ -16,6 +16,7 @@ cannot silently come back:
 Hermetic: parses sources and runs only the parser CLI under sys.executable
 (no rebar3, no network, no shared paths).
 """
+import ast
 import glob
 import json
 import os
@@ -236,12 +237,26 @@ class WrapperWiring(unittest.TestCase):
         self.assertTrue(suites, f'no *_SUITE.erl under {CT_DIR}')
 
     def test_every_exit_goes_through_the_guard(self):
-        src = _read(WRAPPER)
-        exits = re.findall(r'^\s*sys\.exit\((.*)\)\s*$', src, re.M)
+        # An AST walk, not a line regex: a call split over several lines
+        # (or written `exit(...)` / `os._exit(...)`) must still be judged.
+        tree = ast.parse(_read(WRAPPER))
+
+        def is_exit(node):
+            f = node.func
+            if isinstance(f, ast.Name):
+                return f.id in ('exit', 'quit')
+            return (isinstance(f, ast.Attribute) and isinstance(f.value, ast.Name)
+                    and (f.value.id, f.attr) in (('sys', 'exit'), ('os', '_exit')))
+
+        exits = [n for n in ast.walk(tree) if isinstance(n, ast.Call) and is_exit(n)]
         self.assertTrue(exits)
-        for e in exits:
-            with self.subTest(exit=e):
-                self.assertIn('_require_tests_executed(', e)
+        for node in exits:
+            with self.subTest(line=node.lineno):
+                guarded = any(
+                    isinstance(c, ast.Call) and isinstance(c.func, ast.Name)
+                    and c.func.id == '_require_tests_executed'
+                    for arg in node.args for c in ast.walk(arg))
+                self.assertTrue(guarded, f'exit at line {node.lineno} bypasses the guard')
 
     def test_deadline_is_below_meson_timeout(self):
         m = re.search(r'_SUITE_DEADLINE_SECS = \{(.*?)\}', _read(WRAPPER), re.S)
