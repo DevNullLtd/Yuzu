@@ -74,9 +74,10 @@ bool contains_line(const std::vector<std::string>& lines, const std::string& nee
 // coreutils 0.10.0, which writes in 1 MiB units (0.8.0 wrote 16 KiB, per
 // #5298), so tests that assumed a small yes write size went red. awk is
 // already this file's flood generator, is POSIX, and its `print "x"` always
-// emits exactly "x\n"; the loop has no exit, so only the runner's kill or the
-// cap ends it, whatever block size the awk implementation buffers its pipe
-// writes in.
+// emits exactly "x\n"; the loop has no exit, so it ends only when the runner
+// kills it (at the deadline, or at the stop_after_max_lines latch).
+// output_cap_bytes is a capture bound and never kills the child. None of this
+// depends on the block size the awk implementation buffers its pipe writes in.
 std::vector<std::string> endless_short_line_flood_argv() {
     return {"/usr/bin/awk", "BEGIN{while(1)print \"x\"}"};
 }
@@ -130,6 +131,10 @@ TEST_CASE("run_bounded_subprocess: the output_cap byte budget bounds result.line
     SubprocessResult result = run_bounded_subprocess(
         endless_short_line_flood_argv(),
         SubprocessOptions{.deadline = 300ms, .max_lines = 1000, .output_cap_bytes = 32});
+    // Upper bounds alone pass vacuously for a child that emits nothing (a
+    // missing awk, an early exit), so also require that the flood arrived.
+    CHECK(!result.lines.empty());
+    CHECK(result.output_truncated);
     CHECK(result.lines.size() <= 16);
     CHECK(result.lines.size() < 1000);
 }
@@ -665,9 +670,10 @@ TEST_CASE("run_bounded_subprocess bounds result.lines by the same cap as result.
     // output blob cap on result.lines too: line materialization iterated
     // over the WHOLE read rather than just the `take` prefix admitted into
     // result.output, so lines could accumulate far past what 1MB of source
-    // text implies (observed against `yes x`, since replaced here by awk:
-    // lines=928256 while output=1000000). This drives a real child past the cap and asserts
-    // both are bounded together.
+    // text implies (the pre-fix defect was observed in a one-off run against
+    // `yes x` as lines=928256 while output=1000000; this test itself uses
+    // awk). This drives a real child past the cap and asserts both are
+    // bounded together.
     SubprocessResult result = run_bounded_subprocess(
         {"/usr/bin/awk", "BEGIN{for(i=0;i<600000;++i)print \"x\"}"},
         SubprocessOptions{.deadline = 10000ms});
@@ -701,10 +707,11 @@ TEST_CASE("run_bounded_subprocess with stop_after_max_lines cleanly stops at exa
     REQUIRE(result.lines.size() == kLines);
     CHECK(result.lines[0] == "x");
     // A clean bounded stop is signalled by termination_reason == line_limit,
-    // NOT by a fabricated exit_code. The runner SIGKILLs the flood child to stop it, so
-    // exit_code stays the honest -1 sentinel (the removed pre-ADR-3002 fixup
-    // used to synthesize 0 here -- exactly the dishonesty the sentinel fix
-    // eliminates; see subprocess_runner.hpp stop_after_max_lines contract).
+    // NOT by a fabricated exit_code. The runner SIGKILLs the flood child to
+    // stop it, so exit_code stays the honest -1 sentinel (the removed
+    // pre-ADR-3002 fixup used to synthesize 0 here -- exactly the dishonesty
+    // the sentinel fix eliminates; see subprocess_runner.hpp
+    // stop_after_max_lines contract).
     CHECK(result.termination_reason == TerminationReason::line_limit);
     CHECK(result.exit_code == -1);
 }
