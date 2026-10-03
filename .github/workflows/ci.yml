@@ -1831,6 +1831,10 @@ jobs:
           export YUZU_TEST_PROGRESS_FILE="$GITHUB_WORKSPACE/build-windows-${{ matrix.build_type }}/meson-logs/progress.log"
           mkdir -p "$(dirname "$YUZU_TEST_PROGRESS_FILE")"
           rm -f "$YUZU_TEST_PROGRESS_FILE"
+          # #4666/#5025: clear any pid-suffixed MI-1b topology report left over from a
+          # prior run in this reused (clean:false) build dir, so the "Surface MI-1b..."
+          # step below can't present a stale previous run's verdict as this run's own.
+          rm -f "build-windows-${{ matrix.build_type }}/log_handoff_multi_image_topology."*.txt
           # Single-sourced: the guard and the real invocation must select the
           # SAME suites, or the guard certifies a list the real run doesn't
           # actually use (sre Gate 6 finding, governance 2026-08-28) — a
@@ -1938,19 +1942,28 @@ jobs:
       # in the build root — nobody had ever read that file from a CI run before this.
       # always(): the verdict is produced on every green run too, not only failures,
       # and this is the leg that only ever uploads on failure/cancel. Cheap (step-
-      # summary text, no artifact storage). Wee Tam is self-hosted and can reuse a
-      # build dir across runs, so an OLDER pid-suffixed report can still be sitting
-      # here from a previous run — `ls -t` picks only the newest by mtime rather than
-      # cat-ing every match, which is a heuristic (a same-second re-run could tie), not
-      # a hard guarantee; see docs/spark-rebuild-baselines/4666-mi1b-windows-registry-verdict.md
-      # for the measured verdict and the plan's own note on this gap.
+      # summary text, no artifact storage), purely informational — continue-on-error
+      # so a transient read/write glitch on this reporting step never reddens the
+      # required Windows job over something that gates nothing.
+      #
+      # The "Test (non-pg suites)" step above clears any same-build-dir leftover
+      # report before running, which closes the common stale-previous-run case. Wee
+      # Tam's 4 runner agents share one per-repo workspace with this job (see
+      # cache-prune.yml's own comment on why `clean: false` is load-bearing there), so
+      # two truly concurrent same-build-type Windows runs could in principle still
+      # collide on this namespace between one run's clear and its own report write;
+      # `ls -t` then picks whichever file is newest, which could be the OTHER run's.
+      # Accepted residual risk (display-only, nothing downstream gates on this
+      # summary) — see docs/spark-rebuild-baselines/4666-mi1b-windows-registry-verdict.md
+      # for the measured verdict this step exists to surface.
       - name: Surface MI-1b Windows spdlog-registry verdict
         if: always()
+        continue-on-error: true
         run: |
           shopt -s nullglob
           files=(build-windows-${{ matrix.build_type }}/log_handoff_multi_image_topology.*.txt)
           if [ ${#files[@]} -eq 0 ]; then
-            echo "MI-1b: no topology report found (agent shard C may not have run)." >> "$GITHUB_STEP_SUMMARY"
+            echo "MI-1b: no topology report found (the test case may not have run)." >> "$GITHUB_STEP_SUMMARY"
           else
             newest="$(ls -t "${files[@]}" | head -1)"
             echo "### MI-1b Windows spdlog-registry verdict ($(basename "$newest"))" >> "$GITHUB_STEP_SUMMARY"

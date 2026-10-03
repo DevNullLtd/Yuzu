@@ -1939,8 +1939,9 @@ adjudicated ACCEPT-WITH-PRECONDITION: the live legacy path and the dormant Spark
 MEDIUM for the #4606 diff, and a flip PR still carrying synchronous writes derives HIGH and is
 BLOCKING. This precondition is tracked in #4666.
 
-**Status update (2026-09-25): #4666 PR-1 and PR-2 have landed; the precondition above is
-substantially addressed, with one residual gap flagged, not fully closed.** PR-1
+**Status update (2026-09-25, Windows since measured — see the 2026-10-03 entry below): #4666
+PR-1 and PR-2 have landed; the precondition above is substantially addressed, with one
+residual gap flagged, not fully closed.** PR-1
 (`agents/core/src/log_handoff.hpp/.cpp`, merged as #4970) built the bounded async log
 hand-off primitive standalone, wired into nothing yet. PR-2 (`main.cpp`/`service_win.cpp`,
 this doc's own #4666 references above) installs that primitive as the process's spdlog
@@ -1956,7 +1957,8 @@ same `--suite agent` binary — so its MI-1b topology verdict is written (Catch2
 a report file) on every Windows run; that output has simply not yet been pulled from a
 CI log and reviewed to turn it into a confirmed finding, which is different from "no
 Windows evidence exists." Absent that review, Windows single-registry status is still
-only inferred from dynamic spdlog linkage, not confirmed. See `docs/darwin-compat.md`'s
+only inferred from dynamic spdlog linkage, not confirmed **[Windows since measured — see
+the 2026-10-03 entry below]**. See `docs/darwin-compat.md`'s
 "spdlog registry identity across images" row for the macOS result, now measured: TWO
 separate registries there, with
 the exe-image swap load-bearing on the teardown side only (install-side logging already
@@ -2001,9 +2003,10 @@ this PR-4 update, all five lines the 2026-09-20 precondition named (`T_detect`, 
 paths, the Spark runtime's own arm-committed/late-arm/sweep-residue lines, and `T_server`) are
 non-blocking — but this precondition does NOT close on that basis alone: the 2026-09-25 entry's
 own residual, the unreviewed Windows MI-1b CI verdict on the agent-side registry-topology claim
-(still only *inferred*, not *confirmed*, per that entry — see above), is untouched by this
-server-side-only PR and remains open. This precondition closes once that Windows review lands
-(or the residual is otherwise explicitly discharged), in addition to PR-4 merging. The rest of
+(still only *inferred*, not *confirmed*, per that entry — see above) **[Windows since measured
+— see the 2026-10-03 entry below]**, is untouched by this server-side-only PR and remains open
+as of this entry. This precondition closes once that Windows review lands (or the residual is
+otherwise explicitly discharged), in addition to PR-4 merging. The rest of
 the #4666 ladder (PR-3's agent-side heartbeat/metrics surfacing, PR-5's blocked-sink chaos
 driver/rig evidence, and PR-6/PR-7's `T_detect`/`T_wire`/`T_server` retirement once `gh issue
 view 4606` is closed) is tracked in the `spark-4666-retire-synchronous-log-writes-DELIVERY-PLAN.md`
@@ -2020,7 +2023,13 @@ shape as Linux, not the macOS two-registry shape.** Full evidence, exact command
 text verbatim: `docs/spark-rebuild-baselines/4666-mi1b-windows-registry-verdict.md`. This closes
 the last open residual named above and in the PR-4 entry: both halves of this precondition (the
 agent-side registry-topology claim and PR-4's server-side `T_server` fix) are now satisfied, and
-this precondition for the F14 flip is CLOSED.
+this precondition for the F14 flip is CLOSED. **This is a point-in-time attestation, not a
+continuously-monitored control**: the measuring fixture's topology verdict is `WARN`-only (by
+original design, not a defect of this measurement — see the fixture's own header comment), so a
+future regression (a toolchain upgrade, a vcpkg spdlog baseline bump, or a `triplets/x64-windows.cmake`
+static-linkage override added for spdlog) would not fail CI on its own; see the evidence file's
+own "Scope and revisit triggers" section for what would need to change before this claim is
+re-verified.
 
 **Precondition for criterion 10 sign-off and the F14 flip (added 2026-09-21, from the #4606
 governance review of the rule-id neutralisation; SATISFIED 2026-09-24 by the #4665 fix landing on

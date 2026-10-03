@@ -1,14 +1,15 @@
 # #4666 PR-2 W3a MI-1b — Windows spdlog-registry topology: empirical verdict
 
-Validates the claim repeated in four-to-five places in the docs (`docs/spark-flip-gate.md`,
-`docs/darwin-compat.md`, `docs/user-manual/server-admin.md` ×2,
+Validates, as the claim stood at `f7a000fc3`, a sentence repeated across five sites in the docs
+(`docs/spark-flip-gate.md`, `docs/darwin-compat.md`, `docs/user-manual/server-admin.md` ×2,
 `docs/resource-ledgers/4666-log-handoff.md`): "on Windows, the agent image and
 `libyuzu_agent_core` share a single spdlog registry — INFERRED from dynamic spdlog linkage, never
 directly measured." The fixture that actually measures this
 (`tests/unit/test_log_handoff_multi_image.cpp`, tags `[log_handoff][multi_image]`, cases MI-1,
 MI-1b(a), MI-1b(b), MI-3) already runs on every Windows CI run, but nobody had read its WARN/report
 output before this run. This is that reading, done on real Windows hardware against a named commit,
-with linkage corroboration.
+with linkage corroboration. The five sites above were updated from "inferred" to "confirmed" in
+the same commit that added this file.
 
 **Verdict: ONE shared registry — the inference is CONFIRMED on Windows.** All four runtime signals
 (MI-1, MI-1b(a), MI-1b(b), MI-3) and the linkage corroboration (`dumpbin`) agree. This is the same
@@ -29,10 +30,9 @@ shape as Linux (confirmed) and the opposite of macOS's two-registry shape.
   `set(PACKAGE_VERSION "1.17.0")`).
 - Build type: debug (`spdlogd.dll` naming throughout confirms this).
 
-## Execution deviation from the plan: a fresh build directory, not `build-windows`
+## Execution deviation: a fresh build directory, not `build-windows`
 
-The plan (`spark-4666-mi1b-windows-registry-verdict-PLAN.md` rev 3) assumed the normal
-`build-windows` directory. On arrival, weecolin was running a live, standing UAT rig directly out of
+The normal `build-windows` directory was assumed going in. On arrival, weecolin was running a live, standing UAT rig directly out of
 `build-windows`: `yuzu-server.exe` (PID 3456, via `C:\rig\run-server.ps1`) and `yuzu-agent.exe` (PID
 9852, via `C:\rig\run-agent.ps1`), both launched against `build-windows\agents\core\...` binaries.
 Rebuilding at the fast-forwarded SHA hit `LINK : fatal error LNK1104: cannot open file
@@ -40,8 +40,8 @@ Rebuilding at the fast-forwarded SHA hit `LINK : fatal error LNK1104: cannot ope
 
 Stopping those processes to free the lock was attempted and was **denied by this session's own
 auto-mode permission classifier** ("Interfere With Workloads") — a live rig potentially in use
-elsewhere, not mine to stop without the operator's explicit say. Per the task's own instruction to
-report blockers honestly rather than work around them, this was not retried in any other form.
+elsewhere, not mine to stop without the operator's explicit say. This was not retried in any
+other form; the blocker is reported as-is below rather than worked around silently.
 
 Instead: a **second, independent build directory** was configured —
 `bash scripts/setup.sh --tests --builddir build-windows-mi1b` — which reuses the same
@@ -173,7 +173,7 @@ shows `LogHandoff::install`/`::teardown`/`::create` resolving from `yuzu_agent_c
 C++-mangled symbols), i.e. the exe genuinely calls back into the library image for the handoff
 object itself, on top of sharing the library's spdlog registry.
 
-This matches the `triplets/x64-windows.cmake` premise cited by the plan: `VCPKG_LIBRARY_LINKAGE
+This matches the premise in `triplets/x64-windows.cmake`: `VCPKG_LIBRARY_LINKAGE
 dynamic` is the default and spdlog is not in the static-override list
 (`abseil|grpc|protobuf|upb|re2|c-ares|utf8-range`); root `meson.build` builds spdlog as
 `SPDLOG_COMPILED_LIB` via `spdlog_dep`, not header-only. The dynamic-linkage premise and the runtime
@@ -185,16 +185,42 @@ measurement agree; neither one is the sole evidence.
 Every signal (MI-1, MI-1b(a), MI-1b(b), MI-3, and `dumpbin` linkage) points the same direction, with
 no ambiguity or conflict between the sub-cases. This is the Linux shape, not the macOS shape — the
 two-registry case `agent_log_wiring.hpp` defends against with its exe-image redundant
-`set_default_logger` call does **not** arise on Windows, same as Linux. Per the plan's own Phase B
-note, this does not change the exit-code-5 fail-closed behavior either way — `swap_ok == false` on a
-failed swap still forces `hard_exit(5)` regardless of registry topology.
+`set_default_logger` call does **not** arise on Windows, same as Linux. This does not change the
+exit-code-5 fail-closed behavior either way — `swap_ok == false` on a failed swap still forces
+`hard_exit(5)` regardless of registry topology.
 
-Per the plan, doc edits (the four-to-five sites currently saying "inferred... not directly measured"
-on Windows) are **Phase C, explicitly out of scope for this run** and were not made.
+The five doc sites that said "inferred... not directly measured" on Windows were updated to
+"confirmed" in the same commit that adds this file.
 
-## Problems encountered (for Phase C / next-run awareness)
+**This is a point-in-time attestation, not a continuously-monitored control.** The fixture's
+topology verdict is `WARN`-only by original design (the WARN/report mechanism predates this run
+and was never meant to gate CI) — a future regression in this exact fact would not fail CI, only
+show up in a Job Summary nobody is obliged to read. See "Scope and revisit triggers" below.
 
-1. **Live UAT rig lock on `build-windows`**: not anticipated by the plan. Worked around with a
+## Scope and revisit triggers
+
+- **Measured on**: weecolin (a personal dev/test rig, Tailscale-reachable, distinct from the CI
+  pool `yuzu-weetam-windows`/"Wee Tam" that the new CI step (`ci.yml`) surfaces this verdict on
+  every run of). The first post-merge Wee Tam run reproduces this verdict on Wee Tam's own image;
+  until then, "confirmed" rests on weecolin's toolchain matching Wee Tam's.
+- **Build type**: debug only (`spdlogd.dll` naming). The underlying mechanism — dynamic linkage via
+  `triplets/x64-windows.cmake`'s default (spdlog excluded from the static-override list) — is
+  build-type-invariant by design, so this is corroboration for generalizing to release, not a
+  release-build measurement itself.
+- **spdlog version**: 1.17.0, pinned via the repo's vcpkg baseline at this SHA.
+- **Revisit triggers**: a vcpkg baseline bump that changes spdlog's resolved version; any edit to
+  `triplets/x64-windows.cmake`'s static-linkage override list that adds spdlog (the exact mechanism
+  already used for grpc/protobuf/abseil, and for spdlog on macOS); a release, ASan, or TSan build of
+  this fixture, none of which have been run against this specific claim; spdlog itself moving to a
+  major version with a different default linkage posture.
+- **Detection signal today**: none automated — the fixture's `WARN`-only design (by original intent,
+  not introduced by this run) means a flip would show up only in the Windows CI job's summary.
+  Giving the fixture a platform-conditional `REQUIRE`/`CHECK` on this specific claim is tracked
+  separately rather than folded into this evidence file.
+
+## Problems encountered
+
+1. **Live UAT rig lock on `build-windows`**: not anticipated going in. Worked around with a
    second build directory (`build-windows-mi1b`, left on the box) rather than stopping the rig, which
    this session's own permission system denied. Future same-box runs should either coordinate with
    whoever owns that rig, or default straight to a side build directory.
@@ -202,6 +228,6 @@ on Windows) are **Phase C, explicitly out of scope for this run** and were not m
    single non-default target like `yuzu-agent.exe` (built separately from the test run since it is
    not a dependency of `tests/yuzu_agent_tests.exe`): `agents/core/yuzu-agent.exe` is rejected
    ("target not found"); the bare meson target name `yuzu-agent` works.
-3. Everything else in the plan's recipe (fast-forward-then-verify SHA, `source` not pipe for the env
-   scripts, Windows-native `scp` destination, dash-form `dumpbin` flags, the shard-C
-   `--test-args`-is-exact claim) held exactly as documented — no other deviations.
+3. Everything else in the recipe this run followed (fast-forward-then-verify SHA, `source` not pipe
+   for the env scripts, Windows-native `scp` destination, dash-form `dumpbin` flags, the shard-C
+   `--test-args`-is-exact claim) held exactly as expected — no other deviations.

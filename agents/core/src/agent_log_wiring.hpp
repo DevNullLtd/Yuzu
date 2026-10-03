@@ -69,16 +69,17 @@ inline constexpr std::string_view kDefaultLogPattern = "[%Y-%m-%d %H:%M:%S.%e] [
             lg->set_formatter(std::make_unique<yuzu::JsonLogFormatter>("agent"));
         else
             lg->set_pattern(std::string(kDefaultLogPattern));
-        // Redundant with h.install()'s own internal spdlog::set_default_logger() call
-        // above (same shared_ptr, already installed) -- kept so the LAST registry
-        // write this function makes only happens once level/format configuration has
-        // actually succeeded, rather than installing, then configuring in place.
-        // CONFIRMED redundant on Linux and Windows (one shared registry between this
-        // image and the core library -- MI-1b(a) measures this directly; Windows result:
-        // docs/spark-rebuild-baselines/4666-mi1b-windows-registry-verdict.md). On macOS
-        // (two separate registries, docs/darwin-compat.md) this call is NOT redundant
-        // for THIS image's own same-image spdlog calls -- it is what gives the exe its
-        // own default logger at all, separately from h.install()'s write to the core
+        // On Linux and Windows (one shared registry between this image and the core
+        // library -- MI-1b(a) measures this directly; Windows result:
+        // docs/spark-rebuild-baselines/4666-mi1b-windows-registry-verdict.md), this call
+        // is CONFIRMED redundant with h.install()'s own internal
+        // spdlog::set_default_logger() call above (same shared_ptr, already installed)
+        // -- kept so the LAST registry write this function makes only happens once
+        // level/format configuration has actually succeeded, rather than installing,
+        // then configuring in place. On macOS (two separate registries,
+        // docs/darwin-compat.md), by contrast, this call is NOT redundant for THIS
+        // image's own same-image spdlog calls -- it is what gives the exe its own
+        // default logger at all, separately from h.install()'s write to the core
         // library's registry. It still doesn't matter for Guardian/Spark correctness
         // there, since that logging is compiled into the core library regardless of
         // which image called install().
