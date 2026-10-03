@@ -20,6 +20,10 @@ Usage:
 Where <content_root> contains subdirectories ``definitions/`` and
 ``packs/`` of .yaml files. Multi-document YAML (``---`` separators)
 is handled.
+
+The output file is rewritten only when its bytes differ from what is already
+on disk, so the build_always_stale custom_target does not force a recompile
+and relink of the server on every ninja invocation.
 """
 
 from __future__ import annotations  # 'dict | None' type hints under py 3.9
@@ -373,8 +377,21 @@ def main() -> int:
 
     out += b"}  // namespace yuzu::server\n"
 
-    out_path.write_bytes(bytes(out))
-    print(f"embed_content.py: wrote {out_path} "
+    # Write only when the bytes changed. The meson custom_target is
+    # build_always_stale (so content/ edits are always re-scanned) and its
+    # ninja rule carries restat=1: an output whose mtime did not move prunes
+    # every dependent. An unconditional write bumped the mtime on every ninja
+    # invocation and so recompiled bundled_content.cpp and relinked
+    # libyuzu_server_core and the server binaries each time. Output is
+    # deterministic (sorted inputs, no timestamps), so a byte compare is exact.
+    new_bytes = bytes(out)
+    try:
+        unchanged = out_path.read_bytes() == new_bytes
+    except OSError:
+        unchanged = False
+    if not unchanged:
+        out_path.write_bytes(new_bytes)
+    print(f"embed_content.py: {'unchanged' if unchanged else 'wrote'} {out_path} "
           f"({len(defs_json)} definitions, {len(sets_json)} sets, "
           f"{len(plugin_docs_json)} plugin-docs manifests)")
     return 0
