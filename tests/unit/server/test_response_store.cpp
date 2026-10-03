@@ -19,6 +19,7 @@
 #include <yuzu/metrics.hpp>
 
 #include <catch2/catch_test_macros.hpp>
+#include <limits>
 
 #include <libpq-fe.h>
 
@@ -2071,6 +2072,11 @@ TEST_CASE("ResponseStore query_bounded keeps only the rows under the payload cap
     // Newest first, and the kept rows are the NEWEST four.
     CHECK(r->rows.front().timestamp == 1039);
     CHECK(r->rows.back().timestamp == 1036);
+    // What libpq actually held: the four kept rows' payload (4 x 64 KiB) plus overhead, far
+    // below the 40 rows (2.5 MiB) query() materialises. This is the observable form of "the
+    // cut happens before the full columns are fetched".
+    CHECK(r->result_bytes >= 4u * 64u * 1024u);
+    CHECK(r->result_bytes < 1024u * 1024u);
 
     // The plain query() fetches all 40, which is exactly what the bound avoids.
     auto all = store.query("cmd-bounded", q);
@@ -2131,6 +2137,57 @@ TEST_CASE("ResponseStore query_bounded row_cap_hit is exact not size equals limi
     CHECK(cut->rows.size() == 4);
     CHECK(cut->row_cap_hit);
     CHECK_FALSE(cut->byte_cap_hit);
+}
+
+TEST_CASE("ResponseStore query_bounded counts a byte cut only among rows within the limit",
+          "[pg][response_store]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore store(pool);
+    REQUIRE(store.is_open());
+    // Four rows of exactly 10 payload bytes. The statement fetches limit + 1 candidates, so
+    // the extra candidate must never be mistaken for a byte-cap casualty.
+    for (int i = 0; i < 4; ++i)
+        put_response(store, "cmd-within", "agent-1", 100 + i, 6, "eeee");
+
+    ResponseQuery q;
+    // limit 2, cap 20: row 2's preceding size is 10 (< 20), kept; the third candidate is past
+    // the limit. Only the row cap fired; an `rn <= limit` guard missing from the cut count
+    // would also report a byte cut here (candidate 3's preceding size is exactly 20).
+    q.limit = 2;
+    auto row_only = store.query_bounded("cmd-within", q, std::nullopt, 20);
+    REQUIRE(row_only.has_value());
+    CHECK(row_only->rows.size() == 2);
+    CHECK(row_only->row_cap_hit);
+    CHECK_FALSE(row_only->byte_cap_hit);
+
+    // limit 3, cap 20: candidate 3 is within the limit but its preceding size (20) is not
+    // below the cap -> dropped (byte cut), and a fourth candidate exists (row cut): both fire.
+    q.limit = 3;
+    auto both = store.query_bounded("cmd-within", q, std::nullopt, 20);
+    REQUIRE(both.has_value());
+    CHECK(both->rows.size() == 2);
+    CHECK(both->row_cap_hit);
+    CHECK(both->byte_cap_hit);
+}
+
+TEST_CASE("ResponseStore query_bounded survives a limit of INT_MAX (limit + 1 does not overflow)",
+          "[pg][response_store]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore store(pool);
+    REQUIRE(store.is_open());
+    for (int i = 0; i < 3; ++i)
+        put_response(store, "cmd-intmax", "agent-1", 100 + i, 4);
+
+    ResponseQuery q;
+    q.limit = std::numeric_limits<int>::max();
+    auto r = store.query_bounded("cmd-intmax", q, std::nullopt, 1 << 20);
+    // nullopt here would be the "integer out of range" degrade the bigint placeholder fixes.
+    REQUIRE(r.has_value());
+    CHECK(r->rows.size() == 3);
+    CHECK_FALSE(r->row_cap_hit);
+    CHECK_FALSE(r->byte_cap_hit);
 }
 
 TEST_CASE("ResponseStore query_bounded applies scope before the cut and breaks ties by id",

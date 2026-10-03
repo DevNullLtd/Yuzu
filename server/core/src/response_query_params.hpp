@@ -128,13 +128,18 @@ inline constexpr int kQueryRowLimitCap = 1000;
 /// cumulative `output` + `error_detail` size of the rows served. It is enforced in TWO
 /// places that share this one constant:
 ///   1. in SQL (`ResponseStore::query_bounded`), so the fetch itself -- libpq's
-///      PGresult and the parsed vector -- holds at most about this much payload plus one
-///      row (<= 2 MiB per field at ingest) and never materialises the rest; and
+///      PGresult and the parsed vector -- holds this much payload plus one final row
+///      (a row is kept while the rows BEFORE it are under the cap, so the last kept row
+///      can run past it by up to its own size, about 4 MiB: each of the two fields is
+///      capped at 2 MiB at ingest) and never materialises the rest; and
 ///   2. at serialization (`append_rows_until_byte_cap`) as a backstop, because CSV
 ///      escaping and JSON framing make the SERIALIZED row larger than its raw payload.
 /// Both cut on whole rows and always serve at least one row. What this does NOT bound:
-/// the plain list routes (`GET .../responses/{id}`, MCP `query_responses`, the
-/// executions route), which are capped by row count only (<= 1000 rows x 2 MiB).
+/// the plain list routes (`GET .../responses/{id}`, MCP `query_responses` and
+/// `GET /api/v1/executions/{id}/responses`: each at most 1000 rows, no byte bound), the
+/// execution visualization route (`query()` with a 10,000-row limit), and the dashboard
+/// `/fragments/results` and scan-page fetches (`query()` with limit 10,000); none of
+/// those goes through `query_bounded`.
 /// A flat constant local to the export surface -- NOT the ingest cap, which bounds a
 /// different thing -- and not operator-tunable. Well above any realistic export (a
 /// 10,000-row export of typical command output is a few MiB).
@@ -158,16 +163,44 @@ struct ExportCut {
     [[nodiscard]] const char* cause() const noexcept { return byte_cap ? "byte_cap" : "row_cap"; }
 };
 
-/// `Content-Disposition` filename: a cut export is renamed `-truncated` so the
-/// truncation survives `curl -o`, browser downloads and proxies that drop response
-/// headers -- the one signal a CSV body cannot carry in-band without corrupting parsers.
+/// `Content-Disposition` filename: a cut export is renamed `-truncated`, a second
+/// out-of-body signal beside the `X-Result-Truncated-By-Cap` header. It survives
+/// `curl -OJ` and a browser download, but NOT a plain `curl -o <name>` (curl then names
+/// the file itself and discards the header); the CSV body therefore also carries an
+/// in-band trailer row on a cut (`export_csv_truncation_row`).
+///
+/// The id is written into a quoted header value, so anything outside `[A-Za-z0-9._-]`
+/// (a quote, CR/LF, a path separator, a non-ASCII byte) is replaced by `_`: the legacy
+/// route's id pattern is `[^/]+`, i.e. unrestricted, where the v1 routes only admit
+/// `[A-Za-z0-9_-]{1,128}`.
 [[nodiscard]] inline std::string export_filename(std::string_view instruction_id,
                                                  std::string_view ext, bool truncated) {
     std::string n = "responses-";
-    n += instruction_id;
+    for (const char c : instruction_id) {
+        const bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                        (c >= '0' && c <= '9') || c == '.' || c == '_' || c == '-';
+        n += ok ? c : '_';
+    }
     n += truncated ? "-truncated." : ".";
     n += ext;
     return n;
+}
+
+/// In-band truncation marker for a CUT CSV export: one extra record after the data
+/// rows, with `columns` fields so a positional parser still sees a rectangular file.
+/// The first field is `# result_truncated_by_cap cause=<row_cap|byte_cap>` and the rest
+/// are empty. A cut CSV is the one case where a consumer must NOT take the file as
+/// complete, so a strict parser that trips on the non-numeric id field is the intended
+/// outcome; an uncut export never carries it (byte-identical to the pre-#4703 body).
+/// Appended after the byte-cap backstop decision, so it is not counted against the cap.
+[[nodiscard]] inline std::string export_csv_truncation_row(const ExportCut& cut,
+                                                           std::size_t columns) {
+    std::string row = "# result_truncated_by_cap cause=";
+    row += cut.cause();
+    for (std::size_t i = 1; i < columns; ++i)
+        row += ',';
+    row += "\r\n";
+    return row;
 }
 
 /// Append rows to an export body until the running byte total reaches `cap`, then stop.

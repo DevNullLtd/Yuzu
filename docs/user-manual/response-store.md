@@ -173,7 +173,7 @@ The dedicated export endpoint supports both CSV and JSON formats with the same
 filter parameters as the query endpoint. It defaults to a higher limit
 (10,000 rows) for bulk exports. Numeric parameters must be one whole base-10 integer
 (`since=1e9`, `limit=100abc`, `status=0x1` and `since=1.5` are `400`, not a different
-filter); `since` at or below `0` and `until=0` mean unbounded.
+filter); `since` or `until` at or below `0` means unbounded.
 
 **Query parameters:**
 
@@ -207,15 +207,21 @@ The CSV format includes the columns:
 
 **A bounded export can be cut.** Besides the row limit, an export stops once the rows served
 carry 50 MiB of `output` plus `error_detail` (always on whole rows, and at least one row is
-served). The cap is not configurable. A cut export, whether by the row limit with more matching
-rows left, or by the byte cap, is marked three ways, so check for it before trusting a bulk pull:
-the JSON envelope has a top-level `"result_truncated_by_cap": true`, a CSV response carries an
-`X-Result-Truncated-By-Cap: true` header, and the download is named
+served; the last row kept can run past the cap by up to its own size, about 4 MiB). The cap is not
+configurable. A cut export, whether by the row limit with more matching rows left, or by the byte
+cap, is marked, so check for it before trusting a bulk pull: the JSON envelope has a top-level
+`"result_truncated_by_cap": true`, and a CSV file ends with one extra trailer record,
+`# result_truncated_by_cap cause=row_cap` (or `byte_cap`) padded with empty fields to the header's
+width. The trailer is the signal that reaches every consumer. Two out-of-body signals accompany
+it: a CSV response carries an `X-Result-Truncated-By-Cap: true` header, and the download is named
 `responses-<instruction_id>-truncated.<json|csv>` instead of `responses-<instruction_id>.<json|csv>`.
-The file name is the signal that survives `curl -o` and browser downloads; to see the headers use
-`curl -sS -D - -o responses.csv ...`. Narrow the export with `since`/`until`/`agent_id`/`status`
-and pull again. In the JSON envelope, `count` is the number of rows served. The REST v1 twin
-(`GET /api/v1/responses/{id}/export`) marks a cut the same way, with the flag under `pagination`.
+A plain `curl -o responses.csv ...` keeps neither (curl picks the file name and drops the headers);
+`curl -OJ` keeps the name, and `curl -sS -D - -o responses.csv ...` prints the headers. An uncut
+export carries none of these. To read past a cap there is no cursor: pull once per `agent_id`, or
+set `until` to the oldest `timestamp` received (inclusive, so rows tied at that second return
+again: de-duplicate on `id`). In the JSON envelope, `count` is the number of rows served. The
+REST v1 twin (`GET /api/v1/responses/{id}/export`) marks a cut the same way, with the JSON flag
+under `pagination` and a 10-field CSV trailer.
 
 ### Generic JSON-to-CSV export
 

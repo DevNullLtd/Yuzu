@@ -365,9 +365,12 @@ This downloads a CSV file with headers:
 id,instruction_id,agent_id,timestamp,status,output,error_detail
 ```
 
-An export is capped at 10,000 rows and at 50 MiB of output. A cut export is saved under a
-`-truncated` name by `-OJ` and carries `X-Result-Truncated-By-Cap: true`; with `-o` the name does not
-change, so print the headers too: `curl -sS -D - -o service-results.csv ...` (look for that header).
+An export is capped at 10,000 rows and at 50 MiB of output. A cut CSV ends with one extra record
+beginning `# result_truncated_by_cap` (check the last line before trusting a bulk pull), and a cut
+JSON export has a top-level `result_truncated_by_cap: true` on this legacy route (under
+`pagination` on the v1 route). A cut export is also saved under a `-truncated` name by `-OJ` and
+carries `X-Result-Truncated-By-Cap: true`; a plain `-o` keeps neither the name nor the header, so
+add `-D -` to print the headers (`curl -sS -D - -o service-results.csv ...`).
 
 ### Export as JSON
 
@@ -901,7 +904,7 @@ curl -s "http://localhost:8080/api/responses/services-f1e2d3c4b5a6a7b8/export?fo
   -b "$COOKIE" -o responses.csv
 ```
 
-(A cut export carries `X-Result-Truncated-By-Cap: true`; add `-D -` to print the headers.)
+(A cut export is marked; the "Export as CSV" section earlier in this guide shows how to tell a cut export from a complete one.)
 
 The CSV file contains one row per agent response with headers:
 

@@ -14,6 +14,7 @@
 #include "instruction_store.hpp"
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
+#include "response_export_metrics.hpp"
 #include "rest_api_v1.hpp"
 #include "response_store.hpp"
 #include "test_route_sink.hpp"
@@ -73,6 +74,7 @@ struct AuditRecord {
 };
 
 struct ExecV1Harness {
+    yuzu::MetricsRegistry metrics; // #4644 counter, seeded like production; outlives the sink
     yuzu::server::test::TestRouteSink sink;
 
     std::unique_ptr<ExecutionTracker> execution_tracker;
@@ -87,6 +89,7 @@ struct ExecV1Harness {
     RestApiV1 api;
 
     explicit ExecV1Harness(pg::PgPool& pool) {
+        yuzu::server::seed_response_metrics(metrics);
         execution_tracker = std::make_unique<ExecutionTracker>(pool);
         REQUIRE(execution_tracker->is_open());
         instruction_store = std::make_unique<InstructionStore>(pool);
@@ -145,7 +148,7 @@ struct ExecV1Harness {
                             /*device_token_store=*/nullptr,
                             /*license_store=*/nullptr,
                             /*guaranteed_state_store=*/nullptr,
-                            /*metrics_registry=*/nullptr,
+                            /*metrics_registry=*/&metrics,
                             /*session_revoke_fn=*/{},
                             /*execution_event_bus=*/nullptr,
                             /*result_set_store=*/nullptr,
@@ -507,6 +510,33 @@ TEST_CASE("GET /api/v1/executions/:id/responses: a malformed numeric query param
     auto ok = h.sink.Get("/api/v1/executions/" + exec_id + "/responses?" + good);
     REQUIRE(ok);
     CHECK(ok->status == 200);
+}
+
+TEST_CASE("GET /api/v1/executions/:id/responses: a rejected numeric parameter counts on the "
+          "rest_v1 surface and a valid request does not (#4644)",
+          "[pg][rest][executions][v1][responses]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, execv1_responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecV1Harness h(pool);
+    auto exec_id = h.make_exec_with_agents("def-resp-metric");
+    auto rejected = [&](const char* surface) {
+        return h.metrics
+            .counter(yuzu::server::kResponseParamRejectedMetric, {{"surface", surface}})
+            .value();
+    };
+    REQUIRE(rejected("rest_v1") == 0.0);
+
+    CHECK(h.sink.Get("/api/v1/executions/" + exec_id + "/responses?limit=100abc")->status == 400);
+    CHECK(rejected("rest_v1") == 1.0);
+    CHECK(h.sink.Get("/api/v1/executions/" + exec_id + "/responses?status=0x1")->status == 400);
+    CHECK(rejected("rest_v1") == 2.0);
+    // A valid request, and the offset 400 (a different refusal), do not count.
+    CHECK(h.sink.Get("/api/v1/executions/" + exec_id + "/responses?limit=10")->status == 200);
+    CHECK(h.sink.Get("/api/v1/executions/" + exec_id + "/responses?offset=1")->status == 400);
+    CHECK(rejected("rest_v1") == 2.0);
+    // The other surfaces stay untouched.
+    CHECK(rejected("rest") == 0.0);
+    CHECK(rejected("mcp") == 0.0);
 }
 
 TEST_CASE("GET /api/v1/executions/:id/responses: fleet_read_fn gates on Response:Read, "

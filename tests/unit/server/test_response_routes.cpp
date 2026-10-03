@@ -277,6 +277,34 @@ struct PgHarness {
 
 } // namespace
 
+namespace {
+constexpr const char* kCsvTrailerPrefix = "# result_truncated_by_cap";
+
+// The in-band truncation record of a CUT CSV export, or "" when the body has none. It is
+// the last CRLF-terminated record.
+std::string csv_trailer(const std::string& body) {
+    if (body.size() < 2 || body.compare(body.size() - 2, 2, "\r\n") != 0)
+        return {};
+    const auto start = body.rfind("\r\n", body.size() - 3);
+    const std::size_t from = start == std::string::npos ? 0 : start + 2;
+    const std::string last = body.substr(from, body.size() - 2 - from);
+    return last.rfind(kCsvTrailerPrefix, 0) == 0 ? last : std::string{};
+}
+
+// Data rows in a CSV export body: every record ends CRLF, the header is one of them and a
+// cut export's trailer is another, neither counted. The seeded payloads contain no CR/LF,
+// so a line count is a row count plus the header (plus the trailer when present).
+std::size_t csv_data_rows(const std::string& body) {
+    std::size_t lines = 0;
+    for (std::size_t pos = body.find("\r\n"); pos != std::string::npos;
+         pos = body.find("\r\n", pos + 2))
+        ++lines;
+    if (!csv_trailer(body).empty() && lines > 0)
+        --lines;
+    return lines == 0 ? 0 : lines - 1;
+}
+} // namespace
+
 TEST_CASE("GET /api/responses/:id/aggregate: happy path returns its own shape, not the "
           "catch-all's -- proving the registration order actually works end-to-end",
           "[server][routes][response_routes][rest][pg]") {
@@ -538,13 +566,16 @@ TEST_CASE("GET /api/responses/:id/export: the total-byte cap truncates JSON and 
         CHECK(body["responses"].size() < 5);
         CHECK(body["count"] == body["responses"].size()); // count reports what was served
         CHECK(body.value("result_truncated_by_cap", false) == true);
-        // UP-3: the signal also survives `curl -o` as a renamed download.
+        // Second out-of-body signal: a renamed download (kept by `curl -OJ` and a browser,
+        // not by a plain `curl -o`; the CSV body carries its own trailer record instead).
         CHECK(res_json->get_header_value("Content-Disposition") ==
               "attachment; filename=\"responses-instr-bytecap-truncated.json\"");
 
         auto res_csv = h.sink.Get("/api/responses/instr-bytecap/export?format=csv");
         REQUIRE(res_csv);
         CHECK(res_csv->get_header_value("X-Result-Truncated-By-Cap") == "true");
+        // In-band signal: the cut CSV ends with one 7-field trailer record naming the cause.
+        CHECK(csv_trailer(res_csv->body) == "# result_truncated_by_cap cause=byte_cap,,,,,,");
         CHECK(res_csv->get_header_value("Content-Disposition") ==
               "attachment; filename=\"responses-instr-bytecap-truncated.csv\"");
     }
@@ -559,6 +590,7 @@ TEST_CASE("GET /api/responses/:id/export: the total-byte cap truncates JSON and 
     auto res_full_csv = h.sink.Get("/api/responses/instr-bytecap/export?format=csv");
     REQUIRE(res_full_csv);
     CHECK(res_full_csv->get_header_value("X-Result-Truncated-By-Cap").empty());
+    CHECK(csv_trailer(res_full_csv->body).empty());
     CHECK(res_full_csv->get_header_value("Content-Disposition") ==
           "attachment; filename=\"responses-instr-bytecap.csv\"");
 }
@@ -583,26 +615,22 @@ TEST_CASE("GET /api/responses/:id/export: a ROW-cap cut renames the download and
         REQUIRE(cut);
         CHECK(cut->get_header_value("Content-Disposition") ==
               "attachment; filename=\"responses-instr-rowcut-truncated." + f + "\"");
+        if (f == "csv") {
+            CHECK(csv_trailer(cut->body) == "# result_truncated_by_cap cause=row_cap,,,,,,");
+            CHECK(csv_data_rows(cut->body) == 2); // the trailer is not a data row
+        }
         // limit == row count: exact crossing, nothing dropped, so nothing is flagged.
         auto exact = h.sink.Get("/api/responses/instr-rowcut/export?limit=3&format=" + f);
         REQUIRE(exact);
         CHECK(exact->get_header_value("Content-Disposition") ==
               "attachment; filename=\"responses-instr-rowcut." + f + "\"");
         CHECK(exact->get_header_value("X-Result-Truncated-By-Cap").empty());
+        if (f == "csv") {
+            CHECK(csv_trailer(exact->body).empty());
+            CHECK(csv_data_rows(exact->body) == 3);
+        }
     }
 }
-
-namespace {
-// Rows in a CSV export body: every record ends CRLF and the header is one of them. The
-// seeded payloads contain no CR/LF, so a line count is a row count plus one.
-std::size_t csv_data_rows(const std::string& body) {
-    std::size_t lines = 0;
-    for (std::size_t pos = body.find("\r\n"); pos != std::string::npos;
-         pos = body.find("\r\n", pos + 2))
-        ++lines;
-    return lines == 0 ? 0 : lines - 1;
-}
-} // namespace
 
 TEST_CASE("GET /api/responses/:id/export: no limit serves every row up to the ceiling and "
           "limit 0 serves exactly one (#4703)",
@@ -674,6 +702,7 @@ TEST_CASE("GET /api/responses/:id/export: the byte cap always serves one row and
     REQUIRE(one_csv);
     CHECK(csv_data_rows(one_csv->body) == 1);
     CHECK(one_csv->get_header_value("X-Result-Truncated-By-Cap").empty());
+    CHECK(csv_trailer(one_csv->body).empty());
     CHECK(one_csv->get_header_value("Content-Disposition") ==
           "attachment; filename=\"responses-instr-lastcross.csv\"");
 
@@ -687,6 +716,7 @@ TEST_CASE("GET /api/responses/:id/export: the byte cap always serves one row and
     REQUIRE(many_csv);
     CHECK(csv_data_rows(many_csv->body) == 1);
     CHECK(many_csv->get_header_value("X-Result-Truncated-By-Cap") == "true");
+    CHECK(csv_trailer(many_csv->body) == "# result_truncated_by_cap cause=byte_cap,,,,,,");
 }
 
 TEST_CASE("legacy response routes: since at or below zero and until zero mean unbounded "
@@ -704,7 +734,7 @@ TEST_CASE("legacy response routes: since at or below zero and until zero mean un
     }
     // Pinned so a future "tighten" of the stores' zero-is-unbounded rule is a visible
     // change: the strict parser only decides what is a number, not what a number means.
-    for (const char* q : {"since=-5", "since=0", "until=0", "since=0&until=0"}) {
+    for (const char* q : {"since=-5", "since=0", "until=0", "until=-5", "since=0&until=0"}) {
         INFO(q);
         auto res = h.sink.Get(std::string("/api/responses/instr-window/export?") + q);
         REQUIRE(res);
@@ -760,6 +790,110 @@ TEST_CASE("legacy response routes count rejected numeric params and cut exports 
     }
     CHECK(cut("rest", "byte_cap") == 1.0);
     CHECK(cut("rest_v1", "byte_cap") == 0.0);
+}
+
+TEST_CASE("GET /api/responses/:id/export: an UNCUT CSV is byte-identical to the plain header + "
+          "rows body, with no trailer record (#4703)",
+          "[server][routes][response_routes][rest][pg]") {
+    PgHarness h;
+    for (int i = 0; i < 2; ++i) {
+        StoredResponse r;
+        r.instruction_id = "instr-ident";
+        r.agent_id = "agent-" + std::to_string(i);
+        r.status = 1;
+        r.output = "out," + std::to_string(i); // forces CSV quoting
+        r.error_detail = "";
+        r.timestamp = 100 + i;
+        h.store->store(r);
+    }
+    // The ids are store-assigned, so read them back through the JSON export.
+    auto js = json::parse(h.sink.Get("/api/responses/instr-ident/export")->body);
+    REQUIRE(js["responses"].size() == 2);
+    std::string expected = "id,instruction_id,agent_id,timestamp,status,output,error_detail\r\n";
+    for (const auto& row : js["responses"])
+        expected += std::to_string(row["id"].get<long long>()) + ",instr-ident," +
+                    row["agent_id"].get<std::string>() + "," +
+                    std::to_string(row["timestamp"].get<long long>()) + ",1,\"" +
+                    row["output"].get<std::string>() + "\",\r\n";
+    auto csv = h.sink.Get("/api/responses/instr-ident/export?format=csv");
+    REQUIRE(csv);
+    CHECK(csv->body == expected);
+    CHECK(csv_trailer(csv->body).empty());
+}
+
+TEST_CASE("GET /api/responses/:id (catch-all): a limit above the 1000 ceiling is clamped AND "
+          "signalled; a request that never exceeded it gets a byte-identical body (#4703)",
+          "[server][routes][response_routes][rest][pg]") {
+    PgHarness h;
+    // 1001 rows: one more than the ceiling, so a clamped page is genuinely incomplete.
+    for (int i = 0; i < 1001; ++i) {
+        StoredResponse r;
+        r.instruction_id = "instr-ceiling";
+        r.agent_id = "agent-" + std::to_string(i);
+        r.status = 1;
+        r.output = "o";
+        r.timestamp = 1000 + i;
+        h.store->store(r);
+    }
+    {
+        auto over = h.sink.Get("/api/responses/instr-ceiling?limit=999999999");
+        REQUIRE(over);
+        REQUIRE(over->status == 200);
+        auto body = json::parse(over->body);
+        CHECK(body["responses"].size() == 1000);
+        CHECK(body["count"] == 1000);
+        CHECK(body.value("result_truncated_by_cap", false) == true);
+    }
+    {
+        // At the ceiling exactly: the caller asked for what it got, nothing was clamped.
+        auto at = h.sink.Get("/api/responses/instr-ceiling?limit=1000");
+        REQUIRE(at);
+        auto body = json::parse(at->body);
+        CHECK(body["responses"].size() == 1000);
+        CHECK_FALSE(body.contains("result_truncated_by_cap"));
+    }
+    {
+        // No limit: the store default, never flagged (the route has always paged by offset).
+        auto dflt = h.sink.Get("/api/responses/instr-ceiling");
+        REQUIRE(dflt);
+        auto body = json::parse(dflt->body);
+        CHECK(body["responses"].size() == 100);
+        CHECK_FALSE(body.contains("result_truncated_by_cap"));
+    }
+    // Clamped request, short result: the page did not come back full, so no flag.
+    h.seed("instr-few", "agent-1", 1);
+    h.seed("instr-few", "agent-2", 1);
+    auto few = h.sink.Get("/api/responses/instr-few?limit=999999999");
+    REQUIRE(few);
+    auto few_body = json::parse(few->body);
+    CHECK(few_body["responses"].size() == 2);
+    CHECK_FALSE(few_body.contains("result_truncated_by_cap"));
+}
+
+TEST_CASE("export helpers: filename sanitisation, trailer record shape and cut cause "
+          "precedence (#4703)",
+          "[server][routes][response_routes]") {
+    using yuzu::server::ExportCut;
+    using yuzu::server::export_csv_truncation_row;
+    using yuzu::server::export_filename;
+
+    // Characters outside [A-Za-z0-9._-] cannot reach the quoted header value.
+    CHECK(export_filename("a\"b\r\n/../\xC3\xA9", "csv", true) ==
+          "responses-a_b___..___-truncated.csv");
+    CHECK(export_filename("instr-1.v2_x", "json", false) == "responses-instr-1.v2_x.json");
+
+    // The trailer is one record with `columns` fields: columns-1 commas, CRLF-terminated.
+    CHECK(export_csv_truncation_row(ExportCut{true, false}, 7) ==
+          "# result_truncated_by_cap cause=row_cap,,,,,,\r\n");
+    CHECK(export_csv_truncation_row(ExportCut{false, true}, 10) ==
+          "# result_truncated_by_cap cause=byte_cap,,,,,,,,,\r\n");
+
+    // byte_cap names the tighter bound when both fired; none fired = not a cut.
+    CHECK(ExportCut{true, true}.cause() == std::string("byte_cap"));
+    CHECK(ExportCut{true, false}.cause() == std::string("row_cap"));
+    CHECK(ExportCut{false, true}.cause() == std::string("byte_cap"));
+    CHECK_FALSE(ExportCut{false, false}.any());
+    CHECK(ExportCut{true, true}.any());
 }
 
 TEST_CASE("seed_response_metrics pre-seeds every closed series at zero (#4644 #4703)",

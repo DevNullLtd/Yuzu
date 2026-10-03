@@ -5087,20 +5087,38 @@ Runbook for the response routes' export limits (#4644, #4703). `GET /api/respons
 `cause="row_cap"` means more rows matched than the limit, `cause="byte_cap"` means the payload cap
 cut the export (preferred when both applied). A byte-cap cut also logs one warning, at most one a
 minute per process, naming the surface and (on v1) the request's correlation id. For a single
-download, the signals are the `X-Result-Truncated-By-Cap: true` header (CSV), the
-`result_truncated_by_cap` field (JSON; under `pagination` on v1), and a `responses-<id>-truncated`
-download name. `curl -sS -D - -o out.csv ...` prints the headers.
+download, the signals are the trailer record that ends a cut CSV (`# result_truncated_by_cap
+cause=...`), the `result_truncated_by_cap` field (JSON; under `pagination` on v1), the
+`X-Result-Truncated-By-Cap: true` header (CSV) and a `responses-<id>-truncated` download name. A
+plain `curl -o out.csv ...` loses the header and the name but not the trailer; `curl -sS -D - -o
+out.csv ...` prints the headers. The byte-cap warning is rate-limited per surface (legacy `rest`
+and `rest_v1` each get their own one-a-minute allowance).
 
 **What the bound covers.** The cut is applied inside the store query, so an export holds about 50
-MiB of payload plus at most one more row while it is fetched (measured at the store query on one run
-at about twice the cap, the driver's result plus the parsed rows; the serialized body built
-afterwards is additional and the end-to-end peak was not measured). The export holds one connection
-from the shared Postgres pool for the fetch and the parse, and that pool also serves RBAC, audit and
-the other stores, so a burst of large exports can make other pool users wait; lower the `limit`, narrow with
-`since`/`until`/`agent_id`/`status`, or use a management-group-confined principal to shrink one. The
-plain list routes (`GET /api/v1/responses/{id}`, the legacy `GET /api/responses/{id}`, MCP
-`query_responses`, `GET /api/v1/executions/{id}/responses`) are capped by row count only, at most 1000
-rows of up to 2 MiB per field; this change does not bound their memory.
+MiB of payload plus one final row while it is fetched. The cap is on whole rows, so the last row
+kept can run past it by up to its own size (each of `output` and `error_detail` is capped at 2 MiB
+at ingest, about 4 MiB per row). The serialization-time backstop counts escaped bytes, so a result
+under 50 MiB of raw payload can still be cut and reported as `byte_cap`. One measurement, 400 rows
+of 512 KiB: the store query's peak resident memory rose by 99 MiB with the bounded fetch, against
+398 MiB with the unbounded one; other row shapes were not measured, and the serialized body built
+afterwards is additional. The plain list routes (`GET /api/v1/responses/{id}`, the legacy `GET
+/api/responses/{id}`, MCP `query_responses`, `GET /api/v1/executions/{id}/responses`) are capped by
+row count only, at most 1000 rows of up to 2 MiB per field, and the execution visualization route
+and the dashboard results fragment and scan page read up to 10,000 rows with no byte bound; this
+change does not bound their memory.
+
+**Pool sizing.** An export holds one connection from the server's shared Postgres pool for the
+fetch and the parse. The pool is sized by `--postgres-pool-size` (default 16) and is shared by
+AuthDB, the session store, the response store, the audit store and the RBAC store, among others.
+The response store's read path waits up to 2000 ms to acquire a connection; the RBAC permission
+lookup waits only 250 ms, and two consecutive failed pool touches open a breaker that denies every
+authorization check without touching the pool until a probe succeeds. So at the default size, 16
+exports in flight at once occupy every connection, and a permission check can then be refused
+(fail closed) while they run. This change adds no concurrency limit on exports, so bound it from
+outside: lower `limit`, narrow with `since`/`until`/`agent_id`/`status`, use a
+management-group-confined principal, or rate-limit the export routes at the proxy. Watch
+`yuzu_pg_pool_in_use` and `yuzu_pg_acquire_wait_seconds` (see "Connection-pool sizing" above). A
+pool-acquire timeout on a response read surfaces as `503` `response store degraded`.
 
 **Malformed filters.** `yuzu_server_response_param_rejected_total{surface}` counts requests refused
 for a malformed numeric parameter. A steady non-zero rate on one surface is a client sending

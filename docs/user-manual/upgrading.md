@@ -111,18 +111,27 @@ too large for its type were already `400`.
   `9223372036854775807` are `-32602` too (the latter used to wrap to `-1`, "any status"; the same
   fix applies to every other MCP argument read with the strict integer reader, 16 call sites).
 - Callers that pass `limit=0` or a negative `limit` to the legacy export: it now serves one row
-  (clamped to `1..10000`, like the v1 export). The legacy list route caps an explicit `limit` at
-  1000; zero or below still means its default of 100.
+  (clamped to `1..10000`, like the v1 export), and its JSON `count` is the number of rows served.
+  The legacy list route caps an explicit `limit` at 1000; zero or below still means its default of
+  100. When the caller asked for more than 1000 and got a full 1000-row page, the legacy list
+  body now carries `"result_truncated_by_cap": true` (absent otherwise).
 
 **Exports are bounded.** Both export routes stop at 50 MiB of row payload (`output` plus
 `error_detail`) in addition to the 10,000-row limit, and the cut is made inside the database query,
 so a large export no longer loads every row into the server first. The cap is not operator-tunable.
 A cut export (row limit with more rows left, or the byte cap) is marked with a top-level
-`result_truncated_by_cap: true` (legacy JSON) or `pagination.result_truncated_by_cap` (v1 JSON), an
-`X-Result-Truncated-By-Cap: true` header (CSV), and a download name `responses-<id>-truncated.json`
-or `.csv`. Existing automation should check for it: `curl -sS -D - -o out.csv ...` shows the header,
-`curl -OJ` keeps the `-truncated` name, and the v1 JSON export carries the flag in the body. Narrow
-the window with `since`/`until`/`agent_id`/`status` and pull again.
+`result_truncated_by_cap: true` (legacy JSON) or `pagination.result_truncated_by_cap` (v1 JSON),
+and a cut CSV ends with one extra trailer record, `# result_truncated_by_cap cause=row_cap` (or
+`byte_cap`), padded to the header's width (7 fields legacy, 10 on v1). **A CSV parser that expects a
+number in the `id` column will fail on that record, and only on a cut file; that is deliberate, so a
+cut file is never read as complete.** An uncut CSV is byte-identical to before. A cut export also
+carries an `X-Result-Truncated-By-Cap: true` header (CSV) and a download name
+`responses-<id>-truncated.json` or `.csv`; a plain `curl -o out.csv ...` keeps neither, `curl -sS -D
+- -o out.csv ...` shows the header and `curl -OJ` keeps the name. The 50 MiB cap counts payload
+bytes, the last row kept can run past it by up to its own size (about 4 MiB), and a result under 50
+MiB of raw payload can still be cut when its escaped serialized form crosses the cap. There is no
+cursor: to read past a cap pull once per `agent_id`, or set `until` to the oldest `timestamp`
+received (inclusive, so de-duplicate on `id`).
 
 **Rolling upgrade.** Replicas on the old and the new build answer a malformed value differently
 (`200` versus `400`), so a client can see both during the rollout. No configuration or data

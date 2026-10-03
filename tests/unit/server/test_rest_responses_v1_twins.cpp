@@ -603,6 +603,34 @@ TEST_CASE("response export: status filter matches the row it names so a malforme
 
 // ── #4703: total export body byte cap ──────────────────────────────────────
 
+namespace {
+constexpr const char* kV1CsvTrailerPrefix = "# result_truncated_by_cap";
+
+// The in-band truncation record of a CUT CSV export, or "" when the body has none. It is
+// the last CRLF-terminated record.
+std::string v1_csv_trailer(const std::string& body) {
+    if (body.size() < 2 || body.compare(body.size() - 2, 2, "\r\n") != 0)
+        return {};
+    const auto start = body.rfind("\r\n", body.size() - 3);
+    const std::size_t from = start == std::string::npos ? 0 : start + 2;
+    const std::string last = body.substr(from, body.size() - 2 - from);
+    return last.rfind(kV1CsvTrailerPrefix, 0) == 0 ? last : std::string{};
+}
+
+// Data rows in a CSV export body: every record ends CRLF, the header is one of them and a
+// cut export's trailer is another, neither counted. The seeded payloads contain no CR/LF.
+std::size_t v1_csv_data_rows(const std::string& body) {
+    std::size_t lines = 0;
+    for (std::size_t pos = body.find("\r\n"); pos != std::string::npos;
+         pos = body.find("\r\n", pos + 2))
+        ++lines;
+    if (!v1_csv_trailer(body).empty() && lines > 0)
+        --lines;
+    return lines == 0 ? 0 : lines - 1;
+}
+} // namespace
+
+
 TEST_CASE("GET /api/v1/responses/:id/export: the total-byte cap truncates JSON and CSV and "
           "sets the same truncation signal as the row cap (#4703)",
           "[pg][rest][responses][v1]") {
@@ -632,6 +660,9 @@ TEST_CASE("GET /api/v1/responses/:id/export: the total-byte cap truncates JSON a
         CHECK(res_csv->get_header_value("Content-Disposition") ==
               "attachment; filename=\"responses-instr-bytecap-truncated.csv\"");
         CHECK(res_csv->body.size() < 5 * 400);
+        // In-band signal: the cut CSV ends with one 10-field trailer record naming the cause.
+        CHECK(v1_csv_trailer(res_csv->body) ==
+              "# result_truncated_by_cap cause=byte_cap,,,,,,,,,");
     }
 
     // Default cap restored: the same export is complete and unmarked.
@@ -646,6 +677,7 @@ TEST_CASE("GET /api/v1/responses/:id/export: the total-byte cap truncates JSON a
     auto res_full_csv = h.sink.Get("/api/v1/responses/instr-bytecap/export?format=csv");
     REQUIRE(res_full_csv);
     CHECK(res_full_csv->get_header_value("X-Result-Truncated-By-Cap").empty());
+    CHECK(v1_csv_trailer(res_full_csv->body).empty());
     CHECK(res_full_csv->get_header_value("Content-Disposition") ==
           "attachment; filename=\"responses-instr-bytecap.csv\"");
 }
@@ -665,11 +697,20 @@ TEST_CASE("GET /api/v1/responses/:id/export: a ROW-cap cut renames the download 
         REQUIRE(cut);
         CHECK(cut->get_header_value("Content-Disposition") ==
               "attachment; filename=\"responses-instr-rowcut-truncated." + f + "\"");
+        if (f == "csv") {
+            CHECK(v1_csv_trailer(cut->body) ==
+                  "# result_truncated_by_cap cause=row_cap,,,,,,,,,");
+            CHECK(v1_csv_data_rows(cut->body) == 2); // the trailer is not a data row
+        }
         auto exact = h.sink.Get("/api/v1/responses/instr-rowcut/export?limit=3&format=" + f);
         REQUIRE(exact);
         CHECK(exact->get_header_value("Content-Disposition") ==
               "attachment; filename=\"responses-instr-rowcut." + f + "\"");
         CHECK(exact->get_header_value("X-Result-Truncated-By-Cap").empty());
+        if (f == "csv") {
+            CHECK(v1_csv_trailer(exact->body).empty());
+            CHECK(v1_csv_data_rows(exact->body) == 3);
+        }
     }
 }
 
@@ -688,18 +729,6 @@ TEST_CASE("GET /api/v1/responses/:id/export: a LAST row that crosses the byte ca
     CHECK(body["data"].size() == 1);
     CHECK_FALSE(body["pagination"].contains("result_truncated_by_cap"));
 }
-
-namespace {
-// Rows in a CSV export body: every record ends CRLF and the header is one of them. The
-// seeded payloads contain no CR/LF, so a line count is a row count plus one.
-std::size_t v1_csv_data_rows(const std::string& body) {
-    std::size_t lines = 0;
-    for (std::size_t pos = body.find("\r\n"); pos != std::string::npos;
-         pos = body.find("\r\n", pos + 2))
-        ++lines;
-    return lines == 0 ? 0 : lines - 1;
-}
-} // namespace
 
 TEST_CASE("GET /api/v1/responses/:id/export: no limit serves every row up to the ceiling and "
           "limit 0 serves exactly one (#4703)",
@@ -754,6 +783,7 @@ TEST_CASE("GET /api/v1/responses/:id/export: the byte cap always serves one row 
     REQUIRE(one_csv);
     CHECK(v1_csv_data_rows(one_csv->body) == 1);
     CHECK(one_csv->get_header_value("X-Result-Truncated-By-Cap").empty());
+    CHECK(v1_csv_trailer(one_csv->body).empty());
     CHECK(one_csv->get_header_value("Content-Disposition") ==
           "attachment; filename=\"responses-instr-lastcross.csv\"");
 
@@ -767,6 +797,7 @@ TEST_CASE("GET /api/v1/responses/:id/export: the byte cap always serves one row 
     REQUIRE(many_csv);
     CHECK(v1_csv_data_rows(many_csv->body) == 1);
     CHECK(many_csv->get_header_value("X-Result-Truncated-By-Cap") == "true");
+    CHECK(v1_csv_trailer(many_csv->body) == "# result_truncated_by_cap cause=byte_cap,,,,,,,,,");
 }
 
 TEST_CASE("v1 response routes: since at or below zero and until zero mean unbounded (#4644)",
@@ -780,7 +811,7 @@ TEST_CASE("v1 response routes: since at or below zero and until zero mean unboun
     // Pinned so a future "tighten" of the stores' zero-is-unbounded rule is a visible
     // change: the strict parser only decides what is a number, not what a number means.
     for (const char* route : {"", "/export"}) {
-        for (const char* q : {"since=-5", "since=0", "until=0", "since=0&until=0"}) {
+        for (const char* q : {"since=-5", "since=0", "until=0", "until=-5", "since=0&until=0"}) {
             INFO(route << " " << q);
             auto res = h.sink.Get(std::string("/api/v1/responses/instr-window") + route + "?" + q);
             REQUIRE(res);

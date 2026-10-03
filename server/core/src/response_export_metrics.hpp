@@ -8,7 +8,9 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
+#include <iterator>
 #include <string>
 #include <string_view>
 
@@ -49,8 +51,9 @@ inline void seed_response_metrics(yuzu::MetricsRegistry& m) {
                "Response exports cut so rows were left out, by surface (rest/rest_v1) and "
                "cause (row_cap = more matching rows than the limit; byte_cap = the 50 MiB "
                "payload cap, preferred when both fired) - the export carries "
-               "X-Result-Truncated-By-Cap / result_truncated_by_cap and a -truncated "
-               "filename; a sustained rate means exports are being consumed incomplete",
+               "X-Result-Truncated-By-Cap / result_truncated_by_cap, a -truncated "
+               "filename and (CSV) a trailer row; a sustained rate means exports are "
+               "being consumed incomplete",
                "counter");
     for (const auto* surface : kResponseParamSurfaces)
         m.counter(kResponseParamRejectedMetric, {{"surface", surface}});
@@ -71,7 +74,8 @@ inline void count_response_param_rejected(yuzu::MetricsRegistry* m, const char* 
 }
 
 /// Count one cut export and, for a BYTE-cap cut only, warn at most once a minute per
-/// process (a looping consumer must not flood the log). `cid` is the request's
+/// process PER SURFACE (a looping consumer must not flood the log, and one noisy
+/// surface must not hide the other's first warning). `cid` is the request's
 /// correlation id, or empty on the legacy surface, which has none. Never logs
 /// instruction or agent ids: they are unbounded and are never metric labels either.
 inline void record_response_export_cut(yuzu::MetricsRegistry* m, const char* surface,
@@ -85,17 +89,27 @@ inline void record_response_export_cut(yuzu::MetricsRegistry* m, const char* sur
                 .increment();
         if (cut.byte_cap) {
             using clock = std::chrono::steady_clock;
-            static std::atomic<clock::rep> last_warn{0};
+            // One slot per entry of kResponseExportSurfaces, found by label value; a
+            // surface not in that closed set shares the last slot rather than adding one.
+            constexpr std::size_t kSlots = std::size(kResponseExportSurfaces);
+            static std::atomic<clock::rep> last_warn[kSlots]{};
+            std::size_t slot = kSlots - 1;
+            for (std::size_t i = 0; i < kSlots; ++i)
+                if (std::string_view{surface} == kResponseExportSurfaces[i]) {
+                    slot = i;
+                    break;
+                }
             const auto now = clock::now().time_since_epoch().count();
-            auto prev = last_warn.load(std::memory_order_relaxed);
+            auto prev = last_warn[slot].load(std::memory_order_relaxed);
             const auto window =
                 std::chrono::duration_cast<clock::duration>(std::chrono::seconds(60)).count();
             // prev == 0 means "never warned"; steady_clock counts from boot, so a real
             // reading is never 0 in practice.
             if ((prev == 0 || now - prev >= window) &&
-                last_warn.compare_exchange_strong(prev, now, std::memory_order_relaxed))
+                last_warn[slot].compare_exchange_strong(prev, now, std::memory_order_relaxed))
                 spdlog::warn("response export cut by the payload byte cap (surface={}, "
-                             "correlation_id={}); rate-limited to one warning per minute",
+                             "correlation_id={}); rate-limited to one warning per minute per "
+                             "surface",
                              surface, cid.empty() ? std::string("n/a") : std::string(cid));
         }
     } catch (...) { // NOLINT(bugprone-empty-catch)

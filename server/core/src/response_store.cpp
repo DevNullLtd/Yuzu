@@ -804,7 +804,9 @@ std::optional<BoundedResponses> ResponseStore::query_bounded(const std::string& 
                 binds.push_back(std::to_string(q.until));
             }
             append_scope_clause(where, binds, idx, scope);
-            const std::string limit_ph = "$" + std::to_string(idx++) + "::integer";
+            // bigint, not integer: the statement computes limit + 1, and an integer
+            // placeholder would raise "integer out of range" at INT_MAX (a 503).
+            const std::string limit_ph = "$" + std::to_string(idx++) + "::bigint";
             const std::string cap_ph = "$" + std::to_string(idx++) + "::bigint";
             const int limit = sanitize_limit(q.limit);
             binds.push_back(std::to_string(limit));
@@ -841,6 +843,7 @@ std::optional<BoundedResponses> ResponseStore::query_bounded(const std::string& 
             if (res.status() != PGRES_TUPLES_OK)
                 return std::nullopt;
             BoundedResponses out;
+            out.result_bytes = PQresultMemorySize(res.get());
             const int n = PQntuples(res.get());
             out.rows.reserve(static_cast<std::size_t>(n));
             for (int i = 0; i < n; ++i)

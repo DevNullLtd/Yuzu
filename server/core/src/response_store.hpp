@@ -148,6 +148,11 @@ struct BoundedResponses {
     /// `octet_length(output) + octet_length(error_detail)` had already reached the
     /// payload cap.
     bool byte_cap_hit{false};
+    /// `PQresultMemorySize()` of the libpq result the query materialised, i.e. what the
+    /// fetch actually held (kept rows' columns plus per-row/field overhead and the two
+    /// `meta` columns). Observability and a test seam for the byte bound; not a request
+    /// limit. 0 when the query returned no rows.
+    std::size_t result_bytes{0};
 };
 
 enum class AggregateOp { Count, Sum, Avg, Min, Max };
@@ -265,7 +270,7 @@ public:
     /// predicates, same resolve-then-scope push-down (ADR-0017 INV-3: the scope clause is
     /// in the WHERE before any cut), but the cut is made IN SQL so neither libpq's
     /// PGresult nor the parsed vector ever holds more than roughly `max_payload_bytes` of
-    /// `output`+`error_detail` (plus at most one row, <= 2 MiB per field at ingest):
+    /// `output`+`error_detail` (plus one final row of up to about 4 MiB: <= 2 MiB per field at ingest):
     ///   1. a sizing pass over the (at most limit+1) candidate rows reads only
     ///      `octet_length(output)+octet_length(error_detail)` -- Postgres answers that
     ///      from the TOAST pointer without detoasting (measured: 0.05 ms vs 207 ms for
@@ -274,7 +279,8 @@ public:
     ///      back to fetch the full columns (the first row is always kept, so a single row
     ///      larger than the cap still makes progress).
     /// Export order is `timestamp DESC, id DESC` (the id tiebreak makes the cut
-    /// deterministic; `query()` orders by timestamp alone). `q.offset` is ignored. A
+    /// deterministic; `query()` orders by timestamp alone, so rows with equal timestamps can come
+    /// back in a different order from the list routes). `q.offset` is ignored. A
     /// concurrent delete between the two steps is one statement, so the snapshot is
     /// consistent. Returns nullopt on store-degraded, exactly like `query()`.
     [[nodiscard]] std::optional<BoundedResponses>

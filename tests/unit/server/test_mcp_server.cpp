@@ -16516,6 +16516,38 @@ TEST_CASE("MCP query_responses: a wrong-typed or out-of-domain status/limit is i
           10.0);
 }
 
+TEST_CASE("MCP query_responses: the status and limit rejections carry the documented messages "
+          "(#4644)",
+          "[pg][mcp][integration][response][fanout]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    yuzu::server::ResponseStore store(pool);
+    REQUIRE(store.is_open());
+
+    McpTestServer ts;
+    ts.response_store_for_test = &store;
+    ts.start("operator");
+    auto call = [&](const std::string& args) {
+        auto res = ts.call(
+            R"({"jsonrpc":"2.0","method":"tools/call","id":76,"params":{"name":"query_responses","arguments":)" +
+            args + "}}");
+        REQUIRE(res);
+        return nlohmann::json::parse(res->body);
+    };
+    // These strings are quoted verbatim in docs/user-manual/mcp.md; a wording change here
+    // must change that page in the same commit.
+    auto st = call(R"({"instruction_id":"instr-msg","status":"0x1"})");
+    REQUIRE(st.contains("error"));
+    CHECK(st["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    CHECK(st["error"]["message"] ==
+          "status must be an integer between -1 and 2147483647 (-1 or omitted = any)");
+    auto lim = call(R"({"instruction_id":"instr-msg","limit":"100abc"})");
+    REQUIRE(lim.contains("error"));
+    CHECK(lim["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    CHECK(lim["error"]["message"] ==
+          "limit must be a JSON integer no larger than 9223372036854775807");
+}
+
 TEST_CASE("MCP query_responses: the strict status and limit boundaries (#4644)",
           "[pg][mcp][integration][response][fanout]") {
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);

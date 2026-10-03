@@ -254,15 +254,19 @@ void register_response_routes(HttpRouteSink& sink, Deps deps) {
                 csv += data_export::csv_escape(r.error_detail) + "\r\n";
                 return csv.size();
             });
-            // A cut export is renamed `-truncated` so the signal survives `curl -o` and
-            // browser downloads, which discard the response header below.
+            // A cut CSV ends with an in-band trailer record: the header and the
+            // `-truncated` name are both lost by a plain `curl -o`, the body is not.
+            if (cut.any())
+                csv += export_csv_truncation_row(cut, 7);
             res.set_header("Content-Disposition",
                            "attachment; filename=\"" +
                                export_filename(instruction_id, "csv", cut.any()) + "\"");
             if (cut.any())
                 res.set_header("X-Result-Truncated-By-Cap", "true");
-            record_response_export_cut(deps.metrics, "rest", cut, {});
             res.set_content(std::move(csv), "text/csv; charset=utf-8");
+            // Counted once the response is fully built into `res`: a throw while building
+            // a large body must not count a cut that was never served.
+            record_response_export_cut(deps.metrics, "rest", cut, {});
         } else {
             nlohmann::json arr = nlohmann::json::array();
             std::size_t json_bytes = 0;
@@ -284,11 +288,11 @@ void register_response_routes(HttpRouteSink& sink, Deps deps) {
             envelope["responses"] = std::move(arr);
             if (cut.any())
                 envelope["result_truncated_by_cap"] = true;
-            record_response_export_cut(deps.metrics, "rest", cut, {});
             res.set_header("Content-Disposition",
                            "attachment; filename=\"" +
                                export_filename(instruction_id, "json", cut.any()) + "\"");
             res.set_content(envelope.dump(2), "application/json; charset=utf-8");
+            record_response_export_cut(deps.metrics, "rest", cut, {});
         }
     });
 
@@ -333,6 +337,9 @@ void register_response_routes(HttpRouteSink& sink, Deps deps) {
         // The legacy list had no ceiling on an explicit `limit` (an unbounded fetch, the
         // same defect class as #4703's export); v1 and MCP clamp to 1000. limit<=0 keeps
         // meaning the store default (100).
+        // The cap used to be silent: a request above it was served `kQueryRowLimitCap` rows
+        // with nothing in the body saying so. `clamped` drives the signal below.
+        const bool limit_clamped = q.limit > kQueryRowLimitCap;
         q.limit = cap_query_limit(q.limit);
 
         // #1634 / ADR-0017 INV-3 (CRITICAL): resolve the in-scope agent set and push it
@@ -386,8 +393,14 @@ void register_response_routes(HttpRouteSink& sink, Deps deps) {
                            {"output", r.output},
                            {"error_detail", r.error_detail}});
         }
-        res.set_content(nlohmann::json({{"responses", arr}, {"count", arr.size()}}).dump(),
-                        "application/json");
+        nlohmann::json body = {{"responses", arr}, {"count", arr.size()}};
+        // Set only when the caller asked for more than the ceiling AND the page came back
+        // full: more rows may exist past it (the fetch does not look ahead, so a result of
+        // exactly the ceiling is flagged too). Absent otherwise, so a request that never
+        // exceeded the ceiling gets a byte-identical body.
+        if (limit_clamped && results.size() == static_cast<std::size_t>(q.limit))
+            body["result_truncated_by_cap"] = true;
+        res.set_content(body.dump(), "application/json");
     });
 }
 
