@@ -1102,9 +1102,9 @@ a runner for a concurrently-queued PR job. Fix: `ci.yml`'s Linux job's
 concurrently, leaving at least one Big Tam runner unclaimed by it — a no-op
 on `pull_request` events (already a single-leg matrix via the existing
 `exclude`). This is a mitigation, not a guarantee: the freed runner is not
-reserved for any specific job. `proto-compat` (this same workflow) targets
-the bare `[self-hosted, Linux, X64]` label every Big Tam Linux runner also
-carries and runs on the same push trigger — it can claim the freed runner
+reserved for any specific job. `proto-compat` (this same workflow) is pinned
+to the same `yuzu-bigtam-linux` label, so it draws on the same four runners,
+and runs on the same push trigger — it can claim the freed runner
 itself before a queued PR job does (its own `timeout-minutes: 5` means it
 self-frees quickly, but it is a real same-push competitor, not just the
 already-named nightly-overlap case). A stacked nightly run, another

@@ -56,6 +56,10 @@ platform-specific sections below. Required-pool outages are intentionally red
 and keep the repository's **no merge to main while `nightly-broken` is open**
 discipline until the next green nightly closes the issue.
 
+There is no Linux fallback runner while Big Tam is down (the Shulgi runners are
+retired); the recovery path is described in the Rollback section of
+`docs/ci-ubuntu-2604-cutover.md`.
+
 ---
 
 ## 1.2 Trusted execution of a fork pull request
