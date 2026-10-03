@@ -12,7 +12,7 @@ Canonical caching patterns for Yuzu CI workflows. **CI eats more time than dev �
 | Runner kind | Cache mechanism | Snippet |
 |---|---|---|
 | GHA-hosted (`ubuntu-24.04`, `macos-15`, `windows-latest`) | `actions/cache/restore` + paired `actions/cache/save` | [GHA-hosted](#gha-hosted-ephemeral-runners) |
-| Self-hosted (`yuzu-wsl2-linux`, `yuzu-local-windows`, future macOS) | Local filesystem under `runner.tool_cache` | [Self-hosted](#self-hosted-runners) |
+| Self-hosted (`yuzu-bigtam-linux`, `yuzu-weetam-windows`, `yuzu-bigmags-macos`) | Local filesystem under `runner.tool_cache` | [Self-hosted](#self-hosted-runners) |
 
 **Hard rule (enforced by `.github/workflows/zizmor.yml`):** never use `save-always: true` on `actions/cache@`. The input is deprecated by the actions/cache maintainers as "does not work as intended and will be removed in a future release." The `Guard — no save-always on actions/cache` step in zizmor.yml fails any workflow audit if `^[[:space:]]*save-always:` reappears as a YAML key. Don't try to silence the guard — rewrite the cache step using the snippets below.
 
@@ -221,7 +221,7 @@ Fix: also trigger the job on `push` to the branch PRs actually base on. The cana
 
 ## Self-hosted runners
 
-Self-hosted runners (`yuzu-wsl2-linux`, `yuzu-local-windows`, and any future self-hosted macOS) keep state across jobs. **Skip GHA's blob-storage cache entirely** — round-tripping ~1 GB of vcpkg binaries through GHA storage when the same data already lives on the runner's local disk is an unforced loss. Pin caches to `runner.tool_cache` (a stable per-runner path that survives between jobs but is owned by the runner setup, not the workspace):
+Self-hosted runners (the `yuzu-bigtam-linux`, `yuzu-weetam-windows` and `yuzu-bigmags-macos` pools) keep state across jobs. **Skip GHA's blob-storage cache entirely** — round-tripping ~1 GB of vcpkg binaries through GHA storage when the same data already lives on the runner's local disk is an unforced loss. Pin caches to `runner.tool_cache` (a stable per-runner path that survives between jobs but is owned by the runner setup, not the workspace):
 
 ```yaml
 # Self-hosted: no actions/cache step at all. Set the env var that
