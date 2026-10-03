@@ -30,6 +30,8 @@
 // this test binary via yuzu_sdk_dep; see test_string_utils.cpp for precedent).
 #include <yuzu/string_utils.hpp>
 
+#include <atomic_file_write.hpp> // yuzu::shared::write_file_atomic (production primitive)
+
 #include <algorithm>
 #include <cstdio>
 #include <filesystem>
@@ -174,22 +176,10 @@ bool has_nested_quantifiers(std::string_view pattern) {
     return false;
 }
 
-// ── Replicated: atomic_write_file ───────────────────────────────────────
-// Simplified (non-Windows) copy from filesystem_plugin.cpp
-
+// atomic_write_file: thin adapter over the production shared primitive (same
+// owner_only_mode=false policy the filesystem plugin uses).
 bool atomic_write_file(const fs::path& target, std::string_view content) {
-    auto dir = target.parent_path();
-    auto tmp = dir / (target.filename().string() + ".yuzu_tmp");
-    {
-        std::ofstream ofs(tmp, std::ios::binary | std::ios::trunc);
-        if (!ofs) return false;
-        ofs.write(content.data(), static_cast<std::streamsize>(content.size()));
-        if (!ofs) { std::error_code ec; fs::remove(tmp, ec); return false; }
-    }
-    std::error_code ec;
-    fs::rename(tmp, target, ec);
-    if (ec) { fs::remove(tmp, ec); return false; }
-    return true;
+    return yuzu::shared::write_file_atomic(target, content, {.owner_only_mode = false}).has_value();
 }
 
 // ── Helper: read entire file as string ──────────────────────────────────
@@ -454,6 +444,61 @@ TEST_CASE("AtomicWrite: writes empty content", "[filesystem][atomic]") {
     CHECK(ok == true);
     CHECK(read_file(tf.path).empty());
 }
+
+TEST_CASE("AtomicWrite: a planted file at the exact temp path fails the write",
+          "[filesystem][atomic]") {
+    TempDir td("yuzu_test_atomic_planted");
+    auto target = td.path / "target.txt";
+    auto planted = fs::path{target.string() + ".tmp.forced"};
+    { std::ofstream f(planted, std::ios::binary); f << "SENTINEL"; }
+
+    auto r = yuzu::shared::write_file_atomic(
+        target, "PAYLOAD", {.owner_only_mode = false, .forced_temp_suffix = "forced"});
+    REQUIRE_FALSE(r.has_value());
+    CHECK_FALSE(fs::exists(target));
+    CHECK(read_file(planted) == "SENTINEL"); // untouched, not followed or removed
+}
+
+#ifndef _WIN32
+TEST_CASE("AtomicWrite: owner_only_mode=false creates at 0666 & ~umask, not 0600",
+          "[filesystem][atomic]") {
+    const mode_t u = ::umask(0);
+    ::umask(u);
+    TempDir td("yuzu_test_atomic_mode");
+    auto target = td.path / "mode.txt";
+
+    auto r = yuzu::shared::write_file_atomic(target, "x", {.owner_only_mode = false});
+    REQUIRE(r.has_value());
+    struct stat st{};
+    REQUIRE(::stat(target.c_str(), &st) == 0);
+    CHECK((st.st_mode & 0777) == (0666 & ~u));
+}
+
+TEST_CASE("AtomicWrite: owner_only_mode=false fails on a file fsync error, keeps dest, no temp",
+          "[filesystem][atomic]") {
+    TempDir td("yuzu_test_atomic_fsync_eio");
+    auto target = td.path / "keep.txt";
+    { std::ofstream f(target, std::ios::binary); f << "ORIGINAL"; }
+
+    // Capture-less seam: every fsync fails. The file fsync runs first, so the
+    // write must fail before the rename publishes anything.
+    yuzu::shared::PosixFdOps ops;
+    ops.fsync = [](int) {
+        errno = EIO;
+        return -1;
+    };
+    auto r = yuzu::shared::write_file_atomic(target, "PAYLOAD",
+                                             {.owner_only_mode = false, .fd_ops = &ops});
+    REQUIRE_FALSE(r.has_value());
+    CHECK(read_file(target) == "ORIGINAL");
+    std::size_t entries = 0;
+    for (const auto& e : fs::directory_iterator(td.path)) {
+        (void)e;
+        ++entries;
+    }
+    CHECK(entries == 1); // only the destination; the staging temp was removed
+}
+#endif
 
 TEST_CASE("AtomicWrite: writes large content 1MB", "[filesystem][atomic]") {
     TempFile tf("", "yuzu_test_atomic_large.txt");

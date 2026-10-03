@@ -16,7 +16,10 @@
 
 #include <yuzu/plugin.hpp>
 
+#include <atomic_file_write.hpp> // yuzu::shared::write_file_atomic
+
 #include <nlohmann/json.hpp>
+#include <spdlog/spdlog.h>
 
 #include <filesystem>
 #include <format>
@@ -69,10 +72,9 @@ void save_tags() {
     }
 
     nlohmann::json j = g_tags;
-    std::ofstream f(g_tags_path);
-    if (f) {
-        f << j.dump(2);
-    }
+    auto r = yuzu::shared::write_file_atomic(g_tags_path, j.dump(2), {.owner_only_mode = false});
+    if (!r)
+        spdlog::warn("tags: state not persisted: {}", r.error().message);
 }
 
 // ── ABI4 capability declarations (#2204) ────────────────────────────────────
