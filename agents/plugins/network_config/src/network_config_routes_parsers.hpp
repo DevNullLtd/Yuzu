@@ -547,7 +547,7 @@ inline std::string mac_v4_text(const unsigned char* sa) {
 /// KAME stores the interface scope of a link-local (or link/node-scoped multicast)
 /// address in bytes 2-3 of the address itself (`fe80:7::` is `fe80::%en0`). That
 /// is an encoding artefact, not part of the address — and it is the only place the
-/// scope lives in a dump — so it is cleared; the row's `interface` carries it.
+/// scope lives in a dump — so it is cleared; the row's `ifname` carries it.
 inline std::string mac_v6_text(const unsigned char* sa) {
     unsigned char a[16]{};
     std::memcpy(a, sa + offsetof(struct sockaddr_in6, sin6_addr), sizeof(a));

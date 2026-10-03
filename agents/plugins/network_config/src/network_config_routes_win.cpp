@@ -133,7 +133,8 @@ int collect_routes_win(yuzu::CommandContext& ctx) {
         w.ifname = interface_alias(r.InterfaceLuid, r.InterfaceIndex);
         routes.push_back(std::move(w));
         if (routes.size() > kRoutesRowCap)
-            break; // one past the cap is enough for win_routes_to_rows() to report it
+            break; // one past the cap is enough for win_routes_to_rows() to report it; an
+                   // unformattable entry after this point goes unreported (the read is CONSTRAINED anyway)
     }
 
     // The host-local filter, the cap-after-filter and the row mapping are the pure
