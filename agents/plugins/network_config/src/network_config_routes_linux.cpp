@@ -12,11 +12,17 @@
  * source `ip` uses). An index that no longer resolves (the interface vanished
  * between the dump and the lookup) is rendered `-`, never guessed.
  */
+#if defined(__linux__)
+// glibc's <net/if.h> (if_indextoname, IF_NAMESIZE) MUST come before anything that pulls in
+// <linux/if.h> — network_config_parsers.hpp does, for IFF_UP — or the two redefine IFF_UP /
+// IFF_BROADCAST / struct ifreq. libc-compat.h makes the kernel header skip what glibc already
+// declared, but only in this order.
+#include <net/if.h>
+#endif
+
 #include "network_config_routes_legs.hpp"
 
 #if defined(__linux__)
-
-#include <net/if.h> // if_indextoname, IF_NAMESIZE
 
 #include <cstdint>
 #include <string>
