@@ -1192,15 +1192,18 @@ A rejected agent re-registers through its `NOT_FOUND` recovery (cooldown from 2 
 exists from agent v0.13.0 (checked in the agent source at the v0.12.0 and v0.13.0 tags), but the released v0.13.0
 and v0.14.0-rc6 agents wedge in their reconnect path with default settings (bug #2182, fixed by PR #5183, in no
 release yet) and recover only with `--no-auto-update` (observed with both) or on a build that includes the fix;
-v0.12.0 and older never re-register by themselves (observed). Upgrade the agents first, then the gateway, with a
+v0.12.0 never re-registers by itself (observed; older is inferred from the source). Upgrade the agents first, then the gateway, with a
 build that includes the #2182 fix once released; until then restart an agent that stays rejected. Agents that do
 not connect through the gateway are not affected. An older agent only
 logs `Heartbeat failed` and, for persistent missing state, stays rejected until it is restarted or upgraded (a heartbeat
 in the short take_pending to register_agent gap can succeed later without re-registration); that matters only when its
 heartbeats are rejected: under a topology that breaks the one-connection assumption, against a gateway
-running without the session index, or after a gateway registry process restart or crash while connections
+running without the session index, after a gateway registry process restart or crash while connections
 stay up (the registry recreates its tables empty; a node failover that leaves the session not held by the
-surviving node is expected to behave the same, inferred, not tested). Rollback is redeploying the
+surviving node is expected to behave the same, inferred, not tested), or, for released agents, after a
+gateway process restart (observed in two graceful SIGTERM runs: the released agents tested did not notice the
+lost `Subscribe` stream and got `NOT_FOUND` on the new gateway, and v0.14.0-rc6 and v0.13.0 then wedged; the
+branch agent re-registered in 11 to 12 s with no rejections). Rollback is redeploying the
 previous gateway (the only new state is the in-memory index; derived from the change, not run).
 - **Connection key.** The key is the pid of the HTTP/2 connection process that carries the call, read
   through a typed accessor added to the vendored grpcbox as its third `YUZU PATCH` site
@@ -1248,7 +1251,7 @@ previous gateway (the only new state is the in-memory index; derived from the ch
 | agent process cleanup | `deregister_agent/3` is fenced on the caller's own pid and session: it always removes that session's row, and removes the routing row and `pg` memberships only while that pid still owns the agent id, so a process superseded by a newer registration cannot remove it. The unfenced `deregister_agent/1` remains (it removes whichever process holds the agent id, with that row's session entry) |
 | registry `DOWN` for an agent pid | the session row goes only if the agent's routing row still names that pid |
 | registry restart | all of its tables (routing, pending and sessions) are recreated empty; lookups answer `{error, unavailable}` while the table is absent and `error` afterwards, so heartbeats get `NOT_FOUND` and agents recover through their re-register path. Observed on a rig by killing the registry process with 4 real agents attached: `unknown_session` rose by 4 (one per agent), `registry_unavailable` stayed 0, and all 4 agents were admitted again within about 25 s without a manual restart |
-| gateway restart | everything is gone and every connection is dropped; agents reconnect with fresh sessions |
+| gateway restart | everything is gone and every connection is dropped; agents with the reconnect fix reconnect with fresh sessions (observed with the branch agent); released agents did not notice the lost `Subscribe` stream in the graceful SIGTERM runs and need a restart if they stay rejected |
 | upstream replay and `reannounce/2` | replay never writes the index directly; a forced disconnect of a superseded replay ends that agent process, and the fenced cleanup then removes its row |
 | server-only restart | untouched: admission does not consult the server, so heartbeats are still admitted and the server's verdict stays advisory |
 
@@ -1269,20 +1272,22 @@ previous gateway (the only new state is the in-memory index; derived from the ch
   requires client certificates (a test-client mutual TLS leg exists in
   `yuzu_gw_heartbeat_conn_rpc_tests`; the shipped listener does not require client certificates). Not
   tested at all: a multiplexing HTTP/2 proxy with upstream keepalive, fleet-scale storms, Windows service
-  mode, a macOS agent, a real hot code load and the real C++ agent across a GOAWAY. The rig runs used
+  mode, a macOS agent, a real hot code load and a GOAWAY that the gateway itself originates (an injected one was run). The rig runs used
   gateway commit `1c145d78a` (the first plaintext run used `2e884bb9b`, which differs only in tests and
   docs); later fix commits (`605f117d2` index guard, `3431d20ea` `/readyz` `sessions_index`,
   `026830cd9` summary log state created at boot, and the round-2 code commits `e139c5e86` boot test and
   two comments, `9ad473534` counter HELP wording, `942fe5770` and `c2d040a66` test changes, `ab3986ec1`
-  comments, and the round-3 code commit `21125cc3b` comment, HELP and test changes) are covered by eunit only (fix-agent runs, not rig runs), and the boot path of the final tip
-  has not been exercised on a rig. The run record is
+  comments, and the round-3 code commit `21125cc3b` comment, HELP and test changes) were covered by eunit only
+  (fix-agent runs) until a plaintext rig run at `1e9c9784d` exercised the boot path of the final gateway source. The
+  commits after `1e9c9784d` are test, documentation and HELP text changes only (covered by eunit, not rig-run). The run record is
   [gateway-heartbeat-connection-binding-2026-10-03](../security-reviews/gateway-heartbeat-connection-binding-2026-10-03.md).
 - **Connection close and GOAWAY.** Observed in the gateway's own tests with a test HTTP/2 client: the
   gateway's HTTP/2 server closes a connection as soon as it sends GOAWAY, so a `Subscribe` stream and
   its binding end with the connection (there is no drain period). A heartbeat that reaches the gateway
   on a different connection while the old `Subscribe` is still bound is rejected (`NOT_FOUND`,
-  connection mismatch) and the agent recovers by re-registering. The behaviour of the real C++ agent
-  across a GOAWAY has not been tested.
+  connection mismatch) and the agent recovers by re-registering. With the real C++ agent (a branch build) a
+  graceful GOAWAY injected on the gateway-side connection by the tester (the gateway did not originate one) moved the
+  next heartbeat to a new connection: the mismatch counter rose by one and the agent re-registered 16 s later.
 - **Deploying.** The index table is created at registry init, so deployment needs a gateway restart;
   hot code upgrade is not supported for this change. Code loaded into a running node has no table: the
   registry guards its index calls (`catch error:badarg`), so it survives and keeps its routing rows and

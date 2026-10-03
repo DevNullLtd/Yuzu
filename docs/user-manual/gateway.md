@@ -174,8 +174,8 @@ response does not reveal which condition failed; the reason appears only in the
 counters below. A heartbeat that is admitted is acknowledged and buffered exactly as
 before.
 
-An agent whose heartbeat is answered `NOT_FOUND` recovers on its own, as it already
-does for any lost session: it waits an escalating cooldown (2 s on the first
+A rejected agent re-registers through its `NOT_FOUND` handling where that handling
+works; see below. Where it works, the agent waits an escalating cooldown (2 s on the first
 rejection, doubling to a 300 s cap), drops its `Subscribe` stream and registers
 again. There is no wire or server change, and no agent change for the supported
 topologies. The recovery logic exists from v0.13.0 (checked in the agent source at
@@ -187,19 +187,25 @@ from the fix). They recover only with `--no-auto-update` (observed with v0.13.0 
 v0.14.0-rc6, re-registering 20 to 21 s after a registry restart; a command-line flag
 with no environment variable) or on a build that includes the fix. Agent v0.12.0 and
 older never re-register by themselves: they only log `Heartbeat failed` (observed with
-v0.12.0, 29 failures in 14.5 minutes, with and without `--no-auto-update`) and, for
+v0.12.0 and default settings, 29 failures in 14.5 minutes; a `--no-auto-update` run was
+watched for only about 2 minutes and behaved the same, with no re-registration; older than
+v0.12.0 is inferred from the agent source, not run) and, for
 persistent missing state, stay rejected until restarted or upgraded (a heartbeat that
 falls in the short gap between the session leaving the pending table and its agent
 process registering can succeed later without re-registration). Upgrade the agents
 first, then the gateway, with a build that includes the #2182 fix once released; until
 then, restart an agent that stays rejected (restarting the agent service re-registers
 it). Agents that do not connect through the gateway are not affected. Recovery matters
-only when heartbeats are rejected, which happens in three cases: a topology that breaks
-the one-connection assumption, a gateway running without the session index, and a
+only when heartbeats are rejected, which happens in four cases: a topology that breaks
+the one-connection assumption, a gateway running without the session index, a
 gateway registry process restart or crash while agent connections stay up (the registry
 recreates its tables empty, so every heartbeat for the agents it held is rejected until
-they re-register). A node failover that leaves the session not held by the surviving
-node is expected to behave the same way (inferred, not tested).
+they re-register), and, for released agents, a gateway process restart (observed in two
+graceful SIGTERM runs: the released agents tested did not notice the lost `Subscribe`
+stream and got `NOT_FOUND` on the new gateway, rc6 and v0.13.0 then wedged, and the
+branch agent re-registered in 11 to 12 s with no rejections; see Connection drain). A
+node failover that leaves the session not held by the surviving node is expected to
+behave the same way (inferred, not tested).
 
 **Supported topologies.** Agents connect to the gateway agent listener (`:50051`)
 directly, or through an L4 / TLS-passthrough path that keeps one TCP connection per
@@ -295,8 +301,9 @@ counters and the summary line.
 - `yuzu_gw_heartbeat_rejected_total{reason="unknown_session"}` rises by about one per
   agent after a gateway registry restart. Observed: after killing the registry process
   with 4 agents attached the counter rose by 4, and all 4 agents were admitted again
-  within about 25 s (observed with agents built from the branch tree, which includes the
-  #2182 fix; one to four registry kills, recovery in 17 to 37 s). The released v0.13.0
+  within about 25 s (a four-agent run; observed with agents built from the branch tree,
+  which includes the #2182 fix). Over four later registry kills with one branch agent,
+  that agent was admitted again 17 to 37 s after each kill. The released v0.13.0
   and v0.14.0-rc6 agents wedge with default settings and v0.12.0 and older only log the
   rejection (see Heartbeat admission above); restart such an agent. It is also expected
   to rise around a node failover, but that was not observed in testing (multi-node was
@@ -326,7 +333,9 @@ observed with two agents only, and no storm test was run at fleet scale.
 a load balancer that should drain such a node must probe `:8081/readyz`.
 
 **Rolling upgrades.** Restart one gateway node at a time behind an L4 balancer. Agents
-on a restarted node reconnect and re-register on their back-off. Multi-node behaviour
+on a restarted node reconnect and re-register on their back-off (agents with the reconnect
+fix; released agents may need a restart, see [Heartbeat admission](#heartbeat-admission)).
+Multi-node behaviour
 is not tested.
 
 **Upgrading.** A rejected agent re-registers on its own only in a build that includes
@@ -342,8 +351,9 @@ hot code load was not run): the registry process survives and keeps its routing 
 and process groups, logs one warning, and every heartbeat on that node is rejected as
 `registry_unavailable` until the node is restarted. `/readyz` reports the table as
 `sessions_index` and answers 503 `not_ready` while it is missing. The table is
-protected: only the registry process writes it. After a restart agents reconnect,
-register and subscribe again, and their sessions are bound to the new connections.
+protected: only the registry process writes it. After a restart agents with the
+reconnect fix reconnect, register and subscribe again, and their sessions are bound to the new
+connections (released agents may need a restart, see [Heartbeat admission](#heartbeat-admission)).
 
 **Rollback.** Redeploy the previous gateway release. The only new state is the in-memory
 session index, and there is no wire, agent or server change, so nothing needs migrating;
@@ -374,14 +384,17 @@ keepalive, Windows service mode, a macOS agent, fleet-scale storms, a real hot c
 load, TLS in the final-code rig run, and a real C++ agent across a `GOAWAY` that the
 gateway itself originates (only an injected one was run).
 
-The rig runs used gateway commit `1c145d78a` (the first run, plaintext, ran on
+The first rig runs used gateway commit `1c145d78a` (the first run, plaintext, ran on
 `2e884bb9b`, which differs from it only in tests and docs). Later fix
-commits were not run on a rig and are covered by the eunit suite only: `605f117d2`
+commits were covered by the eunit suite only until a plaintext rig run (rig run 4) at `1e9c9784d`
+exercised the final gateway source, the boot path included: `605f117d2`
 (index guard), `3431d20ea` (`/readyz` `sessions_index`) and `026830cd9` (summary log
-state created at boot), and the round-2 code commits `e139c5e86` (boot test and two
+state created at boot), the round-2 code commits `e139c5e86` (boot test and two
 source comments), `9ad473534` (counter HELP wording), `942fe5770` and `c2d040a66`
-(test changes) and `ab3986ec1` (comments). The round-3 code commit `21125cc3b` changes a source comment, the `yuzu_gw_heartbeat_rejected_total` HELP text and tests only. The boot path of the final tip
-has not been exercised on a rig. At `ab3986ec1` the fix agents ran eunit (401 of 401,
+(test changes) and `ab3986ec1` (comments), and the round-3 code commit `21125cc3b` (a source
+comment, the `yuzu_gw_heartbeat_rejected_total` HELP text and tests). The commits after
+`1e9c9784d` (`050703fcc`, `e3c9989b4`, `b19e4d818`, `b497ead98` and later documentation and test
+commits) change tests, documentation and HELP text only, and were not run on a rig. At `ab3986ec1` the fix agents ran eunit (401 of 401,
 three times from a fresh build) and dialyzer (clean); these were not rig runs. The per-run record is in
 [the evidence record](../security-reviews/gateway-heartbeat-connection-binding-2026-10-03.md).
 
