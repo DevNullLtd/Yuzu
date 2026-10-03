@@ -36,21 +36,43 @@
  *     clock reading) are NOT adopted: there is nothing to probe for and no
  *     prior reading worth persisting when the content being aged out is
  *     disposable scratch space, not a record whose true age matters.
- *   - Part 3 (SANITISE the reading) and part 4 (SUPPRESS only a repeat of
- *     the SAME anomaly) are NOT adopted for the same reason: they exist to
- *     stop a transient clock glitch from mass-wiping real records across
- *     passes; a scratch sweep has no "mass-wipe" blast radius to begin with
- *     (see the caps below), so the anomaly-suppression machinery has
- *     nothing to protect.
+ *   - Part 3 (SANITISE the reading) IS adopted IN-PROCESS (#4503), in the
+ *     one shape that needs no persistence: agents/shared/wall_clock_step.hpp
+ *     compares CONSECUTIVE (wall, monotonic) samples taken at each
+ *     non-startup pass. A forward wall-clock step larger than
+ *     kScratchSweepClockStepToleranceSecs between two samples quarantines
+ *     sweeping for kScratchDirStaleAfterSecs of MONOTONIC time (the pass is
+ *     skipped and reported via ScratchSweepResult::skipped_clock_step). After
+ *     that, every directory created before the step has a real age beyond
+ *     the stale threshold, so cleanup resumes with no restart. Consecutive
+ *     comparison (not startup-relative) is deliberate: a backward step that
+ *     is later restored shows up as a forward step at the restoration, and a
+ *     permanent forward correction is recovered from once the quarantine
+ *     lapses. Backward steps alone are not acted on -- they only make
+ *     entries look fresher. The STARTUP pass has no prior sample and is
+ *     accepted as-is: its only concurrent writer is a plugin-capture
+ *     process, and the regenerable-copy argument above bounds the cost of a
+ *     wrong reading (recorded; same register row in the doc).
+ *   - Part 4 (SUPPRESS only a repeat of the SAME anomaly) is NOT adopted
+ *     separately: the quarantine window above is the suppression, keyed on
+ *     monotonic time rather than a persisted fact-set.
  *   - Part 5 (cap every accepted pass UNCONDITIONALLY) IS adopted, via the
- *     four `kScratchSweep*` constants below -- a pass never opens more than
- *     kScratchSweepMaxRootEntries root entries, never removes more than
- *     kScratchSweepMaxRemovals candidates, never starts a new candidate once
- *     kScratchSweepMaxWallMs has elapsed (checked before each root entry and
- *     before each candidate -- not preemptive mid-candidate, since one
- *     candidate's own bounded file-unlink loop is never interrupted once
- *     started), and never trusts more than kScratchSweepMaxDirEntries
- *     entries inside one candidate.
+ *     five `kScratchSweep*` constants below (carried per pass in
+ *     SweepLimits) -- a pass never opens more than max_root_entries root
+ *     entries, never removes more than max_removals candidates, never fails
+ *     more than max_failures, never starts a new candidate once max_wall_ms
+ *     has elapsed (checked before each root entry and before each candidate
+ *     -- not preemptive mid-candidate, since one candidate's own bounded
+ *     file-unlink loop is never interrupted once started), and never trusts
+ *     more than max_dir_entries entries inside one candidate.
+ *   - Rotation (#4504): each pass starts its walk at sweep_start_index(
+ *     pass_counter, n) and wraps, so a persistently failing run of early
+ *     entries cannot starve later ones across passes. STATED LIMIT: rotation
+ *     guarantees eventual coverage of every entry WITHIN the first
+ *     max_root_entries the root enumeration returns; a data_dir holding more
+ *     entries than that reports `deferred` on every pass and entries beyond
+ *     the cap are not reached by rotation. A resumable root enumeration
+ *     (a confined_fs_walk.hpp change) is the named upgrade path.
  *   - Part 6 (decide deliberately what a missing anchor means) is NOT
  *     adopted: there is no persisted anchor here to be missing.
  *   - Part 7 (elapsed-time thresholds are ABSOLUTE, never relative to a
@@ -97,6 +119,8 @@ inline constexpr std::size_t kScratchDirRandomHexLen = 32;
 inline constexpr std::int64_t kScratchDirStaleAfterSecs = 3600;
 
 // ── Unconditional per-pass caps (clock-guarded-retention part 5) ─────────
+// The constants below are the DEFAULTS of SweepLimits (further down); the
+// sweep reads only the SweepLimits it is handed.
 
 /// Maximum entries enumerated directly under agent.data_dir in one pass.
 inline constexpr std::size_t kScratchSweepMaxRootEntries = 4096;
@@ -125,6 +149,26 @@ inline constexpr std::int64_t kScratchSweepMaxWallMs = 2000;
 /// small, fixed set -- so this is a generous cap, not a working limit.
 inline constexpr std::size_t kScratchSweepMaxDirEntries = 64;
 
+/// Forward wall-vs-monotonic divergence between consecutive samples above
+/// which the caller treats the wall clock as stepped (part 3, banner above).
+inline constexpr std::int64_t kScratchSweepClockStepToleranceSecs = 60;
+
+/// Per-pass caps, injectable so tests can drive tiny values.
+struct SweepLimits {
+    std::size_t max_root_entries = kScratchSweepMaxRootEntries;
+    std::size_t max_removals = kScratchSweepMaxRemovals;
+    std::size_t max_failures = kScratchSweepMaxFailures;
+    std::int64_t max_wall_ms = kScratchSweepMaxWallMs;
+    std::size_t max_dir_entries = kScratchSweepMaxDirEntries;
+};
+
+/// Index at which pass number `pass_counter` starts walking `entry_count`
+/// root entries (wrapping): 0 when empty, else pass_counter % entry_count.
+[[nodiscard]] constexpr std::size_t sweep_start_index(std::uint64_t pass_counter,
+                                                      std::size_t entry_count) noexcept {
+    return entry_count == 0 ? 0 : static_cast<std::size_t>(pass_counter % entry_count);
+}
+
 /// Outcome of one sweep pass. Every count defaults to zero; `enumerate_error`
 /// + `os_error` are set only when the root itself could not be opened/
 /// enumerated at all (the pass then did nothing, rather than guessing).
@@ -136,6 +180,9 @@ struct ScratchSweepResult {
     std::size_t deferred{0};
     bool enumerate_error{false};
     int os_error{0};
+    /// Set by the caller (not the sweep) when a pass was skipped entirely
+    /// because the wall clock stepped forward (quarantine, part 3).
+    bool skipped_clock_step{false};
 };
 
 /// True only for the exact prefix followed by exactly
@@ -169,16 +216,27 @@ struct ScratchSweepResult {
     return (now_unix_s - mtime_unix_s) > stale_after_s;
 }
 
+/// Open-time rejection of a candidate directory handle, from the plain fields
+/// of BY_HANDLE_FILE_INFORMATION (dwFileAttributes, dwVolumeSerialNumber) and
+/// the pinned root's volume serial: true for a reparse point (a mid-walk swap)
+/// or a volume mismatch. Pure so it is unit-testable off Windows; the header
+/// stays OS-header-free, hence plain integers and the literal reparse bit.
+inline constexpr std::uint32_t kFileAttributeReparsePoint = 0x00000400; // FILE_ATTRIBUTE_REPARSE_POINT
+
+[[nodiscard]] constexpr bool reject_candidate_handle(std::uint32_t file_attributes,
+                                                     std::uint32_t volume_serial,
+                                                     std::uint32_t root_volume_serial) noexcept {
+    return (file_attributes & kFileAttributeReparsePoint) != 0 ||
+           volume_serial != root_volume_serial;
+}
+
 #ifdef _WIN32
 /// Sweep `data_dir` for stale execution_artifacts scratch directories and
 /// remove them, using confined_fs's handle-relative, ownership-verified
 /// primitives (execution_artifacts_scratch_sweep_win.cpp). Never throws;
 /// never removes anything whose name fails is_scratch_dir_name, whose type
 /// is not a directory, whose age (per is_stale) is not past `stale_after_s`,
-/// or whose owner is not this process's own token owner.
-[[nodiscard]] ScratchSweepResult
-sweep_stale_scratch_dirs(const std::wstring& data_dir, std::int64_t now_unix_s,
-                          std::int64_t stale_after_s = kScratchDirStaleAfterSecs) noexcept;
+/// X
 #endif
 
 } // namespace yuzu::execution_artifacts

@@ -39,11 +39,15 @@
 
 #include <yuzu/string_utils.hpp>
 
+#include <wall_clock_step.hpp> // yuzu::shared::ClockStepGuard (agents/shared)
+
 #include <spdlog/spdlog.h>
 
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
+#include <mutex>
 #include <string>
 #include <string_view>
 
@@ -147,7 +151,10 @@ public:
         // A1 (#4390): reclaim any stale scratch directory a crashed/killed
         // prior dispatch left under agent.data_dir before this agent ever
         // runs amcache itself. Never affects init()'s own outcome -- see
-        // sweep_scratch_dirs's own try/catch(...).
+        // sweep_scratch_dirs's own try/catch(...). The guard is seeded BEFORE
+        // the startup pass; that pass itself is accepted as-is (no prior
+        // sample -- see the sweep header banner, part 3).
+        clock_guard_.last = yuzu::shared::sample_clocks();
         sweep_scratch_dirs("startup");
 #endif
         return {};
@@ -214,20 +221,36 @@ private:
                 reinterpret_cast<const char8_t*>(data_dir_.data()), data_dir_.size()};
             const std::wstring wide_data_dir = std::filesystem::path{data_dir_u8}.wstring();
 
-            const auto now = std::chrono::duration_cast<std::chrono::seconds>(
-                                  std::chrono::system_clock::now().time_since_epoch())
-                                  .count();
+            const yuzu::shared::ClockSample now = yuzu::shared::sample_clocks();
 
+            // Consecutive-sample forward-step guard (#4503). The startup pass
+            // has no prior sample and is accepted as-is.
+            bool skip = false;
+            if (std::string_view{trigger} != "startup") {
+                std::lock_guard<std::mutex> lock{clock_mu_};
+                skip = yuzu::shared::observe_and_should_skip(
+                    clock_guard_, now, yuzu::execution_artifacts::kScratchSweepClockStepToleranceSecs,
+                    yuzu::execution_artifacts::kScratchDirStaleAfterSecs);
+            }
+            if (skip) {
+                spdlog::warn("execution_artifacts: {} scratch sweep skipped: wall clock stepped "
+                             "forward relative to monotonic time; sweeping resumes after {} s",
+                             trigger, yuzu::execution_artifacts::kScratchDirStaleAfterSecs);
+                return;
+            }
+
+            const std::uint64_t pass = pass_counter_++;
             const auto result = yuzu::execution_artifacts::sweep_stale_scratch_dirs(
-                wide_data_dir, static_cast<std::int64_t>(now));
+                wide_data_dir, now.wall_s, yuzu::execution_artifacts::kScratchDirStaleAfterSecs,
+                yuzu::execution_artifacts::SweepLimits{}, pass);
 
             const std::size_t total = result.removed + result.failed + result.skipped_not_ours +
                                        result.deferred;
             if (total > 0) {
                 spdlog::warn(
-                    "execution_artifacts: {} scratch sweep under agent.data_dir: removed {} "
-                    "failed {} not_ours {} deferred {}",
-                    trigger, result.removed, result.failed, result.skipped_not_ours,
+                    "execution_artifacts: {} scratch sweep (pass {}) under agent.data_dir: "
+                    "removed {} failed {} not_ours {} deferred {}",
+                    trigger, pass, result.removed, result.failed, result.skipped_not_ours,
                     result.deferred);
             }
             if (result.enumerate_error) {
@@ -247,6 +270,15 @@ private:
     // directory), empty when agent.data_dir is unset -- collect_amcache
     // hard-fails constrained|data_dir_unset in that case, no fallback.
     std::string data_dir_;
+
+#ifdef _WIN32
+    // Consecutive-sample clock-step guard + rotation counter for the scratch
+    // sweep (#4503/#4504). execute() may run on concurrent threads, so the
+    // guard is mutex-protected; the counter is atomic.
+    yuzu::shared::ClockStepGuard clock_guard_;
+    std::mutex clock_mu_;
+    std::atomic<std::uint64_t> pass_counter_{0};
+#endif
 };
 
 YUZU_PLUGIN_EXPORT(ExecutionArtifactsPlugin)
