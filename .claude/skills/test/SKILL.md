@@ -49,7 +49,7 @@ The skill runs on both **Linux** (CI, WSL2) and **macOS** (operator dev box). Th
 **What skips on macOS without a running Docker daemon:**
 - Phase 1 docker-image-build → SKIP (operator can build locally only what they need)
 - Phase 2 upgrade-test → SKIP via `test-upgrade-stack.sh`'s `docker_available` early-out, gate row records SKIP with operator-readable note
-- Phase 6 sanitizers → still dispatches to the `yuzu-wsl2-linux` self-hosted runner, unaffected by local Docker availability
+- Phase 6 sanitizers → still dispatches to the `yuzu-bigtam-linux` self-hosted pool, unaffected by local Docker availability
 
 Everything else (Phase 0 preflight, Phase 1 C++ + Erlang build, Phase 4 native stack, Phase 5 unit/EUnit/dialyzer/CT/integration/e2e/synthetic-UAT/puppeteer, Phase 7a perf, Phase 7b coverage, Phase 8 teardown) runs natively on macOS.
 
@@ -72,7 +72,7 @@ Phase 5 — Test Gates (parallel) (unit / EUnit / dialyzer / CT / integration /
                                  e2e-api / e2e-mcp / synthetic UAT /
                                  puppeteer / instructions; e2e-security runs
                                  alone after the fan-out)
-Phase 6 — Sanitizers            (--full only — dispatched to yuzu-wsl2-linux runner)
+Phase 6 — Sanitizers            (--full only — dispatched to yuzu-bigtam-linux pool)
 Phase 7b — Coverage             (--full only — enforces tests/coverage-baseline.json)
 Phase 8 — Teardown + Summary    (cleans Phase 2 compose projects + scratch dir,
                                  finalises run row; LEAVES THE UAT ALIVE on
@@ -596,7 +596,7 @@ The results document each phase, every probe (with TCP latency), the agent's res
 
 ## Phase 6 — Sanitizers (PR2)
 
-Sanitizer rebuilds are dispatched to the `yuzu-wsl2-linux` self-hosted runner via `workflow_dispatch`. Running them locally would pin the dev box for ~15 min of compile time each; the always-on runner absorbs that cost while the operator continues Phase 5 gates locally.
+Sanitizer rebuilds are dispatched to the `yuzu-bigtam-linux` self-hosted pool via `workflow_dispatch`. Running them locally would pin the dev box for ~15 min of compile time each; the always-on runner absorbs that cost while the operator continues Phase 5 gates locally.
 
 ```bash
 if [[ "$MODE" == "full" ]]; then
@@ -611,7 +611,7 @@ The gate script:
 4. Parses each sanitizer log for `ERROR: AddressSanitizer`, `ERROR: LeakSanitizer`, `WARNING: ThreadSanitizer`, `ThreadSanitizer: data race`, `runtime error:`
 5. Writes two Phase 6 rows to `test_gates`: `Sanitizers (ASan+UBSan)` and `Sanitizers (TSan)`
 
-**Runner-offline path (WARN, not FAIL).** If `yuzu-wsl2-linux` is offline or the dispatch times out, both gates record `WARN` with notes explaining the operator retry path. The skill continues with the rest of the run rather than blocking on CI infrastructure that's out of reach.
+**Runner-offline path (WARN, not FAIL).** If the `yuzu-bigtam-linux` pool is offline or the dispatch times out, both gates record `WARN` with notes explaining the operator retry path. The skill continues with the rest of the run rather than blocking on CI infrastructure that's out of reach.
 
 **Workflow-file requirement.** `workflow_dispatch` evaluates the workflow file on the target ref. If you're dispatching against a commit that doesn't have `sanitizer-tests.yml` yet (e.g. running /test from an older branch), the dispatch will fail hard. The gate treats that as WARN per the offline-runner path.
 

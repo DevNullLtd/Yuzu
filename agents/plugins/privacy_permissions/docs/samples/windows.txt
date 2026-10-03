@@ -1,0 +1,124 @@
+captured: windows Windows 10.0.26200 x86_64 · bare-metal · 2026-10-02 · LocalSystem (elevated; account names replaced with jsmith) · leg-hash 6f22f62118ed
+== action=permissions
+permissions|windows|jsmith/-|camera|allowed|Allow|-|-
+permissions|windows|jsmith/-|full_disk_access|allowed|Allow|-|-
+permissions|windows|jsmith/-|location|allowed|Allow|-|-
+permissions|windows|jsmith/-|microphone|allowed|Allow|-|-
+permissions|windows|jsmith/5319275A.WhatsAppDesktop_cv1g1gvanyjgm|camera|denied|Deny|-|-
+permissions|windows|jsmith/5319275A.WhatsAppDesktop_cv1g1gvanyjgm|location|allowed|Allow|-|-
+permissions|windows|jsmith/C:/PROGRA~2/Citrix/ICACLI~1/HdxRtcEngine.exe|camera|absent|-|1699446591317|1699448586363
+permissions|windows|jsmith/C:/PROGRA~2/Citrix/ICACLI~1/HdxRtcEngine.exe|microphone|absent|-|1699446611274|1699448585475
+permissions|windows|jsmith/C:/PROGRA~2/Citrix/ICACLI~1/wfica32.exe|microphone|absent|-|1727429693627|1727429699770
+permissions|windows|jsmith/C:/Program Files (x86)/Steam/bin/cef/cef.win7x64/steamwebhelper.exe|microphone|absent|-|1672318772321|1672318774367
+permissions|windows|jsmith/C:/Program Files (x86)/Steam/steam.exe|microphone|absent|-|1737300284911|1737312589346
+permissions|windows|jsmith/C:/Program Files (x86)/ZoomCitrixHDXMediaPlugin/Zoom.exe|camera|absent|-|1732527131754|1732528329384
+permissions|windows|jsmith/C:/Program Files (x86)/ZoomCitrixHDXMediaPlugin/Zoom.exe|microphone|absent|-|1732527102525|1732528328824
+permissions|windows|jsmith/C:/Program Files/Google/Chrome/Application/chrome.exe|camera|absent|-|1680086733584|1680090101562
+permissions|windows|jsmith/C:/Program Files/Google/Chrome/Application/chrome.exe|microphone|absent|-|1680086733339|1680090101104
+permissions|windows|jsmith/C:/Program Files/Mozilla Firefox/firefox.exe|camera|absent|-|1783076929709|1783076929814
+permissions|windows|jsmith/C:/Program Files/Mozilla Firefox/firefox.exe|location|absent|-|1783980629480|1783980638651
+permissions|windows|jsmith/C:/Program Files/Mozilla Firefox/firefox.exe|microphone|absent|-|1783067244389|1783076927925
+permissions|windows|jsmith/C:/Program Files/ZoomVDIUniversalPlugin/Zoom.exe|camera|absent|-|1740751243521|1740753173596
+permissions|windows|jsmith/C:/Program Files/ZoomVDIUniversalPlugin/Zoom.exe|microphone|absent|-|1740756758468|1740758910632
+permissions|windows|jsmith/C:/Users/jsmith/AppData/Local/Discord/app-1.0.9003/Discord.exe|microphone|absent|-|1641936724694|1641939926749
+permissions|windows|jsmith/C:/Users/jsmith/AppData/Local/Discord/app-1.0.9004/Discord.exe|microphone|absent|-|1653427015718|1653435257256
+permissions|windows|jsmith/C:/Users/jsmith/AppData/Local/Discord/app-1.0.9005/Discord.exe|microphone|absent|-|1656188181497|1656201227494
+permissions|windows|jsmith/C:/Users/jsmith/AppData/Local/Discord/app-1.0.9006/Discord.exe|microphone|absent|-|1666209072080|1666211283640
+permissions|windows|jsmith/C:/Users/jsmith/AppData/Local/Discord/app-1.0.9007/Discord.exe|microphone|absent|-|1667209177309|1667215054016
+permissions|windows|jsmith/C:/Users/jsmith/AppData/Local/Discord/app-1.0.9011/Discord.exe|microphone|absent|-|1679341386067|1679347574918
+permissions|windows|jsmith/C:/Users/jsmith/AppData/Local/Discord/app-1.0.9013/Discord.exe|microphone|absent|-|1688667746674|1688678450415
+permissions|windows|jsmith/C:/Users/jsmith/AppData/Local/Discord/app-1.0.9015/Discord.exe|microphone|absent|-|1689366386961|1689370917031
+permissions|windows|jsmith/C:/Users/jsmith/AppData/Local/Discord/app-1.0.9019/Discord.exe|microphone|absent|-|1697050768806|1697050994230
+permissions|windows|jsmith/C:/Users/jsmith/AppData/Local/Discord/app-1.0.9020/Discord.exe|microphone|absent|-|1698351343228|1698357213518
+permissions|windows|jsmith/C:/Users/jsmith/AppData/Local/Discord/app-1.0.9022/Discord.exe|microphone|absent|-|1699382314222|1699402917314
+permissions|windows|jsmith/C:/Users/jsmith/AppData/Local/Discord/app-1.0.9023/Discord.exe|camera|absent|-|1699644379393|1699644382190
+permissions|windows|jsmith/C:/Users/jsmith/AppData/Local/Discord/app-1.0.9023/Discord.exe|microphone|absent|-|1699642952011|1699665007016
+permissions|windows|jsmith/C:/Users/jsmith/AppData/Local/Discord/app-1.0.9024/Discord.exe|microphone|absent|-|1700592861639|1700613349366
+permissions|windows|jsmith/C:/Users/jsmith/AppData/Local/Discord/app-1.0.9025/Discord.exe|microphone|absent|-|1701639781203|1701641999588
+permissions|windows|jsmith/C:/Users/jsmith/AppData/Local/Discord/app-1.0.9027/Discord.exe|microphone|absent|-|1702934775742|1702939458890
+permissions|windows|jsmith/C:/Users/jsmith/AppData/Local/Discord/app-1.0.9028/Discord.exe|microphone|absent|-|1703105116605|1703111525444
+permissions|windows|jsmith/C:/Users/jsmith/AppData/Local/Discord/app-1.0.9031/Discord.exe|microphone|absent|-|1706300032704|1706310276122
+permissions|windows|jsmith/C:/Users/jsmith/AppData/Local/Discord/app-1.0.9032/Discord.exe|microphone|absent|-|1707766522717|1707777308511
+permissions|windows|jsmith/C:/Users/jsmith/AppData/Local/Discord/app-1.0.9033/Discord.exe|microphone|absent|-|1708459793343|1708468848563
+permissions|windows|jsmith/C:/Users/jsmith/AppData/Local/Discord/app-1.0.9034/Discord.exe|microphone|absent|-|1709221729944|1709227561152
+permissions|windows|jsmith/C:/Users/jsmith/AppData/Local/Discord/app-1.0.9037/Discord.exe|microphone|absent|-|1711316796678|1711324110795
+permissions|windows|jsmith/C:/Users/jsmith/AppData/Local/Discord/app-1.0.9038/Discord.exe|microphone|absent|-|1711628516877|1711630458860
+permissions|windows|jsmith/C:/Users/jsmith/AppData/Local/Discord/app-1.0.9041/Discord.exe|microphone|absent|-|1713370164447|1713371405672
+permissions|windows|jsmith/C:/Users/jsmith/AppData/Local/Discord/app-1.0.9042/Discord.exe|microphone|absent|-|1713469424445|1713481425614
+permissions|windows|jsmith/C:/Users/jsmith/AppData/Local/Discord/app-1.0.9149/Discord.exe|microphone|absent|-|1718376503052|1718377184314
+permissions|windows|jsmith/C:/Users/jsmith/AppData/Local/Discord/app-1.0.9151/Discord.exe|microphone|absent|-|1718908410005|1718915762201
+permissions|windows|jsmith/C:/Users/jsmith/AppData/Local/Discord/app-1.0.9152/Discord.exe|microphone|absent|-|1719945712342|1719956197519
+permissions|windows|jsmith/C:/Users/jsmith/AppData/Local/Discord/app-1.0.9156/Discord.exe|microphone|absent|-|1722619964546|1722631724968
+permissions|windows|jsmith/C:/Users/jsmith/AppData/Local/Discord/app-1.0.9166/Discord.exe|microphone|absent|-|1729614885573|1729616756253
+permissions|windows|jsmith/C:/Users/jsmith/AppData/Local/Discord/app-1.0.9167/Discord.exe|microphone|absent|-|1728584268799|1728591467793
+permissions|windows|jsmith/C:/Users/jsmith/AppData/Local/Discord/app-1.0.9171/Discord.exe|microphone|absent|-|1732459503434|1732466614530
+permissions|windows|jsmith/C:/Users/jsmith/AppData/Local/Discord/app-1.0.9172/Discord.exe|microphone|absent|-|1733161061856|1733164067454
+permissions|windows|jsmith/C:/Users/jsmith/AppData/Local/Discord/app-1.0.9174/Discord.exe|microphone|absent|-|1734299996157|1734303503785
+permissions|windows|jsmith/C:/Users/jsmith/AppData/Local/Discord/app-1.0.9175/Discord.exe|microphone|absent|-|1735657642807|1735662777975
+permissions|windows|jsmith/C:/Users/jsmith/AppData/Local/Discord/app-1.0.9177/Discord.exe|microphone|absent|-|1736866952869|1736874806974
+permissions|windows|jsmith/C:/Users/jsmith/AppData/Local/Discord/app-1.0.9178/Discord.exe|microphone|absent|-|1737300280280|1737312583165
+permissions|windows|jsmith/C:/Users/jsmith/AppData/Local/Discord/app-1.0.9181/Discord.exe|microphone|absent|-|1739092584889|1739096531065
+permissions|windows|jsmith/C:/Users/jsmith/AppData/Local/Discord/app-1.0.9182/Discord.exe|microphone|absent|-|1739785340733|1739790058288
+permissions|windows|jsmith/C:/Users/jsmith/AppData/Local/Discord/app-1.0.9187/Discord.exe|microphone|absent|-|1743012362882|1743016960694
+permissions|windows|jsmith/C:/Users/jsmith/AppData/Local/Discord/app-1.0.9208/Discord.exe|microphone|absent|-|1757949723514|1757953839748
+permissions|windows|jsmith/C:/Users/jsmith/AppData/Local/Discord/app-1.0.9222/Discord.exe|microphone|absent|-|1770384768514|1770393631670
+permissions|windows|jsmith/C:/Users/jsmith/AppData/Local/Discord/app-1.0.9223/Discord.exe|microphone|absent|-|1771000246718|1771003698920
+permissions|windows|jsmith/C:/Users/jsmith/AppData/Local/Discord/app-1.0.9224/Discord.exe|microphone|absent|-|1771272641885|1771275870016
+permissions|windows|jsmith/C:/Users/jsmith/AppData/Local/Discord/app-1.0.9225/Discord.exe|microphone|absent|-|1772115608543|1772125526264
+permissions|windows|jsmith/C:/Users/jsmith/AppData/Local/Discord/app-1.0.9226/Discord.exe|microphone|absent|-|1772709317290|1772712113414
+permissions|windows|jsmith/C:/Users/jsmith/AppData/Local/Discord/app-1.0.9227/Discord.exe|microphone|absent|-|1773237382544|1773240741643
+permissions|windows|jsmith/C:/Users/jsmith/AppData/Local/Discord/app-1.0.9228/Discord.exe|microphone|absent|-|1774551315903|1774568452355
+permissions|windows|jsmith/C:/Users/jsmith/AppData/Local/Discord/app-1.0.9230/Discord.exe|microphone|absent|-|1776449694428|1776464080982
+permissions|windows|jsmith/C:/Users/jsmith/AppData/Local/Discord/app-1.0.9233/Discord.exe|microphone|absent|-|1777312880181|1777327547091
+permissions|windows|jsmith/C:/Users/jsmith/AppData/Local/Discord/app-1.0.9234/Discord.exe|microphone|absent|-|1777460549260|1777469261633
+permissions|windows|jsmith/C:/Users/jsmith/AppData/Local/Discord/app-1.0.9235/Discord.exe|microphone|absent|-|1779357734638|1779362283159
+permissions|windows|jsmith/C:/Users/jsmith/AppData/Local/Discord/app-1.0.9238/Discord.exe|microphone|absent|-|1779904741520|1779920743780
+permissions|windows|jsmith/C:/Users/jsmith/AppData/Local/Discord/app-1.0.9239/Discord.exe|microphone|absent|-|1781170361570|1781175021689
+permissions|windows|jsmith/C:/Users/jsmith/AppData/Local/Discord/app-1.0.9241/Discord.exe|microphone|absent|-|1781257515202|1781263577868
+permissions|windows|jsmith/C:/Users/jsmith/AppData/Local/Discord/app-1.0.9242/Discord.exe|microphone|absent|-|1783105168328|1783115279551
+permissions|windows|jsmith/C:/Users/jsmith/AppData/Local/Discord/app-1.0.9244/Discord.exe|microphone|absent|-|1783421710891|1783427258277
+permissions|windows|jsmith/C:/Users/jsmith/AppData/Local/Discord/app-1.0.9245/Discord.exe|microphone|absent|-|1783966216833|1783980915307
+permissions|windows|jsmith/C:/Users/jsmith/AppData/Local/Discord/app-1.0.9248/Discord.exe|microphone|absent|-|1784885744595|1784890268436
+permissions|windows|jsmith/C:/Users/jsmith/AppData/Local/Discord/app-1.0.9254/Discord.exe|microphone|absent|-|1787651688278|1787659714372
+permissions|windows|jsmith/C:/Users/jsmith/AppData/Local/Discord/app-1.0.9255/Discord.exe|microphone|absent|-|1788269803085|1788273411005
+permissions|windows|jsmith/C:/Users/jsmith/AppData/Local/Programs/Microsoft VS Code/Code.exe|microphone|absent|-|1783161241429|1783161241555
+permissions|windows|jsmith/C:/Users/jsmith/AppData/Local/Programs/signal-desktop/Signal.exe|camera|absent|-|1784037378988|1784039431566
+permissions|windows|jsmith/C:/Users/jsmith/AppData/Local/Programs/signal-desktop/Signal.exe|microphone|absent|-|1784037378173|1784039431154
+permissions|windows|jsmith/D:/SteamLibrary/steamapps/common/Arma Reforger/ArmaReforgerSteam.exe|microphone|absent|-|1743014916214|1743014916417
+permissions|windows|jsmith/D:/SteamLibrary/steamapps/common/DayZ/DayZ_x64.exe|microphone|absent|-|1722628952143|1722628970084
+permissions|windows|jsmith/D:/SteamLibrary/steamapps/common/Deep Rock Galactic/FSD/Binaries/Win64/FSD-Win64-Shipping.exe|microphone|absent|-|1678378776253|1678378776254
+permissions|windows|jsmith/D:/SteamLibrary/steamapps/common/Helldivers 2/bin/helldivers2.exe|microphone|absent|-|1712693468882|1712694936231
+permissions|windows|jsmith/D:/SteamLibrary/steamapps/common/New World/Bin64/NewWorld.exe|microphone|absent|-|1635254791155|1635256732907
+permissions|windows|jsmith/D:/SteamLibrary/steamapps/common/PUBG/TslGame/Binaries/Win64/TslGame.exe|microphone|absent|-|1737312516969|1737312586363
+permissions|windows|jsmith/D:/SteamLibrary/steamapps/common/ProjectZomboid/ProjectZomboid64.exe|microphone|absent|-|1713470679624|1713477286209
+permissions|windows|jsmith/D:/SteamLibrary/steamapps/common/Sea of Thieves/Athena/Binaries/Win64/SoTGame.exe|microphone|absent|-|1641383186574|1641384566238
+permissions|windows|jsmith/D:/SteamLibrary/steamapps/common/Space Marine 2/client_pc/root/bin/pc/Warhammer 40000 Space Marine 2 - Retail.exe|microphone|absent|-|1728834193292|1728834193370
+permissions|windows|jsmith/D:/SteamLibrary/steamapps/common/Tabletop Simulator/Tabletop Simulator.exe|microphone|absent|-|1788273393795|1788273396408
+permissions|windows|jsmith/Microsoft.OutlookForWindows_8wekyb3d8bbwe|location|prompt_undetermined|Prompt|-|-
+permissions|windows|jsmith/Microsoft.ScreenSketch_8wekyb3d8bbwe|microphone|allowed|Allow|-|-
+permissions|windows|jsmith/Microsoft.StartExperiencesApp_8wekyb3d8bbwe|location|allowed|Allow|1787688504424|1787688504426
+permissions|windows|jsmith/Microsoft.WindowsCamera_8wekyb3d8bbwe|camera|allowed|Allow|1783420802415|1783420880770
+permissions|windows|jsmith/Microsoft.WindowsCamera_8wekyb3d8bbwe|location|denied|Deny|-|-
+permissions|windows|jsmith/Microsoft.WindowsCamera_8wekyb3d8bbwe|microphone|allowed|Allow|-|-
+permissions|windows|jsmith/Microsoft.WindowsSoundRecorder_8wekyb3d8bbwe|microphone|allowed|Allow|1667151517042|1667151532249
+permissions|windows|jsmith/Microsoft.XboxGamingOverlay_8wekyb3d8bbwe|camera|prompt_undetermined|Prompt|-|-
+permissions|windows|jsmith/Microsoft.XboxGamingOverlay_8wekyb3d8bbwe|microphone|allowed|Allow|-|-
+permissions|windows|jsmith/MicrosoftWindows.Client.WebExperience_cw5n1h2txyewy|location|absent|-|1789415912001|1789415912004
+permissions|windows|jsmith/NonPackaged|camera|allowed|Allow|-|-
+permissions|windows|jsmith/NonPackaged|full_disk_access|absent|-|-|-
+permissions|windows|jsmith/NonPackaged|location|allowed|Allow|-|-
+permissions|windows|jsmith/NonPackaged|microphone|allowed|Allow|-|-
+permissions|windows|jsmith/OpenAI.Codex_2p2nqsd0c76g0|location|prompt_undetermined|Prompt|-|-
+permissions|windows|jsmith/SpotifyAB.SpotifyMusic_zpdnekdrzrea0|location|allowed|Allow|-|-
+permissions|windows|jsmith/microsoft.windowscommunicationsapps_8wekyb3d8bbwe|location|prompt_undetermined|Prompt|-|-
+permissions|windows|jsmith/windows.immersivecontrolpanel_cw5n1h2txyewy|microphone|absent|-|1770383192894|1770383199696
+permissions|windows|-|camera|allowed|Allow|-|-
+permissions|windows|NonPackaged|camera|absent|-|-|-
+permissions|windows|-|microphone|allowed|Allow|-|-
+permissions|windows|NonPackaged|microphone|absent|-|-|-
+permissions|windows|-|location|allowed|Allow|-|-
+permissions|windows|NonPackaged|location|absent|-|-|-
+permissions|windows|C:/Windows/System32/svchost.exe|location|absent|-|1790071350180|1790071350182
+permissions|windows|-|full_disk_access|allowed|Allow|-|-
+permissions|windows|NonPackaged|full_disk_access|absent|-|-|-
+[result_status] OK / FULL /

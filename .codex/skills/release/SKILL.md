@@ -29,7 +29,7 @@ Default mode (no flag): full pipeline from preflight → tag push → workflow m
 
 Before invoking the skill, the operator should already have:
 - All commits intended for this release merged to `main` (releases tag from main, not dev — confirm `git log origin/main..origin/dev` is empty or only contains intentional dev-only changes).
-- CHANGELOG `[Unreleased]` section content moved to `## [X.Y.Z] - YYYY-MM-DD`.
+- CHANGELOG promoted: `python3 scripts/assemble-changelog.py promote X.Y.Z` run and committed — it assembles all `changelog.d/` fragments (plus any legacy `[Unreleased]` content) into `## [X.Y.Z] - YYYY-MM-DD` and deletes the fragment files. Never hand-move `[Unreleased]` content. Preflight check 4b fails while unpromoted fragments remain. **Later RCs and the final release:** the version was promoted at its first RC, so hotfix fragments added since then are folded in with `python3 scripts/assemble-changelog.py promote X.Y.Z --append` before each later RC tag, and with `--append --date <final-date>` before the final tag; run that even if no fragment landed since the last RC: with no fragments it only re-dates the header (#5221). Convention: `changelog.d/README.md`.
 - `meson.build` `version: 'X.Y.Z'` updated.
 - All tracked compose files updated to `${YUZU_VERSION:-<BASE_VERSION>}` defaults — the **base** version with any `-rcN`/`-betaN` suffix stripped (e.g., for tag `v0.12.0-rc0` the default is `0.12.0`, NOT `0.12.0-rc0`). The workflow's `Validate docker-compose image versions` gate inside the `Create Release` job invokes `bash scripts/check-compose-versions.sh "$BASE_VERSION"` and will hard-fail the release after the full build matrix has run if the defaults don't match. Local dry-run **must use the same base version**: `bash scripts/check-compose-versions.sh 0.12.0` (NOT `0.12.0-rc0`) — the script accepts whatever you pass and is happy with consistent garbage, so passing the rc-suffixed version locally green-lights a doomed release. Preflight (`scripts/release-preflight.sh`) does the right thing automatically because it strips the suffix internally; the lesson from v0.12.0-rc0's first cut was that local one-off `check-compose-versions.sh` invocations are misleading on RC tags.
 
@@ -113,7 +113,7 @@ echo "Release workflow: https://github.com/DevNullLtd/Yuzu/actions/runs/$RUN_ID"
 
 ## Phase 2 — Monitor the workflow (~30-60 min)
 
-Six jobs run with a partial DAG:
+The jobs run with a partial DAG (simplified; the full list follows):
 
 ```
 build-linux ─┬─ build-gateway ─┐
@@ -128,7 +128,31 @@ build-linux ────────────────────┴─�
 - **build-windows** (self-hosted Windows, ~40 min, parallel) — MSVC + InnoSetup + signtool
 - **build-macos** (macos-14 GitHub-hosted, ~30 min, parallel) — clang + codesign + notary
 - **docker-publish** (matrix server+gateway, ~15 min each, needs build-linux + build-gateway) — buildx + GHCR push
+- **docker-publish-postgres** (~1 min) — the `yuzu-postgres` image the composes pin
+- **docker-publish-chisel** (matrix server/gateway/agent, 1–16 min warm, needs build-linux + build-gateway) — the `*-chisel` images and their SBOMs
 - **release** (ubuntu-24.04, ~3 min, needs all of the above) — assemble artifacts, generate SHA256SUMS, cosign-sign, gh release create
+- **docker-publish-agent-bundle** (needs release) — built from the published release; its SBOM is not a release asset
+
+Since #5242 the release waits for `docker-publish-chisel`, so the chisel SBOMs are always in the signed `SHA256SUMS`. If any job the release needs fails or is cancelled (a build job, `docker-publish`, `docker-publish-postgres` or a `docker-publish-chisel` leg), the release job is skipped (fail-closed): no GitHub release is created, but every image leg that reached its push step has already pushed `:X.Y.Z` (and `:X.Y` and `:latest` on a stable tag).
+
+**Recovery: start a fresh run of the tag. Never use "Re-run failed jobs" on a release run.** A fresh run is always the newest run for the tag, so nothing can supersede it, and its own signed `SHA256SUMS` describes the images it pushes:
+
+```bash
+TAG=v0.14.0
+# 1. No release run for the tag is queued, waiting or running (this must print nothing):
+gh run list --workflow release.yml --repo DevNullLtd/Yuzu --branch "$TAG" --json databaseId,status --jq '.[] | select(.status != "completed")'
+# 2. No release exists (read the output: it must say "release not found"):
+gh release view "$TAG" --repo DevNullLtd/Yuzu
+# 3. Start the fresh run, then capture ITS id (gh workflow run prints none; wait until a newer run appears):
+PREV=$(gh run list --workflow release.yml --repo DevNullLtd/Yuzu --branch "$TAG" --limit 1 --json databaseId -q '.[0].databaseId')
+gh workflow run release.yml --repo DevNullLtd/Yuzu --ref "$TAG"
+for i in $(seq 1 24); do sleep 5; RUN_ID=$(gh run list --workflow release.yml --repo DevNullLtd/Yuzu --branch "$TAG" --limit 1 --json databaseId -q '.[0].databaseId'); [ -n "$RUN_ID" ] && [ "$RUN_ID" != "$PREV" ] && break; RUN_ID=; done
+echo "fresh run: ${RUN_ID:-not seen after 2 min, check the Actions page}"
+```
+
+Start it only when step 1 prints nothing (a queued run counts as running: wait for it) and step 2 says `release not found` (any other error: stop and investigate). It is for the newest release only: on an older stable tag, a fresh run would move `:latest` and `:X.Y` back to the older images. If the failure is deterministic, fix it and re-tag instead; a fresh run of the same tag fails the same way. If a stable release cannot be fixed promptly, move `:latest` (and `:X.Y`) back to the previous release's images meanwhile. If a release already exists, a run has succeeded: do not start another, because it would push new image digests over the published tag. A fresh run rebuilds everything, about 40+ minutes.
+
+The chisel timeout (120 min) is set in the workflow at the tagged commit, so a fresh run of the same tag cannot change it. Raising it means committing the bump and re-tagging.
 
 Watch with `gh run watch` (interactive), or poll-until-done from the LLM:
 
@@ -168,14 +192,13 @@ Match the failure against this table. **All entries have happened in real Yuzu r
 | `Artifact download failed after 5 retries` on the `release` job, complaining about a `*.dockerbuild` file | Docker buildx provenance/attestation artifacts have unstable names that download-artifact occasionally cannot resolve | Already filtered in workflow with `pattern: 'yuzu-*'` — if regression, re-add filter. v0.10.0 hit this and was assembled manually. |
 | `ccache stats: 0 hits` on a re-run that should have been cached | ccache key changed (any C++ file edit invalidates) | Normal; subsequent build hits. If repeated 0% on identical input, check `~/.cache/ccache` writability on the runner. |
 | `signtool sign /f` fails on Windows | `WINDOWS_SIGNING_CERT` secret missing or expired | The signing step is conditional on `env.HAS_SIGNING_CERT == 'true'` — release proceeds unsigned if absent. Confirm with operator whether unsigned is acceptable for this release; if not, refresh secret and retag. |
-| `xcrun notarytool submit` times out (15 min) on macOS | Apple notary backlog | Re-run the macOS job — `staple` step is idempotent. If consistently failing, post-process: download the .pkg, run `notarytool submit + staple` locally, then upload via `gh release upload`. |
+| `xcrun notarytool submit` times out (15 min) on macOS | Apple notary backlog | Start a fresh run of the tag (see Recovery above; never "Re-run failed jobs" on a release run). If it keeps failing, fix the cause and re-tag: a notarize failure fails `build-macos`, which skips the release, so there is no release to upload a hand-notarized `.pkg` to, and it would sit outside the signed `SHA256SUMS`. |
 | `Build and push` fails with `unauthorized` on GHCR | `GITHUB_TOKEN` `packages: write` scope missing | Verify `permissions: packages: write` at workflow root. |
 | `vcpkg install` fails with version baseline mismatch | `VCPKG_COMMIT` env var in workflow drift from `vcpkg.json` baseline | Sync both — workflow env + manifest baseline must match. Tracked by `.github/workflows/vcpkg-baseline-update.yml`. |
 | `Run EUnit tests` fails with non-zero exit + "Failed: 0" in log | meck fixture cancellation false-positive (known #336/#337 class) | Workflow already has the `if grep -q "Failed: 0"` workaround — should pass with warning. If it doesn't, paste the eunit.log tail and check if a new module is leaking processes. |
-| `actions/cache` save fails with EOF | GitHub cache backend transient | `save-always: true` ensures partial saves; retry the workflow. |
-| `Linking target server/core/yuzu-server` fails with LNK2038 on Windows | vcpkg cache poisoned with mixed runtime-libraries (the option-D issue from #375 / PR #373) | Bust the Windows vcpkg cache, re-run. Long-form: see `.codex/agents/build-ci.md` "Windows MSVC static-link history and #375". |
+| `Linking target server/core/yuzu-server` fails with LNK2038 on Windows | vcpkg cache poisoned with mixed runtime-libraries (the option-D issue from #375 / PR #373) | Bust the Windows vcpkg cache, then start a fresh run of the tag (see Recovery above). Long-form: see `.codex/agents/build-ci.md` "Windows MSVC static-link history and #375". |
 
-For any failure not in the table: pull `gh run view "$RUN_ID" --log-failed` in full, summarize the error, and ask the operator how to proceed (re-run? skip? abort?).
+For any failure not in the table: pull `gh run view "$RUN_ID" --log-failed` in full, summarize the error, and ask the operator how to proceed (a fresh run of the tag per Recovery above, a fix and re-tag, or abort; never "Re-run failed jobs" on a release run).
 
 ## Phase 4 — Post-release verification (~2 min)
 
@@ -355,7 +378,7 @@ Releases that hit unfamiliar failure modes (the v0.10.0 download-artifact bug) h
 
 ## Known limitations
 
-- **Self-hosted runner required for Linux + Windows + gateway.** macOS uses a GitHub-hosted runner. The workflow assumes both self-hosted runners (`yuzu-wsl2-linux`, `yuzu-local-windows`) are online; the runner-inventory-sentinel workflow gates this separately. If a runner is offline at tag-push time, the build matrix will queue indefinitely. Phase 2 monitor will surface this as `status=queued` for >5 min — escalate by waking the runner.
+- **Self-hosted runner required for Linux + Windows + gateway.** The workflow assumes the self-hosted pools (`yuzu-bigtam-linux`, `yuzu-weetam-windows`, `yuzu-bigmags-macos`) are online; the runner-inventory-sentinel workflow gates this separately. If a runner is offline at tag-push time, the build matrix will queue indefinitely. Phase 2 monitor will surface this as `status=queued` for >5 min — escalate by waking the runner.
 - **No rollback.** Once `gh release create` runs, the release is public. Untagging is technically possible but discouraged once consumers exist. Prefer a follow-up patch release (vX.Y.Z+1) over rollback.
 - **Compose Wizard requires the tag's commit to have `tools/compose-wizard/`.** PR #405 merged to `main` directly. If a future release is cut from a branch that hasn't reconciled with main, the wizard won't be in the source tree and the workflow step will skip it. Preflight does NOT currently check for this — consider adding.
 - **Cosign keyless signing requires GitHub Actions OIDC.** Manual asset uploads via `gh release upload` are NOT signed. If a release was assembled manually (per Phase 3 table), `SHA256SUMS.sigstore` will be missing and operators must verify integrity via `sha256sum -c SHA256SUMS` only.
