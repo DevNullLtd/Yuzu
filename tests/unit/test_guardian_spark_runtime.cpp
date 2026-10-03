@@ -8201,8 +8201,8 @@ TEST_CASE("#4354: the double-fault recovery pop in finalize_arm_compensation ret
     rt->begin_stop();
 }
 
-TEST_CASE("#4354: a firewalled drain whose head release fails is retained without failing a live "
-          "follower queued after the snapshot",
+TEST_CASE("#4354: a firewalled drain whose head release fails does not fail a live follower "
+          "queued after the snapshot",
           "[spark][runtime][liveness]") {
     // Mutation: drop the `finished.empty()` guard on publish_arm_verdicts_locked's firewall
     // branch -> the retained head (still at the fifo front after its failed release) makes

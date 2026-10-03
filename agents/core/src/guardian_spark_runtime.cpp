@@ -1053,7 +1053,8 @@ bool GuardianSparkRuntime::publish_arm_verdicts_locked(
             // defence in depth) is KEPT as a Queued tombstone holding its mapping,
             // never dropped - dropping it would leave a ghost (key, rule) mapping
             // that makes the next same-key attach take the shared-watcher branch
-            // for a key that has no PerKey. The next same-key event sweeps it.
+            // for a key that has no PerKey. The refill sweep below
+            // (try_dispatch_head_locked) retries it.
             (void)release_or_retain_tombstone_locked(*c);
             if (!c->outcome) {
                 fault_here_for_test(7); // ch-1: the SIBLING fill-in allocation, in

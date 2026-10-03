@@ -1101,11 +1101,13 @@ private:
     /// seam / defence in depth) leaves `index_held` set: the claim is then withdrawn
     /// (never re-committed) yet still holds its mapping, and stays in its fifo as a
     /// tombstone until a later release or sweep succeeds, so `withdrawn` does not by
-    /// itself mean the mapping is gone. Every release of a claim's mapping goes through
+    /// itself mean the mapping is gone. A release of a claim's held mapping goes through
     /// release_claim_index_locked, is guarded by that flag, and calls
     /// erase_rule(rule_id, generation), which erases only while the claim's generation
     /// is still the recorded owner (spark_key_rule_index.hpp) - a stale claim must never
-    /// remove a replacement's mapping.
+    /// remove a replacement's mapping. Two other sites call erase_rule directly, both
+    /// generation-guarded and idempotent: attach_core's rollback of a mapping it just
+    /// added, and on_arm_complete's adoption-catch cleanup of a mapping it re-added.
     ///
     /// `end` is a PR-5 plug point: a FACT about how the claim ended, recorded so the
     /// fault-wiring rung (wedge marking / K-bound / arm_failed reason) has something to
@@ -1940,8 +1942,10 @@ private:
     /// the compensating disarm itself. When nothing is owed a disarm, this function
     /// finishes the job itself, immediately, exactly as before. Firewalled: an
     /// exception in its own staging still eventually publishes a terminal outcome on
-    /// every claim and drops the entry (claim_drain_failures_), whichever path reaches
-    /// that publish.
+    /// every claim it snapshotted (claim_drain_failures_), whichever path reaches that
+    /// publish; when the exception came before the snapshot, nothing was snapshotted,
+    /// so the publish fails every claim in the fifo and drops the entry. A snapshotted
+    /// head whose index release fails is retained as a tombstone, not dropped.
     void on_arm_complete(const std::string& key, const std::shared_ptr<KeyClaim>& claim,
                          IoResult<std::expected<std::uint64_t, std::string>>&& r) noexcept;
     /// The drain_fault_point_for_test_ seam on_arm_complete's own staging (and, since
@@ -1989,13 +1993,17 @@ private:
     /// nobody withdrew (e.g. a non-adopted wedge). The helper also writes
     /// dispatch = Queued (the sweep requires it), and is_retained_wedge reads
     /// dispatch, so for a retained wedge head that predicate's answer changes; this is
-    /// intended and harmless because the claim is terminal (it carries an outcome or a
-    /// commit_exception) whenever the helper runs. `withdrawn` is redundant with that
-    /// terminal outcome for every current reader (each either also requires no
-    /// outcome, or only chooses a verdict that publish_arm_verdicts_locked discards
-    /// for a claim that already has one); it is kept as defence in depth and to match
-    /// fail_all_claims_locked's convention. Returns true iff c no longer owns a
-    /// mapping and may be popped/erased.
+    /// intended and harmless because the claim is terminal at every call site except
+    /// one transient window: the firewall loop in publish_arm_verdicts_locked calls
+    /// the helper before it fills a missing outcome, so a throw in that gap
+    /// (fault_here_for_test(7) or an allocation failure) leaves a withdrawn claim with
+    /// no outcome. `withdrawn` is what keeps a retained claim from being re-committed
+    /// or re-selected: most readers also test the outcome, but not all of them test
+    /// commit_exception (the claimed-rules list in detach_all and the Case-0 search in
+    /// withdraw_rule_after_wedge_sweep_locked check outcome only), so for a claim that
+    /// carries only a commit_exception, and in the firewall-loop gap, `withdrawn` is
+    /// the only guard. It also matches fail_all_claims_locked's convention. Returns
+    /// true iff c no longer owns a mapping and may be popped/erased.
     [[nodiscard]] bool release_or_retain_tombstone_locked(KeyClaim& c) noexcept;
     /// registry_mu_ held. The waiter gave up on `claim` (deadline or stop): a Queued
     /// claim is erased outright, a dispatched one is marked waiter_abandoned for its
