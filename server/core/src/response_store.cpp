@@ -774,6 +774,85 @@ std::optional<std::vector<StoredResponse>> ResponseStore::query(const std::strin
         });
 }
 
+std::optional<BoundedResponses> ResponseStore::query_bounded(const std::string& instruction_id,
+                                                              const ResponseQuery& q,
+                                                              const AggregateScope& scope,
+                                                              std::size_t max_payload_bytes) const {
+    static DegradeSampler sampler;
+    return resp_read<BoundedResponses>(
+        open_, pool_, metrics_, "query_bounded", sampler,
+        [&](PGconn* conn) -> std::optional<BoundedResponses> {
+            // Predicates and the scope clause are byte-identical to query() (ADR-0017
+            // INV-3: scope BEFORE the limit/cut).
+            std::string where = " WHERE instruction_id = $1";
+            std::vector<std::string> binds{instruction_id};
+            int idx = 2;
+            if (!q.agent_id.empty()) {
+                where += " AND agent_id = $" + std::to_string(idx++);
+                binds.push_back(q.agent_id);
+            }
+            if (q.status >= 0) {
+                where += " AND status = $" + std::to_string(idx++) + "::integer";
+                binds.push_back(std::to_string(q.status));
+            }
+            if (q.since > 0) {
+                where += " AND timestamp >= $" + std::to_string(idx++) + "::bigint";
+                binds.push_back(std::to_string(q.since));
+            }
+            if (q.until > 0) {
+                where += " AND timestamp <= $" + std::to_string(idx++) + "::bigint";
+                binds.push_back(std::to_string(q.until));
+            }
+            append_scope_clause(where, binds, idx, scope);
+            const std::string limit_ph = "$" + std::to_string(idx++) + "::integer";
+            const std::string cap_ph = "$" + std::to_string(idx++) + "::bigint";
+            const int limit = sanitize_limit(q.limit);
+            binds.push_back(std::to_string(limit));
+            binds.push_back(std::to_string(max_payload_bytes));
+
+            // `lim`: the candidate rows (limit + 1, so "more rows exist" is exact), SIZES
+            // ONLY -- octet_length() on TOASTed text reads the toast pointer, not the value.
+            // `ranked`: running payload size in export order. `kept`: rows whose
+            // PRECEDING cumulative size is still under the cap (rn = 1 always kept).
+            // `meta`: the candidate count and how many in-limit rows the cap dropped.
+            // Only `kept` rows are joined back for the full columns, so a cut-off row's
+            // output/error_detail is never sent over the wire or parsed.
+            std::string sql =
+                "WITH lim AS (SELECT id, timestamp, "
+                "COALESCE(octet_length(output), 0) + COALESCE(octet_length(error_detail), 0) "
+                "AS sz FROM response_store.responses" +
+                where + " ORDER BY timestamp DESC, id DESC LIMIT (" + limit_ph +
+                " + 1)), "
+                "ranked AS (SELECT id, sz, ROW_NUMBER() OVER w AS rn, SUM(sz) OVER w AS running "
+                "FROM lim WINDOW w AS (ORDER BY timestamp DESC, id DESC)), "
+                "meta AS (SELECT COUNT(*) AS total, "
+                "COUNT(*) FILTER (WHERE rn <= " +
+                limit_ph + " AND rn > 1 AND running - sz >= " + cap_ph +
+                ") AS cut_bytes FROM ranked), "
+                "kept AS (SELECT id FROM ranked WHERE rn <= " +
+                limit_ph + " AND (rn = 1 OR running - sz < " + cap_ph +
+                ")) "
+                "SELECT r.id, r.instruction_id, r.agent_id, r.timestamp, r.status, r.output, "
+                "r.error_detail, r.ttl_expires_at, r.plugin, r.execution_id, r.received_at_ms, "
+                "COALESCE(r.plugin_result_status, 0), meta.total, meta.cut_bytes "
+                "FROM kept JOIN response_store.responses r ON r.id = kept.id CROSS JOIN meta "
+                "ORDER BY r.timestamp DESC, r.id DESC";
+            pg::PgResult res = pg::exec_params(conn, sql.c_str(), binds);
+            if (res.status() != PGRES_TUPLES_OK)
+                return std::nullopt;
+            BoundedResponses out;
+            const int n = PQntuples(res.get());
+            out.rows.reserve(static_cast<std::size_t>(n));
+            for (int i = 0; i < n; ++i)
+                out.rows.push_back(parse_response_row(res.get(), i));
+            if (n > 0) {
+                out.row_cap_hit = to_i64(PQgetvalue(res.get(), 0, 12)) > limit;
+                out.byte_cap_hit = to_i64(PQgetvalue(res.get(), 0, 13)) > 0;
+            }
+            return out;
+        });
+}
+
 std::optional<std::vector<StoredResponse>>
 ResponseStore::query_by_execution(const std::string& execution_id, const ResponseQuery& q,
                                   const AggregateScope& scope) const {

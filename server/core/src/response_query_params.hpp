@@ -10,8 +10,9 @@
 /// with `std::stoi`/`std::stoll`, which accept leading digits followed by anything
 /// (`stoi("0x1")` -> 0, `stoll("1e9")` -> 1, `stoi("100abc")` -> 100), so a
 /// malformed value silently became a different, valid-looking filter (`?since=1e9`
-/// meant "since epoch second 1", `?status=0x1` meant "status SUCCESS"). The OpenAPI
-/// text promised a 400 for an invalid numeric parameter; the code did not deliver it.
+/// meant "since epoch second 1", `?status=0x1` meant status 0). Empty values and
+/// overflow already 400'd (`stoi("")` threw); what is new is rejecting every value that
+/// is not ONE base-10 integer, and `status < -1`.
 ///
 /// Pure and I/O-free: no httplib.h, no store access. The caller supplies a getter so
 /// this header never sees the request type.
@@ -20,7 +21,6 @@
 #include <charconv>
 #include <cstddef>
 #include <cstdint>
-#include <limits>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -103,6 +103,19 @@ template <typename Req>
 /// handlers so the two cannot drift (the legacy route used to clamp only its default).
 inline constexpr int kExportRowLimitCap = 10000;
 
+/// Row-count ceiling for the plain (non-export) list routes: the legacy
+/// `GET /api/responses/{id}` used to pass an explicit `limit` straight to the store, so
+/// `?limit=2147483647` was an unbounded fetch while its v1 and MCP twins clamp to this.
+inline constexpr int kQueryRowLimitCap = 1000;
+
+/// Apply the plain-list ceiling: a `limit` above `kQueryRowLimitCap` is clamped down.
+/// A non-positive value is deliberately left alone -- the store maps it to its default
+/// (100), which is this legacy route's long-standing meaning for `limit<=0`; only the
+/// missing ceiling is fixed here, not that.
+[[nodiscard]] inline int cap_query_limit(int requested) {
+    return requested > kQueryRowLimitCap ? kQueryRowLimitCap : requested;
+}
+
 /// Normalise an export `limit`: a caller-supplied value is clamped to
 /// `[1, kExportRowLimitCap]`, an omitted one defaults to the cap. One definition so
 /// the legacy and v1 export handlers cannot drift, and so the exact ceiling is
@@ -112,17 +125,20 @@ inline constexpr int kExportRowLimitCap = 10000;
                     : kExportRowLimitCap;
 }
 
-/// Approximate ceiling on the ROW PAYLOAD BYTES of one export response, on top of the
-/// row-count cap. It counts each serialized row (not commas, the JSON envelope or the
-/// legacy route's pretty-print whitespace), and the cut is on whole rows, so the body
-/// is approximately 50 MiB of row payload at most plus at most one row. It bounds the
-/// SERIALIZED response, NOT worker memory: `ResponseStore::query` materialises the full
-/// result (up to 10,000 rows, each `output`/`error_detail` capped only at the 2 MiB
-/// ingest limit) before this cap is consulted, so the worst case is still tens of GiB
-/// of worker memory. A byte-aware store fetch is the real memory bound and is
-/// tracked separately. A flat constant local to the export surface -- NOT the ingest
-/// cap, which bounds a different thing. Well above any realistic export (a 10,000-row
-/// export of typical command output is a few MiB).
+/// Ceiling on the ROW PAYLOAD BYTES of one export, on top of the row-count cap: the
+/// cumulative `output` + `error_detail` size of the rows served. It is enforced in TWO
+/// places that share this one constant:
+///   1. in SQL (`ResponseStore::query_bounded`), so the fetch itself -- libpq's
+///      PGresult and the parsed vector -- holds at most about this much payload plus one
+///      row (<= 2 MiB per field at ingest) and never materialises the rest; and
+///   2. at serialization (`append_rows_until_byte_cap`) as a backstop, because CSV
+///      escaping and JSON framing make the SERIALIZED row larger than its raw payload.
+/// Both cut on whole rows and always serve at least one row. What this does NOT bound:
+/// the plain list routes (`GET .../responses/{id}`, MCP `query_responses`, the
+/// executions route), which are capped by row count only (<= 1000 rows x 2 MiB).
+/// A flat constant local to the export surface -- NOT the ingest cap, which bounds a
+/// different thing -- and not operator-tunable. Well above any realistic export (a
+/// 10,000-row export of typical command output is a few MiB).
 inline constexpr std::size_t kExportBodyByteCap = 50u * 1024u * 1024u;
 
 /// Test seam over `kExportBodyByteCap`: production reads the default; a unit test
@@ -134,12 +150,36 @@ inline std::atomic<std::size_t>& export_body_byte_cap() {
     return cap;
 }
 
+/// Why an export was cut. Both can be set; `cause()` names the tighter one.
+struct ExportCut {
+    bool row_cap{false};  ///< more matching rows existed beyond `limit`
+    bool byte_cap{false}; ///< rows within `limit` were left out by the payload cap
+    [[nodiscard]] bool any() const noexcept { return row_cap || byte_cap; }
+    /// Closed metric-label value (`yuzu_server_response_export_truncated_total{cause}`).
+    [[nodiscard]] const char* cause() const noexcept { return byte_cap ? "byte_cap" : "row_cap"; }
+};
+
+/// `Content-Disposition` filename: a cut export is renamed `-truncated` so the
+/// truncation survives `curl -o`, browser downloads and proxies that drop response
+/// headers -- the one signal a CSV body cannot carry in-band without corrupting parsers.
+[[nodiscard]] inline std::string export_filename(std::string_view instruction_id,
+                                                 std::string_view ext, bool truncated) {
+    std::string n = "responses-";
+    n += instruction_id;
+    n += truncated ? "-truncated." : ".";
+    n += ext;
+    return n;
+}
+
 /// Append rows to an export body until the running byte total reaches `cap`, then stop.
 /// `append(row)` adds one row's bytes to the body and returns that body's new total
 /// size. Returns true when rows were left out (i.e. the body is truncated by the byte
 /// cap) -- false when every row fit, including when the LAST row is the one that
 /// crosses the cap (nothing was dropped, so no truncation signal). At least one row is
 /// always emitted, so a single row larger than a test-lowered cap still makes progress.
+/// The returned total is whatever `append` reports (CSV: the whole body incl. header;
+/// JSON: the serialized row objects only) -- a backstop to the SQL cut, not an exact
+/// body-size limit.
 template <typename Rows, typename Append>
 [[nodiscard]] bool append_rows_until_byte_cap(const Rows& rows, std::size_t cap, Append&& append) {
     std::size_t i = 0;

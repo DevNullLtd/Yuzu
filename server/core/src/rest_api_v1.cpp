@@ -1249,7 +1249,7 @@ const std::string& openapi_spec() {
       "get": {"summary": "Aggregate command/instruction responses (#2146 A2-R2)", "tags": ["Responses"], "description": "REST v1 twin of the legacy GET /api/responses/{id}/aggregate and MCP aggregate_responses (shared builder response_aggregate_row_json). group_by must be status or agent_id; op is one of count|sum|avg|min|max (default count); op_column (sum/avg/min/max only) must be one of timestamp|status|id, default id when omitted -- an invalid group_by/op_column is a 400, validated against ResponseStore's own allow-list before the query runs. Gated on Response:Read with the same resolve-then-scope confinement as the query route above (filter-before-aggregate, ADR-0017 INV-3). Audited as response.read (REST fail-closed): a scope-drop emits a distinct denied row, and every served read also emits a success row.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string", "pattern": "^[A-Za-z0-9_-]{1,128}$"}, "description": "instruction_id (a.k.a. command_id)"}, {"name": "group_by", "in": "query", "required": false, "schema": {"type": "string", "enum": ["status", "agent_id"], "default": "status"}}, {"name": "op", "in": "query", "required": false, "schema": {"type": "string", "enum": ["count", "sum", "avg", "min", "max"], "default": "count"}}, {"name": "op_column", "in": "query", "required": false, "schema": {"type": "string", "enum": ["timestamp", "status", "id"], "default": "id"}}, {"name": "agent_id", "in": "query", "required": false, "schema": {"type": "string"}}, {"name": "status", "in": "query", "required": false, "schema": {"type": "integer"}}, {"name": "since", "in": "query", "required": false, "schema": {"type": "integer"}}, {"name": "until", "in": "query", "required": false, "schema": {"type": "integer"}}], "responses": {"200": {"description": "{instruction_id, groups: [{group_value, count, aggregate_value}], total_groups, total_rows}", "headers": {"X-Correlation-Id": {"schema": {"type": "string"}}}}, "400": {"description": "Invalid group_by or op_column, or a malformed numeric query parameter (#4644: the whole value must be one base-10 integer; status below -1 is rejected, -1 means any)"}, "401": {"description": "Authentication required"}, "403": {"description": "Insufficient permission (Response:Read)"}, "503": {"description": "Response store not initialised/degraded, or the response.read audit row could not persist; envelope includes retry_after_ms.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}}}
     },
     "/responses/{id}/export": {
-      "get": {"summary": "Export command/instruction responses as CSV or JSON (#2146 A2-R2)", "tags": ["Responses"], "description": "REST v1 twin of the legacy GET /api/responses/{id}/export. format is json (default) or csv -- an unrecognised value falls through to json, matching the legacy route's own behavior exactly (neither route rejects an unknown format with 400); both use the same widened field set as GET /responses/{id} (unlike the legacy CSV export's narrower 7-column shape -- this is a new endpoint with no positional-column consumer to keep compatible). limit is clamped to [1,10000] on BOTH bounds, default 10000 when omitted (the legacy route is clamped identically as of #4703). The response is also cut at approximately 50 MiB of row payload (counted per serialized row, excluding commas/envelope; on whole rows, at least one row always served) on top of the row cap. This bounds the serialized body only, NOT worker memory: the store materialises the full result before the cap applies, and each response output is capped at only 2 MiB at ingest. No offset parameter, same non-unique-timestamp-ordering rationale as GET /responses/{id} above -- a caller-supplied offset is rejected with 400. When the served row count equals limit, or the 50 MiB body cap cut the export, a cap-hit is signalled: pagination.result_truncated_by_cap on the JSON format, an X-Result-Truncated-By-Cap: true response header on the CSV format (which has no JSON envelope to carry the field in) -- most consequential here since bulk export is this route's purpose and a truncated CSV would otherwise look byte-for-byte like a complete one. Same resolve-then-scope confinement, gate, and fail-closed response.read audit posture as the query/aggregate routes above.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string", "pattern": "^[A-Za-z0-9_-]{1,128}$"}, "description": "instruction_id (a.k.a. command_id)"}, {"name": "format", "in": "query", "required": false, "schema": {"type": "string", "enum": ["json", "csv"], "default": "json"}}, {"name": "agent_id", "in": "query", "required": false, "schema": {"type": "string"}}, {"name": "status", "in": "query", "required": false, "schema": {"type": "integer"}}, {"name": "since", "in": "query", "required": false, "schema": {"type": "integer"}}, {"name": "until", "in": "query", "required": false, "schema": {"type": "integer"}}, {"name": "limit", "in": "query", "required": false, "schema": {"type": "integer", "default": 10000, "maximum": 10000}}], "responses": {"200": {"description": "CSV (Content-Disposition: attachment) or {data: [...], pagination, meta} JSON, same field set as GET /responses/{id}. pagination.result_truncated_by_cap (JSON) / X-Result-Truncated-By-Cap header (CSV) present true when the limit cap or the ~50 MiB row-payload cap dropped rows.", "headers": {"X-Correlation-Id": {"schema": {"type": "string"}}, "Content-Disposition": {"schema": {"type": "string"}}}}, "400": {"description": "Malformed numeric query parameter (#4644: the whole value must be one base-10 integer -- trailing characters, hex/exponent forms, whitespace, a leading +, an empty value and overflow are rejected; status below -1 is rejected, -1 means any), or offset supplied (not supported on this route)"}, "401": {"description": "Authentication required"}, "403": {"description": "Insufficient permission (Response:Read)"}, "503": {"description": "Response store not initialised/degraded, or the response.read audit row could not persist; envelope includes retry_after_ms.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}}}
+      "get": {"summary": "Export command/instruction responses as CSV or JSON (#2146 A2-R2)", "tags": ["Responses"], "description": "REST v1 twin of the legacy GET /api/responses/{id}/export. format is json (default) or csv -- an unrecognised value falls through to json, matching the legacy route's own behavior exactly (neither route rejects an unknown format with 400); both use the same widened field set as GET /responses/{id} (unlike the legacy CSV export's narrower 7-column shape -- this is a new endpoint with no positional-column consumer to keep compatible). limit is clamped to [1,10000] on BOTH bounds, default 10000 when omitted (the legacy route is clamped identically as of #4703). The export is also cut at 50 MiB of row payload (output + error_detail) on top of the row cap, on whole rows, with at least one row always served. The cut is applied in the store query itself, so the fetch holds about that much payload plus at most one row (each output is capped at 2 MiB at ingest); a serialization-time backstop counts the escaped row bytes (excluding commas/envelope). No offset parameter, same non-unique-timestamp-ordering rationale as GET /responses/{id} above -- a caller-supplied offset is rejected with 400. When matching rows beyond limit exist, or the 50 MiB payload cap dropped rows, a cut is signalled (and the download is renamed responses-<id>-truncated.<ext>): pagination.result_truncated_by_cap on the JSON format, an X-Result-Truncated-By-Cap: true response header on the CSV format (which has no JSON envelope to carry the field in) -- most consequential here since bulk export is this route's purpose and a truncated CSV would otherwise look byte-for-byte like a complete one. Same resolve-then-scope confinement, gate, and fail-closed response.read audit posture as the query/aggregate routes above.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string", "pattern": "^[A-Za-z0-9_-]{1,128}$"}, "description": "instruction_id (a.k.a. command_id)"}, {"name": "format", "in": "query", "required": false, "schema": {"type": "string", "enum": ["json", "csv"], "default": "json"}}, {"name": "agent_id", "in": "query", "required": false, "schema": {"type": "string"}}, {"name": "status", "in": "query", "required": false, "schema": {"type": "integer"}}, {"name": "since", "in": "query", "required": false, "schema": {"type": "integer"}}, {"name": "until", "in": "query", "required": false, "schema": {"type": "integer"}}, {"name": "limit", "in": "query", "required": false, "schema": {"type": "integer", "default": 10000, "maximum": 10000}}], "responses": {"200": {"description": "CSV (Content-Disposition: attachment) or {data: [...], pagination, meta} JSON, same field set as GET /responses/{id}. pagination.result_truncated_by_cap (JSON) / X-Result-Truncated-By-Cap header (CSV) present true when the limit cap or the ~50 MiB row-payload cap dropped rows.", "headers": {"X-Correlation-Id": {"schema": {"type": "string"}}, "Content-Disposition": {"schema": {"type": "string"}}}}, "400": {"description": "Malformed numeric query parameter (#4644: the whole value must be one base-10 integer -- trailing characters, hex/exponent forms, whitespace, a leading +, an empty value and overflow are rejected; status below -1 is rejected, -1 means any), or offset supplied (not supported on this route)"}, "401": {"description": "Authentication required"}, "403": {"description": "Insufficient permission (Response:Read)"}, "503": {"description": "Response store not initialised/degraded, or the response.read audit row could not persist; envelope includes retry_after_ms.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}}}
     },
     "/workflows": {
       "get": {"summary": "List workflows (#4030)", "tags": ["Workflows"], "description": "REST v1 twin of the legacy GET /api/workflows and MCP list_workflows (new). Requires Workflow:Read (RBAC seeding prerequisite fixed by #4030/#4032 — Workflow was gated but never seeded, so no role could hold this grant before this change). Shared builder workflow_row_json (workflow_model.hpp) — REST/MCP cannot drift on field set.", "parameters": [{"name": "name", "in": "query", "required": false, "schema": {"type": "string"}}, {"name": "limit", "in": "query", "required": false, "schema": {"type": "integer", "default": 100, "maximum": 500}}], "responses": {"200": {"description": "Workflow list"}, "400": {"description": "Invalid limit or numeric query parameter"}, "403": {"description": "Insufficient permission (Workflow:Read)"}, "503": {"description": "Workflow engine not available"}}}
@@ -10039,15 +10039,21 @@ void RestApiV1::register_routes(
                 return;
             }
 
-            auto results_opt = response_store->query(instruction_id, q, scope_arg);
-            if (!results_opt) {
+            // #4703: byte-aware fetch -- the payload cap is applied IN SQL, so the PGresult
+            // and the parsed vector never hold more than about export_body_byte_cap() of
+            // output/error_detail (see ResponseStore::query_bounded). Same predicates and
+            // scope push-down (ADR-0017 INV-3) as query().
+            const std::size_t byte_cap = export_body_byte_cap().load();
+            auto bounded_opt = response_store->query_bounded(instruction_id, q, scope_arg, byte_cap);
+            if (!bounded_opt) {
                 res.status = 503;
                 res.set_content(
                     detail::a4_error(res, "response store degraded", {.retry_after_ms = 5000}),
                     "application/json");
                 return;
             }
-            auto results = std::move(*results_opt);
+            auto results = std::move(bounded_opt->rows);
+            ExportCut cut{bounded_opt->row_cap_hit, bounded_opt->byte_cap_hit};
 
             if (!detail::emit_behavioral_audit(audit_fn, req, res, "response.read", "success",
                                                "Execution", instruction_id,
@@ -10062,44 +10068,38 @@ void RestApiV1::register_routes(
                 return;
             }
 
-            // happy-path/enterprise-readiness governance finding: this route
-            // never signalled a cap-hit -- a caller with more than `limit`
-            // matching rows got exactly `limit` back with no marker that the
-            // export was cut, most consequential here since bulk export is
-            // this route's whole purpose. Mirrors MCP query_responses' own
-            // `hit_cap = results.size() == limit` convention (this PR's own
-            // MCP twin already computes this).
-            //
-            // #4703: a row-count cap alone still allowed a multi-GB body (each row's
-            // output/error_detail is independently capped at 2 MiB at ingest), built in
-            // memory on an httplib worker. The body is also cut at
-            // export_body_byte_cap() and folded into the SAME truncation signal.
-            const std::size_t byte_cap = export_body_byte_cap().load();
-            bool hit_cap = results.size() == static_cast<std::size_t>(q.limit);
+            // Truncation signal: `cut.row_cap` = more matching rows existed beyond `limit`
+            // (exact: the store fetches limit+1 candidates); `cut.byte_cap` = rows within
+            // `limit` were left out by the payload cap, in SQL or by the serialization
+            // backstop below (CSV escaping / JSON framing make the serialized row larger
+            // than its raw payload). A cut export is also renamed `-truncated` so the
+            // signal survives `curl -o` and browser downloads, which drop the header.
             auto format = req.get_param_value("format");
             if (format == "csv") {
                 std::string csv{kResponseExportCsvHeader};
-                hit_cap |= append_rows_until_byte_cap(results, byte_cap, [&csv](const auto& r) {
+                cut.byte_cap |= append_rows_until_byte_cap(results, byte_cap, [&csv](const auto& r) {
                     csv += response_export_csv_row(r);
                     return csv.size();
                 });
                 res.set_header("Content-Disposition",
-                               "attachment; filename=\"responses-" + instruction_id + ".csv\"");
-                if (hit_cap)
+                               "attachment; filename=\"" +
+                                   export_filename(instruction_id, "csv", cut.any()) + "\"");
+                if (cut.any())
                     res.set_header("X-Result-Truncated-By-Cap", "true");
-                res.set_content(csv, "text/csv; charset=utf-8");
+                res.set_content(std::move(csv), "text/csv; charset=utf-8");
             } else {
                 JArr arr;
                 std::size_t json_bytes = 0;
-                hit_cap |= append_rows_until_byte_cap(results, byte_cap, [&](const auto& r) {
+                cut.byte_cap |= append_rows_until_byte_cap(results, byte_cap, [&](const auto& r) {
                     auto row = response_query_row_json(r).dump();
                     json_bytes += row.size();
-                    arr.add_raw(std::move(row));
+                    arr.add_raw(row);
                     return json_bytes;
                 });
                 res.set_header("Content-Disposition",
-                               "attachment; filename=\"responses-" + instruction_id + ".json\"");
-                res.set_content(list_json(arr.str(), arr.size(), 0, 50, hit_cap),
+                               "attachment; filename=\"" +
+                                   export_filename(instruction_id, "json", cut.any()) + "\"");
+                res.set_content(list_json(arr.str(), arr.size(), 0, 50, cut.any()),
                                 "application/json; charset=utf-8");
             }
         });

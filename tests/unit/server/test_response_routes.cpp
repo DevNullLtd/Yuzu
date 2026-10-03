@@ -518,16 +518,58 @@ TEST_CASE("GET /api/responses/:id/export: the total-byte cap truncates JSON and 
         CHECK(body["responses"].size() < 5);
         CHECK(body["count"] == body["responses"].size()); // count reports what was served
         CHECK(body.value("result_truncated_by_cap", false) == true);
+        // UP-3: the signal also survives `curl -o` as a renamed download.
+        CHECK(res_json->get_header_value("Content-Disposition") ==
+              "attachment; filename=\"responses-instr-bytecap-truncated.json\"");
 
         auto res_csv = h.sink.Get("/api/responses/instr-bytecap/export?format=csv");
         REQUIRE(res_csv);
         CHECK(res_csv->get_header_value("X-Result-Truncated-By-Cap") == "true");
+        CHECK(res_csv->get_header_value("Content-Disposition") ==
+              "attachment; filename=\"responses-instr-bytecap-truncated.csv\"");
     }
     auto res_full = h.sink.Get("/api/responses/instr-bytecap/export");
     REQUIRE(res_full);
     auto full = json::parse(res_full->body);
     CHECK(full["responses"].size() == 5);
     CHECK_FALSE(full.contains("result_truncated_by_cap"));
+    CHECK(res_full->get_header_value("Content-Disposition") ==
+          "attachment; filename=\"responses-instr-bytecap.json\"");
+
+    auto res_full_csv = h.sink.Get("/api/responses/instr-bytecap/export?format=csv");
+    REQUIRE(res_full_csv);
+    CHECK(res_full_csv->get_header_value("X-Result-Truncated-By-Cap").empty());
+    CHECK(res_full_csv->get_header_value("Content-Disposition") ==
+          "attachment; filename=\"responses-instr-bytecap.csv\"");
+}
+
+TEST_CASE("GET /api/responses/:id/export: a ROW-cap cut renames the download and an exactly-full "
+          "export does not (#4703 UP-3)",
+          "[server][routes][response_routes][rest][pg]") {
+    PgHarness h;
+    for (int i = 0; i < 3; ++i) {
+        StoredResponse r;
+        r.instruction_id = "instr-rowcut";
+        r.agent_id = "agent-" + std::to_string(i);
+        r.status = 0;
+        r.output = "o";
+        r.timestamp = 100 + i;
+        h.store->store(r);
+    }
+    for (const char* fmt : {"json", "csv"}) {
+        const std::string f = fmt;
+        // limit=2 of 3 rows: cut by row count.
+        auto cut = h.sink.Get("/api/responses/instr-rowcut/export?limit=2&format=" + f);
+        REQUIRE(cut);
+        CHECK(cut->get_header_value("Content-Disposition") ==
+              "attachment; filename=\"responses-instr-rowcut-truncated." + f + "\"");
+        // limit == row count: exact crossing, nothing dropped, so nothing is flagged.
+        auto exact = h.sink.Get("/api/responses/instr-rowcut/export?limit=3&format=" + f);
+        REQUIRE(exact);
+        CHECK(exact->get_header_value("Content-Disposition") ==
+              "attachment; filename=\"responses-instr-rowcut." + f + "\"");
+        CHECK(exact->get_header_value("X-Result-Truncated-By-Cap").empty());
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

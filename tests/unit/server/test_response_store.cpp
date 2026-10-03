@@ -2028,3 +2028,141 @@ TEST_CASE("ResponseStore: scoped facet_values/facet_agent_count apply the WHOLE 
     REQUIRE(count.has_value());
     CHECK(*count == 1);
 }
+
+// ── query_bounded (#4703): the byte-aware export fetch ────────────────────────────────
+namespace {
+
+void put_response(ResponseStore& store, const std::string& instruction, const std::string& agent,
+                  std::int64_t ts, std::size_t payload_bytes, const std::string& error = {}) {
+    StoredResponse r;
+    r.instruction_id = instruction;
+    r.agent_id = agent;
+    r.timestamp = ts;
+    r.status = 1;
+    r.output = std::string(payload_bytes, 'x');
+    r.error_detail = error;
+    store.store(r);
+}
+
+} // namespace
+
+TEST_CASE("ResponseStore query_bounded keeps only the rows under the payload cap",
+          "[pg][response_store]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore store(pool);
+    REQUIRE(store.is_open());
+
+    // 40 rows x 64 KiB (2.5 MiB). A 200 KiB cap keeps rows whose PRECEDING cumulative size
+    // is still under it: 0, 64, 128, 192 KiB -> 4 rows. The vector holds exactly the rows
+    // the final statement returned (no C++-side filtering), so rows.size() IS what libpq
+    // buffered: it is 4, not 40, because the cut happens in SQL before the full columns
+    // are fetched.
+    for (int i = 0; i < 40; ++i)
+        put_response(store, "cmd-bounded", "agent-1", 1000 + i, 64 * 1024);
+
+    ResponseQuery q;
+    q.limit = 100;
+    auto r = store.query_bounded("cmd-bounded", q, std::nullopt, 200 * 1024);
+    REQUIRE(r.has_value());
+    CHECK(r->rows.size() == 4);
+    CHECK(r->byte_cap_hit);
+    CHECK_FALSE(r->row_cap_hit);
+    // Newest first, and the kept rows are the NEWEST four.
+    CHECK(r->rows.front().timestamp == 1039);
+    CHECK(r->rows.back().timestamp == 1036);
+
+    // The plain query() fetches all 40, which is exactly what the bound avoids.
+    auto all = store.query("cmd-bounded", q);
+    REQUIRE(all.has_value());
+    CHECK(all->size() == 40);
+}
+
+TEST_CASE("ResponseStore query_bounded payload cap boundary is strict and exact",
+          "[pg][response_store]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore store(pool);
+    REQUIRE(store.is_open());
+    // Three rows of exactly 10 payload bytes (output 6 + error_detail 4).
+    for (int i = 0; i < 3; ++i)
+        put_response(store, "cmd-edge", "agent-1", 100 + i, 6, "eeee");
+
+    ResponseQuery q;
+    q.limit = 100;
+    // Row 3's PRECEDING cumulative size is 20. Under a cap of 20 it is NOT strictly
+    // below, so it is dropped (2 rows, cut); under 21 it is kept (3 rows, no cut).
+    auto cut = store.query_bounded("cmd-edge", q, std::nullopt, 20);
+    REQUIRE(cut.has_value());
+    CHECK(cut->rows.size() == 2);
+    CHECK(cut->byte_cap_hit);
+    auto fit = store.query_bounded("cmd-edge", q, std::nullopt, 21);
+    REQUIRE(fit.has_value());
+    CHECK(fit->rows.size() == 3);
+    CHECK_FALSE(fit->byte_cap_hit);
+
+    // A cap of 0 still serves the first row (progress) and flags the cut.
+    auto zero = store.query_bounded("cmd-edge", q, std::nullopt, 0);
+    REQUIRE(zero.has_value());
+    CHECK(zero->rows.size() == 1);
+    CHECK(zero->byte_cap_hit);
+}
+
+TEST_CASE("ResponseStore query_bounded row_cap_hit is exact not size equals limit",
+          "[pg][response_store]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore store(pool);
+    REQUIRE(store.is_open());
+    for (int i = 0; i < 5; ++i)
+        put_response(store, "cmd-rowcap", "agent-1", 500 + i, 4);
+
+    ResponseQuery q;
+    q.limit = 5; // exactly as many rows as exist: NOT a cut
+    auto exact = store.query_bounded("cmd-rowcap", q, std::nullopt, 1 << 20);
+    REQUIRE(exact.has_value());
+    CHECK(exact->rows.size() == 5);
+    CHECK_FALSE(exact->row_cap_hit);
+    CHECK_FALSE(exact->byte_cap_hit);
+
+    q.limit = 4; // one more row exists beyond the limit: a cut
+    auto cut = store.query_bounded("cmd-rowcap", q, std::nullopt, 1 << 20);
+    REQUIRE(cut.has_value());
+    CHECK(cut->rows.size() == 4);
+    CHECK(cut->row_cap_hit);
+    CHECK_FALSE(cut->byte_cap_hit);
+}
+
+TEST_CASE("ResponseStore query_bounded applies scope before the cut and breaks ties by id",
+          "[pg][response_store]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore store(pool);
+    REQUIRE(store.is_open());
+    // Interleaved agents, SAME timestamp (the id tiebreak makes the order deterministic).
+    for (int i = 0; i < 6; ++i)
+        put_response(store, "cmd-scope", i % 2 == 0 ? "agent-a" : "agent-b", 777, 100);
+
+    ResponseQuery q;
+    q.limit = 100;
+    // Whole set = 600 bytes, cap 250 would cut it; agent-a's 3 rows (300 bytes) with a
+    // cap of 301 all fit ONLY if the scope is applied before the cut.
+    AggregateScope only_a = std::vector<std::string>{"agent-a"};
+    auto scoped = store.query_bounded("cmd-scope", q, only_a, 301);
+    REQUIRE(scoped.has_value());
+    CHECK(scoped->rows.size() == 3);
+    CHECK_FALSE(scoped->byte_cap_hit);
+    for (const auto& row : scoped->rows)
+        CHECK(row.agent_id == "agent-a");
+    // Same timestamp: strictly decreasing ids.
+    CHECK(scoped->rows[0].id > scoped->rows[1].id);
+    CHECK(scoped->rows[1].id > scoped->rows[2].id);
+
+    // An engaged EMPTY scope is fail-closed: zero rows, never an unfiltered read.
+    AggregateScope none = std::vector<std::string>{};
+    auto empty = store.query_bounded("cmd-scope", q, none, 1 << 20);
+    REQUIRE(empty.has_value());
+    CHECK(empty->rows.empty());
+    CHECK_FALSE(empty->byte_cap_hit);
+    CHECK_FALSE(empty->row_cap_hit);
+}

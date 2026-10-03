@@ -629,10 +629,14 @@ TEST_CASE("GET /api/v1/responses/:id/export: the total-byte cap truncates JSON a
         CHECK(body["data"].size() < 5);         // and the cap actually cut the export
         REQUIRE(body["pagination"].contains("result_truncated_by_cap"));
         CHECK(body["pagination"]["result_truncated_by_cap"].get<bool>() == true);
+        CHECK(res_json->get_header_value("Content-Disposition") ==
+              "attachment; filename=\"responses-instr-bytecap-truncated.json\"");
 
         auto res_csv = h.sink.Get("/api/v1/responses/instr-bytecap/export?format=csv");
         REQUIRE(res_csv);
         CHECK(res_csv->get_header_value("X-Result-Truncated-By-Cap") == "true");
+        CHECK(res_csv->get_header_value("Content-Disposition") ==
+              "attachment; filename=\"responses-instr-bytecap-truncated.csv\"");
         CHECK(res_csv->body.size() < 5 * 400);
     }
 
@@ -642,6 +646,37 @@ TEST_CASE("GET /api/v1/responses/:id/export: the total-byte cap truncates JSON a
     auto full = nlohmann::json::parse(res_full->body);
     CHECK(full["data"].size() == 5);
     CHECK_FALSE(full["pagination"].contains("result_truncated_by_cap"));
+    CHECK(res_full->get_header_value("Content-Disposition") ==
+          "attachment; filename=\"responses-instr-bytecap.json\"");
+
+    auto res_full_csv = h.sink.Get("/api/v1/responses/instr-bytecap/export?format=csv");
+    REQUIRE(res_full_csv);
+    CHECK(res_full_csv->get_header_value("X-Result-Truncated-By-Cap").empty());
+    CHECK(res_full_csv->get_header_value("Content-Disposition") ==
+          "attachment; filename=\"responses-instr-bytecap.csv\"");
+}
+
+TEST_CASE("GET /api/v1/responses/:id/export: a ROW-cap cut renames the download and an "
+          "exactly-full export does not (#4703 UP-3)",
+          "[pg][rest][responses][v1]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, respv1_responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    RespV1Harness h(pool);
+    for (int i = 0; i < 3; ++i)
+        h.response_store->store(
+            mk_resp("instr-rowcut", "agent-" + std::to_string(i), 0, "o", 100 + i));
+    for (const char* fmt : {"json", "csv"}) {
+        const std::string f = fmt;
+        auto cut = h.sink.Get("/api/v1/responses/instr-rowcut/export?limit=2&format=" + f);
+        REQUIRE(cut);
+        CHECK(cut->get_header_value("Content-Disposition") ==
+              "attachment; filename=\"responses-instr-rowcut-truncated." + f + "\"");
+        auto exact = h.sink.Get("/api/v1/responses/instr-rowcut/export?limit=3&format=" + f);
+        REQUIRE(exact);
+        CHECK(exact->get_header_value("Content-Disposition") ==
+              "attachment; filename=\"responses-instr-rowcut." + f + "\"");
+        CHECK(exact->get_header_value("X-Result-Truncated-By-Cap").empty());
+    }
 }
 
 TEST_CASE("GET /api/v1/responses/:id/export: a LAST row that crosses the byte cap is not a "

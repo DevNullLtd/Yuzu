@@ -214,15 +214,21 @@ void register_response_routes(HttpRouteSink& sink, Deps deps) {
             scope_arg = std::move(in_scope); // engaged-empty means no rows
         }
 
-        auto results_opt = deps.store->query(instruction_id, q, scope_arg);
-        if (!results_opt) {
+        // #4703: byte-aware fetch -- the payload cap is applied IN SQL, so the PGresult and
+        // the parsed vector never hold more than about export_body_byte_cap() of
+        // output/error_detail (see ResponseStore::query_bounded). Same predicates and
+        // scope push-down as query().
+        const std::size_t byte_cap = export_body_byte_cap().load();
+        auto bounded_opt = deps.store->query_bounded(instruction_id, q, scope_arg, byte_cap);
+        if (!bounded_opt) {
             res.status = 503;
             res.set_content(
                 R"({"error":{"code":503,"message":"response store degraded"},"meta":{"api_version":"v1"}})",
                 "application/json");
             return;
         }
-        auto results = std::move(*results_opt);
+        auto results = std::move(bounded_opt->rows);
+        ExportCut cut{bounded_opt->row_cap_hit, bounded_opt->byte_cap_hit};
 
         // CC7.2 evidence: record the scope-drop on this surface (#1634 compliance review).
         if (export_dropped > 0)
@@ -231,15 +237,11 @@ void register_response_routes(HttpRouteSink& sink, Deps deps) {
 
         auto format = req.get_param_value("format");
 
-        // Truncation signal (#4703): the row-count cap (limit) OR the row-payload byte cap below (approximate: counts serialized rows, not framing).
-        // Legacy export never signalled either; additive header / envelope field.
-        const std::size_t byte_cap = export_body_byte_cap().load();
-        bool truncated = results.size() == static_cast<std::size_t>(q.limit);
-
         if (format == "csv") {
             std::string csv =
                 "id,instruction_id,agent_id,timestamp,status,output,error_detail\r\n";
-            truncated |= append_rows_until_byte_cap(results, byte_cap, [&csv](const auto& r) {
+            // Backstop: CSV escaping makes the serialized row larger than its raw payload.
+            cut.byte_cap |= append_rows_until_byte_cap(results, byte_cap, [&csv](const auto& r) {
                 csv += std::to_string(r.id) + ",";
                 csv += data_export::csv_escape(r.instruction_id) + ",";
                 csv += data_export::csv_escape(r.agent_id) + ",";
@@ -249,15 +251,18 @@ void register_response_routes(HttpRouteSink& sink, Deps deps) {
                 csv += data_export::csv_escape(r.error_detail) + "\r\n";
                 return csv.size();
             });
+            // A cut export is renamed `-truncated` so the signal survives `curl -o` and
+            // browser downloads, which discard the response header below.
             res.set_header("Content-Disposition",
-                           "attachment; filename=\"responses-" + instruction_id + ".csv\"");
-            if (truncated)
+                           "attachment; filename=\"" +
+                               export_filename(instruction_id, "csv", cut.any()) + "\"");
+            if (cut.any())
                 res.set_header("X-Result-Truncated-By-Cap", "true");
-            res.set_content(csv, "text/csv; charset=utf-8");
+            res.set_content(std::move(csv), "text/csv; charset=utf-8");
         } else {
             nlohmann::json arr = nlohmann::json::array();
             std::size_t json_bytes = 0;
-            truncated |= append_rows_until_byte_cap(results, byte_cap, [&](const auto& r) {
+            cut.byte_cap |= append_rows_until_byte_cap(results, byte_cap, [&](const auto& r) {
                 arr.push_back({{"id", r.id},
                                {"instruction_id", r.instruction_id},
                                {"agent_id", r.agent_id},
@@ -265,18 +270,19 @@ void register_response_routes(HttpRouteSink& sink, Deps deps) {
                                {"status", r.status},
                                {"output", r.output},
                                {"error_detail", r.error_detail}});
-                // Serialized size of the row just appended (escapes counted), so the cap
-                // bounds the real body rather than an estimate of it.
+                // Serialized size of the row just appended (escapes counted).
                 json_bytes += arr.back().dump().size();
                 return json_bytes;
             });
             nlohmann::json envelope = {{"instruction_id", instruction_id},
                                        {"count", arr.size()},
-                                       {"responses", arr}};
-            if (truncated)
+                                       {"responses", nullptr}};
+            envelope["responses"] = std::move(arr);
+            if (cut.any())
                 envelope["result_truncated_by_cap"] = true;
             res.set_header("Content-Disposition",
-                           "attachment; filename=\"responses-" + instruction_id + ".json\"");
+                           "attachment; filename=\"" +
+                               export_filename(instruction_id, "json", cut.any()) + "\"");
             res.set_content(envelope.dump(2), "application/json; charset=utf-8");
         }
     });
@@ -318,6 +324,10 @@ void register_response_routes(HttpRouteSink& sink, Deps deps) {
                 "application/json");
             return;
         }
+        // The legacy list had no ceiling on an explicit `limit` (an unbounded fetch, the
+        // same defect class as #4703's export); v1 and MCP clamp to 1000. limit<=0 keeps
+        // meaning the store default (100).
+        q.limit = cap_query_limit(q.limit);
 
         // #1634 / ADR-0017 INV-3 (CRITICAL): resolve the in-scope agent set and push it
         // into the SQL WHERE clause BEFORE LIMIT/OFFSET — see the /export sibling above
