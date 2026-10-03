@@ -57,8 +57,10 @@
  *     separately: the quarantine window above is the suppression, keyed on
  *     monotonic time rather than a persisted fact-set.
  *   - Part 5 (cap every accepted pass UNCONDITIONALLY) IS adopted, via the
- *     five `kScratchSweep*` constants below (carried per pass in
- *     SweepLimits) -- a pass never opens more than max_root_entries root
+ *     five cap constants below, kScratchSweepMaxRootEntries through
+ *     kScratchSweepMaxDirEntries (carried per pass in SweepLimits;
+ *     kScratchSweepClockStepToleranceSecs shares the prefix but is part 3's
+ *     tolerance, not a cap) -- a pass never opens more than max_root_entries root
  *     entries, never removes more than max_removals candidates, never fails
  *     more than max_failures, never starts a new candidate once max_wall_ms
  *     has elapsed (checked before each root entry and before each candidate

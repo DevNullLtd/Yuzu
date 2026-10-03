@@ -234,7 +234,8 @@ private:
             }
             if (skip) {
                 spdlog::warn("execution_artifacts: {} scratch sweep skipped: wall clock stepped "
-                             "forward relative to monotonic time; sweeping resumes after {} s",
+                             "forward relative to monotonic time; sweeping resumes within {} s of "
+                             "monotonic time",
                              trigger, yuzu::execution_artifacts::kScratchDirStaleAfterSecs);
                 return;
             }

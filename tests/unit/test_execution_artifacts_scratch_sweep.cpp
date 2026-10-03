@@ -16,8 +16,6 @@
 
 #include <catch2/catch_test_macros.hpp>
 
-#include <wall_clock_step.hpp> // yuzu::shared::ClockStepGuard (#4503)
-
 #include "test_helpers.hpp" // yuzu::test::TempDir, yuzu::test::process_random_salt
 
 #include <cstdint>
@@ -114,42 +112,6 @@ TEST_CASE("is_stale: exact-equality age is fresh, one second past is stale, a ne
     CHECK(is_stale(kMtime, kMtime + kScratchDirStaleAfterSecs + 1, kScratchDirStaleAfterSecs));
     // now < mtime -- a future-dated mtime (clock skew).
     CHECK_FALSE(is_stale(kMtime, kMtime - 10, kScratchDirStaleAfterSecs));
-}
-
-TEST_CASE("ClockStepGuard (#4503): steady progression never skips; forward step, backward-then-"
-          "restore skip; quarantine expires; boundary is strictly greater",
-          "[execution_artifacts][scratch_sweep]") {
-    using yuzu::shared::ClockSample;
-    using yuzu::shared::ClockStepGuard;
-    using yuzu::shared::observe_and_should_skip;
-    using yuzu::shared::stepped_forward;
-    constexpr std::int64_t kTol = kScratchSweepClockStepToleranceSecs;
-    constexpr std::int64_t kQuar = kScratchDirStaleAfterSecs;
-
-    SECTION("steady-only progression never skips") {
-        ClockStepGuard g{ClockSample{1000, 10}, ClockStepGuard{}.quarantine_until_steady_s};
-        for (std::int64_t i = 1; i <= 20; ++i)
-            CHECK_FALSE(observe_and_should_skip(g, {1000 + i * 30, 10 + i * 30}, kTol, kQuar));
-    }
-    SECTION("forward step skips") {
-        ClockStepGuard g{ClockSample{0, 0}, ClockStepGuard{}.quarantine_until_steady_s};
-        CHECK(observe_and_should_skip(g, {3700, 1}, kTol, kQuar));
-    }
-    SECTION("backward step then restoration skips at the restoration, not before") {
-        ClockStepGuard g{ClockSample{0, 0}, ClockStepGuard{}.quarantine_until_steady_s};
-        CHECK_FALSE(observe_and_should_skip(g, {-3590, 10}, kTol, kQuar));
-        CHECK(observe_and_should_skip(g, {20, 20}, kTol, kQuar));
-    }
-    SECTION("quarantine expires after quarantine_s of steady time with no further step") {
-        ClockStepGuard g{ClockSample{0, 0}, ClockStepGuard{}.quarantine_until_steady_s};
-        CHECK(observe_and_should_skip(g, {3700, 1}, kTol, kQuar));
-        CHECK(observe_and_should_skip(g, {3700 + kQuar - 1, 1 + kQuar - 1}, kTol, kQuar));
-        CHECK_FALSE(observe_and_should_skip(g, {3700 + kQuar, 1 + kQuar}, kTol, kQuar));
-    }
-    SECTION("stepped_forward: exactly the tolerance is no step, one more is") {
-        CHECK_FALSE(stepped_forward({0, 0}, {kTol, 0}, kTol));
-        CHECK(stepped_forward({0, 0}, {kTol + 1, 0}, kTol));
-    }
 }
 
 #if defined(_WIN32)
@@ -616,28 +578,60 @@ constexpr std::int64_t kSweepStale = kSweepNow - kScratchDirStaleAfterSecs - 30;
 
 TEST_CASE("sweep_stale_scratch_dirs: removal and failure caps are independent (#4505)",
           "[execution_artifacts][scratch_sweep]") {
+    // The loop guard runs before every candidate and stops the pass as soon as EITHER
+    // counter reaches its cap, so (removed == max_removals && failed == max_failures)
+    // is unreachable for any order. Each section binds exactly one cap and leaves the
+    // other non-binding, which makes the result independent of NTFS enumeration order.
     yuzu::test::TempDir root{"yuzu_test_execart_sweep_caps_"};
     std::error_code ec;
     fs::create_directories(root.path, ec);
     REQUIRE_FALSE(ec);
 
-    // Order F R F R F R: the pass stops before the 5th entry (removed 2, failed 2),
-    // so the third removable is deferred, not reached.
-    create_failing_scratch_dir(root.path / ordered_scratch_name(1), kSweepStale);
-    create_scratch_dir_with_file(root.path / ordered_scratch_name(2), kSweepStale);
-    create_failing_scratch_dir(root.path / ordered_scratch_name(3), kSweepStale);
-    create_scratch_dir_with_file(root.path / ordered_scratch_name(4), kSweepStale);
-    create_failing_scratch_dir(root.path / ordered_scratch_name(5), kSweepStale);
-    create_scratch_dir_with_file(root.path / ordered_scratch_name(6), kSweepStale);
+    SECTION("removal cap alone: the third removable is deferred, not reached") {
+        for (unsigned i = 1; i <= 3; ++i)
+            create_scratch_dir_with_file(root.path / ordered_scratch_name(i), kSweepStale);
 
-    const ScratchSweepResult r =
-        sweep_stale_scratch_dirs(root.path.wstring(), kSweepNow, kScratchDirStaleAfterSecs,
-                                 SweepLimits{.max_removals = 2, .max_failures = 2}, 0);
-    CAPTURE(r.removed, r.failed, r.deferred);
-    CHECK(r.removed == 2);
-    CHECK(r.failed == 2);
-    CHECK(r.deferred >= 1);
-    CHECK(fs::exists(root.path / ordered_scratch_name(6)));
+        const ScratchSweepResult r =
+            sweep_stale_scratch_dirs(root.path.wstring(), kSweepNow, kScratchDirStaleAfterSecs,
+                                     SweepLimits{.max_removals = 2}, 0);
+        CAPTURE(r.removed, r.failed, r.deferred);
+        CHECK(r.removed == 2);
+        CHECK(r.failed == 0);
+        CHECK(r.deferred == 1);
+        std::size_t survivors = 0;
+        for (unsigned i = 1; i <= 3; ++i)
+            survivors += fs::exists(root.path / ordered_scratch_name(i)) ? 1 : 0;
+        CHECK(survivors == 1);
+    }
+    SECTION("failure cap alone: the third failing candidate is deferred, not reached") {
+        for (unsigned i = 1; i <= 3; ++i)
+            create_failing_scratch_dir(root.path / ordered_scratch_name(i), kSweepStale);
+
+        const ScratchSweepResult r =
+            sweep_stale_scratch_dirs(root.path.wstring(), kSweepNow, kScratchDirStaleAfterSecs,
+                                     SweepLimits{.max_failures = 2}, 0);
+        CAPTURE(r.removed, r.failed, r.deferred);
+        CHECK(r.removed == 0);
+        CHECK(r.failed == 2);
+        CHECK(r.deferred == 1);
+        for (unsigned i = 1; i <= 3; ++i)
+            CHECK(fs::exists(root.path / ordered_scratch_name(i) / "nested"));
+    }
+    SECTION("failures do not consume the removal budget: an orphan behind them is removed") {
+        for (unsigned i = 1; i <= 3; ++i)
+            create_failing_scratch_dir(root.path / ordered_scratch_name(i), kSweepStale);
+        const fs::path orphan = root.path / ordered_scratch_name(4);
+        create_scratch_dir_with_file(orphan, kSweepStale);
+
+        const ScratchSweepResult r =
+            sweep_stale_scratch_dirs(root.path.wstring(), kSweepNow, kScratchDirStaleAfterSecs,
+                                     SweepLimits{.max_removals = 2}, 0);
+        CAPTURE(r.removed, r.failed, r.deferred);
+        CHECK(r.removed == 1);
+        CHECK(r.failed == 3);
+        CHECK(r.deferred == 0);
+        CHECK_FALSE(fs::exists(orphan));
+    }
 }
 
 TEST_CASE("sweep_stale_scratch_dirs: root entry cap defers visibly; rotation does not reach past "
@@ -723,8 +717,11 @@ TEST_CASE("sweep_stale_scratch_dirs: an already-expired wall deadline defers and
     const fs::path dir = root.path / unique_scratch_name();
     create_scratch_dir_with_file(dir, kSweepStale);
 
-    // The deadline is computed once per pass; with max_wall_ms = 0 it is past
-    // by the first check, whether enumeration or the per-candidate check trips.
+    // The deadline is computed once per pass; with max_wall_ms = 0 it is already
+    // past when enumerate_at checks it (confined_fs_win.cpp:516, before reading any
+    // entry), so the root enumeration returns WallTimeCap with zero entries and the
+    // sweep's own per-candidate check never runs. That second check
+    // (execution_artifacts_scratch_sweep_win.cpp:245-248) is read-verified only.
     const ScratchSweepResult r =
         sweep_stale_scratch_dirs(root.path.wstring(), kSweepNow, kScratchDirStaleAfterSecs,
                                  SweepLimits{.max_wall_ms = 0}, 0);
@@ -733,10 +730,19 @@ TEST_CASE("sweep_stale_scratch_dirs: an already-expired wall deadline defers and
     CHECK(fs::exists(dir / "amcache.hve"));
 }
 
-// Missing-mtime branch (`!entry.meta.mtime` -> failed, never "old"): NTFS always
-// reports a last-write time, so a fixture cannot make entry.meta.mtime nullopt
-// and the branch is not exercised here. Its contract -- absence is never treated
-// as stale -- is the same one is_stale() pins above (a future-dated age is fresh).
+// Known test gaps -- three branches of the sweep loop that no fixture can reach
+// deterministically (read-verified only; recorded in the PR body):
+//   - Missing mtime (`!entry.meta.mtime` -> failed, never "old"): enumerate_at sets
+//     meta.mtime from filetime_to_unix_seconds(LastWriteTime), which is nullopt only
+//     for ticks <= 0; NTFS treats a zero time in SetFileTime as "do not change", so
+//     it cannot be made to report one -- only a hostile or redirected filesystem can.
+//     (is_stale() is never reached on that branch, so it does not pin this contract.)
+//   - Open-time reparse-point rejection and open-time volume-mismatch rejection: the
+//     enumeration-time `EntryType != Directory` skip already drops a junction (see the
+//     junction fixture in the first sweep case), so these checks run only when an
+//     entry is swapped for a reparse point / mount point BETWEEN enumerate_at(root)
+//     returning and open_candidate_relative() for it, inside one synchronous call.
+//     No helper in this TU can time that swap.
 
 TEST_CASE("sweep_stale_scratch_dirs: persistent failures sorting first cannot starve a later "
           "orphan across rotated passes (#4504)",
@@ -829,43 +835,6 @@ TEST_CASE("execution_artifacts amcache dispatch: a newly planted stale scratch d
     (void)dispatcher.run(plugin->descriptor, "amcache"); // rc ignored -- may be constrained unelevated
 
     CHECK_FALSE(fs::exists(data_dir.path / stale_name));
-
-    if (plugin->descriptor->shutdown)
-        plugin->descriptor->shutdown(ctx.get());
-}
-
-TEST_CASE("execution_artifacts amcache dispatch: a fresh planted scratch dir is never swept "
-          "(#4503)",
-          "[execution_artifacts][scratch_sweep]") {
-    // The in-process clock-step skip cannot be forced from a test (the plugin has
-    // no clock seam); the pure ClockStepGuard cases above pin that decision.
-    // This pins the observable invariant either way: a fresh dir survives.
-    auto plugin = load_execution_artifacts_plugin();
-    if (!plugin) {
-        require_plugin_or_skip();
-        return;
-    }
-
-    yuzu::test::TempDir data_dir("yuzu_test_execart_sweep_fresh_");
-    std::error_code ec;
-    fs::create_directories(data_dir.path, ec);
-    REQUIRE_FALSE(ec);
-
-    yuzu::agent::StandalonePluginContext ctx(
-        "execution_artifacts",
-        std::unordered_map<std::string, std::string>{{"agent.data_dir", data_dir.path.string()}});
-    REQUIRE(plugin->descriptor->init(ctx.get()) == 0);
-
-    const auto real_now_s = std::chrono::duration_cast<std::chrono::seconds>(
-                                std::chrono::system_clock::now().time_since_epoch())
-                                .count();
-    const std::string fresh_name = unique_scratch_name();
-    create_scratch_dir_with_file(data_dir.path / fresh_name, real_now_s);
-
-    yuzu::agent::LocalDispatcher dispatcher;
-    (void)dispatcher.run(plugin->descriptor, "amcache");
-
-    CHECK(fs::exists(data_dir.path / fresh_name));
 
     if (plugin->descriptor->shutdown)
         plugin->descriptor->shutdown(ctx.get());

@@ -18,6 +18,12 @@
  * fresher (age shrinks), which can delay a cleanup but never trigger one early.
  * Nothing is persisted; the first sample a caller takes has no predecessor and
  * is accepted as-is by construction (the caller seeds `ClockStepGuard::last`).
+ *
+ * Suspend/resume: where the monotonic clock excludes sleep (Linux
+ * CLOCK_MONOTONIC, Darwin mach_absolute_time) a resume reads as a forward step
+ * and costs one quarantine of delayed work -- fail-safe, never an early
+ * deletion. On Windows std::steady_clock is QueryPerformanceCounter, which
+ * counts time asleep, so a resume is not read as a step.
  */
 
 #include <chrono>

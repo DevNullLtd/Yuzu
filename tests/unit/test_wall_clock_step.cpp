@@ -36,7 +36,8 @@ TEST_CASE("guard: permanent forward step quarantines then recovers without resta
     CHECK(shared::observe_and_should_skip(g, {3610, 10}, kTol, kQ));
     // Still inside the quarantine window: wall and steady now advance in step.
     CHECK(shared::observe_and_should_skip(g, {3610 + kQ - 1, 10 + kQ - 1}, kTol, kQ));
-    CHECK_FALSE(shared::observe_and_should_skip(g, {3610 + kQ + 1, 10 + kQ + 1}, kTol, kQ));
+    // Exactly kQ after the step: the strict `<` in observe_and_should_skip lifts it here.
+    CHECK_FALSE(shared::observe_and_should_skip(g, {3610 + kQ, 10 + kQ}, kTol, kQ));
 }
 
 TEST_CASE("guard: steady-only progression never skips", "[wall_clock_step]") {
