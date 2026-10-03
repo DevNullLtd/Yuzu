@@ -36,6 +36,8 @@ Modes:
       files. Existing bullets and any non-canonical subsections are left as
       they are. The header date is kept unless --date is given; pass the
       final release date when folding fragments in before tagging the final.
+      With no fragments, --date alone re-dates the header (the final release
+      after an RC that already folded every fragment); nothing else changes.
       Refuses if [Unreleased] is missing or still holds legacy subsections (run a plain
       promote of the next version for those), if <X.Y.Z> is not the newest
       released section (override: --allow-older-section), if more than one
@@ -529,8 +531,22 @@ def cmd_promote_append(version: str, date_str: str | None, changelog: Path, frag
 
     frags = fragment_files(fragments_dir)
     if not frags:
-        print("promote --append: nothing to append — no fragments in changelog.d/", file=sys.stderr)
-        return 1
+        if not date_str:
+            print("promote --append: nothing to append — no fragments in changelog.d/ (to only change the "
+                  f"## [{version}] header date, pass --date YYYY-MM-DD)", file=sys.stderr)
+            return 1
+        # No hotfixes since the last append: the final release still needs its
+        # own date on the header, so --date alone re-dates it. Nothing else changes.
+        old_header = lines[start]
+        header = f"## [{version}] - {date_str}"
+        if old_header == header:
+            print(f"promote --append: {header} already carries that date; nothing to do")
+            return 0
+        lines[start] = header
+        write_atomic(changelog, "\n".join(lines))
+        print(f"promote --append: no fragments; re-dated {old_header} -> {header}")
+        print("promote --append: review the diff, then commit CHANGELOG.md.")
+        return 0
     additions: dict[str, list[str]] = {name: [] for name in CANONICAL_SECTIONS}
     already = []
     for path in frags:

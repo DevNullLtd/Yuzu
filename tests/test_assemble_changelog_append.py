@@ -107,6 +107,28 @@ class PromoteAppend(unittest.TestCase):
     def test_refuses_without_fragments(self):
         r = self.run_append()
         self.assertEqual(r.returncode, 1)
+        self.assertIn("pass --date", r.stderr)
+        self.assertEqual(self.changelog.read_text(encoding="utf-8"), CHANGELOG)
+
+    def test_date_only_redates_header(self):
+        r = self.run_append("--date", "2026-10-10")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.changelog.read_text(encoding="utf-8"),
+                         CHANGELOG.replace("## [1.2.0] - 2026-09-01", "## [1.2.0] - 2026-10-10"))
+        self.assertEqual(sorted(p.name for p in self.dir.iterdir()), ["CHANGELOG.md", "changelog.d"])
+
+    def test_date_only_same_date_is_a_noop(self):
+        r = self.run_append("--date", "2026-09-01")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("nothing to do", r.stdout)
+        self.assertEqual(self.changelog.read_text(encoding="utf-8"), CHANGELOG)
+
+    def test_date_only_still_guards_older_section_and_bad_date(self):
+        r = self.run_version("1.1.0", "--date", "2026-10-10")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("not the newest released section", r.stderr)
+        r = self.run_append("--date", "2026-02-30")
+        self.assertEqual(r.returncode, 2)
         self.assertEqual(self.changelog.read_text(encoding="utf-8"), CHANGELOG)
 
     def test_refuses_legacy_unreleased_content(self):
