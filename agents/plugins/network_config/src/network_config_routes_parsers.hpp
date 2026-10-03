@@ -452,8 +452,13 @@ inline RtRoutesParse parse_rtnetlink_routes_chunk(std::span<const unsigned char>
         }
         if (rta_len > 0)
             malformed = true; // attribute walk stopped on a bad rta_len
-        if (malformed)
+        if (malformed) {
+            // Never emit a row built from a failed decode: an unreadable gateway would render
+            // `-`, which the schema defines as "on-link". The read is flagged incomplete instead,
+            // the same as the invalid-prefix case above.
             out.truncated = true;
+            continue;
+        }
 
         if (rec.table == RT_TABLE_LOCAL)
             continue; // checked AFTER the attribute walk so RTA_TABLE can override rtm_table
@@ -696,7 +701,17 @@ inline MacRoutesParse parse_route_table_dump(std::span<const unsigned char> blob
                 rec.gateway = routes_detail::mac_v4_text(sa_gw);
             else if (sa_gw[1] == AF_INET6 && sa_gw[0] >= sizeof(struct sockaddr_in6))
                 rec.gateway = routes_detail::mac_v6_text(sa_gw);
-            // AF_LINK (`link#N`): on-link, no gateway address. Anything else: none.
+            else if (sa_gw[1] != AF_LINK) {
+                // Neither a decodable IPv4/IPv6 gateway nor an AF_LINK (`link#N`, on-link) one: a
+                // short sockaddr or an unknown family. Reading it as "no gateway" would render
+                // on-link, so the read is flagged incomplete and the record dropped.
+                out.truncated = true;
+                continue;
+            }
+            if (rec.gateway.empty() && sa_gw[1] != AF_LINK) {
+                out.truncated = true; // inet_ntop refused it
+                continue;
+            }
         }
 
         if (out.records.size() >= kRoutesRowCap) {

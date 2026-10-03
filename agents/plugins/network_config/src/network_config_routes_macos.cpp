@@ -22,6 +22,7 @@
 #include <sys/socket.h>
 #include <sys/sysctl.h>
 
+#include <algorithm>
 #include <cerrno>
 #include <cstddef>
 #include <string>
@@ -47,8 +48,10 @@ Fetch fetch_route_dump(std::vector<unsigned char>& out) {
         if (need > kMaxDumpBytes)
             return Fetch::TooLarge;
         // Headroom: entries added between the size probe and the fill would
-        // otherwise fail the fill with ENOMEM on every retry of a busy table.
-        out.assign(need + need / 8 + 4096, 0);
+        // otherwise fail the fill with ENOMEM on every retry of a busy table — but never past the
+        // bound: the allocation and anything the fill returns stay <= kMaxDumpBytes, and a table
+        // that outgrows it makes the next probe report TooLarge.
+        out.assign(std::min(need + need / 8 + 4096, kMaxDumpBytes), 0);
         std::size_t got = out.size();
         if (::sysctl(mib, 6, out.data(), &got, nullptr, 0) == 0) {
             out.resize(got);

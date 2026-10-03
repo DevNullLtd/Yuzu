@@ -69,7 +69,12 @@ inline yuzu::agent::ScopedFd open_rtnetlink_socket() {
         struct timeval tv {
             kRecvTimeoutSeconds, 0
         };
-        ::setsockopt(fd.get(), SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        // The receive timeout is the ONLY bound on a silent recvmsg (the wall-clock deadline in
+        // dump() is checked after a read returns), so a socket that cannot have it is not usable:
+        // an unchecked failure here would silently restore a blocking, unbounded wait. Same rule as
+        // the firewall plugin's nft socket (firewall_plugin.cpp:923-931).
+        if (::setsockopt(fd.get(), SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) < 0)
+            return yuzu::agent::ScopedFd{};
     }
     return fd;
 }

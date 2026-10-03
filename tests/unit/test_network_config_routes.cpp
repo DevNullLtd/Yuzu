@@ -608,17 +608,16 @@ TEST_CASE("routes decode rejects an out-of-range prefix length as malformed",
     CHECK(out.truncated);
 }
 
-TEST_CASE("routes decode treats a too-short address attribute as malformed, not as absent",
+TEST_CASE("routes decode drops a record whose address attribute is too short and flags the read",
           "[network_config][routes][rtnetlink]") {
     constexpr std::uint32_t kSeq = 7;
     auto m = route_msg(kSeq, AF_INET, 24, RT_TABLE_MAIN, RTN_UNICAST, 3, 0,
                        {{RTA_DST, v4(10, 0, 0, 0)}, {RTA_GATEWAY, {10, 0}}}); // 2 bytes, not 4
     const auto out = parse_rtnetlink_routes_chunk(m, kSeq);
     CHECK(out.truncated);
-    // The route is still reported (its destination was readable) but the caller is
-    // told the read was imperfect, and no half-parsed gateway is invented.
-    REQUIRE(out.records.size() == 1);
-    CHECK(out.records[0].gateway.empty());
+    // No row at all: an unreadable gateway would render `-`, which means "on-link". The read is
+    // reported incomplete instead of the route being reported wrong.
+    CHECK(out.records.empty());
 }
 
 TEST_CASE("routes decode surfaces an `ip nexthop` object reference without resolving it",
@@ -641,7 +640,7 @@ TEST_CASE("routes decode survives a later nexthop whose rtnh_len points past the
     // past the payload (a heap-buffer-overflow under ASan, since the message ends
     // exactly at the attribute). With it the second nexthop is rejected: one nexthop
     // is counted, so the route is NOT flagged collapsed, and the leftover bytes mark
-    // the read malformed.
+    // the read malformed — which now drops the record (never a row from a failed decode).
     constexpr std::uint32_t kSeq = 7;
     std::vector<unsigned char> nh;
     struct rtnexthop first {};
@@ -656,9 +655,7 @@ TEST_CASE("routes decode survives a later nexthop whose rtnh_len points past the
                        {{RTA_DST, v4(172, 20, 0, 0)}, {RTA_MULTIPATH, nh}});
     const auto out = parse_rtnetlink_routes_chunk(m, kSeq);
     CHECK(out.truncated);
-    REQUIRE(out.records.size() == 1);
-    CHECK(out.records[0].ifindex == 12);
-    CHECK_FALSE(out.records[0].multipath_collapsed);
+    CHECK(out.records.empty());
 }
 
 TEST_CASE("routes decode reports NLMSG_ERROR", "[network_config][routes][rtnetlink]") {
@@ -876,7 +873,7 @@ TEST_CASE("netlink dump trims to the record cap and says so",
     CHECK(r.records.size() == 5);
 }
 
-TEST_CASE("routes decode flags a malformed nested multipath gateway instead of reporting on-link",
+TEST_CASE("routes decode drops a malformed nested multipath gateway instead of reporting on-link",
           "[network_config][routes][rtnetlink]") {
     // The FIRST nexthop carries an RTA_GATEWAY too short to be an IPv4 address (2 bytes) — and,
     // separately, an RTA_VIA whose family is neither AF_INET nor AF_INET6. Both used to be
@@ -895,12 +892,12 @@ TEST_CASE("routes decode flags a malformed nested multipath gateway instead of r
     };
     const auto short_gw = parse_rtnetlink_routes_chunk(with_nested(RTA_GATEWAY, {10, 0}), kSeq);
     CHECK(short_gw.truncated);
-    REQUIRE(short_gw.records.size() == 1);
-    CHECK(short_gw.records[0].gateway.empty());
+    CHECK(short_gw.records.empty());
 
     const std::vector<unsigned char> bad_via{0x63, 0x00, 1, 2, 3, 4}; // family 99
     const auto bad = parse_rtnetlink_routes_chunk(with_nested(RTA_VIA, bad_via), kSeq);
     CHECK(bad.truncated);
+    CHECK(bad.records.empty());
 
     // and a well-formed nested gateway is still clean
     const auto ok = parse_rtnetlink_routes_chunk(with_nested(RTA_GATEWAY, v4(10, 77, 0, 1)), kSeq);
@@ -1146,6 +1143,36 @@ TEST_CASE("routes decode survives a sockaddr whose sa_len overruns its record",
     const auto out = parse_route_table_dump(msg);
     CHECK(out.records.empty());
     CHECK(out.truncated);
+}
+
+TEST_CASE("routes decode never reports an undecodable gateway as on-link",
+          "[network_config][routes][pf_route]") {
+    // AF_LINK (`link#N`) IS on-link. A short AF_INET gateway or one of an unknown family is not
+    // decodable, and rendering it `-` would read as on-link: the record is dropped and the read
+    // flagged, like every other malformed shape on this leg.
+    const auto dst = sin_bytes(198, 51, 100, 0);
+    const auto mask = trimmed_mask_v4({0xff, 0xff, 0xff});
+    const std::vector<unsigned char> link{8, AF_LINK, 7, 0, 0, 0, 0, 0};
+    const auto on_link = parse_route_table_dump(route_msg(RTF_UP | RTF_STATIC, 7, dst, &link, &mask));
+    REQUIRE(on_link.records.size() == 1);
+    CHECK(on_link.records[0].gateway.empty());
+    CHECK_FALSE(on_link.truncated);
+
+    const std::vector<unsigned char> short_in{8, AF_INET, 0, 0, 10, 0, 0, 1}; // sa_len 8 < 16
+    const auto s1 = parse_route_table_dump(route_msg(RTF_UP | RTF_GATEWAY, 7, dst, &short_in, &mask));
+    CHECK(s1.records.empty());
+    CHECK(s1.truncated);
+
+    const std::vector<unsigned char> unknown{16, 7 /* AF_ISO */, 0, 0, 1, 2, 3, 4, 0, 0, 0, 0, 0, 0, 0, 0};
+    const auto s2 = parse_route_table_dump(route_msg(RTF_UP | RTF_GATEWAY, 7, dst, &unknown, &mask));
+    CHECK(s2.records.empty());
+    CHECK(s2.truncated);
+
+    const auto gw = sin_bytes(198, 51, 100, 1);
+    const auto ok = parse_route_table_dump(route_msg(RTF_UP | RTF_GATEWAY, 7, dst, &gw, &mask));
+    REQUIRE(ok.records.size() == 1);
+    CHECK(ok.records[0].gateway == "198.51.100.1");
+    CHECK_FALSE(ok.truncated);
 }
 
 TEST_CASE("routes decode flags a record that advertises a sockaddr it does not contain",
