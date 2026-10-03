@@ -128,7 +128,7 @@ std::string read_text_file(const fs::path& p) {
     return std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
 }
 
-// Both helpers delegate to yuzu::shared::write_file_atomic (#4723 option 3: one
+// This helper delegates to yuzu::shared::write_file_atomic (#4723 option 3: one
 // audited implementation shared with asset_tags). The residual path-based rename
 // window and the Windows DACL gap are shared with asset_tags and documented in
 // the banner of agents/shared/atomic_file_write.hpp.
