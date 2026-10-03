@@ -838,6 +838,33 @@ if host_machine.system() == 'linux' and get_option('b_sanitize') == 'none'
   )
 endif
 
+# ── Plugin ABI containment under allocation failure (separate binary, deliberately) ──
+# test_plugin_abi_oom_containment.cpp replaces the global operator new/delete and defines the
+# yuzu_ctx_* host entry points itself (the real ones allocate), so it is not a source of
+# yuzu_agent_tests and must be ABSENT from sanitizer builds (they own the allocator). Not
+# built on Windows: plugin.h declares YUZU_EXPORT as dllimport there unless
+# YUZU_AGENT_CORE_BUILDING, so a test exe cannot define yuzu_ctx_* without posing as agent
+# core. Unlike the spark probe it is not Linux-only (header-inline seams, no .so
+# interposition), so macOS runs it too. Same --allow-running-no-tests rationale as above.
+if host_machine.system() != 'windows' and get_option('b_sanitize') == 'none'
+  plugin_abi_oom_exe = executable(
+    'yuzu_plugin_abi_oom_containment_tests',
+    files('unit/test_plugin_abi_oom_containment.cpp'),
+    include_directories: [include_directories('../agents/plugins/browser_policy/src'),
+                          include_directories('../agents/plugins/update_source_trust/src'),
+                          include_directories('../agents/shared')],
+    cpp_args: test_partial_init_args,
+    dependencies: [yuzu_sdk_dep, catch2_dep],
+  )
+  test(
+    'plugin ABI containment under allocation failure',
+    plugin_abi_oom_exe,
+    args: ['--allow-running-no-tests'],
+    suite: 'agent',
+    timeout: 30,
+  )
+endif
+
 # ── Agent unit tests: 3 tag-partitioned shards (#5073) ───────────────────────
 # The single 'agent unit tests' entry (one Catch2 process, serial) was the
 # Windows suite's longest and had no headroom left: 2026-10-01 case-level sum
