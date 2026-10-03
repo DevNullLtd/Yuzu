@@ -88,6 +88,141 @@ TEST_CASE("format_route_row cannot be split by an interface name containing the 
     CHECK(row == "route|ipv4|10.0.0.0|8|-|ev\\|il name/x|-|-|unicast|-");
 }
 
+
+// ── Windows mapping (portable: pure logic over a plain struct) ────────────
+//
+// The GetIpForwardTable2 call itself is the Windows-only shell and is verified live
+// on the-rig; everything decidable without Windows headers is tested here, on every
+// host, against a real capture of that table.
+
+namespace {
+
+// Mirrors the leg's own unpacking of a row: an unspecified next hop (0.0.0.0 / ::) is
+// on-link and becomes empty.
+std::vector<WinRoute> read_windows_fixture(const fs::path& p) {
+    REQUIRE(fs::exists(p));
+    std::ifstream f(p);
+    std::vector<WinRoute> out;
+    std::string line;
+    while (std::getline(f, line)) {
+        while (!line.empty() && line.back() == '\r')
+            line.pop_back();
+        if (line.empty() || line.front() == '#')
+            continue;
+        std::vector<std::string> c;
+        std::size_t start = 0;
+        for (std::size_t i = 0; i <= line.size(); ++i) {
+            if (i == line.size() || line[i] == '\t') {
+                c.push_back(line.substr(start, i - start));
+                start = i + 1;
+            }
+        }
+        REQUIRE(c.size() == 9);
+        WinRoute r;
+        r.ipv6 = c[0] == "ipv6";
+        r.destination = c[1];
+        r.prefix_len = static_cast<unsigned>(std::stoul(c[2]));
+        r.next_hop = (c[3] == "0.0.0.0" || c[3] == "::") ? std::string{} : c[3];
+        r.interface = c[4];
+        r.metric = std::stoul(c[6]);
+        r.protocol = std::stoi(c[7]);
+        out.push_back(std::move(r));
+    }
+    return out;
+}
+
+} // namespace
+
+TEST_CASE("windows routes from a real GetIpForwardTable2 capture keep reachability and drop the host's own",
+          "[network_config][routes][windows_map]") {
+    const auto table = read_windows_fixture(fixture_dir("windows") / "forward_table.tsv");
+    REQUIRE(table.size() == 41);
+
+    std::vector<std::string> rows;
+    for (const auto& r : table)
+        if (!win_route_is_host_local(r))
+            rows.push_back(format_route_row(win_route_to_row(r)));
+
+    // Hand-checked against the Get-NetRoute ground truth in the provenance file.
+    const std::vector<std::string> expected{
+        "route|ipv4|0.0.0.0|0|192.0.2.1|Ethernet|0|-|unicast|netmgmt",
+        "route|ipv4|100.64.0.12|32|-|Tailscale|0|-|unicast|netmgmt",
+        "route|ipv4|100.100.100.100|32|-|Tailscale|0|-|unicast|netmgmt",
+        "route|ipv4|100.64.0.77|32|-|Tailscale|0|-|unicast|netmgmt",
+        "route|ipv4|100.64.0.43|32|-|Tailscale|0|-|unicast|netmgmt",
+        "route|ipv4|127.0.0.0|8|-|Loopback Pseudo-Interface 1|256|-|unicast|local",
+        "route|ipv4|192.0.2.0|24|-|Ethernet|256|-|unicast|local",
+        "route|ipv6|fd7a:115c:a1e0::|48|fd7a:115c:a1e0::53|Tailscale|0|-|unicast|netmgmt",
+        "route|ipv6|fd7a:115c:a1e0::53|128|-|Tailscale|0|-|unicast|netmgmt",
+        "route|ipv6|fe80::|64|-|VPN Adapter|256|-|unicast|local",
+        "route|ipv6|fe80::|64|-|Local Area Connection|256|-|unicast|local",
+        "route|ipv6|fe80::|64|-|Ethernet 2|256|-|unicast|local",
+        "route|ipv6|fe80::|64|-|Ethernet|256|-|unicast|local",
+        "route|ipv6|fe80::|64|-|Bluetooth Network Connection|256|-|unicast|local",
+        "route|ipv6|fe80::|64|-|WiFi|256|-|unicast|local",
+        "route|ipv6|fe80::|64|-|Local Area Connection* 1|256|-|unicast|local",
+        "route|ipv6|fe80::|64|-|Local Area Connection* 2|256|-|unicast|local",
+    };
+    REQUIRE(rows.size() == expected.size());
+    for (std::size_t i = 0; i < expected.size(); ++i)
+        CHECK(rows[i] == expected[i]);
+}
+
+TEST_CASE("windows host-local rule: Local full-length and multicast are dropped, the rest kept",
+          "[network_config][routes][windows_map]") {
+    auto route = [](bool v6, const char* dst, unsigned plen, int proto) {
+        WinRoute r;
+        r.ipv6 = v6;
+        r.destination = dst;
+        r.prefix_len = plen;
+        r.protocol = proto;
+        return r;
+    };
+    // Dropped: own address / broadcast (Local + /32 or /128), multicast prefixes.
+    CHECK(win_route_is_host_local(route(false, "192.0.2.131", 32, 2)));
+    CHECK(win_route_is_host_local(route(false, "192.0.2.255", 32, 2)));
+    CHECK(win_route_is_host_local(route(false, "255.255.255.255", 32, 2)));
+    CHECK(win_route_is_host_local(route(false, "224.0.0.0", 4, 2)));
+    CHECK(win_route_is_host_local(route(false, "239.255.255.250", 32, 3))); // multicast wins over protocol
+    CHECK(win_route_is_host_local(route(true, "::1", 128, 2)));
+    CHECK(win_route_is_host_local(route(true, "fe80::200:5eff:fe00:5301", 128, 2)));
+    CHECK(win_route_is_host_local(route(true, "ff00::", 8, 2)));
+    // Kept: the connected-subnet routes, and any non-Local full-length route.
+    CHECK_FALSE(win_route_is_host_local(route(false, "192.0.2.0", 24, 2)));
+    CHECK_FALSE(win_route_is_host_local(route(false, "127.0.0.0", 8, 2)));
+    CHECK_FALSE(win_route_is_host_local(route(true, "fe80::", 64, 2)));
+    CHECK_FALSE(win_route_is_host_local(route(false, "100.64.0.12", 32, 3))); // NetMgmt peer route
+    CHECK_FALSE(win_route_is_host_local(route(true, "fd7a:115c:a1e0::53", 128, 3)));
+    CHECK_FALSE(win_route_is_host_local(route(false, "0.0.0.0", 0, 3)));      // default route
+    CHECK_FALSE(win_route_is_host_local(route(false, "223.255.255.255", 32, 3))); // just below multicast
+    CHECK_FALSE(win_route_is_host_local(route(true, "fd00::", 8, 3)));        // 'f' but not ff
+}
+
+TEST_CASE("windows protocol names cover NL_ROUTE_PROTOCOL and fall back to a numbered token",
+          "[network_config][routes][windows_map]") {
+    CHECK(win_protocol_name(2) == "local");
+    CHECK(win_protocol_name(3) == "netmgmt");
+    CHECK(win_protocol_name(13) == "ospf");
+    CHECK(win_protocol_name(14) == "bgp");
+    CHECK(win_protocol_name(19) == "dhcp");
+    CHECK(win_protocol_name(10006) == "static");
+    CHECK(win_protocol_name(777) == "proto777");
+}
+
+TEST_CASE("windows row keeps the route metric and renders an on-link next hop as a dash",
+          "[network_config][routes][windows_map]") {
+    WinRoute r;
+    r.destination = "198.51.100.0";
+    r.prefix_len = 24;
+    r.interface = "Ethernet";
+    r.metric = 281;
+    r.protocol = 3;
+    CHECK(format_route_row(win_route_to_row(r)) ==
+          "route|ipv4|198.51.100.0|24|-|Ethernet|281|-|unicast|netmgmt");
+    r.next_hop = "198.51.100.1";
+    CHECK(format_route_row(win_route_to_row(r)).starts_with("route|ipv4|198.51.100.0|24|198.51.100.1|"));
+}
+
 #if defined(__linux__)
 
 #include <cstring>

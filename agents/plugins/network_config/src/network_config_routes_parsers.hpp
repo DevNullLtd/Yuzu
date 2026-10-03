@@ -73,6 +73,118 @@ inline std::string format_route_row(const RouteRow& r) {
                        field(r.metric), field(r.table), field(r.type), field(r.origin));
 }
 
+// ── Windows: GetIpForwardTable2 rows ─────────────────────────────────────
+//
+// The IP Helper call and its SOCKADDR_INET unpacking live in the (impure, Windows
+// only) leg TU. Everything decidable WITHOUT Windows headers lives here, on a
+// plain struct whose addresses the shell has already rendered to text, so the
+// mapping and the skip rule are unit-tested on every host.
+
+/// One MIB_IPFORWARD_ROW2, reduced.
+struct WinRoute {
+    bool ipv6 = false;
+    std::string destination;
+    unsigned prefix_len = 0;
+    std::string next_hop;     // empty = on-link (an unspecified next hop)
+    std::string interface;    // ConvertInterfaceLuidToAlias, or `if<index>`
+    unsigned long metric = 0; // the ROUTE metric; the interface metric is NOT added
+    int protocol = 0;         // NL_ROUTE_PROTOCOL
+};
+
+inline constexpr int kWinProtocolLocal = 2; // MIB_IPPROTO_LOCAL
+
+/// NL_ROUTE_PROTOCOL as Get-NetRoute names it (lower-cased). Numeric literals,
+/// not the SDK enumerators: this header must compile on hosts without them.
+inline std::string win_protocol_name(int p) {
+    switch (p) {
+    case 1:
+        return "other";
+    case 2:
+        return "local";
+    case 3:
+        return "netmgmt";
+    case 4:
+        return "icmp";
+    case 5:
+        return "egp";
+    case 6:
+        return "ggp";
+    case 7:
+        return "hello";
+    case 8:
+        return "rip";
+    case 9:
+        return "isis";
+    case 10:
+        return "esis";
+    case 11:
+        return "cisco";
+    case 12:
+        return "bbn";
+    case 13:
+        return "ospf";
+    case 14:
+        return "bgp";
+    case 15:
+        return "idpr";
+    case 16:
+        return "eigrp";
+    case 17:
+        return "dvmrp";
+    case 18:
+        return "rpl";
+    case 19:
+        return "dhcp";
+    case 10002:
+        return "autostatic";
+    case 10006:
+        return "static";
+    case 10007:
+        return "static_non_dod";
+    default:
+        return "proto" + std::to_string(p);
+    }
+}
+
+/// True for the rows Windows generates for the HOST rather than for reachability,
+/// the same noise the Linux leg drops with the local table and the macOS leg with
+/// RTF_LOCAL / RTF_MULTICAST / RTF_BROADCAST:
+///   - a full-length prefix (/32, /128) with Protocol=Local: the host's own
+///     addresses and its broadcast addresses (Windows tags both `Local`);
+///   - a multicast prefix (224.0.0.0/4, ff00::/8), one per interface.
+/// Protocol=Local with a SHORTER prefix is kept: that is the connected-subnet
+/// route (192.0.2.0/24, fe80::/64, 127.0.0.0/8) and is exactly what a reader wants.
+/// A /32 with any other protocol (NetMgmt: a VPN peer route, a static route) is kept.
+inline bool win_route_is_host_local(const WinRoute& r) {
+    const unsigned full = r.ipv6 ? 128u : 32u;
+    if (r.protocol == kWinProtocolLocal && r.prefix_len == full)
+        return true;
+    if (r.ipv6)
+        return r.destination.starts_with("ff") && r.prefix_len == 8;
+    // IPv4 multicast is 224.0.0.0/4: first octet 224-239.
+    unsigned first = 0;
+    for (char c : r.destination) {
+        if (c < '0' || c > '9')
+            break;
+        first = first * 10 + static_cast<unsigned>(c - '0');
+    }
+    return first >= 224 && first <= 239 && r.prefix_len >= 4;
+}
+
+/// Reduce a Windows route to the cross-OS row. Windows has no table id and no
+/// route type, so `table` is `-` and `type` is `unicast`.
+inline RouteRow win_route_to_row(const WinRoute& r) {
+    RouteRow row;
+    row.ipv6 = r.ipv6;
+    row.destination = r.destination;
+    row.prefix_len = r.prefix_len;
+    row.gateway = r.next_hop;
+    row.interface = r.interface;
+    row.metric = std::to_string(r.metric);
+    row.origin = win_protocol_name(r.protocol);
+    return row;
+}
+
 #if defined(__linux__)
 
 // ── Linux: RTM_GETROUTE (AF_UNSPEC) dump ─────────────────────────────────
