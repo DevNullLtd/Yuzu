@@ -16,6 +16,7 @@ cannot silently come back:
 Hermetic: parses sources and runs only the parser CLI under sys.executable
 (no rebar3, no network, no shared paths).
 """
+import glob
 import json
 import os
 import re
@@ -308,6 +309,42 @@ class AssertGatewayTests(unittest.TestCase):
                     # It must check the dir meson just configured, not a
                     # sibling whose intro-tests.json could be stale.
                     self.assertEqual(a.group(1).strip('"'), m.group(1).strip('"'))
+
+    def test_every_job_that_runs_tests_asserts_the_gateway(self):
+        # The per-`meson setup` check above only sees the files it names and
+        # only a literal `meson setup`. This one discovers EVERY workflow
+        # (glob, so a new or renamed file is covered) and, for each job that
+        # runs tests (`meson test`, or flake-retry.py which wraps it), requires
+        # an assert-gateway-tests.py step at or before the first test step.
+        # fork-dynamic-review.yml configures through scripts/setup.sh and
+        # ran `meson test` with no Erlang and no assertion until this check
+        # existed. Comment lines are ignored.
+        import yaml
+        found = set()
+        for path in sorted(glob.glob(os.path.join(ROOT, '.github', 'workflows', '*.yml'))):
+            wf = os.path.basename(path)
+            with open(path, encoding='utf-8') as f:
+                doc = yaml.safe_load(f)
+            for job, body in (doc.get('jobs') or {}).items():
+                tests, asserts = [], []
+                for i, step in enumerate(body.get('steps') or []):
+                    run = '\n'.join(l for l in str(step.get('run') or '').split('\n')
+                                    if not l.lstrip().startswith('#'))
+                    if re.search(r'\bmeson test\b|flake-retry\.py', run):
+                        tests.append(i)
+                    if 'scripts/ci/assert-gateway-tests.py' in run:
+                        asserts.append(i)
+                if not tests:
+                    continue
+                found.add((wf, job))
+                with self.subTest(workflow=wf, job=job):
+                    self.assertTrue(asserts, 'runs tests but never asserts the gateway tests registered')
+                    self.assertLessEqual(min(asserts), min(tests),
+                                         'the assertion runs after the first test step')
+        # Guard the discovery itself: it must still see the legs the doc names.
+        for want in (('ci.yml', 'linux'), ('ci.yml', 'windows'), ('ci.yml', 'macos'),
+                     ('fork-dynamic-review.yml', 'linux'), ('nightly.yml', 'coverage')):
+            self.assertIn(want, found)
 
 
 if __name__ == '__main__':

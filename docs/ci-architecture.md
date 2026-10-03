@@ -1265,12 +1265,15 @@ signing/notarization deferred to Phase B). Only the `pre-release.yml`
 The macOS job installs Erlang/OTP 28 + rebar3 per run via `erlef/setup-beam`
 (`ImageOS: macos26`), the same pin as the Linux leg, so the gateway is built and its
 eunit/ct suites run on macOS too. Before #4841 it had no Erlang and Meson silently
-skipped the gateway. Every CI leg that runs `meson test` (ci.yml Linux/Windows/macOS, nightly asan/tsan/coverage/windows-asan, sanitizer-tests asan/tsan) now runs
-`scripts/ci/assert-gateway-tests.py <builddir>` straight after `meson setup`, so a missing `rebar3` (gateway tests not registered)
+skipped the gateway. Every CI leg that runs tests (ci.yml Linux/Windows/macOS, nightly asan/tsan/coverage/windows-asan, sanitizer-tests asan/tsan, and the dispatch-only
+`fork-dynamic-review.yml` Linux leg, which installs Erlang the same way) now runs
+`scripts/ci/assert-gateway-tests.py <builddir>` straight after configure (`meson setup`, or `scripts/setup.sh` in the fork review leg), so a missing `rebar3` (gateway tests not registered)
 fails the Configure step rather than skipping. It is deliberately a post-configure check, not the `-Drequire_gateway` project
 option: a non-default project option stored in these persistent, branch-shared build dirs makes every older branch's
 `meson setup --reconfigure` fail with `Unknown options` (measured, #4851). `tests/test_gateway_test_summary.py` pins that
-every such `meson setup` is followed by the check and that none passes `-Drequire_gateway`.
+every such `meson setup` is followed by the check, that none passes `-Drequire_gateway`, and (by globbing
+every `.github/workflows/*.yml`, so a new or renamed workflow is covered) that every job running `meson test` or `flake-retry.py`
+has the check at or before its first test step.
 
 Inventory declared in `.github/runner-inventory.json`. The sentinel at
 `runner-inventory-sentinel.yml` (every 30 min) compares actual to expected
