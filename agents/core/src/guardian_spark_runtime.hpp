@@ -1944,8 +1944,10 @@ private:
     /// exception in its own staging still eventually publishes a terminal outcome on
     /// every claim it snapshotted (claim_drain_failures_), whichever path reaches that
     /// publish; when the exception came before the snapshot, nothing was snapshotted,
-    /// so the publish fails every claim in the fifo and drops the entry. A snapshotted
-    /// head whose index release fails is retained as a tombstone, not dropped.
+    /// so the publish fails every claim in the fifo and drops the entry. A claim whose
+    /// index release fails is retained as a tombstone rather than dropped, on both
+    /// paths (the snapshotted head in the ordinary pop, and any fifo claim in the
+    /// before-snapshot branch).
     void on_arm_complete(const std::string& key, const std::shared_ptr<KeyClaim>& claim,
                          IoResult<std::expected<std::uint64_t, std::string>>&& r) noexcept;
     /// The drain_fault_point_for_test_ seam on_arm_complete's own staging (and, since
