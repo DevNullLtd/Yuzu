@@ -76,10 +76,12 @@ check(Ctx, SessionId) ->
             end
     end.
 
-%% @doc Create the summary-log state. Called once at boot, before any
-%% heartbeat can be rejected: creating it lazily on the first rejection is
-%% racy when the first rejections arrive together (each concurrent first
-%% caller would create its own state and log its own line).
+%% @doc Create the summary-log state. Called once at boot, before the
+%% supervision tree serves heartbeats (the agent listener belongs to the
+%% grpcbox dependency application, which can start first; the lazy path
+%% covers that window): creating it lazily on the first rejection is racy
+%% when the first rejections arrive together (each concurrent first caller
+%% would create its own state and log its own line).
 -spec init_summary_state() -> ok.
 init_summary_state() ->
     _ = new_summary_state(),

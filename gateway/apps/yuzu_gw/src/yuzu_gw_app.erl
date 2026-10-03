@@ -61,8 +61,11 @@ do_start() ->
 do_start_services() ->
     %% Attach telemetry/prometheus handlers.
     yuzu_gw_telemetry:setup(),
-    %% Heartbeat-rejection summary log state: created before any heartbeat is
-    %% admitted, so a burst of first rejections shares one rate limit.
+    %% Heartbeat-rejection summary log state: created before the supervision
+    %% tree serves heartbeats, so a burst of first rejections shares one rate
+    %% limit. The agent listener belongs to the grpcbox dependency application,
+    %% which can start first; the lazy path in yuzu_gw_heartbeat_admission
+    %% covers that window.
     ok = yuzu_gw_heartbeat_admission:init_summary_state(),
 
     %% Start Prometheus HTTP exporter for /metrics endpoint.
