@@ -8193,6 +8193,86 @@ TEST_CASE("#4354: the double-fault recovery pop in finalize_arm_compensation ret
     rt->begin_stop();
 }
 
+TEST_CASE("#4354: a firewalled drain whose head release fails is retained without failing a live "
+          "follower queued after the snapshot",
+          "[spark][runtime][liveness]") {
+    // Mutation: drop the `finished.empty()` guard on publish_arm_verdicts_locked's firewall
+    // branch -> the retained head (still at the fifo front after its failed release) makes
+    // the branch fire with a non-empty `finished` and fail EVERY fifo claim, so r2, queued
+    // in the drain gap (after the snapshot, hence not in `finished`), gets "arm drain
+    // failed" and loses its claim instead of being swept to the front and armed.
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    b->hang_next_arm.store(true);
+    auto rt = make_rt(r, b, GuardianSparkRuntime::Config{.backend_op_deadline = std::chrono::seconds(30)});
+    const auto key = spark_key(file_spec("/a"));
+    auto park = std::make_shared<DrainPark>();
+
+    // Threads before the guard (the file's idiom): on unwind the guard releases the parked
+    // backend and the gap hook first, then the QueuedAttach destructor joins a returned attach.
+    QueuedAttach a2;
+    struct Cleanup {
+        FakeBackend* backend;
+        DrainPark* park;
+        ~Cleanup() {
+            backend->release_hang();
+            park->release();
+        }
+    } cleanup{b.get(), park.get()};
+
+    auto res1 = rt->attach_rule(GuardianSparkRuntime::NonWaiting{}, "r1", file_spec("/a"),
+                                file_exists_rule("r1"), true);
+    REQUIRE(b->wait_entered_hang(std::chrono::seconds(30)));
+    REQUIRE(res1.has_value());
+    REQUIRE(rt->claim_queue_depth_for_test(key) == 1);
+
+    // Seam shot 1: withdraw the in-flight head. It stays as the key's Dispatched marker
+    // with its release failing, so it still holds its mapping.
+    rt->set_index_remove_fault_for_test(true);
+    rt->detach_rule("r1");
+    CHECK(rt->claim_index_release_failures() == 1);
+    CHECK(rt->claim_queue_depth_for_test(key) == 1);
+
+    // Seam shot 2: the late success finds no live claim (live.empty), so the compensating
+    // path owes a disarm and r1's own release fails again. Fault point 4 (nothing earlier
+    // consumes it) makes the continuation allocation throw: the drain is firewalled, the
+    // subscription is disarmed directly, and the publish runs inline with finished == [r1].
+    // The gap hook fires first (nothing is published yet). It parks until r2 has queued
+    // behind r1, which is therefore NOT in `finished`, and only then re-arms the seam
+    // (shot 3) so that the ordinary loop's release of r1 inside that publish fails and r1
+    // is retained at the front. The hook only touches atomics and the park: it runs on the
+    // detached worker, so no Catch2 assertion in here.
+    rt->set_index_remove_fault_for_test(true);
+    rt->set_drain_fault_point_for_test(4);
+    rt->set_drain_gap_hook_for_test([rtp = rt.get(), park] {
+        park->wait();
+        rtp->set_index_remove_fault_for_test(true);
+    });
+    b->release_hang();
+    REQUIRE(yuzu::test::spin_until([&] { return park->entered.load(); }, std::chrono::seconds(10)));
+
+    a2.t = std::thread{[&] { a2.gen = rt->attach_rule("r2", file_spec("/a"), file_exists_rule("r2"), true); }};
+    REQUIRE(yuzu::test::spin_until([&] { return rt->claim_queue_depth_for_test(key) == 2; },
+                                   std::chrono::seconds(10)));
+    park->release();
+    a2.t.join();
+    INFO("r2: " << (a2.gen.has_value() ? std::string{"armed"} : a2.gen.error()));
+    REQUIRE(a2.gen.has_value()); // not "arm drain failed": the live follower was armed
+
+    settle_key_claims(*rt, key);
+    // Three shots, each consumed by exactly one failing release: the detach, the live.empty
+    // release, and the ordinary loop's release of the firewalled head.
+    CHECK(rt->claim_index_release_failures() == 3);
+    CHECK(rt->rule_count() == 1);
+    CHECK(rt->armed_key_count() == 1);
+    CHECK(rt->claim_queue_depth_for_test(key) == 0);
+    CHECK(b->disarms.load() == 1); // r1's subscription, disarmed directly (firewalled)
+    CHECK(b->arms.load() == 2);    // r1's compensated arm, then r2's own
+
+    rt->set_drain_gap_hook_for_test({});
+    rt->begin_stop();
+}
+
 // adversarial round 4 K2/C5: index_add_rollback's .fn runs inside ~GuardianRollback,
 // which swallows exceptions; remove_rule's key copy could throw there and leave a ghost
 // mapping. erase_rule is the same walk without the copy (noexcept).

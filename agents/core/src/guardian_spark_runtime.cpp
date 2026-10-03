@@ -1038,8 +1038,13 @@ bool GuardianSparkRuntime::publish_arm_verdicts_locked(
         if (release_or_retain_tombstone_locked(*c) && !fifo.empty() && fifo.front() == c)
             fifo.pop_front();
     }
-    if (firewall && !fifo.empty() && fifo.front() == claim) {
-        // finished was never filled: the head is still here. Drop the entry.
+    if (firewall && finished.empty() && !fifo.empty() && fifo.front() == claim) {
+        // finished was never filled (the drain threw before its fifo snapshot): the head
+        // is still here. Drop the entry. The `finished.empty()` guard is what keeps this
+        // literally true: a non-empty `finished` always starts with the head, and the loop
+        // above retains it at the front when its index release fails, so without the guard
+        // that retained head would fail every fifo claim - including live followers queued
+        // after the snapshot, which are not in `finished` and are still owed their arm.
         for (auto& c : fifo) {
             // Governance pass-3 cs-2: a claim whose index release fails (seam /
             // defence in depth) is KEPT as a Queued tombstone holding its mapping,
