@@ -533,5 +533,29 @@ class WorkflowWiringTests(unittest.TestCase):
         self.assertIn("failed before it could emit typed evidence", sentinel)
 
 
+    def test_inline_self_hosted_runs_on_lists_are_pinned_to_a_declared_pool(self) -> None:
+        """A bare [self-hosted, Linux, X64] list matches every runner carrying
+        those default labels, including runners outside the inventory (a retired
+        runner stayed registered and took proto-compat and cache-prune jobs).
+        Every inline self-hosted runs-on list must carry a yuzu-* pool label and
+        be a subset of some declared runner's labels."""
+        inventory = json.loads(
+            (ROOT / ".github" / "runner-inventory.json").read_text(encoding="utf-8")
+        )
+        declared = [set(r["labels"]) for r in inventory["expected_runners"]]
+        pattern = re.compile(r"^\s*runs-on:\s*\[([^\]]*)\]", re.MULTILINE)
+        offenders: list[str] = []
+        for path in sorted((ROOT / ".github" / "workflows").glob("*.yml")):
+            for match in pattern.finditer(path.read_text(encoding="utf-8")):
+                body = match.group(1)
+                if "self-hosted" not in body or "${{" in body:
+                    continue
+                labels = {part.strip() for part in body.split(",") if part.strip()}
+                pooled = any(label.startswith("yuzu-") for label in labels)
+                if not pooled or not any(labels <= d for d in declared):
+                    offenders.append(f"{path.name}: [{body.strip()}]")
+        self.assertEqual([], offenders)
+
+
 if __name__ == "__main__":
     unittest.main()
