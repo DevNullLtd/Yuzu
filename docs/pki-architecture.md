@@ -400,7 +400,8 @@ source:
 > reverse proxy, including a service-mesh sidecar that terminates HTTP/2, is not
 > supported for heartbeat admission, see
 > [Heartbeat admission](user-manual/gateway.md#heartbeat-admission)); or (b) keep
-> the agent port on a trusted network (VPN / private subnet / service mesh).
+> the agent port on a trusted network (VPN / private subnet / a mesh policy that does not
+> terminate HTTP/2; see [Heartbeat admission](user-manual/gateway.md#heartbeat-admission)).
 > Observed in a test with two agents: behind an HTTP/2-terminating proxy (nginx
 > `grpc_pass`) every heartbeat was rejected as a connection mismatch (counted, never
 > forwarded) while the agents still enrolled and received commands; behind an L4 TCP

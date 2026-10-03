@@ -472,7 +472,8 @@ See `deploy/docker/gateway-entrypoint.sh` for the exact logic.
 > enabled; an HTTP/2-terminating reverse proxy, including a service-mesh sidecar
 > that terminates HTTP/2, is not supported for heartbeat admission, see
 > [Heartbeat admission](#heartbeat-admission)), or (b) keep
-> `:50051` on a trusted network (VPN / private subnet / service mesh). Direct
+> `:50051` on a trusted network (VPN / private subnet / a mesh policy that does not
+> terminate HTTP/2; see [Heartbeat admission](#heartbeat-admission)). Direct
 > agent→server connections use TLS; this gap is specific to the gateway edge.
 
 | Hop | State | Notes |
