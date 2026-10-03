@@ -479,7 +479,7 @@ def contains_block(haystack: list[str], block: list[str]) -> bool:
 def redated_header(old: str, version: str, date_str: str) -> str:
     """`## [X.Y.Z] - <date_str>`, keeping any text after an existing date
     (e.g. a ` [YANKED]` marker); a non-canonical header is rewritten whole."""
-    m = re.match(rf"^## \[{re.escape(version)}\] - \d{{4}}-\d{{2}}-\d{{2}}(?P<suffix>.*)$", old)
+    m = re.match(rf"^## \[{re.escape(version)}\] - \d{{4}}-\d{{2}}-\d{{2}}(?P<suffix>(?:\s.*)?)$", old)
     return f"## [{version}] - {date_str}" + (m.group("suffix") if m else "")
 
 

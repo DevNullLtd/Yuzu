@@ -124,6 +124,12 @@ class PromoteAppend(unittest.TestCase):
         self.assertEqual(self.changelog.read_text(encoding="utf-8"),
                          text.replace("## [1.2.0] - 2026-09-01 [YANKED]", "## [1.2.0] - 2026-10-10 [YANKED]"))
 
+    def test_redate_rewrites_a_mangled_date_whole(self):
+        text = CHANGELOG.replace("## [1.2.0] - 2026-09-01", "## [1.2.0] - 2026-09-0123")
+        self.changelog.write_text(text, encoding="utf-8")
+        self.assertEqual(self.run_append("--date", "2026-10-10").returncode, 0)
+        self.assertIn("\n## [1.2.0] - 2026-10-10\n", self.changelog.read_text(encoding="utf-8"))
+
     def test_date_only_same_date_is_a_noop(self):
         r = self.run_append("--date", "2026-09-01")
         self.assertEqual(r.returncode, 0, r.stderr)
