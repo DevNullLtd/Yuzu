@@ -1932,6 +1932,33 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
+      # #4666/#5025: tests/unit/test_log_handoff_multi_image.cpp's MI-1b case measures
+      # the Windows spdlog-registry topology and writes its verdict as a Catch2 WARN
+      # (already captured by testlog.txt above on failure) plus a per-PID report file
+      # in the build root — nobody had ever read that file from a CI run before this.
+      # always(): the verdict is produced on every green run too, not only failures,
+      # and this is the leg that only ever uploads on failure/cancel. Cheap (step-
+      # summary text, no artifact storage). Wee Tam is self-hosted and can reuse a
+      # build dir across runs, so an OLDER pid-suffixed report can still be sitting
+      # here from a previous run — `ls -t` picks only the newest by mtime rather than
+      # cat-ing every match, which is a heuristic (a same-second re-run could tie), not
+      # a hard guarantee; see docs/spark-rebuild-baselines/4666-mi1b-windows-registry-verdict.md
+      # for the measured verdict and the plan's own note on this gap.
+      - name: Surface MI-1b Windows spdlog-registry verdict
+        if: always()
+        run: |
+          shopt -s nullglob
+          files=(build-windows-${{ matrix.build_type }}/log_handoff_multi_image_topology.*.txt)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "MI-1b: no topology report found (agent shard C may not have run)." >> "$GITHUB_STEP_SUMMARY"
+          else
+            newest="$(ls -t "${files[@]}" | head -1)"
+            echo "### MI-1b Windows spdlog-registry verdict ($(basename "$newest"))" >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            cat "$newest" >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+          fi
+
       - name: ccache stats + build observability
         if: always()
         run: |

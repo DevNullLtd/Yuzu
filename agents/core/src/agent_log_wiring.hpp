@@ -73,6 +73,15 @@ inline constexpr std::string_view kDefaultLogPattern = "[%Y-%m-%d %H:%M:%S.%e] [
         // above (same shared_ptr, already installed) -- kept so the LAST registry
         // write this function makes only happens once level/format configuration has
         // actually succeeded, rather than installing, then configuring in place.
+        // CONFIRMED redundant on Linux and Windows (one shared registry between this
+        // image and the core library -- MI-1b(a) measures this directly; Windows result:
+        // docs/spark-rebuild-baselines/4666-mi1b-windows-registry-verdict.md). On macOS
+        // (two separate registries, docs/darwin-compat.md) this call is NOT redundant
+        // for THIS image's own same-image spdlog calls -- it is what gives the exe its
+        // own default logger at all, separately from h.install()'s write to the core
+        // library's registry. It still doesn't matter for Guardian/Spark correctness
+        // there, since that logging is compiled into the core library regardless of
+        // which image called install().
         spdlog::set_default_logger(lg);
         return true;
         // `lg` goes out of scope here -- this function never lets the install()-returned
@@ -117,10 +126,13 @@ inline void release_log_handoff_from_this_image(LogHandoff& h) noexcept {
     h.teardown(); // already noexcept -- not double-wrapped in try/catch.
     if (!swap_ok) {
         // Fail closed, matching log_handoff.cpp's own teardown-exception precedent
-        // (hard_exit(kLogTeardownExitCode) there too). On Linux/Windows (single
-        // registry) this is unreachable in practice: teardown()'s own T2 step already
-        // dropped the one registry's reference before this check runs. On macOS this is
-        // the ONLY backstop for the retained-reference hazard above.
+        // (hard_exit(kLogTeardownExitCode) there too). On Linux and Windows (CONFIRMED
+        // single shared registry -- Windows measured 2026-10-03, see
+        // docs/spark-rebuild-baselines/4666-mi1b-windows-registry-verdict.md; Linux via
+        // the same fixture) this is unreachable in practice: teardown()'s own T2 step
+        // already dropped the one registry's reference before this check runs. On macOS
+        // (two separate registries, docs/darwin-compat.md) this is the ONLY backstop for
+        // the retained-reference hazard above.
         hard_exit(kLogTeardownExitCode);
     }
 }

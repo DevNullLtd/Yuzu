@@ -1974,8 +1974,8 @@ remains separately tracked.
 
 **Status update (2026-09-28): #4666 PR-4 adds a dedicated logger closing the `T_server` piece
 named above — the precondition's server-side half is now addressed too, not only the agent
-side. PR-4 is implemented and adversarially reviewed (Kimi + Codex, both PASS) but not yet
-merged — it exists only on `feat/4666-pr4-t-server-async-logger`, not on `origin/dev`.**
+side. PR-4 is implemented and adversarially reviewed (Kimi + Codex, both PASS) and has since
+merged to `origin/dev` (PR #5281, `f7a000fc3`).**
 `server/core/src/guardian_ingest.{hpp,cpp}` gives the `T_server` line its own dedicated bounded
 async logger (`spdlog::async_logger`, a private 1024-slot `spdlog::details::thread_pool`,
 `overrun_oldest` — the same eviction policy PR-1/PR-2 use, sized down since this backs one
@@ -2009,6 +2009,18 @@ driver/rig evidence, and PR-6/PR-7's `T_detect`/`T_wire`/`T_server` retirement o
 view 4606` is closed) is tracked in the `spark-4666-retire-synchronous-log-writes-DELIVERY-PLAN.md`
 plan record, not in this section — none of those remaining PRs gate this precondition or the F14
 flip on their own.
+
+**Status update (2026-10-03): the 2026-09-25 entry's residual is now discharged — the Windows
+MI-1b verdict has been measured, not merely inferred.** Run on real MSVC hardware (weecolin) at
+`f7a000fc3`, the same commit PR-4 above merged at: all of MI-1, MI-1b(a), MI-1b(b), MI-3 pass,
+and agree with each other and with `dumpbin` import-table evidence (all four images — the exe,
+`yuzu_agent_core.dll`, `agent_actions.dll`, the test binary — resolve spdlog's registry-wide free
+functions from one shared `spdlogd.dll`). **Windows has ONE shared spdlog registry, the same
+shape as Linux, not the macOS two-registry shape.** Full evidence, exact commands, and WARN/report
+text verbatim: `docs/spark-rebuild-baselines/4666-mi1b-windows-registry-verdict.md`. This closes
+the last open residual named above and in the PR-4 entry: both halves of this precondition (the
+agent-side registry-topology claim and PR-4's server-side `T_server` fix) are now satisfied, and
+this precondition for the F14 flip is CLOSED.
 
 **Precondition for criterion 10 sign-off and the F14 flip (added 2026-09-21, from the #4606
 governance review of the rule-id neutralisation; SATISFIED 2026-09-24 by the #4665 fix landing on
