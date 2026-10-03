@@ -60,6 +60,8 @@ enum class WmiReadOutcome { ok, absent, denied, failed };
 ///     (issue #4900 tracks a committed real-WMI test). The same answer after a row WAS returned
 ///     cannot mean "the class is missing" (the class just answered), so it reads `failed`: the
 ///     token carries no iteration index, so the caller passes the count wmi_bounded records.
+///     `rows_before_error` has no default: a caller that left it out would read a fault after a
+///     returned row as an absence.
 /// Every other absence-looking HRESULT is a FAULT and reads `failed`: WBEM_E_NOT_FOUND
 /// (0x80041002) anywhere (Microsoft lists it at connect as a repository-corruption symptom), and
 /// INVALID_NAMESPACE / INVALID_CLASS at a stage that cannot legitimately produce them. The
@@ -69,7 +71,7 @@ enum class WmiReadOutcome { ok, absent, denied, failed };
 /// A property-enumeration fault (`wmi_property_enum_failed_*`) is a fault at every HRESULT: it
 /// matches no `absent` stage above, so it reads `failed` (or `denied` for a refusal HRESULT).
 [[nodiscard]] inline WmiReadOutcome
-classify_wmi_error_token(std::string_view token, std::size_t rows_before_error = 0) noexcept {
+classify_wmi_error_token(std::string_view token, std::size_t rows_before_error) noexcept {
     const auto hr = hresult_from_token(token);
     const WmiReadOutcome o = hr ? classify_hresult(*hr) : WmiReadOutcome::failed;
     if (o != WmiReadOutcome::absent) return o == WmiReadOutcome::ok ? WmiReadOutcome::failed : o;

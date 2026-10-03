@@ -944,6 +944,25 @@ TEST_CASE("FirmwareReport::fail_all: per-field unreadable rows and one token", "
     CHECK(w.denied);
 }
 
+// fail_all(kSmbiosFields/kBiosFields, ...) relies on these lists naming exactly the fields the
+// row builders emit. Fails under: a field added to smbios_rows/wmi_bios_rows (or the lists) alone.
+TEST_CASE("kSmbiosFields / kBiosFields name exactly the fields smbios_rows / wmi_bios_rows emit",
+          "[firmware_posture]") {
+    Smbios0 d; // every optional field specified, so smbios_rows emits its full set
+    d.rom_size_bytes = 1;
+    d.bios_major = 1;
+    d.bios_minor = 2;
+    d.ec_major = 3;
+    d.ec_minor = 4;
+    std::vector<std::string> smbios;
+    for (const auto& r : smbios_rows(d)) smbios.push_back(r.field);
+    CHECK(smbios == std::vector<std::string>(kSmbiosFields.begin(), kSmbiosFields.end()));
+
+    std::vector<std::string> wmi;
+    for (const auto& r : wmi_bios_rows({})) wmi.push_back(r.field);
+    CHECK(wmi == std::vector<std::string>(kBiosFields.begin(), kBiosFields.end()));
+}
+
 // ── fwupd busctl fixture (REAL CAPTURE) ──────────────────────────────────
 
 // Test-local decoder for busctl's text form of an `aa{sv}` reply: `aa{sv} <n> <m> "key" <sig>

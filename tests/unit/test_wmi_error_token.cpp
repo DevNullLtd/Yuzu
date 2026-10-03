@@ -46,17 +46,17 @@ TEST_CASE("classify_hresult: refusals, absence-looking and other HRESULTs", "[wm
 TEST_CASE("classify_wmi_error_token: absent only for the two answers WMI gives when something is missing",
           "[wmi_error_token]") {
     // exactly three cells read absent
-    CHECK(classify_wmi_error_token("wmi_connect_failed_0x8004100e") == WmiReadOutcome::absent);
-    CHECK(classify_wmi_error_token("wmi_query_failed_0x80041010") == WmiReadOutcome::absent);
-    CHECK(classify_wmi_error_token("wmi_next_failed_0x80041010") == WmiReadOutcome::absent);
+    CHECK(classify_wmi_error_token("wmi_connect_failed_0x8004100e", 0) == WmiReadOutcome::absent);
+    CHECK(classify_wmi_error_token("wmi_query_failed_0x80041010", 0) == WmiReadOutcome::absent);
+    CHECK(classify_wmi_error_token("wmi_next_failed_0x80041010", 0) == WmiReadOutcome::absent);
     // NOT_FOUND is never a "missing" answer here: Microsoft lists it as a repository-corruption symptom
-    CHECK(classify_wmi_error_token("wmi_connect_failed_0x80041002") == WmiReadOutcome::failed);
-    CHECK(classify_wmi_error_token("wmi_query_failed_0x80041002") == WmiReadOutcome::failed);
-    CHECK(classify_wmi_error_token("wmi_next_failed_0x80041002") == WmiReadOutcome::failed);
+    CHECK(classify_wmi_error_token("wmi_connect_failed_0x80041002", 0) == WmiReadOutcome::failed);
+    CHECK(classify_wmi_error_token("wmi_query_failed_0x80041002", 0) == WmiReadOutcome::failed);
+    CHECK(classify_wmi_error_token("wmi_next_failed_0x80041002", 0) == WmiReadOutcome::failed);
     // a namespace answer at a stage that cannot produce it, and a class answer at connect
-    CHECK(classify_wmi_error_token("wmi_connect_failed_0x80041010") == WmiReadOutcome::failed);
-    CHECK(classify_wmi_error_token("wmi_query_failed_0x8004100e") == WmiReadOutcome::failed);
-    CHECK(classify_wmi_error_token("wmi_next_failed_0x8004100e") == WmiReadOutcome::failed); // #4895
+    CHECK(classify_wmi_error_token("wmi_connect_failed_0x80041010", 0) == WmiReadOutcome::failed);
+    CHECK(classify_wmi_error_token("wmi_query_failed_0x8004100e", 0) == WmiReadOutcome::failed);
+    CHECK(classify_wmi_error_token("wmi_next_failed_0x8004100e", 0) == WmiReadOutcome::failed); // #4895
     // INVALID_CLASS at Next() after a row was already returned: the class just answered, so this is
     // a fault, never absence (the token has no iteration index; wmi_bounded records the row count)
     CHECK(classify_wmi_error_token("wmi_next_failed_0x80041010", 0) == WmiReadOutcome::absent);
@@ -65,9 +65,9 @@ TEST_CASE("classify_wmi_error_token: absent only for the two answers WMI gives w
     CHECK(classify_wmi_error_token("wmi_query_failed_0x80041010", 0) == WmiReadOutcome::absent);
     CHECK(classify_wmi_error_token("wmi_next_failed_0x80041003", 3) == WmiReadOutcome::denied);
     // the proxy blanket runs before the query and carries no WBEM schema answer
-    CHECK(classify_wmi_error_token("wmi_proxy_blanket_failed_0x80041002") == WmiReadOutcome::failed);
-    CHECK(classify_wmi_error_token("wmi_proxy_blanket_failed_0x80041010") == WmiReadOutcome::failed);
-    CHECK(classify_wmi_error_token("wmi_proxy_blanket_failed_0x8004100e") == WmiReadOutcome::failed);
+    CHECK(classify_wmi_error_token("wmi_proxy_blanket_failed_0x80041002", 0) == WmiReadOutcome::failed);
+    CHECK(classify_wmi_error_token("wmi_proxy_blanket_failed_0x80041010", 0) == WmiReadOutcome::failed);
+    CHECK(classify_wmi_error_token("wmi_proxy_blanket_failed_0x8004100e", 0) == WmiReadOutcome::failed);
     // a property-enumeration fault is a fault at every HRESULT, at any row count
     for (const char* hr : {"0x8004100e", "0x80041010", "0x80041002", "0x80004005"}) {
         INFO(hr);
@@ -79,13 +79,13 @@ TEST_CASE("classify_wmi_error_token: absent only for the two answers WMI gives w
     for (const char* stage : {"wmi_connect_failed_", "wmi_query_failed_", "wmi_proxy_blanket_failed_",
                               "wmi_next_failed_", "wmi_property_enum_failed_"}) {
         INFO(stage);
-        CHECK(classify_wmi_error_token(std::string{stage} + "0x80041003") == WmiReadOutcome::denied);
-        CHECK(classify_wmi_error_token(std::string{stage} + "0x80070005") == WmiReadOutcome::denied);
+        CHECK(classify_wmi_error_token(std::string{stage} + "0x80041003", 0) == WmiReadOutcome::denied);
+        CHECK(classify_wmi_error_token(std::string{stage} + "0x80070005", 0) == WmiReadOutcome::denied);
     }
     // No HRESULT, an unrelated HRESULT, or an HRESULT of 0: always a failed read.
-    CHECK(classify_wmi_error_token("wmi_deadline_exceeded") == WmiReadOutcome::failed);
-    CHECK(classify_wmi_error_token("com_init_failed") == WmiReadOutcome::failed);
-    CHECK(classify_wmi_error_token("wmi_query_failed_no_in_signature") == WmiReadOutcome::failed);
-    CHECK(classify_wmi_error_token("wmi_connect_failed_0x80004005") == WmiReadOutcome::failed);
-    CHECK(classify_wmi_error_token("wmi_connect_failed_0x00000000") == WmiReadOutcome::failed);
+    CHECK(classify_wmi_error_token("wmi_deadline_exceeded", 0) == WmiReadOutcome::failed);
+    CHECK(classify_wmi_error_token("com_init_failed", 0) == WmiReadOutcome::failed);
+    CHECK(classify_wmi_error_token("wmi_query_failed_no_in_signature", 0) == WmiReadOutcome::failed);
+    CHECK(classify_wmi_error_token("wmi_connect_failed_0x80004005", 0) == WmiReadOutcome::failed);
+    CHECK(classify_wmi_error_token("wmi_connect_failed_0x00000000", 0) == WmiReadOutcome::failed);
 }

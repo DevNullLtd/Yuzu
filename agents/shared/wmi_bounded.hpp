@@ -215,6 +215,22 @@ template <class Obj>
     return FAILED(hr) ? hr : S_OK;
 }
 
+// extract_row + append: the single place a FAILED extract_row becomes a failed query. On success
+// the row is appended to result.rows and this returns true; on a FAILED HRESULT it calls
+// fail_enumeration with `wmi_property_enum_failed_<hr>` (so rows_before_error is recorded before
+// the rows are cleared) and returns false, and the caller returns `result` immediately.
+template <class Obj>
+[[nodiscard]] bool commit_row(Obj* obj, BoundedQueryResult& result) {
+    WmiRow row;
+    const HRESULT hr = extract_row(obj, row);
+    if (FAILED(hr)) {
+        fail_enumeration(result, error_tokens::kWmiPropertyEnumFailedPrefix + hr_hex(hr));
+        return false;
+    }
+    result.rows.push_back(std::move(row));
+    return true;
+}
+
 // Bounded connect shared by both public entry points: ComInit + locator +
 // ConnectServer(WBEM_FLAG_CONNECT_USE_MAX_WAIT — the WMI-sanctioned connect
 // bound; ConnectServer has no millisecond knob) + CoSetProxyBlanket.
@@ -320,13 +336,8 @@ inline BoundedQueryResult run_bounded_wmi_query(const std::wstring& wmi_namespac
         ComPtr<IWbemClassObject> obj;
         *obj.put() = raw_obj; // adopt ownership from Next()
 
-        WmiRow row;
-        hr = extract_row(obj.get(), row);
-        if (FAILED(hr)) {
-            fail_enumeration(result, error_tokens::kWmiPropertyEnumFailedPrefix + hr_hex(hr));
+        if (!commit_row(obj.get(), result))
             return result;
-        }
-        result.rows.push_back(std::move(row));
     }
 
     return result;
@@ -447,13 +458,8 @@ inline BoundedQueryResult exec_object_method(const std::wstring& wmi_namespace,
             result.error = error_tokens::kWmiNextFailedPrefix + hr_hex(hr);
             return result;
         }
-        WmiRow row;
-        hr = extract_row(out_params.get(), row);
-        if (FAILED(hr)) {
-            fail_enumeration(result, error_tokens::kWmiPropertyEnumFailedPrefix + hr_hex(hr));
+        if (!commit_row(out_params.get(), result))
             return result;
-        }
-        result.rows.push_back(std::move(row));
         break;
     }
 

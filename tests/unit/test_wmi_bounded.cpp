@@ -33,6 +33,7 @@ using yuzu::shared::wmi::BoundedQueryOptions;
 using yuzu::shared::wmi::BoundedQueryResult;
 using yuzu::shared::wmi::WmiRow;
 using yuzu::shared::wmi::detail::clamp_call_timeout_ms;
+using yuzu::shared::wmi::detail::commit_row;
 using yuzu::shared::wmi::detail::extract_row;
 using yuzu::shared::wmi::detail::fail_enumeration;
 using yuzu::shared::wmi::detail::hr_hex;
@@ -211,6 +212,29 @@ TEST_CASE("extract_row on a clean run returns S_OK with every non-null property"
     REQUIRE(extract_row(&obj, row) == S_OK);
     REQUIRE(row == WmiRow{{"Count", "7"}, {"Other", "-3"}});
     REQUIRE(obj.end_calls == 1);
+}
+
+TEST_CASE("commit_row appends a clean row; a FAILED extract_row fails the query with the "
+          "property-enum token and records the rows read so far") {
+    // commit_row is the one place both row loops (run_bounded_wmi_query, exec_object_method) turn
+    // a FAILED extract_row into a failed query: removing its FAILED check, or the
+    // fail_enumeration call, fails this test.
+    BoundedQueryResult r;
+    FakeWbemObject good;
+    good.add_i4(L"Count", 7);
+    REQUIRE(commit_row(&good, r));
+    REQUIRE_FALSE(r.error.has_value());
+    REQUIRE(r.rows.size() == 1);
+    REQUIRE(r.rows.front() == WmiRow{{"Count", "7"}});
+
+    FakeWbemObject bad;
+    bad.add_i4(L"Count", 8);
+    bad.end_hr = kFailed; // Next() faults after the one property
+    REQUIRE_FALSE(commit_row(&bad, r));
+    REQUIRE(r.error.has_value());
+    REQUIRE(*r.error == "wmi_property_enum_failed_0x80041001");
+    REQUIRE(r.rows.empty());           // failed, so no partial data
+    REQUIRE(r.rows_before_error == 1); // the one row appended before the fault
 }
 
 TEST_CASE("clamp_call_timeout_ms bounds the per-call wait to what remains of the "

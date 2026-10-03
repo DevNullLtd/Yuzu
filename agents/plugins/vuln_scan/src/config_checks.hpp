@@ -87,8 +87,9 @@ inline LinesResult read_lines_from(std::istream& in) {
 // one row per severity. UNREADABLE (the check could not run)
 // is counted separately and is NOT an issue, nor is INFO.
 inline std::vector<std::string> summary_rows(const std::vector<std::string>& severities) {
+    static constexpr const char* kSeverities[] = {"CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO", "UNREADABLE"};
     std::map<std::string, int> counts;
-    for (const char* sev : {"CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO", "UNREADABLE"})
+    for (const char* sev : kSeverities)
         counts[sev] = 0;
     for (const auto& s : severities)
         counts[s]++;
@@ -103,7 +104,7 @@ inline std::vector<std::string> summary_rows(const std::vector<std::string>& sev
 
     std::vector<std::string> rows;
     rows.push_back(std::format("summary|TOTAL|{} findings ({} issues)", total, issues));
-    for (const char* sev : {"CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO", "UNREADABLE"})
+    for (const char* sev : kSeverities)
         rows.push_back(std::format("summary|{}|{}", sev, counts[sev]));
     return rows;
 }
