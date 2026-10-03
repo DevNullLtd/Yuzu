@@ -103,12 +103,26 @@ template <typename Req>
 /// handlers so the two cannot drift (the legacy route used to clamp only its default).
 inline constexpr int kExportRowLimitCap = 10000;
 
-/// Total-BYTE ceiling for one export response body, on top of the row-count cap.
-/// Each row's `output`/`error_detail` is independently capped at ingest (2 MiB), so a
-/// row-count cap alone still allowed a theoretical tens-of-GB body built in memory on
-/// an httplib worker (#4703). A flat constant local to the export surface -- NOT the
-/// ingest cap, which bounds a different thing. Deliberately well above any realistic
-/// export (a 10,000-row export of typical command output is a few MiB).
+/// Normalise an export `limit`: a caller-supplied value is clamped to
+/// `[1, kExportRowLimitCap]`, an omitted one defaults to the cap. One definition so
+/// the legacy and v1 export handlers cannot drift, and so the exact ceiling is
+/// observable in a pure unit test without storing 10,001 rows.
+[[nodiscard]] inline int normalize_export_limit(bool supplied, int requested) {
+    return supplied ? (requested < 1 ? 1 : (requested > kExportRowLimitCap ? kExportRowLimitCap : requested))
+                    : kExportRowLimitCap;
+}
+
+/// Approximate ceiling on the ROW PAYLOAD BYTES of one export response, on top of the
+/// row-count cap. It counts each serialized row (not commas, the JSON envelope or the
+/// legacy route's pretty-print whitespace), and the cut is on whole rows, so the body
+/// is approximately 50 MiB of row payload at most plus at most one row. It bounds the
+/// SERIALIZED response, NOT worker memory: `ResponseStore::query` materialises the full
+/// result (up to 10,000 rows, each `output`/`error_detail` capped only at the 2 MiB
+/// ingest limit) before this cap is consulted, so the worst case is still tens of GiB
+/// of worker memory. A byte-aware store fetch is the real memory bound and is
+/// tracked separately. A flat constant local to the export surface -- NOT the ingest
+/// cap, which bounds a different thing. Well above any realistic export (a 10,000-row
+/// export of typical command output is a few MiB).
 inline constexpr std::size_t kExportBodyByteCap = 50u * 1024u * 1024u;
 
 /// Test seam over `kExportBodyByteCap`: production reads the default; a unit test

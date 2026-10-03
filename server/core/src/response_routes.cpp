@@ -185,8 +185,7 @@ void register_response_routes(HttpRouteSink& sink, Deps deps) {
         }
         // Export default and ceiling (#4703): the old code clamped only the DEFAULT, so
         // an explicit ?limit=999999999 asked the store for an unbounded fetch.
-        q.limit = req.has_param("limit") ? std::clamp(q.limit, 1, kExportRowLimitCap)
-                                         : kExportRowLimitCap;
+        q.limit = normalize_export_limit(req.has_param("limit"), q.limit);
 
         // #1634 / ADR-0017 INV-3 (CRITICAL): resolve the in-scope agent set and push it
         // into the SQL WHERE clause BEFORE LIMIT/OFFSET, not as a post-fetch filter — a
@@ -232,7 +231,7 @@ void register_response_routes(HttpRouteSink& sink, Deps deps) {
 
         auto format = req.get_param_value("format");
 
-        // Truncation signal (#4703): the row-count cap (limit) OR the total-byte cap below.
+        // Truncation signal (#4703): the row-count cap (limit) OR the row-payload byte cap below (approximate: counts serialized rows, not framing).
         // Legacy export never signalled either; additive header / envelope field.
         const std::size_t byte_cap = export_body_byte_cap().load();
         bool truncated = results.size() == static_cast<std::size_t>(q.limit);

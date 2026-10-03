@@ -279,6 +279,13 @@ std::optional<int64_t> param_int_strict(const nlohmann::json& params, const char
         return def;
     if (!params[key].is_number_integer())
         return std::nullopt;
+    // nlohmann reports is_number_integer() for its UNSIGNED variant too, and
+    // get<int64_t>() wraps a value above INT64_MAX to a negative number (UINT64_MAX
+    // becomes -1, a documented "any" sentinel on several filters). Reject it as the
+    // malformed input it is rather than let it alias a different, valid value.
+    if (params[key].is_number_unsigned() &&
+        params[key].get<uint64_t>() > static_cast<uint64_t>(std::numeric_limits<int64_t>::max()))
+        return std::nullopt;
     return params[key].get<int64_t>();
 }
 
@@ -636,7 +643,7 @@ static const ToolDef kTools[] = {
      "(server ingest wall-clock, 0 on legacy pre-v3 rows — distinct from the "
      "agent-claimed timestamp field, useful for spotting agent/server clock drift) "
      "(#2146 A2-R2).",
-     R"j({"type":"object","properties":{"execution_id":{"type":"string","description":"Execution ID returned by execute_instruction; exact-correlation collect of just that dispatch. Takes precedence over instruction_id."},"instruction_id":{"type":"string","description":"Instruction ID (required when execution_id is omitted)"},"agent_id":{"type":"string"},"status":{"type":"integer","minimum":-1,"description":"CommandResponse status enum; omit or -1 for any. A non-integer or a value below -1 is rejected (invalid params), never read as any"},"limit":{"type":"integer","default":100,"minimum":1,"maximum":1000}},"anyOf":[{"required":["execution_id"]},{"required":["instruction_id"]}]})j",
+     R"j({"type":"object","properties":{"execution_id":{"type":"string","description":"Execution ID returned by execute_instruction; exact-correlation collect of just that dispatch. Takes precedence over instruction_id."},"instruction_id":{"type":"string","description":"Instruction ID (required when execution_id is omitted)"},"agent_id":{"type":"string"},"status":{"type":"integer","minimum":-1,"maximum":2147483647,"description":"CommandResponse status enum; omit or -1 for any. A non-integer, a value below -1 or above 2147483647 (including unsigned values beyond int64) is rejected (invalid params), never read as any"},"limit":{"type":"integer","default":100,"minimum":1,"maximum":1000}},"anyOf":[{"required":["execution_id"]},{"required":["instruction_id"]}]})j",
      R"j({"type":"object","properties":{"responses":{"type":"array","items":{"type":"object","properties":{"id":{"type":"integer","description":"The response row's own id"},"instruction_id":{"type":"string"},"agent_id":{"type":"string"},"execution_id":{"type":"string"},"status":{"type":"integer"},"output":{"type":"string"},"error_detail":{"type":"string"},"timestamp":{"type":"integer"},"plugin":{"type":"string"},"received_at_ms":{"type":"integer","description":"Server ingest wall-clock in epoch ms; 0 on legacy pre-v3 rows"}},"required":["id","instruction_id","agent_id","execution_id","status","output","error_detail","timestamp","plugin","received_at_ms"]}},"audit_persisted":{"type":"boolean","description":"Present (false) only when the audit write for this read itself failed"},"result_truncated_by_cap":{"type":"boolean","description":"Present (true) only when more rows exist past the limit cap"},"retry_after_ms":{"type":"integer","description":"Present only when execution_id was supplied and its execution is confirmed non-terminal — minimum ms before polling again"}},"required":["responses"]})j"},
 
     {"aggregate_responses",

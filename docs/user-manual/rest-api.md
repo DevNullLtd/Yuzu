@@ -6045,8 +6045,9 @@ tab](instructions.md#13-dashboard-ui) for the fragment's rendered behaviour.
 Versioned REST + MCP twins of the legacy, unversioned `GET /api/responses/{id}` family
 (command/instruction-ID-keyed — **not** the execution-ID-keyed `GET /api/v1/executions/{id}/responses`
 documented above, a different, already-shipped capability). The legacy routes
-(`response_routes.cpp`) are frozen reference code for this PR — the query/aggregate/export
-semantics below mirror them exactly, but the legacy handlers themselves are unmodified. `GET
+(`response_routes.cpp`) do not call the shared row builders; the query/aggregate/export
+semantics below mirror them, and since #4644/#4703 they share the strict numeric parser, the export
+row cap and the export byte cap. `GET
 /api/v1/responses/{id}` and MCP `query_responses` share one JSON row builder
 (`response_query_row_json`, `docs/api-twin-recipe.md` Rule 1); `GET /api/v1/responses/{id}/aggregate`
 and MCP `aggregate_responses` share another (`response_aggregate_row_json`).
@@ -6092,14 +6093,19 @@ truncated result with `since`/`until`, not `offset` (rejected, see above).
 
 **Export body size cap (#4703).** Both export routes (this family's `GET /api/v1/responses/{id}/export`
 and the legacy `GET /api/responses/{id}/export`) also stop appending rows once the response body
-reaches 50 MiB, on top of the row-count cap: each response's `output`/`error_detail` is capped at
-2 MiB at ingest, so a row-count cap alone still let a 10,000-row export reach tens of GB, built in
-memory on a request worker. A body cut by the byte cap carries the SAME truncation signal as a row-cap
+reaches approximately 50 MiB of row payload, on top of the row-count cap: each response's
+`output`/`error_detail` is capped at only 2 MiB at ingest, so a row-count cap alone still let a
+10,000-row export serialize to tens of GB. The counter measures serialized row bytes (not commas, the
+JSON envelope or the legacy route's pretty-print whitespace), so the body is approximately, not
+exactly, bounded. **This bounds the response body, not worker memory:** the store loads the full
+result (up to 10,000 rows) before the cap is applied, so a worst-case export (10,000 rows of
+near-2-MiB output) can still allocate tens of GiB on the worker; a byte-aware store fetch is the
+real memory bound and is tracked separately. A body cut by the byte cap carries the SAME truncation signal as a row-cap
 hit (`pagination.result_truncated_by_cap` on the v1 JSON, the `X-Result-Truncated-By-Cap: true`
 header on CSV, and — new on the legacy route, which previously signalled neither cap — a top-level
 `result_truncated_by_cap: true` on its JSON envelope plus the same CSV header). At least one row is
 always served, and a body that merely ends on the row that crosses the cap is not truncated. The cut
-is on whole rows, so the body can exceed 50 MiB by at most one row.
+is on whole rows, so the row payload can exceed 50 MiB by at most one row.
 
 Audit posture: all three routes below emit a `response.read` audit event, **REST fail-closed** (503
 on an audit-persist failure, `docs/api-twin-recipe.md` §4) — a deliberate addition vs. the legacy
@@ -6168,8 +6174,8 @@ compatible. Both formats set `Content-Disposition: attachment`. The JSON format'
 standard v1 `{data, pagination, meta}` shape (same as `GET /api/v1/responses/{id}` above) -
 distinct from the legacy export's bespoke `{instruction_id, count, responses}` body. A cap-hit
 (served rows == `limit`) is most consequential here since bulk export is this route's whole
-purpose — see `pagination.result_truncated_by_cap`/`X-Result-Truncated-By-Cap` above (also set when the 50 MiB
-body cap cut the export); there is no built-in way to page past 10,000 rows other than narrowing
+purpose — see `pagination.result_truncated_by_cap`/`X-Result-Truncated-By-Cap` above (also set when the ~50 MiB
+row-payload cap cut the export); there is no built-in way to page past 10,000 rows other than narrowing
 with `since`/`until`/`agent_id`/`status`.
 
 **Response** (`format=json`):
@@ -10035,7 +10041,7 @@ Aggregate response data for a command (counts, summaries).
 #### `GET /api/responses/{id}/export`
 
 Export response data in CSV format (`format=csv`) or JSON. `limit` defaults to 10000 and is clamped
-to `[1,10000]`; the body is also cut at 50 MiB (see "Export body size cap" under Command/Instruction
+to `[1,10000]`; the row payload is also cut at approximately 50 MiB (bounds the serialized body, not worker memory; see "Export body size cap" under Command/Instruction
 Responses). A truncated export sets `X-Result-Truncated-By-Cap: true` (CSV) or a top-level
 `result_truncated_by_cap: true` (JSON envelope). Numeric query parameters (`status`, `since`,
 `until`, `limit`) are parsed strictly and a malformed value is `400` — see the Command/Instruction

@@ -16481,8 +16481,13 @@ TEST_CASE("MCP query_responses: a wrong-typed or out-of-domain status/limit is i
                             R"({"instruction_id":"instr-strict","status":true})",
                             R"({"instruction_id":"instr-strict","status":-5})",
                             R"({"instruction_id":"instr-strict","status":4294967296})",
+                            // nlohmann's unsigned variant is is_number_integer() too, and
+                            // get<int64_t>() wraps it: UINT64_MAX would become -1 ("any").
+                            R"({"instruction_id":"instr-strict","status":18446744073709551615})",
+                            R"({"instruction_id":"instr-strict","status":9223372036854775808})",
                             R"({"instruction_id":"instr-strict","limit":"100abc"})",
-                            R"({"instruction_id":"instr-strict","limit":1.5})"}) {
+                            R"({"instruction_id":"instr-strict","limit":1.5})",
+                            R"({"instruction_id":"instr-strict","limit":18446744073709551615})"}) {
         INFO(bad);
         auto body = call(bad);
         REQUIRE(body.contains("error"));

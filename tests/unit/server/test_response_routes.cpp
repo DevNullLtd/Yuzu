@@ -410,6 +410,42 @@ TEST_CASE("legacy response routes: limit/offset reject trailing garbage where ac
     CHECK(res->status == 400);
 }
 
+TEST_CASE("legacy response catch-all: a valid offset still paginates (#4644 must not break it)",
+          "[server][routes][response_routes][rest][pg]") {
+    PgHarness h;
+    h.seed("instr-offset", "agent-1", 1);
+    h.seed("instr-offset", "agent-2", 1);
+    h.seed("instr-offset", "agent-3", 1);
+
+    auto count_for = [&](const std::string& query) {
+        auto res = h.sink.Get("/api/responses/instr-offset" + query);
+        REQUIRE(res);
+        REQUIRE(res->status == 200);
+        return json::parse(res->body)["responses"].size();
+    };
+    // offset skips rows (3 stored): a regression that rejects or ignores a valid offset
+    // changes one of these counts.
+    CHECK(count_for("") == 3);
+    CHECK(count_for("?offset=1") == 2);
+    CHECK(count_for("?offset=2") == 1);
+    CHECK(count_for("?offset=3") == 0);
+}
+
+TEST_CASE("export limit normalisation: the ceiling is exactly 10000, the floor 1, omitted = ceiling",
+          "[server][routes][response_routes]") {
+    using yuzu::server::kExportRowLimitCap;
+    using yuzu::server::normalize_export_limit;
+    CHECK(kExportRowLimitCap == 10000);
+    CHECK(normalize_export_limit(true, 999999999) == 10000);
+    CHECK(normalize_export_limit(true, 10001) == 10000);
+    CHECK(normalize_export_limit(true, 10000) == 10000);
+    CHECK(normalize_export_limit(true, 9999) == 9999);
+    CHECK(normalize_export_limit(true, 1) == 1);
+    CHECK(normalize_export_limit(true, 0) == 1);
+    CHECK(normalize_export_limit(true, -5) == 1);
+    CHECK(normalize_export_limit(false, 12345) == 10000);
+}
+
 TEST_CASE("legacy response routes: well-formed numerics still pass, incl. zero-padding and "
           "the -1 'any' sentinel (#4644)",
           "[server][routes][response_routes][rest][pg]") {
