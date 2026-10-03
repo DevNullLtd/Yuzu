@@ -32,13 +32,16 @@ cadences.
   sortable or filterable there; read them from the raw `output` on
   `GET /api/v1/responses/{id}` or MCP `query_responses`. A macOS `list` payload
   is about three times larger than before (14 KB to 42 KB for 323 applications);
-  `bundle_id` is `-` past the 5000-application / 120 s enrichment cap, which the
-  agent logs but does not report as degraded.
+  `bundle_id` is `-` for rows the bounded bundle-id pass (30 s, at most 5000
+  applications, one pass in flight) did not reach; that run leads with a
+  `warning|bundle_id_*` row and reports CONSTRAINED -- never silently.
   On Linux/macOS, a
   degraded acquisition (timeout, kill, spawn failure, truncation, or a
   nonzero exit) now emits a single `error|installed_apps: acquisition
   degraded (...)` row and a nonzero result instead of an empty or partial
-  `app|` list — see "Degraded collections are skipped, not published" below.
+  `app|` list; on macOS a `list` may begin with a `warning|bundle_id_*` row --
+  key on the first token `app`. See "Degraded collections are skipped, not
+  published" below.
   Automation that only parses `app|` rows and ignores `error|` is
   unaffected; automation that assumed `list` always succeeds needs an
   update. See `docs/user-manual/agent-plugins.md`'s `installed_apps`/
