@@ -178,22 +178,28 @@ An agent whose heartbeat is answered `NOT_FOUND` recovers on its own, as it alre
 does for any lost session: it waits an escalating cooldown (2 s on the first
 rejection, doubling to a 300 s cap), drops its `Subscribe` stream and registers
 again. There is no wire or server change, and no agent change for the supported
-topologies. This recovery needs **agent 0.13.0 or newer** (checked in the agent
-source at the v0.12.0 and v0.13.0 tags). Deployments that use the Erlang gateway of
-this release need agents 0.13.0 or newer: the final 0.13.0 tag, not
-`v0.13.0-rc1` to `v0.13.0-rc6`, which lack the recovery (checked in the agent source).
-Upgrade the agents first, then the gateway. Agents that do not connect through the
-gateway are not affected. An older agent only logs `Heartbeat failed`
-and, for persistent missing state, stays rejected until it is restarted or upgraded
-(a heartbeat that falls in the short gap between the session leaving the pending table
-and its agent process registering can succeed later without re-registration). That
-matters only when its heartbeats are rejected, which happens in three cases: a topology that breaks the
-one-connection assumption, a gateway running without the session index, and a gateway
-registry process restart or crash while agent connections stay up (the registry
+topologies. The recovery logic exists from v0.13.0 (checked in the agent source at
+the v0.12.0 and v0.13.0 tags), but the released v0.13.0 and v0.14.0-rc6 agents wedge in
+their reconnect path with default settings (bug #2182, fixed by PR #5183, in no release
+yet): after the rejection they log `(#1894)` and `Heartbeat thread stopped` and never
+re-register (observed, 19 minutes, reproduced on a second agent; the cause is inferred
+from the fix). They recover only with `--no-auto-update` (observed with v0.13.0 and
+v0.14.0-rc6, re-registering 20 to 21 s after a registry restart; a command-line flag
+with no environment variable) or on a build that includes the fix. Agent v0.12.0 and
+older never re-register by themselves: they only log `Heartbeat failed` (observed with
+v0.12.0, 29 failures in 14.5 minutes, with and without `--no-auto-update`) and, for
+persistent missing state, stay rejected until restarted or upgraded (a heartbeat that
+falls in the short gap between the session leaving the pending table and its agent
+process registering can succeed later without re-registration). Upgrade the agents
+first, then the gateway, with a build that includes the #2182 fix once released; until
+then, restart an agent that stays rejected (restarting the agent service re-registers
+it). Agents that do not connect through the gateway are not affected. Recovery matters
+only when heartbeats are rejected, which happens in three cases: a topology that breaks
+the one-connection assumption, a gateway running without the session index, and a
+gateway registry process restart or crash while agent connections stay up (the registry
 recreates its tables empty, so every heartbeat for the agents it held is rejected until
 they re-register). A node failover that leaves the session not held by the surviving
-node is expected to behave the same way (inferred, not tested). An agent older than
-0.13.0 was not run through any of these.
+node is expected to behave the same way (inferred, not tested).
 
 **Supported topologies.** Agents connect to the gateway agent listener (`:50051`)
 directly, or through an L4 / TLS-passthrough path that keeps one TCP connection per
@@ -239,8 +245,18 @@ sends `GOAWAY`, so a `Subscribe` stream and its binding end with the connection;
 there is no drain period. A heartbeat that reaches the gateway on a different
 connection while the old `Subscribe` is still bound is rejected (`NOT_FOUND`,
 connection mismatch), and the agent recovers by re-registering. This is what the
-gateway's own tests observed with a test HTTP/2 client; the behaviour of the real C++
-agent across a `GOAWAY` has not been tested.
+gateway's own tests observed with a test HTTP/2 client. With the real C++ agent (a build
+from the branch tree) a graceful `GOAWAY` injected by the tester on the gateway-side
+connection (the gateway itself did not send one) moved the agent's next heartbeat to a
+new connection: the mismatch counter rose by one, the agent logged `(#1894)` and
+re-registered 16 s after the `GOAWAY`, and acked heartbeats resumed about 30 s later. An
+abrupt close of just that agent's connection made it re-register in 9 s with the
+counters unchanged. A graceful gateway SIGTERM and restart (observed twice) showed the
+branch agent reconnecting in about 11 to 12 s with no rejections; the released agents
+tested (v0.14.0-rc6, v0.13.0, v0.12.0, default settings) did not notice the lost
+`Subscribe` stream across that restart, their heartbeats got `NOT_FOUND`, and rc6 and
+v0.13.0 then wedged as described above (restart them). A `GOAWAY` originating from the
+gateway on its own was not observed.
 
 **Observability.** Rejections are counted by two families (see
 [Available Metrics](#available-metrics)): `yuzu_gw_heartbeat_rejected_total{reason}`
@@ -271,15 +287,20 @@ counters and the summary line.
   between the agents and `:50051`; use L4 or TLS passthrough.
 - `yuzu_gw_heartbeat_session_mismatch_total` that keeps rising for more than about
   15 minutes (a rule of thumb, not a measured value) points to a topology that breaks
-  one connection per agent (an HTTP/2-terminating proxy, or similar). A brief rise
-  around agent reconnects is expected but was not observed in testing: the counter
-  stayed at 0 through agent and gateway restarts in the rig runs.
+  one connection per agent (an HTTP/2-terminating proxy, or similar). A rise of
+  one per affected agent is expected when an agent's connection is replaced while its
+  session is still held (observed with an injected GOAWAY, a test-only trigger; not
+  observed with an abrupt close or a gateway restart, where the counter stayed
+  unchanged).
 - `yuzu_gw_heartbeat_rejected_total{reason="unknown_session"}` rises by about one per
   agent after a gateway registry restart. Observed: after killing the registry process
   with 4 agents attached the counter rose by 4, and all 4 agents were admitted again
-  within about 25 s (observed with agents built from the branch tree, which carries the 0.13.0 recovery; an agent older than
-  0.13.0 only logs the rejection and stays rejected until it is restarted). It is also expected to rise around a node failover, but that was
-  not observed in testing (multi-node was not tested).
+  within about 25 s (observed with agents built from the branch tree, which includes the
+  #2182 fix; one to four registry kills, recovery in 17 to 37 s). The released v0.13.0
+  and v0.14.0-rc6 agents wedge with default settings and v0.12.0 and older only log the
+  rejection (see Heartbeat admission above); restart such an agent. It is also expected
+  to rise around a node failover, but that was not observed in testing (multi-node was
+  not tested).
 - `yuzu_gw_heartbeat_rejected_total{reason="no_connection"}` rises when the call, or
   the session it names, has no connection key to compare. Not observed in testing. Its
   possible causes are a registration path that carries no connection key, or a
@@ -308,9 +329,11 @@ a load balancer that should drain such a node must probe `:8081/readyz`.
 on a restarted node reconnect and re-register on their back-off. Multi-node behaviour
 is not tested.
 
-**Upgrading.** Deployments that use this gateway need agents 0.13.0 or newer (the final
-0.13.0 tag; `v0.13.0-rc1` to `v0.13.0-rc6` lack the recovery): upgrade the agents first, then
-the gateway. Agents that do not connect through the gateway are not affected. Deploy this
+**Upgrading.** A rejected agent re-registers on its own only in a build that includes
+the #2182 fix, or with `--no-auto-update` on v0.13.0 and v0.14.0-rc6 (see Heartbeat
+admission): upgrade the agents first, then the gateway, with a build that includes the fix
+once released. Until then, restart an agent that stays rejected (restarting the agent service
+re-registers it). Agents that do not connect through the gateway are not affected. Deploy this
 change with a **gateway restart**. The session index is a
 new in-memory table created when the gateway registry starts, and hot code upgrade
 is not supported for this change. New code loaded into a running node has no index
@@ -324,7 +347,7 @@ register and subscribe again, and their sessions are bound to the new connection
 
 **Rollback.** Redeploy the previous gateway release. The only new state is the in-memory
 session index, and there is no wire, agent or server change, so nothing needs migrating;
-agents re-register on their own (agents older than 0.13.0 may need a restart, see
+agents re-register on their own (released agents may need a restart, see
 [Heartbeat admission](#heartbeat-admission)), and a rollback removes the connection
 check. This is derived from the change and was not run.
 
@@ -334,7 +357,13 @@ the counters stayed at 0 through gateway, agent and server restarts; the listene
 advertises `h2` through NPN only and the agent connects without an ALPN error), a
 Windows agent (about 25 minutes, plaintext), the released agents v0.13.0 and
 v0.14.0-rc6 (plaintext), a 31-minute soak with 4 agents plus a run with 25 extra
-agents, and non-default agent heartbeat intervals.
+agents, and non-default agent heartbeat intervals. A later plaintext run on the final
+gateway code covered a clean boot (`/readyz` 200 with `sessions_index`, both counter
+families at 0), a 6 minute 23 s steady run of a branch agent at the default heartbeat interval, a heartbeat
+for a held session sent from a second connection (`NOT_FOUND`, mismatch counter 0 to 1,
+nothing buffered), registry kills, graceful gateway restarts, an injected `GOAWAY` and an
+abrupt connection close, with the released agents v0.14.0-rc6, v0.13.0 and v0.12.0 (see
+Heartbeat admission and Connection drain for the results).
 
 **Not tested with a real agent:** a multi-node gateway (a two-node registry unit test,
 `yuzu_gw_registry_multinode_tests`, exists), and a listener that requires client
@@ -342,7 +371,8 @@ certificates (a test-client mutual TLS leg exists in
 `yuzu_gw_heartbeat_conn_rpc_tests`; the shipped listener does not require client
 certificates). **Not tested at all:** a multiplexing HTTP/2 proxy with upstream
 keepalive, Windows service mode, a macOS agent, fleet-scale storms, a real hot code
-load, and the real C++ agent across a `GOAWAY`.
+load, TLS in the final-code rig run, and a real C++ agent across a `GOAWAY` that the
+gateway itself originates (only an injected one was run).
 
 The rig runs used gateway commit `1c145d78a` (the first run, plaintext, ran on
 `2e884bb9b`, which differs from it only in tests and docs). Later fix
@@ -925,8 +955,8 @@ that are actually emitted are listed.
 | `yuzu_gw_cluster_peers_connected` | gauge | Distribution-connected peer nodes as of the most recent redial tick (label `node`; `#4555`). Compare against `peers_resolved` — a sustained gap most often means a distribution-cookie mismatch across replicas. |
 | `yuzu_gw_cluster_connect_failures_total` | counter | Total `net_kernel:connect_node/1` failures from the redial loop (`#4555`). |
 | `yuzu_gw_cluster_address_cap_exceeded_total` | counter | Total times the lifetime distinct-address cap (`cluster_max_lifetime_addrs`) refused a never-before-seen address (`#4555` review round 2). Any non-zero value should be investigated immediately — it means the seed DNS name is returning an unexpectedly large or rotating/hostile answer set. |
-| `yuzu_gw_heartbeat_rejected_total` | counter | Agent `Heartbeat` calls rejected before buffering because no usable session binding exists (label `reason`, closed set: `unknown_session` = the session is not held by this node, `no_connection` = no connection key to compare, `registry_unavailable` = the session index does not exist). Every reason is created at 0 at start. The agent re-registers on the `NOT_FOUND` answer (agents 0.13.0 and newer; older agents only log it). A held session whose heartbeat arrived on a different connection is counted in the next row instead. See [Heartbeat admission](#heartbeat-admission). |
-| `yuzu_gw_heartbeat_session_mismatch_total` | counter | Agent `Heartbeat` calls rejected because the session is held by this node but the call arrived on a different connection than the one that opened it (label `event`, always `security`, for SIEM routing; created at 0 at start). Also rises when an HTTP/2 proxy between agents and the gateway spreads one agent's calls over several connections, and possibly around agent reconnects (expected, not observed in testing). There is no audit row (the sender of a rejected heartbeat is not a resolved principal): the counter and a rate-limited summary log line are the signal. |
+| `yuzu_gw_heartbeat_rejected_total` | counter | Agent `Heartbeat` calls rejected before buffering because no usable session binding exists (label `reason`, closed set: `unknown_session` = the session is not held by this node, `no_connection` = no connection key to compare, `registry_unavailable` = the session index does not exist). Every reason is created at 0 at start. The agent re-registers on the `NOT_FOUND` answer when its build includes the reconnect fix (see the gateway manual); older agents only log it. A held session whose heartbeat arrived on a different connection is counted in the next row instead. See [Heartbeat admission](#heartbeat-admission). |
+| `yuzu_gw_heartbeat_session_mismatch_total` | counter | Agent `Heartbeat` calls rejected because the session is held by this node but the call arrived on a different connection than the one that opened it (label `event`, always `security`, for SIEM routing; created at 0 at start). Also rises when an HTTP/2 proxy between agents and the gateway spreads one agent's calls over several connections. A rise of one per affected agent is expected when an agent's connection is replaced while its session is still held (observed with an injected GOAWAY, a test-only trigger; not observed with an abrupt close or a gateway restart). There is no audit row (the sender of a rejected heartbeat is not a resolved principal): the counter and a rate-limited summary log line are the signal. |
 
 The full set of gateway metrics (BEAM scheduler/memory gauges, fan-out and
 queue-length histograms, circuit-breaker and cluster counters) is registered in

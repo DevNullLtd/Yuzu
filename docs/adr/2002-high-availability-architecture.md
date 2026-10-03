@@ -1188,11 +1188,13 @@ only on that connection and only for a session the node holds. The `unknown_sess
 (2026-10-01 note) therefore names only sessions the node held at admission time; it remains an advisory
 snapshot (`gateway.proto`: it may be stale) and the replay keeps its own liveness, dedupe and pacing
 rules. No wire or server change, and no agent change for the supported topologies; this change does not fix #1197.
-A rejected agent re-registers through its `NOT_FOUND` recovery (cooldown from 2 s doubling to 300 s), which
-exists in agent 0.13.0 and newer (checked in the agent source at the v0.12.0 and v0.13.0 tags). Deployments that use
-the Erlang gateway of this release therefore need agents 0.13.0 or newer: the final 0.13.0 tag, not
-`v0.13.0-rc1` to `v0.13.0-rc6`, which lack the recovery (checked in the agent source); upgrade the agents first, then
-the gateway, and agents that do not connect through the gateway are not affected. An older agent only
+A rejected agent re-registers through its `NOT_FOUND` recovery (cooldown from 2 s doubling to 300 s). That logic
+exists from agent v0.13.0 (checked in the agent source at the v0.12.0 and v0.13.0 tags), but the released v0.13.0
+and v0.14.0-rc6 agents wedge in their reconnect path with default settings (bug #2182, fixed by PR #5183, in no
+release yet) and recover only with `--no-auto-update` (observed with both) or on a build that includes the fix;
+v0.12.0 and older never re-register by themselves (observed). Upgrade the agents first, then the gateway, with a
+build that includes the #2182 fix once released; until then restart an agent that stays rejected. Agents that do
+not connect through the gateway are not affected. An older agent only
 logs `Heartbeat failed` and, for persistent missing state, stays rejected until it is restarted or upgraded (a heartbeat
 in the short take_pending to register_agent gap can succeed later without re-registration); that matters only when its
 heartbeats are rejected: under a topology that breaks the one-connection assumption, against a gateway
