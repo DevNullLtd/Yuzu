@@ -596,8 +596,9 @@ shipped behind it on `dev` (#4707, the gateway `/metrics` endpoint returning HTT
 #4708, a stale test); neither reached a tagged release. The gateway's EUnit check was
 unaffected and did run.
 
-#4800 closes it: the check now runs the suites (52 cases on the Linux and Windows legs),
-and the wrapper fails any run that exits 0 without executing a test. `/test`'s EUnit gate
+#4800 closes it: the check now runs the suites on the Linux, Windows and macOS legs (52
+Common Test cases were measured on Linux and on Windows when it merged; the macOS count
+was not measured then), and the wrapper fails any run that exits 0 without executing a test. `/test`'s EUnit gate
 and the release workflow's EUnit step were brought under the same rule. A hermetic
 self-test (`tests/test_gateway_test_summary.py`) pins the directory and the rule. The same
 change closes a second, older gap (#4841): the macOS CI leg never had Erlang, so Meson
