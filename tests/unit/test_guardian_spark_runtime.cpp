@@ -12584,6 +12584,12 @@ struct PoolTomb5322 {
 };
 } // namespace
 
+// Guard isolation: this case does NOT isolate try_dispatch_head_locked's is_dead_claim
+// guard. Its tombstone is a withdrawn one (a detach whose index release failed), and it
+// observes the backend arm count and the receipt statuses only, so removing just that guard
+// leaves it green: dispatch_arm_off_lock's entry guard (withdrawn / commit_exception) still
+// keeps the tombstone from reaching the backend. The dispatch_entries assertion in the
+// "behind a committed head" case below is what isolates the selector guard.
 TEST_CASE("#5322: a tombstone head is never redispatched while the pool is exhausted",
           "[spark][runtime][liveness]") {
     using namespace std::chrono_literals;
@@ -12619,6 +12625,11 @@ TEST_CASE("#5322: a tombstone head is never redispatched while the pool is exhau
         [&] { return rig.status(rb->receipt) == RT::ReceiptStatus::Committed; }, 10s));
 }
 
+// Guard isolation: this case isolates try_dispatch_head_locked's is_dead_claim guard (the
+// selector) via the dispatch_entries == 0 assertion. The entry hook it counts fires at the
+// top of dispatch_arm_off_lock, before that function's own entry guard, so a tombstone the
+// selector wrongly picks is counted even though the entry guard would still stop it from
+// arming; the arm_entries check alone could not tell the two guards apart.
 TEST_CASE("#5322: a tombstone behind a committed head is not dispatched and one pass releases it",
           "[spark][runtime][liveness]") {
     using namespace std::chrono_literals;
@@ -13504,4 +13515,64 @@ TEST_CASE("#5323: an abandoned Queued claim whose index release fails is retaine
     // The key arms afresh.
     (void)f.rt->attach_rule(RT::NonWaiting{}, "r3", file_spec("/a"), file_exists_rule("r3"), true);
     REQUIRE(yuzu::test::spin_until([&] { return f.b->arms.load() == 2; }, 10s));
+}
+
+TEST_CASE("#5322: a blocking waiter is woken by the pass that reaper-synthesizes its outcome",
+          "[spark][runtime][liveness]") {
+    using namespace std::chrono_literals;
+    using RT = GuardianSparkRuntime;
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    // A LONG deadline: a missed notify leaves the waiter asleep far past the 2 s bound
+    // below, so the failure is unambiguous (the waiter is never woken by its own deadline).
+    auto rt = make_rt(r, b, RT::Config{.backend_op_deadline = 30s});
+    const auto key = spark_key(file_spec("/a"));
+
+    // The up-4 double-fault construction (see the "up-4 (#4221)" case above), but with the
+    // BLOCKING attach_rule overload on its own thread: fault point 1 fails the initial
+    // staging, the gap hook re-arms fault point 7 so the firewall loop throws after
+    // release_claim_index_locked failed (index_remove_fault) and marked the claim
+    // withdrawn+Queued, before its outcome is written. The waiter's claim is that residue.
+    std::atomic<bool> hook_fired{false};
+    rt->set_index_remove_fault_for_test(true);
+    rt->set_drain_fault_point_for_test(1);
+    rt->set_drain_gap_hook_for_test([&] {
+        rt->set_drain_fault_point_for_test(7);
+        hook_fired.store(true, std::memory_order_release);
+    });
+
+    std::atomic<bool> waiter_done{false};
+    std::optional<std::expected<std::uint64_t, std::string>> waiter_result;
+    std::thread waiter([&] {
+        waiter_result = rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true);
+        waiter_done.store(true, std::memory_order_release);
+    });
+    // On EVERY exit path (a RED run included): stop the runtime so a still-blocked waiter
+    // returns "stopping" instead of sleeping out its 30 s deadline, then join it.
+    yuzu::test::ScopeExit cleanup{[&] {
+        rt->set_drain_gap_hook_for_test({});
+        rt->begin_stop();
+        if (waiter.joinable())
+            waiter.join();
+    }};
+
+    REQUIRE(yuzu::test::spin_until([&] { return hook_fired.load(std::memory_order_acquire); },
+                                   10s));
+    // The compensating disarm has run (compensation_finished) and the residue is in place:
+    // one Queued claim, no outcome, so the waiter is still blocked.
+    REQUIRE(yuzu::test::spin_until([&] { return b->disarms.load() == 1; }, 10s));
+    REQUIRE(yuzu::test::spin_until([&] { return rt->claim_queue_depth_for_test(key) == 1; }, 10s));
+    REQUIRE_FALSE(waiter_done.load(std::memory_order_acquire));
+
+    // This pass expires nothing (the claim is not overdue) and refills nothing: the ONLY
+    // thing it does is reap the residue and write its fallback outcome. The waiter must be
+    // woken by it, not at its own 30 s deadline.
+    CHECK(rt->expire_overdue_claims() == 0);
+    CHECK(rt->claim_queue_depth_for_test(key) == 0);
+    REQUIRE(yuzu::test::spin_until([&] { return waiter_done.load(std::memory_order_acquire); },
+                                   2s));
+    waiter.join();
+    REQUIRE(waiter_result.has_value());
+    REQUIRE_FALSE(waiter_result->has_value());
+    CHECK(waiter_result->error() == "arm drain failed");
 }

@@ -2529,6 +2529,7 @@ std::size_t GuardianSparkRuntime::expire_overdue_claims() {
     std::vector<std::pair<std::string, std::shared_ptr<KeyClaim>>> refills;
     std::vector<std::shared_ptr<KeyClaim>> disarms;
     std::size_t expired_count = 0;
+    std::size_t reaped_count = 0;
     {
         std::lock_guard<std::mutex> lk{registry_mu_};
         // Collect first, mutate second: abandon_claim_locked() erases from a key's
@@ -2558,7 +2559,7 @@ std::size_t GuardianSparkRuntime::expire_overdue_claims() {
         // up-4 (#4221): the terminal-recovery safety net (see this function's own
         // doc comment) - separate from the overdue-live-claim pass above, which
         // deliberately excludes anything already outcome/commit_exception/abandoned.
-        reap_stranded_claims_locked(refills);
+        reaped_count = reap_stranded_claims_locked(refills);
         // #5322: the owner of a ->0 edge a release dropped. Contained here so the
         // reaper's refills (already flipped Dispatching) always reach their dispatch.
         try {
@@ -2567,7 +2568,9 @@ std::size_t GuardianSparkRuntime::expire_overdue_claims() {
             claim_drain_failures_.fetch_add(1, std::memory_order_relaxed);
         }
     }
-    if (expired_count || !refills.empty())
+    // A reaped claim may carry an outcome this pass just wrote (the synthesis arm), which a
+    // blocking waiter in wait_for_claim() is waiting on, so a reap alone must wake it.
+    if (expired_count || reaped_count || !refills.empty())
         claim_cv_.notify_all();
     for (auto& [key, refill] : refills)
         dispatch_arm_off_lock(key, refill);
