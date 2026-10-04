@@ -76,6 +76,17 @@ A small, source-agnostic seam:
   mass-deploy or a site's Monday-morning power-on does not herd); otherwise wait
   for the next phase fire.
 
+> **Update (2026-10-04, #5327):** a source whose collect yields nothing records
+> `skip_streak` / `last_skip` in the same `__sync__` KV. A source that opts in
+> (`skip_backoff`; today installed_software only — the other sources re-dispatch
+> many actions on a retry) retries at min(next phase slot, 1 h · 2^(streak-1))
+> for five additional retry attempts, then falls back to its daily slot; the others keep one full
+> interval. The skip reason reaches the server only as a heartbeat tag, never a
+> report. KV writes are ordered skip fields first, so an interrupted save never
+> advances `next_fire` without the skip fields already recorded; a kill between
+> the `skip_streak` and `last_skip` writes can still leave the tags unpublished
+> until the next collection, and the stale `next_fire` makes that retry immediate.
+
 ### 4. Hash-skip conditional protocol
 - The agent **always** sends a per-source `content_hash`; it **omits the full
   blob when the hash is unchanged** since the last successful sync.

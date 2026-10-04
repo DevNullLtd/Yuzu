@@ -2168,6 +2168,7 @@ the literal label values, not substring matches.
 | Reason label | Meaning | Operator action |
 |---|---|---|
 | `reserved_name` | Plugin declared a reserved name (`__guard__`, `__system__`, `__update__`, `__guardian_journal__`, `__guardian__`, `__sync__`). Possible plugin-author error or a malicious shadowing attempt (#453; the `kv_store`-namespace names added in #2303). | Investigate the plugin source / drop. |
+| `duplicate_name` | A second file in the plugin directory declared a name another file in the same scan had already claimed; the first file the directory walk encountered keeps the name, the later file is rejected and immediately unloaded without its plugin init being called. | Remove the duplicate from `--plugin-dir` (two builds of one plugin); which copy wins is filesystem order, so do not rely on it. |
 | `load_failed` | `dlopen` / `LoadLibrary` failed, missing `yuzu_plugin_descriptor` export, or ABI version mismatch. | Check the agent log for the dlopen error and rebuild the plugin against the current SDK ABI. |
 | `signature_missing` | `--plugin-trust-bundle` is set, `--plugin-require-signature` is set, and a plugin has no `<plugin>.so.sig` sibling. | Sign the plugin, deploy the `.sig` alongside, or relax the require flag. |
 | `signature_invalid` | `.sig` file exists but the CMS verification failed at the signature/digest layer (most commonly: the plugin file was modified after signing). | Re-sign the plugin or investigate tampering. |
