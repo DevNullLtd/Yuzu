@@ -37,12 +37,12 @@
 #
 # Usage:
 #   bash scripts/start-UAT.sh          # start + verify
-#   bash scripts/start-UAT.sh stop     # kill all
+#   bash scripts/start-UAT.sh stop     # stop the processes this script started
 #   bash scripts/start-UAT.sh status   # show running processes
 
 set -euo pipefail
 
-YUZU_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+YUZU_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 # Per-OS canonical build dir (see CLAUDE.md "Per-OS build directory convention").
 # This script is named linux-start-UAT.sh but defaults sensibly on macOS too;
@@ -56,6 +56,10 @@ else
 fi
 GATEWAY_DIR="$YUZU_ROOT/gateway"
 UAT_DIR="/tmp/yuzu-uat"
+# No env override on purpose: the start-time wipe of $UAT_DIR must never be
+# redirectable. PID records (pid + launched path) live under PID_DIR (#5333).
+PID_DIR="$UAT_DIR/pids"
+UAT_PORTS="8080 50051 50052 50054 50055 50063 8081 9568"
 
 # Postgres sidecar (see header). PG_SOFT_FAIL=1 → a missing/failed sidecar
 # warns and continues; becomes a hard failure once #1320 PR 3 makes the
@@ -135,59 +139,179 @@ poll_metric_at_least() {
 }
 
 # ── Kill helpers ────────────────────────────────────────────────────────
+#
+# Signal only processes this script recorded at spawn (#5333). Selecting a
+# victim by command-line substring once killed an unrelated
+# `meson compile ... yuzu-agent`; ports are used only to REFUSE, never to
+# pick a kill target.
+
+# record_pid NAME PID IDENT — line 1 the PID, line 2 the launch identity (the
+# launched binary / release path that must appear in the process command line).
+record_pid() {
+    mkdir -p "$PID_DIR"
+    printf '%s\n%s\n' "$2" "$3" > "$PID_DIR/$1.pid"
+}
+
+# recorded_pid_state NAME — read-only validator shared by kill and status.
+# Prints absent | malformed | "dead PID" | "reused PID" | "owned PID". The
+# identity is the RECORDED path, not the current $BUILDDIR, so a stack this
+# script started from another worktree is still recognised as its own, while
+# a recycled PID (same number, different program) is never signalled.
+recorded_pid_state() {
+    local f="$PID_DIR/$1.pid" pid="" ident=""
+    [ -f "$f" ] || { echo absent; return 0; }
+    { read -r pid || true; read -r ident || true; } < "$f"
+    case "$pid" in ''|*[!0-9]*) echo malformed; return 0 ;; esac
+    [ -n "$ident" ] || { echo malformed; return 0; }
+    kill -0 "$pid" 2>/dev/null || { echo "dead $pid"; return 0; }
+    case "$(ps -o command= -p "$pid" 2>/dev/null)" in
+        *"$ident"*) echo "owned $pid" ;;
+        *)          echo "reused $pid" ;;
+    esac
+}
+
+# kill_tree PID — SIGKILL descendants then PID. The sudo -n arm covers the
+# root-owned sudo parent of an --as-user agent (needs a warm sudo cache).
+kill_tree() {
+    local child
+    for child in $(pgrep -P "$1" 2>/dev/null || true); do
+        kill_tree "$child"
+    done
+    kill -9 "$1" 2>/dev/null || sudo -n kill -9 "$1" 2>/dev/null || true
+}
+
+# kill_recorded NAME — 0 stopped, 1 nothing to stop, 2 owned but survived
+# (its record is kept so the operator still has the PID).
+kill_recorded() {
+    local name="$1" state pid _
+    state=$(recorded_pid_state "$name")
+    pid="${state#* }"
+    case "$state" in
+        absent) return 1 ;;
+        malformed|dead*) rm -f "$PID_DIR/$name.pid"; return 1 ;;
+        reused*)
+            warn "recorded $name PID $pid now belongs to another process, not signalling it"
+            rm -f "$PID_DIR/$name.pid"; return 1 ;;
+    esac
+    kill_tree "$pid"
+    for _ in 1 2 3 4 5; do
+        kill -0 "$pid" 2>/dev/null || break
+        sleep 0.2
+    done
+    if kill -0 "$pid" 2>/dev/null; then
+        fail "could not stop $name (PID $pid) — kept its record; stop it by hand (sudo kill -9 $pid) before starting"
+        return 2
+    fi
+    rm -f "$PID_DIR/$name.pid"
+    ok "Stopped $name (PID $pid)"
+}
+
+# An unavailable inspector must not read as "ports free".
+have_port_inspector() { command -v lsof >/dev/null 2>&1 || command -v ss >/dev/null 2>&1; }
+
+report_busy_ports() {
+    local p
+    command -v lsof >/dev/null 2>&1 || return 0
+    for p in "$@"; do
+        lsof -iTCP:"$p" -sTCP:LISTEN -P -n 2>/dev/null | tail -n +2
+    done
+}
 
 kill_stale() {
-    echo "Cleaning up stale Yuzu processes..."
-    local killed=0
+    echo "Stopping Yuzu processes recorded by this script..."
+    local killed=0 failed=0 rc name held="" _
 
-    for pattern in yuzu-server yuzu-agent; do
-        local pids
-        pids=$(pgrep -f "$pattern" 2>/dev/null || true)
-        if [ -n "$pids" ]; then
-            echo "$pids" | xargs kill -9 2>/dev/null || true
-            ok "Killed $pattern (PIDs: $(echo $pids | tr '\n' ' '))"
-            killed=$((killed + 1))
-        fi
+    for name in server gateway agent; do
+        rc=0; kill_recorded "$name" || rc=$?
+        case "$rc" in
+            0) killed=$((killed + 1)) ;;
+            2) failed=$((failed + 1)) ;;
+        esac
     done
-
-    # Erlang BEAM (gateway). Match by yuzu_gw release path or node name
-    # rather than beam.smp — release scripts rewrite cmdline so the binary
-    # name doesn't appear in /proc/$pid/cmdline.
-    local beam_pids
-    beam_pids=$(pgrep -f "yuzu_gw[/_]" 2>/dev/null || true)
-    if [ -n "$beam_pids" ]; then
-        echo "$beam_pids" | xargs kill -9 2>/dev/null || true
-        ok "Killed yuzu_gw beam (PIDs: $(echo $beam_pids | tr '\n' ' '))"
-        killed=$((killed + 1))
+    if [ "$failed" -gt 0 ]; then
+        fail "refusing to start: $failed recorded process(es) survived SIGKILL (see above)"
+        return 1
     fi
 
-    # Postgres sidecar container (no volume — state is per-run, matching
-    # the rig's wipe-state semantics).
+    if ! have_port_inspector; then
+        fail "neither lsof nor ss found — cannot verify the UAT ports are free; refusing to start (#5333)"
+        return 1
+    fi
+    for _ in 1 2 3 4 5; do
+        # shellcheck disable=SC2086  # UAT_PORTS is a deliberate word list
+        held=$(listening_ports_among $UAT_PORTS)
+        [ -z "$held" ] && break
+        sleep 1
+    done
+    if [ -n "$held" ]; then
+        fail "ports still held by processes this script did not start: $held"
+        # shellcheck disable=SC2086
+        report_busy_ports ${held//,/ }
+        fail "refusing to signal them — stop that stack from the session that owns it (#5333)"
+        return 1
+    fi
+
+    # Postgres sidecar container (no volume — state is per-run). Removed only
+    # after the refusal gate above, so a stack we decline to stop keeps its DB.
     if command -v docker >/dev/null 2>&1; then
         if docker rm -f "$PG_CONTAINER" >/dev/null 2>&1; then
             ok "Removed postgres sidecar container ($PG_CONTAINER)"
             killed=$((killed + 1))
         fi
     fi
-
-    if [ "$killed" -eq 0 ]; then
-        ok "No stale processes found"
+    for _ in 1 2 3 4 5; do
+        held=$(listening_ports_among "$PG_HOST_PORT")
+        [ -z "$held" ] && break
+        sleep 1
+    done
+    if [ -n "$held" ]; then
+        fail "port $PG_HOST_PORT still held after removing $PG_CONTAINER — not this rig's sidecar"
+        report_busy_ports "$PG_HOST_PORT"
+        return 1
     fi
 
-    # Wait for ports to release
-    sleep 1
+    if [ "$killed" -eq 0 ]; then
+        ok "No recorded processes to stop"
+    fi
+}
+
+# kill_stale, then the #947 wipe. Refusal happens before any wipe or spawn.
+prepare_fresh_run() {
+    kill_stale || return 1
+
+    # If a prior run used --as-user, the agent left files owned by that
+    # user (typically _yuzu) under $UAT_DIR. The current user can't `rm`
+    # them. Try plain rm first; on failure, fall back to `sudo -n rm -rf`
+    # which works if the operator's sudo cache is still warm. If both
+    # fail, fall through to mkdir -p which will succeed for the new
+    # subdirectories — the leftover files are mostly harmless (they get
+    # overwritten by this run), and the operator gets a hint to rerun
+    # `sudo -v` if they care about a fully fresh state.
+    if ! rm -rf "$UAT_DIR" 2>/dev/null; then
+        if sudo -n rm -rf "$UAT_DIR" 2>/dev/null; then
+            ok "Cleared $UAT_DIR (had files owned by another user; sudo cleanup)"
+        else
+            warn "Could not fully clear $UAT_DIR (some files owned by another user)"
+            warn "  manual fix: sudo rm -rf $UAT_DIR"
+        fi
+    fi
+    mkdir -p "$UAT_DIR/agent-data"
 }
 
 # ── Status ──────────────────────────────────────────────────────────────
 
 show_status() {
     echo "=== Yuzu UAT Stack Status ==="
-    for proc in yuzu-server yuzu-agent beam.smp; do
-        if pgrep -f "$proc" > /dev/null 2>&1; then
-            ok "$proc running (PID: $(pgrep -f "$proc" | head -1))"
-        else
-            fail "$proc not running"
-        fi
+    local name state pid
+    for name in server gateway agent; do
+        state=$(recorded_pid_state "$name")
+        pid="${state#* }"
+        case "$state" in
+            owned*)  ok "$name running (PID $pid, recorded by start-UAT.sh)" ;;
+            reused*) fail "$name not running (recorded PID $pid now belongs to another process)" ;;
+            absent)  fail "$name not running (no record)" ;;
+            *)       fail "$name not running (stale record)" ;;
+        esac
     done
     if command -v docker >/dev/null 2>&1 && \
        docker ps --filter "name=^${PG_CONTAINER}$" --format '{{.Names}}' 2>/dev/null | grep -q .; then
@@ -201,7 +325,7 @@ show_status() {
     # ports we care about and print one row per listener so the output is
     # the same shape on both OSes.
     local _any=0 _p _line
-    for _p in 50051 50052 50054 50055 50063 8080 8081 9568 "$PG_HOST_PORT"; do
+    for _p in $UAT_PORTS "$PG_HOST_PORT"; do
         _line=$(lsof -iTCP:"$_p" -sTCP:LISTEN -P -n 2>/dev/null | tail -n +2)
         if [ -n "$_line" ]; then
             echo "$_line"
@@ -464,28 +588,8 @@ start_all() {
 
     ok "Preflight checks passed"
 
-    # ── Kill stale ──────────────────────────────────────────────────────
-    kill_stale
-
-    # ── Clean UAT state ─────────────────────────────────────────────────
-    #
-    # If a prior run used --as-user, the agent left files owned by that
-    # user (typically _yuzu) under $UAT_DIR. The current user can't `rm`
-    # them. Try plain rm first; on failure, fall back to `sudo -n rm -rf`
-    # which works if the operator's sudo cache is still warm. If both
-    # fail, fall through to mkdir -p which will succeed for the new
-    # subdirectories — the leftover files are mostly harmless (they get
-    # overwritten by this run), and the operator gets a hint to rerun
-    # `sudo -v` if they care about a fully fresh state.
-    if ! rm -rf "$UAT_DIR" 2>/dev/null; then
-        if sudo -n rm -rf "$UAT_DIR" 2>/dev/null; then
-            ok "Cleared $UAT_DIR (had files owned by another user; sudo cleanup)"
-        else
-            warn "Could not fully clear $UAT_DIR (some files owned by another user)"
-            warn "  manual fix: sudo rm -rf $UAT_DIR"
-        fi
-    fi
-    mkdir -p "$UAT_DIR/agent-data"
+    # ── Stop our own stale stack, refuse on foreign holders, wipe state ──
+    prepare_fresh_run || exit 1
 
     # ── Generate credentials ────────────────────────────────────────────
     generate_config
@@ -537,6 +641,7 @@ start_all() {
         --config "$UAT_DIR/yuzu-server.cfg" \
         > "$UAT_DIR/server.log" 2>&1 &
     local server_pid=$!
+    record_pid server "$server_pid" "$BUILDDIR/server/core/yuzu-server"
 
     if ! wait_for_port 8080 "yuzu-server" 30; then
         fail "Server failed to start. Check $UAT_DIR/server.log"
@@ -576,10 +681,14 @@ start_all() {
     if [ -x "$gw_rel/bin/yuzu_gw" ]; then
         # #659: the release refuses to boot with the default Erlang cookie.
         # Single-gateway UAT doesn't cluster, so any unique value works.
-        (YUZU_GW_COOKIE="${YUZU_GW_COOKIE:-$(openssl rand -hex 32)}" \
+        # No subshell: $! must be the launcher's PID. relx's `foreground`
+        # execs erlexec -> beam, so it becomes beam, whose command line
+        # carries the physical (pwd -P) release dir recorded as identity.
+        YUZU_GW_COOKIE="${YUZU_GW_COOKIE:-$(openssl rand -hex 32)}" \
             "$gw_rel/bin/yuzu_gw" foreground \
-            > "$UAT_DIR/gateway.log" 2>&1) &
+            > "$UAT_DIR/gateway.log" 2>&1 &
         local gw_pid=$!
+        record_pid gateway "$gw_pid" "$(cd "$gw_rel" && pwd -P)"
     else
         fail "Gateway release not found at $gw_rel"
         fail "Run: cd gateway && rebar3 as prod release"
@@ -662,6 +771,7 @@ start_all() {
             > "$UAT_DIR/agent.log" 2>&1 &
     fi
     local agent_pid=$!
+    record_pid agent "$agent_pid" "$BUILDDIR/agents/core/yuzu-agent"
 
     # Wait for registration. Authoritative signal is the server's
     # yuzu_fleet_agents_healthy gauge — when it crosses 1 the server has
@@ -888,6 +998,9 @@ for r in d.get('responses',[]):
     return ${UAT_TEST_RESULT:-0}
 }
 
+# Sourced (tests/shell) → definitions only; do not parse args or act.
+[[ "${BASH_SOURCE[0]}" == "$0" ]] || return 0
+
 # ── Main ────────────────────────────────────────────────────────────────
 
 # Parse optional flags BEFORE the action verb. Supported flags:
@@ -910,7 +1023,7 @@ Options:
 
 Actions:
   start                Bring up server + gateway + agent (default)
-  stop                 Kill all Yuzu processes
+  stop                 Stop the processes this script started (PID records)
   status               Show running processes + listening ports
 
 Examples:
@@ -930,7 +1043,7 @@ done
 
 case "${ACTION:-start}" in
     start)  start_all ;;
-    stop)   kill_stale; echo "UAT stack stopped." ;;
+    stop)   kill_stale || exit 1; echo "UAT stack stopped." ;;
     status) show_status ;;
     *)      echo "Usage: $0 [options] {start|stop|status}"; exit 1 ;;
 esac

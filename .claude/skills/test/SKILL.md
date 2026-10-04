@@ -357,6 +357,8 @@ bash scripts/test/test-db-write.sh gate \
 
 **`start-UAT.sh` correctly returns non-zero on any connectivity test failure** (this is the post-PR1 behavior — earlier versions exited 0 unconditionally, see CHANGELOG `[Unreleased]`). The Phase 4 gate's PASS/FAIL accurately reflects whether the 6 inline connectivity tests passed against the fresh stack. The Phase 5 Synthetic UAT gate runs again standalone with sub-step timing capture into the test-runs DB — both gates are intentional, not a duplicate.
 
+A Phase 4 FAIL whose `fresh-stack.log` says `ports still held` or `survived SIGKILL` means a foreign process holds a UAT port, or a recorded process could not be stopped. It is not a stack defect, and `start-UAT.sh` will not kill it (it only signals PIDs it recorded); the log names the holder.
+
 ## Phase 5 — Test Gates (parallel)
 
 Run all gates concurrently via `&` + `wait`. Each is a self-contained bash invocation that captures its own log to `$LOG_DIR/<gate>.log`. Don't try to collect their stdout — read the log paths in the failure summary instead.
