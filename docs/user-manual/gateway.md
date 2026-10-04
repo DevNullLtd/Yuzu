@@ -461,10 +461,15 @@ message BatchHeartbeatResponse {
 answering server replica does not hold in memory (at most 4096; empty and
 over-length ids are never listed), and `unknown_session_ids_truncated` is set
 when more than that were unknown. A server that predates these fields and a
-server with nothing unknown look the same on the wire, by design. **The gateway
-does not read either field yet** (only the server side exists today), so
-today they have no effect on gateway behaviour; the gateway-side replay that
-will consume them is tracked in #1197.
+server with nothing unknown look the same on the wire, by design. The gateway
+reads both fields on every successful `BatchHeartbeat` response: it keeps the
+ids that are non-empty binaries of at most 64 bytes, de-duplicates them, passes
+at most 4096 of them to the upstream client, and replays exactly the sessions it
+still holds through the registration-replay drip (see
+[What happens when the server restarts](#what-happens-when-the-server-restarts)).
+A truncated list is counted and logged, and the omitted sessions may be reported
+again by later heartbeats. An empty list, or a response without the fields (an
+older server), changes nothing.
 
 ### StreamStatusNotification Message
 
@@ -551,6 +556,20 @@ The gateway is configured via `gateway/config/sys.config`. Key settings:
     {cluster_max_lifetime_addrs, 1024}
 ]}
 ```
+
+**Registration replay tuning** (application env keys read by the upstream
+client at start; set them in the `yuzu_gw` section of `sys.config`. No
+`YUZU_GW_*` environment variable maps to any of them):
+
+| Key | Default | Valid range | Meaning |
+|---|---|---|---|
+| `registration_replay_spacing_ms` | 20 | not range-checked | Gap between two replay `ProxyRegister` calls in the replay drip |
+| `registration_replay_session_guard_ms` | 10000 | 0 to 3600000 | A session that was just replayed is not queued again by a heartbeat verdict until this many ms have passed |
+| `registration_replay_queue_max` | 10000 | 1 to 1000000 | Most agents the replay queue holds; there is one pending entry per agent, and an id past the cap is counted in `yuzu_gw_heartbeat_verdict_dropped_total{reason="queue_full"}` |
+
+An invalid value for either of the last two logs a warning that names the key
+and falls back to the default. See
+[What happens when the server restarts](#what-happens-when-the-server-restarts).
 
 **`YUZU_GW_ADVERTISE_ADDR`** (env var only, no `sys.config` key — consumed by
 `deploy/docker/gateway-entrypoint.sh` before the BEAM starts, not by
@@ -756,35 +775,156 @@ yuzu-server --gateway-upstream "0.0.0.0:50055"
 > QUIC transport migration (#376). Until then, SIEM/audit consumers correlating
 > `source_ip` with network logs on this path will see the gateway's address.
 
-> **Known limitation - server-only restart (#1197).** After the server restarts
-> while a gateway stays connected, `/health` `agents.online` can stay 0. The
-> server keeps its gateway sessions in memory, and no registration replay was
-> observed in this scenario (the replay drip documented under
-> [Prometheus Metrics](#prometheus-metrics) runs after an upstream reconnect,
-> which a server-only restart did not trigger in the observed runs). Signals at
-> the default log level: the server WARN `GatewayRouteStore renew_leases guard
-> rejected the write (outcome=unknown_session ...)`, logged for each heartbeat
-> batch that carries such a session (about every 30 s per agent on the rig;
-> expect more log volume on a larger fleet), the WARN `ProxyInventory: unknown
-> session` when an inventory report arrives, and
-> `yuzu_server_gateway_route_desync_total{op="renew_leases",outcome="unknown_session"}`
-> rising while `/health` `agents.online` stays at 0. With `--log-level debug`
-> the server also logs `BatchHeartbeat: unknown session` and `0/1 acked`.
-> Observed on one local development rig after a SIGKILL of the server with an
-> immediate restart (about 5 to 13 s of downtime across the four samples), with
-> one agent; graceful shutdown, longer downtime and multiple agents or replicas
-> were not tested. A command to the agent was still delivered while its route
-> lease was unexpired (the lease runs 90 s from the last heartbeat the previous
-> server ingested, so the window after the restart is 90 s minus that
-> heartbeat's age at the kill minus the downtime) and was refused (503)
-> afterwards; if the previous server had ingested no heartbeat there was no
-> such window; the server did not relearn the session in the observed windows
-> (to about 125 s). A full restart of the server, the gateway and the agent
-> restored it (the one agent tested; for a fleet this would mean every agent
-> behind that gateway, which was not tested); that is the only recovery
-> observed and is NOT a recommended procedure (restarting only the gateway, or
-> only the agent, was not tested). The gateway-side fix is tracked in #1197;
-> this note will be revised when it ships.
+### What happens when the server restarts
+
+This section covers a server process restart while a gateway stays up and its
+agents stay connected to it. The agents do not notice. The server keeps its
+gateway sessions in memory, so a restarted server does not know them, and it
+says so in every `BatchHeartbeatResponse` (see
+[BatchHeartbeat Message](#batchheartbeat-message)). A gateway that reads that
+answer re-registers the listed agents upstream without operator action.
+Restart the gateway to deploy this behaviour; the wire format is unchanged, so
+an old gateway with a new server, or a new gateway with an old server, still
+works (the old pairing simply keeps the behaviour described under "Without the
+reconcile" below).
+
+**What you should see** (new gateway and new server, one core replica):
+
+| Where | Level | Line | Meaning |
+|---|---|---|---|
+| gateway | INFO | `Registration replay: heartbeat verdict named N session(s); queued Q, not local L, already queued A, within guard G, queue full F` | One verdict was handled. Logged at INFO when Q is at least 1, at DEBUG otherwise. It carries counts only, no session ids. |
+| gateway | DEBUG | `Registration replay: re-proxied <agent> (adopted session <id>)` | One agent was re-proxied by the replay drip, one line per agent. |
+| server | INFO | `[gateway] ProxyRegister succeeded: agent=..., session=<the pre-restart session id>` | The server accepted the replay and relearned the session under the id the agent already holds. |
+| server | DEBUG | `[gateway] ProxyRegister: adopted presented session ... (store-confirmed=true)` | The presented session was adopted; `store-confirmed=true` when the routing directory confirmed it. |
+
+The server's `renew_leases ... unknown_session` warnings stop once the agent
+is known again. The bound is one agent heartbeat interval (30 s by default),
+plus one gateway flush (1 s by default, `heartbeat_batch_interval_ms`), plus the
+agent's position in the replay drip (see the table below). The gateway-side
+counters move as follows: `yuzu_gw_registration_replay_triggered_total{trigger="heartbeat"}`
+rises by one each time a verdict queued at least one agent,
+`yuzu_gw_registration_replay_total` rises by one per agent sent through the
+drip, and `yuzu_gw_registration_replay_queue_depth` rises, then returns to 0.
+
+**A sustained `unknown_session` rate means the reconcile is not converging.**
+If `yuzu_server_gateway_route_desync_total{op="renew_leases",outcome="unknown_session"}`
+keeps rising well after the restart, with both the gateway and the server
+upgraded, read the three new gateway counters:
+
+- `yuzu_gw_heartbeat_verdict_dropped_total{reason}`: `not_local` means the
+  server named sessions this node does not hold (they are never replayed),
+  `circuit_open` means the upstream circuit breaker
+  was open when the verdict arrived (the sessions are listed again by later
+  heartbeats), `queue_full` means the replay queue is at its cap, `malformed`
+  means the id was not a usable session id.
+- `yuzu_gw_heartbeat_unknown_truncated_total`: the server listed more than
+  4096 unknown sessions in one response. Sessions beyond the cap may be
+  reported by later heartbeats.
+- `yuzu_gw_registration_replay_triggered_total{trigger="heartbeat"}`: rises by
+  one each time a verdict queued at least one agent. If this and the two
+  counters above all stay at 0 while `unknown_session` rises, no verdict is
+  reaching the replay (an older gateway, or a response without the fields).
+
+A replay the server answers with `accepted=false` is handled separately. The
+gateway logs `Registration replay: <agent> was not accepted by the server (<reason>); disconnecting so the agent follows its own registration path`
+(the reason is the server's text, cut to 128 bytes, and no session id is
+logged), disconnects that agent's process, and does not re-announce the
+session. The agent then registers directly and follows its own outcome. The
+server counts an enrollment denial in `yuzu_register_denied_total{source="gateway_proxy"}`
+and logs the refusal in its own log.
+
+**What the reconcile promises, on one core replica.** Every session the server
+reports unknown, and that the gateway still holds live, is re-proxied through
+the existing replay drip at most once per guard window
+(`registration_replay_session_guard_ms`, 10 s by default), with no operator
+action. A listed agent is known to the server again (heartbeats acknowledged,
+lease renewed, counted in `agents.online`) within one heartbeat interval plus
+one flush plus its drip position times (ProxyRegister RPC time plus the
+spacing). The change adds no new unbounded state: one pending entry per agent,
+a queue cap (`registration_replay_queue_max`, 10000 by default), and at most
+4096 session ids of at most 64 bytes per flush. The circuit breaker policy is
+unchanged.
+
+**What it does not promise.**
+
+- Completion inside a route lease. The route lease runs 90 s from the last
+  heartbeat the previous server ingested. Agents whose turn in the drip comes
+  after the remaining lease has run out get `503 no agent connected` for
+  commands until their turn.
+- Dispatch reachability after the session is adopted. Adopting restores the
+  server's knowledge of the session (heartbeats acknowledged, lease renewed,
+  `agents.online`). Dispatch placement converges when the agent's re-sent
+  CONNECTED notification is delivered. A rise in
+  `yuzu_gw_upstream_notify_dropped_total` during recovery means some agents
+  stay acknowledged but unreachable for commands until their next reconnect.
+  This is a known follow-up and is not fixed here.
+- Correctness on several core replicas (see below).
+- Any order beyond first-in, first-out in the order the server listed the
+  sessions. The gateway has no lease data to prioritise by.
+
+**Load and convergence bounds.** The drip sends one ProxyRegister at a time.
+The period per agent is the ProxyRegister RPC time plus the spacing
+(`registration_replay_spacing_ms`, 20 ms by default) plus scheduling. The
+figures below are arithmetic on those constants, not measurements: the
+largest real run was 27 agents, and the fleet-scale measurement is tracked in
+#5313.
+
+| ProxyRegister RPC time | Drip rate | 1,000 agents | 10,000 agents |
+|---|---|---|---|
+| 5 ms | 40 per second | 25 s | 250 s |
+| 20 ms | 25 per second | 40 s | 400 s |
+| 100 ms | 8.3 per second | 120 s | 1200 s |
+
+The drip also waits while 10 stream-status notifications are in flight, so
+these rates are ceilings. The first verdict lists the agents that heartbeated
+in the first flush window, so synchronized heartbeats list more agents at
+once. Spacing is the gateway's only lever; the RPC time is the server's. A
+drain longer than about 300 s meets the server's first lease reap tick
+(#4627).
+
+**Several core replicas.** The verdict and replay reconcile is correct and
+bounded on one core replica. On several replicas it converges in one round only
+if a gateway's `BatchHeartbeat`, replay `ProxyRegister` and re-announced
+`NotifyStreamStatus` reach the same replica during the reconcile. The shipped
+gateway does this per connection (one grpcbox channel, one endpoint, one
+HTTP/2 connection) through a layer-4 VIP. A multi-endpoint node list (grpcbox
+round-robins per RPC) or a layer-7 per-RPC balancer breaks it. Convergence is
+then probabilistic, not bounded, and the per-session guard bounds the replay
+rate but not the number of rounds. No multi-replica run exists; this is
+inferred from the code. The durable cross-replica session lookup (WS-5,
+#4246 item 3) is the fix, and until it lands the safe-to-scale gate forbids a
+second replica (see [ADR-2002](../adr/2002-high-availability-architecture.md),
+section 7c, update 2026-10-04).
+
+**Agent dependency.** The ordinary restart path above does not need the agent
+to do anything. When the gateway does disconnect an agent process (an
+`accepted=false` replay answer, or a session the server reports as superseded),
+the agent has to register again by itself. In the
+[connection-binding test record](../security-reviews/gateway-heartbeat-connection-binding-2026-10-03.md),
+released agents v0.13.0 and v0.14.0-rc6 with default settings did not
+re-register after a `NOT_FOUND` heartbeat rejection, while the same agents run
+with `--no-auto-update` did; the cause is inferred to be bug #2182, fixed by
+#5183, which is in no release yet. Agent v0.12.0 never recovered by itself in
+that test. Restarting the agent is the interim action for an agent that stays
+disconnected.
+
+**Without the reconcile** (a gateway that does not yet read the verdict, or a
+verdict that never reaches the replay) the symptom was the following. Observed
+on one local development rig with one agent, plaintext, one core replica, after
+a server-only restart (about 12.5 s and 300 s of downtime): `/health`
+`agents.online` stayed 0 for about 280 s and about 270 s, and the gateway
+never replayed (no log line, `yuzu_gw_registration_replay_total` 0). The
+server logged `BatchHeartbeat: unknown session` (at debug level) and the WARN
+`GatewayRouteStore renew_leases guard rejected the write (outcome=unknown_session ...)`
+every 30 s, and `ProxyInventory: unknown session` when an inventory report
+arrived. A command to the agent was delivered only while its route lease was
+unexpired and was refused with `503 no agent connected` afterwards. After a
+300 s outage there was no delivery window at all. TLS, several agents, several
+replicas and graceful shutdown were not tested.
+
+**Rollback.** A plain revert of the gateway. There is no schema, no migration
+and no new required configuration; the two tunables are optional application
+env keys with defaults, which a reverted build ignores.
 
 ---
 
@@ -972,8 +1112,11 @@ that are actually emitted are listed.
 | `yuzu_gw_agent_session_duration_ms` | histogram | Agent session duration in ms (label `node`) |
 | `yuzu_gw_upstream_rpc_duration_ms` | histogram | Upstream (gateway→server) RPC latency in ms (label `rpc_name`) |
 | `yuzu_gw_upstream_rpc_errors_total` | counter | Upstream RPC errors (labels `rpc_name`, `code`) |
-| `yuzu_gw_registration_replay_total` | counter | Agents re-proxied upstream by the registration-replay drip after an upstream reconnect |
-| `yuzu_gw_registration_replay_queue_depth` | gauge | Agents still queued for registration replay (0 = idle, label `node`). A persistently non-zero value indicates a replay that never drains — alert on it. |
+| `yuzu_gw_registration_replay_total` | counter | Replay `ProxyRegister` attempts made by the registration-replay drip, one per agent sent, any outcome. The drip runs after the upstream circuit breaker recovers, and when a heartbeat verdict lists sessions the gateway still holds |
+| `yuzu_gw_registration_replay_queue_depth` | gauge | Agents still queued for registration replay, whether queued by an upstream recovery or by a heartbeat verdict (0 = idle, label `node`). A persistently non-zero value indicates a replay that never drains; alert on it. |
+| `yuzu_gw_registration_replay_triggered_total` | counter | Registration replays started, by `trigger` (`breaker` = the upstream recovered and every agent this node holds is replayed, `heartbeat` = a heartbeat verdict listed sessions the server does not know and only those are replayed). Both series are created at 0 at start. |
+| `yuzu_gw_heartbeat_unknown_truncated_total` | counter | `BatchHeartbeat` responses whose list of unknown sessions the server truncated at 4096. Sessions beyond the cap may be reported by later heartbeats. |
+| `yuzu_gw_heartbeat_verdict_dropped_total` | counter | Session ids named by a heartbeat verdict that were not queued for replay (label `reason`, closed set: `malformed` = not a usable session id, `not_local` = this node does not hold the session, `circuit_open` = the upstream circuit breaker is open, `queue_full` = the replay queue is at its cap). Every reason is created at 0 at start. Ids already queued, or replayed within the session guard window, are not counted. |
 | `yuzu_gw_cluster_peers_resolved` | gauge | Peer addresses found by the cluster-formation redial loop's most recent tick (label `node`; HA WS-4 `#4555`). 0 is expected for a genuinely single-node deployment. |
 | `yuzu_gw_cluster_peers_connected` | gauge | Distribution-connected peer nodes as of the most recent redial tick (label `node`; `#4555`). Compare against `peers_resolved` — a sustained gap most often means a distribution-cookie mismatch across replicas. |
 | `yuzu_gw_cluster_connect_failures_total` | counter | Total `net_kernel:connect_node/1` failures from the redial loop (`#4555`). |
