@@ -8,7 +8,7 @@ Lane-3 predicate (`is_os_native`, cpe_normalize.hpp) routes them. This script ch
 against the real tree, that:
 
   1. every published surface equals the agreed vocabulary (EXPECTED_*);
-  2. every value an agent emits is in that vocabulary (emitted ⊆ published);
+  2. the values the agents emit are exactly that vocabulary (emitted == published);
   3. every non-Lane-1 ecosystem and Lane-3 kind is named in `is_os_native`, and `pkg`
      is NOT a kind-level trigger (it is routed by its ecosystem).
 
@@ -114,9 +114,9 @@ class VocabularyConsistency(unittest.TestCase):
         self.assertEqual(extract_table_row(text, "kind"), EXPECTED_KINDS)
         self.assertEqual(extract_table_row(text, "ecosystem"), EXPECTED_ECOSYSTEMS)
 
-    def test_emitted_subset_of_published(self):
-        self.assertLessEqual(self.emitted_kinds, EXPECTED_KINDS)
-        self.assertLessEqual(self.emitted_ecos, EXPECTED_ECOSYSTEMS)
+    def test_emitted_equals_published(self):
+        self.assertEqual(self.emitted_kinds, EXPECTED_KINDS)
+        self.assertEqual(self.emitted_ecos, EXPECTED_ECOSYSTEMS)
 
     def test_lane3_predicate_covers_vocabulary(self):
         hdr = read(CPE_HDR)
