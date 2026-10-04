@@ -27,7 +27,7 @@ tests acquire real resources, both RAII:
 
 | resource | owner | acquired | released | transfer | failure cleanup |
 |---|---|---|---|---|---|
-| mapped plugin libraries: `PluginHandle::load` of `installed_apps`, `pkg_inventory` and `windows_optional_features` from `MESON_BUILD_ROOT`, one load per table row (four in all) | the loop-local `std::optional<PluginHandle>` in the descriptor-pin case | each iteration of the pin loop | end of the iteration: `~PluginHandle` dlcloses | none | RAII; a failed `REQUIRE` unwinds the scope. `init` is never called, so no `shutdown` is owed |
+| mapped plugin libraries: `PluginHandle::load` of `installed_apps`, `pkg_inventory` and `windows_optional_features` from `MESON_BUILD_ROOT`, one load per table row (four in all) | the loop-local `std::expected<PluginHandle, LoadError>` in the descriptor-pin case | each iteration of the pin loop | end of the iteration: `~PluginHandle` dlcloses | none | RAII; a failed `REQUIRE` unwinds the scope. `init` is never called, so no `shutdown` is owed |
 | duplicate-name scratch directory holding two copied plugin binaries (`yuzu_test_dup_plugin_` prefix) and the dlopen handle `scan` returns for the winner | `yuzu::test::TempDir tmp`, declared before `result` (and `result.loaded`) | the case body | scope exit: `result` is destroyed first (dlclose), then `tmp` removes the directory | none | RAII on both, so a failed `REQUIRE` still removes the directory |
 
 No new process, socket or long-lived handle.
