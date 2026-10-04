@@ -163,6 +163,9 @@ estimate_is_upper_bound_of_encoded_size() ->
         %% 2 MiB snapshot, a long id, a maximal timestamp and many tags.
         #{session_id => LongId, sent_at => #{millis_epoch => 9223372036854775807},
           status_tags => ManyTags, fleet_snapshot_json => binary:copy(<<"s">>, 2 * ?MIB)},
+        %% No tags: the fixed overhead alone must be covered.
+        #{session_id => LongId, sent_at => #{millis_epoch => 9223372036854775807},
+          fleet_snapshot_json => binary:copy(<<"s">>, 2 * ?MIB)},
         #{session_id => <<"a">>, sent_at => #{millis_epoch => 1},
           status_tags => #{<<"k">> => <<"v">>}},
         #{session_id => <<"b">>},
