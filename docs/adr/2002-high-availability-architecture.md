@@ -1433,12 +1433,16 @@ one core replica a server-only restart now recovers through the replay described
   one rejected by the server with a non-transient status is dropped, so that none of them blocks newer
   heartbeats or stops a session's lease renewal; the same round added a flush of at most 8 chunks per
   cycle; transient failures still keep heartbeats buffered (probed against a fake server, not rig-run).
-  A per-connection cap on agent sessions (`max_sessions_per_connection`, default 8, refusals counted in
-  `yuzu_gw_session_limit_rejected_total`) keeps one connection from pushing other agents' snapshots out
-  of a full buffer (probed against a fake upstream, not rig-run). Consequences: the server's
+  A per-connection cap on agent sessions (`max_sessions_per_connection`, default 8, valid 1 to 1000, read
+  once when the registry starts; a refused `Register` or `Subscribe` is answered `UNAVAILABLE` and counted
+  in `yuzu_gw_session_limit_rejected_total`) keeps one connection from pushing other agents' snapshots out
+  of a full buffer (probed against a fake upstream, not rig-run). The early check that keeps a refused
+  `Register` off the server is not atomic with the pending-store step: two concurrent Registers can both
+  pass it, and the later one is then refused after it was proxied to the server (documented in the
+  registry module). Consequences: the server's
   `yuzu_heartbeats_received_total{via="gateway"}` under-counts while a backlog is coalesced, and an agent's
   topology snapshot can be one agent snapshot cycle older after an eviction. The server's 4 MiB receive
-  limit is unchanged and not raised. The post-change rig run (`990e57e48`, 1 to 30 agents, plaintext, debug builds) recovered where the old gateway did not; see the evidence record. Not tested and known limits: 100 or more agents and a backlog that reaches the default byte cap; the
+  limit is unchanged and not raised. The post-change rig run (`990e57e48`, 1 to 30 agents, plaintext, debug builds) recovered where the old gateway did not; see the evidence record. A third rig pass (G1 to G5, build `f3e9d52a4`) recovered the same way; the heartbeat screening that keeps a session's lease renewing, the router timeout clamp and the session cap are not in that build, and a pass on the final commit is pending. Not tested and known limits: 100 or more agents and a backlog that reaches the default byte cap; the
   agent's snapshot size is not bounded here (the agent proto comment says 5 to 20 KB, 200 to 800 KB was
   observed, the server accepts up to 2 MiB) and is a follow-up for the agent side; the server does not
   configure its maximum receive size explicitly, so the chunk size relies on the library default (INFERRED
@@ -1493,14 +1497,17 @@ one core replica a server-only restart now recovers through the replay described
   the process not running during a restart). The callers get `{error, upstream_unavailable}` or
   `{error, registry_unavailable}`; the exit reason is never logged or returned, and one warning per second
   per called process names only the class (`noproc`, `timeout` or `other`). The Register handler answers
-  `INTERNAL` for any `{error, _}` (as it does for `circuit_open`) and the agent retries on any non-OK status
+  `INTERNAL` for any `{error, _}` of the upstream call (as it does for `circuit_open`; a registration
+  refused by the per-connection session cap is `UNAVAILABLE`) and the agent retries on any non-OK status
   (read in `yuzu_gw_agent_service.erl` and `agents/core/src/agent.cpp`, not run). A failed registry call in
   the per-agent process's init used to exit with a reason that embedded the request, which the Subscribe
   handler logged (INFERRED from the code, not run); that init now stops with the fixed reason
   `registry_unavailable`. The application env key `upstream_call_timeout_ms` (default 30000) sets the call
   timeout of the first two sites. A logger primary filter, `yuzu_gw_crash_redact`, installed when the
-  application starts, covers the processes `yuzu_gw_upstream`, `yuzu_gw_agent` and `yuzu_gw_registry`, each
-  matched by its registered name or by having been started by that module's `init/1`: it rewrites the
+  application starts, covers the processes `yuzu_gw_upstream`, `yuzu_gw_agent`, `yuzu_gw_registry`,
+  `yuzu_gw_router` and `yuzu_gw_heartbeat_buffer` (the last two hold command parameters and fleet status
+  tags, not registration requests), each matched by its registered name or by having been started by that
+  module's `init/1`: it rewrites the
   `proc_lib` crash report (the mailbox and the process dictionary become counts, the exception keeps no
   argument lists), the `gen_server` terminate report (upstream client and registry), the `gen_statem`
   terminate report (per-agent process) and the supervisor reports that carry a reason. The filter and the
@@ -1510,8 +1517,8 @@ one core replica a server-only restart now recovers through the replay described
   installed there); a report shape the filter does not recognise; hot-loading the code into a running node
   (hot code upgrade is not a supported gateway deployment path: the appup in the repository is an old
   skeleton, no relup is built, and the runbook says to restart; INFERRED from a search of the repository);
-  and any other process that holds a registration request, since only these three processes were checked and
-  others (the gRPC handler processes) have not been audited.
+  and any other process that holds a registration request, since only the three processes that hold one
+  were checked and others (the gRPC handler processes) have not been audited.
   In those cases a crash report can still print the token, certificate or CSR of a request. Operator
   guidance (treat crash reports as sensitive; the `chars_limit` and `depth` logger options remain as defence
   in depth) and the shipped logger settings are in `docs/user-manual/gateway.md`, Known limits.
