@@ -1114,6 +1114,8 @@ private:
     /// fifo is always `[optional Disarm head] + [Arm claims...]` - "arm queued behind
     /// a disarm" is the real rearm-after-teardown shape, "disarm behind an arm" is
     /// unreachable. Asserted in debug; the code handles the general push regardless.
+    /// An Arm claim on a key whose keys_ entry exists is a terminal residue or an
+    /// in-flight drain's own head; a new attach on such a key joins instead of queuing.
     ///
     /// Index ownership: an Arm claim holds exactly one index_ (key, rule_id) mapping
     /// while `index_held` is set, added when it is queued (index_->add is the 0->1
@@ -2414,7 +2416,7 @@ private:
     std::atomic<bool> detach_fault_for_test_{false};  ///< see the setter
     std::atomic<std::uint64_t> tombstones_released_by_reaper_{0}; ///< #5322: runtime-only, incremented by reap_stranded_claims_locked
     std::atomic<std::uint64_t> orphan_disarms_started_{0};        ///< #5322: runtime-only, incremented by a later WP
-    std::atomic<std::uint64_t> dead_watchers_erased_on_lost_{0};  ///< #5322: runtime-only, incremented by a later WP
+    std::atomic<std::uint64_t> dead_watchers_erased_on_lost_{0};  ///< #5322: runtime-only, incremented by on_subscription_lost's post-condition guard
     std::uint32_t reaper_release_failed_passes_{0}; ///< #5322: registry_mu_-guarded; consecutive reaper passes whose release failed (rate-limited warn)
     std::atomic<int> index_remove_fault_for_test_{0}; ///< see the setters (>0 counted, <0 sticky, 0 off)
     std::atomic<std::uint64_t> detach_post_commit_failures_{0}; ///< r3 C4: contained drop_rule throw

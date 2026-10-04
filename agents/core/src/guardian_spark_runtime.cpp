@@ -1554,9 +1554,10 @@ void GuardianSparkRuntime::on_arm_complete(const std::string& key,
                                 fresh->spec = claim->spec; // the spec actually armed
                                 fresh->subscription = sub;
                                 if (!keys_.emplace(key, fresh).second) {
-                                    // A claimed key has no keys_ entry by construction
-                                    // (attach_rule queues behind a claim instead of
-                                    // writing keys_). Committing against a PerKey that is
+                                    // A fresh attach on a key with a keys_ entry joins instead
+                                    // of queuing, so this is reachable only through a
+                                    // hand-back redispatch of an already-committed head (a
+                                    // double fault). Committing against a PerKey that is
                                     // not the one in keys_ would leave `sub` untracked
                                     // forever (adversarial review C1); fail the claim
                                     // and let the compensating disarm reclaim `sub`.
@@ -2769,7 +2770,12 @@ GuardianSparkRuntime::attach_core(const std::string& key, std::string rule_id, S
                                                               // `gen` is this attach's own incarnation
                                                               // token - see erase_rule()'s doc comment.
         index_added = true;
-        if (key_claimed || (arm_edge && io_class)) {
+        // #5322: a key with a keys_ entry is a subscription rules_/keys_ already owns (a
+        // live watcher, an orphan with no rules, or a committed head whose drain has not
+        // yet published). ANY attach on it joins - never queues behind a residue or an
+        // unpublished head, where the refill would collide at the keys_.emplace.
+        const bool committed_live = keys_.contains(key);
+        if (!committed_live && (key_claimed || (arm_edge && io_class))) {
             // Claim path: mark and return to the caller below WITHOUT touching
             // keys_/rules_/pending_initial/lifecycle - all deferred to the completion
             // callback's commit, so a same-key racer never sees a half-built PerKey.
@@ -2819,7 +2825,7 @@ GuardianSparkRuntime::attach_core(const std::string& key, std::string rule_id, S
             } else {
                 to_dispatch = try_dispatch_head_locked(key); // it is the head
             }
-        } else if (arm_edge) {
+        } else if (!committed_live && arm_edge) {
             // Inline type (Interval/Startup/Disk): unchanged synchronous arm, still
             // under registry_mu_ - these are never a blocking OS watch.
             std::shared_ptr<PerKey> pk;
@@ -2855,10 +2861,11 @@ GuardianSparkRuntime::attach_core(const std::string& key, std::string rule_id, S
                                          attach_now, waker, outbox_waker, CommitPath::InlineArm);
             rollback.committed = true;
         } else {
-            // An existing, COMMITTED shared watcher for this key: reaching here with
-            // arm_edge==false and no claim entry means keys_ genuinely has it (a key
-            // with a claim entry took the branch above, so keys_.at cannot throw here).
-            // No backend call, but a throw below (map insert, or a throwing
+            // A committed watcher, whatever the claims fifo holds (committed_live): a
+            // live shared watcher, an orphan, or a committed head still unpublished.
+            // keys_.at cannot throw when committed_live. The one other way here is the
+            // #5323 ghost leak (no claims, no keys_, add() false), which throws
+            // out_of_range exactly as before. No backend call, but a throw below (map insert, or a throwing
             // waker/outbox_waker COPY) must still undo the index_->add - mirrors the
             // original unified rollback's armed_here=false shape (never disarms;
             // there is no new watcher to tear down, only this rule's own bookkeeping;
@@ -3371,6 +3378,15 @@ void GuardianSparkRuntime::on_subscription_lost(const std::string& key,
                     claims_.erase(eit);
                 dead_subscription_disarms_skipped_.fetch_add(1, std::memory_order_relaxed);
             }
+        }
+        // #5322 post-condition: keys_ never keeps the dead id. The detach loop erases it
+        // when it detaches the last rule on the key; a refcount-0 orphan has no rules, so
+        // the loop ran zero times and the entry would survive for the next attach to JOIN.
+        // Re-find: an erase inside the loop may have invalidated `kit`.
+        if (const auto dead = keys_.find(key);
+            dead != keys_.end() && dead->second->subscription == subscription_id) {
+            keys_.erase(dead);
+            dead_watchers_erased_on_lost_.fetch_add(1, std::memory_order_relaxed);
         }
         outbox_waker = outbox_enqueue_waker_;
     }

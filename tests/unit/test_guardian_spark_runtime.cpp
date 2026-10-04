@@ -12928,10 +12928,10 @@ TEST_CASE("#5322: a reaper refill whose push throws parks the exposed head inste
         [&] { return f.rig.status(f.receipt_b) == RT::ReceiptStatus::Committed; }, 10s));
 }
 
-// Pins the CE2 residual at dev's shape (WP2b rewrites it to the join). A clean follower
-// queued on a COMMITTED key behind a retained tombstone is refilled onto the committed
-// key and CommitThrews at the keys_.emplace collision.
-TEST_CASE("#5322: a clean follower queued on a committed key behind a tombstone fails at the collision",
+// An attach on a COMMITTED key joins its watcher whatever the fifo holds (INV-2). Here the
+// fifo holds a retained tombstone at the front; the attach used to queue behind it and be
+// refilled onto the committed key, where it CommitThrew at the keys_.emplace collision.
+TEST_CASE("#5322: an attach on a committed key behind a tombstone joins the watcher instead of queuing",
           "[spark][runtime][liveness]") {
     using namespace std::chrono_literals;
     using RT = GuardianSparkRuntime;
@@ -12940,28 +12940,30 @@ TEST_CASE("#5322: a clean follower queued on a committed key behind a tombstone 
     f.commit_head_leaving_tombstone();
     REQUIRE(f.b->arm_entries.load() == 1);
 
+    // A synchronous join returns an EMPTY receipt (which reads Failed by construction), so
+    // the outcome kind is the assertion, never the receipt.
     auto w = f.rt->attach_rule(RT::NonWaiting{}, "w", file_spec("/a"), file_exists_rule("w"), true);
     REQUIRE(w.has_value());
-    CHECK(w->kind == RT::ArmOutcomeKind::Accepted);
-    CHECK(f.rt->receipt_status(w->receipt) == RT::ReceiptStatus::Pending);
-    CHECK(f.rt->rule_count() == 1);
+    CHECK(w->kind == RT::ArmOutcomeKind::Armed);
+    CHECK(f.rt->rule_count() == 2);
+    CHECK(f.b->arms.load() == 1);
     CHECK(f.b->arm_entries.load() == 1);
-    CHECK(f.depth() == 2); // [t, w]
+    CHECK(f.depth() == 1); // the tombstone alone: w never queued
 
     f.rt->set_index_remove_fault_count_for_test(0);
-    (void)f.rt->expire_overdue_claims(); // pops t, refills w onto the committed key
-    REQUIRE(yuzu::test::spin_until([&] { return f.b->arm_entries.load() == 2; }, 10s));
-    REQUIRE(yuzu::test::spin_until(
-        [&] { return f.rt->receipt_status(w->receipt) == RT::ReceiptStatus::Failed; }, 10s));
-    REQUIRE(yuzu::test::spin_until([&] { return f.b->disarms.load() == 1; }, 10s));
-    CHECK(f.rt->rule_count() == 1);
+    (void)f.rt->expire_overdue_claims(); // pops t; nothing is refilled
+    CHECK(f.rt->retained_tombstones() == 0);
+    CHECK(f.depth() == 0);
     CHECK(f.rt->armed_key_count() == 1);
+    CHECK(f.rt->rule_count() == 2);
+    CHECK(f.b->arm_entries.load() == 1);
+    CHECK(f.b->disarms.load() == 0);
 }
 
-// Pins clause (1) of the committed-key invariant at dev's shape (WP2b rewrites it to the
-// join): the fault-2 gap leaves H committed in keys_ but unpublished, and a different rule
-// attaching there queues behind it.
-TEST_CASE("#5322: a clean follower attached in the commit-to-publish gap queues behind the committed head",
+// Pins clause (1) of the committed-key invariant: the fault-2 gap leaves H committed in
+// keys_ but unpublished, and a different rule attaching there joins the watcher instead of
+// queuing behind H (it used to be dispatched as a second backend arm after the publish).
+TEST_CASE("#5322: an attach in the commit-to-publish gap joins the committed watcher",
           "[spark][runtime][liveness]") {
     using namespace std::chrono_literals;
     using RT = GuardianSparkRuntime;
@@ -12988,21 +12990,181 @@ TEST_CASE("#5322: a clean follower attached in the commit-to-publish gap queues 
     REQUIRE(rt->rule_count() == 1);
     REQUIRE(rt->claim_queue_depth_for_test(key) == 1); // H: committed, unpublished
 
+    const auto failures_before = rt->claim_drain_failures();
+    // A synchronous join returns an EMPTY receipt (Failed by construction): assert the kind.
     auto w = rt->attach_rule(RT::NonWaiting{}, "w", file_spec("/a"), file_exists_rule("w"), true);
     REQUIRE(w.has_value());
-    CHECK(w->kind == RT::ArmOutcomeKind::Accepted);
-    CHECK(rt->receipt_status(w->receipt) == RT::ReceiptStatus::Pending);
-    CHECK(rt->claim_queue_depth_for_test(key) == 2);
+    CHECK(w->kind == RT::ArmOutcomeKind::Armed);
+    CHECK(rt->rule_count() == 2);
+    CHECK(rt->claim_queue_depth_for_test(key) == 1); // H alone: w never queued
     CHECK(b->arms.load() == 1);
 
     park->release();
-    REQUIRE(yuzu::test::spin_until([&] { return b->arms.load() == 2; }, 10s));
-    REQUIRE(yuzu::test::spin_until(
-        [&] { return rt->receipt_status(w->receipt) == RT::ReceiptStatus::Failed; }, 10s));
-    REQUIRE(yuzu::test::spin_until([&] { return b->disarms.load() == 1; }, 10s));
     REQUIRE(yuzu::test::spin_until([&] { return rt->claim_queue_depth_for_test(key) == 0; }, 10s));
     CHECK(rt->receipt_status(h->receipt) == RT::ReceiptStatus::Committed);
-    CHECK(rt->claim_drain_failures() >= 1);
+    CHECK(rt->claim_drain_failures() == failures_before + 1); // the firewall count
+    CHECK(b->arms.load() == 1);                               // no second backend arm
+    CHECK(b->disarms.load() == 0);
     CHECK(rt->armed_key_count() == 1);
-    CHECK(rt->rule_count() == 1);
+    CHECK(rt->rule_count() == 2);
+}
+
+// A refcount-0 orphan (keys_[K] present, no rules on K, an empty claims entry) is joined by
+// the next attach: no second backend arm, the watcher survives the empty entry's erasure.
+TEST_CASE("#5322: an attach on an orphan watcher joins it instead of arming over it",
+          "[spark][runtime][liveness]") {
+    using namespace std::chrono_literals;
+    using RT = GuardianSparkRuntime;
+    TombRig5322 f;
+    f.attach("y");
+    REQUIRE(f.b->wait_entered_hang(10s));
+    f.attach("z");
+    f.rt->set_index_remove_fault_count_for_test(-1);
+    f.rt->detach_rule("z"); // z's claim: a retained tombstone behind y
+    REQUIRE(f.depth() == 2);
+    REQUIRE(f.rt->retained_tombstones() == 1);
+    f.commit_head_leaving_tombstone();
+
+    // y goes: z's ghost mapping is the key's only one, so keys_ is an orphan watcher
+    // (refcount 1). The seam clears and the redrive lane (NOT the heartbeat) pops the
+    // tombstone: the ->0 edge is discarded, the entry is left empty, nothing is disarmed.
+    f.rt->detach_rule("y");
+    REQUIRE(f.rt->armed_key_count() == 1);
+    REQUIRE(f.b->disarms.load() == 0);
+    f.rt->set_index_remove_fault_count_for_test(0);
+    (void)f.rt->redrive_parked_arms();
+    REQUIRE(f.rt->retained_tombstones() == 0);
+    REQUIRE(f.depth() == 0);
+    REQUIRE(f.rt->rule_count() == 0);
+    REQUIRE(f.rt->armed_key_count() == 1); // the orphan
+
+    auto w = f.rt->attach_rule(RT::NonWaiting{}, "w", file_spec("/a"), file_exists_rule("w"), true);
+    REQUIRE(w.has_value());
+    CHECK(w->kind == RT::ArmOutcomeKind::Armed);
+    CHECK(f.b->arms.load() == 1);
+    CHECK(f.rt->rule_count() == 1);
+    CHECK(f.rt->armed_key_count() == 1);
+
+    (void)f.rt->expire_overdue_claims(); // erases the empty entry; the watcher is KEPT
+    CHECK(f.rt->armed_key_count() == 1);
+    CHECK(f.rt->rule_count() == 1);
+    CHECK(f.b->arms.load() == 1);
+    CHECK(f.b->disarms.load() == 0);
+}
+
+// Lost never leaves keys_ holding the dead id. Three orders of the detach loop, then the
+// refcount-0 orphan where the loop runs zero times.
+TEST_CASE("#5322: Lost with the ghost detached first leaves no dead watcher and the key re-arms",
+          "[spark][runtime][liveness]") {
+    using namespace std::chrono_literals;
+    using RT = GuardianSparkRuntime;
+    TombRig5322 f;
+    // rules_for(K) is sorted: "a_ghost" detaches before "z_live".
+    f.attach("z_live");
+    REQUIRE(f.b->wait_entered_hang(10s));
+    f.attach("a_ghost");
+    f.rt->set_index_remove_fault_count_for_test(-1);
+    f.rt->detach_rule("a_ghost");
+    REQUIRE(f.depth() == 2);
+    REQUIRE(f.rt->retained_tombstones() == 1);
+    f.commit_head_leaving_tombstone(); // no park_every: the synchronous teardown needs none
+    const auto sub = f.b->armed_ids().at(0);
+    const auto skipped_before = f.rt->dead_subscription_disarms_skipped();
+
+    f.rt->on_event(SparkEvent{.key = f.key, .kind = SparkEventKind::Lost, .subscription_id = sub});
+    CHECK(f.rt->armed_key_count() == 0);
+    CHECK(f.rt->rule_count() == 0);
+    CHECK(f.rt->dead_watchers_erased_on_lost() == 0); // the detach loop erased keys_ itself
+    CHECK(f.rt->dead_subscription_disarms_skipped() == skipped_before + 1);
+    CHECK(f.b->disarms.load() == 0);
+    CHECK(f.depth() == 0);
+
+    auto w = f.rt->attach_rule(RT::NonWaiting{}, "w", file_spec("/a"), file_exists_rule("w"), true);
+    REQUIRE(w.has_value());
+    // No kind assertion: Accepted (claim in flight) or Armed (a free-pool claim that committed
+    // before the attach returned) are both a fresh arm; a JOIN of the dead watcher is told
+    // apart by the backend arm count below.
+    REQUIRE(yuzu::test::spin_until([&] { return f.b->arms.load() == 2; }, 10s));
+    REQUIRE(yuzu::test::spin_until([&] { return f.rt->armed_key_count() == 1; }, 10s));
+}
+
+TEST_CASE("#5322: Lost with the ghost detached last leaves no dead watcher and the key re-arms",
+          "[spark][runtime][liveness]") {
+    using namespace std::chrono_literals;
+    using RT = GuardianSparkRuntime;
+    TombRig5322 f;
+    // "z_ghost" detaches after "a_live". Never park_every here: the last-resort disarm is
+    // synchronous and the test must not depend on a parked redispatch.
+    f.attach("a_live");
+    REQUIRE(f.b->wait_entered_hang(10s));
+    f.attach("z_ghost");
+    f.rt->set_index_remove_fault_count_for_test(-1);
+    f.rt->detach_rule("z_ghost");
+    REQUIRE(f.depth() == 2);
+    REQUIRE(f.rt->retained_tombstones() == 1);
+    f.commit_head_leaving_tombstone();
+    const auto sub = f.b->armed_ids().at(0);
+    const auto residue_before = f.rt->detach_sweep_left_residue();
+    const auto claim_failures_before = f.rt->detach_claim_failures();
+
+    f.rt->on_event(SparkEvent{.key = f.key, .kind = SparkEventKind::Lost, .subscription_id = sub});
+    CHECK(f.rt->armed_key_count() == 0);
+    CHECK(f.rt->rule_count() == 0);
+    CHECK(f.rt->dead_watchers_erased_on_lost() == 0);
+    CHECK(f.rt->detach_sweep_left_residue() == residue_before + 1);
+    CHECK(f.rt->detach_claim_failures() == claim_failures_before + 1);
+    // The last-resort disarm ran synchronously on the dead id (a pre-existing inefficiency).
+    CHECK(f.b->disarms.load() == 1);
+    CHECK(f.depth() == 1); // t stays until the next pass
+
+    (void)f.rt->expire_overdue_claims(); // N-3: the ghost mapping is gone, so t releases
+    CHECK(f.depth() == 0);
+    CHECK(f.rt->retained_tombstones() == 0);
+
+    auto w = f.rt->attach_rule(RT::NonWaiting{}, "w", file_spec("/a"), file_exists_rule("w"), true);
+    REQUIRE(w.has_value());
+    // No kind assertion: Accepted (claim in flight) or Armed (a free-pool claim that committed
+    // before the attach returned) are both a fresh arm; a JOIN of the dead watcher is told
+    // apart by the backend arm count below.
+    REQUIRE(yuzu::test::spin_until([&] { return f.b->arms.load() == 2; }, 10s));
+    REQUIRE(yuzu::test::spin_until([&] { return f.rt->armed_key_count() == 1; }, 10s));
+}
+
+TEST_CASE("#5322: Lost on an orphan watcher with no rules erases the dead watcher",
+          "[spark][runtime][liveness]") {
+    using namespace std::chrono_literals;
+    using RT = GuardianSparkRuntime;
+    TombRig5322 f;
+    f.attach("y");
+    REQUIRE(f.b->wait_entered_hang(10s));
+    f.attach("z");
+    f.rt->set_index_remove_fault_count_for_test(-1);
+    f.rt->detach_rule("z");
+    REQUIRE(f.depth() == 2);
+    f.commit_head_leaving_tombstone();
+    f.rt->detach_rule("y");
+    f.rt->set_index_remove_fault_count_for_test(0);
+    (void)f.rt->redrive_parked_arms(); // refcount 0, keys_[K] present, an empty entry
+    REQUIRE(f.rt->retained_tombstones() == 0);
+    REQUIRE(f.rt->armed_key_count() == 1);
+    REQUIRE(f.rt->rule_count() == 0);
+    const auto sub = f.b->armed_ids().at(0);
+    const auto skipped_before = f.rt->dead_subscription_disarms_skipped();
+
+    f.rt->on_event(SparkEvent{.key = f.key, .kind = SparkEventKind::Lost, .subscription_id = sub});
+    CHECK(f.rt->armed_key_count() == 0);
+    CHECK(f.rt->dead_watchers_erased_on_lost() == 1);
+    CHECK(f.b->disarms.load() == 0); // the dead id is never disarmed
+    CHECK(f.rt->dead_subscription_disarms_skipped() == skipped_before);
+
+    // No teardown idiom comparing disarmed_ids() with armed_ids() here: the dead id is not
+    // disarmed. The next attach arms anew rather than joining the dead watcher.
+    auto w = f.rt->attach_rule(RT::NonWaiting{}, "w", file_spec("/a"), file_exists_rule("w"), true);
+    REQUIRE(w.has_value());
+    // No kind assertion: Accepted (claim in flight) or Armed (a free-pool claim that committed
+    // before the attach returned) are both a fresh arm; a JOIN of the dead watcher is told
+    // apart by the backend arm count below.
+    REQUIRE(yuzu::test::spin_until([&] { return f.b->arms.load() == 2; }, 10s));
+    REQUIRE(yuzu::test::spin_until([&] { return f.rt->armed_key_count() == 1; }, 10s));
+    CHECK(f.rt->rule_count() == 1);
 }
