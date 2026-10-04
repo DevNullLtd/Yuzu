@@ -2221,7 +2221,8 @@ public:
         metrics_.describe("yuzu_fleet_inventory_sync_skipping",
                           "Agents currently reporting heartbeats whose daily-sync source skipped "
                           "its latest collection cycle(s) (heartbeat tag "
-                          "yuzu.sync.<source>.skip_streak > 0), by source; correlate with "
+                          "yuzu.sync.<source>.skip_streak > 0; agents that do not emit it are "
+                          "not counted), by source; correlate with "
                           "yuzu_inventory_stale_agents, never subtract (different populations, "
                           "see metrics.md)",
                           "gauge");

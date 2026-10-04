@@ -661,9 +661,10 @@ ingest is failing. Four further series sharpen the picture:
 - `yuzu_fleet_inventory_sync_skipping{source}` (gauge) — agents currently
   heartbeating whose `source` skipped its latest collection cycle(s), from the agent
   heartbeat tag `yuzu.sync.<source>.skip_streak` (today only `source="installed_software"`,
-  written by agents that include the skip-visibility change, #5327). The cause is the device's
-  `yuzu.sync.<source>.last_skip` tag and the agent's `sync: … — skipping this cycle`
-  warning. Published every sweep, 0 included. The gauge only counts agents that emit the
+  written by agents that include the skip-visibility change, #5327). The cause is in the agent's own log (the `sync: … — skipping this cycle`
+  warning, or `sync: installed_apps plugin not loaded`); the agent also publishes it as the
+  `yuzu.sync.<source>.last_skip` heartbeat tag, which no server page or API returns yet.
+  Published every sweep, 0 included. The gauge only counts agents that emit the
   skip-streak heartbeat tag: an agent that does not emit it (older agents, during a
   rollout, or in a mixed-version fleet) contributes zero even when its collector is
   skipping, so a zero gauge does not establish that all collectors are healthy.
@@ -735,8 +736,8 @@ you have observed your fleet's normal stale-count baseline and set the threshold
 ~5–10% of your expected active fleet; correlate with `yuzu_fleet_agents_healthy` to
 separate "agents offline" from "sync source broken / disabled". Also
 correlate with `yuzu_fleet_inventory_sync_skipping{source="installed_software"}`: a
-host counted there is online but its collector is skipping (reason in its `last_skip`
-tag). The two gauges count different populations (stored-receipt age over 48 h in
+host counted there is online but its collector is skipping (the reason is in that agent's
+log, and in its `last_skip` heartbeat tag). The two gauges count different populations (stored-receipt age over 48 h in
 Postgres vs live heartbeats, which include hosts skipping for less than 48 h and
 hosts that have never reported), so read them side by side and never subtract one
 from the other. Agents that do not emit the skip tag (older agents, or during a

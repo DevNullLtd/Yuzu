@@ -2292,8 +2292,16 @@ TEST_CASE("REAL AgentHealthStore: yuzu_fleet_inventory_sync_skipping counts vali
     beat_tags(store, "f", {{k, "-1"}});
     beat_tags(store, "g", {{k, "1234567890123456789"}}); // > 18 chars: over-long, rejected
     beat_tags(store, "h", {{k, ""}});
+    beat_tags(store, "j", {{k, "1x"}}); // trailing garbage: the whole value must be digits
+    beat_tags(store, "l", {{k, " 5"}}); // leading space: rejected
     store.recompute_metrics(metrics, std::chrono::seconds{300});
     CHECK(series_val(metrics.serialize(), gauge) == 3.0);
+
+    // Recovery: agent "a" heartbeats again without the tag. upsert replaces its tag map, so the
+    // count drops (a merge-instead-of-replace regression would leave it at 3).
+    beat_tags(store, "a", {});
+    store.recompute_metrics(metrics, std::chrono::seconds{300});
+    CHECK(series_val(metrics.serialize(), gauge) == 2.0);
 
     // Every snapshot pruned (0 s window): still PUBLISHED, at 0 - never absent (a
     // server-owned count over the reporting population, the deliberate exception to
