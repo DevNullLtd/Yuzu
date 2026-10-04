@@ -222,7 +222,7 @@ endif
 agent_test_openssl_dep = dependency('openssl', required: true, include_type: 'system')
 
 # Test fixtures deliberately partial-aggregate-init wide inventory structs
-# (SwEntry is 12 fields, SoftwareEntry 14 stored members (16 wire slots); a 4-field
+# (SwEntry and SoftwareEntry are 14 members each (16 wire slots); a 4-field
 # init IS the contract — "the rest stays empty"). -Wextra's
 # missing-field-initializers would flag every such fixture; suppress it for
 # the TEST targets only — production code stays fully warned.
@@ -433,6 +433,8 @@ agent_test_exe = executable(
     'unit/test_discovery_scan_plan.cpp',      # Wave 2 WP-C: pure sweep bounds + honest-degrade decisions
     'unit/test_network_config_parsers.cpp',   # PKG-NC: pure /proc/net/arp, dns_cache line filters,
                                                 # rtnetlink + PF_ROUTE default-route binary decoders
+    'unit/test_network_config_routes.cpp',    # Wave 11 PR11.2-a: `routes` row format + rtnetlink/PF_ROUTE
+                                                # full-table decoders (real-capture fixtures)
     'unit/test_network_config_local_dispatcher.cpp', # PKG-NC: real network_config.dylib/.so driven
                                                 # end to end via LocalDispatcher (POSIX-only; a no-op
                                                 # TU on Windows via the file's own #ifndef _WIN32 guard)
@@ -530,9 +532,10 @@ agent_test_exe = executable(
     'unit/test_execution_artifacts_win_local.cpp',  # Wave 7b PR7b.1: Windows leg shape assertions, unguarded TU
     'unit/test_execution_artifacts_scratch_sweep.cpp',  # #4390: portable scratch-dir selection policy (every OS) + Windows handle-relative sweep, init()/dispatch e2e
     'unit/test_execution_artifacts_win_internals.cpp',  # #4392: TU-inclusion seam over execution_artifacts_win.cpp (Windows-only body, empty TU elsewhere)
-    'unit/test_privacy_permissions_parsers.cpp',          # Wave 8 PR8.5: pure state/category/row tests, no OS call (Linux + macOS leg; Windows follows in its own PR's test file)
+    'unit/test_privacy_permissions_parsers.cpp',          # Wave 8 PR8.5: pure state/category/row tests, no OS call (all three legs' OS-free parsers)
     'unit/test_privacy_permissions_local_dispatcher.cpp', # Wave 8 PR8.5: real plugin via LocalDispatcher, unguarded on every OS
     'unit/test_privacy_permissions_macos_internals.cpp',  # TU-inclusion seam over privacy_permissions_macos.cpp, Apple-only body, unguarded TU
+    'unit/test_privacy_permissions_win_internals.cpp',    # TU-inclusion seam over privacy_permissions_win.cpp (Windows-only body, empty TU elsewhere)
     'unit/test_posix_dir_walk.cpp',     # PR #4154 round-8 remediation: shared capped
                                         # directory-walk primitive (agents/shared/posix_dir_walk.hpp)
     'unit/test_wire_utf8.cpp',          # shared strict-UTF-8 scrubber (agents/shared/wire_utf8.hpp), portable
@@ -653,6 +656,11 @@ agent_test_exe = executable(
              # CAPTURE tree manifest via this same define.
              '-DYUZU_TEST_FIXTURE_DIR="' +
              (meson.project_source_root() / 'tests' / 'unit' / 'fixtures').replace('\\', '/') +
+             '"',
+             # test_inventory_sync.cpp reads the plugins' REAL CAPTURE samples
+             # (agents/plugins/*/docs/samples/*.txt) at run time via this define.
+             '-DYUZU_PLUGIN_SRC_DIR="' +
+             (meson.project_source_root() / 'agents' / 'plugins').replace('\\', '/') +
              '"'] +
             # /bigobj: test_spark_mechanism.cpp (15k lines) and test_guardian_spark_runtime.cpp
             # hit MSVC's hard C1128 limit (65,279 sections per object) in the nightly
@@ -870,8 +878,7 @@ endif
 # without the suffix a carved tag pulls in cases the old single entry never ran.
 # Linux, 2026-10-01: the one `[tsan-heavy]` case (test_guardian_spark_runtime.cpp
 # ~2721, tagged [runtime][liveness], both carved here) would run twice, here and in
-# 'agent tsan-heavy checkpoints'; and the one hidden `[.]` case (same file, ~7194,
-# tagged [runtime][liveness]) would run although it is hidden. On Windows the
+# 'agent tsan-heavy checkpoints'. On Windows the
 # `[.][flaky-4086][guardian][guard]...` case (test_guard_file.cpp ~1110, under
 # #ifdef _WIN32) carries [guard], which shard A carves, so there the suffix is what
 # keeps it out; that Windows leak was reasoned from the tags, NOT observed. The
@@ -1295,6 +1302,7 @@ if build_server
       'unit/server/test_tag_routes.cpp', # #2542 PR-11: the 4-route Tags API, extracted onto the HttpRouteSink seam
       'unit/server/test_scope_engine.cpp',
       'unit/server/test_web_utils.cpp',
+      'unit/server/test_secret_file.cpp', # #5272 --postgres-dsn-file / --oidc-client-secret-file
       'unit/server/test_mcp_body_cap.cpp',
       'unit/server/test_dispatch_target_shape.cpp',
       'unit/server/test_sensitive_instruction_params.cpp',
@@ -2616,6 +2624,16 @@ test('qa-stack gateway crash signatures',
   timeout: 30,
 )
 
+# Release artifact gate (#5242): runs scripts/check-release-artifacts.sh
+# against a synthetic complete artifacts directory, then with each expected
+# SBOM removed, which must fail. Needs a POSIX bash; skips on Windows.
+test('release artifact gate',
+  _python3_test,
+  args: [files('test_check_release_artifacts.py')],
+  suite: 'docs',
+  timeout: 60,
+)
+
 # Windows agent installer trust-anchor lockdown (#5196): the .iss is compiled
 # only by release.yml, so this lints its source text -- no /T on the icacls
 # grant, a Constrained-Language-safe exact SDDL check, the user manual's copy of
@@ -2628,6 +2646,14 @@ test('agent installer trust-anchor ACL lint',
 )
 
 # ── Repo hygiene tests ─────────────────────────────────────────────────────
+# Changelog promote --append (#5221): folds post-promotion hotfix fragments
+# into an already-promoted release section. Stdlib only.
+test('changelog promote append',
+  _python3_test,
+  args: [files('test_assemble_changelog_append.py')],
+  suite: 'docs',
+  timeout: 60,
+)
 test('changelog order',
   _python3_test,
   args: [files('test_changelog_order.py')],
@@ -2645,6 +2671,15 @@ test('capability catalogue completeness',
   timeout: 30,
 )
 
+# Wave 11 PR11.2-a: the network_config `routes` instruction definition exists and matches the
+# row the plugin emits (id, dispatch pair, approval mode, platforms, ordered columns). Hermetic.
+test('network_config routes definition',
+  _python3_test,
+  args: [files('test_network_config_routes_definition.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
 # #1398 data-gate: every capability-catalogue row's authored ExecuteGate
 # matches the strictest approval.mode any shipped InstructionDefinition
 # declares for that plugin.action pair, and a content-declared pair with no
@@ -2655,6 +2690,17 @@ test('capability gate consistency',
   args: [files('test_capability_gate_consistency.py')],
   suite: 'docs',
   timeout: 30,
+)
+
+# server/core/scripts/embed_content.py must not rewrite an unchanged
+# bundled_content.cpp: the custom_target is build_always_stale, so a rewrite
+# would recompile and relink the server on every ninja run. Runs the real
+# generator against content/ into a temp dir; ~8 s, hence the wider timeout.
+test('embed_content idempotent',
+  _python3_test,
+  args: [files('test_embed_content_idempotent.py')],
+  suite: 'docs',
+  timeout: 60,
 )
 
 # The /test --instructions gate broadcasts every default-risk definition; the server refuses a
@@ -2775,6 +2821,17 @@ test('prometheus harness selftest',
   timeout: 30,
 )
 
+# #4800: pins scripts/test_gateway.py's zero-executed guard, the ct --dir that
+# points at apps/yuzu_gw/test/ct, and each gateway suite's wrapper deadline
+# sitting below its meson timeout. Hermetic (parses sources, runs no
+# rebar3), so it runs on every leg, including ones without Erlang.
+test('gateway wrapper guard selftest',
+  _python3_test,
+  args: [files('test_gateway_test_summary.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
 # Audit-retention alert coverage manifest gate (#2854 rung B). Same
 # SKIP-vs-FAIL contract as the entry above -- no CI leg here sets
 # YUZU_TEST_ENABLE_PROMTOOL_DOCKER and none carries a 3.x native promtool, so
@@ -2867,6 +2924,16 @@ if _bash_test.found()
     args: [files('shell/test_build_examples_gating.sh')],
     suite: 'docs',
     timeout: 120,
+  )
+  # #5333: start-UAT.sh kill_stale signals only PIDs it recorded and refuses on
+  # foreign port holders. Sources the script with kill/ps/pgrep/lsof/docker
+  # replaced by functions; spawns and signals nothing. The decoy command line
+  # contains yuzu-agent, as the `meson compile` the old pgrep -f killed did.
+  test('start-UAT.sh kill_stale scoping (#5333)',
+    _bash_test,
+    args: [files('shell/test_start_uat_kill_stale.sh')],
+    suite: 'docs',
+    timeout: 60,
   )
 endif
 

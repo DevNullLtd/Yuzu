@@ -49,7 +49,7 @@ The skill runs on both **Linux** (CI, WSL2) and **macOS** (operator dev box). Th
 **What skips on macOS without a running Docker daemon:**
 - Phase 1 docker-image-build → SKIP (operator can build locally only what they need)
 - Phase 2 upgrade-test → SKIP via `test-upgrade-stack.sh`'s `docker_available` early-out, gate row records SKIP with operator-readable note
-- Phase 6 sanitizers → still dispatches to the `yuzu-wsl2-linux` self-hosted runner, unaffected by local Docker availability
+- Phase 6 sanitizers → still dispatches to the `yuzu-bigtam-linux` self-hosted pool, unaffected by local Docker availability
 
 Everything else (Phase 0 preflight, Phase 1 C++ + Erlang build, Phase 4 native stack, Phase 5 unit/EUnit/dialyzer/CT/integration/e2e/synthetic-UAT/puppeteer, Phase 7a perf, Phase 7b coverage, Phase 8 teardown) runs natively on macOS.
 
@@ -72,7 +72,7 @@ Phase 5 — Test Gates (parallel) (unit / EUnit / dialyzer / CT / integration /
                                  e2e-api / e2e-mcp / synthetic UAT /
                                  puppeteer / instructions; e2e-security runs
                                  alone after the fan-out)
-Phase 6 — Sanitizers            (--full only — dispatched to yuzu-wsl2-linux runner)
+Phase 6 — Sanitizers            (--full only — dispatched to yuzu-bigtam-linux pool)
 Phase 7b — Coverage             (--full only — enforces tests/coverage-baseline.json)
 Phase 8 — Teardown + Summary    (cleans Phase 2 compose projects + scratch dir,
                                  finalises run row; LEAVES THE UAT ALIVE on
@@ -357,6 +357,8 @@ bash scripts/test/test-db-write.sh gate \
 
 **`start-UAT.sh` correctly returns non-zero on any connectivity test failure** (this is the post-PR1 behavior — earlier versions exited 0 unconditionally, see CHANGELOG `[Unreleased]`). The Phase 4 gate's PASS/FAIL accurately reflects whether the 6 inline connectivity tests passed against the fresh stack. The Phase 5 Synthetic UAT gate runs again standalone with sub-step timing capture into the test-runs DB — both gates are intentional, not a duplicate.
 
+A Phase 4 FAIL whose `fresh-stack.log` says `ports still held` or `survived SIGKILL` means a foreign process holds a UAT port, or a recorded process could not be stopped. It is not a stack defect, and `start-UAT.sh` will not kill it (it only signals PIDs it recorded); the log names the held ports (and the holding process where `lsof` is available).
+
 ## Phase 5 — Test Gates (parallel)
 
 Run all gates concurrently via `&` + `wait`. Each is a self-contained bash invocation that captures its own log to `$LOG_DIR/<gate>.log`. Don't try to collect their stdout — read the log paths in the failure summary instead.
@@ -433,7 +435,7 @@ gate_run "CT suites" "ct.log" \
 
 # Real-upstream CT suite — lives under apps/yuzu_gw/integration_test/
 # (separate dir from the regular test/ tree so CI's `rebar3 ct --dir
-# apps/yuzu_gw/test` discovery does NOT pick it up). Requires:
+# apps/yuzu_gw/test/ct` discovery does NOT pick it up). Requires:
 #   1. A live yuzu-server reachable on 127.0.0.1:50055 (Phase 4 brings
 #      this up via start-UAT.sh).
 #   2. YUZU_GW_TEST_TOKEN env var set to a valid enrollment token, OR
@@ -596,7 +598,7 @@ The results document each phase, every probe (with TCP latency), the agent's res
 
 ## Phase 6 — Sanitizers (PR2)
 
-Sanitizer rebuilds are dispatched to the `yuzu-wsl2-linux` self-hosted runner via `workflow_dispatch`. Running them locally would pin the dev box for ~15 min of compile time each; the always-on runner absorbs that cost while the operator continues Phase 5 gates locally.
+Sanitizer rebuilds are dispatched to the `yuzu-bigtam-linux` self-hosted pool via `workflow_dispatch`. Running them locally would pin the dev box for ~15 min of compile time each; the always-on runner absorbs that cost while the operator continues Phase 5 gates locally.
 
 ```bash
 if [[ "$MODE" == "full" ]]; then
@@ -611,7 +613,7 @@ The gate script:
 4. Parses each sanitizer log for `ERROR: AddressSanitizer`, `ERROR: LeakSanitizer`, `WARNING: ThreadSanitizer`, `ThreadSanitizer: data race`, `runtime error:`
 5. Writes two Phase 6 rows to `test_gates`: `Sanitizers (ASan+UBSan)` and `Sanitizers (TSan)`
 
-**Runner-offline path (WARN, not FAIL).** If `yuzu-wsl2-linux` is offline or the dispatch times out, both gates record `WARN` with notes explaining the operator retry path. The skill continues with the rest of the run rather than blocking on CI infrastructure that's out of reach.
+**Runner-offline path (WARN, not FAIL).** If the `yuzu-bigtam-linux` pool is offline or the dispatch times out, both gates record `WARN` with notes explaining the operator retry path. The skill continues with the rest of the run rather than blocking on CI infrastructure that's out of reach.
 
 **Workflow-file requirement.** `workflow_dispatch` evaluates the workflow file on the target ref. If you're dispatching against a commit that doesn't have `sanitizer-tests.yml` yet (e.g. running /test from an older branch), the dispatch will fail hard. The gate treats that as WARN per the offline-runner path.
 

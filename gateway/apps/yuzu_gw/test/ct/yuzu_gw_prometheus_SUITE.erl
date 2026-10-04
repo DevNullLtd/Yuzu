@@ -28,7 +28,14 @@
     metrics_content_type_is_prometheus/1
 ]).
 
--define(PROM_PORT, 19568).  %% Unique test port to avoid conflicts
+%% Bind an EPHEMERAL port (0) and read back what the OS assigned. A fixed
+%% port (this suite used 19568) is a cross-job shared resource on the
+%% self-hosted CI pools: 4 runner agents share ONE OS identity on ONE box,
+%% so two concurrent `gateway ct` runs would collide with eaddrinuse
+%% (#1871). This
+%% suite only started running in CI with #4800, which is what made the
+%% collision reachable.
+-define(PROM_PORT, 0).
 
 %%%===================================================================
 %%% CT Callbacks
@@ -59,12 +66,14 @@ init_per_suite(Config) ->
     %% Start prometheus_httpd on a test port.
     application:set_env(prometheus, prometheus_http, [{port, ?PROM_PORT}, {path, "/metrics"}]),
     {ok, HttpdPid} = prometheus_httpd:start(),
+    Port = proplists:get_value(port, httpd:info(HttpdPid)),
+    true = is_integer(Port) andalso Port > 0,
 
     %% Increment some counters so they appear in output.
     prometheus_counter:inc(yuzu_gw_agents_connected_total, [<<"test-node">>]),
     prometheus_counter:inc(yuzu_gw_commands_dispatched_total, [<<"test-plugin">>]),
 
-    [{prom_port, ?PROM_PORT}, {httpd_pid, HttpdPid} | Config].
+    [{prom_port, Port}, {httpd_pid, HttpdPid} | Config].
 
 end_per_suite(Config) ->
     HttpdPid = proplists:get_value(httpd_pid, Config),

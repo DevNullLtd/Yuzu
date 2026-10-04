@@ -24,6 +24,7 @@
 #include <string_view>
 
 #include "network_config_parsers.hpp"
+#include "network_config_routes_legs.hpp" // `routes` per-OS legs (own TUs)
 
 #if defined(__linux__) || defined(__APPLE__)
 #include <spdlog/spdlog.h>
@@ -1386,6 +1387,11 @@ int do_proxy(yuzu::CommandContext& ctx) {
 // dns_cache stays a permanent OS capability gap (see do_dns_cache's own
 // comment): dscacheutil -cachedump was gutted upstream and there is nothing
 // left to shell out to.
+// `routes` (the full routing table, all rung 1) lives in its own per-OS TUs
+// (network_config_routes_{linux,macos,win}.cpp): rtnetlink RTM_GETROUTE
+// AF_UNSPEC, the PF_ROUTE NET_RT_DUMP sysctl for every address family, and
+// GetIpForwardTable2 — the same native readers adapters/ip_addresses/arp use,
+// widened from "the default route" to "every route".
 const YuzuActionDescriptor kActionDescriptors[] = {
     {
         /* .action      = */ "adapters",
@@ -1462,6 +1468,28 @@ const YuzuActionDescriptor kActionDescriptors[] = {
          "RTF_LLINFO dump and are emitted as '-'"},
         /* .windows_leg = */ {YUZU_SUPPORT_SUPPORTED, 1, "GetIpNetTable2", nullptr},
     },
+    {
+        /* .action      = */ "routes",
+        /* .linux_leg   = */
+        {YUZU_SUPPORT_CONSTRAINED, 1, "rtnetlink RTM_GETROUTE (AF_UNSPEC)",
+         "main and custom routing tables, IPv4 and IPv6; the local table, cloned entries and "
+         "host-local route types are not reported; a multipath route reports its first nexthop "
+         "only and an `ip nexthop` object route carries no resolved gateway (both flagged in the "
+         "result status)"},
+        /* .macos_leg   = */
+        {YUZU_SUPPORT_CONSTRAINED, 1, "PF_ROUTE sysctl NET_RT_DUMP",
+         "IPv4 and IPv6; macOS has no route metric or table id, so those fields are '-', and the "
+         "origin is only the RTF_STATIC bit (static, which also covers connected-interface "
+         "routes), else RTF_DYNAMIC/RTF_MODIFIED (dynamic), else other; entries flagged as "
+         "neighbour (RTF_LLINFO), cloned, multicast, broadcast or own-address (RTF_LOCAL) are not "
+         "reported (the limited-broadcast 255.255.255.255/32 route carries none of those flags "
+         "and is); interface-scoped routes (RTF_IFSCOPE) are listed like any other"},
+        /* .windows_leg = */
+        {YUZU_SUPPORT_CONSTRAINED, 1, "GetIpForwardTable2",
+         "IPv4 and IPv6; the host's own and broadcast addresses (Protocol Local, full-length "
+         "prefix) and the multicast prefixes are not reported, connected-subnet routes are; the "
+         "metric is the route metric alone, without the interface metric"},
+    },
 };
 
 } // namespace
@@ -1471,13 +1499,13 @@ public:
     std::string_view name() const noexcept override { return "network_config"; }
     std::string_view version() const noexcept override { return "1.0.0"; }
     std::string_view description() const noexcept override {
-        return "Reports network adapter configuration, IP addresses, DNS servers, and proxy "
-               "settings";
+        return "Reports network adapter configuration, IP addresses, DNS servers, proxy "
+               "settings, and the routing table";
     }
 
     const char* const* actions() const noexcept override {
         static const char* acts[] = {"adapters", "ip_addresses", "dns_servers", "proxy",
-                                     "dns_cache", "arp",         nullptr};
+                                     "dns_cache", "arp",         "routes",      nullptr};
         return acts;
     }
 
@@ -1506,12 +1534,43 @@ public:
             return do_dns_cache(ctx);
         if (action == "arp")
             return do_arp(ctx);
+        if (action == "routes")
+            return do_routes(ctx);
 
         ctx.write_output(std::format("unknown action: {}", action));
         return 1;
     }
 
 private:
+    // routes|... — the full routing table (see network_config_routes_parsers.hpp for the
+    // row shape). The three legs live in their own TUs; this wrapper only picks the host
+    // leg. Frozen seam: nothing may escape the plugin ABI (the SDK trampoline does not
+    // catch), and the legs allocate (rows, status reason), so a throw here is reported as
+    // a CONSTRAINED internal_error row and rc 1 rather than propagated. Every data-level
+    // outcome — an unreadable or capped table included — is rc 0 with a typed status.
+    static int do_routes(yuzu::CommandContext& ctx) {
+        try {
+#if defined(_WIN32)
+            return yuzu::network_config::collect_routes_win(ctx);
+#elif defined(__linux__)
+            return yuzu::network_config::collect_routes_linux(ctx);
+#elif defined(__APPLE__)
+            return yuzu::network_config::collect_routes_macos(ctx);
+#else
+            return 1;
+#endif
+        } catch (...) {
+            try {
+                ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED,
+                                      YUZU_RESULT_COMPLETENESS_PARTIAL,
+                                      "network_config:routes_internal_error");
+                ctx.write_output("error|routes: internal error");
+            } catch (...) {
+            }
+            return 1;
+        }
+    }
+
     // arp|iface|ip|mac|type — the host ARP / IPv6-neighbour table. Windows reads the
     // kernel neighbour cache via GetIpNetTable2(AF_UNSPEC); Linux reads /proc/net/arp
     // natively; macOS reads the PF_ROUTE NET_RT_FLAGS/RTF_LLINFO sysctl via
