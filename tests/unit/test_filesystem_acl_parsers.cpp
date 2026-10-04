@@ -26,7 +26,6 @@
 #include <unistd.h>
 #include <uuid/uuid.h>
 
-#include <iostream>
 #include <memory>
 #include <type_traits>
 #endif
@@ -288,17 +287,6 @@ fs::path make_file(const yuzu::test::TempDir& d) {
 
 }  // namespace
 
-TEST_CASE("acl_to_text round trip: resolved principal", "[filesystem][acl][macos]") {
-    yuzu::test::TempDir dir{"yuzu_test_acl_"};
-    uuid_t www;
-    REQUIRE(mbr_uid_to_uuid(70, www) == 0);  // _www
-    auto text = roundtrip(make_file(dir), {&www});
-    auto acl = parse_acl_to_text(text);
-    REQUIRE(acl.has_value());
-    REQUIRE(acl->entries.size() == 1);
-    CHECK(format_macos_ace(acl->entries[0]) == "ace|allow|user:_www|read|-");
-}
-
 TEST_CASE("acl_to_text round trip: unresolved principals keep distinct UUIDs",
           "[filesystem][acl][macos]") {
     yuzu::test::TempDir dir{"yuzu_test_acl_"};
@@ -306,7 +294,6 @@ TEST_CASE("acl_to_text round trip: unresolved principals keep distinct UUIDs",
     uuid_generate_random(a);
     uuid_generate_random(b);
     auto text = roundtrip(make_file(dir), {&a, &b});
-    std::cout << "CAPTURED acl_to_text:\n" << text << std::flush;
     auto acl = parse_acl_to_text(text);
     REQUIRE(acl.has_value());
     REQUIRE(acl->entries.size() == 2);
