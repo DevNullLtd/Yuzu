@@ -97,6 +97,8 @@ bound_test_() ->
        fun repair_utf8_is_total/0},
       {"a session whose every heartbeat has bad tags keeps shipping for 3 cycles",
        fun degraded_session_keeps_shipping/0},
+      {"the server's status message is cut and its control bytes replaced in the BatchHeartbeat warning",
+       fun status_message_is_sanitised_in_the_log/0},
       {"a one-heartbeat chunk refused with RESOURCE_EXHAUSTED or INVALID_ARGUMENT is dropped",
        fun refused_single_chunk_is_dropped/0},
       {"a refused chunk of several is split and only the refused heartbeat is dropped",
@@ -780,6 +782,27 @@ refused_single_chunk_is_dropped() ->
          ?assertEqual([], requests())
      end || Status <- [?GRPC_STATUS_RESOURCE_EXHAUSTED, ?GRPC_STATUS_INVALID_ARGUMENT]],
     ok.
+
+%% The server's grpc-message is untrusted text: the BatchHeartbeat warning shows
+%% it cut to 128 bytes with every control character replaced (the same bounded
+%% text yuzu_gw_upstream logs), whatever a hostile or buggy server sends.
+status_message_is_sanitised_in_the_log() ->
+    Message = <<"m1\r\nm2\e[31m", 0, 127, 16#85, 16#9B, (binary:copy(<<"z">>, 1024))/binary>>,
+    meck:expect(grpcbox_client, unary,
+                fun(_Ctx, _Path, Req, _Def, _Opts) ->
+                    rec({request, Req, 0}),
+                    {error, {?GRPC_STATUS_INVALID_ARGUMENT, Message}, #{}}
+                end),
+    queue(hb(<<"one">>, #{})),
+    {_, Lines} = capture_logs(fun() -> yuzu_gw_heartbeat_buffer:flush_sync() end),
+    [Warning] = [T || {warning, T} <- Lines,
+                      binary:match(T, <<"BatchHeartbeat failed">>) =/= nomatch],
+    [?assertEqual({nomatch, C}, {binary:match(Warning, <<C>>), C}) || C <- [$\r, 27, 0, 127]],
+    [?assertEqual({nomatch, C}, {binary:match(Warning, <<16#C2, C>>), C}) || C <- [16#85, 16#9B]],
+    ?assertNotEqual(nomatch, binary:match(Warning, <<"m1??m2?[31m????">>)),
+    ?assertNotEqual(nomatch, binary:match(Warning, binary:copy(<<"z">>, 128 - 15))),
+    ?assertEqual(nomatch, binary:match(Warning, binary:copy(<<"z">>, 128 - 14))),
+    ?assert(byte_size(Warning) < 300).
 
 %% Chunks of two 1 MiB heartbeats: [p,q1] and [q2]. The server refuses any
 %% request holding p. [p,q1] is split, [p] dropped, [q1] and [q2] delivered, all

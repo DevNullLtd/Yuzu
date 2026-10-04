@@ -396,7 +396,7 @@ do_flush(BatchReq, N) ->
                               #{rpc_name => <<"batch_heartbeat">>,
                                 code => Status}),
             logger:warning("BatchHeartbeat failed (~b in chunk): ~p ~s",
-                           [N, Status, Message]),
+                           [N, Status, yuzu_gw_env:log_text(Message)]),
             {error, {Status, Message}};
         {http_error, {Status, _}, _Trailers} ->
             %% HA WS-4 4.4 round-2 review fix (consistency-auditor c-1 /
