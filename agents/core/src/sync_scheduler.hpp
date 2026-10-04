@@ -117,7 +117,8 @@ public:
     /// kSkipRetryBase << (streak - 1), capped by the next phase slot, while
     /// streak <= kSkipRetryBudget; afterwards one attempt per daily slot. Since
     /// 1+2+4+8 = 15h, the fifth delay (16h) is always capped by the slot:
-    /// effectively up to four intra-day retries (1h, 2h, 4h, then the next slot).
+    /// effectively up to four extra attempts the same day (1h, 3h, 7h and 15h
+    /// after the first skip), then the next slot.
     static constexpr std::chrono::seconds kSkipRetryBase{60 * 60};
     static constexpr int kSkipRetryBudget{5};
 
