@@ -156,10 +156,11 @@ birth_token() {
 # record_pid NAME PID IDENT — line 1 the PID, line 2 the launch identity (the
 # launched binary / release path that must appear in the process command line),
 # line 3 the birth token (a recycled PID never has the same start time). A
-# failed write stops the just-spawned process: an unrecorded one is never found
-# again (the agent listens on no port).
+# failed write, or an unreadable start time, stops the just-spawned process: an
+# unrecorded one is never found again (the agent listens on no port).
 record_pid() {
-    if ! { mkdir -p "$PID_DIR" && printf '%s\n%s\n%s\n' "$2" "$3" "$(birth_token "$2")" > "$PID_DIR/$1.pid"; }; then
+    local tok; tok=$(birth_token "$2")
+    if [ -z "$tok" ] || ! { mkdir -p "$PID_DIR" && printf '%s\n%s\n%s\n' "$2" "$3" "$tok" > "$PID_DIR/$1.pid"; }; then
         kill_tree "$2"
         fail "could not record $1 PID $2 under $PID_DIR — stopped it; refusing to continue"
         return 1

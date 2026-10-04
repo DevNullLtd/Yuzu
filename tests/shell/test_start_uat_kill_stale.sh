@@ -104,9 +104,11 @@ echo "record_pid write failure"
 reset; alive 4242 "$AGT"; rm -rf "$PID_DIR"; : > "$PID_DIR"
 run record_pid x 4242 /p
 check "unwritable PID_DIR: rc 1, the just-spawned PID is killed" "$([ $rc = 1 ] && has "$TMP/kills" '-9 4242' && echo 0 || echo 1)"
+reset; run record_pid x 4343 /p
+check "unreadable start time (no such process): rc 1, no record written" "$([ $rc = 1 ] && [ ! -e "$PID_DIR/x.pid" ] && echo 0 || echo 1)"
 
 echo "dead"
-reset; record_pid gateway 300 "$GATEWAY_DIR/rel"
+reset; mkdir -p "$PID_DIR"; printf '300\n%s\nSun Oct  4 10:00:00 2026\n' "$GATEWAY_DIR/rel" > "$PID_DIR/gateway.pid"  # a process that is gone
 run kill_stale
 check "dead record dropped, nothing killed" "$([ $rc = 0 ] && ! [ -e "$TMP/kills" ] && [ ! -e "$PID_DIR/gateway.pid" ] && echo 0 || echo 1)"
 
@@ -133,7 +135,7 @@ check "reused reported as another process" "$([[ $out == *'agent not running (re
 check "status never signals or pgreps, keeps records" "$([ ! -e "$TMP/violations" ] && [ ! -e "$TMP/kills" ] && [ -f "$PID_DIR/agent.pid" ] && echo 0 || echo 1)"
 
 echo "status: absent / dead / malformed"
-reset; record_pid server 500 "$SRV"; printf 'abc\n/x\n' > "$PID_DIR/agent.pid"
+reset; mkdir -p "$PID_DIR"; printf '500\n%s\nSun Oct  4 10:00:00 2026\n' "$SRV" > "$PID_DIR/server.pid"; printf 'abc\n/x\n' > "$PID_DIR/agent.pid"
 run show_status
 check "absent record labelled" "$([[ $out == *'gateway not running (no record)'* ]] && echo 0 || echo 1)"
 check "dead and malformed records labelled stale" "$([[ $out == *'server not running (stale record)'* && $out == *'agent not running (stale record)'* ]] && echo 0 || echo 1)"
@@ -186,6 +188,7 @@ check "free ports: wiped and agent-data recreated" "$([ $rc = 0 ] && [ ! -e "$UA
 echo "lexical wiring"
 cnt() { grep -cF -- "$1" "$SCRIPT" || true; }
 # shellcheck disable=SC2016  # the patterns are literal source text, not expansions
+check "ownership probe reads the full command line (ps -ww)" "$([ "$(cnt 'ps -ww -o command= -p')" = 1 ] && echo 0 || echo 1)"
 check "record_pid after each of the three spawns" "$([ "$(cnt 'record_pid server "$server_pid"')" = 1 ] && [ "$(cnt 'record_pid gateway "$gw_pid"')" = 1 ] && [ "$(cnt 'record_pid agent "$agent_pid"')" = 1 ] && echo 0 || echo 1)"
 # shellcheck disable=SC2016
 check "gateway identity is the physical rel dir" "$([ "$(cnt 'record_pid gateway "$gw_pid" "$(cd "$gw_rel" && pwd -P)"')" = 1 ] && echo 0 || echo 1)"
