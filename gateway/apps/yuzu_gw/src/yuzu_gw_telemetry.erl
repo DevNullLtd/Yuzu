@@ -265,7 +265,11 @@ handle_event([yuzu, gw, heartbeat, verdict_dropped], #{count := N}, Meta, _Confi
 %% gave up to stay bounded, by the closed reason set buffer_full (a heartbeat
 %% or whole session dropped) | snapshot_oversize (one snapshot larger than a
 %% chunk, heartbeat kept) | snapshot_evicted (oldest snapshot dropped to fit the
-%% byte cap). The label is an atom chosen by yuzu_gw_heartbeat_buffer; any other
+%% byte cap) | heartbeat_oversize (a heartbeat still larger than a chunk without
+%% its snapshot, or with too many status tags, dropped) | heartbeat_invalid (a
+%% heartbeat whose session id or a status tag is not valid UTF-8, dropped) |
+%% chunk_rejected (one heartbeat the server rejected with a non-transient
+%% status, dropped). The label is an atom chosen by yuzu_gw_heartbeat_buffer; any other
 %% value falls to `unknown' so a bug cannot widen the label set, and the handler
 %% must never crash (telemetry detaches a handler that raises).
 handle_event([yuzu, gw, heartbeat, coalesced], #{count := N}, _Meta, _Config) ->
@@ -273,7 +277,9 @@ handle_event([yuzu, gw, heartbeat, coalesced], #{count := N}, _Meta, _Config) ->
 
 handle_event([yuzu, gw, heartbeat, buffer_dropped], #{count := N}, Meta, _Config) ->
     Reason = case maps:get(reason, Meta, unknown) of
-        R when R =:= buffer_full; R =:= snapshot_oversize; R =:= snapshot_evicted -> R;
+        R when R =:= buffer_full; R =:= snapshot_oversize; R =:= snapshot_evicted;
+               R =:= heartbeat_oversize; R =:= heartbeat_invalid;
+               R =:= chunk_rejected -> R;
         _ -> unknown
     end,
     prometheus_counter:inc(yuzu_gw_heartbeat_buffer_dropped_total,
@@ -513,20 +519,27 @@ declare_metrics() ->
     prometheus_counter:declare([
         {name, yuzu_gw_heartbeat_buffer_dropped_total},
         {labels, [reason]},
-        {help, "Heartbeat data the gateway buffer gave up to stay bounded while "
-               "the server could not be reached, by reason (buffer_full = a "
+        {help, "Heartbeat data the gateway buffer gave up to stay bounded or to "
+               "keep flushing, by reason (buffer_full = a "
                "heartbeat or whole session dropped because the session count or "
                "byte cap was reached, snapshot_oversize = one fleet snapshot "
                "larger than a request chunk was dropped and the heartbeat kept, "
                "snapshot_evicted = the oldest fleet snapshot was dropped to fit "
-               "the byte cap and the heartbeat kept)"}]),
+               "the byte cap and the heartbeat kept, heartbeat_oversize = a "
+               "heartbeat still larger than a request chunk without its snapshot, "
+               "or with more than 512 status tags, was dropped, heartbeat_invalid "
+               "= a heartbeat whose session id or a status tag is not valid UTF-8 "
+               "was dropped, chunk_rejected = a single heartbeat the server "
+               "rejected with a non-transient status was dropped)"}]),
     prometheus_counter:declare([
         {name, yuzu_gw_heartbeat_coalesced_total},
         {labels, []},
         {help, "Heartbeats merged into the already buffered heartbeat of the "
                "same session before a flush (the buffer keeps one per session)"}]),
     [prometheus_counter:inc(yuzu_gw_heartbeat_buffer_dropped_total, [R], 0)
-     || R <- [<<"buffer_full">>, <<"snapshot_oversize">>, <<"snapshot_evicted">>]],
+     || R <- [<<"buffer_full">>, <<"snapshot_oversize">>, <<"snapshot_evicted">>,
+              <<"heartbeat_oversize">>, <<"heartbeat_invalid">>,
+              <<"chunk_rejected">>]],
     prometheus_counter:inc(yuzu_gw_heartbeat_coalesced_total, [], 0),
     prometheus_counter:declare([
         {name, yuzu_gw_mgmt_auth_pin_unresolved_total},
