@@ -233,7 +233,7 @@ TEST_CASE("key_hint never echoes raw key material", "[licensing][parsers]") {
         CHECK(derive_key_hint("3V66T", raw) == "3V66T");
     }
     SECTION("no material at all -> empty") { CHECK(derive_key_hint("", "").empty()); }
-    SECTION("shared SHA-256 matches the NIST 'abc' vector") {
+    SECTION("local SHA-256 matches the NIST 'abc' vector") {
         CHECK(sha256_hex12("abc") == "ba7816bf8f01");
     }
 }

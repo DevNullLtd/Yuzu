@@ -88,6 +88,17 @@ TEST_CASE("posix_secure_read: a valid child hop opens, reads through its fd and 
     CHECK(errno == EBADF);
 }
 
+TEST_CASE("posix_secure_read: file opens never block, follow a leaf link or adopt a controlling tty",
+          "[shared][posix_secure_read]") {
+    // MUTATION: dropping O_NONBLOCK hangs on a planted FIFO; dropping O_NOCTTY lets a planted
+    // tty character device become the daemon's controlling terminal before the S_ISREG refusal.
+    constexpr int flags = detail::kFileFlags;
+    CHECK((flags & O_NOFOLLOW) == O_NOFOLLOW);
+    CHECK((flags & O_NONBLOCK) == O_NONBLOCK);
+    CHECK((flags & O_NOCTTY) == O_NOCTTY);
+    CHECK((flags & O_CLOEXEC) == O_CLOEXEC);
+}
+
 TEST_CASE("posix_secure_read: symlink to directory at the leaf is refused", "[shared][posix_secure_read]") {
     yuzu::test::TempDir tmp{"yuzu_test_psr_"};
     REQUIRE(fs::create_directory(tmp.path));

@@ -193,7 +193,7 @@ inline FileRead finish_file_open(int fd, std::size_t cap) {
 }
 
 inline constexpr int kDirFlags = O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC;
-inline constexpr int kFileFlags = O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC;
+inline constexpr int kFileFlags = O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_NOCTTY | O_CLOEXEC;
 
 } // namespace detail
 
