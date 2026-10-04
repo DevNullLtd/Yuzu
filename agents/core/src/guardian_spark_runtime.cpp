@@ -2775,6 +2775,8 @@ GuardianSparkRuntime::attach_core(const std::string& key, std::string rule_id, S
         // it was unreachable via GuardianEngine's mtx_-serialised production callers
         // and is replaced, not removed: a second same-key call is now a QUEUED claim
         // that commits against the same subscription when the head's arm lands.
+        // (#5322: not when keys_ already has an entry for the key - committed_live below
+        // routes that attach to a join instead of the claim path.)
         const auto cit = claims_.find(key);
         const bool key_claimed = io_class && cit != claims_.end() && !cit->second.fifo.empty();
 
@@ -2938,10 +2940,15 @@ GuardianSparkRuntime::attach_core(const std::string& key, std::string rule_id, S
         } else {
             // A committed watcher, whatever the claims fifo holds (committed_live): a
             // live shared watcher, an orphan, or a committed head still unpublished.
-            // keys_.at cannot throw when committed_live. The one other way here is the
-            // #5323 ghost leak (no claims, no keys_, add() false), which throws
-            // out_of_range exactly as before. No backend call, but a throw below (map insert, or a throwing
-            // waker/outbox_waker COPY) must still undo the index_->add - mirrors the
+            // keys_.at cannot throw when committed_live. The one other way here would be
+            // no claims, no keys_ entry and add() false (a mapping that outlived both its
+            // claim and its watcher), and keys_.at would then throw out_of_range. No
+            // known path produces that state: the abandon path that used to (#5323) now
+            // retains the claim when its release fails, and the other sites that erase a
+            // claim from its fifo release (or retain) its mapping first, except at stop,
+            // after which attach_core refuses. Treat this as a defensive branch, not a
+            // reachable one. No backend call, but a throw below (map insert, or a
+            // throwing waker/outbox_waker COPY) must still undo the index_->add - mirrors the
             // original unified rollback's armed_here=false shape (never disarms;
             // there is no new watcher to tear down, only this rule's own bookkeeping;
             // index_add_rollback above handles the index_->add undo).
@@ -3245,7 +3252,11 @@ GuardianSparkRuntime::withdraw_rule_after_wedge_sweep_locked(
                 //    longer owns anything and its next release is a no-op that succeeds.
                 //    The residue is therefore left for the next same-key sweep
                 //    (try_dispatch_head_locked, or this function) to pop; nothing here
-                //    waits on the failing release succeeding.
+                //    waits on the failing release succeeding. The heartbeat's
+                //    reap_stranded_claims_locked() pops it too (shown by the "#5322:
+                //    Lost with the ghost detached last" test, which reaches this
+                //    branch and then sees the residue gone after one
+                //    expire_overdue_claims()).
                 sweep_terminal_queued_locked(eit->second);
                 // The sweep's precondition (an empty fifo) is established by call-graph
                 // reasoning, not by construction, and the branch above is reachable, so

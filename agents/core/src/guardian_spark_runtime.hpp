@@ -2065,8 +2065,8 @@ private:
     /// releases (they run before publish_arm_verdicts_locked); publish_arm_verdicts_
     /// locked's own fill-in; synthesize_fallback_outcome_locked; the dispatched branch
     /// of abandon_claim_locked. (2) They run at sticky-stop time, where the leak is
-    /// moot: begin_stop; dispatch_parked_arm_guarded's stop path. abandon_claim_locked's
-    /// Queued branch (#5323) consults it through release_or_retain_tombstone_locked: a
+    /// moot: begin_stop; dispatch_parked_arm_guarded's stop path; dispatch_arm_off_lock's
+    /// stopping entry-guard path (#5322). abandon_claim_locked's Queued branch (#5323) consults it through release_or_retain_tombstone_locked: a
     /// failed release keeps the abandoned claim in its fifo as a withdrawn tombstone.
     /// Accounting: backend_op_timeouts_ is incremented once, at the abandonment itself;
     /// the retries that later pop the tombstone are counted in
