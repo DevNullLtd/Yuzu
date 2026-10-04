@@ -138,10 +138,11 @@ public:
     /// Set the maximum number of triggers allowed (default: kDefaultMaxTriggers).
     void set_max_triggers(size_t limit);
 
-    /// Override how often the file-watch loop polls (default 5s). A seam for tests, which
-    /// otherwise wait out the real cadence; production never calls it. Takes effect at the loop's
-    /// next wait, so it is safe at any time. `interval` must be positive: zero makes the loop spin.
-    void set_file_poll_interval(std::chrono::milliseconds interval);
+    /// Test seam: override how often the file-watch loop polls (default 5s). Production never
+    /// calls it. Takes effect at the loop's next wait, so it is safe at any time. The value is
+    /// clamped to [1 ms, 1 h]: zero or negative would spin the worker, and an absurd value would
+    /// overflow the wait's millisecond-to-nanosecond conversion.
+    void set_file_poll_interval_for_test(std::chrono::milliseconds interval);
 
     /// Start all monitoring loops. Fires AgentStartup triggers immediately.
     void start();
@@ -153,7 +154,9 @@ public:
     [[nodiscard]] size_t trigger_count() const;
 
     /// The registered config for `id` AS STORED, i.e. after register_trigger's clamping
-    /// (an Interval below 30s reads back as 30). nullopt when no such trigger.
+    /// (an Interval below 30s reads back as 30). nullopt when no such trigger. Takes the engine
+    /// lock like trigger_count(), so do not call it from the dispatch callback while start() is
+    /// firing AgentStartup triggers: that path holds the lock across the callback.
     [[nodiscard]] std::optional<TriggerConfig> find_trigger(const std::string& id) const;
 
     /// Returns true if the engine is currently running.
@@ -195,7 +198,8 @@ private:
     mutable std::mutex mu_;
     std::atomic<bool> running_{false};
     std::vector<std::thread> workers_;
-    std::atomic<std::chrono::milliseconds::rep> file_poll_ms_{5000};  // set_file_poll_interval()
+    // Poll interval of the file-watch loop, in ms; see set_file_poll_interval_for_test().
+    std::atomic<std::chrono::milliseconds::rep> file_poll_ms_{5000};
 
     // Shutdown signalling for the worker loops.
     //

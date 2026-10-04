@@ -129,8 +129,11 @@ void TriggerEngine::set_dispatch(DispatchFn fn) {
     dispatch_ = std::move(fn);
 }
 
-void TriggerEngine::set_file_poll_interval(std::chrono::milliseconds interval) {
-    file_poll_ms_.store(interval.count(), std::memory_order_relaxed);
+void TriggerEngine::set_file_poll_interval_for_test(std::chrono::milliseconds interval) {
+    // Clamped, see the header: a zero, negative or absurd value would spin or overflow the wait.
+    const auto lo = std::chrono::milliseconds{1};
+    const auto hi = std::chrono::milliseconds{std::chrono::hours{1}};
+    file_poll_ms_.store(std::clamp(interval, lo, hi).count(), std::memory_order_relaxed);
 }
 
 std::optional<TriggerConfig> TriggerEngine::find_trigger(const std::string& id) const {

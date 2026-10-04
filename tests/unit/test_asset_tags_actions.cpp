@@ -420,8 +420,19 @@ TEST_CASE("asset_tags plugin: shutdown() wakes the check thread at once, not aft
     }
 
     yuzu::test::TempDir dir{"yuzu_test_asset_tags_shutdown_"};
-    yuzu::agent::StandalonePluginContext ctx("asset_tags", {{"agent.data_dir", dir.path.string()}});
+    // 30s is the interval floor. Pinning it means a lost notify fails the CHECK below after ~30s,
+    // instead of hanging for the 300s default until the shard's timeout kills every other case in
+    // the shard with it.
+    yuzu::agent::StandalonePluginContext ctx(
+        "asset_tags", {{"agent.data_dir", dir.path.string()}, {"asset_tags.check_interval", "30"}});
     REQUIRE(plugin->descriptor->init(ctx.get()) == 0);
+    // shutdown() joins the check thread, so run it on every exit from here, including an unwound
+    // assertion; the timed call below marks it done so the guard does not repeat it.
+    bool shut_down = false;
+    yuzu::test::ScopeExit shutdown_on_exit{[&] {
+        if (!shut_down)
+            plugin->descriptor->shutdown(ctx.get());
+    }};
 
     // Give the check thread time to reach its wait, so the notify path and not just the
     // predicate is what runs. This is a head start, not a handshake: if the runner starves the
@@ -432,6 +443,7 @@ TEST_CASE("asset_tags plugin: shutdown() wakes the check thread at once, not aft
 
     const auto t0 = std::chrono::steady_clock::now();
     plugin->descriptor->shutdown(ctx.get());
+    shut_down = true;
     const auto elapsed = std::chrono::steady_clock::now() - t0;
     CHECK(elapsed < std::chrono::seconds{3});
 }

@@ -139,7 +139,7 @@ docs/yaml-dsl-spec.md             — add `kind: GuaranteedStateRule` (done with
 
 ## Patterns and existing code to reuse (don't reinvent)
 
-- **Registry watcher**: `TriggerEngine::registry_watch_loop()` in `agents/core/src/trigger_engine.cpp` already has a working `RegNotifyChangeKeyValue` + `WaitForMultipleObjects` loop. Lift the wait/re-arm/stop-event structure into `RegistryGuard`.
+- **Registry watcher**: `TriggerEngine::registry_watch_loop()` in `agents/core/src/trigger_engine.cpp` already has a working `RegNotifyChangeKeyValue` loop: it polls each watch's event with `WaitForSingleObject(evt, 0)` once per 2 s tick and stops through `wait_for_stop`, it does not block in `WaitForMultipleObjects`. Lift the re-arm structure into `RegistryGuard`; the blocking wait against a stop event is new work.
 - **Windows service registration**: `main.cpp:136–200` already does `SERVICE_AUTO_START` + `FailureActions`. Guardian gets pre-login activation for free — no service-config changes needed.
 - **Plugin-namespaced KV**: `agents/core/include/yuzu/agent/kv_store.hpp` — Guardian uses namespace `"__guardian__"`, no second DB file.
 - **Store + MigrationRunner**: `server/core/src/audit_store.{hpp,cpp}` is the cleanest template; `server/core/src/migration_runner.hpp` drives schema versions.
