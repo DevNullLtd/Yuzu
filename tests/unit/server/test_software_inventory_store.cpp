@@ -1118,7 +1118,7 @@ TEST_CASE("ingest boundary-truncates an over-long multibyte field so PG accepts 
     // name = 1023 'a' + 'é' (0xC3 0xA9) = 1025 bytes; record = name|1|| (0x1F fields,
     // 0x1E terminator; octal \037=0x1F \036=0x1E to avoid greedy \x hex escapes).
     std::string longname = std::string(1023, 'a') + "\xc3\xa9";
-    std::string blob = longname + "\0371\037\037\036";
+    std::string blob = longname + "\037" "1\037\037\036";
     agentpb::InventoryReport rep;
     (*rep.mutable_content_hashes())["installed_software"] = "x"; // recomputed on a full payload
     (*rep.mutable_plugin_data())["installed_software"] = blob;
