@@ -56,6 +56,38 @@ TEST_CASE("posix_secure_read: directory opens and walks", "[shared][posix_secure
     CHECK(seen == std::set<std::string>{"a.txt", "b.txt"});
 }
 
+TEST_CASE("posix_secure_read: a valid child hop opens, reads through its fd and closes on scope exit",
+          "[shared][posix_secure_read]") {
+    yuzu::test::TempDir tmp{"yuzu_test_psr_"};
+    REQUIRE(fs::create_directory(tmp.path));
+    REQUIRE(fs::create_directory(tmp.path / "child"));
+    write_file(tmp.path / "child" / "f.txt", "hello");
+
+    auto root = open_dir_no_follow(tmp.path.string());
+    REQUIRE(root.opened());
+
+    int child_fd = -1;
+    {
+        auto child = open_dir_no_follow_at(root.dir.fd(), "child");
+        REQUIRE(child.opened());
+        CHECK(child.err == 0);
+        child_fd = child.dir.fd();
+        REQUIRE(child_fd >= 0);
+
+        auto file = read_file_no_follow_at(child_fd, "f.txt", 64);
+        CHECK(file.error == ReadError::none);
+        CHECK(file.data == "hello");
+
+        // Moving the owner transfers the descriptor; the moved-from handle no longer owns it.
+        ScopedDir moved{std::move(child.dir)};
+        CHECK(moved.fd() == child_fd);
+        CHECK(child.dir.fd() < 0);
+    }
+    // The only owner went out of scope, so the descriptor is closed.
+    CHECK(::fcntl(child_fd, F_GETFD) == -1);
+    CHECK(errno == EBADF);
+}
+
 TEST_CASE("posix_secure_read: symlink to directory at the leaf is refused", "[shared][posix_secure_read]") {
     yuzu::test::TempDir tmp{"yuzu_test_psr_"};
     REQUIRE(fs::create_directory(tmp.path));

@@ -17,7 +17,7 @@
  * enforced by VALUE, not by absence: `profile_dir` and `display_name` ARE
  * free-text fields Chromium populates from the account (a signed-in Edge
  * profile in particular is often keyed by its account e-mail), so
- * `looks_like_email_address` below redacts either field WHOLE to
+ * `looks_like_email_address` (agents/shared/email_redaction.hpp) redacts either field WHOLE to
  * `kRedactedEmailPlaceholder` when it CONTAINS an e-mail-shaped substring
  * before it ever reaches BrowserProfileRow (adversarial-review findings
  * 2026-09-22/2026-09-23 -- the original structural-only claim was

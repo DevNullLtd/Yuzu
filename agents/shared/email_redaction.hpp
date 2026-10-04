@@ -11,32 +11,61 @@
 
 namespace yuzu::shared {
 
-/// Substituted for a field whose raw value contains an e-mail address
-/// (see `looks_like_email_address`). Irreversible by construction: an
-/// e-mail address is an account identifier, so callers filter it, they do
-/// not document an exception.
+/// Substituted for `profile_dir`/`display_name` when the raw value
+/// contains an e-mail address (see `looks_like_email_address` below).
+/// Irreversible by construction -- unlike the accepted personal-name
+/// residual risk on `display_name`, an e-mail address is a
+/// browsing-account identifier and the PRIVACY CONTRACT above forbids it
+/// unconditionally, so this is a filter, not a documented exception.
 inline constexpr std::string_view kRedactedEmailPlaceholder = "[redacted-email]";
 
-/// True when `value` CONTAINS an e-mail-shaped substring anywhere: bare,
-/// decorated (`Alice <alice@example.com>`), embedded, several, quoted
-/// (`"alice.smith"@example.com`), with RFC 5322 comments or folding
-/// whitespace around the '@' (`alice(comment)@example.com`,
-/// `alice\n@example.com`). Coarse by design; over-match is the safe
-/// direction. The only local-side condition is that '@' is not at position
-/// 0. The domain side must look email-shaped after CFWS (folding
-/// whitespace and nested parenthesized comments) is skipped after '@' and
-/// around each dot: a dotted label pair (ASCII alnum/-/._ or any byte >=
-/// 0x80, so a raw IDN domain matches) or a non-empty bracketed literal
-/// (`@[203.0.113.5]`). An unterminated comment consumes the rest of
-/// `value` and yields no match.
+/// True when `value` CONTAINS an e-mail-shaped substring anywhere -- bare
+/// (`account@example.com`), decorated (`Alice <alice@example.com>`,
+/// `alice@example.com (Work)`), embedded (`x alice@example.com`),
+/// several (`a@x.org,b@y.org`), quoted (`"alice.smith"@example.com`),
+/// RFC 5322 comment-syntax (`alice(comment)@example.com`), or separated
+/// from the domain by folding whitespace/control characters
+/// (`alice\n@example.com`); coarse by design, over-match is the safe
+/// direction. Round-2 governance finding G-1 (2026-09-23): the earlier
+/// local-part exclusion list rejected exactly the whitespace/quote/
+/// comment characters a decorated or folded address puts immediately
+/// before '@', which is backwards for a filter whose stated principle is
+/// over-match-is-safe -- the ONLY local-side condition is now that '@' is
+/// not at position 0. The domain side still has to look email-shaped, but
+/// CFWS (folding whitespace and/or a parenthesized comment, possibly
+/// nested) is skipped both immediately after '@' and around each domain
+/// dot before that check runs: a dotted label (label '.' label, non-empty
+/// either side once CFWS is skipped; domain bytes are ASCII alnum/-/._ or
+/// any byte >= 0x80, so a raw non-punycode IDN domain still matches), or a
+/// non-empty bracketed domain literal (`@[203.0.113.5]`, itself reachable
+/// through leading CFWS); any hit redacts the whole field. Round-2
+/// adversarial finding 2026-09-23 (domain-side mirror of G-3): the earlier
+/// domain scan started matching immediately at '@', so CFWS before the
+/// domain or around a dot (`alice@ (comment)example.com`,
+/// `alice@example . com`) produced an empty or truncated domain and
+/// returned false. (An unterminated comment consumes the rest of `value`
+/// and yields no match by the same pre-existing contract `skip_cfws`
+/// documents below -- not something this finding changed.) Round-3
+/// code-review finding F1 (2026-09-23): a backslash-escaped byte inside a
+/// comment is consumed as one RFC 5322 quoted-pair and never changes depth,
+/// so an escaped `(`/`)` (`alice@(a\(b)example.com`,
+/// `alice@(escaped\)paren)example.com`) does not open/close the comment
+/// early and truncate the domain scan that follows.
 [[nodiscard]] inline bool looks_like_email_address(std::string_view value) {
     auto is_domain_char = [](char c) {
         return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
                c == '-' || c == '.' || c == '_' || static_cast<unsigned char>(c) >= 0x80;
     };
-    // Skips folding whitespace and parenthesized comments (nested, tracked
-    // by depth) from `i`. A backslash and the next byte are one quoted-pair,
-    // never a depth change; an unterminated comment eats the rest of `value`.
+    // Skips a run of folding whitespace and/or a parenthesized comment
+    // (nested comments tracked by depth) starting at `i`, repeating until
+    // neither advances. An unterminated comment consumes the rest of
+    // `value` (depth never returns to 0), which is intentional: the caller
+    // then finds an empty domain and reports no match. Inside a comment, a
+    // backslash and the byte immediately after it are consumed together as
+    // one RFC 5322 quoted-pair -- that byte is never itself tested as a
+    // depth-changing '(' or ')' (round-3 finding F1, 2026-09-23: an escaped
+    // ')' inside a comment was closing the comment early, truncating the
+    // domain scan that follows).
     auto skip_cfws = [value](std::size_t& i) {
         for (;;) {
             bool advanced = false;
@@ -53,7 +82,11 @@ inline constexpr std::string_view kRedactedEmailPlaceholder = "[redacted-email]"
                 std::size_t depth = 0;
                 while (i < value.size()) {
                     if (value[i] == '\\') {
-                        // Quoted-pair; a trailing lone backslash must not pass the end.
+                        // Quoted-pair: consume the backslash and the next
+                        // byte as one unit, never as a depth-changing
+                        // paren. A trailing lone backslash must not step
+                        // past the end -- it then reads as an unterminated
+                        // comment (depth stays open), same as before.
                         i += (i + 1 < value.size()) ? 2 : 1;
                     } else if (value[i] == '(') {
                         ++depth;
