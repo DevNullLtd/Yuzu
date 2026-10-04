@@ -1955,8 +1955,8 @@ TEST_CASE("REAL AgentHealthStore: yuzu_fleet_inventory_sync_skipping counts vali
     // The wire key the agent writes, pinned literally (not re-derived through a builder).
     const char* const k = "yuzu.sync.installed_software.skip_streak";
     const char* const gauge = "yuzu_fleet_inventory_sync_skipping{source=\"installed_software\"} ";
-    beat_tags(store, "a", {{k, "2"}});
-    beat_tags(store, "b", {{k, "1"}});
+    beat_tags(store, "a", {{k, "9"}});  // accepted: digits only, > 0 (9 = last digit)
+    beat_tags(store, "b", {{k, "10"}}); // accepted: multi-digit, contains a 0
     beat_tags(store, "c", {{k, "0"}});
     beat_tags(store, "d", {});
     beat_tags(store, "e", {{k, "abc"}});

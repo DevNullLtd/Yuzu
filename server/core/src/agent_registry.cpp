@@ -2474,9 +2474,9 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
         // #5332: agents whose daily-sync source is skipping (skip_streak > 0). Same
         // digits-only/>0 rule as the tar total above; its 18-char cap vs the emitter's 6 is
         // harmless - the value is only counted, never summed or labelled.
-        // ponytail: one source today (the agent emitter is generic over every registered sync
-        // source, but only installed_software sets skip_reason); make this a table when a
-        // second source emits skip_streak.
+        // One source today (the agent emitter is generic over every registered sync source, but
+        // only installed_software sets skip_reason); make this a table when a second source
+        // emits skip_streak.
         static const std::string kKeySyncSkip{"yuzu.sync.installed_software.skip_streak"};
         if (parse_tar_corruption_total(get_view(kKeySyncSkip)))
             ++sync_skipping;
