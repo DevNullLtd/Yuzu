@@ -904,12 +904,14 @@ endif
 # shards run 3-wide by `meson test`:
 # 29.9 / 30.8 / 32.0s, against 92.6s for the old single-spec run of the same
 # binary. Windows startup cost, and what concurrent shards cost each other under
-# CI's smaller pools, were not measured.
+# CI's smaller pools, were not measured. (All counts and times in this paragraph predate the
+# 2026-10-04 re-balance below.)
 # The carve uses only tags with >=25 cases (hand-pruned from a simulated-annealing
 # fit that used tiny tags and was 1-3% tighter): A is guarded by [ack],[actions],
 # [browser_policy],[drain],[execution_artifacts],[guard],[runtime]; B by [agent],
-# [liveness],[mechanism],[trigger_engine],[log_handoff],[posix_actions]. Re-balance by
-# moving a tag between the two variables below, never by hand-editing a spec string.
+# [liveness],[mechanism],[trigger_engine] plus the tags the 2026-10-04 re-balance below added.
+# agent_shard_a_tags / agent_shard_b_tags below are authoritative. Re-balance by moving a tag
+# between the two variables, never by hand-editing a spec string.
 #
 # RE-BALANCE 2026-10-04: [log_handoff] and [posix_actions] moved from C to B. Shard C alone was
 # the macOS "Test" step (~100s of case time against ~53s and ~10s for A and B once B's own fixed

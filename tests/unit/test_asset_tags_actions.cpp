@@ -18,9 +18,10 @@
  *     persist failure reports CONSTRAINED/PARTIAL `asset_tags:persist_failed`
  *     with truthful rows; then a valid snapshot plus a floored interval load.
  *     Both cycles live in ONE case, in this order, because the interval is a
- *     process-global the second cycle overwrites. Each shutdown() joins the
- *     plugin's 5-second-granularity check thread, so this case costs up to
- *     ~10 s of wall clock and no assertion depends on time.
+ *     process-global the second cycle overwrites. shutdown() wakes the
+ *     plugin's check thread at once (the dedicated shutdown case below pins
+ *     that), so this case runs in milliseconds and no assertion depends on
+ *     time.
  *
  * RUNS ON ALL THREE PLATFORMS unconditionally (the plugin has no per-OS leg).
  */

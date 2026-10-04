@@ -309,6 +309,8 @@ TEST_CASE("TriggerEngine: an interval below 30s is clamped to 30", "[trigger_eng
     const auto stored = engine.find_trigger("fast-trigger");
     REQUIRE(stored.has_value());
     CHECK(stored->interval_seconds == 30);
+
+    CHECK_FALSE(engine.find_trigger("missing").has_value());
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -416,15 +418,13 @@ TEST_CASE("TriggerEngine: interval trigger registered, start/stop no crash",
     cfg.interval_seconds = 30;
     engine.register_trigger(cfg);
 
-    // 20ms tick (production: 1s): the window below spans many ticks instead of one.
-    engine.set_poll_cadence(std::chrono::milliseconds{20});
     engine.start();
     REQUIRE(engine.is_running());
 
-    // Negative / no-crash window: long enough for the loop to run its first tick (the
-    // first-observation baseline for this trigger) and several more, and still be mid-loop
-    // at stop(). The 30s interval can never elapse inside it.
-    std::this_thread::sleep_for(std::chrono::milliseconds{150});
+    // Negative / no-crash window: interval_loop ticks once per second, so 1.2s lets it run its
+    // first tick (first-observation baseline for this trigger) and still be mid-loop at stop().
+    // Anything longer only re-runs the same no-op tick; the 1s tick is the floor.
+    std::this_thread::sleep_for(std::chrono::milliseconds{1200});
 
     engine.stop();
     CHECK_FALSE(engine.is_running());
@@ -467,11 +467,15 @@ TEST_CASE("TriggerEngine: file change trigger fires on modification",
     // a starved runner can delay it past any fixed sleep, absorbing a one-off change into the
     // baseline. So keep moving the mtime to a fresh future value until a poll reports it (set
     // explicitly: NTFS caching can delay the natural update).
-    engine.set_poll_cadence(std::chrono::milliseconds{50});
+    //
+    // The 5s deadline is what locks the seam: at the production 5s poll the first poll only
+    // records the baseline and the first detection lands near 10s, so this fails if the interval
+    // stops reaching the loop. It is ~30x the measured 0.16s.
+    engine.set_file_poll_interval(std::chrono::milliseconds{50});
     engine.start();
 
     bool fired = false;
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{12};
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{5};
     for (int bump = 1; !fired && std::chrono::steady_clock::now() < deadline; ++bump) {
         {
             std::ofstream ofs(watch_file, std::ios::trunc);
@@ -479,7 +483,7 @@ TEST_CASE("TriggerEngine: file change trigger fires on modification",
         }
         std::error_code ec;
         fs::last_write_time(watch_file,
-                            std::filesystem::file_time_type::clock::now() +
+                            fs::file_time_type::clock::now() +
                                 std::chrono::seconds{10 * bump},
                             ec);
         // Returns the instant the dispatch arrives; a green run pays a few polls.
@@ -517,7 +521,7 @@ TEST_CASE("TriggerEngine: file change trigger with empty watch_path starts and s
     // 20ms poll (production: 5s), so the loop polls ~10 times inside the window below and every
     // poll walks past the empty watch_path (the skip). At the production cadence the first poll
     // lands after 5s, so no short window ever reached it.
-    engine.set_poll_cadence(std::chrono::milliseconds{20});
+    engine.set_file_poll_interval(std::chrono::milliseconds{20});
     engine.start();
     // The outcome is the same whether the skip or the failing canonical("") handles the empty
     // path (the loop continues and a first observation never fires), so what this proves is that
