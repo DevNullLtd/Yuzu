@@ -177,8 +177,8 @@ the next cycle, so a long backlog drains over several cycles. A chunk that fails
 for a transient reason (the server is unreachable, a timeout), and the chunks not
 yet sent, stay buffered for the next flush; transient server trouble does not lose
 heartbeats. A chunk the server rejects with a non-transient status (for example
-`RESOURCE_EXHAUSTED`) is retried entry by entry when it holds more than one
-heartbeat, and a single heartbeat that is still rejected is dropped and counted
+`RESOURCE_EXHAUSTED`) is split in halves and retried when it holds more than one
+heartbeat (a few extra RPCs per bad heartbeat), and a single heartbeat that is still rejected is dropped and counted
 (`yuzu_gw_heartbeat_buffer_dropped_total{reason="chunk_rejected"}`), so that it
 cannot block the newer heartbeats behind it. A single heartbeat that is by itself
 larger than 3 MiB is sent without its snapshot
@@ -1628,7 +1628,8 @@ env keys with defaults, which a reverted build ignores.
   checked, and the registry is now one of them. The gRPC handler processes for
   Register and Subscribe hold the request while they run; their two call sites
   named above (a Register while the registry is down, a Subscribe while the agent
-  supervisor is down) are now covered, and other handler-process call sites were
+  supervisor is down, and the command request that the management handler hands
+  to the router) are now covered, and other handler-process call sites were
   searched by grep, not exhaustively audited, so what a crash report of one of
   them would print is not established (INFERRED, not measured). Operator guidance:
   treat any gateway crash report as sensitive.
