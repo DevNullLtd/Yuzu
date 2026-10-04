@@ -137,8 +137,10 @@
 start_link() ->
     gen_server:start_link({local, ?SERVER}, ?MODULE, [], []).
 
-%% @doc Forward a RegisterRequest to the C++ server.
--spec proxy_register(map()) -> {ok, map()} | {error, term()}.
+%% @doc Forward a RegisterRequest to the C++ server. The `ok' payload is
+%% whatever the gRPC client handed back: a RegisterResponse map, but a caller
+%% must not assume it (an OK with no DATA frame is not a map).
+-spec proxy_register(map()) -> {ok, term()} | {error, term()}.
 proxy_register(RegisterReq) ->
     gen_server:call(?SERVER, {proxy_register, RegisterReq}, 30000).
 
