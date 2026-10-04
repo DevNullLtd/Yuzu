@@ -144,7 +144,7 @@ Deploy** (the cohort is frozen then). On those devices it:
 The progress view is **aggregate-first**: a count strip (targeted / succeeded /
 executing / in-flight / failed / skipped) and a progress bar are the headline, with
 the per-device list below, problem-first. A device is **Succeeded** on exit 0,
-**Failed** on a stage error, a non-zero exit, being quarantined, or the dispatched
+**Failed** on a stage error, a non-zero exit, being quarantined, the dispatched
 plugin being absent from its reported inventory, or a per-OS kill switch
 withholding the plugin from that device's OS (the last three are permanent — a
 retry will not help), and **Skipped** if you no longer have scope to it when the

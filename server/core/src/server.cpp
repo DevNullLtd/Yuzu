@@ -1436,9 +1436,10 @@ public:
                           "(route=mcp) or the dashboard exec console (route=dashboard) (#3685). "
                           "Both labels are closed sets; every reachable pair "
                           "is pre-seeded at boot so absent() stays meaningful. The "
-                          "policy-withhold reasons quarantined, unknown_plugin and "
-                          "kill_switched_os are correct containment or operator policy, "
-                          "not caller mistakes, and are excluded from the "
+                          "withhold reasons quarantined, unknown_plugin and "
+                          "kill_switched_os are deliberate withholds (containment, an "
+                          "absent plugin, operator policy) rather than malformed "
+                          "targeting, and are excluded from the "
                           "YuzuDispatchTargetRejected alert.",
                           "counter");
         // The route-level reasons below are the literals in `kRouteRejectReasons`

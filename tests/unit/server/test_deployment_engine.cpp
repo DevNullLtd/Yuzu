@@ -400,8 +400,9 @@ TEST_CASE("deployment engine fails a kill-switched device in a mixed batch inste
             CHECK(d.error.find("per-OS kill switch") != std::string::npos);
 
     // sent == 0, every id named: the whole batch is accounted for, so each
-    // device settles to 'failed' with the per-OS text and no residual
-    // revert-to-pending reclaims it.
+    // device settles to 'failed' with the per-OS text. Without the named-id
+    // handling the residual rule would fail them with the generic text, so
+    // the error-text CHECK below is what pins this behaviour.
     const std::string id3 = "e-os-killed-all";
     auto dep3 = make_dep(id3);
     dep3.source_run_id = "run-all-killed"; // one running deployment per source run

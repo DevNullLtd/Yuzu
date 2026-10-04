@@ -20476,11 +20476,11 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 const auto plugin = param_str(args, "plugin");
                 const auto action = param_str(args, "action");
-                // Strict: a present-but-non-string `os` (e.g. 1) must not
-                // fall through param_str's "" and target the all-OS row.
+                // Strict: a present-but-non-string or empty `os` must not
+                // fall through to "" and target the all-OS row (REST parity).
                 const auto os = param_string_strict(args, "os");
-                if (!os) {
-                    res.set_content(a4_error(kInvalidParams, "os must be a string"),
+                if (!os || (args.contains("os") && os->empty())) {
+                    res.set_content(a4_error(kInvalidParams, "os must be a non-empty string"),
                                     "application/json");
                     return;
                 }
@@ -20535,8 +20535,8 @@ McpServer::HandlerFn McpServer::build_handler(
                 const auto action = param_str(args, "action");
                 const auto reason = param_str(args, "reason");
                 const auto os = param_string_strict(args, "os");
-                if (!os) {
-                    res.set_content(a4_error(kInvalidParams, "os must be a string"),
+                if (!os || (args.contains("os") && os->empty())) {
+                    res.set_content(a4_error(kInvalidParams, "os must be a non-empty string"),
                                     "application/json");
                     return;
                 }

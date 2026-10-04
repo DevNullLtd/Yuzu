@@ -44,7 +44,11 @@ plugin and action rows read back unchanged, so nothing flips on upgrade.
 - **Mixed versions.** An older replica applies `PUT .../kill-switch?os=<os>` as the PLUGIN-LEVEL
   row. `enabled=true` can therefore re-enable a plugin you stopped for the whole fleet, and
   `enabled=false` stops the plugin on every OS. Set per-OS rows only after every replica runs this
-  build, and list and re-apply them after any rollback.
+  build, and never write one from an older binary. After a rollback per-OS OFF rows stay stored
+  but are not enforced: if the plugin must stay stopped, set its plugin-level OFF row. Find your
+  rows in the `plugin_config.kill_switch.set` audit entries (`target_id`
+  `<plugin>[.<action>]@<os>`) and confirm each with `GET ...?os=` once every replica is back on
+  this build.
 - **Limits.** An agent whose OS is unknown or empty is never withheld. The OS is what the agent
   reports and is matched exactly (`windows`, `linux`, `darwin`). The MCP pre-dispatch dry run cannot
   see the per-OS layer. Remote agents (connected through another replica) rely on the presence
