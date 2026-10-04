@@ -167,7 +167,8 @@ handle_event([yuzu, gw, upstream, circuit_state], #{count := N}, Meta, _Config) 
     prometheus_counter:inc(yuzu_gw_upstream_circuit_transitions_total, [State], N);
 
 %% Gate 7 sre OBS-4 — registration-replay observability. `replayed` counts
-%% agents re-proxied upstream; `queue_depth` is the gauge an operator alerts
+%% registration replay attempts by the drip, any outcome (success, failure,
+%% accepted=false, superseded); `queue_depth` is the gauge an operator alerts
 %% on to spot a replay storm (UP-5) that never drains.
 handle_event([yuzu, gw, upstream, registration_replay],
              #{replayed := N, queue_depth := Q}, _Meta, _Config) ->
@@ -386,7 +387,7 @@ declare_metrics() ->
     prometheus_counter:declare([
         {name, yuzu_gw_registration_replay_total},
         {labels, []},
-        {help, "Total agents re-proxied upstream by the registration-replay drip"}]),
+        {help, "Total registration replay attempts by the drip, any outcome"}]),
     prometheus_counter:declare([
         {name, yuzu_gw_upstream_notify_dropped_total},
         {labels, [reason]},
