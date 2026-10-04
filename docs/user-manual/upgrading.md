@@ -106,6 +106,10 @@ too large for its type were already `400`.
 
 - Scripts that build `since`/`until` from `date +%s.%N` or any fractional timestamp: send integer
   seconds (`date +%s`).
+- Scripts that send a **negative** `since` or `until` to a response route: it is `400` now. It used
+  to be read as "unbounded", so a window computed as `now - n` that went past the epoch silently
+  returned the whole result. Send `0` (or omit the parameter) for "no bound on that side"; `0` stays
+  valid because the store cannot tell an omitted bound from a literal `0`.
 - MCP clients that send `"limit": null` or `"status": null`, or a float or string for either: omit
   the key to get the default. A `status` above `2147483647` and an unsigned value above
   `9223372036854775807` are `-32602` too (the latter used to wrap to `-1`, "any status"; the same

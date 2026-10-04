@@ -177,7 +177,8 @@ The dedicated export endpoint supports both CSV and JSON formats with the same
 filter parameters as the query endpoint. It defaults to a higher limit
 (10,000 rows) for bulk exports. Numeric parameters must be one whole base-10 integer
 (`since=1e9`, `limit=100abc`, `status=0x1` and `since=1.5` are `400`, not a different
-filter); `since` or `until` at or below `0` means unbounded.
+filter); `since` or `until` of `0` (or omitted) means no bound on that side, and a negative
+value is `400`.
 
 **Query parameters:**
 

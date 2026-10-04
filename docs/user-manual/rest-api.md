@@ -6064,8 +6064,11 @@ no wraparound. Zero-padding (`status=007`) is still a valid `7`. `status` has on
 is the documented "any status" sentinel and stays accepted, but any value below `-1` (for example
 `status=-5`) is rejected, because the store only applies the filter for `status >= 0`, so it
 previously behaved exactly like "no filter" while looking like one. A script that sends a
-fractional epoch (`date +%s.%N`) must send integer seconds. `since` and `until` get no range check:
-`since` or `until` at or below `0` means unbounded on that side. `GET
+fractional epoch (`date +%s.%N`) must send integer seconds. `since` and `until` must be `0` or
+more: `0` (or omitting the parameter) means no bound on that side, and a **negative** value is `400`
+(it used to be read as "unbounded" too, so a computed window that underflowed silently returned the
+whole result). Zero cannot be rejected as well: the store applies a bound only above `0`, so it
+cannot tell an omitted bound from a literal `0`. `GET
 /api/v1/executions/{id}/responses` shares the parser. MCP `query_responses` applies the same rule
 to its JSON arguments, with its own error codes (see its entry in the MCP tool reference). Each
 rejection increments `yuzu_server_response_param_rejected_total{surface}`
@@ -10111,7 +10114,7 @@ export" under Command/Instruction Responses. A cut CSV export ends with a `# res
 (7 fields) and sets `X-Result-Truncated-By-Cap: true`; a cut JSON envelope carries a top-level
 `result_truncated_by_cap: true`; both are downloaded as `responses-<id>-truncated.<json|csv>`. The JSON envelope's `count` is the number of rows served.
 Numeric query parameters (`status`, `since`, `until`, `limit`) are parsed strictly and a malformed
-value is `400`; `since` or `until` at or below `0` means unbounded. The legacy export writes no
+value is `400`; `since` or `until` of `0` means unbounded and a negative one is `400`. The legacy export writes no
 success audit row (only a management-group scope drop is audited; the v1 twin audits every read).
 
 **Audit caveat (#5556).** Legacy `GET /api/responses/*` writes no `result=success` audit row and does not fail closed on audit-persist failure; use `/api/v1/responses` for SIEM evidence of response reads.

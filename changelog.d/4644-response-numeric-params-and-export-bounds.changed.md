@@ -5,7 +5,7 @@
   `?status=0x1` meant status `0`, `?limit=100abc` meant `100` and `?since=1.5` meant `1`. The whole value must now be one base-10
   integer, so those forms return `400` (an empty value and a value too large for its type already did). `status` below the
   documented `-1` "any" sentinel, such as `status=-5` (which the store treated as no filter), is now `400` as well. A script that
-  passes a fractional epoch (`date +%s.%N`) must send integer seconds. MCP `query_responses` returns `-32602` for a `status` or `limit`
+  passes a fractional epoch (`date +%s.%N`) must send integer seconds. A **negative** `since` or `until` is `400` too (it was read as "unbounded", so a window that underflowed returned the whole result); `0` still means no bound on that side. MCP `query_responses` returns `-32602` for a `status` or `limit`
   that is not a JSON integer (a float, a string, a boolean and `null`, which was previously read as the default: omit the key
   instead), for `status` below `-1` or above `2147483647`, and for an unsigned value above `9223372036854775807` (which wrapped to
   `-1`, the "any" sentinel). `param_int_strict` now refuses that unsigned range for its 16 other MCP callers too.

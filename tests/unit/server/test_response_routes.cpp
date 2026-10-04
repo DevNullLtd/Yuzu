@@ -770,8 +770,8 @@ TEST_CASE("GET /api/responses/:id/export: the byte cap always serves one row and
     CHECK(csv_trailer(many_csv->body) == "# result_truncated_by_cap cause=byte_cap,,,,,,");
 }
 
-TEST_CASE("legacy response routes: since at or below zero and until zero mean unbounded "
-          "(#4644)",
+TEST_CASE("legacy response routes: since and until of zero mean unbounded, a negative one is a "
+          "400 (#4644)",
           "[server][routes][response_routes][rest][pg]") {
     PgHarness h;
     for (int i = 0; i < 3; ++i) {
@@ -783,14 +783,26 @@ TEST_CASE("legacy response routes: since at or below zero and until zero mean un
         r.timestamp = 100 + i;
         h.store->store(r);
     }
-    // Pinned so a future "tighten" of the stores' zero-is-unbounded rule is a visible
-    // change: the strict parser only decides what is a number, not what a number means.
-    for (const char* q : {"since=-5", "since=0", "until=0", "until=-5", "since=0&until=0"}) {
+    // Zero is the documented "no bound on that side" sentinel (ResponseQuery defaults both
+    // to 0, so the store cannot tell an omitted bound from a literal 0): pinned.
+    for (const char* q : {"since=0", "until=0", "since=0&until=0", "since=000"}) {
         INFO(q);
         auto res = h.sink.Get(std::string("/api/responses/instr-window/export?") + q);
         REQUIRE(res);
         REQUIRE(res->status == 200);
         CHECK(json::parse(res->body)["responses"].size() == 3);
+    }
+    // A negative epoch is no timestamp: it used to widen to "unbounded", so a computed window
+    // that underflowed silently returned the whole result. Every route sharing the parser.
+    for (const char* route : {"/api/responses/instr-window", "/api/responses/instr-window/export",
+                              "/api/responses/instr-window/aggregate"}) {
+        for (const char* q : {"since=-5", "until=-5", "since=-1&until=0", "since=0&until=-9"}) {
+            INFO(route << "?" << q);
+            auto res = h.sink.Get(std::string(route) + "?" + q);
+            REQUIRE(res);
+            CHECK(res->status == 400);
+            CHECK(json::parse(res->body)["error"]["message"] == "invalid numeric query parameter");
+        }
     }
 }
 

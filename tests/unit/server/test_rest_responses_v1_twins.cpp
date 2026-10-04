@@ -848,7 +848,8 @@ TEST_CASE("GET /api/v1/responses/:id/export: the byte cap always serves one row 
     CHECK(v1_csv_trailer(many_csv->body) == "# result_truncated_by_cap cause=byte_cap,,,,,,,,,");
 }
 
-TEST_CASE("v1 response routes: since at or below zero and until zero mean unbounded (#4644)",
+TEST_CASE("v1 response routes: since and until of zero mean unbounded, a negative one is a 400 "
+          "(#4644)",
           "[pg][rest][responses][v1]") {
     YUZU_REQUIRE_PG_DB_TPL(db, respv1_responsestore_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
@@ -856,15 +857,25 @@ TEST_CASE("v1 response routes: since at or below zero and until zero mean unboun
     for (int i = 0; i < 3; ++i)
         h.response_store->store(
             mk_resp("instr-window", "agent-" + std::to_string(i), 0, "o", 100 + i));
-    // Pinned so a future "tighten" of the stores' zero-is-unbounded rule is a visible
-    // change: the strict parser only decides what is a number, not what a number means.
+    // Zero is the documented "no bound on that side" sentinel: pinned.
     for (const char* route : {"", "/export"}) {
-        for (const char* q : {"since=-5", "since=0", "until=0", "until=-5", "since=0&until=0"}) {
+        for (const char* q : {"since=0", "until=0", "since=0&until=0"}) {
             INFO(route << " " << q);
             auto res = h.sink.Get(std::string("/api/v1/responses/instr-window") + route + "?" + q);
             REQUIRE(res);
             REQUIRE(res->status == 200);
             CHECK(nlohmann::json::parse(res->body)["data"].size() == 3);
+        }
+    }
+    // A negative epoch is no timestamp; it used to widen to "unbounded".
+    for (const char* route : {"", "/export", "/aggregate"}) {
+        for (const char* q : {"since=-5", "until=-5", "since=-1&until=0", "since=0&until=-9"}) {
+            INFO(route << " " << q);
+            auto res = h.sink.Get(std::string("/api/v1/responses/instr-window") + route + "?" + q);
+            REQUIRE(res);
+            CHECK(res->status == 400);
+            CHECK(nlohmann::json::parse(res->body)["error"]["message"] ==
+                  "invalid numeric query parameter");
         }
     }
 }
