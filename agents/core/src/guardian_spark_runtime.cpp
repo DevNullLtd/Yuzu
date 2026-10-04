@@ -213,6 +213,13 @@ GuardianSparkRuntime::try_dispatch_head_locked(const std::string& key) {
     auto& head = eit->second.fifo.front();
     if (head->dispatch != ClaimDispatch::Queued)
         return nullptr;
+    // #5322 INV-1: a dead Queued head (the sweep above could not release it, or it is
+    // withdrawn / abandoned / terminal) is NEVER selected for a fresh dispatch. It would
+    // arm and compensate in a loop on a free pool, or stamp the clean follower behind it
+    // AdmissionRejected on a full one. It stays put until reap_stranded_claims_locked()
+    // (or the next sweep) releases and pops it.
+    if (is_dead_claim(*head))
+        return nullptr;
     head->dispatch = ClaimDispatch::Dispatching;
     head->arm_parked = false; // #5168: a parked arm redriven by a same-key event
     return head;
@@ -289,9 +296,11 @@ void GuardianSparkRuntime::fail_all_claims_locked(const std::string& key, const 
         return;
     }
     // Keep only the tombstones (Queued, withdrawn, index still held): the next
-    // same-key attach queues behind them and its dispatch drives the head; the drain
-    // then sweeps the tombstones, retrying their index release, and adopts the arm for
-    // the live claim. Erase-by-iterator only: nothing here can throw.
+    // same-key attach queues behind them. A tombstone head is never dispatched (INV-1,
+    // try_dispatch_head_locked); the next sweep (an attach's head drive, a detach, the
+    // redrive lane's sweep-before-adopt) or the heartbeat's reap_stranded_claims_locked
+    // retries its index release, pops it, and refills the live claim behind it.
+    // Erase-by-iterator only: nothing here can throw.
     std::erase_if(fifo, [](const std::shared_ptr<KeyClaim>& c) { return !c->index_held; });
     for (auto& c : fifo)
         c->dispatch = ClaimDispatch::Queued;
@@ -627,8 +636,15 @@ void GuardianSparkRuntime::adopt_undriven_arm_head_locked(KeyClaimQueue& entry) 
     // threw, or (d) a double-fault recovery in on_arm_complete / finalize_arm_compensation /
     // dispatch_arm_off_lock handed a head back to Queued (its own comment says the claim
     // may already have committed: a re-arm of a committed key fails at keys_.emplace and is
-    // compensated, never leaked, so driving it here is safe and self-healing). Park it so
-    // the permit-release hooks and redrive_parked_arms() reach it.
+    // compensated, never leaked, so driving it here is safe; the redundant arm is the cost).
+    // Park it so the permit-release hooks and redrive_parked_arms() reach it.
+    //
+    // #5322: a dead Queued head is never parked or dispatched (INV-1), so sweep first: a
+    // tombstone whose release now succeeds is popped and the follower it exposed becomes
+    // the head this function adopts. An entry the sweep empties is LEFT in place (the
+    // callers range-for claims_, so erasing it here would invalidate them); every consumer
+    // tolerates an empty entry and reap_stranded_claims_locked() erases it.
+    sweep_terminal_queued_locked(entry);
     if (entry.fifo.empty())
         return;
     const auto& head = entry.fifo.front();
@@ -853,7 +869,39 @@ void GuardianSparkRuntime::dispatch_arm_off_lock(const std::string& key,
             const auto eit = claims_.find(key);
             if (eit == claims_.end() || eit->second.fifo.empty() || eit->second.fifo.front() != claim)
                 return; // already resolved/replaced before dispatch even began
-            if (auto permit = try_reserve_compensation_locked(claim->io_class)) {
+            // #5322 INV-1 entry guard, the FIRST arm of this chain (a standalone `if` would
+            // still run the reservation below on a claim this guard just erased). A
+            // claim withdrawn or carrying a commit throw during the Dispatching window
+            // (the entry hook above, a detach, a caller timeout) must not reach the backend:
+            // arming it would only be compensated again. NOT the full dead predicate: a
+            // waiter_abandoned claim that carries an outcome must still reach the
+            // reservation so reclassify_dispatching_race_locked and late adoption work.
+            if (claim->withdrawn || claim->commit_exception) {
+                if (stopping_) {
+                    // begin_stop()'s walk skipped it (it was Dispatching) and nothing
+                    // redrives after a sticky stop: drop it as that walk drops a Queued
+                    // claim, so the receipt does not stay Pending and no residue is left.
+                    clear_retained_locked(*claim);
+                    release_claim_index_locked(*claim); // noexcept
+                    try {
+                        if (!claim->outcome)
+                            claim->outcome = std::unexpected(std::string{"stopping"});
+                    } catch (...) {
+                    }
+                    if (claim->end == ClaimEnd::None)
+                        claim->end = ClaimEnd::Stopped;
+                    claims_dropped_at_stop_.fetch_add(1, std::memory_order_relaxed);
+                    std::erase(eit->second.fifo, claim);
+                    if (eit->second.fifo.empty())
+                        claims_.erase(eit);
+                } else {
+                    // Back to Queued: the heartbeat's reaper (or the next sweep) releases and
+                    // pops it and refills the follower behind it.
+                    claim->dispatch = ClaimDispatch::Queued;
+                    claim->arm_parked = false;
+                }
+                refused = true;
+            } else if (auto permit = try_reserve_compensation_locked(claim->io_class)) {
                 // rung 9c PR-5b hardening (this governance run): the permit now
                 // lives on the claim itself (KeyClaim::compensation_permit, an
                 // RAII CompensationPermit) rather than a plain bool - see that
@@ -2300,8 +2348,8 @@ std::size_t GuardianSparkRuntime::reap_stranded_claims_locked(
     std::vector<std::pair<std::string, std::shared_ptr<KeyClaim>>>& refills) {
     const auto now = std::chrono::steady_clock::now();
     std::size_t reaped = 0;
+    bool release_failed = false;
     for (auto it = claims_.begin(); it != claims_.end();) {
-        const std::string& key = it->first;
         auto& fifo = it->second.fifo;
         bool key_changed = false;
         while (!fifo.empty()) {
@@ -2332,52 +2380,79 @@ std::size_t GuardianSparkRuntime::reap_stranded_claims_locked(
             // Fable's review could construct a real reproduction of it either -
             // left as a documented non-fix (see the PLAN doc) rather than risking
             // this exact class of defect again.
-            const bool stranded_queued = c->dispatch == ClaimDispatch::Queued && !c->outcome &&
-                                         !c->commit_exception &&
-                                         (c->withdrawn || c->waiter_abandoned);
-            if (!stranded_queued)
-                break; // legitimately still in flight, or legitimately awaiting its turn
+            if (c->dispatch != ClaimDispatch::Queued)
+                break; // legitimately still in flight: a drain owns it
             if (!c->compensation_finished)
                 break; // its own compensating disarm is genuinely still outstanding
-            try {
-                synthesize_fallback_outcome_locked(*c);
-            } catch (...) {
-                claim_drain_failures_.fetch_add(1, std::memory_order_relaxed);
-                break; // leave it for the next pass rather than reap a half-written claim
+            // #5322: the pop predicate is the sweep's (a Queued claim already carrying an
+            // outcome or a commit throw: a retained tombstone, a committed Queued suffix,
+            // a non-owner claim, the hand-back shape) plus the old synthesis arm (a
+            // withdrawn / abandoned head with NO outcome yet, written here first). A CLEAN
+            // head with neither is awaiting its turn.
+            if (!c->outcome && !c->commit_exception) {
+                if (!(c->withdrawn || c->waiter_abandoned))
+                    break;
+                try {
+                    synthesize_fallback_outcome_locked(*c);
+                } catch (...) {
+                    claim_drain_failures_.fetch_add(1, std::memory_order_relaxed);
+                    break; // leave it for the next pass rather than reap a half-written claim
+                }
             }
-            if (!release_claim_index_locked(*c))
-                break; // release still failing (seam / genuine failure): retry next pass
+            // Decided BEFORE the release (which clears index_held): did this pass free a
+            // genuine ghost mapping, not merely pop a non-owner or a committed suffix?
+            const bool genuine = c->index_held && index_->owns(c->key, c->rule_id, c->generation);
+            if (!release_claim_index_locked(*c)) {
+                release_failed = true;
+                break; // ONE attempt per terminal tombstone per pass; retry next pass
+            }
+            if (genuine)
+                tombstones_released_by_reaper_.fetch_add(1, std::memory_order_relaxed);
             fifo.pop_front();
             ++reaped;
             key_changed = true;
         }
         if (fifo.empty()) {
-            it = claims_.erase(it);
-        } else {
-            if (key_changed) {
-                if (auto refill = try_dispatch_head_locked(key)) {
-                    // Fable review (2026-09-14): try_dispatch_head_locked() already
-                    // flipped this head Queued->Dispatching before returning it - if
-                    // the collection push below throws (key's std::string copy,
-                    // vector growth), nobody will ever drive this claim: it is not
-                    // Queued any more (redrive_retained_disarms()/a same-key event
-                    // won't touch it) and the NEXT stranded-claims pass skips
-                    // non-Queued heads too. Same class of alloc-after-flip wedge this
-                    // function exists to fix - contained the same way the rest of
-                    // this file handles it (dispatch_arm_off_lock's own refusal path,
-                    // above): hand the head back to Queued so the next same-key event
-                    // or stranded-claims pass re-drives it, and count the failure.
-                    try {
-                        refills.emplace_back(key, refill);
-                    } catch (...) {
-                        claim_drain_failures_.fetch_add(1, std::memory_order_relaxed);
-                        if (refill->dispatch == ClaimDispatch::Dispatching)
-                            refill->dispatch = ClaimDispatch::Queued;
-                    }
+            it = claims_.erase(it); // the ONLY erase of a claims_ entry in this loop
+            continue;
+        }
+        if (key_changed) {
+            // The popped claims exposed a new head. Never select a dead one (INV-1), and
+            // never call try_dispatch_head_locked() here: it may erase this very entry
+            // mid-iteration. The refill is pushed BEFORE the head is flipped to
+            // Dispatching, so a push that throws leaves it a clean Queued head; the catch
+            // parks it (the permit-release hooks and the convergence lane's
+            // redrive_parked_arms() drive a parked arm, as does a same-key attach's head
+            // drive). The reaper itself never re-selects a clean head.
+            const auto& head = fifo.front();
+            if (head->kind == ClaimKind::Arm && head->dispatch == ClaimDispatch::Queued &&
+                !is_dead_claim(*head)) {
+                try {
+                    fault_here_for_test(16); // seam: "the refill push threw"
+                    refills.emplace_back(it->first, head);
+                    head->dispatch = ClaimDispatch::Dispatching;
+                    head->arm_parked = false;
+                } catch (...) {
+                    claim_drain_failures_.fetch_add(1, std::memory_order_relaxed);
+                    adopt_undriven_arm_head_locked(it->second);
                 }
             }
-            ++it;
         }
+        ++it;
+    }
+    // A release that keeps failing leaves its tombstone (and the follower behind it)
+    // blocked for good; say so, rarely: every 64th consecutive pass that left one.
+    if (release_failed) {
+        if (++reaper_release_failed_passes_ % 64 == 0) {
+            try {
+                spdlog::warn("Guardian spark: a retained claim's index release has failed on {} "
+                             "consecutive heartbeat passes - its key stays blocked",
+                             reaper_release_failed_passes_);
+            } catch (...) {
+            }
+        }
+    } else {
+        reaper_release_failed_passes_ = 0;
     }
     return reaped;
 }
@@ -2731,9 +2806,11 @@ GuardianSparkRuntime::attach_core(const std::string& key, std::string rule_id, S
                 // own claim is one a contained failure handed back (a refill whose
                 // admission-failure cleanup threw, a drain whose publish threw) or a
                 // withdrawn tombstone still holding its index mapping. Nothing else
-                // drives it, so THIS call does, exactly as it would its own head: the
-                // drain then adopts the arm for the live claims behind it and sweeps
-                // the tombstone (retrying its index release).
+                // drives it, so THIS call does: try_dispatch_head_locked sweeps terminal
+                // heads first (retrying a tombstone's index release and popping it) and
+                // dispatches the head it exposes. A head that is STILL dead (INV-1: a
+                // tombstone whose release keeps failing) is not selected; this call's
+                // claim stays queued behind it until the heartbeat's reaper releases it.
                 else if (entry.fifo.front() != c && entry.fifo.front()->kind == ClaimKind::Arm &&
                          entry.fifo.front()->dispatch == ClaimDispatch::Queued)
                     to_dispatch = try_dispatch_head_locked(key);
