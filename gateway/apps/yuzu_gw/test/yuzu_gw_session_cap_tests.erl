@@ -87,7 +87,15 @@ cap_test_() ->
       {"two rows of one agent, committed in either order, leave one row and a commit of a gone row answers an error",
        fun commit_orders_leave_one_row/0},
       {"2 and 20 concurrent Registers of one agent id leave exactly one pending row, 200 times",
-       {timeout, 120, fun concurrent_same_agent_registers_leave_one_row/0}}
+       {timeout, 120, fun concurrent_same_agent_registers_leave_one_row/0}},
+      {"the rows of a connection that dies are gone at once, other connections' rows stay",
+       fun closed_connection_rows_dropped/0},
+      {"a connection already dead when its row is stored loses the row too",
+       fun dead_connection_rows_dropped/0},
+      {"one monitor per connection, and none left after 100 connection cycles",
+       {timeout, 60, fun connection_monitors_do_not_leak/0}},
+      {"the sweep releases the monitor of a live connection with no row left, and keeps the others",
+       fun sweep_releases_idle_connection_monitors/0}
      ]}.
 
 setup() ->
@@ -713,6 +721,87 @@ concurrent_same_agent_registers_leave_one_row() ->
         ?assertEqual([], reserved_rows())
     end, [{N, Round} || N <- [2, 20], Round <- lists:seq(1, 200)]).
 
+%% A connection process that exits takes its reservations and pending rows with
+%% it, within a bounded wait (the DOWN, not the 2 minute TTL): rows of a live
+%% connection and of another one are untouched.
+closed_connection_rows_dropped() ->
+    Dying = conn(),
+    Live = conn(),
+    Other = conn(),
+    [ok = yuzu_gw_registry:store_pending(session(I), info(agent(I), Dying))
+     || I <- lists:seq(1, 3)],
+    {ok, _} = yuzu_gw_registry:reserve_session(Dying, agent(4)),
+    [ok = yuzu_gw_registry:store_pending(session(I), info(agent(I), Live))
+     || I <- lists:seq(11, 12)],
+    {ok, LiveRef} = yuzu_gw_registry:reserve_session(Live, agent(13)),
+    ok = yuzu_gw_registry:store_pending(session(21), info(agent(21), Other)),
+    ?assertEqual(3, length(pending_rows(Dying))),
+    ?assertEqual(1, length(reserved_rows_of(Dying))),
+    exit(Dying, kill),
+    ?assertEqual(ok, wait_until(fun() -> pending_rows(Dying) =:= [] andalso
+                                         reserved_rows_of(Dying) =:= [] end)),
+    ?assertEqual([session(11), session(12)], lists:sort(pending_rows(Live))),
+    ?assertEqual([{reserved, LiveRef}], reserved_rows_of(Live)),
+    ?assertEqual([session(21)], pending_rows(Other)),
+    %% The count of the dead connection is free: a reconnect starts at zero.
+    ?assertEqual(ok, yuzu_gw_registry:store_pending(session(31), info(agent(31), conn()))).
+
+dead_connection_rows_dropped() ->
+    Dead = spawn(fun() -> ok end),
+    Mon = monitor(process, Dead),
+    receive {'DOWN', Mon, process, Dead, _} -> ok after 2000 -> error(not_dead) end,
+    {ok, Ref} = yuzu_gw_registry:reserve_session(Dead, agent(1)),
+    ?assert(is_reference(Ref)),
+    %% The caller is answered ok, or the fixed error when the DOWN removed its row
+    %% before the commit: either way the row does not stay.
+    ?assert(lists:member(yuzu_gw_registry:store_pending(session(2), info(agent(2), Dead)),
+                         [ok, {error, registry_unavailable}])),
+    ?assertEqual(ok, wait_until(fun() -> pending_rows(Dead) =:= [] andalso
+                                         reserved_rows() =:= [] end)),
+    %% The registry still serves, and the monitor is spent.
+    ?assertEqual(0, monitor_count()).
+
+%% The monitors the registry holds: one per connection however many rows, and
+%% none for a connection that is gone or has no row left.
+connection_monitors_do_not_leak() ->
+    Base = monitor_count(),
+    One = conn(),
+    [ok = yuzu_gw_registry:store_pending(session(I), info(agent(I), One))
+     || I <- lists:seq(1, ?CAP)],
+    ?assertEqual(Base + 1, monitor_count()),
+    [begin
+         C = conn(),
+         [ok = yuzu_gw_registry:store_pending(session(100 + I), info(agent(100 + I), C))
+          || I <- lists:seq(1, 3)],
+         exit(C, kill),
+         ?assertEqual(ok, wait_until(fun() -> pending_rows(C) =:= [] end))
+     end || _ <- lists:seq(1, 100)],
+    barrier(),
+    ?assertEqual(Base + 1, monitor_count()),
+    exit(One, kill),
+    ?assertEqual(ok, wait_until(fun() -> monitor_count() =:= Base end)).
+
+sweep_releases_idle_connection_monitors() ->
+    Base = monitor_count(),
+    Idle = [conn() || _ <- lists:seq(1, 5)],
+    Busy = conn(),
+    [ok = yuzu_gw_registry:store_pending(session(I), info(agent(I), C))
+     || {I, C} <- lists:zip(lists:seq(1, 5), Idle)],
+    ok = yuzu_gw_registry:store_pending(session(9), info(agent(9), Busy)),
+    ?assertEqual(Base + 6, monitor_count()),
+    %% Subscribe takes the five rows of the idle connections.
+    [?assertMatch(#{agent_id := _}, yuzu_gw_registry:take_pending(session(I)))
+     || I <- lists:seq(1, 5)],
+    yuzu_gw_registry ! sweep_pending,
+    barrier(),
+    ?assertEqual(Base + 1, monitor_count()),
+    %% The idle connection stores a row again: monitored again.
+    ok = yuzu_gw_registry:store_pending(session(10), info(agent(10), hd(Idle))),
+    ?assertEqual(Base + 2, monitor_count()),
+    %% And the busy one still loses its row with its process.
+    exit(Busy, kill),
+    ?assertEqual(ok, wait_until(fun() -> pending_rows(Busy) =:= [] end)).
+
 %%%===================================================================
 %%% Helpers
 %%%===================================================================
@@ -763,6 +852,16 @@ conn_count(ConnKey) ->
 pending_rows(ConnKey) ->
     [S || {S, #{conn_key := K}, _} <- ets:tab2list(yuzu_gw_pending),
           is_binary(S), K =:= ConnKey].
+
+%% The keys of the reservation rows of ConnKey.
+reserved_rows_of(ConnKey) ->
+    [K || {{reserved, _} = K, #{conn_key := C}, _} <- ets:tab2list(yuzu_gw_pending),
+          C =:= ConnKey].
+
+%% How many monitors the registry process holds.
+monitor_count() ->
+    {monitors, Mons} = process_info(whereis(yuzu_gw_registry), monitors),
+    length(Mons).
 
 %% The keys of the reservation rows.
 reserved_rows() ->

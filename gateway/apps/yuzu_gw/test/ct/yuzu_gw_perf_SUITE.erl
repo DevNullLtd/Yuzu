@@ -458,7 +458,7 @@ reconnection_storm(_Config) ->
     end, {[], []}, lists:seq(1, Cycles)),
 
     %% Verify monitor_refs map — no leaks.
-    {state, MonRefs, _} = sys:get_state(yuzu_gw_registry),
+    MonRefs = element(2, sys:get_state(yuzu_gw_registry)),
     MonRefCount = maps:size(MonRefs),
     ?assertEqual(N, MonRefCount,
                  lists:flatten(io_lib:format(
@@ -520,7 +520,7 @@ monitor_map_stability(_Config) ->
         lists:foreach(fun(Pid) -> exit(Pid, kill) end, Pids),
         ok = yuzu_gw_perf_helpers:wait_for_registry_count(0, 30000),
 
-        {state, MonRefs, _} = sys:get_state(yuzu_gw_registry),
+        MonRefs = element(2, sys:get_state(yuzu_gw_registry)),
         MonRefCount = maps:size(MonRefs),
         ?assertEqual(0, MonRefCount,
                      lists:flatten(io_lib:format(

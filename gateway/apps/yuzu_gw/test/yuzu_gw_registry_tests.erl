@@ -296,7 +296,8 @@ reregister_no_monitor_leak() ->
     ok = yuzu_gw_registry:register_agent(<<"leak-test">>, Pid2, <<"s2">>, [], <<>>),
 
     %% Inspect the gen_server state via sys:get_state.
-    {state, MonRefs, _SweepTimer} = sys:get_state(yuzu_gw_registry),
+    %% The agent monitors are the second field of the state.
+    MonRefs = element(2, sys:get_state(yuzu_gw_registry)),
 
     %% There should be exactly one monitor ref for <<"leak-test">>.
     RefCount = length([V || {_, V} <- maps:to_list(MonRefs), V =:= <<"leak-test">>]),

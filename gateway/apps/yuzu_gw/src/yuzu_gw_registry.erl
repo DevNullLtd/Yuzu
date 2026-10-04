@@ -64,6 +64,16 @@
 %%% every removal path (deregister, supersede, a dead process) releases the
 %%% count. A connection key of `undefined' is never counted.
 %%%
+%%% 4. A closed connection frees its rows at once. The registry monitors the
+%%% connection process (one monitor per connection, taken when a reservation or
+%%% pending row is first stored for it, whatever the number of rows) and removes
+%%% every reservation and pending row of the connection when it goes down, so a
+%%% client that reconnects over and over neither starts again below the cap nor
+%%% leaves its stored RegisterRequests to wait for the TTL. The sweep releases the
+%%% monitor of a connection that has no row left. Only a pid is monitored. A row
+%%% stored for a connection that is already dead is removed the same way: the
+%%% monitor of a dead process fires at once.
+%%%
 %%% Not covered: the gap between Subscribe taking a pending row and the live
 %%% insert, where a slot is free for a moment and another Register can take it;
 %%% the live insert is then the one refused, never a proxied Register left
@@ -125,6 +135,9 @@
 
 -record(state, {
     monitor_refs :: #{reference() => binary()},
+    %% One monitor per connection process that has a reservation or a pending row
+    %% (the connection key, when it is a pid): its death removes those rows.
+    conn_monitors = #{} :: #{pid() => reference()},
     sweep_timer  :: reference()
 }).
 
@@ -786,7 +799,10 @@ handle_call({reserve_session, ConnKey, AgentId}, _From, State) ->
         {error, session_limit} = Refused ->
             Refused
     end,
-    {reply, Reply, State};
+    {reply, Reply, case Reply of
+                       {ok, _} -> monitor_connection(ConnKey, State);
+                       _       -> State
+                   end};
 
 handle_call({commit_pending, SessionId, ConnKey, AgentId, Ref}, _From, State) ->
     %% The pending row is already stored, and it must still be there: a commit
@@ -816,7 +832,10 @@ handle_call({commit_pending, SessionId, ConnKey, AgentId, Ref}, _From, State) ->
         [] ->
             {error, registry_unavailable}
     end,
-    {reply, Reply, State};
+    {reply, Reply, case Reply of
+                       ok -> monitor_connection(ConnKey, State);
+                       _  -> State
+                   end};
 
 handle_call({register, AgentId, _Pid, _SessionId, _Plugins, _Hostname, _RegisterReq, ConnKey}
             = Request, From, State) ->
@@ -885,7 +904,18 @@ handle_info({'DOWN', MonRef, process, Pid, _Reason},
             %% pg auto-removes dead processes, but we clean ETS explicitly.
             {noreply, State#state{monitor_refs = maps:remove(MonRef, Mons)}};
         error ->
-            {noreply, State}
+            %% A connection process: its reservations and pending rows go with it
+            %% (a stored RegisterRequest is not kept for a connection that is
+            %% gone, and a reconnect does not start again below the cap). The
+            %% monitor is spent.
+            #state{conn_monitors = ConnMons} = State,
+            case maps:find(Pid, ConnMons) of
+                {ok, MonRef} ->
+                    drop_connection_rows(Pid),
+                    {noreply, State#state{conn_monitors = maps:remove(Pid, ConnMons)}};
+                _ ->
+                    {noreply, State}
+            end
     end;
 
 handle_info(sweep_pending, State) ->
@@ -913,7 +943,7 @@ handle_info(sweep_pending, State) ->
         N -> logger:info("Swept ~b expired pending registrations", [N])
     end,
     TRef = erlang:send_after(?PENDING_SWEEP_MS, self(), sweep_pending),
-    {noreply, State#state{sweep_timer = TRef}};
+    {noreply, release_idle_monitors(State#state{sweep_timer = TRef})};
 
 handle_info(_Info, State) ->
     {noreply, State}.
@@ -958,6 +988,41 @@ take_reservation(Ref) ->
         [{_, _, StoredAt}] -> StoredAt >= Oldest;
         []                 -> false
     end.
+
+%% Monitor the connection process ConnKey once, when the first reservation or
+%% pending row is stored for it. Only a pid is monitored (the key is any term in
+%% tests, and a monitor of an atom names a registered process). A process that is
+%% already dead is monitored all the same: its DOWN arrives at once and removes
+%% the rows just stored.
+monitor_connection(ConnKey, #state{conn_monitors = ConnMons} = State) when is_pid(ConnKey) ->
+    case maps:is_key(ConnKey, ConnMons) of
+        true  -> State;
+        false -> State#state{conn_monitors = ConnMons#{ConnKey => monitor(process, ConnKey)}}
+    end;
+monitor_connection(_ConnKey, State) ->
+    State.
+
+%% Remove every reservation and pending row of the connection ConnKey.
+drop_connection_rows(ConnKey) ->
+    _ = ets:select_delete(?PENDING_TABLE,
+                          [{{'_', #{conn_key => ConnKey}, '_'}, [], [true]}]),
+    ok.
+
+%% Release the monitor of a connection with no reservation or pending row left
+%% (Subscribe took its rows, or they expired): a connection that lives for days
+%% must not hold one for as long. Run by the sweep; a connection that stores a
+%% row later is monitored again by that call.
+release_idle_monitors(#state{conn_monitors = ConnMons} = State) ->
+    Present = ets:foldl(fun({_, #{conn_key := K}, _}, Acc) -> Acc#{K => true};
+                           (_, Acc)                        -> Acc
+                        end, #{}, ?PENDING_TABLE),
+    Kept = maps:filter(fun(Conn, MonRef) ->
+                           case maps:is_key(Conn, Present) of
+                               true  -> true;
+                               false -> demonitor(MonRef, [flush]), false
+                           end
+                       end, ConnMons),
+    State#state{conn_monitors = Kept}.
 
 %% A Register of AgentId on ConnKey replaces its older pending rows there, as the
 %% live insert replaces the live row: the rows of the agent stored at or before
