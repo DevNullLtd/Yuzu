@@ -1,0 +1,18 @@
+File: acl_to_text.txt -- libSystem acl_to_text() output (ACL_TYPE_EXTENDED), one ACL.
+REAL CAPTURES, joined under one header. Host braga (this Mac), macOS 26.6.2, arm64, captured 2026-10-04.
+
+Entries 1-2 (resolved), on a scratch directory d:
+  chmod +a "group:staff deny write,limit_inherit" d
+  chmod +a "<login> allow read,file_inherit,directory_inherit,only_inherit" d
+  acl_get_file(d, ACL_TYPE_EXTENDED) + acl_to_text() (8-line C program, scratchpad)
+libSystem emits deny entries first, hence the group line precedes the user line.
+Redaction: the login name was replaced by `_user` (README standard rule 5); its UUID and uid 501 are as captured.
+
+Entries 3-4 (unresolved): printed by the test case "acl_to_text round trip: unresolved principals keep
+distinct UUIDs" in tests/unit/test_filesystem_acl_parsers.cpp (two uuid_generate_random qualifiers no
+directory service resolves; acl_set_file + acl_get_file + acl_to_text). Lines copied verbatim from its output.
+Build+run command (scratchpad):
+  clang++ -std=c++23 -I<vcpkg>/include -Isdk/include -Iagents/plugins/filesystem/src -Itests/unit -Itests \
+    tests/unit/test_filesystem_acl_parsers.cpp -L<vcpkg>/lib -L<vcpkg>/lib/manual-link -lCatch2Main -lCatch2 -o t
+  ./t "acl_to_text round trip*"
+Unresolved principals print name and id empty: user:<UUID>:::allow:read.
