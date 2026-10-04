@@ -399,6 +399,11 @@ ecosystem value, not collected). `version` is now the upstream version with the
 release/revision split into its own field, and rpm `publisher` switches
 VENDOR→PACKAGER — both operator-visible data shifts on Linux fleets.
 
+> **Update (2026-10-04, #5328):** `homebrew` was never emitted as an ecosystem
+> value and is retired. Homebrew (ecosystem `brew`; kind `pkg` for formulae, `app`
+> for casks) and Windows optional features (ecosystem `optional_feature`, kind
+> `feat`) are collected since #5335.
+
 Mechanics:
 
 - The fields ride **inside** the `plugin_data["installed_software"]` blob — no

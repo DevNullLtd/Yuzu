@@ -28,6 +28,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <filesystem>
 #include <format>
 #include <mutex>
@@ -45,6 +46,11 @@ std::mutex g_mu;
 AssetTagState g_state;
 fs::path g_store_path;
 std::atomic<bool> g_shutdown{false};
+// Wakes the check thread at once on shutdown(), instead of letting it sleep out a 5s chunk and
+// making every plugin unload pay that long in join(). g_shutdown is set UNDER g_stop_mu so a
+// waiter cannot test it (still false), then block after the notify has already fired.
+std::mutex g_stop_mu;
+std::condition_variable g_stop_cv;
 std::thread g_check_thread;
 std::atomic<int> g_check_interval_s{300}; // default 5 minutes
 
@@ -83,15 +89,13 @@ void load_state() {
 
 void check_thread_fn() {
     while (!g_shutdown.load(std::memory_order_acquire)) {
-        // Sleep in small increments for responsive shutdown
-        auto remaining = std::chrono::seconds{g_check_interval_s.load(std::memory_order_relaxed)};
-        while (remaining.count() > 0 && !g_shutdown.load(std::memory_order_acquire)) {
-            auto sleep_time = std::min(remaining, std::chrono::seconds{5});
-            std::this_thread::sleep_for(sleep_time);
-            remaining -= sleep_time;
+        {
+            std::unique_lock lk(g_stop_mu);
+            if (g_stop_cv.wait_for(
+                    lk, std::chrono::seconds{g_check_interval_s.load(std::memory_order_relaxed)},
+                    [] { return g_shutdown.load(std::memory_order_acquire); }))
+                break;
         }
-        if (g_shutdown.load(std::memory_order_acquire))
-            break;
 
         // Check if tags are stale (no sync within the check interval)
         std::lock_guard lock(g_mu);
@@ -178,7 +182,11 @@ public:
     }
 
     void shutdown(yuzu::PluginContext& /*ctx*/) noexcept override {
-        g_shutdown.store(true, std::memory_order_release);
+        {
+            std::lock_guard lk(g_stop_mu);
+            g_shutdown.store(true, std::memory_order_release);
+        }
+        g_stop_cv.notify_all();
         if (g_check_thread.joinable())
             g_check_thread.join();
     }
