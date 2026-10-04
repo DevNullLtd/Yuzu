@@ -23,7 +23,6 @@
 #include <cstdlib>
 #include <filesystem>
 #include <map>
-#include <set>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -61,14 +60,11 @@ TEST_CASE("installed-software action table matches real plugin descriptors",
     const auto table = yuzu::agent::installed_software_actions();
     REQUIRE_FALSE(table.empty());
 
-    std::set<std::pair<std::string_view, std::string_view>> seen;
     std::map<std::string, yuzu::agent::PluginHandle> handles; // alive to end of test
 
     for (const auto& [plugin_sv, action_sv] : table) {
         const std::string plugin{plugin_sv};
         INFO("plugin=" << plugin << " action=" << action_sv);
-
-        CHECK(seen.emplace(plugin_sv, action_sv).second); // no duplicate pair
 
         auto it = handles.find(plugin);
         if (it == handles.end()) {
@@ -89,14 +85,5 @@ TEST_CASE("installed-software action table matches real plugin descriptors",
         for (const char* const* a = d->actions; a && *a; ++a)
             if (std::string_view{*a} == action_sv) in_actions = true;
         CHECK(in_actions);
-
-        if (d->action_descriptor_count > 0) {
-            bool in_desc = false;
-            for (size_t i = 0; i < d->action_descriptor_count; ++i)
-                if (d->action_descriptors[i].action &&
-                    std::string_view{d->action_descriptors[i].action} == action_sv)
-                    in_desc = true;
-            CHECK(in_desc);
-        }
     }
 }

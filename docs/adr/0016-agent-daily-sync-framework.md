@@ -80,13 +80,12 @@ A small, source-agnostic seam:
 > `skip_streak` / `last_skip` in the same `__sync__` KV. A source that opts in
 > (`skip_backoff`; today installed_software only — the other sources re-dispatch
 > many actions on a retry) retries at min(next phase slot, 1 h · 2^(streak-1))
-> while the streak is at most 5. In practice that is four extra attempts, 1 h, 3 h, 7 h and 15 h
-> after the first skip (the fifth wait is capped by the next daily slot), then one attempt per
-> daily slot; the others keep one full interval. The skip reason reaches the server only as a heartbeat tag, never a
-> report. KV writes are ordered skip fields first, so an interrupted save never
-> advances `next_fire` without the skip fields already recorded; a kill between
-> the `skip_streak` and `last_skip` writes can still leave the tags unpublished
-> until the next collection, and the stale `next_fire` makes that retry immediate.
+> while the streak is at most 5, then once per daily slot; the others keep one
+> full interval. The operator-facing schedule is stated once, in
+> `docs/user-manual/inventory.md`. The skip reason reaches the server only as a
+> heartbeat tag, never a report. KV writes are ordered skip fields first
+> (`save_state`), so an interrupted save never advances `next_fire` with the skip
+> unrecorded.
 
 ### 4. Hash-skip conditional protocol
 - The agent **always** sends a per-source `content_hash`; it **omits the full

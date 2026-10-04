@@ -429,6 +429,7 @@ SyncSource make_installed_software_source(SyncPluginMap plugins) {
         constexpr std::size_t kInventoryCaptureCap = 3'670'016; // 3.5 MiB
         std::vector<SwEntry> all;
         for (const auto& row : kInventoryActions) {
+            const std::string source = std::string(row.plugin) + '.' + std::string(row.action);
             const auto it = plugins.find(row.plugin);
             if (it == plugins.end() || it->second == nullptr) {
                 spdlog::warn("sync: {} plugin not loaded — {} rows will be absent from this report "
@@ -443,8 +444,7 @@ SyncSource make_installed_software_source(SyncPluginMap plugins) {
                 // flip-flops (mirrors the snapshot pump) — drop the cycle.
                 spdlog::warn("sync: {}.{} rc={}{} — skipping this cycle", row.plugin, row.action,
                              r.rc, r.truncated ? " (output truncated at the capture cap)" : "");
-                return skip(std::string(row.plugin) + '.' + std::string(row.action) +
-                            (r.rc != 0 ? ":rc=" + std::to_string(r.rc) : ":truncated"));
+                return skip(source + (r.rc != 0 ? ":rc=" + std::to_string(r.rc) : ":truncated"));
             }
             AdaptedRows rows = row.adapt(r.captured);
             if (rows.entries.size() > kMaxEntries) {
@@ -454,7 +454,7 @@ SyncSource make_installed_software_source(SyncPluginMap plugins) {
                 // would ship as complete. Same UP-4 posture as the byte cap.
                 spdlog::warn("sync: {}.{} read more than {} rows — skipping this cycle",
                              row.plugin, row.action, kMaxEntries);
-                return skip(std::string(row.plugin) + '.' + std::string(row.action) + ":row_cap");
+                return skip(source + ":row_cap");
             }
             if (rows.status == AdaptedRows::Status::unsupported) {
                 spdlog::debug("sync: {}.{} unsupported on this OS — skipped", row.plugin,
@@ -464,19 +464,17 @@ SyncSource make_installed_software_source(SyncPluginMap plugins) {
             if (rows.status == AdaptedRows::Status::failed) {
                 spdlog::warn("sync: {}.{} failed: {} — skipping this cycle", row.plugin, row.action,
                              rows.reason);
-                return skip(std::string(row.plugin) + '.' + std::string(row.action) + ':' +
-                            rows.reason);
+                return skip(source + ':' + rows.reason);
             }
             if (r.result_completeness == YUZU_RESULT_COMPLETENESS_PARTIAL && !row.accept_partial) {
                 spdlog::warn("sync: {}.{} typed result completeness PARTIAL — skipping this cycle",
                              row.plugin, row.action);
-                return skip(std::string(row.plugin) + '.' + std::string(row.action) + ":partial");
+                return skip(source + ":partial");
             }
             if (!rows.reason.empty())
                 spdlog::info("sync: {}.{} constrained ({}) — rows kept: the constraint names facts "
                              "this row does not carry",
                              row.plugin, row.action, rows.reason);
-            std::string source = std::string(row.plugin) + '.' + std::string(row.action);
             for (auto& e : rows.entries) {
                 e.source = source;
                 all.push_back(std::move(e));

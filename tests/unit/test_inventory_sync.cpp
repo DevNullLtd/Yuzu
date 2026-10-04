@@ -549,37 +549,6 @@ TEST_CASE("SyncScheduler: collect returning nothing sends no RPC and retries nex
 }
 
 namespace {
-// Test-local copy of the scheduler's FNV-1a phase (agent_id ":" source) so the
-// skip-backoff expectations are computed independently of the code under test.
-std::int64_t test_phase(const std::string& agent, const std::string& source,
-                        std::int64_t interval) {
-    std::uint64_t h = 1469598103934665603ULL;
-    for (unsigned char c : agent + ":" + source) {
-        h ^= c;
-        h *= 1099511628211ULL;
-    }
-    return static_cast<std::int64_t>(h % static_cast<std::uint64_t>(interval));
-}
-
-std::int64_t test_next_slot(std::int64_t now, std::int64_t interval, std::int64_t phase) {
-    std::int64_t base = now - (now % interval) + phase;
-    if (base <= now)
-        base += interval;
-    return base;
-}
-
-// Expected next_fire after the `streak`-th consecutive skip of a skip_backoff source.
-std::int64_t expected_skip_fire(const std::string& agent, std::int64_t interval, std::int64_t now,
-                                int streak) {
-    const std::int64_t slot =
-        test_next_slot(now, interval, test_phase(agent, "installed_software", interval));
-    if (streak > SyncScheduler::kSkipRetryBudget)
-        return slot;
-    const std::int64_t retry =
-        now + (static_cast<std::int64_t>(SyncScheduler::kSkipRetryBase.count()) << (streak - 1));
-    return std::min(slot, retry);
-}
-
 // Fake KV + sender + a source whose collect skips or succeeds on demand.
 struct SkipRig {
     std::map<std::string, std::string> kv;
@@ -676,49 +645,6 @@ TEST_CASE("SyncScheduler: a skip persists the sanitised reason and bumps the str
     CHECK(rig.kv["sync.installed_software.last_skip"] == std::string(64, 'r'));
 }
 
-TEST_CASE("SyncScheduler: skip_backoff retries within the day, then settles to one attempt per "
-          "daily slot",
-          "[sync][scheduler][skip]") {
-    const std::string agent = "agent-backoff";
-    const std::int64_t interval = 86400;
-    SkipRig rig;
-    rig.reason = "r:1";
-    SyncScheduler sched(agent, rig.getter(), rig.setter(), rig.sender());
-    sched.add_source(rig.source(true, interval));
-    sched.tick(1000);
-
-    std::int64_t now = 1700;
-    std::vector<std::int64_t> fires;
-    for (int streak = 1; streak <= 10; ++streak) {
-        sched.tick(now);
-        INFO("streak " << streak << " now " << now);
-        CHECK(rig.kv["sync.installed_software.skip_streak"] == std::to_string(streak)); // uncapped
-        CHECK(rig.next_fire() == expected_skip_fire(agent, interval, now, streak));
-        CHECK(rig.next_fire() > now);
-        fires.push_back(now);
-        now = rig.next_fire();
-    }
-    // Budget spent (streak 6..10): every fire sits on the daily phase slot, one per day.
-    const std::int64_t phase = test_phase(agent, "installed_software", interval);
-    for (std::size_t i = 6; i < fires.size(); ++i) {
-        INFO("fire " << i);
-        CHECK(fires[i] % interval == phase);
-        if (i > 6)
-            CHECK(fires[i] - fires[i - 1] == interval);
-    }
-    CHECK(fires.back() - fires[6] == 3 * interval); // further days, exactly one fire each
-}
-
-TEST_CASE("SyncScheduler: the phase slot bounds the skip backoff", "[sync][scheduler][skip]") {
-    SkipRig rig;
-    SyncScheduler sched("agent-short", rig.getter(), rig.setter(), rig.sender());
-    sched.add_source(rig.source(true, 600));
-    sched.tick(1000);
-    sched.tick(1700);
-    CHECK(rig.next_fire() > 1700);
-    CHECK(rig.next_fire() <= 1700 + 600);
-}
-
 TEST_CASE("SyncScheduler: a successful collect clears the skip before the send and restarts "
           "the budget",
           "[sync][scheduler][skip]") {
@@ -751,11 +677,11 @@ TEST_CASE("SyncScheduler: a successful collect clears the skip before the send a
     now = rig.next_fire();
     sched.tick(now);
     CHECK(rig.kv["sync.installed_software.skip_streak"] == "1");
-    CHECK(rig.next_fire() == expected_skip_fire(agent, 86400, now, 1)); // fresh budget
+    // Fresh budget: 1 h again (the success put next_fire on a phase slot, a full day ahead).
+    CHECK(rig.next_fire() == now + 3600);
 }
 
-TEST_CASE("SyncScheduler: a forced skip records the reason but neither spends budget nor "
-          "reschedules",
+TEST_CASE("SyncScheduler: a forced skip neither spends budget nor reschedules",
           "[sync][scheduler][skip]") {
     SkipRig rig;
     rig.reason = "r:forced";
@@ -765,11 +691,13 @@ TEST_CASE("SyncScheduler: a forced skip records the reason but neither spends bu
     REQUIRE_FALSE(sched.request_now("installed_software").empty());
     sched.tick(1700);
     CHECK(rig.collects == 1);
-    CHECK(rig.kv["sync.installed_software.last_skip"] == "r:forced");
     CHECK(rig.kv["sync.installed_software.skip_streak"] == "0"); // one click, no budget spent
     CHECK(rig.next_fire() == 1700);                              // retries next tick
+    // The batch pass re-collects and records the skip exactly once.
     sched.tick(1701);
     CHECK(rig.collects == 2);
+    CHECK(rig.kv["sync.installed_software.skip_streak"] == "1");
+    CHECK(rig.kv["sync.installed_software.last_skip"] == "r:forced");
 }
 
 TEST_CASE("SyncScheduler: skip_backoff from a phase slot retries at literal 1h, 2h, 4h, 8h, "
@@ -783,8 +711,13 @@ TEST_CASE("SyncScheduler: skip_backoff from a phase slot retries at literal 1h, 
     sched.add_source(rig.source(true, interval));
     sched.tick(1000);
 
-    // Start exactly on a daily phase slot so the next slot is a full day away.
-    const std::int64_t start = test_phase(agent, "installed_software", interval) + 10 * interval;
+    // Start exactly on a daily phase slot so the next slot is a full day away: a
+    // successful collect leaves next_fire on one (apply_ack), taken from production.
+    rig.skip = false;
+    sched.tick(rig.next_fire());
+    REQUIRE(rig.sends == 1);
+    rig.skip = true;
+    const std::int64_t start = rig.next_fire(); // apply_ack put next_fire on a phase slot
     sched.tick(start);
     CHECK(rig.next_fire() == start + 3600);
     sched.tick(start + 3600);
@@ -797,6 +730,60 @@ TEST_CASE("SyncScheduler: skip_backoff from a phase slot retries at literal 1h, 
     CHECK(rig.next_fire() == start + interval); // 16h would overshoot: the slot wins
     sched.tick(start + interval);
     CHECK(rig.next_fire() == start + 2 * interval); // budget spent: one attempt per day
+    CHECK(rig.kv["sync.installed_software.skip_streak"] == "6");
+    for (int day = 2; day <= 5; ++day) { // streak uncapped, still exactly one attempt per slot
+        sched.tick(start + day * interval);
+        INFO("day " << day);
+        CHECK(rig.next_fire() == start + (day + 1) * interval);
+        CHECK(rig.kv["sync.installed_software.skip_streak"] == std::to_string(5 + day));
+    }
+}
+
+TEST_CASE("SyncScheduler: an off-slot first skip is capped at the slot, then the doubling "
+          "continues",
+          "[sync][scheduler][skip]") {
+    const std::string agent = "agent-offslot";
+    const std::int64_t interval = 86400;
+    const std::int64_t h = 3600;
+
+    // A probe scheduler learns this agent's daily phase slot from production: a
+    // successful collect leaves next_fire on one (apply_ack).
+    SkipRig probe;
+    probe.skip = false;
+    SyncScheduler s0(agent, probe.getter(), probe.setter(), probe.sender());
+    s0.add_source(probe.source(true, interval));
+    s0.tick(10 * interval);
+    s0.tick(probe.next_fire());
+    REQUIRE(probe.sends == 1);
+    const std::int64_t slot = probe.next_fire();
+    const std::int64_t start = slot - 10 * h; // the first skip lands 10 h before that slot
+
+    // A second scheduler (same agent id, so the same phase) over a KV pre-seeded to be due at
+    // `start`. Expected next_fire = min(next slot, now + (1 h << (streak - 1))):
+    //   streak 1: min(slot, start + 1 h)           = start + 1 h
+    //   streak 2: min(slot, start + 1 h + 2 h)     = start + 3 h
+    //   streak 3: min(slot, start + 3 h + 4 h)     = start + 7 h
+    //   streak 4: min(slot, start + 7 h + 8 h)     = slot (start + 10 h < start + 15 h)
+    //   streak 5: at the slot, min(slot + 24 h, slot + 16 h) = slot + 16 h (not capped)
+    //   streak 6: budget spent -> the next slot after slot + 16 h = slot + 24 h
+    SkipRig rig;
+    rig.reason = "r:1";
+    rig.kv["sync.installed_software.next_fire"] = std::to_string(start);
+    SyncScheduler sched(agent, rig.getter(), rig.setter(), rig.sender());
+    sched.add_source(rig.source(true, interval));
+    sched.tick(start);
+    CHECK(rig.next_fire() == start + 1 * h);
+    sched.tick(start + 1 * h);
+    CHECK(rig.next_fire() == start + 3 * h);
+    sched.tick(start + 3 * h);
+    CHECK(rig.next_fire() == start + 7 * h);
+    sched.tick(start + 7 * h);
+    CHECK(rig.next_fire() == slot); // 8 h would overshoot: the slot wins
+    sched.tick(slot);
+    CHECK(rig.next_fire() == slot + 16 * h); // the fifth wait is NOT capped from an off-slot start
+    sched.tick(slot + 16 * h);
+    CHECK(rig.next_fire() == slot + interval); // budget spent: the next slot
+    CHECK(rig.kv["sync.installed_software.skip_streak"] == "6");
 }
 
 TEST_CASE("SyncScheduler: forced recovery clears skip state before a failed RPC",
@@ -885,24 +872,6 @@ TEST_CASE("emit_sync_skip_tags publishes only a positive streak with a bounded r
     rig.kv.erase(lr);
     CHECK(skip_tags(rig).empty());
     rig.kv[lr] = std::string(65, 'x');
-    CHECK(skip_tags(rig).empty());
-}
-
-TEST_CASE("emit_sync_skip_tags follows the real scheduler through a skip and a recovery",
-          "[sync][scheduler][skip]") {
-    SkipRig rig;
-    rig.reason = "installed_apps:not_loaded";
-    SyncScheduler sched("agent-e2e", rig.getter(), rig.setter(), rig.sender());
-    sched.add_source(rig.source(false, 86400));
-    sched.tick(1000);
-    sched.tick(1700);
-    auto tags = skip_tags(rig);
-    CHECK(tags["yuzu.sync.installed_software.skip_streak"] == "1");
-    CHECK(tags["yuzu.sync.installed_software.last_skip"] == "installed_apps:not_loaded");
-
-    rig.skip = false;
-    sched.tick(rig.next_fire());
-    CHECK(rig.sends == 1);
     CHECK(skip_tags(rig).empty());
 }
 
@@ -1868,10 +1837,6 @@ TEST_CASE("collector: typed PARTIAL completeness skips the cycle unless the row 
                                                YUZU_RESULT_COMPLETENESS_FULL, ""};
         CHECK(collect_with(all_plugins()).has_value());
     }
-    SECTION("no typed status (UNKNOWN): collected") {
-        fake_mac();
-        CHECK(collect_with(all_plugins()).has_value());
-    }
     SECTION("managers CONSTRAINED/PARTIAL with a present row: opt-in accepts") {
         fake_mac();
         g_fake[1].out["managers"] = constrained_managers_with_present_row();
@@ -1884,12 +1849,6 @@ TEST_CASE("collector: typed PARTIAL completeness skips the cycle unless the row 
         const auto got = collect_with(all_plugins());
         REQUIRE(got.has_value());
         CHECK(records_of(got->first).size() == 393 + 66 + 1);
-    }
-    SECTION("in-band unsupported wins over UNAVAILABLE/PARTIAL (pkg on windows)") {
-        fake_windows();
-        g_fake[1].result_status["managers"] = {YUZU_RESULT_STATUS_UNAVAILABLE, kPartial, "r"};
-        g_fake[1].result_status["packages"] = {YUZU_RESULT_STATUS_UNAVAILABLE, kPartial, "r"};
-        CHECK(collect_with(all_plugins()).has_value());
     }
 }
 

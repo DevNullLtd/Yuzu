@@ -113,12 +113,12 @@ public:
     static constexpr std::chrono::seconds kNeedFullJitterWindow{5 * 60};
     static constexpr std::chrono::seconds kMinTickSeconds{30};
     static constexpr std::chrono::seconds kMaxTickSeconds{15 * 60};
-    /// Skip backoff (opt-in per source, SyncSource::skip_backoff): retry delay is
-    /// kSkipRetryBase << (streak - 1), capped by the next phase slot, while
-    /// streak <= kSkipRetryBudget; afterwards one attempt per daily slot. Since
-    /// 1+2+4+8 = 15h, the fifth delay (16h) is always capped by the slot:
-    /// effectively up to four extra attempts the same day (1h, 3h, 7h and 15h
-    /// after the first skip), then the next slot.
+    /// Skip backoff (opt-in per source, SyncSource::skip_backoff): the retry delay is
+    /// kSkipRetryBase << (streak - 1), capped at the next phase slot, while
+    /// streak <= kSkipRetryBudget; afterwards one attempt per slot. The cap gives an
+    /// outage at most four retries that are not themselves slot attempts; whether the
+    /// fifth delay (16 h) is capped depends on where in the day the streak started.
+    /// Operator-facing wording: docs/user-manual/inventory.md.
     static constexpr std::chrono::seconds kSkipRetryBase{60 * 60};
     static constexpr int kSkipRetryBudget{5};
 
@@ -152,11 +152,14 @@ private:
 
     State& load_state(std::size_t idx, std::int64_t now_secs);
     void save_state(const SyncSource& src, const State& st);
-    /// Record one skipped (nullopt) collect. `reschedule` is true on the batch
-    /// path (bumps skip_streak and picks the next fire per skip_backoff) and false
-    /// on the forced path (records last_skip only, leaves next_fire — a forced
-    /// source retries next tick, and one click must not spend two budget slots).
-    void note_skip(std::size_t idx, std::int64_t now_secs, bool reschedule);
+    /// Record one skipped (nullopt) batch-path collect: bumps skip_streak, stores the
+    /// sanitised skip_reason and picks the next fire per skip_backoff. Not called on the
+    /// forced path — drain_pending left next_fire = now, so the batch pass re-collects
+    /// next tick and records the skip once (one click never spends two budget slots).
+    void note_skip(std::size_t idx, std::int64_t now_secs);
+    /// A collect succeeded: clear skip state and persist BEFORE the send, so an RPC
+    /// failure never leaves a stale reason.
+    void note_collected(std::size_t idx);
     /// Stable per-(agent,source) phase offset in [0, interval).
     std::int64_t phase_offset(const std::string& source, std::int64_t interval) const;
     /// Hash-skip decision for one source at `now_secs`, given its freshly

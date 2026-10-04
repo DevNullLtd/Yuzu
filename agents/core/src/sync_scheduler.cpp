@@ -124,27 +124,34 @@ void SyncScheduler::save_state(const SyncSource& src, const State& st) {
     kv_set_(kv_key(src.name, "nf_streak"), std::to_string(st.needfull_streak));
 }
 
-void SyncScheduler::note_skip(std::size_t idx, std::int64_t now_secs, bool reschedule) {
+void SyncScheduler::note_skip(std::size_t idx, std::int64_t now_secs) {
     const SyncSource& src = sources_[idx];
     State& st = states_[idx];
     st.last_skip = src.skip_reason ? sanitize_skip_reason(src.skip_reason()) : std::string{};
-    if (reschedule) {
-        if (st.skip_streak < std::numeric_limits<int>::max()) // overflow guard, not a cap
-            ++st.skip_streak;
-        const std::int64_t interval = src.interval.count();
-        if (!src.skip_backoff) {
-            st.next_fire = now_secs + interval;
-        } else {
-            const std::int64_t slot = next_slot(now_secs, interval, phase_offset(src.name, interval));
-            if (st.skip_streak <= kSkipRetryBudget)
-                st.next_fire =
-                    std::min(slot, now_secs + (static_cast<std::int64_t>(kSkipRetryBase.count())
-                                               << (st.skip_streak - 1)));
-            else
-                st.next_fire = slot; // budget spent: exactly one attempt per slot
-        }
+    if (st.skip_streak < std::numeric_limits<int>::max()) // overflow guard, not a cap
+        ++st.skip_streak;
+    const std::int64_t interval = src.interval.count();
+    if (!src.skip_backoff) {
+        st.next_fire = now_secs + interval;
+    } else {
+        const std::int64_t slot = next_slot(now_secs, interval, phase_offset(src.name, interval));
+        if (st.skip_streak <= kSkipRetryBudget)
+            st.next_fire =
+                std::min(slot, now_secs + (static_cast<std::int64_t>(kSkipRetryBase.count())
+                                           << (st.skip_streak - 1)));
+        else
+            st.next_fire = slot; // budget spent: exactly one attempt per slot
     }
     save_state(src, st);
+}
+
+void SyncScheduler::note_collected(std::size_t idx) {
+    State& st = states_[idx];
+    if (st.skip_streak == 0)
+        return;
+    st.skip_streak = 0;
+    st.last_skip.clear();
+    save_state(sources_[idx], st);
 }
 
 std::vector<std::string> SyncScheduler::request_now(std::string_view source_or_all) {
@@ -269,17 +276,12 @@ std::chrono::seconds SyncScheduler::tick(std::int64_t now_secs) {
         State& st = load_state(i, now_secs);
         auto collected = src.collect ? src.collect() : std::nullopt;
         if (!collected) {
-            note_skip(i, now_secs, false);
-            spdlog::debug("sync: forced source '{}' collect returned nothing ({}) — will retry "
-                          "next tick",
-                          src.name, st.last_skip);
+            spdlog::debug(
+                "sync: forced source '{}' collect returned nothing — will retry next tick",
+                src.name);
             continue;
         }
-        if (st.skip_streak != 0 || !st.last_skip.empty()) {
-            st.skip_streak = 0; // before the send: an RPC failure never leaves a stale reason
-            st.last_skip.clear();
-            save_state(src, st);
-        }
+        note_collected(i);
         const std::string& blob = collected->first;
         const std::string& hash = collected->second;
         const bool full = decide_full(st, hash, now_secs);
@@ -318,17 +320,13 @@ std::chrono::seconds SyncScheduler::tick(std::int64_t now_secs) {
         if (!collected) {
             // Source unavailable this cycle (e.g. backing plugin not loaded).
             // Skip; leave last_hash untouched. note_skip picks the retry time.
-            note_skip(i, now_secs, true);
+            note_skip(i, now_secs);
             spdlog::debug("sync: source '{}' collect returned nothing — skipping (reason='{}', "
                           "streak={}, next_fire={})",
                           src.name, st.last_skip, st.skip_streak, st.next_fire);
             continue;
         }
-        if (st.skip_streak != 0 || !st.last_skip.empty()) {
-            st.skip_streak = 0; // before the send: an RPC failure never leaves a stale reason
-            st.last_skip.clear();
-            save_state(src, st);
-        }
+        note_collected(i);
         const std::string& blob = collected->first;
         const std::string& hash = collected->second;
         const bool full = decide_full(st, hash, now_secs);

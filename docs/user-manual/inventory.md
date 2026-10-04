@@ -27,9 +27,9 @@ cadences.
   `constrained` Homebrew `managers` answer that still names a present prefix is
   accepted: the constraint concerns tap/Cellar/Caskroom facts the presence row
   never carried. A skipped cycle is retried sooner on a phase-aligned backoff:
-  waits of 1 h, 2 h, 4 h and 8 h after consecutive skips (attempts 1 h, 3 h, 7 h and 15 h
-  after the first skip; the fifth wait is capped by the next daily slot), after which the source
-  returns to exactly one attempt per daily slot until a collection succeeds.
+  waits that double from 1 h after each consecutive skip (1 h, 2 h, 4 h, 8 h, …),
+  each retry capped so it never lands after the next daily slot — up to four
+  extra attempts — then one attempt per daily slot until a collection succeeds.
   While it is skipping, the agent publishes the heartbeat tags
   `yuzu.sync.installed_software.skip_streak` (consecutive skips since the last
   success, uncapped) and `yuzu.sync.installed_software.last_skip` (the reason
@@ -568,8 +568,8 @@ reason. The warning's reason token is also the device's
 `yuzu.sync.installed_software.last_skip` heartbeat tag, and
 `yuzu.sync.installed_software.skip_streak` counts consecutive skips (uncapped),
 which tells an online-but-skipping host from an offline one. The agent retries
-a skipped cycle after waits of 1 h, 2 h, 4 h and 8 h (four extra attempts the same day, 1 h,
-3 h, 7 h and 15 h after the first skip), then falls back to one attempt per daily slot. A host that keeps skipping is flagged by `yuzu_inventory_stale_agents`
+a skipped cycle on the bounded backoff described under *What is collected*, then
+falls back to one attempt per daily slot. A host that keeps skipping is flagged by `yuzu_inventory_stale_agents`
 after two missed daily cycles; fix the failing action, or remove its plugin,
 and the next retry or daily sync recovers. A warning of the form `sync: <plugin>.<action>
 read more than 20000 rows` (or a merged-entry or 3 MiB blob cap) is not an
