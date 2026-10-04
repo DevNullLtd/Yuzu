@@ -53,7 +53,13 @@ start_link() ->
 %% CommandRequest field. See agent.proto CommandRequest.dispatch_tag.
 -spec send_command([binary()], map(), map()) -> {ok, reference()} | {error, term()}.
 send_command(AgentIds, CommandReq, Opts) ->
-    gen_server:call(?SERVER, {send_command, AgentIds, CommandReq, Opts}).
+    %% Called from the grpcbox handler of the management listener. A call that
+    %% exits (this process not running, or restarting) exits the CALLER with a
+    %% reason that embeds the call and so CommandReq (plugin parameters, which
+    %% may be secrets), and grpcbox logs it: see yuzu_gw_safe_call. The default
+    %% 5000 ms call timeout is kept.
+    yuzu_gw_safe_call:call(?SERVER, {send_command, AgentIds, CommandReq, Opts},
+                           5000, router_unavailable).
 
 %%%===================================================================
 %%% gen_server callbacks

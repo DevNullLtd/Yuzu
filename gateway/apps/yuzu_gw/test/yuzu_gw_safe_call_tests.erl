@@ -80,6 +80,8 @@ safe_call_test_() ->
        fun pending_calls_without_registry/0},
       {"start_agent answers agent_sup_unavailable for an exit, and an error is not caught",
        fun start_agent_guard/0},
+      {"router send_command with the router not running answers an error, nothing leaks",
+       fun router_send_command_router_down/0},
       {"control: a raw ets:insert into the missing pending table does leak",
        fun control_raw_ets_insert_leaks/0}
      ]}.
@@ -379,6 +381,21 @@ start_agent_guard() ->
     ?assertError(boom, yuzu_gw_safe_call:guard(some_server, fun() -> error(boom) end, x)),
     ?assertEqual({error, x},
                  yuzu_gw_safe_call:guard(some_server, fun() -> exit(boom) end, x)).
+
+%% The management handler calls the router with the CommandRequest, whose plugin
+%% parameters can be secrets, in the call: a router that is not running exited
+%% the handler with the call (and so the request) in the reason.
+router_send_command_router_down() ->
+    stop_named(yuzu_gw_router),
+    {Result, Events} = run_caller(fun() ->
+        grpcbox_style(fun() ->
+            yuzu_gw_router:send_command([<<"a-1">>],
+                #{plugin => <<"p">>, parameters => #{<<"password">> => ?M_TOKEN}}, #{})
+        end)
+    end),
+    ?assertEqual({returned, {error, router_unavailable}}, Result),
+    assert_no_markers(Events),
+    ?assert(has_warning(Events, <<"noproc">>)).
 
 %% The harness sees the leak when there is one: the same insert, made raw.
 control_raw_ets_insert_leaks() ->

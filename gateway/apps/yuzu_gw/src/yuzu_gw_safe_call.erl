@@ -31,7 +31,7 @@
 -define(WARN_INTERVAL_MS, 1000).
 %% The servers a caller here names: the WARN stamp of each is created at
 %% application start by init_limits/0.
--define(SERVERS, [yuzu_gw_upstream, yuzu_gw_registry, yuzu_gw_agent_sup]).
+-define(SERVERS, [yuzu_gw_upstream, yuzu_gw_registry, yuzu_gw_agent_sup, yuzu_gw_router]).
 
 %% @doc gen_server:call(Server, Request, Timeout), with an exit turned into
 %% {error, Error}. A reply is returned as is.

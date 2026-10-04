@@ -155,7 +155,7 @@ boot_removes_crash_filter_when_the_tree_does_not_start_test() ->
 %% the supervision tree starts, so a burst of first failures shares one limit.
 boot_creates_safe_call_limits_before_sup_test() ->
     Keys = [{yuzu_gw_safe_call, S}
-            || S <- [yuzu_gw_upstream, yuzu_gw_registry, yuzu_gw_agent_sup]],
+            || S <- [yuzu_gw_upstream, yuzu_gw_registry, yuzu_gw_agent_sup, yuzu_gw_router]],
     [persistent_term:erase(K) || K <- Keys],
     with_boot_mocks(
       fun(Self) ->
@@ -167,7 +167,7 @@ boot_creates_safe_call_limits_before_sup_test() ->
       end,
       fun() ->
           ?assertMatch({ok, _}, yuzu_gw_app:start(normal, [])),
-          ?assertEqual([true, true, true],
+          ?assertEqual([true, true, true, true],
                        receive {sup_started, L} -> L after 0 -> missing end)
       end).
 
