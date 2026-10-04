@@ -3102,11 +3102,13 @@ test('ci telemetry selftest',
 # Windows SDK is selected at four independent boundaries: native MSYS2,
 # runner provisioning/manifest, GHA environment activation, and documentation.
 # Keep them exact and keep the GHA action itself visible to Dependabot.
+# Budget: 4-5 s on a clean Windows runner, 7-8 s when other jobs share the box;
+# the old 10 s limit tripped (#4164, #4171).
 test('windows sdk contract',
   _python3_test,
   args: [files('test_windows_sdk_contract.py')],
   suite: 'docs',
-  timeout: 10,
+  timeout: 30,
 )
 
 # The nightly TSan gdb capture's pure-logic selftest (#1038): junit -> failing
