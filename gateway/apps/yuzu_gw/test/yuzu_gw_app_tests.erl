@@ -151,6 +151,26 @@ boot_removes_crash_filter_when_the_tree_does_not_start_test() ->
           ?assertEqual(false, crash_filter_installed())
       end).
 
+%% yuzu_gw_app:start/2 creates the WARN limit state of yuzu_gw_safe_call before
+%% the supervision tree starts, so a burst of first failures shares one limit.
+boot_creates_safe_call_limits_before_sup_test() ->
+    Keys = [{yuzu_gw_safe_call, S}
+            || S <- [yuzu_gw_upstream, yuzu_gw_registry, yuzu_gw_agent_sup]],
+    [persistent_term:erase(K) || K <- Keys],
+    with_boot_mocks(
+      fun(Self) ->
+          fun() ->
+              Self ! {sup_started, [persistent_term:get(K, undefined) =/= undefined
+                                    || K <- Keys]},
+              {ok, self()}
+          end
+      end,
+      fun() ->
+          ?assertMatch({ok, _}, yuzu_gw_app:start(normal, [])),
+          ?assertEqual([true, true, true],
+                       receive {sup_started, L} -> L after 0 -> missing end)
+      end).
+
 crash_filter_installed() ->
     lists:keymember(yuzu_gw_crash_redact, 1, maps:get(filters, logger:get_primary_config())).
 

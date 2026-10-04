@@ -16,7 +16,8 @@
 %%%   timeout - the server did not answer in time
 %%%   other   - anything else (the server died while serving the call, ...)
 %%% Neither the exit reason nor the request is ever logged or returned. The WARN
-%%% is limited to one per second per server, so an outage that fails every
+%%% is limited to one per second per server (the limit state is created once, at
+%%% application start, by init_limits/0), so an outage that fails every
 %%% registering agent does not flood the log; the callers log their own
 %%% per-request line with the fixed atom.
 %%% @end
@@ -24,9 +25,13 @@
 -module(yuzu_gw_safe_call).
 
 -export([call/4, guard/3]).
+-export([init_limits/0, init_limits/1]).
 -export([exit_class/1, reset_limits/0]).  %% for testing
 
 -define(WARN_INTERVAL_MS, 1000).
+%% The servers a caller here names: the WARN stamp of each is created at
+%% application start by init_limits/0.
+-define(SERVERS, [yuzu_gw_upstream, yuzu_gw_registry, yuzu_gw_agent_sup]).
 
 %% @doc gen_server:call(Server, Request, Timeout), with an exit turned into
 %% {error, Error}. A reply is returned as is.
@@ -55,44 +60,68 @@ exit_class({noproc, _}) -> noproc;
 exit_class({timeout, _}) -> timeout;
 exit_class(_)            -> other.
 
-%% @doc Forget the WARN stamps, so the next failure of every server logs.
+%% @doc Create the WARN stamp of every server a caller here names, once, before
+%% any of them can fail (yuzu_gw_app calls this ahead of the supervision tree).
+%% Creating it on the first failure instead is racy: when the first failures
+%% arrive together every caller creates its own stamp and logs its own line.
+%% Idempotent: a stamp that exists is reset, not replaced (a persistent_term:put
+%% over an existing key costs a global GC).
+-spec init_limits() -> ok.
+init_limits() ->
+    init_limits(?SERVERS).
+
+%% @doc init_limits/0 for the named servers (a test's own fake).
+-spec init_limits([atom()]) -> ok.
+init_limits(Servers) ->
+    lists:foreach(fun init_stamp/1, Servers).
+
+%% @doc Forget the WARN stamps and create the default ones afresh, so the next
+%% failure of each default server logs.
 -spec reset_limits() -> ok.
 reset_limits() ->
     lists:foreach(fun({?MODULE, _} = Key) -> persistent_term:erase(Key);
                      (_)                  -> ok
                   end, [K || {K, _} <- persistent_term:get()]),
-    ok.
+    init_limits().
 
 %%%===================================================================
 %%% Internal
 %%%===================================================================
 
 %% At most one WARN per ?WARN_INTERVAL_MS per server. The stamp lives in an
-%% atomics array kept in persistent_term (created on the first failure of that
-%% server, so the global-GC cost of persistent_term:put/2 is paid once); two
-%% callers racing the first creation each hold a valid array, the later put
-%% wins, and at worst one extra line is logged.
+%% atomics array kept in persistent_term, created once by init_limits/0. A
+%% server with no stamp (a caller that runs before the application start, or
+%% names a server init_limits/0 does not) logs nothing and creates nothing: the
+%% callers log their own per-request line, and creating a stamp here is the race
+%% init_limits/0 exists to remove.
 warn_limited(Server, Class) ->
-    Now = erlang:monotonic_time(millisecond),
-    Ref = stamp_ref(Server, Now),
-    Last = atomics:get(Ref, 1),
-    case Now - Last >= ?WARN_INTERVAL_MS
-         andalso atomics:compare_exchange(Ref, 1, Last, Now) =:= ok of
-        true ->
-            logger:warning("Call to ~s failed (~s); the request is not logged",
-                           [Server, Class]);
-        false ->
-            ok
+    case persistent_term:get({?MODULE, Server}, undefined) of
+        undefined ->
+            ok;
+        Ref ->
+            Now = erlang:monotonic_time(millisecond),
+            Last = atomics:get(Ref, 1),
+            case Now - Last >= ?WARN_INTERVAL_MS
+                 andalso atomics:compare_exchange(Ref, 1, Last, Now) =:= ok of
+                true ->
+                    logger:warning("Call to ~s failed (~s); the request is not logged",
+                                   [Server, Class]);
+                false ->
+                    ok
+            end
     end.
 
-stamp_ref(Server, Now) ->
+init_stamp(Server) ->
     Key = {?MODULE, Server},
     case persistent_term:get(Key, undefined) of
         undefined ->
             Ref = atomics:new(1, [{signed, true}]),
-            atomics:put(Ref, 1, Now - 2 * ?WARN_INTERVAL_MS),
-            persistent_term:put(Key, Ref),
-            Ref;
+            atomics:put(Ref, 1, never_warned()),
+            persistent_term:put(Key, Ref);
         Ref ->
-            Ref
+            atomics:put(Ref, 1, never_warned())
     end.
+
+%% A stamp old enough that the first failure logs.
+never_warned() ->
+    erlang:monotonic_time(millisecond) - 2 * ?WARN_INTERVAL_MS.

@@ -62,6 +62,14 @@ safe_call_test_() ->
        fun exit_class_shapes/0},
       {"control: an uncaught gen_server:call to the same server does leak",
        fun control_raw_call_leaks/0},
+      {"500 concurrent first failures after init_limits log at most two WARNs",
+       fun warn_burst_is_limited_after_init/0},
+      {"a server without a stamp logs no WARN and creates no stamp",
+       fun missing_stamp_logs_nothing_and_creates_nothing/0},
+      {"init_limits is idempotent: it resets the stamp and does not replace it",
+       fun init_limits_is_idempotent/0},
+      {"upstream_call_timeout_ms: 100..300000 is kept, anything else warns and takes 30000",
+       fun call_timeout_validation/0},
       {"Register handler: the registry not running answers a fixed error, nothing leaks",
        fun register_handler_registry_down/0},
       {"Subscribe handler: the registry not running answers a fixed error, nothing leaks",
@@ -83,7 +91,7 @@ setup() ->
     Level = maps:get(level, logger:get_primary_config()),
     logger:set_primary_config(level, all),
     yuzu_gw_safe_call:reset_limits(),
-    application:set_env(yuzu_gw, ?TIMEOUT_KEY, 50),
+    application:set_env(yuzu_gw, ?TIMEOUT_KEY, 100),
     Level.
 
 cleanup(Level) ->
@@ -197,11 +205,81 @@ warn_names_class_only_and_is_limited() ->
     ?assertNot(contains(W, <<"gen_server">>)),
     ?assertNot(contains(W, <<"proxy_register">>)),
     %% The stamp is per server: another one still logs at once.
+    ok = yuzu_gw_safe_call:init_limits([yuzu_gw_registry_probe]),
     start_fake(yuzu_gw_registry_probe, hang),
     ?assertEqual({error, x}, yuzu_gw_safe_call:call(yuzu_gw_registry_probe, ping, 20, x)),
     ?assertMatch([_|_], [M || M <- warnings(drain_events()),
                               contains(M, <<"yuzu_gw_registry_probe">>)]),
     stop_named(yuzu_gw_registry_probe).
+
+%% Every first failure of a burst used to create its own stamp (and log): the
+%% stamp is created once, by init_limits/0, and 500 callers failing together
+%% share it.
+warn_burst_is_limited_after_init() ->
+    ok = yuzu_gw_safe_call:init_limits(),
+    capture_to_self(),
+    Parent = self(),
+    N = 500,
+    Pids = [spawn_monitor(fun() ->
+                Parent ! {burst_ready, self()},
+                receive go -> ok end,
+                {error, x} = yuzu_gw_safe_call:call(yuzu_gw_upstream, ping, 20, x)
+            end) || _ <- lists:seq(1, N)],
+    [receive {burst_ready, P} -> ok after ?WAIT_MS -> error(burst_not_ready) end
+     || {P, _} <- Pids],
+    [P ! go || {P, _} <- Pids],
+    [receive {'DOWN', M, process, P, normal} -> ok
+     after ?WAIT_MS -> error({burst_caller_failed, P})
+     end || {P, M} <- Pids],
+    Warns = [W || W <- warnings(drain_events()), contains(W, <<"yuzu_gw_upstream">>)],
+    %% One per interval; a second only if the burst straddled the interval.
+    ?assert(length(Warns) >= 1),
+    ?assert(length(Warns) =< 2).
+
+missing_stamp_logs_nothing_and_creates_nothing() ->
+    Key = {yuzu_gw_safe_call, yuzu_gw_never_initialised},
+    ?assertEqual(undefined, persistent_term:get(Key, undefined)),
+    {Result, Events} = run_caller(fun() ->
+        yuzu_gw_safe_call:call(yuzu_gw_never_initialised, ping, 20, x)
+    end),
+    ?assertEqual({returned, {error, x}}, Result),
+    ?assertEqual([], [W || W <- warnings(Events), contains(W, <<"never_initialised">>)]),
+    ?assertEqual(undefined, persistent_term:get(Key, undefined)).
+
+init_limits_is_idempotent() ->
+    Key = {yuzu_gw_safe_call, yuzu_gw_upstream},
+    Ref = persistent_term:get(Key),
+    %% Use the stamp up (a WARN), then init again: same array, stamp reset.
+    {_, E1} = run_caller(fun() -> yuzu_gw_safe_call:call(yuzu_gw_upstream, ping, 20, x) end),
+    ?assertMatch([_], [W || W <- warnings(E1), contains(W, <<"yuzu_gw_upstream">>)]),
+    {_, E2} = run_caller(fun() -> yuzu_gw_safe_call:call(yuzu_gw_upstream, ping, 20, x) end),
+    ?assertEqual([], [W || W <- warnings(E2), contains(W, <<"yuzu_gw_upstream">>)]),
+    ok = yuzu_gw_safe_call:init_limits(),
+    ?assertEqual(Ref, persistent_term:get(Key)),
+    {_, E3} = run_caller(fun() -> yuzu_gw_safe_call:call(yuzu_gw_upstream, ping, 20, x) end),
+    ?assertMatch([_], [W || W <- warnings(E3), contains(W, <<"yuzu_gw_upstream">>)]).
+
+call_timeout_validation() ->
+    Default = 30000,
+    [begin
+         application:set_env(yuzu_gw, ?TIMEOUT_KEY, V),
+         capture_to_self(),
+         ?assertEqual(V, yuzu_gw_upstream:call_timeout()),
+         ?assertEqual([], [W || W <- warnings(drain_events()),
+                                contains(W, <<"upstream_call_timeout_ms">>)])
+     end || V <- [100, 5000, 300000]],
+    application:unset_env(yuzu_gw, ?TIMEOUT_KEY),
+    capture_to_self(),
+    ?assertEqual(Default, yuzu_gw_upstream:call_timeout()),
+    ?assertEqual([], warnings(drain_events())),
+    [begin
+         application:set_env(yuzu_gw, ?TIMEOUT_KEY, Bad),
+         capture_to_self(),
+         ?assertEqual(Default, yuzu_gw_upstream:call_timeout()),
+         ?assertMatch([_], [W || W <- warnings(drain_events()),
+                                 contains(W, <<"upstream_call_timeout_ms">>)])
+     end || Bad <- [0, -1, 99, 300001, 999999999, 1.5, foo, <<"100">>]],
+    ok.
 
 exit_class_shapes() ->
     Call = {gen_server, call, [s, {proxy_register, #{enrollment_token => ?M_TOKEN}}, 1]},

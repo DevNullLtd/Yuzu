@@ -67,6 +67,9 @@ do_start_services() ->
     %% which can start first; the lazy path in yuzu_gw_heartbeat_admission
     %% covers that window.
     ok = yuzu_gw_heartbeat_admission:init_summary_state(),
+    %% The same for the WARN limit of the calls that carry a registration
+    %% request (yuzu_gw_safe_call): a burst of first failures shares one limit.
+    ok = yuzu_gw_safe_call:init_limits(),
 
     %% Start Prometheus HTTP exporter for /metrics endpoint.
     Port = application:get_env(yuzu_gw, prometheus_port, 9568),

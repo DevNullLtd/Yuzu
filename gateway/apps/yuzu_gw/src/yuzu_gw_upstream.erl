@@ -66,6 +66,7 @@
          replay_sessions/1,
          circuit_state/0]).
 -export([classify_tls_error/1]).  %% for testing (R-3 TLS-error classifier)
+-export([call_timeout/0]).        %% for testing (upstream_call_timeout_ms validation)
 %% The reason/stacktrace redaction format_status/1 applies, shared with the
 %% crash-report filter (yuzu_gw_crash_redact), which applies it to the parts of
 %% a report OTP prints outside format_status.
@@ -84,6 +85,8 @@
 %% upstream). Overflow is dropped best-effort; durable buffering is Guardian A3.
 -define(MAX_GUARDIAN_INFLIGHT, 50).
 -define(DEFAULT_CALL_TIMEOUT_MS, 30000).
+-define(MIN_CALL_TIMEOUT_MS, 100).
+-define(MAX_CALL_TIMEOUT_MS, 300000).
 -define(DEFAULT_CB_THRESHOLD, 5).
 -define(DEFAULT_CB_RESET_MS, 10000).
 -define(DEFAULT_CB_MAX_RESET_MS, 300000).
@@ -206,14 +209,14 @@ circuit_state() ->
     gen_server:call(?SERVER, circuit_state, 5000).
 
 %% How long proxy_register/1 and proxy_inventory/1 wait for the upstream
-%% process. The application env key upstream_call_timeout_ms (a positive
-%% integer, ms) overrides the default; it exists so a test can exercise the
-%% timeout without waiting 30 s, and anything else falls back to the default.
+%% process. The application env key upstream_call_timeout_ms (ms, valid
+%% 100..300000, default 30000) overrides the default; it exists so a test can
+%% exercise the timeout without waiting 30 s. Anything else logs a warning that
+%% names the key and takes the default. Read on every call, so a bad value warns
+%% on every call.
 call_timeout() ->
-    case application:get_env(yuzu_gw, upstream_call_timeout_ms, ?DEFAULT_CALL_TIMEOUT_MS) of
-        T when is_integer(T), T > 0 -> T;
-        _                           -> ?DEFAULT_CALL_TIMEOUT_MS
-    end.
+    yuzu_gw_env:env_int(upstream_call_timeout_ms, ?DEFAULT_CALL_TIMEOUT_MS,
+                        ?MIN_CALL_TIMEOUT_MS, ?MAX_CALL_TIMEOUT_MS).
 
 %%%===================================================================
 %%% gen_server callbacks
