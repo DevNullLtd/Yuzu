@@ -869,8 +869,7 @@ TEST_CASE("SyncScheduler: the persisted skip streak and reason survive a restart
     CHECK(rig.kv[last] == "r:2");
     CHECK(rig.next_fire() == start + 3600 + 7200);
 
-    // A third life recovers: the loaded streak is what makes the success clear the persisted
-    // tags (a streak read as 0 would leave them stale on a healthy host).
+    // A third life recovers: a success after a restart leaves no skip state behind.
     rig.skip = false;
     SyncScheduler third(agent, rig.getter(), rig.setter(), rig.sender());
     third.add_source(rig.source(true, 86400));
