@@ -32,7 +32,7 @@
          reannounce/2]).
 
 %% gen_statem callbacks
--export([callback_mode/0, init/1, terminate/3, code_change/4]).
+-export([callback_mode/0, init/1, terminate/3, code_change/4, format_status/1]).
 -export([connecting/3, streaming/3, disconnected/3]).
 
 -record(data, {
@@ -360,6 +360,27 @@ terminate(_Reason, _State, Data) ->
 
 code_change(_OldVsn, State, Data, _Extra) ->
     {ok, State, Data}.
+
+%% What OTP prints for this process in a terminate or crash report and in
+%% sys:get_status/1: the data without the stored RegisterRequest, which holds
+%% the enrollment token, machine certificate and CSR (and is only the replay
+%% copy the registry also keeps). Only the reports are affected:
+%% sys:get_state/1 still returns the real record.
+%%
+%% NOT covered here, because OTP prints it from raw data outside this callback
+%% (the `reason' stacktrace, whose frames carry the argument list of a failing
+%% call and so the whole data record; the mailbox; the init arguments in the
+%% supervisor report): yuzu_gw_crash_redact, the logger primary filter
+%% yuzu_gw_app installs, rewrites those for the processes of this module. It is
+%% NOT in place when this module is used without the application.
+-spec format_status(map()) -> map().
+format_status(Status) ->
+    maps:map(fun(data, Data) -> redact_data(Data);
+                (_Key, Value) -> Value
+             end, Status).
+
+redact_data(#data{} = Data) -> Data#data{register_req = '$redacted'};
+redact_data(_Other)         -> '$redacted'.
 
 %%%===================================================================
 %%% Internal functions

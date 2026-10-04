@@ -47,7 +47,8 @@
          take_pending/1]).
 
 %% gen_server callbacks
--export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, code_change/3]).
+-export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, code_change/3,
+         format_status/1]).
 
 -define(SERVER, ?MODULE).
 -define(TABLE,  yuzu_gw_agents).
@@ -590,6 +591,26 @@ terminate(_Reason, _State) ->
 
 code_change(_OldVsn, State, _Extra) ->
     {ok, State}.
+
+%% What OTP prints for this process in a terminate report and in
+%% sys:get_status/1: the last message with the RegisterRequest of a `register'
+%% call (enrollment token, machine certificate, CSR) replaced. The state holds
+%% no request. NOT covered here, because OTP prints it from raw data outside
+%% this callback (the stacktrace, whose frames carry the argument list of a
+%% failing handle_call/3, and the mailbox): yuzu_gw_crash_redact, the logger
+%% primary filter yuzu_gw_app installs, rewrites those for this process. It is
+%% NOT in place when this module is used without the application.
+-spec format_status(map()) -> map().
+format_status(Status) ->
+    maps:map(fun(message, Msg) -> redact_message(Msg);
+                (_Key, Value)  -> Value
+             end, Status).
+
+redact_message({register, AgentId, Pid, SessionId, Plugins, Hostname, _RegisterReq, ConnKey}) ->
+    {register, AgentId, Pid, SessionId, Plugins, Hostname, '$redacted', ConnKey};
+redact_message({'$gen_call', From, Msg}) -> {'$gen_call', From, redact_message(Msg)};
+redact_message({'$gen_cast', Msg})       -> {'$gen_cast', redact_message(Msg)};
+redact_message(Msg)                      -> Msg.
 
 %%%===================================================================
 %%% Internal

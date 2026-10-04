@@ -1,26 +1,36 @@
 %%%-------------------------------------------------------------------
 %%% @doc Logger primary filter that keeps registration credentials out of the
-%%% crash reports of yuzu_gw_upstream (#1197).
+%%% crash reports of the gateway processes that hold a RegisterRequest (#1197).
 %%%
-%%% The upstream's replay queue and its mailbox hold stored or in-flight
-%%% RegisterRequests (enrollment_token, machine_certificate, csr_pem).
-%%% yuzu_gw_upstream:format_status/1 redacts what OTP passes through that
+%%% Three processes hold or are sent a RegisterRequest (enrollment_token,
+%%% machine_certificate, csr_pem):
+%%%   - yuzu_gw_upstream: its replay queue and its mailbox;
+%%%   - yuzu_gw_agent (one per connected agent): the stored `register_req';
+%%%   - yuzu_gw_registry: the `register' call that stores it.
+%%% Each has a format_status/1 that redacts what OTP passes through that
 %%% callback, but three things reach the log from raw data outside it:
 %%%   - the `messages' (the whole mailbox) and the `error_info' exception of
 %%%     the proc_lib CRASH REPORT;
-%%%   - the stacktrace gen_server appends to its own terminate report, whose
-%%%     frames carry the argument lists of the failing calls;
+%%%   - the stacktrace OTP appends to its own terminate report, whose frames
+%%%     carry the argument lists of the failing calls (for an agent, its whole
+%%%     data record; for the registry, the failing handle_call/3 request);
 %%%   - the `reason' of the supervisor report that names the child.
 %%% This filter rewrites those events before any handler sees them:
-%%%   - proc_lib crash report of the upstream: `messages' becomes
+%%%   - proc_lib crash report of a protected process: `messages' becomes
 %%%     {redacted, Count}; `dictionary' likewise; `error_info' keeps its class,
 %%%     with the reason and stacktrace reduced by yuzu_gw_upstream's
-%%%     redact_why/1 and redact_stack/1 (the functions format_status uses: one
-%%%     implementation, not a copy);
-%%%   - gen_server terminate report of the upstream: `reason' through
-%%%     yuzu_gw_upstream:redact_reason/1;
-%%%   - supervisor report whose offender id is the upstream (child_terminated
+%%%     redact_why/1 and redact_stack/1 (the functions its format_status uses:
+%%%     one implementation, not a copy);
+%%%   - gen_server terminate report of the upstream or the registry, and
+%%%     gen_statem terminate report of an agent: `reason' reduced the same way;
+%%%   - supervisor report whose offender is a protected process (child_terminated
 %%%     and the other reports that carry a reason): `reason' likewise.
+%%% A process is protected when it is registered under the name of one of the
+%%% modules or was started by that module's init/1 (a crash report still names
+%%% it after its name is gone), which covers the unregistered agent processes;
+%%% a gen_statem terminate report names its callback module in `modules'; a
+%%% supervisor report names the child by its id (upstream, registry) or by the
+%%% module in its start spec (agent: its id is the shared word `agent').
 %%% Reports of every other process pass through unchanged. Only the first
 %%% process of a crash report is rewritten; the neighbours listed after it are
 %%% other processes.
@@ -31,8 +41,8 @@
 %%% fixed text that names no data (and the report callbacks, which would try to
 %%% format that text as a report, are removed from its metadata).
 %%%
-%%% Installed by yuzu_gw_app on start and removed on stop. A yuzu_gw_upstream
-%%% used without the application (a test, a shell) is NOT covered.
+%%% Installed by yuzu_gw_app on start and removed on stop. These processes used
+%%% without the application (a test, a shell) are NOT covered.
 %%% @end
 %%%-------------------------------------------------------------------
 -module(yuzu_gw_crash_redact).
@@ -41,6 +51,9 @@
 
 -define(FILTER_ID, yuzu_gw_crash_redact).
 -define(UPSTREAM, yuzu_gw_upstream).
+%% The modules whose processes are protected: the callback modules of the
+%% upstream client, the agent state machine and the registry.
+-define(PROTECTED, [yuzu_gw_upstream, yuzu_gw_agent, yuzu_gw_registry]).
 
 %% @doc Add the primary filter. Idempotent: already present is success.
 -spec install() -> ok.
@@ -73,16 +86,25 @@ filter(Event, _Extra) ->
 
 rewrite(#{msg := {report, #{label := {proc_lib, crash}, report := [ProcInfo | Rest]} = R}} = Event)
   when is_list(ProcInfo) ->
-    case is_upstream_proc(ProcInfo) of
+    case is_protected_proc(ProcInfo) of
         true  -> Event#{msg := {report, R#{report := [redact_proc(ProcInfo) | Rest]}}};
         false -> Event
     end;
-rewrite(#{msg := {report, #{label := {gen_server, terminate}, name := ?UPSTREAM,
+rewrite(#{msg := {report, #{label := {gen_server, terminate}, name := Name,
                             reason := Reason} = R}} = Event) ->
-    Event#{msg := {report, R#{reason := ?UPSTREAM:redact_reason(Reason)}}};
+    case is_protected_name(Name) of
+        true  -> Event#{msg := {report, R#{reason := ?UPSTREAM:redact_reason(Reason)}}};
+        false -> Event
+    end;
+rewrite(#{msg := {report, #{label := {gen_statem, terminate}, modules := Modules,
+                            reason := Reason} = R}} = Event) when is_list(Modules) ->
+    case lists:any(fun is_protected_module/1, Modules) of
+        true  -> Event#{msg := {report, R#{reason := redact_statem_reason(Reason)}}};
+        false -> Event
+    end;
 rewrite(#{msg := {report, #{label := {supervisor, _}, report := Props} = R}} = Event)
   when is_list(Props) ->
-    case is_upstream_offender(Props) andalso lists:keymember(reason, 1, Props) of
+    case is_protected_offender(Props) andalso lists:keymember(reason, 1, Props) of
         true ->
             Reason = element(2, lists:keyfind(reason, 1, Props)),
             Props1 = lists:keyreplace(reason, 1, Props,
@@ -95,22 +117,56 @@ rewrite(Event) ->
     Event.
 
 %% A crash report's first element is the crashed process's proplist. The
-%% process is the upstream when it is registered under that name, or was
-%% started by its init/1 (the name can already be gone).
-is_upstream_proc(ProcInfo) ->
-    lists:keyfind(registered_name, 1, ProcInfo) =:= {registered_name, ?UPSTREAM}
-        orelse case lists:keyfind(initial_call, 1, ProcInfo) of
-                   {initial_call, {?UPSTREAM, init, _}} -> true;
-                   _                                    -> false
-               end.
+%% process is protected when it is registered under a protected module's name,
+%% or was started by that module's init/1 (the name can already be gone, and an
+%% agent process never had one).
+is_protected_proc(ProcInfo) ->
+    case lists:keyfind(registered_name, 1, ProcInfo) of
+        {registered_name, Name} when is_atom(Name), Name =/= [] ->
+            is_protected_name(Name) orelse initial_call_protected(ProcInfo);
+        _ ->
+            initial_call_protected(ProcInfo)
+    end.
 
-is_upstream_offender(Props) ->
+initial_call_protected(ProcInfo) ->
+    case lists:keyfind(initial_call, 1, ProcInfo) of
+        {initial_call, {Module, init, _}} -> is_protected_module(Module);
+        _                                 -> false
+    end.
+
+%% The registered names of the protected modules are their module names.
+is_protected_name(Name) -> is_protected_module(Name).
+
+is_protected_module(Module) -> lists:member(Module, ?PROTECTED).
+
+%% The offender of a supervisor report: the child id is the module name for the
+%% upstream and the registry; the agent supervisor's id is `agent', so the
+%% module of the start spec decides.
+is_protected_offender(Props) ->
     case lists:keyfind(offender, 1, Props) of
         {offender, Offender} when is_list(Offender) ->
-            lists:keyfind(id, 1, Offender) =:= {id, ?UPSTREAM};
+            case lists:keyfind(id, 1, Offender) of
+                {id, Id} when is_atom(Id) ->
+                    is_protected_module(Id) orelse mfargs_protected(Offender);
+                _ ->
+                    mfargs_protected(Offender)
+            end;
         _ ->
             false
     end.
+
+mfargs_protected(Offender) ->
+    case lists:keyfind(mfargs, 1, Offender) of
+        {mfargs, {Module, _, _}} -> is_protected_module(Module);
+        _                        -> false
+    end.
+
+%% A gen_statem terminate reason is an atom or {Class, Reason, Stacktrace}.
+redact_statem_reason(Reason) when is_atom(Reason) -> Reason;
+redact_statem_reason({Class, Why, Stack}) when is_atom(Class) ->
+    {Class, ?UPSTREAM:redact_why(Why), ?UPSTREAM:redact_stack(Stack)};
+redact_statem_reason(_Other) ->
+    '$redacted'.
 
 redact_proc(ProcInfo) ->
     [redact_item(Item) || Item <- ProcInfo].
