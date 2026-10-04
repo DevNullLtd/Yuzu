@@ -566,7 +566,9 @@ store_counted(SessionId, Info, ConnKey, AgentId, Ref) ->
                 {error, _} = Error ->
                     %% Refused (the registry already removed the row) or not
                     %% reachable (the row must not stay unadmitted).
-                    _ = ets:delete(?PENDING_TABLE, SessionId),
+                    try ets:delete(?PENDING_TABLE, SessionId)
+                    catch error:badarg -> true
+                    end,
                     release_session(Ref),
                     Error
             end;

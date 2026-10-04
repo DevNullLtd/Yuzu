@@ -46,7 +46,7 @@ cap_test_() ->
        fun live_cap/0},
       {"pending: the 9th distinct agent's Register row is refused and not stored",
        fun pending_cap/0},
-      {"pending plus live count together, an agent with both counts once",
+      {"pending plus live count together, an agent with both counts twice for the others",
        fun pending_and_live_count_together/0},
       {"an expired pending row is not counted",
        fun expired_pending_not_counted/0},
@@ -81,7 +81,9 @@ cap_test_() ->
       {"an expired reservation is not counted and the sweep removes it",
        fun expired_reservation_not_counted_and_swept/0},
       {"a reservation held is the admission, one that is gone is checked",
-       fun reservation_is_the_admission/0}
+       fun reservation_is_the_admission/0},
+      {"the registry dying between the row and its commit answers registry_unavailable, no crash",
+       fun registry_dies_before_commit/0}
      ]}.
 
 setup() ->
@@ -600,6 +602,32 @@ reservation_is_the_admission() ->
     ?assertEqual(ok, yuzu_gw_registry:release_session(Ref2)),
     ?assertEqual(ok, yuzu_gw_registry:release_session(undefined)),
     ?assertEqual([], reserved_rows()).
+
+%% The registry goes away after the row is stored and before it is committed: the
+%% table is gone with it, and dropping the uncommitted row must not raise.
+registry_dies_before_commit() ->
+    Reg = whereis(yuzu_gw_registry),
+    ok = meck:new(yuzu_gw_safe_call, [passthrough, no_link]),
+    try
+        ok = meck:expect(yuzu_gw_safe_call, call,
+                         fun(yuzu_gw_registry, {commit_pending, _, _, _, _}, _Timeout, Error) ->
+                                 Mon = monitor(process, Reg),
+                                 exit(Reg, kill),
+                                 receive {'DOWN', Mon, process, Reg, _} -> ok
+                                 after 2000 -> error(registry_not_dead)
+                                 end,
+                                 ok = wait_until(fun() -> ets:info(yuzu_gw_pending) =:= undefined end),
+                                 {error, Error};
+                            (Server, Request, Timeout, Error) ->
+                                 meck:passthrough([Server, Request, Timeout, Error])
+                         end),
+        ?assertEqual({error, registry_unavailable},
+                     yuzu_gw_registry:store_pending(session(1), info(agent(1), conn()))),
+        ?assertEqual(1, meck:num_calls(yuzu_gw_safe_call, call,
+                                       ['_', {commit_pending, '_', '_', '_', '_'}, '_', '_']))
+    after
+        meck:unload(yuzu_gw_safe_call)
+    end.
 
 %%%===================================================================
 %%% Helpers
