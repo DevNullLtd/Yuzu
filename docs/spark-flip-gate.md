@@ -586,7 +586,7 @@ flip, with a red-first test each:
   same-type load. Criterion: PR-5 either resolves #4279 directly or explicitly re-assesses it
   against the landed K-bound logic and records the outcome here, rather than leaving it to drift
   as an unrelated open issue.
-- **FIX in PR #<PR>, pending merge (relates to #4354; added 2026-09-14, discovered during rung 9c PR-5a's own
+- **FIX in PR #5337, pending merge (relates to #4354; added 2026-09-14, discovered during rung 9c PR-5a's own
   cs-103 tombstone-reachability investigation)**: #4354, `publish_arm_verdicts_locked`'s ordinary
   (non-firewall) pop loop used to pop every claim in `finished` on outcome presence and fifo-front
   identity alone, without checking whether that claim's index release had succeeded. The one release
@@ -607,7 +607,7 @@ flip, with a red-first test each:
   (`try_dispatch_head_locked` calling `sweep_terminal_queued_locked`) retries the release
   immediately. Regression coverage: the Catch2 cases whose names start "#4354:" in
   `tests/unit/test_guardian_spark_runtime.cpp`, at least one per fix site. This criterion is
-  satisfied once PR #<PR> merges; the retained-tombstone gaps it leaves are the next two bullets.
+  satisfied once PR #5337 merges; the retained-tombstone gaps it leaves are the next two bullets.
 - **NEW flip criterion (added 2026-10-03, Dave's ruling; found while planning the #4354 fix)**:
   #5322, a retained withdrawn tombstone can be re-dispatched, or can strand a clean follower
   behind it. One mechanism with two faces, so one fix. Construction (existing test seams only):
