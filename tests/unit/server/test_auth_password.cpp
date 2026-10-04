@@ -153,6 +153,16 @@ struct CredInfra {
         return std::stoi(scalar("SELECT count(*) FROM session_store.sessions WHERE username = '" +
                                 user + "'"));
     }
+    /// REAL statement fault for ONE audit action (BEFORE INSERT trigger on
+    /// NEW.action) — every other audit row still commits.
+    void fault_audit_for_action(const std::string& action) {
+        exec("CREATE FUNCTION public.yuzu_test_audit_action_fault() RETURNS trigger LANGUAGE "
+             "plpgsql AS $$ BEGIN IF NEW.action = '" + action +
+             "' THEN RAISE EXCEPTION 'injected audit fault'; END IF; RETURN NEW; END $$");
+        exec("CREATE TRIGGER yuzu_test_audit_action_fault BEFORE INSERT ON "
+             "audit_store.audit_events FOR EACH ROW EXECUTE FUNCTION "
+             "public.yuzu_test_audit_action_fault()");
+    }
     int audit_total() { return std::stoi(scalar("SELECT count(*) FROM audit_store.audit_events")); }
     int audit_rows(const std::string& action, const std::string& target) {
         return std::stoi(scalar("SELECT count(*) FROM audit_store.audit_events WHERE action = '" +
@@ -462,6 +472,40 @@ TEST_CASE("commit_password_change: a REAL audit statement fault rolls the whole 
     CHECK(vrole(mgr, "ivy", kOld) == Role::user);
     CHECK_FALSE(vrole(mgr, "ivy", kNew).has_value());
     CHECK(f.audit.emit_failed_count() >= 1);
+}
+
+TEST_CASE("commit_password_change (admin): a fault on ONLY the auth.lockout.cleared row rolls "
+          "the whole change back",
+          "[pg][auth][password][audit][lockout]") {
+    // The second in-transaction row is atomic with the credential change: the
+    // user.password_reset INSERT succeeds, the lockout row alone faults, and
+    // nothing commits. Distinguishes "both rows in the transaction" from "the
+    // lockout row written post-commit", which a whole-table fault cannot.
+    CredInfra f;
+    AuthManager mgr;
+    f.wire(mgr);
+    seed_local(*f.db, "lockd", kOld, Role::user);
+    const auto before = f.db->get_user("lockd")->hash_hex;
+    auto s = mgr.create_local_session("lockd", Role::user, false, anchor_of(mgr, "lockd", kOld));
+    REQUIRE_FALSE(s.empty());
+    for (int i = 0; i < 3; ++i)
+        REQUIRE(f.db->record_failed_login("lockd", 3, 3600).has_value());
+    const auto armed = f.db->lockout_status("lockd");
+    REQUIRE(armed->locked);
+    f.fault_audit_for_action("auth.lockout.cleared");
+
+    const auto r = mgr.commit_password_change(mkreq(Kind::kAdminReset, "lockd", kNew));
+    CHECK(r.result == Result::kAuditUnavailable);
+    CHECK_FALSE(r.lockout_cleared);
+    CHECK(f.db->get_user("lockd")->hash_hex == before);
+    CHECK(mgr.validate_session(s).has_value());
+    CHECK(f.sessions_of("lockd") == 1);
+    const auto st = f.db->lockout_status("lockd");
+    REQUIRE(st.has_value());
+    CHECK(st->locked);
+    CHECK(st->failed_count == armed->failed_count);
+    CHECK(f.audit_rows("user.password_reset", "lockd") == 0);
+    CHECK(f.audit_rows("auth.lockout.cleared", "lockd") == 0);
 }
 
 TEST_CASE("commit_password_change: audit-row presence <=> new-hash presence, on abort and commit "

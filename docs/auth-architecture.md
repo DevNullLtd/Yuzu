@@ -245,8 +245,9 @@ columns cleared); `DELETE FROM session_store.sessions WHERE username=$1` + the
 copy, shared with `SessionStore::invalidate_user`); and the success audit
 row(s) via `AuditStore::log_in_txn` — `user.password_change` /
 `user.password_reset` (detail `sessions_revoked=N provisional_mfa_cleared=…`)
-and, for an admin reset of an account that had a lockout (`locked_until` set or
-a non-zero failure count), `auth.lockout.cleared` (detail `password_reset`). An
+and, for an admin reset of an account that had a lockout (`locked_until` set —
+even if the lock has since expired — or a non-zero failure count),
+`auth.lockout.cleared` (detail `password_reset`). An
 audit INSERT failure aborts everything → `503 audit_unavailable` +
 `Sec-Audit-Failed`; any other failure (lease, lock timeout, statement, COMMIT)
 → `503 store_unavailable`. A refusal changes NOTHING — the caller's session,

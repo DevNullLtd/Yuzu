@@ -303,6 +303,20 @@ struct PasswordRoutesHarness {
              "FOR EACH ROW EXECUTE FUNCTION public.yuzu_test_audit_fault()");
     }
 
+    /// REAL statement fault for ONE audit action: a BEFORE INSERT trigger
+    /// raises only when NEW.action matches, so every other audit row commits.
+    /// Faulting just the SECOND in-transaction row (auth.lockout.cleared)
+    /// proves it shares the credential change's transaction — a fault on the
+    /// table as a whole (break_audit_table) cannot tell the two rows apart.
+    void fault_audit_for_action(const std::string& action) {
+        exec("CREATE FUNCTION public.yuzu_test_audit_action_fault() RETURNS trigger LANGUAGE "
+             "plpgsql AS $$ BEGIN IF NEW.action = '" + action +
+             "' THEN RAISE EXCEPTION 'injected audit fault'; END IF; RETURN NEW; END $$");
+        exec("CREATE TRIGGER yuzu_test_audit_action_fault BEFORE INSERT ON "
+             "audit_store.audit_events FOR EACH ROW EXECUTE FUNCTION "
+             "public.yuzu_test_audit_action_fault()");
+    }
+
     int sessions_of(const std::string& user) {
         yuzu::server::pg::PgConn conn{PQconnectdb(db.dsn().c_str())};
         REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
@@ -1408,6 +1422,42 @@ TEST_CASE("password routes: admin reset under a REAL audit fault makes no change
     h.restore_audit_table();
     CHECK(h.committed("user.password_reset", "nora") == 0);
     CHECK(h.committed("auth.lockout.cleared", "nora") == 0);
+}
+
+TEST_CASE("password routes: a fault on ONLY the auth.lockout.cleared row rolls the whole reset back",
+          "[pg][rest][password][audit][lockout]") {
+    // The SECOND in-transaction audit row is atomic with the credential
+    // change too: the user.password_reset INSERT succeeds, the
+    // auth.lockout.cleared INSERT alone faults, and nothing at all commits —
+    // not the hash, not the lockout clear, not the session revoke, not the
+    // first audit row. A lockout row written post-commit would leave the reset
+    // standing here.
+    PasswordRoutesHarness h;
+    h.wire();
+    h.as_admin();
+    h.seed("lockd", kOld, Role::user);
+    auto lockd_session = h.auth_mgr.create_local_session_for_test("lockd", Role::user, false);
+    REQUIRE_FALSE(lockd_session.empty());
+    for (int i = 0; i < 3; ++i)
+        REQUIRE(h.db->record_failed_login("lockd", 3, 3600).has_value());
+    const auto armed = h.db->lockout_status("lockd");
+    REQUIRE(armed->locked);
+    const auto before = h.stored_hash("lockd");
+    h.fault_audit_for_action("auth.lockout.cleared");
+
+    auto res = h.reset("lockd", kNew);
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+    CHECK(h.stored_hash("lockd") == before);
+    CHECK(h.password_works("lockd", kOld));
+    CHECK(h.auth_mgr.validate_session(lockd_session).has_value());
+    auto st = h.db->lockout_status("lockd");
+    REQUIRE(st.has_value());
+    CHECK(st->locked);
+    CHECK(st->failed_count == armed->failed_count);
+    CHECK(h.committed("user.password_reset", "lockd") == 0);
+    CHECK(h.committed("auth.lockout.cleared", "lockd") == 0);
 }
 
 TEST_CASE("password routes: two concurrent admin resets, the second's audit faulted — the first "

@@ -1670,7 +1670,7 @@ curl -s -X POST \
 }
 ```
 
-- `lockout_cleared` — `true` only when the target **had** a lockout (an active lock or a non-zero failure count) and it was cleared, in the same transaction as the reset, with an `auth.lockout.cleared` row (`detail=password_reset`) in the same commit. `false` means there was nothing to clear (no `auth.lockout.cleared` row is written).
+- `lockout_cleared` — `true` only when the target **had** a lockout (`locked_until` set — even if the lock has since expired — or a non-zero failure count) and it was cleared, in the same transaction as the reset, with an `auth.lockout.cleared` row (`detail=password_reset`) in the same commit. `false` means there was nothing to clear (no `auth.lockout.cleared` row is written).
 - `provisional_mfa_cleared` — `true` when an un-enrolled TOTP secret was wiped, so an enrolment started before the reset cannot be finished and the next enrolment gets a fresh secret.
 - `api_tokens_active` — **API tokens are deliberately left alone** (automation may depend on them, and a reset is not by itself a compromise finding), so the response reports how many active tokens the account holds. If the token store cannot be read it is `null` and `"api_tokens_unknown": true` is added; `remediation` then says the count could not be confirmed. The dashboard shows a warning unless the count is a confirmed `0`.
 
