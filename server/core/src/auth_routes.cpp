@@ -2004,8 +2004,14 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
             return;
         }
         const auto role_opt = check.role;
-        if (!role_opt)
-            return; // unreachable: kVerified always carries the role (defensive)
+        if (!role_opt) {
+            // Unreachable: kVerified always carries the role. Defensive, but
+            // never an empty 200 that a client could read as a login success.
+            spdlog::error("POST /login: verified credential carried no role");
+            res.status = 500;
+            res.set_content(detail::a4_error(res, "internal error"), "application/json");
+            return;
+        }
 
         // (Break-glass success evidence is emitted further down, AFTER the UP-1
         // hard-deny — so an un-enrolled armed break-glass user that proved its

@@ -1671,6 +1671,8 @@ Every dashboard session of the target is revoked (durably, cross-replica) and it
 
 **Metric:** `yuzu_auth_password_changes_total{kind="admin", result=...}`.
 
+**Rate limit:** both password routes share the per-IP `/login` rate-limit bucket (`login_rate_limit_per_ip`), not the general API bucket, because the self route verifies a password. Over the limit: `429` with `Retry-After: 1`.
+
 **No MCP twin (parity exception).** Neither password route has an MCP tool, by design, recorded as `exception:` rows in `docs/api-parity-ledger.md`. Self-service change is permanently excluded: an MCP caller is a token, not the human, and a token that could change its owner's password would turn a token leak into an account takeover. Admin reset is deferred: `UserManagement:Write` is approval-gated at the supervised MCP tier, and an approval ticket stores the tool's arguments in plain text and shows them to approvers, so a password argument would be persisted and displayed. A follow-up tool that takes no password argument (a server-generated temporary password) is the intended path.
 
 ---

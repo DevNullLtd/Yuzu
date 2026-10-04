@@ -2198,6 +2198,10 @@ bool AuthManager::rollback_password_write(const std::string& username,
         return false;
     // Restore ONLY if the stored hash is still the one we wrote — a later
     // writer's credential is never clobbered by a stale compensation.
+    // set_password zeroes the lockout columns on BOTH writes, so the rollback
+    // restores the credential but not a prior lockout state. Harmless: the
+    // self route only writes for a caller who is not locked, and an admin
+    // reset's caller could clear the lockout anyway (POST .../unlock).
     auto restored = auth_db_->set_password(username, written.previous_hash_hex,
                                            written.previous_salt_hex, written.new_hash_hex);
     if (!restored)

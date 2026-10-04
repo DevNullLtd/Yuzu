@@ -898,6 +898,11 @@ extern const char* const kSettingsHtml =
           });
           return;
         }
+        if (resp.status === 401) {
+          /* Not a step-up: the session itself is gone (expired or revoked). */
+          window.location.href = '/login';
+          return;
+        }
         done(resp.status >= 200 && resp.status < 300, resp);
       })
       .catch(function(err) {

@@ -2987,7 +2987,8 @@ public:
                           "Total requests refused 503 by an is_store_unavailable fail-closed "
                           "guard on the auth/MFA surface, by route",
                           "counter");
-        for (auto route : {"login", "mfa_verify", "mfa_stepup", "mfa_enroll", "elevate"}) {
+        for (auto route :
+             {"login", "mfa_verify", "mfa_stepup", "mfa_enroll", "elevate", "password_change"}) {
             metrics_.counter("yuzu_auth_secret_unavailable_total", {{"route", route}});
         }
         // #2396 / #2401: reason-labelled sibling of the counter above. Same
@@ -2999,21 +3000,53 @@ public:
         // (reason=query_error) vs an undecryptable/absent secret
         // (reason=secret_unavailable). Lets SRE tell a transient retry-storm
         // apart from a uniform outage, which the route-only counter above cannot
-        // (#2401). Only the initial POST /login handler is instrumented; the
-        // other is_store_unavailable->503 auth sites (login/mfa, stepup, enroll,
-        // elevate) keep only yuzu_auth_secret_unavailable_total{route}. Reason
+        // (#2401). Only the initial POST /login handler and the self-service
+        // password change (route=password_change, which shares its lockout
+        // helper, #5342) are instrumented; the other is_store_unavailable->503
+        // auth sites (login/mfa, stepup, enroll, elevate) keep only
+        // yuzu_auth_secret_unavailable_total{route}. Reason
         // token matches the yuzu_*_read_degrade_total family. Bounded, pre-seeded
         // closed label set per docs/observability-conventions.md so absent()
         // alerts stay meaningful.
         metrics_.describe("yuzu_auth_read_degrade_total",
                           "Requests refused 503 by an is_store_unavailable fail-closed guard in "
-                          "the initial POST /login handler, labelled by why the auth store was "
-                          "unavailable (pool_acquire_timeout / query_error / secret_unavailable)",
+                          "the initial POST /login handler or the self-service password change, "
+                          "by route and by why the auth store was unavailable "
+                          "(pool_acquire_timeout / query_error / secret_unavailable)",
                           "counter");
-        for (auto reason : {"pool_acquire_timeout", "query_error", "secret_unavailable"}) {
-            metrics_.counter("yuzu_auth_read_degrade_total",
-                             {{"route", "login"}, {"reason", reason}});
+        // route=password_change: POST /api/v1/users/me/password shares /login's
+        // lockout helper (AuthRoutes::verify_password_with_lockout), so its
+        // fail-closed refusals land here too (#5342).
+        for (auto route : {"login", "password_change"}) {
+            for (auto reason : {"pool_acquire_timeout", "query_error", "secret_unavailable"}) {
+                metrics_.counter("yuzu_auth_read_degrade_total",
+                                 {{"route", route}, {"reason", reason}});
+            }
         }
+        // #5342: outcomes of the two local-password routes. kind=self is
+        // POST /api/v1/users/me/password, kind=admin is
+        // POST /api/v1/users/{name}/password; result is ok / denied / error.
+        // A kind=self,result=denied burst is password guessing through the
+        // change route, so the closed 2x3 set is pre-seeded (#5177: increase()
+        // never sees the first event of a series born at 1).
+        metrics_.describe("yuzu_auth_password_changes_total",
+                          "Local-password change/reset outcomes, by kind (self|admin) and result "
+                          "(ok|denied|error)",
+                          "counter");
+        for (auto kind : {"self", "admin"}) {
+            for (auto result : {"ok", "denied", "error"}) {
+                metrics_.counter("yuzu_auth_password_changes_total",
+                                 {{"kind", kind}, {"result", result}});
+            }
+        }
+        // #5342/#5274: a credential check that passed against the hash it read,
+        // then found a different hash under the row lock (the password changed
+        // mid-login), and was denied. Unlabelled; pre-seeded to 0.
+        metrics_.describe("yuzu_auth_credential_changed_during_verify_total",
+                          "Password verifications denied because the stored hash changed "
+                          "between the verify read and the row-locked recheck",
+                          "counter");
+        metrics_.counter("yuzu_auth_credential_changed_during_verify_total");
         // Gate 5 chaos-injector CH-3/UP-6 follow-up (#4020): the ONE
         // caller-visible signal that get_user_role() is about to floor a
         // legacy-API-token-authenticated request's role to Role::user
@@ -14388,6 +14421,14 @@ private:
             is_login = is_login ||
                        (req.path == "/auth/saml/start" && req.method == "GET") ||
                        (req.path == "/saml/acs"        && req.method == "POST");
+            // #5342: POST /api/v1/users/me/password verifies the current
+            // password, so it is the same online-guessing surface as /login
+            // (lockout bounds it only while --auth-lockout-threshold > 0).
+            // The admin reset (/api/v1/users/{name}/password) rides the same
+            // bucket: one predicate for the pair, no cost to a human admin.
+            is_login = is_login ||
+                       (req.method == "POST" && req.path.starts_with("/api/v1/users/") &&
+                        req.path.ends_with("/password"));
             auto& limiter = is_login ? login_rate_limiter_ : api_rate_limiter_;
             if (!limiter.allow(req.remote_addr)) {
                 res.status = 429;
