@@ -418,15 +418,21 @@ cfg edit look like a reset; that path is gone.)
   admin role or a custom role holding `UserManagement:Write` is refused
   (`403 durable_admin_required`), as are API and MCP tokens; MFA step-up
   applies when the caller is enrolled. The configured break-glass account
-  cannot be reset this way (`403 break_glass_target`). The user's sessions are
-  revoked before the password is written; their API tokens are **not** (the
-  response reports how many remain active).
+  cannot be reset this way (`403 break_glass_target`). The new password, the
+  sign-out of the user's sessions, the discarding of an unfinished MFA
+  enrolment, the lockout clear and the audit row are one database
+  transaction — all of it lands, or none of it. Their API tokens and any
+  ENROLLED second factor are **not** touched (the response reports how many
+  tokens remain active); for a compromised account also run
+  `yuzu-server --mfa-reset <user>` and revoke the tokens.
 - A user who still knows their password changes it themselves: Settings →
   User Management → **Change password**, or `POST /api/v1/users/me/password`.
   They are signed out everywhere and sign in again with the new password.
 
-Audit: `user.password_reset` / `user.password_change`. A reset also clears
-the account's lockout (`auth.lockout.cleared`, `detail=password_reset`). There
+Audit: `user.password_reset` / `user.password_change`, written in the same
+transaction as the change (an audit failure makes no change: `503`). A reset
+also clears the account's lockout, recording `auth.lockout.cleared`
+(`detail=password_reset`) only when there was a lockout to clear. There
 is no MCP tool for either (#5357 tracks a temporary-password reset tool).
 
 **Re-running the Windows server installer is not a reset.** On an upgrade it

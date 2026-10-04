@@ -91,7 +91,7 @@ TEST_CASE_METHOD(MfaFixture, "mfa_verify_enrollment with valid code enrolls and 
     REQUIRE(init.has_value());
     auto code = code_for_now(init->secret_base32);
 
-    auto recovery = db->mfa_verify_enrollment("alice", code);
+    auto recovery = db->mfa_verify_enrollment("alice", code, std::nullopt);
     REQUIRE(recovery.has_value());
     REQUIRE(recovery->size() == 10);
 
@@ -105,7 +105,7 @@ TEST_CASE_METHOD(MfaFixture, "mfa_verify_enrollment rejects wrong code", "[pg][m
     auto init = db->mfa_init_enrollment("alice", "Yuzu");
     REQUIRE(init.has_value());
 
-    auto r = db->mfa_verify_enrollment("alice", "000000");
+    auto r = db->mfa_verify_enrollment("alice", "000000", std::nullopt);
     REQUIRE_FALSE(r.has_value());
     REQUIRE(r.error() == AuthDBError::InvalidCredentials);
 
@@ -130,14 +130,14 @@ TEST_CASE_METHOD(MfaFixture, "double init reuses the provisional secret (no rota
     CHECK(first->otpauth_uri == second->otpauth_uri);
     // And a code from the first QR still verifies after the second init.
     auto code = code_for_now(first->secret_base32);
-    CHECK(db->mfa_verify_enrollment("alice", code).has_value());
+    CHECK(db->mfa_verify_enrollment("alice", code, std::nullopt).has_value());
 }
 
 TEST_CASE_METHOD(MfaFixture, "init refuses if already enrolled", "[pg][mfa][store]") {
     auto init = db->mfa_init_enrollment("alice", "Yuzu");
     REQUIRE(init.has_value());
     auto code = code_for_now(init->secret_base32);
-    REQUIRE(db->mfa_verify_enrollment("alice", code).has_value());
+    REQUIRE(db->mfa_verify_enrollment("alice", code, std::nullopt).has_value());
 
     auto reinit = db->mfa_init_enrollment("alice", "Yuzu");
     REQUIRE_FALSE(reinit.has_value());
@@ -148,7 +148,7 @@ TEST_CASE_METHOD(MfaFixture, "mfa_verify_login_code replay-protected", "[pg][mfa
     auto init = db->mfa_init_enrollment("alice", "Yuzu");
     REQUIRE(init.has_value());
     auto code = code_for_now(init->secret_base32);
-    REQUIRE(db->mfa_verify_enrollment("alice", code).has_value());
+    REQUIRE(db->mfa_verify_enrollment("alice", code, std::nullopt).has_value());
 
     // Same code in the same step is rejected on login (replay).
     auto replay = db->mfa_verify_login_code("alice", code);
@@ -169,7 +169,7 @@ TEST_CASE_METHOD(MfaFixture,
     auto init = db->mfa_init_enrollment("alice", "Yuzu");
     REQUIRE(init.has_value());
     auto enroll_code = code_for_now(init->secret_base32);
-    REQUIRE(db->mfa_verify_enrollment("alice", enroll_code).has_value());
+    REQUIRE(db->mfa_verify_enrollment("alice", enroll_code, std::nullopt).has_value());
 
     auto bytes = mfa::base32_decode(init->secret_base32);
     REQUIRE(bytes.has_value());
@@ -190,7 +190,7 @@ TEST_CASE_METHOD(MfaFixture, "mfa_verify_login_code rejects garbage", "[pg][mfa]
     auto init = db->mfa_init_enrollment("alice", "Yuzu");
     REQUIRE(init.has_value());
     auto code = code_for_now(init->secret_base32);
-    REQUIRE(db->mfa_verify_enrollment("alice", code).has_value());
+    REQUIRE(db->mfa_verify_enrollment("alice", code, std::nullopt).has_value());
 
     auto r = db->mfa_verify_login_code("alice", "");
     REQUIRE(r.has_value());
@@ -205,7 +205,7 @@ TEST_CASE_METHOD(MfaFixture, "recovery codes are single-use", "[pg][mfa][store][
     auto init = db->mfa_init_enrollment("alice", "Yuzu");
     REQUIRE(init.has_value());
     auto code = code_for_now(init->secret_base32);
-    auto recovery_res = db->mfa_verify_enrollment("alice", code);
+    auto recovery_res = db->mfa_verify_enrollment("alice", code, std::nullopt);
     REQUIRE(recovery_res.has_value());
 
     const auto& codes = *recovery_res;
@@ -227,7 +227,7 @@ TEST_CASE_METHOD(MfaFixture, "recovery codes normalise separator and case",
                  "[pg][mfa][store][recovery]") {
     auto init = db->mfa_init_enrollment("alice", "Yuzu");
     auto code = code_for_now(init->secret_base32);
-    auto recovery_res = db->mfa_verify_enrollment("alice", code);
+    auto recovery_res = db->mfa_verify_enrollment("alice", code, std::nullopt);
     REQUIRE(recovery_res.has_value());
     auto orig = recovery_res->front(); // shape "XXXXX-XXXXX"
 
@@ -254,7 +254,7 @@ TEST_CASE_METHOD(MfaFixture, "recovery codes normalise separator and case",
 TEST_CASE_METHOD(MfaFixture, "regenerate replaces all codes", "[pg][mfa][store][recovery]") {
     auto init = db->mfa_init_enrollment("alice", "Yuzu");
     auto code = code_for_now(init->secret_base32);
-    auto first_set = db->mfa_verify_enrollment("alice", code);
+    auto first_set = db->mfa_verify_enrollment("alice", code, std::nullopt);
     REQUIRE(first_set.has_value());
 
     auto second_set = db->mfa_regenerate_recovery_codes("alice");
@@ -275,7 +275,7 @@ TEST_CASE_METHOD(MfaFixture, "regenerate replaces all codes", "[pg][mfa][store][
 TEST_CASE_METHOD(MfaFixture, "disable clears secret and recovery codes", "[pg][mfa][store]") {
     auto init = db->mfa_init_enrollment("alice", "Yuzu");
     auto code = code_for_now(init->secret_base32);
-    REQUIRE(db->mfa_verify_enrollment("alice", code).has_value());
+    REQUIRE(db->mfa_verify_enrollment("alice", code, std::nullopt).has_value());
 
     REQUIRE(db->mfa_disable("alice").has_value());
 
@@ -294,13 +294,13 @@ TEST_CASE_METHOD(MfaFixture, "disable clears secret and recovery codes", "[pg][m
     CHECK(reinit->secret_base32 != init->secret_base32);
     // The fresh secret completes a new enroll → verify cycle end-to-end.
     auto new_code = code_for_now(reinit->secret_base32);
-    CHECK(db->mfa_verify_enrollment("alice", new_code).has_value());
+    CHECK(db->mfa_verify_enrollment("alice", new_code, std::nullopt).has_value());
 }
 
 TEST_CASE_METHOD(MfaFixture, "verify_login_code on disabled user always fails", "[pg][mfa][store]") {
     auto init = db->mfa_init_enrollment("alice", "Yuzu");
     auto code = code_for_now(init->secret_base32);
-    REQUIRE(db->mfa_verify_enrollment("alice", code).has_value());
+    REQUIRE(db->mfa_verify_enrollment("alice", code, std::nullopt).has_value());
     REQUIRE(db->mfa_disable("alice").has_value());
 
     auto r = db->mfa_verify_login_code("alice", code);

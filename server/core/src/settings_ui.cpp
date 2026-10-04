@@ -981,9 +981,11 @@ extern const char* const kSettingsHtml =
           } else if (!confirmedNone) {
             msg += ' Could not confirm whether the account has active API tokens; any it has were NOT revoked — review them if the account may be compromised.';
           }
-          if (d.lockout_cleared === false)
-            msg += ' Its account lockout could not be cleared — use Unlock.';
-          showToast(msg, confirmedNone && d.lockout_cleared !== false ? 'success' : 'warning');
+          /* #5342 Gate 8: lockout_cleared is true only when a lockout existed
+             and was cleared in the same transaction as the reset. */
+          if (d.lockout_cleared === true)
+            msg += ' Its account lockout was cleared.';
+          showToast(msg, confirmedNone ? 'success' : 'warning');
         }
       });
     });

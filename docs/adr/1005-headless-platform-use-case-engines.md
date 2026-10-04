@@ -544,10 +544,10 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        lands, this row stands as the open exception.
      - **The exception relaxes no control.** Both routes accept interactive
        dashboard sessions only, require a same-site `Origin`/`Referer` and
-       `Content-Type: application/json`, pass MFA step-up, revoke every
-       session of the account before writing, and audit fail-closed with a
-       compensating rollback (`yuzu_auth_password_change_unrecorded_total`
-       when that also fails). The admin reset is gated on the A2/A1
+       `Content-Type: application/json`, pass MFA step-up, and commit the
+       credential, the deletion of every session of the account and the
+       audit row in ONE transaction (`CredentialChangeOwner`) — an audit
+       failure makes no change. The admin reset is gated on the A2/A1
        durable-Administrator predicate (`is_rbac_administrator(kRest)` + the
        current-regime re-check), not an ordinary permission. A4 envelope
        and OpenAPI entries hold for both (A2/A3 for the REST half).

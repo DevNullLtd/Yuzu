@@ -8,6 +8,7 @@
  */
 
 #include "session_store.hpp"
+#include "session_store_sql_helpers.hpp"
 
 #include "pg/pg_exec.hpp"
 #include "pg/pg_migration_runner.hpp"
@@ -74,18 +75,9 @@ std::uint64_t to_u64(const char* s) {
     return std::strtoull(s, nullptr, 10);
 }
 
-// Bump the durable write-generation IN THE CALLER'S TXN. Every authz-affecting
-// mutation calls this so a replica's validate-cache sees the change on its next
-// generation refresh. Mirrors RbacStore::bump_generation_in_txn.
-bool bump_generation_in_txn(PGconn* c) {
-    PgResult r = exec_params(
-        c,
-        "INSERT INTO session_store.session_meta (key, value) VALUES ('write_generation', '1') "
-        "ON CONFLICT (key) DO UPDATE SET value = "
-        "(session_store.session_meta.value::bigint + 1)::text",
-        std::vector<std::string>{});
-    return r.status() == PGRES_COMMAND_OK || r.status() == PGRES_TUPLES_OK;
-}
+// The durable write-generation bump lives in session_store_sql_helpers.hpp (one
+// copy, shared with the ADR-0012 §3 CredentialChangeOwner, #5342).
+using session_sql::bump_generation_in_txn;
 
 SessionRow row_from(PGresult* res, int i) {
     SessionRow row;
@@ -265,16 +257,14 @@ SessionStore::invalidate_user(const std::string& username) {
         return std::unexpected(Error{"session store not open"});
     int count = 0;
     std::string err;
+    // The ONE "revoke every session of a user" statement pair, shared with
+    // CredentialChangeOwner (session_store_sql_helpers.hpp, #5342).
     const bool ok = pool_.with_txn_for(kWriteTimeout, [&](PGconn* c) -> bool {
-        PgResult r = exec_params(
-            c, "DELETE FROM session_store.sessions WHERE username=$1 RETURNING token_hash",
-            std::vector<std::string>{username});
-        if (r.status() != PGRES_TUPLES_OK) {
-            err = std::string("session delete-by-user failed: ") + PQerrorMessage(c);
+        const auto deleted = session_sql::invalidate_user_in_txn(c, username, err);
+        if (!deleted)
             return false;
-        }
-        count = PQntuples(r.get());
-        return bump_generation_in_txn(c);
+        count = *deleted;
+        return true;
     });
     if (!ok)
         return std::unexpected(Error{err.empty() ? "invalidate_user failed" : err});

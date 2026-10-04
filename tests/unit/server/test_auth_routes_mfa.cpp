@@ -29,6 +29,8 @@
 #include "test_analytics_pg_helper.hpp" // AnalyticsEventStorePg — ADR-0049 PG port
 #include "test_api_token_pg_helper.hpp" // ApiTokenStorePg — PR 4.1 PG port
 #include "audit_store.hpp"
+#include "credential_change_owner.hpp"
+#include "session_store.hpp"
 #include "pg/pg_pool.hpp"
 #include "test_route_sink.hpp"
 #include "../../../server/core/src/totp.hpp"
@@ -198,8 +200,33 @@ struct AuthRoutesHarness {
         auto init = auth_db->mfa_init_enrollment(username, "Yuzu");
         REQUIRE(init.has_value());
         auto code = totp_at(init->secret_base32, 0);
-        REQUIRE(auth_db->mfa_verify_enrollment(username, code).has_value());
+        REQUIRE(auth_db->mfa_verify_enrollment(username, code, std::nullopt).has_value());
         return init->secret_base32;
+    }
+
+    /// #5342 Gate 8: an administrative password reset through the ONE writer
+    /// (`CredentialChangeOwner`), built on the AuthDB's own pool with that
+    /// pool's session_store + audit_store schemas (the production one-pool
+    /// shape; this harness's own audit_store lives on a separate database).
+    void admin_reset(const std::string& username, const std::string& new_password) {
+        SessionStore ss{auth_db.pool()};
+        REQUIRE(ss.is_open());
+        AuditStore as{auth_db.pool()};
+        REQUIRE(as.is_open());
+        CredentialChangeOwner owner{auth_db.pool(), &as};
+        auth_mgr.set_credential_change_owner(&owner);
+        CredentialChangeRequest r;
+        r.kind = CredentialChangeRequest::Kind::kAdminReset;
+        r.username = username;
+        const auto salt = auth::AuthManager::random_bytes(16);
+        r.new_salt_hex = auth::AuthManager::bytes_to_hex(salt);
+        r.new_hash_hex = auth::AuthManager::pbkdf2_sha256(new_password, salt, 100'000);
+        r.audit_template.principal = "root";
+        r.audit_template.target_type = "User";
+        r.audit_template.target_id = username;
+        const auto outcome = auth_mgr.commit_password_change(r);
+        auth_mgr.set_credential_change_owner(nullptr);
+        REQUIRE(outcome.result == CredentialChangeResult::kOk);
     }
 
     /// Count audit rows that match action + principal.
@@ -1571,7 +1598,15 @@ TEST_CASE("POST /login: a credential change racing the login is 503, not a count
         if (fired)
             return;
         fired = true;
-        REQUIRE(h.auth_db->set_password("alice", racer, racer_salt).has_value());
+        // A committed credential change by another writer (a plain UPDATE on
+        // its own connection stands in for the owner's transaction).
+        yuzu::server::pg::PgConn c{PQconnectdb(h.auth_db.dsn().c_str())};
+        REQUIRE(PQstatus(c.get()) == CONNECTION_OK);
+        yuzu::server::pg::PgResult u{PQexec(
+            c.get(), ("UPDATE auth.users SET password_hash = '" + racer + "', salt_hex = '" +
+                      racer_salt + "' WHERE username = 'alice'")
+                         .c_str())};
+        REQUIRE(u.ok());
     });
     auto res = h.sink.Post("/login", form({{"username", "alice"}, {"password", "alicepassword1"}}),
                            "application/x-www-form-urlencoded");
@@ -1604,8 +1639,7 @@ TEST_CASE("POST /login/mfa/enroll: an old-password pending token cannot complete
     std::string pending = body.at("mfa_pending_token");
     std::string secret = body.at("secret_base32");
 
-    REQUIRE(h.auth_mgr.reset_password("alice", "reset-by-an-admin-1").outcome ==
-            auth::PasswordWriteOutcome::kOk);
+    h.admin_reset("alice", "reset-by-an-admin-1");
 
     auto code = h.totp_at(secret, 0);
     auto step2 = h.sink.Post("/login/mfa/enroll",
@@ -1621,6 +1655,63 @@ TEST_CASE("POST /login/mfa/enroll: an old-password pending token cannot complete
     REQUIRE(rows.has_value());
     for (const auto& row : *rows)
         CHECK(row.result != "ok");
+    // #5342 Gate 8 (chaos R3 inverted): the attacker's TOTP was NOT enrolled
+    // either — before the class fix the enrolment committed and only the
+    // session mint was denied, leaving the attacker's second factor on the
+    // account. The reset wiped the provisional secret (F1).
+    auto st = h.auth_db->mfa_status("alice");
+    REQUIRE(st.has_value());
+    CHECK_FALSE(st->enrolled);
+    CHECK(h.count_audits("mfa.enroll.verified", "alice") == 0);
+}
+
+TEST_CASE("POST /login/mfa/enroll: a valid code cannot enrol once the proven credential changed "
+          "(#5342 Gate 8 F2)",
+          "[pg][mfa][enroll][routes][auth_routes][password]") {
+    // The enrolment is bound to the credential the pending login PROVED. Even
+    // with a code that verifies against the provisional secret currently
+    // stored (here the account's own post-reset re-enrolment secret), an
+    // old-password pending token cannot complete: the guarded UPDATE's
+    // password_hash predicate fails → CredentialChanged → generic 401, audited
+    // `credential_changed`, the token spent, nothing enrolled, no session.
+    AuthRoutesHarness h;
+    h.cfg.mfa_enforcement = "required";
+    auto step1 =
+        h.sink.Post("/login", form({{"username", "alice"}, {"password", "alicepassword1"}}),
+                    "application/x-www-form-urlencoded");
+    REQUIRE(step1->status == 202);
+    std::string pending = nlohmann::json::parse(step1->body).at("mfa_pending_token");
+
+    h.admin_reset("alice", "reset-by-an-admin-1");
+    auto fresh = h.auth_db->mfa_init_enrollment("alice", "Yuzu"); // the new provisional secret
+    REQUIRE(fresh.has_value());
+
+    auto step2 = h.sink.Post(
+        "/login/mfa/enroll",
+        form({{"mfa_pending_token", pending}, {"code", h.totp_at(fresh->secret_base32, 0)}}),
+        "application/x-www-form-urlencoded");
+    REQUIRE(step2);
+    CHECK(step2->status == 401);
+    CHECK(step2->get_header_value("Set-Cookie").empty());
+    CHECK(step2->body.find("credential") == std::string::npos); // no oracle on the wire
+    CHECK_FALSE(h.auth_db->mfa_status("alice")->enrolled);
+    AuditQuery q;
+    q.action = "mfa.enroll.failed";
+    q.principal = "alice";
+    auto rows = h.audit_store->query(q);
+    REQUIRE(rows.has_value());
+    bool saw = false;
+    for (const auto& row : *rows)
+        saw = saw || row.detail == "credential_changed";
+    CHECK(saw);
+    // The token is spent: a retry is "pending token invalid", not another try.
+    auto retry = h.sink.Post(
+        "/login/mfa/enroll",
+        form({{"mfa_pending_token", pending}, {"code", h.totp_at(fresh->secret_base32, 0)}}),
+        "application/x-www-form-urlencoded");
+    REQUIRE(retry);
+    CHECK(retry->status == 401);
+    CHECK(h.count_audits("mfa.enroll.verified", "alice") == 0);
 }
 
 TEST_CASE("POST /login/mfa: an old-password login challenge cannot complete after a reset "
@@ -1635,8 +1726,7 @@ TEST_CASE("POST /login/mfa: an old-password login challenge cannot complete afte
     auto body = nlohmann::json::parse(step1->body);
     std::string pending = body.at("mfa_pending_token");
 
-    REQUIRE(h.auth_mgr.reset_password("admin", "reset-by-another-admin").outcome ==
-            auth::PasswordWriteOutcome::kOk);
+    h.admin_reset("admin", "reset-by-another-admin");
 
     auto step2 = h.sink.Post("/login/mfa",
                              form({{"mfa_pending_token", pending}, {"code", h.totp_at(secret_b32)}}),

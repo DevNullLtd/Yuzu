@@ -48,6 +48,7 @@
 #include "rotation_warn_dedup.hpp"
 #include "approval_manager.hpp"
 #include "audit_store.hpp"
+#include "credential_change_owner.hpp" // #5342 — one-transaction local credential change
 #include "tar_corruption_audit.hpp" // #1567 corruption audit gate
 #include "body_cap_policy.hpp" // #2407: pre-auth request-body cap policy table
 #include "ca_routes.hpp"
@@ -3026,9 +3027,10 @@ public:
         // #5342: outcomes of the two local-password routes. kind=self is
         // POST /api/v1/users/me/password, kind=admin is
         // POST /api/v1/users/{name}/password; result is ok / denied / error.
-        // A kind=self,result=denied burst is password guessing through the
-        // change route, so the closed 2x3 set is pre-seeded (#5177: increase()
-        // never sees the first event of a series born at 1).
+        // kind=self,result=denied includes wrong current passwords (which can
+        // indicate guessing through the change route) alongside the other
+        // refusals; the closed 2x3 set is pre-seeded (#5177: increase() never
+        // sees the first event of a series born at 1).
         metrics_.describe("yuzu_auth_password_changes_total",
                           "Local-password change/reset outcomes, by kind (self|admin) and result "
                           "(ok|denied|error)",
@@ -3039,20 +3041,6 @@ public:
                                  {{"kind", kind}, {"result", result}});
             }
         }
-        // #5342/#5274: a credential check that passed against the hash it read,
-        // then found a different hash under the row lock (the password changed
-        // mid-login), and was denied. Unlabelled; pre-seeded to 0.
-        // #5342 Gate 7: a password change/reset whose mandatory audit row
-        // could not be persisted AND whose compensating rollback ALSO failed —
-        // the new password is in effect with no audit evidence. Should never
-        // move; any increment pages (YuzuPasswordChangeUnrecorded). Closed
-        // 2-value set, pre-seeded so increase() sees the first event.
-        metrics_.describe("yuzu_auth_password_change_unrecorded_total",
-                          "Password changes/resets now in effect with NO audit row (audit write "
-                          "and rollback both failed), by kind (self|admin)",
-                          "counter");
-        for (auto kind : {"self", "admin"})
-            metrics_.counter("yuzu_auth_password_change_unrecorded_total", {{"kind", kind}});
         // #5274: cfg users whose yuzu-server.cfg hash differs from their
         // auth.users row at boot (dead cfg credentials; the stored one wins).
         // Set once by AuthManager::report_stale_cfg_credentials after
@@ -3062,6 +3050,9 @@ public:
                           "store at boot (the cfg is seed-only; the stored credential wins)",
                           "gauge");
         metrics_.gauge("yuzu_auth_cfg_credentials_stale").set(0.0);
+        // #5342/#5274: a credential check that passed against the hash it read,
+        // then found a different hash under the row lock (the password changed
+        // mid-login), and was denied. Unlabelled; pre-seeded to 0.
         metrics_.describe("yuzu_auth_credential_changed_during_verify_total",
                           "Password verifications denied because the stored hash changed "
                           "between the verify read and the row-locked recheck",
@@ -5437,6 +5428,18 @@ public:
                     legacy_sqlite_probe::warn_if_legacy_rows(cfg_.db_dir() / "audit.db",
                                                              "AuditStore", {"audit_events"});
                     audit_store_->start_cleanup();
+                    // #5342 Gate 8: the ADR-0012 §3 query owner for a local
+                    // account's credential change — the credential, its
+                    // sessions, provisional MFA, lockout and audit row(s) in
+                    // ONE transaction on the shared pool. Needs AuthDB,
+                    // SessionStore and AuditStore on THIS pool (all three are:
+                    // auth_db_/session_store_ above, audit_store_ here); the
+                    // one-pool assumption is what makes its cross-schema
+                    // transaction possible (credential_change_owner.hpp).
+                    // Nulled on auth_mgr_ at teardown beside set_auth_db.
+                    credential_change_owner_ =
+                        std::make_unique<CredentialChangeOwner>(*pg_pool_, audit_store_.get());
+                    auth_mgr_.set_credential_change_owner(credential_change_owner_.get());
                 }
             }
             // Internal-CA store — PostgreSQL (ADR-0053, schema ca_store): cert inventory + CRL
@@ -10135,6 +10138,10 @@ public:
         // set_session_store; null it before session_store_ destructs with the
         // rest of this object's members.
         auth_mgr_.set_session_store(nullptr);
+        // #5342: same contract for the credential-change owner (borrows
+        // pg_pool_ + audit_store_, both reset below).
+        auth_mgr_.set_credential_change_owner(nullptr);
+        credential_change_owner_.reset();
 
         // Release Phase 2 components (RAII handles close).
         execution_tracker_.reset();
@@ -19208,15 +19215,15 @@ private:
         // (the SAME section POST /login runs — never a second copy); it and the
         // principal-explicit audit writer capture auth_routes_ (constructed
         // above, outlives the route table). No session cookie is minted here
-        // any more: a self-change revokes every session and the user signs in
-        // again (#5342 Gate 7).
+        // any more: a self-change deletes every session of the account in its
+        // own transaction and the user signs in again (#5342 Gate 7/8).
         // The CSRF same-site gate uses the same trusted-origin allowlist as the
         // dashboard/CA cookie POSTs (#2537). MUST run BEFORE register_routes(),
         // same timing contract as the setters above.
-        // #5342 Gate 7: every audit row those routes write names the principal
-        // captured BEFORE they revoke the caller's sessions (the routes revoke
-        // first, so a session-resolving audit_fn would stamp an empty
-        // principal afterwards) — hence AuthRoutes::audit_log_for_principal.
+        // #5342 Gate 7/8: every audit row those routes write names the
+        // principal captured at the start of the request — refusal rows via
+        // AuthRoutes::audit_log_for_principal, the in-transaction success
+        // rows via make_audit_event_for_principal's template.
         // The break-glass account is refused as an admin-reset target.
         rest_api_v1_->set_password_change_deps(RestApiV1::PasswordChangeDeps{
             &auth_mgr_, auth_routes_->password_change_verify_fn(),
@@ -19229,7 +19236,18 @@ private:
                                                    principal_role, target_type, target_id,
                                                    detail);
             },
-            cfg_.break_glass_user});
+            cfg_.break_glass_user,
+            // #5342 Gate 8: the success row(s) are written INSIDE the
+            // credential-change transaction; this builds their identity half
+            // with the SAME builder audit_log_for_principal uses.
+            [ar = auth_routes_.get()](const httplib::Request& req, const std::string& principal,
+                                      const std::string& principal_role,
+                                      const std::string& target_type,
+                                      const std::string& target_id) {
+                return ar->make_audit_event_for_principal(req, /*action=*/{}, /*result=*/{},
+                                                          principal, principal_role,
+                                                          target_type, target_id);
+            }});
         rest_api_v1_->set_csrf_trusted_origins(cfg_.csrf_trusted_origins);
         rest_api_v1_->register_routes(
             *web_server_,
@@ -20638,6 +20656,11 @@ private:
     /// Borrows pg_pool_ → declared after it; reset in stop() before the pool.
     std::unique_ptr<AccessReviewStore> access_review_store_;
     std::unique_ptr<AuditStore> audit_store_;
+    /// #5342: one-transaction credential-change query owner. Borrows pg_pool_
+    /// and audit_store_ — declared AFTER audit_store_ so it destructs first;
+    /// stop() also resets it explicitly (after nulling auth_mgr_'s pointer)
+    /// before audit_store_/pg_pool_ go.
+    std::unique_ptr<CredentialChangeOwner> credential_change_owner_;
     std::unique_ptr<TagStore> tag_store_;
 
     // Phase 2: Instruction system

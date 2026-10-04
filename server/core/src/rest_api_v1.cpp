@@ -57,6 +57,7 @@
 #include "service_scope_policy.hpp" // authz::service_scope_may_mutate_tag_key — #3289
 #include "rest_audit.hpp"            // detail::emit_behavioral_audit (Sec-Audit-Failed, #1647)
 #include "password_policy.hpp"       // #5342 — check_password_policy for the password routes
+#include "credential_change_owner.hpp" // #5342 — CredentialChangeRequest/Outcome (the one-transaction write)
 #include "rotation_sweep_naming.hpp" // kApiTokenConfirmTotalMetric
 #include "web_utils.hpp"  // audit_token (H1 — neutralise k=v audit-field forgery)
 #include "response_templates_engine.hpp"
@@ -1127,10 +1128,10 @@ const std::string& openapi_spec() {
       "post": {"summary": "Clear a user's account-lockout counter (admin unlock, SOC 2 CC6.3)", "tags": ["Users"], "parameters": [{"name": "username", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Lockout cleared: {username, unlocked, audit_emitted}"}, "400": {"description": "Username empty or malformed"}, "401": {"description": "MFA step-up required (stale/absent proof) — see meta.challenge_url"}, "403": {"description": "Requires UserManagement:Write"}, "500": {"description": "Auth store write failed"}, "503": {"description": "Lockout subsystem unavailable (auth store not configured or unreachable \u2014 see --postgres-dsn)"}}}
     },
     "/users/me/password": {
-      "post": {"summary": "Change your own local-account password (#5342)", "tags": ["Users"], "description": "Interactive LOCAL cookie session only (API/MCP/engine/service-scoped tokens 403 token_session; SSO sessions 409 not_local). Same-site Origin/Referer required (403 csrf) and Content-Type: application/json (415). MFA step-up if enrolled. The current password is checked through the SAME lockout-accounted path as POST /login, so a wrong current password counts toward account lockout; a password that could not be verified (auth store unavailable, or the credential changed concurrently) is a retryable 503 and never counts. Under --auth-mode=sso-only only an ARMED break-glass account may change its password (403 sso_only_local_disabled otherwise, with no password evaluated). New password: 12..1024 BYTES (UTF-8). Every session of the account — including the caller's own — is revoked (durable, cross-replica) BEFORE the credential changes; a revoke that cannot be persisted is 503 session_revoke_failed and nothing is written. No replacement session is issued: the response clears the cookie (Set-Cookie Max-Age=0) and the user signs in again with the new password. Audited as user.password_change (fail-closed: if the audit row cannot be persisted the change is rolled back and 500 + Sec-Audit-Failed is returned). No MCP twin by design (ADR-1005 parity-ledger exception).", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["current_password", "new_password"], "properties": {"current_password": {"type": "string", "maxLength": 1024}, "new_password": {"type": "string", "minLength": 12, "maxLength": 1024, "description": "Length is measured in bytes (UTF-8)"}}}}}}, "responses": {"200": {"description": "Changed: {username, password_changed, sessions_revoked, session_reissued (always false), audit_emitted (always true)}; Set-Cookie clears the session cookie (Max-Age=0)"}, "400": {"description": "Malformed body, or new password outside 12..1024 bytes (not audited)"}, "401": {"description": "Unauthenticated, or MFA step-up required (stale/absent proof) — see meta.challenge_url"}, "403": {"description": "Wrong current password (also returned while the account is locked), token session, cross-origin request, or sso_only_local_disabled"}, "404": {"description": "Account no longer active (sessions were revoked; password unchanged)"}, "409": {"description": "Not a local account (SSO/SCIM), or the password changed concurrently (sessions were revoked; password unchanged)"}, "415": {"description": "Content-Type is not application/json"}, "500": {"description": "Audit row could not be persisted (change rolled back, or — disclosed in the body and counted by yuzu_auth_password_change_unrecorded_total — rollback also failed)"}, "503": {"description": "Auth store unavailable, password could not be verified (verify_transient), or session_revoke_failed (retry_after_ms set)"}}}
+      "post": {"summary": "Change your own local-account password (#5342)", "tags": ["Users"], "description": "Interactive LOCAL cookie session only (API/MCP/engine/service-scoped tokens 403 token_session; SSO sessions 409 not_local). Same-site Origin/Referer required (403 csrf) and Content-Type: application/json (415). MFA step-up if enrolled. The current password is checked through the SAME lockout-accounted path as POST /login, so a wrong current password counts toward account lockout; a password that could not be verified (auth store unavailable, or the credential changed concurrently) is a retryable 503 and never counts. Under --auth-mode=sso-only only an ARMED break-glass account may change its password (403 sso_only_local_disabled otherwise, with no password evaluated). New password: 12..1024 BYTES (UTF-8). ONE TRANSACTION under the account's row lock: the credential, the deletion of every session of the account (the caller's own included, durable and cross-replica), the wipe of a provisional (un-enrolled) TOTP secret, and the user.password_change audit row commit or abort together. A refusal changes nothing (the caller's session stays valid). If the audit row cannot be written the whole change is not made: 503 audit_unavailable + Sec-Audit-Failed. No replacement session is issued: on success the response clears the cookie (Set-Cookie Max-Age=0) and the user signs in again with the new password. A 503 changed nothing unless the server lost contact with the database at commit; a successful sign-in with the new password confirms the change, which is audited either way. No MCP twin by design (ADR-1005 parity-ledger exception).", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["current_password", "new_password"], "properties": {"current_password": {"type": "string", "maxLength": 1024}, "new_password": {"type": "string", "minLength": 12, "maxLength": 1024, "description": "Length is measured in bytes (UTF-8)"}}}}}}, "responses": {"200": {"description": "Changed: {username, password_changed, sessions_revoked, session_reissued (always false), provisional_mfa_cleared, audit_emitted (always true)}; Set-Cookie clears the session cookie (Max-Age=0)"}, "400": {"description": "Malformed body, or new password outside 12..1024 bytes (not audited)"}, "401": {"description": "Unauthenticated, or MFA step-up required (stale/absent proof) — see meta.challenge_url"}, "403": {"description": "Wrong current password (also returned while the account is locked), token session, cross-origin request, or sso_only_local_disabled"}, "404": {"description": "Account no longer active (nothing changed)"}, "409": {"description": "Not a local account (SSO/SCIM) — not_local; or the password changed concurrently — conflict (nothing changed)"}, "415": {"description": "Content-Type is not application/json"}, "503": {"description": "store_unavailable, audit_unavailable (+ Sec-Audit-Failed), or the password could not be verified (verify_transient); retry_after_ms set. Nothing changed unless the connection was lost at commit"}}}
     },
     "/users/{username}/password": {
-      "post": {"summary": "Reset another user's local-account password (admin, #5342)", "tags": ["Users"], "description": "Gated on the canonical durable-Administrator predicate (the same is_rbac_administrator check as the RBAC role-assignment routes, re-verified against the enforcement regime in effect right now) — NOT an ordinary permission check, and the same rule for every target: RBAC off, the caller's own local account must hold the admin role; RBAC on, the caller must hold a user-principal Administrator grant. A JIT elevation, an IdP-group-derived session role, or a custom role holding UserManagement:Write is refused (403 durable_admin_required); a store that cannot confirm authority is 503 admin_gate_unavailable. Interactive cookie session only (API/MCP/engine/service-scoped tokens 403 token_session). Same-site Origin/Referer required (403 csrf) and Content-Type: application/json (415). Refuses your own account (403 self_target — use POST /users/me/password) and the configured break-glass account (403 break_glass_target), both before MFA step-up. SSO/SCIM accounts 409 not_local; absent/inactive 404. New password: 12..1024 BYTES (UTF-8). Every cookie session of the target is revoked BEFORE the credential changes (503 session_revoke_failed and nothing written if that cannot be persisted). After the recorded reset the target's lockout is cleared through the admin-unlock primitive (audited as auth.lockout.cleared; a failure is reported as lockout_cleared:false). API tokens are NOT revoked — the response reports api_tokens_active (null + api_tokens_unknown when the token store cannot be read). Audited as user.password_reset (fail-closed with rollback, as for the self route). No MCP twin by design (ADR-1005 parity-ledger exception).", "parameters": [{"name": "username", "in": "path", "required": true, "schema": {"type": "string"}}], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["new_password"], "properties": {"new_password": {"type": "string", "minLength": 12, "maxLength": 1024, "description": "Length is measured in bytes (UTF-8)"}}}}}}, "responses": {"200": {"description": "Reset: {username, password_reset, sessions_revoked, lockout_cleared, api_tokens_active (number, or null with api_tokens_unknown: true), remediation}"}, "400": {"description": "Malformed body or username, or new password outside 12..1024 bytes (not audited)"}, "401": {"description": "Unauthenticated, or MFA step-up required (stale/absent proof) — see meta.challenge_url"}, "403": {"description": "Not a durable Administrator (durable_admin_required); or token session, cross-origin request, self_target, or break_glass_target"}, "404": {"description": "No active account by that name (sessions were revoked; password unchanged)"}, "409": {"description": "Not a local account (SSO/SCIM) (sessions were revoked; password unchanged)"}, "415": {"description": "Content-Type is not application/json"}, "500": {"description": "Audit row could not be persisted (reset rolled back, or — disclosed in the body and counted by yuzu_auth_password_change_unrecorded_total — rollback also failed)"}, "503": {"description": "Auth store unavailable, admin_gate_unavailable, or session_revoke_failed (retry_after_ms set)"}}}
+      "post": {"summary": "Reset another user's local-account password (admin, #5342)", "tags": ["Users"], "description": "Gated on the canonical durable-Administrator predicate (the same is_rbac_administrator check as the RBAC role-assignment routes, re-verified against the enforcement regime in effect right now) — NOT an ordinary permission check, and the same rule for every target: RBAC off, the caller's own local account must hold the admin role; RBAC on, the caller must hold a user-principal Administrator grant. A JIT elevation, an IdP-group-derived session role, or a custom role holding UserManagement:Write is refused (403 durable_admin_required); a store that cannot confirm authority is 503 admin_gate_unavailable. Interactive cookie session only (API/MCP/engine/service-scoped tokens 403 token_session). Same-site Origin/Referer required (403 csrf) and Content-Type: application/json (415). Refuses your own account (403 self_target — use POST /users/me/password) and the configured break-glass account (403 break_glass_target), both before MFA step-up. SSO/SCIM accounts 409 not_local; absent/inactive 404. New password: 12..1024 BYTES (UTF-8). ONE TRANSACTION under the target's row lock: the credential, the deletion of every session of the target, the wipe of a provisional (un-enrolled) TOTP secret, the clearing of any lockout, and the user.password_reset audit row (plus auth.lockout.cleared, detail password_reset, when a lockout existed) commit or abort together; an audit failure makes no change (503 audit_unavailable + Sec-Audit-Failed). An ENROLLED second factor is not touched. API tokens are NOT revoked — the response reports api_tokens_active (null + api_tokens_unknown when the token store cannot be read). A 503 changed nothing unless the server lost contact with the database at commit; a successful sign-in with the new password confirms the change, which is audited either way. No MCP twin by design (ADR-1005 parity-ledger exception).", "parameters": [{"name": "username", "in": "path", "required": true, "schema": {"type": "string"}}], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["new_password"], "properties": {"new_password": {"type": "string", "minLength": 12, "maxLength": 1024, "description": "Length is measured in bytes (UTF-8)"}}}}}}, "responses": {"200": {"description": "Reset: {username, password_reset, sessions_revoked, lockout_cleared (true iff a lockout existed and was cleared), provisional_mfa_cleared, api_tokens_active (number, or null with api_tokens_unknown: true), remediation}"}, "400": {"description": "Malformed body or username, or new password outside 12..1024 bytes (not audited)"}, "401": {"description": "Unauthenticated, or MFA step-up required (stale/absent proof) — see meta.challenge_url"}, "403": {"description": "Not a durable Administrator (durable_admin_required); or token session, cross-origin request, self_target, or break_glass_target"}, "404": {"description": "No active account by that name (nothing changed)"}, "409": {"description": "Not a local account (SSO/SCIM) (nothing changed)"}, "415": {"description": "Content-Type is not application/json"}, "503": {"description": "store_unavailable, audit_unavailable (+ Sec-Audit-Failed), or admin_gate_unavailable; retry_after_ms set. Nothing changed unless the connection was lost at commit"}}}
     },
     "/users/{username}/elevation-eligibility": {
       "post": {"summary": "Grant or revoke a user's JIT-admin-elevation eligibility (SOC 2 CC6.3/CC6.6)", "tags": ["Users"], "description": "Admin (or an active elevation) + MFA step-up. Sets the per-user users.elevation_eligible flag. Self-grant is blocked. Setting eligible=false also terminates any in-flight elevation for that user. Errors use the A4 envelope (correlation_id + remediation).", "parameters": [{"name": "username", "in": "path", "required": true, "schema": {"type": "string"}}], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["eligible"], "properties": {"eligible": {"type": "boolean"}}}}}}, "responses": {"200": {"description": "{status: ok}"}, "400": {"description": "Invalid username or non-boolean body"}, "401": {"description": "Not authenticated, or MFA step-up required (stale/absent proof) — see meta.challenge_url"}, "403": {"description": "Not admin, or self-grant"}, "404": {"description": "User not found"}, "503": {"description": "Auth store not configured or unreachable — see --postgres-dsn"}}}
@@ -1906,11 +1907,11 @@ std::atomic<int>& live_poll_interval_ms() {
 // POST /api/v1/users/{name}/password  {new_password}                 (admin)
 //
 // Both are INTERACTIVE-COOKIE-ONLY credential mutations. The canonical
-// sequence (#5342 Gate 7 fix contract; each audited refusal is written under
-// `user.password_change` / `user.password_reset` with a fixed detail token —
-// NEVER the password, its length, or the request body — and EVERY row, before
-// and after the revoke, names the principal captured at step 1 through the
-// principal-explicit AuditPrincipalFn):
+// sequence (#5342 Gate 8 class fix — "one transaction"; each audited REFUSAL
+// is written under `user.password_change` / `user.password_reset` with a fixed
+// detail token — NEVER the password, its length, or the request body — naming
+// the principal captured at step 1 through the principal-explicit
+// AuditPrincipalFn):
 //
 //   1. auth_fn; capture the caller's principal + effective role ONCE.
 //   2. Class gates: any bearer credential (API, MCP or engine token, or a
@@ -1942,22 +1943,19 @@ std::atomic<int>& live_poll_interval_ms() {
 //      gate section POST /login runs): kLocked/kBadCredential → 403 (counted
 //      toward lockout); kStoreUnavailable/kTransient → 503 (never counted);
 //      kGateRejected → 403 `sso_only_local_disabled`.
-//  10. REVOKE FIRST: every session of the account — INCLUDING the caller's
-//      own on the self route — is revoked (durable, cross-replica) BEFORE the
-//      credential changes, so no old session outlives the old password. A
-//      revoke that did not persist durably → 503 `session_revoke_failed`
-//      and NOTHING is written.
-//  11. WRITE: self = CAS on the hash step 9 verified (no second PBKDF2);
-//      admin = plain guarded UPDATE (active + local). A refusal here states
-//      "sessions were revoked; password unchanged".
-//  12. AUDIT the success (detail carries sessions_revoked=N) FAIL-CLOSED:
-//      a lost row rolls the write back (CAS: only if nobody wrote since) →
-//      500 + Sec-Audit-Failed; a failed rollback is spdlog::critical +
-//      yuzu_auth_password_change_unrecorded_total{kind} and disclosed.
-//  13. (admin) Clear the target's lockout through the admin-unlock primitive
-//      (`lockout_clear_fn` + an `auth.lockout.cleared` row); a failure is
-//      reported (`lockout_cleared:false` + remediation), never fatal.
-//  14. 200. The self route does NOT re-mint a session: it answers with a
+//  10. PBKDF2 of the new password — no lock of any kind held.
+//  11. ONE TRANSACTION (`AuthManager::commit_password_change` →
+//      `CredentialChangeOwner`, credential_change_owner.hpp): under the
+//      `auth.users` row lock, classify (404 `not_found` / 409 `not_local` /
+//      409 `conflict` — the self route's verified anchor is no longer the
+//      stored hash), write the credential, wipe a provisional (un-enrolled)
+//      TOTP secret, clear the lockout (admin), DELETE every durable session of
+//      the account, and INSERT the success audit row(s) — all committing or
+//      aborting together. An audit INSERT failure aborts everything → 503
+//      `audit_unavailable` + Sec-Audit-Failed; any other store failure → 503
+//      `store_unavailable`. There is no rollback and no revoke-first: a
+//      refusal changed nothing, the caller's own session included.
+//  12. 200. The self route does NOT re-mint a session: it answers with a
 //      clearing Set-Cookie (`Max-Age=0`) and `session_reissued:false` — the
 //      user signs in again with the new password. The admin route does NOT
 //      revoke the target's API tokens; it reports how many are active.
@@ -1970,18 +1968,24 @@ struct PasswordRouteWiring {
     yuzu::MetricsRegistry* metrics{nullptr};
     RestApiV1::PasswordChangeDeps deps;
     std::vector<std::string> csrf_trusted_origins;
-    // Admin route only — the canonical durable-Administrator gate and the
-    // post-reset lock clear.
+    // Admin route only — the canonical durable-Administrator gate.
     const RbacStore* rbac_store{nullptr};
     AuthDB* auth_db{nullptr};
-    RestApiV1::LockoutClearFn lockout_clear_fn;
 };
 
-/// The clearing cookie the self route answers with once the caller's own
-/// session has been revoked (same attributes as POST /logout and
-/// DELETE /api/v1/sessions/me).
+/// The clearing cookie the self route answers with once its change committed
+/// (the caller's own session was deleted in that transaction; same attributes
+/// as POST /logout and DELETE /api/v1/sessions/me).
 constexpr const char* kClearSessionCookie =
     "yuzu_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0";
+
+/// The honest 503 wording (#5342 Gate 8): the transaction rolled back, so
+/// nothing changed — except in the one case no client can rule out, a
+/// connection lost AT commit, where the change and its audit row landed
+/// together.
+constexpr std::string_view k503Truth =
+    "; nothing was changed unless the server lost contact with the database at commit; a "
+    "successful sign-in with the new password confirms the change, which is audited either way";
 
 /// Media type of a Content-Type header value, lowercased, parameters dropped
 /// and whitespace trimmed (`"Application/JSON; charset=utf-8"` →
@@ -2010,8 +2014,8 @@ struct PasswordRouteCtx {
     const char* action; // "user.password_change" | "user.password_reset"
     const char* kind;   // metric label: "self" | "admin"
     std::string target; // audit target_id (the account whose password is at stake)
-    // Captured ONCE, from the live session, before anything can revoke it —
-    // every audit row (pre- and post-revoke) is stamped with these (C5).
+    // Captured ONCE, from the live session, at step 1 — every refusal row and
+    // the in-transaction success template are stamped with these.
     std::string principal;
     std::string principal_role;
 
@@ -2022,9 +2026,9 @@ struct PasswordRouteCtx {
                 .increment();
     }
 
-    /// Persist one audit row through the principal-explicit writer; false on a
-    /// silent persist failure, a throw (the HIGH-2 on PR #883 wrapper shape),
-    /// or an unwired writer.
+    /// Persist one REFUSAL audit row through the principal-explicit writer;
+    /// false on a silent persist failure, a throw (the HIGH-2 on PR #883
+    /// wrapper shape), or an unwired writer.
     bool audit(const std::string& action_name, const char* result,
                const std::string& detail) const {
         if (!w.deps.audit_principal_fn)
@@ -2053,7 +2057,7 @@ struct PasswordRouteCtx {
         opts.retry_after_ms = retry_after_ms;
         opts.remediation = remediation;
         res.set_content(detail::error_json_a4(status, message, cid, opts), "application/json");
-        if (!audit(action, result, detail_token))
+        if (!audit(action, result, detail_token) && !res.has_header("Sec-Audit-Failed"))
             res.set_header("Sec-Audit-Failed", "true");
         count(result);
     }
@@ -2079,7 +2083,8 @@ struct PasswordRouteCtx {
 /// not wired answers 503 before it evaluates anything.
 bool password_route_deps_ready(PasswordRouteCtx& ctx, bool self_route) {
     const auto& d = ctx.w.deps;
-    const bool ready = d.auth_mgr && d.audit_principal_fn && (!self_route || d.verify_current_fn);
+    const bool ready = d.auth_mgr && d.audit_principal_fn && d.audit_event_fn &&
+                       (!self_route || d.verify_current_fn);
     if (ready)
         return true;
     ctx.refuse(503, "error", "store_unavailable",
@@ -2153,105 +2158,70 @@ bool password_route_policy_ok(const PasswordRouteCtx& ctx, const std::string& ne
     return true;
 }
 
-/// Step 10: revoke every session of the account BEFORE the credential
-/// changes. Returns the revoke result when it persisted durably; on a durable
-/// failure writes 503 `session_revoke_failed` (audited, nothing written) and
-/// returns nullopt. `clear_caller_cookie` (self route) also drops the
-/// caller's own — now dead — cookie in the browser.
-std::optional<auth::AuthManager::RevokeResult>
-revoke_sessions_first(const PasswordRouteCtx& ctx, bool clear_caller_cookie) {
-    const auto revoke = ctx.w.deps.auth_mgr->invalidate_user_sessions(ctx.target);
-    if (clear_caller_cookie)
-        ctx.res.set_header("Set-Cookie", kClearSessionCookie);
-    if (revoke.db_persisted)
-        return revoke;
-    spdlog::error("{} for '{}': session revoke did not persist durably — refusing to change the "
-                  "password (another replica could keep honouring an old session)",
-                  ctx.action, ctx.target);
-    ctx.refuse(503, "error", "session_revoke_failed",
-               "existing sessions could not be durably revoked; the password was NOT changed",
-               "retry shortly; if it persists, check the Postgres session store", 2000);
-    return std::nullopt;
-}
+/// Steps 10 + 11: hash the new password (no lock held), then the one
+/// transaction. Returns the outcome; on anything but kOk it has already
+/// written the refusal (audited, counted). A refusal changed NOTHING — the
+/// caller's own session included — so it never clears the cookie.
+CredentialChangeOutcome commit_password(const PasswordRouteCtx& ctx,
+                                        CredentialChangeRequest::Kind kind,
+                                        const std::string& next,
+                                        std::optional<std::string> anchor) {
+    CredentialChangeRequest creq;
+    creq.kind = kind;
+    creq.username = ctx.target;
+    const auto salt = auth::AuthManager::random_bytes(16);
+    creq.new_salt_hex = auth::AuthManager::bytes_to_hex(salt);
+    creq.new_hash_hex =
+        auth::AuthManager::pbkdf2_sha256(next, salt, auth::AuthManager::kPbkdf2Iterations);
+    creq.expected_current_hash_hex = std::move(anchor);
+    try {
+        creq.audit_template =
+            ctx.w.deps.audit_event_fn(ctx.req, ctx.principal, ctx.principal_role, "User",
+                                      ctx.target);
+    } catch (const std::exception& e) {
+        spdlog::error("{}: audit_event_fn threw for '{}': {}", ctx.action, ctx.target, e.what());
+        ctx.res.set_header("Sec-Audit-Failed", "true");
+        ctx.refuse(503, "error", "audit_unavailable",
+                   std::string("the change could not be recorded, so it was not made").append(
+                       k503Truth),
+                   "retry shortly; if it persists, check the audit store", 2000);
+        return {};
+    }
 
-/// Map a non-kOk PasswordWriteOutcome reached AFTER the revoke (step 11) to
-/// its refusal. Every message states the post-revoke truth: the sessions are
-/// gone, the password is unchanged.
-void refuse_password_write(const PasswordRouteCtx& ctx, auth::PasswordWriteOutcome o) {
-    using O = auth::PasswordWriteOutcome;
-    constexpr std::string_view kAfterRevoke = "; sessions were revoked; password unchanged";
-    auto msg = [&](std::string_view head) { return std::string(head).append(kAfterRevoke); };
-    switch (o) {
-    case O::kOk:
-        return; // not a refusal
-    case O::kTooShort: // unreachable: policy was checked at step 8
-    case O::kTooLong:
-        ctx.reject_unaudited(400, msg("password does not meet the length policy"));
-        return;
-    case O::kNotFound:
-        ctx.refuse(404, "denied", "not_found", msg("no active account by that name"));
-        return;
-    case O::kNotLocal:
-        ctx.refuse(409, "denied", "not_local", msg("not a local account"),
+    const auto outcome = ctx.w.deps.auth_mgr->commit_password_change(creq);
+    using R = CredentialChangeResult;
+    switch (outcome.result) {
+    case R::kOk:
+        break;
+    case R::kNotFound:
+        ctx.refuse(404, "denied", "not_found", "no active account by that name");
+        break;
+    case R::kNotLocal:
+        ctx.refuse(409, "denied", "not_local", "not a local account",
                    "SSO and SCIM-managed accounts have no local password; manage it at the "
                    "identity provider");
-        return;
-    case O::kConflict:
-        ctx.refuse(409, "denied", "conflict", msg("the password was changed concurrently"),
+        break;
+    case R::kConflict:
+        ctx.refuse(409, "denied", "conflict", "the password was changed concurrently",
                    "sign in with the current password and retry");
-        return;
-    case O::kStoreUnavailable:
+        break;
+    case R::kStoreUnavailable:
         ctx.refuse(503, "error", "store_unavailable",
-                   msg("authentication store is temporarily unavailable"),
+                   std::string("authentication store is temporarily unavailable").append(k503Truth),
                    "retry shortly; if it persists, check the Postgres auth store", 2000);
-        return;
+        break;
+    case R::kAuditUnavailable:
+        // The evidence row could not be written, so the whole transaction
+        // rolled back. Signalled unconditionally — the refusal row below is a
+        // best-effort attempt against the same failing store.
+        ctx.res.set_header("Sec-Audit-Failed", "true");
+        ctx.refuse(503, "error", "audit_unavailable",
+                   std::string("the change could not be recorded, so it was not made")
+                       .append(k503Truth),
+                   "retry shortly; if it persists, check the audit store", 2000);
+        break;
     }
-    ctx.refuse(500, "error", "store_unavailable", msg("unexpected password-write outcome"));
-}
-
-/// Step 12: the mandatory success audit, fail-closed via CAS rollback. Returns
-/// true when the row persisted (the caller proceeds); false when it has
-/// already written the 500.
-bool audit_password_write_or_roll_back(const PasswordRouteCtx& ctx,
-                                       const auth::PasswordWriteResult& written,
-                                       const std::string& success_detail) {
-    if (ctx.audit(ctx.action, "ok", success_detail))
-        return true;
-    const bool rolled_back = ctx.w.deps.auth_mgr->rollback_password_write(ctx.target, written);
-    ctx.res.status = 500;
-    ctx.res.set_header("Sec-Audit-Failed", "true");
-    if (rolled_back) {
-        spdlog::error("{} audit FAILED for '{}' — password write rolled back", ctx.action,
-                      ctx.target);
-        // Best-effort evidence of the attempt (the audit store just failed; a
-        // transient fault may let this one through).
-        (void)ctx.audit(ctx.action, "error", "audit_failed_rolled_back");
-        ctx.res.set_content(
-            detail::error_json_a4(500,
-                                  "could not record the password change; it was rolled back — "
-                                  "sessions were revoked; password unchanged",
-                                  ctx.cid, "retry; if it persists, check the audit store"),
-            "application/json");
-    } else {
-        spdlog::critical("{} audit FAILED for '{}' AND the compensating rollback ALSO FAILED — "
-                         "the NEW password is in effect and UNRECORDED; manual review required",
-                         ctx.action, ctx.target);
-        if (ctx.w.metrics)
-            ctx.w.metrics
-                ->counter("yuzu_auth_password_change_unrecorded_total", {{"kind", ctx.kind}})
-                .increment();
-        (void)ctx.audit(ctx.action, "error", "audit_failed_rollback_failed");
-        ctx.res.set_content(
-            detail::error_json_a4(500,
-                                  "the password change could neither be recorded nor rolled back; "
-                                  "the NEW password is now in effect, unrecorded; sessions were "
-                                  "revoked",
-                                  ctx.cid,
-                                  "an administrator must review the audit and auth stores"),
-            "application/json");
-    }
-    ctx.count("error");
-    return false;
+    return outcome;
 }
 
 /// Step 4 (admin): the canonical durable-Administrator gate, the A2/A1 handler
@@ -2377,41 +2347,34 @@ void register_password_routes(HttpRouteSink& sink, PasswordRouteWiring wiring) {
         }
         if (check.verified_hash_hex.empty()) {
             // Defensive: kVerified always carries the anchor. Never write
-            // without it (the CAS would have nothing to bind to).
+            // without it (the compare under the row lock would have nothing
+            // to bind to).
             ctx.refuse(500, "error", "store_unavailable", "password check returned no anchor");
             return;
         }
 
-        // Step 10 — revoke every session of this account, the caller's own
-        // included, BEFORE the credential changes.
-        const auto revoke = revoke_sessions_first(ctx, /*clear_caller_cookie=*/true);
-        if (!revoke)
+        // Steps 10 + 11 — hash, then the one transaction, anchored on the
+        // hash step 9 verified (compared under the row lock; no 2nd PBKDF2).
+        const auto outcome = commit_password(ctx, CredentialChangeRequest::Kind::kSelf, next,
+                                             check.verified_hash_hex);
+        if (outcome.result != CredentialChangeResult::kOk)
             return;
 
-        // Step 11 — the write: CAS on the hash step 9 verified (no 2nd PBKDF2).
-        const auto written =
-            deps.auth_mgr->change_password(session->username, check.verified_hash_hex, next);
-        if (written.outcome != auth::PasswordWriteOutcome::kOk) {
-            refuse_password_write(ctx, written.outcome);
-            return;
-        }
-        // Step 12 — the mandatory success audit (fail-closed).
-        if (!audit_password_write_or_roll_back(
-                ctx, written, "self_service sessions_revoked=" + std::to_string(revoke->count)))
-            return;
-
-        // Step 14 — no re-mint: the caller signs in again with the new
-        // password (the clearing Set-Cookie was set at step 10).
+        // Step 12 — no re-mint: the caller's own session was deleted in the
+        // transaction; clear the cookie and let the user sign in again.
+        res.set_header("Set-Cookie", kClearSessionCookie);
         ctx.count("ok");
         res.status = 200;
-        res.set_content(ok_json(JObj()
-                                    .add("username", session->username)
-                                    .add("password_changed", true)
-                                    .add("sessions_revoked", static_cast<int64_t>(revoke->count))
-                                    .add("session_reissued", false)
-                                    .add("audit_emitted", true)
-                                    .str()),
-                        "application/json");
+        res.set_content(
+            ok_json(JObj()
+                        .add("username", session->username)
+                        .add("password_changed", true)
+                        .add("sessions_revoked", static_cast<int64_t>(outcome.sessions_revoked))
+                        .add("session_reissued", false)
+                        .add("provisional_mfa_cleared", outcome.provisional_mfa_cleared)
+                        .add("audit_emitted", true)
+                        .str()),
+            "application/json");
     });
 
     sink.Post(R"(/api/v1/users/([^/]+)/password)", [w](const httplib::Request& req,
@@ -2434,7 +2397,7 @@ void register_password_routes(HttpRouteSink& sink, PasswordRouteWiring wiring) {
         // sec-H1: validate BEFORE the target reaches an audit row — a NUL or
         // control byte must never diverge the audit target_id from the SQL
         // bind. A principal-shaped (SSO) name passes here and is answered 409
-        // not_local by the write's own classification.
+        // not_local by the owner's own classification.
         if (target.empty() || !is_valid_principal(target)) {
             ctx.reject_unaudited(400, "invalid username format",
                                  "username must match the allowed format");
@@ -2477,40 +2440,12 @@ void register_password_routes(HttpRouteSink& sink, PasswordRouteWiring wiring) {
         if (!password_route_policy_ok(ctx, next))
             return;
 
-        // Step 10 — revoke every cookie session of the target first.
-        const auto revoke = revoke_sessions_first(ctx, /*clear_caller_cookie=*/false);
-        if (!revoke)
+        // Steps 10 + 11 — hash, then the one transaction (credential +
+        // sessions + provisional MFA + lockout + audit rows).
+        const auto outcome =
+            commit_password(ctx, CredentialChangeRequest::Kind::kAdminReset, next, std::nullopt);
+        if (outcome.result != CredentialChangeResult::kOk)
             return;
-        // Step 11 — a plain guarded write (no CAS, no target classification).
-        const auto written = deps.auth_mgr->reset_password(target, next);
-        if (written.outcome != auth::PasswordWriteOutcome::kOk) {
-            refuse_password_write(ctx, written.outcome);
-            return;
-        }
-        // Step 12 — the mandatory success audit (fail-closed).
-        if (!audit_password_write_or_roll_back(
-                ctx, written,
-                std::string("admin_reset target_role=") + auth::role_to_string(written.role) +
-                    " sessions_revoked=" + std::to_string(revoke->count)))
-            return;
-
-        // Step 13 — clear the target's lockout through the admin-unlock
-        // primitive, audited like the unlock route (its try_audit shape). The
-        // reset itself is already committed and recorded, so a failure here is
-        // reported, never fatal.
-        bool lockout_cleared = false;
-        if (w->lockout_clear_fn) {
-            try {
-                lockout_cleared = w->lockout_clear_fn(target);
-            } catch (const std::exception& e) {
-                spdlog::error("lockout_clear_fn threw for '{}': {}", target, e.what());
-            } catch (...) {
-                spdlog::error("lockout_clear_fn threw unknown for '{}'", target);
-            }
-        }
-        if (!ctx.audit("auth.lockout.cleared", lockout_cleared ? "ok" : "error",
-                       "password_reset"))
-            res.set_header("Sec-Audit-Failed", "true");
 
         // API tokens are deliberately left alone (automation may depend on
         // them, and a reset is not by itself a compromise finding) — the
@@ -2523,8 +2458,11 @@ void register_password_routes(HttpRouteSink& sink, PasswordRouteWiring wiring) {
         JObj out;
         out.add("username", target)
             .add("password_reset", true)
-            .add("sessions_revoked", static_cast<int64_t>(revoke->count))
-            .add("lockout_cleared", lockout_cleared);
+            .add("sessions_revoked", static_cast<int64_t>(outcome.sessions_revoked))
+            // true ⇔ a lockout (failed-attempt count or lock) existed and was
+            // cleared in the same transaction (audited as auth.lockout.cleared).
+            .add("lockout_cleared", outcome.lockout_cleared)
+            .add("provisional_mfa_cleared", outcome.provisional_mfa_cleared);
         std::string remediation;
         if (tokens_active) {
             out.add("api_tokens_active", static_cast<int64_t>(*tokens_active));
@@ -2537,9 +2475,6 @@ void register_password_routes(HttpRouteSink& sink, PasswordRouteWiring wiring) {
             remediation = "could not confirm whether the account holds active API tokens; any it "
                           "holds were NOT revoked — review them if it may be compromised";
         }
-        if (!lockout_cleared)
-            remediation += "; the account's lockout could not be cleared — retry with POST "
-                           "/api/v1/users/{name}/unlock";
         out.add("remediation", remediation);
         ctx.count("ok");
         res.status = 200;
@@ -5945,8 +5880,7 @@ void RestApiV1::register_routes(
     // register_password_routes' header comment for the full gate order.
     register_password_routes(
         sink, PasswordRouteWiring{auth_fn, step_up_fn, token_store, metrics_registry,
-                                  password_deps_, csrf_trusted_origins_, rbac_store, auth_db,
-                                  lockout_clear_fn});
+                                  password_deps_, csrf_trusted_origins_, rbac_store, auth_db});
 
     // ── Quarantine (/api/v1/quarantine) ──────────────────────────────────
 

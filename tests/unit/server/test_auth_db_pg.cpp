@@ -328,153 +328,10 @@ TEST_CASE("AuthDB user CRUD + role", "[pg][auth_db]") {
     }
 }
 
-// ── set_password (#5342) ───────────────────────────────────────────────────
-//
-// The ONLY writer of password_hash on an existing row. The guarded UPDATE's
-// WHERE clause is the local-account gate (active + identity_source='local' +
-// provisioning_source='local'); every refusal is a zero-row UserNotFound with
-// the stored credential left untouched.
-
-TEST_CASE("AuthDB::set_password writes hash/salt only and never touches the lockout",
-          "[pg][auth_db][password]") {
-    // #5342 Gate 7 (C7): clearing a lock is an AUDITED administrative act
-    // (clear_failed_logins behind the admin unlock/reset route's own
-    // auth.lockout.cleared row) — the credential write must not do it
-    // silently, or an audit-failure rollback would restore the hash but leave
-    // a previously-armed lock erased.
-    YUZU_REQUIRE_PG_DB_TPL(db, auth_db_tpl);
-    Harness h{db.dsn()};
-    REQUIRE(h.db.upsert_user("pat", "oldhash", "oldsalt", yuzu::server::auth::Role::admin)
-                .has_value());
-    for (int i = 0; i < 3; ++i)
-        REQUIRE(h.db.record_failed_login("pat", /*threshold=*/3, /*window_secs=*/3600).has_value());
-    const auto armed = h.db.lockout_status("pat");
-    REQUIRE(armed.has_value());
-    REQUIRE(armed->locked);
-
-    // Plain (no CAS) write to an ADMIN row: written — there is no role
-    // predicate (who may reset whom is the route's is_rbac_administrator gate).
-    REQUIRE(h.db.set_password("pat", "newhash", "newsalt").has_value());
-
-    auto entry = h.db.get_user("pat");
-    REQUIRE(entry.has_value());
-    CHECK(entry->hash_hex == "newhash");
-    CHECK(entry->salt_hex == "newsalt");
-    CHECK(entry->role == yuzu::server::auth::Role::admin); // role untouched
-    auto st = h.db.lockout_status("pat");
-    REQUIRE(st.has_value());
-    CHECK(st->locked);                              // lock untouched
-    CHECK(st->failed_count == armed->failed_count); // counter untouched
-
-    // The CAS variant behaves the same way on the lockout columns.
-    REQUIRE(h.db.set_password("pat", "h3", "s3", std::string("newhash")).has_value());
-    st = h.db.lockout_status("pat");
-    REQUIRE(st.has_value());
-    CHECK(st->locked);
-    CHECK(st->failed_count == armed->failed_count);
-}
-
-TEST_CASE("AuthDB::set_password refuses non-local, inactive and absent accounts",
-          "[pg][auth_db][password]") {
-    YUZU_REQUIRE_PG_DB_TPL(db, auth_db_tpl);
-    Harness h{db.dsn()};
-
-    auto expect_untouched = [&](const std::string& user, const std::string& hash) {
-        auto entry = h.db.get_user(user);
-        REQUIRE(entry.has_value());
-        CHECK(entry->hash_hex == hash);
-    };
-
-    SECTION("SCIM-provisioned row (provisioning_source='scim')") {
-        REQUIRE(h.db.upsert_user("scimmed", "h0", "s0", yuzu::server::auth::Role::user).has_value());
-        REQUIRE(h.db.set_provisioning_source("scimmed", "scim").has_value());
-        auto r = h.db.set_password("scimmed", "h1", "s1");
-        REQUIRE_FALSE(r.has_value());
-        CHECK(r.error() == AuthDBError::UserNotFound);
-        expect_untouched("scimmed", "h0");
-    }
-    SECTION("identity_source not local, provisioning_source still local") {
-        REQUIRE(h.db.upsert_user("ssoish", "h0", "s0", yuzu::server::auth::Role::user).has_value());
-        REQUIRE(h.db.set_identity_source("ssoish", "scim").has_value());
-        auto r = h.db.set_password("ssoish", "h1", "s1");
-        REQUIRE_FALSE(r.has_value());
-        CHECK(r.error() == AuthDBError::UserNotFound);
-        expect_untouched("ssoish", "h0");
-    }
-    SECTION("SSO principal (fails is_valid_username before any query)") {
-        const std::string principal = "oidc:https://idp.example#sub-9";
-        REQUIRE(h.db.upsert_sso_identity(principal, "https://idp.example", "sub-9", "Sam", "oidc")
-                    .has_value());
-        auto r = h.db.set_password(principal, "h1", "s1");
-        REQUIRE_FALSE(r.has_value());
-        CHECK(r.error() == AuthDBError::InvalidUsername);
-    }
-    SECTION("inactive (soft-deleted) row") {
-        REQUIRE(h.db.upsert_user("gone", "h0", "s0", yuzu::server::auth::Role::user).has_value());
-        REQUIRE(h.db.remove_user("gone").has_value());
-        auto r = h.db.set_password("gone", "h1", "s1");
-        REQUIRE_FALSE(r.has_value());
-        CHECK(r.error() == AuthDBError::UserNotFound);
-        // Reactivate to prove the stored credential was not rewritten.
-        REQUIRE(h.db.reactivate_user("gone").has_value());
-        expect_untouched("gone", "h0");
-    }
-    SECTION("absent row") {
-        auto r = h.db.set_password("nobody", "h1", "s1");
-        REQUIRE_FALSE(r.has_value());
-        CHECK(r.error() == AuthDBError::UserNotFound);
-    }
-    SECTION("empty hash / salt / CAS anchor is InvalidCredentials") {
-        REQUIRE(h.db.upsert_user("emp", "h0", "s0", yuzu::server::auth::Role::user).has_value());
-        CHECK(h.db.set_password("emp", "", "s1").error() == AuthDBError::InvalidCredentials);
-        CHECK(h.db.set_password("emp", "h1", "").error() == AuthDBError::InvalidCredentials);
-        CHECK(h.db.set_password("emp", "h1", "s1", std::string{}).error() ==
-              AuthDBError::InvalidCredentials);
-        expect_untouched("emp", "h0");
-    }
-}
-
-TEST_CASE("AuthDB::set_password compare-and-swap on the expected current hash",
-          "[pg][auth_db][password]") {
-    YUZU_REQUIRE_PG_DB_TPL(db, auth_db_tpl);
-    Harness h{db.dsn()};
-    REQUIRE(h.db.upsert_user("cas", "h0", "s0", yuzu::server::auth::Role::user).has_value());
-
-    // A stale anchor is refused and leaves the row alone.
-    auto stale = h.db.set_password("cas", "h1", "s1", std::string("not-the-hash"));
-    REQUIRE_FALSE(stale.has_value());
-    CHECK(stale.error() == AuthDBError::UserNotFound);
-    CHECK(h.db.get_user("cas")->hash_hex == "h0");
-
-    // The right anchor lands.
-    REQUIRE(h.db.set_password("cas", "h1", "s1", std::string("h0")).has_value());
-    CHECK(h.db.get_user("cas")->hash_hex == "h1");
-
-    // The rollback shape: restore only if the stored hash is still ours.
-    REQUIRE(h.db.set_password("cas", "h2", "s2", std::string("h1")).has_value());
-    auto rollback_lost = h.db.set_password("cas", "h0", "s0", std::string("h1"));
-    REQUIRE_FALSE(rollback_lost.has_value()); // someone (h2) wrote since — never clobbered
-    CHECK(h.db.get_user("cas")->hash_hex == "h2");
-}
-
-TEST_CASE("AuthDB::set_password: plain and CAS variants both write an admin local row",
-          "[pg][auth_db][password]") {
-    // #5342 Gate 7 (A2): the forbid_admin_target role guard is gone — the
-    // write has NO target-role classification, in either variant.
-    YUZU_REQUIRE_PG_DB_TPL(db, auth_db_tpl);
-    Harness h{db.dsn()};
-    REQUIRE(h.db.upsert_user("boss", "h0", "s0", yuzu::server::auth::Role::admin).has_value());
-
-    REQUIRE(h.db.set_password("boss", "h1", "s1").has_value()); // plain
-    CHECK(h.db.get_user("boss")->hash_hex == "h1");
-    REQUIRE(h.db.set_password("boss", "h2", "s2", std::string("h1")).has_value()); // CAS
-    CHECK(h.db.get_user("boss")->hash_hex == "h2");
-    auto stale = h.db.set_password("boss", "h3", "s3", std::string("h1")); // stale CAS
-    REQUIRE_FALSE(stale.has_value());
-    CHECK(stale.error() == AuthDBError::UserNotFound);
-    CHECK(h.db.get_user("boss")->hash_hex == "h2");
-    CHECK(h.db.get_user("boss")->role == yuzu::server::auth::Role::admin);
-}
+// AuthDB has NO credential-write method (#5342 Gate 8): an existing row's
+// password_hash is written only by CredentialChangeOwner, in one transaction
+// with the account's sessions, provisional MFA, lockout and audit row(s) —
+// covered in test_auth_password.cpp / test_rest_password_routes.cpp.
 
 TEST_CASE("AuthDB::recheck_role_locked hands the current password_hash to the callback (#5274)",
           "[pg][auth_db][password]") {
@@ -489,11 +346,61 @@ TEST_CASE("AuthDB::recheck_role_locked hands the current password_hash to the ca
                 }).has_value());
     CHECK(seen_role == yuzu::server::auth::Role::admin);
     CHECK(seen_hash == "h0");
-    REQUIRE(h.db.set_password("rr", "h1", "s1").has_value());
+    // A committed credential change (a plain UPDATE stands in for the owner's).
+    PgResult upd{PQexec(h.conn.get(),
+                        "UPDATE auth.users SET password_hash = 'h1', salt_hex = 's1' "
+                        "WHERE username = 'rr'")};
+    REQUIRE(upd.ok());
     REQUIRE(h.db.recheck_role_locked("rr", [&](yuzu::server::auth::Role, const std::string& hh) {
                     seen_hash = hh;
                 }).has_value());
     CHECK(seen_hash == "h1");
+}
+
+// #5342 Gate 8 (F2): an enrolment bound to the credential the caller proved.
+TEST_CASE("AuthDB::mfa_verify_enrollment binds to the proven credential (CredentialChanged)",
+          "[pg][auth_db][password][mfa]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, auth_db_tpl);
+    Harness h{db.dsn()};
+    REQUIRE(h.db.upsert_user("bind", "h0", "s0", yuzu::server::auth::Role::user).has_value());
+    auto init = h.db.mfa_init_enrollment("bind", "Yuzu");
+    REQUIRE(init.has_value());
+    auto raw = yuzu::server::mfa::base32_decode(init->secret_base32);
+    REQUIRE(raw.has_value());
+    const auto code = yuzu::server::mfa::generate(
+        std::string_view(reinterpret_cast<const char*>(raw->data()), raw->size()),
+        yuzu::server::mfa::current_counter(std::chrono::system_clock::now()));
+
+    // The stored hash is no longer the one the caller proved → refused, not
+    // enrolled, and graded as a business outcome (never a store fault).
+    auto stale = h.db.mfa_verify_enrollment("bind", code, std::string("not-h0"));
+    REQUIRE_FALSE(stale.has_value());
+    CHECK(stale.error() == AuthDBError::CredentialChanged);
+    CHECK_FALSE(yuzu::server::is_store_unavailable(AuthDBError::CredentialChanged));
+    CHECK_FALSE(h.db.mfa_status("bind")->enrolled);
+
+    // The proven credential still stored → enrols.
+    auto ok = h.db.mfa_verify_enrollment("bind", code, std::string("h0"));
+    REQUIRE(ok.has_value());
+    CHECK(ok->size() == 10);
+    CHECK(h.db.mfa_status("bind")->enrolled);
+}
+
+TEST_CASE("AuthDB::mfa_verify_enrollment with no expected hash ignores the credential (Settings)",
+          "[pg][auth_db][password][mfa]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, auth_db_tpl);
+    Harness h{db.dsn()};
+    REQUIRE(h.db.upsert_user("sett", "h0", "s0", yuzu::server::auth::Role::user).has_value());
+    auto init = h.db.mfa_init_enrollment("sett", "Yuzu");
+    REQUIRE(init.has_value());
+    auto raw = yuzu::server::mfa::base32_decode(init->secret_base32);
+    REQUIRE(raw.has_value());
+    const auto code = yuzu::server::mfa::generate(
+        std::string_view(reinterpret_cast<const char*>(raw->data()), raw->size()),
+        yuzu::server::mfa::current_counter(std::chrono::system_clock::now()));
+    auto ok = h.db.mfa_verify_enrollment("sett", code, std::nullopt);
+    REQUIRE(ok.has_value());
+    CHECK(h.db.mfa_status("sett")->enrolled);
 }
 
 // ── fresh-start admin seeding ─────────────────────────────────────────────
@@ -1514,7 +1421,7 @@ TEST_CASE("AuthDB MFA enroll -> verify round trip is envelope-encrypted end to e
     auto counter = yuzu::server::mfa::current_counter(now);
     auto code = yuzu::server::mfa::generate(secret_view, counter);
 
-    auto verify = h.db.mfa_verify_enrollment("mfauser", code);
+    auto verify = h.db.mfa_verify_enrollment("mfauser", code, std::nullopt);
     REQUIRE(verify.has_value());
     CHECK(verify->size() == 10);
 
@@ -1582,7 +1489,7 @@ TEST_CASE("AuthDB MFA: concurrent enrollment verify enrolls exactly once, no orp
         while (!go.load(std::memory_order_acquire)) {
             std::this_thread::yield();
         }
-        auto r = h.db.mfa_verify_enrollment("enrollrace", code);
+        auto r = h.db.mfa_verify_enrollment("enrollrace", code, std::nullopt);
         if (r.has_value()) {
             *slot = *r;
             ok.fetch_add(1, std::memory_order_relaxed);
@@ -1709,7 +1616,7 @@ TEST_CASE("AuthDB MFA: disable then re-enroll succeeds — the guard does not we
         auto sv = std::string_view(reinterpret_cast<const char*>(raw->data()), raw->size());
         auto code = yuzu::server::mfa::generate(
             sv, yuzu::server::mfa::current_counter(std::chrono::system_clock::now()));
-        auto verify = h.db.mfa_verify_enrollment("reenroll", code);
+        auto verify = h.db.mfa_verify_enrollment("reenroll", code, std::nullopt);
         REQUIRE(verify.has_value());
         CHECK(verify->size() == 10);
     };
@@ -1754,7 +1661,7 @@ TEST_CASE("AuthDB MFA: concurrent submission of one valid code succeeds exactly 
     auto counter = yuzu::server::mfa::current_counter(std::chrono::system_clock::now());
     // Complete enrollment at `counter`; the login code is the NEXT step so the
     // enrollment counter's own replay protection does not reject it.
-    REQUIRE(h.db.mfa_verify_enrollment("racer", yuzu::server::mfa::generate(secret_view, counter))
+    REQUIRE(h.db.mfa_verify_enrollment("racer", yuzu::server::mfa::generate(secret_view, counter), std::nullopt)
                 .has_value());
     auto login_code = yuzu::server::mfa::generate(secret_view, counter + 1);
 
@@ -1857,7 +1764,7 @@ TEST_CASE("AuthDB MFA fail-closed: corrupted ENROLLED secret -> SecretUnavailabl
         std::string_view(reinterpret_cast<const char*>(raw_secret->data()), raw_secret->size());
     auto counter = yuzu::server::mfa::current_counter(std::chrono::system_clock::now());
     auto code = yuzu::server::mfa::generate(secret_view, counter);
-    REQUIRE(h.db.mfa_verify_enrollment("corrupt1", code).has_value());
+    REQUIRE(h.db.mfa_verify_enrollment("corrupt1", code, std::nullopt).has_value());
 
     corrupt_secret(h.conn.get(), "corrupt1");
 
@@ -1895,7 +1802,7 @@ TEST_CASE("AuthDB MFA fail-closed: ENROLLED but NULL secret is SecretUnavailable
     auto secret_view =
         std::string_view(reinterpret_cast<const char*>(raw_secret->data()), raw_secret->size());
     auto counter = yuzu::server::mfa::current_counter(std::chrono::system_clock::now());
-    REQUIRE(h.db.mfa_verify_enrollment("nullsec1", yuzu::server::mfa::generate(secret_view, counter))
+    REQUIRE(h.db.mfa_verify_enrollment("nullsec1", yuzu::server::mfa::generate(secret_view, counter), std::nullopt)
                 .has_value());
 
     null_secret_keep_enrolled(h.conn.get(), "nullsec1");
@@ -1968,7 +1875,7 @@ TEST_CASE("AuthDB MFA fail-closed: a FAILED secret read surfaces as a store outa
 
     // A 404-shaped UserNotFound would tell the caller "enroll first" and burn
     // the in-progress enrollment; the caller needs a 503-shaped retry.
-    auto verify = h.db.mfa_verify_enrollment("qfail2", "123456");
+    auto verify = h.db.mfa_verify_enrollment("qfail2", "123456", std::nullopt);
     REQUIRE_FALSE(verify.has_value());
     CHECK(verify.error() == AuthDBError::QueryFailed);
     CHECK(yuzu::server::is_store_unavailable(verify.error()));
@@ -2120,7 +2027,7 @@ TEST_CASE("AuthDB MFA fail-closed: mfa_verify_enrollment refuses a corrupted pro
     REQUIRE(init.has_value());
     corrupt_secret(h.conn.get(), "corrupt3");
 
-    auto verify = h.db.mfa_verify_enrollment("corrupt3", "123456");
+    auto verify = h.db.mfa_verify_enrollment("corrupt3", "123456", std::nullopt);
     REQUIRE_FALSE(verify.has_value());
     CHECK(verify.error() == AuthDBError::SecretUnavailable);
 

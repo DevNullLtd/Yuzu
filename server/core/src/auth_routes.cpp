@@ -1438,15 +1438,11 @@ bool AuthRoutes::audit_log(const httplib::Request& req, const std::string& actio
     return ok;
 }
 
-bool AuthRoutes::audit_log_for_principal(const httplib::Request& req, const std::string& action,
-                                         const std::string& result, const std::string& principal,
-                                         const std::string& principal_role,
-                                         const std::string& target_type,
-                                         const std::string& target_id,
-                                         const std::string& detail,
-                                         const std::string& principal_class_override) {
-    if (!audit_store_)
-        return true;
+AuditEvent AuthRoutes::make_audit_event_for_principal(
+    const httplib::Request& req, const std::string& action, const std::string& result,
+    const std::string& principal, const std::string& principal_role,
+    const std::string& target_type, const std::string& target_id, const std::string& detail,
+    const std::string& principal_class_override) const {
     AuditEvent event;
     event.action = action;
     event.result = result;
@@ -1466,6 +1462,21 @@ bool AuthRoutes::audit_log_for_principal(const httplib::Request& req, const std:
     // Stamped like make_audit_event so a row written by this path carries the same
     // session correlator. Empty at the pre-session login sites, which is correct there.
     event.session_id = extract_session_cookie(req);
+    return event;
+}
+
+bool AuthRoutes::audit_log_for_principal(const httplib::Request& req, const std::string& action,
+                                         const std::string& result, const std::string& principal,
+                                         const std::string& principal_role,
+                                         const std::string& target_type,
+                                         const std::string& target_id,
+                                         const std::string& detail,
+                                         const std::string& principal_class_override) {
+    if (!audit_store_)
+        return true;
+    const auto event =
+        make_audit_event_for_principal(req, action, result, principal, principal_role, target_type,
+                                       target_id, detail, principal_class_override);
     auto ok = audit_store_->log(event);
     if (!ok) {
         spdlog::warn("audit_log_for_principal: AuditStore::log failed for action='{}' "
@@ -2770,11 +2781,19 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         bool verified = false;
         bool store_unavailable = false;
         bool already_enrolled = false;
+        bool credential_changed = false;
         if (is_totp) {
-            auto r = db->mfa_verify_enrollment(entry.username, code);
+            // #5342 Gate 8 (F2): bind the enrolment to the credential this
+            // pending login PROVED (the B4 hash carry) — a password change or
+            // reset committed since makes the guarded UPDATE match nothing
+            // (CredentialChanged), so an enrolment begun under a retired
+            // password can never complete.
+            auto r = db->mfa_verify_enrollment(entry.username, code, entry.hash_hex);
             if (r) {
                 recovery_codes = std::move(*r);
                 verified = true;
+            } else if (r.error() == AuthDBError::CredentialChanged) {
+                credential_changed = true;
             } else if (r.error() == AuthDBError::MfaAlreadyEnrolled) {
                 // The account is already enrolled — a concurrent verify won the
                 // race (or it was enrolled before this pending token committed).
@@ -2792,6 +2811,26 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                 // instead of burning an attempt on a transient outage.
                 store_unavailable = true;
             }
+        }
+
+        if (credential_changed) {
+            // #5342 Gate 8 (F2): the account's password changed after the login
+            // that issued this token. Uniform 401 (no oracle for the attacker
+            // who may hold an old-password token); the truth is in the audit
+            // detail. The token was move-erased on take-ownership above and is
+            // deliberately NOT re-inserted — it is spent. Nothing was enrolled
+            // and no session is minted.
+            res.status = 401;
+            res.set_content(kFailureBody(res), "application/json");
+            audit_log_for_principal(req, "mfa.enroll.failed", "error", entry.username,
+                                    auth::role_to_string(entry.role), "User", entry.username,
+                                    "credential_changed");
+            emit_event("mfa.enroll.failed", req,
+                       {{"source_ip", req.remote_addr},
+                        {"username", entry.username},
+                        {"reason", "credential_changed"}},
+                       {}, Severity::kWarn);
+            return;
         }
 
         if (already_enrolled) {

@@ -656,6 +656,19 @@ public:
                                  const std::string& detail = {},
                                  const std::string& principal_class_override = {});
 
+    /// The `AuditEvent` `audit_log_for_principal` would write, built WITHOUT
+    /// writing it (#5342 Gate 8): the identity/request fields (principal,
+    /// role, class, source IP, user agent, session correlator, target) for a
+    /// caller that persists the row INSIDE its own transaction via
+    /// `AuditStore::log_in_txn` — the credential-change owner. ONE builder for
+    /// both, so an in-transaction row and an ordinary row for the same actor
+    /// can never disagree. Works in audit-off mode too (no store needed).
+    [[nodiscard]] AuditEvent make_audit_event_for_principal(
+        const httplib::Request& req, const std::string& action, const std::string& result,
+        const std::string& principal, const std::string& principal_role,
+        const std::string& target_type = {}, const std::string& target_id = {},
+        const std::string& detail = {}, const std::string& principal_class_override = {}) const;
+
     /// guardian-confinement-2298 PR3 §3e — server.cpp's shared deny gate for
     /// routes that reach agent/fleet/execution data via `require_auth`
     /// alone, with no `require_permission`/`require_scoped_permission` call

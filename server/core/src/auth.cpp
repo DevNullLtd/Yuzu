@@ -6,6 +6,7 @@
 #include "saml_principal.hpp" // saml_principal_id — ADR-2001 PR4a single principal-string builder
 #include "password_policy.hpp" // #5342 — the ONE local password length policy
 #include "session_store.hpp"  // HA WS-1/1a — durable operator sessions (ADR-2002 §4)
+#include "credential_change_owner.hpp" // #5342 — the one-transaction credential change
 
 #include <spdlog/spdlog.h>
 
@@ -758,7 +759,7 @@ AuthManager::find_user_or_hydrate(const std::string& username) {
     std::unique_lock lock(mu_);
     // #4020 warm-up for the cache's OTHER readers. try_emplace, never
     // insert_or_assign: a write path (upsert_user / reactivate_user /
-    // change_password / reset_password) that landed while the read above was in
+    // commit_password_change) that landed while the read above was in
     // flight has already installed a NEWER entry than the row we hold, and the
     // write paths own cache refresh. Nothing here consults the cached
     // credential any more (#5274), so leaving an existing entry alone is safe.
@@ -888,49 +889,52 @@ bool AuthManager::post_mint_role_recheck(const std::string& username, Role minte
     // #4107 check-then-mint gap (external adversarial review, fjarvis, PR
     // #4076): recheck_role_after_credential_check's row-locked read closes
     // the SAME-process/cross-replica divergence race for the read itself,
-    // but a demotion committing strictly AFTER that read and before this
-    // session's mint completes still lands a session stamped with the
-    // pre-demote role - and that demote's own sweep (update_role's
-    // std::erase_if) already ran before this session existed, so it can't
-    // catch it either.
+    // but a demotion (or, #5342, a credential change) committing strictly
+    // AFTER that read and before this session's mint completes would still
+    // land a session stamped with the pre-change role/credential.
     //
     // Closed here via the SAME pattern this codebase already uses for the
     // structurally identical OIDC/SAML deprovision-race (docs/
     // auth-architecture.md, "post-mint re-check"): mint normally, then
     // immediately re-verify against the authority and revoke-and-deny if it
-    // diverged, rather than serializing the mint inside the row lock.
-    // Serializing was considered and explicitly rejected for that race
-    // class - it would require holding AuthDB's row lock across a
-    // SessionStore call, violating this codebase's "never hold one store's
-    // pool lease while calling another" discipline (docs/
-    // auth-architecture.md §3) - SessionStore's shared write-generation row
-    // is exactly the kind of cross-store lock that could deadlock against
-    // AuthDB's row lock under the wrong interleaving.
+    // diverged, rather than serializing the mint inside the row lock (that
+    // would hold AuthDB's row lock across a SessionStore write — the shared
+    // `session_meta` write-generation row — which is the cross-store lock
+    // nesting docs/auth-architecture.md §3 rejects for this race class).
     //
-    // Ordering proof (why this closes the race rather than merely
-    // narrowing it, for the SAME-PROCESS case): a racing update_role()
-    // commits its AuthDB UPDATE BEFORE taking mu_ to sweep sessions_ (see
-    // update_role's own body). persist_new_session's mint-write and
-    // update_role's sweep both take mu_, so one strictly happens-before
-    // the other. If the mint happens-before the sweep, the sweep (running
-    // after) finds and erases this just-minted session - self-healed. If
-    // the sweep happens-before the mint, the sweep's own UPDATE already
-    // committed before the sweep ran, which is before the mint, which is
-    // before this call - so this call's fresh AuthDB read is guaranteed to
-    // observe it. Cross-replica: this needs no mu_ analogue at all (authdb
-    // Gate 8 correction to an earlier draft of this comment, which wrongly
-    // reached for one) - mu_ is per-process and has no cross-replica
-    // meaning. The actual argument is simpler and stronger: this call's
-    // own SELECT (get_user(), a bare autocommit read, no held transaction)
-    // runs strictly AFTER persist_new_session returns, and ordinary READ
-    // COMMITTED visibility on a single-primary Postgres instance guarantees
-    // it observes any commit that landed before it, regardless of which
-    // connection or replica issued either statement - no replica-local
-    // state or clock needs to agree with any other's. This reasoning
-    // assumes single-primary Postgres; it would need re-deriving under
-    // read-replica routing, the same caveat ADR-2001's own analogous
-    // cross-replica guarantee (docs/adr/2001-scim-oidc-identity-linkage.md,
-    // "Known residuals") flags for its own case.
+    // Ordering proof — LOCK-based (#5342 Gate 8, M1). The re-read below is
+    // `AuthDB::recheck_role_locked`: `SELECT role, password_hash ... FOR
+    // UPDATE`, issued strictly AFTER persist_new_session's INSERT has
+    // COMMITTED (so this session's durable row is visible to every later
+    // statement, on any connection, under READ COMMITTED on single-primary
+    // Postgres). Every writer this check races takes the SAME `auth.users`
+    // row lock for its whole transaction (update_role's UPDATE;
+    // CredentialChangeOwner's `SELECT ... FOR UPDATE` → UPDATE → DELETE of the
+    // account's sessions → COMMIT). For a credential change W, exactly one of:
+    //   (1) W committed before this FOR UPDATE ran → this read sees the new
+    //       hash → deny + revoke;
+    //   (2) W holds the row lock (its UPDATE ran, not yet committed) → this
+    //       FOR UPDATE WAITS for W's commit, then reads the new hash → deny +
+    //       revoke (a plain read here would have seen the OLD hash past W's
+    //       uncommitted UPDATE while W's session DELETE — which ran before this
+    //       session existed — never sweeps it: the Gate 8 R1 defect);
+    //   (3) W has not yet taken the row lock → this read sees the old hash and
+    //       admits; W's later DELETE runs after this session's INSERT
+    //       committed and therefore sweeps it.
+    // The same three cases cover a demotion (update_role takes the row lock,
+    // and its own in-memory sweep runs after its commit). The wait in (2) is
+    // bounded by recheck_role_locked's txn-scoped lock_timeout; a timeout is
+    // a store error → deny + revoke (fail closed). This reasoning assumes
+    // single-primary Postgres; it would need re-deriving under read-replica
+    // routing, the same caveat ADR-2001's own analogous cross-replica
+    // guarantee (docs/adr/2001-scim-oidc-identity-linkage.md, "Known
+    // residuals") flags for its own case.
+    //
+    // Lock-order safety: this call holds NO session_store lock while it waits
+    // on `auth.users` (persist_new_session's transaction — and with it the
+    // `session_meta` row lock — has already committed), and the callback does
+    // no I/O and takes no mutex, so it cannot complete a cycle with
+    // CredentialChangeOwner's `auth.users` → `session_store` order.
     //
     // Residual this does NOT close (same one ADR-2001/OIDC's own post-mint
     // recheck discloses for its structurally identical race): a demote
@@ -938,7 +942,8 @@ bool AuthManager::post_mint_role_recheck(const std::string& username, Role minte
     // Set-Cookie actually reaching the client is not observable to this
     // function at all - closing that would mean holding this transaction
     // open all the way to the HTTP response, which is a different, larger
-    // change than a role recheck.
+    // change than a role recheck. (A credential change in that window is
+    // case (3): its DELETE sweeps the session.)
     //
     // wipe_user_sessions_durable/invalidate_user_sessions delete the
     // durable row directly rather than working off a stale local list,
@@ -949,7 +954,26 @@ bool AuthManager::post_mint_role_recheck(const std::string& username, Role minte
     // truth there, nothing to diverge from.
     if (!auth_db_)
         return true;
-    auto post = auth_db_->get_user(username);
+    enum class Divergence { kNone, kRole, kCredential };
+    Divergence divergence = Divergence::kNone;
+    Role db_role_seen = minted_role;
+    auto post = auth_db_->recheck_role_locked(
+        username, [&](Role db_role, const std::string& db_hash) {
+            // Under the row lock: compare only — no I/O, no mutex.
+            db_role_seen = db_role;
+            if (db_role != minted_role) {
+                divergence = Divergence::kRole;
+                return;
+            }
+            // #5342 Gate 7: the credential anchor. The caller verified the
+            // password against `expected_hash_hex`; a session proven with the
+            // OLD credential must not survive a change committed since (an
+            // empty anchor never equals a stored hash, so it DENIES — fail
+            // closed). Two server-held hashes, but constant_time_compare keeps
+            // the idiom uniform.
+            if (expected_hash_hex && !constant_time_compare(db_hash, *expected_hash_hex))
+                divergence = Divergence::kCredential;
+        });
     if (!post) {
         const bool removed = yuzu::server::AuthDBError::UserNotFound == post.error();
         spdlog::warn("{}: post-mint re-check for '{}' {} - revoking the session just minted",
@@ -962,10 +986,10 @@ bool AuthManager::post_mint_role_recheck(const std::string& username, Role minte
         (void)revoke; // best-effort revoke; the mint is already denied to the caller either way
         return false;
     }
-    if (post->role != minted_role) {
+    if (divergence == Divergence::kRole) {
         spdlog::warn("{}: post-mint re-check for '{}' found the role changed {} -> {} during "
                     "the mint (concurrent role-change race) - revoking the session just minted",
-                    context, username, role_to_string(minted_role), role_to_string(post->role));
+                    context, username, role_to_string(minted_role), role_to_string(db_role_seen));
         auto revoke = invalidate_user_sessions(username);
         if (metrics_) {
             metrics_->counter("yuzu_auth_role_recheck_post_mint_denied_total").increment();
@@ -973,16 +997,7 @@ bool AuthManager::post_mint_role_recheck(const std::string& username, Role minte
         (void)revoke;
         return false;
     }
-    // #5342 Gate 7: the credential anchor. The caller verified the password
-    // against `expected_hash_hex`; if the stored hash is no longer that one, a
-    // password change/reset committed after the verify (possibly across a
-    // whole MFA round trip on a pending entry), and a session proven with the
-    // OLD credential must not survive it. Same revoke-and-deny as a role
-    // divergence, same ordering proof (set_password commits before this read
-    // begins, or the revoke the change's route runs sweeps this session). An
-    // empty anchor never equals a stored hash, so it DENIES — fail closed.
-    // Two server-held hashes, but constant_time_compare keeps the idiom uniform.
-    if (expected_hash_hex && !constant_time_compare(post->hash_hex, *expected_hash_hex)) {
+    if (divergence == Divergence::kCredential) {
         spdlog::warn("{}: post-mint re-check for '{}' found the stored credential changed after "
                      "the password was verified (concurrent password change/reset) - revoking "
                      "the session just minted",
@@ -1484,10 +1499,6 @@ void AuthManager::set_role_recheck_inside_lock_hook_for_test(std::function<void(
 
 void AuthManager::set_post_mint_race_hook_for_test(std::function<void()> hook) {
     post_mint_race_hook_for_test_ = std::move(hook);
-}
-
-void AuthManager::set_password_write_race_hook_for_test(std::function<void()> hook) {
-    password_write_race_hook_for_test_ = std::move(hook);
 }
 
 std::optional<Role> AuthManager::cached_role_for_test(const std::string& username) const {
@@ -2070,210 +2081,35 @@ bool AuthManager::reactivate_user(const std::string& username) {
 
 // ── Password change / reset (#5342) ─────────────────────────────────────────
 
-std::optional<UserEntry>
-AuthManager::read_local_account_for_password_write(const std::string& username,
-                                                   const std::string& new_password,
-                                                   PasswordWriteResult& out) {
-    // No AuthDB, no durable credential to change: every production server runs
-    // on Postgres (it fails closed at boot without a DSN); cfg-file-only mode is
-    // a test/legacy shape, and a password written only to users_ + the cfg file
-    // would not survive the next seed anyway. Fail closed, never pretend.
-    if (!auth_db_) {
-        out.outcome = PasswordWriteOutcome::kStoreUnavailable;
-        return std::nullopt;
-    }
-    switch (check_password_policy(new_password)) {
-    case PasswordPolicyVerdict::kTooShort:
-        out.outcome = PasswordWriteOutcome::kTooShort;
-        return std::nullopt;
-    case PasswordPolicyVerdict::kTooLong:
-        out.outcome = PasswordWriteOutcome::kTooLong;
-        return std::nullopt;
-    case PasswordPolicyVerdict::kOk:
-        break;
-    }
-    // An SSO principal ("oidc:..."/"saml:...") is never a local account. The
-    // check runs before any DB read so a principal-shaped name is classified
-    // the same whether or not such a row exists.
-    if (!yuzu::server::is_valid_username(username)) {
-        out.outcome = yuzu::server::is_valid_principal(username) ? PasswordWriteOutcome::kNotLocal
-                                                                 : PasswordWriteOutcome::kNotFound;
-        return std::nullopt;
-    }
-    // AUTHORITATIVE read — never users_ (#5274). get_user filters is_active.
-    auto row = auth_db_->get_user(username);
-    if (!row) {
-        out.outcome = (row.error() == yuzu::server::AuthDBError::UserNotFound ||
-                       row.error() == yuzu::server::AuthDBError::InvalidUsername)
-                          ? PasswordWriteOutcome::kNotFound
-                          : PasswordWriteOutcome::kStoreUnavailable;
-        return std::nullopt;
-    }
-    if (row->identity_source != "local") {
-        out.outcome = PasswordWriteOutcome::kNotLocal;
-        return std::nullopt;
-    }
-    // provisioning_source is the second axis: a SCIM-provisioned row is
-    // identity_source='scim' today, but the SCIM provenance marker is the
-    // authority on who owns the lifecycle, so it is checked independently.
-    // set_password's WHERE clause enforces both again at write time.
-    auto prov = auth_db_->get_provisioning_source(username);
-    if (!prov) {
-        out.outcome = prov.error() == yuzu::server::AuthDBError::UserNotFound
-                          ? PasswordWriteOutcome::kNotFound
-                          : PasswordWriteOutcome::kStoreUnavailable;
-        return std::nullopt;
-    }
-    if (*prov != yuzu::server::kProvisioningSourceLocal) {
-        out.outcome = PasswordWriteOutcome::kNotLocal;
-        return std::nullopt;
-    }
-    return std::move(*row);
-}
-
-PasswordWriteResult AuthManager::write_password(const std::string& username,
-                                                const UserEntry& current,
-                                                const std::string& new_password,
-                                                const std::optional<std::string>& cas_anchor) {
-    PasswordWriteResult out;
-    auto salt = random_bytes(16);
-    auto salt_hex = bytes_to_hex(salt);
-    auto hash = pbkdf2_sha256(new_password, salt, kPbkdf2Iterations);
-
-    // TEST-ONLY seam (see set_password_write_race_hook_for_test's doc): fires
-    // after the caller's read and before the UPDATE, with no lock held.
-    if (password_write_race_hook_for_test_)
-        password_write_race_hook_for_test_();
-
-    // Self-change: CAS on the hash the caller's lockout-accounted verify just
-    // proved — the write lands only if that credential is still the stored
-    // one. Admin reset: a plain guarded write (local + active only). Either
-    // way set_password touches ONLY hash/salt/updated_at (#5342 Gate 7) —
-    // never the lockout columns; an admin reset clears a lock through the
-    // audited admin-unlock primitive at the route instead.
-    auto written = auth_db_->set_password(username, hash, salt_hex, cas_anchor);
-    if (!written) {
-        if (written.error() != yuzu::server::AuthDBError::UserNotFound) {
-            out.outcome = PasswordWriteOutcome::kStoreUnavailable;
-            return out;
-        }
-        // Zero rows: the account went away / stopped being local, OR (self
-        // change only) the CAS predicate failed because someone else wrote
-        // first. Re-read so the caller can answer 404 vs 409 honestly.
-        auto again = auth_db_->get_user(username);
-        if (!again) {
-            out.outcome = again.error() == yuzu::server::AuthDBError::UserNotFound
-                              ? PasswordWriteOutcome::kNotFound
-                              : PasswordWriteOutcome::kStoreUnavailable;
-            return out;
-        }
-        if (again->identity_source != "local") {
-            out.outcome = PasswordWriteOutcome::kNotLocal;
-            return out;
-        }
-        // The same two axes the pre-write classification checks
-        // (read_local_account_for_password_write): set_password's WHERE clause also
-        // requires provisioning_source='local', so a SCIM adoption between the
-        // read and the write is "not local any more" — on the CAS path too,
-        // where it would otherwise be misreported as a concurrent change.
-        auto prov = auth_db_->get_provisioning_source(username);
-        if (!prov) {
-            out.outcome = prov.error() == yuzu::server::AuthDBError::UserNotFound
-                              ? PasswordWriteOutcome::kNotFound
-                              : PasswordWriteOutcome::kStoreUnavailable;
-            return out;
-        }
-        if (*prov != yuzu::server::kProvisioningSourceLocal) {
-            out.outcome = PasswordWriteOutcome::kNotLocal;
-        } else if (cas_anchor) {
-            out.outcome = PasswordWriteOutcome::kConflict;
-        } else {
-            // A plain guarded write matched nothing, yet the row is active and
-            // local on both axes when re-read: it changed and changed back
-            // between the write and this read. Report it as not local (the
-            // write was refused for that reason); the caller writes nothing.
-            out.outcome = PasswordWriteOutcome::kNotLocal;
-        }
-        return out;
-    }
-
-    // Refresh this process's cache entry AFTER the durable commit (the
-    // file-wide "never hold mu_ across a DB call" ordering). Credentials only:
-    // .role is untouched, so the role_version lockstep invariant (UserEntry::
-    // role_version's doc) needs no new stamp. An uncached username stays
-    // uncached — find_user_or_hydrate is DB-first in this mode regardless.
-    {
-        std::unique_lock lock(mu_);
-        if (auto it = users_.find(username); it != users_.end()) {
-            it->second.hash_hex = hash;
-            it->second.salt_hex = salt_hex;
-        }
-    }
-    out.outcome = PasswordWriteOutcome::kOk;
-    out.role = current.role;
-    out.previous_hash_hex = current.hash_hex;
-    out.previous_salt_hex = current.salt_hex;
-    out.new_hash_hex = std::move(hash);
-    return out;
-}
-
-PasswordWriteResult AuthManager::change_password(const std::string& username,
-                                                 const std::string& verified_hash_hex,
-                                                 const std::string& new_password) {
-    PasswordWriteResult out;
-    // An empty anchor is a caller bug (no verify happened); never let it reach
-    // set_password, which would refuse it anyway (InvalidCredentials).
-    if (verified_hash_hex.empty()) {
-        out.outcome = PasswordWriteOutcome::kConflict;
-        return out;
-    }
-    auto row = read_local_account_for_password_write(username, new_password, out);
-    if (!row)
-        return out;
-    // #5342 Gate 7: no second PBKDF2. The current password was proven ONCE,
-    // under lockout accounting (AuthRoutes::verify_password_with_lockout), and
-    // that proof's stored hash is the CAS anchor. If the stored credential
-    // already moved since, fail fast; the CAS below closes the remaining
-    // read→write window.
-    if (!constant_time_compare(row->hash_hex, verified_hash_hex)) {
-        out.outcome = PasswordWriteOutcome::kConflict;
-        return out;
-    }
-    return write_password(username, *row, new_password, verified_hash_hex);
-}
-
-PasswordWriteResult AuthManager::reset_password(const std::string& username,
-                                                const std::string& new_password) {
-    PasswordWriteResult out;
-    auto row = read_local_account_for_password_write(username, new_password, out);
-    if (!row)
-        return out;
-    // Plain guarded write — no CAS, no target-role classification (#5342 Gate
-    // 7: the route's is_rbac_administrator gate is the sole who-may-reset-whom
-    // decision). The row read above supplies the rollback values.
-    return write_password(username, *row, new_password, std::nullopt);
-}
-
-bool AuthManager::rollback_password_write(const std::string& username,
-                                          const PasswordWriteResult& written) {
-    if (!auth_db_ || written.outcome != PasswordWriteOutcome::kOk)
-        return false;
-    // Restore ONLY if the stored hash is still the one we wrote — a later
-    // writer's credential is never clobbered by a stale compensation.
-    // set_password writes hash/salt/updated_at only (#5342 Gate 7), so the
-    // rollback restores the credential and nothing else: a lockout armed on
-    // the account before the write is still armed after it (the write never
-    // touched it either).
-    auto restored = auth_db_->set_password(username, written.previous_hash_hex,
-                                           written.previous_salt_hex, written.new_hash_hex);
-    if (!restored)
-        return false;
+yuzu::server::CredentialChangeOutcome
+AuthManager::commit_password_change(const yuzu::server::CredentialChangeRequest& request) {
+    // No owner (cfg-file-only mode, or a server wired without Postgres): there
+    // is no durable credential to change, and a password written only to
+    // users_ + the cfg file would not survive the next seed anyway. Fail
+    // closed, never pretend.
+    if (!credential_change_owner_)
+        return yuzu::server::CredentialChangeOutcome{};
+    // The ONE transaction (credential_change_owner.hpp). No mu_ is held across
+    // it — the file-wide "never hold mu_ across a DB call" discipline, which is
+    // also what keeps recheck_role_after_credential_check's mu_-inside-row-lock
+    // acquisition deadlock-free against this owner's row lock.
+    auto outcome = credential_change_owner_->commit(request);
+    if (outcome.result != yuzu::server::CredentialChangeResult::kOk)
+        return outcome;
+    // Post-commit cache refresh. Credentials only (.role untouched, so the
+    // role_version lockstep invariant needs no new stamp); an uncached username
+    // stays uncached (find_user_or_hydrate is DB-first in this mode). Every
+    // in-memory session of the account goes too — the durable rows were deleted
+    // in the transaction and the bumped write-generation makes every OTHER
+    // replica drop its cached copies on its next refresh.
     std::unique_lock lock(mu_);
-    if (auto it = users_.find(username); it != users_.end()) {
-        it->second.hash_hex = written.previous_hash_hex;
-        it->second.salt_hex = written.previous_salt_hex;
+    if (auto it = users_.find(request.username); it != users_.end()) {
+        it->second.hash_hex = request.new_hash_hex;
+        it->second.salt_hex = request.new_salt_hex;
     }
-    return true;
+    std::erase_if(sessions_,
+                  [&](const auto& pair) { return pair.second.username == request.username; });
+    return outcome;
 }
 
 std::size_t AuthManager::report_stale_cfg_credentials() {

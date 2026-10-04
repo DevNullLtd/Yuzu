@@ -230,7 +230,7 @@ TEST_CASE("POST /api/settings/mfa/init twice returns MfaAlreadyEnrolled with ope
     REQUIRE(bytes.has_value());
     std::string raw(reinterpret_cast<const char*>(bytes->data()), bytes->size());
     auto code = mfa::generate(raw, mfa::current_counter(std::chrono::system_clock::now()));
-    REQUIRE(h.auth_db->mfa_verify_enrollment("admin", code).has_value());
+    REQUIRE(h.auth_db->mfa_verify_enrollment("admin", code, std::nullopt).has_value());
 
     auto res = post_same_origin(h.sink, "/api/settings/mfa/init");
     REQUIRE(res);
@@ -250,7 +250,7 @@ TEST_CASE("POST /api/settings/mfa/recovery-codes regenerates 10 codes + cache he
     REQUIRE(bytes.has_value());
     std::string raw(reinterpret_cast<const char*>(bytes->data()), bytes->size());
     auto code = mfa::generate(raw, mfa::current_counter(std::chrono::system_clock::now()));
-    REQUIRE(h.auth_db->mfa_verify_enrollment("admin", code).has_value());
+    REQUIRE(h.auth_db->mfa_verify_enrollment("admin", code, std::nullopt).has_value());
 
     auto res = post_same_origin(h.sink, "/api/settings/mfa/recovery-codes");
     REQUIRE(res);
@@ -281,7 +281,7 @@ TEST_CASE("POST /api/settings/mfa/verify on an already-enrolled account audits m
     auto code = mfa::generate(raw, mfa::current_counter(std::chrono::system_clock::now()));
     // Concurrent winner: enroll out-of-band, then drive the settings verify route
     // with the same still-valid code the racing operator would have submitted.
-    REQUIRE(h.auth_db->mfa_verify_enrollment("admin", code).has_value());
+    REQUIRE(h.auth_db->mfa_verify_enrollment("admin", code, std::nullopt).has_value());
 
     auto res = post_same_origin(h.sink, "/api/settings/mfa/verify", "code=" + code);
     REQUIRE(res);
@@ -303,7 +303,7 @@ TEST_CASE("POST /api/settings/mfa/disable clears state + emits mfa.disabled",
     REQUIRE(bytes.has_value());
     std::string raw(reinterpret_cast<const char*>(bytes->data()), bytes->size());
     auto code = mfa::generate(raw, mfa::current_counter(std::chrono::system_clock::now()));
-    REQUIRE(h.auth_db->mfa_verify_enrollment("admin", code).has_value());
+    REQUIRE(h.auth_db->mfa_verify_enrollment("admin", code, std::nullopt).has_value());
 
     auto res = post_same_origin(h.sink, "/api/settings/mfa/disable");
     REQUIRE(res);
@@ -331,7 +331,7 @@ TEST_CASE("POST /api/settings/mfa/disable is blocked for self under enforcement 
     REQUIRE(bytes.has_value());
     std::string raw(reinterpret_cast<const char*>(bytes->data()), bytes->size());
     auto code = mfa::generate(raw, mfa::current_counter(std::chrono::system_clock::now()));
-    REQUIRE(h.auth_db->mfa_verify_enrollment("admin", code).has_value());
+    REQUIRE(h.auth_db->mfa_verify_enrollment("admin", code, std::nullopt).has_value());
 
     // Turn on enforcement (cfg is held by reference by SettingsRoutes).
     h.cfg.mfa_enforcement = "required";
@@ -360,7 +360,7 @@ TEST_CASE("POST /api/settings/mfa/disable under admin-only blocks admins but the
     REQUIRE(bytes.has_value());
     std::string raw(reinterpret_cast<const char*>(bytes->data()), bytes->size());
     auto code = mfa::generate(raw, mfa::current_counter(std::chrono::system_clock::now()));
-    REQUIRE(h.auth_db->mfa_verify_enrollment("admin", code).has_value());
+    REQUIRE(h.auth_db->mfa_verify_enrollment("admin", code, std::nullopt).has_value());
 
     h.cfg.mfa_enforcement = "admin-only";
     // Admin (session_role defaults to admin) is protected.

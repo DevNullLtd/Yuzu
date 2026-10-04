@@ -6791,7 +6791,8 @@ void SettingsRoutes::register_routes(
                                       "text/html; charset=utf-8");
                       return;
                   }
-                  auto codes_res = db->mfa_verify_enrollment(session->username, code);
+                  auto codes_res = db->mfa_verify_enrollment(session->username, code,
+                                                             /*expected_password_hash_hex=*/std::nullopt);
                   if (!codes_res) {
                       // Re-render the verify form (no QR re-reveal — the
                       // provisional row survives so the operator's

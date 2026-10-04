@@ -406,6 +406,8 @@ yuzu_server_core_lib = static_library(
     'src/bundle_service.cpp',
     'src/bundle_orchestrator.cpp',
     'src/audit_store.cpp',
+    'src/credential_change_owner.cpp', # #5342: ADR-0012 §3 query owner — one-transaction
+                                       # local credential change (auth + session_store + audit_store)
     'src/tag_store.cpp',
     'src/tag_routes.cpp',
     'src/scope_engine.cpp',

@@ -1960,37 +1960,6 @@ tests:
         eval_time: 45m
         exp_samples: []
 
-  # ── YuzuPasswordChangeUnrecorded (#5342) ────────────────────────────────
-
-  # One unrecorded change after the boot seed pages, carrying its kind label.
-  # The flat-0 prefix is the boot seed in server.cpp (both kinds seeded).
-  - interval: 1m
-    name: password change unrecorded - one event after the boot seed fires
-    input_series:
-      - series: 'yuzu_auth_password_change_unrecorded_total{job="yuzu",instance="s1",kind="admin"}'
-        values: "0x30 1x30"
-      - series: 'yuzu_auth_password_change_unrecorded_total{job="yuzu",instance="s1",kind="self"}'
-        values: "0x60"
-    promql_expr_test:
-      - expr: 'ALERTS{alertname="YuzuPasswordChangeUnrecorded", alertstate="firing"}'
-        eval_time: 45m
-        exp_samples:
-          - labels: 'ALERTS{alertname="YuzuPasswordChangeUnrecorded", alertstate="firing", instance="s1", job="yuzu", kind="admin", severity="critical"}'
-            value: 1
-
-  # Flat seeded counters, no page.
-  - interval: 1m
-    name: password change unrecorded - flat seeded counters stay quiet
-    input_series:
-      - series: 'yuzu_auth_password_change_unrecorded_total{job="yuzu",instance="s1",kind="self"}'
-        values: "0x60"
-      - series: 'yuzu_auth_password_change_unrecorded_total{job="yuzu",instance="s1",kind="admin"}'
-        values: "0x60"
-    promql_expr_test:
-      - expr: 'ALERTS{alertname="YuzuPasswordChangeUnrecorded"}'
-        eval_time: 45m
-        exp_samples: []
-
   # ── YuzuScimDeprovisionRoleRefusedWithActiveLink (D1) ───────────────────
 
   # CASE 41 -- D1 fires: a still-linked out-of-band admin was refused

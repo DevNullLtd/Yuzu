@@ -14,10 +14,17 @@
  * #5342 Gate 7 additions: the typed `verify_password` result (a store error or
  * a concurrent credential change is TRANSIENT, never a failed guess), the
  * credential anchor every login carries to its session mint (a reset landing
- * between verify and mint denies the mint), the self-change CAS on the
- * verified hash (no second PBKDF2), the plain admin reset (no target-role
- * classification), the lockout-preserving `set_password`, and the #5274 boot
- * signal for stale cfg credentials.
+ * between verify and mint denies the mint), and the #5274 boot signal for
+ * stale cfg credentials.
+ *
+ * #5342 Gate 8 (the class fix): every credential write goes through
+ * `AuthManager::commit_password_change` → `CredentialChangeOwner` — ONE
+ * transaction under the `auth.users` row lock for the credential, the
+ * account's sessions, its provisional MFA secret, its lockout (admin) and the
+ * audit row(s). The cases below drive that owner against a real AuthDB +
+ * SessionStore + AuditStore on one pool (the production shape), inject REAL
+ * statement faults inside the throwaway database, and pin the locking
+ * post-mint re-read (M1).
  *
  * PG-gated through AuthDbPg (skips when YUZU_TEST_POSTGRES_DSN is unset,
  * fails when it is set but broken).
@@ -27,21 +34,29 @@
 #include <yuzu/server/auth.hpp>
 #include <yuzu/server/auth_db.hpp>
 
+#include "audit_store.hpp"
+#include "credential_change_owner.hpp"
 #include "password_policy.hpp"
+#include "session_store.hpp"
 #include "test_auth_db_pg_helper.hpp"
+#include "../../../server/core/src/totp.hpp"
 
 #include "../test_helpers.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <optional>
+#include <stdexcept>
 #include <string>
+#include <thread>
 
 namespace fs = std::filesystem;
 using yuzu::server::auth::AuthManager;
-using yuzu::server::auth::PasswordWriteOutcome;
+using Kind = yuzu::server::CredentialChangeRequest::Kind;
+using Result = yuzu::server::CredentialChangeResult;
 using yuzu::server::auth::Role;
 using yuzu::server::auth::VerifyFailure;
 
@@ -76,6 +91,86 @@ std::string anchor_of(AuthManager& mgr, const std::string& user, const std::stri
     REQUIRE(v.has_value());
     REQUIRE_FALSE(v->hash_hex.empty());
     return v->hash_hex;
+}
+
+/// A credential-change request as the routes build it: PBKDF2 of `pw` at the
+/// production iteration count (anything cheaper would never verify).
+yuzu::server::CredentialChangeRequest mkreq(Kind kind, const std::string& user,
+                                            const std::string& pw,
+                                            std::optional<std::string> anchor = std::nullopt) {
+    yuzu::server::CredentialChangeRequest r;
+    r.kind = kind;
+    r.username = user;
+    const auto salt = AuthManager::random_bytes(16);
+    r.new_salt_hex = AuthManager::bytes_to_hex(salt);
+    r.new_hash_hex = AuthManager::pbkdf2_sha256(pw, salt, AuthManager::kPbkdf2Iterations);
+    r.expected_current_hash_hex = std::move(anchor);
+    r.audit_template.principal = kind == Kind::kSelf ? user : "root";
+    r.audit_template.principal_role = "admin";
+    r.audit_template.target_type = "User";
+    r.audit_template.target_id = user;
+    return r;
+}
+
+/// The production store shape on ONE pool: AuthDB + SessionStore + AuditStore
+/// + the credential-change owner (server.cpp wires all four on `*pg_pool_`).
+struct CredInfra {
+    yuzu::test::AuthDbPg db;
+    yuzu::server::SessionStore sessions{db.pool()};
+    yuzu::server::AuditStore audit{db.pool()};
+    yuzu::server::CredentialChangeOwner owner{db.pool(), &audit};
+
+    CredInfra() {
+        REQUIRE(sessions.is_open());
+        REQUIRE(audit.is_open());
+    }
+
+    void wire(AuthManager& mgr) {
+        mgr.set_auth_db(db.get());
+        mgr.set_session_store(&sessions);
+        mgr.set_credential_change_owner(&owner);
+    }
+
+    void exec_on(PGconn* c, const std::string& sql) {
+        yuzu::server::pg::PgResult r{PQexec(c, sql.c_str())};
+        INFO(sql << " -> " << PQresultErrorMessage(r.get()));
+        REQUIRE(r.ok());
+    }
+    void exec(const std::string& sql) {
+        yuzu::server::pg::PgConn c{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(c.get()) == CONNECTION_OK);
+        exec_on(c.get(), sql);
+    }
+    std::string scalar(const std::string& sql) {
+        yuzu::server::pg::PgConn c{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(c.get()) == CONNECTION_OK);
+        yuzu::server::pg::PgResult r{PQexec(c.get(), sql.c_str())};
+        INFO(sql << " -> " << PQresultErrorMessage(r.get()));
+        REQUIRE(r.ok());
+        return PQntuples(r.get()) == 0 ? std::string{} : std::string(PQgetvalue(r.get(), 0, 0));
+    }
+    int sessions_of(const std::string& user) {
+        return std::stoi(scalar("SELECT count(*) FROM session_store.sessions WHERE username = '" +
+                                user + "'"));
+    }
+    int audit_total() { return std::stoi(scalar("SELECT count(*) FROM audit_store.audit_events")); }
+    int audit_rows(const std::string& action, const std::string& target) {
+        return std::stoi(scalar("SELECT count(*) FROM audit_store.audit_events WHERE action = '" +
+                                action + "' AND target_id = '" + target + "'"));
+    }
+    std::string audit_detail(const std::string& action, const std::string& target) {
+        return scalar("SELECT detail FROM audit_store.audit_events WHERE action = '" + action +
+                      "' AND target_id = '" + target + "' ORDER BY id DESC LIMIT 1");
+    }
+};
+
+/// A TOTP code for the current step from an enrolment's base32 secret.
+std::string code_for_now(const std::string& secret_b32) {
+    auto bytes = yuzu::server::mfa::base32_decode(secret_b32);
+    REQUIRE(bytes.has_value());
+    std::string raw(reinterpret_cast<const char*>(bytes->data()), bytes->size());
+    return yuzu::server::mfa::generate(
+        raw, yuzu::server::mfa::current_counter(std::chrono::system_clock::now()));
 }
 
 /// Break ONLY AuthDB::get_user's own SELECT (it reads identity_source; the
@@ -137,262 +232,301 @@ TEST_CASE("verify_password: an AuthDB read failure is kStoreUnavailable, never a
     CHECK(yuzu::server::auth::is_transient(r.error()));
 }
 
-// ── change_password / reset_password contract ──────────────────────────────
+// ── The one-transaction credential change (#5342 Gate 8, T1) ───────────────
 
-TEST_CASE("change_password: CAS on the verified hash writes, old password stops working",
+TEST_CASE("commit_password_change (self): anchor compared under the row lock; old password dies",
           "[pg][auth][password]") {
-    yuzu::test::AuthDbPg db;
+    CredInfra f;
     AuthManager mgr;
-    mgr.set_auth_db(db.get());
+    f.wire(mgr);
     REQUIRE(mgr.upsert_user("alice", kOld, Role::user));
-    const auto before = db->get_user("alice");
-    REQUIRE(before.has_value());
+    auto s1 = mgr.create_local_session("alice", Role::user, false, anchor_of(mgr, "alice", kOld));
+    REQUIRE_FALSE(s1.empty());
 
-    const auto r = mgr.change_password("alice", anchor_of(mgr, "alice", kOld), kNew);
-    REQUIRE(r.outcome == PasswordWriteOutcome::kOk);
-    CHECK(r.role == Role::user);
-    CHECK(r.previous_hash_hex == before->hash_hex);
-    CHECK(r.previous_salt_hex == before->salt_hex);
-    CHECK(r.new_hash_hex == db->get_user("alice")->hash_hex);
-    CHECK(r.new_hash_hex != r.previous_hash_hex);
-
+    const auto r = mgr.commit_password_change(
+        mkreq(Kind::kSelf, "alice", kNew, anchor_of(mgr, "alice", kOld)));
+    REQUIRE(r.result == Result::kOk);
+    CHECK(r.target_role == "user");
+    CHECK(r.sessions_revoked == 1);
+    CHECK_FALSE(r.lockout_cleared); // a self change never touches the lockout
     CHECK_FALSE(vrole(mgr, "alice", kOld).has_value());
     CHECK(vrole(mgr, "alice", kNew) == Role::user);
+    CHECK_FALSE(mgr.validate_session(s1).has_value());
+    CHECK(f.sessions_of("alice") == 0);
+    CHECK(f.audit_rows("user.password_change", "alice") == 1);
+    CHECK(f.audit_detail("user.password_change", "alice") ==
+          "self_service sessions_revoked=1 provisional_mfa_cleared=false");
 }
 
-TEST_CASE("change_password: a stale or empty anchor writes nothing (kConflict)",
+TEST_CASE("commit_password_change: every refusal under the lock writes NOTHING",
           "[pg][auth][password]") {
-    yuzu::test::AuthDbPg db;
+    // T1(i): hash, sessions and audit rows are byte-for-byte unchanged.
+    CredInfra f;
     AuthManager mgr;
-    mgr.set_auth_db(db.get());
-    REQUIRE(mgr.upsert_user("bob", kOld, Role::user));
-    const auto anchor = anchor_of(mgr, "bob", kOld);
-    const auto before = db->get_user("bob")->hash_hex;
+    f.wire(mgr);
 
-    // An anchor that is not the stored hash (the credential moved since the
-    // caller proved it) — refused without a write. No second PBKDF2 happens:
-    // change_password never sees a password, only the anchor.
-    CHECK(mgr.change_password("bob", std::string(before.size(), 'f'), kNew).outcome ==
-          PasswordWriteOutcome::kConflict);
-    CHECK(mgr.change_password("bob", "", kNew).outcome == PasswordWriteOutcome::kConflict);
-    CHECK(db->get_user("bob")->hash_hex == before);
-    CHECK(vrole(mgr, "bob", kOld) == Role::user);
+    auto check_untouched = [&](const std::string& user, const std::string& hash_before,
+                               const std::string& session) {
+        CHECK(f.db->get_user(user)->hash_hex == hash_before);
+        CHECK(mgr.validate_session(session).has_value());
+        CHECK(f.sessions_of(user) == 1);
+        CHECK(f.audit_total() == 0);
+    };
 
-    // A reset committing between the verify and the change wins: the anchor
-    // the caller holds is dead, so the change is refused.
-    REQUIRE(mgr.reset_password("bob", "reset-by-admin-1").outcome == PasswordWriteOutcome::kOk);
-    CHECK(mgr.change_password("bob", anchor, kNew).outcome == PasswordWriteOutcome::kConflict);
-    CHECK(vrole(mgr, "bob", "reset-by-admin-1") == Role::user);
-}
-
-TEST_CASE("change_password: the CAS closes the read->write window", "[pg][auth][password]") {
-    // The race hook fires after change_password's own read (which still sees
-    // the anchored hash) and before the UPDATE: a concurrent writer there must
-    // make the CAS miss rather than be silently overwritten.
-    yuzu::test::AuthDbPg db;
-    AuthManager mgr;
-    mgr.set_auth_db(db.get());
-    seed_local(*db, "cass", kOld, Role::user);
-    const auto anchor = anchor_of(mgr, "cass", kOld);
-    auto salt = AuthManager::random_bytes(16);
-    const auto racer = AuthManager::pbkdf2_sha256("racer-password-1", salt,
-                                                  AuthManager::kPbkdf2Iterations);
-    mgr.set_password_write_race_hook_for_test([&] {
-        REQUIRE(db->set_password("cass", racer, AuthManager::bytes_to_hex(salt)).has_value());
-    });
-    const auto r = mgr.change_password("cass", anchor, kNew);
-    mgr.set_password_write_race_hook_for_test(nullptr);
-    CHECK(r.outcome == PasswordWriteOutcome::kConflict);
-    CHECK(db->get_user("cass")->hash_hex == racer);
-}
-
-TEST_CASE("change_password / reset_password: length policy", "[pg][auth][password]") {
-    yuzu::test::AuthDbPg db;
-    AuthManager mgr;
-    mgr.set_auth_db(db.get());
-    REQUIRE(mgr.upsert_user("carol", kOld, Role::user));
-    using yuzu::server::auth::kMaxPasswordBytes;
-    using yuzu::server::auth::kMinPasswordBytes;
-    const auto anchor = anchor_of(mgr, "carol", kOld);
-
-    CHECK(mgr.change_password("carol", anchor, std::string(kMinPasswordBytes - 1, 'a')).outcome ==
-          PasswordWriteOutcome::kTooShort);
-    CHECK(mgr.change_password("carol", anchor, std::string(kMaxPasswordBytes + 1, 'a')).outcome ==
-          PasswordWriteOutcome::kTooLong);
-    CHECK(mgr.reset_password("carol", std::string(kMinPasswordBytes - 1, 'a')).outcome ==
-          PasswordWriteOutcome::kTooShort);
-    CHECK(mgr.reset_password("carol", std::string(kMaxPasswordBytes + 1, 'a')).outcome ==
-          PasswordWriteOutcome::kTooLong);
-    // Exactly at both bounds is accepted.
-    CHECK(mgr.reset_password("carol", std::string(kMinPasswordBytes, 'a')).outcome ==
-          PasswordWriteOutcome::kOk);
-    CHECK(mgr.reset_password("carol", std::string(kMaxPasswordBytes, 'b')).outcome ==
-          PasswordWriteOutcome::kOk);
-    CHECK(vrole(mgr, "carol", std::string(kMaxPasswordBytes, 'b')) == Role::user);
-}
-
-TEST_CASE("change_password / reset_password: not-local and absent accounts",
-          "[pg][auth][password]") {
-    yuzu::test::AuthDbPg db;
-    AuthManager mgr;
-    mgr.set_auth_db(db.get());
-
-    SECTION("SCIM-provisioned") {
-        seed_local(*db, "scimmy", kOld, Role::user);
-        const auto anchor = db->get_user("scimmy")->hash_hex;
-        REQUIRE(db->set_provisioning_source("scimmy", "scim").has_value());
-        CHECK(mgr.reset_password("scimmy", kNew).outcome == PasswordWriteOutcome::kNotLocal);
-        CHECK(mgr.change_password("scimmy", anchor, kNew).outcome ==
-              PasswordWriteOutcome::kNotLocal);
+    SECTION("self: a stale anchor is kConflict") {
+        seed_local(*f.db, "bob", kOld, Role::user);
+        const auto before = f.db->get_user("bob")->hash_hex;
+        auto s = mgr.create_local_session_for_test("bob", Role::user, false);
+        REQUIRE_FALSE(s.empty());
+        CHECK(mgr.commit_password_change(
+                      mkreq(Kind::kSelf, "bob", kNew, std::string(before.size(), 'f')))
+                  .result == Result::kConflict);
+        CHECK(mgr.commit_password_change(mkreq(Kind::kSelf, "bob", kNew, std::string{})).result ==
+              Result::kConflict);
+        CHECK(mgr.commit_password_change(mkreq(Kind::kSelf, "bob", kNew, std::nullopt)).result ==
+              Result::kConflict);
+        check_untouched("bob", before, s);
+        CHECK(vrole(mgr, "bob", kOld) == Role::user);
     }
-    SECTION("SSO principal") {
+    SECTION("SCIM-provisioned is kNotLocal (both kinds)") {
+        seed_local(*f.db, "scimmy", kOld, Role::user);
+        const auto before = f.db->get_user("scimmy")->hash_hex;
+        auto s = mgr.create_local_session_for_test("scimmy", Role::user, false);
+        REQUIRE(f.db->set_provisioning_source("scimmy", "scim").has_value());
+        CHECK(mgr.commit_password_change(mkreq(Kind::kAdminReset, "scimmy", kNew)).result ==
+              Result::kNotLocal);
+        CHECK(mgr.commit_password_change(mkreq(Kind::kSelf, "scimmy", kNew, before)).result ==
+              Result::kNotLocal);
+        check_untouched("scimmy", before, s);
+    }
+    SECTION("identity_source not local is kNotLocal") {
+        seed_local(*f.db, "idp_user", kOld, Role::user);
+        const auto before = f.db->get_user("idp_user")->hash_hex;
+        auto s = mgr.create_local_session_for_test("idp_user", Role::user, false);
+        REQUIRE(f.db->set_identity_source("idp_user", "scim").has_value());
+        CHECK(mgr.commit_password_change(mkreq(Kind::kAdminReset, "idp_user", kNew)).result ==
+              Result::kNotLocal);
+        check_untouched("idp_user", before, s);
+    }
+    SECTION("SSO principal-shaped name is kNotLocal, absent/inactive is kNotFound") {
         const std::string principal = "oidc:https://idp.example#s1";
-        REQUIRE(db->upsert_sso_identity(principal, "https://idp.example", "s1", "S", "oidc")
+        REQUIRE(f.db->upsert_sso_identity(principal, "https://idp.example", "s1", "S", "oidc")
                     .has_value());
-        CHECK(mgr.reset_password(principal, kNew).outcome == PasswordWriteOutcome::kNotLocal);
-    }
-    SECTION("identity_source not local") {
-        seed_local(*db, "idp_user", kOld, Role::user);
-        REQUIRE(db->set_identity_source("idp_user", "scim").has_value());
-        CHECK(mgr.reset_password("idp_user", kNew).outcome == PasswordWriteOutcome::kNotLocal);
-    }
-    SECTION("absent and inactive") {
-        CHECK(mgr.reset_password("ghost", kNew).outcome == PasswordWriteOutcome::kNotFound);
-        seed_local(*db, "removed", kOld, Role::user);
-        REQUIRE(db->remove_user("removed").has_value());
-        CHECK(mgr.reset_password("removed", kNew).outcome == PasswordWriteOutcome::kNotFound);
+        CHECK(mgr.commit_password_change(mkreq(Kind::kAdminReset, principal, kNew)).result ==
+              Result::kNotLocal);
+        CHECK(mgr.commit_password_change(mkreq(Kind::kAdminReset, "ghost", kNew)).result ==
+              Result::kNotFound);
+        seed_local(*f.db, "removed", kOld, Role::user);
+        REQUIRE(f.db->remove_user("removed").has_value());
+        CHECK(mgr.commit_password_change(mkreq(Kind::kAdminReset, "removed", kNew)).result ==
+              Result::kNotFound);
+        CHECK(f.audit_total() == 0);
     }
 }
 
-TEST_CASE("change_password / reset_password: a SCIM adoption racing the write is kNotLocal",
-          "[pg][auth][password]") {
-    // The race hook fires after the pre-write read (which still sees a local
-    // row) and before the UPDATE. Flipping provisioning_source there makes the
-    // guarded write match nothing; the re-read must classify that as "not
-    // local any more" on BOTH paths — on the CAS path it must not be
-    // misreported as a concurrent password change (kConflict).
-    yuzu::test::AuthDbPg db;
-    AuthManager mgr;
-    mgr.set_auth_db(db.get());
-
-    SECTION("self change (CAS)") {
-        seed_local(*db, "adoptee", kOld, Role::user);
-        const auto anchor = anchor_of(mgr, "adoptee", kOld);
-        const auto before = db->get_user("adoptee")->hash_hex;
-        mgr.set_password_write_race_hook_for_test(
-            [&] { REQUIRE(db->set_provisioning_source("adoptee", "scim").has_value()); });
-        const auto r = mgr.change_password("adoptee", anchor, kNew);
-        mgr.set_password_write_race_hook_for_test(nullptr);
-        CHECK(r.outcome == PasswordWriteOutcome::kNotLocal);
-        CHECK(db->get_user("adoptee")->hash_hex == before);
-    }
-    SECTION("admin reset (plain)") {
-        seed_local(*db, "adoptee2", kOld, Role::user);
-        const auto before = db->get_user("adoptee2")->hash_hex;
-        mgr.set_password_write_race_hook_for_test(
-            [&] { REQUIRE(db->set_provisioning_source("adoptee2", "scim").has_value()); });
-        const auto r = mgr.reset_password("adoptee2", kNew);
-        mgr.set_password_write_race_hook_for_test(nullptr);
-        CHECK(r.outcome == PasswordWriteOutcome::kNotLocal);
-        CHECK(db->get_user("adoptee2")->hash_hex == before);
-    }
-}
-
-TEST_CASE("reset_password: a plain write, no target-role classification (#5342 Gate 7)",
+TEST_CASE("commit_password_change (admin): a plain write, no target-role classification",
           "[pg][auth][password]") {
     // Who may reset whom is decided ONCE, at the route, by is_rbac_administrator.
-    // The store/manager layer writes any active LOCAL row — including an admin
-    // one — and the write's admin-ness never changes the outcome.
-    yuzu::test::AuthDbPg db;
+    CredInfra f;
     AuthManager mgr;
-    mgr.set_auth_db(db.get());
-    seed_local(*db, "root2", kOld, Role::admin);
-
-    const auto r = mgr.reset_password("root2", kNew);
-    REQUIRE(r.outcome == PasswordWriteOutcome::kOk);
-    CHECK(r.role == Role::admin);
+    f.wire(mgr);
+    seed_local(*f.db, "root2", kOld, Role::admin);
+    const auto r = mgr.commit_password_change(mkreq(Kind::kAdminReset, "root2", kNew));
+    REQUIRE(r.result == Result::kOk);
+    CHECK(r.target_role == "admin");
     CHECK(vrole(mgr, "root2", kNew) == Role::admin);
     CHECK_FALSE(vrole(mgr, "root2", kOld).has_value());
+    CHECK(f.audit_detail("user.password_reset", "root2") ==
+          "admin_reset target_role=admin sessions_revoked=0 provisional_mfa_cleared=false");
+}
 
-    SECTION("a promotion racing the write does not change the outcome") {
-        seed_local(*db, "climber", kOld, Role::user);
-        mgr.set_password_write_race_hook_for_test(
-            [&] { REQUIRE(db->update_role("climber", Role::admin).has_value()); });
-        const auto raced = mgr.reset_password("climber", kNew);
-        mgr.set_password_write_race_hook_for_test(nullptr);
-        CHECK(raced.outcome == PasswordWriteOutcome::kOk);
-        CHECK(vrole(mgr, "climber", kNew) == Role::admin);
+TEST_CASE("commit_password_change (admin): the lockout clears IN the transaction, audited iff it "
+          "existed",
+          "[pg][auth][password][lockout]") {
+    CredInfra f;
+    AuthManager mgr;
+    f.wire(mgr);
+
+    SECTION("a locked account: cleared + one auth.lockout.cleared row") {
+        seed_local(*f.db, "lockie", kOld, Role::user);
+        for (int i = 0; i < 3; ++i)
+            REQUIRE(f.db->record_failed_login("lockie", 3, 3600).has_value());
+        REQUIRE(f.db->lockout_status("lockie")->locked);
+        const auto r = mgr.commit_password_change(mkreq(Kind::kAdminReset, "lockie", kNew));
+        REQUIRE(r.result == Result::kOk);
+        CHECK(r.lockout_cleared);
+        const auto after = f.db->lockout_status("lockie");
+        REQUIRE(after.has_value());
+        CHECK_FALSE(after->locked);
+        CHECK(after->failed_count == 0);
+        CHECK(f.audit_rows("auth.lockout.cleared", "lockie") == 1);
+        CHECK(f.audit_detail("auth.lockout.cleared", "lockie") == "password_reset");
+    }
+    SECTION("a never-locked account: lockout_cleared=false and NO auth.lockout.cleared row") {
+        seed_local(*f.db, "calm", kOld, Role::user);
+        const auto r = mgr.commit_password_change(mkreq(Kind::kAdminReset, "calm", kNew));
+        REQUIRE(r.result == Result::kOk);
+        CHECK_FALSE(r.lockout_cleared);
+        CHECK(f.audit_rows("auth.lockout.cleared", "calm") == 0);
+        CHECK(f.audit_rows("user.password_reset", "calm") == 1);
+    }
+    SECTION("a self change leaves an armed lock armed") {
+        seed_local(*f.db, "selfie", kOld, Role::user);
+        const auto anchor = anchor_of(mgr, "selfie", kOld);
+        for (int i = 0; i < 2; ++i)
+            REQUIRE(f.db->record_failed_login("selfie", 5, 3600).has_value());
+        const auto r = mgr.commit_password_change(mkreq(Kind::kSelf, "selfie", kNew, anchor));
+        REQUIRE(r.result == Result::kOk);
+        CHECK_FALSE(r.lockout_cleared);
+        CHECK(f.db->lockout_status("selfie")->failed_count == 2);
+        CHECK(f.audit_rows("auth.lockout.cleared", "selfie") == 0);
     }
 }
 
-TEST_CASE("reset_password / rollback never touch the lockout columns (#5342 Gate 7, C7)",
-          "[pg][auth][password][lockout]") {
-    // set_password writes hash/salt/updated_at ONLY: a lock armed before an
-    // admin reset is cleared by the route's audited admin-unlock step, not by
-    // the write — so an audit-failure rollback cannot have silently erased it.
-    yuzu::test::AuthDbPg db;
+TEST_CASE("commit_password_change: a provisional TOTP secret is wiped; an enrolled one is kept",
+          "[pg][auth][password][mfa]") {
+    // F1 (chaos R4 inverted) + F3.
+    CredInfra f;
     AuthManager mgr;
-    mgr.set_auth_db(db.get());
-    seed_local(*db, "lockie", kOld, Role::user);
-    for (int i = 0; i < 3; ++i)
-        REQUIRE(db->record_failed_login("lockie", 3, 3600).has_value());
-    const auto armed = db->lockout_status("lockie");
-    REQUIRE(armed.has_value());
-    REQUIRE(armed->locked);
+    f.wire(mgr);
 
-    const auto r = mgr.reset_password("lockie", kNew);
-    REQUIRE(r.outcome == PasswordWriteOutcome::kOk);
-    auto after_write = db->lockout_status("lockie");
-    REQUIRE(after_write.has_value());
-    CHECK(after_write->locked);
-    CHECK(after_write->failed_count == armed->failed_count);
-
-    REQUIRE(mgr.rollback_password_write("lockie", r));
-    auto after_rollback = db->lockout_status("lockie");
-    REQUIRE(after_rollback.has_value());
-    CHECK(after_rollback->locked);
-    CHECK(after_rollback->failed_count == armed->failed_count);
+    SECTION("admin reset wipes a provisional secret; the next enrolment gets a NEW one") {
+        seed_local(*f.db, "vic", kOld, Role::user);
+        auto s1 = f.db->mfa_init_enrollment("vic", "Yuzu");
+        REQUIRE(s1.has_value());
+        const auto r = mgr.commit_password_change(mkreq(Kind::kAdminReset, "vic", kNew));
+        REQUIRE(r.result == Result::kOk);
+        CHECK(r.provisional_mfa_cleared);
+        CHECK(f.audit_detail("user.password_reset", "vic").ends_with("provisional_mfa_cleared=true"));
+        auto st = f.db->mfa_status("vic");
+        REQUIRE(st.has_value());
+        CHECK_FALSE(st->enrolled);
+        auto s2 = f.db->mfa_init_enrollment("vic", "Yuzu");
+        REQUIRE(s2.has_value());
+        CHECK(s1->secret_base32 != s2->secret_base32);
+    }
+    SECTION("self change wipes a provisional secret too") {
+        seed_local(*f.db, "pia", kOld, Role::user);
+        auto s1 = f.db->mfa_init_enrollment("pia", "Yuzu");
+        REQUIRE(s1.has_value());
+        const auto r = mgr.commit_password_change(
+            mkreq(Kind::kSelf, "pia", kNew, anchor_of(mgr, "pia", kOld)));
+        REQUIRE(r.result == Result::kOk);
+        CHECK(r.provisional_mfa_cleared);
+        auto s2 = f.db->mfa_init_enrollment("pia", "Yuzu");
+        REQUIRE(s2.has_value());
+        CHECK(s1->secret_base32 != s2->secret_base32);
+    }
+    SECTION("an ENROLLED secret and its recovery codes survive a reset (F3)") {
+        seed_local(*f.db, "eno", kOld, Role::user);
+        auto init = f.db->mfa_init_enrollment("eno", "Yuzu");
+        REQUIRE(init.has_value());
+        auto codes = f.db->mfa_verify_enrollment("eno", code_for_now(init->secret_base32),
+                                                 std::nullopt);
+        REQUIRE(codes.has_value());
+        const auto before = f.db->mfa_status("eno");
+        REQUIRE(before.has_value());
+        REQUIRE(before->enrolled);
+        const auto r = mgr.commit_password_change(mkreq(Kind::kAdminReset, "eno", kNew));
+        REQUIRE(r.result == Result::kOk);
+        CHECK_FALSE(r.provisional_mfa_cleared);
+        const auto after = f.db->mfa_status("eno");
+        REQUIRE(after.has_value());
+        CHECK(after->enrolled);
+        CHECK(after->recovery_codes_remaining == before->recovery_codes_remaining);
+        // The enrolled secret still verifies a fresh code.
+        auto again = f.db->mfa_init_enrollment("eno", "Yuzu");
+        REQUIRE_FALSE(again.has_value());
+        CHECK(again.error() == yuzu::server::AuthDBError::MfaAlreadyEnrolled);
+    }
 }
 
-TEST_CASE("change_password / reset_password fail closed without AuthDB", "[auth][password]") {
+TEST_CASE("commit_password_change: a REAL audit statement fault rolls the whole change back",
+          "[pg][auth][password][audit]") {
+    // T1(ii) at the owner seam: the audit table is renamed in the throwaway
+    // database, so the in-transaction INSERT genuinely fails.
+    CredInfra f;
+    AuthManager mgr;
+    f.wire(mgr);
+    seed_local(*f.db, "ivy", kOld, Role::user);
+    const auto before = f.db->get_user("ivy")->hash_hex;
+    auto s = mgr.create_local_session("ivy", Role::user, false, anchor_of(mgr, "ivy", kOld));
+    REQUIRE_FALSE(s.empty());
+    f.exec("ALTER TABLE audit_store.audit_events RENAME TO audit_events_gone");
+
+    const auto r = mgr.commit_password_change(mkreq(Kind::kAdminReset, "ivy", kNew));
+    CHECK(r.result == Result::kAuditUnavailable);
+    CHECK(f.db->get_user("ivy")->hash_hex == before);
+    CHECK(mgr.validate_session(s).has_value());
+    CHECK(f.sessions_of("ivy") == 1);
+    CHECK(vrole(mgr, "ivy", kOld) == Role::user);
+    CHECK_FALSE(vrole(mgr, "ivy", kNew).has_value());
+    CHECK(f.audit.emit_failed_count() >= 1);
+}
+
+TEST_CASE("commit_password_change: audit-row presence <=> new-hash presence, on abort and commit "
+          "failure",
+          "[pg][auth][password][audit]") {
+    // T1(iv). The owner's evidence and its credential land together or not at
+    // all — whichever way the transaction ends.
+    CredInfra f;
+    AuthManager mgr;
+    f.wire(mgr);
+    seed_local(*f.db, "ada", kOld, Role::user);
+    const auto before = f.db->get_user("ada")->hash_hex;
+
+    SECTION("forced abort inside the transaction (pre-commit hook throws)") {
+        f.owner.set_pre_commit_hook_for_test([] { throw std::runtime_error("forced abort"); });
+        const auto r = mgr.commit_password_change(mkreq(Kind::kAdminReset, "ada", kNew));
+        f.owner.set_pre_commit_hook_for_test(nullptr);
+        CHECK(r.result == Result::kStoreUnavailable);
+        CHECK(f.db->get_user("ada")->hash_hex == before);
+        CHECK(f.audit_rows("user.password_reset", "ada") == 0);
+    }
+    SECTION("COMMIT itself fails (a deferred constraint trigger raises at commit)") {
+        f.exec("CREATE FUNCTION public.yuzu_test_fail_commit() RETURNS trigger LANGUAGE plpgsql AS "
+               "$$ BEGIN RAISE EXCEPTION 'forced commit failure'; END $$");
+        f.exec("CREATE CONSTRAINT TRIGGER yuzu_test_fail_commit AFTER INSERT ON "
+               "audit_store.audit_events DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE "
+               "FUNCTION public.yuzu_test_fail_commit()");
+        const auto r = mgr.commit_password_change(mkreq(Kind::kAdminReset, "ada", kNew));
+        CHECK(r.result == Result::kStoreUnavailable);
+        CHECK(f.db->get_user("ada")->hash_hex == before);
+        CHECK(f.audit_rows("user.password_reset", "ada") == 0);
+        CHECK(vrole(mgr, "ada", kOld) == Role::user);
+    }
+    SECTION("commit succeeds: both present") {
+        const auto r = mgr.commit_password_change(mkreq(Kind::kAdminReset, "ada", kNew));
+        REQUIRE(r.result == Result::kOk);
+        CHECK(f.db->get_user("ada")->hash_hex != before);
+        CHECK(f.audit_rows("user.password_reset", "ada") == 1);
+    }
+}
+
+TEST_CASE("commit_password_change fails closed without an owner or an audit store",
+          "[auth][password]") {
     AuthManager mgr; // cfg-file-only: no durable credential to change
-    CHECK(mgr.change_password("x", "deadbeef", kNew).outcome ==
-          PasswordWriteOutcome::kStoreUnavailable);
-    CHECK(mgr.reset_password("x", kNew).outcome == PasswordWriteOutcome::kStoreUnavailable);
-}
-
-TEST_CASE("rollback_password_write restores the previous credential, only if still ours",
-          "[pg][auth][password]") {
+    CHECK(mgr.commit_password_change(mkreq(Kind::kAdminReset, "x", kNew)).result ==
+          Result::kStoreUnavailable);
     yuzu::test::AuthDbPg db;
-    AuthManager mgr;
+    yuzu::server::CredentialChangeOwner no_audit{db.pool(), nullptr};
     mgr.set_auth_db(db.get());
-    seed_local(*db, "dora", kOld, Role::user);
-
-    const auto r = mgr.reset_password("dora", kNew);
-    REQUIRE(r.outcome == PasswordWriteOutcome::kOk);
-    REQUIRE(mgr.rollback_password_write("dora", r));
-    CHECK(vrole(mgr, "dora", kOld) == Role::user);
-    CHECK_FALSE(vrole(mgr, "dora", kNew).has_value());
-    // A second compensation finds the stored hash is no longer the one it
-    // wrote — refused, never clobbering.
-    CHECK_FALSE(mgr.rollback_password_write("dora", r));
-
-    // A write that LOST the race is never "rolled back" over the winner.
-    const auto mine = mgr.reset_password("dora", kNew);
-    REQUIRE(mine.outcome == PasswordWriteOutcome::kOk);
-    REQUIRE(mgr.reset_password("dora", "third-password-789").outcome == PasswordWriteOutcome::kOk);
-    CHECK_FALSE(mgr.rollback_password_write("dora", mine));
-    CHECK(vrole(mgr, "dora", "third-password-789") == Role::user);
+    mgr.set_credential_change_owner(&no_audit);
+    seed_local(*db, "y", kOld, Role::user);
+    const auto before = db->get_user("y")->hash_hex;
+    CHECK(mgr.commit_password_change(mkreq(Kind::kAdminReset, "y", kNew)).result ==
+          Result::kAuditUnavailable);
+    CHECK(db->get_user("y")->hash_hex == before);
 }
 
-// ── The credential anchor at session mint (#5342 Gate 7, B4) ───────────────
+// ── The credential anchor at session mint (#5342 Gate 7 B4 + Gate 8 M1) ────
 
 TEST_CASE("create_local_session denies a mint whose verified hash is no longer stored",
           "[pg][auth][password]") {
-    yuzu::test::AuthDbPg db;
+    CredInfra f;
     AuthManager mgr;
-    mgr.set_auth_db(db.get());
-    seed_local(*db, "mira", kOld, Role::user);
+    f.wire(mgr);
+    seed_local(*f.db, "mira", kOld, Role::user);
     const auto anchor = anchor_of(mgr, "mira", kOld);
 
     // The anchor is current: the mint lands.
@@ -404,10 +538,12 @@ TEST_CASE("create_local_session denies a mint whose verified hash is no longer s
     CHECK(mgr.create_local_session("mira", Role::user, false, "").empty());
 
     // A reset after the verify: the OLD anchor can no longer mint, and the
-    // denied mint leaves no live session behind (revoke-and-deny).
-    REQUIRE(mgr.reset_password("mira", kNew).outcome == PasswordWriteOutcome::kOk);
+    // denied mint leaves no live session behind.
+    REQUIRE(mgr.commit_password_change(mkreq(Kind::kAdminReset, "mira", kNew)).result ==
+            Result::kOk);
     CHECK(mgr.create_local_session("mira", Role::user, false, anchor).empty());
-    CHECK_FALSE(mgr.validate_session(ok).has_value()); // swept by the deny's revoke
+    CHECK_FALSE(mgr.validate_session(ok).has_value());
+    CHECK(f.sessions_of("mira") == 0);
 }
 
 TEST_CASE("authenticate: a reset committing between the recheck and the mint revokes the session",
@@ -416,24 +552,60 @@ TEST_CASE("authenticate: a reset committing between the recheck and the mint rev
     // row-locked recheck released and before the session is persisted — the
     // check-then-mint window. A reset landing there must not leave a session
     // proven with the OLD password alive.
-    yuzu::test::AuthDbPg db;
+    CredInfra f;
     AuthManager mgr;
-    mgr.set_auth_db(db.get());
-    seed_local(*db, "rhea", kOld, Role::user);
+    f.wire(mgr);
+    seed_local(*f.db, "rhea", kOld, Role::user);
     bool fired = false;
     mgr.set_post_mint_race_hook_for_test([&] {
         if (fired)
             return;
         fired = true;
         AuthManager other; // a second replica's admin reset
-        other.set_auth_db(db.get());
-        REQUIRE(other.reset_password("rhea", kNew).outcome == PasswordWriteOutcome::kOk);
+        f.wire(other);
+        REQUIRE(other.commit_password_change(mkreq(Kind::kAdminReset, "rhea", kNew)).result ==
+                Result::kOk);
     });
     auto token = mgr.authenticate("rhea", kOld);
     mgr.set_post_mint_race_hook_for_test(nullptr);
     CHECK(fired);
     CHECK_FALSE(token.has_value());
+    CHECK(f.sessions_of("rhea") == 0);
     CHECK(vrole(mgr, "rhea", kNew) == Role::user);
+}
+
+TEST_CASE("post-mint recheck WAITS on an uncommitted credential write and then denies (M1)",
+          "[pg][auth][password]") {
+    // #5342 Gate 8 M1, deterministic: transaction A has executed its credential
+    // UPDATE (holding the auth.users row lock) but not committed. A mint for
+    // the OLD credential, started after A's UPDATE returned, must not be
+    // admitted by reading the old hash past A's uncommitted write: its post-
+    // mint re-read is row-locked, so it waits for A's COMMIT and then sees the
+    // new hash. (A plain read here was the Gate 8 R1 defect: the mint survived
+    // because A's session DELETE had already run before it existed.)
+    CredInfra f;
+    AuthManager mgr;
+    f.wire(mgr);
+    seed_local(*f.db, "mona", kOld, Role::user);
+    const auto anchor = anchor_of(mgr, "mona", kOld);
+
+    yuzu::server::pg::PgConn a{PQconnectdb(f.db.dsn().c_str())};
+    REQUIRE(PQstatus(a.get()) == CONNECTION_OK);
+    f.exec_on(a.get(), "BEGIN");
+    f.exec_on(a.get(), "UPDATE auth.users SET password_hash = 'deadbeef', salt_hex = 'abcd' "
+                       "WHERE username = 'mona'");
+    f.exec_on(a.get(), "DELETE FROM session_store.sessions WHERE username = 'mona'");
+
+    std::string token = "unset";
+    std::thread b([&] { token = mgr.create_local_session("mona", Role::user, false, anchor); });
+    // Give B ample time to persist its session and reach the row-locked
+    // re-read (where it blocks). At HEAD's plain read it would already have
+    // returned a live token by now.
+    std::this_thread::sleep_for(std::chrono::milliseconds(600));
+    f.exec_on(a.get(), "COMMIT");
+    b.join();
+    CHECK(token.empty());
+    CHECK(f.sessions_of("mona") == 0);
 }
 
 // ── #5274 acceptance ───────────────────────────────────────────────────────
@@ -443,7 +615,8 @@ TEST_CASE("#5274: a restart that re-seeds the OLD cfg hash does not shadow the c
     yuzu::test::TempDir dir{"yuzu_test_pwcfg_"};
     fs::create_directories(dir.path);
     const auto cfg = dir.path / "yuzu-server.cfg";
-    yuzu::test::AuthDbPg db;
+    CredInfra f;
+    auto& db = f.db;
 
     // The installer/first-run shape: the account lives in yuzu-server.cfg AND
     // in AuthDB with the same (old) password.
@@ -460,9 +633,10 @@ TEST_CASE("#5274: a restart that re-seeds the OLD cfg hash does not shadow the c
     {
         AuthManager boot1;
         REQUIRE(boot1.load_config(cfg));
-        boot1.set_auth_db(db.get());
-        REQUIRE(boot1.change_password("alice", anchor_of(boot1, "alice", kOld), kNew).outcome ==
-                PasswordWriteOutcome::kOk);
+        f.wire(boot1);
+        REQUIRE(boot1.commit_password_change(
+                         mkreq(Kind::kSelf, "alice", kNew, anchor_of(boot1, "alice", kOld)))
+                    .result == Result::kOk);
     }
 
     // Boot 2 (the restart): the cfg file still carries the OLD hash and is
@@ -528,19 +702,21 @@ TEST_CASE("#5274: the boot check names and counts cfg users whose stored credent
 
 TEST_CASE("#5274: a second replica's warm cache does not keep accepting the old password",
           "[pg][auth][password][5274]") {
-    yuzu::test::AuthDbPg db;
-    seed_local(*db, "erin", kOld, Role::user);
+    CredInfra f;
+    seed_local(*f.db, "erin", kOld, Role::user);
 
     AuthManager replica_a;
-    replica_a.set_auth_db(db.get());
+    f.wire(replica_a);
     AuthManager replica_b;
-    replica_b.set_auth_db(db.get());
+    f.wire(replica_b);
     // Warm BOTH caches with the old credential.
     REQUIRE(replica_a.authenticate("erin", kOld).has_value());
     REQUIRE(replica_b.authenticate("erin", kOld).has_value());
 
-    REQUIRE(replica_a.change_password("erin", anchor_of(replica_a, "erin", kOld), kNew).outcome ==
-            PasswordWriteOutcome::kOk);
+    REQUIRE(replica_a
+                .commit_password_change(
+                    mkreq(Kind::kSelf, "erin", kNew, anchor_of(replica_a, "erin", kOld)))
+                .result == Result::kOk);
 
     CHECK_FALSE(replica_b.authenticate("erin", kOld).has_value());
     CHECK_FALSE(vrole(replica_b, "erin", kOld).has_value());
@@ -558,8 +734,10 @@ TEST_CASE("#5274: a password change committing mid-verification is kCredentialCh
     mgr.set_metrics_registry(&metrics);
     // Fires after the DB-first read + PBKDF2 matched the OLD hash and before
     // the row-locked recheck: the moment a concurrent change commits. (Not
-    // inside the row lock — a synchronous set_password there would
-    // self-deadlock; see set_role_recheck_race_hook_for_test's doc.)
+    // inside the row lock — a synchronous write there would self-deadlock;
+    // see set_role_recheck_race_hook_for_test's doc.) The concurrent writer is
+    // a plain UPDATE on its own connection, standing in for the credential
+    // change's committed write.
     auto salt = AuthManager::random_bytes(16);
     const auto new_hash = AuthManager::pbkdf2_sha256(kNew, salt, AuthManager::kPbkdf2Iterations);
     const auto new_salt = AuthManager::bytes_to_hex(salt);
@@ -568,7 +746,13 @@ TEST_CASE("#5274: a password change committing mid-verification is kCredentialCh
         if (fired)
             return;
         fired = true;
-        REQUIRE(db->set_password("fay", new_hash, new_salt).has_value());
+        yuzu::server::pg::PgConn c{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(c.get()) == CONNECTION_OK);
+        yuzu::server::pg::PgResult u{PQexec(
+            c.get(), ("UPDATE auth.users SET password_hash = '" + new_hash + "', salt_hex = '" +
+                      new_salt + "' WHERE username = 'fay'")
+                         .c_str())};
+        REQUIRE(u.ok());
     });
 
     auto raced = mgr.verify_password("fay", kOld); // verified against a dead hash

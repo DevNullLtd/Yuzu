@@ -160,7 +160,7 @@ struct HardenedHarness {
         REQUIRE(bytes.has_value());
         std::string raw(reinterpret_cast<const char*>(bytes->data()), bytes->size());
         auto code = mfa::generate(raw, mfa::current_counter(std::chrono::system_clock::now()));
-        REQUIRE(auth_db->mfa_verify_enrollment(name, code).has_value());
+        REQUIRE(auth_db->mfa_verify_enrollment(name, code, std::nullopt).has_value());
     }
 
     void arm(const std::string& name, int window_secs = 3600) {

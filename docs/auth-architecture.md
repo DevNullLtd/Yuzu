@@ -215,41 +215,88 @@ wire contract: `docs/user-manual/rest-api.md` "Users".
 - `POST /api/v1/users/{name}/password` `{new_password}` — administrative reset
   (the canonical durable-Administrator gate + MFA step-up — see "Route gates").
 
-**One write primitive.** `AuthDB::set_password` is the only writer of
-`password_hash` on an existing row (`upsert_user` is INSERT-only — `ON CONFLICT
-DO NOTHING`). It is a single guarded `UPDATE ... RETURNING` whose `WHERE` clause
-is the local-account gate (`is_active AND identity_source='local' AND
-provisioning_source='local'`). It writes `password_hash`, `salt_hex` and
-`updated_at` ONLY — never the lockout columns (clearing a lock is an audited
-admin act; see "Sessions and lockout") — and takes one optional guard, a
-compile-time SQL variant (no interpolation): a **compare-and-swap** on the
-expected current hash. There is **no role predicate**: who may reset whom is
-decided once, at the route, by `is_rbac_administrator` (#5342 Gate 7). Zero
-rows is `UserNotFound` with no oracle at the store; the `AuthManager` caller
-re-reads to answer 404 / 409 honestly.
+**One writer, one transaction.** `CredentialChangeOwner`
+(`credential_change_owner.{hpp,cpp}`, #5342 Gate 8) is the only writer of
+`password_hash` on an existing row — `AuthDB` has no credential-write method
+(`upsert_user` is INSERT-only — `ON CONFLICT DO NOTHING`; the first-boot seed
+paths only INSERT a new row). It is an ADR-0012 §3 query owner (see that ADR's
+2026-10-04 Update): one pool lease, one `with_txn_for`, schema-qualified SQL
+across `auth`, `session_store` and `audit_store`. Both routes reach it through
+`AuthManager::commit_password_change`, which on success refreshes only this
+process's caches (`users_` hash/salt, `sessions_`).
 
-**AuthManager.** `change_password` / `reset_password` return a typed
-`PasswordWriteOutcome` (never the legacy "any false = weak password" bool). Both
-read the account **from the AuthDB** (never `users_`) and classify non-local
-accounts. `change_password(username, verified_hash, new)` takes the stored hash
-the caller's lockout-accounted `verify_password` just verified the current
-password against (`VerifiedCredential::hash_hex`) and writes CAS-anchored on it
-— no second PBKDF2; anything committed in between (an admin reset) wins →
-`kConflict`. `reset_password(username, new)` is a plain guarded write (no CAS,
-no target-role classification). `verify_password` itself returns
-`std::expected<VerifiedCredential, VerifyFailure>`: `kBadCredential` /
-`kUnknownUser` are credential verdicts; `kStoreUnavailable` (an AuthDB read
-failed) and `kCredentialChanged` (the hash moved under the row lock) are
-**transient** — `/login` answers them `503` + `Retry-After` with no lockout
-strike and no `auth.login_failed` row, the self route `503 verify_transient`.
+**The invariant.** A local account's credential, its session set, its
+provisional MFA state, its lockout state (admin reset) and the audit evidence
+for the change commit or abort TOGETHER, in one transaction holding the
+`auth.users` row lock first — and every session mint re-reads that row under
+the same lock after persisting (below). Nothing proven under a retired
+credential is honoured, and no compensating write exists.
 
-**The credential anchor at session mint.** `create_local_session(username,
-role, mfa_verified, expected_hash_hex)` takes the verified hash (no default;
-the MFA pending entry carries it across the TOTP round trip), and its post-mint
-recheck revokes-and-denies when the stored hash is no longer that one — so a
-pending login proven with the OLD password cannot be completed after a reset
-or a change, and a reset landing between `authenticate()`'s recheck and its
-mint revokes the session just minted. An empty anchor denies.
+The transaction, in order: `set_config('lock_timeout', …, true)` (every lock
+wait bounded, txn-scoped); `SELECT … FROM auth.users WHERE username=$1 AND
+is_active FOR UPDATE` — classification **under the lock**: no row → `404`;
+non-local identity or provisioning source → `409 not_local`; the self route's
+verified hash (`VerifiedCredential::hash_hex`, from the lockout-accounted
+`verify_password` — no second PBKDF2) no longer the stored one → `409
+conflict`. Then one guarded `UPDATE auth.users` (new hash/salt, `updated_at`,
+the provisional TOTP secret wiped, and — admin reset only — the lockout
+columns cleared); `DELETE FROM session_store.sessions WHERE username=$1` + the
+`session_meta` write-generation bump (`session_store_sql_helpers.hpp`, the ONE
+copy, shared with `SessionStore::invalidate_user`); and the success audit
+row(s) via `AuditStore::log_in_txn` — `user.password_change` /
+`user.password_reset` (detail `sessions_revoked=N provisional_mfa_cleared=…`)
+and, for an admin reset of an account that had a lockout (`locked_until` set or
+a non-zero failure count), `auth.lockout.cleared` (detail `password_reset`). An
+audit INSERT failure aborts everything → `503 audit_unavailable` +
+`Sec-Audit-Failed`; any other failure (lease, lock timeout, statement, COMMIT)
+→ `503 store_unavailable`. A refusal changes NOTHING — the caller's session,
+the target's sessions and the lockout are exactly as they were. The `503`
+bodies say what is true: nothing was changed unless the server lost contact
+with the database at commit; a successful sign-in with the new password
+confirms the change, which is audited either way (the audit row is in the same
+commit).
+
+**Lock order** (documented in the owner header; a change inverting it can
+deadlock): the `auth.users` row → `session_store.sessions` rows → the
+`session_store.session_meta` `write_generation` row → `audit_store.audit_events`
+(INSERT). Nothing holds `session_meta` and then waits on `auth.users`: no
+`session_store` transaction touches another schema, and the post-mint re-read
+takes `auth.users` only after its session INSERT committed.
+`RbacAdminAuthorityOwner` takes `principal_roles` → `auth.users` and never a
+session/audit lock. The owner requires AuthDB, SessionStore and AuditStore on
+ONE pool/database (ADR-0006; server.cpp builds all three on `*pg_pool_`); a
+split fails every statement closed, never a partial write.
+
+**The locking post-mint read.** `create_local_session(username, role,
+mfa_verified, expected_hash_hex)` takes the verified hash (no default; the MFA
+pending entry carries it across the TOTP round trip). After the session is
+persisted, `post_mint_role_recheck` re-reads the row with
+`AuthDB::recheck_role_locked` (`SELECT … FOR UPDATE`, bounded `lock_timeout`)
+and revokes-and-denies when the role or the stored hash diverged. Because the
+read is LOCKING, a credential change whose UPDATE has executed but not yet
+committed makes the mint wait for that commit and then see the new hash; a
+change that has not yet taken the lock will DELETE the (already committed)
+session row; one that committed earlier is simply seen. A plain read here
+would see the old hash past an uncommitted UPDATE whose session DELETE had
+already run — the Gate 8 defect this closes. An empty anchor denies.
+
+**MFA.** The transaction wipes a provisional (never-enrolled) TOTP secret on
+both routes, so an enrolment begun under the retired credential cannot be
+finished and the account's next enrolment gets a fresh secret (F1). The
+login-enforcement bootstrap (`POST /login/mfa/enroll`) additionally binds its
+guarded enrolment UPDATE to the pending login's verified hash
+(`mfa_verify_enrollment(…, expected_password_hash_hex)`): a changed credential
+is `AuthDBError::CredentialChanged` → the generic `401`, audited
+`mfa.enroll.failed` detail `credential_changed`, the pending token spent (F2).
+An ENROLLED second factor and its recovery codes are not touched by a change or
+reset (F3); clearing one is `yuzu-server --mfa-reset` (an optional admin-reset
+flag is a follow-up).
+
+**Accepted residual (R11).** The admin route's durable-Administrator gate runs
+before the transaction; an Administrator grant revoked in the PBKDF2 window
+between the gate and the commit lets that one in-flight reset complete under
+the revoked authority (the next request is refused) — the same lock-free regime
+check the A2/A1 handlers accept.
 
 **Route gates** (`rest_api_v1.cpp` `register_password_routes`): interactive
 cookie sessions only — any MCP tier, service-scoped token, engine principal or
@@ -274,8 +321,9 @@ break-glass account (`403 break_glass_target`) so a compromised IdP cannot
 invalidate the sealed escape hatch — both before step-up. The body is parsed
 with a non-throwing, type-guarded parse and never echoed; body/policy `400`s
 are not audited; passwords, hashes and lengths never reach a log or audit row.
-Every audit row both routes write names the principal captured before any
-revoke (`AuthRoutes::audit_log_for_principal`). (The session-revoke routes
+Every audit row both routes write names the principal captured at the start of
+the request (refusals via `AuthRoutes::audit_log_for_principal`; the
+in-transaction success rows from `make_audit_event_for_principal`'s template). (The session-revoke routes
 `DELETE /api/v1/sessions/me` and `DELETE /api/v1/sessions?username=` still
 write their row after revoking the caller's own session, with an empty
 principal — #5358.)
@@ -299,32 +347,13 @@ successful login does (`auth.lockout.cleared`, detail
 write is then refused. Response timing can still tell a locked account from a
 wrong password, on `/login` and here alike (#5364).
 
-**Sequence — revoke first, then write, then audit.** Both routes revoke every
-session of the account (`invalidate_user_sessions` — durable delete +
-write-generation bump; on the self route this includes the caller's own)
-BEFORE the credential changes; a revoke that did not persist durably is
-`503 session_revoke_failed` and nothing is written. A write refused after the
-revoke says "sessions were revoked; password unchanged". The success row
-(`user.password_change` / `user.password_reset`, detail `sessions_revoked=N`)
-is written after the write; if it cannot be persisted, `rollback_password_write`
-restores the previous hash/salt guarded `WHERE password_hash = <the hash just
-written>` (restores only if nobody wrote since) → `500` + `Sec-Audit-Failed`.
-If the rollback also fails → `500` + `Sec-Audit-Failed` + `spdlog::critical` +
-`yuzu_auth_password_change_unrecorded_total{kind}` (alert
-`YuzuPasswordChangeUnrecorded`), with the state (new password in effect,
-unrecorded, sessions revoked) disclosed in the body. The rollback is itself a
-`set_password` call, which refuses an empty hash or salt, so an account
-hand-seeded with an empty credential cannot be rolled back and lands in the
-unrecorded branch (#5362). A same-transaction audit+mutation API on
-`AuditStore` would remove the compensating write altogether (#5360).
-
-**Sessions and lockout.** The self route issues **no** replacement session: it
-answers with a clearing `Set-Cookie` (`Max-Age=0`) and `session_reissued:false`
-— the user signs in again with the new password. The admin reset, once the
-reset is recorded, clears the target's lockout through the admin-unlock
-primitive (`lockout_clear_fn` + an `auth.lockout.cleared` row, detail
-`password_reset`); a failure is reported (`lockout_cleared:false` + remediation),
-never fatal. It reports `api_tokens_active`
+**Sessions and lockout.** The self route issues **no** replacement session: on
+success it answers with a clearing `Set-Cookie` (`Max-Age=0`) and
+`session_reissued:false` — the user signs in again with the new password (a
+refusal never clears the cookie: nothing changed). The admin reset clears the
+target's lockout inside the same transaction; `lockout_cleared` is `true` only
+when a lockout existed and was cleared (then an `auth.lockout.cleared` row is in
+the same commit). It reports `api_tokens_active`
 (`ApiTokenStore::list_active_for_principal_checked`; `null` +
 `api_tokens_unknown` when the read fails) — tokens are deliberately not
 auto-revoked.

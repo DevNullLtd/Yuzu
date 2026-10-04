@@ -15,17 +15,29 @@
  * JOINs across) for the canonical durable-Administrator gate. Only auth_fn and
  * step_up_fn are harness-controlled, so each gate can be driven directly.
  *
+ * #5342 Gate 8 (the class fix): the credential, the account's sessions, its
+ * provisional MFA secret, its lockout (admin) and the success audit row(s)
+ * commit or abort TOGETHER in one transaction (`CredentialChangeOwner`), so
+ * the harness wires a REAL SessionStore + AuditStore + owner on the AuthDB's
+ * own pool (the production one-pool shape). Audit-failure cases inject REAL
+ * statement faults inside the throwaway database (a renamed table, or a
+ * trigger that raises for one principal) — never a fake writer returning
+ * false. Concurrency cases (the chaos R5/R5b/M2 repros, inverted) race real
+ * requests through the owner's pre-commit hook.
+ *
  * Audit `detail` tokens are asserted EXACTLY — they are the SOC 2 CC6.3
- * evidence vocabulary a SIEM rule keys on. Every audit row is captured WITH
- * its principal: the routes revoke the caller's sessions before they write,
- * so a session-resolving audit writer would stamp an empty principal; the
- * harness's legacy `audit_fn` records an EMPTY principal on purpose, so any
- * row written through it fails `check_every_row_names()`. No assertion here
- * (or anywhere in the routes) may see a password, its length, or the request
- * body: the "never echoed" cases check the response and every audit row.
+ * evidence vocabulary a SIEM rule keys on. REFUSAL rows go through the
+ * principal-explicit writer (captured here WITH their principal); SUCCESS
+ * rows are read back from the real audit_store. The harness's legacy
+ * `audit_fn` records an EMPTY principal on purpose, so any row written
+ * through it fails `check_every_row_names()`. No assertion here (or anywhere
+ * in the routes) may see a password, its length, or the request body: the
+ * "never echoed" cases check the response and every audit row.
  */
 
+#include "audit_store.hpp"
 #include "auth_routes.hpp"
+#include "credential_change_owner.hpp"
 #include "rest_api_v1.hpp"
 #include "session_store.hpp"
 #include "test_api_token_pg_helper.hpp"
@@ -33,6 +45,7 @@
 #include "test_rbac_admin_surface_harness.hpp" // RbacStoreOnAuthPool
 #include "test_route_sink.hpp"
 #include "web_utils.hpp"
+#include "../../../server/core/src/totp.hpp"
 
 #include <yuzu/metrics.hpp>
 #include <yuzu/server/auth.hpp>
@@ -42,12 +55,15 @@
 #include <catch2/catch_test_macros.hpp>
 #include <nlohmann/json.hpp>
 
+#include <atomic>
 #include <chrono>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <shared_mutex>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -69,7 +85,11 @@ struct PasswordRoutesHarness {
     yuzu::MetricsRegistry metrics;
     yuzu::test::AuthDbPg db;
     RbacStoreOnAuthPool rbac{db.pool()}; // after db: borrows its pool
-    std::optional<SessionStore> sessions; // enable_session_store()
+    // The production one-pool shape the credential-change transaction needs:
+    // durable sessions, the audit store and the owner, all on the AuthDB's pool.
+    SessionStore sessions{db.pool()};
+    AuditStore audit_store{db.pool()};
+    CredentialChangeOwner owner{db.pool(), &audit_store};
     AuthManager auth_mgr;
     std::shared_mutex oidc_mu;
     std::unique_ptr<oidc::OidcProvider> oidc_provider; // empty
@@ -89,16 +109,16 @@ struct PasswordRoutesHarness {
     bool step_up_pass{true};
     int step_up_calls{0};
 
-    // Audit capture + fault injection: `audit_fail_match(action, result)`
-    // makes the FIRST matching row report a persist failure (and run
-    // `on_audit_fail` first, so a test can race the rollback).
+    // REFUSAL rows (the principal-explicit writer). Guarded: the concurrency
+    // cases write refusal rows from a second request thread.
+    std::mutex audits_mu;
     std::vector<AuditRow> audits;
-    std::optional<std::pair<std::string, std::string>> audit_fail_match;
-    bool audit_fail_all_after_first{false};
-    std::function<void()> on_audit_fail;
-    bool audit_failing{false};
 
-    bool lockout_clear_ok{true};
+    // Fired by the wrapped verify_current_fn AFTER the real lockout-accounted
+    // check returns — i.e. between the self route's step 9 and its
+    // transaction (the PBKDF2 window), where a concurrent writer can land.
+    std::function<void()> after_verify;
+
     ApiTokenStore* token_store{nullptr};
     std::vector<std::string> trusted_origins;
     bool wire_deps{true};
@@ -110,7 +130,11 @@ struct PasswordRoutesHarness {
         cfg.auth_lockout_threshold = lockout_threshold;
         cfg.auth_lockout_window_secs = 3600;
         cfg.https_enabled = false;
+        REQUIRE(sessions.is_open());
+        REQUIRE(audit_store.is_open());
         auth_mgr.set_auth_db(db.get());
+        auth_mgr.set_session_store(&sessions);
+        auth_mgr.set_credential_change_owner(&owner);
         auth_mgr.set_metrics_registry(&metrics);
         auth_routes = std::make_unique<AuthRoutes>(cfg, auth_mgr, /*rbac_store=*/nullptr,
                                                    /*api_token_store=*/nullptr,
@@ -121,29 +145,36 @@ struct PasswordRoutesHarness {
                                                    oidc_provider);
     }
 
-    /// Durable sessions on the same database (so a revoke can be made to
-    /// fail by dropping the session schema).
-    void enable_session_store() {
-        sessions.emplace(db.pool());
-        REQUIRE(sessions->is_open());
-        auth_mgr.set_session_store(&*sessions);
-    }
-
     /// Register the routes. Separate from the ctor so a test can adjust the
     /// wiring knobs (token_store, trusted_origins, wire_deps, cfg) first.
     void wire() {
         if (wire_deps) {
             // The production wiring (server.cpp): the principal-explicit audit
             // writer, here capturing every row with its principal.
+            auto real_verify = auth_routes->password_change_verify_fn();
             api.set_password_change_deps(RestApiV1::PasswordChangeDeps{
-                &auth_mgr, auth_routes->password_change_verify_fn(),
+                &auth_mgr,
+                [this, real_verify](const std::string& user, const std::string& pw,
+                                    const httplib::Request& req) {
+                    auto r = real_verify(user, pw, req);
+                    if (after_verify)
+                        after_verify();
+                    return r;
+                },
                 [this](const httplib::Request&, const std::string& action,
                        const std::string& result, const std::string& principal,
                        const std::string&, const std::string& target_type,
                        const std::string& target_id, const std::string& detail) {
                     return record(action, result, principal, target_type, target_id, detail);
                 },
-                cfg.break_glass_user});
+                cfg.break_glass_user,
+                // The production builder (server.cpp wires the same method).
+                [this](const httplib::Request& req, const std::string& principal,
+                       const std::string& principal_role, const std::string& target_type,
+                       const std::string& target_id) {
+                    return auth_routes->make_audit_event_for_principal(
+                        req, {}, {}, principal, principal_role, target_type, target_id);
+                }});
         }
         api.set_csrf_trusted_origins(trusted_origins);
 
@@ -198,7 +229,7 @@ struct PasswordRoutesHarness {
             return false;
         };
         RestApiV1::LockoutClearFn lockout_clear_fn = [this](const std::string& user) {
-            return lockout_clear_ok && db->clear_failed_logins(user).has_value();
+            return db->clear_failed_logins(user).has_value();
         };
 
         api.register_routes(sink, auth_fn, perm_fn, audit_fn, rbac.get(), /*mgmt_store=*/nullptr,
@@ -223,18 +254,64 @@ struct PasswordRoutesHarness {
     bool record(const std::string& action, const std::string& result, const std::string& principal,
                 const std::string& target_type, const std::string& target_id,
                 const std::string& detail) {
+        std::lock_guard lk(audits_mu);
         audits.push_back({action, result, principal, target_type, target_id, detail});
-        if (audit_failing && audit_fail_all_after_first)
-            return false;
-        if (audit_fail_match && audit_fail_match->first == action &&
-            audit_fail_match->second == result) {
-            audit_fail_match.reset();
-            audit_failing = true;
-            if (on_audit_fail)
-                on_audit_fail();
-            return false;
-        }
         return true;
+    }
+
+    /// The SUCCESS rows the owner committed to the real audit_store.
+    std::vector<AuditRow> store_rows() {
+        auto rows = audit_store.query(AuditQuery{.limit = 1000});
+        REQUIRE(rows.has_value());
+        std::vector<AuditRow> out;
+        for (const auto& r : *rows)
+            out.push_back({r.action, r.result, r.principal, r.target_type, r.target_id, r.detail});
+        return out;
+    }
+
+    /// Committed audit rows for one action + target (the real store).
+    int committed(const std::string& action, const std::string& target) {
+        int n = 0;
+        for (const auto& r : store_rows())
+            n += (r.action == action && r.target_id == target) ? 1 : 0;
+        return n;
+    }
+
+    /// Run `sql` against the throwaway database.
+    void exec(const std::string& sql) {
+        yuzu::server::pg::PgConn conn{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        yuzu::server::pg::PgResult r{PQexec(conn.get(), sql.c_str())};
+        INFO(sql << " -> " << PQresultErrorMessage(r.get()));
+        REQUIRE(r.ok());
+    }
+
+    /// REAL statement fault: every audit INSERT fails (42P01) until restored.
+    void break_audit_table() {
+        exec("ALTER TABLE audit_store.audit_events RENAME TO audit_events_gone");
+    }
+    void restore_audit_table() {
+        exec("ALTER TABLE audit_store.audit_events_gone RENAME TO audit_events");
+    }
+    /// REAL statement fault for ONE principal: a BEFORE INSERT trigger raises
+    /// for that principal's audit rows only (another admin's still commit).
+    void fault_audit_for(const std::string& principal) {
+        exec("CREATE FUNCTION public.yuzu_test_audit_fault() RETURNS trigger LANGUAGE plpgsql AS "
+             "$$ BEGIN IF NEW.principal = '" + principal +
+             "' THEN RAISE EXCEPTION 'injected audit fault'; END IF; RETURN NEW; END $$");
+        exec("CREATE TRIGGER yuzu_test_audit_fault BEFORE INSERT ON audit_store.audit_events "
+             "FOR EACH ROW EXECUTE FUNCTION public.yuzu_test_audit_fault()");
+    }
+
+    int sessions_of(const std::string& user) {
+        yuzu::server::pg::PgConn conn{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        yuzu::server::pg::PgResult r{PQexec(
+            conn.get(),
+            ("SELECT count(*) FROM session_store.sessions WHERE username = '" + user + "'")
+                .c_str())};
+        REQUIRE(r.ok());
+        return std::stoi(PQgetvalue(r.get(), 0, 0));
     }
 
     void seed(const std::string& user, const std::string& pw, Role role) {
@@ -288,20 +365,40 @@ struct PasswordRoutesHarness {
         return post("/api/v1/users/" + target + "/password", {{"new_password", next}});
     }
 
+    std::unique_ptr<httplib::Response> reset_with_cookie(const std::string& token,
+                                                         const std::string& target,
+                                                         const std::string& next) {
+        auto h = browser_headers();
+        h["Cookie"] = "yuzu_session=" + token;
+        return post("/api/v1/users/" + target + "/password", {{"new_password", next}}, h);
+    }
+
+    /// Refusal rows (principal-explicit writer) AND committed success rows.
+    std::vector<AuditRow> all_rows() {
+        std::vector<AuditRow> out;
+        {
+            std::lock_guard lk(audits_mu);
+            out = audits;
+        }
+        for (auto& r : store_rows())
+            out.push_back(std::move(r));
+        return out;
+    }
+
     bool has_audit(const std::string& action, const std::string& result,
-                   const std::string& detail_prefix = {}) const {
-        for (const auto& a : audits)
+                   const std::string& detail_prefix = {}) {
+        for (const auto& a : all_rows())
             if (a.action == action && a.result == result && a.target_type == "User" &&
                 a.detail.starts_with(detail_prefix))
                 return true;
         return false;
     }
 
-    /// C5: every row these routes wrote names `principal` (never empty —
-    /// even the rows written AFTER the caller's own sessions were revoked).
-    void check_every_row_names(const std::string& principal) const {
-        REQUIRE_FALSE(audits.empty());
-        for (const auto& a : audits) {
+    /// C5: every row these routes wrote names `principal` (never empty).
+    void check_every_row_names(const std::string& principal) {
+        const auto rows = all_rows();
+        REQUIRE_FALSE(rows.empty());
+        for (const auto& a : rows) {
             INFO("action=" << a.action << " result=" << a.result << " detail=" << a.detail);
             CHECK(a.principal == principal);
         }
@@ -336,9 +433,9 @@ struct PasswordRoutesHarness {
     }
 
     /// No response body or audit row may carry the submitted secret.
-    void check_never_echoed(const httplib::Response& res, const std::string& secret) const {
+    void check_never_echoed(const httplib::Response& res, const std::string& secret) {
         CHECK(res.body.find(secret) == std::string::npos);
-        for (const auto& a : audits)
+        for (const auto& a : all_rows())
             CHECK(a.detail.find(secret) == std::string::npos);
     }
 };
@@ -357,6 +454,15 @@ std::string error_message_of(const httplib::Response& res) {
 }
 
 constexpr const char* kClearCookie = "yuzu_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0";
+
+/// A TOTP code for the current step (+offset) from a base32 secret.
+std::string totp_now(const std::string& secret_b32, int offset = 0) {
+    auto bytes = yuzu::server::mfa::base32_decode(secret_b32);
+    REQUIRE(bytes.has_value());
+    std::string raw(reinterpret_cast<const char*>(bytes->data()), bytes->size());
+    return yuzu::server::mfa::generate(
+        raw, yuzu::server::mfa::current_counter(std::chrono::system_clock::now()) + offset);
+}
 
 /// Drop the durable session schema so the next SessionStore op fails (the
 /// test_auth_session_store.cpp fault-inject).
@@ -400,6 +506,7 @@ TEST_CASE("password routes: self change revokes EVERY session incl. the caller's
     CHECK(d["password_changed"] == true);
     CHECK(d["session_reissued"] == false);
     CHECK(d["audit_emitted"] == true);
+    CHECK(d["provisional_mfa_cleared"] == false);
     CHECK(d["sessions_revoked"].get<int64_t>() >= 2);
     CHECK_FALSE(d.contains("sessions_db_persisted"));
     CHECK(res->get_header_value("Set-Cookie") == kClearCookie);
@@ -652,7 +759,8 @@ TEST_CASE("password routes: a store fault or mid-verify credential change is a 5
             if (fired)
                 return;
             fired = true;
-            REQUIRE(h.db->set_password("tess", racer, racer_salt).has_value());
+            h.exec("UPDATE auth.users SET password_hash = '" + racer + "', salt_hex = '" +
+                   racer_salt + "' WHERE username = 'tess'");
         });
         auto res = h.change(kOld, kNew);
         h.auth_mgr.set_role_recheck_race_hook_for_test(nullptr);
@@ -702,75 +810,55 @@ TEST_CASE("password routes: unwired deps answer 503, never a partial write",
     CHECK(reset->status == 503);
 }
 
-TEST_CASE("password routes: audit failure rolls the self change back (fail-closed)",
+TEST_CASE("password routes: a REAL audit fault makes NO change — the caller keeps their session",
           "[pg][rest][password][audit]") {
+    // #5342 Gate 8 T1(ii)/T3: the success row is INSERTed inside the
+    // credential transaction; the audit table is renamed in the throwaway DB,
+    // so that INSERT genuinely fails and the WHOLE change rolls back. No
+    // rollback write, no revoke-first: the credential, the sessions and the
+    // caller's cookie are exactly as they were.
     PasswordRoutesHarness h;
     h.wire();
     h.seed("ivy", kOld, Role::user);
-    h.session_user = "ivy";
-    auto old_token = h.auth_mgr.authenticate("ivy", kOld);
-    REQUIRE(old_token.has_value());
+    auto token = h.auth_mgr.authenticate("ivy", kOld);
+    REQUIRE(token.has_value());
     const auto before = h.stored_hash("ivy");
-    h.audit_fail_match = std::make_pair(std::string("user.password_change"), std::string("ok"));
+    h.break_audit_table();
 
-    auto res = h.change(kOld, kNew);
+    auto res = h.change_with_cookie(*token, kOld, kNew);
     REQUIRE(res);
-    CHECK(res->status == 500);
+    CHECK(res->status == 503);
     CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
-    CHECK(error_message_of(*res).find("rolled back") != std::string::npos);
-    CHECK(error_message_of(*res).find("sessions were revoked; password unchanged") !=
-          std::string::npos);
-    // Rolled back: the stored credential is byte-identical, the OLD password
-    // works. The sessions were revoked FIRST (step 10) and stay revoked.
+    auto j = nlohmann::json::parse(res->body);
+    CHECK(j["error"]["retry_after_ms"].is_number());
+    CHECK(error_message_of(*res).find("nothing was changed unless the server lost contact with "
+                                      "the database at commit") != std::string::npos);
+    CHECK(error_message_of(*res).find("rolled back") == std::string::npos);
+    CHECK(res->get_header_value("Set-Cookie").empty()); // refusal: the cookie is NOT cleared
+    // Nothing changed: same hash, the session still validates, old pw works.
     CHECK(h.stored_hash("ivy") == before);
+    CHECK(h.auth_mgr.validate_session(*token).has_value());
+    CHECK(h.sessions_of("ivy") == 1);
     CHECK(h.password_works("ivy", kOld));
     CHECK_FALSE(h.password_works("ivy", kNew));
-    CHECK_FALSE(h.auth_mgr.validate_session(*old_token).has_value());
-    CHECK(h.has_audit("user.password_change", "error", "audit_failed_rolled_back"));
-    CHECK(res->get_header_value("Set-Cookie") == kClearCookie);
+    {
+        std::lock_guard lk(h.audits_mu);
+        bool saw = false;
+        for (const auto& a : h.audits)
+            saw = saw || (a.action == "user.password_change" && a.detail == "audit_unavailable");
+        CHECK(saw);
+    }
     CHECK(h.changes("self", "error") == 1.0);
-    h.check_every_row_names("ivy");
+    CHECK(h.changes("self", "ok") == 0.0);
+    h.restore_audit_table();
+    CHECK(h.committed("user.password_change", "ivy") == 0);
 }
 
-TEST_CASE("password routes: audit failure whose rollback also fails is disclosed and counted",
-          "[pg][rest][password][audit]") {
-    PasswordRoutesHarness h;
-    h.wire();
-    h.seed("jack", kOld, Role::user);
-    h.session_user = "jack";
-    h.audit_fail_match = std::make_pair(std::string("user.password_change"), std::string("ok"));
-    // A concurrent writer lands between the write and the compensation, so
-    // the rollback's CAS (WHERE password_hash = <the hash we wrote>) misses.
-    auto salt = AuthManager::random_bytes(16);
-    const auto other_hash =
-        AuthManager::pbkdf2_sha256("someone-else-pw1", salt, AuthManager::kPbkdf2Iterations);
-    const auto other_salt = AuthManager::bytes_to_hex(salt);
-    h.on_audit_fail = [&] {
-        REQUIRE(h.db->set_password("jack", other_hash, other_salt).has_value());
-    };
-
-    auto res = h.change(kOld, kNew);
-    REQUIRE(res);
-    CHECK(res->status == 500);
-    CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
-    CHECK(error_message_of(*res).find("could neither be recorded nor rolled back") !=
-          std::string::npos);
-    CHECK(error_message_of(*res).find("sessions were revoked") != std::string::npos);
-    CHECK(h.has_audit("user.password_change", "error", "audit_failed_rollback_failed"));
-    CHECK(h.metrics.counter("yuzu_auth_password_change_unrecorded_total", {{"kind", "self"}})
-              .value() == 1.0);
-    // The concurrent writer's credential was never clobbered by the stale
-    // compensation.
-    CHECK(h.stored_hash("jack") == other_hash);
-}
-
-TEST_CASE("password routes: a failed durable revoke refuses the change with nothing written",
+TEST_CASE("password routes: a session-store fault inside the transaction makes NO change",
           "[pg][rest][password]") {
-    // #5342 Gate 7 (C5): revoke FIRST; if it did not persist, 503 and the
-    // credential is untouched — an old session must never outlive the old
-    // password on another replica.
+    // The DELETE of the account's sessions is a statement of the same
+    // transaction: if it fails, the credential write rolls back with it.
     PasswordRoutesHarness h;
-    h.enable_session_store();
     h.wire();
     h.seed("kurt", kOld, Role::user);
     h.as_admin();
@@ -784,8 +872,9 @@ TEST_CASE("password routes: a failed durable revoke refuses the change with noth
         REQUIRE(res);
         CHECK(res->status == 503);
         CHECK(nlohmann::json::parse(res->body)["error"]["retry_after_ms"].is_number());
-        CHECK(h.has_audit("user.password_change", "error", "session_revoke_failed"));
+        CHECK(h.has_audit("user.password_change", "error", "store_unavailable"));
         CHECK(h.stored_hash("kurt") == before);
+        CHECK(h.committed("user.password_change", "kurt") == 0);
         h.check_every_row_names("kurt");
     }
     SECTION("admin route") {
@@ -794,14 +883,18 @@ TEST_CASE("password routes: a failed durable revoke refuses the change with noth
         auto res = h.reset("kurt", kNew);
         REQUIRE(res);
         CHECK(res->status == 503);
-        CHECK(h.has_audit("user.password_reset", "error", "session_revoke_failed"));
+        CHECK(h.has_audit("user.password_reset", "error", "store_unavailable"));
         CHECK(h.stored_hash("kurt") == before);
+        CHECK(h.committed("user.password_reset", "kurt") == 0);
         h.check_every_row_names("root");
     }
 }
 
-TEST_CASE("password routes: a write that fails AFTER the revoke says so (sessions gone, hash kept)",
+TEST_CASE("password routes: a refusal under the row lock changes nothing — sessions stay valid",
           "[pg][rest][password]") {
+    // T1(i)/T3: classification happens UNDER the lock, inside the transaction
+    // that would write; a refusal writes nothing at all — in particular it no
+    // longer revokes the target's sessions first.
     PasswordRoutesHarness h;
     h.wire();
     h.as_admin();
@@ -809,21 +902,137 @@ TEST_CASE("password routes: a write that fails AFTER the revoke says so (session
     auto lara_session = h.auth_mgr.create_local_session_for_test("lara", Role::user, false);
     REQUIRE_FALSE(lara_session.empty());
     const auto before = h.stored_hash("lara");
-    // SCIM adopts the account between the route's read and its UPDATE: the
-    // guarded write matches nothing.
-    h.auth_mgr.set_password_write_race_hook_for_test(
-        [&] { REQUIRE(h.db->set_provisioning_source("lara", "scim").has_value()); });
+    REQUIRE(h.db->set_provisioning_source("lara", "scim").has_value());
 
     auto res = h.reset("lara", kNew);
-    h.auth_mgr.set_password_write_race_hook_for_test(nullptr);
     REQUIRE(res);
     CHECK(res->status == 409);
-    CHECK(error_message_of(*res).find("sessions were revoked; password unchanged") !=
-          std::string::npos);
+    CHECK(error_message_of(*res).find("sessions were revoked") == std::string::npos);
     CHECK(h.has_audit("user.password_reset", "denied", "not_local"));
-    CHECK_FALSE(h.auth_mgr.validate_session(lara_session).has_value());
+    CHECK(h.auth_mgr.validate_session(lara_session).has_value());
+    CHECK(h.sessions_of("lara") == 1);
     CHECK(h.stored_hash("lara") == before);
+    CHECK(h.committed("user.password_reset", "lara") == 0);
     h.check_every_row_names("root");
+}
+
+TEST_CASE("password routes: an admin reset landing after the self route's verify is a 409 conflict",
+          "[pg][rest][password]") {
+    // The verified anchor is compared UNDER the row lock: an admin reset that
+    // commits in the self route's PBKDF2 window wins, and the self change
+    // writes nothing (409 conflict, the caller's cookie is not cleared).
+    PasswordRoutesHarness h;
+    h.wire();
+    h.seed("vera", kOld, Role::user);
+    h.session_user = "vera";
+    std::string admin_hash;
+    h.after_verify = [&] {
+        h.after_verify = nullptr;
+        CredentialChangeRequest r;
+        r.kind = CredentialChangeRequest::Kind::kAdminReset;
+        r.username = "vera";
+        const auto salt = AuthManager::random_bytes(16);
+        r.new_salt_hex = AuthManager::bytes_to_hex(salt);
+        r.new_hash_hex =
+            AuthManager::pbkdf2_sha256("admin-set-pw-123", salt, AuthManager::kPbkdf2Iterations);
+        r.audit_template.principal = "root";
+        r.audit_template.target_type = "User";
+        r.audit_template.target_id = "vera";
+        REQUIRE(h.auth_mgr.commit_password_change(r).result == CredentialChangeResult::kOk);
+        admin_hash = r.new_hash_hex;
+    };
+    auto res = h.change(kOld, kNew);
+    REQUIRE(res);
+    CHECK(res->status == 409);
+    CHECK(h.has_audit("user.password_change", "denied", "conflict"));
+    CHECK(res->get_header_value("Set-Cookie").empty());
+    CHECK(h.stored_hash("vera") == admin_hash);
+    CHECK(h.committed("user.password_change", "vera") == 0);
+    CHECK(h.committed("user.password_reset", "vera") == 1);
+}
+
+TEST_CASE("password routes: a session minted with the OLD credential during the change never "
+          "survives (M2)",
+          "[pg][rest][password]") {
+    // #5342 Gate 8 M2 (g8-security-guardian-1 inverted). The owner's
+    // pre-commit hook fires with every lock held; a racing mint for the OLD
+    // credential is started there and allowed to proceed once the hook
+    // returns. Whatever it manages, after the route returns no session minted
+    // with the old credential is valid and no durable row for the account
+    // remains.
+    PasswordRoutesHarness h;
+    h.wire();
+    h.as_admin();
+    h.seed("vic", kOld, Role::user);
+    const auto old_anchor = h.auth_mgr.verify_password("vic", kOld)->hash_hex;
+
+    std::string minted = "unset";
+    std::thread racer;
+    std::atomic<bool> fired{false};
+    h.owner.set_pre_commit_hook_for_test([&] {
+        if (fired.exchange(true))
+            return;
+        racer = std::thread(
+            [&] { minted = h.auth_mgr.create_local_session("vic", Role::user, false, old_anchor); });
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    });
+    auto res = h.reset("vic", kNew);
+    h.owner.set_pre_commit_hook_for_test(nullptr);
+    REQUIRE(fired);
+    racer.join();
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK((minted.empty() || !h.auth_mgr.validate_session(minted).has_value()));
+    CHECK(h.sessions_of("vic") == 0);
+    CHECK(h.password_works("vic", kNew));
+}
+
+TEST_CASE("password routes: an old-password MFA login challenge completed during the change is "
+          "denied (M2)",
+          "[pg][rest][password][mfa]") {
+    // The /login/mfa completion of a pending token proven with the OLD
+    // password races the reset's transaction: its TOTP consume blocks on the
+    // held auth.users row, and the mint's locking post-mint re-read then sees
+    // the new hash — 401, no session.
+    PasswordRoutesHarness h;
+    h.wire();
+    h.auth_routes->register_routes(h.sink);
+    h.as_admin();
+    h.seed("mfa_vic", kOld, Role::user);
+    auto init = h.db->mfa_init_enrollment("mfa_vic", "Yuzu");
+    REQUIRE(init.has_value());
+    REQUIRE(h.db->mfa_verify_enrollment("mfa_vic", totp_now(init->secret_base32), std::nullopt)
+                .has_value());
+    auto step1 = h.sink.Post("/login", "username=mfa_vic&password=" + std::string(kOld),
+                             "application/x-www-form-urlencoded");
+    REQUIRE(step1);
+    REQUIRE(step1->status == 202);
+    const std::string pending = nlohmann::json::parse(step1->body).at("mfa_pending_token");
+
+    std::unique_ptr<httplib::Response> step2;
+    std::thread racer;
+    std::atomic<bool> fired{false};
+    h.owner.set_pre_commit_hook_for_test([&] {
+        if (fired.exchange(true))
+            return;
+        racer = std::thread([&] {
+            step2 = h.sink.Post("/login/mfa",
+                                "mfa_pending_token=" + pending +
+                                    "&code=" + totp_now(init->secret_base32, 1),
+                                "application/x-www-form-urlencoded");
+        });
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    });
+    auto res = h.reset("mfa_vic", kNew);
+    h.owner.set_pre_commit_hook_for_test(nullptr);
+    REQUIRE(fired);
+    racer.join();
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    REQUIRE(step2);
+    CHECK(step2->status == 401);
+    CHECK(step2->get_header_value("Set-Cookie").empty());
+    CHECK(h.sessions_of("mfa_vic") == 0);
 }
 
 TEST_CASE("password routes: self change for an account with no row answers wrong_current",
@@ -906,7 +1115,8 @@ TEST_CASE("password routes: admin reset succeeds, revokes the target's sessions,
     CHECK(d["username"] == "lena");
     CHECK(d["password_reset"] == true);
     CHECK(d["sessions_revoked"].get<int64_t>() >= 1);
-    CHECK(d["lockout_cleared"] == true);
+    CHECK(d["lockout_cleared"] == true); // a lockout existed and was cleared, in-transaction
+    CHECK(d["provisional_mfa_cleared"] == false);
     CHECK(d["api_tokens_active"].get<int64_t>() == 2);
     CHECK_FALSE(d.contains("api_tokens_unknown"));
     CHECK_FALSE(d.contains("sessions_db_persisted"));
@@ -923,6 +1133,41 @@ TEST_CASE("password routes: admin reset succeeds, revokes the target's sessions,
     h.check_every_row_names("root");
     CHECK(h.changes("admin", "ok") == 1.0);
     h.check_never_echoed(*res, kNew);
+}
+
+TEST_CASE("password routes: admin reset of a never-locked account reports lockout_cleared:false "
+          "and writes NO auth.lockout.cleared row",
+          "[pg][rest][password][lockout]") {
+    PasswordRoutesHarness h;
+    h.wire();
+    h.as_admin();
+    h.seed("calm", kOld, Role::user);
+    auto res = h.reset("calm", kNew);
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    auto d = data_of(*res);
+    CHECK(d["lockout_cleared"] == false);
+    CHECK(d["remediation"].get<std::string>().find("/unlock") == std::string::npos);
+    CHECK(h.committed("auth.lockout.cleared", "calm") == 0);
+    CHECK(h.committed("user.password_reset", "calm") == 1);
+}
+
+TEST_CASE("password routes: admin reset wipes a provisional TOTP secret (F1)",
+          "[pg][rest][password][mfa]") {
+    PasswordRoutesHarness h;
+    h.wire();
+    h.as_admin();
+    h.seed("pend", kOld, Role::user);
+    auto s1 = h.db->mfa_init_enrollment("pend", "Yuzu");
+    REQUIRE(s1.has_value());
+    auto res = h.reset("pend", kNew);
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    CHECK(data_of(*res)["provisional_mfa_cleared"] == true);
+    CHECK_FALSE(h.db->mfa_status("pend")->enrolled);
+    auto s2 = h.db->mfa_init_enrollment("pend", "Yuzu");
+    REQUIRE(s2.has_value());
+    CHECK(s1->secret_base32 != s2->secret_base32);
 }
 
 TEST_CASE("password routes: admin reset reports unknown API tokens as null, never 0",
@@ -1129,78 +1374,131 @@ TEST_CASE("password routes: admin reset refusals", "[pg][rest][password]") {
         CHECK(a.principal == "root");
 }
 
-TEST_CASE("password routes: admin reset audit failure rolls back; rollback failure disclosed",
+TEST_CASE("password routes: admin reset under a REAL audit fault makes no change at all",
           "[pg][rest][password][audit]") {
+    // T1(ii) for the admin route: the lockout stays armed, the target's
+    // session stays valid, the credential is untouched, and no
+    // auth.lockout.cleared row exists — one transaction, nothing half-done.
     PasswordRoutesHarness h;
     h.wire();
     h.as_admin();
     h.seed("nora", kOld, Role::user);
     auto nora_session = h.auth_mgr.create_local_session_for_test("nora", Role::user, false);
     REQUIRE_FALSE(nora_session.empty());
+    for (int i = 0; i < 3; ++i)
+        REQUIRE(h.db->record_failed_login("nora", 3, 3600).has_value());
+    const auto armed = h.db->lockout_status("nora");
+    REQUIRE(armed->locked);
+    const auto before = h.stored_hash("nora");
+    h.break_audit_table();
 
-    SECTION("rollback succeeds; a lock armed before the reset is still armed") {
-        // #5342 Gate 7 (C7): set_password no longer clears the lockout, and the
-        // audited lock-clear step only runs after a RECORDED reset — so a
-        // rolled-back reset leaves the lockout columns exactly as they were.
-        for (int i = 0; i < 3; ++i)
-            REQUIRE(h.db->record_failed_login("nora", 3, 3600).has_value());
-        const auto armed = h.db->lockout_status("nora");
-        REQUIRE(armed.has_value());
-        REQUIRE(armed->locked);
-        const auto before = h.stored_hash("nora");
-        h.audit_fail_match = std::make_pair(std::string("user.password_reset"), std::string("ok"));
-        auto res = h.reset("nora", kNew);
-        REQUIRE(res);
-        CHECK(res->status == 500);
-        CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
-        CHECK(h.stored_hash("nora") == before);
-        CHECK(h.password_works("nora", kOld));
-        CHECK_FALSE(h.auth_mgr.validate_session(nora_session).has_value()); // revoked first
-        CHECK(h.has_audit("user.password_reset", "error", "audit_failed_rolled_back"));
-        CHECK_FALSE(h.has_audit("auth.lockout.cleared", "ok"));
-        auto st = h.db->lockout_status("nora");
-        REQUIRE(st.has_value());
-        CHECK(st->locked);
-        CHECK(st->failed_count == armed->failed_count);
-    }
-    SECTION("rollback fails") {
-        h.audit_fail_match = std::make_pair(std::string("user.password_reset"), std::string("ok"));
-        h.audit_fail_all_after_first = true; // the best-effort error row is lost too
-        h.on_audit_fail = [&] {
-            REQUIRE(h.db->set_password("nora", "deadbeef", "cafe").has_value());
-        };
-        auto res = h.reset("nora", kNew);
-        REQUIRE(res);
-        CHECK(res->status == 500);
-        CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
-        CHECK(error_message_of(*res).find("NEW password is now in effect") != std::string::npos);
-        CHECK(h.stored_hash("nora") == "deadbeef");
-        CHECK(h.metrics.counter("yuzu_auth_password_change_unrecorded_total", {{"kind", "admin"}})
-                  .value() == 1.0);
-    }
+    auto res = h.reset("nora", kNew);
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+    CHECK(nlohmann::json::parse(res->body)["error"]["retry_after_ms"].is_number());
+    CHECK(h.stored_hash("nora") == before);
+    CHECK(h.password_works("nora", kOld));
+    CHECK(h.auth_mgr.validate_session(nora_session).has_value());
+    auto st = h.db->lockout_status("nora");
+    REQUIRE(st.has_value());
+    CHECK(st->locked);
+    CHECK(st->failed_count == armed->failed_count);
     CHECK(h.changes("admin", "error") == 1.0);
+    h.restore_audit_table();
+    CHECK(h.committed("user.password_reset", "nora") == 0);
+    CHECK(h.committed("auth.lockout.cleared", "nora") == 0);
 }
 
-TEST_CASE("password routes: a failed post-reset lock clear is reported, never fatal",
-          "[pg][rest][password][lockout]") {
+TEST_CASE("password routes: two concurrent admin resets, the second's audit faulted — the first "
+          "stands (chaos R5 inverted)",
+          "[pg][rest][password][audit]") {
+    // Admin B's reset holds the row lock (pre-commit hook); admin A's reset of
+    // the same account starts in a second thread and queues on that lock. B
+    // commits; A then writes and its audit INSERT hits a REAL fault (a trigger
+    // raising for rootA's rows) — A's whole transaction rolls back. Before the
+    // class fix, A's stale-snapshot ROLLBACK resurrected H0 over B's audited
+    // reset.
     PasswordRoutesHarness h;
     h.wire();
-    h.as_admin();
-    h.seed("otto", kOld, Role::user);
-    for (int i = 0; i < 3; ++i)
-        REQUIRE(h.db->record_failed_login("otto", 3, 3600).has_value());
-    h.lockout_clear_ok = false;
+    h.seed("rootA", kOld, Role::admin);
+    h.seed("rootB", kOld, Role::admin);
+    h.seed("vic", kOld, Role::user);
+    const auto h0 = h.stored_hash("vic");
+    const auto tokA = h.auth_mgr.create_local_session_for_test("rootA", Role::admin, true);
+    const auto tokB = h.auth_mgr.create_local_session_for_test("rootB", Role::admin, true);
+    REQUIRE_FALSE(tokA.empty());
+    REQUIRE_FALSE(tokB.empty());
+    h.fault_audit_for("rootA");
+    constexpr const char* kA = "admin-a-password-012";
+    constexpr const char* kB = "admin-b-password-789";
 
-    auto res = h.reset("otto", kNew);
-    REQUIRE(res);
-    REQUIRE(res->status == 200);
-    auto d = data_of(*res);
-    CHECK(d["password_reset"] == true);
-    CHECK(d["lockout_cleared"] == false);
-    CHECK(d["remediation"].get<std::string>().find("/unlock") != std::string::npos);
-    CHECK(h.has_audit("auth.lockout.cleared", "error", "password_reset"));
-    CHECK(h.password_works("otto", kNew));
-    CHECK(h.db->lockout_status("otto")->locked); // still locked — operator must unlock
+    std::unique_ptr<httplib::Response> resA;
+    std::thread admin_a;
+    std::atomic<bool> fired{false};
+    h.owner.set_pre_commit_hook_for_test([&] {
+        if (fired.exchange(true))
+            return;
+        admin_a = std::thread([&] { resA = h.reset_with_cookie(tokA, "vic", kA); });
+        std::this_thread::sleep_for(std::chrono::milliseconds(400)); // A queues on the row lock
+    });
+    auto resB = h.reset_with_cookie(tokB, "vic", kB);
+    h.owner.set_pre_commit_hook_for_test(nullptr);
+    REQUIRE(fired);
+    admin_a.join();
+    REQUIRE(resB);
+    REQUIRE(resA);
+    INFO("B=" << resB->status << " " << resB->body);
+    INFO("A=" << resA->status << " " << resA->body);
+    CHECK(resB->status == 200);
+    CHECK(resA->status == 503);
+    CHECK(resA->get_header_value("Sec-Audit-Failed") == "true");
+    const auto final_hash = h.stored_hash("vic");
+    CHECK(final_hash != h0);
+    CHECK(h.password_works("vic", kB));
+    CHECK_FALSE(h.password_works("vic", kA));
+    CHECK_FALSE(h.password_works("vic", kOld));
+    CHECK(h.committed("user.password_reset", "vic") == 1); // B's row, exactly one
+}
+
+TEST_CASE("password routes: a victim's self-change then a faulted admin reset — the victim's "
+          "rotation stands (chaos R5b inverted)",
+          "[pg][rest][password][audit]") {
+    PasswordRoutesHarness h;
+    h.wire();
+    h.seed("rootA", kOld, Role::admin);
+    h.seed("vic", kOld, Role::user);
+    const auto tokA = h.auth_mgr.create_local_session_for_test("rootA", Role::admin, true);
+    auto tokVic = h.auth_mgr.authenticate("vic", kOld);
+    REQUIRE(tokVic.has_value());
+    h.fault_audit_for("rootA");
+    constexpr const char* kSelf = "victim-self-new-345";
+    constexpr const char* kA = "admin-a-password-012";
+
+    std::unique_ptr<httplib::Response> resA;
+    std::thread admin_a;
+    std::atomic<bool> fired{false};
+    h.owner.set_pre_commit_hook_for_test([&] {
+        if (fired.exchange(true))
+            return;
+        admin_a = std::thread([&] { resA = h.reset_with_cookie(tokA, "vic", kA); });
+        std::this_thread::sleep_for(std::chrono::milliseconds(400));
+    });
+    auto resSelf = h.change_with_cookie(*tokVic, kOld, kSelf);
+    h.owner.set_pre_commit_hook_for_test(nullptr);
+    REQUIRE(fired);
+    admin_a.join();
+    REQUIRE(resSelf);
+    REQUIRE(resA);
+    INFO("self=" << resSelf->status << " " << resSelf->body);
+    INFO("A=" << resA->status << " " << resA->body);
+    CHECK(resSelf->status == 200);
+    CHECK(resA->status == 503);
+    CHECK(h.password_works("vic", kSelf));
+    CHECK_FALSE(h.password_works("vic", kOld));
+    CHECK_FALSE(h.password_works("vic", kA));
+    CHECK(h.committed("user.password_change", "vic") == 1);
+    CHECK(h.committed("user.password_reset", "vic") == 0);
 }
 
 TEST_CASE("password routes: the literal /me route wins over the {name} regex",

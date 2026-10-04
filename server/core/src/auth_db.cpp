@@ -1038,56 +1038,6 @@ std::expected<void, AuthDBError> AuthDB::update_role(const std::string& username
 }
 
 std::expected<void, AuthDBError>
-AuthDB::set_password(const std::string& username, const std::string& password_hash,
-                     const std::string& salt_hex,
-                     const std::optional<std::string>& expected_current_hash) {
-    // is_valid_username, NOT is_valid_principal: only a local account has a
-    // password, and an SSO principal ("oidc:..."/"saml:...") can never be one.
-    // Also closes the embedded-NUL truncation class get_user() documents.
-    if (!is_valid_username(username)) {
-        spdlog::warn("set_password rejected invalid username: '{}'", username);
-        return std::unexpected(AuthDBError::InvalidUsername);
-    }
-    if (password_hash.empty() || salt_hex.empty() ||
-        (expected_current_hash && expected_current_hash->empty()))
-        return std::unexpected(AuthDBError::InvalidCredentials);
-
-    // Guarded single UPDATE ... RETURNING (update_role's idiom). The WHERE
-    // clause IS the local-account gate — active, identity_source='local' AND
-    // provisioning_source='local' — so no caller-side check can be raced
-    // past. hash/salt/updated_at ONLY: the lockout columns are never touched
-    // here (see the .hpp — #5342 Gate 7). The CAS variant adds
-    // `password_hash = $4`. Two parameter-free compile-time statements — the
-    // literals are constants, never interpolated input.
-#define YUZU_SET_PASSWORD_HEAD                                                                     \
-    "UPDATE auth.users SET password_hash = $1, salt_hex = $2, updated_at = now() "                 \
-    "WHERE username = $3 AND is_active = TRUE AND identity_source = 'local' "                      \
-    "AND provisioning_source = 'local'"
-    static constexpr const char* kSql = YUZU_SET_PASSWORD_HEAD " RETURNING id";
-    static constexpr const char* kSqlCas =
-        YUZU_SET_PASSWORD_HEAD " AND password_hash = $4 RETURNING id";
-#undef YUZU_SET_PASSWORD_HEAD
-    const char* sql = expected_current_hash ? kSqlCas : kSql;
-
-    auto lease = impl_->pool.try_acquire_for(kWriteTimeout);
-    if (!lease)
-        return std::unexpected(AuthDBError::WriteFailed);
-    std::vector<std::string> params{password_hash, salt_hex, username};
-    if (expected_current_hash)
-        params.push_back(*expected_current_hash);
-    pg::PgResult res = pg::exec_params(lease.get(), sql, params);
-    if (res.status() != PGRES_TUPLES_OK)
-        return std::unexpected(AuthDBError::WriteFailed);
-    if (PQntuples(res.get()) == 0) {
-        spdlog::warn("set_password: no active local account matched '{}'{}", username,
-                     expected_current_hash ? " (or the stored credential changed)" : "");
-        return std::unexpected(AuthDBError::UserNotFound);
-    }
-    spdlog::info("Password updated for local account: {}", username);
-    return {};
-}
-
-std::expected<void, AuthDBError>
 AuthDB::recheck_role_locked(
     const std::string& username,
     const std::function<void(auth::Role, const std::string& password_hash)>& under_row_lock) {
@@ -1150,7 +1100,8 @@ AuthDB::recheck_role_locked(
         }
         // #5274: password_hash is read under the SAME row lock so the caller
         // can deny a credential check whose verified hash a concurrent
-        // set_password() already replaced (see the header doc).
+        // credential change (CredentialChangeOwner, #5342) already replaced
+        // (see the header doc).
         pg::PgResult sel = pg::exec_params(
             conn,
             "SELECT role, password_hash FROM auth.users WHERE username = $1 AND is_active = TRUE "
@@ -1696,7 +1647,8 @@ AuthDB::mfa_init_enrollment(const std::string& username, std::string_view issuer
 }
 
 std::expected<std::vector<std::string>, AuthDBError>
-AuthDB::mfa_verify_enrollment(const std::string& username, std::string_view code) {
+AuthDB::mfa_verify_enrollment(const std::string& username, std::string_view code,
+                              const std::optional<std::string>& expected_password_hash_hex) {
     if (!is_valid_username(username)) {
         return std::unexpected(AuthDBError::InvalidUsername);
     }
@@ -1765,13 +1717,24 @@ AuthDB::mfa_verify_enrollment(const std::string& username, std::string_view code
         // a legitimate enroll: an uninterrupted verify's loaded secret is still the stored
         // one, and a post-disable re-enroll re-inits a fresh secret and verifies a code of
         // THAT secret, so its own loaded blob matches.
+        //   (c) #5342 Gate 8 (F2): `($4::text IS NULL OR password_hash = $4)` binds
+        //       the enrolment to the credential the caller PROVED (the login
+        //       bootstrap passes the pending login's verified hash; Settings
+        //       passes NULL — its session would have been revoked by a credential
+        //       change). A password change/reset committed after that login makes
+        //       this 0 rows → `CredentialChanged` below, so an enrolment begun
+        //       under a retired password can never complete. The credential
+        //       change holds this row's lock for its whole transaction, so this
+        //       UPDATE either sees its committed hash or waits for it.
         pg::PgResult r = pg::exec_params(
             conn,
             "UPDATE auth.users SET mfa_enrolled_at = now(), mfa_last_counter = $1, updated_at = now() "
             "WHERE username = $2 AND is_active = TRUE AND mfa_enrolled_at IS NULL "
-            "AND mfa_totp_secret = decode($3, 'hex') RETURNING id",
-            std::vector<std::string>{std::to_string(*matched), username,
-                                     auth::AuthManager::bytes_to_hex(row->secret_blob)});
+            "AND mfa_totp_secret = decode($3, 'hex') "
+            "AND ($4::text IS NULL OR password_hash = $4) RETURNING id",
+            std::vector<std::optional<std::string>>{
+                std::to_string(*matched), username,
+                auth::AuthManager::bytes_to_hex(row->secret_blob), expected_password_hash_hex});
         if (r.status() != PGRES_TUPLES_OK)
             return false; // write outage → fail closed (WriteFailed → 503)
         if (PQntuples(r.get()) == 0) {
@@ -1782,13 +1745,22 @@ AuthDB::mfa_verify_enrollment(const std::string& username, std::string_view code
             // secret-unavailable degrade metric + a kCritical "store unavailable" audit
             // for a benign race. A genuinely deactivated user keeps the fail-closed
             // WriteFailed/503 (unchanged).
+            // #5342 Gate 8 (F2): an active, still un-enrolled row whose hash is
+            // no longer the caller's proven credential → CredentialChanged (a
+            // refusal, not a store fault). Evaluated in the SAME statement as
+            // the enrolled test so the two cannot disagree.
             pg::PgResult cls = pg::exec_params(
                 conn,
-                "SELECT is_active, (mfa_enrolled_at IS NOT NULL) FROM auth.users WHERE username = $1",
-                std::vector<std::string>{username});
+                "SELECT is_active, (mfa_enrolled_at IS NOT NULL), "
+                "($2::text IS NOT NULL AND password_hash IS DISTINCT FROM $2) "
+                "FROM auth.users WHERE username = $1",
+                std::vector<std::optional<std::string>>{username, expected_password_hash_hex});
             if (cls.status() == PGRES_TUPLES_OK && PQntuples(cls.get()) == 1 &&
-                to_bool(col(cls.get(), 0, 0)) && to_bool(col(cls.get(), 0, 1))) {
-                txn_error = AuthDBError::MfaAlreadyEnrolled;
+                to_bool(col(cls.get(), 0, 0))) {
+                if (to_bool(col(cls.get(), 0, 1)))
+                    txn_error = AuthDBError::MfaAlreadyEnrolled;
+                else if (to_bool(col(cls.get(), 0, 2)))
+                    txn_error = AuthDBError::CredentialChanged;
             }
             return false;
         }

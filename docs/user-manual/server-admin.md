@@ -3097,9 +3097,10 @@ their credentials live at the identity provider (#5342).
   page, so non-admin users change their password with
   `POST /api/v1/users/me/password` for now (#5353).
 - **Any other local row → Reset password.** Enter the new password
-  twice. Every dashboard session of that user is signed out and its
-  lockout is cleared (the toast says if the lockout could not be
-  cleared — use **Unlock** then). Their **API tokens are not revoked**;
+  twice. Every dashboard session of that user is signed out and any
+  lockout on the account is cleared (the toast says so when there was
+  one). Their **API tokens are not revoked**, nor is an enrolled
+  second factor (`yuzu-server --mfa-reset` clears that);
   the toast says how many are still active, or that it could not tell,
   so you can revoke them (Settings → API Tokens) if the account may be
   compromised. **Reset needs a durable Administrator:** with RBAC off,
@@ -3112,12 +3113,11 @@ their credentials live at the identity provider (#5342).
   changing its own password.
 
 Both require a password of 12–1024 bytes (UTF-8), and prompt for an MFA
-code when your session's step-up proof is stale. The sessions are
-signed out **before** the password is written; if that cannot be
-recorded durably, nothing is written and an error toast asks you to
-retry. Both are recorded as `user.password_change` /
-`user.password_reset`; if the audit row cannot be written, the change
-is rolled back and an error toast is shown. The REST contract
+code when your session's step-up proof is stale. The new password,
+the sign-out of the account's sessions and the audit record
+(`user.password_change` / `user.password_reset`) are saved in one
+database transaction — all of it or none of it; if anything fails,
+nothing changed and an error toast asks you to retry. The REST contract
 (`POST /api/v1/users/me/password`, `POST /api/v1/users/{name}/password`)
 is in [rest-api.md](rest-api.md#post-apiv1usersmepassword); there is no
 MCP tool for either, by design (#5357 tracks a temporary-password reset

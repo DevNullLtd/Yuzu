@@ -78,7 +78,7 @@ struct StepUpFixture {
         REQUIRE(bytes.has_value());
         std::string raw(reinterpret_cast<const char*>(bytes->data()), bytes->size());
         auto code = mfa::generate(raw, mfa::current_counter(std::chrono::system_clock::now()));
-        REQUIRE(db->mfa_verify_enrollment("alice", code).has_value());
+        REQUIRE(db->mfa_verify_enrollment("alice", code, std::nullopt).has_value());
 
         audit_fn = [this](const httplib::Request&, const std::string& action,
                           const std::string& result, const std::string& target_type,
