@@ -1452,7 +1452,7 @@ one core replica a server-only restart now recovers through the replay described
   proxied upstream; both are fixed. Consequences: the server's
   `yuzu_heartbeats_received_total{via="gateway"}` under-counts while a backlog is coalesced, and an agent's
   topology snapshot can be one agent snapshot cycle older after an eviction. The server's 4 MiB receive
-  limit is unchanged and not raised. The post-change rig run (`990e57e48`, 1 to 30 agents, plaintext, debug builds) recovered where the old gateway did not; see the evidence record. A third rig pass (G1 to G5, build `f3e9d52a4`) recovered the same way; the heartbeat screening that keeps a session's lease renewing, the router timeout clamp and the session cap are not in that build, rig passes 4 (`ab01f4f2f`) and 5 (`e3cf6b38a`) ran later builds, and a pass on the final commit has not been run. Not tested and known limits: 100 or more agents and a backlog that reaches the default byte cap; the
+  limit is unchanged and not raised. The post-change rig run (`990e57e48`, 1 to 30 agents, plaintext, debug builds) recovered where the old gateway did not; see the evidence record. A third rig pass (G1 to G5, build `f3e9d52a4`) recovered the same way; the heartbeat screening that keeps a session's lease renewing, the router timeout clamp and the session cap are not in that build, rig passes 4 (`ab01f4f2f`) and 5 (`e3cf6b38a`) ran later builds, and rig pass 6 (`c518edd93`) ran the nodelay change and server restarts at 1000 and 2000 simulated agents (the four review fix commits after it are in no rig build). Not tested and known limits: 100 or more real agents and a backlog that reaches the default byte cap; the
   agent's snapshot size is not bounded here (the agent proto comment says 5 to 20 KB, 200 to 800 KB was
   observed, the server accepts up to 2 MiB) and is a follow-up for the agent side; the server does not
   configure its maximum receive size explicitly, so the chunk size relies on the library default (INFERRED
@@ -1547,7 +1547,7 @@ one core replica a server-only restart now recovers through the replay described
   about 700 agents could not finish inside the agents' 30 s `Register` deadline (1000 agents: 703 registered). The
   gateway now sets `TCP_NODELAY` on that one upstream channel by default (`upstream_tcp_nodelay`, `sys.config` only);
   running the proxy RPC outside the process, shedding requests whose caller is gone and a shorter upstream deadline
-  are planned follow-ups with no issue numbers yet, and a rig pass on the final commit is pending. Detail:
+  are planned follow-ups with no issue numbers yet. Rig pass 6 (`c518edd93`, simulated agents, loopback) registered 1000, 2000 and 5000 agents in 1.89 s, 4.16 s and 12.08 s with the shipped setting. Detail:
   `docs/user-manual/gateway.md`, "Registration rate per gateway".
 
 ### 7d. Cross-cluster gateway fan-out — "rest of 4.3" (WS-4, 2026-09-21)

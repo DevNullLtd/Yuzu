@@ -702,7 +702,7 @@ through the environment; it takes a `sys.config` edit):
 
 | Key | Default | Valid values | Meaning |
 |---|---|---|---|
-| `upstream_tcp_nodelay` | `true` | `true` or `false` | Sets TCP_NODELAY on the gateway-to-server (upstream) gRPC channel. Without it, every upstream call with a request under about 64 KiB waited about 41 to 43 ms for Nagle's algorithm and the server's delayed ACK, which capped registration at about 24 agents per gateway per second (see "Registration rate per gateway"). At start the gateway restarts grpcbox's `default_channel` with `{nodelay, true}` added to the `socket_options` of each endpoint; the channel connects on its first call, so the restart drops no connection and existing `sys.config` files need no edit. Other `socket_options` of an endpoint are kept, and a `nodelay` entry you set there yourself wins (a hand-set `{nodelay, false}` keeps Nagle on that endpoint). It applies only to the upstream channel, not to the agent listener or the management channel. A value that is not a boolean logs a warning that names the key and uses the default `true`. `false` logs one INFO line and leaves the channel as configured. If the restart fails, one WARN `could not restart it with TCP_NODELAY` is logged and the channel is restored with the endpoints as configured; if that restore fails as well, one further WARN `could not restore it with the endpoints as configured either` is logged, and the node then has no upstream channel (read from the code and its eunit tests, not run on a rig). |
+| `upstream_tcp_nodelay` | `true` | `true` or `false` | Sets TCP_NODELAY on the gateway-to-server (upstream) gRPC channel. Without it, every upstream call with a request under about 64 KiB waited about 41 to 43 ms for Nagle's algorithm and the server's delayed ACK, which capped registration at about 24 agents per gateway per second (see "Registration rate per gateway"). At start the gateway restarts grpcbox's `default_channel` with `{nodelay, true}` added to the `socket_options` of each endpoint; the channel connects on its first call, so the restart drops no connection and existing `sys.config` files need no edit. Other `socket_options` of an endpoint are kept, and a `nodelay` entry you set there yourself wins (a hand-set `{nodelay, false}` keeps Nagle on that endpoint). It applies only to the upstream channel, not to the agent listener or the management channel. A value that is not a boolean logs a warning that names the key and uses the default `true`. `false` logs one INFO line and leaves the channel as configured. If the restart fails, one WARN `could not restart it with TCP_NODELAY` is logged and the channel is restored with the endpoints as configured; if that restore fails as well, one further WARN `could not restore it with the endpoints as configured either` is logged, and the node then has no upstream channel (the restart itself was observed on a rig in pass 6, run K0; the restore paths are read from the code and its eunit tests, not run on a rig). |
 
 **Heartbeat batching interval** (read by the heartbeat buffer at start; unlike
 the replay keys above, it also has an environment override):
@@ -1470,7 +1470,7 @@ the raw rig logs are local only.
 - **`yuzu_gw_upstream_notify_dropped_total`.** OBSERVED: the metric has HELP
   and TYPE lines but no sample until a notification is first dropped, so an
   absent series means no drops.
-- **Not tested:** 100 or more agents, scale, HA or several replicas, notify
+- **Not tested:** 100 or more real agents (rig pass 6 ran 1000 to 5000 simulated agents, a load generator that answers no commands and sends no inventory, see the K rows of the table below), HA or several replicas, notify
   pressure, agents started with `--no-auto-update`, the `queue_full` and
   `malformed` verdict reasons produced by a real server (only injected verdicts
   were run, E6), a double replay, a verdict that arrives after a replay it
@@ -1483,7 +1483,7 @@ the raw rig logs are local only.
   `e3cf6b38a` (the pending row cleanup on connection down with its grace, the
   per-connection pending index, the same-agent commit rule, the `UNAVAILABLE`
   answer for a superseded `Register` and the removal of a dead connection's rows
-  by its index: eunit, dialyzer, Common Test and scratch probes only), and hot loading the
+  by its index: eunit, dialyzer, Common Test and scratch probes only; rig pass 6 on `c518edd93`, which predates the removal by index and the superseded answer, observed the grace itself and the removal of a dead connection's rows after it, run K5), and hot loading the
   code into a running node (not a supported deployment path).
 
 **Later runs: several agents and the buffer change.** OBSERVED on the same kind
@@ -1492,11 +1492,12 @@ build containing #5183). Runs E1 to E6 ran on gateway commit `848709698` (before
 the heartbeat buffer change); runs F1 to F6 ran on `990e57e48` (with it); runs H1
 to H7 (rig pass 4) ran on `ab01f4f2f` and runs J1 to J7 (rig pass 5) on
 `e3cf6b38a`, both with the later review rounds' code up to those commits (rig pass
-3, runs G1 to G5, is in the evidence record). The code after `e3cf6b38a` has not
-run in a recovery pass; the only rig runs on it are the registration-rate
-investigation on `71ee2b02f` (runs K1 and K2 in the table) and, for the nodelay
-commits, none yet (a pass on the final commit is pending). T0 is
-the first `/health` 200 of the restarted server. "Default agents" means the
+3, runs G1 to G5, is in the evidence record). The code after `e3cf6b38a` ran in a
+recovery pass only in rig pass 6 on `c518edd93` (runs K0 to K7 of pass 6 in the
+table, which include the nodelay commits); the other rig run on it is the
+registration-rate investigation on `71ee2b02f` (runs K1 and K2 in the table, not a
+recovery pass). The four review fix commits after `c518edd93` are not in any rig
+build. T0 is the first `/health` 200 of the restarted server. "Default agents" means the
 default plugin set with the TAR plugin loaded; "no TAR" means the TAR plugin was
 removed so the heartbeat carried no snapshot.
 
@@ -1535,6 +1536,15 @@ removed so the heartbeat carried no snapshot.
 | J7 | `e3cf6b38a` | 5 minute steady state after J3 | gateway WARN 0, ERROR 0, 0 flush errors |
 | K1 | `71ee2b02f` | registration rate, C++ clients with the agents' 30 s deadline, real-size `Register` (9,054 bytes), stock gateway and gateway with nodelay set kernel-wide, real server, loopback | stock: each upstream call 41 to 43 ms, about 24 per second per gateway; 1000 agents 703 registered and 297 hit the deadline; 2000 agents all registered after 776 s (85 s ideal), 5.9 attempts per agent. With nodelay: 2000 agents in 3.8 s and 5000 in 10.2 s, 0 retries. Stock 5000 not run. Not a recovery pass |
 | K2 | `71ee2b02f` | probe client: 40 concurrent `Register` calls of 256 KiB on one connection (the earlier J5 b2 case), Erlang HTTP/2 client and a C++ client | the 2 per second of J5 b2 came from the Erlang client's flow-control window update coalescing (500 ms by default), a measurement artefact; the C++ client sent the same 40 x 256 KiB in 91 ms through the same gateway |
+| K0 (pass 6) | `c518edd93` | nodelay on the stock configuration (no nodelay setting in `sys.config`) | start log `Upstream channel default_channel: TCP_NODELAY on`; the upstream client socket reported `{nodelay,true}` after the first agent registered |
+| K1 to K3 (pass 6) | `c518edd93` | cold-start bursts of 1000, 2000 and 5000 simulated agents (a load generator: one connection per agent, the real 9,054 byte `Register`, the 30 s deadline; it answers no commands and sends no inventory), stock gateway, shipped nodelay | 1000 agents: all registered in 1.89, 2.11 and 2.09 s (three runs), 0 deadline failures, 1.0 `ProxyRegister` per agent; 2000 agents 4.16 s; 5000 agents 12.08 s; 0 failures, WARN 0, ERROR 0 in every run |
+| K1-control (pass 6) | `c518edd93` | the 1000 agent load with `upstream_tcp_nodelay` set to `false` | 703 registered inside the deadline and 297 hit it (the same count as the stock run on `71ee2b02f`), 1297 attempts, last agent at 55.5 s |
+| K4a to K4d (pass 6) | `c518edd93` | real agents (TAR plugin loaded): 30 agents and a 12 s outage; 45 agents and 150 s; 1 agent and 300 s (plus an open-breaker variant); 20 agents and three gateway kill -9 | K4a all 30 online at T0 + 15.5 s, same sessions; K4b breaker open, all 45 online at T0 + 17.3 s, 0 buffer drops; K4c online at T0 + 0.98 s (breaker closed), K4c2 at T0 + 52.9 s (breaker open); K4d 20 of 20 re-registered in every gateway life (12 to 13 s), 0 refused, 0 stale pending rows |
+| K5 (pass 6) | `c518edd93` | grace of a closed connection's pending rows, probe client | default grace: a `Subscribe` on a new connection accepted, rows 2 at +10 s and 0 at +17 s, a late `Subscribe` refused; with `dead_connection_grace_ms` 2000 the rows were gone by +3.7 s. The refusal reached the probe as status 2, see Known limits |
+| K6 (pass 6) | `c518edd93` | server-only restart with 1000 and 2000 simulated agents that heartbeat and hold a `Subscribe` (the load generator) | 1000 agents all back at T0 + 22.7 to 23.3 s (10 s and 60 s outages), 2000 agents at T0 + 46.1 s; breaker closed throughout (the generator sends no inventory), 0 drops, original session ids kept |
+| K7 (pass 6) | `c518edd93` | 5 minute steady state after K4c, 1 real agent | WARN 0, ERROR 0, 0 flush errors |
+
+The K0 to K7 rows marked pass 6 are one run set (the evidence record's "Rig pass 6" has the full figures and caveats); the unmarked K1 and K2 above are the earlier investigation on a different commit. All pass 6 runs were loopback, plaintext, one core replica, a debug-built C++ server and PostgreSQL with fsync off, on a shared box.
 
 Details of what these runs showed:
 
@@ -1589,9 +1599,11 @@ Details of what these runs showed:
 The period per agent is the ProxyRegister RPC time plus the spacing
 (`registration_replay_spacing_ms`, 20 ms by default) plus scheduling. The
 figures below are arithmetic on those constants, not measurements: the
-largest real runs of the replay drip were 30 agents (runs E3b, F2 and F3b under
-"Observed on a rig", drip gap median 42 to 43 ms per agent with the default
-20 ms spacing; the heartbeat connection-binding soak with 27 agents, recorded in
+largest real-agent runs of the replay drip were 30 agents (runs E3b, F2 and F3b
+under "Observed on a rig", drip gap median 42 to 43 ms per agent with the default
+20 ms spacing; rig pass 6 later ran the drip at 1000 and 2000 simulated agents
+from a load generator, run K6, see "Replay recovery at fleet scale" below; the
+heartbeat connection-binding soak with 27 agents, recorded in
 [its evidence record](../security-reviews/gateway-heartbeat-connection-binding-2026-10-03.md),
 did not exercise the replay drip), and the fleet-scale measurement is
 tracked in #5313.
@@ -1628,22 +1640,27 @@ The server's own handler time for a real-size `Register` was 1 to 2 ms, new
 enrollment included (derived from client-side latency, the server has no such
 metric). Bursts of simultaneous registrations, one connection per agent:
 
-| Agents | Stock gateway | With nodelay |
-|---|---|---|
-| 1000, one burst | 703 registered inside the 30 s deadline, 297 hit it | not run |
-| 2000, one burst, agents retry | all registered after 776 s (85 s ideal), 5.9 attempts per agent | 3.8 s, 0 retries |
-| 5000, one burst, agents retry | not run | 10.2 s, 0 retries |
+| Agents | Stock gateway (before the change) | With nodelay (kernel-wide setting, earlier measurement) | Shipped setting, no override (rig pass 6, `c518edd93`) |
+|---|---|---|---|
+| 1000, one burst | 703 registered inside the 30 s deadline, 297 hit it | not run | all registered, last at 1.89 s (three runs: 1.89, 2.11 and 2.09 s), 0 deadline failures; the same load with `upstream_tcp_nodelay` set to `false`: 703 registered, 297 hit the deadline, last agent at 55.5 s |
+| 2000, one burst, agents retry | all registered after 776 s (85 s ideal), 5.9 attempts per agent | 3.8 s, 0 retries | 4.16 s, 0 failures, 2000 attempts |
+| 5000, one burst, agents retry | not run | 10.2 s, 0 retries | 12.08 s, 0 failures, 5000 attempts |
 
 The "With nodelay" column was measured with the equivalent kernel-wide setting
 (`inet_default_connect_options` with `{nodelay, true}`) in the gateway's
-`sys.config`, not with `upstream_tcp_nodelay`. The per-endpoint `socket_options`
-setting that the key applies was measured by writing it into the channel
-declaration by hand, on the same commit and against an in-VM fake upstream only:
-40 concurrent real-size registrations took 1,665 ms stock and 43 ms with it, and
-a serial call 42 ms and 1 ms. A rig pass
-with the final commit (1000 and 2000 agent cold starts) is pending; until it
-runs, treat the nodelay column as the expected result of this change, not as a
-measurement of it.
+`sys.config`, not with `upstream_tcp_nodelay`, on the earlier commit; it is kept
+as it was recorded. The last column is the shipped mechanism: OBSERVED in rig pass
+6 on `c518edd93`, with no nodelay setting in `sys.config` (the default `true`; the
+start log and the socket confirmed it, run K0), and the clients were simulated
+agents from a load generator (one connection per agent, the real 9,054 byte
+`Register`, the 30 s deadline and the agents' retry backoff), not real agents. It
+was loopback, a debug-built server, PostgreSQL with fsync off, on a box shared
+with other sessions (the 5000 agent run peaked at 597% gateway CPU). A stock
+5000-agent burst (with the key off) was not run. The per-endpoint `socket_options`
+setting that the key applies was also measured earlier by writing it into the
+channel declaration by hand, on `71ee2b02f` and against an in-VM fake upstream
+only: 40 concurrent real-size registrations took 1,665 ms stock and 43 ms with it,
+and a serial call 42 ms and 1 ms.
 
 Three consequences. First, the agents give up on a `Register` after 30 s, and 24
 per second times 30 s is about 700, so a simultaneous burst of more than about
@@ -1656,13 +1673,35 @@ and drained at 24 per second). Third, the replay drip's spacing
 (`registration_replay_spacing_ms`, 20 ms by default) was never the limit on a
 stock gateway: each call took about 43 ms, so the call time set the pace. With
 nodelay a call takes 1 to 2 ms, so the spacing becomes the pace of the drip
-(INFERRED from the code and the figures above, not run: the 5 ms row of the table
-under "Load and convergence bounds" is the nearest). Not measured: a replay of
-thousands of sessions through the drip, TLS (the certificate request adds about 1
+(INFERRED from the code and the figures above; the next paragraph has the
+measured replay at 1000 and 2000 simulated agents, and the 5 ms row of the table
+under "Load and convergence bounds" is the arithmetic). Not measured: a replay of
+5000 sessions through the drip, TLS (the certificate request adds about 1
 KiB to each `Register`), a non-loopback network (its round trip adds to each
 call), a stock 5000-agent burst, and the effect of a registration storm on
 inventory traffic (it runs through the same process) and on heartbeat batches
 (INFERRED from the code: they call the channel directly, not through the process).
+
+**Replay recovery at fleet scale.** OBSERVED in rig pass 6 on `c518edd93`
+(loopback, one box shared with other sessions, a debug-built server,
+PostgreSQL with fsync off, plaintext; the agents were simulated by a load
+generator that heartbeats and holds a `Subscribe` open but answers no commands and
+sends no inventory): after a server-only restart (kill -9 of the server, outages of
+10 s and 60 s), 1000 simulated agents were all back 22.7 to 23.3 s after the
+restarted server's first `/health` 200, and 2000 agents 46.1 s. Recovery was
+linear in the agent count at about 22.5 ms per agent, which is the replay
+spacing (20 ms by default) plus about 2 ms per upstream call: with the Nagle delay
+gone, the drip sets the pace, not the upstream call. All sessions were re-adopted
+under their original session ids, with 0 `circuit_open` or `queue_full` verdict
+drops and 0 buffer drops. For 5000 agents the same rate gives about 115 s;
+that is arithmetic on the observed rate, not a measurement (K6 at 5000 agents was
+not run). The breaker stayed closed in these runs because the generator sends no
+inventory, so nothing fed it; the open-breaker recovery was measured only with
+real agents, at 45 agents or fewer (45 agents back at T0 + 17.3 s with the
+breaker open, run K4b). A real fleet adds inventory, snapshots and a non-loopback
+round trip to each call, none of which was measured at this scale. Spacing is the
+operator's lever (`registration_replay_spacing_ms`); each agent costs the spacing
+plus the call.
 
 | Symptom | What you see | Cause | Action |
 |---|---|---|---|
@@ -1920,6 +1959,41 @@ env keys with defaults, which a reverted build ignores.
   the brief gap between `Subscribe` taking the pending row and the live insert
   (the agent retries, INFERRED about 2 s later). Details under "Per-connection
   session cap" in Configuration.
+- **Cold-start notifications are shed at the in-flight limit, so most route rows
+  stay tombstoned until the replay runs.** OBSERVED in rig pass 6 (runs K1 and K6
+  of that pass) and, per the local rig notes, in the cold start of pass 5 run J1;
+  pre-existing, not introduced by this change. After a cold `Subscribe` wave of
+  1000 simulated agents `yuzu_gw_upstream_notify_dropped_total{reason="at_capacity"}`
+  was 987 (989 and 988 in two repeats, and 1953 after 2000 agents).
+  `MAX_NOTIFY_INFLIGHT` is 10 in `yuzu_gw_upstream.erl`, so `CONNECTED`
+  notifications beyond 10 in flight are shed best effort. The server's route table
+  before the restart showed `live=13 tomb=987` for the 1000 agent run; the rows are
+  only filled when the replay (or a re-announce) runs, after which it showed
+  `live=1000 tomb=0`. With 30 real agents cold started the same effect gave 13
+  drops. The counter did not move during the restart itself. The consequence is
+  that the server's `online` count and its route rows disagree after a large cold
+  start. It is covered by the planned follow-up (i) below, a bounded pending queue
+  for dropped notifications, and by #4632 (the in-flight notification limit).
+- **A refused `Subscribe` reaches the client as status 2 (`process exited without
+  reason`), not as `NOT_FOUND`, and logs an error report.** OBSERVED in rig pass 6
+  (run K5) with an Erlang probe client, not with a real agent: for a `Subscribe`
+  with no pending registration the gateway logged the WARN `Subscribe: no pending
+  registration for session` and then an `[error] crasher` report from
+  `grpcbox_stream:handle_streams/2` carrying `throw: {grpc_error, {<<"5">>,
+  <<"No pending registration for session">>}}`, and the probe's stream ended with
+  status 2 instead of 5. INFERRED from the code: `yuzu_gw_agent_service:subscribe/2`
+  signals its refusals with `throw({grpc_error, ...})`, which crashes the stream
+  process of a bidirectional streaming call. The same throw pattern exists on
+  `origin/dev` (`subscribe/2` there throws at its argument, pending-registration
+  and internal-error refusals; checked with `git show` and `grep -n throw`), so
+  this is not introduced by this change. No functional effect was seen in pass 6,
+  but no real agent was refused: from `agents/core/src/agent.cpp` (not run) a
+  non-OK `Register` goes back to the retry loop and an ended `Subscribe` stream
+  goes through the reconnect loop, whichever status the stream ended with, so the
+  agent re-registers either way. Expect one error report per refused `Subscribe`
+  (for example after the dead connection grace has passed). Follow-up, no issue
+  number yet: answer these refusals with a status returned from the handler rather
+  than a throw.
 - Related tracked items: #5244 (an idempotent adopt: a re-adopt of a session the
   server already holds wipes placement), #4632 (the in-flight notification limit
   on the convergence path), #5278 (verdict follow-ups: the desync log seam and a
