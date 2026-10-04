@@ -1345,6 +1345,24 @@ one core replica a server-only restart now recovers through the replay described
   `yuzu_gw_registration_replay_triggered_total{trigger="heartbeat"}` rising at the guard rate. The
   durable cross-replica session lookup (WS-5, `#4246` #3) is the fix; until it lands the safe-to-scale
   gate forbids a second replica.
+- **Observed on a local rig, not reproducible from the repository (one real agent, one core replica,
+  debug builds).** After a server-only restart the replay came on the first agent heartbeat after the
+  server was healthy again (about 17 s in the 10 s outage runs, with the same session id and no agent
+  reconnect), and again about 17 s after restart on a rig with gateway-to-server mutual TLS and
+  agent-to-gateway one-way TLS (web UI over plain HTTP; HTTPS on the web UI was not tested). After a 300 s
+  outage that had opened the gateway circuit breaker, recovery took 58 s: the first two verdicts were
+  dropped as `circuit_open`, and the replay ran once the breaker went half open (INFERRED from the code:
+  the same transition recovered the gateway before this change, so a breaker-opening outage is bounded by
+  the breaker's remaining backoff, capped at 300 s, plus a heartbeat interval and a flush). With the breaker
+  never opened, the replay came 4.2 s after the server was healthy. Not tested: more than one agent, scale,
+  several replicas, agents started with `--no-auto-update`.
+- **Known limit (observed, not fixed here).** A route row the server's lease reaper tombstones while the
+  server stays up (observed after a 6.9 minute gateway-to-server partition) is not repaired: the verdict
+  is computed from the server's in-memory session map, which still holds the session (INFERRED from
+  `gateway_service_impl.cpp`), so no verdict and no replay follow. Commands kept working in the observed
+  run, and with one replica dispatch uses the in-memory map (INFERRED), so this is a gap for HA and
+  multi-replica routing, not for one replica. It is related to #4627 and is not a regression. Signal: a repeating `renew_leases` shortfall
+  warning on the server with no `Registration replay` line on the gateway after the partition heals.
 - **What it does not promise.** Fleet completion inside a route lease (the drip period is the
   ProxyRegister RPC time plus the spacing, so the time to drain scales with the number of agents), and
   dispatch reachability after the session is adopted (placement converges when the agent's re-sent
