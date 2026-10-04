@@ -38,19 +38,26 @@
 #include <yuzu/plugin.hpp>
 #include <yuzu/string_utils.hpp>
 
+#include "filesystem_acl_parsers.hpp"
+
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cstdint>
 #include <cstdio>
 #include <filesystem>
 #include <format>
 #include <fstream>
+#include <memory>
+#include <optional>
 #include <regex>
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <system_error>
+#include <type_traits>
 #include <vector>
 
 #ifdef _WIN32
@@ -77,6 +84,13 @@
 #pragma comment(lib, "version.lib")
 #else
 #include <sys/stat.h>
+#ifdef __linux__
+#include <sys/xattr.h>
+#endif
+#ifdef __APPLE__
+#include <sys/acl.h>
+#endif
+#include <cerrno>
 #include <grp.h>
 #include <pwd.h>
 #include <unistd.h>
@@ -427,9 +441,9 @@ bool atomic_write_file(const fs::path& target, std::string_view content) {
 //     yuzu::agent::run_bounded_subprocess exec'ing an ABSOLUTE-path
 //     shasum/sha256sum/sha1sum — argv, no shell (rung 2, compute_hash_unix).
 //   - get_acl: Windows uses GetNamedSecurityInfo/DACL enumeration (native,
-//     rung 1). The #else branch (Linux AND macOS both take it) is stat()-only
-//     basic owner/group/permission bits — no ACL/ACE enumeration — a real
-//     limitation, so CONSTRAINED rather than SUPPORTED on those two legs.
+//     rung 1). Linux reads the system.posix_acl_access/_default xattrs via
+//     getxattr (no libacl); macOS reads ACL_TYPE_EXTENDED via acl_get_file —
+//     both native in-process calls, rung 1, SUPPORTED.
 //   - get_signature: Windows WinVerifyTrust (native, rung 1). macOS execs
 //     /usr/bin/codesign via run_bounded_subprocess (argv, no shell — rung 2,
 //     per the objective's reference point). Linux has no equivalent
@@ -480,10 +494,8 @@ const YuzuActionDescriptor kActionDescriptors[] = {
     },
     {
         "get_acl",
-        {YUZU_SUPPORT_CONSTRAINED, 1, "posix_stat",
-         "stat()-only basic owner/group/permission bits; no ACL/ACE enumeration"},
-        {YUZU_SUPPORT_CONSTRAINED, 1, "posix_stat",
-         "stat()-only basic owner/group/permission bits; no ACL/ACE enumeration"},
+        {YUZU_SUPPORT_SUPPORTED, 1, "posix_stat+getxattr(system.posix_acl_*)", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 1, "posix_stat+acl_get_file(ACL_TYPE_EXTENDED)", nullptr},
         {YUZU_SUPPORT_SUPPORTED, 1, "win32_acl", nullptr},
     },
     {
@@ -1013,6 +1025,156 @@ private:
 
     // ── get_acl: Return file/directory ACL permissions ────────────────────
 
+#ifdef _WIN32
+    // DOMAIN\name via LookupAccountSidW (size query, then exact-size buffers);
+    // falls back to the string SID.
+    std::string win_account_for_sid(PSID sid) {
+        DWORD name_len = 0, domain_len = 0;
+        SID_NAME_USE use;
+        LookupAccountSidW(nullptr, sid, nullptr, &name_len, nullptr, &domain_len, &use);
+        if (GetLastError() == ERROR_INSUFFICIENT_BUFFER && name_len > 0) {
+            std::wstring name(name_len, L'\0'), domain(domain_len, L'\0');
+            if (LookupAccountSidW(nullptr, sid, name.data(), &name_len, domain.data(), &domain_len,
+                                  &use)) {
+                return std::format("{}\\{}", yuzu::win::from_wide(domain.c_str()),
+                                   yuzu::win::from_wide(name.c_str()));
+            }
+        }
+        LPWSTR sid_str = nullptr;
+        if (!ConvertSidToStringSidW(sid, &sid_str))
+            return {};
+        auto account = yuzu::win::from_wide(sid_str);
+        LocalFree(sid_str);
+        return account;
+    }
+#elif defined(__linux__)
+    struct XattrRead {
+        enum class Kind { present, absent, unsupported, error } kind = Kind::absent;
+        std::vector<char> data;
+        std::string error;
+    };
+
+    XattrRead read_acl_xattr(const std::string& path, const char* name) {
+        XattrRead r;
+        r.data.resize(64 * 1024);
+        const ssize_t n = ::getxattr(path.c_str(), name, r.data.data(), r.data.size());
+        if (n >= 0) {
+            r.data.resize(static_cast<size_t>(n));
+            r.kind = XattrRead::Kind::present;
+            return r;
+        }
+        const int e = errno;
+        r.data.clear();
+        switch (e) {
+        case ENODATA: r.kind = XattrRead::Kind::absent; break;
+        case ENOTSUP: r.kind = XattrRead::Kind::unsupported; break;  // == EOPNOTSUPP on Linux
+        case ERANGE: r.kind = XattrRead::Kind::error; r.error = "acl too large"; break;
+        case EACCES:
+        case EPERM:
+            r.kind = XattrRead::Kind::error;
+            r.error = "getxattr failed (permission denied)";
+            break;
+        default:
+            r.kind = XattrRead::Kind::error;
+            r.error = std::format("getxattr failed ({})", std::generic_category().message(e));
+            break;
+        }
+        return r;
+    }
+
+    // Name for a qualifier id, or the numeric id when unresolved. _r variants only.
+    std::string posix_qualifier_name(std::uint16_t tag, std::uint32_t id) {
+        std::array<char, 16384> buf;
+        if (tag == yuzu::filesystem::acl::kAclUser) {
+            passwd pw{};
+            passwd* res = nullptr;
+            if (getpwuid_r(static_cast<uid_t>(id), &pw, buf.data(), buf.size(), &res) == 0 && res)
+                return res->pw_name;
+        } else {
+            group gr{};
+            group* res = nullptr;
+            if (getgrgid_r(static_cast<gid_t>(id), &gr, buf.data(), buf.size(), &res) == 0 && res)
+                return res->gr_name;
+        }
+        return std::to_string(id);
+    }
+
+    // Appends the acl|... and ace|... rows; returns an error message on failure.
+    // Both attributes are read before any row is produced.
+    std::optional<std::string> collect_acl_rows(const std::string& path, bool is_dir,
+                                                std::vector<std::string>& rows) {
+        namespace acl = yuzu::filesystem::acl;
+        auto access = read_acl_xattr(path, "system.posix_acl_access");
+        if (access.kind == XattrRead::Kind::error)
+            return access.error;
+        if (access.kind == XattrRead::Kind::unsupported) {
+            rows.emplace_back("acl|unsupported|-");
+            return std::nullopt;
+        }
+        XattrRead def;
+        if (is_dir) {
+            def = read_acl_xattr(path, "system.posix_acl_default");
+            if (def.kind == XattrRead::Kind::error)
+                return def.error;
+        }
+        if (access.kind != XattrRead::Kind::present && def.kind != XattrRead::Kind::present) {
+            rows.emplace_back("acl|none|-");
+            return std::nullopt;
+        }
+        rows.emplace_back("acl|extended|-");
+        for (auto* attr : {&access, &def}) {
+            if (attr->kind != XattrRead::Kind::present)
+                continue;
+            auto entries = acl::decode_posix_acl_xattr({attr->data.data(), attr->data.size()});
+            if (!entries)
+                return "acl xattr unparseable";
+            for (const auto& e : *entries) {
+                const bool qualified = e.tag == acl::kAclUser || e.tag == acl::kAclGroup;
+                rows.push_back(acl::format_posix_ace(
+                    e, qualified ? posix_qualifier_name(e.tag, e.id) : std::string{},
+                    attr == &def));
+            }
+        }
+        return std::nullopt;
+    }
+#elif defined(__APPLE__)
+    using AclPtr = std::unique_ptr<std::remove_pointer_t<acl_t>, int (*)(void*)>;
+    using AclTextPtr = std::unique_ptr<char, int (*)(void*)>;
+
+    std::optional<std::string> collect_acl_rows(const std::string& path, bool /*is_dir*/,
+                                                std::vector<std::string>& rows) {
+        namespace acl = yuzu::filesystem::acl;
+        AclPtr a{::acl_get_file(path.c_str(), ACL_TYPE_EXTENDED), ::acl_free};
+        if (!a) {
+            const int e = errno;
+            if (e == ENOENT) {  // macOS: no extended ACL on the file (verified with a real call)
+                rows.emplace_back("acl|none|-");
+                return std::nullopt;
+            }
+            if (e == EACCES || e == EPERM)
+                return "acl_get_file failed (permission denied)";
+            return std::format("acl_get_file failed ({})", std::generic_category().message(e));
+        }
+        ssize_t len = 0;
+        AclTextPtr text{::acl_to_text(a.get(), &len), ::acl_free};
+        if (!text || len < 0)
+            return "acl_to_text failed";
+        auto parsed = acl::parse_acl_to_text({text.get(), static_cast<size_t>(len)});
+        if (!parsed)
+            return "acl text unparseable";
+        rows.push_back("acl|extended|" + acl::detail::join_or_dash(parsed->acl_flags));
+        for (const auto& e : parsed->entries)
+            rows.push_back(acl::format_macos_ace(e));
+        return std::nullopt;
+    }
+#else
+    std::optional<std::string> collect_acl_rows(const std::string&, bool,
+                                                std::vector<std::string>& rows) {
+        rows.emplace_back("acl|unsupported|-");
+        return std::nullopt;
+    }
+#endif
+
     int do_get_acl(yuzu::CommandContext& ctx, yuzu::Params params) {
         auto path = params.get("path");
         if (path.empty()) {
@@ -1029,29 +1191,40 @@ private:
 
 #ifdef _WIN32
         // Windows: Use GetNamedSecurityInfo to retrieve the DACL
-        PSECURITY_DESCRIPTOR sd = nullptr;
+        namespace acl = yuzu::filesystem::acl;
+        PSECURITY_DESCRIPTOR sd_raw = nullptr;
         PACL dacl = nullptr;
         const std::wstring wpath = yuzu::win::to_wide(validated); // (#1681) .c_str() consumer
 
         DWORD result = GetNamedSecurityInfoW(
             wpath.c_str(), SE_FILE_OBJECT,
             OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
-            nullptr, nullptr, &dacl, nullptr, &sd);
+            nullptr, nullptr, &dacl, nullptr, &sd_raw);
 
         if (result != ERROR_SUCCESS) {
             ctx.write_output(std::format("error|GetNamedSecurityInfo failed (error {})", result));
             return 1;
         }
+        std::unique_ptr<void, decltype(&LocalFree)> sd{sd_raw, LocalFree};
 
         // Convert security descriptor to SDDL string for readable output
         LPSTR sddl_str = nullptr;
         if (ConvertSecurityDescriptorToStringSecurityDescriptorA(
-                sd, SDDL_REVISION_1,
+                sd.get(), SDDL_REVISION_1,
                 OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
                 &sddl_str, nullptr)) {
             ctx.write_output(std::format("sddl|{}", sddl_str));
             LocalFree(sddl_str);
         }
+
+        SECURITY_DESCRIPTOR_CONTROL control = 0;
+        DWORD sd_rev = 0;
+        if (!GetSecurityDescriptorControl(sd.get(), &control, &sd_rev)) {
+            ctx.write_output(
+                std::format("error|GetSecurityDescriptorControl failed ({})", GetLastError()));
+            return 1;
+        }
+        ctx.write_output(acl::format_control_row(control));
 
         // Enumerate individual ACEs
         if (dacl) {
@@ -1059,54 +1232,64 @@ private:
             if (GetAclInformation(dacl, &acl_info, sizeof(acl_info), AclSizeInformation)) {
                 for (DWORD i = 0; i < acl_info.AceCount; ++i) {
                     LPVOID ace = nullptr;
-                    if (!GetAce(dacl, i, &ace)) continue;
+                    if (!GetAce(dacl, i, &ace)) {
+                        ctx.write_output(
+                            std::format("error|GetAce failed at index {} ({})", i, GetLastError()));
+                        return 1;
+                    }
 
                     auto* header = static_cast<ACE_HEADER*>(ace);
-                    std::string ace_type =
-                        (header->AceType == ACCESS_ALLOWED_ACE_TYPE) ? "allow" :
-                        (header->AceType == ACCESS_DENIED_ACE_TYPE)  ? "deny"  : "other";
-
                     PSID sid = nullptr;
                     ACCESS_MASK mask = 0;
-                    if (header->AceType == ACCESS_ALLOWED_ACE_TYPE) {
+                    switch (header->AceType) {
+                    case ACCESS_ALLOWED_ACE_TYPE:
+                    case ACCESS_DENIED_ACE_TYPE:
+                    case ACCESS_ALLOWED_CALLBACK_ACE_TYPE:
+                    case ACCESS_DENIED_CALLBACK_ACE_TYPE: {
+                        // Same leading layout; a callback ACE's condition blob follows the SID
+                        // and is not decoded.
                         auto* a = static_cast<ACCESS_ALLOWED_ACE*>(ace);
                         sid = &a->SidStart;
                         mask = a->Mask;
-                    } else if (header->AceType == ACCESS_DENIED_ACE_TYPE) {
-                        auto* a = static_cast<ACCESS_DENIED_ACE*>(ace);
-                        sid = &a->SidStart;
+                        break;
+                    }
+                    case ACCESS_ALLOWED_OBJECT_ACE_TYPE:
+                    case ACCESS_DENIED_OBJECT_ACE_TYPE: {
+                        auto* a = static_cast<ACCESS_ALLOWED_OBJECT_ACE*>(ace);
+                        auto off = acl::win_object_ace_sid_offset(a->Flags, header->AceSize);
+                        if (!off) {
+                            ctx.write_output(std::format("error|malformed object ACE at index {}", i));
+                            return 1;
+                        }
+                        sid = reinterpret_cast<unsigned char*>(ace) + *off;
                         mask = a->Mask;
+                        break;
+                    }
+                    default:
+                        break;
                     }
 
-                    if (sid) {
-                        char name[256]{}, domain[256]{};
-                        DWORD name_len = sizeof(name), domain_len = sizeof(domain);
-                        SID_NAME_USE use;
-                        std::string account;
-                        if (LookupAccountSidA(nullptr, sid, name, &name_len,
-                                              domain, &domain_len, &use)) {
-                            account = std::format("{}\\{}", domain, name);
-                        } else {
-                            LPSTR sid_str = nullptr;
-                            if (ConvertSidToStringSidA(sid, &sid_str)) {
-                                account = sid_str;
-                                LocalFree(sid_str);
-                            }
-                        }
-                        ctx.write_output(std::format("ace|{}|{}|0x{:08x}", ace_type, account, mask));
-                    }
+                    ctx.write_output(acl::format_win_ace(
+                        header->AceType, header->AceFlags,
+                        sid ? win_account_for_sid(sid) : std::string{"-"}, mask));
                 }
             }
         }
 
-        LocalFree(sd);
         return 0;
 
 #else
-        // Linux/macOS: Use stat() for basic POSIX permissions
+        // Linux/macOS: stat() for the basic bits, then the extended ACL.
         struct stat st{};
         if (stat(validated.c_str(), &st) != 0) {
             ctx.write_output("error|stat failed");
+            return 1;
+        }
+
+        // Acquire the whole ACL before emitting anything, so a failure is one error row.
+        std::vector<std::string> acl_rows;
+        if (auto err = collect_acl_rows(validated, S_ISDIR(st.st_mode), acl_rows)) {
+            ctx.write_output("error|" + *err);
             return 1;
         }
 
@@ -1131,6 +1314,8 @@ private:
 
         ctx.write_output(std::format("permissions|{}", perms));
         ctx.write_output(std::format("mode|{:04o}", st.st_mode & 07777));
+        for (const auto& row : acl_rows)
+            ctx.write_output(row);
         return 0;
 #endif
     }
