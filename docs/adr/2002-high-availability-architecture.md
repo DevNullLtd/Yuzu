@@ -1426,7 +1426,11 @@ one core replica a server-only restart now recovers through the replay described
   oldest first and then whole sessions oldest first; a single heartbeat over 3 MiB is sent without its
   snapshot; and `max_heartbeat_buffer` now counts sessions, dropping a heartbeat of a new session when full.
   New counters: `yuzu_gw_heartbeat_buffer_dropped_total{reason}` (`buffer_full`, `snapshot_oversize`,
-  `snapshot_evicted`) and `yuzu_gw_heartbeat_coalesced_total`. Consequences: the server's
+  `snapshot_evicted`, and the later `heartbeat_oversize`, `heartbeat_invalid`, `chunk_rejected`) and
+  `yuzu_gw_heartbeat_coalesced_total`. A later review round added a bounded drop for a heartbeat that cannot be
+  sent (still over the chunk limit without its snapshot, invalid UTF-8, or rejected by the server with a
+  non-transient status) so that one such heartbeat cannot block newer ones, and a flush of at most 8 chunks per
+  cycle; transient failures still keep heartbeats buffered (probed against a fake server, not rig-run). Consequences: the server's
   `yuzu_heartbeats_received_total{via="gateway"}` under-counts while a backlog is coalesced, and an agent's
   topology snapshot can be one agent snapshot cycle older after an eviction. The server's 4 MiB receive
   limit is unchanged and not raised. The post-change rig run (`990e57e48`, 1 to 30 agents, plaintext, debug builds) recovered where the old gateway did not; see the evidence record. Not tested and known limits: 100 or more agents and a backlog that reaches the default byte cap; the

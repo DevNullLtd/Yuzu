@@ -167,14 +167,35 @@ snapshot must not erase the last one. `yuzu_gw_heartbeat_coalesced_total` counts
 each replacement.
 
 **Chunked flush.** A flush is split into chunks of at most about 3 MiB
-(estimated), oldest first, so that no `BatchHeartbeat` request approaches the
-server's gRPC receive limit of 4194304 bytes (4 MiB). The verdict of each chunk
-that succeeds is consumed as usual (see
+(estimated), oldest first, so that a `BatchHeartbeat` request the gateway builds
+stays under the server's gRPC receive limit of 4194304 bytes (4 MiB). The verdict
+of each chunk that succeeds is consumed as usual (see
 [What happens when the server restarts](#what-happens-when-the-server-restarts)).
-A chunk that fails, and the chunks not yet sent, stay buffered for the next
-flush. A single heartbeat that is by itself larger than 3 MiB is sent without its
-snapshot (`yuzu_gw_heartbeat_buffer_dropped_total{reason="snapshot_oversize"}`).
-On a rig the largest chunk observed was 3,142,583 bytes, under the 3 MiB packing
+A flush sends at most 8 chunks (about 24 MiB) per cycle (one cycle is
+`heartbeat_batch_interval_ms`, 1 s by default); what is left stays buffered for
+the next cycle, so a long backlog drains over several cycles. A chunk that fails
+for a transient reason (the server is unreachable, a timeout), and the chunks not
+yet sent, stay buffered for the next flush; transient server trouble does not lose
+heartbeats. A chunk the server rejects with a non-transient status (for example
+`RESOURCE_EXHAUSTED`) is retried entry by entry when it holds more than one
+heartbeat, and a single heartbeat that is still rejected is dropped and counted
+(`yuzu_gw_heartbeat_buffer_dropped_total{reason="chunk_rejected"}`), so that it
+cannot block the newer heartbeats behind it. A single heartbeat that is by itself
+larger than 3 MiB is sent without its snapshot
+(`yuzu_gw_heartbeat_buffer_dropped_total{reason="snapshot_oversize"}`, counted
+only when a snapshot was present). A heartbeat that is still larger than 3 MiB
+after its snapshot is removed (for example from very large status tags), or that
+carries more than 512 status tags, is dropped and counted
+(`reason="heartbeat_oversize"`); it is not retried. A heartbeat whose session id
+or a status tag is not valid UTF-8 is dropped and counted
+(`reason="heartbeat_invalid"`). Before these drop reasons existed, one heartbeat
+over the server's 4 MiB limit (5 to 8 MiB of status tags; the gateway had no
+inbound size cap) blocked every newer heartbeat until its own session heartbeated
+again (verified by two reviewers with a fake server and a real registered agent;
+not run on a rig), and an invalid UTF-8 heartbeat made the buffer process crash
+and lose every buffered heartbeat (found by a review probe, not on a rig; the
+crash was there before this work). On a rig the largest chunk observed was
+3,142,583 bytes, under the 3 MiB packing
 limit of 3,145,728 bytes; chunk sizes are in no log or metric. The line
 `Flushed N heartbeats in M chunk(s)` is logged at INFO only when a flush needed
 more than one chunk (M greater than 1) and at DEBUG otherwise.
@@ -190,7 +211,9 @@ oldest first
 (`yuzu_gw_heartbeat_buffer_dropped_total{reason="snapshot_evicted"}`), and only when
 no entry holds a snapshot any more is the oldest whole session dropped (counted as
 `reason="buffer_full"`). What is lost is only older heartbeat state: the agent
-sends its next heartbeat on its own interval.
+sends its next heartbeat on its own interval. The same holds for a dropped
+`heartbeat_oversize`, `heartbeat_invalid` or `chunk_rejected` heartbeat: one
+heartbeat is lost, and the agent sends the next on its own interval.
 
 **Consequences.**
 
@@ -616,10 +639,10 @@ client at start, except `upstream_call_timeout_ms`, which is read on every call;
 | `registration_replay_spacing_ms` | 20 | 0 to 60000 | Gap between two replay `ProxyRegister` calls in the replay drip |
 | `registration_replay_session_guard_ms` | 10000 | 0 to 3600000 | A session that was just replayed is not queued again by a heartbeat verdict until this many ms have passed. The stamp is taken when the replay is sent, so a stale verdict can arrive up to the 5 s flush deadline (the vendored grpcbox client default) plus the replay RPC time later (INFERRED from the code): do not set it below 5000 plus the expected replay RPC time, because a smaller guard lets such a stale verdict replay a session the server already knows; the default 10000 is safe (see "Replaying a session the server already knows is not free" under [What happens when the server restarts](#what-happens-when-the-server-restarts)) |
 | `registration_replay_queue_max` | 10000 | 1 to 1000000 | Most agents the replay queue holds when a heartbeat verdict appends to it; there is one pending entry per agent, and an id past the cap is counted in `yuzu_gw_heartbeat_verdict_dropped_total{reason="queue_full"}` (so is an id in a verdict that the heartbeat buffer did not cast because the upstream client's mailbox held more than 100 messages, see "Heartbeat batching interval" below). The cap bounds only verdict appends: the snapshot a breaker recovery seeds is not capped (it is bounded by the number of agents the node holds, as before), and while a snapshot of this size or larger drains, every verdict id for an agent not already queued counts as `queue_full` |
-| `upstream_call_timeout_ms` | 30000 | any positive integer | How long `yuzu_gw_upstream:proxy_register/1` and `proxy_inventory/1` wait for the upstream client before the call gives up with `{error, upstream_unavailable}` and one caller-side warning that names the class `timeout`. Read on every call, not at start. It exists so a test can exercise the timeout without waiting 30 s, and it also works as a setting. A value that is not a positive integer falls back to the default without a warning |
+| `upstream_call_timeout_ms` | 30000 | 100 to 300000 | How long `yuzu_gw_upstream:proxy_register/1` and `proxy_inventory/1` wait for the upstream client before the call gives up with `{error, upstream_unavailable}` and one caller-side warning that names the class `timeout`. Read on every call, not at start. It exists so a test can exercise the timeout without waiting 30 s, and it also works as a setting. A value outside the range, or one that is not an integer, falls back to the default with a WARN that names the key |
 
-An invalid value for any of the first three keys logs one warning that names the
-key and falls back to the default; `upstream_call_timeout_ms` falls back silently. See
+An invalid value for any of these keys falls back to the default and logs a
+warning that names the key. See
 [What happens when the server restarts](#what-happens-when-the-server-restarts).
 
 **Heartbeat batching interval** (read by the heartbeat buffer at start; unlike
@@ -647,7 +670,10 @@ Application env keys read by the heartbeat buffer at start (set them in the
 | `max_heartbeat_buffer_bytes` | 67108864 (64 MiB) | 1048576 to 1073741824 | Most bytes (estimated) the buffer retains across a failed flush. When the buffer is over this cap, snapshots are dropped oldest first (`reason="snapshot_evicted"`); only when none is left is the oldest whole session dropped (`reason="buffer_full"`). A value outside the range logs one warning that names the key and falls back to the default. Do not set it below a few MiB: on a rig with the 1048576 minimum and 5 agents, `snapshot_evicted` kept rising after the server was back, because two snapshot-bearing heartbeats (about 0.8 MB each) landing in one 1 s flush window exceed that cap. The default 64 MiB was not observed to evict in the rig runs (see "Observed on a rig"). |
 
 A flush is split into chunks of at most about 3 MiB (estimated), a fixed value
-that is not configurable. Size the byte cap for the largest backlog you want to
+that is not configurable, and sends at most 8 chunks (about 24 MiB) per flush
+cycle, also fixed; the rest stays buffered for the next cycle. A heartbeat larger
+than the chunk limit after its snapshot is removed is dropped and counted, not
+retried (`reason="heartbeat_oversize"`, see "Heartbeat Batching"). Size the byte cap for the largest backlog you want to
 survive: each session's entry can carry a snapshot of several hundred KB (observed
 on one rig, see "Known limits" below), so 64 MiB holds roughly 80 to 330 such
 snapshots at once (arithmetic on the default and the observed 200 to 800 KB range,
@@ -921,7 +947,7 @@ agent build that re-registers by itself; released agents do not (see
 | gateway | WARN | `Registration replay: <agent> failed: <reason>` | A replay `ProxyRegister` failed. It counts as a failure for the shared circuit breaker (see "Replay failures feed the shared circuit breaker" below). |
 | gateway | metric | `yuzu_gw_registration_replay_triggered_total{trigger="breaker"}` rising | The circuit breaker closed after an outage and the gateway replayed every agent this node holds. Expected after a long outage when the breaker opened (see "Several agents and a long outage" below). No action. |
 | gateway | metric | `yuzu_gw_heartbeat_coalesced_total` rising | Newer heartbeats of a session are replacing older buffered ones, one at a time. Expected during a server outage: heartbeats pile up between failed flushes and are merged, so the buffer stays at one entry per session. No action. The server's `yuzu_heartbeats_received_total{via="gateway"}` falls short of the number of heartbeats the agents sent for the same reason; that is not a loss of agents. |
-| gateway | metric | `yuzu_gw_heartbeat_buffer_dropped_total{reason}` rising | The buffer is under pressure, typically after a long server outage. `snapshot_evicted`: older snapshots were dropped to stay under `max_heartbeat_buffer_bytes`, oldest first. `buffer_full`: the buffer held `max_heartbeat_buffer` sessions and a heartbeat of a new session was dropped, or it was still over `max_heartbeat_buffer_bytes` with no snapshot left and its oldest whole session was dropped. `snapshot_oversize`: one heartbeat larger than about 3 MiB was sent without its snapshot (see "Known limits" below for the agent side). The data lost is only older heartbeat state, which the agents refresh on their own interval. No action unless it keeps rising after the server is back; if it does, check that the server is reachable and answering `BatchHeartbeat` (`yuzu_gw_upstream_rpc_errors_total{rpc_name}`), and consider raising `max_heartbeat_buffer_bytes` or `max_heartbeat_buffer` if your fleet is larger than the defaults assume. Do not restart the gateway for this: a restart disconnects every agent the node holds. |
+| gateway | metric | `yuzu_gw_heartbeat_buffer_dropped_total{reason}` rising | The buffer is under pressure, typically after a long server outage. `snapshot_evicted`: older snapshots were dropped to stay under `max_heartbeat_buffer_bytes`, oldest first. `buffer_full`: the buffer held `max_heartbeat_buffer` sessions and a heartbeat of a new session was dropped, or it was still over `max_heartbeat_buffer_bytes` with no snapshot left and its oldest whole session was dropped. `snapshot_oversize`: one heartbeat larger than about 3 MiB was sent without its snapshot (see "Known limits" below for the agent side). `heartbeat_oversize`: a heartbeat still larger than about 3 MiB after its snapshot was removed, or with more than 512 status tags, was dropped. `heartbeat_invalid`: a heartbeat whose session id or a status tag was not valid UTF-8 was dropped. `chunk_rejected`: one heartbeat that the server rejected with a non-transient status (for example `RESOURCE_EXHAUSTED`) was dropped so that it does not block newer heartbeats. These last three mean an agent sent a malformed or oversized heartbeat. The metric has no agent label, so identify the agent from the gateway log or debug log if one names it, and upgrade or fix that agent; no other action is needed, because the data lost is one heartbeat per count and the agent sends the next on its own interval. Transient server trouble (server unreachable, timeouts) does not lose heartbeats: they stay buffered. The data lost for the first three reasons is only older heartbeat state, which the agents refresh on their own interval. No action unless `buffer_full`, `snapshot_oversize` or `snapshot_evicted` keeps rising after the server is back; if it does, check that the server is reachable and answering `BatchHeartbeat` (`yuzu_gw_upstream_rpc_errors_total{rpc_name}`), and consider raising `max_heartbeat_buffer_bytes` or `max_heartbeat_buffer` if your fleet is larger than the defaults assume. Do not restart the gateway for this: a restart disconnects every agent the node holds. |
 
 The server's `renew_leases ... unknown_session` warnings stop once the agent
 is known again. How long that takes depends on the gateway's upstream circuit
@@ -1455,10 +1481,16 @@ env keys with defaults, which a reverted build ignores.
   default and is not configured explicitly by the server (INFERRED from reading
   the server code; not run), so the gateway's chunk size of about 3 MiB depends on
   that default staying as it is. It is not raised by this change. (3) The
-  gateway's shutdown flush waits at most 5 s; a shutdown with a backlog that
-  needs several chunks may not finish inside that time, and what is still
-  buffered is then lost with the process (INFERRED from the code; not run).
-  Losing buffered heartbeats at shutdown costs only older heartbeat state.
+  gateway's shutdown flush waits at most 5 s and sends at most 8 chunks; it is
+  best effort. A shutdown with a backlog that needs more chunks, or that does not
+  finish inside that time, loses what is still buffered with the process (INFERRED
+  from the code; not run). Losing buffered heartbeats at shutdown costs only older
+  heartbeat state. (4) One heartbeat larger than the chunk limit (after its snapshot
+  is removed) is dropped and counted as `heartbeat_oversize`; it is not retried, so
+  an agent that keeps sending such heartbeats has them all dropped until it is
+  fixed. (5) An exit that escapes the flush RPC no longer ends the
+  buffer process (it used to be able to, losing every buffered heartbeat), and
+  the buffer's crash-report status shows counts only, not heartbeat contents.
 - **R2b: a route row tombstoned while the server stayed up is not repaired by this
   reconcile.** OBSERVED: during a 6.9 minute network partition between the
   gateway and the server, with the server staying up (the traffic went through a
@@ -1547,7 +1579,12 @@ env keys with defaults, which a reverted build ignores.
   the calling handler process at INFO together with the whole request (OBSERVED by a
   security reviewer running the real application with a real gRPC client, for three
   triggers on the upstream client: a crash with a call queued, a 30 s stall with no
-  crash, and the restart gap). Third, a logger primary filter,
+  crash, and the restart gap). A later security review, running the real application,
+  found two more call sites that put the request into a crash report (OBSERVED):
+  a Register while the registry process was down (the ETS insert error carried the
+  request in its stacktrace) and a Subscribe while the agent supervisor was down
+  (the `start_child` exit carried the request in its arguments). The exit wrap now
+  covers both, and each returns a fixed error that carries no request. Third, a logger primary filter,
   `yuzu_gw_crash_redact`, installed when the application starts, now covers three
   processes: `yuzu_gw_upstream`, `yuzu_gw_agent` and `yuzu_gw_registry`. A process
   is covered when it is registered under one of those module names or was started
@@ -1559,7 +1596,9 @@ env keys with defaults, which a reverted build ignores.
   first process of a crash report is rewritten, not the neighbours listed after
   it). In the `gen_server` terminate report of the upstream client or the registry,
   and the `gen_statem` terminate report of a per-agent process (matched by the
-  callback module in its `modules` list), the reason is reduced the same way. In a
+  callback module in its `modules` list), the reason is reduced the same way; the
+  terminate report of `yuzu_gw_agent` also redacts its queue and last event, where
+  present. In a
   supervisor report whose offender is a covered process, the reason is reduced
   likewise (the offender is matched by its child id for the upstream client and the
   registry, and by the module in its start spec for the per-agent processes,
@@ -1586,10 +1625,12 @@ env keys with defaults, which a reverted build ignores.
   runbook above says to restart; INFERRED from a search of the gateway sources,
   the CI workflows and the docs); and (iv) any other process that holds a
   registration request and is not named here. Only the three processes above were
-  checked, and the registry is now one of them. Other processes have not been
-  audited: from reading the code, the gRPC handler processes for Register and
-  Subscribe hold the request while they run, and none of those was checked for what
-  a crash report of it would print (INFERRED, not measured). Operator guidance:
+  checked, and the registry is now one of them. The gRPC handler processes for
+  Register and Subscribe hold the request while they run; their two call sites
+  named above (a Register while the registry is down, a Subscribe while the agent
+  supervisor is down) are now covered, and other handler-process call sites were
+  searched by grep, not exhaustively audited, so what a crash report of one of
+  them would print is not established (INFERRED, not measured). Operator guidance:
   treat any gateway crash report as sensitive.
   As defence in depth, if your log pipeline is shared, you can also bound how much
   of a term the logger prints with the `chars_limit` and `depth` options of the
@@ -1801,7 +1842,7 @@ that are actually emitted are listed.
 | `yuzu_gw_registration_replay_triggered_total` | counter | Registration replays started, by `trigger` (`breaker` = the upstream recovered and every agent this node holds is queued for replay, unless a verdict-seeded drip is already queued, in which case the trigger is dropped, `heartbeat` = a heartbeat verdict listed sessions the server does not know and only those are replayed). Both series are created at 0 at start. |
 | `yuzu_gw_heartbeat_unknown_truncated_total` | counter | `BatchHeartbeat` responses whose list of unknown sessions the server truncated at 4096. Sessions beyond the cap may be reported again by later heartbeats. Every occurrence is counted; the matching WARN is logged at most once per 60 s per heartbeat buffer process (the limit resets when that process restarts). |
 | `yuzu_gw_heartbeat_verdict_dropped_total` | counter | Session ids named by a heartbeat verdict that were not queued for replay (label `reason`, closed set: `malformed` = not a usable session id, `not_local` = this node does not hold the session, `circuit_open` = the upstream circuit breaker is open, `queue_full` = the replay queue is at its cap, or the upstream process already holds more than 100 unhandled messages so the ids were not handed to it; the cap bounds only verdict appends, so while a breaker-seeded snapshot of that size or larger drains, every verdict id for an agent not already queued counts here). Every reason is created at 0 at start. Ids already queued, or replayed within the session guard window, are not counted. |
-| `yuzu_gw_heartbeat_buffer_dropped_total` | counter | Heartbeat state the gateway's heartbeat buffer dropped instead of sending (label `reason`, closed set, all created at 0 at start: `buffer_full` = a heartbeat of a new session was dropped because the buffer held `max_heartbeat_buffer` sessions, or the oldest whole session was dropped because the buffer was still over `max_heartbeat_buffer_bytes` with no snapshot left to drop; `snapshot_oversize` = a single heartbeat larger than about 3 MiB was sent without its snapshot; `snapshot_evicted` = a retained snapshot was dropped, oldest first, because the buffer was over `max_heartbeat_buffer_bytes`). What is lost is older heartbeat state. See [Heartbeat Batching](#heartbeat-batching). |
+| `yuzu_gw_heartbeat_buffer_dropped_total` | counter | Heartbeat state the gateway's heartbeat buffer dropped instead of sending (label `reason`, closed set of six, all created at 0 at start: `buffer_full` = a heartbeat of a new session was dropped because the buffer held `max_heartbeat_buffer` sessions, or the oldest whole session was dropped because the buffer was still over `max_heartbeat_buffer_bytes` with no snapshot left to drop; `snapshot_oversize` = a single heartbeat larger than about 3 MiB was sent without its snapshot; `snapshot_evicted` = a retained snapshot was dropped, oldest first, because the buffer was over `max_heartbeat_buffer_bytes`; `heartbeat_oversize` = a heartbeat still larger than about 3 MiB after its snapshot was removed, or with more than 512 status tags, was dropped; `heartbeat_invalid` = a heartbeat whose session id or a status tag is not valid UTF-8 was dropped; `chunk_rejected` = a single heartbeat the server rejected with a non-transient status was dropped). What is lost is older heartbeat state, or one heartbeat for the last three reasons. See [Heartbeat Batching](#heartbeat-batching). |
 | `yuzu_gw_heartbeat_coalesced_total` | counter | Buffered heartbeats replaced by a newer heartbeat of the same session (unlabelled). Expected to rise while the server is unreachable. While a backlog is coalesced, the server's `yuzu_heartbeats_received_total{via="gateway"}` under-counts, because it counts the heartbeats the server received. |
 | `yuzu_gw_cluster_peers_resolved` | gauge | Peer addresses found by the cluster-formation redial loop's most recent tick (label `node`; HA WS-4 `#4555`). 0 is expected for a genuinely single-node deployment. |
 | `yuzu_gw_cluster_peers_connected` | gauge | Distribution-connected peer nodes as of the most recent redial tick (label `node`; `#4555`). Compare against `peers_resolved` — a sustained gap most often means a distribution-cookie mismatch across replicas. |
