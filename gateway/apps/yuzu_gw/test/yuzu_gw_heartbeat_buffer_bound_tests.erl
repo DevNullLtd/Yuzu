@@ -102,7 +102,11 @@ bound_test_() ->
       {"the timer's flush sends at most 8 chunks per cycle: 30 chunks drain in 8, 8, 8, 6",
        fun timer_flush_sends_at_most_eight_chunks/0},
       {"flush_sync sends at most 8 chunks and the rest stays buffered",
-       fun flush_sync_sends_at_most_eight_chunks/0}
+       fun flush_sync_sends_at_most_eight_chunks/0},
+      {"a large drain is followed by a GC that frees the released binaries",
+       fun large_drain_frees_binaries/0},
+      {"a small flush does not ask for a GC",
+       fun small_flush_does_not_gc/0}
      ]}.
 
 setup() ->
@@ -741,6 +745,40 @@ flush_sync_sends_at_most_eight_chunks() ->
     ?assertEqual(ok, yuzu_gw_heartbeat_buffer:flush_sync()),
     ?assertEqual(8, length(requests())),
     ?assertEqual(28, session_count()).
+
+%% The binaries a buffer process references (its off-heap binary list), bytes.
+binary_bytes(Pid) ->
+    {binary, L} = process_info(Pid, binary),
+    lists:sum([Size || {_, Size, _} <- L]).
+
+%% 20 snapshots of 800 KB (16 MB estimated, over the 8 MiB threshold) are
+%% queued and flushed in two flushes (8 chunks, then 2). The released entries
+%% are garbage until a collection; one called inside the flush callback frees
+%% nothing (the old state is still on its stack), so the collection is the
+%% {continue, gc} after it. flush_sync's reply comes before the continue runs,
+%% and the sys:get_state/1 request is only served after it: the barrier.
+large_drain_frees_binaries() ->
+    Pid = whereis(yuzu_gw_heartbeat_buffer),
+    [queue(hb(sid(I), #{snap => snap(800 * 1024)})) || I <- lists:seq(1, 20)],
+    Held = binary_bytes(Pid),
+    ?assert(Held >= 20 * 800 * 1024),
+    ?assertEqual(ok, yuzu_gw_heartbeat_buffer:flush_sync()),
+    ?assertEqual(ok, yuzu_gw_heartbeat_buffer:flush_sync()),
+    ?assertEqual(0, session_count()),
+    %% session_count/0 went through sys:get_state/1: the continue has run.
+    ?assert(binary_bytes(Pid) < ?MIB).
+
+%% Control for the test above: a flush that releases less than the threshold
+%% leaves its garbage (no GC is asked for), so the drop above is the GC and not
+%% an artefact of the measurement.
+small_flush_does_not_gc() ->
+    Pid = whereis(yuzu_gw_heartbeat_buffer),
+    [queue(hb(sid(I), #{snap => snap(800 * 1024)})) || I <- lists:seq(1, 6)],
+    Held = binary_bytes(Pid),
+    ?assert(Held >= 6 * 800 * 1024),
+    ?assertEqual(ok, yuzu_gw_heartbeat_buffer:flush_sync()),
+    ?assertEqual(0, session_count()),
+    ?assert(binary_bytes(Pid) >= 6 * 800 * 1024).
 
 %%%===================================================================
 %%% Helpers

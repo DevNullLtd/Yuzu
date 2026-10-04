@@ -89,7 +89,8 @@
 -export([estimate_bytes/1]).
 
 %% gen_server callbacks
--export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, code_change/3]).
+-export([init/1, handle_call/3, handle_cast/2, handle_info/2, handle_continue/2,
+         terminate/2, code_change/3]).
 
 -define(SERVER, ?MODULE).
 -define(DEFAULT_MAX_HB_BUFFER, 10000).
@@ -114,8 +115,11 @@
 %% the server's 4194304-byte gRPC receive limit with a wide margin for the
 %% estimate's slack and the request's own framing.
 -define(CHUNK_BYTES, 3145728).
-%% A flush that released more than this many estimated bytes forces a GC, so
-%% the large binaries of a drained backlog are not held until the next one.
+%% A flush that released more than this many estimated bytes is followed by a GC
+%% (run from handle_continue/2: inside the callback that released them the old
+%% state is still referenced from its frame, and a collection there frees
+%% nothing), so the large binaries of a drained backlog are not held until the
+%% next one.
 -define(GC_AFTER_RELEASED_BYTES, 8388608).
 %% heartbeat_batch_interval_ms: the flush period, and so the ceiling on how
 %% often one verdict can be cast. Valid 100..60000 (default 1000); anything
@@ -218,9 +222,9 @@ handle_call(flush_sync, _From, #state{buffer = Buf} = State) when map_size(Buf) 
 handle_call(flush_sync, _From, #state{timer = TRef, interval = Interval} = State) ->
     %% Cancel the pending timer and flush immediately.
     _ = erlang:cancel_timer(TRef),
-    {Result, State1} = flush_chunks(chunks(State), State),
+    {Result, State1, Gc} = flush_chunks(chunks(State), State),
     NewTRef = erlang:send_after(Interval, self(), flush),
-    {reply, Result, State1#state{timer = NewTRef}};
+    reply(Result, State1#state{timer = NewTRef}, Gc);
 handle_call(_Request, _From, State) ->
     {reply, {error, unknown_call}, State}.
 
@@ -242,12 +246,24 @@ handle_info(flush, #state{buffer = Buf, interval = Interval} = State)
 
 handle_info(flush, #state{interval = Interval} = State) ->
     %% A failed chunk (and every later one) stays buffered for the next cycle.
-    {_Result, State1} = flush_chunks(chunks(State), State),
+    {_Result, State1, Gc} = flush_chunks(chunks(State), State),
     TRef = erlang:send_after(Interval, self(), flush),
-    {noreply, State1#state{timer = TRef}};
+    noreply(State1#state{timer = TRef}, Gc);
 
 handle_info(_Info, State) ->
     {noreply, State}.
+
+%% The collection a large release asks for, run after the callback that released
+%% the entries has returned (see ?GC_AFTER_RELEASED_BYTES).
+handle_continue(gc, State) ->
+    erlang:garbage_collect(),
+    {noreply, State}.
+
+reply(Result, State, true)  -> {reply, Result, State, {continue, gc}};
+reply(Result, State, false) -> {reply, Result, State}.
+
+noreply(State, true)  -> {noreply, State, {continue, gc}};
+noreply(State, false) -> {noreply, State}.
 
 terminate(_Reason, _State) ->
     ok.
@@ -556,9 +572,10 @@ pack([{_, _, Bytes} = E | Rest], Cur, CurBytes, Done) ->
 %% consumed (once) and its sessions removed from the buffer. What happens on a
 %% failure depends on its class (see the module doc and classify/1); a
 %% transient one ends the flush with {error, Reason}, the failed chunk and the
-%% unsent ones staying buffered. A flush that released more than
-%% ?GC_AFTER_RELEASED_BYTES forces a GC.
--spec flush_chunks([chunk()], #state{}) -> {ok | {error, term()}, #state{}}.
+%% unsent ones staying buffered. The last element of the result is whether the
+%% flush released more than ?GC_AFTER_RELEASED_BYTES (the caller asks for a GC
+%% through {continue, gc}).
+-spec flush_chunks([chunk()], #state{}) -> {ok | {error, term()}, #state{}, boolean()}.
 flush_chunks(Chunks, State) ->
     flush_loop(lists:sublist(Chunks, ?MAX_CHUNKS_PER_FLUSH), State, #acc{}).
 
@@ -599,7 +616,7 @@ classify(_Other) ->
     transient.
 
 -spec failed(refused | raised | transient, term(), chunk(), [chunk()],
-             #state{}, #acc{}) -> {ok | {error, term()}, #state{}}.
+             #state{}, #acc{}) -> {ok | {error, term()}, #state{}, boolean()}.
 failed(transient, Error, _Chunk, _Rest, State, Acc) ->
     finish({error, Error}, State, Acc);
 failed(refused, _Error, [{Sid, _, Bytes}], Rest, State, Acc) ->
@@ -645,25 +662,17 @@ remove_chunk(Chunk, State) ->
                         {remove_entry(Sid, maps:get(Sid, S#state.buffer), S), Total + Bytes}
                 end, {State, 0}, Chunk).
 
-finish(Result, State, Acc) ->
+finish(Result, State, #acc{released = Released} = Acc) ->
     flushed(Acc),
-    {Result, State}.
+    {Result, State, Released > ?GC_AFTER_RELEASED_BYTES}.
 
-%% @doc Log what a flush sent (counts only, never session ids) and collect the
-%% garbage of a large release.
-flushed(#acc{sent = 0, released = Released}) ->
-    gc_after(Released);
-flushed(#acc{sent = Sent, nchunks = NChunks, released = Released}) ->
+%% @doc Log what a flush sent (counts only, never session ids).
+flushed(#acc{sent = 0}) ->
+    ok;
+flushed(#acc{sent = Sent, nchunks = NChunks}) ->
     case NChunks > 1 of
         true  -> logger:info("Flushed ~b heartbeats in ~b chunk(s)", [Sent, NChunks]);
         false -> logger:debug("Flushed ~b heartbeats in ~b chunk(s)", [Sent, NChunks])
-    end,
-    gc_after(Released).
-
-gc_after(Released) ->
-    case Released > ?GC_AFTER_RELEASED_BYTES of
-        true  -> erlang:garbage_collect();
-        false -> ok
     end,
     ok.
 
