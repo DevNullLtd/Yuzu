@@ -98,7 +98,11 @@ bound_test_() ->
       {"an exception or exit out of the RPC is a failed flush, not a crash, and logs no reason",
        fun exception_out_of_rpc_is_a_failed_flush/0},
       {"entries the encoder raises on are dropped from a failed chunk and the rest is sent",
-       fun encoder_raising_entries_are_dropped_from_the_chunk/0}
+       fun encoder_raising_entries_are_dropped_from_the_chunk/0},
+      {"the timer's flush sends at most 8 chunks per cycle: 30 chunks drain in 8, 8, 8, 6",
+       fun timer_flush_sends_at_most_eight_chunks/0},
+      {"flush_sync sends at most 8 chunks and the rest stays buffered",
+       fun flush_sync_sends_at_most_eight_chunks/0}
      ]}.
 
 setup() ->
@@ -227,12 +231,16 @@ retained_30x800kb_batch_drains_in_chunks_each_under_4194304() ->
     ?assertEqual(3, length(requests())),
     ?assertEqual(30, session_count()),
     ?assertEqual(lists:sort(Ids), lists:sort(buffered_ids())),
-    %% The server is back: one flush drains everything.
+    %% The server is back: 10 chunks of three, and a flush sends at most 8, so
+    %% the second flush finishes the drain.
     reset_requests(),
     set_unary(fun(_N) -> {ok, #{acknowledged_count => 0}, #{}} end),
     ?assertEqual(ok, yuzu_gw_heartbeat_buffer:flush_sync()),
+    ?assertEqual(8, length(requests())),
+    ?assertEqual(6, session_count()),
+    ?assertEqual(ok, yuzu_gw_heartbeat_buffer:flush_sync()),
     Reqs = requests(),
-    ?assert(length(Reqs) > 1),
+    ?assertEqual(10, length(Reqs)),
     [?assert(Size < ?SERVER_LIMIT) || Size <- request_sizes()],
     Sent = [maps:get(session_id, H) || R <- Reqs, H <- hbs(R)],
     ?assertEqual(30, length(Sent)),
@@ -697,6 +705,42 @@ encoder_raising_entries_are_dropped_from_the_chunk() ->
     ?assertEqual(0, session_count()),
     ?assertEqual([<<"a">>, <<"c">>],
                  [maps:get(session_id, H) || R <- requests(), H <- hbs(R)]).
+
+%% 60 heartbeats of 1 MiB: two to a chunk, so 30 chunks. A fast mock accepts
+%% everything; what limits a cycle is the chunk count. The timer's message is
+%% sent by hand (the same handle_info clause, without waiting for the interval),
+%% and sys:get_state/1 is the barrier that proves the cycle has finished.
+timer_flush_sends_at_most_eight_chunks() ->
+    Pid = whereis(yuzu_gw_heartbeat_buffer),
+    [queue(hb(sid(I), #{snap => snap(?MIB)})) || I <- lists:seq(1, 60)],
+    ?assertEqual(60, session_count()),
+    Cycle = fun() ->
+        reset_requests(),
+        Pid ! flush,
+        _ = sys:get_state(Pid),
+        {length(requests()), session_count()}
+    end,
+    ?assertEqual({8, 44}, Cycle()),
+    ?assertEqual({8, 28}, Cycle()),
+    ?assertEqual({8, 12}, Cycle()),
+    ?assertEqual({6, 0}, Cycle()),
+    ?assertEqual({0, 0}, Cycle()),
+    ?assertEqual(0, dropped_total()),
+    ?assertEqual(Pid, whereis(yuzu_gw_heartbeat_buffer)).
+
+flush_sync_sends_at_most_eight_chunks() ->
+    Ids = [sid(I) || I <- lists:seq(1, 60)],
+    [queue(hb(Id, #{snap => snap(?MIB)})) || Id <- Ids],
+    ?assertEqual(ok, yuzu_gw_heartbeat_buffer:flush_sync()),
+    ?assertEqual(8, length(requests())),
+    ?assertEqual(44, session_count()),
+    %% Oldest first: the 16 sent are the first 16 queued.
+    ?assertEqual(lists:sublist(Ids, 16), [maps:get(session_id, H) || R <- requests(), H <- hbs(R)]),
+    %% A buffer of 8 chunks or fewer is flushed completely (control).
+    reset_requests(),
+    ?assertEqual(ok, yuzu_gw_heartbeat_buffer:flush_sync()),
+    ?assertEqual(8, length(requests())),
+    ?assertEqual(28, session_count()).
 
 %%%===================================================================
 %%% Helpers

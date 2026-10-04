@@ -36,8 +36,11 @@
 %%%
 %%% Flushing calls do_flush/2 which sends BatchHeartbeat RPCs via grpcbox.
 %%% The buffer is split into chunks, oldest entry first, each estimated under
-%%% 3 MiB, so no request reaches the server's 4 MiB receive limit however long
-%%% the outage was. A chunk that the server accepted is removed. On a transient
+%%% 3 MiB, and a flush (the timer's, or flush_sync/0) sends at most
+%%% ?MAX_CHUNKS_PER_FLUSH of them (about 24 MiB): the rest stays buffered for
+%%% the next cycle, so a long backlog drains over several cycles and one flush
+%%% never blocks this process for long. A chunk that the server accepted is
+%%% removed. On a transient
 %%% failure (the server unreachable, a timeout, an exception out of the RPC, any
 %%% status not named below) that chunk and every later one are retained for the
 %%% next flush cycle and the flush stops. On a non-transient refusal
@@ -90,6 +93,9 @@
 
 -define(SERVER, ?MODULE).
 -define(DEFAULT_MAX_HB_BUFFER, 10000).
+%% One flush sends at most this many chunks (about 24 MiB): the rest stays
+%% buffered for the next cycle.
+-define(MAX_CHUNKS_PER_FLUSH, 8).
 %% One flush makes at most this many RPCs, retries of a refused chunk included:
 %% a server that refuses every request would otherwise cost one RPC per
 %% buffered heartbeat in a single flush.
@@ -175,7 +181,9 @@ start_link() ->
 queue_heartbeat(HeartbeatReq) ->
     gen_server:cast(?SERVER, {queue_heartbeat, HeartbeatReq}).
 
-%% @doc Flush the heartbeat buffer synchronously. Blocks until done.
+%% @doc Flush the heartbeat buffer synchronously: at most ?MAX_CHUNKS_PER_FLUSH
+%% chunks (about 24 MiB), like the timer's flush. Whatever is left is not sent,
+%% so the shutdown flush is best effort. Blocks until those chunks are done.
 -spec flush_sync() -> ok | {error, term()}.
 flush_sync() ->
     gen_server:call(?SERVER, flush_sync, 5000).
@@ -544,7 +552,7 @@ pack([{_, _, Bytes} = E | Rest], Cur, CurBytes, Done)
 pack([{_, _, Bytes} = E | Rest], Cur, CurBytes, Done) ->
     pack(Rest, [E | Cur], CurBytes + Bytes, Done).
 
-%% @doc Send the chunks in order. A chunk the server accepted has its verdict
+%% @doc Send the first ?MAX_CHUNKS_PER_FLUSH chunks in order. A chunk the server accepted has its verdict
 %% consumed (once) and its sessions removed from the buffer. What happens on a
 %% failure depends on its class (see the module doc and classify/1); a
 %% transient one ends the flush with {error, Reason}, the failed chunk and the
@@ -552,7 +560,7 @@ pack([{_, _, Bytes} = E | Rest], Cur, CurBytes, Done) ->
 %% ?GC_AFTER_RELEASED_BYTES forces a GC.
 -spec flush_chunks([chunk()], #state{}) -> {ok | {error, term()}, #state{}}.
 flush_chunks(Chunks, State) ->
-    flush_loop(Chunks, State, #acc{}).
+    flush_loop(lists:sublist(Chunks, ?MAX_CHUNKS_PER_FLUSH), State, #acc{}).
 
 flush_loop([], State, Acc) ->
     finish(ok, State, Acc);
