@@ -24,23 +24,47 @@
 %%% number of sessions (a Register without a Subscribe stores a pending row, and
 %%% every session may carry a fleet snapshot of up to 3 MiB into the heartbeat
 %%% buffer). A connection key (see `yuzu_gw_conn') may hold at most
-%%% `max_sessions_per_connection' (default 8, valid 1..1000) DISTINCT agents'
-%%% sessions, pending plus live, counted without the agent being (re)registered:
-%%% a reconnect or supersede of the same agent id replaces its own session and
-%%% never meets the cap. The cap is applied where sessions are stored:
-%%% store_pending/2 (and session_admission/2, which Register asks before it
-%%% proxies the registration upstream, so a Register refused there leaves
-%%% nothing on the server) and the live insert in `register'. Both answer
+%%% `max_sessions_per_connection' (default 8, valid 1..1000) sessions, pending
+%%% plus live, counted WITHOUT the agent being (re)registered: an agent id's own
+%%% rows never count against it, so a reconnect or supersede never meets the cap
+%%% by itself. The guarantee has three parts.
+%%%
+%%% 1. Rows, not agents. The count is the live rows plus the pending rows on the
+%%% connection, one row per live session and one per agent with a pending or
+%%% reserved session. A repeated Register of one agent id SUPERSEDES that agent's
+%%% older pending rows on the connection (the live supersede does the same to the
+%%% live row), so one agent holds at most one pending row and one live row and a
+%%% connection holds at most cap+1 rows (the agent being registered keeps its live
+%%% row until its Subscribe replaces it). A Register repeated with one id and no
+%%% Subscribe therefore never grows the pending table.
+%%%
+%%% 2. One atomic step. The check and the claim of a slot are made inside this
+%%% process, which handles one call at a time: reserve_session/2 counts the other
+%%% agents' rows and, below the cap, stores a reservation row (a pending-table
+%%% row keyed {reserved, Ref}, same TTL, counted like a pending row) before the
+%%% registration is proxied upstream, so N concurrent Registers on a connection
+%%% admit at most the cap and the rest are refused with nothing sent to the
+%%% server. store_pending/3 then makes the reservation the pending row in one
+%%% call to this process (commit_pending), which also supersedes the agent's older
+%%% pending rows there, so concurrent same-agent Registers end with exactly one
+%%% pending row (the last one handled). The reservation is released by the caller
+%%% when the proxied Register fails (release_session/1) and by the TTL sweep when
+%%% the caller died; a stored pending row is released by Subscribe or its TTL.
+%%%
+%%% 3. Every other store is checked the same way. The live insert (the
+%%% `register' call) asks session_admission/2 inside this process, and
+%%% store_pending/2 without a reservation reserves one itself. All refuse with
 %%% `{error, session_limit}'. The pending count is a scan of the pending table
 %%% (short lived rows), the live count a lookup in a per-connection index owned by
 %%% this process (an unnamed bag whose id is kept in persistent_term), kept in
 %%% step with the session index by index_session/4 and unindex_session/2 only, so
 %%% every removal path (deregister, supersede, a dead process) releases the
-%%% count. A connection key of `undefined' is never counted. The check and the
-%%% pending insert are not one atomic step: concurrent Registers on one connection
-%%% can overshoot by at most the connection's concurrent stream limit, and one
-%%% that passes the early check but is refused at store_pending/2 has already been
-%%% proxied upstream (a server session that never subscribes).
+%%% count. A connection key of `undefined' is never counted.
+%%%
+%%% Not covered: the gap between Subscribe taking a pending row and the live
+%%% insert, where a slot is free for a moment and another Register can take it;
+%%% the live insert is then the one refused, never a proxied Register left
+%%% without a pending row.
 %%% @end
 %%%-------------------------------------------------------------------
 -module(yuzu_gw_registry).
@@ -66,7 +90,10 @@
          agent_count/0,
          list_agents/2,
          store_pending/2,
+         store_pending/3,
          take_pending/1,
+         reserve_session/2,
+         release_session/1,
          session_admission/2]).
 
 %% gen_server callbacks
@@ -486,34 +513,113 @@ list_agents(Limit, Cursor) ->
 %% stamped with the node-local monotonic clock, so the TTL in
 %% `lookup_pending_session/1' and the sweep is immune to wall-clock steps.
 %%
+%% Reservation is what reserve_session/2 returned for this Register (or
+%% `undefined'): the row then takes the slot the reservation holds, with no
+%% second count. Without one the connection's slot is reserved here, so a
+%% caller that did not reserve is still refused over the cap. Either way the
+%% pending rows of the same agent id on the same connection that are older than
+%% this one are removed (see the module doc, part 2), and the reservation is
+%% consumed. A row with no connection key is stored as is: it is never counted.
+%%
 %% The table is owned by the registry process and written from the caller's own
 %% process (a grpcbox handler). With the registry down the table is gone and the
 %% insert raises badarg, whose stacktrace carries Info, which holds the
 %% RegisterRequest (enrollment token, certificate, CSR) and which grpcbox logs.
 %% The error is caught here and the fixed {error, registry_unavailable} returned:
-%% no stacktrace, no arguments.
+%% no stacktrace, no arguments. The one call made to the registry process carries
+%% the session id, the connection key, the agent id and the reservation, never
+%% Info.
 -spec store_pending(binary(), map()) -> ok | {error, registry_unavailable | session_limit}.
 store_pending(SessionId, Info) ->
-    case session_admission(maps:get(conn_key, Info, undefined),
-                           maps:get(agent_id, Info, undefined)) of
+    store_pending(SessionId, Info, undefined).
+
+-spec store_pending(binary(), map(), reference() | undefined) ->
+          ok | {error, registry_unavailable | session_limit}.
+store_pending(SessionId, Info, Reservation) ->
+    case maps:get(conn_key, Info, undefined) of
+        undefined ->
+            insert_pending(SessionId, Info);
+        ConnKey ->
+            AgentId = maps:get(agent_id, Info, undefined),
+            case held_reservation(ConnKey, AgentId, Reservation) of
+                {ok, Ref}          -> store_counted(SessionId, Info, ConnKey, AgentId, Ref);
+                {error, _} = Error -> Error
+            end
+    end.
+
+held_reservation(ConnKey, AgentId, undefined) ->
+    reserve_session(ConnKey, AgentId);
+held_reservation(_ConnKey, _AgentId, Reservation) ->
+    {ok, Reservation}.
+
+%% The row goes in first and the registry process then commits it (one call):
+%% the reservation it replaces is counted for the same agent in between, so the
+%% count never reads lower than the rows that exist.
+store_counted(SessionId, Info, ConnKey, AgentId, Ref) ->
+    case insert_pending(SessionId, Info) of
         ok ->
-            try ets:insert(?PENDING_TABLE,
-                           {SessionId, Info, erlang:monotonic_time(millisecond)}) of
-                true -> ok
-            catch
-                error:badarg -> {error, registry_unavailable}
+            case yuzu_gw_safe_call:call(?SERVER,
+                                        {commit_pending, SessionId, ConnKey, AgentId, Ref},
+                                        5000, registry_unavailable) of
+                ok ->
+                    ok;
+                {error, _} = Error ->
+                    %% Refused (the registry already removed the row) or not
+                    %% reachable (the row must not stay unadmitted).
+                    _ = ets:delete(?PENDING_TABLE, SessionId),
+                    release_session(Ref),
+                    Error
             end;
-        {error, session_limit} = Refused ->
-            Refused
+        {error, _} = Error ->
+            release_session(Ref),
+            Error
+    end.
+
+insert_pending(SessionId, Info) ->
+    try ets:insert(?PENDING_TABLE, {SessionId, Info, erlang:monotonic_time(millisecond)}) of
+        true -> ok
+    catch
+        error:badarg -> {error, registry_unavailable}
+    end.
+
+%% @doc Claim a session slot on ConnKey for AgentId BEFORE the registration is
+%% proxied upstream. `{ok, Reservation}' holds the slot until it is turned into
+%% the pending row by store_pending/3, released by release_session/1 or swept
+%% after the pending TTL; `{error, session_limit}' when the connection already
+%% holds `max_sessions_per_connection' other agents' rows (counted, and logged
+%% as one WARN per second that names only the cap). The check and the claim are
+%% one step in the registry process, which is what makes the cap hold under
+%% concurrent Registers. A `undefined' key is never counted: `{ok, undefined}'.
+%% `{error, registry_unavailable}' when the registry cannot be called.
+-spec reserve_session(yuzu_gw_conn:key(), term()) ->
+          {ok, reference() | undefined} | {error, session_limit | registry_unavailable}.
+reserve_session(undefined, _AgentId) ->
+    {ok, undefined};
+reserve_session(ConnKey, AgentId) ->
+    yuzu_gw_safe_call:call(?SERVER, {reserve_session, ConnKey, AgentId}, 5000,
+                           registry_unavailable).
+
+%% @doc Release a reservation that was not turned into a pending row (the
+%% proxied Register failed). Idempotent; `undefined' and a missing table are
+%% no-ops.
+-spec release_session(reference() | undefined) -> ok.
+release_session(undefined) ->
+    ok;
+release_session(Reservation) ->
+    try ets:delete(?PENDING_TABLE, {reserved, Reservation}) of
+        true -> ok
+    catch
+        error:badarg -> ok
     end.
 
 %% @doc Whether the connection ConnKey may take a session for AgentId: `ok', or
 %% `{error, session_limit}' when it already holds `max_sessions_per_connection'
-%% other agents' sessions (pending or live). A refusal is counted
+%% other agents' rows (pending, reserved or live). A refusal is counted
 %% (yuzu_gw_session_limit_rejected_total) and logged as one WARN per second that
-%% names only the cap. A `undefined' key is always admitted. Register calls this
-%% before it proxies the registration upstream; store_pending/2 and the live
-%% insert call it again, so the decision is made where the session is stored.
+%% names only the cap. A `undefined' key is always admitted. This is a read: the
+%% Subscribe handler asks it before it starts an agent process, and the registry
+%% process asks it for the live insert and inside reserve_session/2, where the
+%% decision and the claim are one step.
 -spec session_admission(yuzu_gw_conn:key(), term()) -> ok | {error, session_limit}.
 session_admission(undefined, _AgentId) ->
     ok;
@@ -531,12 +637,15 @@ session_admission(ConnKey, AgentId) ->
 max_sessions_per_connection() ->
     persistent_term:get(?MAX_SESSIONS_KEY, ?DEFAULT_MAX_SESSIONS).
 
-%% The number of distinct agents other than AgentId that hold a session, pending
-%% (not past its TTL) or live, on ConnKey. A table that does not exist counts as
-%% empty: its absence is reported by the calls that need it, not here.
+%% The rows other than AgentId's own on ConnKey: one per live session, plus one
+%% per agent with a pending (not past its TTL) or reserved session. AgentId's own
+%% rows never count: its Register replaces its older pending rows and its live
+%% insert replaces its live row. A table that does not exist counts as empty: its
+%% absence is reported by the calls that need it, not here.
 others_on_connection(ConnKey, AgentId) ->
-    Agents = lists:usort(live_agents(ConnKey) ++ pending_agents(ConnKey)),
-    length([A || A <- Agents, A =/= AgentId]).
+    Live = [A || A <- live_agents(ConnKey), A =/= AgentId],
+    Pending = [A || A <- lists:usort(pending_agents(ConnKey)), A =/= AgentId],
+    length(Live) + length(Pending).
 
 live_agents(ConnKey) ->
     case persistent_term:get(?CONN_INDEX_KEY, undefined) of
@@ -548,6 +657,8 @@ live_agents(ConnKey) ->
             end
     end.
 
+%% The agent ids of the pending and reserved rows on ConnKey (a reservation is a
+%% pending-table row keyed {reserved, Ref}); one entry per row.
 pending_agents(ConnKey) ->
     Oldest = erlang:monotonic_time(millisecond) - ?PENDING_TTL_MS,
     try ets:select(?PENDING_TABLE,
@@ -656,6 +767,41 @@ init_limit_warn_stamp() ->
         Ref ->
             atomics:put(Ref, 1, Old)
     end.
+
+handle_call({reserve_session, ConnKey, AgentId}, _From, State) ->
+    %% Check and claim in one step: this process handles one call at a time, so
+    %% the count a reservation was admitted on is the count the next one sees.
+    Reply = case session_admission(ConnKey, AgentId) of
+        ok ->
+            Ref = make_ref(),
+            true = ets:insert(?PENDING_TABLE,
+                              {{reserved, Ref}, #{conn_key => ConnKey, agent_id => AgentId},
+                               erlang:monotonic_time(millisecond)}),
+            {ok, Ref};
+        {error, session_limit} = Refused ->
+            Refused
+    end,
+    {reply, Reply, State};
+
+handle_call({commit_pending, SessionId, ConnKey, AgentId, Ref}, _From, State) ->
+    %% The pending row is already stored. A live reservation is the admission:
+    %% consumed, not checked again (the connection may hold one row more than the
+    %% cap by now through rows that count twice, and the proxied Register must
+    %% not be left without its row). Without one (swept after its TTL, or
+    %% released) the cap is checked here and a refusal removes the row.
+    Reply = case take_reservation(Ref) of
+        true ->
+            supersede_pending(ConnKey, AgentId, SessionId);
+        false ->
+            case session_admission(ConnKey, AgentId) of
+                ok ->
+                    supersede_pending(ConnKey, AgentId, SessionId);
+                {error, session_limit} = Refused ->
+                    ets:delete(?PENDING_TABLE, SessionId),
+                    Refused
+            end
+    end,
+    {reply, Reply, State};
 
 handle_call({register, AgentId, _Pid, _SessionId, _Plugins, _Hostname, _RegisterReq, ConnKey}
             = Request, From, State) ->
@@ -786,6 +932,29 @@ redact_message(Msg)                      -> Msg.
 %%%===================================================================
 %%% Internal
 %%%===================================================================
+
+%% Remove the reservation Ref and say whether it was live (stored and not past
+%% its TTL). `undefined' holds nothing.
+take_reservation(undefined) ->
+    false;
+take_reservation(Ref) ->
+    Oldest = erlang:monotonic_time(millisecond) - ?PENDING_TTL_MS,
+    case ets:take(?PENDING_TABLE, {reserved, Ref}) of
+        [{_, _, StoredAt}] -> StoredAt >= Oldest;
+        []                 -> false
+    end.
+
+%% A Register of AgentId on ConnKey replaces its older pending rows there, as the
+%% live insert replaces the live row: only SessionId's row stays. Run in this
+%% process after each caller stored its row, so when concurrent Registers of one
+%% agent id all commit, the last one handled is the one left. Reservation rows
+%% (keys that are not binaries) are other Registers still in flight: left alone.
+supersede_pending(ConnKey, AgentId, SessionId) ->
+    _ = ets:select_delete(?PENDING_TABLE,
+                          [{{'$1', #{conn_key => ConnKey, agent_id => AgentId}, '_'},
+                            [{is_binary, '$1'}, {'=/=', '$1', {const, SessionId}}],
+                            [true]}]),
+    ok.
 
 do_deregister(AgentId, #state{monitor_refs = Mons} = State) ->
     case ets:lookup(?TABLE, AgentId) of

@@ -36,19 +36,31 @@ register(Ctx, RegisterReq) ->
     PeerAddr = maps:get(<<":authority">>, Headers,
                         maps:get(<<"x-forwarded-for">>, Headers, <<"unknown">>)),
 
-    %% The connection's session quota is asked BEFORE the registration goes
-    %% upstream: a refusal after it would leave a session on the server that never
-    %% subscribes. store_pending/2 below checks again where the row is stored.
+    %% A slot on the connection is RESERVED before the registration goes
+    %% upstream: the check and the claim are one step in the registry, so
+    %% concurrent Registers on one connection admit at most the quota and a
+    %% refused one leaves nothing on the server. The reservation becomes the
+    %% pending row in store_pending/3 and is released here on every other way out
+    %% (a reservation of a crashed handler is swept after the pending TTL).
     AgentInfo0 = maps:get(info, RegisterReq, maps:get(<<"info">>, RegisterReq, #{})),
-    case yuzu_gw_registry:session_admission(yuzu_gw_conn:key_from_ctx(Ctx),
-                                            extract_agent_id(AgentInfo0)) of
-        ok ->
-            register_upstream(Ctx, RegisterReq, PeerAddr);
+    case yuzu_gw_registry:reserve_session(yuzu_gw_conn:key_from_ctx(Ctx),
+                                          extract_agent_id(AgentInfo0)) of
+        {ok, Reservation} ->
+            try
+                register_upstream(Ctx, RegisterReq, PeerAddr, Reservation)
+            after
+                yuzu_gw_registry:release_session(Reservation)
+            end;
         {error, session_limit} ->
-            session_limit_error()
+            session_limit_error();
+        {error, registry_unavailable} ->
+            %% Nothing was proxied: the session could not be matched by Subscribe.
+            logger:warning("Register failed: registry_unavailable"),
+            {grpc_error, {?GRPC_STATUS_INTERNAL,
+                          <<"Registration failed: registry unavailable">>}}
     end.
 
-register_upstream(Ctx, RegisterReq, PeerAddr) ->
+register_upstream(Ctx, RegisterReq, PeerAddr, Reservation) ->
     case yuzu_gw_upstream:proxy_register(RegisterReq) of
         {ok, Response} when is_map(Response) ->
             %% Stash the session_id and agent_info; the agent process is
@@ -71,7 +83,8 @@ register_upstream(Ctx, RegisterReq, PeerAddr) ->
                                   register_req => RegisterReq,
                                   peer_addr  => PeerAddr,
                                   conn_key   => yuzu_gw_conn:key_from_ctx(Ctx),
-                                  registered_at => erlang:system_time(millisecond)}) of
+                                  registered_at => erlang:system_time(millisecond)},
+                                Reservation) of
                 ok ->
                     logger:info("Agent ~s registered, awaiting Subscribe", [AgentId]),
                     {ok, Response, Ctx};
