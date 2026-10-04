@@ -27,6 +27,7 @@
 -define(LOGK, {?MODULE, log}).
 -define(LOG_HANDLER, yuzu_verdict_test_log).
 -define(EV_DROP,  [yuzu, gw, heartbeat, verdict_dropped]).
+-define(WAIT_UNTIL_MS, 3000).
 -define(EV_TRUNC, [yuzu, gw, heartbeat, unknown_truncated]).
 %% Element positions in the buffer's state record (tag at 1); the rate-limit
 %% test asserts the tuple size so a layout change fails loudly there.
@@ -63,8 +64,8 @@ verdict_test_() ->
        fun truncated_warning_is_rate_limited/0},
       {"the cast is skipped and counted queue_full while the upstream mailbox is over 100",
        fun cast_skipped_while_upstream_queue_is_long/0},
-      {"the upstream mailbox check is harmless when the process is gone",
-       fun queue_check_with_dead_upstream_still_casts/0},
+      {"the upstream mailbox check is harmless when the name is not registered",
+       fun queue_check_with_unregistered_upstream_still_casts/0},
       {"a flush interval outside 100..60000 or not an integer falls back with a warning",
        fun interval_invalid_falls_back/0},
       {"a flush interval inside 100..60000 is kept",
@@ -326,9 +327,12 @@ cast_skipped_while_upstream_queue_is_long() ->
     ?assertEqual(2, dropped(queue_full)),
     stop_stand_in(Dummy).
 
-%% The mailbox length is read from a registered pid that may be gone: a
-%% name nobody holds, or a process that has just died, never costs the cast.
-queue_check_with_dead_upstream_still_casts() ->
+%% The mailbox length is read from a registered pid: a name nobody holds (here,
+%% the stand-in is stopped and so unregistered) never costs the cast. The
+%% window between whereis/1 and process_info/2, where the process dies in
+%% between, is covered by the `undefined' clause of upstream_queue_len/0 but is
+%% not reproducible without a hook in the code under test.
+queue_check_with_unregistered_upstream_still_casts() ->
     Dummy = register_upstream_stand_in(),
     [Dummy ! filler || _ <- lists:seq(1, 500)],
     S1 = <<"verdict-session-dead">>,
@@ -403,17 +407,27 @@ drain_filler() ->
 %% Empty the stand-in's mailbox of filler and wait until it has.
 drain(Pid) ->
     Pid ! drain,
-    wait_until(fun() -> process_info(Pid, message_queue_len) =:= {message_queue_len, 0} end).
+    wait_until(stand_in_mailbox_empty,
+               fun() -> process_info(Pid, message_queue_len) =:= {message_queue_len, 0} end).
 
 stop_stand_in(Pid) ->
     Ref = monitor(process, Pid),
     Pid ! stop,
     receive {'DOWN', Ref, process, Pid, _} -> ok after 2000 -> error(stand_in_did_not_stop) end.
 
-wait_until(Pred) ->
+%% Poll Pred until it holds, for at most ?WAIT_UNTIL_MS; a timeout fails with
+%% the name of the condition, so a hang reads as what it was waiting for.
+wait_until(Name, Pred) ->
+    wait_until(Name, Pred, erlang:monotonic_time(millisecond) + ?WAIT_UNTIL_MS).
+
+wait_until(Name, Pred, Deadline) ->
     case Pred() of
         true  -> ok;
-        false -> erlang:yield(), wait_until(Pred)
+        false ->
+            case erlang:monotonic_time(millisecond) >= Deadline of
+                true  -> error({wait_until_timed_out, Name});
+                false -> erlang:yield(), wait_until(Name, Pred, Deadline)
+            end
     end.
 
 %% The truncated-verdict warnings, as the `suppressed N' text each carries.
