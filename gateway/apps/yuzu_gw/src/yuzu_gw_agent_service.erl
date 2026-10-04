@@ -142,16 +142,6 @@ subscribe(Ref, State) ->
                     %% written by a pre-upgrade Register still resolves.
                     RegisterReq = maps:get(register_req, Pending, #{}),
 
-                    %% The connection's session quota is asked before the agent
-                    %% process is started: a refusal then costs no process and
-                    %% no crash report. The registry asks again at the live
-                    %% insert, where the decision is made.
-                    ConnKey = yuzu_gw_conn:key_from_stream(State),
-                    case yuzu_gw_registry:session_admission(ConnKey, AgentId) of
-                        ok                     -> ok;
-                        {error, session_limit} -> throw(session_limit_error())
-                    end,
-
                     %% Spawn the agent process — it owns this stream.
                     %% We pass stream_pid=self() so the agent process sends
                     %% commands back to us via {send_command, Cmd} messages.
@@ -164,7 +154,17 @@ subscribe(Ref, State) ->
                              agent_info   => AgentInfo,
                              register_req => RegisterReq,
                              peer_addr    => PeerAddr,
-                             conn_key     => ConnKey},
+                             conn_key     => yuzu_gw_conn:key_from_stream(State)},
+
+                    %% The connection's session quota is asked before the agent
+                    %% process is started: a refusal then costs no process and
+                    %% no crash report. The registry asks again at the live
+                    %% insert, where the decision is made.
+                    case yuzu_gw_registry:session_admission(maps:get(conn_key, Args),
+                                                            AgentId) of
+                        ok                     -> ok;
+                        {error, session_limit} -> throw(session_limit_error())
+                    end,
 
                     case yuzu_gw_agent_sup:start_agent(Args) of
                         {ok, AgentPid} ->

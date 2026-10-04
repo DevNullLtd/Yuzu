@@ -658,13 +658,45 @@ init_limit_warn_stamp() ->
     end.
 
 handle_call({register, AgentId, _Pid, _SessionId, _Plugins, _Hostname, _RegisterReq, ConnKey}
-            = Request, _From, State) ->
+            = Request, From, State) ->
     %% The cap is checked before anything is changed, so a refused registration
-    %% leaves the agent's older one in place.
+    %% leaves the agent's older one in place. An admitted one is handled by the
+    %% clause below.
     case session_admission(ConnKey, AgentId) of
-        ok                     -> do_register(Request, State);
+        ok                     -> handle_call(setelement(1, Request, admitted_register),
+                                              From, State);
         {error, session_limit} -> {reply, {error, session_limit}, State}
     end;
+
+handle_call({admitted_register, AgentId, Pid, SessionId, Plugins, Hostname, RegisterReq, ConnKey},
+            _From, #state{monitor_refs = Mons} = State) ->
+    %% Remove any stale entry for this agent_id (returns cleaned Mons).
+    Mons1 = maybe_cleanup(AgentId, Mons),
+
+    %% Insert into ETS. The trailing field is the verbatim RegisterRequest,
+    %% kept so yuzu_gw_upstream can re-proxy it on upstream reconnect.
+    Now = erlang:system_time(millisecond),
+    ets:insert(?TABLE, {AgentId, Pid, node(Pid), SessionId, Plugins, Now,
+                        Hostname, RegisterReq}),
+
+    %% Index the session for heartbeat admission. A session id of
+    %% `undefined' (the routing-focused test path) is not indexed.
+    index_session(SessionId, AgentId, Pid, ConnKey),
+
+    %% Join pg groups. `{agent, AgentId}` (HA WS-4 4.3a) is the cross-node
+    %% location-transparency group `lookup/1`'s fallback reads — see that
+    %% function's doc comment.
+    pg:join(?PG_SCOPE, all_agents, Pid),
+    pg:join(?PG_SCOPE, {agent, AgentId}, Pid),
+    lists:foreach(fun(Plugin) ->
+        pg:join(?PG_SCOPE, {plugin, Plugin}, Pid)
+    end, Plugins),
+
+    %% Monitor the agent process for automatic cleanup.
+    MonRef = monitor(process, Pid),
+    Mons2 = Mons1#{MonRef => AgentId},
+
+    {reply, ok, State#state{monitor_refs = Mons2}};
 
 handle_call(_Request, _From, State) ->
     {reply, {error, unknown_call}, State}.
@@ -754,36 +786,6 @@ redact_message(Msg)                      -> Msg.
 %%%===================================================================
 %%% Internal
 %%%===================================================================
-
-do_register({register, AgentId, Pid, SessionId, Plugins, Hostname, RegisterReq, ConnKey},
-            #state{monitor_refs = Mons} = State) ->
-    %% Remove any stale entry for this agent_id (returns cleaned Mons).
-    Mons1 = maybe_cleanup(AgentId, Mons),
-
-    %% Insert into ETS. The trailing field is the verbatim RegisterRequest,
-    %% kept so yuzu_gw_upstream can re-proxy it on upstream reconnect.
-    Now = erlang:system_time(millisecond),
-    ets:insert(?TABLE, {AgentId, Pid, node(Pid), SessionId, Plugins, Now,
-                        Hostname, RegisterReq}),
-
-    %% Index the session for heartbeat admission. A session id of
-    %% `undefined' (the routing-focused test path) is not indexed.
-    index_session(SessionId, AgentId, Pid, ConnKey),
-
-    %% Join pg groups. `{agent, AgentId}` (HA WS-4 4.3a) is the cross-node
-    %% location-transparency group `lookup/1`'s fallback reads; see that
-    %% function's doc comment.
-    pg:join(?PG_SCOPE, all_agents, Pid),
-    pg:join(?PG_SCOPE, {agent, AgentId}, Pid),
-    lists:foreach(fun(Plugin) ->
-        pg:join(?PG_SCOPE, {plugin, Plugin}, Pid)
-    end, Plugins),
-
-    %% Monitor the agent process for automatic cleanup.
-    MonRef = monitor(process, Pid),
-    Mons2 = Mons1#{MonRef => AgentId},
-
-    {reply, ok, State#state{monitor_refs = Mons2}}.
 
 do_deregister(AgentId, #state{monitor_refs = Mons} = State) ->
     case ets:lookup(?TABLE, AgentId) of
