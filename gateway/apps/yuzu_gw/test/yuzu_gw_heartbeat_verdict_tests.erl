@@ -28,8 +28,11 @@
 -define(LOG_HANDLER, yuzu_verdict_test_log).
 -define(EV_DROP,  [yuzu, gw, heartbeat, verdict_dropped]).
 -define(EV_TRUNC, [yuzu, gw, heartbeat, unknown_truncated]).
-%% Element position in the buffer's state record (tag at 1).
+%% Element positions in the buffer's state record (tag at 1); the rate-limit
+%% test asserts the tuple size so a layout change fails loudly there.
 -define(ST_INTERVAL, 5).
+-define(ST_WARNED_AT, 7).
+-define(ST_SUPPRESSED, 8).
 
 verdict_test_() ->
     {foreach,
@@ -56,6 +59,8 @@ verdict_test_() ->
        fun non_map_body_is_no_verdict/0},
       {"a verdict field of the wrong type is ignored and the buffer survives",
        fun wrong_typed_verdict_fields_are_ignored/0},
+      {"the truncated warning is logged once per 60 s, the counter on every occurrence",
+       fun truncated_warning_is_rate_limited/0},
       {"the cast is skipped and counted queue_full while the upstream mailbox is over 100",
        fun cast_skipped_while_upstream_queue_is_long/0},
       {"the upstream mailbox check is harmless when the process is gone",
@@ -260,6 +265,38 @@ wrong_typed_verdict_fields_are_ignored() ->
     ?assertEqual([], events(?EV_TRUNC)),
     ?assertEqual(0, dropped(malformed)).
 
+%% A truncated verdict is counted every time but warned about at most once per
+%% 60 s per buffer process. The clock is the buffer's own monotonic stamp, aged
+%% here through sys:replace_state/2 instead of waiting a minute. The second
+%% warning says how many occurrences the first window swallowed.
+truncated_warning_is_rate_limited() ->
+    S1 = <<"verdict-session-rl">>,
+    Trunc = {ok, #{acknowledged_count => 0, unknown_session_ids => [S1],
+                   unknown_session_ids_truncated => true}, #{}},
+    Pid = whereis(yuzu_gw_heartbeat_buffer),
+    St0 = sys:get_state(Pid),
+    ?assertEqual(8, tuple_size(St0)),
+    ?assertEqual(undefined, element(?ST_WARNED_AT, St0)),
+    ?assertEqual(0, element(?ST_SUPPRESSED, St0)),
+    {_, Lines1} = capture_logs(fun() ->
+        [ok = flush_sync(Trunc) || _ <- [1, 2, 3]]
+    end),
+    ?assertEqual(["suppressed 0"], trunc_warnings(Lines1)),
+    ?assertEqual(3, length(events(?EV_TRUNC))),
+    ?assertEqual(2, element(?ST_SUPPRESSED, sys:get_state(Pid))),
+    %% Age the last warning past the window: the next occurrence warns again.
+    Old = erlang:monotonic_time(millisecond) - 61000,
+    _ = sys:replace_state(Pid, fun(St) -> setelement(?ST_WARNED_AT, St, Old) end),
+    {_, Lines2} = capture_logs(fun() -> ok = flush_sync(Trunc) end),
+    ?assertEqual(["suppressed 2"], trunc_warnings(Lines2)),
+    ?assertEqual(4, length(events(?EV_TRUNC))),
+    ?assertEqual(0, element(?ST_SUPPRESSED, sys:get_state(Pid))),
+    %% And inside the new window it is quiet again.
+    {_, Lines3} = capture_logs(fun() -> ok = flush_sync(Trunc) end),
+    ?assertEqual([], trunc_warnings(Lines3)),
+    ?assertEqual(5, length(events(?EV_TRUNC))),
+    ?assertEqual(1, element(?ST_SUPPRESSED, sys:get_state(Pid))).
+
 %% The bound on the upstream mailbox does not depend on configuration. A
 %% stand-in registered as yuzu_gw_upstream never reads its mailbox, so its
 %% length is exactly what the test put there. At 100 messages the cast goes
@@ -379,6 +416,14 @@ wait_until(Pred) ->
         false -> erlang:yield(), wait_until(Pred)
     end.
 
+%% The truncated-verdict warnings, as the `suppressed N' text each carries.
+trunc_warnings(Lines) ->
+    [begin
+         {match, [M]} = re:run(T, <<"\\(suppressed [0-9]+\\)">>, [{capture, first, list}]),
+         string:trim(string:trim(M, leading, "("), trailing, ")")
+     end || {warning, T} <- Lines,
+            binary:match(T, <<"omitted sessions may be reported by subsequent heartbeats">>)
+                =/= nomatch].
 
 %% Make the next BatchHeartbeat rpc return Result.
 set_result(Result) ->

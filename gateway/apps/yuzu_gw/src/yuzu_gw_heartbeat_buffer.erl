@@ -58,6 +58,8 @@
 %% upstream process already holds more than this many unhandled messages. The
 %% bound does not depend on configuration: it holds whatever the interval is.
 -define(UPSTREAM_QUEUE_MAX, 100).
+%% At most one truncated-verdict warning per this long (monotonic ms).
+-define(TRUNC_WARN_INTERVAL_MS, 60000).
 %% Bounds on one verdict: the longest session id the gateway will carry and
 %% the most ids handed to the upstream per flush.
 -define(MAX_SESSION_ID_BYTES, 64).
@@ -70,7 +72,11 @@
     buf_len     :: non_neg_integer(), %% tracked length (avoid length/1)
     timer       :: reference() | undefined,
     interval    :: non_neg_integer(), %% flush interval in ms
-    max_buf     :: non_neg_integer()  %% cap for retained buffer on failure
+    max_buf     :: non_neg_integer(), %% cap for retained buffer on failure
+    %% Monotonic ms of the last truncated-verdict warning (undefined: none
+    %% yet), and the truncated verdicts seen since it, not logged.
+    trunc_warned_at  = undefined :: integer() | undefined,
+    trunc_suppressed = 0         :: non_neg_integer()
 }).
 
 %%%===================================================================
@@ -281,6 +287,10 @@ settle_flush({error, _} = Error, State) ->
 %% later heartbeat lists the sessions again). Casting faster than the upstream
 %% drains would only grow its mailbox.
 %%
+%% A truncated verdict is counted every time, but warned about at most once per
+%% ?TRUNC_WARN_INTERVAL_MS; the warning says how many were suppressed since the
+%% last one. The timestamps live in the returned state.
+%%
 %% A body that is not a map is no verdict (grpcbox returns {ok, <<>>, Trailers}
 %% for an OK with trailers and no DATA frame): nothing is cast or counted and
 %% the flush still succeeds. A key of the wrong type is treated as absent. A
@@ -309,10 +319,7 @@ consume_verdict(Response, State) when is_map(Response) ->
         true ->
             telemetry:execute([yuzu, gw, heartbeat, unknown_truncated],
                               #{count => 1}, #{}),
-            logger:warning("Heartbeat verdict truncated by the server (~b listed); "
-                           "omitted sessions may be reported by subsequent heartbeats",
-                           [length(Listed)]),
-            State;
+            warn_truncated(length(Listed), State);
         _ ->
             State
     end,
@@ -352,6 +359,22 @@ upstream_queue_len() ->
                 {message_queue_len, Len} -> Len;
                 undefined                -> undefined
             end
+    end.
+
+%% @doc The truncated-verdict warning, at most once per ?TRUNC_WARN_INTERVAL_MS.
+-spec warn_truncated(non_neg_integer(), #state{}) -> #state{}.
+warn_truncated(ListedCount, #state{trunc_warned_at = Last,
+                                   trunc_suppressed = Suppressed} = State) ->
+    Now = erlang:monotonic_time(millisecond),
+    case Last =:= undefined orelse Now - Last >= ?TRUNC_WARN_INTERVAL_MS of
+        true ->
+            logger:warning("Heartbeat verdict truncated by the server (~b listed); "
+                           "omitted sessions may be reported by subsequent heartbeats "
+                           "(suppressed ~b)",
+                           [ListedCount, Suppressed]),
+            State#state{trunc_warned_at = Now, trunc_suppressed = 0};
+        false ->
+            State#state{trunc_suppressed = Suppressed + 1}
     end.
 
 %% @doc Read an integer application env key that must lie in Min..Max; an
