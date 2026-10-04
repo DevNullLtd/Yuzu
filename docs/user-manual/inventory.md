@@ -739,7 +739,8 @@ host counted there is online but its collector is skipping (reason in its `last_
 tag). The two gauges count different populations (stored-receipt age over 48 h in
 Postgres vs live heartbeats, which include hosts skipping for less than 48 h and
 hosts that have never reported), so read them side by side and never subtract one
-from the other.
+from the other. Agents that do not emit the skip tag (older agents, or during a
+rollout) are not counted, so a zero there does not rule out a skipping collector.
 
 **`install_location` is `-` for many Windows applications and every Linux application.** `-` means the OS
 reported no location, not that collection failed. Windows reads each Uninstall key's `InstallLocation`, which many
