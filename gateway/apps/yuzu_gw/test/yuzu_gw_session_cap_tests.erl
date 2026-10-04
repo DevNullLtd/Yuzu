@@ -104,8 +104,12 @@ cap_test_() ->
 
 setup() ->
     {ok, _} = application:ensure_all_started(telemetry),
-    Prev = application:get_env(yuzu_gw, max_sessions_per_connection),
+    Prev = {application:get_env(yuzu_gw, max_sessions_per_connection),
+            application:get_env(yuzu_gw, dead_connection_grace_ms)},
     application:unset_env(yuzu_gw, max_sessions_per_connection),
+    %% The cases below that pin the removal of a closed connection's rows run with
+    %% no grace; the grace cases restart the registry with their own value.
+    application:set_env(yuzu_gw, dead_connection_grace_ms, 0),
     yuzu_gw_test_registry:ensure_fresh(),
     unlink(whereis(yuzu_gw_registry)),
     catch ets:delete(?EVENTS_TAB),
@@ -120,7 +124,7 @@ setup() ->
                             #{config => #{table => ?EVENTS_TAB}, level => all}),
     Prev.
 
-cleanup(Prev) ->
+cleanup({PrevCap, PrevGrace}) ->
     %% The stand-in agent processes joined pg groups under the registry that is
     %% being replaced: stop them, or a later module that registers the same
     %% agent id would find them through lookup/1's pg fallback.
@@ -128,14 +132,15 @@ cleanup(Prev) ->
     catch logger:remove_handler(?LOG_HANDLER),
     catch telemetry:detach(?EV_HANDLER),
     catch ets:delete(?EVENTS_TAB),
-    case Prev of
-        {ok, V}   -> application:set_env(yuzu_gw, max_sessions_per_connection, V);
-        undefined -> application:unset_env(yuzu_gw, max_sessions_per_connection)
-    end,
+    restore_env(max_sessions_per_connection, PrevCap),
+    restore_env(dead_connection_grace_ms, PrevGrace),
     catch meck:unload([yuzu_gw_conn, yuzu_gw_upstream]),
     yuzu_gw_test_registry:ensure_fresh(),
     unlink(whereis(yuzu_gw_registry)),
     ok.
+
+restore_env(Key, {ok, V})   -> application:set_env(yuzu_gw, Key, V);
+restore_env(Key, undefined) -> application:unset_env(yuzu_gw, Key).
 
 handle_event(_Event, #{count := N}, _Meta, _Config) ->
     true = ets:insert(?EVENTS_TAB, {erlang:unique_integer([monotonic]), refused, N}),

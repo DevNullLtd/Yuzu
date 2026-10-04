@@ -75,7 +75,7 @@ drain_test_() ->
            fun() -> goaway_ends_binding(State) end},
           {"after GOAWAY the agent reconnects: a fresh session binds to the new connection",
            fun() -> reconnect_binds_new_connection(State) end},
-          {"pending session whose connection got GOAWAY: dropped with the connection, the agent registers again",
+          {"pending session whose connection got GOAWAY: rejected until Subscribe binds the new connection",
            fun() -> pending_session_after_goaway(State) end},
           {"heartbeat on a new connection while the old Subscribe is still bound is rejected",
            fun() -> new_connection_during_drain_window(State) end},
@@ -150,35 +150,32 @@ reconnect_binds_new_connection(State) ->
 
 pending_session_after_goaway(State) ->
     with_channels(State, fun(A, B, Counts) ->
-        Id = agent_id(<<"pending">>),
-        S = register_session(A, Id),
+        S = register_session(A, agent_id(<<"pending">>)),
         {ok, K1} = yuzu_gw_registry:lookup_pending_session(S),
         ?assertMatch({ok, _, _}, heartbeat(A, S)),
         Mon = monitor(process, K1),
         Sub = client_goaway(A),
         ?assertEqual(normal, await_down(Mon)),
         ok = await_channel_lost(Sub),
-        %% The pending row goes with the connection that registered (the registry
-        %% monitors it), not at the end of the 2 minute TTL.
-        ok = wait_until(fun() -> yuzu_gw_registry:lookup_pending_session(S) =:= error end,
-                        3000),
-        %% So no connection is admitted for it: unknown session, not mismatch.
+        %% The pending row is not tied to the connection process: it stays,
+        %% still naming the connection that registered, which is gone.
+        ?assertEqual({ok, K1}, yuzu_gw_registry:lookup_pending_session(S)),
+        %% So no connection is admitted for it until Subscribe binds it.
         ?assertMatch({error, {<<"5">>, <<"unknown session">>}, _}, heartbeat(A, S)),
         ?assertMatch({error, {<<"5">>, <<"unknown session">>}, _}, heartbeat(B, S)),
-        ?assertEqual(0, count(Counts, connection_mismatch)),
-        ?assertEqual(2, count(Counts, unknown_session)),
-        %% The agent registers again on the reconnected channel, as it does when
-        %% its Subscribe is answered NOT_FOUND; the new session binds to the NEW
+        ?assertEqual(2, count(Counts, connection_mismatch)),
+        %% Subscribe on the reconnected channel binds the session to the NEW
         %% connection, and only that connection is admitted.
-        {S2, Holder} = register_and_subscribe(A, Id),
+        Holder = subscribe(A, S),
         try
-            {ok, #{conn_key := K2}} = yuzu_gw_registry:lookup_session(S2),
+            ok = await_bound(S),
+            {ok, #{conn_key := K2}} = yuzu_gw_registry:lookup_session(S),
             ?assertNotEqual(K1, K2),
-            ?assertMatch({ok, _, _}, heartbeat(A, S2)),
-            ?assertMatch({error, {<<"5">>, <<"unknown session">>}, _}, heartbeat(B, S2)),
-            ?assertEqual(1, count(Counts, connection_mismatch))
+            ?assertMatch({ok, _, _}, heartbeat(A, S)),
+            ?assertMatch({error, {<<"5">>, <<"unknown session">>}, _}, heartbeat(B, S)),
+            ?assertEqual(3, count(Counts, connection_mismatch))
         after
-            end_session(Holder, S2)
+            end_session(Holder, S)
         end
     end).
 
@@ -462,7 +459,12 @@ subscribe_def() ->
 setup() ->
     {ok, _} = application:ensure_all_started(grpcbox),
     {ok, _} = application:ensure_all_started(telemetry),
-    ok = yuzu_gw_test_registry:ensure(),
+    %% A pending session must outlive the GOAWAY of its connection until a
+    %% Subscribe on the reconnected channel takes it: a grace far beyond the case,
+    %% on a registry started with it (a reused one may hold another value).
+    PrevGrace = application:get_env(yuzu_gw, dead_connection_grace_ms),
+    application:set_env(yuzu_gw, dead_connection_grace_ms, 60000),
+    ok = yuzu_gw_test_registry:ensure_fresh(),
     AgentSup = case whereis(yuzu_gw_agent_sup) of
         undefined ->
             {ok, P} = yuzu_gw_agent_sup:start_link(),
@@ -492,10 +494,14 @@ setup() ->
                                fun ?MODULE:handle_telemetry/4, Counts),
     {Port, Server} = start_listener(5),
     #{port => Port, server => Server, agent_sup => AgentSup,
-      counts => Counts, handler_id => HandlerId}.
+      counts => Counts, handler_id => HandlerId, prev_grace => PrevGrace}.
 
 cleanup(#{server := Server, agent_sup := AgentSup, handler_id := HandlerId,
-          counts := Counts}) ->
+          counts := Counts, prev_grace := PrevGrace}) ->
+    case PrevGrace of
+        {ok, V}   -> application:set_env(yuzu_gw, dead_connection_grace_ms, V);
+        undefined -> application:unset_env(yuzu_gw, dead_connection_grace_ms)
+    end,
     catch supervisor:terminate_child(grpcbox_services_simple_sup, Server),
     catch telemetry:detach(HandlerId),
     catch ets:delete(Counts),

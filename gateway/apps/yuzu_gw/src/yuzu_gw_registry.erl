@@ -68,15 +68,24 @@
 %%% the next reservation or commit on the connection, or by the sweep. A connection
 %%% key of `undefined' is never counted.
 %%%
-%%% 4. A closed connection frees its rows at once. The registry monitors the
+%%% 4. A closed connection frees its rows after a grace. The registry monitors the
 %%% connection process (one monitor per connection, taken when a reservation or
-%%% pending row is first stored for it, whatever the number of rows) and removes
-%%% every reservation and pending row of the connection when it goes down, so a
-%%% client that reconnects over and over neither starts again below the cap nor
-%%% leaves its stored RegisterRequests to wait for the TTL. The sweep releases the
-%%% monitor of a connection that has no row left. Only a pid is monitored. A row
-%%% stored for a connection that is already dead is removed the same way: the
-%%% monitor of a dead process fires at once.
+%%% pending row is first stored for it, whatever the number of rows). When it goes
+%%% down the registry starts ONE timer for the connection, `dead_connection_grace_ms'
+%%% (default 15000, 0..120000, 0 = at once), and when that fires removes every
+%%% reservation and pending row of the connection, so a client that reconnects over
+%%% and over neither starts again below the cap nor leaves its stored
+%%% RegisterRequests to wait for the TTL. Until then the rows stay and can be taken:
+%%% an agent whose connection got GOAWAY after its Register subscribes on the
+%%% reconnected channel and must find its session (a released agent answers
+%%% NOT_FOUND by wedging, #2182). The rows count for the dead connection key only,
+%%% which nothing uses. A dead connection with no row left has no timer, a row
+%%% taken during the grace is simply gone when the timer fires, and the sweep
+%%% cancels the timer of a dead connection whose rows are all gone. The sweep
+%%% releases the monitor of a live connection that has no row left. Only a pid is
+%%% monitored. A row stored for a connection that is already dead is removed the
+%%% same way: the monitor of a dead process fires at once, and the connection's
+%%% timer, if one runs, covers the new row (it does not restart).
 %%%
 %%% Not covered: the gap between Subscribe taking a pending row and the live
 %%% insert, where a slot is free for a moment and another Register can take it;
@@ -128,6 +137,9 @@
 %% hold. Valid 1..1000 (default 8); anything else logs a warning naming the key
 %% and takes the default. Read once at registry start.
 -define(DEFAULT_MAX_SESSIONS, 8).
+%% How long the rows of a connection that went down stay takeable.
+-define(DEFAULT_DEAD_GRACE_MS, 15000).
+-define(MAX_DEAD_GRACE_MS, 120000).
 -define(MIN_MAX_SESSIONS, 1).
 -define(MAX_MAX_SESSIONS, 1000).
 %% persistent_term keys: the configured cap, the per-connection index (an
@@ -143,7 +155,11 @@
     %% One monitor per connection process that has a reservation or a pending row
     %% (the connection key, when it is a pid): its death removes those rows.
     conn_monitors = #{} :: #{pid() => reference()},
-    sweep_timer  :: reference()
+    sweep_timer  :: reference(),
+    %% One grace timer per dead connection that still has a row: the rows go when
+    %% it fires (never one timer per row).
+    dead_conns = #{} :: #{pid() => reference()},
+    dead_grace_ms = ?DEFAULT_DEAD_GRACE_MS :: non_neg_integer()
 }).
 
 %%%===================================================================
@@ -768,7 +784,9 @@ init([]) ->
                                        ?MIN_MAX_SESSIONS, ?MAX_MAX_SESSIONS)),
     init_limit_warn_stamp(),
     TRef = erlang:send_after(?PENDING_SWEEP_MS, self(), sweep_pending),
-    {ok, #state{monitor_refs = #{}, sweep_timer = TRef}}.
+    Grace = yuzu_gw_env:env_int(dead_connection_grace_ms, ?DEFAULT_DEAD_GRACE_MS,
+                                0, ?MAX_DEAD_GRACE_MS),
+    {ok, #state{monitor_refs = #{}, sweep_timer = TRef, dead_grace_ms = Grace}}.
 
 %% A persistent_term:put over a different value costs a global GC: skip it
 %% when the value is already there.
@@ -912,18 +930,29 @@ handle_info({'DOWN', MonRef, process, Pid, _Reason},
             %% pg auto-removes dead processes, but we clean ETS explicitly.
             {noreply, State#state{monitor_refs = maps:remove(MonRef, Mons)}};
         error ->
-            %% A connection process: its reservations and pending rows go with it
-            %% (a stored RegisterRequest is not kept for a connection that is
-            %% gone, and a reconnect does not start again below the cap). The
-            %% monitor is spent.
+            %% A connection process: its reservations and pending rows go after
+            %% the grace (a stored RegisterRequest is not kept for a connection
+            %% that is gone, and a reconnect does not start again below the cap).
+            %% The monitor is spent.
             #state{conn_monitors = ConnMons} = State,
             case maps:find(Pid, ConnMons) of
                 {ok, MonRef} ->
-                    drop_connection_rows(Pid),
-                    {noreply, State#state{conn_monitors = maps:remove(Pid, ConnMons)}};
+                    {noreply, connection_down(
+                                Pid, State#state{conn_monitors = maps:remove(Pid, ConnMons)})};
                 _ ->
                     {noreply, State}
             end
+    end;
+
+handle_info({timeout, TRef, Pid}, #state{dead_conns = Dead} = State) when is_pid(Pid) ->
+    %% The grace of a dead connection is over. A timer that was cancelled, or
+    %% replaced, is not the one the state holds: nothing to do.
+    case maps:find(Pid, Dead) of
+        {ok, TRef} ->
+            drop_connection_rows(Pid),
+            {noreply, State#state{dead_conns = maps:remove(Pid, Dead)}};
+        _ ->
+            {noreply, State}
     end;
 
 handle_info(sweep_pending, State) ->
@@ -1011,17 +1040,41 @@ monitor_connection(ConnKey, #state{conn_monitors = ConnMons} = State) when is_pi
 monitor_connection(_ConnKey, State) ->
     State.
 
-%% Remove every reservation and pending row of the connection ConnKey, through
-%% its index (one lookup, not a scan of the table).
+%% The connection process ConnKey went down (its monitor is spent). With no row
+%% left there is nothing to wait for. With a grace of 0 the rows go now. Otherwise
+%% ONE timer starts for the connection, and none when one already runs (a row
+%% stored for the dead connection meanwhile goes with the first timer).
+connection_down(ConnKey, #state{dead_conns = Dead, dead_grace_ms = Grace} = State) ->
+    case maps:is_key(ConnKey, Dead) of
+        true ->
+            State;
+        false ->
+            case indexed_rows(ConnKey) of
+                [] ->
+                    with_index(?PENDING_INDEX_KEY, fun(Index) -> ets:delete(Index, ConnKey) end),
+                    State;
+                _ when Grace =:= 0 ->
+                    drop_connection_rows(ConnKey),
+                    State;
+                _ ->
+                    TRef = erlang:start_timer(Grace, self(), ConnKey),
+                    State#state{dead_conns = Dead#{ConnKey => TRef}}
+            end
+    end.
+
+%% Remove every reservation and pending row of the connection ConnKey: whatever
+%% the table holds for it, indexed or not (a row a handler inserted and has not
+%% committed yet), and then its index entries.
 drop_connection_rows(ConnKey) ->
-    _ = [ets:delete(?PENDING_TABLE, Key) || {Key, _, _} <- indexed_rows(ConnKey)],
+    _ = ets:select_delete(?PENDING_TABLE, [{{'_', #{conn_key => ConnKey}, '_'}, [], [true]}]),
     with_index(?PENDING_INDEX_KEY, fun(Index) -> ets:delete(Index, ConnKey) end).
 
 %% Release the monitor of a connection with no reservation or pending row left
 %% (Subscribe took its rows, or they expired): a connection that lives for days
 %% must not hold one for as long. Run by the sweep; a connection that stores a
-%% row later is monitored again by that call.
-release_idle_monitors(#state{conn_monitors = ConnMons} = State) ->
+%% row later is monitored again by that call. The same for the grace timer of a
+%% dead connection whose rows are all gone.
+release_idle_monitors(#state{conn_monitors = ConnMons, dead_conns = Dead} = State) ->
     case persistent_term:get(?PENDING_INDEX_KEY, undefined) of
         undefined ->
             State;
@@ -1033,7 +1086,13 @@ release_idle_monitors(#state{conn_monitors = ConnMons} = State) ->
                                        false -> demonitor(MonRef, [flush]), false
                                    end
                                end, ConnMons),
-            State#state{conn_monitors = Kept}
+            DeadKept = maps:filter(fun(Conn, TRef) ->
+                                       case ets:member(Index, Conn) of
+                                           true  -> true;
+                                           false -> _ = erlang:cancel_timer(TRef), false
+                                       end
+                                   end, Dead),
+            State#state{conn_monitors = Kept, dead_conns = DeadKept}
     end.
 
 %% A Register of AgentId on ConnKey replaces its older pending rows there, as the
