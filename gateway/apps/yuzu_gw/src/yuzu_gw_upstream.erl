@@ -551,8 +551,8 @@ do_replay_one(AgentId, Pid, SessionId, RegisterReq, QueueDepth, State) ->
                 %% enrollment). Re-announcing a session the server never
                 %% installed would only be rejected again, and the next
                 %% verdict would replay it again, so tear down this process's
-                %% stream: the agent then registers directly and follows its
-                %% own outcome. The answer is authoritative, so it is a breaker
+                %% stream: the agent then registers again by itself through the gateway
+                %% and follows its own outcome. The answer is authoritative, so it is a breaker
                 %% SUCCESS (as for the superseded case below), and the attempt
                 %% is stamped like any other replay. A MISSING `accepted' key
                 %% still means accepted (the decoder always sets it on the wire;

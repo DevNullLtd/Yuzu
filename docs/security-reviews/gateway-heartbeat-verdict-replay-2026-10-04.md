@@ -40,7 +40,7 @@ All runs used one real agent, one core replica, debug builds and gateway log lev
 
 At the rig commit `caef11df5` (fix-agent and reviewer runs, not rig runs):
 
-- eunit: 458 of 458 passed, three runs from a fresh `_build/test`. For the count after the later test commits, see the PR for the final count.
+- eunit: 458 of 458 passed on the rig-tested commit, three runs from a fresh `_build/test`; 467 of 467 after the governance fix round (three runs from a fresh `_build/test`, no flake).
 - dialyzer: exit code 0.
 - Common Test: 52 cases.
 
