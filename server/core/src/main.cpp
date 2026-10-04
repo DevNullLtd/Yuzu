@@ -331,7 +331,7 @@ int main(int argc, char* argv[]) {
     std::string postgres_dsn_file;
     app.add_option("--postgres-dsn-file", postgres_dsn_file,
                    "Read the PostgreSQL connection string from this file instead of taking it "
-                   "on the command line (whole file; a trailing newline and a UTF-8 BOM are "
+                   "on the command line (whole file; trailing whitespace and a UTF-8 BOM are "
                    "ignored). Cannot be combined with --postgres-dsn / YUZU_POSTGRES_DSN. The "
                    "file's permissions are not checked: keep it in a directory only the "
                    "server's account can read.")
@@ -975,29 +975,13 @@ int main(int argc, char* argv[]) {
     // Resolved here, before anything reads cfg. A failure is reported again
     // after the log file is set up (below): a Windows service has no console,
     // so a stderr-only message would never be seen.
-    std::string secret_file_error;
-    auto load_secret_file = [&secret_file_error](const std::string& file, std::string& target,
-                                                 std::string_view file_flag,
-                                                 std::string_view direct) {
-        if (file.empty() || !secret_file_error.empty())
-            return;
-        if (!target.empty()) {
-            secret_file_error = std::format("{} cannot be combined with {} (set on the command "
-                                            "line or in the environment); use one of them",
-                                            file_flag, direct);
-            return;
-        }
-        auto secret = yuzu::server::read_secret_file(file, file_flag);
-        if (!secret) {
-            secret_file_error = secret.error();
-            return;
-        }
-        target = std::move(*secret);
-    };
-    load_secret_file(postgres_dsn_file, cfg.postgres_dsn, "--postgres-dsn-file",
-                     "--postgres-dsn / YUZU_POSTGRES_DSN");
-    load_secret_file(oidc_client_secret_file, cfg.oidc_client_secret, "--oidc-client-secret-file",
-                     "--oidc-client-secret / YUZU_OIDC_CLIENT_SECRET");
+    std::string secret_file_error = yuzu::server::resolve_secret_file_option(
+        postgres_dsn_file, cfg.postgres_dsn, "--postgres-dsn-file",
+        "--postgres-dsn / YUZU_POSTGRES_DSN");
+    if (secret_file_error.empty())
+        secret_file_error = yuzu::server::resolve_secret_file_option(
+            oidc_client_secret_file, cfg.oidc_client_secret, "--oidc-client-secret-file",
+            "--oidc-client-secret / YUZU_OIDC_CLIENT_SECRET");
     if (!secret_file_error.empty())
         std::cerr << "Error: " << secret_file_error << "\n";
 

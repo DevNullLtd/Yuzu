@@ -23,7 +23,6 @@
 #include <expected>
 #include <filesystem>
 #include <fstream>
-#include <iterator>
 #include <string>
 #include <string_view>
 
@@ -58,10 +57,13 @@ read_secret_file(const std::filesystem::path& path, std::string_view flag) {
     std::ifstream in(path, std::ios::binary);
     if (!in)
         return std::unexpected(where + ": could not be opened for reading");
-    std::string text{std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
+    // Read at most one byte past the cap: the path may have been swapped for
+    // something unbounded (a FIFO, a device) since the checks above.
+    std::string text(kMaxSecretFileBytes + 1, '\0');
+    in.read(text.data(), static_cast<std::streamsize>(text.size()));
     if (in.bad())
         return std::unexpected(where + ": could not be read");
-    // Re-check after reading: the file may have grown since file_size().
+    text.resize(static_cast<std::size_t>(in.gcount()));
     if (text.size() > kMaxSecretFileBytes)
         return std::unexpected(where + ": larger than " + std::to_string(kMaxSecretFileBytes) +
                                " bytes, so it is not a secret file");
@@ -74,6 +76,27 @@ read_secret_file(const std::filesystem::path& path, std::string_view flag) {
     if (text.empty())
         return std::unexpected(where + ": the file is empty");
     return text;
+}
+
+/// One --x-file / --x pair: when `file` is given, read it into `target`.
+/// Refuses (returns the reason) when `target` already holds a value -- from
+/// the direct option or its environment variable -- so a secret is never
+/// silently taken from two places. Returns "" on success or when `file` is
+/// empty. `file_flag` and `direct` name the options in the message.
+[[nodiscard]] inline std::string resolve_secret_file_option(const std::string& file,
+                                                            std::string& target,
+                                                            std::string_view file_flag,
+                                                            std::string_view direct) {
+    if (file.empty())
+        return {};
+    if (!target.empty())
+        return std::string(file_flag) + " cannot be combined with " + std::string(direct) +
+               " (set on the command line or in the environment); use one of them";
+    auto secret = read_secret_file(file, file_flag);
+    if (!secret)
+        return secret.error();
+    target = std::move(*secret);
+    return {};
 }
 
 } // namespace yuzu::server

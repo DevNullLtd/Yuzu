@@ -13,6 +13,7 @@
 
 using yuzu::server::kMaxSecretFileBytes;
 using yuzu::server::read_secret_file;
+using yuzu::server::resolve_secret_file_option;
 
 namespace {
 
@@ -100,5 +101,37 @@ TEST_CASE("read_secret_file: refuses, naming the flag and file but not the conte
                                   "--f");
         REQUIRE_FALSE(r);
         CHECK(r.error().find("QQQQ") == std::string::npos);
+    }
+}
+
+TEST_CASE("resolve_secret_file_option: the --x-file / --x pair as main.cpp wires it",
+          "[secret_file]") {
+    yuzu::test::TempDir dir("yuzu_test_secret_");
+    const auto file = write_file(dir, "dsn", "host=db password=x\n").string();
+
+    SECTION("no file given: nothing to do, target untouched") {
+        std::string target = "from-env";
+        CHECK(resolve_secret_file_option("", target, "--f", "--d").empty());
+        CHECK(target == "from-env");
+    }
+    SECTION("file given, direct option empty: the file wins") {
+        std::string target;
+        CHECK(resolve_secret_file_option(file, target, "--f", "--d").empty());
+        CHECK(target == "host=db password=x");
+    }
+    SECTION("file given AND the direct option (or its env var) set: refused, target untouched") {
+        std::string target = "from-env";
+        const auto err =
+            resolve_secret_file_option(file, target, "--postgres-dsn-file", "--postgres-dsn");
+        CHECK(err.find("cannot be combined") != std::string::npos);
+        CHECK(err.find("--postgres-dsn-file") != std::string::npos);
+        CHECK(target == "from-env");
+    }
+    SECTION("an unreadable file passes its reason through") {
+        std::string target;
+        const auto err = resolve_secret_file_option((dir.path / "missing").string(), target,
+                                                    "--f", "--d");
+        CHECK(err.find("does not exist") != std::string::npos);
+        CHECK(target.empty());
     }
 }

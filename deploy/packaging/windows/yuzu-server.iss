@@ -30,12 +30,14 @@
 ;   /NOTLS                 Disable gRPC TLS (dev only)
 ;   /NOSTART               Do not start service after install
 ;
-; Exit codes: 0 success; 7 the installation was stopped before anything was
+; Exit codes: 0 success; 7 the installation was stopped before any file was
 ; installed (Inno's PrepareToInstall failure) -- for this installer that means
 ; an input was invalid or missing, or the data directory, certificates,
-; secrets or configuration could not be secured (#5196, #5210, #5272, #5273).
-; The reason is in the setup log (/LOG=<file>), on a line starting
-; "PrepareToInstall:".
+; secrets or configuration could not be secured (#5196, #5210, #5272). The
+; reason is in the setup log (/LOG=<file>), on a line starting
+; "PrepareToInstall:"; a service already stopped by then stays stopped. 10 the
+; files were installed but the service could not be registered or its command
+; line could not be written and confirmed; the service is disabled.
 ;
 ; THE SETUP LOG RECORDS THE FULL COMMAND LINE, including any /ADMIN_PASS=,
 ; /OPERATOR_PASS=, /POSTGRES_DSN= or /OIDC_CLIENT_SECRET= value. Prefer the
@@ -158,8 +160,15 @@ var
   CACertBtn: TNewButton;
 
   // Set when PrepareToInstall stopped a running YuzuServer service, so an
-  // abort can say so truthfully. Sticky: never cleared within a run.
+  // abort can say so truthfully. Sticky: cleared only if this run starts the
+  // service again itself.
   StoppedRunningService: Boolean;
+  // Set when this run disabled the service (a failed restore of the old data
+  // directory), so the abort message does not promise it restarts at reboot.
+  ServiceDisabled: Boolean;
+  // Set when the service could not be registered or its command line could
+  // not be written; Setup then exits with code 10 (GetCustomSetupExitCode).
+  ServiceSetupFailed: Boolean;
 
 // ── Command-line helpers ─────────────────────────────────────────────────
 function GetCmdParam(const ParamName: string): string;
@@ -188,6 +197,23 @@ begin
       Result := True;
       Exit;
     end;
+end;
+
+// True when Name is set where the service will see it: machine-wide, or in
+// the YuzuServer service's own Environment value (REG_MULTI_SZ, NAME=value
+// lines). Either is honoured by the server, and either is readable by local
+// users; the server refuses to start with both a variable and its -file flag.
+function EnvVarSet(const Name: string): Boolean;
+var
+  V: string;
+begin
+  Result := RegQueryStringValue(HKLM, 'SYSTEM\CurrentControlSet\Control\Session Manager\Environment',
+                                Name, V) and (V <> '');
+  if not Result then
+    if RegQueryMultiStringValue(HKLM, 'SYSTEM\CurrentControlSet\Services\YuzuServer',
+                                'Environment', V) then
+      Result := (Pos(Uppercase(Name) + '=', Uppercase(V)) = 1) or
+                (Pos(#0 + Uppercase(Name) + '=', Uppercase(V)) > 0);
 end;
 
 // ── File browse helper ───────────────────────────────────────────────────
@@ -563,7 +589,7 @@ begin
   begin
     if (DatabasePage.Values[0] = '') and
        not FileExists(ExpandConstant('{commonappdata}\Yuzu Server\postgres.dsn')) and
-       (GetCmdParam('POSTGRES_DSN_FILE') = '') then
+       (GetCmdParam('POSTGRES_DSN_FILE') = '') and not EnvVarSet('YUZU_POSTGRES_DSN') then
     begin
       MsgBox('A PostgreSQL connection string is required: the server does not start without ' +
              'a database.', mbError, MB_OK);
@@ -628,11 +654,15 @@ end;
 //   yuzu-server.cfg       dashboard password hashes
 //   postgres.dsn          the Postgres connection string (#5272)
 //   oidc-client-secret    the OIDC client secret (#5272)
-//   certs\                operator TLS certificates and keys, AND the server's
-//                         own CA, default certificates and key-encryption keys
-//                         (--ca-dir, #5273; formerly C:\ProgramData\Yuzu\certs,
-//                         which the agent also uses)
+//   certs\                operator TLS certificates and keys
 //   data\                 the server's data directory
+// The server's OWN CA, default certificates and key-encryption keys stay where
+// the server keeps them by default (C:\ProgramData\Yuzu\certs, --ca-dir not
+// passed). The server applies its own protected Administrators+SYSTEM DACL to
+// that folder and the key files when it writes them (key_provider.cpp,
+// WinOwnerOnlyDacl). Moving them needs server changes first -- the CA root's
+// key_ref in Postgres is an absolute path into that folder, and the Settings
+// page writes uploaded certificates there regardless of --ca-dir (#5273).
 // The service's command line (its ImagePath) and its registry Environment value
 // are readable by local users, so they carry only PATHS to these files, never a
 // secret (--postgres-dsn-file, --oidc-client-secret-file).
@@ -645,11 +675,6 @@ end;
 function CertDirPath(const Root: string): string;
 begin
   Result := Root + '\certs';
-end;
-
-function LegacyCertDirPath: string;
-begin
-  Result := ExpandConstant('{commonappdata}\Yuzu\certs');
 end;
 
 function StagePath: string;
@@ -736,14 +761,6 @@ begin
     Result := True;
 end;
 
-// The machine-wide YUZU_POSTGRES_DSN, if an operator set one by hand. It is
-// honoured (the server reads it) but readable by local users.
-function MachineEnvDsn: string;
-begin
-  if not RegQueryStringValue(HKLM, 'SYSTEM\CurrentControlSet\Control\Session Manager\Environment',
-                             'YUZU_POSTGRES_DSN', Result) then
-    Result := '';
-end;
 
 // ── Helpers ──────────────────────────────────────────────────────────────
 
@@ -795,7 +812,9 @@ end;
 function AbortSuffix: string;
 begin
   Result := '';
-  if StoppedRunningService then
+  if ServiceDisabled then
+    Result := #13#10#13#10 + 'The Yuzu Server service has been stopped and DISABLED (see above).'
+  else if StoppedRunningService then
     Result := #13#10#13#10 + 'The existing Yuzu Server service was stopped and has not been ' +
               'restarted. It will start again at the next reboot, or run: sc start YuzuServer';
 end;
@@ -830,12 +849,13 @@ end;
 //           delete, delete-child, change-permissions or take-ownership
 //           (inherit-only entries do not apply to it and are skipped).
 //           Ownership alone is not integrity: a folder a standard user
-//           created before the original install keeps that user as owner
-//           and, through CREATOR OWNER, full control over every file an
-//           administrator later wrote into it -- so they could rewrite an
-//           admin-owned yuzu-server.cfg or CA key, or swap a checked file for
-//           their own before it is copied. The stock ProgramData grants
-//           (Users may create files in subfolders, and read) pass.
+//           created before the original install keeps that user as owner,
+//           so they can re-permission it and delete or rename what an
+//           administrator later wrote into it -- swapping a checked file for
+//           their own before it is copied -- and any entry granting them
+//           write on a file lets them rewrite it in place. The stock
+//           ProgramData grants (Users may create files in subfolders, and
+//           read) pass.
 //
 // The same rules as the agent installer's RunAclCheck apply (yuzu-agent.iss;
 // the reasons are recorded there): compare the EXACT owner and ACE set on the
@@ -878,7 +898,7 @@ begin
       // Rights of an SDDL ACE as a mask. An unknown token counts as full
       // control, so anything unrecognised is refused, never passed.
       '$map=@{''GA''=0x1F01FF;''GW''=0x120116;''GR''=0x120089;''GX''=0x1200A0;''FA''=0x1F01FF;''FW''=0x120116;''FR''=0x120089;''FX''=0x1200A0;''SD''=0x10000;''RC''=0x20000;''WD''=0x40000;''WO''=0x80000;''CC''=1;''DC''=2;''LC''=4;''SW''=8;''RP''=0x10;''WP''=0x20;''DT''=0x40;''LO''=0x80;''CR''=0x100};' +
-      'function Mask($t){if($t -match ''^0x[0-9A-Fa-f]+$''){return [int64]$t};$v=0;foreach($k in @($t -split ''(..)'' | Where-Object {$_})){$x=$map[$k];if($null -eq $x){return 0x1F01FF};$v=$v -bor $x};return $v};' +
+      'function Mask($t){if($t -match ''^0x[0-9A-Fa-f]+$''){$h=[int64]$t;if(($h -band 0xF0000000) -ne 0){return 0x1F01FF};return $h};$v=0;foreach($k in @($t -split ''(..)'' | Where-Object {$_})){$x=$map[$k];if($null -eq $x){return 0x1F01FF};$v=$v -bor $x};return $v};' +
       // Refuse an Allow entry for any account other than BA/SY whose rights
       // include a bit in $bad. $io: skip inherit-only entries.
       'function Aces($p,$s,$bad,$io,$what){' +
@@ -886,8 +906,13 @@ begin
         '$all=($Matches[1] -replace ''^\(|\)$'','''');' +
         'foreach($a in @($all -split ''\)\('')){' +
           '$f=@($a -split '';'');if($f.Count -lt 6){Fail (''its permission list could not be read: '' + $p)};' +
-          'if($f[0] -ne ''A''){continue};if(($f[5] -eq ''BA'') -or ($f[5] -eq ''SY'')){continue};' +
+          'if(($f[5] -eq ''BA'') -or ($f[5] -eq ''SY'')){continue};' +
           'if($io -and ($f[1] -match ''IO'')){continue};' +
+          // Deny entries take access away; any allow-type other than plain A
+          // (conditional XA/ZA, object OA, ...) is one this check does not
+          // evaluate, so it is refused rather than skipped.
+          'if(($f[0] -eq ''D'') -or ($f[0] -eq ''OD'') -or ($f[0] -eq ''XD'')){continue};' +
+          'if($f[0] -ne ''A''){Fail (''its permission list has an entry of a kind this check does not evaluate ('' + $f[0] + '' for '' + $f[5] + ''): '' + $p + '' '' + $s)};' +
           'if(((Mask $f[2]) -band $bad) -ne 0){Fail (''another account ('' + $f[5] + '') can '' + $what + '': '' + $p + '' '' + $s)}' +
         '}' +
       '};' +
@@ -1062,59 +1087,6 @@ begin
   end;
 end;
 
-// The server's own key material in the legacy directory, as a closed set:
-// default-*.pem/.key/.json (the CA, its default leaves and marker) and
-// secrets-kek-v*.key (the key-encryption keys). Nothing else is taken from
-// there, and nothing else in it is looked at: it is also the agent's
-// certificate directory. A link carrying one of those names is refused.
-function IsServerKeyName(const FileName: string): Boolean;
-var
-  Name, Ext: string;
-begin
-  Name := Lowercase(FileName);
-  Ext := ExtractFileExt(Name);
-  Result := ((Pos('default-', Name) = 1) and ((Ext = '.pem') or (Ext = '.key') or (Ext = '.json'))) or
-            ((Pos('secrets-kek-v', Name) = 1) and (Ext = '.key'));
-end;
-
-function ListLegacyKeyFiles(var Files: TArrayOfString): string;
-var
-  R: TFindRec;
-  More, Found: Boolean;
-  Dir: string;
-begin
-  Result := '';
-  Dir := LegacyCertDirPath;
-  if IsReparsePoint(Dir, Found) then
-  begin
-    Result := 'it is a junction or symbolic link, not a directory: ' + Dir;
-    Exit;
-  end;
-  if not Found or not DirExists(Dir) then Exit;
-  if not FindFirst(Dir + '\*', R) then
-  begin
-    Result := 'its contents could not be listed: ' + Dir;
-    Exit;
-  end;
-  try
-    More := True;
-    while More and (Result = '') do
-    begin
-      if ((R.Attributes and FileAttrDirectory) = 0) and IsServerKeyName(R.Name) then
-      begin
-        if (R.Attributes and FileAttrReparsePoint) <> 0 then
-          Result := 'it is a file link: ' + Dir + '\' + R.Name
-        else
-          AddPath(Files, Dir + '\' + R.Name);
-      end;
-      if Result = '' then
-        More := FindNext(R);
-    end;
-  finally
-    FindClose(R);
-  end;
-end;
-
 // ── Writing into a locked directory ──────────────────────────────────────
 //
 // Every file is written under a new name in the locked directory, so it is
@@ -1126,20 +1098,29 @@ end;
 var
   Replaced: string;
 
-// The old file is renamed aside first and put back if the new one cannot be
-// moved in, so a failure never leaves the file missing.
+function SetFileAttributes(lpFileName: string; dwFileAttributes: DWORD): BOOL;
+  external 'SetFileAttributesW@kernel32.dll stdcall';
+
+const
+  FileAttrNormal = $80;
+
+// The old file is renamed aside first (under a name of its own, so an
+// operator's "<file>.old" backup is never touched) and put back if the new one
+// cannot be moved in, so a failure never leaves the file missing.
 function SwapIn(const Tmp, Dest: string): string;
 var
   Old: string;
   HadOld: Boolean;
 begin
   Result := '';
-  Old := Dest + '.old';
+  // A source file's read-only attribute is copied with it; it would block
+  // replacing this file next time.
+  SetFileAttributes(Tmp, FileAttrNormal);
+  Old := Dest + '.replaced-' + GetDateTimeString('yyyymmdd-hhnnss', '-', '-');
   HadOld := FileExists(Dest);
   if HadOld then
   begin
-    DeleteFile(Old);
-    if not RenameFile(Dest, Old) then
+    if FileExists(Old) or not RenameFile(Dest, Old) then
     begin
       DeleteFile(Tmp);
       Result := 'Could not replace ' + Dest + ' (it may be in use).';
@@ -1149,11 +1130,19 @@ begin
   if not RenameFile(Tmp, Dest) then
   begin
     DeleteFile(Tmp);
-    if HadOld then RenameFile(Old, Dest);
-    Result := 'Could not move the new file into place: ' + Dest;
+    if HadOld and not RenameFile(Old, Dest) then
+      Result := 'Could not move the new file into place, nor put the old one back: the old ' +
+                'file is now ' + Old
+    else
+      Result := 'Could not move the new file into place: ' + Dest;
     Exit;
   end;
-  if HadOld then DeleteFile(Old);
+  if HadOld then
+  begin
+    SetFileAttributes(Old, FileAttrNormal);
+    if not DeleteFile(Old) then
+      Log('SwapIn: could not delete the replaced file ' + Old + ' (inside the locked directory).');
+  end;
   Replaced := Replaced + #13#10 + '  ' + Dest;
 end;
 
@@ -1321,14 +1310,17 @@ begin
       Result := True;
 end;
 
-// A value placed on the service's command line inside double quotes.
+// A value placed on the service's command line inside double quotes. No
+// double quote, control character or '%' (the ImagePath is expanded, so %NAME%
+// would be replaced), and no trailing backslash (the C runtime reads \" as a
+// literal quote and merges the next argument into this one).
 function BadArg(const S: string): Boolean;
 var
   I: Integer;
 begin
-  Result := False;
+  Result := (S <> '') and (S[Length(S)] = '\');
   for I := 1 to Length(S) do
-    if (S[I] = '"') or (Ord(S[I]) < 32) then
+    if (S[I] = '"') or (S[I] = '%') or (Ord(S[I]) < 32) then
       Result := True;
 end;
 
@@ -1376,8 +1368,22 @@ begin
       Result := 'Give either /OIDC_CLIENT_SECRET= or /OIDC_CLIENT_SECRET_FILE=, not both.'
     else if Inp.UseOIDC and (BadArg(Inp.OidcIssuer) or BadArg(Inp.OidcClientId) or
                             BadArg(Inp.OidcAdminGroup) or (Inp.OidcClientId = '')) then
-      Result := 'The OIDC issuer, client ID and admin group may not contain double quotes or ' +
-                'control characters, and a client ID is required with an issuer.';
+      Result := 'The OIDC issuer, client ID and admin group may not contain double quotes, ''%'', ' +
+                'control characters or a trailing backslash, and a client ID is required with an ' +
+                'issuer.';
+  end;
+  if Result = '' then
+  begin
+    if (Inp.HttpsCert <> '') <> (Inp.HttpsKey <> '') then
+      Result := 'Give the HTTPS certificate and its private key together (/HTTPS_CERT= and /HTTPS_KEY=).'
+    else if (Inp.GrpcCert <> '') <> (Inp.GrpcKey <> '') then
+      Result := 'Give the gRPC certificate and its private key together (/GRPC_CERT= and /GRPC_KEY=).'
+    else if WizardSilent and HasCmdFlag('GATEWAY') and BadArg(GetCmdParam('GATEWAY_ADDR')) then
+      Result := 'The gateway address (/GATEWAY_ADDR=) may not contain double quotes, ''%'', ' +
+                'control characters or a trailing backslash.'
+    else if not WizardSilent and GatewayCheckbox.Checked and BadArg(GatewayAddrEdit.Text) then
+      Result := 'The gateway address may not contain double quotes, ''%'', control characters ' +
+                'or a trailing backslash.';
   end;
   if Result = '' then Result := CheckFileParam(Inp.DsnFile, 'POSTGRES_DSN_FILE');
   if Result = '' then Result := CheckFileParam(Inp.OidcSecretFile, 'OIDC_CLIENT_SECRET_FILE');
@@ -1461,7 +1467,6 @@ begin
 
   Result := '--config "' + DataDir + '\yuzu-server.cfg"' +
             ' --data-dir "' + DataDir + '\data"' +
-            ' --ca-dir "' + CertDir + '"' +
             ' --log-file "' + ExpandConstant('{app}') + '\logs\yuzu-server.log"';
   if FileExists(DataDir + '\postgres.dsn') then
     Result := Result + ' --postgres-dsn-file "' + DataDir + '\postgres.dsn"';
@@ -1510,26 +1515,58 @@ begin
   end;
 end;
 
+// 10 when the service could not be registered or configured (see
+// CurStepChanged). The installed files are in place, but SCCM/Intune must not
+// record this as a working deployment.
+function GetCustomSetupExitCode: Integer;
+begin
+  if ServiceSetupFailed then
+    Result := 10
+  else
+    Result := 0;
+end;
+
 // ── Post-install: register the service ───────────────────────────────────
 procedure CurStepChanged(CurStep: TSetupStep);
 var
   ResultCode: Integer;
-  BinPath: string;
+  BinPath, Want, Got, Key: string;
+  Ok: Boolean;
 begin
   if CurStep = ssPostInstall then
   begin
     // The data directory, configuration, secrets and certificates were all
     // written and verified by PrepareToInstall, before any file was installed.
     BinPath := ExpandConstant('{app}') + '\bin\yuzu-server.exe';
+    Key := 'SYSTEM\CurrentControlSet\Services\YuzuServer';
     Exec(BinPath, '--install-service', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
     // Write the command line to the service's ImagePath directly. sc.exe's
     // binPath= quoting mangled a quoted executable path followed by quoted
     // arguments, and an unquoted path with spaces is an unquoted-service-path
-    // hole.
-    if not RegWriteExpandStringValue(HKLM, 'SYSTEM\CurrentControlSet\Services\YuzuServer',
-                                     'ImagePath', '"' + BinPath + '" ' + GetServiceArgs) then
-      Log('CurStepChanged: could not write the YuzuServer service command line.');
-    if ShouldStartService then
+    // hole. Then read it back: if security software blocked the write, the
+    // OLD command line -- which may carry a secret (0.14.0 passed the OIDC
+    // client secret there) -- would otherwise stay in force while Setup
+    // reported success.
+    Want := '"' + BinPath + '" ' + GetServiceArgs;
+    Ok := Exec(ExpandConstant('{sys}\sc.exe'), 'query YuzuServer', '', SW_HIDE,
+               ewWaitUntilTerminated, ResultCode) and (ResultCode <> 1060);
+    Ok := Ok and RegWriteExpandStringValue(HKLM, Key, 'ImagePath', Want);
+    Ok := Ok and RegQueryStringValue(HKLM, Key, 'ImagePath', Got) and (Got = Want);
+    if not Ok then
+    begin
+      ServiceSetupFailed := True;
+      Exec(ExpandConstant('{sys}\sc.exe'), 'config YuzuServer start= disabled', '', SW_HIDE,
+           ewWaitUntilTerminated, ResultCode);
+      Log('CurStepChanged: the YuzuServer service could not be registered, or its command line ' +
+          'could not be written and confirmed (security software may have blocked the change). ' +
+          'The service has been DISABLED; Setup exits with code 10.');
+      SuppressibleMsgBox('The Yuzu Server files were installed, but the YuzuServer service could ' +
+        'not be registered, or its command line could not be written and confirmed -- security ' +
+        'software may have blocked the change. The service has been disabled rather than left ' +
+        'running with an old command line. Allow the change and run the installer again.',
+        mbError, MB_OK, IDOK);
+    end
+    else if ShouldStartService then
       Exec(ExpandConstant('{sys}\sc.exe'), 'start YuzuServer', '', SW_HIDE,
            ewWaitUntilTerminated, ResultCode);
   end;
@@ -1564,12 +1601,6 @@ end;
 //
 // A link (junction or symbolic link) at the path is refused in every state.
 // Nothing recurses through a link; nothing takes ownership of anything.
-//
-// The server's own key material moves from C:\ProgramData\Yuzu\certs (shared
-// with the agent) into certs\ (#5273): when certs\ has no default-ca.key and
-// the legacy directory has one, the closed set default-* and secrets-kek-v*
-// is copied across under the same rules. Losing them would re-root the
-// internal CA and make stored secrets undecryptable. The originals are left.
 //
 // A non-empty result stops the installation with that message (logged, and
 // shown unless silent) and Setup exits with code 7. Nothing in {app} has been
@@ -1661,18 +1692,18 @@ function PrepareToInstall(var NeedsRestart: Boolean): string;
 var
   Inp: TInstallInputs;
   State, ResultCode: Integer;
-  DataDir, Stage, Aside, Reason, OldCfgDir: string;
-  RegenConfig, CarryDsn, CarryOidc, NeedLegacy: Boolean;
-  CarryFiles, DataFiles, LegacyFiles, Dirs: TArrayOfString;
+  DataDir, Stage, Aside, Reason, OldCfgDir, OldImagePath: string;
+  RegenConfig, CarryDsn, CarryOidc: Boolean;
+  CarryFiles, DataFiles, Dirs: TArrayOfString;
 begin
   GetInputs(Inp);
   DataDir := DataDirPath;
   Stage := StagePath;
   SetArrayLength(CarryFiles, 0);
   SetArrayLength(DataFiles, 0);
-  SetArrayLength(LegacyFiles, 0);
   SetArrayLength(Dirs, 0);
   Replaced := '';
+  ServiceDisabled := False;
 
   // ── 1. Every check, before the service is stopped ──
   Result := CheckInputs(Inp);
@@ -1688,11 +1719,12 @@ begin
       Result := 'The admin username and password (/ADMIN_USER=, /ADMIN_PASS=) are required: ' +
                 'there is no existing configuration to keep.' + #13#10#13#10 +
                 'Nothing has been changed.'
-    else if (MachineEnvDsn <> '') and ((Inp.Dsn <> '') or (Inp.DsnFile <> '') or CarryDsn) then
+    else if (EnvVarSet('YUZU_POSTGRES_DSN')) and ((Inp.Dsn <> '') or (Inp.DsnFile <> '') or CarryDsn) then
       // The server refuses to start with both (--postgres-dsn-file cannot be
       // combined with YUZU_POSTGRES_DSN), so this would install a server
       // that does not boot.
-      Result := 'A machine-wide YUZU_POSTGRES_DSN environment variable is set, and a connection ' +
+      Result := 'A YUZU_POSTGRES_DSN environment variable is set (machine-wide or for the ' +
+                'YuzuServer service), and a connection ' +
                 'string is also being stored for the server; the server refuses to start with ' +
                 'both. Remove the environment variable (every local user can read it), for ' +
                 'example: [Environment]::SetEnvironmentVariable(''YUZU_POSTGRES_DSN'', $null, ' +
@@ -1700,7 +1732,7 @@ begin
                 'Nothing has been changed.'
     else if (Inp.Dsn = '') and (Inp.DsnFile = '') and not CarryDsn then
     begin
-      if MachineEnvDsn <> '' then
+      if EnvVarSet('YUZU_POSTGRES_DSN') then
         Log('PrepareToInstall: no connection string was given or stored; the server will use ' +
             'the machine-wide YUZU_POSTGRES_DSN environment variable, which every local user ' +
             'can read. Pass /POSTGRES_DSN_FILE= to store it in the locked data directory instead.')
@@ -1711,6 +1743,30 @@ begin
                   'Nothing has been changed.';
     end;
   end;
+  if (Result = '') and Inp.UseOIDC and (Inp.OidcSecret = '') and (Inp.OidcSecretFile = '') and
+     not CarryOidc then
+  begin
+    // Earlier installers stored the OIDC client secret nowhere but the
+    // service's command line -- and their sc.exe binPath= quoting dropped
+    // every argument, so in practice it is there only if an operator added it
+    // by hand. If it is, upgrading without giving it again would silently drop
+    // it (sign-in for a confidential client such as an Entra web app then fails
+    // at the token exchange).
+    if not RegQueryStringValue(HKLM, 'SYSTEM\CurrentControlSet\Services\YuzuServer', 'ImagePath',
+                               OldImagePath) then
+      OldImagePath := '';
+    if Pos('--oidc-client-secret ', OldImagePath) > 0 then
+      Result := 'The service''s current command line carries an OIDC client secret (readable by ' +
+                'local users), and it is not stored anywhere else. ' +
+                'Give it again with /OIDC_CLIENT_SECRET_FILE=<file> (or in the wizard), so it is ' +
+                'kept in the secured data directory; then rotate it in your identity provider.' + #13#10#13#10 + 'Nothing has been changed.';
+  end;
+  if (Result = '') and EnvVarSet('YUZU_OIDC_CLIENT_SECRET') and
+     ((Inp.OidcSecret <> '') or (Inp.OidcSecretFile <> '') or CarryOidc) then
+    Result := 'A YUZU_OIDC_CLIENT_SECRET environment variable is set (machine-wide or for the ' +
+              'YuzuServer service), and an OIDC client secret is also being stored for the server; ' +
+              'the server refuses to start with both. Remove the environment variable (local users ' +
+              'can read it), then run the installer again.' + #13#10#13#10 + 'Nothing has been changed.';
   if (Result = '') and RegenConfig then
   begin
     Result := CheckFullLanguage();
@@ -1744,29 +1800,6 @@ begin
         Reason + '. Inspect it; if that file is yours, make Administrators its owner ' +
         '(icacls <file> /setowner *S-1-5-32-544 /L) or remove it, then run the installer again. ' +
         'Nothing has been changed.');
-  end;
-  if Result = '' then
-  begin
-    // The legacy key material: needed when the destination certs\ will have
-    // no CA key of its own.
-    if State = StateNew then
-      NeedLegacy := True
-    else
-      NeedLegacy := not FileExists(CertDirPath(DataDir) + '\default-ca.key');
-    NeedLegacy := NeedLegacy and FileExists(LegacyCertDirPath + '\default-ca.key');
-    if NeedLegacy then
-    begin
-      Reason := ListLegacyKeyFiles(LegacyFiles);
-      SetArrayLength(Dirs, 0);
-      AddPath(Dirs, ExpandConstant('{commonappdata}\Yuzu'));
-      AddPath(Dirs, LegacyCertDirPath);
-      if Reason = '' then Reason := CheckCarry(LegacyFiles, Dirs);
-      if Reason <> '' then
-        Result := 'The server''s existing CA and key-encryption keys in ' + LegacyCertDirPath +
-          ' cannot be moved into the secured data directory: ' + Reason + '. Without them the ' +
-          'server would create a new CA (every agent certificate would stop verifying) and ' +
-          'could not decrypt stored secrets. Nothing has been changed.';
-    end;
   end;
   if Result <> '' then
   begin
@@ -1803,7 +1836,6 @@ begin
                              OldCfgDir + '\' + ExtractFileName(CarryFiles[ResultCode]));
         end;
     end;
-    if Result = '' then Result := CopyAll(LegacyFiles, Stage + '\certs');
     if Result = '' then Result := InstallCertificates(Inp, Stage);
     if (Result = '') and ((Inp.Dsn <> '') or (Inp.DsnFile <> '')) then
       Result := WriteSecret(Inp.Dsn, Inp.DsnFile, Stage + '\postgres.dsn');
@@ -1812,6 +1844,13 @@ begin
     if (Result = '') and RegenConfig then Result := WriteServerConfig(Inp, Stage);
     if Result = '' then
     begin
+      // Files this installer wrote are owned by whoever ran it, which on a
+      // client SKU (or with "Object creator" as the default owner) is the
+      // administrator's own account, not Administrators. The stage is private
+      // to this installer, so making everything in it Administrators-owned
+      // adopts nothing anyone else placed. /L: never through a link.
+      Exec(ExpandConstant('{sys}\icacls.exe'), '"' + Stage + '" /setowner *S-1-5-32-544 /T /L /C /Q',
+           '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
       Reason := RunAclCheck(Stage, 'tree', '');
       if Reason <> '' then
         Result := NotSecuredMessage(DataDir, 'The new directory did not verify: ' + Reason);
@@ -1833,7 +1872,6 @@ begin
     // Created inside the locked directory, so they inherit it.
     if not (ForceDirectories(CertDirPath(DataDir)) and ForceDirectories(DataDir + '\data')) then
       Result := 'Could not create certs\ or data\ in ' + DataDir;
-    if Result = '' then Result := CopyAll(LegacyFiles, CertDirPath(DataDir));
     if Result = '' then Result := InstallCertificates(Inp, DataDir);
     if (Result = '') and ((Inp.Dsn <> '') or (Inp.DsnFile <> '')) then
       Result := WriteSecret(Inp.Dsn, Inp.DsnFile, DataDir + '\postgres.dsn');
@@ -1852,6 +1890,15 @@ begin
            '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
       Exec(ExpandConstant('{sys}\icacls.exe'), '"' + DataDir + '\data\*" /reset /L /C /Q',
            '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+      // And owned by Administrators (files this run wrote are owned by the
+      // account that ran it; see the stage note). Same closed set, already
+      // checked to be owned by Administrators or SYSTEM.
+      Exec(ExpandConstant('{sys}\icacls.exe'), '"' + DataDir + '\*" /setowner *S-1-5-32-544 /L /C /Q',
+           '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+      Exec(ExpandConstant('{sys}\icacls.exe'), '"' + CertDirPath(DataDir) + '\*" /setowner *S-1-5-32-544 /L /C /Q',
+           '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+      Exec(ExpandConstant('{sys}\icacls.exe'), '"' + DataDir + '\data\*" /setowner *S-1-5-32-544 /L /C /Q',
+           '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
     end;
   end
   else
@@ -1863,6 +1910,8 @@ begin
       Result := CopyAll(DataFiles, Stage + '\data');
       if Result = '' then
       begin
+        Exec(ExpandConstant('{sys}\icacls.exe'), '"' + Stage + '" /setowner *S-1-5-32-544 /T /L /C /Q',
+             '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
         Reason := RunAclCheck(Stage, 'tree', '');
         if Reason <> '' then
           Result := NotSecuredMessage(DataDir, 'The new directory did not verify: ' + Reason);
@@ -1871,8 +1920,15 @@ begin
       begin
         Aside := DataDir + '.insecure-' + GetDateTimeString('yyyymmdd-hhnnss', '-', '-');
         if not RenameFile(DataDir, Aside) then
-          Result := 'The old data directory could not be renamed aside (it may be in use):' + #13#10 +
-                    DataDir;
+        begin
+          Result := 'The old data directory could not be renamed aside: something has a file in ' +
+                    'it open (close it, or find it with Resource Monitor''s "Associated Handles"):' + #13#10 + DataDir + #13#10#13#10 + 'Nothing has been changed.';
+          // Nothing changed, so put the service back the way it was.
+          if StoppedRunningService and
+             Exec(ExpandConstant('{sys}\sc.exe'), 'start YuzuServer', '', SW_HIDE,
+                  ewWaitUntilTerminated, ResultCode) and (ResultCode = 0) then
+            StoppedRunningService := False;
+        end;
       end;
       if Result <> '' then
         DelTree(Stage, True, True, True);
@@ -1896,6 +1952,7 @@ begin
             // must not start over a directory this installer did not make.
             Exec(ExpandConstant('{sys}\sc.exe'), 'config YuzuServer start= disabled', '', SW_HIDE,
                  ewWaitUntilTerminated, ResultCode);
+            ServiceDisabled := True;
             Result := Result + ' The old directory could not be put back either: it is now ' +
                       Aside + '. Something else created ' + DataDir + ' in the meantime -- ' +
                       'inspect it. The YuzuServer service has been DISABLED so that it cannot ' +
@@ -1942,7 +1999,9 @@ begin
     if not UninstallSilent then
       if MsgBox('Remove server data directory?' + #13#10 +
                 ExpandConstant('{commonappdata}\Yuzu Server') + #13#10#13#10 +
-                'This includes databases, configuration, certificates, and all server state.',
+                'This deletes the configuration (dashboard accounts), the stored database ' +
+                'connection string and OIDC secret, your TLS certificates and the server''s data ' +
+                'directory. The PostgreSQL database itself is not touched.',
                 mbConfirmation, MB_YESNO or MB_DEFBUTTON2) = IDYES then
       begin
         DelTree(ExpandConstant('{commonappdata}\Yuzu Server'), True, True, True);

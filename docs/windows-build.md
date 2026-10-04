@@ -114,8 +114,9 @@ installers run on the customer's machine, today
 `yuzu-agent.iss` / `yuzu-server.iss`, target the Windows PowerShell 5.1
 (`powershell.exe`) that every Windows host has, and carry no PowerShell 7
 guard. They must stay ASCII-only outside comments (5.1 reads BOM-less files
-in the ANSI codepage), and each must first reset `PSModulePath` to Windows
-PowerShell's own modules (#5176).
+in the ANSI codepage), and each must first reset `PSModulePath` (#5176):
+the permission checks to `$PSHOME\Modules` alone, `generate-config.ps1` to
+that plus the machine value.
 
 **The permission checks (`RunAclCheck` in both installers) must run under
 Constrained Language Mode**, which WDAC script enforcement, or AppLocker
