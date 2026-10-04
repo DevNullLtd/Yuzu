@@ -282,6 +282,13 @@ void register_plugin_config_routes(HttpRouteSink& sink, Deps deps) {
                 const std::string plugin = req.matches[1].str();
                 const std::string action = req.has_param("action") ? req.get_param_value("action") : "";
                 const std::string os = req.has_param("os") ? req.get_param_value("os") : "";
+                // A present-but-empty `?os=` is malformed, not "all OSes":
+                // the parser accepts an empty os as the all-OS row, so an
+                // unvalidated blank would silently widen the target.
+                if (req.has_param("os") && os.empty()) {
+                    write_store_error(res, PluginConfigStore::Error::InvalidInput);
+                    return;
+                }
                 auto entry = deps.store->get_kill_switch(plugin, action, os);
                 if (!entry) {
                     write_store_error(res, entry.error());
@@ -330,7 +337,8 @@ void register_plugin_config_routes(HttpRouteSink& sink, Deps deps) {
                 // recorded for an input the store would reject anyway.
                 const std::string os = req.has_param("os") ? req.get_param_value("os") : "";
                 const auto scope = plugin_config::parse_kill_switch_scope(plugin, action, os);
-                if (!scope || !plugin_config::is_valid_reason(reason) ||
+                // Present-but-empty `?os=` must not silently target the all-OS row.
+                if ((req.has_param("os") && os.empty()) || !scope || !plugin_config::is_valid_reason(reason) ||
                     !plugin_config::is_valid_actor(actor(*session))) {
                     write_store_error(res, PluginConfigStore::Error::InvalidInput);
                     return;

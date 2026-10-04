@@ -3066,12 +3066,13 @@ static const ToolDef kTools[] = {
      "decision (PluginConfigStore::action_allowed collapses any store error to disabled, "
      "which this display accessor deliberately does not) — this is the inspection view an "
      "operator reads before deciding whether to flip it. Absence of a prior flip reads as "
-     "enabled=true with no reason/set_by. Requires PluginConfig:Read.",
+     "enabled=true with no reason/set_by. Without os this reports the all-OS layer only and "
+     "never reflects a per-OS OFF row. Requires PluginConfig:Read.",
      // plugin maxLength is 68, not 64: parse_kill_switch_scope also accepts a
      // reserved-namespace plugin name (__<identifier>__, #3265), whose total
      // length can reach kMaxIdentifierBytes (64) + 4 sentinel bytes = 68 —
      // this schema must not reject an input the store would accept.
-     R"j({"type":"object","properties":{"plugin":{"type":"string","minLength":1,"maxLength":68},"action":{"type":"string","maxLength":64,"description":"Action name for an action-level switch; omit for the whole-plugin switch"},"os":{"type":"string","enum":["windows","linux","darwin"],"description":"Agent OS for a per-OS view; omit for the all-OS switch. With os, enabled is the EFFECTIVE state and reason/set_by/source name the row that produced it"}},"required":["plugin"]})j",
+     R"j({"type":"object","properties":{"plugin":{"type":"string","minLength":1,"maxLength":68},"action":{"type":"string","maxLength":64,"description":"Action name for an action-level switch; omit for the whole-plugin switch"},"os":{"type":"string","enum":["windows","linux","darwin"],"description":"Agent OS for a per-OS view; omit for the all-OS switch. With os, enabled is the EFFECTIVE state and reason/set_by/source name the row that produced it. Within the OS layer an action@os ON row overrides a plugin@os OFF row, but a per-OS row never widens past the all-OS layer"}},"required":["plugin"]})j",
      R"j({"type":"object","properties":{"plugin":{"type":"string"},"action":{"type":"string"},"os":{"type":"string"},"enabled":{"type":"boolean"},"reason":{"type":"string"},"set_by":{"type":"string"},"updated_at_ms":{"type":"integer"},"source":{"type":"string"}},"required":["plugin","action","enabled"]})j"},
 
     {"set_plugin_kill_switch",
@@ -3080,9 +3081,10 @@ static const ToolDef kTools[] = {
      "dispatch-gating caller that consults this switch fails CLOSED (treats disabled) on any "
      "store error, so throwing this switch is a reliable emergency stop for the named "
      "plugin/action — there is no separate 'force disable' escalation beyond this call. "
-     "Requires PluginConfig:Write.",
+     "The result echoes the row written, not the effective state. Requires "
+     "PluginConfig:Write.",
      // plugin maxLength is 68 — see the identical note on get_plugin_kill_switch above.
-     R"j({"type":"object","properties":{"plugin":{"type":"string","minLength":1,"maxLength":68},"action":{"type":"string","maxLength":64,"description":"Action name for an action-level switch; omit for the whole-plugin switch"},"os":{"type":"string","enum":["windows","linux","darwin"],"description":"Agent OS to narrow the switch to; omit for the all-OS switch. A per-OS row only ever narrows, never widens"},"enabled":{"type":"boolean","description":"true = allowed (the default/no-row state); false = killed"},"reason":{"type":"string","maxLength":512,"description":"Operator-entered explanation, audited and displayed verbatim"}},"required":["plugin","enabled"]})j",
+     R"j({"type":"object","properties":{"plugin":{"type":"string","minLength":1,"maxLength":68},"action":{"type":"string","maxLength":64,"description":"Action name for an action-level switch; omit for the whole-plugin switch"},"os":{"type":"string","enum":["windows","linux","darwin"],"description":"Agent OS to narrow the switch to; omit for the all-OS switch. Within the OS layer an action@os ON row overrides a plugin@os OFF row, but a per-OS row never widens past the all-OS layer"},"enabled":{"type":"boolean","description":"true = allowed (the default/no-row state); false = killed"},"reason":{"type":"string","maxLength":512,"description":"Operator-entered explanation, audited and displayed verbatim"}},"required":["plugin","enabled"]})j",
      R"j({"type":"object","properties":{"plugin":{"type":"string"},"action":{"type":"string"},"enabled":{"type":"boolean"},"reason":{"type":"string"},"set_by":{"type":"string"},"updated_at_ms":{"type":"integer"},"os":{"type":"string"},"source":{"type":"string"}},"required":["plugin","action","enabled"]})j"},
 
     {"mint_upload_grant",
@@ -17595,6 +17597,12 @@ McpServer::HandlerFn McpServer::build_handler(
                         // even though both are theoretically possible together
                         // (a bad expression is never evaluated against the
                         // registry, so it cannot be).
+                        // os_gate_unreadable (#5294) is the exception that
+                        // never co-occurs with this: the ladder refuses on the
+                        // presence read BEFORE parsing the scope
+                        // (dispatch_scope_ladder.hpp, wire_and_dispatch_confined),
+                        // so a bad scope with presence down answers
+                        // os_gate_unreadable and scope_parse_error stays unset.
                         zero_status = "invalid_scope";
                         zero_message = "No agents reached: the scope expression could not be "
                                        "parsed (" +
@@ -20468,8 +20476,15 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 const auto plugin = param_str(args, "plugin");
                 const auto action = param_str(args, "action");
-                const auto os = param_str(args, "os");
-                auto entry = plugin_config_store_->get_kill_switch(plugin, action, os);
+                // Strict: a present-but-non-string `os` (e.g. 1) must not
+                // fall through param_str's "" and target the all-OS row.
+                const auto os = param_string_strict(args, "os");
+                if (!os) {
+                    res.set_content(a4_error(kInvalidParams, "os must be a string"),
+                                    "application/json");
+                    return;
+                }
+                auto entry = plugin_config_store_->get_kill_switch(plugin, action, *os);
                 if (!entry) {
                     const auto info = plugin_config_error_info(entry.error());
                     res.set_content(a4_error(info.code, info.message,
@@ -20519,8 +20534,13 @@ McpServer::HandlerFn McpServer::build_handler(
                 const auto plugin = param_str(args, "plugin");
                 const auto action = param_str(args, "action");
                 const auto reason = param_str(args, "reason");
-                const auto os = param_str(args, "os");
-                const auto scope = plugin_config::parse_kill_switch_scope(plugin, action, os);
+                const auto os = param_string_strict(args, "os");
+                if (!os) {
+                    res.set_content(a4_error(kInvalidParams, "os must be a string"),
+                                    "application/json");
+                    return;
+                }
+                const auto scope = plugin_config::parse_kill_switch_scope(plugin, action, *os);
                 if (!scope || !plugin_config::is_valid_reason(reason) ||
                     !plugin_config::is_valid_actor(session->username)) {
                     res.set_content(a4_error(kInvalidParams, "invalid plugin/action/os/reason"),
@@ -20543,7 +20563,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 }
                 auto result = plugin_config_store_->set_kill_switch(plugin, action, enabled, reason,
-                                                                    session->username, os);
+                                                                    session->username, *os);
                 const std::string ks_detail =
                     std::string("enabled=") + (enabled ? "true" : "false");
                 if (!result) {

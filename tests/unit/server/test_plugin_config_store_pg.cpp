@@ -819,6 +819,18 @@ TEST_CASE("PluginConfigStore: a genuine v1->v2 upgrade keeps an existing plugin-
     CHECK(entry->os.empty());
     CHECK_FALSE(entry->enabled);
     CHECK(entry->reason == "pre-v2");
+
+    // The `os` column added by migration v2 is writable on the UPGRADED schema
+    // (the template-backed cases only exercise a freshly-built one).
+    auto written = store.set_kill_switch("legacy", "", true, "per-os", "ops", "windows");
+    REQUIRE(written.has_value());
+    CHECK(written->os == "windows"); // the row written, not the effective state
+    // Effective state: the legacy all-OS OFF row still wins (a per-OS ON never widens).
+    auto win = store.get_kill_switch("legacy", "", "windows");
+    REQUIRE(win.has_value());
+    CHECK(win->os == "windows");
+    CHECK_FALSE(win->enabled);
+    CHECK(win->source == "legacy");
 }
 
 TEST_CASE("PluginConfigStore: a per-OS seed narrows without flipping the plugin-level state, "
@@ -842,6 +854,11 @@ TEST_CASE("PluginConfigStore: a per-OS seed narrows without flipping the plugin-
     auto lin = w.store.get_kill_switch("p", "", "linux");
     REQUIRE(lin.has_value());
     CHECK(lin->enabled);
+    // The all-OS view attributes the base layer only: a per-OS OFF row is
+    // never reflected in a GET without os.
+    auto all = w.store.get_kill_switch("p", "");
+    REQUIRE(all.has_value());
+    CHECK(all->enabled);
 
     REQUIRE(w.store.set_kill_switch("p", "", true, "rollout", "ops", "windows").has_value());
     CHECK(w.store.kill_switch_decision("p", "a")->empty());

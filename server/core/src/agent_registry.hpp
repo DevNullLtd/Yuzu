@@ -387,9 +387,10 @@ private:
 ///
 /// `action_allowed`'s contract is IDENTICAL to `classify_and_authorize_
 /// dispatch`'s `has_permission`: injected, not looked up — the production
-/// binder wraps `PluginConfigStore::action_allowed`, fail-closed by that
-/// store's own contract (a closed store, a lease timeout, or a query failure
-/// all report "not allowed"). An empty/unset callback means no kill-switch
+/// binders bind `PluginConfigStore::kill_switch_decision` (the one-statement
+/// read `action_allowed` itself wraps), fail-closed by that store's own
+/// contract (a closed store, a lease timeout, or a query failure all return
+/// nullopt, i.e. "not allowed"). An empty/unset callback means no kill-switch
 /// store is wired at all (legacy-open for THIS gate ONLY, mirroring how an
 /// absent `plugin_config_store_` behaves in `server.cpp`) — never call this
 /// with a callback that unconditionally returns `true` "to be safe"; that

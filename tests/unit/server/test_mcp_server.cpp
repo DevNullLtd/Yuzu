@@ -18050,6 +18050,15 @@ TEST_CASE("MCP operator surface: set/get_plugin_kill_switch carry the os argumen
         REQUIRE(bad);
         CHECK(bad->body.find("-32602") != std::string::npos); // kInvalidParams
     }
+    // A present-but-non-string os must not fall through to the all-OS row.
+    for (const char* tool : {"set_plugin_kill_switch", "get_plugin_kill_switch"}) {
+        const std::string body =
+            std::string(R"({"jsonrpc":"2.0","method":"tools/call","id":5,"params":{"name":")") +
+            tool + R"(","arguments":{"plugin":"firewall","enabled":false,"os":1}}})";
+        auto bad = ts.call(body);
+        REQUIRE(bad);
+        CHECK(bad->body.find("-32602") != std::string::npos); // kInvalidParams
+    }
     CHECK(*w.store.kill_switch_decision("firewall", "block") ==
           std::unordered_set<std::string>{"windows"});
 }

@@ -614,4 +614,13 @@ TEST_CASE("plugin_config_routes: kill-switch GET/PUT carry os and source; ?os= r
                               json{{"enabled", false}}.dump());
     REQUIRE(bad_put);
     CHECK(bad_put->status == 400);
+
+    // A present-but-empty ?os= is malformed, never the all-OS row.
+    auto blank = h.sink.Get("/api/v1/plugin-config/firewall/kill-switch?os=");
+    REQUIRE(blank);
+    CHECK(blank->status == 400);
+    auto blank_put = h.sink.Put("/api/v1/plugin-config/firewall/kill-switch?os=",
+                                json{{"enabled", false}}.dump());
+    REQUIRE(blank_put);
+    CHECK(blank_put->status == 400);
 }

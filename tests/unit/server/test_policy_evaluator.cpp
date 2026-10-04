@@ -127,6 +127,10 @@ struct Harness {
     // compute_delivered's `route_unreadable` branch the same way
     // `containment_unreadable` is exercised in deployment_engine.cpp.
     bool route_unreadable_outcome{false};
+    // #5294: the fake dispatch_fn returns `os_gate_unreadable` for the WHOLE
+    // batch (degraded presence read: sent == 0, no per-id data), mirroring
+    // the real ladder's early refusal.
+    bool os_gate_unreadable_outcome{false};
     // WS-4 4.2b Task D fix regression: agent ids the fake dispatch_fn marks
     // `not_sent` while ALSO stamping `outcome.route_unreadable = true`,
     // alongside genuinely-sent siblings in the SAME batch -- mirrors a real
@@ -186,6 +190,10 @@ struct Harness {
             dispatched_plugins.push_back(plugin);
             yuzu::server::ConfinedDispatchOutcome outcome;
             outcome.command_id = "cmd-" + execid;
+            if (os_gate_unreadable_outcome) {
+                outcome.os_gate_unreadable = true;
+                return outcome;
+            }
             if (route_unreadable_outcome) {
                 // Mirrors the real chokepoint: a degraded GatewayRouteStore
                 // directory read means nothing in the batch was individually
@@ -912,6 +920,36 @@ TEST_CASE("policy evaluator: a mixed delivered+kill_switched_os remediate batch 
     auto rr2 = ev.remediate(pid, {"agentB"});
     REQUIRE(rr2.ok);
     CHECK(rr2.agents == 1);
+    CHECK(h.status_of(pid, "agentB") == "fixing");
+}
+
+TEST_CASE("policy evaluator: an os_gate_unreadable outcome leaves the WHOLE remediate batch "
+          "undelivered and releases the claims for retry (#5294)",
+          "[pg][policy][evaluator][claim]") {
+    // compute_delivered has no dedicated os_gate_unreadable branch: the
+    // refusal (sent == 0, no per-id data) is caught by the residual
+    // `sent == 0 && claimed > not_delivered` rule. Pin that, so a later edit
+    // to the residual cannot silently mark the batch delivered.
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    Harness h(pool);
+    auto pid = h.author("result.hostname != ''", /*with_fix=*/true);
+
+    h.os_gate_unreadable_outcome = true;
+    PolicyEvaluator ev(h.deps());
+    auto rr = ev.remediate(pid, {"agentA", "agentB"});
+    REQUIRE(rr.ok);
+    CHECK(rr.agents == 0);
+    CHECK(h.status_of(pid, "agentA") == "unknown");
+    CHECK(h.status_of(pid, "agentB") == "unknown");
+
+    h.os_gate_unreadable_outcome = false;
+    h.canned["agentA|fixp"] = {1, "ok"};
+    h.canned["agentB|fixp"] = {1, "ok"};
+    auto rr2 = ev.remediate(pid, {"agentA", "agentB"});
+    REQUIRE(rr2.ok);
+    CHECK(rr2.agents == 2);
+    CHECK(h.status_of(pid, "agentA") == "fixing");
     CHECK(h.status_of(pid, "agentB") == "fixing");
 }
 

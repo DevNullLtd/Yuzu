@@ -1435,7 +1435,11 @@ public:
                           "explicit agent_ids on REST (route=command), MCP execute_instruction "
                           "(route=mcp) or the dashboard exec console (route=dashboard) (#3685). "
                           "Both labels are closed sets; every reachable pair "
-                          "is pre-seeded at boot so absent() stays meaningful.",
+                          "is pre-seeded at boot so absent() stays meaningful. The "
+                          "policy-withhold reasons quarantined, unknown_plugin and "
+                          "kill_switched_os are correct containment or operator policy, "
+                          "not caller mistakes, and are excluded from the "
+                          "YuzuDispatchTargetRejected alert.",
                           "counter");
         // The route-level reasons below are the literals in `kRouteRejectReasons`
         // (dispatch_target_shape.hpp). They are spelled out here rather than
@@ -13507,13 +13511,15 @@ private:
     // row it is ONE aggregate decision with no per-agent count. Audit row only:
     // the scheduled-path outbox already counts the cause
     // (`yuzu_server_command_outbox_deliver_retry_cause_total`), and
-    // `yuzu_server_dispatch_target_rejected_total` is the caller-mistake family.
+    // `yuzu_server_dispatch_target_rejected_total` carries the per-target
+    // withhold reasons, and this refusal has no per-target count.
     void audit_os_gate_unreadable(const std::string& principal, const std::string& principal_role,
                                   const std::string& command_id, const std::string& plugin) {
         write_withheld_row(principal, principal_role, command_id, plugin, "os_gate_unreadable");
     }
 
-    // Shared body of the two emitters above: `metric_reason` is the
+    // Shared body of `audit_unknown_plugin_dispatch` and
+    // `audit_kill_switched_os_dispatch`: `metric_reason` is the
     // `yuzu_server_dispatch_target_rejected_total` label, `detail_reason` the
     // token written into the audit row's detail.
     void audit_dispatch_withheld(std::string_view route, const std::string& principal,

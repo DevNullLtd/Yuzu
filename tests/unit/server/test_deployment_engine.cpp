@@ -398,6 +398,22 @@ TEST_CASE("deployment engine fails a kill-switched device in a mixed batch inste
     for (const auto& d : store.get_devices(id2))
         if (d.agent_id == "b2")
             CHECK(d.error.find("per-OS kill switch") != std::string::npos);
+
+    // sent == 0, every id named: the whole batch is accounted for, so each
+    // device settles to 'failed' with the per-OS text and no residual
+    // revert-to-pending reclaims it.
+    const std::string id3 = "e-os-killed-all";
+    auto dep3 = make_dep(id3);
+    dep3.source_run_id = "run-all-killed"; // one running deployment per source run
+    REQUIRE(store.create_deployment(dep3, {tgt("c1"), tgt("c2")}));
+    Harness h3{store};
+    h3.kill_switched_os_agents = {"c1", "c2"};
+    auto deps3 = h3.deps();
+    advance(deps3, id3, cfg, {"c1", "c2"}, test_caller());
+    CHECK(step_of(store, id3, "c1") == "failed");
+    CHECK(step_of(store, id3, "c2") == "failed");
+    for (const auto& d : store.get_devices(id3))
+        CHECK(d.error.find("per-OS kill switch") != std::string::npos);
 }
 
 TEST_CASE("deployment engine retries after a transient GatewayRouteStore directory-read "
