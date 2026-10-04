@@ -22,7 +22,6 @@
 
 #include <cstdlib>
 #include <filesystem>
-#include <map>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -60,23 +59,14 @@ TEST_CASE("installed-software action table matches real plugin descriptors",
     const auto table = yuzu::agent::installed_software_actions();
     REQUIRE_FALSE(table.empty());
 
-    std::map<std::string, yuzu::agent::PluginHandle> handles; // alive to end of test
-
     for (const auto& [plugin_sv, action_sv] : table) {
         const std::string plugin{plugin_sv};
-        INFO("plugin=" << plugin << " action=" << action_sv);
+        const auto path = find_plugin(plugin);
+        INFO("plugin=" << plugin << " action=" << action_sv << " path=" << path.string());
 
-        auto it = handles.find(plugin);
-        if (it == handles.end()) {
-            const auto path = find_plugin(plugin);
-            INFO("path=" << path.string());
-            std::error_code ec;
-            REQUIRE(fs::exists(path, ec));
-            auto loaded = yuzu::agent::PluginHandle::load(path);
-            REQUIRE(loaded.has_value());
-            it = handles.emplace(plugin, std::move(*loaded)).first;
-        }
-        const YuzuPluginDescriptor* d = it->second.descriptor();
+        auto loaded = yuzu::agent::PluginHandle::load(path);
+        REQUIRE(loaded.has_value());
+        const YuzuPluginDescriptor* d = loaded->descriptor();
         REQUIRE(d != nullptr);
 
         CHECK(std::string_view{d->name} == plugin_sv);

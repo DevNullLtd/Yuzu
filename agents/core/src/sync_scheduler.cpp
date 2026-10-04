@@ -90,8 +90,6 @@ SyncScheduler::State& SyncScheduler::load_state(std::size_t idx, std::int64_t no
         st.last_full = 0;
         st.last_hash.clear();
         st.force_full = false;
-        st.skip_streak = 0;
-        st.last_skip.clear();
         save_state(src, st);
     } else {
         st.next_fire = std::strtoll(nf.c_str(), nullptr, 10);

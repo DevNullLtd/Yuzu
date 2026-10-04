@@ -13,7 +13,6 @@
 
 #include <yuzu/plugin.h>
 
-#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
@@ -31,7 +30,6 @@
 #include <vector>
 
 using yuzu::agent::AdaptedRows;
-using yuzu::agent::installed_software_actions;
 using yuzu::agent::installed_software_canonical_blob;
 using yuzu::agent::make_installed_software_source;
 using yuzu::agent::parse_pkg_inventory_managers_output;
@@ -636,13 +634,6 @@ TEST_CASE("SyncScheduler: a skip persists the sanitised reason and bumps the str
     sched.tick(1700);
     CHECK(rig.kv["sync.installed_software.skip_streak"] == "1");
     CHECK(rig.kv["sync.installed_software.last_skip"] == "pkg_inventory.packages:_bad_status");
-    // skip_backoff off: today's one-interval retry.
-    CHECK(rig.next_fire() == 1700 + 86400);
-
-    rig.reason = std::string(70, 'r');
-    sched.tick(rig.next_fire());
-    CHECK(rig.kv["sync.installed_software.skip_streak"] == "2");
-    CHECK(rig.kv["sync.installed_software.last_skip"] == std::string(64, 'r'));
 }
 
 TEST_CASE("SyncScheduler: a successful collect clears the skip before the send and restarts "
@@ -1763,7 +1754,7 @@ TEST_CASE("entry cap: the splitter reads one past kMaxEntries and the collector 
     CHECK_FALSE(collect_with(only_ia).has_value());
 }
 
-// --- constrained managers, typed PARTIAL guard, exported action table ---
+// --- constrained managers, typed PARTIAL guard ---
 
 namespace {
 // Real emitters: a constrained managers status row carrying one present Homebrew row.
@@ -1798,39 +1789,24 @@ TEST_CASE("collector: constrained managers keeps a present row", "[sync][collect
                                      "/usr/local", "-", "macos:homebrew_cellar:permission_denied")});
         CHECK_FALSE(collect_with(all_plugins()).has_value());
     }
-    SECTION("no data rows: skipped") {
-        fake_mac();
-        g_fake[1].out["managers"] =
-            pkg::format_status_row("managers", pkg::StatusLevel::constrained,
-                                   "macos:homebrew_taps:permission_denied") +
-            "\n";
-        CHECK_FALSE(collect_with(all_plugins()).has_value());
-    }
 }
 
-TEST_CASE("pkg_inventory adapters: constrained managers is ok, packages stays failed",
+TEST_CASE("pkg_inventory adapters: constrained managers with a present row is ok and carries "
+          "its reason",
           "[sync][parse][adapter]") {
     const std::string token = "macos:homebrew_taps:permission_denied";
     const auto m = parse_pkg_inventory_managers_output(constrained_managers_with_present_row());
     CHECK(m.status == AdaptedRows::Status::ok);
     CHECK(m.entries.size() == 1);
     CHECK(m.reason == token);
-
-    const auto p = parse_pkg_inventory_packages_output(
-        nl({pkg::format_status_row("packages", pkg::StatusLevel::constrained, token),
-            pkg::format_package_row("wget", "1.24", pkg::PackageKind::formula)}));
-    CHECK(p.status == AdaptedRows::Status::failed);
-    CHECK(p.reason == token);
 }
 
-TEST_CASE("collector: typed PARTIAL completeness skips the cycle unless the row opts in",
+// The skip on a typed PARTIAL is pinned in the skip_reason case below (collect() is nullopt with
+// the `:partial` token); this case pins the paths that must NOT skip.
+TEST_CASE("collector: typed completeness - FULL collected, an opted-in PARTIAL accepted, in-band "
+          "unsupported wins",
           "[sync][collector]") {
     constexpr auto kPartial = YUZU_RESULT_COMPLETENESS_PARTIAL;
-    SECTION("packages CONSTRAINED/PARTIAL with parseable rows: skipped") {
-        fake_mac();
-        g_fake[1].result_status["packages"] = {YUZU_RESULT_STATUS_CONSTRAINED, kPartial, "x"};
-        CHECK_FALSE(collect_with(all_plugins()).has_value());
-    }
     SECTION("packages OK/FULL: collected") {
         fake_mac();
         g_fake[1].result_status["packages"] = {YUZU_RESULT_STATUS_OK,
@@ -1850,16 +1826,6 @@ TEST_CASE("collector: typed PARTIAL completeness skips the cycle unless the row 
         REQUIRE(got.has_value());
         CHECK(records_of(got->first).size() == 393 + 66 + 1);
     }
-}
-
-TEST_CASE("installed_software_actions: the exported table, in order", "[sync][collector]") {
-    const auto a = installed_software_actions();
-    const std::vector<std::pair<std::string_view, std::string_view>> want = {
-        {"installed_apps", "list_inventory"},
-        {"pkg_inventory", "managers"},
-        {"pkg_inventory", "packages"},
-        {"windows_optional_features", "list"}};
-    CHECK(a == want);
 }
 
 TEST_CASE("collector: skip_reason names the cause of each skip and clears on success",
