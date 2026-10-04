@@ -40,7 +40,8 @@
 %%%   circuit_breaker_failure_threshold   — consecutive failures to trip (default 5)
 %%%   circuit_breaker_reset_timeout_ms    — initial open duration (default 10000)
 %%%   circuit_breaker_max_reset_timeout_ms — max backoff cap (default 300000)
-%%%   registration_replay_spacing_ms      — gap between replay RPCs (default 20)
+%%%   registration_replay_spacing_ms      — gap between replay RPCs
+%%%                                          (default 20, valid 0..60000)
 %%%   registration_replay_session_guard_ms - how long a replayed session is not
 %%%                                          queued again by a verdict
 %%%                                          (default 10000, valid 0..3600000)
@@ -82,6 +83,7 @@
 -define(DEFAULT_CB_RESET_MS, 10000).
 -define(DEFAULT_CB_MAX_RESET_MS, 300000).
 -define(DEFAULT_REPLAY_SPACING_MS, 20).
+-define(MAX_REPLAY_SPACING_MS, 60000).
 -define(DEFAULT_REPLAY_SESSION_GUARD_MS, 10000).
 -define(MAX_REPLAY_SESSION_GUARD_MS, 3600000).
 -define(DEFAULT_REPLAY_QUEUE_MAX, 10000).
@@ -197,7 +199,8 @@ init([]) ->
     Threshold  = application:get_env(yuzu_gw, circuit_breaker_failure_threshold, ?DEFAULT_CB_THRESHOLD),
     BaseTimeout = application:get_env(yuzu_gw, circuit_breaker_reset_timeout_ms, ?DEFAULT_CB_RESET_MS),
     MaxTimeout  = application:get_env(yuzu_gw, circuit_breaker_max_reset_timeout_ms, ?DEFAULT_CB_MAX_RESET_MS),
-    ReplaySpacing = application:get_env(yuzu_gw, registration_replay_spacing_ms, ?DEFAULT_REPLAY_SPACING_MS),
+    ReplaySpacing = env_int(registration_replay_spacing_ms,
+                            ?DEFAULT_REPLAY_SPACING_MS, 0, ?MAX_REPLAY_SPACING_MS),
     SessionGuard = env_int(registration_replay_session_guard_ms,
                            ?DEFAULT_REPLAY_SESSION_GUARD_MS, 0, ?MAX_REPLAY_SESSION_GUARD_MS),
     QueueMax = env_int(registration_replay_queue_max,

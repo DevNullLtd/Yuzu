@@ -231,7 +231,11 @@ verdict_env_test_() ->
       t("an out of range or non integer queue cap falls back to the default with a warning",
         fun env_queue_max_invalid_falls_back/0),
       t("a queue cap inside 1..1000000 is kept",
-        fun env_queue_max_valid_is_kept/0)
+        fun env_queue_max_valid_is_kept/0),
+      t("an out of range or non integer replay spacing falls back to the default with a warning",
+        fun env_spacing_invalid_falls_back/0),
+      t("a replay spacing inside 0..60000 is kept",
+        fun env_spacing_valid_is_kept/0)
      ]}.
 
 setup() ->
@@ -1725,6 +1729,16 @@ env_queue_max_valid_is_kept() ->
      || V <- [1, 7, 1000000]],
     ok.
 
+env_spacing_invalid_falls_back() ->
+    [env_case(registration_replay_spacing_ms, Bad, replay_spacing, 20, invalid)
+     || Bad <- [-5, 60001, 1.5, foo, <<"20">>, "20"]],
+    ok.
+
+env_spacing_valid_is_kept() ->
+    [env_case(registration_replay_spacing_ms, V, replay_spacing, V, valid)
+     || V <- [0, 1, 60000]],
+    ok.
+
 %% Restart the upstream with Key=Val and check the state field and the
 %% warning. An invalid value warns (naming the key) and takes the default; a
 %% valid value is kept and does not warn about that key.
@@ -1836,7 +1850,7 @@ to_half_open() ->
 %%%===================================================================
 
 start_buffer() ->
-    application:set_env(yuzu_gw, heartbeat_batch_interval_ms, 600000),
+    application:set_env(yuzu_gw, heartbeat_batch_interval_ms, 60000),
     case whereis(yuzu_gw_heartbeat_buffer) of
         undefined -> ok;
         Old -> catch unlink(Old), catch gen_server:stop(Old, shutdown, 1000)
