@@ -1303,6 +1303,52 @@ previous gateway (the only new state is the in-memory index; derived from the ch
   is compatible. A future heartbeat-forwarding slice cannot reuse the connection pid as its key, because a pid
   is meaningful only on the node that owns the connection.
 
+**Update (2026-10-04, #1197 PR-C - the gateway now consumes the unknown-session verdict).** The
+gateway reads `unknown_session_ids` and `unknown_session_ids_truncated` from every successful
+`BatchHeartbeatResponse` and replays exactly the sessions it still holds through the existing
+registration-replay drip. The 2026-10-01 update above describes the state before this change (the
+consumer was pending) and is left as written; the wire is unchanged and no server code changes.
+- **Mechanism.** `yuzu_gw_heartbeat_buffer` validates the listed ids (non-empty binaries of at most 64
+  bytes, de-duplicated, at most 4096), counts what it drops as malformed, and casts the rest to
+  `yuzu_gw_upstream:replay_sessions/1`. A flush never feeds the circuit breaker; the only coupling is that
+  one cast. The upstream client resolves the ids against this node's registry and queues one pending
+  entry per agent, subject to a per-session guard window (`registration_replay_session_guard_ms`, default
+  10000, valid 0..3600000) and a queue cap (`registration_replay_queue_max`, default 10000, valid
+  1..1000000); both are application-env keys read at start, an invalid value warns and falls back to the
+  default. A verdict that arrives while the breaker is `open` is dropped and counted; one that arrives
+  `half_open` is queued and its first replay RPC is the probe. A replay the server answers with
+  `accepted=false` makes the gateway disconnect that agent process, with no re-announce, so the agent
+  registers directly and follows its own outcome.
+- **Two keys, two decisions.** The verdict is enqueued by SESSION: the server names sessions, and
+  `yuzu_gw_registry:entries_for_sessions/1` resolves each id through the node-local session index from
+  the 2026-10-02 update, then reads the agent row once and requires it to agree with the index (same
+  pid, same session). The drip pops by AGENT: `lookup_local_session/1` re-checks liveness immediately
+  before each send, so an agent that left or re-registered under another session while queued is
+  skipped. The replay path never writes the session index (`yuzu_gw_sessions` is written only by
+  `register_agent/7` and the fenced deregister); `entries_for_sessions/1` is read-only.
+- **Multi-replica statement (read from the code; no multi-replica run exists, so this is inferred).**
+  The verdict/replay reconcile is correct and bounded on one core replica. On several replicas it
+  converges in one round only if a gateway's `BatchHeartbeat`, replay `ProxyRegister` and reannounce
+  `NotifyStreamStatus` reach the SAME replica during the reconcile. The shipped gateway does this per
+  connection (one grpcbox channel, one endpoint, one HTTP/2 connection) through an L4 VIP. A
+  multi-endpoint node list (grpcbox round-robins per RPC) or an L7 per-RPC balancer breaks it: the
+  lacking replica keeps listing the session, an arbitrary replica receives each replay, a replica that
+  already holds the session re-installs it (placement wiped until its own reannounce lands on it), and
+  the lacking replica learns the session only when a replay happens to land there. Convergence is then
+  probabilistic, not bounded; the per-session guard bounds the replay rate (one per session per 10 s
+  per gateway by default, further paced by the 20 ms drip) but not the number of rounds. Signature:
+  `yuzu_server_gateway_route_desync_total{op="renew_leases",outcome="unknown_session"}` not decaying on
+  some replica after both sides are upgraded, with
+  `yuzu_gw_registration_replay_triggered_total{trigger="heartbeat"}` rising at the guard rate. The
+  durable cross-replica session lookup (WS-5, `#4246` #3) is the fix; until it lands the safe-to-scale
+  gate forbids a second replica.
+- **What it does not promise.** Fleet completion inside a route lease (the drip period is the
+  ProxyRegister RPC time plus the spacing, so the time to drain scales with the number of agents), and
+  dispatch reachability after the session is adopted (placement converges when the agent's re-sent
+  CONNECTED is delivered; a rise in `yuzu_gw_upstream_notify_dropped_total` marks agents that stay
+  acknowledged but unreachable until their next reconnect, a known follow-up). The operator runbook and
+  the load table are in `docs/user-manual/gateway.md`, "What happens when the server restarts".
+
 ### 7d. Cross-cluster gateway fan-out — "rest of 4.3" (WS-4, 2026-09-21)
 
 **Status: CLOSED.** The last named WS-4 4.3 gap: 4.3a (§ above) built INTRA-cluster routing (agent on a
