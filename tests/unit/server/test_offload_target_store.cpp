@@ -238,6 +238,23 @@ TEST_CASE("OffloadTargetStore[pg]: rejects batch_size < 1", "[offload_store][pg]
               .has_value());
 }
 
+TEST_CASE("OffloadTargetStore[pg]: batch_size is bounded to 1 to kMaxOffloadBatchSize",
+          "[offload_store][pg]") {
+    OffloadTargetStorePg store;
+    // The buffer flushes only at batch_size and has no other cap, so the store (the one
+    // writer REST and MCP both reach) refuses anything above the ceiling.
+    CHECK(store->create_target("max", "https://x.example.com/h", OffloadAuthType::None, "", "*",
+                               kMaxOffloadBatchSize)
+              .has_value());
+    for (const int bad : {kMaxOffloadBatchSize + 1, 2147483647}) {
+        INFO("batch_size=" << bad);
+        auto r = store->create_target("big-" + std::to_string(bad), "https://x.example.com/h",
+                                      OffloadAuthType::None, "", "*", bad);
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error() == OffloadWriteError::invalid_input);
+    }
+}
+
 // ── Empty deliveries ───────────────────────────────────────────────────────
 
 TEST_CASE("OffloadTargetStore[pg]: get_deliveries on empty target returns empty",

@@ -449,6 +449,9 @@ std::expected<void, std::string>
 GuaranteedStateStore::create_rule(const GuaranteedStateRuleRow& row) {
     if (!open_)
         return std::unexpected("database not open");
+    if (!rule_version_in_range(row.version))
+        return std::unexpected("rule version out of range (1.." + std::to_string(kMaxRuleVersion) +
+                               ")");
     auto lease = pool_.try_acquire_for(kWriteTimeout);
     if (!lease)
         return std::unexpected("no database connection: " + pool_.last_error());
@@ -493,6 +496,9 @@ std::expected<void, std::string>
 GuaranteedStateStore::update_rule(const GuaranteedStateRuleRow& row) {
     if (!open_)
         return std::unexpected("database not open");
+    if (!rule_version_in_range(row.version))
+        return std::unexpected("rule version out of range (1.." + std::to_string(kMaxRuleVersion) +
+                               ")");
     auto lease = pool_.try_acquire_for(kWriteTimeout);
     if (!lease)
         return std::unexpected("no database connection: " + pool_.last_error());

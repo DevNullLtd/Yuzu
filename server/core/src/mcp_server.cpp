@@ -14339,8 +14339,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 // schema says minimum 1; the ceiling is INT32_MAX (a counter nothing
                 // reaches by bumping).
                 const auto version_opt = param_int_strict(args, "version", 1);
-                if (!version_opt || *version_opt < 1 ||
-                    *version_opt > std::numeric_limits<int>::max()) {
+                if (!version_opt || !rule_version_in_range(*version_opt)) {
                     res.set_content(
                         // retry-hint-exempt: caller-input rejection, not a store/query fault -
                         // resending the identical value cannot succeed.
@@ -14575,9 +14574,10 @@ McpServer::HandlerFn McpServer::build_handler(
                 updated.os_target = param_str(args, "os_target", existing_rule.os_target.c_str());
                 updated.scope_expr =
                     param_str(args, "scope_expr", existing_rule.scope_expr.c_str());
-                if (existing_rule.version >= std::numeric_limits<int64_t>::max()) {
-                    // Only reachable for a row written out of band: create is capped at
-                    // INT32_MAX. Refuse rather than overflow the signed increment.
+                if (rule_version_exhausted(existing_rule.version)) {
+                    // Create and update_rule are capped at kMaxRuleVersion (INT32_MAX), so
+                    // this is reachable only for a row stored before that bound existed or
+                    // written out of band. Refuse rather than overflow the signed increment.
                     res.set_content(
                         // retry-hint-exempt: the stored version counter is exhausted; a retry
                         // cannot succeed.
@@ -21781,7 +21781,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 // (the old wrap to 0 was rejected by the store) would make the offload
                 // buffer, which flushes only when it reaches batch_size and has no other
                 // cap, grow without bound, so enforce the declared range here.
-                if (*batch_size_opt < 1 || *batch_size_opt > 10000) {
+                if (*batch_size_opt < 1 || *batch_size_opt > kMaxOffloadBatchSize) {
                     res.set_content(
                         // retry-hint-exempt: caller-input range rejection, not a
                         // store/query fault - resending the identical value cannot succeed.

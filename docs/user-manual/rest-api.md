@@ -5451,7 +5451,7 @@ Fetch a single target by numeric id. `auth_credential` is redacted (`has_credent
 
 #### `POST /api/v1/offload-targets`
 
-Create a new offload target. Returns 201 + `{id, status}` on success, 400 when validation fails (invalid URL scheme, empty `name`, `batch_size < 1`, duplicate `name`, a control byte in a free-text field, a present-but-wrong-typed field such as `batch_size` sent as a string, or an unrecognized `auth_type`).
+Create a new offload target. Returns 201 + `{id, status}` on success, 400 when validation fails (invalid URL scheme, empty `name`, `batch_size` outside `1`..`10000`, duplicate `name`, a control byte in a free-text field, a present-but-wrong-typed field such as `batch_size` sent as a string, or an unrecognized `auth_type`).
 
 | Field | Type | Required | Description |
 |---|---|---|---|
@@ -5460,7 +5460,7 @@ Create a new offload target. Returns 201 + `{id, status}` on success, 400 when v
 | `auth_type` | string | No (`none`) | One of `none`, `bearer`, `basic`, `hmac`. |
 | `auth_credential` | string | No | Bearer token (Bearer), `user:pass` (Basic), shared secret (Hmac). Never returned by any endpoint. |
 | `event_types` | string | No (`*`) | Comma-separated list of event types or `*` for all. Same semantics as webhooks. |
-| `batch_size` | int | No (1) | Accumulate up to N events into a single POST body. `1` = no batching. |
+| `batch_size` | int | No (1) | Accumulate up to N events into a single POST body. `1` = no batching. Must be `1`..`10000`; the per-target buffer flushes only at this size and has no other cap, so the store refuses a larger value (the same range MCP `create_offload_target` enforces). |
 | `enabled` | bool | No (true) | When false, no events are dispatched until re-enabled. |
 
 **Auth headers (set per `auth_type`):**
@@ -8431,7 +8431,7 @@ A rule may be authored **structured** (the agent-enforceable form) or **legacy**
 | `assertion` | object | Structured | `{type, params}` desired-state block, e.g. `registry-value-equals`, `file-exists`, `file-hash-equals`. |
 | `remediation` | object | No | `{type, params}` — `alert-only` (default) or `enforce`. `params` carries the **resilience policy** (`mode`, `max_attempts`, `backoff_*`, …) and `event_debounce_ms`. |
 | `yaml_source` | string | Legacy | Full rule YAML; required only when no structured `spark`+`assertion` is given. The server generates `yaml_source` from the structured form otherwise. |
-| `version` | integer | No | Starting version (default `1`). |
+| `version` | integer | No | Starting version (default `1`). Must be `1`..`2147483647` (`400` otherwise): an update adds one to the stored version and the agent push casts it to an unsigned 64-bit value, so a value near the 64-bit maximum would overflow. |
 | `enabled` | boolean | No | Default `true`. |
 | `enforcement_mode` | string | No | `enforce` (default) or `audit`. **Set once at creation — immutable on update** (see PUT below). |
 | `severity` | string | No | `low` / `medium` (default) / `high` / `critical`. |
@@ -8441,7 +8441,7 @@ A rule may be authored **structured** (the agent-enforceable form) or **legacy**
 The catalog of valid `spark` / `assertion` / `remediation` types and their `params` (including the resilience-policy bounds) is discoverable at [`GET /api/v1/guaranteed-state/schemas`](#get-apiv1guaranteed-stateschemas).
 
 - **Response:** `201` with `data.rule_id`.
-- **4xx:** `400` missing required fields, invalid JSON, a request body nesting deeper than 32 levels (`kMcpMaxJsonDepth`), a `rule_id` that doesn't match `[A-Za-z0-9._-]+` or exceeds 256 bytes (#4665), or an **invalid resilience policy** (e.g. Bounded `max_attempts` < 1, `backoff_initial_ms` > `backoff_max_ms`) — returned as the A4 structured error envelope; `409` on duplicate `rule_id` or duplicate `name`; `403` if a service-scoped API token calls this route (same reasoning as the `GET` list above — no per-target shape to confine against).
+- **4xx:** `400` missing required fields, invalid JSON, a request body nesting deeper than 32 levels (`kMcpMaxJsonDepth`), a `rule_id` that doesn't match `[A-Za-z0-9._-]+` or exceeds 256 bytes (#4665), or a `version` outside `1`..`2147483647`, an **invalid resilience policy** (e.g. Bounded `max_attempts` < 1, `backoff_initial_ms` > `backoff_max_ms`) — returned as the A4 structured error envelope; `409` on duplicate `rule_id` or duplicate `name`; `403` if a service-scoped API token calls this route (same reasoning as the `GET` list above — no per-target shape to confine against).
 - **Audit:** `guaranteed_state.rule.create` (`success` / `denied`; an invalid `rule_id` is audited as `denied` too — #4665).
 - **MCP twin:** `create_guardian_rule` (#2146 Batch B1) — same store write and validation.
 
@@ -8464,7 +8464,7 @@ Update a rule. Version is incremented on every successful update regardless of w
 - **Request body:** Any subset of the create-body fields *except* `enforcement_mode` (absent fields retain their current values). A body carrying structured `spark`/`assertion`/`remediation` blocks **re-authors** the Guard (re-deriving the canonical spec and re-validating the resilience policy) rather than dropping them; a metadata-only body leaves the existing spec intact.
 - **`enforcement_mode` is immutable.** A body whose `enforcement_mode` differs from the stored value is rejected with `400` (`enforcement_mode is immutable — create a new Guard for a different posture (Watch vs Enforce)`); a different posture is a different Guard. A no-op echo of the current value is accepted.
 - **Response:** `200` with `data.updated = true` and `data.version`.
-- **4xx:** `400` invalid JSON, a request body nesting deeper than 32 levels (`kMcpMaxJsonDepth`), an invalid resilience policy (A4 envelope), or an `enforcement_mode` change; `404` rule not found; `409` on name conflict; `403` if a service-scoped API token calls this route (same reasoning as the create route above).
+- **4xx:** `400` invalid JSON, a request body nesting deeper than 32 levels (`kMcpMaxJsonDepth`), an invalid resilience policy (A4 envelope), or an `enforcement_mode` change; `404` rule not found; `409` on name conflict or when the stored version counter is exhausted (a row stored at `2147483647` or above, which only a row written before the bound existed can be; create a new rule instead); `403` if a service-scoped API token calls this route (same reasoning as the create route above).
 - **5xx:** `503` if the pre-update rule lookup hits a degraded store (A4 envelope, `retry_after_ms: 5000`).
 - **Audit:** `guaranteed_state.rule.update`.
 - **MCP twin:** `update_guardian_rule` (#2146 Batch B1) — same validation and version-bump. No optimistic-concurrency check against concurrent writers on either transport (tracked in #4303).

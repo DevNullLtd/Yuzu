@@ -115,6 +115,26 @@ TEST_CASE("REST offload-targets: list empty", "[rest][offload][pg]") {
     CHECK(j["offload_targets"].empty());
 }
 
+TEST_CASE("REST offload-targets: create rejects a batch_size above the ceiling with 400",
+          "[rest][offload][pg]") {
+    OffloadHarness h;
+    for (const int bad : {kMaxOffloadBatchSize + 1, 2147483647}) {
+        INFO("batch_size=" << bad);
+        nlohmann::json body = {{"name", "big-" + std::to_string(bad)},
+                               {"url", "https://siem.example.com/ingest"},
+                               {"batch_size", bad}};
+        auto res = h.sink.Post("/api/v1/offload-targets", body.dump());
+        REQUIRE(res);
+        CHECK(res->status == 400);
+    }
+    nlohmann::json ok = {{"name", "at-ceiling"},
+                         {"url", "https://siem.example.com/ingest"},
+                         {"batch_size", kMaxOffloadBatchSize}};
+    auto res = h.sink.Post("/api/v1/offload-targets", ok.dump());
+    REQUIRE(res);
+    CHECK(res->status == 201);
+}
+
 TEST_CASE("REST offload-targets: create returns 201 and id", "[rest][offload][pg]") {
     OffloadHarness h;
     nlohmann::json body = {{"name", "siem-primary"},

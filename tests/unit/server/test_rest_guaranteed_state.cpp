@@ -944,6 +944,67 @@ TEST_CASE("REST gs.rules: duplicate name → 409 via kConflictPrefix",
     CHECK(h.audit_log[1].result == "denied");
 }
 
+TEST_CASE("REST gs.rules: create bounds version to 1..2147483647 with a denied audit",
+          "[pg][rest][guaranteed_state][create]") {
+    RestGsHarness h;
+    int n = 0;
+    for (const char* bad : {"0", "-1", "2147483648", "9223372036854775807"}) {
+        INFO("version=" << bad);
+        auto body = nlohmann::json::parse(
+            RestGsHarness::make_rule_body("r-v" + std::to_string(++n), "name-v" + std::to_string(n)));
+        body["version"] = nlohmann::json::parse(bad);
+        auto res = h.sink.Post("/api/v1/guaranteed-state/rules", body.dump());
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        CHECK(res->body.find("1 to 2147483647") != std::string::npos);
+        REQUIRE_FALSE(h.audit_log.empty());
+        CHECK(h.audit_log.back().action == "guaranteed_state.rule.create");
+        CHECK(h.audit_log.back().result == "denied");
+    }
+    CHECK(h.store->rule_count() == 0);
+
+    auto ok = nlohmann::json::parse(RestGsHarness::make_rule_body("r-edge", "name-edge"));
+    ok["version"] = 2147483647;
+    auto res = h.sink.Post("/api/v1/guaranteed-state/rules", ok.dump());
+    REQUIRE(res);
+    CHECK(res->status == 201);
+}
+
+// An update bumps the version by one. A row at (or past) the bound could only be stored
+// before the bound existed, so the test writes it directly and expects a clean 409 instead
+// of the signed-overflow increment.
+TEST_CASE("REST gs.rules: update refuses an exhausted version counter with 409",
+          "[pg][rest][guaranteed_state][update]") {
+    RestGsHarness h;
+    REQUIRE(h.sink
+                .Post("/api/v1/guaranteed-state/rules",
+                      RestGsHarness::make_rule_body("r-x", "rule-x"))
+                ->status == 201);
+    {
+        yuzu::server::pg::PgConn conn{PQconnectdb(h.gs_db_pg->dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        auto r = yuzu::server::pg::exec_params(
+            conn.get(),
+            "UPDATE guaranteed_state_store.guaranteed_state_rules SET version = "
+            "9223372036854775807 WHERE rule_id = 'r-x'",
+            std::vector<std::string>{});
+        REQUIRE(r.status() == PGRES_COMMAND_OK);
+    }
+    nlohmann::json patch;
+    patch["severity"] = "critical";
+    auto upd = h.sink.Put("/api/v1/guaranteed-state/rules/r-x", patch.dump());
+    REQUIRE(upd);
+    CHECK(upd->status == 409);
+    CHECK(upd->body.find("counter exhausted") != std::string::npos);
+    REQUIRE_FALSE(h.audit_log.empty());
+    CHECK(h.audit_log.back().action == "guaranteed_state.rule.update");
+    CHECK(h.audit_log.back().result == "denied");
+    auto stored = h.store->get_rule("r-x");
+    REQUIRE(stored.has_value());
+    REQUIRE(stored->has_value());
+    CHECK((*stored)->severity != "critical"); // the refused update wrote nothing
+}
+
 TEST_CASE("REST gs.rules: list, get, update, delete round-trip", "[pg][rest][guaranteed_state][crud]") {
     RestGsHarness h;
     REQUIRE(h.sink

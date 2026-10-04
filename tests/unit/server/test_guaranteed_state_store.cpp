@@ -268,6 +268,36 @@ TEST_CASE("GuaranteedStateStore: rule round-trip", "[pg][guaranteed_state_store]
     CHECK((*fetched)->updated_by == "alice");
 }
 
+TEST_CASE("GuaranteedStateStore: rule version is bounded to 1..kMaxRuleVersion on create and update",
+          "[pg][guaranteed_state_store][rules]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardianstate_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+
+    int n = 0;
+    for (const int64_t bad : {int64_t{0}, int64_t{-1}, kMaxRuleVersion + 1,
+                              std::numeric_limits<int64_t>::max()}) {
+        INFO("version=" << bad);
+        auto rule = make_rule("bad-" + std::to_string(++n), "bad-name-" + std::to_string(n));
+        rule.version = bad;
+        auto r = store.create_rule(rule);
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error().find("out of range") != std::string::npos);
+    }
+    CHECK(store.rule_count() == 0);
+
+    auto edge = make_rule("edge", "edge-name");
+    edge.version = kMaxRuleVersion;
+    REQUIRE(store.create_rule(edge));
+
+    auto low = make_rule("low", "low-name");
+    REQUIRE(store.create_rule(low));
+    low.version = std::numeric_limits<int64_t>::max();
+    auto u = store.update_rule(low);
+    REQUIRE_FALSE(u.has_value());
+    CHECK(u.error().find("out of range") != std::string::npos);
+}
+
 TEST_CASE("GuaranteedStateStore: list returns all rules ordered by name",
           "[pg][guaranteed_state_store][rules]") {
     YUZU_REQUIRE_PG_DB_TPL(db, guardianstate_tpl);

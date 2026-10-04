@@ -167,6 +167,73 @@ migration is needed. Two new counters report the effect:
 `yuzu_server_response_export_truncated_total{surface,cause}`
 ([Metrics](metrics.md#response-store-metrics)).
 
+## Behaviour change: numeric query parameters on other routes are parsed strictly too (#4644)
+
+**Breaking for scripts that relied on a malformed value being silently misread.** The strict
+parsing the response routes got (above) now also covers the routes listed in the REST API
+reference under [Numeric Query Parameters](rest-api.md#numeric-query-parameters-4644): the
+execution-statistics routes, the executions lists, the audit routes, the instruction, product-pack,
+workflow and compliance lists, the patch lists, the software-inventory list, the fleet-topology
+`machines_max` and the app-performance compare `window`. A value that is not one whole base-10
+integer now returns `400` where it used to be read as something else: `limit=100abc` (was `100`),
+`since=junk` on the statistics routes (was `0`, "from the beginning"), `?limit=abc` on
+`/api/analytics/recent` and the patch lists (was ignored), `window=7days` (was `7`).
+
+On MCP, `query_audit_log` answers `-32602` for a `since`, `until` or `limit` that is not a JSON
+integer or does not fit a signed 64-bit value (a string used to mean `0`, unbounded, and
+`18446744073709551615` wrapped to `-1`), and the app-performance compare tool does the same for
+`window`. Other integer arguments that do not fit saturate instead of wrapping, except three tools
+where a saturated value would be harmful and the argument is strict and bounded instead (`-32602`
+otherwise): `create_offload_target` `batch_size` must be 1 to 10000 (the declared schema range, now
+enforced), `mint_upload_grant` `declared_max_size` must be a JSON integer that fits a signed 64-bit
+value, and `create_guardian_rule` `version` must be 1 to 2147483647. The same two bounds now hold
+at the REST twins and in the stores, so no writer bypasses them: `POST /api/v1/offload-targets`
+answers `400` for a `batch_size` above 10000, `POST /api/v1/guaranteed-state/rules` answers `400`
+for a `version` outside 1 to 2147483647, and `PUT /api/v1/guaranteed-state/rules/{id}` and MCP
+`update_guardian_rule` refuse a rule whose stored version is already at 2147483647 (`409` on REST,
+`-32602` on MCP) instead of overflowing the version bump.
+
+A negative `since` or `until` is refused as well (`400`, `-32602` on MCP) on the legacy `GET
+/api/audit`, MCP `query_audit_log` and `GET /api/v1/execution-statistics/definitions`/`agents`
+(`since`): the store applies a bound only above zero, so `-3600` used to mean no bound and returned
+the whole log or statistics set. `0`, or omitting the parameter, still means no bound.
+`GET /api/v1/audit` takes no `since`/`until` and is unchanged.
+
+Still lenient, and not an exhaustive list: the dashboard fragments' own page-size helpers and the
+verify fragment's `parse_window`, the notification, webhook and offload delivery list routes, the
+DEX signal list `limit`, the pre-flight run list `limit`, the network quality `limit`
+(`network_routes.cpp`), the software-inventory `limit` read in `inventory_routes.cpp` and the
+hardware routes' `await_since`/`n`/chart parameters (`hardware_routes.cpp`), and the live-snapshot
+`n` attempt counters elsewhere.
+
+**What to do.** Send whole integers, and omit a parameter to get its default. No configuration or
+data migration is needed. During a rolling upgrade, replicas on the old and new build answer a
+malformed value differently (`200` versus `400`).
+
+## Breaking: per-agent execution statistics are confined to the caller's scope (#3526)
+
+`GET /api/v1/execution-statistics/agents` and the MCP tool `get_execution_statistics_by_agent` used
+to gate on a bare `Execution:Read` check and return one row per agent across every execution of every
+operator, so a management-group-confined operator saw agents outside its groups. They now go through
+the same admit-then-filter fleet-read gate as `GET /api/v1/executions` (ADR-0017): a confined caller
+sees only the rows of the agents it can see, applied in the query before the row limit, and a caller
+with unrestricted read sees what it saw before.
+
+- **Fewer rows for a confined operator** is the intended effect; a script that totalled the fleet
+  from this route as a confined user will now get its own scope's total.
+- **A service-scoped API token on the REST route** used to be refused (`403`) by the bare gate. It is
+  now admitted as a confined view (only the agents tagged for its service), the same as the other
+  fleet-read routes, provided RBAC enforcement is on and the minting principal holds `Execution:Read`;
+  a degraded tag store answers `503`. The MCP tool still denies service-scoped tokens. Widening that
+  is a separate decision, not made here.
+- `GET /api/v1/execution-statistics/definitions` and the fleet summary carry no agent identity and
+  keep the plain `Execution:Read` gate (the summary's `active_agents` is a fleet-wide count).
+  `GET /fragments/executions` remains an open gap tracked in #3526.
+- A negative `since` on `/agents` and `/definitions` is `400` (see the previous section).
+
+During a rolling upgrade, replicas on the old and the new build return different row sets to a
+confined caller.
+
 ## Behaviour change: a cut visualization, results fragment or TAR scan is reported (#4644)
 
 The execution visualization route (`GET /api/v1/executions/{id}/visualization`), the dashboard

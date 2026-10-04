@@ -14482,6 +14482,18 @@ void RestApiV1::register_routes(
         row.rule_id = body.value("rule_id", "");
         row.name = body.value("name", "");
         row.version = body.value("version", int64_t{1});
+        // An update bumps the stored version by one and the agent push casts it to uint64,
+        // so the accepted range is bounded here (and again in create_rule) the same way the
+        // MCP create tool bounds it.
+        if (!rule_version_in_range(row.version)) {
+            res.status = 400;
+            res.set_content(detail::error_json_a4(400, "version must be an integer from 1 to 2147483647",
+                                                  cid, "omit version (it defaults to 1) or send 1..2147483647"),
+                            "application/json");
+            audit_fn(req, "guaranteed_state.rule.create", "denied", "GuaranteedState", row.rule_id,
+                     "version out of range");
+            return;
+        }
         row.enabled = body.value("enabled", true);
         row.enforcement_mode = body.value("enforcement_mode", std::string{"enforce"});
         row.severity = body.value("severity", std::string{"medium"});
@@ -14836,6 +14848,18 @@ void RestApiV1::register_routes(
                  updated.severity = body.value("severity", updated.severity);
                  updated.os_target = body.value("os_target", updated.os_target);
                  updated.scope_expr = body.value("scope_expr", updated.scope_expr);
+                 if (rule_version_exhausted(existing_rule.version)) {
+                     // Reachable only for a row stored before the version bound existed or
+                     // written out of band; refuse rather than overflow the signed increment.
+                     res.status = 409;
+                     res.set_content(
+                         detail::error_json_a4(409, "rule version counter exhausted", cid,
+                                               "create a new rule instead of updating this one"),
+                         "application/json");
+                     audit_fn(req, "guaranteed_state.rule.update", "denied", "GuaranteedState", id,
+                              "rule version counter exhausted");
+                     return;
+                 }
                  updated.version = existing_rule.version + 1;
 
                  // A structured body re-authors the Guard (contract §8): re-derive the

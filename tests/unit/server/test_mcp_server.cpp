@@ -5002,6 +5002,42 @@ TEST_CASE("MCP Guardian: update_guardian_rule bumps version and rejects an "
     CHECK(ts.audit_log.back() == "guaranteed_state.rule.update|denied");
 }
 
+// Same exhausted-counter guard as REST: a row stored at the bound (or written out of band)
+// must refuse the bump with -32602 and a denied audit row, never overflow the increment.
+TEST_CASE("MCP Guardian: update_guardian_rule refuses an exhausted version counter",
+          "[pg][mcp][integration][guardian]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_read_twins_pg_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    mcp_seed_rule(store, "r-exh", "rule-exhausted");
+    {
+        yuzu::server::pg::PgConn conn{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        auto r = yuzu::server::pg::exec_params(
+            conn.get(),
+            "UPDATE guaranteed_state_store.guaranteed_state_rules SET version = "
+            "9223372036854775807 WHERE rule_id = 'r-exh'",
+            std::vector<std::string>{});
+        REQUIRE(r.status() == PGRES_COMMAND_OK);
+    }
+    McpTestServer ts;
+    ts.guaranteed_state_store_for_test = &store;
+    ts.start("");
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":208,"params":{"name":"update_guardian_rule",)"
+        R"("arguments":{"rule_id":"r-exh","severity":"high"}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == kInvalidParams);
+    CHECK(body["error"]["message"].get<std::string>().find("counter exhausted") !=
+          std::string::npos);
+    auto stored = store.get_rule("r-exh");
+    REQUIRE(stored.has_value());
+    REQUIRE(stored->has_value());
+    CHECK((*stored)->version == std::numeric_limits<int64_t>::max()); // untouched
+}
+
 TEST_CASE("MCP Guardian: update_guardian_rule denies a service-scoped token",
           "[mcp][integration][guardian][security]") {
     McpTestServer ts;
