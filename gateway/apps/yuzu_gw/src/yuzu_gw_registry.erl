@@ -102,7 +102,6 @@ register_agent(AgentId, Pid, SessionId, Plugins, Hostname, RegisterReq) ->
 %% heartbeat for SessionId only on that connection. The /5 and /6 forms
 %% register with `undefined', which admits nothing. A session id of
 %% `undefined' is not indexed at all.
--spec register_agent(binary(), pid(), binary() | undefined,
 %%
 %% Never exits the caller: a registry that is not running, stalls past the call
 %% timeout or dies serving the call gives `{error, registry_unavailable}'. The
