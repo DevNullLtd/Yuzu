@@ -662,7 +662,10 @@ ingest is failing. Four further series sharpen the picture:
   heartbeating whose `source` skipped its latest collection cycle(s), from the agent
   heartbeat tag `yuzu.sync.<source>.skip_streak`. The cause is the device's
   `yuzu.sync.<source>.last_skip` tag and the agent's `sync: … — skipping this cycle`
-  warning. Published every sweep, 0 included.
+  warning. Published every sweep, 0 included. The gauge only counts agents that emit the
+  skip-streak heartbeat tag: an agent that does not emit it (older agents, during a
+  rollout, or in a mixed-version fleet) contributes zero even when its collector is
+  skipping, so a zero gauge does not establish that all collectors are healthy.
 - `yuzu_inventory_ingest_dropped_total{reason}` (counter, reason ∈ `store_not_open` /
   `pool_acquire_timeout` / `query_error` / `invalid_key` / `stale`) — generic-store
   (ADR-0037) upsert calls that did not persist. Ingest is fail-soft (the next

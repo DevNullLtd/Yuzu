@@ -2219,12 +2219,11 @@ public:
                           "when none; at most 64 named labels, the rest under plugin=other)",
                           "gauge");
         metrics_.describe("yuzu_fleet_inventory_sync_skipping",
-                          "Agents currently reporting heartbeats whose daily-sync source skipped its "
-                          "most recent collection cycle(s) (heartbeat tag "
-                          "yuzu.sync.<source>.skip_streak > 0), by source. Correlate with "
-                          "yuzu_inventory_stale_agents to tell an online host whose collector is "
-                          "skipping from an offline one; the two count different populations (live "
-                          "heartbeats vs stored-receipt age), so never subtract one from the other",
+                          "Agents currently reporting heartbeats whose daily-sync source skipped "
+                          "its latest collection cycle(s) (heartbeat tag "
+                          "yuzu.sync.<source>.skip_streak > 0), by source; correlate with "
+                          "yuzu_inventory_stale_agents, never subtract (different populations, "
+                          "see metrics.md)",
                           "gauge");
         metrics_.describe("yuzu_fleet_agents_dex_observer_disarmed",
                           "Windows agents (DEX enabled) reporting their DEX signal observer is not "
