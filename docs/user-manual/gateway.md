@@ -873,9 +873,12 @@ upgraded, read the new gateway counters:
   - `not_local`: the server named sessions this node does not hold (they are
     never replayed). INFERRED: this happens when an agent left this node, or
     changed session, after its heartbeat was buffered and before the verdict was
-    handled. No action; informational. If it stays high while agents stay
-    offline, look at agent reconnect churn (`yuzu_gw_heartbeat_rejected_total`,
-    the agent log) rather than at the replay.
+    handled. No action; informational, with one exception: if it rises after a
+    `Registration replay aborted: registry unavailable` WARN, those agents are
+    not coming back through the replay (see that row above), and released agents
+    need an agent service restart (see "Agent dependency" below). If it stays
+    high while agents stay offline, look at agent reconnect churn
+    (`yuzu_gw_heartbeat_rejected_total`, the agent log) rather than at the replay.
   - `circuit_open`: the upstream circuit breaker was open when the verdict
     arrived; the sessions are listed again by later heartbeats. Wait for the
     breaker (see the breaker rows above); do not restart.
@@ -883,7 +886,8 @@ upgraded, read the new gateway counters:
     sessions are listed again by later heartbeats (INFERRED), so first wait and
     watch `yuzu_gw_registration_replay_queue_depth` fall. If it recurs at your
     normal fleet size, raise the key in the `yuzu_gw` section of `sys.config`
-    and restart the gateway (the key is read at start).
+    and restart the gateway (the key is read at start). A gateway restart
+    disconnects every agent it holds, so read "Upgrade day" above first.
   - `malformed`: an id the gateway could not use as a session id (not a binary
     of 1 to 64 bytes). Expected to stay at 0, because the server does not list
     over-length ids. No gateway-side action; a sustained non-zero count means the
