@@ -47,7 +47,7 @@ Each plugin that has adopted the README standard (`docs/plugin-readme-standard.m
 | `netprobe` | ✅ ✅ ✅ | Active network measurement: ICMP/TCP round-trip time, jitter, loss, and DNS resolution timing to operator-chosen targets | [README](../../agents/plugins/netprobe/README.md) |
 | `netstat` | ✅ ✅ ✅ | Enumerates active network connections and listening sockets | [README](../../agents/plugins/netstat/README.md) |
 | `network_actions` | ✅ ✅ ✅ | Network actions — DNS flush and ping | [README](../../agents/plugins/network_actions/README.md) |
-| `network_config` | ✅ ✅ ✅ | Reports network adapter configuration, IP addresses, DNS servers, and proxy settings | [README](../../agents/plugins/network_config/README.md) |
+| `network_config` | ✅ ✅ ✅ | Reports network adapter configuration, IP addresses, DNS servers, proxy settings, and the routing table | [README](../../agents/plugins/network_config/README.md) |
 | `network_diag` | ✅ ✅ ✅ | Network diagnostics — listening ports and established connections | [README](../../agents/plugins/network_diag/README.md) |
 | `os_info` | ✅ ✅ ✅ | Reports OS name, version, build, architecture, and system uptime | [README](../../agents/plugins/os_info/README.md) |
 | `peripherals` | ✅ ✅ ✅ | USB, PCI and Thunderbolt/USB4 device inventory | [README](../../agents/plugins/peripherals/README.md) |

@@ -433,6 +433,8 @@ agent_test_exe = executable(
     'unit/test_discovery_scan_plan.cpp',      # Wave 2 WP-C: pure sweep bounds + honest-degrade decisions
     'unit/test_network_config_parsers.cpp',   # PKG-NC: pure /proc/net/arp, dns_cache line filters,
                                                 # rtnetlink + PF_ROUTE default-route binary decoders
+    'unit/test_network_config_routes.cpp',    # Wave 11 PR11.2-a: `routes` row format + rtnetlink/PF_ROUTE
+                                                # full-table decoders (real-capture fixtures)
     'unit/test_network_config_local_dispatcher.cpp', # PKG-NC: real network_config.dylib/.so driven
                                                 # end to end via LocalDispatcher (POSIX-only; a no-op
                                                 # TU on Windows via the file's own #ifndef _WIN32 guard)
@@ -2663,6 +2665,15 @@ test('changelog order',
 test('capability catalogue completeness',
   _python3_test,
   args: [files('test_capability_catalogue_complete.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
+# Wave 11 PR11.2-a: the network_config `routes` instruction definition exists and matches the
+# row the plugin emits (id, dispatch pair, approval mode, platforms, ordered columns). Hermetic.
+test('network_config routes definition',
+  _python3_test,
+  args: [files('test_network_config_routes_definition.py')],
   suite: 'docs',
   timeout: 30,
 )
