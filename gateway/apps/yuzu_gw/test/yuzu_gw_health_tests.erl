@@ -38,7 +38,7 @@ setup() ->
     MockPids = lists:filtermap(fun(Name) ->
         case whereis(Name) of
             undefined ->
-                Pid = spawn_link(fun() -> mock_loop() end),
+                Pid = spawn_link(mock_for(Name)),
                 register(Name, Pid),
                 {true, {Name, Pid, true}};  % true = we own it
             _Existing ->
@@ -97,6 +97,10 @@ cleanup({_Port, HealthPid, UpPid, NeedUpstream, MockPids}) ->
     timer:sleep(50),
     ok.
 
+%% The registry stand-in also owns the session index table readiness checks.
+mock_for(yuzu_gw_registry) -> fun yuzu_gw_test_registry:mock_registry_loop/0;
+mock_for(_Name)            -> fun mock_loop/0.
+
 mock_loop() ->
     receive
         stop -> ok;
@@ -125,6 +129,7 @@ readyz_ok() ->
     ?assert(binary:match(Body, <<"ready">>) =/= nomatch),
     %% Core checks should be true
     ?assert(binary:match(Body, <<"\"registry\":true">>) =/= nomatch),
+    ?assert(binary:match(Body, <<"\"sessions_index\":true">>) =/= nomatch),
     ?assert(binary:match(Body, <<"\"upstream\":true">>) =/= nomatch),
     ?assert(binary:match(Body, <<"\"circuit_breaker\":true">>) =/= nomatch).
 

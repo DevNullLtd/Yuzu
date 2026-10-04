@@ -302,7 +302,7 @@ used as-is — they aren't renames, so they create no split-brain.
   Engine + deliver via `agent_registry.send_to()`, reusing the instruction-dispatch path)
   → typed `push` →
   agent: parse typed proto (no YAML), **Registry Spark** (`RegNotifyChangeKeyValue` +
-  `WaitForMultipleObjects`, lift `trigger_engine.cpp:365-463`), minimal evaluator
+  `WaitForMultipleObjects`, lift `TriggerEngine::registry_watch_loop()` in `trigger_engine.cpp`), minimal evaluator
   (`registry-value-equals`), emit `drift.detected` →
   agent→server drain via an **event-sink** wired in `agent.cpp` — writes
   `CommandResponse{plugin:"__guard__", action:"event", payload:<GuaranteedStateEvent>}`

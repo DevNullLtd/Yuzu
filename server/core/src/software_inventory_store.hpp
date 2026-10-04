@@ -65,11 +65,12 @@ namespace yuzu::server {
 /// stamped on every Linux row from /etc/os-release.
 struct SoftwareEntry {
     std::string name;
-    std::string version; // upstream version, release/revision stripped (v2)
+    std::string version; // upstream version, release/revision stripped (v2); for
+                         // ecosystem optional_feature, the DISM feature state
     std::string publisher; // rpm PACKAGER / deb Maintainer / Windows Publisher
     std::string install_date;
-    std::string kind;      // "package" | "app"
-    std::string ecosystem; // rpm|deb|apk|pacman|windows|macos|homebrew
+    std::string kind;      // "package" | "app" | "pkg" | "feat" (agent-side vocabulary)
+    std::string ecosystem; // rpm|deb|apk|pacman|windows|macos|macos_pkgutil|brew|optional_feature
     std::string epoch;
     std::string release;   // rpm RELEASE / deb revision / apk pkgrel
     std::string arch;

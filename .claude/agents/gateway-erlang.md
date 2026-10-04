@@ -63,9 +63,9 @@ command -v erl >/dev/null || { echo "Erlang missing"; exit 1; }
 
 cd gateway
 rebar3 compile                                                           # compile only
-rebar3 eunit --dir apps/yuzu_gw/test                                     # unit tests (current expected: 148)
+rebar3 eunit --dir apps/yuzu_gw/test                                     # unit tests (the summary line must show more than 0 passed)
 rebar3 dialyzer                                                          # MANDATORY after any .erl change
-rebar3 ct --dir apps/yuzu_gw/test --suite yuzu_gw_integration_SUITE      # integration (no real upstream)
+rebar3 ct --dir apps/yuzu_gw/test/ct --suite yuzu_gw_integration_SUITE      # integration (no real upstream)
 rebar3 ct --dir apps/yuzu_gw/integration_test --suite=yuzu_gw_real_upstream_SUITE  # needs YUZU_GW_TEST_TOKEN + live server
 ```
 
@@ -94,7 +94,7 @@ For real isolation, either `rm -rf gateway/_build/test` between runs, or drop in
   - `yuzu_gw_agent_handler.erl` — Per-agent connection process
   - `yuzu_gw_upstream.erl` — Server-side gRPC client
   - `yuzu_gw_metrics.erl` — Prometheus metrics
-- `gateway/apps/yuzu_gw/test/` — Standard CT suites (no external prerequisites)
+- `gateway/apps/yuzu_gw/test/` — EUnit test modules; the standard CT suites (no external prerequisites) are in its `ct/` subdirectory
 - `gateway/apps/yuzu_gw/integration_test/` — CT suites that require a real running upstream + enrollment token
 - `gateway/rebar.config` — Build and dependency configuration
 - `docs/erlang-gateway-blueprint.md` — Architecture reference
@@ -279,7 +279,8 @@ factorial(0) -> 1.
 | `ctx` dependency | `ctx:background/0` is a transitive dep of `grpcbox` but called directly; dialyzer can't find it in the PLT | List `ctx` in `yuzu_gw.app.src` `applications`. **Rule: if you call a function from a transitive dep, add it to applications.** |
 | `prometheus_httpd` | `start/1` does not exist | Use `start/0` with `application:set_env` |
 | `prometheus_httpd` | First scrape returns 500 | Call `application:ensure_all_started(prometheus_httpd)` before first scrape |
-| `rebar3 ct` | Suite not found | Always pass `--dir apps/yuzu_gw/test` with `--suite` flags |
+| `prometheus_text_format` | EVERY scrape returns 500 (`badarg` in `escape_string/2`) | A charlist element > 255 (e.g. an em dash in UTF-8 source) in a metric `{help, ...}` string or a charlist label value (#4707, #5177) — keep HELP text ASCII-only |
+| `rebar3 ct` | Suite not found, or `All 0 tests passed.` with rc 0 | Always pass `--dir apps/yuzu_gw/test/ct` — CT suites live there and ct does not recurse, so `--dir apps/yuzu_gw/test` (or no `--dir`) silently runs zero suites (#4800) |
 | `gen_server:stop` vs `exit(Pid, shutdown)` | `exit(Pid, shutdown)` is async; `timer:sleep(50)` guesses are racy on WSL2 | Use synchronous `gen_server:stop(Pid, shutdown, 5000)` in test cleanup (#336) |
 | `spawn_monitor` inside gen_server handle_cast | Child processes outlive their parent gen_server after `exit/shutdown`, continue running mocked RPCs, leak log lines into later test modules | `gen_server:stop` (which calls `terminate/2` and waits) is still only half the fix — if handlers spawn unlinked children, the cleanup must track and kill them explicitly |
 | Proto compat | Erlang gpb vs C++ protoc | Validate field numbers and types match across both codegen outputs |
@@ -318,7 +319,7 @@ When reviewing another agent's Change Summary:
 - [ ] New gateway modules use OTP behaviors
 - [ ] Supervisor child specs have correct restart strategies
 - [ ] ETS table access patterns are concurrent-safe
-- [ ] Tests use Common Test with `--dir apps/yuzu_gw/test` (or `--dir apps/yuzu_gw/integration_test` for real-upstream suites)
+- [ ] Common Test invocations pass `--dir apps/yuzu_gw/test/ct` (or `--dir apps/yuzu_gw/integration_test` for real-upstream suites); `ct` does not recurse, so `--dir apps/yuzu_gw/test` runs zero suites and passes (#4800)
 - [ ] Eunit invocations pass `--dir apps/yuzu_gw/test` (#337 workaround)
 - [ ] `rebar3 dialyzer` was run and is clean — not just `rebar3 compile`
 - [ ] prometheus_httpd pitfall handled correctly

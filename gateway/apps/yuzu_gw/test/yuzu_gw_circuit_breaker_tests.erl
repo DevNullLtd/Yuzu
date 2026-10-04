@@ -68,6 +68,29 @@ trip_circuit() ->
     _ = yuzu_gw_upstream:proxy_register(#{info => #{}}),
     ?assertEqual(open, yuzu_gw_upstream:circuit_state()).
 
+%% The open -> half_open transition is driven by an erlang:send_after timer in
+%% yuzu_gw_upstream (the 200ms reset timeout set in setup), so on a loaded
+%% runner the timer can fire late, or its message can queue behind this test's
+%% circuit_state call. A fixed `timer:sleep(350)` then `half_open` check is an
+%% UPPER-bound race of the kind that flaked on the first macOS CI runs (#4841,
+%% #4851; BigMags shares its CPU between two agents, and macOS coalesces
+%% background timers). Poll every 10ms up to a 2s deadline instead. These tests
+%% only claim the transition happens, not when, so the deadline changes
+%% nothing they assert (the backoff AMOUNTS are pinned in
+%% yuzu_gw_circuit_breaker_nf_tests).
+await_state(Want) ->
+    poll_state(Want, erlang:monotonic_time(millisecond) + 2000).
+
+poll_state(Want, Deadline) ->
+    case yuzu_gw_upstream:circuit_state() of
+        Want -> Want;
+        Other ->
+            case erlang:monotonic_time(millisecond) >= Deadline of
+                true -> Other;
+                false -> timer:sleep(10), poll_state(Want, Deadline)
+            end
+    end.
+
 %%%===================================================================
 %%% Tests
 %%%===================================================================
@@ -106,15 +129,13 @@ rejects_when_open() ->
 
 transitions_to_half_open() ->
     trip_circuit(),
-    %% Wait for the reset timeout (200ms) + margin
-    timer:sleep(350),
-    ?assertEqual(half_open, yuzu_gw_upstream:circuit_state()).
+    %% Wait for the timer-driven half_open (200ms reset timeout).
+    ?assertEqual(half_open, await_state(half_open)).
 
 closes_on_probe_success() ->
     trip_circuit(),
-    %% Wait for half_open
-    timer:sleep(350),
-    ?assertEqual(half_open, yuzu_gw_upstream:circuit_state()),
+    %% Wait for the timer-driven half_open.
+    ?assertEqual(half_open, await_state(half_open)),
     %% Make the probe succeed
     meck:expect(grpcbox_client, unary, fun(_, _, _, _, _) ->
         {ok, #{session_id => <<"recovered">>}, #{}}
@@ -124,9 +145,8 @@ closes_on_probe_success() ->
 
 reopens_on_probe_failure() ->
     trip_circuit(),
-    %% Wait for half_open
-    timer:sleep(350),
-    ?assertEqual(half_open, yuzu_gw_upstream:circuit_state()),
+    %% Wait for the timer-driven half_open.
+    ?assertEqual(half_open, await_state(half_open)),
     %% Probe fails — should reopen
     {error, _} = yuzu_gw_upstream:proxy_register(#{info => #{}}),
     ?assertEqual(open, yuzu_gw_upstream:circuit_state()).
