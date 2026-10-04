@@ -1307,7 +1307,10 @@ previous gateway (the only new state is the in-memory index; derived from the ch
 gateway reads `unknown_session_ids` and `unknown_session_ids_truncated` from every successful
 `BatchHeartbeatResponse` and replays exactly the sessions it still holds through the existing
 registration-replay drip. The 2026-10-01 update above describes the state before this change (the
-consumer was pending) and is left as written; the wire is unchanged and no server code changes.
+consumer was pending) and is left as written; the wire is unchanged and no server code changes. The
+"known limitation under Server-Side Setup" cited in the #10 correlation bullet earlier in this section is
+likewise superseded: that gateway manual note is replaced by "What happens when the server restarts", and on
+one core replica a server-only restart now recovers through the replay described here.
 - **Mechanism.** `yuzu_gw_heartbeat_buffer` validates the listed ids (non-empty binaries of at most 64
   bytes, de-duplicated, at most 4096), counts what it drops as malformed, and casts the rest to
   `yuzu_gw_upstream:replay_sessions/1`. A flush never feeds the circuit breaker; the only coupling is that

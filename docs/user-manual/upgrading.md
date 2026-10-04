@@ -22,7 +22,7 @@ This guide covers upgrading Yuzu components (server, agent, gateway) between ver
 | 0.13.x | 0.12.0 | 0.12.0 | **Fleet visualization process layer.** `/viz/fleet` now renders interior process dots inside each machine cube, coloured by category (system/browser/database/web/runtime/other) — no operator action required, but operators upgrading from a 0.12.x build will see the dashboard suddenly populated with thousands of small spheres on next page load. Process data was already collected via `tar.fleet_snapshot` since 0.12.x; PR 7 only renders it. To suppress process visibility for specific agents (privacy-sensitive hosts, regulated workloads), set `process_enabled=false` on those agents via `tar.configure` — this also suppresses their dots on the visualization. Hover a dot to see pid/name/user/category; agent-controlled string fields are HTML-escaped and length-clamped before render. Per-cube dot count is soft-capped at 1000 for graceful degradation on heavily-threaded hosts; the cube tooltip still shows the true reported count. |
 | 0.12.x | 0.12.0 | 0.12.0 | **Build-time content auto-import.** All YAML files in `content/definitions/` (217 InstructionDefinitions) and `content/packs/` (10 InstructionSets at this version) are now embedded in the server binary and auto-imported on every startup. Existing operator-customised definitions with matching IDs are NEVER overwritten — conflicts are silently skipped. **Behaviour change for upgrades:** definitions that an operator previously DELETED via the REST API or dashboard will reappear after upgrade because the auto-import treats a missing row as "needs creation". To permanently suppress a shipped definition, set `enabled: false` via the dashboard or `PATCH /api/v1/definitions/{id}` rather than DELETE-ing the row. Each auto-import write emits an `audit_events.action="content.bundled_import"` row with `principal=system` so operators can audit which definitions were inserted at boot. **Yuzu dark navy palette + Inter webfont** (visual change every operator sees) and **Apache ECharts chart renderer** (replaces bespoke SVG; same payload contract — no operator migration required) ship in the same release. |
 
-**Rule of thumb:** agents and gateway should be the same minor version as the server, or one minor version behind. The server is always upgraded first. Upgrading the server first restarts it while gateways stay connected, which is the scenario in the known limitation under [Server-Side Setup](gateway.md#server-side-setup). That limitation was observed on one local rig after a SIGKILL restart (graceful upgrade restarts were not tested): agents behind a gateway can read offline, and dispatch worked only for the remaining route lease (up to about 90 s). The gateway-side fix is tracked in #1197.
+**Rule of thumb:** agents and gateway should be the same minor version as the server, or one minor version behind. The server is always upgraded first. Upgrading the server first restarts it while gateways stay connected. A gateway at this version re-registers the sessions the server reports unknown, so a server-only restart recovers without operator action once both sides are upgraded; see [What happens when the server restarts](gateway.md#what-happens-when-the-server-restarts). Behind a gateway that does not yet read that report, agents can read offline after a server restart (observed on one local rig after a SIGKILL restart; graceful upgrade restarts were not tested), and dispatch worked only for the remaining route lease (up to about 90 s). An agent the gateway disconnects has to register again by itself; the same section covers that agent dependency.
 
 ## Operator note: the software-inventory store migration (v7) is a hard cutover (#5172)
 
@@ -3110,7 +3110,7 @@ genuine read-only dry run, matching its documented `readOnlyHint: true`.
 
 Always upgrade in this order:
 
-1. **Server** -- new server versions accept connections from older agents. Restarting the server while a gateway stays connected has a known limitation: see [Server-Side Setup](gateway.md#server-side-setup) (a gateway-only restart as a remedy was not tested)
+1. **Server** -- new server versions accept connections from older agents. A server-only restart while a gateway stays connected recovers without operator action once the gateway is also at this version; see [What happens when the server restarts](gateway.md#what-happens-when-the-server-restarts) (an older gateway keeps the previous behaviour described there)
 2. **Gateway** -- updated to match server protocol changes
 3. **Agents** -- can be upgraded via OTA or manually, in batches
 
@@ -3415,7 +3415,7 @@ Start-Service yuzu-server  # or start manually
 
 ## Upgrading the Gateway
 
-If the server was restarted while this gateway stayed connected, see the known limitation under [Server-Side Setup](gateway.md#server-side-setup) first; whether restarting only the gateway recovers it was not tested.
+If the server was restarted while this gateway stayed connected, see [What happens when the server restarts](gateway.md#what-happens-when-the-server-restarts) first: a gateway at this version re-registers the sessions the server reports unknown, and an older gateway needs this upgrade to do so.
 
 ### Linux (systemd)
 
