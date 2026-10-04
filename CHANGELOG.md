@@ -14,7 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 > `Changelog fragments` CI check). Entries below predate the fragment
 > convention and will be promoted normally at the next release.
 
-## [0.14.0] - 2026-09-29
+## [0.14.0] - 2026-10-03
 
 ### Added
 
