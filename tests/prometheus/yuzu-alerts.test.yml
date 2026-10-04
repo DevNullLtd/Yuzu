@@ -2392,10 +2392,25 @@ tests:
         eval_time: 25m
         exp_samples: []
 
-  # CASE 62b -- a real targeting mistake still fires alongside BOTH excluded
-  # reasons on the same route, so neither exclusion widened into a silencer.
+  # CASE 61c -- #5294: a dispatch withheld because the per-OS kill switch is
+  # off is an operator's own policy at work, not a targeting mistake: silent.
   - interval: 1m
-    name: dispatch target rejected - a real targeting mistake still fires alongside both exclusions
+    name: dispatch target rejected - kill-switched-os withholdings never fire the targeting alert
+    input_series:
+      - series: 'yuzu_server_dispatch_target_rejected_total{job="yuzu",instance="s1",route="command",reason="kill_switched_os"}'
+        values: "0 0 0 40x30"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuDispatchTargetRejected"}'
+        eval_time: 10m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuDispatchTargetRejected"}'
+        eval_time: 25m
+        exp_samples: []
+
+  # CASE 62b -- a real targeting mistake still fires alongside ALL THREE excluded
+  # reasons on the same route, so no exclusion widened into a silencer.
+  - interval: 1m
+    name: dispatch target rejected - a real targeting mistake still fires alongside all three exclusions
     input_series:
       - series: 'yuzu_server_dispatch_target_rejected_total{job="yuzu",instance="s1",route="command",reason="agent_ids_empty"}'
         values: "0 0 0 0+1x30"
@@ -2403,13 +2418,15 @@ tests:
         values: "0 0 0 40x30"
       - series: 'yuzu_server_dispatch_target_rejected_total{job="yuzu",instance="s1",route="command",reason="unknown_plugin"}'
         values: "0 0 0 40x30"
+      - series: 'yuzu_server_dispatch_target_rejected_total{job="yuzu",instance="s1",route="command",reason="kill_switched_os"}'
+        values: "0 0 0 40x30"
     promql_expr_test:
       - expr: 'ALERTS{alertname="YuzuDispatchTargetRejected", alertstate="firing"}'
         eval_time: 20m
         exp_samples:
           - labels: 'ALERTS{alertname="YuzuDispatchTargetRejected", alertstate="firing", route="command", reason="agent_ids_empty", severity="warning"}'
             value: 1
-      - expr: 'sum by (route, reason) (increase(yuzu_server_dispatch_target_rejected_total{reason!~"quarantined|unknown_plugin"}[15m]))'
+      - expr: 'sum by (route, reason) (increase(yuzu_server_dispatch_target_rejected_total{reason!~"quarantined|unknown_plugin|kill_switched_os"}[15m]))'
         eval_time: 20m
         exp_samples:
           - labels: '{route="command", reason="agent_ids_empty"}'
