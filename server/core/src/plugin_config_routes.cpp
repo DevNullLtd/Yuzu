@@ -338,7 +338,8 @@ void register_plugin_config_routes(HttpRouteSink& sink, Deps deps) {
                 const std::string os = req.has_param("os") ? req.get_param_value("os") : "";
                 const auto scope = plugin_config::parse_kill_switch_scope(plugin, action, os);
                 // Present-but-empty `?os=` must not silently target the all-OS row.
-                if ((req.has_param("os") && os.empty()) || !scope || !plugin_config::is_valid_reason(reason) ||
+                if ((req.has_param("os") && os.empty()) || !scope ||
+                    !plugin_config::is_valid_reason(reason) ||
                     !plugin_config::is_valid_actor(actor(*session))) {
                     write_store_error(res, PluginConfigStore::Error::InvalidInput);
                     return;

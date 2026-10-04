@@ -48,12 +48,12 @@ plugin and action rows read back unchanged, so nothing flips on upgrade.
 - **Limits.** An agent whose OS is unknown or empty is never withheld. The OS is what the agent
   reports and is matched exactly (`windows`, `linux`, `darwin`). The MCP pre-dispatch dry run cannot
   see the per-OS layer. Remote agents (connected through another replica) rely on the presence
-  snapshot,.
+  snapshot.
 - **Integrations.** MCP clients should key on `status`, tolerate unknown fields and re-fetch
   `tools/list`. `execute_instruction` has two new `status` values (`kill_switched_os`,
   `os_gate_unreadable`) and its output schema now requires `agents_kill_switched_os` in every
-  zero-reach branch. The kill-switch REST responses gain additive `os`, `source` and
-  `withheld_kill_switched_os` fields.
+  zero-reach branch. The kill-switch REST responses gain additive `os` and `source` fields,
+  and the `/api/command` response gains `withheld_kill_switched_os`.
 
 ## Behaviour change: DEX device score and management-group member reads now fail closed on a degraded read (#4855, #1762)
 
