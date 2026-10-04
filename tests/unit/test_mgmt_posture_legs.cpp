@@ -175,6 +175,16 @@ TEST_CASE("L9 sssd.conf without [sssd] domains is constrained, rows kept", "[mgm
     CHECK(p.rows.size() == 5);
 }
 
+TEST_CASE("L9b an sssd.conf with an embedded NUL is constrained, never a clean none",
+          "[mgmt_posture]") {
+    // MUTATION: dropping the NUL check reports `supported` + `plane|none` for a corrupt file.
+    FakeFs f;
+    f.files[kSssdConf] = ok(std::string("[sssd]\ndomains = corp\0junk\n", 28));
+    const auto p = f.run();
+    expect(p, StatusState::constrained, "linux:mgmt_posture:sssd_conf:invalid_bytes");
+    CHECK(p.rows.size() == 5);
+}
+
 TEST_CASE("L10 a refused IPA default.conf is only constrained", "[mgmt_posture]") {
     FakeFs f;
     f.files[kIpaConf] = fail(EACCES);

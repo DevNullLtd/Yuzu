@@ -81,8 +81,9 @@ public:
 
     int execute(yuzu::CommandContext& ctx, std::string_view action,
                 yuzu::Params /*params*/) override {
-        // Every failure-token literal matches
-        // ^(windows|macos|linux):[a-z0-9_]+(:[a-z0-9_]+)*$; the body is execute_posture.
+        // Every failure-token literal matches ^(windows|macos|linux|subprocess_runner):[a-z0-9_]+
+        // (:[a-z0-9_]+)*$ (subprocess_runner:* come from the shared runner classifier); the body
+        // is execute_posture.
 #if defined(_WIN32)
         return yuzu::mgmt_posture::execute_posture(ctx, action, &yuzu::mgmt_posture::run_windows,
                                                    kLegExceptionToken);

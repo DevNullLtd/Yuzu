@@ -257,6 +257,10 @@ inline Posture posture_linux(const LinuxFs& fs) {
 
     std::optional<SssdFacts> sssd;
     if (sssd_present) {
+        // An embedded NUL means the file is not the text SSSD reads; a corrupt config must not
+        // pass as a clean `none`.
+        if (text.find('\0') != std::string::npos)
+            acc.add_failure("linux:mgmt_posture:sssd_conf:invalid_bytes");
         sssd = sssd_facts(parse_ini(text));
         if (!sssd->domains_key_present)
             acc.add_failure("linux:mgmt_posture:sssd_conf:no_domains_key");
