@@ -88,6 +88,15 @@ register_upstream(Ctx, RegisterReq, PeerAddr, Reservation) ->
                 ok ->
                     logger:info("Agent ~s registered, awaiting Subscribe", [AgentId]),
                     {ok, Response, Ctx};
+                {error, superseded} ->
+                    %% A newer Register of this agent id on the connection
+                    %% committed first: this session will never be matched by
+                    %% Subscribe, and the registry is healthy. The agent retries
+                    %% on any non-OK status; UNAVAILABLE is the retryable class
+                    %% (the session cap answers it too), not a server fault.
+                    logger:info("Register superseded by a newer registration"),
+                    {grpc_error, {?GRPC_STATUS_UNAVAILABLE,
+                                  <<"Registration superseded by a newer registration">>}};
                 {error, registry_unavailable} ->
                     %% The registry is not running: the session cannot be
                     %% matched by Subscribe, so the agent must register again.

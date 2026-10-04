@@ -47,12 +47,19 @@
 %%% server. store_pending/3 then makes the reservation the pending row in one
 %%% call to this process (commit_pending), which also supersedes the agent's older
 %%% committed rows there, so concurrent same-agent Registers end with exactly one
-%%% pending row (the newest committed). A commit whose own row is gone (the
-%%% registry restarted since the insert), or is itself superseded by a newer
-%%% committed row, answers {error, registry_unavailable} and leaves no row of its
-%%% own, so no caller is told ok for a row that is not there. The reservation is released by the caller
-%%% when the proxied Register fails (release_session/1) and by the TTL sweep when
-%%% the caller died; a stored pending row is released by Subscribe or its TTL.
+%%% pending row (the newest committed). A commit that is itself superseded by a
+%%% newer committed row, or whose own row a newer commit of the same agent already
+%%% removed, answers {error, superseded} and leaves no row of its own: the registry
+%%% is healthy, the agent's newer Register won, and the handler answers a retryable
+%%% status. A commit whose own row is gone with no committed row of the agent there
+%%% (the registry restarted since the insert) and a registry that cannot be reached
+%%% (a missing table, a timeout) answer {error, registry_unavailable}. So no caller
+%%% is told ok for a row that is not there AT COMMIT TIME: afterwards the row can
+%%% be taken by Subscribe, swept after its TTL or removed with a dead connection,
+%%% which is the later life of the row, not a false answer. The reservation is
+%%% released by the caller when the proxied Register fails (release_session/1) and
+%%% by the TTL sweep when the caller died; a stored pending row is released by
+%%% Subscribe or its TTL.
 %%%
 %%% 3. Every other store is checked the same way. The live insert (the
 %%% `register' call) asks session_admission/2 inside this process, and
@@ -566,12 +573,16 @@ list_agents(Limit, Cursor) ->
 %% no stacktrace, no arguments. The one call made to the registry process carries
 %% the session id, the connection key, the agent id and the reservation, never
 %% Info.
--spec store_pending(binary(), map()) -> ok | {error, registry_unavailable | session_limit}.
+%%
+%% `{error, superseded}' when a newer Register of the same agent id on the
+%% connection committed first: the row is not stored and the registry is healthy.
+-spec store_pending(binary(), map()) ->
+          ok | {error, registry_unavailable | session_limit | superseded}.
 store_pending(SessionId, Info) ->
     store_pending(SessionId, Info, undefined).
 
 -spec store_pending(binary(), map(), reference() | undefined) ->
-          ok | {error, registry_unavailable | session_limit}.
+          ok | {error, registry_unavailable | session_limit | superseded}.
 store_pending(SessionId, Info, Reservation) ->
     case maps:get(conn_key, Info, undefined) of
         undefined ->
@@ -855,7 +866,13 @@ handle_call({commit_pending, SessionId, ConnKey, AgentId, Ref}, _From, State) ->
                     end
             end;
         [] ->
-            {error, registry_unavailable}
+            %% Superseded when a newer commit of the same agent removed this row
+            %% (that one is committed, so its row is indexed); otherwise the row
+            %% is lost with the table (a restart), which is a registry failure.
+            case committed_rows_of(ConnKey, AgentId, SessionId) of
+                [] -> {error, registry_unavailable};
+                _  -> {error, superseded}
+            end
     end,
     prune_pending_index(ConnKey),
     {reply, Reply, case Reply of
@@ -1107,12 +1124,11 @@ release_idle_monitors(#state{conn_monitors = ConnMons, dead_conns = Dead} = Stat
 %% not yet committed is another Register still in flight and is left alone, as are
 %% reservation rows (keys that are not binaries).
 supersede_pending(ConnKey, AgentId, SessionId, StoredAt) ->
-    Committed = [{Key, T} || {Key, #{agent_id := A}, T} <- indexed_rows(ConnKey),
-                             is_binary(Key), Key =/= SessionId, A =:= AgentId],
+    Committed = committed_rows_of(ConnKey, AgentId, SessionId),
     case lists:any(fun({_, T}) -> T > StoredAt end, Committed) of
         true ->
             ets:delete(?PENDING_TABLE, SessionId),
-            {error, registry_unavailable};
+            {error, superseded};
         false ->
             _ = [begin
                      ets:delete(?PENDING_TABLE, Key),
@@ -1121,6 +1137,13 @@ supersede_pending(ConnKey, AgentId, SessionId, StoredAt) ->
             pending_index_add(ConnKey, SessionId),
             ok
     end.
+
+%% The committed pending rows of AgentId on ConnKey other than SessionId's own, as
+%% `{Key, StoredAt}': the index lists only committed rows and reservations, and a
+%% reservation key is not a binary.
+committed_rows_of(ConnKey, AgentId, SessionId) ->
+    [{Key, T} || {Key, #{agent_id := A}, T} <- indexed_rows(ConnKey),
+                 is_binary(Key), Key =/= SessionId, A =:= AgentId].
 
 do_deregister(AgentId, #state{monitor_refs = Mons} = State) ->
     case ets:lookup(?TABLE, AgentId) of

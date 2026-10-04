@@ -86,6 +86,10 @@ cap_test_() ->
        fun registry_dies_before_commit/0},
       {"two rows of one agent, committed in either order, leave one row and a commit of a gone row answers an error",
        fun commit_orders_leave_one_row/0},
+      {"a commit of a row a newer commit removed answers superseded, a lost row of an unknown agent registry_unavailable",
+       fun commit_of_removed_row_is_superseded/0},
+      {"a superseded Register is answered UNAVAILABLE without a WARN, a failing registry INTERNAL with one",
+       fun handler_superseded_register_is_retryable/0},
       {"2 and 20 concurrent Registers of one agent id leave exactly one pending row, 200 times",
        {timeout, 120, fun concurrent_same_agent_registers_leave_one_row/0}},
       {"the rows of a connection that dies are gone at once, other connections' rows stay",
@@ -686,7 +690,7 @@ commit_orders_leave_one_row() ->
         %% A commit that answered ok is for a row that is there at its end or was
         %% replaced by a later commit, never a row that was not there.
         ?assert(lists:member(ok, [R || {_, R} <- Replies]), {Order, Replies}),
-        [?assertEqual({error, registry_unavailable}, R)
+        [?assertEqual({error, superseded}, R)
          || {I, R} <- Replies, R =/= ok, maps:get(I, Sessions) =/= Survivor],
         case T1 =:= T2 of
             %% Stamped apart: the newer row survives whatever the order.
@@ -697,14 +701,85 @@ commit_orders_leave_one_row() ->
         %% Nothing is left to leak into the next case.
         ets:delete(yuzu_gw_pending, Survivor)
     end, Cases),
-    %% A commit whose row was never stored (the registry restarted since, or the
-    %% row was superseded) changes nothing: another agent's row stays.
+    %% A commit whose row was never stored (the registry restarted since) is a
+    %% registry failure, not a supersede (the agent has no committed row), and
+    %% changes nothing: another agent's row stays.
     C2 = conn(),
     true = ets:insert(yuzu_gw_pending, {session(7), info(agent(7), C2), T}),
     ?assertEqual({error, registry_unavailable},
                  gen_server:call(yuzu_gw_registry,
                                  {commit_pending, session(8), C2, agent(8), undefined})),
     ?assertEqual([session(7)], pending_rows(C2)).
+
+%% A commit whose own row was removed by a newer commit of the same agent answers
+%% `superseded' (the registry is healthy); a commit of a row that never was there,
+%% for an agent with no committed row, still answers `registry_unavailable'.
+commit_of_removed_row_is_superseded() ->
+    T = erlang:monotonic_time(millisecond),
+    C = conn(),
+    A = agent(1),
+    {ok, R1} = yuzu_gw_registry:reserve_session(C, A),
+    {ok, R2} = yuzu_gw_registry:reserve_session(C, A),
+    true = ets:insert(yuzu_gw_pending, {session(1), info(A, C), T}),
+    %% Stamped far ahead, so that no later row of this case is newer than it.
+    true = ets:insert(yuzu_gw_pending, {session(2), info(A, C), T + 60000}),
+    ?assertEqual(ok, gen_server:call(yuzu_gw_registry,
+                                     {commit_pending, session(1), C, A, R1})),
+    ?assertEqual(ok, gen_server:call(yuzu_gw_registry,
+                                     {commit_pending, session(2), C, A, R2})),
+    ?assertEqual([session(2)], pending_rows(C)),
+    %% The first caller's commit comes late: its row is gone, the newer one is there.
+    ?assertEqual({error, superseded},
+                 gen_server:call(yuzu_gw_registry,
+                                 {commit_pending, session(1), C, A, undefined})),
+    ?assertEqual([session(2)], pending_rows(C)),
+    %% The same for the entry point the handler calls.
+    ?assertEqual({error, superseded},
+                 yuzu_gw_registry:store_pending(session(3), info(A, C))),
+    %% No committed row of this agent: the lost row is a registry failure.
+    ?assertEqual({error, registry_unavailable},
+                 gen_server:call(yuzu_gw_registry,
+                                 {commit_pending, session(9), C, agent(9), undefined})).
+
+%% A Register superseded by a newer one is answered UNAVAILABLE (retryable, the
+%% class the session cap uses) and logs no WARN: the registry is healthy. A
+%% registry that fails is still INTERNAL with the WARN.
+handler_superseded_register_is_retryable() ->
+    mock_handler_deps(),
+    A = agent(1),
+    %% While this Register is proxied upstream a newer one of the same agent
+    %% commits (its row is stamped later than the row this Register stores).
+    ok = meck:expect(yuzu_gw_upstream, proxy_register,
+                     fun(#{info := #{agent_id := Id}}) ->
+                         Newer = <<"newer-session">>,
+                         true = ets:insert(yuzu_gw_pending,
+                                           {Newer, info(A, conn_a),
+                                            erlang:monotonic_time(millisecond) + 60000}),
+                         ok = gen_server:call(yuzu_gw_registry,
+                                              {commit_pending, Newer, conn_a, A, undefined}),
+                         {ok, #{session_id => <<"reg-session-", Id/binary>>}}
+                     end),
+    Reply = yuzu_gw_agent_service:register(ctx_with(conn_a),
+                                           #{info => #{agent_id => A, hostname => <<"h">>}}),
+    ?assertMatch({grpc_error, {?GRPC_STATUS_UNAVAILABLE, _}}, Reply),
+    {grpc_error, {_, Message}} = Reply,
+    ?assertNotEqual(nomatch, binary:match(Message, <<"superseded">>)),
+    ?assertEqual([], [T || {_, log, T} <- ets:tab2list(?EVENTS_TAB)]),
+    ?assertEqual([<<"newer-session">>], pending_rows(conn_a)),
+    ?assertEqual([], reserved_rows()),
+    %% A registry failure keeps INTERNAL and the WARN.
+    ok = meck:new(yuzu_gw_registry, [passthrough, no_link]),
+    try
+        ok = meck:expect(yuzu_gw_registry, store_pending,
+                         fun(_, _, _) -> {error, registry_unavailable} end),
+        Failed = yuzu_gw_agent_service:register(ctx_with(conn_b),
+                                                #{info => #{agent_id => A, hostname => <<"h">>}}),
+        ?assertMatch({grpc_error, {?GRPC_STATUS_INTERNAL, _}}, Failed),
+        ?assertEqual(1, length([T || {_, log, T} <- ets:tab2list(?EVENTS_TAB),
+                                     binary:match(T, <<"registry_unavailable">>) =/= nomatch]))
+    after
+        meck:unload(yuzu_gw_registry)
+    end.
 
 %% N Registers of one agent id on one connection stored at once, 200 rounds each
 %% for N = 2 and N = 20: after the last reply exactly one pending row is left, it
@@ -730,7 +805,7 @@ concurrent_same_agent_registers_leave_one_row() ->
         [Survivor] = Left,
         [Winner] = [I || {I, _} <- Results, Id(I) =:= Survivor],
         ?assertEqual(ok, proplists:get_value(Winner, Results)),
-        ?assert(lists:all(fun({_, R}) -> R =:= ok orelse R =:= {error, registry_unavailable} end,
+        ?assert(lists:all(fun({_, R}) -> R =:= ok orelse R =:= {error, superseded} end,
                           Results), Results),
         ?assertEqual([], reserved_rows())
     end, [{N, Round} || N <- [2, 20], Round <- lists:seq(1, 200)]).
