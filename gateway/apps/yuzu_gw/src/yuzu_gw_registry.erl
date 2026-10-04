@@ -29,8 +29,8 @@
 %%% a reconnect or supersede of the same agent id replaces its own session and
 %%% never meets the cap. The cap is applied where sessions are stored:
 %%% store_pending/2 (and session_admission/2, which Register asks before it
-%%% proxies the registration upstream, so a refused one leaves nothing on the
-%%% server) and the live insert in `register'. Both answer
+%%% proxies the registration upstream, so a Register refused there leaves
+%%% nothing on the server) and the live insert in `register'. Both answer
 %%% `{error, session_limit}'. The pending count is a scan of the pending table
 %%% (short lived rows), the live count a lookup in a per-connection index owned by
 %%% this process (an unnamed bag whose id is kept in persistent_term), kept in
@@ -38,7 +38,9 @@
 %%% every removal path (deregister, supersede, a dead process) releases the
 %%% count. A connection key of `undefined' is never counted. The check and the
 %%% pending insert are not one atomic step: concurrent Registers on one connection
-%%% can overshoot by at most the connection's concurrent stream limit.
+%%% can overshoot by at most the connection's concurrent stream limit, and one
+%%% that passes the early check but is refused at store_pending/2 has already been
+%%% proxied upstream (a server session that never subscribes).
 %%% @end
 %%%-------------------------------------------------------------------
 -module(yuzu_gw_registry).
