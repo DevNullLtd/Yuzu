@@ -978,22 +978,24 @@ emit_verdict_dropped(Reason, Count) ->
     telemetry:execute([yuzu, gw, heartbeat, verdict_dropped],
                       #{count => Count}, #{reason => Reason}).
 
-%% @doc The server's reject_reason, cut to 128 bytes for the log, with every
-%% control byte (below 32, and 127) replaced by `?' so the text cannot split or
-%% forge a log line (CR, LF) or drive a terminal (ESC). Bytes, not graphemes:
-%% the text is untrusted and need not be valid UTF-8, so the replacement is
-%% per byte and bytes of 128 and above pass through.
-reject_reason_for_log(Response) ->
-    case maps:get(reject_reason, Response, <<>>) of
-        Reason when is_binary(Reason) ->
-            Cut = binary:part(Reason, 0, min(byte_size(Reason), 128)),
-            << <<(printable_byte(B))>> || <<B>> <= Cut >>;
-        _ ->
-            <<>>
-    end.
+%% @doc Untrusted server text for a log line: cut to 128 bytes, then every
+%% control character is replaced by `?': C0 (below 32), DEL (127) and C1
+%% (128..159, which ~s would render as the Latin-1 code points U+0080..U+009F,
+%% among them NEL and CSI). The rest is shown as Latin-1 characters. Bytes,
+%% not graphemes: the text need not be valid UTF-8, so the replacement is per
+%% byte. Anything that is not a binary logs as empty.
+log_text(Text) when is_binary(Text) ->
+    Cut = binary:part(Text, 0, min(byte_size(Text), 128)),
+    << <<(printable_byte(B))>> || <<B>> <= Cut >>;
+log_text(_Other) ->
+    <<>>.
 
-printable_byte(B) when B < 32; B =:= 127 -> $?;
-printable_byte(B)                        -> B.
+%% @doc The server's reject_reason, as log text.
+reject_reason_for_log(Response) ->
+    log_text(maps:get(reject_reason, Response, <<>>)).
+
+printable_byte(B) when B < 32; B >= 127, B =< 159 -> $?;
+printable_byte(B)                                  -> B.
 
 %% @doc Read an integer application env key that must lie in Min..Max; an
 %% invalid value is logged (naming the key) and replaced by the default.
@@ -1099,7 +1101,7 @@ do_rpc(Method, Request, Tag, Ctx) ->
                               #{count => 1},
                               #{rpc_name => atom_to_binary(Tag, utf8),
                                 code => Status}),
-            logger:warning("Upstream RPC ~s failed: ~p ~s", [Method, Status, Message]),
+            logger:warning("Upstream RPC ~s failed: ~p ~s", [Method, Status, log_text(Message)]),
             {error, {Status, Message}};
         {http_error, {Status, _}, _Trailers} ->
             %% HA WS-4 4.4 round-2 review fix (consistency-auditor c-1 /

@@ -150,6 +150,8 @@ verdict_replay_test_() ->
         fun sys_get_status_shows_counts_not_requests/0),
       t("E23 the reports of an abnormal stop carry the queue as counts",
         fun abnormal_stop_reports_show_queue_counts/0),
+      t("E20 a server grpc-message is cut and its control characters replaced in the log",
+        fun rpc_error_message_is_sanitised_in_the_log/0),
       t("E23 format_status redacts reason, stacktrace args and log, and is total",
         fun format_status_redacts_reason_log_and_odd_fields/0),
       t("E23 an RPC that raises is a counted failure and carries no request",
@@ -1151,10 +1153,12 @@ rejected_replay_disconnects_without_reannounce() ->
     [Warning] = [T || {warning, T} <- Lines, binary:match(T, <<"not accepted">>) =/= nomatch],
     ?assertNotEqual(nomatch, binary:match(Warning, binary:copy(<<"x">>, 128))),
     ?assertEqual(nomatch, binary:match(Warning, binary:copy(<<"x">>, 129))),
-    %% Control bytes (CR, LF, ESC, NUL, DEL) become `?' after the cut; bytes of
-    %% 128 and above pass through (~s shows the latin-1 byte 16#E9 as its UTF-8
-    %% form C3 A9), and the text is still cut to 128 bytes.
-    Hostile = <<"line1\r\nline2\e[31m", 0, 127, 16#E9, (binary:copy(<<"y">>, 200))/binary>>,
+    %% Control bytes (CR, LF, ESC, NUL, DEL and the C1 range 16#80..16#9F, here
+    %% NEL 16#85 and CSI 16#9B) become `?' after the cut; other bytes pass
+    %% through (~s shows the latin-1 byte 16#E9 as its UTF-8 form C3 A9), and
+    %% the text is still cut to 128 bytes.
+    Hostile = <<"line1\r\nline2\e[31m", 0, 127, 16#85, 16#9B, 16#E9,
+                (binary:copy(<<"y">>, 200))/binary>>,
     A2 = bind_agent(<<"e20s">>),
     mock_unary(fun(<<"ProxyRegister">>, _Req, Hdr) when Hdr =/= undefined ->
                        {ok, #{accepted => false, reject_reason => Hostile,
@@ -1168,9 +1172,11 @@ rejected_replay_disconnects_without_reannounce() ->
     end),
     [Warning2] = [T || {warning, T} <- Lines2, binary:match(T, <<"not accepted">>) =/= nomatch],
     [?assertEqual({nomatch, C}, {binary:match(Warning2, <<C>>), C}) || C <- [$\r, $\n, 27, 0, 127]],
-    Expected = <<"line1??line2?[31m??", 16#C3, 16#A9, (binary:copy(<<"y">>, 128 - 20))/binary>>,
+    %% U+0085 and U+009B would show as C2 85 and C2 9B if they got through.
+    [?assertEqual({nomatch, C}, {binary:match(Warning2, <<16#C2, C>>), C}) || C <- [16#85, 16#9B]],
+    Expected = <<"line1??line2?[31m????", 16#C3, 16#A9, (binary:copy(<<"y">>, 128 - 22))/binary>>,
     ?assertNotEqual(nomatch, binary:match(Warning2, Expected)),
-    ?assertEqual(nomatch, binary:match(Warning2, binary:copy(<<"y">>, 128 - 19))).
+    ?assertEqual(nomatch, binary:match(Warning2, binary:copy(<<"y">>, 128 - 21))).
 
 %% E20b: an OK with trailers and no DATA frame reaches the replay as a
 %% non-map response. The upstream stays up and the drip goes on; the attempt
@@ -1214,6 +1220,22 @@ non_map_replay_response_is_a_failure() ->
     ?assertEqual([], disconnects()),
     ?assertEqual([{agent, reannounce, pid(A3), sid(A3)}],
                  [C || {agent, reannounce, _, _} = C <- agent_calls()]).
+
+%% The server's grpc-message is untrusted text too: the same cut and the same
+%% control-character replacement as reject_reason, in the failed-RPC warning.
+rpc_error_message_is_sanitised_in_the_log() ->
+    Message = <<"m1\r\nm2\e[31m", 0, 127, 16#85, 16#9B, (binary:copy(<<"z">>, 200))/binary>>,
+    mock_unary(fun(<<"ProxyRegister">>, _Req, _Hdr) -> {error, {<<"14">>, Message}, #{}};
+                  (M, R, H) -> default_rpc(M, R, H)
+               end),
+    {Result, Lines} = capture_logs(fun() -> yuzu_gw_upstream:proxy_register(trigger_req()) end),
+    ?assertEqual({error, {<<"14">>, Message}}, Result),
+    [Warning] = [T || {warning, T} <- Lines, binary:match(T, <<"Upstream RPC">>) =/= nomatch],
+    [?assertEqual({nomatch, C}, {binary:match(Warning, <<C>>), C}) || C <- [$\r, $\n, 27, 0, 127]],
+    [?assertEqual({nomatch, C}, {binary:match(Warning, <<16#C2, C>>), C}) || C <- [16#85, 16#9B]],
+    ?assertNotEqual(nomatch, binary:match(Warning, <<"m1??m2?[31m????">>)),
+    ?assertNotEqual(nomatch, binary:match(Warning, binary:copy(<<"z">>, 128 - 15))),
+    ?assertEqual(nomatch, binary:match(Warning, binary:copy(<<"z">>, 128 - 14))).
 
 %% Mocks return #{} and older callers omit the key: absent means accepted.
 missing_accepted_key_is_accepted() ->
