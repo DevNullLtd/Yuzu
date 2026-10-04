@@ -87,8 +87,12 @@ bound_test_() ->
        fun invalid_utf8_is_repaired_and_buffer_survives/0},
       {"a lone 0xFF byte in a tag value is delivered repaired and counted",
        fun lone_ff_is_delivered_repaired/0},
-      {"tags that fit a chunk but grow past it when repaired lose the tags, counted as oversize",
+      {"tags that fit a chunk but grow past it when repaired (a session id of 2.5 MiB) lose the tags, counted as oversize",
        fun repair_growth_past_a_chunk_drops_tags/0},
+      {"tags over 64 KiB a key or value or 256 KiB in all are dropped before the repair runs",
+       fun oversize_tag_bytes_are_dropped_before_the_repair/0},
+      {"the tags of a real agent heartbeat pass unchanged",
+       fun agent_sized_tags_pass_unchanged/0},
       {"repair_utf8 is total and its output always encodes",
        fun repair_utf8_is_total/0},
       {"a session whose every heartbeat has bad tags keeps shipping for 3 cycles",
@@ -363,17 +367,19 @@ byte_cap_strips_oldest_snapshot_before_dropping_session() ->
     ?assertEqual(<<>>, maps:get(fleet_snapshot_json, maps:get(sid(1), Sent), <<>>)),
     [?assertEqual(Snap, maps:get(fleet_snapshot_json, maps:get(sid(I), Sent)))
      || I <- [2, 3, 4]],
-    %% No snapshot to strip: the oldest whole session goes. Three heartbeats
-    %% of ~400 KB tags in a 1 MiB cap.
+    %% No snapshot to strip: the oldest whole session goes. Four heartbeats of
+    %% ~240 KB tags (4 x 60 KiB, inside the tag bounds) fit a 1 MiB cap, the
+    %% fifth does not.
     restart_buffer(100, ?MIB),
     reset_events(),
-    Tags = #{<<"big">> => binary:copy(<<"t">>, 400 * 1024)},
-    [queue(hb(sid(I), #{tags => Tags})) || I <- [1, 2]],
+    Tags = maps:from_list([{<<"big", (integer_to_binary(K))/binary>>, binary:copy(<<"t">>, 60 * 1024)}
+                           || K <- lists:seq(1, 4)]),
+    [queue(hb(sid(I), #{tags => Tags})) || I <- [1, 2, 3, 4]],
     ?assertEqual(0, dropped_total()),
-    queue(hb(sid(3), #{tags => Tags})),
+    queue(hb(sid(5), #{tags => Tags})),
     ?assertEqual(1, dropped(buffer_full)),
     ?assertEqual(0, dropped(snapshot_evicted)),
-    ?assertEqual([sid(2), sid(3)], lists:sort(buffered_ids())),
+    ?assertEqual([sid(2), sid(3), sid(4), sid(5)], lists:sort(buffered_ids())),
     ?assert(buffered_bytes() =< ?MIB).
 
 count_cap_drop_counted_and_replacement_never_dropped() ->
@@ -540,18 +546,21 @@ oversize_tags_are_dropped_and_heartbeat_kept() ->
     ?assertEqual(2, dropped(heartbeat_oversize)),
     ?assertEqual([<<"big-snap">>], buffered_ids()).
 
-%% Each part fits a chunk alone (a 2 MiB snapshot, then 1.5 MiB of tags) and the
-%% coalesced heartbeat does not: the older snapshot goes, the heartbeat stays.
+%% Each part fits a chunk alone (a 2.9 MiB snapshot, then 200 KiB of tags, within
+%% the tag bounds) and the coalesced heartbeat does not: the older snapshot goes,
+%% the heartbeat stays.
 coalesced_over_a_chunk_strips_the_snapshot() ->
-    queue(hb(<<"a">>, #{snap => snap(2 * ?MIB)})),
+    queue(hb(<<"a">>, #{snap => snap(29 * ?MIB div 10)})),
     ?assertEqual(0, dropped_total()),
-    queue(hb(<<"a">>, #{tags => #{<<"t">> => binary:copy(<<"t">>, 3 * ?MIB div 2)}})),
+    Tags = maps:from_list([{<<"t", (integer_to_binary(I))/binary>>, binary:copy(<<"t">>, 50 * 1024)}
+                           || I <- lists:seq(1, 4)]),
+    queue(hb(<<"a">>, #{tags => Tags})),
     ?assertEqual(1, dropped(snapshot_oversize)),
     ?assertEqual(1, dropped_total()),
     ?assertEqual(ok, yuzu_gw_heartbeat_buffer:flush_sync()),
     [H] = [H || R <- requests(), H <- hbs(R)],
     ?assertEqual(<<>>, maps:get(fleet_snapshot_json, H, <<>>)),
-    ?assertEqual(3 * ?MIB div 2, byte_size(maps:get(<<"t">>, maps:get(status_tags, H)))).
+    ?assertEqual(Tags, maps:get(status_tags, H)).
 
 %% A degraded heartbeat is the session's newest: it replaces the older tags and
 %% keeps the older snapshot (the usual coalescing).
@@ -621,11 +630,15 @@ lone_ff_is_delivered_repaired() ->
     [H] = [H || R <- requests(), H <- hbs(R)],
     ?assertEqual(#{<<"k">> => <<"a", 16#EF, 16#BF, 16#BD, "b">>}, maps:get(status_tags, H)).
 
-%% Each invalid byte becomes three (U+FFFD): 1.5 MiB of 0xFF fits a chunk raw and
-%% is 4.5 MiB repaired, so the size is checked again after the repair.
+%% Each invalid byte becomes three (U+FFFD). The tag bounds keep the repaired tags
+%% under 768 KiB, so only a session id of a few MiB can carry the repaired
+%% heartbeat over a chunk: 2.5 MiB of session id and 200 KiB of 0xFF tags fit a
+%% chunk raw and are 3.1 MiB repaired, so the size is checked again after the repair.
 repair_growth_past_a_chunk_drops_tags() ->
-    Tags = #{<<"k">> => binary:copy(<<255>>, 3 * ?MIB div 2)},
-    queue(hb(<<"grow">>, #{tags => Tags, sent_at => 1})),
+    Sid = binary:copy(<<"s">>, 5 * ?MIB div 2),
+    Tags = maps:from_list([{<<"k", (integer_to_binary(I))/binary>>, binary:copy(<<255>>, 50 * 1024)}
+                           || I <- lists:seq(1, 4)]),
+    queue(hb(Sid, #{tags => Tags, sent_at => 1})),
     ?assertEqual(1, dropped(heartbeat_oversize)),
     ?assertEqual(0, dropped(heartbeat_invalid)),
     ?assertEqual(1, dropped_total()),
@@ -633,6 +646,73 @@ repair_growth_past_a_chunk_drops_tags() ->
     [H] = [H || R <- requests(), H <- hbs(R)],
     ?assertNot(maps:is_key(status_tags, H)),
     [?assert(Size =< ?SERVER_LIMIT) || Size <- request_sizes()].
+
+%% The repair walk is the costliest thing the buffer does for one heartbeat and
+%% the buffer is one process with no per-session rate limit, so tags over the byte
+%% bounds (64 KiB a key or value, 256 KiB in all) are dropped before it runs: the
+%% walk's calls are counted: none for them, many for tags at the bound.
+oversize_tag_bytes_are_dropped_before_the_repair() ->
+    MaxItem = 64 * 1024,
+    Over = [
+        {<<"huge-value">>,  #{<<"k">> => binary:copy(<<255>>, 3 * ?MIB)}},
+        {<<"huge-key">>,    #{binary:copy(<<255>>, 3 * ?MIB) => <<"v">>}},
+        {<<"item-value">>,  #{<<"k">> => binary:copy(<<255>>, MaxItem + 1)}},
+        {<<"item-key">>,    #{binary:copy(<<255>>, MaxItem + 1) => <<"v">>}},
+        %% each item under the bound, 5 x 60 KiB = 300 KiB over the total
+        {<<"total">>,       maps:from_list([{<<"k", (integer_to_binary(I))/binary>>,
+                                             binary:copy(<<255>>, 60 * 1024)}
+                                            || I <- lists:seq(1, 5)])}
+    ],
+    {Walked, _} = repair_walk_calls(fun() ->
+        [queue(hb(Sid, #{tags => Tags, snap => <<"snap">>})) || {Sid, Tags} <- Over]
+    end),
+    ?assertEqual(0, Walked),
+    ?assertEqual(length(Over), dropped(heartbeat_oversize)),
+    ?assertEqual(0, dropped(heartbeat_invalid)),
+    ?assertEqual(lists:sort([Sid || {Sid, _} <- Over]), lists:sort(buffered_ids())),
+    ?assertEqual(ok, yuzu_gw_heartbeat_buffer:flush_sync()),
+    Sent = [H || R <- requests(), H <- hbs(R)],
+    ?assertEqual(length(Over), length(Sent)),
+    [begin
+         ?assertNot(maps:is_key(status_tags, H)),
+         ?assertEqual(<<"snap">>, maps:get(fleet_snapshot_json, H))
+     end || H <- Sent],
+    %% Control: at the bounds the walk runs and the repaired tags are kept.
+    reset_requests(), reset_events(),
+    AtItem = #{<<"k">> => binary:copy(<<255>>, MaxItem)},
+    AtTotal = maps:from_list([{<<"k", (integer_to_binary(I))/binary>>, binary:copy(<<255>>, MaxItem - 10)}
+                              || I <- lists:seq(1, 4)]),
+    {Walked2, _} = repair_walk_calls(fun() ->
+        queue(hb(<<"at-item">>, #{tags => AtItem})),
+        queue(hb(<<"at-total">>, #{tags => AtTotal}))
+    end),
+    ?assert(Walked2 >= 2),
+    ?assertEqual(2, dropped(heartbeat_invalid)),
+    ?assertEqual(0, dropped(heartbeat_oversize)),
+    ?assertEqual(ok, yuzu_gw_heartbeat_buffer:flush_sync()),
+    Sent2 = maps:from_list([{maps:get(session_id, H), H} || R <- requests(), H <- hbs(R)]),
+    ?assertEqual(3 * MaxItem, byte_size(maps:get(<<"k">>,
+                                                maps:get(status_tags, maps:get(<<"at-item">>, Sent2))))),
+    ?assertEqual(4, map_size(maps:get(status_tags, maps:get(<<"at-total">>, Sent2)))).
+
+%% What a real agent sends (about 22 tags, plus plugin tags at the agent's own
+%% bounds: 50 plugins x 8 keys, a 32 character key suffix, a 64 byte value) is
+%% well inside the byte bounds and passes unchanged, with no event.
+agent_sized_tags_pass_unchanged() ->
+    Core = maps:from_list([{iolist_to_binary(["yuzu.tag_", integer_to_list(I)]),
+                            integer_to_binary(I * 1000)} || I <- lists:seq(1, 22)]),
+    Plugin = maps:from_list([{iolist_to_binary(["yuzu.plugin.plugin_", integer_to_list(P), ".",
+                                                lists:duplicate(32, $k), integer_to_list(K)]),
+                              binary:copy(<<"v">>, 64)}
+                             || P <- lists:seq(1, 50), K <- lists:seq(1, 8)]),
+    Failed = #{<<"yuzu.plugins_failed">> => binary:copy(<<"plugin_name,">>, 400)},
+    Tags = maps:merge(maps:merge(Core, Plugin), Failed),
+    ?assertEqual(22 + 400 + 1, map_size(Tags)),
+    queue(hb(<<"agent">>, #{tags => Tags, sent_at => 1})),
+    ?assertEqual(0, dropped_total()),
+    ?assertEqual(ok, yuzu_gw_heartbeat_buffer:flush_sync()),
+    [H] = [H || R <- requests(), H <- hbs(R)],
+    ?assertEqual(Tags, maps:get(status_tags, H)).
 
 repair_utf8_is_total() ->
     %% All 256 single bytes and 2000 random binaries, some of them valid.
@@ -1018,6 +1098,21 @@ encoded_size(Batch) ->
     iolist_size(gateway_pb:encode_msg(Batch, 'yuzu.gateway.v1.BatchHeartbeatRequest')).
 
 %% Queue one heartbeat and wait until the buffer has handled it.
+%% Run Fun with the calls to the buffer's repair walk (a local function, one call
+%% per input byte) counted by the VM (call_count: no trace message is sent);
+%% returns {NumberOfCalls, FunResult}. The count is removed on the way out,
+%% whatever Fun does.
+repair_walk_calls(Fun) ->
+    MFA = {yuzu_gw_heartbeat_buffer, repair_walk, 2},
+    1 = erlang:trace_pattern(MFA, true, [call_count]),
+    try
+        Result = Fun(),
+        {call_count, N} = erlang:trace_info(MFA, call_count),
+        {N, Result}
+    after
+        erlang:trace_pattern(MFA, false, [call_count])
+    end.
+
 queue(Hb) ->
     yuzu_gw_heartbeat_buffer:queue_heartbeat(Hb),
     _ = sys:get_state(whereis(yuzu_gw_heartbeat_buffer)),

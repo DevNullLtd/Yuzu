@@ -31,8 +31,12 @@
 %%% cannot be sent is removed and the heartbeat is kept. A status tag key or
 %%% value that is not valid UTF-8 (the encoder raises on it) is repaired, each
 %%% invalid byte becoming U+FFFD, and counted as heartbeat_invalid. A heartbeat
-%%% with more than ?MAX_STATUS_TAGS status tags, or whose tags alone exceed one
-%%% chunk, loses ALL its status tags and is counted as heartbeat_oversize. Only a
+%%% with more than ?MAX_STATUS_TAGS status tags, a tag key or value over
+%%% ?MAX_TAG_ITEM_BYTES, tags over ?MAX_TAG_BYTES_TOTAL in all, or tags that alone
+%%% exceed one chunk, loses ALL its status tags and is counted as
+%%% heartbeat_oversize; the byte bounds are checked BEFORE the repair walk, which
+%%% costs about 8 ms per MiB of invalid bytes on this single process and has no
+%%% per-session rate limit, so a repair is only ever run on a bounded input. Only a
 %%% heartbeat without a usable session id (it cannot be keyed), or one that still
 %%% exceeds a chunk with its tags and snapshot removed, is dropped (invalid and
 %%% oversize respectively). So every entry fits one chunk and every request is
@@ -110,6 +114,19 @@
 %% (heartbeat_oversize). The agent sends about 25; the bound only has to stop a
 %% sender that floods the tag map.
 -define(MAX_STATUS_TAGS, 512).
+%% A heartbeat with a status tag key or value over MAX_TAG_ITEM_BYTES (64 KiB), or
+%% tag keys and values over MAX_TAG_BYTES_TOTAL (256 KiB) in all, loses all its
+%% tags (heartbeat_oversize) without the repair walk being run: the walk is the
+%% costliest thing this process does for one heartbeat (24 ms for one 3 MiB
+%% invalid value, against 0.65 ms for a valid one), and the repaired value is
+%% three times its size. What the agent sends is far below both: its tags are
+%% about 25 `yuzu.*' numbers and names plus, per loaded plugin, at most 8
+%% `yuzu.plugin.<name>.<key>' tags with a key suffix of at most 32 characters and
+%% a value of at most 64 bytes (agents/core/src/plugin_heartbeat_tags.hpp), so
+%% about 70 KiB for 50 plugins; the one list-valued tag, yuzu.plugins_failed, is
+%% a few KiB.
+-define(MAX_TAG_ITEM_BYTES, 65536).
+-define(MAX_TAG_BYTES_TOTAL, 262144).
 %% max_heartbeat_buffer_bytes: the cap on the buffer's estimated encoded size.
 %% Valid 1 MiB..1 GiB (default 64 MiB); anything else logs a warning naming the
 %% key and takes the default.
@@ -450,8 +467,9 @@ enqueue_screened(Hb, #state{buffer = Buf, max_buf = MaxBuf} = State) ->
 %%     a session);
 %%   - status_tags not a map, or holding a non-binary key or value: all tags
 %%     removed, heartbeat_invalid;
-%%   - more than ?MAX_STATUS_TAGS tags, or tags larger than one chunk: all tags
-%%     removed, heartbeat_oversize;
+%%   - more than ?MAX_STATUS_TAGS tags, a key or value over ?MAX_TAG_ITEM_BYTES,
+%%     tags over ?MAX_TAG_BYTES_TOTAL in all, or tags larger than one chunk: all
+%%     tags removed, heartbeat_oversize, with no repair run;
 %%   - invalid UTF-8 in a tag key or value: repaired, heartbeat_invalid;
 %%   - still over one chunk without tags and snapshot: dropped,
 %%     heartbeat_oversize (cannot happen with a session id of at most 64 bytes;
@@ -459,7 +477,8 @@ enqueue_screened(Hb, #state{buffer = Buf, max_buf = MaxBuf} = State) ->
 %% The newest heartbeat wins every field but the snapshot, so a heartbeat too
 %% large without its snapshot is too large coalesced as well. Size is checked
 %% before the repair walk (which can grow a value to three times its size, so it
-%% is checked again after).
+%% is checked again after: with the tag bounds the growth is at most 768 KiB, but
+%% a session id of a few MiB can still carry the result over a chunk).
 -spec screen(map()) -> {ok, map(), [heartbeat_oversize | heartbeat_invalid]}
                      | {drop, heartbeat_oversize | heartbeat_invalid}.
 screen(Hb) ->
@@ -477,6 +496,7 @@ screen_tags(Hb) ->
     case maps:get(status_tags, Hb, #{}) of
         Tags when is_map(Tags) ->
             case map_size(Tags) > ?MAX_STATUS_TAGS
+                 orelse tags_over_byte_bounds(Tags)
                  orelse estimate_bytes(Hb#{fleet_snapshot_json => <<>>}) > ?CHUNK_BYTES of
                 true ->
                     without_tags(Hb, heartbeat_oversize);
@@ -494,6 +514,27 @@ screen_tags(Hb) ->
             end;
         _NotAMap ->
             without_tags(Hb, heartbeat_invalid)
+    end.
+
+%% True when a tag key or value is over ?MAX_TAG_ITEM_BYTES or the keys and values
+%% together are over ?MAX_TAG_BYTES_TOTAL. Sizes only (bin_size/1 counts a
+%% non-binary as 0, so it still reaches repair_tags/1 and its heartbeat_invalid
+%% answer); called with at most ?MAX_STATUS_TAGS tags, and stops at the first
+%% excess.
+-spec tags_over_byte_bounds(map()) -> boolean().
+tags_over_byte_bounds(Tags) ->
+    try
+        _ = maps:fold(fun(K, V, Total) ->
+                              KS = bin_size(K),
+                              VS = bin_size(V),
+                              (KS > ?MAX_TAG_ITEM_BYTES orelse VS > ?MAX_TAG_ITEM_BYTES
+                               orelse Total + KS + VS > ?MAX_TAG_BYTES_TOTAL)
+                                  andalso throw(over_bounds),
+                              Total + KS + VS
+                      end, 0, Tags),
+        false
+    catch
+        throw:over_bounds -> true
     end.
 
 %% Remove every status tag. What is left (session id, sent_at, the snapshot) is
