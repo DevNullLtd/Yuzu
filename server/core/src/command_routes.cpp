@@ -707,7 +707,7 @@ void register_command_routes(HttpRouteSink& sink, Deps deps) {
         // A fail-closed containment gate already withholds every id and is
         // reported first below (`containment_unreadable`), so skip the
         // presence read rather than let `os_gate_unreadable` shadow it.
-        static const std::unordered_set<std::string> kNoOsKillSwitch;
+        static const std::unordered_set<std::string> kNoOsKillSwitch{};
         const auto os_kill_switched = deps.registry->ids_with_os(
             containment_gate.fail_closed ? kNoOsKillSwitch : classified->kill_switched_os());
         if (!os_kill_switched) {

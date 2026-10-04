@@ -945,8 +945,9 @@ TEST_CASE("PluginConfigStore: an exhausted lease yields no kill-switch decision 
         held.push_back(std::move(lease));
     }
     REQUIRE(w.store.is_open());
+    // action_allowed is kill_switch_decision(...).has_value(): not re-asserted
+    // here, it would cost a second deterministic 300 ms wait.
     CHECK_FALSE(w.store.kill_switch_decision("p", "a").has_value());
-    CHECK_FALSE(w.store.action_allowed("p", "a"));
 }
 
 TEST_CASE("PluginConfigStore: a failed kill-switch query yields no decision (fail closed)",

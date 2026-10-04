@@ -102,6 +102,16 @@ yuzu::test::PgTestTemplate os_presence_tpl{"os_kill_switch_presence", [](const s
         throw std::runtime_error("os_kill_switch_presence template: store failed to migrate");
 }};
 
+// Tracker tables + endpoint_state migrated once, cloned per test (no per-test DDL).
+yuzu::test::PgTestTemplate os_tracker_presence_tpl{
+    "os_ks_tracker_presence", [](const std::string& dsn) {
+        PgPool pool{{.conninfo = dsn, .size = 1}};
+        yuzu::server::ExecutionTracker tracker{pool};
+        OfflineEndpointStore store{pool};
+        if (!tracker.is_open() || !store.is_open())
+            throw std::runtime_error("os_ks_tracker_presence template: migrate failed");
+    }};
+
 /// Holds ACCESS EXCLUSIVE on the presence table so a presence read with a
 /// short lock timeout degrades deterministically (the #4981 PR-1 recipe).
 struct PresenceLocker {
@@ -239,9 +249,9 @@ TEST_CASE("ids_with_os: local sessions match on their reported os; empty os is n
     EventBus bus;
     yuzu::MetricsRegistry metrics;
     AgentRegistry registry(bus, metrics);
-    registry.register_agent(make_info("win", "windows"));
-    registry.register_agent(make_info("lin", "linux"));
-    registry.register_agent(make_info("unknown", ""));
+    (void)registry.register_agent(make_info("win", "windows"));
+    (void)registry.register_agent(make_info("lin", "linux"));
+    (void)registry.register_agent(make_info("unknown", ""));
 
     auto got = registry.ids_with_os(IdSet{"windows"});
     REQUIRE(got.has_value());
@@ -267,7 +277,7 @@ TEST_CASE("ids_with_os: a presence-only id is matched on its presence os; a loca
     yuzu::MetricsRegistry metrics;
     AgentRegistry registry(bus, metrics);
     registry.configure_presence(&store, std::chrono::hours(1));
-    registry.register_agent(make_info("local-lin", "linux"));
+    (void)registry.register_agent(make_info("local-lin", "linux"));
     REQUIRE(store.upsert("remote-win", "h", "windows", 0, 0, "1.0.0", "x86_64", "s1"));
     REQUIRE(store.upsert("remote-lin", "h", "linux", 0, 0, "1.0.0", "x86_64", "s2"));
     REQUIRE(store.upsert("remote-unknown", "h", "", 0, 0, "1.0.0", "x86_64", "s3"));
@@ -292,7 +302,7 @@ TEST_CASE("ids_with_os: a degraded presence read with a non-empty set is an erro
     yuzu::MetricsRegistry metrics;
     AgentRegistry registry(bus, metrics);
     registry.configure_presence(&store, std::chrono::hours(1));
-    registry.register_agent(make_info("local-win", "windows"));
+    (void)registry.register_agent(make_info("local-win", "windows"));
 
     PresenceLocker locker{db.dsn()};
     const auto empty_in = registry.ids_with_os({});
@@ -343,6 +353,36 @@ yuzu::server::ConfinedDispatchOutcome wire(AgentRegistry& registry,
 
 } // namespace
 
+// send_system_reserved is a one-line wrapper over send_to, so binding send_to /
+// send_to_all binds every system_reserved caller. A gateway-routed windows
+// session gives a positive control through drain_gateway_pending().
+TEST_CASE("send_to / send_to_all: a per-OS OFF set is enforced at send time for local sessions",
+          "[server][dispatch][os_kill_switch][registry]") {
+    EventBus bus;
+    yuzu::MetricsRegistry metrics;
+    AgentRegistry registry(bus, metrics);
+    (void)registry.register_agent(make_info("win", "windows"));
+    (void)registry.register_agent(make_info("lin", "linux"));
+    for (const auto& id : {"win", "lin"})
+        REQUIRE(registry.set_gateway_route(
+            id, {}, "test-gateway",
+            {std::string(yuzu::server::detail::kGatewayWireCapabilityDispatchTagV1)}));
+
+    const auto off = classified_with_os_off({"windows"});
+    CHECK_FALSE(registry.send_to("win", off));
+    CHECK(registry.drain_gateway_pending().empty());
+    CHECK(registry.send_to("lin", off));
+    CHECK(registry.drain_gateway_pending().size() == 1);
+    CHECK(registry.send_to_all(off) == 1); // windows excluded, linux counted
+    CHECK(registry.drain_gateway_pending().size() == 1);
+
+    const auto on = classified_with_os_off({});
+    CHECK(registry.send_to("win", on));
+    CHECK(registry.drain_gateway_pending().size() == 1);
+    CHECK(registry.send_to_all(on) == 2);
+    CHECK(registry.drain_gateway_pending().size() == 2);
+}
+
 TEST_CASE("wire_and_dispatch_confined: an OS-withheld id's per-device claim is released, and a "
           "dispatch after the switch is cleared reaches it",
           "[pg][server][dispatch][os_kill_switch][integration]") {
@@ -356,7 +396,7 @@ TEST_CASE("wire_and_dispatch_confined: an OS-withheld id's per-device claim is r
     yuzu::MetricsRegistry metrics;
     AgentRegistry registry(bus, metrics);
     (void)registry.register_agent(make_info("dev-A", "windows"));
-    registry.register_agent(make_info("dev-B", "linux"));
+    (void)registry.register_agent(make_info("dev-B", "linux"));
     for (const auto& id : {"dev-A", "dev-B"})
         REQUIRE(registry.set_gateway_route(
             id, {}, "test-gateway",
@@ -412,9 +452,7 @@ TEST_CASE("wire_and_dispatch_confined: a remote-only (presence) Windows target i
 TEST_CASE("wire_and_dispatch_confined: degraded presence with a per-OS switch OFF refuses the "
           "dispatch before targeting and before any claim",
           "[pg][ha][presence][failclosed][server][dispatch][os_kill_switch][integration]") {
-    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::execution_tracker_pg_template);
-    // The execution-tracker template has no endpoint_state schema; build the
-    // presence store in the same database.
+    YUZU_REQUIRE_PG_DB_TPL(db, os_tracker_presence_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4, .lock_timeout_ms = 100}};
     REQUIRE(pool.valid());
     yuzu::server::ExecutionTracker tracker{pool};

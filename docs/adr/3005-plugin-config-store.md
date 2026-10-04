@@ -188,6 +188,22 @@ is already on.
   `get_plugin_kill_switch` / `set_plugin_kill_switch` take an optional `os`; the audit `target_id`
   gains the `@<os>` suffix. The zero-reach cascades report `kill_switched_os` (permanent) and
   `os_gate_unreadable` (retryable) as distinct causes.
+- **Send-time check.** `AgentRegistry::send_to` and the local-session loop of `send_to_all` also
+  refuse a session whose OS is in the command's set, so every local caller (including
+  `send_system_reserved`) is covered and a session that registers after the dispatch-time presence
+  snapshot is still withheld. The residual is `send_via_directory` (remote ids, no session), which
+  relies on the presence snapshot. A send-time refusal counts as undelivered.
+- **Presence ceiling.** `ids_with_os` reads `live_presence()`, which is `Truncated` above 100,000
+  rows. Above that, a plugin/action with a per-OS row is refused fail-closed with
+  `os_gate_unreadable` until the fleet drops below the cap; this is the same cap `evaluate_scope`
+  already aborts on.
+- **Cascade order.** The aggregate zero-reach cascade keeps the pre-existing #3424 order and so
+  reports `plugin_not_found` ahead of `kill_switched_os`; the per-OS withhold is always disclosed
+  by the `agents_kill_switched_os` / `withheld_kill_switched_os` counts, so a mixed answer is
+  incomplete, not false.
+- **Rollback and mixed versions.** A server older than this change ignores `<plugin>@<os>` rows and
+  applies a `?os=` PUT as the plugin-level row; see the upgrading guide ("Behaviour change: per-OS
+  plugin kill switch rows (#5294)").
 - **Scope.** This is the mechanism only; no plugin is wired to a per-OS seed here.
 
 ### REST authorization — existing operations only

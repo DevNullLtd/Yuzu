@@ -489,7 +489,7 @@ inline ConfinedDispatchOutcome wire_and_dispatch_confined(
     // presence read is skipped: the dispatch then reports `containment_unreadable`,
     // the cause the routed-concerns cascade ranks first, rather than a second
     // store's `os_gate_unreadable` shadowing it.
-    static const std::unordered_set<std::string> kNoOsKillSwitch;
+    static const std::unordered_set<std::string> kNoOsKillSwitch{};
     auto os_kill_switched = registry.ids_with_os(
         (gate.enforced && gate.fail_closed) ? kNoOsKillSwitch : cmd.kill_switched_os());
     if (!os_kill_switched) {
