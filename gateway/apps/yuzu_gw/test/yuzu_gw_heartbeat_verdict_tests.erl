@@ -49,7 +49,11 @@ verdict_test_() ->
       {"ids are deduplicated, sorted and capped at 4096",
        fun ids_are_deduplicated_sorted_and_capped/0},
       {"a verdict with the upstream not running still returns ok",
-       fun verdict_with_upstream_not_running_returns_ok/0}
+       fun verdict_with_upstream_not_running_returns_ok/0},
+      {"a success body that is not a message is no verdict and the buffer survives",
+       fun non_map_body_is_no_verdict/0},
+      {"a verdict field of the wrong type is ignored and the buffer survives",
+       fun wrong_typed_verdict_fields_are_ignored/0}
      ]}.
 
 setup() ->
@@ -198,6 +202,49 @@ verdict_with_upstream_not_running_returns_ok() ->
     ?assert(is_process_alive(Pid)),
     ?assertEqual(Pid, whereis(yuzu_gw_heartbeat_buffer)),
     ?assertEqual(1, dropped(malformed)).
+
+%% grpcbox returns {ok, <<>>, Trailers} for an OK with trailers and no DATA
+%% frame, which reaches the second success arm. Before the guard this raised
+%% badmap inside the buffer and lost every heartbeat it held. The buffered
+%% heartbeat is still counted as flushed (flush returns ok, buffer emptied).
+non_map_body_is_no_verdict() ->
+    Control = <<"verdict-control-nm">>,
+    ok = flush_sync({ok, #{acknowledged_count => 0, unknown_session_ids => [Control]}, #{}}),
+    Pid = whereis(yuzu_gw_heartbeat_buffer),
+    [begin
+         ?assertEqual(ok, flush_sync({ok, Body, #{}})),
+         flush_msg({ok, Body, #{}}),
+         ?assertEqual(Pid, whereis(yuzu_gw_heartbeat_buffer)),
+         ?assert(is_process_alive(Pid))
+     end || Body <- [<<>>, not_a_map, [], 42]],
+    ?assertEqual([[Control]], casts()),
+    ?assertEqual([], events(?EV_TRUNC)),
+    ?assertEqual(0, dropped(malformed)),
+    %% The buffer still works after all of that.
+    S1 = <<"verdict-after-nm">>,
+    ok = flush_sync({ok, #{acknowledged_count => 0, unknown_session_ids => [S1]}, #{}}),
+    ?assertEqual([[Control], [S1]], casts()).
+
+%% A map whose verdict fields have the wrong type, in both success arms: no
+%% cast, no event, buffer alive. A non-boolean truncated flag is not `true'.
+wrong_typed_verdict_fields_are_ignored() ->
+    Control = <<"verdict-control-wt">>,
+    ok = flush_sync({ok, #{acknowledged_count => 0, unknown_session_ids => [Control]}, #{}}),
+    Pid = whereis(yuzu_gw_heartbeat_buffer),
+    Bad = [#{unknown_session_ids => not_a_list},
+           #{unknown_session_ids => <<"abc">>},
+           #{unknown_session_ids => [<<"improper">> | <<"tail">>]},
+           #{unknown_session_ids_truncated => <<"true">>},
+           #{unknown_session_ids_truncated => 1}],
+    [begin
+         ?assertEqual(ok, flush_sync({ok, Body#{acknowledged_count => 0}, #{}})),
+         ?assertEqual(ok, flush_sync({ok, Body, #{}})),
+         flush_msg({ok, Body, #{}}),
+         ?assertEqual(Pid, whereis(yuzu_gw_heartbeat_buffer))
+     end || Body <- Bad],
+    ?assertEqual([[Control]], casts()),
+    ?assertEqual([], events(?EV_TRUNC)),
+    ?assertEqual(0, dropped(malformed)).
 
 %%%===================================================================
 %%% Helpers

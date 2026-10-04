@@ -244,9 +244,14 @@ do_flush(BatchReq, BufLen) ->
 %% them. The kept ids are deduplicated, sorted and capped at
 %% ?MAX_VERDICT_IDS before the cast. The ids are never logged: only counts.
 %% No key, or an empty list, casts nothing.
--spec consume_verdict(map()) -> ok.
-consume_verdict(Response) ->
-    Listed = maps:get(unknown_session_ids, Response, []),
+%%
+%% A body that is not a map is no verdict (grpcbox returns {ok, <<>>, Trailers}
+%% for an OK with trailers and no DATA frame): nothing is cast or counted and
+%% the flush still succeeds. A key of the wrong type is treated as absent. A
+%% crash here would take this process, and every heartbeat it buffers, with it.
+-spec consume_verdict(term()) -> ok.
+consume_verdict(Response) when is_map(Response) ->
+    Listed = listed_ids(maps:get(unknown_session_ids, Response, [])),
     {Kept, Malformed} = lists:partition(fun is_session_id/1, Listed),
     Ids = lists:sublist(lists:usort(Kept), ?MAX_VERDICT_IDS),
     case Listed of
@@ -277,7 +282,20 @@ consume_verdict(Response) ->
     case Ids of
         [] -> ok;
         _  -> yuzu_gw_upstream:replay_sessions(Ids)
-    end.
+    end;
+consume_verdict(_NotAMap) ->
+    logger:debug("Heartbeat verdict: response body is not a message; no verdict"),
+    ok.
+
+%% @doc The listed ids when the field is a proper list, else none.
+listed_ids(Ids) when is_list(Ids) ->
+    try length(Ids) of
+        _ -> Ids
+    catch
+        error:badarg -> []
+    end;
+listed_ids(_) ->
+    [].
 
 is_session_id(Id) ->
     is_binary(Id) andalso byte_size(Id) > 0 andalso byte_size(Id) =< ?MAX_SESSION_ID_BYTES.
