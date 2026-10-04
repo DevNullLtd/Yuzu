@@ -272,7 +272,7 @@ TEST_CASE("filesystem get_acl: a file with an access ACL reports its entries, no
         extended = extended || r == "acl|extended|-";
         if (starts_with(r, "ace|")) {
             ++ace_rows;
-            CHECK_FALSE(r.size() >= 8 && r.substr(r.size() - 8) == "|default");
+            CHECK_FALSE((r.size() >= 8 && r.substr(r.size() - 8) == "|default"));
         }
     }
     CHECK(extended);

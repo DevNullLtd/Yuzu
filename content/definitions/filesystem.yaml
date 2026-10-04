@@ -539,7 +539,9 @@ metadata:
     Retrieve access control list (ACL) or permissions for a file or
     directory. On Windows, returns the SDDL representation and individual
     ACE entries (allow/deny, account, access mask). On Linux/macOS,
-    returns POSIX owner, group, and permission mode (rwxrwxrwx).
+    returns owner, group and permission mode (rwxrwxrwx) plus the extended
+    ACL: POSIX access and default entries on Linux, allow/deny entries with
+    principal, rights and inheritance flags on macOS.
   tags: [filesystem, security, compliance, acl]
 
 spec:

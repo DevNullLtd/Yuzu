@@ -1273,6 +1273,11 @@ private:
                         header->AceType, header->AceFlags,
                         sid ? win_account_for_sid(sid) : std::string{"-"}, mask));
                 }
+            } else {
+                // Never report an unreadable ACL as an empty one.
+                ctx.write_output(
+                    std::format("error|GetAclInformation failed ({})", GetLastError()));
+                return 1;
             }
         }
 
