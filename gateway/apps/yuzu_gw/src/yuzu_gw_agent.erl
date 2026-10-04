@@ -151,9 +151,19 @@ init(#{agent_id := AgentId, agent_info := AgentInfo,
     %% when the upstream connection re-establishes.
     Hostname = maps:get(<<"hostname">>, AgentInfo,
                         maps:get(hostname, AgentInfo, <<>>)),
-    yuzu_gw_registry:register_agent(AgentId, self(), SessionId, Plugins,
-                                    Hostname, RegisterReq, ConnKey),
+    case yuzu_gw_registry:register_agent(AgentId, self(), SessionId, Plugins,
+                                         Hostname, RegisterReq, ConnKey) of
+        ok ->
+            announce_connected(Data);
+        {error, registry_unavailable} ->
+            %% A fixed reason: an init failure is printed by the supervisor and
+            %% by the Subscribe handler, and must not carry the request.
+            {stop, registry_unavailable}
+    end.
 
+%% The rest of init/1, once the agent is in the routing table.
+announce_connected(#data{agent_id = AgentId, session_id = SessionId, peer_addr = PeerAddr,
+                         stream_pid = StreamPid, stream_home_id = StreamHomeId} = Data) ->
     %% Notify WatchEvents subscribers.
     notify_watchers(#{agent_id    => AgentId,
                       occurred_at => #{millis_epoch => erlang:system_time(millisecond)},

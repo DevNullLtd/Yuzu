@@ -83,6 +83,7 @@
 %% evidence; still bounded (NFR — no unbounded process spawn under a slow
 %% upstream). Overflow is dropped best-effort; durable buffering is Guardian A3.
 -define(MAX_GUARDIAN_INFLIGHT, 50).
+-define(DEFAULT_CALL_TIMEOUT_MS, 30000).
 -define(DEFAULT_CB_THRESHOLD, 5).
 -define(DEFAULT_CB_RESET_MS, 10000).
 -define(DEFAULT_CB_MAX_RESET_MS, 300000).
@@ -146,14 +147,23 @@ start_link() ->
 %% @doc Forward a RegisterRequest to the C++ server. The `ok' payload is
 %% whatever the gRPC client handed back: a RegisterResponse map, but a caller
 %% must not assume it (an OK with no DATA frame is not a map).
+%%
+%% Never exits the caller: an upstream that is not running, stalls past the call
+%% timeout or dies serving the call gives `{error, upstream_unavailable}'. The
+%% exit of a gen_server:call carries the request, which here holds the
+%% enrollment token, certificate and CSR, and the caller's own crash handling
+%% (grpcbox logs it) would print it. See yuzu_gw_safe_call.
 -spec proxy_register(map()) -> {ok, term()} | {error, term()}.
 proxy_register(RegisterReq) ->
-    gen_server:call(?SERVER, {proxy_register, RegisterReq}, 30000).
+    yuzu_gw_safe_call:call(?SERVER, {proxy_register, RegisterReq}, call_timeout(),
+                           upstream_unavailable).
 
-%% @doc Forward an InventoryReport to the C++ server.
+%% @doc Forward an InventoryReport to the C++ server. Like proxy_register/1,
+%% never exits the caller: `{error, upstream_unavailable}' instead.
 -spec proxy_inventory(map()) -> {ok, map()} | {error, term()}.
 proxy_inventory(InventoryReport) ->
-    gen_server:call(?SERVER, {proxy_inventory, InventoryReport}, 30000).
+    yuzu_gw_safe_call:call(?SERVER, {proxy_inventory, InventoryReport}, call_timeout(),
+                           upstream_unavailable).
 
 %% @doc Notify C++ server about agent stream connect/disconnect.
 -spec notify_stream_status(binary(), binary() | undefined, connected | disconnected, binary(),
@@ -194,6 +204,16 @@ replay_sessions(SessionIds) ->
 -spec circuit_state() -> closed | open | half_open.
 circuit_state() ->
     gen_server:call(?SERVER, circuit_state, 5000).
+
+%% How long proxy_register/1 and proxy_inventory/1 wait for the upstream
+%% process. The application env key upstream_call_timeout_ms (a positive
+%% integer, ms) overrides the default; it exists so a test can exercise the
+%% timeout without waiting 30 s, and anything else falls back to the default.
+call_timeout() ->
+    case application:get_env(yuzu_gw, upstream_call_timeout_ms, ?DEFAULT_CALL_TIMEOUT_MS) of
+        T when is_integer(T), T > 0 -> T;
+        _                           -> ?DEFAULT_CALL_TIMEOUT_MS
+    end.
 
 %%%===================================================================
 %%% gen_server callbacks

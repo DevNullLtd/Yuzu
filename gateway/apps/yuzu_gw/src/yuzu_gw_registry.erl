@@ -80,7 +80,7 @@ start_link() ->
 %% replay path; it records an empty request, so such an agent is simply
 %% skipped by the replay drip.
 -spec register_agent(binary(), pid(), binary() | undefined,
-                     [binary()], binary()) -> ok.
+                     [binary()], binary()) -> ok | {error, registry_unavailable}.
 register_agent(AgentId, Pid, SessionId, Plugins, Hostname) ->
     register_agent(AgentId, Pid, SessionId, Plugins, Hostname, #{}).
 
@@ -91,7 +91,7 @@ register_agent(AgentId, Pid, SessionId, Plugins, Hostname) ->
 %% agent originally sent; it is stashed so the upstream client can
 %% re-proxy it on reconnect (see all_register_reqs/0).
 -spec register_agent(binary(), pid(), binary() | undefined,
-                     [binary()], binary(), map()) -> ok.
+                     [binary()], binary(), map()) -> ok | {error, registry_unavailable}.
 register_agent(AgentId, Pid, SessionId, Plugins, Hostname, RegisterReq) ->
     register_agent(AgentId, Pid, SessionId, Plugins, Hostname, RegisterReq, undefined).
 
@@ -103,12 +103,19 @@ register_agent(AgentId, Pid, SessionId, Plugins, Hostname, RegisterReq) ->
 %% register with `undefined', which admits nothing. A session id of
 %% `undefined' is not indexed at all.
 -spec register_agent(binary(), pid(), binary() | undefined,
-                     [binary()], binary(), map(), yuzu_gw_conn:key()) -> ok.
+%%
+%% Never exits the caller: a registry that is not running, stalls past the call
+%% timeout or dies serving the call gives `{error, registry_unavailable}'. The
+%% exit of a gen_server:call carries the request, which here holds the stored
+%% RegisterRequest (enrollment token, certificate, CSR). See yuzu_gw_safe_call.
+-spec register_agent(binary(), pid(), binary() | undefined,
+                     [binary()], binary(), map(), yuzu_gw_conn:key()) ->
+          ok | {error, registry_unavailable}.
 register_agent(AgentId, Pid, SessionId, Plugins, Hostname, RegisterReq, ConnKey) ->
-    gen_server:call(?SERVER,
-                    {register, AgentId, Pid, SessionId, Plugins, Hostname, RegisterReq,
-                     ConnKey},
-                    30000).
+    yuzu_gw_safe_call:call(?SERVER,
+                           {register, AgentId, Pid, SessionId, Plugins, Hostname, RegisterReq,
+                            ConnKey},
+                           30000, registry_unavailable).
 
 %% @doc Remove an agent from the routing table.
 %%
