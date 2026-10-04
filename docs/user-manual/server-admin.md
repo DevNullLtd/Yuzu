@@ -5106,9 +5106,12 @@ of 512 KiB: the store query's peak resident memory rose by 99 MiB with the bound
 afterwards is additional. These named routes are not covered by the byte cap: the plain list
 routes (`GET /api/v1/responses/{id}`, the legacy `GET /api/responses/{id}`, MCP `query_responses`,
 `GET /api/v1/executions/{id}/responses`) are capped by row count only, at most 1000 rows of up to
-2 MiB of raw bytes per field (plus the uncut terminal-frame `error_detail`), and the execution visualization route and the dashboard results
-fragment and scan page read up to 10,000 rows with no byte bound; this change does not bound their
-memory. Other internal reads also have no byte bound and take their limit from something other than a
+2 MiB of raw bytes per field (plus the uncut terminal-frame `error_detail`), and the dashboard
+results fragment's filtered branch (it reads by response id) has no byte bound. The execution
+visualization route, the dashboard results fragment's unfiltered read and the TAR
+retention-paused scan page's read are bounded by the same 50 MiB cap in SQL and say so when it
+cuts (`result_truncated_by_cap`, or a visible "truncated" notice on the dashboard).
+Other internal reads also have no byte bound and take their limit from something other than a
 request parameter; for example (not an exhaustive list), the fleet visualization snapshot's collect poll (the number of agents it
 dispatched to, plus 16), the deployment poll (a fixed 50,000), the pre-flight per-check read (a fixed 50,000),
 a bundle execution's result read (1000) and an execution-detail page read (500).

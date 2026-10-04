@@ -19,6 +19,7 @@
 #include "rest_api_v1.hpp"
 #include "response_store.hpp"
 #include "test_route_sink.hpp"
+#include "test_export_cap_guard.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -637,4 +638,51 @@ TEST_CASE("REST visualization: every agent out of scope → empty chart, no leak
     CHECK(body["data"]["meta"]["responses_total"] == 0);
     CHECK(res->body.find("chrome") == std::string::npos);
     CHECK(res->body.find("sshd") == std::string::npos);
+}
+
+// ── #4644 Gate 7 (row 6a): the chart read is byte-bounded and says so when it is cut ──
+
+TEST_CASE("REST visualization: a read cut by the payload cap is flagged result_truncated_by_cap "
+          "(cause byte_cap); an uncut read carries no such keys",
+          "[pg][rest][visualization][cap]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    VizHarness h(pool);
+    nlohmann::json import_body;
+    import_body["id"] = "def-capped";
+    import_body["name"] = "capped-chart";
+    import_body["type"] = "question";
+    import_body["plugin"] = "procfetch";
+    import_body["visualizations"] = nlohmann::json::array({nlohmann::json::object({
+        {"type", "pie"},
+        {"processor", "single_series"},
+        {"title", "By name"},
+        {"labelField", 1},
+    })});
+    REQUIRE(h.instruction_store->import_definition_json(import_body.dump()).has_value());
+    for (int i = 0; i < 3; ++i)
+        h.push_response("cmd-capped", "agent-" + std::to_string(i),
+                        "1|chrome|/usr/bin/chrome|d\n2|chrome|/usr/bin/chrome|d\n");
+
+    const std::string url = "/api/v1/executions/cmd-capped/visualization?definition_id=def-capped";
+
+    // Uncut (the default 50 MiB cap): no truncation keys at all.
+    auto uncut = h.sink.Get(url);
+    REQUIRE(uncut);
+    REQUIRE(uncut->status == 200);
+    auto uncut_data = nlohmann::json::parse(uncut->body)["data"];
+    CHECK_FALSE(uncut_data.contains("result_truncated_by_cap"));
+    CHECK_FALSE(uncut_data.contains("truncation_cause"));
+    CHECK_FALSE(uncut_data.contains("rows_capped"));
+
+    // A cap below one row's payload still serves the first row, drops the rest, and says so.
+    yuzu::test::ExportByteCapGuard guard(40);
+    auto cut = h.sink.Get(url);
+    REQUIRE(cut);
+    REQUIRE(cut->status == 200);
+    auto cut_data = nlohmann::json::parse(cut->body)["data"];
+    CHECK(cut_data["result_truncated_by_cap"] == true);
+    CHECK(cut_data["truncation_cause"] == "byte_cap");
+    // Not the row cap: rows_capped stays absent (it is exact now).
+    CHECK_FALSE(cut_data.contains("rows_capped"));
 }

@@ -329,6 +329,7 @@ std::string tar_retention_paused_json(const TarRetentionPausedScan& scan) {
                {"agents_with_no_paused_sources", scan.agents_with_no_paused_sources},
                {"agents_filtered_out_of_scope", scan.agents_filtered_out_of_scope},
                {"store_degraded", scan.store_degraded},
+               {"result_truncated_by_cap", scan.result_truncated_by_cap},
                {"rows", rows_json}}
         .dump();
 }

@@ -32,6 +32,7 @@
 #include "pg/pg_pool.hpp"
 #include "response_store.hpp"
 #include "test_route_sink.hpp"
+#include "test_export_cap_guard.hpp"
 
 #include "../test_helpers.hpp"
 
@@ -399,4 +400,49 @@ TEST_CASE("/fragments/results: Create Group button still renders for an "
     CHECK(res->status == 200);
     CHECK(contains(res->body, "btn-create-group"));
     CHECK(contains(res->body, "Create Group from 1 Agent"));
+}
+
+// ── #4644 Gate 7 (row 6a): the unfiltered read is byte-bounded and a cut is visible ──
+
+TEST_CASE("/fragments/results: an unfiltered read cut by the payload cap shows a truncation "
+          "notice, an uncut one does not",
+          "[pg][server][dashboard][fragment][cap]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore rs{pool};
+    REQUIRE(rs.is_open());
+    const std::string command_id = "cmd-frag-capped-1";
+    for (const char* agent : {"agent-a", "agent-b", "agent-c"}) {
+        StoredResponse r;
+        r.instruction_id = command_id;
+        r.agent_id = agent;
+        r.received_at_ms = 1000;
+        r.status = 0;
+        r.output = std::string("output from ") + agent + " " + std::string(200, 'x');
+        rs.store(r);
+    }
+
+    FragmentResultsHarness h(&rs);
+    h.routes.set_fleet_read_fn(
+        [](const httplib::Request&, httplib::Response&, const std::string&,
+           const std::string&) -> yuzu::server::authz::FleetReadGate {
+            return {true, std::nullopt};
+        });
+    const std::string url = "/fragments/results?command_id=" + command_id + "&plugin=registry";
+
+    auto uncut = h.get(url);
+    REQUIRE(uncut);
+    CHECK(uncut->status == 200);
+    CHECK(contains(uncut->body, "3 agents"));
+    CHECK_FALSE(contains(uncut->body, "data-result-truncated"));
+
+    // A 300-byte cap keeps two ~215-byte rows (a row is kept while the rows before it are under
+    // the cap) and drops the third: the page must say its rows and counts are partial.
+    yuzu::test::ExportByteCapGuard guard(300);
+    auto cut = h.get(url);
+    REQUIRE(cut);
+    CHECK(cut->status == 200);
+    CHECK(contains(cut->body, "data-result-truncated=\"true\""));
+    CHECK(contains(cut->body, "2 agents"));
+    CHECK_FALSE(contains(cut->body, "3 agents"));
 }

@@ -6135,8 +6135,11 @@ built afterwards is additional. These named routes are **not** covered by the by
 list routes (`GET /api/v1/responses/{id}`, the legacy `GET /api/responses/{id}`, MCP
 `query_responses` and `GET /api/v1/executions/{id}/responses`) are capped by row count only (at
 most 1000 rows of up to 2 MiB of raw bytes per field, before the U+FFFD growth and the uncut terminal-frame `error_detail` described above);
-the execution visualization route and the two dashboard result fetches (the results fragment and
-the scan page) read up to 10,000 rows through the same unbounded `query()`. Other internal reads
+the dashboard results fragment's FILTERED branch (it reads by response id, not through
+`query_bounded`) is not bounded either. **Bounded by the same 50 MiB cap in SQL (#4644 Gate 7):** the
+execution visualization route (`GET /api/v1/executions/{id}/visualization`), the dashboard results
+fragment's unfiltered read and the TAR retention-paused scan page's read, each up to 10,000 rows;
+a cut there is signalled (see those routes), never silent. Other internal reads
 also bypass it and take their limit from something other than a request parameter; for example (not an exhaustive list), the fleet
 visualization snapshot's collect poll sizes it from the number of agents it dispatched to
 (`dispatched.size() + 16`), the deployment poll uses a fixed 50,000, the pre-flight per-check read uses a fixed 50,000,
@@ -7267,6 +7270,8 @@ Render an execution's response set as chart-ready JSON, using the `spec.visualiz
 **Permission:** `require_fleet_read("Response","Read")` (ADR-0017 admit-then-filter — #1634, replaced the flat `Response:Read` gate)
 
 **Confined (#1634).** A management-group-confined operator is admitted and sees only their in-scope agents' rows in the rendered chart — real cross-operator isolation, not the earlier inert per-row filter. The visible-agent set is resolved and pushed into the underlying SQL query before the row cap (ADR-0017 INV-3), so `rows_capped` (below) reflects the CALLER's own scoped cap hit, not a raw-then-filtered one that could fire entirely inside another operator's rows. On a **corrupt or unavailable RBAC store** the endpoint still fails **closed** (`403`/`503`) rather than exposing the whole fleet. When rows are dropped, a SEPARATE `result=denied` audit row fires (`detail` carries `scope_dropped=<N>`), paired with the `result=success` row for the same request — this fires under ordinary operation for a confined caller whose execution spans agents outside their groups, not only on RBAC-store corruption.
+
+**Bounded read (#4644 Gate 7).** The response read behind the chart is capped at 10,000 rows AND 50 MiB of row payload (`output` plus `error_detail`), applied in SQL on whole rows with at least one row always read (the same fetch as the export routes, see [Command/Instruction Responses](#commandinstruction-responses--v1-read-twins-2146-a2-r2)). `rows_capped:true` with `rows_cap:10000` now means more matching rows existed beyond the row cap (it used to be set on a read of exactly 10,000 rows too). When either cap cut the read the payload also carries `result_truncated_by_cap:true` and `truncation_cause` (`row_cap` or `byte_cap`): a chart built from a cut read is a wrong picture, not a smaller one, so a client must show it as partial. The cut is logged but not counted on the export-cut counter, whose `surface` label is a closed set naming the export routes.
 
 **Path parameters:**
 
@@ -10714,7 +10719,7 @@ The **agentic-first (A1) structured surface** for the same destructive purge —
 
 **Request:** no parameters.
 
-**Response:** `{"data":{"scan_id","scan_count","scan_at","agents_responded","agents_with_no_paused_sources","agents_filtered_out_of_scope","store_degraded","rows":[{"agent_id","agent_display","source","paused_at","live_rows","oldest_ts","value_error","enabled_raw"}]},"meta":{"api_version":"v1"}}`. `scan_id` is `""` when the operator has not dispatched a scan yet — `POST /fragments/tar/retention-paused/scan` is dashboard-only today (a mutating dispatch route, out of scope for #4027).
+**Response:** `{"data":{"scan_id","scan_count","scan_at","agents_responded","agents_with_no_paused_sources","agents_filtered_out_of_scope","store_degraded","result_truncated_by_cap","rows":[{"agent_id","agent_display","source","paused_at","live_rows","oldest_ts","value_error","enabled_raw"}]},"meta":{"api_version":"v1"}}`. `result_truncated_by_cap` (#4644 Gate 7) is `true` when the scan's response read hit the 10,000-row or 50 MiB payload cap, so `rows` and the counters are partial: dropped responses read as agents that never answered, i.e. as "collecting normally". It is distinct from `store_degraded` (the read failed outright). `scan_id` is `""` when the operator has not dispatched a scan yet — `POST /fragments/tar/retention-paused/scan` is dashboard-only today (a mutating dispatch route, out of scope for #4027).
 
 **Headers:** `Cache-Control: no-store, private` + `Vary: Cookie` — per-operator-scoped data, same UP-11 posture as the fragment.
 

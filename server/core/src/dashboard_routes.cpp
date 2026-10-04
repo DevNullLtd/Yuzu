@@ -25,6 +25,7 @@
 #include "http_route_sink.hpp"
 #include "instruction_store.hpp"
 #include "management_group_store.hpp"
+#include "response_query_params.hpp" // export_body_byte_cap (#4644 Gate 7, row 6a)
 #include "response_store.hpp"
 #include "response_templates_engine.hpp"
 #include "visualization_engine.hpp"
@@ -2222,13 +2223,25 @@ std::string DashboardRoutes::render_results(
     // sites below (tbody empty-state, #result-summary) so an operator sees "store
     // degraded, not zero matches" rather than a silently wrong "no results".
     bool store_degraded = false;
+    // #4644 Gate 7 (row 6a): set when the unfiltered read below was cut by the row or the
+    // byte cap, so the render says "partial" instead of presenting a cut result as complete.
+    bool result_truncated = false;
     if (filters.empty()) {
-        // No filters — load all responses for this instruction
+        // No filters — load all responses for this instruction. Byte-aware: the 50 MiB
+        // payload cap is applied in SQL (ResponseStore::query_bounded), so the fetch never
+        // materialises up to 10,000 full rows (each output is cut to 2 MiB at ingest) while
+        // holding a lease on the shared Postgres pool. The scope is still applied below,
+        // after the fetch, exactly as before: a cut is therefore reported even when every
+        // dropped row happened to be out of this caller's scope (conservative, never silent).
         ResponseQuery q;
         q.limit = 10000; // upper bound
-        auto responses_opt = response_store_->query(command_id, q);
-        store_degraded = !responses_opt.has_value();
-        responses = responses_opt.value_or(std::vector<StoredResponse>{});
+        auto bounded_opt = response_store_->query_bounded(command_id, q, std::nullopt,
+                                                          export_body_byte_cap().load());
+        store_degraded = !bounded_opt.has_value();
+        if (bounded_opt) {
+            result_truncated = bounded_opt->row_cap_hit || bounded_opt->byte_cap_hit;
+            responses = std::move(bounded_opt->rows);
+        }
         total_agent_count = static_cast<int64_t>(responses.size());
     } else {
         // Use faceted index to get matching response IDs, then load them
@@ -2501,6 +2514,11 @@ std::string DashboardRoutes::render_results(
                 (total_lines != 1 ? "s" : "") + " across " +
                 std::to_string(total_agent_count) + " agent" +
                 (total_agent_count != 1 ? "s" : "");
+        if (result_truncated) {
+            html += " <span class=\"result-degrade-banner\" data-result-truncated=\"true\">"
+                    "truncated: the 10,000-row / 50 MiB read cap was reached, so these "
+                    "rows and counts are partial</span>";
+        }
 
         // Confined-caller withhold (Gate 6 enterprise-readiness finding, this
         // round): /fragments/create-group-form and /api/dashboard/group-from-
@@ -2533,6 +2551,12 @@ std::string DashboardRoutes::render_results(
                     "Create Group from " + std::to_string(total_agent_count) +
                     " Agent" + (total_agent_count != 1 ? "s" : "") + "</button>";
         }
+    } else if (result_truncated) {
+        // Nothing parsed into a visible line, but the read itself was cut: do not let an empty
+        // summary read as "complete, no results".
+        html += "<span class=\"result-degrade-banner\" data-result-truncated=\"true\">"
+                "truncated: the 10,000-row / 50 MiB read cap was reached, so these rows "
+                "and counts are partial</span>";
     }
     html += "</div>";
 
@@ -2919,11 +2943,22 @@ DashboardRoutes::gather_tar_retention_paused(const std::string& username,
     // empty-state render so "store couldn't be read" doesn't get reported as
     // "every collector is running normally" — the operator-facing claim this
     // view exists to make.
+    //
+    // #4644 Gate 7 (row 6a): the read is byte-aware (ResponseStore::query_bounded applies the
+    // 50 MiB payload cap in SQL), because a buggy or hostile agent can store many large
+    // responses under one command_id. A cut is NOT silent: dropped rows would read as agents
+    // that never answered, i.e. as "collecting normally", so `result_truncated_by_cap` is set
+    // and every surface (HTML banner, REST/MCP JSON) reports the result as partial.
     ResponseQuery q;
     q.limit = 10000;
-    auto responses_opt = response_store_->query(scan.scan_id, q);
-    scan.store_degraded = !responses_opt.has_value();
-    auto responses = responses_opt.value_or(std::vector<StoredResponse>{});
+    auto bounded_opt = response_store_->query_bounded(scan.scan_id, q, std::nullopt,
+                                                      export_body_byte_cap().load());
+    scan.store_degraded = !bounded_opt.has_value();
+    std::vector<StoredResponse> responses;
+    if (bounded_opt) {
+        scan.result_truncated_by_cap = bounded_opt->row_cap_hit || bounded_opt->byte_cap_hit;
+        responses = std::move(bounded_opt->rows);
+    }
 
     // Each response is from one agent. Parse each line for
     //   config|<source>_enabled|<value>
@@ -3106,6 +3141,15 @@ std::string DashboardRoutes::render_tar_retention_paused(
                             agents_filtered_out_of_scope == 1 ? "" : "s");
     }
     html += "</div>";
+    if (scan.result_truncated_by_cap) {
+        // A cut read drops whole responses, which reads as agents that never answered, i.e. as
+        // "collecting normally". Say the picture is partial (#4644 Gate 7, row 6a).
+        html += "<div class=\"result-degrade-banner\" data-result-truncated=\"true\">"
+                "<b>Partial result.</b> The scan's response read reached its "
+                "10,000-row / 50 MiB cap, so some agents' responses are missing "
+                "below. This is <b>not</b> confirmation that every collector is "
+                "running normally.</div>";
+    }
 
     if (rows.empty()) {
         // Distinguish "scan still in progress" from "scan complete and clean"

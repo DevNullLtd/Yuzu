@@ -1165,7 +1165,7 @@ const std::string& openapi_spec() {
       "get": {"summary": "List recent offload delivery attempts", "tags": ["Offload"], "description": "Requires Infrastructure:Read. limit query parameter is clamped to [1, 1000]; default 50.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "integer"}}, {"name": "limit", "in": "query", "required": false, "schema": {"type": "integer", "minimum": 1, "maximum": 1000, "default": 50}}], "responses": {"200": {"description": "List of delivery records"}, "404": {"description": "Target not found (deleted, never created, or numeric overflow on id)"}, "503": {"description": "Offload store unavailable"}}}
     },
     "/executions/{id}/visualization": {
-      "get": {"summary": "Render execution responses as chart-ready JSON", "tags": ["Executions"], "description": "Gated by the ADR-0017 admit-then-filter fleet-read primitive (Response:Read). A management-group-confined caller sees chart data built only from their in-scope agents' responses; the row cap and rows_capped signal reflect the caller's own scoped result, not the raw fleet-wide one. The definition_id query parameter is required and must match [A-Za-z0-9._-]+. Returns chart data shaped by the spec.visualization (or spec.visualizations) block on the InstructionDefinition (see yaml-dsl-spec.md). When a definition declares multiple charts, use the optional index query parameter to select among them; default 0. The response payload includes chart_index and chart_count fields so callers can iterate. Caps the underlying response read at 10000 rows; when the cap is hit the payload includes rows_capped:true and rows_cap:10000. Emits an execution.visualization.fetch audit event on every invocation.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}, {"name": "definition_id", "in": "query", "required": true, "schema": {"type": "string"}}, {"name": "index", "in": "query", "required": false, "schema": {"type": "integer", "minimum": 0, "default": 0}, "description": "Chart index when the definition declares multiple visualizations."}], "responses": {"200": {"description": "Chart data payload"}, "400": {"description": "definition_id not provided or index is not a non-negative integer"}, "404": {"description": "Definition not found, no visualization configured, or index out of range"}, "500": {"description": "Visualization spec is invalid"}, "503": {"description": "Service unavailable"}}}
+      "get": {"summary": "Render execution responses as chart-ready JSON", "tags": ["Executions"], "description": "Gated by the ADR-0017 admit-then-filter fleet-read primitive (Response:Read). A management-group-confined caller sees chart data built only from their in-scope agents' responses; the row cap and rows_capped signal reflect the caller's own scoped result, not the raw fleet-wide one. The definition_id query parameter is required and must match [A-Za-z0-9._-]+. Returns chart data shaped by the spec.visualization (or spec.visualizations) block on the InstructionDefinition (see yaml-dsl-spec.md). When a definition declares multiple charts, use the optional index query parameter to select among them; default 0. The response payload includes chart_index and chart_count fields so callers can iterate. Caps the underlying response read at 10000 rows AND at 50 MiB of row payload (output + error_detail, applied in the store query itself, on whole rows, with at least one row always read); when more matching rows exist past the row cap the payload includes rows_capped:true and rows_cap:10000, and when either cap cut the read it includes result_truncated_by_cap:true and truncation_cause (row_cap or byte_cap), because a chart built from a cut read is a wrong picture, not a smaller one. rows_capped is exact: it is not set on a read of exactly 10000 rows. Emits an execution.visualization.fetch audit event on every invocation.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}, {"name": "definition_id", "in": "query", "required": true, "schema": {"type": "string"}}, {"name": "index", "in": "query", "required": false, "schema": {"type": "integer", "minimum": 0, "default": 0}, "description": "Chart index when the definition declares multiple visualizations."}], "responses": {"200": {"description": "Chart data payload"}, "400": {"description": "definition_id not provided or index is not a non-negative integer"}, "404": {"description": "Definition not found, no visualization configured, or index out of range"}, "500": {"description": "Visualization spec is invalid"}, "503": {"description": "Service unavailable"}}}
     },
     "/definitions/{id}/response-templates": {
       "get": {"summary": "List response templates for an InstructionDefinition", "tags": ["Definitions"], "description": "Requires InstructionDefinition:Read. Returns the operator-authored templates plus a synthesised __default__ template (auto-prepended when no operator template is marked default). The synthesised default lists columns from spec.result.columns when populated, otherwise from the plugin's column schema (issue #254, Phase 8.2).", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string", "pattern": "^[A-Za-z0-9._-]{1,128}$"}}], "responses": {"200": {"description": "List of response templates"}, "400": {"description": "Malformed definition id"}, "404": {"description": "Definition not found"}, "503": {"description": "Service unavailable"}}},
@@ -11022,7 +11022,14 @@ void RestApiV1::register_routes(
                 scope_arg = std::move(in_scope); // engaged-empty means no rows
             }
 
-            auto responses_opt = response_store->query(execution_id, q, scope_arg);
+            // #4644 Gate 7 (row 6a): the same byte-aware fetch the export routes use. The
+            // old unbounded query() materialised up to 10,000 full rows (each output is
+            // cut to 2 MiB at ingest) while holding a lease on the shared Postgres pool;
+            // query_bounded applies the 50 MiB payload cap in SQL, so the PGresult and the
+            // parsed vector never hold more than about that much plus one row. Same scope
+            // push-down (ADR-0017 INV-3) and predicates as query().
+            auto responses_opt = response_store->query_bounded(execution_id, q, scope_arg,
+                                                               export_body_byte_cap().load());
             if (!responses_opt) {
                 res.status = 503;
                 res.set_content(detail::a4_error(res, "response store degraded",
@@ -11032,15 +11039,19 @@ void RestApiV1::register_routes(
                          definition_id + " reason=response_store_degraded");
                 return;
             }
-            auto responses = std::move(*responses_opt);
+            const ExportCut cut{responses_opt->row_cap_hit, responses_opt->byte_cap_hit};
+            auto responses = std::move(responses_opt->rows);
             // The scoped query's own LIMIT now bounds the IN-SCOPE result directly,
             // so hitting it means THIS caller's own visible chart data was truncated
             // — more precise than the old raw-then-filtered signal, which could fire
             // on a cap hit entirely inside another operator's out-of-scope rows.
-            bool rows_capped = static_cast<int>(responses.size()) >= kRowCap;
-            if (rows_capped) {
-                spdlog::warn("visualization row cap hit ({} rows): execution={} definition={}",
-                             kRowCap, execution_id, definition_id);
+            // `rows_capped` is now exact (more matching rows existed beyond the cap):
+            // the old `size >= kRowCap` also fired on a result of exactly kRowCap rows.
+            const bool rows_capped = cut.row_cap;
+            if (cut.any()) {
+                spdlog::warn("visualization cap hit (cause={}, {} rows served): execution={} "
+                             "definition={}",
+                             cut.cause(), responses.size(), execution_id, definition_id);
             }
 
             VisualizationEngine engine;
@@ -11067,6 +11078,14 @@ void RestApiV1::register_routes(
                 if (rows_capped) {
                     final_json += ",\"rows_capped\":true,\"rows_cap\":";
                     final_json += std::to_string(kRowCap);
+                }
+                // A chart built from a cut result is a wrong picture, not a smaller one:
+                // say so, and why (the row cap, or the 50 MiB payload cap, which drops
+                // whole rows and is not otherwise visible in the payload).
+                if (cut.any()) {
+                    final_json += ",\"result_truncated_by_cap\":true,\"truncation_cause\":\"";
+                    final_json += cut.cause();
+                    final_json += "\"";
                 }
                 final_json += "}";
             }

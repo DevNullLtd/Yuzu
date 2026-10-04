@@ -145,10 +145,11 @@ inline constexpr int kQueryRowLimitCap = 1000;
 ///      escaping and JSON framing make the SERIALIZED row larger than its raw payload.
 /// Both cut on whole rows and always serve at least one row. The NAMED routes below are not
 /// bounded by it: the plain list routes (`GET .../responses/{id}`, MCP `query_responses` and
-/// `GET /api/v1/executions/{id}/responses`: each at most 1000 rows, no byte bound), the
-/// execution visualization route (`query()` with a 10,000-row limit), and the dashboard
-/// `/fragments/results` and scan-page fetches (`query()` with limit 10,000); none of
-/// those goes through `query_bounded`. Other internal reads are likewise unbounded by
+/// `GET /api/v1/executions/{id}/responses`: each at most 1000 rows, no byte bound) and the
+/// dashboard `/fragments/results` FILTERED branch (it reads by response id); none of those goes
+/// through `query_bounded`. The execution visualization route, the `/fragments/results`
+/// unfiltered read and the TAR scan-page read DO (#4644 Gate 7, row 6a), each reporting a cut
+/// explicitly. Other internal reads are likewise unbounded by
 /// bytes and take their limit from something other than a request parameter; for example
 /// (not an exhaustive list) server.cpp's fleet visualization snapshot collect poll
 /// (limit = dispatched agents + 16) and deployment poll (a fixed 50,000), the pre-flight

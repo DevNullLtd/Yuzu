@@ -26,6 +26,7 @@
  */
 
 #include "dashboard_routes.hpp"
+#include "test_export_cap_guard.hpp"
 #include "management_group_store.hpp"
 #include "pg/pg_pool.hpp"
 #include "response_store.hpp"
@@ -35,6 +36,8 @@
 #include "../test_helpers.hpp"
 
 #include <catch2/catch_test_macros.hpp>
+
+#include <nlohmann/json.hpp>
 
 #include <initializer_list>
 #include <stdexcept>
@@ -438,6 +441,48 @@ TEST_CASE("render_tar_retention_paused: a degraded store read renders the "
     CHECK(contains(html, "Retention state unavailable"));
     CHECK_FALSE(contains(html, "No paused sources detected"));
     CHECK_FALSE(contains(html, "still in progress"));
+}
+
+// ── #4644 Gate 7 (row 6a): the scan read is byte-bounded and a cut is reported ───
+
+TEST_CASE("gather_tar_retention_paused: a read cut by the payload cap sets "
+          "result_truncated_by_cap, renders a partial-result banner and serialises the flag",
+          "[pg][server][tar][retention-render][cap]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore rs{pool};
+    yuzu::test::ManagementGroupStorePg mg_bundle;
+    ManagementGroupStore& mg = *mg_bundle;
+    grant_visibility(mg, {"agent-A", "agent-B", "agent-C"});
+    for (const char* agent : {"agent-A", "agent-B", "agent-C"})
+        rs.store(mk_resp(agent, 10,
+                         "config|process_enabled|false\nconfig|process_paused_at|1710000000\n"));
+
+    DashboardTarRetentionTestAccess acc;
+    acc.set_stores(&rs, &mg);
+    acc.set_scan(kUser, kScan, 3, 1);
+
+    // Uncut: every response read, no flag, no banner, the JSON carries an explicit false.
+    {
+        const auto scan = acc.routes.gather_tar_retention_paused(kUser);
+        CHECK_FALSE(scan.result_truncated_by_cap);
+        CHECK(scan.agents_responded == 3);
+        CHECK_FALSE(contains(acc.render(kUser), "Partial result"));
+        CHECK(nlohmann::json::parse(tar_retention_paused_json(scan))["result_truncated_by_cap"] ==
+              false);
+    }
+
+    // Each response is ~70 bytes; a 100-byte cap keeps two and drops the third.
+    yuzu::test::ExportByteCapGuard guard(100);
+    const auto scan = acc.routes.gather_tar_retention_paused(kUser);
+    CHECK(scan.result_truncated_by_cap);
+    CHECK(scan.agents_responded == 2); // the dropped response reads as an agent that never answered
+    CHECK_FALSE(scan.store_degraded);  // a cut is not a failed read
+    const auto html = acc.render(kUser);
+    CHECK(contains(html, "data-result-truncated=\"true\""));
+    CHECK(contains(html, "Partial result"));
+    CHECK(nlohmann::json::parse(tar_retention_paused_json(scan))["result_truncated_by_cap"] ==
+          true);
 }
 
 } // namespace yuzu::server
