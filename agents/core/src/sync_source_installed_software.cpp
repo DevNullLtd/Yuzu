@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <chrono>
 #include <optional>
+#include <string>
 #include <string_view>
 #include <utility>
 
@@ -26,10 +27,12 @@ constexpr std::size_t kMaxFieldLen = 1024;
 // headroom for the InventoryReport's proto/map framing + content_hashes +
 // collected_at on top of the blob. At 4 MiB the wire message would exceed the
 // 4 MiB receive ceiling and the RPC would be rejected before the handler runs —
-// a permanent tight retry loop (governance UP-6). A 3 MiB canonical blob is
-// ~20k v2 entries (~150 B/record with the 12-field blob-v2 layout), which
-// matches kMaxEntries as the binding limit; no real machine reaches it, and an
-// over-cap host is dropped (governance UP-4) rather than looping. Lowering this
+// a permanent tight retry loop (governance UP-6). Real captures measure ~111-113 B
+// per record including the 16-field tail (Mac: 460 records / 51,062 B; Windows:
+// 378 / 42,556 B; tests/unit/test_inventory_sync.cpp); a dense host at ~150 B per
+// 12-field record plus the ~35 B tail (~185 B) hits this byte cap near ~17k
+// records, before kMaxEntries (20k). No real machine reaches either; an over-cap
+// host is dropped (governance UP-4) rather than looping. Lowering this
 // trades "outlier host skips" for "outlier host loops" — the right call for
 // installed software.
 constexpr std::size_t kMaxBlobBytes = 3u * 1024 * 1024;
@@ -41,9 +44,10 @@ constexpr std::size_t kMaxBlobBytes = 3u * 1024 * 1024;
 // server's canonical hashes diverge → permanent always-full. This source's
 // field cap is kMaxFieldLen above (comment-coordinated with the server seam).
 
-// Sort/dedup key walks ALL 12 v2 fields in blob order. MUST mirror the server's
-// entry_less/entry_equal (software_inventory_store.cpp) or the two sides'
-// canonical hashes diverge → permanent always-full.
+// Sort/dedup key walks the 12 v2 fields then the package_id/source tail, in blob
+// order. MUST mirror the server's entry_less/entry_equal
+// (software_inventory_store.cpp) or the two sides' canonical hashes diverge →
+// permanent always-full.
 bool entry_less(const SwEntry& a, const SwEntry& b) {
     if (a.name != b.name)
         return a.name < b.name;
@@ -67,7 +71,13 @@ bool entry_less(const SwEntry& a, const SwEntry& b) {
         return a.signature_status < b.signature_status;
     if (a.distro_id != b.distro_id)
         return a.distro_id < b.distro_id;
-    return a.distro_version < b.distro_version;
+    if (a.distro_version != b.distro_version)
+        return a.distro_version < b.distro_version;
+    // Extended tail LAST, package_id then source — byte-for-byte the server's
+    // comparator (software_inventory_store.cpp).
+    if (a.package_id != b.package_id)
+        return a.package_id < b.package_id;
+    return a.source < b.source;
 }
 
 bool entry_equal(const SwEntry& a, const SwEntry& b) {
@@ -75,15 +85,23 @@ bool entry_equal(const SwEntry& a, const SwEntry& b) {
            a.install_date == b.install_date && a.kind == b.kind && a.ecosystem == b.ecosystem &&
            a.epoch == b.epoch && a.release == b.release && a.arch == b.arch &&
            a.signature_status == b.signature_status && a.distro_id == b.distro_id &&
-           a.distro_version == b.distro_version;
+           a.distro_version == b.distro_version && a.package_id == b.package_id &&
+           a.source == b.source;
 }
 
-} // namespace
+// The single sort + dedup in the server's comparator order, shared by the cap
+// check and the canonical blob.
+void normalize_installed_software(std::vector<SwEntry>& entries) {
+    std::sort(entries.begin(), entries.end(), entry_less);
+    entries.erase(std::unique(entries.begin(), entries.end(), entry_equal), entries.end());
+}
 
-std::vector<SwEntry> parse_installed_apps_output(const std::string& out) {
-    std::vector<SwEntry> entries;
+// ── shared line/token splitters (installed_apps + the pkg/wof adapters) ──
+
+// Calls `fn(line)` for every non-empty line (CRLF-tolerant) until it returns false.
+template <class Fn> void for_each_line(const std::string& out, Fn&& fn) {
     std::size_t pos = 0;
-    while (pos < out.size() && entries.size() < kMaxEntries) {
+    while (pos < out.size()) {
         std::size_t eol = out.find('\n', pos);
         if (eol == std::string::npos)
             eol = out.size();
@@ -93,25 +111,110 @@ std::vector<SwEntry> parse_installed_apps_output(const std::string& out) {
         pos = eol + 1;
         if (line.empty())
             continue;
+        if (!fn(line))
+            return;
+    }
+}
 
+// Split on '|' into at most `max` tokens; anything past the max-th token is dropped.
+std::vector<std::string_view> split_tokens(std::string_view line, std::size_t max) {
+    std::vector<std::string_view> tok;
+    std::size_t fp = 0;
+    while (tok.size() < max) {
+        std::size_t bar = line.find('|', fp);
+        if (bar == std::string_view::npos) {
+            tok.push_back(line.substr(fp));
+            break;
+        }
+        tok.push_back(line.substr(fp, bar - fp));
+        fp = bar + 1;
+    }
+    return tok;
+}
+
+AdaptedRows failed(std::string reason) {
+    AdaptedRows r;
+    r.status = AdaptedRows::Status::failed;
+    r.reason = std::move(reason);
+    return r;
+}
+
+// `pkg_inventory` grammar (pkg_inventory_parsers.hpp format_status_row /
+// format_manager_row / format_package_row): exactly one
+// `status|<action>|<supported|constrained|unsupported>|<tokens or ->` row, plus
+// data rows. Status decides success; malformed DATA rows are dropped. A status
+// row answering a different action is not counted (-> "bad status").
+template <class OnRow>
+AdaptedRows adapt_pkg_inventory(const std::string& out, std::string_view action, OnRow on_row) {
+    AdaptedRows res;
+    int status_rows = 0;
+    std::string level;
+    std::string reason;
+    for_each_line(out, [&](std::string_view line) {
+        const auto tok = split_tokens(line, 8);
+        if (tok[0] == "status") {
+            if (tok.size() >= 4 && tok[1] == action) {
+                ++status_rows;
+                level = std::string(tok[2]);
+                reason = std::string(tok[3]);
+            }
+            return true;
+        }
+        on_row(tok, res.entries);
+        return res.entries.size() <= kMaxEntries;
+    });
+    if (status_rows != 1 || (level != "supported" && level != "constrained" && level != "unsupported"))
+        return failed("bad status");
+    if (level == "constrained")
+        return failed(reason);
+    if (level == "unsupported") {
+        res.entries.clear();
+        res.status = AdaptedRows::Status::unsupported;
+    }
+    return res;
+}
+
+// One table row per inventory action. Adding an action = one row + one pure adapter.
+struct InventoryAction {
+    std::string_view plugin;
+    std::string_view action;
+    AdaptedRows (*adapt)(const std::string& captured);
+};
+
+// UP-IN6 preserved per plugin: installed_apps always reports >= 1 application on a
+// real endpoint, so an empty parse is a plugin hiccup, NOT "everything uninstalled".
+// Sending the other plugins' rows alone would DELETE the stored apps.
+AdaptedRows adapt_installed_apps(const std::string& captured) {
+    AdaptedRows r;
+    r.entries = parse_installed_apps_output(captured);
+    if (r.entries.empty())
+        return failed("no inv rows");
+    return r;
+}
+
+const InventoryAction kInventoryActions[] = {
+    {"installed_apps", "list_inventory", adapt_installed_apps},
+    {"pkg_inventory", "managers", parse_pkg_inventory_managers_output},
+    {"pkg_inventory", "packages", parse_pkg_inventory_packages_output},
+    {"windows_optional_features", "list", parse_windows_optional_features_output},
+};
+
+} // namespace
+
+std::vector<SwEntry> parse_installed_apps_output(const std::string& out) {
+    std::vector<SwEntry> entries;
+    // Reads ONE PAST kMaxEntries so the collector's per-action raw-count check can
+    // see an over-cap host and skip the cycle rather than hash a silently truncated
+    // list.
+    for_each_line(out, [&entries](std::string_view line) {
         // Split on '|' into up to 13 tokens (the `inv` prefix + 12 v2 fields).
         // Anything past the 13th token is dropped — the same truncation the
         // server's parse applies past field 12, so fields can never shift.
-        std::vector<std::string_view> tok;
-        std::size_t fp = 0;
-        while (tok.size() < 13) {
-            std::size_t bar = line.find('|', fp);
-            if (bar == std::string_view::npos) {
-                tok.push_back(line.substr(fp));
-                break;
-            }
-            tok.push_back(line.substr(fp, bar - fp));
-            fp = bar + 1;
-        }
+        const auto tok = split_tokens(line, 13);
         if (tok.empty() || tok[0] != "inv")
-            continue; // skip app|, user_app|, error|, found|, etc.
+            return true; // skip app|, user_app|, error|, found|, etc.
         if (tok.size() < 2 || tok[1].empty())
-            continue; // malformed / empty name
+            return true; // malformed / empty name
 
         // Blob contract v2 field order; missing trailing tokens → empty fields.
         SwEntry e;
@@ -134,19 +237,108 @@ std::vector<SwEntry> parse_installed_apps_output(const std::string& out) {
         // name). The server's parse_software_blob drops empty-name rows, so the
         // agent must too or the two canonical hashes diverge → permanent
         // always-full (governance UP-1). Mirrors the server's `!e.name.empty()`.
-        if (e.name.empty())
-            continue;
-        entries.push_back(std::move(e));
-    }
+        if (!e.name.empty())
+            entries.push_back(std::move(e));
+        return entries.size() <= kMaxEntries;
+    });
     return entries;
 }
 
+AdaptedRows parse_pkg_inventory_packages_output(const std::string& out) {
+    // package|homebrew|<id>|<version>|<formula|cask>
+    return adapt_pkg_inventory(out, "packages",
+                               [](const std::vector<std::string_view>& tok,
+                                  std::vector<SwEntry>& entries) {
+        if (tok[0] != "package" || tok.size() != 5 || tok[1] != "homebrew")
+            return;
+        SwEntry e;
+        e.name = clamp_field(tok[2], kMaxFieldLen);
+        if (e.name.empty())
+            return;
+        if (tok[4] == "formula")
+            e.kind = "pkg";
+        else if (tok[4] == "cask")
+            e.kind = "app";
+        else
+            return;
+        e.version = clamp_field(tok[3], kMaxFieldLen);
+        e.ecosystem = "brew";
+        entries.push_back(std::move(e));
+    });
+}
+
+AdaptedRows parse_pkg_inventory_managers_output(const std::string& out) {
+    // manager|<name>|<present|unavailable>|<version or ->|<root>|<facts>|<reason>
+    // A PRESENCE row only (the v2 row has no field for the prefix, so two Homebrew
+    // prefixes collapse to one row after dedup). Homebrew-only: any other manager
+    // name (dpkg/apt/rpm/dnf/pacman/apk) is dropped — the Linux/Windows managers
+    // legs must add a deliberate mapping, and manager facts belong to facet rows.
+    return adapt_pkg_inventory(out, "managers",
+                               [](const std::vector<std::string_view>& tok,
+                                  std::vector<SwEntry>& entries) {
+        if (tok[0] != "manager" || tok.size() != 7 || tok[2] != "present")
+            return;
+        if (tok[1] != "homebrew") {
+            spdlog::debug("sync: pkg_inventory manager '{}' has no installed_software mapping — "
+                          "dropped",
+                          tok[1]);
+            return;
+        }
+        SwEntry e;
+        e.name = "homebrew";
+        e.version = tok[3] == "-" ? std::string{} : clamp_field(tok[3], kMaxFieldLen);
+        e.kind = "app";
+        e.ecosystem = "brew";
+        entries.push_back(std::move(e));
+    });
+}
+
+AdaptedRows parse_windows_optional_features_output(const std::string& out) {
+    // windows_optional_features_parsers.hpp: `feature|<name>|<state>|<0/1>` per
+    // feature (no status row in this grammar); sentinels are 3-token
+    // `feature|unsupported|<token>` / `feature|unavailable|<token>`. The restart
+    // flag is dropped (transient, no slot); the state token rides in `version`.
+    AdaptedRows res;
+    AdaptedRows sentinel; // status != ok once an unsupported/unavailable sentinel row is seen
+    for_each_line(out, [&](std::string_view line) {
+        const auto tok = split_tokens(line, 5);
+        if (tok[0] != "feature")
+            return true;
+        if (tok.size() == 3 && tok[1] == "unsupported") {
+            sentinel.status = AdaptedRows::Status::unsupported;
+            return false;
+        }
+        if (tok.size() == 3 && tok[1] == "unavailable") {
+            sentinel = failed(std::string(tok[2]));
+            return false;
+        }
+        if (tok.size() != 4)
+            return true;
+        SwEntry e;
+        e.name = clamp_field(tok[1], kMaxFieldLen);
+        if (e.name.empty())
+            return true;
+        e.version = clamp_field(tok[2], kMaxFieldLen);
+        e.kind = "feat";
+        e.ecosystem = "optional_feature";
+        res.entries.push_back(std::move(e));
+        return res.entries.size() <= kMaxEntries;
+    });
+    if (sentinel.status != AdaptedRows::Status::ok)
+        return sentinel;
+    if (res.entries.empty())
+        return failed("no rows");
+    return res;
+}
+
 std::string installed_software_canonical_blob(std::vector<SwEntry> entries) {
-    std::sort(entries.begin(), entries.end(), entry_less);
-    entries.erase(std::unique(entries.begin(), entries.end(), entry_equal), entries.end());
+    normalize_installed_software(entries);
     // Blob contract v2: 12 fields, 0x1F-separated, in this exact order, record-
     // terminated 0x1E — byte-identical to the server's canonical_hash walk
-    // (software_inventory_store.cpp). Append-only: never reorder.
+    // (software_inventory_store.cpp). Append-only: never reorder. The 4-field tail
+    // (reserved install_location, reserved uninstall_string, package_id, source)
+    // is appended whole only when package_id or source is non-empty, so a 12-field
+    // entry hashes exactly as it always did.
     std::string canon;
     canon.reserve(entries.size() * 96);
     for (const auto& e : entries) {
@@ -173,17 +365,27 @@ std::string installed_software_canonical_blob(std::vector<SwEntry> entries) {
         canon += e.distro_id;
         canon += '\x1f';
         canon += e.distro_version;
+        if (!e.package_id.empty() || !e.source.empty()) {
+            canon += "\x1f\x1f"; // reserved slots 13-14: always empty
+            canon += '\x1f';
+            canon += e.package_id;
+            canon += '\x1f';
+            canon += e.source;
+        }
         canon += '\x1e';
     }
     return canon;
 }
 
-SyncSource make_installed_software_source(const YuzuPluginDescriptor* descriptor) {
+SyncSource make_installed_software_source(SyncPluginMap plugins) {
     SyncSource src;
     src.name = "installed_software";
     src.interval = std::chrono::hours{24};
-    src.collect = [descriptor]() -> std::optional<std::pair<std::string, std::string>> {
-        if (descriptor == nullptr) {
+    src.collect = [plugins = std::move(plugins)]() -> std::optional<std::pair<std::string, std::string>> {
+        // installed_apps anchors the report (UP-IN6): without it the other
+        // plugins' rows alone would replace the stored inventory.
+        const auto anchor = plugins.find("installed_apps");
+        if (anchor == plugins.end() || anchor->second == nullptr) {
             spdlog::debug("sync: installed_apps plugin not loaded — installed_software source idle");
             return std::nullopt;
         }
@@ -191,37 +393,64 @@ SyncSource make_installed_software_source(const YuzuPluginDescriptor* descriptor
         // Per-call capture cap: v2's 12-field rows (~200 B each raw) would
         // saturate the shared 2 MiB default around ~14k packages, turning a
         // dense host into a permanent silent cycle-skip. 3.5 MiB re-aligns the
-        // capture ceiling with kMaxEntries (20k) as the binding limit: a 20k-row
-        // canonical blob is ~2.8 MB, still under kMaxBlobBytes (3 MiB) and the
-        // 4 MiB gRPC receive ceiling. The shared default stays 2 MiB.
+        // capture ceiling with the 3 MiB blob cap (a ~17k-row blob is ~3 MiB; raw rows
+        // are larger than their canonical form). The shared default stays 2 MiB.
         constexpr std::size_t kInventoryCaptureCap = 3'670'016; // 3.5 MiB
-        LocalDispatcher::Result r =
-            dispatcher.run(descriptor, "list_inventory", {}, kInventoryCaptureCap);
-        if (r.rc != 0) {
-            spdlog::warn("sync: installed_apps 'list_inventory' rc={} — skipping this cycle", r.rc);
+        std::vector<SwEntry> all;
+        for (const auto& row : kInventoryActions) {
+            const auto it = plugins.find(row.plugin);
+            if (it == plugins.end() || it->second == nullptr) {
+                spdlog::debug("sync: {} plugin not loaded — {} skipped", row.plugin, row.action);
+                continue;
+            }
+            LocalDispatcher::Result r =
+                dispatcher.run(it->second, row.action, {}, kInventoryCaptureCap);
+            if (r.rc != 0 || r.truncated) {
+                // A truncated capture would yield a partial inventory and a hash that
+                // flip-flops (mirrors the snapshot pump) — drop the cycle.
+                spdlog::warn("sync: {}.{} rc={}{} — skipping this cycle", row.plugin, row.action,
+                             r.rc, r.truncated ? " (output truncated at the capture cap)" : "");
+                return std::nullopt;
+            }
+            AdaptedRows rows = row.adapt(r.captured);
+            if (rows.entries.size() > kMaxEntries) {
+                // Every adapter stops reading at kMaxEntries + 1 RAW rows, so the post-
+                // dedup merged check below cannot see the overflow once exact
+                // duplicates pull the count back under the cap — a truncated inventory
+                // would ship as complete. Same UP-4 posture as the byte cap.
+                spdlog::warn("sync: {}.{} read more than {} rows — skipping this cycle",
+                             row.plugin, row.action, kMaxEntries);
+                return std::nullopt;
+            }
+            if (rows.status == AdaptedRows::Status::unsupported) {
+                spdlog::debug("sync: {}.{} unsupported on this OS — skipped", row.plugin,
+                              row.action);
+                continue;
+            }
+            if (rows.status == AdaptedRows::Status::failed) {
+                spdlog::warn("sync: {}.{} failed: {} — skipping this cycle", row.plugin, row.action,
+                             rows.reason);
+                return std::nullopt;
+            }
+            std::string source = std::string(row.plugin) + '.' + std::string(row.action);
+            for (auto& e : rows.entries) {
+                e.source = source;
+                all.push_back(std::move(e));
+            }
+        }
+        if (all.empty()) {
+            spdlog::debug("sync: installed_software collected no rows — skipping this cycle");
             return std::nullopt;
         }
-        if (r.truncated) {
-            // The capture hit the byte cap — parsing it would yield a partial
-            // inventory and a hash that flip-flops. Drop this cycle rather than
-            // sync wrong data (mirrors the snapshot pump).
-            spdlog::warn("sync: installed_apps 'list_inventory' output truncated at the capture "
-                         "cap — skipping this cycle");
+        normalize_installed_software(all);
+        if (all.size() > kMaxEntries) {
+            // The server keeps the first kMaxEntries in blob order, so its hash would
+            // diverge from ours → permanent need_full. Same UP-4 posture as the byte cap.
+            spdlog::warn("sync: installed_software {} entries exceed {} cap — skipping this cycle",
+                         all.size(), kMaxEntries);
             return std::nullopt;
         }
-        auto entries = parse_installed_apps_output(r.captured);
-        if (entries.empty()) {
-            // A real endpoint always reports >= 1 application; an empty parse is a
-            // transient plugin hiccup (or an old plugin without the action → rc!=0
-            // above), NOT a genuine "everything uninstalled". Sending an empty full
-            // payload would DELETE the agent's stored inventory and the server
-            // would record the wipe as a successful store (governance UP-IN6). Skip
-            // the cycle and keep the last good state; the next cycle re-collects.
-            spdlog::debug("sync: installed_apps 'list_inventory' yielded no entries — skipping "
-                          "this cycle (not wiping stored inventory)");
-            return std::nullopt;
-        }
-        std::string blob = installed_software_canonical_blob(std::move(entries));
+        std::string blob = installed_software_canonical_blob(std::move(all));
         if (blob.size() > kMaxBlobBytes) {
             spdlog::warn("sync: installed_software blob {} B exceeds {} B cap — skipping this "
                          "cycle (won't send an un-storable payload)",

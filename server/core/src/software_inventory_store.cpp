@@ -269,11 +269,10 @@ std::string sha256_hex(const std::string& in) {
 // Sort/dedup key walks every STORED field in blob order (name..source; wire slots 13-14
 // are reserved and not stored) so two entries differing only in one field are distinct
 // rows, not duplicates.
-// The agent sorts and dedups on its 12 fields (sync_source_installed_software.cpp); this
-// adds package_id and source, which no shipped agent fills, so the two agree today. The
-// agent change (#5186) must extend its key the same way, or the canonical hashes diverge
-// → permanent always-full. Records differing only in the reserved slots 13-14 collapse
-// to one row here.
+// The agent (sync_source_installed_software.cpp) sorts and dedups on the same fields in
+// the same order, package_id and source last; the two must stay identical or the canonical
+// hashes diverge → permanent always-full. Records differing only in the reserved slots
+// 13-14 collapse to one row here.
 bool entry_less(const SoftwareEntry& a, const SoftwareEntry& b) {
     if (a.name != b.name)
         return a.name < b.name;

@@ -222,7 +222,7 @@ endif
 agent_test_openssl_dep = dependency('openssl', required: true, include_type: 'system')
 
 # Test fixtures deliberately partial-aggregate-init wide inventory structs
-# (SwEntry is 12 fields, SoftwareEntry 14 stored members (16 wire slots); a 4-field
+# (SwEntry and SoftwareEntry are 14 members each (16 wire slots); a 4-field
 # init IS the contract — "the rest stays empty"). -Wextra's
 # missing-field-initializers would flag every such fixture; suppress it for
 # the TEST targets only — production code stays fully warned.
@@ -654,6 +654,11 @@ agent_test_exe = executable(
              # CAPTURE tree manifest via this same define.
              '-DYUZU_TEST_FIXTURE_DIR="' +
              (meson.project_source_root() / 'tests' / 'unit' / 'fixtures').replace('\\', '/') +
+             '"',
+             # test_inventory_sync.cpp reads the plugins' REAL CAPTURE samples
+             # (agents/plugins/*/docs/samples/*.txt) at run time via this define.
+             '-DYUZU_PLUGIN_SRC_DIR="' +
+             (meson.project_source_root() / 'agents' / 'plugins').replace('\\', '/') +
              '"'] +
             # /bigobj: test_spark_mechanism.cpp (15k lines) and test_guardian_spark_runtime.cpp
             # hit MSVC's hard C1128 limit (65,279 sections per object) in the nightly

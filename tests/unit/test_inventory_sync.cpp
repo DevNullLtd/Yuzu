@@ -7,24 +7,36 @@
 #include "local_dispatcher.hpp"
 #include "sync_canonical.hpp" // sha256_hex
 #include "sync_scheduler.hpp"
+#include "pkg_inventory_parsers.hpp"
 #include "sync_source_installed_software.hpp"
+#include "windows_optional_features_parsers.hpp"
 
 #include <yuzu/plugin.h>
 
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <map>
 #include <optional>
 #include <set>
+#include <sstream>
+#include <string_view>
 #include <string>
 #include <utility>
 #include <vector>
 
+using yuzu::agent::AdaptedRows;
 using yuzu::agent::installed_software_canonical_blob;
+using yuzu::agent::make_installed_software_source;
+using yuzu::agent::parse_pkg_inventory_managers_output;
+using yuzu::agent::parse_pkg_inventory_packages_output;
+using yuzu::agent::parse_windows_optional_features_output;
 using yuzu::agent::parse_installed_apps_output;
 using yuzu::agent::sha256_hex;
 using yuzu::agent::SwEntry;
+using yuzu::agent::SyncPluginMap;
 using yuzu::agent::SyncScheduler;
 using yuzu::agent::SyncSource;
 
@@ -732,4 +744,678 @@ TEST_CASE("SyncScheduler: a forced source's own RPC failure retries next tick, "
     REQUIRE(fx.calls.size() == 2);
     CHECK(fx.calls[1] == std::vector<std::string>{"slow"});
     CHECK(fx.collect_counts == std::vector<int>{0, 0, 2});
+}
+
+// ============================================================================
+// Extended tail pins, action adapters and the multi-action collector
+// ============================================================================
+
+namespace {
+namespace fs = std::filesystem;
+namespace pkg = yuzu::pkg_inventory;
+using Status = AdaptedRows::Status;
+
+// Server-side fixtures, copied verbatim from
+// tests/unit/server/test_software_inventory_store.cpp: the agent builder and the
+// server's canonical_hash must produce these exact digests (blob v2 + 4-slot tail).
+constexpr const char* kCrossPinHashExtended =
+    "371b647c95b0f48a039ff98790c6085947ef71fcfd40a399c3cd70d70321291d";
+constexpr const char* kTailOrderPinHash =
+    "ab2abf993a2b0868b9c69397497799920773fd44c29cde86380e8c4369ccbe8d";
+constexpr const char* kMixedBlobHash =
+    "7b37bca935f3ae92a042949ef4280d69b25edc8ee6e518f993ded0eeec7e76f3";
+
+SwEntry full_extended_entry() {
+    SwEntry e = full_v2_entry();
+    e.package_id = "bash-5.2.21-3.fc40.x86_64";
+    e.source = "installed_apps.list_inventory";
+    return e;
+}
+
+// Lines strictly between `== action=<action>` and the next `== action=` /
+// `[result_status]` line of a committed real capture. Never skips: a missing
+// sample is a failure. The record counts pinned in the collector tests below are
+// tied to the committed captures: re-measure them when a sample is refreshed.
+std::string capture_section(const char* plugin, const char* sample, std::string_view action) {
+    const fs::path p = fs::path(YUZU_PLUGIN_SRC_DIR) / plugin / "docs" / "samples" / sample;
+    REQUIRE(fs::exists(p));
+    std::ifstream in(p);
+    std::string line;
+    std::string out;
+    bool on = false;
+    const std::string want = "== action=" + std::string(action);
+    while (std::getline(in, line)) {
+        if (line.rfind("== action=", 0) == 0) {
+            on = (line == want);
+            continue;
+        }
+        if (line.rfind("[result_status]", 0) == 0) {
+            on = false;
+            continue;
+        }
+        if (on)
+            out += line + '\n';
+    }
+    REQUIRE_FALSE(out.empty());
+    return out;
+}
+
+std::string nl(std::initializer_list<std::string> lines) {
+    std::string out;
+    for (const auto& l : lines)
+        out += l + '\n';
+    return out;
+}
+
+std::vector<std::string> records_of(const std::string& blob) {
+    std::vector<std::string> recs;
+    std::size_t pos = 0;
+    while (pos < blob.size()) {
+        const std::size_t e = blob.find('\x1e', pos);
+        recs.push_back(blob.substr(pos, e - pos));
+        pos = e + 1;
+    }
+    return recs;
+}
+
+std::vector<std::string> fields_of(const std::string& rec) {
+    std::vector<std::string> f;
+    std::size_t pos = 0;
+    for (;;) {
+        const std::size_t e = rec.find('\x1f', pos);
+        if (e == std::string::npos) {
+            f.push_back(rec.substr(pos));
+            return f;
+        }
+        f.push_back(rec.substr(pos, e - pos));
+        pos = e + 1;
+    }
+}
+
+// --- fake in-process plugins: canned output per action, test-set rc ---
+struct FakeOut {
+    std::map<std::string, std::string> out;
+    std::map<std::string, std::string> overflow; // optional 2nd write, after `out`
+    std::map<std::string, int> rc;
+};
+FakeOut g_fake[3]; // 0 installed_apps, 1 pkg_inventory, 2 windows_optional_features
+
+template <int I>
+int fake_execute(YuzuCommandContext* ctx, const char* action, const YuzuParam* /*params*/,
+                 std::size_t /*param_count*/) {
+    const auto it = g_fake[I].out.find(action);
+    if (it != g_fake[I].out.end())
+        yuzu_ctx_write_output(ctx, it->second.c_str());
+    const auto more = g_fake[I].overflow.find(action);
+    if (more != g_fake[I].overflow.end())
+        yuzu_ctx_write_output(ctx, more->second.c_str());
+    const auto rc = g_fake[I].rc.find(action);
+    return rc == g_fake[I].rc.end() ? 0 : rc->second;
+}
+
+const char* const kFakeIaActions[] = {"list_inventory", nullptr};
+const char* const kFakePkgActions[] = {"managers", "packages", nullptr};
+const char* const kFakeWofActions[] = {"list", nullptr};
+
+#define YUZU_FAKE_DESC(var, plugin_name, actions, idx)                                            \
+    const YuzuPluginDescriptor var = {YUZU_PLUGIN_ABI_VERSION, plugin_name, "1.0.0", "test fake", \
+                                      actions,                 nullptr,     nullptr,  fake_execute<idx>, \
+                                      nullptr}
+YUZU_FAKE_DESC(kFakeIa, "installed_apps", kFakeIaActions, 0);
+YUZU_FAKE_DESC(kFakePkg, "pkg_inventory", kFakePkgActions, 1);
+YUZU_FAKE_DESC(kFakeWof, "windows_optional_features", kFakeWofActions, 2);
+#undef YUZU_FAKE_DESC
+
+SyncPluginMap all_plugins() {
+    return {{"installed_apps", &kFakeIa},
+            {"pkg_inventory", &kFakePkg},
+            {"windows_optional_features", &kFakeWof}};
+}
+
+void reset_fakes() {
+    for (auto& f : g_fake) {
+        f.out.clear();
+        f.overflow.clear();
+        f.rc.clear();
+    }
+}
+
+void fake_mac() {
+    reset_fakes();
+    g_fake[0].out["list_inventory"] =
+        capture_section("installed_apps", "macos.txt", "list_inventory");
+    g_fake[1].out["managers"] = capture_section("pkg_inventory", "macos.txt", "managers");
+    g_fake[1].out["packages"] = capture_section("pkg_inventory", "macos.txt", "packages");
+    g_fake[2].out["list"] = yuzu::wof::format_unsupported_row("list", "macos:dism:unsupported") + "\n";
+}
+
+void fake_windows() {
+    reset_fakes();
+    g_fake[0].out["list_inventory"] =
+        capture_section("installed_apps", "windows.txt", "list_inventory");
+    g_fake[1].out["managers"] =
+        pkg::unsupported_status_row("managers", "windows:planned") + "\n";
+    g_fake[1].out["packages"] =
+        pkg::unsupported_status_row("packages", "windows:planned") + "\n";
+    g_fake[2].out["list"] = capture_section("windows_optional_features", "windows.txt", "list");
+}
+
+std::optional<std::pair<std::string, std::string>> collect_with(SyncPluginMap plugins) {
+    return make_installed_software_source(std::move(plugins)).collect();
+}
+
+std::string supported_status(std::string_view action) {
+    return pkg::format_status_row(action, pkg::StatusLevel::supported, "");
+}
+
+// A ceiling on canonical bytes/record for the real-capture runs; the measured
+// figures (logged below) are what the cap comments in the .cpp quote.
+constexpr double kMaxBytesPerRecord = 200.0;
+
+void check_blob_size(const std::string& blob, std::size_t records) {
+    const double per = static_cast<double>(blob.size()) / static_cast<double>(records);
+    INFO("canonical blob " << blob.size() << " B / " << records << " records = " << per
+                           << " B/record");
+    CHECK(blob.size() < 3u * 1024 * 1024);
+    CHECK(per <= kMaxBytesPerRecord);
+}
+} // namespace
+
+TEST_CASE("extended tail: agent blob hashes to the server's three contract pins",
+          "[sync][hash][extended_row]") {
+    CHECK(sha256_hex(installed_software_canonical_blob({full_extended_entry()})) ==
+          kCrossPinHashExtended);
+
+    SwEntry first = full_extended_entry();
+    first.source = "installed_apps.list_apps";
+    CHECK(sha256_hex(installed_software_canonical_blob({full_extended_entry(), first})) ==
+          kTailOrderPinHash);
+
+    SwEntry alpha;
+    alpha.name = "alpha";
+    alpha.version = "1.0";
+    alpha.publisher = "AlphaCo";
+    alpha.install_date = "2026-01-01";
+    alpha.kind = "app";
+    SwEntry zed;
+    zed.name = "zed";
+    zed.version = "1";
+    zed.source = "installed_apps.list_inventory"; // source-only tail
+    CHECK(sha256_hex(installed_software_canonical_blob({zed, full_extended_entry(), alpha})) ==
+          kMixedBlobHash);
+}
+
+TEST_CASE("extended tail rule: the tail enters the blob only when package_id or source is set",
+          "[sync][hash][extended_row]") {
+    const std::vector<SwEntry> v2 = {
+        {"Zeta", "9", "", ""},
+        full_v2_entry(),
+        {"Acme Reader", "1.2", "Acme", "2026-01-02"},
+    };
+    CHECK(sha256_hex(installed_software_canonical_blob(v2)) == kCrossPinHash);
+
+    auto with_source = v2;
+    with_source[0].source = "installed_apps.list_apps";
+    const auto h_src = sha256_hex(installed_software_canonical_blob(with_source));
+    CHECK(h_src != kCrossPinHash);
+
+    auto only_pkg = v2;
+    only_pkg[0].package_id = "x-1";
+    const auto h_pkg = sha256_hex(installed_software_canonical_blob(only_pkg));
+    CHECK(h_pkg != kCrossPinHash);
+    CHECK(h_pkg != h_src);
+
+    const SwEntry base = full_extended_entry();
+    const auto one = sha256_hex(installed_software_canonical_blob({base}));
+    for (auto field : {&SwEntry::package_id, &SwEntry::source}) {
+        SwEntry other = base;
+        other.*field = "zz-different";
+        const auto both = sha256_hex(installed_software_canonical_blob({other, base}));
+        CHECK(both != one); // distinct rows never collapse
+        CHECK(both == sha256_hex(installed_software_canonical_blob({base, other})));
+    }
+    CHECK(sha256_hex(installed_software_canonical_blob({base, base})) == one); // exact dup dedups
+}
+
+TEST_CASE("extended tail order: package_id sorts before source, even when they disagree",
+          "[sync][hash][extended_row]") {
+    // Same v2 fields, so the tail decides: a{pid a, src z} vs b{pid b, src a}. A
+    // comparator that swapped the two would put b first.
+    SwEntry a;
+    a.name = "same";
+    a.package_id = "a";
+    a.source = "z";
+    SwEntry b = a;
+    b.package_id = "b";
+    b.source = "a";
+    for (const auto& in : {std::vector<SwEntry>{a, b}, std::vector<SwEntry>{b, a}}) {
+        const auto recs = records_of(installed_software_canonical_blob(in));
+        REQUIRE(recs.size() == 2);
+        CHECK(fields_of(recs[0])[14] == "a");
+        CHECK(fields_of(recs[0])[15] == "z");
+        CHECK(fields_of(recs[1])[14] == "b");
+        CHECK(fields_of(recs[1])[15] == "a");
+    }
+}
+
+TEST_CASE("pkg_inventory packages adapter: real macOS capture", "[sync][parse][adapter]") {
+    const auto r = parse_pkg_inventory_packages_output(
+        capture_section("pkg_inventory", "macos.txt", "packages"));
+    REQUIRE(r.status == Status::ok);
+    REQUIRE(r.entries.size() == 66);
+    CHECK(r.entries[0].name == "actionlint");
+    CHECK(r.entries[0].version == "1.7.12");
+    CHECK(r.entries[0].kind == "pkg");
+    CHECK(r.entries[0].ecosystem == "brew");
+    for (const auto& e : r.entries) {
+        CHECK((e.kind == "pkg" || e.kind == "app"));
+        CHECK(e.ecosystem == "brew");
+        CHECK(e.source.empty()); // the collector stamps source
+    }
+}
+
+TEST_CASE("pkg_inventory packages adapter maps casks to kind app", "[sync][parse][adapter]") {
+    const auto r = parse_pkg_inventory_packages_output(
+        nl({supported_status("packages"),
+            pkg::format_package_row("wget", "1.24", pkg::PackageKind::formula),
+            pkg::format_package_row("firefox", "130.0", pkg::PackageKind::cask)}));
+    REQUIRE(r.status == Status::ok);
+    REQUIRE(r.entries.size() == 2);
+    CHECK(r.entries[0].kind == "pkg");
+    CHECK(r.entries[1].kind == "app");
+}
+
+TEST_CASE("pkg_inventory managers adapter: one Homebrew presence row", "[sync][parse][adapter]") {
+    const auto r = parse_pkg_inventory_managers_output(
+        capture_section("pkg_inventory", "macos.txt", "managers"));
+    REQUIRE(r.status == Status::ok);
+    REQUIRE(r.entries.size() == 1);
+    CHECK(r.entries[0].name == "homebrew");
+    CHECK(r.entries[0].version.empty()); // "-" in the row
+    CHECK(r.entries[0].kind == "app");
+    CHECK(r.entries[0].ecosystem == "brew");
+}
+
+TEST_CASE("pkg_inventory managers adapter: presence semantics and Homebrew-only", "[sync][parse][adapter]") {
+    const auto hb_row = [](const char* prefix) {
+        return pkg::format_manager_row(pkg::Manager::homebrew, pkg::Presence::present, "", prefix,
+                                       "-", "");
+    };
+    SECTION("two prefixes parse to two identical entries; the collector yields ONE record") {
+        const std::string managers = nl({supported_status("managers"), hb_row("/opt/homebrew"),
+                                         hb_row("/usr/local")});
+        const auto r = parse_pkg_inventory_managers_output(managers);
+        REQUIRE(r.status == Status::ok);
+        REQUIRE(r.entries.size() == 2);
+        CHECK(r.entries[0].name == r.entries[1].name);
+
+        fake_mac();
+        g_fake[1].out["managers"] = managers;
+        g_fake[1].out["packages"] = supported_status("packages") + "\n";
+        const auto got = collect_with(all_plugins());
+        REQUIRE(got.has_value());
+        std::size_t homebrew = 0;
+        for (const auto& rec : records_of(got->first))
+            if (fields_of(rec)[0] == "homebrew")
+                ++homebrew;
+        CHECK(homebrew == 1);
+    }
+    SECTION("a non-homebrew manager is dropped") {
+        const auto r = parse_pkg_inventory_managers_output(
+            nl({supported_status("managers"),
+                pkg::format_manager_row(pkg::Manager::dpkg, pkg::Presence::present, "1.22", "/",
+                                        "-", "")}));
+        CHECK(r.status == Status::ok);
+        CHECK(r.entries.empty());
+    }
+    SECTION("an unavailable manager emits nothing") {
+        const auto r = parse_pkg_inventory_managers_output(nl(
+            {supported_status("managers"),
+             pkg::format_manager_row(pkg::Manager::homebrew, pkg::Presence::unavailable, "",
+                                     "/usr/local", "-", "macos:homebrew_cellar:permission_denied")}));
+        CHECK(r.status == Status::ok);
+        CHECK(r.entries.empty());
+    }
+}
+
+TEST_CASE("pkg_inventory adapters: status grammar", "[sync][parse][adapter]") {
+    const std::string good_row = pkg::format_package_row("wget", "1.24", pkg::PackageKind::formula);
+
+    SECTION("no status row") {
+        CHECK(parse_pkg_inventory_packages_output(nl({good_row})).status == Status::failed);
+    }
+    SECTION("constrained carries the reason") {
+        const auto r = parse_pkg_inventory_packages_output(
+            nl({pkg::format_status_row("packages", pkg::StatusLevel::constrained, "x"), good_row}));
+        CHECK(r.status == Status::failed);
+        CHECK(r.reason == "x");
+    }
+    SECTION("two status rows") {
+        CHECK(parse_pkg_inventory_packages_output(
+                  nl({supported_status("packages"), supported_status("packages"), good_row}))
+                  .status == Status::failed);
+    }
+    SECTION("an unknown level") {
+        CHECK(parse_pkg_inventory_packages_output(
+                  nl({std::string("status|packages|") + "bogus" + "|-", good_row}))
+                  .status == Status::failed);
+    }
+    SECTION("a malformed data row is dropped; status decides") {
+        const auto r = parse_pkg_inventory_packages_output(
+            nl({supported_status("packages"), good_row, "package|homebrew|onlythree"}));
+        REQUIRE(r.status == Status::ok);
+        CHECK(r.entries.size() == 1);
+    }
+    SECTION("a status row for the other action is not accepted") {
+        CHECK(parse_pkg_inventory_packages_output(nl({supported_status("managers"), good_row}))
+                  .status == Status::failed);
+        CHECK(parse_pkg_inventory_managers_output(nl({supported_status("packages"), good_row}))
+                  .status == Status::failed);
+    }
+    SECTION("empty input") {
+        CHECK(parse_pkg_inventory_packages_output("").status == Status::failed);
+        CHECK(parse_pkg_inventory_managers_output("").status == Status::failed);
+    }
+}
+
+TEST_CASE("pkg_inventory adapters: Linux sample is unsupported", "[sync][parse][adapter]") {
+    const auto m = parse_pkg_inventory_managers_output(
+        capture_section("pkg_inventory", "linux.txt", "managers"));
+    CHECK(m.status == Status::unsupported);
+    CHECK(m.entries.empty());
+    const auto p = parse_pkg_inventory_packages_output(
+        capture_section("pkg_inventory", "linux.txt", "packages"));
+    CHECK(p.status == Status::unsupported);
+    CHECK(p.entries.empty());
+}
+
+TEST_CASE("windows_optional_features adapter: real capture keeps every feature with its state",
+          "[sync][parse][adapter]") {
+    const auto r = parse_windows_optional_features_output(
+        capture_section("windows_optional_features", "windows.txt", "list"));
+    REQUIRE(r.status == Status::ok);
+    REQUIRE(r.entries.size() == 137);
+    std::size_t enabled = 0;
+    std::size_t disabled = 0;
+    std::map<std::string, std::string> state;
+    for (const auto& e : r.entries) {
+        CHECK(e.kind == "feat");
+        CHECK(e.ecosystem == "optional_feature");
+        CHECK(e.publisher.empty());
+        state[e.name] = e.version;
+        enabled += e.version == "enabled";
+        disabled += e.version == "disabled";
+    }
+    CHECK(enabled == 17);
+    CHECK(disabled == 120);
+    CHECK(state["NetFx3"] == "enabled");
+    CHECK(state["VirtualMachinePlatform"] == "enabled");
+    CHECK(state["TelnetClient"] == "disabled");
+
+    // The restart flag is dropped; a pending state keeps its token.
+    const auto p = parse_windows_optional_features_output(
+        yuzu::wof::format_feature_row("X", yuzu::wof::FeatureState::install_pending, true) + "\n");
+    REQUIRE(p.status == Status::ok);
+    REQUIRE(p.entries.size() == 1);
+    CHECK(p.entries[0].version == "pending_enable");
+}
+
+TEST_CASE("windows_optional_features adapter: sentinels and empty input", "[sync][parse][adapter]") {
+    CHECK(parse_windows_optional_features_output(
+              yuzu::wof::format_unsupported_row("list", "macos:dism:unsupported") + "\n")
+              .status == Status::unsupported);
+    const auto u = parse_windows_optional_features_output(
+        yuzu::wof::format_unavailable_row("list", "windows:dism:busy") + "\n");
+    CHECK(u.status == Status::failed);
+    CHECK(u.reason == "windows:dism:busy");
+    CHECK(parse_windows_optional_features_output("").status == Status::failed);
+
+    // Only the disabled features: still a successful, non-empty answer.
+    const std::string real = capture_section("windows_optional_features", "windows.txt", "list");
+    std::istringstream in(real);
+    std::string line;
+    std::string only_disabled;
+    while (std::getline(in, line))
+        if (line.find("|disabled|") != std::string::npos)
+            only_disabled += line + '\n';
+    const auto d = parse_windows_optional_features_output(only_disabled);
+    REQUIRE(d.status == Status::ok);
+    CHECK(d.entries.size() == 120);
+    for (const auto& e : d.entries)
+        CHECK(e.version == "disabled");
+}
+
+TEST_CASE("new adapters clamp every field like parse_installed_apps_output",
+          "[sync][parse][adapter]") {
+    const std::string too_long(2000, 'v');
+
+    SECTION("packages: 0x1F stripped from the name, version truncated") {
+        const auto r = parse_pkg_inventory_packages_output(
+            nl({supported_status("packages"),
+                std::string("package|homebrew|wg\037et|") + too_long + "|formula"}));
+        REQUIRE(r.status == Status::ok);
+        REQUIRE(r.entries.size() == 1);
+        CHECK(r.entries[0].name == "wget");
+        CHECK(r.entries[0].version.size() == 1024);
+    }
+    SECTION("managers: over-length version truncated") {
+        const auto r = parse_pkg_inventory_managers_output(
+            nl({supported_status("managers"),
+                "manager|homebrew|present|" + too_long + "|/opt/homebrew|-|-"}));
+        REQUIRE(r.status == Status::ok);
+        REQUIRE(r.entries.size() == 1);
+        CHECK(r.entries[0].version.size() == 1024);
+    }
+    SECTION("optional features: invalid UTF-8 in the name becomes U+FFFD") {
+        const auto r = parse_windows_optional_features_output(
+            std::string("feature|Caf\xe9|enabled|0\n"));
+        REQUIRE(r.status == Status::ok);
+        REQUIRE(r.entries.size() == 1);
+        CHECK(r.entries[0].name == std::string("Caf\xef\xbf\xbd"));
+    }
+}
+
+TEST_CASE("collector: Mac-shaped run merges apps, brew packages and the presence row",
+          "[sync][collector]") {
+    fake_mac();
+    const auto got = collect_with(all_plugins());
+    REQUIRE(got.has_value());
+    const auto recs = records_of(got->first);
+    CHECK(recs.size() == 393 + 66 + 1);
+    const std::set<std::string> sources = {"installed_apps.list_inventory",
+                                           "pkg_inventory.packages", "pkg_inventory.managers"};
+    std::vector<SwEntry> parsed;
+    std::map<std::string, std::size_t> per_source;
+    for (const auto& rec : recs) {
+        const auto f = fields_of(rec);
+        REQUIRE(f.size() == 16);
+        CHECK(f[12].empty());
+        CHECK(f[13].empty());
+        CHECK(sources.count(f[15]) == 1);
+        ++per_source[f[15]];
+        SwEntry e;
+        e.name = f[0];
+        e.version = f[1];
+        e.publisher = f[2];
+        e.install_date = f[3];
+        e.kind = f[4];
+        e.ecosystem = f[5];
+        e.epoch = f[6];
+        e.release = f[7];
+        e.arch = f[8];
+        e.signature_status = f[9];
+        e.distro_id = f[10];
+        e.distro_version = f[11];
+        e.package_id = f[14];
+        e.source = f[15];
+        parsed.push_back(std::move(e));
+    }
+    CHECK(per_source["installed_apps.list_inventory"] == 393);
+    CHECK(per_source["pkg_inventory.packages"] == 66);
+    CHECK(per_source["pkg_inventory.managers"] == 1);
+    CHECK(installed_software_canonical_blob(parsed) == got->first); // sorted, stable
+    CHECK(got->second == sha256_hex(got->first));
+    check_blob_size(got->first, recs.size());
+}
+
+TEST_CASE("collector: an absent plugin is skipped", "[sync][collector]") {
+    fake_mac();
+    SyncPluginMap m = all_plugins();
+    m.erase("pkg_inventory");
+    m.erase("windows_optional_features");
+    const auto got = collect_with(m);
+    REQUIRE(got.has_value());
+    const auto recs = records_of(got->first);
+    CHECK(recs.size() == 393);
+    for (const auto& rec : recs)
+        CHECK(fields_of(rec)[15] == "installed_apps.list_inventory");
+}
+
+TEST_CASE("collector: installed_apps absent idles the source (UP-IN6)", "[sync][collector]") {
+    fake_mac();
+    SyncPluginMap m = all_plugins();
+    m.erase("installed_apps");
+    CHECK_FALSE(collect_with(m).has_value());
+}
+
+TEST_CASE("collector: one failing action skips the whole cycle", "[sync][collector]") {
+    SECTION("pkg_inventory rc != 0") {
+        fake_mac();
+        g_fake[1].rc["packages"] = 1;
+        CHECK_FALSE(collect_with(all_plugins()).has_value());
+    }
+    SECTION("pkg_inventory constrained") {
+        fake_mac();
+        g_fake[1].out["packages"] =
+            pkg::format_status_row("packages", pkg::StatusLevel::constrained, "macos:x") + "\n";
+        CHECK_FALSE(collect_with(all_plugins()).has_value());
+    }
+    SECTION("windows_optional_features unavailable") {
+        fake_windows();
+        g_fake[2].out["list"] =
+            yuzu::wof::format_unavailable_row("list", "windows:dism:timeout") + "\n";
+        CHECK_FALSE(collect_with(all_plugins()).has_value());
+    }
+    SECTION("installed_apps empty while brew has rows (UP-IN6 per plugin)") {
+        fake_mac();
+        g_fake[0].out["list_inventory"] = "";
+        CHECK_FALSE(collect_with(all_plugins()).has_value());
+    }
+    SECTION("a truncated capture (rc 0, over the capture cap)") {
+        fake_mac();
+        // A first write the adapter accepts, then one write past kInventoryCaptureCap
+        // (3'670'016): the real capture path drops it and flags truncation, leaving a
+        // parseable prefix, so only the collector's truncation check can skip the cycle.
+        g_fake[1].out["packages"] = supported_status("packages") + "\n";
+        g_fake[1].overflow["packages"] = std::string(3'700'000, 'x');
+        CHECK_FALSE(collect_with(all_plugins()).has_value());
+    }
+}
+
+TEST_CASE("collector: successful-empty answers are not failures", "[sync][collector]") {
+    fake_mac();
+    const auto full = collect_with(all_plugins());
+    REQUIRE(full.has_value());
+
+    SECTION("brew with no formulae and no managers: the apps stay") {
+        g_fake[1].out["packages"] = supported_status("packages") + "\n";
+        g_fake[1].out["managers"] = supported_status("managers") + "\n";
+        const auto got = collect_with(all_plugins());
+        REQUIRE(got.has_value());
+        const auto recs = records_of(got->first);
+        CHECK(recs.size() == 393);
+        for (const auto& rec : recs)
+            CHECK(fields_of(rec)[15] == "installed_apps.list_inventory");
+        CHECK(got->second != full->second);
+    }
+    SECTION("Windows: every feature is reported, enabled and disabled hash differently") {
+        fake_windows();
+        const auto got = collect_with(all_plugins());
+        REQUIRE(got.has_value());
+        const auto recs = records_of(got->first);
+        CHECK(recs.size() == 241 + 137);
+        std::size_t disabled = 0;
+        std::size_t enabled = 0;
+        for (const auto& rec : recs) {
+            const auto f = fields_of(rec);
+            if (f[5] != "optional_feature")
+                continue;
+            CHECK(f[4] == "feat");
+            CHECK(f[15] == "windows_optional_features.list");
+            disabled += f[1] == "disabled";
+            enabled += f[1] == "enabled";
+        }
+        CHECK(disabled == 120);
+        CHECK(enabled == 17);
+        check_blob_size(got->first, recs.size());
+
+        SwEntry on;
+        on.name = "F";
+        on.version = "enabled";
+        SwEntry off = on;
+        off.version = "disabled";
+        CHECK(sha256_hex(installed_software_canonical_blob({on})) !=
+              sha256_hex(installed_software_canonical_blob({off})));
+    }
+}
+
+TEST_CASE("collector: Windows-shaped run with the real captures", "[sync][collector]") {
+    fake_windows();
+    g_fake[2].out["list"] = [] {
+        std::string enabled_only;
+        std::istringstream in(capture_section("windows_optional_features", "windows.txt", "list"));
+        std::string line;
+        while (std::getline(in, line))
+            if (line.find("|enabled|") != std::string::npos)
+                enabled_only += line + '\n';
+        return enabled_only;
+    }();
+    const auto got = collect_with(all_plugins());
+    REQUIRE(got.has_value());
+    CHECK(records_of(got->first).size() == 241 + 17);
+}
+
+TEST_CASE("entry cap: the splitter reads one past kMaxEntries and the collector skips above it",
+          "[sync][collector][cap]") {
+    const auto lines = [](std::size_t n, std::size_t name_width = 0) {
+        std::string out;
+        for (std::size_t i = 0; i < n; ++i) {
+            std::string name = "n" + std::to_string(i);
+            if (name.size() < name_width)
+                name.append(name_width - name.size(), 'x');
+            out += "inv|" + name + "|1|\n";
+        }
+        return out;
+    };
+    CHECK(parse_installed_apps_output(lines(20001)).size() == 20001);
+
+    reset_fakes();
+    SyncPluginMap only_ia = {{"installed_apps", &kFakeIa}};
+    g_fake[0].out["list_inventory"] = lines(20001);
+    CHECK_FALSE(collect_with(only_ia).has_value());
+
+    g_fake[0].out["list_inventory"] = lines(20000);
+    const auto got = collect_with(only_ia);
+    REQUIRE(got.has_value());
+    CHECK(records_of(got->first).size() == 20000);
+
+    // 20,001 RAW rows where one is an exact duplicate: the splitter stopped at the
+    // cap, so the deduped count (20,000) must not launder a truncated read.
+    g_fake[0].out["list_inventory"] = lines(20000) + "inv|n0|1|\n";
+    CHECK_FALSE(collect_with(only_ia).has_value());
+
+    // Byte cap: the entry cap runs first, so the over-cap input stays <= 20,000
+    // rows and under the raw capture cap, but its canonical blob exceeds kMaxBlobBytes.
+    // 12,000 x 200 B names is proven under the cap by the test itself.
+    const std::string under = lines(12000, 200);
+    CHECK(installed_software_canonical_blob(parse_installed_apps_output(under)).size() <
+          3u * 1024 * 1024);
+    g_fake[0].out["list_inventory"] = under;
+    REQUIRE(collect_with(only_ia).has_value());
+
+    // The capture itself must not be truncated (that would skip for the wrong reason).
+    const std::string over = lines(16000, 200);
+    CHECK(over.size() < 3'670'016); // kInventoryCaptureCap
+    g_fake[0].out["list_inventory"] = over;
+    CHECK_FALSE(collect_with(only_ia).has_value());
 }

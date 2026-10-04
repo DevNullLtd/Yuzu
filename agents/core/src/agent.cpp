@@ -2144,7 +2144,9 @@ public:
                 // persists in kv_store_ namespace "__sync__" across reconnects, so a
                 // flap does not lose or duplicate a daily push.
                 {
-                    const YuzuPluginDescriptor* ia_descriptor = nullptr;
+                    // installed_software (ADR-0016): every loaded plugin by name; the source
+                    // picks the inventory actions it needs and skips absent ones.
+                    SyncPluginMap sync_plugins;
                     const YuzuPluginDescriptor* tar_descriptor = nullptr;
                     // device_ci source plugins (ADR-0016): hardware / device_identity /
                     // os_info / network_config, reused in-process via LocalDispatcher.
@@ -2159,9 +2161,8 @@ public:
                     const YuzuPluginDescriptor* app_usage_descriptor = nullptr;
                     for (const auto& handle : plugins_) {
                         const std::string_view pname{handle.descriptor()->name};
-                        if (pname == "installed_apps")
-                            ia_descriptor = handle.descriptor();
-                        else if (pname == "tar")
+                        sync_plugins.emplace(std::string(pname), handle.descriptor());
+                        if (pname == "tar")
                             tar_descriptor = handle.descriptor();
                         else if (pname == "hardware")
                             hw_descriptor = handle.descriptor();
@@ -2187,7 +2188,7 @@ public:
                     } else {
                     sync_stop_.store(false, std::memory_order_release);
                     auto sync_stub = pb::AgentService::NewStub(channel);
-                    sync_thread_ = std::thread([this, ia_descriptor, tar_descriptor, hw_descriptor,
+                    sync_thread_ = std::thread([this, sync_plugins, tar_descriptor, hw_descriptor,
                                                 devid_descriptor, osinfo_descriptor,
                                                 netcfg_descriptor, license_descriptor,
                                                 app_usage_descriptor,
@@ -2261,7 +2262,7 @@ public:
                             std::make_shared<SyncScheduler>(cfg_.agent_id, kv_get, kv_set, sender);
                         SyncScheduler& scheduler = *scheduler_ptr;
                         // Clear the sync-on-demand handle on EVERY exit of this thread
-                        // (normal stop, or a throw out of tick()) so the command loop
+                        // (normal stop, or a throw outside the tick firewall below) so the command loop
                         // never arms a scheduler whose thread is gone.
                         ScopeExit clear_sync_handle{[this]() {
                             std::lock_guard<std::mutex> lk(sync_sched_mu_);
@@ -2319,7 +2320,7 @@ public:
                         // Registration order carries NO persisted meaning (KV keys and
                         // request_now()'s name match are both name-keyed, per
                         // sync_scheduler.hpp's own contract), so this reorder is safe.
-                        scheduler.add_source(make_installed_software_source(ia_descriptor));
+                        scheduler.add_source(make_installed_software_source(sync_plugins));
                         // Publish AFTER the last add_source: request_now() reads sources_
                         // without the mutex on the append-only-before-publication contract.
                         {
@@ -2332,7 +2333,18 @@ public:
                             auto now_secs = std::chrono::duration_cast<std::chrono::seconds>(
                                                 std::chrono::system_clock::now().time_since_epoch())
                                                 .count();
-                            auto sleep = scheduler.tick(now_secs);
+                            // Exception firewall (mirrors the heartbeat thread): a throw
+                            // mid-tick leaves the persisted state at the last save_state, so
+                            // the next tick simply re-collects.
+                            std::chrono::seconds sleep{60};
+                            try {
+                                sleep = scheduler.tick(now_secs);
+                            } catch (const std::exception& e) {
+                                spdlog::warn("Daily-sync tick failed: {} — retrying in 60 s",
+                                             e.what());
+                            } catch (...) {
+                                spdlog::warn("Daily-sync tick failed — retrying in 60 s");
+                            }
                             auto remaining = sleep;
                             while (remaining.count() > 0 && !should_stop()) {
                                 // __sync__.now: re-tick immediately; the drain at the top of
