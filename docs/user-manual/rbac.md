@@ -176,8 +176,14 @@ Recommended order for a fresh install:
 > with no per-agent filter. Dashboard `/fragments/results/filter-bar`,
 > `/fragments/create-group-form`, and `POST /api/dashboard/group-from-results`
 > (tracked #3489; #3525 tracked the same finding and was closed as its
-> duplicate); REST `GET /api/v1/execution-statistics/agents` and the
-> workflow executions LIST fragment `/fragments/executions` (tracked #3526). So
+> duplicate); REST `GET /api/v1/execution-statistics/agents` (tracked #3526). The
+> workflow executions LIST fragment `/fragments/executions` and MCP
+> `summarize_working_set` `kind=execution` were on this list and are now on
+> `require_fleet_read` too (a group-scoped-only operator gets a confined view
+> where it previously got `403`); neither was a reachable leak before, because the
+> flat gate only ever admitted global-grant callers, who are unfiltered anyway.
+> `summarize_working_set` `kind=fleet`/`result_set` still return an unscoped
+> whole-registry agent count. So
 > a degraded store looks like "no agents in scope" / "no responses" / `503`
 > across every reader on this page now — check the server startup log for
 > `RbacStore` errors, the `/health` store status, and

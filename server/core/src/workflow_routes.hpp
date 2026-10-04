@@ -106,7 +106,8 @@ public:
 
     /// #1712 / #3290 Phase 2 — the injected-callback twin of
     /// `AuthRoutes::require_fleet_read`, backing the executions-drawer
-    /// detail route's real per-agent/service confinement (same shape as
+    /// detail route's and the executions LIST fragment's real
+    /// per-agent/service confinement (same shape as
     /// `McpServer::FleetReadFn`/`RestApiV1::FleetReadFn`/
     /// `DashboardRoutes::FleetReadFn` — server.cpp wires the SAME
     /// conversion lambda into all of them so they cannot drift). MUST be
@@ -140,8 +141,9 @@ public:
         PermFn perm_fn;
         /// #1712 / #3290 Phase 2 — see FleetReadFn's doc comment above.
         /// Used ONLY by the executions-drawer detail route
-        /// (/fragments/executions/{id}/detail); every other route in this
-        /// file keeps using `perm_fn` above unchanged.
+        /// (/fragments/executions/{id}/detail) and the executions LIST
+        /// fragment (/fragments/executions, #3526); every other route in
+        /// this file keeps using `perm_fn` above unchanged.
         FleetReadFn fleet_read_fn;
         AuditFn audit_fn;
         EmitEventFn emit_fn;

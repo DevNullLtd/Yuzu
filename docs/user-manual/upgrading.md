@@ -273,6 +273,34 @@ Only case (e) means the key files are gone. Nothing inside the server can rebuil
   3. This database cannot be brought back by any supported means. Every start checks each registered KEK and refuses. The one-shot modes `--mfa-reset` and `--break-glass-arm` run after that check, so they stop with the same `kek_unresolvable` error. What is gone: the CA private key, so every agent certificate it issued no longer chains and every agent must enroll again; and every secret sealed under the KEK, including TOTP enrolments, webhook signing secrets and the other secret columns listed in `docs/user-manual/server-admin.md` "Key management (secrets KEK)". Passwords and API tokens are hashed, not sealed, but they live in the same database.
   4. Start a new install. With the bundled Postgres, `docker compose down -v` deletes the Postgres volume along with the others. `down -v` does not reset an external Postgres: that database still registers the lost KEK, so a new install against it fails the same way. Give the new install a new, empty database. Then provision the admin account again, re-enroll your agents, and re-create your configuration.
 
+## Behaviour change: the executions list fragment and MCP `summarize_working_set` (execution kind) use the fleet-read gate (#3526, #4753)
+
+`GET /fragments/executions` (the dashboard executions list) and the `execution` kind of the MCP tool
+`summarize_working_set` moved from a plain `Execution:Read` permission check onto the
+management-group-aware fleet-read gate that `GET /api/v1/executions` already used. This is
+hardening plus an admission change, not a fix for a leak: the old gate only admitted callers
+holding a global grant, and those callers were never filtered, so nobody was shown out-of-scope
+data before. Nothing flips for a caller with a global `Execution:Read` grant, and nothing changes
+with RBAC off.
+
+- **Group-scoped-only operators** (an `Execution:Read` grant held only through a management
+  group) previously got `403` and now get a confined view: only executions that touched one of
+  their agents or that they dispatched, with the counters and the error preview recomputed from
+  their visible agents only. For `summarize_working_set` the narrative carries the same projected
+  counts.
+- **Service-scoped API tokens** get the same confined view from `GET /fragments/executions` where
+  they got `403`. `summarize_working_set` is unchanged for them: it stays denied.
+- **Degraded store.** The fragment answers `503` where it used to show "No executions yet", and
+  `summarize_working_set` returns an error carrying `retry_after_ms` where it used to say the
+  execution "was not found".
+- **Audit.** `summarize_working_set` with `kind=execution` now writes `mcp.summarize_working_set`
+  with `result=denied` for an execution that is absent or outside the caller's scope (the two read
+  identically to the caller), and `success` only when it returned data. Previously an absent id
+  was audited `success`. Adjust any SIEM rule keyed on that row.
+- **Still unscoped.** `summarize_working_set` with `kind=fleet` or `kind=result_set` returns the
+  whole-registry agent count, and `GET /api/v1/execution-statistics/agents` has no per-agent
+  filter (#3526). Both remain tracked.
+
 ## Behaviour change: service-scoped tokens, the `ITServiceOwner` ceiling on the fleet-read gate, and `GET /api/v1/upload-grants` (#3526)
 
 Two chokepoints let a service-scoped API token reach more than the `ITServiceOwner` role allows (found

@@ -125,6 +125,24 @@ tar_tree) were not re-swept here; they already carry `deny_service_scoped_*`/
 `token_scope_service` handling from prior PRs in this saga (found by
 compliance-officer, Gate 6) and are not re-verified by this document.
 
+## Update (#3526, #4753): `GET /fragments/executions` now admits a service-scoped token, confined
+
+This inventory covers gate-less routes, and `GET /fragments/executions` was not one: it called
+`perm_fn(Execution, Read)`, so the flip denied a service-scoped token (403) like every other
+`require_permission` caller. It has since moved onto `fleet_read_fn` (`require_fleet_read`) as its
+sole gate, the same shape as `/fragments/executions/{id}/detail`, so a service-scoped token is now
+ADMITTED and served the confined view (owner-or-visible rows, counters and `last_error_detail`
+projected to the in-scope agents, scope pushed into SQL before the 50-row limit). That is a
+deliberate admission change with a real mechanism behind it, not a widening of
+`kServiceScopeGlobalSafe`. It is also not a leak fix: before the change the route disclosed nothing
+out of scope to any principal it admitted (global-grant callers are unfiltered by design). Tests:
+`test_workflow_executions_list_authz.cpp` (real `require_fleet_read`, exact served-id sets).
+
+MCP `summarize_working_set` is unchanged on this axis: it keeps the default
+`ServiceScopeClass::denied`, because its `kind=agent` and `kind=fleet` have no mechanism on the
+service-scope axis and `confined` needs a real downstream mechanism for every kind. A test pins the
+denial before `fleet_read_fn_` runs.
+
 ## Update (#3526): `require_fleet_read` now applies the `ITServiceOwner` ceiling on its service axis
 
 This inventory covers gate-less routes. `require_fleet_read` is not one, but its service-scoped

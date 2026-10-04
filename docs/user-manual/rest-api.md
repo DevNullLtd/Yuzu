@@ -5898,8 +5898,9 @@ step's dispatch-time target-agent count) — stripped above for a confined calle
 
 #### `GET /api/v1/executions`
 
-**Permission:** `Execution:Read`, gated on the fleet-read chokepoint (ADR-0017) — **not** the plain
-permission check `GET /fragments/executions` uses; a confined caller sees only executions
+**Permission:** `Execution:Read`, gated on the fleet-read chokepoint (ADR-0017), as is
+`GET /fragments/executions` (which used the plain permission check until #3526; its admission
+change is in `docs/user-manual/upgrading.md`); a confined caller sees only executions
 involving at least one visible agent (or that they dispatched). The v1 twin of
 `GET /fragments/executions`, MCP twin `list_executions` (widened by this PR to the same field set).
 Accepts `definition_id`, `status`, and `limit` (capped at 500) query parameters.
