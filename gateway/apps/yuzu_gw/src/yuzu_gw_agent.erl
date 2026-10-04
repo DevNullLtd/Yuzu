@@ -379,8 +379,13 @@ format_status(Status) ->
                 (_Key, Value) -> Value
              end, Status).
 
-redact_data(#data{} = Data) -> Data#data{register_req = '$redacted'};
-redact_data(_Other)         -> '$redacted'.
+%% Shown as a map of the fields (a record with register_req replaced would
+%% violate the field's declared type), the way yuzu_gw_upstream shows its state.
+redact_data(#data{} = Data) ->
+    Fields = maps:from_list(lists:zip(record_info(fields, data), tl(tuple_to_list(Data)))),
+    Fields#{register_req := '$redacted'};
+redact_data(_Other) ->
+    '$redacted'.
 
 %%%===================================================================
 %%% Internal functions
