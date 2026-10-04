@@ -586,7 +586,10 @@ invalid_utf8_is_repaired_and_buffer_survives() ->
     %% No usable session id: it cannot be keyed, so the heartbeat is dropped.
     Dropped = [
         #{session_id => <<255, 1>>, status_tags => #{<<"k">> => <<"v">>}},
-        #{session_id => 7}
+        #{session_id => 7},
+        %% an empty session id, and none at all
+        #{session_id => <<>>, status_tags => #{<<"k">> => <<"v">>}},
+        #{status_tags => #{<<"k">> => <<"v">>}}
     ],
     Good = [hb(<<"good-1">>, #{tags => #{<<"k">> => <<"v">>}}),
             %% multi-byte UTF-8 (a euro sign, an emoji) is valid and untouched

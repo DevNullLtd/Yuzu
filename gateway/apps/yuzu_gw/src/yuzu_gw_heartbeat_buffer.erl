@@ -445,8 +445,9 @@ enqueue_screened(Hb, #state{buffer = Buf, max_buf = MaxBuf} = State) ->
 %% @doc Make a heartbeat sendable, decided on the heartbeat alone (never on the
 %% buffer), so a dropped heartbeat leaves its session's older entry untouched.
 %% Returns the heartbeat to buffer and the drop reasons to count, or a drop:
-%%   - no binary session id of valid UTF-8: dropped, heartbeat_invalid (it cannot
-%%     be keyed, and admission already rejects such a session);
+%%   - no session id (absent or empty), or one that is not binary UTF-8: dropped,
+%%     heartbeat_invalid (it cannot be keyed, and admission already rejects such
+%%     a session);
 %%   - status_tags not a map, or holding a non-binary key or value: all tags
 %%     removed, heartbeat_invalid;
 %%   - more than ?MAX_STATUS_TAGS tags, or tags larger than one chunk: all tags
@@ -462,9 +463,14 @@ enqueue_screened(Hb, #state{buffer = Buf, max_buf = MaxBuf} = State) ->
 -spec screen(map()) -> {ok, map(), [heartbeat_oversize | heartbeat_invalid]}
                      | {drop, heartbeat_oversize | heartbeat_invalid}.
 screen(Hb) ->
-    case valid_utf8(maps:get(session_id, Hb, <<>>)) of
-        false -> {drop, heartbeat_invalid};
-        true  -> screen_tags(Hb)
+    case maps:get(session_id, Hb, <<>>) of
+        <<>> ->
+            {drop, heartbeat_invalid};
+        Sid ->
+            case valid_utf8(Sid) of
+                false -> {drop, heartbeat_invalid};
+                true  -> screen_tags(Hb)
+            end
     end.
 
 screen_tags(Hb) ->
