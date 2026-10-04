@@ -917,9 +917,11 @@ upgraded, read the new gateway counters:
   recovery that needs more than one round (more than 4096 unknown sessions from
   one gateway in one batch), and the gateway logs a WARN
   `Heartbeat verdict truncated by the server`. The counter counts every
-  occurrence, but the WARN is logged at most once per 60 s per gateway node, and
-  its text ends with `suppressed N`, the number of occurrences since the last
-  WARN, so a recovery of several rounds does not repeat the line every flush.
+  occurrence, but the WARN is logged at most once per 60 s per heartbeat buffer
+  process, and its text ends with `suppressed N`, the number of occurrences since
+  the last WARN. The limit resets when the buffer process restarts, so the first
+  WARN after a restart says `suppressed 0`. A recovery of several rounds
+  therefore does not repeat the line every flush.
 - `yuzu_gw_registration_replay_triggered_total{trigger="heartbeat"}`: rises by
   one each time a verdict queued at least one agent.
 - `yuzu_gw_registration_replay_total`: rises for every replay attempt the drip
@@ -1235,38 +1237,66 @@ env keys with defaults, which a reverted build ignores.
   `record_result_no_replay` discards the replay trigger; unit test
   `breaker_replay_during_targeted_drip_is_dropped`). Not observed on a rig.
   Tracked as a follow-up (no issue yet), together with the entry above.
-- **A crash report of `yuzu_gw_upstream` can still contain the enrollment token,
-  certificate or CSR of a registration that was queued or in flight, in two
-  cases: when the module is used outside the application, and for a report shape
-  that the redaction filter does not recognise.** While an agent waits in the
-  replay queue, the upstream client holds its stored registration request.
-  Before this change a crash report of that process printed the whole state,
-  with every queued request. Now three layers apply. First, the `format_status`
-  callback redacts the replay queue and the recent-replay stamps (shown as
-  sizes), the last message, the reason and the debug log. Second, an exception
+- **A crash report can still contain the enrollment token, certificate or CSR of
+  a registration in four cases: use of the modules outside the application, a
+  report shape the redaction filter does not recognise, new code hot-loaded into a
+  running node, and any other process that holds a registration request and is not
+  named here.** Two gateway processes keep a registration request after a Register:
+  the upstream client `yuzu_gw_upstream` (every agent waiting in the replay queue,
+  and a request in flight) and the per-agent process `yuzu_gw_agent` (the stored
+  request of its own agent). Three layers now cover those two processes. First,
+  `format_status` redacts the stored request: for the upstream client the replay
+  queue and the recent-replay stamps (shown as sizes), the last message, the
+  reason and the debug log, and for the per-agent process the stored registration
+  request. Second, a request can no longer leave through an exit reason: an exception
   raised inside the upstream client's own RPC calls is caught and counted as a
-  failed RPC (code `exception`), so its stacktrace carries no request. Third, a
-  logger primary filter, `yuzu_gw_crash_redact`, installed when the application
-  starts, redacts the crash report of `yuzu_gw_upstream`, the `gen_server` terminate
-  report and the supervisor `child_terminated` report for it: the process
-  mailbox becomes a count, the process dictionary is dropped, and the
-  `messages:` line and the exception lines keep no argument lists. A crash from
-  any other source (for example a function clause in a helper that was handed a
-  request) would otherwise print that function's argument list, because OTP
-  appends the stacktrace after `format_status` runs; with the application
-  running, the filter removes the argument lists from that report as well. The
-  filter is verified by a unit test on the real process (the final test
-  count is on the PR); it was not run on a rig. The residual
-  is therefore: use of the module outside the application (the filter is
-  installed by the application start, so a bare `yuzu_gw_upstream` started in a
-  shell has no filter), and any report shape the filter does not recognise (an
-  OTP release that formats the report differently). The exposure needs both an
-  unhandled crash of the process and an in-flight request. Operator guidance:
-  treat any `yuzu_gw_upstream` crash report as sensitive. As defence in depth, if
-  your log pipeline is shared, you can also bound how much of a term the logger
-  prints with the `chars_limit` and `depth` options of the `logger_formatter`
-  (set in the handler's `formatter` config; a size bound, not a redaction, and
-  not tested here); it is no longer the main remedy. The shipped
+  failed RPC (code `exception`), and the two caller side entry points
+  (`yuzu_gw_upstream:proxy_register/1` and `proxy_inventory/1`) catch an exit of
+  their call to the upstream client (the upstream process crashing, the 30 s call
+  timeout, or the process not running during a restart) and return
+  `{error, upstream_unavailable}`. The exit reason carries the registration
+  request and is never logged; one warning in the calling process names only the
+  kind (`noproc`, `timeout` or `other`). Before this, the gRPC server library logged
+  the exit of the calling handler process at INFO together with the whole request
+  (OBSERVED by a security reviewer running the real application with a real gRPC
+  client, for three triggers: an upstream crash with a call queued, a 30 s stall
+  with no crash, and the restart gap). Third, a logger primary filter,
+  `yuzu_gw_crash_redact`, installed when the application starts, redacts the crash
+  report, the `gen_server` terminate report and the supervisor `child_terminated`
+  report of `yuzu_gw_upstream` and, now, of `yuzu_gw_agent` processes: the process
+  mailbox becomes a count, the process dictionary is dropped, and the `messages:`
+  line and the exception lines keep no argument lists. A crash of a per-agent
+  process printed its stored request before this change (OBSERVED by the same
+  reviewer with a forced crash). A crash from any other source (for example a
+  function clause in a helper that was handed a request) would otherwise print
+  that function's argument list, because OTP appends the stacktrace after
+  `format_status` runs; with the application running, the filter removes the
+  argument lists from that report as well. The two format_status callbacks and the
+  filter share one redaction helper module, so the two processes use one
+  implementation. They are verified by unit tests on the real processes (the final
+  test count is on the PR); none of this was run on a rig. The residual is
+  therefore: (i) use of the modules outside the application (the filter is
+  installed at application start, so a bare `yuzu_gw_upstream` or
+  `yuzu_gw_agent` started in a shell has no filter); (ii) a report shape the filter
+  does not recognise (an OTP release that formats the report differently);
+  (iii) hot-loading the code into a running node, because the filter is
+  installed at application start and a hot-loaded node would not have it (hot code
+  upgrade is not a supported deployment path for the gateway: the appup in the
+  repository is an old skeleton from 0.1.0 to 0.2.0, no relup is built, and the
+  runbook above says to restart; INFERRED from a search of the gateway sources,
+  the CI workflows and the docs); and (iv) any other process that holds a
+  registration request and is not named here. I list only the two processes
+  checked: other processes have not been audited. From reading the code, the
+  routing registry keeps the stored request in an ETS table (a table, not process
+  state, so not part of a process crash report) and receives it in the message of
+  its `register` call, `yuzu_gw_registry` has no `format_status`, and the gRPC
+  handler processes for Register and Subscribe hold it while they run; none of
+  those was checked for what a crash report of it would print (INFERRED, not
+  measured). Operator guidance: treat any gateway crash report as sensitive.
+  As defence in depth, if your log pipeline is shared, you can also bound how much
+  of a term the logger prints with the `chars_limit` and `depth` options of the
+  `logger_formatter` (set in the handler's `formatter` config; a size bound, not a
+  redaction, and not tested here); it is not the main remedy. The shipped
   `gateway/config/sys.config` and `sys.config.prod` set neither: their default
   handler sets only a level and a formatter template (read at this commit).
 - The several-replica and agent-dependency limits are described above.
@@ -1464,7 +1494,7 @@ that are actually emitted are listed.
 | `yuzu_gw_registration_replay_total` | counter | Total registration replay attempts by the drip, any outcome. The drip runs after the upstream circuit breaker recovers, and when a heartbeat verdict lists sessions the gateway still holds |
 | `yuzu_gw_registration_replay_queue_depth` | gauge | Agents still queued for registration replay, whether queued by an upstream recovery or by a heartbeat verdict (0 = idle, label `node`). A non-zero value is normal while a drip runs: each entry takes the `ProxyRegister` RPC time plus the spacing (20 ms by default), so a full 10000-entry verdict queue takes at least 200 s to drain (250 s at 5 ms RPC time, see the table under "Load and convergence bounds"), and a breaker-seeded snapshot can be larger. A value that does not fall over longer than that points to a replay that is not draining (INFERRED). No alert rule ships for it. |
 | `yuzu_gw_registration_replay_triggered_total` | counter | Registration replays started, by `trigger` (`breaker` = the upstream recovered and every agent this node holds is queued for replay, unless a verdict-seeded drip is already queued, in which case the trigger is dropped, `heartbeat` = a heartbeat verdict listed sessions the server does not know and only those are replayed). Both series are created at 0 at start. |
-| `yuzu_gw_heartbeat_unknown_truncated_total` | counter | `BatchHeartbeat` responses whose list of unknown sessions the server truncated at 4096. Sessions beyond the cap may be reported again by later heartbeats. Every occurrence is counted; the matching WARN is logged at most once per 60 s per gateway node. |
+| `yuzu_gw_heartbeat_unknown_truncated_total` | counter | `BatchHeartbeat` responses whose list of unknown sessions the server truncated at 4096. Sessions beyond the cap may be reported again by later heartbeats. Every occurrence is counted; the matching WARN is logged at most once per 60 s per heartbeat buffer process (the limit resets when that process restarts). |
 | `yuzu_gw_heartbeat_verdict_dropped_total` | counter | Session ids named by a heartbeat verdict that were not queued for replay (label `reason`, closed set: `malformed` = not a usable session id, `not_local` = this node does not hold the session, `circuit_open` = the upstream circuit breaker is open, `queue_full` = the replay queue is at its cap, or the upstream client's mailbox held more than 100 messages so the heartbeat buffer did not cast the verdict; the cap bounds only verdict appends, so while a breaker-seeded snapshot of that size or larger drains, every verdict id for an agent not already queued counts here). Every reason is created at 0 at start. Ids already queued, or replayed within the session guard window, are not counted. |
 | `yuzu_gw_cluster_peers_resolved` | gauge | Peer addresses found by the cluster-formation redial loop's most recent tick (label `node`; HA WS-4 `#4555`). 0 is expected for a genuinely single-node deployment. |
 | `yuzu_gw_cluster_peers_connected` | gauge | Distribution-connected peer nodes as of the most recent redial tick (label `node`; `#4555`). Compare against `peers_resolved` — a sustained gap most often means a distribution-cookie mismatch across replicas. |

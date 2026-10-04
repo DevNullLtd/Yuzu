@@ -1322,8 +1322,8 @@ one core replica a server-only restart now recovers through the replay described
   `heartbeat_batch_interval_ms` (default 1000, valid 100..60000). The buffer also skips the cast while the
   upstream client's mailbox holds more than 100 messages, and counts those ids as `queue_full` (so that
   reason means a full replay queue or an upstream message backlog); the sessions are listed again by later
-  heartbeats (INFERRED). The truncated-verdict WARN is logged at most once per 60 s per gateway node, with a
-  `suppressed N` count; the counter still counts every occurrence. The queue cap bounds only verdict appends: the snapshot a breaker recovery seeds is not
+  heartbeats (INFERRED). The truncated-verdict WARN is logged at most once per 60 s per heartbeat buffer process (the limit
+  resets when that process restarts), with a `suppressed N` count; the counter still counts every occurrence. The queue cap bounds only verdict appends: the snapshot a breaker recovery seeds is not
   capped (bounded by the local agent count, as before), and while a snapshot of 10000 or more agents
   drains, every verdict id for an agent not already queued counts as `queue_full`. A verdict that
   arrives while the breaker is `open` is dropped and counted; one that arrives `half_open` is queued and
@@ -1423,19 +1423,29 @@ one core replica a server-only restart now recovers through the replay described
   released agents behind it. Whether restarting only the gateway recovers agents stranded by an earlier
   server restart was NOT tested; INFERRED from the code that a reconnecting agent is accepted by the
   running server, which holds only for an agent build that re-registers by itself.
-- **Known limit (crash report, narrowed not closed).** The upstream client holds each queued agent's stored
-  registration request. Before this change a crash report of it printed the whole state. Now its
-  `format_status` redacts the queue, the recent-replay stamps, the last message, the reason and the debug
-  log, an exception inside its own RPC calls is caught and counted as a failed RPC (so its stacktrace
-  carries no request), and a logger primary filter, `yuzu_gw_crash_redact`, installed when the application
-  starts, redacts the crash report of the upstream client and the supervisor `child_terminated` report for
-  it: the process mailbox becomes a count, and the `messages:` and exception lines keep no argument lists.
-  The filter is verified in a test on the real process, not on a rig. The residual is use of the module
-  outside the application (no filter is installed there) and any report shape the filter does not
-  recognise; in those cases an unhandled crash while a registration is queued or in flight can still print
-  the token, certificate or CSR of those in-flight requests. Operator guidance (the `chars_limit` and
-  `depth` logger options remain as defence in depth) and the shipped logger settings are in
-  `docs/user-manual/gateway.md`, Known limits.
+- **Known limit (crash report, narrowed not closed).** Two gateway processes keep a stored registration
+  request: the upstream client (each queued agent's request, and one in flight) and the per-agent process
+  (its own agent's request). Three layers now cover those two processes. Their `format_status` callbacks
+  redact the stored request (for the upstream client also the queue, the recent-replay stamps, the last
+  message, the reason and the debug log). A request no longer leaves through an exit reason: an exception
+  inside the upstream client's own RPC calls is caught and counted as a failed RPC, and
+  `yuzu_gw_upstream:proxy_register/1` and `proxy_inventory/1` catch an exit of their call to it (a crash, the
+  30 s timeout, or the process not running during a restart) and return `{error, upstream_unavailable}`,
+  never logging the exit reason and logging one warning that names only the kind. A logger primary filter,
+  `yuzu_gw_crash_redact`, installed when the application starts, redacts the crash report, the `gen_server`
+  terminate report and the supervisor `child_terminated` report of both processes: the process mailbox becomes
+  a count, and the `messages:` and exception lines keep no argument lists. The filter and the
+  `format_status` callbacks are verified by unit tests on the real processes, not on a rig; the exit-reason
+  leak and the per-agent crash report were OBSERVED by a security reviewer running the real application
+  before this layer existed. The residual is: use of the modules outside the application (no filter is
+  installed there); a report shape the filter does not recognise; hot-loading the code into a running node
+  (hot code upgrade is not a supported gateway deployment path: the appup in the repository is an old
+  skeleton, no relup is built, and the runbook says to restart; INFERRED from a search of the repository);
+  and any other process that holds a registration request, since only these two processes were checked and
+  others (the registry, which has no `format_status`, and the gRPC handler processes) have not been audited.
+  In those cases a crash report can still print the token, certificate or CSR of a request. Operator
+  guidance (treat crash reports as sensitive; the `chars_limit` and `depth` logger options remain as defence
+  in depth) and the shipped logger settings are in `docs/user-manual/gateway.md`, Known limits.
 - **What it does not promise.** Fleet completion inside a route lease (the drip period is the
   ProxyRegister RPC time plus the spacing, so the time to drain scales with the number of agents), and
   dispatch reachability after the session is adopted (placement converges when the agent's re-sent
