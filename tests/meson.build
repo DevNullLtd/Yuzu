@@ -2691,6 +2691,16 @@ test('capability gate consistency',
   timeout: 30,
 )
 
+# #5328: the installed-software kind/ecosystem vocabulary the agents emit is a subset of
+# what MCP, OpenAPI and the manual publish, and the CPE Lane-3 predicate covers it.
+# Hermetic — parses sources, builds nothing.
+test('installed-software vocabulary consistency',
+  _python3_test,
+  args: [files('test_software_vocabulary_consistency.py')],
+  suite: 'docs',
+  timeout: 10,
+)
+
 # server/core/scripts/embed_content.py must not rewrite an unchanged
 # bundled_content.cpp: the custom_target is build_always_stale, so a rewrite
 # would recompile and relink the server on every ninja run. Runs the real
