@@ -627,16 +627,20 @@ winner), and a claim that no longer owns its mapping releases as a successful no
 commit exception) is never selected for dispatch (`is_dead_claim`); the dispatch entry
 guard is narrower (withdrawn or commit-exception only). `expire_overdue_claims()`'s
 reaper pops terminal `Queued` heads with one index-release attempt per tombstone per
-pass and refills the follower it exposes; an attach on a key that already has a `keys_`
+pass (two in the pass that synthesizes the outcome of a withdrawn or waiter-abandoned head
+that has none; the second is a no-op if the first succeeded) and refills the follower it
+exposes; a synthesized outcome wakes blocking waiters at once, even if the release that
+follows it fails; an attach on a key that already has a `keys_`
 entry joins that watcher instead of queuing; `on_subscription_lost` never leaves `keys_`
-holding the dead subscription id; and an orphan watcher (index refcount 0, no claim)
-is given a durable Disarm claim by the same pass. (3) An abandoned `Queued` claim whose
+holding the dead subscription id; and an orphan watcher (index refcount 0, no claim) of an
+io-class type (File, Registry, Service) is given a durable Disarm claim by the same
+heartbeat pass (an inline-type key is left alone). (3) An abandoned `Queued` claim whose
 release fails is retained as a tombstone instead of being erased with its mapping
 (#5323). Four distinctions the counters and `retained_tombstones()` rely on: a tombstone
 holds a genuine mapping (`index_held` AND `owns()`), a stale local flag does not; a pending
 clean claim is not a committed claim left in a fifo (the reaper pops the latter without
-counting it as a released tombstone); `orphan_disarms_started` counts a Disarm queued (or an
-inline disarm started), not a backend teardown completed; and the reaper leaves a key alone
+counting it as a released tombstone); `orphan_disarms_started` counts an orphan Disarm claim
+queued, not a backend teardown completed; and the reaper leaves a key alone
 while its head claim is in flight (it only pops a `Queued` head), so recovery there waits for
 that claim's completion. The flip-gate rows are in `docs/spark-flip-gate.md`.
 
