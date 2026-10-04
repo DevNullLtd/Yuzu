@@ -11,6 +11,8 @@
 %%%   - after the grace every row of the dead connection is gone (and only its),
 %%%     including a row stored for it while the grace ran;
 %%%   - a grace of 0 removes the rows at once and starts no timer;
+%%%   - dropping a dead connection costs its own rows (its index entries), not a
+%%%     scan of the pending table: 20000 rows of another connection do not move it;
 %%%   - one timer per dead connection, however many rows (counted on the timeout
 %%%     messages the registry receives), and none for a connection with no row;
 %%%   - a connection that comes back (a new process, the same agent) is unaffected;
@@ -47,6 +49,10 @@ grace_test_() ->
        fun row_stored_during_grace/0},
       {"grace 0 removes the rows at once and starts no timer",
        fun grace_zero_is_immediate/0},
+      {"dropping a dead connection's rows costs its own rows, not a scan of 20000 rows of others",
+       {timeout, 120, fun drop_cost_independent_of_table_size/0}},
+      {"a row stored and not yet committed survives the drop of its connection and goes with its commit",
+       fun uncommitted_row_survives_drop_until_commit/0},
       {"a dead connection with no row left starts no timer",
        fun no_rows_no_timer/0},
       {"one timer per dead connection with 100 rows",
@@ -183,6 +189,61 @@ grace_zero_is_immediate() ->
     ?assertEqual([], dead_conns()),
     ?assertEqual(0, timeouts_received(Trace)),
     ?assertEqual([session(21)], pending_rows(Other)).
+
+%% 20000 rows of another connection sit in the pending table (stored without an
+%% index entry: all a scan would have to read). The work the registry does to
+%% drop one dead connection of 3 rows is measured in reductions, which are not a
+%% function of the machine's load, and a scan of the table costs thousands of
+%% times more: removing the rows by the connection's index entries is what keeps
+%% a loss of thousands of connections from being seconds of registry time.
+drop_cost_independent_of_table_size() ->
+    start_registry(0),
+    Others = conn(),
+    Now = erlang:monotonic_time(millisecond),
+    [true = ets:insert(yuzu_gw_pending, {session(100000 + I), info(agent(100000 + I), Others), Now})
+     || I <- lists:seq(1, 20000)],
+    ?assertEqual(20000, ets:info(yuzu_gw_pending, size)),
+    Reg = whereis(yuzu_gw_registry),
+    Reductions = fun() -> {reductions, R} = process_info(Reg, reductions), R end,
+    Spent = [begin
+                 Dying = conn(),
+                 [ok = yuzu_gw_registry:store_pending(session(I), info(agent(I), Dying))
+                  || I <- lists:seq(1, 3)],
+                 {ok, _} = yuzu_gw_registry:reserve_session(Dying, agent(4)),
+                 barrier(),
+                 R0 = Reductions(),
+                 kill(Dying),
+                 ?assertEqual(ok, wait_until(fun() ->
+                     lists:all(fun(I) -> not ets:member(yuzu_gw_pending, session(I)) end,
+                               [1, 2, 3]) andalso reserved_rows_of(Dying) =:= [] end, 5000)),
+                 barrier(),
+                 Reductions() - R0
+             end || _ <- lists:seq(1, 11)],
+    ?assert(lists:nth(6, lists:sort(Spent)) < 2000, {reductions, Spent}),
+    %% Nothing of the other connection went with it.
+    ?assertEqual(20000, ets:info(yuzu_gw_pending, size)).
+
+%% The drop removes the rows the connection's index names. A row a handler has
+%% stored and not committed is in no index: it stays, the commit that follows
+%% finds the connection down and monitors it again, and the DOWN removes the row
+%% (a caller that never commits is covered by the TTL sweep).
+uncommitted_row_survives_drop_until_commit() ->
+    start_registry(0),
+    Dying = conn(),
+    ok = yuzu_gw_registry:store_pending(session(1), info(agent(1), Dying)),
+    kill(Dying),
+    ?assertEqual(ok, wait_until(fun() -> pending_rows(Dying) =:= [] end, 5000)),
+    barrier(),
+    true = ets:insert(yuzu_gw_pending,
+                      {session(2), info(agent(2), Dying), erlang:monotonic_time(millisecond)}),
+    barrier(),
+    ?assertEqual([session(2)], pending_rows(Dying)),
+    ?assertEqual(ok, gen_server:call(yuzu_gw_registry,
+                                     {commit_pending, session(2), Dying, agent(2), undefined})),
+    ?assertEqual(ok, wait_until(fun() -> pending_rows(Dying) =:= [] end, 5000)),
+    barrier(),
+    ?assertEqual([], index_entries(Dying)),
+    ?assertEqual(0, monitor_count()).
 
 no_rows_no_timer() ->
     start_registry(60000),

@@ -80,9 +80,9 @@
 %%% pending row is first stored for it, whatever the number of rows). When it goes
 %%% down the registry starts ONE timer for the connection, `dead_connection_grace_ms'
 %%% (default 15000, 0..120000, 0 = at once), and when that fires removes every
-%%% reservation and pending row of the connection, so a client that reconnects over
-%%% and over neither starts again below the cap nor leaves its stored
-%%% RegisterRequests to wait for the TTL. Until then the rows stay and can be taken:
+%%% reservation and committed pending row of the connection (the rows its index
+%%% names), so a client that reconnects over and over neither starts again below
+%%% the cap nor leaves its stored RegisterRequests to wait for the TTL. Until then the rows stay and can be taken:
 %%% an agent whose connection got GOAWAY after its Register subscribes on the
 %%% reconnected channel and must find its session (a released agent answers
 %%% NOT_FOUND by wedging, #2182). The rows count for the dead connection key only,
@@ -92,7 +92,13 @@
 %%% releases the monitor of a live connection that has no row left. Only a pid is
 %%% monitored. A row stored for a connection that is already dead is removed the
 %%% same way: the monitor of a dead process fires at once, and the connection's
-%%% timer, if one runs, covers the new row (it does not restart).
+%%% timer, if one runs, covers the new row (it does not restart). The removal reads
+%%% the connection's index entries, so it costs the rows of that connection and
+%%% never a scan of the pending table (one scan per lost connection is seconds of
+%%% registry time when thousands go at once). A row a handler stored and has not
+%%% committed yet is in no index and is NOT removed by it: its own commit finds the
+%%% connection down and monitors it again (the removal then covers it), and if its
+%%% caller died the TTL sweep removes it.
 %%%
 %%% Not covered: the gap between Subscribe taking a pending row and the live
 %%% insert, where a slot is free for a moment and another Register can take it;
@@ -1079,12 +1085,18 @@ connection_down(ConnKey, #state{dead_conns = Dead, dead_grace_ms = Grace} = Stat
             end
     end.
 
-%% Remove every reservation and pending row of the connection ConnKey: whatever
-%% the table holds for it, indexed or not (a row a handler inserted and has not
-%% committed yet), and then its index entries.
+%% Remove every reservation and pending row of the connection ConnKey that its
+%% index names (each by its key, so the cost is that connection's rows, not the
+%% table's), and then its index entries. A row not in the index (inserted by a
+%% handler and not yet committed) stays for its own commit or the TTL sweep.
 drop_connection_rows(ConnKey) ->
-    _ = ets:select_delete(?PENDING_TABLE, [{{'_', #{conn_key => ConnKey}, '_'}, [], [true]}]),
-    with_index(?PENDING_INDEX_KEY, fun(Index) -> ets:delete(Index, ConnKey) end).
+    with_index(?PENDING_INDEX_KEY,
+               fun(Index) ->
+                   _ = [ets:select_delete(?PENDING_TABLE,
+                                          [{{Key, #{conn_key => ConnKey}, '_'}, [], [true]}])
+                        || {_, Key} <- ets:lookup(Index, ConnKey)],
+                   ets:delete(Index, ConnKey)
+               end).
 
 %% Release the monitor of a connection with no reservation or pending row left
 %% (Subscribe took its rows, or they expired): a connection that lives for days
