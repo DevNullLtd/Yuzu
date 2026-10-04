@@ -24,10 +24,12 @@
 #include <sstream>
 #include <string_view>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
 using yuzu::agent::AdaptedRows;
+using yuzu::agent::installed_software_actions;
 using yuzu::agent::installed_software_canonical_blob;
 using yuzu::agent::make_installed_software_source;
 using yuzu::agent::parse_pkg_inventory_managers_output;
@@ -838,6 +840,9 @@ struct FakeOut {
     std::map<std::string, std::string> out;
     std::map<std::string, std::string> overflow; // optional 2nd write, after `out`
     std::map<std::string, int> rc;
+    // Typed result status a fake plugin declares for an action (applied in fake_execute).
+    std::map<std::string, std::tuple<YuzuResultStatus, YuzuResultCompleteness, std::string>>
+        result_status;
 };
 FakeOut g_fake[3]; // 0 installed_apps, 1 pkg_inventory, 2 windows_optional_features
 
@@ -850,6 +855,10 @@ int fake_execute(YuzuCommandContext* ctx, const char* action, const YuzuParam* /
     const auto more = g_fake[I].overflow.find(action);
     if (more != g_fake[I].overflow.end())
         yuzu_ctx_write_output(ctx, more->second.c_str());
+    const auto rs = g_fake[I].result_status.find(action);
+    if (rs != g_fake[I].result_status.end())
+        yuzu_ctx_set_result_status(ctx, std::get<0>(rs->second), std::get<1>(rs->second),
+                                   std::get<2>(rs->second).c_str());
     const auto rc = g_fake[I].rc.find(action);
     return rc == g_fake[I].rc.end() ? 0 : rc->second;
 }
@@ -878,6 +887,7 @@ void reset_fakes() {
         f.out.clear();
         f.overflow.clear();
         f.rc.clear();
+        f.result_status.clear();
     }
 }
 
@@ -1419,4 +1429,113 @@ TEST_CASE("entry cap: the splitter reads one past kMaxEntries and the collector 
     CHECK(over.size() < 3'670'016); // kInventoryCaptureCap
     g_fake[0].out["list_inventory"] = over;
     CHECK_FALSE(collect_with(only_ia).has_value());
+}
+
+// --- constrained managers, typed PARTIAL guard, exported action table ---
+
+namespace {
+// Real emitters: a constrained managers status row carrying one present Homebrew row.
+std::string constrained_managers_with_present_row() {
+    return nl({pkg::format_status_row("managers", pkg::StatusLevel::constrained,
+                                      "macos:homebrew_taps:permission_denied"),
+               pkg::format_manager_row(pkg::Manager::homebrew, pkg::Presence::present, "",
+                                       "/opt/homebrew", "-", "")});
+}
+} // namespace
+
+TEST_CASE("collector: constrained managers keeps a present row", "[sync][collector]") {
+    SECTION("present row: the cycle succeeds with one managers record") {
+        fake_mac();
+        g_fake[1].out["managers"] = constrained_managers_with_present_row();
+        const auto got = collect_with(all_plugins());
+        REQUIRE(got.has_value());
+        const auto recs = records_of(got->first);
+        CHECK(recs.size() == 393 + 66 + 1);
+        std::size_t managers = 0;
+        for (const auto& rec : recs)
+            if (fields_of(rec)[15] == "pkg_inventory.managers")
+                ++managers;
+        CHECK(managers == 1);
+    }
+    SECTION("only an unavailable row: skipped") {
+        fake_mac();
+        g_fake[1].out["managers"] = nl(
+            {pkg::format_status_row("managers", pkg::StatusLevel::constrained,
+                                    "macos:homebrew_taps:permission_denied"),
+             pkg::format_manager_row(pkg::Manager::homebrew, pkg::Presence::unavailable, "",
+                                     "/usr/local", "-", "macos:homebrew_cellar:permission_denied")});
+        CHECK_FALSE(collect_with(all_plugins()).has_value());
+    }
+    SECTION("no data rows: skipped") {
+        fake_mac();
+        g_fake[1].out["managers"] =
+            pkg::format_status_row("managers", pkg::StatusLevel::constrained,
+                                   "macos:homebrew_taps:permission_denied") +
+            "\n";
+        CHECK_FALSE(collect_with(all_plugins()).has_value());
+    }
+}
+
+TEST_CASE("pkg_inventory adapters: constrained managers is ok, packages stays failed",
+          "[sync][parse][adapter]") {
+    const std::string token = "macos:homebrew_taps:permission_denied";
+    const auto m = parse_pkg_inventory_managers_output(constrained_managers_with_present_row());
+    CHECK(m.status == AdaptedRows::Status::ok);
+    CHECK(m.entries.size() == 1);
+    CHECK(m.reason == token);
+
+    const auto p = parse_pkg_inventory_packages_output(
+        nl({pkg::format_status_row("packages", pkg::StatusLevel::constrained, token),
+            pkg::format_package_row("wget", "1.24", pkg::PackageKind::formula)}));
+    CHECK(p.status == AdaptedRows::Status::failed);
+    CHECK(p.reason == token);
+}
+
+TEST_CASE("collector: typed PARTIAL completeness skips the cycle unless the row opts in",
+          "[sync][collector]") {
+    constexpr auto kPartial = YUZU_RESULT_COMPLETENESS_PARTIAL;
+    SECTION("packages CONSTRAINED/PARTIAL with parseable rows: skipped") {
+        fake_mac();
+        g_fake[1].result_status["packages"] = {YUZU_RESULT_STATUS_CONSTRAINED, kPartial, "x"};
+        CHECK_FALSE(collect_with(all_plugins()).has_value());
+    }
+    SECTION("packages OK/FULL: collected") {
+        fake_mac();
+        g_fake[1].result_status["packages"] = {YUZU_RESULT_STATUS_OK,
+                                               YUZU_RESULT_COMPLETENESS_FULL, ""};
+        CHECK(collect_with(all_plugins()).has_value());
+    }
+    SECTION("no typed status (UNKNOWN): collected") {
+        fake_mac();
+        CHECK(collect_with(all_plugins()).has_value());
+    }
+    SECTION("managers CONSTRAINED/PARTIAL with a present row: opt-in accepts") {
+        fake_mac();
+        g_fake[1].out["managers"] = constrained_managers_with_present_row();
+        g_fake[1].result_status["managers"] = {YUZU_RESULT_STATUS_CONSTRAINED, kPartial, "x"};
+        CHECK(collect_with(all_plugins()).has_value());
+    }
+    SECTION("in-band unsupported wins over UNAVAILABLE/PARTIAL (WOF on mac)") {
+        fake_mac();
+        g_fake[2].result_status["list"] = {YUZU_RESULT_STATUS_UNAVAILABLE, kPartial, "r"};
+        const auto got = collect_with(all_plugins());
+        REQUIRE(got.has_value());
+        CHECK(records_of(got->first).size() == 393 + 66 + 1);
+    }
+    SECTION("in-band unsupported wins over UNAVAILABLE/PARTIAL (pkg on windows)") {
+        fake_windows();
+        g_fake[1].result_status["managers"] = {YUZU_RESULT_STATUS_UNAVAILABLE, kPartial, "r"};
+        g_fake[1].result_status["packages"] = {YUZU_RESULT_STATUS_UNAVAILABLE, kPartial, "r"};
+        CHECK(collect_with(all_plugins()).has_value());
+    }
+}
+
+TEST_CASE("installed_software_actions: the exported table, in order", "[sync][collector]") {
+    const auto a = installed_software_actions();
+    const std::vector<std::pair<std::string_view, std::string_view>> want = {
+        {"installed_apps", "list_inventory"},
+        {"pkg_inventory", "managers"},
+        {"pkg_inventory", "packages"},
+        {"windows_optional_features", "list"}};
+    CHECK(a == want);
 }

@@ -144,8 +144,15 @@ AdaptedRows failed(std::string reason) {
 // `status|<action>|<supported|constrained|unsupported>|<tokens or ->` row, plus
 // data rows. Status decides success; malformed DATA rows are dropped. A status
 // row answering a different action is not counted (-> "bad status").
+// `constrained_fails`: a `constrained` level fails the action (packages: a
+// constrained listing is an incomplete package list). When false (managers) the
+// constraint names facts the presence row does not carry, so the adapted rows
+// are kept (status ok, reason = the status token) -- but ONLY if at least one
+// present row survived: constrained with zero rows is indistinguishable from an
+// absent/unreadable manager and still fails.
 template <class OnRow>
-AdaptedRows adapt_pkg_inventory(const std::string& out, std::string_view action, OnRow on_row) {
+AdaptedRows adapt_pkg_inventory(const std::string& out, std::string_view action, OnRow on_row,
+                                bool constrained_fails) {
     AdaptedRows res;
     int status_rows = 0;
     std::string level;
@@ -165,8 +172,11 @@ AdaptedRows adapt_pkg_inventory(const std::string& out, std::string_view action,
     });
     if (status_rows != 1 || (level != "supported" && level != "constrained" && level != "unsupported"))
         return failed("bad status");
-    if (level == "constrained")
-        return failed(reason);
+    if (level == "constrained") {
+        if (constrained_fails || res.entries.empty())
+            return failed(reason);
+        res.reason = reason; // ok + non-empty reason = constrained, rows kept
+    }
     if (level == "unsupported") {
         res.entries.clear();
         res.status = AdaptedRows::Status::unsupported;
@@ -179,6 +189,10 @@ struct InventoryAction {
     std::string_view plugin;
     std::string_view action;
     AdaptedRows (*adapt)(const std::string& captured);
+    // A typed result_completeness of PARTIAL (sdk/include/yuzu/plugin.h:264-267)
+    // skips the cycle unless the row opts in. managers opts in: it legitimately
+    // reports CONSTRAINED/PARTIAL while still carrying a present row.
+    bool accept_partial{false};
 };
 
 // UP-IN6 preserved per plugin: installed_apps always reports >= 1 application on a
@@ -194,7 +208,7 @@ AdaptedRows adapt_installed_apps(const std::string& captured) {
 
 const InventoryAction kInventoryActions[] = {
     {"installed_apps", "list_inventory", adapt_installed_apps},
-    {"pkg_inventory", "managers", parse_pkg_inventory_managers_output},
+    {"pkg_inventory", "managers", parse_pkg_inventory_managers_output, true},
     {"pkg_inventory", "packages", parse_pkg_inventory_packages_output},
     {"windows_optional_features", "list", parse_windows_optional_features_output},
 };
@@ -264,7 +278,7 @@ AdaptedRows parse_pkg_inventory_packages_output(const std::string& out) {
         e.version = clamp_field(tok[3], kMaxFieldLen);
         e.ecosystem = "brew";
         entries.push_back(std::move(e));
-    });
+    }, /*constrained_fails=*/true);
 }
 
 AdaptedRows parse_pkg_inventory_managers_output(const std::string& out) {
@@ -290,7 +304,7 @@ AdaptedRows parse_pkg_inventory_managers_output(const std::string& out) {
         e.kind = "app";
         e.ecosystem = "brew";
         entries.push_back(std::move(e));
-    });
+    }, /*constrained_fails=*/false);
 }
 
 AdaptedRows parse_windows_optional_features_output(const std::string& out) {
@@ -329,6 +343,13 @@ AdaptedRows parse_windows_optional_features_output(const std::string& out) {
     if (res.entries.empty())
         return failed("no rows");
     return res;
+}
+
+std::vector<std::pair<std::string_view, std::string_view>> installed_software_actions() {
+    std::vector<std::pair<std::string_view, std::string_view>> out;
+    for (const auto& row : kInventoryActions)
+        out.emplace_back(row.plugin, row.action);
+    return out;
 }
 
 std::string installed_software_canonical_blob(std::vector<SwEntry> entries) {
@@ -386,7 +407,7 @@ SyncSource make_installed_software_source(SyncPluginMap plugins) {
         // plugins' rows alone would replace the stored inventory.
         const auto anchor = plugins.find("installed_apps");
         if (anchor == plugins.end() || anchor->second == nullptr) {
-            spdlog::debug("sync: installed_apps plugin not loaded — installed_software source idle");
+            spdlog::warn("sync: installed_apps plugin not loaded — installed_software source idle");
             return std::nullopt;
         }
         LocalDispatcher dispatcher;
@@ -400,7 +421,9 @@ SyncSource make_installed_software_source(SyncPluginMap plugins) {
         for (const auto& row : kInventoryActions) {
             const auto it = plugins.find(row.plugin);
             if (it == plugins.end() || it->second == nullptr) {
-                spdlog::debug("sync: {} plugin not loaded — {} skipped", row.plugin, row.action);
+                spdlog::warn("sync: {} plugin not loaded — {} rows will be absent from this report "
+                             "(its stored rows are removed server-side)",
+                             row.plugin, row.action);
                 continue;
             }
             LocalDispatcher::Result r =
@@ -432,6 +455,15 @@ SyncSource make_installed_software_source(SyncPluginMap plugins) {
                              rows.reason);
                 return std::nullopt;
             }
+            if (r.result_completeness == YUZU_RESULT_COMPLETENESS_PARTIAL && !row.accept_partial) {
+                spdlog::warn("sync: {}.{} typed result completeness PARTIAL — skipping this cycle",
+                             row.plugin, row.action);
+                return std::nullopt;
+            }
+            if (!rows.reason.empty())
+                spdlog::info("sync: {}.{} constrained ({}) — rows kept: the constraint names facts "
+                             "this row does not carry",
+                             row.plugin, row.action, rows.reason);
             std::string source = std::string(row.plugin) + '.' + std::string(row.action);
             for (auto& e : rows.entries) {
                 e.source = source;
