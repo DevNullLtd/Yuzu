@@ -7258,7 +7258,7 @@ Get fleet-wide execution summary.
 
 Get per-agent execution statistics.
 
-**Permission:** `Execution:Read`
+**Permission:** `Execution:Read`, through the fleet-read chokepoint (ADR-0017 admit-then-filter, #3526): a management-group-confined caller is admitted and sees only the rows of the agents it can see (filtered in SQL before the `limit`), while a global grant sees every agent. The sibling `/definitions` route and the fleet summary carry no agent identity and keep the plain `Execution:Read` gate. A malformed `since` or `limit` is `400`, and so is a negative `since`.
 
 **Query parameters:**
 

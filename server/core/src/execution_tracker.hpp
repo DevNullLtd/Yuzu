@@ -176,6 +176,11 @@ struct ExecutionStatsQuery {
     int64_t since{0};
     int64_t until{0};
     int limit{50};
+    /// ADR-0017 admit-then-filter confinement for `get_agent_statistics` (#3526): `nullopt`
+    /// = unconfined (a global grant); present = ONLY these agents' rows, applied in SQL
+    /// BEFORE the GROUP BY and LIMIT, and present-EMPTY = deny-all (never "no filter").
+    /// Ignored by `get_definition_statistics`, whose rows carry no agent identity.
+    std::optional<std::vector<std::string>> visible_agents;
 };
 
 /// HA WS-1(1b), ADR-2002 section 5. Outcome of a `command_execution`

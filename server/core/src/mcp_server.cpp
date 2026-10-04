@@ -3268,9 +3268,10 @@ static const ToolDef kTools[] = {
      "/api/v1/execution-statistics/agents. Use to find which agents are failing "
      "disproportionately, or to see one agent's execution history at a glance (pass agent_id). "
      "An empty data array means no agent has any completed execution matching the filter, not a "
-     "fault. NOT confined by the caller's own management-group scope -- like its REST twin, this "
-     "fleet-wide rollup returns rows for every agent regardless of the caller's visible-agent "
-     "set. Requires Execution:Read.",
+     "fault. Confined by the caller's management-group scope (ADR-0017, #3526) like its REST "
+     "twin: only rows for agents the caller can see are returned, filtered before the limit, so "
+     "a confined caller's empty data array can also mean none of their visible agents match. "
+     "Requires Execution:Read.",
      R"j({"type":"object","properties":{"agent_id":{"type":"string","maxLength":256,"description":"Filter to one agent; omit for every agent"},"since":{"type":"integer","minimum":0,"description":"Only count executions dispatched at/after this epoch-seconds timestamp"},"limit":{"type":"integer","minimum":1,"maximum":1000,"default":50,"description":"Max rows, highest total_executions first"}}})j",
      R"j({"type":"object","properties":{"data":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"total_executions":{"type":"integer"},"success_count":{"type":"integer"},"failure_count":{"type":"integer"},"success_rate":{"type":"number","description":"Percent, 0-100"},"avg_duration_seconds":{"type":"number"},"last_execution_at":{"type":"integer"}},"required":["agent_id","total_executions","success_count","failure_count","success_rate","avg_duration_seconds","last_execution_at"]}}},"required":["data"]})j"},
 
@@ -21111,14 +21112,22 @@ McpServer::HandlerFn McpServer::build_handler(
             }
 
             if (tool_name == "get_execution_statistics_by_agent") {
-                if (!tier_allows(tier, "Execution", "Read")) {
-                    res.set_content(
-                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
-                        "application/json");
+                // #3526 (ADR-0017): per-agent rows are a fan-out read of per-agent data, so
+                // this tool gates SOLELY on the admit-then-filter fleet-read chokepoint (it
+                // runs the MCP tier policy and the management-group axis itself), exactly
+                // like list_executions and its REST twin. A confined caller sees only its
+                // visible agents. A service-scoped token is still refused earlier by the
+                // generic C8 gate (`denied` ServiceScopeClass), so this does not widen it.
+                if (!fleet_read_fn_) {
+                    spdlog::error("get_execution_statistics_by_agent: fleet_read_fn_ unwired; "
+                                  "failing closed");
+                    res.set_content(error_response(id, kInternalError, "service unavailable"),
+                                    "application/json");
                     return;
                 }
-                if (!perm_fn(req, res, "Execution", "Read"))
-                    return;
+                auto stats_gate = fleet_read_fn_(req, res, "Execution", "Read");
+                if (!stats_gate.admitted)
+                    return; // gate already wrote the response.
                 if (!execution_tracker) {
                     res.set_content(a4_error(kInternalError, "Execution tracker unavailable"),
                                     "application/json");
@@ -21186,6 +21195,9 @@ McpServer::HandlerFn McpServer::build_handler(
                 q.limit = saturate_to_int(*limit_opt);
                 if (q.limit > 1000)
                     q.limit = 1000;
+                if (stats_gate.scope)
+                    q.visible_agents = std::vector<std::string>(stats_gate.scope->begin(),
+                                                                stats_gate.scope->end());
                 auto stats = execution_tracker->get_agent_statistics(q);
                 JArr arr;
                 for (const auto& s : stats)

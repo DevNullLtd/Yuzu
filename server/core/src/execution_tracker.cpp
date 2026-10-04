@@ -2083,6 +2083,19 @@ ExecutionTracker::get_agent_statistics(const ExecutionStatsQuery& q) const {
         sql += " AND a.dispatched_at <= $" + std::to_string(idx++);
         params.push_back(std::to_string(q.until));
     }
+    // ADR-0017 confinement (#3526): resolve the visible set INTO the WHERE clause so the
+    // GROUP BY and LIMIT only ever see in-scope agents -- a post-fetch filter would hand a
+    // confined caller a short or empty page while visible rows sit past the hidden ones.
+    // Present-empty is deny-all, never "no filter".
+    if (q.visible_agents) {
+        if (q.visible_agents->empty()) {
+            sql += " AND 1=0";
+        } else {
+            std::vector<std::string_view> sv(q.visible_agents->begin(), q.visible_agents->end());
+            sql += " AND a.agent_id = ANY($" + std::to_string(idx++) + "::text[])";
+            params.push_back(pg::to_text_array(sv));
+        }
+    }
     sql += " GROUP BY a.agent_id ORDER BY total DESC LIMIT $" + std::to_string(idx++);
     params.push_back(std::to_string(q.limit > 0 ? q.limit : 50));
 

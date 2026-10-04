@@ -1492,7 +1492,7 @@ const std::string& openapi_spec() {
       "get": {"summary": "Fleet-wide execution summary", "tags": ["Executions"], "description": "Requires Execution:Read. Aggregate counters over the ExecutionTracker fleet summary.", "responses": {"200": {"description": "{total_executions, executions_today, active_agents, overall_success_rate, avg_duration_seconds}"}}}
     },
     "/execution-statistics/agents": {
-      "get": {"summary": "Per-agent execution statistics", "tags": ["Executions"], "description": "Requires Execution:Read.", "parameters": [{"name": "agent_id", "in": "query", "required": false, "schema": {"type": "string"}, "description": "Filter to a single agent"}, {"name": "since", "in": "query", "required": false, "schema": {"type": "integer"}, "description": "Unix timestamp — only executions after this time"}, {"name": "limit", "in": "query", "required": false, "schema": {"type": "integer"}, "description": "Max results (default 50, clamped to 1000)"}], "responses": {"200": {"description": "List, one row per agent: {agent_id, total_executions, success_count, failure_count, success_rate, avg_duration_seconds, last_execution_at}"}}}
+      "get": {"summary": "Per-agent execution statistics", "tags": ["Executions"], "description": "Requires Execution:Read, gated via the ADR-0017 admit-then-filter fleet-read chokepoint (#3526): a management-group-confined caller sees only rows for the agents it can see, filtered in SQL before the limit; a global grant sees every agent. A malformed since or limit is a 400, and a negative since is a 400.", "parameters": [{"name": "agent_id", "in": "query", "required": false, "schema": {"type": "string"}, "description": "Filter to a single agent"}, {"name": "since", "in": "query", "required": false, "schema": {"type": "integer"}, "description": "Unix timestamp — only executions after this time"}, {"name": "limit", "in": "query", "required": false, "schema": {"type": "integer"}, "description": "Max results (default 50, clamped to 1000)"}], "responses": {"200": {"description": "List, one row per agent: {agent_id, total_executions, success_count, failure_count, success_rate, avg_duration_seconds, last_execution_at}"}, "400": {"description": "since or limit is not one base-10 integer, or since is negative"}, "403": {"description": "Insufficient permission (Execution:Read)"}}}
     },
     "/execution-statistics/definitions": {
       "get": {"summary": "Per-InstructionDefinition execution statistics", "tags": ["Executions"], "description": "Requires Execution:Read.", "parameters": [{"name": "definition_id", "in": "query", "required": false, "schema": {"type": "string"}, "description": "Filter to a single definition"}, {"name": "since", "in": "query", "required": false, "schema": {"type": "integer"}, "description": "Unix timestamp — only executions after this time"}, {"name": "limit", "in": "query", "required": false, "schema": {"type": "integer"}, "description": "Max results (default 50, clamped to 1000)"}], "responses": {"200": {"description": "List, one row per definition: {definition_id, total_executions, total_agents, success_rate, avg_duration_seconds}"}}}
@@ -9380,10 +9380,17 @@ void RestApiV1::register_routes(
                                  "application/json");
              });
 
+    // #3526 (ADR-0017): per-agent rows are a fan-out read of per-agent data, so this route
+    // gates on the admit-then-filter fleet-read chokepoint, NOT a bare perm_fn -- a
+    // management-group-confined caller sees only its visible agents' rows. The
+    // /definitions and fleet-summary siblings below carry no agent identity and keep the
+    // plain Execution:Read gate.
     sink.Get("/api/v1/execution-statistics/agents",
-             [perm_fn, execution_tracker](const httplib::Request& req, httplib::Response& res) {
-                 if (!perm_fn(req, res, "Execution", "Read"))
-                     return;
+             [fleet_read_fn, execution_tracker](const httplib::Request& req,
+                                                httplib::Response& res) {
+                 auto gate = fleet_read_fn(req, res, "Execution", "Read");
+                 if (!gate.admitted)
+                     return; // gate already wrote the response.
                  ExecutionStatsQuery q;
                  if (req.has_param("agent_id"))
                      q.agent_id = req.get_param_value("agent_id");
@@ -9401,8 +9408,17 @@ void RestApiV1::register_routes(
                                      "application/json");
                      return;
                  }
+                 if (q.since < 0) {
+                     res.status = 400;
+                     res.set_content(detail::a4_error(res, "since must not be negative"),
+                                     "application/json");
+                     return;
+                 }
                  if (q.limit > 1000)
                      q.limit = 1000;
+                 if (gate.scope)
+                     q.visible_agents =
+                         std::vector<std::string>(gate.scope->begin(), gate.scope->end());
                  auto stats = execution_tracker->get_agent_statistics(q);
                  JArr arr;
                  // #2146 Batch B3: shared builder -- the MCP twin

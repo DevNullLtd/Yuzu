@@ -27875,8 +27875,18 @@ TEST_CASE("MCP get_execution_statistics_by_agent: denies without Execution:Read"
 
     McpTestServer ts;
     ts.execution_tracker_for_test = &tracker;
-    ts.perm_override_for_test = [](const std::string& sec, const std::string& op) -> bool {
-        return !(sec == "Execution" && op == "Read");
+    // #3526: the tool's SOLE gate is now fleet_read_fn_ (the admit-then-filter chokepoint),
+    // which owns the Execution:Read decision, so the denial is modelled on that fake, not on
+    // perm_override_for_test (which only the bare perm_fn consults).
+    std::string securable_seen, operation_seen;
+    ts.fleet_read_fn_for_test = [&](const httplib::Request&, httplib::Response& r,
+                                    const std::string& sec,
+                                    const std::string& op) -> yuzu::server::authz::FleetReadGate {
+        securable_seen = sec;
+        operation_seen = op;
+        r.status = 403;
+        r.set_content(R"({"error":{"code":403,"message":"denied"}})", "application/json");
+        return {false, yuzu::server::authz::deny_all()};
     };
     ts.start("readonly");
 
@@ -27885,6 +27895,8 @@ TEST_CASE("MCP get_execution_statistics_by_agent: denies without Execution:Read"
         R"("get_execution_statistics_by_agent","arguments":{}}})");
     REQUIRE(res);
     CHECK(res->status == 403);
+    CHECK(securable_seen == "Execution");
+    CHECK(operation_seen == "Read");
 }
 
 // ── get_execution_statistics_by_definition ────────────────────────────────
@@ -32693,4 +32705,102 @@ TEST_CASE("MCP get_execution_statistics_by_agent: a limit above INT_MAX saturate
     // Saturated, it is a very large limit that the route's own 1000 ceiling then applies to.
     CHECK(rows_for("4294967296") == 60);
     CHECK(rows_for("10") == 10);
+}
+
+// ── #3526 (ADR-0017): get_execution_statistics_by_agent is confined ────────
+
+TEST_CASE("MCP get_execution_statistics_by_agent: a confined caller sees exactly its visible "
+          "agents, deny-all sees none, the scope applies before the limit (#3526)",
+          "[pg][mcp][integration][operator_surface][security]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
+
+    auto now = operator_surface_now();
+    auto e1 = b3_make_exec("def-scope-a", "succeeded", 3, 3, 0, now - 300, now - 290);
+    auto id1 = tracker.create_execution(e1);
+    REQUIRE(id1.has_value());
+    b3_insert_agent_status(tracker, *id1, "agent-busy", "success", 0, now - 300, now - 290);
+    b3_insert_agent_status(tracker, *id1, "agent-quiet", "success", 0, now - 300, now - 290);
+    for (int i = 0; i < 2; ++i) {
+        auto e = b3_make_exec("def-scope-b", "succeeded", 1, 1, 0, now - 200, now - 190);
+        auto id = tracker.create_execution(e);
+        REQUIRE(id.has_value());
+        b3_insert_agent_status(tracker, *id, "agent-busy", "success", 0, now - 200, now - 190);
+    }
+
+    McpTestServer ts;
+    ts.execution_tracker_for_test = &tracker;
+    ts.start();
+    auto agents_for = [&](const std::string& args) {
+        auto res = ts.call(
+            R"({"jsonrpc":"2.0","method":"tools/call","id":6,"params":{"name":)"
+            R"("get_execution_statistics_by_agent","arguments":)" + args + "}}");
+        REQUIRE(res);
+        auto payload = operator_surface_payload(res);
+        std::vector<std::string> ids;
+        for (const auto& row : payload["data"])
+            ids.push_back(row["agent_id"].get<std::string>());
+        return ids;
+    };
+
+    // Unconfined (the fixture default admits nullopt): every agent, busiest first.
+    CHECK(agents_for("{}") == std::vector<std::string>{"agent-busy", "agent-quiet"});
+
+    // Confined to the lower-ranked agent: only it, and still present at limit 1 (the scope is
+    // applied in SQL before the LIMIT, not as a post-fetch filter).
+    ts.fleet_read_fn_for_test = [](const httplib::Request&, httplib::Response&, const std::string&,
+                                   const std::string&) -> yuzu::server::authz::FleetReadGate {
+        return {true, yuzu::server::authz::VisibleSet{std::unordered_set<std::string>{"agent-quiet"}}};
+    };
+    ts.start();
+    CHECK(agents_for("{}") == std::vector<std::string>{"agent-quiet"});
+    CHECK(agents_for(R"({"limit":1})") == std::vector<std::string>{"agent-quiet"});
+    // Naming an out-of-scope agent explicitly yields the same empty answer.
+    CHECK(agents_for(R"({"agent_id":"agent-busy"})").empty());
+
+    // Present-empty is deny-all, never "no filter".
+    ts.fleet_read_fn_for_test = [](const httplib::Request&, httplib::Response&, const std::string&,
+                                   const std::string&) -> yuzu::server::authz::FleetReadGate {
+        return {true, yuzu::server::authz::deny_all()};
+    };
+    ts.start();
+    CHECK(agents_for("{}").empty());
+}
+
+TEST_CASE("MCP get_execution_statistics_by_agent: an unwired fleet-read gate fails closed and a "
+          "gate denial serves nothing (#3526)",
+          "[pg][mcp][integration][operator_surface][security]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
+    auto now = operator_surface_now();
+    auto e1 = b3_make_exec("def-gate", "succeeded", 1, 1, 0, now - 300, now - 290);
+    auto id1 = tracker.create_execution(e1);
+    REQUIRE(id1.has_value());
+    b3_insert_agent_status(tracker, *id1, "agent-gate", "success", 0, now - 300, now - 290);
+
+    McpTestServer ts;
+    ts.execution_tracker_for_test = &tracker;
+    ts.fleet_read_fn_for_test = {}; // genuinely unwired, not the fixture default
+    ts.start();
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":7,"params":{"name":)"
+        R"("get_execution_statistics_by_agent","arguments":{}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(res->body.find("agent-gate") == std::string::npos);
+
+    ts.fleet_read_fn_for_test = [](const httplib::Request&, httplib::Response& r, const std::string&,
+                                   const std::string&) -> yuzu::server::authz::FleetReadGate {
+        r.status = 403;
+        r.set_content(R"({"jsonrpc":"2.0","id":8,"error":{"code":-32001,"message":"denied"}})",
+                      "application/json");
+        return {false, yuzu::server::authz::deny_all()};
+    };
+    ts.start();
+    auto denied = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":8,"params":{"name":)"
+        R"("get_execution_statistics_by_agent","arguments":{}}})");
+    REQUIRE(denied);
+    CHECK(denied->body.find("agent-gate") == std::string::npos);
 }

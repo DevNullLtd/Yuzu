@@ -789,3 +789,128 @@ TEST_CASE("GET /api/v1/executions: a trailing-garbage limit is a 400, not the nu
     REQUIRE(ok);
     CHECK(ok->status == 200);
 }
+
+// ── #3526 (ADR-0017): GET /api/v1/execution-statistics/agents is confined ─────
+
+namespace {
+// Agent ids of the rows an /agents response served, in served order.
+std::vector<std::string> served_agent_ids(const httplib::Response& res) {
+    std::vector<std::string> ids;
+    for (const auto& row : nlohmann::json::parse(res.body)["data"])
+        ids.push_back(row["agent_id"].get<std::string>());
+    return ids;
+}
+
+// One execution with a terminal row for each named agent (so each counts once in /agents).
+void stats_exec_for(ExecV1Harness& h, std::initializer_list<const char*> agents) {
+    Execution e;
+    e.definition_id = "def-stats-scope";
+    e.dispatched_by = "tester";
+    e.status = "completed";
+    e.dispatched_at = 1735689600;
+    auto id = h.execution_tracker->create_execution(e);
+    REQUIRE(id.has_value());
+    for (const char* agent : agents) {
+        AgentExecStatus a;
+        a.agent_id = agent;
+        a.status = "success";
+        a.dispatched_at = 1735689600;
+        a.completed_at = 1735689610;
+        h.execution_tracker->update_agent_status(*id, a);
+    }
+}
+} // namespace
+
+TEST_CASE("GET /api/v1/execution-statistics/agents: an unconfined caller sees every agent, a "
+          "confined one sees exactly its visible set, deny-all sees none (#3526)",
+          "[pg][rest][executions][v1][statistics][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, execv1_responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecV1Harness h(pool);
+    stats_exec_for(h, {"agent-in", "agent-out", "agent-other"});
+
+    auto sorted = [](std::vector<std::string> v) {
+        std::sort(v.begin(), v.end());
+        return v;
+    };
+
+    // Unconfined (a global grant): the whole fleet's rows.
+    auto all = h.sink.Get("/api/v1/execution-statistics/agents");
+    REQUIRE(all);
+    CHECK(all->status == 200);
+    CHECK(sorted(served_agent_ids(*all)) ==
+          std::vector<std::string>{"agent-in", "agent-other", "agent-out"});
+
+    // Confined to {agent-in}: exactly that agent, never the others.
+    h.fleet_read_scope = authz::VisibleSet{std::unordered_set<std::string>{"agent-in"}};
+    auto confined = h.sink.Get("/api/v1/execution-statistics/agents");
+    REQUIRE(confined);
+    CHECK(confined->status == 200);
+    CHECK(served_agent_ids(*confined) == std::vector<std::string>{"agent-in"});
+    CHECK(nlohmann::json::parse(confined->body)["pagination"]["total"] == 1);
+
+    // Confined to two of three.
+    h.fleet_read_scope =
+        authz::VisibleSet{std::unordered_set<std::string>{"agent-in", "agent-other"}};
+    auto two = h.sink.Get("/api/v1/execution-statistics/agents");
+    REQUIRE(two);
+    CHECK(sorted(served_agent_ids(*two)) == std::vector<std::string>{"agent-in", "agent-other"});
+
+    // Present-EMPTY is deny-all, never "no filter": a 200 with no rows, not the fleet.
+    h.fleet_read_scope = authz::deny_all();
+    auto none = h.sink.Get("/api/v1/execution-statistics/agents");
+    REQUIRE(none);
+    CHECK(none->status == 200);
+    CHECK(served_agent_ids(*none).empty());
+
+    // Naming an out-of-scope agent explicitly yields the same empty answer.
+    h.fleet_read_scope = authz::VisibleSet{std::unordered_set<std::string>{"agent-in"}};
+    auto named = h.sink.Get("/api/v1/execution-statistics/agents?agent_id=agent-out");
+    REQUIRE(named);
+    CHECK(named->status == 200);
+    CHECK(served_agent_ids(*named).empty());
+}
+
+TEST_CASE("GET /api/v1/execution-statistics/agents: the visible set is applied BEFORE the limit "
+          "(a confined caller is not handed a short or empty page)",
+          "[pg][rest][executions][v1][statistics][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, execv1_responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecV1Harness h(pool);
+    // agent-busy has 3 completed rows, agent-quiet 1: unconfined `limit=1` ranks agent-busy first.
+    stats_exec_for(h, {"agent-busy", "agent-quiet"});
+    stats_exec_for(h, {"agent-busy"});
+    stats_exec_for(h, {"agent-busy"});
+
+    auto top = h.sink.Get("/api/v1/execution-statistics/agents?limit=1");
+    REQUIRE(top);
+    CHECK(served_agent_ids(*top) == std::vector<std::string>{"agent-busy"});
+
+    // Confined to the lower-ranked agent: a post-fetch filter after LIMIT 1 would return nothing.
+    h.fleet_read_scope = authz::VisibleSet{std::unordered_set<std::string>{"agent-quiet"}};
+    auto confined = h.sink.Get("/api/v1/execution-statistics/agents?limit=1");
+    REQUIRE(confined);
+    CHECK(served_agent_ids(*confined) == std::vector<std::string>{"agent-quiet"});
+}
+
+TEST_CASE("GET /api/v1/execution-statistics/agents: a gate denial is a 403 and a negative since "
+          "is a 400 (#3526 #4644)",
+          "[pg][rest][executions][v1][statistics]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, execv1_responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecV1Harness h(pool);
+    stats_exec_for(h, {"agent-in"});
+
+    auto neg = h.sink.Get("/api/v1/execution-statistics/agents?since=-1");
+    REQUIRE(neg);
+    CHECK(neg->status == 400);
+    auto zero = h.sink.Get("/api/v1/execution-statistics/agents?since=0");
+    REQUIRE(zero);
+    CHECK(zero->status == 200);
+
+    h.perm_grant = false;
+    auto denied = h.sink.Get("/api/v1/execution-statistics/agents");
+    REQUIRE(denied);
+    CHECK(denied->status == 403);
+    CHECK(denied->body.find("agent-in") == std::string::npos);
+}
