@@ -10,7 +10,7 @@
 %%% RegisterRequest in the call (enrollment_token, machine_certificate,
 %%% csr_pem) would reach the default log.
 %%%
-%%% call/4 turns every such exit into `{error, Error}' (Error is a fixed atom
+%%% call/4 (and guard/3, for a supervisor:start_child) turns every such exit into `{error, Error}' (Error is a fixed atom
 %%% chosen by the caller) and logs one WARN naming only the class of the exit:
 %%%   noproc  - the server is not running
 %%%   timeout - the server did not answer in time
@@ -23,7 +23,7 @@
 %%%-------------------------------------------------------------------
 -module(yuzu_gw_safe_call).
 
--export([call/4]).
+-export([call/4, guard/3]).
 -export([exit_class/1, reset_limits/0]).  %% for testing
 
 -define(WARN_INTERVAL_MS, 1000).
@@ -32,8 +32,17 @@
 %% {error, Error}. A reply is returned as is.
 -spec call(atom(), term(), timeout(), atom()) -> term() | {error, atom()}.
 call(Server, Request, Timeout, Error) ->
+    guard(Server, fun() -> gen_server:call(Server, Request, Timeout) end, Error).
+
+%% @doc Fun(), with an exit turned into {error, Error}, for a call that is not
+%% a gen_server:call (a supervisor:start_child with the register request in its
+%% arguments). Server is only the name the WARN uses. Only an exit is caught: an
+%% error or a throw is not the shape of a dead or stalled server, and its
+%% stacktrace is not ours to hide.
+-spec guard(atom(), fun(() -> term()), atom()) -> term() | {error, atom()}.
+guard(Server, Fun, Error) ->
     try
-        gen_server:call(Server, Request, Timeout)
+        Fun()
     catch
         exit:Reason ->
             warn_limited(Server, exit_class(Reason)),

@@ -21,6 +21,7 @@
 %%%-------------------------------------------------------------------
 -module(yuzu_gw_safe_call_tests).
 -include_lib("eunit/include/eunit.hrl").
+-include_lib("grpcbox/include/grpcbox.hrl").
 
 -export([log/2]).  %% logger handler
 
@@ -60,7 +61,19 @@ safe_call_test_() ->
       {"exit_class reads only the shape of the reason",
        fun exit_class_shapes/0},
       {"control: an uncaught gen_server:call to the same server does leak",
-       fun control_raw_call_leaks/0}
+       fun control_raw_call_leaks/0},
+      {"Register handler: the registry not running answers a fixed error, nothing leaks",
+       fun register_handler_registry_down/0},
+      {"Subscribe handler: the registry not running answers a fixed error, nothing leaks",
+       fun subscribe_handler_registry_down/0},
+      {"Subscribe handler: the agent supervisor not running answers a fixed error, nothing leaks",
+       fun subscribe_handler_agent_sup_down/0},
+      {"store_pending and take_pending answer registry_unavailable without a registry",
+       fun pending_calls_without_registry/0},
+      {"start_agent answers agent_sup_unavailable for an exit, and an error is not caught",
+       fun start_agent_guard/0},
+      {"control: a raw ets:insert into the missing pending table does leak",
+       fun control_raw_ets_insert_leaks/0}
      ]}.
 
 setup() ->
@@ -209,9 +222,128 @@ control_raw_call_leaks() ->
     Text = events_text(Events),
     [?assert(contains(Text, M)) || M <- ?MARKERS].
 
+%% The Register handler stores the request in the pending table from its own
+%% process. The registry owns the table, so with the registry down the insert
+%% raised badarg with the request in the stacktrace, which grpcbox logs.
+register_handler_registry_down() ->
+    stop_named(yuzu_gw_registry),
+    ok = meck:new(yuzu_gw_upstream, [passthrough, no_link]),
+    try
+        ok = meck:expect(yuzu_gw_upstream, proxy_register,
+                         fun(_) -> {ok, #{session_id => <<"s-1">>}} end),
+        {Result, Events} = run_caller(fun() ->
+            grpcbox_style(fun() ->
+                yuzu_gw_agent_service:register(ctx:background(),
+                    maps:merge(req(), #{info => #{agent_id => <<"a-1">>}}))
+            end)
+        end),
+        ?assertMatch({returned, {grpc_error, {?GRPC_STATUS_INTERNAL, _}}}, Result),
+        assert_no_markers(Events),
+        %% The handler says what happened, in a fixed line.
+        ?assert(lists:any(fun(W) -> contains(W, <<"registry_unavailable">>) end,
+                          warnings(Events)))
+    after
+        meck:unload(yuzu_gw_upstream)
+    end.
+
+subscribe_handler_registry_down() ->
+    stop_named(yuzu_gw_registry),
+    {Result, Events} = run_subscribe(<<"s-sub-1">>),
+    ?assertMatch({returned, {caught, throw, {grpc_error, {?GRPC_STATUS_INTERNAL, _}}}}, Result),
+    assert_no_markers(Events).
+
+subscribe_handler_agent_sup_down() ->
+    stop_named(yuzu_gw_registry),
+    stop_named(yuzu_gw_agent_sup),
+    {ok, Reg} = yuzu_gw_registry:start_link(),
+    unlink(Reg),
+    try
+        S = <<"s-sub-2">>,
+        ok = yuzu_gw_registry:store_pending(S,
+                #{agent_id => <<"a-2">>, agent_info => #{}, peer_addr => <<"p">>,
+                  register_req => req(), conn_key => undefined}),
+        {Result, Events} = run_subscribe(S),
+        ?assertMatch({returned, {caught, throw,
+                                 {grpc_error, {?GRPC_STATUS_INTERNAL, _}}}}, Result),
+        assert_no_markers(Events),
+        %% Positive control: the pending row was consumed, so the handler got
+        %% as far as the supervisor.
+        ?assertEqual(undefined, yuzu_gw_registry:take_pending(S))
+    after
+        stop_named(yuzu_gw_registry)
+    end.
+
+pending_calls_without_registry() ->
+    stop_named(yuzu_gw_registry),
+    ?assertEqual({error, registry_unavailable},
+                 yuzu_gw_registry:store_pending(<<"s">>, #{register_req => req()})),
+    ?assertEqual({error, registry_unavailable}, yuzu_gw_registry:take_pending(<<"s">>)),
+    %% Control: with the registry running they work.
+    {ok, Reg} = yuzu_gw_registry:start_link(),
+    unlink(Reg),
+    try
+        ?assertEqual(ok, yuzu_gw_registry:store_pending(<<"s">>, #{a => 1})),
+        ?assertEqual(#{a => 1}, yuzu_gw_registry:take_pending(<<"s">>)),
+        ?assertEqual(undefined, yuzu_gw_registry:take_pending(<<"s">>))
+    after
+        stop_named(yuzu_gw_registry)
+    end.
+
+start_agent_guard() ->
+    stop_named(yuzu_gw_agent_sup),
+    {Result, Events} = run_caller(fun() ->
+        grpcbox_style(fun() -> yuzu_gw_agent_sup:start_agent(#{register_req => req()}) end)
+    end),
+    ?assertEqual({returned, {error, agent_sup_unavailable}}, Result),
+    assert_no_markers(Events),
+    ?assert(has_warning(Events, <<"noproc">>)),
+    %% Only an exit is caught: an error keeps its own shape.
+    ?assertError(boom, yuzu_gw_safe_call:guard(some_server, fun() -> error(boom) end, x)),
+    ?assertEqual({error, x},
+                 yuzu_gw_safe_call:guard(some_server, fun() -> exit(boom) end, x)).
+
+%% The harness sees the leak when there is one: the same insert, made raw.
+control_raw_ets_insert_leaks() ->
+    {Result, Events} = run_caller(fun() ->
+        grpcbox_style(fun() ->
+            ets:insert(yuzu_gw_pending_missing_table, {<<"s">>, #{register_req => req()}, 1})
+        end)
+    end),
+    ?assertMatch({returned, {caught, error, badarg}}, Result),
+    Text = events_text(Events),
+    [?assert(contains(Text, M)) || M <- ?MARKERS].
+
 %%%===================================================================
 %%% Scenario helpers
 %%%===================================================================
+
+%% Fun under the catch-and-log grpcbox_stream wraps a handler in, answering what
+%% it returned or {caught, Class, Exception}.
+grpcbox_style(Fun) ->
+    try Fun()
+    catch C:E:S ->
+        logger:info("crash: class=~p exception=~p stacktrace=~p", [C, E, S]),
+        {caught, C, E}
+    end.
+
+%% yuzu_gw_agent_service:subscribe/2 for session S, with the stream's ctx
+%% mocked to carry the session id header.
+run_subscribe(S) ->
+    ok = meck:new(grpcbox_stream, [non_strict, no_link]),
+    try
+        ok = meck:expect(grpcbox_stream, ctx,
+                         fun(_State) ->
+                             ctx:set(ctx:background(), md_incoming_key,
+                                     #{<<"x-yuzu-session-id">> => S})
+                         end),
+        run_caller(fun() ->
+            grpcbox_style(fun() ->
+                yuzu_gw_agent_service:subscribe(make_ref(), not_a_stream_state)
+            end)
+        end)
+    after
+        meck:unload(grpcbox_stream)
+    end.
 
 req() ->
     #{enrollment_token => ?M_TOKEN, machine_certificate => ?M_CERT, csr_pem => ?M_CSR}.

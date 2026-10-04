@@ -446,10 +446,20 @@ list_agents(Limit, Cursor) ->
 %% Called by agent_service on Register, consumed by Subscribe. The row is
 %% stamped with the node-local monotonic clock, so the TTL in
 %% `lookup_pending_session/1' and the sweep is immune to wall-clock steps.
--spec store_pending(binary(), map()) -> ok.
+%%
+%% The table is owned by the registry process and written from the caller's own
+%% process (a grpcbox handler). With the registry down the table is gone and the
+%% insert raises badarg, whose stacktrace carries Info, which holds the
+%% RegisterRequest (enrollment token, certificate, CSR) and which grpcbox logs.
+%% The error is caught here and the fixed {error, registry_unavailable} returned:
+%% no stacktrace, no arguments.
+-spec store_pending(binary(), map()) -> ok | {error, registry_unavailable}.
 store_pending(SessionId, Info) ->
-    ets:insert(?PENDING_TABLE, {SessionId, Info, erlang:monotonic_time(millisecond)}),
-    ok.
+    try ets:insert(?PENDING_TABLE, {SessionId, Info, erlang:monotonic_time(millisecond)}) of
+        true -> ok
+    catch
+        error:badarg -> {error, registry_unavailable}
+    end.
 
 %% @doc Atomically retrieve-and-delete pending registration info.
 %% Returns the info map, or undefined if not found or already taken (by a
@@ -471,13 +481,19 @@ store_pending(SessionId, Info) ->
 %% `ets:take/2' guarantees exactly one concurrent caller receives the object
 %% for a given key (all others get `[]'); the once-per-session property is
 %% pinned by the concurrent-barrier test in yuzu_gw_registry_tests.erl.
--spec take_pending(binary()) -> map() | undefined.
+%%
+%% With the registry down the table is gone: the fixed
+%% {error, registry_unavailable}, caught here for the reason store_pending/2
+%% gives.
+-spec take_pending(binary()) -> map() | undefined | {error, registry_unavailable}.
 take_pending(SessionId) ->
-    case ets:take(?PENDING_TABLE, SessionId) of
+    try ets:take(?PENDING_TABLE, SessionId) of
         [{_, Info, _}] ->
             Info;
         [] ->
             undefined
+    catch
+        error:badarg -> {error, registry_unavailable}
     end.
 
 %%%===================================================================

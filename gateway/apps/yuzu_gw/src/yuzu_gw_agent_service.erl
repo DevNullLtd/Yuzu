@@ -52,16 +52,23 @@ register(Ctx, RegisterReq) ->
             %% for upstream-reconnect replay. conn_key is the connection
             %% this Register arrived on: until Subscribe is admitted, a
             %% heartbeat for the pending session is admitted only on it.
-            yuzu_gw_registry:store_pending(SessionId,
+            case yuzu_gw_registry:store_pending(SessionId,
                                 #{agent_id  => AgentId,
                                   agent_info => AgentInfo,
                                   register_req => RegisterReq,
                                   peer_addr  => PeerAddr,
                                   conn_key   => yuzu_gw_conn:key_from_ctx(Ctx),
-                                  registered_at => erlang:system_time(millisecond)}),
-
-            logger:info("Agent ~s registered, awaiting Subscribe", [AgentId]),
-            {ok, Response, Ctx};
+                                  registered_at => erlang:system_time(millisecond)}) of
+                ok ->
+                    logger:info("Agent ~s registered, awaiting Subscribe", [AgentId]),
+                    {ok, Response, Ctx};
+                {error, registry_unavailable} ->
+                    %% The registry is not running: the session cannot be
+                    %% matched by Subscribe, so the agent must register again.
+                    logger:warning("Register failed: registry_unavailable"),
+                    {grpc_error, {?GRPC_STATUS_INTERNAL,
+                                  <<"Registration failed: registry unavailable">>}}
+            end;
 
         {ok, _NotAMap} ->
             %% An OK whose message is not a decoded response: the same failure
@@ -101,6 +108,11 @@ subscribe(Ref, State) ->
                                 <<"Missing x-yuzu-session-id header">>}});
         _ ->
             case yuzu_gw_registry:take_pending(SessionId) of
+                {error, registry_unavailable} ->
+                    logger:warning("Subscribe failed: registry_unavailable"),
+                    throw({grpc_error, {?GRPC_STATUS_INTERNAL,
+                                        <<"Internal: registry unavailable">>}});
+
                 undefined ->
                     logger:warning("Subscribe: no pending registration for session ~s",
                                    [SessionId]),
