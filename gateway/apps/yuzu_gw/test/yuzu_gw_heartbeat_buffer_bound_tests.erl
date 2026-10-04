@@ -87,6 +87,8 @@ bound_test_() ->
        fun invalid_utf8_is_repaired_and_buffer_survives/0},
       {"a lone 0xFF byte in a tag value is delivered repaired and counted",
        fun lone_ff_is_delivered_repaired/0},
+      {"tags that fit a chunk but grow past it when repaired lose the tags, counted as oversize",
+       fun repair_growth_past_a_chunk_drops_tags/0},
       {"repair_utf8 is total and its output always encodes",
        fun repair_utf8_is_total/0},
       {"a session whose every heartbeat has bad tags keeps shipping for 3 cycles",
@@ -615,6 +617,19 @@ lone_ff_is_delivered_repaired() ->
     ?assertEqual(ok, yuzu_gw_heartbeat_buffer:flush_sync()),
     [H] = [H || R <- requests(), H <- hbs(R)],
     ?assertEqual(#{<<"k">> => <<"a", 16#EF, 16#BF, 16#BD, "b">>}, maps:get(status_tags, H)).
+
+%% Each invalid byte becomes three (U+FFFD): 1.5 MiB of 0xFF fits a chunk raw and
+%% is 4.5 MiB repaired, so the size is checked again after the repair.
+repair_growth_past_a_chunk_drops_tags() ->
+    Tags = #{<<"k">> => binary:copy(<<255>>, 3 * ?MIB div 2)},
+    queue(hb(<<"grow">>, #{tags => Tags, sent_at => 1})),
+    ?assertEqual(1, dropped(heartbeat_oversize)),
+    ?assertEqual(0, dropped(heartbeat_invalid)),
+    ?assertEqual(1, dropped_total()),
+    ?assertEqual(ok, yuzu_gw_heartbeat_buffer:flush_sync()),
+    [H] = [H || R <- requests(), H <- hbs(R)],
+    ?assertNot(maps:is_key(status_tags, H)),
+    [?assert(Size =< ?SERVER_LIMIT) || Size <- request_sizes()].
 
 repair_utf8_is_total() ->
     %% All 256 single bytes and 2000 random binaries, some of them valid.
