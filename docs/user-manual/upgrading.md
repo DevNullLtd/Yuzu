@@ -203,9 +203,11 @@ The same strictness now covers the dashboard fragments' `page`/`per_page`, the s
 inventory, DEX perf, network quality, hardware and CA-issued lists, the notification, webhook and
 offload delivery lists, the pre-flight run list `limit`, the hardware sync poll's `await_since`
 (a malformed freshness bound used to read as "no bound"), the TAR process-tree `node` and the
-event streams' `?since` cursor. A malformed `Last-Event-ID` header still means "no replay" rather
-than a `400`, but `-1` and `5abc` are no longer accepted as cursors. A parameter that is present
-but empty (`?limit=`) is malformed, not absent, on these routes. The verify fragment's `window`
+`GET /api/v1/events` `?since` cursor (the workflow stream has the header only). A malformed
+`Last-Event-ID` header is served live only (nothing replayed, never the whole buffer) rather than
+a `400`, and `-1` and `5abc` are never accepted as cursors (`5abc` used to replay from 5). On the
+query-parameter routes, a parameter that is present but empty (`?limit=`) is malformed, not
+absent, `GET /api/v1/audit` `limit` included. The verify fragment's `window`
 is refused with its usual `200` note instead of a `4xx` (the dashboard drops `4xx` bodies).
 
 Four admin forms stop silently saving a different value than the one typed. A malformed
@@ -213,14 +215,18 @@ Four admin forms stop silently saving a different value than the one typed. A ma
 and saves nothing (it used to persist the clamped minimum). On the enrollment-token forms and the
 API-token `ttl_hours`, `0x5` used to read as `0`; `max_uses` `0` means unlimited and a TTL of `0`
 means no expiry, so a mistyped limit minted an unlimited or never-expiring credential. Only an
-empty field or a literal `0` means unlimited or no expiry now. A malformed `rollout_pct` on an OTA
+empty field, or a value that parses to a literal `0` (`0`, `-0`, `00`), means unlimited or no
+expiry now, and a negative `ttl_hours` is refused (it would have computed `0`). The API-token form
+refuses with its usual `200` feedback span and mints nothing; the other forms answer `400` plus an
+error toast. On the batch route an empty `max_uses` defaults to `1`. A malformed `rollout_pct` on an OTA
 package upload or rollout change is a `400` instead of silently becoming `100`.
 
 Still lenient, and not an exhaustive list: the live-snapshot `n` attempt counters
 (`deployment_routes.cpp`, `device_routes.cpp`, `hardware_routes.cpp`, `dex_routes.cpp`,
-`preflight_routes.cpp`, `tar_tree_routes.cpp`), numeric path segments matched by a `(\d+)` route
-pattern (a 21-digit id fails with `500`), and values parsed from stored rows, agent output or
-server configuration rather than from a request.
+`preflight_routes.cpp`, `tar_tree_routes.cpp`), and values parsed from stored rows, agent output
+or server configuration rather than from a request. Numeric path segments matched by a `(\d+)`
+pattern (notification read/dismiss, the webhook routes, the auto-approve rule index) now answer
+`404` for an id that does not fit a signed 64-bit integer; they used to fail with `500`.
 
 **What to do.** Send whole integers, and omit a parameter to get its default. No configuration or
 data migration is needed. During a rolling upgrade, replicas on the old and new build answer a

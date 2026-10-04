@@ -461,7 +461,7 @@ curl -s -X POST http://localhost:8080/api/settings/updates/upload \
 | `file` | Yes | The agent binary to upload |
 | `platform` | Yes | Target platform (`linux`, `windows`, `darwin`) |
 | `arch` | Yes | Target architecture (`x86_64`, `aarch64`) |
-| `rollout_pct` | No | Rollout percentage, 0--100 (default: `100`) |
+| `rollout_pct` | No | Rollout percentage, 0--100 (default: `100`). An empty value is the default; a malformed value (`0x5`, `5abc`, `1e1`) is `400` and nothing is stored, it never becomes `100`; an out-of-range integer is clamped to 0--100 |
 | `mandatory` | No | Whether agents must apply this update (`true`/`false`, default: `false`) |
 
 ### View Available Updates
@@ -529,7 +529,7 @@ Unless noted, these endpoints accept form-encoded parameters and return HTML fra
 | `POST` | `/api/settings/auto-approve/{index}/toggle` | Enable/disable a rule | HTMX |
 | `DELETE` | `/api/settings/auto-approve/{index}` | Delete a rule | HTMX |
 | `POST` | `/api/settings/updates/upload` | Upload an agent binary (multipart) | HTMX |
-| `POST` | `/api/settings/updates/{platform}/{arch}/{version}/rollout` | Set rollout percentage (form: `rollout_pct`) | HTMX |
+| `POST` | `/api/settings/updates/{platform}/{arch}/{version}/rollout` | Set rollout percentage (form: `rollout_pct`; a malformed value is `400` with an error toast and nothing changes) | HTMX |
 | `DELETE` | `/api/settings/updates/{platform}/{arch}/{version}` | Remove an uploaded binary | HTMX |
 
 ---

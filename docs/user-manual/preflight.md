@@ -75,12 +75,20 @@ re-checked.
 responses for the run (the window slides; it keeps the newest). On a very large cohort with a
 lot of re-dispatch the window can fill, and a device that is absent from it is then
 **ambiguous**: it may not have answered, or it may have answered and been pushed out of the
-window. Such a device is never shown as passing. Its cell reads **"inconclusive: response cap
-reached"**, the device stays **Incomplete** (so it is not in Deploy's go cohort), and the
-server stops re-dispatching that run's checks, because every extra reply would push another
-device's answer out of the window. The run still completes at its deadline. To resolve those
-devices, re-run the pre-flight against a smaller group; per-device paging of the response
-read is a tracked follow-up.
+window. Such a device is never shown as passing. A device with **no row at all** in a full
+window has its cell read **"inconclusive: response cap reached"**; a device whose in-progress
+row is still in the window is simply pending and is not labelled. Either way the device stays
+**Incomplete** (so it is not in Deploy's go cohort), and the server stops re-dispatching that
+run's checks, because every extra reply would push another device's answer out of the window.
+The run still completes at its deadline, and the go cohort only ever shrinks.
+
+What fills the window: a device that gave a terminal error answer (verdict unknown) is still
+incomplete, so it is re-dispatched on every tick and each dispatch adds rows; the window
+evicts the **oldest** rows first, which are the **earliest** answerers. On a large cohort,
+with a long window (up to 2,880 minutes) and a cohort near its 20,000-device cap, devices that
+passed early can therefore flip to "inconclusive" before the deadline. To resolve those
+devices, re-run the pre-flight against a smaller group. Changing the re-dispatch rule, and
+per-device paging of the response read, are tracked follow-ups.
 
 ## Verify — before / after performance
 
