@@ -1273,12 +1273,15 @@ grpc::Status GatewayUpstreamServiceImpl::BatchHeartbeat(grpc::ServerContext* con
         }
         if (!session_to_agent.empty()) {
             // A `std::unordered_map` keyed on session_id already collapses a
-            // RETRIED batch's duplicate session id (the Erlang buffer retains
-            // a failed batch and PREPENDS the next one with no dedup —
-            // gateway/apps/yuzu_gw/src/yuzu_gw_heartbeat_buffer.erl) to one
-            // entry, so the two parallel arrays below are already the
-            // distinct, race-loser-filtered eligible set — no separate
-            // sort/unique pass needed (PR #4299 review SHOULD 2).
+            // repeated session id to one entry. The Erlang buffer
+            // (gateway/apps/yuzu_gw/src/yuzu_gw_heartbeat_buffer.erl) keeps one
+            // heartbeat per session (the newest fields, and the newest
+            // non-empty snapshot) and splits a flush into chunks under 3 MiB,
+            // so a batch normally lists a session once; a chunk resent after a
+            // lost response can still repeat one. Either way the two parallel
+            // arrays below are already the distinct, race-loser-filtered
+            // eligible set, so no separate sort/unique pass is needed
+            // (PR #4299 review SHOULD 2).
             std::vector<std::string> renew_agents;
             std::vector<std::string> renew_sessions;
             renew_agents.reserve(session_to_agent.size());
