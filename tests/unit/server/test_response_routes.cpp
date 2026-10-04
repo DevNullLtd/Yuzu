@@ -396,20 +396,27 @@ TEST_CASE("GET /api/responses/:id (catch-all): an engaged scope that drops a res
     REQUIRE(body["responses"].size() == 1);
     CHECK(body["responses"][0]["agent_id"] == "in-scope-agent");
 
-    REQUIRE(h.audits.size() == 1);
+    // Denied scope-drop row, THEN the fail-closed success row (#4644 Gate 7). This used to
+    // be the only row (size 1); the success row is new.
+    REQUIRE(h.audits.size() == 2);
     CHECK(h.audits[0].action == "response.read");
     CHECK(h.audits[0].result == "denied");
     CHECK(h.audits[0].detail.find("surface=get") != std::string::npos);
+    CHECK(h.audits[1].result == "success");
 }
 
 TEST_CASE("GET /api/responses/:id (catch-all): an unconfined caller's genuinely-empty "
-          "result is NOT audited (no scope engaged, nothing dropped)",
+          "result writes no denied row (nothing dropped) but IS audited once as a success read",
           "[server][routes][response_routes][rest][pg]") {
     PgHarness h; // fleet_scope stays nullopt -- unconfined
     auto res = h.sink.Get("/api/responses/instr-nonexistent");
     REQUIRE(res);
     CHECK(res->status == 200);
-    CHECK(h.audits.empty());
+    // Was `audits.empty()` before #4644 Gate 7 made the legacy get fail-closed-audited: an
+    // admitted read of an empty result is still an access, exactly as on the v1 twin.
+    REQUIRE(h.audits.size() == 1);
+    CHECK(h.audits[0].result == "success");
+    CHECK(h.audits[0].target_id == "instr-nonexistent");
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1144,5 +1151,158 @@ TEST_CASE("GET /api/responses/:id/export: an audit row that does not persist or 
             CHECK(res->get_header_value("Content-Disposition").empty());
             REQUIRE(h.audits.size() == 1); // the one attempted row, not retried
         }
+    }
+}
+
+// ── #4644 Gate 7: the legacy get and aggregate write fail-closed audit rows ──
+//
+// The legacy export got the same treatment first (above). These cases run the two remaining
+// legacy reads through one table so a route cannot drift from its sibling.
+
+namespace {
+struct LegacyReadRoute {
+    const char* path_suffix; // after /api/responses/<id>
+    const char* detail_prefix;
+    const char* surface;
+};
+constexpr LegacyReadRoute kLegacyGet{"", "legacy response query cid=", "surface=get"};
+constexpr LegacyReadRoute kLegacyAggregate{"/aggregate", "legacy response aggregate cid=",
+                                           "surface=aggregate"};
+} // namespace
+
+TEST_CASE("legacy get and aggregate: an unconfined caller writes exactly one response.read "
+          "success row carrying the response correlation id",
+          "[server][routes][response_routes][rest][pg][audit]") {
+    PgHarness h;
+    h.seed("instr-la", "agent-a");
+    h.seed("instr-la", "agent-b");
+
+    for (const auto& route : {kLegacyGet, kLegacyAggregate}) {
+        INFO(route.path_suffix);
+        h.audits.clear();
+        auto res = h.sink.Get(std::string("/api/responses/instr-la") + route.path_suffix);
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        REQUIRE(h.audits.size() == 1);
+        CHECK(h.audits[0].action == "response.read");
+        CHECK(h.audits[0].result == "success");
+        CHECK(h.audits[0].target_type == "Execution");
+        CHECK(h.audits[0].target_id == "instr-la");
+        CHECK(h.audits[0].detail ==
+              std::string(route.detail_prefix) + res->get_header_value("X-Correlation-Id"));
+        CHECK_FALSE(res->has_header("Sec-Audit-Failed"));
+    }
+}
+
+TEST_CASE("legacy get and aggregate: a scope drop writes the denied row THEN the success row",
+          "[server][routes][response_routes][rest][pg][audit]") {
+    PgHarness h;
+    h.seed("instr-la-scope", "in-scope-agent");
+    h.seed("instr-la-scope", "out-of-scope-agent");
+    h.fleet_scope = authz::VisibleSet{std::unordered_set<std::string>{"in-scope-agent"}};
+
+    for (const auto& route : {kLegacyGet, kLegacyAggregate}) {
+        INFO(route.path_suffix);
+        h.audits.clear();
+        auto res = h.sink.Get(std::string("/api/responses/instr-la-scope") + route.path_suffix);
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        REQUIRE(h.audits.size() == 2);
+        CHECK(h.audits[0].result == "denied");
+        CHECK(h.audits[0].detail == std::string("scope_dropped=1 ") + route.surface);
+        CHECK(h.audits[1].result == "success");
+        CHECK(h.audits[1].detail.rfind(route.detail_prefix, 0) == 0);
+    }
+}
+
+TEST_CASE("legacy get and aggregate: an audit row that does not persist or an audit pipeline "
+          "that throws is a 503 with no data and one attempted row",
+          "[server][routes][response_routes][rest][pg][audit]") {
+    PgHarness h;
+    h.seed("instr-la-fail", "agent-a");
+
+    for (const auto& route : {kLegacyGet, kLegacyAggregate}) {
+        for (const bool throws : {false, true}) {
+            INFO(route.path_suffix << (throws ? " throws" : " returns false"));
+            h.audits.clear();
+            h.audit_succeeds = false;
+            h.audit_throws = throws;
+            auto res = h.sink.Get(std::string("/api/responses/instr-la-fail") + route.path_suffix);
+            REQUIRE(res);
+            CHECK(res->status == 503);
+            CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+            auto body = json::parse(res->body, nullptr, false);
+            REQUIRE_FALSE(body.is_discarded());
+            CHECK(body["error"]["code"] == 503);
+            CHECK(body["error"]["retry_after_ms"] == 5000);
+            CHECK(body["error"]["message"].get<std::string>().find("audit subsystem unavailable") !=
+                  std::string::npos);
+            // Nothing the route would have served is in the body.
+            CHECK(res->body.find("agent-a") == std::string::npos);
+            CHECK_FALSE(body.contains("responses"));
+            CHECK_FALSE(body.contains("groups"));
+            REQUIRE(h.audits.size() == 1); // the one attempted row, not retried
+        }
+    }
+}
+
+// The scope-drop `denied` row is fail-closed too (it used to be set-and-proceed on these two
+// routes): whichever of the two rows fails, nothing is served and no further row is attempted.
+TEST_CASE("legacy get and aggregate: a scope drop with a failing audit is a 503 with no data "
+          "for either row a false return or a throw",
+          "[server][routes][response_routes][rest][pg][audit]") {
+    PgHarness h;
+    h.seed("instr-la-drop-fail", "in-scope-agent");
+    h.seed("instr-la-drop-fail", "out-of-scope-agent");
+    h.fleet_scope = authz::VisibleSet{std::unordered_set<std::string>{"in-scope-agent"}};
+
+    // fail_after 0: the DENIED row fails first. fail_after 1: the denied row persists and the
+    // SUCCESS row fails.
+    for (const auto& route : {kLegacyGet, kLegacyAggregate}) {
+        for (const std::size_t fail_after : {std::size_t{0}, std::size_t{1}}) {
+            for (const bool throws : {false, true}) {
+                INFO(route.path_suffix << " fail_after=" << fail_after
+                                       << (throws ? " throws" : " returns false"));
+                h.audits.clear();
+                h.audit_fail_after = fail_after;
+                h.audit_succeeds = false;
+                h.audit_throws = throws;
+                auto res = h.sink.Get(std::string("/api/responses/instr-la-drop-fail") +
+                                      route.path_suffix);
+                REQUIRE(res);
+                CHECK(res->status == 503);
+                CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+                CHECK(res->body.find("in-scope-agent") == std::string::npos);
+                CHECK(res->body.find("out-of-scope-agent") == std::string::npos);
+                auto body = json::parse(res->body, nullptr, false);
+                REQUIRE_FALSE(body.is_discarded());
+                CHECK_FALSE(body.contains("responses"));
+                CHECK_FALSE(body.contains("groups"));
+                REQUIRE(h.audits.size() == fail_after + 1); // the failing row ends the request
+                CHECK(h.audits[0].result == "denied");
+            }
+        }
+    }
+}
+
+// A request rejected before the store read is not a read: no row of either kind.
+TEST_CASE("legacy get and aggregate: a rejected request parameter is a 400 and writes no "
+          "audit row",
+          "[server][routes][response_routes][rest][pg][audit]") {
+    PgHarness h;
+    h.seed("instr-la-400", "agent-a");
+    h.fleet_scope = authz::VisibleSet{std::unordered_set<std::string>{"agent-a"}};
+
+    for (const char* url : {"/api/responses/instr-la-400?limit=abc",
+                            "/api/responses/instr-la-400?status=abc",
+                            "/api/responses/instr-la-400/aggregate?status=abc",
+                            "/api/responses/instr-la-400/aggregate?group_by=bogus",
+                            "/api/responses/instr-la-400/aggregate?op_column=bogus"}) {
+        INFO(url);
+        h.audits.clear();
+        auto res = h.sink.Get(url);
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        CHECK(h.audits.empty());
     }
 }

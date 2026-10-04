@@ -16,6 +16,34 @@
 
 namespace yuzu::server::response {
 
+namespace {
+
+/// Fail-closed access-audit step shared by the three legacy read routes (get, aggregate,
+/// export; #4644 Gate 7). Emits one `response.read` row and, when it does not durably persist
+/// (a false return, or a throwing pipeline, both already handled by `emit_behavioral_audit`;
+/// an unwired audit_fn is audit-off and persists), answers 503 (A4 envelope, retry_after_ms
+/// 5000, `Sec-Audit-Failed`) and returns false. The caller must then return without building
+/// any body, so an unaudited read serves no data. This is the legacy twin of the v1 routes'
+/// posture; the verb, target type and result strings are chosen by the caller and must stay
+/// equal to v1's so the twins are countable together.
+[[nodiscard]] bool audit_read_or_refuse(const Deps& deps, const httplib::Request& req,
+                                        httplib::Response& res, const char* result,
+                                        const std::string& instruction_id,
+                                        const std::string& detail_text) {
+    if (detail::emit_behavioral_audit(deps.audit_fn, req, res, "response.read", result,
+                                      "Execution", instruction_id, detail_text))
+        return true;
+    res.status = 503;
+    res.set_content(detail::a4_error(res,
+                                     "audit subsystem unavailable; refusing to serve "
+                                     "response data without durable evidence",
+                                     {.retry_after_ms = 5000, .remediation = "retry the request"}),
+                    "application/json");
+    return false;
+}
+
+} // namespace
+
 void register_response_routes(HttpRouteSink& sink, Deps deps) {
     // -- Response API ---------------------------------------------------------
 
@@ -126,9 +154,13 @@ void register_response_routes(HttpRouteSink& sink, Deps deps) {
         // it so a cross-operator access attempt that was suppressed is auditable on this
         // surface too (#1634 compliance review; parity with the MCP denied row / the
         // visualization scope_dropped detail).
-        if (agg_dropped > 0)
-            (void)deps.audit_fn(req, "response.read", "denied", "Execution", instruction_id,
-                                "scope_dropped=" + std::to_string(agg_dropped) + " surface=aggregate");
+        // Fail-closed like the export and the v1 twins: a drop whose evidence cannot be
+        // persisted serves nothing.
+        if (agg_dropped > 0 &&
+            !audit_read_or_refuse(deps, req, res, "denied", instruction_id,
+                                  "scope_dropped=" + std::to_string(agg_dropped) +
+                                      " surface=aggregate"))
+            return;
 
         auto results_opt = deps.store->aggregate(instruction_id, aq, filter, agg_scope);
         if (!results_opt) {
@@ -139,6 +171,14 @@ void register_response_routes(HttpRouteSink& sink, Deps deps) {
             return;
         }
         const auto& results = *results_opt;
+
+        // Fail-closed success row (#4644 Gate 7), mirroring v1 aggregate: after the store read
+        // (a 503 degrade is not audited as a read) and BEFORE the body is built. Same verb,
+        // target and result as v1; the detail names this surface.
+        if (!audit_read_or_refuse(deps, req, res, "success", instruction_id,
+                                  "legacy response aggregate cid=" +
+                                      detail::ensure_correlation_id(res)))
+            return;
 
         int64_t total_rows = 0;
         nlohmann::json groups = nlohmann::json::array();
@@ -240,33 +280,18 @@ void register_response_routes(HttpRouteSink& sink, Deps deps) {
         // happened. Emitted after the store read (so a 503 degrade is not audited as a read) and
         // BEFORE any body is built, so an audit failure serves no data. The helper also covers an
         // unwired audit_fn (audit off: persisted) and a throwing one (not persisted).
-        const auto audit_unavailable = [&res]() {
-            res.status = 503;
-            res.set_content(detail::a4_error(res,
-                                             "audit subsystem unavailable; refusing to serve "
-                                             "response data without durable evidence",
-                                             {.retry_after_ms = 5000,
-                                              .remediation = "retry the request"}),
-                            "application/json");
-        };
         // CC7.2 evidence: record the scope-drop on this surface (#1634 compliance review).
         if (export_dropped > 0 &&
-            !detail::emit_behavioral_audit(deps.audit_fn, req, res, "response.read", "denied",
-                                           "Execution", instruction_id,
-                                           "scope_dropped=" + std::to_string(export_dropped) +
-                                               " surface=export")) {
-            audit_unavailable();
+            !audit_read_or_refuse(deps, req, res, "denied", instruction_id,
+                                  "scope_dropped=" + std::to_string(export_dropped) +
+                                      " surface=export"))
             return;
-        }
         // Same verb, target and result as the v1 export's success row, so the two twins are
         // countable together; the detail names this surface.
-        if (!detail::emit_behavioral_audit(deps.audit_fn, req, res, "response.read", "success",
-                                           "Execution", instruction_id,
-                                           "legacy response export cid=" +
-                                               detail::ensure_correlation_id(res))) {
-            audit_unavailable();
+        if (!audit_read_or_refuse(deps, req, res, "success", instruction_id,
+                                  "legacy response export cid=" +
+                                      detail::ensure_correlation_id(res)))
             return;
-        }
 
         auto format = req.get_param_value("format");
 
@@ -409,9 +434,18 @@ void register_response_routes(HttpRouteSink& sink, Deps deps) {
         auto results = std::move(*results_opt);
 
         // CC7.2 evidence: record the scope-drop on this surface (#1634 compliance review).
-        if (get_dropped > 0)
-            (void)deps.audit_fn(req, "response.read", "denied", "Execution", instruction_id,
-                                "scope_dropped=" + std::to_string(get_dropped) + " surface=get");
+        // Fail-closed like the export and the v1 twins (see audit_read_or_refuse).
+        if (get_dropped > 0 &&
+            !audit_read_or_refuse(deps, req, res, "denied", instruction_id,
+                                  "scope_dropped=" + std::to_string(get_dropped) +
+                                      " surface=get"))
+            return;
+        // Fail-closed success row (#4644 Gate 7), mirroring v1 query: after the store read and
+        // BEFORE the body is built. The detail names the v1 verb's twin, "query".
+        if (!audit_read_or_refuse(deps, req, res, "success", instruction_id,
+                                  "legacy response query cid=" +
+                                      detail::ensure_correlation_id(res)))
+            return;
 
         nlohmann::json arr = nlohmann::json::array();
         for (const auto& r : results) {

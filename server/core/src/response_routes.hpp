@@ -37,13 +37,17 @@
 /// hidden ones LIMIT already truncated — see each handler's own inline
 /// comment, preserved verbatim).
 ///
-/// AUDIT: each route emits a `"response.read"`/`"denied"` row ONLY when the
-/// gate's scope is engaged AND at least one distinct responding agent was
-/// dropped by the scope filter (CC7.2 evidence — a scope-drop is a
-/// security-relevant filtering event); the `surface` detail distinguishes
-/// `aggregate`/`export`/`get`. No other outcome on any of the 3 routes is
-/// audited (pure reads otherwise) — matches the pre-extraction inline code
-/// exactly.
+/// AUDIT (#4644 Gate 7), FAIL-CLOSED on all 3 routes, the legacy twins of the v1 routes:
+///   - every served read writes ONE `"response.read"`/`"success"` row (target type `Execution`,
+///     target id the instruction id, detail `legacy response <aggregate|export|query> cid=<id>`)
+///     after the store read and BEFORE any body is built;
+///   - when the gate's scope is engaged AND at least one distinct responding agent was dropped
+///     by the scope filter, a `"response.read"`/`"denied"` row (CC7.2 evidence) precedes it; the
+///     `surface` detail distinguishes `aggregate`/`export`/`get`.
+/// A row that does not durably persist (a false return or a throwing audit pipeline) answers
+/// 503 + `Sec-Audit-Failed` and serves no data, via the one local `audit_read_or_refuse`.
+/// Responses that never reach the read (400 parameter rejections, 503 store unavailable or
+/// degraded, an unadmitted gate) write no row.
 ///
 /// Routes (3), gate in parens (all `fleet_read_fn`):
 ///   GET /api/responses/:id/aggregate  (Response:Read) — MUST register 1st

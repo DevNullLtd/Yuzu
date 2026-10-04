@@ -9770,10 +9770,11 @@ void RestApiV1::register_routes(
     // event (a scope-drop "denied" row, parity with the legacy routes' own
     // CC7.2 evidence, PLUS a "success" row per docs/api-twin-recipe.md §4's
     // REST-JSON posture and the `/api/v1/executions/{id}/responses` REST
-    // precedent above) — a judgment call: the legacy routes only audit
-    // scope-drops, never success; this v1 surface adds the success audit
-    // deliberately, matching the closer response-body-read precedent rather
-    // than leaving v1 unaudited on the happy path.
+    // precedent above) — a judgment call made when v1 was added, when the
+    // legacy routes audited only scope-drops. #4644 Gate 7 has since brought
+    // all three legacy routes (response_routes.cpp) to the same fail-closed
+    // success audit, so the twins are countable together; only the detail
+    // string differs.
     //
     // Registration order: aggregate/export MUST register before the plain
     // catch-all below, matching the legacy family's own load-bearing order
