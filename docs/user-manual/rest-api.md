@@ -302,12 +302,13 @@ Derived directly from `server/core/src/body_cap_policy.hpp`'s `kBodyCapTable` (l
 | any | `/api/v1/hardware` | 4 KiB | `hardware` | The third `requires_measurable=true` class. Only `POST .../sync` carries a body (a single short `source` enum token); the bodyless `GET /api/v1/hardware` and `GET /api/v1/hardware/{id}` list/record routes share the class rather than falling to the 4 MiB catch-all. |
 | any | `/api/v1/rbac/roles/` | 4 KiB | `rbac_role_assignment` | A2 global human role assignment — see "Fleet-Wide Role Assignment" below. `POST .../assignments` body is `{principal_type, principal_id}`, two short strings; `DELETE .../assignments/{principal_id}` carries none. Any method — the DELETE sibling shares this literal prefix once past the role-name path segment. |
 | any | `/api/v1/rbac/enforcement` | 1 KiB | `rbac_enforcement` | A1 enforcement enable/disable toggle. Body is `{"enabled": true}`, under 64 bytes even pretty-printed; 1 KiB is 16× headroom. A segment-boundary-distinct prefix from `rbac_role_assignment` above, so it needs its own row or it would fall to the 4 MiB catch-all. |
+| any | `/api/v1/users` | 16 KiB | `users` | The local-account user subtree: `POST .../me/password` and `POST .../{name}/password` (#5342) plus the bodyless `.../unlock` and the small `.../elevation-eligibility`. The largest legitimate body is two passwords at the 1024-byte policy maximum; worst-case JSON escaping puts that near 12.3 KiB, so 16 KiB admits every policy-conformant request. Any method, because the bodyless siblings share the prefix. |
 | any (catch-all) | *(empty prefix — matches everything not listed above)* | 4 MiB | `default` | Applies to ordinary JSON/form mutation routes not called out individually. |
 
 † = a reasoned margin over a real, cited handler-level check — the pre-routing gate sees the RAW body while the handler checks a DECODED/PARSED value (form-decoded, JSON-unescaped, or multipart-extracted), so the two numbers are never expected to match exactly. Reasoned headroom, not a measured worst case; getting the margin wrong rejects legitimate traffic (the `tar_dashboard_sql`/`tar_result_set_sql` history above is a shipped example).
 ‡ = a generous, explicit, judgment-call bound because no aggregate size contract exists for that class yet, reasoned against that class's OWN realistic scale rather than copy-pasted from a sibling — **not** a fixed multiple below httplib's 100 MiB backstop: it ranges from ~12.5× for the 8 MiB `nvd_match` entry (just over one order of magnitude) down to 6.25× for the six 16 MiB entries (under one order of magnitude) — none of the ‡ entries reach two orders of magnitude. Do not read either footnote as license to invent a number for a different route — see the header block of `body_cap_policy.hpp`.
 
-Counting by table **ROW** (one `BodyCapEntry` struct in `kBodyCapTable` = one row): **8 rows carry †** (`plugin_config`, `ca_import_chain_dashboard`, `plugin_trust_bundle`, `tar_dashboard_sql`, `tar_result_set_sql`, and all three `instruction_yaml` rows) and **6 rows carry ‡** (`nvd_match`, both `guardian_rule_authoring` rows, `workflow_yaml`, `product_pack_yaml`, `instruction_import`) — **14 rows total**, out of **31 rows** in the table overall (A2 added `rbac_role_assignment`, and A1 `rbac_enforcement`, both unmarked — an exact reasoned-from-real-shape bound, not a measured mirror or a judgment call against an arbitrary-content class). Counting by **CLASS** (`path_class`; several classes span multiple rows) that collapses to **6 † classes and 5 ‡ classes — 11 classes total**, out of **27 classes** overall. Every other row/class mirrors a cited, decoded-equals-raw byte count exactly (this now includes `upload_session`, added alongside `plugin_config` in this table — an exact protocol-constant mirror, not a reasoned margin, so it carries neither footnote). A third, unmarked category (`ota_upload`, `json_to_csv_export`) is pinned at httplib's own 100 MiB backstop as an explicit, reviewed decision rather than squeezed or given a judgment-call number — neither is "reasoned" in the † /‡ sense, since there is no smaller number to reason toward.
+Counting by table **ROW** (one `BodyCapEntry` struct in `kBodyCapTable` = one row): **8 rows carry †** (`plugin_config`, `ca_import_chain_dashboard`, `plugin_trust_bundle`, `tar_dashboard_sql`, `tar_result_set_sql`, and all three `instruction_yaml` rows) and **6 rows carry ‡** (`nvd_match`, both `guardian_rule_authoring` rows, `workflow_yaml`, `product_pack_yaml`, `instruction_import`) — **14 rows total**, out of **32 rows** in the table overall (A2 added `rbac_role_assignment`, A1 `rbac_enforcement`, and #5342 `users`, all unmarked — an exact reasoned-from-real-shape bound, not a measured mirror or a judgment call against an arbitrary-content class). Counting by **CLASS** (`path_class`; several classes span multiple rows) that collapses to **6 † classes and 5 ‡ classes — 11 classes total**, out of **28 classes** overall. Every other row/class mirrors a cited, decoded-equals-raw byte count exactly (this now includes `upload_session`, added alongside `plugin_config` in this table — an exact protocol-constant mirror, not a reasoned margin, so it carries neither footnote). A third, unmarked category (`ota_upload`, `json_to_csv_export`) is pinned at httplib's own 100 MiB backstop as an explicit, reviewed decision rather than squeezed or given a judgment-call number — neither is "reasoned" in the † /‡ sense, since there is no smaller number to reason toward.
 
 **Raising a cap.** Edit the table in `body_cap_policy.hpp` (with review) and update this table to match — never reach for `Server::set_payload_max_length`, which is global across every route on the listener (see "Why not one global cap?" above). See also `docs/user-manual/server-admin.md`'s upgrade note for this change and `docs/user-manual/metrics.md`'s `yuzu_body_cap_rejected_total` row for observing rejections.
 
@@ -1545,6 +1546,132 @@ curl -s -X POST \
 **Errors:** `400` — username empty or malformed (e.g. contains a reserved `:`); `401` — MFA step-up required (stale or absent proof; see `meta.challenge_url`); `403` — caller lacks `UserManagement:Write`, or a SAML session (step-up is not available for SAML sessions); `500` — the AuthDB (Postgres) write failed (a best-effort `auth.lockout.cleared`/`error` audit is still attempted); `503` — the lockout subsystem is not wired (no `AuthDB`).
 
 **Audit:** a successful unlock emits `auth.lockout.cleared` with `result=ok`, `target_type=User`, `target_id=<username>`, `detail=admin_unlock`. A failed write emits the same verb with `result=error`. Note that a lockout cleared automatically (no operator action) emits `auth.lockout.cleared` with `result=ok` and `detail=reset_on_successful_login` when the user next logs in successfully; the threshold crossing itself emits `auth.lockout.applied`. These two verbs are the durable CC6.3 evidence; blocked-while-locked attempts are tracked only via the `yuzu_auth_lockout_blocked_total` metric (no per-attempt audit row **or** analytics event) to avoid amplification under a sustained brute-force.
+
+---
+
+#### `POST /api/v1/users/me/password`
+
+Change the caller's own **local-account** password (#5342). The caller proves the current password; the new one must be **12–1024 bytes** (UTF-8 bytes). The dashboard's Settings → User Management → **Change password** button uses this route.
+
+**Who can call it:** an interactive dashboard session whose account is local (`auth_source=local`). There is no extra permission check — every local user may change their own password.
+
+**Request requirements (all checked before the body is read):**
+
+| Check | Refusal |
+|---|---|
+| API token, MCP token, engine principal or service-scoped token | `403`, audit detail `token_session` — credentials never transit a token or MCP channel |
+| OIDC or SAML session | `409` "not a local account", audit detail `not_local` — change it at the identity provider |
+| Cross-origin request: `Origin`/`Referer` not the dashboard's own origin (or a `--csrf-trusted-origins` entry), **or both headers absent** | `403`, audit detail `csrf` |
+| `Content-Type` is not `application/json` | `415` (not audited) |
+| MFA enrolled and the step-up proof is stale | `401` step-up envelope (`meta.mfa_step_up_required`, `meta.challenge_url`) |
+
+**Body:** `{"current_password": "<string>", "new_password": "<string>"}`. A body that is not that shape is `400` — the body is never echoed, because it may hold a password.
+
+**Example:**
+
+```bash
+curl -s -X POST \
+  -H "Cookie: yuzu_session=$COOKIE" \
+  -H "Origin: https://yuzu.example.com" \
+  -H "Content-Type: application/json" \
+  -d '{"current_password":"old-password-123","new_password":"a-new-long-password"}' \
+  -c cookies.txt \
+  "https://yuzu.example.com/api/v1/users/me/password"
+```
+
+**Response (200)** — and a `Set-Cookie: yuzu_session=...` header carrying a **replacement session**:
+
+```json
+{
+  "data": {
+    "username": "alice",
+    "password_changed": true,
+    "sessions_revoked": 3,
+    "sessions_db_persisted": true,
+    "session_reissued": true,
+    "audit_emitted": true
+  },
+  "meta": { "api_version": "v1" }
+}
+```
+
+On success the server revokes **every** session of the account (durably, so every replica drops them — the caller's own session included), then mints a new session for the caller and returns it in `Set-Cookie`, so the browser stays signed in. The new session keeps the old one's MFA proof but **not** a JIT admin elevation. If the replacement cannot be minted, `session_reissued` is `false` and the response clears the cookie instead (`Max-Age=0`) — the password change still stands; sign in again with the new password. API tokens are not touched. The lockout counter is cleared. `sessions_db_persisted=false` means the durable revoke failed and another replica may honour an old session until it expires. `audit_emitted` reports the **session-revoke** audit row (`session.revoke_all.self`, `detail=count=<N> reason=password_change`); the password-change row itself is mandatory (see below), so a `200` always means it was written.
+
+**Errors:**
+
+| Status | Audit detail | Meaning |
+|---|---|---|
+| `400` | `weak_password` / `too_long` | New password under 12 or over 1024 bytes |
+| `400` | *(not audited)* | Malformed body |
+| `401` | — | No session, or MFA step-up required |
+| `403` | `wrong_current` | The current password is wrong. Counts toward [account lockout](server-admin.md#server-cli-flags) exactly like a failed `/login` |
+| `403` | `account_locked` | The account is locked. **Same message as a wrong password** ("current password is incorrect") — no lock-state oracle |
+| `403` | `token_session` / `csrf` | See the table above |
+| `409` | `not_local` | OIDC/SAML session, or the account is SSO/SCIM-managed |
+| `409` | `conflict` | The stored password changed between the check and the write (a concurrent reset). Nothing was written; retry |
+| `404` | `not_found` | The account was deactivated in between |
+| `415` | *(not audited)* | `Content-Type` is not `application/json` |
+| `500` | `audit_failed_rolled_back` / `audit_failed_rollback_failed` | The audit row could not be written — see below |
+| `503` | `store_unavailable` | The auth store is unavailable (`retry_after_ms: 2000`), or the server runs without the Postgres auth store (`retry_after_ms: 5000`) |
+
+**Audit:** `user.password_change`, `target_type=User`, `target_id=<caller>`. Success is `result=ok`, `detail=self_service`. Refusals are `result=denied` (or `error` for `503`/`500`) with the detail tokens above. The password, its hash and its length never appear in any audit row or log line. **The success row is fail-closed:** if it cannot be written, the server restores the previous password with a compare-and-swap (it restores only if nobody has written since) and answers `500` with `Sec-Audit-Failed: true` and "could not record the password change; it was not applied". If the restore **also** fails, the `500` says so — the new password is in effect, unrecorded, and no sessions were revoked; an administrator must review the audit and auth stores (the server logs this at `critical`).
+
+**Metric:** `yuzu_auth_password_changes_total{kind="self", result="ok"|"denied"|"error"}`.
+
+---
+
+#### `POST /api/v1/users/{username}/password`
+
+Reset another user's **local-account** password (#5342) without knowing the current one. The dashboard's Settings → User Management → **Reset password** button uses this route.
+
+**Permission:** `UserManagement:Write`, plus MFA step-up when the caller is enrolled (parity with `POST /api/v1/users/{username}/unlock`). The caller must use an interactive dashboard session — local or OIDC. API, MCP, engine and service-scoped tokens are refused `403` (`token_session`). A SAML session passes the session check but is refused `403` by the shared step-up gate, which has no SAML MFA attestation in this release.
+
+**Rules:**
+
+- **Not yourself:** targeting your own username is `403` (`self_target`) — use `POST /api/v1/users/me/password`, which requires your current password, so a stolen admin cookie cannot re-key its own account.
+- **Administrator targets need a standing administrator.** If the target's role is `admin`, the caller's durable role must be `admin`; a JIT elevation grants `UserManagement:Write` for its window but is not enough (`403`, `admin_target_requires_durable_admin`). The UPDATE itself carries the same guard (`role <> 'admin'`), so a promotion of the target that commits after the check is still refused.
+- **Local accounts only:** an SSO principal or a SCIM-provisioned account is `409` (`not_local`); an absent or deactivated account is `404` (`not_found`). A path segment cannot carry an SSO principal's `/` and `#`, so in practice only local usernames reach the handler. An account literally named `me` cannot be reset over REST — `POST /api/v1/users/me/password` is the self route.
+- Same CSRF (`Origin`/`Referer`), `Content-Type: application/json` and 12–1024-byte rules as the self route.
+
+**Body:** `{"new_password": "<string>"}`.
+
+**Example:**
+
+```bash
+curl -s -X POST \
+  -H "Cookie: yuzu_session=$COOKIE" \
+  -H "Origin: https://yuzu.example.com" \
+  -H "Content-Type: application/json" \
+  -d '{"new_password":"a-temporary-long-password"}' \
+  "https://yuzu.example.com/api/v1/users/bob/password"
+```
+
+**Response (200):**
+
+```json
+{
+  "data": {
+    "username": "bob",
+    "password_reset": true,
+    "sessions_revoked": 2,
+    "sessions_db_persisted": true,
+    "api_tokens_active": 1,
+    "remediation": "the account's API tokens were NOT revoked; if it may be compromised, revoke them (DELETE /api/v1/tokens/{id})",
+    "audit_emitted": true
+  },
+  "meta": { "api_version": "v1" }
+}
+```
+
+Every dashboard session of the target is revoked (durably, cross-replica) and its lockout is cleared. **API tokens are deliberately left alone** — automation may depend on them and a reset is not by itself a compromise finding — so the response reports `api_tokens_active` (`null` if the token store is not wired) for the operator to act on. `audit_emitted` reports the `session.revoke_all` row (`detail=count=<N> reason=password_reset`).
+
+**Errors:** `400` malformed username or body (not audited), or `weak_password`/`too_long`; `401` unauthenticated or step-up required; `403` missing `UserManagement:Write`, `token_session`, `csrf`, `self_target`, `admin_target_requires_durable_admin`, or a SAML session at the step-up gate; `404` `not_found`; `409` `not_local`, or `conflict` (the password changed concurrently — nothing written, retry); `415` wrong `Content-Type`; `500` audit failure (same rollback semantics as the self route); `503` `store_unavailable`.
+
+**Audit:** `user.password_reset`, `target_type=User`, `target_id=<target>`; success `result=ok`, `detail=admin_reset target_role=<admin|user>`; refusals as for the self route. Fail-closed with rollback exactly like `user.password_change`.
+
+**Metric:** `yuzu_auth_password_changes_total{kind="admin", result=...}`.
+
+**No MCP twin (parity exception).** Neither password route has an MCP tool, by design, recorded as `exception:` rows in `docs/api-parity-ledger.md`. Self-service change is permanently excluded: an MCP caller is a token, not the human, and a token that could change its owner's password would turn a token leak into an account takeover. Admin reset is deferred: `UserManagement:Write` is approval-gated at the supervised MCP tier, and an approval ticket stores the tool's arguments in plain text and shows them to approvers, so a password argument would be persisted and displayed. A follow-up tool that takes no password argument (a server-generated temporary password) is the intended path.
 
 ---
 
@@ -3418,6 +3545,8 @@ row fails to persist, the response carries a `Sec-Audit-Failed: true` header
 | `user.create` | Local account created. `result` ∈ {`success`, `denied`}. Denied detail values: `duplicate_username` (409 — attempted create on an existing name), `weak_password` (400 — fewer than 12 characters). The `role` field is ignored on create — new users always land as `user`. To change role, use the dedicated `POST /api/settings/users/{username}/role` endpoint (audit action `user.role_change`). |
 | `user.role_change` | Local account role changed via `POST /api/settings/users/{username}/role`. `result` ∈ {`success`, `denied`, `no_op`}. Denied detail values: `self_role_change_blocked` (403), `invalid_username` (400), `invalid_json` (400), `missing_role` (400), `invalid_role` (400), `user_not_found` (404), `db_failure` (500). `no_op` detail format `same_role={admin\|user}` (200) when the requested role equals the current role — recorded so compliance review can distinguish operator intent from inaction. Success detail format `old_role=user,new_role=admin`. |
 | `user.delete` | Local account deleted. `result` ∈ {`success`, `denied`}. Denied detail values: `self_delete_blocked` (403), `invalid_username` (400), `user_not_found` (404). |
+| `user.password_change` | Local account changed its own password via `POST /api/v1/users/me/password` (#5342). `target_type=User`, `target_id=<caller>`. `result` ∈ {`ok`, `denied`, `error`}. Success detail `self_service`. Denied/error detail tokens: `token_session`, `not_local`, `csrf`, `weak_password`, `too_long`, `wrong_current`, `account_locked`, `not_found`, `conflict`, `store_unavailable`, `audit_failed_rolled_back`, `audit_failed_rollback_failed`. Never carries the password or its length. Paired with a `session.revoke_all.self` row (`detail=count=<N> reason=password_change`). |
+| `user.password_reset` | Admin reset another local account's password via `POST /api/v1/users/{name}/password` (#5342). `target_type=User`, `target_id=<target>`. `result` ∈ {`ok`, `denied`, `error`}. Success detail `admin_reset target_role=<admin\|user>`. Denied/error detail tokens: `token_session`, `csrf`, `self_target`, `weak_password`, `too_long`, `not_found`, `not_local`, `admin_target_requires_durable_admin`, `conflict`, `store_unavailable`, `audit_failed_rolled_back`, `audit_failed_rollback_failed`. Paired with a `session.revoke_all` row (`detail=count=<N> reason=password_reset`). |
 | `auth.admin_required` | Centralised denial event emitted by `AuthRoutes::require_admin` on every privileged-endpoint 403. `target_type=endpoint`, `target_id={req.path}`. SOC 2 CC7.2 evidence chain — captures rejected attempts that previously surfaced only in the request log. |
 | `auth.lockout.applied` | Account locked after `--auth-lockout-threshold` consecutive failed local-password logins (SOC 2 CC6.3). Emitted **once** at the threshold crossing — not once per blocked attempt (those are tracked only by `yuzu_auth_lockout_blocked_total` to avoid audit flooding). `result=ok` (the lock was applied; the warning severity is carried by the metric + analytics event, not the audit result), `target_type=User`, `detail=threshold=<N> window_secs=<S>`. |
 | `auth.lockout.cleared` | Account-lockout counter reset. `result` ∈ {`ok`, `error`}, `target_type=User`. `detail=admin_unlock` for `POST /api/v1/users/{name}/unlock`, or `reset_on_successful_login` when the user's next successful login clears a non-zero counter. |
@@ -10893,6 +11022,8 @@ The following endpoints return `401` with an MFA step-up envelope when the calli
 - `POST /api/v1/tokens/{id}/confirm` (confirm an API token rotation)
 - `DELETE /api/v1/sessions` (admin force-logout another user)
 - `POST /api/v1/users/{name}/unlock` (clear a user's account-lockout counter — parity with `DELETE /api/v1/sessions`)
+- `POST /api/v1/users/me/password` (change your own local password — only when MFA is enrolled)
+- `POST /api/v1/users/{name}/password` (reset another user's local password)
 - `POST /api/v1/software-packages` (upload software package)
 - `POST /api/v1/software-deployments/{id}/start` (start deployment)
 - `POST /api/v1/guaranteed-state/rules` (create Guardian rule)

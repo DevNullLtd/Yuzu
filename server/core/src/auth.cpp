@@ -1438,6 +1438,10 @@ void AuthManager::set_post_mint_race_hook_for_test(std::function<void()> hook) {
     post_mint_race_hook_for_test_ = std::move(hook);
 }
 
+void AuthManager::set_password_write_race_hook_for_test(std::function<void()> hook) {
+    password_write_race_hook_for_test_ = std::move(hook);
+}
+
 std::optional<Role> AuthManager::cached_role_for_test(const std::string& username) const {
     std::shared_lock lock(mu_);
     auto it = users_.find(username);
@@ -2081,23 +2085,34 @@ AuthManager::read_local_account_for_password_write(const std::string& username,
 
 PasswordWriteResult AuthManager::write_password_cas(const std::string& username,
                                                     const UserEntry& current,
-                                                    const std::string& new_password) {
+                                                    const std::string& new_password,
+                                                    bool forbid_admin_target) {
     PasswordWriteResult out;
     auto salt = random_bytes(16);
     auto salt_hex = bytes_to_hex(salt);
     auto hash = pbkdf2_sha256(new_password, salt, kPbkdf2Iterations);
 
+    // TEST-ONLY seam (see set_password_write_race_hook_for_test's doc): fires
+    // after the caller's read and before the UPDATE, with no lock held.
+    if (password_write_race_hook_for_test_)
+        password_write_race_hook_for_test_();
+
     // CAS on the hash the caller read (and, for a self-change, verified): the
-    // write lands only if that credential is still the stored one.
-    auto written = auth_db_->set_password(username, hash, salt_hex, current.hash_hex);
+    // write lands only if that credential is still the stored one. With
+    // forbid_admin_target the same statement also refuses an admin row, so a
+    // promotion committing after the caller's admin-target decision cannot be
+    // raced past (#5342 — the role check and the write are one UPDATE).
+    auto written =
+        auth_db_->set_password(username, hash, salt_hex, current.hash_hex, forbid_admin_target);
     if (!written) {
         if (written.error() != yuzu::server::AuthDBError::UserNotFound) {
             out.outcome = PasswordWriteOutcome::kStoreUnavailable;
             return out;
         }
-        // Zero rows: the account went away / stopped being local, OR the CAS
-        // predicate failed because someone else wrote first. Re-read so the
-        // caller can answer 404 vs 409 honestly.
+        // Zero rows: the account went away / stopped being local, the role
+        // guard refused a (now-)admin row, OR the CAS predicate failed because
+        // someone else wrote first. Re-read so the caller can answer 404 vs
+        // 403 vs 409 honestly.
         auto again = auth_db_->get_user(username);
         if (!again) {
             out.outcome = again.error() == yuzu::server::AuthDBError::UserNotFound
@@ -2105,8 +2120,16 @@ PasswordWriteResult AuthManager::write_password_cas(const std::string& username,
                               : PasswordWriteOutcome::kStoreUnavailable;
             return out;
         }
-        out.outcome = again->identity_source != "local" ? PasswordWriteOutcome::kNotLocal
-                                                        : PasswordWriteOutcome::kConflict;
+        if (again->identity_source != "local") {
+            out.outcome = PasswordWriteOutcome::kNotLocal;
+        } else if (forbid_admin_target && again->role == Role::admin) {
+            // Checked before kConflict: a retry would be refused for the same
+            // reason, so "retry" would be the wrong answer.
+            out.outcome = PasswordWriteOutcome::kAdminTarget;
+            out.role = Role::admin;
+        } else {
+            out.outcome = PasswordWriteOutcome::kConflict;
+        }
         return out;
     }
 
@@ -2148,7 +2171,7 @@ PasswordWriteResult AuthManager::change_password(const std::string& username,
         out.outcome = PasswordWriteOutcome::kWrongCurrent;
         return out;
     }
-    return write_password_cas(username, *row, new_password);
+    return write_password_cas(username, *row, new_password, /*forbid_admin_target=*/false);
 }
 
 PasswordWriteResult AuthManager::reset_password(const std::string& username,
@@ -2163,7 +2186,10 @@ PasswordWriteResult AuthManager::reset_password(const std::string& username,
         out.role = row->role;
         return out;
     }
-    return write_password_cas(username, *row, new_password);
+    // The read above is only the fast-path refusal; the write re-decides
+    // admin-target atomically when the caller may not touch an admin.
+    return write_password_cas(username, *row, new_password,
+                              /*forbid_admin_target=*/!permit_admin_target);
 }
 
 bool AuthManager::rollback_password_write(const std::string& username,

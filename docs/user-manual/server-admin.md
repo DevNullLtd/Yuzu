@@ -95,7 +95,7 @@ The Yuzu server binary accepts the following command-line flags. All flags are o
 | `--mfa-login-pending-secs` | `120` | Lifetime of the intermediate `mfa_pending_token` between password success and TOTP submission. The pending state is per-process (lost on restart, not shared across HA replicas without sticky sessions). Env: `YUZU_MFA_LOGIN_PENDING_SECS`. |
 | `--mfa-reset <username>` | *(none)* | **Break-glass.** Clears the named user's MFA enrollment and exits **without starting the server** — the recovery path from MFA-enforcement lockout. Writes an `mfa.reset.breakglass` audit row (principal = the OS account that ran the CLI). Requires the Postgres auth store (`--postgres-dsn` / `YUZU_POSTGRES_DSN`), and the same `--config` the service uses if it is not at the platform default (`/etc/yuzu/yuzu-server.cfg` on Linux and root macOS; `C:\ProgramData\Yuzu\yuzu-server.cfg` on Windows) — the container images run with `--config /var/lib/yuzu/yuzu-server.cfg`, and without it the binary falls into interactive first-run setup and exits. No TLS flags needed. See `docs/ops-runbooks/auth-db-recovery.md` § Emergency MFA disable. |
 | `--generate-tokens <N>` | *(none)* | Mint `N` enrollment tokens directly into the same PostgreSQL `auth.enrollment_tokens` store the running server reads (WS-6 6.2), and exit **without starting the server** — the recovery/scripting equivalent of the dashboard "Generate Token" button. Requires the Postgres auth store (`--postgres-dsn` / `YUZU_POSTGRES_DSN`); refuses with the same style of message as `--mfa-reset` when it is absent or unreachable. Tokens are attributed `created_by = "cli:<OS account that ran the CLI>"` (kernel-authoritative identity, `getpwuid(geteuid())`/`GetUserNameA`, not `getenv("USER")` — the same anti-forgery rule the break-glass audit rows use), so a dashboard operator reviewing the token list can tell a CLI-minted batch apart from one minted through `POST /api/settings/enrollment-tokens`. Companions: `--token-label` (label prefix, default `batch-<n>`), `--token-max-uses` (default `1`; `0` = unlimited), `--token-ttl-hours` (default `0` = never expires). Prints `{"count":N,"tokens":[...]}` to stdout (each raw token shown once — capture it now) and exits non-zero if any token fails to persist, naming how many of the batch minted before the failure (those remain valid; revoke via the dashboard). Does **not** run the one-time legacy `.cfg` import (that only ever runs from the server's own boot path, immediately after the auth store is wired — never from a CLI one-shot). |
-| `--auth-lockout-threshold` | `5` | Consecutive failed **local-password** login attempts before an account is temporarily locked (SOC 2 CC6.3). A locked account returns the **same generic 401** as a bad password — no enumeration/lock-state oracle. Counter resets on a successful login or an admin unlock (`POST /api/v1/users/{name}/unlock`). Scope is local-password only — OIDC/SSO sessions and API tokens are unaffected. Setting `0` **disables** lockout (startup `WARN`) and constitutes a deviation from the CC6.3 hardened baseline — record it as a documented exception on your risk register, do not just flip it. NIST 800-63B §5.2.2 suggests allowing ≥10 attempts where network-layer rate-limiting is also present; raise the threshold accordingly if you front Yuzu with an IP throttle. Env: `YUZU_AUTH_LOCKOUT_THRESHOLD`. |
+| `--auth-lockout-threshold` | `5` | Consecutive failed **local-password** login attempts before an account is temporarily locked (SOC 2 CC6.3). A locked account returns the **same generic 401** as a bad password — no enumeration/lock-state oracle. Counter resets on a successful login, an admin unlock (`POST /api/v1/users/{name}/unlock`), or a successful password change/reset (`POST /api/v1/users/me/password`, `POST /api/v1/users/{name}/password`). A wrong current password on the self-service change route counts as a failed attempt. Scope is local-password only — OIDC/SSO sessions and API tokens are unaffected. Setting `0` **disables** lockout (startup `WARN`) and constitutes a deviation from the CC6.3 hardened baseline — record it as a documented exception on your risk register, do not just flip it. NIST 800-63B §5.2.2 suggests allowing ≥10 attempts where network-layer rate-limiting is also present; raise the threshold accordingly if you front Yuzu with an IP throttle. Env: `YUZU_AUTH_LOCKOUT_THRESHOLD`. |
 | `--auth-lockout-window-secs` | `900` | How long an account stays locked after the threshold is crossed. The lock **auto-expires** after this window — it is never permanent, so it cannot be weaponised to permanently deny a legitimate principal; a waited-out user regains a full attempt budget. Env: `YUZU_AUTH_LOCKOUT_WINDOW_SECS`. |
 | `--jit-max-elevation-secs` | `3600` | **JIT admin elevation** maximum window (SOC 2 CC6.3/CC6.6). Caps the lifetime of a time-boxed admin elevation activated via `POST /api/v1/elevate`; a request asking for longer is clamped. Range 1–86400 (24h). Eligibility is the per-user `users.elevation_eligible` flag (admin-set via `POST /api/v1/users/<name>/elevation-eligibility`), elevation requires a fresh MFA step-up, and for Postgres-backed deployments the grant is **durably persisted** to the cookie session's `SessionStore` row (HA WS-1/1a, ADR-2002 §4), so it **survives a restart** — bounded by this 24h ceiling and the session's own absolute expiry, and auto-reverting on lapse, logout, or explicit revoke (config-file-only deployments keep the old in-memory-per-session behavior a restart drops). API/MCP tokens can never be elevated. Env: `YUZU_JIT_MAX_ELEVATION_SECS`. |
 | `--jit-oidc-amr-elevation` / `--no-jit-oidc-amr-elevation` | `true` (enabled) | Whether an OIDC session whose IdP login attested MFA (the `amr` claim, seeding `Session::mfa_verified_at` at `/auth/callback`) can satisfy `POST /api/v1/elevate`'s mandatory second-factor requirement **without** local TOTP enrollment. An OIDC session never consults a local namesake account's TOTP enrollment — a single-factor (no-`amr`) OIDC session is **always** denied regardless of this flag. Pass `--no-jit-oidc-amr-elevation` to disable JIT elevation for OIDC sessions **entirely** — an OIDC session cannot present a local TOTP step-up (its step-up challenge is re-authenticating via SSO, not a TOTP code), so with the flag off an operator must switch to a local-authenticated session with local TOTP to elevate. A one-time INFO log line is emitted at boot when OIDC is configured and this flag is on. ⚠️ **This flag currently has no observable effect** — since the #1837/#1857 identity re-key, an OIDC session is denied JIT elevation at the eligibility gate (its `oidc:<iss>#<sub>` principal has no local `users` row), before the `amr` branch this flag controls is reached; OIDC elevation is restored by #1852. Env: `YUZU_JIT_OIDC_AMR_ELEVATION`. |
@@ -219,7 +219,10 @@ read its presence as a supported default — removing it from the tree is tracke
 separately.
 
 > **If you seed an account yourself, change its password before exposing the
-> server.** For enterprise deployments, integrate OIDC SSO and disable local
+> server** — sign in and use Settings → User Management → **Change password**
+> (or `POST /api/v1/users/me/password`). Editing the config file afterwards does
+> not change it: once the account exists in the PostgreSQL auth store, that row
+> is the only credential checked (#5274). For enterprise deployments, integrate OIDC SSO and disable local
 > accounts.
 
 ---
@@ -278,7 +281,7 @@ The server's own CA, default certificates and key-encryption keys stay where the
 - **A connection string is required on a fresh install, and on an upgrade from any earlier version**, because no earlier version stored one. Give `/POSTGRES_DSN_FILE=<file>` (preferred) or `/POSTGRES_DSN=<connection string>`. Without one the install stops with exit code 7. The exception is a `YUZU_POSTGRES_DSN` environment variable, set machine-wide or for the service: the installer then goes ahead and logs a warning that local users can read it. Earlier installers never passed a connection string, so the service they registered could not start.
 - **A `YUZU_POSTGRES_DSN` or `YUZU_OIDC_CLIENT_SECRET` environment variable cannot be combined with a stored secret of the same kind.** The server refuses to start with both, so the installer refuses first and changes nothing. Remove the environment variable, then run the installer again.
 - **An OIDC client secret is not carried from an earlier version:** none stored it anywhere except the service's command line, and their own command line lost its arguments. Give it with `/OIDC_CLIENT_SECRET_FILE=` (preferred) or `/OIDC_CLIENT_SECRET=`. If you had added `--oidc-client-secret` to the service's command line by hand and OIDC is enabled on the upgrade (`/OIDC_ISSUER`), the upgrade refuses until you give the secret again; rotate it in your identity provider afterwards, since local users could read it.
-- **An upgrade keeps the existing accounts** when `/ADMIN_USER`, `/ADMIN_PASS` and the operator pair are left out. It keeps the stored connection string unless a new one is given, and keeps the stored OIDC secret when `/OIDC_ISSUER` is given again. Repeat your other options (`/GATEWAY`, `/OIDC_ISSUER`, `/OIDC_CLIENT_ID`, …) on an upgrade: they are not remembered.
+- **An upgrade keeps the existing accounts** when `/ADMIN_USER`, `/ADMIN_PASS` and the operator pair are left out. Giving `/ADMIN_PASS` on an upgrade does not reset the admin's password either: it changes only the hash in `yuzu-server.cfg`, which seeds a fresh database and is not consulted for an account the PostgreSQL auth store already holds (#5274). It keeps the stored connection string unless a new one is given, and keeps the stored OIDC secret when `/OIDC_ISSUER` is given again. Repeat your other options (`/GATEWAY`, `/OIDC_ISSUER`, `/OIDC_CLIENT_ID`, …) on an upgrade: they are not remembered.
 - **Upgrade in place; do not uninstall the previous version first.** Uninstalling removes the service and the installation record but keeps the old, unlocked data directory. The new installer then cannot tell that an administrator created that directory, and refuses it.
 - **Exit code 7** means the install was stopped before any file was installed: an input was missing or invalid, or something could not be secured. The reason is in the setup log on a line starting `PrepareToInstall:`. If the existing service had been stopped by then, it is left stopped, and the message says so (and says if it was disabled). The exception is an upgrade from an unsecured directory that stops before the old directory is moved: the service is then started again. On an upgrade of an already-secured install, the message also lists any files in the data directory that had already been replaced.
 - **Exit code 10** means the files were installed but the service could not be registered or its command line could not be written. Setup disables the service if it can, and the message and log say whether it did; if not, disable it yourself (`sc config YuzuServer start= disabled`) until the cause is fixed.
@@ -290,7 +293,7 @@ If any file that would be copied, or a folder holding one, fails that check, or 
 
 **After upgrading from an earlier version:**
 
-1. **Rotate what the old directory exposed.** Local users could read it, so treat its contents as disclosed: reset the dashboard passwords, re-issue the TLS keys in `certs\`, and rotate the OIDC client secret.
+1. **Rotate what the old directory exposed.** Local users could read it, so treat its contents as disclosed: reset the dashboard passwords, re-issue the TLS keys in `certs\`, and rotate the OIDC client secret. Reset the passwords **in the product** (Settings → User Management, or `POST /api/v1/users/me/password` / `POST /api/v1/users/{name}/password`): re-running the installer with a new `/ADMIN_PASS` rewrites the hash in `yuzu-server.cfg` but does not change an account that already exists in the PostgreSQL auth store, because the config file only seeds a fresh database (#5274).
 2. **Move the server's data subdirectories, if you ran the server.** `data\agent-updates\` and `data\upload-blobs\` (OTA packages and uploads that database rows refer to) stay in the renamed directory. Local users could create files in them, so check their contents. Then stop the server, move them into the new `data\`, make Administrators their owner and reset their permissions: `icacls "%ProgramData%\Yuzu Server\data" /setowner *S-1-5-32-544 /T /L`, then `icacls "%ProgramData%\Yuzu Server\data" /reset /T /L`. If you would rather not trust them, re-upload the packages instead.
 3. **Delete the renamed directory** once the upgrade is confirmed. It still holds the old password hashes and keys.
 
@@ -2764,7 +2767,7 @@ The Settings page is organized into sections, each loaded as an HTMX fragment. C
 | Section | Fragment Route | Description |
 |---|---|---|
 | TLS Configuration | `/fragments/settings/tls` | Enable/disable HTTPS, upload PEM certificate and key files. |
-| User Management | `/fragments/settings/users` | Create and delete local user accounts. |
+| User Management | `/fragments/settings/users` | Create and delete local user accounts, change your own password and reset other local users' passwords, revoke sessions. |
 | Multi-Factor Authentication | `/fragments/settings/mfa` | Per-operator TOTP enrollment + recovery codes. Admin-only in this release. Self-service for the logged-in admin only; to clear another (locked-out) user's MFA use the audited break-glass CLI `yuzu-server --mfa-reset <username>` — see `docs/ops-runbooks/auth-db-recovery.md` § Emergency MFA disable. |
 | Enrollment Tokens | `/fragments/settings/tokens` | Generate and revoke tokens for Tier 2 agent enrollment. |
 | Pending Agents | `/fragments/settings/pending` | Approve or deny agents waiting in the Tier 1 approval queue. |
@@ -3009,15 +3012,15 @@ Yuzu supports two built-in roles for local users:
 ### Creating a User
 
 1. Navigate to **Settings > User Management**.
-2. Enter a username, password, and select a role.
-3. Click **Create User**.
+2. Enter a username and a password (12–1024 bytes). The form also shows a role selector, but the role is ignored — see below.
+3. Click **Add User**.
 
 The password is hashed with PBKDF2 before storage. Plaintext passwords are never written to disk.
 
 > **Breaking change in v0.12.0** — the `role` field is **ignored** on
-> create. New users are always created as `user`. To grant admin, use
-> the **Change Role** button on the user's row, or `POST
-> /api/settings/users/{username}/role` programmatically. This is a
+> create. New users are always created as `user`. To grant admin, call
+> `POST /api/settings/users/{username}/role` (the Users table has no
+> role button today — see "Changing a User's Role" below). This is a
 > deliberate split (security finding C1): collapsing role assignment
 > into the create endpoint allowed a 4xx-on-create + audit-as-success
 > pattern that operators couldn't audit cleanly. Each role transition
@@ -3026,9 +3029,15 @@ The password is hashed with PBKDF2 before storage. Plaintext passwords are never
 
 ### Changing a User's Role
 
-1. Navigate to **Settings > User Management**.
-2. Click **Change Role** next to the target user.
-3. Pick `admin` or `user` and confirm.
+The Settings → User Management table does **not** render a role button;
+change a role with the Settings endpoint from an admin session (it is
+MFA step-up gated):
+
+```bash
+curl -s -X POST -H "Cookie: yuzu_session=$COOKIE" \
+  -H "Content-Type: application/json" -d '{"role":"admin"}' \
+  "https://yuzu.example.com/api/settings/users/alice/role"
+```
 
 The server emits an audit event on every branch:
 
@@ -3069,6 +3078,42 @@ The server emits an audit event on every branch:
 > until the process is restarted against its on-disk config. To remove
 > the account you are signed in as, first create a second admin, log
 > out, log in as the second admin, and delete the original.
+
+### Changing and resetting passwords
+
+Settings → User Management shows a password button on every **local**
+account's row; SSO (OIDC/SAML) and SCIM-provisioned rows have none —
+their credentials live at the identity provider (#5342).
+
+- **Your own row → Change password.** Enter the current password and
+  the new one twice. On success every session of your account is
+  signed out — on every server — and this browser is handed a fresh
+  session, so you stay signed in here. A wrong current password counts
+  toward account lockout like a failed login.
+- **Any other local row → Reset password.** Enter the new password
+  twice. Every dashboard session of that user is signed out. Their
+  **API tokens are not revoked**; the confirmation toast says how many
+  are still active, so you can revoke them (Settings → API Tokens) if
+  the account may be compromised. Resetting an **administrator's**
+  password needs a standing admin — a JIT elevation is refused.
+
+Both require a password of 12–1024 bytes, clear the account's lockout,
+and prompt for an MFA code when your session's step-up proof is stale.
+They are recorded as `user.password_change` / `user.password_reset`; if
+the audit row cannot be written, the change is rolled back and an error
+toast is shown. The REST contract (`POST /api/v1/users/me/password`,
+`POST /api/v1/users/{name}/password`) is in
+[rest-api.md](rest-api.md#post-apiv1usersmepassword); there is no MCP
+tool for either, by design.
+
+> **`yuzu-server.cfg` no longer resets a password (#5274).** The config
+> file seeds the first administrator into the PostgreSQL auth store on a
+> fresh database. After that, login checks the auth store only — editing
+> a hash in the config file, regenerating it, or re-running an installer
+> with a new admin password does not change an existing account's
+> password. Use the buttons above or the REST routes; if no
+> administrator can sign in at all, see
+> [the recovery runbook](../ops-runbooks/auth-db-recovery.md#password-reset).
 
 ---
 

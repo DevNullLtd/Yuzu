@@ -1,5 +1,7 @@
 // Settings page HTML — compiled in its own translation unit.
-// Uses HTMX for all server interactions; no client-side JavaScript except clipboard.
+// HTMX-first. Plain JS only where htmx has no CSP-safe equivalent: clipboard
+// copy, and fetch() for the JSON REST v1 routes (engine principals, #5342
+// password change/reset). Never `hx-on` — the CSP blocks it (CLAUDE.md).
 
 // NOLINTBEGIN(cert-err58-cpp)
 extern const char* const kSettingsHtml =
@@ -145,6 +147,7 @@ extern const char* const kSettingsHtml =
       border: 1px solid var(--border); border-radius: 0.3rem;
       font-size: 0.8rem; outline: none;
     }
+    .pw-form { flex-wrap: wrap; margin-top: 0.25rem; padding-top: 0; border-top: none; }
 
     /* ── Token reveal ──────────────────────────────────────── */
     .token-reveal {
@@ -801,6 +804,178 @@ extern const char* const kSettingsHtml =
       })
       .catch(function(err) {
         if (feedback) feedback.textContent = 'Error: ' + err.message;
+      });
+    });
+)HTM"
+    // Split here to keep each raw-string literal under MSVC's 16 KB C2026 cap
+    // (the #5342 password-change block below). Adjacent literals concatenate
+    // byte-for-byte, so the runtime HTML is unchanged by the split.
+    R"HTM(    /* "Sign out everywhere" (users fragment, own row) — redirect to the
+       login page once DELETE /api/v1/sessions/me has run. A body-level
+       htmx:afterRequest listener keyed on data-signout-everywhere, NOT an
+       hx-on attribute: htmx compiles hx-on:* with new Function(), which this
+       page's CSP (no 'unsafe-eval') blocks at runtime. A 401 also redirects
+       (the session is already gone); anything else toasts and stays. */
+    document.body.addEventListener('htmx:afterRequest', function(e) {
+      var el = e.detail && e.detail.elt;
+      if (!el || !el.hasAttribute || !el.hasAttribute('data-signout-everywhere')) return;
+      var status = e.detail.xhr ? e.detail.xhr.status : 0;
+      if (e.detail.successful || status === 401) {
+        window.location = '/login';
+        return;
+      }
+      showToast('Sign out everywhere failed (HTTP ' + status + ')', 'error');
+    });
+
+    /* ── #5342 Local password change (own row) / admin reset (other local
+       rows). JSON REST routes, so a plain fetch() — no hx-post (htmx would
+       send form-encoding) and no hx-on (CSP). Toggle buttons and the
+       delegated submit listener are keyed on data-pw-toggle / data-pw-action
+       (settings_routes.cpp render_users_fragment). The username is read from
+       an html_escape'd data attribute and only ever reaches the URL through
+       encodeURIComponent and the page through textContent (showToast). The
+       client-side checks mirror password_policy.hpp (12..1024 BYTES, UTF-8);
+       the server re-checks and stays authoritative. */
+    function yuzuPwBytes(s) {
+      try { return new TextEncoder().encode(s).length; } catch (_) { return s.length; }
+    }
+    function yuzuPwErr(resp, fallback) {
+      var d = resp && resp.data;
+      if (d && d.error && d.error.message) return d.error.message;
+      return fallback + (resp && resp.status ? ' (HTTP ' + resp.status + ')' : '');
+    }
+    /* POST JSON; on a 401 MFA step-up envelope, prompt for a code, POST it
+       to meta.challenge_url (same-origin path only) and retry ONCE — the
+       dashboard's htmx step-up intercept, re-done for fetch(). */
+    function yuzuPwPost(url, payload, done, retried) {
+      fetch(url, {
+        method: 'POST',
+        credentials: 'same-origin',
+        cache: 'no-store',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      })
+      .then(function(r) {
+        return r.text().then(function(t) {
+          var d = null;
+          try { d = JSON.parse(t); } catch (_) {}
+          return { status: r.status, data: d };
+        });
+      })
+      .then(function(resp) {
+        var meta = resp.data && resp.data.meta;
+        if (resp.status === 401 && !retried && meta && meta.mfa_step_up_required) {
+          var challenge = meta.challenge_url;
+          if (typeof challenge !== 'string' || challenge.charAt(0) !== '/' ||
+              challenge.charAt(1) === '/' || challenge.charAt(1) === '\\')
+            challenge = '/login/mfa/stepup';
+          if (challenge.split('?')[0] !== '/login/mfa/stepup') {
+            /* An SSO session's challenge is a re-login at the IdP
+               (/auth/oidc/start), not a code POST — never send it a code. */
+            showToast('MFA step-up required: sign in again through your identity provider, then retry.', 'warning');
+            done(false, { cancelled: true });
+            return;
+          }
+          var code = window.prompt('MFA step-up required for this action.\n\nEnter your 6-digit TOTP code (or a recovery code):');
+          if (!code) { done(false, { cancelled: true }); return; }
+          var form = new URLSearchParams();
+          form.set('code', code.trim());
+          fetch(challenge, {
+            method: 'POST',
+            credentials: 'same-origin',
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+            body: form.toString()
+          }).then(function(sr) {
+            if (!sr.ok) {
+              showToast('MFA step-up failed — verify your code and try again.', 'error');
+              done(false, { cancelled: true });
+              return;
+            }
+            yuzuPwPost(url, payload, done, true);
+          }).catch(function() {
+            showToast('MFA step-up request failed — please try again.', 'error');
+            done(false, { cancelled: true });
+          });
+          return;
+        }
+        done(resp.status >= 200 && resp.status < 300, resp);
+      })
+      .catch(function(err) {
+        showToast('Password request failed: ' + err.message, 'error');
+        done(false, { cancelled: true });
+      });
+    }
+    document.body.addEventListener('click', function(e) {
+      var t = e.target.closest('[data-pw-toggle]');
+      if (!t) return;
+      var row = document.getElementById(t.getAttribute('data-pw-toggle'));
+      if (!row) return;
+      row.hidden = !row.hidden;
+      var form = row.querySelector('form');
+      if (row.hidden) {
+        if (form) form.reset();
+      } else {
+        var first = row.querySelector('input[type=password]');
+        if (first) first.focus();
+      }
+    });
+    document.body.addEventListener('submit', function(e) {
+      var form = e.target.closest('form[data-pw-action]');
+      if (!form) return;
+      e.preventDefault();
+      var action = form.getAttribute('data-pw-action');
+      var user = form.getAttribute('data-username') || '';
+      var row = document.getElementById(form.getAttribute('data-pw-row') || '');
+      var cur = form.querySelector('input[name=current_password]');
+      var next = form.querySelector('input[name=new_password]').value;
+      var confirmPw = form.querySelector('input[name=confirm_password]').value;
+      if (next !== confirmPw) {
+        showToast('The new password and its confirmation do not match.', 'error');
+        return;
+      }
+      var n = yuzuPwBytes(next);
+      if (n < 12) { showToast('The new password must be at least 12 characters.', 'error'); return; }
+      if (n > 1024) { showToast('The new password must be at most 1024 bytes.', 'error'); return; }
+      var url, payload;
+      if (action === 'self') {
+        url = '/api/v1/users/me/password';
+        payload = { current_password: cur ? cur.value : '', new_password: next };
+      } else if (action === 'reset') {
+        url = '/api/v1/users/' + encodeURIComponent(user) + '/password';
+        payload = { new_password: next };
+      } else {
+        return;
+      }
+      var btn = form.querySelector('button[type=submit]');
+      if (btn) btn.disabled = true;
+      yuzuPwPost(url, payload, function(ok, resp) {
+        if (btn) btn.disabled = false;
+        if (!ok) {
+          if (resp && resp.cancelled) return;
+          showToast(yuzuPwErr(resp, action === 'self' ? 'Password change failed' : 'Password reset failed'), 'error');
+          return;
+        }
+        form.reset();
+        if (row) row.hidden = true;
+        var d = (resp.data && resp.data.data) || {};
+        if (action === 'self') {
+          if (d.session_reissued === false) {
+            showToast('Password changed. Sign in again with the new password.', 'warning');
+            setTimeout(function() { window.location = '/login'; }, 2500);
+          } else {
+            showToast('Password changed. Your other sessions were signed out; this one stays signed in.', 'success');
+          }
+        } else {
+          var msg = 'Password reset for "' + user + '". Their dashboard sessions were signed out.';
+          var tokens = d.api_tokens_active;
+          if (typeof tokens === 'number' && tokens > 0) {
+            msg += ' ' + tokens + ' API token' + (tokens === 1 ? '' : 's') +
+                   ' remain active and were NOT revoked — revoke them if the account may be compromised.';
+          }
+          showToast(msg, (typeof tokens === 'number' && tokens > 0) ? 'warning' : 'success');
+        }
+        if (d.audit_emitted === false)
+          showToast('The password was changed, but the session-revoke audit row could not be written.', 'warning');
       });
     });
     /* Ctrl+K / Cmd+K — navigate to dashboard command palette */

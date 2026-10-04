@@ -340,6 +340,66 @@ psql "$YUZU_POSTGRES_DSN" -c \
   "UPDATE auth.users SET failed_login_count = 0, last_failed_login_at = NULL, locked_until = NULL;"
 ```
 
+## Password reset
+
+A local account's password lives **only** in the PostgreSQL auth store
+(`auth.users.password_hash`/`salt_hex`). `yuzu-server.cfg` seeds the first
+administrator into an *empty* `auth` schema and is never consulted for an
+account that already exists there (#5274) — so **editing or regenerating
+`yuzu-server.cfg` no longer resets anyone's password**, and neither does
+re-running an installer with a new admin password. (Before #5274 a cfg hash
+silently shadowed the stored one on the replica that loaded it, which made a
+cfg edit look like a reset; that path is gone.)
+
+**Preferred — in the product** (audited, no database access):
+
+- Another administrator resets it: Settings → User Management → **Reset
+  password**, or
+  ```bash
+  curl -fsS -X POST "https://yuzu.internal/api/v1/users/alice/password" \
+       -H "Cookie: yuzu_session=$COOKIE" -H "Origin: https://yuzu.internal" \
+       -H "Content-Type: application/json" \
+       -d '{"new_password":"<12-1024 bytes>"}'
+  ```
+  This needs an interactive dashboard session with `UserManagement:Write`
+  (plus MFA step-up when enrolled) — API and MCP tokens are refused. An
+  administrator's password can only be reset by a *standing* admin, not a
+  JIT-elevated one. The user's sessions are revoked; their API tokens are
+  **not** (the response reports how many remain active).
+- A user who still knows their password changes it themselves: Settings →
+  User Management → **Change password**, or `POST /api/v1/users/me/password`.
+
+Audit: `user.password_reset` / `user.password_change`. A reset also clears
+the account's lockout.
+
+**Fallback — direct SQL**, when no administrator can sign in at all (the only
+admin forgot their password). This writes no audit row and revokes no
+sessions; record it in your change-management system. Generate the hash the
+way the server does (PBKDF2-HMAC-SHA256, 100 000 iterations, 32-byte key,
+16-byte random salt, both hex-encoded):
+
+```bash
+read -rs NEWPW   # 12-1024 bytes; not echoed, not in shell history
+# Passed via the environment, not argv (argv is visible to every local user in ps).
+NEWPW="$NEWPW" python3 - <<'PY'
+import hashlib, os
+salt = os.urandom(16)
+dk = hashlib.pbkdf2_hmac('sha256', os.environ['NEWPW'].encode(), salt, 100000, dklen=32)
+print(f"UPDATE auth.users SET password_hash = '{dk.hex()}', salt_hex = '{salt.hex()}', "
+      "failed_login_count = 0, last_failed_login_at = NULL, locked_until = NULL, "
+      "updated_at = now() WHERE username = 'admin' AND identity_source = 'local' "
+      "AND provisioning_source = 'local' AND is_active;")
+PY
+# Review the printed statement, then run it:
+psql "$YUZU_POSTGRES_DSN" -c "<the printed UPDATE>"
+```
+
+Expect `UPDATE 1`. No restart is needed: login reads the auth store directly.
+Then sign in, revoke the account's old sessions
+(`DELETE /api/v1/sessions?username=admin`, or **Sign out everywhere**), and
+consider enrolling a second administrator so the in-product reset is
+available next time.
+
 ## Emergency MFA disable (break-glass)
 
 **When to use.** An operator has lost both their authenticator device *and*

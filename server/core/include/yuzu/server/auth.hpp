@@ -708,6 +708,18 @@ public:
     /// default.
     void set_post_mint_race_hook_for_test(std::function<void()> hook);
 
+    /// TEST-ONLY: installs a callback fired in `write_password_cas` (the
+    /// shared tail of `change_password`/`reset_password`, #5342) AFTER the
+    /// caller's authoritative AuthDB read and BEFORE the guarded
+    /// `AuthDB::set_password` UPDATE — the window in which a concurrent
+    /// `update_role()` promotion could land after `reset_password` decided the
+    /// target was not an admin. No lock is held at this firing point, so a
+    /// hook MAY call `AuthDB::update_role()` synchronously (deterministic
+    /// red/green, same shape as `set_post_mint_race_hook_for_test`).
+    /// Production code MUST NOT call this - no caller in `server/core/src/**`
+    /// references it. A no-op (nullptr) by default.
+    void set_password_write_race_hook_for_test(std::function<void()> hook);
+
     /// TEST-ONLY: raw `users_` cache peek, bypassing AuthDB entirely (unlike
     /// `get_user_role()`, which is DB-authoritative and so cannot observe
     /// cache staleness at all). Lets a test confirm the version-guard in
@@ -835,9 +847,14 @@ public:
     /// rollback restores exactly what this call overwrote. Caller must NOT
     /// hold `mu_`.
     ///
-    /// Residual (disclosed): the admin-target decision is taken on this call's
-    /// read; a promotion of the target committing between that read and the
-    /// UPDATE is not re-checked by the write itself.
+    /// The admin-target decision is enforced TWICE: on this call's read (the
+    /// cheap refusal) and, when `permit_admin_target` is false, by the write
+    /// itself — `AuthDB::set_password(..., forbid_admin_target=true)` adds
+    /// `AND role <> 'admin'` to the UPDATE, so a promotion of the target that
+    /// commits between the read and the write makes the write match zero rows
+    /// and the call returns `kAdminTarget` (re-read to tell it from a CAS
+    /// miss). A demotion racing the other way is harmless: the caller was
+    /// already permitted an admin target, so it is permitted a non-admin one.
     [[nodiscard]] PasswordWriteResult reset_password(const std::string& username,
                                                      const std::string& new_password,
                                                      bool permit_admin_target);
@@ -1271,9 +1288,14 @@ private:
     /// map a zero-row miss to `kNotFound`/`kConflict` by re-reading, and on
     /// success refresh the `users_` entry. `current` is the row read by the
     /// caller. Caller must NOT hold `mu_`.
+    ///
+    /// `forbid_admin_target` threads to `AuthDB::set_password`'s role guard
+    /// (the write refuses an admin row); a zero-row miss on a row that is now
+    /// admin maps to `kAdminTarget`, ahead of `kConflict`.
     [[nodiscard]] PasswordWriteResult write_password_cas(const std::string& username,
                                                          const UserEntry& current,
-                                                         const std::string& new_password);
+                                                         const std::string& new_password,
+                                                         bool forbid_admin_target);
 
     /// Shared head of `change_password`/`reset_password`: policy check on the
     /// new password, then the AUTHORITATIVE AuthDB read + local-account
@@ -1332,6 +1354,13 @@ private:
     /// as `role_recheck_race_hook_for_test_` above - see that field's
     /// Resource Ledger entry, which covers this one too.
     std::function<void()> post_mint_race_hook_for_test_;
+
+    /// Backing field for `set_password_write_race_hook_for_test` - see that
+    /// method's doc. Invoked (if set) from inside `write_password_cas` only,
+    /// between the read and the guarded UPDATE. Same shape/lifetime/
+    /// production-reachability as `role_recheck_race_hook_for_test_` above -
+    /// see that field's Resource Ledger entry, which covers this one too.
+    std::function<void()> password_write_race_hook_for_test_;
 
     /// Backing counter for `next_role_version_()` - see `UserEntry::role_version`'s
     /// doc for why this is process-wide, not per-username. `std::atomic` since

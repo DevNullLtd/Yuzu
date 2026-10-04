@@ -221,6 +221,15 @@ Every SAML and OIDC login attempt — success or failure — increments its prov
 | `yuzu_auth_saml_deprovisioned_denied_store_unavailable_total` | counter, no labels | #3069 — SAML analogue of `yuzu_auth_oidc_deprovisioned_denied_store_unavailable_total`: the login was refused because the `ScimStore` could not be reached, not because of a real deprovision (`decision.scim_id` absent). An availability signal, not a termination event — correlate with Postgres health. |
 | `yuzu_saml_group_cap_truncated_total` | counter, no labels | Bumped once per SAML login (not once per dropped group value) when the assertion's `groups` attribute exceeded the 200-value cap and real group values were dropped. A non-zero rate means some SAML-asserted group-based RBAC role mappings may not be taking effect for the affected principal — check the assertion's attribute statement. OIDC has no equivalent counter: OIDC group claims are bounded by JWT/ID-token size rather than a fixed value-count cap, so the two providers hit different limits and are not expected to have parity here. |
 
+## Local password metrics (#5342, #5274)
+
+| Metric | Type | Meaning |
+|---|---|---|
+| `yuzu_auth_password_changes_total{kind, result}` | counter | Outcomes of the two local-password routes. `kind` is `self` (`POST /api/v1/users/me/password`) or `admin` (`POST /api/v1/users/{name}/password`); `result` is `ok`, `denied` (every refusal, including a malformed body or wrong `Content-Type`, which are not audited) or `error` (auth store unavailable, or the mandatory audit row could not be written). The paired audit actions `user.password_change` / `user.password_reset` carry the refusal reason. A burst of `kind="self",result="denied"` is password guessing through the change route — those attempts also count toward account lockout. Not pre-seeded: a series appears on its first increment. |
+| `yuzu_auth_credential_changed_during_verify_total` | counter, no labels | A login (or other credential check) whose password verified, but the row-locked re-check found the stored hash had changed underneath it — a password change or reset committed mid-login. The login is denied and the user retries. Expected to be rare and bursty around password changes; a steady rate is unexplained credential churn. Not pre-seeded. |
+
+The self-service change route's lockout check shares `/login`'s instrumentation: a fail-closed auth-store refusal there increments `yuzu_auth_secret_unavailable_total{route="password_change"}` and `yuzu_auth_read_degrade_total{route="password_change",reason}` (see `docs/auth-architecture.md`, login/Postgres decoupling).
+
 ## SCIM deprovision-linkage metrics (ADR-2001, CC6.8)
 
 Two detective counters for the SCIM↔OIDC identity-link revoke seam — a SCIM

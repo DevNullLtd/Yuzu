@@ -175,6 +175,52 @@ TEST_CASE("reset_password: an admin target needs permit_admin_target", "[pg][aut
     CHECK(mgr.verify_password("root2", kNew) == Role::admin);
 }
 
+TEST_CASE("reset_password: a promotion racing the write is refused by the UPDATE itself",
+          "[pg][auth][password]") {
+    // The closed race (#5342): reset_password reads the target as a NON-admin
+    // (so permit_admin_target=false lets it through the read-side check), then
+    // an update_role() promotion commits before the UPDATE. The write's own
+    // `role <> 'admin'` guard must refuse it and the outcome must be the
+    // admin-target refusal — not kOk, and not a "retry" kConflict.
+    yuzu::test::AuthDbPg db;
+    AuthManager mgr;
+    mgr.set_auth_db(db.get());
+    seed_local(*db, "climber", kOld, Role::user);
+    const auto before = db->get_user("climber")->hash_hex;
+
+    int fired = 0;
+    mgr.set_password_write_race_hook_for_test([&] {
+        ++fired;
+        REQUIRE(db->update_role("climber", Role::admin).has_value());
+    });
+    const auto r = mgr.reset_password("climber", kNew, /*permit_admin_target=*/false);
+    mgr.set_password_write_race_hook_for_test(nullptr);
+
+    CHECK(fired == 1);
+    CHECK(r.outcome == PasswordWriteOutcome::kAdminTarget);
+    CHECK(r.role == Role::admin);
+    CHECK(db->get_user("climber")->hash_hex == before);
+    CHECK(mgr.verify_password("climber", kOld) == Role::admin);
+    CHECK_FALSE(mgr.verify_password("climber", kNew).has_value());
+
+    SECTION("a caller permitted admin targets is unaffected by the same race") {
+        REQUIRE(db->update_role("climber", Role::user).has_value());
+        mgr.set_password_write_race_hook_for_test(
+            [&] { REQUIRE(db->update_role("climber", Role::admin).has_value()); });
+        const auto ok = mgr.reset_password("climber", kNew, /*permit_admin_target=*/true);
+        mgr.set_password_write_race_hook_for_test(nullptr);
+        CHECK(ok.outcome == PasswordWriteOutcome::kOk);
+        CHECK(mgr.verify_password("climber", kNew) == Role::admin);
+    }
+    SECTION("a self-change never applies the admin guard") {
+        // change_password always passes forbid_admin_target=false: an admin
+        // changing their OWN password is the normal case.
+        mgr.set_password_write_race_hook_for_test(nullptr);
+        const auto self = mgr.change_password("climber", kOld, kNew);
+        CHECK(self.outcome == PasswordWriteOutcome::kOk);
+    }
+}
+
 TEST_CASE("change_password / reset_password fail closed without AuthDB", "[auth][password]") {
     AuthManager mgr; // cfg-file-only: no durable credential to change
     CHECK(mgr.change_password("x", kOld, kNew).outcome == PasswordWriteOutcome::kStoreUnavailable);

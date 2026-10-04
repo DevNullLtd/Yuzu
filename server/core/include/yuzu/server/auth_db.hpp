@@ -365,8 +365,16 @@ public:
     /// guard, and the audit-failure rollback's "restore only if nobody wrote
     /// since" guard).
     ///
+    /// `forbid_admin_target`, when true, adds `AND role <> 'admin'` — the
+    /// write itself refuses an admin row, so a caller that was NOT permitted
+    /// to overwrite an admin's credential (`AuthManager::reset_password` with
+    /// `permit_admin_target=false`) cannot be raced past by a promotion that
+    /// commits between its read and this UPDATE. The role check and the write
+    /// are one statement, so there is no window between them.
+    ///
     /// Returns `UserNotFound` when ZERO rows matched — absent, inactive, not
-    /// local, OR the CAS predicate failed. The store deliberately draws no
+    /// local, the role guard refused an admin row, OR the CAS predicate
+    /// failed. The store deliberately draws no
     /// distinction (no oracle at this layer); a caller that must answer 404
     /// vs 409 reads the row (`get_user` + `get_provisioning_source`) BEFORE the
     /// write. `InvalidUsername` for a malformed username, `InvalidCredentials`
@@ -375,7 +383,8 @@ public:
     std::expected<void, AuthDBError>
     set_password(const std::string& username, const std::string& password_hash,
                  const std::string& salt_hex,
-                 const std::optional<std::string>& expected_current_hash = std::nullopt);
+                 const std::optional<std::string>& expected_current_hash = std::nullopt,
+                 bool forbid_admin_target = false);
 
     /// Row-locked role + credential re-check (#4107, extended by #5274):
     /// `SELECT role, password_hash FROM auth.users WHERE username = $1 AND

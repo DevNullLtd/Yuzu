@@ -538,7 +538,9 @@ std::string SettingsRoutes::render_users_fragment(const std::string& current_use
     if (users.empty()) {
         html += "<tr><td colspan=\"3\" style=\"color:#484f58\">No users</td></tr>";
     } else {
+        std::size_t row_index = 0;
         for (const auto& u : users) {
+            const std::size_t this_row = row_index++;
             auto role_str = auth::role_to_string(u.role);
             auto cls = (u.role == auth::Role::admin) ? "role-admin" : "role-user";
             const bool is_self = !current_username.empty() && u.username == current_username;
@@ -551,10 +553,25 @@ std::string SettingsRoutes::render_users_fragment(const std::string& current_use
             // it below rather than rendering a button that always 400s. (The
             // #5342 password routes, POST /api/v1/users/me/password and
             // POST /api/v1/users/{name}/password, refuse SSO/SCIM accounts
-            // too — 409 "not a local account".) Session-revoke and
+            // too — 409 "not a local account" — so their password buttons
+            // are suppressed on such rows as well.) Session-revoke and
             // elevation-eligibility are principal-keyed (`is_valid_principal`)
             // and stay available.
             const bool is_sso = u.identity_source != "local";
+            // #5342 — password buttons: own LOCAL row → "Change password"
+            // (current/new/confirm → POST /api/v1/users/me/password); any
+            // other LOCAL row → "Reset password" (new/confirm → POST
+            // /api/v1/users/{name}/password). A SCIM row carries
+            // identity_source='scim' (scim_routes.cpp), so `is_sso` covers it;
+            // the server's own local-account classification (409 not_local)
+            // stays authoritative for any row this view misjudges. The form
+            // is a hidden sibling <tr>, keyed by row index (never by the
+            // username, so no username reaches an id or a JS string); the
+            // username rides only in an html_escape'd data-username attribute
+            // read back with getAttribute. Submission is a body-level
+            // delegated listener in settings_ui.cpp — no hx-on (CSP).
+            const bool pw_button = !is_sso;
+            const std::string pw_row_id = "pw-row-" + std::to_string(this_row);
             html += "<tr><td>" + html_escape(u.username);
             if (is_sso) {
                 html += " <span class=\"role-badge\" style=\"background:#1f6feb22;"
@@ -587,13 +604,27 @@ std::string SettingsRoutes::render_users_fragment(const std::string& current_use
                         "Current user</span>"
                         "<button class=\"btn btn-secondary\" "
                         "style=\"padding:0.2rem 0.6rem;font-size:0.7rem\" "
-                        "hx-delete=\"/api/v1/sessions/me\" "
+                        "hx-delete=\"/api/v1/sessions/me\" hx-swap=\"none\" "
+                        "data-signout-everywhere=\"1\" "
                         "hx-confirm=\"Sign out of every device AND revoke "
                         "every API token you own? You will be redirected to "
                         "the login page; any of your CI/CD or automation "
-                        "tokens will need to be re-issued.\" "
-                        "hx-on::after-request=\"window.location='/login'\""
+                        "tokens will need to be re-issued.\""
                         ">Sign out everywhere</button>";
+                // The post-request redirect is a body-level
+                // `htmx:afterRequest` listener keyed on
+                // data-signout-everywhere (settings_ui.cpp): the former
+                // `hx-on::after-request` is compiled by htmx with
+                // `new Function()`, which the dashboard CSP (no
+                // 'unsafe-eval') blocks at runtime — the redirect silently
+                // never ran.
+                if (pw_button) {
+                    html += "<button type=\"button\" class=\"btn btn-secondary\" "
+                            "style=\"padding:0.2rem 0.6rem;font-size:0.7rem;"
+                            "margin-left:0.3rem\" "
+                            "data-pw-toggle=\"" +
+                            pw_row_id + "\">Change password</button>";
+                }
             } else {
                 // governance round (arch-S1) — the query-parameter VALUE
                 // must be URL-encoded, not HTML-escaped: `html_escape`
@@ -636,8 +667,51 @@ std::string SettingsRoutes::render_users_fragment(const std::string& current_use
                             "&quot;?\""
                             ">Remove</button>";
                 }
+                if (pw_button) {
+                    html += "<button type=\"button\" class=\"btn btn-secondary\" "
+                            "style=\"padding:0.2rem 0.6rem;font-size:0.7rem;"
+                            "margin-left:0.3rem\" "
+                            "data-pw-toggle=\"" +
+                            pw_row_id + "\">Reset password</button>";
+                }
             }
             html += "</td></tr>";
+            if (pw_button) {
+                const std::string esc_user = html_escape(u.username);
+                html += "<tr class=\"pw-form-row\" id=\"" + pw_row_id +
+                        "\" hidden><td colspan=\"3\">"
+                        "<form class=\"add-user-form pw-form\" data-pw-action=\"" +
+                        std::string(is_self ? "self" : "reset") + "\" data-username=\"" +
+                        esc_user + "\" data-pw-row=\"" + pw_row_id + "\">";
+                if (is_self) {
+                    // Hidden username field: lets a password manager file
+                    // the new credential under the right account.
+                    html += "<input type=\"text\" name=\"username\" value=\"" + esc_user +
+                            "\" autocomplete=\"username\" hidden readonly>"
+                            "<div class=\"mini-field\"><label>Current password</label>"
+                            "<input type=\"password\" name=\"current_password\" "
+                            "autocomplete=\"current-password\" maxlength=\"1024\" "
+                            "required></div>";
+                }
+                html += "<div class=\"mini-field\"><label>New password <span "
+                        "style=\"color:#8b949e;font-weight:normal;font-size:0.7rem\">"
+                        "(min 12 chars)</span></label>"
+                        "<input type=\"password\" name=\"new_password\" "
+                        "autocomplete=\"new-password\" minlength=\"12\" maxlength=\"1024\" "
+                        "required></div>"
+                        "<div class=\"mini-field\"><label>Confirm new password</label>"
+                        "<input type=\"password\" name=\"confirm_password\" "
+                        "autocomplete=\"new-password\" minlength=\"12\" maxlength=\"1024\" "
+                        "required></div>"
+                        "<button class=\"btn btn-primary\" type=\"submit\">" +
+                        std::string(is_self ? "Change password" : "Reset password") +
+                        "</button>"
+                        "<button class=\"btn btn-secondary\" type=\"button\" "
+                        "data-pw-toggle=\"" +
+                        pw_row_id +
+                        "\">Cancel</button>"
+                        "</form></td></tr>";
+            }
         }
     }
 

@@ -33,6 +33,21 @@ not supported for this migration at this stage: above about 2 million rows stop 
 then start one and let it finish; below that, start one replica first. The procedure, the row-count query
 and the free-space guidance are in [Installed-Software Inventory](inventory.md) (Upgrading).
 
+## Behaviour change: `yuzu-server.cfg` no longer overrides a stored password (#5274); passwords are now changed in the product (#5342)
+
+**What changed.** Login now reads a local account's password from the PostgreSQL auth store (`auth.users`) **only**. Before this release the server loaded the password hashes in `yuzu-server.cfg` into memory at boot and checked them **first**, so a hash in the config file silently took precedence over the stored one on the server that loaded it. That is gone: the config file is now a **seed** — it provisions the first administrator into an empty `auth` schema, and is never consulted for an account the auth store already holds.
+
+**Who is affected.** Anyone who reset a password by editing (or regenerating) `yuzu-server.cfg` and restarting — including re-running the Windows server installer with a new `/ADMIN_PASS` on an existing install. **That no longer changes the password.** After upgrading, the password that works is the one in the auth store, which for most installs is the one the account was first created with — if you had "reset" the admin password through the config file, sign in with the **original** password (or recover as below).
+
+**What to use instead.**
+
+- Settings → User Management → **Change password** on your own row (`POST /api/v1/users/me/password`), or **Reset password** on another local account's row (`POST /api/v1/users/{name}/password`, `UserManagement:Write` + MFA step-up; an administrator's password needs a standing admin). See [Authentication](authentication.md#changing-and-resetting-a-local-password) and [REST API](rest-api.md#post-apiv1usersmepassword).
+- If no administrator can sign in at all: [auth-db-recovery runbook → Password reset](../ops-runbooks/auth-db-recovery.md#password-reset) (a direct-SQL fallback).
+
+**Also in this release.** Passwords must be 12–1024 bytes; `/login` answers a password over 1024 bytes as a wrong password. A password change or reset revokes the account's sessions on every server (the self-service change re-issues the caller's own cookie) and clears its lockout. Neither action has an MCP tool, by design. New metrics: `yuzu_auth_password_changes_total{kind,result}` and `yuzu_auth_credential_changed_during_verify_total` (a login denied because the password changed while it was being checked — the user retries). New audit actions: `user.password_change`, `user.password_reset`.
+
+No config or data migration is required.
+
 ## Behaviour change: DEX device score and management-group member reads now fail closed on a degraded read (#4855, #1762)
 
 **Not a Breaking lead for the DEX routes and the management-group MEMBER-read path** — those already documented a `503` response before this release; what changes for them is when it fires, not the documented contract. **This does NOT hold for `GET /api/v1/management-groups/{id}`'s own GROUP-ROW read or its MCP twin `get_management_group`** (governance round-2, #1762): before this release, a degraded group-row read answered the SAME flat, undocumented `404 "group not found"` a genuinely nonexistent group id gets — there was no `503` contract for that case at all. This release adds a NEWLY DOCUMENTED, additive `503`/retryable error path for a degraded group-row read specifically; the `404` contract for a genuine not-found is unchanged. A client that already treats any `503` from these routes as retryable per the A4 contract needs no code change; a client that inferred "management group not found" purely from a `404` status code should note that `404` now unambiguously means "no such group" (never "could not tell") — narrower, not wider, than before.

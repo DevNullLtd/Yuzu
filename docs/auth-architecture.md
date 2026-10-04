@@ -12,12 +12,12 @@ Certificate setup instructions: `scripts/Certificate Instructions.txt`.
 
 ## Login and session management
 
-- **RBAC login** — session-cookie auth with PBKDF2-hashed passwords in `yuzu-server.cfg`. Legacy roles: `admin` (full access) and `user` (read-only). First-run interactive setup prompts for credentials.
+- **RBAC login** — session-cookie auth with PBKDF2-hashed passwords stored in the AuthDB (Postgres schema `auth`, `auth.users`). `yuzu-server.cfg` is a **seed only**: it provisions the first administrator into an empty `auth` schema and is never consulted for an existing account's credentials (#5274 — see "Local password change and reset" below). Legacy roles: `admin` (full access) and `user` (read-only). First-run interactive setup prompts for credentials and writes the seed file.
 - **Login page** — dark-themed, with greyed-out OIDC SSO stub where appropriate. Yuzu does not support Light Mode.
 - **Settings page** (admin-only) — TLS toggle, PEM cert upload, user management, enrollment tokens, pending agent approvals, AD/Entra section.
 - **Hamburger menu** — upper-right dropdown with Settings, About (popup), and Logout.
 - **Auth middleware** — `set_pre_routing_handler` redirects unauthenticated requests to `/login`, returns 401 for API calls.
-- **HTMX paradigm** — Settings page uses HTMX for all server interactions; server renders HTML fragments. Vanilla JS reserved only for clipboard copy. Dominant UI pattern going forward.
+- **HTMX paradigm** — Settings page uses HTMX for server interactions; server renders HTML fragments. Vanilla JS is reserved for what htmx cannot do CSP-safely: clipboard copy and `fetch()` to JSON REST v1 routes (engine principals, password change/reset). Never `hx-on` (the CSP has no `unsafe-eval`). Dominant UI pattern going forward.
 - **Session revocation REST surface (CC6.3 revocation, CC6.7 disposition, CC6.8 termination).**
   - `DELETE /api/v1/sessions?username=<name>` — admin-only via `UserManagement:Write`. Cookie sessions only; API tokens deliberately not revoked.
   - `DELETE /api/v1/sessions/me` — any interactive authenticated principal. Wipes cookie sessions AND revokes the caller's API tokens (lost-laptop UX). MCP-tier and service-scoped tokens rejected with 403. Response sets `Set-Cookie: yuzu_session=; Max-Age=0` so the client side completes the disposition.
@@ -204,6 +204,127 @@ scope here.
   load-shed).
 - **Metrics** — `yuzu_auth_lockout_applied_total`,
   `yuzu_auth_lockout_blocked_total`.
+
+## Local password change and reset (#5342, #5274)
+
+Two REST v1 routes write a local account's password; the dashboard's Settings
+→ User Management buttons call them with `fetch()` (no `hx-on` — CSP). Full
+wire contract: `docs/user-manual/rest-api.md` "Users".
+
+- `POST /api/v1/users/me/password` `{current_password, new_password}` — self-service.
+- `POST /api/v1/users/{name}/password` `{new_password}` — administrative reset
+  (`UserManagement:Write` + MFA step-up).
+
+**One write primitive.** `AuthDB::set_password` is the only writer of
+`password_hash` on an existing row (`upsert_user` is INSERT-only — `ON CONFLICT
+DO NOTHING`). It is a single guarded `UPDATE ... RETURNING` whose `WHERE` clause
+is the local-account gate (`is_active AND identity_source='local' AND
+provisioning_source='local'`), clears the lockout columns in the same
+statement, and takes two optional guards, each a compile-time SQL variant (no
+interpolation): a **compare-and-swap** on the expected current hash, and
+**`forbid_admin_target`** (`AND role <> 'admin'`). Zero rows is `UserNotFound`
+with no oracle at the store; the `AuthManager` caller re-reads to answer 404 /
+409 / 403 honestly.
+
+**AuthManager.** `change_password` / `reset_password` return a typed
+`PasswordWriteOutcome` (never the legacy "any false = weak password" bool). Both
+read the account **from the AuthDB** (never `users_`), classify non-local
+accounts, and write CAS-anchored on the hash they read — for a self-change, the
+hash the current password was just re-verified against, so an admin reset that
+lands in between wins (`kConflict`). `reset_password(…, permit_admin_target)`
+refuses an admin target on its read, and when the caller is NOT permitted one
+it also passes `forbid_admin_target=true`, so a promotion of the target
+committing between the read and the `UPDATE` makes the write match zero rows →
+`kAdminTarget` (the read-then-write race the first slice disclosed, now closed
+by the write itself). The REST route sets `permit_admin_target` from the
+caller's **durable** `Session::role`, never `effective_role()` — a JIT
+elevation grants `UserManagement:Write` (the legacy permission check admits on
+the effective role) but must not re-key a standing administrator.
+
+**Route gates** (`rest_api_v1.cpp` `register_password_routes`, shared helper
+`password_route_session_gates`): interactive cookie sessions only — any MCP
+tier, service-scoped token, engine principal or non-interactive `auth_source`
+is `403 token_session`; the self route additionally requires
+`auth_source == "local"` (`409 not_local` for OIDC/SAML). CSRF: `Origin`/`Referer`
+must be same-site (`origin_is_same_site`, honouring `--csrf-trusted-origins`)
+and a cookie request lacking **both** headers is refused — matching the other
+cookie-authorized state-changing POSTs (`ca_routes`, `dashboard_routes`).
+`Content-Type` must be `application/json` (`415`). The admin route refuses a
+self-target (`403 self_target`) so a hijacked admin cookie cannot re-key its own
+account without the current password. The admin route accepts OIDC and SAML
+admin sessions at the session gate, but a SAML session is then refused by the
+shared step-up gate (no SAML MFA attestation). The body is parsed with a
+non-throwing, type-guarded parse and never echoed; passwords, hashes and
+lengths never reach a log or audit row.
+
+**Lockout.** The self route's current-password check runs through
+`AuthRoutes::verify_password_with_lockout` — the striped `login_lock_for`
+lockout section extracted from `/login`, behaviour-preserving, and the ONE copy
+(no second striped-lock section). A wrong current password records a failed
+login exactly like `/login`; a locked account answers the SAME `403` "current
+password is incorrect" as a wrong password (audit detail `account_locked` vs
+`wrong_current` records the truth). Its store-unavailable branch counts under
+`yuzu_auth_secret_unavailable_total{route="password_change"}` /
+`yuzu_auth_read_degrade_total{route="password_change",reason}`. `change_password`
+re-verifies against the stored hash only as the write's CAS anchor; it applies
+no lockout of its own and is unreachable without first clearing the
+lockout-accounted check.
+
+**Audit fail-closed via CAS rollback** (the `/api/v1/elevate` precedent): the
+success row (`user.password_change` / `user.password_reset`) is written after
+the write; if it cannot be persisted, `rollback_password_write` restores the
+previous hash/salt guarded `WHERE password_hash = <the hash just written>`
+(restores only if nobody wrote since) → `500` + `Sec-Audit-Failed`. If the
+rollback also fails → `500` + `Sec-Audit-Failed` + `spdlog::critical`, with the
+state (new password in effect, unrecorded, sessions NOT revoked) disclosed in
+the body. A same-transaction audit+mutation API on `AuditStore` would remove the
+compensating write; that is a follow-up.
+
+**Sessions.** After the audited write, `invalidate_user_sessions(username)`
+(durable delete + write-generation bump, so every replica drops its cache).
+Self-change then mints a replacement session for the caller through a callback
+owned by `AuthRoutes` (it owns the cookie attributes — `RestApiV1` never
+formats a cookie), carrying the old session's MFA proof but not its JIT
+elevation; if minting fails the response clears the cookie. Admin reset revokes
+the target's cookie sessions only and reports `api_tokens_active`
+(`ApiTokenStore::list_active_for_principal`) — tokens are deliberately not
+auto-revoked.
+
+**#5274 — the config file can no longer shadow the AuthDB.** Before this change
+`find_user_or_hydrate` was cache-first, and `users_` is seeded from
+`yuzu-server.cfg` at boot (before `set_auth_db`) and never overwritten by a
+hydrate; the post-verify recheck compared role/active, never the hash. So after
+a password change (a) every restart re-seeded the OLD cfg hash, which then won,
+and (b) a second replica kept its cached old hash until restart. Now, with an
+AuthDB wired, `find_user_or_hydrate` reads the AuthDB and **never consults
+`users_` for credentials** (the `get_user_role` "always authoritative"
+precedent); `users_` remains the store only in cfg-only (no-AuthDB) mode. And
+`recheck_role_locked`'s row-locked `SELECT ... FOR UPDATE` now also returns
+`password_hash`; the credential check **denies** if it differs from the hash
+just verified (a change committed mid-login — the user retries; no re-verify),
+counted by `yuzu_auth_credential_changed_during_verify_total`. The cfg file is
+therefore seed-only by construction: an operator can no longer reset a
+password by editing it (behaviour change — see `docs/user-manual/upgrading.md`).
+cfg-only non-admin accounts are a separate, pre-existing gap (only the cfg
+admin is provisioned on a fresh database) and are not changed here.
+
+**Password policy.** `password_policy.hpp` is the ONE length policy:
+`kMinPasswordBytes = 12`, `kMaxPasswordBytes = 1024` (bytes). It replaces the
+three hand-copied `< 12` checks; `/login` answers an over-max password like a
+wrong one without running PBKDF2. Body cap: `kBodyCapTable` row `/api/v1/users`
+(any method, 16 KiB, `path_class="users"`).
+
+**No MCP twin** (ADR-1005 parity-ledger `exception:` rows,
+`docs/api-parity-ledger.md`). Self-service change is permanently excluded: an
+MCP caller is a token, not the human, so a token able to change its owner's
+password converts token compromise into account takeover. Admin reset is
+deferred: `UserManagement:Write` is approval-gated at the supervised MCP tier,
+and an approval ticket persists the tool's `canonical_args` in plain text
+(`approvals.scope_expression`) and renders them to approvers — a password
+argument would be stored and displayed. The intended follow-up is a
+temp-password MCP tool that takes no password argument.
+
+**Metric.** `yuzu_auth_password_changes_total{kind="self"|"admin", result="ok"|"denied"|"error"}`.
 
 ## Inactivity (idle) session timeout (SOC 2 CC6.3)
 

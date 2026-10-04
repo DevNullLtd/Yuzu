@@ -442,6 +442,42 @@ TEST_CASE("AuthDB::set_password compare-and-swap on the expected current hash",
     CHECK(h.db.get_user("cas")->hash_hex == "h2");
 }
 
+TEST_CASE("AuthDB::set_password forbid_admin_target refuses an admin row in the UPDATE",
+          "[pg][auth_db][password]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, auth_db_tpl);
+    Harness h{db.dsn()};
+    REQUIRE(h.db.upsert_user("boss", "h0", "s0", yuzu::server::auth::Role::admin).has_value());
+    REQUIRE(h.db.upsert_user("crew", "c0", "t0", yuzu::server::auth::Role::user).has_value());
+
+    // Guarded, no CAS: an admin row is a zero-row UserNotFound, untouched.
+    auto refused = h.db.set_password("boss", "h1", "s1", std::nullopt, /*forbid_admin_target=*/true);
+    REQUIRE_FALSE(refused.has_value());
+    CHECK(refused.error() == AuthDBError::UserNotFound);
+    CHECK(h.db.get_user("boss")->hash_hex == "h0");
+
+    // Guarded + CAS with the RIGHT anchor: still refused — the role guard is
+    // independent of the CAS predicate.
+    auto refused_cas =
+        h.db.set_password("boss", "h1", "s1", std::string("h0"), /*forbid_admin_target=*/true);
+    REQUIRE_FALSE(refused_cas.has_value());
+    CHECK(refused_cas.error() == AuthDBError::UserNotFound);
+    CHECK(h.db.get_user("boss")->hash_hex == "h0");
+
+    // A non-admin row is written by both guarded variants.
+    REQUIRE(h.db.set_password("crew", "c1", "t1", std::nullopt, true).has_value());
+    CHECK(h.db.get_user("crew")->hash_hex == "c1");
+    REQUIRE(h.db.set_password("crew", "c2", "t2", std::string("c1"), true).has_value());
+    CHECK(h.db.get_user("crew")->hash_hex == "c2");
+
+    // Promote crew: the guard now refuses it; the unguarded default writes.
+    REQUIRE(h.db.update_role("crew", yuzu::server::auth::Role::admin).has_value());
+    CHECK(h.db.set_password("crew", "c3", "t3", std::string("c2"), true).error() ==
+          AuthDBError::UserNotFound);
+    CHECK(h.db.get_user("crew")->hash_hex == "c2");
+    REQUIRE(h.db.set_password("crew", "c3", "t3", std::string("c2")).has_value());
+    CHECK(h.db.get_user("crew")->hash_hex == "c3");
+}
+
 TEST_CASE("AuthDB::recheck_role_locked hands the current password_hash to the callback (#5274)",
           "[pg][auth_db][password]") {
     YUZU_REQUIRE_PG_DB_TPL(db, auth_db_tpl);
