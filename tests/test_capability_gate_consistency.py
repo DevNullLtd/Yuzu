@@ -107,6 +107,7 @@ FRAGMENT_FILES = [
     "server/core/src/capability_decls/plugin_action_catalogue_privacy_permissions.hpp",
     "server/core/src/capability_decls/plugin_action_catalogue_system_hardening.hpp",
     "server/core/src/capability_decls/plugin_action_catalogue_pkg_inventory.hpp",
+    "server/core/src/capability_decls/plugin_action_catalogue_mgmt_posture.hpp",
 ]
 # 4 + 5 + 45 + 55 + 34 + 42 + 2 + 3 + 4 — see command_capability.hpp's fragment
 # doc comments and the #1398 design doc's verified row-count audit. The 2 is
@@ -164,7 +165,9 @@ FRAGMENT_FILES = [
 # local_security_policy's `sudoers` action (+1, Medium risk tier) on top of that 228: the total is
 # 229, re-derived by running parse_fragment_gate_rows over FRAGMENT_FILES, not by adding to a
 # baseline.
-EXPECTED_TOTAL_ROWS = 229
+# mgmt_posture (posture, +1) on top of that 229: the total is 230, re-derived by running
+# parse_fragment_gate_rows over FRAGMENT_FILES, not by adding to a baseline.
+EXPECTED_TOTAL_ROWS = 230
 
 # Decision 1 (#1398 design doc): the ONLY prefixes a content-declared pair
 # with no catalogue row may carry — server-side handlers with no
