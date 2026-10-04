@@ -559,7 +559,7 @@ agent_test_exe = executable(
     'unit/test_asset_tags_parsers.cpp',   # #232: pure cap/escape/apply_sync/snapshot helpers (asset_tags_parsers.hpp)
     'unit/test_asset_tags_store.cpp',   # #232: atomic state-file lifecycle (asset_tags_store.hpp), TempDir-based
     'unit/test_asset_tags_actions.cpp',   # #232: real asset_tags dylib/.so/.dll via LocalDispatcher, unguarded on every OS
-    'unit/test_asset_tags_sync_lock.cpp', # #232: TU-inclusion seam over asset_tags_plugin.cpp -- sync writes under g_mu (POSIX body, empty TU on Windows)
+    'unit/test_asset_tags_sync_lock.cpp', # #232: TU-inclusion seam over asset_tags_plugin.cpp -- sync writes under g_mu (a condition-variable seam, no per-OS body, runs on every OS)
     'unit/test_system_hardening_parsers.cpp',            # Wave 8 PR8.1-b: pure state mappers + errno classifier over REAL CAPTURE fixtures
     'unit/test_system_hardening_win_parsers.cpp',        # Wave 8 PR8.1-b: pure mitigation-registry decoder over the-rig REAL CAPTURE fixtures
     'unit/test_system_hardening_local_dispatcher.cpp',   # Wave 8 PR8.1-b: real system_hardening dylib/.so/.dll via LocalDispatcher, unguarded on every OS
@@ -903,12 +903,25 @@ endif
 # shards run 3-wide by `meson test`:
 # 29.9 / 30.8 / 32.0s, against 92.6s for the old single-spec run of the same
 # binary. Windows startup cost, and what concurrent shards cost each other under
-# CI's smaller pools, were not measured.
+# CI's smaller pools, were not measured. (All counts and times in this paragraph predate the
+# 2026-10-04 re-balance below.)
 # The carve uses only tags with >=25 cases (hand-pruned from a simulated-annealing
 # fit that used tiny tags and was 1-3% tighter): A is guarded by [ack],[actions],
 # [browser_policy],[drain],[execution_artifacts],[guard],[runtime]; B by [agent],
-# [liveness],[mechanism],[trigger_engine]. Re-balance by moving a tag between the
-# two variables below, never by hand-editing a spec string.
+# [liveness],[mechanism],[trigger_engine] plus the tags the 2026-10-04 re-balance below added.
+# agent_shard_a_tags / agent_shard_b_tags below are authoritative. Re-balance by moving a tag
+# between the two variables, never by hand-editing a spec string.
+#
+# RE-BALANCE 2026-10-04: [log_handoff] and [posix_actions] moved from C to B. Shard C alone was
+# the macOS "Test" step (~100s of case time against ~53s and ~10s for A and B once B's own fixed
+# waits were gone); both tags move whole ([log_handoff] has 29 cases and [posix_actions] 37 on
+# macOS; [posix_actions] has fewer on Windows, where its real-tool cases are not compiled). The
+# before/after case-sums are in the message of commit d19658f2e, not here, because they rot.
+# TO REGENERATE: run yuzu_agent_tests with YUZU_TEST_PROGRESS=1 YUZU_TEST_PROGRESS_FILE=<f>
+# (the `[progress] ... END <case> <ms>` lines, tests/unit/test_progress_listener.cpp; CI
+# uploads meson-logs/progress.log with a RED run's artifact), take each case's tags from
+# `yuzu_agent_tests --list-tests -r xml '~[.]~[tsan-heavy]~[flaky-4086]'`, place it by the
+# partition rule above, and sum per shard. Count is not time: use the sums, not the counts.
 #
 # The real-DISM cases ([actions][windows_optional_features] in
 # test_windows_optional_features_local_dispatcher.cpp ~157-237) stay in ONE shard
@@ -927,7 +940,8 @@ endif
 # fails loudly (the old single entry matched zero cases and exited 2). Measured on
 # build-linux's yuzu_agent_tests at HEAD 79344ceae, 2026-10-01, `<shard spec>
 # '[nonexistent_zzz]' --list-tests --allow-running-no-tests`: A lists 319 cases, B
-# 437, C 0; appending '[spark]' to A still lists all 539 of A's cases (the
+# 437 (B's count and last OR term changed in the 2026-10-04 re-balance; A's did
+# not), C 0; appending '[spark]' to A still lists all 539 of A's cases (the
 # reference set has 704 [spark] cases). So `--test-args '[tag]'` is exact
 # only for shard C. For a targeted run call the binary directly,
 # `build-*/tests/yuzu_agent_tests '[tag]'` (docs/build-guide.md, "Direct binary
@@ -960,7 +974,7 @@ endif
 # shard spec does not end with it, so edit both together (an edit to only one is caught).
 agent_shard_suffix = '~[.]~[tsan-heavy]~[flaky-4086]'
 agent_shard_a_tags = ['ack', 'actions', 'browser_policy', 'drain', 'execution_artifacts', 'guard', 'runtime']
-agent_shard_b_tags = ['agent', 'liveness', 'mechanism', 'trigger_engine']
+agent_shard_b_tags = ['agent', 'liveness', 'mechanism', 'trigger_engine', 'log_handoff', 'posix_actions']
 _agent_a_terms = []
 _agent_a_excl = ''
 foreach t : agent_shard_a_tags
