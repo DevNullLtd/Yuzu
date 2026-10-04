@@ -1937,13 +1937,11 @@ TEST_CASE("collector: skip_reason names the cause of each skip and clears on suc
         CHECK_FALSE(src.collect().has_value());
         CHECK(src.skip_reason() == "pkg_inventory.packages:partial");
     }
-    SECTION("no rows at all") {
+    SECTION("the anchor emits no rows") {
+        // The anchor adapter fails an empty listing ("an empty parse is a plugin
+        // hiccup, not everything uninstalled"), before the merged no-rows check.
         g_fake[0].out["list_inventory"] = "";
-        g_fake[1].out["managers"] = supported_status("managers") + "\n";
-        g_fake[1].out["packages"] = supported_status("packages") + "\n";
-        g_fake[2].out["list"] =
-            yuzu::wof::format_unsupported_row("list", "macos:dism:unsupported") + "\n";
         CHECK_FALSE(src.collect().has_value());
-        CHECK(src.skip_reason() == "installed_software:no_rows");
+        CHECK(src.skip_reason() == "installed_apps.list_inventory:no inv rows");
     }
 }
