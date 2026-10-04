@@ -2822,6 +2822,9 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         bool route_unreadable = false;
         std::size_t denied_quarantined_count = 0;
         std::size_t unknown_plugin_count = 0;
+        // #5294: mirrors unknown_plugin_count for the per-OS kill-switch filter.
+        std::size_t kill_switched_os_count = 0;
+        bool os_gate_unreadable = false;
         std::optional<std::string> scope_parse_error;
         try {
             // #2500: NAME the broadcast rather than expressing it as "both
@@ -2855,6 +2858,8 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             route_unreadable = dispatch_outcome.route_unreadable;
             denied_quarantined_count = dispatch_outcome.denied_quarantined_count;
             unknown_plugin_count = dispatch_outcome.unknown_plugin_count;
+            kill_switched_os_count = dispatch_outcome.kill_switched_os_count;
+            os_gate_unreadable = dispatch_outcome.os_gate_unreadable;
             scope_parse_error = dispatch_outcome.scope_parse_error;
         } catch (const std::exception& e) {
             spdlog::error("instruction dispatch failed: {}", e.what());
@@ -2973,6 +2978,21 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                          {"meta", {{"api_version", "v1"}}}})
                         .dump(),
                     "application/json");
+            } else if (os_gate_unreadable) {
+                // #5294: agent presence could not be read while a per-OS kill
+                // switch is OFF -- a transient fail-closed refusal.
+                res.set_content(
+                    nlohmann::json(
+                        {{"error", {{"code", 503},
+                                   {"message", "agent presence could not be read while a "
+                                               "per-OS kill switch is set — dispatch is "
+                                               "failing closed and reaching no agent"},
+                                   {"reason", "os_gate_unreadable"},
+                                   {"retry_after_ms", 5000},
+                                   {"correlation_id", detail::ensure_correlation_id(res)}}},
+                         {"meta", {{"api_version", "v1"}}}})
+                        .dump(),
+                    "application/json");
             } else if (denied_quarantined_count > 0) {
                 res.set_content(
                     nlohmann::json(
@@ -2993,6 +3013,21 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                                                "reported inventory — dispatch was withheld, not "
                                                "attempted"},
                                    {"reason", "plugin_not_found"},
+                                   {"retry_after_ms", nullptr},
+                                   {"correlation_id", detail::ensure_correlation_id(res)}}},
+                         {"meta", {{"api_version", "v1"}}}})
+                        .dump(),
+                    "application/json");
+            } else if (kill_switched_os_count > 0) {
+                // #5294: every reachable target runs an OS whose per-OS kill
+                // switch is OFF -- withheld, not an empty fleet.
+                res.set_content(
+                    nlohmann::json(
+                        {{"error", {{"code", 503},
+                                   {"message", "every target runs an OS for which this plugin "
+                                               "action is switched off — dispatch was withheld, "
+                                               "not attempted"},
+                                   {"reason", "kill_switched_os"},
                                    {"retry_after_ms", nullptr},
                                    {"correlation_id", detail::ensure_correlation_id(res)}}},
                          {"meta", {{"api_version", "v1"}}}})
