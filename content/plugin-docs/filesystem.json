@@ -189,16 +189,16 @@
       ],
       "legs": {
         "linux": {
-          "fallback": "stat()-only basic owner/group/permission bits; no ACL/ACE enumeration",
-          "mechanism": "posix_stat",
+          "fallback": "",
+          "mechanism": "posix_stat+getxattr(system.posix_acl_*)",
           "rung": "1",
-          "support": "constrained"
+          "support": "supported"
         },
         "macos": {
-          "fallback": "stat()-only basic owner/group/permission bits; no ACL/ACE enumeration",
-          "mechanism": "posix_stat",
+          "fallback": "",
+          "mechanism": "posix_stat+acl_get_file(ACL_TYPE_EXTENDED)",
           "rung": "1",
-          "support": "constrained"
+          "support": "supported"
         },
         "windows": {
           "fallback": "",
@@ -422,9 +422,9 @@
   "caveats": [
     "**`executeRoles` in the YAML is advisory, not enforced.** Since #1398, raw dispatch authorizes on the compiled `(plugin,action)` pair's securable/operation plus its `ExecuteGate` — `permissions.executeRoles` in `InstructionDefinition` YAML is retired to documentation only (`changelog.d/1398-dispatch-approval-gate.security.md`). Do not treat the Roles row above as an access-control guarantee; the real gate is the Security row.",
     "**`delete_lines`'s output field names don't match its own YAML.** The plugin emits `lines_deleted|total_lines_before|total_lines_after` (`filesystem_plugin.cpp:1997-1999`), but `content/definitions/t2_capabilities.yaml:571-576` declares `lines_deleted`/`lines_before`/`lines_after` — a genuine drift between the shipped result and its own schema. This README's Outputs table uses the runtime field names; `t2_capabilities.yaml` is out of this PR's ownership scope, so the mismatch is flagged here rather than silently \"corrected\" in either direction.",
-    "**`filesystem` and `filesystem_posture` are two different plugins with confusingly similar names.** `filesystem_posture` (`changelog.d/wave6-pr61b-filesystem-posture.added.md`) is a separate, read-only plugin for `mounts`/`quotas`/`snapshots`; two of its test files (`test_filesystem_posture_local_dispatcher.cpp`, `test_filesystem_posture_parsers.cpp`) sit alongside this plugin's own tests in `tests/unit/` and are easy to mistake for filesystem's own coverage. They are not — see *Source and tests*.",
-    "**No test loads the real built plugin through `LocalDispatcher`.** Unlike `filesystem_posture`'s dispatcher test, `test_filesystem_actions.cpp` and `test_filesystem_read.cpp` both replicate the plugin's helper logic (`validate_path`, `glob_match`, `atomic_write_file`, etc.) in the test TU's own anonymous namespace rather than linking or loading `filesystem.dylib`/`.so`/`.dll` (`tests/unit/test_filesystem_actions.cpp:12-13`, `tests/unit/test_filesystem_read.cpp:5-6`) — a regression in the real `.cpp` that the replica doesn't share would not be caught by these suites.",
-    "**macOS/Linux `get_signature`/`get_version_info`'s TOCTOU re-check is a narrowing, not a fix.** The BR-006 comments in the code say so explicitly: an unprivileged writer inside `base_dir` can still win a race between the re-validate call and codesign's/plutil's own `open()`, because both are path-based external tools (`filesystem_plugin.cpp:1206-1223`, `:1469-1483`). `base_dir` must not be writable by lower-privileged principals."
+    "**The tests beside this plugin are easy to misread as coverage of the real plugin.** `filesystem_posture` is a separate, read-only plugin for `mounts`/`quotas`/`snapshots` with a confusingly similar name; two of its test files (`test_filesystem_posture_local_dispatcher.cpp`, `test_filesystem_posture_parsers.cpp`) sit alongside this plugin's own tests in `tests/unit/` and are not filesystem's own coverage — see *Source and tests*. Of this plugin's own tests, none loads the real built plugin through `LocalDispatcher`: `test_filesystem_actions.cpp` and `test_filesystem_read.cpp` replicate the plugin's helper logic (`validate_path`, `glob_match`, `atomic_write_file`, etc.) in the test TU's own anonymous namespace rather than linking or loading `filesystem.dylib`/`.so`/`.dll` (`tests/unit/test_filesystem_actions.cpp:12-13`, `tests/unit/test_filesystem_read.cpp:5-6`), so a regression in the real `.cpp` that the replica doesn't share would not be caught by them.",
+    "**macOS/Linux `get_signature`/`get_version_info`'s TOCTOU re-check is a narrowing, not a fix.** The BR-006 comments in the code say so explicitly: an unprivileged writer inside `base_dir` can still win a race between the re-validate call and codesign's/plutil's own `open()`, because both are path-based external tools (`filesystem_plugin.cpp:1206-1223`, `:1469-1483`). `base_dir` must not be writable by lower-privileged principals.",
+    "**`get_acl` decodes what the OS reports and no more.** Object ACEs (`allow_object`/`deny_object`) do not normally occur on file objects; they are decoded by layout only. Conditional ACE expressions (`allow_conditional`/`deny_conditional`) are not decoded: the SID and mask are real, the condition blob is ignored. The SACL is not read (it needs `SeSecurityPrivilege`). `acl|unsupported` means the filesystem cannot carry an ACL, not that none is set. A `GetAce` or `getxattr` failure ends the command with a single error row, so a partial ACL is never reported as complete. On macOS, names resolve through membership lookups the OS performs inside `acl_to_text`; an unresolved principal is reported by its UUID, and a real macOS ACL lists a deny entry before an allow entry."
   ],
   "definitions": [
     {
@@ -793,7 +793,7 @@
     }
   ],
   "description": "Filesystem operations — exists, list_dir, file_hash, search_dir, text ops (admin-only)",
-  "how_it_works": "Every action funnels its `path`/`root`/`directory` parameter through `validate_path` or `validate_path_or_parent`, which resolve symlinks via `fs::canonical` and, when `base_dir` is set, refuse anything that resolves outside it (`filesystem_plugin.cpp:101-184`). Reads never touch the target; the four write actions (`replace`, `write_content` on an existing file, `delete_lines`) go through `atomic_write_file` — write to a same-directory temp file, then rename (`filesystem_plugin.cpp:391-415`) — while `append`, `create_temp`, `create_temp_dir`, and a fresh `write_content` open the target directly. `file_hash`/`find_by_hash` hash in-process via BCrypt on Windows (`compute_hash_win`, `filesystem_plugin.cpp:188-245`) and by exec'ing an absolute-path `sha256sum`/`sha1sum`/`shasum` through the bounded subprocess runner on POSIX, never a shell (`compute_hash_unix`, `filesystem_plugin.cpp:249-316`). `get_signature`/`get_version_info` are Windows/macOS-only: native `WinVerifyTrust`/`GetFileVersionInfoW` calls on Windows (`filesystem_plugin.cpp:1154-1206`, `:1389-1453`), `/usr/bin/codesign`/`/usr/bin/plutil` exec'd through the same runner on macOS, each preceded by a BR-006 immediate re-validate-before-exec check that narrows (but does not eliminate) a TOCTOU window (`filesystem_plugin.cpp:1206-1223`, `:1463-1483`); both report an honest unsupported/`not_available` result on Linux (`filesystem_plugin.cpp:1262-1265`, `:1550-1553`). `search_dir`/`search`/`replace` share a ReDoS guard that rejects nested-quantifier regexes (`has_nested_quantifiers`, `filesystem_plugin.cpp:322-345`); `search_dir`'s glob mode uses a hand-rolled matcher (`glob_match`, `filesystem_plugin.cpp:349-387`).\n\nThe plugin deliberately never calls a typed result-status setter — no `set_result_status`/`yuzu_ctx_set_result_status` call exists anywhere in `filesystem_plugin.cpp` — so every action's outcome is carried entirely in its pipe-delimited rows and return code; see *Result status* below. It also deliberately stops at line-range deletion and ACL *reads*: there is no whole-file delete, no rename, and no ACL/DACL *write* action anywhere in the action list.",
+  "how_it_works": "Every action funnels its `path`/`root`/`directory` parameter through `validate_path` or `validate_path_or_parent`, which resolve symlinks via `fs::canonical` and, when `base_dir` is set, refuse anything that resolves outside it (`filesystem_plugin.cpp:101-184`). Reads never touch the target; the four write actions (`replace`, `write_content` on an existing file, `delete_lines`) go through `atomic_write_file` — write to a same-directory temp file, then rename (`filesystem_plugin.cpp:391-415`) — while `append`, `create_temp`, `create_temp_dir`, and a fresh `write_content` open the target directly. `file_hash`/`find_by_hash` hash in-process via BCrypt on Windows (`compute_hash_win`, `filesystem_plugin.cpp:188-245`) and by exec'ing an absolute-path `sha256sum`/`sha1sum`/`shasum` through the bounded subprocess runner on POSIX, never a shell (`compute_hash_unix`, `filesystem_plugin.cpp:249-316`). `get_signature`/`get_version_info` are Windows/macOS-only: native `WinVerifyTrust`/`GetFileVersionInfoW` calls on Windows (`filesystem_plugin.cpp:1154-1206`, `:1389-1453`), `/usr/bin/codesign`/`/usr/bin/plutil` exec'd through the same runner on macOS, each preceded by a BR-006 immediate re-validate-before-exec check that narrows (but does not eliminate) a TOCTOU window (`filesystem_plugin.cpp:1206-1223`, `:1463-1483`); both report an honest unsupported/`not_available` result on Linux (`filesystem_plugin.cpp:1262-1265`, `:1550-1553`). `search_dir`/`search`/`replace` share a ReDoS guard that rejects nested-quantifier regexes (`has_nested_quantifiers`, `filesystem_plugin.cpp:322-345`); `search_dir`'s glob mode uses a hand-rolled matcher (`glob_match`, `filesystem_plugin.cpp:349-387`).\n\n`get_acl` reads the extended ACL with a different native call per OS, then prints the same `ace|<type>|<principal>|<perms>|<flags>` row shape. Windows calls `GetNamedSecurityInfoW` for `OWNER|DACL`, emits the SDDL string and the DACL control flags, and walks the ACEs with `GetAce`, resolving each SID with `LookupAccountSidW` (falling back to the string SID). Linux reads the `system.posix_acl_access` attribute and, for a directory, `system.posix_acl_default` with `getxattr` (glibc, no libacl), decoding the binary value in the pure `filesystem_acl_parsers.hpp`; user and group ids are resolved with `getpwuid_r`/`getgrgid_r`. macOS calls `acl_get_file(ACL_TYPE_EXTENDED)` and parses the text from `acl_to_text`; a file with no extended ACL returns `ENOENT`, reported as `acl|none|-`. On Linux and macOS the whole ACL is acquired before any row is written, so a failure is one `error|` row and never a partial listing.\n\nThe plugin deliberately never calls a typed result-status setter — no `set_result_status`/`yuzu_ctx_set_result_status` call exists anywhere in `filesystem_plugin.cpp` — so every action's outcome is carried entirely in its pipe-delimited rows and return code; see *Result status* below. It also deliberately stops at line-range deletion and ACL *reads* (see the `get_acl` paragraph above): there is no whole-file delete, no rename, and no ACL/DACL *write* action anywhere in the action list.",
   "inputs": [
     {
       "constraints": {
@@ -1601,7 +1601,7 @@
     "gathered": true,
     "mutating": true
   },
-  "leg_hash": "4db605b6c689",
+  "leg_hash": "c8a3100adc66",
   "manifest_version": 1,
   "name": "filesystem",
   "outputs": [
@@ -1890,25 +1890,36 @@
           "values": null
         },
         {
-          "description": "Windows-only. One access-control-entry row's effect; the plugin emits one ace row per DACL entry.\n",
+          "description": "One access-control-entry row's kind; the plugin emits one ace row per entry on every OS. Windows - allow, deny, allow_conditional, deny_conditional, allow_object, deny_object, other (any other ACE type). macOS - allow or deny. Linux - user, group, mask or other (the POSIX ACL tag).",
           "example": "allow",
           "name": "ace_type",
           "platforms": [
-            "windows"
+            "windows",
+            "linux",
+            "darwin"
           ],
           "type": "string",
           "values": [
             "allow",
             "deny",
-            "other"
+            "allow_conditional",
+            "deny_conditional",
+            "allow_object",
+            "deny_object",
+            "other",
+            "user",
+            "group",
+            "mask"
           ]
         },
         {
-          "description": "Windows-only. The DOMAIN\\account the ACE names, or the SID string when the account cannot be resolved. Values: free text.",
+          "description": "The principal: DOMAIN\\account or SID on Windows; user:<name>, group:<name>, user:#<id> or user:<UUID> (unresolved) on macOS; the qualifier name or numeric id, or - for the owner/owning-group/mask/other entries on Linux. Values: free text.",
           "example": "NT AUTHORITY\\SYSTEM",
           "name": "account",
           "platforms": [
-            "windows"
+            "windows",
+            "linux",
+            "darwin"
           ],
           "type": "string",
           "values": null
@@ -1966,6 +1977,84 @@
           ],
           "type": "string",
           "values": null
+        },
+        {
+          "description": "POSIX-only. The ACE's permissions: r/w/x triple on Linux, comma-separated ACL permission names on macOS (- when none). Values: free text.",
+          "example": "r-x",
+          "name": "ace_perms",
+          "platforms": [
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "The ACE's flags, comma-joined, or - when none. Windows - object_inherit, container_inherit, no_propagate, inherit_only, inherited. macOS - inherited, file_inherit, directory_inherit, limit_inherit, only_inherit. Linux - default for an entry of the directory default ACL.",
+          "example": "-",
+          "name": "ace_flags",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": [
+            "object_inherit",
+            "container_inherit",
+            "no_propagate",
+            "inherit_only",
+            "inherited",
+            "file_inherit",
+            "directory_inherit",
+            "limit_inherit",
+            "only_inherit",
+            "default",
+            "-"
+          ]
+        },
+        {
+          "description": "POSIX-only. Whether the path carries an extended ACL: none, extended, or unsupported (the filesystem cannot carry an ACL, not that none is set). Single-value row.",
+          "example": "extended",
+          "name": "acl",
+          "platforms": [
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": [
+            "none",
+            "extended",
+            "unsupported"
+          ]
+        },
+        {
+          "description": "macOS-only. ACL-level flags, comma-joined, or - when none. Single-value field of the acl row.",
+          "example": "-",
+          "name": "acl_flags",
+          "platforms": [
+            "darwin"
+          ],
+          "type": "string",
+          "values": [
+            "no_inherit",
+            "defer_inherit",
+            "-"
+          ]
+        },
+        {
+          "description": "Windows-only. DACL control flags from the security descriptor, comma-joined, or - when none. Single-value row.",
+          "example": "protected",
+          "name": "control",
+          "platforms": [
+            "windows"
+          ],
+          "type": "string",
+          "values": [
+            "protected",
+            "auto_inherited",
+            "-"
+          ]
         }
       ],
       "definition_id": "device.filesystem.get_acl"
@@ -2440,7 +2529,7 @@
       "definition_id": "workflow.version_compliance_check"
     }
   ],
-  "outputs_note": "Every action writes pipe-delimited `key|value` lines via `ctx.write_output()`. A *repeating* row (`list_dir`'s entries, Windows `get_acl`'s ACEs, `search`/`search_dir`/`find_by_hash`'s matches, `read`'s lines) is prefixed with a literal discriminator word naming the row's kind, then its fields; a single-value field is its own `key|value` line with no discriminator. There is no shared placeholder row for \"found nothing\" — a zero-hit action reports only its trailing count (`total_matches|0`, `matches_found|0`) with no rows above it. Failure is always a single `error|<message>` line plus a non-zero return code, never a placeholder success row (see *Result status*).",
+  "outputs_note": "Every action writes pipe-delimited `key|value` lines via `ctx.write_output()`. A *repeating* row (`list_dir`'s entries, `get_acl`'s ACEs (every OS), `search`/`search_dir`/`find_by_hash`'s matches, `read`'s lines) is prefixed with a literal discriminator word naming the row's kind, then its fields; a single-value field is its own `key|value` line with no discriminator. There is no shared placeholder row for \"found nothing\" — a zero-hit action reports only its trailing count (`total_matches|0`, `matches_found|0`) with no rows above it. Failure is always a single `error|<message>` line plus a non-zero return code, never a placeholder success row (see *Result status*). For `get_acl` the `ace` row is repeating on every OS (`ace|<type>|<principal>|<access>|<flags>`, `-` for an empty field); `acl|<none|extended|unsupported>|<acl flags or ->` (Linux, macOS) and `control|<flags or ->` (Windows) are single-value rows.",
   "platforms": {
     "linux": "supported",
     "macos": "supported",
@@ -2488,7 +2577,7 @@
           "rows": [
             "exists|true",
             "type|file",
-            "size|172"
+            "size|177"
           ],
           "truncated": false
         },
@@ -2524,9 +2613,9 @@
           },
           "row_count": 3,
           "rows": [
-            "hash|60aae00e788a173131b105d5694045ac736b668be86396d4991d1dbe3d70ef38",
+            "hash|5ed49ae76ca451e9f063a9b28d11f6e8784a851e983664cb495206b75453c412",
             "algorithm|sha256",
-            "size|172"
+            "size|177"
           ],
           "truncated": false
         },
@@ -2542,7 +2631,7 @@
           },
           "row_count": 2,
           "rows": [
-            "path|/tmp/yuzu-UPhb03.tmp",
+            "path|/tmp/yuzu-GqGF5B.tmp",
             "persist|true"
           ],
           "truncated": false
@@ -2559,7 +2648,7 @@
           },
           "row_count": 2,
           "rows": [
-            "path|/tmp/yuzu-7OcS9w",
+            "path|/tmp/yuzu-CtDWtd",
             "persist|true"
           ],
           "truncated": false
@@ -2587,19 +2676,20 @@
         {
           "action": "get_acl",
           "not_captured": null,
-          "params": "path=/etc/hosts",
+          "params": "path=/tmp/yuzu_test_acl/f",
           "rc": 0,
           "result_status": {
             "completeness": "UNKNOWN",
             "provenance": "",
             "status": "UNDECLARED"
           },
-          "row_count": 4,
+          "row_count": 11,
           "rows": [
             "owner|root",
             "group|root",
-            "permissions|rw-r--r--",
-            "mode|0644"
+            "permissions|rw-rwxr--",
+            "mode|0674",
+            "acl|extended|-"
           ],
           "truncated": false
         },
@@ -2622,16 +2712,17 @@
         {
           "action": "find_by_hash",
           "not_captured": null,
-          "params": "directory=/etc sha256=c7dd0e2ed261ce76d76f852596c5b54026b9a894fa481381ffd399b556c0e2da",
+          "params": "directory=/etc sha256=5ed49ae76ca451e9f063a9b28d11f6e8784a851e983664cb495206b75453c412",
           "rc": 0,
           "result_status": {
             "completeness": "UNKNOWN",
             "provenance": "",
             "status": "UNDECLARED"
           },
-          "row_count": 1,
+          "row_count": 2,
           "rows": [
-            "matches_found|0"
+            "match|/etc/hosts|177",
+            "matches_found|1"
           ],
           "truncated": false
         },
@@ -2688,7 +2779,7 @@
         {
           "action": "replace",
           "not_captured": null,
-          "params": "path=/tmp/yuzu_capture/yuzu_capture_tmp.txt search=yuzu-capture replace=yuzu-replaced",
+          "params": "path=/tmp/yuzu_capture_vySwPCm6/yuzu_capture_tmp.txt search=yuzu-capture replace=yuzu-replaced",
           "rc": 0,
           "result_status": {
             "completeness": "UNKNOWN",
@@ -2698,15 +2789,15 @@
           "row_count": 3,
           "rows": [
             "replacements_made|2",
-            "file_size_before|40",
-            "file_size_after|16"
+            "file_size_before|37",
+            "file_size_after|13"
           ],
           "truncated": false
         },
         {
           "action": "write_content",
           "not_captured": null,
-          "params": "path=/tmp/yuzu_capture/yuzu_capture_tmp.txt content=\"yuzu-capture written\" overwrite=true",
+          "params": "path=/tmp/yuzu_capture_vySwPCm6/yuzu_capture_tmp.txt content=\"yuzu-capture written\" overwrite=true",
           "rc": 0,
           "result_status": {
             "completeness": "UNKNOWN",
@@ -2717,14 +2808,14 @@
           "rows": [
             "status|ok",
             "bytes_written|20",
-            "path|/tmp/yuzu_capture/yuzu_capture_tmp.txt"
+            "path|/tmp/yuzu_capture_vySwPCm6/yuzu_capture_tmp.txt"
           ],
           "truncated": false
         },
         {
           "action": "append",
           "not_captured": null,
-          "params": "path=/tmp/yuzu_capture/yuzu_capture_tmp.txt content=\"yuzu-capture appended\"",
+          "params": "path=/tmp/yuzu_capture_vySwPCm6/yuzu_capture_tmp.txt content=\"yuzu-capture appended\"",
           "rc": 0,
           "result_status": {
             "completeness": "UNKNOWN",
@@ -2734,15 +2825,15 @@
           "row_count": 3,
           "rows": [
             "status|ok",
-            "bytes_appended|21",
-            "total_size|40"
+            "bytes_appended|22",
+            "total_size|20"
           ],
           "truncated": false
         },
         {
           "action": "delete_lines",
           "not_captured": null,
-          "params": "path=/tmp/yuzu_capture/yuzu_capture_tmp.txt start_line=1 end_line=1",
+          "params": "path=/tmp/yuzu_capture_vySwPCm6/yuzu_capture_tmp.txt start_line=1 end_line=1",
           "rc": 0,
           "result_status": {
             "completeness": "UNKNOWN",
@@ -2759,9 +2850,9 @@
         }
       ],
       "stamp": {
-        "date": "2026-09-07",
+        "date": "2026-10-04",
         "host_class": "container",
-        "leg_hash": "4db605b6c689",
+        "leg_hash": "c8a3100adc66",
         "os": "linux",
         "os_version": "Debian GNU/Linux 13 (trixie) aarch64",
         "privilege": "euid 0"
@@ -2837,7 +2928,7 @@
           },
           "row_count": 2,
           "rows": [
-            "path|/var/folders/hq/lc3t_rsx2blfc8rhys6kzh4r0000gn/T//yuzu-ayE16A.tmp",
+            "path|/var/folders/hq/lc3t_rsx2blfc8rhys6kzh4r0000gn/T//yuzu-oqRhjd.tmp",
             "persist|true"
           ],
           "truncated": false
@@ -2854,7 +2945,7 @@
           },
           "row_count": 2,
           "rows": [
-            "path|/var/folders/hq/lc3t_rsx2blfc8rhys6kzh4r0000gn/T//yuzu-R7qEuY",
+            "path|/var/folders/hq/lc3t_rsx2blfc8rhys6kzh4r0000gn/T//yuzu-sPr64l",
             "persist|true"
           ],
           "truncated": false
@@ -2882,19 +2973,20 @@
         {
           "action": "get_acl",
           "not_captured": null,
-          "params": "path=/etc/hosts",
+          "params": "path=/tmp/yuzu_test_acl_Rw0R2f/acl_file",
           "rc": 0,
           "result_status": {
             "completeness": "UNKNOWN",
             "provenance": "",
             "status": "UNDECLARED"
           },
-          "row_count": 4,
+          "row_count": 7,
           "rows": [
-            "owner|root",
+            "owner|jsmith",
             "group|wheel",
             "permissions|rw-r--r--",
-            "mode|0644"
+            "mode|0644",
+            "acl|extended|-"
           ],
           "truncated": false
         },
@@ -2985,7 +3077,7 @@
         {
           "action": "replace",
           "not_captured": null,
-          "params": "path=/var/folders/hq/lc3t_rsx2blfc8rhys6kzh4r0000gn/T/yuzu_capture_8s9wf1vr/yuzu_capture_tmp.txt search=yuzu-capture replace=yuzu-replaced",
+          "params": "path=/var/folders/hq/lc3t_rsx2blfc8rhys6kzh4r0000gn/T//yuzu_capture_MaI1z1B3/yuzu_capture_tmp.txt search=yuzu-capture replace=yuzu-replaced",
           "rc": 0,
           "result_status": {
             "completeness": "UNKNOWN",
@@ -2995,15 +3087,15 @@
           "row_count": 3,
           "rows": [
             "replacements_made|2",
-            "file_size_before|40",
-            "file_size_after|16"
+            "file_size_before|37",
+            "file_size_after|13"
           ],
           "truncated": false
         },
         {
           "action": "write_content",
           "not_captured": null,
-          "params": "path=/var/folders/hq/lc3t_rsx2blfc8rhys6kzh4r0000gn/T/yuzu_capture_8s9wf1vr/yuzu_capture_tmp.txt content=\"yuzu-capture written\" overwrite=true",
+          "params": "path=/var/folders/hq/lc3t_rsx2blfc8rhys6kzh4r0000gn/T//yuzu_capture_MaI1z1B3/yuzu_capture_tmp.txt content=\"yuzu-capture written\" overwrite=true",
           "rc": 0,
           "result_status": {
             "completeness": "UNKNOWN",
@@ -3014,14 +3106,14 @@
           "rows": [
             "status|ok",
             "bytes_written|20",
-            "path|/private/var/folders/hq/lc3t_rsx2blfc8rhys6kzh4r0000gn/T/yuzu_capture_8s9wf1vr/yuzu_capture_tmp.txt"
+            "path|/private/var/folders/hq/lc3t_rsx2blfc8rhys6kzh4r0000gn/T/yuzu_capture_MaI1z1B3/yuzu_capture_tmp.txt"
           ],
           "truncated": false
         },
         {
           "action": "append",
           "not_captured": null,
-          "params": "path=/var/folders/hq/lc3t_rsx2blfc8rhys6kzh4r0000gn/T/yuzu_capture_8s9wf1vr/yuzu_capture_tmp.txt content=\"yuzu-capture appended\"",
+          "params": "path=/var/folders/hq/lc3t_rsx2blfc8rhys6kzh4r0000gn/T//yuzu_capture_MaI1z1B3/yuzu_capture_tmp.txt content=\"yuzu-capture appended\"",
           "rc": 0,
           "result_status": {
             "completeness": "UNKNOWN",
@@ -3039,7 +3131,7 @@
         {
           "action": "delete_lines",
           "not_captured": null,
-          "params": "path=/var/folders/hq/lc3t_rsx2blfc8rhys6kzh4r0000gn/T/yuzu_capture_8s9wf1vr/yuzu_capture_tmp.txt start_line=1 end_line=1",
+          "params": "path=/var/folders/hq/lc3t_rsx2blfc8rhys6kzh4r0000gn/T//yuzu_capture_MaI1z1B3/yuzu_capture_tmp.txt start_line=1 end_line=1",
           "rc": 0,
           "result_status": {
             "completeness": "UNKNOWN",
@@ -3056,9 +3148,9 @@
         }
       ],
       "stamp": {
-        "date": "2026-09-07",
+        "date": "2026-10-04",
         "host_class": "bare-metal",
-        "leg_hash": "4db605b6c689",
+        "leg_hash": "c8a3100adc66",
         "os": "macos",
         "os_version": "macOS 26.6.2 arm64",
         "privilege": "euid 501 (jsmith)"
@@ -3080,7 +3172,7 @@
           "rows": [
             "exists|true",
             "type|file",
-            "size|1432"
+            "size|1405"
           ],
           "truncated": false
         },
@@ -3096,7 +3188,7 @@
           },
           "row_count": 6,
           "rows": [
-            "entry|hosts|file|1432",
+            "entry|hosts|file|1405",
             "entry|hosts.ics|file|444",
             "entry|lmhosts.sam|file|3683",
             "entry|networks|file|407",
@@ -3116,9 +3208,9 @@
           },
           "row_count": 3,
           "rows": [
-            "hash|904287aa347ca8218ad8b694c173b038ff2faf684e94deeb6094ce4b43e40d35",
+            "hash|9321feab332edbba521c7ea3eb978d9844cb4f62a4730dab9cf60fb79649037d",
             "algorithm|sha256",
-            "size|1432"
+            "size|1405"
           ],
           "truncated": false
         },
@@ -3134,7 +3226,7 @@
           },
           "row_count": 2,
           "rows": [
-            "path|D:\\yuzu-dev\\tmp\\yuzu-14298277ed7220950c97d6a97a2e8180.tmp",
+            "path|C:\\WINDOWS\\TEMP\\yuzu-391d5e4c88ea2e641a93b5dd96849117.tmp",
             "persist|true"
           ],
           "truncated": false
@@ -3151,7 +3243,7 @@
           },
           "row_count": 2,
           "rows": [
-            "path|D:\\yuzu-dev\\tmp\\yuzu-2342ff50ffda6cdc156dbde1418407c0",
+            "path|C:\\WINDOWS\\TEMP\\yuzu-41a05a87a8d5aae48423ac53334d0429",
             "persist|true"
           ],
           "truncated": false
@@ -3179,20 +3271,18 @@
         {
           "action": "get_acl",
           "not_captured": null,
-          "params": "path=C:\\Windows\\System32\\drivers\\etc\\hosts",
+          "params": "path=C:\\WINDOWS\\TEMP\\yuzu_acl_599f97e1\\cond.txt",
           "rc": 0,
           "result_status": {
             "completeness": "UNKNOWN",
             "provenance": "",
             "status": "UNDECLARED"
           },
-          "row_count": 7,
+          "row_count": 3,
           "rows": [
-            "sddl|O:BAD:AI(A;;FA;;;SY)(A;ID;FA;;;SY)(A;ID;FA;;;BA)(A;ID;0x1200a9;;;BU)(A;ID;0x1200a9;;;AC)(A;ID;0x1200a9;;;S-1-15-2-2)",
-            "ace|allow|NT AUTHORITY\\SYSTEM|0x001f01ff",
-            "ace|allow|NT AUTHORITY\\SYSTEM|0x001f01ff",
-            "ace|allow|BUILTIN\\Administrators|0x001f01ff",
-            "ace|allow|BUILTIN\\Users|0x001200a9"
+            "sddl|O:BAD:PAI(XA;;FA;;;WD;(Member_of {SID(BA)}))",
+            "control|protected,auto_inherited",
+            "ace|allow_conditional|\\Everyone|0x001f01ff|-"
           ],
           "truncated": false
         },
@@ -3215,7 +3305,7 @@
         {
           "action": "find_by_hash",
           "not_captured": null,
-          "params": "directory=C:\\Windows\\System32\\drivers\\etc sha256=904287aa347ca8218ad8b694c173b038ff2faf684e94deeb6094ce4b43e40d35",
+          "params": "directory=C:\\Windows\\System32\\drivers\\etc sha256=9321feab332edbba521c7ea3eb978d9844cb4f62a4730dab9cf60fb79649037d",
           "rc": 0,
           "result_status": {
             "completeness": "UNKNOWN",
@@ -3224,7 +3314,7 @@
           },
           "row_count": 2,
           "rows": [
-            "match|C:\\Windows\\System32\\drivers\\etc\\hosts|1432",
+            "match|C:\\Windows\\System32\\drivers\\etc\\hosts|1405",
             "matches_found|1"
           ],
           "truncated": false
@@ -3287,7 +3377,7 @@
         {
           "action": "replace",
           "not_captured": null,
-          "params": "path=C:\\WINDOWS\\TEMP\\yuzu_capture_bs7ucomo\\yuzu_capture_tmp.txt search=yuzu-capture replace=yuzu-replaced",
+          "params": "path=C:\\WINDOWS\\TEMP\\yuzu_capture_599f97e1\\yuzu_capture_tmp.txt search=yuzu-capture replace=yuzu-replaced",
           "rc": 0,
           "result_status": {
             "completeness": "UNKNOWN",
@@ -3296,16 +3386,16 @@
           },
           "row_count": 3,
           "rows": [
-            "replacements_made|2",
-            "file_size_before|42",
-            "file_size_after|18"
+            "replacements_made|1",
+            "file_size_before|24",
+            "file_size_after|12"
           ],
           "truncated": false
         },
         {
           "action": "write_content",
           "not_captured": null,
-          "params": "path=C:\\WINDOWS\\TEMP\\yuzu_capture_bs7ucomo\\yuzu_capture_tmp.txt content=\"yuzu-capture written\" overwrite=true",
+          "params": "path=C:\\WINDOWS\\TEMP\\yuzu_capture_599f97e1\\yuzu_capture_tmp.txt content=\"yuzu-capture written\" overwrite=true",
           "rc": 0,
           "result_status": {
             "completeness": "UNKNOWN",
@@ -3316,14 +3406,14 @@
           "rows": [
             "status|ok",
             "bytes_written|20",
-            "path|C:\\Windows\\Temp\\yuzu_capture_bs7ucomo\\yuzu_capture_tmp.txt"
+            "path|C:\\Windows\\Temp\\yuzu_capture_599f97e1\\yuzu_capture_tmp.txt"
           ],
           "truncated": false
         },
         {
           "action": "append",
           "not_captured": null,
-          "params": "path=C:\\WINDOWS\\TEMP\\yuzu_capture_bs7ucomo\\yuzu_capture_tmp.txt content=\"yuzu-capture appended\"",
+          "params": "path=C:\\WINDOWS\\TEMP\\yuzu_capture_599f97e1\\yuzu_capture_tmp.txt content=\"yuzu-capture appended\"",
           "rc": 0,
           "result_status": {
             "completeness": "UNKNOWN",
@@ -3341,7 +3431,7 @@
         {
           "action": "delete_lines",
           "not_captured": null,
-          "params": "path=C:\\WINDOWS\\TEMP\\yuzu_capture_bs7ucomo\\yuzu_capture_tmp.txt start_line=1 end_line=1",
+          "params": "path=C:\\WINDOWS\\TEMP\\yuzu_capture_599f97e1\\yuzu_capture_tmp.txt start_line=1 end_line=1",
           "rc": 0,
           "result_status": {
             "completeness": "UNKNOWN",
@@ -3358,12 +3448,12 @@
         }
       ],
       "stamp": {
-        "date": "2026-09-07",
+        "date": "2026-10-04",
         "host_class": "bare-metal",
-        "leg_hash": "4db605b6c689",
+        "leg_hash": "c8a3100adc66",
         "os": "windows",
-        "os_version": "Microsoft Windows NT 10.0.26200.0 x64",
-        "privilege": "SYSTEM"
+        "os_version": "Windows 10.0.26200 x86_64",
+        "privilege": "LocalSystem (elevated)"
       }
     }
   },
@@ -3517,18 +3607,22 @@
     "capability_rows": [
       "server/core/src/capability_decls/plugin_action_catalogue_a.hpp"
     ],
-    "changelog": [],
+    "changelog": [
+      "changelog.d/2026-10-04-filesystem-acl.added.md"
+    ],
     "definitions": [
       "content/definitions/filesystem.yaml",
       "content/definitions/t2_capabilities.yaml",
       "content/definitions/t2_chaining_examples.yaml"
     ],
     "plugin": [
+      "agents/plugins/filesystem/src/filesystem_acl_parsers.hpp",
       "agents/plugins/filesystem/src/filesystem_macos_sig.hpp",
       "agents/plugins/filesystem/src/filesystem_plugin.cpp"
     ],
     "privilege_row": true,
     "tests": [
+      "tests/unit/test_filesystem_acl_parsers.cpp",
       "tests/unit/test_filesystem_actions.cpp",
       "tests/unit/test_filesystem_macos_sig.cpp",
       "tests/unit/test_filesystem_posture_local_dispatcher.cpp",
