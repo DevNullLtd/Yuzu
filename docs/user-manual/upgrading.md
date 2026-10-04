@@ -185,6 +185,27 @@ SQL-side 50 MiB payload cap as the response exports, and say so when it cuts.
 - The filtered results-fragment branch, the plain list routes and the internal reads are not bounded
   by this change.
 
+## Behaviour change: numeric query parameters on other routes are parsed strictly too (#4644)
+
+**Breaking for scripts that relied on a malformed value being silently misread.** The strict
+parsing the response routes got (above) now also covers the routes listed in the REST API
+reference under [Numeric Query Parameters](rest-api.md#numeric-query-parameters-4644): the
+execution-statistics routes, the executions lists, the audit routes, the instruction, product-pack,
+workflow and compliance lists, the patch lists, the software-inventory list, the fleet-topology
+`machines_max` and the app-performance compare `window`. A value that is not one whole base-10
+integer now returns `400` where it used to be read as something else: `limit=100abc` (was `100`),
+`since=junk` on the statistics routes (was `0`, "from the beginning"), `?limit=abc` on
+`/api/analytics/recent` and the patch lists (was ignored), `window=7days` (was `7`).
+
+On MCP, `query_audit_log` answers `-32602` for a `since`, `until` or `limit` that is not a JSON
+integer or does not fit a signed 64-bit value (a string used to mean `0`, unbounded, and
+`18446744073709551615` wrapped to `-1`), and the app-performance compare tool does the same for
+`window`. Other integer arguments that do not fit saturate instead of wrapping.
+
+**What to do.** Send whole integers, and omit a parameter to get its default. No configuration or
+data migration is needed. During a rolling upgrade, replicas on the old and new build answer a
+malformed value differently (`200` versus `400`).
+
 ## Operator note: the software-inventory store migration (v7) is a hard cutover (#5172)
 
 Schema v7 of the software-inventory store adds `package_id` and `source` columns and a row id to

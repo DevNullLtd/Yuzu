@@ -253,10 +253,33 @@ std::string param_str(const nlohmann::json& params, const char* key, const char*
     return def;
 }
 
+/// Lenient integer read: a present-but-wrong-type value yields `def` (callers that
+/// must reject it use `param_int_strict` below). The one thing this must NOT do is
+/// alias a value to a DIFFERENT, valid-looking one: nlohmann reports
+/// `is_number_integer()` for its UNSIGNED variant too, and `get<int64_t>()` wraps a
+/// value above INT64_MAX to a negative number (UINT64_MAX becomes -1, the documented
+/// "any" sentinel on several filters). An out-of-range unsigned value therefore
+/// SATURATES to INT64_MAX (it stays "huge", never flips sign) rather than wrapping
+/// (#4644 Gate 7). Filters where even a saturated value would answer the wrong
+/// question use `param_int_strict` and answer -32602 instead.
 int64_t param_int(const nlohmann::json& params, const char* key, int64_t def = 0) {
-    if (params.contains(key) && params[key].is_number_integer())
+    if (params.contains(key) && params[key].is_number_integer()) {
+        if (params[key].is_number_unsigned() &&
+            params[key].get<uint64_t>() > static_cast<uint64_t>(std::numeric_limits<int64_t>::max()))
+            return std::numeric_limits<int64_t>::max();
         return params[key].get<int64_t>();
+    }
     return def;
+}
+
+/// int64 -> int by SATURATING, never wrapping: `static_cast<int>(4294967296)` is 0,
+/// which a store reads as "use the default" (or a one-row page), not "a very large
+/// number". Saturating keeps the ordering the caller expressed; each caller's own
+/// clamp or store ceiling then applies to INT_MAX exactly as it would to any large
+/// value (#4644 Gate 7).
+[[nodiscard]] int saturate_to_int(int64_t v) {
+    return static_cast<int>(std::clamp<int64_t>(v, std::numeric_limits<int>::min(),
+                                                std::numeric_limits<int>::max()));
 }
 
 /// #2970B: `param_int` SILENTLY substitutes `def` when the key is present but
@@ -332,7 +355,7 @@ std::optional<std::string> param_string_strict(const nlohmann::json& params, con
 }
 
 int param_int32(const nlohmann::json& params, const char* key, int def = 0) {
-    return static_cast<int>(param_int(params, key, def));
+    return saturate_to_int(param_int(params, key, def));
 }
 
 /// Caller-supplied id as it may appear in an audit `detail` (CWE-117): capped at
@@ -8295,8 +8318,24 @@ McpServer::HandlerFn McpServer::build_handler(
                 aq.principal = param_str(args, "principal");
                 aq.action = param_str(args, "action");
                 aq.target_type = param_str(args, "target_type");
-                aq.since = param_int(args, "since");
-                aq.until = param_int(args, "until");
+                // #4644 Gate 7: the lenient reader turned a wrong-typed bound into 0
+                // ("unbounded") and, before it saturated, wrapped UINT64_MAX to -1, so a
+                // malformed window silently meant "the whole log". Strict: -32602.
+                const auto since_opt = param_int_strict(args, "since", 0);
+                const auto until_opt = param_int_strict(args, "until", 0);
+                const auto audit_limit_opt = param_int_strict(args, "limit", 50);
+                if (!since_opt || !until_opt || !audit_limit_opt) {
+                    // retry-hint-exempt: malformed client input (wrong JSON type or
+                    // out of signed 64-bit range), not a store fault -- resending the
+                    // same value fails identically.
+                    res.set_content(error_response(id, kInvalidParams,
+                                                   "since, until and limit must each be a JSON "
+                                                   "integer that fits in a signed 64-bit value"),
+                                    "application/json");
+                    return;
+                }
+                aq.since = *since_opt;
+                aq.until = *until_opt;
                 // Clamp BOTH bounds, in 64-bit BEFORE narrowing — the
                 // query_responses idiom (`:3660`). Upper alone left a
                 // negative or zero `limit` reaching `AuditStore::query`,
@@ -8307,8 +8346,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 // never reads false-empty. `param_int32`'s int64->int32 cast
                 // also wraps a limit above INT_MAX negative before `std::min`
                 // ever saw it; clamping the raw int64 first avoids that.
-                aq.limit = static_cast<int>(
-                    std::clamp<std::int64_t>(param_int(args, "limit", 50), 1, 500));
+                aq.limit = static_cast<int>(std::clamp<std::int64_t>(*audit_limit_opt, 1, 500));
                 // ADR-0040: degrade-distinguishable read — nullopt on a
                 // store/pool failure. Surface an error, never a false-empty
                 // result (an audit blip must not read as "no activity").
@@ -8374,7 +8412,7 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
-                iq.limit = static_cast<int>(*limit_opt);
+                iq.limit = saturate_to_int(*limit_opt);
                 auto defs_result = instruction_store->query_definitions(iq);
                 if (!defs_result) {
                     res.set_content(
@@ -8523,7 +8561,7 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
-                q.limit = static_cast<int>(*limit_opt);
+                q.limit = saturate_to_int(*limit_opt);
                 auto packs_result = product_pack_store->list(q);
                 if (!packs_result) {
                     // product_pack_error_status classifies a genuine DB/lease
@@ -16593,8 +16631,21 @@ McpServer::HandlerFn McpServer::build_handler(
                 // param_int reads as int64 (no std::out_of_range throw on an
                 // out-of-int32 client value, unlike .get<int>(); gov L2); clamp in
                 // 64-bit BEFORE narrowing.
-                const int window = static_cast<int>(std::clamp<std::int64_t>(
-                    param_int(args, "window", 7), 1, AppPerfDailyStore::kRetentionDays));
+                // Strict: a wrong-typed window used to fall back to 7 days, answering a
+                // different comparison than asked (#4644 Gate 7).
+                const auto window_opt = param_int_strict(args, "window", 7);
+                if (!window_opt) {
+                    // retry-hint-exempt: malformed client input, not a store fault --
+                    // resending the same value fails identically.
+                    res.set_content(
+                        error_response(id, kInvalidParams,
+                                       "window must be a JSON integer that fits in a signed "
+                                       "64-bit value"),
+                        "application/json");
+                    return;
+                }
+                const int window = static_cast<int>(
+                    std::clamp<std::int64_t>(*window_opt, 1, AppPerfDailyStore::kRetentionDays));
 
                 VerifyCompareQuery vq{group, app, baseline, candidate, window};
                 auto result = verify_api->compare(vq);
@@ -21132,7 +21183,7 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
-                q.limit = static_cast<int>(*limit_opt);
+                q.limit = saturate_to_int(*limit_opt);
                 if (q.limit > 1000)
                     q.limit = 1000;
                 auto stats = execution_tracker->get_agent_statistics(q);
@@ -21214,7 +21265,7 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
-                q.limit = static_cast<int>(*limit_opt);
+                q.limit = saturate_to_int(*limit_opt);
                 if (q.limit > 1000)
                     q.limit = 1000;
                 auto stats = execution_tracker->get_definition_statistics(q);
@@ -21656,7 +21707,7 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
-                const int batch_size = static_cast<int>(*batch_size_opt);
+                const int batch_size = saturate_to_int(*batch_size_opt);
                 // Gate 8 fix (#2146 Batch B5 review): same #2970B-class type
                 // confusion as batch_size two lines above, but fail-OPEN here
                 // - {"enabled":"false"} (a JSON string) silently created an
@@ -21886,7 +21937,7 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
-                const int limit = std::clamp(static_cast<int>(*limit_opt), 1, 1000);
+                const int limit = std::clamp(saturate_to_int(*limit_opt), 1, 1000);
                 // Shared builder (offload_target_model.hpp) - the REST twin
                 // GET /api/v1/offload-targets/{id}/deliveries calls the SAME
                 // function (docs/api-twin-recipe.md §1 Rule 1).

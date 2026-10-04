@@ -400,6 +400,15 @@ TEST_CASE("REST visualization: multi-chart definition (#587)",
     CHECK(body0["data"]["chart_index"] == 0);
     CHECK(body0["data"]["chart_count"] == 2);
 
+    // #4644 Gate 7: `index=1abc` was read as 1 (the bar chart); it is a 400 now.
+    for (const char* bad : {"index=1abc", "index=1e0", "index=0x1", "index="}) {
+        INFO(bad);
+        auto r = h.sink.Get(std::string("/api/v1/executions/cmd-multi/visualization?definition_id="
+                                        "def-multi&") + bad);
+        REQUIRE(r);
+        CHECK(r->status == 400);
+    }
+
     // index=1 returns the bar
     auto res1 =
         h.sink.Get("/api/v1/executions/cmd-multi/visualization?definition_id=def-multi&index=1");

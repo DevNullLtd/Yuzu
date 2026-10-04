@@ -2,6 +2,7 @@
 
 #include "dispatch_target_shape.hpp" // kBroadcastScope (#2500)
 #include "access_review_model.hpp" // Periodic Access Reviews (SOC 2 CC6.2) — pure read-model
+#include "query_int_parse.hpp" // strict_stoi/strict_stoll (#4644 Gate 7)
 #include "access_review_store.hpp" // Periodic Access Reviews — campaign persistence
 #include "approval_model.hpp" // #2146 A2-R4: shared approval-row JSON builder (REST v1 + MCP)
 #include "pg_error_class.hpp" // is_permanent_pg_error — approval store error classification (PR #4656)
@@ -7409,7 +7410,7 @@ void RestApiV1::register_routes(
                            req.get_param_value("enabled_only") == "1");
         if (req.has_param("limit")) {
             try {
-                q.limit = std::stoi(req.get_param_value("limit"));
+                q.limit = strict_stoi(req.get_param_value("limit"));
             } catch (const std::exception&) {
                 res.status = 400;
                 res.set_content(detail::a4_error(res, "invalid numeric query parameter"),
@@ -7513,7 +7514,7 @@ void RestApiV1::register_routes(
             q.name_filter = req.get_param_value("name");
         if (req.has_param("limit")) {
             try {
-                q.limit = std::stoi(req.get_param_value("limit"));
+                q.limit = strict_stoi(req.get_param_value("limit"));
             } catch (const std::exception&) {
                 res.status = 400;
                 res.set_content(detail::a4_error(res, "invalid numeric query parameter"),
@@ -8068,8 +8069,15 @@ void RestApiV1::register_routes(
                  auto limit_str = req.get_param_value("limit");
                  if (!limit_str.empty()) {
                      try {
-                         q.limit = std::stoi(limit_str);
-                     } catch (...) {}
+                         q.limit = strict_stoi(limit_str);
+                     } catch (const std::exception&) {
+                         // Not ONE base-10 integer (or overflow): a client error, not a
+                         // silent fall-back to the default page size (#4644 Gate 7).
+                         res.status = 400;
+                         res.set_content(detail::a4_error(res, "invalid numeric query parameter"),
+                                         "application/json");
+                         return;
+                     }
                  }
                  if (q.limit > 1000)
                      q.limit = 1000;
@@ -9066,7 +9074,7 @@ void RestApiV1::register_routes(
                  std::int64_t want = 100;
                  if (req.has_param("limit")) {
                      try {
-                         want = std::stoll(req.get_param_value("limit"));
+                         want = strict_stoll(req.get_param_value("limit"));
                      } catch (...) {
                          res.status = 400;
                          res.set_content(
@@ -9379,14 +9387,20 @@ void RestApiV1::register_routes(
                  ExecutionStatsQuery q;
                  if (req.has_param("agent_id"))
                      q.agent_id = req.get_param_value("agent_id");
-                 if (req.has_param("since"))
-                     try {
-                         q.since = std::stoll(req.get_param_value("since"));
-                     } catch (...) {}
-                 if (req.has_param("limit"))
-                     try {
-                         q.limit = std::stoi(req.get_param_value("limit"));
-                     } catch (...) {}
+                 // #4644 Gate 7: a malformed `since`/`limit` used to be swallowed into the
+                 // default (`?since=junk` meant "from the beginning"), answering a different
+                 // query than the caller asked. Not ONE base-10 integer -> 400.
+                 try {
+                     if (req.has_param("since"))
+                         q.since = strict_stoll(req.get_param_value("since"));
+                     if (req.has_param("limit"))
+                         q.limit = strict_stoi(req.get_param_value("limit"));
+                 } catch (const std::exception&) {
+                     res.status = 400;
+                     res.set_content(detail::a4_error(res, "invalid numeric query parameter"),
+                                     "application/json");
+                     return;
+                 }
                  if (q.limit > 1000)
                      q.limit = 1000;
                  auto stats = execution_tracker->get_agent_statistics(q);
@@ -9406,14 +9420,20 @@ void RestApiV1::register_routes(
                  ExecutionStatsQuery q;
                  if (req.has_param("definition_id"))
                      q.definition_id = req.get_param_value("definition_id");
-                 if (req.has_param("since"))
-                     try {
-                         q.since = std::stoll(req.get_param_value("since"));
-                     } catch (...) {}
-                 if (req.has_param("limit"))
-                     try {
-                         q.limit = std::stoi(req.get_param_value("limit"));
-                     } catch (...) {}
+                 // #4644 Gate 7: a malformed `since`/`limit` used to be swallowed into the
+                 // default (`?since=junk` meant "from the beginning"), answering a different
+                 // query than the caller asked. Not ONE base-10 integer -> 400.
+                 try {
+                     if (req.has_param("since"))
+                         q.since = strict_stoll(req.get_param_value("since"));
+                     if (req.has_param("limit"))
+                         q.limit = strict_stoi(req.get_param_value("limit"));
+                 } catch (const std::exception&) {
+                     res.status = 400;
+                     res.set_content(detail::a4_error(res, "invalid numeric query parameter"),
+                                     "application/json");
+                     return;
+                 }
                  if (q.limit > 1000)
                      q.limit = 1000;
                  auto stats = execution_tracker->get_definition_statistics(q);
@@ -9475,7 +9495,7 @@ void RestApiV1::register_routes(
                 q.status = req.get_param_value("status");
             try {
                 if (req.has_param("limit"))
-                    q.limit = std::stoi(req.get_param_value("limit"));
+                    q.limit = strict_stoi(req.get_param_value("limit"));
             } catch (const std::exception&) {
                 res.status = 400;
                 res.set_content(detail::a4_error(res, "invalid numeric query parameter"),
@@ -10931,7 +10951,7 @@ void RestApiV1::register_routes(
             int chart_index = 0;
             if (req.has_param("index")) {
                 try {
-                    chart_index = std::stoi(req.get_param_value("index"));
+                    chart_index = strict_stoi(req.get_param_value("index"));
                 } catch (...) {
                     res.status = 400;
                     res.set_content(detail::a4_error(res, "index must be a non-negative integer"),
@@ -16766,11 +16786,18 @@ void RestApiV1::register_routes(
             }
             int window = 7; // days each side
             if (req.has_param("window")) {
-                char* end = nullptr;
-                const std::string w = req.get_param_value("window");
-                const long v = std::strtol(w.c_str(), &end, 10);
-                if (end != w.c_str() && *end == '\0')
-                    window = static_cast<int>(v);
+                // A malformed `window` used to fall back to 7 silently, answering a
+                // different comparison than asked (#4644 Gate 7).
+                const auto v = parse_query_int<int>(req.get_param_value("window"));
+                if (!v) {
+                    res.status = 400;
+                    res.set_content(detail::error_json_a4(
+                                        400, "window must be an integer number of days", cid,
+                                        "pass window as a base-10 integer, or omit it for 7"),
+                                    "application/json");
+                    return;
+                }
+                window = *v;
             }
             window = std::clamp(window, 1, AppPerfDailyStore::kRetentionDays);
 

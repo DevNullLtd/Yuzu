@@ -2,6 +2,7 @@
 
 #include "analytics_event_store.hpp"
 #include "audit_store.hpp"
+#include "query_int_parse.hpp" // strict_stoi/strict_stoll (#4644 Gate 7)
 #include "data_export.hpp"
 #include "http_route_sink.hpp"
 #include "json_extract.hpp" // extract_json_string — shared JSON body-extraction helper
@@ -110,13 +111,13 @@ void register_dashboard_api_routes(HttpRouteSink& sink, Deps deps) {
             q.target_id = req.get_param_value("target_id");
         try {
             if (req.has_param("since"))
-                q.since = std::stoll(req.get_param_value("since"));
+                q.since = strict_stoll(req.get_param_value("since"));
             if (req.has_param("until"))
-                q.until = std::stoll(req.get_param_value("until"));
+                q.until = strict_stoll(req.get_param_value("until"));
             if (req.has_param("limit"))
-                q.limit = std::stoi(req.get_param_value("limit"));
+                q.limit = strict_stoi(req.get_param_value("limit"));
             if (req.has_param("offset"))
-                q.offset = std::stoi(req.get_param_value("offset"));
+                q.offset = strict_stoi(req.get_param_value("offset"));
         } catch (const std::exception&) {
             res.status = 400;
             res.set_content(
@@ -267,11 +268,20 @@ void register_dashboard_api_routes(HttpRouteSink& sink, Deps deps) {
             int limit = 50;
             if (req.has_param("limit")) {
                 try {
-                    limit = std::stoi(req.get_param_value("limit"));
-                } catch (...) {}
+                    limit = strict_stoi(req.get_param_value("limit"));
+                } catch (const std::exception&) {
+                    // A value that is not ONE base-10 integer is a client error: it
+                    // used to be silently ignored (or truncated at the first
+                    // non-digit), which answered a different question than asked.
+                    res.status = 400;
+                    res.set_content(
+                        R"({"error":{"code":400,"message":"invalid numeric query parameter"},"meta":{"api_version":"v1"}})",
+                        "application/json");
+                    return;
+                }
             }
-            // A non-positive limit isn't a client-error worth a 400 (this
-            // route has always silently ignored a malformed value), but
+            // A non-positive limit isn't a client-error worth a 400 (a
+            // well-formed integer is never rejected here), but
             // unlike SQLite's LIMIT -1 = "unlimited" idiom the old store
             // relied on, Postgres's LIMIT REJECTS a negative bind
             // outright — which query_recent() below can only report as

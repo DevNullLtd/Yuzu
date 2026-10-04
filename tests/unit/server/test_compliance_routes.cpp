@@ -539,3 +539,25 @@ TEST_CASE("GET /api/v1/compliance/{id}: audit succeeds -> 200 with the per-agent
             saw_success = true;
     CHECK(saw_success);
 }
+
+// #4644 Gate 7: the policy-fragment and policy list routes read `limit` strictly.
+TEST_CASE("GET /api/v1/policy-fragments and /policies: a trailing-garbage or overflowing limit "
+          "is a 400, not its numeric prefix",
+          "[pg][compliance][rest]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, policy_store_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    PolicyStore store{pool};
+    ComplianceHarness h{&store};
+    for (const char* route : {"/api/v1/policy-fragments", "/api/v1/policies",
+                              "/api/policy-fragments", "/api/policies"}) {
+        for (const char* bad : {"limit=100abc", "limit=1e3", "limit=0x10", "limit=", "limit=99999999999999999999"}) {
+            INFO(route << "?" << bad);
+            auto res = h.sink.Get(std::string(route) + "?" + bad);
+            REQUIRE(res);
+            CHECK(res->status == 400);
+        }
+        auto ok = h.sink.Get(std::string(route) + "?limit=10");
+        REQUIRE(ok);
+        CHECK(ok->status == 200);
+    }
+}

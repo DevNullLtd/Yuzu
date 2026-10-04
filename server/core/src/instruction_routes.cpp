@@ -2,6 +2,7 @@
 
 #include "http_route_sink.hpp"
 #include "instruction_store.hpp"
+#include "query_int_parse.hpp" // strict_stoi/strict_stoll (#4644 Gate 7)
 #include "instruction_yaml.hpp"
 #include "json_extract.hpp"
 #include "store_errors.hpp"
@@ -50,7 +51,7 @@ void register_instruction_routes(HttpRouteSink& sink, Deps deps) {
             q.enabled_only = true;
         try {
             if (req.has_param("limit"))
-                q.limit = std::stoi(req.get_param_value("limit"));
+                q.limit = strict_stoi(req.get_param_value("limit"));
         } catch (const std::exception&) {
             res.status = 400;
             res.set_content(

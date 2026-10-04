@@ -3556,6 +3556,21 @@ TEST_CASE("REST dex/perf/compare: param + degrade + paired-compute paths",
         REQUIRE(res);
         CHECK(res->status == 400);
     }
+    SECTION("#4644 Gate 7: a malformed window → 400, not the 7-day default") {
+        RestGsHarness h;
+        for (const char* bad : {"window=7days", "window=1e1", "window=0x7", "window=", "window=abc",
+                                "window=4294967296"}) {
+            INFO(bad);
+            auto res = h.sink.Get(std::string("/api/v1/dex/perf/compare?app=AcmeVPN.exe&group=g1"
+                                              "&baseline=4.2.0.0&candidate=4.3.0.0&") + bad);
+            REQUIRE(res);
+            CHECK(res->status == 400);
+        }
+        auto ok = h.sink.Get("/api/v1/dex/perf/compare?app=AcmeVPN.exe&group=g1"
+                             "&baseline=4.2.0.0&candidate=4.3.0.0&window=30");
+        REQUIRE(ok);
+        CHECK(ok->status != 400);
+    }
     SECTION("provider absent → 503") {
         RestGsHarness h(true, true, /*wire_app_perf=*/false);
         auto res = h.sink.Get(

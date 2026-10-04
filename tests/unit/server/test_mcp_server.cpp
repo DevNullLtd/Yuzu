@@ -9898,6 +9898,22 @@ TEST_CASE("MCP compare_app_perf_versions: cohort-paired before/after (evidential
         REQUIRE(body.contains("error"));
         CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
     }
+    SECTION("#4644 Gate 7: a wrong-typed or oversized window is kInvalidParams, not 7 days") {
+        for (const char* window : {R"("7")", "1.5", "true", "18446744073709551615",
+                                   "9223372036854775808"}) {
+            INFO(window);
+            auto res = ts.call(
+                std::string(R"({"jsonrpc":"2.0","method":"tools/call","id":92,"params":{"name":"compare_app_perf_versions","arguments":{"app":"AcmeVPN.exe","group":"g1","baseline":"4.2.0.0","candidate":"4.3.0.0","window":)") +
+                window + "}}}");
+            auto body = nlohmann::json::parse(res->body);
+            REQUIRE(body.contains("error"));
+            CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+        }
+        // An in-range window (clamped to the retention) still works.
+        auto ok = ts.call(
+            R"({"jsonrpc":"2.0","method":"tools/call","id":94,"params":{"name":"compare_app_perf_versions","arguments":{"app":"AcmeVPN.exe","group":"g1","baseline":"4.2.0.0","candidate":"4.3.0.0","window":30}}})");
+        CHECK(nlohmann::json::parse(ok->body).contains("result"));
+    }
 }
 
 // ── CRITICAL finding, this branch's own governance review (PR #3156, while
@@ -32603,4 +32619,78 @@ TEST_CASE("MCP B5: software-deployment mutations are tier-denied below supervise
         R"("params":{"name":"list_software_deployments","arguments":{}}})");
     REQUIRE(list_res);
     CHECK(list_res->status == 403);
+}
+
+// ── #4644 Gate 7: MCP integer handling never wraps a value into a different one ──
+
+TEST_CASE("MCP query_audit_log: a wrong-typed or out-of-range since/until/limit is -32602, "
+          "never a wrapped or defaulted value",
+          "[pg][mcp][integration][audit]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_audit_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    AuditStore store(pool);
+    REQUIRE(store.is_open());
+
+    McpTestServer ts;
+    ts.audit_store_for_test = &store;
+    ts.start("readonly");
+    auto call = [&](const std::string& args) {
+        auto res = ts.call(
+            R"({"jsonrpc":"2.0","method":"tools/call","id":77,"params":{"name":"query_audit_log","arguments":)" +
+            args + "}}");
+        REQUIRE(res);
+        return nlohmann::json::parse(res->body);
+    };
+    // The lenient reader turned each of these into a DIFFERENT valid-looking window:
+    // a string became 0 ("unbounded"), and UINT64_MAX wrapped to -1.
+    for (const char* bad : {R"({"since":"1700000000"})", R"({"since":1.5})", R"({"until":"x"})",
+                            R"({"since":18446744073709551615})",
+                            R"({"until":18446744073709551615})",
+                            R"({"since":9223372036854775808})", R"({"limit":"50"})",
+                            R"({"limit":18446744073709551615})"}) {
+        INFO(bad);
+        auto body = call(bad);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    }
+    // Omitted and well-formed values (including 0 = unbounded and the int64 maximum) still work.
+    for (const char* ok : {R"({})", R"({"since":0,"until":0,"limit":10})",
+                           R"({"since":9223372036854775807})"}) {
+        INFO(ok);
+        auto body = call(ok);
+        CHECK(body.contains("result"));
+    }
+}
+
+TEST_CASE("MCP get_execution_statistics_by_agent: a limit above INT_MAX saturates instead of "
+          "wrapping to the 50-row default",
+          "[pg][mcp][integration][operator_surface]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
+
+    auto now = operator_surface_now();
+    auto e1 = b3_make_exec("def-wrap", "succeeded", 60, 60, 0, now - 300, now - 290);
+    auto id1 = tracker.create_execution(e1);
+    REQUIRE(id1.has_value());
+    for (int i = 0; i < 60; ++i)
+        b3_insert_agent_status(tracker, *id1, "agent-wrap-" + std::to_string(i), "success", 0,
+                               now - 300, now - 290);
+
+    McpTestServer ts;
+    ts.execution_tracker_for_test = &tracker;
+    ts.start();
+    auto rows_for = [&](const std::string& limit_literal) -> std::size_t {
+        auto res = ts.call(
+            R"({"jsonrpc":"2.0","method":"tools/call","id":5,"params":{"name":)"
+            R"("get_execution_statistics_by_agent","arguments":{"limit":)" +
+            limit_literal + "}}}");
+        REQUIRE(res);
+        auto payload = operator_surface_payload(res);
+        REQUIRE(payload["data"].is_array());
+        return payload["data"].size();
+    };
+    // static_cast<int>(4294967296) is 0, which the tracker reads as "default page (50)".
+    // Saturated, it is a very large limit that the route's own 1000 ceiling then applies to.
+    CHECK(rows_for("4294967296") == 60);
+    CHECK(rows_for("10") == 10);
 }

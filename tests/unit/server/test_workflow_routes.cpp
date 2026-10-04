@@ -5054,3 +5054,21 @@ TEST_CASE("GET /api/v1/schedules: an unrecognized enabled_only value answers 400
     REQUIRE(res);
     CHECK(res->status == 400);
 }
+
+// #4644 Gate 7: the workflow list routes read `limit` strictly.
+TEST_CASE("GET /api/workflows and /api/v1/workflows: a trailing-garbage or overflowing limit is "
+          "a 400, not its numeric prefix",
+          "[pg][workflow][list]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool, /*with_bus=*/true, /*budget=*/nullptr, /*wire_exec_visible=*/true,
+                  /*with_workflow_engine=*/true);
+    for (const char* route : {"/api/workflows", "/api/v1/workflows"}) {
+        for (const char* bad : {"limit=100abc", "limit=1e3", "limit=0x10", "limit=4294967296"}) {
+            INFO(route << "?" << bad);
+            auto res = h.sink.Get(std::string(route) + "?" + bad);
+            REQUIRE(res);
+            CHECK(res->status == 400);
+        }
+    }
+}

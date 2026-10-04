@@ -737,3 +737,55 @@ TEST_CASE("GET /api/v1/executions/:id/children: fleet_read_fn denial -> 403",
     REQUIRE(res);
     CHECK(res->status == 403);
 }
+
+// ── #4644 Gate 7: the execution-statistics routes and the v1 executions list read
+// `since`/`limit` strictly. A malformed value used to be swallowed into the default
+// (`?since=junk` meant "from the beginning"), answering a different query than asked.
+
+TEST_CASE("GET /api/v1/execution-statistics/{agents,definitions}: a malformed since or limit is "
+          "a 400, not the default; a clean value still works (#4644)",
+          "[pg][rest][executions][v1][statistics]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, execv1_responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecV1Harness h(pool);
+    h.make_exec_with_agents("def-stats-strict");
+
+    const std::string route = GENERATE(as<std::string>{}, "/api/v1/execution-statistics/agents",
+                                       "/api/v1/execution-statistics/definitions");
+    const std::string bad = GENERATE(as<std::string>{}, "since=junk", "since=1e9", "since=100abc",
+                                     "since=", "since=99999999999999999999", "limit=100abc",
+                                     "limit=1e3", "limit=", "limit=4294967296");
+    INFO(route << "?" << bad);
+    auto res = h.sink.Get(route + "?" + bad);
+    REQUIRE(res);
+    CHECK(res->status == 400);
+    CHECK(nlohmann::json::parse(res->body)["error"]["message"] == "invalid numeric query parameter");
+
+    const std::string good = GENERATE(as<std::string>{}, "since=0", "since=007", "limit=10",
+                                      "since=1700000000&limit=5");
+    INFO(route << "?" << good);
+    auto ok = h.sink.Get(route + "?" + good);
+    REQUIRE(ok);
+    CHECK(ok->status == 200);
+}
+
+TEST_CASE("GET /api/v1/executions: a trailing-garbage limit is a 400, not the numeric prefix "
+          "(#4644)",
+          "[pg][rest][executions][v1]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, execv1_responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecV1Harness h(pool);
+    h.make_exec_with_agents("def-list-strict");
+
+    for (const char* bad : {"limit=100abc", "limit=1e3", "limit=0x10", "limit=", "limit=4294967296"}) {
+        INFO(bad);
+        auto res = h.sink.Get(std::string("/api/v1/executions?") + bad);
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        CHECK(nlohmann::json::parse(res->body)["error"]["message"] ==
+              "invalid numeric query parameter");
+    }
+    auto ok = h.sink.Get("/api/v1/executions?limit=10");
+    REQUIRE(ok);
+    CHECK(ok->status == 200);
+}

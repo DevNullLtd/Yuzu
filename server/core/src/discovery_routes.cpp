@@ -2,6 +2,7 @@
 
 #include "enrollment_directory_model.hpp" // #4031: shared row builders, REST/MCP parity (Rule 1)
 #include "http_route_sink.hpp"
+#include "query_int_parse.hpp" // strict_stoi/strict_stoll (#4644 Gate 7)
 
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
@@ -315,8 +316,13 @@ void DiscoveryRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermF
                 try {
                     auto limit_str = req.get_param_value("limit");
                     if (!limit_str.empty())
-                        q.limit = std::stoi(limit_str);
-                } catch (...) {
+                        q.limit = strict_stoi(limit_str);
+                } catch (const std::exception&) {
+                    res.status = 400;
+                    res.set_content(
+                        R"({"error":{"code":400,"message":"invalid numeric query parameter"},"meta":{"api_version":"v1"}})",
+                        "application/json");
+                    return;
                 }
 
                 auto status_filter = q.status.empty() ? "missing" : q.status;
@@ -512,8 +518,13 @@ void DiscoveryRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermF
                 try {
                     auto limit_str = req.get_param_value("limit");
                     if (!limit_str.empty())
-                        limit = std::stoi(limit_str);
-                } catch (...) {
+                        limit = strict_stoi(limit_str);
+                } catch (const std::exception&) {
+                    res.status = 400;
+                    res.set_content(
+                        R"({"error":{"code":400,"message":"invalid numeric query parameter"},"meta":{"api_version":"v1"}})",
+                        "application/json");
+                    return;
                 }
 
                 auto deployments = patch_manager->list_deployments(limit);

@@ -776,6 +776,16 @@ Tools accept parameters via the `arguments` object in the `tools/call` request.
 Required parameters are validated server-side; missing required fields return a
 `-32602 Invalid params` error.
 
+**Integer arguments never wrap into a different value (#4644).** A JSON integer above
+`9223372036854775807` (nlohmann reports it as an unsigned integer) used to wrap to a negative
+number, and `18446744073709551615` became `-1`, the "any" sentinel on several filters.
+`query_audit_log`'s `since`, `until` and `limit` and the app-performance compare tool's `window`
+now answer `-32602` for a value that is not a JSON integer or does not fit a signed 64-bit value
+(a string used to mean `0`, that is unbounded, for `since`/`until`). Elsewhere an integer that
+does not fit saturates (`9223372036854775807`, or the `int` range where a tool narrows to `int`)
+instead of wrapping, so an oversized `limit` reaches that tool's own ceiling instead of becoming
+`0` or the default page.
+
 For **approval-gated tools**, arguments are additionally validated against the
 tool's published `inputSchema` (from `tools/list`) *before* any approval-ticket
 work (#2405): a call with missing, mistyped, or out-of-bounds arguments (per

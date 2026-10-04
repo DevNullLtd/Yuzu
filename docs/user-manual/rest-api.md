@@ -237,6 +237,42 @@ The R2 A4 completion (2026-07) routed the RBAC/tier denial gates (`require_admin
 
 ---
 
+## Numeric Query Parameters (#4644)
+
+A numeric query parameter must be **one complete base-10 integer**, on the routes that read it
+this way, or the route answers `400` with the A4 message `invalid numeric query parameter` (the
+two `GET /api/v1/` routes that name the parameter in their message, `window` and the
+`software` inventory `limit`, keep that wording). They were read by `std::stoi`/`std::stoll`, which
+stop at the first non-digit, so `?limit=100abc` was read as `100`, `?since=1e9` as `1` and
+`?since=junk` was swallowed into the default ("from the beginning"): a malformed filter silently
+answered a different question than the one asked. Rejected now: trailing characters, hex and
+exponent forms, decimals, whitespace, a leading `+` and a value too large for its type (an
+empty value and an overflow were already refused on most of these routes). Zero padding (`007`) is accepted.
+Omitting a parameter still means its default, and each route's existing clamping and sentinel
+values (for example `limit` clamped to a ceiling, `since=0` meaning "no lower bound") are unchanged.
+
+Routes that parse strictly (the response routes are listed in
+[Response Store](#responses) below):
+
+| Family | Routes and parameters |
+|---|---|
+| Execution statistics | `GET /api/v1/execution-statistics/agents` and `/definitions`: `since`, `limit` |
+| Executions | `GET /api/executions`, `GET /api/v1/executions`: `limit`; `GET /api/v1/executions/{id}/visualization`: `index` |
+| Audit | `GET /api/v1/audit`: `limit`; `GET /api/audit`: `since`, `until`, `limit`, `offset`; `GET /api/analytics/recent`: `limit` (a malformed value used to be ignored) |
+| Instructions, product packs, workflows | `GET /api/instructions`, `GET /api/v1/instructions`, `GET /api/v1/product-packs`, `GET /api/product-packs`, `GET /api/workflows`, `GET /api/v1/workflows`: `limit` |
+| Compliance | `GET /api/policy-fragments`, `GET /api/policies`, `GET /api/v1/policy-fragments`, `GET /api/v1/policies`: `limit` |
+| Patches | `GET /api/patches`, `GET /api/patches/deployments`: `limit` (a malformed value used to be ignored) |
+| Inventory | `GET /api/v1/inventory/software`: `limit` (trailing characters were read as their numeric prefix) |
+| Fleet visualization | `GET /api/v1/viz/fleet/topology`: `machines_max` |
+| Verification | the app-performance compare route: `window` (a malformed value used to fall back to 7 days) |
+
+Not covered by this change, and still lenient (the list is not exhaustive): the dashboard
+fragments' own page-size helpers, the notification, webhook and offload delivery list routes, the
+DEX signal list `limit`, the pre-flight run list `limit`, and the live-snapshot `n` attempt
+counter.
+
+---
+
 ## Pre-Auth Request Body Caps (#2407)
 
 Every request is checked against a per-route body-size cap **before authentication runs and before the body is read** — a single pre-routing chokepoint (`server.cpp`) resolves the caller's `(method, path)` against the policy table in `body_cap_policy.hpp` and rejects an oversized or unmeasurable body without buffering it. **The four health-probe paths (`/livez`, `/readyz`, `/health`, `/api/health`) are NOT exempt from this gate** — the cap is a single lambda, `enforce_pre_auth_body_cap` in `server.cpp`'s pre-routing handler, invoked from exactly two sites: once INSIDE the probe branch, before its early return, and once after the on-behalf-of guard and the rate limiter for every other route. One definition, two call sites — so the probes cannot drift out of coverage without deleting a call. `tests/unit/server/test_body_cap_policy.cpp`'s "POST /health … is rejected (D3)" case exercises that DECISION on a real socket, but against a test server that reproduces the gate rather than invoking the production one, so it does not pin the wiring: deleting either call site in `server.cpp` would leave the suite green. Treat the wiring as verified by review, not by test, until that gap is closed. Before this fix the probes' early-return sat above the cap entirely, making them the server's last unauthenticated 100 MiB buffer — closing that was the point. The probes remain exempt from the on-behalf-of guard and the rate limiter that run further below (a header-stamping proxy or orchestrator must not be able to crash-loop the server by tripping either on its own liveness check) — that exemption is unchanged; only the body cap now also reaches them. Three status codes:

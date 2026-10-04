@@ -1460,4 +1460,32 @@ TEST_CASE("AuthRoutes::audit_log: a hostile target_id is neutralised in the pers
     CHECK(body.find('\r') == std::string::npos);
     CHECK(body.find('\n') == std::string::npos);
     CHECK(logs.find("evil\r") == std::string::npos);
+
+// ── #4644 Gate 7: the shared strict integer primitive (query_int_parse.hpp) ──
+
+TEST_CASE("query_int_parse: parse_query_int/strict_stoi/strict_stoll accept exactly one base-10 "
+          "integer",
+          "[response_routes][strict_int]") {
+    using yuzu::server::parse_query_int;
+    using yuzu::server::strict_stoi;
+    using yuzu::server::strict_stoll;
+
+    CHECK(parse_query_int<int>("0") == 0);
+    CHECK(parse_query_int<int>("-1") == -1);
+    CHECK(parse_query_int<int>("007") == 7); // zero padding is not malformed
+    CHECK(parse_query_int<long long>("9223372036854775807") == 9223372036854775807LL);
+    CHECK(strict_stoi("2147483647") == 2147483647);
+    CHECK(strict_stoll("-9223372036854775807") == -9223372036854775807LL);
+
+    for (const char* bad : {"", " 1", "1 ", "+1", "1e3", "0x10", "100abc", "abc", "1.5", "--1",
+                            "4294967296", "-2147483649", "99999999999999999999"}) {
+        INFO("[" << bad << "]");
+        CHECK_FALSE(parse_query_int<int>(bad).has_value());
+        CHECK_THROWS_AS(strict_stoi(bad), std::invalid_argument);
+    }
+    CHECK_FALSE(parse_query_int<long long>("9223372036854775808").has_value());
+    CHECK_THROWS_AS(strict_stoll("100abc"), std::invalid_argument);
+    CHECK_THROWS_AS(strict_stoll(""), std::invalid_argument);
+    // std::stoi would have returned the prefix; that is exactly the bug.
+    CHECK(std::stoi("100abc") == 100);
 }
