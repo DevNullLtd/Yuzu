@@ -908,8 +908,24 @@ endif
 # The carve uses only tags with >=25 cases (hand-pruned from a simulated-annealing
 # fit that used tiny tags and was 1-3% tighter): A is guarded by [ack],[actions],
 # [browser_policy],[drain],[execution_artifacts],[guard],[runtime]; B by [agent],
-# [liveness],[mechanism],[trigger_engine]. Re-balance by moving a tag between the
-# two variables below, never by hand-editing a spec string.
+# [liveness],[mechanism],[trigger_engine],[log_handoff],[posix_actions]. Re-balance by
+# moving a tag between the two variables below, never by hand-editing a spec string.
+#
+# RE-BALANCE 2026-10-04 (case-sum predictions from the per-case progress.log of three
+# 2026-10-03 CI runs, not CI measurements of the new split): the first carve left B light
+# once its own heaviest cases got cheap, and shard C alone was the macOS "Test" step.
+# Shard case-sums in seconds, A/B/C. Before: Linux gcc-15 debug 30.1/29.7/29.4, macOS debug
+# 53.3/30.3/99.7, Windows MSVC debug 65.9/72.9/79.8. Two things changed: the fixed waits
+# in the TriggerEngine tests and in asset_tags' check thread went away (all in B, ~15-25s
+# per leg), and [log_handoff] + [posix_actions] moved from C to B. Predicted after: Linux
+# 30.1/19.4/15.9, macOS 53.3/55.3/54.8, Windows 65.9/65.6/68.2 (Windows-only cases the
+# POSIX binary cannot list carry no tags in this join, so that row is the least certain).
+# Both tags carry >=25 cases and move whole, so their cases keep one another's company.
+# TO REGENERATE: run yuzu_agent_tests with YUZU_TEST_PROGRESS=1 YUZU_TEST_PROGRESS_FILE=<f>
+# (the `[progress] ... END <case> <ms>` lines, tests/unit/test_progress_listener.cpp; CI
+# uploads meson-logs/progress.log with a RED run's artifact), take each case's tags from
+# `yuzu_agent_tests --list-tests -r xml '~[.]~[tsan-heavy]~[flaky-4086]'`, place it by the
+# partition rule above, and sum per shard. Count is not time: use the sums, not the counts.
 #
 # The real-DISM cases ([actions][windows_optional_features] in
 # test_windows_optional_features_local_dispatcher.cpp ~157-237) stay in ONE shard
@@ -961,7 +977,7 @@ endif
 # shard spec does not end with it, so edit both together (an edit to only one is caught).
 agent_shard_suffix = '~[.]~[tsan-heavy]~[flaky-4086]'
 agent_shard_a_tags = ['ack', 'actions', 'browser_policy', 'drain', 'execution_artifacts', 'guard', 'runtime']
-agent_shard_b_tags = ['agent', 'liveness', 'mechanism', 'trigger_engine']
+agent_shard_b_tags = ['agent', 'liveness', 'mechanism', 'trigger_engine', 'log_handoff', 'posix_actions']
 _agent_a_terms = []
 _agent_a_excl = ''
 foreach t : agent_shard_a_tags
