@@ -47,7 +47,7 @@ plugin and action rows read back unchanged, so nothing flips on upgrade.
   build, and never write one from an older binary. After a rollback per-OS OFF rows stay stored
   but are not enforced: if the plugin must stay stopped, set its plugin-level OFF row. Find your
   rows in the `plugin_config.kill_switch.set` audit entries (`target_id`
-  `<plugin>[.<action>]@<os>`) and confirm each with `GET ...?os=` once every replica is back on
+  `<plugin>[.<action>]@<os>`) and confirm each with `GET ...?os=<os>` once every replica is back on
   this build.
 - **Limits.** An agent whose OS is unknown or empty is never withheld. The OS is what the agent
   reports and is matched exactly (`windows`, `linux`, `darwin`). The MCP pre-dispatch dry run cannot
