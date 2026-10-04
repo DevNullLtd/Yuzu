@@ -14,6 +14,10 @@ subprocess or thread.
 | `std::string_view` from `get_view` | per snapshot, loop-local | per agent | end of iteration | non-copying; points into `snap.status_tags`, stable because `mu_` (`std::lock_guard lock(mu_)` at the top of `recompute_metrics`) is held for the whole function |
 | gauge `yuzu_fleet_inventory_sync_skipping{source}` | `MetricsRegistry`, as every sibling gauge | first `.gauge()` call | registry lifetime | fixed label set (`source="installed_software"`); the agent-controlled tag value is parsed and only counted, never a label |
 
+Transfer: none (no resource changes owner). Failure cleanup: not applicable - nothing acquired can leak:
+the only objects are a stack scalar, an immutable function-static string and a borrowed view; no BCrypt
+handle, callback context or thread is created.
+
 Published every sweep, 0 included, so no `clear_gauge_family` is needed. Precedent for an
 always-published-at-0 server-owned count: `yuzu_fleet_tar_db_corruption_agents`.
 

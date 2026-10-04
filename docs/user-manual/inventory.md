@@ -660,7 +660,8 @@ ingest is failing. Four further series sharpen the picture:
   it can stall while `yuzu_inventory_read_degrade_total` stays quiet).
 - `yuzu_fleet_inventory_sync_skipping{source}` (gauge) — agents currently
   heartbeating whose `source` skipped its latest collection cycle(s), from the agent
-  heartbeat tag `yuzu.sync.<source>.skip_streak`. The cause is the device's
+  heartbeat tag `yuzu.sync.<source>.skip_streak` (today only `source="installed_software"`,
+  written by agents that include the skip-visibility change, #5327). The cause is the device's
   `yuzu.sync.<source>.last_skip` tag and the agent's `sync: … — skipping this cycle`
   warning. Published every sweep, 0 included. The gauge only counts agents that emit the
   skip-streak heartbeat tag: an agent that does not emit it (older agents, during a

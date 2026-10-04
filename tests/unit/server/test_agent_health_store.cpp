@@ -1946,34 +1946,6 @@ TEST_CASE("REAL AgentHealthStore: yuzu_fleet_plugin_init_failed is per plugin, c
     CHECK(m2.serialize().find("yuzu_fleet_plugin_init_failed{") == std::string::npos);
 }
 
-// ── #5332: daily-sync skip fleet gauge (REAL store) ───────────────────────────
-
-TEST_CASE("REAL AgentHealthStore: yuzu_fleet_inventory_sync_skipping counts valid streaks > 0",
-          "[health_store][sync][skip][real]") {
-    AgentHealthStore store;
-    yuzu::MetricsRegistry metrics;
-    // The wire key the agent writes, pinned literally (not re-derived through a builder).
-    const char* const k = "yuzu.sync.installed_software.skip_streak";
-    const char* const gauge = "yuzu_fleet_inventory_sync_skipping{source=\"installed_software\"} ";
-    beat_tags(store, "a", {{k, "9"}});  // accepted: digits only, > 0 (9 = last digit)
-    beat_tags(store, "b", {{k, "10"}}); // accepted: multi-digit, contains a 0
-    beat_tags(store, "c", {{k, "0"}});
-    beat_tags(store, "d", {});
-    beat_tags(store, "e", {{k, "abc"}});
-    beat_tags(store, "f", {{k, "-1"}});
-    beat_tags(store, "g", {{k, "1234567890123456789"}}); // > 18 chars: over-long, rejected
-    beat_tags(store, "h", {{k, ""}});
-    store.recompute_metrics(metrics, std::chrono::seconds{300});
-    CHECK(series_val(metrics.serialize(), gauge) == 2.0);
-
-    // Every snapshot pruned (0 s window): still PUBLISHED, at 0 - never absent (a
-    // server-owned count over the reporting population, the deliberate exception to
-    // absent-not-zero, like yuzu_fleet_tar_db_corruption_agents); series_val REQUIREs the
-    // series exists.
-    store.recompute_metrics(metrics, std::chrono::seconds{0});
-    CHECK(series_val(metrics.serialize(), gauge) == 0.0);
-}
-
 TEST_CASE("REAL AgentHealthStore: corruption candidates are surfaced, not deduped",
           "[health_store][tar][corruption][real]") {
     AgentHealthStore store;
@@ -2300,4 +2272,33 @@ TEST_CASE("tar corruption audit detail: encode/decode round-trip and sink compos
     REQUIRE(rows.size() == 1);
     beat(); // durable now: no further row
     CHECK(rows.size() == 1);
+}
+
+// ── #5332: daily-sync skip fleet gauge (REAL store) ───────────────────────────
+
+TEST_CASE("REAL AgentHealthStore: yuzu_fleet_inventory_sync_skipping counts valid streaks > 0",
+          "[health_store][sync][skip][real]") {
+    AgentHealthStore store;
+    yuzu::MetricsRegistry metrics;
+    // The wire key the agent writes, pinned literally (not re-derived through a builder).
+    const char* const k = "yuzu.sync.installed_software.skip_streak";
+    const char* const gauge = "yuzu_fleet_inventory_sync_skipping{source=\"installed_software\"} ";
+    beat_tags(store, "a", {{k, "9"}});  // accepted: digits only, > 0 (9 = last digit)
+    beat_tags(store, "b", {{k, "10"}}); // accepted: multi-digit, contains a 0
+    beat_tags(store, "i", {{k, "999999999999999999"}}); // exactly 18 chars: accepted (the cap)
+    beat_tags(store, "c", {{k, "0"}});
+    beat_tags(store, "d", {});
+    beat_tags(store, "e", {{k, "abc"}});
+    beat_tags(store, "f", {{k, "-1"}});
+    beat_tags(store, "g", {{k, "1234567890123456789"}}); // > 18 chars: over-long, rejected
+    beat_tags(store, "h", {{k, ""}});
+    store.recompute_metrics(metrics, std::chrono::seconds{300});
+    CHECK(series_val(metrics.serialize(), gauge) == 3.0);
+
+    // Every snapshot pruned (0 s window): still PUBLISHED, at 0 - never absent (a
+    // server-owned count over the reporting population, the deliberate exception to
+    // absent-not-zero, like yuzu_fleet_tar_db_corruption_agents); series_val REQUIREs the
+    // series exists.
+    store.recompute_metrics(metrics, std::chrono::seconds{0});
+    CHECK(series_val(metrics.serialize(), gauge) == 0.0);
 }
