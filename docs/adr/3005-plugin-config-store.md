@@ -177,7 +177,8 @@ is already on.
   does no presence read and keeps the unfiltered broadcast fast path.
 - **Degraded presence fails closed.** With a non-empty OS set, an unreadable presence store
   refuses the whole dispatch before targeting (`os_gate_unreadable`) instead of enforcing on local
-  sessions only.
+  sessions only. A fail-closed containment gate outranks it: containment already withholds every
+  id, so the presence read is skipped and the reported cause is `containment_unreadable`.
 - **Claims.** An OS-withheld id has already taken its per-device concurrency claim, so it is the
   fourth bucket released with not-sent, quarantined and unknown-plugin ids.
 - **Dry run.** The MCP pre-dispatch authorization dry run has no target, so it cannot see the

@@ -769,6 +769,37 @@ TEST_CASE("/api/command: unreadable presence with a per-OS switch OFF refuses 50
     CHECK(h.os_gate_unreadable_audit_plugin == "noop");
 }
 
+// #5294: both gates unreadable at once -- the fail-closed containment gate
+// already withholds every id, so it is the reported cause and the per-OS
+// presence read (and its audit row) is skipped.
+TEST_CASE("/api/command: a fail-closed containment gate outranks unreadable presence "
+          "(reason=containment_unreadable, no os_gate_unreadable audit)",
+          "[pg][command_routes][5294]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, os_presence_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 2, .lock_timeout_ms = 100}};
+    REQUIRE(pool.valid());
+    OfflineEndpointStore store{pool};
+    REQUIRE(store.is_open());
+
+    CommandHarness h;
+    h.registry.configure_presence(&store, std::chrono::hours(1));
+    auto win = make_agent_info("windows-agent");
+    win.mutable_platform()->set_os("windows");
+    (void)h.registry.register_agent(win);
+    h.kill_switched_os = {"windows"};
+    h.containment_fail_closed = true;
+
+    PresenceLocker locker{db.dsn()};
+    auto res = h.sink.Post("/api/command",
+                           R"({"plugin":"noop","action":"run","agent_ids":["windows-agent"]})");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    auto j = nlohmann::json::parse(res->body);
+    CHECK(j["error"]["reason"] == "containment_unreadable");
+    CHECK(h.send_to_ids_called.empty());
+    CHECK(h.os_gate_unreadable_audit_calls == 0);
+}
+
 TEST_CASE("/api/command: audit_quarantine_dispatch_denied_batch throwing still returns 200 "
           "with command_id",
           "[command_routes]") {

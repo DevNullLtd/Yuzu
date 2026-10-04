@@ -20384,8 +20384,13 @@ private:
         // raw `plugin` local — see the /api/command sibling site's comment.
         const auto plugin_missing = registry_.ids_missing_plugin(classified->wire().plugin());
         // #5294: per-OS kill-switch ids; a degraded presence read while a
-        // per-OS switch is OFF refuses the dispatch (fail closed).
-        const auto os_kill_switched = registry_.ids_with_os(classified->kill_switched_os());
+        // per-OS switch is OFF refuses the dispatch (fail closed). A fail-closed
+        // containment gate already withholds every id and is reported first
+        // below (`containment_unreadable`), so skip the presence read rather
+        // than let `os_gate_unreadable` shadow it.
+        static const std::unordered_set<std::string> kNoOsKillSwitch;
+        const auto os_kill_switched = registry_.ids_with_os(
+            containment_gate.fail_closed ? kNoOsKillSwitch : classified->kill_switched_os());
         if (!os_kill_switched) {
             spdlog::error("legacy dispatch {}:{} refused: presence unreadable while a per-OS "
                           "kill switch is OFF",

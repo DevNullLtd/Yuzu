@@ -330,8 +330,9 @@ yuzu::server::ConfinedDispatchOutcome wire(AgentRegistry& registry,
                                            yuzu::server::ExecutionTracker* tracker,
                                            const yuzu::server::detail::ClassifiedCommand& cmd,
                                            const std::vector<std::string>& ids,
-                                           const std::string& execution_id = "exec-1") {
-    auto gate = ContainmentGate::exempt_control_plugin();
+                                           const std::string& execution_id = "exec-1",
+                                           const ContainmentGate& gate =
+                                               ContainmentGate::exempt_control_plugin()) {
     auto noop = [](const std::string&, const std::string&, const std::string&,
                    const std::string&) {};
     return yuzu::server::wire_and_dispatch_confined(
@@ -354,7 +355,7 @@ TEST_CASE("wire_and_dispatch_confined: an OS-withheld id's per-device claim is r
     EventBus bus;
     yuzu::MetricsRegistry metrics;
     AgentRegistry registry(bus, metrics);
-    registry.register_agent(make_info("dev-A", "windows"));
+    (void)registry.register_agent(make_info("dev-A", "windows"));
     registry.register_agent(make_info("dev-B", "linux"));
     for (const auto& id : {"dev-A", "dev-B"})
         REQUIRE(registry.set_gateway_route(
@@ -425,7 +426,7 @@ TEST_CASE("wire_and_dispatch_confined: degraded presence with a per-OS switch OF
     yuzu::MetricsRegistry metrics;
     AgentRegistry registry(bus, metrics);
     registry.configure_presence(&store, std::chrono::hours(1));
-    registry.register_agent(make_info("dev-A", "windows"));
+    (void)registry.register_agent(make_info("dev-A", "windows"));
     REQUIRE(registry.set_gateway_route(
         "dev-A", {}, "test-gateway",
         {std::string(yuzu::server::detail::kGatewayWireCapabilityDispatchTagV1)}));
@@ -440,4 +441,37 @@ TEST_CASE("wire_and_dispatch_confined: degraded presence with a per-OS switch OF
     auto claim = tracker.claim_concurrency_slots("def-1", "exec-9", "os-cmd-9", {"dev-A"},
                                                   /*expires_at_seconds=*/9999999999);
     CHECK(claim == std::vector<std::string>{"dev-A"});
+}
+
+// Both gates unreadable at once: the fail-closed containment gate already
+// withholds every id, so it must be the reported cause -- the per-OS presence
+// read is skipped and `os_gate_unreadable` never shadows it.
+TEST_CASE("wire_and_dispatch_confined: a fail-closed containment gate outranks a degraded "
+          "presence read as the reported cause",
+          "[pg][ha][presence][failclosed][server][dispatch][os_kill_switch][integration]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, os_presence_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4, .lock_timeout_ms = 100}};
+    REQUIRE(pool.valid());
+    OfflineEndpointStore store{pool};
+    REQUIRE(store.is_open());
+
+    EventBus bus;
+    yuzu::MetricsRegistry metrics;
+    AgentRegistry registry(bus, metrics);
+    registry.configure_presence(&store, std::chrono::hours(1));
+    (void)registry.register_agent(make_info("dev-A", "windows"));
+    REQUIRE(registry.set_gateway_route(
+        "dev-A", {}, "test-gateway",
+        {std::string(yuzu::server::detail::kGatewayWireCapabilityDispatchTagV1)}));
+
+    PresenceLocker locker{db.dsn()};
+    const std::vector<std::string> ids{"dev-A"};
+    const auto outcome =
+        wire(registry, nullptr, classified_with_os_off({"windows"}), ids, "exec-1",
+             ContainmentGate::enforcing(/*fail_closed=*/true, {}));
+    CHECK(outcome.containment_unreadable);
+    CHECK_FALSE(outcome.os_gate_unreadable);
+    CHECK(outcome.sent == 0);
+    // Fail-closed containment denies every id, so nothing is withheld by OS.
+    CHECK(outcome.kill_switched_os.empty());
 }
