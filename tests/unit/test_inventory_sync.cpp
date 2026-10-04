@@ -249,8 +249,9 @@ TEST_CASE("clamp_field strips framing separators and truncates over-long fields"
           "[sync][parse]") {
     // 0x1F (field sep) and 0x1E (record sep) embedded in a field must be stripped
     // so a value can never corrupt the canonical wire structure the server splits
-    // on. (octal \037 == 0x1F, \036 == 0x1E.)
-    auto e = parse_installed_apps_output(std::string("inv|na\037me|1\0362|pub|d\n"));
+    // on. (octal \037 == 0x1F, \036 == 0x1E. Literals are split after an escape
+    // where a digit follows: MSVC C4125, #5334.)
+    auto e = parse_installed_apps_output(std::string("inv|na\037me|1\036" "2|pub|d\n"));
     REQUIRE(e.size() == 1);
     CHECK(e[0].name == "name");    // 0x1F stripped
     CHECK(e[0].version == "12");   // 0x1E stripped
@@ -346,8 +347,8 @@ TEST_CASE("canonical blob is the exact wire format the server parses", "[sync][h
     // A|1|P|D|×8-empty<rec>  B|2|×10-empty<rec>  (| == 0x1F, <rec> == 0x1E);
     // 11 separators per record regardless of how many trailing fields are empty.
     CHECK(installed_software_canonical_blob(e) ==
-          std::string("A\0371\037P\037D\037\037\037\037\037\037\037\037\036"
-                      "B\0372\037\037\037\037\037\037\037\037\037\037\036"));
+          std::string("A\037" "1\037P\037D\037\037\037\037\037\037\037\037\036"
+                      "B\037" "2\037\037\037\037\037\037\037\037\037\037\036"));
 }
 
 TEST_CASE("empty inventory parses to no entries and a stable empty hash",
