@@ -508,7 +508,7 @@ TEST_CASE("ExecutionStatistics: definition stats skips pending/running execution
 // #4644 Gate 7: a degraded read is distinguishable from "no executions"
 // ============================================================================
 
-TEST_CASE("ExecutionStatistics: try_get_* reports a degraded store as nullopt, not empty",
+TEST_CASE("ExecutionStatistics: try_get_* reports a degraded store as nullopt and not empty",
           "[pg][execution_statistics][degrade]") {
     yuzu::test::ExecutionTrackerPg tracker_bundle;
     ExecutionTracker& tracker = *tracker_bundle;

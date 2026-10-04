@@ -44,7 +44,8 @@ std::string qparam(const httplib::Request& req, const char* name) {
 // `window` is a FILTER (the compare span in days): a present-but-malformed value must
 // not silently become the 7-day default, or the operator reads a verdict computed over
 // a different window than the one they asked for. Absent => 7; malformed => nullopt
-// (the caller answers 400); out-of-range integers keep the documented [1, max] clamp.
+// (the caller answers the 200 note); an integer that does not fit an `int` fails the parse and
+// is rejected like any malformed value, while an in-range integer clamps to [1, kMaxWindowDays].
 std::optional<int> parse_window(const httplib::Request& req) {
     int window = 7;
     if (req.has_param("window")) {

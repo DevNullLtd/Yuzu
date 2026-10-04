@@ -1076,7 +1076,7 @@ TEST_CASE("GET /api/v1/execution-statistics/agents: a gate denial is a 403 and a
 // failed statement) with an EMPTY or ZEROED value, so REST served 200 `[]` / an all-zero
 // summary: "no executions" presented as a measurement. A degraded read is now a 503 with
 // retry_after_ms; an HONEST empty scope (deny-all, no rows) is still a 200 `[]`.
-TEST_CASE("execution-statistics routes: a degraded tracker read is a 503, an honest empty is a 200",
+TEST_CASE("execution-statistics routes: a degraded tracker read is a 503 and an honest empty is a 200",
           "[pg][rest][executions][v1][statistics][degrade]") {
     YUZU_REQUIRE_PG_DB_TPL(db, execv1_responsestore_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};

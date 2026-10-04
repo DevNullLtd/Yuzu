@@ -249,7 +249,7 @@ std::string render_ca_fragment(CaStore* ca_store) {
     if (static_cast<int>(issued.size()) >= kPanelLimit) {
         html += "<p style=\"font-size:0.72rem;color:#d29922;margin-top:0.5rem\">Showing the first " +
                 std::to_string(kPanelLimit) +
-                " certificates. Use <code>GET /api/v1/ca/issued?offset=</code> to page through the "
+                " certificates. Use <code>GET /api/v1/ca/issued?offset=&lt;n&gt;</code> to page through the "
                 "full inventory.</p>";
     }
     html += "<p style=\"font-size:0.72rem;color:var(--mds-color-theme-text-tertiary);"

@@ -146,7 +146,16 @@ void mount(HttpRouteSink& sink, WebhookRoutes::PermFn perm_fn, WebhookRoutes::Au
                                        "application/json");
                        return;
                    }
-                   auto id = std::stoll(req.matches[1].str());
+                   // A 21-digit `(\d+)` id made `stoll` throw (500): not representable => 404.
+                   const auto id_parsed =
+                       yuzu::server::parse_query_int<long long>(req.matches[1].str());
+                   if (!id_parsed) {
+                       res.status = 404;
+                       res.set_content(detail::a4_error(res, "webhook not found"),
+                                       "application/json");
+                       return;
+                   }
+                   const auto id = *id_parsed;
                    // gov Gate 2/4/5 (PR #3563 full-PR review): snapshot the
                    // URL BEFORE deleting — matches `offload_routes.cpp`'s
                    // existing "compliance F-3" hardening for the identical
@@ -192,7 +201,14 @@ void mount(HttpRouteSink& sink, WebhookRoutes::PermFn perm_fn, WebhookRoutes::Au
                                     "application/json");
                     return;
                 }
-                auto webhook_id = std::stoll(req.matches[1].str());
+                const auto webhook_id_parsed =
+                    yuzu::server::parse_query_int<long long>(req.matches[1].str());
+                if (!webhook_id_parsed) {
+                    res.status = 404;
+                    res.set_content(detail::a4_error(res, "webhook not found"), "application/json");
+                    return;
+                }
+                const auto webhook_id = *webhook_id_parsed;
                 int limit = 50;
                 auto limit_str = req.get_param_value("limit");
                 if (req.has_param("limit")) {

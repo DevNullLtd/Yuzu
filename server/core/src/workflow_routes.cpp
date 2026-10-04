@@ -27,6 +27,7 @@
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
+#include <limits>
 #include <chrono>
 #include <cstring>
 #include <expected>
@@ -1205,9 +1206,10 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                  std::uint64_t since_id = 0;
                  if (req.has_header("Last-Event-ID")) {
                      // Strict cursor: stoull accepted "-1" (wrapping past every event) and
-                     // "5abc" (as 5). A malformed header keeps the neutral no-replay outcome.
-                     const auto v = parse_query_int<long long>(req.get_header_value("Last-Event-ID"));
-                     since_id = (v && *v >= 0) ? static_cast<std::uint64_t>(*v) : 0;
+                     // "5abc" (as 5). A malformed header is live-only (no replay).
+                     // A malformed header is served LIVE ONLY (no replay): see
+                     // sse_cursor_from_header. since_id 0 would replay the whole ring buffer.
+                     since_id = sse_cursor_from_header(req.get_header_value("Last-Event-ID")).since_id;
                  }
                  auto* bus = execution_event_bus;
                  // Install the listener and replay atomically, using one scope

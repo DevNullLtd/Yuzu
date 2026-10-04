@@ -9,14 +9,9 @@
 namespace yuzu::server::preflight {
 
 namespace {
-// Per-check fetch cap. MUST exceed the run's cohort cap (PreflightRunStore
-// kRowCap=20000) with headroom for the multiple rows/agent that re-dispatch
-// accrues — `query_by_execution` is `ORDER BY ts DESC LIMIT`, a sliding window,
-// so an undersized cap evicts already-answered agents' terminal rows and the run
-// can never complete (#governance perf-S2/architect). 50000 covers realistic
-// re-dispatch depth at the 20k cohort ceiling; the true fix (per-agent keyset
-// paging so size is independent of row count) is a tracked follow-up — a
-// truncation hit is surfaced as `PreflightCheckResponses::truncated` and logged below.
+// Latest-wins scoring for one agent's rows (the cap constant kResponseFetchCap and its
+// sliding-window rationale live in preflight_eval.hpp; the true fix, per-agent keyset paging, is
+// a tracked follow-up).
 int score_response(const StoredResponse& r) {
     int s = 0;
     if (r.status != 0) // 0 = RUNNING; terminal beats running

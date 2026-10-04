@@ -494,7 +494,7 @@ TEST_CASE("/fragments/results: a cut read that parses to zero lines still says i
 
 // #4644 Gate 7: `page` / `per_page` are ONE base-10 integer or a 400: a malformed page used to
 // fall back to the default silently, so the operator read page 1 as the page they asked for.
-TEST_CASE("/fragments/results: a malformed page or per_page is a 400, valid values are served",
+TEST_CASE("/fragments/results: a malformed page or per_page is a 400 and valid values are served",
           "[pg][server][dashboard][fragment][numeric_params]") {
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};

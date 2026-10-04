@@ -5414,10 +5414,18 @@ void SettingsRoutes::register_routes(
                 max_uses = yuzu::server::strict_stoi(max_uses_s);
             if (!ttl_s.empty())
                 ttl_hours = yuzu::server::strict_stoi(ttl_s);
+            // A negative TTL computes `ttl_hours > 0 ? ... : 0` and 0 means NEVER EXPIRES, so a
+            // typed `-1` used to mint a credential with no expiry. Refuse it. (`-0` and `00`
+            // parse to a literal 0 and keep the documented meaning.)
+            if (ttl_hours < 0)
+                throw std::invalid_argument("negative ttl_hours");
         } catch (const std::exception&) {
             audit_fn_(req, "enrollment.token_create", "denied", "EnrollmentToken", "",
                       "invalid_numeric_parameter");
             res.status = 400;
+            // The dashboard drops 4xx bodies (swap:false): the toast is what the operator sees.
+            res.set_header("HX-Trigger",
+                           R"({"showToast":{"message":"Invalid numeric parameter - nothing was created","level":"error"}})");
             res.set_content(detail::a4_error(res, "invalid numeric parameter"),
                             "application/json");
             return;
@@ -5509,10 +5517,18 @@ void SettingsRoutes::register_routes(
                 max_uses = yuzu::server::strict_stoi(max_uses_s);
             if (!ttl_s.empty())
                 ttl_hours = yuzu::server::strict_stoi(ttl_s);
+            // A negative TTL computes `ttl_hours > 0 ? ... : 0` and 0 means NEVER EXPIRES, so a
+            // typed `-1` used to mint a credential with no expiry. Refuse it. (`-0` and `00`
+            // parse to a literal 0 and keep the documented meaning.)
+            if (ttl_hours < 0)
+                throw std::invalid_argument("negative ttl_hours");
         } catch (const std::exception&) {
             audit_fn_(req, "enrollment.bulk_token_create", "denied", "EnrollmentToken", "",
                       "invalid_numeric_parameter");
             res.status = 400;
+            // The dashboard drops 4xx bodies (swap:false): the toast is what the operator sees.
+            res.set_header("HX-Trigger",
+                           R"({"showToast":{"message":"Invalid numeric parameter - nothing was created","level":"error"}})");
             res.set_content(detail::a4_error(res, "invalid numeric parameter"),
                             "application/json");
             return;
@@ -5619,6 +5635,8 @@ void SettingsRoutes::register_routes(
             try {
                 // Strict: a mistyped TTL ("0x5" -> 0) used to mint a token that never expires.
                 int ttl_hours = yuzu::server::strict_stoi(ttl_s);
+                if (ttl_hours < 0) // would mint a token that never expires; refused, nothing minted
+                    throw std::invalid_argument("negative ttl_hours");
                 if (ttl_hours > 0) {
                     auto now = std::chrono::duration_cast<std::chrono::seconds>(
                                    std::chrono::system_clock::now().time_since_epoch())
@@ -6063,7 +6081,14 @@ void SettingsRoutes::register_routes(
               [this](const httplib::Request& req, httplib::Response& res) {
                   if (!admin_fn_(req, res))
                       return;
-                  auto idx = static_cast<size_t>(std::stoul(req.matches[1].str()));
+                  // `(\d+)` also matches a 21-digit index that `stoul` rejects by throwing (500).
+                  const auto idx_parsed = yuzu::server::parse_query_int<long long>(req.matches[1].str());
+                  if (!idx_parsed || *idx_parsed < 0) {
+                      res.status = 404;
+                      res.set_content(detail::a4_error(res, "rule not found"), "application/json");
+                      return;
+                  }
+                  auto idx = static_cast<size_t>(*idx_parsed);
                   auto rules = auto_approve_->list_rules();
                   if (idx < rules.size()) {
                       auto_approve_->set_enabled(idx, !rules[idx].enabled);
@@ -6075,7 +6100,14 @@ void SettingsRoutes::register_routes(
                 [this](const httplib::Request& req, httplib::Response& res) {
                     if (!admin_fn_(req, res))
                         return;
-                    auto idx = static_cast<size_t>(std::stoul(req.matches[1].str()));
+                    const auto idx_parsed =
+                        yuzu::server::parse_query_int<long long>(req.matches[1].str());
+                    if (!idx_parsed || *idx_parsed < 0) {
+                        res.status = 404;
+                        res.set_content(detail::a4_error(res, "rule not found"), "application/json");
+                        return;
+                    }
+                    auto idx = static_cast<size_t>(*idx_parsed);
                     auto_approve_->remove_rule(idx);
                     spdlog::info("Auto-approve rule {} removed", idx);
                     res.set_content(render_auto_approve_fragment(), "text/html; charset=utf-8");
@@ -6241,23 +6273,18 @@ void SettingsRoutes::register_routes(
             return;
         }
 
-        int rollout_pct = 100;
-        if (!rollout_s.empty()) {
-            // A malformed percentage must NOT fall back to 100 (a full-fleet rollout the
-            // operator did not ask for): 400, nothing stored.
-            const auto parsed = yuzu::server::parse_query_int<int>(rollout_s);
-            if (!parsed) {
-                res.status = 400;
-                res.set_content(detail::a4_error(res, "invalid numeric parameter: rollout_pct"),
-                                "application/json");
-                return;
-            }
-            rollout_pct = *parsed;
+        // A malformed percentage must NOT fall back to 100 (a full-fleet rollout the operator
+        // did not ask for): 400, nothing stored. Shared with the rollout route.
+        const auto rollout_parsed = yuzu::server::parse_rollout_pct(rollout_s);
+        if (!rollout_parsed) {
+            res.status = 400;
+            res.set_header("HX-Trigger",
+                           R"({"showToast":{"message":"Invalid rollout percentage - nothing was stored","level":"error"}})");
+            res.set_content(detail::a4_error(res, "invalid numeric parameter: rollout_pct"),
+                            "application/json");
+            return;
         }
-        if (rollout_pct < 0)
-            rollout_pct = 0;
-        if (rollout_pct > 100)
-            rollout_pct = 100;
+        const int rollout_pct = *rollout_parsed;
 
         // Shape-check the signature BEFORE the binary is written. A well-sized
         // file of garbage would otherwise be stored, reported "signed" by the
@@ -6544,23 +6571,18 @@ void SettingsRoutes::register_routes(
                   auto version = req.matches[3].str();
                   auto pct_s = extract_form_value(req.body, "rollout_pct");
 
-                  int pct = 100;
-                  if (!pct_s.empty()) {
-                      // Malformed => 400, never the 100% default (see the upload route).
-                      const auto parsed = yuzu::server::parse_query_int<int>(pct_s);
-                      if (!parsed) {
-                          res.status = 400;
-                          res.set_content(
-                              detail::a4_error(res, "invalid numeric parameter: rollout_pct"),
-                              "application/json");
-                          return;
-                      }
-                      pct = *parsed;
+                  // Malformed => 400, never the 100% default (shared with the upload route).
+                  const auto pct_parsed = yuzu::server::parse_rollout_pct(pct_s);
+                  if (!pct_parsed) {
+                      res.status = 400;
+                      res.set_header("HX-Trigger",
+                                     R"({"showToast":{"message":"Invalid rollout percentage - nothing was changed","level":"error"}})");
+                      res.set_content(
+                          detail::a4_error(res, "invalid numeric parameter: rollout_pct"),
+                          "application/json");
+                      return;
                   }
-                  if (pct < 0)
-                      pct = 0;
-                  if (pct > 100)
-                      pct = 100;
+                  const int pct = *pct_parsed;
 
                   // Capture the PRIOR percentage before the write. It is the whole
                   // evidentiary value of this row: #3692's scenario is an admin —

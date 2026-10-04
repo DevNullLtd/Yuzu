@@ -161,3 +161,24 @@ TEST_CASE("compute_device_results labels an absent agent in a truncated window i
         CHECK((cell.value == std::string(kPreflightCapReachedValue)) == truncated);
     }
 }
+
+// A device whose RUNNING row IS in the truncated window is simply still pending: only a device
+// with NO row at all is ambiguous (its answer may have been evicted), so only it is labelled.
+TEST_CASE("compute_device_results does not label a device whose running row is in the window",
+          "[preflight][eval][numeric_params]") {
+    PreflightCheckResponses c;
+    c.key = "disk";
+    c.label = "Disk";
+    c.truncated = true;
+    c.by_agent["agent-1"] = {0, ""}; // RUNNING, no output yet
+    std::vector<PreflightTarget> targets = {{"agent-1", "h1", "windows"}, {"agent-2", "h2", "windows"}};
+    PreflightConfig cfg;
+    bool any_pending = false;
+    const auto grid = compute_device_results(targets, {c}, cfg, &any_pending);
+    REQUIRE(grid.size() == 2);
+    CHECK(any_pending);
+    CHECK(grid[0].checks[0].value != std::string(kPreflightCapReachedValue)); // running, in window
+    CHECK(grid[1].checks[0].value == std::string(kPreflightCapReachedValue)); // absent: ambiguous
+    CHECK(grid[0].checks[0].verdict == Verdict::kUnknown);
+    CHECK(grid[1].checks[0].verdict == Verdict::kUnknown);
+}

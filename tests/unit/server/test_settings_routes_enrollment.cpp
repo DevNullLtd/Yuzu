@@ -397,12 +397,16 @@ TEST_CASE("settings enrollment: a malformed max_uses or ttl_hours mints nothing"
           "[pg][settings_routes][enrollment][numeric_params]") {
     for (const char* body : {"label=x&max_uses=0x5", "label=x&max_uses=5abc",
                              "label=x&max_uses=1e1", "label=x&max_uses=%2B3",
-                             "label=x&max_uses=1&ttl_hours=24h", "label=x&ttl_hours=0x18"}) {
+                             "label=x&max_uses=1&ttl_hours=24h", "label=x&ttl_hours=0x18",
+                             // A negative TTL computes 0 = NEVER EXPIRES: refused, not minted.
+                             "label=x&ttl_hours=-1", "label=x&max_uses=1&ttl_hours=-24"}) {
         EnrollRoutesHarness h;
         INFO(body);
         auto res = h.sink.Post("/api/settings/enrollment-tokens", body, kForm);
         REQUIRE(res);
         CHECK(res->status == 400);
+        // The dashboard drops 4xx bodies, so the operator is told by the toast.
+        CHECK(res->get_header_value("HX-Trigger").find("showToast") != std::string::npos);
         CHECK(h.only("enrollment.token_create").result == "denied");
         CHECK(h.auth_mgr.list_enrollment_tokens().value().empty());
         CHECK(raw_token_in(res->body).empty());
@@ -411,8 +415,10 @@ TEST_CASE("settings enrollment: a malformed max_uses or ttl_hours mints nothing"
 
 TEST_CASE("settings enrollment: an empty or literal-zero limit still means unlimited",
           "[pg][settings_routes][enrollment][numeric_params]") {
+    // `-0` and `00` parse to a literal 0, so they keep the documented meaning; only an empty
+    // field or a value that parses to 0 is "unlimited" / "no expiry".
     for (const char* body : {"label=x&max_uses=0&ttl_hours=0", "label=x&max_uses=&ttl_hours=",
-                             "label=x"}) {
+                             "label=x", "label=x&max_uses=00&ttl_hours=-0"}) {
         EnrollRoutesHarness h;
         INFO(body);
         auto res = h.sink.Post("/api/settings/enrollment-tokens", body, kForm);
@@ -425,12 +431,14 @@ TEST_CASE("settings enrollment: an empty or literal-zero limit still means unlim
 TEST_CASE("settings enrollment: the batch route refuses a malformed count or limit too",
           "[pg][settings_routes][enrollment][numeric_params]") {
     for (const char* body : {R"({"count":"3x"})", R"({"count":"2","max_uses":"0x1"})",
-                             R"({"count":"2","ttl_hours":"1e1"})"}) {
+                             R"({"count":"2","ttl_hours":"1e1"})",
+                             R"({"count":"2","ttl_hours":"-1"})"}) {
         EnrollRoutesHarness h;
         INFO(body);
         auto res = h.sink.Post("/api/settings/enrollment-tokens/batch", body);
         REQUIRE(res);
         CHECK(res->status == 400);
+        CHECK(res->get_header_value("HX-Trigger").find("showToast") != std::string::npos);
         CHECK(h.auth_mgr.list_enrollment_tokens().value().empty());
     }
 }

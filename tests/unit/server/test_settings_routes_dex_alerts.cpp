@@ -227,7 +227,7 @@ TEST_CASE("cohort-export POST: non-admin → 403, nothing persisted",
 // #4644 Gate 7: a present-but-malformed blast-radius threshold is a 400 with NOTHING saved and
 // no live apply. `stoi("0x10")` is 0 and `stoi("5abc")` is 5, so a typo used to persist a
 // different (clamped) threshold than the one typed. Valid integers keep the documented clamp.
-TEST_CASE("blast POST: a malformed threshold 400s and persists nothing, a valid one clamps",
+TEST_CASE("blast POST: a malformed threshold 400s and persists nothing and a valid one clamps",
           "[pg][settings][dex][numeric_params]") {
     YUZU_REQUIRE_PG_DB_TPL(db, dex_alerts_tpl);
     DexAlertsHarness h(db.dsn());

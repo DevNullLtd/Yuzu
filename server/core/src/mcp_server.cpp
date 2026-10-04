@@ -3258,7 +3258,9 @@ static const ToolDef kTools[] = {
      "get_execution_statistics_by_agent or get_execution_statistics_by_definition for the same "
      "rollup broken down by agent or instruction definition, or get_fleet_statistics for the "
      "same data reshaped for a dashboard tile. All-zero values are the honest empty state for a "
-     "fleet with no completed executions yet, not an error. Requires Execution:Read.",
+     "fleet with no completed executions yet, not an error; a degraded statistics store is a "
+     "retryable internal error (-32603, retry_after_ms), never an all-zero result. Requires "
+     "Execution:Read.",
      R"j({"type":"object","properties":{},"additionalProperties":false})j",
      R"j({"type":"object","properties":{"total_executions":{"type":"integer"},"executions_today":{"type":"integer"},"active_agents":{"type":"integer"},"overall_success_rate":{"type":"number","description":"Percent, 0-100"},"avg_duration_seconds":{"type":"number"}},"required":["total_executions","executions_today","active_agents","overall_success_rate","avg_duration_seconds"]})j"},
 
@@ -3297,7 +3299,8 @@ static const ToolDef kTools[] = {
      "Same underlying ExecutionTracker fleet summary as get_execution_statistics, reshaped for "
      "a dashboard tile -- prefer get_execution_statistics if the flat shape is more convenient. "
      "All-zero values are the honest empty state for a fleet with no completed executions yet, "
-     "not an error. Requires Infrastructure:Read.",
+     "not an error; a degraded statistics store is a retryable internal error (-32603, "
+     "retry_after_ms), never an all-zero result. Requires Infrastructure:Read.",
      R"j({"type":"object","properties":{},"additionalProperties":false})j",
      R"j({"type":"object","properties":{"executions":{"type":"object","properties":{"total":{"type":"integer"},"today":{"type":"integer"},"success_rate":{"type":"number","description":"Percent, 0-100"},"avg_duration_seconds":{"type":"number"}},"required":["total","today","success_rate","avg_duration_seconds"]},"active_agents":{"type":"integer"}},"required":["executions","active_agents"]})j"},
 
@@ -21134,12 +21137,14 @@ McpServer::HandlerFn McpServer::build_handler(
             // Shared builders (execution_statistics_model.hpp) -- the REST twins
             // (rest_api_v1.cpp) call the SAME functions, so the JSON shape cannot
             // drift (api-twin-recipe.md Rule 1). ExecutionTracker's aggregate
-            // queries here (get_fleet_summary/get_agent_statistics/
-            // get_definition_statistics) return plain values, never
-            // std::optional/std::expected -- a pool/query fault degrades
-            // SILENTLY to zero/empty (matching every existing caller of these
-            // three methods, REST included -- see execution_tracker.cpp), so the
-            // only guardable failure mode here is the pointer itself being
+            // queries here are read through the try_get_* forms
+            // (try_get_fleet_summary/try_get_agent_statistics/
+            // try_get_definition_statistics), which return std::optional: nullopt
+            // means the store was not open, the pool timed out or a statement
+            // failed, and every handler below answers a retryable error for it
+            // rather than a zero/empty success (#4644 Gate 7). The plain get_*
+            // forms still collapse a fault to zero/empty and have no production
+            // caller. The other guardable failure mode is the pointer itself being
             // unwired. Unaudited on REST (no audit_fn call at either route); the
             // generic mcp_audit("success") is still emitted, matching the
             // dominant convention nearly every sibling read tool in this file

@@ -284,11 +284,12 @@ struct PreflightTarget {
     std::string os; ///< family: "windows" | "linux" | "darwin" | "?"
 };
 
-/// One check's outcome on one device (verdict + the device's actual value).
-/// Display value for a device x check cell that has no response in a TRUNCATED fetch window
-/// (the answer may have been evicted by the row cap). Persisted in `checks_json` `val`.
+/// Display value for a device x check cell that has NO row at all in a TRUNCATED fetch window
+/// (the answer may have been evicted by the row cap). Persisted in `checks_json` `val`. A device
+/// whose RUNNING row is still in the window is not labelled: its answer is genuinely pending.
 inline constexpr std::string_view kPreflightCapReachedValue = "inconclusive: response cap reached";
 
+/// One check's outcome on one device (verdict + the device's actual value).
 struct PreflightDeviceCheck {
     std::string key;
     std::string label;
@@ -433,8 +434,9 @@ compute_device_results(const std::vector<PreflightTarget>& targets,
                 }
             }
             // Ambiguous, not unanswered: see PreflightCheckResponses::truncated. Verdict stays
-            // kUnknown (never go); only the display value says why.
-            if (!terminal && c.truncated)
+            // kUnknown (never go); only the display value says why. Only a device with NO row in
+            // the window is ambiguous: one whose RUNNING row is present is simply still pending.
+            if (!terminal && c.truncated && it == c.by_agent.end())
                 ck.value = std::string(kPreflightCapReachedValue);
             if (!terminal && any_pending)
                 *any_pending = true;

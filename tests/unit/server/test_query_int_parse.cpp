@@ -94,3 +94,37 @@ TEST_CASE("strict_stoi/strict_stoll: the throwing drop-ins agree with the primit
     CHECK(std::stoi("100abc") == 100);
     CHECK_THROWS_AS(strict_stoi("100abc"), std::invalid_argument);
 }
+
+// The OTA upload route is multipart (TestRouteSink cannot drive it) and the rollout route is a
+// form: both call this one helper, so these cases cover BOTH. A typo must never become a
+// full-fleet rollout: malformed is nullopt (the routes answer 400 and store nothing), EMPTY is the
+// route's documented default, a valid integer is clamped to 0..100 as documented.
+TEST_CASE("parse_rollout_pct: malformed is rejected, empty is the default, valid is clamped",
+          "[query_int_parse][numeric_params]") {
+    for (const char* bad : {"0x5", "5abc", "1e1", "+5", " 5", "5 ", "-", "99999999999999999999"})
+        CHECK_FALSE(yuzu::server::parse_rollout_pct(bad).has_value());
+    CHECK(yuzu::server::parse_rollout_pct("") == 100);
+    CHECK(yuzu::server::parse_rollout_pct("", 0) == 0);
+    CHECK(yuzu::server::parse_rollout_pct("0") == 0);
+    CHECK(yuzu::server::parse_rollout_pct("-0") == 0);
+    CHECK(yuzu::server::parse_rollout_pct("007") == 7);
+    CHECK(yuzu::server::parse_rollout_pct("50") == 50);
+    CHECK(yuzu::server::parse_rollout_pct("100") == 100);
+    CHECK(yuzu::server::parse_rollout_pct("101") == 100);   // clamped, documented
+    CHECK(yuzu::server::parse_rollout_pct("-5") == 0);      // clamped, documented
+    CHECK(yuzu::server::parse_rollout_pct("2147483647") == 100);
+}
+
+TEST_CASE("sse_cursor_from_header: the cursor is one non-negative integer or live only",
+          "[query_int_parse][numeric_params]") {
+    CHECK(yuzu::server::sse_cursor_from_header("0").since_id == 0);
+    CHECK_FALSE(yuzu::server::sse_cursor_from_header("0").live_only);
+    CHECK(yuzu::server::sse_cursor_from_header("42").since_id == 42);
+    CHECK(yuzu::server::sse_cursor_from_header("9223372036854775807").since_id == 9223372036854775807ULL);
+    for (const char* bad : {"-1", "5abc", "", "0x10", "+3", " 3", "9223372036854775808"}) {
+        INFO(bad);
+        const auto c = yuzu::server::sse_cursor_from_header(bad);
+        CHECK(c.live_only);
+        CHECK(c.since_id == std::numeric_limits<std::uint64_t>::max());
+    }
+}

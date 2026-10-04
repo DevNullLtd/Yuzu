@@ -196,11 +196,27 @@ TEST_CASE("/fragments/auto/verify/drill: gates GuaranteedState:Read and audits "
 // parse silently fell back to the 7-day default on anything else, so a typo verified a
 // DIFFERENT window than the one the operator asked for. Now: present-but-malformed is the
 // same honest 200 note as this file's other rejections, with nothing computed or audited.
-TEST_CASE("/fragments/auto/verify/run: a malformed window is refused, never defaulted",
+TEST_CASE("/fragments/auto/verify/run: a malformed window is refused and never defaulted",
           "[verify_routes][numeric_params]") {
     for (const char* bad : {"7abc", "0x10", "1e1", "", " 7", "+7", "7.5", "99999999999999999999"}) {
         VerifyHarness h;
         auto res = h.sink.Get(run_query() + "&window=" + bad);
+        REQUIRE(res);
+        INFO("window=" << bad);
+        CHECK(res->status == 200);
+        CHECK(res->body.find("whole number of days") != std::string::npos);
+        CHECK(h.audit_calls.empty());
+        CHECK(h.last_window == -1);
+    }
+}
+
+// The DRILL route parses `window` through the same helper but was never exercised with a
+// malformed one (only /run was): same honest 200 note, nothing computed or audited.
+TEST_CASE("/fragments/auto/verify/drill: a malformed window is refused and never defaulted",
+          "[verify_routes][numeric_params]") {
+    for (const char* bad : {"7abc", "0x10", "1e1", "", " 7", "+7", "7.5", "99999999999999999999"}) {
+        VerifyHarness h;
+        auto res = h.sink.Get(drill_query() + "&window=" + bad);
         REQUIRE(res);
         INFO("window=" << bad);
         CHECK(res->status == 200);

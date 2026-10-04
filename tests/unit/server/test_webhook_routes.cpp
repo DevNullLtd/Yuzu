@@ -335,3 +335,15 @@ TEST_CASE("REST webhooks[pg]: GET /:id/deliveries rejects a malformed limit",
     REQUIRE(ok);
     CHECK(ok->status == 200);
 }
+
+TEST_CASE("REST webhooks[pg]: an id that overflows int64 is a 404 not a 500",
+          "[rest][webhook][pg][numeric_params]") {
+    WebhookRouteHarness h;
+    auto del = h.sink.Delete("/api/webhooks/99999999999999999999");
+    REQUIRE(del);
+    CHECK(del->status == 404);
+    auto dl = h.sink.Get("/api/webhooks/99999999999999999999/deliveries");
+    REQUIRE(dl);
+    CHECK(dl->status == 404);
+    CHECK(h.audit_log.empty()); // nothing was deleted, so nothing is audited as a deletion
+}

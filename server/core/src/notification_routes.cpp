@@ -88,7 +88,16 @@ void NotificationRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, Pe
                          "application/json");
                      return;
                  }
-                 auto id = std::stoll(req.matches[1].str());
+                 // `(\d+)` also matches a 21-digit id, which `stoll` rejects by THROWING (a 500).
+                 // An id that is not a representable int64 cannot name a notification: 404.
+                 const auto id_parsed = yuzu::server::parse_query_int<long long>(req.matches[1].str());
+                 if (!id_parsed) {
+                     res.status = 404;
+                     res.set_content(R"({"error":{"code":404,"message":"notification not found"},"meta":{"api_version":"v1"}})",
+                                     "application/json");
+                     return;
+                 }
+                 const auto id = *id_parsed;
                  if (!notification_store->mark_read(id)) {
                      res.status = 404;
                      res.set_content(R"({"error":{"code":404,"message":"notification not found"},"meta":{"api_version":"v1"}})",
@@ -111,7 +120,16 @@ void NotificationRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, Pe
                          "application/json");
                      return;
                  }
-                 auto id = std::stoll(req.matches[1].str());
+                 // `(\d+)` also matches a 21-digit id, which `stoll` rejects by THROWING (a 500).
+                 // An id that is not a representable int64 cannot name a notification: 404.
+                 const auto id_parsed = yuzu::server::parse_query_int<long long>(req.matches[1].str());
+                 if (!id_parsed) {
+                     res.status = 404;
+                     res.set_content(R"({"error":{"code":404,"message":"notification not found"},"meta":{"api_version":"v1"}})",
+                                     "application/json");
+                     return;
+                 }
+                 const auto id = *id_parsed;
                  if (!notification_store->dismiss(id)) {
                      audit_fn(req, "notification.dismiss", "failure", "notification",
                               std::to_string(id), "");

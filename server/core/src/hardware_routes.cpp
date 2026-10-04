@@ -107,7 +107,10 @@ std::optional<HardwareListQuery> query_from_request(const httplib::Request& req)
         if (!req.has_param(name)) return dflt;
         const auto v = yuzu::server::parse_query_int<long long>(req.get_param_value(name));
         if (!v) { malformed = true; return dflt; }
-        return *v < 0 ? 0 : static_cast<std::size_t>(*v);
+        // A negative offset/limit is malformed (the other converted sites reject it too),
+        // not a request for page 0.
+        if (*v < 0) { malformed = true; return dflt; }
+        return static_cast<std::size_t>(*v);
     };
     q.offset = parse_u("offset", 0);
     q.limit = parse_u("limit", 50);

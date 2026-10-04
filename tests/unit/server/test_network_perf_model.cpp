@@ -670,3 +670,34 @@ TEST_CASE("OpenAPI spec lists the network endpoints (A2 discovery), stays valid 
     CHECK(res->body.find(R"("/network/fleet":)") != std::string::npos);
     CHECK(res->body.find(R"("/network/devices":)") != std::string::npos);
 }
+
+// #4644 Gate 8 round 4: the devices drill's `limit` is ONE base-10 integer or a 400 (it used to be
+// read with stoi, so `limit=50abc` silently became 50). A well-formed value is still clamped.
+TEST_CASE("network routes: a malformed devices limit is a 400 and a valid one is served",
+          "[network][routes][numeric_params]") {
+    auto okAuth = [](const httplib::Request&, httplib::Response&) {
+        return std::optional<auth::Session>(auth::Session{});
+    };
+    auto okPerm = [](const httplib::Request&, httplib::Response&, const std::string&,
+                     const std::string&) { return true; };
+    auto okAudit = [](const httplib::Request&, const std::string&, const std::string&,
+                      const std::string&, const std::string&, const std::string&) { return true; };
+    NetworkRoutes::NetworkApiPtr perf =
+        std::make_shared<yuzu::server::test::FnNetworkApi>([](const std::string&) {
+            NetPerfSnapshot snap;
+            snap.devices.push_back(degraded("deg-dev", 95.0, false));
+            return snap;
+        });
+    yuzu::server::test::TestRouteSink sink;
+    NetworkRoutes routes;
+    routes.register_routes(sink, okAuth, okPerm, okAudit, perf);
+    for (const char* bad : {"50abc", "0x10", "1e2", "", "99999999999999999999"}) {
+        INFO("limit=" << bad);
+        auto res = sink.Get(std::string("/fragments/network/devices?limit=") + bad);
+        REQUIRE(res);
+        CHECK(res->status == 400);
+    }
+    auto ok = sink.Get("/fragments/network/devices?limit=10");
+    REQUIRE(ok);
+    CHECK(ok->status == 200);
+}

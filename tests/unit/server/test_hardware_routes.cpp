@@ -698,12 +698,13 @@ TEST_CASE("route: POST .../sync — audit-store degrade fails CLOSED, no dispatc
 // #4644 Gate 7: offset/limit/await_since are ONE base-10 integer or a 400. `await_since` is
 // the freshness bound a sync poll waits past: a malformed one used to read as "no bound" and
 // the poll could serve a STALE snapshot as fresh.
-TEST_CASE("route: hardware list, JSON list and sync poll refuse malformed numeric params",
+TEST_CASE("route: hardware list and JSON list and sync poll refuse malformed numeric params",
           "[hardware][route][numeric_params]") {
     HwHarness h;
     h.roster_rows = {make_row("agent-1", "HOST-1", "linux", true)};
+    // A NEGATIVE offset/limit is malformed too (it used to be silently clamped to 0).
     for (const char* bad : {"limit=3abc", "limit=0x10", "limit=1e1", "limit=", "offset=2x",
-                            "limit=99999999999999999999"}) {
+                            "limit=99999999999999999999", "offset=-1", "limit=-5"}) {
         INFO(bad);
         auto frag = h.sink.Get(std::string("/fragments/hardware/list?results_only=1&") + bad);
         REQUIRE(frag);

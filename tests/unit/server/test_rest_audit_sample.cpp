@@ -314,17 +314,19 @@ TEST_CASE("GET /api/v1/audit: a malformed limit is a 400 instead of the default 
           "prefix",
           "[pg][audit][rest]") {
     AuthSampleHarness h;
-    for (const char* bad : {"limit=abc", "limit=100abc", "limit=1e3", "limit=0x10",
+    // `limit=` (present but empty) is malformed here like on every other converted route: it
+    // used to be read as absent, the one exception the docs' blanket sentence had to carve out.
+    for (const char* bad : {"limit=abc", "limit=100abc", "limit=1e3", "limit=0x10", "limit=",
                             "limit=4294967296", "limit=99999999999999999999"}) {
         INFO(bad);
         auto res = h.sink.Get(std::string("/api/v1/audit?") + bad);
         REQUIRE(res);
         CHECK(res->status == 400);
     }
-    // An empty value keeps its long-standing meaning (default page size); a clean one works.
-    auto empty = h.sink.Get("/api/v1/audit?limit=");
-    REQUIRE(empty);
-    CHECK(empty->status == 200);
+    // Omitting the parameter keeps the default page size; a clean value works.
+    auto absent = h.sink.Get("/api/v1/audit");
+    REQUIRE(absent);
+    CHECK(absent->status == 200);
     auto ok = h.sink.Get("/api/v1/audit?limit=10");
     REQUIRE(ok);
     CHECK(ok->status == 200);

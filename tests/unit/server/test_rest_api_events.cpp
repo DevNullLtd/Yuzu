@@ -34,6 +34,7 @@
 #include "device_token_store.hpp"
 #include "event_bus.hpp"
 #include "execution_event_bus.hpp"
+#include "query_int_parse.hpp"
 #include "stream_budget.hpp"
 #include "execution_tracker.hpp"
 #include "pg/pg_raii.hpp"
@@ -686,7 +687,7 @@ TEST_CASE("GET /api/v1/events: ?since param replays buffered events", "[pg][even
     REQUIRE(h.event_bus->subscriber_count(exec_id) == 1);
 }
 
-TEST_CASE("GET /api/v1/events: an invalid ?since is a 400, not a silent no-replay",
+TEST_CASE("GET /api/v1/events: an invalid ?since is a 400 and not a silent no-replay",
           "[pg][events][replay]") {
     RestEventsHarness h;
     auto exec_id = h.make_exec("running");
@@ -876,8 +877,8 @@ TEST_CASE("GET /api/v1/events: Last-Event-ID header drives replay when ?since ab
     REQUIRE(snap.size() == 3);
 }
 
-TEST_CASE("GET /api/v1/events: ?since query takes precedence over Last-Event-ID header (with "
-          "header injected)",
+TEST_CASE("GET /api/v1/events: ?since query takes precedence over Last-Event-ID header "
+          "with header injected",
           "[pg][events][replay]") {
     // Paired with the existing `?since` precedence test — that one
     // proves `?since` alone works; this one proves `?since` WINS when
@@ -1693,7 +1694,7 @@ TEST_CASE("GET /api/v1/events: a malformed ?since is a 400 and never subscribes"
     }
 }
 
-TEST_CASE("GET /api/v1/events: a malformed Last-Event-ID header means no replay, not a 400",
+TEST_CASE("GET /api/v1/events: a malformed Last-Event-ID header is live only and not a 400",
           "[pg][events][replay][numeric_params]") {
     for (const char* bad : {"5abc", "-1", "0x10", "", "99999999999999999999"}) {
         RestEventsHarness h;
@@ -1705,4 +1706,80 @@ TEST_CASE("GET /api/v1/events: a malformed Last-Event-ID header means no replay,
         CHECK(res->status == 200);
         CHECK(h.event_bus->subscriber_count(exec_id) == 1);
     }
+}
+
+// ── #4644 Gate 8 round 4: a malformed Last-Event-ID is LIVE ONLY, never replay-everything ─────
+// A cursor of 0 replays the whole ring buffer (every id is > 0), so the old `-> 0` fallback
+// replayed up to 1000 events as duplicates while the comment, upgrading.md and the test above
+// all said "no replay". TestRouteSink cannot drain a chunked SSE body, so the frame count is
+// taken from the REAL bus with the cursor the routes use (sse_cursor_from_header is the one
+// helper shared by /api/v1/events and the workflow stream).
+TEST_CASE("sse_cursor_from_header: a malformed header replays zero buffered events",
+          "[events][replay][numeric_params]") {
+    using yuzu::server::sse_cursor_from_header;
+    for (const char* bad : {"-1", "5abc", "0x10", "", " 3", "+3", "99999999999999999999"}) {
+        INFO("Last-Event-ID=" << bad);
+        const auto cur = sse_cursor_from_header(bad);
+        CHECK(cur.live_only);
+
+        ExecutionEventBus bus;
+        for (int i = 0; i < 3; ++i)
+            bus.publish("exec-1", "agent-transition", R"({"agent_id":"a"})", false);
+        int replayed = 0;
+        const auto sub = bus.subscribe_and_replay(
+            "exec-1", cur.since_id, [&replayed](const ExecutionEvent&) { ++replayed; });
+        CHECK(replayed == 0);
+        // Live delivery is unaffected by the maximum cursor.
+        bus.publish("exec-1", "agent-transition", R"({"agent_id":"b"})", false);
+        CHECK(replayed == 1);
+        bus.unsubscribe("exec-1", sub);
+    }
+}
+
+TEST_CASE("sse_cursor_from_header: a valid header replays exactly the tail",
+          "[events][replay][numeric_params]") {
+    using yuzu::server::sse_cursor_from_header;
+    struct Case {
+        const char* header;
+        int expected_replayed;
+    };
+    for (const Case c : {Case{"0", 3}, Case{"1", 2}, Case{"2", 1}, Case{"3", 0}, Case{"002", 1},
+                         Case{"9000", 0}}) {
+        INFO("Last-Event-ID=" << c.header);
+        const auto cur = sse_cursor_from_header(c.header);
+        CHECK_FALSE(cur.live_only);
+        ExecutionEventBus bus;
+        for (int i = 0; i < 3; ++i)
+            bus.publish("exec-1", "agent-transition", R"({"agent_id":"a"})", false);
+        int replayed = 0;
+        bus.subscribe_and_replay("exec-1", cur.since_id,
+                                 [&replayed](const ExecutionEvent&) { ++replayed; });
+        CHECK(replayed == c.expected_replayed);
+    }
+}
+
+// A rejected `?since` must leave NO success audit row and must be answered BEFORE the stream
+// lease is taken: the harness default (no budget) cannot see either order, so wire a budget with
+// its single slot already held. A reorder would turn the 400 into a 429.
+TEST_CASE("GET /api/v1/events: a bad since is a 400 before the budget and before the audit row",
+          "[pg][events][admission][numeric_params]") {
+    yuzu::server::detail::StreamBudget budget{
+        yuzu::server::detail::StreamBudget::Config{/*global_cap=*/1}};
+    auto held = budget.try_acquire(yuzu::server::detail::SseSurface::kApiEvents, "someone-else",
+                                   yuzu::server::detail::kPerPrincipalApiEvents);
+    REQUIRE(held.lease);
+
+    RestEventsHarness h{/*with_bus=*/true, /*with_tracker=*/true, &budget};
+    const auto exec_id = h.make_exec("running");
+    const auto before = h.audit_log.size();
+    for (const char* bad : {"5abc", "-1", ""}) {
+        INFO("since=" << bad);
+        auto res = h.sink.Get("/api/v1/events?execution_id=" + exec_id + "&since=" + bad);
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        CHECK(budget.active() == 1);
+        CHECK(h.event_bus->subscriber_count(exec_id) == 0);
+    }
+    for (std::size_t i = before; i < h.audit_log.size(); ++i)
+        CHECK(h.audit_log[i].result != "success");
 }

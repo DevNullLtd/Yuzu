@@ -80,6 +80,7 @@
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
+#include <limits>
 #include <atomic>
 #include <cctype>
 #include <charconv>
@@ -1224,7 +1225,7 @@ const std::string& openapi_spec() {
       "get": {"summary": "Guaranteed State alerts", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Read. Placeholder — alert aggregation lands in Guardian PR 11.", "responses": {"200": {"description": "Alerts list (empty in PR 2)"}}}
     },
     "/events": {
-      "get": {"summary": "Subscribe to per-execution live events (JSON SSE)", "tags": ["Events"], "description": "Authenticated agentic-first JSON Server-Sent Events channel (sprint W5.1). Gated by the ADR-0017 admit-then-filter fleet-read primitive (Execution:Read) — an execution with no agent visible to the caller 404s identically to a nonexistent one; a confined subscriber's agent-transition events are filtered to their in-scope agents, execution-progress is withheld, and execution-completed carries only the real terminal status (no fleet-wide counts). Reuses the per-execution ExecutionEventBus that backs the dashboard /sse/executions/{id} route. Each SSE frame carries an `id:`, `event:` (one of `agent-transition`, `execution-progress`, `execution-completed`, plus the synthetic `replay-gap` / `events-dropped` / `heartbeat`), and a JSON `data:` payload conforming to ExecutionSseEvent. Reconnect via `Last-Event-ID` request header OR `?since=<event_id>` query (query wins). Non-integer `?since` values silently degrade to 0 (no replay). On reconnect after the per-execution ring buffer has evicted older events (FIFO, ~1000 events / ~30s window), a synthetic `replay-gap` frame is emitted as the first event so the worker knows state may be inconsistent. A slow consumer that lets the per-connection queue fill receives a synthetic `events-dropped` envelope summarising the drop count rather than silent OOM growth. Errors use the A4 envelope (ErrorEnvelope schema). Response headers always include X-Correlation-Id; Sec-Audit-Failed: true is set when audit persistence fails (CC6.6 contract).", "parameters": [{"name": "execution_id", "in": "query", "required": true, "schema": {"type": "string", "pattern": "^[A-Za-z0-9_-]{1,128}$"}, "description": "Execution to subscribe to. Unfiltered subscription is reserved for sprint W5.2."}, {"name": "since", "in": "query", "schema": {"type": "integer", "minimum": 0}, "description": "Replay events with id > since. Overrides Last-Event-ID header. Non-integer values silently degrade to 0."}, {"name": "Last-Event-ID", "in": "header", "schema": {"type": "string"}, "description": "Browser EventSource auto-reconnect header. Ignored when `since` is set."}], "responses": {"200": {"description": "SSE stream. Content-Type: text/event-stream. Each `data:` line is an ExecutionSseEvent.", "headers": {"X-Correlation-Id": {"schema": {"type": "string"}}, "Sec-Audit-Failed": {"schema": {"type": "string", "enum": ["true"]}, "description": "Present when audit row persistence failed; subscription still proceeds (CC6.6 evidence chain)."}}, "content": {"text/event-stream": {"schema": {"$ref": "#/components/schemas/ExecutionSseEvent"}}}}, "400": {"description": "Missing or malformed execution_id", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "401": {"description": "Authentication required"}, "403": {"description": "Insufficient permission (Execution:Read)"}, "404": {"description": "Execution not found", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "410": {"description": "Execution already terminal — subscribe-time stream is no longer available", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "503": {"description": "Tracker or event bus not initialised; envelope includes retry_after_ms.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}}}
+      "get": {"summary": "Subscribe to per-execution live events (JSON SSE)", "tags": ["Events"], "description": "Authenticated agentic-first JSON Server-Sent Events channel (sprint W5.1). Gated by the ADR-0017 admit-then-filter fleet-read primitive (Execution:Read) — an execution with no agent visible to the caller 404s identically to a nonexistent one; a confined subscriber's agent-transition events are filtered to their in-scope agents, execution-progress is withheld, and execution-completed carries only the real terminal status (no fleet-wide counts). Reuses the per-execution ExecutionEventBus that backs the dashboard /sse/executions/{id} route. Each SSE frame carries an `id:`, `event:` (one of `agent-transition`, `execution-progress`, `execution-completed`, plus the synthetic `replay-gap` / `events-dropped` / `heartbeat`), and a JSON `data:` payload conforming to ExecutionSseEvent. Reconnect via `Last-Event-ID` request header OR `?since=<event_id>` query (query wins). A `?since` that is not one non-negative base-10 integer is a 400 (answered before the stream budget is touched and before the success audit row); a malformed `Last-Event-ID` header is served live only (nothing replayed). On reconnect after the per-execution ring buffer has evicted older events (FIFO, ~1000 events / ~30s window), a synthetic `replay-gap` frame is emitted as the first event so the worker knows state may be inconsistent. A slow consumer that lets the per-connection queue fill receives a synthetic `events-dropped` envelope summarising the drop count rather than silent OOM growth. Errors use the A4 envelope (ErrorEnvelope schema). Response headers always include X-Correlation-Id; Sec-Audit-Failed: true is set when audit persistence fails (CC6.6 contract).", "parameters": [{"name": "execution_id", "in": "query", "required": true, "schema": {"type": "string", "pattern": "^[A-Za-z0-9_-]{1,128}$"}, "description": "Execution to subscribe to. Unfiltered subscription is reserved for sprint W5.2."}, {"name": "since", "in": "query", "schema": {"type": "integer", "minimum": 0}, "description": "Replay events with id > since. Overrides Last-Event-ID header. A value that is not one non-negative base-10 integer is a 400."}, {"name": "Last-Event-ID", "in": "header", "schema": {"type": "string"}, "description": "Browser EventSource auto-reconnect header. Ignored when `since` is set."}], "responses": {"200": {"description": "SSE stream. Content-Type: text/event-stream. Each `data:` line is an ExecutionSseEvent.", "headers": {"X-Correlation-Id": {"schema": {"type": "string"}}, "Sec-Audit-Failed": {"schema": {"type": "string", "enum": ["true"]}, "description": "Present when audit row persistence failed; subscription still proceeds (CC6.6 evidence chain)."}}, "content": {"text/event-stream": {"schema": {"$ref": "#/components/schemas/ExecutionSseEvent"}}}}, "400": {"description": "Missing or malformed execution_id, or a malformed since", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "401": {"description": "Authentication required"}, "403": {"description": "Insufficient permission (Execution:Read)"}, "404": {"description": "Execution not found", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "410": {"description": "Execution already terminal — subscribe-time stream is no longer available", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "503": {"description": "Tracker or event bus not initialised; envelope includes retry_after_ms.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}}}
     },
     "/executions": {
       "get": {"summary": "List executions, fleet-confined (#4030)", "tags": ["Events"], "description": "REST v1 twin of the dashboard /fragments/executions list fragment and the widened MCP list_executions tool (docs/api-twin-recipe.md Rule 1 — all three call the same execution_list_row_json builder). Gated on the ADR-0017 fleet-read primitive (Execution:Read via fleet_read_fn), the same gate the fragment now uses (#3526). Rows carry the definition name (resolved + memoized per request) and a truncated last_error_detail preview alongside the existing agents_targeted/responded/success/failure split.", "parameters": [{"name": "definition_id", "in": "query", "required": false, "schema": {"type": "string"}}, {"name": "status", "in": "query", "required": false, "schema": {"type": "string"}}, {"name": "limit", "in": "query", "required": false, "schema": {"type": "integer", "default": 100, "maximum": 500}}], "responses": {"200": {"description": "Execution list", "headers": {"X-Correlation-Id": {"schema": {"type": "string"}}}}, "400": {"description": "Invalid numeric query parameter"}, "401": {"description": "Authentication required"}, "403": {"description": "Insufficient permission (Execution:Read)"}, "503": {"description": "Execution tracker not initialised or degraded; envelope includes retry_after_ms.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}}}
@@ -8067,7 +8068,9 @@ void RestApiV1::register_routes(
 
                  AuditQuery q;
                  auto limit_str = req.get_param_value("limit");
-                 if (!limit_str.empty()) {
+                 // `has_param`, not `!empty()`: a present-but-empty `?limit=` is malformed
+                 // (like every other converted route), not an absent parameter.
+                 if (req.has_param("limit")) {
                      try {
                          q.limit = strict_stoi(limit_str);
                      } catch (const std::exception&) {
@@ -18429,6 +18432,37 @@ void RestApiV1::register_routes(
             return;
         }
 
+        // Replay window. `since` query param overrides
+        // `Last-Event-ID` header — explicit operator intent beats
+        // browser auto-reconnect inference. The cursor is ONE non-negative base-10
+        // integer: `stoull` accepted "-1" (wrapping to a cursor past every event) and
+        // "5abc" (as 5), so a typo replayed the wrong window without telling anyone.
+        // A malformed `since` QUERY parameter is the caller's explicit input and is a
+        // 400 (answered before the stream budget is touched). A malformed
+        // `Last-Event-ID` HEADER is browser-supplied inference, so a malformed one is
+        // served LIVE ONLY (no replay, never the whole buffer) rather than failing a
+        // reconnect. The parse runs BEFORE the success audit row so a rejected request
+        // leaves no success row, and before the stream lease.
+        std::uint64_t since_id = 0;
+        bool live_only = false;
+        if (req.has_param("since")) {
+            const auto v = yuzu::server::parse_query_int<long long>(req.get_param_value("since"));
+            if (!v || *v < 0) {
+                res.status = 400;
+                res.set_content(detail::a4_error(res, "invalid numeric query parameter: since"),
+                                "application/json");
+                return;
+            }
+            since_id = static_cast<std::uint64_t>(*v);
+        } else if (req.has_header("Last-Event-ID")) {
+            // A malformed header is LIVE ONLY: since_id 0 would replay the whole ring buffer.
+            const auto cursor =
+                yuzu::server::sse_cursor_from_header(req.get_header_value("Last-Event-ID"));
+            since_id = cursor.since_id;
+            live_only = cursor.live_only;
+        }
+
+
         // Audit BEFORE the chunked provider takes over — once
         // set_chunked_content_provider runs, headers are sealed.
         // Audit failure surfaces via `Sec-Audit-Failed: true`
@@ -18451,31 +18485,6 @@ void RestApiV1::register_routes(
         // text/event-stream content type. governance round
         // security-guardian LOW-2.
         res.set_header("X-Content-Type-Options", "nosniff");
-
-        // Replay window. `since` query param overrides
-        // `Last-Event-ID` header — explicit operator intent beats
-        // browser auto-reconnect inference. The cursor is ONE non-negative base-10
-        // integer: `stoull` accepted "-1" (wrapping to a cursor past every event) and
-        // "5abc" (as 5), so a typo replayed the wrong window without telling anyone.
-        // A malformed `since` QUERY parameter is the caller's explicit input and is a
-        // 400 (answered before the stream budget is touched). A malformed
-        // `Last-Event-ID` HEADER is browser-supplied inference, so it keeps the neutral
-        // "no replay" outcome rather than failing a reconnect.
-        std::uint64_t since_id = 0;
-        if (req.has_param("since")) {
-            const auto v = yuzu::server::parse_query_int<long long>(req.get_param_value("since"));
-            if (!v || *v < 0) {
-                res.status = 400;
-                res.set_content(detail::a4_error(res, "invalid numeric query parameter: since"),
-                                "application/json");
-                return;
-            }
-            since_id = static_cast<std::uint64_t>(*v);
-        } else if (req.has_header("Last-Event-ID")) {
-            const auto v =
-                yuzu::server::parse_query_int<long long>(req.get_header_value("Last-Event-ID"));
-            since_id = (v && *v >= 0) ? static_cast<std::uint64_t>(*v) : 0;
-        }
 
         // Admission control (ADR-0034). This response is about to hold an httplib worker for
         // the life of the subscription, so it leases from the ONE budget every streaming
@@ -18558,7 +18567,7 @@ void RestApiV1::register_routes(
         // `SseSinkState::pre_emit` instead; the content provider
         // drains it on first invocation BEFORE the bounded queue
         // drain. governance R2 fix for unhappy-NEW-1 HIGH.
-        if (since_id > 0) {
+        if (since_id > 0 && !live_only) {
             auto snap = execution_event_bus->snapshot(exec_id);
             if (!snap.empty() && snap.front().id > since_id + 1) {
                 detail::SseEvent gap_sse;
