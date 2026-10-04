@@ -448,6 +448,8 @@ The first frame surfaces every device × source pair where the collector has bee
 
 **Columns:** device hostname, source pill, paused since (UTC), paused for (coarse age), live rows count, oldest data age.
 
+**Partial result banner (#4644).** The scan's response read is capped at 10,000 rows and 50 MiB of response payload. When either cap cuts it, the page shows a "Partial result" banner above the table, the header counts ("responded", "have all sources collecting normally") are marked as describing only the responses that were read, and, if no paused rows are in the part that was read, the empty state says the page cannot tell and that Refresh will not change it (the cut repeats), instead of "still in progress" or "running normally". Dropped responses read as agents that never answered, so the banner is NOT confirmation that every collector is running normally: narrow the scan to a smaller management group and scan again. The same condition is `result_truncated_by_cap: true` in `GET /api/v1/tar/retention-paused` and the `list_tar_retention_paused` tool, which also set `store_degraded: true` for a cut scan so an older client sees an incomplete result.
+
 **Row states.** Beyond a normal paused row (with a timestamp), the table surfaces two conditions and floats both to the top of the list so they aren't missed:
 
 - **"schema older than server" badge** — the agent reported the source disabled but sent no `paused_at` timestamp, i.e. it is a pre-v0.12.0 agent that lacks the field. The row sorts as the oldest entry. **Action:** upgrade the agent so it records the transition time.

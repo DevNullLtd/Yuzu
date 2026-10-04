@@ -3128,12 +3128,17 @@ std::string DashboardRoutes::render_tar_retention_paused(
         "Scan <code>{}</code> &middot; dispatched to <strong>{}</strong> "
         "agent{} in your scope {} &middot; <strong>{}</strong> in-scope "
         "responded &middot; <strong>{}</strong> have all sources collecting "
-        "normally",
+        "normally{}",
         html_escape(scan_id),
         scan_count, scan_count == 1 ? "" : "s",
         format_age(scan_at, now),
         agents_responded,
-        agents_with_no_paused_sources);
+        agents_with_no_paused_sources,
+        // A cut read drops whole responses, so these counts describe only the
+        // responses that were read.
+        scan.result_truncated_by_cap
+            ? " <em>in the responses read (partial result, see below)</em>"
+            : "");
     if (agents_filtered_out_of_scope > 0) {
         html += std::format(" &middot; <strong>{}</strong> out-of-scope "
                             "agent{} dropped",
@@ -3156,7 +3161,20 @@ std::string DashboardRoutes::render_tar_retention_paused(
         // from "the store couldn't be read" — conflating the last with either
         // of the first two tells the operator every collector is fine (or
         // just slow) when the truth is the read failed.
-        if (store_degraded) {
+        if (scan.result_truncated_by_cap) {
+            // The cut persists across Refresh (the read is capped the same way each
+            // time), so neither "still in progress" nor "all clear" is true: say the
+            // page cannot tell, and what to do.
+            html += "<div class=\"empty-state result-degrade-banner\">"
+                    "<b>No paused sources in the partial result.</b> The response "
+                    "read was cut at its cap, so this page cannot tell whether "
+                    "paused sources exist on the agents whose responses were "
+                    "dropped. This is <b>not</b> confirmation that every "
+                    "collector is running normally, and Refresh will not change "
+                    "it. Narrow the scan to a smaller management group and "
+                    "scan again."
+                    "</div>";
+        } else if (store_degraded) {
             html += "<div class=\"empty-state result-degrade-banner\">"
                     "<b>Retention state unavailable.</b> The response store "
                     "could not be read (Postgres pool/query degraded). This is "

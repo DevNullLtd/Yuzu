@@ -328,7 +328,12 @@ std::string tar_retention_paused_json(const TarRetentionPausedScan& scan) {
                {"agents_responded", scan.agents_responded},
                {"agents_with_no_paused_sources", scan.agents_with_no_paused_sources},
                {"agents_filtered_out_of_scope", scan.agents_filtered_out_of_scope},
-               {"store_degraded", scan.store_degraded},
+               // A cut scan also reports store_degraded so a client that predates
+               // result_truncated_by_cap still sees the result is not complete;
+               // result_truncated_by_cap is the discriminator between "the read failed"
+               // and "the read was cut". The dashboard page uses the two fields
+               // separately (scan.store_degraded stays "the read failed").
+               {"store_degraded", scan.store_degraded || scan.result_truncated_by_cap},
                {"result_truncated_by_cap", scan.result_truncated_by_cap},
                {"rows", rows_json}}
         .dump();
