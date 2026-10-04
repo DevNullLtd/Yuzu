@@ -39,7 +39,7 @@ param(
 # wrote an empty hash and still exited 0.
 $ErrorActionPreference = 'Stop'
 
-# Use Windows PowerShell's own modules (#5176). Built without any cmdlet, so
+# Use Windows PowerShell's own modules, then the machine-wide path (#5176). Built without any cmdlet, so
 # nothing here depends on the path it is fixing.
 $env:PSModulePath = $PSHOME + '\Modules;' + [Environment]::GetEnvironmentVariable('PSModulePath', 'Machine')
 

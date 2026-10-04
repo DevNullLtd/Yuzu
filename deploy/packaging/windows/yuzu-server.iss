@@ -9,10 +9,12 @@
 ;                          the existing accounts.
 ;   /OPERATOR_USER=name    Operator username (optional; only with /ADMIN_PASS)
 ;   /OPERATOR_PASS=pass    Operator password (required with /OPERATOR_USER, min 12 chars)
-;   /POSTGRES_DSN_FILE=f   File holding the PostgreSQL connection string (required
-;                          on a fresh install unless /POSTGRES_DSN is given; kept
-;                          on an upgrade). Preferred: unlike /POSTGRES_DSN it keeps
-;                          the password out of the /LOG= file.
+;   /POSTGRES_DSN_FILE=f   File holding the PostgreSQL connection string. One of
+;                          this or /POSTGRES_DSN is required on a fresh install and
+;                          on an upgrade from any earlier version (none stored one),
+;                          unless a YUZU_POSTGRES_DSN environment variable is set;
+;                          later upgrades keep the stored one. Preferred: unlike
+;                          /POSTGRES_DSN it keeps the password out of the /LOG= file.
 ;   /POSTGRES_DSN=dsn      The PostgreSQL connection string itself
 ;   /GATEWAY               Enable gateway mode
 ;   /GATEWAY_ADDR=h:p      Gateway command address (default: localhost:50063)
@@ -35,9 +37,11 @@
 ; an input was invalid or missing, or the data directory, certificates,
 ; secrets or configuration could not be secured (#5196, #5210, #5272). The
 ; reason is in the setup log (/LOG=<file>), on a line starting
-; "PrepareToInstall:"; a service already stopped by then stays stopped. 10 the
-; files were installed but the service could not be registered or its command
-; line could not be written and confirmed; the service is disabled.
+; "PrepareToInstall:". A service already stopped by then stays stopped, unless
+; the abort came before the old directory was moved (it is then restarted). 10
+; the files were installed but the service could not be registered or its
+; command line could not be written and confirmed; Setup disables the service
+; if it can, and says whether it did.
 ;
 ; THE SETUP LOG RECORDS THE FULL COMMAND LINE, including any /ADMIN_PASS=,
 ; /OPERATOR_PASS=, /POSTGRES_DSN= or /OIDC_CLIENT_SECRET= value. Prefer the
@@ -1532,6 +1536,7 @@ var
   ResultCode: Integer;
   BinPath, Want, Got, Key: string;
   Ok: Boolean;
+  StartType: Cardinal;
 begin
   if CurStep = ssPostInstall then
   begin
@@ -1557,14 +1562,20 @@ begin
       ServiceSetupFailed := True;
       Exec(ExpandConstant('{sys}\sc.exe'), 'config YuzuServer start= disabled', '', SW_HIDE,
            ewWaitUntilTerminated, ResultCode);
+      // Confirm it rather than claim it: whatever blocked the command line may
+      // block this too, and an unregistered service has nothing to disable.
+      if RegQueryDWordValue(HKLM, Key, 'Start', StartType) and (StartType = 4) then
+        Got := 'The service has been disabled rather than left to run with an old command line.'
+      else
+        Got := 'The service could NOT be disabled (or is not registered): if it exists, disable ' +
+               'it yourself (sc config YuzuServer start= disabled) until this is fixed.';
       Log('CurStepChanged: the YuzuServer service could not be registered, or its command line ' +
           'could not be written and confirmed (security software may have blocked the change). ' +
-          'The service has been DISABLED; Setup exits with code 10.');
+          Got + ' Setup exits with code 10.');
       SuppressibleMsgBox('The Yuzu Server files were installed, but the YuzuServer service could ' +
         'not be registered, or its command line could not be written and confirmed -- security ' +
-        'software may have blocked the change. The service has been disabled rather than left ' +
-        'running with an old command line. Allow the change and run the installer again.',
-        mbError, MB_OK, IDOK);
+        'software may have blocked the change. ' + Got + ' Allow the change and run the ' +
+        'installer again.', mbError, MB_OK, IDOK);
     end
     else if ShouldStartService then
       Exec(ExpandConstant('{sys}\sc.exe'), 'start YuzuServer', '', SW_HIDE,
@@ -1583,9 +1594,8 @@ end;
 //   SECURED   it exists and its top folder is exactly locked. Everything in it
 //             must be owned by Administrators or SYSTEM and contain no link;
 //             new files are written in place, then the top-level entries,
-//             certs\* and data\* are reset to inherit (the server applies its
-//             own protected DACL to its key folder and files, which is
-//             equivalent but not inherited), and the whole tree is verified.
+//             certs\* and data\* are reset to inherit and made
+//             Administrators-owned, and the whole tree is verified.
 //   INSECURE  it exists but is not locked -- every version before this one
 //             left it so. Only if an administrator installed a server here
 //             before (RegisteredInstall) is it upgraded: a fresh locked
@@ -1734,8 +1744,8 @@ begin
     begin
       if EnvVarSet('YUZU_POSTGRES_DSN') then
         Log('PrepareToInstall: no connection string was given or stored; the server will use ' +
-            'the machine-wide YUZU_POSTGRES_DSN environment variable, which every local user ' +
-            'can read. Pass /POSTGRES_DSN_FILE= to store it in the locked data directory instead.')
+            'the YUZU_POSTGRES_DSN environment variable (machine-wide or the service''s), which ' +
+            'local users can read. Pass /POSTGRES_DSN_FILE= to store it in the locked data directory instead.')
       else
         Result := 'A PostgreSQL connection string is required: the server does not start ' +
                   'without one (ADR-0006). Give /POSTGRES_DSN_FILE=<file> (recommended: it keeps ' +
@@ -1755,7 +1765,8 @@ begin
     if not RegQueryStringValue(HKLM, 'SYSTEM\CurrentControlSet\Services\YuzuServer', 'ImagePath',
                                OldImagePath) then
       OldImagePath := '';
-    if Pos('--oidc-client-secret ', OldImagePath) > 0 then
+    if (Pos('--oidc-client-secret ', OldImagePath) > 0) or
+       (Pos('--oidc-client-secret=', OldImagePath) > 0) then
       Result := 'The service''s current command line carries an OIDC client secret (readable by ' +
                 'local users), and it is not stored anywhere else. ' +
                 'Give it again with /OIDC_CLIENT_SECRET_FILE=<file> (or in the wizard), so it is ' +
@@ -1931,7 +1942,15 @@ begin
         end;
       end;
       if Result <> '' then
+      begin
         DelTree(Stage, True, True, True);
+        // Nothing has been changed yet (the old directory is still in place),
+        // so put the service back the way it was.
+        if StoppedRunningService and
+           Exec(ExpandConstant('{sys}\sc.exe'), 'start YuzuServer', '', SW_HIDE,
+                ewWaitUntilTerminated, ResultCode) and (ResultCode = 0) then
+          StoppedRunningService := False;
+      end;
     end;
     if Result = '' then
     begin
@@ -1963,8 +1982,11 @@ begin
       end
       else if State = StateInsecure then
         Log('PrepareToInstall: the previous, unsecured data directory was kept as ' + Aside +
-            '. Delete it once the upgrade is confirmed: it may still hold old password ' +
-            'hashes and keys that local users could read.');
+            '. Its data\ subdirectories (agent-updates, upload-blobs: packages and uploads the ' +
+            'database refers to) were NOT carried: check them, then move them into the new data\ ' +
+            'before deleting it (see the upgrade note in the server administration guide). Then ' +
+            'delete it: it still holds the old password hashes and keys, which local users could ' +
+            'read -- rotate them.');
     end;
   end;
 
