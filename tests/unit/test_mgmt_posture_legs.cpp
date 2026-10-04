@@ -5,7 +5,7 @@
  */
 #include <catch2/catch_test_macros.hpp>
 
-#include "../../agents/plugins/mgmt_posture/src/mgmt_posture_legs.hpp"
+#include "mgmt_posture_legs.hpp"
 
 #include <algorithm>
 #include <map>

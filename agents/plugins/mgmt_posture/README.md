@@ -20,7 +20,7 @@ On Linux the leg reads `/etc/sssd/sssd.conf` and the `/etc/sssd/conf.d/*.conf` s
 
 ```mermaid
 flowchart LR
-  OP[Operator / workflow] --> SRV[Server<br/>authz: Security.Read]
+  OP[Operator / workflow] --> SRV[Server<br/>authz: Inventory.Read]
   SRV -- gRPC mTLS --> HOST[Agent plugin host] --> EX[mgmt_posture.execute]
   EX --> WIN[Windows leg<br/>status row only: windows:planned]
   EX --> MAC[macOS leg<br/>profiles status -type enrollment via bounded runner]

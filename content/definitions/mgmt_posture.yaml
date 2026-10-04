@@ -27,7 +27,8 @@ metadata:
     Linux, the plane (none, ad, ipa or unknown) from the SSSD active domains
     in sssd.conf and conf.d and the IPA default.conf, plus whether
     /etc/krb5.keytab is present. On macOS, MDM enrolment and the MDM server
-    host from the profiles tool. The Windows leg is planned and not yet read.
+    host from the profiles tool. The Windows leg is planned and not yet read; the
+    plane values workgroup, aad and hybrid and the tenant_id row are reserved for it.
     The configuration is reported as written, not the live join state, and a
     refused read is permission_denied, never not-joined. Domain, OU and joined
     state are device_identity's and are not repeated here. A leading status row
@@ -52,7 +53,8 @@ spec:
     # row always comes first.
     #
     #   status|posture|<supported|constrained|permission_denied|unsupported>|<reason or ->
-    #   plane|<none|workgroup|ad|aad|hybrid|ipa|unknown>      (Linux; macOS emits "-")
+    #   plane|<none|workgroup|ad|aad|hybrid|ipa|unknown>      (Linux; macOS emits "-"; workgroup, aad and hybrid are
+    #                                                          reserved for the Windows leg and never emitted today)
     #   mdm_enrolled|<true|false|->                           (macOS; Linux emits "-")
     #   mdm_provider|<MDM server host|->                      (macOS; Linux emits "-")
     #   tenant_id|-                                           (reserved; always "-" today)

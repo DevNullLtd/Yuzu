@@ -40,7 +40,7 @@
       "author_roles": [
         "content-author"
       ],
-      "description": "Reports which management plane controls the device, as facts only. On Linux, the plane (none, ad, ipa or unknown) from the SSSD active domains in sssd.conf and conf.d and the IPA default.conf, plus whether /etc/krb5.keytab is present. On macOS, MDM enrolment and the MDM server host from the profiles tool. The Windows leg is planned and not yet read. The configuration is reported as written, not the live join state, and a refused read is permission_denied, never not-joined. Domain, OU and joined state are device_identity's and are not repeated here. A leading status row states whether the read was complete.",
+      "description": "Reports which management plane controls the device, as facts only. On Linux, the plane (none, ad, ipa or unknown) from the SSSD active domains in sssd.conf and conf.d and the IPA default.conf, plus whether /etc/krb5.keytab is present. On macOS, MDM enrolment and the MDM server host from the profiles tool. The Windows leg is planned and not yet read; the plane values workgroup, aad and hybrid and the tenant_id row are reserved for it. The configuration is reported as written, not the live join state, and a refused read is permission_denied, never not-joined. Domain, OU and joined state are device_identity's and are not repeated here. A leading status row states whether the read was complete.",
       "display_name": "Management Posture",
       "execute_roles": [
         "endpoint-admin",

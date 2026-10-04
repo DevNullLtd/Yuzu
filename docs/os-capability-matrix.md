@@ -8,7 +8,7 @@ whole agent surface, grouped into sections: **agent core**, **Guardian guards**,
 **Spark detection mechanisms**, **DEX**, **TAR warehouse capture sources**,
 **inventory / daily-sync sources**, **live device snapshot**, **security posture
 & file/certificate surfaces**, **network quality**, and every **agent plugin**
-(68).
+(69).
 
 **Read this first — accuracy & drift.** This is a *curated snapshot*, and a
 hand-maintained matrix drifts from code exactly the way the gap above happened.
@@ -123,7 +123,7 @@ duplicates.
 | interaction | ✅ | ✅ | 🟡 | win/apple/linux branches. macOS caveat: as a GUI-less root LaunchDaemon `message_box` can't reach a WindowServer session — the `osascript` leg reports an honest `status\|not_reachable` (never a fabricated `response\|ok`), decoded via pure `interaction_parsers.hpp` in `interaction_plugin.cpp`; delivering the dialog to the logged-in user is a deferred per-session helper |
 | ioc | ✅ | ✅ | ✅ | win/linux/apple all implemented |
 | license_scan | ✅ | ✅ | ✅ | per-OS TUs `licensing_{win,linux,macos}.cpp` (feeds SLE sync) |
-| mgmt_posture | 🟡 | ✅ | 🔜 | Read-only device-management posture, one `posture` action (rung 1 on Linux, rung 2 on macOS). Linux: `/etc/sssd/sssd.conf` plus `conf.d/*.conf` active SSSD domains (`ad`/`ipa`/`ldap`/`other`), `/etc/ipa/default.conf` and `/etc/krb5.keytab` presence, bounded file reads of the configuration as written, not the live join state; a 0600 `sssd.conf` read as an unprivileged agent reports `permission_denied`, never not-joined. macOS: MDM enrolment from `/usr/bin/profiles status -type enrollment` through the bounded argv runner (AD binding stays `device_identity.domain`; Jamf is not read). Windows is a PLANNED placeholder that reports one `unsupported` status row (`windows:planned`); the `NetGetJoinInformation`/Enrollments-registry leg follows as its own PR. |
+| mgmt_posture | 🔜 | ✅ | ✅ | Read-only device-management posture, one `posture` action (rung 1 on Linux, rung 2 on macOS). Linux: `/etc/sssd/sssd.conf` plus `conf.d/*.conf` active SSSD domains (plane `ad`, `ipa` or `none`), `/etc/ipa/default.conf` and `/etc/krb5.keytab` presence, bounded file reads of the configuration as written, not the live join state; a 0600 `sssd.conf` read as an unprivileged agent reports `permission_denied`, never not-joined. macOS: MDM enrolment from `/usr/bin/profiles status -type enrollment` through the bounded argv runner (AD binding stays `device_identity.domain`; Jamf is not read). Windows is a PLANNED placeholder that reports one `unsupported` status row (`windows:planned`); the `NetGetJoinInformation`/Enrollments-registry leg follows as its own PR. |
 | msi_packages | ✅ | ⛔ | ✅ | Win MSI (`MsiEnumProductsA`); macOS `pkgutil --pkgs`/`--pkg-info` receipts (reverse-domain id / derived name / version / install location) — pure parser `msi_packages_macos.hpp` + `__APPLE__` branch in `msi_packages_plugin.cpp` (500-pkg cap, `__truncated__` sentinel); Linux `#else` → "platform not supported" |
 | netprobe | ✅ | ✅ | ✅ | `_WIN32` vs POSIX portable sockets |
 | netstat | ✅ | ✅ | ✅ | linux/apple/win branches. `attribution` action additionally resolves the owning process's name/path (folds the retired sockwho plugin in, #3403) |

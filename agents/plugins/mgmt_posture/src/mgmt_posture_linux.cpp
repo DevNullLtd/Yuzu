@@ -76,12 +76,11 @@ struct DirDeleter {
     void operator()(DIR* d) const noexcept { ::closedir(d); }
 };
 
-/// Lists conf.d `*.conf` names (no dotfiles) into `out`, sorted byte-wise and cut to the
-/// first kMaxSnippets. Memory is bounded: only the smallest kMaxSnippets+1 names are ever
-/// retained and at most kMaxDirEntries entries are examined; either overflow sets
-/// `too_many` (the caller reports constrained). Returns 0, or the errno of a failed
-/// opendir/readdir (a readdir error is NOT an end-of-directory: ENOENT only means absent
-/// when it comes from opendir).
+/// Lists conf.d `*.conf` names (no dotfiles) into `out`, sorted and cut to kMaxSnippets by
+/// finalize_snippets. At most kMaxDirEntries entries are examined, which bounds memory;
+/// either overflow sets `too_many` (the caller reports constrained). Returns 0, or the errno
+/// of a failed opendir/readdir (a readdir error is NOT an end-of-directory: ENOENT only
+/// means absent when it comes from opendir).
 int list_snippets(std::vector<std::string>& out, bool& too_many) {
     const std::unique_ptr<DIR, DirDeleter> d(::opendir(kSssdConfD));
     if (!d)
@@ -99,17 +98,10 @@ int list_snippets(std::vector<std::string>& out, bool& too_many) {
             too_many = true;
             break;
         }
-        const std::string n = e->d_name;
-        if (n.size() > 5 && n[0] != '.' && n.ends_with(".conf")) {
-            out.push_back(n);
-        }
+        if (is_snippet_name(e->d_name))
+            out.emplace_back(e->d_name);
     }
-    // Byte order approximates SSSD's locale collation (README caveat).
-    std::ranges::sort(out);
-    if (out.size() > kMaxSnippets) {
-        out.resize(kMaxSnippets);
-        too_many = true;
-    }
+    finalize_snippets(out, kMaxSnippets, too_many);
     return 0;
 }
 

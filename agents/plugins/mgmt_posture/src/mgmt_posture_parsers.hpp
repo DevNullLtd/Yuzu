@@ -229,6 +229,22 @@ inline Plane classify_linux(const std::optional<SssdFacts>& sssd,
     return ipa_default_conf_present ? Plane::ipa : Plane::none;
 }
 
+/// conf.d entry selection, OS-free so the filter, byte order and cap are unit-tested.
+/// A snippet is a regular-looking `*.conf` name that is not a dotfile.
+inline bool is_snippet_name(std::string_view n) {
+    return n.size() > 5 && n[0] != '.' && n.ends_with(".conf");
+}
+
+/// Sorts byte-wise (approximates SSSD's locale collation) and cuts to `cap`; cutting sets
+/// `too_many` so the caller reports constrained instead of silently ignoring a snippet.
+inline void finalize_snippets(std::vector<std::string>& names, std::size_t cap, bool& too_many) {
+    std::sort(names.begin(), names.end());
+    if (names.size() > cap) {
+        names.resize(cap);
+        too_many = true;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // macOS `profiles status -type enrollment`
 // ---------------------------------------------------------------------------
@@ -273,10 +289,12 @@ inline ProfilesEnrollment parse_profiles_status(std::string_view text) {
         const auto key = detail::lower(detail::trim(line.substr(0, colon)));
         const auto val = detail::trim(line.substr(colon + 1));
         const auto lv = detail::lower(val);
+        // Whole leading word only: "Yes (User Approved)" is yes, "Yesterday"/"None" are not.
         std::optional<bool> yn;
-        if (lv.starts_with("yes"))
+        const auto first_word = std::string_view{lv}.substr(0, lv.find_first_of(" \t("));
+        if (first_word == "yes")
             yn = true;
-        else if (lv.starts_with("no"))
+        else if (first_word == "no")
             yn = false;
 
         if (key == "enrolled via dep" || key == "mdm enrollment") {

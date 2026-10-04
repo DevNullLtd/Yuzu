@@ -44,5 +44,17 @@ class MgmtPostureDefinitionColumns(unittest.TestCase):
         self.assertEqual(row_kind["values"], ROW_KINDS)
 
 
+class MgmtPostureDefinitionContract(unittest.TestCase):
+    def test_platforms_gather_approval_and_compatibility_are_pinned(self):
+        spec = _definition()["spec"]
+        self.assertEqual(spec["platforms"], ["windows", "linux", "darwin"])
+        self.assertEqual(spec["execution"]["concurrency"], "per-device")
+        self.assertEqual(spec["gather"]["ttlSeconds"], 3600)
+        self.assertEqual(spec["approval"]["mode"], "auto")
+        self.assertEqual(spec["permissions"]["executeRoles"], ["endpoint-admin", "endpoint-operator"])
+        self.assertEqual(spec["compatibility"]["requiredPlugins"], ["mgmt_posture"])
+        self.assertEqual(spec["parameters"]["properties"], {})
+
+
 if __name__ == "__main__":
     unittest.main()

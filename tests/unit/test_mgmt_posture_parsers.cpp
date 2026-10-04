@@ -10,7 +10,7 @@
  */
 #include <catch2/catch_test_macros.hpp>
 
-#include "../../agents/plugins/mgmt_posture/src/mgmt_posture_parsers.hpp"
+#include "mgmt_posture_parsers.hpp"
 
 #include <string>
 #include <vector>
@@ -181,6 +181,40 @@ TEST_CASE("mgmt_posture: parse_profiles_status", "[mgmt_posture]") {
               .mdm_server_host == "h.example.com");
     CHECK_FALSE(parse_profiles_status("").recognised());
     CHECK_FALSE(parse_profiles_status("garbage\nfoo: bar\n").recognised());
+}
+
+TEST_CASE("mgmt_posture: profiles yes/no is a whole word, never a prefix", "[mgmt_posture]") {
+    // MUTATION: matching with starts_with() reads "Yesterday" as yes and "None"/"Not applicable" as no.
+    CHECK(parse_profiles_status("MDM enrollment: Yes (User Approved)\n").mdm_enrolled == true);
+    CHECK(parse_profiles_status("MDM enrollment: No\n").mdm_enrolled == false);
+    for (const char* v : {"Yesterday", "None", "Not applicable", "Nope", ""}) {
+        const auto r = parse_profiles_status(std::string{"MDM enrollment: "} + v + "\n");
+        INFO("value: " << v);
+        CHECK_FALSE(r.mdm_enrolled.has_value());
+    }
+}
+
+TEST_CASE("mgmt_posture: conf.d snippet selection", "[mgmt_posture]") {
+    CHECK(is_snippet_name("10-ad.conf"));
+    CHECK(is_snippet_name("a.conf"));
+    CHECK_FALSE(is_snippet_name(".conf"));       // too short: no stem
+    CHECK_FALSE(is_snippet_name(".hidden.conf")); // dotfile
+    CHECK_FALSE(is_snippet_name("10-ad.confx"));
+    CHECK_FALSE(is_snippet_name("10-ad.conf.bak"));
+    CHECK_FALSE(is_snippet_name("readme"));
+
+    std::vector<std::string> names{"20-b.conf", "10-a.conf", "15-z.conf"};
+    bool too_many = false;
+    finalize_snippets(names, 32, too_many);
+    CHECK(names == std::vector<std::string>{"10-a.conf", "15-z.conf", "20-b.conf"}); // byte order
+    CHECK_FALSE(too_many);
+
+    // MUTATION: dropping the cut (or not flagging it) lets a 33rd snippet be silently ignored
+    // or silently read.
+    names = {"c.conf", "a.conf", "b.conf", "d.conf"};
+    finalize_snippets(names, 2, too_many);
+    CHECK(names == std::vector<std::string>{"a.conf", "b.conf"});
+    CHECK(too_many);
 }
 
 TEST_CASE("mgmt_posture: row formatters", "[mgmt_posture]") {
