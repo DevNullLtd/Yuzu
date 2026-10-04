@@ -1,8 +1,7 @@
 /**
  * email_redaction.hpp -- portable e-mail-address detection and the
  * placeholder substituted for a redacted field. No OS call, no yuzu/
- * include, no plugin include. First consumer: browser_inventory; next:
- * remote_access_audit.
+ * include, no plugin include. Consumer today: browser_inventory.
  */
 #pragma once
 

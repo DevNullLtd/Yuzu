@@ -18,6 +18,7 @@
 #include <fstream>
 #include <set>
 #include <string>
+#include <type_traits>
 
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -97,6 +98,54 @@ TEST_CASE("posix_secure_read: file opens never block, follow a leaf link or adop
     CHECK((flags & O_NONBLOCK) == O_NONBLOCK);
     CHECK((flags & O_NOCTTY) == O_NOCTTY);
     CHECK((flags & O_CLOEXEC) == O_CLOEXEC);
+}
+
+TEST_CASE("posix_secure_read: path forms refuse an embedded NUL and a trailing slash or dot",
+          "[shared][posix_secure_read]") {
+    // MUTATION: dropping is_plain_leaf_path lets "link/" follow a leaf symlink (defeating
+    // O_NOFOLLOW) and lets "a\0b" silently open the prefix "a".
+    yuzu::test::TempDir tmp{"yuzu_test_psr_"};
+    REQUIRE(fs::create_directory(tmp.path));
+    REQUIRE(fs::create_directory(tmp.path / "real"));
+    write_file(tmp.path / "real" / "f.txt", "x");
+    fs::create_directory_symlink(tmp.path / "real", tmp.path / "link");
+
+    const std::string base = tmp.path.string();
+    for (const std::string& bad :
+         {base + "/link/", base + "/link/.", base + "/real/", base + "/real/.", base + "/real\0junk"s}) {
+        INFO("path: " << bad);
+        const auto d = open_dir_no_follow(bad);
+        CHECK_FALSE(d.opened());
+        CHECK(d.err == EINVAL);
+        const auto f = read_file_no_follow(bad, 16);
+        CHECK(f.error == ReadError::io);
+        CHECK(f.err == EINVAL);
+    }
+    // The plain forms still work, and "/" alone is a legal directory path.
+    CHECK(open_dir_no_follow(base + "/real").opened());
+    CHECK(read_file_no_follow(base + "/real/f.txt", 16).ok());
+    CHECK(open_dir_no_follow("/").opened());
+}
+
+TEST_CASE("posix_secure_read: ScopedDir is move-only and move-assign releases the old directory",
+          "[shared][posix_secure_read]") {
+    static_assert(!std::is_copy_constructible_v<ScopedDir>);
+    static_assert(!std::is_copy_assignable_v<ScopedDir>);
+    yuzu::test::TempDir tmp{"yuzu_test_psr_"};
+    REQUIRE(fs::create_directory(tmp.path));
+    REQUIRE(fs::create_directory(tmp.path / "a"));
+    REQUIRE(fs::create_directory(tmp.path / "b"));
+    auto a = open_dir_no_follow((tmp.path / "a").string());
+    auto b = open_dir_no_follow((tmp.path / "b").string());
+    REQUIRE(a.opened());
+    REQUIRE(b.opened());
+    const int a_fd = a.dir.fd();
+    const int b_fd = b.dir.fd();
+    a.dir = std::move(b.dir);  // closes a's old directory, takes b's
+    CHECK(a.dir.fd() == b_fd);
+    CHECK(b.dir.fd() < 0);
+    CHECK(::fcntl(a_fd, F_GETFD) == -1);
+    CHECK(errno == EBADF);
 }
 
 TEST_CASE("posix_secure_read: symlink to directory at the leaf is refused", "[shared][posix_secure_read]") {

@@ -34,7 +34,14 @@
  *
  * The path forms (open_dir_no_follow, read_file_no_follow) apply O_NOFOLLOW
  * to the leaf only; intermediate components ARE followed. Use the dir-fd
- * forms to confine.
+ * forms to confine. Both reject, with err = EINVAL before any syscall, a path
+ * holding a NUL byte (it would silently open the prefix) and a path ending in
+ * '/' or '/.' (the kernel follows a symlink leaf named that way, defeating
+ * O_NOFOLLOW); the single path "/" is allowed.
+ *
+ * Blocking: open and read carry no deadline of their own, so a path on a dead
+ * hard network mount can pin the calling worker (#4875 tracks the host-level
+ * guard).
  *
  * errno policy: err is reported verbatim. ENOENT is NOT special-cased here;
  * each consumer keeps its own benign-absent predicate (autoruns_macos.hpp,
@@ -109,6 +116,16 @@ struct FileRead {
 };
 
 namespace detail {
+
+/// False for a path the no-follow guarantee cannot hold for: an embedded NUL, or a trailing
+/// '/' or '/.' (the kernel resolves those through a symlink leaf). "/" alone is fine.
+inline bool is_plain_leaf_path(const std::string& p) {
+    if (p.find('\0') != std::string::npos)
+        return false;
+    if (p.size() > 1 && p.back() == '/')
+        return false;
+    return !(p.size() >= 2 && p.compare(p.size() - 2, 2, "/.") == 0);
+}
 
 /// True for a name that is safe to hand to openat() as one hop.
 inline bool is_single_component(const char* name) noexcept {
@@ -199,6 +216,11 @@ inline constexpr int kFileFlags = O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_NOCTTY 
 
 /// Open `path` as a directory; the leaf is not followed (intermediates are).
 inline DirOpen open_dir_no_follow(const std::string& path) {
+    if (!detail::is_plain_leaf_path(path)) {
+        DirOpen out;
+        out.err = EINVAL;
+        return out;
+    }
     return detail::finish_dir_open(::open(path.c_str(), detail::kDirFlags));
 }
 
@@ -214,6 +236,12 @@ inline DirOpen open_dir_no_follow_at(int parent_fd, const char* name) {
 
 /// Read the regular file at `path` (leaf not followed) up to `cap` bytes.
 inline FileRead read_file_no_follow(const std::string& path, std::size_t cap) {
+    if (!detail::is_plain_leaf_path(path)) {
+        FileRead out;
+        out.error = ReadError::io;
+        out.err = EINVAL;
+        return out;
+    }
     return detail::finish_file_open(::open(path.c_str(), detail::kFileFlags), cap);
 }
 
