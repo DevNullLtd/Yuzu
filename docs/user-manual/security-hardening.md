@@ -156,7 +156,17 @@ chmod 600 /etc/yuzu/secrets.env
 # EnvironmentFile=/etc/yuzu/secrets.env
 ```
 
+For the database connection string and the OIDC client secret, a file is an
+alternative to the environment: `--postgres-dsn-file` and
+`--oidc-client-secret-file` (or `YUZU_POSTGRES_DSN_FILE` /
+`YUZU_OIDC_CLIENT_SECRET_FILE`) read the value from a file you protect, such as
+a Docker or Kubernetes secret mount. On Windows, prefer the file: a service's
+environment there is readable by local users. A `-file` flag cannot be combined
+with its direct option or environment variable. See the flag table in
+`server-admin.md`.
+
 Sensitive environment variables:
+- `YUZU_POSTGRES_DSN` — PostgreSQL connection string (usually includes a password)
 - `YUZU_OIDC_CLIENT_SECRET` — OIDC client secret
 - `YUZU_CLICKHOUSE_PASSWORD` — ClickHouse password
 - `YUZU_NVD_API_KEY` — NVD API key
