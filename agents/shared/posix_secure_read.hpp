@@ -7,23 +7,18 @@
  * directory holds leaves with no core or plugin dependency edge). POSIX only; the whole
  * body is compiled out on Windows.
  *
- * Divergences between the per-plugin copies this replaces:
- *   1. Directory handles: some copies hand a raw fd to fdopendir() and keep
- *      closing it on the failure path; here the fd is owned by exactly one of
- *      the raw int or the DIR*, never both (see finish_dir_open).
- *   2. Symlink-leaf errno: under O_DIRECTORY|O_NOFOLLOW a symlink answers
- *      ENOTDIR, not ELOOP. ELOOP on a directory open means a link loop. File
- *      reads carry no O_DIRECTORY, so there a symlink leaf is ELOOP and maps
- *      to ReadError::symlink_refused.
- *   3. Size handling: reads go to EOF in fixed chunks and stop with
- *      `oversized` the moment the cap is exceeded. They never trust st_size
- *      (browser_inventory reads to st_size, which a growing or sparse file
- *      defeats).
- *   4. Non-regular leaves: O_NONBLOCK is load-bearing. Opening a FIFO
- *      O_RDONLY without it blocks until a writer appears, hanging the agent
- *      on an attacker-planted FIFO (same reasoning as
- *      local_security_policy_legs.hpp:148-156). With it the open succeeds, the
- *      fstat reports !S_ISREG, and the read is refused.
+ * Symlink-leaf errno: under O_DIRECTORY|O_NOFOLLOW a symlink answers
+ * ENOTDIR, not ELOOP; ELOOP on a directory open means a link loop. File
+ * reads carry no O_DIRECTORY, so there a symlink leaf is ELOOP and maps to
+ * ReadError::symlink_refused.
+ *
+ * Non-regular leaves: O_NONBLOCK is load-bearing. Opening a FIFO O_RDONLY
+ * without it blocks until a writer appears, hanging the agent on an
+ * attacker-planted FIFO. With it the open succeeds, fstat reports
+ * !S_ISREG, and the read is refused. Reads go to EOF in fixed chunks and
+ * stop with `oversized` once the cap is exceeded; they never trust st_size.
+ * A directory handle is owned by exactly one of the raw fd or the DIR*
+ * (see finish_dir_open).
  *
  * SINGLE-COMPONENT CONTRACT for every `_at` form: `name` must be a non-empty
  * single path component. It is rejected with err = EINVAL, before any
@@ -42,10 +37,6 @@
  *
  * Out of scope: owner/mode policy checks (caller-side), reason-token
  * vocabulary (per plugin), and deadlines/timeouts (#4875 is host-level).
- *
- * Consumers still to migrate: pkg_inventory (posix::Dir hand-over),
- * browser_inventory (st_size read), local_security_policy (strict arm stays
- * caller-side), autoruns_linux / autoruns_macos.
  */
 #pragma once
 
