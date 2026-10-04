@@ -690,6 +690,20 @@ std::size_t GuardianSparkRuntime::arms_parked() const {
     return n;
 }
 
+std::size_t GuardianSparkRuntime::retained_tombstones() const {
+    std::lock_guard<std::mutex> lk{registry_mu_};
+    std::size_t n = 0;
+    for (const auto& [key, entry] : claims_) {
+        for (const auto& c : entry.fifo) {
+            if (c->kind == ClaimKind::Arm && c->dispatch == ClaimDispatch::Queued &&
+                (c->outcome || c->commit_exception) && c->index_held &&
+                index_->owns(key, c->rule_id, c->generation))
+                ++n;
+        }
+    }
+    return n;
+}
+
 std::size_t GuardianSparkRuntime::parked_arm_waiter_depth_for_test() const {
     std::lock_guard<std::mutex> lk{registry_mu_};
     std::size_t n = 0;
@@ -2388,6 +2402,11 @@ bool GuardianSparkRuntime::is_retained_wedge(const KeyClaim& head) noexcept {
            (head.dispatch == ClaimDispatch::Dispatching ||
             head.dispatch == ClaimDispatch::Dispatched) &&
            head.waiter_abandoned && head.end == ClaimEnd::WaiterTimedOutDispatched;
+}
+
+bool GuardianSparkRuntime::is_dead_claim(const KeyClaim& claim) noexcept {
+    return claim.withdrawn || claim.waiter_abandoned || claim.outcome.has_value() ||
+           static_cast<bool>(claim.commit_exception);
 }
 
 GuardianSparkRuntime::AttachCoreResult
@@ -4447,7 +4466,11 @@ void GuardianSparkRuntime::set_detach_post_fault_point_for_test(int point) noexc
 }
 
 void GuardianSparkRuntime::set_index_remove_fault_for_test(bool on) noexcept {
-    index_remove_fault_for_test_.store(on);
+    index_remove_fault_for_test_.store(on ? 1 : 0);
+}
+
+void GuardianSparkRuntime::set_index_remove_fault_count_for_test(int n) noexcept {
+    index_remove_fault_for_test_.store(n);
 }
 
 void GuardianSparkRuntime::set_detach_fault_for_test(bool on) noexcept {

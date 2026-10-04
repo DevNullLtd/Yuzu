@@ -816,6 +816,10 @@ public:
     /// index_->remove_rule's own key-copy allocation would, BEFORE the mapping or the
     /// claim's index_held flag is touched.
     void set_index_remove_fault_for_test(bool on) noexcept;
+    /// #5322: counted/sticky form of the index-release fault seam. n > 0 = the next n
+    /// releases throw (decremented as each fires), n < 0 = every release throws until
+    /// reset (never decremented), 0 = off. The bool setter above is `n = on ? 1 : 0`.
+    void set_index_remove_fault_count_for_test(int n) noexcept;
     /// R5.2 detach post-mutation fault seam (adversarial re-review r3 C4): consumed
     /// once by the next detach_rule_locked. 1 = std::bad_alloc where the lifecycle-kind
     /// string copy allocates (now BEFORE the durable mutation: the detach fails cleanly
@@ -851,6 +855,22 @@ public:
     /// next release to retry. Expected 0. Lock-free.
     [[nodiscard]] std::uint64_t claim_index_release_failures() const noexcept {
         return claim_index_release_failures_.load(std::memory_order_relaxed);
+    }
+    /// #5322: tombstones (dead Queued Arm claims that still hold an index mapping)
+    /// popped by the expiry reaper. Runtime-only, NOT exported on the heartbeat yet
+    /// (that export is owned by the #5168 tags PR). Lock-free.
+    [[nodiscard]] std::uint64_t tombstones_released_by_reaper() const noexcept {
+        return tombstones_released_by_reaper_.load(std::memory_order_relaxed);
+    }
+    /// #5322: orphan-key disarms started by the reaper's orphan pass. Runtime-only,
+    /// not exported yet. Lock-free.
+    [[nodiscard]] std::uint64_t orphan_disarms_started() const noexcept {
+        return orphan_disarms_started_.load(std::memory_order_relaxed);
+    }
+    /// #5322: dead watchers erased by on_subscription_lost for a key with no rules.
+    /// Runtime-only, not exported yet. Lock-free.
+    [[nodiscard]] std::uint64_t dead_watchers_erased_on_lost() const noexcept {
+        return dead_watchers_erased_on_lost_.load(std::memory_order_relaxed);
     }
     /// rung 9c PR-5a (#4221 cs-103): detach_rule_locked's last-on-key branch sweeps
     /// claims_[key] before constructing a new Disarm claim, on the belief (see the
@@ -1554,6 +1574,12 @@ public:
     /// arm_parked set, no outcome). A live gauge, computed under registry_mu_ by
     /// scanning claims_ - diagnostic/test use, not a hot-path read.
     [[nodiscard]] std::size_t arms_parked() const;
+    /// #5322: retained tombstones - Queued Arm claims that are dead (outcome or
+    /// commit_exception set) yet still hold a genuine ghost index mapping
+    /// (index_held && index_->owns(key, rule_id, generation)). A live gauge under
+    /// registry_mu_ by scanning claims_; runtime-only, NOT exported on the heartbeat
+    /// yet (owned by the #5168 tags PR). Diagnostic/test use, not a hot-path read.
+    [[nodiscard]] std::size_t retained_tombstones() const;
     /// #5168 test seam: total entries across the per-class waiter deques (live and
     /// stale), to pin that they stay bounded.
     [[nodiscard]] std::size_t parked_arm_waiter_depth_for_test() const;
@@ -1597,6 +1623,12 @@ private:
     /// responsibility (both current call sites already hold it), not this
     /// function's, since it never touches shared state itself.
     [[nodiscard]] static bool is_retained_wedge(const KeyClaim& head) noexcept;
+
+    /// #5322: a claim that can never be selected for a fresh dispatch - withdrawn,
+    /// its waiter abandoned, or already carrying a terminal outcome / commit throw.
+    /// Pure read of `claim`'s own fields; registry_mu_ is the caller's concern.
+    /// Not called yet (the INV-1 selection guard lands in a later work package).
+    [[nodiscard]] static bool is_dead_claim(const KeyClaim& claim) noexcept;
 
     /// rung 9c PR-5e (#4221, K-bound closeout): the pure ClaimEnd->ReceiptStatus
     /// mapping receipt_status() applies - factored out so
@@ -2348,7 +2380,10 @@ private:
     std::function<void()> dispatch_entry_hook_for_test_; ///< registry_mu_-guarded; see the setter
     std::atomic<int> drain_fault_point_for_test_{0};  ///< see the setter
     std::atomic<bool> detach_fault_for_test_{false};  ///< see the setter
-    std::atomic<bool> index_remove_fault_for_test_{false}; ///< see the setter
+    std::atomic<std::uint64_t> tombstones_released_by_reaper_{0}; ///< #5322: runtime-only, incremented by a later WP
+    std::atomic<std::uint64_t> orphan_disarms_started_{0};        ///< #5322: runtime-only, incremented by a later WP
+    std::atomic<std::uint64_t> dead_watchers_erased_on_lost_{0};  ///< #5322: runtime-only, incremented by a later WP
+    std::atomic<int> index_remove_fault_for_test_{0}; ///< see the setters (>0 counted, <0 sticky, 0 off)
     std::atomic<std::uint64_t> detach_post_commit_failures_{0}; ///< r3 C4: contained drop_rule throw
     std::atomic<int> detach_post_fault_point_for_test_{0}; ///< see the setter
     /// Seam body for set_detach_post_fault_point_for_test; consumed once at `point`.
@@ -2357,10 +2392,17 @@ private:
         if (detach_post_fault_point_for_test_.compare_exchange_strong(expected, 0))
             throw std::bad_alloc{};
     }
-    /// Seam body for set_index_remove_fault_for_test; consumed once.
+    /// Seam body for set_index_remove_fault_for_test / ..._count_for_test: n > 0 fires
+    /// and decrements (compare-exchange, so concurrent callers never over-fire), n < 0
+    /// fires without decrementing, 0 never fires.
     void index_remove_fault_here_for_test() {
-        if (index_remove_fault_for_test_.exchange(false))
-            throw std::bad_alloc{};
+        int n = index_remove_fault_for_test_.load();
+        while (n != 0) {
+            if (n < 0)
+                throw std::bad_alloc{};
+            if (index_remove_fault_for_test_.compare_exchange_weak(n, n - 1))
+                throw std::bad_alloc{};
+        }
     }
     /// Seam body for set_detach_fault_for_test; consumed once.
     void detach_fault_here_for_test() {

@@ -118,6 +118,17 @@ public:
     /// The key `rule_id` is currently mapped to, or nullopt if unknown.
     [[nodiscard]] std::optional<std::string> key_for_rule(std::string_view rule_id) const;
 
+    /// True IFF `rule_id` is mapped to exactly `spark_key` AND the mapping is currently
+    /// owned by `generation` (the ownership test erase_rule() applies, without
+    /// mutating). Heterogeneous lookup, no allocation. False for an unknown rule, a
+    /// different key, or a stale generation.
+    [[nodiscard]] bool owns(std::string_view spark_key, std::string_view rule_id,
+                            std::uint64_t generation) const noexcept {
+        const auto it = by_rule_.find(rule_id);
+        return it != by_rule_.end() && it->second.key == spark_key &&
+               it->second.generation == generation;
+    }
+
     [[nodiscard]] bool empty() const noexcept { return by_rule_.empty(); }
     [[nodiscard]] std::size_t key_count() const noexcept { return by_key_.size(); }
     [[nodiscard]] std::size_t rule_count() const noexcept { return by_rule_.size(); }

@@ -8281,6 +8281,108 @@ TEST_CASE("#4354: a firewalled drain whose head release fails does not fail a li
     rt->begin_stop();
 }
 
+// #5322 WP0: the index-release fault seam is counted (n > 0: the next n releases fail) or
+// sticky (n < 0: every release fails until reset), and the old bool setter is still the
+// one-shot. The gauge is runtime-only and 0 on a quiescent runtime (its positive cases
+// arrive with the work packages that create retained tombstones).
+TEST_CASE("#5322: counted/sticky index-release fault seam", "[spark][runtime][liveness]") {
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    b->hang_next_arm.store(true);
+    auto rt = make_rt(r, b, GuardianSparkRuntime::Config{.backend_op_deadline = std::chrono::seconds(30)});
+    const auto key = spark_key(file_spec("/a"));
+
+    QueuedAttach a1;
+    // Clear the seam FIRST, then release the hang, so a failing assertion can neither
+    // leave releases failing nor leave the attach thread parked in the backend.
+    struct Cleanup {
+        GuardianSparkRuntime* rt;
+        FakeBackend* backend;
+        ~Cleanup() {
+            rt->set_index_remove_fault_count_for_test(0);
+            backend->release_hang();
+        }
+    } cleanup{rt.get(), b.get()};
+
+    CHECK(rt->retained_tombstones() == 0); // quiescent runtime
+
+    a1.t = std::thread{[&] { a1.gen = rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true); }};
+    REQUIRE(b->wait_entered_hang(std::chrono::seconds(30)));
+
+    // The hung head is Dispatched with its mapping held. detach_rule's Case 0 releases it
+    // (release attempt 1), and the hung arm's late completion takes the live.empty()
+    // branch (release attempt 2); the publish pop is attempt 3.
+    const auto failures_before = rt->claim_index_release_failures();
+
+    SECTION("counted: n = 2 fails exactly the first two release attempts") {
+        rt->set_index_remove_fault_count_for_test(2);
+        rt->detach_rule("r1");
+        a1.t.join();
+        REQUIRE_FALSE(a1.gen.has_value());
+        CHECK(a1.gen.error() == "withdrawn");
+        CHECK(rt->claim_index_release_failures() == failures_before + 1);
+
+        b->release_hang();
+        settle_key_claims(*rt, key);
+        CHECK(rt->claim_index_release_failures() == failures_before + 2);
+        CHECK(rt->claim_queue_depth_for_test(key) == 0);
+        CHECK(rt->retained_tombstones() == 0);
+        CHECK(rt->rule_count() == 0);
+    }
+
+    SECTION("sticky: n = -1 keeps failing, is never consumed, and 0 turns it off") {
+        rt->set_index_remove_fault_count_for_test(-1);
+        rt->detach_rule("r1");
+        a1.t.join();
+        REQUIRE_FALSE(a1.gen.has_value());
+        CHECK(rt->claim_index_release_failures() == failures_before + 1);
+
+        b->release_hang();
+        // The live.empty() release and the publish pop's release both fail as well: three
+        // attempts in all, none of which consumed the seam.
+        REQUIRE(yuzu::test::spin_until(
+            [&] { return rt->claim_index_release_failures() >= failures_before + 3; },
+            std::chrono::seconds(10)));
+        CHECK(rt->claim_queue_depth_for_test(key) == 1); // retained: its release never succeeded
+
+        rt->set_index_remove_fault_count_for_test(0);
+        // The next same-key attach sweeps the tombstone and retries its release, which now
+        // succeeds (a fresh attach is not a failure to be counted).
+        const auto failures_off = rt->claim_index_release_failures();
+        std::expected<std::uint64_t, std::string> gen2;
+        REQUIRE_NOTHROW(gen2 = rt->attach_rule("r2", file_spec("/a"), file_exists_rule("r2"), true));
+        REQUIRE(gen2);
+        settle_key_claims(*rt, key);
+        CHECK(rt->claim_index_release_failures() == failures_off);
+        CHECK(rt->claim_queue_depth_for_test(key) == 0);
+        CHECK(rt->retained_tombstones() == 0);
+    }
+
+    SECTION("bool setter: true is a one-shot (stores 1), false stores 0") {
+        rt->set_index_remove_fault_for_test(true);
+        rt->detach_rule("r1"); // consumes the single shot
+        a1.t.join();
+        REQUIRE_FALSE(a1.gen.has_value());
+        CHECK(rt->claim_index_release_failures() == failures_before + 1);
+
+        b->release_hang();
+        settle_key_claims(*rt, key);
+        CHECK(rt->claim_index_release_failures() == failures_before + 1); // spent: later releases succeed
+        CHECK(rt->claim_queue_depth_for_test(key) == 0);
+
+        rt->set_index_remove_fault_for_test(true);
+        rt->set_index_remove_fault_for_test(false); // stores 0: nothing fires
+        std::expected<std::uint64_t, std::string> gen2;
+        REQUIRE_NOTHROW(gen2 = rt->attach_rule("r2", file_spec("/a"), file_exists_rule("r2"), true));
+        REQUIRE(gen2);
+        rt->detach_rule("r2");
+        settle_key_claims(*rt, key);
+        CHECK(rt->claim_index_release_failures() == failures_before + 1);
+    }
+
+    rt->begin_stop();
+}
+
 // adversarial round 4 K2/C5: index_add_rollback's .fn runs inside ~GuardianRollback,
 // which swallows exceptions; remove_rule's key copy could throw there and leave a ghost
 // mapping. erase_rule is the same walk without the copy (noexcept).
