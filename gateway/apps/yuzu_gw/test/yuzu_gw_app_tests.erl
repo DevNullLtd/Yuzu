@@ -171,6 +171,38 @@ boot_creates_safe_call_limits_before_sup_test() ->
                        receive {sup_started, L} -> L after 0 -> missing end)
       end).
 
+%%%===================================================================
+%%% Boot wiring: TCP_NODELAY on the upstream channel
+%%%===================================================================
+
+%% yuzu_gw_app:start/2 applies the upstream channel's nodelay rewrite before the
+%% supervision tree starts (the tree holds the channel's only callers, so no
+%% call can see the channel mid-restart). Nothing else boots the app, so a
+%% deleted or reordered apply_nodelay/0 call is invisible without this.
+boot_applies_upstream_nodelay_before_sup_test() ->
+    Applied = {?MODULE, nodelay_applied},
+    persistent_term:erase(Applied),
+    ok = meck:new(yuzu_gw_upstream_channel, [passthrough, no_link]),
+    try
+        meck:expect(yuzu_gw_upstream_channel, apply_nodelay,
+                    fun() -> persistent_term:put(Applied, true), ok end),
+        with_boot_mocks(
+          fun(Self) ->
+              fun() ->
+                  Self ! {sup_started, persistent_term:get(Applied, false)},
+                  {ok, self()}
+              end
+          end,
+          fun() ->
+              ?assertMatch({ok, _}, yuzu_gw_app:start(normal, [])),
+              ?assertEqual(true, receive {sup_started, A} -> A after 0 -> missing end),
+              ?assertEqual(1, meck:num_calls(yuzu_gw_upstream_channel, apply_nodelay, []))
+          end)
+    after
+        meck:unload(yuzu_gw_upstream_channel),
+        persistent_term:erase(Applied)
+    end.
+
 crash_filter_installed() ->
     lists:keymember(yuzu_gw_crash_redact, 1, maps:get(filters, logger:get_primary_config())).
 
