@@ -514,13 +514,14 @@ TEST_CASE("TriggerEngine: file change trigger with empty watch_path starts and s
     cfg.watch_path = ""; // empty
     engine.register_trigger(cfg);
 
+    // 20ms poll (production: 5s), so the loop polls ~10 times inside the window below and every
+    // poll walks past the empty watch_path (the skip). At the production cadence the first poll
+    // lands after 5s, so no short window ever reached it.
+    engine.set_poll_cadence(std::chrono::milliseconds{20});
     engine.start();
-    // Negative / no-crash window, honestly bounded: file_watch_loop does its first poll only
-    // after a 5s wait, so no window short of >5s reaches the empty watch_path skip, and the
-    // outcome is the same either way (canonical("") fails and the loop continues; a first
-    // observation never fires). This case therefore proves "registering an empty-path
-    // FileChange trigger and starting/stopping the engine is safe and dispatches nothing". To
-    // exercise the skip itself would need an injectable file-poll interval in TriggerEngine.
+    // The outcome is the same whether the skip or the failing canonical("") handles the empty
+    // path (the loop continues and a first observation never fires), so what this proves is that
+    // an empty-path FileChange trigger survives repeated polls and dispatches nothing.
     std::this_thread::sleep_for(std::chrono::milliseconds{200});
     engine.stop();
 
