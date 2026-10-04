@@ -137,7 +137,13 @@ verdict_replay_test_() ->
       t("E7 flush errors never reach the breaker",
         fun flush_errors_never_reach_the_breaker/0),
       t("E8 a truncated verdict replays only the listed session",
-        fun truncated_verdict_replays_only_the_listed_session/0)
+        fun truncated_verdict_replays_only_the_listed_session/0),
+      t("E23 format_status shows counts, never the queued requests",
+        fun format_status_shows_counts_not_requests/0),
+      t("E23 sys:get_status on the real process shows counts, never the requests",
+        fun sys_get_status_shows_counts_not_requests/0),
+      t("E23 a crash report of a full queue carries counts, never the requests",
+        fun crash_report_shows_counts_not_requests/0)
      ]}.
 
 %% Breaker reset timers far beyond a test: an open breaker stays open until
@@ -1040,6 +1046,122 @@ queue_depth_is_reported_on_skip() ->
     await(fun() -> length(depths()) >= 2 end),
     await_idle(),
     ?assertEqual([{0, 1}, {0, 0}], depths()).
+
+%%% -- Crash reports and sys:get_status must not carry the queued requests ----
+
+%% The credential-bearing keys of agent.proto's RegisterRequest, plus a value
+%% per entry; a printed queue or request shows at least one of them.
+secret_req(N) ->
+    Tag = integer_to_binary(N),
+    #{info => #{agent_id => <<"fs-agent-", Tag/binary>>},
+      enrollment_token => <<"tok-", Tag/binary>>,
+      machine_certificate => <<"cert-", Tag/binary>>,
+      csr_pem => <<"csr-", Tag/binary>>}.
+
+secret_queue(Count) ->
+    [{<<"fs-agent-", (integer_to_binary(N))/binary>>,
+      <<"fs-sess-", (integer_to_binary(N))/binary>>, secret_req(N)}
+     || N <- lists:seq(1, Count)].
+
+%% Markers that must never reach a report: the key names and every value.
+secret_markers() ->
+    ["enrollment_token", "machine_certificate", "csr_pem", "tok-", "cert-", "csr-",
+     "fs-agent-", "fs-sess-"].
+
+assert_no_secrets(Text) ->
+    [?assertEqual({nomatch, M}, {string:find(Text, M), M}) || M <- secret_markers()],
+    ok.
+
+%% The callback on its own: a state holding 50 queued requests and the message
+%% that carries one more. The keys of the original status survive.
+format_status_shows_counts_not_requests() ->
+    Count = 50,
+    State0 = sys:get_state(yuzu_gw_upstream),
+    State = setelement(up_index(recent_replays),
+                       setelement(up_index(replay_queue), State0, secret_queue(Count)),
+                       #{<<"fs-sess-1">> => 1, <<"fs-sess-2">> => 2}),
+    Status = #{state => State,
+               message => {proxy_register, secret_req(0)},
+               reason => {test, reason},
+               log => []},
+    Result = yuzu_gw_upstream:format_status(Status),
+    ?assertEqual([log, message, reason, state], lists:sort(maps:keys(Result))),
+    assert_no_secrets(lists:flatten(io_lib:format("~p", [Result]))),
+    #{state := Shown} = Result,
+    ?assertEqual(Count, maps:get(replay_queue_len, Shown)),
+    ?assertEqual(2, maps:get(recent_replays_size, Shown)),
+    ?assertNot(maps:is_key(replay_queue, Shown)),
+    ?assertNot(maps:is_key(recent_replays, Shown)),
+    %% The scalar fields are kept.
+    ?assertEqual(up_get(cb_state), maps:get(cb_state, Shown)),
+    ?assertEqual(up_get(session_guard_ms), maps:get(session_guard_ms, Shown)),
+    ?assertEqual(up_get(replay_queue_max), maps:get(replay_queue_max, Shown)),
+    ?assertEqual({reason, {test, reason}}, {reason, maps:get(reason, Result)}),
+    %% The wrapped forms of every message that carries a payload.
+    [begin
+         Shown2 = lists:flatten(io_lib:format("~p", [
+                      maps:get(message, yuzu_gw_upstream:format_status(
+                                          #{state => State, message => Msg}))])),
+         assert_no_secrets(Shown2)
+     end || Msg <- [{'$gen_call', {self(), make_ref()}, {proxy_register, secret_req(1)}},
+                    {proxy_register, secret_req(2)},
+                    {proxy_inventory, secret_req(3)},
+                    {replay_sessions, [<<"fs-sess-4">>]},
+                    {'$gen_cast', {forward_guardian_message, <<"guardian-agent">>, secret_req(5)}}]],
+    %% A message without a payload, and a state that is not the record, pass
+    %% through safely.
+    ?assertEqual(circuit_state,
+                 maps:get(message, yuzu_gw_upstream:format_status(
+                                     #{state => State, message => circuit_state}))),
+    ?assertEqual('$redacted',
+                 maps:get(state, yuzu_gw_upstream:format_status(#{state => secret_queue(1)}))),
+    %% A sys:get_status style map has no message key.
+    ?assertNot(maps:is_key(message, yuzu_gw_upstream:format_status(#{state => State}))).
+
+%% Through the real process. A drip is not started (no replay_next message is
+%% sent), so the queue stays as placed; sys:get_state still returns the record.
+sys_get_status_shows_counts_not_requests() ->
+    Count = 50,
+    _ = sys:replace_state(yuzu_gw_upstream,
+                          fun(St) -> setelement(up_index(replay_queue), St,
+                                                secret_queue(Count)) end),
+    Status = sys:get_status(yuzu_gw_upstream),
+    Text = lists:flatten(io_lib:format("~p", [Status])),
+    assert_no_secrets(Text),
+    ?assertNotEqual(nomatch, string:find(Text, "replay_queue_len")),
+    ?assertEqual(Count, length(up_get(replay_queue))),
+    _ = sys:replace_state(yuzu_gw_upstream,
+                          fun(St) -> setelement(up_index(replay_queue), St, []) end),
+    ok.
+
+%% An abnormal stop runs the same report path as a crash. The test process
+%% owns its own upstream and traps exits, like registry_stopped_mid_drip_*.
+crash_report_shows_counts_not_requests() ->
+    Prev = process_flag(trap_exit, true),
+    stop_upstream(),
+    {ok, UpPid} = yuzu_gw_upstream:start_link(),
+    Count = 50,
+    try
+        _ = sys:replace_state(yuzu_gw_upstream,
+                              fun(St) -> setelement(up_index(replay_queue), St,
+                                                    secret_queue(Count)) end),
+        {_, Lines} = capture_logs(fun() ->
+            catch gen_server:stop(UpPid, {test_crash, boom}, 5000),
+            ok
+        end),
+        Reports = [T || {error, T} <- Lines,
+                        binary:match(T, <<"test_crash">>) =/= nomatch],
+        %% The gen_server terminate report and the proc_lib crash report.
+        ?assertEqual(2, length(Reports)),
+        [assert_no_secrets(unicode:characters_to_list(R)) || R <- Reports],
+        ?assertMatch([_], [R || R <- Reports,
+                                binary:match(R, <<"replay_queue_len => 50">>) =/= nomatch])
+    after
+        catch unlink(UpPid),
+        catch gen_server:stop(UpPid, normal, 2000),
+        process_flag(trap_exit, Prev),
+        flush_exits()
+    end.
 
 %%% -- The real heartbeat buffer feeding the real upstream ----------------
 

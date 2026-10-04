@@ -67,7 +67,8 @@
 -export([classify_tls_error/1]).  %% for testing (R-3 TLS-error classifier)
 
 %% gen_server callbacks
--export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, code_change/3]).
+-export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, code_change/3,
+         format_status/1]).
 
 -define(SERVER, ?MODULE).
 -define(MAX_NOTIFY_INFLIGHT, 10).
@@ -611,6 +612,45 @@ terminate(_Reason, _State) ->
 
 code_change(_OldVsn, State, _Extra) ->
     {ok, State}.
+
+%% @doc What a crash report and sys:get_status/1 show of this process.
+%%
+%% The replay queue holds every queued agent's stored RegisterRequest
+%% verbatim (enrollment_token, machine_certificate, csr_pem), and a crash
+%% report prints the whole state: with a full queue that is credentials in
+%% the log and, measured, 28 s and 179 MB of log for 10000 entries. So the
+%% state is shown as a map of its scalar fields with replay_queue and
+%% recent_replays replaced by their sizes (replay_queue_len,
+%% recent_replays_size), and the last message is shown without the
+%% request it carries. Only the report is affected: sys:get_state/1 still
+%% returns the real record.
+-spec format_status(map()) -> map().
+format_status(Status) ->
+    maps:map(fun(state, State)   -> redact_state(State);
+                (message, Msg)   -> redact_message(Msg);
+                (_Key, Value)    -> Value
+             end, Status).
+
+redact_state(#state{replay_queue = Queue, recent_replays = Recent} = State) ->
+    Fields = maps:from_list(lists:zip(record_info(fields, state),
+                                      tl(tuple_to_list(State)))),
+    (maps:without([replay_queue, recent_replays], Fields))#{
+        replay_queue_len => length(Queue),
+        recent_replays_size => map_size(Recent)};
+redact_state(_Other) ->
+    '$redacted'.
+
+%% The messages that carry a request, an inventory report, session ids or a
+%% guardian frame; anything else is shown as is. gen_server hands the bare message to
+%% the report, the wrappers are handled for sys:get_status/1 style callers.
+redact_message({proxy_register, _Req})            -> {proxy_register, '$redacted'};
+redact_message({proxy_inventory, _Report})        -> {proxy_inventory, '$redacted'};
+redact_message({replay_sessions, _Ids})           -> {replay_sessions, '$redacted'};
+redact_message({forward_guardian_message, AgentId, _Frame}) ->
+    {forward_guardian_message, AgentId, '$redacted'};
+redact_message({'$gen_call', From, Msg})          -> {'$gen_call', From, redact_message(Msg)};
+redact_message({'$gen_cast', Msg})                -> {'$gen_cast', redact_message(Msg)};
+redact_message(Msg)                               -> Msg.
 
 %%%===================================================================
 %%% Circuit breaker logic
