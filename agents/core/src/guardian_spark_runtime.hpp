@@ -809,7 +809,11 @@ public:
     /// wedge adoption AFTER index_->add moved the rule's mapping to the adopted key and
     /// before the PerKey is built (the adoption's catch then erases that mapping); 16 = a
     /// throw in the reaper's refill push (reap_stranded_claims_locked), before the
-    /// exposed head is flipped to Dispatching. 0 = off.
+    /// exposed head is flipped to Dispatching; 13 = a throw while the orphan pass builds
+    /// one orphan's Disarm claim (inside the per-orphan containment); 14 = a throw in the
+    /// orphan pass's off-lock collection push, after the Disarm is already durable in
+    /// claims_ and keys_ has been erased; 15 = a throw at the top of the orphan pass,
+    /// outside the per-orphan containment (the walk itself). 0 = off.
     void set_drain_fault_point_for_test(int point) noexcept;
     /// R5.2 detach fault seam (adversarial re-review r2 C1): consumed once by the next
     /// detach_rule_locked that builds a DISARM claim - throws std::bad_alloc at the
@@ -1924,6 +1928,21 @@ private:
     /// of claims actually reaped. `refills` collects any newly-dispatchable head
     /// (an arm queued behind a reaped entry) for the caller to dispatch off-lock.
     std::size_t reap_stranded_claims_locked(std::vector<std::pair<std::string, std::shared_ptr<KeyClaim>>>& refills);
+    /// registry_mu_ held. #5322: the owner of the index's ->0 edge when a release (the
+    /// reaper, a sweep, a publish pop, an abandonment) dropped it without a caller to act
+    /// on it. An ORPHAN is a keys_ entry whose index refcount is 0 and whose claims_
+    /// entry is absent or empty. An io-class orphan gets a durable Disarm claim pushed
+    /// (queued in the SAME critical section that erases keys_[key], the shape of
+    /// detach_rule_locked) and appended to `disarms` for the caller to submit off-lock;
+    /// an inline-type orphan is disarmed synchronously, best-effort. Does nothing once
+    /// stopping_ is set. Invariant: after the pass either keys_ still owns the watcher
+    /// (a failed build or push is counted and retried next pass) or a durable Disarm
+    /// claim owns its teardown, EXCEPT the inline branch, where a throwing
+    /// backend_->disarm leaves no durable record; and no refill selected by
+    /// reap_stranded_claims_locked is left Dispatching without a worker, because the
+    /// caller contains any throw from here. Complexity: O(|keys_|) hash lookups plus one
+    /// O(log |by_key_|) refcount query each; no allocation when there is no orphan.
+    void disarm_orphan_keys_locked(std::vector<std::shared_ptr<KeyClaim>>& disarms);
     /// Off-lock. Dispatch an ARM claim (already the Dispatching head) through
     /// io_executor_.submit(); on a synchronous admission refusal (or a throw building
     /// the call) fail the head and every arm queued behind it with today's strings.
@@ -2415,7 +2434,7 @@ private:
     std::atomic<int> drain_fault_point_for_test_{0};  ///< see the setter
     std::atomic<bool> detach_fault_for_test_{false};  ///< see the setter
     std::atomic<std::uint64_t> tombstones_released_by_reaper_{0}; ///< #5322: runtime-only, incremented by reap_stranded_claims_locked
-    std::atomic<std::uint64_t> orphan_disarms_started_{0};        ///< #5322: runtime-only, incremented by a later WP
+    std::atomic<std::uint64_t> orphan_disarms_started_{0};        ///< #5322: runtime-only, incremented by disarm_orphan_keys_locked
     std::atomic<std::uint64_t> dead_watchers_erased_on_lost_{0};  ///< #5322: runtime-only, incremented by on_subscription_lost's post-condition guard
     std::uint32_t reaper_release_failed_passes_{0}; ///< #5322: registry_mu_-guarded; consecutive reaper passes whose release failed (rate-limited warn)
     std::atomic<int> index_remove_fault_for_test_{0}; ///< see the setters (>0 counted, <0 sticky, 0 off)

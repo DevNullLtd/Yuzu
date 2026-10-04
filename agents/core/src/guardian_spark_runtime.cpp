@@ -2458,10 +2458,73 @@ std::size_t GuardianSparkRuntime::reap_stranded_claims_locked(
     return reaped;
 }
 
+void GuardianSparkRuntime::disarm_orphan_keys_locked(
+    std::vector<std::shared_ptr<KeyClaim>>& disarms) {
+    if (stopping_)
+        return; // stop never starts new teardown; begin_stop owns the shutdown path
+    fault_here_for_test(15); // seam: "the walk itself threw" (outside the per-orphan try)
+    for (auto it = keys_.begin(); it != keys_.end();) {
+        const auto cit = claims_.find(it->first);
+        // An EMPTY claims_ entry is not a claim: the reaper may have left one this pass.
+        const bool orphan = index_->refcount(it->first) == 0 &&
+                            (cit == claims_.end() || cit->second.fifo.empty());
+        if (!orphan) {
+            ++it;
+            continue;
+        }
+        auto& pk = it->second;
+        if (const auto ioc = io_class_for_spark_type(pk->spec.type)) {
+            std::shared_ptr<KeyClaim> c;
+            try {
+                fault_here_for_test(13); // seam: "the Disarm build threw"
+                c = std::make_shared<KeyClaim>();
+                c->kind = ClaimKind::Disarm;
+                c->key = it->first;
+                c->io_class = *ioc;
+                c->subscription = pk->subscription;
+                // Everything fallible runs BEFORE keys_.erase, while keys_ still owns the
+                // watcher (detach_rule_locked's order); an inserted empty entry is rolled
+                // back if the push throws.
+                const auto [eit, inserted] = claims_.try_emplace(it->first);
+                try {
+                    eit->second.fifo.push_back(c);
+                } catch (...) {
+                    if (inserted)
+                        claims_.erase(eit);
+                    throw;
+                }
+            } catch (...) {
+                claim_drain_failures_.fetch_add(1, std::memory_order_relaxed);
+                ++it; // keys_ still owns the watcher; the next pass retries
+                continue;
+            }
+            it = keys_.erase(it); // same critical section as the push
+            orphan_disarms_started_.fetch_add(1, std::memory_order_relaxed);
+            try {
+                fault_here_for_test(14); // seam: "the off-lock collection push threw"
+                disarms.push_back(std::move(c));
+            } catch (...) {
+                // The Disarm is DURABLE in claims_; redrive_retained_disarms() drives it.
+                claim_drain_failures_.fetch_add(1, std::memory_order_relaxed);
+            }
+        } else {
+            // Inline type: synchronous under the lock, the last-resort shape of
+            // detach_rule_locked. Best-effort by design: a throw leaves no durable record.
+            try {
+                backend_->disarm(pk->subscription);
+            } catch (...) {
+            }
+            it = keys_.erase(it);
+            orphan_disarms_started_.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+}
+
 std::size_t GuardianSparkRuntime::expire_overdue_claims() {
     const auto now = std::chrono::steady_clock::now();
     std::vector<std::pair<std::string, std::shared_ptr<KeyClaim>>> overdue;
     std::vector<std::pair<std::string, std::shared_ptr<KeyClaim>>> refills;
+    std::vector<std::shared_ptr<KeyClaim>> disarms;
     std::size_t expired_count = 0;
     {
         std::lock_guard<std::mutex> lk{registry_mu_};
@@ -2493,11 +2556,20 @@ std::size_t GuardianSparkRuntime::expire_overdue_claims() {
         // doc comment) - separate from the overdue-live-claim pass above, which
         // deliberately excludes anything already outcome/commit_exception/abandoned.
         reap_stranded_claims_locked(refills);
+        // #5322: the owner of a ->0 edge a release dropped. Contained here so the
+        // reaper's refills (already flipped Dispatching) always reach their dispatch.
+        try {
+            disarm_orphan_keys_locked(disarms);
+        } catch (...) {
+            claim_drain_failures_.fetch_add(1, std::memory_order_relaxed);
+        }
     }
     if (expired_count || !refills.empty())
         claim_cv_.notify_all();
     for (auto& [key, refill] : refills)
         dispatch_arm_off_lock(key, refill);
+    for (auto& d : disarms)
+        submit_disarm_off_lock(d); // takes registry_mu_ itself
     return expired_count;
 }
 
@@ -3120,6 +3192,8 @@ GuardianSparkRuntime::withdraw_rule_after_wedge_sweep_locked(
     // claim - and the next same-key attach then hit the keys_.emplace hard error.
     // The ->0 edge is PREDICTED from the refcount (same lock, nothing can change it
     // between here and remove_rule) instead of learned from remove_rule's return.
+    // (A ->0 edge dropped anywhere else, e.g. release_claim_index_locked's erase_rule,
+    // is owned by disarm_orphan_keys_locked on the next heartbeat pass.)
     // Adversarial re-review r3 C4: the lifecycle kind is copied HERE, before the durable
     // mutation, not at the enqueue call after it - that copy allocates, and a throw
     // there used to unwind past the claim hand-off with rules_/index_/keys_ already
