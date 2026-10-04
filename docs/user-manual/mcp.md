@@ -781,7 +781,7 @@ Required parameters are validated server-side; missing required fields return a
 number, and `18446744073709551615` became `-1`, the "any" sentinel on several filters.
 `query_audit_log`'s `since`, `until` and `limit` and the app-performance compare tool's `window`
 now answer `-32602` for a value that is not a JSON integer or does not fit a signed 64-bit value
-(a string used to mean `0`, that is unbounded, for `since`/`until`). Elsewhere an integer that
+(a string used to mean `0`, that is unbounded, for `since`/`until`). `query_audit_log` also refuses a NEGATIVE `since` or `until` with `-32602` (the store applies a bound only above zero, so `-3600` used to mean no bound and returned the whole log); `0` or omitting the argument still means no bound. Elsewhere an integer that
 does not fit saturates (`9223372036854775807`, or the `int` range where a tool narrows to `int`)
 instead of wrapping, so an oversized `limit` reaches that tool's own ceiling instead of becoming
 `0` or the default page.

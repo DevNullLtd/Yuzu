@@ -88,7 +88,8 @@ struct ExecV1Harness {
 
     RestApiV1 api;
 
-    explicit ExecV1Harness(pg::PgPool& pool) {
+    // wire_fleet_read=false leaves fleet_read_fn unwired (exercises the 503 guard).
+    explicit ExecV1Harness(pg::PgPool& pool, bool wire_fleet_read = true) {
         yuzu::server::seed_response_metrics(metrics);
         execution_tracker = std::make_unique<ExecutionTracker>(pool);
         REQUIRE(execution_tracker->is_open());
@@ -169,7 +170,9 @@ struct ExecV1Harness {
                             /*stream_budget=*/nullptr,
                             /*exec_visible_fn=*/{},
                             /*list_read_fn=*/{},
-                            /*fleet_read_fn=*/std::move(fleet_read_fn));
+                            /*fleet_read_fn=*/wire_fleet_read
+                                ? RestApiV1::FleetReadFn(std::move(fleet_read_fn))
+                                : RestApiV1::FleetReadFn{});
     }
 
     ~ExecV1Harness() {
@@ -891,6 +894,36 @@ TEST_CASE("GET /api/v1/execution-statistics/agents: the visible set is applied B
     auto confined = h.sink.Get("/api/v1/execution-statistics/agents?limit=1");
     REQUIRE(confined);
     CHECK(served_agent_ids(*confined) == std::vector<std::string>{"agent-quiet"});
+}
+
+TEST_CASE("GET /api/v1/execution-statistics/agents: an unwired fleet_read_fn fails closed with a 503, "
+          "not an exception (#3526)",
+          "[pg][rest][executions][v1][statistics]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, execv1_responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecV1Harness h(pool, /*wire_fleet_read=*/false);
+    auto r = h.sink.Get("/api/v1/execution-statistics/agents");
+    REQUIRE(r);
+    CHECK(r->status == 503);
+    CHECK(r->body.find("agent") == std::string::npos);
+}
+
+TEST_CASE("GET /api/v1/execution-statistics/definitions: a negative since is a 400 like /agents, "
+          "zero and omitted stay unbounded (#4644)",
+          "[pg][rest][executions][v1][statistics]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, execv1_responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecV1Harness h(pool);
+    auto neg = h.sink.Get("/api/v1/execution-statistics/definitions?since=-1");
+    REQUIRE(neg);
+    CHECK(neg->status == 400);
+    CHECK(nlohmann::json::parse(neg->body)["error"]["message"] == "since must not be negative");
+    for (const char* ok : {"?since=0", "", "?since=1700000000"}) {
+        INFO(ok);
+        auto r = h.sink.Get(std::string("/api/v1/execution-statistics/definitions") + ok);
+        REQUIRE(r);
+        CHECK(r->status == 200);
+    }
 }
 
 TEST_CASE("GET /api/v1/execution-statistics/agents: a gate denial is a 403 and a negative since "

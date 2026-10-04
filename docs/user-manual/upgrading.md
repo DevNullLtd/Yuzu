@@ -125,6 +125,10 @@ too large for its type were already `400`.
   `now - n` that went past the epoch silently returned the whole result. Omit the parameter for
   "no bound on that side". `since=0` stays valid and matches exactly what omitting `since`
   matches; no script that sends `since=0` changes behaviour.
+- Scripts that send a **negative** `since` or `until` to `GET /api/v1/execution-statistics/agents` or `/definitions` (`since`), to the legacy `GET /api/audit` (`since`/`until`) or to MCP `query_audit_log` (`since`/`until`, `-32602`): it is `400` now. It used
+  to be read as "unbounded", so a window computed as `now - n` that went past the epoch silently
+  returned the whole result. Send `0` (or omit the parameter) for "no bound on that side"; `0` stays
+  valid on those routes because their stores cannot yet tell an omitted bound from a literal `0`.
 - MCP clients that send `"limit": null` or `"status": null`, or a float or string for either: omit
   the key to get the default. A `status` above `2147483647` and an unsigned value above
   `9223372036854775807` are `-32602` too (the latter used to wrap to `-1`, "any status"; the same

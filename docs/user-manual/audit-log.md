@@ -371,6 +371,8 @@ Note: the v1 endpoint supports `principal` and `action` filters only. For
 additional filters (`target_type`, `target_id`, `since`, `until`, `offset`),
 use the legacy `/api/audit` endpoint.
 
+A negative `since` or `until` is rejected (`400` on `/api/audit`, `-32602` on MCP `query_audit_log`): the store applies a bound only above zero, so a literal `-3600` used to mean no bound and returned the whole log. `0`, or omitting the parameter, still means no bound.
+
 **Example --- fetch the 20 most recent events:**
 
 ```bash

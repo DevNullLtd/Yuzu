@@ -9388,6 +9388,19 @@ void RestApiV1::register_routes(
     sink.Get("/api/v1/execution-statistics/agents",
              [fleet_read_fn, execution_tracker](const httplib::Request& req,
                                                 httplib::Response& res) {
+                 const auto cid = detail::make_correlation_id();
+                 res.set_header("X-Correlation-Id", cid);
+                 // Unwired seam: fail closed with an A4 503, like every sibling fleet-read
+                 // route, instead of an empty std::function throwing out of the handler.
+                 if (!fleet_read_fn) {
+                     spdlog::error("execution-statistics/agents: fleet_read_fn unwired -- "
+                                   "misconfigured call site; failing closed; cid={}",
+                                   cid);
+                     res.status = 503;
+                     res.set_content(detail::error_json_a4(503, "service unavailable", cid),
+                                     "application/json");
+                     return;
+                 }
                  auto gate = fleet_read_fn(req, res, "Execution", "Read");
                  if (!gate.admitted)
                      return; // gate already wrote the response.
@@ -9447,6 +9460,12 @@ void RestApiV1::register_routes(
                  } catch (const std::exception&) {
                      res.status = 400;
                      res.set_content(detail::a4_error(res, "invalid numeric query parameter"),
+                                     "application/json");
+                     return;
+                 }
+                 if (q.since < 0) {
+                     res.status = 400;
+                     res.set_content(detail::a4_error(res, "since must not be negative"),
                                      "application/json");
                      return;
                  }

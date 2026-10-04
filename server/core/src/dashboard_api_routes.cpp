@@ -125,6 +125,16 @@ void register_dashboard_api_routes(HttpRouteSink& sink, Deps deps) {
                 "application/json");
             return;
         }
+        // A negative bound is not a time: the store applies a bound only when it is above
+        // zero, so a literal `since=-3600` (an underflowed "an hour ago") used to mean
+        // "the whole log". Zero stays "no bound", exactly as omitting the parameter does.
+        if (q.since < 0 || q.until < 0) {
+            res.status = 400;
+            res.set_content(
+                R"({"error":{"code":400,"message":"since and until must not be negative"},"meta":{"api_version":"v1"}})",
+                "application/json");
+            return;
+        }
         // Range, not just parseability: a negative limit would otherwise
         // reach PG as `LIMIT -1`, error, and be reported as an audit-store
         // DEGRADE — 503 plus the read-degrade counter the availability

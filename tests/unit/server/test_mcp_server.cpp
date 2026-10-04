@@ -32783,6 +32783,17 @@ TEST_CASE("MCP query_audit_log: a wrong-typed or out-of-range since/until/limit 
         REQUIRE(body.contains("error"));
         CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
     }
+    // A negative bound is refused too: the store applies a bound only above zero, so -3600
+    // used to mean "the whole log".
+    for (const char* neg : {R"({"since":-1})", R"({"until":-1})", R"({"since":-3600,"until":0})",
+                            R"({"since":0,"until":-9223372036854775807})"}) {
+        INFO(neg);
+        auto body = call(neg);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+        CHECK(body["error"]["message"].get<std::string>().find("must not be negative") !=
+              std::string::npos);
+    }
     // Omitted and well-formed values (including 0 = unbounded and the int64 maximum) still work.
     for (const char* ok : {R"({})", R"({"since":0,"until":0,"limit":10})",
                            R"({"since":9223372036854775807})"}) {

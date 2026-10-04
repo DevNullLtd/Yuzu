@@ -7265,8 +7265,8 @@ Get per-agent execution statistics.
 | Param | Type | Description |
 |---|---|---|
 | `agent_id` | string | Filter to a single agent |
-| `since` | integer | Unix timestamp — only executions after this time |
-| `limit` | integer | Max results (default 100, max 1000) |
+| `since` | integer | Unix timestamp — only executions after this time. `0` or omitted means no bound; a negative value is `400` (the store applies a bound only above zero, so it used to read as no bound) |
+| `limit` | integer | Max results (default 50, max 1000) |
 
 **Response:**
 
@@ -7278,7 +7278,7 @@ Get per-agent execution statistics.
       "total_executions": 324,
       "success_count": 310,
       "failure_count": 14,
-      "success_rate": 0.957,
+      "success_rate": 95.7,
       "avg_duration_seconds": 3.8,
       "last_execution_at": 1711900800
     }
@@ -7298,8 +7298,8 @@ Get per-definition execution statistics.
 | Param | Type | Description |
 |---|---|---|
 | `definition_id` | string | Filter to a single definition |
-| `since` | integer | Unix timestamp — only executions after this time |
-| `limit` | integer | Max results (default 100, max 1000) |
+| `since` | integer | Unix timestamp — only executions after this time. `0` or omitted means no bound; a negative value is `400` (the store applies a bound only above zero, so it used to read as no bound) |
+| `limit` | integer | Max results (default 50, max 1000) |
 
 **Response:**
 
@@ -7310,7 +7310,7 @@ Get per-definition execution statistics.
       "definition_id": "os-info-query",
       "total_executions": 5200,
       "total_agents": 142,
-      "success_rate": 0.995,
+      "success_rate": 99.5,
       "avg_duration_seconds": 1.2
     }
   ],
@@ -10016,8 +10016,10 @@ size, when that second read degrades; do not treat `null` as "unknown but
 probably zero".
 
 **Errors:** `403` — caller lacks `AuditLog:Read`; `400` — a `since`/`until`/
-`limit`/`offset` query parameter is not a valid integer, or `limit < 1` /
-`offset < 0`; `503` — the audit store is closed, or the page-rows query
+`limit`/`offset` query parameter is not a valid integer, `since` or `until`
+is negative (the store applies a bound only above zero, so a negative value used
+to read as no bound and returned the whole log; `0` or omitting the parameter
+still means no bound), or `limit < 1` / `offset < 0`; `503` — the audit store is closed, or the page-rows query
 degraded (ADR-0040 deny-on-degrade; never a false-empty `200`).
 
 ---

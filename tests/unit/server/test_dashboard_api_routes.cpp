@@ -633,6 +633,35 @@ TEST_CASE("dashboard_api_routes: /api/audit rejects a malformed since/until/limi
     CHECK(ok->status == 200);
 }
 
+TEST_CASE("dashboard_api_routes: /api/audit rejects a negative since or until with 400, zero stays "
+          "unbounded",
+          "[pg][server][routes][dashboard_api_routes]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, dashapi_audit_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    AuditStore audit{pool};
+    REQUIRE(audit.is_open());
+
+    Harness h;
+    h.audit_store = &audit;
+    h.wire();
+
+    // The store applies a bound only above zero, so a literal -3600 used to mean "the whole log".
+    for (const char* bad : {"since=-1", "since=-3600", "until=-1", "since=-1&until=-1",
+                            "since=0&until=-5"}) {
+        INFO(bad);
+        auto r = h.sink.Get(std::string("/api/audit?") + bad);
+        REQUIRE(r);
+        CHECK(r->status == 400);
+        CHECK(json::parse(r->body)["error"]["message"] == "since and until must not be negative");
+    }
+    for (const char* ok : {"since=0", "until=0", "since=0&until=0", "", "since=1700000000"}) {
+        INFO(ok);
+        auto r = h.sink.Get(std::string("/api/audit?") + ok);
+        REQUIRE(r);
+        CHECK(r->status == 200);
+    }
+}
+
 TEST_CASE("dashboard_api_routes: /api/analytics/recent rejects a malformed limit with 400 "
           "instead of silently ignoring it",
           "[server][routes][dashboard_api_routes]") {

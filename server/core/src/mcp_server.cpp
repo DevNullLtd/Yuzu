@@ -4103,11 +4103,14 @@ static const ToolSecurityEntry kToolSecurityRows[] = {
     {"get_deployment_preview", {"SoftwareDeployment", "Read"}},
 
     // #2146 Batch B3 — fleet visualization + execution/fleet statistics read
-    // twins. Default (2-element) form: none of these routes reason about
-    // service-scoped tokens on the REST side either (no
-    // deny_fleet_wide_service_scoped call, no per-agent confinement) — a
-    // service-scoped MCP token is structurally denied at the generic C8
-    // chokepoint here, matching the REST twins' own posture exactly.
+    // twins. Default (2-element) form, so a service-scoped MCP token is
+    // structurally denied at the generic C8 chokepoint. That still matches the REST
+    // twins for the fleet-summary and by-definition tools (no per-agent identity,
+    // plain gate). It no longer matches get_execution_statistics_by_agent: its REST
+    // twin is confined via require_fleet_read (#3526), which admits a service-scoped
+    // token as a confined view, while this tool stays `denied` by default class.
+    // Moving it to `confined` is a separate security decision (needs a test against
+    // the real chokepoint), not made here.
     {"get_execution_statistics", {"Execution", "Read"}},
     {"get_execution_statistics_by_agent", {"Execution", "Read"}},
     {"get_execution_statistics_by_definition", {"Execution", "Read"}},
@@ -8321,7 +8324,10 @@ McpServer::HandlerFn McpServer::build_handler(
                 aq.target_type = param_str(args, "target_type");
                 // #4644 Gate 7: the lenient reader turned a wrong-typed bound into 0
                 // ("unbounded") and, before it saturated, wrapped UINT64_MAX to -1, so a
-                // malformed window silently meant "the whole log". Strict: -32602.
+                // malformed window silently meant "the whole log". Strict: -32602. A
+                // negative bound is refused too: the store applies a bound only above
+                // zero, so a literal -3600 (an underflowed "an hour ago") read as no bound
+                // at all. Zero stays "no bound", like omitting the argument.
                 const auto since_opt = param_int_strict(args, "since", 0);
                 const auto until_opt = param_int_strict(args, "until", 0);
                 const auto audit_limit_opt = param_int_strict(args, "limit", 50);
@@ -8333,6 +8339,14 @@ McpServer::HandlerFn McpServer::build_handler(
                                                    "since, until and limit must each be a JSON "
                                                    "integer that fits in a signed 64-bit value"),
                                     "application/json");
+                    return;
+                }
+                if (*since_opt < 0 || *until_opt < 0) {
+                    // retry-hint-exempt: malformed client input, not a store fault --
+                    // resending the same value fails identically.
+                    res.set_content(
+                        error_response(id, kInvalidParams, "since and until must not be negative"),
+                        "application/json");
                     return;
                 }
                 aq.since = *since_opt;
