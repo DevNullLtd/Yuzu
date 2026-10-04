@@ -1030,7 +1030,27 @@ rejected_replay_disconnects_without_reannounce() ->
     ?assert(is_integer(maps:get(sid(A1), up_get(recent_replays), undefined))),
     [Warning] = [T || {warning, T} <- Lines, binary:match(T, <<"not accepted">>) =/= nomatch],
     ?assertNotEqual(nomatch, binary:match(Warning, binary:copy(<<"x">>, 128))),
-    ?assertEqual(nomatch, binary:match(Warning, binary:copy(<<"x">>, 129))).
+    ?assertEqual(nomatch, binary:match(Warning, binary:copy(<<"x">>, 129))),
+    %% Control bytes (CR, LF, ESC, NUL, DEL) become `?' after the cut; bytes of
+    %% 128 and above pass through (~s shows the latin-1 byte 16#E9 as its UTF-8
+    %% form C3 A9), and the text is still cut to 128 bytes.
+    Hostile = <<"line1\r\nline2\e[31m", 0, 127, 16#E9, (binary:copy(<<"y">>, 200))/binary>>,
+    A2 = bind_agent(<<"e20s">>),
+    mock_unary(fun(<<"ProxyRegister">>, _Req, Hdr) when Hdr =/= undefined ->
+                       {ok, #{accepted => false, reject_reason => Hostile,
+                              session_id => Hdr}, #{}};
+                  (M, R, H) -> default_rpc(M, R, H)
+               end),
+    {_, Lines2} = capture_logs(fun() ->
+        ok = yuzu_gw_upstream:replay_sessions([sid(A2)]),
+        await(fun() -> lists:member({agent, disconnect, pid(A2)}, agent_calls()) end),
+        await_idle()
+    end),
+    [Warning2] = [T || {warning, T} <- Lines2, binary:match(T, <<"not accepted">>) =/= nomatch],
+    [?assertEqual({nomatch, C}, {binary:match(Warning2, <<C>>), C}) || C <- [$\r, $\n, 27, 0, 127]],
+    Expected = <<"line1??line2?[31m??", 16#C3, 16#A9, (binary:copy(<<"y">>, 128 - 20))/binary>>,
+    ?assertNotEqual(nomatch, binary:match(Warning2, Expected)),
+    ?assertEqual(nomatch, binary:match(Warning2, binary:copy(<<"y">>, 128 - 19))).
 
 %% Mocks return #{} and older callers omit the key: absent means accepted.
 missing_accepted_key_is_accepted() ->

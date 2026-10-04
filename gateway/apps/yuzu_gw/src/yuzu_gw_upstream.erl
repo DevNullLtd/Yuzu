@@ -906,13 +906,22 @@ emit_verdict_dropped(Reason, Count) ->
     telemetry:execute([yuzu, gw, heartbeat, verdict_dropped],
                       #{count => Count}, #{reason => Reason}).
 
-%% @doc The server's reject_reason, cut to 128 bytes for the log. Bytes, not
-%% graphemes: the text is untrusted and need not be valid UTF-8.
+%% @doc The server's reject_reason, cut to 128 bytes for the log, with every
+%% control byte (below 32, and 127) replaced by `?' so the text cannot split or
+%% forge a log line (CR, LF) or drive a terminal (ESC). Bytes, not graphemes:
+%% the text is untrusted and need not be valid UTF-8, so the replacement is
+%% per byte and bytes of 128 and above pass through.
 reject_reason_for_log(Response) ->
     case maps:get(reject_reason, Response, <<>>) of
-        Reason when is_binary(Reason) -> binary:part(Reason, 0, min(byte_size(Reason), 128));
-        _                             -> <<>>
+        Reason when is_binary(Reason) ->
+            Cut = binary:part(Reason, 0, min(byte_size(Reason), 128)),
+            << <<(printable_byte(B))>> || <<B>> <= Cut >>;
+        _ ->
+            <<>>
     end.
+
+printable_byte(B) when B < 32; B =:= 127 -> $?;
+printable_byte(B)                        -> B.
 
 %% @doc Read an integer application env key that must lie in Min..Max; an
 %% invalid value is logged (naming the key) and replaced by the default.
