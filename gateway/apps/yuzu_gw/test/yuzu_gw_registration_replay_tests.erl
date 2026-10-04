@@ -108,6 +108,8 @@ verdict_replay_test_() ->
         fun triggered_event_is_labelled_breaker/0),
       t("E12 4096 junk ids none held: no rpc, no queue, no stamp, 4096 not_local",
         fun junk_verdict_is_all_not_local/0),
+      t("E12b a cast of 5000 ids is cut to 4096 at the boundary; a non-list is ignored",
+        fun oversized_or_non_list_cast_is_bounded/0),
       t("E15 an empty stored request is skipped: no rpc, no stamp",
         fun empty_stored_request_is_skipped_without_stamp/0),
       t("E15b an agent re-registered under a new session is skipped at pop",
@@ -157,6 +159,8 @@ verdict_breaker_test_() ->
      [
       t("E11 an open breaker drops the verdict; the half_open probe replays once",
         fun open_breaker_drops_verdict_then_half_open_probe_replays_once/0),
+      t("E12c an oversized cast with the circuit open counts only 4096 circuit_open",
+        fun oversized_cast_with_open_circuit_is_bounded/0),
       t("E14 a failed half_open probe reopens the breaker",
         fun failed_half_open_probe_reopens/0),
       t("E22 queue depth drops to zero when the drip aborts on an open breaker",
@@ -810,6 +814,36 @@ junk_verdict_is_all_not_local() ->
     ?assertEqual(0, proxy_count()),
     ?assertEqual([], up_get(replay_queue)),
     ?assertEqual(StampsBefore, up_get(recent_replays)).
+
+%% E12b: replay_sessions/1 is exported, so the cast boundary bounds its own
+%% input: 5000 ids none of which this node holds count 4096 not_local (not
+%% 5000), and anything that is not a list is ignored without crashing the
+%% process. The 4096-id case above is the positive control for the counter.
+oversized_or_non_list_cast_is_bounded() ->
+    UpPid = whereis(yuzu_gw_upstream),
+    Ids = [iolist_to_binary(io_lib:format("junk-session-~6..0b", [N])) || N <- lists:seq(1, 5000)],
+    ok = yuzu_gw_upstream:replay_sessions(Ids),
+    sync(),
+    ?assertEqual(4096, dropped(not_local)),
+    [begin
+         ok = yuzu_gw_upstream:replay_sessions(Bad),
+         sync()
+     end || Bad <- [not_a_list, <<"abc">>, 42, [<<"improper">> | <<"tail">>]]],
+    ?assertEqual(UpPid, whereis(yuzu_gw_upstream)),
+    ?assertEqual(4096, dropped(not_local)),
+    ?assertEqual(0, proxy_count()),
+    ?assertEqual([], up_get(replay_queue)),
+    ?assertEqual([], triggers(heartbeat)).
+
+%% E12c: the same bound on the circuit-open path, which counts before it
+%% drops.
+oversized_cast_with_open_circuit_is_bounded() ->
+    trip_breaker(),
+    Ids = [iolist_to_binary(io_lib:format("junk-session-~6..0b", [N])) || N <- lists:seq(1, 5000)],
+    ok = yuzu_gw_upstream:replay_sessions(Ids),
+    sync(),
+    ?assertEqual(4096, dropped(circuit_open)),
+    ?assertEqual(0, dropped(not_local)).
 
 %% E15: the agent registered without a stashed request. It is queued (the
 %% trigger event says so), then skipped at pop with no rpc and no stamp.

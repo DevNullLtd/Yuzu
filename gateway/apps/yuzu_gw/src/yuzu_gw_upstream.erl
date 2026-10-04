@@ -86,6 +86,10 @@
 -define(MAX_REPLAY_SESSION_GUARD_MS, 3600000).
 -define(DEFAULT_REPLAY_QUEUE_MAX, 10000).
 -define(MAX_REPLAY_QUEUE_MAX, 1000000).
+%% Most session ids one replay_sessions cast may name. The same bound as
+%% ?MAX_VERDICT_IDS in yuzu_gw_heartbeat_buffer, which applies it before the
+%% cast; keep the two equal.
+-define(MAX_REPLAY_SESSION_IDS, 4096).
 
 %% CC-03 wire-capability handshake (proto/yuzu/gateway/v1/gateway.proto,
 %% StreamStatusNotification.wire_capabilities): the literal this gateway
@@ -171,8 +175,9 @@ forward_guardian_message(AgentId, ResponseFrame) ->
 %% and so never blocking it. `ok' means handed over, not replayed: the ids are
 %% dropped when the circuit is open, when this node does not hold the session,
 %% when the agent is already queued, when the session was replayed within the
-%% guard window, and when the queue is full. The caller has already bounded
-%% the list (at most 4096 binaries of 1 to 64 bytes).
+%% guard window, and when the queue is full. The heartbeat buffer already
+%% bounds the list (at most 4096 binaries of 1 to 64 bytes); the cast handler
+%% bounds it again: a non-list is ignored and only the first 4096 ids are used.
 -spec replay_sessions([binary()]) -> ok.
 replay_sessions(SessionIds) ->
     gen_server:cast(?SERVER, {replay_sessions, SessionIds}).
@@ -343,19 +348,18 @@ handle_cast({forward_guardian_message, AgentId, ResponseFrame},
             end
     end;
 
-handle_cast({replay_sessions, SessionIds}, #state{cb_state = open} = State) ->
-    %% Drop, do not queue: the upstream is known to be down, so every replay
-    %% RPC would fail fast anyway. The server lists these sessions again on a
-    %% later heartbeat once it answers, so nothing is lost but time.
-    Count = length(SessionIds),
-    emit_verdict_dropped(circuit_open, Count),
-    logger:debug("Registration replay: heartbeat verdict named ~b session(s) "
-                 "while the circuit is open; dropped", [Count]),
-    {noreply, State};
-handle_cast({replay_sessions, SessionIds}, State) ->
-    %% closed or half_open. half_open queues on purpose: the first replay
-    %% RPC is the probe that decides whether the breaker closes.
-    {noreply, enqueue_sessions(SessionIds, State)};
+handle_cast({replay_sessions, SessionIds0}, State) ->
+    %% replay_sessions/1 is exported, so this boundary bounds its own input
+    %% (the heartbeat buffer's cap is not the only caller's guarantee): a
+    %% non-list is ignored, a list is cut to ?MAX_REPLAY_SESSION_IDS before it
+    %% is counted, dropped or queued.
+    case bound_session_ids(SessionIds0) of
+        invalid ->
+            logger:debug("Registration replay: ignoring a verdict that is not a list"),
+            {noreply, State};
+        SessionIds ->
+            {noreply, replay_verdict(SessionIds, State)}
+    end;
 
 handle_cast(replay_registrations, #state{replay_queue = [_ | _]} = State) ->
     %% Gate 7 UP-5 — a drip is already in flight. The OLD behaviour
@@ -770,6 +774,31 @@ schedule_replay_next([], _Spacing) ->
 schedule_replay_next(_Rest, Spacing) ->
     erlang:send_after(Spacing, self(), replay_next),
     ok.
+
+%% @doc A verdict's ids, cut to ?MAX_REPLAY_SESSION_IDS; `invalid' for anything
+%% that is not a list (an improper list included).
+bound_session_ids(Ids) when is_list(Ids) ->
+    try lists:sublist(Ids, ?MAX_REPLAY_SESSION_IDS)
+    catch error:_ -> invalid
+    end;
+bound_session_ids(_) ->
+    invalid.
+
+%% @doc The verdict of a bounded list: dropped while the circuit is open,
+%% queued otherwise.
+replay_verdict(SessionIds, #state{cb_state = open} = State) ->
+    %% Drop, do not queue: the upstream is known to be down, so every replay
+    %% RPC would fail fast anyway. The server lists these sessions again on a
+    %% later heartbeat once it answers, so nothing is lost but time.
+    Count = length(SessionIds),
+    emit_verdict_dropped(circuit_open, Count),
+    logger:debug("Registration replay: heartbeat verdict named ~b session(s) "
+                 "while the circuit is open; dropped", [Count]),
+    State;
+replay_verdict(SessionIds, State) ->
+    %% closed or half_open. half_open queues on purpose: the first replay
+    %% RPC is the probe that decides whether the breaker closes.
+    enqueue_sessions(SessionIds, State).
 
 %% @doc Queue the entries for the sessions a heartbeat verdict named (#1197
 %% PR-C). Ids are resolved to entries by session (yuzu_gw_registry:

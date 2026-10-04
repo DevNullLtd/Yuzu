@@ -44,6 +44,8 @@
 %% Bounds on one verdict: the longest session id the gateway will carry and
 %% the most ids handed to the upstream per flush.
 -define(MAX_SESSION_ID_BYTES, 64).
+%% Same bound as ?MAX_REPLAY_SESSION_IDS in yuzu_gw_upstream, which applies it
+%% again at the cast boundary; keep the two equal.
 -define(MAX_VERDICT_IDS, 4096).
 
 -record(state, {
