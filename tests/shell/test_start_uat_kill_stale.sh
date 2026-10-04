@@ -209,7 +209,7 @@ check "kill_tree refuses PID 0" "$([ ! -e "$TMP/kills" ] && echo 0 || echo 1)"
 echo "forged records: provenance"
 reset; alive 100 "$SRV --no-tls"; record_pid server 100 "$SRV"; chmod 777 "$PID_DIR"
 run kill_stale
-check "world-writable PID_DIR: untrusted, nothing killed, record kept" "$([ $rc = 0 ] && ! [ -e "$TMP/kills" ] && [ -f "$PID_DIR/server.pid" ] && [[ $out == *'ignoring PID records not owned by you'* ]] && echo 0 || echo 1)"
+check "world-writable PID_DIR: untrusted, nothing killed, record kept, stop refuses (rc 1)" "$([ $rc = 1 ] && ! [ -e "$TMP/kills" ] && [ -f "$PID_DIR/server.pid" ] && [[ $out == *'ignoring PID records not owned by you'* ]] && echo 0 || echo 1)"
 run show_status
 check "status labels the ignored record" "$([[ $out == *'server record ignored'* ]] && echo 0 || echo 1)"
 reset; alive 100 "$SRV --no-tls"; record_pid server 100 "$SRV"; chmod 775 "$PID_DIR"
@@ -218,7 +218,7 @@ reset; alive 100 "$SRV --no-tls"; record_pid server 100 "$SRV"; chmod 777 "$UAT_
 check "world-writable UAT_DIR is untrusted" "$([ "$(recorded_pid_state server)" = untrusted ] && echo 0 || echo 1)"
 reset; alive 100 "$SRV --no-tls"; record_pid server 100 "$SRV"; mv "$PID_DIR/server.pid" "$TMP/real.pid"; ln -s "$TMP/real.pid" "$PID_DIR/server.pid"
 run kill_stale
-check "symlinked record: untrusted, nothing killed, link kept" "$([ $rc = 0 ] && ! [ -e "$TMP/kills" ] && [ -L "$PID_DIR/server.pid" ] && echo 0 || echo 1)"
+check "symlinked record: untrusted, nothing killed, link kept, stop refuses (rc 1)" "$([ $rc = 1 ] && ! [ -e "$TMP/kills" ] && [ -L "$PID_DIR/server.pid" ] && echo 0 || echo 1)"
 reset; alive 100 "$SRV --no-tls"; record_pid server 100 "$SRV"
 check "ordinary record is trusted and owned" "$([ "$(recorded_pid_state server)" = 'owned 100' ] && echo 0 || echo 1)"
 check "record_pid leaves PID_DIR at 0700" "$([ "$(find "$PID_DIR" -maxdepth 0 -perm 700)" = "$PID_DIR" ] && echo 0 || echo 1)"

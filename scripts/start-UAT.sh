@@ -232,8 +232,9 @@ kill_tree() {
     kill -9 "$1" 2>/dev/null || { pid_alive "$1" && sudo -n kill -9 "$1" 2>/dev/null; } || true
 }
 
-# kill_recorded NAME — 0 stopped, 1 nothing to stop, 2 owned but survived
-# (its record is kept so the operator still has the PID).
+# kill_recorded NAME — 0 stopped, 1 nothing to stop, 2 could not stop: owned but
+# survived (its record is kept so the operator still has the PID), or an
+# untrusted record that may name a live process (never signalled, never removed).
 kill_recorded() {
     local name="$1" state pid _
     state=$(recorded_pid_state "$name")
@@ -243,7 +244,7 @@ kill_recorded() {
         untrusted)
             # Never signalled and never deleted: not ours to remove.
             warn "ignoring PID records not owned by you in $PID_DIR ($name)"
-            return 1 ;;
+            return 2 ;;
         malformed|dead*) rm -f "$PID_DIR/$name.pid"; return 1 ;;
         reused*)
             warn "recorded $name PID $pid now belongs to another process, not signalling it"
@@ -296,7 +297,7 @@ kill_stale() {
         esac
     done
     if [ "$failed" -gt 0 ]; then
-        fail "$failed recorded process(es) survived SIGKILL — refusing to continue (see above)"
+        fail "$failed recorded process(es) could not be stopped (survived SIGKILL, or the record is not trusted) — refusing to continue (see above)"
         return 1
     fi
 
