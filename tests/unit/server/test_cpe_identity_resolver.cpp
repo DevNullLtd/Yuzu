@@ -75,9 +75,15 @@ TEST_CASE("os-native lanes are not-assessed with no identity work", "[cpe]") {
 
     SoftwareEntry win = pkg("Google Chrome", "120.0", "windows", "", "app");
     SoftwareEntry mac = pkg("Safari", "17.0", "macos", "", "app");
-    SoftwareEntry brew = pkg("wget", "1.21", "homebrew", "", "package");
+    SoftwareEntry brew = pkg("wget", "1.21", "brew", "", "pkg");
+    SoftwareEntry cask = pkg("iterm2", "3.5", "brew", "", "app");
+    SoftwareEntry receipt =
+        pkg("com.apple.pkg.CLTools_Executables", "15.0", "macos_pkgutil", "", "pkg");
+    SoftwareEntry feat = pkg("NetFx3", "enabled", "optional_feature", "", "feat");
+    // kind=feat wins over a lane-1 ecosystem (os-native check precedes lane 1)
+    SoftwareEntry feat_rpm = pkg("NetFx3", "enabled", "rpm", "", "feat");
 
-    for (const SoftwareEntry* e : {&win, &mac, &brew}) {
+    for (const SoftwareEntry* e : {&win, &mac, &brew, &cask, &receipt, &feat, &feat_rpm}) {
         auto id = r.resolve(*e);
         REQUIRE(id.outcome == IdentityOutcome::NotAssessed);
         REQUIRE(id.not_assessed_reason == std::string(kReasonOsNative));
@@ -475,4 +481,32 @@ TEST_CASE("ADVERSARIAL: production ctor parses the real build-embedded curated "
     REQUIRE(id.outcome == IdentityOutcome::Resolved);
     CHECK(id.cpe_product == "openssl");
     CHECK(id.exact_product);
+}
+
+TEST_CASE("REGRESSION GUARD: every Lane-1 ecosystem (rpm/deb/apk/pacman) resolves via the "
+          "curated map",
+          "[cpe]") {
+    // The Lane-3 (kind, ecosystem) pairs are covered by the os-native case above.
+    CpeIdentityResolver r{kSeed};
+
+    for (const char* eco : {"rpm", "deb", "apk", "pacman"}) {
+        auto id = r.resolve(pkg("openssl", "1.1.1", eco, "", "package"));
+        INFO(eco);
+        REQUIRE(id.outcome == IdentityOutcome::Resolved);
+        CHECK(id.cpe_product == "openssl");
+    }
+}
+
+TEST_CASE("REGRESSION GUARD: the retired `homebrew` value is unsupported-ecosystem, not "
+          "os-native; pkg is not a kind-level Lane-3 trigger",
+          "[cpe]") {
+    CpeIdentityResolver r{kSeed};
+
+    auto retired = r.resolve(pkg("wget", "1.21", "homebrew", "", "package"));
+    REQUIRE(retired.outcome == IdentityOutcome::NotAssessed);
+    CHECK(retired.not_assessed_reason == std::string(kReasonUnsupportedEcosystem));
+
+    auto bare_pkg = r.resolve(pkg("wget", "1.21", "", "", "pkg"));
+    REQUIRE(bare_pkg.outcome == IdentityOutcome::NotAssessed);
+    CHECK(bare_pkg.not_assessed_reason == std::string(kReasonUnsupportedEcosystem));
 }

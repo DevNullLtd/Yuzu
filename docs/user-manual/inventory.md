@@ -10,10 +10,22 @@ cadences.
 ## What is collected
 
 - **Machine-wide installed software** (blob contract v2): name, version,
-  publisher, install date, plus the package-manager fields below. Collected by
-  the `installed_apps` plugin via its `list_inventory` action (Windows: `HKLM` +
-  the agent service account's own `HKCU`; Linux: `dpkg`/`rpm`/`pacman`/`apk`;
-  macOS: `system_profiler`). The operator-facing `list` action keeps its
+  publisher, install date, plus the package-manager fields below. The daily
+  sync calls four inventory actions in-process and merges their rows:
+  `installed_apps` `list_inventory` (Windows: `HKLM` + the agent service
+  account's own `HKCU`; Linux: `dpkg`/`rpm`/`pacman`/`apk`; macOS:
+  `system_profiler`), `pkg_inventory` `packages` and `managers` (Homebrew), and
+  `windows_optional_features` `list`. An action whose plugin is not loaded, or
+  that answers "unsupported on this OS", is skipped (except `installed_apps`:
+  without it the source stays idle, because it anchors the report); an action
+  that fails (non-zero exit, truncated output, a constrained or unavailable
+  answer, a malformed status row, no feature rows from
+  `windows_optional_features`, or no applications at all from `installed_apps`)
+  skips that day's
+  report and keeps the last good state — nothing is deleted. Every row's `source` names the
+  producing action (`installed_apps.list_inventory`, `pkg_inventory.packages`,
+  `pkg_inventory.managers`, `windows_optional_features.list`); `package_id` is
+  empty for these producers. The operator-facing `list` action keeps its
   original four columns (`name`, `version`, `publisher`, `install_date`) in
   the same order and appends two trailing columns, `install_location` and
   `bundle_id` (ADR-0028). A response's raw `output` holds many rows joined by
@@ -47,28 +59,42 @@ cadences.
   empty string, **never synthesised** (no `-` placeholders, no guessed `0`
   epoch). Per-ecosystem availability:
 
-  | Field | rpm | deb | apk | pacman | Windows | macOS apps | macOS pkgutil |
-  |---|---|---|---|---|---|---|---|
-  | `kind` | `package` | `package` | `package` | `package` | `app` | `app` | `pkg` |
-  | `ecosystem` | `rpm` | `deb` | `apk` | `pacman` | `windows` | `macos` | `macos_pkgutil` |
-  | `name` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ (receipt id) |
-  | `version` (upstream, release stripped) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-  | `epoch` | ✓ (empty if none) | ✓ (empty if none) | — | ✓ (empty if none) | — | — | — |
-  | `release` | ✓ | ✓ (empty for native pkgs) | ✓ (pkgrel) | ✓ | — | — | — |
-  | `arch` | ✓ | ✓ | — | — | — | — | — |
-  | `publisher` | PACKAGER | Maintainer | — | — | Publisher | signing leaf CN | — |
-  | `install_date` | ✓ | — | — | — | ✓ | Last Modified | epoch seconds |
-  | `signature_status` | `signed`/`unsigned` (stored header tags) | — | — | — | — | `signed`/`unsigned`; empty = not read | — |
-  | `distro_id` / `distro_version` | ✓ | ✓ | ✓ | ✓ | — | — | — |
+  | Field | rpm | deb | apk | pacman | Windows | macOS apps | macOS pkgutil | Homebrew formula | Homebrew cask | Windows feature |
+  |---|---|---|---|---|---|---|---|---|---|---|
+  | `kind` | `package` | `package` | `package` | `package` | `app` | `app` | `pkg` | `pkg` | `app` | `feat` |
+  | `ecosystem` | `rpm` | `deb` | `apk` | `pacman` | `windows` | `macos` | `macos_pkgutil` | `brew` | `brew` | `optional_feature` |
+  | `name` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ (receipt id) | ✓ | ✓ | ✓ |
+  | `version` (upstream, release stripped) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | DISM state |
+  | `epoch` | ✓ (empty if none) | ✓ (empty if none) | — | ✓ (empty if none) | — | — | — | — | — | — |
+  | `release` | ✓ | ✓ (empty for native pkgs) | ✓ (pkgrel) | ✓ | — | — | — | — | — | — |
+  | `arch` | ✓ | ✓ | — | — | — | — | — | — | — | — |
+  | `publisher` | PACKAGER | Maintainer | — | — | Publisher | signing leaf CN | — | — | — | — |
+  | `install_date` | ✓ | — | — | — | ✓ | Last Modified | epoch seconds | — | — | — |
+  | `signature_status` | `signed`/`unsigned` (stored header tags) | — | — | — | — | `signed`/`unsigned`; empty = not read | — | — | — | — |
+  | `distro_id` / `distro_version` | ✓ | ✓ | ✓ | ✓ | — | — | — | — | — | — |
 
   Notes: rpm `signature_status` reflects the **stored** signature header tags in
   the rpmdb (is a signature recorded), never a live `rpm -K` cryptographic
   verification. `distro_id`/`distro_version` are host-level (`/etc/os-release`
   `ID`/`VERSION_ID`), stamped on every Linux row. deb rows include **held**
-  packages (they are installed). `homebrew` is a reserved `ecosystem` value —
-  not collected yet (per-user Homebrew stores are out of scope; the sync is machine-scope). The
-  `pkg_inventory` plugin reads the machine-scope Homebrew prefix on demand
-  (an instruction result, not a daily-sync source).
+  packages (they are installed). Machine-scope Homebrew
+  is collected through `pkg_inventory` with `ecosystem` `brew`: each formula is
+  `kind` `pkg`, each cask `kind` `app` (`source` `pkg_inventory.packages`), plus
+  one `kind` `app` row named `homebrew` with `source` `pkg_inventory.managers`
+  that records Homebrew itself is present — one row however many prefixes
+  exist (`/opt/homebrew` and `/usr/local` on one Mac collapse to one). Per-user
+  Homebrew stores are out of scope; the sync is machine-scope. Only Homebrew is
+  mapped today; other package managers `pkg_inventory` may report are not
+  collected here.
+
+  **Windows optional features** are collected with `ecosystem`
+  `optional_feature` and `kind` `feat`, every feature the host knows, enabled or
+  not. For these rows `version` carries the DISM feature state verbatim
+  (`enabled`, `disabled`, `pending_enable`, `pending_disable`, `superseded`,
+  `partially_installed`, `unknown`) because a feature has no version of its own;
+  `publisher` is empty. A host with a disabled feature therefore still lists
+  it, so the `/software` catalogue count (grouped by name) counts a host with a
+  DISABLED feature as having it — read `version` to tell them apart.
 
   **macOS `app` rows** carry `publisher` and `signature_status` read natively
   through CoreFoundation + Security.framework (`CFBundleCreate`,
@@ -182,8 +208,8 @@ The data lands in the Postgres schema **`software_inventory_store`**:
   — one row per installed package per device. Every column except `agent_id`,
   `name` and `install_id` may be empty (`''`) per the honest-empty contract above; rows
   synced by a pre-v2 agent carry `''` in all eight v2 columns until that
-  agent's next full resend. Rows from agents that do not yet emit the extended
-  tail carry `''` in `package_id` and `source`; `install_id` (a row id, reassigned
+  agent's next full resend. Rows from agents older than this release
+  carry `''` in `package_id` and `source`; `install_id` (a row id, reassigned
   on each full report) is always populated.
 - `inventory_state(agent_id, source, content_hash, first_seen, last_seen)` — per
   device sync bookkeeping. `first_seen`/`last_seen` are **server receipt times**
@@ -244,7 +270,13 @@ SELECT version FROM public.schema_meta WHERE store = 'software_inventory_store';
 
 Deploy the server before any agent that emits the new fields.
 
-Today it is queried with **direct SQL**, e.g.:
+**Agent upgrade.** An agent that collects the extra actions (`source`,
+Homebrew, optional features) changes its content hash, so its first report after
+the upgrade is a full one. It arrives at the agent's existing phase-spread slot
+(within about 24 h), not all at once, and carries the new rows; hash-skip
+resumes afterwards.
+
+The inventory is queried today with **direct SQL**, e.g.:
 
 ```sql
 -- Which devices have Google Chrome, and what version?
@@ -510,6 +542,21 @@ agent was built with `-Dbuild_agent=true` (the default for released binaries)
 and that `installed_apps` is present in the agent's `--plugin-dir`. The sync also
 only runs once per ~24 h per agent (spread across the fleet), so a freshly
 enrolled agent populates within minutes (jittered first sync), not instantly.
+
+**One host stopped reporting after upgrading agents; its log shows
+`sync: <plugin>.<action> … — skipping this cycle`.** One of the collected
+actions failed, and a failure skips the WHOLE report for that day — the
+applications too — and keeps the last good inventory (nothing is deleted).
+Typical causes: Windows DISM busy or `api_unavailable` (the
+`windows_optional_features` action answers `feature|unavailable|…`), or a
+constrained Homebrew read on macOS. The warning names the action and the
+reason. A host that keeps skipping is flagged by `yuzu_inventory_stale_agents`
+after two missed daily cycles; fix the failing action, or remove its plugin,
+and the next daily sync recovers. A warning of the form `sync: <plugin>.<action>
+read more than 20000 rows` (or a merged-entry or 3 MiB blob cap) is not an
+action failure: that host reports more software rows than one report can carry,
+so its report is skipped rather than sent truncated; review the host's
+inventory rather than removing a plugin.
 
 **Non-ASCII app names show as `?` after upgrading from a pre-#1662 build.** The
 initial `installed_apps` plugin read the Windows registry with the ANSI `Reg*A`
