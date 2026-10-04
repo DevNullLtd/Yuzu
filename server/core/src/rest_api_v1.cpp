@@ -18416,21 +18416,27 @@ void RestApiV1::register_routes(
 
         // Replay window. `since` query param overrides
         // `Last-Event-ID` header — explicit operator intent beats
-        // browser auto-reconnect inference. Bad input → 0 (no
-        // replay) rather than 400; matches the dashboard sibling.
+        // browser auto-reconnect inference. The cursor is ONE non-negative base-10
+        // integer: `stoull` accepted "-1" (wrapping to a cursor past every event) and
+        // "5abc" (as 5), so a typo replayed the wrong window without telling anyone.
+        // A malformed `since` QUERY parameter is the caller's explicit input and is a
+        // 400 (answered before the stream budget is touched). A malformed
+        // `Last-Event-ID` HEADER is browser-supplied inference, so it keeps the neutral
+        // "no replay" outcome rather than failing a reconnect.
         std::uint64_t since_id = 0;
         if (req.has_param("since")) {
-            try {
-                since_id = std::stoull(req.get_param_value("since"));
-            } catch (...) {
-                since_id = 0;
+            const auto v = yuzu::server::parse_query_int<long long>(req.get_param_value("since"));
+            if (!v || *v < 0) {
+                res.status = 400;
+                res.set_content(detail::a4_error(res, "invalid numeric query parameter: since"),
+                                "application/json");
+                return;
             }
+            since_id = static_cast<std::uint64_t>(*v);
         } else if (req.has_header("Last-Event-ID")) {
-            try {
-                since_id = std::stoull(req.get_header_value("Last-Event-ID"));
-            } catch (...) {
-                since_id = 0;
-            }
+            const auto v =
+                yuzu::server::parse_query_int<long long>(req.get_header_value("Last-Event-ID"));
+            since_id = (v && *v >= 0) ? static_cast<std::uint64_t>(*v) : 0;
         }
 
         // Admission control (ADR-0034). This response is about to hold an httplib worker for

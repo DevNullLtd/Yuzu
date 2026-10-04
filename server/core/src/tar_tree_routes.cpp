@@ -3,6 +3,7 @@
 /// See tar_tree_routes.hpp for the auth/caching contract.
 
 #include "tar_tree_routes.hpp"
+#include "query_int_parse.hpp" // parse_query_int / strict_stoi / strict_stoll (#4644 Gate 7)
 
 #include "http_route_sink.hpp"
 #include "rest_a4_envelope_http.hpp" // detail::a4_denial, detail::a4_error, make_correlation_id
@@ -1105,7 +1106,11 @@ void TarTreeRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn 
         const std::string token = get_param(req, "token");
         std::size_t node_id = 0;
         try {
-            node_id = static_cast<std::size_t>(std::stoul(get_param(req, "node")));
+            // stoul would accept "-1" (wraps to SIZE_MAX) and "5abc" (-> 5): parse strictly.
+            const auto parsed_node = yuzu::server::parse_query_int<long long>(get_param(req, "node"));
+            if (!parsed_node || *parsed_node < 0)
+                throw std::invalid_argument("node");
+            node_id = static_cast<std::size_t>(*parsed_node);
         } catch (...) {
             res.status = 400;
             res.set_content("bad request", "text/plain");

@@ -389,3 +389,48 @@ TEST_CASE("settings enrollment: bulk approve/deny with the store down are 503 + 
     CHECK(h.sink.Post("/api/settings/pending-agents/bulk-deny", "", kForm)->status == 503);
     CHECK(h.only("enrollment.bulk_deny").result == "failure");
 }
+
+// #4644 Gate 7: `stoi("0x5")` is 0 and max_uses 0 means UNLIMITED, so a mistyped limit used to
+// mint an unlimited token. Only an EMPTY field or a literal 0 may mean "unlimited"/"no expiry";
+// anything else must be ONE base-10 integer, otherwise 400, audited denied, nothing minted.
+TEST_CASE("settings enrollment: a malformed max_uses or ttl_hours mints nothing",
+          "[pg][settings_routes][enrollment][numeric_params]") {
+    for (const char* body : {"label=x&max_uses=0x5", "label=x&max_uses=5abc",
+                             "label=x&max_uses=1e1", "label=x&max_uses=%2B3",
+                             "label=x&max_uses=1&ttl_hours=24h", "label=x&ttl_hours=0x18"}) {
+        EnrollRoutesHarness h;
+        INFO(body);
+        auto res = h.sink.Post("/api/settings/enrollment-tokens", body, kForm);
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        CHECK(h.only("enrollment.token_create").result == "denied");
+        CHECK(h.auth_mgr.list_enrollment_tokens().value().empty());
+        CHECK(raw_token_in(res->body).empty());
+    }
+}
+
+TEST_CASE("settings enrollment: an empty or literal-zero limit still means unlimited",
+          "[pg][settings_routes][enrollment][numeric_params]") {
+    for (const char* body : {"label=x&max_uses=0&ttl_hours=0", "label=x&max_uses=&ttl_hours=",
+                             "label=x"}) {
+        EnrollRoutesHarness h;
+        INFO(body);
+        auto res = h.sink.Post("/api/settings/enrollment-tokens", body, kForm);
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        CHECK(h.auth_mgr.list_enrollment_tokens().value().size() == 1);
+    }
+}
+
+TEST_CASE("settings enrollment: the batch route refuses a malformed count or limit too",
+          "[pg][settings_routes][enrollment][numeric_params]") {
+    for (const char* body : {R"({"count":"3x"})", R"({"count":"2","max_uses":"0x1"})",
+                             R"({"count":"2","ttl_hours":"1e1"})"}) {
+        EnrollRoutesHarness h;
+        INFO(body);
+        auto res = h.sink.Post("/api/settings/enrollment-tokens/batch", body);
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        CHECK(h.auth_mgr.list_enrollment_tokens().value().empty());
+    }
+}

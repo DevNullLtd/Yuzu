@@ -264,12 +264,22 @@ Routes that parse strictly (the response routes are listed in
 | Patches | `GET /api/patches`, `GET /api/patches/deployments`: `limit` (a malformed value used to be ignored) |
 | Inventory | `GET /api/v1/inventory/software`: `limit` (trailing characters were read as their numeric prefix) |
 | Fleet visualization | `GET /api/v1/viz/fleet/topology`: `machines_max` |
-| Verification | the app-performance compare route: `window` (a malformed value used to fall back to 7 days) |
+| Verification | the app-performance compare route: `window` (a malformed value used to fall back to 7 days). This dashboard fragment keeps its own rejection style: an honest `200` note ("The window must be a whole number of days."), because the dashboard's htmx config drops `4xx` bodies; nothing is computed or audited |
+| Dashboard fragments | `GET /fragments/results`: `page`, `per_page`; the software inventory fragments (`/fragments/inventory/software`, `/software/devices`): `limit`; the DEX perf devices fragment and the network quality devices fragment: `limit`; the hardware list fragment and `GET /api/v1/hardware`: `offset`, `limit`; the hardware sync poll: `await_since` (a malformed freshness bound used to read as "no bound", so a stale snapshot could be served as fresh); `GET /fragments/tar/process-tree/detail`: `node` (`stoul` read `-1` as the largest node id and `5x` as `5`) |
+| Delivery and list routes | `GET /api/notifications`: `limit`, `offset`; `GET /api/webhooks/{id}/deliveries` and `GET /api/v1/offload-targets/{id}/deliveries`: `limit`; `GET /api/v1/ca/issued`: `limit`, `offset`; `GET /api/v1/preflight/runs`: `limit` |
+| Event streams | `GET /api/v1/events`: `since` (a non-negative integer; a malformed value is `400`, answered before the stream budget is touched). A malformed `Last-Event-ID` **header** on `GET /api/v1/events` or the workflow execution stream keeps its neutral outcome, no replay, because it is browser-supplied inference and a `400` would fail a reconnect; the cursor is parsed strictly, so `-1` and `5abc` no longer replay from a wrong position |
+| Settings forms | `POST /api/settings/dex-alerts/blast` (`min_devices`, `window_seconds`, `cooldown_seconds`): a malformed value is `400` and nothing is saved (it used to persist the clamped minimum); `POST /api/settings/enrollment-tokens` and `/batch` (`max_uses`, `ttl_hours`, `count`): `0x5` used to read as `0`, and `max_uses` `0` means unlimited, so a mistyped limit minted an unlimited token (only an **empty** field or a literal `0` means unlimited or no expiry now); the API-token create form `ttl_hours` (the same `0x5` read as a token that never expires); the OTA package `rollout_pct` on upload and on the rollout route: a malformed value used to become `100`, a full-fleet rollout |
 
-Not covered by this change, and still lenient (the list is not exhaustive): the dashboard
-fragments' own page-size helpers, the notification, webhook and offload delivery list routes, the
-DEX signal list `limit`, the pre-flight run list `limit`, and the live-snapshot `n` attempt
-counter.
+A parameter that is **present but empty** (`?limit=`) is malformed on these routes, not absent.
+
+Not covered by this change, and still lenient (the list is not exhaustive): the live-snapshot
+`n` attempt counters (`deployment_routes.cpp`, `device_routes.cpp`, `hardware_routes.cpp`,
+`dex_routes.cpp`, `preflight_routes.cpp`, `tar_tree_routes.cpp`), which are polling counters
+clamped to a small range; numeric path segments matched by a `(\d+)` route pattern (a 21-digit
+id throws `std::out_of_range` and the request fails with `500` rather than `404`:
+`/api/notifications/{id}/read`, `/dismiss`, the webhook routes and the auto-approve rule index);
+and values that are parsed from stored rows, agent output or server configuration rather than
+from a request.
 
 ---
 

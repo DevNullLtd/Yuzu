@@ -355,3 +355,27 @@ TEST_CASE("POST /api/notifications/:id/dismiss: happy path dismisses and audits 
     REQUIRE(all.size() == 1);
     CHECK(all[0].dismissed == true); // confirms the mutation actually landed
 }
+
+// #4644 Gate 7: a present-but-malformed `limit`/`offset` used to be swallowed by
+// `catch (...) {}` and the default page served as if it were the one asked for.
+TEST_CASE("GET /api/notifications: a malformed limit or offset is a 400, valid values unchanged",
+          "[notification_routes][pg][numeric_params]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, notif_routes_tpl);
+    PgWired w{db.dsn()};
+    NotificationHarness h;
+    h.store = &w.store;
+    h.wire();
+    REQUIRE(w.store.create("info", "t", "m") > 0);
+
+    for (const char* q : {"limit=10abc", "limit=0x10", "limit=1e1", "limit=", "offset=5x",
+                          "offset=-", "limit=99999999999999999999"}) {
+        INFO(q);
+        auto res = h.sink.Get(std::string("/api/notifications?") + q);
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        CHECK(res->body.find("invalid numeric query parameter") != std::string::npos);
+    }
+    auto ok = h.sink.Get("/api/notifications?limit=10&offset=0");
+    REQUIRE(ok);
+    CHECK(ok->status == 200);
+}

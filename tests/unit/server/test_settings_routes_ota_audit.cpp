@@ -437,3 +437,22 @@ TEST_CASE("a rollout write does not clobber a concurrent change to another colum
     REQUIRE(h.audited.size() == 1);
     CHECK(h.audited.front().detail.find("mandatory=true") != std::string::npos);
 }
+
+// #4644 Gate 7: a malformed rollout percentage must NOT fall back to 100 (a full-fleet rollout
+// nobody asked for): 400, nothing stored, no audit row claiming a change happened.
+TEST_CASE("OTA rollout with a malformed percentage is a 400 and changes nothing",
+          "[ota][audit][settings_routes][pg][numeric_params]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, ota_audit_tpl);
+    OtaAuditHarness h{db.dsn()};
+    h.seed(/*rollout_pct=*/25, /*mandatory=*/false);
+    for (const char* bad : {"50abc", "0x32", "1e1", "99999999999999999999"}) {
+        INFO("rollout_pct=" << bad);
+        auto res = h.post_rollout("1.2.3", bad);
+        REQUIRE(res);
+        CHECK(res->status == 400);
+    }
+    CHECK(h.audited.empty());
+    auto pkgs = h.registry->list_packages();
+    REQUIRE(pkgs.size() == 1);
+    CHECK(pkgs.front().rollout_pct == 25); // untouched, NOT 100
+}

@@ -14,6 +14,7 @@
 /// (created_by) so one operator can't open another's run.
 
 #include "preflight_routes.hpp"
+#include "query_int_parse.hpp" // parse_query_int / strict_stoi / strict_stoll (#4644 Gate 7)
 
 #include "preflight_eval.hpp"       // collect/applicable/dispatch_params/check_*/config_*/checks_from_json
 #include "preflight_parse.hpp"      // kPreflightChecks, compute_device_results, bucket_from_token
@@ -586,7 +587,7 @@ void PreflightRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermF
         int64_t limit = 12;
         if (req.has_param("limit")) {
             try {
-                limit = std::clamp<int64_t>(std::stoll(req.get_param_value("limit")), 1, 100);
+                limit = std::clamp<int64_t>(yuzu::server::strict_stoll(req.get_param_value("limit")), 1, 100);
             } catch (...) {
                 res.status = 400;
                 res.set_content(detail::a4_error(res, "invalid limit"), "application/json");

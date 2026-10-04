@@ -495,12 +495,24 @@ TEST_CASE("ca_routes: /ca/issued pagination params are accepted + clamped", "[ca
     REQUIRE(h.store->set_root(sample_root()));
     REQUIRE(h.store->record_issued(sample_issued("AA01")));
     h.wire();
-    // limit=0 (→clamped to 1) and an absurd limit (→clamped) both 200, no error.
+    // limit=0 (→clamped to 1) and an absurd limit (→clamped) both 200, no error: a
+    // well-formed integer out of range is CLAMPED, never rejected.
     for (const char* q : {"/api/v1/ca/issued?limit=0", "/api/v1/ca/issued?limit=999999",
-                          "/api/v1/ca/issued?offset=-5", "/api/v1/ca/issued?limit=abc"}) {
+                          "/api/v1/ca/issued?offset=-5"}) {
         auto r = h.sink.Get(q);
         REQUIRE(r);
         REQUIRE(r->status == 200);
+    }
+    // #4644 Gate 7: a MALFORMED integer is not "out of range", it is not a number. It used
+    // to fall back to the default page silently (`limit=abc` -> 200, 200 rows).
+    for (const char* q : {"/api/v1/ca/issued?limit=abc", "/api/v1/ca/issued?limit=50x",
+                          "/api/v1/ca/issued?limit=1e2", "/api/v1/ca/issued?offset=0x10",
+                          "/api/v1/ca/issued?limit=", "/api/v1/ca/issued?limit=99999999999999999999"}) {
+        INFO(q);
+        auto r = h.sink.Get(q);
+        REQUIRE(r);
+        REQUIRE(r->status == 400);
+        CHECK(r->body.find("invalid numeric query parameter") != std::string::npos);
     }
 }
 

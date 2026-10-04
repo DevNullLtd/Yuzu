@@ -7,6 +7,7 @@
 /// does. An unwired provider degrades to an honest banner.
 
 #include "inventory_routes.hpp"
+#include "query_int_parse.hpp" // parse_query_int / strict_stoi / strict_stoll (#4644 Gate 7)
 
 #include "http_route_sink.hpp"
 #include "rest_a4_envelope_http.hpp" // detail::a4_denial
@@ -28,15 +29,21 @@ namespace {
 
 // Clamp a `limit` query param into [1, hi] in 64-bit BEFORE narrowing, so a
 // negative/wrapped value can't defeat the cap (mirrors the REST route).
-int clamp_limit(const httplib::Request& req, int dflt, int hi) {
+// nullopt when `limit` is present but not ONE base-10 integer (the caller answers 400:
+// a malformed page size must not silently become the default, #4644 Gate 7).
+std::optional<int> clamp_limit(const httplib::Request& req, int dflt, int hi) {
     if (!req.has_param("limit"))
         return dflt;
-    try {
-        std::int64_t want = std::stoll(req.get_param_value("limit"));
-        return static_cast<int>(std::clamp<std::int64_t>(want, 1, hi));
-    } catch (...) {
-        return dflt;
-    }
+    const auto want = yuzu::server::parse_query_int<std::int64_t>(req.get_param_value("limit"));
+    if (!want)
+        return std::nullopt;
+    return static_cast<int>(std::clamp<std::int64_t>(*want, 1, hi));
+}
+
+void reject_bad_limit(httplib::Response& res) {
+    res.status = 400;
+    res.set_content(detail::a4_error(res, "invalid numeric query parameter: limit"),
+                    "application/json");
 }
 
 void send_html(httplib::Response& res, std::string body) {
@@ -116,8 +123,13 @@ void InventoryRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermF
                  if (!perm_fn_(req, res, "Inventory", "Read"))
                      return;
                  SoftwareCatalogQuery q;
-                 q.q = req.has_param("q") ? req.get_param_value("q") : "";
-                 q.limit = clamp_limit(req, 200, 2000);
+                q.q = req.has_param("q") ? req.get_param_value("q") : "";
+                 const auto limit_sw = clamp_limit(req, 200, 2000);
+                 if (!limit_sw) {
+                     reject_bad_limit(res);
+                     return;
+                 }
+                 q.limit = *limit_sw;
                  // results_only=1 (round-3 item 8, mirrors hardware_ui.cpp's fix for
                  // the same class of bug): the search box's own hx-get swaps ONLY
                  // #sw-results, so a re-render never destroys the input mid-keystroke.
@@ -170,7 +182,12 @@ void InventoryRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermF
                  const std::string name = req.has_param("name") ? req.get_param_value("name") : "";
                  SoftwareFleetQuery q;
                  q.name = name;
-                 q.limit = clamp_limit(req, 1000, 1000);
+                 const auto limit_fl = clamp_limit(req, 1000, 1000);
+                 if (!limit_fl) {
+                     reject_bad_limit(res);
+                     return;
+                 }
+                 q.limit = *limit_fl;
                  std::optional<std::vector<SoftwareFleetRow>> rows_opt;
                  if (fleet_fn_ && !name.empty())
                      rows_opt = fleet_fn_(q);

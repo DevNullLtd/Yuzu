@@ -1,4 +1,5 @@
 #include "notification_routes.hpp"
+#include "query_int_parse.hpp" // parse_query_int / strict_stoi / strict_stoll (#4644 Gate 7)
 
 #include "http_route_sink.hpp" // HttpRouteSink, HttplibRouteSink
 
@@ -36,11 +37,23 @@ void NotificationRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, Pe
                 int offset = 0;
                 auto limit_str = req.get_param_value("limit");
                 auto offset_str = req.get_param_value("offset");
-                if (!limit_str.empty()) {
-                    try { limit = std::stoi(limit_str); } catch (...) {}
-                }
-                if (!offset_str.empty()) {
-                    try { offset = std::stoi(offset_str); } catch (...) {}
+                // Present-but-malformed `limit`/`offset` is a 400, not a silent default: a
+                // page the caller did not ask for reads as the page they did (#4644 Gate 7).
+                // `has_param`, not `!raw.empty()`: `?limit=` is PRESENT and malformed, not absent.
+                struct Param { const char* name; const std::string& raw; int* out; };
+                for (const auto& [name, raw, out] : {Param{"limit", limit_str, &limit},
+                                                     Param{"offset", offset_str, &offset}}) {
+                    if (!req.has_param(name))
+                        continue;
+                    const auto v = yuzu::server::parse_query_int<int>(raw);
+                    if (!v) {
+                        res.status = 400;
+                        res.set_content(
+                            R"({"error":{"code":400,"message":"invalid numeric query parameter"},"meta":{"api_version":"v1"}})",
+                            "application/json");
+                        return;
+                    }
+                    *out = *v;
                 }
 
                 auto notifications =

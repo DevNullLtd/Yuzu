@@ -379,3 +379,24 @@ TEST_CASE("REST offload-targets: GET /:id/deliveries 404 on missing target",
     REQUIRE(res);
     CHECK(res->status == 404);
 }
+
+// #4644 Gate 7: the delivery-list `limit` is ONE base-10 integer or a 400. The documented
+// [1, 1000] clamp still applies to every well-formed integer.
+TEST_CASE("REST offload-targets: GET /:id/deliveries rejects a malformed limit",
+          "[rest][offload][pg][numeric_params]") {
+    OffloadHarness h;
+    auto post = h.sink.Post("/api/v1/offload-targets",
+                            R"({"name":"limit-bad","url":"https://x.example.com/h"})");
+    REQUIRE(post);
+    const auto id = nlohmann::json::parse(post->body)["id"].get<int64_t>();
+    const std::string base = "/api/v1/offload-targets/" + std::to_string(id) + "/deliveries";
+    for (const char* bad : {"50abc", "0x10", "1e2", "", "99999999999999999999"}) {
+        INFO("limit=" << bad);
+        auto res = h.sink.Get(base + "?limit=" + bad);
+        REQUIRE(res);
+        CHECK(res->status == 400);
+    }
+    auto ok = h.sink.Get(base + "?limit=0"); // well-formed, out of range: clamped to 1
+    REQUIRE(ok);
+    CHECK(ok->status == 200);
+}

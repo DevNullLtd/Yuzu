@@ -1,4 +1,5 @@
 #include "dashboard_routes.hpp"
+#include "query_int_parse.hpp" // parse_query_int / strict_stoi / strict_stoll (#4644 Gate 7)
 
 #include "dispatch_destructive_gate.hpp" // PR6.0b: the shared Destructive targeting gate (#3685)
 #include "on_behalf_guard.hpp"              // sanitize_for_log
@@ -79,11 +80,13 @@ static int64_t now_epoch() {
                std::chrono::system_clock::now().time_since_epoch()).count();
 }
 
-// -- Helper: safe int from query param ----------------------------------------
-static int param_int(const httplib::Request& req, const char* name, int def) {
+// -- Helper: strict int from query param --------------------------------------
+// Absent => `def`. Present-but-malformed (trailing garbage, empty, overflow) => nullopt,
+// and the caller answers 400: a page size that silently became the default is a
+// different, valid-looking query (#4644 Gate 7).
+static std::optional<int> param_int(const httplib::Request& req, const char* name, int def) {
     if (!req.has_param(name)) return def;
-    try { return std::stoi(req.get_param_value(name)); }
-    catch (...) { return def; }
+    return yuzu::server::parse_query_int<int>(req.get_param_value(name));
 }
 
 // -- Helper: column index by name (case-insensitive, excl. Agent col) ---------
@@ -288,8 +291,16 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                 if (sort_col.empty()) sort_col = "agent";
                 if (sort_dir.empty()) sort_dir = "asc";
 
-                int page = clamp(param_int(req, "page", 1), 1, 100000);
-                int per_page = clamp(param_int(req, "per_page", 50), 10, 200);
+                const auto page_opt = param_int(req, "page", 1);
+                const auto per_page_opt = param_int(req, "per_page", 50);
+                if (!page_opt || !per_page_opt) {
+                    res.status = 400;
+                    res.set_content(detail::a4_error(res, "invalid numeric query parameter"),
+                                    "application/json");
+                    return;
+                }
+                int page = clamp(*page_opt, 1, 100000);
+                int per_page = clamp(*per_page_opt, 10, 200);
 
                 auto filters = parse_filters(req, plugin);
                 bool filters_explicit = !filters.empty();

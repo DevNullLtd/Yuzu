@@ -1204,11 +1204,10 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                  // auto-reconnect). 0 = no header / first connect → no replay.
                  std::uint64_t since_id = 0;
                  if (req.has_header("Last-Event-ID")) {
-                     try {
-                         since_id = std::stoull(req.get_header_value("Last-Event-ID"));
-                     } catch (...) {
-                         since_id = 0;
-                     }
+                     // Strict cursor: stoull accepted "-1" (wrapping past every event) and
+                     // "5abc" (as 5). A malformed header keeps the neutral no-replay outcome.
+                     const auto v = parse_query_int<long long>(req.get_header_value("Last-Event-ID"));
+                     since_id = (v && *v >= 0) ? static_cast<std::uint64_t>(*v) : 0;
                  }
                  auto* bus = execution_event_bus;
                  // Install the listener and replay atomically, using one scope

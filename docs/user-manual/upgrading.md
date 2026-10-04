@@ -199,12 +199,28 @@ A negative `since` or `until` is refused as well (`400`, `-32602` on MCP) on the
 the whole log or statistics set. `0`, or omitting the parameter, still means no bound.
 `GET /api/v1/audit` takes no `since`/`until` and is unchanged.
 
-Still lenient, and not an exhaustive list: the dashboard fragments' own page-size helpers and the
-verify fragment's `parse_window`, the notification, webhook and offload delivery list routes, the
-DEX signal list `limit`, the pre-flight run list `limit`, the network quality `limit`
-(`network_routes.cpp`), the software-inventory `limit` read in `inventory_routes.cpp` and the
-hardware routes' `await_since`/`n`/chart parameters (`hardware_routes.cpp`), and the live-snapshot
-`n` attempt counters elsewhere.
+The same strictness now covers the dashboard fragments' `page`/`per_page`, the software
+inventory, DEX perf, network quality, hardware and CA-issued lists, the notification, webhook and
+offload delivery lists, the pre-flight run list `limit`, the hardware sync poll's `await_since`
+(a malformed freshness bound used to read as "no bound"), the TAR process-tree `node` and the
+event streams' `?since` cursor. A malformed `Last-Event-ID` header still means "no replay" rather
+than a `400`, but `-1` and `5abc` are no longer accepted as cursors. A parameter that is present
+but empty (`?limit=`) is malformed, not absent, on these routes. The verify fragment's `window`
+is refused with its usual `200` note instead of a `4xx` (the dashboard drops `4xx` bodies).
+
+Four admin forms stop silently saving a different value than the one typed. A malformed
+`min_devices`, `window_seconds` or `cooldown_seconds` on the DEX blast-radius thresholds is a `400`
+and saves nothing (it used to persist the clamped minimum). On the enrollment-token forms and the
+API-token `ttl_hours`, `0x5` used to read as `0`; `max_uses` `0` means unlimited and a TTL of `0`
+means no expiry, so a mistyped limit minted an unlimited or never-expiring credential. Only an
+empty field or a literal `0` means unlimited or no expiry now. A malformed `rollout_pct` on an OTA
+package upload or rollout change is a `400` instead of silently becoming `100`.
+
+Still lenient, and not an exhaustive list: the live-snapshot `n` attempt counters
+(`deployment_routes.cpp`, `device_routes.cpp`, `hardware_routes.cpp`, `dex_routes.cpp`,
+`preflight_routes.cpp`, `tar_tree_routes.cpp`), numeric path segments matched by a `(\d+)` route
+pattern (a 21-digit id fails with `500`), and values parsed from stored rows, agent output or
+server configuration rather than from a request.
 
 **What to do.** Send whole integers, and omit a parameter to get its default. No configuration or
 data migration is needed. During a rolling upgrade, replicas on the old and new build answer a

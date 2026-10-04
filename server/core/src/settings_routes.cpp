@@ -3,6 +3,7 @@
 /// Extracted from server.cpp — Phase 1 of the god-object decomposition.
 
 #include "settings_routes.hpp"
+#include "query_int_parse.hpp" // parse_query_int / strict_stoi / strict_stoll (#4644 Gate 7)
 
 #include "ota_signature_sidecar.hpp"
 #include "rest_a4_envelope_http.hpp" // detail::a4_error
@@ -3838,18 +3839,33 @@ void SettingsRoutes::register_routes(
         // Clamp server-side to the same ranges update_alert_shape enforces, so
         // the STORED values always match the LIVE values (no silent divergence
         // between what the UI shows and what the detector runs).
+        // A present-but-malformed field is a 400 with NOTHING saved: `stoi("0x10")` is 0 and
+        // `stoi("5abc")` is 5, so a typo used to persist a different (clamped) threshold
+        // than the one the operator typed (#4644 Gate 7). Empty/absent keeps the default.
+        bool malformed = false;
         auto clamp_int = [&](const char* field, int lo, int hi, int fallback) {
-            try {
-                const auto v = extract_form_value(req.body, field);
-                if (!v.empty())
-                    return std::clamp(std::stoi(v), lo, hi);
-            } catch (...) {}
-            return fallback;
+            const auto v = extract_form_value(req.body, field);
+            if (v.empty())
+                return fallback;
+            const auto parsed = yuzu::server::parse_query_int<int>(v);
+            if (!parsed) {
+                malformed = true;
+                return fallback;
+            }
+            return std::clamp(*parsed, lo, hi);
         };
         const BlastRadiusConfig d{};
         const int min_dev = clamp_int("min_devices", 2, 100000, d.min_devices);
         const int win_s = clamp_int("window_seconds", 60, 86400, d.window_seconds);
         const int cool_s = clamp_int("cooldown_seconds", 0, 7 * 86400, d.cooldown_seconds);
+        if (malformed) {
+            res.status = 400;
+            res.set_header("HX-Trigger",
+                           R"({"showToast":{"message":"Thresholds must be whole numbers","level":"error"}})");
+            res.set_content(detail::a4_error(res, "invalid numeric parameter"),
+                            "application/json");
+            return;
+        }
         auto session = auth_fn_(req, res);
         const std::string by = session ? session->username : "unknown";
         bool ok = true;
@@ -5391,10 +5407,13 @@ void SettingsRoutes::register_routes(
         int max_uses = 0;
         int ttl_hours = 0;
         try {
+            // Strict: `stoi("0x5")` is 0 and max_uses 0 means UNLIMITED, so a mistyped limit
+            // used to mint an unlimited token. Only an EMPTY field or a literal 0 means
+            // "unlimited" / "no expiry"; anything else must be one base-10 integer.
             if (!max_uses_s.empty())
-                max_uses = std::stoi(max_uses_s);
+                max_uses = yuzu::server::strict_stoi(max_uses_s);
             if (!ttl_s.empty())
-                ttl_hours = std::stoi(ttl_s);
+                ttl_hours = yuzu::server::strict_stoi(ttl_s);
         } catch (const std::exception&) {
             audit_fn_(req, "enrollment.token_create", "denied", "EnrollmentToken", "",
                       "invalid_numeric_parameter");
@@ -5483,12 +5502,13 @@ void SettingsRoutes::register_routes(
         int max_uses = 1;
         int ttl_hours = 0;
         try {
+            // Strict (see the single-token route): a malformed limit must never read as 0.
             if (!count_s.empty())
-                count = std::stoi(count_s);
+                count = yuzu::server::strict_stoi(count_s);
             if (!max_uses_s.empty())
-                max_uses = std::stoi(max_uses_s);
+                max_uses = yuzu::server::strict_stoi(max_uses_s);
             if (!ttl_s.empty())
-                ttl_hours = std::stoi(ttl_s);
+                ttl_hours = yuzu::server::strict_stoi(ttl_s);
         } catch (const std::exception&) {
             audit_fn_(req, "enrollment.bulk_token_create", "denied", "EnrollmentToken", "",
                       "invalid_numeric_parameter");
@@ -5597,7 +5617,8 @@ void SettingsRoutes::register_routes(
         int64_t expires_at = 0;
         if (!ttl_s.empty()) {
             try {
-                int ttl_hours = std::stoi(ttl_s);
+                // Strict: a mistyped TTL ("0x5" -> 0) used to mint a token that never expires.
+                int ttl_hours = yuzu::server::strict_stoi(ttl_s);
                 if (ttl_hours > 0) {
                     auto now = std::chrono::duration_cast<std::chrono::seconds>(
                                    std::chrono::system_clock::now().time_since_epoch())
@@ -6221,10 +6242,18 @@ void SettingsRoutes::register_routes(
         }
 
         int rollout_pct = 100;
-        try {
-            if (!rollout_s.empty())
-                rollout_pct = std::stoi(rollout_s);
-        } catch (...) {}
+        if (!rollout_s.empty()) {
+            // A malformed percentage must NOT fall back to 100 (a full-fleet rollout the
+            // operator did not ask for): 400, nothing stored.
+            const auto parsed = yuzu::server::parse_query_int<int>(rollout_s);
+            if (!parsed) {
+                res.status = 400;
+                res.set_content(detail::a4_error(res, "invalid numeric parameter: rollout_pct"),
+                                "application/json");
+                return;
+            }
+            rollout_pct = *parsed;
+        }
         if (rollout_pct < 0)
             rollout_pct = 0;
         if (rollout_pct > 100)
@@ -6516,10 +6545,18 @@ void SettingsRoutes::register_routes(
                   auto pct_s = extract_form_value(req.body, "rollout_pct");
 
                   int pct = 100;
-                  try {
-                      if (!pct_s.empty())
-                          pct = std::stoi(pct_s);
-                  } catch (...) {}
+                  if (!pct_s.empty()) {
+                      // Malformed => 400, never the 100% default (see the upload route).
+                      const auto parsed = yuzu::server::parse_query_int<int>(pct_s);
+                      if (!parsed) {
+                          res.status = 400;
+                          res.set_content(
+                              detail::a4_error(res, "invalid numeric parameter: rollout_pct"),
+                              "application/json");
+                          return;
+                      }
+                      pct = *parsed;
+                  }
                   if (pct < 0)
                       pct = 0;
                   if (pct > 100)

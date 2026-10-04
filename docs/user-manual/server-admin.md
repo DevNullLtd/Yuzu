@@ -3415,6 +3415,7 @@ For automated or bulk deployment. Agents present a token at startup for instant 
 3. Configure token properties:
    - **Expiry** -- time limit (e.g., 24 hours, 7 days).
    - **Max uses** -- how many agents can use this token (1 for single-device, unlimited for bulk).
+     Leave the field empty or enter `0` for unlimited. Any other value must be one whole number: a typo such as `0x5` or `5abc` is refused with `400` and no token is minted (it used to be read as `0`, which means unlimited). The same rule applies to the token lifetime (`ttl_hours`, empty or `0` for no expiry).
 4. Copy the generated token string.
 
 **Agent side:**

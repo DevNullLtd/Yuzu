@@ -948,3 +948,17 @@ TEST_CASE("tar_retention_paused_json: sorts value-error first, then oldest-pause
     CHECK(rows[1]["agent_id"] == "dev-old"); // then oldest paused_at first
     CHECK(rows[2]["agent_id"] == "dev-new");
 }
+
+// #4644 Gate 7: `node` is ONE non-negative base-10 integer. `stoul` accepted "-1" (wrapping to
+// SIZE_MAX) and "5x" (as 5), so a malformed node id silently selected a different process node.
+TEST_CASE("process-tree detail: a malformed node id is a 400",
+          "[tar][tree][numeric_params]") {
+    TarHarness h;
+    const std::string token(32, 'a');
+    for (const char* bad : {"-1", "5x", "0x10", "1e1", "", "99999999999999999999"}) {
+        INFO("node=" << bad);
+        auto res = h.sink.Get("/fragments/tar/process-tree/detail?token=" + token + "&node=" + bad);
+        REQUIRE(res);
+        CHECK(res->status == 400);
+    }
+}

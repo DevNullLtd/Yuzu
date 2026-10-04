@@ -1669,3 +1669,37 @@ TEST_CASE("GET /api/v1/approvals/pending/count: a genuine store failure answers 
     REQUIRE(res->body.find(R"("message":"approval store unavailable")") != std::string::npos);
     REQUIRE(res->body.find(R"("retry_after_ms":null)") != std::string::npos);
 }
+
+// ── #4644 Gate 7: the replay cursor is ONE non-negative base-10 integer ─────────
+// `stoull` accepted "-1" (wrapping to a cursor past every event) and "5abc" (as 5), so a typo
+// silently replayed the wrong window. A malformed `?since` is the caller's explicit input: 400,
+// answered BEFORE the stream budget and the bus subscription are touched. A malformed
+// `Last-Event-ID` header is browser-supplied inference: the neutral "no replay", never a 400
+// that would fail a reconnect.
+TEST_CASE("GET /api/v1/events: a malformed ?since is a 400 and never subscribes",
+          "[pg][events][replay][numeric_params]") {
+    RestEventsHarness h;
+    auto exec_id = h.make_exec("running");
+    h.event_bus->publish(exec_id, "agent-transition", R"({"agent_id":"a1"})", false);
+    for (const char* bad : {"5abc", "-1", "0x10", "1e1", "", "+3", "99999999999999999999"}) {
+        INFO("since=" << bad);
+        auto res = h.sink.Get("/api/v1/events?execution_id=" + exec_id + "&since=" + bad);
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        CHECK(h.event_bus->subscriber_count(exec_id) == 0);
+    }
+}
+
+TEST_CASE("GET /api/v1/events: a malformed Last-Event-ID header means no replay, not a 400",
+          "[pg][events][replay][numeric_params]") {
+    for (const char* bad : {"5abc", "-1", "0x10", "", "99999999999999999999"}) {
+        RestEventsHarness h;
+        auto exec_id = h.make_exec("running");
+        h.event_bus->publish(exec_id, "agent-transition", R"({"agent_id":"a1"})", false);
+        INFO("Last-Event-ID=" << bad);
+        auto res = h.sink.Get("/api/v1/events?execution_id=" + exec_id, {{"Last-Event-ID", bad}});
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        CHECK(h.event_bus->subscriber_count(exec_id) == 1);
+    }
+}

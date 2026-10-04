@@ -1,4 +1,5 @@
 #include "offload_routes.hpp"
+#include "query_int_parse.hpp" // parse_query_int / strict_stoi / strict_stoll (#4644 Gate 7)
 
 #include "offload_target_model.hpp" // adversarial-review fix (#2146 Batch B5): shared REST+MCP JSON builders (Rule 1)
 #include "rest_a4_envelope_http.hpp" // detail::a4_error
@@ -277,8 +278,16 @@ void mount(HttpRouteSink& sink, OffloadRoutes::PermFn perm_fn, OffloadRoutes::Au
                  // ceiling.
                  int limit = 50;
                  auto limit_str = req.get_param_value("limit");
-                 if (!limit_str.empty()) {
-                     try { limit = std::stoi(limit_str); } catch (...) {}
+                 if (req.has_param("limit")) {
+                     const auto v = yuzu::server::parse_query_int<int>(limit_str);
+                     if (!v) {
+                         res.status = 400;
+                         res.set_content(
+                             detail::a4_error(res, "invalid numeric query parameter: limit"),
+                             "application/json");
+                         return;
+                     }
+                     limit = *v;
                  }
                  limit = std::clamp(limit, 1, 1000);
                  auto deliveries = offload_store->get_deliveries(*id_opt, limit);
