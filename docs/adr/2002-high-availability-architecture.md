@@ -1332,8 +1332,9 @@ one core replica a server-only restart now recovers through the replay described
   answer of superseded or `accepted=false` counts as a success). The breaker policy is unchanged; verdict
   replays are a new source of failures that count. With the default threshold of 5 and 20 ms spacing, a
   failing server can open the breaker within about 100 ms plus the RPC time of five calls. An open breaker
-  gates `ProxyRegister` and `ProxyInventory`, drops stream-status notifications and sets `/readyz`
-  `circuit_breaker` to false.
+  gates `ProxyRegister` and `ProxyInventory`, drops stream-status notifications and makes the whole
+  `/readyz` answer 503 (its `circuit_breaker` check is false), which can take the node out of rotation for a
+  load balancer that probes `/readyz` (INFERRED from `yuzu_gw_health.erl`).
 - **Replaying a session the server already knows is not free (INFERRED from the code).** The server's
   ADOPT calls `register_agent` for every replayed session, so a session it already holds is re-installed as
   a fresh `AgentSession`: the agent loses its dispatch placement until its re-sent CONNECTED lands (the
@@ -1341,8 +1342,10 @@ one core replica a server-only restart now recovers through the replay described
   revoked when a prior session exists and a device-token store is wired. No device-token store is wired in
   the production server today (`set_device_token_store` has no production caller), so that revoke is
   dormant until one is. Two cases replay a known session: (i) a verdict computed before a replay landed
-  arrives after it (the flush RPC deadline is 5 s, the vendored grpcbox client default, so keep
-  `registration_replay_session_guard_ms` at or above 5000; the default is 10000); (ii) a double replay: a
+  arrives after it (the guard stamp is taken when the replay is sent, and a stale verdict can arrive up to the 5 s flush
+  deadline, the vendored grpcbox client default, plus the replay RPC time later, so do not set
+  `registration_replay_session_guard_ms` below 5000 plus the expected replay RPC time; the default 10000 is
+  safe, INFERRED); (ii) a double replay: a
   verdict replay runs first (no prior session, nothing revoked) and a later full breaker-recovery replay
   re-proxies the same sessions (a prior session now exists; the breaker-seeded snapshot is not filtered by
   the guard). Neither was observed on the rig. An idempotent ADOPT is tracked in #5244.
@@ -1385,7 +1388,8 @@ one core replica a server-only restart now recovers through the replay described
   is computed from the server's in-memory session map, which still holds the session (INFERRED from
   `gateway_service_impl.cpp`), so no verdict and no replay follow. Commands kept working in the observed
   run, and with one replica dispatch uses the in-memory map (INFERRED), so this is a gap for HA and
-  multi-replica routing, not for one replica. It is related to #4627 and is not a regression. Signal: a repeating `renew_leases` shortfall
+  multi-replica routing, not for one replica. This is not fixed here; the observed run had no breaker-recovery replay, and the narrowing of the repair a
+  breaker-recovery full replay could give such a row is the next entry. It is related to #4627. Signal: a repeating `renew_leases` shortfall
   warning on the server with no `Registration replay` line on the gateway after the partition heals. The
   recovery action for that row is NOT tested (restarting the gateway or the agent was not tried).
 - **Known limit (INFERRED from the code, not observed).** While a verdict-seeded (targeted) drip is queued, a
@@ -1396,9 +1400,23 @@ one core replica a server-only restart now recovers through the replay described
   by a verdict, and before this change a breaker-recovery full replay could have repaired it; now that row
   waits for the agent's own reconnect. Tracked as a follow-up (no issue yet), together with the entry above.
 - **Upgrade day.** The server is upgraded first, so the server restart that ships this fix meets the old
-  gateway and agents behind it read offline; restart the gateway after upgrading it (a gateway restart
-  reconnects every agent that node holds). Whether restarting only the gateway recovers agents stranded by
-  an earlier server restart was NOT tested.
+  gateway and agents behind it can read offline (observed on one rig after a SIGKILL restart; a graceful
+  upgrade restart was not tested); restart the gateway after upgrading it. A gateway restart disconnects
+  every agent that node holds, and in a graceful gateway restart test released v0.13.0 and v0.14.0-rc6 agents
+  with default settings stayed wedged and v0.12.0 never re-registered (bug #2182, fixed by #5183, in no
+  release tag yet), while a build with the fix re-registered in 11 to 12 s. Upgrade agents to a build that
+  includes #5183 before the gateway restart where available, or expect to restart the agent service on the
+  released agents behind it. Whether restarting only the gateway recovers agents stranded by an earlier
+  server restart was NOT tested; INFERRED from the code that a reconnecting agent is accepted by the
+  running server, which holds only for an agent build that re-registers by itself.
+- **Known limit (crash report, disclosed not closed).** The upstream client holds each queued agent's stored
+  registration request, and its `format_status` now redacts the queue, the recent-replay stamps, the last
+  message, the argument lists in the exit reason and stacktrace, and the debug log in a crash report; before
+  this change the whole state was printed. It cannot redact the process mailbox or the `messages:` and
+  exception lines of the `proc_lib` report, so an unhandled crash while a registration is queued or in flight
+  can still print the token, certificate or CSR of those in-flight requests (stand-in probe, OTP 28.4.2, not a
+  rig run). Operator guidance and the shipped logger settings are in `docs/user-manual/gateway.md`, Known
+  limits.
 - **What it does not promise.** Fleet completion inside a route lease (the drip period is the
   ProxyRegister RPC time plus the spacing, so the time to drain scales with the number of agents), and
   dispatch reachability after the session is adopted (placement converges when the agent's re-sent
@@ -1406,7 +1424,7 @@ one core replica a server-only restart now recovers through the replay described
   acknowledged but unreachable until their next reconnect; the series has no agent label, and the in-flight
   notification limit behind it is tracked in #4632). The operator runbook and the load table are in
   `docs/user-manual/gateway.md`, "What happens when the server restarts". The evidence record (run table,
-  test results, mutation summary, declined ledger obligations, not-tested list) is
+  test results, mutation summary, ledger obligations and their status, not-tested list) is
   `docs/security-reviews/gateway-heartbeat-verdict-replay-2026-10-04.md`.
 
 ### 7d. Cross-cluster gateway fan-out — "rest of 4.3" (WS-4, 2026-09-21)
