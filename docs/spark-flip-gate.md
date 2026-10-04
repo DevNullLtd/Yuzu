@@ -510,8 +510,10 @@ flip, with a red-first test each:
   `docs/spark-stage2-guardian-consumer-design.md` R5.2 amendment). Criteria for the flip: (1) a
   measured Service `watch()` p99 below the 5 s claim deadline (a large surplus of slow arms can
   still end congestion-expired); (2) the parked-arm signals exported as heartbeat tags -
-  `arms_parked_total`, `arm_redrives`, `compensation_reservation_refused`, `claim_drain_failures`
-  and the current parked depth (`arms_parked()`) are runtime accessors only today, so
+  `arms_parked_total`, `arm_redrives`, `compensation_reservation_refused`, `claim_drain_failures`,
+  the current parked depth (`arms_parked()`) and, from #4354, `claim_index_release_failures()`
+  (which counts release attempts, not claims) are runtime accessors only today, and no
+  retained-tombstone count exists yet (only the test-only `claim_queue_depth_for_test`), so
   `arm_pending > 0` cannot yet be told apart from ordinary in-flight arms; (3) a decision on the
   deferred faster redrive/expiry cadence (expiry lands between the deadline
   and the deadline plus one heartbeat interval (30 s by default), and the redrive sweep is a ~5 s
@@ -584,28 +586,70 @@ flip, with a red-first test each:
   same-type load. Criterion: PR-5 either resolves #4279 directly or explicitly re-assesses it
   against the landed K-bound logic and records the outcome here, rather than leaving it to drift
   as an unrelated open issue.
-- **NEW (added 2026-09-14, discovered during rung 9c PR-5a's own cs-103 tombstone-reachability
-  investigation)**: #4354, `publish_arm_verdicts_locked`'s ordinary (non-firewall) pop loop
-  (`guardian_spark_runtime.cpp:580-601`) pops every claim in `finished` on outcome presence and
-  fifo-front identity alone - it never checks whether that claim's index release actually
-  succeeded. The one release attempt for a withdrawn sibling happens earlier, exactly once, in
-  `on_arm_complete`'s own "claims that were withdrawn/abandoned while their siblings adopted"
-  loop (`:911-913`); nothing retries it. A failure there (reproduced via a `[.exploratory]` test
-  in `tests/unit/test_guardian_spark_runtime.cpp`, PR-5a) leaves a permanent ghost
-  `SparkKeyRuleIndex` entry with no `claims_[key]` residue at all - unlike up-2/up-101's
-  tombstones, no existing sweep can ever find it. Consequence, confirmed empirically: the ghost
-  permanently blocks `keys_[key]`'s own erasure (even after the last real rule on that key is
-  properly detached, `detach_rule_locked`'s `index_->remove_rule` keeps reporting "siblings
-  remain"), leaking the real backend subscription; a LATER, unrelated rule attaching to the same
-  key then silently inherits that stale, never-reverified subscription via the "reuse existing
-  shared watcher" path, with no new `arm()` call. Same production-reachability status as every
-  other criterion in this list - `release_claim_index_locked`'s real `erase_rule` call is
-  internally noexcept/allocation-free, so this is reachable only via the
-  `set_index_remove_fault_for_test` seam today, not live - but structurally real, and worse in
-  consequence (a permanent leak plus silent stale-subscription reuse, not just delayed cleanup)
-  than anything else named here. Criterion: give the ordinary pop loop the same release-success
-  check the firewall branch already has (the cs-2 fix, `:602-620`), or an equivalent guarantee
-  that a release-failed sibling is retained rather than silently popped, before the flip.
+- **FIX in PR #5337, pending merge (relates to #4354; added 2026-09-14, discovered during rung 9c PR-5a's own
+  cs-103 tombstone-reachability investigation)**: #4354, `publish_arm_verdicts_locked`'s ordinary
+  (non-firewall) pop loop used to pop every claim in `finished` on outcome presence and fifo-front
+  identity alone, without checking whether that claim's index release had succeeded. The one release
+  attempt for a withdrawn sibling happened earlier, exactly once, in `on_arm_complete`'s "claims that
+  were withdrawn/abandoned while their siblings adopted" loop; nothing retried it. A failure there
+  left a permanent ghost `SparkKeyRuleIndex` entry with no `claims_[key]` residue at all - unlike
+  up-2/up-101's tombstones, no existing sweep could find it. The ghost blocked `keys_[key]`'s own
+  erasure (even after the last real rule on that key was properly detached, `detach_rule_locked`'s
+  `index_->remove_rule` kept reporting "siblings remain"), leaking the real backend subscription,
+  and a LATER, unrelated rule attaching to the same key silently inherited that stale subscription
+  via the "reuse existing shared watcher" path, with no new `arm()` call. Production reachability was
+  the same as every other criterion in this list: `release_claim_index_locked`'s real `erase_rule`
+  call is internally noexcept/allocation-free, so the defect was reachable only via the
+  `set_index_remove_fault_for_test` seam, not live. Fix: the ordinary pop loop, the firewall branch
+  and the two double-fault recovery pops (`finalize_arm_compensation` and `on_arm_complete`) now all
+  go through `release_or_retain_tombstone_locked`, which retries the release and, on failure, keeps
+  the claim as a withdrawn `Queued` tombstone instead of popping it; the same-call sweep
+  (`try_dispatch_head_locked` calling `sweep_terminal_queued_locked`) retries the release
+  immediately. Regression coverage: the Catch2 cases whose names start "#4354:" in
+  `tests/unit/test_guardian_spark_runtime.cpp`, at least one per fix site. This criterion is
+  satisfied once PR #5337 merges; the retained-tombstone gaps it leaves are the next two bullets.
+- **NEW flip criterion (added 2026-10-03, Dave's ruling; found while planning the #4354 fix)**:
+  #5322, a retained withdrawn tombstone can be re-dispatched, or can strand a clean follower
+  behind it. One mechanism with two faces, so one fix. Construction (existing test seams only):
+  `fill_pool`; park an arm ra on a key; arm `set_index_remove_fault_for_test`; detach ra (Case 0 in
+  `withdraw_rule_after_wedge_sweep_locked` retains it because its release fails); re-arm the
+  one-shot seam. (1) Redispatch: attach rb on the same key, so `try_dispatch_head_locked` sweeps,
+  the release fails again, and it flips the tombstone `Queued` to `Dispatching`;
+  `dispatch_arm_off_lock` has no withdrawn/outcome guard. With the pool still exhausted,
+  `park_congested_arm_locked` refuses the dirty claim and `fail_all_claims_locked` stamps the CLEAN
+  follower rb `AdmissionRejected` (a #5168 regression); with the pool freed first, a withdrawn spec
+  is armed and then compensated. (2) Strand: with a clean follower rb queued behind ra BEFORE ra's
+  detach (and no later attach), ra stays `Queued` + withdrawn + outcome-bearing + `arm_parked`; `parked_arm_entry_valid_locked`,
+  `adopt_undriven_arm_head_locked`, `park_congested_arm_locked`, `reap_stranded_claims_locked` and
+  `expire_overdue_claims` each refuse or skip it, so rb waits for a same-key attach, its own
+  deadline, or `begin_stop`. Not reachable in production today (`erase_rule` is noexcept; the failure path is exercised only
+  through `set_index_remove_fault_for_test`). #4354's fix does not change the trigger (a second
+  release failure at the same-key sweep) but adds three producers of a retained tombstone (the
+  ordinary publish pop and both recovery pops; the firewall branch already retained), where those
+  paths previously left a ghost mapping; under a persistent failure each producer feeds the redispatch cycle, so
+  this criterion's fix must cover them. Further scenarios recorded from read-only analysis (not
+  executed; each needs a counted or sticky failure seam that does not exist today, because with
+  the one-shot seam every producer's tombstone is swept within the same lock hold): a late
+  successful release of a retained tombstone that is the last mapping on its key does not queue
+  the disarm, leaving the key's watch armed with an empty index; a retained tombstone plus a
+  last-on-key detach reaches `detach_sweep_left_residue_` (a synchronous backend disarm under
+  `registry_mu_`); `redrive_parked_arms` adopts and redispatches a retained `Queued` head without
+  sweeping; with no later same-key event a retained tombstone lasts until `begin_stop` (no depth
+  cap at enqueue; `reap_stranded_claims_locked` needs no outcome and `expire_overdue_claims` skips
+  terminal claims). Fix direction: a
+  guard in `try_dispatch_head_locked`, sweep-before-adopt in `adopt_undriven_arm_head_locked`, and a
+  periodic retry of outcome-bearing `Queued` tombstones in `reap_stranded_claims_locked` (a guard
+  alone converts the redispatch into the strand). Criterion: resolved, or explicitly re-assessed
+  and recorded here, before the flip - the E5+E6 exposure cap that
+  bounds it lapses at the flip (see the rung 9c PR-5 acceptance criteria preamble above).
+- **RECORDED, not flip-gating unless Dave rules otherwise (added 2026-10-03)**: #5323,
+  `abandon_claim_locked`'s `Queued` branch erases the claim from the fifo after a failed index
+  release, leaving a ghost mapping (the #4354 defect class on a different path). Not a one-line
+  helper swap: the `Queued` branch erases the claim from the fifo in the same step, before the
+  function writes the claim's outcome, `end` and the timeout counter, so retaining it needs the
+  retained state set while the claim is still in the fifo and a decision on that accounting. It
+  also interacts with the previous bullet (a retained tombstone at the front is what strands a
+  follower), so it should land after or with that fix. Dormant for the same reason.
 - **up-101 and cs-103 status (rung 9c PR-5a, #4221) - not previously listed as their
   own bullets in this section, added here for completeness.** up-101 (a same-rule
   re-attach behind a surviving tombstone leaking a watcher, `guardian_spark_
