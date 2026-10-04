@@ -464,7 +464,7 @@ std::vector<macos::MountEntry> snapshot_mounts(std::vector<PermissionRow>& rows,
 /// The system db, then each home's db until the run-wide output budget is spent.
 void read_all_sources(std::vector<PermissionRow>& rows, yuzu::shared::ConstraintAccumulator& acc,
                       const std::string& system_db, const std::string& users_dir,
-                      const macos::ReadBounds& bounds, macos::OutputBudget& output) {
+                      const macos::ReadBounds& bounds, OutputBudget& output) {
     const auto read = [&](std::string_view owner, const std::string& path, bool missing_is_absent) {
         const auto first = rows.size();
         read_tcc_source(owner, path, missing_is_absent, rows, acc, bounds);
@@ -478,7 +478,7 @@ void read_all_sources(std::vector<PermissionRow>& rows, yuzu::shared::Constraint
     for (const auto& user : users) {
         if (output.exhausted()) {
             rows.push_back(failure_row("macos", "-", "-", false,
-                                       std::string{macos::kBudgetExceededToken}, acc));
+                                       std::string{kBudgetExceededToken}, acc));
             break;
         }
         read(user, users_dir + "/" + user + std::string{kUserTccRelPath},
@@ -491,7 +491,7 @@ void read_all_sources(std::vector<PermissionRow>& rows, yuzu::shared::Constraint
 void run_collection(std::vector<PermissionRow>& rows, yuzu::shared::ConstraintAccumulator& acc,
                     const std::string& system_db, const std::string& users_dir, MountFetch fetch,
                     macos::ReadBounds bounds = {}) {
-    macos::OutputBudget output;
+    OutputBudget output;
     bounds.mounts = snapshot_mounts(rows, acc, fetch);
     output.charge(rows); // the snapshot's failure row, if any
     read_all_sources(rows, acc, system_db, users_dir, bounds, output);

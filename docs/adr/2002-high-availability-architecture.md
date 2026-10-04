@@ -1182,6 +1182,127 @@ correct action in both cases is today's behaviour (no replay).
   `/health` `agents.online` read 0 throughout, and the server did not recover in the observed windows
   (to about 125 s). An early successful command is therefore not evidence the reconcile is unnecessary.
 
+**Update (2026-10-02, gateway heartbeat admission bound to the session's connection).** A gateway
+session is bound to the connection whose `Subscribe` stream created it; `heartbeat/2` admits a heartbeat
+only on that connection and only for a session the node holds. The `unknown_session_ids` verdict
+(2026-10-01 note) therefore names only sessions the node held at admission time; it remains an advisory
+snapshot (`gateway.proto`: it may be stale) and the replay keeps its own liveness, dedupe and pacing
+rules. No wire or server change, and no agent change for the supported topologies; this change does not fix #1197.
+A rejected agent re-registers through its `NOT_FOUND` recovery (cooldown from 2 s doubling to 300 s). That logic
+exists from agent v0.13.0 (checked in the agent source at the v0.12.0 and v0.13.0 tags), but the released v0.13.0
+and v0.14.0-rc6 agents wedge in their reconnect path with default settings (bug #2182, fixed by PR #5183, in no
+release yet) and recover only with `--no-auto-update` (observed with both) or on a build that includes the fix;
+v0.12.0 never re-registers by itself (observed; older versions were not tested). Upgrade the agents first, then the gateway, with a
+build that includes the #2182 fix once released; until then restart an agent that stays rejected. Agents that do
+not connect through the gateway are not affected. An older agent only
+logs `Heartbeat failed` and, for persistent missing state, stays rejected until it is restarted or upgraded (a heartbeat
+in the short take_pending to register_agent gap can succeed later without re-registration); that matters only when its
+heartbeats are rejected: under a topology that breaks the one-connection assumption, against a gateway
+running without the session index, after a gateway registry process restart or crash while connections
+stay up (the registry recreates its tables empty; a node failover that leaves the session not held by the
+surviving node is expected to behave the same, inferred, not tested), or, for released agents, after a
+gateway process restart (observed in a graceful SIGTERM run with rc6, v0.13.0 and v0.12.0: the released agents did not notice the
+lost `Subscribe` stream and got `NOT_FOUND` on the new gateway, and v0.14.0-rc6 and v0.13.0 then wedged; the
+branch agent re-registered in 11 to 12 s with no rejections). Rollback is redeploying the
+previous gateway (the only new state is the in-memory index; derived from the change, not run).
+- **Connection key.** The key is the pid of the HTTP/2 connection process that carries the call, read
+  through a typed accessor added to the vendored grpcbox as its third `YUZU PATCH` site
+  (`grpcbox_stream:connection_pid/1`, `connection_pid_from_ctx/1`; `YUZU_PATCH.md`), wrapped by
+  `yuzu_gw_conn` (the only module the handlers call for keys). Every stream of one connection reports
+  the same key. A call without a key (`undefined`) never matches, not even a session registered without
+  one.
+- **Admission.** `yuzu_gw_heartbeat_admission` decides from node-local state only (never `pg`, never the
+  upstream server's view): the session index `yuzu_gw_sessions` (`{SessionId, AgentId, Pid, ConnKey}`,
+  created by the registry in `init/1` beside the routing and pending tables), then, on a miss, the
+  pending table. A pending session (Register done, `Subscribe` not yet admitted) is held to the
+  connection that sent the Register (`conn_key` in the pending row; `lookup_pending_session/1` does not
+  consume the row and treats an expired row as absent). Every rejection is the same gRPC `NOT_FOUND`
+  `unknown session` and the heartbeat is never queued; the reason appears only in counters:
+  `yuzu_gw_heartbeat_rejected_total{reason=unknown_session|no_connection|registry_unavailable}` and
+  `yuzu_gw_heartbeat_session_mismatch_total{event="security"}`, all pre-seeded to 0 and ASCII-HELP, plus
+  one rate-limited summary log line that never carries a session id. A rejected heartbeat has no resolved
+  principal, so the observability carve-out applies (metric and a rate-limited summary log, no audit row). No alert rule
+  ships yet.
+- **Lookup primitive.** `yuzu_gw_registry:lookup_session/1` returns `{ok, #{agent_id, pid, conn_key}}`,
+  `error` (not held on this node, or the process is no longer alive) or `{error, unavailable}` (the
+  index table does not exist, for example while the registry restarts). Callers must treat
+  `{error, unavailable}` as "not admitted", never as "no filter"; admission answers it with the same
+  `NOT_FOUND`. A future consumer (the gateway-side replay) must handle all three shapes, and must not
+  read `error` as "gone": it also covers a session that is only pending and the brief gap between
+  `take_pending` and `register_agent`. `{ok, #{conn_key := undefined}}` means the session is held but
+  never admits (it was registered without a connection key), not "not held". A consumer should use one
+  lookup consistently: `lookup_session/1` is session-keyed and checks that the process is local and
+  alive, while `lookup_local_session/1` is agent-keyed and has no node check. The server's
+  `unknown_session_ids` verdict stays an advisory snapshot whatever a consumer does with this function.
+  `error` also covers a pending session and the gap between `take_pending` and `register_agent`;
+  `lookup_pending_session/1` distinguishes a pending session from that gap, but it does not distinguish
+  the gap from an unknown or expired session (both lookups return `error` for each). The two also differ
+  on age: `lookup_pending_session/1` treats a row older than the 120 s TTL as absent, while `take_pending`
+  ignores the stored timestamp and still admits it until the 60 s sweep removes it, so a `Subscribe` can
+  succeed on a row the lookup reports as absent. An `{ok, Map}` result can go stale before the caller
+  acts, so a consumer treats it as advisory and re-checks at the act.
+- **Lifecycle, as implemented.**
+
+| Event | Index row |
+|---|---|
+| `register/2` succeeds upstream | pending row written with the Register connection's key (TTL 120 s, swept every 60 s) |
+| `subscribe/2`: `take_pending`, then `start_agent` | pending row consumed; for the short interval before the agent process registers neither row exists and a heartbeat gets `NOT_FOUND` (accepted; the agent recovers through its existing re-register path) |
+| `yuzu_gw_agent:init/1` calls `register_agent/7` | row inserted with the Subscribe connection's key; `maybe_cleanup` also removes the superseded process's row; `/5` and `/6` registrations carry `undefined` and admit nothing; an `undefined` session id is not indexed |
+| agent process cleanup | `deregister_agent/3` is fenced on the caller's own pid and session: it always removes that session's row, and removes the routing row and `pg` memberships only while that pid still owns the agent id, so a process superseded by a newer registration cannot remove it. The unfenced `deregister_agent/1` remains (it removes whichever process holds the agent id, with that row's session entry) |
+| registry `DOWN` for an agent pid | the session row goes only if the agent's routing row still names that pid |
+| registry restart | all of its tables (routing, pending and sessions) are recreated empty; lookups answer `{error, unavailable}` while the table is absent and `error` afterwards, so heartbeats get `NOT_FOUND` and agents with the reconnect fix recover through their re-register path. Observed on a rig by killing the registry process with 4 real agents attached: `unknown_session` rose by 4 (one per agent), `registry_unavailable` stayed 0, and all 4 agents were admitted again within about 25 s without a manual restart |
+| gateway restart | everything is gone and every connection is dropped; agents with the reconnect fix reconnect with fresh sessions (observed with the branch agent); released agents did not notice the lost `Subscribe` stream in a graceful SIGTERM run and need a restart if they stay rejected |
+| upstream replay and `reannounce/2` | replay never writes the index directly; a forced disconnect of a superseded replay ends that agent process, and the fenced cleanup then removes its row |
+| server-only restart | untouched: admission does not consult the server, so heartbeats are still admitted and the server's verdict stays advisory |
+
+- **Supported topologies.** Agents connect to `:50051` directly, or through an L4 / TLS-passthrough path
+  that keeps one TCP connection per agent. An HTTP/2-terminating or HTTP/2-multiplexing proxy between
+  agents and the gateway is not supported for this check: it may cause repeated heartbeat rejection or share
+  gateway-side connections across agents, removing the per-agent connection separation the check requires. It can
+  spread one agent's calls over several connections (connection mismatches, counted by `yuzu_gw_heartbeat_session_mismatch_total` and shown
+  as the `connection_mismatch=` count in the gateway summary log line, plus repeated re-registration)
+  and removes the per-agent separation the check relies on. There is no topology knob and no
+  `sys.config` change. Observed with a real C++ agent and two agents per run: behind an
+  HTTP/2-terminating proxy (nginx `grpc_pass`, two agents) every heartbeat was rejected as a connection mismatch
+  and none reached the server, while the agents still enrolled and received commands and re-registered
+  on their back-off ladder (2 s doubling to a 300 s cap); behind an L4 TCP forwarder (nginx `stream`)
+  there were no rejections. The agent-facing message is the same `unknown session` for every reason, so
+  operators diagnose from the counters and the summary log. Not tested with a real agent: a multi-node
+  gateway (a two-node registry unit test, `yuzu_gw_registry_multinode_tests`, exists) and a listener that
+  requires client certificates (a test-client mutual TLS leg exists in
+  `yuzu_gw_heartbeat_conn_rpc_tests`; the shipped listener does not require client certificates). Not
+  tested at all: a multiplexing HTTP/2 proxy with upstream keepalive, fleet-scale storms, Windows service
+  mode, a macOS agent, a real hot code load and a GOAWAY that the gateway itself originates (an injected one was run). The rig runs used
+  gateway commit `1c145d78a` (the first plaintext run used `2e884bb9b`, which differs only in tests and
+  docs); later fix commits (`605f117d2` index guard, `3431d20ea` `/readyz` `sessions_index`,
+  `026830cd9` summary log state created at boot, and the round-2 code commits `e139c5e86` boot test and
+  two comments, `9ad473534` counter HELP wording, `942fe5770` and `c2d040a66` test changes, `ab3986ec1`
+  comments, and the round-3 code commit `21125cc3b` comment, HELP and test changes) were covered by eunit only
+  (fix-agent runs) until a plaintext rig run at `1e9c9784d` exercised the boot path of the final gateway source. The
+  commits after `1e9c9784d` are test, documentation and HELP text changes only (covered by eunit, not rig-run). The run record is
+  [gateway-heartbeat-connection-binding-2026-10-03](../security-reviews/gateway-heartbeat-connection-binding-2026-10-03.md).
+- **Connection close and GOAWAY.** Observed in the gateway's own tests with a test HTTP/2 client: the
+  gateway's HTTP/2 server closes a connection as soon as it sends GOAWAY, so a `Subscribe` stream and
+  its binding end with the connection (there is no drain period). A heartbeat that reaches the gateway
+  on a different connection while the old `Subscribe` is still bound is rejected (`NOT_FOUND`,
+  connection mismatch) and an agent with the reconnect fix recovers by re-registering. With the real C++ agent (a branch build) a
+  graceful GOAWAY injected on the gateway-side connection by the tester (the gateway did not originate one) moved the
+  next heartbeat to a new connection: the mismatch counter rose by one and the agent re-registered 16 s later.
+- **Deploying.** The index table is created at registry init, so deployment needs a gateway restart;
+  hot code upgrade is not supported for this change. Code loaded into a running node has no table: the
+  registry guards its index calls (`catch error:badarg`), so it survives and keeps its routing rows and
+  `pg` groups, logs one warning, and every heartbeat on that node is rejected as `registry_unavailable`
+  until the gateway is restarted (covered by a unit test that deletes the table inside the registry; a
+  real hot code load was not run). `/readyz` reports `sessions_index` and answers 503 while the table is
+  missing. `yuzu_gw_sessions` is a protected table written only by the registry process.
+- **Limits.** `Subscribe` admission is unchanged by this change. Some log lines still include session
+  ids; two gateway info lines no longer do. The node-local rule also applies to a multi-node gateway: one
+  agent's `Heartbeat` must reach the node that holds its `Subscribe` stream (per-connection sticky L4,
+  no per-RPC balancing). Planned agent-side endpoint failover (WS-13) must keep one channel per agent to
+  one node for the life of a session; a failover that re-registers on a new channel mints a new session and
+  is compatible. A future heartbeat-forwarding slice cannot reuse the connection pid as its key, because a pid
+  is meaningful only on the node that owns the connection.
+
 ### 7d. Cross-cluster gateway fan-out — "rest of 4.3" (WS-4, 2026-09-21)
 
 **Status: CLOSED.** The last named WS-4 4.3 gap: 4.3a (§ above) built INTRA-cluster routing (agent on a

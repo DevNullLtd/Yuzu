@@ -358,12 +358,22 @@ heartbeat_batch_scale() ->
         end
     end),
     whereis(yuzu_gw_heartbeat_buffer) ! flush,
-    timer:sleep(200),
+    %% Poll rather than a fixed sleep(200): the buffer must first work through
+    %% the N queued casts, and meck records the RPC with an async cast carrying
+    %% the whole N-heartbeat batch. On a loaded runner (#4851 runs this suite on
+    %% macOS CI, where BigMags shares its CPU between two agents) that can take
+    %% longer than 200ms. The check is "the batch holds all N", not "how
+    %% fast", so the 5s deadline (above the 2s used elsewhere, for the N-sized
+    %% backlog) changes nothing it asserts; a missing RPC still fails below.
+    BatchReqsFun = fun() ->
+        [Req || {_, {grpcbox_client, unary, [_, Path, Req, _, _]}, _}
+                    <- meck:history(grpcbox_client),
+                binary:match(Path, <<"BatchHeartbeat">>) =/= nomatch]
+    end,
+    _ = wait_until(fun() -> BatchReqsFun() =/= [] end, 5000),
 
     %% Verify that the batch contained all N heartbeats.
-    Calls = meck:history(grpcbox_client),
-    BatchReqs = [Req || {_, {grpcbox_client, unary, [_, Path, Req, _, _]}, _} <- Calls,
-                        binary:match(Path, <<"BatchHeartbeat">>) =/= nomatch],
+    BatchReqs = BatchReqsFun(),
     case BatchReqs of
         [Req | _] ->
             HBs = maps:get(heartbeats, Req, []),

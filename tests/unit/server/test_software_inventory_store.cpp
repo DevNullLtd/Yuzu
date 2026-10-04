@@ -198,11 +198,9 @@ std::string wire_record_reserved(const SoftwareEntry& e, const std::string& inst
 
 // SERVER CONTRACT PIN (16 fields, slots 13-14 empty). sha256 of wire_record(full_extended_entry(), 16) bytes:
 //   printf 'bash\0375.2.21\037Fedora Project\037Mon 01 Jan 2026\037package\037rpm\0370\0373.fc40\037x86_64\037signed\037fedora\03740\037\037\037bash-5.2.21-3.fc40.x86_64\037installed_apps.list_inventory\036' | shasum -a 256
-// The agent builder (installed_software_canonical_blob) still emits 12 fields until
-// the agent-side update; that update copies this constant and these fixture bytes into
-// tests/unit/test_inventory_sync.cpp, making it the cross-side pin exactly as
-// kCrossPinHash is today. Until then this proves only that the server hashes stored
-// 16-field rows to the raw blob bytes.
+// The agent builder (installed_software_canonical_blob) emits this tail; the identical
+// constant and fixture bytes live in tests/unit/test_inventory_sync.cpp, making it the
+// live cross-side pin exactly as kCrossPinHash is.
 constexpr const char* kCrossPinHashExtended =
     "371b647c95b0f48a039ff98790c6085947ef71fcfd40a399c3cd70d70321291d";
 
@@ -1120,7 +1118,7 @@ TEST_CASE("ingest boundary-truncates an over-long multibyte field so PG accepts 
     // name = 1023 'a' + 'é' (0xC3 0xA9) = 1025 bytes; record = name|1|| (0x1F fields,
     // 0x1E terminator; octal \037=0x1F \036=0x1E to avoid greedy \x hex escapes).
     std::string longname = std::string(1023, 'a') + "\xc3\xa9";
-    std::string blob = longname + "\0371\037\037\036";
+    std::string blob = longname + "\037" "1\037\037\036";
     agentpb::InventoryReport rep;
     (*rep.mutable_content_hashes())["installed_software"] = "x"; // recomputed on a full payload
     (*rep.mutable_plugin_data())["installed_software"] = blob;

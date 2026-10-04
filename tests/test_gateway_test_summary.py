@@ -1,0 +1,574 @@
+#!/usr/bin/env python3
+"""Pin the Meson gateway test wrapper's #4800 guarantees.
+
+#4800: the `gateway ct` Meson test ran `rebar3 ct` with no `--dir`, so it
+discovered zero suites, printed "All 0 tests passed." and exited 0 on every
+platform, hiding #4707 and #4708. This file pins three things so that
+cannot silently come back:
+
+  1. scripts/gateway_test_summary.py's summary parser and zero-executed
+     guard, against every rebar3 ct/eunit summary shape it must handle;
+  2. scripts/test_gateway.py still points ct at the directory the CT suites
+     actually live in, and still routes every exit through the guard;
+  3. each suite's wrapper deadline stays BELOW its meson timeout, so the
+     wrapper's pre-kill process-tree dump is reachable.
+
+Hermetic: parses sources and runs only the parser CLI under sys.executable
+(no rebar3, no network, no shared paths).
+"""
+import ast
+import glob
+import json
+import os
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+import unittest
+
+ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
+sys.path.insert(0, os.path.join(ROOT, 'scripts'))
+
+import gateway_test_summary as gts  # noqa: E402
+
+WRAPPER = os.path.join(ROOT, 'scripts', 'test_gateway.py')
+MESON = os.path.join(ROOT, 'meson.build')
+CT_DIR = os.path.join(ROOT, 'gateway', 'apps', 'yuzu_gw', 'test', 'ct')
+
+
+def _read(path):
+    with open(path, encoding='utf-8') as f:
+        return f.read()
+
+
+class ExecutedCount(unittest.TestCase):
+
+    def test_summary_shapes(self):
+        cases = {
+            # ct. The three lines marked CAPTURED are verbatim output of
+            # `rebar3 as test ct --dir apps/yuzu_gw/test/ct
+            # --suite=yuzu_gw_e2e_SUITE` run locally with rebar3 3.27.0 on
+            # OTP 28.4.2 (the failing and skipping ones with a scratch-only
+            # broken assertion / init_per_testcase skip), including the
+            # trailing space rebar3 prints. rebar3 CT never singularises
+            # "test(s)": "Failed 1 tests." is the real wording. The other
+            # lines come from the format strings in rebar3's CT provider
+            # (extracted from the 3.24.0 binary, the CI pin, during the PR
+            # review), not from a capture.
+            'All 52 tests passed.': 52,
+            'All 5 tests passed.': 5,                                    # CAPTURED
+            'Failed 1 tests. Passed 4 tests. ': 5,                       # CAPTURED
+            'Failed 1 tests. Skipped 1 (1, 0) tests. Passed 3 tests. ': 4,  # CAPTURED
+            'Failed 6 tests. Skipped 2 (0, 2) tests. Passed 44 tests. ': 50,
+            'Skipped 2 (2, 0) tests. Passed 44 tests.': 44,
+            'Failed 5 tests. Passed 0 tests.': 5,
+            # a CRLF-terminated variant of the captured line above
+            'Failed 1 tests. Passed 4 tests. \r\n': 5,
+            # eunit
+            '  All 324 tests passed.': 324,
+            '  Failed: 2.  Skipped: 0.  Passed: 309.': 311,
+            '  Test passed.': 1,
+            '  2 tests passed.': 2,
+            'There were no tests to run.': 0,
+            # the #4800 false green itself
+            '\x1b[0mAll 0 tests passed.\r\n': 0,
+            # ANSI colouring around the summary (rebar3 default)
+            '\x1b[0;32mAll 52 tests passed.\x1b[0m\r\n': 52,
+        }
+        for text, want in cases.items():
+            with self.subTest(text=text):
+                self.assertEqual(gts.executed_count(text), want)
+
+    def test_no_summary_is_none(self):
+        self.assertIsNone(gts.executed_count('===> Compiling yuzu_gw\n'))
+        self.assertIsNone(gts.executed_count(''))
+
+    def test_truncated_capture_fails_closed(self):
+        # #4800 Gate 5 CH-1: output cut before rebar3's summary must never
+        # read as a pass, including when a test's own log text CONTAINS a
+        # summary-shaped phrase (anchoring), a line is cut mid-way, or an
+        # ANSI escape is split by the cut.
+        real = ('%%% yuzu_gw_e2e_SUITE: ....\n'
+                '*** log: All 5 tests passed. (fixture noise)\n'
+                'agent said "Passed 3 tests." earlier\n'
+                '\x1b[0mAll 52 tests passed.\n')
+        cut = real.index('\x1b[0mAll 52')
+        for n in range(0, cut + 1):
+            with self.subTest(cut=n):
+                self.assertEqual(gts.require_tests_executed(real[:n], 'ct', 0), 1)
+        for partial in ('All 5', '\x1b[0mAll 52 tests pass', '\x1b[', '\x1b[0'):
+            with self.subTest(partial=partial):
+                self.assertEqual(
+                    gts.require_tests_executed(real[:cut] + partial, 'ct', 0), 1)
+        self.assertEqual(gts.require_tests_executed(real, 'ct', 0), 0)
+
+    def test_last_summary_wins(self):
+        self.assertEqual(
+            gts.executed_count('All 3 tests passed.\n...\n  All 311 tests passed.\n'), 311)
+
+    def test_several_genuine_summaries_last_one_decides(self):
+        # Documents the limit of "last summary wins". Today `rebar3 ct` is
+        # run once with a single --dir, so one genuine summary is printed.
+        # A future `--spec` run (or any invocation that makes rebar3 print a
+        # summary per group) could print several GENUINE summary lines; the
+        # parser then judges only the last one, so an early failing run
+        # followed by a passing one reads as a pass and the reverse reads as
+        # a fail. This pins that outcome so changing the invocation shape
+        # forces a decision here rather than going unnoticed.
+        failed_then_passed = ('Failed 1 tests. Passed 4 tests. \n'
+                              'All 5 tests passed.\n')
+        passed_then_failed = ('All 5 tests passed.\n'
+                              'Failed 1 tests. Passed 4 tests. \n')
+        self.assertEqual(gts.last_summary(failed_then_passed), (5, 0, False))
+        self.assertEqual(gts.last_summary(passed_then_failed), (5, 1, False))
+        # A zero-executed LAST summary still fails the run.
+        self.assertEqual(gts.require_tests_executed(
+            'All 5 tests passed.\nAll 0 tests passed.\n', 'ct', 0), 1)
+
+
+class RequireTestsExecuted(unittest.TestCase):
+
+    def test_zero_executed_fails_a_green_run(self):
+        self.assertEqual(gts.require_tests_executed('All 0 tests passed.', 'ct', 0), 1)
+        self.assertEqual(gts.require_tests_executed('There were no tests to run.', 'eunit', 0), 1)
+
+    def test_missing_summary_fails_a_green_run(self):
+        self.assertEqual(gts.require_tests_executed('===> Running Common Test suites...', 'ct', 0), 1)
+
+    def test_real_run_passes(self):
+        self.assertEqual(gts.require_tests_executed('All 52 tests passed.', 'ct', 0), 0)
+
+    def test_nonzero_rc_passes_through_unchanged(self):
+        self.assertEqual(gts.require_tests_executed('Failed 6 tests. Passed 44 tests.', 'ct', 1), 1)
+        self.assertEqual(gts.require_tests_executed('', 'ct', -1), -1)
+
+
+class CancelTolerantVerdict(unittest.TestCase):
+    # The verdict /test's eunit-gate.sh and the release workflow's EUnit step
+    # both take from scripts/gateway_test_summary.py (#1005 tolerance +
+    # #4800 zero-executed rule).
+
+    def test_matrix(self):
+        cases = [
+            # (log, rc, expected exit, why)
+            ('  All 300 tests passed.', 0, 0, 'green'),
+            ('  2 tests passed.', 0, 0, 'two tests'),
+            ('  Test passed.', 0, 0, 'one test'),
+            ('  Failed: 0.  Skipped: 0.  Passed: 309.\nOne or more tests were cancelled.', 1, 0,
+             'some sets cancelled (#1005)'),
+            ('  Failed: 0.  Skipped: 0.  Passed: 0.\nOne or more tests were cancelled.', 1, 1,
+             'ALL cancelled (#4800 C-1)'),
+            ('  Failed: 2.  Skipped: 0.  Passed: 307.', 1, 1, 'real failure'),
+            ('  There were no tests to run.', 0, 1, 'nothing discovered'),
+            ('===> Compilation failed', 1, 1, 'rebar3 failed before tests'),
+            ('*** log: All 5 tests passed. (noise)\n', 0, 1, 'embedded noise only'),
+            ('  All 300 tests passed.', 1, 1, 'rc!=0 without a Failed: line'),
+        ]
+        for log, rc, want, why in cases:
+            with self.subTest(why=why):
+                self.assertEqual(gts.cancel_tolerant_verdict(log, rc)[0], want)
+
+    def test_cli(self):
+        script = os.path.join(ROOT, 'scripts', 'gateway_test_summary.py')
+        with tempfile.TemporaryDirectory(prefix='yuzu_test_') as d:
+            log = os.path.join(d, 'eunit.log')
+            for text, rc, want in [('  All 3 tests passed.\n', '0', 0),
+                                   ('  Failed: 0.  Skipped: 0.  Passed: 0.\n', '1', 1)]:
+                with open(log, 'w', encoding='utf-8') as f:
+                    f.write(text)
+                p = subprocess.run([sys.executable, script, 'cancel-tolerant', rc, log, '--github'],
+                                   capture_output=True, text=True)
+                self.assertEqual(p.returncode, want, p.stdout + p.stderr)
+            p = subprocess.run([sys.executable, script], capture_output=True, text=True)
+            self.assertEqual(p.returncode, 2)
+
+    def test_shell_gates_use_this_parser(self):
+        # A hand-written regex copy in either gate is how the CH-1 anchoring
+        # fix reached only one of three gates; keep them on the shared parser.
+        for path in (os.path.join(ROOT, 'scripts', 'test', 'eunit-gate.sh'),
+                     os.path.join(ROOT, '.github', 'workflows', 'release.yml')):
+            with self.subTest(path=path):
+                self.assertRegex(_read(path), r'gateway_test_summary\.py"?\s+cancel-tolerant')
+
+    def test_local_runner_judges_by_the_summary(self):
+        # gateway/test_runner.sh (the documented local runner) used to trust
+        # rebar3's exit code, so the #4800 false green survived there. Every
+        # rebar3 test invocation must go through its `gated` helper, which
+        # hands the capture to the shared parser: strict for ct, the #1005
+        # cancel-tolerant rule for eunit.
+        src = _read(os.path.join(ROOT, 'gateway', 'test_runner.sh'))
+        self.assertRegex(src, r'SUMMARY_PARSER="\$SCRIPT_DIR/\.\./scripts/gateway_test_summary\.py"')
+        self.assertRegex(src, r'python3 "\$SUMMARY_PARSER" strict ')
+        self.assertRegex(src, r'python3 "\$SUMMARY_PARSER" "\$mode" ')
+        calls = re.findall(r'^\s*(?!#)(.*\brebar3 as test\b.*)$', src, re.M)
+        self.assertEqual(len(calls), 4, calls)   # eunit and ct, each with/without cover
+        for line in calls:
+            with self.subTest(call=line):
+                want = 'strict ct' if ' ct ' in line else 'cancel-tolerant eunit'
+                self.assertRegex(line, r'^gated %s rebar3 as test ' % want)
+
+    def test_strict_cli(self):
+        script = os.path.join(ROOT, 'scripts', 'gateway_test_summary.py')
+        with tempfile.TemporaryDirectory(prefix='yuzu_test_') as d:
+            log = os.path.join(d, 'ct.log')
+            for text, rc, want in [('All 5 tests passed.\n', '0', 0),
+                                   ('All 0 tests passed.\n', '0', 1),
+                                   ('no summary\n', '0', 1),
+                                   ('Failed 1 tests. Passed 4 tests. \n', '1', 1)]:
+                with open(log, 'w', encoding='utf-8') as f:
+                    f.write(text)
+                p = subprocess.run([sys.executable, script, 'strict', 'ct', rc, log],
+                                   capture_output=True, text=True)
+                self.assertEqual(p.returncode, want, text + p.stdout + p.stderr)
+            p = subprocess.run([sys.executable, script, 'strict', 'ct', '0'],
+                               capture_output=True, text=True)
+            self.assertEqual(p.returncode, 2)
+
+
+@unittest.skipUnless(shutil.which('bash') and os.name != 'nt',
+                     'needs bash and a POSIX host (gateway/test_runner.sh is never run on Windows)')
+class LocalRunnerBehaviour(unittest.TestCase):
+    # The source-text pin above cannot see `rebar_rc=${PIPESTATUS[0]}` become
+    # `$?` or `verdict=$?` become `verdict=0`. This runs the real script
+    # against a stub `rebar3` on PATH and asserts its exit code. The runner is
+    # executed in place (it resolves the parser relative to itself and cd's
+    # into gateway/); only rebar3 is faked, and TMPDIR is a private dir.
+
+    RUNNER = os.path.join(ROOT, 'gateway', 'test_runner.sh')
+    STUB = (
+        '#!/usr/bin/env bash\n'
+        'case "$1" in compile) exit 0;; esac\n'
+        'for a in "$@"; do\n'
+        '  if [ "$a" = ct ]; then printf \'%s\\n\' "$STUB_CT_OUT"; exit "$STUB_CT_RC"; fi\n'
+        '  if [ "$a" = eunit ]; then printf \'%s\\n\' "$STUB_EUNIT_OUT"; exit "$STUB_EUNIT_RC"; fi\n'
+        'done\n'
+        'exit 99\n')
+
+    CT_PASS = ('All 5 tests passed.', 0)
+    EU_PASS = ('  All 300 tests passed.', 0)
+
+    # Copies stdin like the real tee, then exits non-zero.
+    FAILING_TEE = '#!/bin/sh\ncommand -p tee "$@"\nexit 1\n'
+
+    def _run(self, args, ct=CT_PASS, eunit=EU_PASS, tee_fails=False):
+        with tempfile.TemporaryDirectory(prefix='yuzu_test_') as d:
+            stubs = [('rebar3', self.STUB)] + ([('tee', self.FAILING_TEE)] if tee_fails else [])
+            for name, body in stubs:
+                stub = os.path.join(d, name)
+                with open(stub, 'w', encoding='utf-8') as f:
+                    f.write(body)
+                os.chmod(stub, os.stat(stub).st_mode | stat.S_IXUSR)
+            env = dict(os.environ, PATH=d + os.pathsep + os.environ['PATH'], TMPDIR=d,
+                       STUB_CT_OUT=ct[0], STUB_CT_RC=str(ct[1]),
+                       STUB_EUNIT_OUT=eunit[0], STUB_EUNIT_RC=str(eunit[1]))
+            p = subprocess.run(['bash', self.RUNNER] + args, env=env,
+                               capture_output=True, text=True, timeout=120)
+            return p.returncode, p.stdout + p.stderr
+
+    def test_ct_verdict_comes_from_the_summary(self):
+        cases = [
+            # (stub ct output, stub rebar3 rc, expected exit, why)
+            ('All 0 tests passed.', 0, 1, 'zero-test ct (the #4800 false green)'),
+            ('Failed 1 tests. Passed 4 tests. ', 1, 1, 'ct failed'),
+            ('===> Compiling yuzu_gw', 0, 1, 'ct printed no summary'),
+            ('All 5 tests passed.', 1, 1, 'strict: rebar3 non-zero stays a failure'),
+            ('All 5 tests passed.', 0, 0, 'ct pass'),
+        ]
+        for out, rc, want, why in cases:
+            with self.subTest(why=why):
+                got, log = self._run(['ct'], ct=(out, rc))
+                self.assertEqual(got, want, log)
+
+    def test_eunit_verdict_comes_from_the_summary(self):
+        cancelled = '\nOne or more tests were cancelled.'
+        cases = [
+            ('  Failed: 0.  Skipped: 0.  Passed: 0.' + cancelled, 1, 1, 'every set cancelled'),
+            ('  Failed: 0.  Skipped: 0.  Passed: 309.' + cancelled, 1, 0, 'cancel-tolerated (#1005)'),
+            ('  Failed: 2.  Skipped: 0.  Passed: 307.', 1, 1, 'real failure'),
+            ('  All 300 tests passed.', 1, 1, 'rc != 0 without a Failed: line'),
+            ('  There were no tests to run.', 0, 1, 'nothing discovered'),
+            ('  All 300 tests passed.', 0, 0, 'eunit pass'),
+        ]
+        for out, rc, want, why in cases:
+            with self.subTest(why=why):
+                got, log = self._run(['eunit'], eunit=(out, rc))
+                self.assertEqual(got, want, log)
+
+    def test_verdict_uses_rebar3_status_not_the_pipeline_status(self):
+        # Under `set -o pipefail` a bare `$?` equals PIPESTATUS[0] unless the
+        # pipeline's other stage (tee) fails, so only a failing tee tells
+        # `rebar_rc=${PIPESTATUS[0]}` from `rebar_rc=$?`: a green ct run whose
+        # capture was copied intact must still pass, and a red one still fail.
+        self.assertEqual(self._run(['ct'], tee_fails=True)[0], 0)
+        self.assertEqual(self._run(['ct'], ct=('All 5 tests passed.', 1), tee_fails=True)[0], 1)
+
+    def test_default_runs_both_and_counts_either_failure(self):
+        zero = ('All 0 tests passed.', 0)
+        bad_eunit = ('  Failed: 2.  Skipped: 0.  Passed: 307.', 1)
+        self.assertEqual(self._run([])[0], 0)
+        self.assertEqual(self._run([], ct=zero)[0], 1)
+        self.assertEqual(self._run([], eunit=bad_eunit)[0], 1)
+        self.assertEqual(self._run([], ct=zero, eunit=bad_eunit)[0], 2)
+
+
+class WrapperWiring(unittest.TestCase):
+
+    def test_ct_dir_points_at_the_suites(self):
+        src = _read(WRAPPER)
+        m = re.search(r'if suite == "ct":\s*\n(?:\s*#.*\n)*\s*cmd \+= \["--dir", "([^"]+)"\]', src)
+        self.assertIsNotNone(m, 'test_gateway.py no longer passes --dir for ct (#4800)')
+        ct_dir = os.path.join(ROOT, 'gateway', *m.group(1).split('/'))
+        self.assertEqual(os.path.normpath(ct_dir), os.path.normpath(CT_DIR))
+        suites = [f for f in os.listdir(CT_DIR) if f.endswith('_SUITE.erl')]
+        self.assertTrue(suites, f'no *_SUITE.erl under {CT_DIR}')
+
+    def test_every_exit_goes_through_the_guard(self):
+        # An AST walk, not a line regex: a call split over several lines
+        # (or written `exit(...)` / `os._exit(...)`) must still be judged.
+        tree = ast.parse(_read(WRAPPER))
+
+        def is_exit(node):
+            f = node.func
+            if isinstance(f, ast.Name):
+                return f.id in ('exit', 'quit')
+            return (isinstance(f, ast.Attribute) and isinstance(f.value, ast.Name)
+                    and (f.value.id, f.attr) in (('sys', 'exit'), ('os', '_exit')))
+
+        exits = [n for n in ast.walk(tree) if isinstance(n, ast.Call) and is_exit(n)]
+        self.assertTrue(exits)
+        for node in exits:
+            with self.subTest(line=node.lineno):
+                guarded = any(
+                    isinstance(c, ast.Call) and isinstance(c.func, ast.Name)
+                    and c.func.id == '_require_tests_executed'
+                    for arg in node.args for c in ast.walk(arg))
+                self.assertTrue(guarded, f'exit at line {node.lineno} bypasses the guard')
+
+    def test_deadline_is_below_meson_timeout(self):
+        m = re.search(r'_SUITE_DEADLINE_SECS = \{(.*?)\}', _read(WRAPPER), re.S)
+        self.assertIsNotNone(m)
+        deadlines = {k: int(v) for k, v in re.findall(r'"(\w+)":\s*(\d+)', m.group(1))}
+        meson = _read(MESON)
+        for suite in ('eunit', 'ct'):
+            with self.subTest(suite=suite):
+                t = re.search(r"test\('gateway %s',.*?timeout:\s*(\d+)" % suite, meson, re.S)
+                self.assertIsNotNone(t, f"meson test 'gateway {suite}' not found")
+                self.assertIn(suite, deadlines)
+                # Leave room for the dump + kill + 15s wait in _run_streamed.
+                self.assertLessEqual(deadlines[suite] + 30, int(t.group(1)))
+
+
+class AssertGatewayTests(unittest.TestCase):
+    # #4841: every CI leg asserts, right after `meson setup`, that the gateway
+    # tests were registered (a missing rebar3 otherwise skips them silently).
+
+    SCRIPT = os.path.join(ROOT, 'scripts', 'ci', 'assert-gateway-tests.py')
+    WORKFLOWS = ('ci.yml', 'nightly.yml', 'sanitizer-tests.yml')
+    # The workflow canary only compiles (it never runs `meson test`), so it
+    # has no gateway tests to lose. Exempted by its STEP NAME, not its build
+    # dir, so a future test-running leg that reuses the dir name is still checked.
+    EXEMPT_STEPS = {('ci.yml', 'Configure (Meson, gcc-13 debug)')}
+
+    def _run(self, tests):
+        with tempfile.TemporaryDirectory(prefix='yuzu_test_') as d:
+            if tests is not None:
+                os.makedirs(os.path.join(d, 'meson-info'))
+                with open(os.path.join(d, 'meson-info', 'intro-tests.json'), 'w', encoding='utf-8') as f:
+                    json.dump(tests, f)
+            return subprocess.run([sys.executable, self.SCRIPT, d],
+                                  capture_output=True, text=True).returncode
+
+    def test_verdicts(self):
+        both = [{'name': 'gateway eunit'}, {'name': 'gateway ct'}, {'name': 'x'}]
+        self.assertEqual(self._run(both), 0)
+        self.assertEqual(self._run([{'name': 'gateway eunit'}]), 1)
+        self.assertEqual(self._run([]), 1)
+        self.assertEqual(self._run(None), 1)   # not configured / unreadable
+
+    def test_every_meson_setup_is_followed_by_the_assertion(self):
+        # And never by -Drequire_gateway: a non-default project option stored
+        # in a persistent, branch-shared build dir breaks every later
+        # `--reconfigure` from a branch whose meson.options predates it.
+        for wf in self.WORKFLOWS:
+            text = _read(os.path.join(ROOT, '.github', 'workflows', wf))
+            self.assertNotIn('-Drequire_gateway', text, wf)
+            lines = text.split('\n')
+            step = None
+            for i, line in enumerate(lines):
+                sm = re.match(r'\s*- name:\s*(.+?)\s*$', line)
+                if sm:
+                    step = sm.group(1)
+                m = re.match(r'\s*meson setup (?:\$reconfig )?(\S+)', line)
+                if not m or (wf, step) in self.EXEMPT_STEPS:
+                    continue
+                j = i
+                while lines[j].rstrip().endswith('\\'):
+                    j += 1
+                with self.subTest(workflow=wf, line=i + 1):
+                    a = re.match(r'\s*python3? scripts/ci/assert-gateway-tests\.py (\S+)\s*$', lines[j + 1])
+                    self.assertIsNotNone(a, lines[j + 1])
+                    # It must check the dir meson just configured, not a
+                    # sibling whose intro-tests.json could be stale.
+                    self.assertEqual(a.group(1).strip('"'), m.group(1).strip('"'))
+
+    # `meson test` / `meson  test` / `meson \<newline> test`, or the flake-retry
+    # wrapper that runs it.
+    TEST_RE = re.compile(r'\bmeson(?:\s|\\\n)+test\b|flake-retry\.py')
+    ASSERT_RE = re.compile(r'scripts/ci/assert-gateway-tests\.py')
+    # `|| true`, `|| :` or `|| exit 0` on the assert's own command line.
+    MASKED_RE = re.compile(r'\|\|\s*(?:true\b|:(?=\s|$|;)|exit\s+0\b)')
+
+    @staticmethod
+    def _truthy(value):
+        v = str(value).strip().lower()
+        if v.startswith('${{') and v.endswith('}}'):
+            v = v[3:-2].strip()
+        return v in ('true', '1')
+
+    @staticmethod
+    def _falsey(value):
+        v = str(value).strip().lower()
+        if v.startswith('${{') and v.endswith('}}'):
+            v = v[3:-2].strip()
+        return v in ('false', '0')
+
+    @classmethod
+    def _gateway_assert_problem(cls, steps):
+        """None if `steps` (one job) either runs no tests or asserts the
+        gateway tests registered STRICTLY before the first test invocation,
+        by a step that can actually fail; else a one-line reason.
+
+        Order is judged by source position: (step index, char offset in the
+        comment-stripped `run:` text), so an assert placed after `meson test`
+        inside one `run:` block is still late. An assert that cannot fail
+        (`|| true`, `continue-on-error: true`, an `if:` that is literally
+        false) does not count."""
+        first_test = None
+        asserts = []
+        for i, step in enumerate(steps or []):
+            run = '\n'.join(l for l in str(step.get('run') or '').split('\n')
+                            if not l.lstrip().startswith('#'))
+            m = cls.TEST_RE.search(run)
+            if m and first_test is None:
+                first_test = (i, m.start())
+            neutral = None
+            if cls._truthy(step.get('continue-on-error', False)):
+                neutral = 'continue-on-error: true'
+            elif 'if' in step and cls._falsey(step['if']):
+                neutral = 'a false if:'
+            for a in cls.ASSERT_RE.finditer(run):
+                lo = max((k.end() for k in re.finditer(r'(?<!\\)\n', run[:a.start()])), default=0)
+                nl = re.search(r'(?<!\\)\n', run[a.end():])
+                line = run[lo:a.end() + nl.start()] if nl else run[lo:]
+                why = neutral or ('|| true on the assert line' if cls.MASKED_RE.search(line) else None)
+                asserts.append(((i, a.start()), why))
+        if first_test is None:
+            return None
+        if not asserts:
+            return 'runs tests but never asserts the gateway tests registered'
+        live = [pos for pos, why in asserts if why is None]
+        if not live:
+            return 'the assertion cannot fail (%s)' % asserts[0][1]
+        if min(live) >= first_test:
+            return 'the assertion does not run strictly before the first test invocation'
+        return None
+
+    def test_assert_ordering_rule_rejects_each_weakening(self):
+        # The rule itself, on synthetic jobs: each mutant of a good job must
+        # be rejected, and the good shapes accepted.
+        good = [{'run': 'python3 scripts/ci/assert-gateway-tests.py b'},
+                {'run': 'meson test -C b'}]
+        problem = self._gateway_assert_problem
+        self.assertIsNone(problem(good))
+        self.assertIsNone(problem([{'run': 'x'}]))   # no tests, nothing to assert
+        self.assertIsNone(problem([{'run': 'python3 scripts/ci/assert-gateway-tests.py b\n'
+                                           'meson test -C b'}]))
+        self.assertIsNone(problem([{'run': 'python3 scripts/ci/assert-gateway-tests.py b'},
+                                   {'run': 'python3 scripts/ci/flake-retry.py -- x'}]))
+        bad = {
+            'assert after the test step': [good[1], good[0]],
+            'assert after meson test in one run': [{'run': 'meson test -C b\n'
+                                                           'python3 scripts/ci/assert-gateway-tests.py b'}],
+            'assert after meson<2 spaces>test in one run': [{'run': 'meson  test -C b\n'
+                                                                    'python3 scripts/ci/assert-gateway-tests.py b'}],
+            'assert after meson<tab>test in one run': [{'run': 'meson\ttest -C b\n'
+                                                               'python3 scripts/ci/assert-gateway-tests.py b'}],
+            'assert after a continued meson test': [{'run': 'meson \\\n  test -C b\n'
+                                                            'python3 scripts/ci/assert-gateway-tests.py b'}],
+            'assert after flake-retry in one run': [{'run': 'python3 scripts/ci/flake-retry.py -- x\n'
+                                                            'python3 scripts/ci/assert-gateway-tests.py b'}],
+            'assert on the test line itself, after': [{'run': 'meson test -C b; '
+                                                              'python3 scripts/ci/assert-gateway-tests.py b'}],
+            'no assert at all': [good[1]],
+            'assert only in a comment': [{'run': '# python3 scripts/ci/assert-gateway-tests.py b'}, good[1]],
+            '|| true': [{'run': 'python3 scripts/ci/assert-gateway-tests.py b || true'}, good[1]],
+            '|| true after a continuation': [{'run': 'python3 scripts/ci/assert-gateway-tests.py \\\n b || true'},
+                                             good[1]],
+            '|| :': [{'run': 'python3 scripts/ci/assert-gateway-tests.py b || :'}, good[1]],
+            'continue-on-error: true': [dict(good[0], **{'continue-on-error': True}), good[1]],
+            "continue-on-error: 'true'": [dict(good[0], **{'continue-on-error': 'true'}), good[1]],
+            "continue-on-error: ${{ true }}": [dict(good[0], **{'continue-on-error': '${{ true }}'}), good[1]],
+            'if: false': [dict(good[0], **{'if': False}), good[1]],
+            "if: ${{ false }}": [dict(good[0], **{'if': '${{ false }}'}), good[1]],
+            "if: 'false'": [dict(good[0], **{'if': 'false'}), good[1]],
+            'only a dead assert before, a live one after': [dict(good[0], **{'if': False}), good[1],
+                                                            {'run': 'python3 scripts/ci/assert-gateway-tests.py b'}],
+        }
+        for why, steps in bad.items():
+            with self.subTest(mutant=why):
+                self.assertIsNotNone(problem(steps), why)
+
+    def test_every_job_that_runs_tests_asserts_the_gateway(self):
+        # The per-`meson setup` check above only sees the files it names and
+        # only a literal `meson setup`. This one discovers EVERY workflow
+        # (glob, so a new or renamed file is covered) and, for each job that
+        # runs tests (`meson test`, or flake-retry.py which wraps it), requires
+        # an assert-gateway-tests.py that runs strictly before the first test
+        # invocation and can fail (see _gateway_assert_problem).
+        # fork-dynamic-review.yml configures through scripts/setup.sh and
+        # ran `meson test` with no Erlang and no assertion until this check
+        # existed. Comment lines are ignored.
+        import yaml
+        found = set()
+        for path in sorted(glob.glob(os.path.join(ROOT, '.github', 'workflows', '*.yml'))):
+            wf = os.path.basename(path)
+            with open(path, encoding='utf-8') as f:
+                doc = yaml.safe_load(f)
+            for job, body in (doc.get('jobs') or {}).items():
+                steps = body.get('steps') or []
+                if not any(self.TEST_RE.search('\n'.join(
+                        l for l in str(st.get('run') or '').split('\n')
+                        if not l.lstrip().startswith('#'))) for st in steps):
+                    continue
+                found.add((wf, job))
+                with self.subTest(workflow=wf, job=job):
+                    self.assertIsNone(self._gateway_assert_problem(steps))
+        # Guard the discovery itself: it must still see the legs the doc names.
+        for want in (('ci.yml', 'linux'), ('ci.yml', 'windows'), ('ci.yml', 'macos'),
+                     ('fork-dynamic-review.yml', 'linux'), ('nightly.yml', 'coverage')):
+            self.assertIn(want, found)
+
+    def test_ci_setup_beam_isolates_the_tool_cache_for_trusted_forks(self):
+        # setup-beam on a self-hosted pool installs erl into RUNNER_TOOL_CACHE,
+        # which later normal jobs on the same agent execute. A trusted-fork run
+        # must get a per-run temp dir instead (#4852). Both ci.yml legs that
+        # install Erlang must switch on trusted_execution.
+        import yaml
+        with open(os.path.join(ROOT, '.github', 'workflows', 'ci.yml'), encoding='utf-8') as f:
+            doc = yaml.safe_load(f)
+        legs = set()
+        for job, body in doc['jobs'].items():
+            for step in body.get('steps') or []:
+                if str(step.get('uses', '')).startswith('erlef/setup-beam@'):
+                    legs.add(job)
+                    with self.subTest(job=job):
+                        cache = str((step.get('env') or {}).get('RUNNER_TOOL_CACHE', ''))
+                        self.assertIn('trusted_execution', cache)
+                        self.assertIn('runner.temp', cache)
+        self.assertEqual(legs, {'linux', 'macos'})
+
+
+if __name__ == '__main__':
+    unittest.main()

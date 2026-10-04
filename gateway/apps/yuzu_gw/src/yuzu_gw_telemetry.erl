@@ -11,7 +11,7 @@
 -module(yuzu_gw_telemetry).
 
 -export([setup/0, handle_event/4]).
--export([mgmt_auth_reject_reasons/0]).
+-export([mgmt_auth_reject_reasons/0, heartbeat_reject_reasons/0]).
 
 %% All telemetry event names used by the gateway.
 -define(EVENTS, [
@@ -42,6 +42,10 @@
     %% Guardian side-channel forwarding (agent drift events -> control plane)
     [yuzu, gw, guardian, forward_accepted],
     [yuzu, gw, guardian, forward_dropped],
+
+    %% Heartbeat admission (connection-bound sessions)
+    [yuzu, gw, heartbeat, rejected],
+    [yuzu, gw, heartbeat, session_mismatch],
 
     %% Mgmt-plane peer authorization (#1422)
     [yuzu, gw, mgmt_auth, rejected],
@@ -209,6 +213,22 @@ handle_event([yuzu, gw, mgmt_auth, rejected], #{count := N}, Meta, _Config) ->
 handle_event([yuzu, gw, mgmt_auth, pin_unresolved], #{count := N}, _Meta, _Config) ->
     prometheus_counter:inc(yuzu_gw_mgmt_auth_pin_unresolved_total, [], N);
 
+%% Heartbeat admission. `rejected' counts heartbeats refused because no usable
+%% binding exists, labeled by the closed reason-atom set from
+%% yuzu_gw_heartbeat_admission (never anything caller-supplied, so a sender
+%% cannot control label cardinality). `session_mismatch' counts a held session
+%% whose heartbeat arrived on a different connection; it carries the fixed
+%% event="security" label so it routes to the SIEM like the server's
+%% session-binding counters.
+handle_event([yuzu, gw, heartbeat, rejected], #{count := N}, Meta, _Config) ->
+    Reason = maps:get(reason, Meta, unknown_session),
+    prometheus_counter:inc(yuzu_gw_heartbeat_rejected_total,
+                           [atom_to_binary(Reason, utf8)], N);
+
+handle_event([yuzu, gw, heartbeat, session_mismatch], #{count := N}, _Meta, _Config) ->
+    prometheus_counter:inc(yuzu_gw_heartbeat_session_mismatch_total,
+                           [<<"security">>], N);
+
 handle_event([yuzu, gw, cluster, node_up], _Measurements, Meta, _Config) ->
     Node = maps:get(node, Meta, <<"unknown">>),
     prometheus_counter:inc(yuzu_gw_cluster_events_total, [<<"node_up">>, Node], 1);
@@ -258,6 +278,21 @@ mgmt_auth_reject_reasons() ->
     [internal_error, no_pins_configured, no_pins_resolved, pin_mismatch,
      missing_server_auth_eku, bad_peer_cert, bad_pin_config].
 
+%% The closed set of `reason' values on yuzu_gw_heartbeat_rejected_total: every
+%% `{reject, Reason}' yuzu_gw_heartbeat_admission:check/2 returns except
+%% connection_mismatch, which is its own family. yuzu_gw_telemetry_tests
+%% checks it against that module's source.
+-spec heartbeat_reject_reasons() -> [atom()].
+heartbeat_reject_reasons() ->
+    [unknown_session, no_connection, registry_unavailable].
+
+%% Every `{help, ...}` string below MUST be plain ASCII (#4707, #5177). This
+%% source file is UTF-8, so a literal em dash or smart quote becomes a charlist
+%% element > 255, and prometheus_text_format:escape_string/2 calls
+%% iolist_to_binary/1 on it, which raises badarg on EVERY scrape: :9568/metrics
+%% answers a bare inets HTTP 500 for the whole registry, not just the one
+%% metric. yuzu_gw_telemetry_tests:metrics_scrape_renders_test_/0 renders the
+%% real registry through the real formatter to catch this.
 declare_metrics() ->
     %% Counters
     prometheus_counter:declare([
@@ -362,6 +397,39 @@ declare_metrics() ->
     [prometheus_counter:inc(yuzu_gw_mgmt_auth_rejected_total,
                             [atom_to_binary(R, utf8)], 0)
      || R <- mgmt_auth_reject_reasons()],
+    prometheus_counter:declare([
+        {name, yuzu_gw_heartbeat_rejected_total},
+        {labels, [reason]},
+        {help, "Agent Heartbeat calls rejected before queueing because no "
+               "usable session binding exists, by reason (closed set: "
+               "unknown_session = not held by this node, no_connection = "
+               "no connection key to compare, registry_unavailable = the "
+               "session index does not exist). The agent re-registers on the "
+               "NOT_FOUND answer when its build includes the reconnect fix "
+               "(see the gateway manual); older agents only log it. A held "
+               "session whose heartbeat arrived on "
+               "a different connection is counted in "
+               "yuzu_gw_heartbeat_session_mismatch_total instead"}]),
+    prometheus_counter:declare([
+        {name, yuzu_gw_heartbeat_session_mismatch_total},
+        {labels, [event]},
+        {help, "Agent Heartbeat calls rejected because the session is held by "
+               "this node but the call arrived on a different connection than "
+               "the one that opened it. Also rises when an HTTP/2 proxy "
+               "between agents and the gateway spreads one agent's calls over "
+               "several connections. A rise of one per affected agent is "
+               "expected when an agent's connection is replaced while its "
+               "session is still held (observed with an injected GOAWAY, a "
+               "test-only trigger; not observed with an abrupt close or a "
+               "gateway restart). "
+               "Carries event=security for SIEM routing"}]),
+    %% Create every series at 0 now (a series that first appears already at 1
+    %% is invisible to increase()).
+    [prometheus_counter:inc(yuzu_gw_heartbeat_rejected_total,
+                            [atom_to_binary(R, utf8)], 0)
+     || R <- heartbeat_reject_reasons()],
+    prometheus_counter:inc(yuzu_gw_heartbeat_session_mismatch_total,
+                           [<<"security">>], 0),
     prometheus_counter:declare([
         {name, yuzu_gw_mgmt_auth_pin_unresolved_total},
         {labels, []},
