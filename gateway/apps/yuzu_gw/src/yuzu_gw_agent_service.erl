@@ -36,6 +36,19 @@ register(Ctx, RegisterReq) ->
     PeerAddr = maps:get(<<":authority">>, Headers,
                         maps:get(<<"x-forwarded-for">>, Headers, <<"unknown">>)),
 
+    %% The connection's session quota is asked BEFORE the registration goes
+    %% upstream: a refusal after it would leave a session on the server that never
+    %% subscribes. store_pending/2 below checks again where the row is stored.
+    AgentInfo0 = maps:get(info, RegisterReq, maps:get(<<"info">>, RegisterReq, #{})),
+    case yuzu_gw_registry:session_admission(yuzu_gw_conn:key_from_ctx(Ctx),
+                                            extract_agent_id(AgentInfo0)) of
+        ok ->
+            register_upstream(Ctx, RegisterReq, PeerAddr);
+        {error, session_limit} ->
+            session_limit_error()
+    end.
+
+register_upstream(Ctx, RegisterReq, PeerAddr) ->
     case yuzu_gw_upstream:proxy_register(RegisterReq) of
         {ok, Response} when is_map(Response) ->
             %% Stash the session_id and agent_info; the agent process is
@@ -67,7 +80,9 @@ register(Ctx, RegisterReq) ->
                     %% matched by Subscribe, so the agent must register again.
                     logger:warning("Register failed: registry_unavailable"),
                     {grpc_error, {?GRPC_STATUS_INTERNAL,
-                                  <<"Registration failed: registry unavailable">>}}
+                                  <<"Registration failed: registry unavailable">>}};
+                {error, session_limit} ->
+                    session_limit_error()
             end;
 
         {ok, _NotAMap} ->
@@ -127,6 +142,16 @@ subscribe(Ref, State) ->
                     %% written by a pre-upgrade Register still resolves.
                     RegisterReq = maps:get(register_req, Pending, #{}),
 
+                    %% The connection's session quota is asked before the agent
+                    %% process is started: a refusal then costs no process and
+                    %% no crash report. The registry asks again at the live
+                    %% insert, where the decision is made.
+                    ConnKey = yuzu_gw_conn:key_from_stream(State),
+                    case yuzu_gw_registry:session_admission(ConnKey, AgentId) of
+                        ok                     -> ok;
+                        {error, session_limit} -> throw(session_limit_error())
+                    end,
+
                     %% Spawn the agent process — it owns this stream.
                     %% We pass stream_pid=self() so the agent process sends
                     %% commands back to us via {send_command, Cmd} messages.
@@ -139,11 +164,16 @@ subscribe(Ref, State) ->
                              agent_info   => AgentInfo,
                              register_req => RegisterReq,
                              peer_addr    => PeerAddr,
-                             conn_key     => yuzu_gw_conn:key_from_stream(State)},
+                             conn_key     => ConnKey},
 
                     case yuzu_gw_agent_sup:start_agent(Args) of
                         {ok, AgentPid} ->
                             stream_loop(Ref, State, AgentPid);
+
+                        {error, session_limit} ->
+                            %% Counted and logged by the registry (one WARN per
+                            %% second, naming only the cap).
+                            throw(session_limit_error());
 
                         {error, Reason} ->
                             logger:error("Failed to start agent process for ~s: ~p",
@@ -265,6 +295,13 @@ report_inventory(Ctx, InventoryReport) ->
 %%--------------------------------------------------------------------
 %% Internal
 %%--------------------------------------------------------------------
+
+%% The answer to a session refused by the per-connection quota: UNAVAILABLE, the
+%% retryable status (the agent backs off and registers again; the quota frees as
+%% the connection's other sessions end). No request in it, and no id.
+session_limit_error() ->
+    {grpc_error, {?GRPC_STATUS_UNAVAILABLE,
+                  <<"Too many agent sessions on this connection">>}}.
 
 extract_agent_id(AgentInfo) ->
     maps:get(<<"agent_id">>, AgentInfo,

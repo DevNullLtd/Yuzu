@@ -158,7 +158,12 @@ init(#{agent_id := AgentId, agent_info := AgentInfo,
         {error, registry_unavailable} ->
             %% A fixed reason: an init failure is printed by the supervisor and
             %% by the Subscribe handler, and must not carry the request.
-            {stop, registry_unavailable}
+            {stop, registry_unavailable};
+        {error, session_limit} ->
+            %% The connection holds its quota of other agents' sessions (the
+            %% registry counted and logged it): refuse this one. A fixed reason,
+            %% for the same reason as above.
+            {stop, session_limit}
     end.
 
 %% The rest of init/1, once the agent is in the routing table.

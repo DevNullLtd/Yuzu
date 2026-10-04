@@ -19,6 +19,26 @@
 %%%
 %%% This gen_server owns the ETS tables and coordinates pg group
 %%% membership on behalf of agent processes.
+%%%
+%%% Sessions per connection. One enrolled connection could otherwise hold any
+%%% number of sessions (a Register without a Subscribe stores a pending row, and
+%%% every session may carry a fleet snapshot of up to 3 MiB into the heartbeat
+%%% buffer). A connection key (see `yuzu_gw_conn') may hold at most
+%%% `max_sessions_per_connection' (default 8, valid 1..1000) DISTINCT agents'
+%%% sessions, pending plus live, counted without the agent being (re)registered:
+%%% a reconnect or supersede of the same agent id replaces its own session and
+%%% never meets the cap. The cap is applied where sessions are stored:
+%%% store_pending/2 (and session_admission/2, which Register asks before it
+%%% proxies the registration upstream, so a refused one leaves nothing on the
+%%% server) and the live insert in `register'. Both answer
+%%% `{error, session_limit}'. The pending count is a scan of the pending table
+%%% (short lived rows), the live count a lookup in a per-connection index owned by
+%%% this process (an unnamed bag whose id is kept in persistent_term), kept in
+%%% step with the session index by index_session/4 and unindex_session/2 only, so
+%%% every removal path (deregister, supersede, a dead process) releases the
+%%% count. A connection key of `undefined' is never counted. The check and the
+%%% pending insert are not one atomic step: concurrent Registers on one connection
+%%% can overshoot by at most the connection's concurrent stream limit.
 %%% @end
 %%%-------------------------------------------------------------------
 -module(yuzu_gw_registry).
@@ -44,7 +64,8 @@
          agent_count/0,
          list_agents/2,
          store_pending/2,
-         take_pending/1]).
+         take_pending/1,
+         session_admission/2]).
 
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, code_change/3,
@@ -57,6 +78,18 @@
 -define(PG_SCOPE, yuzu_gw).
 -define(PENDING_TTL_MS, 120000).     %% 2 minutes
 -define(PENDING_SWEEP_MS, 60000).    %% 1 minute
+%% max_sessions_per_connection: distinct agents' sessions one connection may
+%% hold. Valid 1..1000 (default 8); anything else logs a warning naming the key
+%% and takes the default. Read once at registry start.
+-define(DEFAULT_MAX_SESSIONS, 8).
+-define(MIN_MAX_SESSIONS, 1).
+-define(MAX_MAX_SESSIONS, 1000).
+%% persistent_term keys: the configured cap, the per-connection index (an
+%% unnamed table) and the stamp that limits the refusal WARN to one per second.
+-define(MAX_SESSIONS_KEY, {?MODULE, max_sessions_per_connection}).
+-define(CONN_INDEX_KEY, {?MODULE, conn_index}).
+-define(LIMIT_WARN_KEY, {?MODULE, session_limit_warn}).
+-define(LIMIT_WARN_INTERVAL_MS, 1000).
 
 -record(state, {
     monitor_refs :: #{reference() => binary()},
@@ -81,7 +114,7 @@ start_link() ->
 %% replay path; it records an empty request, so such an agent is simply
 %% skipped by the replay drip.
 -spec register_agent(binary(), pid(), binary() | undefined,
-                     [binary()], binary()) -> ok | {error, registry_unavailable}.
+                     [binary()], binary()) -> ok | {error, registry_unavailable | session_limit}.
 register_agent(AgentId, Pid, SessionId, Plugins, Hostname) ->
     register_agent(AgentId, Pid, SessionId, Plugins, Hostname, #{}).
 
@@ -92,7 +125,8 @@ register_agent(AgentId, Pid, SessionId, Plugins, Hostname) ->
 %% agent originally sent; it is stashed so the upstream client can
 %% re-proxy it on reconnect (see all_register_reqs/0).
 -spec register_agent(binary(), pid(), binary() | undefined,
-                     [binary()], binary(), map()) -> ok | {error, registry_unavailable}.
+                     [binary()], binary(), map()) ->
+          ok | {error, registry_unavailable | session_limit}.
 register_agent(AgentId, Pid, SessionId, Plugins, Hostname, RegisterReq) ->
     register_agent(AgentId, Pid, SessionId, Plugins, Hostname, RegisterReq, undefined).
 
@@ -104,13 +138,16 @@ register_agent(AgentId, Pid, SessionId, Plugins, Hostname, RegisterReq) ->
 %% register with `undefined', which admits nothing. A session id of
 %% `undefined' is not indexed at all.
 %%
+%% `{error, session_limit}' when the connection already holds the configured
+%% number of other agents' sessions (see the module doc); nothing is changed.
+%%
 %% Never exits the caller: a registry that is not running, stalls past the call
 %% timeout or dies serving the call gives `{error, registry_unavailable}'. The
 %% exit of a gen_server:call carries the request, which here holds the stored
 %% RegisterRequest (enrollment token, certificate, CSR). See yuzu_gw_safe_call.
 -spec register_agent(binary(), pid(), binary() | undefined,
                      [binary()], binary(), map(), yuzu_gw_conn:key()) ->
-          ok | {error, registry_unavailable}.
+          ok | {error, registry_unavailable | session_limit}.
 register_agent(AgentId, Pid, SessionId, Plugins, Hostname, RegisterReq, ConnKey) ->
     yuzu_gw_safe_call:call(?SERVER,
                            {register, AgentId, Pid, SessionId, Plugins, Hostname, RegisterReq,
@@ -453,12 +490,88 @@ list_agents(Limit, Cursor) ->
 %% RegisterRequest (enrollment token, certificate, CSR) and which grpcbox logs.
 %% The error is caught here and the fixed {error, registry_unavailable} returned:
 %% no stacktrace, no arguments.
--spec store_pending(binary(), map()) -> ok | {error, registry_unavailable}.
+-spec store_pending(binary(), map()) -> ok | {error, registry_unavailable | session_limit}.
 store_pending(SessionId, Info) ->
-    try ets:insert(?PENDING_TABLE, {SessionId, Info, erlang:monotonic_time(millisecond)}) of
-        true -> ok
-    catch
-        error:badarg -> {error, registry_unavailable}
+    case session_admission(maps:get(conn_key, Info, undefined),
+                           maps:get(agent_id, Info, undefined)) of
+        ok ->
+            try ets:insert(?PENDING_TABLE,
+                           {SessionId, Info, erlang:monotonic_time(millisecond)}) of
+                true -> ok
+            catch
+                error:badarg -> {error, registry_unavailable}
+            end;
+        {error, session_limit} = Refused ->
+            Refused
+    end.
+
+%% @doc Whether the connection ConnKey may take a session for AgentId: `ok', or
+%% `{error, session_limit}' when it already holds `max_sessions_per_connection'
+%% other agents' sessions (pending or live). A refusal is counted
+%% (yuzu_gw_session_limit_rejected_total) and logged as one WARN per second that
+%% names only the cap. A `undefined' key is always admitted. Register calls this
+%% before it proxies the registration upstream; store_pending/2 and the live
+%% insert call it again, so the decision is made where the session is stored.
+-spec session_admission(yuzu_gw_conn:key(), term()) -> ok | {error, session_limit}.
+session_admission(undefined, _AgentId) ->
+    ok;
+session_admission(ConnKey, AgentId) ->
+    Cap = max_sessions_per_connection(),
+    case others_on_connection(ConnKey, AgentId) >= Cap of
+        true ->
+            telemetry:execute([yuzu, gw, session, limit_rejected], #{count => 1}, #{}),
+            warn_session_limit(Cap),
+            {error, session_limit};
+        false ->
+            ok
+    end.
+
+max_sessions_per_connection() ->
+    persistent_term:get(?MAX_SESSIONS_KEY, ?DEFAULT_MAX_SESSIONS).
+
+%% The number of distinct agents other than AgentId that hold a session, pending
+%% (not past its TTL) or live, on ConnKey. A table that does not exist counts as
+%% empty: its absence is reported by the calls that need it, not here.
+others_on_connection(ConnKey, AgentId) ->
+    Agents = lists:usort(live_agents(ConnKey) ++ pending_agents(ConnKey)),
+    length([A || A <- Agents, A =/= AgentId]).
+
+live_agents(ConnKey) ->
+    case persistent_term:get(?CONN_INDEX_KEY, undefined) of
+        undefined ->
+            [];
+        Index ->
+            try [A || {_, A, _} <- ets:lookup(Index, ConnKey)]
+            catch error:badarg -> []
+            end
+    end.
+
+pending_agents(ConnKey) ->
+    Oldest = erlang:monotonic_time(millisecond) - ?PENDING_TTL_MS,
+    try ets:select(?PENDING_TABLE,
+                   [{{'_', #{conn_key => ConnKey, agent_id => '$1'}, '$2'},
+                     [{'>=', '$2', Oldest}], ['$1']}])
+    catch error:badarg -> []
+    end.
+
+%% At most one WARN per second, from any process; the stamp is created by init/1
+%% (without it nothing is logged: the registry is not running).
+warn_session_limit(Cap) ->
+    case persistent_term:get(?LIMIT_WARN_KEY, undefined) of
+        undefined ->
+            ok;
+        Ref ->
+            Now = erlang:monotonic_time(millisecond),
+            Last = atomics:get(Ref, 1),
+            case Now - Last >= ?LIMIT_WARN_INTERVAL_MS
+                 andalso atomics:compare_exchange(Ref, 1, Last, Now) =:= ok of
+                true ->
+                    logger:warning("Registration refused: a connection already holds "
+                                   "the configured ~b agent sessions "
+                                   "(max_sessions_per_connection)", [Cap]);
+                false ->
+                    ok
+            end
     end.
 
 %% @doc Atomically retrieve-and-delete pending registration info.
@@ -510,38 +623,46 @@ init([]) ->
     %% protected: only this process writes the session index; heartbeat
     %% handler processes read it.
     ets:new(?SESSIONS_TABLE, [named_table, set, protected, {read_concurrency, true}]),
+    %% The per-connection index: unnamed, so a restarting registry never meets
+    %% the previous one's table, and its id is published for the handlers.
+    ConnIndex = ets:new(yuzu_gw_conn_sessions, [bag, protected, {read_concurrency, true}]),
+    persistent_term:put(?CONN_INDEX_KEY, ConnIndex),
+    put_if_changed(?MAX_SESSIONS_KEY,
+                   yuzu_gw_env:env_int(max_sessions_per_connection, ?DEFAULT_MAX_SESSIONS,
+                                       ?MIN_MAX_SESSIONS, ?MAX_MAX_SESSIONS)),
+    init_limit_warn_stamp(),
     TRef = erlang:send_after(?PENDING_SWEEP_MS, self(), sweep_pending),
     {ok, #state{monitor_refs = #{}, sweep_timer = TRef}}.
 
-handle_call({register, AgentId, Pid, SessionId, Plugins, Hostname, RegisterReq, ConnKey},
-            _From, #state{monitor_refs = Mons} = State) ->
-    %% Remove any stale entry for this agent_id (returns cleaned Mons).
-    Mons1 = maybe_cleanup(AgentId, Mons),
+%% A persistent_term:put over a different value costs a global GC: skip it
+%% when the value is already there.
+put_if_changed(Key, Value) ->
+    case persistent_term:get(Key, undefined) of
+        Value -> ok;
+        _     -> persistent_term:put(Key, Value)
+    end.
 
-    %% Insert into ETS. The trailing field is the verbatim RegisterRequest,
-    %% kept so yuzu_gw_upstream can re-proxy it on upstream reconnect.
-    Now = erlang:system_time(millisecond),
-    ets:insert(?TABLE, {AgentId, Pid, node(Pid), SessionId, Plugins, Now,
-                        Hostname, RegisterReq}),
+%% A stamp old enough that the first refusal logs; an existing one is reset, not
+%% replaced.
+init_limit_warn_stamp() ->
+    Old = erlang:monotonic_time(millisecond) - 2 * ?LIMIT_WARN_INTERVAL_MS,
+    case persistent_term:get(?LIMIT_WARN_KEY, undefined) of
+        undefined ->
+            Ref = atomics:new(1, [{signed, true}]),
+            atomics:put(Ref, 1, Old),
+            persistent_term:put(?LIMIT_WARN_KEY, Ref);
+        Ref ->
+            atomics:put(Ref, 1, Old)
+    end.
 
-    %% Index the session for heartbeat admission. A session id of
-    %% `undefined' (the routing-focused test path) is not indexed.
-    index_session(SessionId, AgentId, Pid, ConnKey),
-
-    %% Join pg groups. `{agent, AgentId}` (HA WS-4 4.3a) is the cross-node
-    %% location-transparency group `lookup/1`'s fallback reads — see that
-    %% function's doc comment.
-    pg:join(?PG_SCOPE, all_agents, Pid),
-    pg:join(?PG_SCOPE, {agent, AgentId}, Pid),
-    lists:foreach(fun(Plugin) ->
-        pg:join(?PG_SCOPE, {plugin, Plugin}, Pid)
-    end, Plugins),
-
-    %% Monitor the agent process for automatic cleanup.
-    MonRef = monitor(process, Pid),
-    Mons2 = Mons1#{MonRef => AgentId},
-
-    {reply, ok, State#state{monitor_refs = Mons2}};
+handle_call({register, AgentId, _Pid, _SessionId, _Plugins, _Hostname, _RegisterReq, ConnKey}
+            = Request, _From, State) ->
+    %% The cap is checked before anything is changed, so a refused registration
+    %% leaves the agent's older one in place.
+    case session_admission(ConnKey, AgentId) of
+        ok                     -> do_register(Request, State);
+        {error, session_limit} -> {reply, {error, session_limit}, State}
+    end;
 
 handle_call(_Request, _From, State) ->
     {reply, {error, unknown_call}, State}.
@@ -632,6 +753,36 @@ redact_message(Msg)                      -> Msg.
 %%% Internal
 %%%===================================================================
 
+do_register({register, AgentId, Pid, SessionId, Plugins, Hostname, RegisterReq, ConnKey},
+            #state{monitor_refs = Mons} = State) ->
+    %% Remove any stale entry for this agent_id (returns cleaned Mons).
+    Mons1 = maybe_cleanup(AgentId, Mons),
+
+    %% Insert into ETS. The trailing field is the verbatim RegisterRequest,
+    %% kept so yuzu_gw_upstream can re-proxy it on upstream reconnect.
+    Now = erlang:system_time(millisecond),
+    ets:insert(?TABLE, {AgentId, Pid, node(Pid), SessionId, Plugins, Now,
+                        Hostname, RegisterReq}),
+
+    %% Index the session for heartbeat admission. A session id of
+    %% `undefined' (the routing-focused test path) is not indexed.
+    index_session(SessionId, AgentId, Pid, ConnKey),
+
+    %% Join pg groups. `{agent, AgentId}` (HA WS-4 4.3a) is the cross-node
+    %% location-transparency group `lookup/1`'s fallback reads; see that
+    %% function's doc comment.
+    pg:join(?PG_SCOPE, all_agents, Pid),
+    pg:join(?PG_SCOPE, {agent, AgentId}, Pid),
+    lists:foreach(fun(Plugin) ->
+        pg:join(?PG_SCOPE, {plugin, Plugin}, Pid)
+    end, Plugins),
+
+    %% Monitor the agent process for automatic cleanup.
+    MonRef = monitor(process, Pid),
+    Mons2 = Mons1#{MonRef => AgentId},
+
+    {reply, ok, State#state{monitor_refs = Mons2}}.
+
 do_deregister(AgentId, #state{monitor_refs = Mons} = State) ->
     case ets:lookup(?TABLE, AgentId) of
         [{_, Pid, _, SessionId, Plugins, _, _, _}] ->
@@ -679,8 +830,14 @@ leave_groups(AgentId, Pid, Plugins) ->
 index_session(undefined, _AgentId, _Pid, _ConnKey) ->
     ok;
 index_session(SessionId, AgentId, Pid, ConnKey) ->
-    try ets:insert(?SESSIONS_TABLE, {SessionId, AgentId, Pid, ConnKey}) of
-        true -> ok
+    try
+        %% A row already indexed under this session id is replaced: its
+        %% per-connection entry goes with it.
+        conn_index_remove(SessionId),
+        ets:insert(?SESSIONS_TABLE, {SessionId, AgentId, Pid, ConnKey}),
+        conn_index_add(ConnKey, AgentId, SessionId)
+    of
+        _ -> ok
     catch
         error:badarg ->
             warn_session_index_missing()
@@ -688,16 +845,57 @@ index_session(SessionId, AgentId, Pid, ConnKey) ->
 
 %% Delete the index entry for SessionId only if it belongs to Pid. The key is
 %% bound in the match head, so this is a single-key operation. A missing table
-%% is tolerated for the reason given at index_session/4.
+%% is tolerated for the reason given at index_session/4. The per-connection
+%% entry of the row goes first (this is the only place a session leaves the
+%% index, so it is the only place the count is released).
 unindex_session(undefined, _Pid) ->
     ok;
 unindex_session(SessionId, Pid) ->
-    try ets:select_delete(?SESSIONS_TABLE,
-                          [{{SessionId, '_', Pid, '_'}, [], [true]}]) of
+    try
+        case ets:lookup(?SESSIONS_TABLE, SessionId) of
+            [{_, AgentId, Pid, ConnKey}] -> conn_index_delete(ConnKey, AgentId, SessionId);
+            _                            -> ok
+        end,
+        ets:select_delete(?SESSIONS_TABLE, [{{SessionId, '_', Pid, '_'}, [], [true]}])
+    of
         _ -> ok
     catch
         error:badarg ->
             ok
+    end.
+
+%% The per-connection index: {ConnKey, AgentId, SessionId}, one object per
+%% indexed session with a connection key. Written by this process only.
+conn_index_add(undefined, _AgentId, _SessionId) ->
+    ok;
+conn_index_add(ConnKey, AgentId, SessionId) ->
+    with_conn_index(fun(Index) -> ets:insert(Index, {ConnKey, AgentId, SessionId}) end).
+
+conn_index_delete(undefined, _AgentId, _SessionId) ->
+    ok;
+conn_index_delete(ConnKey, AgentId, SessionId) ->
+    with_conn_index(fun(Index) -> ets:delete_object(Index, {ConnKey, AgentId, SessionId}) end).
+
+%% The per-connection index is a secondary structure like the session index: a
+%% registry that runs without it (new code loaded into a running node) skips it,
+%% and the count then reads as empty.
+with_conn_index(Fun) ->
+    case persistent_term:get(?CONN_INDEX_KEY, undefined) of
+        undefined ->
+            ok;
+        Index ->
+            try Fun(Index) of
+                _ -> ok
+            catch
+                error:badarg -> ok
+            end
+    end.
+
+%% Drop the per-connection entry of whatever row is indexed under SessionId.
+conn_index_remove(SessionId) ->
+    case ets:lookup(?SESSIONS_TABLE, SessionId) of
+        [{_, AgentId, _Pid, ConnKey}] -> conn_index_delete(ConnKey, AgentId, SessionId);
+        []                            -> ok
     end.
 
 %% One warning per registry process, not one per registration.

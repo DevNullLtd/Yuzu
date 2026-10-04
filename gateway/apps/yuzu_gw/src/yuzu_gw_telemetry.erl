@@ -52,6 +52,9 @@
     [yuzu, gw, heartbeat, coalesced],
     [yuzu, gw, heartbeat, buffer_dropped],
 
+    %% Registrations refused by the per-connection session quota
+    [yuzu, gw, session, limit_rejected],
+
     %% Mgmt-plane peer authorization (#1422)
     [yuzu, gw, mgmt_auth, rejected],
     [yuzu, gw, mgmt_auth, pin_unresolved],
@@ -285,6 +288,11 @@ handle_event([yuzu, gw, heartbeat, buffer_dropped], #{count := N}, Meta, _Config
     end,
     prometheus_counter:inc(yuzu_gw_heartbeat_buffer_dropped_total,
                            [atom_to_binary(Reason, utf8)], N);
+
+%% A Register or Subscribe refused because its connection already holds
+%% `max_sessions_per_connection' agent sessions (yuzu_gw_registry).
+handle_event([yuzu, gw, session, limit_rejected], #{count := N}, _Meta, _Config) ->
+    prometheus_counter:inc(yuzu_gw_session_limit_rejected_total, [], N);
 
 handle_event([yuzu, gw, cluster, node_up], _Measurements, Meta, _Config) ->
     Node = maps:get(node, Meta, <<"unknown">>),
@@ -542,6 +550,12 @@ declare_metrics() ->
               <<"heartbeat_oversize">>, <<"heartbeat_invalid">>,
               <<"chunk_rejected">>]],
     prometheus_counter:inc(yuzu_gw_heartbeat_coalesced_total, [], 0),
+    prometheus_counter:declare([
+        {name, yuzu_gw_session_limit_rejected_total},
+        {labels, []},
+        {help, "Registrations refused because one connection already holds the "
+               "configured number of agent sessions"}]),
+    prometheus_counter:inc(yuzu_gw_session_limit_rejected_total, [], 0),
     prometheus_counter:declare([
         {name, yuzu_gw_mgmt_auth_pin_unresolved_total},
         {labels, []},
