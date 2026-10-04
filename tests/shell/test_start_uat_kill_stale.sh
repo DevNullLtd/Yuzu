@@ -20,27 +20,42 @@ trap 'rm -rf "$TMP"' EXIT
 source "$SCRIPT"
 # The script hard-wires these (no env override); point them at the temp dir.
 UAT_DIR="$TMP/uat"; PID_DIR="$UAT_DIR/pids"; BUILDDIR="$TMP/build"; GATEWAY_DIR="$TMP/gw"
+# reset() rm -rf's UAT_DIR: never let it point outside the temp dir.
+[[ $UAT_DIR == "$TMP"/* && $PID_DIR == "$TMP"/* ]] || { echo 'refusing: UAT_DIR not under TMP' >&2; exit 2; }
 
 # shellcheck disable=SC2032  # shadows the builtin for the sourced functions only
 kill() {
   case $1 in
-    -0) [[ -e $TMP/alive/$2 ]] ;;
+    # eperm: alive but not signalable by this user (root-owned sudo parent) -> kill -0 fails
+    -0) [[ -e $TMP/alive/$2 && ! -e $TMP/eperm/$2 ]] ;;
     *) printf '%s\n' "$*" >> "$TMP/kills"
        # unkillable: fail like EPERM and leave the process alive
        if [[ -e $TMP/unkillable/${*: -1} ]]; then return 1; fi
-       rm -f "$TMP/alive/${*: -1}" ;;
+       # vanish: exited between the ownership check and the kill -> ESRCH, nothing left
+       if [[ -e $TMP/vanish/${*: -1} ]]; then rm -f "$TMP/alive/${*: -1}"; return 1; fi
+       # a successful kill also frees the busy ports (the owned stack's listeners)
+       rm -f "$TMP/alive/${*: -1}" "$TMP/busy" ;;
   esac
 }
 sudo()  { echo "sudo $*" >> "$TMP/sudo"; return 1; }
-ps()    { cat "$TMP/cmd/${*: -1}" 2>/dev/null; }
+# Liveness comes from alive/ (what kill removes), like the real ps -p.
+ps()    { local p=${*: -1}; [[ -e $TMP/alive/$p ]] || return 1; [[ $* == *command=* ]] && { cat "$TMP/cmd/$p" 2>/dev/null || true; }; return 0; }
 pgrep() { case $1 in -P) cat "$TMP/children/$2" 2>/dev/null ;; *) echo "pgrep $*" >> "$TMP/violations"; return 1 ;; esac; }
 pkill() { echo "pkill $*" >> "$TMP/violations"; return 1; }
 lsof()  { printf 'COMMAND PID\nfake-holder 777 ...\n'; }
-docker() { echo "docker $*" >> "$TMP/docker-calls"; return 1; }
+docker() { echo "docker $*" >> "$TMP/docker-calls"; [[ -e $TMP/docker-ok ]]; }
 sleep() { :; }
 have_port_inspector() { [[ ! -e $TMP/no-inspector ]]; }
-# Busy ports: persistent unless the fake kill of a PID clears them (see owned case).
-listening_ports_among() { cat "$TMP/busy" 2>/dev/null || true; }
+# Busy ports: the requested ports present in `busy`, comma-joined like the real
+# helper; persistent unless a successful fake kill clears the file.
+listening_ports_among() {
+  local p h=""
+  [[ -f $TMP/busy ]] || return 0
+  for p in "$@"; do
+    case ",$(cat "$TMP/busy")," in *",$p,"*) h+="${h:+,}$p" ;; esac
+  done
+  printf '%s' "$h"
+}
 
 pass=0 fail=0
 check() { # check <desc> <condition-exit>
@@ -49,9 +64,9 @@ check() { # check <desc> <condition-exit>
 }
 has()  { grep -qF -- "$2" "$1" 2>/dev/null; }
 reset() {
-  rm -rf "$TMP/alive" "$TMP/cmd" "$TMP/children" "$TMP/unkillable" "$TMP/kills" "$TMP/sudo" \
+  rm -rf "$TMP/alive" "$TMP/cmd" "$TMP/children" "$TMP/unkillable" "$TMP/eperm" "$TMP/vanish" "$TMP/docker-ok" "$TMP/kills" "$TMP/sudo" \
          "$TMP/violations" "$TMP/docker-calls" "$TMP/busy" "$TMP/no-inspector" "$UAT_DIR"
-  mkdir -p "$TMP/alive" "$TMP/cmd" "$TMP/children" "$TMP/unkillable" "$PID_DIR"
+  mkdir -p "$TMP/alive" "$TMP/cmd" "$TMP/children" "$TMP/unkillable" "$TMP/eperm" "$TMP/vanish" "$PID_DIR"
 }
 alive() { : > "$TMP/alive/$1"; printf '%s\n' "$2" > "$TMP/cmd/$1"; }
 run()   { set +e; out=$("$@" 2>&1); rc=$?; set -e; }
@@ -68,9 +83,9 @@ check "no pgrep -f / pkill" "$([ ! -e "$TMP/violations" ] && echo 0 || echo 1)"
 
 echo "owned"
 reset; alive 100 "$SRV --no-tls"; alive 101 child; echo 101 > "$TMP/children/100"
-record_pid server 100 "$SRV"
+record_pid server 100 "$SRV"; echo 8080 > "$TMP/busy"
 run kill_stale
-check "owned tree killed, record removed, docker rm called" "$([ $rc = 0 ] && has "$TMP/kills" '-9 100' && has "$TMP/kills" '-9 101' && [ ! -e "$PID_DIR/server.pid" ] && ! has "$TMP/kills" 4242 && has "$TMP/docker-calls" "rm -f $PG_CONTAINER" && echo 0 || echo 1)"
+check "owned tree killed, busy port cleared by the kill, record removed, docker rm called" "$([ $rc = 0 ] && has "$TMP/kills" '-9 100' && has "$TMP/kills" '-9 101' && [ ! -e "$PID_DIR/server.pid" ] && ! has "$TMP/kills" 4242 && has "$TMP/docker-calls" "rm -f $PG_CONTAINER" && echo 0 || echo 1)"
 
 echo "pid reuse"
 reset; alive 200 "$DECOY"; record_pid agent 200 "$AGT"
@@ -82,10 +97,20 @@ reset; record_pid gateway 300 "$GATEWAY_DIR/rel"
 run kill_stale
 check "dead record dropped, nothing killed" "$([ $rc = 0 ] && ! [ -e "$TMP/kills" ] && [ ! -e "$PID_DIR/gateway.pid" ] && echo 0 || echo 1)"
 
+echo "malformed"
+reset; printf 'abc\n/x\n' > "$PID_DIR/server.pid"; printf '123\n' > "$PID_DIR/agent.pid"
+run kill_stale
+check "non-numeric PID and empty identity: nothing killed, records removed" "$([ $rc = 0 ] && ! [ -e "$TMP/kills" ] && [ ! -e "$PID_DIR/server.pid" ] && [ ! -e "$PID_DIR/agent.pid" ] && echo 0 || echo 1)"
+
 echo "foreign holder"
 reset; echo '8080,50051' > "$TMP/busy"
 run kill_stale
 check "refuses naming both ports, docker untouched" "$([ $rc = 1 ] && [[ $out == *8080* && $out == *50051* && $out == *refusing* ]] && [ ! -e "$TMP/docker-calls" ] && [ ! -e "$TMP/kills" ] && echo 0 || echo 1)"
+
+echo "pg port still held"
+reset; echo 15433 > "$TMP/busy"; : > "$TMP/docker-ok"
+run kill_stale
+check "rm succeeded but 15433 still held: rc 1, names the port, PG arm (not UAT arm) fired" "$([ $rc = 1 ] && [[ $out == *15433* && $out == *"not this rig's sidecar"* && $out != *'refusing to signal'* ]] && has "$TMP/docker-calls" "rm -f $PG_CONTAINER" && echo 0 || echo 1)"
 
 echo "status"
 reset; alive 100 "$SRV --no-tls"; record_pid server 100 "$SRV"; alive 200 "$DECOY"; record_pid agent 200 "$AGT"
@@ -93,6 +118,13 @@ run show_status
 check "owned reported running" "$([[ $out == *'server running (PID 100'* ]] && echo 0 || echo 1)"
 check "reused reported as another process" "$([[ $out == *'agent not running (recorded PID 200 now belongs to another process)'* ]] && echo 0 || echo 1)"
 check "status never signals or pgreps, keeps records" "$([ ! -e "$TMP/violations" ] && [ ! -e "$TMP/kills" ] && [ -f "$PID_DIR/agent.pid" ] && echo 0 || echo 1)"
+
+echo "status: absent / dead / malformed"
+reset; record_pid server 500 "$SRV"; printf 'abc\n/x\n' > "$PID_DIR/agent.pid"
+run show_status
+check "absent record labelled" "$([[ $out == *'gateway not running (no record)'* ]] && echo 0 || echo 1)"
+check "dead and malformed records labelled stale" "$([[ $out == *'server not running (stale record)'* && $out == *'agent not running (stale record)'* ]] && echo 0 || echo 1)"
+check "status leaves records, signals nothing" "$([ -f "$PID_DIR/server.pid" ] && [ -f "$PID_DIR/agent.pid" ] && [ ! -e "$TMP/kills" ] && [ ! -e "$TMP/violations" ] && echo 0 || echo 1)"
 
 echo "cross-worktree"
 reset; A=/Users/x/Yuzu-worktrees/A/build-macos/server/core/yuzu-server
@@ -109,6 +141,19 @@ echo "survivor"
 reset; alive 200 "$AGT --server x"; record_pid agent 200 "$AGT"; : > "$TMP/unkillable/200"
 run kill_stale
 check "survivor: sudo fallback tried, record kept, rc 1" "$([ $rc = 1 ] && has "$TMP/kills" '-9 200' && has "$TMP/sudo" 'kill -9 200' && [ -f "$PID_DIR/agent.pid" ] && [[ $out == *survived* && $out == *'kept its record'* ]] && echo 0 || echo 1)"
+
+echo "eperm (root-owned sudo parent, --as-user)"
+reset; alive 200 "sudo -u _yuzu -H env $AGT"; record_pid agent 200 "$AGT"; : > "$TMP/eperm/200"; : > "$TMP/unkillable/200"
+run kill_stale
+check "alive-but-EPERM is not dead: sudo arm tried, record kept, rc 1, no Stopped" "$([ $rc = 1 ] && has "$TMP/sudo" 'kill -9 200' && [ -f "$PID_DIR/agent.pid" ] && [[ $out != *Stopped* ]] && echo 0 || echo 1)"
+reset; alive 200 "sudo -u _yuzu -H env $AGT"; record_pid agent 200 "$AGT"; : > "$TMP/eperm/200"
+run kill_stale
+check "EPERM PID that the kill removes: Stopped, record removed" "$([ $rc = 0 ] && [[ $out == *'Stopped agent'* ]] && [ ! -e "$PID_DIR/agent.pid" ] && echo 0 || echo 1)"
+
+echo "exits before the kill (ESRCH)"
+reset; alive 200 "$AGT --server x"; record_pid agent 200 "$AGT"; : > "$TMP/vanish/200"
+run kill_stale
+check "no sudo kill aimed at a PID that is gone" "$([ $rc = 0 ] && [ ! -e "$TMP/sudo" ] && [ ! -e "$PID_DIR/agent.pid" ] && echo 0 || echo 1)"
 
 echo "beam fixture"
 reset; rel="$GATEWAY_DIR/_build/prod/rel/yuzu_gw"
@@ -129,6 +174,10 @@ echo "lexical wiring"
 cnt() { grep -cF -- "$1" "$SCRIPT" || true; }
 # shellcheck disable=SC2016  # the patterns are literal source text, not expansions
 check "record_pid after each of the three spawns" "$([ "$(cnt 'record_pid server "$server_pid"')" = 1 ] && [ "$(cnt 'record_pid gateway "$gw_pid"')" = 1 ] && [ "$(cnt 'record_pid agent "$agent_pid"')" = 1 ] && echo 0 || echo 1)"
+# shellcheck disable=SC2016
+check "gateway identity is the physical rel dir" "$([ "$(cnt 'record_pid gateway "$gw_pid" "$(cd "$gw_rel" && pwd -P)"')" = 1 ] && echo 0 || echo 1)"
+check "UAT_PORTS is the full eight-port list" "$([ "$UAT_PORTS" = "8080 50051 50052 50054 50055 50063 8081 9568" ] && echo 0 || echo 1)"
+check "stop dispatches through the shared refusal gate" "$([ "$(cnt 'stop)   kill_stale || exit 1')" = 1 ] && echo 0 || echo 1)"
 check "no pgrep -f / pkill in start-UAT.sh" "$(! grep -qE 'pgrep -f|pkill' "$SCRIPT" && echo 0 || echo 1)"
 check "start_all calls prepare_fresh_run once" "$([ "$(cnt 'prepare_fresh_run || exit 1')" = 1 ] && echo 0 || echo 1)"
 

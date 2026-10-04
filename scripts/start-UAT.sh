@@ -8,7 +8,7 @@
 #     scripts/test/_portable.sh
 #   - grep -oE rather than -oP (BSD grep has no Perl regex)
 #   - awk replacements for grep -oP '\K' lookbehind tricks
-# Linux behaviour, ports, exit semantics are unchanged.
+# Linux behaviour and ports are unchanged; `stop` exits 1 when it refuses (#5333).
 #
 # Topology (all traffic flows through the gateway):
 #   Agent ──→ Gateway(:50051) ──→ Server(:50055 upstream)
@@ -152,19 +152,25 @@ record_pid() {
     printf '%s\n%s\n' "$2" "$3" > "$PID_DIR/$1.pid"
 }
 
+# pid_alive PID — visibility, not signal permission: `kill -0` returns EPERM
+# for a live root-owned process (the --as-user sudo parent), which would read
+# as dead; ps sees it.
+pid_alive() { ps -p "$1" >/dev/null 2>&1; }
+
 # recorded_pid_state NAME — read-only validator shared by kill and status.
 # Prints absent | malformed | "dead PID" | "reused PID" | "owned PID". The
 # identity is the RECORDED path, not the current $BUILDDIR, so a stack this
 # script started from another worktree is still recognised as its own, while
 # a recycled PID (same number, different program) is never signalled.
 recorded_pid_state() {
-    local f="$PID_DIR/$1.pid" pid="" ident=""
+    local f="$PID_DIR/$1.pid" pid="" ident="" cmd=""
     [ -f "$f" ] || { echo absent; return 0; }
     { read -r pid || true; read -r ident || true; } < "$f"
     case "$pid" in ''|*[!0-9]*) echo malformed; return 0 ;; esac
     [ -n "$ident" ] || { echo malformed; return 0; }
-    kill -0 "$pid" 2>/dev/null || { echo "dead $pid"; return 0; }
-    case "$(ps -o command= -p "$pid" 2>/dev/null)" in
+    cmd=$(ps -o command= -p "$pid" 2>/dev/null || true)
+    [ -n "$cmd" ] || { echo "dead $pid"; return 0; }
+    case "$cmd" in
         *"$ident"*) echo "owned $pid" ;;
         *)          echo "reused $pid" ;;
     esac
@@ -177,7 +183,9 @@ kill_tree() {
     for child in $(pgrep -P "$1" 2>/dev/null || true); do
         kill_tree "$child"
     done
-    kill -9 "$1" 2>/dev/null || sudo -n kill -9 "$1" 2>/dev/null || true
+    # sudo only if the PID is still there: a plain-kill failure can be ESRCH,
+    # and root must never SIGKILL a recycled PID.
+    kill -9 "$1" 2>/dev/null || { pid_alive "$1" && sudo -n kill -9 "$1" 2>/dev/null; } || true
 }
 
 # kill_recorded NAME — 0 stopped, 1 nothing to stop, 2 owned but survived
@@ -195,10 +203,10 @@ kill_recorded() {
     esac
     kill_tree "$pid"
     for _ in 1 2 3 4 5; do
-        kill -0 "$pid" 2>/dev/null || break
+        pid_alive "$pid" || break
         sleep 0.2
     done
-    if kill -0 "$pid" 2>/dev/null; then
+    if pid_alive "$pid"; then
         fail "could not stop $name (PID $pid) — kept its record; stop it by hand (sudo kill -9 $pid) before starting"
         return 2
     fi
@@ -240,12 +248,12 @@ kill_stale() {
         esac
     done
     if [ "$failed" -gt 0 ]; then
-        fail "refusing to start: $failed recorded process(es) survived SIGKILL (see above)"
+        fail "$failed recorded process(es) survived SIGKILL — refusing to continue (see above)"
         return 1
     fi
 
     if ! have_port_inspector; then
-        fail "neither lsof nor ss found — cannot verify the UAT ports are free; refusing to start (#5333)"
+        fail "neither lsof nor ss found — cannot verify the UAT ports are free; refusing to continue (#5333)"
         return 1
     fi
     # shellcheck disable=SC2086  # UAT_PORTS is a deliberate word list
