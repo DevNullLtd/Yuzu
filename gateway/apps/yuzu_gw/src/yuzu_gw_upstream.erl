@@ -203,12 +203,13 @@ init([]) ->
     Threshold  = application:get_env(yuzu_gw, circuit_breaker_failure_threshold, ?DEFAULT_CB_THRESHOLD),
     BaseTimeout = application:get_env(yuzu_gw, circuit_breaker_reset_timeout_ms, ?DEFAULT_CB_RESET_MS),
     MaxTimeout  = application:get_env(yuzu_gw, circuit_breaker_max_reset_timeout_ms, ?DEFAULT_CB_MAX_RESET_MS),
-    ReplaySpacing = env_int(registration_replay_spacing_ms,
-                            ?DEFAULT_REPLAY_SPACING_MS, 0, ?MAX_REPLAY_SPACING_MS),
-    SessionGuard = env_int(registration_replay_session_guard_ms,
-                           ?DEFAULT_REPLAY_SESSION_GUARD_MS, 0, ?MAX_REPLAY_SESSION_GUARD_MS),
-    QueueMax = env_int(registration_replay_queue_max,
-                       ?DEFAULT_REPLAY_QUEUE_MAX, 1, ?MAX_REPLAY_QUEUE_MAX),
+    ReplaySpacing = yuzu_gw_env:env_int(registration_replay_spacing_ms,
+                                    ?DEFAULT_REPLAY_SPACING_MS, 0, ?MAX_REPLAY_SPACING_MS),
+    SessionGuard = yuzu_gw_env:env_int(registration_replay_session_guard_ms,
+                                   ?DEFAULT_REPLAY_SESSION_GUARD_MS, 0,
+                                   ?MAX_REPLAY_SESSION_GUARD_MS),
+    QueueMax = yuzu_gw_env:env_int(registration_replay_queue_max,
+                               ?DEFAULT_REPLAY_QUEUE_MAX, 1, ?MAX_REPLAY_QUEUE_MAX),
     ClusterId = ensure_binary(application:get_env(yuzu_gw, cluster_id, <<"default">>)),
 
     logger:info("Upstream client started (circuit breaker: threshold=~b, base_timeout=~bms, "
@@ -1015,19 +1016,6 @@ reject_reason_for_log(Response) ->
 
 printable_byte(B) when B < 32; B >= 127, B =< 159 -> $?;
 printable_byte(B)                                  -> B.
-
-%% @doc Read an integer application env key that must lie in Min..Max; an
-%% invalid value is logged (naming the key) and replaced by the default.
--spec env_int(atom(), integer(), integer(), integer()) -> integer().
-env_int(Key, Default, Min, Max) ->
-    case application:get_env(yuzu_gw, Key, Default) of
-        Value when is_integer(Value), Value >= Min, Value =< Max ->
-            Value;
-        Bad ->
-            logger:warning("Invalid ~s value ~p (expected an integer in ~b..~b); using ~b",
-                           [Key, Bad, Min, Max, Default]),
-            Default
-    end.
 
 %%%===================================================================
 %%% Internal — RPC execution

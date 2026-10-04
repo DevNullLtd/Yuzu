@@ -101,8 +101,9 @@ flush_sync() ->
 %%%===================================================================
 
 init([]) ->
-    Interval = env_int(heartbeat_batch_interval_ms, ?DEFAULT_BATCH_INTERVAL_MS,
-                       ?MIN_BATCH_INTERVAL_MS, ?MAX_BATCH_INTERVAL_MS),
+    Interval = yuzu_gw_env:env_int(heartbeat_batch_interval_ms,
+                                ?DEFAULT_BATCH_INTERVAL_MS,
+                                ?MIN_BATCH_INTERVAL_MS, ?MAX_BATCH_INTERVAL_MS),
     MaxBuf = application:get_env(yuzu_gw, max_heartbeat_buffer, ?DEFAULT_MAX_HB_BUFFER),
 
     TRef = erlang:send_after(Interval, self(), flush),
@@ -375,21 +376,6 @@ warn_truncated(ListedCount, #state{trunc_warned_at = Last,
             State#state{trunc_warned_at = Now, trunc_suppressed = 0};
         false ->
             State#state{trunc_suppressed = Suppressed + 1}
-    end.
-
-%% @doc Read an integer application env key that must lie in Min..Max; an
-%% invalid value is logged (naming the key) and replaced by the default. Same
-%% contract as yuzu_gw_upstream's env_int/4; kept private here so this module
-%% does not depend on the upstream's exports (its tests mock that module).
--spec env_int(atom(), integer(), integer(), integer()) -> integer().
-env_int(Key, Default, Min, Max) ->
-    case application:get_env(yuzu_gw, Key, Default) of
-        Value when is_integer(Value), Value >= Min, Value =< Max ->
-            Value;
-        Bad ->
-            logger:warning("Invalid ~s value ~p (expected an integer in ~b..~b); using ~b",
-                           [Key, Bad, Min, Max, Default]),
-            Default
     end.
 
 %% @doc The listed ids when the field is a proper list, else none.
