@@ -1331,7 +1331,13 @@ one core replica a server-only restart now recovers through the replay described
   admin-denied or not yet approved enrollment; reached only when the agent is not already approved in the
   enrollment store) makes the gateway disconnect that agent process, with no re-announce, so the agent
   registers again by itself through the gateway and follows its own outcome. That disconnect has the shape
-  tracked in #4629 (no session-match guard).
+  tracked in #4629 (no session-match guard). The `accepted=false` disconnect is a new branch of this change.
+  On `dev` the replay's `{ok, Response}` arm in `yuzu_gw_upstream.erl` has no `accepted` check (the only
+  disconnect there is the superseded `FAILED_PRECONDITION` arm), so an `accepted=false` answer took the adopt
+  arm, re-announced, and the server then refused the announcement as an unknown session (INFERRED from the
+  code, not run): the agent stayed stranded without a signal. The disconnect makes the strand visible and
+  lets the agent follow its own registration path. Released agents that wedge after any disconnect still
+  need the agent service restarted until a release containing #5183 ships.
 - **Replay failures feed the shared breaker (INFERRED from `yuzu_gw_upstream.erl`).** A flush never feeds
   the circuit breaker, but a failed replay `ProxyRegister` does, like any other `ProxyRegister` (a server
   answer of superseded or `accepted=false` counts as a success). The breaker policy is unchanged; verdict
@@ -1402,8 +1408,10 @@ one core replica a server-only restart now recovers through the replay described
   is computed from the server's in-memory session map, which still holds the session (INFERRED from
   `gateway_service_impl.cpp`), so no verdict and no replay follow. Commands kept working in the observed
   run, and with one replica dispatch uses the in-memory map (INFERRED), so this is a gap for HA and
-  multi-replica routing, not for one replica. This is not fixed here; the observed run had no breaker-recovery replay, and the narrowing of the repair a
-  breaker-recovery full replay could give such a row is the next entry. It is related to #4627. Signal: a repeating `renew_leases` shortfall
+  multi-replica routing, not for one replica. This is not fixed here. The observed run had no breaker transition and no replay, so an earlier
+  breaker-recovery full replay could not have repaired it, and the row is not caused by this change; the
+  next entry narrows an incidental repair path that exists only when a breaker transition happens to
+  coincide with a tombstoned row. It is related to #4627. Signal: a repeating `renew_leases` shortfall
   warning on the server with no `Registration replay` line on the gateway after the partition heals. The
   recovery action for that row is NOT tested (restarting the gateway or the agent was not tried).
 - **Known limit (INFERRED from the code, not observed).** While a verdict-seeded (targeted) drip is queued, a
@@ -1411,8 +1419,16 @@ one core replica a server-only restart now recovers through the replay described
   the half open probe closes the breaker without seeding a full replay (`record_result_no_replay` discards
   it; unit test `breaker_replay_during_targeted_drip_is_dropped`). The server lists only sessions missing
   from its in-memory map, so a session it still knows whose durable route row was tombstoned is not repaired
-  by a verdict, and before this change a breaker-recovery full replay could have repaired it; now that row
-  waits for the agent's own reconnect. Tracked as a follow-up (no issue yet), together with the entry above.
+  by a verdict. A breaker-recovery full replay was an incidental repair path for such a row, existing only
+  when a breaker transition happens to coincide with a tombstoned row, and this change narrows it; it was
+  not observed to repair the row of the entry above, and that row is not caused by this change. The limit
+  stands: the row waits for the agent's own reconnect. Tracked as a follow-up (no issue yet), together with
+  the entry above.
+- **Planned follow-ups (tracked as follow-ups, no issue numbers yet), in this order.** (i) A bounded pending
+  queue for dropped notifications, a gateway-only change. (ii) A server-side re-arm of a tombstoned route
+  row when a lease renewal comes up short, with a new advisory list that the gateway answers by
+  re-announcing; this needs a protocol change and is planned to land before the safe-to-scale gate.
+  (iii) A session-match guard and a refusal counter for the `accepted=false` disconnect.
 - **Upgrade day.** The server is upgraded first, so the server restart that ships this fix meets the old
   gateway and agents behind it can read offline (observed on one rig after a SIGKILL restart; a graceful
   upgrade restart was not tested); restart the gateway after upgrading it. A gateway restart disconnects
@@ -1423,26 +1439,38 @@ one core replica a server-only restart now recovers through the replay described
   released agents behind it. Whether restarting only the gateway recovers agents stranded by an earlier
   server restart was NOT tested; INFERRED from the code that a reconnecting agent is accepted by the
   running server, which holds only for an agent build that re-registers by itself.
-- **Known limit (crash report, narrowed not closed).** Two gateway processes keep a stored registration
-  request: the upstream client (each queued agent's request, and one in flight) and the per-agent process
-  (its own agent's request). Three layers now cover those two processes. Their `format_status` callbacks
-  redact the stored request (for the upstream client also the queue, the recent-replay stamps, the last
-  message, the reason and the debug log). A request no longer leaves through an exit reason: an exception
-  inside the upstream client's own RPC calls is caught and counted as a failed RPC, and
-  `yuzu_gw_upstream:proxy_register/1` and `proxy_inventory/1` catch an exit of their call to it (a crash, the
-  30 s timeout, or the process not running during a restart) and return `{error, upstream_unavailable}`,
-  never logging the exit reason and logging one warning that names only the kind. A logger primary filter,
-  `yuzu_gw_crash_redact`, installed when the application starts, redacts the crash report, the `gen_server`
-  terminate report and the supervisor `child_terminated` report of both processes: the process mailbox becomes
-  a count, and the `messages:` and exception lines keep no argument lists. The filter and the
+- **Known limit (crash report, narrowed not closed).** Three gateway processes hold or are sent a
+  registration request: the upstream client (each queued agent's request, and one in flight), the per-agent
+  process (its own agent's request) and the routing registry (the request in its `register` call, kept in an
+  ETS table). Three layers now cover those three processes. Their `format_status` callbacks redact the
+  stored request (for the upstream client also the queue, the recent-replay stamps, the last message, the
+  reason and the debug log; for the registry the request inside the `register` message). A request no longer
+  leaves through an exit reason: an exception inside the upstream client's own RPC calls is caught and
+  counted as a failed RPC, and the three caller side call sites that carry a request, namely
+  `yuzu_gw_upstream:proxy_register/1`, `proxy_inventory/1` and `yuzu_gw_registry:register_agent/7`, go
+  through one wrapper (`yuzu_gw_safe_call`) that catches an exit of the call (a crash, the call timeout, or
+  the process not running during a restart). The callers get `{error, upstream_unavailable}` or
+  `{error, registry_unavailable}`; the exit reason is never logged or returned, and one warning per second
+  per called process names only the class (`noproc`, `timeout` or `other`). The Register handler answers
+  `INTERNAL` for any `{error, _}` (as it does for `circuit_open`) and the agent retries on any non-OK status
+  (read in `yuzu_gw_agent_service.erl` and `agents/core/src/agent.cpp`, not run). A failed registry call in
+  the per-agent process's init used to exit with a reason that embedded the request, which the Subscribe
+  handler logged (INFERRED from the code, not run); that init now stops with the fixed reason
+  `registry_unavailable`. The application env key `upstream_call_timeout_ms` (default 30000) sets the call
+  timeout of the first two sites. A logger primary filter, `yuzu_gw_crash_redact`, installed when the
+  application starts, covers the processes `yuzu_gw_upstream`, `yuzu_gw_agent` and `yuzu_gw_registry`, each
+  matched by its registered name or by having been started by that module's `init/1`: it rewrites the
+  `proc_lib` crash report (the mailbox and the process dictionary become counts, the exception keeps no
+  argument lists), the `gen_server` terminate report (upstream client and registry), the `gen_statem`
+  terminate report (per-agent process) and the supervisor reports that carry a reason. The filter and the
   `format_status` callbacks are verified by unit tests on the real processes, not on a rig; the exit-reason
   leak and the per-agent crash report were OBSERVED by a security reviewer running the real application
   before this layer existed. The residual is: use of the modules outside the application (no filter is
   installed there); a report shape the filter does not recognise; hot-loading the code into a running node
   (hot code upgrade is not a supported gateway deployment path: the appup in the repository is an old
   skeleton, no relup is built, and the runbook says to restart; INFERRED from a search of the repository);
-  and any other process that holds a registration request, since only these two processes were checked and
-  others (the registry, which has no `format_status`, and the gRPC handler processes) have not been audited.
+  and any other process that holds a registration request, since only these three processes were checked and
+  others (the gRPC handler processes) have not been audited.
   In those cases a crash report can still print the token, certificate or CSR of a request. Operator
   guidance (treat crash reports as sensitive; the `chars_limit` and `depth` logger options remain as defence
   in depth) and the shipped logger settings are in `docs/user-manual/gateway.md`, Known limits.
