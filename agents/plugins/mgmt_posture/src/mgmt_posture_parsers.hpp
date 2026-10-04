@@ -124,7 +124,6 @@ inline IniDoc parse_ini(std::string_view text) {
 struct SssdFacts {
     std::vector<std::string> active_domains;                    ///< query order
     std::map<std::string, std::string> id_provider_by_domain;   ///< lowercased
-    bool has_sssd_section = false;
     bool domains_key_present = false; ///< false -> caller reports linux:mgmt_posture:sssd_conf:no_domains_key
 };
 
@@ -149,7 +148,6 @@ inline const std::string* find_key(const IniDoc& doc, const std::string& section
 inline SssdFacts sssd_facts(const IniDoc& doc) {
     constexpr std::string_view prefix = "domain/";
     SssdFacts f;
-    f.has_sssd_section = doc.sections.contains("sssd");
 
     std::vector<std::string> declared;
     for (const auto& sec : doc.section_order) {
@@ -213,14 +211,9 @@ inline bool parse_ipa_default_conf_has_realm(const IniDoc& doc) {
     return r && !r->empty();
 }
 
-struct LinuxClassification {
-    Plane plane = Plane::none;
-    std::string domain; ///< the active domain that decided it, or empty (never emitted)
-};
-
 /// First active domain (SSSD query order) whose id_provider is ad or ipa decides;
 /// otherwise an ipa default.conf means ipa; otherwise none.
-inline LinuxClassification classify_linux(const std::optional<SssdFacts>& sssd,
+inline Plane classify_linux(const std::optional<SssdFacts>& sssd,
                                           bool ipa_default_conf_present) {
     if (sssd) {
         for (const auto& dom : sssd->active_domains) {
@@ -228,14 +221,12 @@ inline LinuxClassification classify_linux(const std::optional<SssdFacts>& sssd,
             if (it == sssd->id_provider_by_domain.end())
                 continue;
             if (it->second == "ad")
-                return {Plane::ad, dom};
+                return Plane::ad;
             if (it->second == "ipa")
-                return {Plane::ipa, dom};
+                return Plane::ipa;
         }
     }
-    if (ipa_default_conf_present)
-        return {Plane::ipa, {}};
-    return {};
+    return ipa_default_conf_present ? Plane::ipa : Plane::none;
 }
 
 // ---------------------------------------------------------------------------
@@ -245,7 +236,6 @@ inline LinuxClassification classify_linux(const std::optional<SssdFacts>& sssd,
 struct ProfilesEnrollment {
     std::optional<bool> dep_enrolled;
     std::optional<bool> mdm_enrolled;
-    bool user_approved = false;
     std::string mdm_server_host; ///< host component only, never the path (may hold a token)
 
     bool recognised() const { return dep_enrolled || mdm_enrolled; }
@@ -293,8 +283,6 @@ inline ProfilesEnrollment parse_profiles_status(std::string_view text) {
             if (!yn)
                 continue;
             (key == "mdm enrollment" ? out.mdm_enrolled : out.dep_enrolled) = yn;
-            if (*yn && lv.find("user approved") != std::string::npos)
-                out.user_approved = true;
         } else if (key == "mdm server") {
             out.mdm_server_host = detail::url_host(val);
         }

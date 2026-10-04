@@ -269,9 +269,9 @@ inline Posture posture_linux(const LinuxFs& fs) {
     else if (r.err != ENOENT)
         acc.add_failure("linux:mgmt_posture:ipa_default_conf:" + errno_token(r.err));
 
-    const auto cls = classify_linux(sssd, ipa_present);
+    const auto plane = classify_linux(sssd, ipa_present);
     return {acc.any_failure() ? StatusState::constrained : StatusState::supported, acc.reason(),
-            linux_rows(cls.plane, keytab)};
+            linux_rows(plane, keytab)};
 }
 
 // ---------------------------------------------------------------------------

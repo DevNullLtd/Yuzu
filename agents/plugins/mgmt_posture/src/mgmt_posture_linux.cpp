@@ -102,10 +102,6 @@ int list_snippets(std::vector<std::string>& out, bool& too_many) {
         const std::string n = e->d_name;
         if (n.size() > 5 && n[0] != '.' && n.ends_with(".conf")) {
             out.push_back(n);
-            if (out.size() >= 2 * (kMaxSnippets + 1)) {
-                std::ranges::sort(out);
-                out.resize(kMaxSnippets + 1);
-            }
         }
     }
     // Byte order approximates SSSD's locale collation (README caveat).

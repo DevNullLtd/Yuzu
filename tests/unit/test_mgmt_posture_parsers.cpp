@@ -62,7 +62,7 @@ constexpr const char* kProfilesEnrolled =
     "MDM server: https://mdm.example.com/devicemanagement/mdm/dep_mdm_enroll";
 
 SssdFacts facts(const char* text) { return sssd_facts(parse_ini(text)); }
-Plane plane_of(const char* text) { return classify_linux(facts(text), false).plane; }
+Plane plane_of(const char* text) { return classify_linux(facts(text), false); }
 
 } // namespace
 
@@ -83,7 +83,6 @@ TEST_CASE("mgmt_posture: AD and IPA specimens", "[mgmt_posture]") {
     CHECK(ad.id_provider_by_domain.at("example.com") == "ad");
     CHECK(ad.domains_key_present);
     CHECK(plane_of(kAdConf) == Plane::ad);
-    CHECK(classify_linux(ad, false).domain == "example.com");
 
     const auto ipa = facts(kIpaConf);
     CHECK(ipa.id_provider_by_domain.at("ipa.example.com") == "ipa");
@@ -103,8 +102,7 @@ TEST_CASE("mgmt_posture: CRLF variant classifies the same", "[mgmt_posture]") {
 TEST_CASE("mgmt_posture: id_provider under [sssd] alone is ignored", "[mgmt_posture]") {
     const auto f = facts("[sssd]\nid_provider=ad\n");
     CHECK(f.active_domains.empty());
-    CHECK(f.has_sssd_section);
-    CHECK(classify_linux(f, false).plane == Plane::none);
+    CHECK(classify_linux(f, false) == Plane::none);
 }
 
 TEST_CASE("mgmt_posture: F1 legacy ldap before corp ad", "[mgmt_posture]") {
@@ -114,8 +112,7 @@ TEST_CASE("mgmt_posture: F1 legacy ldap before corp ad", "[mgmt_posture]") {
     const auto both = facts("[sssd]\ndomains = legacy, corp\n[domain/legacy]\nid_provider=ldap\n"
                             "[domain/corp]\nid_provider=ad\n");
     CHECK(both.active_domains == std::vector<std::string>{"legacy", "corp"});
-    CHECK(classify_linux(both, false).plane == Plane::ad);
-    CHECK(classify_linux(both, false).domain == "corp");
+    CHECK(classify_linux(both, false) == Plane::ad);
 }
 
 TEST_CASE("mgmt_posture: enabled = false, enabled = true, undeclared names", "[mgmt_posture]") {
@@ -125,7 +122,7 @@ TEST_CASE("mgmt_posture: enabled = false, enabled = true, undeclared names", "[m
     const auto f = facts("[sssd]\ndomains = a\n[domain/a]\nid_provider=ldap\n"
                          "[domain/b]\nid_provider=ad\nenabled = true\n[domain/c]\nid_provider=ipa\n");
     CHECK(f.active_domains == std::vector<std::string>{"a", "b"});
-    CHECK(classify_linux(f, false).plane == Plane::ad);
+    CHECK(classify_linux(f, false) == Plane::ad);
     // listed but undeclared -> not active
     CHECK(facts("[sssd]\ndomains = ghost\n").active_domains.empty());
 }
@@ -141,7 +138,7 @@ TEST_CASE("mgmt_posture: no domains key falls back to file order", "[mgmt_postur
                          "[domain/y]\nid_provider=ipa\n[domain/z]\nid_provider=ad\nenabled=false\n");
     CHECK_FALSE(f.domains_key_present);
     CHECK(f.active_domains == std::vector<std::string>{"x", "y"});
-    CHECK(classify_linux(f, false).plane == Plane::ipa);
+    CHECK(classify_linux(f, false) == Plane::ipa);
 }
 
 TEST_CASE("mgmt_posture: mixed ad+ipa follows query order", "[mgmt_posture]") {
@@ -160,13 +157,12 @@ TEST_CASE("mgmt_posture: ipa default.conf and classify matrix", "[mgmt_posture]"
 
     const auto ad = facts(kAdConf);
     const auto nodom = facts("[sssd]\n");
-    CHECK(classify_linux(ad, false).plane == Plane::ad);
-    CHECK(classify_linux(ad, true).plane == Plane::ad);
-    CHECK(classify_linux(nodom, true).plane == Plane::ipa);
-    CHECK(classify_linux(nodom, false).plane == Plane::none);
-    CHECK(classify_linux(std::nullopt, true).plane == Plane::ipa);
-    CHECK(classify_linux(std::nullopt, false).plane == Plane::none);
-    CHECK(classify_linux(std::nullopt, true).domain.empty());
+    CHECK(classify_linux(ad, false) == Plane::ad);
+    CHECK(classify_linux(ad, true) == Plane::ad);
+    CHECK(classify_linux(nodom, true) == Plane::ipa);
+    CHECK(classify_linux(nodom, false) == Plane::none);
+    CHECK(classify_linux(std::nullopt, true) == Plane::ipa);
+    CHECK(classify_linux(std::nullopt, false) == Plane::none);
 }
 
 TEST_CASE("mgmt_posture: parse_profiles_status", "[mgmt_posture]") {
@@ -174,13 +170,11 @@ TEST_CASE("mgmt_posture: parse_profiles_status", "[mgmt_posture]") {
     CHECK(u.dep_enrolled == false);
     CHECK(u.mdm_enrolled == false);
     CHECK(u.mdm_server_host.empty());
-    CHECK_FALSE(u.user_approved);
     CHECK(u.recognised());
 
     const auto e = parse_profiles_status(kProfilesEnrolled);
     CHECK(e.dep_enrolled == true);
     CHECK(e.mdm_enrolled == true);
-    CHECK(e.user_approved);
     CHECK(e.mdm_server_host == "mdm.example.com");
 
     CHECK(parse_profiles_status("MDM server: https://u:p@h.example.com:8443/x?t=secret\n")
