@@ -810,9 +810,10 @@ begin
   end;
 end;
 
-// Appended to every abort message once the existing service has been stopped.
-// StoppedRunningService is sticky: once set it is never cleared, so a retried
-// PrepareToInstall (an interactive Back/Next after an abort) still says so.
+// Appended to every abort message while the existing service is stopped by
+// this run. StoppedRunningService is cleared only when an early insecure-path
+// abort starts the service again, so the suffix is shown only while it is
+// still stopped (and a retried PrepareToInstall reports the current state).
 function AbortSuffix: string;
 begin
   Result := '';
