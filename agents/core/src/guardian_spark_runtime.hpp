@@ -805,7 +805,9 @@ public:
     /// continuation branch below run on top of an already-issued direct disarm AND
     /// made finalize_arm_compensation()'s claims_.find("") miss the real key,
     /// permanently wedging it - `cont` is now assigned only as the LAST statement
-    /// of the try, so points 4 and 5 both leave it null identically). 0 = off.
+    /// of the try, so points 4 and 5 both leave it null identically). 12 = a throw in a
+    /// wedge adoption AFTER index_->add moved the rule's mapping to the adopted key and
+    /// before the PerKey is built (the adoption's catch then erases that mapping). 0 = off.
     void set_drain_fault_point_for_test(int point) noexcept;
     /// R5.2 detach fault seam (adversarial re-review r2 C1): consumed once by the next
     /// detach_rule_locked that builds a DISARM claim - throws std::bad_alloc at the
@@ -873,17 +875,13 @@ public:
         return dead_watchers_erased_on_lost_.load(std::memory_order_relaxed);
     }
     /// rung 9c PR-5a (#4221 cs-103): detach_rule_locked's last-on-key branch sweeps
-    /// claims_[key] before constructing a new Disarm claim, on the belief (see the
-    /// reachability note at that call site) that nothing survives the sweep. This
-    /// counts every time that belief was WRONG - i.e. every time the debug-only
-    /// assert() next to this counter's increment site would have fired in a debug
-    /// build. Expected 0; unlike a bare assert() (compiled out under NDEBUG in a
-    /// release build), this counter and its accompanying log line survive into
-    /// release, matching this file's own established precedent at
-    /// dispatch_arm_off_lock's "not an Arm claim" guard for a should-never-happen
-    /// branch. A nonzero value here means the reachability note's call-graph
-    /// argument was incomplete somewhere - re-open the investigation rather than
-    /// assume it is safe to ignore.
+    /// claims_[key] before constructing a new Disarm claim. This counts every time
+    /// the sweep left the fifo non-empty (the new Disarm claim is then not pushed and
+    /// the real disarm runs through the synchronous last-resort fallback). The branch
+    /// is reachable - a retained owner tombstone holding an orphan key's last mapping
+    /// - and the counted, logged fallback is its accepted outcome; the debug-only
+    /// assert that used to sit next to the increment site is gone (see the reachability
+    /// note at that call site). Expected 0 outside a failing index release.
     [[nodiscard]] std::uint64_t detach_sweep_left_residue() const noexcept {
         return detach_sweep_left_residue_.load(std::memory_order_relaxed);
     }
@@ -1125,7 +1123,12 @@ private:
     /// release_claim_index_locked, is guarded by that flag, and calls
     /// erase_rule(rule_id, generation), which erases only while the claim's generation
     /// is still the recorded owner (spark_key_rule_index.hpp) - a stale claim must never
-    /// remove a replacement's mapping. Two other sites call erase_rule directly, both
+    /// remove a replacement's mapping. `index_held` is the claim's own belief: a
+    /// same-rule re-attach or a wedge adoption can move the mapping to another claim or
+    /// key while the flag stays set, so ownership is asked of the index
+    /// (SparkKeyRuleIndex::owns). A claim that no longer owns the mapping releases as a
+    /// no-op - `index_held` is cleared, the release succeeds and is never counted as a
+    /// failure - and the drain commits only a claim that owns its mapping at commit time. Two other sites call erase_rule directly, both
     /// generation-guarded and idempotent: attach_core's rollback of a mapping it just
     /// added, and on_arm_complete's adoption-catch cleanup of a mapping it re-added.
     ///
@@ -2375,7 +2378,7 @@ private:
     std::atomic<std::uint64_t> detach_claim_failures_{0}; ///< R5.2: detach_rule_locked rollback / last resort fired
     std::atomic<std::uint64_t> dead_subscription_disarms_skipped_{0}; ///< cs-1: Disarm claims completed for an id already reported dead
     std::atomic<std::uint64_t> claim_index_release_failures_{0}; ///< r3 C2/C3: contained remove_rule throw
-    std::atomic<std::uint64_t> detach_sweep_left_residue_{0}; ///< PR-5a #4221 cs-103: last-on-key sweep left the fifo non-empty (should never happen)
+    std::atomic<std::uint64_t> detach_sweep_left_residue_{0}; ///< PR-5a #4221 cs-103: last-on-key sweep left the fifo non-empty (a retained owner tombstone; see detach_sweep_left_residue())
     std::function<void()> drain_gap_hook_for_test_; ///< registry_mu_-guarded; see the setter
     std::function<void()> dispatch_entry_hook_for_test_; ///< registry_mu_-guarded; see the setter
     std::atomic<int> drain_fault_point_for_test_{0};  ///< see the setter

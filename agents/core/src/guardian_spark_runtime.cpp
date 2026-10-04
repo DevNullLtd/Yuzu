@@ -144,6 +144,19 @@ GuardianSparkRuntime::make_handler(std::shared_ptr<GuardianSparkRuntime> rt) {
 bool GuardianSparkRuntime::release_claim_index_locked(KeyClaim& claim) noexcept {
     if (!claim.index_held)
         return true;
+    // #4605 / #5322: `index_held` is the claim's own belief, not proof. A same-rule
+    // re-attach (add() transferring the mapping to the newer generation) or a wedge
+    // adoption (index_->add() moving it to the adopted key) can hand the rule's one
+    // (rule_id -> key, generation) mapping to someone else while this claim still
+    // says it holds it. A claim that no longer owns the mapping holds none, so its
+    // release succeeds as a no-op: it clears the belief and cannot fail, which keeps
+    // the failure path below (and its test seam) for a release that would actually
+    // mutate the index. Checked BEFORE the try for that reason.
+    if (!index_->owns(claim.key, claim.rule_id, claim.generation)) {
+        claim.index_held = false;
+        return true;
+    }
+
     // Adversarial re-review r2 C2: remove FIRST, clear the ownership flag AFTER.
     // remove_rule's one allocation (its key copy) precedes its mutation, so a throw
     // leaves both the index mapping and index_held intact - the next release for this
@@ -172,9 +185,11 @@ bool GuardianSparkRuntime::release_claim_index_locked(KeyClaim& claim) noexcept 
         // "the next same-key event... retries the release" case) can fire after a
         // same-rule re-attach has already installed a new mapping for this rule_id; the
         // generation check inside erase_rule() is what makes that a safe no-op instead of
-        // an erroneous erase of the newer owner's entry. (An earlier version of this
-        // comment claimed index_held alone was sufficient - it was not; see the header
-        // doc comment on SparkKeyRuleIndex::erase_rule.)
+        // an erroneous erase of the newer owner's entry. (The owns() check above now
+        // stops that case before it gets here; this generation check stays as the second
+        // line of defence. An earlier version of this comment claimed index_held alone
+        // was sufficient - it was not; see the header doc comment on
+        // SparkKeyRuleIndex::erase_rule.)
         index_->erase_rule(claim.rule_id, claim.generation); // noexcept; idempotent
     } catch (...) {
         claim_index_release_failures_.fetch_add(1, std::memory_order_relaxed);
@@ -1265,8 +1280,13 @@ void GuardianSparkRuntime::on_arm_complete(const std::string& key,
                     // its index mapping. The last two guards (governance pass-3
                     // sg-3/ar-4/cs-5) keep a tombstone or an already-published claim
                     // that survived a double fault from ever being committed twice.
+                    // Ownership is asked of the index, not trusted from the claim's own
+                    // `index_held` (#4605): a wedge adoption that moved the rule's
+                    // mapping to another key leaves this claim believing it still
+                    // holds one, and it must not commit over the rule's current owner.
                     if (c->kind == ClaimKind::Arm && !c->withdrawn && !c->waiter_abandoned &&
-                        !c->outcome && !c->commit_exception && c->index_held)
+                        !c->outcome && !c->commit_exception && c->index_held &&
+                        index_->owns(c->key, c->rule_id, c->generation))
                         live.push_back(c);
 
                 // Adversarial-review correction (rung 9c PR-5d follow-up): this
@@ -1371,6 +1391,8 @@ void GuardianSparkRuntime::on_arm_complete(const std::string& key,
                         // that guard's own comment) an ordinary ongoing redeploy.
                         index_->add(key, claim->rule_id, claim->generation); // may throw
                         index_readded = true;
+                        fault_here_for_test(12); // seam: adoption fails AFTER index_->add moved
+                                                 // the mapping (the catch below erases it)
                         auto fresh = std::make_shared<PerKey>();
                         fresh->spec = claim->spec;
                         fresh->subscription = sub;
@@ -1547,14 +1569,20 @@ void GuardianSparkRuntime::on_arm_complete(const std::string& key,
                             }
                         }
                     }
-                    // Claims that were withdrawn/abandoned while their siblings adopted.
+                    // Claims that were withdrawn/abandoned while their siblings adopted,
+                    // or that lost the rule's mapping to another claim (#4605: the rule
+                    // is no longer wanted on this key, so the verdict is Withdrawn).
+                    // Ownership is read BEFORE the release: an owner's release erases
+                    // the mapping, after which every claim would read as a non-owner.
                     for (const auto& c : finished) {
+                        const bool withdrawn =
+                            c->withdrawn || !index_->owns(c->key, c->rule_id, c->generation);
                         release_claim_index_locked(*c);
-                        stage(c, std::unexpected(std::string{c->withdrawn ? "withdrawn"
-                                                                          : "arm timed out"}),
+                        stage(c, std::unexpected(std::string{withdrawn ? "withdrawn"
+                                                                       : "arm timed out"}),
                               nullptr,
-                              c->withdrawn ? ClaimEnd::Withdrawn
-                                           : ClaimEnd::WaiterTimedOutDispatched);
+                              withdrawn ? ClaimEnd::Withdrawn
+                                        : ClaimEnd::WaiterTimedOutDispatched);
                     }
                 }
             }
@@ -3033,60 +3061,44 @@ GuardianSparkRuntime::withdraw_rule_after_wedge_sweep_locked(
                 // a never-dispatched terminal tombstone may still sit here after a
                 // double fault, and is swept first (governance pass-3 sg-3/ar-4/cs-5).
                 //
-                // rung 9c PR-5a (#4221 cs-103) reachability note (corrected 2026-09-14,
-                // governance S2 - the original (a) below was wrong for a same-rule_id
-                // tombstone; see the correction inline): this sweep's ATTACH-path twin
-                // (try_dispatch_head_locked, this file's other
-                // sweep_terminal_queued_locked call site) has concrete, tested repros
-                // (the "adversarial re-review r3 C2" death test and PR-5a's own
-                // "up-101/ch-101" test both leave a real tombstone for this call to
-                // sweep). This DETACH-path call site does not, and an extensive trace
-                // of the actual call graph (attach_core, publish_arm_verdicts_locked,
-                // on_arm_complete, Case 0 in this function) did not turn up a
-                // producible sequence of public-API calls that reaches here with a
-                // non-empty fifo. Two cases, scoped by whose rule_id the tombstone
-                // holds - conflating them was the (a) defect:
-                // (a) a DIFFERENT rule sharing this key still holds its OWN
-                //     index_->add() mapping (its release having failed): by_key_ is a
-                //     std::set<rule_id>, so a SECOND, distinct rule_id inflates
-                //     index_->refcount() for this key past 1 and blocks `last_on_key`
-                //     above from ever gating entry into this branch while that
-                //     tombstone persists. This case does NOT apply to a same-rule_id
-                //     tombstone from an older generation: by_key_ counts the rule_id
-                //     string once regardless of which generation currently owns it in
-                //     by_rule_, so refcount stays 1 either way.
-                // (b) the SAME rule's own stale tombstone gets opportunistically swept
-                //     by try_dispatch_head_locked's OWN call as part of that rule's
-                //     next attach - see PR-5a's up-101 test, where the tombstone is
-                //     cleared before the new claim ever reaches commit, not left for a
-                //     later, separate detach to find. This is the case that actually
-                //     covers a same-rule_id tombstone; (a) never needs to.
-                // The overall unreachability conclusion rests on (b) alone for the
-                // same-rule case and on (a) for the different-rule case - independently
-                // traced by two reviewers with no counter-example found, but not
-                // exhaustively modeled against every background retry path. This
-                // matches the governance finding's own framing (sg-3/ar-4/cs-5 hardened
-                // BOTH sweep call sites symmetrically as defence-in-depth) rather than a
-                // distinctly reproduced defect at this specific site. Flagging rather
-                // than asserting impossibility: a future change to up-5's
-                // retained-disarm redrive (5b) or to the claim/index bookkeeping above
-                // could open a path this analysis didn't model - re-check this note
-                // rather than deleting it if either changes. Because this conclusion is
-                // call-graph reasoning, not a compile-time guarantee, the check right
-                // below is a REAL runtime guard (counted via
-                // detach_sweep_left_residue(), logged, safe fallback) rather than a bare
-                // debug-only assert - see its own comment for why.
+                // rung 9c PR-5a (#4221 cs-103) / #4605: what this sweep can leave behind.
+                // It pops never-dispatched terminal Arm claims from the front and stops
+                // at the first one whose index release fails, or at a front that is not
+                // such a claim. A release can fail only for a claim that still OWNS its
+                // mapping: a non-owner's release is a no-op (release_claim_index_locked),
+                // so a stale generation cannot be what stops it. The branch below is
+                // therefore REACHABLE, not a should-never-happen: an earlier version of
+                // this note concluded from call-graph reasoning that nothing survives the
+                // sweep and paired that with a debug-only assert; the conclusion did not
+                // hold (a retained owner tombstone can hold an orphan key's last mapping
+                // when its own rule re-attaches or detaches), and the assert is gone.
+                //
+                // What still holds, and what the fallback below relies on:
+                //  - this branch is entered only with `last_on_key` AND keys_[key]
+                //    present;
+                //  - a DIFFERENT rule's claim that holds a mapping keeps the key's
+                //    refcount above 1, which blocks `last_on_key`, so any residue claim
+                //    that owns a mapping belongs to `rule_id` (by_key_ counts a rule_id
+                //    once whatever its generation);
+                //  - remove_rule(rule_id) below erases that mapping, so such a claim no
+                //    longer owns anything and its next release is a no-op that succeeds.
+                //    The residue is therefore left for the next same-key sweep
+                //    (try_dispatch_head_locked, or this function) to pop; nothing here
+                //    waits on the failing release succeeding.
                 sweep_terminal_queued_locked(eit->second);
-                // rung 9c PR-5a (#4221 cs-103): a bare assert() here would compile out
-                // entirely under NDEBUG, silently proceeding as if the sweep's
-                // precondition held even though this investigation only established it
-                // via call-graph reasoning, not a compile-time guarantee. Matches this
-                // file's own established precedent for a should-never-happen branch
-                // (dispatch_arm_off_lock's "not an Arm claim" guard): keep the debug
-                // assert for immediate local visibility, but pair it with a REAL,
-                // NDEBUG-surviving fallback that never risks inserting this Disarm claim
-                // behind (or ahead of) something whose state this code no longer
-                // understands.
+                // The sweep's precondition (an empty fifo) is established by call-graph
+                // reasoning, not by construction, and the branch above is reachable, so
+                // the check below is a REAL runtime guard (counted via
+                // detach_sweep_left_residue(), logged, safe fallback) with no assert in
+                // front of it: assert() is live in every project-authored build
+                // configuration (meson.build sets no b_ndebug, which defaults to false
+                // even for --buildtype=release; release.yml and
+                // deploy/docker/Dockerfile.agent and Dockerfile.server all build release
+                // without defining NDEBUG; scripts/setup.sh can pass one through), so an
+                // assert here aborted the agent on the reachable shape. The fallback
+                // never risks inserting this Disarm claim behind (or ahead of) something
+                // whose state this code does not model, and the counted outcome is the
+                // accepted one.
                 //
                 // Gate 8 re-review correction (G2, both cpp-expert and cpp-safety):
                 // this comment and this commit's own message originally claimed the
@@ -3103,7 +3115,6 @@ GuardianSparkRuntime::withdraw_rule_after_wedge_sweep_locked(
                 // genuinely left for the next same-key event is the unexpected residue
                 // still sitting in claims_[key]'s own fifo (this rule's own
                 // rules_/index_ cleanup below also runs unconditionally regardless).
-                assert(eit->second.fifo.empty());
                 if (!eit->second.fifo.empty()) {
                     detach_sweep_left_residue_.fetch_add(1, std::memory_order_relaxed);
                     try {

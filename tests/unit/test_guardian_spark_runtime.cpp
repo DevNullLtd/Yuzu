@@ -8383,6 +8383,299 @@ TEST_CASE("#5322: counted/sticky index-release fault seam", "[spark][runtime][li
     rt->begin_stop();
 }
 
+// #4605 / #5322 WP1: steps 1-3 of the #4605 repro, shared by the T5 cases. One rule (r1)
+// has an arm wedged on key A (parked in the backend past its 50 ms deadline), a second
+// r1 arm in flight on key B (which moved r1's index mapping to B), and a re-attach on A
+// that re-observed the wedge. Per-key gates park each arm inside the backend, so the
+// test, not a clock, decides when each arm completes. Steps are methods, not a
+// constructor, so a failed REQUIRE still runs the destructor that frees the parked
+// workers (a throwing constructor never runs it).
+namespace {
+struct Repro4605 {
+    using RT = GuardianSparkRuntime;
+    std::shared_ptr<FakeReader> r = std::make_shared<FakeReader>();
+    std::shared_ptr<FakeBackend> b = std::make_shared<FakeBackend>();
+    std::shared_ptr<RT> rt =
+        make_rt(r, b, RT::Config{.backend_op_deadline = std::chrono::milliseconds(50)});
+    const std::string key_a = spark_key(file_spec("/a"));
+    const std::string key_b = spark_key(file_spec("/b"));
+    std::shared_ptr<FakeBackend::ArmGate> gate_a = b->park_next_arm_for_key(key_a);
+    std::shared_ptr<FakeBackend::ArmGate> gate_b = b->park_next_arm_for_key(key_b);
+    RT::ArmReceipt receipt_a; ///< r1's wedged claim on A
+    RT::ArmReceipt receipt_b; ///< r1's in-flight claim on B
+
+    // The seam is cleared FIRST, then the gates opened, so a failing assertion can
+    // neither leave releases failing nor leave a worker parked in the backend.
+    ~Repro4605() {
+        rt->set_index_remove_fault_count_for_test(0);
+        rt->set_drain_fault_point_for_test(0);
+        b->release_all_key_gates();
+        rt->begin_stop();
+    }
+
+    [[nodiscard]] std::size_t depth(const std::string& key) const {
+        return rt->claim_queue_depth_for_test(key);
+    }
+
+    /// Step 1: r1 on A, parked in the backend, then wedged by its 50 ms deadline.
+    void wedge_r1_on_a() {
+        using namespace std::chrono_literals;
+        auto a = rt->attach_rule(RT::NonWaiting{}, "r1", file_spec("/a"), file_exists_rule("r1"), true);
+        REQUIRE(a.has_value());
+        receipt_a = a->receipt;
+        REQUIRE(gate_a->wait_entered(10s));
+        REQUIRE(yuzu::test::spin_until(
+            [&] {
+                rt->expire_overdue_claims();
+                return rt->receipt_status(receipt_a) == RT::ReceiptStatus::Wedged;
+            },
+            10s));
+    }
+    /// Step 2: r1 re-attached on B. Its mapping moves to B; the arm parks in the backend.
+    void queue_r1_on_b() {
+        using namespace std::chrono_literals;
+        auto b1 = rt->attach_rule(RT::NonWaiting{}, "r1", file_spec("/b"), file_exists_rule("r1"), true);
+        REQUIRE(b1.has_value());
+        receipt_b = b1->receipt;
+        REQUIRE(gate_b->wait_entered(10s));
+        REQUIRE(rt->receipt_status(receipt_b) == RT::ReceiptStatus::Pending);
+    }
+    /// Step 3: r1 re-attached on A. Re-observes A's wedge and touches no index state.
+    void reobserve_r1_on_a() {
+        const auto before = rt->wedged_reobservations();
+        auto again = rt->attach_rule(RT::NonWaiting{}, "r1", file_spec("/a"), file_exists_rule("r1"), true);
+        REQUIRE(again.has_value());
+        REQUIRE(again->receipt.claim == receipt_a.claim);
+        REQUIRE(rt->wedged_reobservations() == before + 1);
+    }
+    /// Step 4: A's late success is adopted (its adoption moves r1's mapping from B to A).
+    void adopt_r1_on_a() {
+        using namespace std::chrono_literals;
+        gate_a->release();
+        REQUIRE(yuzu::test::spin_until([&] { return rt->rule_count() == 1; }, 10s));
+        REQUIRE(rt->armed_key_count() == 1);
+        REQUIRE(depth(key_a) == 0);
+        (void)drain_lifecycle(*rt); // boundary: the adoption's "armed" entry is spent
+    }
+};
+
+// T4a / T7: a hung head H on key K, a rule `r` queued behind it, and the sticky index-release
+// seam. On code that redispatches a tombstone the head loops arm/compensate, so `park_every`
+// is set (under the gate's own mutex, once workers are live) AFTER the hung head committed to
+// bound it. Cleanup clears the seam FIRST, then opens the park and the hang.
+struct SeamRig4605 {
+    using RT = GuardianSparkRuntime;
+    std::shared_ptr<FakeReader> r = std::make_shared<FakeReader>();
+    std::shared_ptr<FakeBackend> b = std::make_shared<FakeBackend>();
+    std::shared_ptr<RT> rt;
+    const std::string key = spark_key(file_spec("/a"));
+    SeamRig4605() {
+        b->hang_next_arm.store(true);
+        rt = make_rt(r, b, RT::Config{.backend_op_deadline = std::chrono::seconds(30)});
+    }
+    ~SeamRig4605() {
+        rt->set_index_remove_fault_count_for_test(0);
+        b->arm_park.open();
+        b->release_hang();
+        rt->begin_stop();
+    }
+    void bound_redispatch_loop() {
+        std::lock_guard<std::mutex> lk{b->arm_park.mu};
+        b->arm_park.park_every = 1;
+    }
+};
+} // namespace
+
+TEST_CASE("#4605: a claim whose index mapping moved away cannot commit after the rule is detached",
+          "[spark][runtime][liveness]") {
+    using namespace std::chrono_literals;
+    Repro4605 f;
+    f.wedge_r1_on_a();
+    f.queue_r1_on_b();
+    f.reobserve_r1_on_a();
+    f.adopt_r1_on_a(); // armed id 1 (A); r1's mapping now points at A
+    REQUIRE(f.b->armed_ids().size() == 1);
+
+    // Step 5: detach finds r1's mapping on A and disarms A. B's claim is not on that key,
+    // so Case 0 cannot see it and it stays in flight.
+    f.rt->detach_rule("r1");
+    CHECK(f.rt->rule_count() == 0);
+    REQUIRE(yuzu::test::spin_until([&] { return f.b->disarms.load() == 1; }, 10s));
+    CHECK(f.rt->armed_key_count() == 0);
+
+    // Step 6: B's arm completes after the withdrawal. It must not commit a rule nobody wants.
+    f.gate_b->release();
+    REQUIRE(yuzu::test::spin_until([&] { return f.depth(f.key_b) == 0; }, 10s));
+    CHECK(f.rt->rule_count() == 0);
+    CHECK(f.rt->armed_key_count() == 0);
+    CHECK(yuzu::test::spin_until([&] { return f.b->disarms.load() == 2; }, 10s));
+    REQUIRE(f.b->armed_ids().size() == 2);
+    CHECK(f.b->disarmed_ids() == f.b->armed_ids()); // both subscriptions, by exact id
+    const auto lc = drain_lifecycle(*f.rt);
+    CHECK(std::none_of(lc.begin(), lc.end(),
+                       [](const OutboxEntry& e) { return e.lifecycle_kind == "armed"; }));
+}
+
+TEST_CASE("#4605: a claim whose index mapping moved away does not commit over the adopted rule",
+          "[spark][runtime][liveness]") {
+    using namespace std::chrono_literals;
+    Repro4605 f;
+    f.wedge_r1_on_a();
+    f.queue_r1_on_b();
+    f.reobserve_r1_on_a();
+    f.adopt_r1_on_a(); // armed id 1 (A)
+
+    // No withdrawal: r1 stays wanted on A. B's late success must be disarmed, not committed.
+    f.gate_b->release();
+    REQUIRE(yuzu::test::spin_until([&] { return f.depth(f.key_b) == 0; }, 10s));
+    CHECK(yuzu::test::spin_until([&] { return f.b->disarms.load() == 1; }, 10s));
+    CHECK(f.rt->rule_count() == 1);
+    CHECK(f.rt->armed_key_count() == 1);
+    REQUIRE(f.b->armed_ids().size() == 2);
+    CHECK(f.b->disarmed_ids() == std::vector<std::uint64_t>{f.b->armed_ids()[1]}); // B's, not A's
+    CHECK(f.rt->keys_for_type(SparkType::File) == std::vector<std::string>{f.key_a});
+}
+
+// Pins the other order (S2: ownership decides the winner). Green on dev too.
+TEST_CASE("#4605: when the in-flight claim completes first it owns the rule and the wedge is refused",
+          "[spark][runtime][liveness]") {
+    using namespace std::chrono_literals;
+    Repro4605 f;
+    f.wedge_r1_on_a();
+    f.queue_r1_on_b();
+    f.reobserve_r1_on_a();
+
+    f.gate_b->release(); // armed id 1 (B)
+    REQUIRE(yuzu::test::spin_until([&] { return f.rt->rule_count() == 1 && f.depth(f.key_b) == 0; }, 10s));
+    CHECK(f.rt->keys_for_type(SparkType::File) == std::vector<std::string>{f.key_b});
+
+    f.gate_a->release(); // armed id 2 (A): its late success is stale
+    REQUIRE(yuzu::test::spin_until([&] { return f.rt->wedge_adopt_stale_refused() == 1; }, 10s));
+    CHECK(yuzu::test::spin_until([&] { return f.b->disarms.load() == 1; }, 10s));
+    REQUIRE(f.b->armed_ids().size() == 2);
+    CHECK(f.b->disarmed_ids() == std::vector<std::uint64_t>{f.b->armed_ids()[1]}); // A's
+    CHECK(f.rt->rule_count() == 1);
+    CHECK(f.rt->keys_for_type(SparkType::File) == std::vector<std::string>{f.key_b});
+    CHECK(f.rt->receipt_status(f.receipt_a) == GuardianSparkRuntime::ReceiptStatus::Wedged);
+}
+
+TEST_CASE("#4605: an adoption that fails after the mapping moved leaves no claim able to commit",
+          "[spark][runtime][liveness]") {
+    using namespace std::chrono_literals;
+    Repro4605 f;
+    f.wedge_r1_on_a();
+    f.queue_r1_on_b();
+    f.reobserve_r1_on_a();
+
+    // Fault 12 sits after index_->add (which moved r1's mapping from B to A) and before
+    // the PerKey is built; the catch erases the re-added mapping, so r1 maps nowhere.
+    f.rt->set_drain_fault_point_for_test(12);
+    f.gate_a->release(); // armed id 1 (A)
+    REQUIRE(yuzu::test::spin_until([&] { return f.b->disarms.load() == 1; }, 10s)); // A compensated
+    CHECK(f.rt->rule_count() == 0);
+    CHECK(f.rt->armed_key_count() == 0);
+
+    // B still believes it owns r1's mapping; the index says it does not.
+    f.gate_b->release(); // armed id 2 (B)
+    REQUIRE(yuzu::test::spin_until([&] { return f.depth(f.key_b) == 0; }, 10s));
+    CHECK(f.rt->rule_count() == 0);
+    CHECK(f.rt->armed_key_count() == 0);
+    CHECK(yuzu::test::spin_until([&] { return f.b->disarms.load() == 2; }, 10s));
+    REQUIRE(f.b->armed_ids().size() == 2);
+    CHECK(f.b->disarmed_ids() == f.b->armed_ids());
+}
+
+TEST_CASE("#4605: a non-owning claim with a live sibling is staged Withdrawn and the sibling commits",
+          "[spark][runtime][liveness]") {
+    using namespace std::chrono_literals;
+    using RT = GuardianSparkRuntime;
+    Repro4605 f;
+    f.wedge_r1_on_a();
+    f.queue_r1_on_b();
+    auto x = f.rt->attach_rule(RT::NonWaiting{}, "x", file_spec("/b"), file_exists_rule("x"), true);
+    REQUIRE(x.has_value()); // queues behind r1's claim on B
+    f.reobserve_r1_on_a();
+    f.adopt_r1_on_a(); // armed id 1 (A); r1's mapping now points at A
+
+    f.gate_b->release(); // armed id 2 (B): x adopts it as the owning sibling
+    REQUIRE(yuzu::test::spin_until([&] { return f.depth(f.key_b) == 0; }, 10s));
+    CHECK(f.rt->receipt_status(f.receipt_b) == RT::ReceiptStatus::Withdrawn);
+    CHECK(f.b->disarms.load() == 0);
+    CHECK(f.rt->rule_count() == 2);
+    CHECK(f.rt->armed_key_count() == 2);
+
+    // Identity via teardown: x holds B's subscription, r1 still holds A's.
+    f.rt->detach_rule("x");
+    REQUIRE(yuzu::test::spin_until([&] { return f.b->disarms.load() == 1; }, 10s));
+    REQUIRE(f.b->armed_ids().size() == 2);
+    CHECK(f.b->disarmed_ids() == std::vector<std::uint64_t>{f.b->armed_ids()[1]}); // B's
+    CHECK(f.rt->armed_key_count() == 1);
+    CHECK(f.rt->rule_count() == 1);
+    f.rt->detach_rule("r1");
+    CHECK(yuzu::test::spin_until([&] { return f.b->disarms.load() == 2; }, 10s));
+    CHECK(f.b->disarmed_ids() == (std::vector<std::uint64_t>{f.b->armed_ids()[1], f.b->armed_ids()[0]}));
+    CHECK(f.rt->rule_count() == 0);
+    CHECK(f.rt->armed_key_count() == 0);
+}
+
+TEST_CASE("#5322: a same-rule re-attach under the sticky seam leaves no residue to abort on",
+          "[spark][runtime][liveness]") {
+    using namespace std::chrono_literals;
+    using RT = GuardianSparkRuntime;
+    SeamRig4605 f;
+    auto g1 = f.rt->attach_rule(RT::NonWaiting{}, "r", file_spec("/a"), file_exists_rule("r"), true);
+    REQUIRE(g1.has_value());
+    REQUIRE(f.b->wait_entered_hang(10s));
+
+    f.rt->set_index_remove_fault_count_for_test(-1);
+    const auto failures_before = f.rt->claim_index_release_failures();
+    // Case 0 withdraws generation 1 in place (its release fails: 1), generation 2 queues and
+    // add() transfers the mapping to it.
+    auto g2 = f.rt->attach_rule(RT::NonWaiting{}, "r", file_spec("/a"), file_exists_rule("r"), true);
+    REQUIRE(g2.has_value());
+    CHECK(f.rt->claim_index_release_failures() == failures_before + 1);
+
+    f.b->release_hang(); // generation 2 commits as the owning sibling
+    REQUIRE(yuzu::test::spin_until([&] { return f.rt->rule_count() == 1; }, 10s));
+    f.bound_redispatch_loop();
+    CHECK(yuzu::test::spin_until([&] { return f.rt->claim_queue_depth_for_test(f.key) == 0; }, 10s));
+    CHECK(f.rt->retained_tombstones() == 0);
+    CHECK(f.rt->claim_index_release_failures() == failures_before + 1); // generation 1's later releases are no-ops
+    CHECK(f.rt->rule_count() == 1);
+
+    f.rt->detach_rule("r");
+    CHECK(f.rt->detach_sweep_left_residue() == 0);
+    CHECK(yuzu::test::spin_until([&] { return f.b->disarms.load() == 1; }, 10s));
+    CHECK(f.rt->armed_key_count() == 0);
+}
+
+TEST_CASE("#5322: releasing a claim that no longer owns its mapping cannot fail",
+          "[spark][runtime][liveness]") {
+    using namespace std::chrono_literals;
+    using RT = GuardianSparkRuntime;
+    SeamRig4605 f;
+    auto h = f.rt->attach_rule(RT::NonWaiting{}, "h", file_spec("/a"), file_exists_rule("h"), true);
+    REQUIRE(h.has_value());
+    REQUIRE(f.b->wait_entered_hang(10s));
+    auto g1 = f.rt->attach_rule(RT::NonWaiting{}, "r", file_spec("/a"), file_exists_rule("r"), true);
+    REQUIRE(g1.has_value()); // queued behind H
+
+    f.rt->set_index_remove_fault_count_for_test(-1);
+    const auto failures_before = f.rt->claim_index_release_failures();
+    // Case 0 withdraws generation 1 in the MIDDLE of the fifo (its release fails: 1),
+    // generation 2 queues behind it and the mapping transfers.
+    auto g2 = f.rt->attach_rule(RT::NonWaiting{}, "r", file_spec("/a"), file_exists_rule("r"), true);
+    REQUIRE(g2.has_value());
+    CHECK(f.rt->claim_index_release_failures() == failures_before + 1);
+
+    f.b->release_hang(); // H and generation 2 commit; generation 1 is a non-owner
+    REQUIRE(yuzu::test::spin_until([&] { return f.rt->rule_count() == 2; }, 10s));
+    f.bound_redispatch_loop();
+    CHECK(yuzu::test::spin_until([&] { return f.rt->claim_queue_depth_for_test(f.key) == 0; }, 10s));
+    CHECK(f.rt->retained_tombstones() == 0);
+    CHECK(f.rt->claim_index_release_failures() == failures_before + 1);
+}
+
 // adversarial round 4 K2/C5: index_add_rollback's .fn runs inside ~GuardianRollback,
 // which swallows exceptions; remove_rule's key copy could throw there and leave a ghost
 // mapping. erase_rule is the same walk without the copy (noexcept).
