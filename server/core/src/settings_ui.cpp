@@ -939,7 +939,7 @@ extern const char* const kSettingsHtml =
         return;
       }
       var n = yuzuPwBytes(next);
-      if (n < 12) { showToast('The new password must be at least 12 characters.', 'error'); return; }
+      if (n < 12) { showToast('The new password must be at least 12 bytes.', 'error'); return; }
       if (n > 1024) { showToast('The new password must be at most 1024 bytes.', 'error'); return; }
       var url, payload;
       if (action === 'self') {

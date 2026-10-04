@@ -264,6 +264,40 @@ TEST_CASE("change_password / reset_password: not-local and absent accounts",
     }
 }
 
+TEST_CASE("change_password / reset_password: a SCIM adoption racing the write is kNotLocal",
+          "[pg][auth][password]") {
+    // The race hook fires after the pre-write read (which still sees a local
+    // row) and before the UPDATE. Flipping provisioning_source there makes the
+    // guarded write match nothing; the re-read must classify that as "not
+    // local any more" on BOTH paths — on the CAS path it must not be
+    // misreported as a concurrent password change (kConflict).
+    yuzu::test::AuthDbPg db;
+    AuthManager mgr;
+    mgr.set_auth_db(db.get());
+
+    SECTION("self change (CAS)") {
+        seed_local(*db, "adoptee", kOld, Role::user);
+        const auto anchor = anchor_of(mgr, "adoptee", kOld);
+        const auto before = db->get_user("adoptee")->hash_hex;
+        mgr.set_password_write_race_hook_for_test(
+            [&] { REQUIRE(db->set_provisioning_source("adoptee", "scim").has_value()); });
+        const auto r = mgr.change_password("adoptee", anchor, kNew);
+        mgr.set_password_write_race_hook_for_test(nullptr);
+        CHECK(r.outcome == PasswordWriteOutcome::kNotLocal);
+        CHECK(db->get_user("adoptee")->hash_hex == before);
+    }
+    SECTION("admin reset (plain)") {
+        seed_local(*db, "adoptee2", kOld, Role::user);
+        const auto before = db->get_user("adoptee2")->hash_hex;
+        mgr.set_password_write_race_hook_for_test(
+            [&] { REQUIRE(db->set_provisioning_source("adoptee2", "scim").has_value()); });
+        const auto r = mgr.reset_password("adoptee2", kNew);
+        mgr.set_password_write_race_hook_for_test(nullptr);
+        CHECK(r.outcome == PasswordWriteOutcome::kNotLocal);
+        CHECK(db->get_user("adoptee2")->hash_hex == before);
+    }
+}
+
 TEST_CASE("reset_password: a plain write, no target-role classification (#5342 Gate 7)",
           "[pg][auth][password]") {
     // Who may reset whom is decided ONCE, at the route, by is_rbac_administrator.

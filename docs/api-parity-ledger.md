@@ -41,8 +41,14 @@ One further row shape exists (#5342): a row keyed on a registered
 REST v1 capability that deliberately has no MCP twin - ADR-1005 expects one
 by default, so the reviewed reason lives here instead of being implicit.
 The two password routes (`POST /api/v1/users/me/password`,
-`POST /api/v1/users/{name}/password`) are the first such rows. Every other
-v1 route stays out of the ledger and is held to the OpenAPI check instead.
+`POST /api/v1/users/{name}/password`) are the first such rows (in
+`scripts/ci/api-parity/rbac.json`): the self-service change is excluded
+permanently (an MCP caller is a token, not the human), and the admin reset is
+deferred to #5357, an MCP tool that takes no password argument (a
+server-generated temporary password) because an approval ticket would store
+and display one. Both are also recorded in ADR-1005's exception ledger
+(`docs/adr-1005-execution-plan.md`). Every other v1 route stays out of the
+ledger and is held to the OpenAPI check instead.
 
 **What populated this first PR.** Every row was extracted mechanically by
 `check-api-parity.py`'s lexical scanner (verified self-consistent against

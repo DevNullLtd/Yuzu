@@ -2169,13 +2169,29 @@ PasswordWriteResult AuthManager::write_password(const std::string& username,
         }
         if (again->identity_source != "local") {
             out.outcome = PasswordWriteOutcome::kNotLocal;
+            return out;
+        }
+        // The same two axes the pre-write classification checks
+        // (read_local_account_for_password_write): set_password's WHERE clause also
+        // requires provisioning_source='local', so a SCIM adoption between the
+        // read and the write is "not local any more" — on the CAS path too,
+        // where it would otherwise be misreported as a concurrent change.
+        auto prov = auth_db_->get_provisioning_source(username);
+        if (!prov) {
+            out.outcome = prov.error() == yuzu::server::AuthDBError::UserNotFound
+                              ? PasswordWriteOutcome::kNotFound
+                              : PasswordWriteOutcome::kStoreUnavailable;
+            return out;
+        }
+        if (*prov != yuzu::server::kProvisioningSourceLocal) {
+            out.outcome = PasswordWriteOutcome::kNotLocal;
         } else if (cas_anchor) {
             out.outcome = PasswordWriteOutcome::kConflict;
         } else {
             // A plain guarded write matched nothing, yet the row is active and
-            // identity_source='local' — so provisioning_source flipped away
-            // from 'local' (SCIM adopted the account) between the read and the
-            // write. Not a local account any more.
+            // local on both axes when re-read: it changed and changed back
+            // between the write and this read. Report it as not local (the
+            // write was refused for that reason); the caller writes nothing.
             out.outcome = PasswordWriteOutcome::kNotLocal;
         }
         return out;

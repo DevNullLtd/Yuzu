@@ -53,7 +53,7 @@
     "capability_id": "post.api-v1-users-param-password",
     "rest_v1_twin": null,
     "mcp_twin": null,
-    "status": "exception:#5342 admin password reset has NO MCP twin yet -- UserManagement:Write at the supervised MCP tier is approval-gated, and an approval ticket persists the tool's canonical_args (args.dump()) in plaintext in approvals.scope_expression and renders them to approvers, so a password argument would be stored and displayed; deferred to a temp-password MCP tool that takes no password argument (follow-up to #5342)"
+    "status": "exception:#5342 admin password reset has NO MCP twin yet -- UserManagement:Write at the supervised MCP tier is approval-gated, and an approval ticket persists the tool's canonical_args (args.dump()) in plaintext in approvals.scope_expression and renders them to approvers, so a password argument would be stored and displayed; deferred to #5357: a reset_user_password MCP tool that takes no password argument (server-generated temporary password + must_change_password, auth schema v3)"
   },
   {
     "method": "GET",

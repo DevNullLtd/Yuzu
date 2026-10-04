@@ -235,7 +235,7 @@ constexpr std::string_view kSelfDemoteToast =
 constexpr std::string_view kDuplicateUsernameToast =
     R"({"showToast":{"message":"Username already exists","level":"error"}})";
 constexpr std::string_view kShortPasswordToast =
-    R"({"showToast":{"message":"Password must be at least 12 characters","level":"error"}})";
+    R"({"showToast":{"message":"Password must be at least 12 bytes","level":"error"}})";
 
 } // namespace
 
@@ -715,7 +715,7 @@ TEST_CASE("SettingsRoutes /fragments/settings/users: add-user form carries minle
     REQUIRE(res);
     REQUIRE(res->status == 200);
     CHECK(res->body.find("minlength=\"12\"") != std::string::npos);
-    CHECK(res->body.find("min 12 chars") != std::string::npos);
+    CHECK(res->body.find("(12-1024 bytes)") != std::string::npos);
 }
 
 // ── Self-deletion guard — UI side (#403) ─────────────────────────────────────
@@ -1022,7 +1022,8 @@ TEST_CASE("SettingsRoutes GET /fragments/settings/users: password buttons on loc
     CHECK(count_of(body, "name=\"confirm_password\"") == 3);
     // The forms are hidden until toggled and carry the policy bounds.
     CHECK(count_of(body, "class=\"pw-form-row\"") == 3);
-    CHECK(count_of(body, "maxlength=\"1024\"") == 7); // self: current+new+confirm; 2 x reset: new+confirm
+    // self: current+new+confirm; 2 x reset: new+confirm; + the add-user form's password.
+    CHECK(count_of(body, "maxlength=\"1024\"") == 8);
     // No CSP-blocked inline htmx handlers anywhere in the fragment —
     // including the "Sign out everywhere" button, which used one before.
     CHECK(body.find("hx-on") == std::string::npos);

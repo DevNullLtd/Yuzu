@@ -281,10 +281,11 @@ The server's own CA, default certificates and key-encryption keys stay where the
 - **A connection string is required on a fresh install, and on an upgrade from any earlier version**, because no earlier version stored one. Give `/POSTGRES_DSN_FILE=<file>` (preferred) or `/POSTGRES_DSN=<connection string>`. Without one the install stops with exit code 7. The exception is a `YUZU_POSTGRES_DSN` environment variable, set machine-wide or for the service: the installer then goes ahead and logs a warning that local users can read it. Earlier installers never passed a connection string, so the service they registered could not start.
 - **A `YUZU_POSTGRES_DSN` or `YUZU_OIDC_CLIENT_SECRET` environment variable cannot be combined with a stored secret of the same kind.** The server refuses to start with both, so the installer refuses first and changes nothing. Remove the environment variable, then run the installer again.
 - **An OIDC client secret is not carried from an earlier version:** none stored it anywhere except the service's command line, and their own command line lost its arguments. Give it with `/OIDC_CLIENT_SECRET_FILE=` (preferred) or `/OIDC_CLIENT_SECRET=`. If you had added `--oidc-client-secret` to the service's command line by hand and OIDC is enabled on the upgrade (`/OIDC_ISSUER`), the upgrade refuses until you give the secret again; rotate it in your identity provider afterwards, since local users could read it.
-- **An upgrade keeps the existing accounts** when `/ADMIN_USER`, `/ADMIN_PASS` and the operator pair are left out. Giving `/ADMIN_PASS` on an upgrade does not reset the admin's password either: it changes only the hash in `yuzu-server.cfg`, which seeds a fresh database and is not consulted for an account the PostgreSQL auth store already holds (#5274). It keeps the stored connection string unless a new one is given, and keeps the stored OIDC secret when `/OIDC_ISSUER` is given again. Repeat your other options (`/GATEWAY`, `/OIDC_ISSUER`, `/OIDC_CLIENT_ID`, …) on an upgrade: they are not remembered.
+- **An upgrade keeps the existing accounts; leave out `/ADMIN_USER`, `/ADMIN_PASS` and the operator pair.** An upgrade is any run where `%ProgramData%\Yuzu Server\yuzu-server.cfg` already exists, including an upgrade from an earlier version. The installer can no longer change a stored password: `yuzu-server.cfg` only seeds the first administrator into an empty database and is not consulted for an account the PostgreSQL auth store already holds (#5274), so a new hash written there would be ignored and the old password would stay valid. A non-empty `/ADMIN_PASS=` or `/OPERATOR_PASS=` on an upgrade is therefore **refused with exit code 11** before anything is stopped or changed, and the interactive wizard skips the account pages on an upgrade. Change or reset passwords in the product instead (Settings → User Management → **Change password** / **Reset password**), or with the direct-SQL fallback in `docs/ops-runbooks/auth-db-recovery.md` if no administrator can sign in. On a fresh install the passwords must be at least 12 characters and at most 1024 bytes of UTF-8 (the server's limit; a character outside ASCII takes 2–4 bytes). The optional `/OPERATOR_USER` account is written to `yuzu-server.cfg` but is never provisioned into the PostgreSQL auth store, so it cannot sign in (#5343); create further accounts in Settings → User Management. An upgrade keeps the stored connection string unless a new one is given, and keeps the stored OIDC secret when `/OIDC_ISSUER` is given again. Repeat your other options (`/GATEWAY`, `/OIDC_ISSUER`, `/OIDC_CLIENT_ID`, …) on an upgrade: they are not remembered.
 - **Upgrade in place; do not uninstall the previous version first.** Uninstalling removes the service and the installation record but keeps the old, unlocked data directory. The new installer then cannot tell that an administrator created that directory, and refuses it.
 - **Exit code 7** means the install was stopped before any file was installed: an input was missing or invalid, or something could not be secured. The reason is in the setup log on a line starting `PrepareToInstall:`. If the existing service had been stopped by then, it is left stopped, and the message says so (and says if it was disabled). The exception is an upgrade from an unsecured directory that stops before the old directory is moved: the service is then started again. On an upgrade of an already-secured install, the message also lists any files in the data directory that had already been replaced.
 - **Exit code 10** means the files were installed but the service could not be registered or its command line could not be written. Setup disables the service if it can, and the message and log say whether it did; if not, disable it yourself (`sc config YuzuServer start= disabled`) until the cause is fixed.
+- **Exit code 11** means an upgrade was given a non-empty `/ADMIN_PASS=` or `/OPERATOR_PASS=` (see above). Setup stopped before the wizard, before the service was stopped and before anything was written; the reason is in the setup log on a line starting `InitializeSetup:`. Run it again without the account parameters, then change the password in the product. (Setup's own temporary folder in `%TEMP%` is left behind in this case; it holds nothing secret.)
 - **Secrets on the command line are recorded** in the setup log (`/LOG=`) and by deployment tools such as SCCM (AppEnforce.log) and Intune, including any `/ADMIN_PASS=`, `/OPERATOR_PASS=`, `/POSTGRES_DSN=` or `/OIDC_CLIENT_SECRET=` value. Prefer `/POSTGRES_DSN_FILE=` and `/OIDC_CLIENT_SECRET_FILE=`. Stage those files in a pre-step, with permissions only Administrators and SYSTEM can read, and delete them afterwards: the installer copies them and leaves the originals. `/ADMIN_PASS=` and `/OPERATOR_PASS=` have no file form, so treat those logs as secrets: restrict or purge them after the deployment.
 
 **Upgrading from an earlier version.** Its data directory is not locked, so the installer builds a new, locked one. It copies across only plain files that are owned by Administrators or SYSTEM and that no other account can change, from folders that are owned by Administrators or SYSTEM and in which no other account can delete or rename anything: the configuration, `postgres.dsn`, `oidc-client-secret`, and the files directly in `certs\` and `data\`. Subdirectories stay behind. The old directory is renamed to `%ProgramData%\Yuzu Server.insecure-<date>-<time>`; it is never changed or deleted.
@@ -293,11 +294,11 @@ If any file that would be copied, or a folder holding one, fails that check, or 
 
 **After upgrading from an earlier version:**
 
-1. **Rotate what the old directory exposed.** Local users could read it, so treat its contents as disclosed: reset the dashboard passwords, re-issue the TLS keys in `certs\`, and rotate the OIDC client secret. Reset the passwords **in the product** (Settings → User Management, or `POST /api/v1/users/me/password` / `POST /api/v1/users/{name}/password`): re-running the installer with a new `/ADMIN_PASS` rewrites the hash in `yuzu-server.cfg` but does not change an account that already exists in the PostgreSQL auth store, because the config file only seeds a fresh database (#5274).
+1. **Rotate what the old directory exposed.** Local users could read it, so treat its contents as disclosed: reset the dashboard passwords, re-issue the TLS keys in `certs\`, and rotate the OIDC client secret. Reset the passwords **in the product** (Settings → User Management, or `POST /api/v1/users/me/password` / `POST /api/v1/users/{name}/password`): the installer refuses a new `/ADMIN_PASS` on an upgrade (exit code 11), because the config file only seeds a fresh database and could not change an account that already exists in the PostgreSQL auth store (#5274). The old hashes stay in `yuzu-server.cfg` — the server logs a boot warning naming each account whose stored password no longer matches it.
 2. **Move the server's data subdirectories, if you ran the server.** `data\agent-updates\` and `data\upload-blobs\` (OTA packages and uploads that database rows refer to) stay in the renamed directory. Local users could create files in them, so check their contents. Then stop the server, move them into the new `data\`, make Administrators their owner and reset their permissions: `icacls "%ProgramData%\Yuzu Server\data" /setowner *S-1-5-32-544 /T /L`, then `icacls "%ProgramData%\Yuzu Server\data" /reset /T /L`. If you would rather not trust them, re-upload the packages instead.
 3. **Delete the renamed directory** once the upgrade is confirmed. It still holds the old password hashes and keys.
 
-**Constrained Language Mode** (WDAC script enforcement, or AppLocker script rules for an install run by an administrator) blocks the .NET calls the installer needs to hash new passwords, so an install with `/ADMIN_PASS` stops with a message saying so. An upgrade that keeps the existing accounts works, and so does an install run as SYSTEM, which AppLocker exempts.
+**Constrained Language Mode** (WDAC script enforcement, or AppLocker script rules for an install run by an administrator) blocks the .NET calls the installer needs to hash new passwords, so a fresh install with `/ADMIN_PASS` stops with a message saying so. An upgrade (which keeps the existing accounts and hashes nothing) works, and so does an install run as SYSTEM, which AppLocker exempts.
 
 ### vNEXT — a hand-edited config listing local users but none with `role=admin` now fails boot, on every restart (breaking)
 
@@ -3087,31 +3088,48 @@ their credentials live at the identity provider (#5342).
 
 - **Your own row → Change password.** Enter the current password and
   the new one twice. On success every session of your account is
-  signed out — on every server — and this browser is handed a fresh
-  session, so you stay signed in here. A wrong current password counts
-  toward account lockout like a failed login.
+  signed out — on every server, **this browser included** — and you are
+  sent to the sign-in page to sign in again with the new password; no
+  replacement session is issued. A wrong current password counts
+  toward account lockout like a failed login. Under
+  `--auth-mode=sso-only` only the armed break-glass account can change
+  its own password. This button is on the admin-only User Management
+  page, so non-admin users change their password with
+  `POST /api/v1/users/me/password` for now (#5353).
 - **Any other local row → Reset password.** Enter the new password
-  twice. Every dashboard session of that user is signed out. Their
-  **API tokens are not revoked**; the confirmation toast says how many
-  are still active, so you can revoke them (Settings → API Tokens) if
-  the account may be compromised. Resetting an **administrator's**
-  password needs a standing admin — a JIT elevation is refused.
+  twice. Every dashboard session of that user is signed out and its
+  lockout is cleared (the toast says if the lockout could not be
+  cleared — use **Unlock** then). Their **API tokens are not revoked**;
+  the toast says how many are still active, or that it could not tell,
+  so you can revoke them (Settings → API Tokens) if the account may be
+  compromised. **Reset needs a durable Administrator:** with RBAC off,
+  your own account must hold the `admin` role; with RBAC on, you need
+  a user `Administrator` grant. A JIT elevation, an admin role that
+  comes only from your identity provider's group mapping, or a custom
+  role holding `UserManagement:Write` is refused. The configured
+  break-glass account (`--break-glass-user`) cannot be reset here; it
+  is re-keyed out of band, or by signing in as it while armed and
+  changing its own password.
 
-Both require a password of 12–1024 bytes, clear the account's lockout,
-and prompt for an MFA code when your session's step-up proof is stale.
-They are recorded as `user.password_change` / `user.password_reset`; if
-the audit row cannot be written, the change is rolled back and an error
-toast is shown. The REST contract (`POST /api/v1/users/me/password`,
-`POST /api/v1/users/{name}/password`) is in
-[rest-api.md](rest-api.md#post-apiv1usersmepassword); there is no MCP
-tool for either, by design.
+Both require a password of 12–1024 bytes (UTF-8), and prompt for an MFA
+code when your session's step-up proof is stale. The sessions are
+signed out **before** the password is written; if that cannot be
+recorded durably, nothing is written and an error toast asks you to
+retry. Both are recorded as `user.password_change` /
+`user.password_reset`; if the audit row cannot be written, the change
+is rolled back and an error toast is shown. The REST contract
+(`POST /api/v1/users/me/password`, `POST /api/v1/users/{name}/password`)
+is in [rest-api.md](rest-api.md#post-apiv1usersmepassword); there is no
+MCP tool for either, by design (#5357 tracks a temporary-password reset
+tool).
 
 > **`yuzu-server.cfg` no longer resets a password (#5274).** The config
 > file seeds the first administrator into the PostgreSQL auth store on a
 > fresh database. After that, login checks the auth store only — editing
 > a hash in the config file, regenerating it, or re-running an installer
 > with a new admin password does not change an existing account's
-> password. Use the buttons above or the REST routes; if no
+> password (the Windows installer now refuses `/ADMIN_PASS` on an
+> upgrade, exit code 11). Use the buttons above or the REST routes; if no
 > administrator can sign in at all, see
 > [the recovery runbook](../ops-runbooks/auth-db-recovery.md#password-reset).
 

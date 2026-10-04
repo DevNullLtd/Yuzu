@@ -275,7 +275,10 @@ invalidate the sealed escape hatch — both before step-up. The body is parsed
 with a non-throwing, type-guarded parse and never echoed; body/policy `400`s
 are not audited; passwords, hashes and lengths never reach a log or audit row.
 Every audit row both routes write names the principal captured before any
-revoke (`AuthRoutes::audit_log_for_principal`).
+revoke (`AuthRoutes::audit_log_for_principal`). (The session-revoke routes
+`DELETE /api/v1/sessions/me` and `DELETE /api/v1/sessions?username=` still
+write their row after revoking the caller's own session, with an empty
+principal — #5358.)
 
 **Lockout.** The self route's current-password check runs through
 `AuthRoutes::verify_password_with_lockout` — the striped `login_lock_for`
@@ -289,7 +292,12 @@ password is incorrect" as a wrong password (audit detail `account_locked` vs
 `--auth-mode=sso-only` the same section runs `/login`'s hardened-mode gate
 (`AuthRoutes::sso_only_local_password_gate`) before PBKDF2: only an ARMED
 break-glass account may change its password; a disarmed one gets
-`403 sso_only_local_disabled` with no password evaluated and no strike.
+`403 sso_only_local_disabled` with no password evaluated and no strike. A
+verified current password clears a non-zero failure counter exactly as a
+successful login does (`auth.lockout.cleared`, detail
+`reset_on_password_change`) — before the write, so it stays cleared even if the
+write is then refused. Response timing can still tell a locked account from a
+wrong password, on `/login` and here alike (#5364).
 
 **Sequence — revoke first, then write, then audit.** Both routes revoke every
 session of the account (`invalidate_user_sessions` — durable delete +
@@ -304,9 +312,11 @@ written>` (restores only if nobody wrote since) → `500` + `Sec-Audit-Failed`.
 If the rollback also fails → `500` + `Sec-Audit-Failed` + `spdlog::critical` +
 `yuzu_auth_password_change_unrecorded_total{kind}` (alert
 `YuzuPasswordChangeUnrecorded`), with the state (new password in effect,
-unrecorded, sessions revoked) disclosed in the body. A same-transaction
-audit+mutation API on `AuditStore` would remove the compensating write; that is
-a follow-up.
+unrecorded, sessions revoked) disclosed in the body. The rollback is itself a
+`set_password` call, which refuses an empty hash or salt, so an account
+hand-seeded with an empty credential cannot be rolled back and lands in the
+unrecorded branch (#5362). A same-transaction audit+mutation API on
+`AuditStore` would remove the compensating write altogether (#5360).
 
 **Sessions and lockout.** The self route issues **no** replacement session: it
 answers with a clearing `Set-Cookie` (`Max-Age=0`) and `session_reissued:false`
@@ -330,18 +340,41 @@ AuthDB wired, `find_user_or_hydrate` reads the AuthDB and **never consults
 precedent); `users_` remains the store only in cfg-only (no-AuthDB) mode. And
 `recheck_role_locked`'s row-locked `SELECT ... FOR UPDATE` now also returns
 `password_hash`; the credential check **denies** if it differs from the hash
-just verified (a change committed mid-login — the user retries; no re-verify),
-counted by `yuzu_auth_credential_changed_during_verify_total`. The cfg file is
-therefore seed-only by construction: an operator can no longer reset a
-password by editing it (behaviour change — see `docs/user-manual/upgrading.md`).
-cfg-only non-admin accounts are a separate, pre-existing gap (only the cfg
-admin is provisioned on a fresh database) and are not changed here.
+just verified: `verify_password` returns `kCredentialChanged` (a change
+committed mid-login), which is transient — `/login` answers `503` +
+`Retry-After` with no lockout strike and no `auth.login_failed` row, and the
+user retries; no re-verify. Counted by
+`yuzu_auth_credential_changed_during_verify_total`. The cfg file is therefore
+seed-only by construction: an operator can no longer reset a password by
+editing it, and a password rotated that way before this change reverts on
+upgrade to the stored one (behaviour change — see
+`docs/user-manual/upgrading.md`). The Windows server installer refuses a
+password on an upgrade for the same reason (exit code 11,
+`docs/user-manual/server-admin.md`). cfg-only non-admin accounts are a
+separate, pre-existing gap (only the cfg admin is provisioned on a fresh
+database; the second first-run account and the installer's `/OPERATOR_USER`
+can never sign in on Postgres — #5343) and are not changed here.
+
+**The cfg file is still a bootstrap credential.** It seeds the first
+administrator whenever the `auth` schema is empty, so an empty-database
+rebuild (a lost or recreated Postgres, a restore onto a fresh database)
+re-seeds whatever password hash the file holds — typically the original
+first-boot password, not the current one. Protect the file like the
+credential it is (the Windows installer locks it to Administrators and SYSTEM),
+and change the administrator password in the product after any rebuild. At
+boot, after `set_auth_db`, `AuthManager::report_stale_cfg_credentials` compares
+each cfg entry's hash with its `auth.users` row and logs a WARN naming every
+account whose stored credential differs ("#5274 cfg is seed-only; stored
+credential wins"), setting the gauge `yuzu_auth_cfg_credentials_stale` to their
+count. It writes no audit row (#5361).
 
 **Password policy.** `password_policy.hpp` is the ONE length policy:
 `kMinPasswordBytes = 12`, `kMaxPasswordBytes = 1024` (bytes). It replaces the
 three hand-copied `< 12` checks; `/login` answers an over-max password like a
 wrong one without running PBKDF2. Body cap: `kBodyCapTable` row `/api/v1/users`
-(any method, 16 KiB, `path_class="users"`).
+(any method, 16 KiB, `path_class="users"`). The Windows server installer and
+`generate-config.ps1` enforce the same 1024-byte maximum (UTF-8) on a fresh
+install; the Compose Wizard does not yet (#5363).
 
 **No MCP twin** (ADR-1005 parity-ledger `exception:` rows,
 `docs/api-parity-ledger.md`). Self-service change is permanently excluded: an
@@ -351,7 +384,9 @@ deferred: `UserManagement:Write` is approval-gated at the supervised MCP tier,
 and an approval ticket persists the tool's `canonical_args` in plain text
 (`approvals.scope_expression`) and renders them to approvers — a password
 argument would be stored and displayed. The intended follow-up is a
-temp-password MCP tool that takes no password argument.
+temp-password MCP tool that takes no password argument (a server-generated
+temporary password plus a must-change-at-next-sign-in flag, auth schema v3 —
+#5357).
 
 **Metric.** `yuzu_auth_password_changes_total{kind="self"|"admin", result="ok"|"denied"|"error"}`.
 

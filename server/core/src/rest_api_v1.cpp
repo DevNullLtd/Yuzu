@@ -2142,7 +2142,7 @@ bool password_route_session_gates(PasswordRouteCtx& ctx, const auth::Session& s,
 bool password_route_policy_ok(const PasswordRouteCtx& ctx, const std::string& next) {
     switch (auth::check_password_policy(next)) {
     case auth::PasswordPolicyVerdict::kTooShort:
-        ctx.reject_unaudited(400, "password must be at least 12 characters");
+        ctx.reject_unaudited(400, "password must be at least 12 bytes (UTF-8)");
         return false;
     case auth::PasswordPolicyVerdict::kTooLong:
         ctx.reject_unaudited(400, "password must be at most 1024 bytes");

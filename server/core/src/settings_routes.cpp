@@ -695,7 +695,7 @@ std::string SettingsRoutes::render_users_fragment(const std::string& current_use
                 }
                 html += "<div class=\"mini-field\"><label>New password <span "
                         "style=\"color:#8b949e;font-weight:normal;font-size:0.7rem\">"
-                        "(min 12 chars)</span></label>"
+                        "(12-1024 bytes)</span></label>"
                         "<input type=\"password\" name=\"new_password\" "
                         "autocomplete=\"new-password\" minlength=\"12\" maxlength=\"1024\" "
                         "required></div>"
@@ -725,9 +725,9 @@ std::string SettingsRoutes::render_users_fragment(const std::string& current_use
             "  </div>"
             "  <div class=\"mini-field\">"
             "    <label>Password <span style=\"color:#8b949e;font-weight:normal;"
-            "font-size:0.7rem\">(min 12 chars)</span></label>"
+            "font-size:0.7rem\">(12-1024 bytes)</span></label>"
             "    <input type=\"password\" name=\"password\" placeholder=\"password\" "
-            "           minlength=\"12\" required>"
+            "           minlength=\"12\" maxlength=\"1024\" required>"
             "  </div>"
             "  <div class=\"mini-field\">"
             "    <label>Role</label>"
@@ -4935,14 +4935,14 @@ void SettingsRoutes::register_routes(
         }
         if (!auth_mgr_->upsert_user(username, password, role)) {
             spdlog::warn("POST /api/settings/users: upsert rejected for '{}' "
-                         "(weak_password — minimum 12 characters)",
+                         "(weak_password — minimum 12 bytes)",
                          username);
             audit_fn_(req, "user.create", "denied", "User", username, "weak_password");
             res.status = 400;
             res.set_header(
                 "HX-Trigger",
-                R"({"showToast":{"message":"Password must be at least 12 characters","level":"error"}})");
-            res.set_content(detail::a4_error(res, "Password must be at least 12 characters"),
+                R"({"showToast":{"message":"Password must be at least 12 bytes","level":"error"}})");
+            res.set_content(detail::a4_error(res, "Password must be at least 12 bytes"),
                             "application/json");
             return;
         }

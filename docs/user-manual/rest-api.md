@@ -1551,21 +1551,23 @@ curl -s -X POST \
 
 #### `POST /api/v1/users/me/password`
 
-Change the caller's own **local-account** password (#5342). The caller proves the current password; the new one must be **12–1024 bytes** (UTF-8 bytes). The dashboard's Settings → User Management → **Change password** button uses this route.
+Change the caller's own **local-account** password (#5342). The caller proves the current password; the new one must be **12–1024 bytes** of UTF-8 (bytes, not characters — a character outside ASCII takes 2–4 bytes). The dashboard's Settings → User Management → **Change password** button uses this route.
 
-**Who can call it:** an interactive dashboard session whose account is local (`auth_source=local`). There is no extra permission check — every local user may change their own password.
+**Who can call it:** an interactive dashboard session whose account is local (`auth_source=local`). There is no extra permission check — every local user may change their own password. Under `--auth-mode=sso-only` only the configured break-glass account, and only while it is armed, may use it (see the `403 sso_only_local_disabled` row below). Non-admin users have no dashboard page for it yet: the button is on the admin-only User Management page, so a non-admin uses the REST call (#5353).
 
-**Request requirements (all checked before the body is read):**
+**Order of checks.** Each step runs only if every earlier one passed:
 
-| Check | Refusal |
-|---|---|
-| API token, MCP token, engine principal or service-scoped token | `403`, audit detail `token_session` — credentials never transit a token or MCP channel |
-| OIDC or SAML session | `409` "not a local account", audit detail `not_local` — change it at the identity provider |
-| Cross-origin request: `Origin`/`Referer` not the dashboard's own origin (or a `--csrf-trusted-origins` entry), **or both headers absent** | `403`, audit detail `csrf` |
-| `Content-Type` is not `application/json` | `415` (not audited) |
-| MFA enrolled and the step-up proof is stale | `401` step-up envelope (`meta.mfa_step_up_required`, `meta.challenge_url`) |
+1. Authentication (`401` without a session).
+2. Session class: an API, MCP or engine token, or a service-scoped token, is `403 token_session`; an OIDC or SAML session is `409 not_local` (change it at the identity provider).
+3. Same-site request: `Origin`/`Referer` must be the dashboard's own origin (or a `--csrf-trusted-origins` entry), and a request carrying **neither** header is refused — `403 csrf`. `Content-Type` must be `application/json` — `415` (not audited).
+4. MFA step-up, when the account is enrolled and its proof is stale — `401` step-up envelope (`meta.mfa_step_up_required`, `meta.challenge_url`).
+5. Body and length policy — `400`, **not audited** (nothing security-relevant was attempted, and a policy rejection never records the length). The body is never echoed, because it may hold a password.
+6. The current password, through the same lockout-accounted check as `POST /login`: a wrong password is `403 wrong_current` and counts toward [account lockout](server-admin.md#server-cli-flags); a locked account gets the **same** `403` and message (`account_locked` in the audit row only — no lock-state oracle). A password that could not be verified — the auth store could not be read, or the stored password changed while it was being checked — is a retryable `503 verify_transient` and never counts. If the lockout counter cannot be recorded the answer is `503 store_unavailable` (fail closed: an uncounted guess is never answered as an ordinary wrong password). A correct current password clears a non-zero failure counter (`auth.lockout.cleared`, `detail=reset_on_password_change`).
+7. **Revoke first.** Every session of the account — **including the caller's own** — is revoked, durably and on every replica, **before** the password changes, so no session outlives the old password. The response clears the caller's cookie from this point on (`Set-Cookie: yuzu_session=; ... Max-Age=0`), whatever happens next. If the revoke cannot be stored durably the answer is `503 session_revoke_failed` (`retry_after_ms: 2000`) and **nothing is written**.
+8. The write: a compare-and-swap on exactly the stored password step 6 verified. A refusal here says "sessions were revoked; password unchanged": `409 conflict` (the password changed concurrently, e.g. a reset), `409 not_local` (the account became SCIM-managed in between), `404 not_found` (it was deactivated), `503 store_unavailable`.
+9. The audit row, fail-closed (below).
 
-**Body:** `{"current_password": "<string>", "new_password": "<string>"}`. A body that is not that shape is `400` — the body is never echoed, because it may hold a password.
+**Body:** `{"current_password": "<string>", "new_password": "<string>"}`.
 
 **Example:**
 
@@ -1575,11 +1577,10 @@ curl -s -X POST \
   -H "Origin: https://yuzu.example.com" \
   -H "Content-Type: application/json" \
   -d '{"current_password":"old-password-123","new_password":"a-new-long-password"}' \
-  -c cookies.txt \
   "https://yuzu.example.com/api/v1/users/me/password"
 ```
 
-**Response (200)** — and a `Set-Cookie: yuzu_session=...` header carrying a **replacement session**:
+**Response (200)** — with a `Set-Cookie` header that **clears** the session cookie:
 
 ```json
 {
@@ -1587,36 +1588,39 @@ curl -s -X POST \
     "username": "alice",
     "password_changed": true,
     "sessions_revoked": 3,
-    "sessions_db_persisted": true,
-    "session_reissued": true,
+    "session_reissued": false,
     "audit_emitted": true
   },
   "meta": { "api_version": "v1" }
 }
 ```
 
-On success the server revokes **every** session of the account (durably, so every replica drops them — the caller's own session included), then mints a new session for the caller and returns it in `Set-Cookie`, so the browser stays signed in. The new session keeps the old one's MFA proof but **not** a JIT admin elevation. If the replacement cannot be minted, `session_reissued` is `false` and the response clears the cookie instead (`Max-Age=0`) — the password change still stands; sign in again with the new password. API tokens are not touched. The lockout counter is cleared. `sessions_db_persisted=false` means the durable revoke failed and another replica may honour an old session until it expires. `audit_emitted` reports the **session-revoke** audit row (`session.revoke_all.self`, `detail=count=<N> reason=password_change`); the password-change row itself is mandatory (see below), so a `200` always means it was written.
+No replacement session is issued: the caller is signed out and signs in again with the new password. `sessions_revoked` counts the sessions revoked at step 7 (the caller's included). `session_reissued` is always `false` and `audit_emitted` always `true` — a `200` means the `user.password_change` row was written. API tokens are not touched.
 
 **Errors:**
 
 | Status | Audit detail | Meaning |
 |---|---|---|
-| `400` | `weak_password` / `too_long` | New password under 12 or over 1024 bytes |
-| `400` | *(not audited)* | Malformed body |
+| `400` | *(not audited)* | Malformed body, or new password outside 12–1024 bytes |
 | `401` | — | No session, or MFA step-up required |
-| `403` | `wrong_current` | The current password is wrong. Counts toward [account lockout](server-admin.md#server-cli-flags) exactly like a failed `/login` |
-| `403` | `account_locked` | The account is locked. **Same message as a wrong password** ("current password is incorrect") — no lock-state oracle |
-| `403` | `token_session` / `csrf` | See the table above |
+| `403` | `token_session` / `csrf` | Steps 2–3 |
+| `403` | `wrong_current` | The current password is wrong. Counts toward lockout exactly like a failed `/login` |
+| `403` | `account_locked` | The account is locked. **Same message as a wrong password** ("current password is incorrect") |
+| `403` | `sso_only_local_disabled` | `--auth-mode=sso-only` and this is not an armed break-glass account. No password was evaluated and nothing counts toward lockout |
+| `404` | `not_found` | The account was deactivated in between (sessions were revoked; password unchanged) |
 | `409` | `not_local` | OIDC/SAML session, or the account is SSO/SCIM-managed |
-| `409` | `conflict` | The stored password changed between the check and the write (a concurrent reset). Nothing was written; retry |
-| `404` | `not_found` | The account was deactivated in between |
+| `409` | `conflict` | The stored password changed between the check and the write (sessions were revoked; password unchanged). Sign in with the current password and retry |
 | `415` | *(not audited)* | `Content-Type` is not `application/json` |
 | `500` | `audit_failed_rolled_back` / `audit_failed_rollback_failed` | The audit row could not be written — see below |
+| `503` | `verify_transient` | The current password could not be verified (store read failure, or a concurrent change). Retry |
+| `503` | `session_revoke_failed` | Sessions could not be durably revoked; the password was **not** changed. Retry |
 | `503` | `store_unavailable` | The auth store is unavailable (`retry_after_ms: 2000`), or the server runs without the Postgres auth store (`retry_after_ms: 5000`) |
 
-**Audit:** `user.password_change`, `target_type=User`, `target_id=<caller>`. Success is `result=ok`, `detail=self_service`. Refusals are `result=denied` (or `error` for `503`/`500`) with the detail tokens above. The password, its hash and its length never appear in any audit row or log line. **The success row is fail-closed:** if it cannot be written, the server restores the previous password with a compare-and-swap (it restores only if nobody has written since) and answers `500` with `Sec-Audit-Failed: true` and "could not record the password change; it was not applied". If the restore **also** fails, the `500` says so — the new password is in effect, unrecorded, and no sessions were revoked; an administrator must review the audit and auth stores (the server logs this at `critical`).
+Every `503` carries `retry_after_ms` and a `Retry-After` header.
 
-**Metric:** `yuzu_auth_password_changes_total{kind="self", result="ok"|"denied"|"error"}`.
+**Audit:** `user.password_change`, `target_type=User`, `target_id=<caller>`. Every row — before and after the revoke — names the caller as principal (captured before its own session is revoked). Success is `result=ok`, `detail=self_service sessions_revoked=<N>`; there is no separate `session.revoke_all` row. Refusals are `result=denied` (`error` for `500`/`503`) with the detail tokens above. The password, its hash and its length never appear in any audit row or log line. **The success row is fail-closed:** if it cannot be written, the server restores the previous password with a compare-and-swap (only if nobody has written since) and answers `500` with `Sec-Audit-Failed: true` and "could not record the password change; it was rolled back — sessions were revoked; password unchanged". If the restore **also** fails, the `500` says so — the **new** password is in effect, unrecorded, and the sessions were revoked; the server logs it at `critical` and increments `yuzu_auth_password_change_unrecorded_total{kind="self"}` (alert `YuzuPasswordChangeUnrecorded`). An administrator must review the audit and auth stores.
+
+**Metric:** `yuzu_auth_password_changes_total{kind="self", result="ok"|"denied"|"error"}` (the not-audited `400`/`415` count as `denied`).
 
 ---
 
@@ -1624,14 +1628,19 @@ On success the server revokes **every** session of the account (durably, so ever
 
 Reset another user's **local-account** password (#5342) without knowing the current one. The dashboard's Settings → User Management → **Reset password** button uses this route.
 
-**Permission:** `UserManagement:Write`, plus MFA step-up when the caller is enrolled (parity with `POST /api/v1/users/{username}/unlock`). The caller must use an interactive dashboard session — local or OIDC. API, MCP, engine and service-scoped tokens are refused `403` (`token_session`). A SAML session passes the session check but is refused `403` by the shared step-up gate, which has no SAML MFA attestation in this release.
+**Who can call it: a durable Administrator — not an ordinary permission check.** The route uses the same `is_rbac_administrator` predicate as the RBAC role-assignment routes, then re-checks it against the enforcement regime in effect right now, and applies the same rule whatever the target's role:
 
-**Rules:**
+- **RBAC off:** the caller's own account, re-read from the auth store, must hold the `admin` role.
+- **RBAC on:** the caller must hold an `Administrator` grant as a **user** principal.
 
-- **Not yourself:** targeting your own username is `403` (`self_target`) — use `POST /api/v1/users/me/password`, which requires your current password, so a stolen admin cookie cannot re-key its own account.
-- **Administrator targets need a standing administrator.** If the target's role is `admin`, the caller's durable role must be `admin`; a JIT elevation grants `UserManagement:Write` for its window but is not enough (`403`, `admin_target_requires_durable_admin`). The UPDATE itself carries the same guard (`role <> 'admin'`), so a promotion of the target that commits after the check is still refused.
-- **Local accounts only:** an SSO principal or a SCIM-provisioned account is `409` (`not_local`); an absent or deactivated account is `404` (`not_found`). A path segment cannot carry an SSO principal's `/` and `#`, so in practice only local usernames reach the handler. An account literally named `me` cannot be reset over REST — `POST /api/v1/users/me/password` is the self route.
-- Same CSRF (`Origin`/`Referer`), `Content-Type: application/json` and 12–1024-byte rules as the self route.
+A JIT elevation, an IdP-group-derived session role (an OIDC session whose admin role comes only from `--oidc-admin-group`), a group-held `Administrator` grant, or a custom role holding `UserManagement:Write` is refused `403 durable_admin_required`. If the stores cannot confirm the caller's authority the answer is `503 admin_gate_unavailable` (retryable; never downgraded to a `403`). The caller must use an interactive dashboard session; API, MCP, engine and service-scoped tokens are refused `403 token_session`. A SAML session that passes the administrator check is then refused `403` by the shared MFA step-up gate, which has no SAML MFA attestation in this release.
+
+**Order of checks:** authentication → username format (`400`, not audited) → session class (`403 token_session`) → same-site `Origin`/`Referer` (`403 csrf`) and `Content-Type: application/json` (`415`, not audited) → the durable-Administrator check (`403 durable_admin_required` / `503 admin_gate_unavailable`) → **not yourself** (`403 self_target`) → **not the break-glass account** (`403 break_glass_target`) → MFA step-up (when the caller is enrolled) → body and 12–1024-byte policy (`400`, not audited) → **revoke first** → write → audit → lockout clear.
+
+- **Not yourself:** targeting your own username is `403 self_target` — use `POST /api/v1/users/me/password`, which requires your current password, so a stolen admin cookie cannot re-key its own account.
+- **Not the break-glass account:** the account named by `--break-glass-user` is `403 break_glass_target`. It is re-keyed only out of band on the server host, or by signing in as it while armed and using `POST /api/v1/users/me/password`, so an identity-provider compromise cannot invalidate the escape hatch.
+- **Revoke first:** every dashboard session of the target is revoked, durably and on every replica, **before** the password changes. If that cannot be stored durably the answer is `503 session_revoke_failed` and nothing is written.
+- **Local accounts only:** the write itself only matches an active local account. An SSO principal or a SCIM-provisioned account is `409 not_local`; an absent or deactivated account is `404 not_found` — both after the revoke, so their message says "sessions were revoked; password unchanged". A path segment cannot carry an SSO principal's `/` and `#`, so in practice only local usernames reach the handler. An account literally named `me` cannot be reset over REST — `POST /api/v1/users/me/password` is the self route (#5359 tracks reserving the name).
 
 **Body:** `{"new_password": "<string>"}`.
 
@@ -1654,26 +1663,41 @@ curl -s -X POST \
     "username": "bob",
     "password_reset": true,
     "sessions_revoked": 2,
-    "sessions_db_persisted": true,
+    "lockout_cleared": true,
     "api_tokens_active": 1,
-    "remediation": "the account's API tokens were NOT revoked; if it may be compromised, revoke them (DELETE /api/v1/tokens/{id})",
-    "audit_emitted": true
+    "remediation": "the account's API tokens were NOT revoked; if it may be compromised, revoke them (DELETE /api/v1/tokens/{id})"
   },
   "meta": { "api_version": "v1" }
 }
 ```
 
-Every dashboard session of the target is revoked (durably, cross-replica) and its lockout is cleared. **API tokens are deliberately left alone** — automation may depend on them and a reset is not by itself a compromise finding — so the response reports `api_tokens_active` (`null` if the token store is not wired) for the operator to act on. `audit_emitted` reports the `session.revoke_all` row (`detail=count=<N> reason=password_reset`).
+- `lockout_cleared` — after the reset is written and recorded, the target's lockout is cleared through the same primitive as `POST /api/v1/users/{username}/unlock`, with an `auth.lockout.cleared` row (`detail=password_reset`). If that fails the reset still stands: `lockout_cleared` is `false` and `remediation` asks you to retry with the unlock route.
+- `api_tokens_active` — **API tokens are deliberately left alone** (automation may depend on them, and a reset is not by itself a compromise finding), so the response reports how many active tokens the account holds. If the token store cannot be read it is `null` and `"api_tokens_unknown": true` is added; `remediation` then says the count could not be confirmed. The dashboard shows a warning unless the count is a confirmed `0`.
 
-**Errors:** `400` malformed username or body (not audited), or `weak_password`/`too_long`; `401` unauthenticated or step-up required; `403` missing `UserManagement:Write`, `token_session`, `csrf`, `self_target`, `admin_target_requires_durable_admin`, or a SAML session at the step-up gate; `404` `not_found`; `409` `not_local`, or `conflict` (the password changed concurrently — nothing written, retry); `415` wrong `Content-Type`; `500` audit failure (same rollback semantics as the self route); `503` `store_unavailable`.
+**Errors:**
 
-**Audit:** `user.password_reset`, `target_type=User`, `target_id=<target>`; success `result=ok`, `detail=admin_reset target_role=<admin|user>`; refusals as for the self route. Fail-closed with rollback exactly like `user.password_change`.
+| Status | Audit detail | Meaning |
+|---|---|---|
+| `400` | *(not audited)* | Malformed username or body, or new password outside 12–1024 bytes |
+| `401` | — | No session, or MFA step-up required |
+| `403` | `durable_admin_required` | The caller is not a durable Administrator (see above) |
+| `403` | `token_session` / `csrf` / `self_target` / `break_glass_target` | See above |
+| `403` | — | A SAML session at the step-up gate |
+| `404` | `not_found` | No active account by that name (sessions were revoked; password unchanged) |
+| `409` | `not_local` | SSO/SCIM account (sessions were revoked; password unchanged) |
+| `415` | *(not audited)* | `Content-Type` is not `application/json` |
+| `500` | `audit_failed_rolled_back` / `audit_failed_rollback_failed` | Same rollback semantics as the self route; `yuzu_auth_password_change_unrecorded_total{kind="admin"}` on a failed rollback |
+| `503` | `admin_gate_unavailable` | The RBAC/auth stores could not confirm the caller's authority |
+| `503` | `session_revoke_failed` | Sessions could not be durably revoked; nothing written |
+| `503` | `store_unavailable` | The auth store is unavailable, or not configured |
+
+**Audit:** `user.password_reset`, `target_type=User`, `target_id=<target>`, principal = the caller on every row. Success `result=ok`, `detail=admin_reset target_role=<admin|user> sessions_revoked=<N>`, followed by `auth.lockout.cleared` (`ok` or `error`, `detail=password_reset`). Refusals as for the self route. Fail-closed with rollback exactly like `user.password_change`.
 
 **Metric:** `yuzu_auth_password_changes_total{kind="admin", result=...}`.
 
 **Rate limit:** both password routes share the per-IP `/login` rate-limit bucket (`login_rate_limit_per_ip`), not the general API bucket, because the self route verifies a password. Over the limit: `429` with `Retry-After: 1`.
 
-**No MCP twin (parity exception).** Neither password route has an MCP tool, by design, recorded as `exception:` rows in `docs/api-parity-ledger.md`. Self-service change is permanently excluded: an MCP caller is a token, not the human, and a token that could change its owner's password would turn a token leak into an account takeover. Admin reset is deferred: `UserManagement:Write` is approval-gated at the supervised MCP tier, and an approval ticket stores the tool's arguments in plain text and shows them to approvers, so a password argument would be persisted and displayed. A follow-up tool that takes no password argument (a server-generated temporary password) is the intended path.
+**No MCP twin (parity exception).** Neither password route has an MCP tool, by design, recorded as `exception:` rows in `docs/api-parity-ledger.md`. Self-service change is permanently excluded: an MCP caller is a token, not the human, and a token that could change its owner's password would turn a token leak into an account takeover. Admin reset is deferred: `UserManagement:Write` is approval-gated at the supervised MCP tier, and an approval ticket stores the tool's arguments in plain text and shows them to approvers, so a password argument would be persisted and displayed. The planned tool takes no password argument — the server generates a temporary password and forces a change at next sign-in (#5357).
 
 ---
 
@@ -3544,11 +3568,11 @@ row fails to persist, the response carries a `Sec-Audit-Failed: true` header
 | `management_group.unassign_role` | Role removed from group |
 | `api_token.create` | API token created |
 | `api_token.revoke` | API token revoked. Can carry `result=success` (token was revoked) or `result=denied` (a non-owner without the admin role attempted a cross-user revoke). Denied events include `detail=owner=<real owner>` so forensics can tell a legitimate self-revoke from an enumeration probe. |
-| `user.create` | Local account created. `result` ∈ {`success`, `denied`}. Denied detail values: `duplicate_username` (409 — attempted create on an existing name), `weak_password` (400 — fewer than 12 characters). The `role` field is ignored on create — new users always land as `user`. To change role, use the dedicated `POST /api/settings/users/{username}/role` endpoint (audit action `user.role_change`). |
+| `user.create` | Local account created. `result` ∈ {`success`, `denied`}. Denied detail values: `duplicate_username` (409 — attempted create on an existing name), `weak_password` (400 — fewer than 12 bytes), `too_long` (400 — more than 1024 bytes, #5342). The `role` field is ignored on create — new users always land as `user`. To change role, use the dedicated `POST /api/settings/users/{username}/role` endpoint (audit action `user.role_change`). |
 | `user.role_change` | Local account role changed via `POST /api/settings/users/{username}/role`. `result` ∈ {`success`, `denied`, `no_op`}. Denied detail values: `self_role_change_blocked` (403), `invalid_username` (400), `invalid_json` (400), `missing_role` (400), `invalid_role` (400), `user_not_found` (404), `db_failure` (500). `no_op` detail format `same_role={admin\|user}` (200) when the requested role equals the current role — recorded so compliance review can distinguish operator intent from inaction. Success detail format `old_role=user,new_role=admin`. |
 | `user.delete` | Local account deleted. `result` ∈ {`success`, `denied`}. Denied detail values: `self_delete_blocked` (403), `invalid_username` (400), `user_not_found` (404). |
-| `user.password_change` | Local account changed its own password via `POST /api/v1/users/me/password` (#5342). `target_type=User`, `target_id=<caller>`. `result` ∈ {`ok`, `denied`, `error`}. Success detail `self_service`. Denied/error detail tokens: `token_session`, `not_local`, `csrf`, `weak_password`, `too_long`, `wrong_current`, `account_locked`, `not_found`, `conflict`, `store_unavailable`, `audit_failed_rolled_back`, `audit_failed_rollback_failed`. Never carries the password or its length. Paired with a `session.revoke_all.self` row (`detail=count=<N> reason=password_change`). |
-| `user.password_reset` | Admin reset another local account's password via `POST /api/v1/users/{name}/password` (#5342). `target_type=User`, `target_id=<target>`. `result` ∈ {`ok`, `denied`, `error`}. Success detail `admin_reset target_role=<admin\|user>`. Denied/error detail tokens: `token_session`, `csrf`, `self_target`, `weak_password`, `too_long`, `not_found`, `not_local`, `admin_target_requires_durable_admin`, `conflict`, `store_unavailable`, `audit_failed_rolled_back`, `audit_failed_rollback_failed`. Paired with a `session.revoke_all` row (`detail=count=<N> reason=password_reset`). |
+| `user.password_change` | Local account changed its own password via `POST /api/v1/users/me/password` (#5342). `target_type=User`, `target_id=<caller>`; the principal is the caller on every row, including those written after its own session was revoked. `result` ∈ {`ok`, `denied`, `error`}. Success detail `self_service sessions_revoked=<N>` (no separate `session.revoke_all` row). Denied/error detail tokens: `token_session`, `not_local`, `csrf`, `wrong_current`, `account_locked`, `sso_only_local_disabled`, `verify_transient`, `session_revoke_failed`, `not_found`, `conflict`, `store_unavailable`, `audit_failed_rolled_back`, `audit_failed_rollback_failed`. A malformed body, a password outside 12–1024 bytes or a wrong `Content-Type` is not audited. Never carries the password or its length. |
+| `user.password_reset` | Admin reset another local account's password via `POST /api/v1/users/{name}/password` (#5342). `target_type=User`, `target_id=<target>`, principal = the caller. `result` ∈ {`ok`, `denied`, `error`}. Success detail `admin_reset target_role=<admin\|user> sessions_revoked=<N>` (no separate `session.revoke_all` row), followed by an `auth.lockout.cleared` row (`detail=password_reset`, `result=ok` or `error`). Denied/error detail tokens: `token_session`, `csrf`, `durable_admin_required`, `admin_gate_unavailable`, `self_target`, `break_glass_target`, `session_revoke_failed`, `not_found`, `not_local`, `store_unavailable`, `audit_failed_rolled_back`, `audit_failed_rollback_failed`. A malformed username or body, a password outside 12–1024 bytes or a wrong `Content-Type` is not audited. |
 | `auth.admin_required` | Centralised denial event emitted by `AuthRoutes::require_admin` on every privileged-endpoint 403. `target_type=endpoint`, `target_id={req.path}`. SOC 2 CC7.2 evidence chain — captures rejected attempts that previously surfaced only in the request log. |
 | `auth.lockout.applied` | Account locked after `--auth-lockout-threshold` consecutive failed local-password logins (SOC 2 CC6.3). Emitted **once** at the threshold crossing — not once per blocked attempt (those are tracked only by `yuzu_auth_lockout_blocked_total` to avoid audit flooding). `result=ok` (the lock was applied; the warning severity is carried by the metric + analytics event, not the audit result), `target_type=User`, `detail=threshold=<N> window_secs=<S>`. |
 | `auth.lockout.cleared` | Account-lockout counter reset. `result` ∈ {`ok`, `error`}, `target_type=User`. `detail=admin_unlock` for `POST /api/v1/users/{name}/unlock`, or `reset_on_successful_login` when the user's next successful login clears a non-zero counter. |
@@ -9032,11 +9056,11 @@ Create a new local account.
 | Field | Type | Required | Description |
 |---|---|---|---|
 | `username` | string | Yes | Account name. 1-64 chars, alphanumeric + `.` `_` `-` only. |
-| `password` | string | Yes | New password. Minimum 12 characters. |
+| `password` | string | Yes | New password. 12–1024 bytes (UTF-8). |
 | `role` | string | (ignored) | Field is parsed but discarded; new users always land as `user`. Documented for backwards-compatibility — scripts that pass `role=admin` will not error, but the field has no effect. |
 
 - **Response (200):** Re-rendered user table fragment with the new account visible. `HX-Trigger: {"showToast":{"message":"User created","level":"success"}}`. Audit event recorded as `user.create / success`.
-- **Response (400):** Returned when `username` is invalid, `password` is empty, or password is shorter than 12 characters. Audit `user.create / denied / weak_password` (or `invalid_username`).
+- **Response (400):** Returned when `username` is invalid, `password` is empty, or the password is shorter than 12 bytes or longer than 1024 bytes. Audit `user.create / denied / weak_password` (too short), `too_long` (over 1024 bytes, #5342), or `invalid_username`.
 - **Response (409):** Returned when `username` already exists. Body is the re-rendered user table fragment with the duplicate-username toast. Audit `user.create / denied / duplicate_username`.
 - **Response (401):** Defensive — admin gate passed but session not re-resolvable.
 - **Response (500):** Defensive — session resolved with empty username.
@@ -10913,7 +10937,8 @@ username=admin&password=secretpass
 | `200` + `Set-Cookie: yuzu_session=…` | Credentials valid; user has no MFA enrolled and no enforcement applies | `{"status":"ok"}` |
 | `202` (`mfa_required`) | Credentials valid; user **has** TOTP MFA enrolled | `{"status":"mfa_required","mfa_pending_token":"<opaque>","expires_in":120}` — complete the challenge by posting the pending token + TOTP code (or recovery code) to `POST /login/mfa` |
 | `202` (`mfa_enrollment_required`) | Credentials valid; user is **un-enrolled** and `--mfa-enforcement` (`admin-only` for admins / `required` for all) requires MFA | `{"status":"mfa_enrollment_required","mfa_pending_token":"<opaque>","otpauth_uri":"otpauth://...","secret_base32":"...","qr_svg":"<inline SVG, or empty>","expires_in":120}` — show the QR/secret and complete enrollment via `POST /login/mfa/enroll` |
-| `401` | Invalid credentials | `{"error":{"code":401,"message":"Invalid username or password"}}` |
+| `401` | Invalid credentials — also a locked account, and a password over 1024 bytes (rejected without hashing; no setting site accepts one) | `{"error":{"code":401,"message":"Invalid username or password"}}` |
+| `503` + `Retry-After: 2` | The password could not be **verified** (#5342, #5274): reading the account from the auth store failed, or its stored password changed while it was being checked (a concurrent change or reset). Nothing was guessed, so no `auth.login_failed` row is written and nothing counts toward lockout (before this release a store read failure answered `401` and counted a strike) | `{"error":{"code":503,"message":"authentication store is temporarily unavailable","retry_after_ms":2000},"meta":{"api_version":"v1"}}` — retry. A store read failure increments `yuzu_auth_read_degrade_total{route="login",reason="query_error"}` and `yuzu_auth_secret_unavailable_total{route="login"}`; a concurrent change increments `yuzu_auth_credential_changed_during_verify_total` |
 | `503` | Enforcement applies but the auth store is unavailable (fail-closed; no session minted) | `{"error":{"code":503,"message":"MFA enrollment is required but the authentication store is unavailable"}}` |
 | `503` | The in-memory pending-challenge map is at capacity (server under a `/login` flood; transient load-shed) | `{"error":{"code":503,"message":"too many pending authentications, retry shortly"}}` — retry after a short back-off; emits `yuzu_auth_mfa_pending_load_shed_total` |
 | `503` + `Retry-After: 2` | A login-path auth-store read/write was unavailable — fail-closed, **no session minted** | `{"error":{"code":503,"message":"authentication store is temporarily unavailable","retry_after_ms":2000},"meta":{"api_version":"v1"}}` — the `mfa_status` decision read first rides out a transient Postgres blip with a bounded acquire-retry (the call that otherwise denies *all* logins on a blip); a persisted 503 means the outage outlasted it, or another login-path acquire failed, so honour `Retry-After` (see `docs/auth-architecture.md` §"Availability coupling"). Increments `yuzu_auth_read_degrade_total{route="login",reason}` (reason = `pool_acquire_timeout` / `query_error` / `secret_unavailable`) |

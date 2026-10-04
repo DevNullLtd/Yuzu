@@ -200,6 +200,29 @@ Postgres backup mechanics (PITR/WAL archiving, base backups, retention) are
 your Postgres platform's concern and out of scope here; what is in scope is
 that the keys directory rides along with whatever you choose.
 
+**A restore rolls credentials and sessions back to the dump.** Passwords live
+only in the auth store (#5274), so restoring a dump puts every local account's
+password back to what it was when the dump was taken — including a password
+changed since because it was exposed — and brings back the session rows and
+lockout state of that moment, so sessions revoked since the dump (a password
+change, **Sign out everywhere**, an admin force-logout) become valid again
+until they expire. After any restore of the auth schema:
+
+1. Revoke every operator session (`DELETE /api/v1/sessions?username=<name>` per
+   account, or the SQL in [Sessions are durable](#sessions-are-durable)).
+2. Re-apply every password change or reset made since the dump — at minimum
+   any made because a password was exposed — in the product.
+3. Review the audit log for `user.password_change` / `user.password_reset`
+   rows after the dump's timestamp to find them (the audit store is not
+   rolled back unless you restored it from the same dump).
+
+**Restoring onto an empty database instead re-seeds `yuzu-server.cfg`.** If the
+`auth` schema is empty when the server starts (a recreated Postgres, a dump
+that did not include it), the server provisions the first administrator from
+the password hash in `yuzu-server.cfg` — usually the original first-boot
+password, not the current one. Keep that file protected, and change the
+administrator password in the product right after such a rebuild.
+
 ## Post-restore verification
 
 After any restore, before declaring the incident closed:
@@ -340,6 +363,34 @@ psql "$YUZU_POSTGRES_DSN" -c \
   "UPDATE auth.users SET failed_login_count = 0, last_failed_login_at = NULL, locked_until = NULL;"
 ```
 
+**Bulk unlock after an auth-store blip.** Before #5342 a login whose account
+row could not be read was answered as a wrong password and counted a lockout
+strike, so a Postgres blip during busy sign-in traffic could lock many
+legitimate accounts at once. A server on this release answers those logins
+`503` with no strike, but a wave of `auth.lockout.applied` audit rows clustered
+around a store outage can still happen (a server not yet upgraded, or
+automation retrying a stale password through the outage). Unlock only the
+accounts whose last failure falls inside the outage window, after confirming
+from the audit log that the window is right:
+
+```bash
+# Inspect: accounts locked by a failure inside the window (UTC).
+psql "$YUZU_POSTGRES_DSN" -c \
+  "SELECT username, failed_login_count, last_failed_login_at, locked_until FROM auth.users
+   WHERE locked_until > now()
+     AND last_failed_login_at BETWEEN '2026-10-04 09:00:00+00' AND '2026-10-04 09:20:00+00';"
+
+# Clear exactly those.
+psql "$YUZU_POSTGRES_DSN" -c \
+  "UPDATE auth.users SET failed_login_count = 0, last_failed_login_at = NULL, locked_until = NULL
+   WHERE locked_until > now()
+     AND last_failed_login_at BETWEEN '2026-10-04 09:00:00+00' AND '2026-10-04 09:20:00+00';"
+```
+
+Like the single-account fallback, this writes no audit row; record it. The
+locks expire on their own after `--auth-lockout-window-secs`, so waiting is
+still the zero-risk choice.
+
 ## Password reset
 
 A local account's password lives **only** in the PostgreSQL auth store
@@ -353,7 +404,7 @@ cfg edit look like a reset; that path is gone.)
 
 **Preferred — in the product** (audited, no database access):
 
-- Another administrator resets it: Settings → User Management → **Reset
+- An administrator resets it: Settings → User Management → **Reset
   password**, or
   ```bash
   curl -fsS -X POST "https://yuzu.internal/api/v1/users/alice/password" \
@@ -361,16 +412,26 @@ cfg edit look like a reset; that path is gone.)
        -H "Content-Type: application/json" \
        -d '{"new_password":"<12-1024 bytes>"}'
   ```
-  This needs an interactive dashboard session with `UserManagement:Write`
-  (plus MFA step-up when enrolled) — API and MCP tokens are refused. An
-  administrator's password can only be reset by a *standing* admin, not a
-  JIT-elevated one. The user's sessions are revoked; their API tokens are
-  **not** (the response reports how many remain active).
+  This needs an interactive dashboard session of a **durable
+  Administrator** — with RBAC off, an account whose own role is `admin`;
+  with RBAC on, a user `Administrator` grant. A JIT elevation, an IdP-group
+  admin role or a custom role holding `UserManagement:Write` is refused
+  (`403 durable_admin_required`), as are API and MCP tokens; MFA step-up
+  applies when the caller is enrolled. The configured break-glass account
+  cannot be reset this way (`403 break_glass_target`). The user's sessions are
+  revoked before the password is written; their API tokens are **not** (the
+  response reports how many remain active).
 - A user who still knows their password changes it themselves: Settings →
   User Management → **Change password**, or `POST /api/v1/users/me/password`.
+  They are signed out everywhere and sign in again with the new password.
 
 Audit: `user.password_reset` / `user.password_change`. A reset also clears
-the account's lockout.
+the account's lockout (`auth.lockout.cleared`, `detail=password_reset`). There
+is no MCP tool for either (#5357 tracks a temporary-password reset tool).
+
+**Re-running the Windows server installer is not a reset.** On an upgrade it
+refuses `/ADMIN_PASS=` and `/OPERATOR_PASS=` with exit code 11 (the config
+file it would write only seeds an empty database).
 
 **Fallback — direct SQL**, when no administrator can sign in at all (the only
 admin forgot their password). This writes no audit row and revokes no
@@ -393,6 +454,40 @@ PY
 # Review the printed statement, then run it:
 psql "$YUZU_POSTGRES_DSN" -c "<the printed UPDATE>"
 ```
+
+The same on Windows (elevated PowerShell; needs Python 3 and `psql` on
+`PATH`). The connection string is read from the installer's locked file, as in
+the backup example above:
+
+```powershell
+$Secure = Read-Host -AsSecureString 'New password (12-1024 bytes)'
+$Env:NEWPW = [System.Net.NetworkCredential]::new('', $Secure).Password
+@'
+import hashlib, os
+salt = os.urandom(16)
+dk = hashlib.pbkdf2_hmac('sha256', os.environ['NEWPW'].encode(), salt, 100000, dklen=32)
+print(f"UPDATE auth.users SET password_hash = '{dk.hex()}', salt_hex = '{salt.hex()}', "
+      "failed_login_count = 0, last_failed_login_at = NULL, locked_until = NULL, "
+      "updated_at = now() WHERE username = 'admin' AND identity_source = 'local' "
+      "AND provisioning_source = 'local' AND is_active;")
+'@ | python -
+Remove-Item Env:NEWPW
+# Review the printed statement, then run it:
+$DsnFile = "C:\ProgramData\Yuzu Server\postgres.dsn"
+$Dsn = if (Test-Path $DsnFile) { (Get-Content -LiteralPath $DsnFile -Raw).Trim() } else { $Env:YUZU_POSTGRES_DSN }
+psql $Dsn -c "<the printed UPDATE>"
+```
+
+With the Docker Compose reference stack, generate the statement on the host
+as above (the server image has no Python), then run it inside the `postgres`
+service, which needs no published port or password:
+
+```bash
+docker compose exec -T postgres psql -U postgres -d yuzu -c "<the printed UPDATE>"
+```
+
+Run it from the directory holding your compose file (or add `-f <file>`);
+adjust `-d` if your server's DSN names a different database.
 
 Expect `UPDATE 1`. No restart is needed: login reads the auth store directly.
 Then sign in, revoke the account's old sessions

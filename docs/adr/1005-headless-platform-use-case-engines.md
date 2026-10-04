@@ -520,6 +520,41 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        shipped REST/HTMX surface); wire reference:
        `docs/user-manual/rest-api.md`'s Hardware section.
 
+   - **2026-10-04 — local password change and admin reset
+     (`POST /api/v1/users/me/password`, `POST /api/v1/users/{name}/password`,
+     #5342).** REST-only, no MCP twin — a "no" on Decision 1/4's
+     both-surfaces requirement, recorded per route as `exception:` rows in
+     `scripts/ci/api-parity/rbac.json` (`docs/api-parity-ledger.md`).
+     Recorded rather than fixed pre-merge because:
+     - **Self-service change — a permanent exception.** An MCP caller is a
+       token, not the human. A token that could change its owner's password
+       turns a token leak into an account takeover (the new password locks
+       the owner out and admits the token holder interactively), so the
+       route refuses every token and MCP session (`403 token_session`) and
+       has no twin to build. Revisit only if MCP gains a human-presence
+       proof that a bearer token cannot replay.
+     - **Admin reset — a tracked follow-up, not a permanent exception.**
+       `UserManagement:Write` is approval-gated at the supervised MCP tier,
+       and an approval ticket persists the tool's `canonical_args` in
+       plaintext (`approvals.scope_expression`) and renders them to
+       approvers, so a password argument would be stored and displayed. The
+       twin to build takes no password argument: a server-generated
+       temporary password with a must-change-at-next-sign-in flag (auth
+       schema v3). Tracked as **#5357**; **revisit by 2027-01-04**. Until it
+       lands, this row stands as the open exception.
+     - **The exception relaxes no control.** Both routes accept interactive
+       dashboard sessions only, require a same-site `Origin`/`Referer` and
+       `Content-Type: application/json`, pass MFA step-up, revoke every
+       session of the account before writing, and audit fail-closed with a
+       compensating rollback (`yuzu_auth_password_change_unrecorded_total`
+       when that also fails). The admin reset is gated on the A2/A1
+       durable-Administrator predicate (`is_rbac_administrator(kRest)` + the
+       current-regime re-check), not an ordinary permission. A4 envelope
+       and OpenAPI entries hold for both (A2/A3 for the REST half).
+     - Design record: `docs/auth-architecture.md` "Local password change and
+       reset (#5342, #5274)"; wire reference: `docs/user-manual/rest-api.md`
+       (`POST /api/v1/users/me/password`).
+
 ## Interim rules (until the named follow-ups ship)
 
 - **No engine principal class exists** until the auth-architecture follow-up lands. Until then, integrations authenticate as themselves via existing API tokens, and the server accepts **no** on-behalf-of assertion on any surface — any such header/field is rejected, not ignored.
