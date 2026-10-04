@@ -21,6 +21,8 @@ trap 'rm -rf "$TMP"' EXIT
 source "$SCRIPT"
 # The script hard-wires these (no env override); point them at the temp dir.
 UAT_DIR="$TMP/uat"; PID_DIR="$UAT_DIR/pids"; BUILDDIR="$TMP/build"; GATEWAY_DIR="$TMP/gw"
+# Fixture dirs must read as trusted (not group/other-writable) whatever the host umask.
+umask 022
 # reset() rm -rf's UAT_DIR: never let it point outside the temp dir.
 [[ $UAT_DIR == "$TMP"/* && $PID_DIR == "$TMP"/* ]] || { echo 'refusing: UAT_DIR not under TMP' >&2; exit 2; }
 
@@ -49,6 +51,9 @@ pkill() { echo "pkill $*" >> "$TMP/violations"; return 1; }
 lsof()  { printf 'COMMAND PID\nfake-holder 777 ...\n'; }
 docker() { echo "docker $*" >> "$TMP/docker-calls"; [[ -e $TMP/docker-ok ]]; }
 sleep() { :; }
+# rm-fails: the wipe of UAT_DIR fails (files owned by someone else), as in a failed sudo cleanup.
+# shellcheck disable=SC2032  # shadows rm for the sourced functions only
+rm() { if [[ -e $TMP/rm-fails && ${2:-} == "$UAT_DIR" ]]; then return 1; fi; command rm "$@"; }
 have_port_inspector() { [[ ! -e $TMP/no-inspector ]]; }
 # Busy ports: the requested ports present in `busy`, comma-joined like the real
 # helper; persistent unless a successful fake kill clears the file.
@@ -69,8 +74,9 @@ check() { # check <desc> <condition-exit>
 has()  { grep -qF -- "$2" "$1" 2>/dev/null; }
 reset() {
   rm -rf "$TMP/alive" "$TMP/cmd" "$TMP/birth" "$TMP/children" "$TMP/unkillable" "$TMP/eperm" "$TMP/vanish" "$TMP/docker-ok" "$TMP/kills" "$TMP/sudo" \
-         "$TMP/violations" "$TMP/docker-calls" "$TMP/busy" "$TMP/no-inspector" "$UAT_DIR"
+         "$TMP/violations" "$TMP/docker-calls" "$TMP/busy" "$TMP/no-inspector" "$TMP/rm-fails" "$TMP/real.pid" "$UAT_DIR"
   mkdir -p "$TMP/alive" "$TMP/cmd" "$TMP/birth" "$TMP/children" "$TMP/unkillable" "$TMP/eperm" "$TMP/vanish" "$PID_DIR"
+  chmod 755 "$UAT_DIR"
 }
 alive() { : > "$TMP/alive/$1"; printf '%s\n' "$2" > "$TMP/cmd/$1"; printf 'Sun Oct  4 10:00:%s 2026\n' "$1" > "$TMP/birth/$1"; }
 run()   { set +e; out=$("$@" 2>&1); rc=$?; set -e; }
@@ -186,6 +192,46 @@ rm -f "$TMP/busy"
 run prepare_fresh_run
 check "free ports: wiped and agent-data recreated" "$([ $rc = 0 ] && [ ! -e "$UAT_DIR/marker" ] && [ -d "$UAT_DIR/agent-data" ] && echo 0 || echo 1)"
 
+echo "forged records: PID floor"
+reset; alive 1 "$SRV --launchd"; record_pid server 1 "$SRV"
+run kill_stale
+check "PID 1 record with a matching command line: nothing killed, record dropped" "$([ $rc = 0 ] && ! [ -e "$TMP/kills" ] && [ ! -e "$PID_DIR/server.pid" ] && echo 0 || echo 1)"
+reset; alive 0 "$AGT --x"; record_pid agent 0 "$AGT"; alive 1 "$SRV"
+printf '01\n%s\nSun Oct  4 10:00:01 2026\n' "$SRV" > "$PID_DIR/server.pid"
+run kill_stale
+check "PID 0 and zero-padded 01 records: nothing killed" "$([ $rc = 0 ] && ! [ -e "$TMP/kills" ] && echo 0 || echo 1)"
+reset; alive 100 "$SRV"; alive 1 init; echo 1 > "$TMP/children/100"
+run kill_tree 100
+check "kill_tree never descends into PID 1" "$(grep -qxF -- '-9 100' "$TMP/kills" && ! grep -qxF -- '-9 1' "$TMP/kills" && echo 0 || echo 1)"
+reset; run kill_tree 0
+check "kill_tree refuses PID 0" "$([ ! -e "$TMP/kills" ] && echo 0 || echo 1)"
+
+echo "forged records: provenance"
+reset; alive 100 "$SRV --no-tls"; record_pid server 100 "$SRV"; chmod 777 "$PID_DIR"
+run kill_stale
+check "world-writable PID_DIR: untrusted, nothing killed, record kept" "$([ $rc = 0 ] && ! [ -e "$TMP/kills" ] && [ -f "$PID_DIR/server.pid" ] && [[ $out == *'ignoring PID records not owned by you'* ]] && echo 0 || echo 1)"
+run show_status
+check "status labels the ignored record" "$([[ $out == *'server record ignored'* ]] && echo 0 || echo 1)"
+reset; alive 100 "$SRV --no-tls"; record_pid server 100 "$SRV"; chmod 775 "$PID_DIR"
+check "group-writable PID_DIR is untrusted too" "$([ "$(recorded_pid_state server)" = untrusted ] && echo 0 || echo 1)"
+reset; alive 100 "$SRV --no-tls"; record_pid server 100 "$SRV"; chmod 777 "$UAT_DIR"
+check "world-writable UAT_DIR is untrusted" "$([ "$(recorded_pid_state server)" = untrusted ] && echo 0 || echo 1)"
+reset; alive 100 "$SRV --no-tls"; record_pid server 100 "$SRV"; mv "$PID_DIR/server.pid" "$TMP/real.pid"; ln -s "$TMP/real.pid" "$PID_DIR/server.pid"
+run kill_stale
+check "symlinked record: untrusted, nothing killed, link kept" "$([ $rc = 0 ] && ! [ -e "$TMP/kills" ] && [ -L "$PID_DIR/server.pid" ] && echo 0 || echo 1)"
+reset; alive 100 "$SRV --no-tls"; record_pid server 100 "$SRV"
+check "ordinary record is trusted and owned" "$([ "$(recorded_pid_state server)" = 'owned 100' ] && echo 0 || echo 1)"
+check "record_pid leaves PID_DIR at 0700" "$([ "$(find "$PID_DIR" -maxdepth 0 -perm 700)" = "$PID_DIR" ] && echo 0 || echo 1)"
+
+echo "prepare_fresh_run: directory provenance"
+reset; mkdir -p "$UAT_DIR"; chmod 777 "$UAT_DIR"; : > "$TMP/rm-fails"
+run prepare_fresh_run
+check "wipe failed and UAT_DIR is world-writable: refuses, no agent-data" "$([ $rc = 1 ] && [[ $out == *refusing* ]] && [ ! -d "$UAT_DIR/agent-data" ] && echo 0 || echo 1)"
+umask_prepare() { umask 002; prepare_fresh_run; }
+reset
+run umask_prepare
+check "umask 002: UAT_DIR is still created unshared, run proceeds" "$([ $rc = 0 ] && dir_trusted "$UAT_DIR" && [ -d "$UAT_DIR/agent-data" ] && echo 0 || echo 1)"
+
 echo "lexical wiring"
 cnt() { grep -cF -- "$1" "$SCRIPT" || true; }
 # shellcheck disable=SC2016  # the patterns are literal source text, not expansions
@@ -195,6 +241,8 @@ check "record_pid after each of the three spawns" "$([ "$(cnt 'record_pid server
 check "gateway identity is the physical rel dir" "$([ "$(cnt 'record_pid gateway "$gw_pid" "$(cd "$gw_rel" && pwd -P)"')" = 1 ] && echo 0 || echo 1)"
 check "UAT_PORTS is the full eight-port list" "$([ "$UAT_PORTS" = "8080 50051 50052 50054 50055 50063 8081 9568" ] && echo 0 || echo 1)"
 check "stop dispatches through the shared refusal gate" "$([ "$(cnt 'stop)   kill_stale || exit 1')" = 1 ] && echo 0 || echo 1)"
+# File ownership cannot be faked in a test, so pin that the -O probes exist.
+check "record and directory ownership probes (-O) are present" "$([ "$(cnt '[ -O "$f" ]')" = 1 ] && [ "$(cnt '[ -O "$1" ]')" = 1 ] && [ "$(cnt 'chmod 700 "$PID_DIR"')" = 1 ] && echo 0 || echo 1)"
 check "no pgrep -f / pkill in start-UAT.sh" "$(! grep -qE 'pgrep -f|pkill' "$SCRIPT" && echo 0 || echo 1)"
 check "start_all calls prepare_fresh_run once" "$([ "$(cnt 'prepare_fresh_run || exit 1')" = 1 ] && echo 0 || echo 1)"
 

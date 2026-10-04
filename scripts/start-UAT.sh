@@ -160,7 +160,7 @@ birth_token() {
 # unrecorded one is never found again (the agent listens on no port).
 record_pid() {
     local tok; tok=$(birth_token "$2")
-    if [ -z "$tok" ] || ! { mkdir -p "$PID_DIR" && printf '%s\n%s\n%s\n' "$2" "$3" "$tok" > "$PID_DIR/$1.pid"; }; then
+    if [ -z "$tok" ] || ! { mkdir -p "$PID_DIR" && chmod 700 "$PID_DIR" && printf '%s\n%s\n%s\n' "$2" "$3" "$tok" > "$PID_DIR/$1.pid"; }; then
         kill_tree "$2"
         fail "could not record $1 PID $2 under $PID_DIR — stopped it; refusing to continue"
         return 1
@@ -172,16 +172,38 @@ record_pid() {
 # as dead; ps sees it.
 pid_alive() { ps -p "$1" >/dev/null 2>&1; }
 
+# valid_pid PID — a plain decimal PID above 1. A forged record naming 0 (the
+# caller's own process group under kill) or 1 (init) must never become a kill.
+# Leading zeros are folded by 10#, so "01" is 1; > 9 digits can wrap the
+# arithmetic and is refused.
+valid_pid() {
+    case "$1" in ''|*[!0-9]*) return 1 ;; esac
+    [ "${#1}" -le 9 ] && [ "$((10#$1))" -gt 1 ]
+}
+
+# dir_trusted D — a real (non-symlink) directory owned by us and not group- or
+# other-writable. PID records are only believed from such a directory: /tmp is
+# shared, and a record is a kill instruction. -O alone is not enough on a
+# umask-002 host, where our own directory is group-writable.
+dir_trusted() {
+    [ ! -L "$1" ] && [ -d "$1" ] && [ -O "$1" ] \
+        && [ -z "$(find "$1" -maxdepth 0 \( -perm -020 -o -perm -002 \) 2>/dev/null)" ]
+}
+
 # recorded_pid_state NAME — read-only validator shared by kill and status.
-# Prints absent | malformed | "dead PID" | "reused PID" | "owned PID". The
-# identity is the RECORDED path, not the current $BUILDDIR, so a stack this
+# Prints absent | untrusted | malformed | "dead PID" | "reused PID" | "owned PID".
+# The identity is the RECORDED path, not the current $BUILDDIR, so a stack this
 # script started from another worktree is still recognised as its own, while
 # a recycled PID (same number, different program) is never signalled.
 recorded_pid_state() {
     local f="$PID_DIR/$1.pid" pid="" ident="" birth="" cmd=""
-    [ -f "$f" ] || { echo absent; return 0; }
+    [ -f "$f" ] || [ -L "$f" ] || { echo absent; return 0; }
+    # Provenance: our own record, in our own unshared directories (#5333).
+    { dir_trusted "$UAT_DIR" && dir_trusted "$PID_DIR" \
+        && [ ! -L "$f" ] && [ -f "$f" ] && [ -O "$f" ]; } || { echo untrusted; return 0; }
     { read -r pid || true; read -r ident || true; read -r birth || true; } < "$f"
-    case "$pid" in ''|*[!0-9]*) echo malformed; return 0 ;; esac
+    valid_pid "$pid" || { echo malformed; return 0; }
+    pid=$((10#$pid))
     [ -n "$ident" ] && [ -n "$birth" ] || { echo malformed; return 0; }
     # -ww: procps truncates the command at COLUMNS when output is not a tty.
     cmd=$(ps -ww -o command= -p "$pid" 2>/dev/null || true)
@@ -201,6 +223,7 @@ recorded_pid_state() {
 # (sub-second TOCTOU, needs reuse by a root process in that window).
 kill_tree() {
     local child
+    valid_pid "$1" || return 0
     for child in $(pgrep -P "$1" 2>/dev/null || true); do
         kill_tree "$child"
     done
@@ -217,6 +240,10 @@ kill_recorded() {
     pid="${state#* }"
     case "$state" in
         absent) return 1 ;;
+        untrusted)
+            # Never signalled and never deleted: not ours to remove.
+            warn "ignoring PID records not owned by you in $PID_DIR ($name)"
+            return 1 ;;
         malformed|dead*) rm -f "$PID_DIR/$name.pid"; return 1 ;;
         reused*)
             warn "recorded $name PID $pid now belongs to another process, not signalling it"
@@ -283,7 +310,7 @@ kill_stale() {
         fail "ports still held by processes this script did not start: $held"
         # shellcheck disable=SC2086
         report_busy_ports ${held//,/ }
-        fail "refusing to signal them — stop that stack from the session that owns it (#5333)"
+        fail "refusing to signal them — stop that stack from the session that owns it, or by hand if it predates PID records or the records were lost: docs/uat-environment.md (#5333)"
         return 1
     fi
 
@@ -327,6 +354,17 @@ prepare_fresh_run() {
             warn "  manual fix: sudo rm -rf $UAT_DIR"
         fi
     fi
+    # -m: the wipe leaves nothing, so this creates UAT_DIR; a umask of 002 must
+    # not make it group-writable. A directory that survived the wipe (not ours,
+    # failed sudo cleanup) keeps its owner and mode and is refused here, so the
+    # next run's PID records never land in a directory another user controls.
+    # shellcheck disable=SC2174  # only the leaf matters; its parent (/tmp) exists
+    mkdir -p -m 755 "$UAT_DIR"
+    if ! dir_trusted "$UAT_DIR"; then
+        fail "$UAT_DIR is not owned by you or is writable by others — refusing to continue (#5333)"
+        fail "  manual fix: sudo rm -rf $UAT_DIR"
+        return 1
+    fi
     mkdir -p "$UAT_DIR/agent-data"
 }
 
@@ -342,6 +380,7 @@ show_status() {
             owned*)  ok "$name running (PID $pid, recorded by start-UAT.sh)" ;;
             reused*) fail "$name not running (recorded PID $pid now belongs to another process)" ;;
             absent)  fail "$name not running (no record)" ;;
+            untrusted) fail "$name record ignored (not owned by you, or $PID_DIR is writable by others)" ;;
             *)       fail "$name not running (stale record)" ;;
         esac
     done
