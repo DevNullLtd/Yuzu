@@ -12675,10 +12675,14 @@ TEST_CASE("#5322: a clean follower behind a stuck tombstone expires CongestionEx
         },
         10s));
     CHECK(f.rig.status(f.receipt_b) != RT::ReceiptStatus::Failed);
-    CHECK(f.rig.rt->retained_tombstones() == 1); // still held by the stuck owner
+    // #5323: the abandoned follower's own release also fails under the sticky seam, so it is
+    // RETAINED behind the stuck owner (it used to be erased with its mapping leaked).
+    CHECK(f.rig.rt->retained_tombstones() == 2);
+    CHECK(f.depth() == 2);
     f.rig.rt->set_index_remove_fault_count_for_test(0);
-    (void)f.rig.rt->expire_overdue_claims();
+    (void)f.rig.rt->expire_overdue_claims(); // one pass releases both
     CHECK(f.rig.rt->retained_tombstones() == 0);
+    CHECK(f.depth() == 0);
 }
 
 TEST_CASE("#5322: redrive_parked_arms sweeps a released tombstone first and drives the follower",
@@ -13411,4 +13415,93 @@ TEST_CASE("#5322: a throw in the orphan pass itself does not strand the reaper's
     CHECK(rt.orphan_disarms_started() == 1);
     REQUIRE(yuzu::test::spin_until([&] { return f.rig.b->disarms.load() == 1; }, 10s));
     CHECK(rt.armed_key_count() == 5);
+}
+
+// ---------------------------------------------------------------------------
+// #5323 WP4: abandon_claim_locked's Queued branch retains the claim when its index release
+// fails, instead of erasing it with the mapping still held (a ghost (key, rule) entry whose
+// refcount never reaches zero, so the key never disarms).
+// ---------------------------------------------------------------------------
+namespace {
+/// A hung head on /a with a SHORT claim deadline. The destructor clears the index-release
+/// seam FIRST, then opens the park and the hang, then stops.
+struct Abandon5323Rig {
+    using RT = GuardianSparkRuntime;
+    std::shared_ptr<FakeReader> r = std::make_shared<FakeReader>();
+    std::shared_ptr<FakeBackend> b = std::make_shared<FakeBackend>();
+    std::shared_ptr<RT> rt;
+    const std::string key = spark_key(file_spec("/a"));
+    Abandon5323Rig() {
+        b->hang_next_arm.store(true);
+        rt = make_rt(r, b, RT::Config{.backend_op_deadline = std::chrono::milliseconds(50)});
+    }
+    ~Abandon5323Rig() {
+        rt->set_index_remove_fault_count_for_test(0);
+        b->arm_park.open();
+        b->release_hang();
+        rt->begin_stop();
+    }
+    [[nodiscard]] std::size_t depth() const { return rt->claim_queue_depth_for_test(key); }
+    [[nodiscard]] RT::ArmReceipt attach_queued(const std::string& rid) {
+        auto res = rt->attach_rule(RT::NonWaiting{}, rid, file_spec("/a"), file_exists_rule(rid), true);
+        REQUIRE(res.has_value());
+        REQUIRE(res->kind == RT::ArmOutcomeKind::Accepted); // queued behind the hung head
+        return res->receipt;
+    }
+};
+} // namespace
+
+TEST_CASE("#5323: an abandoned Queued claim whose index release fails is retained and the key still disarms",
+          "[spark][runtime][liveness]") {
+    using namespace std::chrono_literals;
+    using RT = GuardianSparkRuntime;
+    Abandon5323Rig f;
+    const auto rch = f.attach_queued("H");
+    REQUIRE(f.b->wait_entered_hang(10s));
+    const auto rc2 = f.attach_queued("r2");
+    f.rt->set_index_remove_fault_count_for_test(-1);
+
+    // The hung head and r2 both pass their 50 ms deadline; poll the TARGET receipt.
+    const auto timeouts_before = f.rt->backend_op_timeouts();
+    REQUIRE(yuzu::test::spin_until(
+        [&] {
+            (void)f.rt->expire_overdue_claims();
+            return f.rt->receipt_status(rc2) == RT::ReceiptStatus::CongestionExpired;
+        },
+        10s));
+    CHECK(f.rt->receipt_status(rch) == RT::ReceiptStatus::Wedged);
+    // r2's release failed: it stays in the fifo as a withdrawn tombstone behind H.
+    CHECK(f.rt->retained_tombstones() == 1);
+    CHECK(f.depth() == 2);
+    // Counted once per abandonment: H (wedged) and r2.
+    CHECK(f.rt->backend_op_timeouts() == timeouts_before + 2);
+
+    // Reaper retries (which fail under the seam) are counted elsewhere, never here.
+    const auto timeouts_after = f.rt->backend_op_timeouts();
+    (void)f.rt->expire_overdue_claims();
+    (void)f.rt->expire_overdue_claims();
+    CHECK(f.rt->backend_op_timeouts() == timeouts_after);
+    CHECK(f.rt->retained_tombstones() == 1);
+
+    // H's late success takes the wedge path and commits; r2's tombstone is still held.
+    f.b->release_hang();
+    REQUIRE(yuzu::test::spin_until([&] { return f.rt->rule_count() == 1; }, 10s));
+    REQUIRE(yuzu::test::spin_until(
+        [&] { return f.rt->retained_tombstones() == 1 && f.depth() == 1; }, 10s));
+
+    // Seam clears: one pass releases r2's mapping and pops it.
+    f.rt->set_index_remove_fault_count_for_test(0);
+    (void)f.rt->expire_overdue_claims();
+    CHECK(f.rt->retained_tombstones() == 0);
+    CHECK(f.depth() == 0);
+    CHECK(f.rt->armed_key_count() == 1);
+
+    // H was the last rule on the key and r2's mapping is gone: detaching H disarms it.
+    f.rt->detach_rule("H");
+    CHECK(f.rt->armed_key_count() == 0);
+    REQUIRE(yuzu::test::spin_until([&] { return f.b->disarms.load() == 1; }, 10s));
+
+    // The key arms afresh.
+    (void)f.rt->attach_rule(RT::NonWaiting{}, "r3", file_spec("/a"), file_exists_rule("r3"), true);
+    REQUIRE(yuzu::test::spin_until([&] { return f.b->arms.load() == 2; }, 10s));
 }

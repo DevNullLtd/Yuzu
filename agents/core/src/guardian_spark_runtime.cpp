@@ -317,9 +317,12 @@ std::string GuardianSparkRuntime::abandon_claim_locked(const std::string& key,
     // abandonment too - never erase a claim the dispatcher still expects to find.
     const std::string reason = stopping ? "stopping" : "arm timed out";
     if (claim->dispatch == ClaimDispatch::Queued) {
-        release_claim_index_locked(*claim);
-        // Never dispatched: queue-wait expiry. Erase it outright; nothing is in flight.
-        if (const auto eit = claims_.find(key); eit != claims_.end()) {
+        // Never dispatched: queue-wait expiry. Erase it outright once its index mapping
+        // is released; nothing is in flight. A failed release (#5323) keeps the claim in
+        // its fifo as a withdrawn tombstone (the ordinary pop's rule), which the next
+        // sweep or the heartbeat reaper pops: erasing it would leak the mapping.
+        const bool released = release_or_retain_tombstone_locked(*claim);
+        if (const auto eit = claims_.find(key); released && eit != claims_.end()) {
             auto& fifo = eit->second.fifo;
             for (auto it = fifo.begin(); it != fifo.end(); ++it) {
                 if (*it == claim) {

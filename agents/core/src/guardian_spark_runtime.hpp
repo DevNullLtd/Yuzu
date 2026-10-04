@@ -2065,9 +2065,12 @@ private:
     /// releases (they run before publish_arm_verdicts_locked); publish_arm_verdicts_
     /// locked's own fill-in; synthesize_fallback_outcome_locked; the dispatched branch
     /// of abandon_claim_locked. (2) They run at sticky-stop time, where the leak is
-    /// moot: begin_stop; dispatch_parked_arm_guarded's stop path. Known gap, tracked as
-    /// #5323: abandon_claim_locked's Queued branch ignores `false` and then
-    /// erases the claim.
+    /// moot: begin_stop; dispatch_parked_arm_guarded's stop path. abandon_claim_locked's
+    /// Queued branch (#5323) consults it through release_or_retain_tombstone_locked: a
+    /// failed release keeps the abandoned claim in its fifo as a withdrawn tombstone.
+    /// Accounting: backend_op_timeouts_ is incremented once, at the abandonment itself;
+    /// the retries that later pop the tombstone are counted in
+    /// claim_index_release_failures_, never in backend_op_timeouts_.
     bool release_claim_index_locked(KeyClaim& claim) noexcept;
     /// registry_mu_ held (#4354). Retry c's index release; on failure keep c as a
     /// retained tombstone. The same-call sweep (try_dispatch_head_locked ->
