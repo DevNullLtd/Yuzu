@@ -727,4 +727,3 @@ TEST_CASE("REST visualization: the 10000-row cap is exact rows_capped and result
     CHECK(over["result_truncated_by_cap"] == true);
     CHECK(over["truncation_cause"] == "row_cap");
 }
-
