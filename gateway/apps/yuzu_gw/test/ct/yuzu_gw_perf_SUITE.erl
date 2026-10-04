@@ -111,7 +111,7 @@ init_per_group(heartbeat, Config) ->
         {ok, #{acknowledged_count => 0}, #{}}
     end),
     %% Long interval — tests trigger flush manually.
-    application:set_env(yuzu_gw, heartbeat_batch_interval_ms, 600000),
+    application:set_env(yuzu_gw, heartbeat_batch_interval_ms, 60000),
     application:set_env(yuzu_gw, max_heartbeat_buffer, 100000),
     {ok, HBPid} = yuzu_gw_heartbeat_buffer:start_link(),
     unlink(HBPid),

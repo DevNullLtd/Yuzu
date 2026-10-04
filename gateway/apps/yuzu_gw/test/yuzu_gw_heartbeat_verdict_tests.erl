@@ -28,6 +28,8 @@
 -define(LOG_HANDLER, yuzu_verdict_test_log).
 -define(EV_DROP,  [yuzu, gw, heartbeat, verdict_dropped]).
 -define(EV_TRUNC, [yuzu, gw, heartbeat, unknown_truncated]).
+%% Element position in the buffer's state record (tag at 1).
+-define(ST_INTERVAL, 5).
 
 verdict_test_() ->
     {foreach,
@@ -53,7 +55,15 @@ verdict_test_() ->
       {"a success body that is not a message is no verdict and the buffer survives",
        fun non_map_body_is_no_verdict/0},
       {"a verdict field of the wrong type is ignored and the buffer survives",
-       fun wrong_typed_verdict_fields_are_ignored/0}
+       fun wrong_typed_verdict_fields_are_ignored/0},
+      {"the cast is skipped and counted queue_full while the upstream mailbox is over 100",
+       fun cast_skipped_while_upstream_queue_is_long/0},
+      {"the upstream mailbox check is harmless when the process is gone",
+       fun queue_check_with_dead_upstream_still_casts/0},
+      {"a flush interval outside 100..60000 or not an integer falls back with a warning",
+       fun interval_invalid_falls_back/0},
+      {"a flush interval inside 100..60000 is kept",
+       fun interval_valid_is_kept/0}
      ]}.
 
 setup() ->
@@ -80,7 +90,7 @@ setup() ->
         ok
     end),
     %% A long interval: flushes only happen when the test asks for one.
-    application:set_env(yuzu_gw, heartbeat_batch_interval_ms, 600000),
+    application:set_env(yuzu_gw, heartbeat_batch_interval_ms, 60000),
     application:set_env(yuzu_gw, max_heartbeat_buffer, 100),
     case whereis(yuzu_gw_heartbeat_buffer) of
         undefined -> ok;
@@ -89,9 +99,13 @@ setup() ->
     {ok, Pid} = yuzu_gw_heartbeat_buffer:start_link(),
     Pid.
 
-cleanup(Pid) ->
-    catch unlink(Pid),
-    catch gen_server:stop(Pid, shutdown, 2000),
+cleanup(_SetupPid) ->
+    %% Tests that restart the buffer leave the current one registered.
+    stop_buffer(),
+    case whereis(yuzu_gw_upstream) of
+        undefined -> ok;
+        Standin   -> exit(Standin, kill)
+    end,
     catch meck:unload([grpcbox_client, telemetry, yuzu_gw_upstream]),
     persistent_term:erase(?LOGK),
     ok.
@@ -246,9 +260,125 @@ wrong_typed_verdict_fields_are_ignored() ->
     ?assertEqual([], events(?EV_TRUNC)),
     ?assertEqual(0, dropped(malformed)).
 
+%% The bound on the upstream mailbox does not depend on configuration. A
+%% stand-in registered as yuzu_gw_upstream never reads its mailbox, so its
+%% length is exactly what the test put there. At 100 messages the cast goes
+%% (the positive control); at 101 it is skipped, the ids are counted as
+%% queue_full and one debug line says so, without naming an id.
+cast_skipped_while_upstream_queue_is_long() ->
+    Dummy = register_upstream_stand_in(),
+    S1 = <<"verdict-session-q1">>,
+    S2 = <<"verdict-session-q2">>,
+    Verdict = {ok, #{acknowledged_count => 0, unknown_session_ids => [S2, S1]}, #{}},
+    [Dummy ! filler || _ <- lists:seq(1, 100)],
+    ?assertEqual({message_queue_len, 100}, process_info(Dummy, message_queue_len)),
+    ok = flush_sync(Verdict),
+    ?assertEqual([[S1, S2]], casts()),
+    ?assertEqual(0, dropped(queue_full)),
+    Dummy ! filler,
+    {_, Lines} = capture_logs(fun() -> ok = flush_sync(Verdict) end, debug),
+    ?assertEqual([[S1, S2]], casts()),
+    ?assertEqual(2, dropped(queue_full)),
+    Named = [T || {debug, T} <- Lines, binary:match(T, <<"upstream queue is 101">>) =/= nomatch],
+    ?assertMatch([_], Named),
+    ?assertEqual([], [T || T <- Named, binary:match(T, <<"verdict-session">>) =/= nomatch]),
+    %% The mailbox drains: casting resumes.
+    drain(Dummy),
+    ok = flush_sync(Verdict),
+    ?assertEqual([[S1, S2], [S1, S2]], casts()),
+    ?assertEqual(2, dropped(queue_full)),
+    stop_stand_in(Dummy).
+
+%% The mailbox length is read from a registered pid that may be gone: a
+%% name nobody holds, or a process that has just died, never costs the cast.
+queue_check_with_dead_upstream_still_casts() ->
+    Dummy = register_upstream_stand_in(),
+    [Dummy ! filler || _ <- lists:seq(1, 500)],
+    S1 = <<"verdict-session-dead">>,
+    Verdict = {ok, #{acknowledged_count => 0, unknown_session_ids => [S1]}, #{}},
+    ok = flush_sync(Verdict),
+    ?assertEqual([], casts()),
+    stop_stand_in(Dummy),
+    ?assertEqual(undefined, whereis(yuzu_gw_upstream)),
+    ok = flush_sync(Verdict),
+    ?assertEqual([[S1]], casts()),
+    ?assertEqual(1, dropped(queue_full)).
+
+%% heartbeat_batch_interval_ms is read once in init/1. Anything but an
+%% integer in 100..60000 falls back to 1000 and warns, naming the key.
+interval_invalid_falls_back() ->
+    [interval_case(Bad, 1000, invalid)
+     || Bad <- [-1, 0, 99, 60001, 600000, 1.5, foo, <<"1000">>, "1000"]],
+    ok.
+
+interval_valid_is_kept() ->
+    [interval_case(V, V, valid) || V <- [100, 1000, 60000]],
+    ok.
+
+interval_case(Val, Expected, Kind) ->
+    stop_buffer(),
+    application:set_env(yuzu_gw, heartbeat_batch_interval_ms, Val),
+    try
+        {Pid, Lines} = capture_logs(fun() ->
+            {ok, P} = yuzu_gw_heartbeat_buffer:start_link(),
+            unlink(P),
+            P
+        end),
+        ?assertEqual(Expected, element(?ST_INTERVAL, sys:get_state(Pid))),
+        Named = [T || {warning, T} <- Lines,
+                      binary:match(T, <<"heartbeat_batch_interval_ms">>) =/= nomatch],
+        case Kind of
+            invalid -> ?assertMatch([_], Named);
+            valid   -> ?assertEqual([], Named)
+        end
+    after
+        stop_buffer(),
+        application:set_env(yuzu_gw, heartbeat_batch_interval_ms, 60000),
+        {ok, P2} = yuzu_gw_heartbeat_buffer:start_link(),
+        unlink(P2)
+    end.
+
 %%%===================================================================
 %%% Helpers
 %%%===================================================================
+
+stop_buffer() ->
+    case whereis(yuzu_gw_heartbeat_buffer) of
+        undefined -> ok;
+        Pid -> catch unlink(Pid), catch gen_server:stop(Pid, normal, 2000), ok
+    end.
+
+%% A process registered as yuzu_gw_upstream that never reads its mailbox.
+register_upstream_stand_in() ->
+    Pid = spawn(fun stand_in_loop/0),
+    true = register(yuzu_gw_upstream, Pid),
+    Pid.
+
+stand_in_loop() ->
+    receive
+        stop  -> ok;
+        drain -> drain_filler(), stand_in_loop()
+    end.
+
+drain_filler() ->
+    receive filler -> drain_filler() after 0 -> ok end.
+
+%% Empty the stand-in's mailbox of filler and wait until it has.
+drain(Pid) ->
+    Pid ! drain,
+    wait_until(fun() -> process_info(Pid, message_queue_len) =:= {message_queue_len, 0} end).
+
+stop_stand_in(Pid) ->
+    Ref = monitor(process, Pid),
+    Pid ! stop,
+    receive {'DOWN', Ref, process, Pid, _} -> ok after 2000 -> error(stand_in_did_not_stop) end.
+
+wait_until(Pred) ->
+    case Pred() of
+        true  -> ok;
+        false -> erlang:yield(), wait_until(Pred)
+    end.
+
 
 %% Make the next BatchHeartbeat rpc return Result.
 set_result(Result) ->
@@ -302,13 +432,16 @@ dropped(Reason) ->
     lists:sum([maps:get(count, M, 0)
                || {M, Meta} <- events(?EV_DROP), norm(maps:get(reason, Meta, undefined)) =:= R]).
 
-%% Run Fun with a capturing logger handler at info level; returns
+%% Run Fun with a capturing logger handler at info level (or Level); returns
 %% {FunResult, [{Level, Text}]}. The handler is VM-wide: callers filter.
 capture_logs(Fun) ->
+    capture_logs(Fun, info).
+
+capture_logs(Fun, Level) ->
     Prev = maps:get(level, logger:get_primary_config()),
-    ok = logger:set_primary_config(level, info),
+    ok = logger:set_primary_config(level, Level),
     ok = logger:add_handler(?LOG_HANDLER, ?MODULE,
-                            #{config => #{pid => self()}, level => info}),
+                            #{config => #{pid => self()}, level => Level}),
     try
         Result = Fun(),
         {Result, collect_logs([])}

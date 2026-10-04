@@ -22,10 +22,17 @@
 %%% malformed; every other decision (which are local, which are already
 %%% queued, the breaker, the queue cap) belongs to the upstream. Flush results
 %%% never feed the circuit breaker, and the only coupling to the upstream is
-%%% that one cast per flush: a cast returns at once, so the handoff adds no
-%%% wait to the flush (the BatchHeartbeat RPC itself is still a synchronous
-%%% unary call under grpcbox's default deadline). A cast to an upstream that is
-%%% not running is a no-op, never a flush failure.
+%%% that one cast per flush (plus a look at its mailbox length first): a cast
+%%% returns at once, so the handoff adds no wait to the flush (the
+%%% BatchHeartbeat RPC itself is still a synchronous unary call under
+%%% grpcbox's default deadline). A cast to an upstream that is not running is
+%%% a no-op, never a flush failure. While the upstream's mailbox holds more
+%%% than 100 messages the cast is skipped and counted (queue_full), so the
+%%% cast rate cannot outrun the drip whatever the flush interval is.
+%%%
+%%% Configuration (sys.config / application env):
+%%%   heartbeat_batch_interval_ms  - flush period (default 1000, valid 100..60000)
+%%%   max_heartbeat_buffer         - heartbeats retained (default 10000)
 %%% @end
 %%%-------------------------------------------------------------------
 -module(yuzu_gw_heartbeat_buffer).
@@ -41,6 +48,16 @@
 
 -define(SERVER, ?MODULE).
 -define(DEFAULT_MAX_HB_BUFFER, 10000).
+%% heartbeat_batch_interval_ms: the flush period, and so the ceiling on how
+%% often one verdict can be cast. Valid 100..60000 (default 1000); anything
+%% else logs a warning naming the key and takes the default.
+-define(DEFAULT_BATCH_INTERVAL_MS, 1000).
+-define(MIN_BATCH_INTERVAL_MS, 100).
+-define(MAX_BATCH_INTERVAL_MS, 60000).
+%% The verdict cast is skipped, and its ids counted as dropped, while the
+%% upstream process already holds more than this many unhandled messages. The
+%% bound does not depend on configuration: it holds whatever the interval is.
+-define(UPSTREAM_QUEUE_MAX, 100).
 %% Bounds on one verdict: the longest session id the gateway will carry and
 %% the most ids handed to the upstream per flush.
 -define(MAX_SESSION_ID_BYTES, 64).
@@ -78,7 +95,8 @@ flush_sync() ->
 %%%===================================================================
 
 init([]) ->
-    Interval = application:get_env(yuzu_gw, heartbeat_batch_interval_ms, 1000),
+    Interval = env_int(heartbeat_batch_interval_ms, ?DEFAULT_BATCH_INTERVAL_MS,
+                       ?MIN_BATCH_INTERVAL_MS, ?MAX_BATCH_INTERVAL_MS),
     MaxBuf = application:get_env(yuzu_gw, max_heartbeat_buffer, ?DEFAULT_MAX_HB_BUFFER),
 
     TRef = erlang:send_after(Interval, self(), flush),
@@ -105,13 +123,13 @@ handle_call(flush_sync, _From, #state{buffer = Buf, buf_len = BufLen,
         heartbeats   => lists:reverse(Buf),
         gateway_node => atom_to_binary(node(), utf8)
     },
-    Result = do_flush(BatchReq, BufLen),
+    {Result, State1} = settle_flush(do_flush(BatchReq, BufLen), State),
     NewTRef = erlang:send_after(Interval, self(), flush),
     case Result of
         ok ->
-            {reply, ok, State#state{buffer = [], buf_len = 0, timer = NewTRef}};
+            {reply, ok, State1#state{buffer = [], buf_len = 0, timer = NewTRef}};
         {error, Reason} ->
-            {reply, {error, Reason}, State#state{timer = NewTRef}}
+            {reply, {error, Reason}, State1#state{timer = NewTRef}}
     end;
 handle_call(_Request, _From, State) ->
     {reply, {error, unknown_call}, State}.
@@ -139,7 +157,8 @@ handle_info(flush, #state{buffer = Buf, buf_len = BufLen,
         gateway_node => atom_to_binary(node(), utf8)
     },
 
-    {NewBuf, NewLen} = case do_flush(BatchReq, BufLen) of
+    {Result, State1} = settle_flush(do_flush(BatchReq, BufLen), State),
+    {NewBuf, NewLen} = case Result of
         ok ->
             {[], 0};
         {error, _Reason} ->
@@ -151,7 +170,7 @@ handle_info(flush, #state{buffer = Buf, buf_len = BufLen,
     end,
 
     TRef = erlang:send_after(Interval, self(), flush),
-    {noreply, State#state{buffer = NewBuf, buf_len = NewLen, timer = TRef}};
+    {noreply, State1#state{buffer = NewBuf, buf_len = NewLen, timer = TRef}};
 
 handle_info(_Info, State) ->
     {noreply, State}.
@@ -166,7 +185,9 @@ code_change(_OldVsn, State, _Extra) ->
 %%% Internal
 %%%===================================================================
 
-%% @doc Send a BatchHeartbeat RPC to the upstream C++ server.
+%% @doc Send a BatchHeartbeat RPC to the upstream C++ server. A success
+%% returns the decoded response untouched; settle_flush/2 consumes its verdict.
+-spec do_flush(map(), non_neg_integer()) -> {ok, term()} | {error, term()}.
 do_flush(BatchReq, BufLen) ->
     InputType = 'yuzu.gateway.v1.BatchHeartbeatRequest',
     OutputType = 'yuzu.gateway.v1.BatchHeartbeatResponse',
@@ -187,15 +208,13 @@ do_flush(BatchReq, BufLen) ->
                               #{duration_ms => Duration},
                               #{rpc_name => <<"batch_heartbeat">>}),
             logger:debug("Flushed ~b heartbeats (ack=~b)", [BufLen, Count]),
-            consume_verdict(Response),
-            ok;
+            {ok, Response};
         {ok, Response, _Headers} ->
             telemetry:execute([yuzu, gw, upstream, rpc_latency],
                               #{duration_ms => Duration},
                               #{rpc_name => <<"batch_heartbeat">>}),
             logger:debug("Flushed ~b heartbeats", [BufLen]),
-            consume_verdict(Response),
-            ok;
+            {ok, Response};
         {error, {Status, Message}, _Trailers} ->
             %% HA WS-4 4.4 review fix (F3, mirrors yuzu_gw_upstream:do_rpc/4's
             %% identical bug): grpcbox_client:unary/5's REAL error shape for a
@@ -237,9 +256,18 @@ do_flush(BatchReq, BufLen) ->
             {error, {internal, Reason}}
     end.
 
+%% @doc Turn the outcome of do_flush/2 into the flush result, consuming the
+%% verdict of a success. Error results never feed the verdict path.
+-spec settle_flush({ok, term()} | {error, term()}, #state{}) ->
+          {ok | {error, term()}, #state{}}.
+settle_flush({ok, Response}, State) ->
+    {ok, consume_verdict(Response, State)};
+settle_flush({error, _} = Error, State) ->
+    {Error, State}.
+
 %% @doc Hand the server's list of unknown sessions to the upstream replay.
 %%
-%% Called from both success arms of do_flush/2 (a decoded response always
+%% Called for both success shapes of do_flush/2 (a decoded response always
 %% carries acknowledged_count, a test double may not). Only ids that can be
 %% session ids are kept (binaries of 1 to 64 bytes); the rest are counted as
 %% verdict_dropped with reason malformed, here, because only this module sees
@@ -247,12 +275,18 @@ do_flush(BatchReq, BufLen) ->
 %% ?MAX_VERDICT_IDS before the cast. The ids are never logged: only counts.
 %% No key, or an empty list, casts nothing.
 %%
+%% The cast is skipped when the upstream already holds more than
+%% ?UPSTREAM_QUEUE_MAX unhandled messages: the ids are counted as
+%% verdict_dropped with reason queue_full and one debug line is logged (a
+%% later heartbeat lists the sessions again). Casting faster than the upstream
+%% drains would only grow its mailbox.
+%%
 %% A body that is not a map is no verdict (grpcbox returns {ok, <<>>, Trailers}
 %% for an OK with trailers and no DATA frame): nothing is cast or counted and
 %% the flush still succeeds. A key of the wrong type is treated as absent. A
 %% crash here would take this process, and every heartbeat it buffers, with it.
--spec consume_verdict(term()) -> ok.
-consume_verdict(Response) when is_map(Response) ->
+-spec consume_verdict(term(), #state{}) -> #state{}.
+consume_verdict(Response, State) when is_map(Response) ->
     Listed = listed_ids(maps:get(unknown_session_ids, Response, [])),
     {Kept, Malformed} = lists:partition(fun is_session_id/1, Listed),
     Ids = lists:sublist(lists:usort(Kept), ?MAX_VERDICT_IDS),
@@ -271,23 +305,69 @@ consume_verdict(Response) when is_map(Response) ->
                               #{count => length(Malformed)},
                               #{reason => malformed})
     end,
-    case maps:get(unknown_session_ids_truncated, Response, false) of
+    State1 = case maps:get(unknown_session_ids_truncated, Response, false) of
         true ->
             telemetry:execute([yuzu, gw, heartbeat, unknown_truncated],
                               #{count => 1}, #{}),
             logger:warning("Heartbeat verdict truncated by the server (~b listed); "
                            "omitted sessions may be reported by subsequent heartbeats",
-                           [length(Listed)]);
+                           [length(Listed)]),
+            State;
         _ ->
-            ok
+            State
     end,
     case Ids of
         [] -> ok;
-        _  -> yuzu_gw_upstream:replay_sessions(Ids)
-    end;
-consume_verdict(_NotAMap) ->
+        _  -> cast_replay(Ids)
+    end,
+    State1;
+consume_verdict(_NotAMap, State) ->
     logger:debug("Heartbeat verdict: response body is not a message; no verdict"),
-    ok.
+    State.
+
+%% @doc Cast Ids to the upstream replay unless its mailbox is already long.
+%% No upstream process (or one that died since the lookup) has no queue to
+%% protect: the cast is a no-op then, exactly as before.
+-spec cast_replay([binary()]) -> ok.
+cast_replay(Ids) ->
+    case upstream_queue_len() of
+        Len when is_integer(Len), Len > ?UPSTREAM_QUEUE_MAX ->
+            telemetry:execute([yuzu, gw, heartbeat, verdict_dropped],
+                              #{count => length(Ids)},
+                              #{reason => queue_full}),
+            logger:debug("Heartbeat verdict: upstream queue is ~b messages; "
+                         "~b session id(s) not cast", [Len, length(Ids)]),
+            ok;
+        _ ->
+            yuzu_gw_upstream:replay_sessions(Ids)
+    end.
+
+-spec upstream_queue_len() -> non_neg_integer() | undefined.
+upstream_queue_len() ->
+    case whereis(yuzu_gw_upstream) of
+        undefined ->
+            undefined;
+        Pid ->
+            case erlang:process_info(Pid, message_queue_len) of
+                {message_queue_len, Len} -> Len;
+                undefined                -> undefined
+            end
+    end.
+
+%% @doc Read an integer application env key that must lie in Min..Max; an
+%% invalid value is logged (naming the key) and replaced by the default. Same
+%% contract as yuzu_gw_upstream's env_int/4; kept private here so this module
+%% does not depend on the upstream's exports (its tests mock that module).
+-spec env_int(atom(), integer(), integer(), integer()) -> integer().
+env_int(Key, Default, Min, Max) ->
+    case application:get_env(yuzu_gw, Key, Default) of
+        Value when is_integer(Value), Value >= Min, Value =< Max ->
+            Value;
+        Bad ->
+            logger:warning("Invalid ~s value ~p (expected an integer in ~b..~b); using ~b",
+                           [Key, Bad, Min, Max, Default]),
+            Default
+    end.
 
 %% @doc The listed ids when the field is a proper list, else none.
 listed_ids(Ids) when is_list(Ids) ->
