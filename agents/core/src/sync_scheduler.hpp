@@ -97,7 +97,10 @@ public:
     /// publication, as agent.cpp does).
     [[nodiscard]] std::vector<std::string> request_now(std::string_view source_or_all);
 
-    /// Registered source names, in registration order (for the agent's error text).
+    /// Registered source names, in registration order (for the agent's error text, and
+    /// the heartbeat thread's emit_sync_skip_tags). Like request_now(), safe from another
+    /// thread only because sources_ is append-only and complete before the scheduler is
+    /// published (agent.cpp).
     [[nodiscard]] std::vector<std::string> source_names() const;
 
     static constexpr std::string_view kAllSources{"all"};
@@ -197,8 +200,10 @@ private:
 /// `yuzu.sync.<source>.skip_streak` / `.last_skip`. Reads the `__sync__` KV (the
 /// cross-thread seam; never the scheduler's in-memory state, which belongs to the
 /// ticking thread). Emits nothing for a source unless the streak is 1-6 ASCII
-/// digits with value > 0 AND a non-empty reason of at most
-/// kPluginHeartbeatMaxValueBytes (64) bytes exists.
+/// digits with value > 0 AND a non-empty reason that is already in sanitised form
+/// (sanitize_skip_reason: at most kPluginHeartbeatMaxValueBytes (64) bytes of
+/// [A-Za-z0-9_.:=,-]) exists — a stored value that is not (corruption, a hand edit)
+/// is never put on the wire.
 /// This tag, not a monotonic counter, is the "equivalent heartbeat tag" for the
 /// skip-visibility requirement (#5327); no protobuf field is added (#1567).
 template <typename TagMap>
@@ -208,7 +213,7 @@ void emit_sync_skip_tags(TagMap& tags, const std::vector<std::string>& sources,
     for (const auto& name : sources) {
         const auto streak = get_fn(SyncScheduler::kv_key(name, "skip_streak"));
         const auto reason = get_fn(SyncScheduler::kv_key(name, "last_skip"));
-        if (!streak || !reason || reason->empty() || reason->size() > kPluginHeartbeatMaxValueBytes)
+        if (!streak || !reason || reason->empty() || sanitize_skip_reason(*reason) != *reason)
             continue;
         if (streak->empty() || streak->size() > 6)
             continue;

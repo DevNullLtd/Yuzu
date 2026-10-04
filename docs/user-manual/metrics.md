@@ -2163,7 +2163,9 @@ with no evidence of ever having been sent.
 Counter incremented every time the agent rejects a plugin at scan time
 **before** its `init` runs (the allowlist and signature checks run before the
 library is even loaded; the name checks run once the library is mapped and its
-declared name read). The `reason` label is bounded to a
+declared name read). The counter is agent-local: the agent has no `/metrics`
+endpoint, so a refusal is visible in that host's agent log, not as a scrapeable
+series. The `reason` label is bounded to a
 fixed set of stable string prefixes — alert rules SHOULD pin against
 the literal label values, not substring matches.
 

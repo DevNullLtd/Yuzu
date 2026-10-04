@@ -693,7 +693,7 @@ TEST_CASE("SyncScheduler: a forced skip records nothing itself; the next batch p
     CHECK(rig.kv["sync.installed_software.last_skip"] == "r:forced");
 }
 
-TEST_CASE("SyncScheduler: skip_backoff from a phase slot retries at literal 1h, 2h, 4h, 8h, "
+TEST_CASE("SyncScheduler: skip_backoff from a phase slot retries at literal 1h 2h 4h 8h "
           "then the next slot",
           "[sync][scheduler][skip]") {
     const std::string agent = "agent-literal";
@@ -732,7 +732,7 @@ TEST_CASE("SyncScheduler: skip_backoff from a phase slot retries at literal 1h, 
     }
 }
 
-TEST_CASE("SyncScheduler: an off-slot first skip is capped at the slot, then the doubling "
+TEST_CASE("SyncScheduler: an off-slot first skip is capped at the slot and then the doubling "
           "continues",
           "[sync][scheduler][skip]") {
     const std::string agent = "agent-offslot";
@@ -809,8 +809,8 @@ TEST_CASE("SyncScheduler: forced recovery clears skip state before a failed RPC"
     CHECK(skip_tags(rig).empty());
 }
 
-TEST_CASE("SyncScheduler: skip state is written skip_streak, last_skip, next_fire and survives "
-          "an interrupted write",
+TEST_CASE("SyncScheduler: skip state is written skip_streak then last_skip then next_fire and "
+          "survives an interrupted write",
           "[sync][scheduler][skip]") {
     SkipRig rig;
     rig.reason = "r:1";
@@ -944,6 +944,19 @@ TEST_CASE("emit_sync_skip_tags publishes only a positive streak with a bounded r
     CHECK(skip_tags(rig).empty());
     rig.kv[lr] = std::string(65, 'x');
     CHECK(skip_tags(rig).empty());
+    for (const char* bad : {"bad reason", "r:\xff", "r:\n"}) { // outside the write-time alphabet
+        rig.kv[lr] = bad;
+        INFO("reason " << bad);
+        CHECK(skip_tags(rig).empty());
+    }
+    // The boundaries the sanitiser and the emitter agree on are published: a 64 B reason, a
+    // 6-digit streak.
+    rig.kv[sk] = "999999";
+    rig.kv[lr] = std::string(64, 'x');
+    tags = skip_tags(rig);
+    CHECK(tags.size() == 2);
+    CHECK(tags["yuzu.sync.installed_software.skip_streak"] == "999999");
+    CHECK(tags["yuzu.sync.installed_software.last_skip"] == std::string(64, 'x'));
 }
 
 TEST_CASE("SyncScheduler: consecutive need_full nacks back off, reset on clean sync",
@@ -1886,7 +1899,7 @@ TEST_CASE("pkg_inventory adapters: constrained managers with a present row is ok
 
 // The skip on a typed PARTIAL is pinned in the skip_reason case below (collect() is nullopt with
 // the `:partial` token); this case pins the paths that must NOT skip.
-TEST_CASE("collector: typed completeness - FULL collected, an opted-in PARTIAL accepted, in-band "
+TEST_CASE("collector: typed completeness - FULL collected; an opted-in PARTIAL accepted; in-band "
           "unsupported wins",
           "[sync][collector]") {
     constexpr auto kPartial = YUZU_RESULT_COMPLETENESS_PARTIAL;
@@ -1975,6 +1988,14 @@ TEST_CASE("collector: skip_reason names the cause of each skip and clears on suc
         g_fake[1].out["packages"] = formulae;
         CHECK_FALSE(src.collect().has_value());
         CHECK(src.skip_reason() == "installed_software:entry_cap");
+    }
+    SECTION("an over-long adapter reason is cut at the heartbeat bound") {
+        fake_windows();
+        g_fake[2].out["list"] =
+            yuzu::wof::format_unavailable_row("list", std::string(100, 'x')) + "\n";
+        CHECK_FALSE(src.collect().has_value());
+        CHECK(src.skip_reason().size() == 64);
+        CHECK(src.skip_reason().starts_with("windows_optional_features.list:"));
     }
     SECTION("the canonical blob exceeds kMaxBlobBytes") {
         g_fake[0].out["list_inventory"] = inv_lines(16000, 200);

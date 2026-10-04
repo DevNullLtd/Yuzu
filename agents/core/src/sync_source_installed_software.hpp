@@ -111,10 +111,10 @@ YUZU_EXPORT std::vector<std::pair<std::string_view, std::string_view>> installed
 YUZU_EXPORT std::string installed_software_canonical_blob(std::vector<SwEntry> entries);
 
 /// Build the `installed_software` SyncSource. `plugins` maps `descriptor->name`
-/// to the loaded descriptor; an absent key = plugin not loaded on this OS (e.g.
-/// `build_agent=false`, or windows_optional_features on macOS) -> that action is
-/// skipped with a warning, except installed_apps: without it the source stays
-/// idle (it anchors the report, UP-IN6). A failing action skips the cycle
+/// to the loaded descriptor; an absent key = plugin not loaded (it failed init, was
+/// refused by the allowlist or signature check, or is not shipped in a trimmed
+/// install) -> that action is skipped with a warning, except installed_apps: without
+/// it the source stays idle (it anchors the report, UP-IN6). A failing action skips the cycle
 /// (nothing is deleted), as does typed PARTIAL completeness unless the action
 /// opts in (pkg_inventory managers).
 ///

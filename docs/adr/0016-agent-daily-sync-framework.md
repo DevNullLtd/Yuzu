@@ -80,10 +80,9 @@ A small, source-agnostic seam:
 > `skip_streak` / `last_skip` in the same `__sync__` KV. A source that opts in
 > (`skip_backoff`; today installed_software only — device_ci dispatches many
 > actions per attempt and software_licensing's single `license_scan.list` is a
-> full scan of every detection surface, so neither retry is cheap) retries at
-> min(next phase slot, 1 h · 2^(streak-1))
-> while the streak is at most 5, then once per daily slot; the others keep one
-> full interval. The operator-facing schedule is stated once, in
+> full scan of every detection surface, so neither retry is cheap) retries after
+> the earlier of the next phase slot and 1 h · 2^(streak-1) while the streak is
+> at most 5, then once per daily slot; the others keep one full interval. The operator-facing schedule is stated once, in
 > `docs/user-manual/inventory.md`. The skip reason reaches the server only as a
 > heartbeat tag, never a report. KV writes are ordered skip fields first
 > (`save_state`), so an interrupted save never advances `next_fire` with the skip

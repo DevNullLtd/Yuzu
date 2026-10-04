@@ -411,8 +411,11 @@ SyncSource make_installed_software_source(SyncPluginMap plugins) {
     src.collect = [plugins = std::move(plugins), last_reason]()
         -> std::optional<std::pair<std::string, std::string>> {
         last_reason->clear();
-        auto skip = [&](std::string reason) -> std::optional<std::pair<std::string, std::string>> {
-            *last_reason = std::move(reason);
+        auto skip = [&](const std::string& reason)
+            -> std::optional<std::pair<std::string, std::string>> {
+            // Persisted and published cut at kPluginHeartbeatMaxValueBytes anyway: keep only that
+            // much, so a plugin's oversized status reason is not retained as string capacity.
+            last_reason->assign(reason, 0, kPluginHeartbeatMaxValueBytes);
             return std::nullopt;
         };
         // installed_apps anchors the report (UP-IN6): without it the other

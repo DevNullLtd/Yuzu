@@ -7,11 +7,12 @@
  * fleet-wide resend (#5330). So this test loads the actual plugin binaries rather
  * than a catalogue copy.
  *
- * MESON_BUILD_ROOT is exact-match only: when set, the sole candidate is
- * <root>/agents/plugins/<plugin>/<plugin><ext>, so a stale artifact from another
- * build dir can never satisfy the pin. (test_disk_actions_local_dispatcher.cpp
- * keeps relative/build-<os> fallbacks for hand-running; they apply here only when
- * MESON_BUILD_ROOT is unset.) A missing library is a failure, never a skip.
+ * Resolution: when MESON_BUILD_ROOT is set (a hand-run harness may set it) the sole
+ * candidate is <root>/agents/plugins/<plugin>/<plugin><ext>. `meson test` does not
+ * export it; it runs the test from the build root, so the working-directory-relative
+ * agents/plugins/<plugin>/<plugin><ext> is the operative path there, and the
+ * build-<os> fallbacks only serve a hand run from the source root. A missing library
+ * is a failure, never a skip.
  */
 #include <catch2/catch_test_macros.hpp>
 
@@ -40,6 +41,11 @@ constexpr const char* kExt = ".dylib";
 constexpr const char* kExt = ".so";
 #endif
 
+// getenv matches the sibling *_local_dispatcher.cpp helpers; MSVC's C4996 is silenced locally.
+#if defined(_MSC_VER)
+#pragma warning(push)
+#pragma warning(disable : 4996)
+#endif
 fs::path find_plugin(const std::string& plugin) {
     const std::string lib = plugin + kExt;
     const fs::path rel = fs::path{"agents"} / "plugins" / plugin / lib;
@@ -52,6 +58,9 @@ fs::path find_plugin(const std::string& plugin) {
         if (std::error_code ec; fs::exists(c, ec)) return c;
     return rel;
 }
+#if defined(_MSC_VER)
+#pragma warning(pop)
+#endif
 
 } // namespace
 
