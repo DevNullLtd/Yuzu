@@ -7198,120 +7198,6 @@ TEST_CASE("rung 9c PR-5a (#4221 up-101/ch-101): a same-rule_id re-attach behind 
     rt->begin_stop();
 }
 
-// EXPLORATORY (not yet reviewed - do not treat as settled coverage): investigating
-// whether publish_arm_verdicts_locked's ORDINARY (non-firewall) pop loop can leave a
-// permanent ghost SparkKeyRuleIndex entry when a withdrawn sibling's
-// release_claim_index_locked call fails exactly once and is never retried. Unlike the
-// firewall branch (guardian_spark_runtime.cpp:602-620, which explicitly re-checks
-// index_held and keeps a release-failed claim as a retained tombstone), the ordinary
-// pop loop at :580-601 pops every finished claim based solely on outcome presence and
-// fifo-front identity - it does not check whether that claim's index release actually
-// succeeded. If confirmed, this produces an index entry with NO corresponding fifo
-// residue at all (unlike up-101's tombstone), so no existing sweep can ever find it.
-TEST_CASE("EXPLORATORY: a release failure on a withdrawn sibling during the ORDINARY "
-          "(non-firewall) publish path - does the claim get popped while its index "
-          "mapping survives?",
-          "[spark][runtime][liveness][.exploratory]") {
-    auto r = std::make_shared<FakeReader>();
-    auto b = std::make_shared<FakeBackend>();
-    b->hang_next_arm.store(true);
-    auto rt = make_rt(r, b, GuardianSparkRuntime::Config{.backend_op_deadline = std::chrono::seconds(30)});
-    const auto key = spark_key(file_spec("/a"));
-
-    // r1 hangs as the head. r2 queues behind it via a genuinely concurrent attach
-    // (NOT the gap-hook trick - r2 must be live/queued, not withdrawn, at the moment
-    // r1's arm resolves is NOT what we want here; we want r2 ALREADY withdrawn with a
-    // FAILED release before r1 resolves, so r1's own "withdrawn siblings" loop is what
-    // attempts r2's release).
-    QueuedAttach a1;
-    a1.t = std::thread{[&] { a1.gen = rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true); }};
-    REQUIRE(b->wait_entered_hang(std::chrono::seconds(30)));
-
-    QueuedAttach a2;
-    a2.t = std::thread{[&] { a2.gen = rt->attach_rule("r2", file_spec("/a"), file_exists_rule("r2"), true); }};
-    REQUIRE(yuzu::test::spin_until([&] { return rt->claim_queue_depth_for_test(key) == 2; },
-                                   std::chrono::seconds(10)));
-
-    // Withdraw r2 (Case-0: still Queued, behind r1) with its OWN index release forced
-    // to fail. It should become a retained tombstone (matches up-101's own finding).
-    rt->set_index_remove_fault_for_test(true);
-    rt->detach_rule("r2");
-    a2.t.join();
-    REQUIRE_FALSE(a2.gen.has_value());
-    CHECK(a2.gen.error() == "withdrawn");
-    CHECK(rt->claim_index_release_failures() == 1);
-    CHECK(rt->claim_queue_depth_for_test(key) == 2); // r1 (head) + r2 (retained tombstone)
-
-    // Re-arm the SAME seam again, from the main thread, BEFORE releasing r1's hang -
-    // so that when r1's own on_arm_complete pass retries r2's release (in its
-    // "withdrawn siblings" loop), THAT attempt fails too.
-    rt->set_index_remove_fault_for_test(true);
-    b->release_hang();
-    a1.t.join();
-    REQUIRE(a1.gen); // r1 itself succeeds and commits normally
-
-    CHECK(rt->claim_index_release_failures() == 2); // r2's release failed a SECOND time
-    CHECK(rt->rule_count() == 1);                   // only r1 is a real, live rule
-    CHECK(rt->armed_key_count() == 1);
-
-    // THE QUESTION: did r2 get popped from the fifo anyway, despite its release
-    // failing? If the ordinary pop loop pops unconditionally (as read from source),
-    // this should be 0 - r2 is gone from claims_[key] entirely, with NOTHING left to
-    // sweep, even though its index entry was never actually released.
-    INFO("claim_queue_depth after r1 commits: " << rt->claim_queue_depth_for_test(key));
-    CHECK(rt->claim_queue_depth_for_test(key) == 0);
-
-    // If the above is 0 (ghost with no fifo trace), r1's OWN eventual detach should
-    // find refcount(key) == 2 (r1 + the ghost "r2"), so remove_rule("r1") reports
-    // siblings remain and NEVER returns the ->0 edge - the real backend subscription
-    // for r1 should therefore NEVER get disarmed, even though r1 is the only rule
-    // left anywhere in rules_/keys_/claims_.
-    const auto arms_before_detach = b->arms.load();
-    const auto disarms_before_detach = b->disarms.load();
-    rt->detach_rule("r1");
-    CHECK(rt->rule_count() == 0);
-    // CORRECTED prediction (first run showed my original guess was wrong in the WORSE
-    // direction): armed_key_count() stays 1, not 0. keys_.erase() is gated on
-    // detach_rule_locked's own `disarm_key` (only set when index_->remove_rule reports
-    // the ->0 edge) - the ghost "r2" still counted in the index means remove_rule("r1")
-    // reports siblings remain, so keys_[key] (and its live PerKey/subscription) is
-    // NEVER erased, even though r1 was the only real rule left anywhere.
-    CHECK(rt->armed_key_count() == 1);
-    // Give any (unexpected) async disarm a moment to land, then check whether it did.
-    std::this_thread::sleep_for(std::chrono::milliseconds(200));
-    INFO("arms before=" << arms_before_detach << " after=" << b->arms.load()
-                        << " disarms before=" << disarms_before_detach
-                        << " after=" << b->disarms.load());
-    CHECK(b->disarms.load() == disarms_before_detach); // PREDICTED: no new disarm fired -
-                                                       // the real subscription is leaked,
-                                                       // permanently armed on the backend,
-                                                       // because remove_rule("r1") still
-                                                       // sees the ghost "r2" as a sibling.
-
-    // Confirm the ghost is PERMANENT: a fresh attach for a NEW rule on the SAME spec
-    // (same key) - does it see the key as already "claimed" or "armed" and behave
-    // oddly, given keys_[key] never went away? And can the key EVER be torn down
-    // again, e.g. via begin_stop's own teardown sweep?
-    const auto arms_before_r4 = b->arms.load();
-    auto gen_r4 = rt->attach_rule("r4", file_spec("/a"), file_exists_rule("r4"), true);
-    INFO("r4 attach: has_value=" << gen_r4.has_value()
-                                 << (gen_r4.has_value() ? "" : (" error=" + gen_r4.error()))
-                                 << " arms before=" << arms_before_r4 << " after=" << b->arms.load()
-                                 << " rule_count=" << rt->rule_count()
-                                 << " armed_key_count=" << rt->armed_key_count());
-    CHECK(gen_r4.has_value()); // does it even succeed?
-    CHECK(rt->rule_count() == 1); // r1 was properly erased from rules_ regardless (the
-                                  // ghost is index-only) - only r4 should be tracked
-    CHECK(b->arms.load() == arms_before_r4); // PREDICTED: r4 silently reuses r1's OLD,
-                                             // still-armed-on-the-backend subscription
-                                             // via the stale keys_[key] entry, WITHOUT
-                                             // a new backend arm() call - r4 ends up
-                                             // sharing a subscription nobody re-verified
-                                             // is even still valid for r4's OWN spec.
-
-    rt->begin_stop();
-}
-
 // rung 9c PR-2 Unit 4 (adversarial review C1, PR #4318 fjarvis): on_arm_complete's
 // compensating branch built the ArmCompensation continuation (a heap allocation plus
 // a string copy) entirely OUTSIDE any try, while a live, un-disarmed backend
@@ -7824,6 +7710,575 @@ TEST_CASE("rung 9c R5.2 (governance pass-3 cs-2): a firewalled drain whose index
     CHECK(rt->rule_count() == 1);
     CHECK(b->arms.load() == 2);
     CHECK(rt->claim_queue_depth_for_test(key) == 0); // tombstone swept, release retried
+}
+
+// #4354: publish_arm_verdicts_locked's ORDINARY (non-firewall) pop loop used to pop every
+// finished claim on fifo-front identity alone, so a claim whose index release had FAILED
+// (the retry at the end of on_arm_complete's success branch, or the compensating /
+// live.empty / adopted branches) left a (key, rule) mapping in index_ with no fifo
+// residue for any sweep to find. The firewall branch (cs-2 above) already keeps such a
+// claim as a withdrawn Queued tombstone; these cases pin the same for the ordinary pop.
+// Two things are pinned, and the titles say which. The RETAIN branch itself (a release
+// that fails at the pop) is hit by the adopted-wedge case, the two recovery-pop cases
+// and the firewalled-follower case at the end. The other cases pin the RETRY before the
+// pop: the one-shot seam is spent by an earlier staging release, so the pop-time release
+// succeeds and the claim is popped with its mapping gone.
+//
+// All of them observe the leak by consequence, not by counting failures (a failure count
+// does not prove the mapping was cleaned up): a ghost mapping makes the key's refcount
+// stay above zero, so the real owner's detach never reaches the 0-edge (no backend
+// disarm, armed_key_count stays 1) and a later attach joins a watcher nobody re-armed -
+// or, when the head never committed, throws out of keys_.at.
+namespace {
+/// Wait until `key`'s claim queue is empty and every executor worker has exited.
+/// FakeBackend::disarm bumps `disarms` BEFORE the runtime pops the Disarm claim, so
+/// spinning on `disarms` alone races a negative assertion or teardown.
+void settle_key_claims(GuardianSparkRuntime& rt, const std::string& key) {
+    REQUIRE(yuzu::test::spin_until([&] { return rt.claim_queue_depth_for_test(key) == 0; },
+                                   std::chrono::seconds(10)));
+    REQUIRE(yuzu::test::spin_until([&] { return rt.active_backend_op_workers() == 0; },
+                                   std::chrono::seconds(10)));
+}
+} // namespace
+
+TEST_CASE("#4354: a withdrawn sibling whose index release failed at staging is retried before "
+          "the ordinary pop, never popped with its mapping - the key still disarms and re-arms",
+          "[spark][runtime][liveness]") {
+    // Mutation: drop the release-or-retain at the ordinary pop (the pre-fix loop) -> r2's
+    // mapping outlives its pop; r1's detach never reaches the 0-edge (armed_key_count()
+    // stays 1, no disarm) and r4 joins the old watcher without a new backend arm.
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    b->hang_next_arm.store(true);
+    auto rt = make_rt(r, b, GuardianSparkRuntime::Config{.backend_op_deadline = std::chrono::seconds(30)});
+    const auto key = spark_key(file_spec("/a"));
+
+    // Threads before the guard (the file's idiom): on unwind the guard releases the parked
+    // backend first, then the QueuedAttach destructors join attaches that have returned.
+    QueuedAttach a1, a2;
+    struct Cleanup {
+        FakeBackend* backend;
+        ~Cleanup() { backend->release_hang(); }
+    } cleanup{b.get()};
+
+    a1.t = std::thread{[&] { a1.gen = rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true); }};
+    REQUIRE(b->wait_entered_hang(std::chrono::seconds(30)));
+    a2.t = std::thread{[&] { a2.gen = rt->attach_rule("r2", file_spec("/a"), file_exists_rule("r2"), true); }};
+    REQUIRE(yuzu::test::spin_until([&] { return rt->claim_queue_depth_for_test(key) == 2; },
+                                   std::chrono::seconds(10)));
+
+    // Withdraw r2 (Queued behind the hung head) with its own index release failing once:
+    // it stays as a withdrawn tombstone holding its mapping.
+    rt->set_index_remove_fault_for_test(true);
+    rt->detach_rule("r2");
+    a2.t.join();
+    REQUIRE_FALSE(a2.gen.has_value());
+    CHECK(a2.gen.error() == "withdrawn");
+    CHECK(rt->claim_index_release_failures() == 1);
+    CHECK(rt->claim_queue_depth_for_test(key) == 2); // r1 (head) + r2 (tombstone)
+
+    // Re-arm the one-shot seam BEFORE releasing the hang, so the first release of r2 in
+    // r1's own drain (the staging loop in its success branch) fails. The seam is then
+    // spent, so the pop-time retry succeeds: this case pins that retry, not the retain.
+    rt->set_index_remove_fault_for_test(true);
+    b->release_hang();
+    a1.t.join();
+    REQUIRE(a1.gen); // r1 itself commits normally
+
+    settle_key_claims(*rt, key);
+    CHECK(rt->claim_index_release_failures() == 2); // detach + the staging release; the pop-time retry succeeded
+    CHECK(rt->rule_count() == 1);
+    CHECK(rt->armed_key_count() == 1);
+
+    // r2's mapping must be gone: r1 is now the key's only owner, so its detach reaches the
+    // 0-edge synchronously (keys_.erase under detach's own lock) and disarms the watcher.
+    const auto disarms_before = b->disarms.load();
+    rt->detach_rule("r1");
+    CHECK(rt->rule_count() == 0);
+    REQUIRE(rt->armed_key_count() == 0); // a surviving ghost mapping keeps the key armed
+    CHECK(yuzu::test::spin_until([&] { return b->disarms.load() == disarms_before + 1; },
+                                 std::chrono::seconds(10)));
+    settle_key_claims(*rt, key);
+    CHECK(b->disarms.load() == disarms_before + 1);
+
+    // ...and a fresh attach on the key arms anew.
+    const auto arms_before = b->arms.load();
+    std::expected<std::uint64_t, std::string> gen4;
+    REQUIRE_NOTHROW(gen4 = rt->attach_rule("r4", file_spec("/a"), file_exists_rule("r4"), true));
+    REQUIRE(gen4);
+    CHECK(b->arms.load() == arms_before + 1);
+    CHECK(rt->rule_count() == 1);
+    CHECK(rt->armed_key_count() == 1);
+    CHECK(rt->claim_queue_depth_for_test(key) == 0);
+    rt->begin_stop();
+}
+
+TEST_CASE("#4354: a live follower queued behind a withdrawn tombstone commits as a sibling and "
+          "the queue drains in the same call once the pop-time retry of the tombstone's release "
+          "succeeds",
+          "[spark][runtime][liveness]") {
+    // Mutation: as the case above (r2's mapping leaks), and additionally pinning that the
+    // follower behind the retained claim is neither popped out of order nor stranded: the
+    // queue still drains to 0 and BOTH live rules commit onto the one watcher.
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    b->hang_next_arm.store(true);
+    auto rt = make_rt(r, b, GuardianSparkRuntime::Config{.backend_op_deadline = std::chrono::seconds(30)});
+    const auto key = spark_key(file_spec("/a"));
+
+    QueuedAttach a1, a2, a3;
+    struct Cleanup {
+        FakeBackend* backend;
+        ~Cleanup() { backend->release_hang(); }
+    } cleanup{b.get()};
+
+    a1.t = std::thread{[&] { a1.gen = rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true); }};
+    REQUIRE(b->wait_entered_hang(std::chrono::seconds(30)));
+    a2.t = std::thread{[&] { a2.gen = rt->attach_rule("r2", file_spec("/a"), file_exists_rule("r2"), true); }};
+    REQUIRE(yuzu::test::spin_until([&] { return rt->claim_queue_depth_for_test(key) == 2; },
+                                   std::chrono::seconds(10)));
+    a3.t = std::thread{[&] { a3.gen = rt->attach_rule("r3", file_spec("/a"), file_exists_rule("r3"), true); }};
+    REQUIRE(yuzu::test::spin_until([&] { return rt->claim_queue_depth_for_test(key) == 3; },
+                                   std::chrono::seconds(10)));
+
+    rt->set_index_remove_fault_for_test(true);
+    rt->detach_rule("r2");
+    a2.t.join();
+    REQUIRE_FALSE(a2.gen.has_value());
+    CHECK(rt->claim_index_release_failures() == 1);
+    CHECK(rt->claim_queue_depth_for_test(key) == 3); // r1 (head), r2 (tombstone), r3 (live)
+
+    rt->set_index_remove_fault_for_test(true);
+    b->release_hang();
+    a1.t.join();
+    a3.t.join();
+    REQUIRE(a1.gen);
+    REQUIRE(a3.gen); // r3 committed as a sibling of r1's watcher
+
+    settle_key_claims(*rt, key);
+    CHECK(rt->claim_index_release_failures() == 2);
+    CHECK(rt->rule_count() == 2);
+    CHECK(rt->armed_key_count() == 1);
+    CHECK(b->arms.load() == 1); // one shared watcher, r3 never armed its own
+
+    // No ghost: the key tears down only when the LAST live rule leaves, then disarms once.
+    const auto disarms_before = b->disarms.load();
+    rt->detach_rule("r1");
+    CHECK(rt->rule_count() == 1);
+    CHECK(rt->armed_key_count() == 1);
+    rt->detach_rule("r3");
+    CHECK(rt->rule_count() == 0);
+    REQUIRE(rt->armed_key_count() == 0); // a surviving ghost mapping keeps the key armed
+    CHECK(yuzu::test::spin_until([&] { return b->disarms.load() == disarms_before + 1; },
+                                 std::chrono::seconds(10)));
+    settle_key_claims(*rt, key);
+    CHECK(b->disarms.load() == disarms_before + 1);
+    rt->begin_stop();
+}
+
+TEST_CASE("#4354: an ADOPTED wedge's late success retains a withdrawn follower whose index "
+          "release fails, instead of popping it with its mapping",
+          "[spark][runtime][liveness]") {
+    // Mutation: drop the release-or-retain at the ordinary pop -> the adopted branch
+    // attempts no release on r2, so it is popped with its mapping (failures stays 1) and
+    // r1's detach never reaches the 0-edge. The seam is re-armed so that a helper which
+    // retried but IGNORED the result would leak too: the failed retry must keep the claim.
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    b->hang_next_arm.store(true);
+    auto rt = make_rt(r, b, GuardianSparkRuntime::Config{.backend_op_deadline =
+                                                         std::chrono::milliseconds(50)});
+    const auto key = spark_key(file_spec("/a"));
+
+    struct Cleanup {
+        FakeBackend* backend;
+        ~Cleanup() { backend->release_hang(); } // idempotent - the explicit release below still fires
+    } cleanup{b.get()};
+
+    auto res1 = rt->attach_rule(GuardianSparkRuntime::NonWaiting{}, "r1", file_spec("/a"),
+                                file_exists_rule("r1"), true);
+    REQUIRE(b->wait_entered_hang(std::chrono::seconds(30)));
+    REQUIRE(res1.has_value());
+    auto res2 = rt->attach_rule(GuardianSparkRuntime::NonWaiting{}, "r2", file_spec("/a"),
+                                file_exists_rule("r2"), true);
+    REQUIRE(res2.has_value());
+    REQUIRE(rt->claim_queue_depth_for_test(key) == 2);
+
+    // Withdraw r2 (Queued behind the hung head) with its release failing: a tombstone.
+    rt->set_index_remove_fault_for_test(true);
+    rt->detach_rule("r2");
+    CHECK(rt->claim_index_release_failures() == 1);
+    CHECK(rt->claim_queue_depth_for_test(key) == 2);
+
+    // Wedge r1 BEFORE re-arming the seam (the expiry releases r1's own index mapping, which
+    // would otherwise spend it). r2 withdrew, so r1 is a lone wedge and keeps rg->active.
+    // KeyClaim::deadline is steady_clock, so poll the expiry rather than sleeping.
+    REQUIRE(yuzu::test::spin_until([&] { return rt->expire_overdue_claims() >= 1; },
+                                   std::chrono::seconds(10)));
+    CHECK(rt->receipt_status(res1->receipt) == GuardianSparkRuntime::ReceiptStatus::Wedged);
+    CHECK(rt->claim_index_release_failures() == 1);
+
+    rt->set_index_remove_fault_for_test(true);
+    b->release_hang();
+    REQUIRE(yuzu::test::spin_until([&] { return rt->rule_count() == 1; }, std::chrono::seconds(10)));
+    settle_key_claims(*rt, key);
+    CHECK(b->disarms.load() == 0); // r1 adopted, not disarmed
+    CHECK(rt->claim_index_release_failures() == 2); // the drain DID retry r2's release
+    CHECK(rt->armed_key_count() == 1);
+
+    // r2's mapping is gone, so r1's detach reaches the 0-edge and disarms.
+    rt->detach_rule("r1");
+    CHECK(rt->rule_count() == 0);
+    REQUIRE(rt->armed_key_count() == 0); // a surviving ghost mapping keeps the key armed
+    CHECK(yuzu::test::spin_until([&] { return b->disarms.load() == 1; }, std::chrono::seconds(10)));
+    settle_key_claims(*rt, key);
+
+    const auto arms_before = b->arms.load();
+    std::expected<std::uint64_t, std::string> gen4;
+    REQUIRE_NOTHROW(gen4 = rt->attach_rule("r4", file_spec("/a"), file_exists_rule("r4"), true));
+    REQUIRE(gen4);
+    CHECK(b->arms.load() == arms_before + 1);
+    CHECK(rt->armed_key_count() == 1);
+    rt->begin_stop();
+}
+
+TEST_CASE("#4354: a withdrawn head whose late success is compensated (live.empty) and whose "
+          "staging release failed is retried before the pop, not popped as a ghost - the next "
+          "attach arms",
+          "[spark][runtime][liveness]") {
+    // Mutation: pop the compensated head regardless of its release result -> its mapping
+    // survives with no keys_ entry (the head never committed), so r4's attach takes the
+    // shared-watcher branch and throws std::out_of_range from keys_.at.
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    b->hang_next_arm.store(true);
+    auto rt = make_rt(r, b, GuardianSparkRuntime::Config{.backend_op_deadline = std::chrono::seconds(30)});
+    const auto key = spark_key(file_spec("/a"));
+
+    struct Cleanup {
+        FakeBackend* backend;
+        ~Cleanup() { backend->release_hang(); }
+    } cleanup{b.get()};
+
+    auto res1 = rt->attach_rule(GuardianSparkRuntime::NonWaiting{}, "r1", file_spec("/a"),
+                                file_exists_rule("r1"), true);
+    REQUIRE(b->wait_entered_hang(std::chrono::seconds(30)));
+    REQUIRE(res1.has_value());
+    REQUIRE(rt->claim_queue_depth_for_test(key) == 1);
+
+    // Withdraw the in-flight head: it stays as the key's Dispatched marker, its release
+    // failing once so it still holds its mapping.
+    rt->set_index_remove_fault_for_test(true);
+    rt->detach_rule("r1");
+    CHECK(rt->claim_index_release_failures() == 1);
+    CHECK(rt->claim_queue_depth_for_test(key) == 1);
+
+    // The late success finds no live claim (live.empty), whose own staging release of the
+    // head fails again (the seam is then spent, so the pop-time retry succeeds), and the
+    // subscription is disarmed by the deferred compensating path.
+    rt->set_index_remove_fault_for_test(true);
+    b->release_hang();
+    REQUIRE(yuzu::test::spin_until([&] { return b->disarms.load() == 1; }, std::chrono::seconds(10)));
+    settle_key_claims(*rt, key);
+    CHECK(rt->claim_index_release_failures() == 2);
+    CHECK(rt->rule_count() == 0);
+    CHECK(rt->armed_key_count() == 0);
+
+    const auto arms_before = b->arms.load();
+    std::expected<std::uint64_t, std::string> gen4;
+    REQUIRE_NOTHROW(gen4 = rt->attach_rule("r4", file_spec("/a"), file_exists_rule("r4"), true));
+    REQUIRE(gen4);
+    CHECK(b->arms.load() == arms_before + 1);
+    CHECK(rt->rule_count() == 1);
+    CHECK(rt->armed_key_count() == 1);
+    CHECK(rt->claim_queue_depth_for_test(key) == 0);
+    rt->begin_stop();
+}
+
+TEST_CASE("#4354: a head whose index release fails at the executor-throw staging site is retried "
+          "before the pop, not popped as a ghost - the next attach arms",
+          "[spark][runtime][liveness]") {
+    // Mutation: drop the release-or-retain at the ordinary pop -> the failed release at
+    // on_arm_complete's `!r` staging is never retried, r1 is popped with its mapping, and
+    // r4's attach takes the shared-watcher branch and throws std::out_of_range from keys_.at.
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    b->hang_next_arm.store(true);
+    auto rt = make_rt(r, b, GuardianSparkRuntime::Config{.backend_op_deadline = std::chrono::seconds(30)});
+    const auto key = spark_key(file_spec("/a"));
+
+    QueuedAttach a1;
+    struct Cleanup {
+        FakeBackend* backend;
+        ~Cleanup() { backend->release_hang(); }
+    } cleanup{b.get()};
+
+    a1.t = std::thread{[&] { a1.gen = rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true); }};
+    REQUIRE(b->wait_entered_hang(std::chrono::seconds(30)));
+    REQUIRE(rt->claim_queue_depth_for_test(key) == 1);
+
+    // The single-shot hang precedes the throw check, so the parked arm throws once released.
+    // The seam is armed only now: nothing releases r1's mapping before the staging site.
+    b->throw_arm.store(true);
+    rt->set_index_remove_fault_for_test(true);
+    b->release_hang();
+    a1.t.join();
+    REQUIRE_FALSE(a1.gen.has_value());
+
+    settle_key_claims(*rt, key);
+    CHECK(rt->claim_index_release_failures() == 1); // the staging release; the retry (if any) succeeds
+    CHECK(rt->rule_count() == 0);
+    CHECK(rt->armed_key_count() == 0);
+    CHECK(b->arms.load() == 0);
+
+    b->throw_arm.store(false);
+    std::expected<std::uint64_t, std::string> gen4;
+    REQUIRE_NOTHROW(gen4 = rt->attach_rule("r4", file_spec("/a"), file_exists_rule("r4"), true));
+    REQUIRE(gen4);
+    CHECK(b->arms.load() == 1);
+    CHECK(rt->rule_count() == 1);
+    CHECK(rt->armed_key_count() == 1);
+    CHECK(rt->claim_queue_depth_for_test(key) == 0);
+    rt->begin_stop();
+}
+
+TEST_CASE("#4354: a head whose index release fails at the backend-refused staging site is retried "
+          "before the pop, not popped as a ghost - the next attach arms",
+          "[spark][runtime][liveness]") {
+    // Mutation: as the case above, for on_arm_complete's `!armed_live` staging.
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    b->hang_next_arm.store(true);
+    auto rt = make_rt(r, b, GuardianSparkRuntime::Config{.backend_op_deadline = std::chrono::seconds(30)});
+    const auto key = spark_key(file_spec("/a"));
+
+    QueuedAttach a1;
+    struct Cleanup {
+        FakeBackend* backend;
+        ~Cleanup() { backend->release_hang(); }
+    } cleanup{b.get()};
+
+    a1.t = std::thread{[&] { a1.gen = rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true); }};
+    REQUIRE(b->wait_entered_hang(std::chrono::seconds(30)));
+    REQUIRE(rt->claim_queue_depth_for_test(key) == 1);
+
+    b->fail_arm.store(true);
+    rt->set_index_remove_fault_for_test(true);
+    b->release_hang();
+    a1.t.join();
+    REQUIRE_FALSE(a1.gen.has_value());
+
+    settle_key_claims(*rt, key);
+    CHECK(rt->claim_index_release_failures() == 1);
+    CHECK(rt->rule_count() == 0);
+    CHECK(rt->armed_key_count() == 0);
+    CHECK(b->arms.load() == 0);
+
+    b->fail_arm.store(false);
+    std::expected<std::uint64_t, std::string> gen4;
+    REQUIRE_NOTHROW(gen4 = rt->attach_rule("r4", file_spec("/a"), file_exists_rule("r4"), true));
+    REQUIRE(gen4);
+    CHECK(b->arms.load() == 1);
+    CHECK(rt->rule_count() == 1);
+    CHECK(rt->armed_key_count() == 1);
+    CHECK(rt->claim_queue_depth_for_test(key) == 0);
+    rt->begin_stop();
+}
+
+TEST_CASE("#4354: the double-fault recovery pop in on_arm_complete retains a head whose index "
+          "release fails, instead of popping it with its mapping",
+          "[spark][runtime][liveness]") {
+    // Mutation: drop the release-or-retain at the recovery pop in on_arm_complete's catch
+    // -> the head is popped with its mapping and r4's attach throws from keys_.at; omit
+    // `dispatch = Queued` from the helper -> the retained head is never swept, so the
+    // queue never drains. (A publish that throws at fault point 3 never reaches the
+    // ordinary pop loop, so this case does not exercise that loop.)
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    b->hang_next_arm.store(true);
+    auto rt = make_rt(r, b, GuardianSparkRuntime::Config{.backend_op_deadline = std::chrono::seconds(30)});
+    const auto key = spark_key(file_spec("/a"));
+
+    QueuedAttach a1;
+    struct Cleanup {
+        FakeBackend* backend;
+        ~Cleanup() { backend->release_hang(); }
+    } cleanup{b.get()};
+
+    a1.t = std::thread{[&] { a1.gen = rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true); }};
+    REQUIRE(b->wait_entered_hang(std::chrono::seconds(30)));
+    REQUIRE(rt->claim_queue_depth_for_test(key) == 1);
+
+    // Staging: the backend refuses and r1's release fails (seam shot 1), leaving r1 holding
+    // its mapping. Fault point 3 makes the first publish throw after the verdict is
+    // written; the gap hook (it fires because nothing was published) re-arms the seam and
+    // fault point 3 so the SECOND publish throws into the recovery catch, whose pop then
+    // releases r1 (seam shot 2). The hook only stores atomics: it runs on the detached
+    // worker, so no Catch2 assertion in here.
+    b->fail_arm.store(true);
+    rt->set_index_remove_fault_for_test(true);
+    rt->set_drain_fault_point_for_test(3);
+    rt->set_drain_gap_hook_for_test([rtp = rt.get()] {
+        rtp->set_index_remove_fault_for_test(true);
+        rtp->set_drain_fault_point_for_test(3);
+    });
+    b->release_hang();
+    a1.t.join();
+    REQUIRE_FALSE(a1.gen.has_value());
+
+    settle_key_claims(*rt, key);
+    CHECK(rt->claim_index_release_failures() == 2); // staging + recovery release
+    CHECK(rt->rule_count() == 0);
+    CHECK(rt->armed_key_count() == 0);
+    CHECK(b->arms.load() == 0);
+
+    b->fail_arm.store(false);
+    std::expected<std::uint64_t, std::string> gen4;
+    REQUIRE_NOTHROW(gen4 = rt->attach_rule("r4", file_spec("/a"), file_exists_rule("r4"), true));
+    REQUIRE(gen4);
+    CHECK(b->arms.load() == 1);
+    CHECK(rt->rule_count() == 1);
+    CHECK(rt->armed_key_count() == 1);
+    CHECK(rt->claim_queue_depth_for_test(key) == 0);
+    rt->set_drain_gap_hook_for_test({});
+    rt->begin_stop();
+}
+
+TEST_CASE("#4354: the double-fault recovery pop in finalize_arm_compensation retains a head whose "
+          "index release fails, instead of popping it with its mapping",
+          "[spark][runtime][liveness]") {
+    // Mutation: drop the release-or-retain at the recovery pop in finalize_arm_compensation's
+    // catch -> the head is popped with its mapping and r4's attach throws from keys_.at;
+    // omit `dispatch = Queued` from the helper -> the retained head is never swept.
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    b->hang_next_arm.store(true);
+    auto rt = make_rt(r, b, GuardianSparkRuntime::Config{.backend_op_deadline = std::chrono::seconds(30)});
+    const auto key = spark_key(file_spec("/a"));
+
+    struct Cleanup {
+        FakeBackend* backend;
+        ~Cleanup() { backend->release_hang(); }
+    } cleanup{b.get()};
+
+    auto res1 = rt->attach_rule(GuardianSparkRuntime::NonWaiting{}, "r1", file_spec("/a"),
+                                file_exists_rule("r1"), true);
+    REQUIRE(b->wait_entered_hang(std::chrono::seconds(30)));
+    REQUIRE(res1.has_value());
+    REQUIRE(rt->claim_queue_depth_for_test(key) == 1);
+
+    // Withdraw the in-flight head (the key's Dispatched marker), its release failing once.
+    rt->set_index_remove_fault_for_test(true);
+    rt->detach_rule("r1");
+    CHECK(rt->claim_index_release_failures() == 1);
+    CHECK(rt->claim_queue_depth_for_test(key) == 1);
+
+    // The late success is live.empty and its own release of the head fails again (seam
+    // shot 2); the subscription is owed a compensating disarm, so on_arm_complete skips
+    // its own publish and the ONLY publish is finalize_arm_compensation's. Fault point 3
+    // (nothing earlier consumes it) makes that publish throw into the recovery catch; the
+    // gap hook re-arms the seam so the recovery pop's release fails (seam shot 3). The hook
+    // only stores an atomic: it runs on the detached worker.
+    rt->set_index_remove_fault_for_test(true);
+    rt->set_drain_fault_point_for_test(3);
+    rt->set_drain_gap_hook_for_test([rtp = rt.get()] { rtp->set_index_remove_fault_for_test(true); });
+    b->release_hang();
+    REQUIRE(yuzu::test::spin_until([&] { return b->disarms.load() == 1; }, std::chrono::seconds(10)));
+    settle_key_claims(*rt, key);
+    CHECK(rt->claim_index_release_failures() == 3); // detach + live.empty + recovery release
+    CHECK(rt->rule_count() == 0);
+    CHECK(rt->armed_key_count() == 0);
+
+    const auto arms_before = b->arms.load();
+    std::expected<std::uint64_t, std::string> gen4;
+    REQUIRE_NOTHROW(gen4 = rt->attach_rule("r4", file_spec("/a"), file_exists_rule("r4"), true));
+    REQUIRE(gen4);
+    CHECK(b->arms.load() == arms_before + 1);
+    CHECK(rt->rule_count() == 1);
+    CHECK(rt->armed_key_count() == 1);
+    CHECK(rt->claim_queue_depth_for_test(key) == 0);
+    rt->set_drain_gap_hook_for_test({});
+    rt->begin_stop();
+}
+
+TEST_CASE("#4354: a firewalled drain whose head release fails does not fail a live follower "
+          "queued after the snapshot",
+          "[spark][runtime][liveness]") {
+    // Mutation: drop the `finished.empty()` guard on publish_arm_verdicts_locked's firewall
+    // branch -> the retained head (still at the fifo front after its failed release) makes
+    // the branch fire with a non-empty `finished` and fail EVERY fifo claim, so r2, queued
+    // in the drain gap (after the snapshot, hence not in `finished`), gets "arm drain
+    // failed" and loses its claim instead of being swept to the front and armed.
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    b->hang_next_arm.store(true);
+    auto rt = make_rt(r, b, GuardianSparkRuntime::Config{.backend_op_deadline = std::chrono::seconds(30)});
+    const auto key = spark_key(file_spec("/a"));
+    auto park = std::make_shared<DrainPark>();
+
+    // Threads before the guard (the file's idiom): on unwind the guard releases the parked
+    // backend and the gap hook first, then the QueuedAttach destructor joins a returned attach.
+    QueuedAttach a2;
+    struct Cleanup {
+        FakeBackend* backend;
+        DrainPark* park;
+        ~Cleanup() {
+            backend->release_hang();
+            park->release();
+        }
+    } cleanup{b.get(), park.get()};
+
+    auto res1 = rt->attach_rule(GuardianSparkRuntime::NonWaiting{}, "r1", file_spec("/a"),
+                                file_exists_rule("r1"), true);
+    REQUIRE(b->wait_entered_hang(std::chrono::seconds(30)));
+    REQUIRE(res1.has_value());
+    REQUIRE(rt->claim_queue_depth_for_test(key) == 1);
+
+    // Seam shot 1: withdraw the in-flight head. It stays as the key's Dispatched marker
+    // with its release failing, so it still holds its mapping.
+    rt->set_index_remove_fault_for_test(true);
+    rt->detach_rule("r1");
+    CHECK(rt->claim_index_release_failures() == 1);
+    CHECK(rt->claim_queue_depth_for_test(key) == 1);
+
+    // Seam shot 2: the late success finds no live claim (live.empty), so the compensating
+    // path owes a disarm and r1's own release fails again. Fault point 4 (nothing earlier
+    // consumes it) makes the continuation allocation throw: the drain is firewalled, the
+    // subscription is disarmed directly, and the publish runs inline with finished == [r1].
+    // The gap hook fires first (nothing is published yet). It parks until r2 has queued
+    // behind r1, which is therefore NOT in `finished`, and only then re-arms the seam
+    // (shot 3) so that the ordinary loop's release of r1 inside that publish fails and r1
+    // is retained at the front. The hook only touches atomics and the park: it runs on the
+    // detached worker, so no Catch2 assertion in here.
+    rt->set_index_remove_fault_for_test(true);
+    rt->set_drain_fault_point_for_test(4);
+    rt->set_drain_gap_hook_for_test([rtp = rt.get(), park] {
+        park->wait();
+        rtp->set_index_remove_fault_for_test(true);
+    });
+    b->release_hang();
+    REQUIRE(yuzu::test::spin_until([&] { return park->entered.load(); }, std::chrono::seconds(10)));
+
+    a2.t = std::thread{[&] { a2.gen = rt->attach_rule("r2", file_spec("/a"), file_exists_rule("r2"), true); }};
+    REQUIRE(yuzu::test::spin_until([&] { return rt->claim_queue_depth_for_test(key) == 2; },
+                                   std::chrono::seconds(10)));
+    park->release();
+    a2.t.join();
+    INFO("r2: " << (a2.gen.has_value() ? std::string{"armed"} : a2.gen.error()));
+    REQUIRE(a2.gen.has_value()); // not "arm drain failed": the live follower was armed
+
+    settle_key_claims(*rt, key);
+    // Three shots, each consumed by exactly one failing release: the detach, the live.empty
+    // release, and the ordinary loop's release of the firewalled head.
+    CHECK(rt->claim_index_release_failures() == 3);
+    CHECK(rt->rule_count() == 1);
+    CHECK(rt->armed_key_count() == 1);
+    CHECK(rt->claim_queue_depth_for_test(key) == 0);
+    CHECK(b->disarms.load() == 1); // r1's subscription, disarmed directly (firewalled)
+    CHECK(b->arms.load() == 2);    // r1's compensated arm, then r2's own
+
+    rt->set_drain_gap_hook_for_test({});
+    rt->begin_stop();
 }
 
 // adversarial round 4 K2/C5: index_add_rollback's .fn runs inside ~GuardianRollback,

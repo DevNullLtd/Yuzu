@@ -878,8 +878,7 @@ endif
 # without the suffix a carved tag pulls in cases the old single entry never ran.
 # Linux, 2026-10-01: the one `[tsan-heavy]` case (test_guardian_spark_runtime.cpp
 # ~2721, tagged [runtime][liveness], both carved here) would run twice, here and in
-# 'agent tsan-heavy checkpoints'; and the one hidden `[.]` case (same file, ~7194,
-# tagged [runtime][liveness]) would run although it is hidden. On Windows the
+# 'agent tsan-heavy checkpoints'. On Windows the
 # `[.][flaky-4086][guardian][guard]...` case (test_guard_file.cpp ~1110, under
 # #ifdef _WIN32) carries [guard], which shard A carves, so there the suffix is what
 # keeps it out; that Windows leak was reasoned from the tags, NOT observed. The
