@@ -213,49 +213,69 @@ wire contract: `docs/user-manual/rest-api.md` "Users".
 
 - `POST /api/v1/users/me/password` `{current_password, new_password}` — self-service.
 - `POST /api/v1/users/{name}/password` `{new_password}` — administrative reset
-  (`UserManagement:Write` + MFA step-up).
+  (the canonical durable-Administrator gate + MFA step-up — see "Route gates").
 
 **One write primitive.** `AuthDB::set_password` is the only writer of
 `password_hash` on an existing row (`upsert_user` is INSERT-only — `ON CONFLICT
 DO NOTHING`). It is a single guarded `UPDATE ... RETURNING` whose `WHERE` clause
 is the local-account gate (`is_active AND identity_source='local' AND
-provisioning_source='local'`), clears the lockout columns in the same
-statement, and takes two optional guards, each a compile-time SQL variant (no
-interpolation): a **compare-and-swap** on the expected current hash, and
-**`forbid_admin_target`** (`AND role <> 'admin'`). Zero rows is `UserNotFound`
-with no oracle at the store; the `AuthManager` caller re-reads to answer 404 /
-409 / 403 honestly.
+provisioning_source='local'`). It writes `password_hash`, `salt_hex` and
+`updated_at` ONLY — never the lockout columns (clearing a lock is an audited
+admin act; see "Sessions and lockout") — and takes one optional guard, a
+compile-time SQL variant (no interpolation): a **compare-and-swap** on the
+expected current hash. There is **no role predicate**: who may reset whom is
+decided once, at the route, by `is_rbac_administrator` (#5342 Gate 7). Zero
+rows is `UserNotFound` with no oracle at the store; the `AuthManager` caller
+re-reads to answer 404 / 409 honestly.
 
 **AuthManager.** `change_password` / `reset_password` return a typed
 `PasswordWriteOutcome` (never the legacy "any false = weak password" bool). Both
-read the account **from the AuthDB** (never `users_`), classify non-local
-accounts, and write CAS-anchored on the hash they read — for a self-change, the
-hash the current password was just re-verified against, so an admin reset that
-lands in between wins (`kConflict`). `reset_password(…, permit_admin_target)`
-refuses an admin target on its read, and when the caller is NOT permitted one
-it also passes `forbid_admin_target=true`, so a promotion of the target
-committing between the read and the `UPDATE` makes the write match zero rows →
-`kAdminTarget` (the read-then-write race the first slice disclosed, now closed
-by the write itself). The REST route sets `permit_admin_target` from the
-caller's **durable** `Session::role`, never `effective_role()` — a JIT
-elevation grants `UserManagement:Write` (the legacy permission check admits on
-the effective role) but must not re-key a standing administrator.
+read the account **from the AuthDB** (never `users_`) and classify non-local
+accounts. `change_password(username, verified_hash, new)` takes the stored hash
+the caller's lockout-accounted `verify_password` just verified the current
+password against (`VerifiedCredential::hash_hex`) and writes CAS-anchored on it
+— no second PBKDF2; anything committed in between (an admin reset) wins →
+`kConflict`. `reset_password(username, new)` is a plain guarded write (no CAS,
+no target-role classification). `verify_password` itself returns
+`std::expected<VerifiedCredential, VerifyFailure>`: `kBadCredential` /
+`kUnknownUser` are credential verdicts; `kStoreUnavailable` (an AuthDB read
+failed) and `kCredentialChanged` (the hash moved under the row lock) are
+**transient** — `/login` answers them `503` + `Retry-After` with no lockout
+strike and no `auth.login_failed` row, the self route `503 verify_transient`.
 
-**Route gates** (`rest_api_v1.cpp` `register_password_routes`, shared helper
-`password_route_session_gates`): interactive cookie sessions only — any MCP
-tier, service-scoped token, engine principal or non-interactive `auth_source`
-is `403 token_session`; the self route additionally requires
-`auth_source == "local"` (`409 not_local` for OIDC/SAML). CSRF: `Origin`/`Referer`
-must be same-site (`origin_is_same_site`, honouring `--csrf-trusted-origins`)
-and a cookie request lacking **both** headers is refused — matching the other
-cookie-authorized state-changing POSTs (`ca_routes`, `dashboard_routes`).
-`Content-Type` must be `application/json` (`415`). The admin route refuses a
-self-target (`403 self_target`) so a hijacked admin cookie cannot re-key its own
-account without the current password. The admin route accepts OIDC and SAML
-admin sessions at the session gate, but a SAML session is then refused by the
-shared step-up gate (no SAML MFA attestation). The body is parsed with a
-non-throwing, type-guarded parse and never echoed; passwords, hashes and
-lengths never reach a log or audit row.
+**The credential anchor at session mint.** `create_local_session(username,
+role, mfa_verified, expected_hash_hex)` takes the verified hash (no default;
+the MFA pending entry carries it across the TOTP round trip), and its post-mint
+recheck revokes-and-denies when the stored hash is no longer that one — so a
+pending login proven with the OLD password cannot be completed after a reset
+or a change, and a reset landing between `authenticate()`'s recheck and its
+mint revokes the session just minted. An empty anchor denies.
+
+**Route gates** (`rest_api_v1.cpp` `register_password_routes`): interactive
+cookie sessions only — any MCP tier, service-scoped token, engine principal or
+non-interactive `auth_source` is `403 token_session`; the self route
+additionally requires `auth_source == "local"` (`409 not_local` for OIDC/SAML).
+CSRF: `Origin`/`Referer` must be same-site (`origin_is_same_site`, honouring
+`--csrf-trusted-origins`) and a cookie request lacking **both** headers is
+refused — matching the other cookie-authorized state-changing POSTs
+(`ca_routes`, `dashboard_routes`). `Content-Type` must be `application/json`
+(`415`). The admin route then runs the **canonical durable-Administrator gate**
+— `is_rbac_administrator(kRest)` (`rbac_admin_predicate.hpp`, the A2/A1
+predicate) followed by `check_caller_authorized_under_current_regime`,
+REPLACING `perm_fn`, for every target: RBAC off, the caller's own local account
+must hold the admin role (an OIDC session whose `admin` role came from IdP
+group mapping does not — its `auth.users` row says `user`); RBAC on, the caller
+must hold a user-principal `Administrator` grant. A JIT elevation or a custom
+role holding `UserManagement:Write` is `403 durable_admin_required`; a store
+that cannot confirm is `503 admin_gate_unavailable`. It refuses a self-target
+(`403 self_target`, via the shared `is_self_target`) so a hijacked admin cookie
+cannot re-key its own account without the current password, and the configured
+break-glass account (`403 break_glass_target`) so a compromised IdP cannot
+invalidate the sealed escape hatch — both before step-up. The body is parsed
+with a non-throwing, type-guarded parse and never echoed; body/policy `400`s
+are not audited; passwords, hashes and lengths never reach a log or audit row.
+Every audit row both routes write names the principal captured before any
+revoke (`AuthRoutes::audit_log_for_principal`).
 
 **Lockout.** The self route's current-password check runs through
 `AuthRoutes::verify_password_with_lockout` — the striped `login_lock_for`
@@ -263,31 +283,40 @@ lockout section extracted from `/login`, behaviour-preserving, and the ONE copy
 (no second striped-lock section). A wrong current password records a failed
 login exactly like `/login`; a locked account answers the SAME `403` "current
 password is incorrect" as a wrong password (audit detail `account_locked` vs
-`wrong_current` records the truth). Its store-unavailable branch counts under
+`wrong_current` records the truth). Its store-unavailable branches count under
 `yuzu_auth_secret_unavailable_total{route="password_change"}` /
-`yuzu_auth_read_degrade_total{route="password_change",reason}`. `change_password`
-re-verifies against the stored hash only as the write's CAS anchor; it applies
-no lockout of its own and is unreachable without first clearing the
-lockout-accounted check.
+`yuzu_auth_read_degrade_total{route="password_change",reason}`. Under
+`--auth-mode=sso-only` the same section runs `/login`'s hardened-mode gate
+(`AuthRoutes::sso_only_local_password_gate`) before PBKDF2: only an ARMED
+break-glass account may change its password; a disarmed one gets
+`403 sso_only_local_disabled` with no password evaluated and no strike.
 
-**Audit fail-closed via CAS rollback** (the `/api/v1/elevate` precedent): the
-success row (`user.password_change` / `user.password_reset`) is written after
-the write; if it cannot be persisted, `rollback_password_write` restores the
-previous hash/salt guarded `WHERE password_hash = <the hash just written>`
-(restores only if nobody wrote since) → `500` + `Sec-Audit-Failed`. If the
-rollback also fails → `500` + `Sec-Audit-Failed` + `spdlog::critical`, with the
-state (new password in effect, unrecorded, sessions NOT revoked) disclosed in
-the body. A same-transaction audit+mutation API on `AuditStore` would remove the
-compensating write; that is a follow-up.
+**Sequence — revoke first, then write, then audit.** Both routes revoke every
+session of the account (`invalidate_user_sessions` — durable delete +
+write-generation bump; on the self route this includes the caller's own)
+BEFORE the credential changes; a revoke that did not persist durably is
+`503 session_revoke_failed` and nothing is written. A write refused after the
+revoke says "sessions were revoked; password unchanged". The success row
+(`user.password_change` / `user.password_reset`, detail `sessions_revoked=N`)
+is written after the write; if it cannot be persisted, `rollback_password_write`
+restores the previous hash/salt guarded `WHERE password_hash = <the hash just
+written>` (restores only if nobody wrote since) → `500` + `Sec-Audit-Failed`.
+If the rollback also fails → `500` + `Sec-Audit-Failed` + `spdlog::critical` +
+`yuzu_auth_password_change_unrecorded_total{kind}` (alert
+`YuzuPasswordChangeUnrecorded`), with the state (new password in effect,
+unrecorded, sessions revoked) disclosed in the body. A same-transaction
+audit+mutation API on `AuditStore` would remove the compensating write; that is
+a follow-up.
 
-**Sessions.** After the audited write, `invalidate_user_sessions(username)`
-(durable delete + write-generation bump, so every replica drops its cache).
-Self-change then mints a replacement session for the caller through a callback
-owned by `AuthRoutes` (it owns the cookie attributes — `RestApiV1` never
-formats a cookie), carrying the old session's MFA proof but not its JIT
-elevation; if minting fails the response clears the cookie. Admin reset revokes
-the target's cookie sessions only and reports `api_tokens_active`
-(`ApiTokenStore::list_active_for_principal`) — tokens are deliberately not
+**Sessions and lockout.** The self route issues **no** replacement session: it
+answers with a clearing `Set-Cookie` (`Max-Age=0`) and `session_reissued:false`
+— the user signs in again with the new password. The admin reset, once the
+reset is recorded, clears the target's lockout through the admin-unlock
+primitive (`lockout_clear_fn` + an `auth.lockout.cleared` row, detail
+`password_reset`); a failure is reported (`lockout_cleared:false` + remediation),
+never fatal. It reports `api_tokens_active`
+(`ApiTokenStore::list_active_for_principal_checked`; `null` +
+`api_tokens_unknown` when the read fails) — tokens are deliberately not
 auto-revoked.
 
 **#5274 — the config file can no longer shadow the AuthDB.** Before this change

@@ -742,8 +742,10 @@ AuthManager::find_user_or_hydrate(const std::string& username) {
         if (db_user.error() == yuzu::server::AuthDBError::UserNotFound ||
             db_user.error() == yuzu::server::AuthDBError::InvalidUsername)
             return std::unexpected(UserLookupMiss::NotFound);
-        spdlog::error("AuthManager: AuthDB lookup for '{}' failed on a cold cache - failing "
-                      "closed (no credential check)",
+        // #5342 Gate 7: this read runs on EVERY credential check now (#5274
+        // made it DB-first), so the old "on a cold cache" wording was false.
+        spdlog::error("AuthManager: AuthDB credential read for '{}' failed - failing closed "
+                      "(transient store error, not a credential verdict)",
                       username);
         return std::unexpected(UserLookupMiss::DbError);
     }
@@ -766,7 +768,7 @@ AuthManager::find_user_or_hydrate(const std::string& username) {
     return std::move(*db_user);
 }
 
-std::optional<Role>
+std::expected<Role, VerifyFailure>
 AuthManager::recheck_role_after_credential_check(const std::string& username, Role pre_check_role,
                                                   [[maybe_unused]] std::uint64_t pre_check_version,
                                                   const std::string& verified_hash_hex,
@@ -860,12 +862,12 @@ AuthManager::recheck_role_after_credential_check(const std::string& username, Ro
             spdlog::warn("{}: user '{}' not active in AuthDB", context, username);
             std::unique_lock lock(mu_);
             users_.erase(username);
-        } else {
-            spdlog::error("{}: AuthDB re-check for '{}' failed (store error, not a removal) - "
-                         "failing closed without touching the cache",
-                         context, username);
+            return std::unexpected(VerifyFailure::kUnknownUser);
         }
-        return std::nullopt;
+        spdlog::error("{}: AuthDB re-check for '{}' failed (store error, not a removal) - "
+                      "failing closed without touching the cache",
+                      context, username);
+        return std::unexpected(VerifyFailure::kStoreUnavailable);
     }
     if (credential_changed) {
         spdlog::warn("{}: credential for '{}' changed during verification (a password change "
@@ -873,12 +875,15 @@ AuthManager::recheck_role_after_credential_check(const std::string& username, Ro
                      context, username);
         if (metrics_)
             metrics_->counter("yuzu_auth_credential_changed_during_verify_total").increment();
-        return std::nullopt;
+        return std::unexpected(VerifyFailure::kCredentialChanged);
     }
-    return result;
+    if (!result) // unreachable: a successful recheck always ran the callback
+        return std::unexpected(VerifyFailure::kStoreUnavailable);
+    return *result;
 }
 
 bool AuthManager::post_mint_role_recheck(const std::string& username, Role minted_role,
+                                         const std::optional<std::string>& expected_hash_hex,
                                          std::string_view context) {
     // #4107 check-then-mint gap (external adversarial review, fjarvis, PR
     // #4076): recheck_role_after_credential_check's row-locked read closes
@@ -968,6 +973,27 @@ bool AuthManager::post_mint_role_recheck(const std::string& username, Role minte
         (void)revoke;
         return false;
     }
+    // #5342 Gate 7: the credential anchor. The caller verified the password
+    // against `expected_hash_hex`; if the stored hash is no longer that one, a
+    // password change/reset committed after the verify (possibly across a
+    // whole MFA round trip on a pending entry), and a session proven with the
+    // OLD credential must not survive it. Same revoke-and-deny as a role
+    // divergence, same ordering proof (set_password commits before this read
+    // begins, or the revoke the change's route runs sweeps this session). An
+    // empty anchor never equals a stored hash, so it DENIES — fail closed.
+    // Two server-held hashes, but constant_time_compare keeps the idiom uniform.
+    if (expected_hash_hex && !constant_time_compare(post->hash_hex, *expected_hash_hex)) {
+        spdlog::warn("{}: post-mint re-check for '{}' found the stored credential changed after "
+                     "the password was verified (concurrent password change/reset) - revoking "
+                     "the session just minted",
+                     context, username);
+        auto revoke = invalidate_user_sessions(username);
+        if (metrics_) {
+            metrics_->counter("yuzu_auth_role_recheck_post_mint_denied_total").increment();
+        }
+        (void)revoke;
+        return false;
+    }
     return true;
 }
 
@@ -1030,7 +1056,7 @@ std::optional<std::string> AuthManager::authenticate(const std::string& username
     auto current_role = recheck_role_after_credential_check(
         username, entry->role, entry->role_version, entry->hash_hex, "Auth failed");
     if (!current_role)
-        return std::nullopt;
+        return std::nullopt; // every failure kind denies here (no session; logged by the helper)
     entry->role = *current_role;
 
     auto token = generate_session_token();
@@ -1053,7 +1079,7 @@ std::optional<std::string> AuthManager::authenticate(const std::string& username
     if (!persist_new_session(token, params))
         return std::nullopt; // durable-write failure → login not honored (ADR-0007)
     // #4107 check-then-mint gap: see post_mint_role_recheck's own doc.
-    if (!post_mint_role_recheck(username, entry->role, "Auth failed"))
+    if (!post_mint_role_recheck(username, entry->role, entry->hash_hex, "Auth failed"))
         return std::nullopt;
 
     spdlog::info("User '{}' authenticated (role={})", username, params.role);
@@ -1068,22 +1094,26 @@ std::optional<std::string> AuthManager::authenticate(const std::string& username
     return token;
 }
 
-std::optional<Role> AuthManager::verify_password(const std::string& username,
-                                                 const std::string& password) {
+std::expected<VerifiedCredential, VerifyFailure>
+AuthManager::verify_password(const std::string& username, const std::string& password) {
     // Mirrors authenticate() up to the credential check but stops short of
     // session creation. Histogram labels match authenticate() so dashboards
     // continue to roll up "password verify" cost across both call sites.
     const auto t_start = std::chrono::steady_clock::now();
     // #5342: same over-max short-circuit as authenticate() (defence in depth —
     // AuthRoutes::verify_password_with_lockout already rejects before calling).
+    // An over-max password can never match, so it is a credential verdict.
     if (password_exceeds_max(password)) {
         spdlog::warn("verify_password failed: over-length password for '{}'", username);
-        return std::nullopt;
+        return std::unexpected(VerifyFailure::kBadCredential);
     }
     auto entry = find_user_or_hydrate(username); // AuthDB-first (#4020/#5274), a COPY
     if (!entry) {
+        // #5342 Gate 7 (sec-3): a store error is TRANSIENT, never a wrong
+        // password — the caller must not count it toward lockout or audit it
+        // as a failed guess. Logged by the helper; no unknown_user sample.
         if (entry.error() == UserLookupMiss::DbError)
-            return std::nullopt; // fail closed; logged by the helper, not an unknown_user sample
+            return std::unexpected(VerifyFailure::kStoreUnavailable);
         spdlog::warn("verify_password failed: unknown user '{}'", username);
         if (metrics_) {
             const auto elapsed =
@@ -1093,7 +1123,7 @@ std::optional<Role> AuthManager::verify_password(const std::string& username,
                             {{"method", "password"}, {"result", "unknown_user"}})
                 .observe(elapsed);
         }
-        return std::nullopt;
+        return std::unexpected(VerifyFailure::kUnknownUser);
     }
     auto salt = hex_to_bytes(entry->salt_hex);
     auto hash = pbkdf2_sha256(password, salt, kPbkdf2Iterations);
@@ -1107,16 +1137,17 @@ std::optional<Role> AuthManager::verify_password(const std::string& username,
                             {{"method", "password"}, {"result", "bad_password"}})
                 .observe(elapsed);
         }
-        return std::nullopt;
+        return std::unexpected(VerifyFailure::kBadCredential);
     }
     // Re-verify against AuthDB: catches a soft-deleted/removed user AND makes
     // this the authoritative role for the caller (same rationale as
-    // authenticate() — see recheck_role_after_credential_check's doc).
+    // authenticate() — see recheck_role_after_credential_check's doc). Its
+    // failure kinds pass straight through (kUnknownUser / kStoreUnavailable /
+    // kCredentialChanged).
     auto current_role = recheck_role_after_credential_check(
         username, entry->role, entry->role_version, entry->hash_hex, "verify_password failed");
     if (!current_role)
-        return std::nullopt;
-    auto role = *current_role;
+        return std::unexpected(current_role.error());
     if (metrics_) {
         const auto elapsed =
             std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count();
@@ -1125,11 +1156,25 @@ std::optional<Role> AuthManager::verify_password(const std::string& username,
                         {{"method", "password"}, {"result", "success"}})
             .observe(elapsed);
     }
-    return role;
+    // The hash the password was verified against, confirmed still current
+    // under the row lock above — the anchor the rest of this login carries.
+    return VerifiedCredential{*current_role, std::move(entry->hash_hex)};
 }
 
 std::string AuthManager::create_local_session(const std::string& username, Role role,
-                                              bool mfa_verified) {
+                                              bool mfa_verified,
+                                              const std::string& expected_hash_hex) {
+    return mint_local_session(username, role, mfa_verified, expected_hash_hex);
+}
+
+std::string AuthManager::create_local_session_for_test(const std::string& username, Role role,
+                                                       bool mfa_verified) {
+    return mint_local_session(username, role, mfa_verified, std::nullopt);
+}
+
+std::string AuthManager::mint_local_session(const std::string& username, Role role,
+                                            bool mfa_verified,
+                                            const std::optional<std::string>& expected_hash_hex) {
     auto token = generate_session_token();
     yuzu::server::SessionWriteParams params;
     params.username = username;
@@ -1156,7 +1201,10 @@ std::string AuthManager::create_local_session(const std::string& username, Role 
     // regardless of how wide that earlier window was. Same empty-token
     // fail-safe contract as the durable-write-failure branch above: no
     // session, degrades to "not authenticated" at the caller's cookie set.
-    if (!post_mint_role_recheck(username, role, "create_local_session"))
+    // #5342 Gate 7: the same re-read also requires the stored hash to still be
+    // the one the caller verified (`expected_hash_hex`), so the window covers
+    // a credential change exactly as it covers a role change.
+    if (!post_mint_role_recheck(username, role, expected_hash_hex, "create_local_session"))
         return {};
     // Stamp last_login_at on every successful login, not just the
     // MFA-verified TOTP path. The MFA-verified TOTP path already does
@@ -2083,10 +2131,10 @@ AuthManager::read_local_account_for_password_write(const std::string& username,
     return std::move(*row);
 }
 
-PasswordWriteResult AuthManager::write_password_cas(const std::string& username,
-                                                    const UserEntry& current,
-                                                    const std::string& new_password,
-                                                    bool forbid_admin_target) {
+PasswordWriteResult AuthManager::write_password(const std::string& username,
+                                                const UserEntry& current,
+                                                const std::string& new_password,
+                                                const std::optional<std::string>& cas_anchor) {
     PasswordWriteResult out;
     auto salt = random_bytes(16);
     auto salt_hex = bytes_to_hex(salt);
@@ -2097,22 +2145,21 @@ PasswordWriteResult AuthManager::write_password_cas(const std::string& username,
     if (password_write_race_hook_for_test_)
         password_write_race_hook_for_test_();
 
-    // CAS on the hash the caller read (and, for a self-change, verified): the
-    // write lands only if that credential is still the stored one. With
-    // forbid_admin_target the same statement also refuses an admin row, so a
-    // promotion committing after the caller's admin-target decision cannot be
-    // raced past (#5342 — the role check and the write are one UPDATE).
-    auto written =
-        auth_db_->set_password(username, hash, salt_hex, current.hash_hex, forbid_admin_target);
+    // Self-change: CAS on the hash the caller's lockout-accounted verify just
+    // proved — the write lands only if that credential is still the stored
+    // one. Admin reset: a plain guarded write (local + active only). Either
+    // way set_password touches ONLY hash/salt/updated_at (#5342 Gate 7) —
+    // never the lockout columns; an admin reset clears a lock through the
+    // audited admin-unlock primitive at the route instead.
+    auto written = auth_db_->set_password(username, hash, salt_hex, cas_anchor);
     if (!written) {
         if (written.error() != yuzu::server::AuthDBError::UserNotFound) {
             out.outcome = PasswordWriteOutcome::kStoreUnavailable;
             return out;
         }
-        // Zero rows: the account went away / stopped being local, the role
-        // guard refused a (now-)admin row, OR the CAS predicate failed because
-        // someone else wrote first. Re-read so the caller can answer 404 vs
-        // 403 vs 409 honestly.
+        // Zero rows: the account went away / stopped being local, OR (self
+        // change only) the CAS predicate failed because someone else wrote
+        // first. Re-read so the caller can answer 404 vs 409 honestly.
         auto again = auth_db_->get_user(username);
         if (!again) {
             out.outcome = again.error() == yuzu::server::AuthDBError::UserNotFound
@@ -2122,13 +2169,14 @@ PasswordWriteResult AuthManager::write_password_cas(const std::string& username,
         }
         if (again->identity_source != "local") {
             out.outcome = PasswordWriteOutcome::kNotLocal;
-        } else if (forbid_admin_target && again->role == Role::admin) {
-            // Checked before kConflict: a retry would be refused for the same
-            // reason, so "retry" would be the wrong answer.
-            out.outcome = PasswordWriteOutcome::kAdminTarget;
-            out.role = Role::admin;
-        } else {
+        } else if (cas_anchor) {
             out.outcome = PasswordWriteOutcome::kConflict;
+        } else {
+            // A plain guarded write matched nothing, yet the row is active and
+            // identity_source='local' — so provisioning_source flipped away
+            // from 'local' (SCIM adopted the account) between the read and the
+            // write. Not a local account any more.
+            out.outcome = PasswordWriteOutcome::kNotLocal;
         }
         return out;
     }
@@ -2154,42 +2202,40 @@ PasswordWriteResult AuthManager::write_password_cas(const std::string& username,
 }
 
 PasswordWriteResult AuthManager::change_password(const std::string& username,
-                                                 const std::string& current_password,
+                                                 const std::string& verified_hash_hex,
                                                  const std::string& new_password) {
     PasswordWriteResult out;
+    // An empty anchor is a caller bug (no verify happened); never let it reach
+    // set_password, which would refuse it anyway (InvalidCredentials).
+    if (verified_hash_hex.empty()) {
+        out.outcome = PasswordWriteOutcome::kConflict;
+        return out;
+    }
     auto row = read_local_account_for_password_write(username, new_password, out);
     if (!row)
         return out;
-    // Re-verify the current password against the STORED hash just read (the
-    // CAS anchor below). Same PBKDF2 + constant-time compare as
-    // verify_password; an over-max input can never match, so it is refused
-    // without hashing.
-    if (password_exceeds_max(current_password) ||
-        !constant_time_compare(pbkdf2_sha256(current_password, hex_to_bytes(row->salt_hex),
-                                             kPbkdf2Iterations),
-                               row->hash_hex)) {
-        out.outcome = PasswordWriteOutcome::kWrongCurrent;
+    // #5342 Gate 7: no second PBKDF2. The current password was proven ONCE,
+    // under lockout accounting (AuthRoutes::verify_password_with_lockout), and
+    // that proof's stored hash is the CAS anchor. If the stored credential
+    // already moved since, fail fast; the CAS below closes the remaining
+    // read→write window.
+    if (!constant_time_compare(row->hash_hex, verified_hash_hex)) {
+        out.outcome = PasswordWriteOutcome::kConflict;
         return out;
     }
-    return write_password_cas(username, *row, new_password, /*forbid_admin_target=*/false);
+    return write_password(username, *row, new_password, verified_hash_hex);
 }
 
 PasswordWriteResult AuthManager::reset_password(const std::string& username,
-                                                const std::string& new_password,
-                                                bool permit_admin_target) {
+                                                const std::string& new_password) {
     PasswordWriteResult out;
     auto row = read_local_account_for_password_write(username, new_password, out);
     if (!row)
         return out;
-    if (row->role == Role::admin && !permit_admin_target) {
-        out.outcome = PasswordWriteOutcome::kAdminTarget;
-        out.role = row->role;
-        return out;
-    }
-    // The read above is only the fast-path refusal; the write re-decides
-    // admin-target atomically when the caller may not touch an admin.
-    return write_password_cas(username, *row, new_password,
-                              /*forbid_admin_target=*/!permit_admin_target);
+    // Plain guarded write — no CAS, no target-role classification (#5342 Gate
+    // 7: the route's is_rbac_administrator gate is the sole who-may-reset-whom
+    // decision). The row read above supplies the rollback values.
+    return write_password(username, *row, new_password, std::nullopt);
 }
 
 bool AuthManager::rollback_password_write(const std::string& username,
@@ -2198,10 +2244,10 @@ bool AuthManager::rollback_password_write(const std::string& username,
         return false;
     // Restore ONLY if the stored hash is still the one we wrote — a later
     // writer's credential is never clobbered by a stale compensation.
-    // set_password zeroes the lockout columns on BOTH writes, so the rollback
-    // restores the credential but not a prior lockout state. Harmless: the
-    // self route only writes for a caller who is not locked, and an admin
-    // reset's caller could clear the lockout anyway (POST .../unlock).
+    // set_password writes hash/salt/updated_at only (#5342 Gate 7), so the
+    // rollback restores the credential and nothing else: a lockout armed on
+    // the account before the write is still armed after it (the write never
+    // touched it either).
     auto restored = auth_db_->set_password(username, written.previous_hash_hex,
                                            written.previous_salt_hex, written.new_hash_hex);
     if (!restored)
@@ -2212,6 +2258,47 @@ bool AuthManager::rollback_password_write(const std::string& username,
         it->second.salt_hex = written.previous_salt_hex;
     }
     return true;
+}
+
+std::size_t AuthManager::report_stale_cfg_credentials() {
+    // #5274 boot signal: with AuthDB wired the cfg file is seed-only — the
+    // stored credential always wins (find_user_or_hydrate is DB-first). A cfg
+    // entry whose hash differs from its auth.users row is therefore DEAD
+    // credential material an operator may still believe is live (e.g. after
+    // an in-product password change, the old cfg hash keeps being re-seeded
+    // into users_ at every boot). Say so, by name, once per boot.
+    if (!auth_db_)
+        return 0;
+    std::vector<std::pair<std::string, std::string>> cfg_entries;
+    {
+        std::shared_lock lock(mu_);
+        cfg_entries.reserve(users_.size());
+        for (const auto& [name, entry] : users_)
+            cfg_entries.emplace_back(name, entry.hash_hex);
+    }
+    std::size_t stale = 0;
+    for (const auto& [name, cfg_hash] : cfg_entries) {
+        auto row = auth_db_->get_user(name); // PG I/O outside mu_
+        if (!row) {
+            if (row.error() != yuzu::server::AuthDBError::UserNotFound &&
+                row.error() != yuzu::server::AuthDBError::InvalidUsername)
+                spdlog::warn("#5274 boot check: could not read auth.users row for cfg user '{}' "
+                             "(store error) - stale-credential check skipped for it",
+                             name);
+            continue; // no row: the cfg entry is not shadowing anything
+        }
+        if (!constant_time_compare(row->hash_hex, cfg_hash)) {
+            ++stale;
+            spdlog::warn("#5274 cfg is seed-only; stored credential wins: yuzu-server.cfg still "
+                         "carries a DIFFERENT (stale) password hash for '{}' than the auth store. "
+                         "That cfg password no longer signs in; remove or rotate the cfg entry so "
+                         "nobody relies on it",
+                         name);
+        }
+    }
+    if (metrics_)
+        metrics_->gauge("yuzu_auth_cfg_credentials_stale").set(static_cast<double>(stale));
+    return stale;
 }
 
 std::optional<Role> AuthManager::get_user_role(const std::string& username) const {

@@ -335,17 +335,25 @@ TEST_CASE("AuthDB user CRUD + role", "[pg][auth_db]") {
 // provisioning_source='local'); every refusal is a zero-row UserNotFound with
 // the stored credential left untouched.
 
-TEST_CASE("AuthDB::set_password writes a local account and clears its lockout",
+TEST_CASE("AuthDB::set_password writes hash/salt only and never touches the lockout",
           "[pg][auth_db][password]") {
+    // #5342 Gate 7 (C7): clearing a lock is an AUDITED administrative act
+    // (clear_failed_logins behind the admin unlock/reset route's own
+    // auth.lockout.cleared row) — the credential write must not do it
+    // silently, or an audit-failure rollback would restore the hash but leave
+    // a previously-armed lock erased.
     YUZU_REQUIRE_PG_DB_TPL(db, auth_db_tpl);
     Harness h{db.dsn()};
     REQUIRE(h.db.upsert_user("pat", "oldhash", "oldsalt", yuzu::server::auth::Role::admin)
                 .has_value());
-    // Arm a lock first: a fresh credential must not inherit it.
     for (int i = 0; i < 3; ++i)
         REQUIRE(h.db.record_failed_login("pat", /*threshold=*/3, /*window_secs=*/3600).has_value());
-    REQUIRE(h.db.lockout_status("pat")->locked);
+    const auto armed = h.db.lockout_status("pat");
+    REQUIRE(armed.has_value());
+    REQUIRE(armed->locked);
 
+    // Plain (no CAS) write to an ADMIN row: written — there is no role
+    // predicate (who may reset whom is the route's is_rbac_administrator gate).
     REQUIRE(h.db.set_password("pat", "newhash", "newsalt").has_value());
 
     auto entry = h.db.get_user("pat");
@@ -355,8 +363,15 @@ TEST_CASE("AuthDB::set_password writes a local account and clears its lockout",
     CHECK(entry->role == yuzu::server::auth::Role::admin); // role untouched
     auto st = h.db.lockout_status("pat");
     REQUIRE(st.has_value());
-    CHECK_FALSE(st->locked);
-    CHECK(st->failed_count == 0);
+    CHECK(st->locked);                              // lock untouched
+    CHECK(st->failed_count == armed->failed_count); // counter untouched
+
+    // The CAS variant behaves the same way on the lockout columns.
+    REQUIRE(h.db.set_password("pat", "h3", "s3", std::string("newhash")).has_value());
+    st = h.db.lockout_status("pat");
+    REQUIRE(st.has_value());
+    CHECK(st->locked);
+    CHECK(st->failed_count == armed->failed_count);
 }
 
 TEST_CASE("AuthDB::set_password refuses non-local, inactive and absent accounts",
@@ -442,40 +457,23 @@ TEST_CASE("AuthDB::set_password compare-and-swap on the expected current hash",
     CHECK(h.db.get_user("cas")->hash_hex == "h2");
 }
 
-TEST_CASE("AuthDB::set_password forbid_admin_target refuses an admin row in the UPDATE",
+TEST_CASE("AuthDB::set_password: plain and CAS variants both write an admin local row",
           "[pg][auth_db][password]") {
+    // #5342 Gate 7 (A2): the forbid_admin_target role guard is gone — the
+    // write has NO target-role classification, in either variant.
     YUZU_REQUIRE_PG_DB_TPL(db, auth_db_tpl);
     Harness h{db.dsn()};
     REQUIRE(h.db.upsert_user("boss", "h0", "s0", yuzu::server::auth::Role::admin).has_value());
-    REQUIRE(h.db.upsert_user("crew", "c0", "t0", yuzu::server::auth::Role::user).has_value());
 
-    // Guarded, no CAS: an admin row is a zero-row UserNotFound, untouched.
-    auto refused = h.db.set_password("boss", "h1", "s1", std::nullopt, /*forbid_admin_target=*/true);
-    REQUIRE_FALSE(refused.has_value());
-    CHECK(refused.error() == AuthDBError::UserNotFound);
-    CHECK(h.db.get_user("boss")->hash_hex == "h0");
-
-    // Guarded + CAS with the RIGHT anchor: still refused — the role guard is
-    // independent of the CAS predicate.
-    auto refused_cas =
-        h.db.set_password("boss", "h1", "s1", std::string("h0"), /*forbid_admin_target=*/true);
-    REQUIRE_FALSE(refused_cas.has_value());
-    CHECK(refused_cas.error() == AuthDBError::UserNotFound);
-    CHECK(h.db.get_user("boss")->hash_hex == "h0");
-
-    // A non-admin row is written by both guarded variants.
-    REQUIRE(h.db.set_password("crew", "c1", "t1", std::nullopt, true).has_value());
-    CHECK(h.db.get_user("crew")->hash_hex == "c1");
-    REQUIRE(h.db.set_password("crew", "c2", "t2", std::string("c1"), true).has_value());
-    CHECK(h.db.get_user("crew")->hash_hex == "c2");
-
-    // Promote crew: the guard now refuses it; the unguarded default writes.
-    REQUIRE(h.db.update_role("crew", yuzu::server::auth::Role::admin).has_value());
-    CHECK(h.db.set_password("crew", "c3", "t3", std::string("c2"), true).error() ==
-          AuthDBError::UserNotFound);
-    CHECK(h.db.get_user("crew")->hash_hex == "c2");
-    REQUIRE(h.db.set_password("crew", "c3", "t3", std::string("c2")).has_value());
-    CHECK(h.db.get_user("crew")->hash_hex == "c3");
+    REQUIRE(h.db.set_password("boss", "h1", "s1").has_value()); // plain
+    CHECK(h.db.get_user("boss")->hash_hex == "h1");
+    REQUIRE(h.db.set_password("boss", "h2", "s2", std::string("h1")).has_value()); // CAS
+    CHECK(h.db.get_user("boss")->hash_hex == "h2");
+    auto stale = h.db.set_password("boss", "h3", "s3", std::string("h1")); // stale CAS
+    REQUIRE_FALSE(stale.has_value());
+    CHECK(stale.error() == AuthDBError::UserNotFound);
+    CHECK(h.db.get_user("boss")->hash_hex == "h2");
+    CHECK(h.db.get_user("boss")->role == yuzu::server::auth::Role::admin);
 }
 
 TEST_CASE("AuthDB::recheck_role_locked hands the current password_hash to the callback (#5274)",

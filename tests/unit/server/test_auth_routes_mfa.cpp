@@ -1511,3 +1511,144 @@ TEST_CASE("POST /login: concurrent burst for one user cannot exceed the threshol
     CHECK(locked->status == 401);
     CHECK(locked->get_header_value("Set-Cookie").empty());
 }
+
+// ── #5342 Gate 7 (B3): a password that could not be VERIFIED is not a guess ──
+//
+// Before the fix, verify_password collapsed an AuthDB read failure (and a
+// credential change racing the login) into the same nullopt as a wrong
+// password, so POST /login answered 401, wrote an auth.login_failed row and
+// counted a lockout strike: a store blip could lock a legitimate user out.
+
+namespace {
+/// Break ONLY AuthDB::get_user's SELECT (it reads identity_source; the
+/// lockout statements do not) — the test_auth_db_pg.cpp fault idiom.
+void break_get_user_only(const std::string& dsn) {
+    yuzu::server::pg::PgConn conn{PQconnectdb(dsn.c_str())};
+    REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+    yuzu::server::pg::PgResult res{
+        PQexec(conn.get(), "ALTER TABLE auth.users DROP COLUMN identity_source")};
+    REQUIRE(res.ok());
+}
+} // namespace
+
+TEST_CASE("POST /login: an auth-store read failure is 503 + Retry-After, no strike, no "
+          "auth.login_failed row (#5342 Gate 7)",
+          "[pg][mfa][routes][auth_routes][lockout]") {
+    AuthRoutesHarness h;
+    h.cfg.auth_lockout_threshold = 3; // cfg_ is held by reference
+    h.cfg.auth_lockout_window_secs = 3600;
+    break_get_user_only(h.auth_db.dsn());
+
+    for (const char* pw : {"alicepassword1", "not-the-password"}) {
+        auto res = h.sink.Post("/login", form({{"username", "alice"}, {"password", pw}}),
+                               "application/x-www-form-urlencoded");
+        REQUIRE(res);
+        CHECK(res->status == 503);
+        CHECK(res->get_header_value("Retry-After") == "2");
+        CHECK(res->get_header_value("Set-Cookie").empty());
+        auto j = nlohmann::json::parse(res->body);
+        CHECK(j["error"]["retry_after_ms"] == 2000);
+    }
+    CHECK(h.count_audits("auth.login_failed") == 0);
+    auto st = h.auth_db->lockout_status("alice");
+    REQUIRE(st.has_value());
+    CHECK(st->failed_count == 0);
+    CHECK_FALSE(st->locked);
+}
+
+TEST_CASE("POST /login: a credential change racing the login is 503, not a counted 401 "
+          "(#5342 Gate 7)",
+          "[pg][mfa][routes][auth_routes][lockout]") {
+    AuthRoutesHarness h;
+    h.cfg.auth_lockout_threshold = 3;
+    h.cfg.auth_lockout_window_secs = 3600;
+    auto salt = auth::AuthManager::random_bytes(16);
+    const auto racer =
+        auth::AuthManager::pbkdf2_sha256("changed-concurrently-1", salt, 100'000);
+    const auto racer_salt = auth::AuthManager::bytes_to_hex(salt);
+    bool fired = false;
+    h.auth_mgr.set_role_recheck_race_hook_for_test([&] {
+        if (fired)
+            return;
+        fired = true;
+        REQUIRE(h.auth_db->set_password("alice", racer, racer_salt).has_value());
+    });
+    auto res = h.sink.Post("/login", form({{"username", "alice"}, {"password", "alicepassword1"}}),
+                           "application/x-www-form-urlencoded");
+    h.auth_mgr.set_role_recheck_race_hook_for_test(nullptr);
+    REQUIRE(res);
+    CHECK(fired);
+    CHECK(res->status == 503);
+    CHECK(res->get_header_value("Set-Cookie").empty());
+    CHECK(h.count_audits("auth.login_failed") == 0);
+    CHECK(h.auth_db->lockout_status("alice")->failed_count == 0);
+}
+
+// ── #5342 Gate 7 (B4): the credential anchor crosses the MFA round trip ─────
+
+TEST_CASE("POST /login/mfa/enroll: an old-password pending token cannot complete after an "
+          "admin reset (#5342 Gate 7)",
+          "[pg][mfa][enroll][routes][auth_routes]") {
+    // mfa_enforcement=required + an un-enrolled user: step 1 proves the OLD
+    // password and parks a pending enrollment; an admin resets the password
+    // (e.g. the account was reported compromised); the attacker holding the
+    // pending token then enrolls their own TOTP. The mint must be denied —
+    // the pending entry's anchor is the OLD hash.
+    AuthRoutesHarness h;
+    h.cfg.mfa_enforcement = "required";
+    auto step1 =
+        h.sink.Post("/login", form({{"username", "alice"}, {"password", "alicepassword1"}}),
+                    "application/x-www-form-urlencoded");
+    REQUIRE(step1->status == 202);
+    auto body = nlohmann::json::parse(step1->body);
+    std::string pending = body.at("mfa_pending_token");
+    std::string secret = body.at("secret_base32");
+
+    REQUIRE(h.auth_mgr.reset_password("alice", "reset-by-an-admin-1").outcome ==
+            auth::PasswordWriteOutcome::kOk);
+
+    auto code = h.totp_at(secret, 0);
+    auto step2 = h.sink.Post("/login/mfa/enroll",
+                             form({{"mfa_pending_token", pending}, {"code", code}}),
+                             "application/x-www-form-urlencoded");
+    REQUIRE(step2);
+    CHECK(step2->status == 401);
+    CHECK(step2->get_header_value("Set-Cookie").empty());
+    AuditQuery q;
+    q.action = "auth.login";
+    q.principal = "alice";
+    auto rows = h.audit_store->query(q);
+    REQUIRE(rows.has_value());
+    for (const auto& row : *rows)
+        CHECK(row.result != "ok");
+}
+
+TEST_CASE("POST /login/mfa: an old-password login challenge cannot complete after a reset "
+          "(#5342 Gate 7)",
+          "[pg][mfa][routes][auth_routes]") {
+    AuthRoutesHarness h;
+    auto secret_b32 = h.enroll_mfa("admin");
+    auto step1 = h.sink.Post("/login",
+                             form({{"username", "admin"}, {"password", "adminpassword1"}}),
+                             "application/x-www-form-urlencoded");
+    REQUIRE(step1->status == 202);
+    auto body = nlohmann::json::parse(step1->body);
+    std::string pending = body.at("mfa_pending_token");
+
+    REQUIRE(h.auth_mgr.reset_password("admin", "reset-by-another-admin").outcome ==
+            auth::PasswordWriteOutcome::kOk);
+
+    auto step2 = h.sink.Post("/login/mfa",
+                             form({{"mfa_pending_token", pending}, {"code", h.totp_at(secret_b32)}}),
+                             "application/x-www-form-urlencoded");
+    REQUIRE(step2);
+    CHECK(step2->status == 401);
+    CHECK(step2->get_header_value("Set-Cookie").empty());
+
+    // The NEW password still logs in normally (nothing else was disturbed).
+    auto fresh = h.sink.Post("/login",
+                             form({{"username", "admin"}, {"password", "reset-by-another-admin"}}),
+                             "application/x-www-form-urlencoded");
+    REQUIRE(fresh);
+    CHECK(fresh->status == 202);
+}

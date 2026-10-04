@@ -566,6 +566,33 @@ groups:
             docs/ops-runbooks/auth-db-recovery.md.
           runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/ops-runbooks/auth-db-recovery.md"
 
+      - alert: YuzuPasswordChangeUnrecorded
+        # #5342 Gate 7. A local password change (kind=self) or admin reset
+        # (kind=admin) whose mandatory audit row could not be persisted AND
+        # whose compensating rollback ALSO failed: the NEW password is in
+        # effect with no audit evidence. Should never happen, so ANY increment
+        # pages. Both kind series are boot-seeded to 0 in server.cpp, so
+        # increase() sees the first event after a restart; same idiom as
+        # YuzuBreakGlassLogin above.
+        expr: |
+          increase(yuzu_auth_password_change_unrecorded_total[1h]) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: "Unrecorded password change on {{ $labels.instance }} (kind={{ $labels.kind }})"
+          description: >-
+            yuzu_auth_password_change_unrecorded_total{kind="{{ $labels.kind }}"}
+            increased: a password change or reset committed, its
+            user.password_change / user.password_reset audit row could not be
+            written, and the rollback that should have undone it also failed.
+            The new password is live with no CC6.3 evidence row; the account's
+            sessions were revoked. Find the server log line "audit FAILED ...
+            AND the compensating rollback ALSO FAILED" for the account, check
+            the audit store's health, and record the change manually. If the
+            change was not sanctioned, reset the account's password again once
+            the audit store is healthy.
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/ops-runbooks/auth-db-recovery.md"
+
       - alert: YuzuRbacEnforcementChanged
         # A1 (RBAC enforcement enable/disable toggle). Threshold-free by
         # design — this fires on ANY observed change to this replica's

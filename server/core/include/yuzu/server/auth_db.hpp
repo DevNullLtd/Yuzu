@@ -354,37 +354,32 @@ public:
     /// carries a discarded random hash and its lifecycle belongs to the IdP).
     /// An SSO principal additionally fails `is_valid_username` up front.
     ///
-    /// The same statement clears the lockout state (`failed_login_count`,
-    /// `last_failed_login_at`, `locked_until`): a fresh credential must not
-    /// inherit a lock armed against the old one — the same reasoning
-    /// `reactivate_user` applies.
+    /// Writes `password_hash`, `salt_hex` and `updated_at` ONLY (#5342 Gate 7).
+    /// It deliberately does NOT touch the lockout columns: clearing a lock is
+    /// an audited administrative act (`clear_failed_logins`, behind the admin
+    /// unlock / reset route's own `auth.lockout.cleared` row), and an
+    /// audit-failure rollback of this write must restore the credential
+    /// without silently having erased an armed lock.
     ///
-    /// `expected_current_hash`, when engaged, adds `AND password_hash = $n` — a
+    /// `expected_current_hash`, when engaged, adds `AND password_hash = $4` — a
     /// compare-and-swap so a caller overwrites only the exact credential it
-    /// last read/verified (the self-change path's "you proved THIS password"
-    /// guard, and the audit-failure rollback's "restore only if nobody wrote
-    /// since" guard).
-    ///
-    /// `forbid_admin_target`, when true, adds `AND role <> 'admin'` — the
-    /// write itself refuses an admin row, so a caller that was NOT permitted
-    /// to overwrite an admin's credential (`AuthManager::reset_password` with
-    /// `permit_admin_target=false`) cannot be raced past by a promotion that
-    /// commits between its read and this UPDATE. The role check and the write
-    /// are one statement, so there is no window between them.
+    /// last verified (the self-change path's "you proved THIS password" guard,
+    /// and the audit-failure rollback's "restore only if nobody wrote since"
+    /// guard). There is NO role predicate: who may reset whom is decided once,
+    /// at the route, by `is_rbac_administrator` (#5342 Gate 7) — never by a
+    /// target-role classification here.
     ///
     /// Returns `UserNotFound` when ZERO rows matched — absent, inactive, not
-    /// local, the role guard refused an admin row, OR the CAS predicate
-    /// failed. The store deliberately draws no
+    /// local, OR the CAS predicate failed. The store deliberately draws no
     /// distinction (no oracle at this layer); a caller that must answer 404
-    /// vs 409 reads the row (`get_user` + `get_provisioning_source`) BEFORE the
-    /// write. `InvalidUsername` for a malformed username, `InvalidCredentials`
-    /// for an empty hash/salt, `WriteFailed` on a lease/query failure. Never
-    /// logs the hash.
+    /// vs 409 reads the row (`get_user` + `get_provisioning_source`) BEFORE
+    /// the write. `InvalidUsername` for a malformed username,
+    /// `InvalidCredentials` for an empty hash/salt/anchor, `WriteFailed` on a
+    /// lease/query failure. Never logs the hash.
     std::expected<void, AuthDBError>
     set_password(const std::string& username, const std::string& password_hash,
                  const std::string& salt_hex,
-                 const std::optional<std::string>& expected_current_hash = std::nullopt,
-                 bool forbid_admin_target = false);
+                 const std::optional<std::string>& expected_current_hash = std::nullopt);
 
     /// Row-locked role + credential re-check (#4107, extended by #5274):
     /// `SELECT role, password_hash FROM auth.users WHERE username = $1 AND

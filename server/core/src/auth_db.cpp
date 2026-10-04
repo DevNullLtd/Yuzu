@@ -1040,8 +1040,7 @@ std::expected<void, AuthDBError> AuthDB::update_role(const std::string& username
 std::expected<void, AuthDBError>
 AuthDB::set_password(const std::string& username, const std::string& password_hash,
                      const std::string& salt_hex,
-                     const std::optional<std::string>& expected_current_hash,
-                     bool forbid_admin_target) {
+                     const std::optional<std::string>& expected_current_hash) {
     // is_valid_username, NOT is_valid_principal: only a local account has a
     // password, and an SSO principal ("oidc:..."/"saml:...") can never be one.
     // Also closes the embedded-NUL truncation class get_user() documents.
@@ -1056,26 +1055,19 @@ AuthDB::set_password(const std::string& username, const std::string& password_ha
     // Guarded single UPDATE ... RETURNING (update_role's idiom). The WHERE
     // clause IS the local-account gate — active, identity_source='local' AND
     // provisioning_source='local' — so no caller-side check can be raced
-    // past. Lockout fields are cleared in the same statement (see the .hpp).
-    // The CAS variants add `password_hash = $4`; the role-guarded variants add
-    // `role <> 'admin'` (the admin-target refusal, decided by the write
-    // itself). Four parameter-free compile-time statements — the literals are
-    // constants, never interpolated input.
+    // past. hash/salt/updated_at ONLY: the lockout columns are never touched
+    // here (see the .hpp — #5342 Gate 7). The CAS variant adds
+    // `password_hash = $4`. Two parameter-free compile-time statements — the
+    // literals are constants, never interpolated input.
 #define YUZU_SET_PASSWORD_HEAD                                                                     \
-    "UPDATE auth.users SET password_hash = $1, salt_hex = $2, updated_at = now(), "                \
-    "failed_login_count = 0, last_failed_login_at = NULL, locked_until = NULL "                    \
+    "UPDATE auth.users SET password_hash = $1, salt_hex = $2, updated_at = now() "                 \
     "WHERE username = $3 AND is_active = TRUE AND identity_source = 'local' "                      \
     "AND provisioning_source = 'local'"
     static constexpr const char* kSql = YUZU_SET_PASSWORD_HEAD " RETURNING id";
     static constexpr const char* kSqlCas =
         YUZU_SET_PASSWORD_HEAD " AND password_hash = $4 RETURNING id";
-    static constexpr const char* kSqlNonAdmin =
-        YUZU_SET_PASSWORD_HEAD " AND role <> 'admin' RETURNING id";
-    static constexpr const char* kSqlCasNonAdmin =
-        YUZU_SET_PASSWORD_HEAD " AND password_hash = $4 AND role <> 'admin' RETURNING id";
 #undef YUZU_SET_PASSWORD_HEAD
-    const char* sql = expected_current_hash ? (forbid_admin_target ? kSqlCasNonAdmin : kSqlCas)
-                                            : (forbid_admin_target ? kSqlNonAdmin : kSql);
+    const char* sql = expected_current_hash ? kSqlCas : kSql;
 
     auto lease = impl_->pool.try_acquire_for(kWriteTimeout);
     if (!lease)
@@ -1087,8 +1079,7 @@ AuthDB::set_password(const std::string& username, const std::string& password_ha
     if (res.status() != PGRES_TUPLES_OK)
         return std::unexpected(AuthDBError::WriteFailed);
     if (PQntuples(res.get()) == 0) {
-        spdlog::warn("set_password: no active local account matched '{}'{}{}", username,
-                     forbid_admin_target ? " (non-admin targets only)" : "",
+        spdlog::warn("set_password: no active local account matched '{}'{}", username,
                      expected_current_hash ? " (or the stored credential changed)" : "");
         return std::unexpected(AuthDBError::UserNotFound);
     }

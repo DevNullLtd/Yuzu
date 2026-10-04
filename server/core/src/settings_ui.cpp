@@ -964,23 +964,27 @@ extern const char* const kSettingsHtml =
         if (row) row.hidden = true;
         var d = (resp.data && resp.data.data) || {};
         if (action === 'self') {
-          if (d.session_reissued === false) {
-            showToast('Password changed. Sign in again with the new password.', 'warning');
-            setTimeout(function() { window.location = '/login'; }, 2500);
-          } else {
-            showToast('Password changed. Your other sessions were signed out; this one stays signed in.', 'success');
-          }
+          /* #5342 Gate 7: a self-change revokes EVERY session of the account,
+             this one included, and never re-issues one (session_reissued is
+             always false) — sign in again with the new password. */
+          showToast('Password changed. All your sessions were signed out — sign in again with the new password.', 'warning');
+          setTimeout(function() { window.location = '/login'; }, 2500);
         } else {
           var msg = 'Password reset for "' + user + '". Their dashboard sessions were signed out.';
           var tokens = d.api_tokens_active;
+          /* Warn unless the server CONFIRMED zero active API tokens: null
+             (api_tokens_unknown) means it could not check, never "none". */
+          var confirmedNone = (typeof tokens === 'number' && tokens === 0);
           if (typeof tokens === 'number' && tokens > 0) {
             msg += ' ' + tokens + ' API token' + (tokens === 1 ? '' : 's') +
                    ' remain active and were NOT revoked — revoke them if the account may be compromised.';
+          } else if (!confirmedNone) {
+            msg += ' Could not confirm whether the account has active API tokens; any it has were NOT revoked — review them if the account may be compromised.';
           }
-          showToast(msg, (typeof tokens === 'number' && tokens > 0) ? 'warning' : 'success');
+          if (d.lockout_cleared === false)
+            msg += ' Its account lockout could not be cleared — use Unlock.';
+          showToast(msg, confirmedNone && d.lockout_cleared !== false ? 'success' : 'warning');
         }
-        if (d.audit_emitted === false)
-          showToast('The password was changed, but the session-revoke audit row could not be written.', 'warning');
       });
     });
     /* Ctrl+K / Cmd+K — navigate to dashboard command palette */

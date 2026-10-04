@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <expected>
 #include <filesystem>
@@ -505,16 +506,50 @@ enum class RemovePendingOutcome : std::uint8_t {
 /// typed result, not a bool: the pre-existing `upsert_user` contract ("any
 /// false = weak password") made a store outage indistinguishable from a
 /// policy rejection, which the new routes must never do.
+///
+/// There is deliberately NO target-role outcome (#5342 Gate 7): who may reset
+/// whom is decided ONCE, at the route, by the canonical durable-Administrator
+/// predicate (`rbac_admin_predicate.hpp::is_rbac_administrator`) — never by a
+/// second "is the target an admin" classification down here.
 enum class PasswordWriteOutcome : std::uint8_t {
     kOk,
     kTooShort,        ///< new password below `kMinPasswordBytes`
     kTooLong,         ///< new password above `kMaxPasswordBytes`
-    kWrongCurrent,    ///< self-change: the current password does not match the STORED credential
     kNotFound,        ///< no ACTIVE account by that name
     kNotLocal,        ///< the account exists but is SSO- or SCIM-managed (no local password)
-    kAdminTarget,     ///< reset refused: target is an admin and the caller was not permitted one
-    kConflict,        ///< the stored credential changed between read and write (CAS miss) — retry
+    kConflict,        ///< self-change: the stored credential is no longer the one the caller
+                      ///< proved (CAS miss) — nothing written; retry
     kStoreUnavailable ///< AuthDB not configured, or a read/write failed — retry/503
+};
+
+/// Why `AuthManager::verify_password` refused (#5342 Gate 7, sec-3). The two
+/// TRANSIENT kinds (`kStoreUnavailable`, `kCredentialChanged`) are NOT a wrong
+/// password: a caller must answer them with a retryable 503 and must NEVER
+/// count them toward account lockout or write a "login failed" evidence row —
+/// a store blip or a concurrent password change is not a guess.
+enum class VerifyFailure : std::uint8_t {
+    kBadCredential,     ///< the password did not match the stored hash (or was over the max)
+    kUnknownUser,       ///< no ACTIVE account by that name (incl. one removed mid-verify)
+    kStoreUnavailable,  ///< an AuthDB read failed — transient, fail closed, retry
+    kCredentialChanged, ///< the stored hash changed between the read and the row-locked
+                        ///< recheck (a password change committed concurrently) — retry
+};
+
+/// True for the `VerifyFailure` kinds that are not a credential verdict.
+[[nodiscard]] constexpr bool is_transient(VerifyFailure f) noexcept {
+    return f == VerifyFailure::kStoreUnavailable || f == VerifyFailure::kCredentialChanged;
+}
+
+/// A successful `verify_password`: the DB-confirmed role AND the exact stored
+/// hash the password was verified against. The hash is the anchor every later
+/// step of the same login carries forward — the session mint's post-mint
+/// recheck (`create_local_session`) denies if the stored hash is no longer this
+/// one, and the self-service change uses it as its compare-and-swap anchor —
+/// so a password reset that lands mid-flow can never be "completed" with the
+/// OLD credential. Credential material: never log, audit, or serialise it.
+struct VerifiedCredential {
+    Role role{Role::user};
+    std::string hash_hex;
 };
 
 /// Result of a password write. On `kOk` it carries exactly what an
@@ -555,14 +590,18 @@ public:
     std::optional<std::string> authenticate(const std::string& username,
                                             const std::string& password);
 
-    /// Verify a username+password without creating a session. Returns the
-    /// user's legacy role on match, nullopt on failure (unknown user /
-    /// bad password / user soft-deleted in AuthDB). Used by the MFA-aware
-    /// login flow at AuthRoutes::POST /login to decide between "mint full
-    /// session now" (no MFA enrolled) and "issue a pending token, wait
+    /// Verify a username+password without creating a session. On match returns
+    /// the DB-confirmed role and the stored hash it verified against
+    /// (`VerifiedCredential`); on failure a TYPED reason (#5342 Gate 7) — a
+    /// wrong password / unknown user is a credential verdict, an AuthDB read
+    /// failure or a concurrent credential change is TRANSIENT (`is_transient`)
+    /// and must never be counted or audited as a failed guess. Used by the
+    /// MFA-aware login flow at AuthRoutes::POST /login to decide between "mint
+    /// full session now" (no MFA enrolled) and "issue a pending token, wait
     /// for TOTP" (MFA enrolled). Histogram metrics observed on every call
     /// using the same labels as authenticate().
-    std::optional<Role> verify_password(const std::string& username, const std::string& password);
+    [[nodiscard]] std::expected<VerifiedCredential, VerifyFailure>
+    verify_password(const std::string& username, const std::string& password);
 
     /// Create a session for a user who has already cleared the password
     /// and any required MFA checks. Mirrors create_oidc_session but with
@@ -580,7 +619,29 @@ public:
     /// the row exists; calling this directly for an account with no row
     /// (e.g. a test synthesizing a session for an OIDC/SCIM-only
     /// principal) will always be denied (#4107 CI finding, 38cc33b88).
-    std::string create_local_session(const std::string& username, Role role, bool mfa_verified);
+    ///
+    /// `expected_hash_hex` (#5342 Gate 7, REQUIRED — no default): the stored
+    /// hash the caller's `verify_password` verified the password against
+    /// (`VerifiedCredential::hash_hex`, carried through any MFA round trip on
+    /// the pending entry). The post-mint recheck also requires the stored hash
+    /// to STILL be this one, constant-time compared, and revokes-and-denies
+    /// otherwise — so a pending login proven with the OLD password cannot be
+    /// completed after an admin reset or a self-change committed in between.
+    /// An empty value never matches a stored hash and so DENIES (fail closed);
+    /// it never disables the check. Ignored in cfg-file-only mode (no AuthDB,
+    /// no concurrent credential writer).
+    std::string create_local_session(const std::string& username, Role role, bool mfa_verified,
+                                     const std::string& expected_hash_hex);
+
+    /// TEST-ONLY: `create_local_session` WITHOUT the credential anchor — the
+    /// post-mint role/active recheck still runs, only the stored-hash compare
+    /// is skipped. For tests that synthesise a session for a principal whose
+    /// password they never verified (fixtures for unrelated route suites).
+    /// Production code MUST NOT call this — no caller in `server/core/src/**`
+    /// references it; every production mint follows a real password
+    /// verification and passes its hash to `create_local_session`.
+    std::string create_local_session_for_test(const std::string& username, Role role,
+                                              bool mfa_verified);
 
     /// Stamp `mfa_verified_at = system_clock::now()` on the named session.
     /// Returns true if the session existed and was updated. Used by the
@@ -708,16 +769,17 @@ public:
     /// default.
     void set_post_mint_race_hook_for_test(std::function<void()> hook);
 
-    /// TEST-ONLY: installs a callback fired in `write_password_cas` (the
-    /// shared tail of `change_password`/`reset_password`, #5342) AFTER the
-    /// caller's authoritative AuthDB read and BEFORE the guarded
-    /// `AuthDB::set_password` UPDATE — the window in which a concurrent
-    /// `update_role()` promotion could land after `reset_password` decided the
-    /// target was not an admin. No lock is held at this firing point, so a
-    /// hook MAY call `AuthDB::update_role()` synchronously (deterministic
-    /// red/green, same shape as `set_post_mint_race_hook_for_test`).
-    /// Production code MUST NOT call this - no caller in `server/core/src/**`
-    /// references it. A no-op (nullptr) by default.
+    /// TEST-ONLY: installs a callback fired in `write_password` (the shared
+    /// tail of `change_password`/`reset_password`, #5342) AFTER the caller's
+    /// authoritative AuthDB read and BEFORE the guarded `AuthDB::set_password`
+    /// UPDATE — the window in which a concurrent writer can change or remove
+    /// the row (a self-change's CAS then misses → `kConflict`; a removal →
+    /// `kNotFound`). Lets the route tests drive "the write fails AFTER the
+    /// sessions were already revoked" deterministically. No lock is held at
+    /// this firing point, so a hook MAY call AuthDB writers synchronously
+    /// (same shape as `set_post_mint_race_hook_for_test`). Production code
+    /// MUST NOT call this - no caller in `server/core/src/**` references it.
+    /// A no-op (nullptr) by default.
     void set_password_write_race_hook_for_test(std::function<void()> hook);
 
     /// TEST-ONLY: raw `users_` cache peek, bypassing AuthDB entirely (unlike
@@ -820,53 +882,57 @@ public:
     /// Self-service password change (#5342). Requires AuthDB (else
     /// `kStoreUnavailable`). Checks the new password against the length policy,
     /// reads the account FROM AUTHDB (never the `users_` cache — #5274), refuses
-    /// a non-local (SSO/SCIM) account, re-verifies `current_password` against
-    /// the STORED hash with the same PBKDF2 + constant-time compare as
-    /// `verify_password`, then writes via `AuthDB::set_password` with a
-    /// compare-and-swap on the hash it just verified — so the write lands only
-    /// if the credential the caller proved is still the stored one (an admin
-    /// reset committed in between wins: `kConflict`). On success refreshes this
-    /// process's `users_` entry (if cached).
+    /// a non-local (SSO/SCIM) account, then writes via `AuthDB::set_password`
+    /// with a compare-and-swap on `verified_hash_hex` — the stored hash the
+    /// caller's lockout-accounted `verify_password` just verified the CURRENT
+    /// password against (`VerifiedCredential::hash_hex`). The write lands only
+    /// if that exact credential is still the stored one; anything committed in
+    /// between (an admin reset, a second self-change) wins and this returns
+    /// `kConflict` without writing. No second PBKDF2 (#5342 Gate 7): the proof
+    /// already happened, once, under lockout accounting; the CAS is what binds
+    /// the write to it. On success refreshes this process's `users_` entry (if
+    /// cached).
     ///
-    /// Does NOT apply account lockout — the REST caller runs the current
-    /// password through `AuthRoutes::verify_password_with_lockout` FIRST; the
-    /// re-verification here is the write's own CAS anchor, not a second
-    /// guessing surface (an attacker cannot reach it without first clearing the
-    /// lockout-accounted check). Does NOT touch sessions — the caller audits,
-    /// then revokes/re-mints (see the route). Caller must NOT hold `mu_`.
+    /// Does NOT touch sessions or lockout state — the route revokes sessions
+    /// FIRST, then writes, then audits. Caller must NOT hold `mu_`.
     [[nodiscard]] PasswordWriteResult change_password(const std::string& username,
-                                                      const std::string& current_password,
+                                                      const std::string& verified_hash_hex,
                                                       const std::string& new_password);
 
-    /// Administrative password reset (#5342) — same as `change_password`
-    /// without the current-password proof. `permit_admin_target` is the
-    /// caller's "may reset an ADMIN account" decision (the REST route passes
-    /// true only for a caller whose DURABLE role is admin); an admin target
-    /// with it false returns `kAdminTarget` without writing. The CAS anchors
-    /// on the hash read here, so a concurrent change returns `kConflict` and a
-    /// rollback restores exactly what this call overwrote. Caller must NOT
-    /// hold `mu_`.
-    ///
-    /// The admin-target decision is enforced TWICE: on this call's read (the
-    /// cheap refusal) and, when `permit_admin_target` is false, by the write
-    /// itself — `AuthDB::set_password(..., forbid_admin_target=true)` adds
-    /// `AND role <> 'admin'` to the UPDATE, so a promotion of the target that
-    /// commits between the read and the write makes the write match zero rows
-    /// and the call returns `kAdminTarget` (re-read to tell it from a CAS
-    /// miss). A demotion racing the other way is harmless: the caller was
-    /// already permitted an admin target, so it is permitted a non-admin one.
+    /// Administrative password reset (#5342) — policy check, the same
+    /// authoritative read + local-account classification as `change_password`,
+    /// then a PLAIN guarded UPDATE (active + local on both axes; no CAS: the
+    /// administrator is overwriting whatever credential is there). WHO may
+    /// reset WHOM is not decided here — the route gates every target on the
+    /// canonical durable-Administrator predicate (`is_rbac_administrator`),
+    /// so there is no target-role classification at this layer (#5342 Gate 7).
+    /// Does NOT clear the account's lockout (the route does that through the
+    /// audited admin-unlock primitive, after the write is recorded). Caller
+    /// must NOT hold `mu_`.
     [[nodiscard]] PasswordWriteResult reset_password(const std::string& username,
-                                                     const std::string& new_password,
-                                                     bool permit_admin_target);
+                                                     const std::string& new_password);
 
     /// Compensating write for a `kOk` result whose mandatory audit row could
     /// not be persisted (#5342, the `/api/v1/elevate` fail-closed precedent):
     /// restores `written.previous_hash_hex`/`previous_salt_hex` via
     /// `AuthDB::set_password` guarded `WHERE password_hash =
-    /// written.new_hash_hex`, so it restores ONLY if nobody wrote since. Returns
-    /// true iff the restore committed. Caller must NOT hold `mu_`.
+    /// written.new_hash_hex`, so it restores ONLY if nobody wrote since. Hash
+    /// and salt only — like the forward write it never touches lockout state.
+    /// Returns true iff the restore committed. Caller must NOT hold `mu_`.
     [[nodiscard]] bool rollback_password_write(const std::string& username,
                                                const PasswordWriteResult& written);
+
+    /// #5274 boot signal (#5342 Gate 7): with AuthDB wired, `yuzu-server.cfg`
+    /// is seed-only and the stored credential always wins. Compares every
+    /// cfg-seeded `users_` entry against its `auth.users` row and, for each
+    /// one whose hash DIFFERS (a dead cfg password an operator may still think
+    /// is live), logs a `spdlog::warn` naming the user. Sets the
+    /// `yuzu_auth_cfg_credentials_stale` gauge to the count and returns it.
+    /// A cfg user with no row, or whose row read fails, is not counted (the
+    /// latter is logged). Call once at boot, right after `set_auth_db`, before
+    /// any login can hydrate `users_`. 0 in cfg-file-only mode. Caller must
+    /// NOT hold `mu_`.
+    std::size_t report_stale_cfg_credentials();
 
     /// Remove a user by name.
     bool remove_user(const std::string& username);
@@ -1277,25 +1343,28 @@ private:
     /// committed between the caller's read and this lock) the check DENIES —
     /// no re-verify against the new hash; the user simply retries. Ignored in
     /// cfg-file mode.
-    [[nodiscard]] std::optional<Role>
+    ///
+    /// Typed (#5342 Gate 7): `kUnknownUser` when the row is no longer active
+    /// (a credential verdict, like an unknown name), `kStoreUnavailable` on a
+    /// store error, `kCredentialChanged` on the hash mismatch above — the last
+    /// two are transient and never a failed guess.
+    [[nodiscard]] std::expected<Role, VerifyFailure>
     recheck_role_after_credential_check(const std::string& username, Role pre_check_role,
                                         std::uint64_t pre_check_version,
                                         const std::string& verified_hash_hex,
                                         std::string_view context);
 
     /// Shared tail of `change_password`/`reset_password`: hash `new_password`,
-    /// write it via `AuthDB::set_password` CAS-guarded on `current.hash_hex`,
-    /// map a zero-row miss to `kNotFound`/`kConflict` by re-reading, and on
-    /// success refresh the `users_` entry. `current` is the row read by the
-    /// caller. Caller must NOT hold `mu_`.
-    ///
-    /// `forbid_admin_target` threads to `AuthDB::set_password`'s role guard
-    /// (the write refuses an admin row); a zero-row miss on a row that is now
-    /// admin maps to `kAdminTarget`, ahead of `kConflict`.
-    [[nodiscard]] PasswordWriteResult write_password_cas(const std::string& username,
-                                                         const UserEntry& current,
-                                                         const std::string& new_password,
-                                                         bool forbid_admin_target);
+    /// write it via `AuthDB::set_password` — CAS-guarded on `cas_anchor` when
+    /// engaged (the self-change's verified hash), a plain guarded write
+    /// otherwise (admin reset) — map a zero-row miss to `kNotFound`/
+    /// `kNotLocal`/`kConflict` by re-reading, and on success refresh the
+    /// `users_` entry. `current` is the row read by the caller; its hash/salt
+    /// become the result's rollback values. Caller must NOT hold `mu_`.
+    [[nodiscard]] PasswordWriteResult write_password(const std::string& username,
+                                                     const UserEntry& current,
+                                                     const std::string& new_password,
+                                                     const std::optional<std::string>& cas_anchor);
 
     /// Shared head of `change_password`/`reset_password`: policy check on the
     /// new password, then the AUTHORITATIVE AuthDB read + local-account
@@ -1330,8 +1399,20 @@ private:
     ///
     /// Returns `true` unconditionally in cfg-file mode (`!auth_db_`) - no
     /// separate authority exists to diverge from. Caller must NOT hold `mu_`.
+    ///
+    /// `expected_hash_hex` (#5342 Gate 7): when engaged, the stored hash must
+    /// ALSO still equal it (constant-time compare) — a password change/reset
+    /// that committed after the caller verified the password revokes and
+    /// denies exactly like a role divergence. Disengaged only for
+    /// `create_local_session_for_test` (no password was ever verified).
     [[nodiscard]] bool post_mint_role_recheck(const std::string& username, Role minted_role,
+                                              const std::optional<std::string>& expected_hash_hex,
                                               std::string_view context);
+
+    /// Shared body of `create_local_session` / `create_local_session_for_test`.
+    [[nodiscard]] std::string
+    mint_local_session(const std::string& username, Role role, bool mfa_verified,
+                       const std::optional<std::string>& expected_hash_hex);
 
     /// Backing field for `set_role_recheck_race_hook_for_test` - see that
     /// method's doc. Invoked (if set) from inside
@@ -1356,7 +1437,7 @@ private:
     std::function<void()> post_mint_race_hook_for_test_;
 
     /// Backing field for `set_password_write_race_hook_for_test` - see that
-    /// method's doc. Invoked (if set) from inside `write_password_cas` only,
+    /// method's doc. Invoked (if set) from inside `write_password` only,
     /// between the read and the guarded UPDATE. Same shape/lifetime/
     /// production-reachability as `role_recheck_race_hook_for_test_` above -
     /// see that field's Resource Ledger entry, which covers this one too.

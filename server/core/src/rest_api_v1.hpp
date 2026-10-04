@@ -700,24 +700,46 @@ public:
     /// `device_ids` is unaffected either way.
     void set_all_agent_ids_fn(AllAgentIdsFn fn) { all_agent_ids_fn_ = std::move(fn); }
 
+    /// #5342 Gate 7 (C5) — an audit writer that stamps the principal
+    /// EXPLICITLY instead of re-resolving it from the request's session.
+    /// Wired from `AuthRoutes::audit_log_for_principal`. The password routes
+    /// REVOKE the caller's own sessions before they write and audit, so the
+    /// session-resolving `AuditFn` would stamp an EMPTY principal on every row
+    /// after the revoke; these routes capture the principal once, up front,
+    /// and pass it to every row. Returns true iff the row persisted (true in
+    /// audit-off mode).
+    using AuditPrincipalFn = std::function<bool(
+        const httplib::Request& req, const std::string& action, const std::string& result,
+        const std::string& principal, const std::string& principal_role,
+        const std::string& target_type, const std::string& target_id, const std::string& detail)>;
+
     /// #5342 — the local-account password routes' dependencies:
     /// `POST /api/v1/users/me/password` (self-service, proves the current
     /// password) and `POST /api/v1/users/{name}/password` (admin reset).
     ///   * `auth_mgr` — the typed `change_password`/`reset_password`/
     ///     `rollback_password_write` writes and `invalidate_user_sessions`.
     ///   * `verify_current_fn` — `AuthRoutes::password_change_verify_fn()`: the
-    ///     ONE lockout-accounted password check `/login` also uses, so this file
-    ///     never carries a second copy of the striped-lock section.
-    ///   * `mint_cookie_fn` — `AuthRoutes::session_cookie_mint_fn()`: the
-    ///     replacement session after a self-change, formatted by AuthRoutes
-    ///     (this class never formats a session cookie).
-    /// Any member unset ⇒ both routes answer 503 (misconfiguration), never a
-    /// partial write. MUST be called BEFORE `register_routes()`, same timing
-    /// contract as `set_engine_principal_store`.
+    ///     ONE lockout-accounted password check `/login` also uses (incl. the
+    ///     sso-only gate), so this file never carries a second copy of the
+    ///     striped-lock section.
+    ///   * `audit_principal_fn` — `AuthRoutes::audit_log_for_principal` (see
+    ///     `AuditPrincipalFn`): EVERY audit row these routes write goes
+    ///     through it.
+    ///   * `break_glass_user` — `Config::break_glass_user`; the admin reset
+    ///     refuses it as a target (403 `break_glass_target`) — the sealed
+    ///     escape hatch is re-keyed only out of band, never by a session an
+    ///     IdP compromise could have produced.
+    /// The admin route additionally uses `register_routes`' own `rbac_store`,
+    /// `auth_db` (the `is_rbac_administrator` gate) and `lockout_clear_fn`
+    /// (the post-reset lock clear). Any required member unset ⇒ the route
+    /// answers 503 (misconfiguration), never a partial write. MUST be called
+    /// BEFORE `register_routes()`, same timing contract as
+    /// `set_engine_principal_store`.
     struct PasswordChangeDeps {
         auth::AuthManager* auth_mgr{nullptr};
         PasswordVerifyFn verify_current_fn;
-        SessionCookieMintFn mint_cookie_fn;
+        AuditPrincipalFn audit_principal_fn;
+        std::string break_glass_user;
     };
     void set_password_change_deps(PasswordChangeDeps deps) { password_deps_ = std::move(deps); }
 

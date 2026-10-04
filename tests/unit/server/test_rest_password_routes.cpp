@@ -5,23 +5,32 @@
  *   POST /api/v1/users/{name}/password  {new_password}
  *
  * Wiring under test is the production shape: RestApiV1 over a TestRouteSink,
- * a REAL AuthManager over a real (PG) AuthDB for the writes, and a REAL
- * AuthRoutes supplying the lockout-accounted current-password check
- * (`password_change_verify_fn`, the same section POST /login runs) and the
- * replacement-session cookie minter. Only auth_fn / perm_fn / audit_fn /
+ * a REAL AuthManager over a real (PG) AuthDB for the writes, a REAL AuthRoutes
+ * supplying the lockout-accounted current-password check
+ * (`password_change_verify_fn`, the same section POST /login runs, incl. the
+ * sso-only gate) and the principal-explicit audit writer
+ * (`audit_log_for_principal`), and a REAL RbacStore co-located on the AuthDB's
+ * own pool (`RbacStoreOnAuthPool`, test_rbac_admin_surface_harness.hpp — the
+ * production same-database shape `check_caller_authorized_under_current_regime`
+ * JOINs across) for the canonical durable-Administrator gate. Only auth_fn and
  * step_up_fn are harness-controlled, so each gate can be driven directly.
  *
  * Audit `detail` tokens are asserted EXACTLY — they are the SOC 2 CC6.3
- * evidence vocabulary a SIEM rule keys on. No assertion here (or anywhere in
- * the routes) may see a password, its length, or the request body: the
- * "never echoed" cases check the response and every audit row for the
- * submitted secret.
+ * evidence vocabulary a SIEM rule keys on. Every audit row is captured WITH
+ * its principal: the routes revoke the caller's sessions before they write,
+ * so a session-resolving audit writer would stamp an empty principal; the
+ * harness's legacy `audit_fn` records an EMPTY principal on purpose, so any
+ * row written through it fails `check_every_row_names()`. No assertion here
+ * (or anywhere in the routes) may see a password, its length, or the request
+ * body: the "never echoed" cases check the response and every audit row.
  */
 
 #include "auth_routes.hpp"
 #include "rest_api_v1.hpp"
+#include "session_store.hpp"
 #include "test_api_token_pg_helper.hpp"
 #include "test_auth_db_pg_helper.hpp"
+#include "test_rbac_admin_surface_harness.hpp" // RbacStoreOnAuthPool
 #include "test_route_sink.hpp"
 #include "web_utils.hpp"
 
@@ -33,6 +42,7 @@
 #include <catch2/catch_test_macros.hpp>
 #include <nlohmann/json.hpp>
 
+#include <chrono>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -51,19 +61,23 @@ constexpr const char* kOld = "old-password-123";
 constexpr const char* kNew = "new-password-456";
 
 struct AuditRow {
-    std::string action, result, target_type, target_id, detail;
+    std::string action, result, principal, target_type, target_id, detail;
 };
 
 struct PasswordRoutesHarness {
     Config cfg{};
     yuzu::MetricsRegistry metrics;
     yuzu::test::AuthDbPg db;
+    RbacStoreOnAuthPool rbac{db.pool()}; // after db: borrows its pool
+    std::optional<SessionStore> sessions; // enable_session_store()
     AuthManager auth_mgr;
     std::shared_mutex oidc_mu;
     std::unique_ptr<oidc::OidcProvider> oidc_provider; // empty
     std::unique_ptr<AuthRoutes> auth_routes;
 
-    // Harness-controlled session (what auth_fn returns).
+    // Harness-controlled session (what auth_fn returns when the request
+    // carries no yuzu_session cookie). A request WITH a cookie is resolved
+    // through the real AuthManager, so revocation is observable end-to-end.
     std::string session_user;
     Role session_role{Role::user};
     std::string session_auth_source{"local"};
@@ -71,19 +85,20 @@ struct PasswordRoutesHarness {
     std::string session_scope;
     std::string session_principal_kind{"human"};
     bool session_mfa_verified{false};
-    bool perm_grant{true};
+    bool session_elevated{false};
     bool step_up_pass{true};
     int step_up_calls{0};
 
-    // Audit fault injection: `audit_fail_on(action, result)` makes the FIRST
-    // matching row report a persist failure (and run `on_fail` first, so a
-    // test can race the rollback).
+    // Audit capture + fault injection: `audit_fail_match(action, result)`
+    // makes the FIRST matching row report a persist failure (and run
+    // `on_audit_fail` first, so a test can race the rollback).
     std::vector<AuditRow> audits;
     std::optional<std::pair<std::string, std::string>> audit_fail_match;
     bool audit_fail_all_after_first{false};
     std::function<void()> on_audit_fail;
     bool audit_failing{false};
 
+    bool lockout_clear_ok{true};
     ApiTokenStore* token_store{nullptr};
     std::vector<std::string> trusted_origins;
     bool wire_deps{true};
@@ -106,18 +121,41 @@ struct PasswordRoutesHarness {
                                                    oidc_provider);
     }
 
+    /// Durable sessions on the same database (so a revoke can be made to
+    /// fail by dropping the session schema).
+    void enable_session_store() {
+        sessions.emplace(db.pool());
+        REQUIRE(sessions->is_open());
+        auth_mgr.set_session_store(&*sessions);
+    }
+
     /// Register the routes. Separate from the ctor so a test can adjust the
-    /// wiring knobs (token_store, trusted_origins, wire_deps) first.
+    /// wiring knobs (token_store, trusted_origins, wire_deps, cfg) first.
     void wire() {
         if (wire_deps) {
+            // The production wiring (server.cpp): the principal-explicit audit
+            // writer, here capturing every row with its principal.
             api.set_password_change_deps(RestApiV1::PasswordChangeDeps{
                 &auth_mgr, auth_routes->password_change_verify_fn(),
-                auth_routes->session_cookie_mint_fn()});
+                [this](const httplib::Request&, const std::string& action,
+                       const std::string& result, const std::string& principal,
+                       const std::string&, const std::string& target_type,
+                       const std::string& target_id, const std::string& detail) {
+                    return record(action, result, principal, target_type, target_id, detail);
+                },
+                cfg.break_glass_user});
         }
         api.set_csrf_trusted_origins(trusted_origins);
 
-        auto auth_fn = [this](const httplib::Request&,
+        auto auth_fn = [this](const httplib::Request& req,
                               httplib::Response& res) -> std::optional<auth::Session> {
+            const auto cookie = req.get_header_value("Cookie");
+            if (cookie.starts_with("yuzu_session=")) {
+                auto s = auth_mgr.validate_session(cookie.substr(13));
+                if (!s)
+                    res.status = 401;
+                return s;
+            }
             if (session_user.empty()) {
                 res.status = 401;
                 return std::nullopt;
@@ -132,30 +170,22 @@ struct PasswordRoutesHarness {
             s.principal_kind = session_principal_kind;
             if (session_mfa_verified)
                 s.mfa_verified_at = std::chrono::system_clock::now();
+            if (session_elevated)
+                s.elevated_until = std::chrono::system_clock::now() + std::chrono::minutes(10);
             return s;
         };
-        auto perm_fn = [this](const httplib::Request&, httplib::Response& res, const std::string&,
-                              const std::string&) -> bool {
-            if (perm_grant)
-                return true;
-            res.status = 403;
-            return false;
-        };
+        // Permissive on purpose: the admin reset no longer consults perm_fn
+        // (the canonical is_rbac_administrator predicate replaces it), so a
+        // caller this admits must STILL be refused unless it is a durable
+        // Administrator — which is what the A1 cases below prove.
+        auto perm_fn = [](const httplib::Request&, httplib::Response&, const std::string&,
+                          const std::string&) -> bool { return true; };
+        // The session-RESOLVING audit writer: records an EMPTY principal, the
+        // way production's would after the caller's session was revoked.
         auto audit_fn = [this](const httplib::Request&, const std::string& action,
                                const std::string& result, const std::string& target_type,
                                const std::string& target_id, const std::string& detail) -> bool {
-            audits.push_back({action, result, target_type, target_id, detail});
-            if (audit_failing && audit_fail_all_after_first)
-                return false;
-            if (audit_fail_match && audit_fail_match->first == action &&
-                audit_fail_match->second == result) {
-                audit_fail_match.reset();
-                audit_failing = true;
-                if (on_audit_fail)
-                    on_audit_fail();
-                return false;
-            }
-            return true;
+            return record(action, result, /*principal=*/"", target_type, target_id, detail);
         };
         StepUpFn step_up_fn = [this](const httplib::Request&, httplib::Response& res,
                                      const auth::Session&, const std::string&) -> bool {
@@ -167,10 +197,12 @@ struct PasswordRoutesHarness {
                             "application/json");
             return false;
         };
+        RestApiV1::LockoutClearFn lockout_clear_fn = [this](const std::string& user) {
+            return lockout_clear_ok && db->clear_failed_logins(user).has_value();
+        };
 
-        api.register_routes(sink, auth_fn, perm_fn, audit_fn,
-                            /*rbac_store=*/nullptr, /*mgmt_store=*/nullptr, token_store,
-                            /*quarantine_store=*/nullptr, /*response_store=*/nullptr,
+        api.register_routes(sink, auth_fn, perm_fn, audit_fn, rbac.get(), /*mgmt_store=*/nullptr,
+                            token_store, /*quarantine_store=*/nullptr, /*response_store=*/nullptr,
                             /*instruction_store=*/nullptr, /*execution_tracker=*/nullptr,
                             /*schedule_engine=*/nullptr, /*approval_manager=*/nullptr,
                             /*tag_store=*/nullptr, /*audit_store=*/nullptr,
@@ -180,7 +212,29 @@ struct PasswordRoutesHarness {
                             /*license_store=*/nullptr, /*guaranteed_state_store=*/nullptr,
                             &metrics, /*session_revoke_fn=*/{},
                             /*execution_event_bus=*/nullptr, /*result_set_store=*/nullptr,
-                            /*command_dispatch_fn=*/{}, step_up_fn);
+                            /*command_dispatch_fn=*/{}, step_up_fn,
+                            /*guardian_push_fn=*/{}, /*dex_perf_fn=*/{}, /*network_api=*/{},
+                            lockout_clear_fn, /*baseline_store=*/nullptr,
+                            /*scoped_perm_fn=*/{}, /*software_inventory_store=*/nullptr,
+                            /*response_scope_fn=*/{}, /*engine_principal_store=*/nullptr,
+                            /*access_review_store=*/nullptr, db.get());
+    }
+
+    bool record(const std::string& action, const std::string& result, const std::string& principal,
+                const std::string& target_type, const std::string& target_id,
+                const std::string& detail) {
+        audits.push_back({action, result, principal, target_type, target_id, detail});
+        if (audit_failing && audit_fail_all_after_first)
+            return false;
+        if (audit_fail_match && audit_fail_match->first == action &&
+            audit_fail_match->second == result) {
+            audit_fail_match.reset();
+            audit_failing = true;
+            if (on_audit_fail)
+                on_audit_fail();
+            return false;
+        }
+        return true;
     }
 
     void seed(const std::string& user, const std::string& pw, Role role) {
@@ -189,6 +243,13 @@ struct PasswordRoutesHarness {
                                 AuthManager::pbkdf2_sha256(pw, salt, AuthManager::kPbkdf2Iterations),
                                 AuthManager::bytes_to_hex(salt), role)
                     .has_value());
+    }
+
+    /// The default caller: a durable (RBAC-off, local role=admin) administrator.
+    void as_admin(const std::string& user = "root") {
+        seed(user, kOld, Role::admin);
+        session_user = user;
+        session_role = Role::admin;
     }
 
     std::unordered_map<std::string, std::string>
@@ -214,6 +275,15 @@ struct PasswordRoutesHarness {
                     {{"current_password", current}, {"new_password", next}});
     }
 
+    std::unique_ptr<httplib::Response> change_with_cookie(const std::string& token,
+                                                          const std::string& current,
+                                                          const std::string& next) {
+        auto h = browser_headers();
+        h["Cookie"] = "yuzu_session=" + token;
+        return post("/api/v1/users/me/password",
+                    {{"current_password", current}, {"new_password", next}}, h);
+    }
+
     std::unique_ptr<httplib::Response> reset(const std::string& target, const std::string& next) {
         return post("/api/v1/users/" + target + "/password", {{"new_password", next}});
     }
@@ -227,13 +297,43 @@ struct PasswordRoutesHarness {
         return false;
     }
 
+    /// C5: every row these routes wrote names `principal` (never empty —
+    /// even the rows written AFTER the caller's own sessions were revoked).
+    void check_every_row_names(const std::string& principal) const {
+        REQUIRE_FALSE(audits.empty());
+        for (const auto& a : audits) {
+            INFO("action=" << a.action << " result=" << a.result << " detail=" << a.detail);
+            CHECK(a.principal == principal);
+        }
+    }
+
     double changes(const std::string& kind, const std::string& result) {
         return metrics.counter("yuzu_auth_password_changes_total",
                                {{"kind", kind}, {"result", result}})
             .value();
     }
 
+    /// PBKDF2 verifications run so far (both verdicts of verify_password's
+    /// hashing path observe this histogram; a refused-before-hashing attempt
+    /// observes neither).
+    std::uint64_t pbkdf2_runs() {
+        return metrics
+                   .histogram("yuzu_auth_login_duration_seconds",
+                              {{"method", "password"}, {"result", "bad_password"}})
+                   .snapshot()
+                   .count +
+               metrics
+                   .histogram("yuzu_auth_login_duration_seconds",
+                              {{"method", "password"}, {"result", "success"}})
+                   .snapshot()
+                   .count;
+    }
+
     std::string stored_hash(const std::string& user) { return db->get_user(user)->hash_hex; }
+
+    bool password_works(const std::string& user, const std::string& pw) {
+        return auth_mgr.verify_password(user, pw).has_value();
+    }
 
     /// No response body or audit row may carry the submitted secret.
     void check_never_echoed(const httplib::Response& res, const std::string& secret) const {
@@ -256,64 +356,71 @@ std::string error_message_of(const httplib::Response& res) {
     return j["error"].value("message", std::string{});
 }
 
-/// "yuzu_session=<tok>; Path=..." → "<tok>".
-std::string token_from_set_cookie(const std::string& set_cookie) {
-    const std::string prefix = "yuzu_session=";
-    if (!set_cookie.starts_with(prefix))
-        return {};
-    auto end = set_cookie.find(';');
-    return set_cookie.substr(prefix.size(), end - prefix.size());
+constexpr const char* kClearCookie = "yuzu_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0";
+
+/// Drop the durable session schema so the next SessionStore op fails (the
+/// test_auth_session_store.cpp fault-inject).
+void drop_session_schema(yuzu::test::AuthDbPg& db) {
+    yuzu::server::pg::PgConn conn{PQconnectdb(db.dsn().c_str())};
+    REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+    yuzu::server::pg::PgResult d{PQexec(conn.get(), "DROP SCHEMA session_store CASCADE")};
+    REQUIRE(d.ok());
+}
+
+/// Break ONLY AuthDB::get_user's SELECT (it reads identity_source).
+void break_get_user(yuzu::test::AuthDbPg& db) {
+    yuzu::server::pg::PgConn conn{PQconnectdb(db.dsn().c_str())};
+    REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+    yuzu::server::pg::PgResult d{
+        PQexec(conn.get(), "ALTER TABLE auth.users DROP COLUMN identity_source")};
+    REQUIRE(d.ok());
 }
 
 } // namespace
 
 // ── Self-service: POST /api/v1/users/me/password ────────────────────────────
 
-TEST_CASE("password routes: self change succeeds, revokes sessions, re-mints the caller's",
+TEST_CASE("password routes: self change revokes EVERY session incl. the caller's, no re-mint",
           "[pg][rest][password]") {
+    // #5342 Gate 7 (C6): the route revokes first and never re-issues a
+    // session — the caller signs in again with the new password.
     PasswordRoutesHarness h;
     h.wire();
     h.seed("alice", kOld, Role::admin);
-    h.session_user = "alice";
-    h.session_role = Role::admin;
-    h.session_mfa_verified = true;
-    auto old_token = h.auth_mgr.authenticate("alice", kOld);
-    REQUIRE(old_token.has_value());
+    auto mine = h.auth_mgr.authenticate("alice", kOld); // the caller's own cookie
+    auto other = h.auth_mgr.authenticate("alice", kOld); // a second device
+    REQUIRE(mine.has_value());
+    REQUIRE(other.has_value());
 
-    auto res = h.change(kOld, kNew);
+    auto res = h.change_with_cookie(*mine, kOld, kNew);
     REQUIRE(res);
     REQUIRE(res->status == 200);
     auto d = data_of(*res);
+    CHECK(d["username"] == "alice");
     CHECK(d["password_changed"] == true);
-    CHECK(d["session_reissued"] == true);
-    CHECK(d["sessions_db_persisted"] == true);
-    CHECK(d["sessions_revoked"].get<int64_t>() >= 1);
+    CHECK(d["session_reissued"] == false);
     CHECK(d["audit_emitted"] == true);
+    CHECK(d["sessions_revoked"].get<int64_t>() >= 2);
+    CHECK_FALSE(d.contains("sessions_db_persisted"));
+    CHECK(res->get_header_value("Set-Cookie") == kClearCookie);
 
-    // Old session dead; replacement cookie valid, MFA proof carried, not elevated.
-    CHECK_FALSE(h.auth_mgr.validate_session(*old_token).has_value());
-    const auto set_cookie = res->get_header_value("Set-Cookie");
-    CHECK(set_cookie.find("HttpOnly") != std::string::npos);
-    CHECK(set_cookie.find("SameSite=Lax") != std::string::npos);
-    const auto new_token = token_from_set_cookie(set_cookie);
-    REQUIRE_FALSE(new_token.empty());
-    auto fresh = h.auth_mgr.validate_session(new_token);
-    REQUIRE(fresh.has_value());
-    CHECK(fresh->username == "alice");
-    CHECK(fresh->role == Role::admin);
-    CHECK(fresh->mfa_verified_at.time_since_epoch().count() != 0);
-    CHECK_FALSE(auth::is_elevated(*fresh));
+    // Both sessions are dead — including the one that made the request.
+    CHECK_FALSE(h.auth_mgr.validate_session(*mine).has_value());
+    CHECK_FALSE(h.auth_mgr.validate_session(*other).has_value());
+    auto again = h.change_with_cookie(*mine, kNew, "third-password-789");
+    REQUIRE(again);
+    CHECK(again->status == 401);
 
-    // Credential swapped durably.
-    CHECK_FALSE(h.auth_mgr.verify_password("alice", kOld).has_value());
-    CHECK(h.auth_mgr.verify_password("alice", kNew) == Role::admin);
-
-    CHECK(h.has_audit("user.password_change", "ok", "self_service"));
-    CHECK(h.has_audit("session.revoke_all.self", "success", "count="));
+    CHECK_FALSE(h.password_works("alice", kOld));
+    CHECK(h.password_works("alice", kNew));
+    CHECK(h.has_audit("user.password_change", "ok", "self_service sessions_revoked="));
+    // No separate session.revoke_all rows: the success row carries the count.
+    for (const auto& a : h.audits)
+        CHECK(a.action.rfind("session.revoke_all", 0) == std::string::npos);
+    h.check_every_row_names("alice");
     CHECK(h.changes("self", "ok") == 1.0);
     h.check_never_echoed(*res, kOld);
     h.check_never_echoed(*res, kNew);
-    CHECK(h.step_up_calls == 1);
 }
 
 TEST_CASE("password routes: self change refuses every non-interactive or non-local session",
@@ -364,6 +471,7 @@ TEST_CASE("password routes: self change refuses every non-interactive or non-loc
     }
     CHECK(h.stored_hash("bob") == before);
     CHECK(h.changes("self", "denied") == 1.0);
+    h.check_every_row_names("bob");
 }
 
 TEST_CASE("password routes: CSRF and Content-Type gates", "[pg][rest][password]") {
@@ -433,7 +541,7 @@ TEST_CASE("password routes: Referer-only and trusted-origin requests pass the CS
     CHECK(referer_only->status == 200);
 }
 
-TEST_CASE("password routes: self change body + policy validation never echoes the body",
+TEST_CASE("password routes: self change body + policy validation is unaudited and never echoes",
           "[pg][rest][password]") {
     PasswordRoutesHarness h;
     h.wire();
@@ -459,19 +567,18 @@ TEST_CASE("password routes: self change body + policy validation never echoes th
         auto res = h.change(kOld, "short");
         REQUIRE(res);
         CHECK(res->status == 400);
-        CHECK(h.has_audit("user.password_change", "denied", "weak_password"));
         h.check_never_echoed(*res, "short");
     }
     SECTION("too long") {
         auto res = h.change(kOld, std::string(1025, 'z'));
         REQUIRE(res);
         CHECK(res->status == 400);
-        CHECK(h.has_audit("user.password_change", "denied", "too_long"));
         // The length itself is never reported.
         CHECK(res->body.find("1025") == std::string::npos);
-        for (const auto& a : h.audits)
-            CHECK(a.detail.find("1025") == std::string::npos);
     }
+    // #5342 Gate 7: body/policy 400s carry no security signal — no audit row.
+    CHECK(h.audits.empty());
+    CHECK(h.changes("self", "denied") == 1.0);
     CHECK(h.stored_hash("eve") == before);
 }
 
@@ -513,6 +620,51 @@ TEST_CASE("password routes: a wrong current password is lockout-accounted like /
     REQUIRE(ok);
     CHECK(ok->status == 200);
     CHECK(h.db->lockout_status("fred")->failed_count == 0);
+}
+
+TEST_CASE("password routes: a store fault or mid-verify credential change is a 503, never a strike",
+          "[pg][rest][password][lockout]") {
+    // #5342 Gate 7 (B3): a password that could not be VERIFIED is not a guess.
+    PasswordRoutesHarness h(/*lockout_threshold=*/3);
+    h.wire();
+    h.seed("tess", kOld, Role::user);
+    h.session_user = "tess";
+
+    SECTION("AuthDB read failure") {
+        break_get_user(h.db);
+        auto res = h.change(kOld, kNew);
+        REQUIRE(res);
+        CHECK(res->status == 503);
+        CHECK(h.has_audit("user.password_change", "error", "verify_transient"));
+        CHECK_FALSE(h.has_audit("user.password_change", "denied", "wrong_current"));
+        CHECK(h.metrics
+                  .counter("yuzu_auth_read_degrade_total",
+                           {{"route", "password_change"}, {"reason", "query_error"}})
+                  .value() == 1.0);
+    }
+    SECTION("the credential changes under the row lock") {
+        auto salt = AuthManager::random_bytes(16);
+        const auto racer = AuthManager::pbkdf2_sha256("racer-password-1", salt,
+                                                      AuthManager::kPbkdf2Iterations);
+        const auto racer_salt = AuthManager::bytes_to_hex(salt);
+        bool fired = false;
+        h.auth_mgr.set_role_recheck_race_hook_for_test([&] {
+            if (fired)
+                return;
+            fired = true;
+            REQUIRE(h.db->set_password("tess", racer, racer_salt).has_value());
+        });
+        auto res = h.change(kOld, kNew);
+        h.auth_mgr.set_role_recheck_race_hook_for_test(nullptr);
+        REQUIRE(res);
+        CHECK(fired);
+        CHECK(res->status == 503);
+        CHECK(h.has_audit("user.password_change", "error", "verify_transient"));
+        CHECK(h.stored_hash("tess") == racer); // never overwritten
+    }
+    auto st = h.db->lockout_status("tess");
+    REQUIRE(st.has_value());
+    CHECK(st->failed_count == 0); // no strike either way
 }
 
 TEST_CASE("password routes: step-up refusal stops the self change before any write",
@@ -558,23 +710,29 @@ TEST_CASE("password routes: audit failure rolls the self change back (fail-close
     h.session_user = "ivy";
     auto old_token = h.auth_mgr.authenticate("ivy", kOld);
     REQUIRE(old_token.has_value());
+    const auto before = h.stored_hash("ivy");
     h.audit_fail_match = std::make_pair(std::string("user.password_change"), std::string("ok"));
 
     auto res = h.change(kOld, kNew);
     REQUIRE(res);
     CHECK(res->status == 500);
     CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
-    CHECK(error_message_of(*res) == "could not record the password change; it was not applied");
-    // Rolled back: the OLD password still works, the old session survives.
-    CHECK(h.auth_mgr.verify_password("ivy", kOld) == Role::user);
-    CHECK_FALSE(h.auth_mgr.verify_password("ivy", kNew).has_value());
-    CHECK(h.auth_mgr.validate_session(*old_token).has_value());
+    CHECK(error_message_of(*res).find("rolled back") != std::string::npos);
+    CHECK(error_message_of(*res).find("sessions were revoked; password unchanged") !=
+          std::string::npos);
+    // Rolled back: the stored credential is byte-identical, the OLD password
+    // works. The sessions were revoked FIRST (step 10) and stay revoked.
+    CHECK(h.stored_hash("ivy") == before);
+    CHECK(h.password_works("ivy", kOld));
+    CHECK_FALSE(h.password_works("ivy", kNew));
+    CHECK_FALSE(h.auth_mgr.validate_session(*old_token).has_value());
     CHECK(h.has_audit("user.password_change", "error", "audit_failed_rolled_back"));
-    CHECK(res->get_header_value("Set-Cookie").empty());
+    CHECK(res->get_header_value("Set-Cookie") == kClearCookie);
     CHECK(h.changes("self", "error") == 1.0);
+    h.check_every_row_names("ivy");
 }
 
-TEST_CASE("password routes: audit failure whose rollback also fails is disclosed",
+TEST_CASE("password routes: audit failure whose rollback also fails is disclosed and counted",
           "[pg][rest][password][audit]") {
     PasswordRoutesHarness h;
     h.wire();
@@ -597,10 +755,75 @@ TEST_CASE("password routes: audit failure whose rollback also fails is disclosed
     CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
     CHECK(error_message_of(*res).find("could neither be recorded nor rolled back") !=
           std::string::npos);
+    CHECK(error_message_of(*res).find("sessions were revoked") != std::string::npos);
     CHECK(h.has_audit("user.password_change", "error", "audit_failed_rollback_failed"));
+    CHECK(h.metrics.counter("yuzu_auth_password_change_unrecorded_total", {{"kind", "self"}})
+              .value() == 1.0);
     // The concurrent writer's credential was never clobbered by the stale
     // compensation.
     CHECK(h.stored_hash("jack") == other_hash);
+}
+
+TEST_CASE("password routes: a failed durable revoke refuses the change with nothing written",
+          "[pg][rest][password]") {
+    // #5342 Gate 7 (C5): revoke FIRST; if it did not persist, 503 and the
+    // credential is untouched — an old session must never outlive the old
+    // password on another replica.
+    PasswordRoutesHarness h;
+    h.enable_session_store();
+    h.wire();
+    h.seed("kurt", kOld, Role::user);
+    h.as_admin();
+
+    SECTION("self route") {
+        h.session_user = "kurt";
+        h.session_role = Role::user;
+        const auto before = h.stored_hash("kurt");
+        drop_session_schema(h.db);
+        auto res = h.change(kOld, kNew);
+        REQUIRE(res);
+        CHECK(res->status == 503);
+        CHECK(nlohmann::json::parse(res->body)["error"]["retry_after_ms"].is_number());
+        CHECK(h.has_audit("user.password_change", "error", "session_revoke_failed"));
+        CHECK(h.stored_hash("kurt") == before);
+        h.check_every_row_names("kurt");
+    }
+    SECTION("admin route") {
+        const auto before = h.stored_hash("kurt");
+        drop_session_schema(h.db);
+        auto res = h.reset("kurt", kNew);
+        REQUIRE(res);
+        CHECK(res->status == 503);
+        CHECK(h.has_audit("user.password_reset", "error", "session_revoke_failed"));
+        CHECK(h.stored_hash("kurt") == before);
+        h.check_every_row_names("root");
+    }
+}
+
+TEST_CASE("password routes: a write that fails AFTER the revoke says so (sessions gone, hash kept)",
+          "[pg][rest][password]") {
+    PasswordRoutesHarness h;
+    h.wire();
+    h.as_admin();
+    h.seed("lara", kOld, Role::user);
+    auto lara_session = h.auth_mgr.create_local_session_for_test("lara", Role::user, false);
+    REQUIRE_FALSE(lara_session.empty());
+    const auto before = h.stored_hash("lara");
+    // SCIM adopts the account between the route's read and its UPDATE: the
+    // guarded write matches nothing.
+    h.auth_mgr.set_password_write_race_hook_for_test(
+        [&] { REQUIRE(h.db->set_provisioning_source("lara", "scim").has_value()); });
+
+    auto res = h.reset("lara", kNew);
+    h.auth_mgr.set_password_write_race_hook_for_test(nullptr);
+    REQUIRE(res);
+    CHECK(res->status == 409);
+    CHECK(error_message_of(*res).find("sessions were revoked; password unchanged") !=
+          std::string::npos);
+    CHECK(h.has_audit("user.password_reset", "denied", "not_local"));
+    CHECK_FALSE(h.auth_mgr.validate_session(lara_session).has_value());
+    CHECK(h.stored_hash("lara") == before);
+    h.check_every_row_names("root");
 }
 
 TEST_CASE("password routes: self change for an account with no row answers wrong_current",
@@ -616,23 +839,64 @@ TEST_CASE("password routes: self change for an account with no row answers wrong
     CHECK(h.has_audit("user.password_change", "denied", "wrong_current"));
 }
 
+TEST_CASE("password routes: under sso-only a DISARMED break-glass session cannot guess or lock",
+          "[pg][rest][password][lockout]") {
+    // #5342 Gate 7 (C8): the self route runs /login's sso-only gate. Arm,
+    // sign in, disarm: the still-live session must get 403
+    // sso_only_local_disabled for every attempt, with zero PBKDF2 and no
+    // lockout strike — it is not a guessing oracle once the window closes.
+    PasswordRoutesHarness h(/*lockout_threshold=*/3);
+    h.cfg.auth_mode = "sso-only";
+    h.cfg.break_glass_user = "bg";
+    h.wire();
+    h.seed("bg", kOld, Role::admin);
+    REQUIRE(h.db->arm_break_glass("bg", 600).has_value());
+    h.session_user = "bg"; // signed in while armed
+    h.session_role = Role::admin;
+    REQUIRE(h.db->disarm_break_glass("bg").has_value());
+
+    const auto pbkdf2_before = h.pbkdf2_runs();
+    for (int i = 0; i < 20; ++i) {
+        auto res = h.change("wrong-guess-" + std::to_string(i), kNew);
+        REQUIRE(res);
+        CHECK(res->status == 403);
+        CHECK(h.has_audit("user.password_change", "denied", "sso_only_local_disabled"));
+    }
+    CHECK(h.pbkdf2_runs() == pbkdf2_before);
+    CHECK_FALSE(h.has_audit("user.password_change", "denied", "wrong_current"));
+    auto st = h.db->lockout_status("bg");
+    REQUIRE(st.has_value());
+    CHECK_FALSE(st->locked);
+    CHECK(st->failed_count == 0);
+    CHECK(h.password_works("bg", kOld));
+
+    // Re-armed: the route behaves normally again.
+    REQUIRE(h.db->arm_break_glass("bg", 600).has_value());
+    auto wrong = h.change("still-not-it-123", kNew);
+    REQUIRE(wrong);
+    CHECK(wrong->status == 403);
+    CHECK(h.has_audit("user.password_change", "denied", "wrong_current"));
+    auto ok = h.change(kOld, kNew);
+    REQUIRE(ok);
+    CHECK(ok->status == 200);
+}
+
 // ── Admin reset: POST /api/v1/users/{name}/password ────────────────────────
 
-TEST_CASE("password routes: admin reset succeeds, revokes the target's sessions, reports tokens",
+TEST_CASE("password routes: admin reset succeeds, revokes the target's sessions, clears its lock",
           "[pg][rest][password]") {
     yuzu::test::ApiTokenStorePg tokens;
     PasswordRoutesHarness h;
     h.token_store = tokens.get();
     h.wire();
-    h.seed("root", kOld, Role::admin);
+    h.as_admin();
     h.seed("lena", kOld, Role::user);
     REQUIRE(tokens->create_token("lena-ci", "lena").has_value());
-    h.session_user = "root";
-    h.session_role = Role::admin;
-    // Arm a lock on the target first — a reset must clear it.
+    REQUIRE(tokens->create_token("lena-backup", "lena").has_value());
+    // Arm a lock on the target first — a reset must clear it (audited).
     for (int i = 0; i < 3; ++i)
         REQUIRE(h.db->record_failed_login("lena", 3, 3600).has_value());
-    auto lena_session = h.auth_mgr.create_local_session("lena", Role::user, false);
+    auto lena_session = h.auth_mgr.create_local_session_for_test("lena", Role::user, false);
     REQUIRE_FALSE(lena_session.empty());
 
     auto res = h.reset("lena", kNew);
@@ -642,51 +906,173 @@ TEST_CASE("password routes: admin reset succeeds, revokes the target's sessions,
     CHECK(d["username"] == "lena");
     CHECK(d["password_reset"] == true);
     CHECK(d["sessions_revoked"].get<int64_t>() >= 1);
-    CHECK(d["api_tokens_active"].get<int64_t>() == 1);
+    CHECK(d["lockout_cleared"] == true);
+    CHECK(d["api_tokens_active"].get<int64_t>() == 2);
+    CHECK_FALSE(d.contains("api_tokens_unknown"));
+    CHECK_FALSE(d.contains("sessions_db_persisted"));
     CHECK(d["remediation"].get<std::string>().find("NOT revoked") != std::string::npos);
     CHECK(res->get_header_value("Set-Cookie").empty()); // the CALLER's cookie is untouched
 
     CHECK_FALSE(h.auth_mgr.validate_session(lena_session).has_value());
-    CHECK(h.auth_mgr.verify_password("lena", kNew) == Role::user);
+    CHECK(h.password_works("lena", kNew));
     CHECK_FALSE(h.db->lockout_status("lena")->locked);
-    CHECK(h.has_audit("user.password_reset", "ok", "admin_reset target_role=user"));
-    CHECK(h.has_audit("session.revoke_all", "success", "count="));
+    CHECK(h.has_audit("user.password_reset", "ok", "admin_reset target_role=user sessions_revoked="));
+    CHECK(h.has_audit("auth.lockout.cleared", "ok", "password_reset"));
+    for (const auto& a : h.audits)
+        CHECK(a.action.rfind("session.revoke_all", 0) == std::string::npos);
+    h.check_every_row_names("root");
     CHECK(h.changes("admin", "ok") == 1.0);
     h.check_never_echoed(*res, kNew);
 }
 
-TEST_CASE("password routes: admin reset refusals", "[pg][rest][password]") {
+TEST_CASE("password routes: admin reset reports unknown API tokens as null, never 0",
+          "[pg][rest][password]") {
+    // #5342 Gate 7 (D9): a token-store read failure is "could not confirm".
+    yuzu::test::ApiTokenStorePg tokens;
+    PasswordRoutesHarness h;
+    h.token_store = tokens.get();
+    h.wire();
+    h.as_admin();
+    h.seed("noel", kOld, Role::user);
+    {
+        yuzu::server::pg::PgConn conn{PQconnectdb(tokens.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        yuzu::server::pg::PgResult d{
+            PQexec(conn.get(), "DROP TABLE api_token_store.api_tokens CASCADE")};
+        REQUIRE(d.ok());
+    }
+    auto res = h.reset("noel", kNew);
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    auto d = data_of(*res);
+    CHECK(d["api_tokens_active"].is_null());
+    CHECK(d["api_tokens_unknown"] == true);
+    CHECK(d["remediation"].get<std::string>().find("could not confirm") != std::string::npos);
+
+    SECTION("no token store wired at all") {
+        PasswordRoutesHarness h2;
+        h2.wire();
+        h2.as_admin();
+        h2.seed("nina", kOld, Role::user);
+        auto r2 = h2.reset("nina", kNew);
+        REQUIRE(r2);
+        REQUIRE(r2->status == 200);
+        CHECK(data_of(*r2)["api_tokens_active"].is_null());
+        CHECK(data_of(*r2)["api_tokens_unknown"] == true);
+    }
+}
+
+TEST_CASE("password routes: the admin gate is the canonical durable-Administrator predicate",
+          "[pg][rest][password]") {
+    // #5342 Gate 7 (A1): is_rbac_administrator(kRest) + the fresh regime
+    // re-read gate EVERY target; perm_fn (here permissive) plays no part.
     PasswordRoutesHarness h;
     h.wire();
-    h.seed("root", kOld, Role::admin);
     h.seed("max", kOld, Role::user);
-    h.seed("other_admin", kOld, Role::admin);
-    h.session_user = "root";
-    h.session_role = Role::admin;
+    const auto before = h.stored_hash("max");
 
-    SECTION("no UserManagement:Write") {
-        h.perm_grant = false;
+    SECTION("RBAC off: a durable local admin may reset") {
+        h.as_admin();
+        auto res = h.reset("max", kNew);
+        REQUIRE(res);
+        CHECK(res->status == 200);
+    }
+    SECTION("RBAC off: a JIT-elevated user is refused") {
+        h.seed("jit", kOld, Role::user);
+        h.session_user = "jit";
+        h.session_role = Role::user;
+        h.session_elevated = true; // effective role admin; durable role user
         auto res = h.reset("max", kNew);
         REQUIRE(res);
         CHECK(res->status == 403);
-        CHECK(h.audits.empty()); // perm_fn owns its own denial evidence
+        CHECK(h.has_audit("user.password_reset", "denied", "durable_admin_required"));
+        CHECK(h.stored_hash("max") == before);
     }
+    SECTION("RBAC off: an OIDC session with an IdP-group-derived admin role is refused") {
+        const std::string principal = "oidc:https://idp.example#grp-admin";
+        REQUIRE(h.db->upsert_sso_identity(principal, "https://idp.example", "grp-admin", "G",
+                                          "oidc")
+                    .has_value()); // auth.users.role stays 'user'
+        h.session_user = principal;
+        h.session_role = Role::admin; // what resolve_role_from_groups stamps
+        h.session_auth_source = "oidc";
+        auto res = h.reset("max", kNew);
+        REQUIRE(res);
+        CHECK(res->status == 403);
+        CHECK(h.has_audit("user.password_reset", "denied", "durable_admin_required"));
+        CHECK(h.stored_hash("max") == before);
+    }
+    SECTION("RBAC on: an Administrator grant holder may reset") {
+        h.seed("rbacadm", kOld, Role::user);
+        REQUIRE(h.rbac->set_rbac_enabled(true).has_value());
+        REQUIRE(h.rbac->assign_role({"user", "rbacadm", "Administrator"}).has_value());
+        h.session_user = "rbacadm";
+        h.session_role = Role::user;
+        auto res = h.reset("max", kNew);
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        CHECK(h.password_works("max", kNew));
+    }
+    SECTION("RBAC on: a custom role holding UserManagement:Write is not enough") {
+        h.seed("helpdesk", kOld, Role::user);
+        REQUIRE(h.rbac->set_rbac_enabled(true).has_value());
+        REQUIRE(h.rbac->create_role({"PwHelpdesk", "test role", false, 0}).has_value());
+        REQUIRE(h.rbac->set_permission({"PwHelpdesk", "UserManagement", "Write", "allow"})
+                    .has_value());
+        REQUIRE(h.rbac->assign_role({"user", "helpdesk", "PwHelpdesk"}).has_value());
+        h.session_user = "helpdesk";
+        h.session_role = Role::user;
+        auto res = h.reset("max", kNew);
+        REQUIRE(res);
+        CHECK(res->status == 403);
+        CHECK(h.has_audit("user.password_reset", "denied", "durable_admin_required"));
+        CHECK(h.stored_hash("max") == before);
+    }
+    SECTION("RBAC on + a degraded RBAC store: 503, never a denial or an admit") {
+        h.seed("rbacadm", kOld, Role::user);
+        REQUIRE(h.rbac->set_rbac_enabled(true).has_value());
+        REQUIRE(h.rbac->assign_role({"user", "rbacadm", "Administrator"}).has_value());
+        h.session_user = "rbacadm";
+        {
+            yuzu::server::pg::PgConn conn{PQconnectdb(h.db.dsn().c_str())};
+            REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+            yuzu::server::pg::PgResult d{
+                PQexec(conn.get(), "DROP TABLE rbac_store.principal_roles CASCADE")};
+            REQUIRE(d.ok());
+        }
+        auto res = h.reset("max", kNew);
+        REQUIRE(res);
+        CHECK(res->status == 503);
+        CHECK(h.has_audit("user.password_reset", "error", "admin_gate_unavailable"));
+        CHECK(h.stored_hash("max") == before);
+    }
+}
+
+TEST_CASE("password routes: admin reset refusals", "[pg][rest][password]") {
+    PasswordRoutesHarness h;
+    h.cfg.break_glass_user = "bg";
+    h.wire();
+    h.as_admin();
+    h.seed("max", kOld, Role::user);
+    h.seed("other_admin", kOld, Role::admin);
+    h.seed("bg", kOld, Role::admin);
+
     SECTION("self-target refused — use /me") {
         auto res = h.reset("root", kNew);
         REQUIRE(res);
         CHECK(res->status == 403);
         CHECK(h.has_audit("user.password_reset", "denied", "self_target"));
-        CHECK(h.auth_mgr.verify_password("root", kOld) == Role::admin);
+        CHECK(h.password_works("root", kOld));
     }
-    SECTION("admin target needs a DURABLE admin caller (JIT-elevated user refused)") {
-        h.session_role = Role::user; // standing role user; perm_fn admits (elevated)
-        auto res = h.reset("other_admin", kNew);
+    SECTION("the break-glass account is never a reset target") {
+        auto res = h.reset("bg", kNew);
         REQUIRE(res);
         CHECK(res->status == 403);
-        CHECK(h.has_audit("user.password_reset", "denied", "admin_target_requires_durable_admin"));
-        CHECK(h.auth_mgr.verify_password("other_admin", kOld) == Role::admin);
+        CHECK(h.has_audit("user.password_reset", "denied", "break_glass_target"));
+        CHECK(h.step_up_calls == 0); // refused BEFORE step-up
+        CHECK(h.password_works("bg", kOld));
     }
-    SECTION("admin target with a durable admin caller is allowed") {
+    SECTION("an admin target is just another target for a durable admin") {
         auto res = h.reset("other_admin", kNew);
         REQUIRE(res);
         CHECK(res->status == 200);
@@ -719,12 +1105,6 @@ TEST_CASE("password routes: admin reset refusals", "[pg][rest][password]") {
         CHECK(res->status == 403);
         CHECK(h.has_audit("user.password_reset", "denied", "token_session"));
     }
-    SECTION("SSO admin cookie session may reset a local account") {
-        h.session_auth_source = "oidc";
-        auto res = h.reset("max", kNew);
-        REQUIRE(res);
-        CHECK(res->status == 200);
-    }
     SECTION("cross-origin refused") {
         auto res = h.post("/api/v1/users/max/password", {{"new_password", kNew}},
                           h.browser_headers("https://evil.example"));
@@ -737,36 +1117,51 @@ TEST_CASE("password routes: admin reset refusals", "[pg][rest][password]") {
         auto res = h.reset("max", kNew);
         REQUIRE(res);
         CHECK(res->status == 401);
-        CHECK(h.auth_mgr.verify_password("max", kOld) == Role::user);
+        CHECK(h.password_works("max", kOld));
     }
-    SECTION("weak password") {
+    SECTION("weak password is a 400 with no audit row") {
         auto res = h.reset("max", "short");
         REQUIRE(res);
         CHECK(res->status == 400);
-        CHECK(h.has_audit("user.password_reset", "denied", "weak_password"));
+        CHECK(h.audits.empty());
     }
+    for (const auto& a : h.audits)
+        CHECK(a.principal == "root");
 }
 
 TEST_CASE("password routes: admin reset audit failure rolls back; rollback failure disclosed",
           "[pg][rest][password][audit]") {
     PasswordRoutesHarness h;
     h.wire();
-    h.seed("root", kOld, Role::admin);
+    h.as_admin();
     h.seed("nora", kOld, Role::user);
-    h.session_user = "root";
-    h.session_role = Role::admin;
-    auto nora_session = h.auth_mgr.create_local_session("nora", Role::user, false);
+    auto nora_session = h.auth_mgr.create_local_session_for_test("nora", Role::user, false);
     REQUIRE_FALSE(nora_session.empty());
 
-    SECTION("rollback succeeds") {
+    SECTION("rollback succeeds; a lock armed before the reset is still armed") {
+        // #5342 Gate 7 (C7): set_password no longer clears the lockout, and the
+        // audited lock-clear step only runs after a RECORDED reset — so a
+        // rolled-back reset leaves the lockout columns exactly as they were.
+        for (int i = 0; i < 3; ++i)
+            REQUIRE(h.db->record_failed_login("nora", 3, 3600).has_value());
+        const auto armed = h.db->lockout_status("nora");
+        REQUIRE(armed.has_value());
+        REQUIRE(armed->locked);
+        const auto before = h.stored_hash("nora");
         h.audit_fail_match = std::make_pair(std::string("user.password_reset"), std::string("ok"));
         auto res = h.reset("nora", kNew);
         REQUIRE(res);
         CHECK(res->status == 500);
         CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
-        CHECK(h.auth_mgr.verify_password("nora", kOld) == Role::user);
-        CHECK(h.auth_mgr.validate_session(nora_session).has_value()); // nothing revoked
+        CHECK(h.stored_hash("nora") == before);
+        CHECK(h.password_works("nora", kOld));
+        CHECK_FALSE(h.auth_mgr.validate_session(nora_session).has_value()); // revoked first
         CHECK(h.has_audit("user.password_reset", "error", "audit_failed_rolled_back"));
+        CHECK_FALSE(h.has_audit("auth.lockout.cleared", "ok"));
+        auto st = h.db->lockout_status("nora");
+        REQUIRE(st.has_value());
+        CHECK(st->locked);
+        CHECK(st->failed_count == armed->failed_count);
     }
     SECTION("rollback fails") {
         h.audit_fail_match = std::make_pair(std::string("user.password_reset"), std::string("ok"));
@@ -780,23 +1175,46 @@ TEST_CASE("password routes: admin reset audit failure rolls back; rollback failu
         CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
         CHECK(error_message_of(*res).find("NEW password is now in effect") != std::string::npos);
         CHECK(h.stored_hash("nora") == "deadbeef");
+        CHECK(h.metrics.counter("yuzu_auth_password_change_unrecorded_total", {{"kind", "admin"}})
+                  .value() == 1.0);
     }
     CHECK(h.changes("admin", "error") == 1.0);
+}
+
+TEST_CASE("password routes: a failed post-reset lock clear is reported, never fatal",
+          "[pg][rest][password][lockout]") {
+    PasswordRoutesHarness h;
+    h.wire();
+    h.as_admin();
+    h.seed("otto", kOld, Role::user);
+    for (int i = 0; i < 3; ++i)
+        REQUIRE(h.db->record_failed_login("otto", 3, 3600).has_value());
+    h.lockout_clear_ok = false;
+
+    auto res = h.reset("otto", kNew);
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    auto d = data_of(*res);
+    CHECK(d["password_reset"] == true);
+    CHECK(d["lockout_cleared"] == false);
+    CHECK(d["remediation"].get<std::string>().find("/unlock") != std::string::npos);
+    CHECK(h.has_audit("auth.lockout.cleared", "error", "password_reset"));
+    CHECK(h.password_works("otto", kNew));
+    CHECK(h.db->lockout_status("otto")->locked); // still locked — operator must unlock
 }
 
 TEST_CASE("password routes: the literal /me route wins over the {name} regex",
           "[pg][rest][password]") {
     // httplib dispatches the FIRST matching registration; ([^/]+) also matches
     // "me". A self change must never be routed to the admin reset handler
-    // (which would demand UserManagement:Write and skip the current-password
-    // proof).
+    // (which would demand a durable Administrator and skip the
+    // current-password proof).
     PasswordRoutesHarness h;
     h.wire();
     h.seed("olga", kOld, Role::user);
-    h.session_user = "olga";
-    h.perm_grant = false; // the admin route would 403 here
+    h.session_user = "olga"; // not an administrator: the admin route would 403
     auto res = h.post("/api/v1/users/me/password", {{"new_password", kNew}}); // no current
     REQUIRE(res);
-    CHECK(res->status == 400); // the SELF handler's body validation, not the admin perm gate
-    CHECK(h.auth_mgr.verify_password("olga", kOld) == Role::user);
+    CHECK(res->status == 400); // the SELF handler's body validation, not the admin gate
+    CHECK(h.password_works("olga", kOld));
 }

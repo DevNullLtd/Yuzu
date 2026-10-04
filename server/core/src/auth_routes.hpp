@@ -127,11 +127,26 @@ enum class PasswordCheckOutcome : std::uint8_t {
     /// rejection would be an UNcounted attempt — a free guess while the store
     /// is degraded (Hermes p2 MEDIUM).
     kStoreUnavailable,
+    /// #5342 Gate 7 (sec-3): the password could not be VERIFIED at all — an
+    /// AuthDB read failed (`VerifyFailure::kStoreUnavailable`) or the stored
+    /// credential changed mid-verify (`kCredentialChanged`, a concurrent
+    /// password change). Not a credential verdict: `on_bad_credential` is NOT
+    /// run, nothing is counted toward lockout, no "login failed" evidence is
+    /// written. The caller answers a retryable 503. A store-unavailable read
+    /// also bumps `yuzu_auth_secret_unavailable_total` + `yuzu_auth_read_degrade_total`
+    /// for `opts.metric_route`; a credential change is counted by
+    /// `yuzu_auth_credential_changed_during_verify_total` (AuthManager).
+    kTransient,
 };
 
 struct PasswordCheckResult {
     PasswordCheckOutcome outcome{PasswordCheckOutcome::kBadCredential};
     std::optional<auth::Role> role; ///< engaged iff kVerified
+    /// kVerified only: the stored hash the password was verified against
+    /// (`VerifiedCredential::hash_hex`) — the anchor a session mint
+    /// (`create_local_session`) and a self-change CAS carry forward. Credential
+    /// material: never log, audit, or serialise it.
+    std::string verified_hash_hex;
 };
 
 /// Per-call knobs for `verify_password_with_lockout`. The defaults are the
@@ -163,14 +178,15 @@ struct PasswordCheckOptions {
 using PasswordVerifyFn = std::function<PasswordCheckResult(
     const std::string& username, const std::string& password, const httplib::Request& req)>;
 
-/// Mint a replacement LOCAL session for `username` and return the COMPLETE
-/// `Set-Cookie` header value (`yuzu_session=<token>` + the same attributes as
-/// `POST /login`), or "" when no session could be minted (durable-persist
-/// failure or the post-mint role recheck denied). Owned by `AuthRoutes` so
-/// cookie formatting lives in exactly one class (#5342 — RestApiV1 never
-/// formats a session cookie).
-using SessionCookieMintFn =
-    std::function<std::string(const std::string& username, auth::Role role, bool mfa_verified)>;
+/// Verdict of `AuthRoutes::sso_only_local_password_gate` (#5342 Gate 7, C8):
+/// may a LOCAL password be evaluated for this username right now?
+enum class SsoOnlyLocalGate : std::uint8_t {
+    kOpen,            ///< not in `--auth-mode=sso-only`: local passwords are live
+    kBreakGlassArmed, ///< sso-only, but this is the configured break-glass account AND
+                      ///< it is currently armed — the one local password that is live
+    kRefused,         ///< sso-only and not an armed break-glass account (or the arm
+                      ///< state could not be read — fail CLOSED): never evaluate PBKDF2
+};
 
 /// Extracted auth helpers and route handlers (Phase 2 of god-object decomposition).
 ///
@@ -578,20 +594,25 @@ public:
 
     /// `verify_password_with_lockout` bound with the self-service
     /// password-change options (metric route `password_change`, the sso-only
-    /// break-glass lockout exemption mirrored from `/login`). Handed to
-    /// `RestApiV1::set_password_change_deps`. Captures `this`; the caller
-    /// keeps this AuthRoutes alive for the route table's lifetime (ServerImpl
-    /// owns both).
+    /// break-glass lockout exemption mirrored from `/login`, and
+    /// `sso_only_local_password_gate` as the `pre_verify_gate` — so under
+    /// sso-only a disarmed break-glass session can neither guess nor lock the
+    /// account through this route: `kGateRejected` before any PBKDF2 or
+    /// lockout write). Handed to `RestApiV1::set_password_change_deps`.
+    /// Captures `this`; the caller keeps this AuthRoutes alive for the route
+    /// table's lifetime (ServerImpl owns both).
     [[nodiscard]] PasswordVerifyFn password_change_verify_fn();
 
-    /// Mint a local session and format its `Set-Cookie` value — see
-    /// `SessionCookieMintFn`. "" on failure.
-    [[nodiscard]] std::string mint_local_session_cookie(const std::string& username,
-                                                        auth::Role role, bool mfa_verified);
-
-    /// `mint_local_session_cookie` as a `SessionCookieMintFn` (captures
-    /// `this`, same lifetime contract as `password_change_verify_fn`).
-    [[nodiscard]] SessionCookieMintFn session_cookie_mint_fn();
+    /// The ONE "may a local password be evaluated for `username`" decision
+    /// under `--auth-mode=sso-only` (#5342 Gate 7, C8 — extracted from POST
+    /// /login's hardened-mode gate so the self-service password change cannot
+    /// drift from it). Reads the break-glass arm state from AuthDB and fails
+    /// CLOSED (`kRefused`) on a read error or with no AuthDB: unlike lockout,
+    /// this gate IS the credential path. Pure decision — writes no response,
+    /// metric, log or audit; each caller keeps its own (`/login` its generic
+    /// 401 + `yuzu_auth_local_disabled_total`; the password route its 403
+    /// `sso_only_local_disabled`).
+    [[nodiscard]] SsoOnlyLocalGate sso_only_local_password_gate(const std::string& username);
 
     /// Construct an AuditEvent from HTTP request context.
     AuditEvent make_audit_event(const httplib::Request& req, const std::string& action,
@@ -802,6 +823,13 @@ private:
     struct MfaPending {
         std::string username;
         auth::Role role{auth::Role::user};
+        /// #5342 Gate 7 (B4): the stored hash the step-1 password was verified
+        /// against (`PasswordCheckResult::verified_hash_hex`). Handed to
+        /// `create_local_session` at step 2, whose post-mint recheck denies if
+        /// the stored hash has since changed — so a pending login proven with
+        /// the OLD password cannot be completed after an admin reset or a
+        /// self-change. Credential material: never logged or serialised.
+        std::string hash_hex;
         std::chrono::steady_clock::time_point expires_at{};
         int attempts{0};
         /// Default is a login challenge. Each endpoint rejects the other's

@@ -3042,6 +3042,26 @@ public:
         // #5342/#5274: a credential check that passed against the hash it read,
         // then found a different hash under the row lock (the password changed
         // mid-login), and was denied. Unlabelled; pre-seeded to 0.
+        // #5342 Gate 7: a password change/reset whose mandatory audit row
+        // could not be persisted AND whose compensating rollback ALSO failed —
+        // the new password is in effect with no audit evidence. Should never
+        // move; any increment pages (YuzuPasswordChangeUnrecorded). Closed
+        // 2-value set, pre-seeded so increase() sees the first event.
+        metrics_.describe("yuzu_auth_password_change_unrecorded_total",
+                          "Password changes/resets now in effect with NO audit row (audit write "
+                          "and rollback both failed), by kind (self|admin)",
+                          "counter");
+        for (auto kind : {"self", "admin"})
+            metrics_.counter("yuzu_auth_password_change_unrecorded_total", {{"kind", kind}});
+        // #5274: cfg users whose yuzu-server.cfg hash differs from their
+        // auth.users row at boot (dead cfg credentials; the stored one wins).
+        // Set once by AuthManager::report_stale_cfg_credentials after
+        // set_auth_db; pre-seeded to 0 for cfg-file-only boots.
+        metrics_.describe("yuzu_auth_cfg_credentials_stale",
+                          "yuzu-server.cfg users whose password hash differs from the auth "
+                          "store at boot (the cfg is seed-only; the stored credential wins)",
+                          "gauge");
+        metrics_.gauge("yuzu_auth_cfg_credentials_stale").set(0.0);
         metrics_.describe("yuzu_auth_credential_changed_during_verify_total",
                           "Password verifications denied because the stored hash changed "
                           "between the verify read and the row-locked recheck",
@@ -4901,6 +4921,13 @@ public:
                         startup_failed_ = true;
                     } else {
                         auth_mgr_.set_auth_db(auth_db_.get());
+                        // #5274 (#5342 Gate 7): the cfg file is seed-only now
+                        // that AuthDB is wired — warn, by name, about any cfg
+                        // user whose stored credential has since diverged, and
+                        // publish the count. Before any listener binds, so no
+                        // login has hydrated users_ yet (it holds cfg entries
+                        // only).
+                        (void)auth_mgr_.report_stale_cfg_credentials();
 
                         // WS-6 6.2: one-time import of the legacy per-replica
                         // enrollment-tokens.cfg / pending-agents.cfg into Postgres.
@@ -19178,15 +19205,31 @@ private:
         rest_api_v1_->set_all_agent_ids_fn([this] { return registry_.all_ids(); });
         // #5342 — POST /api/v1/users/me/password + /api/v1/users/{name}/password.
         // The current-password proof is AuthRoutes' lockout-accounted check
-        // (the SAME section POST /login runs — never a second copy) and the
-        // replacement session cookie is minted + formatted by AuthRoutes; both
-        // capture auth_routes_ (constructed above, outlives the route table).
+        // (the SAME section POST /login runs — never a second copy); it and the
+        // principal-explicit audit writer capture auth_routes_ (constructed
+        // above, outlives the route table). No session cookie is minted here
+        // any more: a self-change revokes every session and the user signs in
+        // again (#5342 Gate 7).
         // The CSRF same-site gate uses the same trusted-origin allowlist as the
         // dashboard/CA cookie POSTs (#2537). MUST run BEFORE register_routes(),
         // same timing contract as the setters above.
+        // #5342 Gate 7: every audit row those routes write names the principal
+        // captured BEFORE they revoke the caller's sessions (the routes revoke
+        // first, so a session-resolving audit_fn would stamp an empty
+        // principal afterwards) — hence AuthRoutes::audit_log_for_principal.
+        // The break-glass account is refused as an admin-reset target.
         rest_api_v1_->set_password_change_deps(RestApiV1::PasswordChangeDeps{
             &auth_mgr_, auth_routes_->password_change_verify_fn(),
-            auth_routes_->session_cookie_mint_fn()});
+            [ar = auth_routes_.get()](const httplib::Request& req, const std::string& action,
+                                      const std::string& result, const std::string& principal,
+                                      const std::string& principal_role,
+                                      const std::string& target_type,
+                                      const std::string& target_id, const std::string& detail) {
+                return ar->audit_log_for_principal(req, action, result, principal,
+                                                   principal_role, target_type, target_id,
+                                                   detail);
+            },
+            cfg_.break_glass_user});
         rest_api_v1_->set_csrf_trusted_origins(cfg_.csrf_trusted_origins);
         rest_api_v1_->register_routes(
             *web_server_,

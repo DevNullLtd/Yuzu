@@ -426,7 +426,7 @@ struct JitHarness {
     // elevation step-up passes; false leaves the epoch sentinel (stale) to
     // exercise the step-up challenge.
     std::string session_for(const std::string& u, Role r = Role::user, bool fresh_mfa = true) {
-        return auth_mgr.create_local_session(u, r, fresh_mfa);
+        return auth_mgr.create_local_session_for_test(u, r, fresh_mfa);
     }
 
     // An OIDC-authenticated cookie session whose display name is `u`. NOTE: post
