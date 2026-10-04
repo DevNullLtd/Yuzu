@@ -14320,7 +14320,22 @@ McpServer::HandlerFn McpServer::build_handler(
                 GuaranteedStateRuleRow row;
                 row.rule_id = param_str(args, "rule_id");
                 row.name = param_str(args, "name");
-                row.version = param_int(args, "version", 1);
+                // Strict and bounded: an update bumps the stored version by one, so a
+                // caller-chosen value near INT64_MAX would overflow that increment. The
+                // schema says minimum 1; the ceiling is INT32_MAX (a counter nothing
+                // reaches by bumping).
+                const auto version_opt = param_int_strict(args, "version", 1);
+                if (!version_opt || *version_opt < 1 ||
+                    *version_opt > std::numeric_limits<int>::max()) {
+                    res.set_content(
+                        // retry-hint-exempt: caller-input rejection, not a store/query fault -
+                        // resending the identical value cannot succeed.
+                        error_response(id, kInvalidParams,
+                                       "version must be a JSON integer from 1 to 2147483647"),
+                        "application/json");
+                    return;
+                }
+                row.version = *version_opt;
                 row.enabled = args.value("enabled", true);
                 row.enforcement_mode = param_str(args, "enforcement_mode", "enforce");
                 row.severity = param_str(args, "severity", "medium");
@@ -14546,6 +14561,17 @@ McpServer::HandlerFn McpServer::build_handler(
                 updated.os_target = param_str(args, "os_target", existing_rule.os_target.c_str());
                 updated.scope_expr =
                     param_str(args, "scope_expr", existing_rule.scope_expr.c_str());
+                if (existing_rule.version >= std::numeric_limits<int64_t>::max()) {
+                    // Only reachable for a row written out of band: create is capped at
+                    // INT32_MAX. Refuse rather than overflow the signed increment.
+                    res.set_content(
+                        // retry-hint-exempt: the stored version counter is exhausted; a retry
+                        // cannot succeed.
+                        error_response(id, kInvalidParams,
+                                       "rule version counter exhausted; recreate the rule"),
+                        "application/json");
+                    return;
+                }
                 updated.version = existing_rule.version + 1;
 
                 auto spec = ::yuzu::server::guardian::derive_rule_spec(
@@ -20853,7 +20879,25 @@ McpServer::HandlerFn McpServer::build_handler(
                 params.expected_sha256 = param_str(args, "expected_sha256");
                 params.retention_class = param_str(args, "retention_class");
                 params.minted_by = session->username;
-                params.declared_max_size = param_int(args, "declared_max_size");
+                // Strict: a wrong-typed or above-INT64_MAX value is rejected here. The
+                // lenient reader saturated an unsigned overflow to INT64_MAX, which the
+                // store accepts (it only rejects <= 0), minting a grant with no real
+                // size limit where the old wrap to -1 was refused. The store has no
+                // ceiling of its own, and none is invented here: a positive int64 is a
+                // legitimate declared size.
+                const auto declared_opt = param_int_strict(args, "declared_max_size", 0);
+                if (!declared_opt) {
+                    res.set_content(
+                        // retry-hint-exempt: caller-input type rejection, not a
+                        // store/query fault - resending the identical malformed
+                        // argument cannot succeed.
+                        error_response(id, kInvalidParams,
+                                       "declared_max_size must be a JSON integer that fits in a "
+                                       "signed 64-bit value"),
+                        "application/json");
+                    return;
+                }
+                params.declared_max_size = *declared_opt;
                 if (args.contains("ttl_secs") && args["ttl_secs"].is_number_integer())
                     params.requested_ttl_secs = args["ttl_secs"].get<std::int64_t>();
                 auto minted = upload_grant_store_->mint(params, now_epoch());
@@ -21719,7 +21763,20 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
-                const int batch_size = saturate_to_int(*batch_size_opt);
+                // The tool schema declares 1..10000. Saturating a huge value to INT_MAX
+                // (the old wrap to 0 was rejected by the store) would make the offload
+                // buffer, which flushes only when it reaches batch_size and has no other
+                // cap, grow without bound, so enforce the declared range here.
+                if (*batch_size_opt < 1 || *batch_size_opt > 10000) {
+                    res.set_content(
+                        // retry-hint-exempt: caller-input range rejection, not a
+                        // store/query fault - resending the identical value cannot succeed.
+                        error_response(id, kInvalidParams,
+                                       "batch_size must be an integer from 1 to 10000"),
+                        "application/json");
+                    return;
+                }
+                const int batch_size = static_cast<int>(*batch_size_opt);
                 // Gate 8 fix (#2146 Batch B5 review): same #2970B-class type
                 // confusion as batch_size two lines above, but fail-OPEN here
                 // - {"enabled":"false"} (a JSON string) silently created an

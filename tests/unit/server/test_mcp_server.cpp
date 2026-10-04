@@ -4804,6 +4804,44 @@ TEST_CASE("MCP Guardian: create_guardian_rule creates a legacy yaml_source rule,
     CHECK(get_data["yaml_source"] == "# legacy\n");
 }
 
+// #4644 Gate 8 round 2: an update bumps the stored version by one, so a lenient read
+// that saturated an above-INT64_MAX `version` to INT64_MAX made the next bump a signed
+// overflow. Strict and bounded to 1..INT32_MAX instead.
+TEST_CASE("MCP Guardian: create_guardian_rule bounds version to 1..2147483647",
+          "[pg][mcp][integration][guardian]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_read_twins_pg_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    McpTestServer ts;
+    ts.guaranteed_state_store_for_test = &store;
+    ts.start("");
+    int rpc_id = 300;
+    auto create = [&](const std::string& rid, const std::string& version_json) {
+        const std::string body =
+            R"({"jsonrpc":"2.0","method":"tools/call","id":)" + std::to_string(++rpc_id) +
+            R"(,"params":{"name":"create_guardian_rule","arguments":{"rule_id":")" + rid +
+            R"(","name":"n-)" + rid + R"(","yaml_source":"# legacy\n","version":)" +
+            version_json + R"(}}})";
+        auto res = ts.call(body);
+        REQUIRE(res);
+        return nlohmann::json::parse(res->body);
+    };
+    for (const char* bad : {"0", "-1", "2147483648", "4294967296", "9223372036854775807",
+                            "18446744073709551615", "\"3\"", "1.5"}) {
+        INFO("version=" << bad);
+        auto b = create(std::string("v-bad-") + std::to_string(rpc_id), bad);
+        REQUIRE(b.contains("error"));
+        CHECK(b["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+        CHECK(b["error"]["message"].get<std::string>().find("1 to 2147483647") !=
+              std::string::npos);
+    }
+    for (const char* ok : {"1", "2147483647"}) {
+        INFO("version=" << ok);
+        auto b = create(std::string("v-ok-") + ok, ok);
+        CHECK_FALSE(b.contains("error"));
+    }
+}
+
 TEST_CASE("MCP Guardian: create_guardian_rule denies a service-scoped token "
           "(fleet-wide authoring, no per-service slice to confine to)",
           "[mcp][integration][guardian][security]") {
@@ -19120,6 +19158,46 @@ TEST_CASE("MCP operator surface: mint_upload_grant writes a real UploadGrantStor
     CHECK(ts.audit_log[1] == "mcp.mint_upload_grant|success");
 }
 
+// #4644 Gate 8 round 2: a lenient read saturated an above-INT64_MAX declared_max_size
+// to INT64_MAX, which the store accepts (it only rejects <= 0); the old wrap to -1 was
+// refused. Strict now: reject the value, accept every positive int64 below it.
+TEST_CASE("MCP operator surface: mint_upload_grant rejects a declared_max_size that does not "
+          "fit a signed 64-bit integer",
+          "[pg][mcp][integration][operator_surface]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, operator_surface_uploadgrant_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::UploadGrantStore store{pool};
+    REQUIRE(store.is_open());
+    McpTestServer ts;
+    ts.upload_grant_store_for_test = &store;
+    ts.start();
+    int rpc_id = 0;
+    auto mint = [&](const std::string& size_json) {
+        const std::string body =
+            R"({"jsonrpc":"2.0","method":"tools/call","id":)" + std::to_string(++rpc_id) +
+            R"(,"params":{"name":"mint_upload_grant","arguments":{"agent_id":"agent-strict",)"
+            R"("declared_max_size":)" + size_json + R"(}}})";
+        auto res = ts.call(body);
+        REQUIRE(res);
+        return nlohmann::json::parse(res->body);
+    };
+    for (const char* bad : {"18446744073709551615", "9223372036854775808", "\"4096\"", "4096.5"}) {
+        INFO("declared_max_size=" << bad);
+        auto b = mint(bad);
+        REQUIRE(b.contains("error"));
+        CHECK(b["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+        CHECK(b["error"]["message"].get<std::string>().find("signed 64-bit") !=
+              std::string::npos);
+    }
+    auto ok = mint("4294967296");  // > INT_MAX is a legitimate size (4 GiB)
+    CHECK_FALSE(ok.contains("error"));
+    auto rows = store.list_for_agent("agent-strict");
+    REQUIRE(rows.has_value());
+    REQUIRE(rows->size() == 1);
+    CHECK((*rows)[0].declared_max_size == 4294967296LL);
+}
+
 TEST_CASE("MCP operator surface: list_upload_grants is confined to what's actually in the "
           "store — a live read, not a cached view",
           "[pg][mcp][integration][operator_surface]") {
@@ -31713,6 +31791,46 @@ TEST_CASE("MCP B5: create_offload_target rejects a non-integer batch_size",
     REQUIRE(body.contains("error"));
     CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
     CHECK(body["error"]["message"].get<std::string>().find("batch_size") != std::string::npos);
+}
+
+// #4644 Gate 8 round 2: the tool schema declares batch_size 1..10000. The saturating
+// narrowing turned 4294967296 (and UINT64_MAX) into INT_MAX, an accepted value that
+// lets the offload buffer grow without bound before its first flush. Enforce the range.
+TEST_CASE("MCP B5: create_offload_target enforces batch_size 1..10000 and rejects the "
+          "values a narrowing would alias",
+          "[pg][mcp][integration][b5]") {
+    yuzu::test::OffloadTargetStorePg store;
+    McpTestServer ts;
+    ts.offload_target_store_for_test = store.get();
+    ts.start();
+    int rpc_id = 0;
+    auto create = [&](const std::string& name, const std::string& batch_json) {
+        const std::string body =
+            R"({"jsonrpc":"2.0","method":"tools/call","id":)" + std::to_string(++rpc_id) +
+            R"(,"params":{"name":"create_offload_target","arguments":{"name":")" + name +
+            R"(","url":"https://example.com/hook","batch_size":)" + batch_json + R"(}}})";
+        auto res = ts.call(body);
+        REQUIRE(res);
+        return nlohmann::json::parse(res->body);
+    };
+    for (const char* bad : {"0", "-1", "10001", "2147483648", "4294967296",
+                            "18446744073709551615", "9223372036854775807"}) {
+        INFO("batch_size=" << bad);
+        auto b = create(std::string("bad-") + bad, bad);
+        REQUIRE(b.contains("error"));
+        CHECK(b["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+        // An unsigned value above INT64_MAX is refused earlier, as not representable;
+        // every other bad value reaches the range check.
+        const auto msg = b["error"]["message"].get<std::string>();
+        CHECK(msg.find(std::string_view(bad) == "18446744073709551615" ? "JSON integer"
+                                                                         : "1 to 10000") !=
+              std::string::npos);
+    }
+    for (const char* ok : {"1", "10000"}) {
+        INFO("batch_size=" << ok);
+        auto b = create(std::string("ok-") + ok, ok);
+        CHECK_FALSE(b.contains("error"));
+    }
 }
 
 // Gate 8 fix (#2146 Batch B5 review): fail-OPEN type confusion - a
