@@ -12490,6 +12490,8 @@ TEST_CASE("#4508 CH-2: candidate reads follow claim outcomes and dispatch state"
 // Every case here is `[liveness]`; positives use spin_until, deadline expiries are polled on
 // the TARGET receipt, and each rig clears the index-release seam FIRST so a failing
 // assertion can neither leave releases failing nor leave a worker parked.
+// The tombstone shapes below are produced only by the index-release test seam: production
+// erase_rule is noexcept, so a release cannot fail outside these tests.
 // ---------------------------------------------------------------------------
 namespace {
 /// SeamRig4605 (hung head `h` on key /a, 30 s deadline) plus the shared #5322 steps. The
@@ -12584,9 +12586,18 @@ struct PoolTomb5322 {
 };
 } // namespace
 
+// #5322: the registry cross-structure invariant checker (a test-only diagnostic) as a REQUIRE
+// whose failure prints the violation lines. The `ORPHANS_OK` form accepts a refcount-0 keys_
+// entry that no heartbeat pass has healed yet.
+#define REQUIRE_REGISTRY_INVARIANTS_5322(rtref) \
+    REQUIRE((rtref).invariant_violations_for_test() == std::vector<std::string>{})
+#define REQUIRE_REGISTRY_INVARIANTS_ORPHANS_OK_5322(rtref) \
+    REQUIRE((rtref).invariant_violations_for_test(true) == std::vector<std::string>{})
+
 // Guard isolation: this case does NOT isolate try_dispatch_head_locked's is_dead_claim
 // guard. Its tombstone is a withdrawn one (a detach whose index release failed), and it
-// observes the backend arm count and the receipt statuses only, so removing just that guard
+// asserts the backend arm count, the receipt statuses, the queue depth and
+// retained_tombstones (it counts no dispatcher entries), so removing just that guard
 // leaves it green: dispatch_arm_off_lock's entry guard (withdrawn / commit_exception) still
 // keeps the tombstone from reaching the backend. The dispatch_entries assertion in the
 // "behind a committed head" case below is what isolates the selector guard.
@@ -12973,6 +12984,7 @@ TEST_CASE("#5322: an attach on a committed key behind a tombstone joins the watc
     CHECK(f.rt->rule_count() == 2);
     CHECK(f.b->arm_entries.load() == 1);
     CHECK(f.b->disarms.load() == 0);
+    REQUIRE_REGISTRY_INVARIANTS_5322(*f.rt);
 }
 
 // Pins clause (1) of the committed-key invariant: the fault-2 gap leaves H committed in
@@ -13022,6 +13034,7 @@ TEST_CASE("#5322: an attach in the commit-to-publish gap joins the committed wat
     CHECK(b->disarms.load() == 0);
     CHECK(rt->armed_key_count() == 1);
     CHECK(rt->rule_count() == 2);
+    REQUIRE_REGISTRY_INVARIANTS_5322(*rt);
 }
 
 // A refcount-0 orphan (keys_[K] present, no rules on K, an empty claims entry) is joined by
@@ -13066,6 +13079,7 @@ TEST_CASE("#5322: an attach on an orphan watcher joins it instead of arming over
     CHECK(f.b->arms.load() == 1);
     CHECK(f.b->disarms.load() == 0);
     CHECK(f.rt->orphan_disarms_started() == 0); // refcount 1: not an orphan any more
+    REQUIRE_REGISTRY_INVARIANTS_5322(*f.rt);
 }
 
 // Lost never leaves keys_ holding the dead id. Three orders of the detach loop, then the
@@ -13102,6 +13116,7 @@ TEST_CASE("#5322: Lost with the ghost detached first leaves no dead watcher and 
     // apart by the backend arm count below.
     REQUIRE(yuzu::test::spin_until([&] { return f.b->arms.load() == 2; }, 10s));
     REQUIRE(yuzu::test::spin_until([&] { return f.rt->armed_key_count() == 1; }, 10s));
+    REQUIRE_REGISTRY_INVARIANTS_5322(*f.rt);
 }
 
 TEST_CASE("#5322: Lost with the ghost detached last leaves no dead watcher and the key re-arms",
@@ -13144,6 +13159,7 @@ TEST_CASE("#5322: Lost with the ghost detached last leaves no dead watcher and t
     // apart by the backend arm count below.
     REQUIRE(yuzu::test::spin_until([&] { return f.b->arms.load() == 2; }, 10s));
     REQUIRE(yuzu::test::spin_until([&] { return f.rt->armed_key_count() == 1; }, 10s));
+    REQUIRE_REGISTRY_INVARIANTS_5322(*f.rt);
 }
 
 TEST_CASE("#5322: Lost on an orphan watcher with no rules erases the dead watcher",
@@ -13183,6 +13199,99 @@ TEST_CASE("#5322: Lost on an orphan watcher with no rules erases the dead watche
     REQUIRE(yuzu::test::spin_until([&] { return f.b->arms.load() == 2; }, 10s));
     REQUIRE(yuzu::test::spin_until([&] { return f.rt->armed_key_count() == 1; }, 10s));
     CHECK(f.rt->rule_count() == 1);
+    REQUIRE_REGISTRY_INVARIANTS_5322(*f.rt);
+}
+
+// The last-on-key sweep can RELEASE the detaching rule's own owner tombstone (the seam has
+// cleared since the tombstone was retained). remove_rule then finds no mapping and returns
+// nullopt although the key's last rule is going: the teardown is owed iff this was the key's
+// last rule, which the pre-sweep refcount says, not remove_rule's return. A live assert on the
+// two agreeing used to abort the agent (SIGABRT) here. Both cases must never set
+// arm_park.park_every: the disarm below runs synchronously under the registry lock.
+TEST_CASE("#5322: Lost where the sweep releases the ghost's own tombstone tears the key down without aborting",
+          "[spark][runtime][liveness]") {
+    using namespace std::chrono_literals;
+    using RT = GuardianSparkRuntime;
+    TombRig5322 f;
+    // "z_ghost" detaches after "a_live" (rules_for(K) is sorted).
+    f.attach("a_live");
+    REQUIRE(f.b->wait_entered_hang(10s));
+    f.attach("z_ghost");
+    f.rt->set_index_remove_fault_count_for_test(-1);
+    f.rt->detach_rule("z_ghost");
+    REQUIRE(f.depth() == 2);
+    REQUIRE(f.rt->retained_tombstones() == 1);
+    f.commit_head_leaving_tombstone();
+    const auto sub = f.b->armed_ids().at(0);
+    const auto residue_before = f.rt->detach_sweep_left_residue();
+    const auto claim_failures_before = f.rt->detach_claim_failures();
+    const auto skipped_before = f.rt->dead_subscription_disarms_skipped();
+
+    f.rt->set_index_remove_fault_count_for_test(0); // the sweep now SUCCEEDS
+    f.rt->on_event(SparkEvent{.key = f.key, .kind = SparkEventKind::Lost, .subscription_id = sub});
+    CHECK(f.rt->armed_key_count() == 0);
+    CHECK(f.rt->rule_count() == 0);
+    CHECK(f.rt->dead_watchers_erased_on_lost() == 0); // the detach loop erased keys_ itself
+    CHECK(f.rt->detach_sweep_left_residue() == residue_before);
+    CHECK(f.rt->detach_claim_failures() == claim_failures_before);
+    CHECK(f.rt->dead_subscription_disarms_skipped() == skipped_before + 1);
+    CHECK(f.b->disarms.load() == 0); // the dead id is never disarmed
+    CHECK(f.depth() == 0);
+    CHECK(f.rt->retained_tombstones() == 0);
+    REQUIRE_REGISTRY_INVARIANTS_5322(*f.rt);
+
+    // The dead subscription is not left in keys_: a fresh attach arms anew (arms 2), it does
+    // not join the dead watcher (arms would stay 1).
+    auto w = f.rt->attach_rule(RT::NonWaiting{}, "w", file_spec("/a"), file_exists_rule("w"), true);
+    REQUIRE(w.has_value());
+    REQUIRE(yuzu::test::spin_until([&] { return f.b->arms.load() == 2; }, 10s));
+    REQUIRE(yuzu::test::spin_until([&] { return f.rt->armed_key_count() == 1; }, 10s));
+    REQUIRE(yuzu::test::spin_until([&] { return f.rt->rule_count() == 1; }, 10s));
+
+    (void)f.rt->expire_overdue_claims();
+    CHECK(f.rt->orphan_disarms_started() == 0); // nothing was left for the orphan pass
+    CHECK(f.rt->armed_key_count() == 1);
+    REQUIRE_REGISTRY_INVARIANTS_5322(*f.rt);
+}
+
+TEST_CASE("#5322: a same-rule re-attach where the sweep releases its own tombstone tears the key down without aborting",
+          "[spark][runtime][liveness]") {
+    using namespace std::chrono_literals;
+    TombRig5322 f;
+    f.attach("y");
+    REQUIRE(f.b->wait_entered_hang(10s));
+    f.attach("z");
+    f.rt->set_index_remove_fault_count_for_test(-1);
+    f.rt->detach_rule("z"); // z's claim: a retained tombstone behind y
+    REQUIRE(f.depth() == 2);
+    REQUIRE(f.rt->retained_tombstones() == 1);
+    f.commit_head_leaving_tombstone();
+
+    // y goes: z's ghost mapping is the key's only one, so keys_ is an orphan watcher.
+    f.rt->detach_rule("y");
+    REQUIRE(f.rt->armed_key_count() == 1);
+    REQUIRE(f.b->disarms.load() == 0);
+
+    f.rt->set_index_remove_fault_count_for_test(0); // z's own re-attach sweep now SUCCEEDS
+    const auto residue_before = f.rt->detach_sweep_left_residue();
+    const auto claim_failures_before = f.rt->detach_claim_failures();
+    // No kind assertion: queued behind the teardown (Accepted) or already committed are both
+    // a fresh arm; the backend counts below tell a join apart.
+    auto z = f.rt->attach_rule(GuardianSparkRuntime::NonWaiting{}, "z", file_spec("/a"),
+                               file_exists_rule("z"), true);
+    REQUIRE(z.has_value());
+    CHECK(f.rt->detach_sweep_left_residue() == residue_before);
+    CHECK(f.rt->detach_claim_failures() == claim_failures_before);
+    REQUIRE(yuzu::test::spin_until([&] { return f.b->disarms.load() == 1; }, 10s));
+    REQUIRE(yuzu::test::spin_until([&] { return f.b->arms.load() == 2; }, 10s));
+    REQUIRE(yuzu::test::spin_until([&] { return f.rt->rule_count() == 1; }, 10s));
+    REQUIRE(yuzu::test::spin_until([&] { return f.depth() == 0; }, 10s));
+    CHECK(f.rt->retained_tombstones() == 0);
+    CHECK(f.rt->armed_key_count() == 1);
+    (void)f.rt->expire_overdue_claims();
+    CHECK(f.rt->orphan_disarms_started() == 0);
+    CHECK(f.rt->armed_key_count() == 1);
+    REQUIRE_REGISTRY_INVARIANTS_5322(*f.rt);
 }
 
 // ---------------------------------------------------------------------------
@@ -13255,6 +13364,7 @@ TEST_CASE("#5322: an orphan watcher whose last mapping was released late is disa
     REQUIRE(yuzu::test::spin_until([&] { return f.rt->rule_count() == 1; }, 10s));
     CHECK(f.rt->armed_key_count() == 1);
     CHECK(f.rt->orphan_disarms_started() == 1);
+    REQUIRE_REGISTRY_INVARIANTS_5322(*f.rt);
 }
 
 TEST_CASE("#5322: the orphan pass never disarms a key that still has a rule", "[spark][runtime][liveness]") {
@@ -13316,6 +13426,7 @@ TEST_CASE("#5322: an attach after the orphan teardown arms a fresh watcher and d
     const auto armed = f.b->armed_ids();
     CHECK(f.b->disarmed_ids() == std::vector<std::uint64_t>{armed.at(0)});
     CHECK(f.b->disarms.load() == 1);
+    REQUIRE_REGISTRY_INVARIANTS_5322(*f.rt);
 }
 
 TEST_CASE("#5322: a throw building one orphan's Disarm leaves keys_ owning the watcher and the next pass retries",
@@ -13330,6 +13441,10 @@ TEST_CASE("#5322: a throw building one orphan's Disarm leaves keys_ owning the w
     CHECK(f.rt->claim_drain_failures() == failures_before + 1);
     CHECK(f.rt->armed_key_count() == 1); // keys_ still owns the watcher
     CHECK(f.depth() == 0);               // no claim, no empty entry
+    // The unhealed orphan is exactly what the checker reports, and exactly what it accepts when
+    // told an orphan is expected here.
+    CHECK(f.rt->invariant_violations_for_test().size() == 1);
+    REQUIRE_REGISTRY_INVARIANTS_ORPHANS_OK_5322(*f.rt);
     CHECK(f.rt->orphan_disarms_started() == 0);
     CHECK(f.b->disarms.load() == 0);
 
@@ -13338,6 +13453,7 @@ TEST_CASE("#5322: a throw building one orphan's Disarm leaves keys_ owning the w
     CHECK(f.rt->orphan_disarms_started() == 1);
     REQUIRE(yuzu::test::spin_until([&] { return f.b->disarms.load() == 1; }, 10s));
     CHECK(f.rt->claim_drain_failures() == failures_before + 1);
+    REQUIRE_REGISTRY_INVARIANTS_5322(*f.rt);
 }
 
 TEST_CASE("#5322: a throw in the orphan pass's off-lock collection push leaves the Disarm durable and redriven",
@@ -13362,6 +13478,7 @@ TEST_CASE("#5322: a throw in the orphan pass's off-lock collection push leaves t
     const auto armed = f.b->armed_ids();
     REQUIRE(armed.size() == 1);
     CHECK(f.b->disarmed_ids() == armed);
+    REQUIRE_REGISTRY_INVARIANTS_5322(*f.rt);
 }
 
 // The throw is at the TOP of the orphan pass, outside the per-orphan try (point 13 cannot show
@@ -13426,6 +13543,26 @@ TEST_CASE("#5322: a throw in the orphan pass itself does not strand the reaper's
     CHECK(rt.orphan_disarms_started() == 1);
     REQUIRE(yuzu::test::spin_until([&] { return f.rig.b->disarms.load() == 1; }, 10s));
     CHECK(rt.armed_key_count() == 5);
+    REQUIRE_REGISTRY_INVARIANTS_5322(rt);
+}
+
+// begin_stop owns the shutdown path: an orphan pass after it starts no teardown (a queued
+// Disarm would be dropped by the stopped runtime anyway), and nothing here relies on the
+// runtime being usable after stop.
+TEST_CASE("#5322: the orphan pass is inert once the runtime is stopping",
+          "[spark][runtime][liveness]") {
+    TombRig5322 f;
+    orphan_after_redrive_5322(f);
+    f.rt->begin_stop();
+    const auto armed_before = f.rt->armed_key_count();
+    const auto disarms_before = f.b->disarms.load();
+    REQUIRE(armed_before == 1); // the orphan watcher is still in keys_
+
+    (void)f.rt->expire_overdue_claims();
+    CHECK(f.rt->orphan_disarms_started() == 0);
+    CHECK(f.depth() == 0); // no Disarm claim was queued
+    CHECK(f.rt->armed_key_count() == armed_before);
+    CHECK(f.b->disarms.load() == disarms_before);
 }
 
 // ---------------------------------------------------------------------------
@@ -13569,6 +13706,68 @@ TEST_CASE("#5322: a blocking waiter is woken by the pass that reaper-synthesizes
     // woken by it, not at its own 30 s deadline.
     CHECK(rt->expire_overdue_claims() == 0);
     CHECK(rt->claim_queue_depth_for_test(key) == 0);
+    REQUIRE(yuzu::test::spin_until([&] { return waiter_done.load(std::memory_order_acquire); },
+                                   2s));
+    waiter.join();
+    REQUIRE(waiter_result.has_value());
+    REQUIRE_FALSE(waiter_result->has_value());
+    CHECK(waiter_result->error() == "arm drain failed");
+}
+
+TEST_CASE("#5322: a blocking waiter is woken by a synthesizing pass even when the reaper's own release fails",
+          "[spark][runtime][liveness]") {
+    using namespace std::chrono_literals;
+    using RT = GuardianSparkRuntime;
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    // A LONG deadline: a missed notify leaves the waiter asleep far past the 2 s bound
+    // below, so the failure is unambiguous (the waiter is never woken by its own deadline).
+    auto rt = make_rt(r, b, RT::Config{.backend_op_deadline = 30s});
+    const auto key = spark_key(file_spec("/a"));
+
+    // The up-4 double-fault construction (see the "up-4 (#4221)" case above), but with the
+    // BLOCKING attach_rule overload on its own thread: fault point 1 fails the initial
+    // staging, the gap hook re-arms fault point 7 so the firewall loop throws after
+    // release_claim_index_locked failed (index_remove_fault) and marked the claim
+    // withdrawn+Queued, before its outcome is written. The waiter's claim is that residue.
+    std::atomic<bool> hook_fired{false};
+    rt->set_index_remove_fault_count_for_test(-1); // sticky: the reaper's releases fail too
+    rt->set_drain_fault_point_for_test(1);
+    rt->set_drain_gap_hook_for_test([&] {
+        rt->set_drain_fault_point_for_test(7);
+        hook_fired.store(true, std::memory_order_release);
+    });
+
+    std::atomic<bool> waiter_done{false};
+    std::optional<std::expected<std::uint64_t, std::string>> waiter_result;
+    std::thread waiter([&] {
+        waiter_result = rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true);
+        waiter_done.store(true, std::memory_order_release);
+    });
+    // On EVERY exit path (a RED run included): stop the runtime so a still-blocked waiter
+    // returns "stopping" instead of sleeping out its 30 s deadline, then join it.
+    yuzu::test::ScopeExit cleanup{[&] {
+        rt->set_index_remove_fault_count_for_test(0);
+        rt->set_drain_gap_hook_for_test({});
+        rt->begin_stop();
+        if (waiter.joinable())
+            waiter.join();
+    }};
+
+    REQUIRE(yuzu::test::spin_until([&] { return hook_fired.load(std::memory_order_acquire); },
+                                   10s));
+    // The compensating disarm has run (compensation_finished) and the residue is in place:
+    // one Queued claim, no outcome, so the waiter is still blocked.
+    REQUIRE(yuzu::test::spin_until([&] { return b->disarms.load() == 1; }, 10s));
+    REQUIRE(yuzu::test::spin_until([&] { return rt->claim_queue_depth_for_test(key) == 1; }, 10s));
+    REQUIRE_FALSE(waiter_done.load(std::memory_order_acquire));
+
+    // The seam stays sticky through the pass, so the reaper's own release of the residue fails
+    // AFTER it synthesized the outcome: reaped is 0 and the tombstone is kept. The pass must
+    // still wake the waiter (its outcome is now written), not leave it asleep to its 30 s
+    // deadline: no later pass would wake it either, since each reaps 0.
+    CHECK(rt->expire_overdue_claims() == 0);
+    CHECK(rt->claim_queue_depth_for_test(key) == 1); // retained: the release failed
     REQUIRE(yuzu::test::spin_until([&] { return waiter_done.load(std::memory_order_acquire); },
                                    2s));
     waiter.join();

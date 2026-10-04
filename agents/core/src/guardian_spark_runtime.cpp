@@ -190,6 +190,9 @@ bool GuardianSparkRuntime::release_claim_index_locked(KeyClaim& claim) noexcept 
         // line of defence. An earlier version of this comment claimed index_held alone
         // was sufficient - it was not; see the header doc comment on
         // SparkKeyRuleIndex::erase_rule.)
+        // The ->0 edge erase_rule reports is discarded here on purpose: disarming a key whose
+        // last mapping a release dropped is disarm_orphan_keys_locked's job, on the next
+        // heartbeat pass.
         index_->erase_rule(claim.rule_id, claim.generation); // noexcept; idempotent
     } catch (...) {
         claim_index_release_failures_.fetch_add(1, std::memory_order_relaxed);
@@ -736,6 +739,35 @@ std::size_t GuardianSparkRuntime::retained_tombstones() const {
         }
     }
     return n;
+}
+
+std::vector<std::string> GuardianSparkRuntime::invariant_violations_for_test(
+    bool allow_orphans) const {
+    std::lock_guard<std::mutex> lk{registry_mu_};
+    std::vector<std::string> out;
+    for (const auto& [rule_id, rg] : rules_) {
+        const auto key = index_->key_for_rule(rule_id);
+        if (!key) {
+            out.push_back("rule '" + rule_id + "' has no index mapping");
+            continue;
+        }
+        if (!index_->owns(*key, rule_id, rg->generation))
+            out.push_back("rule '" + rule_id + "' generation " + std::to_string(rg->generation) +
+                          " does not own its mapping");
+        if (!keys_.contains(*key))
+            out.push_back("rule '" + rule_id + "' maps to a key absent from keys_");
+    }
+    for (const auto& [key, pk] : keys_) {
+        if (index_->refcount(key) > 0)
+            continue;
+        const auto cit = claims_.find(key);
+        if (cit != claims_.end() && !cit->second.fifo.empty())
+            continue;
+        if (!allow_orphans)
+            out.push_back("keys_ entry with subscription " + std::to_string(pk->subscription) +
+                          " has refcount 0 and no queued claim (an unhealed orphan watcher)");
+    }
+    return out;
 }
 
 std::size_t GuardianSparkRuntime::parked_arm_waiter_depth_for_test() const {
@@ -2353,6 +2385,11 @@ std::size_t GuardianSparkRuntime::reap_stranded_claims_locked(
     const auto now = std::chrono::steady_clock::now();
     std::size_t reaped = 0;
     bool release_failed = false;
+    // The key of the first claim whose release failed this pass, for the rate-limited warn.
+    // A pointer to the claims_ node's key, not a copy: nothing here can throw, and the
+    // element stays valid (this entry keeps its non-empty fifo, and erasing or inserting
+    // OTHER unordered_map entries never invalidates references) until the warn below.
+    const std::string* first_failed_key = nullptr;
     for (auto it = claims_.begin(); it != claims_.end();) {
         auto& fifo = it->second.fifo;
         bool key_changed = false;
@@ -2402,13 +2439,22 @@ std::size_t GuardianSparkRuntime::reap_stranded_claims_locked(
                     claim_drain_failures_.fetch_add(1, std::memory_order_relaxed);
                     break; // leave it for the next pass rather than reap a half-written claim
                 }
+                // The outcome is written: a blocking waiter in wait_for_claim() sleeps on it, so
+                // wake it HERE rather than rely on this pass reaping the claim - the release
+                // below can still fail (that claim is then retained, and no later pass writes
+                // its outcome again). Under the lock: a _locked helper cannot defer it.
+                claim_cv_.notify_all();
             }
             // Decided BEFORE the release (which clears index_held): did this pass free a
             // genuine ghost mapping, not merely pop a non-owner or a committed suffix?
             const bool genuine = c->index_held && index_->owns(c->key, c->rule_id, c->generation);
             if (!release_claim_index_locked(*c)) {
                 release_failed = true;
-                break; // ONE attempt per terminal tombstone per pass; retry next pass
+                if (!first_failed_key)
+                    first_failed_key = &it->first;
+                break; // one attempt per tombstone per pass (two in the pass that synthesized
+                       // its outcome on the not-committed branch: the release in
+                       // synthesize_fallback_outcome_locked, then this one); retry next pass
             }
             if (genuine)
                 tombstones_released_by_reaper_.fetch_add(1, std::memory_order_relaxed);
@@ -2429,6 +2475,10 @@ std::size_t GuardianSparkRuntime::reap_stranded_claims_locked(
             // redrive_parked_arms() drive a parked arm, as does a same-key attach's head
             // drive). The reaper itself never re-selects a clean head.
             const auto& head = fifo.front();
+            // The !is_dead_claim guard is not redundant with dispatch_arm_off_lock's entry
+            // guard: that guard stops only a withdrawn or commit_exception head, so for an
+            // abandoned (waiter_abandoned) or outcome-only head this check is the only thing
+            // that keeps this refill from reaching a backend arm.
             if (head->kind == ClaimKind::Arm && head->dispatch == ClaimDispatch::Queued &&
                 !is_dead_claim(*head)) {
                 try {
@@ -2450,8 +2500,10 @@ std::size_t GuardianSparkRuntime::reap_stranded_claims_locked(
         if (++reaper_release_failed_passes_ % 64 == 0) {
             try {
                 spdlog::warn("Guardian spark: a retained claim's index release has failed on {} "
-                             "consecutive heartbeat passes - its key stays blocked",
-                             reaper_release_failed_passes_);
+                             "consecutive heartbeat passes - key '{}' (the first affected "
+                             "this pass) stays blocked",
+                             reaper_release_failed_passes_,
+                             ::yuzu::log_key_token(*first_failed_key));
             } catch (...) {
             }
         }
@@ -2503,6 +2555,14 @@ void GuardianSparkRuntime::disarm_orphan_keys_locked(
             }
             it = keys_.erase(it); // same critical section as the push
             orphan_disarms_started_.fetch_add(1, std::memory_order_relaxed);
+            // An orphan is an anomaly (a release dropped the key's last mapping and nobody
+            // acted on the ->0 edge), so one line per orphan; each is erased this same pass.
+            try {
+                spdlog::warn("Guardian spark: key '{}' held a watcher with no index mapping left; "
+                             "disarming it (orphan pass)",
+                             ::yuzu::log_key_token(c->key));
+            } catch (...) {
+            }
             try {
                 fault_here_for_test(14); // seam: "the off-lock collection push threw"
                 disarms.push_back(std::move(c));
@@ -2511,14 +2571,12 @@ void GuardianSparkRuntime::disarm_orphan_keys_locked(
                 claim_drain_failures_.fetch_add(1, std::memory_order_relaxed);
             }
         } else {
-            // Inline type: synchronous under the lock, the last-resort shape of
-            // detach_rule_locked. Best-effort by design: a throw leaves no durable record.
-            try {
-                backend_->disarm(pk->subscription);
-            } catch (...) {
-            }
-            it = keys_.erase(it);
-            orphan_disarms_started_.fetch_add(1, std::memory_order_relaxed);
+            // An inline-type key (no io class) never carries claims or ghost mappings, and
+            // its refcount reaches 0 only inside detach_rule_locked, which tears it down
+            // synchronously, so a refcount-0 inline key is not expected here. Leave it
+            // alone rather than make a synchronous backend disarm under registry_mu_.
+            ++it;
+            continue;
         }
     }
 }
@@ -2569,7 +2627,10 @@ std::size_t GuardianSparkRuntime::expire_overdue_claims() {
         }
     }
     // A reaped claim may carry an outcome this pass just wrote (the synthesis arm), which a
-    // blocking waiter in wait_for_claim() is waiting on, so a reap alone must wake it.
+    // blocking waiter in wait_for_claim() is waiting on, so a reap alone must wake it. The
+    // synthesis arm also wakes waiters itself the moment it writes an outcome, so a pass
+    // whose release then fails (reaped_count 0) still wakes them; this notify covers the
+    // abandon, reap and refill cases.
     if (expired_count || reaped_count || !refills.empty())
         claim_cv_.notify_all();
     for (auto& [key, refill] : refills)
@@ -3251,15 +3312,25 @@ GuardianSparkRuntime::withdraw_rule_after_wedge_sweep_locked(
                 //    refcount above 1, which blocks `last_on_key`, so any residue claim
                 //    that owns a mapping belongs to `rule_id` (by_key_ counts a rule_id
                 //    once whatever its generation);
-                //  - remove_rule(rule_id) below erases that mapping, so such a claim no
-                //    longer owns anything and its next release is a no-op that succeeds.
-                //    The residue is therefore left for the next same-key sweep
-                //    (try_dispatch_head_locked, or this function) to pop; nothing here
-                //    waits on the failing release succeeding. The heartbeat's
-                //    reap_stranded_claims_locked() pops it too (shown by the "#5322:
-                //    Lost with the ghost detached last" test, which reaches this
+                //  - when the sweep's release FAILED, remove_rule(rule_id) below erases
+                //    that mapping, so such a claim no longer owns anything and its next
+                //    release is a no-op that succeeds. The residue is therefore left for
+                //    the next same-key sweep (try_dispatch_head_locked, or this function)
+                //    to pop; nothing here waits on the failing release succeeding. The
+                //    heartbeat's reap_stranded_claims_locked() pops it too (shown by the
+                //    "#5322: Lost with the ghost detached last" test, which reaches this
                 //    branch and then sees the residue gone after one
-                //    expire_overdue_claims()).
+                //    expire_overdue_claims());
+                //  - when the sweep's release SUCCEEDS for this rule's own owner
+                //    tombstone (the index-release seam has cleared since it was
+                //    retained), that release IS the key's ->0 edge: the mapping is gone
+                //    before remove_rule runs, so remove_rule returns nullopt although
+                //    this was the key's last rule. Whether the Disarm claim is pushed
+                //    below (an emptied fifo) or the residue fallback runs, the teardown
+                //    after remove_rule still runs because it is gated on `last_on_key`,
+                //    not on remove_rule's return (pinned by the two "#5322: ... tears
+                //    the key down without aborting" tests; an assert on the two
+                //    agreeing used to abort here).
                 sweep_terminal_queued_locked(eit->second);
                 // The sweep's precondition (an empty fifo) is established by call-graph
                 // reasoning, not by construction, and the branch above is reachable, so
@@ -3281,7 +3352,7 @@ GuardianSparkRuntime::withdraw_rule_after_wedge_sweep_locked(
                 // WRONG. Deliberately not pushing the new Disarm claim here just leaves
                 // `claim_pushed` false and `inline_disarm` unset, so control falls
                 // through to the PRE-EXISTING (unrelated to this PR) `!claim_pushed`
-                // last-resort fallback in the `if (disarm_key)` block later in this
+                // last-resort fallback in the `if (last_on_key)` block later in this
                 // function: that fallback runs SYNCHRONOUSLY, in this SAME call, under
                 // this SAME lock -
                 // it calls backend_->disarm() on the real subscription directly and then
@@ -3321,7 +3392,7 @@ GuardianSparkRuntime::withdraw_rule_after_wedge_sweep_locked(
     }
     if (known)
         rit->second->active = false; // in-flight evals will not commit
-    std::optional<std::string> disarm_key;
+    [[maybe_unused]] std::optional<std::string> disarm_key; // see the teardown gate below
     try {
         // remove_rule is strong-guarantee (its one allocation precedes its mutation);
         // on a throw pop the pre-pushed claim so the key is left exactly as found -
@@ -3362,9 +3433,15 @@ GuardianSparkRuntime::withdraw_rule_after_wedge_sweep_locked(
         // durable state and the queued disarm are unaffected. Counted.
         detach_post_commit_failures_.fetch_add(1, std::memory_order_relaxed);
     }
-    assert(disarm_key.has_value() == last_on_key); // the prediction and the edge agree
-    if (disarm_key) {
-        const auto kit = keys_.find(*disarm_key);
+    // Teardown is owed iff this was the key's last rule (the refcount read above), NOT iff
+    // remove_rule returned the key: the last-on-key sweep may already have released this
+    // rule's own owner tombstone, which drops the ->0 edge before remove_rule runs and makes
+    // it return nullopt. When remove_rule did return a key it is *key_opt, so that case is
+    // unchanged. The two can disagree, so this is deliberately not an assert (assert() is
+    // live in every project build configuration, see the note above, and it aborted the
+    // agent on this shape).
+    if (last_on_key) {
+        const auto kit = keys_.find(*key_opt);
         if (kit != keys_.end()) {
             if (inline_disarm) {
                 backend_->disarm(*inline_disarm); // inline type: unchanged, synchronous
