@@ -14,6 +14,7 @@
 #include <yuzu/plugin.h>
 #include <yuzu/plugin.hpp>
 
+#include "filesystem_acl_parsers.hpp"
 #include "local_dispatcher.hpp"
 #include "test_helpers.hpp"
 
@@ -28,6 +29,10 @@
 
 #if defined(__linux__)
 #include <sys/xattr.h>
+#endif
+#if defined(__APPLE__)
+#include <sys/acl.h>
+#include <uuid/uuid.h>
 #endif
 
 namespace fs = std::filesystem;
@@ -181,42 +186,135 @@ TEST_CASE("filesystem get_acl: a plain file reports owner, mode and an acl row, 
 #endif
 }
 
+#ifndef YUZU_TEST_FIXTURE_DIR
+#define YUZU_TEST_FIXTURE_DIR "tests/unit/fixtures"
+#endif
+
 #if defined(__linux__)
-TEST_CASE("filesystem get_acl: a directory with only a default ACL reports it as extended",
+namespace {
+
+/// The real captured xattr bytes (fixtures/wave11/filesystem_acl/linux/<name>.hex: `0x` + hex).
+std::string fixture_xattr_bytes(const std::string& name) {
+    const auto path =
+        fs::path{YUZU_TEST_FIXTURE_DIR} / "wave11" / "filesystem_acl" / "linux" / name;
+    INFO("fixture path: " << path.string());
+    REQUIRE(fs::exists(path));
+    std::ifstream f(path, std::ios::binary);
+    std::ostringstream ss;
+    ss << f.rdbuf();
+    const std::string text = ss.str();
+    auto p = text.find("0x");
+    REQUIRE(p != std::string::npos);
+    std::string out;
+    for (p += 2; p + 1 < text.size() && std::isxdigit(static_cast<unsigned char>(text[p])); p += 2)
+        out.push_back(static_cast<char>(std::stoi(text.substr(p, 2), nullptr, 16)));
+    return out;
+}
+
+/// Sets `xattr` to the captured bytes; false (and a WARN) when the temp filesystem refuses
+/// POSIX ACL xattrs, so the case skips instead of failing on such a runner.
+bool set_acl_xattr(const fs::path& target, const char* xattr, const std::string& blob) {
+    if (::setxattr(target.c_str(), xattr, blob.data(), blob.size(), 0) == 0)
+        return true;
+    WARN("filesystem under the temp dir does not accept POSIX ACL xattrs -- skipping");
+    return false;
+}
+
+std::size_t expected_entries(const std::string& blob) {
+    auto decoded = yuzu::filesystem::acl::decode_posix_acl_xattr(blob);
+    REQUIRE(decoded.has_value());
+    return decoded->size();
+}
+
+}  // namespace
+
+TEST_CASE("filesystem get_acl: a directory with only a default ACL reports every entry as default",
           "[filesystem][acl][dispatcher][linux]") {
     auto plugin = load_or_fail();
     if (!plugin)
         return;
     yuzu::test::TempDir dir{"yuzu_test_acl_"};
     fs::create_directories(dir.path);
-    // The real captured default-ACL xattr (fixtures/wave11/filesystem_acl/linux).
-    const std::string blob = [] {
-        const std::string hex = "0200000001000700ffffffff02000700e903000004000500ffffffff"
-                                "08000500ea03000010000700ffffffff20000500ffffffff";
-        std::string out;
-        for (std::size_t i = 0; i + 1 < hex.size(); i += 2)
-            out.push_back(static_cast<char>(std::stoi(hex.substr(i, 2), nullptr, 16)));
-        return out;
-    }();
-    if (::setxattr(dir.path.c_str(), "system.posix_acl_default", blob.data(), blob.size(), 0) !=
-        0) {
-        WARN("filesystem under the temp dir does not accept POSIX ACL xattrs -- skipping");
+    const auto blob = fixture_xattr_bytes("posix_acl_default.hex");
+    if (!set_acl_xattr(dir.path, "system.posix_acl_default", blob))
         return;
-    }
     const auto result = get_acl(*plugin, dir.path.string());
     CHECK(result.rc == 0);
-    const auto rows = captured_rows(result.captured);
     bool extended = false;
     std::size_t ace_rows = 0;
-    for (const auto& r : rows) {
+    for (const auto& r : captured_rows(result.captured)) {
         extended = extended || r == "acl|extended|-";
         if (starts_with(r, "ace|")) {
             ++ace_rows;
-            CHECK(r.size() > 8);
+            REQUIRE(r.size() > 8);
             CHECK(r.substr(r.size() - 8) == "|default");
         }
     }
     CHECK(extended);
-    CHECK(ace_rows == 5);
+    CHECK(ace_rows == expected_entries(blob));
+}
+
+TEST_CASE("filesystem get_acl: a file with an access ACL reports its entries, none as default",
+          "[filesystem][acl][dispatcher][linux]") {
+    auto plugin = load_or_fail();
+    if (!plugin)
+        return;
+    yuzu::test::TempDir dir{"yuzu_test_acl_"};
+    const auto file = make_file(dir);
+    const auto blob = fixture_xattr_bytes("posix_acl_access.hex");
+    if (!set_acl_xattr(file, "system.posix_acl_access", blob))
+        return;
+    const auto result = get_acl(*plugin, file.string());
+    CHECK(result.rc == 0);
+    bool extended = false;
+    std::size_t ace_rows = 0;
+    for (const auto& r : captured_rows(result.captured)) {
+        extended = extended || r == "acl|extended|-";
+        if (starts_with(r, "ace|")) {
+            ++ace_rows;
+            CHECK_FALSE(r.size() >= 8 && r.substr(r.size() - 8) == "|default");
+        }
+    }
+    CHECK(extended);
+    CHECK(ace_rows == expected_entries(blob));
+}
+#endif
+
+#if defined(__APPLE__)
+TEST_CASE("filesystem get_acl: a file with an extended ACL reports its allow entry",
+          "[filesystem][acl][dispatcher][macos]") {
+    auto plugin = load_or_fail();
+    if (!plugin)
+        return;
+    yuzu::test::TempDir dir{"yuzu_test_acl_"};
+    const auto file = make_file(dir);
+
+    uuid_t who;
+    uuid_generate_random(who);  // unresolved on purpose: the row names the UUID
+    acl_t acl = acl_init(1);
+    REQUIRE(acl != nullptr);
+    acl_entry_t entry = nullptr;
+    REQUIRE(acl_create_entry(&acl, &entry) == 0);
+    REQUIRE(acl_set_tag_type(entry, ACL_EXTENDED_ALLOW) == 0);
+    REQUIRE(acl_set_qualifier(entry, who) == 0);
+    acl_permset_t perms = nullptr;
+    REQUIRE(acl_get_permset(entry, &perms) == 0);
+    REQUIRE(acl_add_perm(perms, ACL_READ_DATA) == 0);
+    const int set_rc = acl_set_file(file.c_str(), ACL_TYPE_EXTENDED, acl);
+    acl_free(acl);
+    REQUIRE(set_rc == 0);
+
+    const auto result = get_acl(*plugin, file.string());
+    CHECK(result.rc == 0);
+    const auto rows = captured_rows(result.captured);
+    bool extended = false;
+    std::size_t allow_rows = 0;
+    for (const auto& r : rows) {
+        extended = extended || r == "acl|extended|-";
+        if (starts_with(r, "ace|allow|user:") && r.size() > 7 && r.substr(r.size() - 7) == "|read|-")
+            ++allow_rows;
+    }
+    CHECK(extended);
+    CHECK(allow_rows == 1);
 }
 #endif

@@ -53,8 +53,8 @@ line|19|# localhost name resolution is handled within DNS itself.
 line|20|#	127.0.0.1       localhost
 line|21|#	::1             localhost
 line|22|# Added by Docker Desktop
-line|23|192.168.0.131 host.docker.internal
-line|24|192.168.0.131 gateway.docker.internal
+line|23|203.0.113.131 host.docker.internal
+line|24|203.0.113.131 gateway.docker.internal
 line|25|# To allow the same kube context to work on the host and the container:
 line|26|127.0.0.1 kubernetes.docker.internal
 line|27|# End of section
@@ -62,10 +62,10 @@ line|28|# TailscaleHostsSectionStart
 line|29|# This section contains MagicDNS entries for Tailscale.
 line|30|# Do not edit this section manually.
 line|31|
-line|32|100.109.177.77 braga.tail128eb2.ts.net. braga
-line|33|100.127.43.37 iphone.tail128eb2.ts.net. iphone
-line|34|100.75.167.98 kyzi.tail128eb2.ts.net. kyzi
-line|35|100.123.53.121 the-rig.tail128eb2.ts.net. the-rig
+line|32|198.51.100.77 workstation1.tail0a0a0a.ts.net. workstation1
+line|33|198.51.100.37 mobile1.tail0a0a0a.ts.net. mobile1
+line|34|198.51.100.98 laptop1.tail0a0a0a.ts.net. laptop1
+line|35|198.51.100.121 buildhost1.tail0a0a0a.ts.net. buildhost1
 line|36|
 line|37|# TailscaleHostsSectionEnd
 total_lines|37

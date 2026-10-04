@@ -618,7 +618,7 @@ Partial — read-only posture only (Wave 8 PR8.6; refs #282, `docs/roadmap.md` I
 
 ### 10.7 File Permissions Inspection :white_check_mark: `T2`
 
-`filesystem` plugin `get_acl` action. Windows: full DACL enumeration via GetNamedSecurityInfo — returns each ACE with trustee, access mask, and ace type. Linux/macOS: POSIX `stat()` permissions (owner, group, other, special bits).
+`filesystem` plugin `get_acl` action. Windows: full DACL enumeration via GetNamedSecurityInfo — returns each ACE with trustee, access mask, and ace type. Linux/macOS: owner, group and permission bits from `stat()`, plus the extended ACL — the POSIX access/default ACL entries on Linux (`system.posix_acl_*` extended attributes) and the allow/deny entries with principal, rights and inheritance flags on macOS (`acl_get_file`); a filesystem that cannot carry an ACL reports `acl|unsupported`.
 
 ### 10.8 Digital Signature Verification :white_check_mark: `T2`
 

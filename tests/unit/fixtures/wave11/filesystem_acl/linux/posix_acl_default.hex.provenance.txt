@@ -2,7 +2,7 @@ File: posix_acl_default.hex -- value of the system.posix_acl_default xattr of a 
 REAL CAPTURE, byte-for-byte. Captured 2026-10-04 in the yuzu-verify:toolchain container
 (Debian 13, kernel 7.0.12-linuxkit, overlayfs; acl + attr installed via apt in a throwaway run).
 Commands:
-  <setfacl default-ACL command on the directory; exact invocation not recorded with the capture>
+  setfacl -d -m ...  (the exact invocation was not recorded with the capture; the ACL it produced is the getfacl output below)
   getfattr -n system.posix_acl_default -e hex /tmp/yuzu_test_acl/d
 `getfacl -n` of the same directory: default:user::rwx / default:user:1001:rwx / default:group::r-x /
 default:group:1002:r-x / default:mask::rwx / default:other::r-x
