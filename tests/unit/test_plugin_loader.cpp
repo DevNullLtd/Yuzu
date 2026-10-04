@@ -384,18 +384,19 @@ TEST_CASE("PluginLoader rejects a second file declaring an already-loaded name",
     }
 
     // Two copies of one valid-named plugin (declares "abi3_fixture") under two
-    // filenames in an isolated directory.
-    auto tmp = yuzu::test::unique_temp_path("yuzu_test_dup_plugin_");
-    fs::create_directories(tmp);
-    const auto a = tmp / (std::string{"aaa_"} + fixture.filename().string());
-    const auto z = tmp / (std::string{"zzz_"} + fixture.filename().string());
+    // filenames in an isolated directory. `tmp` is declared BEFORE `result`, so the
+    // dlopen handles are released before the directory (and the files) are removed.
+    yuzu::test::TempDir tmp{"yuzu_test_dup_plugin_"};
+    fs::create_directories(tmp.path);
+    const auto a = tmp.path / (std::string{"aaa_"} + fixture.filename().string());
+    const auto z = tmp.path / (std::string{"zzz_"} + fixture.filename().string());
     std::error_code ec;
     fs::copy_file(fixture, a, fs::copy_options::overwrite_existing, ec);
     REQUIRE_FALSE(ec);
     fs::copy_file(fixture, z, fs::copy_options::overwrite_existing, ec);
     REQUIRE_FALSE(ec);
 
-    auto result = yuzu::agent::PluginLoader::scan(tmp);
+    auto result = yuzu::agent::PluginLoader::scan(tmp.path);
 
     // Exactly one wins the name (directory-walk order decides which — the loaded
     // handle's path is the dlopen/fd-pin path, so it is not compared).
@@ -407,9 +408,6 @@ TEST_CASE("PluginLoader rejects a second file declaring an already-loaded name",
     CHECK((err.path == a.string() || err.path == z.string()));
     REQUIRE(err.reason.starts_with(yuzu::agent::kDuplicateNameReason));
     CHECK(err.reason.find("abi3_fixture") != std::string::npos);
-
-    result.loaded.clear(); // release the dlopen handle before deleting its file
-    fs::remove_all(tmp, ec);
 }
 
 TEST_CASE("PluginLoader rejects a plugin declaring an invalid name",

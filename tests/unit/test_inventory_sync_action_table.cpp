@@ -20,6 +20,7 @@
 
 #include "sync_source_installed_software.hpp"
 
+#include <algorithm>
 #include <cstdlib>
 #include <filesystem>
 #include <string>
@@ -58,6 +59,11 @@ TEST_CASE("installed-software action table matches real plugin descriptors",
           "[sync][table]") {
     const auto table = yuzu::agent::installed_software_actions();
     REQUIRE_FALSE(table.empty());
+
+    // No (plugin, action) pair twice: a duplicate would dispatch the action twice per cycle.
+    auto sorted = table;
+    std::sort(sorted.begin(), sorted.end());
+    CHECK(std::adjacent_find(sorted.begin(), sorted.end()) == sorted.end());
 
     for (const auto& [plugin_sv, action_sv] : table) {
         const std::string plugin{plugin_sv};

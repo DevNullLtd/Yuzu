@@ -14,6 +14,8 @@
 
 #include <yuzu/plugin.h> // YUZU_EXPORT (agent-core DLL export macro)
 
+#include "plugin_heartbeat_tags.hpp" // kPluginHeartbeatMaxValueBytes (heartbeat tag value bound)
+
 #include <chrono>
 #include <cstdint>
 #include <functional>
@@ -47,7 +49,7 @@ struct SyncSource {
 
     /// Retry a skipped cycle on the bounded phase-aligned backoff
     /// (SyncScheduler::kSkipRetryBase) instead of one full interval; opt in ONLY
-    /// when the source's nullopt paths are cheap to re-run — device_ci dispatches
+    /// when a re-run is a handful of in-process dispatches — device_ci dispatches
     /// up to fifteen actions and software_licensing runs license_scan.list before
     /// it can skip (sync_source_device_ci.cpp, sync_source_software_licensing.cpp),
     /// so they stay off.
@@ -55,8 +57,8 @@ struct SyncSource {
 };
 
 /// Sanitise a skip reason for the KV / heartbeat tag: keep [A-Za-z0-9_.:=,-],
-/// replace any other byte with '_', truncate to 64 bytes (the
-/// kPluginHeartbeatMaxValueBytes bound in plugin_heartbeat_tags.hpp).
+/// replace any other byte with '_', truncate to kPluginHeartbeatMaxValueBytes
+/// (64) bytes.
 YUZU_EXPORT std::string sanitize_skip_reason(std::string_view reason);
 
 class YUZU_EXPORT SyncScheduler {
@@ -195,7 +197,8 @@ private:
 /// `yuzu.sync.<source>.skip_streak` / `.last_skip`. Reads the `__sync__` KV (the
 /// cross-thread seam; never the scheduler's in-memory state, which belongs to the
 /// ticking thread). Emits nothing for a source unless the streak is 1-6 ASCII
-/// digits with value > 0 AND a non-empty reason of at most 64 bytes exists.
+/// digits with value > 0 AND a non-empty reason of at most
+/// kPluginHeartbeatMaxValueBytes (64) bytes exists.
 /// This tag, not a monotonic counter, is the "equivalent heartbeat tag" for the
 /// skip-visibility requirement (#5327); no protobuf field is added (#1567).
 template <typename TagMap>
@@ -205,7 +208,7 @@ void emit_sync_skip_tags(TagMap& tags, const std::vector<std::string>& sources,
     for (const auto& name : sources) {
         const auto streak = get_fn(SyncScheduler::kv_key(name, "skip_streak"));
         const auto reason = get_fn(SyncScheduler::kv_key(name, "last_skip"));
-        if (!streak || !reason || reason->empty() || reason->size() > 64)
+        if (!streak || !reason || reason->empty() || reason->size() > kPluginHeartbeatMaxValueBytes)
             continue;
         if (streak->empty() || streak->size() > 6)
             continue;

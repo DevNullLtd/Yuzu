@@ -672,7 +672,8 @@ TEST_CASE("SyncScheduler: a successful collect clears the skip before the send a
     CHECK(rig.next_fire() == now + 3600);
 }
 
-TEST_CASE("SyncScheduler: a forced skip neither spends budget nor reschedules",
+TEST_CASE("SyncScheduler: a forced skip records nothing itself; the next batch pass records it "
+          "once",
           "[sync][scheduler][skip]") {
     SkipRig rig;
     rig.reason = "r:forced";
@@ -682,9 +683,10 @@ TEST_CASE("SyncScheduler: a forced skip neither spends budget nor reschedules",
     REQUIRE_FALSE(sched.request_now("installed_software").empty());
     sched.tick(1700);
     CHECK(rig.collects == 1);
-    CHECK(rig.kv["sync.installed_software.skip_streak"] == "0"); // one click, no budget spent
-    CHECK(rig.next_fire() == 1700);                              // retries next tick
-    // The batch pass re-collects and records the skip exactly once.
+    CHECK(rig.kv["sync.installed_software.skip_streak"] == "0"); // the forced path records no skip
+    CHECK(rig.next_fire() == 1700);                              // still due: retries next tick
+    // The batch pass re-collects and records the skip exactly once, so one click costs one
+    // backoff rung and one extra collection.
     sched.tick(1701);
     CHECK(rig.collects == 2);
     CHECK(rig.kv["sync.installed_software.skip_streak"] == "1");
@@ -836,6 +838,69 @@ TEST_CASE("SyncScheduler: skip state is written skip_streak, last_skip, next_fir
     sched2.add_source(rig2.source(false, 86400));
     sched2.tick(1701);
     CHECK(rig2.collects == 1); // fires again: the stale next_fire was still due
+}
+
+TEST_CASE("SyncScheduler: the persisted skip streak and reason survive a restart",
+          "[sync][scheduler][skip]") {
+    const std::string agent = "agent-restart";
+    const std::string streak = "sync.installed_software.skip_streak";
+    const std::string last = "sync.installed_software.last_skip";
+    SkipRig rig;
+    rig.reason = "r:1";
+    SyncScheduler first(agent, rig.getter(), rig.setter(), rig.sender());
+    first.add_source(rig.source(true, 86400));
+    first.tick(1000);
+    rig.skip = false;
+    first.tick(rig.next_fire()); // a success leaves next_fire on a phase slot, a day ahead
+    REQUIRE(rig.sends == 1);
+    rig.skip = true;
+    const std::int64_t start = rig.next_fire();
+    first.tick(start);
+    REQUIRE(rig.kv[streak] == "1");
+    REQUIRE(rig.next_fire() == start + 3600);
+
+    // A new scheduler over the same KV (an agent restart) continues the ladder: the loaded
+    // streak is 1, so this skip is the second, waits 2 h, and replaces the reason.
+    rig.reason = "r:2";
+    SyncScheduler second(agent, rig.getter(), rig.setter(), rig.sender());
+    second.add_source(rig.source(true, 86400));
+    second.tick(start + 3600);
+    CHECK(rig.kv[streak] == "2");
+    CHECK(rig.kv[last] == "r:2");
+    CHECK(rig.next_fire() == start + 3600 + 7200);
+
+    // A third life recovers: the loaded streak is what makes the success clear the persisted
+    // tags (a streak read as 0 would leave them stale on a healthy host).
+    rig.skip = false;
+    SyncScheduler third(agent, rig.getter(), rig.setter(), rig.sender());
+    third.add_source(rig.source(true, 86400));
+    third.tick(rig.next_fire());
+    REQUIRE(rig.sends == 2);
+    CHECK(rig.kv[streak] == "0");
+    CHECK(rig.kv[last].empty());
+    CHECK(skip_tags(rig).empty());
+}
+
+TEST_CASE("SyncScheduler: a corrupt negative skip streak is clamped on load",
+          "[sync][scheduler][skip]") {
+    const std::string agent = "agent-clamp";
+    SkipRig rig;
+    rig.reason = "r:1";
+    SyncScheduler first(agent, rig.getter(), rig.setter(), rig.sender());
+    first.add_source(rig.source(true, 86400));
+    first.tick(1000);
+    rig.skip = false;
+    first.tick(rig.next_fire());
+    REQUIRE(rig.sends == 1);
+    rig.skip = true;
+    const std::int64_t start = rig.next_fire();
+
+    rig.kv["sync.installed_software.skip_streak"] = "-5"; // never reaches the backoff shift
+    SyncScheduler second(agent, rig.getter(), rig.setter(), rig.sender());
+    second.add_source(rig.source(true, 86400));
+    second.tick(start);
+    CHECK(rig.kv["sync.installed_software.skip_streak"] == "1"); // clamped to 0, then this skip
+    CHECK(rig.next_fire() == start + 3600);
 }
 
 TEST_CASE("emit_sync_skip_tags publishes only a positive streak with a bounded reason",
@@ -1240,6 +1305,18 @@ std::optional<std::pair<std::string, std::string>> collect_with(SyncPluginMap pl
 
 std::string supported_status(std::string_view action) {
     return pkg::format_status_row(action, pkg::StatusLevel::supported, "");
+}
+
+// `n` machine-scope `inv|name|version|` rows; names are padded with 'x' to `name_width`.
+std::string inv_lines(std::size_t n, std::size_t name_width = 0) {
+    std::string out;
+    for (std::size_t i = 0; i < n; ++i) {
+        std::string name = "n" + std::to_string(i);
+        if (name.size() < name_width)
+            name.append(name_width - name.size(), 'x');
+        out += "inv|" + name + "|1|\n";
+    }
+    return out;
 }
 
 // A ceiling on canonical bytes/record for the real-capture runs; the measured
@@ -1711,44 +1788,34 @@ TEST_CASE("collector: Windows-shaped run with the real captures", "[sync][collec
 
 TEST_CASE("entry cap: the splitter reads one past kMaxEntries and the collector skips above it",
           "[sync][collector][cap]") {
-    const auto lines = [](std::size_t n, std::size_t name_width = 0) {
-        std::string out;
-        for (std::size_t i = 0; i < n; ++i) {
-            std::string name = "n" + std::to_string(i);
-            if (name.size() < name_width)
-                name.append(name_width - name.size(), 'x');
-            out += "inv|" + name + "|1|\n";
-        }
-        return out;
-    };
-    CHECK(parse_installed_apps_output(lines(20001)).size() == 20001);
+    CHECK(parse_installed_apps_output(inv_lines(20001)).size() == 20001);
 
     reset_fakes();
     SyncPluginMap only_ia = {{"installed_apps", &kFakeIa}};
-    g_fake[0].out["list_inventory"] = lines(20001);
+    g_fake[0].out["list_inventory"] = inv_lines(20001);
     CHECK_FALSE(collect_with(only_ia).has_value());
 
-    g_fake[0].out["list_inventory"] = lines(20000);
+    g_fake[0].out["list_inventory"] = inv_lines(20000);
     const auto got = collect_with(only_ia);
     REQUIRE(got.has_value());
     CHECK(records_of(got->first).size() == 20000);
 
     // 20,001 RAW rows where one is an exact duplicate: the splitter stopped at the
     // cap, so the deduped count (20,000) must not launder a truncated read.
-    g_fake[0].out["list_inventory"] = lines(20000) + "inv|n0|1|\n";
+    g_fake[0].out["list_inventory"] = inv_lines(20000) + "inv|n0|1|\n";
     CHECK_FALSE(collect_with(only_ia).has_value());
 
     // Byte cap: the entry cap runs first, so the over-cap input stays <= 20,000
     // rows and under the raw capture cap, but its canonical blob exceeds kMaxBlobBytes.
     // 12,000 x 200 B names is proven under the cap by the test itself.
-    const std::string under = lines(12000, 200);
+    const std::string under = inv_lines(12000, 200);
     CHECK(installed_software_canonical_blob(parse_installed_apps_output(under)).size() <
           3u * 1024 * 1024);
     g_fake[0].out["list_inventory"] = under;
     REQUIRE(collect_with(only_ia).has_value());
 
     // The capture itself must not be truncated (that would skip for the wrong reason).
-    const std::string over = lines(16000, 200);
+    const std::string over = inv_lines(16000, 200);
     CHECK(over.size() < 3'670'016); // kInventoryCaptureCap
     g_fake[0].out["list_inventory"] = over;
     CHECK_FALSE(collect_with(only_ia).has_value());
@@ -1786,7 +1853,8 @@ TEST_CASE("collector: constrained managers keeps a present row", "[sync][collect
             {pkg::format_status_row("managers", pkg::StatusLevel::constrained,
                                     "macos:homebrew_taps:permission_denied"),
              pkg::format_manager_row(pkg::Manager::homebrew, pkg::Presence::unavailable, "",
-                                     "/usr/local", "-", "macos:homebrew_cellar:permission_denied")});
+                                     "/usr/local", "-",
+                                     "macos:homebrew_cellar:permission_denied")});
         CHECK_FALSE(collect_with(all_plugins()).has_value());
     }
 }
@@ -1868,5 +1936,34 @@ TEST_CASE("collector: skip_reason names the cause of each skip and clears on suc
         g_fake[0].out["list_inventory"] = "";
         CHECK_FALSE(src.collect().has_value());
         CHECK(src.skip_reason() == "installed_apps.list_inventory:no inv rows");
+    }
+    SECTION("a truncated capture") {
+        // A parseable first write, then one past kInventoryCaptureCap (3'670'016).
+        g_fake[1].out["packages"] = supported_status("packages") + "\n";
+        g_fake[1].overflow["packages"] = std::string(3'700'000, 'x');
+        CHECK_FALSE(src.collect().has_value());
+        CHECK(src.skip_reason() == "pkg_inventory.packages:truncated");
+    }
+    SECTION("one action reads more than kMaxEntries raw rows") {
+        g_fake[0].out["list_inventory"] = inv_lines(20001);
+        CHECK_FALSE(src.collect().has_value());
+        CHECK(src.skip_reason() == "installed_apps.list_inventory:row_cap");
+    }
+    SECTION("the merged inventory exceeds kMaxEntries") {
+        // Each action is under the raw-row cap (12,000 applications, 9,000 formulae); the
+        // merge (plus the managers presence row) is over it.
+        g_fake[0].out["list_inventory"] = inv_lines(12000);
+        std::string formulae = supported_status("packages") + "\n";
+        for (int i = 0; i < 9000; ++i)
+            formulae += pkg::format_package_row("f" + std::to_string(i), "1.0",
+                                                pkg::PackageKind::formula) + "\n";
+        g_fake[1].out["packages"] = formulae;
+        CHECK_FALSE(src.collect().has_value());
+        CHECK(src.skip_reason() == "installed_software:entry_cap");
+    }
+    SECTION("the canonical blob exceeds kMaxBlobBytes") {
+        g_fake[0].out["list_inventory"] = inv_lines(16000, 200);
+        CHECK_FALSE(src.collect().has_value());
+        CHECK(src.skip_reason() == "installed_software:blob_cap");
     }
 }

@@ -1,6 +1,7 @@
 # Resource Ledger — #5327 (installed-software collector skip follow-ups)
 
-Range `b123c55c0..HEAD` (col-1..col-3). A Resource Ledger is required for a C++ diff (policy floor).
+Range `b123c55c0..fced3c772` plus the gate-fix commits that follow it (the governance gate re-pins the final
+head). A Resource Ledger is required for a C++ diff (policy floor).
 
 ## Production code (`agents/core/src/sync_scheduler.{hpp,cpp}`, `sync_source_installed_software.cpp`, `plugin_loader.cpp`, `agent.cpp`)
 
@@ -21,6 +22,14 @@ Threads: none created. Callback contexts: `skip_reason` is invoked only from `Sy
 
 ## Test code (`tests/unit/test_inventory_sync.cpp`, `test_inventory_sync_action_table.cpp`, `test_plugin_loader.cpp`)
 
-Pure-function and in-memory fixtures: scheduler tests inject `kv_get_`/`kv_set_` map lambdas and a fake clock;
-the collector tests inject descriptors; the duplicate-name loader test copies a fixture plugin twice under a `yuzu_test_dup_plugin_` temp
-directory, clears `result.loaded` (dlclose) and then `fs::remove_all`s it at the end of the case. No new process, socket or long-lived handle.
+Scheduler tests inject `kv_get_`/`kv_set_` map lambdas and a fake clock; the collector tests inject descriptors. Two
+tests acquire real resources, both RAII:
+
+| resource | owner | acquired | released | transfer | failure cleanup |
+|---|---|---|---|---|---|
+| mapped plugin libraries: `PluginHandle::load` of `installed_apps`, `pkg_inventory` and `windows_optional_features` from `MESON_BUILD_ROOT`, one load per table row (four in all) | the loop-local `std::optional<PluginHandle>` in the descriptor-pin case | each iteration of the pin loop | end of the iteration: `~PluginHandle` dlcloses | none | RAII; a failed `REQUIRE` unwinds the scope. `init` is never called, so no `shutdown` is owed |
+| duplicate-name scratch directory holding two copied plugin binaries (`yuzu_test_dup_plugin_` prefix) and the dlopen handle `scan` returns for the winner | `yuzu::test::TempDir tmp`, declared before `result` (and `result.loaded`) | the case body | scope exit: `result` is destroyed first (dlclose), then `tmp` removes the directory | none | RAII on both, so a failed `REQUIRE` still removes the directory |
+
+No new process, socket or long-lived handle.
+
+**Adjudications recorded:** none required — no manual (non-RAII) resource cleanup exists in this diff.

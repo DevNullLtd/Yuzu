@@ -547,7 +547,7 @@ credentials.)
 ## Troubleshooting
 
 **The `installed_software` table is empty after upgrading agents.** Most likely
-the `installed_apps` plugin isn't loaded — the sync source then idles silently
+the `installed_apps` plugin isn't loaded — the sync source then idles
 (it logs `sync: installed_apps plugin not loaded` at **warn**, and the device's
 `yuzu.sync.installed_software.last_skip` heartbeat tag reads
 `installed_apps:not_loaded`). Verify the
@@ -564,10 +564,13 @@ Typical causes: Windows DISM busy or `api_unavailable` (the
 `windows_optional_features` action answers `feature|unavailable|…`), or a
 constrained Homebrew `packages` read on macOS (a constrained `managers` answer
 with a present prefix no longer skips). The warning names the action and the
-reason. The warning's reason token is also the device's
-`yuzu.sync.installed_software.last_skip` heartbeat tag, and
-`yuzu.sync.installed_software.skip_streak` counts consecutive skips (uncapped),
-which tells an online-but-skipping host from an offline one. The agent retries
+reason. The same reason reaches the server as the device's
+`yuzu.sync.installed_software.last_skip` heartbeat tag (characters outside
+`A-Z a-z 0-9 _ . : = , -` become `_`, and the value is cut at 64 bytes, so a long
+list of constraint tokens is shortened), and
+`yuzu.sync.installed_software.skip_streak` counts consecutive skips (uncapped): an
+online host that is skipping publishes a non-zero streak, an offline host no
+heartbeat at all. The agent retries
 a skipped cycle on the bounded backoff described under *What is collected*, then
 falls back to one attempt per daily slot. A host that keeps skipping is flagged by `yuzu_inventory_stale_agents`
 after two missed daily cycles; fix the failing action, or remove its plugin,

@@ -49,8 +49,8 @@ void SyncScheduler::add_source(SyncSource src) {
 
 std::string sanitize_skip_reason(std::string_view reason) {
     std::string out;
-    out.reserve(std::min<std::size_t>(reason.size(), 64));
-    for (unsigned char c : reason.substr(0, 64)) {
+    out.reserve(std::min(reason.size(), kPluginHeartbeatMaxValueBytes));
+    for (unsigned char c : reason.substr(0, kPluginHeartbeatMaxValueBytes)) {
         const bool ok = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
                         (c >= '0' && c <= '9') || c == '_' || c == '.' || c == ':' || c == '=' ||
                         c == ',' || c == '-';
@@ -101,7 +101,8 @@ SyncScheduler::State& SyncScheduler::load_state(std::size_t idx, std::int64_t no
         // Clamp: a corrupt KV value must never reach the backoff shift as a negative.
         const long long ss =
             std::strtoll(kv_get_(kv_key(src.name, "skip_streak")).c_str(), nullptr, 10);
-        st.skip_streak = static_cast<int>(std::clamp<long long>(ss, 0, std::numeric_limits<int>::max()));
+        st.skip_streak =
+            static_cast<int>(std::clamp<long long>(ss, 0, std::numeric_limits<int>::max()));
         st.last_skip = kv_get_(kv_key(src.name, "last_skip"));
     }
     st.loaded = true;

@@ -403,7 +403,9 @@ SyncSource make_installed_software_source(SyncPluginMap plugins) {
     SyncSource src;
     src.name = "installed_software";
     src.interval = std::chrono::hours{24};
-    src.skip_backoff = true; // every skip path is a cheap re-run (dispatch + parse, no fan-out)
+    // A retry re-runs at most the four table actions in-process (no fan-out); the backoff
+    // caps that at four extra runs per outage.
+    src.skip_backoff = true;
     auto last_reason = std::make_shared<std::string>();
     src.skip_reason = [last_reason] { return *last_reason; };
     src.collect = [plugins = std::move(plugins), last_reason]()

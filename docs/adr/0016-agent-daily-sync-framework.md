@@ -78,8 +78,9 @@ A small, source-agnostic seam:
 
 > **Update (2026-10-04, #5327):** a source whose collect yields nothing records
 > `skip_streak` / `last_skip` in the same `__sync__` KV. A source that opts in
-> (`skip_backoff`; today installed_software only — the other sources re-dispatch
-> many actions on a retry) retries at min(next phase slot, 1 h · 2^(streak-1))
+> (`skip_backoff`; today installed_software only — device_ci and
+> software_licensing dispatch many actions per attempt, so their retries are not
+> cheap) retries at min(next phase slot, 1 h · 2^(streak-1))
 > while the streak is at most 5, then once per daily slot; the others keep one
 > full interval. The operator-facing schedule is stated once, in
 > `docs/user-manual/inventory.md`. The skip reason reaches the server only as a
