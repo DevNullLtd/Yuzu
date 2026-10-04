@@ -555,7 +555,8 @@ do_replay_one(AgentId, Pid, SessionId, RegisterReq, QueueDepth, State) ->
                 %% own outcome. The answer is authoritative, so it is a breaker
                 %% SUCCESS (as for the superseded case below), and the attempt
                 %% is stamped like any other replay. A MISSING `accepted' key
-                %% still means accepted. The reason is the server's text, so
+                %% still means accepted (the decoder always sets it on the wire;
+                %% only test doubles omit it). The reason is the server's text, so
                 %% it is cut before it is logged; no session id is logged.
                 logger:warning("Registration replay: ~s was not accepted by the server (~s); "
                                "disconnecting so the agent follows its own registration path",
@@ -805,7 +806,9 @@ replay_verdict(SessionIds, State) ->
 %% entries_for_sessions/1), and each pop is re-verified by agent
 %% (lookup_local_session/1): two decisions, two keys.
 %%
-%% Per entry, in verdict order, the first rule that applies wins:
+%% Per entry, in the order of the ids given (a heartbeat verdict arrives sorted
+%% by session id: the buffer sorts it, so the queue order is by session id, not
+%% the order the server listed), the first rule that applies wins:
 %%   - the agent is already queued: skipped. One pending entry per agent, so
 %%     a second session for the same agent is not queued; the earlier entry
 %%     is skipped as stale at its pop and the new session is listed again by
