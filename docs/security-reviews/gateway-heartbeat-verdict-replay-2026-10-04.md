@@ -3,7 +3,7 @@
 - **Date:** 2026-10-04
 - **Change:** branch `feat/1197-gateway-heartbeat-reconcile` (issue #1197; builds on the server-side verdict recorded in `changelog.d/1197-batch-heartbeat-unknown-sessions.changed.md`)
 - **Component:** Erlang gateway (`gateway/apps/yuzu_gw`): `yuzu_gw_heartbeat_buffer`, `yuzu_gw_upstream`, `yuzu_gw_registry`, `yuzu_gw_telemetry`. No server, proto or agent change.
-- **Reviewed by:** `/governance` (security, SRE, architecture and gateway, documentation, consistency, enterprise-readiness, compliance and quality-engineering roles). Outcome in plain words: no blocking findings except one documentation finding (the replay of a session the server already knows is not free, and the docs did not say so), which the documentation fix round of this change addressed. The other findings were should-fix and nice-to-have items (circuit breaker interplay, runbook gaps, wording, tracking numbers) and were fixed in that round or recorded as follow-ups below.
+- **Reviewed by:** `/governance` (security, SRE, architecture and gateway, documentation, consistency, enterprise-readiness, compliance and quality-engineering roles). Outcome in plain words: the first run found one derived-HIGH documentation finding (the side effects of replaying a session the server already knows). The re-review of the fix round found two further derived-HIGH items (upgrade-day guidance that omitted the wedge of released agents, and crash report redaction that covered the state but not the mailbox) and a number of MEDIUM and LOW items. All of them are addressed in this PR as documented here and in the Known limits of the gateway manual; the crash report mailbox residual is disclosed, not closed.
 - **Reading this record:** it summarises local rig runs and local review notes. Nothing here is a CI result. Every figure is as recorded in those notes; where a statement was inferred from the code rather than observed it says so.
 
 ## Scope
@@ -18,9 +18,9 @@ This record covers one core replica. No multi-replica run exists; the multi-repl
 |---|---|---|
 | Rig runs and automated results | `caef11df5` | real agent runs R1, R2, R2d, R2c, R5 and R6 (plaintext and TLS rigs, one box), plus eunit, dialyzer and Common Test (see below) |
 | Documentation commits after the rig | the docs commits on top of `caef11df5` | documentation only; not rig-run |
-| Later code-agent commits | test, comment and `format_status` changes after `caef11df5` | not rig-run; eunit and dialyzer only, see the PR for the final count |
+| Later code commits | the code commits on top of `caef11df5` | input validation and log hardening, eunit and dialyzer only, NOT rig-run; listed below |
 
-The gateway source on the rig runs is the source at `caef11df5`. The commits after it change tests, comments, the crash-report `format_status` and documentation only (no replay decision logic), and were not run on a rig.
+The gateway source on the rig runs is the source at `caef11df5`. The later code commits are not rig-run and are not limited to tests, comments and documentation. They add: the `consume_verdict` map guard and `listed_ids` in the heartbeat buffer; the cast-boundary cap and type check of `replay_sessions` (`bound_session_ids`, `replay_verdict`); control byte replacement in `reject_reason_for_log`; the HELP text correction of the truncated counter; and, in the second fix round, redaction of the reason and the log in `format_status`, an exception wrap of the RPC bodies, a non-map reply guard at the replay arm and in the agent service register, and C1 control byte replacement. They validate inputs and harden logging, and they were checked by eunit and dialyzer only.
 
 ## Real-agent runs
 
@@ -38,24 +38,32 @@ All runs used one real agent, one core replica, debug builds and gateway log lev
 
 ## Automated results
 
-At the rig commit `caef11df5` (fix-agent and reviewer runs, not rig runs):
+At the rig-tested commit `caef11df5` (fix-agent and reviewer runs, not rig runs):
 
-- eunit: 458 of 458 passed on the rig-tested commit, three runs from a fresh `_build/test`; 467 of 467 after the governance fix round (three runs from a fresh `_build/test`, no flake).
+- eunit: 458 of 458 passed, three runs from a fresh `_build/test`.
 - dialyzer: exit code 0.
 - Common Test: 52 cases.
+
+At the later code commits (not rig-run):
+
+- eunit: 467 of 467 passed after the first governance fix round (three runs from a fresh `_build/test`, no flake). The second fix round added tests; see the PR for the final eunit count at the branch tip.
+- dialyzer: see the PR for the result at the branch tip.
 
 ## Mutation checks
 
 - Author mutants, each shown to fail a test before the fix was put back: stamping a session into the guard at enqueue time instead of at send time failed 7 tests; removing the open-breaker guard on the verdict path failed 1; removing the per-agent dedupe failed 1.
-- Governance quality-engineering mutants a to j: the survivors and their disposition are recorded in the governance ledger run for this branch (`governance.d/`), not restated here.
+- Governance quality-engineering mutants a to j: the survivors and their disposition are recorded in the governance ledger fragment for this branch, `governance.d/1197-gateway-heartbeat-reconcile.*.jsonl` (it exists at merge), not restated here.
 
-## Declined obligations from the server-side verdict's governance ledger
+## Obligations from the server-side verdict's governance ledger
 
-The server-side change recorded obligations for the gateway consumer (finding `F-prc-obligations`). Three were declined, each for one reason:
+The server-side change recorded six obligations for the gateway consumer (finding `F-prc-obligations`, in `governance.d/1197-batch-heartbeat-unknown-sessions.1sz0KG.jsonl`). The ledger records only that they were linked to #1197 (disposition `linked-to-#1197`), with no rationale. The reasons below were RECONSTRUCTED from the code at the branch tip by the author of this change; they are not recovered from a stored decision. Status per obligation:
 
-- **Replay only ids seen in at least two batches (the two-batch rule).** Declined: the replay already re-checks local liveness when an id is queued and again immediately before every send, a per-agent pending entry and the guard window bound repeats, and a second batch would only add up to one heartbeat interval of latency.
-- **A "verdict ever seen" gauge for version skew.** Declined: skew is a no-op in both directions by design (an old server never sends the fields, an old gateway ignores them), and `yuzu_gw_registration_replay_total` shows whether replays are being sent.
-- **The exclusion half of "suppress replays while the directory is unavailable and exclude them from breaker accounting".** Declined: a replay that the server answers with `UNAVAILABLE` must still count toward the circuit breaker; the suppression half is met by the open-breaker drop and the guard window.
+1. **Replay only ids seen in at least two batches (the two-batch rule).** Not adopted. Reason (reconstructed): the replay already re-checks local liveness when an id is queued and again immediately before every send, a per-agent pending entry and the guard window bound repeats, and a second batch would only add up to one heartbeat interval of latency.
+2. **Check local liveness at replay time (no ghost resurrection).** Met by `yuzu_gw_registry:entries_for_sessions/1` at queue time, which requires the agent row to agree with the session index, and by `lookup_local_session/1` immediately before each send.
+3. **Dedupe against the replay queue and reuse the drip pacing.** Met by one pending entry per agent (an already queued agent is skipped), the per-session guard window, and the verdict entries feeding the existing drip with its spacing.
+4. **Suppress replays while the directory is unavailable and exclude them from breaker accounting.** Two halves. Suppression is approximated, not met: a verdict that arrives while the breaker is open is dropped, but an open breaker only approximates "the directory is unavailable", and a verdict that arrives half open is queued on purpose, because its first replay is the probe (`yuzu_gw_upstream.erl`, `replay_verdict` and `enqueue_sessions`). Excluding replays from breaker accounting is not adopted. Reason (reconstructed): a replay that the server answers with `UNAVAILABLE` must still count toward the circuit breaker, so a failing server can open it (see "Replay failures feed the shared circuit breaker" in the gateway manual).
+5. **A "verdict ever seen" gauge for version skew.** Not adopted. Reason (reconstructed): skew is a no-op in both directions by design (an old server never sends the fields, an old gateway ignores them), and `yuzu_gw_registration_replay_triggered_total{trigger="heartbeat"}` and `yuzu_gw_registration_replay_total` show whether replays are being sent.
+6. **Sanitise ids before logging in Erlang.** Met for the ids the server lists: the verdict path logs counts only, never ids. The pre-existing DEBUG line `Registration replay: re-proxied <agent> (adopted session <id>)` still logs the session id the server returned, unsanitised (INFERRED from the code; this change did not touch that line).
 
 ## Not tested
 
@@ -66,6 +74,7 @@ The server-side change recorded obligations for the gateway consumer (finding `F
 - The recovery action for R2b: restarting the gateway or the agent was not tried.
 - Whether restarting only the gateway recovers agents stranded by an earlier server restart.
 - The web UI over HTTPS (R6 served it over plain HTTP).
+- The crash report redaction of `yuzu_gw_upstream` on the real process: it was checked on a stand-in probe (OTP 28.4.2) only, and the process mailbox and the `messages:` and exception lines of the crash report are NOT redacted (see "Known limits" in the gateway manual).
 - Rollback to the previous gateway: derived from the change (no schema, no migration, no required configuration), not run.
 
 ## Caveats
