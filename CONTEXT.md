@@ -87,7 +87,7 @@ Whether one node in the fleet can initiate a network connection to another. Yuzu
 - **Observed reachability** — an edge backed by a network flow the fleet's own agents *actually saw* (a `fleet_snapshot.v1` connection whose destination resolves to another fleet member via the server's IP→agent map). This is the spine of Yuzu's reachability graph. It deliberately **undercounts** what is possible — a path that policy permits but no host ever exercised is invisible — and that recall trade-off is accepted because trustworthy, low-false-positive results are the product's cornerstone.
 - **Potential reachability** — what the network/firewall *policy would allow*, independent of whether a flow was ever observed. Yuzu can only ever approximate the **host-firewall** slice of this (the set of `(port, protocol, allowed-source)` a host would accept), and only after structured firewall parsing that does not exist yet — it is a later, clearly-labeled enrichment, never conflated with observed edges.
 
-**Fabric-level reachability** — what switch/router ACLs, cloud security groups, and VLAN segmentation permit — is **out of scope**: an on-box agent cannot see it and Yuzu never fabricates it. A seam is left to *consume* it from an upstream source or *publish* Yuzu's observed graph upstream in a future iteration.
+**Fabric-level reachability** — what switch/router ACLs, cloud security groups, and VLAN segmentation permit — is **out of scope**: an on-box agent cannot see it and Yuzu never fabricates it. A seam is left to *consume* it from an upstream source or *publish* Yuzu's observed graph upstream in a future iteration. **Physical adjacency** from **network elements** (LLDP edges, FDB/ARP attachments, ADR-0068) is a third, distinct thing: it says which port a host hangs off, not what the fabric *permits*, so it does **not** fill this seam (config analysis à la Batfish would).
 
 Distinct from **Scope**, which is a device-*set* target expression, not a graph; reachability is about edges between nodes, not membership.
 
@@ -197,6 +197,36 @@ Collectively, the use-case engine host's UI and the in-server admin console (ADR
 ## Admin console
 
 The thin in-server surface retained under the headless-platform direction (ADR-1005 Decision 7): the bootstrap/break-glass set — enrollment and device liveness, health/readiness, RBAC and principal management, settings, audit view. The list is **closed**; adding a console surface requires amending ADR-1005. Distinct from the existing full dashboard, which remains supported and shrinks toward the console via a strangler migration, never a forced one. Must function with zero dependency on any engine being reachable.
+
+## Network element
+
+A switch, router, firewall or similar piece of network infrastructure that Yuzu inventories and observes **without an agent daemon**, reached through a **network collector** speaking a **protocol adapter** (gNMI/OpenConfig first; SNMP deferred, not foreclosed). A network element is a first-class member of the estate — it appears in inventory and service diagrams alongside agent-managed devices — but it is **read-only** in the first iteration — not a dispatch target for instructions and never an **Operator**. A write path (gNMI `Set`, e.g. port quarantine) is **reserved, not foreclosed**: it is an effect, so it would have to cross core as an Execution Plan with approval provenance (ADR-0033 §10, #1398) before any element is ever written to. The model is protocol-neutral by decision: a network element's identity, authorization unit and inventory row are the same whichever adapter reaches it. Distinct from an agent-managed **device** (runs the agent daemon, keyed by `agent_id`) and from a **discovered device** (an unmanaged IP found by the `discovery` plugin's ARP/ping scan, with no credentials or adapter).
+_Avoid_: "network device" (already means an agent endpoint in the `/network` network-quality lens — `list_network_devices`, `network.device.view`), "switch" as the generic term, "telemetry" for its state data (ADR-0003 owns that word for agent flow capture).
+
+## Purview (co-determination purview)
+
+An operator-declared marker placing a **subject** — a population of person-assigned devices, declared on a **management group**; derived (admin-overridable) for a **network element** whose tables can reveal those devices' presence — under employee co-determination (German §87(1)(6) BetrVG and its peers). Purview **follows the person, not the geography**: a German employee's laptop abroad stays in purview; a data-centre switch with only servers behind it is not. **In purview**, an individually-identifying behavioural read is **denied unless made under an open Incident**; aggregate reads (floor-protected) are unaffected. **Out of purview**, behaviour is today's: permitted and per-open audited. A subject with no declaration is **out** by default (preserves existing behaviour on upgrade); an EU-wide deployment flips the deployment-wide default to **in**. Enforced at the single behavioural-read funnel (`emit_behavioral_audit`, `rest_audit.hpp`), never per route. Decided 2026-10-03 as its own ADR (ADR-0067); the network-element connector (ADR-0068) depends on it. Distinct from **Scope** (a target expression), from **Trust zone** (network position) and from **Confinement** (who may see which agents — purview is about *what kind of read* is permitted on a subject, not which operator may see it).
+_Avoid_: "co-determination scope" (Scope is taken), "jurisdiction", "country flag", "works-council mode".
+
+## Incident
+
+A declared, reasoned, **time-boxed** authorisation under which in-**purview** individually-identifying reads are permitted: an operator opens it with a justification (e.g. a ticket), it is approved through the one core-owned approval primitive (four-eyes or admin, ADR-1005), every read made under it is stamped with the incident id, and it closes on expiry or explicitly — after which the same reads are denied again. Its purpose is a complete, exportable account for the works council of what was read, by whom, and why. Distinct from a **TAR** investigation (reconstructing activity) and from an **approval** of a single instruction: an Incident licenses a *class of reads* on in-purview subjects for a bounded time. Owned by ADR-0067.
+_Avoid_: "break-glass" (as the term — it is the mechanism's family, not its name), "investigation", "case".
+
+## Connector
+
+A core mechanism that collects estate facts from a source that is **not an agent daemon** — a network element via its network collector, a management system's inventory, a file upload — and lands them in the estate model behind the versioned REST/MCP surface. **Connectors are core** (maintainer verdict 2026-10-03, ADR-1005 Decision 2 appendix, given for the class): collecting and normalising the facts is mechanism; *interpreting* them for a purpose stays engine territory. The first connector is the network-element connector (ADR-0068). Distinct from a **plugin** (runs inside the agent daemon on a managed device) and from a **use-case engine** (consumes facts, never collects them).
+_Avoid_: "integration" (too broad), "engine" for the connector runtime.
+
+## Network collector
+
+The Yuzu-shipped, separately-deployed data-plane process that dials **network elements**, holds their streaming sessions and is the **only** thing that ever connects to a network element. Decided as **gnmic** (openconfig, Apache-2.0) run as a sidecar near the elements, not code Yuzu writes: Yuzu is the **control plane** (owns the element inventory, adapter profiles and the target list the collector loads) and a **consumer** (reads element state through the collector's single gNMI endpoint, as its sole client). Counters flow collector → Prometheus directly and never through `yuzu-server`; state (LLDP, ARP, FDB, interfaces, identity) flows collector → core into the estate model. Distinct from the **Gateway** (southbound for agent daemons only) and from a **collector agent** (an agent daemon hosting the dialer — considered and rejected in favour of gnmic).
+_Avoid_: "proxy", "poller", "collector agent".
+
+## Collector principal
+
+The **engine principal** a network collector authenticates to core as, holding exactly one grant — `NetworkElement:Collect`, seeded to no human role — which admits it to the single route that returns network-element credentials in the clear (the collector's target list). It is Yuzu's **first secret-egress route**: every fetch is audited with principal id and target count, nothing but a collector principal may call it, and the credentials live in the collector's memory only. Read-only posture today (gNMI `Set` reserved, ADR-0068); the egress security is revisited before any write path ships. Distinct from a human **Operator** and from an agent daemon's mTLS identity.
+_Avoid_: "service account", "collector token".
 
 ## Operator
 
