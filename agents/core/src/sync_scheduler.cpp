@@ -146,7 +146,9 @@ void SyncScheduler::note_skip(std::size_t idx, std::int64_t now_secs) {
 
 void SyncScheduler::note_collected(std::size_t idx) {
     State& st = states_[idx];
-    if (st.skip_streak == 0)
+    // A reason left behind a zero streak (save_state writes skip_streak before last_skip, so an
+    // interrupted clear can leave one) is cleared here too.
+    if (st.skip_streak == 0 && st.last_skip.empty())
         return;
     st.skip_streak = 0;
     st.last_skip.clear();

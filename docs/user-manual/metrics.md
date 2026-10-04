@@ -2161,7 +2161,9 @@ with no evidence of ever having been sent.
 ### Plugin load + signing rejections (`yuzu_agent_plugin_rejected_total`)
 
 Counter incremented every time the agent rejects a plugin at scan time
-**before** the plugin's code runs. The `reason` label is bounded to a
+**before** its `init` runs (the allowlist and signature checks run before the
+library is even loaded; the name checks run once the library is mapped and its
+declared name read). The `reason` label is bounded to a
 fixed set of stable string prefixes — alert rules SHOULD pin against
 the literal label values, not substring matches.
 

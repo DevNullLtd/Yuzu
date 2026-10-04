@@ -880,6 +880,22 @@ TEST_CASE("SyncScheduler: the persisted skip streak and reason survive a restart
     CHECK(skip_tags(rig).empty());
 }
 
+TEST_CASE("SyncScheduler: a success clears a reason left behind a zero streak by an interrupted "
+          "clear",
+          "[sync][scheduler][skip]") {
+    SkipRig rig;
+    rig.kv["sync.installed_software.next_fire"] = "1000"; // due now
+    rig.kv["sync.installed_software.skip_streak"] = "0";  // the streak write landed...
+    rig.kv["sync.installed_software.last_skip"] = "r:old"; // ...the last_skip write did not
+    rig.skip = false;
+    SyncScheduler sched("agent-interrupted-clear", rig.getter(), rig.setter(), rig.sender());
+    sched.add_source(rig.source(true, 86400));
+    sched.tick(1000);
+    REQUIRE(rig.sends == 1);
+    CHECK(rig.kv["sync.installed_software.skip_streak"] == "0");
+    CHECK(rig.kv["sync.installed_software.last_skip"].empty());
+}
+
 TEST_CASE("SyncScheduler: a corrupt negative skip streak is clamped on load",
           "[sync][scheduler][skip]") {
     const std::string agent = "agent-clamp";

@@ -114,8 +114,8 @@ A **C++23 CRTP wrapper** (`sdk/include/yuzu/plugin.hpp`) provides ergonomic C++ 
 
 ### Plugin Lifecycle
 
-1. The agent scans its plugin directory at startup. If an allowlist is configured, each library's SHA-256 hash is verified **before loading** (see [Plugin Allowlist](#plugin-allowlist) below). If a code-signing trust bundle is configured, the library's CMS detached signature is verified against it as well (see [Plugin Code Signing](#plugin-code-signing) below) — both checks run before `dlopen`/`LoadLibrary` so tampered or untrusted binaries never execute code. Plugin names must be unique within the directory: if a second file declares a name an earlier file in the same scan already claimed, it is rejected at scan with a `duplicate plugin name` reason, and the first file the directory walk encountered keeps the name.
-2. Each shared library (`.dll` on Windows, `.so` on Linux, `.dylib` on macOS) is loaded dynamically.
+1. The agent scans its plugin directory at startup. If an allowlist is configured, each library's SHA-256 hash is verified **before loading** (see [Plugin Allowlist](#plugin-allowlist) below). If a code-signing trust bundle is configured, the library's CMS detached signature is verified against it as well (see [Plugin Code Signing](#plugin-code-signing) below) — both checks run before `dlopen`/`LoadLibrary` so tampered or untrusted binaries never execute code.
+2. Each shared library (`.dll` on Windows, `.so` on Linux, `.dylib` on macOS) is loaded dynamically. Plugin names must be unique within the directory: once a library is loaded and its declared name read, a second file declaring a name an earlier file in the same scan already claimed is unloaded again before its `init` runs and rejected with a `duplicate plugin name` reason; the first file the directory walk encountered keeps the name.
 3. The agent calls the plugin's `init` function, passing a context with configuration and callbacks.
 4. When the server sends an instruction targeting a plugin action, the agent dispatches it to the correct plugin.
 5. The plugin executes the action and returns results via the output callback.
