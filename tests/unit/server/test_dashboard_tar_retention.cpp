@@ -525,13 +525,31 @@ TEST_CASE("retention-paused page: a cut read with no rows says the page cannot t
     yuzu::test::ExportByteCapGuard guard(60);  // keeps one or two of three responses
     // agents_responded < scan_count (the dropped agents never "answered") and, with
     // scan_count == agents_responded after the cut, the "all clear" branch would fire.
-    for (const int scan_count : {5, 3}) {
+    // The surviving response count is the one scan_count the other two cannot reach: with
+    // agents_responded == scan_count the page would otherwise be eligible for the "all agents
+    // responded, every collector is running normally" text even though a response was dropped.
+    // Measure it rather than hard-code it (how many responses fit under the cap depends on the
+    // row sizes), then run it as the third case.
+    int surviving = 0;
+    {
+        DashboardTarRetentionTestAccess probe;
+        probe.set_stores(&rs, &mg);
+        probe.set_scan(kUser, kScan, 5, 1);
+        const auto first = probe.routes.gather_tar_retention_paused(kUser);
+        REQUIRE(first.result_truncated_by_cap);
+        surviving = first.agents_responded;
+        REQUIRE(surviving >= 1);
+        REQUIRE(surviving < 3); // at least one of the three responses was dropped
+    }
+    for (const int scan_count : {5, 3, surviving}) {
         DashboardTarRetentionTestAccess acc;
         acc.set_stores(&rs, &mg);
         acc.set_scan(kUser, kScan, scan_count, 1);
         const auto scan = acc.routes.gather_tar_retention_paused(kUser);
         REQUIRE(scan.result_truncated_by_cap);
         REQUIRE(scan.rows.empty());
+        if (scan_count == surviving)
+            REQUIRE(scan.agents_responded == scan_count); // the all-clear-eligible case
         const auto html = acc.render(kUser);
         INFO("scan_count=" << scan_count);
         CHECK(contains(html, "No paused sources in the partial result"));

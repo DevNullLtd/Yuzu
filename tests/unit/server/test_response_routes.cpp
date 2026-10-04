@@ -1062,7 +1062,9 @@ TEST_CASE("GET /api/responses/:id/export: a scope drop with a failing audit is a
                 CHECK(res->body.find("in-scope-agent") == std::string::npos);
                 CHECK(res->body.find("out-of-scope-agent") == std::string::npos);
                 CHECK(res->get_header_value("Content-Disposition").empty());
-                CHECK(h.audits.size() == fail_after + 1); // the failing row ends the request
+                // REQUIRE, not CHECK: a missing row must fail cleanly rather than make the
+                // index below undefined behaviour.
+                REQUIRE(h.audits.size() == fail_after + 1); // the failing row ends the request
                 CHECK(h.audits[0].result == "denied");
             }
         }

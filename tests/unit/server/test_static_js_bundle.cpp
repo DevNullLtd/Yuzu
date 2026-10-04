@@ -1120,6 +1120,32 @@ TEST_CASE("static_js_bundle: kYuzuChartsJs surfaces a cut visualization result i
     // The call itself: a defined-but-never-invoked helper must not satisfy this test.
     // Anchored to a line start so a commented-out call does not satisfy it.
     CHECK_THAT(js, ContainsSubstring("\n    truncationNotice(target, data);"));
+    // The call must also be REACHED. render() has exactly two legitimate early exits before
+    // it (the null guard and the deferred-until-echarts-loads branch); any further `return`
+    // between the function's opening line and the call would make the notice dead code while
+    // the string checks above stayed green (a `return;` inserted there did exactly that).
+    // Limit, stated plainly: this pins the known set of early exits in the source text. It
+    // does not execute the JS, so a throw or an always-false branch before the call would
+    // not be caught; the ad hoc headless-Chrome check in the commit notes covers behaviour.
+    {
+        const std::string open_marker = "\n  function render(target, data) {";
+        const std::string call_marker = "\n    truncationNotice(target, data);";
+        const auto open_at = js.find(open_marker);
+        const auto call_at = js.find(call_marker);
+        REQUIRE(open_at != std::string::npos);
+        REQUIRE(call_at != std::string::npos);
+        REQUIRE(open_at < call_at);
+        const std::string span = js.substr(open_at, call_at - open_at);
+        std::size_t returns = 0;
+        for (auto at = span.find("return"); at != std::string::npos;
+             at = span.find("return", at + 1))
+            ++returns;
+        CHECK(returns == 2);
+        // And the notice runs before the error and empty-state branches, which return.
+        const auto error_at = js.find("\n    if (data.error) {", call_at);
+        REQUIRE(error_at != std::string::npos);
+        CHECK(call_at < error_at);
+    }
     // CSP is script-src 'self' 'unsafe-inline' with no unsafe-eval.
     CHECK_THAT(js, !ContainsSubstring("new Function("));
     CHECK_THAT(js, !ContainsSubstring("eval("));
