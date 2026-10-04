@@ -3424,7 +3424,8 @@ GuardianSparkRuntime::withdraw_rule_after_wedge_sweep_locked(
     // teardown continues; enqueue_lifecycle_locked's disarm branch is firewalled
     // inside itself (journal_stage_failures_) and its only caller-side allocation, the
     // kind string, was moved ahead of the mutation above. The inline-type synchronous
-    // backend_->disarm is contained too: a throw is counted and keys_ is still erased.
+    // backend_->disarm is contained too: a throw is counted and keys_ is still erased
+    // (containment, not completion: the engine subscription may remain live and unowned).
     if (known)
         rules_.erase(rule_id);
     try {
@@ -3456,6 +3457,9 @@ GuardianSparkRuntime::withdraw_rule_after_wedge_sweep_locked(
                 // defensive: a throw is swallowed and counted, and keys_ is still erased
                 // below (rules_ and the index mapping are already gone, so a surviving
                 // refcount-0 inline entry would be joined by the next attach on this key).
+                // The count means "inspect": the engine subscription may be left live and
+                // unowned, because the throw can come from a lock acquisition before or
+                // after SparkEngine::disarm's own bookkeeping.
                 try {
                     backend_->disarm(*inline_disarm);
                 } catch (...) {

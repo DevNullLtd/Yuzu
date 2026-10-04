@@ -682,7 +682,8 @@ flip, with a red-first test each:
     erases it (submitted off-lock afterwards), with one warning line per orphan naming the key. An
     inline-type key (no io class) is left alone: it never carries claims or ghost mappings and its
     refcount reaches 0 only inside `detach_rule_locked`, which tears it down synchronously (a throw
-    from the backend disarm is swallowed and counted, and `keys_` is still erased). Limits: it
+    from the backend disarm is swallowed and counted, and `keys_` is still erased, though the
+    engine subscription may then remain live and unowned). Limits: it
     runs once per heartbeat pass, so an idle orphan watcher can live until the next pass; a key whose
     ghost mapping is still held has a nonzero refcount and is not an orphan yet.
   - Trade D2 (decided by the maintainer during the #5322 work): a clean follower queued behind a
@@ -750,7 +751,8 @@ flip, with a red-first test each:
       counters `detach_sweep_left_residue()`, `detach_claim_failures()`,
       `detach_post_commit_failures()` and `claims_dropped_at_stop()`: this fix removed the live
       assert on the last-on-key sweep and made the residue fallback an accepted, counted outcome,
-      and `detach_post_commit_failures()` also counts a swallowed inline-type backend disarm throw.
+      and `detach_post_commit_failures()` also counts a swallowed inline-type backend disarm throw
+      (a nonzero value means inspect: that engine subscription may remain live and unowned).
       The residue fallback increments both `detach_sweep_left_residue()` and
       `detach_claim_failures()`. Steady-state expectation for the first three is 0 outside a
       failing index release; `claims_dropped_at_stop()` counts shutdown drops only.

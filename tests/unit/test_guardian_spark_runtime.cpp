@@ -12516,6 +12516,16 @@ struct TombRig5322 : SeamRig4605 {
         REQUIRE(res.has_value());
         REQUIRE(res->kind == RT::ArmOutcomeKind::Accepted);
     }
+    /// For an attach NOT held behind the hung head or a full pool: the arm runs on a free
+    /// worker, so its claim may commit before the non-waiting attach returns (Armed, an empty
+    /// receipt) or still be in flight (Accepted). Both are a fresh arm; the caller's spin_until
+    /// conditions on the backend counts tell the outcomes apart from a join.
+    void attach_free_pool(const std::string& rid) {
+        auto res = rt->attach_rule(RT::NonWaiting{}, rid, file_spec("/a"), file_exists_rule(rid), true);
+        REQUIRE(res.has_value());
+        REQUIRE((res->kind == RT::ArmOutcomeKind::Accepted ||
+                 res->kind == RT::ArmOutcomeKind::Armed));
+    }
     /// Hung head `h`, rule `ra` queued behind it, the seam sticky, `ra` detached: ra's claim
     /// is a retained tombstone in the middle of the fifo (its release fails, so Case 0
     /// leaves it withdrawn and Queued).
@@ -12751,7 +12761,7 @@ TEST_CASE("#5322: a same-rule re-attach over an orphan watcher's tombstone re-ar
     // z re-attaches (no park_every: the synchronous teardown below needs none).
     const auto residue_before = f.rt->detach_sweep_left_residue();
     const auto claim_failures_before = f.rt->detach_claim_failures();
-    f.attach("z");
+    f.attach_free_pool("z");
     CHECK(f.rt->detach_sweep_left_residue() == residue_before + 1);
     CHECK(f.rt->detach_claim_failures() == claim_failures_before + 1);
     REQUIRE(yuzu::test::spin_until([&] { return f.b->disarms.load() == 1; }, 10s));
@@ -13803,6 +13813,7 @@ TEST_CASE("#5322: a throwing inline disarm in the last detach is contained and t
     CHECK_NOTHROW(rt->detach_rule("r1"));
     CHECK(b->disarm_entries.load() == 1); // the disarm was attempted, and it threw
     CHECK_FALSE(b->throw_next_disarm.load());
+    CHECK(rt->detach_post_commit_failures() == 1); // the contained throw is counted
     CHECK(rt->rule_count() == 0);
     CHECK(rt->armed_key_count() == 0); // the keys_ entry is gone, not left at refcount 0
     REQUIRE_REGISTRY_INVARIANTS_5322(*rt);

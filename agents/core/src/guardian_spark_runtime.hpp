@@ -847,8 +847,11 @@ public:
     void set_detach_post_fault_point_for_test(int point) noexcept;
     /// R5.2 (r3 C4): a post-mutation step of detach_rule_locked threw and was contained:
     /// outbox_.drop_rule (non-durable), or the inline-type synchronous backend disarm
-    /// (keys_ is still erased, #5322). The teardown and any queued disarm completed
-    /// regardless. Expected 0. Lock-free.
+    /// (keys_ is still erased, #5322). The queued disarm, if any, was still handed to the
+    /// caller. A nonzero count means "inspect", not "teardown completed": a throw from the
+    /// inline backend disarm can leave the engine subscription live and unowned (the
+    /// std::system_error may come from a lock acquisition before or after SparkEngine's
+    /// bookkeeping). Expected 0. Lock-free.
     [[nodiscard]] std::uint64_t detach_post_commit_failures() const noexcept {
         return detach_post_commit_failures_.load(std::memory_order_relaxed);
     }
