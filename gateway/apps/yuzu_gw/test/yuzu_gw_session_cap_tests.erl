@@ -76,6 +76,16 @@ cap_test_() ->
        fun concurrent_reservations_admit_the_cap/0},
       {"200 concurrent Registers proxy at most the cap upstream and store one row per admitted",
        {timeout, 60, fun concurrent_registers_proxy_at_most_cap/0}},
+      {"20 concurrent Registers of ONE agent id proxy at most the cap upstream, the rest are refused",
+       {timeout, 60, fun concurrent_same_id_registers_proxy_at_most_cap/0}},
+      {"20 concurrent reservations of one agent id admit exactly the cap",
+       fun concurrent_same_id_reservations_admit_the_cap/0},
+      {"4 agents with 5 concurrent reservations each admit exactly the cap in total",
+       fun concurrent_mixed_id_reservations_admit_the_cap/0},
+      {"a same-id reservation is admitted once the earlier ones are released, a retry in flight uses a slot",
+       fun same_id_reservation_after_release/0},
+      {"an agent with a live row and a committed pending row registers again on a full connection",
+       fun live_and_committed_rows_of_registering_agent_do_not_count/0},
       {"a failed proxied Register releases its reservation",
        fun failed_proxy_releases_reservation/0},
       {"an expired reservation is not counted and the sweep removes it",
@@ -90,7 +100,7 @@ cap_test_() ->
        fun commit_of_removed_row_is_superseded/0},
       {"a superseded Register is answered UNAVAILABLE without a WARN, a failing registry INTERNAL with one",
        fun handler_superseded_register_is_retryable/0},
-      {"2 and 20 concurrent Registers of one agent id leave exactly one pending row, 200 times",
+      {"2 and 20 concurrent Registers of one agent id leave exactly one pending row, 200 times (cap above the concurrency)",
        {timeout, 120, fun concurrent_same_agent_registers_leave_one_row/0}},
       {"the rows of a connection that dies are gone at once, other connections' rows stay",
        fun closed_connection_rows_dropped/0},
@@ -564,6 +574,118 @@ concurrent_registers_proxy_at_most_cap() ->
     ?assertEqual([], reserved_rows()),
     ?assertEqual(200 - ?CAP, refused()).
 
+%% The same at the handler with ONE agent id: every Register carries the same id,
+%% so none is another agent's row, yet each reservation holds a slot. 8 are
+%% blocked upstream, 12 are answered UNAVAILABLE and counted, and only the 8 were
+%% ever proxied. Released, the 8 end with one pending row (the same-agent commit
+%% rule) and every reply either ok or the retryable superseded.
+concurrent_same_id_registers_proxy_at_most_cap() ->
+    mock_handler_deps(),
+    Parent = self(),
+    N = 20,
+    ok = meck:expect(yuzu_gw_upstream, proxy_register,
+                     fun(#{info := #{agent_id := Id}}) ->
+                         Parent ! {in_proxy, self()},
+                         receive {release, Parent} -> ok after 20000 -> error(not_released) end,
+                         {ok, #{session_id => <<"reg-session-", Id/binary,
+                                                "-", (integer_to_binary(erlang:unique_integer([positive])))/binary>>}}
+                     end),
+    [spawn_link(fun() ->
+         Reply = yuzu_gw_agent_service:register(
+                     ctx_with(conn_a),
+                     #{info => #{agent_id => agent(1), hostname => <<"h">>}}),
+         Parent ! {replied, I, Reply}
+     end) || I <- lists:seq(1, N)],
+    Refusals = [receive {replied, I, R} -> {I, R} after 5000 -> error(timeout) end
+                || _ <- lists:seq(1, N - ?CAP)],
+    [?assertMatch({_, {grpc_error, {?GRPC_STATUS_UNAVAILABLE, _}}}, R) || R <- Refusals],
+    InProxy = [receive {in_proxy, P} -> P after 5000 -> error(timeout) end
+               || _ <- lists:seq(1, ?CAP)],
+    ?assertEqual(?CAP, length(reserved_rows())),
+    ?assertEqual(N - ?CAP, refused()),
+    [P ! {release, Parent} || P <- InProxy],
+    Replies = [receive {replied, _, R} -> R after 10000 -> error(timeout) end
+               || _ <- lists:seq(1, ?CAP)],
+    ?assert(lists:any(fun({ok, _, _}) -> true; (_) -> false end, Replies), Replies),
+    [?assert(case R of
+                 {ok, _, _}                                  -> true;
+                 {grpc_error, {?GRPC_STATUS_UNAVAILABLE, _}} -> true;
+                 _                                           -> false
+             end, R) || R <- Replies],
+    ?assertEqual(?CAP, meck:num_calls(yuzu_gw_upstream, proxy_register, '_')),
+    ?assertEqual(1, length(pending_rows(conn_a))),
+    ?assertEqual([], reserved_rows()),
+    ?assertEqual(N - ?CAP, refused()).
+
+%% The registry-level counterpart: 20 processes reserve for ONE agent id at once.
+concurrent_same_id_reservations_admit_the_cap() ->
+    C = conn(),
+    Results = concurrent_reserve(C, [agent(1) || _ <- lists:seq(1, 20)]),
+    ?assertEqual(?CAP, length([x || {ok, _} <- Results])),
+    ?assertEqual(20 - ?CAP, length([x || {error, session_limit} <- Results])),
+    ?assertEqual(20 - ?CAP, refused()),
+    ?assertEqual(?CAP, length(reserved_rows())).
+
+%% 4 agents, 5 concurrent reservations each: the slots are counted by reservation,
+%% for the agent itself and for the others alike, so exactly the cap is admitted.
+concurrent_mixed_id_reservations_admit_the_cap() ->
+    C = conn(),
+    Agents = [agent(I) || I <- lists:seq(1, 4), _ <- lists:seq(1, 5)],
+    Results = concurrent_reserve(C, Agents),
+    ?assertEqual(?CAP, length([x || {ok, _} <- Results])),
+    ?assertEqual(20 - ?CAP, length([x || {error, session_limit} <- Results])),
+    ?assertEqual(?CAP, length(reserved_rows())).
+
+%% Reservations released (their proxied Register finished) free their slots, and a
+%% retry made while the earlier Register is in flight is one slot more.
+same_id_reservation_after_release() ->
+    C = conn(),
+    Refs = [begin {ok, R} = yuzu_gw_registry:reserve_session(C, agent(1)), R end
+            || _ <- lists:seq(1, ?CAP)],
+    ?assertEqual({error, session_limit}, yuzu_gw_registry:reserve_session(C, agent(1))),
+    [ok = yuzu_gw_registry:release_session(R) || R <- Refs],
+    ?assertEqual([], reserved_rows()),
+    {ok, Ref} = yuzu_gw_registry:reserve_session(C, agent(1)),
+    ?assertEqual(ok, yuzu_gw_registry:store_pending(session(1), info(agent(1), C), Ref)),
+    %% A committed row is not a slot for its own agent: 8 more are admitted.
+    More = [yuzu_gw_registry:reserve_session(C, agent(1)) || _ <- lists:seq(1, ?CAP + 1)],
+    ?assertEqual(?CAP, length([x || {ok, _} <- More])),
+    %% One agent's retry in flight while 7 others hold rows uses the last slot.
+    C2 = conn(),
+    [bind(agent(I), session(I), C2) || I <- lists:seq(10, 10 + ?CAP - 2)],
+    {ok, _} = yuzu_gw_registry:reserve_session(C2, agent(2)),
+    ?assertEqual({error, session_limit}, yuzu_gw_registry:reserve_session(C2, agent(2))).
+
+%% The agent's own live row and committed pending row are not slots: a connection
+%% holding that agent and 7 others admits its next Register at once (the commit
+%% supersedes both), where counting either would refuse it.
+live_and_committed_rows_of_registering_agent_do_not_count() ->
+    C = conn(),
+    %% The other 7 agents and this one, whose live and pending rows count twice for
+    %% the others (stored with the cap lifted, as reservation_is_the_admission does).
+    CapKey = {yuzu_gw_registry, max_sessions_per_connection},
+    persistent_term:put(CapKey, 100),
+    bind(agent(1), session(1), C),
+    ok = yuzu_gw_registry:store_pending(session(101), info(agent(1), C)),
+    [bind(agent(I), session(I), C) || I <- lists:seq(2, ?CAP)],
+    persistent_term:put(CapKey, ?CAP),
+    ?assertEqual(0, refused()),
+    {ok, Ref} = yuzu_gw_registry:reserve_session(C, agent(1)),
+    ?assertEqual(ok, yuzu_gw_registry:store_pending(session(102), info(agent(1), C), Ref)),
+    ?assertEqual([session(102)], pending_rows(C)),
+    ?assertEqual(0, refused()),
+    %% A ninth distinct agent is refused: the connection is full.
+    ?assertEqual({error, session_limit}, yuzu_gw_registry:reserve_session(C, agent(99))).
+
+concurrent_reserve(C, Agents) ->
+    Parent = self(),
+    Pids = [spawn_link(fun() ->
+                receive go -> ok end,
+                Parent ! {reserved, self(), yuzu_gw_registry:reserve_session(C, A)}
+            end) || A <- Agents],
+    [P ! go || P <- Pids],
+    [receive {reserved, P, R} -> R after 5000 -> error(timeout) end || P <- Pids].
+
 failed_proxy_releases_reservation() ->
     mock_handler_deps(),
     Reg = fun(Conn, I) ->
@@ -789,6 +911,9 @@ handler_superseded_register_is_retryable() ->
 concurrent_same_agent_registers_leave_one_row() ->
     Parent = self(),
     Agent = agent(1),
+    %% Each in-flight reservation is a slot, so the cap is lifted above the 20
+    %% concurrent callers: this case pins the commit rule, the cap has its own.
+    persistent_term:put({yuzu_gw_registry, max_sessions_per_connection}, 50),
     lists:foreach(fun({N, Round}) ->
         C = conn(),
         Id = fun(I) -> iolist_to_binary(["capsession-c", integer_to_list(N), "-",

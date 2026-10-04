@@ -36,11 +36,17 @@
 %%% live row), so one agent holds at most one pending row and one live row and a
 %%% connection holds at most cap+1 rows (the agent being registered keeps its live
 %%% row until its Subscribe replaces it). A Register repeated with one id and no
-%%% Subscribe therefore never grows the pending table.
+%%% Subscribe therefore never grows the pending table. The exception is a Register
+%%% still in flight: each reservation is a slot of its own, the registering
+%%% agent's other reservations included (only its live row and its committed
+%%% pending row are not counted, a commit supersedes them), so N concurrent
+%%% Registers of one id admit at most the cap and a retry made while an earlier
+%%% Register is in flight uses one more slot until that one is released or
+%%% committed.
 %%%
 %%% 2. One atomic step. The check and the claim of a slot are made inside this
-%%% process, which handles one call at a time: reserve_session/2 counts the other
-%%% agents' rows and, below the cap, stores a reservation row (a pending-table
+%%% process, which handles one call at a time: reserve_session/2 counts the slots held
+%%% and, below the cap, stores a reservation row (a pending-table
 %%% row keyed {reserved, Ref}, same TTL, counted like a pending row) before the
 %%% registration is proxied upstream, so N concurrent Registers on a connection
 %%% admit at most the cap and the rest are refused with nothing sent to the
@@ -642,8 +648,10 @@ insert_pending(SessionId, Info) ->
 %% proxied upstream. `{ok, Reservation}' holds the slot until it is turned into
 %% the pending row by store_pending/3, released by release_session/1 or swept
 %% after the pending TTL; `{error, session_limit}' when the connection already
-%% holds `max_sessions_per_connection' other agents' rows (counted, and logged
-%% as one WARN per second that names only the cap). The check and the claim are
+%% holds `max_sessions_per_connection' slots other than the agent's own live row
+%% and committed pending row (the agent's other reservations in flight each count;
+%% a refusal is counted, and logged as one WARN per second that names only the
+%% cap). The check and the claim are
 %% one step in the registry process, which is what makes the cap hold under
 %% concurrent Registers. A `undefined' key is never counted: `{ok, undefined}'.
 %% `{error, registry_unavailable}' when the registry cannot be called.
@@ -680,8 +688,18 @@ release_session(Reservation) ->
 session_admission(undefined, _AgentId) ->
     ok;
 session_admission(ConnKey, AgentId) ->
+    admission(ConnKey, AgentId, live).
+
+%% Mode `live': AgentId's own rows never count (the live insert replaces its live
+%% row and consumes its Register's pending row). Mode `reserve': the agent's live
+%% row and committed pending row still do not count (the commit this reservation
+%% leads to supersedes them), but every other in-flight reservation of the agent
+%% does, one slot each: each is a Register proxied upstream.
+admission(undefined, _AgentId, _Mode) ->
+    ok;
+admission(ConnKey, AgentId, Mode) ->
     Cap = max_sessions_per_connection(),
-    case others_on_connection(ConnKey, AgentId) >= Cap of
+    case others_on_connection(ConnKey, AgentId, Mode) >= Cap of
         true ->
             telemetry:execute([yuzu, gw, session, limit_rejected], #{count => 1}, #{}),
             warn_session_limit(Cap),
@@ -693,15 +711,24 @@ session_admission(ConnKey, AgentId) ->
 max_sessions_per_connection() ->
     persistent_term:get(?MAX_SESSIONS_KEY, ?DEFAULT_MAX_SESSIONS).
 
-%% The rows other than AgentId's own on ConnKey: one per live session, plus one
-%% per agent with a pending (not past its TTL) or reserved session. AgentId's own
-%% rows never count: its Register replaces its older pending rows and its live
-%% insert replaces its live row. A table that does not exist counts as empty: its
-%% absence is reported by the calls that need it, not here.
-others_on_connection(ConnKey, AgentId) ->
+%% The slots held on ConnKey other than AgentId's own live row and committed
+%% pending row (its live insert replaces the first and its commit supersedes the
+%% second): one per live session of another agent, one per reservation (each is a
+%% Register in flight, whatever agent holds it), and one per other agent whose
+%% committed pending row is not past its TTL and who has no reservation in flight
+%% (a commit of that reservation supersedes the committed row). In mode `live'
+%% AgentId's reservations are left out too. A table that does not exist counts as
+%% empty: its absence is reported by the calls that need it, not here.
+others_on_connection(ConnKey, AgentId, Mode) ->
     Live = [A || A <- live_agents(ConnKey), A =/= AgentId],
-    Pending = [A || A <- lists:usort(pending_agents(ConnKey)), A =/= AgentId],
-    length(Live) + length(Pending).
+    {Reserved, Committed} = pending_slots(ConnKey),
+    Reservations = case Mode of
+        live    -> [A || A <- Reserved, A =/= AgentId];
+        reserve -> Reserved
+    end,
+    Holding = sets:from_list(Reserved),
+    Rows = [A || A <- lists:usort(Committed), A =/= AgentId, not sets:is_element(A, Holding)],
+    length(Live) + length(Reservations) + length(Rows).
 
 live_agents(ConnKey) ->
     case persistent_term:get(?CONN_INDEX_KEY, undefined) of
@@ -713,12 +740,15 @@ live_agents(ConnKey) ->
             end
     end.
 
-%% The agent ids of the pending and reserved rows on ConnKey (a reservation is a
-%% pending-table row keyed {reserved, Ref}) not past their TTL; one entry per row.
+%% The agent ids of the reservation rows and of the committed pending rows on
+%% ConnKey (a reservation is a pending-table row keyed {reserved, Ref}, a committed
+%% row is keyed by its binary session id) not past their TTL; one entry per row.
 %% Read from the connection's index: the cost is its rows, not the table's.
-pending_agents(ConnKey) ->
+pending_slots(ConnKey) ->
     Oldest = erlang:monotonic_time(millisecond) - ?PENDING_TTL_MS,
-    [A || {_, #{agent_id := A}, StoredAt} <- indexed_rows(ConnKey), StoredAt >= Oldest].
+    Rows = [{Key, A} || {Key, #{agent_id := A}, StoredAt} <- indexed_rows(ConnKey),
+                        StoredAt >= Oldest],
+    {[A || {{reserved, _}, A} <- Rows], [A || {Key, A} <- Rows, is_binary(Key)]}.
 
 %% At most one WARN per second, from any process; the stamp is created by init/1
 %% (without it nothing is logged: the registry is not running).
@@ -829,7 +859,7 @@ init_limit_warn_stamp() ->
 handle_call({reserve_session, ConnKey, AgentId}, _From, State) ->
     %% Check and claim in one step: this process handles one call at a time, so
     %% the count a reservation was admitted on is the count the next one sees.
-    Reply = case session_admission(ConnKey, AgentId) of
+    Reply = case admission(ConnKey, AgentId, reserve) of
         ok ->
             Ref = make_ref(),
             true = ets:insert(?PENDING_TABLE,
@@ -863,7 +893,7 @@ handle_call({commit_pending, SessionId, ConnKey, AgentId, Ref}, _From, State) ->
                 true ->
                     supersede_pending(ConnKey, AgentId, SessionId, StoredAt);
                 false ->
-                    case session_admission(ConnKey, AgentId) of
+                    case admission(ConnKey, AgentId, reserve) of
                         ok ->
                             supersede_pending(ConnKey, AgentId, SessionId, StoredAt);
                         {error, session_limit} = Refused ->
