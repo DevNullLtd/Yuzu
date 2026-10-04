@@ -150,7 +150,7 @@ revocation, and the future gateway-mTLS cutover.)
 Individual agent heartbeats are not forwarded one-by-one. Instead,
 `yuzu_gw_upstream` buffers heartbeats and sends them in a single
 `BatchHeartbeat` RPC at a configurable interval (`heartbeat_batch_interval_ms`,
-default 1000 ms; env override `YUZU_GW_HEARTBEAT_INTERVAL_MS`).
+default 1000 ms, valid 100 to 60000; env override `YUZU_GW_HEARTBEAT_INTERVAL_MS`).
 
 This reduces upstream load from O(agents/interval) to O(nodes/interval).
 
@@ -563,13 +563,27 @@ client at start; set them in the `yuzu_gw` section of `sys.config`. No
 
 | Key | Default | Valid range | Meaning |
 |---|---|---|---|
-| `registration_replay_spacing_ms` | 20 | not range-checked | Gap between two replay `ProxyRegister` calls in the replay drip |
+| `registration_replay_spacing_ms` | 20 | 0 to 60000 | Gap between two replay `ProxyRegister` calls in the replay drip |
 | `registration_replay_session_guard_ms` | 10000 | 0 to 3600000 | A session that was just replayed is not queued again by a heartbeat verdict until this many ms have passed. The stamp is taken when the replay is sent, so a stale verdict can arrive up to the 5 s flush deadline (the vendored grpcbox client default) plus the replay RPC time later (INFERRED from the code): do not set it below 5000 plus the expected replay RPC time, because a smaller guard lets such a stale verdict replay a session the server already knows; the default 10000 is safe (see "Replaying a session the server already knows is not free" under [What happens when the server restarts](#what-happens-when-the-server-restarts)) |
-| `registration_replay_queue_max` | 10000 | 1 to 1000000 | Most agents the replay queue holds when a heartbeat verdict appends to it; there is one pending entry per agent, and an id past the cap is counted in `yuzu_gw_heartbeat_verdict_dropped_total{reason="queue_full"}`. The cap bounds only verdict appends: the snapshot a breaker recovery seeds is not capped (it is bounded by the number of agents the node holds, as before), and while a snapshot of this size or larger drains, every verdict id for an agent not already queued counts as `queue_full` |
+| `registration_replay_queue_max` | 10000 | 1 to 1000000 | Most agents the replay queue holds when a heartbeat verdict appends to it; there is one pending entry per agent, and an id past the cap is counted in `yuzu_gw_heartbeat_verdict_dropped_total{reason="queue_full"}` (so is an id in a verdict that the heartbeat buffer did not cast because the upstream client's mailbox held more than 100 messages, see "Heartbeat batching interval" below). The cap bounds only verdict appends: the snapshot a breaker recovery seeds is not capped (it is bounded by the number of agents the node holds, as before), and while a snapshot of this size or larger drains, every verdict id for an agent not already queued counts as `queue_full` |
 
-An invalid value for either of the last two logs a warning that names the key
+An invalid value for any of these three keys logs one warning that names the key
 and falls back to the default. See
 [What happens when the server restarts](#what-happens-when-the-server-restarts).
+
+**Heartbeat batching interval** (read by the heartbeat buffer at start; unlike
+the replay keys above, it also has an environment override):
+
+| Key | Environment override | Default | Valid range | Meaning |
+|---|---|---|---|---|
+| `heartbeat_batch_interval_ms` | `YUZU_GW_HEARTBEAT_INTERVAL_MS` | 1000 | 100 to 60000 | How often the buffered heartbeats are flushed in one `BatchHeartbeat` RPC. A value outside the range logs one warning that names the key and falls back to the default (INFERRED: the range check also applies to a value set through the environment override, because the override writes the same application key at start) |
+
+The buffer also skips casting a verdict to the upstream client when the upstream
+client's mailbox holds more than 100 messages. Those session ids are counted in
+`yuzu_gw_heartbeat_verdict_dropped_total{reason="queue_full"}` and one DEBUG line
+is logged; the sessions are listed again by later heartbeats (INFERRED). So
+`queue_full` means either that the replay queue is at its cap or that the upstream
+client has a message backlog.
 
 **Circuit breaker tuning** (the breaker the replay and the other upstream calls
 share; read once when the upstream client starts, not range-checked, and each key
@@ -882,7 +896,10 @@ upgraded, read the new gateway counters:
   - `circuit_open`: the upstream circuit breaker was open when the verdict
     arrived; the sessions are listed again by later heartbeats. Wait for the
     breaker (see the breaker rows above); do not restart.
-  - `queue_full`: the replay queue is at `registration_replay_queue_max`. The
+  - `queue_full`: the replay queue is at `registration_replay_queue_max`, or the
+    upstream client's mailbox held more than 100 messages when the heartbeat
+    buffer would have cast the verdict to it (the buffer then skips the cast and
+    logs one DEBUG line). The
     sessions are listed again by later heartbeats (INFERRED), so first wait and
     watch `yuzu_gw_registration_replay_queue_depth` fall. If it recurs at your
     normal fleet size, raise the key in the `yuzu_gw` section of `sys.config`
@@ -899,7 +916,10 @@ upgraded, read the new gateway counters:
   reported again by later heartbeats. No action; informational. It marks a
   recovery that needs more than one round (more than 4096 unknown sessions from
   one gateway in one batch), and the gateway logs a WARN
-  `Heartbeat verdict truncated by the server`.
+  `Heartbeat verdict truncated by the server`. The counter counts every
+  occurrence, but the WARN is logged at most once per 60 s per gateway node, and
+  its text ends with `suppressed N`, the number of occurrences since the last
+  WARN, so a recovery of several rounds does not repeat the line every flush.
 - `yuzu_gw_registration_replay_triggered_total{trigger="heartbeat"}`: rises by
   one each time a verdict queued at least one agent.
 - `yuzu_gw_registration_replay_total`: rises for every replay attempt the drip
@@ -1216,31 +1236,38 @@ env keys with defaults, which a reverted build ignores.
   `breaker_replay_during_targeted_drip_is_dropped`). Not observed on a rig.
   Tracked as a follow-up (no issue yet), together with the entry above.
 - **A crash report of `yuzu_gw_upstream` can still contain the enrollment token,
-  certificate or CSR of a registration that was queued or in flight.** While an
-  agent waits in the replay queue, the upstream client holds its stored
-  registration request. Before this change a crash report of that process
-  printed the whole state, with every queued request. Now the `format_status`
-  callback redacts, in that report: the replay queue and the recent-replay
-  stamps (shown as sizes), the last message, the reason and the debug log, and
-  an exception raised inside the upstream client's own RPC calls is caught and
-  counted as a failed RPC (code `exception`), so its stacktrace carries no
-  request. A crash from any other source (for example a function clause in a
-  helper that was handed a request) still prints that function's argument
-  list, because OTP appends the stacktrace after `format_status` runs. It also
-  cannot redact what OTP prints from raw data outside `format_status`: the
-  process mailbox, and the `messages:` and exception lines of the `proc_lib`
-  crash report. So an
-  unhandled crash of this process while a registration is queued or in flight can
-  still print the credentials of those in-flight requests. This was verified on
-  a stand-in probe (OTP 28.4.2), not on a rig and not with the real process. The
-  exposure needs both an unhandled crash of the process and an in-flight request.
-  Operator guidance: treat any `yuzu_gw_upstream` crash report as sensitive. If
-  your log pipeline is shared, bound how much of a term the logger prints with
-  the `chars_limit` and `depth` options of the `logger_formatter` (set in the
-  handler's `formatter` config; a size bound, not a redaction, and not tested
-  here). The shipped `gateway/config/sys.config` and `sys.config.prod` set
-  neither: their default handler sets only a level and a formatter template
-  (read at this commit).
+  certificate or CSR of a registration that was queued or in flight, in two
+  cases: when the module is used outside the application, and for a report shape
+  that the redaction filter does not recognise.** While an agent waits in the
+  replay queue, the upstream client holds its stored registration request.
+  Before this change a crash report of that process printed the whole state,
+  with every queued request. Now three layers apply. First, the `format_status`
+  callback redacts the replay queue and the recent-replay stamps (shown as
+  sizes), the last message, the reason and the debug log. Second, an exception
+  raised inside the upstream client's own RPC calls is caught and counted as a
+  failed RPC (code `exception`), so its stacktrace carries no request. Third, a
+  logger primary filter, `yuzu_gw_crash_redact`, installed when the application
+  starts, redacts the crash report of `yuzu_gw_upstream` and the supervisor
+  `child_terminated` report for it: the process mailbox becomes a count, and the
+  `messages:` line and the exception lines keep no argument lists. A crash from
+  any other source (for example a function clause in a helper that was handed a
+  request) would otherwise print that function's argument list, because OTP
+  appends the stacktrace after `format_status` runs; with the application
+  running, the filter removes the argument lists from that report as well. The
+  filter is verified by a unit test on the real process (the final test
+  count is on the PR); it was not run on a rig. The residual
+  is therefore: use of the module outside the application (the filter is
+  installed by the application start, so a bare `yuzu_gw_upstream` started in a
+  shell has no filter), and any report shape the filter does not recognise (an
+  OTP release that formats the report differently). The exposure needs both an
+  unhandled crash of the process and an in-flight request. Operator guidance:
+  treat any `yuzu_gw_upstream` crash report as sensitive. As defence in depth, if
+  your log pipeline is shared, you can also bound how much of a term the logger
+  prints with the `chars_limit` and `depth` options of the `logger_formatter`
+  (set in the handler's `formatter` config; a size bound, not a redaction, and
+  not tested here); it is no longer the main remedy. The shipped
+  `gateway/config/sys.config` and `sys.config.prod` set neither: their default
+  handler sets only a level and a formatter template (read at this commit).
 - The several-replica and agent-dependency limits are described above.
 - Related tracked items: #5244 (an idempotent adopt: a re-adopt of a session the
   server already holds wipes placement), #4632 (the in-flight notification limit
@@ -1434,10 +1461,10 @@ that are actually emitted are listed.
 | `yuzu_gw_upstream_rpc_duration_ms` | histogram | Upstream (gateway→server) RPC latency in ms (label `rpc_name`) |
 | `yuzu_gw_upstream_rpc_errors_total` | counter | Upstream RPC errors (labels `rpc_name`, `code`) |
 | `yuzu_gw_registration_replay_total` | counter | Total registration replay attempts by the drip, any outcome. The drip runs after the upstream circuit breaker recovers, and when a heartbeat verdict lists sessions the gateway still holds |
-| `yuzu_gw_registration_replay_queue_depth` | gauge | Agents still queued for registration replay, whether queued by an upstream recovery or by a heartbeat verdict (0 = idle, label `node`). A persistently non-zero value indicates a replay that never drains; alert on it. |
+| `yuzu_gw_registration_replay_queue_depth` | gauge | Agents still queued for registration replay, whether queued by an upstream recovery or by a heartbeat verdict (0 = idle, label `node`). A non-zero value is normal while a drip runs: each entry takes the `ProxyRegister` RPC time plus the spacing (20 ms by default), so a full 10000-entry verdict queue takes at least 200 s to drain (250 s at 5 ms RPC time, see the table under "Load and convergence bounds"), and a breaker-seeded snapshot can be larger. A value that does not fall over longer than that points to a replay that is not draining (INFERRED). No alert rule ships for it. |
 | `yuzu_gw_registration_replay_triggered_total` | counter | Registration replays started, by `trigger` (`breaker` = the upstream recovered and every agent this node holds is queued for replay, unless a verdict-seeded drip is already queued, in which case the trigger is dropped, `heartbeat` = a heartbeat verdict listed sessions the server does not know and only those are replayed). Both series are created at 0 at start. |
-| `yuzu_gw_heartbeat_unknown_truncated_total` | counter | `BatchHeartbeat` responses whose list of unknown sessions the server truncated at 4096. Sessions beyond the cap may be reported again by later heartbeats. |
-| `yuzu_gw_heartbeat_verdict_dropped_total` | counter | Session ids named by a heartbeat verdict that were not queued for replay (label `reason`, closed set: `malformed` = not a usable session id, `not_local` = this node does not hold the session, `circuit_open` = the upstream circuit breaker is open, `queue_full` = the replay queue is at its cap; the cap bounds only verdict appends, so while a breaker-seeded snapshot of that size or larger drains, every verdict id for an agent not already queued counts here). Every reason is created at 0 at start. Ids already queued, or replayed within the session guard window, are not counted. |
+| `yuzu_gw_heartbeat_unknown_truncated_total` | counter | `BatchHeartbeat` responses whose list of unknown sessions the server truncated at 4096. Sessions beyond the cap may be reported again by later heartbeats. Every occurrence is counted; the matching WARN is logged at most once per 60 s per gateway node. |
+| `yuzu_gw_heartbeat_verdict_dropped_total` | counter | Session ids named by a heartbeat verdict that were not queued for replay (label `reason`, closed set: `malformed` = not a usable session id, `not_local` = this node does not hold the session, `circuit_open` = the upstream circuit breaker is open, `queue_full` = the replay queue is at its cap, or the upstream client's mailbox held more than 100 messages so the heartbeat buffer did not cast the verdict; the cap bounds only verdict appends, so while a breaker-seeded snapshot of that size or larger drains, every verdict id for an agent not already queued counts here). Every reason is created at 0 at start. Ids already queued, or replayed within the session guard window, are not counted. |
 | `yuzu_gw_cluster_peers_resolved` | gauge | Peer addresses found by the cluster-formation redial loop's most recent tick (label `node`; HA WS-4 `#4555`). 0 is expected for a genuinely single-node deployment. |
 | `yuzu_gw_cluster_peers_connected` | gauge | Distribution-connected peer nodes as of the most recent redial tick (label `node`; `#4555`). Compare against `peers_resolved` — a sustained gap most often means a distribution-cookie mismatch across replicas. |
 | `yuzu_gw_cluster_connect_failures_total` | counter | Total `net_kernel:connect_node/1` failures from the redial loop (`#4555`). |
