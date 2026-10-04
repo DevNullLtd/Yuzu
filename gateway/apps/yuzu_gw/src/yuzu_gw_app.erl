@@ -76,8 +76,14 @@ do_start_services() ->
     logger:info("Heartbeat admission is connection-bound: a heartbeat is "
                 "admitted only on the connection that opened its session"),
 
-    %% Start the supervision tree.
-    yuzu_gw_sup:start_link().
+    %% Start the supervision tree. The crash-report filter goes in first so
+    %% the upstream's first crash is already redacted (it holds registration
+    %% credentials in its mailbox); a tree that does not start removes it again.
+    ok = yuzu_gw_crash_redact:install(),
+    case yuzu_gw_sup:start_link() of
+        {ok, _} = Started -> Started;
+        Other             -> ok = yuzu_gw_crash_redact:remove(), Other
+    end.
 
 %%--------------------------------------------------------------------
 %% Distribution cookie guard (#659)
@@ -203,6 +209,9 @@ stop(_State) ->
         timer:sleep(500)
     end,
 
+    %% The filter outlives the supervision tree (already down by now), so the
+    %% upstream's shutdown reports are redacted too.
+    ok = yuzu_gw_crash_redact:remove(),
     logger:info("Gateway shutdown complete"),
     ok.
 

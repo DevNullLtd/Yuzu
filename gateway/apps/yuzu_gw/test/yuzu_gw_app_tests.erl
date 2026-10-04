@@ -119,3 +119,62 @@ boot_creates_summary_state_before_listener_and_sup_test() ->
         end,
         persistent_term:erase(Key)
     end.
+
+%%%===================================================================
+%%% Boot wiring: the upstream crash-report redaction filter (#1197)
+%%%===================================================================
+
+%% yuzu_gw_app:start/2 installs the yuzu_gw_crash_redact primary filter before
+%% the supervision tree starts (so the upstream's first crash is already
+%% redacted) and stop/1 removes it. Nothing else boots the app, so a deleted
+%% install or remove call is invisible without this.
+boot_installs_crash_filter_before_sup_and_stop_removes_it_test() ->
+    with_boot_mocks(
+      fun(Self) ->
+          fun() -> Self ! {sup_started, crash_filter_installed()}, {ok, self()} end
+      end,
+      fun() ->
+          ?assertEqual(false, crash_filter_installed()),
+          ?assertMatch({ok, _}, yuzu_gw_app:start(normal, [])),
+          ?assertEqual(true, receive {sup_started, F} -> F after 0 -> missing end),
+          ?assertEqual(true, crash_filter_installed()),
+          ?assertEqual(ok, yuzu_gw_app:stop([])),
+          ?assertEqual(false, crash_filter_installed())
+      end).
+
+%% A supervision tree that does not start must not leave the filter behind.
+boot_removes_crash_filter_when_the_tree_does_not_start_test() ->
+    with_boot_mocks(
+      fun(_Self) -> fun() -> {error, boom} end end,
+      fun() ->
+          ?assertEqual({error, boom}, yuzu_gw_app:start(normal, [])),
+          ?assertEqual(false, crash_filter_installed())
+      end).
+
+crash_filter_installed() ->
+    lists:keymember(yuzu_gw_crash_redact, 1, maps:get(filters, logger:get_primary_config())).
+
+%% Run Body with the listener, telemetry setup, supervisor and heartbeat
+%% buffer replaced (no port or process is started); SupFun(Self) is the
+%% supervisor's start_link/0.
+with_boot_mocks(SupFun, Body) ->
+    Mods = [yuzu_gw_telemetry, prometheus_httpd, yuzu_gw_sup, yuzu_gw_heartbeat_buffer],
+    PrevCookieFlag = os:getenv("YUZU_GW_ALLOW_DEFAULT_COOKIE"),
+    os:putenv("YUZU_GW_ALLOW_DEFAULT_COOKIE", "1"),
+    ok = yuzu_gw_crash_redact:remove(),
+    ok = meck:new(Mods, [non_strict, no_link]),
+    try
+        meck:expect(yuzu_gw_telemetry, setup, fun() -> ok end),
+        meck:expect(prometheus_httpd, start, fun() -> {ok, self()} end),
+        meck:expect(yuzu_gw_sup, start_link, SupFun(self())),
+        meck:expect(yuzu_gw_heartbeat_buffer, flush_sync, fun() -> ok end),
+        Body()
+    after
+        meck:unload(Mods),
+        ok = yuzu_gw_crash_redact:remove(),
+        case PrevCookieFlag of
+            false -> os:unsetenv("YUZU_GW_ALLOW_DEFAULT_COOKIE");
+            Prev  -> os:putenv("YUZU_GW_ALLOW_DEFAULT_COOKIE", Prev)
+        end,
+        persistent_term:erase({yuzu_gw_heartbeat_admission, summary_state})
+    end.

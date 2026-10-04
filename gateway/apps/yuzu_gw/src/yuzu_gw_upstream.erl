@@ -66,6 +66,10 @@
          replay_sessions/1,
          circuit_state/0]).
 -export([classify_tls_error/1]).  %% for testing (R-3 TLS-error classifier)
+%% The reason/stacktrace redaction format_status/1 applies, shared with the
+%% crash-report filter (yuzu_gw_crash_redact), which applies it to the parts of
+%% a report OTP prints outside format_status.
+-export([redact_reason/1, redact_why/1, redact_stack/1]).
 
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, code_change/3,
@@ -655,11 +659,15 @@ code_change(_OldVsn, State, _Extra) ->
 %%     callback iterates it).
 %% Only the reports are affected: sys:get_state/1 still returns the real record.
 %%
-%% NOT covered, because OTP prints them from raw data outside this callback:
-%% the process mailbox (the `messages:' line of the proc_lib crash report),
-%% the exception line of that report, and the stacktrace that gen_server
-%% appends to the terminate report after calling this callback. A crash
-%% report of yuzu_gw_upstream is therefore sensitive: treat it as such.
+%% NOT covered by this callback, because OTP prints them from raw data outside
+%% it: the process mailbox (the `messages:' line of the proc_lib crash report),
+%% the exception line of that report, the stacktrace gen_server appends to its
+%% own terminate report after calling this callback, and the `reason' of the
+%% supervisor report. Those are redacted by yuzu_gw_crash_redact, a logger
+%% primary filter that yuzu_gw_app installs on start and removes on stop; it
+%% reuses redact_reason/1, redact_why/1 and redact_stack/1 below. It is NOT in
+%% place when this module is used without the application (a test, a shell):
+%% there a crash report of yuzu_gw_upstream is sensitive, treat it as such.
 %% do_rpc/4 keeps the request out of exceptions raised by the RPC itself.
 -spec format_status(map()) -> map().
 format_status(Status) ->
@@ -695,10 +703,12 @@ redact_message(Msg)                               -> Msg.
 %% when it is an atom, or a tuple whose first element is an atom (shown as
 %% {Atom, '$redacted'}: {badmatch, Value} carries the value); any other
 %% term becomes '$redacted'.
+-spec redact_reason(term()) -> term().
 redact_reason(Reason) when is_atom(Reason) -> Reason;
 redact_reason({Why, Stack})                -> {redact_why(Why), redact_stack(Stack)};
 redact_reason(_Other)                      -> '$redacted'.
 
+-spec redact_why(term()) -> term().
 redact_why(Why) when is_atom(Why) -> Why;
 redact_why(Why) when is_tuple(Why), tuple_size(Why) > 0, is_atom(element(1, Why)) ->
     {element(1, Why), '$redacted'};
@@ -707,6 +717,7 @@ redact_why(_Other) -> '$redacted'.
 %% A stacktrace frame prints its ARGUMENT LIST when the error was raised with
 %% one (function_clause, undef, error(Reason, Args)); keep the arity only. A
 %% frame that is not one of the two stacktrace shapes becomes '$redacted'.
+-spec redact_stack(term()) -> term().
 redact_stack(Stack) when is_list(Stack) ->
     [redact_frame(Frame) || Frame <- Stack];
 redact_stack(_Other) ->
