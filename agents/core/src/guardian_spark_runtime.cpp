@@ -2500,8 +2500,8 @@ std::size_t GuardianSparkRuntime::reap_stranded_claims_locked(
         if (++reaper_release_failed_passes_ % 64 == 0) {
             try {
                 spdlog::warn("Guardian spark: a retained claim's index release has failed on {} "
-                             "consecutive heartbeat passes - key '{}' (the first affected "
-                             "this pass) stays blocked",
+                             "consecutive heartbeat passes - key '{}' (the first one affected "
+                             "in this pass) stays blocked",
                              reaper_release_failed_passes_,
                              ::yuzu::log_key_token(*first_failed_key));
             } catch (...) {
@@ -2555,8 +2555,10 @@ void GuardianSparkRuntime::disarm_orphan_keys_locked(
             }
             it = keys_.erase(it); // same critical section as the push
             orphan_disarms_started_.fetch_add(1, std::memory_order_relaxed);
-            // An orphan is an anomaly (a release dropped the key's last mapping and nobody
-            // acted on the ->0 edge), so one line per orphan; each is erased this same pass.
+            // An orphan is an anomaly (an index release, e.g. a reaper pop, a sweep, a
+            // publish pop or an abandonment through release_claim_index_locked, dropped
+            // the key's last mapping and no caller acted on the ->0 edge), so one line per
+            // orphan; each is erased this same pass.
             try {
                 spdlog::warn("Guardian spark: key '{}' held a watcher with no index mapping left; "
                              "disarming it (orphan pass)",
@@ -2573,8 +2575,10 @@ void GuardianSparkRuntime::disarm_orphan_keys_locked(
         } else {
             // An inline-type key (no io class) never carries claims or ghost mappings, and
             // its refcount reaches 0 only inside detach_rule_locked, which tears it down
-            // synchronously, so a refcount-0 inline key is not expected here. Leave it
-            // alone rather than make a synchronous backend disarm under registry_mu_.
+            // synchronously (a throw from the backend disarm is swallowed and counted, and
+            // keys_ is still erased), so a refcount-0 inline key is not expected here.
+            // Leave it alone rather than make a synchronous backend disarm under
+            // registry_mu_.
             ++it;
             continue;
         }
@@ -3420,7 +3424,7 @@ GuardianSparkRuntime::withdraw_rule_after_wedge_sweep_locked(
     // teardown continues; enqueue_lifecycle_locked's disarm branch is firewalled
     // inside itself (journal_stage_failures_) and its only caller-side allocation, the
     // kind string, was moved ahead of the mutation above. The inline-type synchronous
-    // backend_->disarm is pre-existing and unchanged.
+    // backend_->disarm is contained too: a throw is counted and keys_ is still erased.
     if (known)
         rules_.erase(rule_id);
     try {
@@ -3439,12 +3443,24 @@ GuardianSparkRuntime::withdraw_rule_after_wedge_sweep_locked(
     // it return nullopt. When remove_rule did return a key it is *key_opt, so that case is
     // unchanged. The two can disagree, so this is deliberately not an assert (assert() is
     // live in every project build configuration, see the note above, and it aborted the
-    // agent on this shape).
+    // agent on this shape). The opposite disagreement (remove_rule returning a key while
+    // last_on_key is false) cannot occur: registry_mu_ is held from the refcount read to
+    // remove_rule, and the only release in between is the sweep inside the last_on_key
+    // branch.
     if (last_on_key) {
         const auto kit = keys_.find(*key_opt);
         if (kit != keys_.end()) {
             if (inline_disarm) {
-                backend_->disarm(*inline_disarm); // inline type: unchanged, synchronous
+                // inline type: synchronous. SparkEngine::disarm can raise only a
+                // std::system_error from its lock acquisitions (spark_engine.hpp), so this is
+                // defensive: a throw is swallowed and counted, and keys_ is still erased
+                // below (rules_ and the index mapping are already gone, so a surviving
+                // refcount-0 inline entry would be joined by the next attach on this key).
+                try {
+                    backend_->disarm(*inline_disarm);
+                } catch (...) {
+                    detach_post_commit_failures_.fetch_add(1, std::memory_order_relaxed);
+                }
             } else if (!claim_pushed) {
                 // Gate 8 re-review correction (G3): this used to read "cannot happen by
                 // construction" - that stopped being true the moment the residue-sweep

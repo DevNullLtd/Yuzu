@@ -198,6 +198,9 @@ struct FakeBackend : ISparkBackend {
     std::atomic<int> disarm_entries{0};
     std::atomic<bool> fail_arm{false};
     std::atomic<bool> throw_arm{false}; ///< arm() throws (a backend that throws, not just fails)
+    /// #5322: the NEXT disarm() call throws (consumed once), after it is counted at entry.
+    /// SparkEngine::disarm is non-throwing by design; this stands in for a backend that is not.
+    std::atomic<bool> throw_next_disarm{false};
     // #2233 item 3: park the NEXT arm() call (on whichever thread calls it - the
     // GuardianIoExecutor detached worker in production/these tests) until
     // release_hang() is called. Mirrors FakeServiceMechanism's hang idiom in
@@ -267,6 +270,8 @@ struct FakeBackend : ISparkBackend {
     }
     void disarm(std::uint64_t sub) override {
         disarm_entries.fetch_add(1);
+        if (throw_next_disarm.exchange(false))
+            throw std::runtime_error("disarm boom");
         if (hang_next_disarm.exchange(false)) {
             std::unique_lock<std::mutex> lk{disarm_gate_mu_};
             disarm_entered_hang_ = true;
@@ -13206,8 +13211,9 @@ TEST_CASE("#5322: Lost on an orphan watcher with no rules erases the dead watche
 // cleared since the tombstone was retained). remove_rule then finds no mapping and returns
 // nullopt although the key's last rule is going: the teardown is owed iff this was the key's
 // last rule, which the pre-sweep refcount says, not remove_rule's return. A live assert on the
-// two agreeing used to abort the agent (SIGABRT) here. Both cases must never set
-// arm_park.park_every: the disarm below runs synchronously under the registry lock.
+// two agreeing used to abort the agent (SIGABRT) here. Both cases leave arm_park.park_every
+// unset and assert detach_sweep_left_residue is unchanged, so neither takes the synchronous
+// backend disarm of the `!claim_pushed` residue fallback.
 TEST_CASE("#5322: Lost where the sweep releases the ghost's own tombstone tears the key down without aborting",
           "[spark][runtime][liveness]") {
     using namespace std::chrono_literals;
@@ -13763,10 +13769,12 @@ TEST_CASE("#5322: a blocking waiter is woken by a synthesizing pass even when th
     REQUIRE_FALSE(waiter_done.load(std::memory_order_acquire));
 
     // The seam stays sticky through the pass, so the reaper's own release of the residue fails
-    // AFTER it synthesized the outcome: reaped is 0 and the tombstone is kept. The pass must
+    // AFTER it synthesized the outcome: the tombstone is kept (the depth check below). The pass must
     // still wake the waiter (its outcome is now written), not leave it asleep to its 30 s
     // deadline: no later pass would wake it either, since each reaps 0.
+    const auto release_failures_before = rt->claim_index_release_failures();
     CHECK(rt->expire_overdue_claims() == 0);
+    CHECK(rt->claim_index_release_failures() == release_failures_before + 2); // synthesis + loop
     CHECK(rt->claim_queue_depth_for_test(key) == 1); // retained: the release failed
     REQUIRE(yuzu::test::spin_until([&] { return waiter_done.load(std::memory_order_acquire); },
                                    2s));
@@ -13774,4 +13782,34 @@ TEST_CASE("#5322: a blocking waiter is woken by a synthesizing pass even when th
     REQUIRE(waiter_result.has_value());
     REQUIRE_FALSE(waiter_result->has_value());
     CHECK(waiter_result->error() == "arm drain failed");
+}
+
+// An inline-type key (Startup here) is torn down by a synchronous backend disarm inside the
+// detach, the only teardown call that has no deferred claim. A throw from it must not skip
+// the keys_ erase: the rule and its index mapping are already gone, so a surviving refcount-0
+// keys_ entry would be JOINED by the next attach on that key (a stale watcher, no new arm).
+TEST_CASE("#5322: a throwing inline disarm in the last detach is contained and the key is erased",
+          "[spark][runtime][liveness]") {
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = make_rt(r, b);
+    const SparkSpec spec{SparkType::Startup, StartupSparkParams{}};
+
+    REQUIRE(rt->attach_rule("r1", spec, file_exists_rule("r1"), true));
+    REQUIRE(b->arms.load() == 1);
+    REQUIRE(rt->armed_key_count() == 1);
+
+    b->throw_next_disarm = true;
+    CHECK_NOTHROW(rt->detach_rule("r1"));
+    CHECK(b->disarm_entries.load() == 1); // the disarm was attempted, and it threw
+    CHECK_FALSE(b->throw_next_disarm.load());
+    CHECK(rt->rule_count() == 0);
+    CHECK(rt->armed_key_count() == 0); // the keys_ entry is gone, not left at refcount 0
+    REQUIRE_REGISTRY_INVARIANTS_5322(*rt);
+
+    // A fresh attach on the same key arms anew; it does not join a stale watcher.
+    REQUIRE(rt->attach_rule("r2", spec, file_exists_rule("r2"), true));
+    CHECK(b->arms.load() == 2);
+    CHECK(rt->armed_key_count() == 1);
+    REQUIRE_REGISTRY_INVARIANTS_5322(*rt);
 }

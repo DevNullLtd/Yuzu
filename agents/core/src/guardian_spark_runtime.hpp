@@ -788,11 +788,17 @@ public:
     /// Dispatching-window race deterministically. Set before triggering the
     /// dispatch; consumed (moved out, resetting to empty) under registry_mu_.
     void set_dispatch_entry_hook_for_test(std::function<void()> hook);
-    /// R5.2 drain fault seam (C2/K5): points 1-8 and 12 are consumed once by the next
-    /// on_arm_complete (the publish it calls included). Points 9, 10, 11 and 13-16 are NOT:
-    /// 9 fires in the reaper's synthesis (synthesize_fallback_outcome_locked), 10 in the
-    /// redrive lane's guarded dispatch, 11 in a congested-arm parking push, and 13-16 in
-    /// the reaper's refill push / the orphan pass (see each below).
+    /// R5.2 drain fault seam (C2/K5): a point is consumed once, the next time execution
+    /// reaches its call site; it is not tied to one entry point. Points 1, 2, 4, 5, 8 and
+    /// 12 are in on_arm_complete. Points 3, 6 and 7 are in publish_arm_verdicts_locked,
+    /// which on_arm_complete calls and finalize_arm_compensation (the compensation worker)
+    /// also calls; on the compensating path on_arm_complete returns before publishing.
+    /// Point 9 is in synthesize_fallback_outcome_locked (the reaper), 10 in
+    /// dispatch_parked_arm_guarded (reached from several callers, among them
+    /// redrive_parked_arms and finalize_arm_compensation's class_refill dispatch), 11 in
+    /// park_congested_arm_locked (a congested-arm parking push), 16 in
+    /// reap_stranded_claims_locked's refill push, and 13-15 in the orphan pass (see each
+    /// below).
     /// 1 = std::bad_alloc before the fifo snapshot (after `compensating` took ownership
     /// of a successful arm); 2 = a throw right after the first commit adopted the
     /// subscription (before its verdict is staged); 3 = a throw inside the publish
@@ -839,9 +845,10 @@ public:
     /// allocation would (AFTER the mutation: contained and counted, the queued disarm
     /// is still handed to the caller). 0 = off.
     void set_detach_post_fault_point_for_test(int point) noexcept;
-    /// R5.2 (r3 C4): a post-mutation, non-durable step of detach_rule_locked
-    /// (outbox_.drop_rule) threw and was contained; the teardown and the queued disarm
-    /// completed regardless. Expected 0. Lock-free.
+    /// R5.2 (r3 C4): a post-mutation step of detach_rule_locked threw and was contained:
+    /// outbox_.drop_rule (non-durable), or the inline-type synchronous backend disarm
+    /// (keys_ is still erased, #5322). The teardown and any queued disarm completed
+    /// regardless. Expected 0. Lock-free.
     [[nodiscard]] std::uint64_t detach_post_commit_failures() const noexcept {
         return detach_post_commit_failures_.load(std::memory_order_relaxed);
     }
@@ -1926,8 +1933,8 @@ private:
     /// head (awaiting its turn) and a head whose index release fails again.
     ///
     /// Retry bound: one erase_rule attempt per terminal tombstone per pass; the pass that
-    /// SYNTHESIZES the outcome makes two (synthesize_fallback_outcome_locked releases once
-    /// on its not-committed branch, then the loop releases again). A stuck OWNER tombstone
+    /// SYNTHESIZES the outcome makes at most two (synthesize_fallback_outcome_locked
+    /// attempts a release only on its not-committed branch, then the loop releases again). A stuck OWNER tombstone
     /// blocks its key (its clean followers wait for the heartbeat and, if the release never
     /// succeeds, expire CongestionExpired). Other same-key events each add their own
     /// attempt: an attach's sweep (try_dispatch_head_locked), sweep-before-adopt, a
@@ -1982,7 +1989,8 @@ private:
     /// detach_rule_locked) and appended to `disarms` for the caller to submit off-lock,
     /// with one warn line per orphan naming the key. An inline-type key (no io class) is
     /// left alone: it never carries claims or ghost mappings and its refcount reaches 0
-    /// only inside detach_rule_locked, which tears it down synchronously, so none is
+    /// only inside detach_rule_locked, which tears it down synchronously (a throw from the
+    /// backend disarm is swallowed and counted, and keys_ is still erased), so none is
     /// expected here. Does nothing once stopping_ is set. Invariant: after the pass either
     /// keys_ still owns the watcher (a failed build or push is counted and retried next
     /// pass) or a durable Disarm claim owns its teardown; and no refill selected by
