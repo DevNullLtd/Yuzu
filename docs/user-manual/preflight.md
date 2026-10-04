@@ -80,7 +80,7 @@ window has its cell read **"inconclusive: response cap reached"**; a device whos
 row is still in the window is simply pending and is not labelled. Either way the device stays
 **Incomplete** (so it is not in Deploy's go cohort), and the server stops re-dispatching that
 run's checks, because every extra reply would push another device's answer out of the window.
-The run still completes at its deadline, and the go cohort only ever shrinks.
+The run still completes at its deadline. A saturated window can only lose devices to eviction; it never gives a device a false go. A reply already in flight when dispatching stops can still land and be recorded, so a device's cell can change after the window fills.
 
 What fills the window: a device that gave a terminal error answer (verdict unknown) is still
 incomplete, so it is re-dispatched on every tick and each dispatch adds rows; the window
@@ -88,7 +88,7 @@ evicts the **oldest** rows first, which are the **earliest** answerers. On a lar
 with a long window (up to 2,880 minutes) and a cohort near its 20,000-device cap, devices that
 passed early can therefore flip to "inconclusive" before the deadline. To resolve those
 devices, re-run the pre-flight against a smaller group. Changing the re-dispatch rule, and
-per-device paging of the response read, are tracked follow-ups.
+per-device paging of the response read, are known follow-ups (not yet filed).
 
 ## Verify — before / after performance
 

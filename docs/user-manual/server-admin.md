@@ -3415,7 +3415,7 @@ For automated or bulk deployment. Agents present a token at startup for instant 
 3. Configure token properties:
    - **Expiry** -- time limit (e.g., 24 hours, 7 days).
    - **Max uses** -- how many agents can use this token (1 for single-device, unlimited for bulk).
-     Leave the field empty or enter `0` for unlimited. Any other value must be one whole number: a typo such as `0x5` or `5abc` is refused with `400` and no token is minted (it used to be read as `0`, which means unlimited). The same rule applies to the token lifetime (`ttl_hours`, empty or `0` for no expiry).
+     Leave the field empty or enter `0` for unlimited. Any other value must be one whole number: a typo such as `0x5` or `5abc` is refused with `400` and no token is minted (it used to be read as `0`, which means unlimited). The same rule applies to the token lifetime (`ttl_hours`, empty or `0` for no expiry); a negative `ttl_hours` is refused with `400` too, because it used to compute to "never expires".
 4. Copy the generated token string.
 
 **Agent side:**
@@ -4940,7 +4940,7 @@ All API routes require a valid session cookie (obtained via `POST /login`) or, w
 |---|---|---|
 | `GET` | `/fragments/settings/tokens` | Render the enrollment tokens fragment (HTMX). |
 | `POST` | `/api/settings/enrollment-tokens` | Generate a new enrollment token. Body: `{ "expiry", "max_uses" }`. |
-| `POST` | `/api/settings/enrollment-tokens/batch` | Generate multiple tokens in one call. Body: `{ "label", "count", "max_uses", "ttl_hours" }`. |
+| `POST` | `/api/settings/enrollment-tokens/batch` | Generate multiple tokens in one call. Body: `{ "label", "count", "max_uses", "ttl_hours" }`. Defaults when a field is empty or omitted: `count` 10 (allowed 1 to 10000), `max_uses` 1, `ttl_hours` 0 (no expiry). A malformed or negative number, or a `count` outside 1 to 10000, is a `400` and nothing is minted. |
 | `DELETE` | `/api/settings/enrollment-tokens/{id}` | Revoke a token by ID. |
 
 ### Pending Agents
