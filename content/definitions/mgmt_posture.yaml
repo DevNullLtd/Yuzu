@@ -1,0 +1,106 @@
+## Management Posture Definitions
+## Reports which management plane controls the device, as facts only: nothing is
+## enforced, changed or fetched. Plugin: mgmt_posture | Actions: posture
+##
+## Sources by platform:
+##   Linux:   bounded file reads of /etc/sssd/sssd.conf and /etc/sssd/conf.d/*.conf
+##            (active domains; id_provider ad or ipa decides), /etc/ipa/default.conf,
+##            and a presence check of /etc/krb5.keytab (never opened).
+##   macOS:   `/usr/bin/profiles status -type enrollment` through the bounded runner
+##            (MDM enrolment and the MDM server host). AD binding is device_identity.
+##   Windows: PLANNED, not read yet; one `unsupported` status row, windows:planned.
+##
+## The AD domain / OU / joined facts belong to device_identity and are never
+## re-emitted here. A refused read (a 0600 sssd.conf under an unprivileged agent) is
+## reported as permission_denied with plane `unknown`, never as "not joined".
+## Configuration as written, not the live join state.
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: crossplatform.security.mgmt_posture
+  displayName: Management Posture
+  version: 1.0.0
+  description: >
+    Reports which management plane controls the device, as facts only. On
+    Linux, the plane (none, ad, ipa or unknown) from the SSSD active domains
+    in sssd.conf and conf.d and the IPA default.conf, plus whether
+    /etc/krb5.keytab is present. On macOS, MDM enrolment and the MDM server
+    host from the profiles tool. The Windows leg is planned and not yet read.
+    The configuration is reported as written, not the live join state, and a
+    refused read is permission_denied, never not-joined. Domain, OU and joined
+    state are device_identity's and are not repeated here. A leading status row
+    states whether the read was complete.
+  tags: [security, management, mdm, sssd, posture]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: mgmt_posture
+    action: posture
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    # Rows are discriminated by field 0 (row_kind); "-" is an absent value. A status
+    # row always comes first.
+    #
+    #   status|posture|<supported|constrained|permission_denied|unsupported>|<reason or ->
+    #   plane|<none|workgroup|ad|aad|hybrid|ipa|unknown>      (Linux; macOS emits "-")
+    #   mdm_enrolled|<true|false|->                           (macOS; Linux emits "-")
+    #   mdm_provider|<MDM server host|->                      (macOS; Linux emits "-")
+    #   tenant_id|-                                           (reserved; always "-" today)
+    #   krb5_keytab|<present|absent|->                        (Linux only; "-" = could not be determined)
+    columns:
+      - name: row_kind
+        type: string
+        values: [status, plane, mdm_enrolled, mdm_provider, tenant_id, krb5_keytab]
+        description: 'Row shape discriminator (field 0). Values: status, plane, mdm_enrolled, mdm_provider, tenant_id, krb5_keytab.'
+        example: plane
+        platforms: [windows, linux, darwin]
+      - name: field_1
+        type: string
+        description: 'status: the literal "posture". plane: none, workgroup, ad, aad, hybrid, ipa or unknown (unknown only on a refused read; "-" on macOS). mdm_enrolled: true, false or "-". mdm_provider: the MDM server host, or "-". tenant_id: always "-" today. krb5_keytab: present, absent, or "-" when presence could not be determined.'
+        example: none
+        platforms: [windows, linux, darwin]
+      - name: field_2
+        type: string
+        description: 'status: supported, constrained, permission_denied or unsupported (Windows, and a leg that threw). Not used by the other kinds.'
+        example: supported
+        values: [supported, constrained, permission_denied, unsupported]
+        platforms: [windows, linux, darwin]
+      - name: field_3
+        type: string
+        description: 'status: reason token(s) for a non-supported read, "-" when complete; tokens look like linux:mgmt_posture:sssd_conf:permission_denied, macos:mgmt_posture:profiles:exit_nonzero, subprocess_runner:deadline, windows:planned. Not used by the other kinds.'
+        example: '-'
+        platforms: [windows, linux, darwin]
+    aggregation:
+      groupBy:
+        - row_kind
+      operations:
+        - count
+
+  readablePayload: "Report management-plane posture"
+
+  gather:
+    ttlSeconds: 3600
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 1.0.0
+    requiredPlugins: [mgmt_posture]
+
+status:
+  phase: active
