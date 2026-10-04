@@ -848,7 +848,7 @@ TEST_CASE("GET /api/v1/responses/:id/export: the byte cap always serves one row 
     CHECK(v1_csv_trailer(many_csv->body) == "# result_truncated_by_cap cause=byte_cap,,,,,,,,,");
 }
 
-TEST_CASE("v1 response routes: since and until of zero mean unbounded, a negative one is a 400 "
+TEST_CASE("v1 response routes: since and until of zero mean unbounded a negative one is a 400 "
           "(#4644)",
           "[pg][rest][responses][v1]") {
     YUZU_REQUIRE_PG_DB_TPL(db, respv1_responsestore_tpl);

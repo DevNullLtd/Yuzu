@@ -446,7 +446,7 @@ TEST_CASE("render_tar_retention_paused: a degraded store read renders the "
 // ── #4644 Gate 7 (row 6a): the scan read is byte-bounded and a cut is reported ───
 
 TEST_CASE("gather_tar_retention_paused: a read cut by the payload cap sets "
-          "result_truncated_by_cap, renders a partial-result banner and serialises the flag",
+          "result_truncated_by_cap renders a partial-result banner and serialises the flag",
           "[pg][server][tar][retention-render][cap]") {
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
@@ -490,7 +490,7 @@ TEST_CASE("gather_tar_retention_paused: a read cut by the payload cap sets "
     CHECK_FALSE(contains(html, "Retention state unavailable"));
 }
 
-TEST_CASE("tar_retention_paused_json: store_degraded is false for an uncut, healthy scan",
+TEST_CASE("tar_retention_paused_json: store_degraded is false for an uncut healthy scan",
           "[pg][server][tar][retention-render][cap]") {
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};

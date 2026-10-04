@@ -686,3 +686,45 @@ TEST_CASE("REST visualization: a read cut by the payload cap is flagged result_t
     // Not the row cap: rows_capped stays absent (it is exact now).
     CHECK_FALSE(cut_data.contains("rows_capped"));
 }
+
+// The row cap goes through the same bounded fetch: `rows_capped` is exact (set only when MORE
+// matching rows exist past 10,000, never on a read of exactly 10,000) and a row-cap cut also
+// carries result_truncated_by_cap with cause row_cap.
+TEST_CASE("REST visualization: the 10000-row cap is exact rows_capped and result_truncated_by_cap "
+          "(cause row_cap) appear only when a row was left out",
+          "[pg][rest][visualization][cap]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    VizHarness h(pool);
+    auto spec = R"({"type":"pie","processor":"single_series","labelField":1,"title":"cap"})";
+    auto def_id = h.make_def(spec, "procfetch");
+
+    constexpr int kRowCap = 10000; // rest_api_v1.cpp's visualization kRowCap
+    for (int i = 0; i < kRowCap; ++i)
+        h.push_response("cmd-cap", "agent-" + std::to_string(i), "1|chrome|/usr/bin/chrome|d");
+
+    const std::string url = "/api/v1/executions/cmd-cap/visualization?definition_id=" + def_id;
+
+    // Exactly at the cap: nothing was left out, so nothing is flagged.
+    auto at_cap = h.sink.Get(url);
+    REQUIRE(at_cap);
+    REQUIRE(at_cap->status == 200);
+    auto at = nlohmann::json::parse(at_cap->body)["data"];
+    CHECK(at["meta"]["responses_total"] == kRowCap);
+    CHECK_FALSE(at.contains("rows_capped"));
+    CHECK_FALSE(at.contains("result_truncated_by_cap"));
+    CHECK_FALSE(at.contains("truncation_cause"));
+
+    // One more matching row: the read is cut at the row cap and says so.
+    h.push_response("cmd-cap", "agent-extra", "1|chrome|/usr/bin/chrome|d");
+    auto over_cap = h.sink.Get(url);
+    REQUIRE(over_cap);
+    REQUIRE(over_cap->status == 200);
+    auto over = nlohmann::json::parse(over_cap->body)["data"];
+    CHECK(over["meta"]["responses_total"] == kRowCap);
+    CHECK(over["rows_capped"] == true);
+    CHECK(over["rows_cap"] == kRowCap);
+    CHECK(over["result_truncated_by_cap"] == true);
+    CHECK(over["truncation_cause"] == "row_cap");
+}
+

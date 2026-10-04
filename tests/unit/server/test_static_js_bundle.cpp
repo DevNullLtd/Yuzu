@@ -1117,6 +1117,9 @@ TEST_CASE("static_js_bundle: kYuzuChartsJs surfaces a cut visualization result i
     CHECK_THAT(js, ContainsSubstring("result-degrade-banner"));
     CHECK_THAT(js, ContainsSubstring("note.textContent = msg"));
     CHECK_THAT(js, ContainsSubstring("Partial result:"));
+    // The call itself: a defined-but-never-invoked helper must not satisfy this test.
+    // Anchored to a line start so a commented-out call does not satisfy it.
+    CHECK_THAT(js, ContainsSubstring("\n    truncationNotice(target, data);"));
     // CSP is script-src 'self' 'unsafe-inline' with no unsafe-eval.
     CHECK_THAT(js, !ContainsSubstring("new Function("));
     CHECK_THAT(js, !ContainsSubstring("eval("));

@@ -231,6 +231,9 @@ struct PgHarness {
     std::vector<AuditRow> audits;
     bool audit_succeeds{true}; // audit_fn's persist outcome (false = row not durably written)
     bool audit_throws{false};  // audit_fn throws (emission pipeline fault)
+    // When set, audit_succeeds/audit_throws apply only to calls AFTER this many rows have been
+    // recorded (0 = fail from the first call, 1 = let the first row persist, fail the second).
+    std::optional<std::size_t> audit_fail_after;
 
     yuzu::MetricsRegistry metrics; // #4644/#4703 counters; outlives the sink's handlers
 
@@ -262,9 +265,10 @@ struct PgHarness {
                                const std::string& tt, const std::string& ti,
                                const std::string& d) -> bool {
             audits.push_back({a, r, tt, ti, d});
-            if (audit_throws)
+            const bool failing = !audit_fail_after || audits.size() > *audit_fail_after;
+            if (failing && audit_throws)
                 throw std::runtime_error("audit pipeline fault");
-            return audit_succeeds;
+            return failing ? audit_succeeds : true;
         };
         response::register_response_routes(sink, deps);
     }
@@ -774,7 +778,7 @@ TEST_CASE("GET /api/responses/:id/export: the byte cap always serves one row and
     CHECK(csv_trailer(many_csv->body) == "# result_truncated_by_cap cause=byte_cap,,,,,,");
 }
 
-TEST_CASE("legacy response routes: since and until of zero mean unbounded, a negative one is a "
+TEST_CASE("legacy response routes: since and until of zero mean unbounded a negative one is a "
           "400 (#4644)",
           "[server][routes][response_routes][rest][pg]") {
     PgHarness h;
@@ -1001,7 +1005,7 @@ TEST_CASE("response_routes: wiring -- server.cpp still calls register_response_r
 // ── #4644 Gate 7: the legacy export writes a fail-closed success audit row ───
 
 TEST_CASE("GET /api/responses/:id/export: every served export writes ONE response.read success "
-          "row, CSV and JSON, before any body",
+          "row CSV and JSON before any body",
           "[server][routes][response_routes][rest][pg][audit]") {
     PgHarness h;
     h.seed("instr-audited", "agent-a");
@@ -1026,8 +1030,74 @@ TEST_CASE("GET /api/responses/:id/export: every served export writes ONE respons
     }
 }
 
+// The scope-drop `denied` row on this route is fail-closed too (it used to be set-and-proceed):
+// an export whose drop evidence cannot be persisted must serve nothing, whichever of the two
+// rows fails and however it fails.
+TEST_CASE("GET /api/responses/:id/export: a scope drop with a failing audit is a 503 with no data "
+          "for either row a false return or a throw CSV and JSON",
+          "[server][routes][response_routes][rest][pg][audit]") {
+    PgHarness h;
+    h.seed("instr-drop-fail", "in-scope-agent");
+    h.seed("instr-drop-fail", "out-of-scope-agent");
+    h.fleet_scope = authz::VisibleSet{std::unordered_set<std::string>{"in-scope-agent"}};
+
+    // fail_after 0: the DENIED row fails first. fail_after 1: the denied row persists and the
+    // SUCCESS row fails.
+    for (const std::size_t fail_after : {std::size_t{0}, std::size_t{1}}) {
+        for (const bool throws : {false, true}) {
+            for (const char* format : {"json", "csv"}) {
+                INFO("fail_after=" << fail_after << (throws ? " throws " : " returns false ")
+                                   << format);
+                h.audits.clear();
+                h.audit_fail_after = fail_after;
+                h.audit_succeeds = false;
+                h.audit_throws = throws;
+                auto res = h.sink.Get(std::string("/api/responses/instr-drop-fail/export?format=") +
+                                      format);
+                REQUIRE(res);
+                CHECK(res->status == 503);
+                CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+                // No export data and no download name: nothing was served, and the
+                // out-of-scope agent is not named anywhere.
+                CHECK(res->body.find("in-scope-agent") == std::string::npos);
+                CHECK(res->body.find("out-of-scope-agent") == std::string::npos);
+                CHECK(res->get_header_value("Content-Disposition").empty());
+                CHECK(h.audits.size() == fail_after + 1); // the failing row ends the request
+                CHECK(h.audits[0].result == "denied");
+            }
+        }
+    }
+}
+
+// A cut export whose audit row fails must not be counted as a cut export that was served.
+TEST_CASE("GET /api/responses/:id/export: a cut export whose audit fails is a 503 and the cut "
+          "counter does not move",
+          "[server][routes][response_routes][rest][pg][audit]") {
+    PgHarness h;
+    h.seed("instr-cut-audit-fail", "agent-a");
+    h.seed("instr-cut-audit-fail", "agent-b");
+    h.audit_succeeds = false;
+
+    auto res = h.sink.Get("/api/responses/instr-cut-audit-fail/export?limit=1");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    CHECK(res->body.find("agent-") == std::string::npos);
+    const auto text = h.metrics.serialize();
+    for (const char* c : {"row_cap", "byte_cap"})
+        CHECK(text.find(std::string("yuzu_server_response_export_truncated_total{surface=\"rest\","
+                                    "cause=\"") + c + "\"} 0") != std::string::npos);
+    // Control: with a healthy audit the same cut IS counted.
+    h.audit_succeeds = true;
+    auto ok = h.sink.Get("/api/responses/instr-cut-audit-fail/export?limit=1");
+    REQUIRE(ok);
+    CHECK(ok->status == 200);
+    const auto after = h.metrics.serialize();
+    CHECK(after.find("yuzu_server_response_export_truncated_total{surface=\"rest\","
+                     "cause=\"row_cap\"} 1") != std::string::npos);
+}
+
 TEST_CASE("GET /api/responses/:id/export: a scope drop writes the denied row THEN the success "
-          "row, once each",
+          "row once each",
           "[server][routes][response_routes][rest][pg][audit]") {
     PgHarness h;
     h.seed("instr-audited-scope", "in-scope-agent");
@@ -1044,8 +1114,8 @@ TEST_CASE("GET /api/responses/:id/export: a scope drop writes the denied row THE
     CHECK(h.audits[1].detail.rfind("legacy response export cid=", 0) == 0);
 }
 
-TEST_CASE("GET /api/responses/:id/export: an audit row that does not persist, or an audit "
-          "pipeline that throws, is a 503 with no data and no cut counter",
+TEST_CASE("GET /api/responses/:id/export: an audit row that does not persist or an audit "
+          "pipeline that throws is a 503 with no data",
           "[server][routes][response_routes][rest][pg][audit]") {
     PgHarness h;
     h.seed("instr-audit-fail", "agent-a");
