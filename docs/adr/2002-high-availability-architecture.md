@@ -1436,14 +1436,24 @@ one core replica a server-only restart now recovers through the replay described
   heartbeats or stops a session's lease renewal; the same round added a flush of at most 8 chunks per
   cycle; transient failures still keep heartbeats buffered (probed against a fake server, not rig-run).
   A per-connection cap on agent sessions (`max_sessions_per_connection`, default 8, valid 1 to 1000, read
-  once when the registry starts; a refused `Register` or `Subscribe` is answered `UNAVAILABLE` and counted
+  once when the registry starts; a refused `Register` is answered `UNAVAILABLE` (14), a refused `Subscribe`
+  ends the stream (status 2 today, see the gateway manual's Known limits), and both are counted
   in `yuzu_gw_session_limit_rejected_total`) keeps one connection from pushing other agents' snapshots out
   of a full buffer (probed against a fake upstream, not rig-run). It counts session rows, pending plus
-  live, excluding the registering agent's own rows; a repeated `Register` of the same
-  agent id on the same connection supersedes that agent's older pending rows; and the slot is reserved
+  live: each unexpired reservation row is one slot, including the registering agent's own in-flight
+  reservations; another agent's live row counts one, and another agent's committed pending row counts one
+  only if that agent has no reservation in flight; the registering agent's own live row and committed
+  pending row never count (a commit supersedes them), and the `Subscribe` path leaves out all of the
+  agent's own rows. A connection therefore holds at most the cap of counted slots plus the registering
+  agent's own live row and committed pending row (stored rows can briefly exceed that by the committed
+  pending row of an agent with a retry in flight, which its commit removes). A repeated `Register` of the same
+  agent id on the same connection supersedes that agent's older committed pending rows; and the slot is reserved
   atomically when a `Register` is admitted, before it is proxied to the server, so concurrent Registers on
-  one connection admit at most the cap and nothing beyond it is proxied (the reservation is released if the
-  proxied `Register` fails or is not accepted, and by the pending time to live otherwise). The rows of a
+  one connection, with one agent id or several, admit at most the cap and nothing beyond it is proxied (the
+  reservation is released if the proxied `Register` fails or is not accepted, and by the pending time to live
+  otherwise). An adversarial review by two external models found that an earlier form of the count left out
+  the registering agent's own reservations, so concurrent Registers carrying one id were all proxied; both
+  reproduced it with probes (20 of 20 and 300 of 300 at cap 8, not rig runs), and it is fixed. The rows of a
   connection that closed stay takeable for a grace (`dead_connection_grace_ms`, default 15000, valid 0 to
   120000, read once when the registry starts) so that a `Subscribe` on a reconnected channel can still take a
   pending session, and the rows its per-connection index names are deleted after it, by key and not by a table scan; a row stored and not yet committed is in no index and stays until its own commit or the pending time to live sweep removes it. A `Register` that a newer `Register` of the same agent id on the connection supersedes is answered `UNAVAILABLE` (it used to be `INTERNAL`, `registry_unavailable`, which stays for a registry that cannot be reached) (checked by eunit, dialyzer and scratch probes, not rig-run). Two review
@@ -1508,7 +1518,7 @@ one core replica a server-only restart now recovers through the replay described
   `{error, registry_unavailable}`; the exit reason is never logged or returned, and one warning per second
   per called process names only the class (`noproc`, `timeout` or `other`). The Register handler answers
   `INTERNAL` for any `{error, _}` of the upstream call (as it does for `circuit_open`; a registration
-  refused by the per-connection session cap is `UNAVAILABLE`) and the agent retries on any non-OK status
+  refused by the per-connection session cap is `UNAVAILABLE`; a refused `Subscribe` ends its stream) and the agent retries on any non-OK status
   (read in `yuzu_gw_agent_service.erl` and `agents/core/src/agent.cpp`, not run). A failed registry call in
   the per-agent process's init used to exit with a reason that embedded the request, which the Subscribe
   handler logged (INFERRED from the code, not run); that init now stops with the fixed reason
