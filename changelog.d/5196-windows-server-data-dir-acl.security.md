@@ -3,10 +3,10 @@
   - stores the PostgreSQL connection string (`postgres.dsn`) and the OIDC client secret (`oidc-client-secret`) there, passing only their paths to the server (`--postgres-dsn-file`, `--oidc-client-secret-file`);
   - points the server's CA, default certificates and key-encryption keys at `certs\` inside the locked directory (`--ca-dir`), copying existing ones from `C:\ProgramData\Yuzu\certs` on upgrade.
 
-  An upgrade over an earlier, unsecured install builds a new locked directory, copies across only plain files owned by Administrators or SYSTEM, and renames the old directory to `Yuzu Server.insecure-<date>-<time>` rather than changing or deleting it. Delete that directory once the upgrade is confirmed. (#5196, #5210, #5272, #5273)
+  An upgrade over an earlier, unsecured install builds a new locked directory, copies across only plain files that Administrators or SYSTEM own and no other account can change (from folders no other account can delete or rename in), and renames the old directory to `Yuzu Server.insecure-<date>-<time>` rather than changing or deleting it. Delete that directory once the upgrade is confirmed. (#5196, #5210, #5272, #5273)
 
   **Behaviour changes for unattended installs:**
-  - A fresh install now requires a connection string: `/POSTGRES_DSN_FILE=<file>`, which keeps the password out of the `/LOG=` file, or `/POSTGRES_DSN=`. Before, the registered service could never start, because no connection string was ever passed.
+  - A fresh install now requires a connection string: `/POSTGRES_DSN_FILE=<file>`, which keeps the password out of the `/LOG=` file, or `/POSTGRES_DSN=`. The exception is a machine-wide `YUZU_POSTGRES_DSN`, which is honoured with a warning. Before, the registered service could never start, because no connection string was ever passed.
   - An upgrade without `/ADMIN_PASS` keeps the existing accounts.
   - Any input, directory, file or certificate that cannot be secured stops the install before anything is installed, with exit code **7** and the reason in the setup log on a `PrepareToInstall:` line.
   - An unsecured data directory that no Yuzu Server installation is registered for is refused.

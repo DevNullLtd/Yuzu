@@ -822,11 +822,20 @@ end;
 //   owners  root's attributes only (not its DACL), plus every descendant: not
 //           a link, not a hard link, owner BA or SY. Used before an
 //           already-secured tree's entries are reset to inherit.
-//   carry   ListFile names files, one per line: each must exist and be a
-//           plain file -- not a directory, link or hard link -- owned by BA
-//           or SY. A file anyone else owns cannot be shown to have been put
-//           there by an administrator or the server, so it is never copied
-//           into the locked directory.
+//   carry   ListFile names files, one per line, and the directories holding
+//           them, as "D|<path>". Each file must be a plain file -- not a
+//           directory, link or hard link -- owned by BA or SY, and grant no
+//           other account more than read access. Each directory must not be
+//           a link, must be owned by BA or SY, and grant no other account
+//           delete, delete-child, change-permissions or take-ownership
+//           (inherit-only entries do not apply to it and are skipped).
+//           Ownership alone is not integrity: a folder a standard user
+//           created before the original install keeps that user as owner
+//           and, through CREATOR OWNER, full control over every file an
+//           administrator later wrote into it -- so they could rewrite an
+//           admin-owned yuzu-server.cfg or CA key, or swap a checked file for
+//           their own before it is copied. The stock ProgramData grants
+//           (Users may create files in subfolders, and read) pass.
 //
 // The same rules as the agent installer's RunAclCheck apply (yuzu-agent.iss;
 // the reasons are recorded there): compare the EXACT owner and ACE set on the
@@ -841,8 +850,11 @@ end;
 //
 // The tree walk is done by hand, one directory at a time, and refuses any
 // junction or symbolic link where it finds it: Windows PowerShell 5.1's
-// Get-ChildItem -Recurse follows them. It is capped (16 levels, 10000
-// entries) so it refuses rather than hangs.
+// Get-ChildItem -Recurse follows them. It checks the entries directly in
+// data\ but does not descend into data\'s subdirectories: the server keeps
+// large trees there (upload blobs, agent updates) that the installer never
+// writes or resets. It is capped (16 levels, 10000 entries) so it refuses
+// rather than hangs.
 function RunAclCheck(const Path, Mode, ListFile: string): string;
 var
   ResultCode: Integer;
@@ -863,15 +875,43 @@ begin
     'function Sd($p){try{return [string](Get-Acl -LiteralPath $p).Sddl}catch{Fail (''the permissions could not be read on '' + $p)}};' +
     'function Own($p,$s){if($s -notmatch ''^O:(BA|SY)G:''){Fail (''it is owned by an account other than Administrators or SYSTEM: '' + $p + '' '' + $s)}};' +
     'if($m -eq ''carry''){' +
+      // Rights of an SDDL ACE as a mask. An unknown token counts as full
+      // control, so anything unrecognised is refused, never passed.
+      '$map=@{''GA''=0x1F01FF;''GW''=0x120116;''GR''=0x120089;''GX''=0x1200A0;''FA''=0x1F01FF;''FW''=0x120116;''FR''=0x120089;''FX''=0x1200A0;''SD''=0x10000;''RC''=0x20000;''WD''=0x40000;''WO''=0x80000;''CC''=1;''DC''=2;''LC''=4;''SW''=8;''RP''=0x10;''WP''=0x20;''DT''=0x40;''LO''=0x80;''CR''=0x100};' +
+      'function Mask($t){if($t -match ''^0x[0-9A-Fa-f]+$''){return [int64]$t};$v=0;foreach($k in @($t -split ''(..)'' | Where-Object {$_})){$x=$map[$k];if($null -eq $x){return 0x1F01FF};$v=$v -bor $x};return $v};' +
+      // Refuse an Allow entry for any account other than BA/SY whose rights
+      // include a bit in $bad. $io: skip inherit-only entries.
+      'function Aces($p,$s,$bad,$io,$what){' +
+        'if($s -notmatch ''D:[A-Z]*(\(.*?\))(S:.*)?$''){Fail (''its permission list could not be read: '' + $p)};' +
+        '$all=($Matches[1] -replace ''^\(|\)$'','''');' +
+        'foreach($a in @($all -split ''\)\('')){' +
+          '$f=@($a -split '';'');if($f.Count -lt 6){Fail (''its permission list could not be read: '' + $p)};' +
+          'if($f[0] -ne ''A''){continue};if(($f[5] -eq ''BA'') -or ($f[5] -eq ''SY'')){continue};' +
+          'if($io -and ($f[1] -match ''IO'')){continue};' +
+          'if(((Mask $f[2]) -band $bad) -ne 0){Fail (''another account ('' + $f[5] + '') can '' + $what + '': '' + $p + '' '' + $s)}' +
+        '}' +
+      '};' +
       'try{$l=@(Get-Content -LiteralPath $lf -Encoding UTF8)}catch{Fail ''the list of files to carry over could not be read''};' +
-      'foreach($p in $l){' +
-        'if(-not $p){continue};' +
+      'foreach($e in $l){' +
+        'if(-not $e){continue};' +
+        'if($e -match ''^D\|(.*)$''){' +
+          '$p=$Matches[1];' +
+          'try{$i=Get-Item -LiteralPath $p -Force}catch{Fail (''it could not be opened: '' + $p)};' +
+          'if(($i.Attributes -band 1024) -ne 0){Fail (''it is a junction or symbolic link, not a directory: '' + $p)};' +
+          'if(($i.Attributes -band 16) -eq 0){Fail (''it is a file, not a directory: '' + $p)};' +
+          '$s=Sd $p;' +
+          'if($s -notmatch ''^O:(BA|SY)G:''){Fail (''the folder holding files to carry over is not owned by Administrators or SYSTEM, so whoever owns it could have changed or swapped them: '' + $p + '' '' + $s)};' +
+          'Aces $p $s 0xD0040 $true ''delete, rename or re-permission what is in this folder'';' +
+          'continue' +
+        '};' +
+        '$p=$e;' +
         'try{$i=Get-Item -LiteralPath $p -Force}catch{Fail (''it could not be opened: '' + $p)};' +
         'if(($i.Attributes -band 1024) -ne 0){Fail (''it is a junction or symbolic link, not a file: '' + $p)};' +
         'if(($i.Attributes -band 16) -ne 0){Fail (''it is a directory, not a file: '' + $p)};' +
         'if($i.LinkType -eq ''HardLink''){Fail (''it is a hard link: '' + $p)};' +
         '$s=Sd $p;' +
-        'if($s -notmatch ''^O:(BA|SY)G:''){Fail (''it is not owned by Administrators or SYSTEM, so it cannot be confirmed that an administrator or the server placed it: '' + $p + '' '' + $s)}' +
+        'if($s -notmatch ''^O:(BA|SY)G:''){Fail (''it is not owned by Administrators or SYSTEM, so it cannot be confirmed that an administrator or the server placed it: '' + $p + '' '' + $s)};' +
+        'Aces $p $s 0xD0156 $false ''change this file''' +
       '};' +
       'Set-Content -LiteralPath $out -Value ''PASS'' -Encoding ASCII;exit 0' +
     '};' +
@@ -886,7 +926,7 @@ begin
       'if(($l -notmatch ''^\(A;OICI;FA;;;(SY|BA)\)\(A;OICI;FA;;;(SY|BA)\)$'') -or ($Matches[1] -eq $Matches[2])){Fail (''its permission list is not exactly Administrators and SYSTEM, each with full control: '' + $s)}' +
     '};' +
     'if($m -eq ''root''){Set-Content -LiteralPath $out -Value ''PASS'' -Encoding ASCII;exit 0};' +
-    '$q=@($d);$dp=@(0);$k=0;$n=0;' +
+    '$q=@($d);$dp=@(0);$k=0;$n=0;$nd=$d+''\data'';' +
     'while($k -lt $q.Count){' +
       '$cur=$q[$k];$lv=$dp[$k];$k++;' +
       'try{$c=@(Get-ChildItem -LiteralPath $cur -Force)}catch{Fail (''its contents could not be listed: '' + $cur)};' +
@@ -904,7 +944,7 @@ begin
           'if($dir){$e=''^\(A;OICIID;FA;;;(SY|BA)\)\(A;OICIID;FA;;;(SY|BA)\)$''}else{$e=''^\(A;ID;FA;;;(SY|BA)\)\(A;ID;FA;;;(SY|BA)\)$''};' +
           'if(($l -notmatch $e) -or ($Matches[1] -eq $Matches[2])){Fail (''an entry''''s permission list is not exactly the inherited Administrators and SYSTEM pair: '' + $p + '' '' + $s)}' +
         '};' +
-        'if($dir){if($lv -ge 16){Fail (''it is nested more than 16 levels deep: '' + $p)};$q+=$p;$dp+=($lv+1)}' +
+        'if($dir -and ($cur -ne $nd)){if($lv -ge 16){Fail (''it is nested more than 16 levels deep: '' + $p)};$q+=$p;$dp+=($lv+1)}' +
       '}' +
     '};' +
     'Set-Content -LiteralPath $out -Value ''PASS'' -Encoding ASCII;' +
@@ -932,16 +972,31 @@ begin
   end;
 end;
 
-// Write Files to a list file and run the carry check on them.
-function CheckCarry(const Files: TArrayOfString): string;
+// Write Files, and the directories holding them (Dirs), to a list file and
+// run the carry check on them.
+function CheckCarry(const Files, Dirs: TArrayOfString): string;
 var
   ListFile: string;
+  All: TArrayOfString;
+  I, N: Integer;
 begin
   Result := '';
   if GetArrayLength(Files) = 0 then Exit;
+  SetArrayLength(All, GetArrayLength(Files) + GetArrayLength(Dirs));
+  N := 0;
+  for I := 0 to GetArrayLength(Dirs) - 1 do
+  begin
+    All[N] := 'D|' + Dirs[I];
+    N := N + 1;
+  end;
+  for I := 0 to GetArrayLength(Files) - 1 do
+  begin
+    All[N] := Files[I];
+    N := N + 1;
+  end;
   ListFile := ExpandConstant('{tmp}\yuzu-server-carry.txt');
   DeleteFile(ListFile);
-  if not SaveStringsToUTF8FileWithoutBOM(ListFile, Files, False) then
+  if not SaveStringsToUTF8FileWithoutBOM(ListFile, All, False) then
   begin
     Result := 'the list of files to carry over could not be written';
     Exit;
@@ -1010,23 +1065,53 @@ end;
 // The server's own key material in the legacy directory, as a closed set:
 // default-*.pem/.key/.json (the CA, its default leaves and marker) and
 // secrets-kek-v*.key (the key-encryption keys). Nothing else is taken from
-// there: it is also the agent's certificate directory.
-function ListLegacyKeyFiles(var Files: TArrayOfString): string;
+// there, and nothing else in it is looked at: it is also the agent's
+// certificate directory. A link carrying one of those names is refused.
+function IsServerKeyName(const FileName: string): Boolean;
 var
-  All: TArrayOfString;
-  I: Integer;
   Name, Ext: string;
 begin
-  SetArrayLength(All, 0);
-  Result := ListDirectFiles(LegacyCertDirPath, All);
-  if Result <> '' then Exit;
-  for I := 0 to GetArrayLength(All) - 1 do
+  Name := Lowercase(FileName);
+  Ext := ExtractFileExt(Name);
+  Result := ((Pos('default-', Name) = 1) and ((Ext = '.pem') or (Ext = '.key') or (Ext = '.json'))) or
+            ((Pos('secrets-kek-v', Name) = 1) and (Ext = '.key'));
+end;
+
+function ListLegacyKeyFiles(var Files: TArrayOfString): string;
+var
+  R: TFindRec;
+  More, Found: Boolean;
+  Dir: string;
+begin
+  Result := '';
+  Dir := LegacyCertDirPath;
+  if IsReparsePoint(Dir, Found) then
   begin
-    Name := Lowercase(ExtractFileName(All[I]));
-    Ext := ExtractFileExt(Name);
-    if ((Pos('default-', Name) = 1) and ((Ext = '.pem') or (Ext = '.key') or (Ext = '.json'))) or
-       ((Pos('secrets-kek-v', Name) = 1) and (Ext = '.key')) then
-      AddPath(Files, All[I]);
+    Result := 'it is a junction or symbolic link, not a directory: ' + Dir;
+    Exit;
+  end;
+  if not Found or not DirExists(Dir) then Exit;
+  if not FindFirst(Dir + '\*', R) then
+  begin
+    Result := 'its contents could not be listed: ' + Dir;
+    Exit;
+  end;
+  try
+    More := True;
+    while More and (Result = '') do
+    begin
+      if ((R.Attributes and FileAttrDirectory) = 0) and IsServerKeyName(R.Name) then
+      begin
+        if (R.Attributes and FileAttrReparsePoint) <> 0 then
+          Result := 'it is a file link: ' + Dir + '\' + R.Name
+        else
+          AddPath(Files, Dir + '\' + R.Name);
+      end;
+      if Result = '' then
+        More := FindNext(R);
+    end;
+  finally
+    FindClose(R);
   end;
 end;
 
@@ -1036,20 +1121,40 @@ end;
 // created there and inherits Administrators and SYSTEM, then swapped in. Anyone
 // holding a handle to an old file keeps the old file.
 
+// Files replaced in the live data directory during this run, for an abort
+// message (the in-place path cannot be rolled back as a whole).
+var
+  Replaced: string;
+
+// The old file is renamed aside first and put back if the new one cannot be
+// moved in, so a failure never leaves the file missing.
 function SwapIn(const Tmp, Dest: string): string;
+var
+  Old: string;
+  HadOld: Boolean;
 begin
   Result := '';
-  if FileExists(Dest) and not DeleteFile(Dest) then
+  Old := Dest + '.old';
+  HadOld := FileExists(Dest);
+  if HadOld then
   begin
-    DeleteFile(Tmp);
-    Result := 'Could not replace ' + Dest + ' (it may be in use).';
-    Exit;
+    DeleteFile(Old);
+    if not RenameFile(Dest, Old) then
+    begin
+      DeleteFile(Tmp);
+      Result := 'Could not replace ' + Dest + ' (it may be in use).';
+      Exit;
+    end;
   end;
   if not RenameFile(Tmp, Dest) then
   begin
     DeleteFile(Tmp);
+    if HadOld then RenameFile(Old, Dest);
     Result := 'Could not move the new file into place: ' + Dest;
+    Exit;
   end;
+  if HadOld then DeleteFile(Old);
+  Replaced := Replaced + #13#10 + '  ' + Dest;
 end;
 
 function CopyInto(const Src, Dest: string): string;
@@ -1558,7 +1663,7 @@ var
   State, ResultCode: Integer;
   DataDir, Stage, Aside, Reason, OldCfgDir: string;
   RegenConfig, CarryDsn, CarryOidc, NeedLegacy: Boolean;
-  CarryFiles, DataFiles, LegacyFiles: TArrayOfString;
+  CarryFiles, DataFiles, LegacyFiles, Dirs: TArrayOfString;
 begin
   GetInputs(Inp);
   DataDir := DataDirPath;
@@ -1566,6 +1671,8 @@ begin
   SetArrayLength(CarryFiles, 0);
   SetArrayLength(DataFiles, 0);
   SetArrayLength(LegacyFiles, 0);
+  SetArrayLength(Dirs, 0);
+  Replaced := '';
 
   // ── 1. Every check, before the service is stopped ──
   Result := CheckInputs(Inp);
@@ -1580,6 +1687,16 @@ begin
     if not RegenConfig and ((State = StateNew) or not FileExists(DataDir + '\yuzu-server.cfg')) then
       Result := 'The admin username and password (/ADMIN_USER=, /ADMIN_PASS=) are required: ' +
                 'there is no existing configuration to keep.' + #13#10#13#10 +
+                'Nothing has been changed.'
+    else if (MachineEnvDsn <> '') and ((Inp.Dsn <> '') or (Inp.DsnFile <> '') or CarryDsn) then
+      // The server refuses to start with both (--postgres-dsn-file cannot be
+      // combined with YUZU_POSTGRES_DSN), so this would install a server
+      // that does not boot.
+      Result := 'A machine-wide YUZU_POSTGRES_DSN environment variable is set, and a connection ' +
+                'string is also being stored for the server; the server refuses to start with ' +
+                'both. Remove the environment variable (every local user can read it), for ' +
+                'example: [Environment]::SetEnvironmentVariable(''YUZU_POSTGRES_DSN'', $null, ' +
+                '''Machine''), then run the installer again.' + #13#10#13#10 +
                 'Nothing has been changed.'
     else if (Inp.Dsn = '') and (Inp.DsnFile = '') and not CarryDsn then
     begin
@@ -1615,8 +1732,13 @@ begin
     if CarryOidc then AddPath(CarryFiles, DataDir + '\oidc-client-secret');
     Reason := ListDirectFiles(CertDirPath(DataDir), CarryFiles);
     if Reason = '' then Reason := ListDirectFiles(DataDir + '\data', DataFiles);
-    if Reason = '' then Reason := CheckCarry(CarryFiles);
-    if Reason = '' then Reason := CheckCarry(DataFiles);
+    // The folders the carried files sit in must not be controlled by
+    // anyone else either: see RunAclCheck's carry mode.
+    AddPath(Dirs, DataDir);
+    if DirExists(CertDirPath(DataDir)) then AddPath(Dirs, CertDirPath(DataDir));
+    if DirExists(DataDir + '\data') then AddPath(Dirs, DataDir + '\data');
+    if Reason = '' then Reason := CheckCarry(CarryFiles, Dirs);
+    if Reason = '' then Reason := CheckCarry(DataFiles, Dirs);
     if Reason <> '' then
       Result := NotSecuredMessage(DataDir, 'It is not secured, and it cannot be upgraded: ' +
         Reason + '. Inspect it; if that file is yours, make Administrators its owner ' +
@@ -1635,7 +1757,10 @@ begin
     if NeedLegacy then
     begin
       Reason := ListLegacyKeyFiles(LegacyFiles);
-      if Reason = '' then Reason := CheckCarry(LegacyFiles);
+      SetArrayLength(Dirs, 0);
+      AddPath(Dirs, ExpandConstant('{commonappdata}\Yuzu'));
+      AddPath(Dirs, LegacyCertDirPath);
+      if Reason = '' then Reason := CheckCarry(LegacyFiles, Dirs);
       if Reason <> '' then
         Result := 'The server''s existing CA and key-encryption keys in ' + LegacyCertDirPath +
           ' cannot be moved into the secured data directory: ' + Reason + '. Without them the ' +
@@ -1652,6 +1777,18 @@ begin
   // ── 2. A new or upgraded directory is filled while it is still private ──
   if State <> StateSecured then
   begin
+    // The finished directory is moved into place with a rename, which cannot
+    // cross volumes. Known now, so refuse now, before anything changes.
+    if CompareText(ExtractFileDrive(Stage), ExtractFileDrive(DataDir)) <> 0 then
+    begin
+      Result := 'The installer''s temporary folder (' + ExtractFileDrive(Stage) + ') is on a ' +
+                'different drive from ' + DataDir + ', so the new data directory cannot be moved ' +
+                'into place. Set TEMP and TMP to a folder on ' + ExtractFileDrive(DataDir) +
+                ', or run the installer as SYSTEM, then run it again.' + #13#10#13#10 +
+                'Nothing has been changed.';
+      Log('PrepareToInstall: ' + Result);
+      Exit;
+    end;
     Result := BuildStage(Stage);
     if (Result = '') and (State = StateInsecure) then
     begin
@@ -1749,8 +1886,23 @@ begin
           'drive). If TEMP is on another drive, set TEMP and TMP to a folder on the system ' +
           'drive, or run the installer as SYSTEM, then run it again.');
         DelTree(Stage, True, True, True);
-        if (State = StateInsecure) and RenameFile(Aside, DataDir) then
-          Result := Result + ' The old directory has been put back.';
+        if State = StateInsecure then
+        begin
+          if RenameFile(Aside, DataDir) then
+            Result := Result + ' The old directory has been put back.'
+          else
+          begin
+            // Something took the name in the moment it was free. The service
+            // must not start over a directory this installer did not make.
+            Exec(ExpandConstant('{sys}\sc.exe'), 'config YuzuServer start= disabled', '', SW_HIDE,
+                 ewWaitUntilTerminated, ResultCode);
+            Result := Result + ' The old directory could not be put back either: it is now ' +
+                      Aside + '. Something else created ' + DataDir + ' in the meantime -- ' +
+                      'inspect it. The YuzuServer service has been DISABLED so that it cannot ' +
+                      'start over that directory; re-enable it (sc config YuzuServer start= auto) ' +
+                      'only after moving the old directory back or running the installer again.';
+          end;
+        end;
       end
       else if State = StateInsecure then
         Log('PrepareToInstall: the previous, unsecured data directory was kept as ' + Aside +
@@ -1769,6 +1921,9 @@ begin
   end;
   if Result <> '' then
   begin
+    if (State = StateSecured) and (Replaced <> '') then
+      Result := Result + #13#10#13#10 + 'These files had already been replaced in the data ' +
+                'directory:' + Replaced;
     Log('PrepareToInstall: ' + Result);
     Result := Result + AbortSuffix;
   end;
