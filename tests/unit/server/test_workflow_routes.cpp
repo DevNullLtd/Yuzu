@@ -1477,14 +1477,16 @@ TEST_CASE("executions list: a status-read degrade under a confined scope is 503"
     h.agent_status(eid, "agent-in", "success");
     h.fleet_read_scope = VS{std::unordered_set<std::string>{"agent-in"}};
 
-    // The list query's own scope predicate reads agent_exec_status too, so renaming it
-    // trips the first (list) call; either way a degrade must surface as 503 and never as
-    // an empty state.
-    exec_sql(db.dsn(),
-             "ALTER TABLE execution_tracker.agent_exec_status RENAME TO agent_exec_status_hidden");
+    // Break ONLY the per-execution status read: plugin_result_status is selected by
+    // get_agent_statuses_for_executions_checked but not by the list query (its scope
+    // predicate and error-preview subquery touch other columns), so the list step succeeds
+    // and the degrade lands on the status step. A degrade there must be a 503, never an
+    // unfiltered or empty render.
+    exec_sql(db.dsn(), "ALTER TABLE execution_tracker.agent_exec_status RENAME COLUMN "
+                       "plugin_result_status TO plugin_result_status_hidden");
     auto res = h.sink.Get("/fragments/executions");
-    exec_sql(db.dsn(),
-             "ALTER TABLE execution_tracker.agent_exec_status_hidden RENAME TO agent_exec_status");
+    exec_sql(db.dsn(), "ALTER TABLE execution_tracker.agent_exec_status RENAME COLUMN "
+                       "plugin_result_status_hidden TO plugin_result_status");
     REQUIRE(res);
     CHECK(res->status == 503);
     CHECK(res->body.find("No executions yet") == std::string::npos);

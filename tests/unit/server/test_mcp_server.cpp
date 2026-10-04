@@ -11187,11 +11187,10 @@ std::string replace_all_str(std::string s, const std::string& from, const std::s
     return s;
 }
 
-void rename_exec_table(const std::string& dsn, const std::string& from, const std::string& to) {
+void exec_tracker_ddl(const std::string& dsn, const std::string& sql) {
     yuzu::server::pg::PgConn conn{PQconnectdb(dsn.c_str())};
     REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
-    yuzu::server::pg::PgResult r{
-        PQexec(conn.get(), ("ALTER TABLE execution_tracker." + from + " RENAME TO " + to).c_str())};
+    yuzu::server::pg::PgResult r{PQexec(conn.get(), sql.c_str())};
     REQUIRE(r.ok());
 }
 } // namespace
@@ -11300,9 +11299,11 @@ TEST_CASE("MCP summarize_working_set execution: a tracker degrade is an error wi
     McpTestServer ts;
     ts.execution_tracker_for_test = &tracker;
     ts.start("operator");
-    rename_exec_table(tracker_bundle.dsn(), "executions", "executions_hidden_3526");
+    exec_tracker_ddl(tracker_bundle.dsn(),
+                     "ALTER TABLE execution_tracker.executions RENAME TO executions_hidden_3526");
     auto res = ts.call(summarize_exec_call_body(exec_id));
-    rename_exec_table(tracker_bundle.dsn(), "executions_hidden_3526", "executions");
+    exec_tracker_ddl(tracker_bundle.dsn(),
+                     "ALTER TABLE execution_tracker.executions_hidden_3526 RENAME TO executions");
     REQUIRE(res);
     auto body = nlohmann::json::parse(res->body);
     REQUIRE(body.contains("error"));
@@ -11329,9 +11330,16 @@ TEST_CASE("MCP summarize_working_set execution: a status-read degrade under a co
         return {true, yuzu::server::authz::VisibleSet{std::unordered_set<std::string>{"agent-in"}}};
     };
     ts.start("operator");
-    rename_exec_table(tracker_bundle.dsn(), "agent_exec_status", "agent_exec_status_hidden_3526");
+    // Break ONLY the status read: plugin_result_status is selected by
+    // get_agent_statuses_checked but not by get_execution_checked, so the execution row
+    // loads and the degrade lands on the status step.
+    exec_tracker_ddl(tracker_bundle.dsn(),
+                     "ALTER TABLE execution_tracker.agent_exec_status RENAME COLUMN "
+                     "plugin_result_status TO plugin_result_status_hidden");
     auto res = ts.call(summarize_exec_call_body(exec_id));
-    rename_exec_table(tracker_bundle.dsn(), "agent_exec_status_hidden_3526", "agent_exec_status");
+    exec_tracker_ddl(tracker_bundle.dsn(),
+                     "ALTER TABLE execution_tracker.agent_exec_status RENAME COLUMN "
+                     "plugin_result_status_hidden TO plugin_result_status");
     REQUIRE(res);
     auto body = nlohmann::json::parse(res->body);
     REQUIRE(body.contains("error"));
