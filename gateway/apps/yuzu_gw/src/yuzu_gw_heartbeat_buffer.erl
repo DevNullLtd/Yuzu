@@ -24,10 +24,20 @@
 %%% yuzu_gw_heartbeat_buffer_dropped_total; coalescing is counted in
 %%% yuzu_gw_heartbeat_coalesced_total.
 %%%
+%%% A heartbeat that could never be sent is screened out on arrival, before it
+%%% touches the buffer (the session's older entry, if any, is kept): one with
+%%% more than ?MAX_STATUS_TAGS status tags, or still larger than one chunk
+%%% without its snapshot, is dropped as heartbeat_oversize, and one whose
+%%% session id or a status tag key or value is not valid UTF-8 (the encoder
+%%% raises on it) as heartbeat_invalid. So every entry fits one chunk and every
+%%% request is under the server's receive limit: nothing here relies on the
+%%% sender being well behaved (the gateway puts no inbound size limit on a
+%%% Heartbeat).
+%%%
 %%% Flushing calls do_flush/2 which sends BatchHeartbeat RPCs via grpcbox.
 %%% The buffer is split into chunks, oldest entry first, each estimated under
-%%% 3 MiB so that no request reaches the server's 4 MiB receive limit however
-%%% long the outage was. A chunk that the server accepted is removed; on the
+%%% 3 MiB, so no request reaches the server's 4 MiB receive limit however long
+%%% the outage was. A chunk that the server accepted is removed; on the
 %%% first failure that chunk and every later one are retained for the next
 %%% flush cycle and the flush stops.
 %%%
@@ -69,6 +79,10 @@
 
 -define(SERVER, ?MODULE).
 -define(DEFAULT_MAX_HB_BUFFER, 10000).
+%% A heartbeat with more status tags than this is dropped (heartbeat_oversize).
+%% The agent sends about 25; the bound only has to stop a sender that floods the
+%% tag map.
+-define(MAX_STATUS_TAGS, 512).
 %% max_heartbeat_buffer_bytes: the cap on the buffer's estimated encoded size.
 %% Valid 1 MiB..1 GiB (default 64 MiB); anything else logs a warning naming the
 %% key and takes the default.
@@ -104,6 +118,8 @@
 %% One buffered session: its insertion/refresh order, the heartbeat to send and
 %% the estimate_bytes/1 of that heartbeat.
 -type entry() :: #{seq := non_neg_integer(), hb := map(), bytes := non_neg_integer()}.
+-type drop_reason() :: buffer_full | snapshot_oversize | snapshot_evicted
+                     | heartbeat_oversize | heartbeat_invalid.
 
 -record(state, {
     buffer      = #{} :: #{term() => entry()}, %% session id => entry
@@ -283,12 +299,22 @@ do_flush(BatchReq, N) ->
             {error, {internal, Reason}}
     end.
 
-%% @doc Queue one heartbeat: coalesce it into its session's entry, or insert
-%% it, or drop it when the session count is at its cap. The count cap never
-%% drops a heartbeat for a session already buffered. A snapshot too large for
-%% one chunk is dropped from the entry, then the byte cap is enforced.
+%% @doc Queue one heartbeat: drop it when it can never be sent (screen/1), else
+%% coalesce it into its session's entry, or insert it, or drop it when the
+%% session count is at its cap. The count cap never drops a heartbeat for a
+%% session already buffered. A snapshot too large for one chunk is dropped from
+%% the entry, then the byte cap is enforced.
 -spec enqueue(map(), #state{}) -> #state{}.
-enqueue(Hb, #state{buffer = Buf, max_buf = MaxBuf} = State) ->
+enqueue(Hb, #state{} = State) ->
+    case screen(Hb) of
+        ok ->
+            enqueue_screened(Hb, State);
+        {drop, Reason} ->
+            note_dropped(Reason),
+            State
+    end.
+
+enqueue_screened(Hb, #state{buffer = Buf, max_buf = MaxBuf} = State) ->
     Sid = maps:get(session_id, Hb, <<>>),
     case Buf of
         #{Sid := #{hb := Old} = Entry} ->
@@ -301,6 +327,47 @@ enqueue(Hb, #state{buffer = Buf, max_buf = MaxBuf} = State) ->
         _ ->
             admit(Sid, put_entry(Sid, Hb, State))
     end.
+
+%% @doc Whether a heartbeat can ever be sent, decided on the heartbeat alone
+%% (never on the buffer), so a dropped heartbeat leaves its session's older entry
+%% untouched. The newest heartbeat wins every field but the snapshot, so a
+%% heartbeat too large without its snapshot is too large coalesced as well. Size
+%% is checked first: it is cheap, and the UTF-8 walk then only runs over a
+%% heartbeat that fits one chunk.
+-spec screen(map()) -> ok | {drop, heartbeat_oversize | heartbeat_invalid}.
+screen(Hb) ->
+    Tags = maps:get(status_tags, Hb, #{}),
+    case tag_count(Tags) > ?MAX_STATUS_TAGS
+         orelse estimate_bytes(Hb#{fleet_snapshot_json => <<>>}) > ?CHUNK_BYTES of
+        true ->
+            {drop, heartbeat_oversize};
+        false ->
+            case valid_text(Hb) of
+                true  -> ok;
+                false -> {drop, heartbeat_invalid}
+            end
+    end.
+
+tag_count(Tags) when is_map(Tags) -> map_size(Tags);
+tag_count(_)                      -> 0.
+
+%% The session id and every status tag key and value are binaries of valid UTF-8
+%% (what the encoder accepts: gateway_pb raises badarg on anything else, and the
+%% decoder of the agent's own message keeps invalid bytes as they came). An
+%% absent field is valid; a status_tags that is not a map is not.
+-spec valid_text(map()) -> boolean().
+valid_text(Hb) ->
+    valid_utf8(maps:get(session_id, Hb, <<>>))
+        andalso case maps:get(status_tags, Hb, #{}) of
+                    Tags when is_map(Tags) ->
+                        maps:fold(fun(K, V, Ok) -> Ok andalso valid_utf8(K) andalso valid_utf8(V) end,
+                                  true, Tags);
+                    _ ->
+                        false
+                end.
+
+valid_utf8(B) when is_binary(B) -> is_binary(unicode:characters_to_binary(B, utf8, utf8));
+valid_utf8(_)                   -> false.
 
 %% @doc The newest heartbeat wins every field; fleet_snapshot_json is the
 %% newest non-empty snapshot (see the module doc).
@@ -316,10 +383,12 @@ coalesce(Old, New) ->
             New
     end.
 
+%% A heartbeat that passed screen/1 fits one chunk without its snapshot, so an
+%% entry over a chunk holds a snapshot: that is what is dropped (and counted).
 -spec admit(term(), #state{}) -> #state{}.
 admit(Sid, #state{buffer = Buf} = State) ->
-    #{Sid := #{bytes := Bytes}} = Buf,
-    State1 = case Bytes > ?CHUNK_BYTES of
+    #{Sid := #{bytes := Bytes, hb := Hb}} = Buf,
+    State1 = case Bytes > ?CHUNK_BYTES andalso has_snapshot(Hb) of
         true ->
             note_dropped(snapshot_oversize),
             strip_snapshot(Sid, State);
@@ -354,7 +423,7 @@ oldest_entry(Buf) ->
                       Acc
               end, {undefined, #{seq => infinity}}, Buf).
 
--spec note_dropped(buffer_full | snapshot_oversize | snapshot_evicted) -> ok.
+-spec note_dropped(drop_reason()) -> ok.
 note_dropped(Reason) ->
     telemetry:execute([yuzu, gw, heartbeat, buffer_dropped],
                       #{count => 1}, #{reason => Reason}).

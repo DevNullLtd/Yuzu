@@ -72,7 +72,19 @@ bound_test_() ->
       {"max_heartbeat_buffer_bytes outside 1 MiB..1 GiB or not an integer falls back with a warning",
        fun max_bytes_invalid_falls_back/0},
       {"max_heartbeat_buffer_bytes inside 1 MiB..1 GiB is kept",
-       fun max_bytes_valid_is_kept/0}
+       fun max_bytes_valid_is_kept/0},
+      {"a lone 5 MiB heartbeat ahead of 50 sessions is dropped on arrival and all 50 are delivered",
+       fun poison_oversize_heartbeat_is_dropped_and_others_delivered/0},
+      {"512 status tags are kept, 513 are dropped as heartbeat_oversize",
+       fun status_tag_count_bound/0},
+      {"a heartbeat over one chunk without its snapshot is dropped, not stripped",
+       fun oversize_without_snapshot_is_dropped_not_stripped/0},
+      {"a coalescing heartbeat over a chunk loses the older snapshot and keeps the heartbeat",
+       fun coalesced_over_a_chunk_strips_the_snapshot/0},
+      {"an oversize or invalid heartbeat leaves the older entry of its session untouched",
+       fun dropped_heartbeat_keeps_the_older_entry/0},
+      {"invalid UTF-8 in a tag or the session id is dropped and never crashes the buffer",
+       fun invalid_utf8_is_dropped_and_buffer_survives/0}
      ]}.
 
 setup() ->
@@ -428,9 +440,134 @@ max_bytes_case(Val, Expected, Kind) ->
         start_buffer()
     end.
 
+%% A server that refuses a request over its receive limit, as the real one does.
+%% One heartbeat with 5 MiB of status tags used to go out as a chunk of its own,
+%% be refused every cycle and hold every newer heartbeat behind it.
+poison_oversize_heartbeat_is_dropped_and_others_delivered() ->
+    set_unary(fun(_N) -> {ok, #{acknowledged_count => 0}, #{}} end),
+    refuse_over_limit(),
+    queue(hb(<<"poison">>, #{tags => #{<<"big">> => binary:copy(<<"t">>, 5 * ?MIB)}})),
+    Ids = [sid(I) || I <- lists:seq(1, 50)],
+    [queue(hb(Id, #{snap => snap(100 * 1024), tags => tags()})) || Id <- Ids],
+    ?assertEqual(1, dropped(heartbeat_oversize)),
+    ?assertEqual(1, dropped_total()),
+    ?assertEqual(0, dropped(snapshot_oversize)),
+    ?assertEqual(50, session_count()),
+    ?assertEqual(ok, yuzu_gw_heartbeat_buffer:flush_sync()),
+    Sent = [maps:get(session_id, H) || R <- requests(), H <- hbs(R)],
+    ?assertEqual(Ids, Sent),
+    ?assertEqual(0, session_count()),
+    [?assert(Size =< ?SERVER_LIMIT) || Size <- request_sizes()],
+    ?assertEqual(1, dropped_total()),
+    %% Control: the refusing server does refuse a request that big, so the drop
+    %% is what kept it out.
+    Big = #{heartbeats => [hb(<<"poison">>, #{tags => #{<<"big">> => binary:copy(<<"t">>, 5 * ?MIB)}})],
+            gateway_node => <<"n">>},
+    ?assert(encoded_size(Big) > ?SERVER_LIMIT).
+
+status_tag_count_bound() ->
+    Tags = fun(N) -> maps:from_list([{iolist_to_binary(["k", integer_to_list(I)]), <<"v">>}
+                                     || I <- lists:seq(1, N)]) end,
+    queue(hb(<<"at-limit">>, #{tags => Tags(512)})),
+    ?assertEqual(0, dropped_total()),
+    queue(hb(<<"over-limit">>, #{tags => Tags(513)})),
+    ?assertEqual(1, dropped(heartbeat_oversize)),
+    ?assertEqual(1, dropped_total()),
+    ?assertEqual([<<"at-limit">>], buffered_ids()),
+    ?assertEqual(ok, yuzu_gw_heartbeat_buffer:flush_sync()),
+    ?assertEqual([<<"at-limit">>], [maps:get(session_id, H) || R <- requests(), H <- hbs(R)]).
+
+oversize_without_snapshot_is_dropped_not_stripped() ->
+    %% 3.1 MiB of tags: over one chunk with no snapshot to strip. A 10 KB
+    %% snapshot beside it does not make the snapshot the cause.
+    Tags = #{<<"big">> => binary:copy(<<"t">>, 3 * ?MIB + 100 * 1024)},
+    queue(hb(<<"no-snap">>, #{tags => Tags})),
+    queue(hb(<<"with-snap">>, #{tags => Tags, snap => snap(10 * 1024)})),
+    ?assertEqual(2, dropped(heartbeat_oversize)),
+    ?assertEqual(0, dropped(snapshot_oversize)),
+    ?assertEqual(2, dropped_total()),
+    ?assertEqual(0, session_count()),
+    %% Control: a snapshot over a chunk is still stripped and counted as such.
+    queue(hb(<<"big-snap">>, #{snap => snap(3 * ?MIB + 1)})),
+    ?assertEqual(1, dropped(snapshot_oversize)),
+    ?assertEqual(2, dropped(heartbeat_oversize)),
+    ?assertEqual([<<"big-snap">>], buffered_ids()).
+
+%% Each part fits a chunk alone (a 2 MiB snapshot, then 1.5 MiB of tags) and the
+%% coalesced heartbeat does not: the older snapshot goes, the heartbeat stays.
+coalesced_over_a_chunk_strips_the_snapshot() ->
+    queue(hb(<<"a">>, #{snap => snap(2 * ?MIB)})),
+    ?assertEqual(0, dropped_total()),
+    queue(hb(<<"a">>, #{tags => #{<<"t">> => binary:copy(<<"t">>, 3 * ?MIB div 2)}})),
+    ?assertEqual(1, dropped(snapshot_oversize)),
+    ?assertEqual(1, dropped_total()),
+    ?assertEqual(ok, yuzu_gw_heartbeat_buffer:flush_sync()),
+    [H] = [H || R <- requests(), H <- hbs(R)],
+    ?assertEqual(<<>>, maps:get(fleet_snapshot_json, H, <<>>)),
+    ?assertEqual(3 * ?MIB div 2, byte_size(maps:get(<<"t">>, maps:get(status_tags, H)))).
+
+dropped_heartbeat_keeps_the_older_entry() ->
+    queue(hb(<<"a">>, #{tags => #{<<"v">> => <<"old">>}, snap => <<"snap-old">>})),
+    queue(hb(<<"a">>, #{tags => #{<<"big">> => binary:copy(<<"t">>, 4 * ?MIB)}})),
+    ?assertEqual(1, dropped(heartbeat_oversize)),
+    queue(#{session_id => <<"a">>, status_tags => #{<<"v">> => <<255>>}}),
+    ?assertEqual(1, dropped(heartbeat_invalid)),
+    ?assertEqual(0, event_count(?EV_COALESCED)),
+    ?assertEqual(ok, yuzu_gw_heartbeat_buffer:flush_sync()),
+    [H] = [H || R <- requests(), H <- hbs(R)],
+    ?assertEqual(#{<<"v">> => <<"old">>}, maps:get(status_tags, H)),
+    ?assertEqual(<<"snap-old">>, maps:get(fleet_snapshot_json, H)).
+
+invalid_utf8_is_dropped_and_buffer_survives() ->
+    Pid = whereis(yuzu_gw_heartbeat_buffer),
+    Bad = [
+        %% a lone 0xFF byte as the key, as the value, and a truncated sequence
+        #{session_id => <<"bad-key">>, status_tags => #{<<255>> => <<"v">>}},
+        #{session_id => <<"bad-val">>, status_tags => #{<<"k">> => <<255>>}},
+        #{session_id => <<"bad-cut">>, status_tags => #{<<"k">> => <<"ab", 226, 130>>}},
+        %% an encoded surrogate and an overlong form
+        #{session_id => <<"bad-surrogate">>, status_tags => #{<<"k">> => <<237, 160, 128>>}},
+        #{session_id => <<"bad-overlong">>, status_tags => #{<<"k">> => <<192, 128>>}},
+        %% the session id itself
+        #{session_id => <<255, 1>>, status_tags => #{<<"k">> => <<"v">>}},
+        %% not a binary at all
+        #{session_id => <<"bad-type">>, status_tags => #{<<"k">> => not_a_binary}},
+        #{session_id => <<"bad-tags">>, status_tags => [{<<"k">>, <<"v">>}]},
+        #{session_id => 7}
+    ],
+    Good = [hb(<<"good-1">>, #{tags => #{<<"k">> => <<"v">>}}),
+            %% multi-byte UTF-8 (a euro sign, an emoji) is valid
+            hb(<<"good-euro">>, #{tags => #{<<226, 130, 172>> => <<240, 159, 146, 169>>}}),
+            hb(<<"good-3">>, #{})],
+    [queue(H) || H <- lists:sublist(Bad, 3) ++ [hd(Good)] ++ lists:nthtail(3, Bad) ++ tl(Good)],
+    ?assertEqual(length(Bad), dropped(heartbeat_invalid)),
+    ?assertEqual(length(Bad), dropped_total()),
+    ?assertEqual(Pid, whereis(yuzu_gw_heartbeat_buffer)),
+    ?assertEqual(lists:sort([<<"good-1">>, <<"good-euro">>, <<"good-3">>]),
+                 lists:sort(buffered_ids())),
+    ?assertEqual(ok, yuzu_gw_heartbeat_buffer:flush_sync()),
+    ?assertEqual(Pid, whereis(yuzu_gw_heartbeat_buffer)),
+    ?assertEqual(lists:sort([<<"good-1">>, <<"good-euro">>, <<"good-3">>]),
+                 lists:sort([maps:get(session_id, H) || R <- requests(), H <- hbs(R)])).
+
 %%%===================================================================
 %%% Helpers
 %%%===================================================================
+
+%% The BatchHeartbeat mock answers RESOURCE_EXHAUSTED to a request over the
+%% server's receive limit (measured with the real marshal fun) and accepts the
+%% rest. The request is logged either way.
+refuse_over_limit() ->
+    Counter = counters:new(1, []),
+    meck:expect(grpcbox_client, unary, fun(_Ctx, _Path, Req, Def, _Opts) ->
+        counters:add(Counter, 1, 1),
+        Size = iolist_size((Def#grpcbox_def.marshal_fun)(Req)),
+        rec({request, Req, Size}),
+        case Size > ?SERVER_LIMIT of
+            true  -> {error, {?GRPC_STATUS_RESOURCE_EXHAUSTED, <<"too big">>}, #{}};
+            false -> {ok, #{acknowledged_count => length(maps:get(heartbeats, Req))}, #{}}
+        end
+    end).
 
 sid(I) -> iolist_to_binary(["session-", integer_to_list(I)]).
 
