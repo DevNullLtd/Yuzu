@@ -46,7 +46,7 @@ At the rig-tested commit `caef11df5` (fix-agent and reviewer runs, not rig runs)
 
 At the later code commits (not rig-run):
 
-- eunit: 467 of 467 passed after the first governance fix round, and 473 of 473 after the second (three runs from a fresh `_build/test` each, no flake, no cancelled run). The count is for the branch before the merge of dev; the merge is re-run and reported on the PR.
+- eunit: 467 of 467 passed after the first governance fix round, 473 of 473 after the second, and 488 of 488 after the open-items round (three runs from a fresh `_build/test` each, no flake, no cancelled run). The merge of dev changed only the changelog file.
 - dialyzer: exit code 0 after the second fix round.
 - Common Test: 52 cases passed after the second fix round.
 

@@ -1247,8 +1247,9 @@ env keys with defaults, which a reverted build ignores.
   raised inside the upstream client's own RPC calls is caught and counted as a
   failed RPC (code `exception`), so its stacktrace carries no request. Third, a
   logger primary filter, `yuzu_gw_crash_redact`, installed when the application
-  starts, redacts the crash report of `yuzu_gw_upstream` and the supervisor
-  `child_terminated` report for it: the process mailbox becomes a count, and the
+  starts, redacts the crash report of `yuzu_gw_upstream`, the `gen_server` terminate
+  report and the supervisor `child_terminated` report for it: the process
+  mailbox becomes a count, the process dictionary is dropped, and the
   `messages:` line and the exception lines keep no argument lists. A crash from
   any other source (for example a function clause in a helper that was handed a
   request) would otherwise print that function's argument list, because OTP
