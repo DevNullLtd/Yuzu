@@ -81,6 +81,21 @@ reset() {
 alive() { : > "$TMP/alive/$1"; printf '%s\n' "$2" > "$TMP/cmd/$1"; printf 'Sun Oct  4 10:00:%s 2026\n' "$1" > "$TMP/birth/$1"; }
 run()   { set +e; out=$("$@" 2>&1); rc=$?; set -e; }
 
+# Host capability probes: Git for Windows (MSYS) keeps no POSIX mode bits on NTFS
+# (chmod is a no-op) and `ln -s` may copy; the mode- and symlink-dependent cases
+# below are skipped there. start-UAT.sh targets macOS and Linux; win-start-UAT.sh
+# is the Windows rig.
+probe_dir=$(mktemp -d "${TMPDIR:-/tmp}/yuzu_test_probe.XXXXXX")
+chmod 777 "$probe_dir"; has_modes=0
+if [ -n "$(find "$probe_dir" -maxdepth 0 -perm -002)" ]; then
+  chmod 700 "$probe_dir"
+  [ -z "$(find "$probe_dir" -maxdepth 0 \( -perm -020 -o -perm -002 \))" ] && has_modes=1
+fi
+: > "$probe_dir/t"; ln -s "$probe_dir/t" "$probe_dir/l" 2>/dev/null; has_links=0
+[ -L "$probe_dir/l" ] && has_links=1
+rm -rf "$probe_dir"
+skip() { printf '  [skip] %s (host has no POSIX %s)\n' "$1" "$2"; }
+
 DECOY='bash /Users/x/.claude/skills/snr-dev/snr-with-lock.sh meson compile -C /Users/x/Yuzu-worktrees/w/build-macos -j4 yuzu-agent'
 SRV="$BUILDDIR/server/core/yuzu-server"
 AGT="$BUILDDIR/agents/core/yuzu-agent"
@@ -207,26 +222,42 @@ reset; run kill_tree 0
 check "kill_tree refuses PID 0" "$([ ! -e "$TMP/kills" ] && echo 0 || echo 1)"
 
 echo "forged records: provenance"
-reset; alive 100 "$SRV --no-tls"; record_pid server 100 "$SRV"; chmod 777 "$PID_DIR"
-run kill_stale
-check "world-writable PID_DIR: untrusted, nothing killed, record kept, stop refuses (rc 1)" "$([ $rc = 1 ] && ! [ -e "$TMP/kills" ] && [ -f "$PID_DIR/server.pid" ] && [[ $out == *'ignoring PID records not owned by you'* ]] && echo 0 || echo 1)"
-run show_status
-check "status labels the ignored record" "$([[ $out == *'server record ignored'* ]] && echo 0 || echo 1)"
-reset; alive 100 "$SRV --no-tls"; record_pid server 100 "$SRV"; chmod 775 "$PID_DIR"
-check "group-writable PID_DIR is untrusted too" "$([ "$(recorded_pid_state server)" = untrusted ] && echo 0 || echo 1)"
-reset; alive 100 "$SRV --no-tls"; record_pid server 100 "$SRV"; chmod 777 "$UAT_DIR"
-check "world-writable UAT_DIR is untrusted" "$([ "$(recorded_pid_state server)" = untrusted ] && echo 0 || echo 1)"
-reset; alive 100 "$SRV --no-tls"; record_pid server 100 "$SRV"; mv "$PID_DIR/server.pid" "$TMP/real.pid"; ln -s "$TMP/real.pid" "$PID_DIR/server.pid"
-run kill_stale
-check "symlinked record: untrusted, nothing killed, link kept, stop refuses (rc 1)" "$([ $rc = 1 ] && ! [ -e "$TMP/kills" ] && [ -L "$PID_DIR/server.pid" ] && echo 0 || echo 1)"
+if [ "$has_modes" = 1 ]; then
+  reset; alive 100 "$SRV --no-tls"; record_pid server 100 "$SRV"; chmod 777 "$PID_DIR"
+  run kill_stale
+  check "world-writable PID_DIR: untrusted, nothing killed, record kept, stop refuses (rc 1)" "$([ $rc = 1 ] && ! [ -e "$TMP/kills" ] && [ -f "$PID_DIR/server.pid" ] && [[ $out == *'ignoring PID records not owned by you'* ]] && echo 0 || echo 1)"
+  run show_status
+  check "status labels the ignored record" "$([[ $out == *'server record ignored'* ]] && echo 0 || echo 1)"
+  reset; alive 100 "$SRV --no-tls"; record_pid server 100 "$SRV"; chmod 775 "$PID_DIR"
+  check "group-writable PID_DIR is untrusted too" "$([ "$(recorded_pid_state server)" = untrusted ] && echo 0 || echo 1)"
+  reset; alive 100 "$SRV --no-tls"; record_pid server 100 "$SRV"; chmod 777 "$UAT_DIR"
+  check "world-writable UAT_DIR is untrusted" "$([ "$(recorded_pid_state server)" = untrusted ] && echo 0 || echo 1)"
+else
+  skip "world/group-writable directory cases" "mode bits"
+fi
+if [ "$has_links" = 1 ]; then
+  reset; alive 100 "$SRV --no-tls"; record_pid server 100 "$SRV"; mv "$PID_DIR/server.pid" "$TMP/real.pid"; ln -s "$TMP/real.pid" "$PID_DIR/server.pid"
+  run kill_stale
+  check "symlinked record: untrusted, nothing killed, link kept, stop refuses (rc 1)" "$([ $rc = 1 ] && ! [ -e "$TMP/kills" ] && [ -L "$PID_DIR/server.pid" ] && echo 0 || echo 1)"
+else
+  skip "symlinked record case" "symlinks"
+fi
 reset; alive 100 "$SRV --no-tls"; record_pid server 100 "$SRV"
 check "ordinary record is trusted and owned" "$([ "$(recorded_pid_state server)" = 'owned 100' ] && echo 0 || echo 1)"
-check "record_pid leaves PID_DIR at 0700" "$([ "$(find "$PID_DIR" -maxdepth 0 -perm 700)" = "$PID_DIR" ] && echo 0 || echo 1)"
+if [ "$has_modes" = 1 ]; then
+  check "record_pid leaves PID_DIR at 0700" "$([ "$(find "$PID_DIR" -maxdepth 0 -perm 700)" = "$PID_DIR" ] && echo 0 || echo 1)"
+else
+  skip "PID_DIR 0700 case" "mode bits"
+fi
 
 echo "prepare_fresh_run: directory provenance"
-reset; mkdir -p "$UAT_DIR"; chmod 777 "$UAT_DIR"; : > "$TMP/rm-fails"
-run prepare_fresh_run
-check "wipe failed and UAT_DIR is world-writable: refuses, no agent-data" "$([ $rc = 1 ] && [[ $out == *refusing* ]] && [ ! -d "$UAT_DIR/agent-data" ] && echo 0 || echo 1)"
+if [ "$has_modes" = 1 ]; then
+  reset; mkdir -p "$UAT_DIR"; chmod 777 "$UAT_DIR"; : > "$TMP/rm-fails"
+  run prepare_fresh_run
+  check "wipe failed and UAT_DIR is world-writable: refuses, no agent-data" "$([ $rc = 1 ] && [[ $out == *refusing* ]] && [ ! -d "$UAT_DIR/agent-data" ] && echo 0 || echo 1)"
+else
+  skip "world-writable UAT_DIR refusal case" "mode bits"
+fi
 umask_prepare() { umask 002; prepare_fresh_run; }
 reset
 run umask_prepare
