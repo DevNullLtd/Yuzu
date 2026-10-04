@@ -537,4 +537,5 @@ not assert row count for the same reason: `tests/unit/test_network_config_local_
 - Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_c.hpp`
 - Tests: `tests/test_network_config_routes_definition.py` · `tests/unit/test_network_config_local_dispatcher.cpp` · `tests/unit/test_network_config_parsers.cpp` · `tests/unit/test_network_config_routes.cpp`
 - Privilege row: `docs/agent-privilege-model.md`
+- Changelog: `changelog.d/2026-10-04-network_config-routes.added.md`
 <!-- END GENERATED -->
