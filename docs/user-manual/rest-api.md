@@ -6089,6 +6089,15 @@ rejection increments `yuzu_server_response_param_rejected_total{surface}`
   `"result_truncated_by_cap": true`: more rows may exist past the ceiling, and a result of
   exactly 1000 sets it too, because that fetch does not look ahead. The field is absent
   otherwise, so a request that never exceeded the ceiling gets the same body as before.
+- **Audit posture.** All three legacy readers (`GET /api/responses/{id}`, `.../aggregate`, `.../export`)
+  write a `response.read` success row on every served read, with the same verb, target type and result
+  as the v1 twins so the two are countable together; only the `detail` differs (`legacy response
+  <query|aggregate|export> cid=<id>`, against `REST v1 response <query|aggregate|export> cid=<id>`).
+  Like v1 they are fail-closed: a success row or a scope-drop `denied` row that cannot be persisted, or a
+  throwing audit pipeline, is a `503` with `Sec-Audit-Failed: true`, an A4 envelope (`retry_after_ms:
+  5000`) and no data. A request rejected for a malformed parameter writes no row. The legacy detail strings
+  keep the `surface=get|aggregate|export` tokens on the `denied` rows; v1 uses `v1_get`, `v1_aggregate`
+  and `v1_export`.
 - `offset` is rejected with `400` on `GET /api/v1/responses/{id}` and `GET
   /api/v1/responses/{id}/export` (the two routes below with a row-level result set), matching
   `GET /api/v1/executions/{id}/responses` and MCP `query_responses` above: the result set orders by
@@ -6169,8 +6178,8 @@ merely ends on the row that crosses the cap is not truncated. Each cut also incr
 
 Audit posture: all three routes below emit a `response.read` audit event, **REST fail-closed** (503
 on an audit-persist failure, `docs/api-twin-recipe.md` §4) — a deliberate addition vs. the legacy
-routes, which only audit a management-group scope-drop, never a plain successful read. A scope-drop
-still emits its own distinct `denied` row (CC7.2 evidence), as the legacy routes already do.
+routes as they were before #4644 Gate 7; the legacy routes now audit successful reads the same way, fail-closed. A scope-drop
+still emits its own distinct `denied` row (CC7.2 evidence), as the legacy routes do.
 
 #### `GET /api/v1/responses/{id}`
 
@@ -10101,14 +10110,19 @@ Convert a JSON result set to CSV format for download.
 
 #### `GET /api/responses/{id}`
 
-Get command responses for a specific command ID. An explicit `limit` is capped at 1000; when the
+Get command responses for a specific command ID. Every served read writes a `response.read` success row
+(`detail=legacy response query cid=<id>`), fail-closed: if that row, or the scope-drop `denied` row, cannot
+be persisted the route answers `503` with `Sec-Audit-Failed: true` and no data (see "Audit posture" under
+Differences between the v1 and the legacy routes). An explicit `limit` is capped at 1000; when the
 caller asked for more than 1000 and the page came back full, the body carries a top-level
 `result_truncated_by_cap: true` (see "Differences between the v1 and the legacy routes" under
 Command/Instruction Responses).
 
 #### `GET /api/responses/{id}/aggregate`
 
-Aggregate response data for a command (counts, summaries).
+Aggregate response data for a command (counts, summaries). Every served read writes a `response.read` success
+row (`detail=legacy response aggregate cid=<id>`), fail-closed like the other two legacy readers: a row that
+cannot be persisted is a `503` with `Sec-Audit-Failed: true` and no data.
 
 #### `GET /api/responses/{id}/export`
 
@@ -10122,7 +10136,7 @@ Numeric query parameters (`status`, `since`, `until`, `limit`) are parsed strict
 value is `400`; `since` or `until` of `0` means unbounded and a negative one is `400`. The legacy export writes a
 `response.read` success audit row on every served export (and the scope-drop `denied` row when a drop occurs), fail-closed like the v1
 twin: if the row cannot be persisted the export answers `503` with `Sec-Audit-Failed: true` and no data. The legacy list and
-aggregate routes write only the scope-drop row and ignore its persist outcome.
+aggregate routes behave the same way (see their sections above).
 
 **Audit caveat (#5556).** Legacy `GET /api/responses/*` writes no `result=success` audit row and does not fail closed on audit-persist failure; use `/api/v1/responses` for SIEM evidence of response reads.
 

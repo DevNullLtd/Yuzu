@@ -5103,9 +5103,11 @@ visualization payload, the "Partial result" notices on the dashboard, the `resul
 boolean on the scan page's REST and MCP JSON) is the only evidence. If a count is wanted, a sibling
 `..._read_truncated_total{surface,cause}` family is the shape; it does not exist today.
 
-**An export that answers 503 `Sec-Audit-Failed`.** `GET /api/responses/{id}/export` and `GET
-/api/v1/responses/{id}/export` write a `response.read` success row after the store read and before
-any body is built, and fail closed: if that row cannot be persisted, the export answers `503` (A4
+**A response read that answers 503 `Sec-Audit-Failed`.** The legacy `GET /api/responses/{id}`,
+`GET /api/responses/{id}/aggregate` and `GET /api/responses/{id}/export`, and their v1 twins
+`GET /api/v1/responses/{id}`, `.../aggregate` and `.../export`, write a `response.read` success row
+after the store read and before any body is built, and fail closed (the scope-drop `denied` row is
+fail-closed too): if a row cannot be persisted, the read answers `503` (A4
 envelope, `retry_after_ms: 5000`, header `Sec-Audit-Failed: true`) and serves no data. A run of
 these after an upgrade means the audit store is unhealthy, not the response store: check
 `/healthz` `stores.audit`, free disk and Postgres connection saturation, and watch
@@ -5113,7 +5115,7 @@ these after an upgrade means the audit store is unhealthy, not the response stor
 A failure the audit pipeline reports by THROWING (an allocation failure, for example) is
 answered the same way but is not counted in that metric, so a 503 spike with a flat counter points
 at that case; correlate by the `X-Correlation-Id` on the 503. Scripted consumers of the legacy
-export must treat that `503` as retryable.
+routes must treat that `503` as retryable.
 
 **What the bound covers.** The cut is applied inside the store query, so an export holds about 50
 MiB of payload plus one final row while it is fetched. The cap is on whole rows, so the last row

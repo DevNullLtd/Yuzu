@@ -2700,7 +2700,7 @@ groups:
   - name: yuzu-audit
     # Behavioural-data routes (guardian.device.view, dex.device.view, dex.signal.view,
     # dex.perf.device.view, network.device.view, and response.read on the v1 query,
-    # aggregate and export routes and the legacy export route)
+    # aggregate and export routes and the legacy get, aggregate and export routes)
     # audit-on-open then FAIL CLOSED: if the audit row cannot persist they return 503
     # and serve no PII (CC7.2). yuzu_server_audit_emit_failed_total is the only signal
     # this is happening — without this alert a fleet-polled CMDB (ServiceNow) integration
@@ -2719,7 +2719,7 @@ groups:
             fail-closed audit-on-open (guardian.device.view, dex.device.view,
             dex.signal.view, dex.perf.device.view, network.device.view, plus
             response.read on the v1 query, aggregate and export routes and on the
-            legacy export route) is returning 503 and withholding PII or response
+            legacy get, aggregate and export routes) is returning 503 and withholding PII or response
             data, so a ServiceNow / CMDB poll blackouts fleet-wide. Check audit_store health (/healthz
             stores.audit) and free disk / connection saturation on the PostgreSQL
             server (ADR-0040 — audit is Postgres-backed, not a local file). Note: a bad_alloc-class
