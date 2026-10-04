@@ -11,6 +11,7 @@
 #include "test_helpers.hpp"
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 
 #include <atomic>
 #include <chrono>
@@ -291,7 +292,7 @@ TEST_CASE("TriggerEngine: unregister specific trigger leaves others",
 // Minimum interval clamping
 // ═══════════════════════════════════════════════════════════════════════════════
 
-TEST_CASE("TriggerEngine: interval < 30 clamped to 30", "[trigger_engine][config]") {
+TEST_CASE("TriggerEngine: an interval below 30s is clamped to 30", "[trigger_engine][config]") {
     TriggerEngine engine;
 
     TriggerConfig cfg;
@@ -299,32 +300,13 @@ TEST_CASE("TriggerEngine: interval < 30 clamped to 30", "[trigger_engine][config
     cfg.type = TriggerType::Interval;
     cfg.plugin = "p1";
     cfg.action = "act";
-    cfg.interval_seconds = 1; // below the 30s minimum
+    cfg.interval_seconds = GENERATE(0, 1, 29);
 
     engine.register_trigger(cfg);
 
-    // Read the stored config back instead of waiting out a negative window: the interval loop
-    // fires from exactly this field, so a removed clamp reads 1 here at once. (The old timed
-    // window needed the loop's real 1s tick and cost 3s per run.)
+    // Read the stored config back: the interval loop fires from exactly this field, so a
+    // removed clamp shows here at once, with no timed negative window.
     const auto stored = engine.find_trigger("fast-trigger");
-    REQUIRE(stored.has_value());
-    CHECK(stored->interval_seconds == 30);
-}
-
-TEST_CASE("TriggerEngine: interval of 0 is clamped to 30", "[trigger_engine][config]") {
-    TriggerEngine engine;
-
-    TriggerConfig cfg;
-    cfg.id = "zero-interval";
-    cfg.type = TriggerType::Interval;
-    cfg.plugin = "p1";
-    cfg.action = "act";
-    cfg.interval_seconds = 0;
-
-    // Should not crash; interval is clamped to 30
-    engine.register_trigger(cfg);
-    CHECK(engine.trigger_count() == 1);
-    const auto stored = engine.find_trigger("zero-interval");
     REQUIRE(stored.has_value());
     CHECK(stored->interval_seconds == 30);
 }
@@ -435,7 +417,7 @@ TEST_CASE("TriggerEngine: interval trigger registered, start/stop no crash",
     engine.register_trigger(cfg);
 
     // 20ms tick (production: 1s): the window below spans many ticks instead of one.
-    engine.set_poll_cadence(std::chrono::milliseconds{20}, std::chrono::seconds{5});
+    engine.set_poll_cadence(std::chrono::milliseconds{20});
     engine.start();
     REQUIRE(engine.is_running());
 
@@ -481,13 +463,11 @@ TEST_CASE("TriggerEngine: file change trigger fires on modification",
     cfg.watch_path = watch_file.string();
     engine.register_trigger(cfg);
 
-    // 50ms poll (production: 5s). The first poll records the baseline mtime without firing, so
-    // a change only counts if it lands AFTER that poll. Rather than sleep and hope the first
-    // poll came first (a starved CI box can delay it past any fixed sleep, and the change would
-    // then be absorbed into the baseline), keep moving the mtime to a fresh future value until
-    // a poll reports it. Every bump is a distinct mtime, so the poll after the baseline always
-    // sees one. mtime is set explicitly because NTFS caching can delay the natural update.
-    engine.set_poll_cadence(std::chrono::seconds{1}, std::chrono::milliseconds{50});
+    // 50ms poll (production: 5s). The first poll records the baseline mtime without firing, and
+    // a starved runner can delay it past any fixed sleep, absorbing a one-off change into the
+    // baseline. So keep moving the mtime to a fresh future value until a poll reports it (set
+    // explicitly: NTFS caching can delay the natural update).
+    engine.set_poll_cadence(std::chrono::milliseconds{50});
     engine.start();
 
     bool fired = false;

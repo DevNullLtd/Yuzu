@@ -129,18 +129,15 @@ void TriggerEngine::set_dispatch(DispatchFn fn) {
     dispatch_ = std::move(fn);
 }
 
-void TriggerEngine::set_poll_cadence(std::chrono::milliseconds interval_tick,
-                                     std::chrono::milliseconds file_poll) {
-    interval_tick_ = interval_tick;
-    file_poll_ = file_poll;
+void TriggerEngine::set_poll_cadence(std::chrono::milliseconds tick) {
+    interval_tick_ = file_poll_ = tick;
 }
 
 std::optional<TriggerConfig> TriggerEngine::find_trigger(const std::string& id) const {
     std::lock_guard lock(mu_);
-    for (const auto& t : triggers_)
-        if (t.id == id)
-            return t;
-    return std::nullopt;
+    auto it = std::find_if(triggers_.begin(), triggers_.end(),
+                           [&](const TriggerConfig& t) { return t.id == id; });
+    return it == triggers_.end() ? std::nullopt : std::optional{*it};
 }
 
 void TriggerEngine::set_max_triggers(size_t limit) {

@@ -410,15 +410,8 @@ TEST_CASE("asset_tags plugin: init() recovery, persistence and the typed sync st
 TEST_CASE("asset_tags plugin: shutdown() wakes the check thread at once, not after its sleep",
           "[agent][asset_tags_actions][shutdown]") {
     // The check thread waits out check_interval (default 300s). It used to do that in 5s
-    // sleep_for chunks, so shutdown()'s join() cost up to a full chunk (~5s) on every plugin
-    // unload, and the agent's own shutdown paid it too. It now waits on a condition variable
-    // that shutdown() signals.
-    //
-    // Bound rationale (same lesson as "stop() wakes parked workers promptly" in
-    // test_trigger_engine.cpp): a woken join is millisecond-scale; the old floor is the 5s
-    // chunk minus the 100ms head start below, ~4.9s. 3s is ~1000x above healthy and
-    // decisively below the old floor, so a return to sleep-chunking goes red even on a
-    // loaded CI box.
+    // sleep_for chunks, so shutdown()'s join() cost up to ~5s. 3s is far above a woken join
+    // (milliseconds) and below that old floor, so sleep-chunking goes red even on a loaded box.
     auto plugin = load_asset_tags_plugin();
     if (!plugin) {
         require_plugin_or_skip();

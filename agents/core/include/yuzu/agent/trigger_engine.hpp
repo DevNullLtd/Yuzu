@@ -138,12 +138,10 @@ public:
     /// Set the maximum number of triggers allowed (default: kDefaultMaxTriggers).
     void set_max_triggers(size_t limit);
 
-    /// Override the poll cadence of the interval loop (default 1s tick) and the file-watch loop
-    /// (default 5s poll). Must be called before start(); the workers read the values once per
-    /// wait, and thread creation in start() is what publishes them. A seam for tests, which
-    /// otherwise wait out the real cadence (a file-change fire took ~10s).
-    void set_poll_cadence(std::chrono::milliseconds interval_tick,
-                          std::chrono::milliseconds file_poll);
+    /// Override the poll cadence of the interval loop (default 1s) and the file-watch loop
+    /// (default 5s) with `tick`. Call before start(): thread creation there publishes the value.
+    /// A seam for tests, which otherwise wait out the real cadence.
+    void set_poll_cadence(std::chrono::milliseconds tick);
 
     /// Start all monitoring loops. Fires AgentStartup triggers immediately.
     void start();
@@ -197,8 +195,8 @@ private:
     mutable std::mutex mu_;
     std::atomic<bool> running_{false};
     std::vector<std::thread> workers_;
-    std::chrono::milliseconds interval_tick_{1000};  // set_poll_cadence, before start()
-    std::chrono::milliseconds file_poll_{5000};      // set_poll_cadence, before start()
+    std::chrono::milliseconds interval_tick_{1000};  // production cadence unless
+    std::chrono::milliseconds file_poll_{5000};      // set_poll_cadence() ran before start()
 
     // Shutdown signalling for the worker loops.
     //
