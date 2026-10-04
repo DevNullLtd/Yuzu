@@ -737,7 +737,7 @@ you have observed your fleet's normal stale-count baseline and set the threshold
 separate "agents offline" from "sync source broken / disabled". Also
 correlate with `yuzu_fleet_inventory_sync_skipping{source="installed_software"}`: a
 host counted there is online but its collector is skipping (the reason is in that agent's
-log, and in its `last_skip` heartbeat tag). The two gauges count different populations (stored-receipt age over 48 h in
+log, and in its `last_skip` heartbeat tag, which no server page or API returns yet). The two gauges count different populations (stored-receipt age over 48 h in
 Postgres vs live heartbeats, which include hosts skipping for less than 48 h and
 hosts that have never reported), so read them side by side and never subtract one
 from the other. Agents that do not emit the skip tag (older agents, or during a
