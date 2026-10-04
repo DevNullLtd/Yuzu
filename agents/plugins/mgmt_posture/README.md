@@ -1,6 +1,15 @@
 # mgmt_posture
 
 <!-- BEGIN GENERATED: plugin-doc-gen header -->
+| | |
+|---|---|
+| **What it does** | Management-plane posture: which plane controls the device (facts only) |
+| **Version** | 1.0.0 |
+| **Kind** | Collector · read-only · gathered (crossplatform.security.mgmt_posture) |
+| **Platforms** | Windows 🟡 planned · macOS ✅ · Linux ✅ |
+| **Actions** | `posture` (definition `crossplatform.security.mgmt_posture`) |
+| **Security** | securable `Inventory` · operation Read · risk Low · dispatch ReadOnly · approval gate None |
+| **Roles** | execute: endpoint-admin, endpoint-operator · author: content-author |
 <!-- END GENERATED -->
 
 ## How it works
@@ -22,6 +31,15 @@ flowchart LR
 ## OS capability
 
 <!-- BEGIN GENERATED: plugin-doc-gen capability -->
+| Action | Windows | macOS | Linux |
+|---|---|---|---|
+| `posture` | 🟡 planned · rung 1 · NetGetJoinInformation + HKLM\\SOFTWARE\\Microsoft\\Enrollments and CloudDomainJoin\\JoinInfo registry reads | ✅ supported · rung 2 · subprocess_runner:/usr/bin/profiles status -type enrollment | ✅ supported · rung 1 · /etc/sssd/sssd.conf + /etc/sssd/conf.d/*.conf active domains, /etc/ipa/default.conf and /etc/krb5.keytab presence (bounded file reads) |
+
+**Declared limits per leg** (descriptor fallback text, verbatim):
+
+- **`posture` / Windows** — not read yet: one unsupported status row, windows:planned
+- **`posture` / macOS** — MDM enrolment only; AD binding is device_identity.domain; Jamf not read
+- **`posture` / Linux** — configuration as written, not the live join state; a 0600 sssd.conf reports permission_denied, never not-joined
 <!-- END GENERATED -->
 
 ## Privileges and prerequisites
@@ -39,6 +57,7 @@ No shell interpreter and no network use. The macOS leg runs one fixed absolute a
 ### Inputs
 
 <!-- BEGIN GENERATED: plugin-doc-gen inputs -->
+The action takes no parameters.
 <!-- END GENERATED -->
 
 ### Outputs
@@ -46,6 +65,14 @@ No shell interpreter and no network use. The macOS leg runs one fixed absolute a
 Every row is pipe-delimited; field 0 is the row kind and the first row is always `status|posture|<supported\|constrained\|permission_denied\|unsupported>|<reason or ->`. The data kinds are `plane`, `mdm_enrolled`, `mdm_provider`, `tenant_id` and `krb5_keytab`, each `kind|value`; `-` is an absent value. Linux emits all five (the three MDM rows as `-`), macOS emits `plane|-` plus the three MDM rows, and neither emits a row for what the other measures. `tenant_id` is reserved and always `-` today. `plane` is `unknown` only when a read was refused. `krb5_keytab|-` means presence could not be determined (caveat 5). Free text is escaped for the server's pipe grammar (`safe_output_field`). `mgmt_posture` is not in the server's key/value plugin set, so rows are decoded as pipe-separated fields.
 
 <!-- BEGIN GENERATED: plugin-doc-gen outputs -->
+**`crossplatform.security.mgmt_posture` — `row_kind|field_1|field_2|field_3`**
+
+| Field | Type | Values | Available | Example | Description |
+|---|---|---|---|---|---|
+| `row_kind` | string | `status` `plane` `mdm_enrolled` `mdm_provider` `tenant_id` `krb5_keytab` | Windows, Linux, macOS | `plane` | Row shape discriminator (field 0). Values: status, plane, mdm_enrolled, mdm_provider, tenant_id, krb5_keytab. |
+| `field_1` | string | - | Windows, Linux, macOS | `none` | status: the literal "posture". plane: none, workgroup, ad, aad, hybrid, ipa or unknown (unknown only on a refused read; "-" on macOS). mdm_enrolled: true, false or "-". mdm_provider: the MDM server host, or "-". tenant_id: always "-" today. krb5_keytab: present, absent, or "-" when presence could not be determined. |
+| `field_2` | string | `supported` `constrained` `permission_denied` `unsupported` | Windows, Linux, macOS | `supported` | status: supported, constrained, permission_denied or unsupported (Windows, and a leg that threw). Not used by the other kinds. |
+| `field_3` | string | - | Windows, Linux, macOS | `-` | status: reason token(s) for a non-supported read, "-" when complete; tokens look like linux:mgmt_posture:sssd_conf:permission_denied, macos:mgmt_posture:profiles:exit_nonzero, subprocess_runner:deadline, windows:planned. Not used by the other kinds. |
 <!-- END GENERATED -->
 
 ### Result status
@@ -72,6 +99,30 @@ Every row is pipe-delimited; field 0 is the row kind and the first row is always
 ## Sample output
 
 <!-- BEGIN GENERATED: plugin-doc-gen samples -->
+**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-10-04 · euid 501 (jsmith) · leg-hash b7575b7af2a2
+
+```
+== action=posture
+status|posture|supported|-
+plane|-
+mdm_enrolled|false
+mdm_provider|-
+tenant_id|-
+[result_status] OK / FULL
+```
+
+**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-10-04 · euid 0 · leg-hash b7575b7af2a2
+
+```
+== action=posture
+status|posture|supported|-
+plane|none
+mdm_enrolled|-
+mdm_provider|-
+tenant_id|-
+krb5_keytab|absent
+[result_status] OK / FULL
+```
 <!-- END GENERATED -->
 
 ## Caveats and known gaps
@@ -85,4 +136,9 @@ Every row is pipe-delimited; field 0 is the row kind and the first row is always
 ## Source and tests
 
 <!-- BEGIN GENERATED: plugin-doc-gen source -->
+- Plugin: `agents/plugins/mgmt_posture/src/mgmt_posture_legs.hpp` · `agents/plugins/mgmt_posture/src/mgmt_posture_linux.cpp` · `agents/plugins/mgmt_posture/src/mgmt_posture_macos.cpp` · `agents/plugins/mgmt_posture/src/mgmt_posture_parsers.hpp` · `agents/plugins/mgmt_posture/src/mgmt_posture_plugin.cpp` · `agents/plugins/mgmt_posture/src/mgmt_posture_win.cpp`
+- Definitions: `content/definitions/mgmt_posture.yaml`
+- Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_mgmt_posture.hpp`
+- Tests: `tests/test_mgmt_posture_definition.py` · `tests/unit/test_mgmt_posture_legs.cpp` · `tests/unit/test_mgmt_posture_local_dispatcher.cpp` · `tests/unit/test_mgmt_posture_parsers.cpp`
+- Privilege row: `docs/agent-privilege-model.md`
 <!-- END GENERATED -->
