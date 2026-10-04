@@ -73,18 +73,24 @@ bound_test_() ->
        fun max_bytes_invalid_falls_back/0},
       {"max_heartbeat_buffer_bytes inside 1 MiB..1 GiB is kept",
        fun max_bytes_valid_is_kept/0},
-      {"a lone 5 MiB heartbeat ahead of 50 sessions is dropped on arrival and all 50 are delivered",
+      {"a lone 5 MiB heartbeat ahead of 50 sessions loses its tags on arrival and all 51 are delivered",
        fun poison_oversize_heartbeat_is_dropped_and_others_delivered/0},
-      {"512 status tags are kept, 513 are dropped as heartbeat_oversize",
+      {"512 status tags are kept, 513 lose all their tags and the heartbeat is kept",
        fun status_tag_count_bound/0},
-      {"a heartbeat over one chunk without its snapshot is dropped, not stripped",
-       fun oversize_without_snapshot_is_dropped_not_stripped/0},
+      {"a heartbeat over one chunk because of its tags loses the tags, not the heartbeat",
+       fun oversize_tags_are_dropped_and_heartbeat_kept/0},
       {"a coalescing heartbeat over a chunk loses the older snapshot and keeps the heartbeat",
        fun coalesced_over_a_chunk_strips_the_snapshot/0},
-      {"an oversize or invalid heartbeat leaves the older entry of its session untouched",
-       fun dropped_heartbeat_keeps_the_older_entry/0},
-      {"invalid UTF-8 in a tag or the session id is dropped and never crashes the buffer",
-       fun invalid_utf8_is_dropped_and_buffer_survives/0},
+      {"an oversize or invalid heartbeat replaces the older entry of its session, keeping the snapshot",
+       fun degraded_heartbeat_replaces_the_older_entry/0},
+      {"invalid UTF-8 in a tag is repaired and the heartbeat kept, in the session id it is dropped",
+       fun invalid_utf8_is_repaired_and_buffer_survives/0},
+      {"a lone 0xFF byte in a tag value is delivered repaired and counted",
+       fun lone_ff_is_delivered_repaired/0},
+      {"repair_utf8 is total and its output always encodes",
+       fun repair_utf8_is_total/0},
+      {"a session whose every heartbeat has bad tags keeps shipping for 3 cycles",
+       fun degraded_session_keeps_shipping/0},
       {"a one-heartbeat chunk refused with RESOURCE_EXHAUSTED or INVALID_ARGUMENT is dropped",
        fun refused_single_chunk_is_dropped/0},
       {"a refused chunk of several is split and only the refused heartbeat is dropped",
@@ -482,10 +488,12 @@ poison_oversize_heartbeat_is_dropped_and_others_delivered() ->
     ?assertEqual(1, dropped(heartbeat_oversize)),
     ?assertEqual(1, dropped_total()),
     ?assertEqual(0, dropped(snapshot_oversize)),
-    ?assertEqual(50, session_count()),
+    ?assertEqual(51, session_count()),
     ?assertEqual(ok, yuzu_gw_heartbeat_buffer:flush_sync()),
     Sent = [maps:get(session_id, H) || R <- requests(), H <- hbs(R)],
-    ?assertEqual(Ids, Sent),
+    ?assertEqual([<<"poison">> | Ids], Sent),
+    [Poison] = [H || R <- requests(), H <- hbs(R), maps:get(session_id, H) =:= <<"poison">>],
+    ?assertNot(maps:is_key(status_tags, Poison)),
     ?assertEqual(0, session_count()),
     [?assert(Size =< ?SERVER_LIMIT) || Size <- request_sizes()],
     ?assertEqual(1, dropped_total()),
@@ -500,23 +508,30 @@ status_tag_count_bound() ->
                                      || I <- lists:seq(1, N)]) end,
     queue(hb(<<"at-limit">>, #{tags => Tags(512)})),
     ?assertEqual(0, dropped_total()),
-    queue(hb(<<"over-limit">>, #{tags => Tags(513)})),
+    queue(hb(<<"over-limit">>, #{tags => Tags(600)})),
     ?assertEqual(1, dropped(heartbeat_oversize)),
     ?assertEqual(1, dropped_total()),
-    ?assertEqual([<<"at-limit">>], buffered_ids()),
+    ?assertEqual([<<"at-limit">>, <<"over-limit">>], lists:sort(buffered_ids())),
     ?assertEqual(ok, yuzu_gw_heartbeat_buffer:flush_sync()),
-    ?assertEqual([<<"at-limit">>], [maps:get(session_id, H) || R <- requests(), H <- hbs(R)]).
+    Sent = maps:from_list([{maps:get(session_id, H), H} || R <- requests(), H <- hbs(R)]),
+    ?assertEqual(512, map_size(maps:get(status_tags, maps:get(<<"at-limit">>, Sent)))),
+    ?assertNot(maps:is_key(status_tags, maps:get(<<"over-limit">>, Sent))).
 
-oversize_without_snapshot_is_dropped_not_stripped() ->
-    %% 3.1 MiB of tags: over one chunk with no snapshot to strip. A 10 KB
-    %% snapshot beside it does not make the snapshot the cause.
+%% 3.1 MiB of tags: over one chunk. The tags go, the heartbeat (and a snapshot
+%% that fits) stays.
+oversize_tags_are_dropped_and_heartbeat_kept() ->
     Tags = #{<<"big">> => binary:copy(<<"t">>, 3 * ?MIB + 100 * 1024)},
     queue(hb(<<"no-snap">>, #{tags => Tags})),
     queue(hb(<<"with-snap">>, #{tags => Tags, snap => snap(10 * 1024)})),
     ?assertEqual(2, dropped(heartbeat_oversize)),
     ?assertEqual(0, dropped(snapshot_oversize)),
     ?assertEqual(2, dropped_total()),
-    ?assertEqual(0, session_count()),
+    ?assertEqual([<<"no-snap">>, <<"with-snap">>], lists:sort(buffered_ids())),
+    ?assertEqual(ok, yuzu_gw_heartbeat_buffer:flush_sync()),
+    Sent = maps:from_list([{maps:get(session_id, H), H} || R <- requests(), H <- hbs(R)]),
+    [?assertNot(maps:is_key(status_tags, H)) || H <- maps:values(Sent)],
+    ?assertEqual(10 * 1024,
+                 byte_size(maps:get(fleet_snapshot_json, maps:get(<<"with-snap">>, Sent)))),
     %% Control: a snapshot over a chunk is still stripped and counted as such.
     queue(hb(<<"big-snap">>, #{snap => snap(3 * ?MIB + 1)})),
     ?assertEqual(1, dropped(snapshot_oversize)),
@@ -536,49 +551,120 @@ coalesced_over_a_chunk_strips_the_snapshot() ->
     ?assertEqual(<<>>, maps:get(fleet_snapshot_json, H, <<>>)),
     ?assertEqual(3 * ?MIB div 2, byte_size(maps:get(<<"t">>, maps:get(status_tags, H)))).
 
-dropped_heartbeat_keeps_the_older_entry() ->
+%% A degraded heartbeat is the session's newest: it replaces the older tags and
+%% keeps the older snapshot (the usual coalescing).
+degraded_heartbeat_replaces_the_older_entry() ->
     queue(hb(<<"a">>, #{tags => #{<<"v">> => <<"old">>}, snap => <<"snap-old">>})),
     queue(hb(<<"a">>, #{tags => #{<<"big">> => binary:copy(<<"t">>, 4 * ?MIB)}})),
     ?assertEqual(1, dropped(heartbeat_oversize)),
     queue(#{session_id => <<"a">>, status_tags => #{<<"v">> => <<255>>}}),
     ?assertEqual(1, dropped(heartbeat_invalid)),
-    ?assertEqual(0, event_count(?EV_COALESCED)),
+    ?assertEqual(2, event_count(?EV_COALESCED)),
     ?assertEqual(ok, yuzu_gw_heartbeat_buffer:flush_sync()),
     [H] = [H || R <- requests(), H <- hbs(R)],
-    ?assertEqual(#{<<"v">> => <<"old">>}, maps:get(status_tags, H)),
+    ?assertEqual(#{<<"v">> => <<16#EF, 16#BF, 16#BD>>}, maps:get(status_tags, H)),
     ?assertEqual(<<"snap-old">>, maps:get(fleet_snapshot_json, H)).
 
-invalid_utf8_is_dropped_and_buffer_survives() ->
+invalid_utf8_is_repaired_and_buffer_survives() ->
     Pid = whereis(yuzu_gw_heartbeat_buffer),
-    Bad = [
+    Repaired = [
         %% a lone 0xFF byte as the key, as the value, and a truncated sequence
         #{session_id => <<"bad-key">>, status_tags => #{<<255>> => <<"v">>}},
         #{session_id => <<"bad-val">>, status_tags => #{<<"k">> => <<255>>}},
         #{session_id => <<"bad-cut">>, status_tags => #{<<"k">> => <<"ab", 226, 130>>}},
         %% an encoded surrogate and an overlong form
         #{session_id => <<"bad-surrogate">>, status_tags => #{<<"k">> => <<237, 160, 128>>}},
-        #{session_id => <<"bad-overlong">>, status_tags => #{<<"k">> => <<192, 128>>}},
-        %% the session id itself
-        #{session_id => <<255, 1>>, status_tags => #{<<"k">> => <<"v">>}},
-        %% not a binary at all
+        #{session_id => <<"bad-overlong">>, status_tags => #{<<"k">> => <<192, 128>>}}
+    ],
+    %% Tags that cannot be repaired (not binaries) lose all the tags, heartbeat kept.
+    TagsLost = [
         #{session_id => <<"bad-type">>, status_tags => #{<<"k">> => not_a_binary}},
-        #{session_id => <<"bad-tags">>, status_tags => [{<<"k">>, <<"v">>}]},
+        #{session_id => <<"bad-tags">>, status_tags => [{<<"k">>, <<"v">>}]}
+    ],
+    %% No usable session id: it cannot be keyed, so the heartbeat is dropped.
+    Dropped = [
+        #{session_id => <<255, 1>>, status_tags => #{<<"k">> => <<"v">>}},
         #{session_id => 7}
     ],
     Good = [hb(<<"good-1">>, #{tags => #{<<"k">> => <<"v">>}}),
-            %% multi-byte UTF-8 (a euro sign, an emoji) is valid
+            %% multi-byte UTF-8 (a euro sign, an emoji) is valid and untouched
             hb(<<"good-euro">>, #{tags => #{<<226, 130, 172>> => <<240, 159, 146, 169>>}}),
             hb(<<"good-3">>, #{})],
-    [queue(H) || H <- lists:sublist(Bad, 3) ++ [hd(Good)] ++ lists:nthtail(3, Bad) ++ tl(Good)],
-    ?assertEqual(length(Bad), dropped(heartbeat_invalid)),
-    ?assertEqual(length(Bad), dropped_total()),
+    [queue(H) || H <- Repaired ++ Dropped ++ TagsLost ++ Good],
+    ?assertEqual(length(Repaired) + length(TagsLost) + length(Dropped), dropped(heartbeat_invalid)),
+    ?assertEqual(0, dropped(heartbeat_oversize)),
     ?assertEqual(Pid, whereis(yuzu_gw_heartbeat_buffer)),
-    ?assertEqual(lists:sort([<<"good-1">>, <<"good-euro">>, <<"good-3">>]),
-                 lists:sort(buffered_ids())),
+    Kept = lists:sort([maps:get(session_id, H) || H <- Repaired ++ TagsLost ++ Good]),
+    ?assertEqual(Kept, lists:sort(buffered_ids())),
     ?assertEqual(ok, yuzu_gw_heartbeat_buffer:flush_sync()),
     ?assertEqual(Pid, whereis(yuzu_gw_heartbeat_buffer)),
-    ?assertEqual(lists:sort([<<"good-1">>, <<"good-euro">>, <<"good-3">>]),
-                 lists:sort([maps:get(session_id, H) || R <- requests(), H <- hbs(R)])).
+    Sent = maps:from_list([{maps:get(session_id, H), H} || R <- requests(), H <- hbs(R)]),
+    ?assertEqual(Kept, lists:sort(maps:keys(Sent))),
+    %% Every delivered tag is valid UTF-8, and the valid ones are as they came.
+    ?assertEqual(#{<<"k">> => <<"v">>}, maps:get(status_tags, maps:get(<<"good-1">>, Sent))),
+    ?assertEqual(#{<<226, 130, 172>> => <<240, 159, 146, 169>>},
+                 maps:get(status_tags, maps:get(<<"good-euro">>, Sent))),
+    ?assertEqual(#{<<"k">> => <<"ab", 16#EF, 16#BF, 16#BD, 16#EF, 16#BF, 16#BD>>},
+                 maps:get(status_tags, maps:get(<<"bad-cut">>, Sent))),
+    [?assertNot(maps:is_key(status_tags, maps:get(Id, Sent))) || Id <- [<<"bad-type">>, <<"bad-tags">>]].
+
+lone_ff_is_delivered_repaired() ->
+    queue(#{session_id => <<"s">>, status_tags => #{<<"k">> => <<"a", 255, "b">>}}),
+    ?assertEqual(1, dropped(heartbeat_invalid)),
+    ?assertEqual(1, dropped_total()),
+    ?assertEqual(ok, yuzu_gw_heartbeat_buffer:flush_sync()),
+    [H] = [H || R <- requests(), H <- hbs(R)],
+    ?assertEqual(#{<<"k">> => <<"a", 16#EF, 16#BF, 16#BD, "b">>}, maps:get(status_tags, H)).
+
+repair_utf8_is_total() ->
+    %% All 256 single bytes and 2000 random binaries, some of them valid.
+    Inputs = [<<B>> || B <- lists:seq(0, 255)]
+          ++ [rand:bytes(rand:uniform(40)) || _ <- lists:seq(1, 2000)]
+          ++ [<<"plain">>, <<226, 130, 172>>, <<>>],
+    [begin
+         R = yuzu_gw_heartbeat_buffer:repair_utf8(I),
+         ?assert(is_binary(unicode:characters_to_binary(R, utf8, utf8))),
+         %% The real encoder takes it.
+         _ = gateway_pb:encode_msg(#{heartbeats => [#{session_id => <<"s">>,
+                                                      status_tags => #{R => R}}],
+                                     gateway_node => <<>>},
+                                   'yuzu.gateway.v1.BatchHeartbeatRequest'),
+         case is_binary(unicode:characters_to_binary(I, utf8, utf8)) of
+             true  -> ?assertEqual(I, R);
+             false -> ?assertNotEqual(I, R)
+         end
+     end || I <- Inputs],
+    ?assertEqual(<<"a", 16#EF, 16#BF, 16#BD, "b">>,
+                 yuzu_gw_heartbeat_buffer:repair_utf8(<<"a", 255, "b">>)),
+    %% A large all-invalid value is repaired in bounded time (linear walk).
+    Big = binary:copy(<<255>>, 1024 * 1024),
+    {Micros, Out} = timer:tc(fun() -> yuzu_gw_heartbeat_buffer:repair_utf8(Big) end),
+    ?assertEqual(3 * 1024 * 1024, byte_size(Out)),
+    ?assert(Micros < 5000000).
+
+%% The same bad heartbeat on every cycle: the session's entry exists each time
+%% and ships each time (a drop on arrival would starve it, and with it the
+%% server's route lease for the agent).
+degraded_session_keeps_shipping() ->
+    Pid = whereis(yuzu_gw_heartbeat_buffer),
+    Bad = fun() ->
+        hb(<<"stuck">>, #{sent_at => 1,
+                          tags => maps:from_list([{<<"k", (integer_to_binary(I))/binary>>, <<255>>}
+                                                  || I <- lists:seq(1, 600)])})
+    end,
+    [begin
+         reset_requests(),
+         queue(Bad()),
+         ?assertEqual([<<"stuck">>], buffered_ids()),
+         Pid ! flush,
+         _ = sys:get_state(Pid),
+         Sent = [H || R <- requests(), H <- hbs(R)],
+         ?assertMatch([#{session_id := <<"stuck">>, sent_at := #{millis_epoch := 1}}], Sent),
+         ?assertNot(maps:is_key(status_tags, hd(Sent))),
+         ?assertEqual(0, session_count())
+     end || _ <- [1, 2, 3]],
+    ?assertEqual(3, dropped(heartbeat_oversize)),
+    ?assertEqual(0, dropped(heartbeat_invalid)).
 
 refused_single_chunk_is_dropped() ->
     [begin

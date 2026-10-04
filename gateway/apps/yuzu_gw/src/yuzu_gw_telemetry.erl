@@ -265,9 +265,10 @@ handle_event([yuzu, gw, heartbeat, verdict_dropped], #{count := N}, Meta, _Confi
 %% gave up to stay bounded, by the closed reason set buffer_full (a heartbeat
 %% or whole session dropped) | snapshot_oversize (one snapshot larger than a
 %% chunk, heartbeat kept) | snapshot_evicted (oldest snapshot dropped to fit the
-%% byte cap) | heartbeat_oversize (a heartbeat still larger than a chunk without
-%% its snapshot, or with too many status tags, dropped) | heartbeat_invalid (a
-%% heartbeat whose session id or a status tag is not valid UTF-8, dropped) |
+%% byte cap) | heartbeat_oversize (the status tags of a heartbeat with too many
+%% tags, or larger than a chunk, dropped, heartbeat kept) | heartbeat_invalid (a
+%% status tag that is not valid UTF-8 repaired with replacement characters,
+%% heartbeat kept) |
 %% chunk_rejected (one heartbeat the server rejected with a non-transient
 %% status, dropped). The label is an atom chosen by yuzu_gw_heartbeat_buffer; any other
 %% value falls to `unknown' so a bug cannot widen the label set, and the handler
@@ -525,12 +526,12 @@ declare_metrics() ->
                "byte cap was reached, snapshot_oversize = one fleet snapshot "
                "larger than a request chunk was dropped and the heartbeat kept, "
                "snapshot_evicted = the oldest fleet snapshot was dropped to fit "
-               "the byte cap and the heartbeat kept, heartbeat_oversize = a "
-               "heartbeat still larger than a request chunk without its snapshot, "
-               "or with more than 512 status tags, was dropped, heartbeat_invalid "
-               "= a heartbeat whose session id or a status tag is not valid UTF-8 "
-               "was dropped, chunk_rejected = a single heartbeat the server "
-               "rejected with a non-transient status was dropped)"}]),
+               "the byte cap and the heartbeat kept, heartbeat_oversize = the "
+               "status tags of a heartbeat that had more than 512 tags or was "
+               "larger than a request chunk were dropped and the heartbeat kept, "
+               "heartbeat_invalid = a status tag with invalid UTF-8 was repaired "
+               "with replacement characters, chunk_rejected = a single heartbeat the "
+               "server rejected with a non-transient status was dropped)"}]),
     prometheus_counter:declare([
         {name, yuzu_gw_heartbeat_coalesced_total},
         {labels, []},

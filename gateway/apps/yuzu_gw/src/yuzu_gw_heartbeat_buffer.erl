@@ -24,15 +24,20 @@
 %%% yuzu_gw_heartbeat_buffer_dropped_total; coalescing is counted in
 %%% yuzu_gw_heartbeat_coalesced_total.
 %%%
-%%% A heartbeat that could never be sent is screened out on arrival, before it
-%%% touches the buffer (the session's older entry, if any, is kept): one with
-%%% more than ?MAX_STATUS_TAGS status tags, or still larger than one chunk
-%%% without its snapshot, is dropped as heartbeat_oversize, and one whose
-%%% session id or a status tag key or value is not valid UTF-8 (the encoder
-%%% raises on it) as heartbeat_invalid. So every entry fits one chunk and every
-%%% request is under the server's receive limit: nothing here relies on the
-%%% sender being well behaved (the gateway puts no inbound size limit on a
-%%% Heartbeat).
+%%% A heartbeat that could never be sent is screened on arrival, before it
+%%% touches the buffer, and degraded rather than dropped: a session whose
+%%% heartbeats are always screened out would never ship again (its older entry
+%%% would age out and the server's route lease for it would lapse), so only what
+%%% cannot be sent is removed and the heartbeat is kept. A status tag key or
+%%% value that is not valid UTF-8 (the encoder raises on it) is repaired, each
+%%% invalid byte becoming U+FFFD, and counted as heartbeat_invalid. A heartbeat
+%%% with more than ?MAX_STATUS_TAGS status tags, or whose tags alone exceed one
+%%% chunk, loses ALL its status tags and is counted as heartbeat_oversize. Only a
+%%% heartbeat without a usable session id (it cannot be keyed), or one that still
+%%% exceeds a chunk with its tags and snapshot removed, is dropped (invalid and
+%%% oversize respectively). So every entry fits one chunk and every request is
+%%% under the server's receive limit: nothing here relies on the sender being well
+%%% behaved (the gateway puts no inbound size limit on a Heartbeat).
 %%%
 %%% Flushing calls do_flush/2 which sends BatchHeartbeat RPCs via grpcbox.
 %%% The buffer is split into chunks, oldest entry first, each estimated under
@@ -86,7 +91,7 @@
 %% API
 -export([start_link/0, queue_heartbeat/1, flush_sync/0]).
 %% Exported for tests (the upper-bound property is asserted against the encoder).
--export([estimate_bytes/1]).
+-export([estimate_bytes/1, repair_utf8/1]).
 
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, handle_continue/2,
@@ -101,9 +106,9 @@
 %% a server that refuses every request would otherwise cost one RPC per
 %% buffered heartbeat in a single flush.
 -define(MAX_RPCS_PER_FLUSH, 64).
-%% A heartbeat with more status tags than this is dropped (heartbeat_oversize).
-%% The agent sends about 25; the bound only has to stop a sender that floods the
-%% tag map.
+%% A heartbeat with more status tags than this loses all its tags
+%% (heartbeat_oversize). The agent sends about 25; the bound only has to stop a
+%% sender that floods the tag map.
 -define(MAX_STATUS_TAGS, 512).
 %% max_heartbeat_buffer_bytes: the cap on the buffer's estimated encoded size.
 %% Valid 1 MiB..1 GiB (default 64 MiB); anything else logs a warning naming the
@@ -415,8 +420,9 @@ do_flush(BatchReq, N) ->
 -spec enqueue(map(), #state{}) -> #state{}.
 enqueue(Hb, #state{} = State) ->
     case screen(Hb) of
-        ok ->
-            enqueue_screened(Hb, State);
+        {ok, Hb1, Reasons} ->
+            lists:foreach(fun note_dropped/1, Reasons),
+            enqueue_screened(Hb1, State);
         {drop, Reason} ->
             note_dropped(Reason),
             State
@@ -436,43 +442,99 @@ enqueue_screened(Hb, #state{buffer = Buf, max_buf = MaxBuf} = State) ->
             admit(Sid, put_entry(Sid, Hb, State))
     end.
 
-%% @doc Whether a heartbeat can ever be sent, decided on the heartbeat alone
-%% (never on the buffer), so a dropped heartbeat leaves its session's older entry
-%% untouched. The newest heartbeat wins every field but the snapshot, so a
-%% heartbeat too large without its snapshot is too large coalesced as well. Size
-%% is checked first: it is cheap, and the UTF-8 walk then only runs over a
-%% heartbeat that fits one chunk.
--spec screen(map()) -> ok | {drop, heartbeat_oversize | heartbeat_invalid}.
+%% @doc Make a heartbeat sendable, decided on the heartbeat alone (never on the
+%% buffer), so a dropped heartbeat leaves its session's older entry untouched.
+%% Returns the heartbeat to buffer and the drop reasons to count, or a drop:
+%%   - no binary session id of valid UTF-8: dropped, heartbeat_invalid (it cannot
+%%     be keyed, and admission already rejects such a session);
+%%   - status_tags not a map, or holding a non-binary key or value: all tags
+%%     removed, heartbeat_invalid;
+%%   - more than ?MAX_STATUS_TAGS tags, or tags larger than one chunk: all tags
+%%     removed, heartbeat_oversize;
+%%   - invalid UTF-8 in a tag key or value: repaired, heartbeat_invalid;
+%%   - still over one chunk without tags and snapshot: dropped,
+%%     heartbeat_oversize (cannot happen with a session id of at most 64 bytes;
+%%     defensive).
+%% The newest heartbeat wins every field but the snapshot, so a heartbeat too
+%% large without its snapshot is too large coalesced as well. Size is checked
+%% before the repair walk (which can grow a value to three times its size, so it
+%% is checked again after).
+-spec screen(map()) -> {ok, map(), [heartbeat_oversize | heartbeat_invalid]}
+                     | {drop, heartbeat_oversize | heartbeat_invalid}.
 screen(Hb) ->
-    Tags = maps:get(status_tags, Hb, #{}),
-    case tag_count(Tags) > ?MAX_STATUS_TAGS
-         orelse estimate_bytes(Hb#{fleet_snapshot_json => <<>>}) > ?CHUNK_BYTES of
-        true ->
-            {drop, heartbeat_oversize};
-        false ->
-            case valid_text(Hb) of
-                true  -> ok;
-                false -> {drop, heartbeat_invalid}
-            end
+    case valid_utf8(maps:get(session_id, Hb, <<>>)) of
+        false -> {drop, heartbeat_invalid};
+        true  -> screen_tags(Hb)
+    end.
+
+screen_tags(Hb) ->
+    case maps:get(status_tags, Hb, #{}) of
+        Tags when is_map(Tags) ->
+            case tag_count(Tags) > ?MAX_STATUS_TAGS
+                 orelse estimate_bytes(Hb#{fleet_snapshot_json => <<>>}) > ?CHUNK_BYTES of
+                true ->
+                    without_tags(Hb, heartbeat_oversize);
+                false ->
+                    case repair_tags(Tags) of
+                        {ok, Tags1, Repaired} ->
+                            Hb1 = Hb#{status_tags => Tags1},
+                            case estimate_bytes(Hb1#{fleet_snapshot_json => <<>>}) > ?CHUNK_BYTES of
+                                true  -> without_tags(Hb, heartbeat_oversize);
+                                false -> {ok, Hb1, [heartbeat_invalid || Repaired]}
+                            end;
+                        error ->
+                            without_tags(Hb, heartbeat_invalid)
+                    end
+            end;
+        _NotAMap ->
+            without_tags(Hb, heartbeat_invalid)
+    end.
+
+%% Remove every status tag. What is left (session id, sent_at, the snapshot) is
+%% checked against one chunk, which only a session id of several MiB could fail.
+without_tags(Hb, Reason) ->
+    Hb1 = maps:remove(status_tags, Hb),
+    case estimate_bytes(Hb1#{fleet_snapshot_json => <<>>}) > ?CHUNK_BYTES of
+        true  -> {drop, heartbeat_oversize};
+        false -> {ok, Hb1, [Reason]}
     end.
 
 tag_count(Tags) when is_map(Tags) -> map_size(Tags);
 tag_count(_)                      -> 0.
 
-%% The session id and every status tag key and value are binaries of valid UTF-8
-%% (what the encoder accepts: gateway_pb raises badarg on anything else, and the
-%% decoder of the agent's own message keeps invalid bytes as they came). An
-%% absent field is valid; a status_tags that is not a map is not.
--spec valid_text(map()) -> boolean().
-valid_text(Hb) ->
-    valid_utf8(maps:get(session_id, Hb, <<>>))
-        andalso case maps:get(status_tags, Hb, #{}) of
-                    Tags when is_map(Tags) ->
-                        maps:fold(fun(K, V, Ok) -> Ok andalso valid_utf8(K) andalso valid_utf8(V) end,
-                                  true, Tags);
-                    _ ->
-                        false
-                end.
+%% The tags with every key and value repaired to valid UTF-8, and whether any was
+%% changed; `error' when an entry is not a binary pair (it cannot be repaired).
+-spec repair_tags(map()) -> {ok, map(), boolean()} | error.
+repair_tags(Tags) ->
+    try maps:fold(fun(K, V, {Acc, Changed}) when is_binary(K), is_binary(V) ->
+                          K1 = repair_utf8(K),
+                          V1 = repair_utf8(V),
+                          {Acc#{K1 => V1}, Changed orelse K1 =/= K orelse V1 =/= V};
+                     (_, _, _) ->
+                          throw(not_binary)
+                  end, {#{}, false}, Tags) of
+        {Tags1, Changed} -> {ok, Tags1, Changed}
+    catch
+        throw:not_binary -> error
+    end.
+
+%% @doc A valid UTF-8 binary from any binary: each byte that does not start (or
+%% continue) a valid sequence becomes U+FFFD. Total and linear; valid input is
+%% returned as is. What the encoder accepts (valid_utf8/1) is the test for the
+%% fast path, so a repaired value always encodes.
+-spec repair_utf8(binary()) -> binary().
+repair_utf8(B) ->
+    case valid_utf8(B) of
+        true  -> B;
+        false -> repair_walk(B, <<>>)
+    end.
+
+repair_walk(<<>>, Acc) ->
+    Acc;
+repair_walk(<<C/utf8, Rest/binary>>, Acc) ->
+    repair_walk(Rest, <<Acc/binary, C/utf8>>);
+repair_walk(<<_, Rest/binary>>, Acc) ->
+    repair_walk(Rest, <<Acc/binary, 16#FFFD/utf8>>).
 
 valid_utf8(B) when is_binary(B) -> is_binary(unicode:characters_to_binary(B, utf8, utf8));
 valid_utf8(_)                   -> false.
