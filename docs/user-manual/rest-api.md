@@ -10114,8 +10114,10 @@ export" under Command/Instruction Responses. A cut CSV export ends with a `# res
 (7 fields) and sets `X-Result-Truncated-By-Cap: true`; a cut JSON envelope carries a top-level
 `result_truncated_by_cap: true`; both are downloaded as `responses-<id>-truncated.<json|csv>`. The JSON envelope's `count` is the number of rows served.
 Numeric query parameters (`status`, `since`, `until`, `limit`) are parsed strictly and a malformed
-value is `400`; `since` or `until` of `0` means unbounded and a negative one is `400`. The legacy export writes no
-success audit row (only a management-group scope drop is audited; the v1 twin audits every read).
+value is `400`; `since` or `until` of `0` means unbounded and a negative one is `400`. The legacy export writes a
+`response.read` success audit row on every served export (and the scope-drop `denied` row when a drop occurs), fail-closed like the v1
+twin: if the row cannot be persisted the export answers `503` with `Sec-Audit-Failed: true` and no data. The legacy list and
+aggregate routes write only the scope-drop row and ignore its persist outcome.
 
 **Audit caveat (#5556).** Legacy `GET /api/responses/*` writes no `result=success` audit row and does not fail closed on audit-persist failure; use `/api/v1/responses` for SIEM evidence of response reads.
 

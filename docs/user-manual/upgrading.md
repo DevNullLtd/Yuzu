@@ -106,6 +106,13 @@ too large for its type were already `400`.
 
 - Scripts that build `since`/`until` from `date +%s.%N` or any fractional timestamp: send integer
   seconds (`date +%s`).
+- Scripts and integrations that call the legacy `GET /api/responses/{id}/export`: it now writes a
+  `response.read` **success** audit row on every served export and is **fail-closed**, like
+  `GET /api/v1/responses/{id}/export`. When the audit store is down (or the row cannot be persisted)
+  it answers `503` with `Sec-Audit-Failed: true`, an A4 envelope (`retry_after_ms: 5000`) and no
+  data, where it used to serve the export unaudited. Retry on `503`. A SIEM rule keyed on
+  `response.read` now sees `result=success` rows with `detail=legacy response export cid=<id>` from
+  this route as well as the v1 ones.
 - Scripts that send a **negative** `since` or `until` to a response route: it is `400` now. It used
   to be read as "unbounded", so a window computed as `now - n` that went past the epoch silently
   returned the whole result. Send `0` (or omit the parameter) for "no bound on that side"; `0` stays

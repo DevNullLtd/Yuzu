@@ -229,6 +229,8 @@ struct PgHarness {
     authz::VisibleSet fleet_scope; // nullopt = unconfined
 
     std::vector<AuditRow> audits;
+    bool audit_succeeds{true}; // audit_fn's persist outcome (false = row not durably written)
+    bool audit_throws{false};  // audit_fn throws (emission pipeline fault)
 
     yuzu::MetricsRegistry metrics; // #4644/#4703 counters; outlives the sink's handlers
 
@@ -260,7 +262,9 @@ struct PgHarness {
                                const std::string& tt, const std::string& ti,
                                const std::string& d) -> bool {
             audits.push_back({a, r, tt, ti, d});
-            return true;
+            if (audit_throws)
+                throw std::runtime_error("audit pipeline fault");
+            return audit_succeeds;
         };
         response::register_response_routes(sink, deps);
     }
@@ -992,4 +996,81 @@ TEST_CASE("response_routes: wiring -- server.cpp still calls register_response_r
     REQUIRE(in.is_open());
     std::string src{std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
     CHECK(src.find("register_response_routes(") != std::string::npos);
+}
+
+// ── #4644 Gate 7: the legacy export writes a fail-closed success audit row ───
+
+TEST_CASE("GET /api/responses/:id/export: every served export writes ONE response.read success "
+          "row, CSV and JSON, before any body",
+          "[server][routes][response_routes][rest][pg][audit]") {
+    PgHarness h;
+    h.seed("instr-audited", "agent-a");
+    h.seed("instr-audited", "agent-b");
+
+    for (const char* format : {"json", "csv"}) {
+        INFO(format);
+        h.audits.clear();
+        auto res = h.sink.Get(std::string("/api/responses/instr-audited/export?format=") + format);
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        REQUIRE(h.audits.size() == 1);
+        CHECK(h.audits[0].action == "response.read");
+        CHECK(h.audits[0].result == "success");
+        CHECK(h.audits[0].target_type == "Execution");
+        CHECK(h.audits[0].target_id == "instr-audited");
+        CHECK(h.audits[0].detail.rfind("legacy response export cid=", 0) == 0);
+        // The cid in the row is the one the response carries.
+        CHECK(h.audits[0].detail ==
+              "legacy response export cid=" + res->get_header_value("X-Correlation-Id"));
+        CHECK_FALSE(res->has_header("Sec-Audit-Failed"));
+    }
+}
+
+TEST_CASE("GET /api/responses/:id/export: a scope drop writes the denied row THEN the success "
+          "row, once each",
+          "[server][routes][response_routes][rest][pg][audit]") {
+    PgHarness h;
+    h.seed("instr-audited-scope", "in-scope-agent");
+    h.seed("instr-audited-scope", "out-of-scope-agent");
+    h.fleet_scope = authz::VisibleSet{std::unordered_set<std::string>{"in-scope-agent"}};
+
+    auto res = h.sink.Get("/api/responses/instr-audited-scope/export");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    REQUIRE(h.audits.size() == 2);
+    CHECK(h.audits[0].result == "denied");
+    CHECK(h.audits[0].detail == "scope_dropped=1 surface=export");
+    CHECK(h.audits[1].result == "success");
+    CHECK(h.audits[1].detail.rfind("legacy response export cid=", 0) == 0);
+}
+
+TEST_CASE("GET /api/responses/:id/export: an audit row that does not persist, or an audit "
+          "pipeline that throws, is a 503 with no data and no cut counter",
+          "[server][routes][response_routes][rest][pg][audit]") {
+    PgHarness h;
+    h.seed("instr-audit-fail", "agent-a");
+
+    for (const bool throws : {false, true}) {
+        for (const char* format : {"json", "csv"}) {
+            INFO((throws ? "throws " : "returns false ") << format);
+            h.audits.clear();
+            h.audit_succeeds = false;
+            h.audit_throws = throws;
+            auto res =
+                h.sink.Get(std::string("/api/responses/instr-audit-fail/export?format=") + format);
+            REQUIRE(res);
+            CHECK(res->status == 503);
+            CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+            auto body = json::parse(res->body, nullptr, false);
+            REQUIRE_FALSE(body.is_discarded());
+            CHECK(body["error"]["code"] == 503);
+            CHECK(body["error"]["retry_after_ms"] == 5000);
+            CHECK(body["error"]["message"].get<std::string>().find("audit subsystem unavailable") !=
+                  std::string::npos);
+            // No export data and no download name: nothing was served.
+            CHECK(res->body.find("agent-a") == std::string::npos);
+            CHECK(res->get_header_value("Content-Disposition").empty());
+            REQUIRE(h.audits.size() == 1); // the one attempted row, not retried
+        }
+    }
 }

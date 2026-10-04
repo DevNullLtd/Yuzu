@@ -6,6 +6,8 @@
 #include "response_export_metrics.hpp"
 #include "response_query_params.hpp"
 #include "response_store.hpp"
+#include "rest_a4_envelope_http.hpp"
+#include "rest_audit.hpp"
 
 #include <nlohmann/json.hpp>
 
@@ -233,10 +235,38 @@ void register_response_routes(HttpRouteSink& sink, Deps deps) {
         auto results = std::move(bounded_opt->rows);
         ExportCut cut{bounded_opt->row_cap_hit, bounded_opt->byte_cap_hit};
 
+        // Fail-closed access audit (#4644 Gate 7), mirroring the v1 export twin: a bulk fleet
+        // read of up to 10,000 rows / 50 MiB must not be served without durable evidence that it
+        // happened. Emitted after the store read (so a 503 degrade is not audited as a read) and
+        // BEFORE any body is built, so an audit failure serves no data. The helper also covers an
+        // unwired audit_fn (audit off: persisted) and a throwing one (not persisted).
+        const auto audit_unavailable = [&res]() {
+            res.status = 503;
+            res.set_content(detail::a4_error(res,
+                                             "audit subsystem unavailable; refusing to serve "
+                                             "response data without durable evidence",
+                                             {.retry_after_ms = 5000,
+                                              .remediation = "retry the request"}),
+                            "application/json");
+        };
         // CC7.2 evidence: record the scope-drop on this surface (#1634 compliance review).
-        if (export_dropped > 0)
-            (void)deps.audit_fn(req, "response.read", "denied", "Execution", instruction_id,
-                                "scope_dropped=" + std::to_string(export_dropped) + " surface=export");
+        if (export_dropped > 0 &&
+            !detail::emit_behavioral_audit(deps.audit_fn, req, res, "response.read", "denied",
+                                           "Execution", instruction_id,
+                                           "scope_dropped=" + std::to_string(export_dropped) +
+                                               " surface=export")) {
+            audit_unavailable();
+            return;
+        }
+        // Same verb, target and result as the v1 export's success row, so the two twins are
+        // countable together; the detail names this surface.
+        if (!detail::emit_behavioral_audit(deps.audit_fn, req, res, "response.read", "success",
+                                           "Execution", instruction_id,
+                                           "legacy response export cid=" +
+                                               detail::ensure_correlation_id(res))) {
+            audit_unavailable();
+            return;
+        }
 
         auto format = req.get_param_value("format");
 
