@@ -32,7 +32,7 @@ struct InvRecord {
                               // integer -- carried through verbatim rather than
                               // reformatted into a shape the receipt never had
     std::string kind;         // "package" | "app" | "pkg" (macOS pkgutil receipt)
-    std::string ecosystem;    // rpm|deb|apk|pacman|windows|macos|macos_pkgutil|homebrew
+    std::string ecosystem;    // rpm|deb|apk|pacman|windows|macos|macos_pkgutil
     std::string epoch;
     std::string release;      // rpm RELEASE / deb revision / apk pkgrel
     std::string arch;
