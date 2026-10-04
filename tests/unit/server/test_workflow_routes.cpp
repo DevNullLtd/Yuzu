@@ -1272,7 +1272,7 @@ TEST_CASE("executions list: perm_fn is not a second gate on the (Execution Read)
     CHECK(res->body.find("SoleGate") != std::string::npos);
 }
 
-TEST_CASE("executions list: unwired fleet_read_fn -> 503, fail closed",
+TEST_CASE("executions list: unwired fleet_read_fn renders a 200 degrade note, fails closed",
           "[pg][workflow][executions][list][rbac]") {
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
@@ -1282,7 +1282,11 @@ TEST_CASE("executions list: unwired fleet_read_fn -> 503, fail closed",
     h.make_exec("def-unwired", "completed", 1, 1, 0);
     auto res = h.sink.Get("/fragments/executions");
     REQUIRE(res);
-    CHECK(res->status == 503);
+    // 200, not 503: the dashboard htmx config drops 4xx/5xx bodies, so a 503 would leave the
+    // panel on "Loading..." forever. Fail-closed is the absence of any row, not the status.
+    CHECK(res->status == 200);
+    CHECK(res->body.find("data-degraded=\"unavailable\"") != std::string::npos);
+    CHECK(res->body.find("No executions yet") == std::string::npos);
     CHECK(res->body.find("Unwired") == std::string::npos);
     CHECK(res->body.find("data-execution-id") == std::string::npos);
 }
@@ -1411,7 +1415,10 @@ TEST_CASE("executions list: deny_all scope with nothing owned renders the empty 
     auto res = h.sink.Get("/fragments/executions");
     REQUIRE(res);
     CHECK(res->status == 200);
-    CHECK(res->body.find("No executions yet") != std::string::npos);
+    // A confined caller's empty page must not claim the fleet has no executions: the
+    // out-of-scope one above exists.
+    CHECK(res->body.find("No executions yet") == std::string::npos);
+    CHECK(res->body.find("No executions visible in your scope.") != std::string::npos);
     CHECK(served_ids(res->body).empty());
 }
 
@@ -1444,7 +1451,7 @@ TEST_CASE("executions list: 60 newer invisible rows do not starve an older visib
     CHECK(std::find(open_ids.begin(), open_ids.end(), visible) == open_ids.end());
 }
 
-TEST_CASE("executions list: a tracker degrade is 503, never 'No executions yet'",
+TEST_CASE("executions list: a tracker degrade is a 200 degrade note, never 'No executions yet'",
           "[pg][workflow][executions][list][confinement]") {
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
@@ -1462,12 +1469,17 @@ TEST_CASE("executions list: a tracker degrade is 503, never 'No executions yet'"
         exec_sql(db.dsn(),
                  "ALTER TABLE execution_tracker.executions_hidden_list RENAME TO executions");
         REQUIRE(res);
-        CHECK(res->status == 503);
+        // 200 so the htmx swap happens (4xx/5xx bodies are dropped by the dashboard config).
+        CHECK(res->status == 200);
+        CHECK(res->body.find("data-degraded=\"tracker\"") != std::string::npos);
+        CHECK(res->body.find("Execution tracker degraded") != std::string::npos);
         CHECK(res->body.find("No executions yet") == std::string::npos);
+        CHECK(res->body.find("No executions visible") == std::string::npos);
+        CHECK(served_ids(res->body).empty());
     }
 }
 
-TEST_CASE("executions list: a status-read degrade under a confined scope is 503",
+TEST_CASE("executions list: a status-read degrade under a confined scope is a 200 degrade note",
           "[pg][workflow][executions][list][confinement]") {
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
@@ -1480,19 +1492,22 @@ TEST_CASE("executions list: a status-read degrade under a confined scope is 503"
     // Break ONLY the per-execution status read: plugin_result_status is selected by
     // get_agent_statuses_for_executions_checked but not by the list query (its scope
     // predicate and error-preview subquery touch other columns), so the list step succeeds
-    // and the degrade lands on the status step. A degrade there must be a 503, never an
-    // unfiltered or empty render.
+    // and the degrade lands on the status step. A degrade there must be a degrade note,
+    // never an unfiltered or empty render.
     exec_sql(db.dsn(), "ALTER TABLE execution_tracker.agent_exec_status RENAME COLUMN "
                        "plugin_result_status TO plugin_result_status_hidden");
     auto res = h.sink.Get("/fragments/executions");
     exec_sql(db.dsn(), "ALTER TABLE execution_tracker.agent_exec_status RENAME COLUMN "
                        "plugin_result_status_hidden TO plugin_result_status");
     REQUIRE(res);
-    CHECK(res->status == 503);
+    CHECK(res->status == 200);
+    CHECK(res->body.find("data-degraded=\"tracker\"") != std::string::npos);
     CHECK(res->body.find("No executions yet") == std::string::npos);
+    CHECK(res->body.find("No executions visible") == std::string::npos);
+    CHECK(served_ids(res->body).empty());
 }
 
-TEST_CASE("executions list: empty principal under a confined scope fails closed (503)",
+TEST_CASE("executions list: empty principal under a confined scope fails closed (200 note)",
           "[pg][workflow][executions][list][confinement]") {
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
@@ -1510,7 +1525,9 @@ TEST_CASE("executions list: empty principal under a confined scope fails closed 
     h.fleet_read_scope = VS{std::unordered_set<std::string>{"agent-in"}};
     auto res = h.sink.Get("/fragments/executions");
     REQUIRE(res);
-    CHECK(res->status == 503);
+    CHECK(res->status == 200);
+    CHECK(res->body.find("data-degraded=\"unavailable\"") != std::string::npos);
+    CHECK(res->body.find("No executions yet") == std::string::npos);
     CHECK(served_ids(res->body).empty());
 }
 

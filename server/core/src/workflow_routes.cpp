@@ -169,17 +169,30 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
     // visible ones), each surviving row's counters and error preview are
     // recomputed from the in-scope agent rows only (so neither the preview
     // text nor the `title=` attribute can carry an out-of-scope agent's
-    // error), and a store degrade is a 503, never "No executions yet".
+    // error), and a store degrade renders an honest 200 degrade note (data-degraded),
+    // never "No executions yet" (the htmx config drops 4xx/5xx bodies).
     // An unconfined caller's output is unchanged.
     sink.Get("/fragments/executions", [auth_fn, fleet_read_fn, execution_tracker,
                                         instruction_store](const httplib::Request& req,
                                                            httplib::Response& res) {
+        // Fragment-local degrade note. Rendered at HTTP 200, NOT 503: the dashboard htmx
+        // config (responseHandling `[45]..` swap:false) drops 4xx/5xx bodies, so a 503 here
+        // left the panel on "Loading..." forever (same convention as
+        // dex_routes.cpp /fragments/dex/perf/apps and verify_routes.hpp). The note is
+        // honest (never "No executions yet") and carries data-degraded for machine
+        // detection. The gate's own A4 JSON 403/503 are untouched; only this fragment's
+        // OWN degrade bodies are 200.
+        auto degraded = [&res](const char* kind, const char* text) {
+            res.status = 200;
+            res.set_content(std::string("<div class=\"empty-state\" data-degraded=\"") + kind +
+                                "\">" + text + "</div>",
+                            "text/html; charset=utf-8");
+        };
         if (!fleet_read_fn) {
             spdlog::error("/fragments/executions: fleet_read_fn unwired -- "
                           "misconfigured call site; failing closed");
-            res.status = 503;
-            res.set_content("<div class=\"empty-state\">Service unavailable</div>",
-                            "text/html; charset=utf-8");
+            degraded("unavailable", "Executions unavailable (service not available). Contact "
+                                    "an administrator if this persists.");
             return;
         }
         auto gate = fleet_read_fn(req, res, "Execution", "Read");
@@ -214,9 +227,8 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             if (username.empty()) {
                 spdlog::error("/fragments/executions: empty principal under a confined "
                               "read -- failing closed");
-                res.status = 503;
-                res.set_content("<div class=\"empty-state\">Service unavailable</div>",
-                                "text/html; charset=utf-8");
+                degraded("unavailable", "Executions unavailable (service not available). "
+                                        "Contact an administrator if this persists.");
                 return;
             }
             ExecutionListScope s;
@@ -227,10 +239,7 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
 
         auto execs_opt = execution_tracker->query_executions_checked(q, scope_arg);
         if (!execs_opt) {
-            res.status = 503;
-            res.set_content("<div class=\"empty-state\">Execution tracker degraded, retry "
-                            "shortly.</div>",
-                            "text/html; charset=utf-8");
+            degraded("tracker", "Execution tracker degraded, retry shortly.");
             return;
         }
         std::vector<Execution> execs = std::move(*execs_opt);
@@ -239,12 +248,14 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             ids.reserve(execs.size());
             for (const auto& e : execs)
                 ids.push_back(e.id);
-            auto statuses_opt = execution_tracker->get_agent_statuses_for_executions_checked(ids);
+            // Scope the read in SQL: a confined caller must not pull every agent row of
+            // every listed execution (a fleet-wide execution has one row per agent).
+            // execution_visible/confined_projection ignore out-of-scope rows, so the
+            // served result is identical to the unfiltered read.
+            auto statuses_opt = execution_tracker->get_agent_statuses_for_executions_checked(
+                ids, std::vector<std::string>(gate.scope->begin(), gate.scope->end()));
             if (!statuses_opt) {
-                res.status = 503;
-                res.set_content("<div class=\"empty-state\">Execution tracker degraded, retry "
-                                "shortly.</div>",
-                                "text/html; charset=utf-8");
+                degraded("tracker", "Execution tracker degraded, retry shortly.");
                 return;
             }
             static const std::vector<AgentExecStatus> kEmptyStatuses;
@@ -271,7 +282,11 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         }
         std::string html;
         if (execs.empty()) {
-            html = "<div class=\"empty-state\">No executions yet.</div>";
+            // A confined caller's empty page does NOT mean the fleet has no executions
+            // (out-of-scope ones may exist), so it gets its own, truthful wording.
+            html = gate.scope
+                       ? "<div class=\"empty-state\">No executions visible in your scope.</div>"
+                       : "<div class=\"empty-state\">No executions yet.</div>";
             res.set_content(html, "text/html; charset=utf-8");
             return;
         }

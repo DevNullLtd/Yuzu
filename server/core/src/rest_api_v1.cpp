@@ -9543,8 +9543,8 @@ void RestApiV1::register_routes(
                 ids.reserve(execs.size());
                 for (const auto& e : execs)
                     ids.push_back(e.id);
-                auto statuses_opt =
-                    execution_tracker->get_agent_statuses_for_executions_checked(ids);
+                auto statuses_opt = execution_tracker->get_agent_statuses_for_executions_checked(
+                    ids, std::vector<std::string>(gate.scope->begin(), gate.scope->end()));
                 if (!statuses_opt) {
                     res.status = 503;
                     res.set_content(detail::a4_error(res, "execution tracker degraded",

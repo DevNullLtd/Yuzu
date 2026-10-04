@@ -11104,7 +11104,7 @@ TEST_CASE("MCP Agentic demo: summarize_working_set execution kind requires Execu
 
 TEST_CASE("MCP summarize_working_set execution: perm_fn is not a second gate on the "
           "(Execution Read) pair",
-          "[pg][mcp][integration][agentic-demo][scope][3526]") {
+          "[pg][mcp][integration][agentic-demo][scope][4753]") {
     yuzu::test::ExecutionTrackerPg tracker_bundle;
     yuzu::server::ExecutionTracker& tracker = *tracker_bundle;
     McpTestServer ts;
@@ -11120,7 +11120,7 @@ TEST_CASE("MCP summarize_working_set execution: perm_fn is not a second gate on 
 }
 
 TEST_CASE("MCP summarize_working_set execution: unwired fleet_read_fn_ fails closed (#3526)",
-          "[pg][mcp][integration][agentic-demo][scope][3526]") {
+          "[pg][mcp][integration][agentic-demo][scope][4753]") {
     yuzu::test::ExecutionTrackerPg tracker_bundle;
     yuzu::server::ExecutionTracker& tracker = *tracker_bundle;
     yuzu::server::Execution exec;
@@ -11196,7 +11196,7 @@ void exec_tracker_ddl(const std::string& dsn, const std::string& sql) {
 } // namespace
 
 TEST_CASE("MCP summarize_working_set execution: confined caller sees the exact projected counts (#3526)",
-          "[pg][mcp][integration][agentic-demo][scope][3526]") {
+          "[pg][mcp][integration][agentic-demo][scope][4753]") {
     YUZU_REQUIRE_PG_DB_TPL(authz_db, yuzu::test::response_execution_authz_tpl);
     yuzu::test::ResponseExecutionAuthzPgRig authz{authz_db.dsn()};
     yuzu::test::ExecutionTrackerPg tracker_bundle;
@@ -11230,7 +11230,7 @@ TEST_CASE("MCP summarize_working_set execution: confined caller sees the exact p
 }
 
 TEST_CASE("MCP summarize_working_set execution: confined-out reads exactly like absent (#3564 #3526)",
-          "[pg][mcp][integration][agentic-demo][scope][3526][notfound]") {
+          "[pg][mcp][integration][agentic-demo][scope][4753][notfound]") {
     YUZU_REQUIRE_PG_DB_TPL(authz_db, yuzu::test::response_execution_authz_tpl);
     yuzu::test::ResponseExecutionAuthzPgRig authz{authz_db.dsn()};
     yuzu::test::ExecutionTrackerPg tracker_bundle;
@@ -11266,9 +11266,70 @@ TEST_CASE("MCP summarize_working_set execution: confined-out reads exactly like 
     CHECK(ts.audit_details[1] == "not found or outside caller's fleet-read scope: " + missing_id);
 }
 
+// An UNCONFINED caller can only miss on a genuinely absent id: no denial occurred, so the
+// audit row stays the pre-existing `success` (no SIEM noise). The caller never sees the audit
+// row, so the confined/unconfined split is not an existence oracle.
+TEST_CASE("MCP summarize_working_set execution: unconfined absent id stays an audited success "
+          "(#4753)",
+          "[pg][mcp][integration][agentic-demo][scope][4753]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    yuzu::server::ExecutionTracker& tracker = *tracker_bundle;
+    McpTestServer ts;
+    ts.execution_tracker_for_test = &tracker;
+    ts.start("readonly");
+    auto res = ts.call(summarize_exec_call_body("exec-absent-unconfined-4753"));
+    REQUIRE(res);
+    CHECK(narrative_of(res->body) == "Execution exec-absent-unconfined-4753 was not found.");
+    REQUIRE(ts.audit_log.size() == 1);
+    CHECK(ts.audit_log[0] == "mcp.summarize_working_set|success");
+}
+
+// The caller-supplied id lands in an audit detail string: it must be neutralised (CR/LF and
+// k=v delimiters) and length-capped, never embedded raw (CWE-117).
+TEST_CASE("MCP summarize_working_set execution: the denied audit detail neutralises and caps "
+          "the caller-supplied id (#4753)",
+          "[pg][mcp][integration][agentic-demo][scope][4753][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(authz_db, yuzu::test::response_execution_authz_tpl);
+    yuzu::test::ResponseExecutionAuthzPgRig authz{authz_db.dsn()};
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    yuzu::server::ExecutionTracker& tracker = *tracker_bundle;
+    McpTestServer ts;
+    ts.execution_tracker_for_test = &tracker;
+    ts.fleet_read_fn_for_test = authz.fleet_read_fn();
+    ts.mock_username = "bob";
+    ts.start("operator");
+    const auto token = authz.mint_bob();
+    const std::string prefix = "not found or outside caller's fleet-read scope: ";
+    const std::string forged = std::string("x\r\nmcp.summarize_working_set|success result=ok");
+    const std::string long_id(5000, 'a');
+    for (const auto& id : {forged, long_id}) {
+        nlohmann::json body = {{"jsonrpc", "2.0"},
+                               {"method", "tools/call"},
+                               {"id", 311},
+                               {"params",
+                                {{"name", "summarize_working_set"},
+                                 {"arguments", {{"kind", "execution"}, {"id", id}}}}}};
+        auto res = ts.call_raw("POST", body.dump(), {{"Authorization", "Bearer " + token}});
+        REQUIRE(res);
+    }
+    REQUIRE(ts.audit_details.size() == 2);
+    for (const auto& d : ts.audit_details) {
+        REQUIRE(d.rfind(prefix, 0) == 0);
+        const auto tail = d.substr(prefix.size());
+        CHECK(tail.find('\r') == std::string::npos);
+        CHECK(tail.find('\n') == std::string::npos);
+        CHECK(tail.find(' ') == std::string::npos);
+        CHECK(tail.find('=') == std::string::npos);
+        CHECK(tail.size() <= 128);
+    }
+    CHECK(ts.audit_details[0].substr(prefix.size()) ==
+          "x__mcp.summarize_working_set|success_result_ok");
+    CHECK(ts.audit_details[1].substr(prefix.size()) == std::string(128, 'a'));
+}
+
 TEST_CASE("MCP summarize_working_set execution: owner with zero visible agents sees an empty "
           "projection (#3526)",
-          "[pg][mcp][integration][agentic-demo][scope][3526]") {
+          "[pg][mcp][integration][agentic-demo][scope][4753]") {
     YUZU_REQUIRE_PG_DB_TPL(authz_db, yuzu::test::response_execution_authz_tpl);
     yuzu::test::ResponseExecutionAuthzPgRig authz{authz_db.dsn()};
     yuzu::test::ExecutionTrackerPg tracker_bundle;
@@ -11291,7 +11352,7 @@ TEST_CASE("MCP summarize_working_set execution: owner with zero visible agents s
 
 TEST_CASE("MCP summarize_working_set execution: a tracker degrade is an error with a retry "
           "hint and no denial audit (#3526)",
-          "[pg][mcp][integration][agentic-demo][scope][3526]") {
+          "[pg][mcp][integration][agentic-demo][scope][4753]") {
     yuzu::test::ExecutionTrackerPg tracker_bundle;
     yuzu::server::ExecutionTracker& tracker = *tracker_bundle;
     const auto exec_id = seed_summarize_exec(tracker, "operator", {});
@@ -11317,7 +11378,7 @@ TEST_CASE("MCP summarize_working_set execution: a tracker degrade is an error wi
 
 TEST_CASE("MCP summarize_working_set execution: a status-read degrade under a confined scope "
           "is an error with a retry hint (#3526)",
-          "[pg][mcp][integration][agentic-demo][scope][3526]") {
+          "[pg][mcp][integration][agentic-demo][scope][4753]") {
     yuzu::test::ExecutionTrackerPg tracker_bundle;
     yuzu::server::ExecutionTracker& tracker = *tracker_bundle;
     const auto exec_id = seed_summarize_exec(tracker, "operator", {{"agent-in", "success"}});

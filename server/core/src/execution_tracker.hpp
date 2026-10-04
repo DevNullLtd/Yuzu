@@ -364,8 +364,17 @@ public:
     /// treat it as "zero agents" (which would 404 a caller during a
     /// transient PG degrade and permanently record a false `denied` audit
     /// row for a non-owner, or hand an owner a false 200-with-zero-counts).
+    ///
+    /// `visible_agents` (optional, default unfiltered): when engaged, only rows whose
+    /// `agent_id` is in the list are read (`agent_id = ANY($n::text[])`, applied in SQL so
+    /// a confined caller never pulls every agent row of a wide execution). Engaged-empty is
+    /// deny-all (zero rows), not unfiltered. Callers that project through
+    /// `execution_visible` / `confined_projection` get IDENTICAL results either way, since
+    /// both ignore out-of-scope rows; the filter only bounds the read.
     std::optional<std::vector<AgentExecStatus>>
-    get_agent_statuses_checked(const std::string& execution_id) const;
+    get_agent_statuses_checked(const std::string& execution_id,
+                               const std::optional<std::vector<std::string>>& visible_agents =
+                                   std::nullopt) const;
     /// #1634 (Doomgoose review finding, important) — batched twin of
     /// `get_agent_statuses` for a LIST caller that needs per-execution
     /// in-scope counts for N executions without N+1 queries (ADR-0017
@@ -387,8 +396,13 @@ public:
     /// normal, non-degraded outcome for a just-dispatched execution
     /// (`agent_exec_status` is response-arrival-seeded, #3789 finding).
     std::optional<std::unordered_map<std::string, std::vector<AgentExecStatus>>>
+    ///
+    /// `visible_agents` (optional, default unfiltered): same SQL-side agent filter as
+    /// `get_agent_statuses_checked` -- a confined list caller passes its visible set so the
+    /// read is bounded by the caller's scope, not by the fleet width of every execution.
     get_agent_statuses_for_executions_checked(
-        const std::vector<std::string>& execution_ids) const;
+        const std::vector<std::string>& execution_ids,
+        const std::optional<std::vector<std::string>>& visible_agents = std::nullopt) const;
     /// Best-effort convenience wrapper over `get_children_checked` with
     /// `scope = nullopt` -- test-only production usage today (no confined
     /// caller). Discards BOTH the degrade signal (a pool/query failure

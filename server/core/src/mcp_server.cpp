@@ -11049,7 +11049,9 @@ McpServer::HandlerFn McpServer::build_handler(
                     // zeroed every confined row's counts on a degrade
                     // instead of surfacing it.
                     auto statuses_opt =
-                        execution_tracker->get_agent_statuses_for_executions_checked(exec_ids);
+                        execution_tracker->get_agent_statuses_for_executions_checked(
+                            exec_ids,
+                            std::vector<std::string>(gate.scope->begin(), gate.scope->end()));
                     if (!statuses_opt) {
                         res.set_content(
                             error_response(id, kInternalError, "execution tracker degraded"),
@@ -19507,7 +19509,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 JArr links;
                 JArr next;
                 std::string narrative;
-                bool execution_not_visible = false; // absent OR confined out: audited `denied`
+                bool execution_not_visible = false; // confined caller: absent OR out of scope => `denied`
                 if (kind == "agent" && !target_id.empty()) {
                     // Group-scope gate (G-S2): an operator scoped to one
                     // management group must not be able to probe arbitrary
@@ -19578,7 +19580,11 @@ McpServer::HandlerFn McpServer::build_handler(
                     if (gate.scope) {
                         // Read whether or not the row exists, so an absent id
                         // and an invisible one do the same backing work.
-                        auto agents_opt = execution_tracker->get_agent_statuses_checked(target_id);
+                        // SQL-side agent filter: only the caller's in-scope rows are
+                        // read (execution_visible/confined_projection ignore the rest).
+                        auto agents_opt = execution_tracker->get_agent_statuses_checked(
+                            target_id,
+                            std::vector<std::string>(gate.scope->begin(), gate.scope->end()));
                         if (!agents_opt) {
                             res.set_content(a4_error(kInternalError,
                                                      "execution tracker degraded", {},
@@ -19602,7 +19608,13 @@ McpServer::HandlerFn McpServer::build_handler(
                                     " responded=" + std::to_string(agents_responded) + ".";
                     } else {
                         narrative = "Execution " + target_id + " was not found.";
-                        execution_not_visible = true;
+                        // Audit `denied` only for a CONFINED caller, whose absent id and
+                        // out-of-scope id must stay indistinguishable. An UNCONFINED
+                        // caller can only miss on a genuinely absent id: no denial
+                        // occurred, so that stays the pre-existing `success` row (no
+                        // SIEM noise). The caller never sees the audit row, so the
+                        // split is not an existence oracle.
+                        execution_not_visible = gate.scope.has_value();
                     }
                     next.add("get_execution_status").add("query_responses");
                 } else {
@@ -19623,8 +19635,10 @@ McpServer::HandlerFn McpServer::build_handler(
                                    .str();
                 auto result = tool_result(payload, kObjectOutputSchema);
                 if (execution_not_visible)
-                    mcp_audit("denied", "not found or outside caller's fleet-read scope: " +
-                                            target_id);
+                    // Caller-supplied id: neutralised (CRLF / k=v forgery) and capped.
+                    mcp_audit("denied",
+                              "not found or outside caller's fleet-read scope: " +
+                                  audit_token(std::string_view(target_id).substr(0, 128)));
                 else
                     mcp_audit("success", kind + ":" + target_id);
                 res.set_content(success_response(id, result), "application/json");
