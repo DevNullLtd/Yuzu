@@ -1,7 +1,7 @@
 # Resource Ledger — #5327 (installed-software collector skip follow-ups)
 
-Range `b123c55c0..fced3c772` plus the gate-fix commits that follow it (the governance gate re-pins the final
-head). A Resource Ledger is required for a C++ diff (policy floor).
+Range `b123c55c0..24311b176` (the last commit with code or test changes; the commits after it change only this
+ledger). A Resource Ledger is required for a C++ diff (policy floor).
 
 ## Production code (`agents/core/src/sync_scheduler.{hpp,cpp}`, `sync_source_installed_software.cpp`, `plugin_loader.cpp`, `agent.cpp`)
 
