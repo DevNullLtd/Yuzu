@@ -240,10 +240,11 @@ real_grpc_status_error_does_not_crash() ->
     %% tuple — `error` + `{Status, Message}` + a trailers map — verified
     %% against the vendored _checkouts/grpcbox/src/grpcbox_client.erl. The
     %% OLD do_batch_heartbeat/2 error clause matched a shape grpcbox never
-    %% actually returns, so a real status like RESOURCE_EXHAUSTED (reachable
-    %% today on an oversized batch) would have crashed this process with a
-    %% case_clause exception instead of retaining the buffer for the next
-    %% flush.
+    %% actually returns, so a real status like UNAVAILABLE would have crashed
+    %% this process with a case_clause exception instead of retaining the
+    %% buffer for the next flush. (RESOURCE_EXHAUSTED and INVALID_ARGUMENT are
+    %% not transient: the buffer drops a one-heartbeat chunk the server
+    %% refuses with either, see yuzu_gw_heartbeat_buffer_bound_tests.)
     drain_buffer(),
 
     HB = make_heartbeat(<<"grpc-status-fail">>, #{<<"yuzu.os">> => <<"linux">>}),
@@ -251,7 +252,7 @@ real_grpc_status_error_does_not_crash() ->
     timer:sleep(20),
 
     meck:expect(grpcbox_client, unary, fun(_, _, _, _, _) ->
-        {error, {<<"8">>, <<"RESOURCE_EXHAUSTED">>}, #{}}
+        {error, {<<"14">>, <<"UNAVAILABLE">>}, #{}}
     end),
     _ = flush_and_await(),
 

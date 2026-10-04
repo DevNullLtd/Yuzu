@@ -84,7 +84,21 @@ bound_test_() ->
       {"an oversize or invalid heartbeat leaves the older entry of its session untouched",
        fun dropped_heartbeat_keeps_the_older_entry/0},
       {"invalid UTF-8 in a tag or the session id is dropped and never crashes the buffer",
-       fun invalid_utf8_is_dropped_and_buffer_survives/0}
+       fun invalid_utf8_is_dropped_and_buffer_survives/0},
+      {"a one-heartbeat chunk refused with RESOURCE_EXHAUSTED or INVALID_ARGUMENT is dropped",
+       fun refused_single_chunk_is_dropped/0},
+      {"a refused chunk of several is split and only the refused heartbeat is dropped",
+       fun refused_chunk_is_split_and_poison_dropped/0},
+      {"a server that refuses every multi-heartbeat request still gets all heartbeats",
+       fun refusal_of_multi_requests_delivers_singles/0},
+      {"a server that refuses everything costs at most 64 RPCs per flush",
+       fun refusing_server_is_bounded_per_flush/0},
+      {"a transient failure keeps the chunk and every later one and stops the flush",
+       fun transient_failures_retain_and_stop/0},
+      {"an exception or exit out of the RPC is a failed flush, not a crash, and logs no reason",
+       fun exception_out_of_rpc_is_a_failed_flush/0},
+      {"entries the encoder raises on are dropped from a failed chunk and the rest is sent",
+       fun encoder_raising_entries_are_dropped_from_the_chunk/0}
      ]}.
 
 setup() ->
@@ -550,9 +564,155 @@ invalid_utf8_is_dropped_and_buffer_survives() ->
     ?assertEqual(lists:sort([<<"good-1">>, <<"good-euro">>, <<"good-3">>]),
                  lists:sort([maps:get(session_id, H) || R <- requests(), H <- hbs(R)])).
 
+refused_single_chunk_is_dropped() ->
+    [begin
+         reset_requests(), reset_events(),
+         queue(hb(<<"one">>, #{})),
+         refuse_if(fun(_Req) -> true end, Status),
+         ?assertEqual(ok, yuzu_gw_heartbeat_buffer:flush_sync()),
+         ?assertEqual(1, length(requests())),
+         ?assertEqual(1, dropped(chunk_rejected)),
+         ?assertEqual(1, dropped_total()),
+         ?assertEqual(0, session_count()),
+         %% Nothing is left to retry: the next flush sends nothing.
+         reset_requests(),
+         ?assertEqual(ok, yuzu_gw_heartbeat_buffer:flush_sync()),
+         ?assertEqual([], requests())
+     end || Status <- [?GRPC_STATUS_RESOURCE_EXHAUSTED, ?GRPC_STATUS_INVALID_ARGUMENT]],
+    ok.
+
+%% Chunks of two 1 MiB heartbeats: [p,q1] and [q2]. The server refuses any
+%% request holding p. [p,q1] is split, [p] dropped, [q1] and [q2] delivered, all
+%% in one flush.
+refused_chunk_is_split_and_poison_dropped() ->
+    Ids = [<<"p">>, <<"q1">>, <<"q2">>],
+    [queue(hb(Id, #{snap => snap(?MIB)})) || Id <- Ids],
+    refuse_if(fun(Req) -> lists:any(fun(H) -> maps:get(session_id, H) =:= <<"p">> end,
+                                    hbs(Req))
+              end, ?GRPC_STATUS_RESOURCE_EXHAUSTED),
+    ?assertEqual(ok, yuzu_gw_heartbeat_buffer:flush_sync()),
+    ?assertEqual([[<<"p">>, <<"q1">>], [<<"p">>], [<<"q1">>], [<<"q2">>]],
+                 [[maps:get(session_id, H) || H <- hbs(R)] || R <- requests()]),
+    ?assertEqual(1, dropped(chunk_rejected)),
+    ?assertEqual(1, dropped_total()),
+    ?assertEqual(0, session_count()),
+    %% The ones the server accepted are q1 and q2, each once.
+    ?assertEqual([[<<"q1">>], [<<"q2">>]],
+                 [[maps:get(session_id, H) || H <- hbs(R)] || R <- requests(),
+                  not lists:any(fun(H) -> maps:get(session_id, H) =:= <<"p">> end, hbs(R))]).
+
+refusal_of_multi_requests_delivers_singles() ->
+    Ids = [sid(I) || I <- lists:seq(1, 8)],
+    [queue(hb(Id, #{tags => tags()})) || Id <- Ids],
+    refuse_if(fun(Req) -> length(hbs(Req)) > 1 end, ?GRPC_STATUS_INVALID_ARGUMENT),
+    ?assertEqual(ok, yuzu_gw_heartbeat_buffer:flush_sync()),
+    Accepted = [maps:get(session_id, H) || R <- requests(), length(hbs(R)) =:= 1, H <- hbs(R)],
+    ?assertEqual(Ids, Accepted),
+    ?assertEqual(0, dropped_total()),
+    ?assertEqual(0, session_count()),
+    %% Halving: 1 + 2 + 4 refused requests then 8 singles, not a retry per entry
+    %% of every level.
+    ?assertEqual(15, length(requests())).
+
+refusing_server_is_bounded_per_flush() ->
+    [queue(hb(sid(I), #{})) || I <- lists:seq(1, 100)],
+    refuse_if(fun(_Req) -> true end, ?GRPC_STATUS_INVALID_ARGUMENT),
+    ?assertEqual({error, rpc_limit}, yuzu_gw_heartbeat_buffer:flush_sync()),
+    ?assertEqual(64, length(requests())),
+    %% What the 64 RPCs got to is dropped; the rest stays for the next cycle.
+    ?assert(dropped(chunk_rejected) > 0),
+    ?assertEqual(100, session_count() + dropped(chunk_rejected)),
+    ?assert(session_count() > 0),
+    ?assert(is_process_alive(whereis(yuzu_gw_heartbeat_buffer))).
+
+transient_failures_retain_and_stop() ->
+    Failures = [
+        {error, {?GRPC_STATUS_UNAVAILABLE, <<"down">>}, #{}},
+        {error, {?GRPC_STATUS_DEADLINE_EXCEEDED, <<"slow">>}, #{}},
+        {error, {?GRPC_STATUS_INTERNAL, <<"oops">>}, #{}},
+        {error, {?GRPC_STATUS_NOT_FOUND, <<"?">>}, #{}},
+        {error, econnrefused},
+        {error, timeout},
+        {error, {stream_down, normal}},
+        {http_error, {<<"502">>, <<>>}, #{}}
+    ],
+    Ids = [sid(I) || I <- lists:seq(1, 4)],
+    [queue(hb(Id, #{snap => snap(?MIB)})) || Id <- Ids],
+    [begin
+         reset_requests(),
+         set_unary(fun(_N) -> F end),
+         ?assertMatch({error, _}, yuzu_gw_heartbeat_buffer:flush_sync()),
+         %% 1 MiB each, two per chunk: one request, the second chunk never sent.
+         ?assertEqual(1, length(requests())),
+         ?assertEqual(Ids, lists:sort(buffered_ids())),
+         ?assertEqual(0, dropped_total())
+     end || F <- Failures],
+    ok.
+
+%% grpcbox_client does not catch an exit of the HTTP/2 connection (an upstream
+%% that accepts and closes made h2_connection:new_stream exit noproc), and the
+%% marshal fun runs inside the call. The reason (it can hold the request) is
+%% not logged: only the class.
+exception_out_of_rpc_is_a_failed_flush() ->
+    Pid = whereis(yuzu_gw_heartbeat_buffer),
+    Marker = <<"MARKER-heartbeat-tag-value">>,
+    queue(hb(<<"a">>, #{tags => #{<<"k">> => Marker}})),
+    Raisers = [
+        {exit,  fun() -> exit({noproc, {gen_server, call, [h2_connection, {new_stream, Marker}]}}) end},
+        {error, fun() -> error({badmatch, Marker}) end},
+        {throw, fun() -> throw({Marker, thrown}) end}
+    ],
+    [begin
+         meck:expect(grpcbox_client, unary, fun(_, _, _, _, _) -> Raise() end),
+         {Result, Lines} = capture_logs(fun() -> yuzu_gw_heartbeat_buffer:flush_sync() end),
+         ?assertEqual({error, {exception, Class}}, Result),
+         ?assertEqual(Pid, whereis(yuzu_gw_heartbeat_buffer)),
+         ?assertEqual([<<"a">>], buffered_ids()),
+         ?assertEqual([], [L || {_, L} <- Lines, binary:match(L, Marker) =/= nomatch]),
+         ?assertMatch([_|_], [L || {warning, L} <- Lines,
+                                   binary:match(L, <<"raised">>) =/= nomatch])
+     end || {Class, Raise} <- Raisers],
+    %% The buffer still works afterwards.
+    set_unary(fun(_N) -> {ok, #{acknowledged_count => 1}, #{}} end),
+    ?assertEqual(ok, yuzu_gw_heartbeat_buffer:flush_sync()),
+    ?assertEqual(0, session_count()),
+    ?assertEqual(0, dropped_total()).
+
+%% Entries that screen/1 would have refused cannot be queued, so one is put in
+%% the state directly: three heartbeats share one chunk, the middle one holds a
+%% tag the encoder raises on. The raising mock is the real marshal fun.
+encoder_raising_entries_are_dropped_from_the_chunk() ->
+    Pid = whereis(yuzu_gw_heartbeat_buffer),
+    [queue(hb(Id, #{tags => tags()})) || Id <- [<<"a">>, <<"b">>, <<"c">>]],
+    _ = sys:replace_state(Pid, fun(St) ->
+        Buf = element(?ST_BUFFER, St),
+        #{<<"b">> := E} = Buf,
+        Bad = (maps:get(hb, E))#{status_tags => #{<<"k">> => <<255>>}},
+        setelement(?ST_BUFFER, St, Buf#{<<"b">> := E#{hb := Bad}})
+    end),
+    ?assertEqual(ok, yuzu_gw_heartbeat_buffer:flush_sync()),
+    ?assertEqual(Pid, whereis(yuzu_gw_heartbeat_buffer)),
+    ?assertEqual(1, dropped(heartbeat_invalid)),
+    ?assertEqual(1, dropped_total()),
+    ?assertEqual(0, session_count()),
+    ?assertEqual([<<"a">>, <<"c">>],
+                 [maps:get(session_id, H) || R <- requests(), H <- hbs(R)]).
+
 %%%===================================================================
 %%% Helpers
 %%%===================================================================
+
+%% Every request is logged, and answered with Status when Pred(Req) holds and
+%% accepted otherwise. The request is encoded with the real marshal fun first.
+refuse_if(Pred, Status) ->
+    meck:expect(grpcbox_client, unary, fun(_Ctx, _Path, Req, Def, _Opts) ->
+        Size = iolist_size((Def#grpcbox_def.marshal_fun)(Req)),
+        rec({request, Req, Size}),
+        case Pred(Req) of
+            true  -> {error, {Status, <<"refused">>}, #{}};
+            false -> {ok, #{acknowledged_count => length(hbs(Req))}, #{}}
+        end
+    end).
 
 %% The BatchHeartbeat mock answers RESOURCE_EXHAUSTED to a request over the
 %% server's receive limit (measured with the real marshal fun) and accepts the

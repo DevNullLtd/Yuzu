@@ -37,9 +37,20 @@
 %%% Flushing calls do_flush/2 which sends BatchHeartbeat RPCs via grpcbox.
 %%% The buffer is split into chunks, oldest entry first, each estimated under
 %%% 3 MiB, so no request reaches the server's 4 MiB receive limit however long
-%%% the outage was. A chunk that the server accepted is removed; on the
-%%% first failure that chunk and every later one are retained for the next
-%%% flush cycle and the flush stops.
+%%% the outage was. A chunk that the server accepted is removed. On a transient
+%%% failure (the server unreachable, a timeout, an exception out of the RPC, any
+%%% status not named below) that chunk and every later one are retained for the
+%%% next flush cycle and the flush stops. On a non-transient refusal
+%%% (RESOURCE_EXHAUSTED or INVALID_ARGUMENT) a chunk of one heartbeat is dropped
+%%% as chunk_rejected and the flush goes on; a chunk of several is split in
+%%% halves and each half is sent again in the same flush, so the heartbeat the
+%%% server will not take is found and dropped without holding back the others.
+%%% One flush makes at most ?MAX_RPCS_PER_FLUSH RPCs, those retries included;
+%%% what is left stays buffered. An exception out of the RPC (a heartbeat the
+%%% encoder raises on, an exit of the HTTP/2 connection) never crashes this
+%%% process: of the entries of the failed chunk, those the encoder raises on
+%%% alone are dropped as heartbeat_invalid and the rest is sent again; with no
+%%% such entry the failure is transient.
 %%%
 %%% Heartbeat verdict (#1197): a successful BatchHeartbeatResponse may
 %%% list sessions the server does not know (unknown_session_ids), typically
@@ -79,6 +90,10 @@
 
 -define(SERVER, ?MODULE).
 -define(DEFAULT_MAX_HB_BUFFER, 10000).
+%% One flush makes at most this many RPCs, retries of a refused chunk included:
+%% a server that refuses every request would otherwise cost one RPC per
+%% buffered heartbeat in a single flush.
+-define(MAX_RPCS_PER_FLUSH, 64).
 %% A heartbeat with more status tags than this is dropped (heartbeat_oversize).
 %% The agent sends about 25; the bound only has to stop a sender that floods the
 %% tag map.
@@ -119,7 +134,17 @@
 %% the estimate_bytes/1 of that heartbeat.
 -type entry() :: #{seq := non_neg_integer(), hb := map(), bytes := non_neg_integer()}.
 -type drop_reason() :: buffer_full | snapshot_oversize | snapshot_evicted
-                     | heartbeat_oversize | heartbeat_invalid.
+                     | heartbeat_oversize | heartbeat_invalid | chunk_rejected.
+-type chunk() :: [{term(), map(), non_neg_integer()}].
+
+%% What one flush has done so far.
+-record(acc, {
+    sent     = 0 :: non_neg_integer(), %% heartbeats the server accepted
+    nchunks  = 0 :: non_neg_integer(), %% requests the server accepted
+    released = 0 :: non_neg_integer(), %% estimated bytes removed from the buffer
+    rpcs     = 0 :: non_neg_integer()  %% RPCs made, failed ones included
+}).
+-define(BATCH_REQUEST, 'yuzu.gateway.v1.BatchHeartbeatRequest').
 
 -record(state, {
     buffer      = #{} :: #{term() => entry()}, %% session id => entry
@@ -232,7 +257,7 @@ code_change(_OldVsn, State, _Extra) ->
 %% yuzu_gw_upstream, so a flush result can not feed the circuit breaker.
 -spec do_flush(map(), non_neg_integer()) -> {ok, term()} | {error, term()}.
 do_flush(BatchReq, N) ->
-    InputType = 'yuzu.gateway.v1.BatchHeartbeatRequest',
+    InputType = ?BATCH_REQUEST,
     OutputType = 'yuzu.gateway.v1.BatchHeartbeatResponse',
     Def = #grpcbox_def{
         service       = 'yuzu.gateway.v1.GatewayUpstream',
@@ -242,8 +267,16 @@ do_flush(BatchReq, N) ->
     },
     Path = <<"/yuzu.gateway.v1.GatewayUpstream/BatchHeartbeat">>,
     StartTime = erlang:monotonic_time(millisecond),
-    Result = grpcbox_client:unary(ctx:background(), Path, BatchReq, Def,
-                                  #{channel => default_channel}),
+    %% The marshal fun runs inside the call, so an invalid heartbeat raises here
+    %% (error), and the HTTP/2 connection can exit under it (an exit that
+    %% grpcbox_client does not catch). Neither may end this process, which holds
+    %% every buffered heartbeat: only the class is kept, never the reason (it
+    %% can hold the request).
+    Result = try grpcbox_client:unary(ctx:background(), Path, BatchReq, Def,
+                                      #{channel => default_channel})
+             catch
+                 Caught:_ -> {caught, Caught}
+             end,
     Duration = erlang:monotonic_time(millisecond) - StartTime,
     case Result of
         {ok, #{acknowledged_count := Count} = Response, _Headers} ->
@@ -289,6 +322,14 @@ do_flush(BatchReq, N) ->
             logger:warning("BatchHeartbeat failed (~b in chunk) with HTTP-level error: ~p",
                            [N, Status]),
             {error, {internal, iolist_to_binary(io_lib:format("http_error ~p", [Status]))}};
+        {caught, Class} ->
+            telemetry:execute([yuzu, gw, upstream, rpc_error],
+                              #{count => 1},
+                              #{rpc_name => <<"batch_heartbeat">>,
+                                code => <<"exception">>}),
+            logger:warning("BatchHeartbeat raised (~b in chunk): class ~p; "
+                           "the reason is not logged", [N, Class]),
+            {error, {exception, Class}};
         {error, Reason} ->
             telemetry:execute([yuzu, gw, upstream, rpc_error],
                               #{count => 1},
@@ -504,46 +545,114 @@ pack([{_, _, Bytes} = E | Rest], Cur, CurBytes, Done) ->
     pack(Rest, [E | Cur], CurBytes + Bytes, Done).
 
 %% @doc Send the chunks in order. A chunk the server accepted has its verdict
-%% consumed (once) and its sessions removed from the buffer. The first failure
-%% stops the flush: that chunk and the unsent ones stay buffered, and the
-%% result is {error, Reason}. A flush that released more than
+%% consumed (once) and its sessions removed from the buffer. What happens on a
+%% failure depends on its class (see the module doc and classify/1); a
+%% transient one ends the flush with {error, Reason}, the failed chunk and the
+%% unsent ones staying buffered. A flush that released more than
 %% ?GC_AFTER_RELEASED_BYTES forces a GC.
--spec flush_chunks([[{term(), map(), non_neg_integer()}]], #state{}) ->
-          {ok | {error, term()}, #state{}}.
+-spec flush_chunks([chunk()], #state{}) -> {ok | {error, term()}, #state{}}.
 flush_chunks(Chunks, State) ->
-    flush_chunks(Chunks, State, 0, 0, 0).
+    flush_loop(Chunks, State, #acc{}).
 
-flush_chunks([], State, Sent, NChunks, Released) ->
-    flushed(Sent, NChunks, Released),
-    {ok, State};
-flush_chunks([Chunk | Rest], State, Sent, NChunks, Released) ->
+flush_loop([], State, Acc) ->
+    finish(ok, State, Acc);
+flush_loop(_Work, State, #acc{rpcs = Rpcs} = Acc) when Rpcs >= ?MAX_RPCS_PER_FLUSH ->
+    finish({error, rpc_limit}, State, Acc);
+flush_loop([Chunk | Rest], State, #acc{rpcs = Rpcs} = Acc) ->
     BatchReq = #{
         heartbeats   => [Hb || {_, Hb, _} <- Chunk],
         gateway_node => atom_to_binary(node(), utf8)
     },
+    Acc1 = Acc#acc{rpcs = Rpcs + 1},
     case do_flush(BatchReq, length(Chunk)) of
         {ok, Response} ->
             State1 = consume_verdict(Response, State),
-            State2 = lists:foldl(
-                       fun({Sid, _, _}, S) ->
-                               remove_entry(Sid, maps:get(Sid, S#state.buffer), S)
-                       end, State1, Chunk),
-            flush_chunks(Rest, State2, Sent + length(Chunk), NChunks + 1,
-                         Released + lists:sum([B || {_, _, B} <- Chunk]));
-        {error, _} = Error ->
-            flushed(Sent, NChunks, Released),
-            {Error, State}
+            {State2, Bytes} = remove_chunk(Chunk, State1),
+            flush_loop(Rest, State2,
+                       Acc1#acc{sent     = Acc1#acc.sent + length(Chunk),
+                                nchunks  = Acc1#acc.nchunks + 1,
+                                released = Acc1#acc.released + Bytes});
+        {error, Error} ->
+            failed(classify(Error), Error, Chunk, Rest, State, Acc1)
     end.
+
+%% How a failed RPC is handled. The status of a gRPC error is the binary grpcbox
+%% returns (<<"8">> is RESOURCE_EXHAUSTED, <<"3">> INVALID_ARGUMENT); the server
+%% refusing a request this way will refuse the same request again, so retrying
+%% it every cycle would hold back everything behind it. Any other failure,
+%% including a status this module does not know, is transient: the data stays.
+-spec classify(term()) -> refused | raised | transient.
+classify({Status, _Message}) when Status =:= ?GRPC_STATUS_RESOURCE_EXHAUSTED;
+                                  Status =:= ?GRPC_STATUS_INVALID_ARGUMENT ->
+    refused;
+classify({exception, error}) ->
+    raised;
+classify(_Other) ->
+    transient.
+
+-spec failed(refused | raised | transient, term(), chunk(), [chunk()],
+             #state{}, #acc{}) -> {ok | {error, term()}, #state{}}.
+failed(transient, Error, _Chunk, _Rest, State, Acc) ->
+    finish({error, Error}, State, Acc);
+failed(refused, _Error, [{Sid, _, Bytes}], Rest, State, Acc) ->
+    %% One heartbeat the server will not take: drop it, go on with the rest.
+    note_dropped(chunk_rejected),
+    State1 = remove_entry(Sid, maps:get(Sid, State#state.buffer), State),
+    flush_loop(Rest, State1, Acc#acc{released = Acc#acc.released + Bytes});
+failed(refused, _Error, Chunk, Rest, State, Acc) ->
+    %% Which heartbeat is not known: send each half again (a half of one is a
+    %% single, handled above), so the cost of finding one is logarithmic.
+    {First, Second} = lists:split(length(Chunk) div 2, Chunk),
+    flush_loop([First, Second | Rest], State, Acc);
+failed(raised, Error, Chunk, Rest, State, Acc) ->
+    %% The encoder raised: the heartbeats it raises on alone are invalid (they
+    %% cannot reach here through enqueue/2, which screens them). With none, the
+    %% exception came from somewhere else and is transient.
+    case lists:partition(fun({_, Hb, _}) -> encodes(Hb) end, Chunk) of
+        {_, []} ->
+            finish({error, Error}, State, Acc);
+        {Good, Bad} ->
+            lists:foreach(fun(_) -> note_dropped(heartbeat_invalid) end, Bad),
+            {State1, Bytes} = remove_chunk(Bad, State),
+            Acc1 = Acc#acc{released = Acc#acc.released + Bytes},
+            case Good of
+                [] -> flush_loop(Rest, State1, Acc1);
+                _  -> flush_loop([Good | Rest], State1, Acc1)
+            end
+    end.
+
+%% Whether the encoder accepts a request holding just this heartbeat.
+-spec encodes(map()) -> boolean().
+encodes(Hb) ->
+    try gateway_pb:encode_msg(#{heartbeats => [Hb], gateway_node => <<>>}, ?BATCH_REQUEST) of
+        _ -> true
+    catch
+        _:_ -> false
+    end.
+
+%% Remove the chunk's sessions; the estimated bytes removed.
+-spec remove_chunk(chunk(), #state{}) -> {#state{}, non_neg_integer()}.
+remove_chunk(Chunk, State) ->
+    lists:foldl(fun({Sid, _, Bytes}, {S, Total}) ->
+                        {remove_entry(Sid, maps:get(Sid, S#state.buffer), S), Total + Bytes}
+                end, {State, 0}, Chunk).
+
+finish(Result, State, Acc) ->
+    flushed(Acc),
+    {Result, State}.
 
 %% @doc Log what a flush sent (counts only, never session ids) and collect the
 %% garbage of a large release.
-flushed(0, _NChunks, _Released) ->
-    ok;
-flushed(Sent, NChunks, Released) ->
+flushed(#acc{sent = 0, released = Released}) ->
+    gc_after(Released);
+flushed(#acc{sent = Sent, nchunks = NChunks, released = Released}) ->
     case NChunks > 1 of
         true  -> logger:info("Flushed ~b heartbeats in ~b chunk(s)", [Sent, NChunks]);
         false -> logger:debug("Flushed ~b heartbeats in ~b chunk(s)", [Sent, NChunks])
     end,
+    gc_after(Released).
+
+gc_after(Released) ->
     case Released > ?GC_AFTER_RELEASED_BYTES of
         true  -> erlang:garbage_collect();
         false -> ok
