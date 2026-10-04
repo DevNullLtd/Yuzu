@@ -7,6 +7,7 @@
 # `meson compile ... yuzu-agent` did when the old pgrep -f killed it.
 #
 # Run:  bash tests/shell/test_start_uat_kill_stale.sh
+# shellcheck disable=SC2016  # the lexical pins below deliberately match literal $-expressions
 set -euo pipefail
 
 ROOT="$(git rev-parse --show-toplevel 2>/dev/null || { cd "$(dirname "$0")/../.." && pwd; })"
