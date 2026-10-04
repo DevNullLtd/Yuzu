@@ -423,9 +423,12 @@ TEST_CASE("asset_tags plugin: shutdown() wakes the check thread at once, not aft
     yuzu::agent::StandalonePluginContext ctx("asset_tags", {{"agent.data_dir", dir.path.string()}});
     REQUIRE(plugin->descriptor->init(ctx.get()) == 0);
 
-    // Let the check thread reach its wait so the notify path (not just the predicate) is what
-    // is exercised. No correctness dependence: shutdown() must return promptly either way.
-    std::this_thread::sleep_for(std::chrono::milliseconds{100});
+    // Give the check thread time to reach its wait, so the notify path and not just the
+    // predicate is what runs. This is a head start, not a handshake: if the runner starves the
+    // worker past it, shutdown() stores the flag first, the worker skips the wait, and a deleted
+    // notify_all() goes unnoticed on that run (a handshake needs a production hook, which the
+    // sibling lock-ordering test avoids). shutdown() must return promptly either way.
+    std::this_thread::sleep_for(std::chrono::milliseconds{250});
 
     const auto t0 = std::chrono::steady_clock::now();
     plugin->descriptor->shutdown(ctx.get());
