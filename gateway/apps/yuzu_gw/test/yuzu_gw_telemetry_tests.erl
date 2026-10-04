@@ -101,7 +101,7 @@ metrics_scrape_renders_test_() ->
                                                  binary_to_list(L))],
            ?assertEqual([], NonAscii)
        end},
-      %% #1197 PR-C: a family that is declared but missing from the scrape, or
+      %% #1197: a family that is declared but missing from the scrape, or
       %% missing its help text, would be invisible to every operator.
       {"the three heartbeat-verdict families render with their HELP lines",
        fun() ->
@@ -232,7 +232,7 @@ admission_reject_atoms(Term) when is_list(Term) ->
     lists:append([admission_reject_atoms(E) || E <- Term]);
 admission_reject_atoms(_) -> [].
 
-%% #1197 PR-C: the heartbeat-verdict families. Real telemetry:execute through
+%% #1197: the heartbeat-verdict families. Real telemetry:execute through
 %% the real handler (the producers' own tests mock telemetry entirely, which
 %% cannot see a missing handler clause or a missing ?EVENTS entry, see the
 %% notify_dropped precedent at the top of this file). The labelled series must
@@ -293,9 +293,10 @@ verdict_families_test_() ->
            ?assertEqual([B + N || {B, N} <- lists:zip(Before, [3, 4096, 2, 1])],
                         [Read(R) || R <- Reasons])
        end},
-      %% Characterisation, not new behaviour: it passes before PR-C and pins
-      %% what PR-C relies on, that the depth reports it adds with replayed=0
-      %% (on append, skip and abort) move the gauge and leave the replay counter.
+      %% Characterisation, not new behaviour: it passes without the verdict
+      %% replay and pins what it relies on, that the depth reports it adds
+      %% with replayed=0 (on append, skip and abort) move the gauge and leave
+      %% the replay counter.
       {"a registration_replay event with replayed=0 sets the depth and adds no replay",
        fun() ->
            C0 = prometheus_counter:value(yuzu_gw_registration_replay_total, []),

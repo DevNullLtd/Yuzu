@@ -1,6 +1,6 @@
 %%%-------------------------------------------------------------------
 %%% @doc Tests for how yuzu_gw_heartbeat_buffer consumes the server's
-%%% unknown-session verdict (#1197 PR-C): BatchHeartbeatResponse fields
+%%% unknown-session verdict (#1197): BatchHeartbeatResponse fields
 %%% unknown_session_ids (2) and unknown_session_ids_truncated (3).
 %%%
 %%% The buffer's whole contract is: from either success shape of the

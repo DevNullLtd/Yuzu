@@ -41,7 +41,7 @@ registry_test_() ->
       {"pending sweep preserves fresh entries", fun pending_sweep_preserves_fresh/0},
       %% Monitor ref leak test
       {"re-register does not leak monitor refs", fun reregister_no_monitor_leak/0},
-      %% #1197 PR-C: the replay entries for sessions this node holds
+      %% #1197: the replay entries for sessions this node holds
       {"entries_for_sessions returns the replay entry of each held session, read only",
        fun entries_for_held_sessions/0},
       {"entries_for_sessions drops an id whose routing row holds a different pid",
@@ -306,7 +306,7 @@ reregister_no_monitor_leak() ->
     kill_dummy(Pid2).
 
 %%%===================================================================
-%%% #1197 PR-C: entries_for_sessions/1
+%%% #1197: entries_for_sessions/1
 %%%===================================================================
 
 %% Each held session resolves, through the session index, to the agent id, the

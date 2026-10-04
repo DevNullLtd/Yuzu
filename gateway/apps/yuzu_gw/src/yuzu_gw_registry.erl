@@ -222,7 +222,7 @@ lookup_remote(AgentId) ->
 %%
 %% `{error, unavailable}' means the agents table does not exist (the registry
 %% is not running or is restarting, which takes its tables with it); the
-%% drip treats it as "stop", never as "agent gone" (#1197 PR-C).
+%% drip treats it as "stop", never as "agent gone" (#1197).
 -spec lookup_local_session(binary()) ->
     {ok, {pid(), binary() | undefined}} | error | {error, unavailable}.
 lookup_local_session(AgentId) ->
@@ -301,7 +301,7 @@ all_agents() ->
 all_agent_pids() ->
     pg:get_members(?PG_SCOPE, all_agents).
 
-%% @doc The replay entries for the sessions this node holds (#1197 PR-C).
+%% @doc The replay entries for the sessions this node holds (#1197).
 %%
 %% Resolves each id through the node-local session index
 %% (`lookup_session/1'), then reads the agent's row once and requires it to

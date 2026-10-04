@@ -14,7 +14,7 @@
 %%% grpcbox. On failure, the buffer is retained (capped) for retry
 %%% on the next flush cycle.
 %%%
-%%% Heartbeat verdict (#1197 PR-C): a successful BatchHeartbeatResponse may
+%%% Heartbeat verdict (#1197): a successful BatchHeartbeatResponse may
 %%% list sessions the server does not know (unknown_session_ids), typically
 %%% after a server restart. Each flush hands that list to
 %%% yuzu_gw_upstream:replay_sessions/1, which re-proxies exactly those

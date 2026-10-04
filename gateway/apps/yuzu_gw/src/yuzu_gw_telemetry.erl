@@ -233,7 +233,7 @@ handle_event([yuzu, gw, heartbeat, session_mismatch], #{count := N}, _Meta, _Con
     prometheus_counter:inc(yuzu_gw_heartbeat_session_mismatch_total,
                            [<<"security">>], N);
 
-%% Heartbeat verdict consumer (#1197 PR-C). `registration_replay_triggered'
+%% Heartbeat verdict consumer (#1197). `registration_replay_triggered'
 %% counts replays that started, by trigger (breaker | heartbeat); the label is
 %% an atom chosen by yuzu_gw_upstream, never caller-supplied, so a sender
 %% cannot control label cardinality. `unknown_truncated' counts verdicts the

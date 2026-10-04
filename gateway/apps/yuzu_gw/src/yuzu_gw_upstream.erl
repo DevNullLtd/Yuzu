@@ -26,7 +26,7 @@
 %%%   server that disappears again mid-replay fails fast and the drip
 %%%   stops; the next genuine recovery restarts it.
 %%%
-%%% Targeted replay on a heartbeat verdict (#1197 PR-C):
+%%% Targeted replay on a heartbeat verdict (#1197):
 %%%   The server answers every BatchHeartbeat with the sessions it does not
 %%%   know. yuzu_gw_heartbeat_buffer casts those ids to replay_sessions/1,
 %%%   which queues exactly the ones this node still holds onto the same drip.
@@ -169,7 +169,7 @@ forward_guardian_message(AgentId, ResponseFrame) ->
     gen_server:cast(?SERVER, {forward_guardian_message, AgentId, ResponseFrame}).
 
 %% @doc Replay the registrations of the sessions the server reported as
-%% unknown in a BatchHeartbeat response (#1197 PR-C).
+%% unknown in a BatchHeartbeat response (#1197).
 %%
 %% Fire-and-forget (cast), called by yuzu_gw_heartbeat_buffer once per flush
 %% and so never blocking it. `ok' means handed over, not replayed: the ids are
@@ -367,7 +367,7 @@ handle_cast(replay_registrations, #state{replay_queue = [_ | _]} = State) ->
     %% cast, so a server that flapped (fail→recover→fail→recover under
     %% packet loss) restarted the replay from zero each time and, at
     %% fleet scale, never drained. Drop the cast: the running drip will
-    %% complete. Since #1197 PR-C the running queue may be a TARGETED one
+    %% complete. Since #1197 the running queue may be a TARGETED one
     %% (the sessions a heartbeat verdict named), not a snapshot of every
     %% agent, so an agent that is not in it is not replayed by this
     %% recovery; it relies on a later verdict, which lists it within one
@@ -550,14 +550,16 @@ do_replay_one(AgentId, Pid, SessionId, RegisterReq, QueueDepth, State) ->
                 %% (RegisterResponse.accepted = false, e.g. a rejected
                 %% enrollment). Re-announcing a session the server never
                 %% installed would only be rejected again, and the next
-                %% verdict would replay it again, so tear down this process's
-                %% stream: the agent then registers again by itself through the gateway
-                %% and follows its own outcome. The answer is authoritative, so it is a breaker
-                %% SUCCESS (as for the superseded case below), and the attempt
-                %% is stamped like any other replay. A MISSING `accepted' key
-                %% still means accepted (the decoder always sets it on the wire;
-                %% only test doubles omit it). The reason is the server's text, so
-                %% it is cut before it is logged; no session id is logged.
+                %% verdict would replay it again, so tear down this
+                %% process's stream: the agent then registers again by
+                %% itself through the gateway and follows its own outcome.
+                %% The answer is authoritative, so it is a breaker SUCCESS
+                %% (as for the superseded case below), and the attempt is
+                %% stamped like any other replay. A MISSING `accepted' key
+                %% still means accepted (the decoder always sets it on the
+                %% wire; only test doubles omit it). The reason is the
+                %% server's text, so it is cut before it is logged; no
+                %% session id is logged.
                 logger:warning("Registration replay: ~s was not accepted by the server (~s); "
                                "disconnecting so the agent follows its own registration path",
                                [AgentId, reject_reason_for_log(Response)]),
@@ -870,8 +872,8 @@ replay_verdict(SessionIds, State) ->
     %% RPC is the probe that decides whether the breaker closes.
     enqueue_sessions(SessionIds, State).
 
-%% @doc Queue the entries for the sessions a heartbeat verdict named (#1197
-%% PR-C). Ids are resolved to entries by session (yuzu_gw_registry:
+%% @doc Queue the entries for the sessions a heartbeat verdict named (#1197).
+%% Ids are resolved to entries by session (yuzu_gw_registry:
 %% entries_for_sessions/1), and each pop is re-verified by agent
 %% (lookup_local_session/1): two decisions, two keys.
 %%

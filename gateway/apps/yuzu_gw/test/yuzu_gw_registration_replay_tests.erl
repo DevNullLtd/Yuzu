@@ -20,7 +20,7 @@
 %%%        straight from the table).
 %%% Mocks: grpcbox_client, telemetry.
 %%%
-%%% #1197 PR-C adds the targeted path: the server's unknown-session verdict
+%%% #1197 adds the targeted path: the server's unknown-session verdict
 %%% (BatchHeartbeatResponse.unknown_session_ids) reaches
 %%% yuzu_gw_upstream:replay_sessions/1 and re-proxies exactly those sessions
 %%% through the same drip. Those tests are the second half of this file
@@ -77,7 +77,7 @@ replay_test_() ->
      ]}.
 
 %%%===================================================================
-%%% #1197 PR-C: the targeted path. Four fixtures differ only in the upstream
+%%% #1197: the targeted path. Four fixtures differ only in the upstream
 %%% env they start with (read once, in init/1).
 %%%===================================================================
 
@@ -318,7 +318,8 @@ cleanup(UpPid) ->
     meck:unload([grpcbox_client, telemetry, yuzu_gw_agent]),
     persistent_term:erase(?SUBK),
     persistent_term:erase(?LOGK),
-    %% The two PR-C tunables are read once in init/1; do not leak them.
+    %% The two verdict replay tunables are read once in init/1; do not leak
+    %% them.
     application:unset_env(yuzu_gw, registration_replay_session_guard_ms),
     application:unset_env(yuzu_gw, registration_replay_queue_max),
     application:set_env(yuzu_gw, circuit_breaker_reset_timeout_ms, 150),
@@ -691,8 +692,8 @@ id_prefix() ->
     <<"replay-", PidBin/binary, "-">>.
 
 %% A stand-in for an agent process. Recorded so cleanup/1 stops it even when a
-%% test never does (the bound agents of the PR-C tests are never stopped by
-%% their tests).
+%% test never does (the bound agents of the verdict replay tests are never
+%% stopped by their tests).
 spawn_dummy() ->
     Pid = spawn(fun() -> receive stop -> ok end end),
     case persistent_term:get(?DUMMYK, undefined) of
@@ -715,7 +716,7 @@ kill_dummy(Pid) ->
     Pid ! stop.
 
 %%%===================================================================
-%%% #1197 PR-C tests (default fixture)
+%%% #1197 verdict replay tests (default fixture)
 %%%===================================================================
 
 %% E1: the verdict names S1; the node holds two agents. One ProxyRegister goes
@@ -1157,11 +1158,11 @@ rejected_replay_disconnects_without_reannounce() ->
     %% NEL 16#85 and CSI 16#9B) become `?' after the cut; other bytes pass
     %% through (~s shows the latin-1 byte 16#E9 as its UTF-8 form C3 A9), and
     %% the text is still cut to 128 bytes.
-    Hostile = <<"line1\r\nline2\e[31m", 0, 127, 16#85, 16#9B, 16#E9,
+    Crafted = <<"line1\r\nline2\e[31m", 0, 127, 16#85, 16#9B, 16#E9,
                 (binary:copy(<<"y">>, 200))/binary>>,
     A2 = bind_agent(<<"e20s">>),
     mock_unary(fun(<<"ProxyRegister">>, _Req, Hdr) when Hdr =/= undefined ->
-                       {ok, #{accepted => false, reject_reason => Hostile,
+                       {ok, #{accepted => false, reject_reason => Crafted,
                               session_id => Hdr}, #{}};
                   (M, R, H) -> default_rpc(M, R, H)
                end),
