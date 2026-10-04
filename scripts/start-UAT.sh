@@ -217,9 +217,20 @@ report_busy_ports() {
     done
 }
 
+# Poll up to 5 x 1 s for the ports to clear; prints whatever is still held.
+wait_ports_free() {
+    local h="" _
+    for _ in 1 2 3 4 5; do
+        h=$(listening_ports_among "$@")
+        [ -z "$h" ] && break
+        sleep 1
+    done
+    printf '%s' "$h"
+}
+
 kill_stale() {
     echo "Stopping Yuzu processes recorded by this script..."
-    local killed=0 failed=0 rc name held="" _
+    local killed=0 failed=0 rc name held=""
 
     for name in server gateway agent; do
         rc=0; kill_recorded "$name" || rc=$?
@@ -237,12 +248,8 @@ kill_stale() {
         fail "neither lsof nor ss found — cannot verify the UAT ports are free; refusing to start (#5333)"
         return 1
     fi
-    for _ in 1 2 3 4 5; do
-        # shellcheck disable=SC2086  # UAT_PORTS is a deliberate word list
-        held=$(listening_ports_among $UAT_PORTS)
-        [ -z "$held" ] && break
-        sleep 1
-    done
+    # shellcheck disable=SC2086  # UAT_PORTS is a deliberate word list
+    held=$(wait_ports_free $UAT_PORTS)
     if [ -n "$held" ]; then
         fail "ports still held by processes this script did not start: $held"
         # shellcheck disable=SC2086
@@ -259,11 +266,7 @@ kill_stale() {
             killed=$((killed + 1))
         fi
     fi
-    for _ in 1 2 3 4 5; do
-        held=$(listening_ports_among "$PG_HOST_PORT")
-        [ -z "$held" ] && break
-        sleep 1
-    done
+    held=$(wait_ports_free "$PG_HOST_PORT")
     if [ -n "$held" ]; then
         fail "port $PG_HOST_PORT still held after removing $PG_CONTAINER — not this rig's sidecar"
         report_busy_ports "$PG_HOST_PORT"
