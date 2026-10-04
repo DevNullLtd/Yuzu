@@ -71,6 +71,17 @@ genuinely passed pre-flight stays counted as passed through a momentary read
 failure, rather than dropping out of the cohort until the run is manually
 re-checked.
 
+**A check's responses can outgrow the read window.** Each check reads its newest 50,000
+responses for the run (the window slides; it keeps the newest). On a very large cohort with a
+lot of re-dispatch the window can fill, and a device that is absent from it is then
+**ambiguous**: it may not have answered, or it may have answered and been pushed out of the
+window. Such a device is never shown as passing. Its cell reads **"inconclusive: response cap
+reached"**, the device stays **Incomplete** (so it is not in Deploy's go cohort), and the
+server stops re-dispatching that run's checks, because every extra reply would push another
+device's answer out of the window. The run still completes at its deadline. To resolve those
+devices, re-run the pre-flight against a smaller group; per-device paging of the response
+read is a tracked follow-up.
+
 ## Verify — before / after performance
 
 The **Verify** stage at the bottom of `/auto` answers a different question from

@@ -238,6 +238,15 @@ with an empty `data` array.
 **What to do.** Treat a `503` from these routes as retryable. A dashboard or script that read
 `data: []` as "nothing to report" during an outage will now see the error instead.
 
+## Changed: a saturated pre-flight response window is inconclusive (#4644)
+
+Each pre-flight check reads its newest 50,000 responses for a run. On a very large cohort a
+device that had answered could be pushed out of that window and then read as "no response" while
+the runner kept re-dispatching. A device absent from a full window now shows **"inconclusive:
+response cap reached"**, stays Incomplete (never in Deploy's go cohort) and the runner stops
+re-dispatching that run; the run still completes at its deadline. Re-run against a smaller group
+to resolve those devices.
+
 ## Breaking: per-agent execution statistics are confined to the caller's scope (#3526)
 
 `GET /api/v1/execution-statistics/agents` and the MCP tool `get_execution_statistics_by_agent` used

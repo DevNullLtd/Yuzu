@@ -285,6 +285,10 @@ struct PreflightTarget {
 };
 
 /// One check's outcome on one device (verdict + the device's actual value).
+/// Display value for a device x check cell that has no response in a TRUNCATED fetch window
+/// (the answer may have been evicted by the row cap). Persisted in `checks_json` `val`.
+inline constexpr std::string_view kPreflightCapReachedValue = "inconclusive: response cap reached";
+
 struct PreflightDeviceCheck {
     std::string key;
     std::string label;
@@ -319,6 +323,13 @@ struct PreflightCheckResponses {
     /// grid-persisting caller MUST check this (via `any_check_degraded`)
     /// before calling `compute_device_results`/`persist_and_maybe_complete`.
     bool degraded = false;
+    /// #4644 Gate 7: true when this check's fetch hit its row cap (`kResponseFetchCap`). The
+    /// read is a SLIDING window (`ORDER BY ts DESC LIMIT`), so an agent absent from
+    /// `by_agent` is then AMBIGUOUS: it may be unanswered, or it may have answered and had its
+    /// row evicted. Such an agent is never reported as passing (its verdict stays Unknown, so
+    /// the device stays Incomplete and out of Deploy's go-cohort); `compute_device_results`
+    /// labels the cell so the operator reads "cap reached", not a false "no response".
+    bool truncated = false;
 };
 
 // ── Verdict (threshold applied to the parsed fact) ───────────────────────────
@@ -421,6 +432,10 @@ compute_device_results(const std::vector<PreflightTarget>& targets,
                     ck.value = "\xE2\x80\x94";
                 }
             }
+            // Ambiguous, not unanswered: see PreflightCheckResponses::truncated. Verdict stays
+            // kUnknown (never go); only the display value says why.
+            if (!terminal && c.truncated)
+                ck.value = std::string(kPreflightCapReachedValue);
             if (!terminal && any_pending)
                 *any_pending = true;
             verdicts.push_back(ck.verdict);

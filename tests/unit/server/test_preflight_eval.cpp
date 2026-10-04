@@ -138,3 +138,26 @@ TEST_CASE("bucket_token / bucket_from_token round-trip", "[preflight][eval]") {
         CHECK(bucket_from_token(bucket_token(b)) == b);
     CHECK(bucket_from_token("garbage") == Bucket::kIncomplete); // safe default
 }
+
+// #4644 Gate 7: a cell with no response in a TRUNCATED fetch window is ambiguous, never a pass.
+TEST_CASE("compute_device_results labels an absent agent in a truncated window inconclusive",
+          "[preflight][eval][numeric_params]") {
+    PreflightCheckResponses c;
+    c.key = "disk";
+    c.label = "Disk";
+    c.by_agent["agent-2"] = {1, "ok"};
+    std::vector<PreflightTarget> targets = {{"agent-1", "h1", "windows"}, {"agent-2", "h2", "windows"}};
+    PreflightConfig cfg;
+
+    for (const bool truncated : {false, true}) {
+        c.truncated = truncated;
+        bool any_pending = false;
+        const auto grid = compute_device_results(targets, {c}, cfg, &any_pending);
+        REQUIRE(grid.size() == 2);
+        const auto& cell = grid[0].checks[0]; // agent-1: no response either way
+        CHECK(cell.verdict == Verdict::kUnknown);
+        CHECK(grid[0].bucket == Bucket::kIncomplete);
+        CHECK(any_pending);
+        CHECK((cell.value == std::string(kPreflightCapReachedValue)) == truncated);
+    }
+}
