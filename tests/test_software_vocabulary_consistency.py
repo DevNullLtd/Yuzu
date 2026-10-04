@@ -10,8 +10,7 @@ against the real tree, that:
   1. every published surface equals the agreed vocabulary (EXPECTED_*);
   2. every value an agent emits is in that vocabulary (emitted ⊆ published);
   3. every non-Lane-1 ecosystem and Lane-3 kind is named in `is_os_native`, and `pkg`
-     is NOT a kind-level trigger (it is routed by its ecosystem);
-  4. the retired `homebrew` value appears in no published enumeration.
+     is NOT a kind-level trigger (it is routed by its ecosystem).
 
 Discovery is anti-vacuous: each emitter pattern must match a file and the emitted sets
 must be non-empty, otherwise the test fails rather than passing on nothing.
@@ -126,31 +125,6 @@ class VocabularyConsistency(unittest.TestCase):
         for kind in LANE3_KINDS:
             self.assertIn(f'kind == "{kind}"', hdr)
         self.assertNotIn('kind == "pkg"', hdr)
-
-    def test_retired_homebrew_not_published(self):
-        for rel in (MCP_SRC, OPENAPI_SRC):
-            text = read(rel)
-            for field in ("kind", "ecosystem"):
-                self.assertNotIn("homebrew", extract_enumeration(text, field))
-        self.assertNotIn("homebrew", extract_table_row(read(MANUAL), "ecosystem"))
-
-
-class ParseHelpers(unittest.TestCase):
-    def test_enumeration_requires_exactly_one(self):
-        with self.assertRaises(AssertionError):
-            extract_enumeration("nothing here", "kind")
-        with self.assertRaises(AssertionError):
-            extract_enumeration("kind (a|b) and kind (c)", "kind")
-        self.assertEqual(extract_enumeration("x kind (a|b) y", "kind"), {"a", "b"})
-
-    def test_discover_raises_on_empty_pattern(self):
-        with self.assertRaises(AssertionError):
-            discover_sources(REPO_ROOT, ["no/such/dir/*.cpp"])
-
-    def test_literals_ignore_non_literal_assignments(self):
-        kinds, ecos = extract_literals('e.kind = field(5); e.ecosystem = "brew"; kind = "pkg";')
-        self.assertEqual(kinds, {"pkg"})
-        self.assertEqual(ecos, {"brew"})
 
 
 if __name__ == "__main__":

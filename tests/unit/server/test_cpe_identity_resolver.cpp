@@ -480,9 +480,10 @@ TEST_CASE("ADVERSARIAL: production ctor parses the real build-embedded curated "
     CHECK(id.exact_product);
 }
 
-TEST_CASE("REGRESSION GUARD: every published (kind, ecosystem) pair routes to Lane 1 or "
-          "Lane 3, never unsupported-ecosystem",
+TEST_CASE("REGRESSION GUARD: every Lane-1 ecosystem (rpm/deb/apk/pacman) resolves via the "
+          "curated map",
           "[cpe]") {
+    // The Lane-3 (kind, ecosystem) pairs are covered by the os-native case above.
     CpeIdentityResolver r{kSeed};
 
     for (const char* eco : {"rpm", "deb", "apk", "pacman"}) {
@@ -490,17 +491,6 @@ TEST_CASE("REGRESSION GUARD: every published (kind, ecosystem) pair routes to La
         INFO(eco);
         REQUIRE(id.outcome == IdentityOutcome::Resolved);
         CHECK(id.cpe_product == "openssl");
-    }
-
-    const std::pair<const char*, const char*> lane3[] = {
-        {"app", "windows"}, {"app", "macos"},           {"pkg", "macos_pkgutil"},
-        {"pkg", "brew"},    {"app", "brew"},            {"feat", "optional_feature"},
-    };
-    for (const auto& [kind, eco] : lane3) {
-        auto id = r.resolve(pkg("x", "1", eco, "", kind));
-        INFO(kind << "/" << eco);
-        REQUIRE(id.outcome == IdentityOutcome::NotAssessed);
-        CHECK(id.not_assessed_reason == std::string(kReasonOsNative));
     }
 }
 
