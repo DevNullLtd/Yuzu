@@ -345,7 +345,7 @@ Per `docs/observability-conventions.md`:
 | Metric | Type | Labels | Status |
 |---|---|---|---|
 | `yuzu_tar_dashboard_view_total` | counter | `frame` (retention/sql/tree), `result` | shipped (PR-A.A) |
-| `yuzu_tar_retention_paused_devices` | gauge | `source` | shipped (PR-A.A) |
+| `yuzu_tar_retention_paused_devices` | gauge | `source` | shipped (PR-A.A). Set from the rows of the page's own scan read, so on a cut scan (`result_truncated_by_cap`, see the bounded-read note in §3) it counts only the part that was read and UNDER-counts; read it together with the in-band cut signal, not as a fleet total. |
 | `yuzu_tar_source_purge_total` | counter | `result` | **shipped** (Phase 15.A — dashboard fragment + `POST /api/v1/tar/retention-paused/purge`) |
 | `yuzu_tar_source_reenable_total` | counter | `result` | shipped (PR-A.A — dashboard fragment only, no REST twin) |
 | `yuzu_tar_scan_dispatched_total` | counter | `result` | shipped (PR-A.A) |
