@@ -662,9 +662,9 @@ flip, with a red-first test each:
     attempt per terminal tombstone per heartbeat pass, then refills the follower it exposes
     (the refill is queued before the head is flipped to `Dispatching`; if that push throws, the head is
     parked instead). The pass that SYNTHESIZES the outcome of a withdrawn or waiter-abandoned head
-    that has none makes two attempts: `synthesize_fallback_outcome_locked` releases once on its
-    not-committed branch, then the reaper releases again (the second is a no-op if the first
-    succeeded). Other same-key events add their own attempts: an attach's head drive,
+    that has none makes at most two attempts: `synthesize_fallback_outcome_locked` attempts a release
+    only on its not-committed branch, then the reaper releases again (the second is a no-op if the
+    first succeeded). Other same-key events add their own attempts: an attach's head drive,
     sweep-before-adopt, an abandonment, a publish pop, a detach's sweep. A release that keeps failing
     logs a rate-limited warning naming the first affected key (every 64th consecutive pass in which a
     release failed). A successful synthesis wakes blocking waiters at once (`claim_cv_`), even when
@@ -681,7 +681,8 @@ flip, with a red-first test each:
     entry is absent or empty gets a durable Disarm claim queued in the same critical section that
     erases it (submitted off-lock afterwards), with one warning line per orphan naming the key. An
     inline-type key (no io class) is left alone: it never carries claims or ghost mappings and its
-    refcount reaches 0 only inside `detach_rule_locked`, which tears it down synchronously. Limits: it
+    refcount reaches 0 only inside `detach_rule_locked`, which tears it down synchronously (a throw
+    from the backend disarm is swallowed and counted, and `keys_` is still erased). Limits: it
     runs once per heartbeat pass, so an idle orphan watcher can live until the next pass; a key whose
     ghost mapping is still held has a nonzero refcount and is not an orphan yet.
   - Trade D2 (decided by the maintainer during the #5322 work): a clean follower queued behind a
@@ -745,7 +746,14 @@ flip, with a red-first test each:
       scan under `registry_mu_` (like `arms_parked()`): read it at the heartbeat cadence only, never
       per event. Steady-state expectation: every counter is 0. A nonzero `orphan_disarms_started`
       means a ->0 index edge was dropped without a Disarm; a nonzero `tombstones_released_by_reaper`
-      records a release that failed earlier and was recovered.
+      records a release that failed earlier and was recovered. Also export the four detach and stop
+      counters `detach_sweep_left_residue()`, `detach_claim_failures()`,
+      `detach_post_commit_failures()` and `claims_dropped_at_stop()`: this fix removed the live
+      assert on the last-on-key sweep and made the residue fallback an accepted, counted outcome,
+      and `detach_post_commit_failures()` also counts a swallowed inline-type backend disarm throw.
+      The residue fallback increments both `detach_sweep_left_residue()` and
+      `detach_claim_failures()`. Steady-state expectation for the first three is 0 outside a
+      failing index release; `claims_dropped_at_stop()` counts shutdown drops only.
     - (P2) Export `ack_maint_exceptions_` (it has no accessor yet).
     - (P3) Add an oldest-pending-Disarm age gauge, so a hung orphan Disarm is visible.
     - (P4) File and cite an issue for the heartbeat-tag export work: the accessors' header comments

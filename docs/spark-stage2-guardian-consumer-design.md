@@ -627,7 +627,7 @@ winner), and a claim that no longer owns its mapping releases as a successful no
 commit exception) is never selected for dispatch (`is_dead_claim`); the dispatch entry
 guard is narrower (withdrawn or commit-exception only). `expire_overdue_claims()`'s
 reaper pops terminal `Queued` heads with one index-release attempt per tombstone per
-pass (two in the pass that synthesizes the outcome of a withdrawn or waiter-abandoned head
+pass (at most two in the pass that synthesizes the outcome of a withdrawn or waiter-abandoned head
 that has none; the second is a no-op if the first succeeded) and refills the follower it
 exposes; a synthesized outcome wakes blocking waiters at once, even if the release that
 follows it fails; an attach on a key that already has a `keys_`
