@@ -584,7 +584,7 @@ alert-rule halves** (#4 RE-SCOPED, not closed — see its bullet):**
   (surfaced via `yuzu_server_gateway_route_desync_total{op="renew_leases",outcome="unknown_session"}`,
   new in this slice, rather than silently dropped) and stays that way until the #4246 #3 durable
   cross-replica session lookup lands under WS-5. Reached after a server-only restart (observed on one
-  rig; see the known limitation under Server-Side Setup in `docs/user-manual/gateway.md`).
+  rig; superseded, see the 2026-10-04 update in this section and "What happens when the server restarts" in `docs/user-manual/gateway.md`).
 - **Ship the write-failure fail-closed posture + alert rule** (#4246 #1 — **CLOSED, 4.2b**). The flip
   landed as a **per-site contract, not a uniform flip**: `record_route_store_failure`'s six call sites
   keep DIFFERENT postures by design — `register_fresh` (ProxyRegister's fresh-registration branch), the
@@ -1303,7 +1303,7 @@ previous gateway (the only new state is the in-memory index; derived from the ch
   is compatible. A future heartbeat-forwarding slice cannot reuse the connection pid as its key, because a pid
   is meaningful only on the node that owns the connection.
 
-**Update (2026-10-04, #1197 PR-C - the gateway now consumes the unknown-session verdict).** The
+**Update (2026-10-04, #1197 - the gateway now consumes the unknown-session verdict).** The
 gateway reads `unknown_session_ids` and `unknown_session_ids_truncated` from every successful
 `BatchHeartbeatResponse` and replays exactly the sessions it still holds through the existing
 registration-replay drip. The 2026-10-01 update above describes the state before this change (the
@@ -1318,10 +1318,34 @@ one core replica a server-only restart now recovers through the replay described
   entry per agent, subject to a per-session guard window (`registration_replay_session_guard_ms`, default
   10000, valid 0..3600000) and a queue cap (`registration_replay_queue_max`, default 10000, valid
   1..1000000); both are application-env keys read at start, an invalid value warns and falls back to the
-  default. A verdict that arrives while the breaker is `open` is dropped and counted; one that arrives
-  `half_open` is queued and its first replay RPC is the probe. A replay the server answers with
-  `accepted=false` makes the gateway disconnect that agent process, with no re-announce, so the agent
-  registers directly and follows its own outcome.
+  default. The queue cap bounds only verdict appends: the snapshot a breaker recovery seeds is not
+  capped (bounded by the local agent count, as before), and while a snapshot of 10000 or more agents
+  drains, every verdict id for an agent not already queued counts as `queue_full`. A verdict that
+  arrives while the breaker is `open` is dropped and counted; one that arrives `half_open` is queued and
+  its first replay RPC is the probe. A replay the server answers with `accepted=false` (for example an
+  admin-denied or not yet approved enrollment; reached only when the agent is not already approved in the
+  enrollment store) makes the gateway disconnect that agent process, with no re-announce, so the agent
+  registers again by itself through the gateway and follows its own outcome. That disconnect has the shape
+  tracked in #4629 (no session-match guard).
+- **Replay failures feed the shared breaker (INFERRED from `yuzu_gw_upstream.erl`).** A flush never feeds
+  the circuit breaker, but a failed replay `ProxyRegister` does, like any other `ProxyRegister` (a server
+  answer of superseded or `accepted=false` counts as a success). The breaker policy is unchanged; verdict
+  replays are a new source of failures that count. With the default threshold of 5 and 20 ms spacing, a
+  failing server can open the breaker within about 100 ms plus the RPC time of five calls. An open breaker
+  gates `ProxyRegister` and `ProxyInventory`, drops stream-status notifications and sets `/readyz`
+  `circuit_breaker` to false.
+- **Replaying a session the server already knows is not free (INFERRED from the code).** The server's
+  ADOPT calls `register_agent` for every replayed session, so a session it already holds is re-installed as
+  a fresh `AgentSession`: the agent loses its dispatch placement until its re-sent CONNECTED lands (the
+  `BatchHeartbeatResponse` comment in `gateway.proto` says the same), and the agent's device tokens are
+  revoked when a prior session exists and a device-token store is wired. No device-token store is wired in
+  the production server today (`set_device_token_store` has no production caller), so that revoke is
+  dormant until one is. Two cases replay a known session: (i) a verdict computed before a replay landed
+  arrives after it (the flush RPC deadline is 5 s, the vendored grpcbox client default, so keep
+  `registration_replay_session_guard_ms` at or above 5000; the default is 10000); (ii) a double replay: a
+  verdict replay runs first (no prior session, nothing revoked) and a later full breaker-recovery replay
+  re-proxies the same sessions (a prior session now exists; the breaker-seeded snapshot is not filtered by
+  the guard). Neither was observed on the rig. An idempotent ADOPT is tracked in #5244.
 - **Two keys, two decisions.** The verdict is enqueued by SESSION: the server names sessions, and
   `yuzu_gw_registry:entries_for_sessions/1` resolves each id through the node-local session index from
   the 2026-10-02 update, then reads the agent row once and requires it to agree with the index (same
@@ -1362,13 +1386,28 @@ one core replica a server-only restart now recovers through the replay described
   `gateway_service_impl.cpp`), so no verdict and no replay follow. Commands kept working in the observed
   run, and with one replica dispatch uses the in-memory map (INFERRED), so this is a gap for HA and
   multi-replica routing, not for one replica. It is related to #4627 and is not a regression. Signal: a repeating `renew_leases` shortfall
-  warning on the server with no `Registration replay` line on the gateway after the partition heals.
+  warning on the server with no `Registration replay` line on the gateway after the partition heals. The
+  recovery action for that row is NOT tested (restarting the gateway or the agent was not tried).
+- **Known limit (INFERRED from the code, not observed).** While a verdict-seeded (targeted) drip is queued, a
+  breaker-recovery full replay trigger is dropped (the existing in-flight rule), and a targeted replay that is
+  the half open probe closes the breaker without seeding a full replay (`record_result_no_replay` discards
+  it; unit test `breaker_replay_during_targeted_drip_is_dropped`). The server lists only sessions missing
+  from its in-memory map, so a session it still knows whose durable route row was tombstoned is not repaired
+  by a verdict, and before this change a breaker-recovery full replay could have repaired it; now that row
+  waits for the agent's own reconnect. Tracked as a follow-up (no issue yet), together with the entry above.
+- **Upgrade day.** The server is upgraded first, so the server restart that ships this fix meets the old
+  gateway and agents behind it read offline; restart the gateway after upgrading it (a gateway restart
+  reconnects every agent that node holds). Whether restarting only the gateway recovers agents stranded by
+  an earlier server restart was NOT tested.
 - **What it does not promise.** Fleet completion inside a route lease (the drip period is the
   ProxyRegister RPC time plus the spacing, so the time to drain scales with the number of agents), and
   dispatch reachability after the session is adopted (placement converges when the agent's re-sent
   CONNECTED is delivered; a rise in `yuzu_gw_upstream_notify_dropped_total` marks agents that stay
-  acknowledged but unreachable until their next reconnect, a known follow-up). The operator runbook and
-  the load table are in `docs/user-manual/gateway.md`, "What happens when the server restarts".
+  acknowledged but unreachable until their next reconnect; the series has no agent label, and the in-flight
+  notification limit behind it is tracked in #4632). The operator runbook and the load table are in
+  `docs/user-manual/gateway.md`, "What happens when the server restarts". The evidence record (run table,
+  test results, mutation summary, declined ledger obligations, not-tested list) is
+  `docs/security-reviews/gateway-heartbeat-verdict-replay-2026-10-04.md`.
 
 ### 7d. Cross-cluster gateway fan-out — "rest of 4.3" (WS-4, 2026-09-21)
 

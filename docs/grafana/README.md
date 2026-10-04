@@ -65,9 +65,9 @@ Scraped from the gateway's Prometheus endpoint (default `:9568`). Duration histo
 | `yuzu_gw_agent_session_duration_ms` | histogram | Agent session duration in ms |
 | `yuzu_gw_upstream_rpc_duration_ms` | histogram | Upstream (gateway→server) RPC latency in ms, labeled by `rpc_name` |
 | `yuzu_gw_upstream_rpc_errors_total` | counter | Upstream RPC errors, labeled by `rpc_name`, `code` |
-| `yuzu_gw_registration_replay_total` | counter | Replay `ProxyRegister` attempts made by the registration-replay drip, one per agent sent, any outcome |
+| `yuzu_gw_registration_replay_total` | counter | Total registration replay attempts by the drip, any outcome |
 | `yuzu_gw_registration_replay_queue_depth` | gauge | Pending registration-replay entries (queued by an upstream recovery or a heartbeat verdict), labeled by `node` |
-| `yuzu_gw_registration_replay_triggered_total` | counter | Registration replays started, labeled by `trigger` (`breaker`, `heartbeat`; both created at 0 at start) |
+| `yuzu_gw_registration_replay_triggered_total` | counter | Registration replays started, labeled by `trigger` (`breaker`, `heartbeat`; both created at 0 at start). A `breaker` trigger is dropped while a verdict-seeded drip is queued |
 | `yuzu_gw_heartbeat_unknown_truncated_total` | counter | `BatchHeartbeat` responses whose list of unknown sessions the server truncated at 4096 |
 | `yuzu_gw_heartbeat_verdict_dropped_total` | counter | Session ids named by a heartbeat verdict that were not queued for replay, labeled by `reason` (`malformed`, `not_local`, `circuit_open`, `queue_full`; all created at 0 at start) |
 | `yuzu_gw_cluster_peers_resolved` | gauge | Peer addresses found by the cluster-formation redial loop's most recent tick, labeled by `node` (HA WS-4 `#4555`) |
