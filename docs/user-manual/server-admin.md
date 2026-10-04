@@ -5094,6 +5094,27 @@ plain `curl -o out.csv ...` loses the header and the name but not the trailer; `
 out.csv ...` prints the headers. The byte-cap warning is rate-limited per surface (legacy `rest`
 and `rest_v1` each get their own one-a-minute allowance).
 
+**What the counters do not cover.** `yuzu_server_response_export_truncated_total` counts the two
+export routes only. A cut on the execution visualization route, the dashboard results fragment's
+unfiltered read and the TAR retention-paused scan page is NOT counted: the visualization route logs
+a warning naming the cause (not rate-limited), the dashboard fragment and the scan page log
+nothing, and the in-band signal (`result_truncated_by_cap` and `truncation_cause` in the
+visualization payload, the "Partial result" notices on the dashboard, the `result_truncated_by_cap`
+boolean on the scan page's REST and MCP JSON) is the only evidence. If a count is wanted, a sibling
+`..._read_truncated_total{surface,cause}` family is the shape; it does not exist today.
+
+**An export that answers 503 `Sec-Audit-Failed`.** `GET /api/responses/{id}/export` and `GET
+/api/v1/responses/{id}/export` write a `response.read` success row after the store read and before
+any body is built, and fail closed: if that row cannot be persisted, the export answers `503` (A4
+envelope, `retry_after_ms: 5000`, header `Sec-Audit-Failed: true`) and serves no data. A run of
+these after an upgrade means the audit store is unhealthy, not the response store: check
+`/healthz` `stores.audit`, free disk and Postgres connection saturation, and watch
+`yuzu_server_audit_emit_failed_total` (the bundled `YuzuAuditPersistFailures` alert fires on it).
+A failure the audit pipeline reports by THROWING (an allocation failure, for example) is
+answered the same way but is not counted in that metric, so a 503 spike with a flat counter points
+at that case; correlate by the `X-Correlation-Id` on the 503. Scripted consumers of the legacy
+export must treat that `503` as retryable.
+
 **What the bound covers.** The cut is applied inside the store query, so an export holds about 50
 MiB of payload plus one final row while it is fetched. The cap is on whole rows, so the last row
 kept can run past it by up to its own size (each of `output` and `error_detail` is cut to 2 MiB at
@@ -5110,7 +5131,7 @@ routes (`GET /api/v1/responses/{id}`, the legacy `GET /api/responses/{id}`, MCP 
 results fragment's filtered branch (it reads by response id) has no byte bound. The execution
 visualization route, the dashboard results fragment's unfiltered read and the TAR
 retention-paused scan page's read are bounded by the same 50 MiB cap in SQL and say so when it
-cuts (`result_truncated_by_cap`, or a visible "truncated" notice on the dashboard).
+cuts (`result_truncated_by_cap`, or a visible "truncated" notice on the dashboard). The visualization route applies the caller's management-group scope inside that query; the dashboard fragment and the scan page apply it after the fetch, so a confined caller can see a cut notice when every dropped row was outside their scope, and out-of-scope rows can use up the 50 MiB budget that would otherwise reach their own rows.
 Other internal reads also have no byte bound and take their limit from something other than a
 request parameter; for example (not an exhaustive list), the fleet visualization snapshot's collect poll (the number of agents it
 dispatched to, plus 16), the deployment poll (a fixed 50,000), the pre-flight per-check read (a fixed 50,000),
@@ -5130,8 +5151,9 @@ management-group-confined principal, or rate-limit the export routes at the prox
 pool-acquire timeout on a response read surfaces as `503` `response store degraded`.
 
 **Malformed filters.** `yuzu_server_response_param_rejected_total{surface}` counts requests refused
-for a malformed numeric parameter. A steady non-zero rate on one surface is a client sending
-fractional timestamps, `null`s or trailing characters; it is not a server fault.
+for a malformed numeric parameter on the response routes and MCP `query_responses` only. A steady
+non-zero rate on one surface is a client sending fractional timestamps, `null`s or trailing
+characters; it is not a server fault.
 
 ## File Logging
 

@@ -155,6 +155,28 @@ migration is needed. Two new counters report the effect:
 `yuzu_server_response_export_truncated_total{surface,cause}`
 ([Metrics](metrics.md#response-store-metrics)).
 
+## Behaviour change: a cut visualization, results fragment or TAR scan is reported (#4644)
+
+The execution visualization route (`GET /api/v1/executions/{id}/visualization`), the dashboard
+results fragment's unfiltered read and the TAR retention-paused scan page now read through the same
+SQL-side 50 MiB payload cap as the response exports, and say so when it cuts.
+
+- The visualization payload gains `result_truncated_by_cap: true` and `truncation_cause` (`row_cap`
+  or `byte_cap`) on a cut read; `rows_capped` is now exact (it also fired on a read of exactly
+  10,000 rows) and is the row cap only. The dashboard chart card shows a "Partial result" notice.
+- The results fragment shows a "truncated" notice in its result summary.
+- The TAR scan page shows a "Partial result" banner and qualifies its header counts; with no rows in
+  the part that was read, its empty state says it cannot tell, instead of "still in progress" or "all
+  clear". `GET /api/v1/tar/retention-paused` and `list_tar_retention_paused` gain a
+  `result_truncated_by_cap` boolean (always present) and **also set `store_degraded: true` on a cut
+  scan**, so a client that treats `store_degraded` as "the read failed" now sees it for a cut as
+  well: test `result_truncated_by_cap` first to tell the two apart.
+- None of these cuts is counted on a metric (see [Response export bounds](server-admin.md#response-export-bounds)),
+  and the dashboard fragment and the scan page apply management-group scope after the fetch, so a
+  confined caller can see the notice when every dropped row was outside their scope.
+- The filtered results-fragment branch, the plain list routes and the internal reads are not bounded
+  by this change.
+
 ## Operator note: the software-inventory store migration (v7) is a hard cutover (#5172)
 
 Schema v7 of the software-inventory store adds `package_id` and `source` columns and a row id to
