@@ -5,6 +5,10 @@
 %%% An agent whose connection got GOAWAY after its Register subscribes on the
 %%% reconnected channel, so the connection's reservations and pending rows stay
 %%% takeable for the grace and go when it is over, never one timer per row.
+%%% The cases drive the end of a grace by delivering the timer's own message
+%%% (`{timeout, TRef, Conn}') to the registry under a grace of 60000, so no
+%%% assertion depends on how long the machine takes; one case runs a real short
+%%% grace and asserts only after the rows are gone, within a bounded wait.
 %%% Covered:
 %%%   - within the grace the rows of the dead connection are still there and can
 %%%     be taken; another connection's rows are untouched;
@@ -57,6 +61,8 @@ grace_test_() ->
        fun no_rows_no_timer/0},
       {"one timer per dead connection with 100 rows",
        fun one_timer_per_connection/0},
+      {"a real short grace removes the rows (asserted after, within a bounded wait)",
+       fun real_timer_expires_the_rows/0},
       {"a connection that comes back (new process, same agent) is unaffected",
        fun reconnect_unaffected/0},
       {"100 connection cycles leave no monitor and no timer entry",
@@ -133,7 +139,7 @@ takeable_within_grace() ->
     ?assertEqual(Base + 1, monitor_count()).
 
 gone_after_grace() ->
-    start_registry(50),
+    start_registry(60000),
     Dying = conn(),
     Live = conn(),
     Other = conn(),
@@ -146,10 +152,12 @@ gone_after_grace() ->
     ok = yuzu_gw_registry:store_pending(session(21), info(agent(21), Other)),
     %% One taken during the grace: the later removal is a no-op for it.
     kill(Dying),
+    ?assertEqual(ok, wait_until(fun() -> dead_conns() =:= [Dying] end, 5000)),
     ?assertMatch(#{conn_key := Dying}, yuzu_gw_registry:take_pending(session(2))),
-    ?assertEqual(ok, wait_until(fun() -> pending_rows(Dying) =:= [] andalso
-                                         reserved_rows_of(Dying) =:= [] end, 2000)),
-    barrier(),
+    ?assertEqual([session(1), session(3)], lists:sort(pending_rows(Dying))),
+    expire(Dying),
+    ?assertEqual([], pending_rows(Dying)),
+    ?assertEqual([], reserved_rows_of(Dying)),
     ?assertEqual([], dead_conns()),
     ?assertEqual([], index_entries(Dying)),
     ?assertEqual([session(11), session(12)], lists:sort(pending_rows(Live))),
@@ -159,20 +167,22 @@ gone_after_grace() ->
     ?assertEqual(ok, yuzu_gw_registry:store_pending(session(31), info(agent(31), conn()))).
 
 row_stored_during_grace() ->
-    start_registry(300),
+    start_registry(60000),
     Dying = conn(),
     ok = yuzu_gw_registry:store_pending(session(1), info(agent(1), Dying)),
     kill(Dying),
-    ?assertEqual(ok, wait_until(fun() -> dead_conns() =:= [Dying] end)),
+    ?assertEqual(ok, wait_until(fun() -> dead_conns() =:= [Dying] end, 5000)),
     [TRef] = dead_timers(),
     %% A late store for the dead key (an in-flight Register): it is monitored
     %% again, its DOWN fires at once and no second timer starts.
-    Late = yuzu_gw_registry:store_pending(session(2), info(agent(2), Dying)),
-    ?assert(lists:member(Late, [ok, {error, registry_unavailable}])),
+    ?assertEqual(ok, yuzu_gw_registry:store_pending(session(2), info(agent(2), Dying))),
     barrier(),
     ?assertEqual([TRef], dead_timers()),
-    ?assertEqual(ok, wait_until(fun() -> pending_rows(Dying) =:= [] end, 3000)),
-    barrier(),
+    %% The late row is still there (the grace is not over) and goes with the one
+    %% timer, as the first row does.
+    ?assertEqual([session(1), session(2)], lists:sort(pending_rows(Dying))),
+    expire(Dying),
+    ?assertEqual([], pending_rows(Dying)),
     ?assertEqual([], dead_conns()).
 
 grace_zero_is_immediate() ->
@@ -257,10 +267,11 @@ no_rows_no_timer() ->
     ?assertEqual([], dead_conns()),
     ?assertEqual([], index_entries(C)).
 
-%% The registry's receives are traced: a timer per row would deliver a hundred
-%% timeout messages, the timer of the connection delivers one.
+%% The timers the registry starts are counted by tracing its calls of
+%% erlang:start_timer/3: a timer per row would be a hundred, the timer of the
+%% connection is one. The grace is not waited for: its end is delivered.
 one_timer_per_connection() ->
-    start_registry(100),
+    start_registry(60000),
     persistent_term:put(?CAP_KEY, 1000),
     Dying = conn(),
     Other = conn(),
@@ -268,39 +279,64 @@ one_timer_per_connection() ->
      || I <- lists:seq(1, 100)],
     ok = yuzu_gw_registry:store_pending(session(201), info(agent(201), Other)),
     ?assertEqual(100, length(pending_rows(Dying))),
-    Trace = trace_registry(),
-    kill(Dying),
-    ?assertEqual(ok, wait_until(fun() -> dead_conns() =:= [Dying] end)),
-    ?assertEqual(1, length(dead_timers())),
-    ?assertEqual(ok, wait_until(fun() -> pending_rows(Dying) =:= [] end, 3000)),
-    barrier(),
-    ?assertEqual(1, timeouts_received(Trace)),
+    Trace = trace_timer_starts(),
+    try
+        kill(Dying),
+        ?assertEqual(ok, wait_until(fun() -> dead_conns() =:= [Dying] end, 5000)),
+        ?assertEqual(1, length(dead_timers())),
+        expire(Dying),
+        ?assertEqual([], pending_rows(Dying)),
+        ?assertEqual(1, timer_starts_traced(Trace))
+    after
+        stop_trace_timer_starts(Trace)
+    end,
     ?assertEqual([], dead_conns()),
     ?assertEqual([session(201)], pending_rows(Other)).
 
 reconnect_unaffected() ->
-    start_registry(50),
+    start_registry(60000),
     Agent = agent(1),
     Old = conn(),
     ok = yuzu_gw_registry:store_pending(session(1), info(Agent, Old)),
     kill(Old),
+    ?assertEqual(ok, wait_until(fun() -> dead_conns() =:= [Old] end, 5000)),
     New = conn(),
     %% The same agent registers again on the new connection (its Subscribe on the
     %% old session was not answered in time).
     ok = yuzu_gw_registry:store_pending(session(2), info(Agent, New)),
     {ok, NewRef} = yuzu_gw_registry:reserve_session(New, agent(2)),
-    ?assertEqual(ok, wait_until(fun() -> pending_rows(Old) =:= [] end, 2000)),
-    barrier(),
+    expire(Old),
+    ?assertEqual([], pending_rows(Old)),
     ?assertEqual([session(2)], pending_rows(New)),
     ?assertEqual([{reserved, NewRef}], reserved_rows_of(New)),
     ?assertEqual({ok, New}, yuzu_gw_registry:lookup_pending_session(session(2))),
     %% And the new connection is still monitored: its own death is handled.
     kill(New),
-    ?assertEqual(ok, wait_until(fun() -> pending_rows(New) =:= [] andalso
-                                         reserved_rows_of(New) =:= [] end, 2000)).
+    ?assertEqual(ok, wait_until(fun() -> dead_conns() =:= [New] end, 5000)),
+    expire(New),
+    ?assertEqual([], pending_rows(New)),
+    ?assertEqual([], reserved_rows_of(New)).
+
+%% The one case on a real timer: a short grace, asserted only once the rows are
+%% gone, within a bounded wait. Nothing here measures how long the grace took:
+%% that the rows stay until it ends is the 60000 cases' business, where the end is
+%% delivered by hand.
+real_timer_expires_the_rows() ->
+    start_registry(100),
+    Dying = conn(),
+    Other = conn(),
+    [ok = yuzu_gw_registry:store_pending(session(I), info(agent(I), Dying))
+     || I <- lists:seq(1, 3)],
+    ok = yuzu_gw_registry:store_pending(session(21), info(agent(21), Other)),
+    kill(Dying),
+    ?assertEqual(ok, wait_until(fun() -> pending_rows(Dying) =:= [] end, 10000)),
+    barrier(),
+    ?assertEqual([], dead_conns()),
+    ?assertEqual([], index_entries(Dying)),
+    ?assertEqual([session(21)], pending_rows(Other)).
 
 no_leak_after_cycles() ->
-    start_registry(20),
+    start_registry(60000),
     Base = monitor_count(),
     Conns = [begin
                  C = conn(),
@@ -311,9 +347,10 @@ no_leak_after_cycles() ->
              end || N <- lists:seq(1, 100)],
     ?assertEqual(Base + 100, monitor_count()),
     [kill(C) || C <- Conns],
-    ?assertEqual(ok, wait_until(fun() -> lists:all(fun(C) -> pending_rows(C) =:= [] end, Conns) end,
-                                3000)),
-    barrier(),
+    ?assertEqual(ok, wait_until(fun() -> lists:sort(dead_conns()) =:= lists:sort(Conns) end,
+                                10000)),
+    [expire(C) || C <- Conns],
+    ?assertEqual(true, lists:all(fun(C) -> pending_rows(C) =:= [] end, Conns)),
     ?assertEqual(Base, monitor_count()),
     ?assertEqual([], dead_conns()),
     ?assertEqual([], ets:tab2list(yuzu_gw_pending)),
@@ -361,22 +398,27 @@ sweep_and_timer_over_expired_rows() ->
     ?assertEqual([session(21)], pending_rows(Other)).
 
 registry_restart_with_timer() ->
-    start_registry(50),
+    start_registry(60000),
     Dying = conn(),
     ok = yuzu_gw_registry:store_pending(session(1), info(agent(1), Dying)),
     Old = whereis(yuzu_gw_registry),
     kill(Dying),
-    ?assertEqual(ok, wait_until(fun() -> dead_conns() =:= [Dying] end)),
+    ?assertEqual(ok, wait_until(fun() -> dead_conns() =:= [Dying] end, 5000)),
     [TRef] = dead_timers(),
-    start_registry(50),
+    start_registry(60000),
     New = whereis(yuzu_gw_registry),
     ?assertNotEqual(Old, New),
-    %% The old timer fires at a process that is gone: nothing reaches the new one.
-    ?assertEqual(ok, wait_until(fun() -> erlang:read_timer(TRef) =:= false end, 2000)),
+    %% The old timer is aimed at a process that is gone: it cannot reach the new
+    %% one, and the same message sent to it by hand (a stale timeout) finds no
+    %% such connection in its state and does nothing.
+    ?assertEqual([], dead_conns()),
+    New ! {timeout, TRef, Dying},
     barrier(),
+    ?assertEqual(New, whereis(yuzu_gw_registry)),
     ?assertEqual({message_queue_len, 0}, process_info(New, message_queue_len)),
     ?assertEqual([], pending_rows(Dying)),
     ?assertEqual([], dead_conns()),
+    _ = erlang:cancel_timer(TRef),
     ?assertEqual(ok, yuzu_gw_registry:store_pending(session(2), info(agent(2), conn()))).
 
 grace_key_validation() ->
@@ -468,8 +510,40 @@ wait_loop(Pred, Deadline) ->
             end
     end.
 
-%% Trace the messages the registry receives; the count of timer messages is read
-%% from the mailbox of this process.
+%% End the grace of the dead connection Conn the way its timer does: cancel the
+%% real timer and deliver its message. The registry has handled it when this
+%% returns.
+expire(Conn) ->
+    #{Conn := TRef} = element(?ST_DEAD_CONNS, sys:get_state(yuzu_gw_registry)),
+    _ = erlang:cancel_timer(TRef),
+    yuzu_gw_registry ! {timeout, TRef, Conn},
+    barrier().
+
+%% Trace the registry's calls of erlang:start_timer/3 (the BIF is traced with a
+%% global pattern, which is removed again by stop_trace_timer_starts/1). The trace
+%% messages reach this process.
+trace_timer_starts() ->
+    Pid = whereis(yuzu_gw_registry),
+    1 = erlang:trace_pattern({erlang, start_timer, 3}, true, [global]),
+    _ = erlang:trace(Pid, true, [call]),
+    Pid.
+
+stop_trace_timer_starts(Pid) ->
+    _ = erlang:trace(Pid, false, [call]),
+    _ = erlang:trace_pattern({erlang, start_timer, 3}, false, [global]),
+    ok.
+
+timer_starts_traced(Pid) ->
+    drain_timer_starts(Pid, 0).
+
+drain_timer_starts(Pid, N) ->
+    receive
+        {trace, Pid, call, {erlang, start_timer, _}} -> drain_timer_starts(Pid, N + 1)
+    after 0 -> N
+    end.
+
+%% Trace the messages the registry receives; the count of messages is read from
+%% the mailbox of this process.
 trace_registry() ->
     Pid = whereis(yuzu_gw_registry),
     _ = erlang:trace(Pid, true, ['receive']),
