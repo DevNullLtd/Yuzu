@@ -285,7 +285,6 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
      - Design record: `docs/auth-architecture.md`'s "Fourth migration
        (#3789)"; wire reference: `docs/user-manual/rest-api.md`'s
        "Executions" section.
-
    - **2026-09-07 — 8 Settings read-twins (`GET /api/v1/settings/{tls,https,
      gateway,server-config,mcp,data-retention,analytics}` +
      `GET /api/v2/agent/plugin-policy` — its predecessor `/api/v1/agent/
@@ -520,6 +519,16 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        shipped REST/HTMX surface); wire reference:
        `docs/user-manual/rest-api.md`'s Hardware section.
 
+   - **2026-10-04 — `GET /api/v1/network-elements/collector-targets` (ADR-0068 D6/D10, PR
+     #5367; design-only until slice 1).** REST-only, no MCP twin, absent from operator route
+     discovery — a **permanent** exception, not a tracked follow-up: the route's only caller is
+     the network collector (gnmic's HTTP target loader) authenticating as a collector principal,
+     it returns element credentials in the clear, and an MCP twin would be a second
+     secret-egress path with no consumer. The exception relaxes no control — the route is gated
+     on a dedicated engine-principal predicate, fail-closed, all-or-503, audited per fetch — and
+     every operator-facing behaviour of the capability (inventory, state, attachments,
+     registration, credentials write-only) has REST + MCP twins.
+
 ## Interim rules (until the named follow-ups ship)
 
 - **No engine principal class exists** until the auth-architecture follow-up lands. Until then, integrations authenticate as themselves via existing API tokens, and the server accepts **no** on-behalf-of assertion on any surface — any such header/field is rejected, not ignored.
@@ -563,4 +572,4 @@ Maintainer verdicts on mechanism-vs-interpretation disputes, as Decision 2 provi
 
 | Date | Class | Verdict | Raised by |
 |---|---|---|---|
-| 2026-10-03 | **Connectors** — collection of estate facts from an external source that is not an agent daemon (a network element over gNMI, a management system's inventory, a file upload). | **Core (mechanism).** Collecting, normalising and storing the facts is core; exposing them is through the versioned REST/MCP surface; **interpreting** them for a purpose (a service diagram, a scoring) remains engine territory by the existing tiebreakers. Settles the roadmap Phase 9 placement question (`docs/roadmap.md`, owner decision 2026-09-07). | ADR-0068 (network-element connector, gNMI via gnmic) |
+| 2026-10-03 | **Connectors** — collection of **estate facts** from an external source that is not an agent daemon (a network element over gNMI, a management system's inventory, a file upload). An *estate fact* is a fact about the customer's own estate; external **domain data** (vulnerability feeds, threat intelligence, catalogues) is not one and stays engine territory under the tiebreaker above — this verdict does not move it. | **Core (mechanism).** Collecting, normalising and storing the facts is core; exposing them is through the versioned REST/MCP surface; **interpreting** them for a purpose (a service diagram, a scoring) remains engine territory by the existing tiebreakers. Settles the roadmap Phase 9 placement question (`docs/roadmap.md`, owner decision 2026-09-07). | ADR-0068 (network-element connector, gNMI via gnmic); PR #5367 |
