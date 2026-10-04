@@ -1427,10 +1427,15 @@ one core replica a server-only restart now recovers through the replay described
   snapshot; and `max_heartbeat_buffer` now counts sessions, dropping a heartbeat of a new session when full.
   New counters: `yuzu_gw_heartbeat_buffer_dropped_total{reason}` (`buffer_full`, `snapshot_oversize`,
   `snapshot_evicted`, and the later `heartbeat_oversize`, `heartbeat_invalid`, `chunk_rejected`) and
-  `yuzu_gw_heartbeat_coalesced_total`. A later review round added a bounded drop for a heartbeat that cannot be
-  sent (still over the chunk limit without its snapshot, invalid UTF-8, or rejected by the server with a
-  non-transient status) so that one such heartbeat cannot block newer ones, and a flush of at most 8 chunks per
-  cycle; transient failures still keep heartbeats buffered (probed against a fake server, not rig-run). Consequences: the server's
+  `yuzu_gw_heartbeat_coalesced_total`. A later review round added bounded handling for a heartbeat that cannot be
+  sent as it is: one still over the chunk limit without its snapshot (or with more than 512 status tags) is
+  kept without its status tags, one with invalid UTF-8 in a status tag is kept with the bytes replaced, and
+  one rejected by the server with a non-transient status is dropped, so that none of them blocks newer
+  heartbeats or stops a session's lease renewal; the same round added a flush of at most 8 chunks per
+  cycle; transient failures still keep heartbeats buffered (probed against a fake server, not rig-run).
+  A per-connection cap on agent sessions (`max_sessions_per_connection`, default 8, refusals counted in
+  `yuzu_gw_session_limit_rejected_total`) keeps one connection from pushing other agents' snapshots out
+  of a full buffer (probed against a fake upstream, not rig-run). Consequences: the server's
   `yuzu_heartbeats_received_total{via="gateway"}` under-counts while a backlog is coalesced, and an agent's
   topology snapshot can be one agent snapshot cycle older after an eviction. The server's 4 MiB receive
   limit is unchanged and not raised. The post-change rig run (`990e57e48`, 1 to 30 agents, plaintext, debug builds) recovered where the old gateway did not; see the evidence record. Not tested and known limits: 100 or more agents and a backlog that reaches the default byte cap; the
