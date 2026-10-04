@@ -373,11 +373,27 @@ code_change(_OldVsn, State, Data, _Extra) ->
 %% supervisor report): yuzu_gw_crash_redact, the logger primary filter
 %% yuzu_gw_app installs, rewrites those for the processes of this module. It is
 %% NOT in place when this module is used without the application.
+%%
+%% The queued events (`queue', whose head is the "Last event" of a terminate
+%% report) and the postponed ones are reduced to their type: an event can carry
+%% a request. No production sender delivers one to this process; this is the
+%% belt to that braces.
 -spec format_status(map()) -> map().
 format_status(Status) ->
-    maps:map(fun(data, Data) -> redact_data(Data);
-                (_Key, Value) -> Value
+    maps:map(fun(data, Data)         -> redact_data(Data);
+                (queue, Events)      -> redact_events(Events);
+                (postponed, Events)  -> redact_events(Events);
+                (_Key, Value)        -> Value
              end, Status).
+
+%% A gen_statem event is {Type, Content}; only the type is kept.
+redact_events(Events) when is_list(Events) ->
+    [redact_event(E) || E <- Events];
+redact_events(_Other) ->
+    '$redacted'.
+
+redact_event({Type, _Content}) -> {Type, '$redacted'};
+redact_event(_Other)           -> '$redacted'.
 
 %% Shown as a map of the fields (a record with register_req replaced would
 %% violate the field's declared type), the way yuzu_gw_upstream shows its state.
