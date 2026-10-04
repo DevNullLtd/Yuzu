@@ -130,6 +130,8 @@ verdict_replay_test_() ->
         fun rejected_replay_disconnects_without_reannounce/0),
       t("E20 a missing accepted key still means accepted",
         fun missing_accepted_key_is_accepted/0),
+      t("E20 an OK with no response message is a replay failure, not a crash",
+        fun non_map_replay_response_is_a_failure/0),
       t("E21 a second session for an already queued agent is not appended",
         fun second_session_for_a_queued_agent_is_not_appended/0),
       t("E22 queue depth is reported on append and after every step",
@@ -1169,6 +1171,49 @@ rejected_replay_disconnects_without_reannounce() ->
     Expected = <<"line1??line2?[31m??", 16#C3, 16#A9, (binary:copy(<<"y">>, 128 - 20))/binary>>,
     ?assertNotEqual(nomatch, binary:match(Warning2, Expected)),
     ?assertEqual(nomatch, binary:match(Warning2, binary:copy(<<"y">>, 128 - 19))).
+
+%% E20b: an OK with trailers and no DATA frame reaches the replay as a
+%% non-map response. The upstream stays up and the drip goes on; the attempt
+%% is a breaker failure, no agent is disconnected or re-announced, and the
+%% warning names neither the session id nor the body.
+non_map_replay_response_is_a_failure() ->
+    watch(),
+    Pid = whereis(yuzu_gw_upstream),
+    A1 = bind_agent(<<"e20n1">>),
+    S1 = sid(A1),
+    mock_unary(fun(<<"ProxyRegister">>, _Req, Hdr) when Hdr =:= S1 ->
+                       {ok, <<"body-marker">>, #{}};
+                  (M, R, H) -> default_rpc(M, R, H)
+               end),
+    {_, Lines} = capture_logs(fun() ->
+        ok = yuzu_gw_upstream:replay_sessions([sid(A1)]),
+        await(fun() -> replay_hdrs() =/= [] end),
+        await_idle()
+    end),
+    ?assertEqual(Pid, whereis(yuzu_gw_upstream)),
+    ?assertEqual(1, up_get(cb_failures)),
+    ?assertEqual([], disconnects()),
+    ?assertEqual([], reannounces()),
+    [Warning] = [T || {warning, T} <- Lines,
+                      binary:match(T, <<"not a response message">>) =/= nomatch],
+    ?assertEqual(nomatch, binary:match(Warning, sid(A1))),
+    ?assertEqual(nomatch, binary:match(Warning, <<"body-marker">>)),
+    %% The next entry of the same drip still runs after a non-map answer.
+    A2 = bind_agent(<<"e20n2">>),
+    A3 = bind_agent(<<"e20n3">>),
+    S2 = sid(A2),
+    mock_unary(fun(<<"ProxyRegister">>, _Req, Hdr) when Hdr =:= S2 ->
+                       {ok, <<>>, #{}};
+                  (M, R, H) -> default_rpc(M, R, H)
+               end),
+    ok = yuzu_gw_upstream:replay_sessions([sid(A2), sid(A3)]),
+    await(fun() -> lists:member({agent, reannounce, pid(A3), sid(A3)}, agent_calls()) end),
+    await_idle(),
+    ?assertEqual(Pid, whereis(yuzu_gw_upstream)),
+    ?assertEqual([sid(A1), sid(A2), sid(A3)], replay_hdrs()),
+    ?assertEqual([], disconnects()),
+    ?assertEqual([{agent, reannounce, pid(A3), sid(A3)}],
+                 [C || {agent, reannounce, _, _} = C <- agent_calls()]).
 
 %% Mocks return #{} and older callers omit the key: absent means accepted.
 missing_accepted_key_is_accepted() ->

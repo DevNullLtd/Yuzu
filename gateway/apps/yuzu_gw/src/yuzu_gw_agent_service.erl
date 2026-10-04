@@ -37,7 +37,7 @@ register(Ctx, RegisterReq) ->
                         maps:get(<<"x-forwarded-for">>, Headers, <<"unknown">>)),
 
     case yuzu_gw_upstream:proxy_register(RegisterReq) of
-        {ok, Response} ->
+        {ok, Response} when is_map(Response) ->
             %% Stash the session_id and agent_info; the agent process is
             %% created when Subscribe arrives (matched by session_id).
             SessionId = maps:get(session_id, Response,
@@ -62,6 +62,13 @@ register(Ctx, RegisterReq) ->
 
             logger:info("Agent ~s registered, awaiting Subscribe", [AgentId]),
             {ok, Response, Ctx};
+
+        {ok, _NotAMap} ->
+            %% An OK whose message is not a decoded response: the same failure
+            %% as an RPC error, with no body in the log or in the error.
+            logger:warning("Upstream Register failed: answer is not a response message"),
+            {grpc_error, {?GRPC_STATUS_INTERNAL,
+                          <<"Upstream registration failed: malformed response">>}};
 
         {error, Reason} ->
             logger:warning("Upstream Register failed: ~p", [Reason]),

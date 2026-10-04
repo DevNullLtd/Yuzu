@@ -563,7 +563,7 @@ do_replay_one(AgentId, Pid, SessionId, RegisterReq, QueueDepth, State) ->
                                [AgentId, reject_reason_for_log(Response)]),
                 yuzu_gw_agent:disconnect(Pid),
                 record_result_no_replay({ok, Response}, State);
-            {ok, Response} ->
+            {ok, Response} when is_map(Response) ->
                 %% HA WS-4 4.4: the server now ALWAYS adopts the presented
                 %% session on success (never a throwaway fresh mint, see
                 %% gateway_route_store.hpp's FORWARD NOTE) — so
@@ -585,6 +585,14 @@ do_replay_one(AgentId, Pid, SessionId, RegisterReq, QueueDepth, State) ->
                 %% dispatch-unreachable until its next real reconnect.
                 yuzu_gw_agent:reannounce(Pid, AdoptedSession),
                 record_result_no_replay({ok, Response}, State);
+            {ok, _NotAMap} ->
+                %% An OK whose message is not a decoded response (for example
+                %% an OK with trailers and no DATA frame): the server never
+                %% answered the registration, so this is a replay FAILURE like
+                %% an RPC error. Neither the body nor the session id is logged.
+                logger:warning("Registration replay: ~s got an upstream answer that is "
+                               "not a response message", [AgentId]),
+                record_result_no_replay({error, malformed_response}, State);
             {error, {Status, _Message}} when Status =:= ?GRPC_STATUS_FAILED_PRECONDITION ->
                 %% The presented session was superseded by a DIFFERENT, LIVE
                 %% session server-side — a genuine stale/zombie replay, not

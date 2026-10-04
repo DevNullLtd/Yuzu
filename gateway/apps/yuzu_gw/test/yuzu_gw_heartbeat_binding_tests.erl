@@ -89,6 +89,8 @@ binding_test_() ->
        fun lookup_session_contract/0},
       {"Register records the connection key in the pending row",
        fun register_records_conn_key/0},
+      {"Register with an upstream answer that is not a map fails without raising",
+       fun register_non_map_upstream_response/0},
       {"rejections produce a rate-limited summary log with no session id",
        fun rejection_log_is_rate_limited_and_id_free/0},
       {"Register and agent-connected info logs carry no session id",
@@ -580,6 +582,27 @@ register_records_conn_key() ->
     ?assertEqual({ok, conn_a}, yuzu_gw_registry:lookup_pending_session(S)),
     ?assertMatch({ok, _, _}, beat(conn_a, S)),
     ?assertEqual(rejected(), beat(conn_b, S)).
+
+%% An OK from the upstream that is not a decoded response (no DATA frame):
+%% the handler answers INTERNAL like for an RPC error and stores nothing.
+register_non_map_upstream_response() ->
+    A = uid(<<"regnm">>),
+    Req = #{info => #{agent_id => A, hostname => <<"h">>}},
+    [begin
+         ok = meck:expect(yuzu_gw_upstream, proxy_register, fun(_) -> {ok, Bad} end),
+         Result = yuzu_gw_agent_service:register(ctx_with(conn_a), Req),
+         Lines = capture_logs(fun() ->
+             ?assertMatch({grpc_error, {?GRPC_STATUS_INTERNAL, _}},
+                          yuzu_gw_agent_service:register(ctx_with(conn_a), Req))
+         end),
+         ?assertMatch({grpc_error, {?GRPC_STATUS_INTERNAL, _}}, Result),
+         {grpc_error, {_, Message}} = Result,
+         ?assertEqual(nomatch, binary:match(Message, <<"body-marker">>)),
+         ?assertEqual([], [L || L <- Lines, binary:match(L, <<"body-marker">>) =/= nomatch]),
+         ?assertNotEqual([], [L || L <- Lines,
+                                   binary:match(L, <<"not a response message">>) =/= nomatch])
+     end || Bad <- [<<"body-marker">>, [<<"body-marker">>], undefined]],
+    ok.
 
 %%%===================================================================
 %%% Logging
