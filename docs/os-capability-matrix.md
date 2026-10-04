@@ -28,10 +28,10 @@ pre-staged/queryable-empty, not hard-unsupported).
 
 _Last re-verified against code: 2026-07-21 (all rows re-checked against the cited
 sources on the consolidated macOS-parity branch; see [Verification](#verification))._
-_Last hand-updated: 2026-08-24 (network_config native-leg migration). Scope note:
-only the `network_config` rows were re-verified against source on that date — the
-full-matrix re-verification stamp above deliberately still reads 2026-07-21, because
-no other row was re-checked._
+_Last hand-updated: 2026-10-03 (network_config `routes` action; before that 2026-08-24,
+the network_config native-leg migration). Scope note: only the `network_config` rows
+were re-verified against source on those dates — the full-matrix re-verification stamp
+above deliberately still reads 2026-07-21, because no other row was re-checked._
 
 ## Matrix
 
@@ -79,6 +79,7 @@ duplicates.
 | **━━ Live device snapshot ("Get live info") ━━** | | | | Device page dispatch-and-poll snapshot; each kind has its own `device.live.<kind>` audit verb. `docs/user-manual/device-management.md` |
 | **Live — process tree + per-process connections** | ✅ tree + conn join | 🟡 tree; conn join absent | 🟡 tree | `processes/list_tree` (`proc\|pid\|ppid\|name\|sha256\|path`, all OSes) joined by PID to `network_diag/connections` (owning PID via `GetExtendedTcpTable`, Windows). Linux `/proc/net/tcp` exposes inode not pid → no join |
 | **Live — ARP / neighbour table** | ✅ | 🟡 | 🟡 | `network_config/arp`: Windows `GetIpNetTable2`; Linux `/proc/net/arp` — constrained: IPv4 ARP only, no IPv6 neighbours (those live in `RTM_GETNEIGH`), and non-Ethernet and incomplete (non-`ATF_COM`) entries are skipped; macOS PF_ROUTE `RTF_LLINFO` sysctl, de-duplicated — constrained because that dump carries no interface name or static/dynamic type, both emitted as `-` |
+| **Live — routing table** | 🟡 | 🟡 | 🟡 | `network_config/routes`: Windows `GetIpForwardTable2` — constrained: the host's own and broadcast addresses and the multicast prefixes are not reported, and the metric is the route metric without the interface metric; Linux rtnetlink `RTM_GETROUTE` (AF_UNSPEC) — constrained: main and custom tables, IPv4 and IPv6, with the local table, cloned entries and host-local route types skipped, a multipath route reporting its first nexthop only and an `ip nexthop` object route carrying no resolved gateway (both flagged in the result status); macOS PF_ROUTE `NET_RT_DUMP` — constrained: no route metric or table id (`-`), origin only the static/dynamic bit, neighbour, cloned, multicast, broadcast and own-address entries skipped |
 | **Live — DNS resolver cache** | ✅ | ⛔ (no portable resolver cache) | ⛔ (OS exposes no resolver-cache contents; `dscacheutil -cachedump` defunct on macOS 26) | `network_config/dns_cache` (`DnsGetCacheDataTable` on Windows; macOS returns an honest `dns_cache\|unsupported` sentinel, no shell-out — see `darwin-compat.md`) |
 | **Live — disk space** | ✅ | ✅ | ✅ | `disk_space` plugin `free` action; `GetDiskFreeSpaceExW` on Windows, `statvfs` on POSIX |
 | **Live — Wi-Fi current connection** | ✅ | 🟡 | 🟡 | `wifi/connected` — Win `WlanQueryInterface`, Linux NetworkManager D-Bus (sd-bus) with `nmcli`/`iwconfig` argv fallbacks, macOS `wifi_corewlan.mm` `corewlan_current_connection` (CoreWLAN `CWWiFiClient`/`CWInterface`, first `.mm` TU; pure `format_connected_record` in `wifi_corewlan.hpp`). Linux 🟡: the D-Bus rung is declared `constrained` — it has not been exercised against a real Wi-Fi radio, and it reports the device interface rather than the NetworkManager profile name in the connection column. macOS 🟡: association/RSSI/channel/security read, but SSID/BSSID are withheld from a background daemon by Location Services on 14+ (`<ssid-withheld>`) — replaces the dead `airport -I` path |
@@ -127,7 +128,7 @@ duplicates.
 | netprobe | ✅ | ✅ | ✅ | `_WIN32` vs POSIX portable sockets |
 | netstat | ✅ | ✅ | ✅ | linux/apple/win branches. `attribution` action additionally resolves the owning process's name/path (folds the retired sockwho plugin in, #3403) |
 | network_actions | ✅ | ✅ | ✅ | win/linux/apple branches. macOS `flush_dns` runs both `dscacheutil -flushcache` **and** `killall -HUP mDNSResponder` (the load-bearing reset), honest status from real exit codes (`network_actions_plugin.cpp`) |
-| network_config | ✅ | ✅ | ✅ | win/linux/apple throughout, no `/bin/sh` on any leg. Linux rtnetlink + `/proc/net/arp`; macOS getifaddrs + `SIOCGIFMEDIA` link speed + PF_ROUTE + SCDynamicStore. `arp` is now live on Linux and macOS; `dns_cache` stays an honest `unsupported` sentinel on macOS (`network_config_plugin.cpp`) |
+| network_config | ✅ | ✅ | ✅ | win/linux/apple throughout, no `/bin/sh` on any leg. Linux rtnetlink + `/proc/net/arp`; macOS getifaddrs + `SIOCGIFMEDIA` link speed + PF_ROUTE + SCDynamicStore. `arp` is now live on Linux and macOS; `routes` reports the full routing table on all three OSes at rung 1 (constrained on each, see the routing-table row); `dns_cache` stays an honest `unsupported` sentinel on macOS (`network_config_plugin.cpp`) |
 | network_diag | ✅ | ✅ | ✅ | win/linux/apple all implemented |
 | os_info | ✅ | ✅ | ✅ | linux/apple/win branches |
 | peripherals | ✅ | ✅ | ✅ | USB/PCI/Thunderbolt bus inventory. macOS + Linux full (IOKit / sysfs, both rung 1). Windows: usb/pci full via SetupAPI (`SetupDiGetClassDevsW` + `SPDRP_HARDWAREID`/`COMPATIBLEIDS`), rung 1; thunderbolt constrained — string-heuristic identification (DEVICEDESC contains Thunderbolt/USB4), no dedicated Thunderbolt device class in SetupAPI, same constrained shape as the Linux leg |
@@ -542,6 +543,9 @@ implementation is.
 | network_config | arp | linux | constrained | 1 | /proc/net/arp | IPv4 ARP entries only; /proc/net/arp carries no IPv6 neighbours (they live in the RTM_GETNEIGH table), and non-Ethernet or incomplete entries are not reported |
 | network_config | arp | macos | constrained | 1 | PF_ROUTE sysctl RTF_LLINFO | ip and mac only; the interface name and static/dynamic type are not carried by the RTF_LLINFO dump and are emitted as '-' |
 | network_config | arp | windows | supported | 1 | GetIpNetTable2 | - |
+| network_config | routes | linux | constrained | 1 | rtnetlink RTM_GETROUTE (AF_UNSPEC) | main and custom routing tables, IPv4 and IPv6; the local table, cloned entries and host-local route types are not reported; a multipath route reports its first nexthop only and an `ip nexthop` object route carries no resolved gateway (both flagged in the result status) |
+| network_config | routes | macos | constrained | 1 | PF_ROUTE sysctl NET_RT_DUMP | IPv4 and IPv6; macOS has no route metric or table id, so those fields are '-', and the origin is only the RTF_STATIC bit (static, which also covers connected-interface routes), else RTF_DYNAMIC/RTF_MODIFIED (dynamic), else other; entries flagged as neighbour (RTF_LLINFO), cloned, multicast, broadcast or own-address (RTF_LOCAL) are not reported (the limited-broadcast 255.255.255.255/32 route carries none of those flags and is); interface-scoped routes (RTF_IFSCOPE) are listed like any other |
+| network_config | routes | windows | constrained | 1 | GetIpForwardTable2 | IPv4 and IPv6; the host's own and broadcast addresses (Protocol Local, full-length prefix) and the multicast prefixes are not reported, connected-subnet routes are; the metric is the route metric alone, without the interface metric |
 | network_diag | listening | linux | supported | 1 | /proc/net/tcp[6] | - |
 | network_diag | listening | macos | supported | 1 | libproc | a socket shared by more than one process (SO_REUSEPORT, prefork) surfaces under one arbitrarily-chosen owning PID, not one row per owner |
 | network_diag | listening | windows | supported | 1 | GetExtendedTcpTable | - |

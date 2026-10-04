@@ -164,7 +164,10 @@ FRAGMENT_FILES = [
 # local_security_policy's `sudoers` action (+1, Medium risk tier) on top of that 228: the total is
 # 229, re-derived by running parse_fragment_gate_rows over FRAGMENT_FILES, not by adding to a
 # baseline.
-EXPECTED_TOTAL_ROWS = 229
+# Wave 11 PR11.2-a: +1 network_config.routes (ReadOnly, Infrastructure:Read, gate None) on top of
+# 229 = 230, re-derived by running parse_fragment_gate_rows over FRAGMENT_FILES (the test's own
+# count), not by adding to a baseline. Fragment C is now 35 rows.
+EXPECTED_TOTAL_ROWS = 230
 
 # Decision 1 (#1398 design doc): the ONLY prefixes a content-declared pair
 # with no catalogue row may carry — server-side handlers with no
