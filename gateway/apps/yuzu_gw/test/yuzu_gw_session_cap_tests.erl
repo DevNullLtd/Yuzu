@@ -83,7 +83,11 @@ cap_test_() ->
       {"a reservation held is the admission, one that is gone is checked",
        fun reservation_is_the_admission/0},
       {"the registry dying between the row and its commit answers registry_unavailable, no crash",
-       fun registry_dies_before_commit/0}
+       fun registry_dies_before_commit/0},
+      {"two rows of one agent, committed in either order, leave one row and a commit of a gone row answers an error",
+       fun commit_orders_leave_one_row/0},
+      {"2 and 20 concurrent Registers of one agent id leave exactly one pending row, 200 times",
+       {timeout, 120, fun concurrent_same_agent_registers_leave_one_row/0}}
      ]}.
 
 setup() ->
@@ -628,6 +632,86 @@ registry_dies_before_commit() ->
     after
         meck:unload(yuzu_gw_safe_call)
     end.
+
+%% Two rows of one agent id on one connection (the two Registers' rows are
+%% stored, then the registry commits them one at a time): in every order of
+%% commits, and for rows stamped apart or in the same millisecond, exactly one row
+%% is left, at least one commit answers ok, a commit answering ok is for a row
+%% that is there, and a row newer than the committing one is never removed by it.
+commit_orders_leave_one_row() ->
+    T = erlang:monotonic_time(millisecond),
+    Cases = [{Order, Stamps} || Order <- [[1, 2], [2, 1]],
+                                Stamps <- [{T, T + 1}, {T, T}]],
+    lists:foreach(fun({Order, {T1, T2}}) ->
+        C = conn(),
+        A = agent(1),
+        Sessions = #{1 => session(1), 2 => session(2)},
+        {ok, R1} = yuzu_gw_registry:reserve_session(C, A),
+        {ok, R2} = yuzu_gw_registry:reserve_session(C, A),
+        Refs = #{1 => R1, 2 => R2},
+        true = ets:insert(yuzu_gw_pending, {session(1), info(A, C), T1}),
+        true = ets:insert(yuzu_gw_pending, {session(2), info(A, C), T2}),
+        Replies = [{I, gen_server:call(yuzu_gw_registry,
+                                       {commit_pending, maps:get(I, Sessions), C, A,
+                                        maps:get(I, Refs)})}
+                   || I <- Order],
+        %% The caller of a commit that answered an error releases its reservation.
+        [yuzu_gw_registry:release_session(R) || R <- maps:values(Refs)],
+        Left = pending_rows(C),
+        ?assertEqual(1, length(Left), {Order, T1, T2, Replies}),
+        ?assertEqual([], reserved_rows()),
+        [Survivor] = Left,
+        %% A commit that answered ok is for a row that is there at its end or was
+        %% replaced by a later commit, never a row that was not there.
+        ?assert(lists:member(ok, [R || {_, R} <- Replies]), {Order, Replies}),
+        [?assertEqual({error, registry_unavailable}, R)
+         || {I, R} <- Replies, R =/= ok, maps:get(I, Sessions) =/= Survivor],
+        case T1 =:= T2 of
+            %% Stamped apart: the newer row survives whatever the order.
+            false -> ?assertEqual(session(2), Survivor);
+            %% The same stamp: the commit handled first removes the other.
+            true  -> ?assertEqual(maps:get(hd(Order), Sessions), Survivor)
+        end,
+        %% Nothing is left to leak into the next case.
+        ets:delete(yuzu_gw_pending, Survivor)
+    end, Cases),
+    %% A commit whose row was never stored (the registry restarted since, or the
+    %% row was superseded) changes nothing: another agent's row stays.
+    C2 = conn(),
+    true = ets:insert(yuzu_gw_pending, {session(7), info(agent(7), C2), T}),
+    ?assertEqual({error, registry_unavailable},
+                 gen_server:call(yuzu_gw_registry,
+                                 {commit_pending, session(8), C2, agent(8), undefined})),
+    ?assertEqual([session(7)], pending_rows(C2)).
+
+%% N Registers of one agent id on one connection stored at once, 200 rounds each
+%% for N = 2 and N = 20: after the last reply exactly one pending row is left, it
+%% is the row of a caller that was answered ok, and every other caller was
+%% answered the fixed error. Before the commit checked its own row, two commits
+%% each removed the other's row and both answered ok with no row left.
+concurrent_same_agent_registers_leave_one_row() ->
+    Parent = self(),
+    Agent = agent(1),
+    lists:foreach(fun({N, Round}) ->
+        C = conn(),
+        Id = fun(I) -> iolist_to_binary(["capsession-c", integer_to_list(N), "-",
+                                         integer_to_list(Round), "-", integer_to_list(I)]) end,
+        Pids = [spawn_link(fun() ->
+                    receive go -> ok end,
+                    Parent ! {done, I, yuzu_gw_registry:store_pending(Id(I), info(Agent, C))}
+                end) || I <- lists:seq(1, N)],
+        [P ! go || P <- Pids],
+        Results = [receive {done, I, R} -> {I, R} after 5000 -> error(timeout) end
+                   || _ <- Pids],
+        Left = pending_rows(C),
+        ?assertEqual(1, length(Left), {N, Round, Results}),
+        [Survivor] = Left,
+        [Winner] = [I || {I, _} <- Results, Id(I) =:= Survivor],
+        ?assertEqual(ok, proplists:get_value(Winner, Results)),
+        ?assert(lists:all(fun({_, R}) -> R =:= ok orelse R =:= {error, registry_unavailable} end,
+                          Results), Results),
+        ?assertEqual([], reserved_rows())
+    end, [{N, Round} || N <- [2, 20], Round <- lists:seq(1, 200)]).
 
 %%%===================================================================
 %%% Helpers

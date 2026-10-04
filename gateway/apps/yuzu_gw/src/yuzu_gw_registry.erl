@@ -45,9 +45,12 @@
 %%% registration is proxied upstream, so N concurrent Registers on a connection
 %%% admit at most the cap and the rest are refused with nothing sent to the
 %%% server. store_pending/3 then makes the reservation the pending row in one
-%%% call to this process (commit_pending), which also supersedes the agent's older
-%%% pending rows there, so concurrent same-agent Registers end with exactly one
-%%% pending row (the last one handled). The reservation is released by the caller
+%%% call to this process (commit_pending), which also supersedes the agent's rows
+%%% stored at or before it there, so concurrent same-agent Registers end with
+%%% exactly one pending row (the last one handled). A commit whose own row is gone
+%%% (superseded, or the registry restarted since the insert) answers
+%%% {error, registry_unavailable} and changes nothing, so no caller is told ok for
+%%% a row that is not there. The reservation is released by the caller
 %%% when the proxied Register fails (release_session/1) and by the TTL sweep when
 %%% the caller died; a stored pending row is released by Subscribe or its TTL.
 %%%
@@ -517,7 +520,7 @@ list_agents(Limit, Cursor) ->
 %% `undefined'): the row then takes the slot the reservation holds, with no
 %% second count. Without one the connection's slot is reserved here, so a
 %% caller that did not reserve is still refused over the cap. Either way the
-%% pending rows of the same agent id on the same connection that are older than
+%% pending rows of the same agent id on the same connection that are not newer than
 %% this one are removed (see the module doc, part 2), and the reservation is
 %% consumed. A row with no connection key is stored as is: it is never counted.
 %%
@@ -786,22 +789,32 @@ handle_call({reserve_session, ConnKey, AgentId}, _From, State) ->
     {reply, Reply, State};
 
 handle_call({commit_pending, SessionId, ConnKey, AgentId, Ref}, _From, State) ->
-    %% The pending row is already stored. A live reservation is the admission:
-    %% consumed, not checked again (the connection may hold one row more than the
-    %% cap by now through rows that count twice, and the proxied Register must
-    %% not be left without its row). Without one (swept after its TTL, or
-    %% released) the cap is checked here and a refusal removes the row.
-    Reply = case take_reservation(Ref) of
-        true ->
-            supersede_pending(ConnKey, AgentId, SessionId);
-        false ->
-            case session_admission(ConnKey, AgentId) of
-                ok ->
-                    supersede_pending(ConnKey, AgentId, SessionId);
-                {error, session_limit} = Refused ->
-                    ets:delete(?PENDING_TABLE, SessionId),
-                    Refused
-            end
+    %% The pending row is already stored, and it must still be there: a commit
+    %% finds its own row gone when a later commit of the same agent id superseded
+    %% it, when the table was replaced by a restart between the insert and this
+    %% call, or when the caller timed out and this is the late call. It then
+    %% answers the fixed error and changes nothing, so a row never reads as
+    %% committed that is not there. A live reservation is the admission: consumed,
+    %% not checked again (the connection may hold one row more than the cap by
+    %% now through rows that count twice, and the proxied Register must not be
+    %% left without its row). Without one (swept after its TTL, or released) the
+    %% cap is checked here and a refusal removes the row.
+    Reply = case ets:lookup(?PENDING_TABLE, SessionId) of
+        [{_, _, StoredAt}] ->
+            case take_reservation(Ref) of
+                true ->
+                    supersede_pending(ConnKey, AgentId, SessionId, StoredAt);
+                false ->
+                    case session_admission(ConnKey, AgentId) of
+                        ok ->
+                            supersede_pending(ConnKey, AgentId, SessionId, StoredAt);
+                        {error, session_limit} = Refused ->
+                            ets:delete(?PENDING_TABLE, SessionId),
+                            Refused
+                    end
+            end;
+        [] ->
+            {error, registry_unavailable}
     end,
     {reply, Reply, State};
 
@@ -947,14 +960,20 @@ take_reservation(Ref) ->
     end.
 
 %% A Register of AgentId on ConnKey replaces its older pending rows there, as the
-%% live insert replaces the live row: only SessionId's row stays. Run in this
-%% process after each caller stored its row, so when concurrent Registers of one
-%% agent id all commit, the last one handled is the one left. Reservation rows
-%% (keys that are not binaries) are other Registers still in flight: left alone.
-supersede_pending(ConnKey, AgentId, SessionId) ->
+%% live insert replaces the live row: the rows of the agent stored at or before
+%% SessionId's own row (StoredAt) are removed, so a row stored after it, whose own
+%% commit may not have run yet, is never removed by this one. Run in this process
+%% after each caller stored its row, so when concurrent Registers of one agent id
+%% all commit, the row of the last one handled is the one left: of two rows, the
+%% commit handled first removes the other only if it is not newer, and the commit
+%% of a row that is gone answers an error instead of reporting a row that is not
+%% there. Reservation rows (keys that are not binaries) are other Registers still
+%% in flight: left alone.
+supersede_pending(ConnKey, AgentId, SessionId, StoredAt) ->
     _ = ets:select_delete(?PENDING_TABLE,
-                          [{{'$1', #{conn_key => ConnKey, agent_id => AgentId}, '_'},
-                            [{is_binary, '$1'}, {'=/=', '$1', {const, SessionId}}],
+                          [{{'$1', #{conn_key => ConnKey, agent_id => AgentId}, '$2'},
+                            [{is_binary, '$1'}, {'=/=', '$1', {const, SessionId}},
+                             {'=<', '$2', StoredAt}],
                             [true]}]),
     ok.
 
