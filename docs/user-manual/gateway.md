@@ -519,8 +519,9 @@ operator.
 The router clamps the `timeout_seconds` of a `SendCommand` request to 1 to 3600
 seconds. A missing, non-positive or non-integer value uses the application env key
 `default_command_timeout_s` (valid 1 to 3600), and 300 seconds when that key is
-unset or invalid. The key is validated once, and an invalid value logs at most one
-warning per minute. A `SendCommand` that arrives on the management API while the
+unset or invalid. The key is read by the router each time a command arrives with no
+timeout of its own, and an invalid value logs at most one warning per minute per
+router process (a restarted router can warn again at once). A `SendCommand` that arrives on the management API while the
 router process is unavailable (for example during its restart) is answered with
 gRPC `UNAVAILABLE` (14); it used to be answered `INTERNAL`. The warning in the
 gateway log is the existing safe-call limiter's warning, at most one per second per
@@ -723,19 +724,25 @@ cycle, also fixed; the rest stays buffered for the next cycle. A heartbeat large
 than the chunk limit after its snapshot is removed, or whose status tags exceed the
 tag bounds (about 64 KiB for one key or value, about 256 KiB in total), is kept
 without its status tags and counted (`reason="heartbeat_oversize"`, see "Heartbeat
-Batching"). Size the byte cap for the largest backlog you want to
+Batching"). The bound is checked before the UTF-8 repair walk runs. What a stock
+agent sends is far below it: at most 8 tags per plugin with a key suffix of at most
+32 characters and a value of at most 64 bytes (read from
+`agents/core/src/plugin_heartbeat_tags.hpp`), so about 70 KiB for 50 plugins
+(arithmetic), plus about 25 `yuzu.*` tags and one list-valued tag of a few KiB. Size the byte cap for the largest backlog you want to
 survive: each session's entry can carry a snapshot of several hundred KB (observed
 on one rig, see "Known limits" below), so 64 MiB holds roughly 80 to 330 such
 snapshots at once (arithmetic on the default and the observed 200 to 800 KB range,
 not measured). See
 [Heartbeat Batching](#heartbeat-batching).
 
-**Per-connection session cap** (an application env key; set it in the `yuzu_gw`
-section of `sys.config`):
+**Per-connection session cap** (application env keys; set them in the `yuzu_gw`
+section of `sys.config`; both are read once, when the registry process starts, so
+a change needs a gateway restart):
 
 | Key | Default | Valid range | Meaning |
 |---|---|---|---|
-| `max_sessions_per_connection` | 8 | 1 to 1000 | Most session rows (pending, meaning registered and not yet subscribed, plus live) one gRPC connection may hold. The one live row that a registration would supersede (the same agent re-registering on this connection) is not counted, and a repeated `Register` of the same agent id on the same connection supersedes that agent's older pending rows, so the same agent repeating `Register` does not accumulate rows. The slot is reserved atomically when a `Register` is admitted, before it is proxied to the server, so N concurrent `Register` calls on one connection admit at most the cap and nothing beyond it is proxied; the reservation is released if the proxied `Register` fails or is not accepted, and by the pending time to live if the process that holds it dies. Over the cap, a `Register` or `Subscribe` is refused with gRPC `UNAVAILABLE` (14), counted in `yuzu_gw_session_limit_rejected_total`, and logged as a warning at most once per second that names only the cap. A value outside the range falls back to the default and logs one warning that names the key. The key is read once, when the registry process starts: a change needs a gateway restart. |
+| `max_sessions_per_connection` | 8 | 1 to 1000 | Most session rows one gRPC connection may hold. The count is the live rows plus one pending-side row per agent (a pending row, meaning registered and not yet subscribed, or a reservation, see below), leaving out the agent that is registering: an agent's own rows never count against it. So a connection holds at most the cap plus one rows (the registering agent keeps its live row until its `Subscribe` replaces it). A slot is reserved inside the registry process, which handles one call at a time, when a `Register` is admitted and before it is proxied to the server, so N concurrent `Register` calls on one connection admit at most the cap and nothing beyond it is proxied. The reservation row is turned into the pending row by a commit step once the server accepted the registration; it is released if the proxied `Register` fails or is not accepted, and a handler that is killed while its `Register` is proxied leaves a reservation that the pending time to live (120 s, swept every 60 s) removes. Over the cap, a `Register` or `Subscribe` is refused with gRPC `UNAVAILABLE` (14), counted in `yuzu_gw_session_limit_rejected_total`, and logged as a warning at most once per second that names only the cap. A value outside the range falls back to the default and logs one warning that names the key. |
+| `dead_connection_grace_ms` | 15000 | 0 to 120000 | How long the reserved and pending rows of a connection that went down stay takeable. The registry monitors each connection once; when it goes down its rows are not dropped at once, so that a `Subscribe` on a reconnected channel can still take a pending session after the connection was closed with a GOAWAY. Without the grace, a released agent v0.13.0 or v0.14.0-rc6 would be answered `NOT_FOUND` and wedge (INFERRED from bug #2182, see "Agent dependency"; not run for this key). When the grace has passed, all of that connection's reserved and pending rows are deleted, so a client that reconnects over and over neither starts again below the cap nor leaves its stored registration requests to wait for the time to live. `0` drops them at once. A value outside the range falls back to the default and logs one warning that names the key. |
 
 The cap exists so that one connection cannot hold many pending sessions with large
 snapshots and, while the upstream is not draining the heartbeat buffer, push other
@@ -748,25 +755,60 @@ deployments sit at 1 of 8 and the default is not expected to matter for the
 supported topologies. An L4 balancer or proxy that multiplexes several agents onto
 one HTTP/2 connection to the gateway would reach the cap, and those agents would be
 answered `UNAVAILABLE`; the operator raises the key (an HTTP/2-terminating proxy is
-already unsupported, see "Supported topologies"). Live sessions are counted per
-connection in an index and pending sessions by a scan of the pending table. The
-count is released on every path that ends a session: deregister, supersede, a
-session process that died, a pending session taken by `Subscribe`, and the pending
-time to live (120 s). The check and the reservation of the slot are one atomic step
-in the registry, so concurrent `Register` calls cannot pass the check together. Two
-independent security reviews found two gaps in an earlier form of the cap, both with
-probes against the real application and a fake upstream, not on a rig. First, the
-same agent id repeating `Register` without `Subscribe` stored unlimited pending
-sessions (OBSERVED: 40 accepted with a cap of 8; 150 `Register` calls with 3.5 MB
-payloads held 510 MiB until the 120 s pending time to live). Second, the early check
-was not atomic with the step that stores the pending session (OBSERVED: with 200
-concurrent `Register` calls, about 121 passed the check and were proxied to the
-server while 8 pending rows were stored, so about 113 server sessions per burst
-never subscribed). Both are fixed as described above. Limits of what was verified:
-the fixed cap was checked by eunit, dialyzer, Common Test and scratch probes against
-a fake upstream (as reported by the code author), not on a rig and not with real
-agents near the cap, and the default of 8 is a chosen value, not one derived from
-fleet data.
+already unsupported, see "Supported topologies").
+
+Both counts come from per-connection indexes that only the registry process writes,
+so a count costs the rows of that connection, never a scan of the pending table.
+The count is released on every path that ends a session: deregister, supersede, a
+session process that died, a pending session taken by `Subscribe`, the pending time
+to live (120 s), and a connection that went down (after the grace above).
+
+A repeated `Register` of the same agent id on the same connection leaves exactly
+one committed pending row: the one with the newest stamp (of equal stamps, the last
+commit handled). A `Register` whose commit finds its own row already gone, or a
+newer committed row of the same agent, is answered `INTERNAL` (13, "registry
+unavailable", with the gateway warning `Register failed: registry_unavailable`) and
+leaves no row of its own; the agent registers again (INFERRED: after about 2 s, from
+the agent's reconnect wait). The server may hold a session for that refused
+`Register` that nobody subscribes to (INFERRED from the code).
+
+Review history. Two independent security reviews found two gaps in an earlier form
+of the cap, both with probes against the real application and a fake upstream, not
+on a rig. First, the same agent id repeating `Register` without `Subscribe` stored
+unlimited pending sessions (OBSERVED: 40 accepted with a cap of 8; 150 `Register`
+calls with 3.5 MB payloads held 510 MiB until the 120 s pending time to live).
+Second, the early check was not atomic with the step that stores the pending
+session (OBSERVED: with 200 concurrent `Register` calls, about 121 passed the check
+and were proxied to the server while 8 pending rows were stored, so about 113
+server sessions per burst never subscribed). The later review rounds found three
+more, all fixed in this change: two `Register` calls of one agent id that committed
+together could leave no pending row (fixed by the commit rule above); the pending
+rows of a closed connection stayed until the time to live (fixed by the grace);
+and counting pending rows scanned the whole pending table (fixed by the
+per-connection index).
+
+OBSERVED on a rig (pass 5, build `e3cf6b38a`, default cap 8, one probe connection,
+20 real agents live): 9 distinct agent ids registered one after the other, the
+first 8 accepted and the 9th refused `UNAVAILABLE`, and after the 8 sessions were
+closed the cap was reached again exactly (no leaked slot); the same agent id
+registering 40 and then 120 times with a 1 MiB payload each left one pending row
+at every sample; 200 concurrent `Register` calls with distinct ids on one
+connection admitted 8, refused 192, and 8 of them reached the server (the same
+probe on the previous code, `ab01f4f2f`, admitted 8 but let 153, 157 and 153
+through to the server in three runs). The pending index, the same-agent commit
+rule and the grace (commits after `e3cf6b38a`) were checked by eunit, dialyzer,
+Common Test and scratch probes against a fake upstream, NOT run on a rig.
+
+Residuals, stated as they are: (1) a handler that dies between inserting its
+pending row and committing it leaves one row with no index entry; it is not
+counted by itself (its reservation is), and the pending time to live sweep removes
+it. (2) A reserve call that times out at 5 s can leave a reservation until the time
+to live. (3) The live insert can be refused in the brief gap between `Subscribe`
+taking the pending row and the live insert, because a slot is free for a moment and
+another `Register` can take it; the agent retries (INFERRED: about 2 s later) and no
+proxied `Register` is left without a pending row. (4) Behaviour with real agents
+near the cap and with an L4 forwarder multiplexing agents was not run, and the
+default of 8 is a chosen value, not one derived from fleet data.
 
 **Circuit breaker tuning** (the breaker the replay and the other upstream calls
 share; read once when the upstream client starts, not range-checked, and each key
@@ -1036,7 +1078,8 @@ agent build that re-registers by itself; released agents do not (see
 | gateway | metric | `yuzu_gw_registration_replay_triggered_total{trigger="breaker"}` rising | The circuit breaker closed after an outage and the gateway replayed every agent this node holds. Expected after a long outage when the breaker opened (see "Several agents and a long outage" below). No action. |
 | gateway | metric | `yuzu_gw_heartbeat_coalesced_total` rising | Newer heartbeats of a session are replacing older buffered ones, one at a time. Expected during a server outage: heartbeats pile up between failed flushes and are merged, so the buffer stays at one entry per session. No action. The server's `yuzu_heartbeats_received_total{via="gateway"}` falls short of the number of heartbeats the agents sent for the same reason; that is not a loss of agents. |
 | gateway | metric | `yuzu_gw_heartbeat_buffer_dropped_total{reason}` rising | The buffer is under pressure, typically after a long server outage. `snapshot_evicted`: older snapshots were dropped to stay under `max_heartbeat_buffer_bytes`, oldest first. `buffer_full`: the buffer held `max_heartbeat_buffer` sessions and a heartbeat of a new session was dropped, or it was still over `max_heartbeat_buffer_bytes` with no snapshot left and its oldest whole session was dropped. `snapshot_oversize`: one heartbeat larger than about 3 MiB was sent without its snapshot (see "Known limits" below for the agent side). `heartbeat_oversize`: a heartbeat still larger than about 3 MiB after its snapshot was removed, or with more than 512 status tags, or with a status tag key or value over about 64 KiB or more than about 256 KiB of tag bytes in total (checked before the UTF-8 repair, so such a heartbeat costs no repair work), lost all of its status tags and was forwarded without them. `heartbeat_invalid`: a heartbeat with a status tag that was not valid UTF-8 was forwarded with the invalid bytes replaced by replacement characters. The reason also counts tags removed because a tag was not a binary and a heartbeat dropped for a bad or empty session id (see "Heartbeat Batching"). `chunk_rejected`: one heartbeat that the server rejected with a non-transient status (for example `RESOURCE_EXHAUSTED`) was dropped so that it does not block newer heartbeats. `heartbeat_oversize` and `heartbeat_invalid` mean an agent, or a plugin on it, sent oversized or invalid status tags: only the tags of those heartbeats are lost or repaired, and liveness is unaffected because the heartbeat itself is forwarded and the session keeps renewing its lease. `chunk_rejected` means the server refused one heartbeat, which is lost; the agent sends the next on its own interval. The metric has no agent label, so identify the agent from the gateway log or debug log if one names it, and upgrade or fix that agent or the plugin that produces the tags; no other action is needed. Transient server trouble (server unreachable, timeouts) does not lose heartbeats: they stay buffered. The data lost for the first three reasons is only older heartbeat state, which the agents refresh on their own interval. No action unless `buffer_full`, `snapshot_oversize` or `snapshot_evicted` keeps rising after the server is back; if it does, check that the server is reachable and answering `BatchHeartbeat` (`yuzu_gw_upstream_rpc_errors_total{rpc_name}`), and consider raising `max_heartbeat_buffer_bytes` or `max_heartbeat_buffer` if your fleet is larger than the defaults assume. Do not restart the gateway for this: a restart disconnects every agent the node holds. |
-| gateway | metric | `yuzu_gw_session_limit_rejected_total` rising | A `Register` or `Subscribe` was refused because one gRPC connection already holds `max_sessions_per_connection` agent sessions (default 8). A stock agent holds one session per connection (INFERRED), so a rise means an L4 balancer, forwarder or client is carrying several agents on one connection (see "Per-connection session cap" under Configuration). The refused call is answered `UNAVAILABLE` and the agent retries. If the topology is legitimate, raise the key in `sys.config`; the key is read once when the registry starts, so the change needs a gateway restart, which disconnects every agent the node holds, so plan it. The metric has no agent label. |
+| gateway | metric | `yuzu_gw_session_limit_rejected_total` rising | A `Register` or `Subscribe` was refused because one gRPC connection already holds `max_sessions_per_connection` agent sessions (default 8). A stock agent holds one session per connection (INFERRED), so a rise means an L4 balancer, forwarder or client is carrying several agents on one connection (see "Per-connection session cap" under Configuration). The refused call is answered `UNAVAILABLE` and the agent retries. If the topology is legitimate, raise the key in `sys.config`; the key is read once when the registry starts, so the change needs a gateway restart, which disconnects every agent the node holds, so plan it. The metric has no agent label. A refused `Register` leaves nothing on the server and no row on the gateway. Rows of a connection that closed stay counted for the dead connection key only, which no new connection uses, until `dead_connection_grace_ms` (default 15 s) has passed, so a reconnecting client is not refused because of them. |
+| gateway | WARN | `Register failed: registry_unavailable` | The agent was answered `INTERNAL` (13) "Registration failed: registry unavailable". Either the gateway's registry process was not reachable (see the `Registration replay aborted: registry unavailable` row), or this `Register` was superseded: a newer `Register` of the same agent id on the same connection committed its pending row first, or this one's own row was already gone. The second case needs two `Register` calls of one agent id in flight on one connection; an occasional line is expected then, and the agent registers again (INFERRED: after about 2 s, from the agent's reconnect wait). A sustained run of lines with the registry running is not expected: check `/readyz` and the registry process. |
 
 The server's `renew_leases ... unknown_session` warnings stop once the agent
 is known again. How long that takes depends on the gateway's upstream circuit
@@ -1063,7 +1106,12 @@ are the measured evidence).
   in R2d and the recoveries in runs F3a (all agents online at T0 + 85.2 s) and
   F3b (T0 + 50.4 s) under "Observed on a rig" are this case; in F3a and F3b the agents came back through
   the breaker's own replay right after the probe closed the breaker, with no wait
-  for a heartbeat). While the breaker is open the whole
+  for a heartbeat). This applies to one agent too: in rig pass 4 (run H3, 1 agent,
+  302 s outage) the breaker was open at the restart, the verdicts at T0 and the
+  next two (30 s heartbeat cadence) were dropped, the breaker went half open and
+  the next verdict closed it as the probe, and the agent was online at T0 + 86.7 s;
+  in rig pass 5 (run J3, 1 agent, 300 s outage, breaker closed at the restart) it was
+  online at T0 + 0.98 s. Wait for the breaker, do not restart. While the breaker is open the whole
   `/readyz` answer is 503, not only its `circuit_breaker` check (INFERRED from
   `yuzu_gw_health.erl`), so a load balancer that probes `/readyz` can take the
   node out of rotation for the open period; `/healthz` (liveness) is not
@@ -1082,7 +1130,13 @@ agents were online at T0 + 85.2 s. In F3b the probe succeeded at T0 + 49.1 s and
 all 30 agents were online at T0 + 50.4 s. Recovery came from the breaker's own
 replay (`trigger="breaker"` 1 in both runs; `trigger="heartbeat"` 0 in F3a), not
 from the heartbeat verdict. With 1 agent the breaker stayed closed and the verdict
-replay (`trigger="heartbeat"`) ran at T0 + 0.67 s (run F1). The heartbeat flush
+replay (`trigger="heartbeat"`) ran at T0 + 0.67 s (run F1). Whether the breaker is
+open at the restart decides the wait, not the number of agents: rig pass 4 (build
+`ab01f4f2f`) recovered 30 agents after a 12 s outage at T0 + 21.2 s and 45 agents
+after a 150 s outage at T0 + 23.8 s with the breaker open, and the single agent
+above at T0 + 86.7 s; rig pass 5 (build `e3cf6b38a`) recovered 45 agents after a
+150 s outage at T0 + 29.5 s with the breaker open and 1 agent at T0 + 0.98 s with it
+closed. The heartbeat flush
 itself was accepted on the first flush after the server returned in these runs
 (no `larger than max` line), so the buffer was not the cause of the wait.
 
@@ -1405,13 +1459,20 @@ the raw rig logs are local only.
   TLS with the final code (R6 ran earlier), a gateway log level other than debug,
   a wait for the circuit breaker longer than the 160 s backoff step, a 300 s or
   longer outage with a closed breaker and several agents (the breaker opened in
-  F3a, 10 agents and 302 s, and in F3b, 30 agents and 152 s), and hot loading the
+  F3a, 10 agents and 302 s, and in F3b, 30 agents and 152 s), the commits after
+  `e3cf6b38a` (the pending row cleanup on connection down with its grace, the
+  per-connection pending index and the same-agent commit rule: eunit, dialyzer,
+  Common Test and scratch probes only), and hot loading the
   code into a running node (not a supported deployment path).
 
 **Later runs: several agents and the buffer change.** OBSERVED on the same kind
 of local rig (one box, plaintext, loopback, debug builds, one core replica, agent
 build containing #5183). Runs E1 to E6 ran on gateway commit `848709698` (before
-the heartbeat buffer change); runs F1 to F6 ran on `990e57e48` (with it). T0 is
+the heartbeat buffer change); runs F1 to F6 ran on `990e57e48` (with it); runs H1
+to H7 (rig pass 4) ran on `ab01f4f2f` and runs J1 to J7 (rig pass 5) on
+`e3cf6b38a`, both with the later review rounds' code up to those commits (rig pass
+3, runs G1 to G5, is in the evidence record). The code after `e3cf6b38a` has not
+run on a rig. T0 is
 the first `/health` 200 of the restarted server. "Default agents" means the
 default plugin set with the TAR plugin loaded; "no TAR" means the TAR plugin was
 removed so the heartbeat carried no snapshot.
@@ -1435,6 +1496,20 @@ removed so the heartbeat carried no snapshot.
 | F4 | `990e57e48` | `max_heartbeat_buffer_bytes` at the 1048576 minimum, 5 default agents, 121.5 s outage | `snapshot_evicted` 23 at T0, agents recovered at T0 + 1.1 s |
 | F5 | `848709698` gateway, `990e57e48` server and agent builds | control: 1 default agent, 302 s outage | FAIL as before: 504 `larger than max` lines, 21,629,287 bytes buffered, no recovery |
 | F6 | `990e57e48` | 10 minute steady state after F1 | no WARN or ERROR, counters flat, gateway mean 2.5% of one core |
+| H1 | `ab01f4f2f` | 30 default agents, 12 s outage | breaker open at the restart, verdicts dropped as `circuit_open`, all 30 online at T0 + 21.2 s, same sessions and processes, cap counter 0 |
+| H2 | `ab01f4f2f` | 45 default agents, 150 s outage | first drain 35 heartbeats in 8 chunks, then 10 in 3, 0 drops, all 45 online at T0 + 23.8 s (breaker open, 45 re-proxied in 1.87 s) |
+| H3 | `ab01f4f2f` | 1 default agent, 302 s outage | breaker open at the restart, verdicts dropped three times, the next verdict closed it as the probe, online at T0 + 86.7 s, same session, no reconnect |
+| H4 | `ab01f4f2f` | bad heartbeats from a probe agent (5 MiB tag, 600 tags, invalid UTF-8, 10 in a row) | all 29 acknowledged, `heartbeat_oversize` 8, `heartbeat_invalid` 5, buffer process not restarted, route row kept renewing |
+| H5 | `ab01f4f2f` | session cap, default 8 and a cap of 2 | 9th distinct agent refused `UNAVAILABLE`, the same id accepted, no leaked slot, 3 refusals counted for each cap value |
+| H6 | `ab01f4f2f` | router timeout clamp and crash redaction | 99999 clamped to 3600 s, non-positive took the 300 s default, forced router and buffer crashes left 0 marker hits |
+| H7 | `ab01f4f2f` | 5 minute steady state after H3 | WARN 0, ERROR 0, only the upstream RPC counts changed |
+| J1 | `e3cf6b38a` | 30 default agents: cold start through the reservation path, then a 12 s outage | cold start: all 30 registered in 7.5 s, 0 refused; outage (breaker closed): all online at T0 + 16.1 s, same sessions and processes |
+| J2 | `e3cf6b38a` | 45 default agents, 150 s outage | 3 chunks then 2, 0 drops, breaker open, all 45 online at T0 + 29.5 s |
+| J3 | `e3cf6b38a` | 1 default agent, 300 s outage | breaker closed at the restart, online at T0 + 0.98 s, same session and process |
+| J4 | `e3cf6b38a` | gateway kill -9 three times with 20 agents | every agent re-registered in every gateway life in the second variant (20 of 20, 60 registrations), 0 refused, 0 stale rows |
+| J5 | `e3cf6b38a` (control: `ab01f4f2f` gateway) | session cap, same-id supersede, 200 concurrent Registers on one connection | 8 admitted, 192 refused, 8 reached the server; control on the previous code let 153 to 157 through per run |
+| J6 | `e3cf6b38a` | tag bound probe (5 MiB invalid value, 6 x 50 KiB, one 40 KiB tag) | `heartbeat_oversize` +2, `heartbeat_invalid` +0, the 40 KiB tag kept, buffer not restarted |
+| J7 | `e3cf6b38a` | 5 minute steady state after J3 | gateway WARN 0, ERROR 0, 0 flush errors |
 
 Details of what these runs showed:
 
@@ -1741,6 +1816,13 @@ env keys with defaults, which a reverted build ignores.
   `gateway/config/sys.config` and `sys.config.prod` set neither: their default
   handler sets only a level and a formatter template (read at this commit).
 - The several-replica and agent-dependency limits are described above.
+- **Per-connection session cap residuals.** A handler that dies between storing
+  its pending row and committing it leaves one row with no index entry, which the
+  pending time to live sweep removes; a reserve call that times out at 5 s can
+  leave a reservation until the time to live; and the live insert can be refused in
+  the brief gap between `Subscribe` taking the pending row and the live insert
+  (the agent retries, INFERRED about 2 s later). Details under "Per-connection
+  session cap" in Configuration.
 - Related tracked items: #5244 (an idempotent adopt: a re-adopt of a session the
   server already holds wipes placement), #4632 (the in-flight notification limit
   on the convergence path), #5278 (verdict follow-ups: the desync log seam and a

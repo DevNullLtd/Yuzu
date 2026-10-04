@@ -1439,17 +1439,20 @@ one core replica a server-only restart now recovers through the replay described
   once when the registry starts; a refused `Register` or `Subscribe` is answered `UNAVAILABLE` and counted
   in `yuzu_gw_session_limit_rejected_total`) keeps one connection from pushing other agents' snapshots out
   of a full buffer (probed against a fake upstream, not rig-run). It counts session rows, pending plus
-  live, excluding only the one live row a registration would supersede; a repeated `Register` of the same
+  live, excluding the registering agent's own rows; a repeated `Register` of the same
   agent id on the same connection supersedes that agent's older pending rows; and the slot is reserved
   atomically when a `Register` is admitted, before it is proxied to the server, so concurrent Registers on
   one connection admit at most the cap and nothing beyond it is proxied (the reservation is released if the
-  proxied `Register` fails or is not accepted, and by the pending time to live otherwise). Two review
+  proxied `Register` fails or is not accepted, and by the pending time to live otherwise). The rows of a
+  connection that closed stay takeable for a grace (`dead_connection_grace_ms`, default 15000, valid 0 to
+  120000, read once when the registry starts) so that a `Subscribe` on a reconnected channel can still take a
+  pending session, and are deleted after it (checked by eunit, dialyzer and scratch probes, not rig-run). Two review
   probes against the real application and a fake upstream (not rig runs) found that an earlier form let the
   same agent id store unlimited pending sessions and let a concurrent burst pass the pre-check and be
   proxied upstream; both are fixed. Consequences: the server's
   `yuzu_heartbeats_received_total{via="gateway"}` under-counts while a backlog is coalesced, and an agent's
   topology snapshot can be one agent snapshot cycle older after an eviction. The server's 4 MiB receive
-  limit is unchanged and not raised. The post-change rig run (`990e57e48`, 1 to 30 agents, plaintext, debug builds) recovered where the old gateway did not; see the evidence record. A third rig pass (G1 to G5, build `f3e9d52a4`) recovered the same way; the heartbeat screening that keeps a session's lease renewing, the router timeout clamp and the session cap are not in that build, and a pass on the final commit is pending. Not tested and known limits: 100 or more agents and a backlog that reaches the default byte cap; the
+  limit is unchanged and not raised. The post-change rig run (`990e57e48`, 1 to 30 agents, plaintext, debug builds) recovered where the old gateway did not; see the evidence record. A third rig pass (G1 to G5, build `f3e9d52a4`) recovered the same way; the heartbeat screening that keeps a session's lease renewing, the router timeout clamp and the session cap are not in that build, rig passes 4 (`ab01f4f2f`) and 5 (`e3cf6b38a`) ran later builds, and a pass on the final commit has not been run. Not tested and known limits: 100 or more agents and a backlog that reaches the default byte cap; the
   agent's snapshot size is not bounded here (the agent proto comment says 5 to 20 KB, 200 to 800 KB was
   observed, the server accepts up to 2 MiB) and is a follow-up for the agent side; the server does not
   configure its maximum receive size explicitly, so the chunk size relies on the library default (INFERRED
