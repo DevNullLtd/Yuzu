@@ -75,7 +75,7 @@ drain_test_() ->
            fun() -> goaway_ends_binding(State) end},
           {"after GOAWAY the agent reconnects: a fresh session binds to the new connection",
            fun() -> reconnect_binds_new_connection(State) end},
-          {"pending session whose connection got GOAWAY: rejected until Subscribe binds the new connection",
+          {"pending session whose connection got GOAWAY: dropped with the connection, the agent registers again",
            fun() -> pending_session_after_goaway(State) end},
           {"heartbeat on a new connection while the old Subscribe is still bound is rejected",
            fun() -> new_connection_during_drain_window(State) end},
@@ -150,32 +150,35 @@ reconnect_binds_new_connection(State) ->
 
 pending_session_after_goaway(State) ->
     with_channels(State, fun(A, B, Counts) ->
-        S = register_session(A, agent_id(<<"pending">>)),
+        Id = agent_id(<<"pending">>),
+        S = register_session(A, Id),
         {ok, K1} = yuzu_gw_registry:lookup_pending_session(S),
         ?assertMatch({ok, _, _}, heartbeat(A, S)),
         Mon = monitor(process, K1),
         Sub = client_goaway(A),
         ?assertEqual(normal, await_down(Mon)),
         ok = await_channel_lost(Sub),
-        %% The pending row is not tied to the connection process: it stays,
-        %% still naming the connection that registered, which is gone.
-        ?assertEqual({ok, K1}, yuzu_gw_registry:lookup_pending_session(S)),
-        %% So no connection is admitted for it until Subscribe binds it.
+        %% The pending row goes with the connection that registered (the registry
+        %% monitors it), not at the end of the 2 minute TTL.
+        ok = wait_until(fun() -> yuzu_gw_registry:lookup_pending_session(S) =:= error end,
+                        3000),
+        %% So no connection is admitted for it: unknown session, not mismatch.
         ?assertMatch({error, {<<"5">>, <<"unknown session">>}, _}, heartbeat(A, S)),
         ?assertMatch({error, {<<"5">>, <<"unknown session">>}, _}, heartbeat(B, S)),
-        ?assertEqual(2, count(Counts, connection_mismatch)),
-        %% Subscribe on the reconnected channel binds the session to the NEW
+        ?assertEqual(0, count(Counts, connection_mismatch)),
+        ?assertEqual(2, count(Counts, unknown_session)),
+        %% The agent registers again on the reconnected channel, as it does when
+        %% its Subscribe is answered NOT_FOUND; the new session binds to the NEW
         %% connection, and only that connection is admitted.
-        Holder = subscribe(A, S),
+        {S2, Holder} = register_and_subscribe(A, Id),
         try
-            ok = await_bound(S),
-            {ok, #{conn_key := K2}} = yuzu_gw_registry:lookup_session(S),
+            {ok, #{conn_key := K2}} = yuzu_gw_registry:lookup_session(S2),
             ?assertNotEqual(K1, K2),
-            ?assertMatch({ok, _, _}, heartbeat(A, S)),
-            ?assertMatch({error, {<<"5">>, <<"unknown session">>}, _}, heartbeat(B, S)),
-            ?assertEqual(3, count(Counts, connection_mismatch))
+            ?assertMatch({ok, _, _}, heartbeat(A, S2)),
+            ?assertMatch({error, {<<"5">>, <<"unknown session">>}, _}, heartbeat(B, S2)),
+            ?assertEqual(1, count(Counts, connection_mismatch))
         after
-            end_session(Holder, S)
+            end_session(Holder, S2)
         end
     end).
 
