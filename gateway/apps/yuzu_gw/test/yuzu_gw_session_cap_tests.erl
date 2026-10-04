@@ -48,6 +48,8 @@ cap_test_() ->
        fun undefined_key_never_counted/0},
       {"every release path frees the count: 100 cycles end at the right count",
        {timeout, 60, fun churn_releases_every_count/0}},
+      {"a session id registered again under another connection moves its count",
+       fun same_session_id_moves_between_connections/0},
       {"a dead agent process frees its slot",
        fun dead_process_frees_slot/0},
       {"the refusal is counted each time and logged once a second, naming the cap only",
@@ -242,6 +244,19 @@ churn_releases_every_count() ->
     Rows = lists:sort([S || {S, _, _, K} <- ets:tab2list(yuzu_gw_sessions), K =:= C]),
     ?assertEqual(Rows, Live),
     _ = Keep.
+
+%% The session index is keyed by session id, so registering an id again replaces
+%% its row: the per-connection entry of the old row must go with it.
+same_session_id_moves_between_connections() ->
+    C1 = conn(), C2 = conn(),
+    [bind(agent(I), session(I), C1) || I <- lists:seq(1, ?CAP)],
+    ?assertEqual(?CAP, conn_count(C1)),
+    %% Agent 1's session id is registered again, by another agent, on C2.
+    _ = bind(agent(500), session(1), C2),
+    ?assertEqual(1, conn_count(C2)),
+    ?assertEqual(?CAP - 1, conn_count(C1)),
+    ?assertEqual(ok, yuzu_gw_registry:register_agent(agent(501), holder(), session(501),
+                                                     [], <<>>, #{}, C1)).
 
 dead_process_frees_slot() ->
     C = conn(),
