@@ -2938,11 +2938,14 @@ if _bash_test.found()
   # foreign port holders. Sources the script with kill/ps/pgrep/lsof/docker
   # replaced by functions; spawns and signals nothing. The decoy command line
   # contains yuzu-agent, as the `meson compile` the old pgrep -f killed did.
+  # Budget: about 1 s on macOS and Linux, but 38-45 s on the Windows runners
+  # and over 60 s when other jobs share the box. 180 s is 4x the slowest clean
+  # Windows run; a real hang still trips it.
   test('start-UAT.sh kill_stale scoping (#5333)',
     _bash_test,
     args: [files('shell/test_start_uat_kill_stale.sh')],
     suite: 'docs',
-    timeout: 60,
+    timeout: 180,
   )
 endif
 
@@ -3200,11 +3203,13 @@ test('ci telemetry selftest',
 # Windows SDK is selected at four independent boundaries: native MSYS2,
 # runner provisioning/manifest, GHA environment activation, and documentation.
 # Keep them exact and keep the GHA action itself visible to Dependabot.
+# Budget: 4-5 s on a clean Windows runner, 7-8 s when other jobs share the box;
+# the old 10 s limit tripped (#4164, #4171).
 test('windows sdk contract',
   _python3_test,
   args: [files('test_windows_sdk_contract.py')],
   suite: 'docs',
-  timeout: 10,
+  timeout: 30,
 )
 
 # The nightly TSan gdb capture's pure-logic selftest (#1038): junit -> failing
