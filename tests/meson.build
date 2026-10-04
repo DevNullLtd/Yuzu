@@ -1302,6 +1302,7 @@ if build_server
       'unit/server/test_tag_routes.cpp', # #2542 PR-11: the 4-route Tags API, extracted onto the HttpRouteSink seam
       'unit/server/test_scope_engine.cpp',
       'unit/server/test_web_utils.cpp',
+      'unit/server/test_secret_file.cpp', # #5272 --postgres-dsn-file / --oidc-client-secret-file
       'unit/server/test_mcp_body_cap.cpp',
       'unit/server/test_dispatch_target_shape.cpp',
       'unit/server/test_sensitive_instruction_params.cpp',
