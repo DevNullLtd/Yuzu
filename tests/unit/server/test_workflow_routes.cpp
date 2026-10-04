@@ -1242,17 +1242,300 @@ TEST_CASE("ExecutionTracker.query_executions: agents_failure>0 with empty "
     CHECK(execs[0].last_error_detail.empty());
 }
 
-// ── sec-M1: LIST handler now gates on Execution:Read ───────────────────────
+// ── sec-M1: LIST handler gates on Execution:Read ───────────────────────────
+// The LIST route's SOLE gate is require_fleet_read (fleet_read_fn), like the
+// detail route above: perm_grant no longer participates, fleet_read_grant is
+// the deny knob.
 
-TEST_CASE("executions list: 403 when perm_fn denies (sec-M1)",
+TEST_CASE("executions list: 403 when fleet_read_fn denies (sec-M1)",
           "[pg][workflow][executions][list][rbac]") {
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     ExecHarness h(pool);
-    h.perm_grant = false;
+    h.fleet_read_grant = false;
     auto res = h.sink.Get("/fragments/executions");
     REQUIRE(res);
     CHECK(res->status == 403);
+}
+
+TEST_CASE("executions list: perm_fn is not a second gate on the (Execution Read) pair",
+          "[pg][workflow][executions][list][rbac]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
+    h.perm_grant = false; // would 403 if the route still stacked perm_fn
+    h.make_def("def-solegate", "SoleGate");
+    h.make_exec("def-solegate", "completed", 1, 1, 0);
+    auto res = h.sink.Get("/fragments/executions");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(res->body.find("SoleGate") != std::string::npos);
+}
+
+TEST_CASE("executions list: unwired fleet_read_fn -> 503, fail closed",
+          "[pg][workflow][executions][list][rbac]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool, /*with_bus=*/true, /*budget=*/nullptr, /*wire_exec_visible=*/true,
+                  /*with_workflow_engine=*/false, /*wire_fleet_read_fn=*/false);
+    h.make_def("def-unwired", "Unwired");
+    h.make_exec("def-unwired", "completed", 1, 1, 0);
+    auto res = h.sink.Get("/fragments/executions");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    CHECK(res->body.find("Unwired") == std::string::npos);
+    CHECK(res->body.find("data-execution-id") == std::string::npos);
+}
+
+// ── Confinement of the LIST fragment (ADR-0017; mirrors GET /api/v1/executions)
+
+namespace {
+// Execution ids served by a list fragment body, in render order.
+std::vector<std::string> served_ids(const std::string& body) {
+    std::vector<std::string> ids;
+    const std::string needle = "data-execution-id=\"";
+    for (auto at = body.find(needle); at != std::string::npos; at = body.find(needle, at)) {
+        at += needle.size();
+        ids.push_back(body.substr(at, body.find('"', at) - at));
+    }
+    return ids;
+}
+using VS = yuzu::server::authz::VisibleSet;
+} // namespace
+
+TEST_CASE("executions list: confined scope serves exactly the owner-or-visible set",
+          "[pg][workflow][executions][list][confinement]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
+    h.make_def("def-c", "Confined");
+    // E_in: carol dispatched, targets in-scope agent only.
+    auto e_in = h.make_exec("def-c", "completed", 1, 1, 0, 1735689600, "carol");
+    h.agent_status(e_in, "agent-in", "success");
+    // E_mixed: fans out to in-scope AND out-of-scope agents.
+    auto e_mixed = h.make_exec("def-c", "completed", 2, 1, 1, 1735689601, "carol");
+    h.agent_status(e_mixed, "agent-in", "success");
+    h.agent_status(e_mixed, "agent-out", "failure", 1, "SECRET-OUT-ERR-MIXED", 1735689670);
+    // E_out: out-of-scope agent only, someone else's.
+    auto e_out = h.make_exec("def-c", "completed", 1, 0, 1, 1735689602, "carol");
+    h.agent_status(e_out, "agent-out", "failure", 1, "SECRET-OUT-ERR-ONLY", 1735689671);
+    // E_own: dispatched by the caller ("tester", the harness principal), but every
+    // agent is out of scope: visible through ownership.
+    auto e_own = h.make_exec("def-c", "completed", 1, 0, 1, 1735689603, "tester");
+    h.agent_status(e_own, "agent-out", "failure", 1, "SECRET-OUT-ERR-OWN", 1735689672);
+    // E_nostatus: no status rows yet, someone else's: not visible.
+    auto e_none = h.make_exec("def-c", "running", 1, 0, 0, 1735689604, "carol");
+
+    h.fleet_read_scope = VS{std::unordered_set<std::string>{"agent-in"}};
+    auto res = h.sink.Get("/fragments/executions");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto ids = served_ids(res->body);
+    std::sort(ids.begin(), ids.end());
+    std::vector<std::string> want{e_in, e_mixed, e_own};
+    std::sort(want.begin(), want.end());
+    CHECK(ids == want);
+    CHECK(std::find(ids.begin(), ids.end(), e_out) == ids.end());
+    CHECK(std::find(ids.begin(), ids.end(), e_none) == ids.end());
+    // Out-of-scope error text must not appear ANYWHERE in the body: not in the
+    // inline preview and not in the title= attribute.
+    CHECK(res->body.find("SECRET-OUT") == std::string::npos);
+
+    // E_mixed's counters are the in-scope projection (1 targeted, 1 success), not the
+    // stored row's 2 targeted / 1 failure.
+    const auto row_at = res->body.find("data-execution-id=\"" + e_mixed + "\"");
+    REQUIRE(row_at != std::string::npos);
+    const auto row_end = res->body.find("</tr>", row_at);
+    const auto row = res->body.substr(row_at, row_end - row_at);
+    CHECK(row.find("1/0 of 1") != std::string::npos);
+    // E_own: ownership admits the row but the projection shows zero visible agents.
+    const auto own_at = res->body.find("data-execution-id=\"" + e_own + "\"");
+    REQUIRE(own_at != std::string::npos);
+    const auto own_row = res->body.substr(own_at, res->body.find("</tr>", own_at) - own_at);
+    CHECK(own_row.find("0/0 of 0") != std::string::npos);
+}
+
+TEST_CASE("executions list: confined error preview and title= carry only the in-scope error",
+          "[pg][workflow][executions][list][confinement]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
+    h.make_def("def-lk", "Leak");
+    auto eid = h.make_exec("def-lk", "completed", 2, 0, 2, 1735689600, "carol");
+    h.agent_status(eid, "agent-in", "failure", 1, "IN-SCOPE-ERR", 1735689650);
+    // Newer than the in-scope failure: the UNSCOPED correlated subquery picks this one.
+    h.agent_status(eid, "agent-out", "failure", 1, "SECRET-OUT-ERR-NEWER", 1735689690);
+
+    // Unconfined caller sees the newest error (control: the secret is in the data).
+    auto open_res = h.sink.Get("/fragments/executions");
+    REQUIRE(open_res);
+    CHECK(open_res->body.find("SECRET-OUT-ERR-NEWER") != std::string::npos);
+
+    h.fleet_read_scope = VS{std::unordered_set<std::string>{"agent-in"}};
+    auto res = h.sink.Get("/fragments/executions");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(res->body.find("SECRET-OUT") == std::string::npos);
+    // The in-scope error shows up in BOTH the preview cell text and the title= attribute.
+    CHECK(res->body.find("title=\"IN-SCOPE-ERR\">IN-SCOPE-ERR</td>") != std::string::npos);
+}
+
+TEST_CASE("executions list: engaged-empty (deny_all) scope serves only the caller's own rows",
+          "[pg][workflow][executions][list][confinement]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
+    h.make_def("def-da", "DenyAll");
+    auto other = h.make_exec("def-da", "completed", 1, 1, 0, 1735689600, "carol");
+    h.agent_status(other, "agent-x", "success");
+    auto own = h.make_exec("def-da", "completed", 1, 1, 0, 1735689601, "tester");
+    h.agent_status(own, "agent-x", "success");
+
+    h.fleet_read_scope = yuzu::server::authz::deny_all();
+    auto res = h.sink.Get("/fragments/executions");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    // present-empty is deny-all, NOT unfiltered: the fleet row must not be served.
+    CHECK(served_ids(res->body) == std::vector<std::string>{own});
+}
+
+TEST_CASE("executions list: deny_all scope with nothing owned renders the empty state",
+          "[pg][workflow][executions][list][confinement]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
+    h.make_def("def-da2", "DenyAll2");
+    auto other = h.make_exec("def-da2", "completed", 1, 1, 0, 1735689600, "carol");
+    h.agent_status(other, "agent-x", "success");
+    h.fleet_read_scope = yuzu::server::authz::deny_all();
+    auto res = h.sink.Get("/fragments/executions");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(res->body.find("No executions yet") != std::string::npos);
+    CHECK(served_ids(res->body).empty());
+}
+
+// ADR-0017 INV-3: the admission predicate runs in SQL BEFORE the LIMIT. 60
+// newer invisible rows must not push the one older visible row off a 50-row page.
+TEST_CASE("executions list: 60 newer invisible rows do not starve an older visible one",
+          "[pg][workflow][executions][list][confinement]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
+    h.make_def("def-lim", "Limit");
+    auto visible = h.make_exec("def-lim", "completed", 1, 1, 0, 1735680000, "carol");
+    h.agent_status(visible, "agent-in", "success");
+    for (int i = 0; i < 60; ++i) {
+        auto id = h.make_exec("def-lim", "completed", 1, 1, 0, 1735690000 + i, "carol");
+        h.agent_status(id, "agent-out", "success");
+    }
+    h.fleet_read_scope = VS{std::unordered_set<std::string>{"agent-in"}};
+    auto res = h.sink.Get("/fragments/executions");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(served_ids(res->body) == std::vector<std::string>{visible});
+
+    // Control: unconfined sees the newest 50 only (the visible row is past the LIMIT).
+    h.fleet_read_scope = std::nullopt;
+    auto open_res = h.sink.Get("/fragments/executions");
+    REQUIRE(open_res);
+    const auto open_ids = served_ids(open_res->body);
+    CHECK(open_ids.size() == 50);
+    CHECK(std::find(open_ids.begin(), open_ids.end(), visible) == open_ids.end());
+}
+
+TEST_CASE("executions list: a tracker degrade is 503, never 'No executions yet'",
+          "[pg][workflow][executions][list][confinement]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
+    h.make_def("def-dg", "Degrade");
+    h.make_exec("def-dg", "completed", 1, 1, 0);
+
+    for (bool confined : {false, true}) {
+        INFO("confined=" << confined);
+        if (confined)
+            h.fleet_read_scope = VS{std::unordered_set<std::string>{"agent-in"}};
+        exec_sql(db.dsn(),
+                 "ALTER TABLE execution_tracker.executions RENAME TO executions_hidden_list");
+        auto res = h.sink.Get("/fragments/executions");
+        exec_sql(db.dsn(),
+                 "ALTER TABLE execution_tracker.executions_hidden_list RENAME TO executions");
+        REQUIRE(res);
+        CHECK(res->status == 503);
+        CHECK(res->body.find("No executions yet") == std::string::npos);
+    }
+}
+
+TEST_CASE("executions list: a status-read degrade under a confined scope is 503",
+          "[pg][workflow][executions][list][confinement]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
+    h.make_def("def-dg2", "Degrade2");
+    auto eid = h.make_exec("def-dg2", "completed", 1, 1, 0, 1735689600, "tester");
+    h.agent_status(eid, "agent-in", "success");
+    h.fleet_read_scope = VS{std::unordered_set<std::string>{"agent-in"}};
+
+    // The list query's own scope predicate reads agent_exec_status too, so renaming it
+    // trips the first (list) call; either way a degrade must surface as 503 and never as
+    // an empty state.
+    exec_sql(db.dsn(),
+             "ALTER TABLE execution_tracker.agent_exec_status RENAME TO agent_exec_status_hidden");
+    auto res = h.sink.Get("/fragments/executions");
+    exec_sql(db.dsn(),
+             "ALTER TABLE execution_tracker.agent_exec_status_hidden RENAME TO agent_exec_status");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    CHECK(res->body.find("No executions yet") == std::string::npos);
+}
+
+TEST_CASE("executions list: empty principal under a confined scope fails closed (503)",
+          "[pg][workflow][executions][list][confinement]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    auto empty_user = [](const httplib::Request&,
+                         httplib::Response&) -> std::optional<yuzu::server::auth::Session> {
+        yuzu::server::auth::Session s;
+        s.username = "";
+        return s;
+    };
+    ExecHarness h(pool, /*with_bus=*/true, /*budget=*/nullptr, /*wire_exec_visible=*/true,
+                  /*with_workflow_engine=*/false, /*wire_fleet_read_fn=*/true,
+                  /*with_product_pack_store=*/false, empty_user);
+    h.make_def("def-eu", "EmptyUser");
+    h.make_exec("def-eu", "completed", 1, 1, 0, 1735689600, "");
+    h.fleet_read_scope = VS{std::unordered_set<std::string>{"agent-in"}};
+    auto res = h.sink.Get("/fragments/executions");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    CHECK(served_ids(res->body).empty());
+}
+
+// Unconfined stays on its old shape: when a confined scope happens to cover every agent
+// of every row (and the stored counters agree with the status rows), the confined render
+// is byte-equal to the unconfined render, so the projection only ever changes what it
+// must.
+TEST_CASE("executions list: full-cover scope renders the same bytes as unconfined",
+          "[pg][workflow][executions][list][confinement]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
+    h.make_def("def-eq", "Equal");
+    auto a = h.make_exec("def-eq", "completed", 2, 1, 1, 1735689600, "tester");
+    h.agent_status(a, "agent-1", "success");
+    h.agent_status(a, "agent-2", "failure", 1, "boom", 1735689650);
+    auto b = h.make_exec("def-eq", "completed", 1, 1, 0, 1735689601, "tester");
+    h.agent_status(b, "agent-1", "success");
+
+    auto open_res = h.sink.Get("/fragments/executions");
+    h.fleet_read_scope = VS{std::unordered_set<std::string>{"agent-1", "agent-2"}};
+    auto confined = h.sink.Get("/fragments/executions");
+    REQUIRE(open_res);
+    REQUIRE(confined);
+    CHECK(open_res->status == 200);
+    CHECK(confined->body == open_res->body);
+    CHECK(served_ids(open_res->body).size() == 2);
 }
 
 // ── UP-1 / qa-S1: agent_id with single-quote does not produce JS injection ─

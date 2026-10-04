@@ -7,6 +7,7 @@
 #include "event_bus.hpp"
 #include "execution_event_bus.hpp"
 #include "execution_event_scope.hpp"
+#include "execution_scope_rules.hpp" // execution_visible / confined_projection (shared with GET /api/v1/executions)
 #include "http_route_sink.hpp"
 #include "mcp_jsonrpc.hpp" // mcp::json_exceeds_depth / kMcpMaxJsonDepth: shared #2437 depth guard
 #include "principal_quota_gate.hpp" // detail::adopt_quota_slot_into_stream (UP-1)
@@ -158,17 +159,32 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
     // The optional `definition_id` query param filters the list to one
     // definition. Click-handling on the trend sparkline (PR 4) and the
     // dashboard's per-instruction detail page (future) pass it through.
-    sink.Get("/fragments/executions", [auth_fn, perm_fn, execution_tracker, instruction_store](
-                                          const httplib::Request& req, httplib::Response& res) {
-        auto session = auth_fn(req, res);
-        if (!session)
+    //
+    // Confinement (ADR-0017): the SOLE gate is `fleet_read_fn`
+    // (require_fleet_read) -- never stacked with perm_fn on the same
+    // (Execution, Read) pair. A confined caller (management-group or
+    // service-scoped) gets the SAME owner-or-visible view as the v1 twin
+    // GET /api/v1/executions: the admission predicate is pushed into SQL
+    // BEFORE the LIMIT (a page of 50 invisible rows must not starve the
+    // visible ones), each surviving row's counters and error preview are
+    // recomputed from the in-scope agent rows only (so neither the preview
+    // text nor the `title=` attribute can carry an out-of-scope agent's
+    // error), and a store degrade is a 503, never "No executions yet".
+    // An unconfined caller's output is unchanged.
+    sink.Get("/fragments/executions", [auth_fn, fleet_read_fn, execution_tracker,
+                                        instruction_store](const httplib::Request& req,
+                                                           httplib::Response& res) {
+        if (!fleet_read_fn) {
+            spdlog::error("/fragments/executions: fleet_read_fn unwired -- "
+                          "misconfigured call site; failing closed");
+            res.status = 503;
+            res.set_content("<div class=\"empty-state\">Service unavailable</div>",
+                            "text/html; charset=utf-8");
             return;
-        // sec-M1: Execution:Read gate. The LIST exposes definition_name
-        // and last_error_detail (per-agent error preview) — same data
-        // class as the DETAIL handler, so it earns the same RBAC gate.
-        // Mirrors MCP list_executions and REST /api/v1/execution-statistics.
-        if (!perm_fn(req, res, "Execution", "Read"))
-            return;
+        }
+        auto gate = fleet_read_fn(req, res, "Execution", "Read");
+        if (!gate.admitted)
+            return; // gate already wrote the A4 error body + status.
         if (!execution_tracker) {
             res.set_content("<div class=\"empty-state\">Not available</div>", "text/html");
             return;
@@ -184,7 +200,75 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         if (req.has_param("definition_id")) {
             q.definition_id = req.get_param_value("definition_id");
         }
-        auto execs = execution_tracker->query_executions(q);
+
+        ExecutionScope scope_arg; // nullopt = unrestricted
+        std::string username;
+        if (gate.scope) {
+            auto session = auth_fn(req, res);
+            if (!session)
+                return;
+            username = session->username;
+            // #1634/#3789 precedent: an empty username under an engaged scope
+            // must never silently widen the owner disjunct to "no owner
+            // filter" for a confined caller.
+            if (username.empty()) {
+                spdlog::error("/fragments/executions: empty principal under a confined "
+                              "read -- failing closed");
+                res.status = 503;
+                res.set_content("<div class=\"empty-state\">Service unavailable</div>",
+                                "text/html; charset=utf-8");
+                return;
+            }
+            ExecutionListScope s;
+            s.owner = username;
+            s.visible_agents.assign(gate.scope->begin(), gate.scope->end());
+            scope_arg = std::move(s);
+        }
+
+        auto execs_opt = execution_tracker->query_executions_checked(q, scope_arg);
+        if (!execs_opt) {
+            res.status = 503;
+            res.set_content("<div class=\"empty-state\">Execution tracker degraded, retry "
+                            "shortly.</div>",
+                            "text/html; charset=utf-8");
+            return;
+        }
+        std::vector<Execution> execs = std::move(*execs_opt);
+        if (gate.scope) {
+            std::vector<std::string> ids;
+            ids.reserve(execs.size());
+            for (const auto& e : execs)
+                ids.push_back(e.id);
+            auto statuses_opt = execution_tracker->get_agent_statuses_for_executions_checked(ids);
+            if (!statuses_opt) {
+                res.status = 503;
+                res.set_content("<div class=\"empty-state\">Execution tracker degraded, retry "
+                                "shortly.</div>",
+                                "text/html; charset=utf-8");
+                return;
+            }
+            static const std::vector<AgentExecStatus> kEmptyStatuses;
+            std::vector<Execution> projected;
+            projected.reserve(execs.size());
+            for (const auto& e : execs) {
+                auto it = statuses_opt->find(e.id);
+                const auto& statuses = it != statuses_opt->end() ? it->second : kEmptyStatuses;
+                if (!execution_visible(e, statuses, gate.scope, username))
+                    continue;
+                auto counts = confined_projection(statuses, gate.scope);
+                Execution row = e;
+                row.agents_targeted = counts.agents_targeted;
+                row.agents_responded = counts.agents_responded;
+                row.agents_success = counts.agents_success;
+                row.agents_failure = counts.agents_failure;
+                // BOTH the inline preview and the title= attribute read this
+                // field below: the confined value, never the unscoped
+                // correlated-subquery text.
+                row.last_error_detail = counts.last_error_detail;
+                projected.push_back(std::move(row));
+            }
+            execs = std::move(projected);
+        }
         std::string html;
         if (execs.empty()) {
             html = "<div class=\"empty-state\">No executions yet.</div>";
