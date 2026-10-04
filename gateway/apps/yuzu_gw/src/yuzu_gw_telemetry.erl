@@ -49,6 +49,8 @@
     [yuzu, gw, heartbeat, session_mismatch],
     [yuzu, gw, heartbeat, unknown_truncated],
     [yuzu, gw, heartbeat, verdict_dropped],
+    [yuzu, gw, heartbeat, coalesced],
+    [yuzu, gw, heartbeat, buffer_dropped],
 
     %% Mgmt-plane peer authorization (#1422)
     [yuzu, gw, mgmt_auth, rejected],
@@ -256,6 +258,25 @@ handle_event([yuzu, gw, heartbeat, unknown_truncated], #{count := N}, _Meta, _Co
 handle_event([yuzu, gw, heartbeat, verdict_dropped], #{count := N}, Meta, _Config) ->
     Reason = maps:get(reason, Meta, unknown),
     prometheus_counter:inc(yuzu_gw_heartbeat_verdict_dropped_total,
+                           [atom_to_binary(Reason, utf8)], N);
+
+%% Heartbeat buffer bounds. `coalesced' counts a heartbeat merged into the
+%% buffered one of the same session. `buffer_dropped' counts what the buffer
+%% gave up to stay bounded, by the closed reason set buffer_full (a heartbeat
+%% or whole session dropped) | snapshot_oversize (one snapshot larger than a
+%% chunk, heartbeat kept) | snapshot_evicted (oldest snapshot dropped to fit the
+%% byte cap). The label is an atom chosen by yuzu_gw_heartbeat_buffer; any other
+%% value falls to `unknown' so a bug cannot widen the label set, and the handler
+%% must never crash (telemetry detaches a handler that raises).
+handle_event([yuzu, gw, heartbeat, coalesced], #{count := N}, _Meta, _Config) ->
+    prometheus_counter:inc(yuzu_gw_heartbeat_coalesced_total, [], N);
+
+handle_event([yuzu, gw, heartbeat, buffer_dropped], #{count := N}, Meta, _Config) ->
+    Reason = case maps:get(reason, Meta, unknown) of
+        R when R =:= buffer_full; R =:= snapshot_oversize; R =:= snapshot_evicted -> R;
+        _ -> unknown
+    end,
+    prometheus_counter:inc(yuzu_gw_heartbeat_buffer_dropped_total,
                            [atom_to_binary(Reason, utf8)], N);
 
 handle_event([yuzu, gw, cluster, node_up], _Measurements, Meta, _Config) ->
@@ -489,6 +510,24 @@ declare_metrics() ->
      || T <- [<<"breaker">>, <<"heartbeat">>]],
     [prometheus_counter:inc(yuzu_gw_heartbeat_verdict_dropped_total, [R], 0)
      || R <- [<<"malformed">>, <<"not_local">>, <<"circuit_open">>, <<"queue_full">>]],
+    prometheus_counter:declare([
+        {name, yuzu_gw_heartbeat_buffer_dropped_total},
+        {labels, [reason]},
+        {help, "Heartbeat data the gateway buffer gave up to stay bounded while "
+               "the server could not be reached, by reason (buffer_full = a "
+               "heartbeat or whole session dropped because the session count or "
+               "byte cap was reached, snapshot_oversize = one fleet snapshot "
+               "larger than a request chunk was dropped and the heartbeat kept, "
+               "snapshot_evicted = the oldest fleet snapshot was dropped to fit "
+               "the byte cap and the heartbeat kept)"}]),
+    prometheus_counter:declare([
+        {name, yuzu_gw_heartbeat_coalesced_total},
+        {labels, []},
+        {help, "Heartbeats merged into the already buffered heartbeat of the "
+               "same session before a flush (the buffer keeps one per session)"}]),
+    [prometheus_counter:inc(yuzu_gw_heartbeat_buffer_dropped_total, [R], 0)
+     || R <- [<<"buffer_full">>, <<"snapshot_oversize">>, <<"snapshot_evicted">>]],
+    prometheus_counter:inc(yuzu_gw_heartbeat_coalesced_total, [], 0),
     prometheus_counter:declare([
         {name, yuzu_gw_mgmt_auth_pin_unresolved_total},
         {labels, []},

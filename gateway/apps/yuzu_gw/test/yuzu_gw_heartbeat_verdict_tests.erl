@@ -276,7 +276,7 @@ truncated_warning_is_rate_limited() ->
                    unknown_session_ids_truncated => true}, #{}},
     Pid = whereis(yuzu_gw_heartbeat_buffer),
     St0 = sys:get_state(Pid),
-    ?assertEqual(8, tuple_size(St0)),
+    ?assertEqual(11, tuple_size(St0)),
     ?assertEqual(undefined, element(?ST_WARNED_AT, St0)),
     ?assertEqual(0, element(?ST_SUPPRESSED, St0)),
     {_, Lines1} = capture_logs(fun() ->
