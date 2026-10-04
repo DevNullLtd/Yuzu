@@ -153,9 +153,11 @@ annotations D10 states — they write Yuzu's own store, never an element.
   `rbac_store.cpp` — which also seeds `Execute`/`Approve` on every type it iterates; both are
   unconsumed here, the Decommission precedent) and to a new **`NetworkEngineer`** role; `Collect`
   is **excluded from `crud_ops` and from the Administrator loop** (the `Push`/`Attest`/`Rotate`
-  precedent) and seeded only to a new **non-assignable `NetworkCollector` role** (engine principals
-  are granted roles, `validate_assignment`), which no human role list offers (D6). Every closed list
-  the securable and operation must join is a slice-1
+  precedent) and seeded to **no role at all**. Engine principals are granted roles, and
+  `assign_role` refuses every seeded (`is_system`) role to an engine principal, so the collector's
+  role is an **operator-created custom role, `NetworkCollector` by convention, holding exactly
+  `NetworkElement:Collect`** — created by the bootstrap runbook (D11), never seeded, never
+  human-assignable. Every closed list the securable and operation must join is a slice-1
   consequence, enumerated under Consequences.
 - **The whole table is deliberate (owner decision, 2026-10-04).** Global `NetworkElement:Read`
   grants an element's complete FDB, ARP and LLDP tables. A complete inventory of everything
@@ -222,8 +224,10 @@ annotations D10 states — they write Yuzu's own store, never an element.
   `token_scope_service` and `mcp_tier` are empty, AND a **direct** `RbacStore::check_permission`
   (503 on store degrade) resolves `NetworkElement:Collect` — so an elevated human session (which
   `require_permission` short-circuits) and an RBAC-off Administrator (which the legacy branch
-  admits for non-`Read` operations) are **denied explicitly**, not merely logged. The route also
-  refuses a request that arrived on the plaintext listener. Because engine
+  admits for non-`Read` operations) are **denied explicitly**, not merely logged. The route is
+  registered only when HTTPS is enabled — the collector feature refuses to start under
+  `--no-https` (the `--scim-enable requires HTTPS` boot-time precedent), since httplib gives a
+  route no per-request listener identity. Because engine
   principals resolve RBAC-only, **the connector requires RBAC enabled**; with RBAC off the route
   403s every caller and the collector cannot start. That precondition is stated in the user manual
   and the compose file.
@@ -288,9 +292,12 @@ annotations D10 states — they write Yuzu's own store, never an element.
   credential or gnmic target. A **re-address is `update_network_element` with a new
   `management_address`** (uniqueness-checked), never a second registration; the id keeps
   `SecretCodec`'s row-PK-bound AAD stable across it. Learned chassis serial and LLDP chassis-id
-  form a **second uniqueness key**: a registration whose learned identity already belongs to
-  another element is audited `duplicate_identity` and refused (or linked, operator's choice), so
-  one physical device can never be dialled under two ids. A **change in chassis serial or
+  form a **second uniqueness key**. Identity is *learned* after the target is dialled, so the
+  collision surfaces on the new element's first sync, not at registration: it is audited
+  `duplicate_identity`, the new element is forced to `disabled` and omitted from the next
+  published list (so two ids dial one device for at most one loader interval), and the operator
+  chooses link-vs-keep. A later new-element transition on an already re-keyed row re-keys with a
+  fresh suffix so the natural-key uniqueness check always holds. A **change in chassis serial or
   chassis-id under the same id is an audited `identity_change`**: edges and observations before it
   are retired, and the operator chooses relabel (keep the id) or new element (the old row is
   re-keyed to `address:<retired>` so the natural key is free, then disabled).
@@ -305,8 +312,11 @@ annotations D10 states — they write Yuzu's own store, never an element.
 - **Edge retirement**: a gNMI delete notification retires the edge (`last_seen` frozen,
   `retired_at` set); an element's disable retires its edges; the leader's initial sync after a
   (re)subscribe is a full snapshot that retires edges absent from it — **but only for targets whose
-  liveness is fresh and whose cache is not `no_data_yet`**, so a cold or evicted gnmic cache can
-  never retire a live link. The `lldp` subscription in the shipped reference config is `SAMPLE`
+  liveness is fresh and whose cache is not `no_data_yet`**, evaluated **per target at the moment
+  its first post-resubscribe snapshot completes**, where "fresh" means a liveness sample received
+  within that same sync window (liveness travels on the same stream, so the predicate is
+  satisfiable on the first batch), so a cold or evicted gnmic cache can never retire a live link
+  and a healthy resubscribe still retires stale edges. The `lldp` subscription in the shipped reference config is `SAMPLE`
   (or `ON_CHANGE` plus a periodic `SAMPLE`) at an interval below the gNMI-server cache expiration
   (a different cache from the Prometheus output's, D8). Retired edges are returned flagged, never
   silently as current.
@@ -315,7 +325,8 @@ annotations D10 states — they write Yuzu's own store, never an element.
   disabled`; re-enable republishes and the next initial sync re-establishes state. Delete
   cascades to the element's interfaces, edges, observations and credential
   (`network_element.delete`), clears the discovered-device link, and the next poll removes the
-  target.
+  target. Delete is **exempt** from the exported-Incident hold below: the export is built from
+  audit rows only (ADR-0067 D6), so deleting the observations destroys no evidence.
 - **Observations retention and erasure**: observations keep a retention window **independent of
   any Incident** (closure neither purges nor extends; rows tied to an exported Incident are held
   only until the export's own retention expires), distinct from the edges window, implemented as a
@@ -364,8 +375,9 @@ annotations D10 states — they write Yuzu's own store, never an element.
   `docs/prometheus/yuzu-alerts.yml`. **The alert names and signals are the contract and are fixed
   here; only thresholds ship in their own change, tuned against real data** (the OTA precedent):
   `NetworkCollectorStreamDown` (`…_stream_up == 0` on the leader), `NetworkCollectorFetchStale`
-  (`time() - max(…_last_fetch_timestamp_seconds)` beyond N intervals — the only signal that
-  distinguishes "stale forever" from healthy), `NetworkCollectorFetchRejected`
+  (`time() - max(…_last_fetch_timestamp_seconds)` beyond N intervals, with a boot grace of `for:`
+  at least two loader intervals so a fresh install or replica restart does not page before the
+  first poll — the only signal that distinguishes "stale forever" from healthy), `NetworkCollectorFetchRejected`
   (`…_fetch_total{result="denied"}` increments), `NetworkCollectorTargetDown` (gnmic's own
   per-target state via `up{job="gnmic"}` and gnmic's target metrics), `NetworkElementUnreachable`
   (**per element**, on gnmic's per-target state series carrying the `event-tags` `element_id`
@@ -428,7 +440,10 @@ annotations D10 states — they write Yuzu's own store, never an element.
   decided in slice 1, stated in the runbook — drives `state` and `last_seen`; the liveness bound
   for an element that has **never** reported is measured from its registration or re-enable time,
   so a wrong credential at registration becomes `unreachable` within the bound rather than staying
-  `registered` forever (a test-connection action is explicitly deferred). `…_stream_up`
+  `registered` forever — `registered` is therefore **transient** and always resolves to one of the
+  other states; `no_profile` is assigned at registration (profile resolution is static), so a
+  profile-less element never enters the liveness race (a test-connection action is explicitly
+  deferred). `…_stream_up`
   qualifies the **core ↔ gnmic hop only**; a dead switch behind a healthy gnmic is reported by
   `NetworkElementUnreachable` within the liveness bound, never left looking like a quiet one.
 - Stream loss on the core ↔ gnmic hop is **observable, never silent**: `…_stream_up` drops to 0
@@ -438,7 +453,8 @@ annotations D10 states — they write Yuzu's own store, never an element.
   (ADR-1005 D7's rule, stated here because gnmic is not an "engine" by name).
   `NetworkElementStore` construction is fail-closed per ADR-0012 but it does **not** join the
   `stores_ok` conjunction: it is not on the agent control-plane path (the ADR-0049 precedent); a
-  store degrade is counted (`…_store_degrade_total`), its routes return 503, the replica stays in
+  store degrade is counted (`yuzu_server_network_element_store_degrade_total`), its routes return
+  503, the replica stays in
   rotation, and — so the degrade is never invisible — `/readyz`'s body carries a non-gating
   `notices` row (`degraded: ["network_element_store"]`) while a collector endpoint is configured.
   The SOC 2 doc's "every PostgreSQL store is gated into `/readyz`" sentence names this store as
@@ -546,7 +562,8 @@ subscriptions only; there is no on-demand device RPC. So under D3 there is no *l
   re-pin; customers scan it as a third-party image (Yuzu's release SBOM/cosign covers Yuzu images
   only). gnmic's REST API server is disabled; its gNMI server is reachable from core only.
 - **Bootstrap order** (slice-1 deliverable, runbook in `server-admin.md`): core up with RBAC
-  enabled → an admin creates the collector engine principal and grants `NetworkElement:Collect` →
+  enabled → an admin creates the custom `NetworkCollector` role (exactly `NetworkElement:Collect`)
+  and the collector engine principal, and grants the role →
   the bearer is minted and mounted as a secret → gnmic starts with the Yuzu-shipped reference
   config; on a 401/503 or an empty list at first boot gnmic simply has no targets and polls again.
   Core learns the gnmic endpoint and its client mTLS material from `--netcollector-endpoint` /
@@ -614,12 +631,12 @@ subscriptions only; there is no on-demand device RPC. So under D3 there is no *l
   Read/Write/Delete, `Collect` excluded), `kRbacSecurables`/`kRbacOps` in `mcp_server.cpp`,
   `kSeededSecurableTypes`/`kSeededOperations` in `test_capability_catalogue.cpp`, the
   `test_rbac_store.cpp` binding test, `kRbacAssignableRoles` (`rbac_assignable_roles.hpp`) and its
-  MCP schema enum for `NetworkEngineer` (and **not** for `NetworkCollector`, which is seeded but
-  never human-assignable), the "securable types" counts in
+  MCP schema enum for `NetworkEngineer` (and **not** for `NetworkCollector`, which is a custom
+  role and never human-assignable), the "securable types" counts in
   `docs/user-manual/rbac.md` and `docs/auth-architecture.md`, `/api/v1/discover/permissions` (store-
   derived, automatic), and the audit-verb table in `docs/user-manual/audit-log.md` (D5's verbs).
-- **SOC 2** (`docs/enterprise-readiness-soc2-first-customer.md`): the "Postgres Data Inventory"
-  table gains
+- **SOC 2** (`docs/enterprise-readiness-soc2-first-customer.md`): the "Data Inventory —
+  server-side PostgreSQL stores" table gains
   `network_element_store` (edges: asset topology; observations: **presence-over-time, new
   category, behavioural-adjacent**, DSAR erasure source, decommission-cascade member, retention per
   D7) and `network_element_credentials` (secret, `SecretCodec`); the "Behavioral telemetry (DEX)"

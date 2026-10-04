@@ -56,8 +56,10 @@ deciding which subjects are which.
    must not enable the ADR-0068 collector or any other new individually-identifying source**; the
    separately-deployed opt-in artifact is the collection off-switch (the SOC 2 doc's precedent).
 6. **An Incident** is a declared, reasoned, **time-boxed** authorisation with a closed state
-   machine — `requested → approved → closed | expired | denied` — in which **reads are admitted
-   only in `approved`**; `incident.open` creates a `requested` Incident and admits nothing. It is
+   machine — `requested → approved | denied | expired` and `approved → closed | expired` (a
+   `requested` Incident expires un-approved after ADR-0033 §4's pending-approval window; an
+   `approved` one expires at its own time box) — in which **reads are admitted only in
+   `approved`**; `incident.open` creates a `requested` Incident and admits nothing. It is
    opened with a justification (e.g. a ticket) by a holder of `Incident:Write`, **approved through
    the one
    core-owned approval primitive exactly as ADR-0033 §4 specifies — the approver holds
@@ -76,8 +78,11 @@ deciding which subjects are which.
    itself an audit row carrying the export's content hash. **An unrecordable read is not made:**
    an audit-persist failure denies the read even under an Incident, and on an **audit-off**
    deployment (`audit_fn` absent, where the funnel's kernel returns `true` today) in-purview reads
-   are refused outright and a purview declaration is itself refused — there is no Incident without
-   evidence.
+   are refused outright and a purview declaration (`purview.set`, a write on the management-group
+   row the pre-read gate never sees) is refused on its own write path — there is no Incident
+   without evidence. Because declarations are refused, an audit-off deployment holds every subject
+   out of purview under Decision 4's "today's behaviour"; the read refusal is reachable only
+   through Decision 5's deployment-wide default flip.
 7. **Enforced by a pre-read, deny-capable decision in front of the single funnel.**
    `emit_behavioral_audit` (`rest_audit.hpp`) is an audit *wrapper*: it returns a persist bool,
    REST fails closed on it, the dashboard and MCP proceed by design, MCP wraps the kernel itself,
