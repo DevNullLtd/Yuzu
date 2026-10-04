@@ -19507,6 +19507,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 JArr links;
                 JArr next;
                 std::string narrative;
+                bool execution_not_visible = false; // absent OR confined out: audited `denied`
                 if (kind == "agent" && !target_id.empty()) {
                     // Group-scope gate (G-S2): an operator scoped to one
                     // management group must not be able to probe arbitrary
@@ -19535,25 +19536,73 @@ McpServer::HandlerFn McpServer::build_handler(
                                     " is not present in the current MCP agent registry.";
                     next.add("get_agent_details").add("get_agent_inventory").add("get_tags");
                 } else if (kind == "execution" && !target_id.empty() && execution_tracker) {
-                    // Execution data is a distinct securable — gate on
-                    // Execution:Read (tier + RBAC), not just the tool's generic
-                    // Infrastructure:Read (G-S2).
-                    if (!tier_allows(tier, "Execution", "Read")) {
-                        res.set_content(a4_error(kTierDenied,
-                                                 "MCP tier does not allow this operation",
-                                                 kTierRemediation),
+                    // Execution data is a distinct securable from the tool's
+                    // generic Infrastructure:Read gate above (G-S2), and it is
+                    // per-agent data: fleet_read_fn_ (require_fleet_read,
+                    // ADR-0017) is the SOLE gate on the (Execution, Read) pair
+                    // here -- tier + RBAC + management-group/service
+                    // confinement in one call, never stacked with a bare
+                    // tier_allows/perm_fn (mirrors get_execution_status
+                    // exactly). The counts below are the caller's confined
+                    // projection, and a confined-out execution reads EXACTLY
+                    // like an absent one (same narrative, denied audit row, no
+                    // success row) so existence is not an oracle (#3564).
+                    //
+                    // ServiceScopeClass stays `denied` for this tool: kind=agent
+                    // and kind=fleet have no mechanism on the service-scope
+                    // axis, and `confined` needs a real downstream mechanism
+                    // for EVERY kind (routed row, service-scope clause 3).
+                    if (!fleet_read_fn_) {
+                        spdlog::error("summarize_working_set(execution): fleet_read_fn_ "
+                                      "unwired; failing closed");
+                        res.set_content(error_response(id, kInternalError, "service unavailable"),
                                         "application/json");
                         return;
                     }
-                    if (!perm_fn(req, res, "Execution", "Read"))
+                    auto gate = fleet_read_fn_(req, res, "Execution", "Read");
+                    if (!gate.admitted)
+                        return; // gate already wrote the response.
+                    // get_execution_checked, not get_execution: a degrade must
+                    // not read as "was not found" (and must not write a denial
+                    // audit row for a legitimate caller).
+                    auto exec_r = execution_tracker->get_execution_checked(target_id);
+                    if (!exec_r) {
+                        res.set_content(
+                            a4_error(kInternalError, "execution tracker degraded", {},
+                                     /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                            "application/json");
                         return;
-                    auto exec = execution_tracker->get_execution(target_id);
-                    if (exec) {
+                    }
+                    const auto& exec = *exec_r;
+                    std::vector<AgentExecStatus> exec_agents;
+                    if (gate.scope) {
+                        // Read whether or not the row exists, so an absent id
+                        // and an invisible one do the same backing work.
+                        auto agents_opt = execution_tracker->get_agent_statuses_checked(target_id);
+                        if (!agents_opt) {
+                            res.set_content(a4_error(kInternalError,
+                                                     "execution tracker degraded", {},
+                                                     /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                                            "application/json");
+                            return;
+                        }
+                        exec_agents = std::move(*agents_opt);
+                    }
+                    if (exec && execution_visible(*exec, exec_agents, gate.scope,
+                                                  session->username)) {
+                        int agents_targeted = exec->agents_targeted;
+                        int agents_responded = exec->agents_responded;
+                        if (gate.scope) {
+                            const auto counts = confined_projection(exec_agents, gate.scope);
+                            agents_targeted = counts.agents_targeted;
+                            agents_responded = counts.agents_responded;
+                        }
                         narrative = "Execution " + target_id + " is " + exec->status +
-                                    " with targeted=" + std::to_string(exec->agents_targeted) +
-                                    " responded=" + std::to_string(exec->agents_responded) + ".";
+                                    " with targeted=" + std::to_string(agents_targeted) +
+                                    " responded=" + std::to_string(agents_responded) + ".";
                     } else {
                         narrative = "Execution " + target_id + " was not found.";
+                        execution_not_visible = true;
                     }
                     next.add("get_execution_status").add("query_responses");
                 } else {
@@ -19573,7 +19622,11 @@ McpServer::HandlerFn McpServer::build_handler(
                                    .raw("recommended_next_tools", next.str())
                                    .str();
                 auto result = tool_result(payload, kObjectOutputSchema);
-                mcp_audit("success", kind + ":" + target_id);
+                if (execution_not_visible)
+                    mcp_audit("denied", "not found or outside caller's fleet-read scope: " +
+                                            target_id);
+                else
+                    mcp_audit("success", kind + ":" + target_id);
                 res.set_content(success_response(id, result), "application/json");
                 return;
             }

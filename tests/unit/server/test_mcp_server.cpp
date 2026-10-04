@@ -11080,10 +11080,19 @@ TEST_CASE("MCP Agentic demo: summarize_working_set execution kind requires Execu
 
     McpTestServer ts;
     ts.execution_tracker_for_test = &tracker;
-    // Deny ONLY Execution:Read — the tool's generic Infrastructure:Read still
-    // allows, so reaching the execution branch must be the thing that 403s.
-    ts.perm_override_for_test = [](const std::string& sec, const std::string& op) -> bool {
-        return !(sec == "Execution" && op == "Read");
+    // The (Execution, Read) pair is now gated ONLY by fleet_read_fn_ (the plain
+    // perm_fn on that pair is gone), so the deny knob is the fleet gate. The tool's
+    // generic Infrastructure:Read still allows, so reaching the execution branch must
+    // be the thing that 403s.
+    ts.fleet_read_fn_for_test = [](const httplib::Request&, httplib::Response& res,
+                                   const std::string& sec,
+                                   const std::string& op) -> yuzu::server::authz::FleetReadGate {
+        if (sec == "Execution" && op == "Read") {
+            res.status = 403;
+            res.set_content(R"({"error":"forbidden"})", "application/json");
+            return {false, yuzu::server::authz::deny_all()};
+        }
+        return {true, std::nullopt};
     };
     ts.start("readonly");
 
@@ -11091,6 +11100,289 @@ TEST_CASE("MCP Agentic demo: summarize_working_set execution kind requires Execu
         R"({"jsonrpc":"2.0","method":"tools/call","id":302,"params":{"name":"summarize_working_set","arguments":{"kind":"execution","id":"exec-xyz"}}})");
     REQUIRE(res);
     CHECK(res->status == 403); // denied at the Execution:Read gate, before tracker read
+}
+
+TEST_CASE("MCP summarize_working_set execution: perm_fn is not a second gate on the "
+          "(Execution Read) pair",
+          "[pg][mcp][integration][agentic-demo][scope][3526]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    yuzu::server::ExecutionTracker& tracker = *tracker_bundle;
+    McpTestServer ts;
+    ts.execution_tracker_for_test = &tracker;
+    ts.perm_override_for_test = [](const std::string& sec, const std::string& op) -> bool {
+        return !(sec == "Execution" && op == "Read"); // would 403 if still stacked
+    };
+    ts.start("readonly");
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":303,"params":{"name":"summarize_working_set","arguments":{"kind":"execution","id":"exec-xyz"}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+}
+
+TEST_CASE("MCP summarize_working_set execution: unwired fleet_read_fn_ fails closed (#3526)",
+          "[pg][mcp][integration][agentic-demo][scope][3526]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    yuzu::server::ExecutionTracker& tracker = *tracker_bundle;
+    yuzu::server::Execution exec;
+    exec.definition_id = "def-unwired";
+    exec.dispatched_by = "alice";
+    exec.status = "running";
+    exec.agents_targeted = 7;
+    auto created = tracker.create_execution(exec);
+    REQUIRE(created.has_value());
+
+    McpTestServer ts;
+    ts.execution_tracker_for_test = &tracker;
+    ts.fleet_read_fn_for_test = {};
+    ts.start("readonly");
+    auto res = ts.call(
+        std::string(R"({"jsonrpc":"2.0","method":"tools/call","id":304,)"
+                    R"("params":{"name":"summarize_working_set","arguments":{"kind":"execution","id":")") +
+        *created + R"("}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+    CHECK(res->body.find("targeted=") == std::string::npos);
+}
+
+namespace {
+// Seeds an execution dispatched by `dispatched_by` with one terminal status row per
+// (agent, status) pair; the stored `agents_targeted` is deliberately 9 so a confined
+// projection that fell back to the stored counters would show.
+std::string seed_summarize_exec(yuzu::server::ExecutionTracker& tracker,
+                                const std::string& dispatched_by,
+                                const std::vector<std::pair<std::string, std::string>>& rows) {
+    yuzu::server::Execution exec;
+    exec.definition_id = "def-summarize-3526";
+    exec.dispatched_by = dispatched_by;
+    exec.status = "running";
+    exec.agents_targeted = 9;
+    exec.agents_responded = 9;
+    auto created = tracker.create_execution(exec);
+    REQUIRE(created.has_value());
+    for (const auto& [agent, status] : rows) {
+        yuzu::server::AgentExecStatus a;
+        a.agent_id = agent;
+        a.status = status;
+        tracker.update_agent_status(*created, a);
+    }
+    return *created;
+}
+
+std::string summarize_exec_call_body(const std::string& exec_id) {
+    return std::string(R"({"jsonrpc":"2.0","method":"tools/call","id":310,)"
+                       R"("params":{"name":"summarize_working_set","arguments":{"kind":"execution","id":")") +
+           exec_id + R"("}}})";
+}
+
+std::string narrative_of(const std::string& body) {
+    return nlohmann::json::parse(body)["result"]["structuredContent"]["narrative"]
+        .get<std::string>();
+}
+
+std::string replace_all_str(std::string s, const std::string& from, const std::string& to) {
+    for (auto at = s.find(from); at != std::string::npos; at = s.find(from, at + to.size()))
+        s.replace(at, from.size(), to);
+    return s;
+}
+
+void rename_exec_table(const std::string& dsn, const std::string& from, const std::string& to) {
+    yuzu::server::pg::PgConn conn{PQconnectdb(dsn.c_str())};
+    REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+    yuzu::server::pg::PgResult r{
+        PQexec(conn.get(), ("ALTER TABLE execution_tracker." + from + " RENAME TO " + to).c_str())};
+    REQUIRE(r.ok());
+}
+} // namespace
+
+TEST_CASE("MCP summarize_working_set execution: confined caller sees the exact projected counts (#3526)",
+          "[pg][mcp][integration][agentic-demo][scope][3526]") {
+    YUZU_REQUIRE_PG_DB_TPL(authz_db, yuzu::test::response_execution_authz_tpl);
+    yuzu::test::ResponseExecutionAuthzPgRig authz{authz_db.dsn()};
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    yuzu::server::ExecutionTracker& tracker = *tracker_bundle;
+    const auto exec_id = seed_summarize_exec(
+        tracker, "alice", {{"bob-agent", "success"}, {"alice-agent", "failure"}});
+
+    McpTestServer ts;
+    ts.execution_tracker_for_test = &tracker;
+    ts.fleet_read_fn_for_test = authz.fleet_read_fn();
+    ts.mock_username = "bob";
+    ts.start("operator");
+    auto res = ts.call_raw("POST", summarize_exec_call_body(exec_id),
+                           {{"Authorization", "Bearer " + authz.mint_bob()}});
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    // One in-scope row, terminal: NOT the stored 9/9, NOT the unscoped 2 rows.
+    CHECK(narrative_of(res->body) ==
+          "Execution " + exec_id + " is running with targeted=1 responded=1.");
+    CHECK(ts.audit_log.back() == "mcp.summarize_working_set|success");
+
+    // Control: an unconfined caller (default test gate, nullopt scope) sees the stored counters.
+    McpTestServer open_ts;
+    open_ts.execution_tracker_for_test = &tracker;
+    open_ts.start("readonly");
+    auto open_res = open_ts.call(summarize_exec_call_body(exec_id));
+    REQUIRE(open_res);
+    // (targeted is the stored 9; responded is recomputed to 2 terminal rows by the tracker.)
+    CHECK(narrative_of(open_res->body) ==
+          "Execution " + exec_id + " is running with targeted=9 responded=2.");
+}
+
+TEST_CASE("MCP summarize_working_set execution: confined-out reads exactly like absent (#3564 #3526)",
+          "[pg][mcp][integration][agentic-demo][scope][3526][notfound]") {
+    YUZU_REQUIRE_PG_DB_TPL(authz_db, yuzu::test::response_execution_authz_tpl);
+    yuzu::test::ResponseExecutionAuthzPgRig authz{authz_db.dsn()};
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    yuzu::server::ExecutionTracker& tracker = *tracker_bundle;
+    // alice-agent only, dispatched by alice: bob has no visible agent and does not own it.
+    const auto hidden_id = seed_summarize_exec(tracker, "alice", {{"alice-agent", "failure"}});
+    const std::string missing_id = "exec-does-not-exist-3526";
+
+    McpTestServer ts;
+    ts.execution_tracker_for_test = &tracker;
+    ts.fleet_read_fn_for_test = authz.fleet_read_fn();
+    ts.mock_username = "bob";
+    ts.start("operator");
+    const auto token = authz.mint_bob();
+    auto hidden = ts.call_raw("POST", summarize_exec_call_body(hidden_id),
+                              {{"Authorization", "Bearer " + token}});
+    auto missing = ts.call_raw("POST", summarize_exec_call_body(missing_id),
+                               {{"Authorization", "Bearer " + token}});
+    REQUIRE(hidden);
+    REQUIRE(missing);
+    CHECK(narrative_of(hidden->body) == "Execution " + hidden_id + " was not found.");
+    // Byte-identical modulo the echoed id.
+    CHECK(replace_all_str(hidden->body, hidden_id, "<ID>") ==
+          replace_all_str(missing->body, missing_id, "<ID>"));
+    CHECK(hidden->body.find("targeted=") == std::string::npos);
+
+    // Two calls, two `denied` rows with the not-found-or-out-of-scope detail, no success row.
+    REQUIRE(ts.audit_log.size() == 2);
+    for (const auto& a : ts.audit_log)
+        CHECK(a == "mcp.summarize_working_set|denied");
+    REQUIRE(ts.audit_details.size() == 2);
+    CHECK(ts.audit_details[0] == "not found or outside caller's fleet-read scope: " + hidden_id);
+    CHECK(ts.audit_details[1] == "not found or outside caller's fleet-read scope: " + missing_id);
+}
+
+TEST_CASE("MCP summarize_working_set execution: owner with zero visible agents sees an empty "
+          "projection (#3526)",
+          "[pg][mcp][integration][agentic-demo][scope][3526]") {
+    YUZU_REQUIRE_PG_DB_TPL(authz_db, yuzu::test::response_execution_authz_tpl);
+    yuzu::test::ResponseExecutionAuthzPgRig authz{authz_db.dsn()};
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    yuzu::server::ExecutionTracker& tracker = *tracker_bundle;
+    const auto exec_id = seed_summarize_exec(tracker, "bob", {{"alice-agent", "success"}});
+
+    McpTestServer ts;
+    ts.execution_tracker_for_test = &tracker;
+    ts.fleet_read_fn_for_test = authz.fleet_read_fn();
+    ts.mock_username = "bob";
+    ts.start("operator");
+    auto res = ts.call_raw("POST", summarize_exec_call_body(exec_id),
+                           {{"Authorization", "Bearer " + authz.mint_bob()}});
+    REQUIRE(res);
+    // Ownership admits VISIBILITY only: the counts are still the confined projection.
+    CHECK(narrative_of(res->body) ==
+          "Execution " + exec_id + " is running with targeted=0 responded=0.");
+    CHECK(ts.audit_log.back() == "mcp.summarize_working_set|success");
+}
+
+TEST_CASE("MCP summarize_working_set execution: a tracker degrade is an error with a retry "
+          "hint and no denial audit (#3526)",
+          "[pg][mcp][integration][agentic-demo][scope][3526]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    yuzu::server::ExecutionTracker& tracker = *tracker_bundle;
+    const auto exec_id = seed_summarize_exec(tracker, "operator", {});
+
+    McpTestServer ts;
+    ts.execution_tracker_for_test = &tracker;
+    ts.start("operator");
+    rename_exec_table(tracker_bundle.dsn(), "executions", "executions_hidden_3526");
+    auto res = ts.call(summarize_exec_call_body(exec_id));
+    rename_exec_table(tracker_bundle.dsn(), "executions_hidden_3526", "executions");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+    CHECK(body["error"]["data"]["retry_after_ms"].get<int64_t>() ==
+          yuzu::server::mcp::kMcpStoreFaultRetryMs);
+    CHECK(res->body.find("was not found") == std::string::npos);
+    for (const auto& a : ts.audit_log)
+        CHECK(a != "mcp.summarize_working_set|denied");
+}
+
+TEST_CASE("MCP summarize_working_set execution: a status-read degrade under a confined scope "
+          "is an error with a retry hint (#3526)",
+          "[pg][mcp][integration][agentic-demo][scope][3526]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    yuzu::server::ExecutionTracker& tracker = *tracker_bundle;
+    const auto exec_id = seed_summarize_exec(tracker, "operator", {{"agent-in", "success"}});
+
+    McpTestServer ts;
+    ts.execution_tracker_for_test = &tracker;
+    ts.fleet_read_fn_for_test = [](const httplib::Request&, httplib::Response&,
+                                   const std::string&,
+                                   const std::string&) -> yuzu::server::authz::FleetReadGate {
+        return {true, yuzu::server::authz::VisibleSet{std::unordered_set<std::string>{"agent-in"}}};
+    };
+    ts.start("operator");
+    rename_exec_table(tracker_bundle.dsn(), "agent_exec_status", "agent_exec_status_hidden_3526");
+    auto res = ts.call(summarize_exec_call_body(exec_id));
+    rename_exec_table(tracker_bundle.dsn(), "agent_exec_status_hidden_3526", "agent_exec_status");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+    CHECK(body["error"]["data"]["retry_after_ms"].get<int64_t>() ==
+          yuzu::server::mcp::kMcpStoreFaultRetryMs);
+    CHECK(res->body.find("was not found") == std::string::npos);
+    for (const auto& a : ts.audit_log)
+        CHECK(a != "mcp.summarize_working_set|denied");
+}
+
+// ServiceScopeClass for summarize_working_set stays the default `denied`: kind=agent and
+// kind=fleet have no mechanism on the service-scope axis, and `confined` needs a real
+// downstream mechanism for EVERY kind (routed row clause 3), so migrating kind=execution's
+// gate does NOT admit a service-scoped token. Pin it (copy of the #4980 proof): C8 must
+// short-circuit BEFORE the handler's own fleet_read_fn_ ever runs.
+TEST_CASE("MCP C8: summarize_working_set is denied for a service-scoped token before "
+          "fleet_read_fn_ ever runs (#3526)",
+          "[mcp][integration][security][service_scope]") {
+    yuzu::MetricsRegistry reg;
+    McpTestServer ts;
+    ts.mock_token_scope_service = "printers";
+    ts.metrics_for_test = &reg;
+    bool fleet_read_fn_reached = false;
+    ts.fleet_read_fn_for_test = [&fleet_read_fn_reached](
+                                    const httplib::Request&, httplib::Response&,
+                                    const std::string&,
+                                    const std::string&) -> yuzu::server::authz::FleetReadGate {
+        fleet_read_fn_reached = true;
+        return {.admitted = true, .scope = {}};
+    };
+    ts.start();
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":51,"params":{"name":"summarize_working_set","arguments":{"kind":"execution","id":"exec-xyz"}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kPermissionDenied);
+    CHECK_FALSE(fleet_read_fn_reached);
+
+    bool saw_denied = false;
+    for (const auto& a : ts.audit_log) {
+        if (a == "mcp.summarize_working_set|denied")
+            saw_denied = true;
+        CHECK(a != "mcp.summarize_working_set|success");
+    }
+    CHECK(saw_denied);
+    CHECK(reg.counter("yuzu_auth_service_scope_default_denied_total",
+                       {{"permission", "Infrastructure:Read"}, {"path_class", "mcp"}})
+              .value() == 1.0);
 }
 
 // #3344: get_execution_status had zero prior unit coverage.
