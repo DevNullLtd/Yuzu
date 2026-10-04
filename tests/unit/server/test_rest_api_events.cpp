@@ -686,17 +686,20 @@ TEST_CASE("GET /api/v1/events: ?since param replays buffered events", "[pg][even
     REQUIRE(h.event_bus->subscriber_count(exec_id) == 1);
 }
 
-TEST_CASE("GET /api/v1/events: invalid ?since parses to no-replay (0)", "[pg][events][replay]") {
+TEST_CASE("GET /api/v1/events: an invalid ?since is a 400, not a silent no-replay",
+          "[pg][events][replay]") {
     RestEventsHarness h;
     auto exec_id = h.make_exec("running");
     h.event_bus->publish(exec_id, "execution-progress", R"({"pending":1})", false);
-    // Garbage `since` value should not 400 — mirrors the dashboard SSE
-    // sibling which silently degrades to "no replay" rather than
-    // breaking an EventSource auto-reconnect on a stale id.
+    // #4644 Gate 7 flipped this from "degrades to no replay": `?since` is the caller's EXPLICIT
+    // cursor (stoull read "-1" as a cursor past every event and "5abc" as 5), so a malformed one
+    // is refused before any subscription or stream-budget lease. The `Last-Event-ID` HEADER, which a
+    // browser sends on its own reconnect, keeps the neutral no-replay outcome (see the
+    // numeric_params tests below).
     auto res = h.sink.Get("/api/v1/events?execution_id=" + exec_id + "&since=not-a-number");
     REQUIRE(res);
-    REQUIRE(res->status == 200);
-    REQUIRE(h.event_bus->subscriber_count(exec_id) == 1);
+    REQUIRE(res->status == 400);
+    REQUIRE(h.event_bus->subscriber_count(exec_id) == 0);
 }
 
 // ── OpenAPI discovery (A2) ──────────────────────────────────────────────────
