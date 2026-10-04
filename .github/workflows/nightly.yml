@@ -232,6 +232,7 @@ jobs:
             -Dbuild_tests=true \
             -Db_sanitize=address,undefined \
             -Dcpp_args=-fno-sanitize=null,alignment
+          python3 scripts/ci/assert-gateway-tests.py build-linux-asan
 
       - name: Build
         run: meson compile -C build-linux-asan -j "$YUZU_BUILD_JOBS"
@@ -399,6 +400,7 @@ jobs:
             -Dcmake_prefix_path=${{ github.workspace }}/vcpkg_installed/x64-linux-tsan \
             -Dbuild_tests=true \
             -Db_sanitize=thread
+          python3 scripts/ci/assert-gateway-tests.py build-linux-tsan
 
       - name: Build
         run: meson compile -C build-linux-tsan -j "$YUZU_BUILD_JOBS"
@@ -667,6 +669,7 @@ jobs:
             -Dbuild_tests=true \
             -Db_sanitize=address \
             -Dcpp_args="-D_DISABLE_STRING_ANNOTATION -D_DISABLE_VECTOR_ANNOTATION"
+          python scripts/ci/assert-gateway-tests.py build-windows-asan
 
       - name: Build
         run: meson compile -C build-windows-asan tests/yuzu_agent_tests -j "$YUZU_BUILD_JOBS"
@@ -846,6 +849,7 @@ jobs:
             -Dcmake_prefix_path=${{ github.workspace }}/vcpkg_installed/x64-linux \
             -Dbuild_tests=true \
             -Db_coverage=true
+          python3 scripts/ci/assert-gateway-tests.py build-linux-coverage
 
       - name: Build
         run: meson compile -C build-linux-coverage -j "$YUZU_BUILD_JOBS"

@@ -128,6 +128,47 @@ remote_lookup_miss_test_() ->
     end}.
 
 %%%===================================================================
+%%% Heartbeat admission is node-local
+%%%===================================================================
+
+%% A session held by a peer node is not admitted here: heartbeat admission
+%% reads this node's session index only and never the cross-node `pg' groups,
+%% so a heartbeat for it is answered like any other unknown session.
+remote_session_not_admitted_test_() ->
+    {timeout, 30, fun() ->
+        yuzu_gw_test_registry:ensure(),
+        {ok, _} = application:ensure_all_started(telemetry),
+        {ok, Peer, PeerNode} = start_peer(),
+        catch meck:unload(yuzu_gw_conn),
+        catch meck:unload(yuzu_gw_heartbeat_buffer),
+        ok = meck:new(yuzu_gw_conn, [non_strict, no_link]),
+        ok = meck:expect(yuzu_gw_conn, key_from_ctx, fun(_) -> conn_a end),
+        ok = meck:new(yuzu_gw_heartbeat_buffer, [passthrough, no_link]),
+        ok = meck:expect(yuzu_gw_heartbeat_buffer, queue_heartbeat, fun(_) -> ok end),
+        try
+            SessionId = <<"multinode-remote-session">>,
+            AgentId = <<"multinode-remote-session-agent">>,
+            PeerAgentPid = spawn_holder(PeerNode),
+            ok = erpc:call(PeerNode, yuzu_gw_registry, register_agent,
+                           [AgentId, PeerAgentPid, SessionId, [], <<"peerhost">>, #{}, conn_a]),
+            %% The peer holds the session under the very key presented here.
+            ?assertMatch({ok, #{conn_key := conn_a}},
+                         erpc:call(PeerNode, yuzu_gw_registry, lookup_session, [SessionId])),
+            %% Wait for pg to replicate the agent group so a cross-node
+            %% lookup would find it; admission must still refuse.
+            ?assertEqual({ok, PeerAgentPid}, await_lookup(AgentId, PeerAgentPid, 100)),
+            ?assertEqual(error, yuzu_gw_registry:lookup_session(SessionId)),
+            ?assertEqual({grpc_error, {<<"5">>, <<"unknown session">>}},
+                         yuzu_gw_agent_service:heartbeat(ctx:background(),
+                                                         #{session_id => SessionId})),
+            ?assertEqual(0, meck:num_calls(yuzu_gw_heartbeat_buffer, queue_heartbeat, '_'))
+        after
+            meck:unload([yuzu_gw_conn, yuzu_gw_heartbeat_buffer]),
+            stop_peer(Peer)
+        end
+    end}.
+
+%%%===================================================================
 %%% Cross-node fanout completion (the fanout_terminal routing fix)
 %%%===================================================================
 

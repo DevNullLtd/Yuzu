@@ -150,3 +150,74 @@ reject_atoms(Term) when is_tuple(Term) ->
 reject_atoms(Term) when is_list(Term) ->
     lists:append([reject_atoms(E) || E <- Term]);
 reject_atoms(_) -> [].
+
+%% Heartbeat admission counters. Both families must exist at 0 after setup()
+%% (a series that first appears already at 1 is invisible to increase()), the
+%% reason list must match the reject reasons yuzu_gw_heartbeat_admission can
+%% return, and the mismatch family carries event="security" so it routes to
+%% the SIEM like the server's own session-binding counters.
+heartbeat_admission_series_test_() ->
+    {setup,
+     fun() ->
+        {ok, S1} = application:ensure_all_started(prometheus),
+        {ok, S2} = application:ensure_all_started(telemetry),
+        catch telemetry:detach(yuzu_gw_prometheus),
+        ok = yuzu_gw_telemetry:setup(),
+        S1 ++ S2
+     end,
+     fun(_) -> catch telemetry:detach(yuzu_gw_prometheus) end,
+     [
+      {"every rejection reason has a series from startup",
+       fun() ->
+           Out = prometheus_text_format:format(),
+           [?assertNotEqual(nomatch,
+                            binary:match(Out, iolist_to_binary(
+                              ["yuzu_gw_heartbeat_rejected_total{reason=\"",
+                               atom_to_binary(R, utf8), "\"} 0"])))
+            || R <- yuzu_gw_telemetry:heartbeat_reject_reasons()]
+       end},
+      {"the mismatch family exists at 0 and carries event=\"security\"",
+       fun() ->
+           Out = prometheus_text_format:format(),
+           ?assertNotEqual(nomatch,
+                           binary:match(Out,
+                             <<"yuzu_gw_heartbeat_session_mismatch_total{event=\"security\"} 0">>))
+       end},
+      {"events increment the matching series",
+       fun() ->
+           Read = fun(Name, Labels) ->
+               prometheus_counter:value(Name, Labels)
+           end,
+           B1 = Read(yuzu_gw_heartbeat_rejected_total, [<<"unknown_session">>]),
+           B2 = Read(yuzu_gw_heartbeat_session_mismatch_total, [<<"security">>]),
+           telemetry:execute([yuzu, gw, heartbeat, rejected], #{count => 1},
+                             #{reason => unknown_session}),
+           telemetry:execute([yuzu, gw, heartbeat, session_mismatch], #{count => 1}, #{}),
+           ?assertEqual(B1 + 1,
+                        Read(yuzu_gw_heartbeat_rejected_total, [<<"unknown_session">>])),
+           ?assertEqual(B2 + 1,
+                        Read(yuzu_gw_heartbeat_session_mismatch_total, [<<"security">>]))
+       end},
+      {"the reason list matches every reject reason in yuzu_gw_heartbeat_admission",
+       fun() ->
+           Src = filename:join([code:lib_dir(yuzu_gw), "src",
+                                "yuzu_gw_heartbeat_admission.erl"]),
+           {ok, Forms} = epp:parse_file(Src, []),
+           Returned = lists:usort(admission_reject_atoms(Forms)),
+           ?assertNotEqual([], Returned),
+           %% connection_mismatch is its own family, so it is not a `reason'.
+           ?assertEqual(lists:usort([connection_mismatch |
+                                     yuzu_gw_telemetry:heartbeat_reject_reasons()]),
+                        Returned)
+       end}
+     ]}.
+
+%% Every literal atom A in a `{reject, A}' tuple expression in the parsed source.
+admission_reject_atoms(Term) when is_tuple(Term) ->
+    case Term of
+        {tuple, _, [{atom, _, reject}, {atom, _, A}]} -> [A];
+        _ -> admission_reject_atoms(tuple_to_list(Term))
+    end;
+admission_reject_atoms(Term) when is_list(Term) ->
+    lists:append([admission_reject_atoms(E) || E <- Term]);
+admission_reject_atoms(_) -> [].

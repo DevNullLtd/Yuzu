@@ -71,6 +71,22 @@ jobs:
           /tmp/yuzu-review-venv/bin/pip install --require-hashes -r requirements-ci.txt
           echo "/tmp/yuzu-review-venv/bin" >> "$GITHUB_PATH"
 
+      # OTP + rebar3 for the gateway tests. Without them meson's
+      # `find_program('rebar3', required: false)` silently skips `gateway
+      # eunit` / `gateway ct`, and this leg would claim a green `meson test`
+      # without having run the gateway (#4800, #4841). Same pin as ci.yml's
+      # Linux leg and release.yml. The runner is a GitHub-hosted, ephemeral
+      # VM, so ImageOS is auto-detected and setup-beam's tool cache is
+      # discarded with the VM (no shared self-hosted tool_cache to isolate).
+      # setup-beam uses the tool cache, not the Actions cache service, so
+      # this does not reopen the quarantine-cache concern described at the
+      # purge job below.
+      - name: Install Erlang/OTP and rebar3
+        uses: erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124 # v1.24.1
+        with:
+          otp-version: '28'
+          rebar3-version: '3.24'
+
       - name: Set up isolated vcpkg
         uses: lukka/run-vcpkg@b1a0dd252f06b9e25b3c022a9a03bd7a427fb6a2 # v11.6
         with:
@@ -85,6 +101,7 @@ jobs:
           ./scripts/setup.sh \
             --tests \
             --native-file meson/native/linux-gcc13.ini
+          python3 scripts/ci/assert-gateway-tests.py build-linux
 
       - name: Compile
         run: meson compile -C build-linux

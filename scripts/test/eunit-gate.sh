@@ -11,9 +11,14 @@
 #   * A flake (registry_tests gen_server timeout under VM pollution) aborts
 #     a test set partway through.
 # Neither case is a regression we want to block a `/test` run on. This
-# wrapper exits 0 iff EUnit's summary line says `Failed: 0`. Real failures
-# (Failed: N > 0) and infrastructure errors (no summary line) propagate as
-# non-zero.
+# wrapper exits 0 iff EUnit's summary line says `Failed: 0` AND at least one
+# test EXECUTED. Real failures (Failed: N > 0), infrastructure errors (no
+# summary line) and zero-executed runs propagate as non-zero. The executed
+# check matters because a set-up that crashes in EVERY module prints
+# `Failed: 0.  Skipped: 0.  Passed: 0.` plus "One or more tests were
+# cancelled" -- an all-cancelled run that would otherwise read as a pass
+# (the #4800 false-green class; scripts/test_gateway.py applies the same rule
+# via scripts/gateway_test_summary.py).
 #
 # Usage:
 #   bash scripts/test/eunit-gate.sh [extra rebar3 args...]
@@ -23,9 +28,12 @@
 # (e.g. --module=foo,bar) — default is `--dir apps/yuzu_gw/test`.
 #
 # Exit codes:
-#   0 — EUnit ran and Failed: 0 (passed, even if some sets were cancelled)
-#   1 — EUnit ran and Failed: >0 OR no summary line found (real failure)
-#   2 — toolchain or invocation error (rebar3 missing, gateway/ missing)
+#   0 — EUnit ran, Failed: 0, and >= 1 test executed (passed, even if some
+#       sets were cancelled)
+#   1 — EUnit ran and Failed: >0, OR no summary line found, OR 0 tests
+#       executed (real failure)
+#   2 — toolchain or invocation error (rebar3 or python3 missing, gateway/
+#       missing, capture file unreadable)
 
 set -uo pipefail
 
@@ -51,6 +59,14 @@ if ! command -v rebar3 >/dev/null 2>&1; then
     echo "eunit-gate: rebar3 not on PATH" >&2
     exit 2
 fi
+# Checked up front so a missing parser fails before minutes of tests run.
+# `python3` only: this gate runs from /test and scripts/run-tests.sh on
+# Linux/macOS hosts, never on a Windows runner (Windows CI steps call
+# `python`; no workflow invokes this script).
+if ! command -v python3 >/dev/null 2>&1; then
+    echo "eunit-gate: python3 not on PATH (needed for the summary parser)" >&2
+    exit 2
+fi
 
 # Default args mirror the /test SKILL.md invocation. Callers can append
 # their own — e.g. `--module=foo,bar` — by passing them as positional
@@ -59,31 +75,21 @@ if [[ $# -eq 0 ]]; then
     set -- --dir apps/yuzu_gw/test
 fi
 
+# Per-run capture file: the verdict below is parsed from it, so a fixed path
+# would let two overlapping runs on one host (#1871) interleave and one read
+# the other's summary.
+capture=$(mktemp "${TMPDIR:-/tmp}/yuzu_test_eunit_gate.XXXXXX") \
+    || { echo "eunit-gate: mktemp failed" >&2; exit 2; }
+trap 'rm -f "$capture"' EXIT
+
 REBAR_BASE_DIR="${REBAR_BASE_DIR:-$PWD/_build_eunit}" \
-    rebar3 eunit "$@" 2>&1 | tee /tmp/eunit-gate-output.txt
+    rebar3 eunit "$@" 2>&1 | tee "$capture"
 rebar3_rc=${PIPESTATUS[0]}
 
-# Parse the EUnit summary. The line we care about looks like:
-#   `  Failed: N.  Skipped: N.  Passed: N.`
-# (sometimes preceded by `=======` banner). If rebar3 exit was 0 we trust
-# it (no need to second-guess); if non-zero we only flip to PASS when the
-# summary explicitly says Failed: 0.
-if [[ $rebar3_rc -eq 0 ]]; then
-    exit 0
-fi
-
-summary=$(grep -E "^[[:space:]]*Failed:[[:space:]]+[0-9]+" /tmp/eunit-gate-output.txt | tail -1)
-if [[ -z "$summary" ]]; then
-    echo "eunit-gate: rebar3 exited $rebar3_rc and no EUnit summary line found — treating as real failure" >&2
-    exit 1
-fi
-
-failed_count=$(echo "$summary" | sed -E 's/.*Failed:[[:space:]]+([0-9]+).*/\1/')
-if [[ "$failed_count" == "0" ]]; then
-    echo "eunit-gate: rebar3 exited $rebar3_rc but EUnit summary shows Failed: 0 — treating as PASS." \
-         "Cancellations are expected and not a regression (#1005)." >&2
-    exit 0
-fi
-
-echo "eunit-gate: EUnit reports Failed: $failed_count — real failure" >&2
-exit 1
+# The verdict comes from the same summary PARSER the Meson wrapper uses
+# (scripts/gateway_test_summary.py, pinned by tests/test_gateway_test_summary.py):
+# whole-line summary matching, the LAST summary wins, and >= 1 test must have
+# EXECUTED (#4800). Unlike the Meson gate, this gate (like the release
+# workflow's) tolerates a non-zero rebar3 exit when eunit's "Failed: 0" line
+# shows tests passed (cancelled sets, #1005); the Meson gate stays strict.
+python3 "$REPO_ROOT/scripts/gateway_test_summary.py" cancel-tolerant "$rebar3_rc" "$capture"

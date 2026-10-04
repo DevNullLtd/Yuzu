@@ -11,6 +11,10 @@
 
 #include "local_dispatcher.hpp"
 
+#if defined(_WIN32)
+#include <win_profiles.hpp> // enumerate_profile_list: the profile set the production collector walks
+#endif
+
 #include <algorithm>
 #include <cstdlib>
 #include <filesystem>
@@ -79,13 +83,13 @@ TEST_CASE("privacy_permissions: descriptor pins the single action per OS",
     REQUIRE(d->action_descriptor_count == 1);
     const auto& a = d->action_descriptors[0];
     CHECK(std::string_view{a.action} == "permissions");
-    // macOS is a real, CONSTRAINED rung-1 leg; Windows stays PLANNED until its own leg lands.
-    // A descriptor regression back to
-    // PLANNED (or an accidental Windows promotion) would otherwise pass every other test
-    // in this file, since none of them read the descriptor's support level.
+    // macOS and Windows are real, CONSTRAINED rung-1 legs. A descriptor regression to a
+    // placeholder support level would otherwise pass every other test in this file, since none
+    // of them read the descriptor's support level.
     CHECK(a.macos_leg.support == YUZU_SUPPORT_CONSTRAINED);
     CHECK(a.macos_leg.rung == 1);
-    CHECK(a.windows_leg.support == YUZU_SUPPORT_PLANNED);
+    CHECK(a.windows_leg.support == YUZU_SUPPORT_CONSTRAINED);
+    CHECK(a.windows_leg.rung == 1);
 }
 
 TEST_CASE("privacy_permissions: unknown action reports rc=1 and a named row",
@@ -196,26 +200,76 @@ TEST_CASE("privacy_permissions: the real macOS dispatch derives its typed status
 #endif
 
 #if defined(_WIN32)
-TEST_CASE("privacy_permissions: the Windows PLANNED leg's placeholder row and typed status are "
-          "both pinned exactly -- one whole-source row, UNAVAILABLE/PARTIAL, provenance "
-          "windows:planned -- so an emptied/duplicated row or a status that erases the planned "
-          "token (both real defects this pin has caught) fail here, not silently. Replace this "
-          "case per privacy_permissions_legs.hpp's checklist once the real leg lands.",
+TEST_CASE("privacy_permissions: the real Windows dispatch derives its typed status from what it "
+          "actually read, and it is never the UNAVAILABLE/windows:planned placeholder result. "
+          "The oracle admits token-only failures (a hive that would not unload, a LastUsedTime "
+          "read) that carry no row, so OK/FULL is never asserted from row shape alone.",
           "[privacy_permissions][dispatcher]") {
+    // CI exposure, stated plainly: this runs the REAL action, so it reads the host's real HKLM
+    // ProfileList and every real profile's ConsentStore, and for a logged-off profile it mounts that
+    // profile's real NTUSER.DAT (RegLoadKeyW) under the shared offline_hive_mutex. On the shared
+    // 4-runner/one-identity box, concurrent jobs running registry-touching tests can collide on a
+    // profile's hive file (ERROR_SHARING_VIOLATION), which surfaces as a `hive_mount_failed` row --
+    // the same exposure test_registry_local_dispatcher already carries. The oracle is therefore
+    // deliberately shape-level, like the macOS arm above: it pins that the status is never the
+    // placeholder and that PERMISSION_DENIED/CONSTRAINED come only with their row evidence. It does
+    // NOT pin the status itself (a hard-coded CONSTRAINED/PARTIAL satisfies the last branch), nor
+    // which profiles a host has or whether they could be read. The one discriminating check is the
+    // profile-coverage one at the end: every profile the host has must reach the wire. Value-level
+    // behaviour is covered where the inputs are controlled: the injected-read cases in
+    // test_privacy_permissions_parsers.cpp and the fixture-registry and TempDir cases in
+    // test_privacy_permissions_win_internals.cpp.
     auto plugin = load_plugin();
     if (!plugin) return;
     yuzu::agent::LocalDispatcher dispatcher;
     const auto result = dispatcher.run(plugin->descriptor(), "permissions");
+    bool any_unreadable = false;
+    for (const auto& row : rows_of(result.captured)) {
+        std::size_t start = 0;
+        for (int i = 0; i < 4; ++i) start = row.find('|', start) + 1;
+        const auto state = row.substr(start, row.find('|', start) - start);
+        if (state == "unreadable") any_unreadable = true;
+    }
+    CHECK(result.result_status != YUZU_RESULT_STATUS_UNAVAILABLE);
+    CHECK(result.result_provenance != "windows:planned");
+    if (result.result_status == YUZU_RESULT_STATUS_PERMISSION_DENIED) {
+        CHECK(result.result_completeness == YUZU_RESULT_COMPLETENESS_PARTIAL);
+    } else if (any_unreadable) {
+        CHECK(result.result_status == YUZU_RESULT_STATUS_CONSTRAINED);
+        CHECK(result.result_completeness == YUZU_RESULT_COMPLETENESS_PARTIAL);
+    } else {
+        const bool ok_full = result.result_status == YUZU_RESULT_STATUS_OK &&
+                             result.result_completeness == YUZU_RESULT_COMPLETENESS_FULL;
+        const bool constrained_partial =
+            result.result_status == YUZU_RESULT_STATUS_CONSTRAINED &&
+            result.result_completeness == YUZU_RESULT_COMPLETENESS_PARTIAL;
+        CHECK((ok_full || constrained_partial));
+    }
+
+    // Profile coverage: derive the profile set exactly as the collector does. A profile -- walked,
+    // unreachable or refused -- always puts at least one `<name>/`-qualified row on the wire, so a
+    // collector that handed the assembler an empty profile list would pass every check above and
+    // fail here. HKLM's own rows are unqualified, so only a profile-name prefix proves a walk. Only
+    // plain names are compared (the wire sanitizer rewrites anything else). "Any", not "every": a
+    // slow host's cooperative deadline may legitimately stop the run after the first profiles.
+    const auto profiles = yuzu::profiles::build_profile_list(
+        yuzu::win::enumerate_profile_list().records, yuzu::win::enumerate_hku_subkeys());
+    const auto plain = [](const std::string& n) {
+        return std::all_of(n.begin(), n.end(), [](char c) {
+            return (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                   c == '.' || c == '_' || c == '-';
+        });
+    };
     const auto rows = rows_of(result.captured);
-    REQUIRE(rows.size() == 1);
-    CHECK(rows[0] == "permissions|windows|-|-|unsupported|windows:planned|-|-");
-    CHECK(result.result_provenance == "windows:planned");
-    CHECK(result.result_status == YUZU_RESULT_STATUS_UNAVAILABLE);
-    // PARTIAL, not FULL: a planned leg has not looked at all, unlike the Linux leg's own
-    // "genuinely reachable mechanism, definitively no session" case (FULL, portal:unavailable
-    // -- a real, complete answer) and the macOS leg's own per-source denied/unreadable rows.
-    // The Windows leg bypasses the shared select_status() for exactly this reason; see
-    // privacy_permissions_win.cpp's banner.
-    CHECK(result.result_completeness == YUZU_RESULT_COMPLETENESS_PARTIAL);
+    bool expect_profile_row = false, saw_profile_row = false;
+    for (const auto& p : profiles) {
+        const std::string name = p.profile_name.empty() ? "-" : p.profile_name;
+        if (!plain(name)) continue;
+        expect_profile_row = true;
+        const std::string prefix = "permissions|windows|" + name + "/";
+        for (const auto& r : rows) saw_profile_row = saw_profile_row || r.rfind(prefix, 0) == 0;
+    }
+    INFO("the host has " << profiles.size() << " non-system profile(s), none reached the wire");
+    CHECK((!expect_profile_row || saw_profile_row));
 }
 #endif

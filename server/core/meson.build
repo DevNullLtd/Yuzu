@@ -263,6 +263,8 @@ content_embed = custom_target(
     '@OUTPUT@',
   ],
   build_always_stale: true,  # always re-scan content/ for edits
+  # embed_content.py skips the write when bytes are unchanged, so always-stale does not
+  # relink; guarded by tests/test_embed_content_idempotent.py.
 )
 
 # Build-time embed of the curated CPE map (PR 3, ADR-0018). Lives under
