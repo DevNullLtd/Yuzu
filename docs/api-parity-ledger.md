@@ -36,6 +36,14 @@ churns the ledger. Each row records:
   fragment route no longer exists; kept for history until the ledger row
   itself is deleted).
 
+One further row shape exists (#5342): a row keyed on a registered
+`/api/v1/*` route, legal ONLY with an `exception:` status. It records a
+REST v1 capability that deliberately has no MCP twin - ADR-1005 expects one
+by default, so the reviewed reason lives here instead of being implicit.
+The two password routes (`POST /api/v1/users/me/password`,
+`POST /api/v1/users/{name}/password`) are the first such rows. Every other
+v1 route stays out of the ledger and is held to the OpenAPI check instead.
+
 **What populated this first PR.** Every row was extracted mechanically by
 `check-api-parity.py`'s lexical scanner (verified self-consistent against
 this session's fresh measurement, AT THAT TIME: 173 registered `/api/v1/*`
@@ -116,7 +124,7 @@ plus `$ref` validity) - the #842 companion to this whole-tree script.
 | instructions | 24 | 11 | 13 |
 | compliance-policy | 19 | 6 | 13 |
 | settings | 15 | 0 | 15 |
-| rbac | 8 | 0 | 8 |
+| rbac | 10 | 0 | 10 |
 | auth-mfa | 7 | 0 | 7 |
 | engine-principals | 1 | 0 | 1 |
 | access-reviews | 2 | 0 | 2 |
@@ -124,11 +132,11 @@ plus `$ref` validity) - the #842 companion to this whole-tree script.
 | ota | 15 | 0 | 15 |
 | enrollment | 19 | 5 | 14 |
 | other | 74 | 13 | 61 |
-| **Total** | **284** | **81** | **203** |
+| **Total** | **286** | **81** | **205** |
 
-Registered `/api/vN/*` routes: 242. OpenAPI `paths` entries: 241. Missing from OpenAPI: 1 (1 carried in `check-api-parity.py`'s `ALLOWLIST_OPENAPI_MISSING` pending F2, 0 unallowlisted). MCP tools: 184.
+Registered `/api/vN/*` routes: 244. OpenAPI `paths` entries: 243. Missing from OpenAPI: 1 (1 carried in `check-api-parity.py`'s `ALLOWLIST_OPENAPI_MISSING` pending F2, 0 unallowlisted). MCP tools: 184.
 
-Ratchet baseline (untwinned rows; shrinks as routes are twinned, or rises only with a reviewed reason stated in the change that raises it): 203.
+Ratchet baseline (untwinned rows; shrinks as routes are twinned, or rises only with a reviewed reason stated in the change that raises it): 205.
 
 <!-- END GENERATED -->
 

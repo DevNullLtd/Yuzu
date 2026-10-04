@@ -458,16 +458,19 @@ TEST_CASE("SettingsRoutes POST /api/settings/users: role parameter ignored on cr
     CHECK(h.has_audit("user.create", "success", "User", "newadmin"));
 }
 
-TEST_CASE("SettingsRoutes POST /api/settings/users: admin self-password-change allowed",
+TEST_CASE("SettingsRoutes POST /api/settings/users: re-posting your own username is a 409 "
+          "and never a password change",
           "[settings][users]") {
     SettingsRoutesHarness h;
     h.session_user = "admin";
     h.session_role = auth::Role::admin;
 
-    // Self-password-change via the POST create endpoint is now a duplicate
-    // username rejection (C1 fix: creation always uses 'user' role, duplicates blocked).
-    // Self-password-change should use a dedicated endpoint in future.
-    // For now, creating with an existing username returns 409.
+    // The create endpoint can NEVER change a password — an existing username
+    // (here the caller's own) is a duplicate-username 409 (C1 fix: creation
+    // always uses 'user' role, duplicates blocked; AuthDB::upsert_user is
+    // INSERT-only). Changing your own password is POST
+    // /api/v1/users/me/password (#5342, test_rest_password_routes.cpp), which
+    // demands the current password.
     auto res = h.Post("/api/settings/users",
                         "username=admin&password=anotherpass12&role=admin",
                         "application/x-www-form-urlencoded");

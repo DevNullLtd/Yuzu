@@ -328,6 +328,140 @@ TEST_CASE("AuthDB user CRUD + role", "[pg][auth_db]") {
     }
 }
 
+// ── set_password (#5342) ───────────────────────────────────────────────────
+//
+// The ONLY writer of password_hash on an existing row. The guarded UPDATE's
+// WHERE clause is the local-account gate (active + identity_source='local' +
+// provisioning_source='local'); every refusal is a zero-row UserNotFound with
+// the stored credential left untouched.
+
+TEST_CASE("AuthDB::set_password writes a local account and clears its lockout",
+          "[pg][auth_db][password]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, auth_db_tpl);
+    Harness h{db.dsn()};
+    REQUIRE(h.db.upsert_user("pat", "oldhash", "oldsalt", yuzu::server::auth::Role::admin)
+                .has_value());
+    // Arm a lock first: a fresh credential must not inherit it.
+    for (int i = 0; i < 3; ++i)
+        REQUIRE(h.db.record_failed_login("pat", /*threshold=*/3, /*window_secs=*/3600).has_value());
+    REQUIRE(h.db.lockout_status("pat")->locked);
+
+    REQUIRE(h.db.set_password("pat", "newhash", "newsalt").has_value());
+
+    auto entry = h.db.get_user("pat");
+    REQUIRE(entry.has_value());
+    CHECK(entry->hash_hex == "newhash");
+    CHECK(entry->salt_hex == "newsalt");
+    CHECK(entry->role == yuzu::server::auth::Role::admin); // role untouched
+    auto st = h.db.lockout_status("pat");
+    REQUIRE(st.has_value());
+    CHECK_FALSE(st->locked);
+    CHECK(st->failed_count == 0);
+}
+
+TEST_CASE("AuthDB::set_password refuses non-local, inactive and absent accounts",
+          "[pg][auth_db][password]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, auth_db_tpl);
+    Harness h{db.dsn()};
+
+    auto expect_untouched = [&](const std::string& user, const std::string& hash) {
+        auto entry = h.db.get_user(user);
+        REQUIRE(entry.has_value());
+        CHECK(entry->hash_hex == hash);
+    };
+
+    SECTION("SCIM-provisioned row (provisioning_source='scim')") {
+        REQUIRE(h.db.upsert_user("scimmed", "h0", "s0", yuzu::server::auth::Role::user).has_value());
+        REQUIRE(h.db.set_provisioning_source("scimmed", "scim").has_value());
+        auto r = h.db.set_password("scimmed", "h1", "s1");
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error() == AuthDBError::UserNotFound);
+        expect_untouched("scimmed", "h0");
+    }
+    SECTION("identity_source not local, provisioning_source still local") {
+        REQUIRE(h.db.upsert_user("ssoish", "h0", "s0", yuzu::server::auth::Role::user).has_value());
+        REQUIRE(h.db.set_identity_source("ssoish", "scim").has_value());
+        auto r = h.db.set_password("ssoish", "h1", "s1");
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error() == AuthDBError::UserNotFound);
+        expect_untouched("ssoish", "h0");
+    }
+    SECTION("SSO principal (fails is_valid_username before any query)") {
+        const std::string principal = "oidc:https://idp.example#sub-9";
+        REQUIRE(h.db.upsert_sso_identity(principal, "https://idp.example", "sub-9", "Sam", "oidc")
+                    .has_value());
+        auto r = h.db.set_password(principal, "h1", "s1");
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error() == AuthDBError::InvalidUsername);
+    }
+    SECTION("inactive (soft-deleted) row") {
+        REQUIRE(h.db.upsert_user("gone", "h0", "s0", yuzu::server::auth::Role::user).has_value());
+        REQUIRE(h.db.remove_user("gone").has_value());
+        auto r = h.db.set_password("gone", "h1", "s1");
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error() == AuthDBError::UserNotFound);
+        // Reactivate to prove the stored credential was not rewritten.
+        REQUIRE(h.db.reactivate_user("gone").has_value());
+        expect_untouched("gone", "h0");
+    }
+    SECTION("absent row") {
+        auto r = h.db.set_password("nobody", "h1", "s1");
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error() == AuthDBError::UserNotFound);
+    }
+    SECTION("empty hash / salt / CAS anchor is InvalidCredentials") {
+        REQUIRE(h.db.upsert_user("emp", "h0", "s0", yuzu::server::auth::Role::user).has_value());
+        CHECK(h.db.set_password("emp", "", "s1").error() == AuthDBError::InvalidCredentials);
+        CHECK(h.db.set_password("emp", "h1", "").error() == AuthDBError::InvalidCredentials);
+        CHECK(h.db.set_password("emp", "h1", "s1", std::string{}).error() ==
+              AuthDBError::InvalidCredentials);
+        expect_untouched("emp", "h0");
+    }
+}
+
+TEST_CASE("AuthDB::set_password compare-and-swap on the expected current hash",
+          "[pg][auth_db][password]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, auth_db_tpl);
+    Harness h{db.dsn()};
+    REQUIRE(h.db.upsert_user("cas", "h0", "s0", yuzu::server::auth::Role::user).has_value());
+
+    // A stale anchor is refused and leaves the row alone.
+    auto stale = h.db.set_password("cas", "h1", "s1", std::string("not-the-hash"));
+    REQUIRE_FALSE(stale.has_value());
+    CHECK(stale.error() == AuthDBError::UserNotFound);
+    CHECK(h.db.get_user("cas")->hash_hex == "h0");
+
+    // The right anchor lands.
+    REQUIRE(h.db.set_password("cas", "h1", "s1", std::string("h0")).has_value());
+    CHECK(h.db.get_user("cas")->hash_hex == "h1");
+
+    // The rollback shape: restore only if the stored hash is still ours.
+    REQUIRE(h.db.set_password("cas", "h2", "s2", std::string("h1")).has_value());
+    auto rollback_lost = h.db.set_password("cas", "h0", "s0", std::string("h1"));
+    REQUIRE_FALSE(rollback_lost.has_value()); // someone (h2) wrote since — never clobbered
+    CHECK(h.db.get_user("cas")->hash_hex == "h2");
+}
+
+TEST_CASE("AuthDB::recheck_role_locked hands the current password_hash to the callback (#5274)",
+          "[pg][auth_db][password]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, auth_db_tpl);
+    Harness h{db.dsn()};
+    REQUIRE(h.db.upsert_user("rr", "h0", "s0", yuzu::server::auth::Role::admin).has_value());
+    std::string seen_hash;
+    yuzu::server::auth::Role seen_role = yuzu::server::auth::Role::user;
+    REQUIRE(h.db.recheck_role_locked("rr", [&](yuzu::server::auth::Role r, const std::string& hh) {
+                    seen_role = r;
+                    seen_hash = hh;
+                }).has_value());
+    CHECK(seen_role == yuzu::server::auth::Role::admin);
+    CHECK(seen_hash == "h0");
+    REQUIRE(h.db.set_password("rr", "h1", "s1").has_value());
+    REQUIRE(h.db.recheck_role_locked("rr", [&](yuzu::server::auth::Role, const std::string& hh) {
+                    seen_hash = hh;
+                }).has_value());
+    CHECK(seen_hash == "h1");
+}
+
 // ── fresh-start admin seeding ─────────────────────────────────────────────
 
 TEST_CASE("AuthDB::seed_admin_if_empty seeds once and no-ops thereafter", "[pg][auth_db]") {

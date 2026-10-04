@@ -25,6 +25,7 @@
 #include "rbac_store.hpp"       // access-review read-model direct-grant reads
 #include "tag_store.hpp" // F2a PR3: TagStore::validate_key for the cohort export key
 #include "mfa_qr.hpp"
+#include "password_policy.hpp" // #5342 — the ONE local password length policy
 #include "plugin_signing_helpers.hpp"
 #include "rest_a4_envelope.hpp"      // #4028 — detail::error_json_a4 for the settings read-twins
 #include "rest_a4_envelope_http.hpp" // #4028 — detail::a4_error/ensure_correlation_id
@@ -545,11 +546,14 @@ std::string SettingsRoutes::render_users_fragment(const std::string& current_use
             // an auto-provisioned `oidc:<iss>#<sub>` principal) now appears
             // in this list. Its `username` fails the STRICT
             // `is_valid_username` gate that guards local-account mutation
-            // routes (delete, password-reset, role-change — see
-            // auth_db.hpp's `is_valid_principal` doc), so those buttons are
-            // suppressed for it below rather than rendering a button that
-            // always 400s. Session-revoke and elevation-eligibility are
-            // principal-keyed (`is_valid_principal`) and stay available.
+            // routes (delete, role-change — see auth_db.hpp's
+            // `is_valid_principal` doc), so those buttons are suppressed for
+            // it below rather than rendering a button that always 400s. (The
+            // #5342 password routes, POST /api/v1/users/me/password and
+            // POST /api/v1/users/{name}/password, refuse SSO/SCIM accounts
+            // too — 409 "not a local account".) Session-revoke and
+            // elevation-eligibility are principal-keyed (`is_valid_principal`)
+            // and stay available.
             const bool is_sso = u.identity_source != "local";
             html += "<tr><td>" + html_escape(u.username);
             if (is_sso) {
@@ -4832,10 +4836,29 @@ void SettingsRoutes::register_routes(
                             "application/json");
             return;
         }
-        // C1 FIX: Self-password-change is allowed, but role is always 'user' on creation.
-        // Role changes must go through POST /api/settings/users/:username/role.
-        // The self-demotion guard is no longer needed on this path since
-        // new users are always created as 'user' role.
+        // C1 FIX: this route CREATES users only — role is always 'user' on
+        // creation, and an existing username was already refused (409) above,
+        // so it can never change anyone's password (AuthDB::upsert_user is
+        // INSERT-only). Role changes go through POST
+        // /api/settings/users/:username/role; password changes go through the
+        // #5342 REST v1 routes — POST /api/v1/users/me/password (self, proves
+        // the current password) and POST /api/v1/users/{name}/password (admin
+        // reset). The self-demotion guard is not needed on this path since new
+        // users are always created as 'user' role.
+        //
+        // #5342: the over-max case gets its own message (the shared policy in
+        // password_policy.hpp); upsert_user's `false` cannot distinguish it from
+        // "too short".
+        if (auth::check_password_policy(password) == auth::PasswordPolicyVerdict::kTooLong) {
+            audit_fn_(req, "user.create", "denied", "User", username, "too_long");
+            res.status = 400;
+            res.set_header(
+                "HX-Trigger",
+                R"({"showToast":{"message":"Password must be at most 1024 bytes","level":"error"}})");
+            res.set_content(detail::a4_error(res, "Password must be at most 1024 bytes"),
+                            "application/json");
+            return;
+        }
         if (!auth_mgr_->upsert_user(username, password, role)) {
             spdlog::warn("POST /api/settings/users: upsert rejected for '{}' "
                          "(weak_password — minimum 12 characters)",

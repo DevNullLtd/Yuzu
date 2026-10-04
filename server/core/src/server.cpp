@@ -19135,6 +19135,18 @@ private:
         // local-vs-presence mismatch one route over. MUST run BEFORE
         // register_routes(), same timing contract as the setters above.
         rest_api_v1_->set_all_agent_ids_fn([this] { return registry_.all_ids(); });
+        // #5342 — POST /api/v1/users/me/password + /api/v1/users/{name}/password.
+        // The current-password proof is AuthRoutes' lockout-accounted check
+        // (the SAME section POST /login runs — never a second copy) and the
+        // replacement session cookie is minted + formatted by AuthRoutes; both
+        // capture auth_routes_ (constructed above, outlives the route table).
+        // The CSRF same-site gate uses the same trusted-origin allowlist as the
+        // dashboard/CA cookie POSTs (#2537). MUST run BEFORE register_routes(),
+        // same timing contract as the setters above.
+        rest_api_v1_->set_password_change_deps(RestApiV1::PasswordChangeDeps{
+            &auth_mgr_, auth_routes_->password_change_verify_fn(),
+            auth_routes_->session_cookie_mint_fn()});
+        rest_api_v1_->set_csrf_trusted_origins(cfg_.csrf_trusted_origins);
         rest_api_v1_->register_routes(
             *web_server_,
             [this](const httplib::Request& req, httplib::Response& res)

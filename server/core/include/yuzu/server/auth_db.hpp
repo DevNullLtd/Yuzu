@@ -209,10 +209,16 @@ public:
 
     // ── User Operations ──────────────────────────────────────────────────
 
-    /// Create or update a user.
-    /// Username is validated (alphanumeric + ._- only, 1-64 chars).
-    /// For new users: password_hash and salt_hex are required.
-    /// For existing users: all fields are updated (password + role).
+    /// Create a user. Username is validated (alphanumeric + ._- only, 1-64
+    /// chars); `password_hash` and `salt_hex` are required.
+    ///
+    /// INSERT-ONLY despite the name: the statement is `INSERT ... ON CONFLICT
+    /// (username) DO NOTHING`, so an EXISTING row is never touched — not its
+    /// password, not its role — and the call returns `UserAlreadyExists`.
+    /// (Never DO UPDATE: that reopens the TOCTOU where two concurrent creates
+    /// both pass a `user_exists()` check and one silently overwrites the
+    /// other's credentials.) Role changes go through `update_role()`;
+    /// password changes go through `set_password()` (#5342).
     std::expected<void, AuthDBError> upsert_user(
         const std::string& username,
         const std::string& password_hash,
@@ -339,8 +345,41 @@ public:
         auth::Role new_role
     );
 
-    /// Row-locked role re-check (#4107): `SELECT role FROM auth.users WHERE
-    /// username = $1 AND is_active FOR UPDATE`, same technique
+    /// Set a LOCAL account's password (#5342) — the ONLY writer of
+    /// `password_hash`/`salt_hex` on an existing row. One guarded
+    /// `UPDATE ... RETURNING` (modelled on `update_role`), matching only a row
+    /// that is ACTIVE and a genuine local account on BOTH axes —
+    /// `identity_source = 'local'` (it authenticates with a local password)
+    /// AND `provisioning_source = 'local'` (it is not SCIM-managed; a SCIM row
+    /// carries a discarded random hash and its lifecycle belongs to the IdP).
+    /// An SSO principal additionally fails `is_valid_username` up front.
+    ///
+    /// The same statement clears the lockout state (`failed_login_count`,
+    /// `last_failed_login_at`, `locked_until`): a fresh credential must not
+    /// inherit a lock armed against the old one — the same reasoning
+    /// `reactivate_user` applies.
+    ///
+    /// `expected_current_hash`, when engaged, adds `AND password_hash = $n` — a
+    /// compare-and-swap so a caller overwrites only the exact credential it
+    /// last read/verified (the self-change path's "you proved THIS password"
+    /// guard, and the audit-failure rollback's "restore only if nobody wrote
+    /// since" guard).
+    ///
+    /// Returns `UserNotFound` when ZERO rows matched — absent, inactive, not
+    /// local, OR the CAS predicate failed. The store deliberately draws no
+    /// distinction (no oracle at this layer); a caller that must answer 404
+    /// vs 409 reads the row (`get_user` + `get_provisioning_source`) BEFORE the
+    /// write. `InvalidUsername` for a malformed username, `InvalidCredentials`
+    /// for an empty hash/salt, `WriteFailed` on a lease/query failure. Never
+    /// logs the hash.
+    std::expected<void, AuthDBError>
+    set_password(const std::string& username, const std::string& password_hash,
+                 const std::string& salt_hex,
+                 const std::optional<std::string>& expected_current_hash = std::nullopt);
+
+    /// Row-locked role + credential re-check (#4107, extended by #5274):
+    /// `SELECT role, password_hash FROM auth.users WHERE username = $1 AND
+    /// is_active FOR UPDATE`, same technique
     /// `mfa_verify_login_code` already uses to close ITS OWN replay race.
     /// Serializes against ANY concurrent `update_role()` write to this row:
     /// if one is already committed, this call's SELECT sees it directly; if
@@ -374,6 +413,14 @@ public:
     /// `reactivate_user()` call starting against an already-inactive row —
     /// there is no lock to contend for at that point.
     ///
+    /// #5274: `under_row_lock` also receives the row's CURRENT
+    /// `password_hash`, read under the same lock, so the credential check can
+    /// deny when the hash it just verified the password against is no longer
+    /// the stored one (a `set_password` committed between the caller's read
+    /// and this lock — a password change racing a login). `set_password`'s
+    /// UPDATE takes the same row lock, so the hash seen here is never one
+    /// another writer's in-flight commit can invalidate a moment later.
+    ///
     /// `under_row_lock` runs WHILE the row lock is held, immediately before
     /// this call commits (releasing the lock) — use it to update
     /// AuthManager's in-process cache under `mu_` before the lock is
@@ -401,8 +448,9 @@ public:
     /// does). `InvalidUsername` / `QueryFailed` on the usual input/store
     /// failures, callback not invoked either way.
     std::expected<void, AuthDBError>
-    recheck_role_locked(const std::string& username,
-                        const std::function<void(auth::Role)>& under_row_lock);
+    recheck_role_locked(
+        const std::string& username,
+        const std::function<void(auth::Role, const std::string& password_hash)>& under_row_lock);
 
     /// Set/clear the per-user JIT-elevation eligibility flag (SOC 2 CC6.3/CC6.6):
     /// who may activate a time-boxed admin elevation via POST /api/v1/elevate,

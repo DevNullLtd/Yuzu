@@ -1038,8 +1038,60 @@ std::expected<void, AuthDBError> AuthDB::update_role(const std::string& username
 }
 
 std::expected<void, AuthDBError>
-AuthDB::recheck_role_locked(const std::string& username,
-                            const std::function<void(auth::Role)>& under_row_lock) {
+AuthDB::set_password(const std::string& username, const std::string& password_hash,
+                     const std::string& salt_hex,
+                     const std::optional<std::string>& expected_current_hash) {
+    // is_valid_username, NOT is_valid_principal: only a local account has a
+    // password, and an SSO principal ("oidc:..."/"saml:...") can never be one.
+    // Also closes the embedded-NUL truncation class get_user() documents.
+    if (!is_valid_username(username)) {
+        spdlog::warn("set_password rejected invalid username: '{}'", username);
+        return std::unexpected(AuthDBError::InvalidUsername);
+    }
+    if (password_hash.empty() || salt_hex.empty() ||
+        (expected_current_hash && expected_current_hash->empty()))
+        return std::unexpected(AuthDBError::InvalidCredentials);
+
+    // Guarded single UPDATE ... RETURNING (update_role's idiom). The WHERE
+    // clause IS the local-account gate — active, identity_source='local' AND
+    // provisioning_source='local' — so no caller-side check can be raced
+    // past. Lockout fields are cleared in the same statement (see the .hpp).
+    // The CAS variant adds `password_hash = $4`. The literals are compile-time
+    // constants, never interpolated input.
+    static constexpr const char* kSql =
+        "UPDATE auth.users SET password_hash = $1, salt_hex = $2, updated_at = now(), "
+        "failed_login_count = 0, last_failed_login_at = NULL, locked_until = NULL "
+        "WHERE username = $3 AND is_active = TRUE AND identity_source = 'local' "
+        "AND provisioning_source = 'local' RETURNING id";
+    static constexpr const char* kSqlCas =
+        "UPDATE auth.users SET password_hash = $1, salt_hex = $2, updated_at = now(), "
+        "failed_login_count = 0, last_failed_login_at = NULL, locked_until = NULL "
+        "WHERE username = $3 AND is_active = TRUE AND identity_source = 'local' "
+        "AND provisioning_source = 'local' AND password_hash = $4 RETURNING id";
+
+    auto lease = impl_->pool.try_acquire_for(kWriteTimeout);
+    if (!lease)
+        return std::unexpected(AuthDBError::WriteFailed);
+    std::vector<std::string> params{password_hash, salt_hex, username};
+    if (expected_current_hash)
+        params.push_back(*expected_current_hash);
+    pg::PgResult res =
+        pg::exec_params(lease.get(), expected_current_hash ? kSqlCas : kSql, params);
+    if (res.status() != PGRES_TUPLES_OK)
+        return std::unexpected(AuthDBError::WriteFailed);
+    if (PQntuples(res.get()) == 0) {
+        spdlog::warn("set_password: no active local account matched '{}'{}", username,
+                     expected_current_hash ? " (or the stored credential changed)" : "");
+        return std::unexpected(AuthDBError::UserNotFound);
+    }
+    spdlog::info("Password updated for local account: {}", username);
+    return {};
+}
+
+std::expected<void, AuthDBError>
+AuthDB::recheck_role_locked(
+    const std::string& username,
+    const std::function<void(auth::Role, const std::string& password_hash)>& under_row_lock) {
     // is_valid_principal, NOT is_valid_username: this is called on the exact
     // same path as get_user() (via AuthManager::recheck_role_after_credential_
     // check, reachable with an SSO-prefixed principal) - see get_user()'s own
@@ -1097,8 +1149,13 @@ AuthDB::recheck_role_locked(const std::string& username,
             err = AuthDBError::QueryFailed;
             return false;
         }
+        // #5274: password_hash is read under the SAME row lock so the caller
+        // can deny a credential check whose verified hash a concurrent
+        // set_password() already replaced (see the header doc).
         pg::PgResult sel = pg::exec_params(
-            conn, "SELECT role FROM auth.users WHERE username = $1 AND is_active = TRUE FOR UPDATE",
+            conn,
+            "SELECT role, password_hash FROM auth.users WHERE username = $1 AND is_active = TRUE "
+            "FOR UPDATE",
             std::vector<std::string>{username});
         if (sel.status() != PGRES_TUPLES_OK) {
             err = AuthDBError::QueryFailed;
@@ -1115,7 +1172,7 @@ AuthDB::recheck_role_locked(const std::string& username,
         }
         // under_row_lock runs here, still holding the row lock - see the
         // header doc: fast, local, in-process work only, no further DB I/O.
-        under_row_lock(auth::string_to_role(col_str(sel.get(), 0, 0)));
+        under_row_lock(auth::string_to_role(col_str(sel.get(), 0, 0)), col_str(sel.get(), 0, 1));
         return true; // commit - releases the row lock; no DB mutation to persist
     });
     if (err)

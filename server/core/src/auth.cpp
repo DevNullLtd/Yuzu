@@ -4,6 +4,7 @@
 
 #include "oidc_principal.hpp" // oidc_principal_id — ADR-2001 §5 single principal-string builder
 #include "saml_principal.hpp" // saml_principal_id — ADR-2001 PR4a single principal-string builder
+#include "password_policy.hpp" // #5342 — the ONE local password length policy
 #include "session_store.hpp"  // HA WS-1/1a — durable operator sessions (ADR-2002 §4)
 
 #include <spdlog/spdlog.h>
@@ -415,8 +416,12 @@ bool AuthManager::first_run_setup(const std::filesystem::path& cfg_path) {
         return false;
     }
     auto admin_pw = prompt_password("Admin password");
-    if (admin_pw.size() < 12) {
-        std::cerr << "Password must be at least 12 characters.\n";
+    if (const auto verdict = check_password_policy(admin_pw);
+        verdict != PasswordPolicyVerdict::kOk) {
+        if (verdict == PasswordPolicyVerdict::kTooShort)
+            std::cerr << "Password must be at least " << kMinPasswordBytes << " characters.\n";
+        else
+            std::cerr << "Password must be at most " << kMaxPasswordBytes << " bytes.\n";
         return false;
     }
     auto admin_pw2 = prompt_password("Confirm admin password");
@@ -438,8 +443,12 @@ bool AuthManager::first_run_setup(const std::filesystem::path& cfg_path) {
         return false;
     }
     auto user_pw = prompt_password("User password");
-    if (user_pw.size() < 12) {
-        std::cerr << "Password must be at least 12 characters.\n";
+    if (const auto verdict = check_password_policy(user_pw);
+        verdict != PasswordPolicyVerdict::kOk) {
+        if (verdict == PasswordPolicyVerdict::kTooShort)
+            std::cerr << "Password must be at least " << kMinPasswordBytes << " characters.\n";
+        else
+            std::cerr << "Password must be at most " << kMaxPasswordBytes << " bytes.\n";
         return false;
     }
     auto user_pw2 = prompt_password("Confirm user password");
@@ -707,19 +716,20 @@ bool AuthManager::session_generation_view_stale() const {
 
 std::expected<UserEntry, AuthManager::UserLookupMiss>
 AuthManager::find_user_or_hydrate(const std::string& username) {
-    {
+    if (!auth_db_) {
+        // cfg-file mode: the map IS the truth (unchanged by #5274).
         std::shared_lock lock(mu_);
         auto it = users_.find(username);
         if (it != users_.end())
             return it->second;
+        return std::unexpected(UserLookupMiss::NotFound);
     }
-    if (!auth_db_)
-        return std::unexpected(UserLookupMiss::NotFound); // cfg-file mode: the map IS the truth
 
-    // Cold cache (#4020): the row may exist in AuthDB even though this process
-    // never cached it. Read it OUTSIDE mu_ (durable PG I/O, same lock ordering as
-    // the other AuthDB-first paths). get_user filters is_active, so a
-    // soft-deleted account stays a miss here.
+    // #5274: AuthDB mode is DB-FIRST on every call — the credential is never
+    // read from users_ (see the header doc: a cfg-seeded or other-replica-stale
+    // cache entry would otherwise shadow a password changed in AuthDB). Read
+    // OUTSIDE mu_ (durable PG I/O, same lock ordering as the other AuthDB-first
+    // paths). get_user filters is_active, so a soft-deleted account is a miss.
     auto db_user = auth_db_->get_user(username);
     if (!db_user) {
         // Gate 2/4 re-review follow-up (security-guardian + authdb, converged
@@ -744,18 +754,22 @@ AuthManager::find_user_or_hydrate(const std::string& username) {
     // exists (see the no-op comment below).
     db_user->role_version = next_role_version_();
     std::unique_lock lock(mu_);
-    // try_emplace, never insert_or_assign: an upsert_user (new password) or
-    // reactivate_user that landed while the read above was in flight has already
-    // installed a NEWER entry than the row we hold; clobbering it would make the
-    // new password fail until the next restart. Whatever is cached now wins.
-    auto [it, inserted] = users_.try_emplace(username, std::move(*db_user));
-    (void)inserted;
-    return it->second;
+    // #4020 warm-up for the cache's OTHER readers. try_emplace, never
+    // insert_or_assign: a write path (upsert_user / reactivate_user /
+    // change_password / reset_password) that landed while the read above was in
+    // flight has already installed a NEWER entry than the row we hold, and the
+    // write paths own cache refresh. Nothing here consults the cached
+    // credential any more (#5274), so leaving an existing entry alone is safe.
+    users_.try_emplace(username, *db_user);
+    lock.unlock();
+    // The credential returned is the DB row, never the cached copy (#5274).
+    return std::move(*db_user);
 }
 
 std::optional<Role>
 AuthManager::recheck_role_after_credential_check(const std::string& username, Role pre_check_role,
                                                   [[maybe_unused]] std::uint64_t pre_check_version,
+                                                  const std::string& verified_hash_hex,
                                                   std::string_view context) {
     if (!auth_db_)
         return pre_check_role; // cfg-file mode: users_ IS the truth, nothing to re-check
@@ -779,7 +793,11 @@ AuthManager::recheck_role_after_credential_check(const std::string& username, Ro
     // avoid touching both call sites in this same round - cleanup tracked
     // as a follow-up.
     std::optional<Role> result;
-    auto outcome = auth_db_->recheck_role_locked(username, [&](Role db_role) {
+    // #5274: set inside the row lock when the stored hash is no longer the one
+    // the caller verified the supplied password against.
+    bool credential_changed = false;
+    auto outcome = auth_db_->recheck_role_locked(username, [&](Role db_role,
+                                                               const std::string& db_hash) {
         // Invoked while AuthDB holds this row's lock - see the header doc.
         // Lock ORDERING invariant (cpp-expert Gate 8 catch): this is the
         // first place in this file mu_ is acquired from INSIDE an open
@@ -796,6 +814,17 @@ AuthManager::recheck_role_after_credential_check(const std::string& username, Ro
         // doc): a no-op (nullptr) in production.
         if (role_recheck_inside_lock_hook_for_test_)
             role_recheck_inside_lock_hook_for_test_();
+        // #5274: a password change committed between the caller's DB-first
+        // read (find_user_or_hydrate) and this row lock means the password was
+        // verified against a credential that no longer exists. Deny - no
+        // re-verify against the new hash; the user retries. Checked BEFORE the
+        // cache write so a denied check leaves the cache untouched. The compare
+        // is of two server-held hashes (no secret-dependent timing to protect),
+        // but constant_time_compare costs nothing and keeps the idiom uniform.
+        if (!constant_time_compare(db_hash, verified_hash_hex)) {
+            credential_changed = true;
+            return;
+        }
         std::unique_lock lock(mu_);
         auto it = users_.find(username);
         if (it != users_.end()) {
@@ -836,6 +865,14 @@ AuthManager::recheck_role_after_credential_check(const std::string& username, Ro
                          "failing closed without touching the cache",
                          context, username);
         }
+        return std::nullopt;
+    }
+    if (credential_changed) {
+        spdlog::warn("{}: credential for '{}' changed during verification (a password change "
+                     "committed concurrently) - denying; the user retries",
+                     context, username);
+        if (metrics_)
+            metrics_->counter("yuzu_auth_credential_changed_during_verify_total").increment();
         return std::nullopt;
     }
     return result;
@@ -943,7 +980,15 @@ std::optional<std::string> AuthManager::authenticate(const std::string& username
     // 100k iterations runs ~50-150 ms on commodity hardware.
     const auto t_start = std::chrono::steady_clock::now();
 
-    // Cache-or-AuthDB lookup (#4020); a COPY, so PBKDF2 below runs off mu_.
+    // #5342: an over-max password can never match (no setting site accepts
+    // one) — reject without the DB read or PBKDF2, which bounds the hash input.
+    // Never log the length.
+    if (password_exceeds_max(password)) {
+        spdlog::warn("Auth failed: over-length password for '{}'", username);
+        return std::nullopt;
+    }
+
+    // AuthDB-first lookup (#4020/#5274); a COPY, so PBKDF2 below runs off mu_.
     auto entry = find_user_or_hydrate(username);
     if (!entry) {
         if (entry.error() == UserLookupMiss::DbError)
@@ -982,8 +1027,8 @@ std::optional<std::string> AuthManager::authenticate(const std::string& username
     // Gate 2/3 governance follow-ups — see recheck_role_after_credential_check's
     // doc for the full rationale, including the row-lock serialization #4107
     // added to close the same-process divergence race).
-    auto current_role = recheck_role_after_credential_check(username, entry->role,
-                                                             entry->role_version, "Auth failed");
+    auto current_role = recheck_role_after_credential_check(
+        username, entry->role, entry->role_version, entry->hash_hex, "Auth failed");
     if (!current_role)
         return std::nullopt;
     entry->role = *current_role;
@@ -1029,7 +1074,13 @@ std::optional<Role> AuthManager::verify_password(const std::string& username,
     // session creation. Histogram labels match authenticate() so dashboards
     // continue to roll up "password verify" cost across both call sites.
     const auto t_start = std::chrono::steady_clock::now();
-    auto entry = find_user_or_hydrate(username); // cache-or-AuthDB (#4020), a COPY
+    // #5342: same over-max short-circuit as authenticate() (defence in depth —
+    // AuthRoutes::verify_password_with_lockout already rejects before calling).
+    if (password_exceeds_max(password)) {
+        spdlog::warn("verify_password failed: over-length password for '{}'", username);
+        return std::nullopt;
+    }
+    auto entry = find_user_or_hydrate(username); // AuthDB-first (#4020/#5274), a COPY
     if (!entry) {
         if (entry.error() == UserLookupMiss::DbError)
             return std::nullopt; // fail closed; logged by the helper, not an unknown_user sample
@@ -1062,7 +1113,7 @@ std::optional<Role> AuthManager::verify_password(const std::string& username,
     // this the authoritative role for the caller (same rationale as
     // authenticate() — see recheck_role_after_credential_check's doc).
     auto current_role = recheck_role_after_credential_check(
-        username, entry->role, entry->role_version, "verify_password failed");
+        username, entry->role, entry->role_version, entry->hash_hex, "verify_password failed");
     if (!current_role)
         return std::nullopt;
     auto role = *current_role;
@@ -1808,8 +1859,8 @@ std::vector<UserEntry> AuthManager::list_users() const {
 }
 
 bool AuthManager::upsert_user(const std::string& username, const std::string& password, Role role) {
-    if (password.size() < 12)
-        return false; // minimum password length (G2-SEC-A1-003)
+    if (check_password_policy(password) != PasswordPolicyVerdict::kOk)
+        return false; // length policy (G2-SEC-A1-003 minimum, #5342 maximum)
     auto salt = random_bytes(16);
     auto salt_hex = bytes_to_hex(salt);
     auto hash = pbkdf2_sha256(password, salt, kPbkdf2Iterations);
@@ -1962,6 +2013,174 @@ bool AuthManager::reactivate_user(const std::string& username) {
 
     std::unique_lock lock(mu_);
     users_[username] = *entry;
+    return true;
+}
+
+// ── Password change / reset (#5342) ─────────────────────────────────────────
+
+std::optional<UserEntry>
+AuthManager::read_local_account_for_password_write(const std::string& username,
+                                                   const std::string& new_password,
+                                                   PasswordWriteResult& out) {
+    // No AuthDB, no durable credential to change: every production server runs
+    // on Postgres (it fails closed at boot without a DSN); cfg-file-only mode is
+    // a test/legacy shape, and a password written only to users_ + the cfg file
+    // would not survive the next seed anyway. Fail closed, never pretend.
+    if (!auth_db_) {
+        out.outcome = PasswordWriteOutcome::kStoreUnavailable;
+        return std::nullopt;
+    }
+    switch (check_password_policy(new_password)) {
+    case PasswordPolicyVerdict::kTooShort:
+        out.outcome = PasswordWriteOutcome::kTooShort;
+        return std::nullopt;
+    case PasswordPolicyVerdict::kTooLong:
+        out.outcome = PasswordWriteOutcome::kTooLong;
+        return std::nullopt;
+    case PasswordPolicyVerdict::kOk:
+        break;
+    }
+    // An SSO principal ("oidc:..."/"saml:...") is never a local account. The
+    // check runs before any DB read so a principal-shaped name is classified
+    // the same whether or not such a row exists.
+    if (!yuzu::server::is_valid_username(username)) {
+        out.outcome = yuzu::server::is_valid_principal(username) ? PasswordWriteOutcome::kNotLocal
+                                                                 : PasswordWriteOutcome::kNotFound;
+        return std::nullopt;
+    }
+    // AUTHORITATIVE read — never users_ (#5274). get_user filters is_active.
+    auto row = auth_db_->get_user(username);
+    if (!row) {
+        out.outcome = (row.error() == yuzu::server::AuthDBError::UserNotFound ||
+                       row.error() == yuzu::server::AuthDBError::InvalidUsername)
+                          ? PasswordWriteOutcome::kNotFound
+                          : PasswordWriteOutcome::kStoreUnavailable;
+        return std::nullopt;
+    }
+    if (row->identity_source != "local") {
+        out.outcome = PasswordWriteOutcome::kNotLocal;
+        return std::nullopt;
+    }
+    // provisioning_source is the second axis: a SCIM-provisioned row is
+    // identity_source='scim' today, but the SCIM provenance marker is the
+    // authority on who owns the lifecycle, so it is checked independently.
+    // set_password's WHERE clause enforces both again at write time.
+    auto prov = auth_db_->get_provisioning_source(username);
+    if (!prov) {
+        out.outcome = prov.error() == yuzu::server::AuthDBError::UserNotFound
+                          ? PasswordWriteOutcome::kNotFound
+                          : PasswordWriteOutcome::kStoreUnavailable;
+        return std::nullopt;
+    }
+    if (*prov != yuzu::server::kProvisioningSourceLocal) {
+        out.outcome = PasswordWriteOutcome::kNotLocal;
+        return std::nullopt;
+    }
+    return std::move(*row);
+}
+
+PasswordWriteResult AuthManager::write_password_cas(const std::string& username,
+                                                    const UserEntry& current,
+                                                    const std::string& new_password) {
+    PasswordWriteResult out;
+    auto salt = random_bytes(16);
+    auto salt_hex = bytes_to_hex(salt);
+    auto hash = pbkdf2_sha256(new_password, salt, kPbkdf2Iterations);
+
+    // CAS on the hash the caller read (and, for a self-change, verified): the
+    // write lands only if that credential is still the stored one.
+    auto written = auth_db_->set_password(username, hash, salt_hex, current.hash_hex);
+    if (!written) {
+        if (written.error() != yuzu::server::AuthDBError::UserNotFound) {
+            out.outcome = PasswordWriteOutcome::kStoreUnavailable;
+            return out;
+        }
+        // Zero rows: the account went away / stopped being local, OR the CAS
+        // predicate failed because someone else wrote first. Re-read so the
+        // caller can answer 404 vs 409 honestly.
+        auto again = auth_db_->get_user(username);
+        if (!again) {
+            out.outcome = again.error() == yuzu::server::AuthDBError::UserNotFound
+                              ? PasswordWriteOutcome::kNotFound
+                              : PasswordWriteOutcome::kStoreUnavailable;
+            return out;
+        }
+        out.outcome = again->identity_source != "local" ? PasswordWriteOutcome::kNotLocal
+                                                        : PasswordWriteOutcome::kConflict;
+        return out;
+    }
+
+    // Refresh this process's cache entry AFTER the durable commit (the
+    // file-wide "never hold mu_ across a DB call" ordering). Credentials only:
+    // .role is untouched, so the role_version lockstep invariant (UserEntry::
+    // role_version's doc) needs no new stamp. An uncached username stays
+    // uncached — find_user_or_hydrate is DB-first in this mode regardless.
+    {
+        std::unique_lock lock(mu_);
+        if (auto it = users_.find(username); it != users_.end()) {
+            it->second.hash_hex = hash;
+            it->second.salt_hex = salt_hex;
+        }
+    }
+    out.outcome = PasswordWriteOutcome::kOk;
+    out.role = current.role;
+    out.previous_hash_hex = current.hash_hex;
+    out.previous_salt_hex = current.salt_hex;
+    out.new_hash_hex = std::move(hash);
+    return out;
+}
+
+PasswordWriteResult AuthManager::change_password(const std::string& username,
+                                                 const std::string& current_password,
+                                                 const std::string& new_password) {
+    PasswordWriteResult out;
+    auto row = read_local_account_for_password_write(username, new_password, out);
+    if (!row)
+        return out;
+    // Re-verify the current password against the STORED hash just read (the
+    // CAS anchor below). Same PBKDF2 + constant-time compare as
+    // verify_password; an over-max input can never match, so it is refused
+    // without hashing.
+    if (password_exceeds_max(current_password) ||
+        !constant_time_compare(pbkdf2_sha256(current_password, hex_to_bytes(row->salt_hex),
+                                             kPbkdf2Iterations),
+                               row->hash_hex)) {
+        out.outcome = PasswordWriteOutcome::kWrongCurrent;
+        return out;
+    }
+    return write_password_cas(username, *row, new_password);
+}
+
+PasswordWriteResult AuthManager::reset_password(const std::string& username,
+                                                const std::string& new_password,
+                                                bool permit_admin_target) {
+    PasswordWriteResult out;
+    auto row = read_local_account_for_password_write(username, new_password, out);
+    if (!row)
+        return out;
+    if (row->role == Role::admin && !permit_admin_target) {
+        out.outcome = PasswordWriteOutcome::kAdminTarget;
+        out.role = row->role;
+        return out;
+    }
+    return write_password_cas(username, *row, new_password);
+}
+
+bool AuthManager::rollback_password_write(const std::string& username,
+                                          const PasswordWriteResult& written) {
+    if (!auth_db_ || written.outcome != PasswordWriteOutcome::kOk)
+        return false;
+    // Restore ONLY if the stored hash is still the one we wrote — a later
+    // writer's credential is never clobbered by a stale compensation.
+    auto restored = auth_db_->set_password(username, written.previous_hash_hex,
+                                           written.previous_salt_hex, written.new_hash_hex);
+    if (!restored)
+        return false;
+    std::unique_lock lock(mu_);
+    if (auto it = users_.find(username); it != users_.end()) {
+        it->second.hash_hex = written.previous_hash_hex;
+        it->second.salt_hex = written.previous_salt_hex;
+    }
     return true;
 }
 

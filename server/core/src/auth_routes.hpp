@@ -20,6 +20,7 @@
 #include <array>
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <expected>
 #include <functional>
 #include <memory>
@@ -100,6 +101,76 @@ struct ListReadGate {
 using TierPolicyFn =
     std::function<bool(const httplib::Request&, httplib::Response&, const auth::Session&,
                        const std::string& securable_type, const std::string& operation)>;
+
+/// Outcome of `AuthRoutes::verify_password_with_lockout` (#5342) — the ONE
+/// lockout-accounted password check, shared by `POST /login` and the
+/// self-service `POST /api/v1/users/me/password` current-password proof.
+enum class PasswordCheckOutcome : std::uint8_t {
+    /// Password matched (`PasswordCheckResult::role` engaged, DB-confirmed by
+    /// `AuthManager::verify_password`'s row-locked recheck). A non-zero (or
+    /// unknown) failure counter was cleared and audited.
+    kVerified,
+    /// The account is currently locked: PBKDF2 skipped, nothing audited (the
+    /// metric + rate-limited log line are the per-attempt signal; the
+    /// once-per-lock `auth.lockout.applied` row is the durable evidence).
+    kLocked,
+    /// The caller's `pre_verify_gate` refused (it has already written the
+    /// response). Neither verified nor counted as a failure.
+    kGateRejected,
+    /// Wrong password, unknown user, or an over-max password (#5342 — refused
+    /// without PBKDF2, indistinguishable from a wrong one). The failure was
+    /// recorded for lockout accounting (and `auth.lockout.applied` audited on
+    /// the threshold-crossing attempt).
+    kBadCredential,
+    /// A wrong-password failure could NOT be recorded because the auth store
+    /// is unavailable. Fail CLOSED (503 + retry hint): answering the ordinary
+    /// rejection would be an UNcounted attempt — a free guess while the store
+    /// is degraded (Hermes p2 MEDIUM).
+    kStoreUnavailable,
+};
+
+struct PasswordCheckResult {
+    PasswordCheckOutcome outcome{PasswordCheckOutcome::kBadCredential};
+    std::optional<auth::Role> role; ///< engaged iff kVerified
+};
+
+/// Per-call knobs for `verify_password_with_lockout`. The defaults are the
+/// non-login shape; `POST /login` sets every field.
+struct PasswordCheckOptions {
+    /// Skip lockout accounting entirely for this call (the sso-only
+    /// break-glass exemption — see `POST /login`). The attempt is still
+    /// verified; a failure is still the caller's to audit.
+    bool lockout_exempt{false};
+    /// Runs AFTER the lockout pre-check and BEFORE PBKDF2, inside the
+    /// per-username stripe. Return false to refuse (having written the
+    /// response) → `kGateRejected`. `/login` uses this for its sso-only gate.
+    std::function<bool()> pre_verify_gate;
+    /// Runs on a bad credential BEFORE the lockout accounting, so a route's
+    /// own failure evidence precedes any `auth.lockout.applied` row (the
+    /// historical `/login` ordering).
+    std::function<void()> on_bad_credential;
+    /// `route` label for the store-unavailable counters
+    /// (`yuzu_auth_secret_unavailable_total`, `yuzu_auth_read_degrade_total`).
+    std::string metric_route{"login"};
+    /// Audit `detail` of the `auth.lockout.cleared` row written on success.
+    std::string cleared_detail{"reset_on_successful_login"};
+};
+
+/// The current-password proof handed to `RestApiV1` (#5342): bound by
+/// `AuthRoutes::password_change_verify_fn()` to `verify_password_with_lockout`
+/// with the self-change route's options, so RestApiV1 never re-implements the
+/// striped-lock section.
+using PasswordVerifyFn = std::function<PasswordCheckResult(
+    const std::string& username, const std::string& password, const httplib::Request& req)>;
+
+/// Mint a replacement LOCAL session for `username` and return the COMPLETE
+/// `Set-Cookie` header value (`yuzu_session=<token>` + the same attributes as
+/// `POST /login`), or "" when no session could be minted (durable-persist
+/// failure or the post-mint role recheck denied). Owned by `AuthRoutes` so
+/// cookie formatting lives in exactly one class (#5342 — RestApiV1 never
+/// formats a session cookie).
+using SessionCookieMintFn =
+    std::function<std::string(const std::string& username, auth::Role role, bool mfa_verified)>;
 
 /// Extracted auth helpers and route handlers (Phase 2 of god-object decomposition).
 ///
@@ -485,6 +556,42 @@ public:
     /// Cookie attribute string: "; Path=/; HttpOnly; SameSite=Lax; Max-Age=28800" + optional ";
     /// Secure".
     std::string session_cookie_attrs() const;
+
+    /// The ONE lockout-accounted password check (#5342; extracted,
+    /// behaviour-preserving, from `POST /login`'s lockout-critical section so
+    /// the self-service current-password proof can never drift from it).
+    /// Under the per-username login stripe (`login_lock_for`, held only when lockout is
+    /// enabled): lockout pre-check (fail-OPEN on a read error, remembered so a
+    /// later success clears defensively) → `opts.pre_verify_gate` → the
+    /// over-max short-circuit (`password_policy.hpp`) → `verify_password` →
+    /// on failure `opts.on_bad_credential` then `record_failed_login` (+ the
+    /// threshold-crossing `auth.lockout.applied` audit/event/metric; a store
+    /// outage → `kStoreUnavailable` with the degrade counters bumped) → on
+    /// success `clear_failed_logins` + `auth.lockout.cleared` audit when the
+    /// counter was non-zero or unknown. Writes NO response itself (except
+    /// whatever `pre_verify_gate` writes) — every outcome's wire shape stays
+    /// the caller's. Returns with the stripe released.
+    [[nodiscard]] PasswordCheckResult
+    verify_password_with_lockout(const std::string& username, const std::string& password,
+                                 const httplib::Request& req,
+                                 const PasswordCheckOptions& opts = {});
+
+    /// `verify_password_with_lockout` bound with the self-service
+    /// password-change options (metric route `password_change`, the sso-only
+    /// break-glass lockout exemption mirrored from `/login`). Handed to
+    /// `RestApiV1::set_password_change_deps`. Captures `this`; the caller
+    /// keeps this AuthRoutes alive for the route table's lifetime (ServerImpl
+    /// owns both).
+    [[nodiscard]] PasswordVerifyFn password_change_verify_fn();
+
+    /// Mint a local session and format its `Set-Cookie` value — see
+    /// `SessionCookieMintFn`. "" on failure.
+    [[nodiscard]] std::string mint_local_session_cookie(const std::string& username,
+                                                        auth::Role role, bool mfa_verified);
+
+    /// `mint_local_session_cookie` as a `SessionCookieMintFn` (captures
+    /// `this`, same lifetime contract as `password_change_verify_fn`).
+    [[nodiscard]] SessionCookieMintFn session_cookie_mint_fn();
 
     /// Construct an AuditEvent from HTTP request context.
     AuditEvent make_audit_event(const httplib::Request& req, const std::string& action,
