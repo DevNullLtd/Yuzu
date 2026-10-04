@@ -39,6 +39,7 @@
 -define(LOGK, {?MODULE, log}).
 -define(SUBK, {?MODULE, sub}).
 -define(LOG_HANDLER, yuzu_replay_test_log).
+-define(DUMMYK, {?MODULE, dummies}).
 
 -define(EV_TRIG,    [yuzu, gw, upstream, registration_replay_triggered]).
 -define(EV_REPLAY,  [yuzu, gw, upstream, registration_replay]).
@@ -179,6 +180,23 @@ verdict_guard_test_() ->
         fun stale_stamps_are_pruned_after_a_breaker_only_drain/0)
      ]}.
 
+%% Session guard 100 ms with the breaker held open for the whole test: the
+%% abort tests below wait the guard out while a step is held, so neither a
+%% reset timer nor a prune on another path may act in between.
+verdict_guard_abort_test_() ->
+    Env = [{registration_replay_session_guard_ms, 100},
+           {circuit_breaker_reset_timeout_ms, 600000},
+           {circuit_breaker_max_reset_timeout_ms, 600000}],
+    {foreach,
+     fun() -> setup(Env) end,
+     fun cleanup/1,
+     [
+      t("E21 expired stamps are pruned when the drip aborts on an open breaker",
+        fun expired_stamps_are_pruned_on_circuit_abort/0),
+      t("E21 expired stamps are pruned when the drip aborts on an unavailable registry",
+        fun expired_stamps_are_pruned_on_registry_abort/0)
+     ]}.
+
 %% Queue cap 2.
 verdict_cap_test_() ->
     {foreach,
@@ -234,6 +252,8 @@ setup(Env) ->
     %% written by an asynchronous cast and would not give that).
     Tid = ets:new(replay_test_log, [public, ordered_set]),
     persistent_term:put(?LOGK, Tid),
+    %% Every dummy agent process spawn_dummy/0 starts, killed in cleanup/1.
+    persistent_term:put(?DUMMYK, ets:new(replay_test_dummies, [public, bag])),
     persistent_term:erase(?SUBK),
 
     meck:new(grpcbox_client, [non_strict, no_link]),
@@ -283,6 +303,7 @@ cleanup(UpPid) ->
     lists:foreach(fun(Id) -> yuzu_gw_registry:deregister_agent(Id) end,
                   yuzu_gw_registry:all_agents()),
     wait_until(fun() -> yuzu_gw_registry:agent_count() =:= 0 end, 2000),
+    kill_dummies(),
     meck:unload([grpcbox_client, telemetry, yuzu_gw_agent]),
     persistent_term:erase(?SUBK),
     persistent_term:erase(?LOGK),
@@ -658,8 +679,26 @@ id_prefix() ->
     PidBin = list_to_binary(pid_to_list(self())),
     <<"replay-", PidBin/binary, "-">>.
 
+%% A stand-in for an agent process. Recorded so cleanup/1 stops it even when a
+%% test never does (the bound agents of the PR-C tests are never stopped by
+%% their tests).
 spawn_dummy() ->
-    spawn(fun() -> receive stop -> ok end end).
+    Pid = spawn(fun() -> receive stop -> ok end end),
+    case persistent_term:get(?DUMMYK, undefined) of
+        undefined -> ok;
+        Tid       -> ets:insert(Tid, {dummy, Pid})
+    end,
+    Pid.
+
+kill_dummies() ->
+    case persistent_term:get(?DUMMYK, undefined) of
+        undefined ->
+            ok;
+        Tid ->
+            [kill_dummy(Pid) || {dummy, Pid} <- ets:tab2list(Tid)],
+            ets:delete(Tid),
+            persistent_term:erase(?DUMMYK)
+    end.
 
 kill_dummy(Pid) ->
     Pid ! stop.
@@ -872,7 +911,79 @@ reregistered_agent_is_skipped_at_pop() ->
     ?assertEqual([sid(B)], replay_hdrs()),
     ?assertEqual([sid(B)], maps:keys(up_get(recent_replays))),
     ?assertEqual(error, yuzu_gw_registry:lookup_session(sid(A))),
+    %% Depth: 2 queued; B's step with A behind it; the skip of A reports 0.
+    %% Without the report at the skip the gauge would stay at 1.
+    ?assertEqual([{0, 2}, {1, 1}, {0, 0}], depths()),
     _ = A2.
+
+%% E21 abort arms. A0 is replayed first and its stamp is left to expire; A1's
+%% step is then held in its rpc while the 100 ms guard is waited out on the
+%% monotonic clock (from after A1's stamp, which is before the rpc is entered),
+%% so both stamps are expired when the drip aborts at A2. Neither the verdict's
+%% enqueue (which prunes first) nor any other path runs in between, so only the
+%% prune on the abort path can leave recent_replays empty. The upstream is
+%% inside the held rpc, so its state cannot be read until it is released.
+expired_stamps_are_pruned_on_circuit_abort() ->
+    watch(),
+    A0 = bind_agent(<<"e21ca0">>),
+    A1 = bind_agent(<<"e21ca1">>),
+    A2 = bind_agent(<<"e21ca2">>),
+    ok = yuzu_gw_upstream:replay_sessions([sid(A0)]),
+    await(fun() -> replay_hdrs() =/= [] end),
+    await_idle(),
+    ?assert(maps:is_key(sid(A0), up_get(recent_replays))),
+    %% Four failures leave the breaker closed; A1's replay is the fifth.
+    mock_unary(fun(_, _, _) -> {error, connection_refused} end),
+    [_ = yuzu_gw_upstream:proxy_register(trigger_req()) || _ <- lists:seq(1, 4)],
+    ?assertEqual(closed, yuzu_gw_upstream:circuit_state()),
+    mock_gated([sid(A1)], fun(_, _, _) -> {error, connection_refused} end),
+    ok = yuzu_gw_upstream:replay_sessions([sid(A1), sid(A2)]),
+    await_msg({rpc_entered, sid(A1)}),
+    wait_elapsed(erlang:monotonic_time(millisecond), 100),
+    release(sid(A1)),
+    await_idle(),
+    ?assertEqual(open, yuzu_gw_upstream:circuit_state()),
+    ?assertEqual([sid(A0), sid(A1)], replay_hdrs()),
+    ?assertEqual([], up_get(replay_queue)),
+    ?assertEqual(#{}, up_get(recent_replays)),
+    ?assertMatch({0, 0}, lists:last(depths())).
+
+expired_stamps_are_pruned_on_registry_abort() ->
+    watch(),
+    Prev = process_flag(trap_exit, true),
+    stop_upstream(),
+    {ok, UpPid} = yuzu_gw_upstream:start_link(),
+    A0 = bind_agent(<<"e21ra0">>),
+    A1 = bind_agent(<<"e21ra1">>),
+    A2 = bind_agent(<<"e21ra2">>),
+    try
+        ok = yuzu_gw_upstream:replay_sessions([sid(A0)]),
+        await(fun() -> replay_hdrs() =/= [] end),
+        await_idle(),
+        ?assert(maps:is_key(sid(A0), up_get(recent_replays))),
+        mock_gated([sid(A1)]),
+        ok = yuzu_gw_upstream:replay_sessions([sid(A1), sid(A2)]),
+        await_msg({rpc_entered, sid(A1)}),
+        wait_elapsed(erlang:monotonic_time(millisecond), 100),
+        ok = gen_server:stop(whereis(yuzu_gw_registry), normal, 5000),
+        await(fun() -> ets:info(yuzu_gw_agents, size) =:= undefined end),
+        {_, Lines} = capture_logs(fun() ->
+            release(sid(A1)),
+            await_idle()
+        end),
+        ?assertMatch([_], [T || {warning, T} <- Lines,
+                                binary:match(T, <<"registry unavailable">>) =/= nomatch]),
+        ?assertEqual(UpPid, whereis(yuzu_gw_upstream)),
+        ?assertEqual([sid(A0), sid(A1)], replay_hdrs()),
+        ?assertEqual([], up_get(replay_queue)),
+        ?assertEqual(#{}, up_get(recent_replays))
+    after
+        ok = yuzu_gw_test_registry:ensure(),
+        catch unlink(UpPid),
+        catch gen_server:stop(UpPid, normal, 2000),
+        process_flag(trap_exit, Prev),
+        flush_exits()
+    end.
 
 %% E16: the session index table is gone (new code loaded into a running
 %% node). The ids are dropped as not_local and the upstream keeps running.
