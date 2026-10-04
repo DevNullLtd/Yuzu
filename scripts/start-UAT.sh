@@ -145,11 +145,25 @@ poll_metric_at_least() {
 # `meson compile ... yuzu-agent`; ports are used only to REFUSE, never to
 # pick a kill target.
 
+# birth_token PID — the process start time, locale-pinned (macOS lstart is
+# strftime %c), whitespace-trimmed. Empty when the process is gone.
+birth_token() {
+    local t=""
+    read -r t < <(LC_ALL=C ps -o lstart= -p "$1" 2>/dev/null) || true
+    printf '%s' "$t"
+}
+
 # record_pid NAME PID IDENT — line 1 the PID, line 2 the launch identity (the
-# launched binary / release path that must appear in the process command line).
+# launched binary / release path that must appear in the process command line),
+# line 3 the birth token (a recycled PID never has the same start time). A
+# failed write stops the just-spawned process: an unrecorded one is never found
+# again (the agent listens on no port).
 record_pid() {
-    mkdir -p "$PID_DIR"
-    printf '%s\n%s\n' "$2" "$3" > "$PID_DIR/$1.pid"
+    if ! { mkdir -p "$PID_DIR" && printf '%s\n%s\n%s\n' "$2" "$3" "$(birth_token "$2")" > "$PID_DIR/$1.pid"; }; then
+        kill_tree "$2"
+        fail "could not record $1 PID $2 under $PID_DIR — stopped it; refusing to continue"
+        return 1
+    fi
 }
 
 # pid_alive PID — visibility, not signal permission: `kill -0` returns EPERM
@@ -163,21 +177,27 @@ pid_alive() { ps -p "$1" >/dev/null 2>&1; }
 # script started from another worktree is still recognised as its own, while
 # a recycled PID (same number, different program) is never signalled.
 recorded_pid_state() {
-    local f="$PID_DIR/$1.pid" pid="" ident="" cmd=""
+    local f="$PID_DIR/$1.pid" pid="" ident="" birth="" cmd=""
     [ -f "$f" ] || { echo absent; return 0; }
-    { read -r pid || true; read -r ident || true; } < "$f"
+    { read -r pid || true; read -r ident || true; read -r birth || true; } < "$f"
     case "$pid" in ''|*[!0-9]*) echo malformed; return 0 ;; esac
-    [ -n "$ident" ] || { echo malformed; return 0; }
-    cmd=$(ps -o command= -p "$pid" 2>/dev/null || true)
+    [ -n "$ident" ] && [ -n "$birth" ] || { echo malformed; return 0; }
+    # -ww: procps truncates the command at COLUMNS when output is not a tty.
+    cmd=$(ps -ww -o command= -p "$pid" 2>/dev/null || true)
     [ -n "$cmd" ] || { echo "dead $pid"; return 0; }
+    # Owned = recorded path in the command line AND the same start time. A
+    # mismatch fails toward refusal (record dropped, the port gate then names
+    # the holder), never toward a kill.
     case "$cmd" in
-        *"$ident"*) echo "owned $pid" ;;
+        *"$ident"*) [ "$(birth_token "$pid")" = "$birth" ] && echo "owned $pid" || echo "reused $pid" ;;
         *)          echo "reused $pid" ;;
     esac
 }
 
 # kill_tree PID — SIGKILL descendants then PID. The sudo -n arm covers the
 # root-owned sudo parent of an --as-user agent (needs a warm sudo cache).
+# Known limit: the PID is not re-validated between the EPERM and the sudo kill
+# (sub-second TOCTOU, needs reuse by a root process in that window).
 kill_tree() {
     local child
     for child in $(pgrep -P "$1" 2>/dev/null || true); do
@@ -207,7 +227,7 @@ kill_recorded() {
         sleep 0.2
     done
     if pid_alive "$pid"; then
-        fail "could not stop $name (PID $pid) — kept its record; stop it by hand (sudo kill -9 $pid) before starting"
+        fail "could not stop $name (PID $pid) — kept its record; stop it by hand (sudo kill -9 $pid) before the next start or stop"
         return 2
     fi
     rm -f "$PID_DIR/$name.pid"

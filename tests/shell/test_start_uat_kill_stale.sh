@@ -39,7 +39,10 @@ kill() {
 }
 sudo()  { echo "sudo $*" >> "$TMP/sudo"; return 1; }
 # Liveness comes from alive/ (what kill removes), like the real ps -p.
-ps()    { local p=${*: -1}; [[ -e $TMP/alive/$p ]] || return 1; [[ $* == *command=* ]] && { cat "$TMP/cmd/$p" 2>/dev/null || true; }; return 0; }
+ps()    { local p=${*: -1}; [[ -e $TMP/alive/$p ]] || return 1
+          [[ $* == *command=* ]] && { cat "$TMP/cmd/$p" 2>/dev/null || true; }
+          [[ $* == *lstart=* ]] && { cat "$TMP/birth/$p" 2>/dev/null || true; }
+          return 0; }
 pgrep() { case $1 in -P) cat "$TMP/children/$2" 2>/dev/null ;; *) echo "pgrep $*" >> "$TMP/violations"; return 1 ;; esac; }
 pkill() { echo "pkill $*" >> "$TMP/violations"; return 1; }
 lsof()  { printf 'COMMAND PID\nfake-holder 777 ...\n'; }
@@ -64,11 +67,11 @@ check() { # check <desc> <condition-exit>
 }
 has()  { grep -qF -- "$2" "$1" 2>/dev/null; }
 reset() {
-  rm -rf "$TMP/alive" "$TMP/cmd" "$TMP/children" "$TMP/unkillable" "$TMP/eperm" "$TMP/vanish" "$TMP/docker-ok" "$TMP/kills" "$TMP/sudo" \
+  rm -rf "$TMP/alive" "$TMP/cmd" "$TMP/birth" "$TMP/children" "$TMP/unkillable" "$TMP/eperm" "$TMP/vanish" "$TMP/docker-ok" "$TMP/kills" "$TMP/sudo" \
          "$TMP/violations" "$TMP/docker-calls" "$TMP/busy" "$TMP/no-inspector" "$UAT_DIR"
-  mkdir -p "$TMP/alive" "$TMP/cmd" "$TMP/children" "$TMP/unkillable" "$TMP/eperm" "$TMP/vanish" "$PID_DIR"
+  mkdir -p "$TMP/alive" "$TMP/cmd" "$TMP/birth" "$TMP/children" "$TMP/unkillable" "$TMP/eperm" "$TMP/vanish" "$PID_DIR"
 }
-alive() { : > "$TMP/alive/$1"; printf '%s\n' "$2" > "$TMP/cmd/$1"; }
+alive() { : > "$TMP/alive/$1"; printf '%s\n' "$2" > "$TMP/cmd/$1"; printf 'Sun Oct  4 10:00:%s 2026\n' "$1" > "$TMP/birth/$1"; }
 run()   { set +e; out=$("$@" 2>&1); rc=$?; set -e; }
 
 DECOY='bash /Users/x/.claude/skills/snr-dev/snr-with-lock.sh meson compile -C /Users/x/Yuzu-worktrees/w/build-macos -j4 yuzu-agent'
@@ -91,6 +94,16 @@ echo "pid reuse"
 reset; alive 200 "$DECOY"; record_pid agent 200 "$AGT"
 run kill_stale
 check "reused PID not signalled, record dropped" "$([ $rc = 0 ] && ! [ -e "$TMP/kills" ] && [ ! -e "$PID_DIR/agent.pid" ] && [[ $out == *'another process'* ]] && echo 0 || echo 1)"
+
+echo "birth token differs"
+reset; alive 200 "lldb -- $AGT"; record_pid agent 200 "$AGT"; echo 'Mon Jan  1 00:00:00 2001' > "$TMP/birth/200"
+run kill_stale
+check "path matches but start time differs: not killed, record removed, another process" "$([ $rc = 0 ] && ! [ -e "$TMP/kills" ] && [ ! -e "$PID_DIR/agent.pid" ] && [[ $out == *'another process'* ]] && echo 0 || echo 1)"
+
+echo "record_pid write failure"
+reset; alive 4242 "$AGT"; rm -rf "$PID_DIR"; : > "$PID_DIR"
+run record_pid x 4242 /p
+check "unwritable PID_DIR: rc 1, the just-spawned PID is killed" "$([ $rc = 1 ] && has "$TMP/kills" '-9 4242' && echo 0 || echo 1)"
 
 echo "dead"
 reset; record_pid gateway 300 "$GATEWAY_DIR/rel"
