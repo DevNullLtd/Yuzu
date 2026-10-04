@@ -1446,7 +1446,7 @@ one core replica a server-only restart now recovers through the replay described
   proxied `Register` fails or is not accepted, and by the pending time to live otherwise). The rows of a
   connection that closed stay takeable for a grace (`dead_connection_grace_ms`, default 15000, valid 0 to
   120000, read once when the registry starts) so that a `Subscribe` on a reconnected channel can still take a
-  pending session, and are deleted after it (checked by eunit, dialyzer and scratch probes, not rig-run). Two review
+  pending session, and the rows its per-connection index names are deleted after it, by key and not by a table scan; a row stored and not yet committed is in no index and stays until its own commit or the pending time to live sweep removes it. A `Register` that a newer `Register` of the same agent id on the connection supersedes is answered `UNAVAILABLE` (it used to be `INTERNAL`, `registry_unavailable`, which stays for a registry that cannot be reached) (checked by eunit, dialyzer and scratch probes, not rig-run). Two review
   probes against the real application and a fake upstream (not rig runs) found that an earlier form let the
   same agent id store unlimited pending sessions and let a concurrent burst pass the pre-check and be
   proxied upstream; both are fixed. Consequences: the server's
