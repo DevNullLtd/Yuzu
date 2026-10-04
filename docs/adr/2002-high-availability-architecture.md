@@ -1428,7 +1428,9 @@ one core replica a server-only restart now recovers through the replay described
   New counters: `yuzu_gw_heartbeat_buffer_dropped_total{reason}` (`buffer_full`, `snapshot_oversize`,
   `snapshot_evicted`, and the later `heartbeat_oversize`, `heartbeat_invalid`, `chunk_rejected`) and
   `yuzu_gw_heartbeat_coalesced_total`. A later review round added bounded handling for a heartbeat that cannot be
-  sent as it is: one still over the chunk limit without its snapshot (or with more than 512 status tags) is
+  sent as it is: one still over the chunk limit without its snapshot (or with more than 512 status tags, or with
+  one tag key or value over about 64 KiB or more than about 256 KiB of tag bytes in total, a size
+  check made before any UTF-8 repair so the repair cost stays bounded) is
   kept without its status tags, one with invalid UTF-8 in a status tag is kept with the bytes replaced, and
   one rejected by the server with a non-transient status is dropped, so that none of them blocks newer
   heartbeats or stops a session's lease renewal; the same round added a flush of at most 8 chunks per
@@ -1436,10 +1438,15 @@ one core replica a server-only restart now recovers through the replay described
   A per-connection cap on agent sessions (`max_sessions_per_connection`, default 8, valid 1 to 1000, read
   once when the registry starts; a refused `Register` or `Subscribe` is answered `UNAVAILABLE` and counted
   in `yuzu_gw_session_limit_rejected_total`) keeps one connection from pushing other agents' snapshots out
-  of a full buffer (probed against a fake upstream, not rig-run). The early check that keeps a refused
-  `Register` off the server is not atomic with the pending-store step: two concurrent Registers can both
-  pass it, and the later one is then refused after it was proxied to the server (documented in the
-  registry module). Consequences: the server's
+  of a full buffer (probed against a fake upstream, not rig-run). It counts session rows, pending plus
+  live, excluding only the one live row a registration would supersede; a repeated `Register` of the same
+  agent id on the same connection supersedes that agent's older pending rows; and the slot is reserved
+  atomically when a `Register` is admitted, before it is proxied to the server, so concurrent Registers on
+  one connection admit at most the cap and nothing beyond it is proxied (the reservation is released if the
+  proxied `Register` fails or is not accepted, and by the pending time to live otherwise). Two review
+  probes against the real application and a fake upstream (not rig runs) found that an earlier form let the
+  same agent id store unlimited pending sessions and let a concurrent burst pass the pre-check and be
+  proxied upstream; both are fixed. Consequences: the server's
   `yuzu_heartbeats_received_total{via="gateway"}` under-counts while a backlog is coalesced, and an agent's
   topology snapshot can be one agent snapshot cycle older after an eviction. The server's 4 MiB receive
   limit is unchanged and not raised. The post-change rig run (`990e57e48`, 1 to 30 agents, plaintext, debug builds) recovered where the old gateway did not; see the evidence record. A third rig pass (G1 to G5, build `f3e9d52a4`) recovered the same way; the heartbeat screening that keeps a session's lease renewing, the router timeout clamp and the session cap are not in that build, and a pass on the final commit is pending. Not tested and known limits: 100 or more agents and a backlog that reaches the default byte cap; the
