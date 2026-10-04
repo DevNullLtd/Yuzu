@@ -2926,6 +2926,16 @@ if _bash_test.found()
     suite: 'docs',
     timeout: 120,
   )
+  # #5333: start-UAT.sh kill_stale signals only PIDs it recorded and refuses on
+  # foreign port holders. Sources the script with kill/ps/pgrep/lsof/docker
+  # replaced by functions; spawns and signals nothing. The decoy command line
+  # contains yuzu-agent, as the `meson compile` the old pgrep -f killed did.
+  test('start-UAT.sh kill_stale scoping (#5333)',
+    _bash_test,
+    args: [files('shell/test_start_uat_kill_stale.sh')],
+    suite: 'docs',
+    timeout: 60,
+  )
 endif
 
 # QE-INFO / build-ci B3: tests/shell/test_capability_matrix_gate.sh (PR1.1
