@@ -109,7 +109,7 @@ The gateway source lives in `gateway/apps/yuzu_gw/src/`:
 | `yuzu_gw_agent` | `gen_statem`: one process per agent bidi stream |
 | `yuzu_gw_registry` | Process groups + ETS routing table, plus the node-local session index used by heartbeat admission |
 | `yuzu_gw_router` | Command fanout coordinator |
-| `yuzu_gw_upstream` | gRPC client pool to the C++ server |
+| `yuzu_gw_upstream` | gRPC client to the C++ server: one channel, one HTTP/2 connection, one call at a time (see "Registration rate per gateway" under [What happens when the server restarts](#what-happens-when-the-server-restarts)) |
 | `yuzu_gw_agent_service` | Agent-facing gRPC server (AgentService proxy) |
 | `yuzu_gw_conn` | Connection key (the HTTP/2 connection pid) of an agent-facing gRPC call, read through the vendored grpcbox accessors |
 | `yuzu_gw_heartbeat_admission` | Admission decision for agent `Heartbeat` calls (session held by this node and call on the connection that opened it), rejection counters and the rate-limited summary log line |
@@ -629,7 +629,8 @@ The gateway is configured via `gateway/config/sys.config`. Key settings:
     {upstream_addr, "127.0.0.1"},
     {upstream_port, 50055},
 
-    %% Upstream connection pool size
+    %% No effect: no gateway code reads this key. The upstream channel is one
+    %% connection whatever the value (see "Registration rate per gateway")
     {upstream_pool_size, 16},
 
     %% Heartbeat batching interval (ms)
@@ -693,6 +694,15 @@ client at start, except `upstream_call_timeout_ms`, which is read on every call;
 An invalid value for any of these keys falls back to the default and logs a
 warning that names the key. See
 [What happens when the server restarts](#what-happens-when-the-server-restarts).
+
+**Upstream channel tuning** (read once, by `yuzu_gw_app` before the supervision
+tree starts; set it in the `yuzu_gw` section of `sys.config`. No `YUZU_GW_*`
+environment variable maps to it, so a compose deployment cannot switch it off
+through the environment; it takes a `sys.config` edit):
+
+| Key | Default | Valid values | Meaning |
+|---|---|---|---|
+| `upstream_tcp_nodelay` | `true` | `true` or `false` | Sets TCP_NODELAY on the gateway-to-server (upstream) gRPC channel. Without it, every upstream call with a request under about 64 KiB waited about 41 to 43 ms for Nagle's algorithm and the server's delayed ACK, which capped registration at about 24 agents per gateway per second (see "Registration rate per gateway"). At start the gateway restarts grpcbox's `default_channel` with `{nodelay, true}` added to the `socket_options` of each endpoint; the channel connects on its first call, so the restart drops no connection and existing `sys.config` files need no edit. Other `socket_options` of an endpoint are kept, and a `nodelay` entry you set there yourself wins (a hand-set `{nodelay, false}` keeps Nagle on that endpoint). It applies only to the upstream channel, not to the agent listener or the management channel. A value that is not a boolean logs a warning that names the key and uses the default `true`. `false` logs one INFO line and leaves the channel as configured. |
 
 **Heartbeat batching interval** (read by the heartbeat buffer at start; unlike
 the replay keys above, it also has an environment override):
@@ -1472,7 +1482,9 @@ the heartbeat buffer change); runs F1 to F6 ran on `990e57e48` (with it); runs H
 to H7 (rig pass 4) ran on `ab01f4f2f` and runs J1 to J7 (rig pass 5) on
 `e3cf6b38a`, both with the later review rounds' code up to those commits (rig pass
 3, runs G1 to G5, is in the evidence record). The code after `e3cf6b38a` has not
-run on a rig. T0 is
+run in a recovery pass; the only rig runs on it are the registration-rate
+investigation on `71ee2b02f` (runs K1 and K2 in the table) and, for the nodelay
+commits, none yet (a pass on the final commit is pending). T0 is
 the first `/health` 200 of the restarted server. "Default agents" means the
 default plugin set with the TAR plugin loaded; "no TAR" means the TAR plugin was
 removed so the heartbeat carried no snapshot.
@@ -1510,6 +1522,8 @@ removed so the heartbeat carried no snapshot.
 | J5 | `e3cf6b38a` (control: `ab01f4f2f` gateway) | session cap, same-id supersede, 200 concurrent Registers on one connection | 8 admitted, 192 refused, 8 reached the server; control on the previous code let 153 to 157 through per run |
 | J6 | `e3cf6b38a` | tag bound probe (5 MiB invalid value, 6 x 50 KiB, one 40 KiB tag) | `heartbeat_oversize` +2, `heartbeat_invalid` +0, the 40 KiB tag kept, buffer not restarted |
 | J7 | `e3cf6b38a` | 5 minute steady state after J3 | gateway WARN 0, ERROR 0, 0 flush errors |
+| K1 | `71ee2b02f` | registration rate, C++ clients with the agents' 30 s deadline, real-size `Register` (9,054 bytes), stock gateway and gateway with nodelay set kernel-wide, real server, loopback | stock: each upstream call 41 to 43 ms, about 24 per second per gateway; 1000 agents 703 registered and 297 hit the deadline; 2000 agents all registered after 776 s (85 s ideal), 5.9 attempts per agent. With nodelay: 2000 agents in 3.8 s and 5000 in 10.2 s, 0 retries. Stock 5000 not run. Not a recovery pass |
+| K2 | `71ee2b02f` | probe client: 40 concurrent `Register` calls of 256 KiB on one connection (the earlier J5 b2 case), Erlang HTTP/2 client and a C++ client | the 2 per second of J5 b2 came from the Erlang client's flow-control window update coalescing (500 ms by default), a measurement artefact; the C++ client sent the same 40 x 256 KiB in 91 ms through the same gateway |
 
 Details of what these runs showed:
 
@@ -1586,6 +1600,63 @@ route lease of 90 s plus the reaper's 180 s grace) makes their route rows
 eligible for the server's lease reaper, which runs about every 5 minutes
 (#4627; read from the server code and the ADR).
 
+**Registration rate per gateway.** Every `ProxyRegister` goes through the one
+`yuzu_gw_upstream` process, over one channel and one HTTP/2 connection, one call
+at a time, so the time of one upstream call sets how many agents a gateway can
+register per second. OBSERVED on a rig, on gateway commit `71ee2b02f` (which does
+not have the `upstream_tcp_nodelay` change; loopback, one box, debug-built
+server, plaintext, a C++ client with the agents' 30 s `Register` deadline and
+retry backoff; the request was a real `RegisterRequest` of 9,054 bytes, captured
+from a running agent through the gateway): each upstream call took about 41 to
+43 ms for any request under about 64 KiB, which caps a stock gateway at about 24
+registrations per second whatever the concurrency. The cause is INFERRED from
+switching nodelay on and off at three places (no packet capture was taken):
+Nagle's algorithm on the gateway-to-server socket meets the server's delayed
+ACK, because the HTTP/2 client library the gateway uses does not set TCP_NODELAY.
+The server's own handler time for a real-size `Register` was 1 to 2 ms, new
+enrollment included (derived from client-side latency, the server has no such
+metric). Bursts of simultaneous registrations, one connection per agent:
+
+| Agents | Stock gateway | With nodelay |
+|---|---|---|
+| 1000, one burst | 703 registered inside the 30 s deadline, 297 hit it | not run |
+| 2000, one burst, agents retry | all registered after 776 s (85 s ideal), 5.9 attempts per agent | 3.8 s, 0 retries |
+| 5000, one burst, agents retry | not run | 10.2 s, 0 retries |
+
+The "With nodelay" column was measured with the equivalent kernel-wide setting
+(`inet_default_connect_options` with `{nodelay, true}`) in the gateway's
+`sys.config`, not with `upstream_tcp_nodelay`. The per-endpoint `socket_options`
+setting that the key applies was measured by writing it into the channel
+declaration by hand, on the same commit and against an in-VM fake upstream only:
+40 concurrent real-size registrations took 1,665 ms stock and 43 ms with it, and
+a serial call 42 ms and 1 ms. A rig pass
+with the final commit (1000 and 2000 agent cold starts) is pending; until it
+runs, treat the nodelay column as the expected result of this change, not as a
+measurement of it.
+
+Three consequences. First, the agents give up on a `Register` after 30 s, and 24
+per second times 30 s is about 700, so a simultaneous burst of more than about
+700 agents on a stock gateway could not complete in one attempt (OBSERVED on the
+1000-agent run). Second, a call the agent has abandoned stays queued in the
+upstream process and is still executed: in the 2000-agent stock run the server
+executed every one of the 11,712 attempts, and the queue filled with abandoned
+work (the process mailbox held 988 messages one second into the 1000-agent burst
+and drained at 24 per second). Third, the replay drip's spacing
+(`registration_replay_spacing_ms`, 20 ms by default) was never the limit on a
+stock gateway: each call took about 43 ms, so the call time set the pace. With
+nodelay a call takes 1 to 2 ms, so the spacing becomes the pace of the drip
+(INFERRED from the code and the figures above, not run: the 5 ms row of the table
+under "Load and convergence bounds" is the nearest). Not measured: a replay of
+thousands of sessions through the drip, TLS (the certificate request adds about 1
+KiB to each `Register`), a non-loopback network (its round trip adds to each
+call), a stock 5000-agent burst, and the effect of a registration storm on
+inventory traffic (it runs through the same process) and on heartbeat batches
+(INFERRED from the code: they call the channel directly, not through the process).
+
+| Symptom | What you see | Cause | Action |
+|---|---|---|---|
+| Agents slow to come back after a server restart on a large fleet | The server log shows more than one `[gateway] ProxyRegister succeeded` line per agent (5.9 attempts per agent in the 2000-agent stock run); agents give up on a `Register` after 30 s; `yuzu_gw_upstream_rpc_duration_ms` for the `register` rpc name has a mean near 40 ms | Before the `upstream_tcp_nodelay` change, the 43 ms per-`Register` Nagle delay (OBSERVED on a rig, see above); also a slow server, because the upstream process runs one call at a time | Confirm `upstream_tcp_nodelay` is not `false` in the `yuzu_gw` section of `sys.config` (and that no endpoint has a hand-set `{nodelay, false}`); check the server's `ProxyRegister` latency. There is no queue metric for the upstream process: the mailbox depth was read on a rig with `process_info`, and no metric or log line shows it |
+
 **Several core replicas.** The verdict and replay reconcile is correct and
 bounded on one core replica. On several replicas it converges in one round only
 if a gateway's `BatchHeartbeat`, replay `ProxyRegister` and re-announced
@@ -1658,6 +1729,19 @@ env keys with defaults, which a reverted build ignores.
   it is fixed. (5) An exit that escapes the flush RPC no longer ends the
   buffer process (it used to be able to, losing every buffered heartbeat), and
   the buffer's crash-report status shows counts only, not heartbeat contents.
+- **Registration is still serialised through one process.** The proxy RPC of a
+  `Register` runs inside the `yuzu_gw_upstream` process, so calls queue behind
+  each other even with nodelay on, and a slow server still limits how fast a
+  gateway registers agents (a call is as slow as the server's answer). The call
+  carries no deadline of its own (only the vendored grpcbox client's default 5 s
+  receive timeout applies; read from the code, not run); the caller waits `upstream_call_timeout_ms`
+  (30 s by default, the same as the agents' `Register` deadline), and a call whose
+  caller or agent has gone is still executed when its turn comes (OBSERVED, see
+  "Registration rate per gateway"). Planned follow-ups, with no issue numbers yet:
+  run the proxy RPC outside the gen_server, shed requests whose caller is gone,
+  and give the upstream call a deadline shorter than the agent's 30 s. The
+  `upstream_pool_size` key in the shipped `sys.config` files does nothing; there
+  is no connection pool to size.
 - **R2b: a route row tombstoned while the server stayed up is not repaired by this
   reconcile.** OBSERVED: during a 6.9 minute network partition between the
   gateway and the server, with the server staying up (the traffic went through a

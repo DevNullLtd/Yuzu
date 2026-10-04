@@ -1541,6 +1541,14 @@ one core replica a server-only restart now recovers through the replay described
   `docs/user-manual/gateway.md`, "What happens when the server restarts". The evidence record (run table,
   test results, mutation summary, ledger obligations and their status, not-tested list) is
   `docs/security-reviews/gateway-heartbeat-verdict-replay-2026-10-04.md`.
+- **Registration rate per gateway (observed on a rig, commit `71ee2b02f`).** Every `ProxyRegister` runs one at a
+  time inside the single `yuzu_gw_upstream` process, and without `TCP_NODELAY` on the gateway-to-server socket each
+  call took about 41 to 43 ms, so one stock gateway registered about 24 agents per second and a burst of more than
+  about 700 agents could not finish inside the agents' 30 s `Register` deadline (1000 agents: 703 registered). The
+  gateway now sets `TCP_NODELAY` on that one upstream channel by default (`upstream_tcp_nodelay`, `sys.config` only);
+  running the proxy RPC outside the process, shedding requests whose caller is gone and a shorter upstream deadline
+  are planned follow-ups with no issue numbers yet, and a rig pass on the final commit is pending. Detail:
+  `docs/user-manual/gateway.md`, "Registration rate per gateway".
 
 ### 7d. Cross-cluster gateway fan-out — "rest of 4.3" (WS-4, 2026-09-21)
 
