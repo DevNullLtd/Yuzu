@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -402,13 +403,22 @@ SyncSource make_installed_software_source(SyncPluginMap plugins) {
     SyncSource src;
     src.name = "installed_software";
     src.interval = std::chrono::hours{24};
-    src.collect = [plugins = std::move(plugins)]() -> std::optional<std::pair<std::string, std::string>> {
+    src.skip_backoff = true; // every skip path is a cheap re-run (dispatch + parse, no fan-out)
+    auto last_reason = std::make_shared<std::string>();
+    src.skip_reason = [last_reason] { return *last_reason; };
+    src.collect = [plugins = std::move(plugins), last_reason]()
+        -> std::optional<std::pair<std::string, std::string>> {
+        last_reason->clear();
+        auto skip = [&](std::string reason) -> std::optional<std::pair<std::string, std::string>> {
+            *last_reason = std::move(reason);
+            return std::nullopt;
+        };
         // installed_apps anchors the report (UP-IN6): without it the other
         // plugins' rows alone would replace the stored inventory.
         const auto anchor = plugins.find("installed_apps");
         if (anchor == plugins.end() || anchor->second == nullptr) {
             spdlog::warn("sync: installed_apps plugin not loaded — installed_software source idle");
-            return std::nullopt;
+            return skip("installed_apps:not_loaded");
         }
         LocalDispatcher dispatcher;
         // Per-call capture cap: v2's 12-field rows (~200 B each raw) would
@@ -433,7 +443,8 @@ SyncSource make_installed_software_source(SyncPluginMap plugins) {
                 // flip-flops (mirrors the snapshot pump) — drop the cycle.
                 spdlog::warn("sync: {}.{} rc={}{} — skipping this cycle", row.plugin, row.action,
                              r.rc, r.truncated ? " (output truncated at the capture cap)" : "");
-                return std::nullopt;
+                return skip(std::string(row.plugin) + '.' + std::string(row.action) +
+                            (r.rc != 0 ? ":rc=" + std::to_string(r.rc) : ":truncated"));
             }
             AdaptedRows rows = row.adapt(r.captured);
             if (rows.entries.size() > kMaxEntries) {
@@ -443,7 +454,7 @@ SyncSource make_installed_software_source(SyncPluginMap plugins) {
                 // would ship as complete. Same UP-4 posture as the byte cap.
                 spdlog::warn("sync: {}.{} read more than {} rows — skipping this cycle",
                              row.plugin, row.action, kMaxEntries);
-                return std::nullopt;
+                return skip(std::string(row.plugin) + '.' + std::string(row.action) + ":row_cap");
             }
             if (rows.status == AdaptedRows::Status::unsupported) {
                 spdlog::debug("sync: {}.{} unsupported on this OS — skipped", row.plugin,
@@ -453,12 +464,13 @@ SyncSource make_installed_software_source(SyncPluginMap plugins) {
             if (rows.status == AdaptedRows::Status::failed) {
                 spdlog::warn("sync: {}.{} failed: {} — skipping this cycle", row.plugin, row.action,
                              rows.reason);
-                return std::nullopt;
+                return skip(std::string(row.plugin) + '.' + std::string(row.action) + ':' +
+                            rows.reason);
             }
             if (r.result_completeness == YUZU_RESULT_COMPLETENESS_PARTIAL && !row.accept_partial) {
                 spdlog::warn("sync: {}.{} typed result completeness PARTIAL — skipping this cycle",
                              row.plugin, row.action);
-                return std::nullopt;
+                return skip(std::string(row.plugin) + '.' + std::string(row.action) + ":partial");
             }
             if (!rows.reason.empty())
                 spdlog::info("sync: {}.{} constrained ({}) — rows kept: the constraint names facts "
@@ -472,7 +484,7 @@ SyncSource make_installed_software_source(SyncPluginMap plugins) {
         }
         if (all.empty()) {
             spdlog::debug("sync: installed_software collected no rows — skipping this cycle");
-            return std::nullopt;
+            return skip("installed_software:no_rows");
         }
         normalize_installed_software(all);
         if (all.size() > kMaxEntries) {
@@ -480,14 +492,14 @@ SyncSource make_installed_software_source(SyncPluginMap plugins) {
             // diverge from ours → permanent need_full. Same UP-4 posture as the byte cap.
             spdlog::warn("sync: installed_software {} entries exceed {} cap — skipping this cycle",
                          all.size(), kMaxEntries);
-            return std::nullopt;
+            return skip("installed_software:entry_cap");
         }
         std::string blob = installed_software_canonical_blob(std::move(all));
         if (blob.size() > kMaxBlobBytes) {
             spdlog::warn("sync: installed_software blob {} B exceeds {} B cap — skipping this "
                          "cycle (won't send an un-storable payload)",
                          blob.size(), kMaxBlobBytes);
-            return std::nullopt;
+            return skip("installed_software:blob_cap");
         }
         std::string hash = sha256_hex(blob);
         return std::make_pair(std::move(blob), std::move(hash));

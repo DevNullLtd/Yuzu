@@ -975,6 +975,8 @@ public:
                 // or outside [A-Za-z0-9_]) — distinct from a reserved-name
                 // attempt so operators can alert on crafted-name loads.
                 reason = "invalid_name";
+            } else if (err.reason.starts_with(yuzu::agent::kDuplicateNameReason)) {
+                reason = "duplicate_name";
             } else if (err.reason.starts_with(yuzu::agent::kSignatureMissingReason)) {
                 reason = "signature_missing";
             } else if (err.reason.starts_with(yuzu::agent::kSignatureUntrustedReason)) {
@@ -2161,6 +2163,9 @@ public:
                     const YuzuPluginDescriptor* app_usage_descriptor = nullptr;
                     for (const auto& handle : plugins_) {
                         const std::string_view pname{handle.descriptor()->name};
+                        // The loader rejects duplicate names at scan (kDuplicateNameReason),
+                        // so plugins_ carries unique names and emplace-first cannot diverge
+                        // from last-wins siblings (tar_descriptor-style lookups).
                         sync_plugins.emplace(std::string(pname), handle.descriptor());
                         if (pname == "tar")
                             tar_descriptor = handle.descriptor();
@@ -2455,6 +2460,19 @@ public:
                                             return kv_store_->get(p, k);
                                         });
                                 }
+                                // Skip streak/reason of each sync source, read from the
+                                // __sync__ KV (never the scheduler's own state).
+                                std::shared_ptr<SyncScheduler> sched;
+                                {
+                                    std::lock_guard<std::mutex> lk(sync_sched_mu_);
+                                    sched = sync_scheduler_;
+                                }
+                                if (sched && kv_store_)
+                                    yuzu::agent::emit_sync_skip_tags(
+                                        tags, sched->source_names(),
+                                        [this](const std::string& k) {
+                                            return kv_store_->get(kSyncKvNamespace, k);
+                                        });
                             } catch (const std::exception& e) {
                                 spdlog::warn("Heartbeat plugin-tag bridge failed: {}", e.what());
                             } catch (...) {

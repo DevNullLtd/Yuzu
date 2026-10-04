@@ -115,6 +115,11 @@ YUZU_EXPORT std::string installed_software_canonical_blob(std::vector<SwEntry> e
 /// idle (it anchors the report, UP-IN6). A failing action skips the cycle
 /// (nothing is deleted), as does typed PARTIAL completeness unless the action
 /// opts in (pkg_inventory managers).
+///
+/// The source opts into SyncSource::skip_backoff and sets skip_reason to the
+/// token of the most recent skip ("<plugin>.<action>:rc=<n>", ":truncated",
+/// ":row_cap", ":partial", ":<adapter reason>", "installed_apps:not_loaded",
+/// "installed_software:no_rows|entry_cap|blob_cap"), "" after a success.
 YUZU_EXPORT SyncSource make_installed_software_source(SyncPluginMap plugins);
 
 } // namespace yuzu::agent
