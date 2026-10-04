@@ -247,11 +247,16 @@ handle_event([yuzu, gw, heartbeat, session_mismatch], #{count := N}, _Meta, _Con
 %% circuit_open | queue_full: the replay queue is at its cap, or the upstream
 %% mailbox holds more than 100 messages so the buffer did not cast the ids);
 %% the ids already queued or inside the session guard are deduplicated, not
-%% dropped, and are not counted. A missing label falls to `unknown' rather than
-%% guessing, and the handler must never crash: telemetry detaches a handler
-%% that raises, which would silence every metric.
+%% dropped, and are not counted. A missing label, or one outside these closed
+%% sets (a non-atom included), falls to an `unknown' series that is not
+%% pre-seeded, as buffer_dropped does, rather than guessing, and the handler must
+%% never crash: telemetry detaches a handler that raises, which would silence
+%% every metric.
 handle_event([yuzu, gw, upstream, registration_replay_triggered], #{count := N}, Meta, _Config) ->
-    Trigger = maps:get(trigger, Meta, unknown),
+    Trigger = case maps:get(trigger, Meta, unknown) of
+        T when T =:= breaker; T =:= heartbeat -> T;
+        _ -> unknown
+    end,
     prometheus_counter:inc(yuzu_gw_registration_replay_triggered_total,
                            [atom_to_binary(Trigger, utf8)], N);
 
@@ -259,7 +264,11 @@ handle_event([yuzu, gw, heartbeat, unknown_truncated], #{count := N}, _Meta, _Co
     prometheus_counter:inc(yuzu_gw_heartbeat_unknown_truncated_total, [], N);
 
 handle_event([yuzu, gw, heartbeat, verdict_dropped], #{count := N}, Meta, _Config) ->
-    Reason = maps:get(reason, Meta, unknown),
+    Reason = case maps:get(reason, Meta, unknown) of
+        R when R =:= malformed; R =:= not_local; R =:= circuit_open;
+               R =:= queue_full -> R;
+        _ -> unknown
+    end,
     prometheus_counter:inc(yuzu_gw_heartbeat_verdict_dropped_total,
                            [atom_to_binary(Reason, utf8)], N);
 

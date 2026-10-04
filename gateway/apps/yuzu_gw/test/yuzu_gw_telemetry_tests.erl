@@ -282,6 +282,41 @@ verdict_families_test_() ->
                              #{count => 1}, #{trigger => breaker}),
            ?assertEqual({H0 + 1, B0 + 1}, {Read(<<"heartbeat">>), Read(<<"breaker">>)})
        end},
+      {"a trigger or reason outside the closed set goes to unknown and the handler stays attached",
+       fun() ->
+           Read = fun(Name, L) ->
+               case prometheus_counter:value(Name, [L]) of
+                   undefined -> 0;
+                   V         -> V
+               end
+           end,
+           Replay = yuzu_gw_registration_replay_triggered_total,
+           Dropped = yuzu_gw_heartbeat_verdict_dropped_total,
+           R0 = Read(Replay, <<"unknown">>), D0 = Read(Dropped, <<"unknown">>),
+           Bad = [<<"binary">>, "string", 42, {tuple}, [list], not_in_the_set],
+           [begin
+                telemetry:execute([yuzu, gw, upstream, registration_replay_triggered],
+                                  #{count => 1}, #{trigger => B}),
+                telemetry:execute([yuzu, gw, heartbeat, verdict_dropped],
+                                  #{count => 2}, #{reason => B})
+            end || B <- Bad],
+           %% A missing label falls to unknown too.
+           telemetry:execute([yuzu, gw, upstream, registration_replay_triggered],
+                             #{count => 1}, #{}),
+           telemetry:execute([yuzu, gw, heartbeat, verdict_dropped], #{count => 2}, #{}),
+           N = length(Bad),
+           ?assertEqual({R0 + N + 1, D0 + 2 * (N + 1)},
+                        {Read(Replay, <<"unknown">>), Read(Dropped, <<"unknown">>)}),
+           %% The handler was not detached by any of them: the closed series still move.
+           H0 = Read(Replay, <<"heartbeat">>),
+           telemetry:execute([yuzu, gw, upstream, registration_replay_triggered],
+                             #{count => 1}, #{trigger => heartbeat}),
+           ?assertEqual(H0 + 1, Read(Replay, <<"heartbeat">>)),
+           ?assert(lists:any(fun(#{id := Id}) -> Id =:= yuzu_gw_prometheus;
+                                (_) -> false end,
+                             telemetry:list_handlers([yuzu, gw, upstream,
+                                                      registration_replay_triggered])))
+       end},
       {"unknown_truncated moves the unlabelled counter",
        fun() ->
            V0 = prometheus_counter:value(yuzu_gw_heartbeat_unknown_truncated_total),
