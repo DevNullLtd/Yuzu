@@ -468,7 +468,7 @@ declare_metrics() ->
         {name, yuzu_gw_heartbeat_unknown_truncated_total},
         {labels, []},
         {help, "BatchHeartbeat responses whose list of unknown sessions the "
-               "server truncated. Sessions beyond the cap are reported again by "
+               "server truncated. Sessions beyond the cap may be reported again by "
                "later heartbeats"}]),
     prometheus_counter:declare([
         {name, yuzu_gw_heartbeat_verdict_dropped_total},
