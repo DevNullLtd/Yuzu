@@ -1755,7 +1755,7 @@ Quarantine a device.
 > [Audit Log](audit-log.md)).
 >
 > **`POST /api/command` reports what it withheld.** The success body carries
-> `withheld_quarantined` and (#3424/#3511) `withheld_unknown_plugin` — both
+> `withheld_quarantined`, (#3424/#3511) `withheld_unknown_plugin` and (#5294) `withheld_kill_switched_os` — all
 > always present, `0` on a clean dispatch — so `agents_reached: 97` on a
 > 100-device group is distinguishable from three devices being offline, and a
 > MIXED partial dispatch (some reached, some plugin-absent) is never silently
@@ -1779,7 +1779,7 @@ Quarantine a device.
 > MIXED partial dispatch the way this route's success body does — tracked as a
 > follow-up.
 >
-> **Its `503` now names the cause.** Four conditions previously shared one
+> **Its `503` now names the cause.** Several conditions previously shared one
 > body ("failed to send command to any agent"), and two of them are
 > fleet-wide/request-wide states rather than a transport failure:
 >
@@ -1788,13 +1788,15 @@ Quarantine a device.
 > | `containment_unreadable` | The gate is failing closed: containment state cannot be read, so **every** target on **every** dispatch is refused. A server condition, not a device one. | `5000` |
 > | `quarantined` | Every target named is contained. The dispatch was withheld, not attempted. | `null` — retrying will not help until the device is released |
 > | `plugin_not_found` (#3511) | The dispatched plugin is absent from every target's reported inventory — a command guaranteed to fail, withheld before dispatch rather than reported as a false success. Permanent for the current plugin name. If the plugin name and spelling are correct and it genuinely is installed on the target, the agent's REPORTED inventory is stale: it is populated once at registration and does not refresh until the agent's management connection next re-registers (a reconnect — daemon restart, or any dropped/re-established connection) — this reason can persist until then even after installation completes. | `null` — retrying will not help; check the plugin name/spelling instead, or trigger a reconnect on the target agent if the plugin was only just installed |
+> | `kill_switched_os` (#5294) | Every reachable target runs an OS for which this plugin action's per-OS kill switch is OFF. The dispatch was withheld, not attempted. | `null` — retrying will not help until the switch is turned back on for that OS |
+> | `os_gate_unreadable` (#5294) | Agent presence could not be read while a per-OS kill switch is set, so the dispatch failed closed rather than reaching only this replica's local agents. Transient. | `5000` |
 > | *(absent)* | Genuinely no agent reachable — the pre-existing meaning. | *(absent)* |
 >
 > `reason` is a top-level key on the error object, not part of the A4
 > `error.data` envelope. `POST /api/instructions/{id}/execute` carries the
-> same three-`reason` `503` split as `POST /api/command` above
-> (`containment_unreadable` / `quarantined` / `plugin_not_found`, same
-> `retry_after_ms` values) — closed alongside the architect finding that its
+> same `reason` `503` split as `POST /api/command` above
+> (`containment_unreadable` / `quarantined` / `plugin_not_found` /
+> `kill_switched_os` / `os_gate_unreadable`, same `retry_after_ms` values) — closed alongside the architect finding that its
 > response-building code
 > was reading `dispatch_outcome.command_id`/`.sent` only, discarding the
 > richer fields already available on the same struct.
