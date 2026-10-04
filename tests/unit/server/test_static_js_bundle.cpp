@@ -1100,6 +1100,28 @@ TEST_CASE("static_js_bundle: kYuzuChartsJs renders an empty-state message on no 
     CHECK_THAT(yuzu::server::kYuzuChartsJs, ContainsSubstring("isEmptyData"));
 }
 
+TEST_CASE("static_js_bundle: kYuzuChartsJs surfaces a cut visualization result in-card",
+          "[static-js][yuzu-charts]") {
+    // The visualization route stamps rows_capped (row cap only) and
+    // result_truncated_by_cap + truncation_cause (row_cap | byte_cap) on a cut
+    // payload. The chart is fetched independently of the results table, so the
+    // adapter is the only place an operator can see that the picture is partial.
+    // Pin that it consumes all three fields and renders the notice with
+    // textContent (never innerHTML) from the payload.
+    const auto& js = yuzu::server::kYuzuChartsJs;
+    CHECK_THAT(js, ContainsSubstring("function truncationNotice"));
+    CHECK_THAT(js, ContainsSubstring("data.result_truncated_by_cap"));
+    CHECK_THAT(js, ContainsSubstring("data.rows_capped"));
+    CHECK_THAT(js, ContainsSubstring("data.truncation_cause"));
+    CHECK_THAT(js, ContainsSubstring("yuzu-chart-truncated"));
+    CHECK_THAT(js, ContainsSubstring("result-degrade-banner"));
+    CHECK_THAT(js, ContainsSubstring("note.textContent = msg"));
+    CHECK_THAT(js, ContainsSubstring("Partial result:"));
+    // CSP is script-src 'self' 'unsafe-inline' with no unsafe-eval.
+    CHECK_THAT(js, !ContainsSubstring("new Function("));
+    CHECK_THAT(js, !ContainsSubstring("eval("));
+}
+
 // ── Per-host page shell (PR 9-pre, /viz/host/<agent_id>) ────────────────────
 
 TEST_CASE("static_js_bundle: kVizHostPageHtml renders IPC graph mount point", "[viz-host][page]") {

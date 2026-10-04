@@ -7309,7 +7309,7 @@ Render an execution's response set as chart-ready JSON, using the `spec.visualiz
 
 `chart_index` and `chart_count` (issue #587) let clients iterate when the definition declares multiple charts. For `datetime_series` charts, `labels` is replaced by `x` (epoch-seconds array) and `"x_axis": "datetime"` is added.
 
-When the underlying response set exceeds the per-request row cap (10000), the response payload includes `"rows_capped": true` and `"rows_cap": 10000` so the client can surface a "showing first N rows" banner.
+When the underlying response set exceeds the per-request row cap (10000), the response payload includes `"rows_capped": true` and `"rows_cap": 10000` so the client can surface a "showing first N rows" banner. `rows_capped` is the row cap only: a read cut by the 50 MiB payload cap sets `result_truncated_by_cap: true` with `truncation_cause: "byte_cap"` and not `rows_capped`, so a client must test `result_truncated_by_cap` to catch both. The dashboard chart adapter does (it shows a "Partial result" notice in the chart card).
 
 **Errors:**
 
