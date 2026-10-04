@@ -239,10 +239,12 @@ handle_event([yuzu, gw, heartbeat, session_mismatch], #{count := N}, _Meta, _Con
 %% cannot control label cardinality. `unknown_truncated' counts verdicts the
 %% server cut short. `verdict_dropped' counts session ids the verdict named
 %% that were not queued for replay, by reason (malformed | not_local |
-%% circuit_open | queue_full); the ids already queued or inside the session
-%% guard are deduplicated, not dropped, and are not counted. A missing label
-%% falls to `unknown' rather than guessing, and the handler must never crash:
-%% telemetry detaches a handler that raises, which would silence every metric.
+%% circuit_open | queue_full: the replay queue is at its cap, or the upstream
+%% mailbox holds more than 100 messages so the buffer did not cast the ids);
+%% the ids already queued or inside the session guard are deduplicated, not
+%% dropped, and are not counted. A missing label falls to `unknown' rather than
+%% guessing, and the handler must never crash: telemetry detaches a handler
+%% that raises, which would silence every metric.
 handle_event([yuzu, gw, upstream, registration_replay_triggered], #{count := N}, Meta, _Config) ->
     Trigger = maps:get(trigger, Meta, unknown),
     prometheus_counter:inc(yuzu_gw_registration_replay_triggered_total,
@@ -477,8 +479,10 @@ declare_metrics() ->
                "for replay, by reason (malformed = not a usable session id, "
                "not_local = this node does not hold the session, circuit_open = "
                "the upstream circuit breaker is open, queue_full = the replay "
-               "queue is at its cap). Ids already queued or replayed within the "
-               "session guard window are not counted"}]),
+               "queue is at its cap, or the upstream process already holds more "
+               "than 100 unhandled messages so the ids were not handed to it). "
+               "Ids already queued or replayed within the session guard window "
+               "are not counted"}]),
     %% Create every series at 0 now (a series that first appears already at 1
     %% is invisible to increase()).
     [prometheus_counter:inc(yuzu_gw_registration_replay_triggered_total, [T], 0)

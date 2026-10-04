@@ -924,7 +924,9 @@ replay_verdict(SessionIds, State) ->
 %%     the agent's next heartbeat.
 %%   - the session was replayed within the guard window: skipped. The verdict
 %%     was computed before that replay landed.
-%%   - the queue is at its cap: dropped and counted (queue_full).
+%%   - the queue is at its cap: dropped and counted (queue_full; the heartbeat
+%%     buffer also counts queue_full when it skips the cast because this
+%%     process's mailbox is long).
 %%   - otherwise appended.
 %% The first two are deduplication, not loss, and are not counted as drops.
 %% Ids this node does not hold are counted as not_local. Membership is

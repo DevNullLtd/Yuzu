@@ -110,6 +110,15 @@ metrics_scrape_renders_test_() ->
             || Help <- [<<"# HELP yuzu_gw_registration_replay_triggered_total ">>,
                         <<"# HELP yuzu_gw_heartbeat_unknown_truncated_total ">>,
                         <<"# HELP yuzu_gw_heartbeat_verdict_dropped_total ">>]]
+       end},
+      %% queue_full has two causes; the HELP must name both, or an operator
+      %% reading a rising series looks only at the replay queue.
+      {"verdict_dropped HELP names both causes of queue_full",
+       fun() ->
+           Out = prometheus_text_format:format(),
+           [?assertNotEqual(nomatch, binary:match(Out, Part))
+            || Part <- [<<"queue_full = the replay queue is at its cap, or the upstream ">>,
+                        <<"process already holds more than 100 unhandled messages">>]]
        end}
      ]}.
 
