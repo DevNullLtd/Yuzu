@@ -933,7 +933,12 @@ TEST_CASE("PluginConfigStore: an exhausted lease yields no kill-switch decision 
           "[pg][store][plugin_config][killswitch]") {
     YUZU_REQUIRE_PG_DB_TPL(db, plugincfg_tpl);
     Wired w{db.dsn()};
-    std::vector<PgPool::Lease> held; // hold every connection; the store waits its own 300 ms
+    // Fixed bounded cost: with every lease held, the production
+    // `kKillSwitchCheckTimeout` (300 ms) wait can only time out, so the
+    // outcome is deterministic on any machine (no polling, no timing
+    // assumption). This is the "open store, exhausted lease" fail-closed arm;
+    // injecting the timeout would add a production parameter for one test.
+    std::vector<PgPool::Lease> held;
     for (std::size_t i = 0; i < w.pool.size(); ++i) {
         auto lease = w.pool.try_acquire_for(std::chrono::milliseconds{1000});
         REQUIRE(lease);

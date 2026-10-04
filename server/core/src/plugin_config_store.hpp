@@ -113,8 +113,9 @@ public:
         std::int64_t updated_at_ms{0};
         /// scope_key of the row that produced reason/set_by/updated_at/enabled
         /// ("" when no row exists). With an `os` request this can differ from
-        /// the requested scope: the first OFF row in specificity order when
-        /// the effective state is off.
+        /// the requested scope: the winning row of the first disabling layer
+        /// (OS layer, then base) when the effective state is off; a row
+        /// overridden within its layer is never named.
         std::string source;
     };
 

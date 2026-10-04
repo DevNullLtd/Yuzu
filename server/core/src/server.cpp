@@ -1576,10 +1576,10 @@ public:
         // here rather than iterated from a shared array — unlike the `reason`
         // constants above, these are hardcoded per-call-site string literals
         // in `command_routes.cpp`, not sourced from a header constant: `success`/
-        // `denial` (the `audit_fn` wrapper) plus the seven `guarded()` site
+        // `denial` (the `audit_fn` wrapper) plus the nine `guarded()` site
         // names (`audit_quarantine_dispatch_fail_closed`,
         // `audit_quarantine_dispatch_denied_batch`, `audit_unknown_plugin_dispatch`,
-        // `audit_kill_switched_os_dispatch` (#5294),
+        // `audit_kill_switched_os_dispatch` (#5294), `audit_os_gate_unreadable` (#5294),
         // `forward_gateway_pending`, `publish(command-status)`,
         // `emit_event(command.dispatched)`, `thead_for_plugin`).
         metrics_.describe(
@@ -1593,7 +1593,8 @@ public:
         for (const char* phase : {"success", "denial", "audit_quarantine_dispatch_fail_closed",
                                   "audit_quarantine_dispatch_denied_batch",
                                   "audit_unknown_plugin_dispatch",
-                                  "audit_kill_switched_os_dispatch", "forward_gateway_pending",
+                                  "audit_kill_switched_os_dispatch",
+                                  "audit_os_gate_unreadable", "forward_gateway_pending",
                                   "publish(command-status)", "emit_event(command.dispatched)",
                                   "thead_for_plugin"})
             metrics_.counter("yuzu_server_dispatch_fanout_throw_total",

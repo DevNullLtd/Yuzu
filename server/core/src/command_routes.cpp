@@ -709,8 +709,10 @@ void register_command_routes(HttpRouteSink& sink, Deps deps) {
             spdlog::error("command dispatch {}:{} refused: presence unreadable while a per-OS "
                           "kill switch is OFF",
                           plugin, action);
-            deps.audit_os_gate_unreadable_fn(caller.principal, caller.principal_role, command_id,
-                                             plugin);
+            guarded(command_id, "audit_os_gate_unreadable", deps.metrics, [&] {
+                deps.audit_os_gate_unreadable_fn(caller.principal, caller.principal_role,
+                                                 command_id, plugin);
+            });
             res.status = 503;
             res.set_content(
                 R"({"error":{"code":503,"message":"agent presence could not be read while a per-OS kill switch is set — dispatch is failing closed and reaching no agent","reason":"os_gate_unreadable","retry_after_ms":5000},"meta":{"api_version":"v1"}})",
