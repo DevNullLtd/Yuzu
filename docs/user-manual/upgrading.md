@@ -56,6 +56,33 @@ and the free-space guidance are in [Installed-Software Inventory](inventory.md) 
 
 No config or data migration is required.
 
+## Behaviour change: per-OS plugin kill switch rows (#5294)
+
+The plugin kill switch can now be narrowed per agent OS (`windows`, `linux`, `darwin`). The
+`plugin_config_store` schema moves to v2 (`ALTER TABLE kill_switches ADD COLUMN os`). Existing
+plugin and action rows read back unchanged, so nothing flips on upgrade.
+
+- **Rollback.** v2 is an additive column and an older server starts on it without complaint (there
+  is no schema-ahead guard). A server older than this change ignores every `<plugin>@<os>` row:
+  per-OS OFF stops being enforced and its `GET` reports `enabled=true`.
+- **Mixed versions.** An older replica applies `PUT .../kill-switch?os=<os>` as the PLUGIN-LEVEL
+  row. `enabled=true` can therefore re-enable a plugin you stopped for the whole fleet, and
+  `enabled=false` stops the plugin on every OS. Set per-OS rows only after every replica runs this
+  build, and never write one from an older binary. After a rollback per-OS OFF rows stay stored
+  but are not enforced: if the plugin must stay stopped, set its plugin-level OFF row. Find your
+  rows in the `plugin_config.kill_switch.set` audit entries (`target_id`
+  `<plugin>[.<action>]@<os>`) and confirm each with `GET ...?os=<os>` once every replica is back on
+  this build.
+- **Limits.** An agent whose OS is unknown or empty is never withheld. The OS is what the agent
+  reports and is matched exactly (`windows`, `linux`, `darwin`). The MCP pre-dispatch dry run cannot
+  see the per-OS layer. Remote agents (connected through another replica) rely on the presence
+  snapshot.
+- **Integrations.** MCP clients should key on `status`, tolerate unknown fields and re-fetch
+  `tools/list`. `execute_instruction` has two new `status` values (`kill_switched_os`,
+  `os_gate_unreadable`) and its output schema now requires `agents_kill_switched_os` in every
+  zero-reach branch. The kill-switch REST responses gain additive `os` and `source` fields,
+  and the `/api/command` response gains `withheld_kill_switched_os`.
+
 ## Behaviour change: DEX device score and management-group member reads now fail closed on a degraded read (#4855, #1762)
 
 **Not a Breaking lead for the DEX routes and the management-group MEMBER-read path** — those already documented a `503` response before this release; what changes for them is when it fires, not the documented contract. **This does NOT hold for `GET /api/v1/management-groups/{id}`'s own GROUP-ROW read or its MCP twin `get_management_group`** (governance round-2, #1762): before this release, a degraded group-row read answered the SAME flat, undocumented `404 "group not found"` a genuinely nonexistent group id gets — there was no `503` contract for that case at all. This release adds a NEWLY DOCUMENTED, additive `503`/retryable error path for a degraded group-row read specifically; the `404` contract for a genuine not-found is unchanged. A client that already treats any `503` from these routes as retryable per the A4 contract needs no code change; a client that inferred "management group not found" purely from a `404` status code should note that `404` now unambiguously means "no such group" (never "could not tell") — narrower, not wider, than before.

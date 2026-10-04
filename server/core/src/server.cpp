@@ -1436,7 +1436,12 @@ public:
                           "explicit agent_ids on REST (route=command), MCP execute_instruction "
                           "(route=mcp) or the dashboard exec console (route=dashboard) (#3685). "
                           "Both labels are closed sets; every reachable pair "
-                          "is pre-seeded at boot so absent() stays meaningful.",
+                          "is pre-seeded at boot so absent() stays meaningful. The "
+                          "withhold reasons quarantined, unknown_plugin and "
+                          "kill_switched_os are deliberate withholds (containment, an "
+                          "absent plugin, operator policy) rather than malformed "
+                          "targeting, and are excluded from the "
+                          "YuzuDispatchTargetRejected alert.",
                           "counter");
         // The route-level reasons below are the literals in `kRouteRejectReasons`
         // (dispatch_target_shape.hpp). They are spelled out here rather than
@@ -1559,6 +1564,13 @@ public:
                              {{"route", route},
                               {"reason", std::string(yuzu::server::kReasonUnknownPlugin)}});
 
+        // #5294: same three routes, same discipline, for the per-OS kill-switch
+        // filter.
+        for (const char* route : {"dispatch_closure", "command", "legacy"})
+            metrics_.counter("yuzu_server_dispatch_target_rejected_total",
+                             {{"route", route},
+                              {"reason", std::string(yuzu::server::kReasonKillSwitchedOs)}});
+
         // Governance round 1 for #2557 (UP-1b): `yuzu_server_dispatch_fanout_
         // throw_total` was introduced by the #2557 extraction (the local
         // `audit_fn` wrapper in `command_routes.cpp`) but was never pre-seeded
@@ -1570,9 +1582,10 @@ public:
         // here rather than iterated from a shared array — unlike the `reason`
         // constants above, these are hardcoded per-call-site string literals
         // in `command_routes.cpp`, not sourced from a header constant: `success`/
-        // `denial` (the `audit_fn` wrapper) plus the seven `guarded()` site
+        // `denial` (the `audit_fn` wrapper) plus the nine `guarded()` site
         // names (`audit_quarantine_dispatch_fail_closed`,
         // `audit_quarantine_dispatch_denied_batch`, `audit_unknown_plugin_dispatch`,
+        // `audit_kill_switched_os_dispatch` (#5294), `audit_os_gate_unreadable` (#5294),
         // `forward_gateway_pending`, `publish(command-status)`,
         // `emit_event(command.dispatched)`, `thead_for_plugin`).
         metrics_.describe(
@@ -1585,7 +1598,9 @@ public:
             "counter");
         for (const char* phase : {"success", "denial", "audit_quarantine_dispatch_fail_closed",
                                   "audit_quarantine_dispatch_denied_batch",
-                                  "audit_unknown_plugin_dispatch", "forward_gateway_pending",
+                                  "audit_unknown_plugin_dispatch",
+                                  "audit_kill_switched_os_dispatch",
+                                  "audit_os_gate_unreadable", "forward_gateway_pending",
                                   "publish(command-status)", "emit_event(command.dispatched)",
                                   "thead_for_plugin"})
             metrics_.counter("yuzu_server_dispatch_fanout_throw_total",
@@ -12128,11 +12143,11 @@ private:
         auto finalized = yuzu::server::detail::finalize_classified_command(
             cap,
             plugin_config_store_ != nullptr
-                ? std::function<bool(std::string_view, std::string_view)>(
+                ? yuzu::server::detail::KillSwitchFn(
                       [this](std::string_view p, std::string_view a) {
-                          return plugin_config_store_->action_allowed(p, a);
+                          return plugin_config_store_->kill_switch_decision(p, a);
                       })
-                : std::function<bool(std::string_view, std::string_view)>{},
+                : yuzu::server::detail::KillSwitchFn{},
             plugin, action, command_id, parameters, payload, stagger_seconds, delay_seconds,
             target_arm, execution_id);
 
@@ -12549,6 +12564,11 @@ private:
         }
         audit_unknown_plugin_dispatch("dispatch_closure", caller.principal, caller.principal_role,
                                       command_id, plugin, outcome.unknown_plugin_count);
+        audit_kill_switched_os_dispatch("dispatch_closure", caller.principal,
+                                        caller.principal_role, command_id, plugin,
+                                        outcome.kill_switched_os_count);
+        if (outcome.os_gate_unreadable)
+            audit_os_gate_unreadable(caller.principal, caller.principal_role, command_id, plugin);
 
         forward_gateway_pending();
         if (outcome.sent > 0)
@@ -13540,16 +13560,57 @@ private:
                                        const std::string& principal_role,
                                        const std::string& command_id, const std::string& plugin,
                                        std::size_t count) {
+        audit_dispatch_withheld(route, principal, principal_role, command_id, plugin, count,
+                                yuzu::server::kReasonUnknownPlugin, "plugin_not_found");
+    }
+
+    // #5294: the per-OS kill-switch sibling -- same aggregate row and metric,
+    // its own `reason`.
+    void audit_kill_switched_os_dispatch(std::string_view route, const std::string& principal,
+                                         const std::string& principal_role,
+                                         const std::string& command_id, const std::string& plugin,
+                                         std::size_t count) {
+        audit_dispatch_withheld(route, principal, principal_role, command_id, plugin, count,
+                                yuzu::server::kReasonKillSwitchedOs, "kill_switched_os");
+    }
+
+    // #5294: a dispatch refused BEFORE targeting because presence could not be
+    // read while a per-OS kill switch is OFF. Like the fail-closed quarantine
+    // row it is ONE aggregate decision with no per-agent count. Audit row only:
+    // the scheduled-path outbox already counts the cause
+    // (`yuzu_server_command_outbox_deliver_retry_cause_total`), and
+    // `yuzu_server_dispatch_target_rejected_total` carries the per-target
+    // withhold reasons, and this refusal has no per-target count.
+    void audit_os_gate_unreadable(const std::string& principal, const std::string& principal_role,
+                                  const std::string& command_id, const std::string& plugin) {
+        write_withheld_row(principal, principal_role, command_id, plugin, "os_gate_unreadable");
+    }
+
+    // Shared body of `audit_unknown_plugin_dispatch` and
+    // `audit_kill_switched_os_dispatch`: `metric_reason` is the
+    // `yuzu_server_dispatch_target_rejected_total` label, `detail_reason` the
+    // token written into the audit row's detail.
+    void audit_dispatch_withheld(std::string_view route, const std::string& principal,
+                                 const std::string& principal_role, const std::string& command_id,
+                                 const std::string& plugin, std::size_t count,
+                                 std::string_view metric_reason, std::string_view detail_reason) {
         if (count == 0)
             return;
         metrics_
             .counter("yuzu_server_dispatch_target_rejected_total",
-                     {{"route", std::string(route)},
-                      {"reason", std::string(yuzu::server::kReasonUnknownPlugin)}})
+                     {{"route", std::string(route)}, {"reason", std::string(metric_reason)}})
             .increment(static_cast<double>(count));
-        spdlog::warn(
-            "dispatch withheld: route={} command={} plugin={} reason=unknown_plugin agents={}",
-            route, command_id, plugin, count);
+        spdlog::warn("dispatch withheld: route={} command={} plugin={} reason={} agents={}", route,
+                     command_id, plugin, metric_reason, count);
+        write_withheld_row(principal, principal_role, command_id, plugin,
+                           std::string(detail_reason) + " agents=" + std::to_string(count));
+    }
+
+    // The one `command.dispatch_withheld` audit row; `reason_tail` is the
+    // text after `reason=` (the cause token, plus `agents=N` where counted).
+    void write_withheld_row(const std::string& principal, const std::string& principal_role,
+                            const std::string& command_id, const std::string& plugin,
+                            const std::string& reason_tail) {
         if (!audit_store_)
             return;
         AuditEvent ev{};
@@ -13560,12 +13621,12 @@ private:
         ev.target_type = "Command";
         ev.target_id = "*";
         ev.detail = "COMMAND_DISPATCH_WITHHELD command=" + command_id + " plugin=" + plugin +
-                    " reason=plugin_not_found agents=" + std::to_string(count);
+                    " reason=" + reason_tail;
         ev.result = "denied";
         if (!audit_store_->log(ev))
             spdlog::error("audit write failed: command.dispatch_withheld (command={} plugin={}, "
-                          "agents={})",
-                          command_id, plugin, count);
+                          "reason={})",
+                          command_id, plugin, reason_tail);
     }
 
     // Apply stored runtime config overrides on startup. Returns false on a
@@ -15707,6 +15768,18 @@ private:
                                const std::string& plugin, std::size_t count) {
                         audit_unknown_plugin_dispatch(route, principal, principal_role,
                                                       command_id, plugin, count);
+                    },
+                    .audit_kill_switched_os_dispatch_fn =
+                        [this](std::string_view route, const std::string& principal,
+                               const std::string& principal_role, const std::string& command_id,
+                               const std::string& plugin, std::size_t count) {
+                        audit_kill_switched_os_dispatch(route, principal, principal_role,
+                                                        command_id, plugin, count);
+                    },
+                    .audit_os_gate_unreadable_fn =
+                        [this](const std::string& principal, const std::string& principal_role,
+                               const std::string& command_id, const std::string& plugin) {
+                        audit_os_gate_unreadable(principal, principal_role, command_id, plugin);
                     },
                     .audit_scope_resolution_failed_fn =
                         [this](const std::string& principal, const std::string& principal_role,
@@ -19789,16 +19862,20 @@ private:
                         });
                     if (!decision)
                         return decision;
-                    const std::function<bool(std::string_view, std::string_view)> action_allowed =
+                    const yuzu::server::detail::KillSwitchFn action_allowed =
                         plugin_config_store_ != nullptr
-                            ? std::function<bool(std::string_view, std::string_view)>(
+                            ? yuzu::server::detail::KillSwitchFn(
                                   [this](std::string_view p, std::string_view a) {
-                                      return plugin_config_store_->action_allowed(p, a);
+                                      return plugin_config_store_->kill_switch_decision(p, a);
                                   })
-                            : std::function<bool(std::string_view, std::string_view)>{};
-                    if (auto denial =
-                            yuzu::server::detail::kill_switch_denial(*decision, action_allowed)) {
-                        return std::unexpected(*denial);
+                            : yuzu::server::detail::KillSwitchFn{};
+                    // The dry run has no target, so it cannot see the per-OS
+                    // layer (only the all-OS denial); a per-OS withhold shows
+                    // up at dispatch as kill_switched_os_count > 0.
+                    if (auto os_set =
+                            yuzu::server::detail::kill_switch_denial(*decision, action_allowed);
+                        !os_set) {
+                        return std::unexpected(os_set.error());
                     }
                     return decision;
                 });
@@ -20427,9 +20504,29 @@ private:
         // for this dispatch. BR-009: `classified->wire().plugin()`, not the
         // raw `plugin` local — see the /api/command sibling site's comment.
         const auto plugin_missing = registry_.ids_missing_plugin(classified->wire().plugin());
+        // #5294: per-OS kill-switch ids; a degraded presence read while a
+        // per-OS switch is OFF refuses the dispatch (fail closed). A fail-closed
+        // containment gate already withholds every id and is reported first
+        // below (`containment_unreadable`), so skip the presence read rather
+        // than let `os_gate_unreadable` shadow it.
+        static const std::unordered_set<std::string> kNoOsKillSwitch{};
+        const auto os_kill_switched = registry_.ids_with_os(
+            containment_gate.fail_closed ? kNoOsKillSwitch : classified->kill_switched_os());
+        if (!os_kill_switched) {
+            spdlog::error("legacy dispatch {}:{} refused: presence unreadable while a per-OS "
+                          "kill switch is OFF",
+                          plugin, action);
+            audit_os_gate_unreadable(caller.principal, caller.principal_role, command_id, plugin);
+            res.status = 503;
+            res.set_content(
+                R"({"error":{"code":503,"message":"agent presence could not be read while a per-OS kill switch is set — dispatch is failing closed and reaching no agent","reason":"os_gate_unreadable","retry_after_ms":5000},"meta":{"api_version":"v1"}})",
+                "application/json");
+            return;
+        }
         auto result = yuzu::server::dispatch_confined_arms(
             yuzu::server::DispatchArm::Broadcast, {}, exec_visible,
-            /*broadcast_on_none=*/false, containment_gate, sink, plugin_missing);
+            /*broadcast_on_none=*/false, containment_gate, sink, plugin_missing,
+            *os_kill_switched);
         int sent = result.sent;
 
         // #881: emitted BEFORE the sent==0 -> 503 branch below, so a
@@ -20447,6 +20544,8 @@ private:
         }
         audit_unknown_plugin_dispatch("legacy", caller.principal, caller.principal_role,
                                       command_id, plugin, result.unknown_plugin_count);
+        audit_kill_switched_os_dispatch("legacy", caller.principal, caller.principal_role,
+                                        command_id, plugin, result.kill_switched_os_count);
 
         if (sent == 0) {
             // Same five-way split as /api/command (command_routes.cpp as of
@@ -20481,6 +20580,10 @@ private:
             } else if (result.unknown_plugin_count > 0) {
                 res.set_content(
                     R"({"error":{"code":503,"message":"the dispatched plugin is not in any target's reported inventory — dispatch was withheld, not attempted","reason":"plugin_not_found","retry_after_ms":null},"meta":{"api_version":"v1"}})",
+                    "application/json");
+            } else if (result.kill_switched_os_count > 0) {
+                res.set_content(
+                    R"({"error":{"code":503,"message":"every target runs an OS for which this plugin action is switched off — dispatch was withheld, not attempted","reason":"kill_switched_os","retry_after_ms":null},"meta":{"api_version":"v1"}})",
                     "application/json");
             } else {
                 res.set_content(

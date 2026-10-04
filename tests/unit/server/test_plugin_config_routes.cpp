@@ -572,3 +572,55 @@ TEST_CASE("plugin_config_routes: list route's AdmitAll (legacy-open RBAC) serves
             found = true;
     CHECK(found);
 }
+
+// #5294: per-OS kill-switch rows through the REST route.
+TEST_CASE("plugin_config_routes: kill-switch GET/PUT carry os and source; ?os= round-trips with "
+          "an @<os> audit target_id; an unknown os is a 400",
+          "[pg][server][routes][config][killswitch]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, route_tpl);
+    PgWired w{db.dsn()};
+    Harness h;
+    h.store = &w.store;
+    h.wire();
+
+    // Plugin-level view carries os "" and a source field.
+    auto plain = h.sink.Get("/api/v1/plugin-config/firewall/kill-switch");
+    REQUIRE(plain);
+    CHECK(body(plain->body)["data"]["os"] == "");
+    CHECK(body(plain->body)["data"].contains("source"));
+
+    auto put = h.sink.Put("/api/v1/plugin-config/firewall/kill-switch?os=windows",
+                          json{{"enabled", false}, {"reason", "leg not ready"}}.dump());
+    REQUIRE(put);
+    CHECK(put->status == 200);
+    CHECK(body(put->body)["data"]["os"] == "windows");
+    REQUIRE(h.audits.size() == 2);
+    CHECK(h.audits[0].target_id == "firewall@windows");
+
+    // Only Windows is withheld; the plugin as a whole still dispatches.
+    CHECK(w.store.action_allowed("firewall", "block"));
+    auto win = h.sink.Get("/api/v1/plugin-config/firewall/kill-switch?os=windows");
+    REQUIRE(win);
+    CHECK(body(win->body)["data"]["enabled"] == false);
+    CHECK(body(win->body)["data"]["source"] == "firewall@windows");
+    auto lin = h.sink.Get("/api/v1/plugin-config/firewall/kill-switch?os=linux");
+    REQUIRE(lin);
+    CHECK(body(lin->body)["data"]["enabled"] == true);
+
+    auto bad = h.sink.Get("/api/v1/plugin-config/firewall/kill-switch?os=macos");
+    REQUIRE(bad);
+    CHECK(bad->status == 400);
+    auto bad_put = h.sink.Put("/api/v1/plugin-config/firewall/kill-switch?os=macos",
+                              json{{"enabled", false}}.dump());
+    REQUIRE(bad_put);
+    CHECK(bad_put->status == 400);
+
+    // A present-but-empty ?os= is malformed, never the all-OS row.
+    auto blank = h.sink.Get("/api/v1/plugin-config/firewall/kill-switch?os=");
+    REQUIRE(blank);
+    CHECK(blank->status == 400);
+    auto blank_put = h.sink.Put("/api/v1/plugin-config/firewall/kill-switch?os=",
+                                json{{"enabled", false}}.dump());
+    REQUIRE(blank_put);
+    CHECK(blank_put->status == 400);
+}

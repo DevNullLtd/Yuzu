@@ -664,10 +664,14 @@ static const ToolDef kTools[] = {
      "Query the typed installed-software inventory collected by the agent daily-sync framework "
      "(ADR-0016) — machine-wide installed packages per device, fleet-wide. Each row carries name, "
      "version (upstream, release stripped), publisher (rpm PACKAGER / deb Maintainer / Windows "
-     "Publisher), install_date, kind (package|app), ecosystem (rpm|deb|apk|pacman|windows|macos|"
-     "homebrew), epoch, release, arch, signature_status (rpm only, from stored header tags), "
+     "Publisher), install_date, kind (package|app|pkg|feat), "
+     "ecosystem (rpm|deb|apk|pacman|windows|macos|macos_pkgutil|brew|optional_feature), "
+     "epoch, release, arch, signature_status (rpm only, from stored header tags), "
      "distro_id and distro_version (/etc/os-release, Linux rows); fields an ecosystem does not "
-     "store are empty strings, never synthesised. Filter by software `name` and/or `agent_id`. "
+     "store are empty strings, never synthesised. Homebrew formulae are kind pkg, casks kind app "
+     "(ecosystem brew), plus one kind app row named homebrew (ecosystem brew) recording that "
+     "Homebrew itself is present; Windows optional features are kind feat with the DISM state in version. "
+     "Filter by software `name` and/or `agent_id`. "
      "This is DISTINCT from "
      "query_inventory/get_agent_inventory, which read the generic per-source blob store on "
      "Infrastructure:Read. Requires Inventory:Read (#3290 Phase 2: the sole gate is the ADR-0017 "
@@ -1964,8 +1968,12 @@ static const ToolDef kTools[] = {
      "change. "
      "ZERO-AGENTS DISCRIMINATION (#3424/#3511): a SUCCESS envelope with agents_reached=0 also "
      "carries a status enum, not just \"no_agents_reached\" - branch on status, not message text. "
-     "\"invalid_scope\" and \"quarantined\" and \"plugin_not_found\" are PERMANENT: retrying "
-     "the same request will not help (retry_after_ms is null on all three) - \"invalid_scope\" "
+     "\"invalid_scope\" and \"quarantined\" and \"plugin_not_found\" and \"kill_switched_os\" are "
+     "PERMANENT: retrying "
+     "the same request will not help (retry_after_ms is null on all four) - \"kill_switched_os\" "
+     "means every target runs an OS for which a per-OS kill switch is OFF (#5294); "
+     "\"os_gate_unreadable\" is a transient failure to read agent presence while a per-OS "
+     "kill switch is OFF (retry_after_ms 5000) - \"invalid_scope\" "
      "means the scope expression itself could not be parsed, a caller error, not a fleet fact. "
      "\"containment_unreadable\" is a transient systemic gate "
      "failure and \"route_unreadable\" (WS-4 4.2b) is a transient systemic gateway "
@@ -1973,8 +1981,8 @@ static const ToolDef kTools[] = {
      "\"no_agents_reached\" is the generic case (offline "
      "device, or a residual approval-required race) - retry_after_ms is non-null here too, since "
      "the offline-device case within it is retryable and a mixed cause must not be understated as "
-     "permanent. agents_quarantined/agents_unknown_plugin are "
-     "present on every zero-agents response with the exact counts, regardless of which status "
+     "permanent. agents_quarantined/agents_unknown_plugin/agents_kill_switched_os "
+     "are present on every zero-agents response with the exact counts, regardless of which status "
      "matched, for a mixed-cause dispatch.",
      // NOTE (governance): these maxLength/maxItems bounds are the MCP SCHEMA
      // contract (A5 materiality backfill), and since #2437 they are ENFORCED
@@ -2020,17 +2028,19 @@ static const ToolDef kTools[] = {
      // plugin_not_found) - not a generic integer, so a client
      // schema-validating the response catches drift between this contract and
      // the handler the same way `agents_reached`'s own const already does.
-     // agents_quarantined/agents_unknown_plugin ride on every zero-agents
+     // agents_quarantined/agents_unknown_plugin/agents_kill_switched_os ride on every zero-agents
      // branch (not just the one each "belongs" to) so a caller reading a
      // mixed failure never has to infer a count from which branch matched.
      R"j({"oneOf":[)j"
      R"j({"type":"object","properties":{"command_id":{"type":"string"},"execution_id":{"type":"string"},"agents_reached":{"type":"integer","minimum":1},"plugin":{"type":"string"},"action":{"type":"string"}},"required":["command_id","execution_id","agents_reached","plugin","action"],"additionalProperties":false},)j"
-     R"j({"type":"object","properties":{"status":{"const":"invalid_scope"},"command_id":{"type":"string"},"execution_id":{"type":"string"},"agents_reached":{"const":0},"plugin":{"type":"string"},"action":{"type":"string"},"message":{"type":"string"},"retry_after_ms":{"const":null},"agents_quarantined":{"type":"integer","minimum":0},"agents_unknown_plugin":{"type":"integer","minimum":0}},"required":["status","command_id","execution_id","agents_reached","plugin","action","message","retry_after_ms","agents_quarantined","agents_unknown_plugin"],"additionalProperties":false},)j"
-     R"j({"type":"object","properties":{"status":{"const":"containment_unreadable"},"command_id":{"type":"string"},"execution_id":{"type":"string"},"agents_reached":{"const":0},"plugin":{"type":"string"},"action":{"type":"string"},"message":{"type":"string"},"retry_after_ms":{"const":5000},"agents_quarantined":{"type":"integer","minimum":0},"agents_unknown_plugin":{"type":"integer","minimum":0}},"required":["status","command_id","execution_id","agents_reached","plugin","action","message","retry_after_ms","agents_quarantined","agents_unknown_plugin"],"additionalProperties":false},)j"
-     R"j({"type":"object","properties":{"status":{"const":"route_unreadable"},"command_id":{"type":"string"},"execution_id":{"type":"string"},"agents_reached":{"const":0},"plugin":{"type":"string"},"action":{"type":"string"},"message":{"type":"string"},"retry_after_ms":{"const":5000},"agents_quarantined":{"type":"integer","minimum":0},"agents_unknown_plugin":{"type":"integer","minimum":0}},"required":["status","command_id","execution_id","agents_reached","plugin","action","message","retry_after_ms","agents_quarantined","agents_unknown_plugin"],"additionalProperties":false},)j"
-     R"j({"type":"object","properties":{"status":{"const":"quarantined"},"command_id":{"type":"string"},"execution_id":{"type":"string"},"agents_reached":{"const":0},"plugin":{"type":"string"},"action":{"type":"string"},"message":{"type":"string"},"retry_after_ms":{"const":null},"agents_quarantined":{"type":"integer","minimum":0},"agents_unknown_plugin":{"type":"integer","minimum":0}},"required":["status","command_id","execution_id","agents_reached","plugin","action","message","retry_after_ms","agents_quarantined","agents_unknown_plugin"],"additionalProperties":false},)j"
-     R"j({"type":"object","properties":{"status":{"const":"plugin_not_found"},"command_id":{"type":"string"},"execution_id":{"type":"string"},"agents_reached":{"const":0},"plugin":{"type":"string"},"action":{"type":"string"},"message":{"type":"string"},"retry_after_ms":{"const":null},"agents_quarantined":{"type":"integer","minimum":0},"agents_unknown_plugin":{"type":"integer","minimum":0}},"required":["status","command_id","execution_id","agents_reached","plugin","action","message","retry_after_ms","agents_quarantined","agents_unknown_plugin"],"additionalProperties":false},)j"
-     R"j({"type":"object","properties":{"status":{"const":"no_agents_reached"},"command_id":{"type":"string"},"execution_id":{"type":"string"},"agents_reached":{"const":0},"plugin":{"type":"string"},"action":{"type":"string"},"message":{"type":"string"},"retry_after_ms":{"const":5000},"agents_quarantined":{"type":"integer","minimum":0},"agents_unknown_plugin":{"type":"integer","minimum":0}},"required":["status","command_id","execution_id","agents_reached","plugin","action","message","retry_after_ms","agents_quarantined","agents_unknown_plugin"],"additionalProperties":false})j"
+     R"j({"type":"object","properties":{"status":{"const":"invalid_scope"},"command_id":{"type":"string"},"execution_id":{"type":"string"},"agents_reached":{"const":0},"plugin":{"type":"string"},"action":{"type":"string"},"message":{"type":"string"},"retry_after_ms":{"const":null},"agents_quarantined":{"type":"integer","minimum":0},"agents_unknown_plugin":{"type":"integer","minimum":0},"agents_kill_switched_os":{"type":"integer","minimum":0}},"required":["status","command_id","execution_id","agents_reached","plugin","action","message","retry_after_ms","agents_quarantined","agents_unknown_plugin","agents_kill_switched_os"],"additionalProperties":false},)j"
+     R"j({"type":"object","properties":{"status":{"const":"containment_unreadable"},"command_id":{"type":"string"},"execution_id":{"type":"string"},"agents_reached":{"const":0},"plugin":{"type":"string"},"action":{"type":"string"},"message":{"type":"string"},"retry_after_ms":{"const":5000},"agents_quarantined":{"type":"integer","minimum":0},"agents_unknown_plugin":{"type":"integer","minimum":0},"agents_kill_switched_os":{"type":"integer","minimum":0}},"required":["status","command_id","execution_id","agents_reached","plugin","action","message","retry_after_ms","agents_quarantined","agents_unknown_plugin","agents_kill_switched_os"],"additionalProperties":false},)j"
+     R"j({"type":"object","properties":{"status":{"const":"route_unreadable"},"command_id":{"type":"string"},"execution_id":{"type":"string"},"agents_reached":{"const":0},"plugin":{"type":"string"},"action":{"type":"string"},"message":{"type":"string"},"retry_after_ms":{"const":5000},"agents_quarantined":{"type":"integer","minimum":0},"agents_unknown_plugin":{"type":"integer","minimum":0},"agents_kill_switched_os":{"type":"integer","minimum":0}},"required":["status","command_id","execution_id","agents_reached","plugin","action","message","retry_after_ms","agents_quarantined","agents_unknown_plugin","agents_kill_switched_os"],"additionalProperties":false},)j"
+     R"j({"type":"object","properties":{"status":{"const":"quarantined"},"command_id":{"type":"string"},"execution_id":{"type":"string"},"agents_reached":{"const":0},"plugin":{"type":"string"},"action":{"type":"string"},"message":{"type":"string"},"retry_after_ms":{"const":null},"agents_quarantined":{"type":"integer","minimum":0},"agents_unknown_plugin":{"type":"integer","minimum":0},"agents_kill_switched_os":{"type":"integer","minimum":0}},"required":["status","command_id","execution_id","agents_reached","plugin","action","message","retry_after_ms","agents_quarantined","agents_unknown_plugin","agents_kill_switched_os"],"additionalProperties":false},)j"
+     R"j({"type":"object","properties":{"status":{"const":"plugin_not_found"},"command_id":{"type":"string"},"execution_id":{"type":"string"},"agents_reached":{"const":0},"plugin":{"type":"string"},"action":{"type":"string"},"message":{"type":"string"},"retry_after_ms":{"const":null},"agents_quarantined":{"type":"integer","minimum":0},"agents_unknown_plugin":{"type":"integer","minimum":0},"agents_kill_switched_os":{"type":"integer","minimum":0}},"required":["status","command_id","execution_id","agents_reached","plugin","action","message","retry_after_ms","agents_quarantined","agents_unknown_plugin","agents_kill_switched_os"],"additionalProperties":false},)j"
+     R"j({"type":"object","properties":{"status":{"const":"kill_switched_os"},"command_id":{"type":"string"},"execution_id":{"type":"string"},"agents_reached":{"const":0},"plugin":{"type":"string"},"action":{"type":"string"},"message":{"type":"string"},"retry_after_ms":{"const":null},"agents_quarantined":{"type":"integer","minimum":0},"agents_unknown_plugin":{"type":"integer","minimum":0},"agents_kill_switched_os":{"type":"integer","minimum":0}},"required":["status","command_id","execution_id","agents_reached","plugin","action","message","retry_after_ms","agents_quarantined","agents_unknown_plugin","agents_kill_switched_os"],"additionalProperties":false},)j"
+     R"j({"type":"object","properties":{"status":{"const":"os_gate_unreadable"},"command_id":{"type":"string"},"execution_id":{"type":"string"},"agents_reached":{"const":0},"plugin":{"type":"string"},"action":{"type":"string"},"message":{"type":"string"},"retry_after_ms":{"const":5000},"agents_quarantined":{"type":"integer","minimum":0},"agents_unknown_plugin":{"type":"integer","minimum":0},"agents_kill_switched_os":{"type":"integer","minimum":0}},"required":["status","command_id","execution_id","agents_reached","plugin","action","message","retry_after_ms","agents_quarantined","agents_unknown_plugin","agents_kill_switched_os"],"additionalProperties":false},)j"
+     R"j({"type":"object","properties":{"status":{"const":"no_agents_reached"},"command_id":{"type":"string"},"execution_id":{"type":"string"},"agents_reached":{"const":0},"plugin":{"type":"string"},"action":{"type":"string"},"message":{"type":"string"},"retry_after_ms":{"const":5000},"agents_quarantined":{"type":"integer","minimum":0},"agents_unknown_plugin":{"type":"integer","minimum":0},"agents_kill_switched_os":{"type":"integer","minimum":0}},"required":["status","command_id","execution_id","agents_reached","plugin","action","message","retry_after_ms","agents_quarantined","agents_unknown_plugin","agents_kill_switched_os"],"additionalProperties":false})j"
      R"j(]})j"},
 
     // ── Live-query bundle (ADR-0011) — MCP/REST parity for /api/v1/bundles ─────
@@ -3056,28 +3066,30 @@ static const ToolDef kTools[] = {
 
     {"get_plugin_kill_switch",
      "Read a plugin or plugin-action kill-switch's current display state. Mirrors GET "
-     "/api/v1/plugin-config/{plugin}/kill-switch (?action=). NOT the dispatch-gating "
+     "/api/v1/plugin-config/{plugin}/kill-switch (?action=&os=). NOT the dispatch-gating "
      "decision (PluginConfigStore::action_allowed collapses any store error to disabled, "
      "which this display accessor deliberately does not) — this is the inspection view an "
      "operator reads before deciding whether to flip it. Absence of a prior flip reads as "
-     "enabled=true with no reason/set_by. Requires PluginConfig:Read.",
+     "enabled=true with no reason/set_by. Without os this reports the all-OS layer only and "
+     "never reflects a per-OS OFF row. Requires PluginConfig:Read.",
      // plugin maxLength is 68, not 64: parse_kill_switch_scope also accepts a
      // reserved-namespace plugin name (__<identifier>__, #3265), whose total
      // length can reach kMaxIdentifierBytes (64) + 4 sentinel bytes = 68 —
      // this schema must not reject an input the store would accept.
-     R"j({"type":"object","properties":{"plugin":{"type":"string","minLength":1,"maxLength":68},"action":{"type":"string","maxLength":64,"description":"Action name for an action-level switch; omit for the whole-plugin switch"}},"required":["plugin"]})j",
-     R"j({"type":"object","properties":{"plugin":{"type":"string"},"action":{"type":"string"},"enabled":{"type":"boolean"},"reason":{"type":"string"},"set_by":{"type":"string"},"updated_at_ms":{"type":"integer"}},"required":["plugin","action","enabled"]})j"},
+     R"j({"type":"object","properties":{"plugin":{"type":"string","minLength":1,"maxLength":68},"action":{"type":"string","maxLength":64,"description":"Action name for an action-level switch; omit for the whole-plugin switch"},"os":{"type":"string","enum":["windows","linux","darwin"],"description":"Agent OS for a per-OS view; omit for the all-OS switch. With os, enabled is the EFFECTIVE state and reason/set_by/source name the row that produced it. Within the OS layer an action@os ON row overrides a plugin@os OFF row, but a per-OS row never widens past the all-OS layer"}},"required":["plugin"]})j",
+     R"j({"type":"object","properties":{"plugin":{"type":"string"},"action":{"type":"string"},"os":{"type":"string"},"enabled":{"type":"boolean"},"reason":{"type":"string"},"set_by":{"type":"string"},"updated_at_ms":{"type":"integer"},"source":{"type":"string"}},"required":["plugin","action","enabled"]})j"},
 
     {"set_plugin_kill_switch",
      "Flip a plugin or plugin-action kill switch on or off. Mirrors PUT "
-     "/api/v1/plugin-config/{plugin}/kill-switch (?action=, body {enabled, reason}). Every "
+     "/api/v1/plugin-config/{plugin}/kill-switch (?action=&os=, body {enabled, reason}). Every "
      "dispatch-gating caller that consults this switch fails CLOSED (treats disabled) on any "
      "store error, so throwing this switch is a reliable emergency stop for the named "
      "plugin/action — there is no separate 'force disable' escalation beyond this call. "
-     "Requires PluginConfig:Write.",
+     "The result echoes the row written, not the effective state. Requires "
+     "PluginConfig:Write.",
      // plugin maxLength is 68 — see the identical note on get_plugin_kill_switch above.
-     R"j({"type":"object","properties":{"plugin":{"type":"string","minLength":1,"maxLength":68},"action":{"type":"string","maxLength":64,"description":"Action name for an action-level switch; omit for the whole-plugin switch"},"enabled":{"type":"boolean","description":"true = allowed (the default/no-row state); false = killed"},"reason":{"type":"string","maxLength":512,"description":"Operator-entered explanation, audited and displayed verbatim"}},"required":["plugin","enabled"]})j",
-     R"j({"type":"object","properties":{"plugin":{"type":"string"},"action":{"type":"string"},"enabled":{"type":"boolean"},"reason":{"type":"string"},"set_by":{"type":"string"},"updated_at_ms":{"type":"integer"}},"required":["plugin","action","enabled"]})j"},
+     R"j({"type":"object","properties":{"plugin":{"type":"string","minLength":1,"maxLength":68},"action":{"type":"string","maxLength":64,"description":"Action name for an action-level switch; omit for the whole-plugin switch"},"os":{"type":"string","enum":["windows","linux","darwin"],"description":"Agent OS to narrow the switch to; omit for the all-OS switch. Within the OS layer an action@os ON row overrides a plugin@os OFF row, but a per-OS row never widens past the all-OS layer"},"enabled":{"type":"boolean","description":"true = allowed (the default/no-row state); false = killed"},"reason":{"type":"string","maxLength":512,"description":"Operator-entered explanation, audited and displayed verbatim"}},"required":["plugin","enabled"]})j",
+     R"j({"type":"object","properties":{"plugin":{"type":"string"},"action":{"type":"string"},"enabled":{"type":"boolean"},"reason":{"type":"string"},"set_by":{"type":"string"},"updated_at_ms":{"type":"integer"},"os":{"type":"string"},"source":{"type":"string"}},"required":["plugin","action","enabled"]})j"},
 
     {"mint_upload_grant",
      "Mint a one-time upload-grant credential authorising ONE agent to push ONE file back to "
@@ -17565,8 +17577,9 @@ McpServer::HandlerFn McpServer::build_handler(
                     // route_unreadable (WS-4 4.2b Task D, the exact sibling:
                     // a systemic gateway routing-directory failure, not a
                     // per-target fact) — then quarantined — then
-                    // plugin_not_found — then the
-                    // generic catch-all. `> 0`, not `== agent_ids.size()`:
+                    // plugin_not_found — then kill_switched_os (#5294) — then the
+                    // generic catch-all. os_gate_unreadable (#5294) sits with the
+                    // unreadable siblings, after route_unreadable. `> 0`, not `== agent_ids.size()`:
                     // a MIXED failure (some quarantined, some plugin-absent,
                     // some genuinely offline) is still not "just offline",
                     // and understating a permanent reason as retryable is the
@@ -17588,6 +17601,12 @@ McpServer::HandlerFn McpServer::build_handler(
                         // even though both are theoretically possible together
                         // (a bad expression is never evaluated against the
                         // registry, so it cannot be).
+                        // os_gate_unreadable (#5294) is the exception that
+                        // never co-occurs with this: the ladder refuses on the
+                        // presence read BEFORE parsing the scope
+                        // (dispatch_scope_ladder.hpp, wire_and_dispatch_confined),
+                        // so a bad scope with presence down answers
+                        // os_gate_unreadable and scope_parse_error stays unset.
                         zero_status = "invalid_scope";
                         zero_message = "No agents reached: the scope expression could not be "
                                        "parsed (" +
@@ -17625,6 +17644,18 @@ McpServer::HandlerFn McpServer::build_handler(
                             "where to route. Retryable — the directory typically recovers "
                             "within seconds once the store is reachable again.";
                         zero_retry_after_ms_json = "5000";
+                    } else if (dispatch_outcome.os_gate_unreadable) {
+                        // #5294: presence could not be read while a per-OS kill
+                        // switch is OFF -- the dispatch was refused before
+                        // targeting (fail closed), a systemic fact like the
+                        // two unreadable siblings above.
+                        zero_status = "os_gate_unreadable";
+                        zero_message =
+                            "No agents reached: agent presence could not be read while a "
+                            "per-OS kill switch is set, so dispatch is failing closed rather "
+                            "than enforcing the switch on this replica's local agents only. "
+                            "Retryable once the presence store is reachable again.";
+                        zero_retry_after_ms_json = "5000";
                     } else if (dispatch_outcome.denied_quarantined_count > 0) {
                         zero_status = "quarantined";
                         zero_message =
@@ -17642,6 +17673,18 @@ McpServer::HandlerFn McpServer::build_handler(
                             "plugin name — retrying will not help. Check discover_plugins for "
                             "the correct name, or confirm the plugin is installed on the "
                             "target(s).";
+                        zero_retry_after_ms_json = "null";
+                    } else if (dispatch_outcome.kill_switched_os_count > 0) {
+                        // #5294: every reachable target runs an OS whose per-OS
+                        // kill switch is OFF -- a permanent policy withhold until
+                        // an operator flips the switch, not an empty fleet.
+                        zero_status = "kill_switched_os";
+                        zero_message =
+                            "No agents reached: every target runs an OS for which this "
+                            "plugin action is switched off by a per-OS kill switch, so the "
+                            "command was withheld before dispatch. Retrying will not help "
+                            "until an operator re-enables it (get_plugin_kill_switch with "
+                            "the os argument shows the state).";
                         zero_retry_after_ms_json = "null";
                     } else {
                         // Deliberately non-null, unlike its two permanent siblings
@@ -17686,6 +17729,8 @@ McpServer::HandlerFn McpServer::build_handler(
                                  static_cast<int64_t>(dispatch_outcome.denied_quarantined_count))
                             .add("agents_unknown_plugin",
                                  static_cast<int64_t>(dispatch_outcome.unknown_plugin_count))
+                            .add("agents_kill_switched_os",
+                                 static_cast<int64_t>(dispatch_outcome.kill_switched_os_count))
                             .str();
                     mcp_audit("failure", zero_status + " execution_id=" + execution_id);
                     res.set_content(
@@ -20435,7 +20480,15 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 const auto plugin = param_str(args, "plugin");
                 const auto action = param_str(args, "action");
-                auto entry = plugin_config_store_->get_kill_switch(plugin, action);
+                // Strict: a present-but-non-string or empty `os` must not
+                // fall through to "" and target the all-OS row (REST parity).
+                const auto os = param_string_strict(args, "os");
+                if (!os || (args.contains("os") && os->empty())) {
+                    res.set_content(a4_error(kInvalidParams, "os must be a non-empty string"),
+                                    "application/json");
+                    return;
+                }
+                auto entry = plugin_config_store_->get_kill_switch(plugin, action, *os);
                 if (!entry) {
                     const auto info = plugin_config_error_info(entry.error());
                     res.set_content(a4_error(info.code, info.message,
@@ -20448,10 +20501,12 @@ McpServer::HandlerFn McpServer::build_handler(
                 JObj payload;
                 payload.add("plugin", entry->plugin)
                     .add("action", entry->action)
+                    .add("os", entry->os)
                     .add("enabled", entry->enabled)
                     .add("reason", entry->reason)
                     .add("set_by", entry->set_by)
-                    .add("updated_at_ms", entry->updated_at_ms);
+                    .add("updated_at_ms", entry->updated_at_ms)
+                    .add("source", entry->source);
                 mcp_audit("success");
                 res.set_content(success_response(id, tool_result(payload.str(), kObjectOutputSchema)),
                                 "application/json");
@@ -20483,10 +20538,16 @@ McpServer::HandlerFn McpServer::build_handler(
                 const auto plugin = param_str(args, "plugin");
                 const auto action = param_str(args, "action");
                 const auto reason = param_str(args, "reason");
-                if (!plugin_config::parse_kill_switch_scope(plugin, action) ||
-                    !plugin_config::is_valid_reason(reason) ||
+                const auto os = param_string_strict(args, "os");
+                if (!os || (args.contains("os") && os->empty())) {
+                    res.set_content(a4_error(kInvalidParams, "os must be a non-empty string"),
+                                    "application/json");
+                    return;
+                }
+                const auto scope = plugin_config::parse_kill_switch_scope(plugin, action, *os);
+                if (!scope || !plugin_config::is_valid_reason(reason) ||
                     !plugin_config::is_valid_actor(session->username)) {
-                    res.set_content(a4_error(kInvalidParams, "invalid plugin/action/reason"),
+                    res.set_content(a4_error(kInvalidParams, "invalid plugin/action/os/reason"),
                                     "application/json");
                     return;
                 }
@@ -20495,7 +20556,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 // consequential of the five: it disables a capability
                 // fleet-wide, which is exactly what an incident review needs
                 // evidence of and cannot reconstruct afterwards.
-                const std::string target_id = action.empty() ? plugin : plugin + "." + action;
+                const std::string target_id = plugin_config::kill_switch_scope_key(*scope);
                 if (!audit_fn(req, "plugin_config.kill_switch.set", "attempted", "PluginConfig",
                               target_id, std::string("enabled=") + (enabled ? "true" : "false"))) {
                     res.set_content(
@@ -20506,7 +20567,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 }
                 auto result = plugin_config_store_->set_kill_switch(plugin, action, enabled, reason,
-                                                                    session->username);
+                                                                    session->username, *os);
                 const std::string ks_detail =
                     std::string("enabled=") + (enabled ? "true" : "false");
                 if (!result) {
@@ -20525,10 +20586,12 @@ McpServer::HandlerFn McpServer::build_handler(
                 JObj payload;
                 payload.add("plugin", result->plugin)
                     .add("action", result->action)
+                    .add("os", result->os)
                     .add("enabled", result->enabled)
                     .add("reason", result->reason)
                     .add("set_by", result->set_by)
-                    .add("updated_at_ms", result->updated_at_ms);
+                    .add("updated_at_ms", result->updated_at_ms)
+                    .add("source", result->source);
                 mcp_audit("success");
                 res.set_content(success_response(id, tool_result(payload.str(), kObjectOutputSchema)),
                                 "application/json");

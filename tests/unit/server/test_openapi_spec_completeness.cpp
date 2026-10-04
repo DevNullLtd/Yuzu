@@ -312,6 +312,35 @@ TEST_CASE("openapi_spec_json(): the app-usage Forensics path is documented (Wave
     CHECK(description.find("all-time") == std::string::npos);
 }
 
+TEST_CASE("openapi_spec_json(): the kill-switch routes document the per-OS query parameter and "
+          "response shape (#5294)",
+          "[openapi][plugin_config][5294]") {
+    const auto& spec_json = yuzu::server::openapi_spec_json();
+    json spec = json::parse(spec_json, nullptr, /*allow_exceptions=*/false);
+    REQUIRE_FALSE(spec.is_discarded());
+    REQUIRE(spec["paths"].contains("/plugin-config/{plugin}/kill-switch"));
+    const auto& path_obj = spec["paths"]["/plugin-config/{plugin}/kill-switch"];
+
+    for (const char* method : {"get", "put"}) {
+        INFO("method: " << method);
+        REQUIRE(path_obj.contains(method));
+        const auto& op = path_obj[method];
+
+        const json* os_param = nullptr;
+        for (const auto& p : op["parameters"])
+            if (p.value("name", "") == "os")
+                os_param = &p;
+        REQUIRE(os_param != nullptr);
+        CHECK((*os_param)["in"] == "query");
+        CHECK((*os_param)["required"] == false);
+        CHECK((*os_param)["schema"]["enum"] == json::array({"windows", "linux", "darwin"}));
+
+        const std::string ok = op["responses"]["200"].value("description", "");
+        CHECK(ok.find("os") != std::string::npos);
+        CHECK(ok.find("source") != std::string::npos);
+    }
+}
+
 TEST_CASE("openapi_spec_json(): every $ref (including discriminator.mapping "
           "values) resolves to an existing component",
           "[openapi][refs]") {

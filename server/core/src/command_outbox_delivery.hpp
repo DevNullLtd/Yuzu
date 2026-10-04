@@ -44,7 +44,8 @@
 /// (`containment_unreadable` OR, WS-4 4.2b Task D, `route_unreadable` — a
 /// degraded `GatewayRouteStore::lookup_routes` read; both mean "the read
 /// itself could not answer", never "answered no") → `reschedule` with
-/// back-off (retry, DON'T mark sent); authority revoked → `mark_failed`;
+/// back-off (retry, DON'T mark sent; #5294's `os_gate_unreadable` — presence
+/// unreadable while a per-OS kill switch is OFF — is the same class); authority revoked → `mark_failed`;
 /// a genuine dispatch with an execution row to bookkeep (`sent > 0`) →
 /// `mark_sent_with_target` (#4982 round 3 — the sent-transition and the
 /// execution's real `agents_targeted` count commit ATOMICALLY, closing a
