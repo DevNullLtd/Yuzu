@@ -90,7 +90,7 @@
 
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, handle_continue/2,
-         terminate/2, code_change/3]).
+         terminate/2, code_change/3, format_status/1]).
 
 -define(SERVER, ?MODULE).
 -define(DEFAULT_MAX_HB_BUFFER, 10000).
@@ -270,6 +270,49 @@ terminate(_Reason, _State) ->
 
 code_change(_OldVsn, State, _Extra) ->
     {ok, State}.
+
+%% What OTP prints for this process in a terminate or crash report and in
+%% sys:get_status/1: counts and sizes only. The buffer holds every pending
+%% heartbeat (status tags, fleet snapshots of 200 to 800 KB each, up to the byte
+%% cap, 64 MiB by default), and printing the state of a crashed buffer put 2 MB
+%% in one report. The reason loses its argument lists (the arguments of a failing
+%% call can be the state) and the last message is reduced to its tag.
+%% sys:get_state/1 still returns the real record.
+%%
+%% NOT covered here, because OTP prints it from raw data outside this callback:
+%% the mailbox and the stacktrace of the proc_lib crash report.
+-spec format_status(map()) -> map().
+format_status(Status) ->
+    maps:map(fun(state, State)   -> redact_state(State);
+                (message, Msg)   -> redact_message(Msg);
+                (reason, Reason) -> yuzu_gw_upstream:redact_reason(Reason);
+                (log, Log)       -> redact_log(Log);
+                (_Key, Value)    -> Value
+             end, Status).
+
+redact_state(#state{buffer = Buf, buf_bytes = Bytes, timer = Timer, interval = Interval,
+                    max_buf = MaxBuf, next_seq = NextSeq, max_bytes = MaxBytes,
+                    snap_idx = SnapIdx, trunc_suppressed = Suppressed})
+  when is_map(Buf) ->
+    #{sessions => map_size(Buf), snapshots => gb_trees:size(SnapIdx),
+      buf_bytes => Bytes, max_bytes => MaxBytes, max_buf => MaxBuf,
+      interval => Interval, timer => Timer, next_seq => NextSeq,
+      trunc_suppressed => Suppressed};
+redact_state(_Other) ->
+    '$redacted'.
+
+redact_message({'$gen_call', From, Msg}) -> {'$gen_call', From, message_tag(Msg)};
+redact_message({'$gen_cast', Msg})       -> {'$gen_cast', message_tag(Msg)};
+redact_message(Msg)                      -> message_tag(Msg).
+
+message_tag(Msg) when is_atom(Msg) -> Msg;
+message_tag(Msg) when is_tuple(Msg), tuple_size(Msg) > 0, is_atom(element(1, Msg)) ->
+    element(1, Msg);
+message_tag(_Other) -> '$redacted'.
+
+%% The report callback iterates the log, so it stays a list.
+redact_log(Log) when is_list(Log) -> [{log_entries_redacted, length(Log)}];
+redact_log(_Other)                 -> [].
 
 %%%===================================================================
 %%% Internal

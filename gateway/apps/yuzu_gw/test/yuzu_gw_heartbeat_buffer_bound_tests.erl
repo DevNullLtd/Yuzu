@@ -106,7 +106,11 @@ bound_test_() ->
       {"a large drain is followed by a GC that frees the released binaries",
        fun large_drain_frees_binaries/0},
       {"a small flush does not ask for a GC",
-       fun small_flush_does_not_gc/0}
+       fun small_flush_does_not_gc/0},
+      {"format_status shows counts only: no tag, snapshot or session id bytes",
+       fun format_status_is_counts_only/0},
+      {"the terminate report of a crashed buffer is small and holds no heartbeat bytes",
+       fun terminate_report_is_small_and_redacted/0}
      ]}.
 
 setup() ->
@@ -779,6 +783,66 @@ small_flush_does_not_gc() ->
     ?assertEqual(ok, yuzu_gw_heartbeat_buffer:flush_sync()),
     ?assertEqual(0, session_count()),
     ?assert(binary_bytes(Pid) >= 6 * 800 * 1024).
+
+%% A buffer with a 3 MB snapshot and marker tags in it: what OTP prints through
+%% format_status/1, for the arguments of a terminate report, and what
+%% sys:get_status/1 returns.
+format_status_is_counts_only() ->
+    Pid = whereis(yuzu_gw_heartbeat_buffer),
+    Hb = hb(<<"SESSION-MARKER">>, #{snap => binary:copy(<<"SNAPSHOT-MARKER">>, 200000),
+                                    tags => #{<<"TAGKEY-MARKER">> => <<"TAGVALUE-MARKER">>}}),
+    queue(Hb),
+    State = sys:get_state(Pid),
+    ?assert(buffered_bytes() > 3000000),
+    Status = yuzu_gw_heartbeat_buffer:format_status(#{
+        state   => State,
+        message => {'$gen_cast', {queue_heartbeat, Hb}},
+        reason  => {badarg, [{yuzu_gw_heartbeat_buffer, enqueue, [Hb, State], [{line, 1}]}]},
+        log     => [{in, {'$gen_cast', {queue_heartbeat, Hb}}}, {noreply, State}]}),
+    Text = iolist_to_binary(io_lib:format("~0p", [Status])),
+    ?assert(byte_size(Text) < 2048),
+    [?assertEqual(nomatch, binary:match(Text, M))
+     || M <- [<<"SESSION-MARKER">>, <<"SNAPSHOT-MARKER">>, <<"TAGKEY-MARKER">>, <<"TAGVALUE-MARKER">>]],
+    ?assertMatch(#{sessions := 1, snapshots := 1, max_bytes := _, buf_bytes := B}
+                   when B > 3000000, maps:get(state, Status)),
+    ?assertEqual({'$gen_cast', queue_heartbeat}, maps:get(message, Status)),
+    ?assertEqual({badarg, [{yuzu_gw_heartbeat_buffer, enqueue, 2, [{line, 1}]}]},
+                 maps:get(reason, Status)),
+    ?assertEqual([{log_entries_redacted, 2}], maps:get(log, Status)),
+    %% Anything that is not the state record is not shown.
+    ?assertEqual('$redacted', maps:get(state, yuzu_gw_heartbeat_buffer:format_status(#{state => foo}))),
+    %% The status OTP builds for sys:get_status/1 goes through it.
+    Rendered = iolist_to_binary(io_lib:format("~0p", [sys:get_status(Pid)])),
+    ?assert(byte_size(Rendered) < 8192),
+    [?assertEqual(nomatch, binary:match(Rendered, M))
+     || M <- [<<"SESSION-MARKER">>, <<"SNAPSHOT-MARKER">>, <<"TAGKEY-MARKER">>, <<"TAGVALUE-MARKER">>]].
+
+%% The buffer is made to crash after a failed flush has left a 3 MB entry in it
+%% (a timer value send_after rejects): the terminate report names the state.
+terminate_report_is_small_and_redacted() ->
+    Pid = whereis(yuzu_gw_heartbeat_buffer),
+    queue(hb(<<"SESSION-MARKER">>, #{snap => binary:copy(<<"SNAPSHOT-MARKER">>, 200000),
+                                     tags => #{<<"TAGKEY-MARKER">> => <<"TAGVALUE-MARKER">>}})),
+    set_unary(fun(_N) -> {error, {?GRPC_STATUS_UNAVAILABLE, <<"down">>}, #{}} end),
+    _ = sys:replace_state(Pid, fun(St) -> setelement(5, St, not_an_interval) end),
+    Ref = monitor(process, Pid),
+    {_, Lines} = capture_logs(fun() ->
+        Pid ! flush,
+        receive {'DOWN', Ref, process, Pid, _} -> ok
+        after 5000 -> error(buffer_did_not_crash)
+        end
+    end),
+    Terminate = [T || {error, T} <- Lines, binary:match(T, <<"gen_server">>) =/= nomatch,
+                      binary:match(T, <<"terminate">>) =/= nomatch],
+    ?assertMatch([_|_], Terminate),
+    [begin
+         ?assert(byte_size(T) < 4096),
+         [?assertEqual(nomatch, binary:match(T, M))
+          || M <- [<<"SESSION-MARKER">>, <<"SNAPSHOT-MARKER">>, <<"TAGKEY-MARKER">>,
+                   <<"TAGVALUE-MARKER">>]]
+     end || T <- Terminate],
+    %% Put a buffer back for the test cleanup.
+    ok = start_buffer().
 
 %%%===================================================================
 %%% Helpers
