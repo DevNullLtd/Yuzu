@@ -71,6 +71,11 @@ do_start_services() ->
     %% request (yuzu_gw_safe_call): a burst of first failures shares one limit.
     ok = yuzu_gw_safe_call:init_limits(),
 
+    %% TCP_NODELAY on the upstream channel, before the supervision tree below
+    %% (the only caller of the channel) exists: grpcbox already started the
+    %% channel from sys.config, so this restarts it with the rewritten endpoints.
+    ok = yuzu_gw_upstream_channel:apply_nodelay(),
+
     %% Start Prometheus HTTP exporter for /metrics endpoint.
     Port = application:get_env(yuzu_gw, prometheus_port, 9568),
     application:set_env(prometheus, prometheus_http, [{port, Port}, {path, "/metrics"}]),
