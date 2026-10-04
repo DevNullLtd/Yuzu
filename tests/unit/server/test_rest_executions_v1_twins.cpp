@@ -10,7 +10,14 @@
  * directly into the captured handlers. No real socket → no #438 TSan trap.
  */
 
+#include "auth_routes.hpp"
 #include "execution_tracker.hpp"
+#include "management_group_store.hpp"
+#include "oidc_provider.hpp"
+#include "rbac_store.hpp"
+#include "tag_store.hpp"
+#include "test_api_token_pg_helper.hpp"
+#include "test_mgmt_group_pg_helper.hpp"
 #include "instruction_store.hpp"
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
@@ -19,6 +26,8 @@
 #include "response_store.hpp"
 #include "test_route_sink.hpp"
 
+#include <yuzu/server/auth.hpp>
+#include <yuzu/server/server.hpp>
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/generators/catch_generators.hpp>
 
@@ -28,7 +37,11 @@
 
 #include "../test_helpers.hpp"
 
+#include <algorithm>
+#include <chrono>
 #include <memory>
+#include <shared_mutex>
+#include <unordered_map>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -89,7 +102,9 @@ struct ExecV1Harness {
     RestApiV1 api;
 
     // wire_fleet_read=false leaves fleet_read_fn unwired (exercises the 503 guard).
-    explicit ExecV1Harness(pg::PgPool& pool, bool wire_fleet_read = true) {
+    // real_fleet_read, when set, replaces the mocked gate with a production-shaped one.
+    explicit ExecV1Harness(pg::PgPool& pool, bool wire_fleet_read = true,
+                           RestApiV1::FleetReadFn real_fleet_read = {}) {
         yuzu::server::seed_response_metrics(metrics);
         execution_tracker = std::make_unique<ExecutionTracker>(pool);
         REQUIRE(execution_tracker->is_open());
@@ -170,9 +185,9 @@ struct ExecV1Harness {
                             /*stream_budget=*/nullptr,
                             /*exec_visible_fn=*/{},
                             /*list_read_fn=*/{},
-                            /*fleet_read_fn=*/wire_fleet_read
-                                ? RestApiV1::FleetReadFn(std::move(fleet_read_fn))
-                                : RestApiV1::FleetReadFn{});
+                            /*fleet_read_fn=*/!wire_fleet_read ? RestApiV1::FleetReadFn{}
+                            : real_fleet_read ? std::move(real_fleet_read)
+                                              : RestApiV1::FleetReadFn(std::move(fleet_read_fn)));
     }
 
     ~ExecV1Harness() {
@@ -894,6 +909,115 @@ TEST_CASE("GET /api/v1/execution-statistics/agents: the visible set is applied B
     auto confined = h.sink.Get("/api/v1/execution-statistics/agents?limit=1");
     REQUIRE(confined);
     CHECK(served_agent_ids(*confined) == std::vector<std::string>{"agent-quiet"});
+}
+
+// The route above is tested with a MOCKED fleet_read_fn. This drives the same route through
+// the REAL AuthRoutes::require_fleet_read (production adapter shape, server.cpp), so the
+// REST-admits-a-service-scoped-token-as-a-confined-view behaviour (#3526) is pinned at the
+// route, not only at the gate (test_authz_gates.cpp pins the gate alone).
+TEST_CASE("GET /api/v1/execution-statistics/agents through the REAL require_fleet_read: a "
+          "service-scoped token sees exactly its service's agents, a gate denial serves no agent, "
+          "a degraded tag store is a 503 (#3526)",
+          "[pg][rest][executions][v1][statistics][security][service_scope]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, execv1_responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 6}};
+
+    Config cfg{};
+    auth::AuthManager auth_mgr{};
+    RbacStore rbac{pool};
+    REQUIRE(rbac.is_open());
+    rbac.set_rbac_enabled(true);
+    yuzu::test::ManagementGroupStorePg mgmt_bundle;
+    ManagementGroupStore& mgmt = *mgmt_bundle;
+    yuzu::test::ApiTokenStorePg api_tokens;
+    TagStore tags{pool};
+    REQUIRE(tags.is_open());
+    std::shared_mutex oidc_mu;
+    std::unique_ptr<oidc::OidcProvider> oidc_provider;
+    REQUIRE(auth_mgr.upsert_user("minter", "correct-horse-battery-staple", auth::Role::admin));
+    AuthRoutes ar(cfg, auth_mgr, &rbac, api_tokens.get(), /*audit_store=*/nullptr, &mgmt, &tags,
+                  /*analytics_store=*/nullptr, oidc_mu, oidc_provider);
+
+    // Execution:Read is a GLOBAL grant for "minter"; a_p, a_c1 and a_s carry service=printers,
+    // a_c2 does not. The service-scoped token must see exactly the first three, never a_c2.
+    REQUIRE(rbac.create_role({"ExecReader", "", false, 0}).has_value());
+    REQUIRE(rbac.set_permission({"ExecReader", "Execution", "Read", "allow"}).has_value());
+    REQUIRE(rbac.assign_role({"user", "minter", "ExecReader"}).has_value());
+    for (const char* a : {"a_p", "a_c1", "a_s"})
+        REQUIRE(tags.set_tag(a, "service", "printers").has_value());
+
+    auto adapter_for = [](AuthRoutes& routes) {
+        return RestApiV1::FleetReadFn(
+            [&routes](const httplib::Request& req, httplib::Response& res, const std::string& type,
+                      const std::string& op) -> authz::FleetReadGate {
+                auto result = routes.require_fleet_read(req, res, type, op);
+                if (!result)
+                    return {}; // admitted=false, res already written
+                return {true, result->visible_for_query()};
+            });
+    };
+    ExecV1Harness h(pool, /*wire_fleet_read=*/true, adapter_for(ar));
+    stats_exec_for(h, {"a_p", "a_c1", "a_c2", "a_s"});
+
+    auto mint = [&](const std::string& scope_service) {
+        auto raw = api_tokens->create_token("exec-stats", "minter",
+                                            std::chrono::duration_cast<std::chrono::seconds>(
+                                                std::chrono::system_clock::now().time_since_epoch())
+                                                    .count() +
+                                                3600,
+                                            scope_service);
+        REQUIRE(raw.has_value());
+        return std::unordered_map<std::string, std::string>{{"Authorization", "Bearer " + *raw}};
+    };
+    auto sorted_ids = [](const httplib::Response& r) {
+        auto v = served_agent_ids(r);
+        std::sort(v.begin(), v.end());
+        return v;
+    };
+
+    // Non-service token with the global grant: AdmitAll, the whole fleet.
+    auto all = h.sink.Get("/api/v1/execution-statistics/agents", mint(""));
+    REQUIRE(all);
+    CHECK(all->status == 200);
+    CHECK(sorted_ids(*all) == std::vector<std::string>{"a_c1", "a_c2", "a_p", "a_s"});
+
+    // Service-scoped token, same global grant: confined to the service's agents EXACTLY. The
+    // service axis, not the minter's global grant, decides (never the unfiltered fleet).
+    auto svc = h.sink.Get("/api/v1/execution-statistics/agents", mint("printers"));
+    REQUIRE(svc);
+    CHECK(svc->status == 200);
+    CHECK(sorted_ids(*svc) == std::vector<std::string>{"a_c1", "a_p", "a_s"});
+
+    // Naming an out-of-service agent explicitly still yields nothing for the service token.
+    auto named = h.sink.Get("/api/v1/execution-statistics/agents?agent_id=a_c2", mint("printers"));
+    REQUIRE(named);
+    CHECK(named->status == 200);
+    CHECK(served_agent_ids(*named).empty());
+
+    // No bearer token at all: the gate answers 401 and serves no agent.
+    auto anon = h.sink.Get("/api/v1/execution-statistics/agents");
+    REQUIRE(anon);
+    CHECK(anon->status == 401);
+    CHECK(anon->body.find("a_p") == std::string::npos);
+
+    // RBAC grant revoked: the service token is denied, no agent served.
+    REQUIRE(rbac.unassign_role("user", "minter", "ExecReader").has_value());
+    auto revoked = h.sink.Get("/api/v1/execution-statistics/agents", mint("printers"));
+    REQUIRE(revoked);
+    CHECK(revoked->status == 403);
+    CHECK(revoked->body.find("a_p") == std::string::npos);
+    REQUIRE(rbac.assign_role({"user", "minter", "ExecReader"}).has_value());
+
+    // A degraded tag store (here: none wired) on a service token is a 503, never an empty or
+    // unfiltered 200.
+    AuthRoutes ar_no_tags(cfg, auth_mgr, &rbac, api_tokens.get(), /*audit_store=*/nullptr, &mgmt,
+                          /*tag_store=*/nullptr, /*analytics_store=*/nullptr, oidc_mu,
+                          oidc_provider);
+    ExecV1Harness h2(pool, /*wire_fleet_read=*/true, adapter_for(ar_no_tags));
+    auto degraded = h2.sink.Get("/api/v1/execution-statistics/agents", mint("printers"));
+    REQUIRE(degraded);
+    CHECK(degraded->status == 503);
+    CHECK(degraded->body.find("a_p") == std::string::npos);
 }
 
 TEST_CASE("GET /api/v1/execution-statistics/agents: an unwired fleet_read_fn fails closed with a 503, "
