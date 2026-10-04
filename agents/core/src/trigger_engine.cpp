@@ -129,6 +129,20 @@ void TriggerEngine::set_dispatch(DispatchFn fn) {
     dispatch_ = std::move(fn);
 }
 
+void TriggerEngine::set_poll_cadence(std::chrono::milliseconds interval_tick,
+                                     std::chrono::milliseconds file_poll) {
+    interval_tick_ = interval_tick;
+    file_poll_ = file_poll;
+}
+
+std::optional<TriggerConfig> TriggerEngine::find_trigger(const std::string& id) const {
+    std::lock_guard lock(mu_);
+    for (const auto& t : triggers_)
+        if (t.id == id)
+            return t;
+    return std::nullopt;
+}
+
 void TriggerEngine::set_max_triggers(size_t limit) {
     std::lock_guard lock(mu_);
     max_triggers_ = limit;
@@ -256,7 +270,7 @@ void TriggerEngine::interval_loop() {
 
     while (running_.load(std::memory_order_acquire)) {
         // Wakes the instant stop() is called, rather than sleeping out the tick.
-        if (wait_for_stop(std::chrono::seconds{1}))
+        if (wait_for_stop(interval_tick_))
             break;
 
         auto now = std::chrono::steady_clock::now();
@@ -314,8 +328,8 @@ void TriggerEngine::file_watch_loop() {
     spdlog::debug("TriggerEngine: file_watch_loop started");
 
     while (running_.load(std::memory_order_acquire)) {
-        // Poll every 5 seconds — but wake at once on stop().
-        if (wait_for_stop(std::chrono::seconds{5}))
+        // Poll every file_poll_ (5s by default) — but wake at once on stop().
+        if (wait_for_stop(file_poll_))
             break;
 
         // Take a snapshot of file change triggers
