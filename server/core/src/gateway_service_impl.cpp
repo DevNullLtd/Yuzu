@@ -1108,6 +1108,12 @@ grpc::Status GatewayUpstreamServiceImpl::BatchHeartbeat(grpc::ServerContext* con
     // ADR-1005 enforceable seam — see grpc_on_behalf_enforce.hpp.
     if (auto s = onbehalf::enforce(context); !s.ok()) return s;
 
+    // Gateway contract (yuzu_gw_heartbeat_buffer, #1197): the gateway treats the
+    // gRPC statuses RESOURCE_EXHAUSTED and INVALID_ARGUMENT on BatchHeartbeat as
+    // "drop this heartbeat": a chunk of one heartbeat rejected with either is
+    // dropped and counted, never retried. Every other status is transient and
+    // the chunk is retried on the next flush cycle. So this handler must not
+    // return those two codes for a transient capacity condition.
     int acked = 0;
     // #1197: distinct session ids this replica does not hold, reported back to
     // the gateway in the response, plus a count of over-length unknown ids.
