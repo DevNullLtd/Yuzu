@@ -154,8 +154,54 @@ default 1000 ms, valid 100 to 60000; env override `YUZU_GW_HEARTBEAT_INTERVAL_MS
 
 This reduces upstream load from O(agents/interval) to O(nodes/interval).
 
-On RPC failure, heartbeat buffers are retained (capped at 10,000) for retry
-on the next flush cycle rather than being silently discarded.
+On RPC failure, the buffered heartbeats are retained for retry on the next
+flush cycle rather than being silently discarded. The retained buffer is bounded
+in sessions and in bytes (see below).
+
+**One entry per session.** The buffer holds at most one entry per session. A
+newer heartbeat for a session that already has an entry replaces the fields of
+the older one (the newest status tags and sent time win), except that the newest
+non-empty `fleet_snapshot_json` is kept: an agent attaches a snapshot only when
+it has a new one and does not resend it, so a replacement that carried no
+snapshot must not erase the last one. `yuzu_gw_heartbeat_coalesced_total` counts
+each replacement.
+
+**Chunked flush.** A flush is split into chunks of at most about 3 MiB
+(estimated), oldest first, so that no `BatchHeartbeat` request approaches the
+server's gRPC receive limit of 4194304 bytes (4 MiB). The verdict of each chunk
+that succeeds is consumed as usual (see
+[What happens when the server restarts](#what-happens-when-the-server-restarts)).
+A chunk that fails, and the chunks not yet sent, stay buffered for the next
+flush. A single heartbeat that is by itself larger than 3 MiB is sent without its
+snapshot (`yuzu_gw_heartbeat_buffer_dropped_total{reason="snapshot_oversize"}`).
+
+**Bounds on the retained buffer.** `max_heartbeat_buffer` (default 10000) is a
+number of sessions. When the buffer holds that many sessions, a heartbeat of a
+new session is dropped and counted
+(`yuzu_gw_heartbeat_buffer_dropped_total{reason="buffer_full"}`); a heartbeat of a
+session that already has an entry is still accepted, because it replaces that
+entry. `max_heartbeat_buffer_bytes` (default 64 MiB; see "Heartbeat buffer
+bounds" under Configuration) caps the bytes the buffer retains. When the buffer is over that cap, snapshots are dropped
+oldest first
+(`yuzu_gw_heartbeat_buffer_dropped_total{reason="snapshot_evicted"}`), and only when
+no entry holds a snapshot any more is the oldest whole session dropped (counted as
+`reason="buffer_full"`). What is lost is only older heartbeat state: the agent
+sends its next heartbeat on its own interval.
+
+**Consequences.**
+
+- `yuzu_heartbeats_received_total{via="gateway"}` on the server under-counts while
+  a backlog is coalesced. It counts the heartbeats the server received, and fewer
+  arrive when several heartbeats of one session are merged into one. It is not a
+  count of the heartbeats the agents sent, so do not read a fall in it during or
+  just after a server outage as agents going quiet; read
+  `yuzu_gw_heartbeat_coalesced_total` and `yuzu_gw_agents_current` beside it.
+- After a snapshot is evicted, the topology snapshot the server holds for that
+  agent can be older by one agent snapshot cycle (INFERRED from the agent proto
+  comment: the agent produces a new snapshot about once a minute and does not
+  resend one it already sent).
+- The server's gRPC receive limit of 4 MiB is unchanged and is not raised. The
+  gateway keeps each request under it instead.
 
 #### Heartbeat admission
 
@@ -586,6 +632,24 @@ is logged; the sessions are listed again by later heartbeats (INFERRED). So
 `queue_full` means either that the replay queue is at its cap or that the upstream
 client has a message backlog.
 
+**Heartbeat buffer bounds**
+
+Application env keys read by the heartbeat buffer at start (set them in the
+`yuzu_gw` section of `sys.config`):
+
+| Key | Default | Valid range | Meaning |
+|---|---|---|---|
+| `max_heartbeat_buffer` | 10000 | not range-checked (use a positive integer) | Most sessions the buffer holds. The buffer keeps one entry per session, so this counts sessions, not heartbeats. When it is full, a heartbeat of a new session is dropped and counted in `yuzu_gw_heartbeat_buffer_dropped_total{reason="buffer_full"}`. |
+| `max_heartbeat_buffer_bytes` | 67108864 (64 MiB) | 1048576 to 1073741824 | Most bytes (estimated) the buffer retains across a failed flush. When the buffer is over this cap, snapshots are dropped oldest first (`reason="snapshot_evicted"`); only when none is left is the oldest whole session dropped (`reason="buffer_full"`). A value outside the range logs one warning that names the key and falls back to the default. |
+
+A flush is split into chunks of at most about 3 MiB (estimated), a fixed value
+that is not configurable. Size the byte cap for the largest backlog you want to
+survive: each session's entry can carry a snapshot of several hundred KB (observed
+on one rig, see "Known limits" below), so 64 MiB holds roughly 80 to 330 such
+snapshots at once (arithmetic on the default and the observed 200 to 800 KB range,
+not measured). See
+[Heartbeat Batching](#heartbeat-batching).
+
 **Circuit breaker tuning** (the breaker the replay and the other upstream calls
 share; read once when the upstream client starts, not range-checked, and each key
 has an environment override, unlike the replay keys above):
@@ -847,6 +911,8 @@ agent build that re-registers by itself; released agents do not (see
 | gateway | WARN | `Registration replay aborted: circuit open (N agent(s) not yet re-proxied)` | The breaker opened while the drip was running. The queue is dropped; the agents come back on a later verdict or on the next breaker recovery. |
 | gateway | WARN | `Registration replay aborted: registry unavailable (N queued entries dropped)` | The gateway's registry process was down when the drip popped an entry, so nothing queued could be re-verified and the queue was dropped. This abort disconnects no agent. INFERRED from the code (not tested): a registry that died has lost its tables (see [Heartbeat admission](#heartbeat-admission)), so a later verdict finds no local session for these agents and counts them `not_local`; they are not listed again into the replay. They come back only through their own `NOT_FOUND` re-register path, which released v0.13.0 and v0.14.0-rc6 agents do not complete (see "Agent dependency" below). |
 | gateway | WARN | `Registration replay: <agent> failed: <reason>` | A replay `ProxyRegister` failed. It counts as a failure for the shared circuit breaker (see "Replay failures feed the shared circuit breaker" below). |
+| gateway | metric | `yuzu_gw_heartbeat_coalesced_total` rising | Newer heartbeats of a session are replacing older buffered ones, one at a time. Expected during a server outage: heartbeats pile up between failed flushes and are merged, so the buffer stays at one entry per session. No action. The server's `yuzu_heartbeats_received_total{via="gateway"}` falls short of the number of heartbeats the agents sent for the same reason; that is not a loss of agents. |
+| gateway | metric | `yuzu_gw_heartbeat_buffer_dropped_total{reason}` rising | The buffer is under pressure, typically after a long server outage. `snapshot_evicted`: older snapshots were dropped to stay under `max_heartbeat_buffer_bytes`, oldest first. `buffer_full`: the buffer held `max_heartbeat_buffer` sessions and a heartbeat of a new session was dropped, or it was still over `max_heartbeat_buffer_bytes` with no snapshot left and its oldest whole session was dropped. `snapshot_oversize`: one heartbeat larger than about 3 MiB was sent without its snapshot (see "Known limits" below for the agent side). The data lost is only older heartbeat state, which the agents refresh on their own interval. No action unless it keeps rising after the server is back; if it does, check that the server is reachable and answering `BatchHeartbeat` (`yuzu_gw_upstream_rpc_errors_total{rpc_name}`), and consider raising `max_heartbeat_buffer_bytes` or `max_heartbeat_buffer` if your fleet is larger than the defaults assume. Do not restart the gateway for this: a restart disconnects every agent the node holds. |
 
 The server's `renew_leases ... unknown_session` warnings stop once the agent
 is known again. How long that takes depends on the gateway's upstream circuit
@@ -1133,6 +1199,30 @@ the raw rig logs are local only.
   enrollment). The web UI was served over plain HTTP. Result: replay at
   T0 + 17.1 s, same session, same process, no reconnect, counters unchanged
   after convergence. The web UI over HTTPS was not tested.
+- **E2a and an unplanned long outage: a stuck heartbeat batch (before the
+  buffer change).** OBSERVED on a rig with an agent that had the TAR plugin
+  (default plugin set), one core replica, before the heartbeat buffer change
+  described under "Heartbeat Batching". Such an agent's heartbeats can carry a
+  `fleet_snapshot_json` of 200 to 800 KB (this rig host, busy). At that time the
+  buffer retained heartbeats on a failed flush capped by count only (10000), so a
+  long server outage (about 150 s or more, INFERRED from the snapshot sizes; the
+  runs below were 300 s and 15.6 minutes) left a retained batch larger than the
+  server's gRPC receive limit of 4194304 bytes. In an unplanned outage of 15.6 minutes the retained batch reached
+  24805137 bytes. After the server was back, every `BatchHeartbeat` failed with
+  `Received message larger than max (... vs. 4194304)` and never drained: no
+  verdict, no replay and no recovery until the gateway was restarted. In run E2a
+  (a planned 300 s outage) the same thing happened: `agents.online` stayed 0 for
+  the whole 420 s deadline plus 91 s of further observation, a command returned
+  `503 no agent connected`, the route row was tombstoned, the replay counters did
+  not move and the agent never reconnected. This is existing buffer behaviour,
+  not introduced by the verdict replay, but it disabled the recovery this section
+  describes. The R runs above used an agent without the TAR plugin, so their
+  heartbeats were small and did not meet it. The buffer change (one entry per
+  session, chunked flush, byte cap) is built to close it. Post-change rig run:
+  pending. Until it exists, that the change closes the failure is INFERRED from
+  the design, not observed. The run is recorded in the
+  [evidence record](../security-reviews/gateway-heartbeat-verdict-replay-2026-10-04.md)
+  on its `Post-fix rig run:` line.
 - **`yuzu_gw_upstream_notify_dropped_total`.** OBSERVED: the metric has HELP
   and TYPE lines but no sample until a notification is first dropped, so an
   absent series means no drops.
@@ -1140,8 +1230,9 @@ the raw rig logs are local only.
   pressure, agents started with `--no-auto-update`, the `queue_full` and
   `malformed` verdict reasons, a double replay, a verdict that arrives after a
   replay it predates, the registry-unavailable abort, an `accepted=false` answer,
-  a failing server feeding the breaker during a drip, and the recovery action for
-  R2b (see "Known limits").
+  a failing server feeding the breaker during a drip, the recovery action for
+  R2b (see "Known limits"), and the heartbeat buffer change on a rig (the post-change
+  run with a TAR plugin agent is pending).
 
 **Load and convergence bounds.** The drip sends one ProxyRegister at a time.
 The period per agent is the ProxyRegister RPC time plus the spacing
@@ -1214,6 +1305,22 @@ env keys with defaults, which a reverted build ignores.
 
 #### Known limits
 
+- **Heartbeat buffer: agent snapshot size, server limit, shutdown flush.**
+  (1) The agent's snapshot size is not bounded by this change. The agent proto
+  comment says a snapshot is typically 5 to 20 KB, while 200 to 800 KB was
+  observed on one busy rig host with the TAR plugin, and the server accepts a
+  snapshot of up to 2 MiB (`kPushedSnapshotMaxBytes` in `fleet_topology_store.hpp`,
+  read from the code). The gateway keeps each request under the server's limit by
+  chunking and by eviction, but a smaller snapshot from the agent side is the
+  real fix; it is tracked as a follow-up for the agent side (no issue number
+  yet). (2) The server's gRPC receive limit of 4194304 bytes is the library
+  default and is not configured explicitly by the server (INFERRED from reading
+  the server code; not run), so the gateway's chunk size of about 3 MiB depends on
+  that default staying as it is. It is not raised by this change. (3) The
+  gateway's shutdown flush waits at most 5 s; a shutdown with a backlog that
+  needs several chunks may not finish inside that time, and what is still
+  buffered is then lost with the process (INFERRED from the code; not run).
+  Losing buffered heartbeats at shutdown costs only older heartbeat state.
 - **R2b: a route row tombstoned while the server stayed up is not repaired by this
   reconcile.** OBSERVED: during a 6.9 minute network partition between the
   gateway and the server, with the server staying up (the traffic went through a
@@ -1546,6 +1653,8 @@ that are actually emitted are listed.
 | `yuzu_gw_registration_replay_triggered_total` | counter | Registration replays started, by `trigger` (`breaker` = the upstream recovered and every agent this node holds is queued for replay, unless a verdict-seeded drip is already queued, in which case the trigger is dropped, `heartbeat` = a heartbeat verdict listed sessions the server does not know and only those are replayed). Both series are created at 0 at start. |
 | `yuzu_gw_heartbeat_unknown_truncated_total` | counter | `BatchHeartbeat` responses whose list of unknown sessions the server truncated at 4096. Sessions beyond the cap may be reported again by later heartbeats. Every occurrence is counted; the matching WARN is logged at most once per 60 s per heartbeat buffer process (the limit resets when that process restarts). |
 | `yuzu_gw_heartbeat_verdict_dropped_total` | counter | Session ids named by a heartbeat verdict that were not queued for replay (label `reason`, closed set: `malformed` = not a usable session id, `not_local` = this node does not hold the session, `circuit_open` = the upstream circuit breaker is open, `queue_full` = the replay queue is at its cap, or the upstream process already holds more than 100 unhandled messages so the ids were not handed to it; the cap bounds only verdict appends, so while a breaker-seeded snapshot of that size or larger drains, every verdict id for an agent not already queued counts here). Every reason is created at 0 at start. Ids already queued, or replayed within the session guard window, are not counted. |
+| `yuzu_gw_heartbeat_buffer_dropped_total` | counter | Heartbeat state the gateway's heartbeat buffer dropped instead of sending (label `reason`, closed set, all created at 0 at start: `buffer_full` = a heartbeat of a new session was dropped because the buffer held `max_heartbeat_buffer` sessions, or the oldest whole session was dropped because the buffer was still over `max_heartbeat_buffer_bytes` with no snapshot left to drop; `snapshot_oversize` = a single heartbeat larger than about 3 MiB was sent without its snapshot; `snapshot_evicted` = a retained snapshot was dropped, oldest first, because the buffer was over `max_heartbeat_buffer_bytes`). What is lost is older heartbeat state. See [Heartbeat Batching](#heartbeat-batching). |
+| `yuzu_gw_heartbeat_coalesced_total` | counter | Buffered heartbeats replaced by a newer heartbeat of the same session (unlabelled). Expected to rise while the server is unreachable. While a backlog is coalesced, the server's `yuzu_heartbeats_received_total{via="gateway"}` under-counts, because it counts the heartbeats the server received. |
 | `yuzu_gw_cluster_peers_resolved` | gauge | Peer addresses found by the cluster-formation redial loop's most recent tick (label `node`; HA WS-4 `#4555`). 0 is expected for a genuinely single-node deployment. |
 | `yuzu_gw_cluster_peers_connected` | gauge | Distribution-connected peer nodes as of the most recent redial tick (label `node`; `#4555`). Compare against `peers_resolved` — a sustained gap most often means a distribution-cookie mismatch across replicas. |
 | `yuzu_gw_cluster_connect_failures_total` | counter | Total `net_kernel:connect_node/1` failures from the redial loop (`#4555`). |

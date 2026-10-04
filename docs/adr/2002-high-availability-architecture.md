@@ -1403,6 +1403,34 @@ one core replica a server-only restart now recovers through the replay described
   `malformed` verdict reasons, a double replay, a verdict that arrives after a replay it predates, the
   registry-unavailable abort, an `accepted=false` answer and a failing server feeding the breaker during a
   drip (the same list as "Observed on a rig" in the gateway manual).
+- **Observed: a stuck heartbeat batch, and the buffer change that closes it (INFERRED closed; post-change
+  rig run pending).** OBSERVED on a rig with an agent that had the TAR plugin, before this change: such an
+  agent's heartbeat can carry a `fleet_snapshot_json` of 200 to 800 KB (a busy rig host), and the gateway
+  heartbeat buffer retained heartbeats on a failed flush capped by count only (10000). In an unplanned
+  15.6 minute server outage and in a 300 s outage (run E2a) the retained batch exceeded the server's gRPC
+  receive limit of 4194304 bytes (24805137 bytes in the first), every `BatchHeartbeat` failed with
+  `Received message larger than max` and none ever drained, so there was no verdict and no replay until the
+  gateway was restarted (in E2a `agents.online` stayed 0 for the whole observation and the route row was
+  tombstoned). This is existing buffer behaviour, not introduced by the replay, and it disabled the recovery
+  this section describes; the earlier rig runs used an agent without the TAR plugin and did not meet it.
+  The change: the buffer keeps one entry per session (a newer heartbeat replaces the fields of the older
+  one, except that the newest non-empty `fleet_snapshot_json` is kept, because the agent sends a snapshot
+  only when it has a new one); a flush is split into chunks of at most about 3 MiB (estimated), oldest
+  first, the verdict of each successful chunk is consumed, and a failed chunk and the unsent ones stay
+  buffered; the retained buffer has a byte cap (`max_heartbeat_buffer_bytes`, default 64 MiB, valid
+  1048576..1073741824, otherwise the default with a WARN naming the key), over which snapshots are dropped
+  oldest first and then whole sessions oldest first; a single heartbeat over 3 MiB is sent without its
+  snapshot; and `max_heartbeat_buffer` now counts sessions, dropping a heartbeat of a new session when full.
+  New counters: `yuzu_gw_heartbeat_buffer_dropped_total{reason}` (`buffer_full`, `snapshot_oversize`,
+  `snapshot_evicted`) and `yuzu_gw_heartbeat_coalesced_total`. Consequences: the server's
+  `yuzu_heartbeats_received_total{via="gateway"}` under-counts while a backlog is coalesced, and an agent's
+  topology snapshot can be one agent snapshot cycle older after an eviction. The server's 4 MiB receive
+  limit is unchanged and not raised. Not tested and known limits: the post-change rig run is pending; the
+  agent's snapshot size is not bounded here (the agent proto comment says 5 to 20 KB, 200 to 800 KB was
+  observed, the server accepts up to 2 MiB) and is a follow-up for the agent side; the server does not
+  configure its maximum receive size explicitly, so the chunk size relies on the library default (INFERRED
+  from the code, not run); `flush_sync`'s 5 s shutdown wait may be exceeded by a multi-chunk shutdown flush
+  (INFERRED from the code, not run). Evidence record: `docs/security-reviews/gateway-heartbeat-verdict-replay-2026-10-04.md`.
 - **Known limit (observed, not fixed here).** A route row the server's lease reaper tombstones while the
   server stays up (observed after a 6.9 minute gateway-to-server partition) is not repaired: the verdict
   is computed from the server's in-memory session map, which still holds the session (INFERRED from
