@@ -71,8 +71,7 @@ apply_nodelay(Client, #{channels := NewChannels} = NewClient, true) ->
                                 "to turn off)", [?CHANNEL, ?ENV_KEY]);
                 {error, Reason} ->
                     logger:warning("Upstream channel ~s: could not restart it with "
-                                   "TCP_NODELAY (~p); it runs with the endpoints as "
-                                   "configured", [?CHANNEL, Reason])
+                                   "TCP_NODELAY (~p)", [?CHANNEL, Reason])
             end;
         false ->
             ok
@@ -93,8 +92,17 @@ restart_channel(Endpoints, OldEndpoints, Options) ->
             {ok, _Pid} ->
                 ok;
             {error, Reason} ->
-                %% Leave the node with a channel rather than without one.
-                _ = start_channel(OldEndpoints, Options, ?START_ATTEMPTS),
+                %% Leave the node with a channel rather than without one, and
+                %% say when even that failed: the node then has no upstream.
+                case start_channel(OldEndpoints, Options, ?START_ATTEMPTS) of
+                    {ok, _} ->
+                        ok;
+                    Failed ->
+                        logger:warning("Upstream channel ~s: could not restore it "
+                                       "with the endpoints as configured either "
+                                       "(~p); the node has no upstream channel",
+                                       [?CHANNEL, Failed])
+                end,
                 {error, Reason}
         end
     catch

@@ -18,6 +18,10 @@
 -module(yuzu_gw_upstream_channel_tests).
 -include_lib("eunit/include/eunit.hrl").
 
+-export([log/2]).
+
+-define(LOG_HANDLER, yuzu_gw_upstream_channel_tests_log).
+-define(LOG_TAB, yuzu_gw_upstream_channel_tests_log_tab).
 -define(CH, default_channel).
 -define(NODELAY, #{socket_options => [{nodelay, true}]}).
 
@@ -111,7 +115,11 @@ runtime_test_() ->
       fun(S) -> {"an invalid upstream_tcp_nodelay value falls back to the default (on)",
                  fun() -> invalid_switch(S) end} end,
       fun(S) -> {"no grpcbox client config is a no-op",
-                 fun() -> no_client_config(S) end} end]}.
+                 fun() -> no_client_config(S) end} end,
+      fun(S) -> {"a failed restart warns; the restore of the original endpoints that works is silent",
+                 fun() -> restart_fails_restore_works(S) end} end,
+      fun(S) -> {"a failed restart whose restore fails too warns about the restore as well",
+                 fun() -> restart_and_restore_fail(S) end} end]}.
 
 control(S) ->
     Endpoint = {http, "127.0.0.1", port(S), []},
@@ -171,6 +179,64 @@ invalid_switch(S) ->
     application:set_env(yuzu_gw, upstream_tcp_nodelay, "no"),
     ok = yuzu_gw_upstream_channel:apply_nodelay(),
     ?assertEqual({ok, [{nodelay, true}]}, client_nodelay(S)).
+
+%% The channel cannot start with the rewritten (nodelay) endpoints but starts
+%% with the original ones: one WARN, for the restart, and the channel is back.
+restart_fails_restore_works(S) ->
+    Endpoint = {http, "127.0.0.1", port(S), []},
+    boot_channel(Endpoint),
+    with_failing_start(fun(Endpoints) -> lists:any(fun(E) -> tuple_size(E) =:= 5 end, Endpoints) end,
+                       fun() -> ok = yuzu_gw_upstream_channel:apply_nodelay() end),
+    ?assertEqual(1, length(warnings("could not restart it"))),
+    ?assertEqual([], warnings("could not restore it")),
+    ?assertMatch(P when is_pid(P), channel_pid()),
+    %% The env is unchanged: the channel runs with the endpoints as configured.
+    ?assertEqual({ok, #{channels => [{?CH, [Endpoint], #{}}]}},
+                 application:get_env(grpcbox, client)).
+
+%% Neither start works: the restart warns, and so does the restore, which is the
+%% node left without an upstream channel.
+restart_and_restore_fail(S) ->
+    Endpoint = {http, "127.0.0.1", port(S), []},
+    boot_channel(Endpoint),
+    with_failing_start(fun(_Endpoints) -> true end,
+                       fun() -> ok = yuzu_gw_upstream_channel:apply_nodelay() end),
+    ?assertEqual(1, length(warnings("could not restart it"))),
+    ?assertEqual(1, length(warnings("could not restore it"))),
+    ?assertEqual(undefined, channel_pid()).
+
+%% grpcbox_channel_sup:start_child/3 answers `{error, boom}' when Fails(Endpoints)
+%% and starts the channel otherwise; the log is captured meanwhile.
+with_failing_start(Fails, Run) ->
+    ?LOG_TAB = ets:new(?LOG_TAB, [named_table, public, bag]),
+    catch logger:remove_handler(?LOG_HANDLER),
+    ok = logger:add_handler(?LOG_HANDLER, ?MODULE, #{config => #{}, level => all}),
+    ok = meck:new(grpcbox_channel_sup, [passthrough, no_link]),
+    try
+        ok = meck:expect(grpcbox_channel_sup, start_child,
+                         fun(Name, Endpoints, Options) ->
+                                 case Fails(Endpoints) of
+                                     true  -> {error, boom};
+                                     false -> meck:passthrough([Name, Endpoints, Options])
+                                 end
+                         end),
+        Run()
+    after
+        meck:unload(grpcbox_channel_sup),
+        catch logger:remove_handler(?LOG_HANDLER)
+    end.
+
+warnings(Text) ->
+    [M || {warning, M} <- ets:tab2list(?LOG_TAB), string:find(M, Text) =/= nomatch].
+
+%% logger handler callback
+log(#{level := Level, msg := Msg}, _Config) ->
+    ets:insert(?LOG_TAB, {Level, lists:flatten(format(Msg))}),
+    ok.
+
+format({string, S}) -> io_lib:format("~ts", [S]);
+format({report, R}) -> io_lib:format("~p", [R]);
+format({Fmt, Args}) -> io_lib:format(Fmt, Args).
 
 no_client_config(_S) ->
     application:unset_env(grpcbox, client),
@@ -265,6 +331,7 @@ acceptor(Mod, L, Handshake, Held) ->
     end.
 
 cleanup(#{listener := {Mod, L}, acceptor := Acceptor, prev_client := Prev}) ->
+    catch ets:delete(?LOG_TAB),
     catch grpcbox_channel:stop(?CH, normal),
     exit(Acceptor, kill),
     catch Mod:close(L),
