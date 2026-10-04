@@ -46,7 +46,7 @@ deciding which subjects are which.
 2. **Purview follows the person, not the geography.** A German employee's laptop abroad stays in
    purview; a data-centre switch with only servers behind it is not. There is **no country flag**.
 3. **In purview, an individually-identifying behavioural read is denied unless made under an
-   open Incident.** Aggregate, floor-protected reads are unaffected.
+   Incident in the `approved` state.** Aggregate, floor-protected reads are unaffected.
 4. **Out of purview, behaviour is today's**: permitted and per-open audited. Nothing changes for
    subjects nobody has declared.
 5. **Default is out.** An undeclared subject is out of purview, preserving existing operators'
@@ -55,8 +55,11 @@ deciding which subjects are which.
    rejected only for upgrade breakage. **Until the flip ships, an EU co-determination deployment
    must not enable the ADR-0068 collector or any other new individually-identifying source**; the
    separately-deployed opt-in artifact is the collection off-switch (the SOC 2 doc's precedent).
-6. **An Incident** is a declared, reasoned, **time-boxed** authorisation: opened with a
-   justification (e.g. a ticket) by a holder of `Incident:Write`, **approved through the one
+6. **An Incident** is a declared, reasoned, **time-boxed** authorisation with a closed state
+   machine — `requested → approved → closed | expired | denied` — in which **reads are admitted
+   only in `approved`**; `incident.open` creates a `requested` Incident and admits nothing. It is
+   opened with a justification (e.g. a ticket) by a holder of `Incident:Write`, **approved through
+   the one
    core-owned approval primitive exactly as ADR-0033 §4 specifies — the approver holds
    `Incident:Approve`, requester ≠ approver as distinct human roots, with MFA step-up; there is
    no admin self-approval and no second approval gate** — stamping every read made under it with
@@ -64,11 +67,17 @@ deciding which subjects are which.
    Its product is a complete, exportable account for the works council of what was read, by whom,
    and why. **The evidence is audit rows, each a named verb**: `incident.open` (justification),
    `incident.approve` / `incident.deny` (requester, approver, both human roots), `incident.close`,
-   `incident.expire`, `purview.set` and `purview.override` (every purview change), every stamped
-   read (its own verb + `incident_id`), and every **denial** during the window. The export is
+   `incident.expire` (written by the gate at the first post-lapse evaluation or by a sweep,
+   whichever comes first; the export derives expiry from `expires_at` regardless), `purview.set`
+   and `network_element.purview.override` (every purview change — the element verb is ADR-0068's,
+   one name), every stamped read (its own verb + `incident_id`), and every **denial** during the
+   window. The export is
    generated from audit rows only, retained ≥ 365 days with the audit store, and its generation is
-   itself an audit row carrying the export's content hash. **An audit-persist failure denies the
-   read even under an Incident — an unrecordable read is not made.**
+   itself an audit row carrying the export's content hash. **An unrecordable read is not made:**
+   an audit-persist failure denies the read even under an Incident, and on an **audit-off**
+   deployment (`audit_fn` absent, where the funnel's kernel returns `true` today) in-purview reads
+   are refused outright and a purview declaration is itself refused — there is no Incident without
+   evidence.
 7. **Enforced by a pre-read, deny-capable decision in front of the single funnel.**
    `emit_behavioral_audit` (`rest_audit.hpp`) is an audit *wrapper*: it returns a persist bool,
    REST fails closed on it, the dashboard and MCP proceed by design, MCP wraps the kernel itself,
@@ -97,19 +106,22 @@ a Warsaw laptop's process tree (out of purview): permitted, audited, no Incident
 
 | Named gap | Status under this ADR |
 |---|---|
-| Kill switch for the individual drill-down | **Partly closed** — a read-side deny on in-purview subjects; not a collection switch |
+| Kill switch for the individual drill-down | **Closed on acceptance + implementation of this ADR's mechanism, not before** — and as a *gate* (Incident-bypassable), not a kill switch; nothing is closed while this ADR is `proposed` |
 | Per-category collection toggles (per management group) | **Related, not closed** — purview is declared per group but gates reads, not collection; ADR-0068's presence observations add a new per-category collection gap (no toggle), mitigated only by the opt-in collector |
 | Pseudonymisation mode | **Open** |
 | Operator-set retention in the dashboard | **Open** |
 | Dedicated `DEX:Read` securable | **Open** |
-| DSAR / per-subject erasure path | **Open** (ADR-0068 names its stores as erasure sources; the path itself is not this ADR) |
+| DSAR / per-subject erasure path | **Open** (ADR-0068 names its stores as erasure sources and an erasure verb; the subject-resolution path, including visitor MACs, is not this ADR) |
+| Deployment-wide EU default flip (Decision 5) | **Open** — wholly undesigned, and the **precondition for any EU deployment**; until it ships, EU deployments must not enable new individually-identifying sources (ADR-0068's collector included) |
+| Writes on in-purview subjects (remote control, screen capture classes) | **Open** — this ADR's first iteration gates reads only |
 
 ## Open (mechanism — to be designed)
 
 - Purview store: a column on the management-group row vs a separate declaration table; the
   element derivation query (it needs ADR-0068's attachments query owner); the override's audit.
 - **How a read binds to its Incident** — parameter, header, or session-scoped — and how the gate
-  learns the binding before the fetch.
+  learns the binding before the fetch; the `requested → approved` transition's own audit and the
+  sweep that writes `incident.expire`.
 - Incident store and lifecycle; the `Incident` securable (`Write`, `Approve`, `Read`); maximum
   time box; renewal; what happens when the approver is deprovisioned (ADR-2001) or the time box
   lapses mid-request; export format and tamper-evidence beyond the content hash.

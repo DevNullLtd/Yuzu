@@ -285,6 +285,7 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
      - Design record: `docs/auth-architecture.md`'s "Fourth migration
        (#3789)"; wire reference: `docs/user-manual/rest-api.md`'s
        "Executions" section.
+
    - **2026-09-07 — 8 Settings read-twins (`GET /api/v1/settings/{tls,https,
      gateway,server-config,mcp,data-retention,analytics}` +
      `GET /api/v2/agent/plugin-policy` — its predecessor `/api/v1/agent/
@@ -572,4 +573,4 @@ Maintainer verdicts on mechanism-vs-interpretation disputes, as Decision 2 provi
 
 | Date | Class | Verdict | Raised by |
 |---|---|---|---|
-| 2026-10-03 | **Connectors** — collection of **estate facts** from an external source that is not an agent daemon (a network element over gNMI, a management system's inventory, a file upload). An *estate fact* is a fact about the customer's own estate; external **domain data** (vulnerability feeds, threat intelligence, catalogues) is not one and stays engine territory under the tiebreaker above — this verdict does not move it. | **Core (mechanism).** Collecting, normalising and storing the facts is core; exposing them is through the versioned REST/MCP surface; **interpreting** them for a purpose (a service diagram, a scoring) remains engine territory by the existing tiebreakers. Settles the roadmap Phase 9 placement question (`docs/roadmap.md`, owner decision 2026-09-07). | ADR-0068 (network-element connector, gNMI via gnmic); PR #5367 |
+| 2026-10-03 | **Connectors** — collection of **estate facts** from an external source that is not an agent daemon (a network element over gNMI, a management system's inventory, a file upload). An *estate fact* is a fact about the customer's own estate; external **domain data** (vulnerability feeds, threat intelligence, CVE/threat catalogues) is not one and stays engine territory under the tiebreaker above — this verdict does not move it. | **Core (mechanism).** Collecting, normalising and storing the facts is core; exposing them is through the versioned REST/MCP surface; **interpreting** them for a purpose (a service diagram, a scoring) remains engine territory by the existing tiebreakers. Settles the roadmap Phase 9 placement question (`docs/roadmap.md`, owner decision 2026-09-07). | ADR-0068 (network-element connector, gNMI via gnmic); PR #5367 |
