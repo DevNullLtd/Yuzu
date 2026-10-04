@@ -46,6 +46,7 @@
 -define(EV_CIRCUIT, [yuzu, gw, upstream, circuit_state]).
 -define(EV_DROP,    [yuzu, gw, heartbeat, verdict_dropped]).
 -define(EV_TRUNC,   [yuzu, gw, heartbeat, unknown_truncated]).
+-define(EV_RPC_ERROR, [yuzu, gw, upstream, rpc_error]).
 
 %%%===================================================================
 %%% Test fixture — fresh upstream per test, shared real registry
@@ -145,8 +146,14 @@ verdict_replay_test_() ->
         fun format_status_shows_counts_not_requests/0),
       t("E23 sys:get_status on the real process shows counts, never the requests",
         fun sys_get_status_shows_counts_not_requests/0),
-      t("E23 a crash report of a full queue carries counts, never the requests",
-        fun crash_report_shows_counts_not_requests/0)
+      t("E23 the reports of an abnormal stop carry the queue as counts",
+        fun abnormal_stop_reports_show_queue_counts/0),
+      t("E23 format_status redacts reason, stacktrace args and log, and is total",
+        fun format_status_redacts_reason_log_and_odd_fields/0),
+      t("E23 an RPC that raises is a counted failure and carries no request",
+        fun rpc_exception_is_counted_and_carries_no_request/0),
+      t("E23 a crash with a request in the mailbox: the gen_server report is clean",
+        fun crash_with_request_in_mailbox_gen_server_report_clean/0)
      ]}.
 
 %% Breaker reset timers far beyond a test: an open breaker stays open until
@@ -1261,7 +1268,7 @@ format_status_shows_counts_not_requests() ->
     ?assertEqual(up_get(cb_state), maps:get(cb_state, Shown)),
     ?assertEqual(up_get(session_guard_ms), maps:get(session_guard_ms, Shown)),
     ?assertEqual(up_get(replay_queue_max), maps:get(replay_queue_max, Shown)),
-    ?assertEqual({reason, {test, reason}}, {reason, maps:get(reason, Result)}),
+    ?assertEqual({reason, {test, '$redacted'}}, {reason, maps:get(reason, Result)}),
     %% The wrapped forms of every message that carries a payload.
     [begin
          Shown2 = lists:flatten(io_lib:format("~p", [
@@ -1299,9 +1306,126 @@ sys_get_status_shows_counts_not_requests() ->
                           fun(St) -> setelement(up_index(replay_queue), St, []) end),
     ok.
 
+%% The reason, its stacktrace frames' argument lists, the debug log and fields
+%% of the wrong type: none of them may print a request, and the callback must
+%% not crash on any of them (OTP would then print the raw message).
+format_status_redacts_reason_log_and_odd_fields() ->
+    State = sys:get_state(yuzu_gw_upstream),
+    Req = secret_req(9),
+    Show = fun(Status) -> lists:flatten(io_lib:format("~p", [yuzu_gw_upstream:format_status(Status)])) end,
+    %% A stacktrace whose frames carry the request as their argument list.
+    Stack = [{m, f, [Req], loc},
+             {m, g, [Req, Req], [{file, "m.erl"}, {line, 7}, {error_info, #{cause => Req}}]},
+             {m, h, 2, [{line, 1}]},
+             {fun(_) -> Req end, [Req], []}],
+    Reason = {function_clause, Stack},
+    Status = #{state => State, reason => Reason, log => [{in, Req}, {out, Req}]},
+    Text = Show(Status),
+    assert_no_secrets(Text),
+    #{reason := {function_clause, Frames}, log := Log} = yuzu_gw_upstream:format_status(Status),
+    ?assertEqual([{log_entries_redacted, 2}], Log),
+    ?assertMatch([{m, f, 1, loc},
+                  {m, g, 2, [{file, "m.erl"}, {line, 7}]},
+                  {m, h, 2, [{line, 1}]},
+                  {_, 1, []}], Frames),
+    %% A reason that carries a value is cut to its first element; one that is
+    %% not an atom or a tuple of one becomes '$redacted'.
+    [begin
+         assert_no_secrets(Show(#{reason => R})),
+         ?assertEqual(Expected, maps:get(reason, yuzu_gw_upstream:format_status(#{reason => R})))
+     end || {R, Expected} <- [{normal, normal},
+                              {shutdown, shutdown},
+                              {{badmatch, Req}, {badmatch, '$redacted'}},
+                              {{{badmatch, Req}, [{m, f, [Req], loc}]},
+                               {{badmatch, '$redacted'}, [{m, f, 1, loc}]}},
+                              {{[Req], [{m, f, [Req], loc}]}, {'$redacted', [{m, f, 1, loc}]}},
+                              {{Req, boom}, {'$redacted', '$redacted'}},
+                              {Req, '$redacted'},
+                              {{function_clause, Req}, {function_clause, '$redacted'}},
+                              {{function_clause, [odd, {Req}, {m, f, Req, loc}]},
+                               {function_clause, ['$redacted', '$redacted', '$redacted']}}]],
+    %% The redacted status still renders through OTP's own report callback
+    %% (a log that is not a list crashes it, and the report is then printed raw).
+    #{state := ShownState, reason := ShownReason, log := ShownLog} =
+        yuzu_gw_upstream:format_status(Status),
+    Rendered0 = gen_server:format_log(
+                    #{label => {gen_server, terminate}, name => yuzu_gw_upstream,
+                      last_message => circuit_state, state => ShownState,
+                      log => ShownLog, reason => {ShownReason, []},
+                      client_info => undefined, process_label => undefined},
+                    #{}),
+    Rendered = unicode:characters_to_list(Rendered0),
+    assert_no_secrets(Rendered),
+    ?assertNotEqual(nomatch, string:find(Rendered, "log_entries_redacted")),
+    %% A log that is not a list, and queue fields of the wrong type.
+    ?assertEqual([], maps:get(log, yuzu_gw_upstream:format_status(#{log => Req}))),
+    Bad = [setelement(up_index(replay_queue), State, Req),
+           setelement(up_index(recent_replays), State, [Req]),
+           setelement(up_index(replay_queue), setelement(up_index(recent_replays), State, Req),
+                      Req)],
+    [begin
+         assert_no_secrets(Show(#{state => B, message => {proxy_register, Req}})),
+         ?assertEqual('$redacted', maps:get(state, yuzu_gw_upstream:format_status(#{state => B})))
+     end || B <- Bad],
+    ok.
+
+%% An RPC that raises, with the request in the exception's stacktrace args,
+%% must not crash the process: it is a failed RPC for the breaker, returns a
+%% failure and logs only the class and the redacted reason.
+rpc_exception_is_counted_and_carries_no_request() ->
+    Pid = whereis(yuzu_gw_upstream),
+    ?assertEqual(0, up_get(cb_failures)),
+    mock_unary(fun(<<"ProxyRegister">>, Req, _Hdr) ->
+                       erlang:error({badmatch, Req}, [Req]);
+                  (M, R, H) -> default_rpc(M, R, H)
+               end),
+    {Result, Lines} = capture_logs(fun() ->
+        yuzu_gw_upstream:proxy_register(secret_req(1))
+    end),
+    ?assertMatch({error, {internal, _}}, Result),
+    assert_no_secrets(lists:flatten(io_lib:format("~p", [Result]))),
+    ?assertEqual(Pid, whereis(yuzu_gw_upstream)),
+    ?assertEqual(1, up_get(cb_failures)),
+    Warned = [T || {warning, T} <- Lines, binary:match(T, <<"raised">>) =/= nomatch],
+    ?assertMatch([_], Warned),
+    [assert_no_secrets(unicode:characters_to_list(T)) || {_, T} <- Lines],
+    ?assertEqual([{rpc_error, <<"exception">>}],
+                 [{rpc_error, Code} || {#{count := 1}, #{code := Code}} <- events(?EV_RPC_ERROR)]).
+
+%% DOCUMENTS A RESIDUAL, it does not pin it as correct. A crash prints the
+%% process mailbox in the proc_lib crash report (`messages:'), from raw data
+%% that format_status cannot reach, so a queued proxy_register is visible
+%% there; this test says nothing about that section. It asserts only what
+%% format_status does cover: the gen_server terminate report.
+crash_with_request_in_mailbox_gen_server_report_clean() ->
+    Prev = process_flag(trap_exit, true),
+    stop_upstream(),
+    {ok, UpPid} = yuzu_gw_upstream:start_link(),
+    try
+        ok = sys:suspend(UpPid),
+        Caller = spawn(fun() -> catch yuzu_gw_upstream:proxy_register(secret_req(1)) end),
+        await(fun() -> process_info(UpPid, message_queue_len) =:= {message_queue_len, 1} end),
+        {_, Lines} = capture_logs(fun() ->
+            catch gen_server:stop(UpPid, {test_crash, boom}, 5000),
+            await(fun() -> not is_process_alive(Caller) end)
+        end),
+        Terminate = [T || {error, T} <- Lines,
+                          binary:match(T, <<"gen_server,terminate">>) =/= nomatch,
+                          binary:match(T, <<"test_crash">>) =/= nomatch],
+        ?assertMatch([_], Terminate),
+        [assert_no_secrets(unicode:characters_to_list(R)) || R <- Terminate]
+    after
+        catch unlink(UpPid),
+        catch gen_server:stop(UpPid, normal, 2000),
+        process_flag(trap_exit, Prev),
+        flush_exits()
+    end.
+
 %% An abnormal stop runs the same report path as a crash. The test process
 %% owns its own upstream and traps exits, like registry_stopped_mid_drip_*.
-crash_report_shows_counts_not_requests() ->
+%% The state holds 50 queued requests and the mailbox is empty: both reports
+%% show the queue as counts. (Nothing here covers the mailbox, see above.)
+abnormal_stop_reports_show_queue_counts() ->
     Prev = process_flag(trap_exit, true),
     stop_upstream(),
     {ok, UpPid} = yuzu_gw_upstream:start_link(),

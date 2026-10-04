@@ -621,22 +621,41 @@ code_change(_OldVsn, State, _Extra) ->
 %% @doc What a crash report and sys:get_status/1 show of this process.
 %%
 %% The replay queue holds every queued agent's stored RegisterRequest
-%% verbatim (enrollment_token, machine_certificate, csr_pem), and a crash
-%% report prints the whole state: with a full queue that is credentials in
-%% the log and, measured, 28 s and 179 MB of log for 10000 entries. So the
-%% state is shown as a map of its scalar fields with replay_queue and
-%% recent_replays replaced by their sizes (replay_queue_len,
-%% recent_replays_size), and the last message is shown without the
-%% request it carries. Only the report is affected: sys:get_state/1 still
-%% returns the real record.
+%% verbatim (enrollment_token, machine_certificate, csr_pem), and the state
+%% printed whole would put those credentials in the log, once per queued
+%% agent. So this callback shows:
+%%   - the state as a map of its scalar fields, with replay_queue and
+%%     recent_replays replaced by their sizes (replay_queue_len,
+%%     recent_replays_size); a state that is not the record, or a queue or
+%%     stamp field of the wrong type, shows as '$redacted', so this callback
+%%     cannot itself crash (OTP would then print the raw message);
+%%   - the last message without the request it carries. A call arrives as
+%%     {'$gen_call', From, Msg} and a cast as {'$gen_cast', Msg}; both
+%%     wrappers are handled, as is the bare Msg;
+%%   - the reason with every term inside it replaced by '$redacted' (only
+%%     atoms survive), and any stacktrace in it with each frame's argument
+%%     list cut to its length;
+%%   - the debug log (sys:log) as its length, kept a list (the OTP report
+%%     callback iterates it).
+%% Only the reports are affected: sys:get_state/1 still returns the real record.
+%%
+%% NOT covered, because OTP prints them from raw data outside this callback:
+%% the process mailbox (the `messages:' line of the proc_lib crash report),
+%% the exception line of that report, and the stacktrace that gen_server
+%% appends to the terminate report after calling this callback. A crash
+%% report of yuzu_gw_upstream is therefore sensitive: treat it as such.
+%% do_rpc/4 keeps the request out of exceptions raised by the RPC itself.
 -spec format_status(map()) -> map().
 format_status(Status) ->
     maps:map(fun(state, State)   -> redact_state(State);
                 (message, Msg)   -> redact_message(Msg);
+                (reason, Reason) -> redact_reason(Reason);
+                (log, Log)       -> redact_log(Log);
                 (_Key, Value)    -> Value
              end, Status).
 
-redact_state(#state{replay_queue = Queue, recent_replays = Recent} = State) ->
+redact_state(#state{replay_queue = Queue, recent_replays = Recent} = State)
+  when is_list(Queue), is_map(Recent) ->
     Fields = maps:from_list(lists:zip(record_info(fields, state),
                                       tl(tuple_to_list(State)))),
     (maps:without([replay_queue, recent_replays], Fields))#{
@@ -646,8 +665,7 @@ redact_state(_Other) ->
     '$redacted'.
 
 %% The messages that carry a request, an inventory report, session ids or a
-%% guardian frame; anything else is shown as is. gen_server hands the bare message to
-%% the report, the wrappers are handled for sys:get_status/1 style callers.
+%% guardian frame; anything else is shown as is.
 redact_message({proxy_register, _Req})            -> {proxy_register, '$redacted'};
 redact_message({proxy_inventory, _Report})        -> {proxy_inventory, '$redacted'};
 redact_message({replay_sessions, _Ids})           -> {replay_sessions, '$redacted'};
@@ -656,6 +674,49 @@ redact_message({forward_guardian_message, AgentId, _Frame}) ->
 redact_message({'$gen_call', From, Msg})          -> {'$gen_call', From, redact_message(Msg)};
 redact_message({'$gen_cast', Msg})                -> {'$gen_cast', redact_message(Msg)};
 redact_message(Msg)                               -> Msg.
+
+%% An exit reason is an atom, or {Why, Stack} for an error. Why is kept only
+%% when it is an atom, or a tuple whose first element is an atom (shown as
+%% {Atom, '$redacted'}: {badmatch, Value} carries the value); any other
+%% term becomes '$redacted'.
+redact_reason(Reason) when is_atom(Reason) -> Reason;
+redact_reason({Why, Stack})                -> {redact_why(Why), redact_stack(Stack)};
+redact_reason(_Other)                      -> '$redacted'.
+
+redact_why(Why) when is_atom(Why) -> Why;
+redact_why(Why) when is_tuple(Why), tuple_size(Why) > 0, is_atom(element(1, Why)) ->
+    {element(1, Why), '$redacted'};
+redact_why(_Other) -> '$redacted'.
+
+%% A stacktrace frame prints its ARGUMENT LIST when the error was raised with
+%% one (function_clause, undef, error(Reason, Args)); keep the arity only. A
+%% frame that is not one of the two stacktrace shapes becomes '$redacted'.
+redact_stack(Stack) when is_list(Stack) ->
+    [redact_frame(Frame) || Frame <- Stack];
+redact_stack(_Other) ->
+    '$redacted'.
+
+redact_frame({M, F, Args, Loc}) when is_list(Args) -> {M, F, length(Args), redact_loc(Loc)};
+redact_frame({M, F, Arity, Loc}) when is_integer(Arity) -> {M, F, Arity, redact_loc(Loc)};
+redact_frame({Fun, Args, Loc}) when is_function(Fun), is_list(Args) ->
+    {Fun, length(Args), redact_loc(Loc)};
+redact_frame({Fun, Arity, Loc}) when is_function(Fun), is_integer(Arity) ->
+    {Fun, Arity, redact_loc(Loc)};
+redact_frame(_Other) ->
+    '$redacted'.
+
+%% Only file and line survive: an error_info entry can carry the offending term.
+redact_loc(Loc) when is_list(Loc) ->
+    [Item || {Key, _} = Item <- Loc, Key =:= file orelse Key =:= line];
+redact_loc(Loc) when is_atom(Loc) ->
+    Loc;
+redact_loc(_Other) ->
+    '$redacted'.
+
+%% The report callback iterates the log, so it stays a list: one marker
+%% entry carrying the count (an empty list if the value is not a list).
+redact_log(Log) when is_list(Log) -> [{log_entries_redacted, length(Log)}];
+redact_log(_Other)                 -> [].
 
 %%%===================================================================
 %%% Circuit breaker logic
@@ -981,10 +1042,26 @@ do_rpc(Method, Request, Tag, Ctx) ->
     },
     Path = <<"/yuzu.gateway.v1.GatewayUpstream/", (atom_to_binary(Method, utf8))/binary>>,
     StartTime = erlang:monotonic_time(millisecond),
-    Result = grpcbox_client:unary(Ctx, Path, Request, Def,
-                                  #{channel => default_channel}),
+    Result = try grpcbox_client:unary(Ctx, Path, Request, Def,
+                                      #{channel => default_channel})
+             catch
+                 %% The stacktrace is dropped on purpose: a frame prints its
+                 %% argument list (the request, with its credentials) in the
+                 %% crash report if this exception reaches the gen_server.
+                 %% Only the class and the redacted reason are kept.
+                 Class:Why ->
+                     {rpc_exception, Class, redact_why(Why)}
+             end,
     Duration = erlang:monotonic_time(millisecond) - StartTime,
     case Result of
+        {rpc_exception, Class1, Why1} ->
+            telemetry:execute([yuzu, gw, upstream, rpc_error],
+                              #{count => 1},
+                              #{rpc_name => atom_to_binary(Tag, utf8),
+                                code => <<"exception">>}),
+            logger:warning("Upstream RPC ~s raised ~p:~p", [Method, Class1, Why1]),
+            {error, {internal, iolist_to_binary(
+                                 io_lib:format("rpc exception ~p:~p", [Class1, Why1]))}};
         {ok, Response, _Headers} ->
             telemetry:execute([yuzu, gw, upstream, rpc_latency],
                               #{duration_ms => Duration},
