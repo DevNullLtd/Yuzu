@@ -18,9 +18,10 @@
  *     persist failure reports CONSTRAINED/PARTIAL `asset_tags:persist_failed`
  *     with truthful rows; then a valid snapshot plus a floored interval load.
  *     Both cycles live in ONE case, in this order, because the interval is a
- *     process-global the second cycle overwrites. Each shutdown() joins the
- *     plugin's 5-second-granularity check thread, so this case costs up to
- *     ~10 s of wall clock and no assertion depends on time.
+ *     process-global the second cycle overwrites. shutdown() wakes the
+ *     plugin's check thread at once (the dedicated shutdown case below pins
+ *     that), so this case runs in milliseconds and no assertion depends on
+ *     time.
  *
  * RUNS ON ALL THREE PLATFORMS unconditionally (the plugin has no per-OS leg).
  */
@@ -35,12 +36,14 @@
 #include "local_dispatcher.hpp"
 #include "test_helpers.hpp"
 
+#include <chrono>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <optional>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -403,4 +406,44 @@ TEST_CASE("asset_tags plugin: init() recovery, persistence and the typed sync st
         CHECK(rows[6] == "check_interval|30"); // floored
         CHECK(rows[7] == "change_count|2");
     }
+}
+
+TEST_CASE("asset_tags plugin: shutdown() wakes the check thread at once, not after its sleep",
+          "[agent][asset_tags_actions][shutdown]") {
+    // The check thread waits out check_interval (default 300s). It used to do that in 5s
+    // sleep_for chunks, so shutdown()'s join() cost up to ~5s. 3s is far above a woken join
+    // (milliseconds) and below that old floor, so sleep-chunking goes red even on a loaded box.
+    auto plugin = load_asset_tags_plugin();
+    if (!plugin) {
+        require_plugin_or_skip();
+        return;
+    }
+
+    yuzu::test::TempDir dir{"yuzu_test_asset_tags_shutdown_"};
+    // 30s is the interval floor. Pinning it means a lost notify fails the CHECK below after ~30s,
+    // instead of hanging for the 300s default until the shard's timeout kills every other case in
+    // the shard with it.
+    yuzu::agent::StandalonePluginContext ctx(
+        "asset_tags", {{"agent.data_dir", dir.path.string()}, {"asset_tags.check_interval", "30"}});
+    REQUIRE(plugin->descriptor->init(ctx.get()) == 0);
+    // shutdown() joins the check thread, so run it on every exit from here, including an unwound
+    // assertion; the timed call below marks it done so the guard does not repeat it.
+    bool shut_down = false;
+    yuzu::test::ScopeExit shutdown_on_exit{[&] {
+        if (!shut_down)
+            plugin->descriptor->shutdown(ctx.get());
+    }};
+
+    // Give the check thread time to reach its wait, so the notify path and not just the
+    // predicate is what runs. This is a head start, not a handshake: if the runner starves the
+    // worker past it, shutdown() stores the flag first, the worker skips the wait, and a deleted
+    // notify_all() goes unnoticed on that run (a handshake needs a production hook, which the
+    // sibling lock-ordering test avoids). shutdown() must return promptly either way.
+    std::this_thread::sleep_for(std::chrono::milliseconds{250});
+
+    const auto t0 = std::chrono::steady_clock::now();
+    plugin->descriptor->shutdown(ctx.get());
+    shut_down = true;
+    const auto elapsed = std::chrono::steady_clock::now() - t0;
+    CHECK(elapsed < std::chrono::seconds{3});
 }
