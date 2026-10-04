@@ -54,8 +54,23 @@ fi
 FRAG_COUNT=$(find changelog.d -maxdepth 1 -name '*.md' ! -name 'README.md' 2>/dev/null | wc -l | tr -d ' ')
 if [ "$FRAG_COUNT" -eq 0 ]; then
     pass "changelog.d/ has no unpromoted fragments"
+    if [ "$VERSION" = "$BASE_VERSION" ]; then
+        # A final release whose RCs already folded every fragment still needs
+        # its own date on the header (#5221); 4b cannot tell, so say it.
+        HEADER=$(grep -m1 "^## \[${BASE_VERSION//./\\.}\]" CHANGELOG.md 2>/dev/null | tr -d '\r' || true)
+        echo "        note: header is '${HEADER:-missing}' — if that is not the release date, run: python3 scripts/assemble-changelog.py promote $BASE_VERSION --append --date YYYY-MM-DD, commit, and re-run preflight"
+    fi
 else
-    fail "changelog.d/ has $FRAG_COUNT unpromoted fragment(s) — run: python3 scripts/assemble-changelog.py promote $BASE_VERSION"
+    if grep -q "^## \[${BASE_VERSION//./\\.}\]" CHANGELOG.md 2>/dev/null; then
+        if [ "$VERSION" = "$BASE_VERSION" ]; then
+            APPEND_DATE=" --date YYYY-MM-DD  (the final release date)"
+        else
+            APPEND_DATE="  (omit --date for an RC; pass it only at the final release)"
+        fi
+        fail "changelog.d/ has $FRAG_COUNT unpromoted fragment(s) and ## [$BASE_VERSION] already exists — run: python3 scripts/assemble-changelog.py promote $BASE_VERSION --append$APPEND_DATE"
+    else
+        fail "changelog.d/ has $FRAG_COUNT unpromoted fragment(s) — run: python3 scripts/assemble-changelog.py promote $BASE_VERSION"
+    fi
 fi
 
 # ── 5. Clean working tree ─────────────────────────────────────────────────

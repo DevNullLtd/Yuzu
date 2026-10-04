@@ -47,7 +47,9 @@ replay_test_() ->
        fun adopted_replay_reannounces_connected/0},
       {"HA WS-4 4.4: a SUPERSEDED replay counts as breaker success and "
        "forces reconnect",
-       fun superseded_replay_forces_reconnect/0}
+       fun superseded_replay_forces_reconnect/0},
+      {"an ADOPTED replay leaves the session binding and routing row unchanged",
+       fun adopted_replay_leaves_session_binding/0}
      ]}.
 
 setup() ->
@@ -279,6 +281,54 @@ adopted_replay_reannounces_connected() ->
                                      <- meck:history(yuzu_gw_agent)],
     ?assert(lists:member({Pid, SessionId}, ReannounceCalls)),
     ?assertEqual(closed, yuzu_gw_upstream:circuit_state()),
+    kill_dummy(Pid).
+
+adopted_replay_leaves_session_binding() ->
+    %% Gateway replay never creates, moves or deletes a heartbeat binding: the
+    %% session row recorded at Subscribe, and the routing row, are the same
+    %% after the upstream client has re-proxied the registration and told the
+    %% agent process to re-announce it.
+    Id  = unique_id(<<"bound">>),
+    Req = agent_req(Id),
+    Pid = spawn_dummy(),
+    SessionId = <<"sess-", Id/binary>>,
+    ok = yuzu_gw_registry:register_agent(Id, Pid, SessionId, [<<"svc">>], <<"host">>,
+                                         Req, conn_a),
+    SessionBefore = yuzu_gw_registry:lookup_session(SessionId),
+    ?assertEqual({ok, #{agent_id => Id, pid => Pid, conn_key => conn_a}}, SessionBefore),
+    RowsBefore = ets:lookup(yuzu_gw_sessions, SessionId),
+    RouteBefore = ets:lookup(yuzu_gw_agents, Id),
+    ?assertMatch([_], RowsBefore),
+    ?assertMatch([_], RouteBefore),
+
+    cause_one_failure(),
+    meck:reset(grpcbox_client),
+    meck:reset(telemetry),
+    meck:expect(grpcbox_client, unary, fun(_, Path, IncomingReq, _, _) ->
+        case binary:match(Path, <<"ProxyRegister">>) of
+            nomatch -> {ok, #{}, #{}};
+            _ ->
+                case IncomingReq of
+                    Req -> {ok, #{session_id => SessionId}, #{}};
+                    _   -> {ok, #{session_id => <<"ok">>}, #{}}
+                end
+        end
+    end),
+    {ok, _} = yuzu_gw_upstream:proxy_register(trigger_req()),
+    ok = wait_for_proxy_register_count(2, 3000), %% trigger + 1 replay
+    %% The replay step has finished once it has reported its own telemetry,
+    %% which it does after the re-announce.
+    ok = wait_until(fun() ->
+        meck:called(telemetry, execute,
+                    [[yuzu, gw, upstream, registration_replay], '_', '_'])
+    end, 3000),
+    ?assert(lists:member({Pid, SessionId},
+                         [{P, S} || {_, {yuzu_gw_agent, reannounce, [P, S]}, _}
+                                        <- meck:history(yuzu_gw_agent)])),
+    ?assert(is_process_alive(whereis(yuzu_gw_upstream))),
+    ?assertEqual(SessionBefore, yuzu_gw_registry:lookup_session(SessionId)),
+    ?assertEqual(RowsBefore, ets:lookup(yuzu_gw_sessions, SessionId)),
+    ?assertEqual(RouteBefore, ets:lookup(yuzu_gw_agents, Id)),
     kill_dummy(Pid).
 
 superseded_replay_forces_reconnect() ->

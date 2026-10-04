@@ -17,6 +17,12 @@
 -include_lib("common_test/include/ct.hrl").
 -include_lib("stdlib/include/assert.hrl").
 
+%% These cases call the agent service handlers in-process (no real
+%% connection), so the connection key heartbeat admission compares is
+%% supplied by a mock of yuzu_gw_conn. Every call "arrives" on this one
+%% connection; sessions that must admit heartbeats are bound to it.
+-define(CONN_KEY, integration_test_connection).
+
 %% CT callbacks
 -export([all/0, groups/0, suite/0,
          init_per_suite/1, end_per_suite/1,
@@ -147,6 +153,10 @@ init_per_suite(Config) ->
         {ok, #{received => true}}
     end),
 
+    %% Connection key for the in-process agent service calls (see ?CONN_KEY).
+    meck:new(yuzu_gw_conn, [passthrough, no_link]),
+    meck:expect(yuzu_gw_conn, key_from_ctx, fun(_Ctx) -> ?CONN_KEY end),
+
     Config.
 
 end_per_suite(_Config) ->
@@ -160,6 +170,7 @@ end_per_suite(_Config) ->
     end,
     %% Unload global mock.
     catch meck:unload(yuzu_gw_upstream),
+    catch meck:unload(yuzu_gw_conn),
     ok.
 
 init_per_group(upstream, Config) ->
@@ -293,10 +304,17 @@ agent_heartbeat_batching(_Config) ->
         ok
     end),
 
+    %% A heartbeat is admitted only for a session this node holds, on the
+    %% connection that opened it: hold a live session bound to ?CONN_KEY.
+    Holder = spawn(fun() -> receive stop -> ok end end),
+    ok = yuzu_gw_registry:register_agent(<<"integration-hb-agent">>, Holder,
+                                         <<"sess-1">>, [], <<>>, #{}, ?CONN_KEY),
+
     Ctx = ctx:background(),
     HbReq = #{session_id => <<"sess-1">>},
 
     {ok, Response, _} = yuzu_gw_agent_service:heartbeat(Ctx, HbReq),
+    Holder ! stop,
 
     ?assertEqual(true, maps:get(acknowledged, Response)),
     ?assert(is_map(maps:get(server_time, Response))),
@@ -516,16 +534,31 @@ mgmt_get_agent(_Config) ->
 %%%===================================================================
 
 upstream_register_error_handling(Config) ->
-    %% Test error handling when upstream returns failure.
+    %% Test error handling when upstream returns a real gRPC status.
+    %%
+    %% #4708 contract decision: the GATEWAY side is authoritative. A genuine
+    %% (non-transport) gRPC status reaches yuzu_gw_upstream:do_rpc/4 in
+    %% grpcbox_client:unary/5's REAL shape -- `{error, {Status, Message},
+    %% Trailers}`, Status being the raw `grpc-status` trailer as a binary
+    %% digit string (grpcbox_stream:grpc_error_response()) -- and do_rpc
+    %% surfaces it UNWRAPPED as `{error, {Status, Message}}`, which is what
+    %% callers such as do_replay_one/6's FAILED_PRECONDITION branch match
+    %% on. `{error, {internal, Bin}}` is reserved for transport-level
+    %% `{error, Reason}` and HTTP-layer errors. This mock previously returned
+    %% `{error, {14, <<"UNAVAILABLE">>, #{}}}`, a shape grpcbox never
+    %% produces, so it fell through to the transport arm; HA WS-4 4.4
+    %% (e0e4f6a17) corrected the eunit twin (yuzu_gw_upstream_tests
+    %% proxy_register_error) but this CT copy was hidden by #4800 (the ct
+    %% gate ran zero suites).
     meck:expect(grpcbox_client, unary, fun(_, Path, _, _, _) ->
         case binary:match(Path, <<"ProxyRegister">>) of
             nomatch -> {ok, #{}, #{}};
-            _ -> {error, {14, <<"UNAVAILABLE">>, #{}}}
+            _ -> {error, {<<"14">>, <<"UNAVAILABLE">>}, #{}}
         end
     end),
 
     Result = yuzu_gw_upstream:proxy_register(#{info => #{}}),
-    ?assertMatch({error, {14, _}}, Result),
+    ?assertEqual({error, {<<"14">>, <<"UNAVAILABLE">>}}, Result),
     Config.
 
 upstream_batch_heartbeat_flush(Config) ->

@@ -1,4 +1,4 @@
-captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-29 · euid 501 (ambient FDA, NOT the production agent identity -- see leg banner; account names replaced with jsmith) · leg-hash 9b1bec4e5ba4
+captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-29 · euid 501 (ambient FDA, NOT the production agent identity -- see leg banner; account names replaced with jsmith) · leg-hash 6f22f62118ed
 == action=permissions
 permissions|macos|-|camera|absent|-|-|-
 permissions|macos|-|microphone|absent|-|-|-

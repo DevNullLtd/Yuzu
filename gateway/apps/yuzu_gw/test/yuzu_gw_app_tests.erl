@@ -81,3 +81,41 @@ cookie_one_below_minimum_length_rejected_test() ->
 override_allows_short_custom_cookie_test() ->
     ?assertEqual(ok,
         yuzu_gw_app:evaluate_cookie('yuzu_gw1@127.0.0.1', 'too_short_cookie', true)).
+
+%%%===================================================================
+%%% Boot wiring: the heartbeat-rejection summary state (#3869)
+%%%===================================================================
+
+%% yuzu_gw_app:start/2 must create the summary-log state before it starts the
+%% metrics listener and the supervision tree. Nothing else boots the app, so
+%% without this a deleted or reordered init_summary_state/0 call is invisible
+%% (the lazy path in yuzu_gw_heartbeat_admission hides it). The listener and
+%% supervisor are replaced by recorders so no port or process is started; each
+%% recorder notes whether the state already existed at the moment it ran.
+boot_creates_summary_state_before_listener_and_sup_test() ->
+    Key = {yuzu_gw_heartbeat_admission, summary_state},
+    Mods = [yuzu_gw_telemetry, prometheus_httpd, yuzu_gw_sup],
+    persistent_term:erase(Key),
+    %% rebar3 runs eunit on a named node with a short cookie.
+    PrevCookieFlag = os:getenv("YUZU_GW_ALLOW_DEFAULT_COOKIE"),
+    os:putenv("YUZU_GW_ALLOW_DEFAULT_COOKIE", "1"),
+    ok = meck:new(Mods, [non_strict, no_link]),
+    Self = self(),
+    Note = fun(Tag) ->
+               Self ! {booted, Tag, persistent_term:get(Key, undefined) =/= undefined}
+           end,
+    try
+        meck:expect(yuzu_gw_telemetry, setup, fun() -> ok end),
+        meck:expect(prometheus_httpd, start, fun() -> Note(listener), {ok, self()} end),
+        meck:expect(yuzu_gw_sup, start_link, fun() -> Note(supervisor), {ok, self()} end),
+        ?assertMatch({ok, _}, yuzu_gw_app:start(normal, [])),
+        ?assertEqual(true, receive {booted, listener, S1} -> S1 after 0 -> missing end),
+        ?assertEqual(true, receive {booted, supervisor, S2} -> S2 after 0 -> missing end)
+    after
+        meck:unload(Mods),
+        case PrevCookieFlag of
+            false -> os:unsetenv("YUZU_GW_ALLOW_DEFAULT_COOKIE");
+            Prev  -> os:putenv("YUZU_GW_ALLOW_DEFAULT_COOKIE", Prev)
+        end,
+        persistent_term:erase(Key)
+    end.

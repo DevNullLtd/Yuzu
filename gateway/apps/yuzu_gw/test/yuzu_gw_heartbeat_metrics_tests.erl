@@ -83,8 +83,11 @@ drain_buffer() ->
     meck:expect(grpcbox_client, unary, fun(_, _, _, _, _) ->
         {ok, #{acknowledged_count => 0}, #{}}
     end),
-    whereis(yuzu_gw_heartbeat_buffer) ! flush,
-    timer:sleep(50),
+    Pid = whereis(yuzu_gw_heartbeat_buffer),
+    Pid ! flush,
+    %% Barrier, not a sleep: the reply proves the drain flush was handled
+    %% before meck history is reset (see flush_and_await/0).
+    _ = sys:get_state(Pid),
     meck:reset(grpcbox_client).
 
 %% Extract all BatchHeartbeat request maps from meck history.
@@ -92,6 +95,34 @@ batch_requests() ->
     Calls = meck:history(grpcbox_client),
     [Req || {_, {grpcbox_client, unary, [_, Path, Req, _, _]}, _} <- Calls,
             binary:match(Path, <<"BatchHeartbeat">>) =/= nomatch].
+
+%% Send the buffer a `flush` and wait until its BatchHeartbeat RPC is visible
+%% in meck history; returns batch_requests(). Replaces `! flush` followed by a
+%% fixed `timer:sleep(100)`, which is an UPPER-bound race on a loaded runner
+%% (#4851 runs this suite on macOS CI for the first time; BigMags shares its
+%% CPU between two agents, and a fixed sleep has already flaked twice there).
+%% Two waits are needed. sys:get_state/1 is a system message queued behind
+%% `flush`, so its reply proves the flush handler, and the RPC inside it, has
+%% run (and fails the test here if the handler crashed). meck then records the
+%% call with an async cast to its own process, so history is polled every 10ms
+%% up to a 2s deadline. The callers only claim "the flush sent this batch", so
+%% the deadline changes nothing they assert.
+flush_and_await() ->
+    Pid = whereis(yuzu_gw_heartbeat_buffer),
+    Pid ! flush,
+    _ = sys:get_state(Pid),
+    await_batches(erlang:monotonic_time(millisecond) + 2000).
+
+await_batches(Deadline) ->
+    case batch_requests() of
+        [] ->
+            case erlang:monotonic_time(millisecond) >= Deadline of
+                true -> [];
+                false -> timer:sleep(10), await_batches(Deadline)
+            end;
+        Batches ->
+            Batches
+    end.
 
 %% Set up the unary mock so BatchHeartbeat succeeds and returns ack count.
 mock_batch_success() ->
@@ -117,10 +148,7 @@ tags_preserved() ->
     timer:sleep(20),
 
     %% Trigger flush.
-    whereis(yuzu_gw_heartbeat_buffer) ! flush,
-    timer:sleep(100),
-
-    Batches = batch_requests(),
+    Batches = flush_and_await(),
     ?assert(length(Batches) > 0),
     [BatchReq | _] = Batches,
     HBs = maps:get(heartbeats, BatchReq, []),
@@ -160,10 +188,7 @@ multi_agent_tags() ->
     yuzu_gw_heartbeat_buffer:queue_heartbeat(HB3),
     timer:sleep(20),
 
-    whereis(yuzu_gw_heartbeat_buffer) ! flush,
-    timer:sleep(100),
-
-    Batches = batch_requests(),
+    Batches = flush_and_await(),
     ?assert(length(Batches) > 0),
     [BatchReq | _] = Batches,
     HBs = maps:get(heartbeats, BatchReq, []),
@@ -190,17 +215,13 @@ tags_survive_failure() ->
     meck:expect(grpcbox_client, unary, fun(_, _, _, _, _) ->
         {error, connection_refused}
     end),
-    whereis(yuzu_gw_heartbeat_buffer) ! flush,
-    timer:sleep(100),
+    _ = flush_and_await(),
 
     %% Now make flush succeed and retry.
     meck:reset(grpcbox_client),
     mock_batch_success(),
 
-    whereis(yuzu_gw_heartbeat_buffer) ! flush,
-    timer:sleep(100),
-
-    Batches = batch_requests(),
+    Batches = flush_and_await(),
     ?assert(length(Batches) > 0),
     [BatchReq | _] = Batches,
     HBs = maps:get(heartbeats, BatchReq, []),
@@ -232,8 +253,7 @@ real_grpc_status_error_does_not_crash() ->
     meck:expect(grpcbox_client, unary, fun(_, _, _, _, _) ->
         {error, {<<"8">>, <<"RESOURCE_EXHAUSTED">>}, #{}}
     end),
-    whereis(yuzu_gw_heartbeat_buffer) ! flush,
-    timer:sleep(100),
+    _ = flush_and_await(),
 
     %% The process must still be alive (no case_clause crash) and the
     %% buffer must still hold the heartbeat, exactly like the
@@ -244,10 +264,7 @@ real_grpc_status_error_does_not_crash() ->
 
     meck:reset(grpcbox_client),
     mock_batch_success(),
-    Pid ! flush,
-    timer:sleep(100),
-
-    Batches = batch_requests(),
+    Batches = flush_and_await(),
     ?assert(length(Batches) > 0),
     [BatchReq | _] = Batches,
     HBs = maps:get(heartbeats, BatchReq, []),
@@ -269,8 +286,7 @@ http_error_shape_does_not_crash() ->
     meck:expect(grpcbox_client, unary, fun(_, _, _, _, _) ->
         {http_error, {502, <<>>}, #{}}
     end),
-    whereis(yuzu_gw_heartbeat_buffer) ! flush,
-    timer:sleep(100),
+    _ = flush_and_await(),
 
     Pid = whereis(yuzu_gw_heartbeat_buffer),
     ?assert(is_pid(Pid)),
@@ -278,10 +294,7 @@ http_error_shape_does_not_crash() ->
 
     meck:reset(grpcbox_client),
     mock_batch_success(),
-    Pid ! flush,
-    timer:sleep(100),
-
-    Batches = batch_requests(),
+    Batches = flush_and_await(),
     ?assert(length(Batches) > 0),
     [BatchReq | _] = Batches,
     HBs = maps:get(heartbeats, BatchReq, []),
@@ -297,10 +310,7 @@ empty_tags_valid() ->
     yuzu_gw_heartbeat_buffer:queue_heartbeat(HB),
     timer:sleep(20),
 
-    whereis(yuzu_gw_heartbeat_buffer) ! flush,
-    timer:sleep(100),
-
-    Batches = batch_requests(),
+    Batches = flush_and_await(),
     ?assert(length(Batches) > 0),
     [BatchReq | _] = Batches,
     HBs = maps:get(heartbeats, BatchReq, []),
@@ -317,10 +327,7 @@ tags_are_maps() ->
     yuzu_gw_heartbeat_buffer:queue_heartbeat(HB),
     timer:sleep(20),
 
-    whereis(yuzu_gw_heartbeat_buffer) ! flush,
-    timer:sleep(100),
-
-    Batches = batch_requests(),
+    Batches = flush_and_await(),
     ?assert(length(Batches) > 0),
     [BatchReq | _] = Batches,
     HBs = maps:get(heartbeats, BatchReq, []),

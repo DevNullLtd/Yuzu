@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # sanitizer-gate.sh — Phase 6 of the /test pipeline (PR2).
 #
-# Dispatches .github/workflows/sanitizer-tests.yml on the yuzu-wsl2-linux
-# self-hosted runner, polls for completion, downloads the logs, and parses
+# Dispatches .github/workflows/sanitizer-tests.yml on the yuzu-bigtam-linux
+# self-hosted runner pool, polls for completion, downloads the logs, and parses
 # ASan+UBSan and TSan results into two gate rows in the test-runs DB:
 #
 #   gate_name="Sanitizers (ASan+UBSan)"   phase=6
@@ -127,7 +127,7 @@ bash "$HERE/dispatch-runner-job.sh" \
     --out-dir "$OUT_DIR" \
     --inputs "$INPUTS_JSON" \
     --timeout-minutes "$TIMEOUT_MINUTES" \
-    --expect-runner yuzu-wsl2-linux \
+    --expect-runner yuzu-bigtam-linux \
     >"$DISPATCH_LOG" 2>&1
 DISPATCH_RC=$?
 set -e
@@ -192,7 +192,7 @@ case $DISPATCH_RC in
         exit 1
         ;;
     3)
-        NOTE="runner offline or dispatch timed out — retry with /test --full when yuzu-wsl2-linux is back"
+        NOTE="runner offline or dispatch timed out — retry with /test --full when the yuzu-bigtam-linux pool is back"
         echo "sanitizer-gate: runner unavailable → WARN"
         if [[ "$SUITE" == "asan" || "$SUITE" == "both" ]]; then
             write_gate "Sanitizers (ASan+UBSan)" WARN "$DISPATCH_DUR" "$NOTE" "sanitizer-dispatch.log"
