@@ -33,9 +33,10 @@
 %%% connection, one row per live session and one per agent with a pending or
 %%% reserved session. A repeated Register of one agent id SUPERSEDES that agent's
 %%% older pending rows on the connection (the live supersede does the same to the
-%%% live row), so one agent holds at most one pending row and one live row and a
-%%% connection holds at most cap+1 rows (the agent being registered keeps its live
-%%% row until its Subscribe replaces it). A Register repeated with one id and no
+%%% live row), so one agent holds at most one pending row and one live row and the
+%%% counted slots of a connection stay within the cap (the agent being registered
+%%% also keeps its own live and committed rows, which are not counted, until its
+%%% Subscribe replaces them). A Register repeated with one id and no
 %%% Subscribe therefore never grows the pending table. The exception is a Register
 %%% still in flight: each reservation is a slot of its own, the registering
 %%% agent's other reservations included (only its live row and its committed
