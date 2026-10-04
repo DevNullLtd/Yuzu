@@ -30,6 +30,10 @@
 -define(DEFAULT_TIMEOUT_S, 300).
 -define(MIN_TIMEOUT_S, 1).
 -define(MAX_TIMEOUT_S, 3600).
+%% An invalid configured default is warned about at most this often per process
+%% (monotonic ms): it is read on every command that sends no timeout of its own.
+-define(DEFAULT_WARN_INTERVAL_MS, 60000).
+-define(DEFAULT_WARN_KEY, {?MODULE, default_timeout_warned_at}).
 
 -record(fanout, {
     from         :: pid(),              %% caller (mgmt service handler)
@@ -217,8 +221,34 @@ command_timeout_s(Opts) ->
     case is_map(Opts) andalso maps:get(timeout_seconds, Opts, undefined) of
         N when is_integer(N), N > ?MAX_TIMEOUT_S -> ?MAX_TIMEOUT_S;
         N when is_integer(N), N >= ?MIN_TIMEOUT_S -> N;
-        _ -> yuzu_gw_env:env_int(default_command_timeout_s, ?DEFAULT_TIMEOUT_S,
-                                 ?MIN_TIMEOUT_S, ?MAX_TIMEOUT_S)
+        _ -> default_timeout_s()
+    end.
+
+%% The configured default_command_timeout_s. A value that is not an integer in
+%% range takes ?DEFAULT_TIMEOUT_S, with one WARN per minute naming the key (this
+%% is read on every command that sends no timeout of its own, so the unthrottled
+%% warning of yuzu_gw_env:env_int/4 would log once per command).
+-spec default_timeout_s() -> pos_integer().
+default_timeout_s() ->
+    case application:get_env(yuzu_gw, default_command_timeout_s, ?DEFAULT_TIMEOUT_S) of
+        V when is_integer(V), V >= ?MIN_TIMEOUT_S, V =< ?MAX_TIMEOUT_S ->
+            V;
+        _Bad ->
+            warn_invalid_default(),
+            ?DEFAULT_TIMEOUT_S
+    end.
+
+%% The stamp lives in the process dictionary of the process that reads the key
+%% (the router).
+warn_invalid_default() ->
+    Now = erlang:monotonic_time(millisecond),
+    case get(?DEFAULT_WARN_KEY) of
+        Last when is_integer(Last), Now - Last < ?DEFAULT_WARN_INTERVAL_MS ->
+            ok;
+        _ ->
+            put(?DEFAULT_WARN_KEY, Now),
+            logger:warning("Invalid default_command_timeout_s value (expected an integer in "
+                           "~b..~b); using ~b", [?MIN_TIMEOUT_S, ?MAX_TIMEOUT_S, ?DEFAULT_TIMEOUT_S])
     end.
 
 %% What OTP prints for this process in a terminate or crash report and in

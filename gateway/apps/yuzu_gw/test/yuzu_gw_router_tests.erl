@@ -9,6 +9,9 @@
 -module(yuzu_gw_router_tests).
 -include_lib("eunit/include/eunit.hrl").
 
+-export([log/2]).  %% logger handler callback, see invalid_default_warns_once/0
+-define(LOG_HANDLER, yuzu_router_test_log).
+
 %%%===================================================================
 %%% Test fixture
 %%%===================================================================
@@ -30,7 +33,9 @@ router_test_() ->
       {"a huge timeout is clamped to 3600 seconds",
        fun huge_timeout_is_clamped/0},
       {"command_timeout_s: valid kept, out of range or not an integer replaced",
-       fun command_timeout_rules/0}
+       fun command_timeout_rules/0},
+      {"an invalid default_command_timeout_s warns once, naming the key, however many commands use it",
+       fun invalid_default_warns_once/0}
      ]}.
 
 setup() ->
@@ -201,6 +206,41 @@ command_timeout_rules() ->
     application:unset_env(yuzu_gw, default_command_timeout_s),
     ?assertEqual(300, yuzu_gw_router:command_timeout_s(#{})),
     application:set_env(yuzu_gw, default_command_timeout_s, 5).
+
+%% The default is read on every command that sends no timeout: an invalid one
+%% must not log once per command. One WARN names the key and the commands still
+%% run with the default.
+invalid_default_warns_once() ->
+    RouterPid = whereis(yuzu_gw_router),
+    {AgentPid, AgentId} = register_fake_agent(<<"idw-1">>),
+    Table = ets:new(router_test_log, [public, ordered_set]),
+    catch logger:remove_handler(?LOG_HANDLER),
+    ok = logger:add_handler(?LOG_HANDLER, ?MODULE, #{config => #{table => Table}, level => all}),
+    try
+        with_default_timeout(0, fun() ->
+            [begin
+                 {ok, Ref} = yuzu_gw_router:send_command([AgentId], #{command_id => <<"c">>}, #{}),
+                 Ms = fanout_timer_ms(RouterPid, Ref),
+                 ?assert(Ms > 299000 andalso Ms =< 300000)
+             end || _ <- lists:seq(1, 5)]
+        end),
+        Lines = [T || {_, T} <- ets:tab2list(Table),
+                      binary:match(T, <<"default_command_timeout_s">>) =/= nomatch],
+        ?assertEqual(1, length(Lines))
+    after
+        logger:remove_handler(?LOG_HANDLER),
+        ets:delete(Table),
+        kill_fake(AgentPid)
+    end.
+
+%% logger handler callback: WARN and above, as text.
+log(#{level := Level} = Event, #{config := #{table := Table}}) when Level =:= warning;
+                                                                    Level =:= error ->
+    Text = unicode:characters_to_binary(logger_formatter:format(Event, #{})),
+    catch ets:insert(Table, {erlang:unique_integer([monotonic]), Text}),
+    ok;
+log(_Event, _Config) ->
+    ok.
 
 fanout_all_respond() ->
     Agents = [register_fake_agent(iolist_to_binary(io_lib:format("far-~b", [I])))
