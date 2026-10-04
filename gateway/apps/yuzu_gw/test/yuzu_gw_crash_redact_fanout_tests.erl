@@ -1,13 +1,17 @@
 %%%-------------------------------------------------------------------
-%%% @doc Tests for the crash-report redaction of yuzu_gw_router (#1197): its
-%%% mailbox holds SendCommand requests, whose plugin parameters can be secrets.
-%%% (The registration holders are in yuzu_gw_crash_redact_holders_tests and the
-%%% upstream in yuzu_gw_crash_redact_tests.)
+%%% @doc Tests for the crash-report redaction of yuzu_gw_router (#1197), whose
+%%% mailbox holds SendCommand requests with plugin parameters that can be
+%%% secrets, and of yuzu_gw_heartbeat_buffer, which holds every buffered
+%%% heartbeat (status tags, fleet snapshots). (The registration holders are in
+%%% yuzu_gw_crash_redact_holders_tests and the upstream in
+%%% yuzu_gw_crash_redact_tests.)
 %%%
-%%% The real router runs under a real supervisor and is suspended; calls that
-%%% carry a marker in their command parameters are queued in its mailbox behind
-%%% one that makes it crash (a command that is not a map, which raises inside
-%%% the router with the request in the stacktrace arguments). A capturing logger
+%%% The real process runs under a real supervisor and is suspended; messages
+%%% that carry a marker are queued in its mailbox behind one that makes it crash
+%%% (for the router a command that is not a map, which raises inside it with the
+%%% request in the stacktrace arguments; for the buffer a state no clause
+%%% matches, which raises with the heartbeat and the real state in the
+%%% stacktrace arguments). A capturing logger
 %%% handler records every event after the primary filters ran; each is rendered
 %%% with the default formatter and with ~p, and none may contain a marker.
 %%%
@@ -26,7 +30,12 @@
 -define(M_QUEUED, <<"MARKER-queued-command-param-6d21">>).
 -define(M_QUEUED2, <<"MARKER-queued-command-param-b7e4">>).
 -define(M_LAST, <<"MARKER-failing-command-param-c9a0">>).
--define(MARKERS, [?M_QUEUED, ?M_QUEUED2, ?M_LAST]).
+-define(M_TAG,   <<"MARKER-heartbeat-tag-4f2c">>).
+-define(M_TAG2,  <<"MARKER-heartbeat-tag-9d1e">>).
+-define(M_TAG3,  <<"MARKER-heartbeat-tag-a05b">>).
+-define(ROUTER_MARKERS, [?M_QUEUED, ?M_QUEUED2, ?M_LAST]).
+-define(BUFFER_MARKERS, [?M_TAG, ?M_TAG2, ?M_TAG3]).
+-define(MARKERS, (?ROUTER_MARKERS ++ ?BUFFER_MARKERS)).
 
 redact_test_() ->
     {foreach,
@@ -38,11 +47,16 @@ redact_test_() ->
       {"router: the same crash without the filter leaks them (control)",
        fun router_crash_without_filter_leaks_control/0},
       {"router: sys:get_status shows counts only, sys:get_state still the real record",
-       fun router_get_status_redacted/0}
+       fun router_get_status_redacted/0},
+      {"heartbeat buffer: a crash with heartbeats queued leaks no tag through the filter",
+       fun buffer_crash_is_redacted_through_the_installed_filter/0},
+      {"heartbeat buffer: the same crash without the filter leaks them (control)",
+       fun buffer_crash_without_filter_leaks_control/0}
      ]}.
 
 setup() ->
     stop_named(yuzu_gw_router),
+    stop_named(yuzu_gw_heartbeat_buffer),
     ok = yuzu_gw_crash_redact:remove(),
     Level = maps:get(level, logger:get_primary_config()),
     logger:set_primary_config(level, notice),
@@ -58,6 +72,7 @@ cleanup({Level, Agent}) ->
     logger:set_primary_config(level, Level),
     Agent ! stop,
     stop_named(yuzu_gw_router),
+    stop_named(yuzu_gw_heartbeat_buffer),
     case whereis(?SUP) of
         undefined -> ok;
         Sup -> catch unlink(Sup), catch exit(Sup, kill)
@@ -88,18 +103,40 @@ router_crash_without_filter_leaks_control() ->
     Events = crash_router(),
     Text = iolist_to_binary([[formatted(E), raw(E)] || E <- Events]),
     %% The mailbox (both queued commands) and the failing command in the frames.
-    [?assert(contains(Text, M)) || M <- ?MARKERS].
+    [?assert(contains(Text, M)) || M <- ?ROUTER_MARKERS].
 
 router_get_status_redacted() ->
     {ok, Pid} = start_router(),
     {ok, _} = yuzu_gw_router:send_command([<<"redact-a-1">>],
         #{plugin => <<"p">>, parameters => #{<<"pw">> => ?M_LAST}}, #{}),
     Status = iolist_to_binary(io_lib:format("~0p", [sys:get_status(Pid)])),
-    [?assertNot(contains(Status, M)) || M <- ?MARKERS],
+    [?assertNot(contains(Status, M)) || M <- ?ROUTER_MARKERS],
     ?assert(contains(Status, <<"fanouts">>)),
     %% Only the report is redacted: the process still holds the real record.
     ?assertMatch({state, #{}}, sys:get_state(Pid)),
     ?assertEqual(1, map_size(element(2, sys:get_state(Pid)))).
+
+buffer_crash_is_redacted_through_the_installed_filter() ->
+    ok = yuzu_gw_crash_redact:install(),
+    Events = crash_buffer(),
+    ?assertMatch([_], by_label(Events, {proc_lib, crash})),
+    ?assertMatch([_], by_label(Events, {gen_server, terminate})),
+    ?assertMatch([_], by_label(Events, {supervisor, child_terminated})),
+    assert_no_markers(Events),
+    [Crash] = by_label(Events, {proc_lib, crash}),
+    CrashText = formatted(Crash),
+    %% The diagnosis survives: what failed, where, and how much was queued.
+    ?assert(contains(CrashText, <<"function_clause">>)),
+    ?assert(contains(CrashText, <<"enqueue">>)),
+    ?assert(contains(CrashText, <<"{redacted,2}">>)).
+
+buffer_crash_without_filter_leaks_control() ->
+    ?assertEqual(false, has_filter()),
+    Events = crash_buffer(),
+    Text = iolist_to_binary([[formatted(E), raw(E)] || E <- Events]),
+    %% The mailbox (two queued heartbeats), the failing heartbeat and the real
+    %% state, in the frames.
+    [?assert(contains(Text, M)) || M <- ?BUFFER_MARKERS].
 
 %%%===================================================================
 %%% Scenario
@@ -124,6 +161,30 @@ crash_router() ->
                     wait_queue_len(Pid, N),
                     N + 1
                 end, 1, Calls),
+    ok = sys:resume(Pid),
+    collect([{proc_lib, crash}, {gen_server, terminate}, {supervisor, child_terminated}]).
+
+%% Crash the real heartbeat buffer: one heartbeat is buffered (it is in the real
+%% state), the state is then replaced by a term no clause matches that wraps the
+%% real one, and two more heartbeats are queued behind the one that fails.
+crash_buffer() ->
+    capture_to_self(),
+    {ok, Sup} = supervisor:start_link({local, ?SUP}, ?MODULE, []),
+    unlink(Sup),
+    {ok, Pid} = supervisor:start_child(?SUP, #{id => yuzu_gw_heartbeat_buffer,
+                                               start => {yuzu_gw_heartbeat_buffer, start_link, []},
+                                               restart => temporary}),
+    Hb = fun(Sid, M) -> #{session_id => Sid, status_tags => #{<<"k">> => M}} end,
+    yuzu_gw_heartbeat_buffer:queue_heartbeat(Hb(<<"s-buffered">>, ?M_TAG3)),
+    Real = sys:get_state(Pid),
+    ok = sys:suspend(Pid),
+    _ = sys:replace_state(Pid, fun(_) -> {garbage, Real} end),
+    lists:foldl(fun(Msg, N) ->
+                    yuzu_gw_heartbeat_buffer:queue_heartbeat(Msg),
+                    wait_queue_len(Pid, N),
+                    N + 1
+                end, 1, [Hb(<<"s-failing">>, ?M_TAG), Hb(<<"s-q1">>, ?M_TAG2),
+                         Hb(<<"s-q2">>, ?M_TAG2)]),
     ok = sys:resume(Pid),
     collect([{proc_lib, crash}, {gen_server, terminate}, {supervisor, child_terminated}]).
 

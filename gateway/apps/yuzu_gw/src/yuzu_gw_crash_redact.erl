@@ -8,7 +8,10 @@
 %%%   - yuzu_gw_agent (one per connected agent): the stored `register_req';
 %%%   - yuzu_gw_registry: the `register' call that stores it.
 %%% yuzu_gw_router is protected for other data: it is sent the SendCommand
-%%% request (plugin parameters, which may be secrets).
+%%% request (plugin parameters, which may be secrets). So is
+%%% yuzu_gw_heartbeat_buffer: its mailbox and, in a crash, the stacktrace
+%%% arguments hold buffered heartbeats (status tags and fleet snapshots:
+%%% telemetry, not credentials).
 %%% Each has a format_status/1 that redacts what OTP passes through that
 %%% callback, but three things reach the log from raw data outside it:
 %%%   - the `messages' (the whole mailbox) and the `error_info' exception of
@@ -54,11 +57,11 @@
 -define(FILTER_ID, yuzu_gw_crash_redact).
 -define(UPSTREAM, yuzu_gw_upstream).
 %% The modules whose processes are protected: the callback modules of the
-%% upstream client, the agent state machine, the registry and the command router
+%% upstream client, the agent state machine, the registry, the command router
 %% (its mailbox holds SendCommand requests, whose plugin parameters may be
-%% secrets).
+%% secrets) and the heartbeat buffer (fleet telemetry: status tags and snapshots).
 -define(PROTECTED, [yuzu_gw_upstream, yuzu_gw_agent, yuzu_gw_registry,
-                    yuzu_gw_router]).
+                    yuzu_gw_router, yuzu_gw_heartbeat_buffer]).
 
 %% @doc Add the primary filter. Idempotent: already present is success.
 -spec install() -> ok.
