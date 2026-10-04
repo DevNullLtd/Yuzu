@@ -40,14 +40,14 @@
 %%% ?MAX_CHUNKS_PER_FLUSH of them (about 24 MiB): the rest stays buffered for
 %%% the next cycle, so a long backlog drains over several cycles and one flush
 %%% never blocks this process for long. A chunk that the server accepted is
-%%% removed. On a transient
-%%% failure (the server unreachable, a timeout, an exception out of the RPC, any
-%%% status not named below) that chunk and every later one are retained for the
-%%% next flush cycle and the flush stops. On a non-transient refusal
-%%% (RESOURCE_EXHAUSTED or INVALID_ARGUMENT) a chunk of one heartbeat is dropped
-%%% as chunk_rejected and the flush goes on; a chunk of several is split in
-%%% halves and each half is sent again in the same flush, so the heartbeat the
-%%% server will not take is found and dropped without holding back the others.
+%%% removed. On a transient failure (the server unreachable, a timeout, an
+%%% exception out of the RPC, any status not named below) that chunk and every
+%%% later one are retained for the next flush cycle and the flush stops. On a
+%%% non-transient refusal (RESOURCE_EXHAUSTED or INVALID_ARGUMENT) a chunk of
+%%% one heartbeat is dropped as chunk_rejected and the flush goes on; a chunk of
+%%% several is split in halves and each half is sent again in the same flush, so
+%%% the heartbeat the server will not take is found and dropped without holding
+%%% back the others.
 %%% One flush makes at most ?MAX_RPCS_PER_FLUSH RPCs, those retries included;
 %%% what is left stays buffered. An exception out of the RPC (a heartbeat the
 %%% encoder raises on, an exit of the HTTP/2 connection) never crashes this
@@ -611,8 +611,9 @@ pack([{_, _, Bytes} = E | Rest], Cur, CurBytes, Done)
 pack([{_, _, Bytes} = E | Rest], Cur, CurBytes, Done) ->
     pack(Rest, [E | Cur], CurBytes + Bytes, Done).
 
-%% @doc Send the first ?MAX_CHUNKS_PER_FLUSH chunks in order. A chunk the server accepted has its verdict
-%% consumed (once) and its sessions removed from the buffer. What happens on a
+%% @doc Send the first ?MAX_CHUNKS_PER_FLUSH chunks in order. A chunk the server
+%% accepted has its verdict consumed (once) and its sessions removed from the
+%% buffer. What happens on a
 %% failure depends on its class (see the module doc and classify/1); a
 %% transient one ends the flush with {error, Reason}, the failed chunk and the
 %% unsent ones staying buffered. The last element of the result is whether the
