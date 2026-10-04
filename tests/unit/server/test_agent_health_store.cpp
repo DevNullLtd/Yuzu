@@ -27,6 +27,7 @@
  */
 
 #include "agent_registry.hpp"     // the REAL AgentHealthStore (detail namespace)
+#include "inventory_sync_fleet_tags.hpp" // #5332 skip_streak parser
 #include "network_perf_rules.hpp" // SHIPPED net-fact validators (no parallel repro)
 #include "spark_fleet_tags.hpp"   // SHIPPED spark helpers (no parallel repro)
 #include "tar_corruption_audit.hpp" // #1567 SHIPPED audit gate + tag keys
@@ -1944,6 +1945,54 @@ TEST_CASE("REAL AgentHealthStore: yuzu_fleet_plugin_init_failed is per plugin, c
         many.remove("agent" + std::to_string(i));
     many.recompute_metrics(m2, std::chrono::seconds{300});
     CHECK(m2.serialize().find("yuzu_fleet_plugin_init_failed{") == std::string::npos);
+}
+
+// ── #5332: daily-sync skip fleet gauge (REAL store) ───────────────────────────
+
+TEST_CASE("REAL AgentHealthStore: yuzu_fleet_inventory_sync_skipping counts valid streaks > 0",
+          "[health_store][sync][skip][real]") {
+    AgentHealthStore store;
+    yuzu::MetricsRegistry metrics;
+    const std::string k = yuzu::server::detail::sync_skip_streak_tag("installed_software");
+    const char* const gauge = "yuzu_fleet_inventory_sync_skipping{source=\"installed_software\"} ";
+    beat_tags(store, "a", {{k, "2"}});
+    beat_tags(store, "b", {{k, "1"}});
+    beat_tags(store, "c", {{k, "0"}});
+    beat_tags(store, "d", {});
+    beat_tags(store, "e", {{k, "abc"}});
+    beat_tags(store, "f", {{k, "-1"}});
+    beat_tags(store, "g", {{k, "1234567"}});
+    beat_tags(store, "h", {{k, ""}});
+    store.recompute_metrics(metrics, std::chrono::seconds{300});
+    CHECK(series_val(metrics.serialize(), gauge) == 2.0);
+
+    // (d) remove() then recount.
+    store.remove("a");
+    store.recompute_metrics(metrics, std::chrono::seconds{300});
+    CHECK(series_val(metrics.serialize(), gauge) == 1.0);
+
+    // (c) staleness prunes the skipping agent: 0 s window drops every snapshot.
+    store.recompute_metrics(metrics, std::chrono::seconds{0});
+    CHECK(series_val(metrics.serialize(), gauge) == 0.0);
+}
+
+TEST_CASE("REAL AgentHealthStore: yuzu_fleet_inventory_sync_skipping is published at 0",
+          "[health_store][sync][skip][real]") {
+    AgentHealthStore store;
+    yuzu::MetricsRegistry metrics;
+    beat_tags(store, "a", {});
+    store.recompute_metrics(metrics, std::chrono::seconds{300});
+    CHECK(series_val(metrics.serialize(),
+                     "yuzu_fleet_inventory_sync_skipping{source=\"installed_software\"} ") == 0.0);
+}
+
+TEST_CASE("parse_sync_skip_streak: digits only, 1-6 chars, value > 0",
+          "[health_store][sync][skip][real]") {
+    using yuzu::server::detail::parse_sync_skip_streak;
+    for (const char* ok : {"1", "2", "999999", "007", "100000"})
+        CHECK(parse_sync_skip_streak(ok));
+    for (const char* bad : {"0", "", " 1", "1 ", "1e3", "-1", "abc", "1234567", "0000000"})
+        CHECK_FALSE(parse_sync_skip_streak(bad));
 }
 
 TEST_CASE("REAL AgentHealthStore: corruption candidates are surfaced, not deduped",

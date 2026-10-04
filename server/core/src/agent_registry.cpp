@@ -16,6 +16,7 @@
 #include "guardian_health_fleet_tags.hpp" // Guardian M1 health-stream fleet telemetry table (#2298 gate 3, item 6d)
 #include "guardian_arm_fleet_tags.hpp" // Guardian arm-ledger fleet telemetry table (rung 9c PR-3)
 #include "guardian_io_ceiling_fleet_tags.hpp" // Guardian io-ceiling fleet telemetry table (rung 9c PR-3)
+#include "inventory_sync_fleet_tags.hpp" // #5332 daily-sync skip_streak fleet gauge
 #include "guardian_journal_fleet_tags.hpp" // Guardian journal fleet telemetry table (#2298 gate 3)
 #include "network_perf_rules.hpp"
 #include "offline_endpoint_store.hpp" // HA WS-5 presence merge (ADR-2002 §7a)
@@ -2384,6 +2385,7 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
     int ota_signature_refusing = 0;
     int tar_db_corruption_agents = 0;               // #1567
     std::map<std::string, int64_t> plugin_init_failed; // #1567: plugin -> agents
+    std::array<int64_t, std::size(kSyncSkipSources)> sync_skipping{}; // #5332: per source
 
     for (const auto& [id, snap] : snapshots_) {
         ++healthy_count;
@@ -2469,6 +2471,19 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
         static const std::string kKeySparkQueuedDropped{kSparkTagQueuedDropped};
         static const std::string kKeySparkConsumerErrors{kSparkTagConsumerErrors};
         static const std::string kKeySparkDisabled{kSparkTagDisabled};
+
+        // #5332: agents whose daily-sync source is skipping (skip_streak > 0). Keys built
+        // once from the table; the value is agent-controlled, so it is only counted.
+        static const auto kSyncSkipKeys = [] {
+            std::array<std::string, std::size(kSyncSkipSources)> k;
+            for (std::size_t i = 0; i < k.size(); ++i)
+                k[i] = sync_skip_streak_tag(kSyncSkipSources[i]);
+            return k;
+        }();
+        for (std::size_t i = 0; i < kSyncSkipKeys.size(); ++i) {
+            if (parse_sync_skip_streak(get_view(kSyncSkipKeys[i])))
+                ++sync_skipping[i];
+        }
 
         auto os_val = get("yuzu.os");
         if (!os_val.empty())
@@ -2785,6 +2800,12 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
     // lexicographic order, the remainder summed under plugin="other".
     metrics.gauge("yuzu_fleet_tar_db_corruption_agents")
         .set(static_cast<double>(tar_db_corruption_agents));
+    // #5332: published for every table row, 0 included (a server-owned count over the
+    // reporting population, like yuzu_fleet_tar_db_corruption_agents above), so the
+    // fixed label set needs no clear_gauge_family.
+    for (std::size_t i = 0; i < sync_skipping.size(); ++i)
+        metrics.gauge("yuzu_fleet_inventory_sync_skipping", {{"source", kSyncSkipSources[i]}})
+            .set(static_cast<double>(sync_skipping[i]));
     {
         constexpr std::size_t kMaxPluginLabels = 64;
         std::size_t n = 0;

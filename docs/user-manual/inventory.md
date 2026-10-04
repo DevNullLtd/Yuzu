@@ -658,6 +658,11 @@ ingest is failing. Four further series sharpen the picture:
   be **frozen, not genuinely low** — the freeze-detector that travels with the
   gauge (the freshness count uses a tighter 250 ms budget than the read paths, so
   it can stall while `yuzu_inventory_read_degrade_total` stays quiet).
+- `yuzu_fleet_inventory_sync_skipping{source}` (gauge) — agents currently
+  heartbeating whose `source` skipped its latest collection cycle(s), from the agent
+  heartbeat tag `yuzu.sync.<source>.skip_streak`. The cause is the device's
+  `yuzu.sync.<source>.last_skip` tag and the agent's `sync: … — skipping this cycle`
+  warning. Published every sweep, 0 included.
 - `yuzu_inventory_ingest_dropped_total{reason}` (counter, reason ∈ `store_not_open` /
   `pool_acquire_timeout` / `query_error` / `invalid_key` / `stale`) — generic-store
   (ADR-0037) upsert calls that did not persist. Ingest is fail-soft (the next
@@ -724,7 +729,13 @@ threshold (`>50` is day-one noise on a 100-device pilot and 0.1% ambient churn o
 explicit `on()/group_left()` matching with a denominator caveat. **Enable it** once
 you have observed your fleet's normal stale-count baseline and set the threshold to
 ~5–10% of your expected active fleet; correlate with `yuzu_fleet_agents_healthy` to
-separate "agents offline" from "sync source broken / disabled".
+separate "agents offline" from "sync source broken / disabled". Also
+correlate with `yuzu_fleet_inventory_sync_skipping{source="installed_software"}`: a
+host counted there is online but its collector is skipping (reason in its `last_skip`
+tag). The two gauges count different populations (stored-receipt age over 48 h in
+Postgres vs live heartbeats, which include hosts skipping for less than 48 h and
+hosts that have never reported), so read them side by side and never subtract one
+from the other.
 
 **`install_location` is `-` for many Windows applications and every Linux application.** `-` means the OS
 reported no location, not that collection failed. Windows reads each Uninstall key's `InstallLocation`, which many
