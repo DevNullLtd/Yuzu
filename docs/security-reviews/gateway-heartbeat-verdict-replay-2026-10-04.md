@@ -20,7 +20,7 @@ This record covers one core replica. No multi-replica run exists; the multi-repl
 | Documentation commits after the rig | the docs commits on top of `caef11df5` | documentation only; not rig-run |
 | Later code commits | the code commits on top of `caef11df5` | input validation and log hardening, eunit and dialyzer only, NOT rig-run; listed below |
 
-The gateway source on the rig runs is the source at `caef11df5`. The later code commits are not rig-run and are not limited to tests, comments and documentation. They add: the `consume_verdict` map guard and `listed_ids` in the heartbeat buffer; the cast-boundary cap and type check of `replay_sessions` (`bound_session_ids`, `replay_verdict`); control byte replacement in `reject_reason_for_log`; the HELP text correction of the truncated counter; and, in the second fix round, redaction of the reason and the log in `format_status`, an exception wrap of the RPC bodies, a non-map reply guard at the replay arm and in the agent service register, and C1 control byte replacement. They validate inputs and harden logging, and they were checked by eunit and dialyzer only.
+The gateway source on the rig runs is the source at `caef11df5`. The later code commits are not rig-run and are not limited to tests, comments and documentation. They add: the `consume_verdict` map guard and `listed_ids` in the heartbeat buffer; the cast-boundary cap and type check of `replay_sessions` (`bound_session_ids`, `replay_verdict`); control byte replacement in `reject_reason_for_log`; the HELP text correction of the truncated counter; and, in the second fix round, redaction of the reason and the log in `format_status`, an exception wrap of the RPC bodies, a non-map reply guard at the replay arm and in the agent service register, and C1 control byte replacement (the other logged server text, the gRPC message of a failed RPC, now goes through the same cut and replacement). One behaviour change comes with them: an exception inside the upstream client's own RPC calls used to crash the process and reset the circuit breaker; it is now a counted failed RPC (telemetry code `exception`, one WARN with the exception class and a redacted reason). They validate inputs and harden logging, and they were checked by eunit and dialyzer only.
 
 ## Real-agent runs
 
@@ -46,8 +46,9 @@ At the rig-tested commit `caef11df5` (fix-agent and reviewer runs, not rig runs)
 
 At the later code commits (not rig-run):
 
-- eunit: 467 of 467 passed after the first governance fix round (three runs from a fresh `_build/test`, no flake). The second fix round added tests; see the PR for the final eunit count at the branch tip.
-- dialyzer: see the PR for the result at the branch tip.
+- eunit: 467 of 467 passed after the first governance fix round, and 473 of 473 after the second (three runs from a fresh `_build/test` each, no flake, no cancelled run). The count is for the branch before the merge of dev; the merge is re-run and reported on the PR.
+- dialyzer: exit code 0 after the second fix round.
+- Common Test: 52 cases passed after the second fix round.
 
 ## Mutation checks
 

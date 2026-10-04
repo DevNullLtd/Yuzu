@@ -487,11 +487,12 @@ handle_info(replay_next, #state{replay_queue = [{AgentId, SessionId, RegisterReq
                                     %% The registry's tables are gone (its process
                                     %% died; it is a sibling under one_for_one).
                                     %% Nothing queued can be re-verified, so drop
-                                    %% the queue instead of crashing this process:
-                                    %% each agent comes back on a later verdict.
+                                    %% the queue instead of crashing this process.
+                                    %% A registry that died has lost its tables, so a
+                                    %% later verdict finds no local session for these
+                                    %% agents: they are not listed again into the replay.
                                     logger:warning("Registration replay aborted: registry unavailable "
-                                                   "(~b queued entries dropped); they return on "
-                                                   "their next heartbeat", [length(Rest) + 1]),
+                                                   "(~b queued entries dropped)", [length(Rest) + 1]),
                                     emit_queue_depth(0),
                                     abort;
                                 _ ->

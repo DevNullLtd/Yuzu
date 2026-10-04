@@ -830,7 +830,7 @@ agent build that re-registers by itself; released agents do not (see
 | gateway | WARN | `Circuit breaker: OPEN (will probe in <ms>ms)` | The upstream circuit breaker opened. A verdict that arrives while it is open is dropped and counted in `yuzu_gw_heartbeat_verdict_dropped_total{reason="circuit_open"}`; the matching line `heartbeat verdict named N session(s) while the circuit is open; dropped` is DEBUG, so at the default log level you see the counter and this warning, not that line. While the breaker is open, the whole `/readyz` answer is 503 `not_ready` (`circuit_breaker` is false in its checks), and the shipped guidance is that a load balancer probes `:8081/readyz`, so an open breaker can take this node out of rotation (INFERRED from `yuzu_gw_health.erl`; not run). Wait: do not restart the gateway. The replay runs after the breaker goes half open (INFO `Circuit breaker: open -> half_open (allowing probe RPC)`; `/readyz` reads ready again from that point), and the probe closing it logs INFO `Circuit breaker: half_open -> closed (probe succeeded)`. |
 | gateway | WARN | `Circuit breaker: half_open -> open (probe failed, increasing backoff)` | The probe RPC failed, so the server is still failing the gateway's calls and the breaker is open again for a longer time. Escalate to the server: check that it is healthy and reachable from the gateway. Restarting the gateway does not help and reconnects every agent it holds. |
 | gateway | WARN | `Registration replay aborted: circuit open (N agent(s) not yet re-proxied)` | The breaker opened while the drip was running. The queue is dropped; the agents come back on a later verdict or on the next breaker recovery. |
-| gateway | WARN | `Registration replay aborted: registry unavailable (N queued entries dropped); they return on their next heartbeat` | The gateway's registry process was down when the drip popped an entry, so nothing queued could be re-verified and the queue was dropped. This abort disconnects no agent. INFERRED from the code (not tested): a registry that died has lost its tables (see [Heartbeat admission](#heartbeat-admission)), so a later verdict finds no local session for these agents and counts them `not_local`; they are not listed again into the replay. They come back only through their own `NOT_FOUND` re-register path, which released v0.13.0 and v0.14.0-rc6 agents do not complete (see "Agent dependency" below). |
+| gateway | WARN | `Registration replay aborted: registry unavailable (N queued entries dropped)` | The gateway's registry process was down when the drip popped an entry, so nothing queued could be re-verified and the queue was dropped. This abort disconnects no agent. INFERRED from the code (not tested): a registry that died has lost its tables (see [Heartbeat admission](#heartbeat-admission)), so a later verdict finds no local session for these agents and counts them `not_local`; they are not listed again into the replay. They come back only through their own `NOT_FOUND` re-register path, which released v0.13.0 and v0.14.0-rc6 agents do not complete (see "Agent dependency" below). |
 | gateway | WARN | `Registration replay: <agent> failed: <reason>` | A replay `ProxyRegister` failed. It counts as a failure for the shared circuit breaker (see "Replay failures feed the shared circuit breaker" below). |
 
 The server's `renew_leases ... unknown_session` warnings stop once the agent
@@ -1221,10 +1221,15 @@ env keys with defaults, which a reverted build ignores.
   registration request. Before this change a crash report of that process
   printed the whole state, with every queued request. Now the `format_status`
   callback redacts, in that report: the replay queue and the recent-replay
-  stamps (shown as sizes), the last message, the argument lists in the exit
-  reason and stacktrace, and the debug log. It cannot redact what OTP prints
-  from raw data outside `format_status`: the process mailbox, and the
-  `messages:` and exception lines of the `proc_lib` crash report. So an
+  stamps (shown as sizes), the last message, the reason and the debug log, and
+  an exception raised inside the upstream client's own RPC calls is caught and
+  counted as a failed RPC (code `exception`), so its stacktrace carries no
+  request. A crash from any other source (for example a function clause in a
+  helper that was handed a request) still prints that function's argument
+  list, because OTP appends the stacktrace after `format_status` runs. It also
+  cannot redact what OTP prints from raw data outside `format_status`: the
+  process mailbox, and the `messages:` and exception lines of the `proc_lib`
+  crash report. So an
   unhandled crash of this process while a registration is queued or in flight can
   still print the credentials of those in-flight requests. This was verified on
   a stand-in probe (OTP 28.4.2), not on a rig and not with the real process. The

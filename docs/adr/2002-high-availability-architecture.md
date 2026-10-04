@@ -1411,8 +1411,10 @@ one core replica a server-only restart now recovers through the replay described
   running server, which holds only for an agent build that re-registers by itself.
 - **Known limit (crash report, disclosed not closed).** The upstream client holds each queued agent's stored
   registration request, and its `format_status` now redacts the queue, the recent-replay stamps, the last
-  message, the argument lists in the exit reason and stacktrace, and the debug log in a crash report; before
-  this change the whole state was printed. It cannot redact the process mailbox or the `messages:` and
+  message, the reason and the debug log in a crash report, and an exception inside its own RPC calls is
+  caught and counted as a failed RPC, so its stacktrace carries no request; before this change the whole
+  state was printed. A crash from another source still prints the failing function's arguments (OTP
+  appends the stacktrace after `format_status`), and it cannot redact the process mailbox or the `messages:` and
   exception lines of the `proc_lib` report, so an unhandled crash while a registration is queued or in flight
   can still print the token, certificate or CSR of those in-flight requests (stand-in probe, OTP 28.4.2, not a
   rig run). Operator guidance and the shipped logger settings are in `docs/user-manual/gateway.md`, Known
