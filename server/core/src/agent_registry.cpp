@@ -696,6 +696,13 @@ bool AgentRegistry::send_to(const std::string& agent_id, const ClassifiedCommand
         auto it = agents_.find(agent_id);
         if (it == agents_.end())
             return false;
+        // #5294: a per-OS kill-switch OFF row is enforced here, at send time,
+        // so every local-session caller (including send_system_reserved) is
+        // covered and a session registered after the dispatch-time snapshot
+        // is still withheld. The set holds only validated windows|linux|darwin
+        // literals, so an empty/unknown session OS never matches.
+        if (cmd.kill_switched_os().contains(it->second->os))
+            return false;
         session = it->second;
     }
     if (!tag_is_valid(cmd.wire(), metrics_, agent_id))
@@ -746,6 +753,9 @@ int AgentRegistry::send_to_all(const ClassifiedCommand& cmd) {
         return 0;
     int count = 0;
     for (auto& s : snapshot) {
+        // #5294: mirror send_to()'s send-time per-OS enforcement.
+        if (cmd.kill_switched_os().contains(s->os))
+            continue;
         std::lock_guard slock(s->stream_mu);
         // #1004: mirror send_to() — gateway-pending path wins over any
         // Subscribe stream the gateway may also hold for the agent.
@@ -1604,6 +1614,28 @@ std::unordered_set<std::string> AgentRegistry::ids_missing_plugin(std::string_vi
             missing.insert(id);
     }
     return missing;
+}
+
+std::expected<std::unordered_set<std::string>, PresenceReadError>
+AgentRegistry::ids_with_os(const std::unordered_set<std::string>& os_values) const {
+    std::unordered_set<std::string> out;
+    if (os_values.empty())
+        return out;
+    // live_presence() runs OFF mu_ (same discipline as all_ids / evaluate_scope).
+    auto presence = live_presence();
+    if (!presence)
+        return std::unexpected(presence.error());
+    std::lock_guard lock(mu_);
+    for (const auto& [id, s] : agents_) {
+        if (!s->os.empty() && os_values.contains(s->os))
+            out.insert(id);
+    }
+    for (const auto& p : *presence) {
+        // Local wins: a session on this replica is judged by its own os.
+        if (!agents_.contains(p.agent_id) && !p.os.empty() && os_values.contains(p.os))
+            out.insert(p.agent_id);
+    }
+    return out;
 }
 
 // Collect every from_result_set:<id> reference in a scope expression so the

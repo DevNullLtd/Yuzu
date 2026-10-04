@@ -1151,12 +1151,22 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                          message = "The gateway routing directory could not be read for one "
                                     "or more targets — dispatch is failing closed rather than "
                                     "guessing where to route.";
+                     } else if (dispatch_outcome.os_gate_unreadable) {
+                         // #5294: presence unreadable while a per-OS kill
+                         // switch is OFF -- transient, fails closed.
+                         message = "Agent presence could not be read while a per-OS kill "
+                                    "switch is set — dispatch is failing closed and reaching "
+                                    "no agent; retry shortly.";
                      } else if (dispatch_outcome.denied_quarantined_count > 0) {
                          message = "Every target is quarantined — dispatch was withheld, "
                                     "not attempted.";
                      } else if (dispatch_outcome.unknown_plugin_count > 0) {
                          message = "The dispatched plugin is not in any target's reported "
                                     "inventory — dispatch was withheld, not attempted.";
+                     } else if (dispatch_outcome.kill_switched_os_count > 0) {
+                         // #5294
+                         message = "Every target runs an OS for which this plugin action is "
+                                    "switched off — dispatch was withheld, not attempted.";
                      }
                      res.set_content(
                          "<span id=\"result-context\" hx-swap-oob=\"true\""
