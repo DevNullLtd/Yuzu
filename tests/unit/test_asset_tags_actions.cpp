@@ -35,12 +35,14 @@
 #include "local_dispatcher.hpp"
 #include "test_helpers.hpp"
 
+#include <chrono>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <optional>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -403,4 +405,36 @@ TEST_CASE("asset_tags plugin: init() recovery, persistence and the typed sync st
         CHECK(rows[6] == "check_interval|30"); // floored
         CHECK(rows[7] == "change_count|2");
     }
+}
+
+TEST_CASE("asset_tags plugin: shutdown() wakes the check thread at once, not after its sleep",
+          "[agent][asset_tags_actions][shutdown]") {
+    // The check thread waits out check_interval (default 300s). It used to do that in 5s
+    // sleep_for chunks, so shutdown()'s join() cost up to a full chunk (~5s) on every plugin
+    // unload, and the agent's own shutdown paid it too. It now waits on a condition variable
+    // that shutdown() signals.
+    //
+    // Bound rationale (same lesson as "stop() wakes parked workers promptly" in
+    // test_trigger_engine.cpp): a woken join is millisecond-scale; the old floor is the 5s
+    // chunk minus the 100ms head start below, ~4.9s. 3s is ~1000x above healthy and
+    // decisively below the old floor, so a return to sleep-chunking goes red even on a
+    // loaded CI box.
+    auto plugin = load_asset_tags_plugin();
+    if (!plugin) {
+        require_plugin_or_skip();
+        return;
+    }
+
+    yuzu::test::TempDir dir{"yuzu_test_asset_tags_shutdown_"};
+    yuzu::agent::StandalonePluginContext ctx("asset_tags", {{"agent.data_dir", dir.path.string()}});
+    REQUIRE(plugin->descriptor->init(ctx.get()) == 0);
+
+    // Let the check thread reach its wait so the notify path (not just the predicate) is what
+    // is exercised. No correctness dependence: shutdown() must return promptly either way.
+    std::this_thread::sleep_for(std::chrono::milliseconds{100});
+
+    const auto t0 = std::chrono::steady_clock::now();
+    plugin->descriptor->shutdown(ctx.get());
+    const auto elapsed = std::chrono::steady_clock::now() - t0;
+    CHECK(elapsed < std::chrono::seconds{3});
 }
