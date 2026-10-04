@@ -7,6 +7,7 @@
 
 #include "ota_signature_sidecar.hpp"
 #include "rest_a4_envelope_http.hpp" // detail::a4_error
+#include "rollout_pct_reject.hpp" // the shared malformed-rollout_pct 400 + toast
 
 #include <atomic>
 #include <cstdio>
@@ -6277,11 +6278,7 @@ void SettingsRoutes::register_routes(
         // did not ask for): 400, nothing stored. Shared with the rollout route.
         const auto rollout_parsed = yuzu::server::parse_rollout_pct(rollout_s);
         if (!rollout_parsed) {
-            res.status = 400;
-            res.set_header("HX-Trigger",
-                           R"({"showToast":{"message":"Invalid rollout percentage - nothing was stored","level":"error"}})");
-            res.set_content(detail::a4_error(res, "invalid numeric parameter: rollout_pct"),
-                            "application/json");
+            yuzu::server::reject_bad_rollout_pct(res, yuzu::server::RolloutRejectEffect::kStored);
             return;
         }
         const int rollout_pct = *rollout_parsed;
@@ -6574,12 +6571,8 @@ void SettingsRoutes::register_routes(
                   // Malformed => 400, never the 100% default (shared with the upload route).
                   const auto pct_parsed = yuzu::server::parse_rollout_pct(pct_s);
                   if (!pct_parsed) {
-                      res.status = 400;
-                      res.set_header("HX-Trigger",
-                                     R"({"showToast":{"message":"Invalid rollout percentage - nothing was changed","level":"error"}})");
-                      res.set_content(
-                          detail::a4_error(res, "invalid numeric parameter: rollout_pct"),
-                          "application/json");
+                      yuzu::server::reject_bad_rollout_pct(
+                          res, yuzu::server::RolloutRejectEffect::kChanged);
                       return;
                   }
                   const int pct = *pct_parsed;

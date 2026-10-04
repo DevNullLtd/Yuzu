@@ -247,10 +247,7 @@ std::string render_ca_fragment(CaStore* ca_store) {
     // more — say so + point at the paginated REST endpoint, so certs beyond the
     // cap aren't silently invisible/unrevocable from the dashboard.
     if (static_cast<int>(issued.size()) >= kPanelLimit) {
-        html += "<p style=\"font-size:0.72rem;color:#d29922;margin-top:0.5rem\">Showing the first " +
-                std::to_string(kPanelLimit) +
-                " certificates. Use <code>GET /api/v1/ca/issued?offset=&lt;n&gt;</code> to page through the "
-                "full inventory.</p>";
+        html += ca_issued_paging_hint(kPanelLimit);
     }
     html += "<p style=\"font-size:0.72rem;color:var(--mds-color-theme-text-tertiary);"
             "margin-top:0.75rem\">To replace the default certificates with operator- or "

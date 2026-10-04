@@ -27,11 +27,11 @@
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
-#include <limits>
 #include <chrono>
 #include <cstring>
 #include <expected>
 #include <format>
+#include <limits>
 #include <map>
 #include <optional>
 #include <string>
@@ -1202,13 +1202,14 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                  auto sink_state = std::make_shared<detail::SseSinkState>();
                  // Replay ring-buffer events newer than the client's
                  // Last-Event-ID header (browser EventSource sets this on
-                 // auto-reconnect). 0 = no header / first connect → no replay.
+                 // auto-reconnect). No header = cursor 0 = the whole ring buffer is
+                 // replayed (every id is > 0), so a late joiner sees recent history.
                  std::uint64_t since_id = 0;
                  if (req.has_header("Last-Event-ID")) {
-                     // Strict cursor: stoull accepted "-1" (wrapping past every event) and
-                     // "5abc" (as 5). A malformed header is live-only (no replay).
-                     // A malformed header is served LIVE ONLY (no replay): see
-                     // sse_cursor_from_header. since_id 0 would replay the whole ring buffer.
+                     // Strict cursor (stoull accepted "-1", wrapping past every event, and
+                     // "5abc" as 5). A MALFORMED header is served LIVE ONLY: see
+                     // sse_cursor_from_header, whose maximum cursor replays nothing; a cursor
+                     // of 0 would replay the whole ring buffer instead.
                      since_id = sse_cursor_from_header(req.get_header_value("Last-Event-ID")).since_id;
                  }
                  auto* bus = execution_event_bus;

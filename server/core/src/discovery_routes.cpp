@@ -314,9 +314,8 @@ void DiscoveryRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermF
                 q.severity = req.get_param_value("severity");
                 q.status = req.get_param_value("status");
                 try {
-                    auto limit_str = req.get_param_value("limit");
-                    if (!limit_str.empty())
-                        q.limit = strict_stoi(limit_str);
+                    if (req.has_param("limit"))
+                        q.limit = strict_stoi(req.get_param_value("limit"));
                 } catch (const std::exception&) {
                     res.status = 400;
                     res.set_content(
@@ -516,9 +515,8 @@ void DiscoveryRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermF
 
                 int limit = 50;
                 try {
-                    auto limit_str = req.get_param_value("limit");
-                    if (!limit_str.empty())
-                        limit = strict_stoi(limit_str);
+                    if (req.has_param("limit"))
+                        limit = strict_stoi(req.get_param_value("limit"));
                 } catch (const std::exception&) {
                     res.status = 400;
                     res.set_content(

@@ -4,6 +4,7 @@
 // contract so a change to it fails here, with the offending input named, rather than
 // surfacing as a vague route failure. No store, no Postgres.
 #include "query_int_parse.hpp"
+#include "rollout_pct_reject.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/generators/catch_generators.hpp>
@@ -99,7 +100,7 @@ TEST_CASE("strict_stoi/strict_stoll: the throwing drop-ins agree with the primit
 // form: both call this one helper, so these cases cover BOTH. A typo must never become a
 // full-fleet rollout: malformed is nullopt (the routes answer 400 and store nothing), EMPTY is the
 // route's documented default, a valid integer is clamped to 0..100 as documented.
-TEST_CASE("parse_rollout_pct: malformed is rejected, empty is the default, valid is clamped",
+TEST_CASE("parse_rollout_pct: malformed is rejected; empty is the default; valid is clamped",
           "[query_int_parse][numeric_params]") {
     for (const char* bad : {"0x5", "5abc", "1e1", "+5", " 5", "5 ", "-", "99999999999999999999"})
         CHECK_FALSE(yuzu::server::parse_rollout_pct(bad).has_value());
@@ -126,5 +127,27 @@ TEST_CASE("sse_cursor_from_header: the cursor is one non-negative integer or liv
         const auto c = yuzu::server::sse_cursor_from_header(bad);
         CHECK(c.live_only);
         CHECK(c.since_id == std::numeric_limits<std::uint64_t>::max());
+    }
+}
+
+// The shared 400 for a malformed OTA rollout_pct. The upload route is multipart (the unit route sink
+// cannot drive it), so this is the closest real seam to its rejection path: both OTA routes call this
+// one function, and a regression that drops the status, the toast or the A4 body goes red here.
+TEST_CASE("reject_bad_rollout_pct answers 400 with a constant toast and an A4 body",
+          "[query_int_parse][numeric_params][ota]") {
+    for (const auto effect : {yuzu::server::RolloutRejectEffect::kStored,
+                              yuzu::server::RolloutRejectEffect::kChanged}) {
+        httplib::Response res;
+        yuzu::server::reject_bad_rollout_pct(res, effect);
+        CHECK(res.status == 400);
+        CHECK(res.get_header_value("Content-Type").find("application/json") != std::string::npos);
+        const auto toast = res.get_header_value("HX-Trigger");
+        CHECK(toast.find("\"showToast\"") != std::string::npos);
+        CHECK(toast.find("\"level\":\"error\"") != std::string::npos);
+        CHECK(toast.find(effect == yuzu::server::RolloutRejectEffect::kStored ? "nothing was stored"
+                                                                              : "nothing was changed") !=
+              std::string::npos);
+        CHECK(res.body.find("rollout_pct") != std::string::npos);
+        CHECK(res.body.find("\"error\"") != std::string::npos);
     }
 }

@@ -2424,6 +2424,45 @@ TEST_CASE("SSE handler: 410 Gone for terminal execution", "[pg][workflow][execut
     CHECK(res->status == 410);
 }
 
+// #4644 Gate 8 round 5: the Last-Event-ID wiring of THIS route (the one that has no gap probe and no
+// `?since`). The sink hands back the real httplib::Response, so the chunked provider is driven once with
+// a capturing DataSink and the frames the route queued are counted. A route that mapped a malformed header
+// to cursor 0 (replay the whole ring) or dropped the strict cursor goes red.
+TEST_CASE("SSE handler: Last-Event-ID wiring replays exactly the tail and a malformed one is live only",
+          "[pg][workflow][executions][pr3][numeric_params]") {
+    auto frames = [](const std::string& wire) {
+        int n = 0;
+        for (auto at = wire.find("event: agent-transition"); at != std::string::npos;
+             at = wire.find("event: agent-transition", at + 1))
+            ++n;
+        return n;
+    };
+    struct Case {
+        const char* header;
+        int expected_replayed;
+    };
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
+    h.make_def("def-SSE-CURSOR", "SseCursor");
+    for (const Case c : {Case{"0", 3}, Case{"1", 2}, Case{"002", 1}, Case{"3", 0}, Case{"5abc", 0},
+                         Case{"-1", 0}, Case{"99999999999999999999", 0}}) {
+        INFO("Last-Event-ID=" << c.header);
+        auto exec_id = h.make_exec("def-SSE-CURSOR", "running", 1, 0, 0);
+        for (int i = 0; i < 3; ++i)
+            h.event_bus->publish(exec_id, "agent-transition", R"({"agent_id":"a"})", false);
+        auto res = h.sink.Get("/sse/executions/" + exec_id, {{"Last-Event-ID", c.header}});
+        REQUIRE(res);
+        REQUIRE(res->status == 200);
+        // One live event so the provider never idles; it is counted with the replayed ones.
+        h.event_bus->publish(exec_id, "agent-transition", R"({"agent_id":"live"})", false);
+        REQUIRE(res->content_provider_);
+        const auto wire = yuzu::server::test::drain_chunked_provider_once(*res);
+        CHECK(frames(wire) == c.expected_replayed + 1);
+        CHECK(wire.find("live") != std::string::npos);
+    }
+}
+
 // Governance fix (#2146 A2-R1 Gate 8 re-review): this route used the plain
 // get_execution(), which collapses "execution genuinely absent" and "read
 // degraded" (a transient pool/query failure) to the same nullopt -- a

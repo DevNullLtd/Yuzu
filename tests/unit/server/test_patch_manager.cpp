@@ -458,16 +458,17 @@ TEST_CASE("DiscoveryRoutes: GET /api/patches and /api/patches/deployments reject
 
     for (const char* route : {"/api/patches", "/api/patches/deployments"}) {
         for (const char* bad : {"limit=abc", "limit=50x", "limit=1e3", "limit=0x10",
-                                "limit=4294967296"}) {
+                                "limit=4294967296", "limit="}) {
             INFO(route << "?" << bad);
             auto res = sink.Get(std::string(route) + "?" + bad);
             REQUIRE(res);
             CHECK(res->status == 400);
         }
-        // Empty keeps its long-standing meaning (the default); a clean value works.
-        auto empty = sink.Get(std::string(route) + "?limit=");
-        REQUIRE(empty);
-        CHECK(empty->status == 200);
+        // A present-but-empty `limit=` is malformed like every other converted
+        // route (the docs table says so); an absent `limit` is still the default.
+        auto absent = sink.Get(std::string(route));
+        REQUIRE(absent);
+        CHECK(absent->status == 200);
         auto ok = sink.Get(std::string(route) + "?limit=10");
         REQUIRE(ok);
         CHECK(ok->status == 200);

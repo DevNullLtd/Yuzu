@@ -450,6 +450,8 @@ TEST_CASE("OTA rollout with a malformed percentage is a 400 and changes nothing"
         auto res = h.post_rollout("1.2.3", bad);
         REQUIRE(res);
         CHECK(res->status == 400);
+        // The dashboard drops 4xx bodies, so the operator only learns of the refusal from the toast.
+        CHECK(res->get_header_value("HX-Trigger").find("nothing was changed") != std::string::npos);
     }
     CHECK(h.audited.empty());
     auto pkgs = h.registry->list_packages();

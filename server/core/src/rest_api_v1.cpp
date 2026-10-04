@@ -80,7 +80,6 @@
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
-#include <limits>
 #include <atomic>
 #include <cctype>
 #include <charconv>
@@ -92,6 +91,7 @@
 #include <ctime>
 #include <format>
 #include <iterator>
+#include <limits>
 #include <memory>
 #include <random>
 #include <regex>
@@ -18233,8 +18233,11 @@ void RestApiV1::register_routes(
     //     `?filter=...` syntax is W5.2.
     //   * Reuses `ExecutionEventBus` (per ladder doc — no new bus).
     //   * Replays via `Last-Event-ID` header OR `?since=<id>` query
-    //     param (query wins). Bad input degrades to 0 (no replay)
-    //     rather than 400, matching the dashboard sibling.
+    //     param (query wins). A malformed `?since` is a 400; a malformed
+    //     `Last-Event-ID` header (browser-supplied inference) is served
+    //     LIVE ONLY: no replay, never a 400 that would fail a reconnect.
+    //     With neither, the cursor is 0 and the ring buffer is replayed
+    //     (every id is > 0), so a late joiner sees the recent history.
     //   * Per-connection queue cap (`kPerConnectionQueueCapDefault`)
     //     with drop-oldest — a slow / blackholed consumer cannot grow
     //     the queue without bound. Drops are surfaced to the client
@@ -18461,7 +18464,6 @@ void RestApiV1::register_routes(
             since_id = cursor.since_id;
             live_only = cursor.live_only;
         }
-
 
         // Audit BEFORE the chunked provider takes over — once
         // set_chunked_content_provider runs, headers are sealed.
