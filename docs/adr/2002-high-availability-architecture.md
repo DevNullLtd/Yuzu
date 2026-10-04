@@ -1398,13 +1398,17 @@ one core replica a server-only restart now recovers through the replay described
   dropped as `circuit_open`, and the replay ran once the breaker went half open (T0 + 54 s on the rig; INFERRED from the code:
   the same transition recovered the gateway before this change, so a breaker-opening outage is bounded by
   the breaker's remaining backoff, capped at 300 s, plus a heartbeat interval and a flush). With the breaker
-  never opened, the replay came 4.2 s after the server was healthy. Not tested: more than one agent, scale,
-  HA or several replicas, notify pressure, agents started with `--no-auto-update`, the `queue_full` and
-  `malformed` verdict reasons, a double replay, a verdict that arrives after a replay it predates, the
+  never opened, the replay came 4.2 s after the server was healthy. A later rig run with 10 and 30 agents
+  behind one gateway saw the breaker open 72 s and 40 s into a 302 s and a 152 s outage, every verdict dropped
+  as `circuit_open` until the probe, and recovery through the breaker's own replay (`trigger="breaker"`) after
+  the probe at T0 + 84.5 s and T0 + 49.1 s (all agents online at T0 + 85.2 s and T0 + 50.4 s; backoff steps up
+  to 160 s observed, the 300 s cap not). Not tested: 100 or more
+  agents, scale, HA or several replicas, notify pressure, agents started with `--no-auto-update`, the `queue_full` and
+  `malformed` verdict reasons from a real server (injected verdicts only), a double replay, a verdict that arrives after a replay it predates, the
   registry-unavailable abort, an `accepted=false` answer and a failing server feeding the breaker during a
   drip (the same list as "Observed on a rig" in the gateway manual).
-- **Observed: a stuck heartbeat batch, and the buffer change that closes it (INFERRED closed; post-change
-  rig run pending).** OBSERVED on a rig with an agent that had the TAR plugin, before this change: such an
+- **Observed: a stuck heartbeat batch, and the buffer change that closes it (post-change rig run
+  observed).** OBSERVED on a rig with an agent that had the TAR plugin, before this change: such an
   agent's heartbeat can carry a `fleet_snapshot_json` of 200 to 800 KB (a busy rig host), and the gateway
   heartbeat buffer retained heartbeats on a failed flush capped by count only (10000). In an unplanned
   15.6 minute server outage and in a 300 s outage (run E2a) the retained batch exceeded the server's gRPC
@@ -1425,7 +1429,7 @@ one core replica a server-only restart now recovers through the replay described
   `snapshot_evicted`) and `yuzu_gw_heartbeat_coalesced_total`. Consequences: the server's
   `yuzu_heartbeats_received_total{via="gateway"}` under-counts while a backlog is coalesced, and an agent's
   topology snapshot can be one agent snapshot cycle older after an eviction. The server's 4 MiB receive
-  limit is unchanged and not raised. Not tested and known limits: the post-change rig run is pending; the
+  limit is unchanged and not raised. The post-change rig run (`990e57e48`, 1 to 30 agents, plaintext, debug builds) recovered where the old gateway did not; see the evidence record. Not tested and known limits: 100 or more agents and a backlog that reaches the default byte cap; the
   agent's snapshot size is not bounded here (the agent proto comment says 5 to 20 KB, 200 to 800 KB was
   observed, the server accepts up to 2 MiB) and is a follow-up for the agent side; the server does not
   configure its maximum receive size explicitly, so the chunk size relies on the library default (INFERRED

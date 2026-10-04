@@ -174,6 +174,10 @@ that succeeds is consumed as usual (see
 A chunk that fails, and the chunks not yet sent, stay buffered for the next
 flush. A single heartbeat that is by itself larger than 3 MiB is sent without its
 snapshot (`yuzu_gw_heartbeat_buffer_dropped_total{reason="snapshot_oversize"}`).
+On a rig the largest chunk observed was 3,142,583 bytes, under the 3 MiB packing
+limit of 3,145,728 bytes; chunk sizes are in no log or metric. The line
+`Flushed N heartbeats in M chunk(s)` is logged at INFO only when a flush needed
+more than one chunk (M greater than 1) and at DEBUG otherwise.
 
 **Bounds on the retained buffer.** `max_heartbeat_buffer` (default 10000) is a
 number of sessions. When the buffer holds that many sessions, a heartbeat of a
@@ -640,7 +644,7 @@ Application env keys read by the heartbeat buffer at start (set them in the
 | Key | Default | Valid range | Meaning |
 |---|---|---|---|
 | `max_heartbeat_buffer` | 10000 | not range-checked (use a positive integer) | Most sessions the buffer holds. The buffer keeps one entry per session, so this counts sessions, not heartbeats. When it is full, a heartbeat of a new session is dropped and counted in `yuzu_gw_heartbeat_buffer_dropped_total{reason="buffer_full"}`. |
-| `max_heartbeat_buffer_bytes` | 67108864 (64 MiB) | 1048576 to 1073741824 | Most bytes (estimated) the buffer retains across a failed flush. When the buffer is over this cap, snapshots are dropped oldest first (`reason="snapshot_evicted"`); only when none is left is the oldest whole session dropped (`reason="buffer_full"`). A value outside the range logs one warning that names the key and falls back to the default. |
+| `max_heartbeat_buffer_bytes` | 67108864 (64 MiB) | 1048576 to 1073741824 | Most bytes (estimated) the buffer retains across a failed flush. When the buffer is over this cap, snapshots are dropped oldest first (`reason="snapshot_evicted"`); only when none is left is the oldest whole session dropped (`reason="buffer_full"`). A value outside the range logs one warning that names the key and falls back to the default. Do not set it below a few MiB: on a rig with the 1048576 minimum and 5 agents, `snapshot_evicted` kept rising after the server was back, because two snapshot-bearing heartbeats (about 0.8 MB each) landing in one 1 s flush window exceed that cap. The default 64 MiB was not observed to evict in the rig runs (see "Observed on a rig"). |
 
 A flush is split into chunks of at most about 3 MiB (estimated), a fixed value
 that is not configurable. Size the byte cap for the largest backlog you want to
@@ -872,7 +876,10 @@ agents stay connected to it. The agents do not notice. The server keeps its
 gateway sessions in memory, so a restarted server does not know them, and it
 says so in every `BatchHeartbeatResponse` (see
 [BatchHeartbeat Message](#batchheartbeat-message)). A gateway that reads that
-answer re-registers the listed agents upstream without operator action.
+answer re-registers the listed agents upstream without operator action. If the
+gateway's circuit breaker opened during the outage, the verdict is dropped while
+it is open and the breaker's own recovery replay re-registers the agents instead
+(see "Several agents and a long outage" below).
 Restart the gateway to deploy this behaviour; the wire format is unchanged, so
 an old gateway with a new server, or a new gateway with an old server, still
 works (the old pairing simply keeps the behaviour described under "Without the
@@ -904,6 +911,7 @@ agent build that re-registers by itself; released agents do not (see
 |---|---|---|---|
 | gateway | INFO | `Registration replay: heartbeat verdict named N session(s); queued Q, not local L, already queued A, within guard G, queue full F` | One verdict was handled. Logged at INFO when Q is at least 1, at DEBUG otherwise. It carries counts only, no session ids. |
 | gateway | DEBUG | `Registration replay: re-proxied <agent> (adopted session <id>)` | One agent was re-proxied by the replay drip, one line per agent. |
+| gateway | INFO | `Flushed N heartbeats in M chunk(s)` | A flush needed more than one chunk (about 3 MiB each), which is expected after a long server outage. It is logged at INFO only when M is greater than 1; a flush of one chunk is logged at DEBUG. The line carries counts only: no log line or metric shows the size of a chunk. |
 | server | INFO | `[gateway] ProxyRegister succeeded: agent=..., session=<the pre-restart session id>` | The server accepted the replay and relearned the session under the id the agent already holds. |
 | server | DEBUG | `[gateway] ProxyRegister: adopted presented session ... (store-confirmed=true)` | The presented session was adopted; `store-confirmed=true` when the routing directory confirmed it. |
 | gateway | WARN | `Circuit breaker: OPEN (will probe in <ms>ms)` | The upstream circuit breaker opened. A verdict that arrives while it is open is dropped and counted in `yuzu_gw_heartbeat_verdict_dropped_total{reason="circuit_open"}`; the matching line `heartbeat verdict named N session(s) while the circuit is open; dropped` is DEBUG, so at the default log level you see the counter and this warning, not that line. While the breaker is open, the whole `/readyz` answer is 503 `not_ready` (`circuit_breaker` is false in its checks), and the shipped guidance is that a load balancer probes `:8081/readyz`, so an open breaker can take this node out of rotation (INFERRED from `yuzu_gw_health.erl`; not run). Wait: do not restart the gateway. The replay runs after the breaker goes half open (INFO `Circuit breaker: open -> half_open (allowing probe RPC)`; `/readyz` reads ready again from that point), and the probe closing it logs INFO `Circuit breaker: half_open -> closed (probe succeeded)`. |
@@ -911,6 +919,7 @@ agent build that re-registers by itself; released agents do not (see
 | gateway | WARN | `Registration replay aborted: circuit open (N agent(s) not yet re-proxied)` | The breaker opened while the drip was running. The queue is dropped; the agents come back on a later verdict or on the next breaker recovery. |
 | gateway | WARN | `Registration replay aborted: registry unavailable (N queued entries dropped)` | The gateway's registry process was down when the drip popped an entry, so nothing queued could be re-verified and the queue was dropped. This abort disconnects no agent. INFERRED from the code (not tested): a registry that died has lost its tables (see [Heartbeat admission](#heartbeat-admission)), so a later verdict finds no local session for these agents and counts them `not_local`; they are not listed again into the replay. They come back only through their own `NOT_FOUND` re-register path, which released v0.13.0 and v0.14.0-rc6 agents do not complete (see "Agent dependency" below). |
 | gateway | WARN | `Registration replay: <agent> failed: <reason>` | A replay `ProxyRegister` failed. It counts as a failure for the shared circuit breaker (see "Replay failures feed the shared circuit breaker" below). |
+| gateway | metric | `yuzu_gw_registration_replay_triggered_total{trigger="breaker"}` rising | The circuit breaker closed after an outage and the gateway replayed every agent this node holds. Expected after a long outage when the breaker opened (see "Several agents and a long outage" below). No action. |
 | gateway | metric | `yuzu_gw_heartbeat_coalesced_total` rising | Newer heartbeats of a session are replacing older buffered ones, one at a time. Expected during a server outage: heartbeats pile up between failed flushes and are merged, so the buffer stays at one entry per session. No action. The server's `yuzu_heartbeats_received_total{via="gateway"}` falls short of the number of heartbeats the agents sent for the same reason; that is not a loss of agents. |
 | gateway | metric | `yuzu_gw_heartbeat_buffer_dropped_total{reason}` rising | The buffer is under pressure, typically after a long server outage. `snapshot_evicted`: older snapshots were dropped to stay under `max_heartbeat_buffer_bytes`, oldest first. `buffer_full`: the buffer held `max_heartbeat_buffer` sessions and a heartbeat of a new session was dropped, or it was still over `max_heartbeat_buffer_bytes` with no snapshot left and its oldest whole session was dropped. `snapshot_oversize`: one heartbeat larger than about 3 MiB was sent without its snapshot (see "Known limits" below for the agent side). The data lost is only older heartbeat state, which the agents refresh on their own interval. No action unless it keeps rising after the server is back; if it does, check that the server is reachable and answering `BatchHeartbeat` (`yuzu_gw_upstream_rpc_errors_total{rpc_name}`), and consider raising `max_heartbeat_buffer_bytes` or `max_heartbeat_buffer` if your fleet is larger than the defaults assume. Do not restart the gateway for this: a restart disconnects every agent the node holds. |
 
@@ -923,7 +932,11 @@ are the measured evidence).
   the server is back, so the bound is up to one agent heartbeat interval (30 s
   by default), plus one gateway flush (1 s by default,
   `heartbeat_batch_interval_ms`), plus the agent's position in the replay drip
-  (see the table below).
+  (see the table below). OBSERVED with 1 agent: after outages of 302 s to 402 s
+  the verdict arrived 0.33 s to 0.67 s after the server was healthy, because the
+  first flush carried the heartbeats buffered during the outage (rig runs E2b,
+  E2c and F1); after a 12 s outage it arrived with the first agent heartbeat
+  after T0, at T0 + 17.6 s (run E1).
 - **Breaker open.** A verdict that arrives while the breaker is open is
   dropped and counted in `yuzu_gw_heartbeat_verdict_dropped_total{reason="circuit_open"}`.
   The replay then waits for the breaker to go half open, so recovery is bounded
@@ -932,11 +945,44 @@ are the measured evidence).
   Configuration), plus up to one heartbeat interval, plus one flush, plus the drip position. A
   long outage can open the breaker because other upstream calls the agent keeps
   retrying feed it. Wait: do not restart anything for this (the 58 s recovery
-  under "Observed on a rig" is this case). While the breaker is open the whole
+  in R2d and the recoveries in runs F3a (all agents online at T0 + 85.2 s) and
+  F3b (T0 + 50.4 s) under "Observed on a rig" are this case; in F3a and F3b the agents came back through
+  the breaker's own replay right after the probe closed the breaker, with no wait
+  for a heartbeat). While the breaker is open the whole
   `/readyz` answer is 503, not only its `circuit_breaker` check (INFERRED from
   `yuzu_gw_health.erl`), so a load balancer that probes `/readyz` can take the
   node out of rotation for the open period; `/healthz` (liveness) is not
   affected.
+
+**Several agents and a long outage: the breaker opened (OBSERVED, a normal
+path).** On a rig with 10 or 30 agents behind one gateway, the circuit breaker
+opened 72 s (10 agents, run F3a, 302 s outage) and 40 s (30 agents, run F3b, 152 s
+outage) into a server outage, because the agents' own upstream calls (an
+inventory report, for example) kept failing and each failure counts toward the
+breaker. Every verdict that arrived after the server was back was dropped as
+`circuit_open` (30 in F3a, 75 in F3b) until the breaker's half open probe
+succeeded. In F3a the probes at the 10, 20, 40 and 80 s backoff steps failed
+while the server was down and the 160 s probe succeeded, at T0 + 84.5 s; all 10
+agents were online at T0 + 85.2 s. In F3b the probe succeeded at T0 + 49.1 s and
+all 30 agents were online at T0 + 50.4 s. Recovery came from the breaker's own
+replay (`trigger="breaker"` 1 in both runs; `trigger="heartbeat"` 0 in F3a), not
+from the heartbeat verdict. With 1 agent the breaker stayed closed and the verdict
+replay (`trigger="heartbeat"`) ran at T0 + 0.67 s (run F1). The heartbeat flush
+itself was accepted on the first flush after the server returned in these runs
+(no `larger than max` line), so the buffer was not the cause of the wait.
+
+- What you see: `yuzu_gw_heartbeat_verdict_dropped_total{reason="circuit_open"}`
+  rising, WARN `Circuit breaker: OPEN (will probe in <ms>ms)` lines, and the
+  `half_open -> closed (probe succeeded)` INFO line when it ends.
+- Action: wait. Do not restart the gateway: a restart disconnects every agent the
+  node holds.
+- How long: the wait after the server is back is the remaining breaker backoff.
+  The backoff doubles from 10 s up to `circuit_breaker_max_reset_timeout_ms`
+  (300 s by default). The steps up to 160 s were observed (F3a); a wait on the
+  300 s step was not observed and a longer outage with several agents was not
+  run, so the worst case is bounded by the configured maximum but not measured
+  beyond 160 s. The rig used a failure threshold of 5, a reset timeout of 10 s
+  and a maximum of 300 s, the defaults.
 
 The gateway-side counters move as follows: `yuzu_gw_registration_replay_triggered_total{trigger="heartbeat"}`
 rises by one each time a verdict queued at least one agent,
@@ -950,7 +996,8 @@ keeps rising well after the restart, with both the gateway and the server
 upgraded, read the new gateway counters:
 
 - `yuzu_gw_heartbeat_verdict_dropped_total{reason}`. Operator action per reason
-  (derived from the code; only `circuit_open` was observed on a rig):
+  (derived from the code; on a rig `circuit_open` was observed in R2d, F3a and
+  F3b, and the other reasons by injected verdicts in run E6):
   - `not_local`: the server named sessions this node does not hold (they are
     never replayed). INFERRED: this happens when an agent left this node, or
     changed session, after its heartbeat was buffered and before the verdict was
@@ -974,7 +1021,10 @@ upgraded, read the new gateway counters:
     disconnects every agent it holds, so read "Upgrade day" above first.
   - `malformed`: an id the gateway could not use as a session id (not a binary
     of 1 to 64 bytes). Expected to stay at 0, because the server does not list
-    over-length ids. No gateway-side action; a sustained non-zero count means the
+    over-length ids. Only the length is checked: ids that are not valid UTF-8 and
+    are within 64 bytes were accepted as ordinary ids and counted `not_local`,
+    not `malformed`, in the injected-verdict run E6, which also counted ids of 65
+    and 100 bytes as `malformed`. No gateway-side action; a sustained non-zero count means the
     server and gateway disagree about the field, so collect the gateway debug
     line `Heartbeat verdict: N unknown session(s) listed, M malformed` and report
     it.
@@ -1138,11 +1188,13 @@ failures now count toward the shared breaker (see below).
   server stayed up (see "Known limits" at the end of this section).
 
 **Observed on a rig.** Everything in this list was observed on a local rig and
-is not reproducible from the repository (the raw logs are not published): one
-real agent with the default auto-update setting, one core replica, debug
-builds, gateway log level debug. T0 is the moment the restarted server's
+is not reproducible from the repository (the raw logs are not published): runs
+R1 to R6 used one real agent with the default auto-update setting; the later
+runs in the table after this list used up to 30 agents behind one gateway. All
+runs used one core replica, debug builds, gateway log level debug, one box, and
+(except R6) plaintext on loopback. T0 is the moment the restarted server's
 `/health` first returned 200. A statement marked INFERRED was read from the
-code and was not seen in a run. The run labels (R1 to R6) follow the local rig
+code and was not seen in a run. The run labels (R, E and F) follow the local rig
 notes. The run table, the test results and the not-tested list are in the
 [evidence record](../security-reviews/gateway-heartbeat-verdict-replay-2026-10-04.md);
 the raw rig logs are local only.
@@ -1214,33 +1266,119 @@ the raw rig logs are local only.
   (a planned 300 s outage) the same thing happened: `agents.online` stayed 0 for
   the whole 420 s deadline plus 91 s of further observation, a command returned
   `503 no agent connected`, the route row was tombstoned, the replay counters did
-  not move and the agent never reconnected. This is existing buffer behaviour,
-  not introduced by the verdict replay, but it disabled the recovery this section
-  describes. The R runs above used an agent without the TAR plugin, so their
-  heartbeats were small and did not meet it. The buffer change (one entry per
-  session, chunked flush, byte cap) is built to close it. Post-change rig run:
-  pending. Until it exists, that the change closes the failure is INFERRED from
-  the design, not observed. The run is recorded in the
+  not move and the agent never reconnected. A 10 s outage with 30 agents behind
+  one gateway (run E3c) failed the same way: the first flush after T0 was 28
+  heartbeats, 20,035,889 bytes, and was rejected. This is existing buffer
+  behaviour, not introduced by the verdict replay, but it disabled the recovery
+  this section describes. The R runs above used an agent without the TAR plugin,
+  so their heartbeats were small and did not meet it. After the buffer change
+  (one entry per session, chunked flush, byte cap) the same scenarios recovered
+  (runs F1 to F6 in the table below, at `990e57e48`), and the same sequence on a
+  gateway built before the change failed again (control run F5). The runs are
+  recorded in the
   [evidence record](../security-reviews/gateway-heartbeat-verdict-replay-2026-10-04.md)
   on its `Post-fix rig run:` line.
 - **`yuzu_gw_upstream_notify_dropped_total`.** OBSERVED: the metric has HELP
   and TYPE lines but no sample until a notification is first dropped, so an
   absent series means no drops.
-- **Not tested:** more than one agent, scale, HA or several replicas, notify
+- **Not tested:** 100 or more agents, scale, HA or several replicas, notify
   pressure, agents started with `--no-auto-update`, the `queue_full` and
-  `malformed` verdict reasons, a double replay, a verdict that arrives after a
-  replay it predates, the registry-unavailable abort, an `accepted=false` answer,
-  a failing server feeding the breaker during a drip, the recovery action for
-  R2b (see "Known limits"), and the heartbeat buffer change on a rig (the post-change
-  run with a TAR plugin agent is pending).
+  `malformed` verdict reasons produced by a real server (only injected verdicts
+  were run, E6), a double replay, a verdict that arrives after a replay it
+  predates, the registry-unavailable abort, a crash of the registry process, an
+  `accepted=false` answer, a failing server feeding the breaker during a drip,
+  TLS with the final code (R6 ran earlier), a gateway log level other than debug,
+  a wait for the circuit breaker longer than the 160 s backoff step, a 300 s or
+  longer outage with a closed breaker and several agents (the breaker opened in
+  F3a, 10 agents and 302 s, and in F3b, 30 agents and 152 s), and hot loading the
+  code into a running node (not a supported deployment path).
+
+**Later runs: several agents and the buffer change.** OBSERVED on the same kind
+of local rig (one box, plaintext, loopback, debug builds, one core replica, agent
+build containing #5183). Runs E1 to E6 ran on gateway commit `848709698` (before
+the heartbeat buffer change); runs F1 to F6 ran on `990e57e48` (with it). T0 is
+the first `/health` 200 of the restarted server. "Default agents" means the
+default plugin set with the TAR plugin loaded; "no TAR" means the TAR plugin was
+removed so the heartbeat carried no snapshot.
+
+| Run | Commit | Scenario | Observed |
+|---|---|---|---|
+| E1 | `848709698` | 1 default agent, server killed for a nominal 10 s | verdict at T0 + 17.6 s, same session, no reconnect (R1: T0 + 17.5 s) |
+| E2a | `848709698` | 1 default agent, 300 s outage | FAIL, the stuck batch: 10 buffered heartbeats, 7,067,350 bytes, `larger than max`, never recovered in 420 s plus 91 s |
+| E2b, E2c | `848709698` | 1 agent (E2b with no plugins loaded, E2c no TAR), 302 s and 402 s outages | recovered at T0 + 0.38 s and T0 + 0.33 s, same session and process, breaker closed |
+| E2x | `848709698` | 1 default agent, unplanned 15.6 minute outage | breaker opened, breaker replay at T0 + 36 s, then the stuck batch (31 buffered, 24,805,137 bytes) until the gateway was restarted |
+| E3a | `848709698` | 10 agents, no TAR, 10 s outage | last agent online at T0 + 17.9 s, one replay per agent, drip gap median 44 ms |
+| E3b | `848709698` | 30 agents, no TAR, 10 s outage | last agent online at T0 + 17.6 s, drip gap median 43 ms, queue depth peak 15, gateway CPU peak 35% of one core, RSS 243 to 256 MB |
+| E3c | `848709698` | 30 default agents, 10 s outage | FAIL, the stuck batch: first flush 28 heartbeats, 20,035,889 bytes, no recovery in 200 s plus 61 s |
+| E4 | `848709698` | R2b state reproduced twice (partitions of 431 s and 411 s), then a recovery action | restarting only the agent re-armed the route row at +10.5 s with a new session; restarting only the gateway re-armed it at +14.2 s with a new session; commands worked throughout |
+| E5 | `848709698` | crash and timeout variants with the crash report filter, 30 agents, release build | all seven markers counted 0 in three variants; the control with the filter removed had hits |
+| E6 | `848709698` | injected verdicts, 30 agents | counters and log lines matched the documented reasons (details below) |
+| F1 | `990e57e48` | 1 default agent, 402.5 s outage | verdict at T0 + 0.67 s, same session and process, no `larger than max` |
+| F2 | `990e57e48` | 30 default agents, 12 s outage | first flush 20 heartbeats in 5 chunks, last agent online at T0 + 17.7 s, same sessions |
+| F3a | `990e57e48` | 10 default agents, 302 s outage | breaker opened 72 s into the outage, verdicts dropped as `circuit_open`, recovery by the breaker replay at T0 + 84.5 s |
+| F3b | `990e57e48` | 30 default agents, 152 s outage | breaker opened 40 s into the outage, 30 heartbeats flushed in 9 chunks, recovery by the breaker replay, all online at T0 + 50.4 s |
+| F4 | `990e57e48` | `max_heartbeat_buffer_bytes` at the 1048576 minimum, 5 default agents, 121.5 s outage | `snapshot_evicted` 23 at T0, agents recovered at T0 + 1.1 s |
+| F5 | `848709698` gateway, `990e57e48` server and agent builds | control: 1 default agent, 302 s outage | FAIL as before: 504 `larger than max` lines, 21,629,287 bytes buffered, no recovery |
+| F6 | `990e57e48` | 10 minute steady state after F1 | no WARN or ERROR, counters flat, gateway mean 2.5% of one core |
+
+Details of what these runs showed:
+
+- **Chunk sizes.** The largest chunk observed was 3,142,583 bytes (F3b, 4
+  heartbeats; F3a: 3,139,857 bytes), against the packing limit of 3 MiB
+  (3,145,728 bytes) and the server's receive limit of 4,194,304 bytes. These
+  figures come from a local trace inside the gateway node that recorded the exact
+  encoded size of every chunk; chunk bytes are in no log line and no metric.
+- **Log level.** `Flushed N heartbeats in M chunk(s)` is INFO only when M is
+  greater than 1 (F2: 20 heartbeats in 5 chunks; F3b: 30 in 9). A one chunk flush
+  is DEBUG, so at the default log level a normal flush leaves no line.
+- **Byte cap at the minimum (F4).** With `max_heartbeat_buffer_bytes` at 1048576
+  and 5 agents, `snapshot_evicted` rose to 23 during the outage and kept rising
+  after the server was back (23 to 29 over 90 s, at the agents' 30 s heartbeat
+  instants), because two snapshot-bearing heartbeats of about 0.8 MB landing in
+  the same 1 s flush window exceed that cap. Do not set the cap below a few MiB.
+  At the default 64 MiB `buffer_dropped` stayed 0 in F1, F2, F3a, F3b and F6; a
+  backlog that reaches the default cap was not run (the largest estimated buffer
+  was 24.2 MB).
+- **Steady state (F6).** After recovery, over 10 minutes with one agent: gateway
+  log WARN 0 and ERROR 0, 21 flushes of one heartbeat, every counter unchanged
+  (`coalesced_total` 12, `buffer_dropped` 0, `replay_total` 1), gateway CPU mean
+  2.5% of one core (maximum 15%) and RSS 235 to 248 MB, server CPU mean 0.4%.
+- **Recovery cost (E3b, F2, F3b).** With 30 agents, the drip re-proxied one agent
+  about every 42 to 43 ms (median); gateway CPU peaked at 35% to 42% of one core
+  and RSS reached 243 to 325 MB across these runs (the chunk tracer adds some CPU
+  in F3b). The last agents came back at about T0 + 17.6 s to 17.7 s in the 12 s
+  outage runs because an agent is named only when its own 30 s heartbeat arrives.
+- **Crash redaction (E5).** In a release build with 30 agents, a crash of the
+  upstream client with a call queued, a crash of three per-agent processes and a
+  35 s suspension of the upstream client each left 0 occurrences of the real
+  enrollment token, `BEGIN CERTIFICATE`, `BEGIN CERTIFICATE REQUEST`,
+  `enrollment_token`, `csr_pem`, `machine_certificate` and a synthetic canary in
+  the gateway log; with the filter removed at run time the upstream crash
+  produced 3 of each. The plaintext rig's registrations had empty certificate and
+  CSR fields, so synthetic canary values stood in for them, and the per-agent
+  crash variant gave 0 hits also without the filter, so it does not test the
+  filter. A crash of the registry process was not tested.
+- **Injected verdicts (E6).** A forwarder on the server to gateway leg replaced
+  one empty `BatchHeartbeatResponse` per stage. 4100 listed ids produced
+  `named 4096 session(s)` (the 4 beyond the cap are neither queued nor counted)
+  and, with the truncated flag set, one WARN `Heartbeat verdict truncated by the
+  server` and `unknown_truncated_total` +1. Ids over 64 bytes (65 and 100) were
+  counted `malformed` (+2). Ids that were not valid UTF-8 but within 64 bytes
+  were counted `not_local`, not `malformed`. With
+  `registration_replay_queue_max` 5 and one verdict naming 30 real sessions: 5
+  queued, `queue_full` +25. All 30 agents stayed online in every stage. The
+  forwarder only touched responses without unknown ids, so the injections landed
+  on an otherwise healthy upstream.
 
 **Load and convergence bounds.** The drip sends one ProxyRegister at a time.
 The period per agent is the ProxyRegister RPC time plus the spacing
 (`registration_replay_spacing_ms`, 20 ms by default) plus scheduling. The
 figures below are arithmetic on those constants, not measurements: the
-largest real run was 27 agents (the heartbeat connection-binding soak recorded in
+largest real runs of the replay drip were 30 agents (runs E3b, F2 and F3b under
+"Observed on a rig", drip gap median 42 to 43 ms per agent with the default
+20 ms spacing; the heartbeat connection-binding soak with 27 agents, recorded in
 [its evidence record](../security-reviews/gateway-heartbeat-connection-binding-2026-10-03.md),
-which did not exercise the replay drip), and the fleet-scale measurement is
+did not exercise the replay drip), and the fleet-scale measurement is
 tracked in #5313.
 
 | ProxyRegister RPC time | Drip rate | 1,000 agents | 10,000 agents |
@@ -1334,7 +1472,9 @@ env keys with defaults, which a reverted build ignores.
   in-memory session map only, so a tombstoned row with a live in-memory session
   never produces one. INFERRED impact: harmless with one replica, because
   dispatch uses the in-memory map and does not consult the durable directory; a
-  gap for HA and multi-replica routing. This is not fixed by this change. The observed run had no breaker
+  gap for HA and multi-replica routing. This is not fixed by this change. The state was
+  reproduced twice in a later rig run (partitions of 431 s and 411 s; E4), with the same
+  outcome for 120 s after the partition healed. The observed run had no breaker
   transition and no replay (no replay and no `ProxyRegister` followed the
   partition), so an earlier breaker-recovery full replay could not have repaired
   that run, and R2b itself is not caused by this change. The next entry narrows
@@ -1343,10 +1483,18 @@ env keys with defaults, which a reverted build ignores.
   related to #4627 (the reap-versus-replay race after a drain that runs past the
   270 s reap eligibility horizon, 90 s lease plus 180 s grace). Signal: a repeating `renew_leases` shortfall
   warning on the server with no `Registration replay` line on the gateway after
-  a partition heals. The recovery action is NOT tested: restarting the gateway
-  or the agent was not tried. What is known is only that commands kept working
-  and the row stayed tombstoned for the 4 minutes observed; the row then waits
-  for the agent's own reconnect (INFERRED).
+  a partition heals. Recovery action, OBSERVED in the later rig run (E4, 1 agent,
+  agent build containing #5183, plaintext): restarting only the agent re-armed
+  the route row at +10.5 s with a new session id, with `agents.online` 1
+  throughout; restarting only the gateway re-armed it at +14.2 s, the agent
+  re-registering by itself, also with a new session id. Commands kept working
+  throughout and returned in 1 s afterwards. Both actions give the agent a new
+  session (the old one is not preserved), and a gateway restart disconnects every
+  agent that node holds (see "Upgrade day" above). Not tested: other partition
+  lengths, several agents, and released agent builds without #5183, which did not
+  re-register by themselves after a rejection in the earlier tests (see "Agent dependency"). Without
+  an action the row stayed tombstoned for the 4 minutes observed in R2b and the
+  120 s observed in E4.
 - **A tombstoned route row is no longer repaired by a breaker-recovery full
   replay while a verdict drip is queued or probing.** The server lists only the
   sessions missing from its in-memory map, so a session it still knows whose
@@ -1426,7 +1574,7 @@ env keys with defaults, which a reverted build ignores.
   The filter reduces reasons and stacktraces with the functions the upstream
   client's `format_status` uses (`redact_why` and `redact_stack`), so those two
   share one implementation. They are verified by unit tests on the real processes
-  (the final test count is on the PR); none of this was run on a rig. The residual
+  (the final test count is on the PR). A later rig run (E5, release build, plaintext, 30 agents) crashed the upstream client with a call queued, crashed three per-agent processes and suspended the upstream client for 35 s, and found none of the seven markers (the real enrollment token, the two certificate markers, the three field names and a synthetic canary) in the gateway log in any variant; with the filter removed the upstream crash printed all of them. That rig's certificate and CSR fields were empty, so synthetic values stood in, and a crash of the registry process was not run. The residual
   is therefore: (i) use of the modules outside the application (the filter is
   installed at application start, so a bare `yuzu_gw_upstream`, `yuzu_gw_agent` or
   `yuzu_gw_registry` started in a shell has no filter); (ii) a report shape the
