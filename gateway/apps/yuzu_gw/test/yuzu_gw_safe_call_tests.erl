@@ -82,6 +82,8 @@ safe_call_test_() ->
        fun start_agent_guard/0},
       {"router send_command with the router not running answers an error, nothing leaks",
        fun router_send_command_router_down/0},
+      {"mgmt SendCommand with the router not running answers UNAVAILABLE (14) and logs one WARN",
+       fun mgmt_send_command_router_down/0},
       {"control: a raw ets:insert into the missing pending table does leak",
        fun control_raw_ets_insert_leaks/0}
      ]}.
@@ -396,6 +398,25 @@ router_send_command_router_down() ->
     ?assertEqual({returned, {error, router_unavailable}}, Result),
     assert_no_markers(Events),
     ?assert(has_warning(Events, <<"noproc">>)).
+
+%% The operator-facing handler: a router that is down is a transient condition
+%% (UNAVAILABLE, 14), not INTERNAL (13); one WARN names only the class, however
+%% many commands fail inside the limiter's second, and the request is not logged.
+mgmt_send_command_router_down() ->
+    stop_named(yuzu_gw_router),
+    Request = #{agent_ids => [<<"a-1">>],
+                command => #{plugin => <<"p">>, parameters => #{<<"password">> => ?M_TOKEN}}},
+    {Result, Events} = run_caller(fun() ->
+        [yuzu_gw_mgmt_service:send_command(Request, no_stream) || _ <- lists:seq(1, 5)]
+    end),
+    {returned, Replies} = Result,
+    ?assertEqual(5, length(Replies)),
+    [?assertEqual({error, #{status => 14, message => <<"Command router unavailable">>}}, R)
+     || R <- Replies],
+    assert_no_markers(Events),
+    ?assert(has_warning(Events, <<"noproc">>)),
+    ?assertEqual(1, length([W || W <- warnings(Events),
+                                 contains(W, <<"Call to yuzu_gw_router failed">>)])).
 
 %% The harness sees the leak when there is one: the same insert, made raw.
 control_raw_ets_insert_leaks() ->

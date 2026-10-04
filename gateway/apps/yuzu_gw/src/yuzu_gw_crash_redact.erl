@@ -7,6 +7,8 @@
 %%%   - yuzu_gw_upstream: its replay queue and its mailbox;
 %%%   - yuzu_gw_agent (one per connected agent): the stored `register_req';
 %%%   - yuzu_gw_registry: the `register' call that stores it.
+%%% yuzu_gw_router is protected for other data: it is sent the SendCommand
+%%% request (plugin parameters, which may be secrets).
 %%% Each has a format_status/1 that redacts what OTP passes through that
 %%% callback, but three things reach the log from raw data outside it:
 %%%   - the `messages' (the whole mailbox) and the `error_info' exception of
@@ -52,8 +54,11 @@
 -define(FILTER_ID, yuzu_gw_crash_redact).
 -define(UPSTREAM, yuzu_gw_upstream).
 %% The modules whose processes are protected: the callback modules of the
-%% upstream client, the agent state machine and the registry.
--define(PROTECTED, [yuzu_gw_upstream, yuzu_gw_agent, yuzu_gw_registry]).
+%% upstream client, the agent state machine, the registry and the command router
+%% (its mailbox holds SendCommand requests, whose plugin parameters may be
+%% secrets).
+-define(PROTECTED, [yuzu_gw_upstream, yuzu_gw_agent, yuzu_gw_registry,
+                    yuzu_gw_router]).
 
 %% @doc Add the primary filter. Idempotent: already present is success.
 -spec install() -> ok.

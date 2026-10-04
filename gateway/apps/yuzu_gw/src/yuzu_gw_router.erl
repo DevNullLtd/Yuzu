@@ -17,9 +17,19 @@
 -export([start_link/0, send_command/3]).
 
 %% gen_server callbacks
--export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, code_change/3]).
+-export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, code_change/3,
+         format_status/1]).
+%% Exported for tests.
+-export([command_timeout_s/1]).
 
 -define(SERVER, ?MODULE).
+%% The command timeout, seconds: a caller's value outside 1..3600 is replaced
+%% (see command_timeout_s/1). The server sends 300; the management API accepts
+%% any int32, and a negative value made erlang:send_after/3 raise inside this
+%% process, whose crash report printed the command request.
+-define(DEFAULT_TIMEOUT_S, 300).
+-define(MIN_TIMEOUT_S, 1).
+-define(MAX_TIMEOUT_S, 3600).
 
 -record(fanout, {
     from         :: pid(),              %% caller (mgmt service handler)
@@ -69,8 +79,7 @@ init([]) ->
     {ok, #state{fanouts = #{}}}.
 
 handle_call({send_command, AgentIds, CommandReq, Opts}, {CallerPid, _Tag}, State) ->
-    TimeoutS = maps:get(timeout_seconds, Opts,
-                        application:get_env(yuzu_gw, default_command_timeout_s, 300)),
+    TimeoutS = command_timeout_s(Opts),
 
     Targets = case AgentIds of
         []    -> yuzu_gw_registry:all_agents();
@@ -198,6 +207,54 @@ handle_info(_Info, State) ->
 
 terminate(_Reason, _State) ->
     ok.
+
+%% @doc The timeout of a fanout, in seconds, from the caller's
+%% `timeout_seconds': a value in 1..3600 is used, a larger one is clamped to
+%% 3600, and a missing, non-positive or non-integer one takes the configured
+%% default (default_command_timeout_s, 300 when unset or invalid).
+-spec command_timeout_s(term()) -> pos_integer().
+command_timeout_s(Opts) ->
+    case is_map(Opts) andalso maps:get(timeout_seconds, Opts, undefined) of
+        N when is_integer(N), N > ?MAX_TIMEOUT_S -> ?MAX_TIMEOUT_S;
+        N when is_integer(N), N >= ?MIN_TIMEOUT_S -> N;
+        _ -> yuzu_gw_env:env_int(default_command_timeout_s, ?DEFAULT_TIMEOUT_S,
+                                 ?MIN_TIMEOUT_S, ?MAX_TIMEOUT_S)
+    end.
+
+%% What OTP prints for this process in a terminate or crash report and in
+%% sys:get_status/1: counts only. A send_command request carries the plugin
+%% parameters of the command, which may be secrets, and the last message of a
+%% crashed router is that request. The reason loses its argument lists (the
+%% arguments of the failing call can be the request) and the last message is
+%% reduced to its tag. The mailbox and the stacktrace of the proc_lib crash report
+%% are covered by yuzu_gw_crash_redact. sys:get_state/1 still returns the real
+%% record.
+-spec format_status(map()) -> map().
+format_status(Status) ->
+    maps:map(fun(state, State)   -> redact_state(State);
+                (message, Msg)   -> redact_message(Msg);
+                (reason, Reason) -> yuzu_gw_upstream:redact_reason(Reason);
+                (log, Log)       -> redact_log(Log);
+                (_Key, Value)    -> Value
+             end, Status).
+
+redact_state(#state{fanouts = Fanouts}) when is_map(Fanouts) ->
+    #{fanouts => map_size(Fanouts)};
+redact_state(_Other) ->
+    '$redacted'.
+
+redact_message({'$gen_call', From, Msg}) -> {'$gen_call', From, message_tag(Msg)};
+redact_message({'$gen_cast', Msg})       -> {'$gen_cast', message_tag(Msg)};
+redact_message(Msg)                      -> message_tag(Msg).
+
+message_tag(Msg) when is_atom(Msg) -> Msg;
+message_tag(Msg) when is_tuple(Msg), tuple_size(Msg) > 0, is_atom(element(1, Msg)) ->
+    element(1, Msg);
+message_tag(_Other) -> '$redacted'.
+
+%% The report callback iterates the log, so it stays a list.
+redact_log(Log) when is_list(Log) -> [{log_entries_redacted, length(Log)}];
+redact_log(_Other)                 -> [].
 
 code_change(_OldVsn, State, _Extra) ->
     {ok, State}.
