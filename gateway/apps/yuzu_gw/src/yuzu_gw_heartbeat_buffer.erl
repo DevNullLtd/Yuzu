@@ -476,7 +476,7 @@ screen(Hb) ->
 screen_tags(Hb) ->
     case maps:get(status_tags, Hb, #{}) of
         Tags when is_map(Tags) ->
-            case tag_count(Tags) > ?MAX_STATUS_TAGS
+            case map_size(Tags) > ?MAX_STATUS_TAGS
                  orelse estimate_bytes(Hb#{fleet_snapshot_json => <<>>}) > ?CHUNK_BYTES of
                 true ->
                     without_tags(Hb, heartbeat_oversize);
@@ -504,9 +504,6 @@ without_tags(Hb, Reason) ->
         true  -> {drop, heartbeat_oversize};
         false -> {ok, Hb1, [Reason]}
     end.
-
-tag_count(Tags) when is_map(Tags) -> map_size(Tags);
-tag_count(_)                      -> 0.
 
 %% The tags with every key and value repaired to valid UTF-8, and whether any was
 %% changed; `error' when an entry is not a binary pair (it cannot be repaired).
