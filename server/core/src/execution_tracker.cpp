@@ -2029,12 +2029,19 @@ int ExecutionTracker::reconcile_stale_concurrency_claims(int64_t now) {
 
 std::vector<AgentExecutionStats>
 ExecutionTracker::get_agent_statistics(const ExecutionStatsQuery& q) const {
+    return try_get_agent_statistics(q).value_or(std::vector<AgentExecutionStats>{});
+}
+
+std::optional<std::vector<AgentExecutionStats>>
+ExecutionTracker::try_get_agent_statistics(const ExecutionStatsQuery& q) const {
     std::vector<AgentExecutionStats> results;
+    // A store that is not open, a pool that timed out and a failed statement are all
+    // DEGRADED reads: nullopt, never an empty page that reads as "no executions".
     if (!open_)
-        return results;
+        return std::nullopt;
     auto lease = pool_.try_acquire_for(kReadTimeout);
     if (!lease)
-        return results;
+        return std::nullopt;
 
     // C5 fix: use status values actually set by update_agent_status/refresh_counts.
     // consistency-auditor Gate 4 finding (PR #3784 fix round): 'running' was NOT
@@ -2101,7 +2108,7 @@ ExecutionTracker::get_agent_statistics(const ExecutionStatsQuery& q) const {
 
     pg::PgResult res = pg::exec_params(lease.get(), sql.c_str(), params);
     if (res.status() != PGRES_TUPLES_OK)
-        return results;
+        return std::nullopt;
 
     const int rows = PQntuples(res.get());
     results.reserve(static_cast<std::size_t>(rows));
@@ -2123,12 +2130,17 @@ ExecutionTracker::get_agent_statistics(const ExecutionStatsQuery& q) const {
 
 std::vector<DefinitionExecutionStats>
 ExecutionTracker::get_definition_statistics(const ExecutionStatsQuery& q) const {
+    return try_get_definition_statistics(q).value_or(std::vector<DefinitionExecutionStats>{});
+}
+
+std::optional<std::vector<DefinitionExecutionStats>>
+ExecutionTracker::try_get_definition_statistics(const ExecutionStatsQuery& q) const {
     std::vector<DefinitionExecutionStats> results;
     if (!open_)
-        return results;
+        return std::nullopt;
     auto lease = pool_.try_acquire_for(kReadTimeout);
     if (!lease)
-        return results;
+        return std::nullopt;
 
     // C5 fix: match all terminal execution statuses. NOTE (#3344): this
     // "NOT IN (pending, running)" idiom is deliberately NOT what
@@ -2169,7 +2181,7 @@ ExecutionTracker::get_definition_statistics(const ExecutionStatsQuery& q) const 
 
     pg::PgResult res = pg::exec_params(lease.get(), sql.c_str(), params);
     if (res.status() != PGRES_TUPLES_OK)
-        return results;
+        return std::nullopt;
 
     const int rows = PQntuples(res.get());
     results.reserve(static_cast<std::size_t>(rows));
@@ -2186,12 +2198,16 @@ ExecutionTracker::get_definition_statistics(const ExecutionStatsQuery& q) const 
 }
 
 FleetExecutionSummary ExecutionTracker::get_fleet_summary(int64_t since) const {
+    return try_get_fleet_summary(since).value_or(FleetExecutionSummary{});
+}
+
+std::optional<FleetExecutionSummary> ExecutionTracker::try_get_fleet_summary(int64_t since) const {
     FleetExecutionSummary s;
     if (!open_)
-        return s;
+        return std::nullopt;
     auto lease = pool_.try_acquire_for(kReadTimeout);
     if (!lease)
-        return s;
+        return std::nullopt;
 
     // Total executions and success rate
     {
@@ -2209,7 +2225,11 @@ FleetExecutionSummary ExecutionTracker::get_fleet_summary(int64_t since) const {
             params.push_back(std::to_string(since));
         }
         pg::PgResult res = pg::exec_params(lease.get(), sql.c_str(), params);
-        if (res.status() == PGRES_TUPLES_OK && PQntuples(res.get()) > 0) {
+        // Any failed sub-query is a degraded read: a half-populated summary would present
+        // zeros for the failed parts as if they were measurements.
+        if (res.status() != PGRES_TUPLES_OK)
+            return std::nullopt;
+        if (PQntuples(res.get()) > 0) {
             s.total_executions = to_i64(col(res.get(), 0, 0));
             s.overall_success_rate = to_d(col(res.get(), 0, 1));
             s.avg_duration_seconds = to_d(col(res.get(), 0, 2));
@@ -2223,7 +2243,9 @@ FleetExecutionSummary ExecutionTracker::get_fleet_summary(int64_t since) const {
         pg::PgResult res = pg::exec_params(
             lease.get(), "SELECT COUNT(*) FROM execution_tracker.executions WHERE dispatched_at >= $1",
             std::vector<std::string>{std::to_string(today_start)});
-        if (res.status() == PGRES_TUPLES_OK && PQntuples(res.get()) > 0)
+        if (res.status() != PGRES_TUPLES_OK)
+            return std::nullopt;
+        if (PQntuples(res.get()) > 0)
             s.executions_today = to_i64(col(res.get(), 0, 0));
     }
 
@@ -2236,7 +2258,9 @@ FleetExecutionSummary ExecutionTracker::get_fleet_summary(int64_t since) const {
             params.push_back(std::to_string(since));
         }
         pg::PgResult res = pg::exec_params(lease.get(), sql.c_str(), params);
-        if (res.status() == PGRES_TUPLES_OK && PQntuples(res.get()) > 0)
+        if (res.status() != PGRES_TUPLES_OK)
+            return std::nullopt;
+        if (PQntuples(res.get()) > 0)
             s.active_agents = to_i64(col(res.get(), 0, 0));
     }
 

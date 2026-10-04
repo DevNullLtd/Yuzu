@@ -9373,10 +9373,20 @@ void RestApiV1::register_routes(
              [perm_fn, execution_tracker](const httplib::Request& req, httplib::Response& res) {
                  if (!perm_fn(req, res, "Execution", "Read"))
                      return;
-                 auto summary = execution_tracker->get_fleet_summary();
+                 // try_get_*: a degraded read is a 503, never a zeroed summary served as a
+                 // measurement (#4644 Gate 7).
+                 const auto summary = execution_tracker->try_get_fleet_summary();
+                 if (!summary) {
+                     res.status = 503;
+                     res.set_content(
+                         detail::a4_error(res, "execution statistics store degraded - please retry",
+                                          {.retry_after_ms = 2000}),
+                         "application/json");
+                     return;
+                 }
                  // #2146 Batch B3: shared builder (execution_statistics_model.hpp) --
                  // the MCP twin get_execution_statistics calls the SAME function.
-                 res.set_content(ok_json(fleet_execution_summary_json(summary)),
+                 res.set_content(ok_json(fleet_execution_summary_json(*summary)),
                                  "application/json");
              });
 
@@ -9432,7 +9442,18 @@ void RestApiV1::register_routes(
                  if (gate.scope)
                      q.visible_agents =
                          std::vector<std::string>(gate.scope->begin(), gate.scope->end());
-                 auto stats = execution_tracker->get_agent_statistics(q);
+                 // A degraded read (store not open, pool timeout, failed statement) is a 503:
+                 // an empty page here would read as "this scope has no executions".
+                 const auto stats_opt = execution_tracker->try_get_agent_statistics(q);
+                 if (!stats_opt) {
+                     res.status = 503;
+                     res.set_content(
+                         detail::a4_error(res, "execution statistics store degraded - please retry",
+                                          {.retry_after_ms = 2000}),
+                         "application/json");
+                     return;
+                 }
+                 const auto& stats = *stats_opt;
                  JArr arr;
                  // #2146 Batch B3: shared builder -- the MCP twin
                  // get_execution_statistics_by_agent calls the SAME function.
@@ -9471,7 +9492,16 @@ void RestApiV1::register_routes(
                  }
                  if (q.limit > 1000)
                      q.limit = 1000;
-                 auto stats = execution_tracker->get_definition_statistics(q);
+                 const auto stats_opt = execution_tracker->try_get_definition_statistics(q);
+                 if (!stats_opt) {
+                     res.status = 503;
+                     res.set_content(
+                         detail::a4_error(res, "execution statistics store degraded - please retry",
+                                          {.retry_after_ms = 2000}),
+                         "application/json");
+                     return;
+                 }
+                 const auto& stats = *stats_opt;
                  JArr arr;
                  // #2146 Batch B3: shared builder -- the MCP twin
                  // get_execution_statistics_by_definition calls the SAME function.
@@ -14289,10 +14319,18 @@ void RestApiV1::register_routes(
              [perm_fn, execution_tracker](const httplib::Request& req, httplib::Response& res) {
                  if (!perm_fn(req, res, "Infrastructure", "Read"))
                      return;
-                 auto fleet = execution_tracker->get_fleet_summary();
+                 const auto fleet = execution_tracker->try_get_fleet_summary();
+                 if (!fleet) {
+                     res.status = 503;
+                     res.set_content(
+                         detail::a4_error(res, "execution statistics store degraded - please retry",
+                                          {.retry_after_ms = 2000}),
+                         "application/json");
+                     return;
+                 }
                  // #2146 Batch B3: shared builder (execution_statistics_model.hpp) --
                  // the MCP twin get_fleet_statistics calls the SAME function.
-                 res.set_content(ok_json(fleet_statistics_json(fleet)), "application/json");
+                 res.set_content(ok_json(fleet_statistics_json(*fleet)), "application/json");
              });
 
     // ── File Retrieval (capability 10.13) ────────────────────────────────

@@ -3268,7 +3268,8 @@ static const ToolDef kTools[] = {
      "/api/v1/execution-statistics/agents. Use to find which agents are failing "
      "disproportionately, or to see one agent's execution history at a glance (pass agent_id). "
      "An empty data array means no agent has any completed execution matching the filter, not a "
-     "fault. Confined by the caller's management-group scope (ADR-0017, #3526) like its REST "
+     "fault; a degraded statistics store is a retryable error carrying retry_after_ms, never an "
+     "empty array. Confined by the caller's management-group scope (ADR-0017, #3526) like its REST "
      "twin: only rows for agents the caller can see are returned, filtered before the limit, so "
      "a confined caller's empty data array can also mean none of their visible agents match. "
      "Requires Execution:Read.",
@@ -3281,7 +3282,9 @@ static const ToolDef kTools[] = {
      "1000 rows. Mirrors GET /api/v1/execution-statistics/definitions. Use to find which "
      "instruction definitions fail disproportionately across the fleet, or to see one "
      "definition's execution history at a glance (pass definition_id). An empty data array "
-     "means no definition has any completed execution matching the filter, not a fault. NOT "
+     "means no definition has any completed execution matching the filter, not a fault; a "
+     "degraded statistics store is a retryable error carrying retry_after_ms, never an empty "
+     "array. NOT "
      "confined by the caller's own management-group scope -- like its REST twin, this "
      "fleet-wide rollup returns rows regardless of the caller's visible-agent set. Requires "
      "Execution:Read.",
@@ -21161,9 +21164,19 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
-                auto summary = execution_tracker->get_fleet_summary();
+                // try_get_*: a degraded read is a retryable error, never a zeroed summary
+                // serialized as a measurement (#4644 Gate 7).
+                const auto summary = execution_tracker->try_get_fleet_summary();
+                if (!summary) {
+                    mcp_audit("failure", "get_execution_statistics degraded");
+                    res.set_content(a4_error(kInternalError, "Execution statistics store degraded",
+                                             "retry shortly",
+                                             /*retry_after_ms=*/mcp::kMcpStoreFaultShortRetryMs),
+                                    "application/json");
+                    return;
+                }
                 mcp_audit("success");
-                res.set_content(success_response(id, tool_result(fleet_execution_summary_json(summary),
+                res.set_content(success_response(id, tool_result(fleet_execution_summary_json(*summary),
                                                                   kObjectOutputSchema)),
                                 "application/json");
                 return;
@@ -21256,7 +21269,16 @@ McpServer::HandlerFn McpServer::build_handler(
                 if (stats_gate.scope)
                     q.visible_agents = std::vector<std::string>(stats_gate.scope->begin(),
                                                                 stats_gate.scope->end());
-                auto stats = execution_tracker->get_agent_statistics(q);
+                const auto stats_opt = execution_tracker->try_get_agent_statistics(q);
+                if (!stats_opt) {
+                    mcp_audit("failure", "get_execution_statistics_by_agent degraded");
+                    res.set_content(a4_error(kInternalError, "Execution statistics store degraded",
+                                             "retry shortly",
+                                             /*retry_after_ms=*/mcp::kMcpStoreFaultShortRetryMs),
+                                    "application/json");
+                    return;
+                }
+                const auto& stats = *stats_opt;
                 JArr arr;
                 for (const auto& s : stats)
                     arr.add_raw(agent_execution_stats_row_json(s));
@@ -21338,7 +21360,16 @@ McpServer::HandlerFn McpServer::build_handler(
                 q.limit = saturate_to_int(*limit_opt);
                 if (q.limit > 1000)
                     q.limit = 1000;
-                auto stats = execution_tracker->get_definition_statistics(q);
+                const auto stats_opt = execution_tracker->try_get_definition_statistics(q);
+                if (!stats_opt) {
+                    mcp_audit("failure", "get_execution_statistics_by_definition degraded");
+                    res.set_content(a4_error(kInternalError, "Execution statistics store degraded",
+                                             "retry shortly",
+                                             /*retry_after_ms=*/mcp::kMcpStoreFaultShortRetryMs),
+                                    "application/json");
+                    return;
+                }
+                const auto& stats = *stats_opt;
                 JArr arr;
                 for (const auto& s : stats)
                     arr.add_raw(definition_execution_stats_row_json(s));
@@ -21364,10 +21395,18 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
-                auto fleet = execution_tracker->get_fleet_summary();
+                const auto fleet = execution_tracker->try_get_fleet_summary();
+                if (!fleet) {
+                    mcp_audit("failure", "get_fleet_statistics degraded");
+                    res.set_content(a4_error(kInternalError, "Execution statistics store degraded",
+                                             "retry shortly",
+                                             /*retry_after_ms=*/mcp::kMcpStoreFaultShortRetryMs),
+                                    "application/json");
+                    return;
+                }
                 mcp_audit("success");
                 res.set_content(
-                    success_response(id, tool_result(fleet_statistics_json(fleet), kObjectOutputSchema)),
+                    success_response(id, tool_result(fleet_statistics_json(*fleet), kObjectOutputSchema)),
                     "application/json");
                 return;
             }

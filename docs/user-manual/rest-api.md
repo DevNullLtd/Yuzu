@@ -7249,6 +7249,12 @@ Get fleet-wide execution summary.
 
 **Permission:** `Execution:Read`
 
+**Degraded store (this route, `/agents`, `/definitions` and `GET /api/v1/statistics`):** a
+statistics read that fails because the execution store is not open, the connection pool timed
+out or a query failed answers `503` with `retry_after_ms: 2000`. It used to answer `200` with an
+empty list (or an all-zero summary), which reads as "no executions". A scope or filter that
+genuinely matches nothing is still `200` with an empty `data` array.
+
 **Response:**
 
 ```json

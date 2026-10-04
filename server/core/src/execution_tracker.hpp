@@ -497,6 +497,18 @@ public:
                                                               const std::string& user);
 
     // Statistics (capability 1.9)
+    //
+    // The `try_get_*` forms are what an operator-facing surface MUST use: `nullopt` means the
+    // read DEGRADED (store not open, pool acquire timed out, or a statement failed), which is
+    // not the same fact as "no executions". The plain `get_*` forms collapse a degrade into
+    // an empty/zeroed value and exist for callers that have no way to report one; a REST or
+    // MCP handler answering a degrade with 200 and `[]` presents a wrong result as correct
+    // (#4644 Gate 7).
+    [[nodiscard]] std::optional<std::vector<AgentExecutionStats>>
+    try_get_agent_statistics(const ExecutionStatsQuery& q = {}) const;
+    [[nodiscard]] std::optional<std::vector<DefinitionExecutionStats>>
+    try_get_definition_statistics(const ExecutionStatsQuery& q = {}) const;
+    [[nodiscard]] std::optional<FleetExecutionSummary> try_get_fleet_summary(int64_t since = 0) const;
     std::vector<AgentExecutionStats> get_agent_statistics(const ExecutionStatsQuery& q = {}) const;
     std::vector<DefinitionExecutionStats> get_definition_statistics(const ExecutionStatsQuery& q = {}) const;
     FleetExecutionSummary get_fleet_summary(int64_t since = 0) const;

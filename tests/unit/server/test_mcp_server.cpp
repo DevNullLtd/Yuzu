@@ -32969,3 +32969,40 @@ TEST_CASE("MCP get_execution_statistics_by_agent: an unwired fleet-read gate fai
     REQUIRE(denied);
     CHECK(denied->body.find("agent-gate") == std::string::npos);
 }
+
+// #4644 Gate 7: a degraded statistics read is a retryable error, never an empty array or a
+// zeroed summary serialized as a measurement.
+TEST_CASE("MCP execution statistics tools: a degraded tracker read is a retryable error",
+          "[pg][mcp][integration][operator_surface][degrade]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
+    auto now = operator_surface_now();
+    auto id = tracker.create_execution(b3_make_exec("def-b3-degrade", "succeeded", 1, 1, 0,
+                                                   now - 300, now - 290));
+    REQUIRE(id.has_value());
+    b3_insert_agent_status(tracker, *id, "agent-b3-d", "success", 0, now - 300, now - 290);
+
+    McpTestServer ts;
+    ts.execution_tracker_for_test = &tracker;
+    ts.start();
+    {
+        auto lease = tracker_bundle.pool().try_acquire_for(std::chrono::seconds(5));
+        REQUIRE(lease);
+        pg::PgResult r = pg::exec_params(
+            lease.get(), "ALTER TABLE execution_tracker.executions RENAME TO executions_hidden_4644",
+            std::vector<std::string>{});
+        REQUIRE(r.status() == PGRES_COMMAND_OK);
+    }
+    int i = 0;
+    for (const char* tool : {"get_execution_statistics", "get_execution_statistics_by_agent",
+                             "get_execution_statistics_by_definition", "get_fleet_statistics"}) {
+        auto res = ts.call(std::string(R"({"jsonrpc":"2.0","method":"tools/call","id":)") +
+                           std::to_string(100 + i++) + R"(,"params":{"name":")" + tool +
+                           R"(","arguments":{}}})");
+        REQUIRE(res);
+        INFO(tool);
+        const auto body = res->body;
+        CHECK(body.find("Execution statistics store degraded") != std::string::npos);
+        CHECK(body.find("retry_after_ms") != std::string::npos);
+    }
+}

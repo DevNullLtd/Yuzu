@@ -226,6 +226,18 @@ server configuration rather than from a request.
 data migration is needed. During a rolling upgrade, replicas on the old and new build answer a
 malformed value differently (`200` versus `400`).
 
+## Changed: a degraded execution-statistics read is a 503, not an empty 200 (#4644)
+
+`GET /api/v1/execution-statistics`, `/agents`, `/definitions`, `GET /api/v1/statistics` and the
+four MCP statistics tools used to answer a store failure (execution store not open, pool timeout,
+failed query) with `200` and an empty list or an all-zero summary, which reads as "no
+executions". They now answer `503` with `retry_after_ms: 2000` on REST and a retryable error with
+`retry_after_ms` on MCP. A filter or confined scope that genuinely matches nothing is still `200`
+with an empty `data` array.
+
+**What to do.** Treat a `503` from these routes as retryable. A dashboard or script that read
+`data: []` as "nothing to report" during an outage will now see the error instead.
+
 ## Breaking: per-agent execution statistics are confined to the caller's scope (#3526)
 
 `GET /api/v1/execution-statistics/agents` and the MCP tool `get_execution_statistics_by_agent` used

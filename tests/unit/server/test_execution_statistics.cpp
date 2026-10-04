@@ -6,6 +6,8 @@
  */
 
 #include "execution_tracker.hpp"
+#include "pg/pg_exec.hpp"   // exec_params: degrade the store in the try_get_* test
+#include "pg/pg_raii.hpp"
 #include "test_execution_tracker_pg_helper.hpp"
 
 #include <catch2/catch_test_macros.hpp>
@@ -500,4 +502,43 @@ TEST_CASE("ExecutionStatistics: definition stats skips pending/running execution
     auto stats = tracker.get_definition_statistics();
     REQUIRE(stats.size() == 1);
     CHECK(stats[0].total_executions == 1); // only the succeeded one
+}
+
+// ============================================================================
+// #4644 Gate 7: a degraded read is distinguishable from "no executions"
+// ============================================================================
+
+TEST_CASE("ExecutionStatistics: try_get_* reports a degraded store as nullopt, not empty",
+          "[pg][execution_statistics][degrade]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
+    auto id = tracker.create_execution(make_exec("def-degrade", "succeeded", 1, 1, 0));
+    REQUIRE(id.has_value());
+    insert_agent_status(tracker, *id, "agent-1", "success");
+
+    // Healthy: a value, even when it is an honest empty one.
+    REQUIRE(tracker.try_get_agent_statistics().has_value());
+    CHECK(tracker.try_get_agent_statistics()->size() == 1);
+    ExecutionStatsQuery none;
+    none.visible_agents = std::vector<std::string>{}; // deny-all: honest empty, NOT a degrade
+    REQUIRE(tracker.try_get_agent_statistics(none).has_value());
+    CHECK(tracker.try_get_agent_statistics(none)->empty());
+    REQUIRE(tracker.try_get_fleet_summary().has_value());
+    CHECK(tracker.try_get_fleet_summary()->total_executions == 1);
+
+    // Degraded: every statistics query reads this table.
+    {
+        auto lease = tracker_bundle.pool().try_acquire_for(std::chrono::seconds(5));
+        REQUIRE(lease);
+        pg::PgResult r = pg::exec_params(
+            lease.get(), "ALTER TABLE execution_tracker.executions RENAME TO executions_hidden_4644",
+            std::vector<std::string>{});
+        REQUIRE(r.status() == PGRES_COMMAND_OK);
+    }
+    CHECK_FALSE(tracker.try_get_agent_statistics().has_value());
+    CHECK_FALSE(tracker.try_get_definition_statistics().has_value());
+    CHECK_FALSE(tracker.try_get_fleet_summary().has_value());
+    // The plain forms keep their documented collapse for callers that cannot report a degrade.
+    CHECK(tracker.get_agent_statistics().empty());
+    CHECK(tracker.get_fleet_summary().total_executions == 0);
 }

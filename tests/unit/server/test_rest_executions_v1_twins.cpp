@@ -1071,3 +1071,43 @@ TEST_CASE("GET /api/v1/execution-statistics/agents: a gate denial is a 403 and a
     CHECK(denied->status == 403);
     CHECK(denied->body.find("agent-in") == std::string::npos);
 }
+
+// #4644 Gate 7: the statistics tracker reads used to answer a store degrade (pool timeout,
+// failed statement) with an EMPTY or ZEROED value, so REST served 200 `[]` / an all-zero
+// summary: "no executions" presented as a measurement. A degraded read is now a 503 with
+// retry_after_ms; an HONEST empty scope (deny-all, no rows) is still a 200 `[]`.
+TEST_CASE("execution-statistics routes: a degraded tracker read is a 503, an honest empty is a 200",
+          "[pg][rest][executions][v1][statistics][degrade]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, execv1_responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecV1Harness h(pool);
+    stats_exec_for(h, {"agent-in"});
+
+    // Honest empty: a deny-all scope is a valid, successful, EMPTY answer.
+    h.fleet_read_scope = authz::VisibleSet{std::unordered_set<std::string>{}};
+    auto honest = h.sink.Get("/api/v1/execution-statistics/agents");
+    REQUIRE(honest);
+    CHECK(honest->status == 200);
+    CHECK(nlohmann::json::parse(honest->body)["data"].empty());
+    h.fleet_read_scope = std::nullopt;
+
+    // Degrade: hide the table every statistics query reads, over a side connection.
+    exec_sql(db.dsn(), "ALTER TABLE execution_tracker.executions RENAME TO executions_hidden_4644");
+    std::vector<std::pair<std::string, int>> seen;
+    for (const char* route : {"/api/v1/execution-statistics", "/api/v1/execution-statistics/agents",
+                              "/api/v1/execution-statistics/definitions", "/api/v1/statistics"}) {
+        auto res = h.sink.Get(route);
+        REQUIRE(res);
+        seen.emplace_back(route, res->status);
+        if (res->status == 503) {
+            auto body = nlohmann::json::parse(res->body);
+            REQUIRE(body.contains("error"));
+            CHECK(body["error"]["retry_after_ms"] == 2000);
+        }
+    }
+    exec_sql(db.dsn(), "ALTER TABLE execution_tracker.executions_hidden_4644 RENAME TO executions");
+    for (const auto& [route, status] : seen) {
+        INFO(route);
+        CHECK(status == 503);
+    }
+}
