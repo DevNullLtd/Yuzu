@@ -172,9 +172,13 @@ sudo tar -czf /var/backups/yuzu/yuzu-keys-$STAMP.tar.gz \
 ```
 
 ```powershell
-# Windows
+# Windows (elevated). The Windows installer stores the connection string in
+# a file only Administrators and SYSTEM can read; a hand-configured server may
+# use the YUZU_POSTGRES_DSN environment variable instead.
 $Stamp = Get-Date -Format yyyyMMddTHHmmssZ
-pg_dump $Env:YUZU_POSTGRES_DSN --format=custom > "C:\Backups\Yuzu\yuzu-$Stamp.dump"
+$DsnFile = "C:\ProgramData\Yuzu Server\postgres.dsn"
+$Dsn = if (Test-Path $DsnFile) { (Get-Content -LiteralPath $DsnFile -Raw).Trim() } else { $Env:YUZU_POSTGRES_DSN }
+pg_dump $Dsn --format=custom > "C:\Backups\Yuzu\yuzu-$Stamp.dump"
 Compress-Archive -Path C:\ProgramData\Yuzu\certs -DestinationPath "C:\Backups\Yuzu\yuzu-keys-$Stamp.zip"
 ```
 

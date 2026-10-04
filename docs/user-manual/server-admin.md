@@ -38,6 +38,7 @@ The Yuzu server binary accepts the following command-line flags. All flags are o
 |---|---|---|
 | `--config` | *(auto)* | Path to `yuzu-server.cfg`. If omitted, uses the platform default: `/etc/yuzu/yuzu-server.cfg` on Linux (and on macOS as root), `~/Library/Application Support/Yuzu/yuzu-server.cfg` on macOS as a non-root user, `C:\ProgramData\Yuzu\yuzu-server.cfg` on Windows. |
 | `--data-dir` | *(config dir)* | Directory for runtime state files (enrollment tokens, pending agents, auto-approve rules) and the NVD CVE cache `nvd_cves.db`, the one remaining server SQLite store, plus the `agent-updates/` (unless `--update-dir` is set) and `upload-blobs/` file directories. All other server data is in PostgreSQL. Defaults to the parent directory of `--config`. Use this in containerized deployments where the config file is on a read-only mount but state files need a writable volume. The path is resolved to its canonical form at startup (symlinks are followed). Env: `YUZU_DATA_DIR`. |
+| `--postgres-dsn-file` | *(none)* | Read the PostgreSQL connection string from this file instead of `--postgres-dsn`, which puts it, password included, on the command line where every local user can read it. The whole file is the connection string; trailing whitespace (including the final newline) and a UTF-8 byte-order mark are ignored. Fails at startup if the file is missing, empty or larger than 64 KiB, and cannot be combined with `--postgres-dsn` / `YUZU_POSTGRES_DSN`. The file's own permissions are not checked (a Docker or Kubernetes secret is mounted world-readable inside its container): keep it where only the server's account can read it. The Windows installer stores it in the locked `%ProgramData%\Yuzu Server\postgres.dsn` and passes this flag. Env: `YUZU_POSTGRES_DSN_FILE`. |
 | `--web-port` | `8080` | HTTP listen port for the dashboard and REST API. |
 | `--web-address` | `127.0.0.1` | Web UI bind address. |
 | `--shutdown-drain-seconds` | `0` | On `SIGTERM`, keep serving for at least this many seconds after `/readyz` turns `503 draining`, so a load balancer stops routing here before the listener closes (HA WS-8). Range 0–60; `0` keeps the listener-closes-at-once behaviour a single server has always had. Set it to at least the load balancer's health-check interval × unhealthy threshold, plus one interval — see "Load balancers and shutdown drain" below. Env: `YUZU_SHUTDOWN_DRAIN_SECONDS`. |
@@ -67,6 +68,7 @@ The Yuzu server binary accepts the following command-line flags. All flags are o
 | `--oidc-issuer` | *(none)* | OIDC identity provider issuer URL (e.g., `https://login.microsoftonline.com/{tenant}/v2.0`). Env: `YUZU_OIDC_ISSUER`. |
 | `--oidc-client-id` | *(none)* | OIDC application (client) ID. Env: `YUZU_OIDC_CLIENT_ID`. |
 | `--oidc-client-secret` | *(none)* | OIDC client secret. Env: `YUZU_OIDC_CLIENT_SECRET`. |
+| `--oidc-client-secret-file` | *(none)* | Read the OIDC client secret from this file instead of `--oidc-client-secret`, keeping it off the command line. Same rules as `--postgres-dsn-file`; cannot be combined with `--oidc-client-secret` / `YUZU_OIDC_CLIENT_SECRET`. Env: `YUZU_OIDC_CLIENT_SECRET_FILE`. |
 | `--oidc-redirect-uri` | *(auto)* | OIDC redirect URI. If omitted, auto-computed from the web address and port. Must match the registered redirect in your identity provider. Env: `YUZU_OIDC_REDIRECT_URI`. |
 | `--oidc-admin-group` | *(none)* | Entra ID group object ID that maps to the admin role. Users in this group are granted admin access on OIDC login. Env: `YUZU_OIDC_ADMIN_GROUP`. (Value is trimmed automatically, same as `--saml-admin-group` — #1830.) |
 | `--oidc-skip-tls-verify` | off | Disable TLS certificate verification for OIDC endpoints. **Insecure — dev only.** Env: `YUZU_OIDC_SKIP_TLS_VERIFY`. |
@@ -222,6 +224,47 @@ separately.
 ---
 
 ## Upgrade Notes
+
+### vNEXT — the Windows server installer locks its data directory and keeps secrets off the command line (#5196, #5210, #5272; breaking for unattended installs)
+
+Windows server is not a supported deployment (ADR-0035), and the `YuzuServer` service cannot yet run under the Service Control Manager at all (#5325). This note is for anyone using `YuzuServerSetup-*.exe` anyway.
+
+**What the installer does now.** The secrets it handles are kept in `%ProgramData%\Yuzu Server`, which it locks to exactly Administrators and SYSTEM and verifies before it installs anything:
+
+| File | Holds | Passed to the server as |
+|---|---|---|
+| `yuzu-server.cfg` | dashboard password hashes | `--config` |
+| `postgres.dsn` | the PostgreSQL connection string | `--postgres-dsn-file` |
+| `oidc-client-secret` | the OIDC client secret | `--oidc-client-secret-file` |
+| `certs\` | your TLS certificates and keys | `--https-cert`, `--cert`, … |
+| `data\` | the server's data directory | `--data-dir` |
+
+The service's command line, which every local user can read, now carries only these paths, and is written with the executable path quoted. Earlier installers meant to pass the OIDC client secret there. In practice, an `sc.exe` quoting fault dropped every argument, so the service they registered ran with no arguments at all, and the directory was readable by local users. The installer reads the command line back after writing it. If it cannot be written, for example because security software blocks the change, the service is disabled and Setup exits with code **10**, rather than leaving the old command line in force.
+
+The server's own CA, default certificates and key-encryption keys stay where the server keeps them: `C:\ProgramData\Yuzu\certs`. The server applies its own Administrators-and-SYSTEM permissions to that folder and to those key files when it writes them. Moving them into the locked directory needs server changes first (#5273).
+
+**Unattended installs:**
+
+- **A connection string is required on a fresh install, and on an upgrade from any earlier version**, because no earlier version stored one. Give `/POSTGRES_DSN_FILE=<file>` (preferred) or `/POSTGRES_DSN=<connection string>`. Without one the install stops with exit code 7. The exception is a `YUZU_POSTGRES_DSN` environment variable, set machine-wide or for the service: the installer then goes ahead and logs a warning that local users can read it. Earlier installers never passed a connection string, so the service they registered could not start.
+- **A `YUZU_POSTGRES_DSN` or `YUZU_OIDC_CLIENT_SECRET` environment variable cannot be combined with a stored secret of the same kind.** The server refuses to start with both, so the installer refuses first and changes nothing. Remove the environment variable, then run the installer again.
+- **An OIDC client secret is not carried from an earlier version:** none stored it anywhere except the service's command line, and their own command line lost its arguments. Give it with `/OIDC_CLIENT_SECRET_FILE=` (preferred) or `/OIDC_CLIENT_SECRET=`. If you had added `--oidc-client-secret` to the service's command line by hand and OIDC is enabled on the upgrade (`/OIDC_ISSUER`), the upgrade refuses until you give the secret again; rotate it in your identity provider afterwards, since local users could read it.
+- **An upgrade keeps the existing accounts** when `/ADMIN_USER`, `/ADMIN_PASS` and the operator pair are left out. It keeps the stored connection string unless a new one is given, and keeps the stored OIDC secret when `/OIDC_ISSUER` is given again. Repeat your other options (`/GATEWAY`, `/OIDC_ISSUER`, `/OIDC_CLIENT_ID`, …) on an upgrade: they are not remembered.
+- **Upgrade in place; do not uninstall the previous version first.** Uninstalling removes the service and the installation record but keeps the old, unlocked data directory. The new installer then cannot tell that an administrator created that directory, and refuses it.
+- **Exit code 7** means the install was stopped before any file was installed: an input was missing or invalid, or something could not be secured. The reason is in the setup log on a line starting `PrepareToInstall:`. If the existing service had been stopped by then, it is left stopped, and the message says so (and says if it was disabled). The exception is an upgrade from an unsecured directory that stops before the old directory is moved: the service is then started again. On an upgrade of an already-secured install, the message also lists any files in the data directory that had already been replaced.
+- **Exit code 10** means the files were installed but the service could not be registered or its command line could not be written. Setup disables the service if it can, and the message and log say whether it did; if not, disable it yourself (`sc config YuzuServer start= disabled`) until the cause is fixed.
+- **Secrets on the command line are recorded** in the setup log (`/LOG=`) and by deployment tools such as SCCM (AppEnforce.log) and Intune, including any `/ADMIN_PASS=`, `/OPERATOR_PASS=`, `/POSTGRES_DSN=` or `/OIDC_CLIENT_SECRET=` value. Prefer `/POSTGRES_DSN_FILE=` and `/OIDC_CLIENT_SECRET_FILE=`. Stage those files in a pre-step, with permissions only Administrators and SYSTEM can read, and delete them afterwards: the installer copies them and leaves the originals. `/ADMIN_PASS=` and `/OPERATOR_PASS=` have no file form, so treat those logs as secrets: restrict or purge them after the deployment.
+
+**Upgrading from an earlier version.** Its data directory is not locked, so the installer builds a new, locked one. It copies across only plain files that are owned by Administrators or SYSTEM and that no other account can change, from folders that are owned by Administrators or SYSTEM and in which no other account can delete or rename anything: the configuration, `postgres.dsn`, `oidc-client-secret`, and the files directly in `certs\` and `data\`. Subdirectories stay behind. The old directory is renamed to `%ProgramData%\Yuzu Server.insecure-<date>-<time>`; it is never changed or deleted.
+
+If any file that would be copied, or a folder holding one, fails that check, or a file is a link or a hard link, the upgrade stops and names it, and nothing is changed. This also catches a folder that a standard user created before the original install: they stay its owner, so they could have swapped its files for their own. Inspect what is named. If it is yours, remove it, or make Administrators its owner and reset its permissions (`icacls <path> /setowner *S-1-5-32-544 /L`, then `icacls <path> /reset /L`), then run the installer again. An unlocked `%ProgramData%\Yuzu Server` with no Yuzu Server installation registered on the machine is refused, because it cannot be shown that an administrator created it. A junction or symbolic link at that path is always refused.
+
+**After upgrading from an earlier version:**
+
+1. **Rotate what the old directory exposed.** Local users could read it, so treat its contents as disclosed: reset the dashboard passwords, re-issue the TLS keys in `certs\`, and rotate the OIDC client secret.
+2. **Move the server's data subdirectories, if you ran the server.** `data\agent-updates\` and `data\upload-blobs\` (OTA packages and uploads that database rows refer to) stay in the renamed directory. Local users could create files in them, so check their contents. Then stop the server, move them into the new `data\`, make Administrators their owner and reset their permissions: `icacls "%ProgramData%\Yuzu Server\data" /setowner *S-1-5-32-544 /T /L`, then `icacls "%ProgramData%\Yuzu Server\data" /reset /T /L`. If you would rather not trust them, re-upload the packages instead.
+3. **Delete the renamed directory** once the upgrade is confirmed. It still holds the old password hashes and keys.
+
+**Constrained Language Mode** (WDAC script enforcement, or AppLocker script rules for an install run by an administrator) blocks the .NET calls the installer needs to hash new passwords, so an install with `/ADMIN_PASS` stops with a message saying so. An upgrade that keeps the existing accounts works, and so does an install run as SYSTEM, which AppLocker exempts.
 
 ### vNEXT — a hand-edited config listing local users but none with `role=admin` now fails boot, on every restart (breaking)
 
