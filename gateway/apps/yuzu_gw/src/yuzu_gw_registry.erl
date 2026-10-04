@@ -45,24 +45,28 @@
 %%% registration is proxied upstream, so N concurrent Registers on a connection
 %%% admit at most the cap and the rest are refused with nothing sent to the
 %%% server. store_pending/3 then makes the reservation the pending row in one
-%%% call to this process (commit_pending), which also supersedes the agent's rows
-%%% stored at or before it there, so concurrent same-agent Registers end with
-%%% exactly one pending row (the last one handled). A commit whose own row is gone
-%%% (superseded, or the registry restarted since the insert) answers
-%%% {error, registry_unavailable} and changes nothing, so no caller is told ok for
-%%% a row that is not there. The reservation is released by the caller
+%%% call to this process (commit_pending), which also supersedes the agent's older
+%%% committed rows there, so concurrent same-agent Registers end with exactly one
+%%% pending row (the newest committed). A commit whose own row is gone (the
+%%% registry restarted since the insert), or is itself superseded by a newer
+%%% committed row, answers {error, registry_unavailable} and leaves no row of its
+%%% own, so no caller is told ok for a row that is not there. The reservation is released by the caller
 %%% when the proxied Register fails (release_session/1) and by the TTL sweep when
 %%% the caller died; a stored pending row is released by Subscribe or its TTL.
 %%%
 %%% 3. Every other store is checked the same way. The live insert (the
 %%% `register' call) asks session_admission/2 inside this process, and
 %%% store_pending/2 without a reservation reserves one itself. All refuse with
-%%% `{error, session_limit}'. The pending count is a scan of the pending table
-%%% (short lived rows), the live count a lookup in a per-connection index owned by
-%%% this process (an unnamed bag whose id is kept in persistent_term), kept in
-%%% step with the session index by index_session/4 and unindex_session/2 only, so
-%%% every removal path (deregister, supersede, a dead process) releases the
-%%% count. A connection key of `undefined' is never counted.
+%%% `{error, session_limit}'. Both counts are lookups in a per-connection index
+%%% owned by this process (unnamed bags whose ids are kept in persistent_term), so
+%%% a count costs the rows of that connection, never the size of either table. The
+%%% live one is kept in step with the session index by index_session/4 and
+%%% unindex_session/2 only, so every removal path (deregister, supersede, a dead
+%%% process) releases the count. The pending one lists candidates, each checked
+%%% against the row it names when counted (see pending_index_add/2): an entry whose
+%%% row Subscribe took or a caller released counts for nothing and is dropped by
+%%% the next reservation or commit on the connection, or by the sweep. A connection
+%%% key of `undefined' is never counted.
 %%%
 %%% 4. A closed connection frees its rows at once. The registry monitors the
 %%% connection process (one monitor per connection, taken when a reservation or
@@ -130,6 +134,7 @@
 %% unnamed table) and the stamp that limits the refusal WARN to one per second.
 -define(MAX_SESSIONS_KEY, {?MODULE, max_sessions_per_connection}).
 -define(CONN_INDEX_KEY, {?MODULE, conn_index}).
+-define(PENDING_INDEX_KEY, {?MODULE, pending_index}).
 -define(LIMIT_WARN_KEY, {?MODULE, session_limit_warn}).
 -define(LIMIT_WARN_INTERVAL_MS, 1000).
 
@@ -676,14 +681,11 @@ live_agents(ConnKey) ->
     end.
 
 %% The agent ids of the pending and reserved rows on ConnKey (a reservation is a
-%% pending-table row keyed {reserved, Ref}); one entry per row.
+%% pending-table row keyed {reserved, Ref}) not past their TTL; one entry per row.
+%% Read from the connection's index: the cost is its rows, not the table's.
 pending_agents(ConnKey) ->
     Oldest = erlang:monotonic_time(millisecond) - ?PENDING_TTL_MS,
-    try ets:select(?PENDING_TABLE,
-                   [{{'_', #{conn_key => ConnKey, agent_id => '$1'}, '$2'},
-                     [{'>=', '$2', Oldest}], ['$1']}])
-    catch error:badarg -> []
-    end.
+    [A || {_, #{agent_id := A}, StoredAt} <- indexed_rows(ConnKey), StoredAt >= Oldest].
 
 %% At most one WARN per second, from any process; the stamp is created by init/1
 %% (without it nothing is logged: the registry is not running).
@@ -758,6 +760,9 @@ init([]) ->
     %% the previous one's table, and its id is published for the handlers.
     ConnIndex = ets:new(yuzu_gw_conn_sessions, [bag, protected, {read_concurrency, true}]),
     persistent_term:put(?CONN_INDEX_KEY, ConnIndex),
+    %% The same for the pending table: {ConnKey, Key} of its connection-keyed rows.
+    PendingIndex = ets:new(yuzu_gw_pending_conn, [bag, protected, {read_concurrency, true}]),
+    persistent_term:put(?PENDING_INDEX_KEY, PendingIndex),
     put_if_changed(?MAX_SESSIONS_KEY,
                    yuzu_gw_env:env_int(max_sessions_per_connection, ?DEFAULT_MAX_SESSIONS,
                                        ?MIN_MAX_SESSIONS, ?MAX_MAX_SESSIONS)),
@@ -795,10 +800,12 @@ handle_call({reserve_session, ConnKey, AgentId}, _From, State) ->
             true = ets:insert(?PENDING_TABLE,
                               {{reserved, Ref}, #{conn_key => ConnKey, agent_id => AgentId},
                                erlang:monotonic_time(millisecond)}),
+            pending_index_add(ConnKey, {reserved, Ref}),
             {ok, Ref};
         {error, session_limit} = Refused ->
             Refused
     end,
+    prune_pending_index(ConnKey),
     {reply, Reply, case Reply of
                        {ok, _} -> monitor_connection(ConnKey, State);
                        _       -> State
@@ -817,7 +824,7 @@ handle_call({commit_pending, SessionId, ConnKey, AgentId, Ref}, _From, State) ->
     %% cap is checked here and a refusal removes the row.
     Reply = case ets:lookup(?PENDING_TABLE, SessionId) of
         [{_, _, StoredAt}] ->
-            case take_reservation(Ref) of
+            case take_reservation(ConnKey, Ref) of
                 true ->
                     supersede_pending(ConnKey, AgentId, SessionId, StoredAt);
                 false ->
@@ -832,6 +839,7 @@ handle_call({commit_pending, SessionId, ConnKey, AgentId, Ref}, _From, State) ->
         [] ->
             {error, registry_unavailable}
     end,
+    prune_pending_index(ConnKey),
     {reply, Reply, case Reply of
                        ok -> monitor_connection(ConnKey, State);
                        _  -> State
@@ -980,10 +988,11 @@ redact_message(Msg)                      -> Msg.
 
 %% Remove the reservation Ref and say whether it was live (stored and not past
 %% its TTL). `undefined' holds nothing.
-take_reservation(undefined) ->
+take_reservation(_ConnKey, undefined) ->
     false;
-take_reservation(Ref) ->
+take_reservation(ConnKey, Ref) ->
     Oldest = erlang:monotonic_time(millisecond) - ?PENDING_TTL_MS,
+    pending_index_delete(ConnKey, {reserved, Ref}),
     case ets:take(?PENDING_TABLE, {reserved, Ref}) of
         [{_, _, StoredAt}] -> StoredAt >= Oldest;
         []                 -> false
@@ -1002,45 +1011,57 @@ monitor_connection(ConnKey, #state{conn_monitors = ConnMons} = State) when is_pi
 monitor_connection(_ConnKey, State) ->
     State.
 
-%% Remove every reservation and pending row of the connection ConnKey.
+%% Remove every reservation and pending row of the connection ConnKey, through
+%% its index (one lookup, not a scan of the table).
 drop_connection_rows(ConnKey) ->
-    _ = ets:select_delete(?PENDING_TABLE,
-                          [{{'_', #{conn_key => ConnKey}, '_'}, [], [true]}]),
-    ok.
+    _ = [ets:delete(?PENDING_TABLE, Key) || {Key, _, _} <- indexed_rows(ConnKey)],
+    with_index(?PENDING_INDEX_KEY, fun(Index) -> ets:delete(Index, ConnKey) end).
 
 %% Release the monitor of a connection with no reservation or pending row left
 %% (Subscribe took its rows, or they expired): a connection that lives for days
 %% must not hold one for as long. Run by the sweep; a connection that stores a
 %% row later is monitored again by that call.
 release_idle_monitors(#state{conn_monitors = ConnMons} = State) ->
-    Present = ets:foldl(fun({_, #{conn_key := K}, _}, Acc) -> Acc#{K => true};
-                           (_, Acc)                        -> Acc
-                        end, #{}, ?PENDING_TABLE),
-    Kept = maps:filter(fun(Conn, MonRef) ->
-                           case maps:is_key(Conn, Present) of
-                               true  -> true;
-                               false -> demonitor(MonRef, [flush]), false
-                           end
-                       end, ConnMons),
-    State#state{conn_monitors = Kept}.
+    case persistent_term:get(?PENDING_INDEX_KEY, undefined) of
+        undefined ->
+            State;
+        Index ->
+            prune_entries(Index, ets:tab2list(Index)),
+            Kept = maps:filter(fun(Conn, MonRef) ->
+                                   case ets:member(Index, Conn) of
+                                       true  -> true;
+                                       false -> demonitor(MonRef, [flush]), false
+                                   end
+                               end, ConnMons),
+            State#state{conn_monitors = Kept}
+    end.
 
 %% A Register of AgentId on ConnKey replaces its older pending rows there, as the
-%% live insert replaces the live row: the rows of the agent stored at or before
-%% SessionId's own row (StoredAt) are removed, so a row stored after it, whose own
-%% commit may not have run yet, is never removed by this one. Run in this process
-%% after each caller stored its row, so when concurrent Registers of one agent id
-%% all commit, the row of the last one handled is the one left: of two rows, the
-%% commit handled first removes the other only if it is not newer, and the commit
-%% of a row that is gone answers an error instead of reporting a row that is not
-%% there. Reservation rows (keys that are not binaries) are other Registers still
-%% in flight: left alone.
+%% live insert replaces the live row. Run in this process when a caller commits
+%% the row it stored (StoredAt is its stamp), against the COMMITTED rows of the
+%% agent, which are the ones in the connection's index: the committed rows stored
+%% at or before this one are removed and this one is indexed; when a committed row
+%% of the agent is NEWER than this one, this one is the older Register and is
+%% itself removed, and the fixed error is answered. So the agent has at most one
+%% committed row after every commit, the one of the newest stamp (of equal stamps,
+%% the last commit handled), and a caller answered ok has a row. A row stored and
+%% not yet committed is another Register still in flight and is left alone, as are
+%% reservation rows (keys that are not binaries).
 supersede_pending(ConnKey, AgentId, SessionId, StoredAt) ->
-    _ = ets:select_delete(?PENDING_TABLE,
-                          [{{'$1', #{conn_key => ConnKey, agent_id => AgentId}, '$2'},
-                            [{is_binary, '$1'}, {'=/=', '$1', {const, SessionId}},
-                             {'=<', '$2', StoredAt}],
-                            [true]}]),
-    ok.
+    Committed = [{Key, T} || {Key, #{agent_id := A}, T} <- indexed_rows(ConnKey),
+                             is_binary(Key), Key =/= SessionId, A =:= AgentId],
+    case lists:any(fun({_, T}) -> T > StoredAt end, Committed) of
+        true ->
+            ets:delete(?PENDING_TABLE, SessionId),
+            {error, registry_unavailable};
+        false ->
+            _ = [begin
+                     ets:delete(?PENDING_TABLE, Key),
+                     pending_index_delete(ConnKey, Key)
+                 end || {Key, _} <- Committed],
+            pending_index_add(ConnKey, SessionId),
+            ok
+    end.
 
 do_deregister(AgentId, #state{monitor_refs = Mons} = State) ->
     case ets:lookup(?TABLE, AgentId) of
@@ -1135,11 +1156,14 @@ conn_index_delete(undefined, _AgentId, _SessionId) ->
 conn_index_delete(ConnKey, AgentId, SessionId) ->
     with_conn_index(fun(Index) -> ets:delete_object(Index, {ConnKey, AgentId, SessionId}) end).
 
-%% The per-connection index is a secondary structure like the session index: a
-%% registry that runs without it (new code loaded into a running node) skips it,
+%% The per-connection indexes are secondary structures like the session index: a
+%% registry that runs without one (new code loaded into a running node) skips it,
 %% and the count then reads as empty.
 with_conn_index(Fun) ->
-    case persistent_term:get(?CONN_INDEX_KEY, undefined) of
+    with_index(?CONN_INDEX_KEY, Fun).
+
+with_index(PtKey, Fun) ->
+    case persistent_term:get(PtKey, undefined) of
         undefined ->
             ok;
         Index ->
@@ -1149,6 +1173,51 @@ with_conn_index(Fun) ->
                 error:badarg -> ok
             end
     end.
+
+%% The pending index: {ConnKey, Key} for each reservation and each committed
+%% pending row of a connection (Key is the session id, or {reserved, Ref}), written
+%% by this process only, in step with the commit (the row exists before it is
+%% indexed). It is a list of CANDIDATES: a row taken by Subscribe, or released or
+%% removed by its caller, leaves its entry behind until the next call for the
+%% connection (prune_pending_index/1) or the sweep, so an entry counts only while
+%% the row it names is stored and belongs to the connection (indexed_rows/1).
+%% That keeps a count at the rows of one connection, however many the table holds.
+pending_index_add(ConnKey, Key) ->
+    with_index(?PENDING_INDEX_KEY, fun(Index) -> ets:insert(Index, {ConnKey, Key}) end).
+
+pending_index_delete(ConnKey, Key) ->
+    with_index(?PENDING_INDEX_KEY,
+               fun(Index) -> ets:delete_object(Index, {ConnKey, Key}) end).
+
+%% The stored rows of ConnKey named by its index entries: `{Key, Info, StoredAt}',
+%% one per entry whose row exists and carries ConnKey. A missing index is empty.
+indexed_rows(ConnKey) ->
+    case persistent_term:get(?PENDING_INDEX_KEY, undefined) of
+        undefined ->
+            [];
+        Index ->
+            try [Row || {_, Key} <- ets:lookup(Index, ConnKey),
+                        Row <- pending_row(ConnKey, Key)]
+            catch error:badarg -> []
+            end
+    end.
+
+pending_row(ConnKey, Key) ->
+    case ets:lookup(?PENDING_TABLE, Key) of
+        [{_, #{conn_key := ConnKey}, _} = Row] -> [Row];
+        _                                      -> []
+    end.
+
+%% Drop the entries of ConnKey in the pending index whose row is gone or belongs
+%% to another connection (the sweep prunes every connection's).
+prune_pending_index(ConnKey) ->
+    with_index(?PENDING_INDEX_KEY,
+               fun(Index) -> prune_entries(Index, ets:lookup(Index, ConnKey)) end).
+
+prune_entries(Index, Entries) ->
+    _ = [ets:delete_object(Index, Entry)
+         || {ConnKey, Key} = Entry <- Entries, pending_row(ConnKey, Key) =:= []],
+    ok.
 
 %% Drop the per-connection entry of whatever row is indexed under SessionId.
 conn_index_remove(SessionId) ->

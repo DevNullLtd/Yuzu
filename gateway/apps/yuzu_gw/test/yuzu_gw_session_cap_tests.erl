@@ -95,7 +95,11 @@ cap_test_() ->
       {"one monitor per connection, and none left after 100 connection cycles",
        {timeout, 60, fun connection_monitors_do_not_leak/0}},
       {"the sweep releases the monitor of a live connection with no row left, and keeps the others",
-       fun sweep_releases_idle_connection_monitors/0}
+       fun sweep_releases_idle_connection_monitors/0},
+      {"the pending index: the cap decision equals a count of the table after random operations on 5 connections",
+       {timeout, 120, fun pending_index_matches_table/0}},
+      {"a registry round trip stays under 5 ms with 10000 pending rows on other connections",
+       {timeout, 120, fun round_trip_with_many_rows_elsewhere/0}}
      ]}.
 
 setup() ->
@@ -231,8 +235,11 @@ expired_pending_not_counted() ->
     C = conn(),
     %% A row stored long ago (the pending TTL is 2 minutes, the sweep a minute).
     Old = erlang:monotonic_time(millisecond) - 10 * 60 * 1000,
-    [true = ets:insert(yuzu_gw_pending, {session(I), info(agent(I), C), Old})
-     || I <- lists:seq(1, ?CAP)],
+    [begin
+         ok = yuzu_gw_registry:store_pending(session(I), info(agent(I), C)),
+         true = ets:update_element(yuzu_gw_pending, session(I), {3, Old})
+     end || I <- lists:seq(1, ?CAP)],
+    ?assertEqual(?CAP, length(pending_rows(C))),
     ?assertEqual(ok, yuzu_gw_registry:store_pending(session(9), info(agent(9), C))),
     ?assertEqual(0, refused()).
 
@@ -595,11 +602,13 @@ expired_reservation_not_counted_and_swept() ->
 reservation_is_the_admission() ->
     C = conn(),
     {ok, Ref} = yuzu_gw_registry:reserve_session(C, agent(1)),
-    %% Other agents' rows reach the cap while the reservation is held (written
-    %% directly: this is the state the reservation protects against).
-    Now = erlang:monotonic_time(millisecond),
-    [true = ets:insert(yuzu_gw_pending, {session(I), info(agent(I), C), Now})
+    %% Other agents' rows reach the cap while the reservation is held (stored with
+    %% the cap lifted: this is the state the reservation protects against).
+    CapKey = {yuzu_gw_registry, max_sessions_per_connection},
+    persistent_term:put(CapKey, 100),
+    [ok = yuzu_gw_registry:store_pending(session(I), info(agent(I), C))
      || I <- lists:seq(2, ?CAP + 1)],
+    persistent_term:put(CapKey, ?CAP),
     %% A caller that did not reserve is refused ...
     ?assertEqual({error, session_limit},
                  yuzu_gw_registry:store_pending(session(1), info(agent(1), C))),
@@ -677,8 +686,8 @@ commit_orders_leave_one_row() ->
         case T1 =:= T2 of
             %% Stamped apart: the newer row survives whatever the order.
             false -> ?assertEqual(session(2), Survivor);
-            %% The same stamp: the commit handled first removes the other.
-            true  -> ?assertEqual(maps:get(hd(Order), Sessions), Survivor)
+            %% The same stamp: the commit handled last removes the other.
+            true  -> ?assertEqual(maps:get(lists:last(Order), Sessions), Survivor)
         end,
         %% Nothing is left to leak into the next case.
         ets:delete(yuzu_gw_pending, Survivor)
@@ -801,6 +810,136 @@ sweep_releases_idle_connection_monitors() ->
     %% And the busy one still loses its row with its process.
     exit(Busy, kill),
     ?assertEqual(ok, wait_until(fun() -> pending_rows(Busy) =:= [] end)).
+
+%% Random reserve / store (with and without a reservation) / release / Subscribe
+%% take / same-agent supersede / connection death / expiry plus sweep over 5
+%% connections, a cap of 3 so that the boundary is crossed often. After every step
+%% the decision of session_admission/2 for every (connection, agent) pair must be
+%% what a count of the table says, and every stored row must be in the index of
+%% its connection; after a sweep the index holds exactly the rows of the table.
+pending_index_matches_table() ->
+    CapKey = {yuzu_gw_registry, max_sessions_per_connection},
+    Cap = 3,
+    persistent_term:put(CapKey, Cap),
+    _ = rand:seed(exsss, {7, 11, 13}),
+    Agents = [agent(I) || I <- lists:seq(1, 6)],
+    Conns0 = maps:from_list([{N, conn()} || N <- lists:seq(1, 5)]),
+    Pick = fun(L) -> lists:nth(rand:uniform(length(L)), L) end,
+    Check = fun(Conns, Step) ->
+        Now = erlang:monotonic_time(millisecond),
+        Rows = ets:tab2list(yuzu_gw_pending),
+        Index = persistent_term:get({yuzu_gw_registry, pending_index}),
+        [begin
+             Expected = lists:usort([Ag || {_, #{conn_key := K, agent_id := Ag}, T} <- Rows,
+                                           K =:= C, T >= Now - 120000, Ag =/= A]),
+             Want = case length(Expected) >= Cap of true -> {error, session_limit}; false -> ok end,
+             ?assertEqual(Want, yuzu_gw_registry:session_admission(C, A), {Step, C, A})
+         end || C <- maps:values(Conns), A <- Agents],
+        [?assert(lists:member({K, Key}, ets:lookup(Index, K)), {Step, K, Key})
+         || {Key, #{conn_key := K}, _} <- Rows]
+    end,
+    Final = lists:foldl(fun(Step, {Conns, Held, Stored}) ->
+        C = maps:get(rand:uniform(5), Conns),
+        A = Pick(Agents),
+        Sess = iolist_to_binary(["capsession-i", integer_to_list(Step)]),
+        {Conns2, Held2, Stored2} =
+            case rand:uniform(7) of
+                1 ->
+                    case yuzu_gw_registry:reserve_session(C, A) of
+                        {ok, Ref} -> {Conns, [Ref | Held], Stored};
+                        _         -> {Conns, Held, Stored}
+                    end;
+                2 when Held =/= [] ->
+                    Ref = Pick(Held),
+                    ok = yuzu_gw_registry:release_session(Ref),
+                    {Conns, Held -- [Ref], Stored};
+                3 when Held =/= [] ->
+                    Ref = Pick(Held),
+                    _ = yuzu_gw_registry:store_pending(Sess, info(A, C), Ref),
+                    {Conns, Held -- [Ref], [Sess | Stored]};
+                4 when Stored =/= [] ->
+                    S = Pick(Stored),
+                    _ = yuzu_gw_registry:take_pending(S),
+                    {Conns, Held, Stored -- [S]};
+                5 ->
+                    _ = yuzu_gw_registry:store_pending(Sess, info(A, C)),
+                    {Conns, Held, [Sess | Stored]};
+                6 ->
+                    N = rand:uniform(5),
+                    Dying = maps:get(N, Conns),
+                    exit(Dying, kill),
+                    ok = wait_until(fun() -> [] =:= [R || {_, #{conn_key := K}, _} = R <-
+                                                           ets:tab2list(yuzu_gw_pending),
+                                                           K =:= Dying]
+                                    end),
+                    {Conns#{N => conn()}, Held, Stored};
+                _ ->
+                    Old = erlang:monotonic_time(millisecond) - 10 * 60 * 1000,
+                    [ets:update_element(yuzu_gw_pending, Key, {3, Old})
+                     || Key <- [S || S <- Stored, rand:uniform(2) =:= 1]],
+                    yuzu_gw_registry ! sweep_pending,
+                    barrier(),
+                    Index = persistent_term:get({yuzu_gw_registry, pending_index}),
+                    Want = lists:sort([{K, Key} || {Key, #{conn_key := K}, _} <-
+                                                       ets:tab2list(yuzu_gw_pending)]),
+                    ?assertEqual(Want, lists:sort(ets:tab2list(Index)), {sweep, Step}),
+                    {Conns, Held, Stored}
+            end,
+        Check(Conns2, Step),
+        {Conns2, Held2, Stored2}
+    end, {Conns0, [], []}, lists:seq(1, 400)),
+    ?assertEqual(5, maps:size(element(1, Final))).
+
+%% The pending count reads the rows of one connection, not the table: with 10000
+%% rows held by 1250 other connections a Register on a new connection (reserve,
+%% store, release) keeps its round trip to the registry process under 5 ms. The
+%% median of 21 is taken so that one scheduling hiccup does not decide it.
+round_trip_with_many_rows_elsewhere() ->
+    Others = [conn() || _ <- lists:seq(1, 1250)],
+    [[ok = yuzu_gw_registry:store_pending(
+               iolist_to_binary(["capsession-m", integer_to_list(N), "-", integer_to_list(I)]),
+               info(agent(I), C))
+      || I <- lists:seq(1, ?CAP)]
+     || {N, C} <- lists:zip(lists:seq(1, 1250), Others)],
+    ?assertEqual(10000, ets:info(yuzu_gw_pending, size)),
+    Time = fun(Fun) ->
+        T0 = erlang:monotonic_time(microsecond),
+        Fun(),
+        erlang:monotonic_time(microsecond) - T0
+    end,
+    Median = fun(L) -> lists:nth(11, lists:sort(L)) end,
+    Reserve = Median([begin
+                          C = conn(),
+                          Time(fun() ->
+                              {ok, Ref} = yuzu_gw_registry:reserve_session(C, agent(1)),
+                              ok = yuzu_gw_registry:release_session(Ref)
+                          end)
+                      end || _ <- lists:seq(1, 21)]),
+    Store = Median([begin
+                        C = conn(),
+                        Time(fun() ->
+                            ok = yuzu_gw_registry:store_pending(
+                                     iolist_to_binary(["capsession-t", integer_to_list(I)]),
+                                     info(agent(1), C))
+                        end)
+                    end || I <- lists:seq(1, 21)]),
+    ?assert(Reserve < 5000, {reserve_us, Reserve}),
+    ?assert(Store < 5000, {store_us, Store}),
+    %% The work the registry process does for one reservation, in reductions: not
+    %% a function of the load of the machine, and a scan of the table costs it
+    %% thousands.
+    Reg = whereis(yuzu_gw_registry),
+    Reductions = fun() -> {reductions, R} = process_info(Reg, reductions), R end,
+    Cs = [conn() || _ <- lists:seq(1, 11)],
+    Spent = [begin
+                 R0 = Reductions(),
+                 {ok, Ref} = yuzu_gw_registry:reserve_session(C, agent(1)),
+                 barrier(),
+                 R1 = Reductions(),
+                 ok = yuzu_gw_registry:release_session(Ref),
+                 R1 - R0
+             end || C <- Cs],
+    ?assert(lists:nth(6, lists:sort(Spent)) < 2000, {reductions, Spent}).
 
 %%%===================================================================
 %%% Helpers
