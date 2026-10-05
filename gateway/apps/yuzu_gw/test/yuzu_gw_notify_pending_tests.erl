@@ -42,6 +42,7 @@
 %% The application env keys a test here may set: saved in setup, restored (or
 %% unset, when they were not set) in teardown.
 -define(ENV_KEYS, [notify_pending_max,
+                   registration_replay_spacing_ms,
                    circuit_breaker_failure_threshold,
                    circuit_breaker_reset_timeout_ms,
                    circuit_breaker_max_reset_timeout_ms]).
@@ -120,6 +121,17 @@ env_test_() ->
         fun env_valid_is_kept/0)
      ]}.
 
+%% A registration replay that is active while the pending store is refilled.
+%% Replay spacing 1 ms so the drip retries quickly.
+replay_test_() ->
+    {foreach,
+     fun() -> setup([{registration_replay_spacing_ms, 1}]) end,
+     fun cleanup/1,
+     [
+      t("a refilled backlog does not starve an active replay: the replay head advances",
+        fun replay_advances_while_the_backlog_is_refilled/0)
+     ]}.
+
 setup(Env) ->
     {ok, _} = application:ensure_all_started(telemetry),
     yuzu_gw_test_registry:ensure(),
@@ -130,6 +142,7 @@ setup(Env) ->
     clear_registry(),
     Prev = [{Key, application:get_env(yuzu_gw, Key)} || Key <- ?ENV_KEYS],
     application:unset_env(yuzu_gw, notify_pending_max),
+    application:unset_env(yuzu_gw, registration_replay_spacing_ms),
     application:set_env(yuzu_gw, circuit_breaker_failure_threshold, 3),
     application:set_env(yuzu_gw, circuit_breaker_reset_timeout_ms, 600000),
     application:set_env(yuzu_gw, circuit_breaker_max_reset_timeout_ms, 600000),
@@ -254,6 +267,7 @@ mock(ProxyMode) ->
             <<"NotifyStreamStatus">> ->
                 notify_rpc(Req);
             _Other when ProxyMode =:= ok ->
+                notify({proxied, Path}),
                 {ok, #{}, #{}};
             _Other ->
                 {error, connection_refused}
@@ -261,7 +275,9 @@ mock(ProxyMode) ->
     end).
 
 %% Runs in the worker the upstream spawned. Counts itself in, tells the test it
-%% entered, then parks until released (or until the gates are open).
+%% entered, then parks until released (or until the gates are open). `release'
+%% answers ok; `{release, Answer}' answers with Answer, a grpcbox_client:unary/5
+%% return, so a test can fail one worker.
 notify_rpc(Req) ->
     #{log := Log, workers := Workers, atoms := Atoms} = ctx(),
     Now = atomics:add_get(Atoms, 1, 1),
@@ -276,12 +292,16 @@ notify_rpc(Req) ->
     %% releases every recorded worker, so a worker that read "closed" is always
     %% on that list.
     true = ets:insert(Workers, {self()}),
-    case atomics:get(Atoms, 3) of
-        1 -> ok;
-        0 -> receive release -> ok after ?PARK_MS -> ok end
+    Reply = case atomics:get(Atoms, 3) of
+        1 -> {ok, #{}, #{}};
+        0 -> receive
+                 release           -> {ok, #{}, #{}};
+                 {release, Answer} -> Answer
+             after ?PARK_MS -> {ok, #{}, #{}}
+             end
     end,
     atomics:sub(Atoms, 1, 1),
-    {ok, #{}, #{}}.
+    Reply.
 
 bump_peak(Atoms, Now) ->
     case atomics:get(Atoms, 2) of
@@ -496,6 +516,32 @@ half_open_circuit_holds_until_closed() ->
     open_and_release_all(),
     await_until(fun() -> last_gauge() =:= {0, 0} end).
 
+%% Ten workers are parked and 30 distinct keys are held, then a replay of three
+%% agents is armed. Releasing one worker at a time frees one slot, and without a
+%% reserved slot the freed slot is refilled from the backlog at once, so the
+%% replay drip never sees fewer than ten workers until the backlog is empty.
+%% The replay head must reach the mock while keys are still held.
+replay_advances_while_the_backlog_is_refilled() ->
+    watch(),
+    Live0 = fill_slots(),
+    Backlog = 30,
+    [cast_connected(agent(I)) || I <- lists:seq(1, Backlog)],
+    Sids = [bind_replay_agent(I) || I <- lists:seq(1, 3)],
+    ok = yuzu_gw_upstream:replay_sessions(Sids),
+    sync(),
+    ?assertEqual({Backlog, ?INFLIGHT_MAX}, last_gauge()),
+    ?assertMatch([_, _, _], up_get(replay_queue)),
+    Refills = release_until_proxied(Live0, 0),
+    ?assertMatch(N when N < Backlog, Refills),
+    ?assert(pending_len() > 0),
+    %% The other two agents follow, and once the replay is over the reserved
+    %% slot is spent on the backlog again.
+    [receive {proxied, _} -> ok
+     after ?AWAIT_MS -> erlang:error(replay_did_not_continue)
+     end || _ <- [2, 3]],
+    await_until(fun() -> last_gauge() =:= {Backlog - Refills - 1, ?INFLIGHT_MAX} end),
+    ?assertEqual([], up_get(replay_queue)).
+
 gauges_follow_a_burst() ->
     watch(),
     %% init/1 emitted zeros before anything else.
@@ -703,6 +749,33 @@ fill_slots() ->
     sync(),
     ?assertEqual({0, ?INFLIGHT_MAX}, last_gauge()),
     [W || {W, _} <- Entered].
+
+%% A live agent in the shared registry, with a stored request, so a replay
+%% verdict naming its session queues it. The stand-in process ends with the test
+%% process; clear_registry/0 removes the row in teardown. Returns the session id.
+bind_replay_agent(I) ->
+    Id = <<"replay-agent-", (integer_to_binary(I))/binary>>,
+    Sid = <<"replay-session-", (integer_to_binary(I))/binary>>,
+    Owner = self(),
+    Pid = spawn(fun() ->
+                    MRef = erlang:monitor(process, Owner),
+                    receive {'DOWN', MRef, process, _, _} -> ok end
+                end),
+    ok = yuzu_gw_registry:register_agent(Id, Pid, Sid, [<<"svc">>], <<"host">>,
+                                         #{info => #{agent_id => Id}}, conn_test),
+    Sid.
+
+%% Release the oldest parked worker and wait for what follows: a new notify
+%% worker entering the mock (the freed slot was refilled from the backlog, one
+%% refill counted) or a ProxyRegister (the replay head advanced). Returns the
+%% number of refills seen before the first ProxyRegister.
+release_until_proxied([W | Rest], Refills) ->
+    W ! release,
+    receive
+        {proxied, _}       -> Refills;
+        {entered, W2, _Req} -> release_until_proxied(Rest ++ [W2], Refills + 1)
+    after ?AWAIT_MS -> erlang:error({replay_never_advanced, Refills})
+    end.
 
 %% A call is answered after every earlier cast from this process was handled.
 sync() ->
