@@ -18,6 +18,7 @@ tag="${GITHUB_REF_NAME:?}"; want="${GITHUB_SHA:?}"
 # unmasked. If the repository ever goes private, read the ref with
 # `gh api repos/$GITHUB_REPOSITORY/git/ref/tags/$tag` instead (#5282, SEC-G8-1).
 # Bounded: a hung connection must not hold a runner slot (G8-CHAOS-1).
+export GIT_TERMINAL_PROMPT=0   # never wait for a credential prompt
 if ! refs="$(timeout 60 git ls-remote origin "refs/tags/$tag" "refs/tags/$tag^{}")"; then
   echo "::error::Could not read refs/tags/$tag from origin; refusing to publish (fail-closed, #5282)."
   exit 1

@@ -251,13 +251,20 @@ for job, spec in (wf.get("jobs") or {}).items():
         if run.strip() != "bash scripts/ci/check-release-tag-sha.sh": bad.append("run")
         if "continue-on-error" in spec and spec["continue-on-error"] not in (False,): bad.append("job-continue-on-error")
         print(f"{job}|{','.join(bad) or 'ok'}")
+    # The push itself must not run after a failed recheck (if: always() etc.).
+    for st in spec.get("steps") or []:
+        txt = (st.get("run") or "") + str(st.get("with") or "")
+        acts = "gh release create" in txt or "--push" in txt or "'push': True" in txt
+        cond = str(st.get("if", ""))
+        if acts and any(k in cond for k in ("always()", "failure()", "cancelled()")):
+            print(f"{job} push step|runs-after-failure")
 PYEOF
 nshape=0
 while IFS='|' read -r job verdict; do
   nshape=$((nshape+1))
   check "$job tag-recheck step is unconditional and exact" ok "$verdict"
 done < "$TMP/stepshape"
-check "found the five tag-recheck steps" 5 "$nshape"
+check "found the five tag-recheck steps" 5 "$(grep -cv ' push step|' "$TMP/stepshape")"
 # Guard against the scan going vacuous (e.g. a reindent that hides every job).
 if [ "$publishers" -ge 4 ]; then check "found the image-publishing jobs (>=4)" yes yes
 else check "found the image-publishing jobs (>=4)" ">=4" "$publishers"; fi

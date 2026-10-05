@@ -2533,13 +2533,14 @@ jobs:
           fi
 
           # The release-guard job refused this run up front if a published
-          # release already existed (#5282), so finding one here means it
-          # appeared after the guard ran (another run of the tag, a hand-run
-          # `gh release create`, or a draft the guard's contents:read token
-          # cannot see). This run's images are already pushed and do not
-          # match that release's signed SHA256SUMS and SBOMs, so fail loudly
-          # instead of the old skip-with-a-notice that went green. Never
-          # re-upload over it either: --clobber would replace signed assets.
+          # release already existed (#5282), so a release found here is either
+          # a DRAFT (an interrupted `gh release create`, possibly this job's own
+          # earlier attempt, or a hand-made draft the guard's contents:read
+          # token cannot see) or one PUBLISHED after the guard ran (an earlier
+          # attempt of this job, another run of the tag, or a hand-run
+          # `gh release create`). Fail with the matching instruction rather than
+          # the old skip-with-a-notice that went green, and never re-upload over
+          # it: --clobber would replace signed assets.
           if existing_draft="$(gh release view "${GITHUB_REF_NAME}" --json isDraft --jq .isDraft 2>/dev/null)"; then
             if [[ "$existing_draft" == "true" ]]; then
               # gh release create makes a draft, uploads, then publishes; an
