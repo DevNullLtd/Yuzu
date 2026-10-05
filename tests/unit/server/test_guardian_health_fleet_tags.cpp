@@ -6,8 +6,8 @@
  * fleet visibility for the first time).
  *
  * Mirrors test_guardian_journal_fleet_tags.cpp's four-way bind for the health family
- * (no age/MAX sibling table here - all of these are plain sparse cumulative counters,
- * none a staleness clock):
+ * (the counter table is plain sparse cumulative counters; the #5403 pending-Disarm age is
+ * the one exception and lives in its own MAX table, pinned by the last three cases below):
  *
  *  - STRUCTURAL: sizeof(GuardianHealthStats) pins the field count to the table row
  *    count, so adding a counter without a fleet gauge is a COMPILE error.
@@ -29,14 +29,18 @@
 
 #include <cstdint>
 #include <map>
+#include <optional>
 #include <set>
 #include <string>
 #include <string_view>
 #include <type_traits>
 
 namespace detail = yuzu::server::detail;
+using yuzu::agent::emit_guardian_disarm_pending_age_tag;
 using yuzu::agent::emit_guardian_health_heartbeat_tags;
 using yuzu::agent::GuardianHealthStats;
+using yuzu::agent::kGuardianDisarmDeadlineElapsedTag;
+using yuzu::agent::kGuardianDisarmPendingAgeTag;
 
 // STRUCTURAL PIN, same rationale as the guardian-journal sibling: GuardianHealthStats
 // is an aggregate of std::uint64_t only (no padding), so its size divided by 8 IS its
@@ -68,6 +72,7 @@ GuardianHealthStats all_nonzero_stats() {
     s.legacy_sink_events_lost = 5;     // #4783
     s.legacy_sink_gap_rules = 6;       // #4783
     s.legacy_sink_dropped_unwired = 7; // #4783 governance follow-up
+    s.disarm_deadline_elapsed = 8;     // #5403
     return s;
 }
 
@@ -104,6 +109,7 @@ TEST_CASE("guardian health: agent emit keys bind exactly to the server table",
         {"yuzu.guardian_legacy_sink_events_lost", "5"},    // #4783
         {"yuzu.guardian_legacy_sink_gap_rules", "6"},      // #4783
         {"yuzu.guardian_legacy_sink_dropped_unwired", "7"}, // #4783 governance follow-up
+        {"yuzu.guardian_disarm_deadline_elapsed", "8"},     // #5403
     };
     // Per-key, NOT `CHECK(tags == expected)` - see the guardian-journal pin test's
     // comment for why a whole-map compare hides which key drifted.
@@ -191,4 +197,65 @@ TEST_CASE("parse_guardian_health_count enforces the forged-value posture",
     // Over-long input is rejected in O(1) BEFORE being scanned (it runs under
     // AgentHealthStore::mu_, 3 times per agent per sweep).
     CHECK_FALSE(parse_guardian_health_count(std::string(4096, '9')).has_value());
+}
+
+// ---- #5403: the pending-Spark-Disarm AGE row (its own MAX-rollup table) -----------------
+
+TEST_CASE("guardian disarm age: the agent key is pinned to the server's age table",
+          "[guardian][health][fleet][disarm]") {
+    // A one-sided rename of the tag string on either side leaves the fleet gauge permanently
+    // absent, which reads as "no Disarm pending": this is the drift guard.
+    REQUIRE(detail::kNGuardianHealthAgeMetrics == 1);
+    CHECK(std::string_view(detail::kGuardianHealthAgeMetrics[0].tag) ==
+          std::string_view(kGuardianDisarmPendingAgeTag));
+    CHECK(std::string_view(kGuardianDisarmPendingAgeTag) ==
+          "yuzu.guardian_disarm_pending_age_seconds");
+
+    // WRITER -> READER and READER -> WRITER, through the agent's REAL emitter.
+    std::map<std::string, std::string> tags;
+    emit_guardian_disarm_pending_age_tag(tags, std::optional<std::uint64_t>{42});
+    REQUIRE(tags.size() == 1);
+    CHECK(tags.count(detail::kGuardianHealthAgeMetrics[0].tag) == 1);
+    CHECK(tags.at(detail::kGuardianHealthAgeMetrics[0].tag) == "42");
+
+    // The age tag must NOT also be a row of the SUM table (it would be summed).
+    for (const auto& m : detail::kGuardianHealthMetrics)
+        CHECK(std::string_view(m.tag) != std::string_view(kGuardianDisarmPendingAgeTag));
+    // The counter tag is the SUM table's, not the age table's.
+    bool found = false;
+    for (const auto& m : detail::kGuardianHealthMetrics)
+        found = found || std::string_view(m.tag) == std::string_view(kGuardianDisarmDeadlineElapsedTag);
+    CHECK(found);
+}
+
+TEST_CASE("guardian disarm age: gauge name follows the age-table rule, HELP states the limits",
+          "[guardian][health][fleet][disarm]") {
+    const auto& m = detail::kGuardianHealthAgeMetrics[0];
+    CHECK(std::string_view(m.gauge) == "yuzu_fleet_guardian_disarm_pending_age_seconds_max");
+    const std::string_view help{m.help};
+    // The HELP is what an operator reads: it must say "too long, not proof of a hang" and
+    // name what the gauge cannot see.
+    CHECK(help.find("TOO LONG") != std::string_view::npos);
+    CHECK(help.find("not proof") != std::string_view::npos);
+    CHECK(help.find("compensating disarm") != std::string_view::npos);
+    CHECK(help.find("direct disarm") != std::string_view::npos);
+    CHECK(help.find("detach_rule_locked") != std::string_view::npos);
+    CHECK(help.find("inline-type") != std::string_view::npos);
+}
+
+TEST_CASE("guardian disarm age: emitter is absent for nullopt, present (including 0) otherwise",
+          "[guardian][health][fleet][disarm]") {
+    std::map<std::string, std::string> none;
+    emit_guardian_disarm_pending_age_tag(none, std::nullopt);
+    CHECK(none.empty()); // "no Disarm pending" is an ABSENCE, never a 0
+
+    std::map<std::string, std::string> young;
+    emit_guardian_disarm_pending_age_tag(young, std::optional<std::uint64_t>{0});
+    REQUIRE(young.count(kGuardianDisarmPendingAgeTag) == 1);
+    CHECK(young.at(kGuardianDisarmPendingAgeTag) == "0"); // pending for under a second
+
+    // And a zero cumulative counter is sparse-omitted by the counter emitter.
+    std::map<std::string, std::string> counter;
+    emit_guardian_health_heartbeat_tags(counter, GuardianHealthStats{});
+    CHECK(counter.count(kGuardianDisarmDeadlineElapsedTag) == 0);
 }

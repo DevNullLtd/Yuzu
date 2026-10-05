@@ -10,6 +10,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <map>
+#include <optional>
 #include <string>
 
 using namespace yuzu::agent;
@@ -102,15 +103,52 @@ TEST_CASE("health heartbeat: zero legacy-sink dropped-unwired omits the tag (spa
     CHECK(tags.empty());
 }
 
-TEST_CASE("health heartbeat: all seven counters independent and additive",
+TEST_CASE("health heartbeat: non-zero Disarm deadline count emits the pinned key + value (#5403)",
+          "[guardian][health][heartbeat]") {
+    std::map<std::string, std::string> tags;
+    emit_guardian_health_heartbeat_tags(tags, GuardianHealthStats{.disarm_deadline_elapsed = 3});
+    CHECK(tags.size() == 1);
+    CHECK(tags.at("yuzu.guardian_disarm_deadline_elapsed") == "3");
+    CHECK(std::string(kGuardianDisarmDeadlineElapsedTag) ==
+          "yuzu.guardian_disarm_deadline_elapsed");
+}
+
+TEST_CASE("health heartbeat: zero Disarm deadline count omits the tag (sparse, #5403)",
+          "[guardian][health][heartbeat]") {
+    std::map<std::string, std::string> tags;
+    emit_guardian_health_heartbeat_tags(tags, GuardianHealthStats{.disarm_deadline_elapsed = 0});
+    CHECK(tags.empty());
+}
+
+TEST_CASE("health heartbeat: pending Disarm age is absent for nullopt and present otherwise "
+          "(#5403)",
+          "[guardian][health][heartbeat]") {
+    std::map<std::string, std::string> tags;
+    emit_guardian_disarm_pending_age_tag(tags, std::nullopt);
+    CHECK(tags.empty()); // never a 0 for "none pending"
+
+    emit_guardian_disarm_pending_age_tag(tags, std::optional<std::uint64_t>{17});
+    CHECK(tags.size() == 1);
+    CHECK(tags.at("yuzu.guardian_disarm_pending_age_seconds") == "17");
+    CHECK(std::string(kGuardianDisarmPendingAgeTag) == "yuzu.guardian_disarm_pending_age_seconds");
+
+    // A pending Disarm younger than a second is a real reading: present, value 0.
+    std::map<std::string, std::string> young;
+    emit_guardian_disarm_pending_age_tag(young, std::optional<std::uint64_t>{0});
+    CHECK(young.size() == 1);
+    CHECK(young.at("yuzu.guardian_disarm_pending_age_seconds") == "0");
+}
+
+TEST_CASE("health heartbeat: all eight counters independent and additive",
           "[guardian][health][heartbeat]") {
     std::map<std::string, std::string> tags;
     emit_guardian_health_heartbeat_tags(
         tags, GuardianHealthStats{.unhealthy_suppressed = 1, .unhealthy_refreshed = 2,
                                   .priority_demoted = 3, .outbox_backpressure_drops = 4,
                                   .legacy_sink_events_lost = 5, .legacy_sink_gap_rules = 6,
-                                  .legacy_sink_dropped_unwired = 7});
-    CHECK(tags.size() == 7);
+                                  .legacy_sink_dropped_unwired = 7,
+                                  .disarm_deadline_elapsed = 8});
+    CHECK(tags.size() == 8);
     CHECK(tags.at("yuzu.guardian_unhealthy_suppressed") == "1");
     CHECK(tags.at("yuzu.guardian_unhealthy_refreshed") == "2");
     CHECK(tags.at("yuzu.guardian_priority_demoted") == "3");
@@ -118,4 +156,5 @@ TEST_CASE("health heartbeat: all seven counters independent and additive",
     CHECK(tags.at("yuzu.guardian_legacy_sink_events_lost") == "5");
     CHECK(tags.at("yuzu.guardian_legacy_sink_gap_rules") == "6");
     CHECK(tags.at("yuzu.guardian_legacy_sink_dropped_unwired") == "7");
+    CHECK(tags.at("yuzu.guardian_disarm_deadline_elapsed") == "8");
 }

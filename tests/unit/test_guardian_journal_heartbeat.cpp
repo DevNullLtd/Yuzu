@@ -201,6 +201,10 @@ TEST_CASE("every documented Guardian heartbeat tag is one the emitter actually e
     emit_guardian_health_heartbeat_tags(
         emitted, GuardianHealthStats{
                      .unhealthy_suppressed = 1, .unhealthy_refreshed = 1, .priority_demoted = 1});
+    // #5403: metrics.md now names the pending-Spark-Disarm deadline count and age tags, so
+    // union their emitters too (the age has its own emitter, not a GuardianHealthStats field).
+    emit_guardian_health_heartbeat_tags(emitted, GuardianHealthStats{.disarm_deadline_elapsed = 1});
+    emit_guardian_disarm_pending_age_tag(emitted, std::optional<std::uint64_t>{1});
     emit_guardian_backend_heartbeat_tag(emitted, /*prefer_spark=*/true,
                                         GuardianEngine::SparkAvailability::SparkFailed);
     // rung 9c PR-3: union in the arm-ledger + io-ceiling emitters too - both are

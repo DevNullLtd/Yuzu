@@ -7,13 +7,16 @@
 /// sharing this family's exact shape: a plain sparse cumulative counter rolled up
 /// as an unlabelled fleet sum; a #4783 governance follow-up added the 7th row -
 /// the pre-network-arm legacy-sink drop, previously counted in-process only with
-/// no accessor, no heartbeat tag, and no fleet visibility). Single source of truth for the
+/// no accessor, no heartbeat tag, and no fleet visibility; #5403 added the 8th row, the
+/// pending-Spark-Disarm deadline count, plus the separate MAX-rollup age table below).
+/// Single source of truth for the
 /// `yuzu.guardian_*` heartbeat tag keys this rollup consumes, the
 /// `yuzu_fleet_guardian_*` gauge names they roll up into, their HELP text, and the
 /// forged-value-safe parse of the agent-supplied values.
 ///
 /// The writer is agents/core/src/guardian_health_heartbeat.hpp
-/// (`emit_guardian_health_heartbeat_tags`, `GuardianHealthStats`). Both sides are
+/// (`emit_guardian_health_heartbeat_tags`, `GuardianHealthStats`; the #5403 age has its own
+/// emitter, `emit_guardian_disarm_pending_age_tag`). Both sides are
 /// bound by tests/unit/server/test_guardian_health_fleet_tags.cpp, which emits through
 /// the agent's REAL emitter and asserts every key produced is one a table here
 /// recognises. That test is the drift guard: a rename on either side without the
@@ -29,10 +32,13 @@
 /// spark and journal pins when that hoist lands - do not let a future two-family sweep
 /// leave this one behind.
 ///
-/// SHAPE: flat and unlabelled, 7 counters, no age/MAX family (unlike the journal
-/// sibling - these are all plain sparse cumulative counters, none of them a
-/// staleness clock). Name rule, asserted by the pin test: `gauge` == "yuzu_fleet_" +
-/// `tag` with its "yuzu." heartbeat-namespace prefix stripped.
+/// SHAPE: flat and unlabelled. `kGuardianHealthMetrics` is 8 plain sparse cumulative
+/// counters rolled up as a fleet SUM. `kGuardianHealthAgeMetrics` (#5403) is the one
+/// exception: a re-statable AGE rolled up as the fleet MAX, in its own table for the
+/// reasons the journal sibling's age table gives (a sum of ages is meaningless, and
+/// the op lives in the consumer). Name rule, asserted by the pin test, for the counter
+/// table: `gauge` == "yuzu_fleet_" + `tag` with its "yuzu." heartbeat-namespace prefix
+/// stripped; the age table appends "_max".
 ///
 /// WHAT ABSENCE MEANS, MECHANICALLY (same posture as the journal family - stated once
 /// there, not re-derived here beyond the mechanics): the writer is SPARSE, a counter
@@ -67,7 +73,7 @@ struct GuardianHealthMetric {
 
 /// The full published set. Order matches GuardianHealthStats / the emit order in
 /// agents/core/src/guardian_health_heartbeat.hpp for reviewability; nothing depends on
-/// it. All 7 are exported as `gauge` - a per-sweep recomputed fleet sum, cleared and
+/// it. All 8 are exported as `gauge` - a per-sweep recomputed fleet sum, cleared and
 /// rebuilt, never monotonic.
 ///
 /// ALERTING: THESE ARE MONITOR-ONLY, same posture and same reasons as the guardian
@@ -161,12 +167,64 @@ inline constexpr GuardianHealthMetric kGuardianHealthMetrics[] = {
      "unwired_ is a plain in-process atomic, never persisted to KvStore, so it resets "
      "to 0 on every agent restart - and the pre-network-arm window it counts recurs on "
      "every boot regardless. MONITOR-ONLY, same posture as the rest of this family"},
+    {"yuzu.guardian_disarm_deadline_elapsed", "yuzu_fleet_guardian_disarm_deadline_elapsed",
+     "Fleet sum of Spark Disarm claims an agent observed pending longer than a fixed 30 s "
+     "threshold (#5403), counted once per claim. Observation only: the runtime never "
+     "releases, pops or force-cancels a pending Disarm, so a nonzero value means a Disarm was "
+     "pending TOO LONG, not that its backend call is proven hung. A pending Disarm holds its "
+     "key, an executor quota slot of its class and, if the call is blocked inside a mechanism, "
+     "that mechanism type's engine lock; recovery from a call that never returns is an agent "
+     "restart or --spark-disable. NOT covered: a compensating disarm, the direct disarm "
+     "fallback, the synchronous residue teardown inside detach_rule_locked, and inline-type "
+     "teardown. Cumulative per agent process (resets on restart); the exported fleet sum is "
+     "rebuilt every sweep. See yuzu_fleet_guardian_disarm_pending_age_seconds_max for the "
+     "age of what is pending now. MONITOR-ONLY, same posture as the rest of this family"},
 };
 
 /// Derived with std::size, never a literal - see the sibling table's comment in
 /// guardian_journal_fleet_tags.hpp for why a hardcoded count is a governance finding
 /// waiting to happen.
 inline constexpr std::size_t kNGuardianHealthMetrics = std::size(kGuardianHealthMetrics);
+
+/// #5403: the AGE family - a SEPARATE, MAX-rollup table, same reasoning as
+/// kGuardianJournalAgeMetrics (guardian_journal_fleet_tags.hpp). Not rows of the table above:
+/// that one is pinned 1:1 to GuardianHealthStats (all uint64 cumulative counters, SUM), and an
+/// age is not a counter - a fleet SUM of ages is meaningless, the question is "how long has
+/// the WORST endpoint's Disarm been pending". The op (MAX) lives in the consumer,
+/// agent_registry.cpp, because the row struct has no op field. Name rule, asserted by the
+/// pin test: gauge == "yuzu_fleet_" + tag minus its "yuzu." prefix + "_max".
+///
+/// EMISSION (writer: emit_guardian_disarm_pending_age_tag): the tag is ABSENT while the agent
+/// has no Disarm pending and present, INCLUDING 0, while one is (0 = pending for less than one
+/// second). So here, absent family = no retained agent reports a pending Disarm; a published 0
+/// = at least one is pending but young. The fleet gauge is NEVER a fabricated 0 for "none".
+///
+/// COVERAGE: not counted in yuzu_fleet_guardian_health_reporting (that meta's documented
+/// meaning is the counter family), and no separate reporting meta ships for it. A value the
+/// parse rejects IS counted in yuzu_fleet_guardian_health_tag_rejected. ATTRIBUTION (same
+/// #2083-class caveat as the journal age family, and worse under MAX): one agent reporting a
+/// plausible but wrong value below the 1e9 ceiling owns the fleet MAX, and no per-agent axis
+/// exists to say which endpoint it is - find the endpoint first (query heartbeat tags).
+/// No alert rule ships with this gauge; one needs fleet data to tune.
+inline constexpr GuardianHealthMetric kGuardianHealthAgeMetrics[] = {
+    {"yuzu.guardian_disarm_pending_age_seconds",
+     "yuzu_fleet_guardian_disarm_pending_age_seconds_max",
+     "Fleet MAX (worst endpoint) of the age in seconds of the oldest Spark Disarm claim still "
+     "pending on an agent (#5403), floored to whole seconds. ABSENT means no retained agent "
+     "reports a pending Disarm; it is never 0 for \"none\" (a published 0 means a Disarm is "
+     "pending for under a second). A large value means a Disarm has been pending TOO LONG - "
+     "it is not proof the backend call is hung, and nothing is released, popped or "
+     "cancelled while it ages. While pending it holds its key, an executor quota slot of its "
+     "class and, if the call is blocked inside a mechanism, that mechanism type's engine lock; "
+     "recovery from a call that never returns is an agent restart or --spark-disable. NOT "
+     "covered: a compensating disarm, the direct disarm fallback, the synchronous residue "
+     "teardown inside detach_rule_locked, and inline-type teardown. Re-statable gauge: it "
+     "falls when the Disarm completes. A stale-evicted agent leaves the MAX. See "
+     "yuzu_fleet_guardian_disarm_deadline_elapsed for the cumulative count of Disarms seen "
+     "pending past 30 s. MONITOR-ONLY: no alert rule ships with it"},
+};
+
+inline constexpr std::size_t kNGuardianHealthAgeMetrics = std::size(kGuardianHealthAgeMetrics);
 
 // Meta-signals: about the ROLLUP, not part of the row table above. Same rationale as
 // the guardian-journal pair - published on EVERY sweep including at 0, because they
@@ -181,14 +239,17 @@ inline constexpr std::size_t kNGuardianHealthMetrics = std::size(kGuardianHealth
 /// Agents whose latest heartbeat carried at least one parseable
 /// yuzu.guardian_unhealthy_*/guardian_priority_demoted/guardian_outbox_backpressure_drops/
 /// guardian_legacy_sink_events_lost/guardian_legacy_sink_gap_rules/
-/// guardian_legacy_sink_dropped_unwired tag.
+/// guardian_legacy_sink_dropped_unwired/guardian_disarm_deadline_elapsed tag (the #5403
+/// pending-age tag does not count here; see kGuardianHealthAgeMetrics).
 inline constexpr const char* kGuardianHealthReportingGauge = "yuzu_fleet_guardian_health_reporting";
 inline constexpr const char* kGuardianHealthReportingHelp =
     "Agents whose latest heartbeat carried at least one parseable "
     "yuzu.guardian_unhealthy_suppressed/refreshed, yuzu.guardian_priority_demoted, "
     "yuzu.guardian_outbox_backpressure_drops, yuzu.guardian_legacy_sink_events_lost, "
-    "yuzu.guardian_legacy_sink_gap_rules, or yuzu.guardian_legacy_sink_dropped_unwired "
-    "tag (#4783) - the coverage denominator for this "
+    "yuzu.guardian_legacy_sink_gap_rules, yuzu.guardian_legacy_sink_dropped_unwired "
+    "(#4783), or yuzu.guardian_disarm_deadline_elapsed (#5403) tag (the "
+    "yuzu.guardian_disarm_pending_age_seconds age tag does not count here) - the "
+    "coverage denominator for this "
     "family. Published every sweep INCLUDING 0, unlike the counters above. READ 0 "
     "CAREFULLY: because the writer is SPARSE (a 0 counter emits no tag), this counts "
     "agents with at least one NON-ZERO counter, not agents whose Guardian health "
@@ -201,7 +262,8 @@ inline constexpr const char* kGuardianHealthTagRejectedGauge =
 inline constexpr const char* kGuardianHealthTagRejectedHelp =
     "Guardian health tags PRESENT on a heartbeat this sweep but rejected by the "
     "forged-value parse (non-numeric, negative, over 10 digits, or above the "
-    "plausibility ceiling). Published every sweep INCLUDING 0. Without it a rejected "
+    "plausibility ceiling), including the #5403 pending-Disarm age tag. Published every "
+    "sweep INCLUDING 0. Without it a rejected "
     "value is a SILENT drop: if the rejected agent were the only reporter, its family "
     "goes absent and absent reads as clean. > 0 means some agent is shipping malformed "
     "Guardian health telemetry - investigate that agent, and re-check the ceiling "

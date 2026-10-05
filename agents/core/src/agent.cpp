@@ -2622,7 +2622,18 @@ public:
                                         .legacy_sink_gap_rules =
                                             guardian_->legacy_sink_gap_rules(),
                                         .legacy_sink_dropped_unwired =
-                                            guardian_->legacy_sink_dropped_unwired()});
+                                            guardian_->legacy_sink_dropped_unwired(),
+                                        // #5403: Disarm claims seen pending past the
+                                        // observation threshold. Sparse; never gated on
+                                        // prefer_spark_ (a zero is equally truthful dormant).
+                                        .disarm_deadline_elapsed =
+                                            guardian_->disarm_deadline_elapsed()});
+                                // #5403: age of the oldest pending Spark Disarm, in whole
+                                // seconds. An age, not a counter, so it is NOT a field of
+                                // GuardianHealthStats (the server rolls it up as MAX);
+                                // absent while no Disarm is pending, never a fabricated 0.
+                                emit_guardian_disarm_pending_age_tag(
+                                    tags, guardian_->oldest_pending_disarm_age_seconds());
                                 // F7 (#2298 rung 2): per-type CURRENT count of rules classified
                                 // Unsupported (neither backend enforces them) - fleet-loud via
                                 // mech_unsupported_total, sparse (0 omits its tag).

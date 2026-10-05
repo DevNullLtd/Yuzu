@@ -13,6 +13,7 @@
 #include "guardian_backend.hpp" // guardian_backend_from_state/label (#2298 F13)
 #include "guardian_convergence_scheduler.hpp" // ConvergenceScheduler (started_for_test, #2238)
 #include "guardian_journal_format.hpp" // kJournalNamespace, parse_journal_batch (item 7 PR-Ag)
+#include "guardian_health_heartbeat.hpp" // #5403: the pending-Disarm age / deadline-count emitters
 #include "guardian_joined_thread_role.hpp" // GuardianJoinedThreadRole (death test below)
 #include "guardian_io_executor.hpp" // GuardianIoExecutor::submit() (rung 9c R5.1 death test)
 #include "guardian_journal_heartbeat.hpp" // emit_guardian_journal_heartbeat_tags (aggregate inertness)
@@ -3072,6 +3073,91 @@ TEST_CASE("rung 9c PR-2 Unit 3: a hung unwatch() no longer wedges apply_rules() 
     f.mechanism->release_hang();
     REQUIRE(yuzu::test::spin_until([&] { return f.mechanism->watching_count() == 0; },
                                    std::chrono::seconds(10)));
+}
+
+// #5403 export half, through the REAL GuardianEngine + SparkEngine + runtime: a Disarm whose
+// mechanism unwatch() is parked is reported by the engine's heartbeat accessors, aged with a
+// synthetic `now` (never a sleep), latched once past the observation threshold, and gone from
+// the age export when the call completes. The runtime-level semantics have their own tests in
+// test_guardian_spark_runtime.cpp; this one proves the engine forwards them and that the
+// agent's real emitters turn them into the pinned tags.
+TEST_CASE("#5403: the engine exports a hung Disarm's age and deadline count as heartbeat tags, "
+          "and the age disappears on completion",
+          "[spark][guardian][reconcile][liveness][disarm]") {
+    SparkReconcileFixture f;
+    // Release the parked mechanism on EVERY exit path, declared after `f` so it runs BEFORE
+    // the fixture tears down SparkEngine/GuardianEngine (same rationale as the #2233 test).
+    struct ReleaseHangOnExit {
+        SparkReconcileFixture& fx;
+        ~ReleaseHangOnExit() { fx.mechanism->release_hang(); }
+    };
+    ReleaseHangOnExit release_parked{f};
+
+    f.apply(make_service_rule("r1"));
+    REQUIRE(f.mechanism->watching_count() == 1);
+
+    // Quiet agent: no Disarm pending, so BOTH exports are silent (the age is absent, not 0).
+    CHECK_FALSE(f.engine->oldest_pending_disarm_age_seconds().has_value());
+    CHECK(f.engine->disarm_deadline_elapsed() == 0);
+    {
+        std::map<std::string, std::string> tags;
+        yuzu::agent::emit_guardian_disarm_pending_age_tag(
+            tags, f.engine->oldest_pending_disarm_age_seconds());
+        yuzu::agent::emit_guardian_health_heartbeat_tags(
+            tags, yuzu::agent::GuardianHealthStats{.disarm_deadline_elapsed =
+                                                       f.engine->disarm_deadline_elapsed()});
+        CHECK(tags.empty());
+    }
+
+    f.mechanism->hang_next_unwatch();
+    // full_sync with the rule disabled: detach_all() -> off-lock Disarm -> parked unwatch().
+    auto dr = f.dispatch_raw(make_service_rule("r1", /*enabled=*/false));
+    REQUIRE(dr.exit_code == 0);
+    REQUIRE(f.mechanism->wait_entered_hang(std::chrono::seconds(30)));
+
+    // Pending: the age is present (young, so it floors to a small whole number of seconds).
+    REQUIRE(f.engine->oldest_pending_disarm_age_seconds().has_value());
+    // Synthetic clock, no sleep: 95 s after now the same claim reads at least 95 whole seconds.
+    const auto later = std::chrono::steady_clock::now() + std::chrono::seconds(95);
+    const auto aged = f.engine->oldest_pending_disarm_age_seconds(later);
+    REQUIRE(aged.has_value());
+    CHECK(*aged >= 95);
+    // A `now` that predates the claim clamps to zero rather than wrapping.
+    const auto before = f.engine->oldest_pending_disarm_age_seconds(
+        std::chrono::steady_clock::time_point{});
+    REQUIRE(before.has_value());
+    CHECK(*before == 0);
+
+    // Latch: a pass 31 s on observes the Disarm pending past the threshold, once.
+    REQUIRE(f.engine->spark_runtime_for_test() != nullptr);
+    const auto thirty_one = std::chrono::steady_clock::now() + std::chrono::seconds(31);
+    f.engine->spark_runtime_for_test()->expire_overdue_claims(thirty_one);
+    f.engine->spark_runtime_for_test()->expire_overdue_claims(thirty_one + std::chrono::seconds(5));
+    CHECK(f.engine->disarm_deadline_elapsed() == 1);
+
+    {
+        std::map<std::string, std::string> tags;
+        yuzu::agent::emit_guardian_disarm_pending_age_tag(
+            tags, f.engine->oldest_pending_disarm_age_seconds(later));
+        yuzu::agent::emit_guardian_health_heartbeat_tags(
+            tags, yuzu::agent::GuardianHealthStats{.disarm_deadline_elapsed =
+                                                       f.engine->disarm_deadline_elapsed()});
+        REQUIRE(tags.count("yuzu.guardian_disarm_pending_age_seconds") == 1);
+        CHECK(std::stoull(tags.at("yuzu.guardian_disarm_pending_age_seconds")) >= 95);
+        CHECK(tags.at("yuzu.guardian_disarm_deadline_elapsed") == "1");
+    }
+
+    // Completion: the call returns, the claim pops, the age export disappears. The
+    // cumulative count is not undone.
+    f.mechanism->release_hang();
+    REQUIRE(yuzu::test::spin_until(
+        [&] { return !f.engine->oldest_pending_disarm_age_seconds(later).has_value(); },
+        std::chrono::seconds(10)));
+    CHECK(f.engine->disarm_deadline_elapsed() == 1);
+    std::map<std::string, std::string> after;
+    yuzu::agent::emit_guardian_disarm_pending_age_tag(
+        after, f.engine->oldest_pending_disarm_age_seconds());
+    CHECK(after.empty());
 }
 
 // ---------------------------------------------------------------------------

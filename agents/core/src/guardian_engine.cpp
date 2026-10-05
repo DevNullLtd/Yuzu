@@ -1270,6 +1270,23 @@ std::uint64_t GuardianEngine::outbox_backpressure_drops() const { // #2993
     return spark_runtime_ ? spark_runtime_->outbox_backpressure_drops() : 0;
 }
 
+std::uint64_t GuardianEngine::disarm_deadline_elapsed() const { // #5403
+    std::lock_guard lock(mtx_);
+    return spark_runtime_ ? spark_runtime_->disarm_deadline_elapsed() : 0;
+}
+
+std::optional<std::uint64_t>
+GuardianEngine::oldest_pending_disarm_age_seconds(std::chrono::steady_clock::time_point now) const {
+    std::lock_guard lock(mtx_);
+    if (!spark_runtime_)
+        return std::nullopt;
+    const auto age = spark_runtime_->oldest_pending_disarm_age(now);
+    if (!age)
+        return std::nullopt;
+    // The runtime clamps a `now` that predates the claim to zero, so this is never negative.
+    return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::seconds>(*age).count());
+}
+
 std::map<SparkType, std::uint64_t> GuardianEngine::unsupported_counts_by_type() const {
     std::lock_guard lock(mtx_);
     std::map<SparkType, std::uint64_t> out;

@@ -2213,6 +2213,11 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
     // live (they don't depend on the Spark flip - see guardian_health_fleet_tags.hpp).
     for (const auto& m : kGuardianHealthMetrics)
         metrics.clear_gauge_family(m.gauge);
+    // #5403: the pending-Spark-Disarm AGE family (MAX). Same rule: the writer emits the tag
+    // only while a Disarm is pending, so a fleet with none pending must read ABSENT, and a
+    // stale series from a sweep that did have one must not outlive it.
+    for (const auto& m : kGuardianHealthAgeMetrics)
+        metrics.clear_gauge_family(m.gauge);
     // rung 9c PR-3: the arm-ledger re-statable-gauge pair (Decision 1) and the
     // io-ceiling monitor-only counter (Decision 3, Option B). Same absent-not-
     // zero rule: on a fleet where no agent is running spark (prefer_spark_ off
@@ -2402,6 +2407,19 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
         std::array<std::string, kNGuardianHealthMetrics> keys;
         for (std::size_t i = 0; i < kNGuardianHealthMetrics; ++i)
             keys[i] = kGuardianHealthMetrics[i].tag;
+        return keys;
+    }();
+    // #5403: the health family's one AGE row accumulates as MAX, never SUM, exactly like
+    // the journal age family (gja_max): a sum of ages is meaningless and the question is
+    // "how long has the worst endpoint's Disarm been pending". `reported` gates publish, so
+    // MAX over an empty set is absence, never a fabricated 0.
+    std::array<double, kNGuardianHealthAgeMetrics> gha_max{};
+    std::array<bool, kNGuardianHealthAgeMetrics> gha_reported{};
+    // Same static-destruction-safety rationale as gj_keys above.
+    static const std::array<std::string, kNGuardianHealthAgeMetrics> gha_keys = [] {
+        std::array<std::string, kNGuardianHealthAgeMetrics> keys;
+        for (std::size_t i = 0; i < kNGuardianHealthAgeMetrics; ++i)
+            keys[i] = kGuardianHealthAgeMetrics[i].tag;
         return keys;
     }();
     // `yuzu.os` is an agent-CONTROLLED heartbeat tag; using it raw as a metric
@@ -2767,6 +2785,23 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
         }
         if (health_reported_any)
             ++gh_reporting;
+        // #5403: the pending-Disarm age, MAX accumulate. Same parse and the same
+        // reject-not-clamp posture as the journal age family: a forged value above the
+        // plausibility ceiling is counted in gh_tag_rejected, never allowed to own the
+        // fleet MAX. DELIBERATELY not fed into health_reported_any/gh_reporting: that
+        // meta-gauge's documented meaning is the counter family's coverage. An absent tag
+        // is skipped and does not contend.
+        for (std::size_t i = 0; i < kNGuardianHealthAgeMetrics; ++i) {
+            const auto raw = get_view(gha_keys[i]);
+            if (raw.empty())
+                continue;
+            if (auto v = parse_guardian_health_count(raw)) {
+                gha_max[i] = std::max(gha_max[i], *v);
+                gha_reported[i] = true;
+            } else {
+                ++gh_tag_rejected;
+            }
+        }
 
         // rung 9c PR-3 (Decision 1): arm-ledger pair. Same absent-vs-rejected
         // split as every family above - an empty view means this agent did not
@@ -2999,6 +3034,10 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
     for (std::size_t i = 0; i < kNGuardianHealthMetrics; ++i)
         if (gh_reported[i])
             metrics.gauge(kGuardianHealthMetrics[i].gauge).set(gh_sum[i]);
+    // #5403: the AGE row's fleet MAX, same absent-when-unreported rule.
+    for (std::size_t i = 0; i < kNGuardianHealthAgeMetrics; ++i)
+        if (gha_reported[i])
+            metrics.gauge(kGuardianHealthAgeMetrics[i].gauge).set(gha_max[i]);
     metrics.gauge(kGuardianHealthReportingGauge).set(static_cast<double>(gh_reporting));
     metrics.gauge(kGuardianHealthTagRejectedGauge)
         .set(static_cast<double>(gh_tag_rejected));

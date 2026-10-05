@@ -331,6 +331,23 @@ public:
     /// prefer_spark is off / no runtime.
     [[nodiscard]] std::uint64_t outbox_backpressure_drops() const;
 
+    /// #5403: Spark Disarm claims observed pending longer than
+    /// GuardianSparkRuntime::kDisarmPendingObserveThreshold, counted once per claim
+    /// (GuardianSparkRuntime::disarm_deadline_elapsed()). Surfaced sparsely as
+    /// `yuzu.guardian_disarm_deadline_elapsed`. Observation only; zero when no runtime.
+    [[nodiscard]] std::uint64_t disarm_deadline_elapsed() const;
+    /// #5403: age, in whole seconds (floored), of the oldest Spark Disarm claim still pending
+    /// (GuardianSparkRuntime::oldest_pending_disarm_age()), or nullopt when none is. Surfaced
+    /// as `yuzu.guardian_disarm_pending_age_seconds` via emit_guardian_disarm_pending_age_tag,
+    /// which emits nothing for nullopt, so "no Disarm pending" is an ABSENCE, never a 0. It
+    /// measures "pending too long", not proof of a hang, and does not see a compensating
+    /// disarm, direct_disarm_fallback(), the synchronous residue fallback in
+    /// detach_rule_locked, or inline-type teardown. `now` defaults to the steady clock; a test
+    /// passes a later reading to age a claim without sleeping. Takes mtx_ then the runtime's
+    /// registry_mu_, the same order attach_rule/detach_rule already use.
+    [[nodiscard]] std::optional<std::uint64_t> oldest_pending_disarm_age_seconds(
+        std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now()) const;
+
     /// #4783 commit 4: cumulative count of legacy-sink events this engine could not
     /// deliver (RefusedCapacity/RefusedAdmission/WriteFailed/a throwing send — see
     /// guardian_legacy_sink_executor.hpp's own loss-table doc comment; LinkDown and
