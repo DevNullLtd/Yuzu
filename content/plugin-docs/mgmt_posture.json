@@ -58,7 +58,7 @@
     }
   ],
   "description": "Management-plane posture: which plane controls the device (facts only)",
-  "how_it_works": "`posture` reports which management plane controls the device, as facts only. It reads local configuration (Linux) or asks one built-in tool (macOS) and changes nothing. The first row is always a `status` row saying whether the read was complete; the data rows follow. The AD domain, OU and joined rows belong to `device_identity` and are never repeated here.\n\nOn Linux the leg reads `/etc/sssd/sssd.conf` and the `/etc/sssd/conf.d/*.conf` snippets (main file first, then snippets in byte order, parsed once so the last value wins as in SSSD) and derives the plane from the first active SSSD domain whose `id_provider` is `ad` or `ipa`; otherwise a `/etc/ipa/default.conf` with a realm means `ipa`, otherwise `none`. `/etc/krb5.keytab` is checked for presence only and is never opened. Every read separates present, absent and refused: a refused `sssd.conf` is `permission_denied` with plane `unknown`, never \"not joined\". On macOS the leg runs `/usr/bin/profiles status -type enrollment` through the bounded runner and reports MDM enrolment and the MDM server host; any runner failure or unrecognised output is `CONSTRAINED` with no data rows. Windows is planned (caveat 3).",
+  "how_it_works": "`posture` reports which management plane controls the device, as facts only. It reads local configuration (Linux) or asks one built-in tool (macOS) and changes nothing. The first row is always a `status` row saying whether the read was complete; the data rows follow. The AD domain, OU and joined rows belong to `device_identity` and are never repeated here.\n\nOn Linux the leg reads `/etc/sssd/sssd.conf` and the `/etc/sssd/conf.d/*.conf` snippets (main file first, then snippets in byte order, parsed once so the last value wins as in SSSD) and derives the plane from the first active SSSD domain whose `id_provider` is `ad` or `ipa`; otherwise a `/etc/ipa/default.conf` with a realm means `ipa`, otherwise `none`. `/etc/krb5.keytab` is checked for presence only and is never opened. Every read separates present, absent and refused: a refused `sssd.conf` is `permission_denied` with plane `unknown`, never \"not joined\". On macOS the leg runs `/usr/bin/profiles status -type enrollment` through the bounded runner and reports MDM enrolment and the MDM server host; a runner failure (the run timed out, was cancelled, was killed by a signal or hit the 16-line cap) or unrecognised output is `CONSTRAINED` with no data rows, and a tool that could not be started is `UNAVAILABLE` with no data rows. Windows is planned (caveat 3).",
   "inputs": [],
   "kind": {
     "collector": true,
@@ -103,7 +103,7 @@
           "values": null
         },
         {
-          "description": "status: supported, constrained, permission_denied or unsupported (Windows, and a leg that threw). Not used by the other kinds.",
+          "description": "status: supported, constrained, permission_denied or unsupported (Windows, a leg that threw, and a macOS tool that could not be started). Not used by the other kinds.",
           "example": "supported",
           "name": "field_2",
           "platforms": [
@@ -151,7 +151,7 @@
     },
     {
       "grant": "None: `profiles status` reports enrolment to an unprivileged caller",
-      "if_refused": "`CONSTRAINED` / partial with a `subprocess_runner:*` or `macos:mgmt_posture:profiles:*` token and no data rows",
+      "if_refused": "`CONSTRAINED` / partial with a `subprocess_runner:*` or `macos:mgmt_posture:profiles:*` token and no data rows; `UNAVAILABLE` / unknown with `subprocess_runner:spawn_error` when the tool could not be started",
       "measured": "Not yet measured on the agent account; see Sample output for the capture",
       "os": "macOS",
       "runs_as": "agent daemon, default account"
@@ -186,9 +186,9 @@
     },
     {
       "completeness": "partial",
-      "provenance": "`subprocess_runner:deadline`, `subprocess_runner:cancelled`, `subprocess_runner:signaled`, `subprocess_runner:line_limit`, `subprocess_runner:spawn_error`",
+      "provenance": "`subprocess_runner:deadline`, `subprocess_runner:cancelled`, `subprocess_runner:signaled`, `subprocess_runner:line_limit`",
       "status": "`CONSTRAINED`",
-      "when": "macOS: `/usr/bin/profiles` could not be started, the run timed out, was cancelled, was killed by a signal or hit the 16-line cap; no data rows"
+      "when": "macOS: `/usr/bin/profiles` ran but the run timed out, was cancelled, was killed by a signal or hit the 16-line cap; no data rows"
     },
     {
       "completeness": "partial",
@@ -201,6 +201,12 @@
       "provenance": "`windows:planned`",
       "status": "`UNAVAILABLE`",
       "when": "Windows: one `status|posture|unsupported|windows:planned` row (caveat 3)"
+    },
+    {
+      "completeness": "unknown",
+      "provenance": "`subprocess_runner:spawn_error`",
+      "status": "`UNAVAILABLE`",
+      "when": "macOS: `/usr/bin/profiles` could not be started; one `status|posture|unsupported|subprocess_runner:spawn_error` row and no data rows"
     },
     {
       "completeness": "unknown",

@@ -73,7 +73,7 @@ spec:
         platforms: [windows, linux, darwin]
       - name: field_2
         type: string
-        description: 'status: supported, constrained, permission_denied or unsupported (Windows, and a leg that threw). Not used by the other kinds.'
+        description: 'status: supported, constrained, permission_denied or unsupported (Windows, a leg that threw, and a macOS tool that could not be started). Not used by the other kinds.'
         example: supported
         values: [supported, constrained, permission_denied, unsupported]
         platforms: [windows, linux, darwin]

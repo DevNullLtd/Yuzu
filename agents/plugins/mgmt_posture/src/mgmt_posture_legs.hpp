@@ -319,13 +319,16 @@ inline Posture posture_macos(const RunFn& run) {
     };
 
     // classify_runner_failure covers termination_reason only (spawn/deadline/cancel/
-    // signal/line_limit); exit code and truncation are named here.
-    if (const auto f = yuzu::agent::classify_runner_failure(r))
+    // signal/line_limit); exit code and truncation are named here. Its status is forwarded,
+    // as the sibling plugins do: a spawn failure read nothing, so it is UNAVAILABLE/UNKNOWN
+    // (an `unsupported` row); every other runner failure ran the tool, so it is CONSTRAINED.
+    // The runner pairs !tool_ran with spawn_error and timed_out with deadline/cancelled
+    // (subprocess_runner.cpp), so the classifier has already caught both before this point.
+    if (const auto f = yuzu::agent::classify_runner_failure(r)) {
+        if (f->status == YUZU_RESULT_STATUS_UNAVAILABLE)
+            return Posture{StatusState::unsupported, f->provenance, {}};
         return constrained(f->provenance);
-    if (!r.tool_ran)
-        return constrained("subprocess_runner:spawn_error");
-    if (r.timed_out)
-        return constrained("subprocess_runner:deadline");
+    }
     if (r.output_truncated)
         return constrained("macos:mgmt_posture:profiles:output_truncated");
     if (r.exit_code != 0)

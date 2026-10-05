@@ -324,11 +324,34 @@ TEST_CASE("M1b a DEP-only output is unrecognised, never a supported row with mdm
     check_constrained(f.run(), "macos:mgmt_posture:profiles:unrecognised_output");
 }
 
-TEST_CASE("M2 spawn failure is constrained with the runner's token", "[mgmt_posture]") {
+TEST_CASE("M2 spawn failure is unsupported with the runner's token and no rows", "[mgmt_posture]") {
+    // The shared classifier reports a spawn failure as UNAVAILABLE (nothing was read) and the
+    // sibling plugins forward it; CONSTRAINED would claim a partial read that never happened.
     FakeRun f;
     f.res.termination_reason = TerminationReason::spawn_error;
     f.res.tool_ran = false;
-    check_constrained(f.run(), "subprocess_runner:spawn_error");
+    const auto p = f.run();
+    CHECK(p.status == StatusState::unsupported);
+    CHECK(p.reason == "subprocess_runner:spawn_error");
+    CHECK(p.rows.empty());
+}
+
+TEST_CASE("M2b the other runner failures stay constrained with no rows", "[mgmt_posture]") {
+    // cancelled, signaled and line_limit ran the tool, so the read is partial, not unavailable.
+    // The output is parseable on purpose: the runner failure must win over a recognisable answer.
+    struct Case {
+        TerminationReason why;
+        const char* token;
+    };
+    const Case cases[] = {{TerminationReason::cancelled, "subprocess_runner:cancelled"},
+                          {TerminationReason::signaled, "subprocess_runner:signaled"},
+                          {TerminationReason::line_limit, "subprocess_runner:line_limit"}};
+    for (const auto& c : cases) {
+        INFO(c.token);
+        auto f = exited(0, kUnenrolled);
+        f.res.termination_reason = c.why;
+        check_constrained(f.run(), c.token);
+    }
 }
 
 TEST_CASE("M3 a deadline is constrained with no rows", "[mgmt_posture]") {
