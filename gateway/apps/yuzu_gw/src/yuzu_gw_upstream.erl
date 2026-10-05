@@ -24,11 +24,38 @@
 %%%   one of the ten slots is held back, so a backlog that refills every freed
 %%%   slot cannot keep the replay drip waiting until the backlog is empty.
 %%%
+%%% The half_open probe (#4632):
+%%%   Held entries are not sent while the breaker is open. When it goes half_open
+%%%   (and when work first arrives while it is half_open) the HEAD held entry is
+%%%   sent as the probe, and the breaker is driven by its result. Without it a
+%%%   held entry could wait forever after the server recovered: a disconnected
+%%%   session sends no heartbeat, and a known session needs no verdict. Only one
+%%%   probe is out at a time, it counts in the ten worker budget, and nothing
+%%%   else drains while it is out. The probe worker sends its result to this
+%%%   process before it exits; the result carries the breaker generation
+%%%   (cb_gen, bumped on every entry into half_open) it was sent under.
+%%%     - The event is retired on ok. On error it goes back to the head of the
+%%%       store (a newer event for the same key that arrived meanwhile wins and
+%%%       the old one is dropped, counted as notify_coalesced). One slot is held
+%%%       back from the cap while a probe is out, so that the give-back always
+%%%       fits.
+%%%     - The breaker is moved only when it is still half_open under the SAME
+%%%       generation: ok closes it (and casts the replay), error reopens it with
+%%%       doubled backoff. In any other state or generation the result does not
+%%%       touch the breaker (a call path RPC may have closed or reopened it
+%%%       meanwhile; a breaker that is open has no on_success or on_failure).
+%%%     - A probe worker that dies without a result is an error (worker_down),
+%%%       once: the record is cleared by whichever of result or 'DOWN' comes
+%%%       first, and a result is always delivered before the 'DOWN' of its
+%%%       sender.
+%%%   Ordinary workers never report to the breaker.
+%%%
 %%% Includes a circuit breaker to prevent cascading failures when the
 %%% upstream server is unreachable. States:
 %%%   closed    — RPCs pass through; consecutive failures tracked
 %%%   open      — RPCs fail immediately with {error, circuit_open}
 %%%   half_open — one probe RPC allowed; success closes, failure reopens
+%%%               (a call path RPC, or one held notification as the probe)
 %%%
 %%% Registration replay on reconnect:
 %%%   When the upstream connection re-establishes after a failure, the
@@ -133,6 +160,12 @@
 %% encode_command_request/1 in yuzu_gw_proto.erl for the forwarding half.
 -define(WIRE_CAP_DISPATCH_TAG_V1, <<"command_dispatch_tag_v1">>).
 
+-type notify_probe() :: #{pid   := pid(),
+                          mref  := reference(),
+                          gen   := non_neg_integer(),
+                          key   := yuzu_gw_notify_queue:key(),
+                          event := yuzu_gw_notify_queue:event()}.
+
 -record(state, {
     notify_pids     :: #{pid() => true},
     %% Stream-status notifications held until a worker slot is free and the
@@ -147,11 +180,13 @@
     cb_max_timeout  :: non_neg_integer(),
     cb_cur_timeout  :: non_neg_integer(),
     cb_timer        :: reference() | undefined,
-    %% Reserved for the half_open probe (not used yet): the number of times the
-    %% breaker entered half_open, and the held notification currently sent as
-    %% the probe.
+    %% The number of times the breaker entered half_open, and the held
+    %% notification currently sent as the half_open probe (its worker, monitor,
+    %% the generation it was started under, and the store key and event it
+    %% took out of the store so a failure can give it back). The event stays
+    %% out of format_status.
     cb_gen          = 0 :: non_neg_integer(),
-    notify_probe    = undefined :: undefined | map(),
+    notify_probe    = undefined :: undefined | notify_probe(),
     %% Registration replay on upstream reconnect
     replay_spacing  :: non_neg_integer(),
     replay_queue    :: [{binary(), binary() | undefined, map()}],  %% agents still to re-proxy ([] = idle)
@@ -331,7 +366,8 @@ handle_call(_Request, _From, State) ->
     {reply, {error, unknown_call}, State}.
 
 handle_cast({notify_stream_status, AgentId, SessionId, Event, PeerAddr, StreamHomeId},
-            #state{notify_pending = Pending, cluster_id = ClusterId} = State) ->
+            #state{notify_pending = Pending, notify_probe = Probe,
+                   cluster_id = ClusterId} = State) ->
     Before = notify_counts(State),
     Notification = #{
         agent_id     => AgentId,
@@ -360,11 +396,13 @@ handle_cast({notify_stream_status, AgentId, SessionId, Event, PeerAddr, StreamHo
     %% #4632: hold the notification instead of dropping it when no slot is free
     %% or the breaker is not closed. Latest event wins within a key (so a
     %% CONNECTED followed by a DISCONNECTED for one session sends only the
-    %% DISCONNECTED); two sessions of one agent are two keys. Nothing is reserved
-    %% yet (the half_open probe will hold one slot back).
+    %% DISCONNECTED); two sessions of one agent are two keys. While a half_open
+    %% probe is out one slot is held back, so the probe's event always fits back
+    %% if the probe fails.
     Key = {AgentId, maps:get(session_id, Notification), StreamHomeId},
+    Reserved = case Probe of undefined -> 0; _ -> 1 end,
     State1 =
-        case yuzu_gw_notify_queue:put(Key, {AgentId, Notification}, 0, Pending) of
+        case yuzu_gw_notify_queue:put(Key, {AgentId, Notification}, Reserved, Pending) of
             {new, Pending1} ->
                 State#state{notify_pending = Pending1};
             {replaced, Pending1} ->
@@ -589,14 +627,33 @@ handle_info(replay_next, #state{replay_queue = [{AgentId, SessionId, RegisterReq
     %% skip and abort paths above do not drain on their own.
     {noreply, report_notify_counts(Before, drain(State2))};
 
-handle_info(circuit_half_open, State) ->
+handle_info(circuit_half_open, #state{cb_gen = Gen} = State) ->
     logger:info("Circuit breaker: open -> half_open (allowing probe RPC)"),
     telemetry:execute([yuzu, gw, upstream, circuit_state],
                       #{count => 1},
                       #{state => <<"half_open">>}),
-    %% Held notifications stay held while half_open: drain/1 sends only when the
-    %% breaker is closed (a half_open probe by a held notification is a later step).
-    {noreply, drain(State#state{cb_state = half_open, cb_timer = undefined})};
+    %% The only entry into half_open, so the only place the generation moves. A
+    %% held notification is sent as the probe (drain/1).
+    Before = notify_counts(State),
+    State1 = State#state{cb_state = half_open, cb_timer = undefined, cb_gen = Gen + 1},
+    {noreply, report_notify_counts(Before, drain(State1))};
+
+%% The result of the half_open probe worker. A result from any pid but the
+%% recorded probe (a duplicate, or one that was already resolved) is ignored.
+handle_info({notify_probe_result, Pid, Gen, Result},
+            #state{notify_probe = #{pid := Pid}} = State) ->
+    Before = notify_counts(State),
+    State1 = resolve_probe(Gen, Result, State),
+    {noreply, report_notify_counts(Before, drain(State1))};
+handle_info({notify_probe_result, _Pid, _Gen, _Result}, State) ->
+    {noreply, State};
+
+%% The probe worker ended with no result (killed): the same as an error, once.
+handle_info({'DOWN', MonRef, process, Pid, _Reason},
+            #state{notify_probe = #{pid := Pid, mref := MonRef, gen := Gen}} = State) ->
+    Before = notify_counts(State),
+    State1 = resolve_probe(Gen, {error, worker_down}, State),
+    {noreply, report_notify_counts(Before, drain(State1))};
 
 handle_info({'DOWN', _MonRef, process, Pid, _Reason},
             #state{notify_pids = Pids, guardian_pids = GPids} = State) ->
@@ -971,8 +1028,75 @@ drain(#state{cb_state = closed, notify_pids = Pids, notify_pending = Pending,
                                       notify_pids = Pids#{Pid => true}})
             end
     end;
+drain(#state{cb_state = half_open, notify_probe = undefined, notify_pids = Pids,
+             notify_pending = Pending, cb_gen = Gen} = State)
+        when map_size(Pids) < ?MAX_NOTIFY_INFLIGHT ->
+    case yuzu_gw_notify_queue:take(Pending) of
+        empty ->
+            State;
+        {Key, {AgentId, Notification} = Event, Pending1} ->
+            %% The probe: the head held entry, sent on a monitored worker like
+            %% any other, but it reports its result to this process (send before
+            %% exit, so the result reaches the mailbox before the 'DOWN'). The
+            %% message carries the result only, never the event.
+            Server = self(),
+            {Pid, MonRef} = spawn_monitor(fun() ->
+                Result = do_rpc('NotifyStreamStatus', Notification, notify_stream),
+                case Result of
+                    {ok, _} -> ok;
+                    {error, Reason} ->
+                        logger:warning("Failed to notify stream status for ~s: ~p",
+                                       [AgentId, Reason])
+                end,
+                Server ! {notify_probe_result, self(), Gen, Result}
+            end),
+            State#state{notify_pending = Pending1,
+                        notify_pids = Pids#{Pid => true},
+                        notify_probe = #{pid => Pid, mref => MonRef, gen => Gen,
+                                         key => Key, event => Event}}
+    end;
 drain(State) ->
     State.
+
+%% @doc Retire the probe attempt: clear the record and free its slot, decide the
+%% event, then (separately) decide the breaker. Called once per probe, by the
+%% first of its result and its 'DOWN'.
+%%
+%% The event: ok retires it; an error gives it back at the head of the store
+%% (the reserved slot guarantees it fits; a newer event for the same key wins and
+%% the old one is dropped and counted).
+%%
+%% The breaker: moved only when it is still half_open AND Gen is the generation
+%% now current. In any other state the result is stale (a call path RPC closed or
+%% reopened the breaker meanwhile, or it went half_open again): the breaker is
+%% not touched, and on_success/on_failure have no clause for an open breaker.
+-spec resolve_probe(non_neg_integer(), {ok, term()} | {error, term()}, #state{}) -> #state{}.
+resolve_probe(Gen, Result,
+              #state{notify_probe = #{pid := Pid, mref := MonRef, key := Key, event := Event},
+                     notify_pids = Pids, notify_pending = Pending,
+                     cb_state = CbState, cb_gen = CbGen} = State) ->
+    erlang:demonitor(MonRef, [flush]),
+    Pending1 =
+        case Result of
+            {ok, _} ->
+                Pending;
+            {error, _} ->
+                case yuzu_gw_notify_queue:push_front(Key, Event, Pending) of
+                    {inserted, Q} ->
+                        Q;
+                    {superseded, Q} ->
+                        telemetry:execute([yuzu, gw, upstream, notify_coalesced],
+                                          #{count => 1}, #{}),
+                        Q
+                end
+        end,
+    State1 = State#state{notify_probe = undefined,
+                         notify_pids = maps:remove(Pid, Pids),
+                         notify_pending = Pending1},
+    case CbState =:= half_open andalso Gen =:= CbGen of
+        true  -> record_result(Result, State1);
+        false -> State1
+    end.
 
 %% @doc How many notify workers drain/1 may have in flight. While a registration
 %% replay is active one slot is held back: the replay drip waits for fewer than
