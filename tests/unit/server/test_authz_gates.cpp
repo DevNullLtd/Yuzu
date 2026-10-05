@@ -526,6 +526,94 @@ TEST_CASE("require_fleet_read: genuinely empty service set ⇒ admitted-empty wi
     CHECK_FALSE(result->in_scope("a_s"));
 }
 
+// ITServiceOwner AUTHORITY CEILING on the service axis (parity with require_permission's
+// service branch). The minter holds a GLOBAL grant and the tag meet would admit, so only the
+// ceiling can produce the 403. `remove_permission` is the operator revoke (it records the
+// `revoked_seed_defaults` marker so a reboot does not re-seed the pair).
+TEST_CASE("require_fleet_read: service token, ITServiceOwner lacks the pair => Forbidden even "
+          "when the minter holds it and the tag meet would admit",
+          "[pg][auth_routes][authz_gates][service_scope]") {
+    YUZU_REQUIRE_PG_DB_TPL(rbac_db_, rbac_gates_tpl);
+    GatesRig r{rbac_db_.dsn()};
+    REQUIRE(r.rbac.assign_role({"user", "minter", "RespReader"}).has_value()); // GLOBAL allow
+    const auto svc = r.mint("printers");
+    const auto plain = r.mint();
+
+    // Ceiling PRESENT (seeded ITServiceOwner Response CRUD): admitted, narrowed to the tag set.
+    {
+        auto req = bearer_request(svc);
+        httplib::Response res;
+        auto result = r.ar->require_fleet_read(req, res, "Response", "Read");
+        REQUIRE(result.has_value());
+        CHECK_FALSE(result->unfiltered());
+        CHECK(result->in_scope("a_p"));
+        CHECK_FALSE(result->in_scope("a_c2"));
+    }
+
+    // Operator revokes the pair from ITServiceOwner only.
+    REQUIRE(r.rbac.remove_permission("ITServiceOwner", "Response", "Read").has_value());
+
+    {
+        auto req = bearer_request(svc);
+        httplib::Response res;
+        auto result = r.ar->require_fleet_read(req, res, "Response", "Read");
+        REQUIRE_FALSE(result.has_value());
+        CHECK(result.error() == authz::GateFailure::Forbidden);
+        CHECK(res.status == 403);
+        CHECK(res.body.find("service-scoped token does not grant Response:Read") !=
+              std::string::npos);
+        // Clause 5: a grant to the minter would not admit this caller, so no `.permission`.
+        CHECK(res.body.find("\"permission\"") == std::string::npos);
+    }
+    // The same minter's NON-service token is unaffected (the ceiling is service-axis only).
+    {
+        auto req = bearer_request(plain);
+        httplib::Response res;
+        auto result = r.ar->require_fleet_read(req, res, "Response", "Read");
+        REQUIRE(result.has_value());
+        CHECK(result->unfiltered());
+    }
+    // The revoke is pair-specific: another pair ITServiceOwner still holds is admitted.
+    REQUIRE(r.rbac.create_role({"ExecReaderGate", "", false, 0}).has_value());
+    REQUIRE(r.rbac.set_permission({"ExecReaderGate", "Execution", "Read", "allow"}).has_value());
+    REQUIRE(r.rbac.assign_role({"user", "minter", "ExecReaderGate"}).has_value());
+    {
+        auto req = bearer_request(svc);
+        httplib::Response res;
+        auto result = r.ar->require_fleet_read(req, res, "Execution", "Read");
+        REQUIRE(result.has_value());
+        CHECK_FALSE(result->unfiltered());
+    }
+}
+
+TEST_CASE("require_fleet_read: service token, degraded ITServiceOwner permission read => "
+          "Forbidden (fail closed, never an admit)",
+          "[pg][auth_routes][authz_gates][service_scope]") {
+    YUZU_REQUIRE_PG_DB_TPL(rbac_db_, rbac_gates_tpl);
+    GatesRig r{rbac_db_.dsn()};
+    REQUIRE(r.rbac.assign_role({"user", "minter", "RespReader"}).has_value());
+    const auto svc = r.mint("printers");
+
+    // Drop the permission table out from under the live store so the ceiling read fails.
+    {
+        yuzu::server::pg::PgConn conn{PQconnectdb(rbac_db_.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        yuzu::server::pg::PgResult d{
+            PQexec(conn.get(), "DROP TABLE rbac_store.role_permissions CASCADE")};
+        REQUIRE(d.ok());
+    }
+
+    auto req = bearer_request(svc);
+    httplib::Response res;
+    auto result = r.ar->require_fleet_read(req, res, "Response", "Read");
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error() == authz::GateFailure::Forbidden);
+    CHECK(res.status == 403);
+    // The ceiling's own body, so a later axis failing for the same reason cannot satisfy this.
+    CHECK(res.body.find("service-scoped token does not grant Response:Read") !=
+          std::string::npos);
+}
+
 TEST_CASE("require_fleet_read: null rbac store ⇒ Degraded (not a crash)",
           "[pg][auth_routes][authz_gates][service_scope]") {
     Config cfg{};

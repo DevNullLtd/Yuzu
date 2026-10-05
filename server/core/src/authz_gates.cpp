@@ -167,6 +167,35 @@ AuthRoutes::require_fleet_read(const httplib::Request& req, httplib::Response& r
         return std::unexpected(authz::GateFailure::Forbidden);
     }
 
+    // ITServiceOwner AUTHORITY CEILING (same check as require_permission's service branch,
+    // auth_routes.cpp: `check_role_has_permission("ITServiceOwner", securable, operation)`):
+    // a service-scoped token can never exceed what that role grants, regardless of what its
+    // minter holds. Without it this gate admitted a service token on the minter's grant plus
+    // the tag meet alone, so an operator who revoked the pair from ITServiceOwner (the
+    // `revoked_seed_defaults` mechanism) still saw service tokens served on every fleet-read
+    // route. `check_role_has_permission` is deny-on-error (a degraded read returns false), so
+    // a store failure here fails CLOSED as a 403, the same outcome require_permission gives.
+    // Deliberately NOT the second half of require_permission's service branch
+    // (`service_scope_admits` / `kServiceScopeGlobalSafe`): that allow-list guards routes that
+    // return fleet-wide data UNCONFINED, whereas this gate's service axis below always
+    // narrows to the tagged set, so the allow-list is neither applied nor widened here.
+    // Service axis only (non-service callers never reach it), after the elevated -> engine ->
+    // mcp_tier branches and before the RBAC axis (branch order unchanged). No `.permission`
+    // on the 403 (routed-concern clause 5): granting `perm` to the minter does not admit this
+    // caller; only an ITServiceOwner grant does.
+    if (!session->token_scope_service.empty() &&
+        !rbac_store_->check_role_has_permission("ITServiceOwner", securable_type, operation)) {
+        audit_log(req, "auth.fleet_read_required", "denied", "", "",
+                  "fleet read blocked: service-scoped token lacks ITServiceOwner permission " +
+                      perm);
+        res.status = 403;
+        res.set_content(detail::a4_denial(res, 403,
+                                          "service-scoped token does not grant " + perm +
+                                              " (the ITServiceOwner role does not hold it)"),
+                        "application/json");
+        return std::unexpected(authz::GateFailure::Forbidden);
+    }
+
     // #4031 topology floor (authz_topology_floor.hpp): RbacStore::authorize_
     // list_read's own legacy-open branch (rbac_store.cpp) returns AdmitAll
     // UNCONDITIONALLY once RBAC enforcement is off, with no floor check of
