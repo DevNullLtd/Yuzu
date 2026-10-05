@@ -1288,6 +1288,18 @@ GuardianEngine::oldest_pending_disarm_age_seconds(std::chrono::steady_clock::tim
     return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::seconds>(*age).count());
 }
 
+std::optional<std::uint64_t> GuardianEngine::oldest_outstanding_compensation_age_seconds(
+    std::chrono::steady_clock::time_point now) const { // #4472
+    std::lock_guard lock(mtx_);
+    if (!spark_runtime_)
+        return std::nullopt;
+    const auto age = spark_runtime_->oldest_outstanding_compensation_age(now);
+    if (!age)
+        return std::nullopt;
+    // The runtime clamps a `now` that predates the owed instant to zero: never negative.
+    return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::seconds>(*age).count());
+}
+
 GuardianHealthStats GuardianEngine::spark_claim_health_stats() const { // #5404
     GuardianHealthStats s;
     {

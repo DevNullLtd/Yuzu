@@ -9,8 +9,9 @@
 ///
 /// SPARSE: the counter is 0 on a healthy / inert (prefer_spark=false) agent, so the tag is
 /// emitted ONLY when non-zero, keeping the "absent == nothing to report" reading honest.
-/// The one exception is the #5403 pending-Disarm age (emit_guardian_disarm_pending_age_tag),
-/// which is an age, not a counter: it is absent while nothing is pending.
+/// The exceptions are the #5403 pending-Disarm age (emit_guardian_disarm_pending_age_tag) and
+/// the #4472 outstanding-compensation age (emit_guardian_compensation_pending_age_tag), which
+/// are ages, not counters: each is absent while nothing is pending.
 
 #include <cstdint>
 #include <optional>
@@ -69,6 +70,13 @@ inline constexpr char kGuardianLegacySinkDroppedUnwiredTag[] =
 /// cumulative-counter shape as its siblings above, so the server rolls it up as a fleet SUM.
 inline constexpr char kGuardianDisarmDeadlineElapsedTag[] = "yuzu.guardian_disarm_deadline_elapsed";
 
+/// #4472: cumulative count of compensating teardowns observed outstanding longer than the
+/// claim's own compensation deadline (GuardianSparkRuntime::compensation_deadline_elapsed(),
+/// once per claim). The Arm-claim counterpart of the Disarm count above, which cannot see it.
+/// Observation only: nothing is released. Sparse: 0 omits the tag; rolled up as a fleet SUM.
+inline constexpr char kGuardianCompensationDeadlineElapsedTag[] =
+    "yuzu.guardian_compensation_deadline_elapsed";
+
 /// #5404 (gate rows P1/P2): the Spark claim-lifecycle counters. Every one is sparse (0 omits the
 /// tag), steady-state 0, and rolled up by the server as a plain fleet SUM like its siblings
 /// above; none is gated on prefer_spark (a zero is equally truthful dormant). Nonzero values
@@ -114,6 +122,15 @@ inline constexpr char kGuardianClaimsDroppedAtStopTag[] = "yuzu.guardian_claims_
 /// maintenance firewall (the heartbeat-thread ack drain and apply_rules' ack preamble).
 inline constexpr char kGuardianAckMaintExceptionsTag[] = "yuzu.guardian_ack_maint_exceptions";
 
+/// #4472: age in whole seconds (floored) of the oldest compensating teardown still outstanding
+/// (GuardianSparkRuntime::oldest_outstanding_compensation_age()), measured from the instant the
+/// compensation became owed, not from the original arm. NOT a counter: a re-statable age, so
+/// the server rolls it up as the fleet MAX. Emitted by emit_guardian_compensation_pending_age_tag
+/// below; ABSENT while none is outstanding. "Teardown pending too long" is what this measures,
+/// not proof of a hang.
+inline constexpr char kGuardianCompensationPendingAgeTag[] =
+    "yuzu.guardian_compensation_pending_age_seconds";
+
 /// #5403: age in whole seconds (floored) of the oldest Spark Disarm claim still pending
 /// (GuardianSparkRuntime::oldest_pending_disarm_age()). NOT a counter: a re-statable age, so
 /// the server rolls it up as the fleet MAX (a sum of ages is meaningless), never as a sum.
@@ -134,6 +151,7 @@ struct GuardianHealthStats {
     std::uint64_t legacy_sink_gap_rules{0};       ///< #4783
     std::uint64_t legacy_sink_dropped_unwired{0}; ///< #4783 governance follow-up
     std::uint64_t disarm_deadline_elapsed{0};     ///< #5403
+    std::uint64_t compensation_deadline_elapsed{0}; ///< #4472
     std::uint64_t orphan_disarms_started{0};          ///< #5404 P1
     std::uint64_t dead_watchers_erased_on_lost{0};    ///< #5404 P1
     std::uint64_t tombstones_released_by_reaper{0};   ///< #5404 P1
@@ -168,6 +186,9 @@ void emit_guardian_health_heartbeat_tags(TagMap& tags, const GuardianHealthStats
             std::to_string(s.legacy_sink_dropped_unwired);
     if (s.disarm_deadline_elapsed != 0)
         tags[kGuardianDisarmDeadlineElapsedTag] = std::to_string(s.disarm_deadline_elapsed);
+    if (s.compensation_deadline_elapsed != 0)
+        tags[kGuardianCompensationDeadlineElapsedTag] =
+            std::to_string(s.compensation_deadline_elapsed);
     if (s.orphan_disarms_started != 0)
         tags[kGuardianOrphanDisarmsStartedTag] = std::to_string(s.orphan_disarms_started);
     if (s.dead_watchers_erased_on_lost != 0)
@@ -196,7 +217,7 @@ void emit_guardian_health_heartbeat_tags(TagMap& tags, const GuardianHealthStats
         tags[kGuardianAckMaintExceptionsTag] = std::to_string(s.ack_maint_exceptions);
 }
 
-/// #5404 (P1): read the ten GuardianSparkRuntime claim-lifecycle values into a
+/// #5404 (P1) and #4472: read the eleven GuardianSparkRuntime claim-lifecycle values into a
 /// GuardianHealthStats (every other field stays 0, so emitting it adds only these tags to the
 /// sparse emitter above; ack_maint_exceptions is engine-owned and filled by the engine).
 /// A template over the runtime type so this header stays free of the runtime's includes (the
@@ -207,6 +228,7 @@ void emit_guardian_health_heartbeat_tags(TagMap& tags, const GuardianHealthStats
 template <typename Runtime>
 [[nodiscard]] GuardianHealthStats guardian_spark_claim_health_stats(const Runtime& rt) {
     GuardianHealthStats s;
+    s.compensation_deadline_elapsed = rt.compensation_deadline_elapsed(); // #4472
     s.orphan_disarms_started = rt.orphan_disarms_started();
     s.dead_watchers_erased_on_lost = rt.dead_watchers_erased_on_lost();
     s.tombstones_released_by_reaper = rt.tombstones_released_by_reaper();
@@ -233,6 +255,18 @@ void emit_guardian_disarm_pending_age_tag(TagMap& tags,
     if (!age_seconds)
         return;
     tags[kGuardianDisarmPendingAgeTag] = std::to_string(*age_seconds);
+}
+
+/// #4472: populate `tags` with the oldest outstanding compensating teardown's age. Same shape
+/// and same reasons as emit_guardian_disarm_pending_age_tag (an age, a MAX at the server, its
+/// own emitter): nullopt (none outstanding) emits NOTHING, never a fabricated 0, and an engaged
+/// optional emits its value including 0 (outstanding for less than one second).
+template <typename TagMap>
+void emit_guardian_compensation_pending_age_tag(TagMap& tags,
+                                                const std::optional<std::uint64_t>& age_seconds) {
+    if (!age_seconds)
+        return;
+    tags[kGuardianCompensationPendingAgeTag] = std::to_string(*age_seconds);
 }
 
 } // namespace yuzu::agent

@@ -765,6 +765,33 @@ GuardianSparkRuntime::oldest_pending_disarm_age(std::chrono::steady_clock::time_
     return oldest_pending_disarm_age_locked(now);
 }
 
+std::optional<std::chrono::steady_clock::duration>
+GuardianSparkRuntime::oldest_outstanding_compensation_age_locked(
+    std::chrono::steady_clock::time_point now) const {
+    std::optional<std::chrono::steady_clock::duration> oldest;
+    for (const auto& [key, entry] : claims_) {
+        for (const auto& c : entry.fifo) {
+            if (c->compensation_finished ||
+                c->compensation_deadline == std::chrono::steady_clock::time_point{})
+                continue;
+            // The deadline was set once, at the owed instant, plus backend_op_deadline.
+            const auto owed_at = c->compensation_deadline - cfg_.backend_op_deadline;
+            // A `now` before the owed instant (a caller-supplied clock) reads as zero.
+            const auto age = std::max(now - owed_at, std::chrono::steady_clock::duration::zero());
+            if (!oldest || age > *oldest)
+                oldest = age;
+        }
+    }
+    return oldest;
+}
+
+std::optional<std::chrono::steady_clock::duration>
+GuardianSparkRuntime::oldest_outstanding_compensation_age(
+    std::chrono::steady_clock::time_point now) const {
+    std::lock_guard<std::mutex> lk{registry_mu_};
+    return oldest_outstanding_compensation_age_locked(now);
+}
+
 void GuardianSparkRuntime::observe_pending_disarms_locked(
     std::chrono::steady_clock::time_point now, std::vector<DisarmObservation>& warns) {
     for (auto& [key, entry] : claims_) {
@@ -2457,8 +2484,8 @@ void GuardianSparkRuntime::synthesize_fallback_outcome_locked(KeyClaim& c) {
 }
 
 std::size_t GuardianSparkRuntime::reap_stranded_claims_locked(
+    std::chrono::steady_clock::time_point now,
     std::vector<std::pair<std::string, std::shared_ptr<KeyClaim>>>& refills) {
-    const auto now = std::chrono::steady_clock::now();
     std::size_t reaped = 0;
     bool release_failed = false;
     // The key of the first claim whose release failed this pass, for the rate-limited warn.
@@ -2706,7 +2733,7 @@ std::size_t GuardianSparkRuntime::expire_overdue_claims(std::chrono::steady_cloc
         // up-4 (#4221): the terminal-recovery safety net (see this function's own
         // doc comment) - separate from the overdue-live-claim pass above, which
         // deliberately excludes anything already outcome/commit_exception/abandoned.
-        reaped_count = reap_stranded_claims_locked(refills);
+        reaped_count = reap_stranded_claims_locked(now, refills);
         // #5322: the owner of a ->0 edge a release dropped. Contained here so the
         // reaper's refills (already flipped Dispatching) always reach their dispatch.
         try {

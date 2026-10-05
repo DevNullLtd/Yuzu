@@ -37,9 +37,12 @@
 #include <type_traits>
 
 namespace detail = yuzu::server::detail;
+using yuzu::agent::emit_guardian_compensation_pending_age_tag;
 using yuzu::agent::emit_guardian_disarm_pending_age_tag;
 using yuzu::agent::emit_guardian_health_heartbeat_tags;
 using yuzu::agent::GuardianHealthStats;
+using yuzu::agent::kGuardianCompensationDeadlineElapsedTag;
+using yuzu::agent::kGuardianCompensationPendingAgeTag;
 using yuzu::agent::kGuardianDisarmDeadlineElapsedTag;
 using yuzu::agent::kGuardianDisarmPendingAgeTag;
 
@@ -74,6 +77,7 @@ GuardianHealthStats all_nonzero_stats() {
     s.legacy_sink_gap_rules = 6;       // #4783
     s.legacy_sink_dropped_unwired = 7; // #4783 governance follow-up
     s.disarm_deadline_elapsed = 8;     // #5403
+    s.compensation_deadline_elapsed = 20; // #4472
     s.orphan_disarms_started = 9;          // #5404
     s.dead_watchers_erased_on_lost = 10;   // #5404
     s.tombstones_released_by_reaper = 11;  // #5404
@@ -122,6 +126,7 @@ TEST_CASE("guardian health: agent emit keys bind exactly to the server table",
         {"yuzu.guardian_legacy_sink_gap_rules", "6"},      // #4783
         {"yuzu.guardian_legacy_sink_dropped_unwired", "7"}, // #4783 governance follow-up
         {"yuzu.guardian_disarm_deadline_elapsed", "8"},     // #5403
+        {"yuzu.guardian_compensation_deadline_elapsed", "20"}, // #4472
         {"yuzu.guardian_orphan_disarms_started", "9"},         // #5404
         {"yuzu.guardian_dead_watchers_erased_on_lost", "10"},  // #5404
         {"yuzu.guardian_tombstones_released_by_reaper", "11"}, // #5404
@@ -228,7 +233,7 @@ TEST_CASE("guardian disarm age: the agent key is pinned to the server's age tabl
           "[guardian][health][fleet][disarm]") {
     // A one-sided rename of the tag string on either side leaves the fleet gauge permanently
     // absent, which reads as "no Disarm pending": this is the drift guard.
-    REQUIRE(detail::kNGuardianHealthAgeMetrics == 1);
+    REQUIRE(detail::kNGuardianHealthAgeMetrics == 2);
     CHECK(std::string_view(detail::kGuardianHealthAgeMetrics[0].tag) ==
           std::string_view(kGuardianDisarmPendingAgeTag));
     CHECK(std::string_view(kGuardianDisarmPendingAgeTag) ==
@@ -281,4 +286,70 @@ TEST_CASE("guardian disarm age: emitter is absent for nullopt, present (includin
     std::map<std::string, std::string> counter;
     emit_guardian_health_heartbeat_tags(counter, GuardianHealthStats{});
     CHECK(counter.count(kGuardianDisarmDeadlineElapsedTag) == 0);
+}
+
+// ---- #4472: the outstanding-compensation AGE row and its deadline count ------------------
+
+TEST_CASE("guardian compensation age: the agent keys are pinned to the server's tables",
+          "[guardian][health][fleet][compensation]") {
+    // The age is the age table's SECOND row; its once-per-claim count is a row of the SUM table.
+    REQUIRE(detail::kNGuardianHealthAgeMetrics == 2);
+    const auto& age = detail::kGuardianHealthAgeMetrics[1];
+    CHECK(std::string_view(age.tag) == std::string_view(kGuardianCompensationPendingAgeTag));
+    CHECK(std::string_view(kGuardianCompensationPendingAgeTag) ==
+          "yuzu.guardian_compensation_pending_age_seconds");
+    CHECK(std::string_view(age.gauge) ==
+          "yuzu_fleet_guardian_compensation_pending_age_seconds_max");
+
+    // WRITER -> READER through the agent's REAL emitter.
+    std::map<std::string, std::string> tags;
+    emit_guardian_compensation_pending_age_tag(tags, std::optional<std::uint64_t>{42});
+    REQUIRE(tags.size() == 1);
+    CHECK(tags.at(age.tag) == "42");
+
+    // The age tag must not also be a SUM-table row (it would be summed), and the count tag
+    // must be one.
+    bool count_found = false;
+    for (const auto& m : detail::kGuardianHealthMetrics) {
+        CHECK(std::string_view(m.tag) != std::string_view(kGuardianCompensationPendingAgeTag));
+        if (std::string_view(m.tag) == std::string_view(kGuardianCompensationDeadlineElapsedTag)) {
+            count_found = true;
+            CHECK(std::string_view(m.gauge) ==
+                  "yuzu_fleet_guardian_compensation_deadline_elapsed");
+        }
+    }
+    CHECK(count_found);
+    // And the two age tags are distinct, so one cannot shadow the other's accumulator.
+    CHECK(std::string_view(detail::kGuardianHealthAgeMetrics[0].tag) !=
+          std::string_view(detail::kGuardianHealthAgeMetrics[1].tag));
+}
+
+TEST_CASE("guardian compensation age: HELP states the limits and the held-generation effect",
+          "[guardian][health][fleet][compensation]") {
+    const std::string_view help{detail::kGuardianHealthAgeMetrics[1].help};
+    CHECK(help.find("TOO LONG") != std::string_view::npos);
+    CHECK(help.find("not proof") != std::string_view::npos);
+    CHECK(help.find("not from the original arm") != std::string_view::npos);
+    CHECK(help.find("not acknowledged") != std::string_view::npos);
+    CHECK(help.find("direct disarm fallback") != std::string_view::npos);
+    CHECK(help.find("detach_rule_locked") != std::string_view::npos);
+    CHECK(help.find("inline-type") != std::string_view::npos);
+    CHECK(help.find("MONITOR-ONLY") != std::string_view::npos);
+}
+
+TEST_CASE("guardian compensation age: emitter is absent for nullopt, present (including 0) "
+          "otherwise",
+          "[guardian][health][fleet][compensation]") {
+    std::map<std::string, std::string> none;
+    emit_guardian_compensation_pending_age_tag(none, std::nullopt);
+    CHECK(none.empty()); // "none outstanding" is an ABSENCE, never a 0
+
+    std::map<std::string, std::string> young;
+    emit_guardian_compensation_pending_age_tag(young, std::optional<std::uint64_t>{0});
+    REQUIRE(young.count(kGuardianCompensationPendingAgeTag) == 1);
+    CHECK(young.at(kGuardianCompensationPendingAgeTag) == "0");
+
+    std::map<std::string, std::string> counter;
+    emit_guardian_health_heartbeat_tags(counter, GuardianHealthStats{});
+    CHECK(counter.count(kGuardianCompensationDeadlineElapsedTag) == 0);
 }

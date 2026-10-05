@@ -16,8 +16,9 @@
 /// forged-value-safe parse of the agent-supplied values.
 ///
 /// The writer is agents/core/src/guardian_health_heartbeat.hpp
-/// (`emit_guardian_health_heartbeat_tags`, `GuardianHealthStats`; the #5403 age has its own
-/// emitter, `emit_guardian_disarm_pending_age_tag`). Both sides are
+/// (`emit_guardian_health_heartbeat_tags`, `GuardianHealthStats`; the #5403 and #4472 ages
+/// each have their own emitter, `emit_guardian_disarm_pending_age_tag` and
+/// `emit_guardian_compensation_pending_age_tag`). Both sides are
 /// bound by tests/unit/server/test_guardian_health_fleet_tags.cpp, which emits through
 /// the agent's REAL emitter and asserts every key produced is one a table here
 /// recognises. That test is the drift guard: a rename on either side without the
@@ -33,9 +34,10 @@
 /// spark and journal pins when that hoist lands - do not let a future two-family sweep
 /// leave this one behind.
 ///
-/// SHAPE: flat and unlabelled. `kGuardianHealthMetrics` is 19 plain sparse rows (18
+/// SHAPE: flat and unlabelled. `kGuardianHealthMetrics` is 20 plain sparse rows (19
 /// cumulative counters and the #5404 retained-tombstone current count) rolled up as a fleet
-/// SUM. `kGuardianHealthAgeMetrics` (#5403) is the one exception: a re-statable AGE rolled up as the fleet MAX, in its own table for the
+/// SUM. `kGuardianHealthAgeMetrics` (#5403, #4472) is the one exception: re-statable AGEs
+/// rolled up as the fleet MAX, in their own table for the
 /// reasons the journal sibling's age table gives (a sum of ages is meaningless, and
 /// the op lives in the consumer). Name rule, asserted by the pin test, for the counter
 /// table: `gauge` == "yuzu_fleet_" + `tag` with its "yuzu." heartbeat-namespace prefix
@@ -175,11 +177,27 @@ inline constexpr GuardianHealthMetric kGuardianHealthMetrics[] = {
      "pending TOO LONG, not that its backend call is proven hung. A pending Disarm holds its "
      "key, an executor quota slot of its class and, if the call is blocked inside a mechanism, "
      "that mechanism type's engine lock; recovery from a call that never returns is an agent "
-     "restart or --spark-disable. NOT covered: a compensating disarm, the direct disarm "
-     "fallback, the synchronous residue teardown inside detach_rule_locked, and inline-type "
-     "teardown. Cumulative per agent process (resets on restart); the exported fleet sum is "
-     "rebuilt every sweep. See yuzu_fleet_guardian_disarm_pending_age_seconds_max for the "
+     "restart or --spark-disable. NOT covered: a compensating disarm (see "
+     "yuzu_fleet_guardian_compensation_deadline_elapsed), the direct disarm fallback outside a "
+     "compensation, the synchronous residue teardown inside detach_rule_locked, and "
+     "inline-type teardown. Cumulative per agent process (resets on restart); the exported "
+     "fleet sum is rebuilt every sweep. See "
+     "yuzu_fleet_guardian_disarm_pending_age_seconds_max for the "
      "age of what is pending now. MONITOR-ONLY, same posture as the rest of this family"},
+    {"yuzu.guardian_compensation_deadline_elapsed",
+     "yuzu_fleet_guardian_compensation_deadline_elapsed",
+     "Fleet sum of compensating teardowns an agent observed outstanding past the claim's own "
+     "compensation deadline (#4472), counted once per claim. A compensating teardown is the "
+     "disarm of a late arm result that nobody adopted: the arm call returned after its caller "
+     "gave up and the rule is no longer wanted, so the subscription is disarmed. Observation "
+     "only: nothing is released, popped or cancelled, so a nonzero value means a teardown was "
+     "pending TOO LONG, not that its backend call is proven hung. While it is outstanding the "
+     "claim stays its key's head (the key, an executor quota slot of its class and, if the "
+     "call is blocked inside a mechanism, that mechanism type's engine lock stay held) and its "
+     "generation is held, not acknowledged. Covers the asynchronous compensating disarm and "
+     "the direct disarm fallback inside a compensation. Cumulative per agent process (resets "
+     "on restart). See yuzu_fleet_guardian_compensation_pending_age_seconds_max for the age of "
+     "what is outstanding now. MONITOR-ONLY, same posture as the rest of this family"},
     // ---- #5404: the Spark claim-lifecycle counters (gate rows P1/P2) ----
     // All steady-state 0, sparse (0 omits the tag), summed fleet-wide, MONITOR-ONLY with no
     // alert rule shipped. Cumulative per agent process (resets on restart) except
@@ -276,18 +294,19 @@ inline constexpr GuardianHealthMetric kGuardianHealthMetrics[] = {
 /// waiting to happen.
 inline constexpr std::size_t kNGuardianHealthMetrics = std::size(kGuardianHealthMetrics);
 
-/// #5403: the AGE family - a SEPARATE, MAX-rollup table, same reasoning as
+/// #5403, #4472: the AGE family - a SEPARATE, MAX-rollup table, same reasoning as
 /// kGuardianJournalAgeMetrics (guardian_journal_fleet_tags.hpp). Not rows of the table above:
 /// that one is pinned 1:1 to GuardianHealthStats (all uint64 cumulative counters, SUM), and an
 /// age is not a counter - a fleet SUM of ages is meaningless, the question is "how long has
-/// the WORST endpoint's Disarm been pending". The op (MAX) lives in the consumer,
+/// the WORST endpoint's Disarm (or compensating teardown) been pending". The op (MAX) lives in the consumer,
 /// agent_registry.cpp, because the row struct has no op field. Name rule, asserted by the
 /// pin test: gauge == "yuzu_fleet_" + tag minus its "yuzu." prefix + "_max".
 ///
-/// EMISSION (writer: emit_guardian_disarm_pending_age_tag): the tag is ABSENT while the agent
-/// has no Disarm pending and present, INCLUDING 0, while one is (0 = pending for less than one
-/// second). So here, absent family = no retained agent reports a pending Disarm; a published 0
-/// = at least one is pending but young. The fleet gauge is NEVER a fabricated 0 for "none".
+/// EMISSION (writers: emit_guardian_disarm_pending_age_tag and
+/// emit_guardian_compensation_pending_age_tag): each tag is ABSENT while the agent has none
+/// pending and present, INCLUDING 0, while one is (0 = pending for less than one second). So
+/// here, absent family = no retained agent reports one pending; a published 0 = at least one is
+/// pending but young. The fleet gauge is NEVER a fabricated 0 for "none".
 ///
 /// COVERAGE: not counted in yuzu_fleet_guardian_health_reporting (that meta's documented
 /// meaning is the counter family), and no separate reporting meta ships for it. A value the
@@ -307,11 +326,32 @@ inline constexpr GuardianHealthMetric kGuardianHealthAgeMetrics[] = {
      "cancelled while it ages. While pending it holds its key, an executor quota slot of its "
      "class and, if the call is blocked inside a mechanism, that mechanism type's engine lock; "
      "recovery from a call that never returns is an agent restart or --spark-disable. NOT "
-     "covered: a compensating disarm, the direct disarm fallback, the synchronous residue "
+     "covered: a compensating disarm (see "
+     "yuzu_fleet_guardian_compensation_pending_age_seconds_max), the direct disarm fallback "
+     "outside a compensation, the synchronous residue "
      "teardown inside detach_rule_locked, and inline-type teardown. Re-statable gauge: it "
      "falls when the Disarm completes. A stale-evicted agent leaves the MAX. See "
      "yuzu_fleet_guardian_disarm_deadline_elapsed for the cumulative count of Disarms seen "
      "pending past 30 s. MONITOR-ONLY: no alert rule ships with it"},
+    {"yuzu.guardian_compensation_pending_age_seconds",
+     "yuzu_fleet_guardian_compensation_pending_age_seconds_max",
+     "Fleet MAX (worst endpoint) of the age in seconds of the oldest compensating teardown "
+     "still outstanding on an agent (#4472), floored to whole seconds and measured from the "
+     "instant the compensation became owed (the late arm result returned and nobody adopted "
+     "it), not from the original arm. ABSENT means no retained agent reports one outstanding; "
+     "it is never 0 for \"none\" (a published 0 means one is outstanding for under a "
+     "second). A large value means a teardown has been pending TOO LONG - it is not proof the "
+     "backend call is hung, and nothing is released, popped or cancelled while it ages. While "
+     "outstanding the claim stays its key's head (the key, an executor quota slot of its class "
+     "and, if the call is blocked inside a mechanism, that mechanism type's engine lock stay "
+     "held), and its generation is held, not acknowledged, so the server keeps re-pushing "
+     "until the teardown finishes. Covers the asynchronous compensating disarm and the direct "
+     "disarm fallback inside a compensation; NOT covered: a plain Disarm claim (see "
+     "yuzu_fleet_guardian_disarm_pending_age_seconds_max), the synchronous residue teardown "
+     "inside detach_rule_locked, and inline-type teardown. Re-statable gauge: it falls when "
+     "the teardown finishes. A stale-evicted agent leaves the MAX. See "
+     "yuzu_fleet_guardian_compensation_deadline_elapsed for the cumulative count. "
+     "MONITOR-ONLY: no alert rule ships with it"},
 };
 
 inline constexpr std::size_t kNGuardianHealthAgeMetrics = std::size(kGuardianHealthAgeMetrics);
@@ -329,19 +369,21 @@ inline constexpr std::size_t kNGuardianHealthAgeMetrics = std::size(kGuardianHea
 /// Agents whose latest heartbeat carried at least one parseable
 /// yuzu.guardian_unhealthy_*/guardian_priority_demoted/guardian_outbox_backpressure_drops/
 /// guardian_legacy_sink_events_lost/guardian_legacy_sink_gap_rules/
-/// guardian_legacy_sink_dropped_unwired/guardian_disarm_deadline_elapsed tag or any of the
-/// #5404 Spark claim-lifecycle tags (the #5403 pending-age tag does not count here; see
-/// kGuardianHealthAgeMetrics).
+/// guardian_legacy_sink_dropped_unwired/guardian_disarm_deadline_elapsed/
+/// guardian_compensation_deadline_elapsed tag or any of the #5404 Spark claim-lifecycle tags
+/// (the #5403 and #4472 pending-age tags do not count here; see kGuardianHealthAgeMetrics).
 inline constexpr const char* kGuardianHealthReportingGauge = "yuzu_fleet_guardian_health_reporting";
 inline constexpr const char* kGuardianHealthReportingHelp =
     "Agents whose latest heartbeat carried at least one parseable "
     "yuzu.guardian_unhealthy_suppressed/refreshed, yuzu.guardian_priority_demoted, "
     "yuzu.guardian_outbox_backpressure_drops, yuzu.guardian_legacy_sink_events_lost, "
     "yuzu.guardian_legacy_sink_gap_rules, yuzu.guardian_legacy_sink_dropped_unwired "
-    "(#4783), yuzu.guardian_disarm_deadline_elapsed (#5403), or any #5404 Spark "
+    "(#4783), yuzu.guardian_disarm_deadline_elapsed (#5403), "
+    "yuzu.guardian_compensation_deadline_elapsed (#4472), or any #5404 Spark "
     "claim-lifecycle tag in this table (yuzu.guardian_orphan_disarms_started through "
     "yuzu.guardian_ack_maint_exceptions) (the "
-    "yuzu.guardian_disarm_pending_age_seconds age tag does not count here) - the "
+    "yuzu.guardian_disarm_pending_age_seconds and "
+    "yuzu.guardian_compensation_pending_age_seconds age tags do not count here) - the "
     "coverage denominator for this "
     "family. Published every sweep INCLUDING 0, unlike the counters above. READ 0 "
     "CAREFULLY: because the writer is SPARSE (a 0 counter emits no tag), this counts "
@@ -355,7 +397,7 @@ inline constexpr const char* kGuardianHealthTagRejectedGauge =
 inline constexpr const char* kGuardianHealthTagRejectedHelp =
     "Guardian health tags PRESENT on a heartbeat this sweep but rejected by the "
     "forged-value parse (non-numeric, negative, over 10 digits, or above the "
-    "plausibility ceiling), including the #5403 pending-Disarm age tag. Published every "
+    "plausibility ceiling), including the #5403 pending-Disarm and #4472 compensation age tags. Published every "
     "sweep INCLUDING 0. Without it a rejected "
     "value is a SILENT drop: if the rejected agent were the only reporter, its family "
     "goes absent and absent reads as clean. > 0 means some agent is shipping malformed "

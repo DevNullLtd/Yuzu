@@ -2550,3 +2550,133 @@ TEST_CASE("REAL AgentHealthStore: malformed #5404 values are rejected, counted, 
     // A malformed value is not a parseable counter tag, so nobody counts as reporting.
     CHECK(unlabelled_series(out, "yuzu_fleet_guardian_health_reporting") == 0.0);
 }
+
+// ── #4472: outstanding-compensation age (fleet MAX) and deadline count (fleet SUM) ────────
+//
+// Driven through the REAL AgentHealthStore. The age is the age table's second row: a MAX, with
+// "no agent has a compensating teardown outstanding" reading ABSENT, never 0. It is a family
+// of its own, independent of the pending-Disarm age.
+
+namespace {
+
+constexpr const char* kCompAgeTag = "yuzu.guardian_compensation_pending_age_seconds";
+constexpr const char* kCompAgeGauge = "yuzu_fleet_guardian_compensation_pending_age_seconds_max";
+constexpr const char* kCompElapsedTag = "yuzu.guardian_compensation_deadline_elapsed";
+constexpr const char* kCompElapsedGauge = "yuzu_fleet_guardian_compensation_deadline_elapsed";
+
+} // namespace
+
+TEST_CASE("REAL AgentHealthStore: compensation age rolls up as the fleet MAX, not the sum, "
+          "independent of the Disarm age",
+          "[guardian][health][rollup][real][compensation]") {
+    REQUIRE(std::string_view(yuzu::server::detail::kGuardianHealthAgeMetrics[1].tag) ==
+            kCompAgeTag);
+    REQUIRE(std::string_view(yuzu::server::detail::kGuardianHealthAgeMetrics[1].gauge) ==
+            kCompAgeGauge);
+
+    yuzu::server::detail::AgentHealthStore store;
+    yuzu::MetricsRegistry metrics;
+    disarm_beat(store, "a1", {{kCompAgeTag, "30"}});
+    disarm_beat(store, "a2", {{kCompAgeTag, "200"}, {kDisarmAgeTag, "7"}});
+    disarm_beat(store, "quiet", {});
+    store.recompute_metrics(metrics, std::chrono::seconds{300});
+    const std::string out = metrics.serialize();
+    CHECK(unlabelled_series(out, kCompAgeGauge) == 200.0); // not 230 (sum), not 30
+    CHECK(out.find(std::string(kCompAgeGauge) + "{") == std::string::npos); // no labels
+    CHECK(unlabelled_series(out, kDisarmAgeGauge) == 7.0); // its own MAX, not widened by it
+}
+
+TEST_CASE("REAL AgentHealthStore: compensation age is absent (not 0) when no agent reports, "
+          "and a published 0 is a real reading",
+          "[guardian][health][rollup][real][compensation]") {
+    yuzu::server::detail::AgentHealthStore store;
+    yuzu::MetricsRegistry metrics;
+    disarm_beat(store, "quiet1", {});
+    disarm_beat(store, "quiet2", {{kDisarmAgeTag, "9"}}); // the Disarm age is a different family
+    store.recompute_metrics(metrics, std::chrono::seconds{300});
+    CHECK_FALSE(has_unlabelled_series(metrics.serialize(), kCompAgeGauge));
+
+    disarm_beat(store, "young", {{kCompAgeTag, "0"}});
+    store.recompute_metrics(metrics, std::chrono::seconds{300});
+    const std::string out = metrics.serialize();
+    REQUIRE(has_unlabelled_series(out, kCompAgeGauge));
+    CHECK(unlabelled_series(out, kCompAgeGauge) == 0.0);
+}
+
+TEST_CASE("REAL AgentHealthStore: compensation age lifecycle - owed, aging, finished, "
+          "disappearance",
+          "[guardian][health][rollup][real][compensation]") {
+    yuzu::server::detail::AgentHealthStore store;
+    yuzu::MetricsRegistry metrics;
+    auto sweep = [&]() -> std::string {
+        store.recompute_metrics(metrics, std::chrono::seconds{300});
+        return metrics.serialize();
+    };
+
+    disarm_beat(store, "a", {});
+    CHECK_FALSE(has_unlabelled_series(sweep(), kCompAgeGauge));
+
+    disarm_beat(store, "a", {{kCompAgeTag, "2"}});
+    CHECK(unlabelled_series(sweep(), kCompAgeGauge) == 2.0);
+
+    disarm_beat(store, "a", {{kCompAgeTag, "41"}, {kCompElapsedTag, "1"}});
+    const std::string aged = sweep();
+    CHECK(unlabelled_series(aged, kCompAgeGauge) == 41.0);
+    CHECK(unlabelled_series(aged, kCompElapsedGauge) == 1.0);
+
+    // The teardown finishes: the agent stops emitting the age, the gauge disappears, the
+    // cumulative count is not undone.
+    disarm_beat(store, "a", {{kCompElapsedTag, "1"}});
+    const std::string done = sweep();
+    CHECK_FALSE(has_unlabelled_series(done, kCompAgeGauge));
+    CHECK(unlabelled_series(done, kCompElapsedGauge) == 1.0);
+}
+
+TEST_CASE("REAL AgentHealthStore: malformed compensation age values are rejected into "
+          "yuzu_fleet_guardian_health_tag_rejected, never throw, never own the MAX",
+          "[guardian][health][rollup][real][compensation]") {
+    yuzu::server::detail::AgentHealthStore store;
+    yuzu::MetricsRegistry metrics;
+    const std::vector<std::string> bad = {"-5",         "abc",        "1.5",        "12x",
+                                          " 7",         "1e3",        "inf",        "nan",
+                                          "1000000001", "9999999999", "18446744073709551615",
+                                          std::string(4096, '9')};
+    int i = 0;
+    for (const auto& v : bad)
+        disarm_beat(store, "bad" + std::to_string(i++), {{kCompAgeTag, v}});
+    disarm_beat(store, "good", {{kCompAgeTag, "12"}});
+
+    REQUIRE_NOTHROW(store.recompute_metrics(metrics, std::chrono::seconds{300}));
+    const std::string out = metrics.serialize();
+    CHECK(unlabelled_series(out, kCompAgeGauge) == 12.0);
+    CHECK(unlabelled_series(out, "yuzu_fleet_guardian_health_tag_rejected") ==
+          static_cast<double>(bad.size()));
+
+    yuzu::server::detail::AgentHealthStore only_bad;
+    yuzu::MetricsRegistry m2;
+    disarm_beat(only_bad, "x", {{kCompAgeTag, "-1"}});
+    only_bad.recompute_metrics(m2, std::chrono::seconds{300});
+    CHECK_FALSE(has_unlabelled_series(m2.serialize(), kCompAgeGauge));
+}
+
+TEST_CASE("REAL AgentHealthStore: compensation deadline count sums across agents, is absent "
+          "when nobody reports, and the age tag does not widen the counter coverage gauge",
+          "[guardian][health][rollup][real][compensation]") {
+    yuzu::server::detail::AgentHealthStore store;
+    yuzu::MetricsRegistry metrics;
+    disarm_beat(store, "a1", {{kCompElapsedTag, "2"}});
+    disarm_beat(store, "a2", {{kCompElapsedTag, "5"}, {kCompAgeTag, "90"}});
+    disarm_beat(store, "age_only", {{kCompAgeTag, "10"}});
+    disarm_beat(store, "quiet", {});
+    store.recompute_metrics(metrics, std::chrono::seconds{300});
+    const std::string out = metrics.serialize();
+    CHECK(unlabelled_series(out, kCompElapsedGauge) == 7.0); // SUM
+    CHECK(unlabelled_series(out, kCompAgeGauge) == 90.0);    // MAX over all three tags
+    CHECK(unlabelled_series(out, "yuzu_fleet_guardian_health_reporting") == 2.0);
+
+    yuzu::server::detail::AgentHealthStore none;
+    yuzu::MetricsRegistry m2;
+    disarm_beat(none, "q", {});
+    none.recompute_metrics(m2, std::chrono::seconds{300});
+    CHECK_FALSE(has_unlabelled_series(m2.serialize(), kCompElapsedGauge));
+}

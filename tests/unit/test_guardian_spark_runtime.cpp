@@ -14405,11 +14405,13 @@ TEST_CASE("#4472: a drain parked in the staging-to-continuation gap already sees
     CHECK(f.rt->receipt_status_wedge_aware(f.wedge_receipt).status ==
           PostK4472Rig::RT::ReceiptStatus::Wedged);
     CHECK_FALSE(f.rt->receipt_status_wedge_aware(f.wedge_receipt).wedge_eligible);
+    CHECK(f.rt->oldest_outstanding_compensation_age(clk::now()).has_value());
 
     park->release();
     REQUIRE(yuzu::test::spin_until([&] { return f.rt->claim_queue_depth_for_test(f.key) == 0; },
                                    std::chrono::seconds(10)));
     CHECK(f.b->disarm_entries.load() == 1);
+    CHECK_FALSE(f.rt->oldest_outstanding_compensation_age(clk::now()).has_value());
     f.rt->set_drain_gap_hook_for_test({});
 }
 
@@ -14435,6 +14437,9 @@ TEST_CASE("#4472: an exception unwinding past staging still leaves the compensat
     REQUIRE(f.b->disarm_entries.load() == 0);
 
     CHECK_FALSE(f.rt->receipt_wedge_k_eligible(f.wedge_receipt));
+    const auto age = f.rt->oldest_outstanding_compensation_age(clk::now() + std::chrono::seconds(5));
+    REQUIRE(age.has_value());
+    CHECK(*age >= std::chrono::seconds(4)); // the deadline was set by the guard, not left unset
 
     park->release();
     REQUIRE(yuzu::test::spin_until([&] { return f.rt->claim_queue_depth_for_test(f.key) == 0; },
@@ -14483,4 +14488,79 @@ TEST_CASE("#4472: a genuinely hung arm stays K-eligible while its compensation p
     CHECK(f.rt->receipt_wedge_k_eligible(f.wedge_receipt));
     CHECK(f.rt->receipt_recovery_status(f.wedge_receipt) ==
           PostK4472Rig::RT::RecoveryStatus::WedgeEligible);
+    CHECK_FALSE(f.rt->oldest_outstanding_compensation_age(clk::now()).has_value());
+}
+
+TEST_CASE("#4472: compensation age is nullopt before, starts at the owed instant, latches once "
+          "across passes, never shows as a plain Disarm, and vanishes when the teardown finishes",
+          "[spark][runtime][liveness][4472][compensation-age]") {
+    // Mutation (age measured from the original arm's creation): the age at the synthetic reading
+    // exceeds the owed-instant upper bound below.
+    using namespace std::chrono_literals;
+    PostK4472Rig f;
+    f.establish_wedge();
+    CHECK_FALSE(f.rt->oldest_outstanding_compensation_age(clk::now() + 1000s).has_value());
+    CHECK(f.rt->compensation_deadline_elapsed() == 0);
+
+    f.rt->detach_all();
+    f.b->hang_next_disarm.store(true);
+    const auto t_before = clk::now();
+    f.b->release_hang();
+    REQUIRE(f.b->wait_entered_disarm_hang(10s));
+    const auto t_after = clk::now();
+
+    // The owed instant lies in [t_before, t_after], so at t_before + 500 s the age is in
+    // [500 s - (t_after - t_before), 500 s]. A creation-based measure exceeds the upper bound.
+    const auto probe = t_before + 500s;
+    const auto age = f.rt->oldest_outstanding_compensation_age(probe);
+    REQUIRE(age.has_value());
+    CHECK(*age <= 500s);
+    CHECK(*age >= 500s - (t_after - t_before));
+    // A reading before the owed instant clamps to zero instead of wrapping.
+    const auto clamped = f.rt->oldest_outstanding_compensation_age(clk::time_point{});
+    REQUIRE(clamped.has_value());
+    CHECK(*clamped == clk::duration::zero());
+    // A compensation is an ARM claim: the plain-Disarm age never sees it.
+    CHECK_FALSE(f.rt->oldest_pending_disarm_age(probe).has_value());
+
+    // The once-per-claim latch: below the deadline nothing; past it exactly one, across many
+    // passes, with nothing released (the claim, the worker and the backend disarm are untouched).
+    f.rt->expire_overdue_claims(t_before + 10s);
+    CHECK(f.rt->compensation_deadline_elapsed() == 0);
+    for (int i = 0; i < 6; ++i)
+        f.rt->expire_overdue_claims(t_after + 200s + std::chrono::seconds(i));
+    CHECK(f.rt->compensation_deadline_elapsed() == 1);
+    CHECK(f.rt->claim_queue_depth_for_test(f.key) == 1);
+    CHECK(f.b->disarm_entries.load() == 1);
+    CHECK(f.rt->oldest_outstanding_compensation_age(probe).has_value());
+
+    f.b->release_disarm_hang();
+    REQUIRE(yuzu::test::spin_until([&] { return f.rt->claim_queue_depth_for_test(f.key) == 0; }, 10s));
+    CHECK_FALSE(f.rt->oldest_outstanding_compensation_age(probe).has_value());
+    CHECK(f.rt->compensation_deadline_elapsed() == 1); // cumulative, not undone
+}
+
+TEST_CASE("#4472: the direct disarm fallback inside a compensation is covered by the age "
+          "(it runs with the flag already false)",
+          "[spark][runtime][liveness][4472][compensation-age]") {
+    // Fault point 4 = the continuation allocation threw: the worker falls back to a direct
+    // backend disarm on itself. Park that disarm and look from the test thread.
+    using namespace std::chrono_literals;
+    PostK4472Rig f;
+    f.establish_wedge();
+    f.rt->detach_all();
+    f.rt->set_drain_fault_point_for_test(4);
+    f.b->hang_next_disarm.store(true);
+    f.b->release_hang();
+    REQUIRE(f.b->wait_entered_disarm_hang(10s)); // inside direct_disarm_fallback
+
+    CHECK_FALSE(f.rt->receipt_wedge_k_eligible(f.wedge_receipt));
+    const auto age = f.rt->oldest_outstanding_compensation_age(clk::now() + 50s);
+    REQUIRE(age.has_value());
+    CHECK(*age >= 49s);
+
+    f.b->release_disarm_hang();
+    REQUIRE(yuzu::test::spin_until([&] { return f.rt->claim_queue_depth_for_test(f.key) == 0; }, 10s));
+    CHECK_FALSE(f.rt->oldest_outstanding_compensation_age(clk::now()).has_value());
+    CHECK(f.live_subscriptions() == 0);
 }

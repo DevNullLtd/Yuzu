@@ -2641,6 +2641,12 @@ public:
                                 // absent while no Disarm is pending, never a fabricated 0.
                                 emit_guardian_disarm_pending_age_tag(
                                     tags, guardian_->oldest_pending_disarm_age_seconds());
+                                // #4472: age of the oldest outstanding compensating teardown
+                                // (the Arm-claim case the Disarm age above cannot see), same
+                                // sparse-absent-not-zero shape. Its once-per-claim elapsed
+                                // count rides spark_claim_health_stats above.
+                                emit_guardian_compensation_pending_age_tag(
+                                    tags, guardian_->oldest_outstanding_compensation_age_seconds());
                                 // F7 (#2298 rung 2): per-type CURRENT count of rules classified
                                 // Unsupported (neither backend enforces them) - fleet-loud via
                                 // mech_unsupported_total, sparse (0 omits its tag).

@@ -3433,6 +3433,107 @@ TEST_CASE("#4472 control: a compensating disarm that finished before the heartbe
     run_post_k_4472_scenario(/*finish_disarm_before_drain=*/true);
 }
 
+// #4472 export half, through the REAL GuardianEngine + SparkEngine + runtime: a compensating
+// teardown whose mechanism unwatch() is parked is reported by the engine's heartbeat accessors
+// (an age from the instant the compensation became owed, never a plain-Disarm age), aged with a
+// synthetic `now` (never a sleep), latched once past its deadline, and gone from the age export
+// when the teardown completes. The agent's real emitters turn them into the pinned tags.
+TEST_CASE("#4472: the engine exports an outstanding compensating teardown's age and deadline "
+          "count as heartbeat tags, and the age disappears on completion",
+          "[spark][guardian][reconcile][liveness][4472]") {
+    using namespace std::chrono_literals;
+    SparkReconcileFixture f;
+    struct ReleaseOnExit {
+        SparkReconcileFixture& fx;
+        ~ReleaseOnExit() {
+            fx.mechanism->release_isolated_unwatch_hang();
+            fx.mechanism->release_hang();
+        }
+    };
+    ReleaseOnExit release_parked{f};
+
+    const auto push = [&](std::uint64_t generation, bool with_rule) {
+        gpb::GuaranteedStatePush p;
+        p.set_full_sync(true);
+        p.set_policy_generation(generation);
+        if (with_rule)
+            *p.add_rules() = make_service_rule("r1");
+        auto dr = yuzu::agent::guardian_dispatch_push_bytes_for_test(*f.engine, p.SerializeAsString());
+        REQUIRE(dr.exit_code == 0);
+    };
+    const auto drain_pending = [&] {
+        REQUIRE(yuzu::test::spin_until(
+            [&] {
+                f.engine->journal_maintenance_tick();
+                return f.engine->ack_pending_count_for_test() == 0;
+            },
+            10s));
+    };
+    const auto emit_tags = [&](std::chrono::steady_clock::time_point now) {
+        std::map<std::string, std::string> tags;
+        yuzu::agent::emit_guardian_compensation_pending_age_tag(
+            tags, f.engine->oldest_outstanding_compensation_age_seconds(now));
+        yuzu::agent::emit_guardian_health_heartbeat_tags(tags, f.engine->spark_claim_health_stats());
+        return tags;
+    };
+
+    // Quiet agent: both exports are silent (the age is absent, not 0).
+    CHECK_FALSE(f.engine->oldest_outstanding_compensation_age_seconds().has_value());
+    CHECK(emit_tags(std::chrono::steady_clock::now()).empty());
+
+    // A hung arm that wedges, a withdrawal, then the arm's late success: compensated, and that
+    // disarm parks inside unwatch().
+    f.mechanism->hang_next_watch();
+    push(5, true);
+    REQUIRE(f.mechanism->wait_entered_hang(30s));
+    REQUIRE(f.engine->spark_runtime_for_test() != nullptr);
+    REQUIRE(f.engine->spark_runtime_for_test()->expire_overdue_claims(
+                std::chrono::steady_clock::now() + 600s) == 1);
+    drain_pending();
+    // A hung arm is not a compensation: still nothing to export.
+    CHECK_FALSE(f.engine->oldest_outstanding_compensation_age_seconds().has_value());
+    push(6, false);
+    drain_pending();
+    f.mechanism->hang_next_unwatch_isolated();
+    f.mechanism->release_hang();
+    REQUIRE(f.mechanism->wait_entered_isolated_unwatch(30s));
+
+    // Pending: present, young; a plain-Disarm age is absent (this is an Arm claim's teardown).
+    REQUIRE(f.engine->oldest_outstanding_compensation_age_seconds().has_value());
+    CHECK_FALSE(f.engine->oldest_pending_disarm_age_seconds().has_value());
+    const auto later = std::chrono::steady_clock::now() + 95s;
+    const auto aged = f.engine->oldest_outstanding_compensation_age_seconds(later);
+    REQUIRE(aged.has_value());
+    CHECK(*aged >= 95);
+    const auto before =
+        f.engine->oldest_outstanding_compensation_age_seconds(std::chrono::steady_clock::time_point{});
+    REQUIRE(before.has_value());
+    CHECK(*before == 0);
+
+    // Latch: two passes well past the deadline observe it once.
+    const auto far = std::chrono::steady_clock::now() + 3600s;
+    f.engine->spark_runtime_for_test()->expire_overdue_claims(far);
+    f.engine->spark_runtime_for_test()->expire_overdue_claims(far + 5s);
+    {
+        const auto tags = emit_tags(later);
+        REQUIRE(tags.count("yuzu.guardian_compensation_pending_age_seconds") == 1);
+        CHECK(std::stoull(tags.at("yuzu.guardian_compensation_pending_age_seconds")) >= 95);
+        REQUIRE(tags.count("yuzu.guardian_compensation_deadline_elapsed") == 1);
+        CHECK(tags.at("yuzu.guardian_compensation_deadline_elapsed") == "1");
+        CHECK(tags.count("yuzu.guardian_disarm_pending_age_seconds") == 0);
+    }
+
+    // Completion: the teardown returns, the claim pops, the age export disappears; the
+    // cumulative count is not undone.
+    f.mechanism->release_isolated_unwatch_hang();
+    REQUIRE(yuzu::test::spin_until(
+        [&] { return !f.engine->oldest_outstanding_compensation_age_seconds(later).has_value(); },
+        10s));
+    const auto after = emit_tags(later);
+    CHECK(after.count("yuzu.guardian_compensation_pending_age_seconds") == 0);
+    CHECK(after.at("yuzu.guardian_compensation_deadline_elapsed") == "1");
+}
+
 #ifndef _WIN32
 // The quiescence gate the fork()-without-exec death tests above rely on. Mutation: make
 // wait_until_quiescent return true unconditionally -> the "false while a thread lives"

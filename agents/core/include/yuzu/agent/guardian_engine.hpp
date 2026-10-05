@@ -349,6 +349,19 @@ public:
     [[nodiscard]] std::optional<std::uint64_t> oldest_pending_disarm_age_seconds(
         std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now()) const;
 
+    /// #4472: age, in whole seconds (floored), of the oldest compensating teardown still
+    /// outstanding (GuardianSparkRuntime::oldest_outstanding_compensation_age()), measured from
+    /// the instant the compensation became owed, or nullopt when none is. Surfaced as
+    /// `yuzu.guardian_compensation_pending_age_seconds` via
+    /// emit_guardian_compensation_pending_age_tag, which emits nothing for nullopt, so "none
+    /// outstanding" is an ABSENCE, never a 0. It measures "teardown pending too long", not proof
+    /// of a hang; while a teardown is outstanding its generation is held (the claim is not
+    /// K-eligible). Observation only. `now` defaults to the steady clock; a test passes a later
+    /// reading to age a claim without sleeping. Takes mtx_ then the runtime's registry_mu_, the
+    /// same order attach_rule/detach_rule already use.
+    [[nodiscard]] std::optional<std::uint64_t> oldest_outstanding_compensation_age_seconds(
+        std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now()) const;
+
     /// #5404 (gate rows P1/P2): the Spark claim-lifecycle values, as a GuardianHealthStats with
     /// only these fields set (guardian_health_heartbeat.hpp's guardian_spark_claim_health_stats
     /// holds the runtime-accessor -> field mapping; ack_maint_exceptions is filled here). All

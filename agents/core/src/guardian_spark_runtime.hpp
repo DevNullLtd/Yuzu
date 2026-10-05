@@ -1254,7 +1254,9 @@ private:
         // (#4472): a claim whose compensation is outstanding is never K-eligible.
         // `compensation_deadline` is set ONCE, when compensation first becomes owed
         // (the same guard), from cfg_.backend_op_deadline - never reset on a fallback
-        // retry. `compensation_deadline_observed` is a
+        // retry. The instant compensation became owed is therefore
+        // compensation_deadline - cfg_.backend_op_deadline, which
+        // oldest_outstanding_compensation_age() measures from. `compensation_deadline_observed` is a
         // once-only latch: in 5b, an elapsed deadline only increments
         // compensation_deadline_elapsed_ (see the class-level comment there) - it
         // does not, and must not, release the reservation, the subscription, the
@@ -1507,8 +1509,9 @@ public:
     /// SAME claim - but the priority is stated for clarity, not because the case is
     /// reachable). `Blocking` covers every other case: an empty receipt, a claim
     /// neither recovered nor currently wedge-eligible (settled to a genuine
-    /// refusal/rejection/withdrawal, or already popped by a resolution nobody
-    /// adopted). registry_mu_ taken ONCE, internally; never mutates state.
+    /// refusal/rejection/withdrawal, already popped by a resolution nobody
+    /// adopted, or - #4472 - still the key's front but with a compensating disarm
+    /// outstanding). registry_mu_ taken ONCE, internally; never mutates state.
     enum class RecoveryStatus { Recovered, WedgeEligible, Blocking };
     [[nodiscard]] RecoveryStatus receipt_recovery_status(const ArmReceipt& receipt) const;
 
@@ -1607,7 +1610,8 @@ public:
     /// #5403: the same pass against a caller-supplied steady_clock reading. The zero-arg form
     /// is this with steady_clock::now(); a test passes a later `now` to age claims without
     /// sleeping (it also moves the Arm-deadline comparison, so an Arm queued behind the
-    /// aged Disarm is judged against it too). The pass also runs the pending-Disarm
+    /// aged Disarm is judged against it too, and so is the outstanding-compensation deadline
+    /// observation, #4472). The pass also runs the pending-Disarm
     /// observation (observe_pending_disarms_locked): a Disarm pending longer than
     /// kDisarmPendingObserveThreshold is counted once (disarm_deadline_elapsed()) and
     /// warned about once, rate-limited per pass, naming the key only through
@@ -1685,8 +1689,9 @@ public:
     /// stay held until the call returns. Recovery from a call that never returns is an agent
     /// restart, or --spark-disable as the rollback lever.
     ///
-    /// WHAT THIS DOES NOT SEE: a compensating disarm (tracked on an ARM claim, see
-    /// compensation_deadline_elapsed()), direct_disarm_fallback(), the synchronous teardown
+    /// WHAT THIS DOES NOT SEE: a compensating disarm (tracked on an ARM claim; see
+    /// oldest_outstanding_compensation_age() and compensation_deadline_elapsed()),
+    /// direct_disarm_fallback() when it runs outside a compensation, the synchronous teardown
     /// fallback that detach_rule_locked runs under registry_mu_ (a hang there stalls this scan
     /// and the expiry pass for every key, not just its own), and inline-type teardown.
     [[nodiscard]] std::optional<std::chrono::steady_clock::duration>
@@ -1698,6 +1703,25 @@ public:
     [[nodiscard]] std::uint64_t disarm_deadline_elapsed() const noexcept {
         return disarm_deadline_elapsed_.load(std::memory_order_relaxed);
     }
+    /// #4472: the age of the oldest compensating teardown still outstanding, measured from
+    /// the instant the compensation became owed (the late arm result returned and nobody
+    /// adopted it), NOT from the original arm's creation, or nullopt when none is. A claim is
+    /// counted from that instant until finalize_arm_compensation (or the !published recovery
+    /// path) marks it finished, so this covers the asynchronous compensating disarm AND the
+    /// direct_disarm_fallback() runs that happen inside a compensation, which execute with the
+    /// claim's flag already false. It is the Arm-claim counterpart of oldest_pending_disarm_age(),
+    /// which selects ClaimKind::Disarm only and by design never sees these. Like it, it
+    /// measures "teardown pending too long", not proof of a hang, and is OBSERVATION ONLY: it
+    /// changes no ownership, queue position, admission, receipt or ack. While outstanding the
+    /// claim stays its key's fifo head, so the key, the executor quota slot of its class
+    /// and, if the call is blocked inside a mechanism, that mechanism type's engine lock stay
+    /// held, and (#4472) the claim is not K-eligible, so the generation is held while it
+    /// is outstanding. `now` before the owed instant reads as zero. Takes registry_mu_ and
+    /// scans claims_ (O(claims)); heartbeat cadence only, and never to be called with
+    /// registry_mu_ held (it has a _locked twin). The once-per-claim elapsed count is the
+    /// existing compensation_deadline_elapsed().
+    [[nodiscard]] std::optional<std::chrono::steady_clock::duration>
+    oldest_outstanding_compensation_age(std::chrono::steady_clock::time_point now) const;
     /// #5322 TEST-ONLY diagnostic (no production caller): the registry's cross-structure
     /// invariants, one human-readable line per violation, empty when all hold. Takes
     /// registry_mu_. Checks (i) every rules_ entry has an index mapping that owns() with
@@ -2061,7 +2085,11 @@ private:
     /// about that claim - up-3's own deadline-semantics contract. Returns the number
     /// of claims actually reaped. `refills` collects any newly-dispatchable head
     /// (an arm queued behind a reaped entry) for the caller to dispatch off-lock.
-    std::size_t reap_stranded_claims_locked(std::vector<std::pair<std::string, std::shared_ptr<KeyClaim>>>& refills);
+    /// #4472: `now` is the pass's own reading (expire_overdue_claims' parameter, the real
+    /// steady clock in production), so the compensation-deadline observation above is judged
+    /// against the same instant a test passes to oldest_outstanding_compensation_age().
+    std::size_t reap_stranded_claims_locked(std::chrono::steady_clock::time_point now,
+                                            std::vector<std::pair<std::string, std::shared_ptr<KeyClaim>>>& refills);
     /// Not a clock-guarded retention pass: it uses a monotonic in-memory claim lifecycle
     /// with no wall clock, no persisted anchor and no age-based delete, so parts 1-4, 6 and
     /// 7 of the clock-guarded-retention rule and its SINGLE-WRITER note do not apply; part 5
@@ -2092,6 +2120,14 @@ private:
     /// terminal (DisarmDone, Stopped, DeadSubscription) and is not pending.
     [[nodiscard]] std::optional<std::chrono::steady_clock::duration>
     oldest_pending_disarm_age_locked(std::chrono::steady_clock::time_point now) const;
+    /// registry_mu_ held. #4472: the scan behind oldest_outstanding_compensation_age(); that
+    /// accessor locks and calls this. Every claim in every fifo is considered (a compensating
+    /// claim is its key's head by construction, but nothing here depends on it): one with
+    /// compensation_finished false and a compensation_deadline set. The instant compensation
+    /// became owed is compensation_deadline - cfg_.backend_op_deadline (the deadline is set
+    /// once, from that same reading plus that same constant), so no second timestamp is kept.
+    [[nodiscard]] std::optional<std::chrono::steady_clock::duration>
+    oldest_outstanding_compensation_age_locked(std::chrono::steady_clock::time_point now) const;
     /// One key whose pending Disarm this pass observed, copied under registry_mu_ so the
     /// warn can be emitted after it releases.
     struct DisarmObservation {
