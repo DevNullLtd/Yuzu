@@ -158,3 +158,56 @@ TEST_CASE("SparkKeyRuleIndex: remove_rule stays unconditional on generation", "[
     REQUIRE(idx.remove_rule("rule-a") == std::optional<std::string>{"registry|4:HKLM"});
     REQUIRE(idx.key_for_rule("rule-a") == std::nullopt);
 }
+
+// owns() (#5322 WP0) is the read-only ownership test erase_rule() applies: (key, rule,
+// generation) must all match the recorded mapping.
+TEST_CASE("SparkKeyRuleIndex: owns is true only for the exact (key, rule, generation)",
+          "[spark][index][owns]") {
+    SparkKeyRuleIndex idx;
+
+    SECTION("unknown rule and empty index") {
+        REQUIRE_FALSE(idx.owns("service|5:sshd", "never-added", 0));
+        idx.add("service|5:sshd", "rule-a", /*generation=*/3);
+        REQUIRE_FALSE(idx.owns("service|5:sshd", "never-added", 3));
+    }
+
+    SECTION("right key, wrong generation") {
+        idx.add("service|5:sshd", "rule-a", /*generation=*/3);
+        REQUIRE(idx.owns("service|5:sshd", "rule-a", 3));
+        REQUIRE_FALSE(idx.owns("service|5:sshd", "rule-a", 2));
+        REQUIRE_FALSE(idx.owns("service|5:sshd", "rule-a", 4));
+    }
+
+    SECTION("right generation, wrong key") {
+        idx.add("service|5:sshd", "rule-a", /*generation=*/3);
+        REQUIRE_FALSE(idx.owns("service|5:nginx", "rule-a", 3));
+        REQUIRE_FALSE(idx.owns("", "rule-a", 3));
+    }
+
+    SECTION("a same-key add() transfers ownership to the newer generation") {
+        idx.add("service|5:sshd", "rule-a", /*generation=*/1);
+        REQUIRE(idx.owns("service|5:sshd", "rule-a", 1));
+        REQUIRE(idx.add("service|5:sshd", "rule-a", /*generation=*/2) == false);
+        REQUIRE(idx.owns("service|5:sshd", "rule-a", 2));
+        REQUIRE_FALSE(idx.owns("service|5:sshd", "rule-a", 1));
+    }
+
+    SECTION("a key move leaves the rule owned under the new key only") {
+        idx.add("service|5:sshd", "rule-a", /*generation=*/1);
+        REQUIRE(idx.add("service|5:nginx", "rule-a", /*generation=*/2) == true);
+        REQUIRE(idx.owns("service|5:nginx", "rule-a", 2));
+        REQUIRE_FALSE(idx.owns("service|5:sshd", "rule-a", 1));
+        REQUIRE_FALSE(idx.owns("service|5:sshd", "rule-a", 2));
+        REQUIRE_FALSE(idx.owns("service|5:nginx", "rule-a", 1));
+    }
+
+    SECTION("a sibling on the same key is independent, and a release clears ownership") {
+        idx.add("service|5:sshd", "rule-a", /*generation=*/1);
+        idx.add("service|5:sshd", "rule-b", /*generation=*/9);
+        REQUIRE(idx.owns("service|5:sshd", "rule-a", 1));
+        REQUIRE(idx.owns("service|5:sshd", "rule-b", 9));
+        REQUIRE(idx.erase_rule("rule-a", 1) == false); // rule-b remains: not the ->0 edge
+        REQUIRE_FALSE(idx.owns("service|5:sshd", "rule-a", 1));
+        REQUIRE(idx.owns("service|5:sshd", "rule-b", 9));
+    }
+}
