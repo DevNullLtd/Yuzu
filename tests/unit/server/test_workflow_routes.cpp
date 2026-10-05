@@ -226,6 +226,9 @@ struct ExecHarness {
     bool dispatch_route_unreadable_override{false};
     std::size_t dispatch_denied_quarantined_count_override{0};
     std::size_t dispatch_unknown_plugin_count_override{0};
+    // #5294: the per-OS kill-switch discriminators.
+    std::size_t dispatch_kill_switched_os_count_override{0};
+    bool dispatch_os_gate_unreadable_override{false};
     /// PR #3939 review fix round: exercises the new scope_parse_error ->
     /// invalid_scope branch this route gained.
     std::optional<std::string> dispatch_scope_parse_error_override;
@@ -473,6 +476,8 @@ struct ExecHarness {
                    .command_id = dispatch_cmd_override,
                    .containment_unreadable = dispatch_containment_unreadable_override,
                    .unknown_plugin_count = dispatch_unknown_plugin_count_override,
+                   .kill_switched_os_count = dispatch_kill_switched_os_count_override,
+                   .os_gate_unreadable = dispatch_os_gate_unreadable_override,
                    .route_unreadable = dispatch_route_unreadable_override};
         };
 
@@ -1828,6 +1833,38 @@ TEST_CASE("instruction execute: a plugin absent from every target's inventory re
     auto body = nlohmann::json::parse(res->body);
     CHECK(body["error"]["reason"] == "plugin_not_found");
     CHECK(body["error"]["retry_after_ms"].is_null());
+}
+
+TEST_CASE("instruction execute: every target on a switched-off OS reports "
+          "reason=kill_switched_os, non-retryable",
+          "[pg][workflow][executions][execute][5294]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
+    h.make_def("def-KO", "KO");
+    h.dispatch_kill_switched_os_count_override = 1;
+    auto res = h.sink.Post("/api/instructions/def-KO/execute", R"({"agent_ids":["agent-1"]})");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    auto body = nlohmann::json::parse(res->body);
+    CHECK(body["error"]["reason"] == "kill_switched_os");
+    CHECK(body["error"]["retry_after_ms"].is_null());
+}
+
+TEST_CASE("instruction execute: an unreadable per-OS gate reports "
+          "reason=os_gate_unreadable, retryable after 5000 ms",
+          "[pg][workflow][executions][execute][5294]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
+    h.make_def("def-OG", "OG");
+    h.dispatch_os_gate_unreadable_override = true;
+    auto res = h.sink.Post("/api/instructions/def-OG/execute", R"({"agent_ids":["agent-1"]})");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    auto body = nlohmann::json::parse(res->body);
+    CHECK(body["error"]["reason"] == "os_gate_unreadable");
+    CHECK(body["error"]["retry_after_ms"] == 5000);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
