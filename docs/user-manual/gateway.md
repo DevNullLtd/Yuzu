@@ -600,8 +600,7 @@ answered a real command; in an outage with the breaker open, 10 held
 `DISCONNECTED` notifications waited 55 to 59 s, then exactly one was sent as the
 probe when the breaker went half open, it closed the breaker, and the other 9
 followed in order, with the pending gauge back at 0 within 2 ms of the half open
-transition (five runs, four with simulated and one with real agents plus a
-repeat). With the server kept frozen through the first two half open periods the
+transition (five runs: three with simulated agents and two with real agents). With the server kept frozen through the first two half open periods the
 probe failed twice by timeout (the breaker reopened with 120 s and then 240 s
 backoff, and the pending gauge dipped to 9 while the probe was out and returned
 to 10), the third probe closed the breaker, and all 10 held notifications were
