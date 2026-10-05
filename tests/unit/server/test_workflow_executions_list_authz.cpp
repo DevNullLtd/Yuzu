@@ -17,12 +17,15 @@
  */
 
 #include "execution_tracker.hpp"
+#include "pg/pg_raii.hpp"
 #include "tag_store.hpp"
 #include "test_response_execution_authz_pg_helper.hpp"
 #include "test_route_sink.hpp"
 #include "workflow_routes.hpp"
 
 #include <catch2/catch_test_macros.hpp>
+
+#include <libpq-fe.h>
 
 #include <algorithm>
 #include <chrono>
@@ -260,4 +263,30 @@ TEST_CASE("fragments/executions real gate: revoking Execution:Read from ITServic
     auto bob = r.get(r.mint("bob"), /*use_tag_aware_auth=*/true);
     CHECK(bob.status == 200);
     CHECK(bob.ids == ListRig::sorted({r.x_bob, r.x_mixed, r.x_bob_own}));
+}
+
+// A FAILED ITServiceOwner ceiling read is an infrastructure fault, not a deny: the fragment
+// surfaces the gate's own retryable 503 (retry_after_ms 5000) and serves no row, while the
+// siblings that keep the 403 mapping (require_permission) are pinned in test_authz_gates.cpp.
+TEST_CASE("fragments/executions real gate: a degraded ITServiceOwner ceiling read is a 503 for "
+          "a service token and serves no rows",
+          "[pg][workflow][executions][list][confinement][authz][service_scope]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::response_execution_authz_tpl);
+    ListRig r{db.dsn()};
+    const auto svc_gary = r.mint("gary", "printers");
+    CHECK(r.get(svc_gary, /*use_tag_aware_auth=*/true).status == 200); // control
+
+    {
+        yuzu::server::pg::PgConn conn{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        yuzu::server::pg::PgResult d{
+            PQexec(conn.get(), "DROP TABLE rbac_store.role_permissions CASCADE")};
+        REQUIRE(d.ok());
+    }
+    auto g = r.get(svc_gary, /*use_tag_aware_auth=*/true);
+    CHECK(g.status == 503);
+    CHECK(g.ids.empty());
+    CHECK(has(g.body, "\"retry_after_ms\":5000"));
+    CHECK_FALSE(has(g.body, "does not grant"));
+    CHECK_FALSE(has(g.body, "SECRET-ALICE"));
 }
