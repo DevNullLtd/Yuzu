@@ -759,10 +759,11 @@ catalogue stays "building". A rollback to an older binary is clean: its grain-le
 and read treat every row as a title-grain row (each title once). On an upgrade with older
 replicas still running, restart them promptly: the v8 `DROP` queues behind an old replica's
 refresh and dies at the pool's 10 s `lock_timeout` (the new server then refuses to start,
-fail-closed). A mixed old/new window has two transient asymmetries until each side's next
+fail-closed). A mixed old/new window has three transient asymmetries until each side's next
 hourly refresh: an old replica's read lists every grain row the new binary wrote (8 to
 8 x C per title), and after an old replica's refresh the new binary's filtered reads are
-empty (not "building").
+empty (not "building"), and the KPI numbers stay at their last new-binary values under a
+fresh "updated" stamp.
 
 KPI definitions: total installs = distinct (device, title) pairs; the OS split counts each
 (device, title) pair once per OS family derived from the ecosystem; stay-current = distinct devices on each title's exact newest

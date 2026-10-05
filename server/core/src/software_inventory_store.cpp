@@ -265,11 +265,13 @@ const std::vector<pg::PgMigration>& migrations() {
          // v8. Its refresh INSERT names no grain column; with the default each of its rows
          // lands as the title grain and it never rolls back on NOT NULL. Once its own refresh
          // has run, its (grain-less) read lists each title once: a rollback to an older binary
-         // only is clean. A MIXED old/new window has two transient asymmetries until each
+         // only is clean. A MIXED old/new window has three transient asymmetries until each
          // side's next hourly refresh: the old read lists every grain row the new binary wrote
          // (8 to 8xC per title) until the old binary's own refresh replaces them, and after an
          // old refresh only grain-7 rows exist, so the new binary's filtered reads (grain != 7)
-         // are empty with refreshed_at > 0. The new refresh always writes grain explicitly
+         // are empty with refreshed_at > 0; and the old meta upsert sets only the stamp, the
+         // title count and the device count, so the KPI columns stay at their last new-binary
+         // values under a fresh stamp. The new refresh always writes grain explicitly
          // from GROUPING().
          // The expression index is what makes the (installs DESC, name) keyset an index
          // seek: the read's row-value compare on ((-device_count), name) matches it; the
@@ -513,6 +515,18 @@ std::string distinct_list(std::string_view col) {
     const std::string c(col);
     return "coalesce(string_agg(DISTINCT " + c + ", ',' ORDER BY " + c + ") FILTER (WHERE " + c +
            " <> ''), '')";
+}
+
+// The search term the reads bind: invalid UTF-8 AND embedded NUL are scrubbed to U+FFFD BEFORE
+// the clamp (U+FFFD is 3 bytes, so the clamp must come after), then the LIKE metacharacters are
+// escaped. PG TEXT cannot hold a NUL and libpq's text-format bind truncates at the first one, so
+// an unscrubbed NUL-first q would bind as "" and run unfiltered; an invalid byte is a PG 22021
+// error (a false store degrade); an all-continuation prefix would clamp to "" and run unfiltered.
+std::string search_term(std::string_view q) {
+    std::string s = sanitize_utf8_strict(q);
+    for (std::size_t pos = 0; (pos = s.find('\0', pos)) != std::string::npos; pos += 3)
+        s.replace(pos, 1, "\xEF\xBF\xBD");
+    return sc::like_escape(sc::clamp_utf8(s, sc::kSearchMaxBytes));
 }
 
 // q arm: a title-level ILIKE over four columns/expressions with ONE bind (`ph`) reused;
@@ -953,8 +967,7 @@ SoftwareInventoryStore::query_software(const SoftwareFleetQuery& q) {
         // decision) when the fleet passes that.
         const std::string ph = "$" + std::to_string(++p);
         sql += q_arms(ph, "name", "publisher", "ecosystem", "source");
-        params.push_back(
-            sc::like_escape(sc::clamp_utf8(sanitize_utf8_strict(q.q), sc::kSearchMaxBytes)));
+        params.push_back(search_term(q.q));
     }
     if (!q.kind.empty()) {
         sql += " AND kind = $" + std::to_string(++p);
@@ -1072,10 +1085,7 @@ SoftwareInventoryStore::software_catalog(const SoftwareCatalogQuery& q) {
         limit = kCatalogRowCap;
     const int versions_min = q.versions_min < 0 ? 0 : q.versions_min;
     const bool host = !q.agent_id.empty();
-    // Scrub invalid UTF-8 BEFORE the clamp (PG rejects the bound text with 22021 otherwise,
-    // and an all-continuation prefix would clamp to "" and run unfiltered).
-    const std::string term =
-        sc::like_escape(sc::clamp_utf8(sanitize_utf8_strict(q.q), sc::kSearchMaxBytes));
+    const std::string term = search_term(q.q);
 
     std::vector<std::string> params;
     int p = 0;

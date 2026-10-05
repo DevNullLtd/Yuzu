@@ -2146,6 +2146,16 @@ TEST_CASE("q is literal and title-level and clamped", "[pg][software_inventory]"
     auto conts_fleet_rows = store.query_software(conts_fleet);
     REQUIRE(conts_fleet_rows.has_value());
     CHECK(conts_fleet_rows->empty());
+    // An embedded NUL would truncate the bound text at the first NUL (a NUL-first q binding as ""
+    // and matching everything); it is scrubbed to U+FFFD on both reads, so each term filters.
+    SoftwareCatalogQuery nul_cat;
+    nul_cat.q = std::string("\0foo", 4);
+    CHECK(names(nul_cat).empty());
+    SoftwareFleetQuery nul_fleet;
+    nul_fleet.q = std::string("\0foo", 4);
+    auto nul_rows = store.query_software(nul_fleet);
+    REQUIRE(nul_rows.has_value());
+    CHECK(nul_rows->empty());
     // The 128-byte clamp is applied on both reads: a title of 128 'a' queried with 128 'a' + 72
     // 'z' is found (the term is cut to the 128 'a'); unclamped the term would match nothing.
     const std::string long_title(128, 'a');
