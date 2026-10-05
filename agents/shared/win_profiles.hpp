@@ -441,6 +441,7 @@ struct HiveAccessReport {
     bool unload_failed{false};
     std::string mount_name;
     std::string refusal; // the OfflineHiveFileCheck token when status == file_refused
+    LSTATUS live_open_rc{ERROR_SUCCESS}; // the live HKU\<SID> RegOpenKeyExW code (status ok == success)
 };
 
 /// Opt-in hive-FILE guard for the offline arm of with_user_hive (default: none, so every
@@ -529,7 +530,10 @@ HiveAccessStatus with_user_hive(const std::string& sid, const std::string& profi
     const std::wstring wsid = to_wide(sid);
 
     RegKey live;
-    if (RegOpenKeyExW(HKEY_USERS, wsid.c_str(), 0, KEY_READ, live.put()) == ERROR_SUCCESS) {
+    const LSTATUS live_rc = RegOpenKeyExW(HKEY_USERS, wsid.c_str(), 0, KEY_READ, live.put());
+    if (report)
+        report->live_open_rc = live_rc;
+    if (live_rc == ERROR_SUCCESS) {
         fn(live.get());
         return finish(HiveAccessStatus::ok);
     }

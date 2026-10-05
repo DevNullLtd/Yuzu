@@ -185,7 +185,7 @@ TEST_CASE("privacy_permissions win: StabilityWatch reports a change armed beneat
     set_sz(grandchild.get(), L"Value", L"Deny"); // a depth-2 Value write after arming
     const auto token = win::classify_stability(watch.poll());
     REQUIRE(token.has_value());
-    CHECK(*token == "changed_during_read");
+    CHECK(*token == win::kChangedDuringRead);
 }
 
 TEST_CASE("privacy_permissions win: walk_consent_store decodes a fixture ConsentStore, reports a "
@@ -525,6 +525,7 @@ TEST_CASE("privacy_permissions win: with_user_hive reads a loaded HKU hive first
     CHECK(before_calls == 0);
     CHECK(after_calls == 0);
     CHECK_FALSE(report.mounted_offline);
+    CHECK(report.live_open_rc == ERROR_SUCCESS);
 }
 
 namespace {
@@ -573,6 +574,7 @@ TEST_CASE("privacy_permissions win: with_user_hive refuses on a before_load toke
     CHECK(n.before == 1);
     CHECK(n.after == 0);
     CHECK(n.fn == 0);
+    CHECK(report.live_open_rc == ERROR_FILE_NOT_FOUND); // the synthetic SID is not loaded
     CHECK_FALSE(report.mounted_offline); // no mount was attempted
     CHECK(report.mount_name.empty());
     CHECK_FALSE(synthetic_mount_present());

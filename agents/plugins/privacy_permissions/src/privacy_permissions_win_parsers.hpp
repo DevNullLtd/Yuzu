@@ -102,6 +102,7 @@ inline constexpr long kErrorSuccess = 0;
 inline constexpr long kErrorFileNotFound = 2;
 inline constexpr long kErrorAccessDenied = 5;
 inline constexpr long kErrorNoMoreItems = 259;
+inline constexpr long kErrorMoreData = 234;
 inline constexpr std::uint32_t kRegSz = 1;
 inline constexpr std::uint32_t kRegQword = 11;
 
@@ -157,6 +158,14 @@ struct RetentionBudget {
 };
 
 inline constexpr std::string_view kTimeoutToken = "collection:timeout";
+/// The `<profile>:profile_list_backup` cause: a `<SID>.bak` ProfileList entry, named and never read.
+inline constexpr std::string_view kProfileListBackupSuffix = "profile_list_backup";
+
+/// The run-level stop row: `<base>:profiles_skipped_<n>`, n = profiles never emitted (those after
+/// the stop, plus one whose rows were dropped). Bounded by kMaxProfiles.
+[[nodiscard]] inline std::string run_stop_token(std::string_view base, std::size_t skipped) {
+    return std::string{base} + ":profiles_skipped_" + std::to_string(skipped);
+}
 /// `<profile>:budget_exceeded` (or `hklm:budget_exceeded`): that one source's rows are truncated.
 inline constexpr std::string_view kSourceBudgetExceededSuffix = "budget_exceeded";
 
@@ -505,11 +514,17 @@ struct StabilityFacts {
     unsigned long wait_gle = 0;   // GetLastError after a WAIT_FAILED
 };
 
+/// The classify_stability token for a ConsentStore that changed while it was read.
+inline constexpr std::string_view kChangedDuringRead = "changed_during_read";
+/// How many times a source whose store changed mid-read is walked again before it is refused
+/// (never once the run's deadline has passed).
+inline constexpr unsigned kStabilityRewalks = 1;
+
 [[nodiscard]] inline std::optional<std::string> classify_stability(const StabilityFacts& f) {
     if (f.create_gle != 0) return "notify_event_failed:win32_" + std::to_string(f.create_gle);
     if (f.arm_rc != 0) return "notify_failed:win32_" + std::to_string(f.arm_rc);
     if (f.wait_rc == kWaitTimeout) return std::nullopt;
-    if (f.wait_rc == kWaitObject0) return std::string{"changed_during_read"};
+    if (f.wait_rc == kWaitObject0) return std::string{kChangedDuringRead};
     return "notify_wait_failed:win32_" + std::to_string(f.wait_gle);
 }
 
@@ -563,14 +578,14 @@ inline void emit_root_failure(std::string_view source, std::string app_id, long 
 }
 
 /// What reading ONE profile produced: how its hive was (or was not) reached and, when it was, its
-/// ConsentStore walk. `peek_rc` is the open code of the live HKU\<SID> root, which
-/// with_user_hive's own `== ERROR_SUCCESS` test cannot tell from "not loaded": it recovers a
-/// refused live hive whose offline fallback then also failed.
+/// ConsentStore walk. `live_open_rc` is the open code of the live HKU\<SID> root (fed from
+/// HiveAccessReport::live_open_rc), which with_user_hive's own `== ERROR_SUCCESS` test cannot tell
+/// from "not loaded": it recovers a refused live hive whose offline fallback then also failed.
 struct ProfileRead {
     profiles::HiveAccessStatus status = profiles::HiveAccessStatus::not_found;
     std::string refusal;          // the hive-file refusal token when status == file_refused
     bool unload_failed = false;   // the read completed; a mount was left behind
-    long peek_rc = kErrorSuccess;
+    long live_open_rc = kErrorSuccess;
     ConsentWalk walk;             // meaningful only when status == ok
 };
 
@@ -639,14 +654,21 @@ using ReadProfileFn = std::function<ProfileRead(const profiles::ProfileInfo&)>;
         return true;
     };
 
-    for (const auto& profile : profile_list) {
+    const std::size_t n = profile_list.size();
+    std::size_t skipped = 0; // profiles never emitted when the run stopped
+    for (std::size_t i = 0; i < n; ++i) {
+        const auto& profile = profile_list[i];
         // A cap the previous profile filled EXACTLY is still the budget stopping the run with
         // profiles left: it must say so, never end silently short.
         if (output.exhausted()) {
             budget_hit = true;
+            skipped = n - i;
             break;
         }
-        if (budget.expired()) break; // `timed_out` is sticky: the run-level row is added below
+        if (budget.expired()) { // `timed_out` is sticky: the run-level row is added below
+            skipped = n - i;
+            break;
+        }
         budget.begin_profile();
         const std::string pname = profile.profile_name.empty() ? "-" : profile.profile_name;
         const std::string profile_row_id = qualify_app_id(pname, "-");
@@ -655,10 +677,24 @@ using ReadProfileFn = std::function<ProfileRead(const profiles::ProfileInfo&)>;
         // The SID is appended to HKEY_USERS by the shell (and by with_user_hive): a malformed or
         // empty one must never open the HKU root or some other key in place of this profile's own
         // hive, so it is refused here, before any read is injected.
+        // A `<SID>.bak` entry is named, not read (its folder may hold the user's real hive): it
+        // must be tested first, since the suffix makes the string an invalid SID.
+        if (profiles::is_profile_backup_entry(profile.sid)) {
+            prof.push_back(failure_row("windows", profile_row_id, "-", false,
+                                       pname + ":" + std::string{kProfileListBackupSuffix}, acc));
+            if (!commit(prof, false)) {
+                skipped = n - i;
+                break;
+            }
+            continue;
+        }
         if (!is_valid_sid_string(profile.sid)) {
             prof.push_back(
                 failure_row("windows", profile_row_id, "-", false, pname + ":invalid_sid", acc));
-            if (!commit(prof, false)) break;
+            if (!commit(prof, false)) {
+                skipped = n - i;
+                break;
+            }
             continue;
         }
 
@@ -671,7 +707,7 @@ using ReadProfileFn = std::function<ProfileRead(const profiles::ProfileInfo&)>;
         // must never read as "this profile has no grants" -- each failure is its own row.
         // `refused`: the cause is itself a refusal (a missing privilege): denied, token unchanged.
         const auto profile_failed = [&](std::string_view cause, bool refused = false) {
-            const bool peek_denied = (rd.peek_rc == kErrorAccessDenied);
+            const bool peek_denied = (rd.live_open_rc == kErrorAccessDenied);
             prof.push_back(failure_row("windows", profile_row_id, "-", peek_denied || refused,
                                        pname + ":" + (peek_denied ? std::string{"access_denied"}
                                                                   : std::string{cause}),
@@ -717,8 +753,14 @@ using ReadProfileFn = std::function<ProfileRead(const profiles::ProfileInfo&)>;
                 truncated_row(prof, pname, profile_row_id);
             }
         }
-        if (!commit(prof, reachable)) break;
-        if (budget.timed_out) break;
+        if (!commit(prof, reachable)) {
+            skipped = n - i; // the dropped profile counts as skipped
+            break;
+        }
+        if (budget.timed_out) {
+            skipped = n - (i + 1);
+            break;
+        }
     }
 
     // HKLM's own rows, unqualified, once (hklm_emitted_once), already charged: everything it
@@ -732,9 +774,10 @@ using ReadProfileFn = std::function<ProfileRead(const profiles::ProfileInfo&)>;
     // The run-wide output budget stopped the walk: every row read so far is above; what was never
     // walked is covered by this one whole-source row.
     if (budget_hit)
-        rows.push_back(failure_row("windows", "-", "-", false, std::string{kBudgetExceededToken}, acc));
+        rows.push_back(failure_row("windows", "-", "-", false,
+                                   run_stop_token(kBudgetExceededToken, skipped), acc));
     if (budget.timed_out)
-        rows.push_back(failure_row("windows", "-", "-", false, std::string{kTimeoutToken}, acc));
+        rows.push_back(failure_row("windows", "-", "-", false, run_stop_token(kTimeoutToken, skipped), acc));
     return rows;
 }
 

@@ -613,6 +613,8 @@ TEST_CASE("win::RetentionBudget: the run deadline is injectable, inclusive and s
     using Clock = std::chrono::steady_clock;
     CHECK(win::kRunBudget == std::chrono::seconds{15});
     CHECK(win::kTimeoutToken == "collection:timeout");
+    CHECK(win::run_stop_token(win::kTimeoutToken, 0) == "collection:timeout:profiles_skipped_0");
+    CHECK(win::kStabilityRewalks == 1);
 
     win::RetentionBudget b;
     b.deadline = Clock::time_point::max();
@@ -904,7 +906,7 @@ TEST_CASE("win::classify_stability: stable only on a created event, an armed wat
         return t ? *t : std::string{"<stable>"};
     };
     CHECK(token(F{0, 0, win::kWaitTimeout, 0}) == "<stable>");
-    CHECK(token(F{0, 0, win::kWaitObject0, 0}) == "changed_during_read");
+    CHECK(token(F{0, 0, win::kWaitObject0, 0}) == win::kChangedDuringRead);
     CHECK(token(F{0, 0, 0xFFFFFFFFul /* WAIT_FAILED */, 6}) == "notify_wait_failed:win32_6");
     CHECK(token(F{0, 0, 0x80ul /* WAIT_ABANDONED */, 0}) == "notify_wait_failed:win32_0");
     CHECK(token(F{8, 0, win::kWaitTimeout, 0}) == "notify_event_failed:win32_8");
@@ -986,6 +988,13 @@ struct AssembledRun {
             return r.app_id == "-" && r.category == "-" && r.raw == token;
         });
     }
+    /// Run-level stop rows for `base`, whatever their `:profiles_skipped_<n>` count.
+    [[nodiscard]] std::size_t stops(std::string_view base) const {
+        const std::string prefix = std::string{base} + ":profiles_skipped_";
+        return count([&](const PermissionRow& r) {
+            return r.app_id == "-" && r.category == "-" && r.raw.rfind(prefix, 0) == 0;
+        });
+    }
     [[nodiscard]] std::size_t rows_of(std::string_view app_prefix) const {
         return count([&](const PermissionRow& r) { return r.app_id.rfind(app_prefix, 0) == 0; });
     }
@@ -1029,12 +1038,23 @@ TEST_CASE("win::assemble_windows_rows: HKLM's overriding Deny is one unqualified
     SECTION("a profile refused as unstable is not reachable: nothing merged, so HKLM keeps the Deny") {
         run.go({profile_of("alice", kSidAlice)}, hklm_camera_deny(), [](const ProfileInfo&) {
             auto rd = reachable_allow();
-            rd.walk.refused = "changed_during_read";
+            rd.walk.refused = std::string{win::kChangedDuringRead};
             return rd;
         });
         CHECK(run.count(hklm_row) == 1);
         CHECK(run.count([](const PermissionRow& r) { return r.raw == "alice:changed_during_read"; }) == 1);
         CHECK(run.rows_of("alice\\-") == 1); // the refusal row alone: no Allow row for the discarded read
+    }
+    SECTION("a `.bak` ProfileList entry is named, never read, and never `invalid_sid`") {
+        const std::string bak = std::string{kSidAlice} + ".bak";
+        run.go({profile_of("alice", bak), profile_of("carol", kSidCarol)}, hklm_camera_deny(),
+               [](const ProfileInfo&) { return reachable_allow(); });
+        CHECK(run.reads == 1); // carol only
+        CHECK(run.count([](const PermissionRow& r) { return r.raw == "alice:profile_list_backup"; }) == 1);
+        CHECK(run.count([](const PermissionRow& r) { return r.raw == "alice:invalid_sid"; }) == 0);
+        const auto st = select_status(run.acc, any_denied(run.rows), false);
+        CHECK(st.status == YUZU_RESULT_STATUS_CONSTRAINED);
+        CHECK(st.completeness == YUZU_RESULT_COMPLETENESS_PARTIAL);
     }
     SECTION("a malformed SID is refused before any read is injected, and is not reachable") {
         run.go({profile_of("mallory", "S-1-5-"), profile_of("carol", kSidCarol)}, hklm_camera_deny(),
@@ -1063,14 +1083,14 @@ TEST_CASE("win::assemble_windows_rows: each hive-access outcome is its own row, 
     }
     SECTION("a refused live peek turns any failure into access_denied, denied") {
         auto rd = unreachable(HiveAccessStatus::not_found);
-        rd.peek_rc = win::kErrorAccessDenied;
+        rd.live_open_rc = win::kErrorAccessDenied;
         only(rd);
         REQUIRE(row_raw("alice:access_denied") == 1);
         CHECK(any_denied(run.rows));
     }
     SECTION("a refused live peek beneath a hive-file refusal is still the denial") {
         auto rd = unreachable(HiveAccessStatus::file_refused, "hive_reparse_point");
-        rd.peek_rc = win::kErrorAccessDenied;
+        rd.live_open_rc = win::kErrorAccessDenied;
         only(rd);
         REQUIRE(row_raw("alice:access_denied") == 1);
         CHECK(row_raw("alice:hive_reparse_point") == 0);
@@ -1111,8 +1131,8 @@ TEST_CASE("win::assemble_windows_rows: the run-wide output budget reserves HKLM'
     const std::size_t per_profile = one.output.b.bytes - reserved;
     REQUIRE(reserved > 0);
     REQUIRE(per_profile > 0);
-    CHECK(none.markers(kBudgetExceededToken) == 0);
-    CHECK(one.markers(kBudgetExceededToken) == 0);
+    CHECK(none.stops(kBudgetExceededToken) == 0);
+    CHECK(one.stops(kBudgetExceededToken) == 0);
 
     const std::vector<ProfileInfo> two{profile_of("alice", kSidAlice), profile_of("bobby", kSidBobby)};
     AssembledRun run;
@@ -1120,7 +1140,7 @@ TEST_CASE("win::assemble_windows_rows: the run-wide output budget reserves HKLM'
     SECTION("a second profile that would cross the cap is absent; the first and HKLM's rows stay") {
         run.output.b.max_bytes = reserved + 2 * per_profile - 1;
         run.go(two, hklm, read);
-        CHECK(run.markers(kBudgetExceededToken) == 1);
+        CHECK(run.markers(win::run_stop_token(kBudgetExceededToken, 1)) == 1);
         CHECK(run.rows_of("alice\\-") == kCategories.size());
         CHECK(run.rows_of("bobby\\") == 0);
         CHECK(run.count([](const PermissionRow& r) { return r.app_id == "-" && r.category == "microphone"; }) == 1);
@@ -1136,18 +1156,18 @@ TEST_CASE("win::assemble_windows_rows: the run-wide output budget reserves HKLM'
         CHECK(run.reads == 1); // bobby is never read
         CHECK(run.rows_of("alice\\-") == kCategories.size());
         CHECK(run.rows_of("bobby\\") == 0);
-        CHECK(run.markers(kBudgetExceededToken) == 1);
+        CHECK(run.markers(win::run_stop_token(kBudgetExceededToken, 1)) == 1);
     }
     SECTION("filling the cap exactly with nothing left to read is complete, not truncated") {
         run.output.b.max_bytes = reserved + per_profile;
         run.go({profile_of("alice", kSidAlice)}, hklm, read);
-        CHECK(run.markers(kBudgetExceededToken) == 0);
+        CHECK(run.stops(kBudgetExceededToken) == 0);
         CHECK(run.rows_of("alice\\-") == kCategories.size());
     }
     SECTION("HKLM is charged first: a profile that fits alone is dropped when HKLM's rows leave no room") {
         run.output.b.max_bytes = per_profile;
         run.go({profile_of("alice", kSidAlice)}, hklm, read);
-        CHECK(run.markers(kBudgetExceededToken) == 1);
+        CHECK(run.markers(win::run_stop_token(kBudgetExceededToken, 1)) == 1);
         CHECK(run.rows_of("alice\\-") == 0);
         // every HKLM row survived, and its Deny is HKLM's own row since no profile carried it
         CHECK(run.count([](const PermissionRow& r) {
@@ -1173,8 +1193,8 @@ TEST_CASE("win::assemble_windows_rows: an expired deadline stops the run with on
         CHECK(run.reads == 1);
         CHECK(run.rows_of("alice\\-") == kCategories.size()); // what was read is kept
         CHECK(run.rows_of("bobby\\") == 0);
-        CHECK(run.markers(win::kTimeoutToken) == 1);
-        CHECK(run.markers(kBudgetExceededToken) == 0);
+        CHECK(run.markers(win::run_stop_token(win::kTimeoutToken, 2)) == 1);
+        CHECK(run.stops(kBudgetExceededToken) == 0);
         const auto st = select_status(run.acc, any_denied(run.rows), false);
         CHECK(st.status == YUZU_RESULT_STATUS_CONSTRAINED);
         CHECK(st.completeness == YUZU_RESULT_COMPLETENESS_PARTIAL);
@@ -1183,14 +1203,14 @@ TEST_CASE("win::assemble_windows_rows: an expired deadline stops the run with on
         run.budget.deadline = std::chrono::steady_clock::now() - std::chrono::seconds{1};
         run.go(three, hklm_camera_deny(), [](const ProfileInfo&) { return reachable_allow(); });
         CHECK(run.reads == 0);
-        CHECK(run.markers(win::kTimeoutToken) == 1);
+        CHECK(run.markers(win::run_stop_token(win::kTimeoutToken, 3)) == 1);
         CHECK(run.count([](const PermissionRow& r) { return r.app_id == "-" && r.category != "-"; }) ==
               kCategories.size());
     }
     SECTION("a run that finishes in time has no timeout row") {
         run.go(three, hklm_camera_deny(), [](const ProfileInfo&) { return reachable_allow(); });
         CHECK(run.reads == 3);
-        CHECK(run.markers(win::kTimeoutToken) == 0);
+        CHECK(run.stops(win::kTimeoutToken) == 0);
     }
 }
 
@@ -1234,7 +1254,7 @@ TEST_CASE("win::assemble_windows_rows: the per-source budget marker, source-leve
     }
     SECTION("an HKLM store refused as unstable is one `hklm:<token>` row") {
         win::ConsentWalk h;
-        h.refused = "changed_during_read";
+        h.refused = std::string{win::kChangedDuringRead};
         run.go({}, h, allow);
         CHECK(with_raw("hklm:changed_during_read") == 1);
     }
@@ -1268,7 +1288,7 @@ TEST_CASE("win::assemble_windows_rows: the per-source budget marker, source-leve
         });
         CHECK(run.reads == 1);
         CHECK(with_raw("alice:timeout") == 1);
-        CHECK(run.markers(win::kTimeoutToken) == 1);
+        CHECK(run.markers(win::run_stop_token(win::kTimeoutToken, 1)) == 1);
     }
 }
 

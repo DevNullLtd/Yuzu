@@ -153,7 +153,8 @@ SubkeyEnum enumerate_subkey_names(HKEY parent) {
         // A counted name with an embedded NUL cannot be reopened by c_str() (the open and
         // from_wide stop at the NUL, so it would read a prefix sibling or, with a leading NUL,
         // the parent itself): skip it here, the one site both walks route through, and count it.
-        if (std::wstring_view(buf, len).find(L'\0') != std::wstring_view::npos)
+        // A zero-length name is the same hazard: RegOpenKeyExW(parent, L"") reopens the PARENT.
+        if (len == 0 || std::wstring_view(buf, len).find(L'\0') != std::wstring_view::npos)
             ++embedded_nul;
         else
             out.names.emplace_back(buf, len);
@@ -642,16 +643,6 @@ int collect_windows_permissions(yuzu::CommandContext& ctx) {
     // empty one never reaches here), so it is safe to append to HKEY_USERS.
     const win::ReadProfileFn read_profile = [&](const yuzu::profiles::ProfileInfo& profile) {
         win::ProfileRead rd;
-        // with_user_hive's live-hive check tests only `== ERROR_SUCCESS`, so a refused LIVE
-        // HKU\<SID> root is indistinguishable from "not loaded" to its caller, and if the offline
-        // fallback then also fails the denial would be lost. A cheap peek at the live root (never
-        // gating or replacing the real call; benign TOCTOU) recovers it.
-        {
-            yuzu::win::RegKey peek;
-            rd.peek_rc = RegOpenKeyExW(HKEY_USERS, yuzu::win::to_wide(profile.sid).c_str(), 0,
-                                       KEY_READ, peek.put());
-        }
-
         yuzu::win::HiveAccessReport report;
         HiveFileGuard guard{budget, profile.sid, 0, std::nullopt};
         const yuzu::win::OfflineHiveFileCheck check{
@@ -678,6 +669,7 @@ int collect_windows_permissions(yuzu::CommandContext& ctx) {
             throw;
         }
         rd.refusal = std::move(report.refusal);
+        rd.live_open_rc = report.live_open_rc; // set by with_user_hive before anything can throw
         rd.unload_failed = report.unload_failed;
         if (report.unload_failed) log_unload_failed();
         return rd;
