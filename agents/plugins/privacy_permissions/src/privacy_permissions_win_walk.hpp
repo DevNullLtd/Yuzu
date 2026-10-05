@@ -81,7 +81,9 @@ public:
     ScopedKey& operator=(const ScopedKey&) = delete;
 
     [[nodiscard]] long open(RegKeyHandle parent, const wchar_t* name) {
-        if (key_) { // a re-open closes the held key first; open_key sets `key_` only on success
+        // A re-open closes the held key first (open_key sets `key_` only on success), so `parent`
+        // must not be this key's own get().
+        if (key_) {
             reg_.close_key(key_);
             key_ = nullptr;
         }
