@@ -30,7 +30,7 @@
 # Records the following timings (gate=phase2):
 #   pull-old-images, stack-up-old, fixtures-write,
 #   image-swap, ready-after-upgrade, fixtures-verify,
-#   synthetic-uat-against-upgraded
+#   synthetic-uat-against-upgraded, recreate-after-upgrade
 #
 # Records the gate row 'Upgrade vOLD->NEW' to test_gates with overall PASS/FAIL.
 #
@@ -525,17 +525,88 @@ else
 fi
 record_timing "synthetic-uat-against-upgraded" "$(elapsed_ms "$T_START")"
 
+# --- Step 9: recreate the server container at NEW (#5370) -----------------
+#
+# The image swap above is itself a container recreate, but it only proves the
+# cert dir survives when the OLD release already keeps its KEK in Postgres
+# (0.14.0+). Recreating the SAME image again makes the check independent of
+# which release --old-version floats to: the server keeps its internal CA,
+# default certs and the secrets KEK in /etc/yuzu/certs, the KEK is registered
+# in Postgres, and if that directory is not on a volume the recreated server
+# refuses to boot with kek_unresolvable. Asserts: the cert dir's contents are
+# byte-identical across the recreate, /readyz goes ready, and login works.
+# Only a digest of the per-file hashes is logged, never key material.
+
+certs_digest() {
+    YUZU_VERSION="$NEW_VERSION" YUZU_TEST_CONFIG="$CONFIG_FILE" \
+        docker compose -f "$HERE/docker-compose.upgrade-test.yml" \
+        --project-name "$PROJECT_NAME" exec -T server \
+        bash -c 'cd /etc/yuzu/certs && test -f secrets-kek-v1.key && sha256sum -- *' \
+        2>/dev/null | sha256sum | awk '{print $1}'
+}
+EMPTY_DIGEST=$(printf '' | sha256sum | awk '{print $1}')
+
+phase "step: recreate the server container at NEW ${NEW_VERSION} (#5370)"
+T_START=$(now_ms)
+RECREATE_OK=0
+CERTS_BEFORE=$(certs_digest)
+if [[ -z "$CERTS_BEFORE" || "$CERTS_BEFORE" == "$EMPTY_DIGEST" ]]; then
+    fl "could not read /etc/yuzu/certs (or secrets-kek-v1.key is missing) before the recreate"
+elif ! YUZU_VERSION="$NEW_VERSION" YUZU_TEST_CONFIG="$CONFIG_FILE" \
+    docker compose -f "$HERE/docker-compose.upgrade-test.yml" \
+    --project-name "$PROJECT_NAME" \
+    up -d --force-recreate --no-deps server >> "$LOG_FILE" 2>&1; then
+    fl "compose up --force-recreate server failed"
+else
+    SERVER_HOST_PORT=$(YUZU_VERSION="$NEW_VERSION" YUZU_TEST_CONFIG="$CONFIG_FILE" \
+        docker compose -f "$HERE/docker-compose.upgrade-test.yml" \
+        --project-name "$PROJECT_NAME" \
+        port server 8080 2>/dev/null | awk -F: '{print $NF}')
+    DASHBOARD_URL="http://localhost:${SERVER_HOST_PORT}"
+    WAITED=0
+    READY=0
+    while (( WAITED < 90 )); do
+        BODY=$(curl -sf --max-time 3 "${DASHBOARD_URL}/readyz" 2>/dev/null || echo "")
+        if [[ "$BODY" == *'"ready"'* ]]; then
+            READY=1
+            break
+        fi
+        sleep 2
+        WAITED=$((WAITED + 2))
+    done
+    if [[ $READY -ne 1 ]]; then
+        fl "/readyz never went ready after the recreate (waited ${WAITED}s) — see the server log below"
+        YUZU_VERSION="$NEW_VERSION" YUZU_TEST_CONFIG="$CONFIG_FILE" \
+            docker compose -f "$HERE/docker-compose.upgrade-test.yml" \
+            --project-name "$PROJECT_NAME" logs server 2>&1 | tail -50 >> "$LOG_FILE"
+    else
+        CERTS_AFTER=$(certs_digest)
+        LOGIN_HTTP=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 \
+            "$DASHBOARD_URL/login" \
+            -d "username=${USERNAME}&password=${PASSWORD}" 2>/dev/null || echo "000")
+        if [[ "$CERTS_AFTER" != "$CERTS_BEFORE" ]]; then
+            fl "/etc/yuzu/certs changed across the recreate (before ${CERTS_BEFORE:0:12}, after ${CERTS_AFTER:0:12})"
+        elif [[ ! "$LOGIN_HTTP" =~ ^[23] ]]; then
+            fl "login HTTP $LOGIN_HTTP after the recreate"
+        else
+            ok "recreated server ready in ${WAITED}s, cert dir unchanged, login HTTP $LOGIN_HTTP"
+            RECREATE_OK=1
+        fi
+    fi
+fi
+record_timing "recreate-after-upgrade" "$(elapsed_ms "$T_START")"
+
 # --- Final gate result ----------------------------------------------------
 
 GATE_DURATION=$((($(now_ms) - GATE_START) / 1000))
-if [[ $FIXTURE_VERIFY_OK -eq 1 && $UAT_OK -eq 1 ]]; then
+if [[ $FIXTURE_VERIFY_OK -eq 1 && $UAT_OK -eq 1 && $RECREATE_OK -eq 1 ]]; then
     ok "Phase 2 PASS"
     record_gate "PASS" "$GATE_DURATION" \
-        "fixtures upheld (api_tokens=${API_TOKENS_EXPECT}), /readyz green, ${MIGR_COUNT} migrations stamped"
+        "fixtures upheld (api_tokens=${API_TOKENS_EXPECT}), /readyz green, ${MIGR_COUNT} migrations stamped, survives recreate"
     exit 0
 else
-    fl "Phase 2 FAIL (fixture_verify=$FIXTURE_VERIFY_OK uat=$UAT_OK)"
+    fl "Phase 2 FAIL (fixture_verify=$FIXTURE_VERIFY_OK uat=$UAT_OK recreate=$RECREATE_OK)"
     record_gate "FAIL" "$GATE_DURATION" \
-        "fixture_verify=$FIXTURE_VERIFY_OK uat=$UAT_OK"
+        "fixture_verify=$FIXTURE_VERIFY_OK uat=$UAT_OK recreate=$RECREATE_OK"
     exit 1
 fi

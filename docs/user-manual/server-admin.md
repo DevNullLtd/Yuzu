@@ -225,6 +225,10 @@ separately.
 
 ## Upgrade Notes
 
+### vNEXT — the shipped Docker Compose files keep `/etc/yuzu/certs` on a volume (#5370; action needed before you recreate a 0.14.0 container)
+
+`deploy/docker/docker-compose.yml`, `docker-compose.uat.yml`, `docker-compose.full-uat.yml`, `docker-compose.viz-uat.yml` and `docker-compose.demo.yml` now mount a `server-certs` volume on `/etc/yuzu/certs`, which holds the internal CA and the secrets KEK. In 0.14.0 that directory sat in the container's own layer, so recreating the container deleted the KEK. Postgres still had it registered, so the server refused to start (`kek_unresolvable`). The reference composes already persisted it. **Before switching an existing 0.14.0 stack to the new file**, copy the directory out of the old container: [Upgrading](upgrading.md), "Docker Compose: copy `/etc/yuzu/certs` out of the server container before you recreate it", gives the commands and the recovery path if the files are already gone. See also [What must persist](#docker-compose).
+
 ### vNEXT — the Windows server installer locks its data directory and keeps secrets off the command line (#5196, #5210, #5272; breaking for unattended installs)
 
 Windows server is not a supported deployment (ADR-0035), and the `YuzuServer` service cannot yet run under the Service Control Manager at all (#5325). This note is for anyone using `YuzuServerSetup-*.exe` anyway.
@@ -4713,6 +4717,15 @@ docker compose up -d          # start all services
 docker compose logs -f        # follow logs
 docker compose down           # stop all services
 ```
+
+**What must persist.** Every shipped compose that keeps Postgres on a volume also keeps these two server directories on named volumes, and a compose you write needs the same two. (The sanitizer rig, `docker-compose.sanitizer-uat.yml`, keeps no state at all and is the one exception.)
+
+| Mount point | Volume (shipped composes) | Holds |
+|---|---|---|
+| `/var/lib/yuzu` | `server-data` | `--data-dir`: the `.cfg` files, `nvd_cves.db`, `agent-updates/`, `upload-blobs/` |
+| `/etc/yuzu/certs` | `server-certs` (`certs` in the two reference composes) | The server's default cert dir: the internal CA (`default-ca.key`), the default leaf certificates, and the secrets KEK files `secrets-kek-v<N>.key` |
+
+The second is easy to miss, because the image never passes `--ca-dir` and the server falls back to `/etc/yuzu/certs`. The KEK is registered in Postgres, so this directory has to live exactly as long as the Postgres volume does. Without a volume, recreating the container (an image upgrade, `down` then `up`, `up --force-recreate`) deletes the key files, and the server then refuses to start with `kek_unresolvable` (#5370). `docker compose down` without `-v` keeps both volumes. `down -v` deletes them along with the Postgres volume, which is a full reset. The image creates `/etc/yuzu/certs` owned by the `yuzu` user, and a new named volume takes that owner, so no `chown` is needed. Do not move the directory under `--data-dir` with `--ca-dir` on an existing install: the CA store records the key's absolute path (#5273). Upgrading a 0.14.0 compose that had no volume there: [Upgrading](upgrading.md), "Docker Compose: copy `/etc/yuzu/certs` out of the server container before you recreate it". Back the directory up with the database as a pair: [the KEK pairing rule](../ops-runbooks/auth-db-recovery.md#backup--the-kek-pairing-rule).
 
 **Pinning a specific release with `docker-compose.uat.yml`:**
 

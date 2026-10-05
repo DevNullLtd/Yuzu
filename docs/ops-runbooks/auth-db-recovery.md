@@ -37,7 +37,7 @@ the Windows event log shows one of these, and they mean different things:
 | `[PG] Refusing to start: no PostgreSQL DSN` | `--postgres-dsn` / `YUZU_POSTGRES_DSN` is unset | [Config](#no-dsn-configured) |
 | `[PG] Refusing to start: cannot reach PostgreSQL substrate: …` | Postgres down, wrong DSN, network/auth failure | [Substrate down](#postgres-substrate-unreachable) |
 | `[PG] Refusing to start: auth store (AuthDB) migration/open failed` | Database reachable, `auth` schema could not be created/opened | [Migration failure](#auth-schema-migration-failure) |
-| `[PG] Refusing to start: SecretCodec::init() failed — …` | The secrets seam could not initialise — usually a missing or unreadable KEK | [KEK problems](#kek-missing-or-unreadable) |
+| `SecretCodec::init() failed for the auth store bootstrap — …` or `[PG] Refusing to start: SecretCodec::init() failed — …` | The secrets seam could not initialise — usually a missing or unreadable KEK | [KEK problems](#kek-missing-or-unreadable) |
 | `[auth] Refusing to start: the 'engine:' namespace …` | An `engine:`-prefixed principal collides with the reserved namespace | `docs/ops-runbooks/engine-principal-store-recovery.md` |
 
 If the shipped systemd unit is in use it retries `StartLimitBurst=3` times
@@ -149,6 +149,19 @@ sudo -u _yuzu ls -l /etc/yuzu/certs/secrets-kek-v*.key
   server generate a new one and consider it fixed: a new KEK cannot decrypt
   existing blobs. Go to [KEK permanently lost](#kek-permanently-lost).
 
+**Docker Compose.** In the container the directory is `/etc/yuzu/certs` (the
+images pass no `--ca-dir`), and it must sit on a named volume: `server-certs`
+in the shipped composes from 0.14.1, `certs` in the two reference composes.
+Check it with `docker compose exec server ls -l /etc/yuzu/certs`; while the
+server is restart-looping, use
+`docker compose run --rm --no-deps -T --entrypoint ls server -l /etc/yuzu/certs`.
+A 0.14.0 quickstart or `docker-compose.uat.yml` stack had no volume there, so
+recreating the container (an image upgrade, `down` then `up`,
+`--force-recreate`) deleted the key files, and `kek_unresolvable` follows on the
+next start (#5370). The copy-out procedure, and the options if the files are
+already gone, are in `docs/user-manual/upgrading.md`, "Docker Compose: copy
+`/etc/yuzu/certs` out of the server container before you recreate it".
+
 ## Backup — the KEK pairing rule
 
 **A Postgres dump alone is not a complete auth backup.** TOTP secrets in
@@ -169,6 +182,13 @@ sudo -u _yuzu pg_dump "$YUZU_POSTGRES_DSN" --format=custom \
      > /var/backups/yuzu/yuzu-$STAMP.dump
 sudo tar -czf /var/backups/yuzu/yuzu-keys-$STAMP.tar.gz \
      -C /etc/yuzu certs
+```
+
+```bash
+# Docker Compose — the keys directory is the server's /etc/yuzu/certs volume.
+# The server runs as the user that owns the files, so it can archive them.
+docker compose exec -T server tar -C /etc/yuzu -czf - certs \
+     > yuzu-keys-$STAMP.tar.gz
 ```
 
 ```powershell
@@ -532,15 +552,24 @@ sudo systemctl restart yuzu-server
   `yuzu-server --first-run-setup` to create a new admin interactively and write
   a fresh config.
 
-- <a id="kek-permanently-lost"></a>**KEK permanently lost.** Painful, but not a
-  total lockout — the blast radius is narrower than it first looks:
-  - **Admin sign-in survives.** MFA recovery codes are verify-only PBKDF2
-    hashes and need no KEK. Sign in with a recovery code, then re-enroll TOTP.
-  - **Password login is unaffected** — password hashes are PBKDF2, not
-    envelope-encrypted.
-  - **TOTP secrets are unrecoverable.** Every enrolled user must re-enroll.
-    Clear the dead ciphertext with the [fallback SQL](#fallback-direct-sql)
-    above (writing NULL needs no key), then have users re-enroll.
+- <a id="kek-permanently-lost"></a>**KEK permanently lost.** First, the server
+  **will not start** on a database that still registers the lost version.
+  Every boot verifies each registered KEK and stops with `kek_unresolvable`.
+  The one-shot modes `--mfa-reset` and `--break-glass-arm` run after that check
+  and fail the same way, and there is no supported way to deregister a KEK
+  version. So the database is usable again only with the key file restored
+  from a backup. Otherwise you start over with a fresh database, and the CA in
+  the same directory is usually gone too, which means a full agent
+  re-enrolment. The Docker Compose case is worked through in
+  `docs/user-manual/upgrading.md` (#5370). What the KEK does and does not
+  protect:
+  - **Not sealed under the KEK:** password hashes and MFA recovery codes are
+    verify-only PBKDF2 hashes. They are lost only if you start over with a
+    fresh database.
+  - **Sealed, and unrecoverable without the key file:** TOTP secrets, so every
+    enrolled user must re-enroll, and the other secret columns listed in
+    `docs/user-manual/server-admin.md` "Key management (secrets KEK)", such as
+    webhook signing secrets.
   - Any future envelope-encrypted column follows the same rule: re-enrollable
     or re-issuable by design, which is why ADR-0010 requires it.
 
