@@ -75,13 +75,16 @@ CommandOutboxDelivery::CommandOutboxDelivery(Deps deps) : d_(std::move(deps)) {
             "HA WS-4 4.2b Task D: additive breakdown, by `cause`, of the command outbox "
             "delivery loop's retry decision when a systemic per-tick gate degrades instead of "
             "answering - `containment_unreadable` (quarantine/containment read) or "
-            "`route_unreadable` (GatewayRouteStore directory read). Either cause reschedules the "
+            "`route_unreadable` (GatewayRouteStore directory read) or `os_gate_unreadable` (#5294: "
+            "agent presence read while a per-OS kill switch is OFF). Any cause reschedules the "
             "WHOLE occurrence with back-off, even when some sends already succeeded.",
             "counter");
         d_.metrics->counter("yuzu_server_command_outbox_deliver_retry_cause_total",
                             {{"cause", "containment_unreadable"}});
         d_.metrics->counter("yuzu_server_command_outbox_deliver_retry_cause_total",
                             {{"cause", "route_unreadable"}});
+        d_.metrics->counter("yuzu_server_command_outbox_deliver_retry_cause_total",
+                            {{"cause", "os_gate_unreadable"}});
         // json-dump-depth-guard fix: the bare
         // yuzu_server_command_outbox_deliver_decode_failed_total counter stays
         // unchanged (dashboards/alerts-in-waiting keep working), but it now
@@ -308,7 +311,9 @@ void CommandOutboxDelivery::deliver(const OutboxCommand& c, const std::string& l
 
     // 5. A systemic transient gate/directory failure — a degraded containment
     //    read, OR (WS-4 4.2b Task D) a degraded gateway routing-directory read
-    //    (`route_unreadable`) — reschedules the WHOLE occurrence with back-off,
+    //    (`route_unreadable`), OR (#5294) a degraded presence read while a
+    //    per-OS kill switch is OFF (`os_gate_unreadable`; refused before
+    //    targeting, so `sent == 0` with no per-id data) — reschedules the WHOLE occurrence with back-off,
     //    leaving it pending.
     //
     //    Unlike the store consumers of this same flag (deployment_engine's
@@ -325,7 +330,8 @@ void CommandOutboxDelivery::deliver(const OutboxCommand& c, const std::string& l
     //    the double-EXECUTION a fresh command_id would cause. Do NOT "fix" this
     //    to gate on `sent == 0`: that would drop the directory-degraded devices
     //    instead of re-driving them.
-    if (outcome.containment_unreadable || outcome.route_unreadable) {
+    if (outcome.containment_unreadable || outcome.route_unreadable ||
+        outcome.os_gate_unreadable) {
         // The existing unlabeled retry counter keeps firing for EITHER cause
         // (dashboards/alerts already key on it); the cause-labeled counter is
         // additive so a route-store degradation is separately countable
@@ -335,12 +341,14 @@ void CommandOutboxDelivery::deliver(const OutboxCommand& c, const std::string& l
             d_.metrics
                 ->counter("yuzu_server_command_outbox_deliver_retry_cause_total",
                          {{"cause", outcome.containment_unreadable ? "containment_unreadable"
-                                                                  : "route_unreadable"}})
+                                    : outcome.route_unreadable        ? "route_unreadable"
+                                                                      : "os_gate_unreadable"}})
                 .increment();
         spdlog::warn("command_outbox_delivery: occurrence '{}' {} — rescheduling",
                      c.occurrence_id,
                      outcome.containment_unreadable ? "containment unreadable"
-                                                    : "gateway route directory unreadable");
+                     : outcome.route_unreadable     ? "gateway route directory unreadable"
+                                                    : "agent presence unreadable (per-OS kill switch set)");
         (void)d_.outbox->reschedule(c.occurrence_id, lock_name, epoch, d_.retry_backoff);
         return;
     }

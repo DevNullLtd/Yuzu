@@ -130,10 +130,12 @@ bool OfflineEndpointStore::upsert(std::string_view agent_id, std::string_view ho
     }
     // Single-statement autocommit upsert; RETURNING carries the result in the
     // step status (no sqlite3_changes()-style mutate-and-count race, #1033).
-    // agent_version/arch: a blank incoming value preserves the existing column
-    // (CASE ... THEN endpoints.x) — see the header doc comment — while
-    // hostname/os/last_heartbeat_ms/agent_ts stay an unconditional EXCLUDED
-    // write (pre-v2 behaviour, unchanged). session_id (HA WS-5) is likewise
+    // agent_version/arch/os: a blank incoming value preserves the existing
+    // column (CASE ... THEN endpoints.x) — see the header doc comment — while
+    // hostname/last_heartbeat_ms/agent_ts stay an unconditional EXCLUDED
+    // write (pre-v2 behaviour, unchanged). os blank-preserves (#5294): the
+    // per-OS kill-switch filter reads it for remote ids, and a heartbeat that
+    // missed the session lookup must not erase a known OS. session_id (HA WS-5) is likewise
     // unconditional EXCLUDED — an empty incoming value (a heartbeat that raced
     // session lookup, same race the agent_version/arch blank-preserve comment
     // above describes) blanking a previously-known session_id is harmless:
@@ -150,7 +152,8 @@ bool OfflineEndpointStore::upsert(std::string_view agent_id, std::string_view ho
         "last_seen_at) "
         "VALUES ($1, $2, $3, $4::bigint, $5::bigint, $6, $7, $8, now()) "
         "ON CONFLICT (agent_id) DO UPDATE SET "
-        "  hostname = EXCLUDED.hostname, os = EXCLUDED.os, "
+        "  hostname = EXCLUDED.hostname, "
+        "  os = CASE WHEN EXCLUDED.os = '' THEN endpoints.os ELSE EXCLUDED.os END, "
         "  last_heartbeat_ms = EXCLUDED.last_heartbeat_ms, agent_ts = EXCLUDED.agent_ts, "
         "  agent_version = CASE WHEN EXCLUDED.agent_version = '' THEN endpoints.agent_version "
         "                       ELSE EXCLUDED.agent_version END, "

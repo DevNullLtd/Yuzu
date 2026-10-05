@@ -6,7 +6,8 @@
 %%%
 %%% - Register: proxied upstream to C++ server
 %%% - Subscribe: terminated locally, one yuzu_gw_agent process spawned
-%%% - Heartbeat: buffered for batch upstream delivery
+%%% - Heartbeat: admitted per session and connection, then buffered for
+%%%   batch upstream delivery
 %%% - ReportInventory: proxied upstream
 %%% - ExecuteCommand: not used (Subscribe is the primary channel)
 %%%
@@ -48,16 +49,18 @@ register(Ctx, RegisterReq) ->
             %% Store pending registration for Subscribe matching.
             %% register_req is the verbatim RegisterRequest; it is carried
             %% through to the agent process so the registry can stash it
-            %% for upstream-reconnect replay.
+            %% for upstream-reconnect replay. conn_key is the connection
+            %% this Register arrived on: until Subscribe is admitted, a
+            %% heartbeat for the pending session is admitted only on it.
             yuzu_gw_registry:store_pending(SessionId,
                                 #{agent_id  => AgentId,
                                   agent_info => AgentInfo,
                                   register_req => RegisterReq,
                                   peer_addr  => PeerAddr,
+                                  conn_key   => yuzu_gw_conn:key_from_ctx(Ctx),
                                   registered_at => erlang:system_time(millisecond)}),
 
-            logger:info("Agent ~s registered (session=~s), awaiting Subscribe",
-                        [AgentId, SessionId]),
+            logger:info("Agent ~s registered, awaiting Subscribe", [AgentId]),
             {ok, Response, Ctx};
 
         {error, Reason} ->
@@ -108,12 +111,16 @@ subscribe(Ref, State) ->
                     %% Spawn the agent process — it owns this stream.
                     %% We pass stream_pid=self() so the agent process sends
                     %% commands back to us via {send_command, Cmd} messages.
+                    %% conn_key is the connection carrying THIS Subscribe
+                    %% stream: the session is bound to it for the life of
+                    %% the agent process (heartbeat admission).
                     Args = #{agent_id     => AgentId,
                              session_id   => SessionId,
                              stream_pid   => self(),
                              agent_info   => AgentInfo,
                              register_req => RegisterReq,
-                             peer_addr    => PeerAddr},
+                             peer_addr    => PeerAddr,
+                             conn_key     => yuzu_gw_conn:key_from_stream(State)},
 
                     case yuzu_gw_agent_sup:start_agent(Args) of
                         {ok, AgentPid} ->
@@ -189,16 +196,29 @@ check_backpressure() ->
 %% Heartbeat — buffer for batch upstream delivery
 %%--------------------------------------------------------------------
 
+%% Admitted only for a session this node holds, on the connection that
+%% opened it (see yuzu_gw_heartbeat_admission). Every rejection is the same
+%% NOT_FOUND "unknown session" the agent already recovers from by
+%% re-registering; a rejected heartbeat is never queued.
 heartbeat(Ctx, HeartbeatReq) ->
-    yuzu_gw_heartbeat_buffer:queue_heartbeat(HeartbeatReq),
+    SessionId = case is_map(HeartbeatReq) of
+        true  -> maps:get(session_id, HeartbeatReq, undefined);
+        false -> undefined
+    end,
+    case yuzu_gw_heartbeat_admission:admit(Ctx, SessionId) of
+        ok ->
+            yuzu_gw_heartbeat_buffer:queue_heartbeat(HeartbeatReq),
 
-    %% Respond immediately — the agent doesn't need to wait for upstream ack.
-    Response = #{
-        acknowledged => true,
-        server_time  => #{millis_epoch => erlang:system_time(millisecond)},
-        pending_commands => []
-    },
-    {ok, Response, Ctx}.
+            %% Respond immediately — the agent doesn't need to wait for upstream ack.
+            Response = #{
+                acknowledged => true,
+                server_time  => #{millis_epoch => erlang:system_time(millisecond)},
+                pending_commands => []
+            },
+            {ok, Response, Ctx};
+        rejected ->
+            {grpc_error, {?GRPC_STATUS_NOT_FOUND, <<"unknown session">>}}
+    end.
 
 %%--------------------------------------------------------------------
 %% ExecuteCommand — not used (Subscribe is the primary channel)

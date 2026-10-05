@@ -16,6 +16,8 @@
          error/2,
          ctx/1,
          ctx/2,
+         connection_pid/1,
+         connection_pid_from_ctx/1,
          handle_streams/2,
          handle_call/2,
          handle_info/2]).
@@ -211,6 +213,24 @@ handle_streams(Ref, State=#state{full_method=FullMethod,
 
 on_send_push_promise(_, State) ->
     {ok, State}.
+
+%% YUZU PATCH (heartbeat connection binding): typed accessors for the pid of
+%% the HTTP/2 connection process that carries this stream. The stream state
+%% record is private to this module, so a caller cannot read the connection
+%% out of it directly. Every stream of one connection reports the same pid;
+%% streams of different connections report different pids. See YUZU_PATCH.md.
+-spec connection_pid(t()) -> pid().
+connection_pid(#state{connection=Conn}) ->
+    h2_stream_set:connection(Conn).
+
+%% Same, from the ctx a unary handler receives. `undefined' when the ctx does
+%% not carry a stream (for example `ctx:background()').
+-spec connection_pid_from_ctx(ctx:t()) -> pid() | undefined.
+connection_pid_from_ctx(Ctx) ->
+    case ctx:get(Ctx, ctx_stream_key, undefined) of
+        State=#state{} -> connection_pid(State);
+        _ -> undefined
+    end.
 
 ctx_with_stream(Ctx, Stream) ->
     ctx:set(Ctx, ctx_stream_key, Stream).

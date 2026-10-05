@@ -1,0 +1,36 @@
+host: this-Mac (Apple Silicon, macOS 26.x), the developer's workstation on a home LAN with a Tailscale client (six utun interfaces)
+identity: the logged-in user (uid 501) — NET_RT_DUMP needs no privilege
+command: sysctl mib {CTL_NET, PF_ROUTE, 0, 0 (all families), NET_RT_DUMP, 0} via python ctypes, size probe then fill; the raw blob is rtm_version 5 messages, 142 of them (79 IPv4 + 63 IPv6)
+date: 2026-10-03
+status: REAL CAPTURE, TRIMMED AND ANONYMISED. The committed blob is 38 of the 142 messages (6,448 of 22,760 bytes), byte-for-byte as the kernel sent them except the address rewrites below. Kept: every one of the 29 routes that survive the decoder's filter, plus the first real sample of each category the decoder must skip: RTF_LLINFO neighbour entries (incl. one per family whose gateway is an AF_LINK sockaddr_dl carrying a 6-byte lladdr), an RTF_WASCLONED cloned host route, an RTF_MULTICAST route per family, an RTF_LOCAL own-address route, and an RTF_LLINFO|RTF_LOCAL ::1.
+anonymisation (same-size, in-place rewrites of every NON-netmask sockaddr in the kept messages — destination, gateway, interface address; netmasks are raw bits and untouched):
+  - 192.168.0.x            -> 192.0.2.x          (RFC 5737 TEST-NET-1, host octet kept, so every /24, /32 mask still matches)
+  - 100.109.177.77         -> 100.64.0.77        (the Tailscale node address; still inside the CGNAT 100.64/10 range)
+  - one public IPv4 host (a cloned route's destination) -> 198.51.100.151 (RFC 5737 TEST-NET-2)
+  - every sockaddr_dl lladdr (neighbour MACs) -> 00:00:5e:00:53:NN (RFC 7042 documentation range)
+  - every fe80::/10 interface identifier except ::/::1 -> 0200:5eff:fe00:53NN (EUI-64 of the RFC 7042 range); the KAME embedded scope id in bytes 2-3 and sin6_scope_id are KEPT, they are what the decoder must handle
+  - the node part of the Tailscale ULA fd7a:115c:a1e0::/48 -> ::77 (the /48 prefix and ::53 MagicDNS are Tailscale-wide public constants and are kept)
+  - kept unchanged because they are standard well-known values: 0.0.0.0, 127/8, 169.254/16 and 169.254.169.254, 224/4 and ff00::/8, 255.255.255.255, 100.64/10, 100.100.100.100 (Tailscale MagicDNS)
+  Interface NAMES (lo0, en0, utun0..6) are generic and kept. The ifindex -> name map the test uses is the capture host's own `socket.if_nameindex()`: lo0=1, en0=7, utun0=19, utun1=20, utun2=21, utun3=22, utun4=23, utun5=24, utun6=25.
+validation done BEFORE anonymisation, on the full 142-message blob: an independent Python decode of the blob (rt_msghdr + sockaddr walk, written separately from the C++ decoder) was cross-checked against `netstat -rnW -f inet` and `-f inet6` captured immediately after: the (flag letters, interface) multiset matched for every route, and the only differences were the 48 transient RTF_WASCLONED host routes the dump held and netstat did not list, plus netstat omitting the RTF_LOCAL / RTF_NOIFREF letters it has no column for. The 29 expected rows in test_network_config_routes.cpp were then hand-checked against that netstat output line by line (destination, gateway kind, interface, flags). The unanonymised blob and netstat text are not committed: they carry the host's real LAN addresses, Tailscale node address and neighbour MACs.
+ground truth for the 29 kept routes, as `netstat -rnW` rendered them, with the anonymisation applied (Destination / Gateway / Flags / Netif; `link#N` = on-link, an AF_LINK gateway):
+  Internet:
+  default            192.0.2.1         UGScg   en0
+  default            link#25           UCSIg   utun6
+  100.64/10          link#25           UCS     utun6
+  100.100.100.100/32 link#25           UCS     utun6
+  127                127.0.0.1         UCS     lo0
+  169.254            link#7            UCS     en0
+  192.0.2            link#7            UCS     en0
+  192.0.2.1/32       link#7            UCS     en0
+  192.0.2.66/32      link#7            UCS     en0
+  255.255.255.255/32 link#7            UCS     en0
+  255.255.255.255/32 link#25           UCSI    utun6
+  Internet6:
+  default            fe80::%utun0      UGcIg   utun0      (and utun1..utun5 alike)
+  default            fd7a:115c:a1e0::  UGcIg   utun6
+  fd7a:115c:a1e0::/48  fe80::<iid>%utun6  Uc   utun6
+  fd7a:115c:a1e0::53/128 link#25       UCS     utun6
+  fe80::%lo0/64      fe80::1%lo0       UcI     lo0
+  fe80::%en0/64      link#7            UCI     en0
+  fe80::%utun0/64    fe80::<iid>%utun0 UcI     utun0      (and utun1..utun6 alike)

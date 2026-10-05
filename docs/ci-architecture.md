@@ -534,11 +534,15 @@ of reading as NOT TESTED.
 | `yuzu-weetam-windows-{0..3}` | Wee Tam 9970X native Windows 11 — 4 CCD-pinned runners, shared label `yuzu-weetam-windows` | **all self-hosted Windows**: ci.yml `windows`, nightly `windows-asan`, codeql Windows leg, release `build-windows`, instructions-windows-validate, cache-prune-windows. Provisioned from [`deploy/windows/`](../deploy/windows/README.md). |
 | `yuzu-bigmags-macos-{0,1}` | BigMags Mac Mini (Apple M4 Pro, 24 GiB, macOS 26) — 2 runners as headless LaunchDaemons, shared label `yuzu-bigmags-macos` | **self-hosted macOS**: ci.yml `macos` matrix + `release.yml` build-macos. Only pre-release `install-macos` stays GitHub-hosted (`macos-14`, an install-to-root smoke test). Release **signing/notarization is deferred** — macOS releases currently ship UNSIGNED (Phase B = on-token `rcodesign`). Provisioned from [`deploy/macos/`](../deploy/macos/README.md). |
 
-**Retired 2026-06-21:** `yuzu-wsl2-linux` (Shulgi WSL2 Ubuntu 24.04, label
+**Retired 2026-06-21** (removed from the inventory afterwards): `yuzu-wsl2-linux` (Shulgi WSL2 Ubuntu 24.04, label
 `yuzu-shulgi`) and `yuzu-local-windows` (Shulgi native Windows) — superseded by
-Big Tam and Wee Tam. Remove them from `.github/runner-inventory.json` to silence
-the inventory sentinel. `proto-compat` and `cache-prune-linux` use the bare
-`[self-hosted, Linux, X64]` label (no compiler), so they resolve to Big Tam.
+Big Tam and Wee Tam, and removed from `.github/runner-inventory.json`.
+`proto-compat` and `cache-prune-linux` are pinned to `yuzu-bigtam-linux`; they
+previously used the bare `[self-hosted, Linux, X64]` label, which Shulgi's WSL2
+runner also carried, so they could land there instead of on Big Tam. The runners
+were deregistered on the GitHub side on 2026-10-03 (per the repo admin). With the pin, `proto-compat` queues (it does not fail) while all four
+Big Tam slots are busy. When no Big Tam runner is online, the preflight job
+fails (required pool `bigtam`) and `proto-compat` is skipped.
 
 ### Ubuntu 26.04 migration (Big Tam) — COMPLETE
 
@@ -1100,9 +1104,9 @@ a runner for a concurrently-queued PR job. Fix: `ci.yml`'s Linux job's
 concurrently, leaving at least one Big Tam runner unclaimed by it — a no-op
 on `pull_request` events (already a single-leg matrix via the existing
 `exclude`). This is a mitigation, not a guarantee: the freed runner is not
-reserved for any specific job. `proto-compat` (this same workflow) targets
-the bare `[self-hosted, Linux, X64]` label every Big Tam Linux runner also
-carries and runs on the same push trigger — it can claim the freed runner
+reserved for any specific job. `proto-compat` (this same workflow) is pinned
+to the same `yuzu-bigtam-linux` label, so it draws on the same four runners,
+and runs on the same push trigger — it can claim the freed runner
 itself before a queued PR job does (its own `timeout-minutes: 5` means it
 self-frees quickly, but it is a real same-push competitor, not just the
 already-named nightly-overlap case). A stacked nightly run, another
@@ -1258,6 +1262,21 @@ NOT yet wired into the `macos` job (Phase 4 to-do), so the DB queries above have
 no macOS data yet. `release.yml` build-macos is now self-hosted on BigMags too (unsigned —
 signing/notarization deferred to Phase B). Only the `pre-release.yml`
 `install-macos` smoke test stays GitHub-hosted (`macos-14`, ephemeral).
+
+The macOS job installs Erlang/OTP 28 + rebar3 per run via `erlef/setup-beam`
+(`ImageOS: macos26`), the same pin as the Linux leg, so the gateway is built and its
+eunit/ct suites run on macOS too. Before #4841 it had no Erlang and Meson silently
+skipped the gateway.
+
+Every CI leg that runs tests (ci.yml Linux/Windows/macOS, nightly asan/tsan/coverage/windows-asan, sanitizer-tests asan/tsan, and the dispatch-only
+`fork-dynamic-review.yml` Linux leg, which installs Erlang the same way) now runs
+`scripts/ci/assert-gateway-tests.py <builddir>` straight after configure (`meson setup`, or `scripts/setup.sh` in the fork review leg), so a missing `rebar3` (gateway tests not registered)
+fails the Configure step rather than skipping. It is deliberately a post-configure check, not the `-Drequire_gateway` project
+option: a non-default project option stored in these persistent, branch-shared build dirs makes every older branch's
+`meson setup --reconfigure` fail with `Unknown options` (measured, #4851). `tests/test_gateway_test_summary.py` pins that
+every such `meson setup` is followed by the check, that none passes `-Drequire_gateway`, and (by globbing
+every `.github/workflows/*.yml`, so a new or renamed workflow is covered) that every job running `meson test` or `flake-retry.py`
+has the check at or before its first test step.
 
 Inventory declared in `.github/runner-inventory.json`. The sentinel at
 `runner-inventory-sentinel.yml` (every 30 min) compares actual to expected
@@ -1631,7 +1650,8 @@ it widens shards A and B, and a mistyped tag is no longer loud. Run the binary
 directly for a targeted run (`build-*/tests/yuzu_agent_tests '[tag]'`, see
 `docs/build-guide.md` "Direct binary invocation"). Repro (2026-10-01, Linux
 `build-linux/tests/yuzu_agent_tests`, `<shard spec> '[nonexistent_zzz]'
---list-tests --allow-running-no-tests`): shard A lists 319 cases, B 437, C 0.
+--list-tests --allow-running-no-tests`): shard A lists 319 cases, B 437, C 0 (B's count changed in
+the 2026-10-04 re-balance; A's did not).
 Every CI leg selects the shards by `--suite agent` (ci.yml Linux step and Windows step,
 nightly.yml windows-asan) or runs `meson test` unfiltered (macOS, nightly and
 sanitizer legs); none selects the old entry name. `agent tsan-heavy checkpoints`

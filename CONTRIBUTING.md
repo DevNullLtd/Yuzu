@@ -84,9 +84,9 @@ on a single change.
 
 The gateway (`gateway/`) is a standalone rebar3 project using Erlang/OTP. See `docs/erlang-gateway-blueprint.md` for the architecture.
 
-- Run EUnit tests: `cd gateway && rebar3 eunit`
-- Run Common Test: `cd gateway && rebar3 ct --dir apps/yuzu_gw/test`
-- Always pass `--dir apps/yuzu_gw/test` with `--suite` flags
+- Run EUnit tests: `cd gateway && rebar3 eunit --dir apps/yuzu_gw/test` (bare `rebar3 eunit` rejects the test modules that have no `src/` counterpart, #337)
+- Run Common Test: `cd gateway && rebar3 ct --dir apps/yuzu_gw/test/ct`
+- For a single CT suite, keep `--dir apps/yuzu_gw/test/ct` and add `--suite <name>`. `ct` does not recurse, so `--dir apps/yuzu_gw/test` finds no suites and passes having run nothing (#4800)
 - Review all Erlang changes with the gateway-erlang agent (`.claude/agents/gateway-erlang.md`)
 
 ## MCP Server

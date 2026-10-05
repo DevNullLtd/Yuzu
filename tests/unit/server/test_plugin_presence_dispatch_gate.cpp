@@ -418,8 +418,10 @@ TEST_CASE("BR-009: ids_missing_plugin against the canonical wire plugin name "
         .risk_tier = yuzu::server::authz::RiskTier::Medium,
         .system_reserved = false,
     };
-    std::function<bool(std::string_view, std::string_view)> switch_on =
-        [](std::string_view, std::string_view) { return true; };
+    yuzu::server::detail::KillSwitchFn switch_on =
+        [](std::string_view, std::string_view) {
+            return std::optional<std::unordered_set<std::string>>{std::unordered_set<std::string>{}};
+        };
 
     // A real caller dispatching with different-cased spelling — classify() is
     // case-insensitive, so this is authorized against kTarPurgeCap exactly

@@ -487,8 +487,8 @@
   },
   "version": "1.0.0",
   "where_the_data_goes": [
-    "**Instruction result.** Rows travel over the agent's mTLS gRPC channel as the command response and land in the ResponseStore, queryable at `/api/responses/{id}`. Both actions are gathered definitions (`crossplatform.software.package_managers` and `crossplatform.software.package_manager_packages`, 300s TTL).",
-    "**Not consumed by** daily-sync, TAR, DEX, or metrics.",
+    "**Instruction result AND daily-sync inventory.** Rows travel over the agent's mTLS gRPC channel as the command response and land in the ResponseStore, queryable at `/api/responses/{id}`. Both actions are gathered definitions (`crossplatform.software.package_managers` and `crossplatform.software.package_manager_packages`, 300s TTL).",
+    "**Also consumed by** the `installed_software` daily-sync source (`agents/core/src/sync_source_installed_software.cpp`), which calls both actions in-process on the agent's 24 h schedule: `packages` rows become `pkg` (formula) / `app` (cask) rows with ecosystem `brew`, and `managers` becomes one `homebrew` presence row (any other manager name is not mapped). Not consumed by TAR, DEX, or metrics.",
     "**Sensitivity.** Rows name installed software (Homebrew formula and cask names and versions) and the Homebrew prefixes present on the host with their tap, formula and cask counts — a software inventory by another route. No row carries a username, account name or user-profile path.",
     "**Siblings:** `installed_apps` (owns the Linux package roster and the macOS application list, and its `list_per_user` also lists Homebrew formulae per user — see caveat 4 for both overlaps) and `software_actions` (installs and removes software; this plugin only reads)."
   ]
