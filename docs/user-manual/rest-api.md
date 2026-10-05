@@ -6744,7 +6744,7 @@ Results carry a **per-agent scope drop filter** — the `require_fleet_read` gat
 | 400 | `limit` is not a valid integer |
 | 401 | Unauthenticated |
 | 403 | No management-group grant for `Inventory:Read`; or a service-scoped token whose RBAC/ITServiceOwner grant is missing, or whose RBAC enforcement is disabled fleet-wide (a service-scoped token always hard-denies when RBAC is off) |
-| 503 | The gate's own RBAC/tag-store lookup is unavailable or degraded, the software inventory store is unavailable or degraded, or the `require_fleet_read` gate itself is unwired (server misconfiguration) — all A4 envelope with `correlation_id`, `retry_after_ms: 5000` where retryable — **never an empty 200** |
+| 503 | The gate's own RBAC/tag-store lookup is unavailable or degraded (including a failed read of the `ITServiceOwner` ceiling for a service-scoped token), the software inventory store is unavailable or degraded, or the `require_fleet_read` gate itself is unwired (server misconfiguration) — all A4 envelope with `correlation_id`, `retry_after_ms: 5000` where retryable — **never an empty 200** |
 
 On a `503` the store (or the confinement check itself) could not be read; do **not** treat it as "not installed anywhere" (ADR-0016 §7 authoritative reads). A genuine empty result is `200` with `count: 0`.
 

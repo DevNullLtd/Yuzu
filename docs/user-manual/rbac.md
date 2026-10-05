@@ -186,6 +186,16 @@ Recommended order for a fresh install:
 > show zero rows after an upgrade or restart, check for `RbacStore` open/migrate
 > errors first.)
 >
+> **Service-scoped tokens and `ITServiceOwner` (the fleet-read authority ceiling, #3526).** Every fleet-read route
+> now applies the `ITServiceOwner` authority ceiling on a service token, so revoking a `Read` pair from
+> `ITServiceOwner` (for example `Execution:Read`) refuses service-scoped tokens on every fleet-read route for
+> that pair, whatever their minter holds; non-service callers are unaffected. A
+> definitive deny is `403`; a FAILED permission read on the fleet-read gate is a
+> retryable `503` (`retry_after_ms` 5000), while `require_permission` and
+> `require_scoped_permission` keep answering `403` for the same failure. `ITServiceOwner`
+> does not hold `Enrollment:Read`, so a service-scoped token is refused with `403` on
+> `GET /api/v1/enrollment/pending-agents`.
+>
 > **Note (#1634):** the per-agent filter on `query_responses`/`aggregate_responses`/the
 > REST visualization+responses endpoints is, under *normal* RBAC operation, currently
 > **inert** — a holder of global `Response:Read` sees all agents' responses;
@@ -228,7 +238,7 @@ admitted; the floor never overrides a live RBAC grant.)
 | `AccessReview:Read` | The fleet-wide access-review grant export (SOC 2 CC6.2 evidence), `GET /api/v1/access-reviews*`, and the lighter-weight live grant-table listing `GET /api/v1/rbac/roles/assignments` (+ MCP `list_rbac_role_assignments`) — same securable, same sensitivity class, not a management-group-confined view |
 | `UserManagement:Read` | `GET /api/v1/rbac/roles` and the rest of the RBAC role graph |
 | `EnginePrincipal:Read` | The engine-principal inventory and grant graph, `GET /api/v1/engine-principals*` and the `list_engine_principals`/`get_engine_principal`/`list_engine_roles` MCP tools |
-| `Enrollment:Read` (#4031) | Auto-approve enrollment rules and pending-agent visibility, `GET /api/v1/enrollment/auto-approve-rules` and `GET /api/v1/enrollment/pending-agents` |
+| `Enrollment:Read` (#4031) | Auto-approve enrollment rules and pending-agent visibility, `GET /api/v1/enrollment/auto-approve-rules` and `GET /api/v1/enrollment/pending-agents` (service-scoped tokens are refused with `403` on both: the `ITServiceOwner` ceiling does not hold this pair) |
 | `OidcConfig:Read` (#4031) | OIDC SSO configuration status, `GET /api/v1/settings/oidc` |
 | `TlsConfig:Read` (#4028) | TLS settings read-twins, `GET /api/v1/settings/tls` and `GET /api/v1/settings/https` |
 | `PluginSigning:Read` (#4028) | Plugin trust-bundle distribution, `GET /api/v2/agent/plugin-policy` (#4144 — there is deliberately no `/api/v1/settings/plugin-signing` route; the v1 predecessor stayed on `require_admin`) |
@@ -271,7 +281,9 @@ non-admin session to reach authorization topology while RBAC is off:
   and grant `Enrollment:Read` — no built-in non-admin role holds it
   (`Administrator` only; unlike `EnginePrincipal`/`Directory`, `Viewer`
   deliberately does not, since these surfaces gate the fleet's enrollment
-  admission policy).
+  admission policy). A service-scoped token is refused (`403`) on these
+  routes whoever minted it, because `ITServiceOwner` does not hold the pair
+  (the authority ceiling); use an Administrator-minted non-service token.
 - For the OIDC SSO config status read: enable RBAC and grant
   `OidcConfig:Read` — `Administrator`-only for the same reason.
 

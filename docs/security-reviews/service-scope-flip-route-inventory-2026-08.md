@@ -124,3 +124,16 @@ scope** — `rest_api_v1.cpp`'s 74 `auth_fn` call sites and `mcp_server.cpp`'s
 tar_tree) were not re-swept here; they already carry `deny_service_scoped_*`/
 `token_scope_service` handling from prior PRs in this saga (found by
 compliance-officer, Gate 6) and are not re-verified by this document.
+
+## Update (#3526): `require_fleet_read` now applies the `ITServiceOwner` ceiling on its service axis
+
+This inventory covers gate-less routes. `require_fleet_read` is not one, but its service-scoped
+branch used to admit a token on the minter's grant plus the tag meet alone, without asking whether
+the `ITServiceOwner` role itself holds the pair the way `require_permission` does. It now applies
+that ceiling for every route on the chokepoint (see `docs/auth-architecture.md`, "`require_fleet_read`
+now applies the `ITServiceOwner` authority ceiling"); `kServiceScopeGlobalSafe` is still not applied or
+widened there. With the seeded defaults the service-token behaviour of the routes on the gate is
+unchanged (`ITServiceOwner` holds the pairs they pass); `Enrollment:Read` (not held by
+`ITServiceOwner`) is the one seeded pair whose service-token behaviour changes (now `403`).
+
+`GET /api/v1/enrollment/pending-agents` (`Enrollment:Read`, `require_fleet_read`): with the `ITServiceOwner` ceiling now applied on that gate, a service-scoped token is `403` again under the seeded defaults (`ITServiceOwner` does not hold `Enrollment:Read`), which restores the answer the route gave before its migration onto the fleet-read gate; the narrowed view a service token received in between was a side effect of that migration, not a decision. Accepted as a documented Breaking change; the seed is deliberately not widened (`test_authz_gates.cpp`, "Enrollment:Read under seeded defaults").
