@@ -35,6 +35,7 @@
 #include "guardian_backend.hpp" // GuardianBackend, guardian_backend_from_state/label (F7)
 #include "guardian_convergence_scheduler.hpp"
 #include "guardian_drift_event.hpp" // apply_drift_to_event (shared with the spark path)
+#include "guardian_health_heartbeat.hpp" // GuardianHealthStats, guardian_spark_claim_health_stats (#5404)
 #include "guardian_detached_worker_role.hpp" // rung 9c R5.1: executor workers
 #include "guardian_joined_thread_role.hpp"
 #include "guardian_journal_heartbeat.hpp" // GuardianJournalStats (item 7 PR-Ag §8)
@@ -1285,6 +1286,17 @@ GuardianEngine::oldest_pending_disarm_age_seconds(std::chrono::steady_clock::tim
         return std::nullopt;
     // The runtime clamps a `now` that predates the claim to zero, so this is never negative.
     return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::seconds>(*age).count());
+}
+
+GuardianHealthStats GuardianEngine::spark_claim_health_stats() const { // #5404
+    GuardianHealthStats s;
+    {
+        std::lock_guard lock(mtx_);
+        if (spark_runtime_)
+            s = guardian_spark_claim_health_stats(*spark_runtime_);
+    }
+    s.ack_maint_exceptions = ack_maint_exceptions();
+    return s;
 }
 
 std::map<SparkType, std::uint64_t> GuardianEngine::unsupported_counts_by_type() const {

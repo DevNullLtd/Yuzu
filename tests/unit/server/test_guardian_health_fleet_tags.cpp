@@ -3,7 +3,8 @@
  * contract (#2298 gate 3, item 6d; #2993 added the 4th counter; #4783 commit 4 added
  * the 5th/6th - legacy-sink loss visibility, same shape, unrelated feature; a #4783
  * governance follow-up added the 7th - the pre-network-arm legacy-sink drop, wired to
- * fleet visibility for the first time).
+ * fleet visibility for the first time; #5403 added the 8th, #5404 the 9th to 19th - the Spark
+ * claim-lifecycle counters and the retained-tombstone count).
  *
  * Mirrors test_guardian_journal_fleet_tags.cpp's four-way bind for the health family
  * (the counter table is plain sparse cumulative counters; the #5403 pending-Disarm age is
@@ -73,6 +74,17 @@ GuardianHealthStats all_nonzero_stats() {
     s.legacy_sink_gap_rules = 6;       // #4783
     s.legacy_sink_dropped_unwired = 7; // #4783 governance follow-up
     s.disarm_deadline_elapsed = 8;     // #5403
+    s.orphan_disarms_started = 9;          // #5404
+    s.dead_watchers_erased_on_lost = 10;   // #5404
+    s.tombstones_released_by_reaper = 11;  // #5404
+    s.claim_index_release_failures = 12;   // #5404
+    s.claim_drain_failures = 13;           // #5404
+    s.retained_tombstones = 14;            // #5404
+    s.detach_sweep_left_residue = 15;      // #5404
+    s.detach_claim_failures = 16;          // #5404
+    s.detach_post_commit_failures = 17;    // #5404
+    s.claims_dropped_at_stop = 18;         // #5404
+    s.ack_maint_exceptions = 19;           // #5404
     return s;
 }
 
@@ -110,6 +122,17 @@ TEST_CASE("guardian health: agent emit keys bind exactly to the server table",
         {"yuzu.guardian_legacy_sink_gap_rules", "6"},      // #4783
         {"yuzu.guardian_legacy_sink_dropped_unwired", "7"}, // #4783 governance follow-up
         {"yuzu.guardian_disarm_deadline_elapsed", "8"},     // #5403
+        {"yuzu.guardian_orphan_disarms_started", "9"},         // #5404
+        {"yuzu.guardian_dead_watchers_erased_on_lost", "10"},  // #5404
+        {"yuzu.guardian_tombstones_released_by_reaper", "11"}, // #5404
+        {"yuzu.guardian_claim_index_release_failures", "12"},  // #5404
+        {"yuzu.guardian_claim_drain_failures", "13"},          // #5404
+        {"yuzu.guardian_retained_tombstones", "14"},           // #5404
+        {"yuzu.guardian_detach_sweep_left_residue", "15"},     // #5404
+        {"yuzu.guardian_detach_claim_failures", "16"},         // #5404
+        {"yuzu.guardian_detach_post_commit_failures", "17"},   // #5404
+        {"yuzu.guardian_claims_dropped_at_stop", "18"},        // #5404
+        {"yuzu.guardian_ack_maint_exceptions", "19"},          // #5404
     };
     // Per-key, NOT `CHECK(tags == expected)` - see the guardian-journal pin test's
     // comment for why a whole-map compare hides which key drifted.

@@ -42,10 +42,12 @@
 #include <chrono>
 #include <cmath>
 #include <functional>
+#include <iterator>
 #include <mutex>
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <unordered_map>
 #include <format>
@@ -2420,4 +2422,131 @@ TEST_CASE("REAL AgentHealthStore: Disarm deadline count sums across agents and i
     disarm_beat(none, "q", {});
     none.recompute_metrics(m2, std::chrono::seconds{300});
     CHECK_FALSE(has_unlabelled_series(m2.serialize(), kDisarmElapsedGauge));
+}
+
+// ── #5404: the Spark claim-lifecycle counters and the retained-tombstone count (fleet SUM) ──
+//
+// Driven through the REAL AgentHealthStore, table-driven off the SHIPPED
+// kGuardianHealthMetrics, so a row dropped from or mistyped in the table fails here, and a
+// literal list pins the eleven #5404 gauge names so a one-sided rename on either side is red.
+
+namespace {
+
+struct ClaimRow {
+    const char* tag;
+    const char* gauge;
+};
+
+constexpr ClaimRow kClaimRows[] = {
+    {"yuzu.guardian_orphan_disarms_started", "yuzu_fleet_guardian_orphan_disarms_started"},
+    {"yuzu.guardian_dead_watchers_erased_on_lost",
+     "yuzu_fleet_guardian_dead_watchers_erased_on_lost"},
+    {"yuzu.guardian_tombstones_released_by_reaper",
+     "yuzu_fleet_guardian_tombstones_released_by_reaper"},
+    {"yuzu.guardian_claim_index_release_failures",
+     "yuzu_fleet_guardian_claim_index_release_failures"},
+    {"yuzu.guardian_claim_drain_failures", "yuzu_fleet_guardian_claim_drain_failures"},
+    {"yuzu.guardian_retained_tombstones", "yuzu_fleet_guardian_retained_tombstones"},
+    {"yuzu.guardian_detach_sweep_left_residue", "yuzu_fleet_guardian_detach_sweep_left_residue"},
+    {"yuzu.guardian_detach_claim_failures", "yuzu_fleet_guardian_detach_claim_failures"},
+    {"yuzu.guardian_detach_post_commit_failures",
+     "yuzu_fleet_guardian_detach_post_commit_failures"},
+    {"yuzu.guardian_claims_dropped_at_stop", "yuzu_fleet_guardian_claims_dropped_at_stop"},
+    {"yuzu.guardian_ack_maint_exceptions", "yuzu_fleet_guardian_ack_maint_exceptions"},
+};
+
+bool shipped_table_has(std::string_view tag, std::string_view gauge) {
+    for (const auto& m : yuzu::server::detail::kGuardianHealthMetrics)
+        if (std::string_view(m.tag) == tag && std::string_view(m.gauge) == gauge)
+            return true;
+    return false;
+}
+
+} // namespace
+
+TEST_CASE("REAL AgentHealthStore: every #5404 claim-lifecycle row sums across agents and "
+          "carries its own value",
+          "[guardian][health][rollup][real][claim]") {
+    for (const auto& r : kClaimRows)
+        REQUIRE(shipped_table_has(r.tag, r.gauge)); // the shipped table, not a parallel copy
+
+    yuzu::server::detail::AgentHealthStore store;
+    yuzu::MetricsRegistry metrics;
+    // Row i: agent a1 reports 10+i, agent a2 reports 100*(i+1), so the SUM of every row is
+    // distinct from every other row's and from either addend (a MAX or a swapped row is red).
+    std::vector<std::pair<std::string, std::string>> a1, a2;
+    for (std::size_t i = 0; i < std::size(kClaimRows); ++i) {
+        a1.emplace_back(kClaimRows[i].tag, std::to_string(10 + i));
+        a2.emplace_back(kClaimRows[i].tag, std::to_string(100 * (i + 1)));
+    }
+    disarm_beat(store, "a1", a1);
+    disarm_beat(store, "a2", a2);
+    disarm_beat(store, "quiet", {});
+    store.recompute_metrics(metrics, std::chrono::seconds{300});
+    const std::string out = metrics.serialize();
+    for (std::size_t i = 0; i < std::size(kClaimRows); ++i) {
+        INFO("gauge " << kClaimRows[i].gauge);
+        REQUIRE(has_unlabelled_series(out, kClaimRows[i].gauge));
+        CHECK(unlabelled_series(out, kClaimRows[i].gauge) ==
+              static_cast<double>((10 + i) + 100 * (i + 1)));
+        CHECK(out.find(std::string(kClaimRows[i].gauge) + "{") == std::string::npos); // no labels
+    }
+    // Two reporters of the counter family; the quiet agent is not one.
+    CHECK(unlabelled_series(out, "yuzu_fleet_guardian_health_reporting") == 2.0);
+}
+
+TEST_CASE("REAL AgentHealthStore: #5404 gauges are absent (not 0) when no agent reports, and "
+          "a stale series does not outlive its reporter",
+          "[guardian][health][rollup][real][claim]") {
+    yuzu::server::detail::AgentHealthStore store;
+    yuzu::MetricsRegistry metrics;
+    disarm_beat(store, "quiet", {});
+    store.recompute_metrics(metrics, std::chrono::seconds{300});
+    for (const auto& r : kClaimRows)
+        CHECK_FALSE(has_unlabelled_series(metrics.serialize(), r.gauge));
+
+    // One agent reports a single row; ONLY that gauge appears.
+    disarm_beat(store, "a", {{"yuzu.guardian_retained_tombstones", "4"}});
+    store.recompute_metrics(metrics, std::chrono::seconds{300});
+    std::string out = metrics.serialize();
+    for (const auto& r : kClaimRows) {
+        INFO("gauge " << r.gauge);
+        if (std::string_view(r.tag) == "yuzu.guardian_retained_tombstones")
+            CHECK(unlabelled_series(out, r.gauge) == 4.0);
+        else
+            CHECK_FALSE(has_unlabelled_series(out, r.gauge));
+    }
+
+    // The tombstones are released: the agent stops emitting the tag (sparse 0). The gauge
+    // disappears on the next sweep instead of holding its last value.
+    disarm_beat(store, "a", {});
+    store.recompute_metrics(metrics, std::chrono::seconds{300});
+    CHECK_FALSE(has_unlabelled_series(metrics.serialize(), "yuzu_fleet_guardian_retained_tombstones"));
+}
+
+TEST_CASE("REAL AgentHealthStore: malformed #5404 values are rejected, counted, and never "
+          "throw or reach a gauge",
+          "[guardian][health][rollup][real][claim]") {
+    yuzu::server::detail::AgentHealthStore store;
+    yuzu::MetricsRegistry metrics;
+
+    const std::vector<std::string> bad = {"-5",         "abc",        "1.5",
+                                          "12x",        " 7",         "inf",
+                                          "1000000001", "18446744073709551615",
+                                          std::string(4096, '9')};
+    int n = 0;
+    for (const auto& r : kClaimRows)
+        for (const auto& v : bad)
+            disarm_beat(store, "bad" + std::to_string(n++), {{r.tag, v}});
+
+    REQUIRE_NOTHROW(store.recompute_metrics(metrics, std::chrono::seconds{300}));
+    const std::string out = metrics.serialize();
+    for (const auto& r : kClaimRows) {
+        INFO("gauge " << r.gauge);
+        CHECK_FALSE(has_unlabelled_series(out, r.gauge)); // only malformed reporters: absent
+    }
+    CHECK(unlabelled_series(out, "yuzu_fleet_guardian_health_tag_rejected") ==
+          static_cast<double>(std::size(kClaimRows) * bad.size()));
+    // A malformed value is not a parseable counter tag, so nobody counts as reporting.
+    CHECK(unlabelled_series(out, "yuzu_fleet_guardian_health_reporting") == 0.0);
 }

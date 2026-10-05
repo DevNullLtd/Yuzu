@@ -73,6 +73,7 @@ class GuardianLifecycleJournal;
 struct GuardianJournalStats;
 struct GuardianJournalAgeStats;
 struct GuardianArmStats;
+struct GuardianHealthStats;
 class GuardianStateReader;
 class GuardianSparkEngineBackend;
 class GuardianLegacySinkExecutor;
@@ -347,6 +348,23 @@ public:
     /// registry_mu_, the same order attach_rule/detach_rule already use.
     [[nodiscard]] std::optional<std::uint64_t> oldest_pending_disarm_age_seconds(
         std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now()) const;
+
+    /// #5404 (gate rows P1/P2): the Spark claim-lifecycle values, as a GuardianHealthStats with
+    /// only these fields set (guardian_health_heartbeat.hpp's guardian_spark_claim_health_stats
+    /// holds the runtime-accessor -> field mapping; ack_maint_exceptions is filled here). All
+    /// zero when no runtime is wired (the runtime fields only; ack_maint_exceptions is engine
+    /// state and still counts). Surfaced sparsely through the same emitter as the other health
+    /// counters. `retained_tombstones` is an O(claims) scan under the runtime's registry_mu_
+    /// (taken after mtx_, the order attach_rule/detach_rule already use): heartbeat cadence
+    /// only, never per event.
+    [[nodiscard]] GuardianHealthStats spark_claim_health_stats() const;
+    /// #5404 (P2): throws caught by the ack-bookkeeping maintenance firewall - the heartbeat
+    /// thread's ack drain / generation advance in journal_maintenance_tick, and the content-id
+    /// hash and begin_application preamble in apply_rules. A throw that recurs every tick
+    /// repeats the skip of that tick's remaining ack drain. Lock-free; zero is steady state.
+    [[nodiscard]] std::uint64_t ack_maint_exceptions() const noexcept {
+        return ack_maint_exceptions_.load(std::memory_order_relaxed);
+    }
 
     /// #4783 commit 4: cumulative count of legacy-sink events this engine could not
     /// deliver (RefusedCapacity/RefusedAdmission/WriteFailed/a throwing send — see

@@ -69,6 +69,51 @@ inline constexpr char kGuardianLegacySinkDroppedUnwiredTag[] =
 /// cumulative-counter shape as its siblings above, so the server rolls it up as a fleet SUM.
 inline constexpr char kGuardianDisarmDeadlineElapsedTag[] = "yuzu.guardian_disarm_deadline_elapsed";
 
+/// #5404 (gate rows P1/P2): the Spark claim-lifecycle counters. Every one is sparse (0 omits the
+/// tag), steady-state 0, and rolled up by the server as a plain fleet SUM like its siblings
+/// above; none is gated on prefer_spark (a zero is equally truthful dormant). Nonzero values
+/// mean "inspect", not "an outage": the server HELP text in guardian_health_fleet_tags.hpp is
+/// the operator-facing statement of what each one says and does not say.
+///
+/// GuardianSparkRuntime::orphan_disarms_started(): a ->0 index edge was dropped without a
+/// Disarm and the reaper's orphan pass queued one.
+inline constexpr char kGuardianOrphanDisarmsStartedTag[] = "yuzu.guardian_orphan_disarms_started";
+/// GuardianSparkRuntime::dead_watchers_erased_on_lost(): on_subscription_lost erased a dead
+/// watcher for a key with no rules.
+inline constexpr char kGuardianDeadWatchersErasedOnLostTag[] =
+    "yuzu.guardian_dead_watchers_erased_on_lost";
+/// GuardianSparkRuntime::tombstones_released_by_reaper(): a release that failed earlier and was
+/// recovered by the expiry reaper.
+inline constexpr char kGuardianTombstonesReleasedByReaperTag[] =
+    "yuzu.guardian_tombstones_released_by_reaper";
+/// GuardianSparkRuntime::claim_index_release_failures(): index releases that threw and were
+/// contained (counts release ATTEMPTS, not claims).
+inline constexpr char kGuardianClaimIndexReleaseFailuresTag[] =
+    "yuzu.guardian_claim_index_release_failures";
+/// GuardianSparkRuntime::claim_drain_failures(): completion-drain / parked-arm bookkeeping
+/// steps that threw and were contained.
+inline constexpr char kGuardianClaimDrainFailuresTag[] = "yuzu.guardian_claim_drain_failures";
+/// GuardianSparkRuntime::retained_tombstones(): a CURRENT count (not cumulative) of dead Queued
+/// Arm claims still holding a genuine index mapping. O(claims) under registry_mu_: read at
+/// heartbeat cadence only.
+inline constexpr char kGuardianRetainedTombstonesTag[] = "yuzu.guardian_retained_tombstones";
+/// GuardianSparkRuntime::detach_sweep_left_residue(): the last-on-key detach sweep left the
+/// key's fifo non-empty and took the synchronous residue fallback.
+inline constexpr char kGuardianDetachSweepLeftResidueTag[] =
+    "yuzu.guardian_detach_sweep_left_residue";
+/// GuardianSparkRuntime::detach_claim_failures(): detach could not hand the subscription to a
+/// Disarm claim and took the counted rollback or last resort.
+inline constexpr char kGuardianDetachClaimFailuresTag[] = "yuzu.guardian_detach_claim_failures";
+/// GuardianSparkRuntime::detach_post_commit_failures(): a post-mutation detach step threw and
+/// was contained, including a swallowed inline-type backend disarm throw.
+inline constexpr char kGuardianDetachPostCommitFailuresTag[] =
+    "yuzu.guardian_detach_post_commit_failures";
+/// GuardianSparkRuntime::claims_dropped_at_stop(): claims dropped by shutdown only.
+inline constexpr char kGuardianClaimsDroppedAtStopTag[] = "yuzu.guardian_claims_dropped_at_stop";
+/// GuardianEngine::ack_maint_exceptions(): throws caught by the engine's ack-bookkeeping
+/// maintenance firewall (the heartbeat-thread ack drain and apply_rules' ack preamble).
+inline constexpr char kGuardianAckMaintExceptionsTag[] = "yuzu.guardian_ack_maint_exceptions";
+
 /// #5403: age in whole seconds (floored) of the oldest Spark Disarm claim still pending
 /// (GuardianSparkRuntime::oldest_pending_disarm_age()). NOT a counter: a re-statable age, so
 /// the server rolls it up as the fleet MAX (a sum of ages is meaningless), never as a sum.
@@ -89,6 +134,17 @@ struct GuardianHealthStats {
     std::uint64_t legacy_sink_gap_rules{0};       ///< #4783
     std::uint64_t legacy_sink_dropped_unwired{0}; ///< #4783 governance follow-up
     std::uint64_t disarm_deadline_elapsed{0};     ///< #5403
+    std::uint64_t orphan_disarms_started{0};          ///< #5404 P1
+    std::uint64_t dead_watchers_erased_on_lost{0};    ///< #5404 P1
+    std::uint64_t tombstones_released_by_reaper{0};   ///< #5404 P1
+    std::uint64_t claim_index_release_failures{0};    ///< #5404 P1
+    std::uint64_t claim_drain_failures{0};            ///< #5404 P1
+    std::uint64_t retained_tombstones{0};             ///< #5404 P1 (a current count, not cumulative)
+    std::uint64_t detach_sweep_left_residue{0};       ///< #5404 P1
+    std::uint64_t detach_claim_failures{0};           ///< #5404 P1
+    std::uint64_t detach_post_commit_failures{0};     ///< #5404 P1
+    std::uint64_t claims_dropped_at_stop{0};          ///< #5404 P1
+    std::uint64_t ack_maint_exceptions{0};            ///< #5404 P2
 };
 
 /// Populate `tags` with the (sparse) Guardian health telemetry. `TagMap` is any map with a
@@ -112,6 +168,56 @@ void emit_guardian_health_heartbeat_tags(TagMap& tags, const GuardianHealthStats
             std::to_string(s.legacy_sink_dropped_unwired);
     if (s.disarm_deadline_elapsed != 0)
         tags[kGuardianDisarmDeadlineElapsedTag] = std::to_string(s.disarm_deadline_elapsed);
+    if (s.orphan_disarms_started != 0)
+        tags[kGuardianOrphanDisarmsStartedTag] = std::to_string(s.orphan_disarms_started);
+    if (s.dead_watchers_erased_on_lost != 0)
+        tags[kGuardianDeadWatchersErasedOnLostTag] =
+            std::to_string(s.dead_watchers_erased_on_lost);
+    if (s.tombstones_released_by_reaper != 0)
+        tags[kGuardianTombstonesReleasedByReaperTag] =
+            std::to_string(s.tombstones_released_by_reaper);
+    if (s.claim_index_release_failures != 0)
+        tags[kGuardianClaimIndexReleaseFailuresTag] =
+            std::to_string(s.claim_index_release_failures);
+    if (s.claim_drain_failures != 0)
+        tags[kGuardianClaimDrainFailuresTag] = std::to_string(s.claim_drain_failures);
+    if (s.retained_tombstones != 0)
+        tags[kGuardianRetainedTombstonesTag] = std::to_string(s.retained_tombstones);
+    if (s.detach_sweep_left_residue != 0)
+        tags[kGuardianDetachSweepLeftResidueTag] = std::to_string(s.detach_sweep_left_residue);
+    if (s.detach_claim_failures != 0)
+        tags[kGuardianDetachClaimFailuresTag] = std::to_string(s.detach_claim_failures);
+    if (s.detach_post_commit_failures != 0)
+        tags[kGuardianDetachPostCommitFailuresTag] =
+            std::to_string(s.detach_post_commit_failures);
+    if (s.claims_dropped_at_stop != 0)
+        tags[kGuardianClaimsDroppedAtStopTag] = std::to_string(s.claims_dropped_at_stop);
+    if (s.ack_maint_exceptions != 0)
+        tags[kGuardianAckMaintExceptionsTag] = std::to_string(s.ack_maint_exceptions);
+}
+
+/// #5404 (P1): read the ten GuardianSparkRuntime claim-lifecycle values into a
+/// GuardianHealthStats (every other field stays 0, so emitting it adds only these tags to the
+/// sparse emitter above; ack_maint_exceptions is engine-owned and filled by the engine).
+/// A template over the runtime type so this header stays free of the runtime's includes (the
+/// server-side pin test includes it); the ONE place the runtime accessor -> health field
+/// mapping lives, so a swapped pair is caught by a test of this function.
+/// `retained_tombstones()` is an O(claims) scan under the runtime's registry lock: call at
+/// heartbeat cadence only, never per event.
+template <typename Runtime>
+[[nodiscard]] GuardianHealthStats guardian_spark_claim_health_stats(const Runtime& rt) {
+    GuardianHealthStats s;
+    s.orphan_disarms_started = rt.orphan_disarms_started();
+    s.dead_watchers_erased_on_lost = rt.dead_watchers_erased_on_lost();
+    s.tombstones_released_by_reaper = rt.tombstones_released_by_reaper();
+    s.claim_index_release_failures = rt.claim_index_release_failures();
+    s.claim_drain_failures = rt.claim_drain_failures();
+    s.retained_tombstones = static_cast<std::uint64_t>(rt.retained_tombstones());
+    s.detach_sweep_left_residue = rt.detach_sweep_left_residue();
+    s.detach_claim_failures = rt.detach_claim_failures();
+    s.detach_post_commit_failures = rt.detach_post_commit_failures();
+    s.claims_dropped_at_stop = rt.claims_dropped_at_stop();
+    return s;
 }
 
 /// #5403: populate `tags` with the oldest pending Disarm's age. A SEPARATE emitter from the

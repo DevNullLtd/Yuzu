@@ -881,19 +881,20 @@ public:
     /// #5322: tombstones (dead Queued Arm claims that still hold a genuine index
     /// mapping, index_held && owns()) whose mapping the expiry reaper released and
     /// popped. A non-owner claim or a committed suffix popped by the same pass is not
-    /// counted. Runtime-only, NOT exported on the heartbeat yet (that export is owned
-    /// by #5404). Lock-free.
+    /// counted. Exported on the heartbeat as `yuzu.guardian_tombstones_released_by_reaper`
+    /// (#5404). Lock-free.
     [[nodiscard]] std::uint64_t tombstones_released_by_reaper() const noexcept {
         return tombstones_released_by_reaper_.load(std::memory_order_relaxed);
     }
     /// #5322: orphan-key Disarm claims queued by the reaper's orphan pass (a Disarm claim
     /// was queued and keys_ erased; the backend disarm itself runs later, off-lock).
-    /// Runtime-only, not exported yet. Lock-free.
+    /// Exported on the heartbeat as `yuzu.guardian_orphan_disarms_started` (#5404). Lock-free.
     [[nodiscard]] std::uint64_t orphan_disarms_started() const noexcept {
         return orphan_disarms_started_.load(std::memory_order_relaxed);
     }
     /// #5322: dead watchers erased by on_subscription_lost for a key with no rules.
-    /// Runtime-only, not exported yet. Lock-free.
+    /// Exported on the heartbeat as `yuzu.guardian_dead_watchers_erased_on_lost` (#5404).
+    /// Lock-free.
     [[nodiscard]] std::uint64_t dead_watchers_erased_on_lost() const noexcept {
         return dead_watchers_erased_on_lost_.load(std::memory_order_relaxed);
     }
@@ -1638,8 +1639,8 @@ public:
     /// #5322: retained tombstones - Queued Arm claims that are dead (outcome or
     /// commit_exception set) yet still hold a genuine ghost index mapping
     /// (index_held && index_->owns(key, rule_id, generation)). A live gauge under
-    /// registry_mu_ by scanning claims_; runtime-only, NOT exported on the heartbeat
-    /// yet (tracked in #5404). Diagnostic/test use, not a hot-path read.
+    /// registry_mu_ by scanning claims_; exported on the heartbeat as
+    /// `yuzu.guardian_retained_tombstones` (#5404) once per heartbeat. Not a per-event read.
     [[nodiscard]] std::size_t retained_tombstones() const;
 
     /// #5403: a Disarm pending longer than this is observed once (a counter and a warn).

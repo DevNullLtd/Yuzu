@@ -3160,6 +3160,76 @@ TEST_CASE("#5403: the engine exports a hung Disarm's age and deadline count as h
     CHECK(after.empty());
 }
 
+// #5404 export half, through the REAL GuardianEngine + runtime: the engine's claim-lifecycle
+// snapshot is all-zero on a healthy engine (so the sparse emitter ships NO tag), and a counter
+// the runtime bumps through its own production path reaches the snapshot and the pinned tag.
+// The accessor -> field mapping itself is pinned in test_guardian_health_heartbeat.cpp; this
+// proves the engine reads the wired runtime and forwards it.
+TEST_CASE("#5404: the engine's claim-lifecycle snapshot is silent when healthy and carries a "
+          "runtime counter bumped through the ack-drain tick",
+          "[spark][guardian][reconcile][claim]") {
+    SparkReconcileFixture f;
+    f.apply(make_service_rule("r1")); // a live armed rule: the healthy steady state
+    REQUIRE(f.mechanism->watching_count() == 1);
+
+    {
+        const auto quiet = f.engine->spark_claim_health_stats();
+        CHECK(quiet.orphan_disarms_started == 0);
+        CHECK(quiet.dead_watchers_erased_on_lost == 0);
+        CHECK(quiet.tombstones_released_by_reaper == 0);
+        CHECK(quiet.claim_index_release_failures == 0);
+        CHECK(quiet.claim_drain_failures == 0);
+        CHECK(quiet.retained_tombstones == 0);
+        CHECK(quiet.detach_sweep_left_residue == 0);
+        CHECK(quiet.detach_claim_failures == 0);
+        CHECK(quiet.detach_post_commit_failures == 0);
+        CHECK(quiet.claims_dropped_at_stop == 0);
+        CHECK(quiet.ack_maint_exceptions == 0);
+        CHECK(f.engine->ack_maint_exceptions() == 0);
+        std::map<std::string, std::string> tags;
+        yuzu::agent::emit_guardian_health_heartbeat_tags(tags, quiet);
+        CHECK(tags.empty()); // sparse: a healthy engine reports nothing
+    }
+
+    // The runtime's orphan pass (inside the ack-drain tick's expiry call) throws once at its
+    // top; the runtime contains it and counts it in claim_drain_failures. Nothing else moves.
+    REQUIRE(f.engine->spark_runtime_for_test() != nullptr);
+    f.engine->spark_runtime_for_test()->set_drain_fault_point_for_test(15);
+    f.engine->journal_maintenance_tick();
+    CHECK(f.engine->spark_runtime_for_test()->claim_drain_failures() == 1);
+
+    const auto stats = f.engine->spark_claim_health_stats();
+    CHECK(stats.claim_drain_failures == 1);
+    CHECK(stats.orphan_disarms_started == 0);
+    CHECK(stats.claim_index_release_failures == 0);
+    CHECK(stats.detach_claim_failures == 0);
+    CHECK(stats.ack_maint_exceptions == 0); // the runtime contained it; the ack firewall did not
+    std::map<std::string, std::string> tags;
+    yuzu::agent::emit_guardian_health_heartbeat_tags(tags, stats);
+    REQUIRE(tags.size() == 1);
+    CHECK(tags.at("yuzu.guardian_claim_drain_failures") == "1");
+}
+
+TEST_CASE("#5404: an engine with no Spark runtime wired reports an all-zero claim-lifecycle "
+          "snapshot",
+          "[spark][guardian][reconcile][claim]") {
+    yuzu::test::TempDbFile db{unique_kv_path()};
+    auto opened = KvStore::open(db.path);
+    REQUIRE(opened.has_value());
+    KvStore kv{std::move(*opened)};
+    GuardianEngine engine{&kv, "agent-test", /*prefer_spark=*/false};
+    REQUIRE(engine.start_local().has_value()); // never wire_spark_engine()'d: no runtime
+    CHECK(engine.spark_runtime_for_test() == nullptr);
+    const auto s = engine.spark_claim_health_stats();
+    CHECK(s.claim_drain_failures == 0);
+    CHECK(s.retained_tombstones == 0);
+    CHECK(s.ack_maint_exceptions == 0);
+    std::map<std::string, std::string> tags;
+    yuzu::agent::emit_guardian_health_heartbeat_tags(tags, s);
+    CHECK(tags.empty());
+    engine.stop();
+}
+
 // ---------------------------------------------------------------------------
 // #2233 item 3: the OTHER half of the liveness fix - a genuinely failed (timed
 // out) arm must be COUNTED, so apply_rules' policy_generation hold-on-failure

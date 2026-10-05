@@ -2628,6 +2628,13 @@ public:
                                         // prefer_spark_ (a zero is equally truthful dormant).
                                         .disarm_deadline_elapsed =
                                             guardian_->disarm_deadline_elapsed()});
+                                // #5404: the Spark claim-lifecycle counters and the
+                                // retained-tombstone count. A second emit of the same sparse
+                                // emitter (keys disjoint from the first; zero omits), never
+                                // gated on prefer_spark_. The accessor mapping lives in
+                                // guardian_spark_claim_health_stats (unit-tested).
+                                emit_guardian_health_heartbeat_tags(
+                                    tags, guardian_->spark_claim_health_stats());
                                 // #5403: age of the oldest pending Spark Disarm, in whole
                                 // seconds. An age, not a counter, so it is NOT a field of
                                 // GuardianHealthStats (the server rolls it up as MAX);

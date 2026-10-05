@@ -8,7 +8,8 @@
 /// as an unlabelled fleet sum; a #4783 governance follow-up added the 7th row -
 /// the pre-network-arm legacy-sink drop, previously counted in-process only with
 /// no accessor, no heartbeat tag, and no fleet visibility; #5403 added the 8th row, the
-/// pending-Spark-Disarm deadline count, plus the separate MAX-rollup age table below).
+/// pending-Spark-Disarm deadline count, plus the separate MAX-rollup age table below;
+/// #5404 added rows 9-19, the Spark claim-lifecycle counters and the retained-tombstone count).
 /// Single source of truth for the
 /// `yuzu.guardian_*` heartbeat tag keys this rollup consumes, the
 /// `yuzu_fleet_guardian_*` gauge names they roll up into, their HELP text, and the
@@ -32,9 +33,9 @@
 /// spark and journal pins when that hoist lands - do not let a future two-family sweep
 /// leave this one behind.
 ///
-/// SHAPE: flat and unlabelled. `kGuardianHealthMetrics` is 8 plain sparse cumulative
-/// counters rolled up as a fleet SUM. `kGuardianHealthAgeMetrics` (#5403) is the one
-/// exception: a re-statable AGE rolled up as the fleet MAX, in its own table for the
+/// SHAPE: flat and unlabelled. `kGuardianHealthMetrics` is 19 plain sparse rows (18
+/// cumulative counters and the #5404 retained-tombstone current count) rolled up as a fleet
+/// SUM. `kGuardianHealthAgeMetrics` (#5403) is the one exception: a re-statable AGE rolled up as the fleet MAX, in its own table for the
 /// reasons the journal sibling's age table gives (a sum of ages is meaningless, and
 /// the op lives in the consumer). Name rule, asserted by the pin test, for the counter
 /// table: `gauge` == "yuzu_fleet_" + `tag` with its "yuzu." heartbeat-namespace prefix
@@ -73,7 +74,7 @@ struct GuardianHealthMetric {
 
 /// The full published set. Order matches GuardianHealthStats / the emit order in
 /// agents/core/src/guardian_health_heartbeat.hpp for reviewability; nothing depends on
-/// it. All 8 are exported as `gauge` - a per-sweep recomputed fleet sum, cleared and
+/// it. All 19 are exported as `gauge` - a per-sweep recomputed fleet sum, cleared and
 /// rebuilt, never monotonic.
 ///
 /// ALERTING: THESE ARE MONITOR-ONLY, same posture and same reasons as the guardian
@@ -179,6 +180,95 @@ inline constexpr GuardianHealthMetric kGuardianHealthMetrics[] = {
      "teardown. Cumulative per agent process (resets on restart); the exported fleet sum is "
      "rebuilt every sweep. See yuzu_fleet_guardian_disarm_pending_age_seconds_max for the "
      "age of what is pending now. MONITOR-ONLY, same posture as the rest of this family"},
+    // ---- #5404: the Spark claim-lifecycle counters (gate rows P1/P2) ----
+    // All steady-state 0, sparse (0 omits the tag), summed fleet-wide, MONITOR-ONLY with no
+    // alert rule shipped. Cumulative per agent process (resets on restart) except
+    // retained_tombstones, a current count. Each HELP says what a nonzero value means and
+    // that it means "inspect", not that a fault is proven.
+    {"yuzu.guardian_orphan_disarms_started", "yuzu_fleet_guardian_orphan_disarms_started",
+     "Fleet sum of Spark Disarm claims an agent's expiry reaper queued for an orphan key (#5404). "
+     "Steady state 0. A nonzero value means a ->0 index edge was dropped without a Disarm and "
+     "the reaper recovered it by queuing one. The backend disarm itself runs afterwards and off-lock; this "
+     "counter does not say it completed (see yuzu_fleet_guardian_disarm_pending_age_seconds_max "
+     "and yuzu_fleet_guardian_disarm_deadline_elapsed). Cumulative per agent process (resets on "
+     "restart); the exported fleet sum is rebuilt every sweep. MONITOR-ONLY, same posture as the "
+     "rest of this family"},
+    {"yuzu.guardian_dead_watchers_erased_on_lost",
+     "yuzu_fleet_guardian_dead_watchers_erased_on_lost",
+     "Fleet sum of dead Spark watcher entries erased when the engine reported a subscription "
+     "lost for a key that no rule uses (#5404): the orphan was erased instead of being left for "
+     "the next same-key attach to join. Steady state 0. A nonzero value means an orphaned "
+     "watcher existed, which is itself the symptom to inspect (compare "
+     "yuzu_fleet_guardian_orphan_disarms_started). Cumulative per agent process (resets on "
+     "restart). MONITOR-ONLY, same posture as the rest of this family"},
+    {"yuzu.guardian_tombstones_released_by_reaper",
+     "yuzu_fleet_guardian_tombstones_released_by_reaper",
+     "Fleet sum of retained tombstones (dead Queued Arm claims still holding a genuine index "
+     "mapping) that the expiry reaper released and popped (#5404). Steady state 0. A nonzero "
+     "value records an index release that failed earlier and was recovered later, not an "
+     "outstanding fault; the outstanding ones are yuzu_fleet_guardian_retained_tombstones. "
+     "Cumulative per agent process (resets on restart). MONITOR-ONLY, same posture as the rest "
+     "of this family"},
+    {"yuzu.guardian_claim_index_release_failures",
+     "yuzu_fleet_guardian_claim_index_release_failures",
+     "Fleet sum of Spark claim index releases that threw and were contained (#5404). It counts "
+     "release ATTEMPTS, not claims: a claim whose release keeps failing is counted once per "
+     "attempt, and the claim keeps its index ownership for the next release to retry. Steady "
+     "state 0. A nonzero value means a release failed (the key-copy allocation inside the "
+     "index); see yuzu_fleet_guardian_retained_tombstones for any mapping still held. "
+     "Cumulative per agent process (resets on restart). MONITOR-ONLY, same posture as the rest "
+     "of this family"},
+    {"yuzu.guardian_claim_drain_failures", "yuzu_fleet_guardian_claim_drain_failures",
+     "Fleet sum of Spark claim bookkeeping steps that threw and were contained (#5404): a "
+     "completion-callback drain whose own bookkeeping threw (the firewall published a terminal "
+     "outcome on every claim and dropped the entry), a parked-arm step that failed and left the "
+     "claim a non-terminal Queued head, or a failed orphan pass. Steady state 0. A nonzero value "
+     "means inspect the agent log. Cumulative per agent process (resets on restart). "
+     "MONITOR-ONLY, same posture as the rest of this family"},
+    {"yuzu.guardian_retained_tombstones", "yuzu_fleet_guardian_retained_tombstones",
+     "Fleet sum of retained tombstones (#5404): dead Queued Arm claims that still hold a genuine "
+     "ghost index mapping. A CURRENT "
+     "count (not cumulative); an agent reports it only while it is nonzero, and it falls when "
+     "the expiry reaper or the next sweep releases the claim. Steady state 0. A nonzero value "
+     "that persists across several heartbeats means the release keeps failing; see "
+     "yuzu_fleet_guardian_claim_index_release_failures. Computed by an O(claims) scan once per "
+     "heartbeat. MONITOR-ONLY, same posture as the rest of this family"},
+    {"yuzu.guardian_detach_sweep_left_residue", "yuzu_fleet_guardian_detach_sweep_left_residue",
+     "Fleet sum of Spark detaches whose last-on-key sweep left the key's claim queue non-empty "
+     "(#5404), so the new Disarm claim was not pushed and the real disarm ran through the "
+     "synchronous last-resort fallback instead (the same detach also counts in "
+     "yuzu_fleet_guardian_detach_claim_failures). That fallback is an accepted, counted "
+     "outcome, not a proven fault: it runs the backend disarm while holding the runtime's "
+     "registry lock, which the pending-Disarm age and deadline gauges do not see. Steady state "
+     "0 outside a failing index release. Cumulative per agent process (resets on restart). "
+     "MONITOR-ONLY, same posture as the rest of this family"},
+    {"yuzu.guardian_detach_claim_failures", "yuzu_fleet_guardian_detach_claim_failures",
+     "Fleet sum of Spark detaches that could not hand the subscription to a Disarm claim and "
+     "took the counted rollback or last resort (#5404): a throw inside the index release after "
+     "the claim was pushed, or the cannot-happen prediction mismatch. The residue fallback "
+     "(yuzu_fleet_guardian_detach_sweep_left_residue) increments both. Steady state 0. "
+     "Cumulative per agent process (resets on restart). MONITOR-ONLY, same posture as the rest "
+     "of this family"},
+    {"yuzu.guardian_detach_post_commit_failures",
+     "yuzu_fleet_guardian_detach_post_commit_failures",
+     "Fleet sum of post-mutation steps of a Spark detach that threw and were contained (#5404): "
+     "the non-durable outbox drop, or the synchronous backend disarm of an inline-type "
+     "mechanism, whose swallowed throw can leave that engine subscription live and unowned. A "
+     "nonzero value means INSPECT: it does not mean teardown completed. Steady state 0. "
+     "Cumulative per agent process (resets on restart). MONITOR-ONLY, same posture as the rest "
+     "of this family"},
+    {"yuzu.guardian_claims_dropped_at_stop", "yuzu_fleet_guardian_claims_dropped_at_stop",
+     "Fleet sum of Spark claims dropped at agent shutdown (#5404): queued, never-dispatched "
+     "claims dropped by the runtime's stop, plus Disarm claims its executor refused with "
+     "Stopped. Counts shutdown drops only (cumulative per agent process, resets on restart). Not "
+     "an outage signal on its own. MONITOR-ONLY, same posture as the rest of this family"},
+    {"yuzu.guardian_ack_maint_exceptions", "yuzu_fleet_guardian_ack_maint_exceptions",
+     "Fleet sum of throws caught by the agent's Guardian ack-bookkeeping maintenance firewall "
+     "(#5404): the heartbeat thread's ack-drain and generation-advance tick (which includes the "
+     "runtime's expiry and reaper pass), and the content-hash and begin-application steps of "
+     "applying a push. Steady state 0. A caught throw skips the rest of that tick's ack drain, "
+     "and one that recurs every tick repeats the skip. Cumulative per agent process "
+     "(resets on restart). MONITOR-ONLY, same posture as the rest of this family"},
 };
 
 /// Derived with std::size, never a literal - see the sibling table's comment in
@@ -239,15 +329,18 @@ inline constexpr std::size_t kNGuardianHealthAgeMetrics = std::size(kGuardianHea
 /// Agents whose latest heartbeat carried at least one parseable
 /// yuzu.guardian_unhealthy_*/guardian_priority_demoted/guardian_outbox_backpressure_drops/
 /// guardian_legacy_sink_events_lost/guardian_legacy_sink_gap_rules/
-/// guardian_legacy_sink_dropped_unwired/guardian_disarm_deadline_elapsed tag (the #5403
-/// pending-age tag does not count here; see kGuardianHealthAgeMetrics).
+/// guardian_legacy_sink_dropped_unwired/guardian_disarm_deadline_elapsed tag or any of the
+/// #5404 Spark claim-lifecycle tags (the #5403 pending-age tag does not count here; see
+/// kGuardianHealthAgeMetrics).
 inline constexpr const char* kGuardianHealthReportingGauge = "yuzu_fleet_guardian_health_reporting";
 inline constexpr const char* kGuardianHealthReportingHelp =
     "Agents whose latest heartbeat carried at least one parseable "
     "yuzu.guardian_unhealthy_suppressed/refreshed, yuzu.guardian_priority_demoted, "
     "yuzu.guardian_outbox_backpressure_drops, yuzu.guardian_legacy_sink_events_lost, "
     "yuzu.guardian_legacy_sink_gap_rules, yuzu.guardian_legacy_sink_dropped_unwired "
-    "(#4783), or yuzu.guardian_disarm_deadline_elapsed (#5403) tag (the "
+    "(#4783), yuzu.guardian_disarm_deadline_elapsed (#5403), or any #5404 Spark "
+    "claim-lifecycle tag in this table (yuzu.guardian_orphan_disarms_started through "
+    "yuzu.guardian_ack_maint_exceptions) (the "
     "yuzu.guardian_disarm_pending_age_seconds age tag does not count here) - the "
     "coverage denominator for this "
     "family. Published every sweep INCLUDING 0, unlike the counters above. READ 0 "
