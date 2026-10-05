@@ -137,18 +137,11 @@ inline constexpr std::chrono::milliseconds kRunBudget{15'000};
 /// source stops; begin_profile() starts the next source from zero. `deadline`/`expired(now)` are
 /// injectable so a test never sleeps; expiry is sticky.
 struct RetentionBudget {
-    std::size_t max_profile_grants = kMaxProfileGrants;
-    std::size_t max_profile_bytes = kMaxProfileBytes;
-    std::size_t profile_grants = 0;
-    std::size_t profile_bytes = 0;
-    bool profile_exhausted = false;
+    yuzu::shared::RowByteBudget source{kMaxProfileGrants, kMaxProfileBytes};
     std::chrono::steady_clock::time_point deadline = std::chrono::steady_clock::now() + kRunBudget;
     bool timed_out = false;
 
-    void begin_profile() noexcept {
-        profile_grants = profile_bytes = 0;
-        profile_exhausted = false;
-    }
+    void begin_profile() noexcept { source.reset(); }
 
     [[nodiscard]] bool expired(
         std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now()) noexcept {
@@ -156,17 +149,10 @@ struct RetentionBudget {
     }
 
     /// Whether the walk of the current source must stop where it is.
-    [[nodiscard]] bool walk_stopped() noexcept { return profile_exhausted || expired(); }
+    [[nodiscard]] bool walk_stopped() noexcept { return source.refused || expired(); }
 
     [[nodiscard]] bool charge(std::size_t n_bytes) noexcept {
-        if (profile_exhausted || profile_grants + 1 > max_profile_grants ||
-            n_bytes > max_profile_bytes - profile_bytes) {
-            profile_exhausted = true;
-            return false;
-        }
-        ++profile_grants;
-        profile_bytes += n_bytes;
-        return true;
+        return !source.refused && source.charge(n_bytes); // refusal sticky per source
     }
 };
 
@@ -610,7 +596,7 @@ using ReadProfileFn = std::function<ProfileRead(const profiles::ProfileInfo&)>;
     // A source that hit its own cap keeps the rows it charged; this row says it is incomplete.
     const auto truncated_row = [&](std::vector<PermissionRow>& into, const std::string& source,
                                    const std::string& row_id) {
-        if (budget.profile_exhausted)
+        if (budget.source.refused)
             into.push_back(failure_row("windows", row_id, "-", false,
                                        source + ":" + std::string{kSourceBudgetExceededSuffix}, acc));
     };

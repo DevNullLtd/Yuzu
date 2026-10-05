@@ -50,6 +50,7 @@
 #include <vector>
 
 #include <constraint_accumulator.hpp>
+#include <row_byte_budget.hpp>
 
 #include <yuzu/plugin.h> // YuzuResultStatus / Completeness (C ABI: no OS types)
 #include <yuzu/string_utils.hpp>
@@ -226,19 +227,18 @@ inline constexpr std::string_view kBudgetExceededToken = "collection:budget_exce
 /// source that crosses it (itself bounded) is kept; Windows asks would_exceed() before a
 /// profile's rows are emitted, and charges the machine-wide rows first so they always fit.
 struct OutputBudget {
-    std::size_t max_bytes = kMaxRunOutputBytes;
-    std::size_t bytes = 0;
+    yuzu::shared::RowByteBudget b{yuzu::shared::RowByteBudget::npos, kMaxRunOutputBytes};
 
-    [[nodiscard]] bool exhausted() const noexcept { return bytes >= max_bytes; }
+    [[nodiscard]] bool exhausted() const noexcept { return b.full(); }
     [[nodiscard]] static std::size_t cost(std::span<const PermissionRow> rows) {
         std::size_t n = 0;
         for (const auto& r : rows) n += format_row(r).size() + 1; // +1: the row separator
         return n;
     }
     [[nodiscard]] bool would_exceed(std::span<const PermissionRow> rows) const {
-        return cost(rows) > max_bytes - (std::min)(bytes, max_bytes);
+        return !b.fits(cost(rows), rows.size());
     }
-    void charge(std::span<const PermissionRow> rows) { bytes += cost(rows); } // allocates
+    void charge(std::span<const PermissionRow> rows) { b.add(cost(rows), rows.size()); } // allocates; unconditional reserve
 };
 
 // ── status selection (pure; the one decision every leg shares) ──────────

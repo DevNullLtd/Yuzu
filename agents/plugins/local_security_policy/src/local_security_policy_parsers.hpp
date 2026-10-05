@@ -23,6 +23,7 @@
 #include <yuzu/string_utils.hpp>
 
 #include <constraint_accumulator.hpp>
+#include <row_byte_budget.hpp>
 
 #include <algorithm>
 #include <array>
@@ -1039,7 +1040,7 @@ struct Tally {
     void row(std::string r) {
         // Row COUNT alone does not bound output: sudoers rows can each be ~12 KiB, so 4096 of them
         // is ~50 MB from a 256 KiB file. The byte budget shares the row cap's marker and status.
-        if (rows.size() + 1 >= kMaxRows || bytes + r.size() > kMaxRowBytes) {
+        if (rows.size() + 1 >= kMaxRows || !budget.fits(r.size())) {
             if (!capped) {
                 acc.add_failure("row_cap");
                 rows.push_back(truncation_marker());
@@ -1047,11 +1048,13 @@ struct Tally {
             capped = true;
             return;
         }
-        bytes += r.size() + 1;
+        budget.add(r.size() + 1);
         rows.push_back(std::move(r));
     }
 
-    std::size_t bytes = 0; // formatted row bytes so far (each row plus its newline)
+    // Formatted row bytes so far (each row plus its newline); byte-only, non-sticky: every row is
+    // re-tested, so a smaller row after the cap marker is still admitted (unchanged behaviour).
+    yuzu::shared::RowByteBudget budget{yuzu::shared::RowByteBudget::npos, kMaxRowBytes};
     std::string marker_prefix{"local_security_policy"};
     std::size_t marker_fields{4};
     [[nodiscard]] std::string truncation_marker() const {
