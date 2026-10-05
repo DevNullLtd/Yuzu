@@ -69,8 +69,8 @@ filtering and pagination.
 |---|---|---|
 | `agent_id` | string | Filter by agent |
 | `status` | integer | Filter by status (integer enum value) |
-| `since` | integer | Only responses after this Unix timestamp |
-| `until` | integer | Only responses before this Unix timestamp |
+| `since` | integer | Only responses at or after this Unix timestamp (inclusive); omit for no lower bound, `0` is accepted and matches the same rows |
+| `until` | integer | Only responses at or before this Unix timestamp (inclusive); omit for no upper bound, must be `1` or more (`0` is `400`) |
 | `limit` | integer | Number of responses to return (default 100, at most 1000; zero or below means the default). Asking for more than 1000 and getting a full page sets `result_truncated_by_cap` in the envelope |
 | `offset` | integer | Offset for pagination (default 0) |
 
@@ -136,8 +136,8 @@ fleet-wide statistics without downloading every row.
 | `op_column` | string | Column for sum/avg/min/max operations |
 | `agent_id` | string | Filter by agent |
 | `status` | integer | Filter by status |
-| `since` | integer | Only responses after this Unix timestamp |
-| `until` | integer | Only responses before this Unix timestamp |
+| `since` | integer | Only responses at or after this Unix timestamp (inclusive); omit for no lower bound, `0` is accepted and matches the same rows |
+| `until` | integer | Only responses at or before this Unix timestamp (inclusive); omit for no upper bound, must be `1` or more (`0` is `400`) |
 
 **Response:**
 
@@ -177,7 +177,7 @@ The dedicated export endpoint supports both CSV and JSON formats with the same
 filter parameters as the query endpoint. It defaults to a higher limit
 (10,000 rows) for bulk exports. Numeric parameters must be one whole base-10 integer
 (`since=1e9`, `limit=100abc`, `status=0x1` and `since=1.5` are `400`, not a different
-filter); `since` or `until` of `0` (or omitted) means no bound on that side, and a negative
+filter); omitting `since` or `until` means no bound on that side, `since=0` is accepted and matches the same rows as omitting it, and `until=0` or a negative
 value is `400`.
 
 **Query parameters:**
@@ -187,8 +187,8 @@ value is `400`.
 | `format` | string | Export format: `csv` or `json` (default: `json`) |
 | `agent_id` | string | Filter by agent |
 | `status` | integer | Filter by status |
-| `since` | integer | Only responses after this Unix timestamp |
-| `until` | integer | Only responses before this Unix timestamp |
+| `since` | integer | Only responses at or after this Unix timestamp (inclusive); omit for no lower bound, `0` is accepted and matches the same rows |
+| `until` | integer | Only responses at or before this Unix timestamp (inclusive); omit for no upper bound, must be `1` or more (`0` is `400`) |
 | `limit` | integer | Number of responses to export (default and maximum 10,000; zero or below serves one row) |
 
 **Example --- export instruction responses as CSV:**
