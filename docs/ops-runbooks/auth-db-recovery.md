@@ -216,7 +216,9 @@ $Stamp = Get-Date -Format yyyyMMddTHHmmssZ
 $Bk = "C:\Backups\Yuzu"
 New-Item -ItemType Directory -Force -Path $Bk | Out-Null
 icacls $Bk /setowner '*S-1-5-32-544' /L /C /Q | Out-Null
+if ($LASTEXITCODE) { throw 'icacls failed: the backup folder is not locked down, stop here' }
 icacls $Bk /inheritance:r /grant:r '*S-1-5-32-544:(OI)(CI)F' '*S-1-5-18:(OI)(CI)F' /L /C /Q | Out-Null
+if ($LASTEXITCODE) { throw 'icacls failed: the backup folder is not locked down, stop here' }
 $DsnFile = "C:\ProgramData\Yuzu Server\postgres.dsn"
 $Dsn = if (Test-Path $DsnFile) { (Get-Content -LiteralPath $DsnFile -Raw).Trim() } else { $Env:YUZU_POSTGRES_DSN }
 pg_dump $Dsn --format=custom --file "$Bk\yuzu-$Stamp.dump"

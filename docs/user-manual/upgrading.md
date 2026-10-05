@@ -109,8 +109,13 @@ yuzu_fill_and_recreate "$OUT"
 The chiselled `yuzu-server-chisel` image has no `tar`, so on it the function stops at step 4 and recreates nothing (the `docker compose run` there has already created the volume). Do steps 4 and 5 in a throwaway container instead, then step 6 by hand. `<project>_server-certs` is the volume's full name, which `docker volume ls` prints. The listing must show the files owned by uid 1000, with `secrets-kek-v1.key` 32 bytes:
 
 ```bash
-docker run --rm -i --network none -v <project>_server-certs:/x/certs alpine tar -x -C /x -f - < "$OUT"
+docker run --rm -i --network none -v <project>_server-certs:/x/certs alpine tar -x -C /x -f - < "${OUT:?run block 2 first}"
 docker run --rm --network none -v <project>_server-certs:/c:ro alpine ls -ln /c
+```
+
+Only if that listing shows `secrets-kek-v1.key` at 32 bytes, owned by uid 1000, recreate the server:
+
+```bash
 docker compose up -d
 ```
 
@@ -162,12 +167,17 @@ A `STATUS` of `Restarting` means the server refuses to start. Then match the out
 - **(d) The listing is empty: look for the keys on a dangling volume.** If the server's certs mount was an anonymous volume (`- /etc/yuzu/certs` with no name in front, as in Compose Wizard output from before 0.14.1 with named volumes off), `docker compose down` then `up` left the keys on the old, now unused volume and gave the new container an empty one. Both `docker compose down` and `down -v` leave such a volume in place, and `docker volume prune` deletes it, so do not prune. List the dangling volumes that hold KEK files:
 
   ```bash
-  for v in $(docker volume ls -qf dangling=true); do
-    docker run --rm --network none -v "$v":/c:ro alpine ls /c 2> /dev/null | grep -q '^secrets-kek-v' && echo "keys on volume: $v"
-  done
+  if docker image inspect alpine > /dev/null 2>&1 || docker pull alpine > /dev/null; then
+    for v in $(docker volume ls -qf dangling=true); do
+      docker run --rm --network none -v "$v":/c:ro alpine ls /c 2> /dev/null | grep -q '^secrets-kek-v' && echo "keys on volume: $v"
+    done
+    echo "search finished"
+  else
+    echo "STOP: the alpine image is not available, so the search did not run. Load it (docker load) and run this again."
+  fi
   ```
 
-  Each line printed names a volume that holds keys. If there is more than one, they come from different installs: compare `docker run --rm --network none -v <volume>:/c:ro alpine cat /c/default-ca.pem | openssl x509 -noout -fingerprint -sha256` with the CA your agents trust. Switch to the 0.14.1 compose (step 3), copy the keys from that volume into the `server-certs` volume, then run `docker compose up -d`:
+  The search needs the `alpine` image; on a host without internet access, `docker load` it first. Go on only after `search finished`. Each `keys on volume:` line names a volume that holds keys; if there is none, case (e) applies. If there is more than one, they come from different installs: compare `docker run --rm --network none -v <volume>:/c:ro alpine cat /c/default-ca.pem | openssl x509 -noout -fingerprint -sha256` with the CA your agents trust. Switch to the 0.14.1 compose (step 3), copy the keys from that volume into the `server-certs` volume, then run `docker compose up -d`:
 
   ```bash
   docker compose run --rm --no-deps -T --user 0 -v <volume>:/from:ro --entrypoint cp server -a /from/. /etc/yuzu/certs/ </dev/null
