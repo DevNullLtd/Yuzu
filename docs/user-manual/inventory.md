@@ -744,19 +744,28 @@ the fleet-newest version of every title is folded from `version_rollup` through 
 cursor into a transaction-scoped temp table with memory bounded by the batch size, not the
 title count. The refresh keeps the 60 s per-statement limit, gains a 10-minute whole-refresh
 limit (both compile-time), and aborts cleanly (last-good rollup kept) on shutdown.
-Scale ceiling (measured on PostgreSQL 18.6): the `GROUPING SETS` statement costs about
-12.8 times the former single `GROUP BY` (37 s against 2.9 s at 1.8M installed rows) and
-reaches the flat 60 s statement limit at about 2.7M installed rows, roughly 6,000
-endpoints; beyond that the catalogue stays "building" until the rollup is made
-incremental. The server's database role needs the `TEMPORARY` privilege (the default
-`PUBLIC` grant; re-grant it after a `REVOKE TEMP` hardening), because the refresh uses a
-transaction-scoped temporary table; without it every refresh fails with SQLSTATE 42501
-and the catalogue stays "building". On a rollback to an older binary, restart old
-replicas promptly: the v8 `DROP` queues behind an old replica's refresh and dies at the
-pool's 10 s `lock_timeout` (the server then refuses to start, fail-closed), and an old
-binary's grain-less rows read as title-grain rows (each title once). KPI definitions: total installs = distinct
-(device, title) pairs; the OS split counts each (device, title) pair once per OS family
-derived from the ecosystem; stay-current = distinct devices on each title's exact newest
+Scale ceiling (measured on PostgreSQL 18.6 with synthetic data at about 450 rows per
+endpoint, on one M-series host with a warm cache and 4 MB `work_mem`; read it as plus or
+minus 40%): the `GROUPING SETS` statement costs about 12.8 times the former single
+`GROUP BY` (37 s against 2.9 s at 1.8M installed rows; the whole refresh about 6.5 times)
+and reaches the flat 60 s statement limit at about 2.7M installed rows, roughly 6,000
+endpoints. A fleet already over that size at the v8 upgrade has no last-good rollup, so its
+catalogue stays "building" until the rollup is made incremental; a fleet that outgrows it
+later keeps serving the last-good rollup while its "updated N ago" stamp ages. The server's
+database role needs the `TEMPORARY` privilege (the default `PUBLIC` grant; re-grant it after
+a `REVOKE TEMP` hardening), because the refresh uses a transaction-scoped temporary table;
+without it every refresh fails with a permission-denied error (SQLSTATE 42501) and the
+catalogue stays "building". A rollback to an older binary is clean: its grain-less refresh
+and read treat every row as a title-grain row (each title once). On an upgrade with older
+replicas still running, restart them promptly: the v8 `DROP` queues behind an old replica's
+refresh and dies at the pool's 10 s `lock_timeout` (the new server then refuses to start,
+fail-closed). A mixed old/new window has two transient asymmetries until each side's next
+hourly refresh: an old replica's read lists every grain row the new binary wrote (8 to
+8 x C per title), and after an old replica's refresh the new binary's filtered reads are
+empty (not "building").
+
+KPI definitions: total installs = distinct (device, title) pairs; the OS split counts each
+(device, title) pair once per OS family derived from the ecosystem; stay-current = distinct devices on each title's exact newest
 version string divided by distinct devices carrying the title, over every title with a known
 version (equivalent spellings such as `1.0` and `1.0.0` are not merged); "newest" is decided
 by the catalogue's own transitive version order, which agrees with the NVD comparator on its

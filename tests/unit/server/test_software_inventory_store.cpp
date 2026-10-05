@@ -2141,6 +2141,11 @@ TEST_CASE("q is literal and title-level and clamped", "[pg][software_inventory]"
     SoftwareFleetQuery bad_fleet;
     bad_fleet.q = "\xFF";
     CHECK(store.query_software(bad_fleet).has_value());
+    SoftwareFleetQuery conts_fleet;
+    conts_fleet.q = std::string(200, '\x80'); // same scrub-before-clamp order on this read
+    auto conts_fleet_rows = store.query_software(conts_fleet);
+    REQUIRE(conts_fleet_rows.has_value());
+    CHECK(conts_fleet_rows->empty());
     // The 128-byte clamp is applied on both reads: a title of 128 'a' queried with 128 'a' + 72
     // 'z' is found (the term is cut to the 128 'a'); unclamped the term would match nothing.
     const std::string long_title(128, 'a');
@@ -2660,4 +2665,47 @@ TEST_CASE("migration v8 reshapes a v7-era rollup schema and re-runs idempotently
     auto built = again.catalog_rollup_meta();
     REQUIRE(built.has_value());
     CHECK(built->refreshed_at > 0);
+    {
+        // Rollback posture, the whole loop: the v7 binary's refresh DML, meta upsert and
+        // grain-less read, verbatim, against the v8 tables (the fixture is the source data).
+        // run_sql REQUIRES each statement to succeed.
+        run_sql(pool, "DELETE FROM software_inventory_store.catalog_rollup");
+        run_sql(pool, "INSERT INTO software_inventory_store.catalog_rollup "
+                      "(name, publisher, device_count, version_count) "
+                      "SELECT name, max(publisher), count(DISTINCT agent_id), "
+                      "count(DISTINCT version) "
+                      "FROM software_inventory_store.installed_software GROUP BY name");
+        run_sql(pool, "DELETE FROM software_inventory_store.version_rollup");
+        run_sql(pool, "INSERT INTO software_inventory_store.version_rollup "
+                      "(name, version, device_count) "
+                      "SELECT name, version, count(DISTINCT agent_id) "
+                      "FROM software_inventory_store.installed_software GROUP BY name, version");
+        run_sql(pool,
+                "INSERT INTO software_inventory_store.catalog_rollup_meta "
+                "(id, refreshed_at, total_titles, total_devices) "
+                "VALUES (1, EXTRACT(EPOCH FROM now())::bigint, "
+                "  (SELECT count(*) FROM software_inventory_store.catalog_rollup), "
+                "  (SELECT count(DISTINCT agent_id) FROM "
+                "software_inventory_store.installed_software)) "
+                "ON CONFLICT (id) DO UPDATE SET refreshed_at = EXCLUDED.refreshed_at, "
+                "  total_titles = EXCLUDED.total_titles, total_devices = EXCLUDED.total_devices "
+                "RETURNING id");
+        auto titles = run_sql(pool, "SELECT count(DISTINCT name) FROM "
+                                    "software_inventory_store.installed_software");
+        const std::int64_t n_titles = std::stoll(PQgetvalue(titles.get(), 0, 0));
+        REQUIRE(n_titles > 1);
+        CHECK(count_rows(pool, "catalog_rollup") == n_titles); // one row per title
+        auto off_grain = run_sql(pool, "SELECT count(*) FROM "
+                                       "software_inventory_store.catalog_rollup WHERE grain <> 7");
+        CHECK(std::string(PQgetvalue(off_grain.get(), 0, 0)) == "0");
+        auto meta_row = run_sql(pool, "SELECT total_titles, refreshed_at FROM "
+                                      "software_inventory_store.catalog_rollup_meta WHERE id = 1");
+        REQUIRE(PQntuples(meta_row.get()) == 1);
+        CHECK(std::stoll(PQgetvalue(meta_row.get(), 0, 0)) == n_titles);
+        CHECK(std::stoll(PQgetvalue(meta_row.get(), 0, 1)) > 0);
+        auto old_read = run_sql(pool, "SELECT name, publisher, device_count, version_count "
+                                      "FROM software_inventory_store.catalog_rollup "
+                                      "ORDER BY device_count DESC, name");
+        CHECK(PQntuples(old_read.get()) == n_titles);
+    }
 }

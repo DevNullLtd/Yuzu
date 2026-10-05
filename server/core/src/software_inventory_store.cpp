@@ -262,10 +262,15 @@ const std::vector<pg::PgMigration>& migrations() {
          // UNIQUE (name, version), which also serves the newest-version cursor order).
          // grain carries DEFAULT 7 (the title-total grain) on purpose: the migration runner
          // skips a version at or below the schema's, so an OLD binary can still run against
-         // v8 (rollback, or an old replica left running). Its refresh INSERT names no grain
-         // column; with the default each of its rows lands as the title grain, its (grain-
-         // less) read lists each title once, and it never rolls back on NOT NULL. The new
-         // refresh always writes grain explicitly from GROUPING().
+         // v8. Its refresh INSERT names no grain column; with the default each of its rows
+         // lands as the title grain and it never rolls back on NOT NULL. Once its own refresh
+         // has run, its (grain-less) read lists each title once: a rollback to an older binary
+         // only is clean. A MIXED old/new window has two transient asymmetries until each
+         // side's next hourly refresh: the old read lists every grain row the new binary wrote
+         // (8 to 8xC per title) until the old binary's own refresh replaces them, and after an
+         // old refresh only grain-7 rows exist, so the new binary's filtered reads (grain != 7)
+         // are empty with refreshed_at > 0. The new refresh always writes grain explicitly
+         // from GROUPING().
          // The expression index is what makes the (installs DESC, name) keyset an index
          // seek: the read's row-value compare on ((-device_count), name) matches it; the
          // unique key's leading `name` serves the per-title newest lookups.
@@ -1252,8 +1257,8 @@ bool SoftwareInventoryStore::refresh_catalog_rollup(const std::function<bool()>&
     if (!open_)
         return false;
     // Cancellation/budget contract: see the declaration in software_inventory_store.hpp.
-    const auto deadline = std::chrono::steady_clock::now() + sc::kRollupRefreshBudget;
     const auto started = std::chrono::steady_clock::now();
+    const auto deadline = started + sc::kRollupRefreshBudget;
     auto abort_requested = [&]() -> bool {
         const auto now = std::chrono::steady_clock::now();
         if (cancelled && cancelled()) {
@@ -1271,11 +1276,13 @@ bool SoftwareInventoryStore::refresh_catalog_rollup(const std::function<bool()>&
         }
         return false;
     };
-    // A failed statement names its cause (SQLSTATE text from libpq) so a timeout, a
-    // serialization failure, a missing privilege and a pool problem are told apart in the log.
+    // A failed statement names its cause (the libpq error text) so a timeout, a serialization
+    // failure, a missing privilege and a pool problem are told apart in the log. A result
+    // that is OK but the wrong shape carries no libpq text; say so instead of logging "".
     auto failed = [](std::string_view label, const pg::PgResult& r) -> bool {
+        const std::string_view err = PQresultErrorMessage(r.get());
         spdlog::warn("SoftwareInventoryStore: catalogue rollup refresh statement '{}' failed: {}",
-                     label, PQresultErrorMessage(r.get()));
+                     label, err.empty() ? "unexpected result shape (no error text)" : err);
         return false;
     };
     // ONE transaction: recompute the rollup tables + the meta from installed_software,
@@ -1289,6 +1296,7 @@ bool SoftwareInventoryStore::refresh_catalog_rollup(const std::function<bool()>&
             const pg::PgResult res = pg::exec_params(c, sql.c_str(), std::vector<std::string>{});
             if (res.status() == PGRES_COMMAND_OK)
                 return true;
+            // The label is the statement's first 48 bytes: enough to name it, bounded for the log.
             return failed(std::string_view(sql).substr(0, 48), res);
         };
         // REPEATABLE READ as the FIRST statement: version_rollup, newest_tmp, catalog_rollup
@@ -1432,8 +1440,9 @@ bool SoftwareInventoryStore::refresh_catalog_rollup(const std::function<bool()>&
         // KPI inputs that are not a single scalar subquery of the meta update.
         // (a) EXACT installs by OS family: distinct (device, title) pairs per family from ONE
         // dedicated statement — ONE result row of four sums, never one row per title. One more
-        // full sort pass of installed_software (the refresh is about 4x today's single GROUP BY
-        // in total). The CASE comes from kEcosystemFamilies.
+        // full sort pass of installed_software (measured at 1.8M rows: the GROUPING SETS
+        // statement is about 12.8x the former GROUP BY, the whole refresh about 6.5x). The CASE
+        // comes from kEcosystemFamilies.
         if (abort_requested())
             return false;
         auto fam_sum = [](std::string_view f) {
