@@ -17,9 +17,23 @@
 -export([start_link/0, send_command/3]).
 
 %% gen_server callbacks
--export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, code_change/3]).
+-export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, code_change/3,
+         format_status/1]).
+%% Exported for tests.
+-export([command_timeout_s/1]).
 
 -define(SERVER, ?MODULE).
+%% The command timeout, seconds: a caller's value outside 1..3600 is replaced
+%% (see command_timeout_s/1). The server sends 300; the management API accepts
+%% any int32, and a negative value made erlang:send_after/3 raise inside this
+%% process, whose crash report printed the command request.
+-define(DEFAULT_TIMEOUT_S, 300).
+-define(MIN_TIMEOUT_S, 1).
+-define(MAX_TIMEOUT_S, 3600).
+%% An invalid configured default is warned about at most this often per process
+%% (monotonic ms): it is read on every command that sends no timeout of its own.
+-define(DEFAULT_WARN_INTERVAL_MS, 60000).
+-define(DEFAULT_WARN_KEY, {?MODULE, default_timeout_warned_at}).
 
 -record(fanout, {
     from         :: pid(),              %% caller (mgmt service handler)
@@ -53,7 +67,13 @@ start_link() ->
 %% CommandRequest field. See agent.proto CommandRequest.dispatch_tag.
 -spec send_command([binary()], map(), map()) -> {ok, reference()} | {error, term()}.
 send_command(AgentIds, CommandReq, Opts) ->
-    gen_server:call(?SERVER, {send_command, AgentIds, CommandReq, Opts}).
+    %% Called from the grpcbox handler of the management listener. A call that
+    %% exits (this process not running, or restarting) exits the CALLER with a
+    %% reason that embeds the call and so CommandReq (plugin parameters, which
+    %% may be secrets), and grpcbox logs it: see yuzu_gw_safe_call. The default
+    %% 5000 ms call timeout is kept.
+    yuzu_gw_safe_call:call(?SERVER, {send_command, AgentIds, CommandReq, Opts},
+                           5000, router_unavailable).
 
 %%%===================================================================
 %%% gen_server callbacks
@@ -63,8 +83,7 @@ init([]) ->
     {ok, #state{fanouts = #{}}}.
 
 handle_call({send_command, AgentIds, CommandReq, Opts}, {CallerPid, _Tag}, State) ->
-    TimeoutS = maps:get(timeout_seconds, Opts,
-                        application:get_env(yuzu_gw, default_command_timeout_s, 300)),
+    TimeoutS = command_timeout_s(Opts),
 
     Targets = case AgentIds of
         []    -> yuzu_gw_registry:all_agents();
@@ -192,6 +211,80 @@ handle_info(_Info, State) ->
 
 terminate(_Reason, _State) ->
     ok.
+
+%% @doc The timeout of a fanout, in seconds, from the caller's
+%% `timeout_seconds': a value in 1..3600 is used, a larger one is clamped to
+%% 3600, and a missing, non-positive or non-integer one takes the configured
+%% default (default_command_timeout_s, 300 when unset or invalid).
+-spec command_timeout_s(term()) -> pos_integer().
+command_timeout_s(Opts) ->
+    case is_map(Opts) andalso maps:get(timeout_seconds, Opts, undefined) of
+        N when is_integer(N), N > ?MAX_TIMEOUT_S -> ?MAX_TIMEOUT_S;
+        N when is_integer(N), N >= ?MIN_TIMEOUT_S -> N;
+        _ -> default_timeout_s()
+    end.
+
+%% The configured default_command_timeout_s. A value that is not an integer in
+%% range takes ?DEFAULT_TIMEOUT_S, with one WARN per minute naming the key (this
+%% is read on every command that sends no timeout of its own, so the unthrottled
+%% warning of yuzu_gw_env:env_int/4 would log once per command).
+-spec default_timeout_s() -> pos_integer().
+default_timeout_s() ->
+    case application:get_env(yuzu_gw, default_command_timeout_s, ?DEFAULT_TIMEOUT_S) of
+        V when is_integer(V), V >= ?MIN_TIMEOUT_S, V =< ?MAX_TIMEOUT_S ->
+            V;
+        _Bad ->
+            warn_invalid_default(),
+            ?DEFAULT_TIMEOUT_S
+    end.
+
+%% The stamp lives in the process dictionary of the process that reads the key
+%% (the router).
+warn_invalid_default() ->
+    Now = erlang:monotonic_time(millisecond),
+    case get(?DEFAULT_WARN_KEY) of
+        Last when is_integer(Last), Now - Last < ?DEFAULT_WARN_INTERVAL_MS ->
+            ok;
+        _ ->
+            put(?DEFAULT_WARN_KEY, Now),
+            logger:warning("Invalid default_command_timeout_s value (expected an integer in "
+                           "~b..~b); using ~b", [?MIN_TIMEOUT_S, ?MAX_TIMEOUT_S, ?DEFAULT_TIMEOUT_S])
+    end.
+
+%% What OTP prints for this process in a terminate or crash report and in
+%% sys:get_status/1: counts only. A send_command request carries the plugin
+%% parameters of the command, which may be secrets, and the last message of a
+%% crashed router is that request. The reason loses its argument lists (the
+%% arguments of the failing call can be the request) and the last message is
+%% reduced to its tag. The mailbox and the stacktrace of the proc_lib crash report
+%% are covered by yuzu_gw_crash_redact. sys:get_state/1 still returns the real
+%% record.
+-spec format_status(map()) -> map().
+format_status(Status) ->
+    maps:map(fun(state, State)   -> redact_state(State);
+                (message, Msg)   -> redact_message(Msg);
+                (reason, Reason) -> yuzu_gw_upstream:redact_reason(Reason);
+                (log, Log)       -> redact_log(Log);
+                (_Key, Value)    -> Value
+             end, Status).
+
+redact_state(#state{fanouts = Fanouts}) when is_map(Fanouts) ->
+    #{fanouts => map_size(Fanouts)};
+redact_state(_Other) ->
+    '$redacted'.
+
+redact_message({'$gen_call', From, Msg}) -> {'$gen_call', From, message_tag(Msg)};
+redact_message({'$gen_cast', Msg})       -> {'$gen_cast', message_tag(Msg)};
+redact_message(Msg)                      -> message_tag(Msg).
+
+message_tag(Msg) when is_atom(Msg) -> Msg;
+message_tag(Msg) when is_tuple(Msg), tuple_size(Msg) > 0, is_atom(element(1, Msg)) ->
+    element(1, Msg);
+message_tag(_Other) -> '$redacted'.
+
+%% The report callback iterates the log, so it stays a list.
+redact_log(Log) when is_list(Log) -> [{log_entries_redacted, length(Log)}];
+redact_log(_Other)                 -> [].
 
 code_change(_OldVsn, State, _Extra) ->
     {ok, State}.

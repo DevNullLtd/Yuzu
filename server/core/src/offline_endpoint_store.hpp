@@ -142,13 +142,14 @@ public:
     /// stores remain the source of truth; this is durability on top. Single
     /// statement, autocommit, `INSERT ... ON CONFLICT ... RETURNING`.
     ///
-    /// `agent_version`/`arch` (round-3 v2 columns): a BLANK value on the
-    /// incoming row NEVER overwrites an already-known non-blank value —
-    /// `hostname`/`os` are the ONE per-ingest source of truth (unconditional
+    /// `agent_version`/`arch` (round-3 v2 columns) and `os` (#5294): a BLANK
+    /// value on the incoming row NEVER overwrites an already-known non-blank
+    /// value — `hostname` is the ONE per-ingest source of truth (unconditional
     /// EXCLUDED write, matching the pre-v2 columns), but a heartbeat that
     /// raced the session lookup (registry lookup miss) supplies "" here, and
-    /// must not blank out a version/arch this store already learned from an
-    /// earlier heartbeat for the same agent.
+    /// must not blank out a version/arch/os this store already learned from an
+    /// earlier heartbeat for the same agent. A non-blank `os` still overwrites,
+    /// so a genuine OS change lands on the next session-hit heartbeat.
     bool upsert(std::string_view agent_id, std::string_view hostname, std::string_view os,
                 std::int64_t last_heartbeat_ms, std::int64_t agent_ts,
                 std::string_view agent_version = {}, std::string_view arch = {},

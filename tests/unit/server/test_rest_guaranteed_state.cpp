@@ -711,7 +711,7 @@ struct RestGsHarness {
         REQUIRE(!session_user.empty());
         REQUIRE(auth_mgr_.upsert_user(session_user, "password1234", session_role));
         auto token =
-            auth_mgr_.create_local_session(session_user, session_role, /*mfa_verified=*/true);
+            auth_mgr_.create_local_session_for_test(session_user, session_role, /*mfa_verified=*/true);
         return {{"Cookie", "yuzu_session=" + token}};
     }
 
@@ -722,7 +722,7 @@ struct RestGsHarness {
     std::unordered_map<std::string, std::string> elevated_status_route_headers() {
         REQUIRE(!session_user.empty());
         REQUIRE(auth_mgr_.upsert_user(session_user, "password1234", auth::Role::user));
-        auto token = auth_mgr_.create_local_session(session_user, auth::Role::user,
+        auto token = auth_mgr_.create_local_session_for_test(session_user, auth::Role::user,
                                                      /*mfa_verified=*/true);
         REQUIRE(auth_mgr_.elevate_session(token, std::chrono::seconds(300)).has_value());
         return {{"Cookie", "yuzu_session=" + token}};

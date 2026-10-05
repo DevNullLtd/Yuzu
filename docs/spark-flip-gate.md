@@ -379,7 +379,7 @@ PR-5d)" stamp), 5e **#4529, merged 2026-09-18T13:18:55Z (`869ea6a29d14`)**
 (K=3 wedge waiver / decision 1 closeout, plus #4279's
 disposition below - see that doc's "as implemented (rung 9c PR-5e)" stamp) -
 see acceptance criteria below) → **PR-6 item 1 (Service positive-establishment
-signal) - IMPLEMENTED, not yet merged** (branch
+signal) - IMPLEMENTED, MERGED as PR #4586 (`01a4e7f87`, 2026-09-18)** (branch
 `feat/spark-9c-pr6-item1-establishment-signal`, off `origin/dev @ 7ff742f19`):
 `SparkIncarnation`/`SparkCoverage`/`SubscriptionEstablishment` (`spark.hpp`),
 the additive `ISparkMechanism::watch_incarnation()`/`set_established_sink()`
@@ -513,7 +513,8 @@ flip, with a red-first test each:
   `arms_parked_total`, `arm_redrives`, `compensation_reservation_refused`, `claim_drain_failures`,
   the current parked depth (`arms_parked()`) and, from #4354, `claim_index_release_failures()`
   (which counts release attempts, not claims) are runtime accessors only today, and no
-  retained-tombstone count exists yet (only the test-only `claim_queue_depth_for_test`), so
+  retained-tombstone count is exported either (`retained_tombstones()`, added by the
+  #4605/#5322/#5323 fix, is a runtime accessor only), so
   `arm_pending > 0` cannot yet be told apart from ordinary in-flight arms; (3) a decision on the
   deferred faster redrive/expiry cadence (expiry lands between the deadline
   and the deadline plus one heartbeat interval (30 s by default), and the redrive sweep is a ~5 s
@@ -586,7 +587,7 @@ flip, with a red-first test each:
   same-type load. Criterion: PR-5 either resolves #4279 directly or explicitly re-assesses it
   against the landed K-bound logic and records the outcome here, rather than leaving it to drift
   as an unrelated open issue.
-- **FIX in PR #5337, pending merge (relates to #4354; added 2026-09-14, discovered during rung 9c PR-5a's own
+- **FIX in PR #5337, merged (relates to #4354; added 2026-09-14, discovered during rung 9c PR-5a's own
   cs-103 tombstone-reachability investigation)**: #4354, `publish_arm_verdicts_locked`'s ordinary
   (non-firewall) pop loop used to pop every claim in `finished` on outcome presence and fifo-front
   identity alone, without checking whether that claim's index release had succeeded. The one release
@@ -607,8 +608,12 @@ flip, with a red-first test each:
   (`try_dispatch_head_locked` calling `sweep_terminal_queued_locked`) retries the release
   immediately. Regression coverage: the Catch2 cases whose names start "#4354:" in
   `tests/unit/test_guardian_spark_runtime.cpp`, at least one per fix site. This criterion is
-  satisfied once PR #5337 merges; the retained-tombstone gaps it leaves are the next two bullets.
-- **NEW flip criterion (added 2026-10-03, Dave's ruling; found while planning the #4354 fix)**:
+  satisfied: PR #5337 merged to `dev` on 2026-10-04. The retained-tombstone gaps it left are the
+  next bullets (#5322 and #5323, both fixed by the #4605/#5322/#5323 fix recorded there).
+- **RESOLVED by the #4605/#5322/#5323 fix on branch `fix/4605-5322-claim-tombstone-state` (the PR that
+  closes #5322) (was a NEW flip criterion; added 2026-10-03, Dave's ruling; found while
+  planning the #4354 fix; the problem text below is as recorded then, the fix is at the end of this
+  bullet)**:
   #5322, a retained withdrawn tombstone can be re-dispatched, or can strand a clean follower
   behind it. One mechanism with two faces, so one fix. Construction (existing test seams only):
   `fill_pool`; park an arm ra on a key; arm `set_index_remove_fault_for_test`; detach ra (Case 0 in
@@ -636,20 +641,164 @@ flip, with a red-first test each:
   `registry_mu_`); `redrive_parked_arms` adopts and redispatches a retained `Queued` head without
   sweeping; with no later same-key event a retained tombstone lasts until `begin_stop` (no depth
   cap at enqueue; `reap_stranded_claims_locked` needs no outcome and `expire_overdue_claims` skips
-  terminal claims). Fix direction: a
+  terminal claims). Fix direction as recorded: a
   guard in `try_dispatch_head_locked`, sweep-before-adopt in `adopt_undriven_arm_head_locked`, and a
   periodic retry of outcome-bearing `Queued` tombstones in `reap_stranded_claims_locked` (a guard
   alone converts the redispatch into the strand). Criterion: resolved, or explicitly re-assessed
   and recorded here, before the flip - the E5+E6 exposure cap that
   bounds it lapses at the flip (see the rung 9c PR-5 acceptance criteria preamble above).
-- **RECORDED, not flip-gating unless Dave rules otherwise (added 2026-10-03)**: #5323,
-  `abandon_claim_locked`'s `Queued` branch erases the claim from the fifo after a failed index
-  release, leaving a ghost mapping (the #4354 defect class on a different path). Not a one-line
-  helper swap: the `Queued` branch erases the claim from the fifo in the same step, before the
-  function writes the claim's outcome, `end` and the timeout counter, so retaining it needs the
-  retained state set while the claim is still in the fifo and a decision on that accounting. It
-  also interacts with the previous bullet (a retained tombstone at the front is what strands a
-  follower), so it should land after or with that fix. Dormant for the same reason.
+  **What the fix does** (`guardian_spark_runtime.{hpp,cpp}`; coverage: the Catch2 cases whose names
+  start "#5322:" in `tests/unit/test_guardian_spark_runtime.cpp`):
+  - INV-1, a dead `Queued` claim is never selected for dispatch: `try_dispatch_head_locked` returns
+    nothing for a head that is withdrawn, waiter-abandoned, outcome-bearing or carries a commit
+    exception (`is_dead_claim`). The `dispatch_arm_off_lock` entry guard is narrower on purpose
+    (withdrawn or commit-exception only, so a waiter-abandoned claim that carries an outcome still
+    reaches `reclassify_dispatching_race_locked` and late adoption): it hands the claim back to
+    `Queued`, or, once the runtime is stopping, drops it the way `begin_stop` drops a `Queued` claim.
+  - Sweep-before-adopt: `adopt_undriven_arm_head_locked` (called from `redrive_parked_arms`, among
+    others) sweeps terminal heads first, so a tombstone whose release now succeeds is popped and the
+    follower it exposes is the head that gets adopted.
+  - One reaper: `reap_stranded_claims_locked` pops terminal `Queued` heads with one `erase_rule`
+    attempt per terminal tombstone per heartbeat pass, then refills the follower it exposes
+    (the refill is queued before the head is flipped to `Dispatching`; if that push throws, the head is
+    parked instead). The pass that SYNTHESIZES the outcome of a withdrawn or waiter-abandoned head
+    that has none makes at most two attempts: `synthesize_fallback_outcome_locked` attempts a release
+    only on its not-committed branch, then the reaper releases again (the second is a no-op if the
+    first succeeded). Other same-key events add their own attempts: an attach's head drive,
+    sweep-before-adopt, an abandonment, a publish pop, a detach's sweep. A release that keeps failing
+    logs a rate-limited warning naming the first affected key (every 64th consecutive pass in which a
+    release failed). A successful synthesis wakes blocking waiters at once (`claim_cv_`), even when
+    the release that follows it fails and nothing is reaped.
+  - The attach join: `attach_core` routes on `keys_.contains(key)`; an attach on a key that already
+    has a committed watcher (live, an orphan with no rules, or a committed head not yet published)
+    JOINS it whatever the claims fifo holds, instead of queuing behind a residue and being refilled
+    onto the committed key where it would collide at the `keys_.emplace`.
+  - The Lost guard: after `on_subscription_lost` detaches the key's rules it erases `keys_[key]` if it
+    still holds the dead subscription id (a rule-less orphan would otherwise be joined by the next
+    attach).
+  - The orphan-key pass (`disarm_orphan_keys_locked`, run from `expire_overdue_claims` under
+    `registry_mu_`, skipped once stopping): a `keys_` entry whose index refcount is 0 and whose claims
+    entry is absent or empty gets a durable Disarm claim queued in the same critical section that
+    erases it (submitted off-lock afterwards), with one warning line per orphan naming the key. An
+    inline-type key (no io class) is left alone: it never carries claims or ghost mappings and its
+    refcount reaches 0 only inside `detach_rule_locked`, which tears it down synchronously (a throw
+    from the backend disarm is swallowed and counted, and `keys_` is still erased, though the
+    engine subscription may then remain live and unowned). Limits: it
+    runs once per heartbeat pass, so an idle orphan watcher can live until the next pass; a key whose
+    ghost mapping is still held has a nonzero refcount and is not an orphan yet.
+  - Trade D2 (decided by the maintainer during the #5322 work): a clean follower queued behind a
+    STUCK owner tombstone is no longer stamped
+    `AdmissionRejected` by a redispatch of the tombstone; it waits, and if the release never
+    succeeds it expires `CongestionExpired` at its own deadline. A waiter-abandoned head with no
+    outcome is no longer redispatched by a same-key attach; the reaper synthesises its outcome,
+    releases and pops it on the next heartbeat pass.
+  - Observability: new runtime accessors `retained_tombstones()` (live gauge),
+    `tombstones_released_by_reaper()`, `orphan_disarms_started()` and
+    `dead_watchers_erased_on_lost()`. Their heartbeat export is not done by this fix: the accessors'
+    own header comments formerly assigned it to "the #5168 tags PR" (a closed issue); the work is now
+    tracked in #5404 (see the pre-flip rows below). A test-only
+    `invariant_violations_for_test()` checks the registry's cross-structure invariants and has no
+    production caller.
+  - A retained owner tombstone that holds an orphan key's last mapping can still reach
+    `detach_rule_locked`'s residue branch; the live `assert` there is gone and the counted
+    (`detach_sweep_left_residue()`), logged fallback is the accepted outcome (the same fix as the
+    #4605 bullet below).
+  - **Known residuals of this fix** (factual limits, all dormant while `prefer_spark_` is false;
+    `expire_overdue_claims()` is reached only after the engine's `prefer_spark_` gate):
+    - The retained-tombstone shapes the reaper and the sweeps recover arise in production code only
+      when `erase_rule` fails, and it is noexcept; today only the index-release test seam
+      (`set_index_remove_fault_for_test`) produces one. The #4605 commit-time ownership filter is the
+      part of this fix that production code can reach.
+    - S1 last-attach-wins and the adjacent stale-adoption case (see the #4605 bullet below): a
+      recorded follow-up, tracked in #5401.
+    - The `dispatch_arm_off_lock` entry-guard hand-back (a withdrawn or commit-exception claim handed
+      back to `Queued`) does not drive the clean follower behind it: the follower waits for the next
+      sweep that reaches the key (`redrive_parked_arms`' sweep-before-adopt on the ~5 s convergence
+      lane, or the reaper on the ~30 s heartbeat) and ends `CongestionExpired` if its own claim
+      deadline passes first. Tracked in #5402.
+    - The orphan pass runs on the ~30 s heartbeat, inside `expire_overdue_claims()` (called from the
+      ack-ledger drain under the engine's lock), after the reaper in one `registry_mu_` critical
+      section; it is not on the ~5 s convergence lane. Rationale: it shares the reaper's locks and
+      pass. Revisit at the flip.
+    - A `Lost` for a subscription id arriving after the orphan pass has already erased `keys_[key]`
+      and queued its Disarm returns at the staleness guard, so that Disarm still runs a backend
+      disarm of an already-dead id. This relies on `SparkEngine::disarm()` being id-idempotent and
+      ids never being recycled, which the file itself calls "not a documented contract".
+    - `begin_stop()` between the orphan pass's unlock and `submit_disarm_off_lock` drops the Queued
+      Disarm claim (the key is already erased from `keys_`), so that watcher is not disarmed by this
+      runtime; the drop is counted in `claims_dropped_at_stop_`, the same accepted shutdown behaviour
+      as any retained Disarm dropped at stop.
+    - An orphan Disarm whose backend disarm never returns stays at its key's head and queues any
+      later same-key arm behind it: `submit()` has no deadline, neither the overdue scan nor the
+      reaper touches a Disarm claim, and no age gauge exists. Tracked in #5403.
+    - A throw out of `expire_overdue_claims()` (it is not noexcept) is caught by the engine's
+      maintenance firewall, counted in `ack_maint_exceptions_` (no accessor, not exported), and skips
+      the rest of that tick's ack drain, including the reaper and the orphan pass when the throw
+      precedes them (for example a throw from the overdue abandon loop); a throw that recurs every
+      tick repeats the skip.
+    - The reaper's refill dispatch loop (after the lock) shares the file-wide exposure to a throw
+      from `dispatch_arm_off_lock` (a `std::lock_guard` failure, which the code calls not reachable
+      in practice): a refill already flipped to `Dispatching` would be left without a worker.
+  - **Pre-flip rows added by this fix** (all join the #5168 export criterion above, which names the
+    same heartbeat-tag surface):
+    - (P1) Export the runtime counters `orphan_disarms_started`, `dead_watchers_erased_on_lost`,
+      `tombstones_released_by_reaper`, `claim_index_release_failures` and `claim_drain_failures`, and
+      the `retained_tombstones()` gauge, as heartbeat tags. `retained_tombstones()` is an O(claims)
+      scan under `registry_mu_` (like `arms_parked()`): read it at the heartbeat cadence only, never
+      per event. Steady-state expectation: every counter is 0. A nonzero `orphan_disarms_started`
+      means a ->0 index edge was dropped without a Disarm; a nonzero `tombstones_released_by_reaper`
+      records a release that failed earlier and was recovered. Also export the four detach and stop
+      counters `detach_sweep_left_residue()`, `detach_claim_failures()`,
+      `detach_post_commit_failures()` and `claims_dropped_at_stop()`: this fix removed the live
+      assert on the last-on-key sweep and made the residue fallback an accepted, counted outcome,
+      and `detach_post_commit_failures()` also counts a swallowed inline-type backend disarm throw
+      (a nonzero value means inspect: that engine subscription may remain live and unowned).
+      The residue fallback increments both `detach_sweep_left_residue()` and
+      `detach_claim_failures()`. Steady-state expectation for the first three is 0 outside a
+      failing index release; `claims_dropped_at_stop()` counts shutdown drops only.
+    - (P2) Export `ack_maint_exceptions_` (it has no accessor yet).
+    - (P3) Add an oldest-pending-Disarm age gauge, so a hung orphan Disarm is visible (#5403).
+    - (P4) The heartbeat-tag export work is tracked in #5404 (the accessors' header comments formerly
+      named "the #5168 tags PR", a closed issue).
+- **FIXED by the #4605/#5322/#5323 fix on branch `fix/4605-5322-claim-tombstone-state` (the PR that
+  closes #5323) (was RECORDED, not flip-gating unless Dave rules otherwise; added
+  2026-10-03)**: #5323,
+  `abandon_claim_locked`'s `Queued` branch erased the claim from the fifo after a failed index
+  release, leaving a ghost mapping (the #4354 defect class on a different path). It now goes
+  through `release_or_retain_tombstone_locked`: a failed release keeps the abandoned claim in its
+  fifo as a withdrawn tombstone, which the next sweep or the heartbeat reaper (previous bullet)
+  pops. Accounting: `backend_op_timeouts` is incremented once, at the abandonment; the reaper's
+  later retries are counted in `claim_index_release_failures`, never in `backend_op_timeouts`.
+  Coverage: the Catch2 case "#5323: an abandoned Queued claim whose index release fails is retained
+  and the key still disarms". Dormant for the same reason as the rest of this section (the failure
+  is reachable only through the index-release test seam).
+- **FIXED by the #4605/#5322/#5323 fix on branch `fix/4605-5322-claim-tombstone-state` (#4605; a
+  precondition named by the issue's own acceptance criteria)**:
+  `index_held` is a claim's own belief that it holds the rule's one `(rule_id -> key, generation)`
+  index mapping. A wedge adoption (`index_->add` moving the mapping to the adopted key) could move
+  that mapping while a same-rule claim on another key kept `index_held` set, and the drain's `live`
+  filter trusted the flag, so that claim could commit after the rule was withdrawn, with no index
+  entry behind it (the issue's six-step sequence). Fix (S2, ownership wins): the drain commits a
+  claim only if `SparkKeyRuleIndex::owns(key, rule_id, generation)` agrees; a claim that does not
+  own its mapping releases as a no-op that clears `index_held` and succeeds (before the failure
+  seam, so a stale generation is never retained as a tombstone) and is staged `Withdrawn`; its late
+  subscription is disarmed unless a live sibling adopts it. A rule already committed in `rules_`
+  still blocks wedge adoption; otherwise an eligible wedge reacquires ownership and a pending claim
+  for the same rule on another key is compensated at its completion. This is NOT the issue's own
+  suggestion (refuse the adoption when another key owns the mapping): refusing would leave the rule
+  on the key it had before the re-observation rather than on the re-observed one. The same fix deletes two
+  live `assert`s in the detach path (`withdraw_rule_after_wedge_sweep_locked`, reached through
+  `detach_rule_locked`): the residue branch's `assert(eit->second.fifo.empty())` (the branch is reachable; the
+  counted, logged fallback stays) and the end-of-function `assert(disarm_key.has_value() ==
+  last_on_key)`. The second one aborted the agent when the last-on-key sweep released the detaching
+  rule's own owner tombstone, because `remove_rule` then returns nullopt for a key whose last rule is
+  going; the teardown is now gated on `last_on_key`, not on `remove_rule`'s return (pinned by the two
+  Catch2 cases named "#5322: ... tears the key down without aborting"). Coverage: the Catch2 cases whose names start "#4605:". Recorded as a
+  FOLLOW-UP decision, not done here: S1 last-attach-wins (a re-observation would withdraw a
+  same-rule pending claim on another key, which means rewriting the "re-observation touches no
+  index state" contract) and the adjacent already-committed-B / stale-adoption case (an adoption
+  refused with `wedge_adopt_stale_refused` after another key committed). #4472 is NOT fixed by this
+  fix: its Reobserved branch re-observes the same claim and does not touch the index.
 - **up-101 and cs-103 status (rung 9c PR-5a, #4221) - not previously listed as their
   own bullets in this section, added here for completeness.** up-101 (a same-rule
   re-attach behind a surviving tombstone leaking a watcher, `guardian_spark_
@@ -662,11 +811,11 @@ flip, with a red-first test each:
   Lost notification). Both closed by PR #4359, full governance pass, zero open
   BLOCKING findings on this PR at merge.
 - **K=3 wedge waiver / decision 1 status (rung 9c PR-5e, #4221): implemented,
-  pending merge as of this writing.** Full mechanism, K-eligibility settling
+  MERGED as PR #4529 (`869ea6a29`, 2026-09-18).** Full mechanism, K-eligibility settling
   requirement, and explicit scope narrowing documented in
   `docs/spark-stage2-guardian-consumer-design.md`'s "R5.3 as implemented (rung
-  9c PR-5e)" stamp - not restated here. This PR is the LAST in the 5a-5e
-  sub-ladder and carries `Closes #4221`; mark CLOSED here only once it merges.
+  9c PR-5e)" stamp - not restated here. That PR was the LAST in the 5a-5e
+  sub-ladder and carried `Closes #4221`; #4221 is CLOSED (2026-09-18).
 - **#4279 disposition (rung 9c PR-5e, per this row's own criterion above):
   ASSESSED against the landed K-bound logic, not resolved, remains open.** The
   lane-cap-overshoot observation (`SparkDetachedLane`'s shared admission
