@@ -570,8 +570,10 @@ runs are marked below.)
   was resumed after two timed-out probes, the same `DISCONNECTED` reached it three
   times and the server counted one `deregister` `session_mismatch` and one
   `unknown_session` for the extra copies, with no error and no change to the
-  final state. Only `DISCONNECTED` was held in that run, so a duplicate of any
-  other event type was not exercised.
+  final state. With five failed probes in a row the same `DISCONNECTED` reached
+  the server six times. A held `CONNECTED` used as the probe was also delivered
+  twice (the timed-out copy executed when the frozen server resumed, then the
+  resend) and changed no server desync counter; all 300 agents ended routable.
 - **Cap.** `notify_pending_max` (default 10000, see "Upstream client tuning")
   bounds the number of held keys, not agents. A notification for a new key that
   arrives when the store is full is dropped and counted in
@@ -608,7 +610,16 @@ delivered in their original order. For contrast, the previous build dropped all 
 (`reason="circuit_open"`) in three runs of the same outage, and the server still
 listed the 10 stopped agents as online about 2.6 minutes after the server resumed
 (10 route rows without a lease); the fixed build left none of them online and
-tombstoned their route rows.
+tombstoned their route rows. The previous build's stale
+registry entries were still online 20 minutes after the server resumed; only the
+route directory cleared (leases expired by 2 minutes, rows tombstoned at about 5
+minutes and deleted at about 10). Other probe paths observed: the open duration
+doubled and then held at the configured cap (5, 10, 20, 20 s with a 20 s cap, six
+half open periods, one probe each); a probe refused by a stopped server failed in
+under a millisecond and doubled the backoff; killing the probe worker produced
+one reopen and the event went back to the head; and a `ProxyRegister` retry that
+arrived while the probe was out drove the breaker transition, the late probe
+result left the breaker alone, and the event was still requeued.
 
 ---
 
