@@ -20,7 +20,9 @@
 %%%   The store is volatile: it is lost when this process stops or restarts.
 %%%   The cap bounds the retained keys only; it is not a memory ceiling, and
 %%%   casts still queue in the mailbox while a ProxyRegister, ProxyInventory or
-%%%   replay RPC runs inside this process.
+%%%   replay RPC runs inside this process. While a registration replay is active
+%%%   one of the ten slots is held back, so a backlog that refills every freed
+%%%   slot cannot keep the replay drip waiting until the backlog is empty.
 %%%
 %%% Includes a circuit breaker to prevent cascading failures when the
 %%% upstream server is unreachable. States:
@@ -583,7 +585,9 @@ handle_info(replay_next, #state{replay_queue = [{AgentId, SessionId, RegisterReq
                         prune_recent_replays(State1#state{replay_queue = []})
                 end
         end,
-    {noreply, report_notify_counts(Before, State2)};
+    %% The reserved slot is spent again as soon as the replay is over, and the
+    %% skip and abort paths above do not drain on their own.
+    {noreply, report_notify_counts(Before, drain(State2))};
 
 handle_info(circuit_half_open, State) ->
     logger:info("Circuit breaker: open -> half_open (allowing probe RPC)"),
@@ -945,24 +949,38 @@ cancel_timer(TRef) -> erlang:cancel_timer(TRef).
 %% free a slot, close the breaker or add an entry, so there is one send path
 %% and a new arrival never overtakes a held one.
 -spec drain(#state{}) -> #state{}.
-drain(#state{cb_state = closed, notify_pids = Pids, notify_pending = Pending} = State)
-        when map_size(Pids) < ?MAX_NOTIFY_INFLIGHT ->
-    case yuzu_gw_notify_queue:take(Pending) of
-        empty ->
+drain(#state{cb_state = closed, notify_pids = Pids, notify_pending = Pending,
+             replay_queue = Replay} = State) ->
+    case map_size(Pids) < notify_budget(Replay) of
+        false ->
             State;
-        {_Key, {AgentId, Notification}, Pending1} ->
-            {Pid, _MonRef} = spawn_monitor(fun() ->
-                case do_rpc('NotifyStreamStatus', Notification, notify_stream) of
-                    {ok, _} -> ok;
-                    {error, Reason} ->
-                        logger:warning("Failed to notify stream status for ~s: ~p",
-                                       [AgentId, Reason])
-                end
-            end),
-            drain(State#state{notify_pending = Pending1, notify_pids = Pids#{Pid => true}})
+        true ->
+            case yuzu_gw_notify_queue:take(Pending) of
+                empty ->
+                    State;
+                {_Key, {AgentId, Notification}, Pending1} ->
+                    {Pid, _MonRef} = spawn_monitor(fun() ->
+                        case do_rpc('NotifyStreamStatus', Notification, notify_stream) of
+                            {ok, _} -> ok;
+                            {error, Reason} ->
+                                logger:warning("Failed to notify stream status for ~s: ~p",
+                                               [AgentId, Reason])
+                        end
+                    end),
+                    drain(State#state{notify_pending = Pending1,
+                                      notify_pids = Pids#{Pid => true}})
+            end
     end;
 drain(State) ->
     State.
+
+%% @doc How many notify workers drain/1 may have in flight. While a registration
+%% replay is active one slot is held back: the replay drip waits for fewer than
+%% ?MAX_NOTIFY_INFLIGHT workers, and a backlog that refills every freed slot at
+%% once would keep it waiting until the backlog is empty (#4632).
+-spec notify_budget([term()]) -> pos_integer().
+notify_budget([]) -> ?MAX_NOTIFY_INFLIGHT;
+notify_budget(_ReplayQueue) -> ?MAX_NOTIFY_INFLIGHT - 1.
 
 %% @doc The two numbers the notify_queue gauges report: held keys and workers.
 -spec notify_counts(#state{}) -> {non_neg_integer(), non_neg_integer()}.
