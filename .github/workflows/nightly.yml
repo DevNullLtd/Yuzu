@@ -221,7 +221,7 @@ jobs:
           # Cost: null and alignment UB is NOT detected for any C++ in this leg (agent,
           # plugins, server), and no other leg runs those checks. ASan and the remaining
           # UBSan checks are unchanged.
-          # Tracking: #5167. Re-enable once yuzu_server_tests links with them (for
+          # Tracking: #5492. Re-enable once yuzu_server_tests links with them (for
           # example by scoping this flag to the server test target). An existing
           # build-linux-asan dir keeps the saved option across --reconfigure, so wipe it
           # or pass -Dcpp_args= when re-enabling.
