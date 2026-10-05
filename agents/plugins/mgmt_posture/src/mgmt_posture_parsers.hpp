@@ -6,7 +6,7 @@
 //
 // Linux: SSSD active-domain classification (sssd.conf + conf.d merged view) and the
 // IPA default.conf realm check. macOS: `profiles status -type enrollment`.
-// The deciding domain name is kept in the struct for tests only: device_identity
+// device_identity
 // owns the domain / OU / joined rows and they are never re-emitted here.
 //
 // The `status|posture|...` row is NOT built here; the legs' report_posture owns it.
@@ -17,6 +17,7 @@
 #include <cctype>
 #include <map>
 #include <optional>
+#include <set>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -78,7 +79,7 @@ struct IniDoc {
 /// `[section]` headers, `key = value` (trimmed), `#` / `;` comment lines and blank
 /// lines skipped, CRLF tolerated, never throws. LAST value wins for a repeated
 /// (section, key) and a re-opened section merges: that is how SSSD merges
-/// sssd.conf with conf.d/*.conf (snippets later in alphabetical order override), so
+/// sssd.conf with conf.d/*.conf (snippets later in byte order override), so
 /// a caller concatenating main + snippets in that order gets the merged view.
 inline IniDoc parse_ini(std::string_view text) {
     IniDoc doc;
@@ -170,11 +171,13 @@ inline SssdFacts sssd_facts(const IniDoc& doc) {
             return true;
         return std::nullopt;
     };
-    const auto is_declared = [&](const std::string& n) {
-        return std::ranges::find(declared, n) != declared.end();
-    };
-    const auto is_active = [&](const std::string& n) {
-        return std::ranges::find(f.active_domains, n) != f.active_domains.end();
+    const std::set<std::string> declared_set(declared.begin(), declared.end());
+    std::set<std::string> active_set;
+    const auto is_declared = [&](const std::string& n) { return declared_set.contains(n); };
+    const auto is_active = [&](const std::string& n) { return active_set.contains(n); };
+    const auto activate = [&](const std::string& n) {
+        active_set.insert(n);
+        f.active_domains.push_back(n);
     };
 
     const auto* list = detail::find_key(doc, "sssd", "domains");
@@ -182,14 +185,14 @@ inline SssdFacts sssd_facts(const IniDoc& doc) {
     if (!list) {
         for (const auto& n : declared)
             if (enabled_of(n) != false)
-                f.active_domains.push_back(n);
+                activate(n);
         return f;
     }
 
     std::string tok;
     const auto flush = [&] {
         if (!tok.empty() && is_declared(tok) && enabled_of(tok) != false && !is_active(tok))
-            f.active_domains.push_back(tok);
+            activate(tok);
         tok.clear();
     };
     for (char c : *list) {
@@ -201,7 +204,7 @@ inline SssdFacts sssd_facts(const IniDoc& doc) {
     flush();
     for (const auto& n : declared)
         if (enabled_of(n) == true && !is_active(n))
-            f.active_domains.push_back(n);
+            activate(n);
     return f;
 }
 
@@ -254,7 +257,8 @@ struct ProfilesEnrollment {
     std::optional<bool> mdm_enrolled;
     std::string mdm_server_host; ///< host component only, never the path (may hold a token)
 
-    bool recognised() const { return dep_enrolled || mdm_enrolled; }
+    /// The MDM line is the one the posture rows report; a DEP-only text is not recognised.
+    bool recognised() const { return mdm_enrolled.has_value(); }
 };
 
 namespace detail {
@@ -317,7 +321,7 @@ enum class Presence { present, absent, unknown };
 inline std::string posture_row(std::string_view key, std::string_view value) {
     std::string r(key);
     r += '|';
-    r += yuzu::util::safe_output_field(value);
+    r += yuzu::util::safe_output_field(yuzu::util::sanitize_utf8(std::string{value}));
     return r;
 }
 

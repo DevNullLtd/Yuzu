@@ -217,6 +217,22 @@ TEST_CASE("mgmt_posture: conf.d snippet selection", "[mgmt_posture]") {
     CHECK(too_many);
 }
 
+TEST_CASE("mgmt_posture: profiles output without the MDM line is not recognised", "[mgmt_posture]") {
+    // MUTATION: accepting a DEP-only text reports supported with mdm_enrolled|- for a changed
+    // or localised output.
+    CHECK_FALSE(parse_profiles_status("Enrolled via DEP: Yes\n").recognised());
+    CHECK(parse_profiles_status("MDM enrollment: No\n").recognised());
+}
+
+TEST_CASE("mgmt_posture: the MDM host row carries only valid UTF-8", "[mgmt_posture]") {
+    // MUTATION: dropping sanitize_utf8 lets invalid bytes reach the protobuf output row.
+    const auto e = parse_profiles_status(std::string("MDM enrollment: Yes\nMDM server: https://h\xff\xfe.example.com/x\n"));
+    const auto rows = macos_rows(e);
+    for (const auto& r : rows)
+        for (unsigned char c : r)
+            CHECK(c < 0x80);
+}
+
 TEST_CASE("mgmt_posture: row formatters", "[mgmt_posture]") {
     using V = std::vector<std::string>;
     CHECK(plane_token(Plane::ad) == "ad");

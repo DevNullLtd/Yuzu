@@ -121,6 +121,70 @@ TEST_CASE("L3 a conf.d readdir error is constrained, not a clean absent", "[mgmt
     expect(f.run(), StatusState::constrained, "linux:mgmt_posture:sssd_conf_d:eio");
 }
 
+TEST_CASE("L3b a failed conf.d listing reads none of the names it returned", "[mgmt_posture]") {
+    // MUTATION: dropping the clear lets an unsorted, uncapped partial list (up to 4096 names of
+    // up to 64 KiB each) be read and merged after the listing failed.
+    FakeFs f;
+    f.list_err = EIO;
+    for (int i = 0; i < 40; ++i)
+        f.names.push_back("snip" + std::to_string(i) + ".conf");
+    const auto p = f.run();
+    expect(p, StatusState::constrained, "linux:mgmt_posture:sssd_conf_d:eio");
+    CHECK(std::ranges::none_of(f.reads, [](const std::string& r) {
+        return r.find("snip") != std::string::npos;
+    }));
+}
+
+TEST_CASE("L3c a failed read of sssd.conf is constrained with plane unknown, never none",
+          "[mgmt_posture]") {
+    // MUTATION: dropping sssd_read_failed reports `plane|none` (unmanaged) beside CONSTRAINED.
+    for (int err : {EIO, EMFILE, ENOTDIR, kErrNotRegular, kErrOversized}) {
+        FakeFs f;
+        f.files[kSssdConf] = fail(err);
+        const auto p = f.run();
+        CHECK(p.status == StatusState::constrained);
+        CHECK(has(p, "plane|unknown"));
+    }
+}
+
+TEST_CASE("L3d two refused snippets name the token once", "[mgmt_posture]") {
+    FakeFs f;
+    f.list_err = 0;
+    f.names = {"10-a.conf", "20-b.conf"};
+    f.files["/etc/sssd/conf.d/10-a.conf"] = fail(EACCES);
+    f.files["/etc/sssd/conf.d/20-b.conf"] = fail(EACCES);
+    const auto p = f.run();
+    CHECK(p.status == StatusState::permission_denied);
+    CHECK(p.reason == "linux:mgmt_posture:sssd_conf_d:permission_denied");
+}
+
+TEST_CASE("L3e IPA realm alone, and a conf.d-only AD snippet, reach the plane row",
+          "[mgmt_posture]") {
+    // MUTATION: hard-coding ipa_present=false or sssd_present=false keeps every other case green.
+    FakeFs ipa;
+    ipa.files[kIpaConf] = ok("[global]\nrealm = IPA.EXAMPLE.COM\n");
+    const auto p1 = ipa.run();
+    CHECK(p1.status == StatusState::supported);
+    CHECK(has(p1, "plane|ipa"));
+
+    FakeFs snip;
+    snip.list_err = 0;
+    snip.names = {"10-ad.conf"};
+    snip.files["/etc/sssd/conf.d/10-ad.conf"] =
+        ok("[sssd]\ndomains = corp\n[domain/corp]\nid_provider = ad\n");
+    const auto p2 = snip.run();
+    CHECK(p2.status == StatusState::supported);
+    CHECK(has(p2, "plane|ad"));
+}
+
+TEST_CASE("L3f an IPA default.conf with an embedded NUL is constrained, never a clean none",
+          "[mgmt_posture]") {
+    // MUTATION: dropping the NUL check reports `supported` + `plane|none` for a corrupt file.
+    FakeFs f;
+    f.files[kIpaConf] = ok(std::string("[global]\nrealm = IPA\0.EXAMPLE.COM\n", 36));
+    expect(f.run(), StatusState::constrained, "linux:mgmt_posture:ipa_default_conf:invalid_bytes");
+}
+
 TEST_CASE("L4 too many snippets is constrained", "[mgmt_posture]") {
     FakeFs f;
     f.list_err = 0;
@@ -179,7 +243,7 @@ TEST_CASE("L9b an sssd.conf with an embedded NUL is constrained, never a clean n
           "[mgmt_posture]") {
     // MUTATION: dropping the NUL check reports `supported` + `plane|none` for a corrupt file.
     FakeFs f;
-    f.files[kSssdConf] = ok(std::string("[sssd]\ndomains = corp\0junk\n", 28));
+    f.files[kSssdConf] = ok(std::string("[sssd]\ndomains = corp\0junk\n", 27));
     const auto p = f.run();
     expect(p, StatusState::constrained, "linux:mgmt_posture:sssd_conf:invalid_bytes");
     CHECK(p.rows.size() == 5);

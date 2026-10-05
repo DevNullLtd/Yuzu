@@ -7,10 +7,10 @@
       ],
       "legs": {
         "linux": {
-          "fallback": "configuration as written, not the live join state; a 0600 sssd.conf reports permission_denied, never not-joined",
+          "fallback": "configuration as written, not the live join state; sssd.conf is root 0600, so an unprivileged agent reports permission_denied (plane unknown), never not-joined; a privileged agent reads it in full",
           "mechanism": "/etc/sssd/sssd.conf + /etc/sssd/conf.d/*.conf active domains, /etc/ipa/default.conf and /etc/krb5.keytab presence (bounded file reads)",
           "rung": "1",
-          "support": "supported"
+          "support": "constrained"
         },
         "macos": {
           "fallback": "MDM enrolment only; AD binding is device_identity.domain; Jamf not read",
@@ -29,7 +29,7 @@
   ],
   "caveats": [
     "**No documented customer driver.** No documented customer driver for this plugin was found (as in `local_security_policy`'s caveat); the reason it exists is the `device_identity` gap where a root-only `sssd.conf` reads as \"not joined\". Pure capability-gap reasoning.",
-    "**Configuration, not live state.** Linux reports what the files say, not whether the join is healthy. `conf.d` snippets are merged in byte order, not SSSD's locale collation, so a mixed-case snippet set can differ. Only snippets ending `.conf` are read (at most 32, 64 KiB each). `plane|none` means no SSSD AD or IPA domain was found: a host managed through `ldap`, `proxy` or `files` providers, or through winbind without SSSD, also reports `none`.",
+    "**Configuration, not live state.** Linux reports what the files say, not whether the join is healthy. `conf.d` snippets are merged in byte order, not SSSD's locale collation, so a mixed-case snippet set can differ. Only snippets ending `.conf` are read (at most 32, 64 KiB each). `plane|none` means no SSSD AD or IPA domain was found: `ldap`, `proxy` or `files` providers, or winbind without SSSD, also report `none`. A snippet SSSD would ignore (not root 0600) is still read if the agent can open it, and a containerised agent reads the image's `/etc`, not the host's.",
     "**Windows is planned.** The join and enrolment read (`NetGetJoinInformation`, the Enrollments and CloudDomainJoin registry keys) is not implemented; the leg reports one `unsupported` row, `windows:planned`.",
     "**Narrow scope.** macOS reports MDM enrolment only (Jamf is not read) and its `plane` is `-`: AD binding is `device_identity.domain`. No UPN or e-mail field exists; `tenant_id` is reserved and `-`.",
     "**Absent versus unknown.** `krb5_keytab|-` means presence could not be determined (a non-ENOENT `access()` failure, with a constrained token), not that the file is absent. The keytab is never opened."
@@ -65,7 +65,7 @@
     "gathered": true,
     "mutating": false
   },
-  "leg_hash": "b7575b7af2a2",
+  "leg_hash": "39319322f1b1",
   "manifest_version": 1,
   "name": "mgmt_posture",
   "outputs": [
@@ -135,9 +135,9 @@
       "definition_id": "crossplatform.security.mgmt_posture"
     }
   ],
-  "outputs_note": "Every row is pipe-delimited; field 0 is the row kind and the first row is always `status|posture|<supported\\|constrained\\|permission_denied\\|unsupported>|<reason or ->`. The data kinds are `plane`, `mdm_enrolled`, `mdm_provider`, `tenant_id` and `krb5_keytab`, each `kind|value`; `-` is an absent value. Linux emits all five (the three MDM rows as `-`), macOS emits `plane|-` plus the three MDM rows, and neither emits a row for what the other measures. `tenant_id` is reserved and always `-` today. `plane` is `unknown` only when a read was refused. `krb5_keytab|-` means presence could not be determined (caveat 5). Free text is escaped for the server's pipe grammar (`safe_output_field`). `mgmt_posture` is not in the server's key/value plugin set, so rows are decoded as pipe-separated fields.",
+  "outputs_note": "Every row is pipe-delimited; field 0 is the row kind and the first row is always `status|posture|<supported\\|constrained\\|permission_denied\\|unsupported>|<reason or ->`. The data kinds are `plane`, `mdm_enrolled`, `mdm_provider`, `tenant_id` and `krb5_keytab`, each `kind|value`; `-` is an absent value. Linux emits all five (`mdm_enrolled` and `mdm_provider` as `-`), macOS emits `plane|-` plus `mdm_enrolled`, `mdm_provider` and `tenant_id`, and neither reports a value for what the other measures. `tenant_id` is reserved and always `-` today. `plane` is `unknown` when a read was refused or the SSSD configuration could not be obtained because of a failed read. `krb5_keytab|-` means presence could not be determined (caveat 5). Free text is escaped for the server's pipe grammar (`safe_output_field`). `mgmt_posture` is not in the server's key/value plugin set, so rows are decoded as pipe-separated fields.",
   "platforms": {
-    "linux": "supported",
+    "linux": "constrained",
     "macos": "supported",
     "windows": "planned"
   },
@@ -157,7 +157,7 @@
       "runs_as": "agent daemon, default account"
     },
     {
-      "grant": "None to read, but `/etc/sssd/sssd.conf` is 0600 root by default, so the account cannot read it unless granted",
+      "grant": "None to read in a root or capability-granted agent, but `/etc/sssd/sssd.conf` is root 0600 (SSSD requires that mode and can hold a bind credential), so the default unprivileged account cannot read it. Loosening the file mode is not a remedy: it would break SSSD or expose the credential to every plugin. The real options are a capability such as `CAP_DAC_READ_SEARCH` on the agent binary, or accepting `plane|unknown`",
       "if_refused": "`PERMISSION_DENIED` / partial with `linux:mgmt_posture:sssd_conf:permission_denied` (or `...:sssd_conf_d:permission_denied`) and plane `unknown`; never reported as not joined",
       "measured": "Not measured on the `yuzu` account: a root capture bypasses permission bits",
       "os": "Linux",
@@ -174,7 +174,7 @@
     },
     {
       "completeness": "partial",
-      "provenance": "`linux:mgmt_posture:sssd_conf:<errno token>`, `linux:mgmt_posture:sssd_conf:no_domains_key`, `linux:mgmt_posture:sssd_conf:invalid_bytes`, `linux:mgmt_posture:sssd_conf_d:<errno token>`, `linux:mgmt_posture:sssd_conf_d:too_many`, `linux:mgmt_posture:ipa_default_conf:<errno token>`, `linux:mgmt_posture:krb5_keytab:<errno token>`",
+      "provenance": "`linux:mgmt_posture:sssd_conf:<errno token>`, `linux:mgmt_posture:sssd_conf:no_domains_key`, `linux:mgmt_posture:sssd_conf:invalid_bytes`, `linux:mgmt_posture:ipa_default_conf:invalid_bytes`, `linux:mgmt_posture:sssd_conf_d:<errno token>`, `linux:mgmt_posture:sssd_conf_d:too_many`, `linux:mgmt_posture:ipa_default_conf:<errno token>`, `linux:mgmt_posture:krb5_keytab:<errno token>`",
       "status": "`CONSTRAINED`",
       "when": "Linux: a read failed other than by refusal of `sssd.conf` or `conf.d` or by absence (an IPA file refusal is only constrained, the realm is also visible in `sssd.conf`; `too_many`: more than 32 `.conf` snippets, or more than 4096 directory entries, in `/etc/sssd/conf.d`); the plane is still classified from what was read. `<errno token>` is one of `permission_denied`, `eio`, `eloop`, `enotdir`, `enametoolong`, `not_regular`, `oversized` or `errno_<n>`"
     },
@@ -192,7 +192,7 @@
     },
     {
       "completeness": "partial",
-      "provenance": "`linux:mgmt_posture:sssd_conf:permission_denied`, `linux:mgmt_posture:sssd_conf_d:permission_denied`",
+      "provenance": "`linux:mgmt_posture:sssd_conf:permission_denied`, `linux:mgmt_posture:sssd_conf_d:permission_denied` (each once; accumulated constrained tokens such as a keytab errno may follow, comma-joined)",
       "status": "`PERMISSION_DENIED`",
       "when": "Linux: `sssd.conf`, the `conf.d` directory or a snippet could not be read; plane is `unknown`"
     },
@@ -236,7 +236,7 @@
       "stamp": {
         "date": "2026-10-04",
         "host_class": "container",
-        "leg_hash": "b7575b7af2a2",
+        "leg_hash": "39319322f1b1",
         "os": "linux",
         "os_version": "Debian GNU/Linux 13 (trixie) aarch64",
         "privilege": "euid 0"
@@ -268,7 +268,7 @@
       "stamp": {
         "date": "2026-10-04",
         "host_class": "bare-metal",
-        "leg_hash": "b7575b7af2a2",
+        "leg_hash": "39319322f1b1",
         "os": "macos",
         "os_version": "macOS 26.6.2 arm64",
         "privilege": "euid 501 (jsmith)"
@@ -290,7 +290,9 @@
     "capability_rows": [
       "server/core/src/capability_decls/plugin_action_catalogue_mgmt_posture.hpp"
     ],
-    "changelog": [],
+    "changelog": [
+      "changelog.d/2026-10-04-mgmt_posture.added.md"
+    ],
     "definitions": [
       "content/definitions/mgmt_posture.yaml"
     ],

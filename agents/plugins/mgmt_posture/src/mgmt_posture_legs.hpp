@@ -27,6 +27,7 @@
 #include <chrono>
 #include <functional>
 #include <optional>
+#include <algorithm>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -208,12 +209,18 @@ inline Posture posture_linux(const LinuxFs& fs) {
     // --- SSSD: sssd.conf then conf.d snippets, concatenated in precedence order ---
     std::string text;
     bool sssd_present = false;
+    bool sssd_read_failed = false; // a non-refusal failure: the SSSD config was not fully obtained
     const auto note = [&](int err, const char* part) {
         const std::string base = std::string("linux:mgmt_posture:") + part;
-        if (refused(err))
-            denied.push_back(base + ":permission_denied");
-        else
+        if (refused(err)) {
+            const std::string tok = base + ":permission_denied";
+            if (std::find(denied.begin(), denied.end(), tok) == denied.end())
+                denied.push_back(tok);
+        } else {
             acc.add_failure(base + ":" + errno_token(err));
+            if (std::string_view{part}.starts_with("sssd_conf"))
+                sssd_read_failed = true;
+        }
     };
 
     if (auto r = fs.read(kSssdConf); r.err == 0) {
@@ -225,8 +232,10 @@ inline Posture posture_linux(const LinuxFs& fs) {
 
     std::vector<std::string> snippets;
     bool too_many = false;
-    if (const int err = fs.list_conf_d(snippets, too_many); err != 0 && err != ENOENT)
+    if (const int err = fs.list_conf_d(snippets, too_many); err != 0 && err != ENOENT) {
         note(err, "sssd_conf_d");
+        snippets.clear(); // a listing that failed midway is neither complete nor ordered
+    }
     if (too_many)
         acc.add_failure("linux:mgmt_posture:sssd_conf_d:too_many");
     for (const auto& n : snippets) {
@@ -268,12 +277,18 @@ inline Posture posture_linux(const LinuxFs& fs) {
 
     // --- IPA: a refusal here is only constrained (the realm is also visible in sssd.conf) ---
     bool ipa_present = false;
-    if (const auto r = fs.read(kIpaConf); r.err == 0)
+    if (const auto r = fs.read(kIpaConf); r.err == 0) {
+        if (r.data.find('\0') != std::string::npos)
+            acc.add_failure("linux:mgmt_posture:ipa_default_conf:invalid_bytes");
         ipa_present = parse_ipa_default_conf_has_realm(parse_ini(r.data));
-    else if (r.err != ENOENT)
+    } else if (r.err != ENOENT)
         acc.add_failure("linux:mgmt_posture:ipa_default_conf:" + errno_token(r.err));
 
-    const auto plane = classify_linux(sssd, ipa_present);
+    auto plane = classify_linux(sssd, ipa_present);
+    // A read that failed for a reason other than refusal or absence means the SSSD config was
+    // not obtained: a "none" would read as "unmanaged", so say `unknown`.
+    if (plane == Plane::none && sssd_read_failed)
+        plane = Plane::unknown;
     return {acc.any_failure() ? StatusState::constrained : StatusState::supported, acc.reason(),
             linux_rows(plane, keytab)};
 }

@@ -31,12 +31,13 @@ constexpr size_t kFileCap = 64 * 1024;
 constexpr size_t kMaxSnippets = 32;
 constexpr size_t kMaxDirEntries = 4096; ///< enumeration budget: entries examined in conf.d
 
-// ponytail: private reader, migrates to agents/shared/posix_secure_read.hpp once that lands
+// ponytail: private reader. It follows symlinks by decision (root-owned /etc is the trust
+// anchor), so a later move onto agents/shared/posix_secure_read.hpp needs a follow-leaf variant.
 // Symlinks are followed on purpose: root-owned /etc is the trust anchor. O_NONBLOCK keeps
 // open(2) on a FIFO from wedging the dispatch thread before the S_ISREG check can run.
 ReadResult read_small_file(const char* path, size_t cap = kFileCap) {
     ReadResult out;
-    const yuzu::agent::ScopedFd fd(::open(path, O_RDONLY | O_NONBLOCK | O_CLOEXEC));
+    const yuzu::agent::ScopedFd fd(::open(path, O_RDONLY | O_NONBLOCK | O_NOCTTY | O_CLOEXEC));
     if (!fd) {
         out.err = errno;
         return out;
@@ -79,8 +80,9 @@ struct DirDeleter {
 /// Lists conf.d `*.conf` names (no dotfiles) into `out`, sorted and cut to kMaxSnippets by
 /// finalize_snippets. At most kMaxDirEntries entries are examined, which bounds memory;
 /// either overflow sets `too_many` (the caller reports constrained). Returns 0, or the errno
-/// of a failed opendir/readdir (a readdir error is NOT an end-of-directory: ENOENT only
-/// means absent when it comes from opendir).
+/// of a failed opendir/readdir. A readdir error is never an end-of-directory; the caller
+/// cannot tell an opendir ENOENT (absent) from a readdir ENOENT (directory removed mid-scan),
+/// and treats both as absent: a snapshot of a changing directory.
 int list_snippets(std::vector<std::string>& out, bool& too_many) {
     const std::unique_ptr<DIR, DirDeleter> d(::opendir(kSssdConfD));
     if (!d)
