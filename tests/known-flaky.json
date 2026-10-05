@@ -1,11 +1,1 @@
-[
-  {
-    "case": "PRODUCTION boot order: wire_spark_engine before start_local",
-    "platforms": ["all"],
-    "reason": "Boot re-arm refuses the 4th/5th Service rule when the compensating-disarm reservation is exhausted (log line: 'compensating-disarm reservation exhausted'). Exercised only at prefer_spark=true; 0.14.x production runs prefer_spark=false (legacy IGuard backend), so the refusal is not production-reachable on this line. Fixed on dev by PR #5184 (park and redrive), deliberately not back-ported to the 0.14.x hotfix line (1.2k product lines in guardian_spark_runtime). Remove when 0.15.0 is promoted to main.",
-    "issue": "https://github.com/DevNullLtd/Yuzu/issues/5168",
-    "owner": "fjarvis",
-    "added": "2026-10-05",
-    "expires": "2026-11-30"
-  }
-]
+[]
