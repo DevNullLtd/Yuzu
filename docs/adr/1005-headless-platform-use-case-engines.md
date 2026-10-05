@@ -520,6 +520,16 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        shipped REST/HTMX surface); wire reference:
        `docs/user-manual/rest-api.md`'s Hardware section.
 
+   - **2026-10-04 — `GET /api/v1/network-elements/collector-targets` (ADR-0068 D6/D10, PR
+     #5367; design-only until slice 1).** REST-only, no MCP twin, absent from operator route
+     discovery — a **permanent** exception, not a tracked follow-up: the route's only caller is
+     the network collector (gnmic's HTTP target loader) authenticating as a collector principal,
+     it returns element credentials in the clear, and an MCP twin would be a second
+     secret-egress path with no consumer. The exception relaxes no control — the route is gated
+     on a dedicated engine-principal predicate, fail-closed, all-or-503, audited per fetch — and
+     every operator-facing behaviour of the capability (inventory, state, attachments,
+     registration, credentials write-only) has REST + MCP twins.
+
 ## Interim rules (until the named follow-ups ship)
 
 - **No engine principal class exists** until the auth-architecture follow-up lands. Until then, integrations authenticate as themselves via existing API tokens, and the server accepts **no** on-behalf-of assertion on any surface — any such header/field is rejected, not ignored.
@@ -556,3 +566,11 @@ Accepted (tracking issue #4099). Shipped in-server: `on_behalf_guard.hpp`, `grpc
 Phase 7 (the vuln-management strangler re-home into a use-case engine under `engines/`, `docs/adr-1005-execution-plan.md`) has NOT started — no `engines/` directory exists. Grandfathered surface #2 is unchanged by this acceptance: it covers only the shipped NVD sync/matching and the absorbed ADR-0023 and ADR-4001 designed scopes, placement-only, outside-by-default beyond them (rider (b): ADR-4002 not absorbed). The remaining vuln ADRs (0001/0002/0005/0029/4002/4003/4004) are deferred into that future engine, not withdrawn, and are NOT grandfathered — each faces Decision 2 fresh at implementation. ADR-0028 (component inventory) is agent-side collection mechanism: deferred, but it stays core under Decision 2 and is not engine scope.
 
 Interim rules at acceptance: rule 1's "no engine principal class" clause is discharged by ADR-0031 (`engine_principal_store`) while its on-behalf-of ban remains live (`on_behalf_guard.hpp`, unamended by ADR-0032); rule 2 is discharged by `principal_quota_gate.hpp`; rule 3 is discharged by the published `docs/api-versioning-policy.md`; rule 4 (unverified-delegation audit marking) remains live and conditional on the delegation follow-up. Decisions 1–4 bind prospectively from 2026-09-07.
+
+## Appendix — Decision 2 boundary verdicts
+
+Maintainer verdicts on mechanism-vs-interpretation disputes, as Decision 2 provides. Each entry binds for the **class** it names, not only the case that raised it.
+
+| Date | Class | Verdict | Raised by |
+|---|---|---|---|
+| 2026-10-03 | **Connectors** — collection of **estate facts** from an external source that is not an agent daemon (a network element over gNMI, a management system's inventory, a file upload). An *estate fact* is a fact about the customer's own estate; external **domain data** (vulnerability feeds, threat intelligence, CVE/threat catalogues) is not one and stays engine territory under the tiebreaker above — this verdict does not move it. | **Core (mechanism).** Collecting, normalising and storing the facts is core; exposing them is through the versioned REST/MCP surface; **interpreting** them for a purpose (a service diagram, a scoring) remains engine territory by the existing tiebreakers. Settles the roadmap Phase 9 placement question (`docs/roadmap.md`, owner decision 2026-09-07). | ADR-0068 (network-element connector, gNMI via gnmic); PR #5367 |

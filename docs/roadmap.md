@@ -1099,6 +1099,13 @@ REST: `GET/POST/DELETE /api/v1/offload-targets`, `GET /api/v1/offload-targets/{i
 > would instead build on ADR-1005's engine-principal / REST+MCP-twin model. 9.8 (Inventory
 > Consolidation & Normalization, #263) closed NOT_PLANNED with no delivery (see its own
 > **Closed — not planned** status) and is unaffected by this deferral either way.
+>
+> **Owner verdict (2026-10-03): settled — connectors are core** (PR #5367). The verdict of record is
+> the row in ADR-1005's "Decision 2 boundary verdicts" appendix — given for the **class** (collection
+> of estate facts from an external source is mechanism), not one case, so the next connector does not
+> reopen it. First instance: the network-element connector (ADR-0068). The 9.x sketches remain
+> sketches; a re-plan keeps the **control plane in core** — the data plane may be an external,
+> non-Yuzu process (ADR-0068's collector is gnmic).
 
 The 9.x sketches predate ADR-0006; any future implementation is Postgres-native — ADR-0006:37-38 is the normative rule ("No new server-side SQLite store is added without an explicit exception ADR"), never SQLite. ADR-0012 is the author contract for whoever builds it, not the substrate rule itself.
 
