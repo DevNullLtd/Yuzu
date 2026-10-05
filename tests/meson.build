@@ -2981,21 +2981,14 @@ test('flake-retry selftest',
 # PR1.2 (ADR-3002 Decision-10a): pure-logic selftest of the lexical spawn gate —
 # a seeded raw-spawn fixture must fail and the sanctioned-runner allowlist case
 # must pass. Wired here so the gate's own matcher is enforced on every platform
-# with bash, mirroring the flake-retry selftest above. Guarded so Windows (no
-# bash) skips cleanly rather than erroring at configure.
+# with bash, mirroring the flake-retry selftest above. The Windows CI leg runs
+# every step under MSYS2 bash (ci.yml), so these bash tests do run there;
+# `required: false` only lets a bash-less developer host configure cleanly.
 _bash_test = find_program('bash', required: false)
 if _bash_test.found()
   test('plugin-spawn lexical gate selftest',
     _bash_test,
     args: [files('../scripts/ci/check-plugin-spawn-lexical.sh'), '--selftest'],
-    suite: 'docs',
-    timeout: 60,
-  )
-  # docs/plugin-readme-standard.md rule 7 — the README touch rule's own
-  # fixture run (a fake `git` on PATH; no repository, no network).
-  test('plugin readme touch-rule selftest',
-    _bash_test,
-    args: [files('../scripts/ci/check-plugin-readme-touch.sh'), '--selftest'],
     suite: 'docs',
     timeout: 60,
   )
@@ -3008,19 +3001,31 @@ if _bash_test.found()
     suite: 'docs',
     timeout: 120,
   )
-  # #5333: start-UAT.sh kill_stale signals only PIDs it recorded and refuses on
-  # foreign port holders. Sources the script with kill/ps/pgrep/lsof/docker
-  # replaced by functions; spawns and signals nothing. The decoy command line
-  # contains yuzu-agent, as the `meson compile` the old pgrep -f killed did.
-  # Budget: about 1 s on macOS and Linux, but 38-45 s on the Windows runners
-  # and over 60 s when other jobs share the box. 180 s is 4x the slowest clean
-  # Windows run; a real hang still trips it.
-  test('start-UAT.sh kill_stale scoping (#5333)',
-    _bash_test,
-    args: [files('shell/test_start_uat_kill_stale.sh')],
-    suite: 'docs',
-    timeout: 180,
-  )
+  # Registered off Windows only (#5428): both fork hundreds of subshells (about
+  # 1 s on macOS/Linux, 28-98 s under MSYS2 on the shared 4-runner Windows box)
+  # and exercise scripts that never run on Windows -- start-UAT.sh is the
+  # macOS/Linux rig (Windows uses scripts/win-start-UAT.sh) and the README
+  # touch rule runs on hosted Ubuntu (docs-lint.yml).
+  if host_machine.system() != 'windows'
+    # docs/plugin-readme-standard.md rule 7 — the README touch rule's own
+    # fixture run (a fake `git` on PATH; no repository, no network).
+    test('plugin readme touch-rule selftest',
+      _bash_test,
+      args: [files('../scripts/ci/check-plugin-readme-touch.sh'), '--selftest'],
+      suite: 'docs',
+      timeout: 60,
+    )
+    # #5333: start-UAT.sh kill_stale signals only PIDs it recorded and refuses on
+    # foreign port holders. Sources the script with kill/ps/pgrep/lsof/docker
+    # replaced by functions; spawns and signals nothing. The decoy command line
+    # contains yuzu-agent, as the `meson compile` the old pgrep -f killed did.
+    test('start-UAT.sh kill_stale scoping (#5333)',
+      _bash_test,
+      args: [files('shell/test_start_uat_kill_stale.sh')],
+      suite: 'docs',
+      timeout: 60,
+    )
+  endif
 endif
 
 # QE-INFO / build-ci B3: tests/shell/test_capability_matrix_gate.sh (PR1.1
