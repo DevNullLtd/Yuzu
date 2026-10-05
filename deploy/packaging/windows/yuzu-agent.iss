@@ -929,8 +929,8 @@ end;
 
 procedure CurStepChanged(CurStep: TSetupStep);
 begin
-  { Inno reaches ssPostInstall only after every file was installed and every
-    [Run] entry -- including the service start -- has run. Before it, a
+  { Inno reaches ssPostInstall only after every file was installed and each
+    entry of the Run section -- including the service start -- has run. Before it, a
     failure (a file that cannot be replaced, a cancel, a fatal error) rolls
     the installation back without running [Run]. }
   if CurStep = ssPostInstall then
