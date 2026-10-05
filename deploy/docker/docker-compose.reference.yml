@@ -69,8 +69,10 @@
 ## creates an EMPTY volume for a wrong name, hence the inspect first. Dump
 ## Postgres FIRST, then the keys (key files only accumulate, so a keys
 ## archive taken after the dump covers every key the dump references):
-##   P=docker; mkdir -p ~/yuzu-backups && chmod 700 ~/yuzu-backups && cd ~/yuzu-backups
-## The last command archives the CA + leaf certs + secrets KEK (the keys
+## Set P, and C to this file's absolute path (the recipes cd away from it):
+##   P=docker; C=/path/to/deploy/docker/docker-compose.reference.yml
+##   mkdir -p ~/yuzu-backups && chmod 700 ~/yuzu-backups && cd ~/yuzu-backups
+## The last docker run archives the CA + leaf certs + secrets KEK (the keys
 ## half of the pair). Go on only after "OK: backup written":
 ##   docker volume inspect "${P}_server-data" "${P}_certs" >/dev/null && \
 ##   docker exec yuzu-postgres pg_dump -U postgres --format=custom yuzu \
@@ -84,15 +86,21 @@
 ##   unrecoverable); pg_dump through the database is consistent against a
 ##   LIVE instance.
 ##
-## Restore (with server stopped):
-##   docker volume inspect "${P}_server-data" >/dev/null && \
-##   docker compose -f docker-compose.reference.yml stop server && \
+## Restore (from ~/yuzu-backups; the chain stops the server itself). It
+## puts back all three parts of the backup: the keys first, then the data
+## volume and the database. Go on only after "OK: restored":
+##   docker volume inspect "${P}_server-data" "${P}_certs" >/dev/null && \
+##   docker compose -f "$C" stop server && \
+##   docker run --rm -v "${P}_certs":/certs -v "$PWD":/backup alpine \
+##     tar xzf "/backup/yuzu-keys-YYYY-MM-DD.tar.gz" -C / && \
 ##   docker run --rm -v "${P}_server-data":/data -v "$PWD":/backup alpine \
 ##     tar xzf "/backup/yuzu-data-YYYY-MM-DD.tar.gz" -C /data && \
 ##   docker exec -i yuzu-postgres pg_restore --clean --if-exists --no-owner \
 ##     --role=yuzu -U postgres --dbname=yuzu < "yuzu-pg-YYYY-MM-DD.dump" && \
-##   docker compose -f docker-compose.reference.yml up -d server && \
+##   docker compose -f "$C" up -d server && \
 ##   echo "OK: restored" || echo "STOP: restore incomplete, see the error above"
+## "OK" means the steps ran; then check the server reaches /readyz (a
+## kek_unresolvable start means the keys and the dump are not a pair).
 ##
 ## Since 0.14.0 (ADR-0010) the Postgres dump holds
 ## ciphertext + wrapped DEKs only — DB and KeyProvider keys-dir backups are
