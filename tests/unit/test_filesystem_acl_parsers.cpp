@@ -14,10 +14,13 @@
 #include "filesystem_acl_parsers.hpp"
 #include "test_helpers.hpp"
 
+#include <cctype>
 #include <filesystem>
 #include <fstream>
+#include <optional>
 #include <sstream>
 #include <string>
+#include <utility>
 #include <vector>
 
 #if defined(__APPLE__)
@@ -125,10 +128,17 @@ TEST_CASE("decode_posix_acl_xattr: bad input is nullopt, never partial", "[files
     std::string bad_version = good;
     bad_version[0] = 0x01;
     CHECK_FALSE(decode_posix_acl_xattr(bad_version).has_value());
-    // header only: valid, zero entries
-    auto empty = decode_posix_acl_xattr(std::string_view{good}.substr(0, 4));
-    REQUIRE(empty.has_value());
-    CHECK(empty->empty());
+    // MUTATION: accepting these renders a corrupt blob as a genuine ACL.
+    // header only: zero entries is not an ACL the kernel would store
+    CHECK_FALSE(decode_posix_acl_xattr(std::string_view{good}.substr(0, 4)).has_value());
+    // an unknown tag is not kernel-generated (FUSE/9p without posix_acl), never an `other` entry
+    for (std::uint16_t tag : {std::uint16_t{0}, std::uint16_t{0x40}, std::uint16_t{0x77}}) {
+        std::string unknown = good;
+        unknown[4] = static_cast<char>(tag & 0xff);
+        unknown[5] = static_cast<char>(tag >> 8);
+        CAPTURE(tag);
+        CHECK_FALSE(decode_posix_acl_xattr(unknown).has_value());
+    }
 }
 
 TEST_CASE("format_posix_ace: numeric fallback and unknown tag", "[filesystem][acl][linux]") {
@@ -143,7 +153,7 @@ TEST_CASE("parse_acl_to_text: captured fixture", "[filesystem][acl][macos]") {
     auto acl = parse_acl_to_text(read_fixture("macos", "acl_to_text.txt"));
     REQUIRE(acl.has_value());
     CHECK(acl->acl_flags.empty());
-    REQUIRE(acl->entries.size() >= 4);
+    REQUIRE(acl->entries.size() == 4);
     // Fixture order is libSystem's canonical order: deny entries first.
     const auto& deny = acl->entries[0];
     CHECK(deny.kind == "group");
@@ -174,7 +184,7 @@ TEST_CASE("parse_acl_to_text: captured fixture", "[filesystem][acl][macos]") {
         CHECK(row == "ace|allow|user:" + e.uuid + "|read|-");
         principals.push_back(row);
     }
-    CHECK(principals.size() >= 2);
+    CHECK(principals.size() == 2);
     CHECK(principals[0] != principals[1]);
 }
 
@@ -190,7 +200,26 @@ TEST_CASE("parse_acl_to_text: header flags, inherited, malformed", "[filesystem]
     CHECK_FALSE(parse_acl_to_text("user:UUID:u:501:allow:read\n").has_value());  // no header
     CHECK_FALSE(parse_acl_to_text("").has_value());
     CHECK_FALSE(parse_acl_to_text("!#acl 12\n").has_value());
-    CHECK_FALSE(parse_acl_to_text("!#acl 1\nuser:UUID:u:501:allow\n").has_value());  // 5 fields
+    // MUTATION: requiring six fields rejects an ACE with an empty permission set, which makes
+    // the whole get_acl fail (acl_to_text prints no perms field for it).
+    auto no_perms = parse_acl_to_text("!#acl 1\nuser:FFFFEEEE-DDDD-CCCC-BBBB-AAAA00000046:_www:70:deny\n"
+                                      "user:85E6C1E9-58CF-44B9-B988-C43D934BF026:::allow,file_inherit\n");
+    REQUIRE(no_perms.has_value());
+    REQUIRE(no_perms->entries.size() == 2);
+    CHECK(no_perms->entries[0].perms.empty());
+    CHECK(format_macos_ace(no_perms->entries[0]) == "ace|deny|user:_www|-|-");
+    CHECK(format_macos_ace(no_perms->entries[1]) ==
+          "ace|allow|user:85E6C1E9-58CF-44B9-B988-C43D934BF026|-|file_inherit");
+    CHECK_FALSE(parse_acl_to_text("!#acl 1\nuser:UUID:u:501:\n").has_value());  // no verdict
+    // A ':' inside a name and CRLF line ends parse; hostile tokens stay inside their row.
+    auto colon = parse_acl_to_text("!#acl 1\r\nuser:UUID:a:b:501:allow:read\r\n");
+    REQUIRE(colon.has_value());
+    REQUIRE(colon->entries.size() == 1);
+    CHECK(colon->entries[0].name == "a:b");
+    auto hostile = parse_acl_to_text("!#acl 1\nuser:UUID:u:501:allow,x|ace:read|write\\\n");
+    REQUIRE(hostile.has_value());
+    const auto row = format_macos_ace(hostile->entries[0]);
+    CHECK(row == "ace|allow|user:u|read\\|write/|x\\|ace");
     CHECK_FALSE(parse_acl_to_text("!#acl 1\nuser:UUID:u:501:maybe:read\n").has_value());
     auto none = parse_acl_to_text("!#acl 1\n");
     REQUIRE(none.has_value());
@@ -234,6 +263,30 @@ TEST_CASE("format_win_ace: keeps the legacy four-field prefix", "[filesystem][ac
           "ace|allow|BUILTIN\\Users|0x001200a9|inherited");
     CHECK(format_win_ace(1, 0, "a|b", 0x1) == "ace|deny|a\\|b|0x00000001|-");
     CHECK(format_win_ace(0x42, 0, "x", 0) == "ace|other|x|0x00000000|-");
+    // An undecoded type carries `-` for the mask (a zero mask would read as "no rights"), and an
+    // empty principal is `-`. MUTATION: dropping either reverts to a fabricated 0x00000000 / empty field.
+    CHECK(format_win_ace(0xB, 0, "-", std::nullopt) == "ace|other|-|-|-");
+    CHECK(format_win_ace(0, 0, "", 0x1) == "ace|allow|-|0x00000001|-");
+}
+
+TEST_CASE("win_ace_sid_ok: revision 1, at most 15 sub-authorities, inside the ACE",
+          "[filesystem][acl][windows]") {
+    // MUTATION: dropping the length check hands a short ACE's SID to LookupAccountSidW, which
+    // reads sub-authorities past AceSize.
+    auto sid = [](unsigned rev, unsigned count) {
+        std::string s{static_cast<char>(rev), static_cast<char>(count), 0, 0, 0, 0, 0, 5};
+        s.append(4 * count, '\0');
+        return s;
+    };
+    const std::string head(8, 'h');
+    CHECK(win_ace_sid_ok(head + sid(1, 2), 8));
+    CHECK(win_ace_sid_ok(head + sid(1, 0), 8));
+    CHECK_FALSE(win_ace_sid_ok(head + sid(2, 1), 8));                  // revision
+    CHECK_FALSE(win_ace_sid_ok(head + sid(1, 16), 8));                 // > 15 sub-authorities
+    const std::string truncated = (head + sid(1, 3)).substr(0, head.size() + 8 + 4 * 3 - 1);
+    CHECK_FALSE(win_ace_sid_ok(truncated, 8));                         // sub-authority past the ACE
+    CHECK_FALSE(win_ace_sid_ok(head + std::string(4, 'x'), 8));        // no room for a SID header
+    CHECK(win_ace_sid_ok(std::string(12, 'h') + sid(1, 1), 12));       // object ACE offset
 }
 
 TEST_CASE("win_object_ace_sid_offset: 12 + 16 per present GUID", "[filesystem][acl][windows]") {

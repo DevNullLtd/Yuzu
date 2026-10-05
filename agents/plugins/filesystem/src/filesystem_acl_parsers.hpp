@@ -3,13 +3,15 @@
 // filesystem_acl_parsers.hpp -- pure ACL decoders/formatters for the
 // filesystem plugin's get_acl action.
 //
-// Portable and header-only: only <std> and <yuzu/string_utils.hpp>, no OS
+// Portable and header-only: only the standard library and <yuzu/string_utils.hpp>, no OS
 // headers, so every host compiles and unit-tests all three legs. The OS shells
 // (getxattr / acl_get_file / GetAce) feed these functions raw bytes or text.
 //
 // Every leg emits ONE cross-OS row shape:
 //
-//     ace|<type>|<principal>|<perms>|<flags>      (`-` = empty principal/flags)
+//     ace|<type>|<principal>|<perms>|<flags>      (`-` = empty principal/flags; perms is a
+//                                                  hex access mask on Windows, `-` for an
+//                                                  undecoded Windows type)
 //
 //   * Linux   <type> = user|group|mask|other; <flags> = `default` for entries
 //             of the directory default ACL, else `-`.
@@ -81,16 +83,23 @@ template <typename T> T le(std::string_view b, std::size_t off) {
 }
 }  // namespace detail
 
-/// nullopt on size < 4, a version other than 2, or trailing bytes that do not
-/// form a whole 8-byte entry -- never a partial vector.
+/// nullopt on size < 4, a version other than 2, no entries at all, an unknown tag, or trailing
+/// bytes that do not form a whole 8-byte entry -- never a partial vector. The kernel only
+/// writes the six known tags; anything else means the bytes are not kernel-generated (a FUSE or
+/// 9p filesystem without `posix_acl`) and must not render as a genuine entry.
 inline std::optional<std::vector<PosixAclEntry>> decode_posix_acl_xattr(std::string_view bytes) {
-    if (bytes.size() < 4 || (bytes.size() - 4) % 8 != 0 ||
+    if (bytes.size() < 12 || (bytes.size() - 4) % 8 != 0 ||
         detail::le<std::uint32_t>(bytes, 0) != kPosixAclVersion)
         return std::nullopt;
     std::vector<PosixAclEntry> out;
-    for (std::size_t off = 4; off < bytes.size(); off += 8)
-        out.push_back({detail::le<std::uint16_t>(bytes, off), detail::le<std::uint16_t>(bytes, off + 2),
+    for (std::size_t off = 4; off < bytes.size(); off += 8) {
+        const auto tag = detail::le<std::uint16_t>(bytes, off);
+        if (tag != kAclUserObj && tag != kAclUser && tag != kAclGroupObj && tag != kAclGroup &&
+            tag != kAclMask && tag != kAclOther)
+            return std::nullopt;
+        out.push_back({tag, detail::le<std::uint16_t>(bytes, off + 2),
                        detail::le<std::uint32_t>(bytes, off + 4)});
+    }
     return out;
 }
 
@@ -164,6 +173,8 @@ inline std::optional<MacosAcl> parse_acl_to_text(std::string_view text) {
     if (lines.empty() || lines[0].compare(0, kHeader.size(), kHeader) != 0)
         return std::nullopt;
     MacosAcl acl;
+    if (!lines[0].empty() && lines[0].back() == '\r')
+        lines[0].pop_back();
     std::string_view hdr_rest = std::string_view{lines[0]}.substr(kHeader.size());
     if (!hdr_rest.empty() && hdr_rest.front() != ' ')
         return std::nullopt;
@@ -176,21 +187,31 @@ inline std::optional<MacosAcl> parse_acl_to_text(std::string_view text) {
             continue;
         // The name may itself contain ':', so anchor on the first two and last three fields.
         auto f = detail::split(line, ':');
-        if (f.size() < 6)
-            return std::nullopt;
         const std::size_t n = f.size();
+        const auto is_verdict = [](const std::string& field) {
+            const auto first = field.substr(0, field.find(','));
+            return first == "allow" || first == "deny";
+        };
+        // Normal layout: ...:<id>:<verdict>:<perms>. An ACE with an empty permission set (written
+        // by acl_set_file, e.g. by a sync tool) prints with no perms field at all.
+        std::size_t verdict_at;
+        if (n >= 6 && is_verdict(f[n - 2]))
+            verdict_at = n - 2;
+        else if (n >= 5 && is_verdict(f[n - 1]))
+            verdict_at = n - 1;
+        else
+            return std::nullopt;
         MacosAclEntry e;
         e.kind = f[0];
         e.uuid = f[1];
-        for (std::size_t k = 2; k + 3 < n; ++k)
+        for (std::size_t k = 2; k + 1 < verdict_at; ++k)
             e.name += (k > 2 ? ":" : "") + f[k];
-        e.id = f[n - 3];
-        auto verdict = detail::split(f[n - 2], ',');
-        if (verdict[0] != "allow" && verdict[0] != "deny")
-            return std::nullopt;
+        e.id = f[verdict_at - 1];
+        auto verdict = detail::split(f[verdict_at], ',');
         e.allow = verdict[0] == "allow";
         e.flags.assign(verdict.begin() + 1, verdict.end());
-        e.perms = detail::split_nonempty(f[n - 1], ',');
+        if (verdict_at + 1 < n)
+            e.perms = detail::split_nonempty(f[verdict_at + 1], ',');
         acl.entries.push_back(std::move(e));
     }
     return acl;
@@ -207,7 +228,8 @@ inline std::string format_macos_ace(const MacosAclEntry& e) {
     else
         principal += e.uuid;
     return std::format("ace|{}|{}|{}|{}", e.allow ? "allow" : "deny", row_field(principal),
-                       detail::join_or_dash(e.perms), detail::join_or_dash(e.flags));
+                       row_field(detail::join_or_dash(e.perms)),
+                       row_field(detail::join_or_dash(e.flags)));
 }
 
 // ── Windows: plain-integer ACE formatting (no Windows headers) ──────────────
@@ -255,9 +277,23 @@ inline std::optional<std::size_t> win_object_ace_sid_offset(std::uint32_t object
     return off;
 }
 
+/// True when `ace` (exactly AceSize bytes) holds a well-formed SID at `sid_off`: revision 1, at
+/// most 15 sub-authorities, and the whole SID inside the ACE. Checked before the SID is handed to
+/// any Windows API, which would otherwise read past a short ACE.
+inline bool win_ace_sid_ok(std::string_view ace, std::size_t sid_off) {
+    if (ace.size() < sid_off + 8 || static_cast<unsigned char>(ace[sid_off]) != 1)
+        return false;
+    const auto count = static_cast<unsigned char>(ace[sid_off + 1]);
+    return count <= 15 && ace.size() >= sid_off + 8 + 4 * static_cast<std::size_t>(count);
+}
+
+/// `mask` is nullopt for a type this plugin does not decode: the row then carries `-` instead of
+/// a zero mask that would read as "no rights". An empty principal is `-` too.
 inline std::string format_win_ace(unsigned char type, unsigned char flags, std::string_view account,
-                                  std::uint32_t mask) {
-    return std::format("ace|{}|{}|0x{:08x}|{}", win_ace_type_name(type), row_field(account), mask,
+                                  std::optional<std::uint32_t> mask) {
+    return std::format("ace|{}|{}|{}|{}", win_ace_type_name(type),
+                       account.empty() ? std::string{"-"} : row_field(account),
+                       mask ? std::format("0x{:08x}", *mask) : std::string{"-"},
                        win_ace_flags(flags));
 }
 

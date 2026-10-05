@@ -44,6 +44,8 @@
 
 #include <algorithm>
 #include <array>
+#include <utility>
+#include <map>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -1042,10 +1044,9 @@ private:
         }
         LPWSTR sid_str = nullptr;
         if (!ConvertSidToStringSidW(sid, &sid_str))
-            return {};
-        auto account = yuzu::win::from_wide(sid_str);
-        LocalFree(sid_str);
-        return account;
+            return "-";
+        std::unique_ptr<void, decltype(&LocalFree)> sid_str_guard{sid_str, LocalFree};
+        return yuzu::win::from_wide(sid_str);
     }
 #elif defined(__linux__)
     struct XattrRead {
@@ -1068,7 +1069,7 @@ private:
         switch (e) {
         case ENODATA: r.kind = XattrRead::Kind::absent; break;
         case ENOTSUP: r.kind = XattrRead::Kind::unsupported; break;  // == EOPNOTSUPP on Linux
-        case ERANGE: r.kind = XattrRead::Kind::error; r.error = "acl too large"; break;
+        case ERANGE: r.kind = XattrRead::Kind::error; r.error = "acl too large (over 64 KiB)"; break;
         case EACCES:
         case EPERM:
             r.kind = XattrRead::Kind::error;
@@ -1121,20 +1122,36 @@ private:
             rows.emplace_back("acl|none|-");
             return std::nullopt;
         }
-        rows.emplace_back("acl|extended|-");
-        for (auto* attr : {&access, &def}) {
+        // Decode both before any NSS call: a malformed blob must not cost lookups.
+        std::vector<acl::PosixAclEntry> access_entries, default_entries;
+        for (auto [attr, out] : {std::pair{&access, &access_entries}, std::pair{&def, &default_entries}}) {
             if (attr->kind != XattrRead::Kind::present)
                 continue;
             auto entries = acl::decode_posix_acl_xattr({attr->data.data(), attr->data.size()});
             if (!entries)
-                return "acl xattr unparseable";
-            for (const auto& e : *entries) {
-                const bool qualified = e.tag == acl::kAclUser || e.tag == acl::kAclGroup;
-                rows.push_back(acl::format_posix_ace(
-                    e, qualified ? posix_qualifier_name(e.tag, e.id) : std::string{},
-                    attr == &def));
-            }
+                return "acl xattr malformed";
+            *out = std::move(*entries);
         }
+        rows.emplace_back("acl|extended|-");
+        // Name resolution is NSS, which has no deadline: each distinct (tag, id) is resolved once,
+        // and only the first kMaxNameLookups are; the rest print the numeric id, so a planted
+        // file with thousands of entries cannot pin the worker for N lookup timeouts.
+        constexpr std::size_t kMaxNameLookups = 64;
+        std::map<std::pair<std::uint16_t, std::uint32_t>, std::string> names;
+        const auto qualifier = [&](const acl::PosixAclEntry& e) -> std::string {
+            if (e.tag != acl::kAclUser && e.tag != acl::kAclGroup)
+                return {};
+            const auto key = std::make_pair(e.tag, e.id);
+            if (const auto it = names.find(key); it != names.end())
+                return it->second;
+            if (names.size() >= kMaxNameLookups)
+                return {};  // numeric id
+            return names.emplace(key, posix_qualifier_name(e.tag, e.id)).first->second;
+        };
+        for (const auto& e : access_entries)
+            rows.push_back(acl::format_posix_ace(e, qualifier(e), false));
+        for (const auto& e : default_entries)
+            rows.push_back(acl::format_posix_ace(e, qualifier(e), true));
         return std::nullopt;
     }
 #elif defined(__APPLE__)
@@ -1151,6 +1168,10 @@ private:
                 rows.emplace_back("acl|none|-");
                 return std::nullopt;
             }
+            if (e == ENOTSUP || e == EOPNOTSUPP) {  // man acl_get_file: the file system has no ACL retrieval
+                rows.emplace_back("acl|unsupported|-");
+                return std::nullopt;
+            }
             if (e == EACCES || e == EPERM)
                 return "acl_get_file failed (permission denied)";
             return std::format("acl_get_file failed ({})", std::generic_category().message(e));
@@ -1161,7 +1182,18 @@ private:
             return "acl_to_text failed";
         auto parsed = acl::parse_acl_to_text({text.get(), static_cast<size_t>(len)});
         if (!parsed)
-            return "acl text unparseable";
+            return "acl text malformed";
+        // The text is split on newlines, so a directory-service principal name that carried one
+        // could forge an entry. The kernel's own entry count is the cross-check.
+        std::size_t kernel_entries = 0;
+        for (int which = ACL_FIRST_ENTRY;; which = ACL_NEXT_ENTRY) {
+            acl_entry_t entry = nullptr;
+            if (::acl_get_entry(a.get(), which, &entry) != 0)
+                break;
+            ++kernel_entries;
+        }
+        if (kernel_entries != parsed->entries.size())
+            return "acl text malformed";
         rows.push_back("acl|extended|" + acl::detail::join_or_dash(parsed->acl_flags));
         for (const auto& e : parsed->entries)
             rows.push_back(acl::format_macos_ace(e));
@@ -1239,8 +1271,16 @@ private:
                     }
 
                     auto* header = static_cast<ACE_HEADER*>(ace);
+                    // Every field below is read only after the ACE is known to be long enough, and
+                    // the SID is validated against AceSize before any API sees it.
+                    const std::string_view ace_bytes{static_cast<const char*>(ace),
+                                                     header->AceSize};
+                    const auto malformed = [&] {
+                        ctx.write_output(std::format("error|malformed ACE at index {}", i));
+                        return 1;
+                    };
                     PSID sid = nullptr;
-                    ACCESS_MASK mask = 0;
+                    std::optional<std::uint32_t> mask;  // nullopt: a type this plugin does not decode
                     switch (header->AceType) {
                     case ACCESS_ALLOWED_ACE_TYPE:
                     case ACCESS_DENIED_ACE_TYPE:
@@ -1248,6 +1288,8 @@ private:
                     case ACCESS_DENIED_CALLBACK_ACE_TYPE: {
                         // Same leading layout; a callback ACE's condition blob follows the SID
                         // and is not decoded.
+                        if (!acl::win_ace_sid_ok(ace_bytes, 8))
+                            return malformed();
                         auto* a = static_cast<ACCESS_ALLOWED_ACE*>(ace);
                         sid = &a->SidStart;
                         mask = a->Mask;
@@ -1255,12 +1297,14 @@ private:
                     }
                     case ACCESS_ALLOWED_OBJECT_ACE_TYPE:
                     case ACCESS_DENIED_OBJECT_ACE_TYPE: {
+                        if (ace_bytes.size() < 12)
+                            return malformed();
                         auto* a = static_cast<ACCESS_ALLOWED_OBJECT_ACE*>(ace);
                         auto off = acl::win_object_ace_sid_offset(a->Flags, header->AceSize);
-                        if (!off) {
-                            ctx.write_output(std::format("error|malformed object ACE at index {}", i));
-                            return 1;
-                        }
+                        if (!off || !acl::win_ace_sid_ok(ace_bytes, *off))
+                            return malformed();
+                        // ACEs are DWORD-aligned and the offset is a multiple of 4: this is a
+                        // pointer into the live ACL, valid while `sd` is.
                         sid = reinterpret_cast<unsigned char*>(ace) + *off;
                         mask = a->Mask;
                         break;

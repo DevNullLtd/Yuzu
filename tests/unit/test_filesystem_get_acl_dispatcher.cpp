@@ -22,7 +22,9 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <memory>
 #include <optional>
+#include <set>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -53,6 +55,25 @@ std::vector<std::string> captured_rows(const std::string& captured) {
 }
 
 bool starts_with(const std::string& s, const std::string& p) { return s.rfind(p, 0) == 0; }
+
+/// Splits a row on unescaped '|' (a backslash-escaped pipe is data).
+std::vector<std::string> fields(const std::string& row) {
+    std::vector<std::string> out;
+    std::string cur;
+    for (std::size_t i = 0; i < row.size(); ++i) {
+        if (row[i] == '\\' && i + 1 < row.size() && row[i + 1] == '|') {
+            cur += '|';
+            ++i;
+        } else if (row[i] == '|') {
+            out.push_back(cur);
+            cur.clear();
+        } else {
+            cur += row[i];
+        }
+    }
+    out.push_back(cur);
+    return out;
+}
 
 #if defined(_WIN32)
 constexpr const char* kPluginExt = ".dll";
@@ -176,6 +197,20 @@ TEST_CASE("filesystem get_acl: a plain file reports owner, mode and an acl row, 
     for (const auto& r : rows)
         control = control || starts_with(r, "control|");
     CHECK(control);
+    // A file in %TEMP% always carries ACEs. Each row is `ace|<type>|<principal>|<mask>|<flags>`:
+    // exactly four unescaped '|' (escaped pipes in a principal are `\\|`).
+    std::size_t ace_rows = 0;
+    for (const auto& r : rows) {
+        if (!starts_with(r, "ace|"))
+            continue;
+        ++ace_rows;
+        std::size_t seps = 0;
+        for (std::size_t i = 0; i < r.size(); ++i)
+            if (r[i] == '|' && (i == 0 || r[i - 1] != '\\'))
+                ++seps;
+        CHECK(seps == 4);
+    }
+    CHECK(ace_rows >= 1);
 #else
     REQUIRE(rows.size() >= 5);
     CHECK(starts_with(rows[0], "owner|"));
@@ -213,10 +248,16 @@ std::string fixture_xattr_bytes(const std::string& name) {
 
 /// Sets `xattr` to the captured bytes; false (and a WARN) when the temp filesystem refuses
 /// POSIX ACL xattrs, so the case skips instead of failing on such a runner.
+/// A filesystem that does not do POSIX ACLs (ENOTSUP/EOPNOTSUPP) skips the case; any other
+/// failure (EINVAL for an unmapped uid, EPERM, ...) is a real problem and fails it, so the test
+/// cannot go green having asserted nothing.
 bool set_acl_xattr(const fs::path& target, const char* xattr, const std::string& blob) {
     if (::setxattr(target.c_str(), xattr, blob.data(), blob.size(), 0) == 0)
         return true;
-    WARN("filesystem under the temp dir does not accept POSIX ACL xattrs -- skipping");
+    const int e = errno;
+    if (e == ENOTSUP || e == EOPNOTSUPP)
+        return false;
+    FAIL("setxattr " << xattr << " failed unexpectedly: errno " << e);
     return false;
 }
 
@@ -237,7 +278,7 @@ TEST_CASE("filesystem get_acl: a directory with only a default ACL reports every
     fs::create_directories(dir.path);
     const auto blob = fixture_xattr_bytes("posix_acl_default.hex");
     if (!set_acl_xattr(dir.path, "system.posix_acl_default", blob))
-        return;
+        SKIP("the temp filesystem does not support POSIX ACL xattrs");
     const auto result = get_acl(*plugin, dir.path.string());
     CHECK(result.rc == 0);
     bool extended = false;
@@ -263,7 +304,7 @@ TEST_CASE("filesystem get_acl: a file with an access ACL reports its entries, no
     const auto file = make_file(dir);
     const auto blob = fixture_xattr_bytes("posix_acl_access.hex");
     if (!set_acl_xattr(file, "system.posix_acl_access", blob))
-        return;
+        SKIP("the temp filesystem does not support POSIX ACL xattrs");
     const auto result = get_acl(*plugin, file.string());
     CHECK(result.rc == 0);
     bool extended = false;
@@ -277,6 +318,17 @@ TEST_CASE("filesystem get_acl: a file with an access ACL reports its entries, no
     }
     CHECK(extended);
     CHECK(ace_rows == expected_entries(blob));
+    // The fixture's permission columns (getfacl: rw-, rw-, r--, r-x, rwx, r--), as a multiset:
+    // a plugin that swapped rwx bits or dropped the perms would still pass the row count.
+    std::multiset<std::string> perms;
+    for (const auto& r : captured_rows(result.captured)) {
+        if (!starts_with(r, "ace|"))
+            continue;
+        const auto f = fields(r);
+        REQUIRE(f.size() == 5);
+        perms.insert(f[3]);
+    }
+    CHECK(perms == std::multiset<std::string>{"rw-", "rw-", "r--", "r-x", "rwx", "r--"});
 }
 #endif
 
@@ -291,18 +343,19 @@ TEST_CASE("filesystem get_acl: a file with an extended ACL reports its allow ent
 
     uuid_t who;
     uuid_generate_random(who);  // unresolved on purpose: the row names the UUID
-    acl_t acl = acl_init(1);
-    REQUIRE(acl != nullptr);
+    std::unique_ptr<std::remove_pointer_t<acl_t>, int (*)(void*)> acl{acl_init(1), acl_free};
+    REQUIRE(acl);
     acl_entry_t entry = nullptr;
-    REQUIRE(acl_create_entry(&acl, &entry) == 0);
+    acl_t raw = acl.release();  // acl_create_entry may reallocate, so hand it the raw handle
+    const int create_rc = acl_create_entry(&raw, &entry);
+    acl.reset(raw);
+    REQUIRE(create_rc == 0);
     REQUIRE(acl_set_tag_type(entry, ACL_EXTENDED_ALLOW) == 0);
     REQUIRE(acl_set_qualifier(entry, who) == 0);
     acl_permset_t perms = nullptr;
     REQUIRE(acl_get_permset(entry, &perms) == 0);
     REQUIRE(acl_add_perm(perms, ACL_READ_DATA) == 0);
-    const int set_rc = acl_set_file(file.c_str(), ACL_TYPE_EXTENDED, acl);
-    acl_free(acl);
-    REQUIRE(set_rc == 0);
+    REQUIRE(acl_set_file(file.c_str(), ACL_TYPE_EXTENDED, acl.get()) == 0);
 
     const auto result = get_acl(*plugin, file.string());
     CHECK(result.rc == 0);

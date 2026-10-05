@@ -538,7 +538,7 @@ metadata:
   description: >
     Retrieve access control list (ACL) or permissions for a file or
     directory. On Windows, returns the SDDL representation and individual
-    ACE entries (allow/deny, account, access mask). On Linux/macOS,
+    ACE entries (type, account, access mask, inheritance flags) and a `control` row. On Linux/macOS,
     returns owner, group and permission mode (rwxrwxrwx) plus the extended
     ACL: POSIX access and default entries on Linux, allow/deny entries with
     principal, rights and inheritance flags on macOS.
@@ -589,7 +589,7 @@ spec:
       - name: account
         type: string
         description: >-
-          The principal: DOMAIN\account or SID on Windows; user:<name>, group:<name>, user:#<id> or user:<UUID> (unresolved) on macOS; the qualifier name or numeric id, or - for the owner/owning-group/mask/other entries on Linux. Values: free text.
+          The principal: DOMAIN\account or SID on Windows; <kind>:<name>, <kind>:#<id> or <kind>:<UUID> (unresolved) on macOS, <kind> being user or group; the qualifier name or numeric id, or - for the owner/owning-group/mask/other entries on Linux. Values: free text.
         example: "NT AUTHORITY\\SYSTEM"
         platforms: [windows, linux, darwin]
       - name: access_mask

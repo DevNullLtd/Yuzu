@@ -1,10 +1,10 @@
 File: acl_to_text.txt -- libSystem acl_to_text() output (ACL_TYPE_EXTENDED), one ACL.
-REAL CAPTURES, joined under one header. Host braga (this Mac), macOS 26.6.2, arm64, captured 2026-10-04.
+REAL CAPTURES, joined under one header. host braga (macOS 26.6.2 arm64), macOS 26.6.2, arm64, captured 2026-10-04.
 
 Entries 1-2 (resolved), on a scratch directory d:
   chmod +a "group:staff deny write,limit_inherit" d
   chmod +a "<login> allow read,file_inherit,directory_inherit,only_inherit" d
-  acl_get_file(d, ACL_TYPE_EXTENDED) + acl_to_text() (8-line C program, scratchpad)
+  acl_get_file(d, ACL_TYPE_EXTENDED) + acl_to_text() (a short C program calling acl_get_file and acl_to_text)
 libSystem emits deny entries first, hence the group line precedes the user line.
 Redaction: the login name was replaced by `_user` (README standard rule 5); its UUID and uid 501 are as captured.
 
