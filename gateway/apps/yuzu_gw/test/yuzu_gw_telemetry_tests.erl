@@ -35,18 +35,18 @@ notify_dropped_test_() ->
      end,
      fun(_) -> catch telemetry:detach(yuzu_gw_prometheus) end,
      [
-      {"circuit_open drop reaches the real Prometheus counter",
+      {"a drop with a reason outside the closed set still reaches its own label",
        fun() ->
            Before = counter_val(yuzu_gw_upstream_notify_dropped_total,
-                                 [<<"circuit_open">>]),
+                                 [<<"other_reason">>]),
            telemetry:execute([yuzu, gw, upstream, notify_dropped],
-                             #{count => 1}, #{reason => <<"circuit_open">>}),
+                             #{count => 1}, #{reason => <<"other_reason">>}),
            ?assertEqual(Before + 1,
                         counter_val(yuzu_gw_upstream_notify_dropped_total,
-                                    [<<"circuit_open">>]))
+                                    [<<"other_reason">>]))
        end},
       {"at_capacity drop reaches the real Prometheus counter, labeled "
-       "distinctly from circuit_open",
+       "distinctly from any other reason",
        fun() ->
            Before = counter_val(yuzu_gw_upstream_notify_dropped_total,
                                  [<<"at_capacity">>]),

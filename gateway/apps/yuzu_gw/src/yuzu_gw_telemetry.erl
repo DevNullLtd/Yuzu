@@ -38,6 +38,8 @@
     [yuzu, gw, upstream, circuit_state],
     [yuzu, gw, upstream, registration_replay],
     [yuzu, gw, upstream, notify_dropped],
+    [yuzu, gw, upstream, notify_queue],
+    [yuzu, gw, upstream, notify_coalesced],
     [yuzu, gw, upstream, registration_replay_triggered],
 
     %% Guardian side-channel forwarding (agent drift events -> control plane)
@@ -181,17 +183,30 @@ handle_event([yuzu, gw, upstream, registration_replay],
     prometheus_gauge:set(yuzu_gw_registration_replay_queue_depth, [node()], Q);
 
 %% HA WS-4 4.4 round-2 review (Gate 3 finding NEW-1 / Gate 6 COMP-2, NEW-2):
-%% yuzu_gw_upstream:handle_cast({notify_stream_status, ...}) emits this on
-%% BOTH drop paths (circuit_open | at_capacity) — without this clause the
-%% event fires into an unregistered telemetry event and never reaches
-%% Prometheus, same failure shape `forward_dropped` above exists to avoid,
-%% and specifically the failure mode that made the original F2 fix a no-op:
-%% a dropped CONNECTED for an ADOPTED replay session (this slice's
-%% reannounce/2 mechanism) left gateway_node/wire_capabilities/
-%% stream_home_id unconverged with literally zero operator-visible signal.
+%% yuzu_gw_upstream emits this when the notify pending store refuses a new
+%% key because it already holds `notify_pending_max` keys (#4632: reason is
+%% `at_capacity` only; `circuit_open` is no longer emitted because a notify
+%% arriving with the breaker not closed is now held, not dropped). Without
+%% this clause the event fires into an unregistered telemetry event and never
+%% reaches Prometheus, same failure shape `forward_dropped` below exists to
+%% avoid. The reason label is taken as given, so the handler stays generic.
 handle_event([yuzu, gw, upstream, notify_dropped], #{count := N}, Meta, _Config) ->
     Reason = maps:get(reason, Meta, <<"unknown">>),
     prometheus_counter:inc(yuzu_gw_upstream_notify_dropped_total, [Reason], N);
+
+%% #4632: size of the notify pending store and the number of NotifyStreamStatus
+%% workers the upstream gen_server tracks, reported together because every
+%% handler that changes one may change the other. Emitted whenever either
+%% changed and once with zeros from yuzu_gw_upstream:init/1.
+handle_event([yuzu, gw, upstream, notify_queue],
+             #{pending := P, inflight := I}, _Meta, _Config) ->
+    prometheus_gauge:set(yuzu_gw_upstream_notify_pending, [node()], P),
+    prometheus_gauge:set(yuzu_gw_upstream_notify_inflight, [node()], I);
+
+%% #4632: a held notification replaced by a newer event for the same agent
+%% session (suppression, not delivery).
+handle_event([yuzu, gw, upstream, notify_coalesced], #{count := N}, _Meta, _Config) ->
+    prometheus_counter:inc(yuzu_gw_upstream_notify_coalesced_total, [], N);
 
 %% Guardian side-channel forwarding. `forward_accepted` is the denominator for a
 %% drop-rate SLO; `forward_dropped` is split by reason (circuit_open | at_capacity).
@@ -438,13 +453,24 @@ declare_metrics() ->
     prometheus_counter:declare([
         {name, yuzu_gw_upstream_notify_dropped_total},
         {labels, [reason]},
-        {help, "Stream-status (CONNECTED/DISCONNECTED) notifications dropped "
-               "before delivery to the C++ server, by reason (circuit_open | "
-               "at_capacity). Includes HA WS-4 4.4's reannounce/2-triggered "
-               "CONNECTED after a replay-adopted session -- a sustained "
-               "non-zero rate here means agents are converging their "
-               "gateway_node placement slower than expected, or not at all, "
-               "during a recovery replay burst."}]),
+        {help, "Stream-status (CONNECTED/DISCONNECTED) notifications lost at "
+               "admission because the pending store already held "
+               "notify_pending_max keys. The label reason has the single value "
+               "at_capacity (the circuit_open value is no longer emitted: a "
+               "notification arriving while the breaker is not closed is held). "
+               "It does not count delivery loss after admission (worker failure, "
+               "gateway shutdown). A sustained non-zero rate means agents are "
+               "converging their gateway_node placement slower than expected, or "
+               "not at all, during a connect burst or recovery replay."}]),
+    %% A series that first appears already at 1 is invisible to increase().
+    prometheus_counter:inc(yuzu_gw_upstream_notify_dropped_total,
+                           [<<"at_capacity">>], 0),
+    prometheus_counter:declare([
+        {name, yuzu_gw_upstream_notify_coalesced_total},
+        {labels, []},
+        {help, "Held stream-status notifications replaced by a newer event for "
+               "the same agent session"}]),
+    prometheus_counter:inc(yuzu_gw_upstream_notify_coalesced_total, [], 0),
     prometheus_counter:declare([
         {name, yuzu_gw_guardian_forward_accepted_total},
         {labels, []},
@@ -639,6 +665,20 @@ declare_metrics() ->
         {labels, [node]},
         {help, "Agents still queued for registration replay (0 = idle; "
                "a persistently non-zero value indicates a replay storm)"}]),
+    prometheus_gauge:declare([
+        {name, yuzu_gw_upstream_notify_pending},
+        {labels, [node]},
+        {help, "Stream-status notifications held because the in-flight limit is "
+               "reached or the upstream circuit breaker is not closed; drained "
+               "first in first out (0 = nothing held)"}]),
+    prometheus_gauge:declare([
+        {name, yuzu_gw_upstream_notify_inflight},
+        {labels, [node]},
+        {help, "NotifyStreamStatus workers tracked by this gateway process (at "
+               "most 10)"}]),
+    %% Series at 0 from startup, before yuzu_gw_upstream:init/1 has reported.
+    prometheus_gauge:set(yuzu_gw_upstream_notify_pending, [node()], 0),
+    prometheus_gauge:set(yuzu_gw_upstream_notify_inflight, [node()], 0),
     prometheus_gauge:declare([
         {name, yuzu_gw_cluster_peers_resolved},
         {labels, [node]},
