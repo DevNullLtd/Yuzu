@@ -3,12 +3,13 @@
  * contract (#2298 gate 3, item 6d; #2993 added the 4th counter; #4783 commit 4 added
  * the 5th/6th - legacy-sink loss visibility, same shape, unrelated feature; a #4783
  * governance follow-up added the 7th - the pre-network-arm legacy-sink drop, wired to
- * fleet visibility for the first time; #5403 added the 8th, #5404 the 9th to 19th - the Spark
- * claim-lifecycle counters and the retained-tombstone count).
+ * fleet visibility for the first time; #5403 added the 8th, #4472 the 9th, #5404 the 10th to
+ * 20th - the Spark claim-lifecycle counters and the retained-tombstone count).
  *
  * Mirrors test_guardian_journal_fleet_tags.cpp's four-way bind for the health family
- * (the counter table is plain sparse cumulative counters; the #5403 pending-Disarm age is
- * the one exception and lives in its own MAX table, pinned by the last three cases below):
+ * (the counter table is plain sparse cumulative counters; the #5403 pending-Disarm and #4472
+ * compensation-teardown ages are the exception and live in their own MAX table, pinned by the
+ * "guardian disarm age" and "guardian compensation age" cases below):
  *
  *  - STRUCTURAL: sizeof(GuardianHealthStats) pins the field count to the table row
  *    count, so adding a counter without a fleet gauge is a COMPILE error.

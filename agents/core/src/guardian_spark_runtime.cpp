@@ -2748,10 +2748,10 @@ std::size_t GuardianSparkRuntime::expire_overdue_claims(std::chrono::steady_cloc
     for (const auto& w : disarm_warns) {
         try {
             spdlog::warn("Guardian spark: the Disarm for key '{}' has been pending for {} s "
-                         "(observation threshold {} s); its key, its class quota slot and, if "
-                         "the backend call is blocked inside a mechanism, that mechanism type "
-                         "stay held until it returns - nothing was released (pending-too-long, "
-                         "not proof the call hung)",
+                         "(observation threshold {} s); its key stays held, and if its backend "
+                         "call was admitted its class quota slot and, if the call is blocked "
+                         "inside a mechanism, that mechanism type stay held until it returns - "
+                         "nothing was released (pending-too-long, not proof the call hung)",
                          ::yuzu::log_key_token(w.key),
                          std::chrono::duration_cast<std::chrono::seconds>(w.age).count(),
                          kDisarmPendingObserveThreshold.count());

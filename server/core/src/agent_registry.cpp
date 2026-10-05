@@ -2206,11 +2206,13 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
     for (const auto& m : kGuardianJournalAgeMetrics)
         metrics.clear_gauge_family(m.gauge);
     // Guardian M1 health-stream telemetry (#2298 gate 3, item 6d; #2993 added a 4th
-    // family, #4783 added the 5th/6th/7th - legacy-sink loss visibility) - same
+    // family, #4783 added the 5th/6th/7th - legacy-sink loss visibility; #5403, #4472 and
+    // #5404 added the Spark rows; kGuardianHealthMetrics is authoritative for the set) - same
     // absent-not-zero rule and same reason it bites hardest here: the writer is
-    // sparse, so a healthy fleet must see all 7 families ABSENT, never a fabricated
-    // 0; an inert (prefer_spark off) fleet still reports the 3 legacy_sink_* families
-    // live (they don't depend on the Spark flip - see guardian_health_fleet_tags.hpp).
+    // sparse, so a healthy fleet must see every family ABSENT, never a fabricated
+    // 0. The 3 legacy_sink_* families do not depend on the Spark flip (prefer_spark),
+    // so they are live on an inert fleet but still sparse: absent while they read 0
+    // (see guardian_health_fleet_tags.hpp).
     for (const auto& m : kGuardianHealthMetrics)
         metrics.clear_gauge_family(m.gauge);
     // #5403: the pending-Spark-Disarm AGE family (MAX). Same rule: the writer emits the tag
@@ -2409,9 +2411,10 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
             keys[i] = kGuardianHealthMetrics[i].tag;
         return keys;
     }();
-    // #5403: the health family's one AGE row accumulates as MAX, never SUM, exactly like
-    // the journal age family (gja_max): a sum of ages is meaningless and the question is
-    // "how long has the worst endpoint's Disarm been pending". `reported` gates publish, so
+    // #5403, #4472: the health family's AGE rows (kGuardianHealthAgeMetrics) accumulate as
+    // MAX, never SUM, exactly like the journal age family (gja_max): a sum of ages is
+    // meaningless and the question is "how long has the worst endpoint's Disarm (or
+    // compensating teardown) been pending". `reported` gates publish, so
     // MAX over an empty set is absence, never a fabricated 0.
     std::array<double, kNGuardianHealthAgeMetrics> gha_max{};
     std::array<bool, kNGuardianHealthAgeMetrics> gha_reported{};
@@ -3034,7 +3037,7 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
     for (std::size_t i = 0; i < kNGuardianHealthMetrics; ++i)
         if (gh_reported[i])
             metrics.gauge(kGuardianHealthMetrics[i].gauge).set(gh_sum[i]);
-    // #5403: the AGE row's fleet MAX, same absent-when-unreported rule.
+    // #5403, #4472: the AGE rows' fleet MAX, same absent-when-unreported rule.
     for (std::size_t i = 0; i < kNGuardianHealthAgeMetrics; ++i)
         if (gha_reported[i])
             metrics.gauge(kGuardianHealthAgeMetrics[i].gauge).set(gha_max[i]);

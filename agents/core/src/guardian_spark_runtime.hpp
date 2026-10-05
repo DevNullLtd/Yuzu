@@ -1676,18 +1676,22 @@ public:
     /// hot path, and never to be called with registry_mu_ held (the scan has a _locked twin).
     ///
     /// POLICY (observation only). The runtime never releases, pops or force-cancels a
-    /// pending Disarm. While one is pending it holds, in order of blast radius: its KEY (a
-    /// same-key Arm queues behind it and, at its own deadline, ends CongestionExpired), the
-    /// executor QUOTA slot of its IoClass until the backend call returns (when a class's
-    /// slots are all held, every later arm of that class is refused and parked, #5168), and,
-    /// if the call is blocked inside a mechanism, SparkEngine's per-TYPE lock (every other
-    /// arm and disarm of that type waits behind it; the mechanism contract, not this class,
-    /// is what bounds that). Releasing the claim early would let the key's next Arm run while
-    /// the old teardown may still be running: the teardown-before-rearm hazard that
-    /// submit_disarm_off_lock's comment records as removed by construction; and it could not
-    /// free anything physical anyway, since the worker, the executor's key and the quota slot
-    /// stay held until the call returns. Recovery from a call that never returns is an agent
-    /// restart, or --spark-disable as the rollback lever.
+    /// pending Disarm. What a pending Disarm holds depends on its state. In every state it
+    /// holds its KEY (a same-key Arm queues behind it and, at its own deadline, ends
+    /// CongestionExpired). Only while an ADMITTED backend call is running (Dispatched) does
+    /// it also hold the executor QUOTA slot of its IoClass, until fn() returns (when a
+    /// class's slots are all held, every later arm of that class is refused and parked,
+    /// #5168), and, if that call is blocked inside a mechanism, SparkEngine's per-TYPE lock
+    /// (every other arm and disarm of that type waits behind it; the mechanism contract, not
+    /// this class, is what bounds that). A Queued Disarm, including a retained one (refused
+    /// at admission, so the backend call never ran, or its worker threw), holds only its key:
+    /// it has no admitted call and so no slot. Releasing the claim early would let the key's
+    /// next Arm run while the old teardown may still be running: the teardown-before-rearm
+    /// hazard that submit_disarm_off_lock's comment records as removed by construction; and,
+    /// for an admitted call, it could not free anything physical anyway, since the worker,
+    /// the executor's key and the quota slot stay held until the call returns. Recovery from
+    /// a call that never returns is an agent restart, or --spark-disable as the rollback
+    /// lever.
     ///
     /// WHAT THIS DOES NOT SEE: a compensating disarm (tracked on an ARM claim; see
     /// oldest_outstanding_compensation_age() and compensation_deadline_elapsed()),
@@ -1698,7 +1702,7 @@ public:
     oldest_pending_disarm_age(std::chrono::steady_clock::time_point now) const;
     /// #5403: Disarm claims observed pending longer than kDisarmPendingObserveThreshold by
     /// expire_overdue_claims(), counted once per claim (KeyClaim::disarm_deadline_observed
-    /// latches). Observation only - the claim, its worker and its quota slot are untouched;
+    /// latches). Observation only - the claim, its worker and any quota slot are untouched;
     /// the compensation_deadline_elapsed() precedent. Lock-free.
     [[nodiscard]] std::uint64_t disarm_deadline_elapsed() const noexcept {
         return disarm_deadline_elapsed_.load(std::memory_order_relaxed);
@@ -1713,10 +1717,14 @@ public:
     /// which selects ClaimKind::Disarm only and by design never sees these. Like it, it
     /// measures "teardown pending too long", not proof of a hang, and is OBSERVATION ONLY: it
     /// changes no ownership, queue position, admission, receipt or ack. While outstanding the
-    /// claim stays its key's fifo head, so the key, the executor quota slot of its class
-    /// and, if the call is blocked inside a mechanism, that mechanism type's engine lock stay
-    /// held, and (#4472) the claim is not K-eligible, so the generation is held while it
-    /// is outstanding. `now` before the owed instant reads as zero. Takes registry_mu_ and
+    /// claim stays its key's fifo head, so the key stays held. What else it holds depends on
+    /// the teardown's form: an asynchronous compensating disarm holds the executor quota slot
+    /// of its class only while its backend call runs (and, if that call is blocked inside a
+    /// mechanism, that mechanism type's engine lock); direct_disarm_fallback() holds no quota
+    /// (it counts as an alive worker against the executor's physical ceiling, not against a
+    /// class quota) and, if blocked inside a mechanism, that type's engine lock; and before
+    /// the teardown is submitted no slot is held at all. (#4472)
+    /// The claim is not K-eligible, so the generation is held while it is outstanding. `now` before the owed instant reads as zero. Takes registry_mu_ and
     /// scans claims_ (O(claims)); heartbeat cadence only, and never to be called with
     /// registry_mu_ held (it has a _locked twin). The once-per-claim elapsed count is the
     /// existing compensation_deadline_elapsed().

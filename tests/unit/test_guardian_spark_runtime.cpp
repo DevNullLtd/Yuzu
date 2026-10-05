@@ -13827,8 +13827,9 @@ TEST_CASE("#5322: a throwing inline disarm in the last detach is contained and t
 
 // ---------------------------------------------------------------------------
 // #5403: a Disarm that stays pending (a hung backend disarm, a retained one, a quota-held
-// one) blocks its key, holds its class quota slot and, if the hang is inside the mechanism,
-// the engine's per-type lock. The runtime never releases, pops or force-cancels it; it
+// one) blocks its key; an ADMITTED hung call also holds its class quota slot and, if the hang
+// is inside the mechanism, the engine's per-type lock (a retained Queued Disarm holds only
+// its key). The runtime never releases, pops or force-cancels it; it
 // reports the age of the oldest pending Disarm (oldest_pending_disarm_age) and counts, once
 // per claim, a Disarm pending past kDisarmPendingObserveThreshold (disarm_deadline_elapsed).
 // "Pending too long" is the claim: an old Queued Disarm is not evidence the backend hung.

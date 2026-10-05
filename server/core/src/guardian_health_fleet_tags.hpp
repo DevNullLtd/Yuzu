@@ -9,7 +9,8 @@
 /// the pre-network-arm legacy-sink drop, previously counted in-process only with
 /// no accessor, no heartbeat tag, and no fleet visibility; #5403 added the 8th row, the
 /// pending-Spark-Disarm deadline count, plus the separate MAX-rollup age table below;
-/// #5404 added rows 9-19, the Spark claim-lifecycle counters and the retained-tombstone count).
+/// #4472 added the 9th row, the compensating-teardown deadline count, and the second age row;
+/// #5404 added rows 10-20, the Spark claim-lifecycle counters and the retained-tombstone count).
 /// Single source of truth for the
 /// `yuzu.guardian_*` heartbeat tag keys this rollup consumes, the
 /// `yuzu_fleet_guardian_*` gauge names they roll up into, their HELP text, and the
@@ -34,9 +35,9 @@
 /// spark and journal pins when that hoist lands - do not let a future two-family sweep
 /// leave this one behind.
 ///
-/// SHAPE: flat and unlabelled. `kGuardianHealthMetrics` is 20 plain sparse rows (19
-/// cumulative counters and the #5404 retained-tombstone current count) rolled up as a fleet
-/// SUM. `kGuardianHealthAgeMetrics` (#5403, #4472) is the one exception: re-statable AGEs
+/// SHAPE: flat and unlabelled. `kGuardianHealthMetrics` is plain sparse rows (cumulative
+/// counters, plus the #5404 retained-tombstone current count) rolled up as a fleet
+/// SUM; the table, not this comment, is authoritative for how many. `kGuardianHealthAgeMetrics` (#5403, #4472) is the one exception: re-statable AGEs
 /// rolled up as the fleet MAX, in their own table for the
 /// reasons the journal sibling's age table gives (a sum of ages is meaningless, and
 /// the op lives in the consumer). Name rule, asserted by the pin test, for the counter
@@ -76,7 +77,7 @@ struct GuardianHealthMetric {
 
 /// The full published set. Order matches GuardianHealthStats / the emit order in
 /// agents/core/src/guardian_health_heartbeat.hpp for reviewability; nothing depends on
-/// it. All 19 are exported as `gauge` - a per-sweep recomputed fleet sum, cleared and
+/// it. Every row is exported as `gauge` - a per-sweep recomputed fleet sum, cleared and
 /// rebuilt, never monotonic.
 ///
 /// ALERTING: THESE ARE MONITOR-ONLY, same posture and same reasons as the guardian
@@ -175,9 +176,10 @@ inline constexpr GuardianHealthMetric kGuardianHealthMetrics[] = {
      "threshold (#5403), counted once per claim. Observation only: the runtime never "
      "releases, pops or force-cancels a pending Disarm, so a nonzero value means a Disarm was "
      "pending TOO LONG, not that its backend call is proven hung. A pending Disarm holds its "
-     "key, an executor quota slot of its class and, if the call is blocked inside a mechanism, "
-     "that mechanism type's engine lock; recovery from a call that never returns is an agent "
-     "restart or --spark-disable. NOT covered: a compensating disarm (see "
+     "key; while its backend call is admitted and running it also holds an executor quota slot "
+     "of its class and, if the call is blocked inside a mechanism, that mechanism type's engine "
+     "lock (a Disarm retained after an admission refusal holds only its key). Recovery from a "
+     "call that never returns is an agent restart or --spark-disable. NOT covered: a compensating disarm (see "
      "yuzu_fleet_guardian_compensation_deadline_elapsed), the direct disarm fallback outside a "
      "compensation, the synchronous residue teardown inside detach_rule_locked, and "
      "inline-type teardown. Cumulative per agent process (resets on restart); the exported "
@@ -192,8 +194,10 @@ inline constexpr GuardianHealthMetric kGuardianHealthMetrics[] = {
      "gave up and the rule is no longer wanted, so the subscription is disarmed. Observation "
      "only: nothing is released, popped or cancelled, so a nonzero value means a teardown was "
      "pending TOO LONG, not that its backend call is proven hung. While it is outstanding the "
-     "claim stays its key's head (the key, an executor quota slot of its class and, if the "
-     "call is blocked inside a mechanism, that mechanism type's engine lock stay held) and its "
+     "claim stays its key's head (the key stays held; an asynchronous compensating disarm also "
+     "holds an executor quota slot of its class only while its backend call runs, and the "
+     "direct fallback holds no quota; if the call is blocked inside a mechanism, that mechanism "
+     "type's engine lock stays held) and its "
      "generation is held, not acknowledged. Covers the asynchronous compensating disarm and "
      "the direct disarm fallback inside a compensation. Cumulative per agent process (resets "
      "on restart). See yuzu_fleet_guardian_compensation_pending_age_seconds_max for the age of "
@@ -237,11 +241,9 @@ inline constexpr GuardianHealthMetric kGuardianHealthMetrics[] = {
      "Cumulative per agent process (resets on restart). MONITOR-ONLY, same posture as the rest "
      "of this family"},
     {"yuzu.guardian_claim_drain_failures", "yuzu_fleet_guardian_claim_drain_failures",
-     "Fleet sum of Spark claim bookkeeping steps that threw and were contained (#5404): a "
-     "completion-callback drain whose own bookkeeping threw (the firewall published a terminal "
-     "outcome on every claim and dropped the entry), a parked-arm step that failed and left the "
-     "claim a non-terminal Queued head, or a failed orphan pass. Steady state 0. A nonzero value "
-     "means inspect the agent log. Cumulative per agent process (resets on restart). "
+     "Fleet sum of Spark claim bookkeeping steps that threw and were contained (#5404). It "
+     "counts contained throws, not claims, and does not by itself say what became of the "
+     "affected claim. Steady state 0. A nonzero value means inspect the agent log. Cumulative per agent process (resets on restart). "
      "MONITOR-ONLY, same posture as the rest of this family"},
     {"yuzu.guardian_retained_tombstones", "yuzu_fleet_guardian_retained_tombstones",
      "Fleet sum of retained tombstones (#5404): dead Queued Arm claims that still hold a genuine "
@@ -323,9 +325,11 @@ inline constexpr GuardianHealthMetric kGuardianHealthAgeMetrics[] = {
      "reports a pending Disarm; it is never 0 for \"none\" (a published 0 means a Disarm is "
      "pending for under a second). A large value means a Disarm has been pending TOO LONG - "
      "it is not proof the backend call is hung, and nothing is released, popped or "
-     "cancelled while it ages. While pending it holds its key, an executor quota slot of its "
-     "class and, if the call is blocked inside a mechanism, that mechanism type's engine lock; "
-     "recovery from a call that never returns is an agent restart or --spark-disable. NOT "
+     "cancelled while it ages. While pending it holds its key; while its backend call is "
+     "admitted and running it also holds an executor quota slot of its class and, if the call "
+     "is blocked inside a mechanism, that mechanism type's engine lock (a Disarm retained after "
+     "an admission refusal holds only its key, and the age includes such a retained Disarm). "
+     "Recovery from a call that never returns is an agent restart or --spark-disable. NOT "
      "covered: a compensating disarm (see "
      "yuzu_fleet_guardian_compensation_pending_age_seconds_max), the direct disarm fallback "
      "outside a compensation, the synchronous residue "
@@ -342,9 +346,11 @@ inline constexpr GuardianHealthMetric kGuardianHealthAgeMetrics[] = {
      "it is never 0 for \"none\" (a published 0 means one is outstanding for under a "
      "second). A large value means a teardown has been pending TOO LONG - it is not proof the "
      "backend call is hung, and nothing is released, popped or cancelled while it ages. While "
-     "outstanding the claim stays its key's head (the key, an executor quota slot of its class "
-     "and, if the call is blocked inside a mechanism, that mechanism type's engine lock stay "
-     "held), and its generation is held, not acknowledged, so the server keeps re-pushing "
+     "outstanding the claim stays its key's head (the key stays held; an asynchronous "
+     "compensating disarm also holds an executor quota slot of its class only while its backend "
+     "call runs, and the direct fallback holds no quota; if the call is blocked inside a "
+     "mechanism, that mechanism type's engine lock stays held), and its generation is held, "
+     "not acknowledged, so the server keeps re-pushing "
      "until the teardown finishes. Covers the asynchronous compensating disarm and the direct "
      "disarm fallback inside a compensation; NOT covered: a plain Disarm claim (see "
      "yuzu_fleet_guardian_disarm_pending_age_seconds_max), the synchronous residue teardown "

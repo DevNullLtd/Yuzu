@@ -2605,7 +2605,8 @@ public:
         // above: a new signal cannot ship with a gauge but no HELP.
         for (const auto& m : detail::kGuardianHealthMetrics)
             metrics_.describe(m.gauge, m.help, "gauge");
-        // #5403: the pending-Spark-Disarm age row, rolled up as MAX (its own table).
+        // #5403, #4472: the pending-Spark-Disarm and compensating-teardown age rows, rolled
+        // up as MAX (their own table).
         for (const auto& m : detail::kGuardianHealthAgeMetrics)
             metrics_.describe(m.gauge, m.help, "gauge");
         metrics_.describe(detail::kGuardianHealthReportingGauge,
