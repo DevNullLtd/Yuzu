@@ -34,6 +34,7 @@
 #include "inventory_ingest_outcome.hpp" // InventoryIngestOutcome
 
 #include <cstdint>
+#include <functional>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -108,35 +109,97 @@ struct SoftwareCursor {
 /// global-gated. Callers caveat the counts, exactly like the `query_software` route.
 struct SoftwareCatalogRow {
     std::string name;
-    std::string publisher;         ///< representative publisher (max over the group); may vary
-    std::int64_t device_count{0};  ///< COUNT(DISTINCT agent_id) carrying the title
-    std::int64_t version_count{0}; ///< COUNT(DISTINCT version) of the title
+    std::string publisher; ///< representative publisher (max over the group); may vary
+    /// EXACT count of distinct devices carrying the title under the active
+    /// kind/ecosystem/source filters (a device carrying it through two sources counts
+    /// ONCE). One precomputed row per (title, filter grain, distinct dimension
+    /// combination) — see `software_catalog_rules.hpp` grain_mask — so nothing is summed.
+    std::int64_t device_count{0};
+    std::int64_t version_count{0}; ///< COUNT(DISTINCT version) of the title under the filters
+    std::string ecosystems; ///< comma-joined distinct ecosystems of the filtered slice
+    std::string kinds;      ///< comma-joined distinct kinds of the filtered slice
+    /// Fleet-wide newest version of the title (catalogue order, see
+    /// `software_catalog::catalog_version_compare`); '' when no version is known.
+    std::string newest_version;
+};
+
+/// Keyset cursor for `software_catalog`: the LAST row of the previous page. A walk spanning
+/// an hourly refresh may skip or repeat rows (the snapshot is replaced atomically).
+struct SoftwareCatalogCursor {
+    /// Must be >= 0 (the only producer is a previous page's last row, whose count is >= 1);
+    /// a negative value is a precondition miss -> empty value, no SQL.
+    std::int64_t installs{0};
+    std::string name;
 };
 
 /// One version's install count for a title — the "installs per version" drill.
 struct SoftwareVersionCount {
     std::string version;
-    std::int64_t device_count{0}; ///< COUNT(DISTINCT agent_id) on this version
+    std::int64_t device_count{0}; ///< COUNT(DISTINCT agent_id) on this version under the filters
+    /// True on the title's fleet-wide newest version (never on an empty version).
+    bool newest{false};
 };
 
-/// Fleet catalogue query. `name_filter` (case-insensitive substring) narrows the
-/// rows by matching EITHER the title OR the publisher (round-3 item 8 — "adobe"
-/// surfaces every Adobe title, not only ones with "adobe" in the name itself);
-/// empty matches all. `limit` caps the returned rows (ordered by install count);
-/// the store also enforces a hard ceiling independent of `limit`.
+/// Fleet catalogue query. `q` is a case-insensitive LITERAL title-level predicate over
+/// name | publisher | ecosystems | sources of the (filtered) slice — `%` and `_` are not
+/// wildcards; it is clamped to 128 bytes at a UTF-8 boundary. A matched title keeps its
+/// whole filtered slice. It is matched against the comma-joined distinct lists on BOTH the
+/// fleet and the host path, so a literal "brew,macos_pkgutil" behaves identically.
+/// `kind`/`ecosystem`/`source` are exact one-value filters. `agent_id` set = the per-device
+/// view (reads installed_software; installs are 1 by construction). `versions_min` keeps
+/// titles with at least that many distinct versions. Rows are ordered (installs DESC, name)
+/// on the fleet path and (name) on the host path; `limit` is clamped to a hard ceiling
+/// independent of the caller; `after` resumes strictly after the cursor. The read runs under
+/// a 5 s execution bound: a timeout is `nullopt` (degrade), never an empty page.
 struct SoftwareCatalogQuery {
-    std::string name_filter;
+    std::string q;
+    std::string kind;
+    std::string ecosystem;
+    std::string source;
+    std::string agent_id;
+    int versions_min{0};
+    int limit{100};
+    std::optional<SoftwareCatalogCursor> after;
+};
+
+/// Installs-per-version drill for one title under the same filters as the catalogue.
+/// No kind/ecosystem/source/agent_id -> precomputed `version_rollup` (exact fleet counts);
+/// any of them -> `installed_software` for that one title (exact distinct devices under the
+/// filters, 5 s bound). `newest` is always the fleet-wide mark.
+struct SoftwareVersionsQuery {
+    std::string name;
+    std::string kind;
+    std::string ecosystem;
+    std::string source;
+    std::string agent_id;
     int limit{200};
 };
 
-/// Freshness + headline counts for the catalogue rollup (the `/inventory` Software-tab
+/// Freshness + headline numbers for the catalogue rollup (the `/inventory` Software-tab
 /// "as of" stamp + KPI strip, so the page never runs a COUNT). `refreshed_at == 0`
 /// means the rollup has never been computed yet ("building" state) — distinct from a
-/// refreshed-but-empty fleet (`refreshed_at > 0`, `total_titles == 0`).
+/// refreshed-but-empty fleet (`refreshed_at > 0`, `total_titles == 0`, every KPI 0).
+/// Every number is computed by the hourly refresh from ONE REPEATABLE READ snapshot.
 struct CatalogRollupMeta {
     std::int64_t refreshed_at{0}; ///< epoch seconds of the last successful refresh; 0 = never
     std::int64_t total_titles{0};
     std::int64_t total_devices{0};
+    std::int64_t total_publishers{0};  ///< distinct non-empty publishers
+    std::int64_t total_installs{0};    ///< distinct (device, title) pairs
+    std::int64_t installs_windows{0};  ///< EXACT distinct (device, title) pairs per OS family
+    std::int64_t installs_macos{0};
+    std::int64_t installs_linux{0};
+    std::int64_t installs_other{0};
+    /// Stay-current numerator: distinct devices on each title's exact newest version string,
+    /// summed over `current_titles` titles (equivalent spellings are NOT merged).
+    std::int64_t current_installs{0};
+    /// Stay-current denominator: distinct devices carrying those same titles (a device on
+    /// 1.0 and 2.0 side by side is one install and counts as current).
+    std::int64_t current_total{0};
+    std::int64_t current_titles{0};    ///< titles with a known (non-empty) version, whole fleet
+    std::int64_t sprawl_titles{0};     ///< titles on >= 3 distinct versions
+    std::int64_t rpm_total{0};         ///< distinct devices x titles on the rpm ecosystem
+    std::int64_t rpm_unsigned{0};
 };
 
 /// Fleet-wide software query. Empty filters match all; results are ordered by
@@ -147,10 +210,19 @@ struct SoftwareFleetQuery {
     /// Page size. Silently clamped to kFleetQueryRowCap by the store, so a
     /// short page is NOT proof of exhaustion: page until an EMPTY page.
     int limit{1000};
-    std::string q;         ///< case-insensitive substring over name|publisher|ecosystem|source
+    /// Case-insensitive LITERAL substring over name|publisher|ecosystem|source (`%`/`_` are
+    /// not wildcards), clamped to 128 bytes; non-empty q runs under a 5 s execution bound.
+    std::string q;
     std::string kind;      ///< exact kind filter
     std::string ecosystem; ///< exact ecosystem filter
     std::string source;    ///< exact source filter
+    /// Exact version filter: nullopt = any version; present (including "") = that exact
+    /// version, so "" selects only the empty-version rows.
+    std::optional<std::string> version;
+    /// Scope push-down (ADR-0033): nullopt = unfiltered; PRESENT-EMPTY = deny-all -> empty
+    /// value with no SQL; non-empty -> `agent_id = ANY(...)` in SQL, so the last returned row
+    /// is the cursor and a scoped caller never gets a short page.
+    std::optional<std::vector<std::string>> agent_ids;
     /// Resume strictly after this (name, agent_id, install_id) in result order. Page with
     /// `after = {last.entry.name, last.agent_id, last.install_id}` until an empty page.
     /// install_id churns when an agent's list is fully replaced, so a walk concurrent with
@@ -233,35 +305,49 @@ public:
     [[nodiscard]] std::optional<std::vector<SoftwareFleetRow>>
     query_software(const SoftwareFleetQuery& q);
 
-    /// Fleet software catalogue — every title with its (device_count, version_count),
-    /// most-installed first (the `/inventory` Software list). Reads the PRECOMPUTED
-    /// `catalog_rollup` table (refreshed by `refresh_catalog_rollup`), NOT an on-demand
-    /// GROUP BY — the underlying `installed_software` changes only on the daily sync, so
-    /// recomputing per request is wasteful and degrades at fleet scale. This read is a
-    /// cheap indexed scan of the small rollup. **FLEET-WIDE** (see `SoftwareCatalogRow`):
-    /// the rollup is global by construction and CANNOT be per-operator scoped, so the
-    /// caller MUST gate on the GLOBAL `Inventory:Read` (ADR-0017). AUTHORITATIVE read:
-    /// `std::nullopt` on a store/pool/query degrade, NEVER a silent empty. An empty value
-    /// means the rollup has no rows — pair with `catalog_rollup_meta()` to tell a
-    /// never-refreshed ("building") rollup from a genuinely empty fleet.
+    /// Fleet software catalogue — one row per title under the active filters, most-installed
+    /// first (the `/inventory` Software list). Reads the PRECOMPUTED `catalog_rollup` (one
+    /// row per title x filter grain x distinct dimension combination; the read picks the grain
+    /// matching the active filters, so every count is one exact lookup) — or, with
+    /// `agent_id`, the per-device view straight from `installed_software`. NOT an on-demand
+    /// fleet GROUP BY. **FLEET-WIDE** (see `SoftwareCatalogRow`): the rollup is global by
+    /// construction and CANNOT be per-operator scoped, so the caller MUST gate on the GLOBAL
+    /// `Inventory:Read` (ADR-0017). AUTHORITATIVE read: `std::nullopt` on a store/pool/query
+    /// degrade (including the 5 s execution bound), NEVER a silent empty. An empty value means
+    /// no rows match (or a negative cursor — a precondition miss); pair with
+    /// `catalog_rollup_meta()` to tell a never-refreshed ("building") rollup from a genuinely
+    /// empty fleet.
     [[nodiscard]] std::optional<std::vector<SoftwareCatalogRow>>
     software_catalog(const SoftwareCatalogQuery& q);
 
-    /// Installs-per-version for ONE title (the catalogue drill), most-installed first.
-    /// Reads the precomputed `version_rollup` (same cadence/scope as `software_catalog`).
-    /// AUTHORITATIVE read: `std::nullopt` on a store/pool/query degrade. An empty `name`
-    /// is a precondition miss → empty value (not a degrade).
+    /// Installs-per-version for ONE title under the filters of `SoftwareVersionsQuery`, most
+    /// installed first, with the fleet-wide newest mark. The newest version is chosen by
+    /// `software_catalog::catalog_version_compare` (transitive; NOT the NVD comparator) with
+    /// the installs-then-string tie rule, and is never an empty version. AUTHORITATIVE read:
+    /// `std::nullopt` on a store/pool/query degrade (the filtered path is bounded to 5 s). An
+    /// empty `name` is a precondition miss -> empty value (not a degrade).
     [[nodiscard]] std::optional<std::vector<SoftwareVersionCount>>
-    software_versions(std::string_view name, int limit);
+    software_versions(const SoftwareVersionsQuery& q);
 
     /// Recompute the catalogue rollup from `installed_software` and atomically replace
-    /// `catalog_rollup` / `version_rollup` / `catalog_rollup_meta` in ONE transaction —
-    /// the single expensive `GROUP BY`, run OFF the request path by the background
-    /// `SoftwareCatalogRollup` thread on a cadence. KEEP-LAST-GOOD: on any lease/SQL
-    /// failure (incl. the generous background `statement_timeout`) the transaction rolls
-    /// back, leaving the prior rollup + its freshness stamp intact (the stamp visibly
-    /// ages). Returns false on failure (the caller logs/metrics it). Idempotent.
-    bool refresh_catalog_rollup();
+    /// `catalog_rollup` / `version_rollup` / `catalog_rollup_meta` in ONE REPEATABLE READ
+    /// transaction — the expensive passes (one GROUPING SETS statement for every filter
+    /// grain, the exact per-OS-family pass, the newest-version stream), run OFF the request
+    /// path by the background `SoftwareCatalogRollup` thread on a cadence. The fleet-newest
+    /// pass streams `version_rollup` through a server-side cursor in (name, version) order into
+    /// a transaction-scoped temp table with bounded memory, independent of title count.
+    /// KEEP-LAST-GOOD: on any lease/SQL failure (incl. the generous background
+    /// `statement_timeout`), cancellation or budget exhaustion the transaction rolls back,
+    /// leaving the prior rollup + its freshness stamp intact (the stamp visibly ages). Returns
+    /// false on failure (the caller logs/metrics it). Idempotent.
+    /// `cancelled` is polled between statements and between every cursor FETCH / temp-table
+    /// INSERT batch, together with the `kRollupRefreshBudget` wall budget; true (or budget
+    /// exhausted) rolls back and returns false, so stop() -> join is bounded by one statement
+    /// plus one batch. An empty predicate means not cancellable (the boot-time call).
+    /// The snapshot is established by the advisory-lock SELECT, so on a second replica a peer
+    /// that commits between our snapshot and our lock acquisition makes our DELETE conflict
+    /// (serialization error) -> false -> ROLLBACK -> next tick: a benign two-replica race.
+    bool refresh_catalog_rollup(const std::function<bool()>& cancelled = {});
 
     /// The catalogue rollup's freshness stamp + headline counts (the Software-tab "as of"
     /// stamp + KPI strip). AUTHORITATIVE read: `std::nullopt` on a store/pool/query

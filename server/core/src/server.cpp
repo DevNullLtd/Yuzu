@@ -17696,7 +17696,8 @@ private:
                    int limit) -> std::optional<std::vector<SoftwareVersionCount>> {
                 if (!software_inventory_store_)
                     return std::nullopt;
-                return software_inventory_store_->software_versions(name, limit);
+                return software_inventory_store_->software_versions(
+                    SoftwareVersionsQuery{.name = name, .limit = limit});
             },
             [this](const SoftwareFleetQuery& q) -> std::optional<std::vector<SoftwareFleetRow>> {
                 if (!software_inventory_store_)

@@ -505,7 +505,13 @@ place, **Hardware** and **Software**, each its own page:
   strip still shows Titles / Devices reporting / Stale / an "updated N ago" (or
   "building") stamp for the catalogue, and the counts are still **fleet-wide, not
   management-group scoped** — the same ADR-0017 gap the REST/MCP section above
-  describes. Two things changed:
+  describes. The catalogue store now serves exact numbers under filters (see "Catalogue
+  rollup grain and KPIs" under the rollup metrics below): **Installs is the exact number of
+  distinct devices** carrying the title under the active kind/ecosystem/source filters (a
+  device carrying one title through two sources counts once), and **search selects titles** —
+  a matched title keeps its whole filtered slice; `%` and `_` in a search term are literal
+  characters, the term is clamped to 128 bytes, and a search that exceeds its 5 s execution
+  bound reports the catalogue as unavailable rather than showing an empty table. Two things changed:
   - The search box is now a **real server round-trip matching title OR publisher**
     (was client-side and title-only), using the same debounced/narrow-swap-target
     pattern as the Hardware list's search box.
@@ -720,6 +726,27 @@ hourly by the background `SoftwareCatalogRollup` thread) emits three further ser
   still alertable). Alert on `time() - this > 7200` **guarded by `and this > 0`** — the
   `> 0` guard skips the cold-boot "building" window (epoch 0); the never-succeeded /
   ongoing-failure case is caught by `…_rollup_total{outcome="error"}` instead.
+
+**Catalogue rollup grain and KPIs.** The rollup keeps one precomputed row per title x
+filter grain x distinct dimension combination, where the grain is which of kind, ecosystem
+and source are fixed (eight grains, from "title total" to "one exact combination"); a title
+therefore has between 8 and 8 x C rows (C = its count of distinct kind/ecosystem/source
+combinations), and every read is one exact lookup, never a sum. The refresh runs in one
+`REPEATABLE READ` transaction: one `GROUPING SETS` pass fills every grain (about three sorted
+passes of `installed_software`), one further pass computes the exact per-OS-family split, and
+the fleet-newest version of every title is folded from `version_rollup` through a server-side
+cursor into a transaction-scoped temp table with memory bounded by the batch size, not the
+title count. In total the refresh costs about four times the former single `GROUP BY`; it
+keeps the 60 s per-statement budget, gains a 10-minute whole-refresh budget, and aborts
+cleanly (last-good rollup kept) on shutdown. KPI definitions: total installs = distinct
+(device, title) pairs; the OS split counts each (device, title) pair once per OS family
+derived from the ecosystem; stay-current = distinct devices on each title's exact newest
+version string divided by distinct devices carrying the title, over every title with a known
+version (equivalent spellings such as `1.0` and `1.0.0` are not merged); "newest" is decided
+by the catalogue's own transitive version order, which agrees with the NVD comparator on its
+documented examples; version sprawl = titles on three or more versions; rpm unsigned = the
+unsigned share of rpm installs. After an upgrade the catalogue reads "building" until the
+first refresh completes (the rollup tables are derived data and are rebuilt, never migrated).
 
 Shipped alert rules live in the `yuzu-inventory` group of
 `docs/prometheus/yuzu-alerts.yml`: `YuzuInventorySustainedIngestErrors` (a non-zero

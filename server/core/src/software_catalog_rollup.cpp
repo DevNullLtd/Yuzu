@@ -71,7 +71,8 @@ void SoftwareCatalogRollup::run() {
             const auto t0 = std::chrono::steady_clock::now();
             YUZU_ASSERT_BACKGROUND_JOB(
                 "software_catalog_rollup.refresh_catalog_rollup"); // WS-10 ReplicaSafe
-            const bool ok = store_.refresh_catalog_rollup();
+            const bool ok = store_.refresh_catalog_rollup(
+                [this] { return stop_.load(std::memory_order_acquire); });
             const double secs =
                 std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
             if (metrics_) {
