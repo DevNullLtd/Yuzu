@@ -1973,12 +1973,17 @@ std::optional<SoftwareCatalogRow> title(SoftwareInventoryStore& s, const std::st
     return std::nullopt;
 }
 
-std::int64_t count_rows(PgPool& pool, const char* table) {
+// Lease, run one parameterless statement, REQUIRE it succeeded (rows or a command tag).
+pg::PgResult run_sql(PgPool& pool, const std::string& stmt) {
     auto lease = pool.try_acquire_for(std::chrono::seconds{5});
     REQUIRE(lease);
-    const std::string sql = std::string("SELECT count(*) FROM software_inventory_store.") + table;
-    pg::PgResult r = pg::exec_params(lease.get(), sql.c_str(), std::vector<std::string>{});
-    REQUIRE(r.status() == PGRES_TUPLES_OK);
+    pg::PgResult r = pg::exec_params(lease.get(), stmt.c_str(), std::vector<std::string>{});
+    REQUIRE((r.status() == PGRES_TUPLES_OK || r.status() == PGRES_COMMAND_OK));
+    return r;
+}
+
+std::int64_t count_rows(PgPool& pool, const char* table) {
+    auto r = run_sql(pool, std::string("SELECT count(*) FROM software_inventory_store.") + table);
     return std::stoll(PQgetvalue(r.get(), 0, 0));
 }
 } // namespace
@@ -2228,24 +2233,19 @@ TEST_CASE("software_versions fleet, filtered and host paths carry the fleet newe
 TEST_CASE("KPI meta is computed by the refresh from one snapshot", "[pg][software_inventory]") {
     SWINV_SHARED(store, pool);
     seed_grain_fixture(store);
-    // Dual: one device on two versions side by side; NoVer: only an unknown version.
-    put(store, "d1",
-        Rows{ent("git", "2.40", "Git SCM", "package", "brew", kSrcPkg),
-             ent("git", "2.40", "Git SCM", "pkg", "macos_pkgutil", kSrcApps),
-             ent("Chrome", "126", "Google", "app", "macos", kSrcApps),
-             ent("Dual", "1.0", "", "package", "brew", kSrcPkg),
+    // d4: one device on two versions of Dual side by side; d5: NoVer has only an unknown version.
+    put(store, "d4",
+        Rows{ent("Dual", "1.0", "", "package", "brew", kSrcPkg),
              ent("Dual", "2.0", "", "package", "brew", kSrcPkg)});
-    put(store, "d2",
-        Rows{ent("git", "2.39", "Git SCM", "package", "brew", kSrcPkg),
-             ent("NoVer", "", "", "package", "brew", kSrcPkg)});
+    put(store, "d5", Rows{ent("NoVer", "", "", "package", "brew", kSrcPkg)});
     REQUIRE(store.refresh_catalog_rollup());
     auto m = store.catalog_rollup_meta();
     REQUIRE(m.has_value());
     CHECK(m->refreshed_at > 0);
     CHECK(m->total_titles == 4);
-    CHECK(m->total_devices == 3);
+    CHECK(m->total_devices == 5);
     CHECK(m->total_publishers == 3); // Git SCM, Fedora, Google ('' excluded)
-    CHECK(m->total_installs == 6);   // git 3 + Chrome 1 + Dual 1 + NoVer 1 (d1 counted once)
+    CHECK(m->total_installs == 6);   // git 3 + Chrome 1 + Dual 1 + NoVer 1 (d4's two Dual versions count once)
     CHECK(m->installs_windows == 0);
     CHECK(m->installs_macos == 5);
     CHECK(m->installs_linux == 1);
@@ -2253,7 +2253,7 @@ TEST_CASE("KPI meta is computed by the refresh from one snapshot", "[pg][softwar
     CHECK(m->installs_windows + m->installs_macos + m->installs_linux + m->installs_other ==
           m->total_installs);
     CHECK(m->current_titles == 3);   // NoVer has no known version
-    CHECK(m->current_installs == 3); // git 2.41 (d3), Chrome 126 (d1), Dual 2.0 (d1)
+    CHECK(m->current_installs == 3); // git 2.41 (d3), Chrome 126 (d1), Dual 2.0 (d4)
     CHECK(m->current_total == 5);    // git 3 + Chrome 1 + Dual 1: side-by-side counts once
     CHECK(m->sprawl_titles == 1);    // git on 3 versions
     CHECK(m->rpm_total == 1);
@@ -2275,20 +2275,20 @@ TEST_CASE("Installs-by-OS is exact and the CASE SQL mirrors the C++ table",
     CHECK(m->installs_windows == 0);
     CHECK(m->total_installs == 2);
 
-    auto lease = pool.try_acquire_for(std::chrono::seconds{5});
-    REQUIRE(lease);
+    // The generated CASE maps every published ecosystem to its table family and anything else
+    // ('' / an unknown spelling) to "other".
     std::string values;
     for (const auto& e : sc::kEcosystemFamilies)
         values += "('" + std::string(e.ecosystem) + "'),";
     values += "(''),('snap')";
-    const std::string sql = "SELECT ecosystem, " + sc::os_family_case_sql() +
-                            " FROM (VALUES " + values + ") v(ecosystem)";
-    pg::PgResult r = pg::exec_params(lease.get(), sql.c_str(), std::vector<std::string>{});
-    REQUIRE(r.status() == PGRES_TUPLES_OK);
-    REQUIRE(PQntuples(r.get()) == static_cast<int>(sc::kEcosystemFamilies.size()) + 2);
-    for (int i = 0; i < PQntuples(r.get()); ++i)
-        CHECK(std::string(PQgetvalue(r.get(), i, 1)) ==
-              sc::os_family_name(sc::os_family_for_ecosystem(PQgetvalue(r.get(), i, 0))));
+    auto r = run_sql(pool, "SELECT ecosystem, " + sc::os_family_case_sql() + " FROM (VALUES " +
+                               values + ") v(ecosystem)");
+    const int published = static_cast<int>(sc::kEcosystemFamilies.size());
+    REQUIRE(PQntuples(r.get()) == published + 2);
+    for (int i = 0; i < published; ++i)
+        CHECK(std::string(PQgetvalue(r.get(), i, 1)) == sc::kEcosystemFamilies[i].family);
+    CHECK(std::string(PQgetvalue(r.get(), published, 1)) == "other");
+    CHECK(std::string(PQgetvalue(r.get(), published + 1, 1)) == "other");
 }
 
 TEST_CASE("a cancelled refresh keeps the last-good rollup", "[pg][software_inventory]") {
@@ -2362,12 +2362,7 @@ TEST_CASE("migration v8 reshapes a v7-era rollup schema and re-runs idempotently
         SoftwareInventoryStore s1{pool};
         REQUIRE(s1.is_open());
     }
-    auto exec = [&](const char* sql) {
-        auto lease = pool.try_acquire_for(std::chrono::seconds{5});
-        REQUIRE(lease);
-        pg::PgResult r = pg::exec_params(lease.get(), sql, std::vector<std::string>{});
-        REQUIRE(r.status() == PGRES_COMMAND_OK);
-    };
+    auto exec = [&](const char* stmt) { run_sql(pool, stmt); };
     auto rewind = [&] {
         exec("UPDATE public.schema_meta SET version = 7 WHERE store = 'software_inventory_store'");
     };
@@ -2390,16 +2385,12 @@ TEST_CASE("migration v8 reshapes a v7-era rollup schema and re-runs idempotently
     REQUIRE(meta.has_value());
     CHECK(meta->refreshed_at == 0); // honest "building" until the next refresh
     {
-        auto lease = pool.try_acquire_for(std::chrono::seconds{5});
-        REQUIRE(lease);
-        pg::PgResult r = pg::exec_params(
-            lease.get(),
+        auto r = run_sql(
+            pool,
             "SELECT count(*) FROM information_schema.columns WHERE table_schema = "
             "'software_inventory_store' AND ((table_name = 'catalog_rollup' AND column_name IN "
             "('grain', 'newest_version', 'sources')) OR (table_name = 'catalog_rollup_meta' AND "
-            "column_name = 'total_installs'))",
-            std::vector<std::string>{});
-        REQUIRE(r.status() == PGRES_TUPLES_OK);
+            "column_name = 'total_installs'))");
         CHECK(std::string(PQgetvalue(r.get(), 0, 0)) == "4");
     }
     rewind();

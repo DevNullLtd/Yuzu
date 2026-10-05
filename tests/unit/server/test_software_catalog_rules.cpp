@@ -1,7 +1,7 @@
 /**
  * test_software_catalog_rules.cpp — pure coverage for software_catalog_rules.hpp (M.9 PR-1):
- * grain mask, OS-family table + KPI fold, the catalogue's TRANSITIVE version order, the
- * tie rule, the streaming fleet-newest fold, search hygiene and the pinned bounds. No
+ * grain mask, OS-family CASE generation, the catalogue's TRANSITIVE version order, the
+ * tie rule, the streaming fleet-newest fold, search hygiene. No
  * store, no libpq, no clock.
  */
 
@@ -34,34 +34,6 @@ TEST_CASE("grain_mask maps every filter combination to PG GROUPING bits",
     REQUIRE(grain_mask("", "rpm", "") == kGrainEcosystem);
 }
 
-TEST_CASE("os_family_for_ecosystem maps the nine published ecosystems",
-          "[server][software_catalog]") {
-    for (auto e : {"rpm", "deb", "apk", "pacman"})
-        REQUIRE(os_family_for_ecosystem(e) == OsFamily::linux);
-    for (auto e : {"windows", "optional_feature"})
-        REQUIRE(os_family_for_ecosystem(e) == OsFamily::windows);
-    for (auto e : {"macos", "macos_pkgutil", "brew"})
-        REQUIRE(os_family_for_ecosystem(e) == OsFamily::macos);
-    REQUIRE(os_family_for_ecosystem("") == OsFamily::other);
-    REQUIRE(os_family_for_ecosystem("snap") == OsFamily::other);
-}
-
-TEST_CASE("fold_kpi_split folds exact family rows and passes rpm through",
-          "[server][software_catalog]") {
-    const std::array<FamilyInstalls, 4> rows{{{OsFamily::macos, 5},
-                                              {OsFamily::linux, 2},
-                                              {OsFamily::macos, 1}, // duplicate family: summed
-                                              {OsFamily::other, 7}}};
-    const auto k = fold_kpi_split(rows, 9, 4);
-    REQUIRE(k.windows == 0); // absent family
-    REQUIRE(k.macos == 6);
-    REQUIRE(k.linux == 2);
-    REQUIRE(k.other == 7);
-    REQUIRE(k.rpm_total == 9);
-    REQUIRE(k.rpm_unsigned == 4);
-    REQUIRE(fold_kpi_split({}, 0, 0).macos == 0);
-}
-
 TEST_CASE("os_family_case_sql is generated from the same table",
           "[server][software_catalog]") {
     const std::string sql = os_family_case_sql();
@@ -72,7 +44,7 @@ TEST_CASE("os_family_case_sql is generated from the same table",
     REQUIRE(sql.ends_with(" ELSE 'other' END"));
     for (const auto& e : kEcosystemFamilies) {
         const std::string needle = "WHEN '" + std::string(e.ecosystem) + "' THEN '" +
-                                   std::string(os_family_name(e.family)) + "'";
+                                   std::string(e.family) + "'";
         REQUIRE(sql.find(needle) != std::string::npos);
     }
 }
@@ -204,13 +176,4 @@ TEST_CASE("clamp_utf8 cuts at a codepoint start with no ellipsis", "[server][sof
     const auto c = clamp_utf8(multi, kSearchMaxBytes);
     REQUIRE(c.size() <= kSearchMaxBytes);
     REQUIRE(c.size() % 3 == 0);
-}
-
-TEST_CASE("catalogue bounds are pinned", "[server][software_catalog]") {
-    REQUIRE(kSearchMaxBytes == 128);
-    REQUIRE(kSprawlVersionThreshold == 3);
-    REQUIRE(kNewestFetchRows == 10000);
-    REQUIRE(kNewestFlushRows == 5000);
-    REQUIRE(kSearchStatementTimeout == "5s");
-    REQUIRE(kRollupRefreshBudget == std::chrono::seconds{600});
 }

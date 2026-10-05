@@ -344,9 +344,8 @@ public:
     /// INSERT batch, together with the `kRollupRefreshBudget` wall budget; true (or budget
     /// exhausted) rolls back and returns false, so stop() -> join is bounded by one statement
     /// plus one batch. An empty predicate means not cancellable (the boot-time call).
-    /// The snapshot is established by the advisory-lock SELECT, so on a second replica a peer
-    /// that commits between our snapshot and our lock acquisition makes our DELETE conflict
-    /// (serialization error) -> false -> ROLLBACK -> next tick: a benign two-replica race.
+    /// A second replica's serialization conflict also rolls back to last-good (benign; the
+    /// mechanism is documented at the advisory-lock statement in the .cpp).
     bool refresh_catalog_rollup(const std::function<bool()>& cancelled = {});
 
     /// The catalogue rollup's freshness stamp + headline counts (the Software-tab "as of"

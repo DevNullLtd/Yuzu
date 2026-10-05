@@ -2,23 +2,20 @@
 
 /// @file software_catalog_rules.hpp
 /// Pure decision core for the Software catalogue rollup (M.9 PR-1): the grain mask,
-/// the OS-family table, the KPI fold, the catalogue's own TRANSITIVE version order, the
+/// the OS-family table, the catalogue's own TRANSITIVE version order, the
 /// streaming fleet-newest fold, search hygiene and the refresh/search bounds. No libpq,
 /// no clock, no I/O — the store (`software_inventory_store.cpp`) owns every statement and
 /// feeds this header plain values, so the unit suite never touches a database for any of it.
 ///
-/// Version order: `catalog_version_compare` is deliberately NOT `nvd_version_compare` (and
-/// not `compare_versions` in nvd_db.hpp). The NVD comparator is cyclic on "1.0" / "1.0a" /
-/// "1.0rc" (tail_sign: an unknown alpha extra reads higher, a pre-release extra lower, but the
-/// positional branch compares 'a' < 'r'), so a running max over it depends on input order and
-/// "newest in fleet" / stay-current would flicker. This order is positional lexicographic over
-/// a total preorder on tokens, hence transitive by construction. NVD files are untouched.
+/// Version order: `catalog_version_compare` is the catalogue's own transitive order, not the
+/// NVD comparator (rationale at its definition below).
 
+#include <algorithm>
 #include <array>
 #include <chrono>
+#include <compare>
 #include <cstddef>
 #include <cstdint>
-#include <span>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -41,102 +38,36 @@ inline constexpr int kGrainEcosystem = 5; ///< ecosystem fixed, kind and source 
 
 // ── OS family (single source of truth for the Installs-by-OS KPI) ───────────
 
-enum class OsFamily { windows, macos, linux, other };
-
 struct EcosystemFamily {
     std::string_view ecosystem;
-    OsFamily family;
+    std::string_view family; ///< windows | macos | linux; any other ecosystem is "other"
 };
 
 inline constexpr std::array<EcosystemFamily, 9> kEcosystemFamilies{{
-    {"windows", OsFamily::windows},
-    {"optional_feature", OsFamily::windows},
-    {"macos", OsFamily::macos},
-    {"macos_pkgutil", OsFamily::macos},
-    {"brew", OsFamily::macos},
-    {"rpm", OsFamily::linux},
-    {"deb", OsFamily::linux},
-    {"apk", OsFamily::linux},
-    {"pacman", OsFamily::linux},
+    {"windows", "windows"},
+    {"optional_feature", "windows"},
+    {"macos", "macos"},
+    {"macos_pkgutil", "macos"},
+    {"brew", "macos"},
+    {"rpm", "linux"},
+    {"deb", "linux"},
+    {"apk", "linux"},
+    {"pacman", "linux"},
 }};
 
-[[nodiscard]] constexpr OsFamily os_family_for_ecosystem(std::string_view eco) noexcept {
-    for (const auto& e : kEcosystemFamilies)
-        if (eco == e.ecosystem)
-            return e.family;
-    return OsFamily::other;
-}
-
-[[nodiscard]] constexpr std::string_view os_family_name(OsFamily f) noexcept {
-    switch (f) {
-    case OsFamily::windows:
-        return "windows";
-    case OsFamily::macos:
-        return "macos";
-    case OsFamily::linux:
-        return "linux";
-    case OsFamily::other:
-        break;
-    }
-    return "other";
-}
-
-/// SQL `CASE` over the `ecosystem` column generated from kEcosystemFamilies, so the SQL and
-/// os_family_for_ecosystem can never disagree. Every literal comes from the constexpr table
-/// (never input).
+/// SQL `CASE` over the `ecosystem` column generated from kEcosystemFamilies, so the SQL has
+/// one source of truth. Every literal comes from the constexpr table (never input).
 [[nodiscard]] inline std::string os_family_case_sql() {
     std::string sql = "CASE ecosystem";
     for (const auto& e : kEcosystemFamilies) {
         sql += " WHEN '";
         sql += e.ecosystem;
         sql += "' THEN '";
-        sql += os_family_name(e.family);
+        sql += e.family;
         sql += '\'';
     }
     sql += " ELSE 'other' END";
     return sql;
-}
-
-/// One exact per-(title, family) distinct-device sum, summed over titles by the caller's SQL.
-struct FamilyInstalls {
-    OsFamily family{OsFamily::other};
-    std::int64_t installs{0};
-};
-
-struct KpiSplit {
-    std::int64_t windows{0};
-    std::int64_t macos{0};
-    std::int64_t linux{0};
-    std::int64_t other{0};
-    std::int64_t rpm_total{0};
-    std::int64_t rpm_unsigned{0};
-};
-
-/// Fold the (at most four) family rows into the split; an absent family is 0, duplicates of
-/// one family are summed; the rpm numbers pass through unchanged.
-[[nodiscard]] inline KpiSplit fold_kpi_split(std::span<const FamilyInstalls> rows,
-                                             std::int64_t rpm_total,
-                                             std::int64_t rpm_unsigned) noexcept {
-    KpiSplit k;
-    k.rpm_total = rpm_total;
-    k.rpm_unsigned = rpm_unsigned;
-    for (const auto& r : rows) {
-        switch (r.family) {
-        case OsFamily::windows:
-            k.windows += r.installs;
-            break;
-        case OsFamily::macos:
-            k.macos += r.installs;
-            break;
-        case OsFamily::linux:
-            k.linux += r.installs;
-            break;
-        case OsFamily::other:
-            k.other += r.installs;
-            break;
-        }
-    }
-    return k;
 }
 
 // ── Version order ────────────────────────────────────────────────────────────
@@ -202,13 +133,15 @@ struct VToken {
     return -1;
 }
 
-/// Total preorder key of one position: class 0 recognised pre-release (by rank), class 1 END
-/// or an all-zero numeric token (so 1.0 == 1.0.0), class 2 any other alpha token, class 3
-/// non-zero numeric.
+/// Total preorder key of one position, compared field by field (cls, n, text): class 0
+/// recognised pre-release (n = rank), class 1 END or an all-zero numeric token (so
+/// 1.0 == 1.0.0), class 2 any other alpha token (text), class 3 non-zero numeric (n = digit
+/// count, text = digits without leading zeros: length then lexicographic).
 struct TokKey {
     int cls{1};
-    int rank{0};
-    std::string_view text; // class 2: alpha text; class 3: digits without leading zeros
+    std::size_t n{0};
+    std::string_view text;
+    auto operator<=>(const TokKey&) const = default;
 };
 
 [[nodiscard]] inline TokKey key_of(const std::vector<VToken>& toks, std::size_t i) noexcept {
@@ -221,28 +154,11 @@ struct TokKey {
             s.remove_prefix(1);
         if (s.empty())
             return {1, 0, {}};
-        return {3, 0, s};
+        return {3, s.size(), s};
     }
     if (const int r = prerelease_rank(t.text); r >= 0)
-        return {0, r, {}};
+        return {0, static_cast<std::size_t>(r), {}};
     return {2, 0, t.text};
-}
-
-[[nodiscard]] inline int cmp_key(const TokKey& a, const TokKey& b) noexcept {
-    if (a.cls != b.cls)
-        return a.cls < b.cls ? -1 : 1;
-    switch (a.cls) {
-    case 0:
-        return a.rank == b.rank ? 0 : (a.rank < b.rank ? -1 : 1);
-    case 2:
-        return a.text == b.text ? 0 : (a.text < b.text ? -1 : 1);
-    case 3:
-        if (a.text.size() != b.text.size())
-            return a.text.size() < b.text.size() ? -1 : 1;
-        return a.text == b.text ? 0 : (a.text < b.text ? -1 : 1);
-    default:
-        return 0;
-    }
 }
 
 } // namespace detail
@@ -261,10 +177,10 @@ struct TokKey {
 [[nodiscard]] inline int catalog_version_compare(std::string_view a, std::string_view b) {
     const auto ta = detail::tokenize(a);
     const auto tb = detail::tokenize(b);
-    const std::size_t n = ta.size() > tb.size() ? ta.size() : tb.size();
+    const std::size_t n = std::max(ta.size(), tb.size());
     for (std::size_t i = 0; i < n; ++i) {
-        if (const int c = detail::cmp_key(detail::key_of(ta, i), detail::key_of(tb, i)); c != 0)
-            return c;
+        if (const auto c = detail::key_of(ta, i) <=> detail::key_of(tb, i); c != 0)
+            return c < 0 ? -1 : 1;
     }
     return 0;
 }
@@ -294,13 +210,10 @@ class NewestFold {
 public:
     void feed(std::string_view name, std::string_view version, std::int64_t installs,
               std::vector<NewestPick>& out) {
-        if (have_name_ && name != name_) {
-            flush(out);
-        }
         if (!have_name_ || name != name_) {
+            flush(out);
             name_.assign(name);
             have_name_ = true;
-            have_best_ = false;
         }
         if (version.empty())
             return;
@@ -360,7 +273,6 @@ private:
 // ── Bounds ───────────────────────────────────────────────────────────────────
 
 inline constexpr std::size_t kSearchMaxBytes = 128;
-inline constexpr std::int64_t kSprawlVersionThreshold = 3;
 inline constexpr int kNewestFetchRows = 10000;
 inline constexpr std::size_t kNewestFlushRows = 5000;
 inline constexpr std::string_view kSearchStatementTimeout = "5s";
