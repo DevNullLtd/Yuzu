@@ -36,8 +36,10 @@ that main.cpp's gate had no Windows-service equivalent:
 
 Static/text-only, no build required -- a lexical gate, not a semantic one: it cannot see a
 relocation that keeps the same tokens but changes the surrounding control flow (review-enforced).
-`//` comment tails are blanked before matching (line numbers unchanged; `/* */` is not stripped),
-so a comment quoting a token can neither satisfy nor trip an invariant. Line numbers are 1-based.
+`//` comment tails are blanked before matching (line numbers unchanged; `/* */` is not stripped
+and a `//` inside a string literal is not recognised), so a comment quoting a token can neither
+satisfy nor trip an invariant. Line numbers are 1-based. A missing source now raises in setUp
+instead of a `::error::` line.
 
 Usage: python3 tests/test_log_handoff_wiring_lexical.py
 """

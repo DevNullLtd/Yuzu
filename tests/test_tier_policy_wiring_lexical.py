@@ -38,7 +38,7 @@ gate; that class of regression stays a plain-review concern.
 
 Lines are counted per line: split on "\\n", one count per line, never str.count. The file
 is read with universal newlines, so a CRLF checkout is matched the same as LF (all sources are
-LF today).
+LF today). A missing source now raises in setUp instead of a `::error::` line.
 
 Usage: python3 tests/test_tier_policy_wiring_lexical.py
 """
