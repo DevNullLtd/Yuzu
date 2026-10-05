@@ -1692,8 +1692,8 @@ TEST_CASE("password routes: two concurrent admin resets, the second's audit faul
     constexpr const char* kB = "admin-b-password-789";
 
     std::unique_ptr<httplib::Response> resA;
-    std::jthread admin_a; // joined on every exit path
     std::atomic<bool> fired{false};
+    std::jthread admin_a; // joined on every exit path
     h.owner.set_pre_commit_hook_for_test([&] {
         if (fired.exchange(true))
             return;
@@ -1735,8 +1735,8 @@ TEST_CASE("password routes: a victim's self-change then a faulted admin reset â€
     constexpr const char* kA = "admin-a-password-012";
 
     std::unique_ptr<httplib::Response> resA;
-    std::jthread admin_a; // joined on every exit path
     std::atomic<bool> fired{false};
+    std::jthread admin_a; // joined on every exit path
     h.owner.set_pre_commit_hook_for_test([&] {
         if (fired.exchange(true))
             return;
@@ -1770,7 +1770,7 @@ TEST_CASE("password routes: a lock held on the audit table never stalls unrelate
     // session_store.session_meta row only AFTER that INSERT, so an UNRELATED
     // account's session create and revoke complete promptly meanwhile. Before
     // T1' the bump preceded the INSERT and both stalled for the owner's whole
-    // lock_timeout (~4 s).
+    // lock_timeout (~1.5 s).
     PasswordRoutesHarness h;
     h.wire();
     h.as_admin("rootA");
@@ -1825,6 +1825,76 @@ TEST_CASE("password routes: a lock held on the audit table never stalls unrelate
     CHECK(h.stored_hash("vic") == h0);
     CHECK(h.committed("user.password_reset", "vic") == 0);
     CHECK(h.password_works("vic", kOld));
+}
+
+TEST_CASE("password routes: a same-account recovery-code sign-in during an audit-table stall "
+          "succeeds and keeps every session (chaos R22e inverted)",
+          "[pg][rest][password][mfa][audit]") {
+    // #5342 Gate 8 iteration 5. A second connection holds ACCESS EXCLUSIVE on
+    // audit_store.audit_events, so the reset's audit INSERT waits while the
+    // owner holds vic's auth.users row. vic's /login/mfa second leg (recovery
+    // code) queues on that row; the owner's lock_timeout (1.5 s) is strictly
+    // below the sign-in recheck's (2 s), so the owner aborts first and the
+    // sign-in completes. Before the fix the owner waited 4 s, the recheck
+    // timed out first and failed closed â€” 401, every vic session swept.
+    PasswordRoutesHarness h;
+    h.wire();
+    h.auth_routes->register_routes(h.sink);
+    h.as_admin("rootA");
+    h.seed("vic", kOld, Role::user);
+    auto init = h.db->mfa_init_enrollment("vic", "Yuzu", std::nullopt);
+    REQUIRE(init.has_value());
+    auto codes =
+        h.db->mfa_verify_enrollment("vic", totp_now(init->secret_base32, -1), std::nullopt);
+    REQUIRE(codes.has_value());
+    REQUIRE_FALSE(codes->empty());
+    const auto h0 = h.stored_hash("vic");
+    const auto prior = h.auth_mgr.create_local_session_for_test("vic", Role::user, true);
+    REQUIRE_FALSE(prior.empty());
+    auto step1 = h.sink.Post("/login", "username=vic&password=" + std::string(kOld),
+                             "application/x-www-form-urlencoded");
+    REQUIRE(step1);
+    INFO("step1=" << step1->status << " " << step1->body);
+    REQUIRE(step1->status == 202);
+    const std::string pending = nlohmann::json::parse(step1->body).at("mfa_pending_token");
+
+    yuzu::server::pg::PgConn locker{PQconnectdb(h.db.dsn().c_str())};
+    REQUIRE(PQstatus(locker.get()) == CONNECTION_OK);
+    auto run = [&](const char* sql) {
+        yuzu::server::pg::PgResult r{PQexec(locker.get(), sql)};
+        return r.ok();
+    };
+    REQUIRE(run("BEGIN"));
+    REQUIRE(run("LOCK TABLE audit_store.audit_events IN ACCESS EXCLUSIVE MODE"));
+
+    std::unique_ptr<httplib::Response> resV;
+    std::unique_ptr<httplib::Response> step2;
+    bool owner_waiting = false;
+    {
+        std::jthread tv([&] { resV = h.reset("vic", kNew); }); // joined on every exit path
+        owner_waiting = yuzu::test::wait_for_pg_lock_waiter(h.db.dsn(), "%INSERT INTO audit_store%");
+        step2 = h.sink.Post("/login/mfa",
+                            "mfa_pending_token=" + pending + "&code=" + codes->front(),
+                            "application/x-www-form-urlencoded");
+        tv.join();
+    }
+    CHECK(run("ROLLBACK"));
+
+    CHECK(owner_waiting);
+    REQUIRE(resV);
+    INFO("reset=" << resV->status << " " << resV->body);
+    CHECK(resV->status == 503);
+    CHECK(resV->get_header_value("Sec-Audit-Failed") == "true");
+    CHECK(h.has_audit("user.password_reset", "error", "audit_unavailable"));
+    CHECK(h.stored_hash("vic") == h0);
+    REQUIRE(step2);
+    INFO("step2=" << step2->status << " " << step2->body);
+    CHECK(step2->status == 200);
+    CHECK_FALSE(step2->get_header_value("Set-Cookie").empty());
+    CHECK(h.auth_mgr.validate_session(prior).has_value());
+    CHECK(h.sessions_of("vic") == 2);
+    CHECK(h.scalar("SELECT count(*) FROM auth.mfa_recovery_codes WHERE username = 'vic' AND "
+                   "consumed_at IS NOT NULL") == "1");
 }
 
 TEST_CASE("password routes: the literal /me route wins over the {name} regex",

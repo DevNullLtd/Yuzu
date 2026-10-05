@@ -180,6 +180,8 @@ constexpr const char* kStoreName = "auth";
 // unbounded `acquire()` is construction-only (used once, in the ctor).
 constexpr std::chrono::milliseconds kReadTimeout{1500};
 constexpr std::chrono::milliseconds kWriteTimeout{2000};
+// Also the lock_timeout of recheck_role_locked; CredentialChangeOwner::kWriteTimeout MUST stay
+// strictly below it (R22e).
 
 // Bounded acquire-retry (issue #2396). The shared PG pool arms a short
 // connect-backoff breaker after a connectivity hiccup (pg_pool.cpp): for a
@@ -1705,8 +1707,9 @@ AuthDB::mfa_init_enrollment(const std::string& username, std::string_view issuer
             return std::unexpected(AuthDBError::CredentialChanged);
         }
         if (!to_bool(col(cls.get(), 0, 3))) {
-            // Active, un-enrolled, same credential, still no secret — nothing
-            // explains the 0 rows. Fail closed (503), never a silent success.
+            // Active, un-enrolled, same credential, still no secret — a concurrent
+            // init plus an MFA disable between the statements can explain the 0
+            // rows; fail closed either way (503), never a silent success.
             return std::unexpected(AuthDBError::WriteFailed);
         }
         // A concurrent init won the mint: loop once to reveal ITS secret.

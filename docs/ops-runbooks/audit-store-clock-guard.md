@@ -372,6 +372,12 @@ itself failed or was interrupted mid-build — not a best-effort background
 build that silently degraded. Treat a missing index as a migration-integrity
 problem, not a performance tuning task.
 
+An exclusive lock on `audit_store.audit_events` (a migration, `VACUUM FULL`, a
+manual `LOCK TABLE`) makes every password change or reset fail closed with 503
+`audit_unavailable` within ~1.5 s (nothing changes; retry after the lock lifts)
+and delays same-account sign-ins by up to that long — schedule it outside
+sign-in peaks.
+
 ## YuzuAuditRetentionNeverRan
 
 `yuzu_server_audit_retention_last_pass_unixtime` has read exactly `0` for at

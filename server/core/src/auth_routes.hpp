@@ -599,8 +599,8 @@ public:
     /// sso-only a disarmed break-glass session can neither guess nor lock the
     /// account through this route: `kGateRejected` before any PBKDF2 or
     /// lockout write). Handed to `RestApiV1::set_password_change_deps`.
-    /// Captures `this`; the caller keeps this AuthRoutes alive for the route
-    /// table's lifetime (ServerImpl owns both).
+    /// Captures `this`; the caller keeps this AuthRoutes alive so it outlives
+    /// route dispatch (ServerImpl owns both).
     [[nodiscard]] PasswordVerifyFn password_change_verify_fn();
 
     /// The ONE "may a local password be evaluated for `username`" decision

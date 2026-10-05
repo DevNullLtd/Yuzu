@@ -6818,8 +6818,8 @@ void SettingsRoutes::register_routes(
                   auto codes_res = db->mfa_verify_enrollment(session->username, code,
                                                              /*expected_password_hash_hex=*/std::nullopt);
                   if (!codes_res && codes_res.error() == AuthDBError::CredentialChanged) {
-                      // #5342 Gate 8 (F4): the password changed while (or
-                      // before) this enrolment was being confirmed — nothing
+                      // #5342 Gate 8 (F4): the password changed while this
+                      // enrolment was being confirmed — nothing
                       // was enrolled and no recovery codes were issued. No
                       // retry form (the provisional secret was discarded with
                       // the credential change); the session is being revoked.

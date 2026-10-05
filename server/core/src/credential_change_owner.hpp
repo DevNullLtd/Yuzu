@@ -136,7 +136,11 @@ struct CredentialChangeOutcome {
 class CredentialChangeOwner {
 public:
     /// Bounded acquire for the one lease, and the txn-scoped `lock_timeout`.
-    static constexpr std::chrono::milliseconds kWriteTimeout{4000};
+    /// MUST stay strictly below `AuthDB::recheck_role_locked`'s lock_timeout
+    /// (auth_db.cpp kWriteTimeout, 2000 ms): a same-account sign-in queued behind
+    /// a stalled change must wait out the change's abort, never fail closed and
+    /// sweep the account's sessions (#5342 Gate 8 R22e).
+    static constexpr std::chrono::milliseconds kWriteTimeout{1500};
 
     /// `audit` may be null (an audit-off wiring) — then every `commit()` answers
     /// `kAuditUnavailable` without touching the database: a credential change is

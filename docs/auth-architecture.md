@@ -283,8 +283,10 @@ split fails every statement closed, never a partial write.
 mfa_verified, expected_hash_hex)` takes the verified hash (no default; the MFA
 pending entry carries it across the TOTP round trip). After the session is
 persisted, `post_mint_role_recheck` re-reads the row with
-`AuthDB::recheck_role_locked` (`SELECT … FOR UPDATE`, bounded `lock_timeout`)
-and revokes-and-denies when the role or the stored hash diverged. Because the
+`AuthDB::recheck_role_locked` (`SELECT … FOR UPDATE`, bounded `lock_timeout`
+(deliberately longer than the owner's own `lock_timeout`, so a same-account mint
+queued behind a stalled change waits out its abort instead of failing closed —
+R22e)) and revokes-and-denies when the role or the stored hash diverged. Because the
 read is LOCKING, a credential change whose UPDATE has executed but not yet
 committed makes the mint wait for that commit and then see the new hash; a
 change that has not yet taken the lock will DELETE the (already committed)
@@ -324,14 +326,19 @@ check the A2/A1 handlers accept.
 
 **Accepted residual (R14).** A Settings MFA init or verify admitted on a
 session that a credential change is revoking — on the same replica between the
-change's COMMIT and its erase of the cached session, or on another replica
-before its next session-generation refresh (≤1 s) — anchors to the NEW hash it
-reads and so can mint and, with a second such request, enrol a secret. That is
-the generic session-revocation propagation window, not a credential-specific
+change's COMMIT and its erase of the cached session, on another replica before
+its next session-generation refresh (≤1 s), or a request admitted before the
+COMMIT whose own store reads land after it, bounded by the store's read timeout
+plus its one retry, ≈4.2 s — mint only — anchors to the NEW hash it reads and so
+can mint and, with a second such request, enrol a secret. A mint alone makes the
+account's next enrolment re-reveal that provisional secret, so a secret the
+revoked session's holder saw can be enrolled by the legitimate user. The same
+window also covers `POST /api/settings/mfa/recovery-codes` and `/disable`. That
+is the generic session-revocation propagation window, not a credential-specific
 one. The controls are the compromise runbook (`yuzu-server --mfa-reset`) and
 the `mfa.enroll.*` audit rows adjacent to `user.password_reset`; full closure
 is a fifth credential-change owner step or a current-password field on the
-Settings enrolment form (new issue).
+Settings enrolment form (#5392).
 
 **Route gates** (`rest_api_v1.cpp` `register_password_routes`): interactive
 cookie sessions only — any MCP tier, service-scoped token, engine principal or

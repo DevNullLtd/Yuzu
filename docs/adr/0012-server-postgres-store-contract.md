@@ -301,11 +301,12 @@ the same shape `rbac_store_sql_helpers.hpp` gives `RbacAdminAuthorityOwner`:
   never a second INSERT.
 
 Lock order (documented in the owner header; a change inverting it can deadlock): the `auth.users`
-row, then `session_store.sessions` rows, then the `session_meta` `write_generation` row, then the
-`audit_store.audit_events` INSERT. It is acyclic against every other holder because no
+row, then `session_store.sessions` rows, then the `audit_store.audit_events` INSERT, then LAST the
+`session_meta` `write_generation` row. It is acyclic against every other holder because no
 `session_store` transaction touches another schema (nothing holds `session_meta` and then waits on
-`auth.users`), the locking post-mint re-read (`AuthDB::recheck_role_locked`) takes `auth.users`
-only after its own session INSERT has committed, and `RbacAdminAuthorityOwner` takes
-`principal_roles` before `auth.users` and never a session or audit lock. Like the RBAC owner, it is
-correct only because `AuthDB`, `SessionStore` and `AuditStore` share ONE pool/database (ADR-0006);
-a split onto separate databases fails every statement closed, never a silent partial write.
+`auth.users`), no audit writer touches `session_store`, the locking post-mint re-read
+(`AuthDB::recheck_role_locked`) takes `auth.users` only after its own session INSERT has committed,
+and `RbacAdminAuthorityOwner` takes `principal_roles` before `auth.users` and never a session or
+audit lock. Like the RBAC owner, it is correct only because `AuthDB`, `SessionStore` and
+`AuditStore` share ONE pool/database (ADR-0006); a split onto separate databases fails every
+statement closed, never a silent partial write.
