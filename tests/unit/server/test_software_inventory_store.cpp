@@ -90,7 +90,7 @@ SwinvShared& swinv_shared() {
 }
 
 // Restore the shared DB to its fresh-clone state: TRUNCATE every data table and
-// re-seed the catalog_rollup_meta singleton. Migration v4 seeds id=1 with
+// re-seed the catalog_rollup_meta singleton. Migration v8 seeds id=1 with
 // refreshed_at=0 ("building"); a bare TRUNCATE would drop that row and break the
 // pre-refresh reads (the catalogue tests), so re-insert it. public.schema_meta
 // is deliberately untouched — the clone stays migrated, so the per-test store
@@ -1291,6 +1291,14 @@ TEST_CASE("reads are AUTHORITATIVE: a degrade returns nullopt, distinct from a t
         q.name = "Chrome";
         CHECK_FALSE(store.query_software(q).has_value());             // degraded → nullopt
         CHECK_FALSE(store.get_agent_software("agent-a").has_value()); // not a silent empty
+        // The rewritten catalogue reads degrade the same way (ADR-0016 §7).
+        CHECK_FALSE(
+            store.software_catalog(yuzu::server::SoftwareCatalogQuery{.q = "x"}).has_value());
+        CHECK_FALSE(store
+                        .software_versions(yuzu::server::SoftwareVersionsQuery{
+                            .name = "x", .ecosystem = "brew"})
+                        .has_value());
+        CHECK_FALSE(store.catalog_rollup_meta().has_value());
     }
 }
 
@@ -2117,6 +2125,22 @@ TEST_CASE("q is literal and title-level and clamped", "[pg][software_inventory]"
     for (int i = 0; i < 150; ++i)
         big.q += "\xC3\xA9";
     CHECK(store.software_catalog(big).has_value());
+    // Invalid UTF-8 is scrubbed before the clamp: a bare invalid byte is a value (not a degrade
+    // -> nullopt via PG 22021), and an all-continuation term filters instead of clamping to ""
+    // and returning the whole catalogue.
+    SoftwareCatalogQuery bad;
+    bad.q = "\xFF";
+    auto bad_page = store.software_catalog(bad);
+    REQUIRE(bad_page.has_value());
+    CHECK(bad_page->empty());
+    SoftwareCatalogQuery conts;
+    conts.q = std::string(200, '\x80');
+    auto conts_page = store.software_catalog(conts);
+    REQUIRE(conts_page.has_value());
+    CHECK(conts_page->empty()); // filtered, not the unfiltered catalogue
+    SoftwareFleetQuery bad_fleet;
+    bad_fleet.q = "\xFF";
+    CHECK(store.query_software(bad_fleet).has_value());
     // The 128-byte clamp is applied on both reads: a title of 128 'a' queried with 128 'a' + 72
     // 'z' is found (the term is cut to the 128 'a'); unclamped the term would match nothing.
     const std::string long_title(128, 'a');
@@ -2131,7 +2155,7 @@ TEST_CASE("q is literal and title-level and clamped", "[pg][software_inventory]"
     CHECK((*hits)[0].entry.name == long_title);
 }
 
-TEST_CASE("catalogue keyset walk is exact, bounded and rejects a negative cursor",
+TEST_CASE("catalogue keyset walk is exact and bounded; rejects a negative cursor",
           "[pg][software_inventory]") {
     SWINV_SHARED(store, pool);
     // A,B on 3 devices; C,D on 2; E,F on 1 (ties inside each count); C on two versions.
@@ -2221,7 +2245,7 @@ TEST_CASE("host catalogue view reads one device and shares the q list representa
     CHECK(host2->empty());
 }
 
-TEST_CASE("software_versions fleet, filtered and host paths carry the fleet newest mark",
+TEST_CASE("software_versions fleet/filtered/host paths carry the fleet newest mark",
           "[pg][software_inventory]") {
     SWINV_SHARED(store, pool);
     put(store, "vA",
@@ -2613,6 +2637,17 @@ TEST_CASE("migration v8 reshapes a v7-era rollup schema and re-runs idempotently
             "('grain', 'newest_version', 'sources')) OR (table_name = 'catalog_rollup_meta' AND "
             "column_name = 'total_installs'))");
         CHECK(std::string(PQgetvalue(r.get(), 0, 0)) == "4");
+    }
+    {
+        // Rollback posture: an OLD binary's refresh INSERT names no grain column. The v8
+        // DEFAULT lands it as the title grain (7) instead of failing NOT NULL.
+        exec("INSERT INTO software_inventory_store.catalog_rollup (name, publisher, "
+             "device_count, version_count) VALUES ('OldShapeTitle', 'p', 3, 1)");
+        auto r = run_sql(pool, "SELECT grain FROM software_inventory_store.catalog_rollup "
+                               "WHERE name = 'OldShapeTitle'");
+        REQUIRE(PQntuples(r.get()) == 1);
+        CHECK(std::string(PQgetvalue(r.get(), 0, 0)) == "7");
+        exec("DELETE FROM software_inventory_store.catalog_rollup WHERE name = 'OldShapeTitle'");
     }
     rewind();
     SoftwareInventoryStore again{pool}; // idempotent re-run

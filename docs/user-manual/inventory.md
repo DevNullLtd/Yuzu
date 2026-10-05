@@ -715,13 +715,16 @@ hourly by the background `SoftwareCatalogRollup` thread) emits three further ser
 
 - `yuzu_inventory_catalog_rollup_total{outcome}` (counter, outcome ∈ `success` / `error`)
   — one per recompute attempt that completes or fails (a shutdown-cancelled attempt is
-  not counted). A rising `error` count with a frozen
-  `…_last_success_timestamp` means recomputes are failing (PG outage / the 60s budget
-  or the 10-minute whole-refresh budget exceeded at scale) and the catalogue is going
-  stale; keep-last-good serves the prior rollup meanwhile.
+  not counted as an error). A rising `error` count with a frozen
+  `…_last_success_timestamp` means recomputes are failing (PG outage, a statement over
+  its 60 s limit, or the 10-minute whole-refresh limit exceeded at scale) and the
+  catalogue is going stale; keep-last-good serves the prior rollup meanwhile, except for
+  the first refresh after the v8 upgrade, which has no last-good and leaves the catalogue
+  "building". The failing statement and its cause are in the server log (warning).
 - `yuzu_inventory_catalog_rollup_duration_seconds` (gauge) — the last recompute's
-  wall-clock. A rising value approaching the 60s budget is the leading indicator to raise
-  the budget (or shard the rollup) before recomputes start timing out. (A gauge, not a
+  whole-refresh wall-clock. Compare it with the two compile-time limits (not flags): 60 s
+  per statement and 600 s for the whole refresh. A value rising towards either is the
+  leading indicator that the fleet is nearing the ceiling below. (A gauge, not a
   histogram: at one sample/hour percentiles add nothing.)
 - `yuzu_inventory_catalog_rollup_last_success_timestamp` (gauge, epoch seconds) — the
   primary liveness signal; it is the source of the Software tab's "updated N ago" stamp.
@@ -739,9 +742,19 @@ combinations), and every read is one exact lookup, never a sum. The refresh runs
 passes of `installed_software`), one further pass computes the exact per-OS-family split, and
 the fleet-newest version of every title is folded from `version_rollup` through a server-side
 cursor into a transaction-scoped temp table with memory bounded by the batch size, not the
-title count. In total the refresh costs about four times the former single `GROUP BY`; it
-keeps the 60 s per-statement budget, gains a 10-minute whole-refresh budget, and aborts
-cleanly (last-good rollup kept) on shutdown. KPI definitions: total installs = distinct
+title count. The refresh keeps the 60 s per-statement limit, gains a 10-minute whole-refresh
+limit (both compile-time), and aborts cleanly (last-good rollup kept) on shutdown.
+Scale ceiling (measured on PostgreSQL 18.6): the `GROUPING SETS` statement costs about
+12.8 times the former single `GROUP BY` (37 s against 2.9 s at 1.8M installed rows) and
+reaches the flat 60 s statement limit at about 2.7M installed rows, roughly 6,000
+endpoints; beyond that the catalogue stays "building" until the rollup is made
+incremental. The server's database role needs the `TEMPORARY` privilege (the default
+`PUBLIC` grant; re-grant it after a `REVOKE TEMP` hardening), because the refresh uses a
+transaction-scoped temporary table; without it every refresh fails with SQLSTATE 42501
+and the catalogue stays "building". On a rollback to an older binary, restart old
+replicas promptly: the v8 `DROP` queues behind an old replica's refresh and dies at the
+pool's 10 s `lock_timeout` (the server then refuses to start, fail-closed), and an old
+binary's grain-less rows read as title-grain rows (each title once). KPI definitions: total installs = distinct
 (device, title) pairs; the OS split counts each (device, title) pair once per OS family
 derived from the ecosystem; stay-current = distinct devices on each title's exact newest
 version string divided by distinct devices carrying the title, over every title with a known

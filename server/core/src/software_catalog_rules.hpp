@@ -86,9 +86,10 @@ struct VToken {
     return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
 }
 
-/// Tokenise on any non-alphanumeric byte and on digit<->alpha transitions (the NVD
-/// tokenizer's rules, restated: that one is file-private). A leading "N:" epoch is dropped
-/// so an rpm epoch cannot outrank another ecosystem's spelling of the same version.
+/// Tokenise on ANY non-alphanumeric byte and on digit<->alpha transitions. Modelled on the
+/// NVD tokenizer (file-private there), which is narrower: it breaks only on `. - _ + ~`.
+/// A leading "N:" epoch is dropped so an rpm epoch cannot outrank another ecosystem's
+/// spelling of the same version.
 [[nodiscard]] inline std::vector<VToken> tokenize(std::string_view v) {
     std::size_t i = 0;
     std::size_t d = 0;
@@ -174,9 +175,12 @@ struct TokKey {
 /// length then lexicographic, overflow-safe). The first unequal position decides; all equal
 /// -> 0. Orders that triple as 1.0rc < 1.0 < 1.0a whatever the input order. Agrees with
 /// nvd_version_compare on its documented examples (1.10 > 1.9; 2.0 > 2.0-rc1; 9.8p1 > 9.8;
-/// 1.0.2a > 1.0.2; 1.0 == 1.0.0; 1:2.3 == 2.3). The ONE documented divergence: a zero
+/// 1.0.2a > 1.0.2; 1.0 == 1.0.0; 1:2.3 == 2.3). Documented divergences from NVD: (1) a zero
 /// numeric token against an alpha token at the same position ("1.0.0" vs "1.0.a") orders the
-/// alpha higher, where NVD orders any numeric higher.
+/// alpha higher, where NVD orders any numeric higher; (2) an unrecognised alpha tag against a
+/// pre-release tag orders by class (pre-release lower), so 1.0rc < 1.0p, where NVD compares
+/// the letters positionally (1.0p < 1.0rc); (3) any non-alphanumeric byte separates tokens
+/// here, NVD only `. - _ + ~`.
 [[nodiscard]] inline int catalog_version_compare(std::string_view a, std::string_view b) {
     const auto ta = detail::tokenize(a);
     const auto tb = detail::tokenize(b);

@@ -150,7 +150,8 @@ struct SoftwareVersionCount {
 /// titles with at least that many distinct versions. Rows are ordered (installs DESC, name)
 /// on the fleet path and (name) on the host path; `limit` is clamped to a hard ceiling
 /// independent of the caller; `after` resumes strictly after the cursor. The read runs under
-/// a 5 s execution bound: a timeout is `nullopt` (degrade), never an empty page.
+/// a 5 s execution bound: a timeout is `nullopt` (degrade), never an empty page. `limit`
+/// defaults to 100 (`<= 0` also means 100).
 struct SoftwareCatalogQuery {
     std::string q;
     std::string kind;
@@ -349,7 +350,7 @@ public:
     /// `cancelled` is polled between statements and between every cursor FETCH / temp-table
     /// INSERT batch, together with the `kRollupRefreshBudget` wall budget; true (or budget
     /// exhausted) rolls back and returns false, so stop() -> join is bounded by one statement
-    /// plus one batch. An empty predicate means not cancellable (the boot-time call).
+    /// plus one batch. An empty predicate means not cancellable (tests).
     /// A second replica's serialization conflict also rolls back to last-good (benign; the
     /// mechanism is documented at the advisory-lock statement in the .cpp).
     bool refresh_catalog_rollup(const std::function<bool()>& cancelled = {});

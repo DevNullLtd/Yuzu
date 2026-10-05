@@ -6,6 +6,7 @@
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
 #include "software_catalog_rules.hpp"
+#include "utf8_sanitize.hpp"
 
 #include <yuzu/metrics.hpp>
 
@@ -49,16 +50,22 @@ constexpr int kFleetQueryRowCap = 100000;
 // `limit`. The catalogue is one row per distinct title; the drill is one per
 // distinct version of a title — both bounded sets.
 constexpr int kCatalogRowCap = 2000;
-// Execution BUDGET (not a guarantee) for the BACKGROUND catalogue recompute
-// (refresh_catalog_rollup) — the single expensive full-table GROUP BY. It runs off the
-// request path on the SoftwareCatalogRollup thread (the page never waits on it) and
-// overrides the pool's 30s default for that one txn. 60s bounds BOTH the worst-case
-// pooled-connection hold AND the shutdown-join stall (stop() can't cancel an in-flight
-// statement, so the join waits up to this long). KEEP-LAST-GOOD on a timeout: the txn
-// rolls back, the prior rollup + freshness stamp survive (the "as of" stamp ages, and
-// yuzu_inventory_catalog_rollup_total{outcome="error"} increments). If a genuine 400k
-// recompute ever exceeds 60s it stays "building"/stale until it fits — observable via the
-// metrics; raise this then. The page READS hit the small precomputed tables, no bound.
+// Execution BUDGET (not a guarantee) PER STATEMENT of the BACKGROUND catalogue recompute
+// (refresh_catalog_rollup). It runs off the request path on the SoftwareCatalogRollup
+// thread (the page never waits on it) and overrides the pool's 30s default for that one
+// txn. The refresh is many statements in one txn, so the pooled-connection hold is up to
+// kRollupRefreshBudget (600 s) plus one statement; the shutdown-join stall stays bounded
+// by 60 s plus one batch (stop() cannot cancel an in-flight statement, so the join waits
+// out the current one). Both limits are compile-time constants, not flags.
+// KEEP-LAST-GOOD on a timeout: the txn rolls back, the prior rollup + freshness stamp
+// survive (the "as of" stamp ages, and yuzu_inventory_catalog_rollup_total{outcome="error"}
+// increments). The first refresh after migration v8 has no last-good (v8 drops the rollup
+// tables), so a failing first refresh leaves the catalogue "building".
+// Scale ceiling (measured on PG 18.6): the GROUPING SETS statement costs about 12.8x the
+// former catalogue GROUP BY (37 s vs 2.9 s at 1.8M rows) and reaches this flat 60 s cap at
+// about 2.7M installed rows (about 6,000 endpoints at about 450 titles each); beyond that
+// the catalogue stays "building" until the rollup is made incremental. The page READS hit
+// the small precomputed tables, no bound.
 constexpr const char* kRollupStatementTimeout = "60s";
 
 const std::vector<pg::PgMigration>& migrations() {
@@ -253,6 +260,12 @@ const std::vector<pg::PgMigration>& migrations() {
          // boot-time refresh the meta row reads refreshed_at = 0, the existing honest
          // "building" state. version_rollup is untouched (shape unchanged, keeps its
          // UNIQUE (name, version), which also serves the newest-version cursor order).
+         // grain carries DEFAULT 7 (the title-total grain) on purpose: the migration runner
+         // skips a version at or below the schema's, so an OLD binary can still run against
+         // v8 (rollback, or an old replica left running). Its refresh INSERT names no grain
+         // column; with the default each of its rows lands as the title grain, its (grain-
+         // less) read lists each title once, and it never rolls back on NOT NULL. The new
+         // refresh always writes grain explicitly from GROUPING().
          // The expression index is what makes the (installs DESC, name) keyset an index
          // seek: the read's row-value compare on ((-device_count), name) matches it; the
          // unique key's leading `name` serves the per-title newest lookups.
@@ -260,7 +273,7 @@ const std::vector<pg::PgMigration>& migrations() {
          "DROP TABLE IF EXISTS catalog_rollup_meta;"
          "CREATE TABLE catalog_rollup ("
          "  name            TEXT     NOT NULL,"
-         "  grain           SMALLINT NOT NULL,"
+         "  grain           SMALLINT NOT NULL DEFAULT 7,"
          "  kind            TEXT     NOT NULL DEFAULT '',"
          "  ecosystem       TEXT     NOT NULL DEFAULT '',"
          "  source          TEXT     NOT NULL DEFAULT '',"
@@ -935,7 +948,8 @@ SoftwareInventoryStore::query_software(const SoftwareFleetQuery& q) {
         // decision) when the fleet passes that.
         const std::string ph = "$" + std::to_string(++p);
         sql += q_arms(ph, "name", "publisher", "ecosystem", "source");
-        params.push_back(sc::like_escape(sc::clamp_utf8(q.q, sc::kSearchMaxBytes)));
+        params.push_back(
+            sc::like_escape(sc::clamp_utf8(sanitize_utf8_strict(q.q), sc::kSearchMaxBytes)));
     }
     if (!q.kind.empty()) {
         sql += " AND kind = $" + std::to_string(++p);
@@ -1053,7 +1067,10 @@ SoftwareInventoryStore::software_catalog(const SoftwareCatalogQuery& q) {
         limit = kCatalogRowCap;
     const int versions_min = q.versions_min < 0 ? 0 : q.versions_min;
     const bool host = !q.agent_id.empty();
-    const std::string term = sc::like_escape(sc::clamp_utf8(q.q, sc::kSearchMaxBytes));
+    // Scrub invalid UTF-8 BEFORE the clamp (PG rejects the bound text with 22021 otherwise,
+    // and an all-continuation prefix would clamp to "" and run unfiltered).
+    const std::string term =
+        sc::like_escape(sc::clamp_utf8(sanitize_utf8_strict(q.q), sc::kSearchMaxBytes));
 
     std::vector<std::string> params;
     int p = 0;
@@ -1064,10 +1081,16 @@ SoftwareInventoryStore::software_catalog(const SoftwareCatalogQuery& q) {
     std::string sql;
     if (!host) {
         const int grain = sc::grain_mask(q.kind, q.ecosystem, q.source);
+        // Named locals, not one operator+ chain: the order of unsequenced bind() calls in a
+        // single expression is compiler-defined, which would permute the $n numbering.
+        const std::string grain_ph = bind(std::to_string(grain));
+        const std::string kind_ph = bind(q.kind);
+        const std::string eco_ph = bind(q.ecosystem);
+        const std::string src_ph = bind(q.source);
         sql = "SELECT name, publisher, device_count, version_count, ecosystems, kinds, "
               "newest_version FROM software_inventory_store.catalog_rollup WHERE grain = " +
-              bind(std::to_string(grain)) + "::smallint AND kind = " + bind(q.kind) +
-              " AND ecosystem = " + bind(q.ecosystem) + " AND source = " + bind(q.source);
+              grain_ph + "::smallint AND kind = " + kind_ph + " AND ecosystem = " + eco_ph +
+              " AND source = " + src_ph;
         if (versions_min > 0)
             sql += " AND version_count >= " + bind(std::to_string(versions_min)) + "::bigint";
         if (!term.empty())
@@ -1230,12 +1253,29 @@ bool SoftwareInventoryStore::refresh_catalog_rollup(const std::function<bool()>&
         return false;
     // Cancellation/budget contract: see the declaration in software_inventory_store.hpp.
     const auto deadline = std::chrono::steady_clock::now() + sc::kRollupRefreshBudget;
+    const auto started = std::chrono::steady_clock::now();
     auto abort_requested = [&]() -> bool {
-        if ((cancelled && cancelled()) || std::chrono::steady_clock::now() >= deadline) {
-            spdlog::info("SoftwareInventoryStore: catalogue rollup refresh cancelled or over "
-                         "budget — keeping last-good");
+        const auto now = std::chrono::steady_clock::now();
+        if (cancelled && cancelled()) {
+            spdlog::info("SoftwareInventoryStore: catalogue rollup refresh cancelled — keeping "
+                         "last-good");
             return true;
         }
+        if (now >= deadline) {
+            spdlog::warn("SoftwareInventoryStore: catalogue rollup refresh over its {} s budget "
+                         "(elapsed {} s) — keeping last-good",
+                         std::chrono::duration_cast<std::chrono::seconds>(sc::kRollupRefreshBudget)
+                             .count(),
+                         std::chrono::duration_cast<std::chrono::seconds>(now - started).count());
+            return true;
+        }
+        return false;
+    };
+    // A failed statement names its cause (SQLSTATE text from libpq) so a timeout, a
+    // serialization failure, a missing privilege and a pool problem are told apart in the log.
+    auto failed = [](std::string_view label, const pg::PgResult& r) -> bool {
+        spdlog::warn("SoftwareInventoryStore: catalogue rollup refresh statement '{}' failed: {}",
+                     label, PQresultErrorMessage(r.get()));
         return false;
     };
     // ONE transaction: recompute the rollup tables + the meta from installed_software,
@@ -1246,8 +1286,10 @@ bool SoftwareInventoryStore::refresh_catalog_rollup(const std::function<bool()>&
         auto cmd = [&](const std::string& sql) -> bool {
             if (abort_requested())
                 return false;
-            return pg::exec_params(c, sql.c_str(), std::vector<std::string>{}).status() ==
-                   PGRES_COMMAND_OK;
+            const pg::PgResult res = pg::exec_params(c, sql.c_str(), std::vector<std::string>{});
+            if (res.status() == PGRES_COMMAND_OK)
+                return true;
+            return failed(std::string_view(sql).substr(0, 48), res);
         };
         // REPEATABLE READ as the FIRST statement: version_rollup, newest_tmp, catalog_rollup
         // and every KPI come from ONE source snapshot. The snapshot itself is taken at the
@@ -1257,7 +1299,7 @@ bool SoftwareInventoryStore::refresh_catalog_rollup(const std::function<bool()>&
         // -> ROLLBACK (keep-last-good) -> next tick. Benign, two-replica-only.
         if (pg::PgResult iso{PQexec(c, "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")};
             iso.status() != PGRES_COMMAND_OK)
-            return false;
+            return failed("SET TRANSACTION ISOLATION LEVEL", iso);
         if (!cmd(std::string("SET LOCAL statement_timeout = '")
                      .append(kRollupStatementTimeout)
                      .append("'")))
@@ -1278,7 +1320,7 @@ bool SoftwareInventoryStore::refresh_catalog_rollup(const std::function<bool()>&
                             "software_catalog_rollup', 0))",
                             std::vector<std::string>{});
         if (lk.status() != PGRES_TUPLES_OK)
-            return false;
+            return failed("advisory lock", lk);
         if (PQntuples(lk.get()) == 1 && std::string_view(PQgetvalue(lk.get(), 0, 0)) == "f")
             return true; // a peer instance is refreshing the shared rollup — skip, success
 
@@ -1295,7 +1337,9 @@ bool SoftwareInventoryStore::refresh_catalog_rollup(const std::function<bool()>&
         // server-side cursor, fold title by title (running max under the catalogue's
         // transitive comparator + the total tie rule) and batch the picks into a
         // transaction-scoped temp table. Memory is one FETCH batch + one flush batch + one
-        // title's running best, independent of the title count.
+        // title's running best, independent of the title count. Needs the TEMPORARY privilege
+        // on the database (default PUBLIC grant; a hardened role without it fails 42501 here
+        // and the catalogue stays "building").
         if (!cmd("CREATE TEMP TABLE newest_tmp (name TEXT PRIMARY KEY, newest_version TEXT NOT "
                  "NULL, newest_installs BIGINT NOT NULL) ON COMMIT DROP"))
             return false;
@@ -1329,7 +1373,7 @@ bool SoftwareInventoryStore::refresh_catalog_rollup(const std::function<bool()>&
                 std::vector<std::string>{pg::to_text_array(names), pg::to_text_array(versions),
                                          pg::to_text_array(counts_sv)});
             picks.clear();
-            return ins.status() == PGRES_COMMAND_OK;
+            return ins.status() == PGRES_COMMAND_OK || failed("INSERT INTO newest_tmp", ins);
         };
         sc::NewestFold fold;
         const std::string fetch_sql =
@@ -1339,7 +1383,7 @@ bool SoftwareInventoryStore::refresh_catalog_rollup(const std::function<bool()>&
                 return false;
             pg::PgResult page = pg::exec_params(c, fetch_sql.c_str(), std::vector<std::string>{});
             if (page.status() != PGRES_TUPLES_OK)
-                return false;
+                return failed("FETCH newest_cur", page);
             const int rows = PQntuples(page.get());
             for (int i = 0; i < rows; ++i) {
                 fold.feed(PQgetvalue(page.get(), i, 0), PQgetvalue(page.get(), i, 1),
@@ -1404,7 +1448,7 @@ bool SoftwareInventoryStore::refresh_catalog_rollup(const std::function<bool()>&
                 .c_str(),
             std::vector<std::string>{});
         if (fam.status() != PGRES_TUPLES_OK || PQntuples(fam.get()) != 1)
-            return false;
+            return failed("KPI OS-family split", fam);
         // (b) rpm: a single ecosystem at the ecosystem-only grain, exact.
         if (abort_requested())
             return false;
@@ -1416,17 +1460,19 @@ bool SoftwareInventoryStore::refresh_catalog_rollup(const std::function<bool()>&
                 .c_str(),
             std::vector<std::string>{});
         if (rpm.status() != PGRES_TUPLES_OK || PQntuples(rpm.get()) != 1)
-            return false;
-        // (c) distinct non-empty publishers, from the source table.
+            return failed("KPI rpm totals", rpm);
+        // (c) distinct non-empty publishers, from the source table (GROUP BY subselect: a hash
+        // aggregate, about 16x faster than count(DISTINCT) at 1.8M rows).
         if (abort_requested())
             return false;
         pg::PgResult pubs = pg::exec_params(
             c,
-            "SELECT count(DISTINCT publisher) FROM software_inventory_store.installed_software "
-            "WHERE publisher <> ''",
+            "SELECT count(*) FROM (SELECT publisher FROM "
+            "software_inventory_store.installed_software WHERE publisher <> '' "
+            "GROUP BY publisher) p",
             std::vector<std::string>{});
         if (pubs.status() != PGRES_TUPLES_OK || PQntuples(pubs.get()) != 1)
-            return false;
+            return failed("KPI publisher count", pubs);
 
         // meta: server receipt clock (now()), everything else from the just-built snapshot.
         // Empty fleet: every KPI 0 with refreshed_at > 0 ("refreshed but empty", distinct from
@@ -1464,7 +1510,7 @@ bool SoftwareInventoryStore::refresh_catalog_rollup(const std::function<bool()>&
                 PQgetvalue(fam.get(), 0, 3), PQgetvalue(rpm.get(), 0, 0),
                 PQgetvalue(rpm.get(), 0, 1)});
         if (m.status() != PGRES_TUPLES_OK)
-            return false;
+            return failed("catalog_rollup_meta update", m);
         if (PQntuples(m.get()) != 1) {
             spdlog::warn("SoftwareInventoryStore: catalogue rollup refresh found no "
                          "catalog_rollup_meta id=1 row to update — keeping last-good (the "
