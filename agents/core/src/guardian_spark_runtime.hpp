@@ -647,7 +647,8 @@ public:
         return disarm_retained_.load(std::memory_order_relaxed);
     }
     /// rung 9c R5.2: queued (never dispatched) claims dropped by begin_stop(), plus
-    /// disarm claims the executor refused with Stopped. Lock-free.
+    /// disarm claims the executor refused with Stopped. Increments only during shutdown
+    /// and resets on restart, so it is rarely observable on the fleet. Lock-free.
     [[nodiscard]] std::uint64_t claims_dropped_at_stop() const noexcept {
         return claims_dropped_at_stop_.load(std::memory_order_relaxed);
     }
@@ -831,7 +832,9 @@ public:
     void set_detach_fault_for_test(bool on) noexcept;
     /// R5.2 index-release fault seam (adversarial re-review r2 C2): consumed once by
     /// the next release_claim_index_locked - throws std::bad_alloc where
-    /// index_->remove_rule's own key-copy allocation would, BEFORE the mapping or the
+    /// index_->remove_rule's own key-copy allocation would have (the release now calls
+    /// erase_rule/owns, both noexcept, so this seam is the ONLY throw source inside
+    /// release_claim_index_locked's try in production code), BEFORE the mapping or the
     /// claim's index_held flag is touched.
     void set_index_remove_fault_for_test(bool on) noexcept;
     /// #5322: counted/sticky form of the index-release fault seam. n > 0 = the next n
@@ -870,11 +873,13 @@ public:
     [[nodiscard]] std::uint64_t detach_claim_failures() const noexcept {
         return detach_claim_failures_.load(std::memory_order_relaxed);
     }
-    /// R5.2 (adversarial re-review r3 C2/C3): a claim's index release threw inside
-    /// index_->remove_rule (its key-copy allocation) and was CONTAINED instead of
-    /// crossing a noexcept boundary (the drain, a refill's admission-failure cleanup,
-    /// begin_stop from the destructor); the claim keeps its index ownership for the
-    /// next release to retry. Expected 0. Lock-free.
+    /// R5.2 (adversarial re-review r3 C2/C3): a claim's index release threw and was
+    /// CONTAINED instead of crossing a noexcept boundary (the drain, a refill's
+    /// admission-failure cleanup, begin_stop from the destructor); the claim keeps its
+    /// index ownership for the next release to retry. DEFENCE-IN-DEPTH CONTAINMENT,
+    /// expected permanently 0 in production: the release calls SparkKeyRuleIndex::
+    /// erase_rule and owns(), both noexcept, so the only throw source inside the try is
+    /// the test seam (set_index_remove_fault_for_test). Lock-free.
     [[nodiscard]] std::uint64_t claim_index_release_failures() const noexcept {
         return claim_index_release_failures_.load(std::memory_order_relaxed);
     }
@@ -882,7 +887,9 @@ public:
     /// mapping, index_held && owns()) whose mapping the expiry reaper released and
     /// popped. A non-owner claim or a committed suffix popped by the same pass is not
     /// counted. Exported on the heartbeat as `yuzu.guardian_tombstones_released_by_reaper`
-    /// (#5404). Lock-free.
+    /// (#5404). A tombstone only exists after a release failed, and the release cannot fail
+    /// in production (see claim_index_release_failures()), so this is expected permanently
+    /// 0 outside tests. Lock-free.
     [[nodiscard]] std::uint64_t tombstones_released_by_reaper() const noexcept {
         return tombstones_released_by_reaper_.load(std::memory_order_relaxed);
     }
@@ -1220,7 +1227,8 @@ private:
         // Disarm payload.
         std::uint64_t subscription{0};
         /// #5403: Disarm-claim-only. steady_clock reading taken where the claim is built
-        /// (disarm_orphan_keys_locked, detach_rule_locked), the origin of
+        /// (disarm_orphan_keys_locked, and withdraw_rule_after_wedge_sweep_locked, which
+        /// detach_rule_locked and detach_all both reach), the origin of
         /// oldest_pending_disarm_age(). Written once, before the claim is pushed; never
         /// reset by an admission refusal, a worker throw or a redrive, so a retained
         /// Disarm keeps aging from its creation. Meaningless (default) on an Arm claim.
@@ -1606,6 +1614,13 @@ public:
     /// dispatch_arm_off_lock (a std::lock_guard failure, not reachable in practice, the same
     /// exposure dispatch_parked_arm_guarded's note names for every off-lock dispatch site);
     /// there is no per-refill catch because the hand-back would retake the same mutex.
+    ///
+    /// #4472 hardening: the synchronous spdlog warns (a pending Disarm past
+    /// kDisarmPendingObserveThreshold, a compensating teardown past its deadline, and one
+    /// summary line when the per-pass cap, kDisarmPendingWarnsPerPass, left some unwarned)
+    /// run LAST, after claim_cv_ is notified and every refill / Disarm is dispatched. The
+    /// latch and counter for each are set under the lock first, so a warn that is skipped
+    /// or fails never loses the once-per-claim count.
     std::size_t expire_overdue_claims();
     /// #5403: the same pass against a caller-supplied steady_clock reading. The zero-arg form
     /// is this with steady_clock::now(); a test passes a later `now` to age claims without
@@ -1615,8 +1630,16 @@ public:
     /// observation (observe_pending_disarms_locked): a Disarm pending longer than
     /// kDisarmPendingObserveThreshold is counted once (disarm_deadline_elapsed()) and
     /// warned about once, rate-limited per pass, naming the key only through
-    /// log_key_token. It changes no ownership, queue position, admission or receipt.
-    std::size_t expire_overdue_claims(std::chrono::steady_clock::time_point now);
+    /// log_key_token. It changes no ownership, queue position, admission or receipt for a
+    /// Disarm. CAUTION: `now` is not an observation-only input. It drives the same pass the
+    /// zero-arg form runs, so it ALSO abandons every in-flight Arm claim whose own deadline is
+    /// before `now` (a future-dated `now` abandons every arm in flight) and reaps terminal
+    /// heads against it. That is why this state-mutating overload is a test seam, named
+    /// `_for_test` like the file's other seams, and production calls only the zero-arg form
+    /// (guardian_arm_ack.cpp's drain).
+    std::size_t expire_overdue_claims_at_for_test(std::chrono::steady_clock::time_point now) {
+        return expire_overdue_claims_impl(now);
+    }
 
     /// rung 9c PR-2 Unit 3 (Astra opine review Blocker 4): bounded, on-demand
     /// maintenance pass for retained disarms - one attempted re-submission per
@@ -1657,6 +1680,8 @@ public:
     /// (index_held && index_->owns(key, rule_id, generation)). A live gauge under
     /// registry_mu_ by scanning claims_; exported on the heartbeat as
     /// `yuzu.guardian_retained_tombstones` (#5404) once per heartbeat. Not a per-event read.
+    /// A tombstone requires a failed index release, which cannot happen in production (see
+    /// claim_index_release_failures()), so this is expected permanently 0 outside tests.
     [[nodiscard]] std::size_t retained_tombstones() const;
 
     /// #5403: a Disarm pending longer than this is observed once (a counter and a warn).
@@ -2025,6 +2050,24 @@ private:
     /// non-noexcept sibling line in publish_arm_verdicts_locked's own fill-in loop
     /// this function mirrors).
     void synthesize_fallback_outcome_locked(KeyClaim& c);
+    /// One key whose pending Disarm (or outstanding compensating teardown) this pass
+    /// observed, copied under registry_mu_ so the warn can be emitted after it releases.
+    struct DisarmObservation {
+        std::string key;
+        std::chrono::steady_clock::duration age{};
+    };
+    /// Per-pass cap on each kind of warn; claims past it are still latched and counted,
+    /// never warned individually (the pass emits one summary line with the remainder).
+    static constexpr std::size_t kDisarmPendingWarnsPerPass = 4;
+    /// What one expire_overdue_claims pass collected under registry_mu_ for its off-lock warn
+    /// phase. `*_more` counts claims latched and counted this pass whose own warn was NOT
+    /// recorded (past the per-pass cap, or a failed copy), so the summary line is truthful.
+    struct ExpireWarns {
+        std::vector<DisarmObservation> disarms;       ///< pending-Disarm observations (#5403)
+        std::size_t disarms_more{0};
+        std::vector<DisarmObservation> compensations; ///< compensation deadline observations (#4472)
+        std::size_t compensations_more{0};
+    };
     /// Not a clock-guarded retention pass: it uses a monotonic in-memory claim lifecycle
     /// with no wall clock, no persisted anchor and no age-based delete, so parts 1-4, 6 and
     /// 7 of the clock-guarded-retention rule and its SINGLE-WRITER note do not apply; part 5
@@ -2096,8 +2139,11 @@ private:
     /// #4472: `now` is the pass's own reading (expire_overdue_claims' parameter, the real
     /// steady clock in production), so the compensation-deadline observation above is judged
     /// against the same instant a test passes to oldest_outstanding_compensation_age().
+    /// `warns.compensations` receives (up to the per-pass cap) the claims whose compensation
+    /// deadline this pass latched (#4472: one warn per claim, key via log_key_token only).
     std::size_t reap_stranded_claims_locked(std::chrono::steady_clock::time_point now,
-                                            std::vector<std::pair<std::string, std::shared_ptr<KeyClaim>>>& refills);
+                                            std::vector<std::pair<std::string, std::shared_ptr<KeyClaim>>>& refills,
+                                            ExpireWarns& warns);
     /// Not a clock-guarded retention pass: it uses a monotonic in-memory claim lifecycle
     /// with no wall clock, no persisted anchor and no age-based delete, so parts 1-4, 6 and
     /// 7 of the clock-guarded-retention rule and its SINGLE-WRITER note do not apply; part 5
@@ -2136,22 +2182,17 @@ private:
     /// once, from that same reading plus that same constant), so no second timestamp is kept.
     [[nodiscard]] std::optional<std::chrono::steady_clock::duration>
     oldest_outstanding_compensation_age_locked(std::chrono::steady_clock::time_point now) const;
-    /// One key whose pending Disarm this pass observed, copied under registry_mu_ so the
-    /// warn can be emitted after it releases.
-    struct DisarmObservation {
-        std::string key;
-        std::chrono::steady_clock::duration age{};
-    };
-    /// Per-pass cap on warns; claims past it are still latched and counted, never warned.
-    static constexpr std::size_t kDisarmPendingWarnsPerPass = 4;
+    /// Impl of expire_overdue_claims() / expire_overdue_claims_at_for_test().
+    std::size_t expire_overdue_claims_impl(std::chrono::steady_clock::time_point now);
     /// registry_mu_ held. #5403: latch (KeyClaim::disarm_deadline_observed) and count
     /// (disarm_deadline_elapsed_) every pending Disarm head older than
     /// kDisarmPendingObserveThreshold at `now`, once per claim, and copy up to
-    /// kDisarmPendingWarnsPerPass of them into `warns` (a copy that throws only drops that
-    /// warn). Observation only: nothing is released, popped or cancelled. Returns nothing;
-    /// the latch and the counter are the record. O(|claims_|).
+    /// kDisarmPendingWarnsPerPass of them into `warns.disarms` (a copy that throws only drops
+    /// that warn; every claim the cap or a failed copy leaves unrecorded is counted in
+    /// `warns.disarms_more`). Observation only: nothing is released, popped or cancelled.
+    /// Returns nothing; the latch and the counter are the record. O(|claims_|).
     void observe_pending_disarms_locked(std::chrono::steady_clock::time_point now,
-                                        std::vector<DisarmObservation>& warns);
+                                        ExpireWarns& warns);
     /// Off-lock. Dispatch an ARM claim (already the Dispatching head) through
     /// io_executor_.submit(); on a synchronous admission refusal (or a throw building
     /// the call) fail the head and every arm queued behind it with today's strings.

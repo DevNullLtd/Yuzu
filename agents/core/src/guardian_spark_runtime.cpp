@@ -793,7 +793,7 @@ GuardianSparkRuntime::oldest_outstanding_compensation_age(
 }
 
 void GuardianSparkRuntime::observe_pending_disarms_locked(
-    std::chrono::steady_clock::time_point now, std::vector<DisarmObservation>& warns) {
+    std::chrono::steady_clock::time_point now, ExpireWarns& warns) {
     for (auto& [key, entry] : claims_) {
         if (entry.fifo.empty())
             continue;
@@ -807,11 +807,14 @@ void GuardianSparkRuntime::observe_pending_disarms_locked(
         // even when the warn copy below fails or the per-pass warn cap is already spent.
         head->disarm_deadline_observed = true;
         disarm_deadline_elapsed_.fetch_add(1, std::memory_order_relaxed);
-        if (warns.size() >= kDisarmPendingWarnsPerPass)
+        if (warns.disarms.size() >= kDisarmPendingWarnsPerPass) {
+            ++warns.disarms_more; // counted, not warned individually: the summary line says so
             continue;
+        }
         try {
-            warns.push_back(DisarmObservation{key, age});
+            warns.disarms.push_back(DisarmObservation{key, age});
         } catch (...) {
+            ++warns.disarms_more;
         }
     }
 }
@@ -832,6 +835,18 @@ std::vector<std::string> GuardianSparkRuntime::invariant_violations_for_test(
         if (!keys_.contains(*key))
             out.push_back("rule '" + rule_id + "' maps to a key absent from keys_");
     }
+    // #4472 tripwire (arch-1): compensation_finished=true is written in the SAME critical
+    // section as the pop (or the dispatch -> Queued double-fault hand-back), so a claim that
+    // ever owed a compensation (deadline set) and now reads finished must not still be a
+    // Dispatched / Dispatching head. See is_wedge_k_eligible_locked's invariant comment.
+    for (const auto& [key, entry] : claims_)
+        for (const auto& c : entry.fifo)
+            if (c->compensation_finished &&
+                c->compensation_deadline != std::chrono::steady_clock::time_point{} &&
+                (c->dispatch == ClaimDispatch::Dispatched ||
+                 c->dispatch == ClaimDispatch::Dispatching))
+                out.push_back("claim on a key reads compensation_finished while still in flight "
+                              "(finished must be written with the pop)");
     for (const auto& [key, pk] : keys_) {
         if (index_->refcount(key) > 0)
             continue;
@@ -2289,6 +2304,15 @@ bool GuardianSparkRuntime::is_wedge_k_eligible_locked(
     // is compensation_finished, written in on_arm_complete's first critical section; NOT the
     // CompensationPermit, which is engaged for every in-flight arm (a genuinely hung arm
     // included) and would disable K for all of them.
+    // INVARIANT (arch-1, #4472): once a compensation was owed, compensation_finished=true is
+    // always written in the SAME registry_mu_ critical section as the pop of that claim (or the
+    // dispatch -> Queued double-fault hand-back in finalize_arm_compensation's catch), never
+    // alone. So a claim that reads finished here with its teardown behind it is already gone
+    // from the head or no longer Dispatched, and this predicate cannot read "K-eligible" for
+    // a compensated claim. A future writer of compensation_finished=true that is not paired
+    // with the pop breaks that, and with it the ack-ledger waiver path's safety (the
+    // RecoveryStatus::Blocking handling in guardian_arm_ack.cpp depends on it too). Tripwire:
+    // invariant_violations_for_test's compensation clause and the "#4472 tripwire" test.
     if (!claim->compensation_finished)
         return false;
     const auto eit = claims_.find(claim->key);
@@ -2485,7 +2509,8 @@ void GuardianSparkRuntime::synthesize_fallback_outcome_locked(KeyClaim& c) {
 
 std::size_t GuardianSparkRuntime::reap_stranded_claims_locked(
     std::chrono::steady_clock::time_point now,
-    std::vector<std::pair<std::string, std::shared_ptr<KeyClaim>>>& refills) {
+    std::vector<std::pair<std::string, std::shared_ptr<KeyClaim>>>& refills,
+    ExpireWarns& warns) {
     std::size_t reaped = 0;
     bool release_failed = false;
     // The key of the first claim whose release failed this pass, for the rate-limited warn.
@@ -2507,6 +2532,20 @@ std::size_t GuardianSparkRuntime::reap_stranded_claims_locked(
                 now >= c->compensation_deadline) {
                 c->compensation_deadline_observed = true;
                 compensation_deadline_elapsed_.fetch_add(1, std::memory_order_relaxed);
+                // #4472 hardening (sre-4): the latch and the counter above are set BEFORE
+                // this copy, so a failed copy only drops the warn. One record per claim (the
+                // latch is once-only); the warn itself is emitted off-lock by the caller.
+                if (warns.compensations.size() >= kDisarmPendingWarnsPerPass) {
+                    ++warns.compensations_more;
+                } else {
+                    try {
+                        warns.compensations.push_back(DisarmObservation{
+                            it->first,
+                            now - (c->compensation_deadline - cfg_.backend_op_deadline)});
+                    } catch (...) {
+                        ++warns.compensations_more;
+                    }
+                }
             }
             // NOTE: deliberately Queued-only, never Dispatched/Dispatching - a
             // Dispatched head can carry an outcome that abandon_claim_locked wrote
@@ -2690,16 +2729,18 @@ void GuardianSparkRuntime::disarm_orphan_keys_locked(
 }
 
 std::size_t GuardianSparkRuntime::expire_overdue_claims() {
-    return expire_overdue_claims(std::chrono::steady_clock::now());
+    return expire_overdue_claims_impl(std::chrono::steady_clock::now());
 }
 
-std::size_t GuardianSparkRuntime::expire_overdue_claims(std::chrono::steady_clock::time_point now) {
+std::size_t
+GuardianSparkRuntime::expire_overdue_claims_impl(std::chrono::steady_clock::time_point now) {
     std::vector<std::pair<std::string, std::shared_ptr<KeyClaim>>> overdue;
     std::vector<std::pair<std::string, std::shared_ptr<KeyClaim>>> refills;
     std::vector<std::shared_ptr<KeyClaim>> disarms;
-    std::vector<DisarmObservation> disarm_warns; // #5403: copied under the lock, warned after it
+    ExpireWarns warns; // #5403/#4472: copied under the lock, warned after the dispatch loops
     try {
-        disarm_warns.reserve(kDisarmPendingWarnsPerPass);
+        warns.disarms.reserve(kDisarmPendingWarnsPerPass);
+        warns.compensations.reserve(kDisarmPendingWarnsPerPass);
     } catch (...) {
     }
     std::size_t expired_count = 0;
@@ -2733,7 +2774,7 @@ std::size_t GuardianSparkRuntime::expire_overdue_claims(std::chrono::steady_cloc
         // up-4 (#4221): the terminal-recovery safety net (see this function's own
         // doc comment) - separate from the overdue-live-claim pass above, which
         // deliberately excludes anything already outcome/commit_exception/abandoned.
-        reaped_count = reap_stranded_claims_locked(now, refills);
+        reaped_count = reap_stranded_claims_locked(now, refills, warns);
         // #5322: the owner of a ->0 edge a release dropped. Contained here so the
         // reaper's refills (already flipped Dispatching) always reach their dispatch.
         try {
@@ -2743,20 +2784,7 @@ std::size_t GuardianSparkRuntime::expire_overdue_claims(std::chrono::steady_cloc
         }
         // #5403: observation only (a counter and a copied key); it releases, pops and
         // cancels nothing, so it can neither strand the refills above nor change a receipt.
-        observe_pending_disarms_locked(now, disarm_warns);
-    }
-    for (const auto& w : disarm_warns) {
-        try {
-            spdlog::warn("Guardian spark: the Disarm for key '{}' has been pending for {} s "
-                         "(observation threshold {} s); its key stays held, and if its backend "
-                         "call was admitted its class quota slot and, if the call is blocked "
-                         "inside a mechanism, that mechanism type stay held until it returns - "
-                         "nothing was released (pending-too-long, not proof the call hung)",
-                         ::yuzu::log_key_token(w.key),
-                         std::chrono::duration_cast<std::chrono::seconds>(w.age).count(),
-                         kDisarmPendingObserveThreshold.count());
-        } catch (...) {
-        }
+        observe_pending_disarms_locked(now, warns);
     }
     // A reaped claim may carry an outcome this pass just wrote (the synthesis arm), which a
     // blocking waiter in wait_for_claim() is waiting on, so a reap alone must wake it. The
@@ -2769,6 +2797,56 @@ std::size_t GuardianSparkRuntime::expire_overdue_claims(std::chrono::steady_cloc
         dispatch_arm_off_lock(key, refill);
     for (auto& d : disarms)
         submit_disarm_off_lock(d); // takes registry_mu_ itself
+    // #4472 hardening (safe-4): the synchronous warns run LAST, after the waiters are woken
+    // and every refill / Disarm has been dispatched, so a slow log sink can delay nothing
+    // that matters. Each is contained: a logging failure must never escape the reaper.
+    for (const auto& w : warns.disarms) {
+        try {
+            spdlog::warn("Guardian spark: the Disarm for key '{}' has been pending for {} s "
+                         "(observation threshold {} s); its key stays held. If its backend "
+                         "call was admitted, its class quota slot stays held and, if the call "
+                         "is blocked inside a mechanism, that mechanism type's engine lock "
+                         "stays held until it returns. Nothing was released (pending too long, "
+                         "not proof the call hung)",
+                         ::yuzu::log_key_token(w.key),
+                         std::chrono::duration_cast<std::chrono::seconds>(w.age).count(),
+                         kDisarmPendingObserveThreshold.count());
+        } catch (...) {
+        }
+    }
+    if (warns.disarms_more != 0) {
+        try {
+            spdlog::warn("Guardian spark: and {} more pending Disarms past the {} s observation "
+                         "threshold this pass (counted in the disarm deadline total, not "
+                         "logged individually)",
+                         warns.disarms_more, kDisarmPendingObserveThreshold.count());
+        } catch (...) {
+        }
+    }
+    for (const auto& w : warns.compensations) {
+        try {
+            spdlog::warn("Guardian spark: the compensating teardown for key '{}' has been "
+                         "outstanding for {} s (past its {} s compensation deadline); its key "
+                         "stays held and its generation is held, not acknowledged, until the "
+                         "teardown finishes. Nothing was released (pending too long, not "
+                         "proof the call hung)",
+                         ::yuzu::log_key_token(w.key),
+                         std::chrono::duration_cast<std::chrono::seconds>(w.age).count(),
+                         std::chrono::duration_cast<std::chrono::seconds>(
+                             cfg_.backend_op_deadline)
+                             .count());
+        } catch (...) {
+        }
+    }
+    if (warns.compensations_more != 0) {
+        try {
+            spdlog::warn("Guardian spark: and {} more compensating teardowns past their "
+                         "deadline this pass (counted in the compensation deadline total, not "
+                         "logged individually)",
+                         warns.compensations_more);
+        } catch (...) {
+        }
+    }
     return expired_count;
 }
 

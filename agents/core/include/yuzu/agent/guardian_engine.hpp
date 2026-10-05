@@ -339,7 +339,7 @@ public:
     [[nodiscard]] std::uint64_t disarm_deadline_elapsed() const;
     /// #5403: age, in whole seconds (floored), of the oldest Spark Disarm claim still pending
     /// (GuardianSparkRuntime::oldest_pending_disarm_age()), or nullopt when none is. Surfaced
-    /// as `yuzu.guardian_disarm_pending_age_seconds` via emit_guardian_disarm_pending_age_tag,
+    /// as `yuzu.guardian_disarm_pending_age_seconds` via emit_guardian_health_age_tags,
     /// which emits nothing for nullopt, so "no Disarm pending" is an ABSENCE, never a 0. It
     /// measures "pending too long", not proof of a hang, and does not see a compensating
     /// disarm, direct_disarm_fallback(), the synchronous residue fallback in
@@ -353,7 +353,7 @@ public:
     /// outstanding (GuardianSparkRuntime::oldest_outstanding_compensation_age()), measured from
     /// the instant the compensation became owed, or nullopt when none is. Surfaced as
     /// `yuzu.guardian_compensation_pending_age_seconds` via
-    /// emit_guardian_compensation_pending_age_tag, which emits nothing for nullopt, so "none
+    /// emit_guardian_health_age_tags, which emits nothing for nullopt, so "none
     /// outstanding" is an ABSENCE, never a 0. It measures "teardown pending too long", not proof
     /// of a hang; while a teardown is outstanding its generation is held (the claim is not
     /// K-eligible). Observation only. `now` defaults to the steady clock; a test passes a later
@@ -363,8 +363,10 @@ public:
         std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now()) const;
 
     /// #5404 (gate rows P1/P2): the Spark claim-lifecycle values, as a GuardianHealthStats with
-    /// only these fields set (guardian_health_heartbeat.hpp's guardian_spark_claim_health_stats
-    /// holds the runtime-accessor -> field mapping; ack_maint_exceptions is filled here). All
+    /// only these fields set: the twelve runtime values (including #5403's
+    /// disarm_deadline_elapsed and #4472's compensation_deadline_elapsed;
+    /// guardian_health_heartbeat.hpp's guardian_spark_claim_health_stats holds the
+    /// runtime-accessor -> field mapping) plus ack_maint_exceptions, which is filled here. All
     /// zero when no runtime is wired (the runtime fields only; ack_maint_exceptions is engine
     /// state and still counts). Surfaced sparsely through the same emitter as the other health
     /// counters. `retained_tombstones` is an O(claims) scan under the runtime's registry_mu_

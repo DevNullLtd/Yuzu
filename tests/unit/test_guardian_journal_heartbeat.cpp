@@ -202,13 +202,15 @@ TEST_CASE("every documented Guardian heartbeat tag is one the emitter actually e
         emitted, GuardianHealthStats{
                      .unhealthy_suppressed = 1, .unhealthy_refreshed = 1, .priority_demoted = 1});
     // #5403: metrics.md now names the pending-Spark-Disarm deadline count and age tags, so
-    // union their emitters too (the age has its own emitter, not a GuardianHealthStats field).
+    // union their emitters too (the ages have their own struct + emitter, not GuardianHealthStats fields).
     emit_guardian_health_heartbeat_tags(emitted, GuardianHealthStats{.disarm_deadline_elapsed = 1});
-    emit_guardian_disarm_pending_age_tag(emitted, std::optional<std::uint64_t>{1});
+    emit_guardian_health_age_tags(
+        emitted, GuardianHealthAgeStats{.disarm_pending_age_seconds = std::uint64_t{1}});
     // #4472: metrics.md also names the compensation-teardown deadline count and age tags.
     emit_guardian_health_heartbeat_tags(emitted,
                                         GuardianHealthStats{.compensation_deadline_elapsed = 1});
-    emit_guardian_compensation_pending_age_tag(emitted, std::optional<std::uint64_t>{1});
+    emit_guardian_health_age_tags(
+        emitted, GuardianHealthAgeStats{.compensation_pending_age_seconds = std::uint64_t{1}});
     // #5404: metrics.md names the eleven Spark claim-lifecycle tags (all GuardianHealthStats
     // fields), so union a fully-populated block through the same emitter.
     emit_guardian_health_heartbeat_tags(

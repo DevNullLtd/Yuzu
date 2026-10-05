@@ -3135,12 +3135,10 @@ TEST_CASE("#5403: the engine exports a hung Disarm's age and deadline count as h
     CHECK_FALSE(f.engine->oldest_pending_disarm_age_seconds().has_value());
     CHECK(f.engine->disarm_deadline_elapsed() == 0);
     {
+        // Through the SAME helper agent.cpp's heartbeat calls (not a hand-assembled copy).
         std::map<std::string, std::string> tags;
-        yuzu::agent::emit_guardian_disarm_pending_age_tag(
-            tags, f.engine->oldest_pending_disarm_age_seconds());
-        yuzu::agent::emit_guardian_health_heartbeat_tags(
-            tags, yuzu::agent::GuardianHealthStats{.disarm_deadline_elapsed =
-                                                       f.engine->disarm_deadline_elapsed()});
+        yuzu::agent::collect_guardian_spark_health_tags(*f.engine, tags,
+                                                         std::chrono::steady_clock::now());
         CHECK(tags.empty());
     }
 
@@ -3166,17 +3164,13 @@ TEST_CASE("#5403: the engine exports a hung Disarm's age and deadline count as h
     // Latch: a pass 31 s on observes the Disarm pending past the threshold, once.
     REQUIRE(f.engine->spark_runtime_for_test() != nullptr);
     const auto thirty_one = std::chrono::steady_clock::now() + std::chrono::seconds(31);
-    f.engine->spark_runtime_for_test()->expire_overdue_claims(thirty_one);
-    f.engine->spark_runtime_for_test()->expire_overdue_claims(thirty_one + std::chrono::seconds(5));
+    f.engine->spark_runtime_for_test()->expire_overdue_claims_at_for_test(thirty_one);
+    f.engine->spark_runtime_for_test()->expire_overdue_claims_at_for_test(thirty_one + std::chrono::seconds(5));
     CHECK(f.engine->disarm_deadline_elapsed() == 1);
 
     {
         std::map<std::string, std::string> tags;
-        yuzu::agent::emit_guardian_disarm_pending_age_tag(
-            tags, f.engine->oldest_pending_disarm_age_seconds(later));
-        yuzu::agent::emit_guardian_health_heartbeat_tags(
-            tags, yuzu::agent::GuardianHealthStats{.disarm_deadline_elapsed =
-                                                       f.engine->disarm_deadline_elapsed()});
+        yuzu::agent::collect_guardian_spark_health_tags(*f.engine, tags, later);
         REQUIRE(tags.count("yuzu.guardian_disarm_pending_age_seconds") == 1);
         CHECK(std::stoull(tags.at("yuzu.guardian_disarm_pending_age_seconds")) >= 95);
         CHECK(tags.at("yuzu.guardian_disarm_deadline_elapsed") == "1");
@@ -3189,10 +3183,13 @@ TEST_CASE("#5403: the engine exports a hung Disarm's age and deadline count as h
         [&] { return !f.engine->oldest_pending_disarm_age_seconds(later).has_value(); },
         std::chrono::seconds(10)));
     CHECK(f.engine->disarm_deadline_elapsed() == 1);
+    // The age is gone; the cumulative count is not, so exactly that one tag remains.
     std::map<std::string, std::string> after;
-    yuzu::agent::emit_guardian_disarm_pending_age_tag(
-        after, f.engine->oldest_pending_disarm_age_seconds());
-    CHECK(after.empty());
+    yuzu::agent::collect_guardian_spark_health_tags(*f.engine, after,
+                                                     std::chrono::steady_clock::now());
+    CHECK(after.count("yuzu.guardian_disarm_pending_age_seconds") == 0);
+    CHECK(after.size() == 1);
+    CHECK(after.at("yuzu.guardian_disarm_deadline_elapsed") == "1");
 }
 
 // #5404 export half, through the REAL GuardianEngine + runtime: the engine's claim-lifecycle
@@ -3365,7 +3362,7 @@ void run_post_k_4472_scenario(bool finish_disarm_before_drain) {
     push(5, true);
     REQUIRE(f.mechanism->wait_entered_hang(30s));
     REQUIRE(f.engine->spark_runtime_for_test() != nullptr);
-    REQUIRE(f.engine->spark_runtime_for_test()->expire_overdue_claims(
+    REQUIRE(f.engine->spark_runtime_for_test()->expire_overdue_claims_at_for_test(
                 std::chrono::steady_clock::now() + 600s) == 1);
     drain_pending();
     REQUIRE(f.engine->policy_generation() == 0);
@@ -3470,10 +3467,9 @@ TEST_CASE("#4472: the engine exports an outstanding compensating teardown's age 
             10s));
     };
     const auto emit_tags = [&](std::chrono::steady_clock::time_point now) {
+        // The SAME helper agent.cpp's heartbeat calls, not a hand-assembled copy.
         std::map<std::string, std::string> tags;
-        yuzu::agent::emit_guardian_compensation_pending_age_tag(
-            tags, f.engine->oldest_outstanding_compensation_age_seconds(now));
-        yuzu::agent::emit_guardian_health_heartbeat_tags(tags, f.engine->spark_claim_health_stats());
+        yuzu::agent::collect_guardian_spark_health_tags(*f.engine, tags, now);
         return tags;
     };
 
@@ -3487,7 +3483,7 @@ TEST_CASE("#4472: the engine exports an outstanding compensating teardown's age 
     push(5, true);
     REQUIRE(f.mechanism->wait_entered_hang(30s));
     REQUIRE(f.engine->spark_runtime_for_test() != nullptr);
-    REQUIRE(f.engine->spark_runtime_for_test()->expire_overdue_claims(
+    REQUIRE(f.engine->spark_runtime_for_test()->expire_overdue_claims_at_for_test(
                 std::chrono::steady_clock::now() + 600s) == 1);
     drain_pending();
     // A hung arm is not a compensation: still nothing to export.
@@ -3512,8 +3508,8 @@ TEST_CASE("#4472: the engine exports an outstanding compensating teardown's age 
 
     // Latch: two passes well past the deadline observe it once.
     const auto far_future = std::chrono::steady_clock::now() + 3600s;
-    f.engine->spark_runtime_for_test()->expire_overdue_claims(far_future);
-    f.engine->spark_runtime_for_test()->expire_overdue_claims(far_future + 5s);
+    f.engine->spark_runtime_for_test()->expire_overdue_claims_at_for_test(far_future);
+    f.engine->spark_runtime_for_test()->expire_overdue_claims_at_for_test(far_future + 5s);
     {
         const auto tags = emit_tags(later);
         REQUIRE(tags.count("yuzu.guardian_compensation_pending_age_seconds") == 1);

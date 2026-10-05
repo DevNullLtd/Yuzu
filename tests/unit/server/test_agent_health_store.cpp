@@ -2466,7 +2466,7 @@ bool shipped_table_has(std::string_view tag, std::string_view gauge) {
 
 TEST_CASE("REAL AgentHealthStore: every #5404 claim-lifecycle row sums across agents and "
           "carries its own value",
-          "[guardian][health][rollup][real][claim]") {
+          "[guardian][health][rollup][real][spark-claim]") {
     for (const auto& r : kClaimRows)
         REQUIRE(shipped_table_has(r.tag, r.gauge)); // the shipped table, not a parallel copy
 
@@ -2497,7 +2497,7 @@ TEST_CASE("REAL AgentHealthStore: every #5404 claim-lifecycle row sums across ag
 
 TEST_CASE("REAL AgentHealthStore: #5404 gauges are absent (not 0) when no agent reports, and "
           "a stale series does not outlive its reporter",
-          "[guardian][health][rollup][real][claim]") {
+          "[guardian][health][rollup][real][spark-claim]") {
     yuzu::server::detail::AgentHealthStore store;
     yuzu::MetricsRegistry metrics;
     disarm_beat(store, "quiet", {});
@@ -2526,7 +2526,7 @@ TEST_CASE("REAL AgentHealthStore: #5404 gauges are absent (not 0) when no agent 
 
 TEST_CASE("REAL AgentHealthStore: malformed #5404 values are rejected, counted, and never "
           "throw or reach a gauge",
-          "[guardian][health][rollup][real][claim]") {
+          "[guardian][health][rollup][real][spark-claim]") {
     yuzu::server::detail::AgentHealthStore store;
     yuzu::MetricsRegistry metrics;
 
@@ -2679,4 +2679,73 @@ TEST_CASE("REAL AgentHealthStore: compensation deadline count sums across agents
     disarm_beat(none, "q", {});
     none.recompute_metrics(m2, std::chrono::seconds{300});
     CHECK_FALSE(has_unlabelled_series(m2.serialize(), kCompElapsedGauge));
+}
+
+// ── Wire-format edge values of the health tag parse (UP-11 / con-7) ──────────────────────
+//
+// Pinned for BOTH a SUM row (a #5404 counter) and an AGE row (the #5403 Disarm age): each goes
+// through the shared parse_guardian_health_count, but the two accumulate in different loops of
+// AgentHealthStore::recompute_metrics, so a regression in one loop is only visible here.
+
+TEST_CASE("REAL AgentHealthStore: health tag wire-format edge values - sign / radix / padding "
+          "rejected, the 1e9 ceiling inclusive, an EMPTY value skipped uncounted",
+          "[guardian][health][rollup][real][spark-claim]") {
+    struct Edge {
+        const char* tag;
+        const char* gauge;
+        bool is_age;
+    };
+    // One SUM row and one AGE row.
+    const Edge edges[] = {
+        {"yuzu.guardian_retained_tombstones", "yuzu_fleet_guardian_retained_tombstones", false},
+        {kDisarmAgeTag, kDisarmAgeGauge, true},
+    };
+    // Each is parsed as a FULL token: a leading '+', a hex prefix and ANY padding are rejected,
+    // not trimmed; 1e9 + 1 and an 11-digit value are over the ceiling / digit cap. All are
+    // counted in yuzu_fleet_guardian_health_tag_rejected and none reaches a gauge.
+    // "00000000001" is 11 characters: the digit cap rejects it before its value is considered.
+    const std::vector<std::string> rejected = {"+5",         "0x10",        " 5",
+                                               "5 ",         "1000000001",  "10000000000",
+                                               "00000000001"};
+    for (const auto& e : edges) {
+        INFO("row " << e.tag);
+        {
+            yuzu::server::detail::AgentHealthStore store;
+            yuzu::MetricsRegistry metrics;
+            int i = 0;
+            for (const auto& v : rejected)
+                disarm_beat(store, "bad" + std::to_string(i++), {{e.tag, v}});
+            REQUIRE_NOTHROW(store.recompute_metrics(metrics, std::chrono::seconds{300}));
+            const std::string out = metrics.serialize();
+            CHECK_FALSE(has_unlabelled_series(out, e.gauge));
+            CHECK(unlabelled_series(out, "yuzu_fleet_guardian_health_tag_rejected") ==
+                  static_cast<double>(rejected.size()));
+        }
+        {
+            // The ceiling itself (1e9) is accepted: the bound is inclusive.
+            yuzu::server::detail::AgentHealthStore store;
+            yuzu::MetricsRegistry metrics;
+            disarm_beat(store, "ceiling", {{e.tag, "1000000000"}});
+            store.recompute_metrics(metrics, std::chrono::seconds{300});
+            const std::string out = metrics.serialize();
+            REQUIRE(has_unlabelled_series(out, e.gauge));
+            CHECK(unlabelled_series(out, e.gauge) == 1'000'000'000.0);
+            CHECK(unlabelled_series(out, "yuzu_fleet_guardian_health_tag_rejected") == 0.0);
+        }
+        {
+            // DELIBERATE, ACCEPTED behaviour (UP-11): an EMPTY value is skipped before the
+            // parse, so it is neither a report nor a rejection. The agent's emitters never write
+            // an empty value (a zero counter writes NO tag, an absent age writes NO tag), so an
+            // empty value can only come from a hand-forged heartbeat; it is therefore a no-op,
+            // not a signal. If this is ever tightened to count empties, change this test and
+            // the HELP text of yuzu_fleet_guardian_health_tag_rejected together.
+            yuzu::server::detail::AgentHealthStore store;
+            yuzu::MetricsRegistry metrics;
+            disarm_beat(store, "empty", {{e.tag, ""}});
+            store.recompute_metrics(metrics, std::chrono::seconds{300});
+            const std::string out = metrics.serialize();
+            CHECK_FALSE(has_unlabelled_series(out, e.gauge));
+            CHECK(unlabelled_series(out, "yuzu_fleet_guardian_health_tag_rejected") == 0.0);
+        }
+    }
 }

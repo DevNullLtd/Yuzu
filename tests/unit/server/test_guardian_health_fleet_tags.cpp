@@ -8,8 +8,9 @@
  *
  * Mirrors test_guardian_journal_fleet_tags.cpp's four-way bind for the health family
  * (the counter table is plain sparse cumulative counters; the #5403 pending-Disarm and #4472
- * compensation-teardown ages are the exception and live in their own MAX table, pinned by the
- * "guardian disarm age" and "guardian compensation age" cases below):
+ * compensation-teardown ages are the exception: they live in GuardianHealthAgeStats and their
+ * own MAX table, pinned by the "guardian health ages", "guardian disarm age" and "guardian
+ * compensation age" cases below):
  *
  *  - STRUCTURAL: sizeof(GuardianHealthStats) pins the field count to the table row
  *    count, so adding a counter without a fleet gauge is a COMPILE error.
@@ -38,9 +39,9 @@
 #include <type_traits>
 
 namespace detail = yuzu::server::detail;
-using yuzu::agent::emit_guardian_compensation_pending_age_tag;
-using yuzu::agent::emit_guardian_disarm_pending_age_tag;
+using yuzu::agent::emit_guardian_health_age_tags;
 using yuzu::agent::emit_guardian_health_heartbeat_tags;
+using yuzu::agent::GuardianHealthAgeStats;
 using yuzu::agent::GuardianHealthStats;
 using yuzu::agent::kGuardianCompensationDeadlineElapsedTag;
 using yuzu::agent::kGuardianCompensationPendingAgeTag;
@@ -63,7 +64,26 @@ static_assert(std::has_unique_object_representations_v<GuardianHealthStats>,
               "GuardianHealthStats gained padding - sizeof/8 is no longer its field "
               "count, so the size pin above silently stops counting fields.");
 
+// The AGE family gets the SAME structural pin against ITS OWN table (mirrors the journal
+// sibling's GuardianJournalAgeStats pin). The two families are deliberately separate
+// structs/tables (SUM vs MAX rollup; the counters are sparse uint64s, the ages are optionals),
+// so each carries its own pin: an age added to GuardianHealthAgeStats without a
+// kGuardianHealthAgeMetrics row is a build break here, and it must never be "fixed" by
+// squeezing the age into the SUM table. The struct is an aggregate of std::optional<uint64_t>
+// only, so its size divided by the optional's size IS its field count (an optional has padding,
+// so has_unique_object_representations cannot be the premise check here; the same-type
+// aggregate is).
+static_assert(sizeof(GuardianHealthAgeStats) ==
+                  detail::kNGuardianHealthAgeMetrics * sizeof(std::optional<std::uint64_t>),
+              "GuardianHealthAgeStats field count != kGuardianHealthAgeMetrics row count - an "
+              "age gauge was added or removed without its fleet MAX row. Add/remove the matching "
+              "row in server/core/src/guardian_health_fleet_tags.hpp.");
+
 namespace {
+
+/// The age family's field count, derived from the struct (never a hand-typed literal).
+constexpr std::size_t kAgeStatsFieldCount =
+    sizeof(GuardianHealthAgeStats) / sizeof(std::optional<std::uint64_t>);
 
 /// Every counter distinct and non-zero, so each key the agent can emit is exercised
 /// AND a field/key mix-up in the emitter shows up as a wrong value (see the
@@ -234,7 +254,7 @@ TEST_CASE("guardian disarm age: the agent key is pinned to the server's age tabl
           "[guardian][health][fleet][disarm]") {
     // A one-sided rename of the tag string on either side leaves the fleet gauge permanently
     // absent, which reads as "no Disarm pending": this is the drift guard.
-    REQUIRE(detail::kNGuardianHealthAgeMetrics == 2);
+    REQUIRE(detail::kNGuardianHealthAgeMetrics == kAgeStatsFieldCount);
     CHECK(std::string_view(detail::kGuardianHealthAgeMetrics[0].tag) ==
           std::string_view(kGuardianDisarmPendingAgeTag));
     CHECK(std::string_view(kGuardianDisarmPendingAgeTag) ==
@@ -242,7 +262,7 @@ TEST_CASE("guardian disarm age: the agent key is pinned to the server's age tabl
 
     // WRITER -> READER and READER -> WRITER, through the agent's REAL emitter.
     std::map<std::string, std::string> tags;
-    emit_guardian_disarm_pending_age_tag(tags, std::optional<std::uint64_t>{42});
+    emit_guardian_health_age_tags(tags, GuardianHealthAgeStats{.disarm_pending_age_seconds = 42});
     REQUIRE(tags.size() == 1);
     CHECK(tags.count(detail::kGuardianHealthAgeMetrics[0].tag) == 1);
     CHECK(tags.at(detail::kGuardianHealthAgeMetrics[0].tag) == "42");
@@ -268,18 +288,18 @@ TEST_CASE("guardian disarm age: gauge name follows the age-table rule, HELP stat
     CHECK(help.find("not proof") != std::string_view::npos);
     CHECK(help.find("compensating disarm") != std::string_view::npos);
     CHECK(help.find("direct disarm") != std::string_view::npos);
-    CHECK(help.find("detach_rule_locked") != std::string_view::npos);
+    CHECK(help.find("synchronous teardown fallback") != std::string_view::npos);
     CHECK(help.find("inline-type") != std::string_view::npos);
 }
 
 TEST_CASE("guardian disarm age: emitter is absent for nullopt, present (including 0) otherwise",
           "[guardian][health][fleet][disarm]") {
     std::map<std::string, std::string> none;
-    emit_guardian_disarm_pending_age_tag(none, std::nullopt);
+    emit_guardian_health_age_tags(none, GuardianHealthAgeStats{});
     CHECK(none.empty()); // "no Disarm pending" is an ABSENCE, never a 0
 
     std::map<std::string, std::string> young;
-    emit_guardian_disarm_pending_age_tag(young, std::optional<std::uint64_t>{0});
+    emit_guardian_health_age_tags(young, GuardianHealthAgeStats{.disarm_pending_age_seconds = 0});
     REQUIRE(young.count(kGuardianDisarmPendingAgeTag) == 1);
     CHECK(young.at(kGuardianDisarmPendingAgeTag) == "0"); // pending for under a second
 
@@ -294,7 +314,7 @@ TEST_CASE("guardian disarm age: emitter is absent for nullopt, present (includin
 TEST_CASE("guardian compensation age: the agent keys are pinned to the server's tables",
           "[guardian][health][fleet][compensation]") {
     // The age is the age table's SECOND row; its once-per-claim count is a row of the SUM table.
-    REQUIRE(detail::kNGuardianHealthAgeMetrics == 2);
+    REQUIRE(detail::kNGuardianHealthAgeMetrics == kAgeStatsFieldCount);
     const auto& age = detail::kGuardianHealthAgeMetrics[1];
     CHECK(std::string_view(age.tag) == std::string_view(kGuardianCompensationPendingAgeTag));
     CHECK(std::string_view(kGuardianCompensationPendingAgeTag) ==
@@ -304,7 +324,8 @@ TEST_CASE("guardian compensation age: the agent keys are pinned to the server's 
 
     // WRITER -> READER through the agent's REAL emitter.
     std::map<std::string, std::string> tags;
-    emit_guardian_compensation_pending_age_tag(tags, std::optional<std::uint64_t>{42});
+    emit_guardian_health_age_tags(tags,
+                                  GuardianHealthAgeStats{.compensation_pending_age_seconds = 42});
     REQUIRE(tags.size() == 1);
     CHECK(tags.at(age.tag) == "42");
 
@@ -333,7 +354,7 @@ TEST_CASE("guardian compensation age: HELP states the limits and the held-genera
     CHECK(help.find("not from the original arm") != std::string_view::npos);
     CHECK(help.find("not acknowledged") != std::string_view::npos);
     CHECK(help.find("direct disarm fallback") != std::string_view::npos);
-    CHECK(help.find("detach_rule_locked") != std::string_view::npos);
+    CHECK(help.find("synchronous teardown fallback") != std::string_view::npos);
     CHECK(help.find("inline-type") != std::string_view::npos);
     CHECK(help.find("MONITOR-ONLY") != std::string_view::npos);
 }
@@ -342,15 +363,108 @@ TEST_CASE("guardian compensation age: emitter is absent for nullopt, present (in
           "otherwise",
           "[guardian][health][fleet][compensation]") {
     std::map<std::string, std::string> none;
-    emit_guardian_compensation_pending_age_tag(none, std::nullopt);
+    emit_guardian_health_age_tags(none, GuardianHealthAgeStats{});
     CHECK(none.empty()); // "none outstanding" is an ABSENCE, never a 0
 
     std::map<std::string, std::string> young;
-    emit_guardian_compensation_pending_age_tag(young, std::optional<std::uint64_t>{0});
+    emit_guardian_health_age_tags(
+        young, GuardianHealthAgeStats{.compensation_pending_age_seconds = 0});
     REQUIRE(young.count(kGuardianCompensationPendingAgeTag) == 1);
     CHECK(young.at(kGuardianCompensationPendingAgeTag) == "0");
 
     std::map<std::string, std::string> counter;
     emit_guardian_health_heartbeat_tags(counter, GuardianHealthStats{});
     CHECK(counter.count(kGuardianCompensationDeadlineElapsedTag) == 0);
+}
+
+// ---- The AGE family as a whole: generic pins (mirror test_guardian_journal_fleet_tags.cpp) ----
+//
+// The per-age cases above pin each row by name. These loop the WHOLE table, so a third age row
+// (or a third field of GuardianHealthAgeStats) is covered the moment it exists, with no test to
+// remember to write: the failure modes are a tag in both tables (summed AND maxed), a gauge
+// without the `_max` marker, an empty HELP, a writer/reader key mismatch, and a field/row mix-up.
+
+TEST_CASE("guardian health ages: emit keys bind exactly to the server MAX table",
+          "[guardian][health][fleet]") {
+    std::set<std::string> table_keys;
+    for (const auto& m : detail::kGuardianHealthAgeMetrics)
+        table_keys.insert(m.tag);
+    REQUIRE(table_keys.size() == detail::kNGuardianHealthAgeMetrics); // no duplicated tag
+    REQUIRE(detail::kNGuardianHealthAgeMetrics == kAgeStatsFieldCount);
+
+    // Distinct values per field: the key-set checks cannot catch a disarm/compensation value
+    // swap in the emitter, this can.
+    std::map<std::string, std::string> tags;
+    emit_guardian_health_age_tags(tags, GuardianHealthAgeStats{.disarm_pending_age_seconds = 31,
+                                                               .compensation_pending_age_seconds = 62});
+    const std::map<std::string, std::string> expected{
+        {"yuzu.guardian_disarm_pending_age_seconds", "31"},
+        {"yuzu.guardian_compensation_pending_age_seconds", "62"},
+    };
+    for (const auto& [key, want] : expected) {
+        INFO("tag " << key);
+        REQUIRE(tags.count(key) == 1);
+        CHECK(tags.at(key) == want);
+    }
+    CHECK(tags.size() == expected.size());
+
+    // WRITER -> READER and READER -> WRITER over the whole table.
+    for (const auto& [key, val] : tags) {
+        INFO("emitted age key not recognised by the server rollup: " << key);
+        CHECK(table_keys.count(key) == 1);
+    }
+    for (const auto& m : detail::kGuardianHealthAgeMetrics) {
+        INFO("age table key never emitted by the agent: " << m.tag);
+        CHECK(tags.count(m.tag) == 1);
+    }
+    CHECK(tags.size() == detail::kNGuardianHealthAgeMetrics);
+}
+
+TEST_CASE("guardian health ages: gauge names follow the mechanical rule with _max, HELP is "
+          "non-empty, and no tag or gauge is in both tables",
+          "[guardian][health][fleet]") {
+    constexpr std::string_view kTagNs = "yuzu.";
+    constexpr std::string_view kMax = "_max";
+    const auto ends_with_max = [&](std::string_view g) {
+        return g.size() >= kMax.size() && g.substr(g.size() - kMax.size()) == kMax;
+    };
+    std::set<std::string> age_gauges;
+    for (const auto& m : detail::kGuardianHealthAgeMetrics) {
+        const std::string_view tag{m.tag};
+        INFO("age tag not in the yuzu. heartbeat namespace: " << m.tag);
+        REQUIRE(tag.substr(0, kTagNs.size()) == kTagNs);
+        const std::string expected = "yuzu_fleet_" + std::string(tag.substr(kTagNs.size())) + "_max";
+        INFO("age tag " << m.tag << " should map to gauge " << expected);
+        CHECK(std::string_view(m.gauge) == expected);
+        CHECK(ends_with_max(m.gauge)); // the visible marker that this family rolls up as MAX
+        INFO("empty HELP for " << m.gauge);
+        CHECK(std::string_view(m.help).size() > 0);
+        age_gauges.insert(m.gauge);
+    }
+    CHECK(age_gauges.size() == detail::kNGuardianHealthAgeMetrics); // no duplicated gauge
+
+    // The reverse marker rule: a SUM gauge must never end `_max` (it would read as a MAX), and
+    // no tag or gauge may appear in BOTH tables (it would be both summed and maxed).
+    for (const auto& m : detail::kGuardianHealthMetrics) {
+        INFO("SUM gauge ends _max: " << m.gauge);
+        CHECK_FALSE(ends_with_max(m.gauge));
+        INFO("age gauge collides with a SUM gauge: " << m.gauge);
+        CHECK(age_gauges.count(m.gauge) == 0);
+        for (const auto& a : detail::kGuardianHealthAgeMetrics) {
+            INFO("tag in both tables: " << m.tag);
+            CHECK(std::string_view(m.tag) != std::string_view(a.tag));
+        }
+    }
+}
+
+TEST_CASE("guardian health ages: a quiescent agent emits no age tag, each age is independent",
+          "[guardian][health][fleet]") {
+    std::map<std::string, std::string> none;
+    emit_guardian_health_age_tags(none, GuardianHealthAgeStats{});
+    CHECK(none.empty());
+
+    std::map<std::string, std::string> one;
+    emit_guardian_health_age_tags(one, GuardianHealthAgeStats{.compensation_pending_age_seconds = 3});
+    REQUIRE(one.size() == 1);
+    CHECK(one.count(kGuardianCompensationPendingAgeTag) == 1);
 }

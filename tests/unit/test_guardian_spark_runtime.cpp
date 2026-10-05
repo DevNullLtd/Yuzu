@@ -13858,9 +13858,9 @@ struct HungDisarmRig5403 {
         b->disarm_park.open();
         b->arm_park.open();
         rt->begin_stop();
-        const auto end = clk::now() + 10s;
-        while (rt->active_backend_op_workers() != 0 && clk::now() < end)
-            std::this_thread::sleep_for(2ms);
+        // Event-polled, sanitizer-scaled wait (the hangs and parks above are already released
+        // and the runtime is stopped, so the workers can only be on their way out).
+        (void)yuzu::test::spin_until([&] { return rt->active_backend_op_workers() == 0; }, 10s);
     }
     /// Park the next backend disarm, detach r1 (its Disarm claim is admitted and then hangs
     /// inside backend->disarm), and wait until the worker is really inside the hang.
@@ -13907,7 +13907,7 @@ TEST_CASE("#5403: a Disarm hung inside the backend is aged by oldest_pending_dis
 
     // The observation past the threshold changes nothing but a counter (M5: a pop on timeout
     // would dispatch the queued Arm into the backend while the Disarm is still inside it).
-    (void)f.rt->expire_overdue_claims(HungDisarmRig5403::later(31s));
+    (void)f.rt->expire_overdue_claims_at_for_test(HungDisarmRig5403::later(31s));
     CHECK(f.rt->disarm_deadline_elapsed() == 1);
     CHECK(f.depth() == 2);
     CHECK(f.rt->receipt_status(rc) == RT::ReceiptStatus::Pending);
@@ -14034,7 +14034,7 @@ TEST_CASE("#5403: a retained Queued Disarm ages from its creation, not from its 
     CHECK(*a2 == *a1);
 
     // A retained Queued claim is pending too: a pass past the threshold counts it.
-    (void)f.rt->expire_overdue_claims(now_fixed);
+    (void)f.rt->expire_overdue_claims_at_for_test(now_fixed);
     CHECK(f.rt->disarm_deadline_elapsed() == 1);
 
     f.rt->set_io_executor_fail_launch_for_test(false);
@@ -14053,11 +14053,12 @@ TEST_CASE("#5403: the deadline observation is counted once per claim and release
         f.hang_disarm_of_r1();
         const auto rc = f.attach_behind("r2");
         const int disarm_entries = f.b->disarm_entries.load();
-        // Below the threshold: nothing is observed.
-        (void)f.rt->expire_overdue_claims(HungDisarmRig5403::later(29s));
+        // Below the threshold: nothing is observed. 20 s, not 29 s: a real-clock margin of
+        // several seconds, so a loaded runner cannot push created_at past the 30 s line.
+        (void)f.rt->expire_overdue_claims_at_for_test(HungDisarmRig5403::later(20s));
         CHECK(f.rt->disarm_deadline_elapsed() == 0);
         for (int i = 0; i < 25; ++i) {
-            (void)f.rt->expire_overdue_claims(HungDisarmRig5403::later(31s + std::chrono::seconds(i)));
+            (void)f.rt->expire_overdue_claims_at_for_test(HungDisarmRig5403::later(31s + std::chrono::seconds(i)));
             REQUIRE(f.rt->disarm_deadline_elapsed() == 1);
             REQUIRE(f.depth() == 2);
             REQUIRE(f.rt->receipt_status(rc) == RT::ReceiptStatus::Pending);
@@ -14080,7 +14081,7 @@ TEST_CASE("#5403: the deadline observation is counted once per claim and release
         f.rt->detach_rule("r1");
         REQUIRE(f.rt->disarm_retained() == 1);
         for (int i = 0; i < 25; ++i) {
-            (void)f.rt->expire_overdue_claims(HungDisarmRig5403::later(31s + std::chrono::seconds(i)));
+            (void)f.rt->expire_overdue_claims_at_for_test(HungDisarmRig5403::later(31s + std::chrono::seconds(i)));
             REQUIRE(f.rt->disarm_deadline_elapsed() == 1);
             REQUIRE(f.depth() == 1);
             REQUIRE(f.rt->disarm_retained() == 1);
@@ -14099,7 +14100,7 @@ TEST_CASE("#5403: the deadline observation is counted once per claim and release
         f.rt->detach_rule("r2");
         REQUIRE(f.rt->disarm_retained() == 2);
         for (int i = 0; i < 5; ++i)
-            (void)f.rt->expire_overdue_claims(HungDisarmRig5403::later(31s));
+            (void)f.rt->expire_overdue_claims_at_for_test(HungDisarmRig5403::later(31s));
         CHECK(f.rt->disarm_deadline_elapsed() == 2);
     }
 }
@@ -14130,7 +14131,7 @@ TEST_CASE("#5403: begin_stop with a hung Dispatched Disarm drops only the Queued
     CHECK_NOTHROW(age = f.rt->oldest_pending_disarm_age(HungDisarmRig5403::later(31s)));
     REQUIRE(age.has_value());
     CHECK(*age >= 31s);
-    CHECK_NOTHROW((void)f.rt->expire_overdue_claims(HungDisarmRig5403::later(31s)));
+    CHECK_NOTHROW((void)f.rt->expire_overdue_claims_at_for_test(HungDisarmRig5403::later(31s)));
 
     f.b->release_disarm_hang();
     REQUIRE(yuzu::test::spin_until([&] { return f.rt->active_backend_op_workers() == 0; }, 10s));
@@ -14149,7 +14150,7 @@ TEST_CASE("#5403: single-rule serialized retries behind a hung Disarm keep the k
         REQUIRE(f.depth() == 2);               // the head plus this cycle's one Arm
         // Past the 120 s backend deadline: the Arm is abandoned (the existing Arm expiry),
         // the Disarm head is untouched.
-        (void)f.rt->expire_overdue_claims(HungDisarmRig5403::later(121s));
+        (void)f.rt->expire_overdue_claims_at_for_test(HungDisarmRig5403::later(121s));
         REQUIRE(f.rt->receipt_status(rc) == RT::ReceiptStatus::CongestionExpired);
         REQUIRE(f.depth() == 1);
         REQUIRE(f.b->arm_entries.load() == arm_base);
@@ -14191,8 +14192,8 @@ struct PostK4472Rig {
     GuardianArmAckLedger ledger;
     RT::ArmReceipt wedge_receipt;
 
-    PostK4472Rig()
-        : rt(make_rt(r, b, RT::Config{.backend_op_deadline = std::chrono::seconds(120)})) {}
+    explicit PostK4472Rig(std::chrono::seconds op_deadline = std::chrono::seconds(120))
+        : rt(make_rt(r, b, RT::Config{.backend_op_deadline = op_deadline})) {}
     // Releases every park and hang before the runtime is stopped, so a failing REQUIRE cannot
     // leave a detached worker parked (the HungDisarmRig5403 destructor's order).
     ~PostK4472Rig() {
@@ -14201,9 +14202,9 @@ struct PostK4472Rig {
         b->disarm_park.open();
         b->arm_park.open();
         rt->begin_stop();
-        const auto end = clk::now() + std::chrono::seconds(10);
-        while (rt->active_backend_op_workers() != 0 && clk::now() < end)
-            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        // Event-polled, sanitizer-scaled wait (see HungDisarmRig5403's destructor).
+        (void)yuzu::test::spin_until([&] { return rt->active_backend_op_workers() == 0; },
+                                     std::chrono::seconds(10));
     }
 
     /// One full_sync application as apply_rules builds it for a single rule: a new identical
@@ -14241,7 +14242,15 @@ struct PostK4472Rig {
         ledger.begin_application(1, digest, /*full_sync=*/true, 1);
         wedge_receipt = attach_r1();
         REQUIRE(b->wait_entered_hang(std::chrono::seconds(10)));
-        REQUIRE(rt->expire_overdue_claims(clk::now() + std::chrono::seconds(121)) == 1);
+        // A live, un-abandoned ARM head aged past the 30 s pending-Disarm threshold (but not past
+        // its own 120 s deadline) must not be observed as a pending Disarm: the observation
+        // selects ClaimKind::Disarm only. Mutation (the `kind != Disarm` clause dropped from
+        // observe_pending_disarms_locked): an Arm head has no outcome yet and a default
+        // created_at, so it counts here and this goes red.
+        REQUIRE(rt->expire_overdue_claims_at_for_test(clk::now() + std::chrono::seconds(31)) == 0);
+        REQUIRE(rt->disarm_deadline_elapsed() == 0);
+        REQUIRE(rt->expire_overdue_claims_at_for_test(clk::now() + std::chrono::seconds(121)) == 1);
+        REQUIRE(rt->disarm_deadline_elapsed() == 0); // and still 0 once the Arm is abandoned
         REQUIRE(rt->receipt_status(wedge_receipt) == RT::ReceiptStatus::Wedged);
         ledger.add_pending("r1", wedge_receipt);
         REQUIRE(ledger.drain_locked(*rt, 10) == 1);
@@ -14544,11 +14553,14 @@ TEST_CASE("#4472: compensation age is nullopt before, starts at the owed instant
 
     // The once-per-claim latch: below the deadline nothing; past it exactly one, across many
     // passes, with nothing released (the claim, the worker and the backend disarm are untouched).
-    f.rt->expire_overdue_claims(t_before + 10s);
+    f.rt->expire_overdue_claims_at_for_test(t_before + 10s);
     CHECK(f.rt->compensation_deadline_elapsed() == 0);
     for (int i = 0; i < 6; ++i)
-        f.rt->expire_overdue_claims(t_after + 200s + std::chrono::seconds(i));
+        f.rt->expire_overdue_claims_at_for_test(t_after + 200s + std::chrono::seconds(i));
     CHECK(f.rt->compensation_deadline_elapsed() == 1);
+    // The compensating head is an ARM claim, far past the 30 s Disarm threshold: the Disarm
+    // observation must not count it (the `kind != Disarm` clause; see establish_wedge).
+    CHECK(f.rt->disarm_deadline_elapsed() == 0);
     CHECK(f.rt->claim_queue_depth_for_test(f.key) == 1);
     CHECK(f.b->disarm_entries.load() == 1);
     CHECK(f.rt->oldest_outstanding_compensation_age(probe).has_value());
@@ -14582,4 +14594,334 @@ TEST_CASE("#4472: the direct disarm fallback inside a compensation is covered by
     REQUIRE(yuzu::test::spin_until([&] { return f.rt->claim_queue_depth_for_test(f.key) == 0; }, 10s));
     CHECK_FALSE(f.rt->oldest_outstanding_compensation_age(clk::now()).has_value());
     CHECK(f.live_subscriptions() == 0);
+}
+
+// ---------------------------------------------------------------------------
+// #4472 governance hardening round: tests added after review (qe-1..qe-4, safe-3, CH-3, CH-6,
+// arch-1, arch-7). Same rigs, same conventions: a synthetic `now` ages claims, nothing sleeps to
+// age one, every wait is event-polled.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("#5403 hardening: the once-per-claim latch and counter precede the per-pass warn cap, "
+          "so six retained Disarms count six in ONE pass and stay six",
+          "[spark][runtime][liveness][5403]") {
+    // Mutation (the per-pass cap `continue` moved ABOVE the latch in
+    // observe_pending_disarms_locked): the first pass latches and counts only the first
+    // kDisarmPendingWarnsPerPass (4), the count reads 4 after pass one and creeps to 6 on later
+    // passes, so "one pass past the threshold counts all six" goes red.
+    HungDisarmRig5403 f;
+    constexpr int kKeys = 6; // more than the per-pass warn cap (4)
+    for (int i = 1; i < kKeys; ++i) {
+        const auto rid = "q" + std::to_string(i);
+        REQUIRE(f.rt->attach_rule(rid, file_spec("/q" + std::to_string(i)), file_exists_rule(rid),
+                                  true));
+    }
+    f.rt->set_io_executor_fail_launch_for_test(true); // every Disarm is refused at admission
+    struct SeamOff {
+        GuardianSparkRuntime* rt;
+        ~SeamOff() { rt->set_io_executor_fail_launch_for_test(false); }
+    } seam_off{f.rt.get()};
+    f.rt->detach_rule("r1");
+    for (int i = 1; i < kKeys; ++i)
+        f.rt->detach_rule("q" + std::to_string(i));
+    REQUIRE(f.rt->disarm_retained() == static_cast<std::uint64_t>(kKeys));
+    REQUIRE(f.b->disarm_entries.load() == 0); // all retained Queued, none reached the backend
+
+    (void)f.rt->expire_overdue_claims_at_for_test(HungDisarmRig5403::later(31s));
+    CHECK(f.rt->disarm_deadline_elapsed() == static_cast<std::uint64_t>(kKeys));
+    (void)f.rt->expire_overdue_claims_at_for_test(HungDisarmRig5403::later(40s));
+    CHECK(f.rt->disarm_deadline_elapsed() == static_cast<std::uint64_t>(kKeys)); // once per claim
+    // Observation only: every retained claim is still there.
+    CHECK(f.rt->disarm_retained() == static_cast<std::uint64_t>(kKeys));
+}
+
+TEST_CASE("#4472: begin_stop with a compensating disarm outstanding keeps the hung worker "
+          "counted, releases no claim, and the accessors and passes do not throw",
+          "[spark][runtime][liveness][4472]") {
+    // CH-6 / qe-4. The compensating head is a Dispatched ARM claim whose compensating disarm is
+    // parked inside the backend. begin_stop() drops only QUEUED claims, so this head stays; the
+    // F3 contract (the hung worker stays counted in active_backend_op_workers) is what lets the
+    // process hard_exit rather than race teardown against it.
+    //
+    // NOT tested, by design (UP closed-by-reading): "compensation age across a Queued
+    // hand-back". finalize_arm_compensation's catch hands a head back to Queued only when it
+    // has NO outcome, and abandon_claim_locked always writes an early outcome for a wedge, so a
+    // wedged claim's compensation can never take that arm; the cases a compensation CAN reach
+    // are the pop (finalize's try, or its catch with an outcome) and are covered below.
+    using namespace std::chrono_literals;
+    PostK4472Rig f;
+    f.establish_wedge();
+    f.rt->detach_all();
+    f.b->hang_next_disarm.store(true);
+    f.b->release_hang();
+    REQUIRE(f.b->wait_entered_disarm_hang(10s));
+    REQUIRE(f.rt->oldest_outstanding_compensation_age(clk::now()).has_value());
+    const auto dropped_before = f.rt->claims_dropped_at_stop();
+
+    f.rt->begin_stop();
+    CHECK(f.rt->active_backend_op_workers() > 0);        // the hung worker stays counted (F3)
+    CHECK(f.rt->claim_queue_depth_for_test(f.key) == 1); // no claim released by the stop
+    CHECK(f.rt->claims_dropped_at_stop() == dropped_before); // a Dispatched head is not dropped
+    CHECK_FALSE(f.rt->receipt_wedge_k_eligible(f.wedge_receipt));
+
+    std::optional<clk::duration> comp_age;
+    std::optional<clk::duration> disarm_age;
+    CHECK_NOTHROW(comp_age = f.rt->oldest_outstanding_compensation_age(clk::now() + 31s));
+    CHECK_NOTHROW(disarm_age = f.rt->oldest_pending_disarm_age(clk::now() + 31s));
+    REQUIRE(comp_age.has_value());
+    CHECK(*comp_age >= 31s);
+    CHECK_FALSE(disarm_age.has_value()); // an Arm claim's teardown is never a plain Disarm
+    CHECK_NOTHROW((void)f.rt->retained_tombstones());
+    CHECK_NOTHROW((void)f.rt->expire_overdue_claims_at_for_test(clk::now() + 1000s));
+    CHECK_NOTHROW((void)f.rt->expire_overdue_claims());
+    CHECK(f.rt->claim_queue_depth_for_test(f.key) == 1); // still nothing released by a pass
+
+    f.b->release_disarm_hang();
+    REQUIRE(yuzu::test::spin_until([&] { return f.rt->active_backend_op_workers() == 0; }, 10s));
+    CHECK_NOTHROW((void)f.rt->oldest_outstanding_compensation_age(clk::now()));
+}
+
+TEST_CASE("#4472 stress: accessors, the zero-arg expiry and aged expiry passes racing arms "
+          "that complete and compensate on workers stay consistent and leak nothing",
+          "[spark][runtime][liveness][4472][stress]") {
+    // safe-3. Until now the heartbeat-cadence accessors were only ever read while workers were
+    // PARKED. Here the test thread reads them (and runs the zero-arg production expiry plus an
+    // aged pass that abandons in-flight arms) continuously while a driver thread repeatedly
+    // starts arms on workers, withdraws their rules mid-flight, and lets the late successes
+    // return, so each one is compensated by a worker. Event-driven throughout (a keyed arm gate
+    // and a drain poll); no sleep ages anything; bounded rounds. Meant for the TSan run
+    // (filter [stress]); every Catch2 assertion stays on this thread.
+    using RT = GuardianSparkRuntime;
+    using namespace std::chrono_literals;
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = make_rt(r, b);
+    constexpr int kKeys = 3; // within the File class quota
+    constexpr int kRounds = 12;
+    std::vector<std::string> paths, keys, rids;
+    for (int i = 0; i < kKeys; ++i) {
+        paths.push_back("/s" + std::to_string(i));
+        keys.push_back(spark_key(file_spec(paths.back())));
+        rids.push_back("s" + std::to_string(i));
+    }
+    std::atomic<bool> done{false};
+    // 0 = ok; otherwise the first failing step (1 attach, 2 arm never entered, 3 claim never drained).
+    std::atomic<int> driver_error{0};
+    // The aged (abandoning) pass is only meaningful once every arm of the round is in flight in
+    // the backend: run earlier it would abandon a claim before its arm ever starts (the attach
+    // itself then reports "arm timed out" and no arm enters the gate). The reader runs it only
+    // while `window_open`, and the driver flips that under the same mutex, so a pass never
+    // overlaps an attach and the window never closes under a pass that is still running.
+    std::mutex window_mu;
+    bool window_open = false;
+    std::thread driver([&] {
+        for (int round = 0; round < kRounds && driver_error.load() == 0; ++round) {
+            std::vector<std::shared_ptr<FakeBackend::ArmGate>> gates;
+            for (int k = 0; k < kKeys; ++k) {
+                gates.push_back(b->park_next_arm_for_key(keys[k]));
+                auto res = rt->attach_rule(RT::NonWaiting{}, rids[k], file_spec(paths[k]),
+                                           file_exists_rule(rids[k]), true);
+                if (!res || res->kind != RT::ArmOutcomeKind::Accepted)
+                    driver_error.store(1 + 10 * round);
+            }
+            for (int k = 0; k < kKeys; ++k)
+                if (!gates[k]->wait_entered(10s))
+                    driver_error.store(2 + 10 * round);
+            for (int k = 0; k < kKeys; ++k)
+                rt->detach_rule(rids[k]); // withdrawn while its arm is in flight
+            {
+                std::lock_guard lk(window_mu);
+                window_open = true;
+            }
+            if (round % 2 == 0) // abandon first, then let the late success return (the wedge shape)
+                (void)rt->expire_overdue_claims_at_for_test(clk::now() + 1000s);
+            for (int k = 0; k < kKeys; ++k)
+                gates[k]->release(); // the late success returns: compensated on a worker
+            for (int k = 0; k < kKeys; ++k)
+                if (!yuzu::test::spin_until([&] { return rt->claim_queue_depth_for_test(keys[k]) == 0; },
+                                            10s))
+                    driver_error.store(3 + 10 * round);
+            {
+                std::lock_guard lk(window_mu);
+                window_open = false;
+            }
+        }
+        done.store(true, std::memory_order_release);
+    });
+    struct Cleanup {
+        std::thread& driver;
+        FakeBackend& backend;
+        GuardianSparkRuntime& rt;
+        ~Cleanup() {
+            backend.release_all_key_gates();
+            backend.arm_park.open();
+            backend.disarm_park.open();
+            if (driver.joinable())
+                driver.join();
+            rt.begin_stop();
+            (void)yuzu::test::spin_until([&] { return rt.active_backend_op_workers() == 0; }, 10s);
+        }
+    } cleanup{driver, *b, *rt};
+
+    std::uint64_t iters = 0;
+    std::uint64_t observed_owed = 0;
+    while (!done.load(std::memory_order_acquire) || iters < 50) {
+        const auto now = clk::now();
+        if (rt->oldest_outstanding_compensation_age(now).has_value())
+            ++observed_owed;
+        (void)rt->oldest_pending_disarm_age(now);
+        (void)rt->retained_tombstones();
+        (void)rt->compensation_deadline_elapsed();
+        (void)rt->disarm_deadline_elapsed();
+        (void)rt->claim_drain_failures();
+        (void)rt->expire_overdue_claims(); // the production form
+        {
+            std::lock_guard lk(window_mu);
+            if (window_open && iters % 4 == 0)
+                (void)rt->expire_overdue_claims_at_for_test(now + 1000s); // abandons in-flight arms
+        }
+        ++iters;
+        std::this_thread::yield();
+    }
+    driver.join();
+    INFO("driver step code (round*10 + 1 attach / 2 arm never entered / 3 claim never drained): "
+         << driver_error.load());
+    REQUIRE(driver_error.load() == 0);
+    (void)observed_owed; // informational only: whether a read landed mid-compensation is timing
+
+    // Nothing leaked: every subscription any arm produced was disarmed, no rule or claim is left,
+    // and the registry invariants (including the compensation tripwire) hold.
+    for (int k = 0; k < kKeys; ++k)
+        CHECK(rt->claim_queue_depth_for_test(keys[k]) == 0);
+    CHECK(rt->rule_count() == 0);
+    auto armed = b->armed_ids();
+    auto disarmed = b->disarmed_ids();
+    std::sort(armed.begin(), armed.end());
+    std::sort(disarmed.begin(), disarmed.end());
+    CHECK(armed.size() == static_cast<std::size_t>(kKeys * kRounds));
+    CHECK(armed == disarmed);
+    CHECK_FALSE(rt->oldest_outstanding_compensation_age(clk::now()).has_value());
+    CHECK(rt->invariant_violations_for_test(/*allow_orphans=*/true).empty());
+}
+
+TEST_CASE("#4472 characterization (ACCEPTED COST, UP-3): reapply_count saturated by a compensation "
+          "hold is inherited, so a fresh hung arm after the hold is K-waived at its FIRST drain",
+          "[spark][runtime][liveness][4472][characterization]") {
+    // This pins an accepted cost of the #4472 fix, it does not endorse it as desirable:
+    // begin_application inherits (and saturates) reapply_count for identical content, so the
+    // >=3 held re-applies of a compensation hold spend the K retry budget; a LATER fresh hung
+    // arm on the same content then reaches K with zero retries. Changing the ledger is out of
+    // scope (the ack waiver path is catastrophic-class; the cheapest future fix, not
+    // incrementing reapply_count while the previous application was held by an outstanding
+    // compensation, is to be taken together with #5459). If this test goes red because that
+    // fix landed, update it, do not delete it.
+    using namespace std::chrono_literals;
+    PostK4472Rig f;
+    f.establish_wedge();
+    f.reapply_twice_while_wedged();
+    const auto held = f.third_reapply_with_compensation_outstanding();
+    f.ledger.add_pending("r1", held);
+    REQUIRE(f.ledger.drain_locked(*f.rt, 10) == 1);
+    REQUIRE_FALSE(f.ledger.can_advance()); // the hold: the generation is not acknowledged
+    REQUIRE(f.ledger.reapply_count_for_test() == kReapplyWaiverThreshold);
+
+    f.b->release_disarm_hang(); // the compensation finishes and pops the claim
+    REQUIRE(yuzu::test::spin_until([&] { return f.rt->claim_queue_depth_for_test(f.key) == 0; }, 10s));
+
+    // The next identical application inherits the saturated count (it does not restart at 0).
+    f.ledger.begin_application(1, f.digest, /*full_sync=*/true, 1);
+    CHECK(f.ledger.reapply_count_for_test() == kReapplyWaiverThreshold);
+    f.rt->detach_all();
+    f.b->reset_hang();
+    f.b->hang_next_arm.store(true);
+    const auto fresh = f.attach_r1();
+    REQUIRE(f.b->wait_entered_hang(10s));
+    REQUIRE(f.rt->expire_overdue_claims_at_for_test(clk::now() + 121s) == 1);
+    REQUIRE(f.rt->receipt_status(fresh) == PostK4472Rig::RT::ReceiptStatus::Wedged);
+    f.ledger.add_pending("r1", fresh);
+    REQUIRE(f.ledger.drain_locked(*f.rt, 10) == 1);
+    CHECK(f.rt->receipt_wedge_k_eligible(fresh)); // a genuinely hung arm: K-eligible
+    CHECK(f.ledger.can_advance());                // ... and waived at its FIRST drain, no retries
+}
+
+TEST_CASE("#4472 tripwire: compensation_finished is written with the pop, never alone (normal "
+          "finalize, finalize's publish throwing, and the direct-disarm fallback)",
+          "[spark][runtime][liveness][4472][tripwire]") {
+    // arch-1. The invariant (see is_wedge_k_eligible_locked's comment): a claim that owed a
+    // compensation and now reads compensation_finished is not still a Dispatched/Dispatching
+    // head. invariant_violations_for_test carries the clause; this drives each path that writes
+    // finished=true and checks it holds throughout. The dispatch -> Queued double-fault
+    // hand-back (publish AND the recovery both throwing) has no clean seam and is not driven;
+    // it is the one writer the clause is written to catch if a future change breaks it.
+    using namespace std::chrono_literals;
+    PostK4472Rig f;
+    f.establish_wedge();
+    CHECK(f.rt->invariant_violations_for_test(/*allow_orphans=*/true).empty());
+
+    SECTION("normal finalize: owed while the disarm hangs, popped when it returns") {
+        f.rt->detach_all();
+        f.b->hang_next_disarm.store(true);
+        f.b->release_hang();
+        REQUIRE(f.b->wait_entered_disarm_hang(10s));
+        // In flight: finished is false, so the clause is silent while the claim is Dispatched.
+        CHECK(f.rt->invariant_violations_for_test(true).empty());
+        CHECK(f.rt->claim_queue_depth_for_test(f.key) == 1);
+        f.b->release_disarm_hang();
+        REQUIRE(yuzu::test::spin_until([&] { return f.rt->claim_queue_depth_for_test(f.key) == 0; }, 10s));
+        CHECK(f.rt->invariant_violations_for_test(true).empty());
+    }
+    SECTION("finalize's publish throws (fault 3): the recovery pops with the flag in the same section") {
+        f.rt->detach_all();
+        f.rt->set_drain_fault_point_for_test(3); // consumed by finalize's publish (on_arm_complete returns first)
+        f.b->release_hang();
+        REQUIRE(yuzu::test::spin_until([&] { return f.rt->claim_queue_depth_for_test(f.key) == 0; }, 10s));
+        CHECK(f.rt->claim_drain_failures() >= 1);
+        CHECK(f.rt->invariant_violations_for_test(true).empty());
+        CHECK(f.live_subscriptions() == 0);
+    }
+    SECTION("direct disarm fallback (fault 4): finished is written with the publish and pop") {
+        f.rt->detach_all();
+        f.rt->set_drain_fault_point_for_test(4);
+        f.b->release_hang();
+        REQUIRE(yuzu::test::spin_until([&] { return f.rt->claim_queue_depth_for_test(f.key) == 0; }, 10s));
+        CHECK(f.rt->invariant_violations_for_test(true).empty());
+        CHECK(f.live_subscriptions() == 0);
+    }
+}
+
+TEST_CASE("#4472: the compensation owed instant is compensation_deadline minus "
+          "cfg.backend_op_deadline, for a non-default deadline too",
+          "[spark][runtime][liveness][4472][compensation-age]") {
+    // arch-7. The age scan derives the owed instant as compensation_deadline -
+    // cfg_.backend_op_deadline instead of storing a second timestamp, which couples the gauge to
+    // how the guard builds the deadline (on_arm_complete's CompensationOwedMark: now() +
+    // cfg_.backend_op_deadline, once). Pin the identity against a deadline that is NOT the rig's
+    // usual 120 s, through both observers: the age and the once-per-claim latch. If the guard
+    // is changed to build the deadline differently, one of these moves by the width and fails.
+    using namespace std::chrono_literals;
+    PostK4472Rig f{std::chrono::seconds(37)};
+    f.establish_wedge();
+    f.rt->detach_all();
+    f.b->hang_next_disarm.store(true);
+    const auto t_before = clk::now();
+    f.b->release_hang();
+    REQUIRE(f.b->wait_entered_disarm_hang(10s));
+    const auto t_after = clk::now();
+
+    // Age: the owed instant lies in [t_before, t_after].
+    const auto probe = t_before + 500s;
+    const auto age = f.rt->oldest_outstanding_compensation_age(probe);
+    REQUIRE(age.has_value());
+    CHECK(*age <= 500s);
+    CHECK(*age >= 500s - (t_after - t_before));
+
+    // Latch: the deadline lies in [t_before + 37 s, t_after + 37 s]. A pass 1 s short of the
+    // earliest possible deadline observes nothing; a pass at the latest possible one does.
+    f.rt->expire_overdue_claims_at_for_test(t_before + 36s);
+    CHECK(f.rt->compensation_deadline_elapsed() == 0);
+    f.rt->expire_overdue_claims_at_for_test(t_after + 37s);
+    CHECK(f.rt->compensation_deadline_elapsed() == 1);
+
+    f.b->release_disarm_hang();
+    REQUIRE(yuzu::test::spin_until([&] { return f.rt->claim_queue_depth_for_test(f.key) == 0; }, 10s));
 }

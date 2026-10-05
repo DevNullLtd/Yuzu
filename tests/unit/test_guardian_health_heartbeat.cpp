@@ -9,6 +9,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <map>
@@ -143,10 +144,11 @@ TEST_CASE("health heartbeat: outstanding compensation age is absent for nullopt 
           "otherwise, floored seconds (#4472)",
           "[guardian][health][heartbeat]") {
     std::map<std::string, std::string> tags;
-    emit_guardian_compensation_pending_age_tag(tags, std::nullopt);
+    emit_guardian_health_age_tags(tags, GuardianHealthAgeStats{});
     CHECK(tags.empty()); // never a 0 for "none outstanding"
 
-    emit_guardian_compensation_pending_age_tag(tags, std::optional<std::uint64_t>{23});
+    emit_guardian_health_age_tags(
+        tags, GuardianHealthAgeStats{.compensation_pending_age_seconds = std::uint64_t{23}});
     CHECK(tags.size() == 1);
     CHECK(tags.at("yuzu.guardian_compensation_pending_age_seconds") == "23");
     CHECK(std::string(kGuardianCompensationPendingAgeTag) ==
@@ -154,13 +156,15 @@ TEST_CASE("health heartbeat: outstanding compensation age is absent for nullopt 
 
     // Outstanding for under a second is a real reading: present, value 0.
     std::map<std::string, std::string> young;
-    emit_guardian_compensation_pending_age_tag(young, std::optional<std::uint64_t>{0});
+    emit_guardian_health_age_tags(
+        young, GuardianHealthAgeStats{.compensation_pending_age_seconds = std::uint64_t{0}});
     CHECK(young.size() == 1);
     CHECK(young.at("yuzu.guardian_compensation_pending_age_seconds") == "0");
 
     // The two age emitters are independent: neither writes the other's key.
     std::map<std::string, std::string> disarm_only;
-    emit_guardian_disarm_pending_age_tag(disarm_only, std::optional<std::uint64_t>{5});
+    emit_guardian_health_age_tags(
+        disarm_only, GuardianHealthAgeStats{.disarm_pending_age_seconds = std::uint64_t{5}});
     CHECK(disarm_only.count("yuzu.guardian_compensation_pending_age_seconds") == 0);
 }
 
@@ -168,28 +172,30 @@ TEST_CASE("health heartbeat: pending Disarm age is absent for nullopt and presen
           "(#5403)",
           "[guardian][health][heartbeat]") {
     std::map<std::string, std::string> tags;
-    emit_guardian_disarm_pending_age_tag(tags, std::nullopt);
+    emit_guardian_health_age_tags(tags, GuardianHealthAgeStats{});
     CHECK(tags.empty()); // never a 0 for "none pending"
 
-    emit_guardian_disarm_pending_age_tag(tags, std::optional<std::uint64_t>{17});
+    emit_guardian_health_age_tags(
+        tags, GuardianHealthAgeStats{.disarm_pending_age_seconds = std::uint64_t{17}});
     CHECK(tags.size() == 1);
     CHECK(tags.at("yuzu.guardian_disarm_pending_age_seconds") == "17");
     CHECK(std::string(kGuardianDisarmPendingAgeTag) == "yuzu.guardian_disarm_pending_age_seconds");
 
     // A pending Disarm younger than a second is a real reading: present, value 0.
     std::map<std::string, std::string> young;
-    emit_guardian_disarm_pending_age_tag(young, std::optional<std::uint64_t>{0});
+    emit_guardian_health_age_tags(
+        young, GuardianHealthAgeStats{.disarm_pending_age_seconds = std::uint64_t{0}});
     CHECK(young.size() == 1);
     CHECK(young.at("yuzu.guardian_disarm_pending_age_seconds") == "0");
 }
 
 namespace {
 
-/// #5404: every Spark claim-lifecycle field with its OWN distinct non-zero value (9..19, after
-/// the eight earlier counters' 1..8; #4472's compensation count is 20), so a swapped field in
+/// Every GuardianHealthStats field (all twenty) with its OWN distinct non-zero value: 1..8 the
+/// eight earlier counters, #5404's 9..19, and #4472's compensation count 20, so a swapped field in
 /// the emitter or in the runtime mapping shows up as a wrong value rather than a still-equal
 /// key set.
-GuardianHealthStats all_nineteen_stats() {
+GuardianHealthStats all_twenty_stats() {
     return GuardianHealthStats{.unhealthy_suppressed = 1,
                                .unhealthy_refreshed = 2,
                                .priority_demoted = 3,
@@ -273,7 +279,7 @@ TEST_CASE("health heartbeat: each #5404 claim-lifecycle field emits only its own
 TEST_CASE("health heartbeat: all twenty counters independent and additive",
           "[guardian][health][heartbeat]") {
     std::map<std::string, std::string> tags;
-    emit_guardian_health_heartbeat_tags(tags, all_nineteen_stats());
+    emit_guardian_health_heartbeat_tags(tags, all_twenty_stats());
     CHECK(tags.size() == 20);
     CHECK(tags.at("yuzu.guardian_compensation_deadline_elapsed") == "20"); // #4472
     CHECK(tags.at("yuzu.guardian_unhealthy_suppressed") == "1");
@@ -300,7 +306,7 @@ TEST_CASE("health heartbeat: all twenty counters independent and additive",
 
 namespace {
 
-/// A stand-in with the eleven GuardianSparkRuntime accessors guardian_spark_claim_health_stats
+/// A stand-in with the twelve GuardianSparkRuntime accessors guardian_spark_claim_health_stats
 /// reads, each returning its own distinct value. Distinct values are the point: the mapping
 /// function is the ONE place a runtime accessor is bound to a health field, so a swapped pair
 /// there (detach_claim_failures reading detach_sweep_left_residue) is observable here and in no
@@ -318,6 +324,7 @@ struct FakeClaimRuntime {
     std::uint64_t detach_post_commit_failures() const noexcept { return 109; }
     std::uint64_t claims_dropped_at_stop() const noexcept { return 110; }
     std::uint64_t compensation_deadline_elapsed() const noexcept { return 111; } // #4472
+    std::uint64_t disarm_deadline_elapsed() const noexcept { return 112; }       // #5403
 };
 
 } // namespace
@@ -337,7 +344,8 @@ TEST_CASE("health heartbeat: guardian_spark_claim_health_stats binds every runti
     CHECK(s.detach_post_commit_failures == 109);
     CHECK(s.claims_dropped_at_stop == 110);
     CHECK(s.compensation_deadline_elapsed == 111);
-    // Only the runtime's eleven: every earlier counter and the engine-owned ack_maint_exceptions
+    CHECK(s.disarm_deadline_elapsed == 112); // #5403, folded in so the template is the ONE place
+    // Only the runtime's twelve: every earlier counter and the engine-owned ack_maint_exceptions
     // stay 0, so a second emit of this struct adds nothing to the first emit's tags.
     CHECK(s.unhealthy_suppressed == 0);
     CHECK(s.unhealthy_refreshed == 0);
@@ -346,16 +354,102 @@ TEST_CASE("health heartbeat: guardian_spark_claim_health_stats binds every runti
     CHECK(s.legacy_sink_events_lost == 0);
     CHECK(s.legacy_sink_gap_rules == 0);
     CHECK(s.legacy_sink_dropped_unwired == 0);
-    CHECK(s.disarm_deadline_elapsed == 0);
     CHECK(s.ack_maint_exceptions == 0);
 
     // Through the emitter, each lands under its own key with its own value.
     std::map<std::string, std::string> tags;
     emit_guardian_health_heartbeat_tags(tags, s);
-    CHECK(tags.size() == 11);
+    CHECK(tags.size() == 12);
+    CHECK(tags.at("yuzu.guardian_disarm_deadline_elapsed") == "112");
     CHECK(tags.at("yuzu.guardian_compensation_deadline_elapsed") == "111");
     CHECK(tags.at("yuzu.guardian_orphan_disarms_started") == "101");
     CHECK(tags.at("yuzu.guardian_detach_sweep_left_residue") == "107");
     CHECK(tags.at("yuzu.guardian_detach_claim_failures") == "108");
     CHECK(tags.at("yuzu.guardian_claims_dropped_at_stop") == "110");
+}
+
+namespace {
+
+/// A stand-in for GuardianEngine with exactly the three accessors
+/// collect_guardian_spark_health_tags calls, each returning its OWN distinct value and recording
+/// the `now` it was handed. The real engine is bound at compile time by agent.cpp's heartbeat.
+struct FakeSparkEngine {
+    std::optional<std::uint64_t> disarm_age{41};
+    std::optional<std::uint64_t> compensation_age{42};
+    mutable std::chrono::steady_clock::time_point disarm_now{};
+    mutable std::chrono::steady_clock::time_point compensation_now{};
+
+    GuardianHealthStats spark_claim_health_stats() const {
+        auto s = guardian_spark_claim_health_stats(FakeClaimRuntime{});
+        s.ack_maint_exceptions = 113; // engine-owned, filled by the engine exactly like this
+        return s;
+    }
+    std::optional<std::uint64_t>
+    oldest_pending_disarm_age_seconds(std::chrono::steady_clock::time_point now) const {
+        disarm_now = now;
+        return disarm_age;
+    }
+    std::optional<std::uint64_t>
+    oldest_outstanding_compensation_age_seconds(std::chrono::steady_clock::time_point now) const {
+        compensation_now = now;
+        return compensation_age;
+    }
+};
+
+} // namespace
+
+TEST_CASE("health heartbeat: collect_guardian_spark_health_tags is the ONE assembly of every "
+          "Spark claim-lifecycle tag (#5403/#5404/#4472)",
+          "[guardian][health][heartbeat][claim]") {
+    // This is the function agent.cpp's heartbeat calls: a call dropped or swapped there is a
+    // call dropped or swapped here, so these assertions pin the wiring the engine tests used to
+    // re-assemble by hand (and under which the disarm_deadline_elapsed key was omitted).
+    const FakeSparkEngine eng;
+    const auto now = std::chrono::steady_clock::now() + std::chrono::hours(1);
+    std::map<std::string, std::string> tags;
+    collect_guardian_spark_health_tags(eng, tags, now);
+
+    // 12 runtime counters + the engine-owned ack_maint_exceptions + the two ages.
+    CHECK(tags.size() == 15);
+    CHECK(tags.at("yuzu.guardian_disarm_deadline_elapsed") == "112");
+    CHECK(tags.at("yuzu.guardian_compensation_deadline_elapsed") == "111");
+    CHECK(tags.at("yuzu.guardian_orphan_disarms_started") == "101");
+    CHECK(tags.at("yuzu.guardian_claims_dropped_at_stop") == "110");
+    CHECK(tags.at("yuzu.guardian_ack_maint_exceptions") == "113");
+    CHECK(tags.at("yuzu.guardian_disarm_pending_age_seconds") == "41");
+    CHECK(tags.at("yuzu.guardian_compensation_pending_age_seconds") == "42");
+    // The SAME reading reaches both age accessors.
+    CHECK(eng.disarm_now == now);
+    CHECK(eng.compensation_now == now);
+
+    // Dormant engine: nothing outstanding and all counters zero emits NOTHING (absent, never 0).
+    struct QuietEngine : FakeSparkEngine {
+        GuardianHealthStats spark_claim_health_stats() const { return GuardianHealthStats{}; }
+    };
+    QuietEngine quiet;
+    quiet.disarm_age.reset();
+    quiet.compensation_age.reset();
+    std::map<std::string, std::string> none;
+    collect_guardian_spark_health_tags(quiet, none, now);
+    CHECK(none.empty());
+
+    // Each age is independent: only the engaged one is emitted.
+    FakeSparkEngine only_comp;
+    only_comp.disarm_age.reset();
+    std::map<std::string, std::string> one_age;
+    collect_guardian_spark_health_tags(only_comp, one_age, now);
+    CHECK(one_age.count("yuzu.guardian_disarm_pending_age_seconds") == 0);
+    CHECK(one_age.count("yuzu.guardian_compensation_pending_age_seconds") == 1);
+}
+
+TEST_CASE("health heartbeat: GuardianHealthAgeStats emits each age under its OWN key",
+          "[guardian][health][heartbeat]") {
+    // Distinct values per field: swapping the two accessors' fields in the emitter keeps the key
+    // set identical and is only visible as a wrong value.
+    std::map<std::string, std::string> tags;
+    emit_guardian_health_age_tags(tags, GuardianHealthAgeStats{.disarm_pending_age_seconds = 7,
+                                                               .compensation_pending_age_seconds = 9});
+    REQUIRE(tags.size() == 2);
+    CHECK(tags.at(kGuardianDisarmPendingAgeTag) == "7");
+    CHECK(tags.at(kGuardianCompensationPendingAgeTag) == "9");
 }

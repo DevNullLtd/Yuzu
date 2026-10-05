@@ -95,6 +95,7 @@ __declspec(allocate(".CRT$XCB"))
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 namespace yuzu::agent {
@@ -2403,6 +2404,11 @@ public:
                         // ratio. Lambda-local so a reconnect re-baselines (a new
                         // session ships no rate until it has ≥2 readings again).
                         netq::RetransWindow hb_net_retrans_window;
+                        // #4472 hardening: the Guardian heartbeat emit block below is
+                        // wrapped in one try/catch (the heartbeat loop has no enclosing
+                        // one); this latches its log line so a persistent fault warns once
+                        // per session, not once per tick.
+                        bool hb_guardian_emit_warned = false;
                         while (!should_stop()) {
                             // Sleep in small increments for responsive shutdown
                             auto remaining = cfg_.heartbeat_interval;
@@ -2541,6 +2547,12 @@ public:
                             // generation 0 — so an agent that has never received a
                             // push still converges once rules exist server-side.
                             if (guardian_) {
+                              // One try/catch around the whole Guardian emit block (#4472
+                              // hardening, safe-2): a bad_alloc / system_error from a
+                              // guardian accessor or a tag insert must never terminate
+                              // the heartbeat thread. A throw skips the rest of this tick's
+                              // Guardian tags; the next tick retries. Never logs tag text.
+                              try {
                                 // Drive durable lifecycle-journal maintenance on the
                                 // heartbeat cadence: retry any persist a prior write left
                                 // pending, so a failed write self-heals with no new push /
@@ -2621,32 +2633,19 @@ public:
                                             guardian_->legacy_sink_events_lost(),
                                         .legacy_sink_gap_rules =
                                             guardian_->legacy_sink_gap_rules(),
+                                        // (the #5403 disarm_deadline_elapsed count rides
+                                        // collect_guardian_spark_health_tags below)
                                         .legacy_sink_dropped_unwired =
-                                            guardian_->legacy_sink_dropped_unwired(),
-                                        // #5403: Disarm claims seen pending past the
-                                        // observation threshold. Sparse; never gated on
-                                        // prefer_spark_ (a zero is equally truthful dormant).
-                                        .disarm_deadline_elapsed =
-                                            guardian_->disarm_deadline_elapsed()});
-                                // #5404: the Spark claim-lifecycle counters and the
-                                // retained-tombstone count. A second emit of the same sparse
-                                // emitter (keys disjoint from the first; zero omits), never
-                                // gated on prefer_spark_. The accessor mapping lives in
-                                // guardian_spark_claim_health_stats (unit-tested).
-                                emit_guardian_health_heartbeat_tags(
-                                    tags, guardian_->spark_claim_health_stats());
-                                // #5403: age of the oldest pending Spark Disarm, in whole
-                                // seconds. An age, not a counter, so it is NOT a field of
-                                // GuardianHealthStats (the server rolls it up as MAX);
-                                // absent while no Disarm is pending, never a fabricated 0.
-                                emit_guardian_disarm_pending_age_tag(
-                                    tags, guardian_->oldest_pending_disarm_age_seconds());
-                                // #4472: age of the oldest outstanding compensating teardown
-                                // (the Arm-claim case the Disarm age above cannot see), same
-                                // sparse-absent-not-zero shape. Its once-per-claim elapsed
-                                // count rides spark_claim_health_stats above.
-                                emit_guardian_compensation_pending_age_tag(
-                                    tags, guardian_->oldest_outstanding_compensation_age_seconds());
+                                            guardian_->legacy_sink_dropped_unwired()});
+                                // #5404 / #5403 / #4472: the Spark claim-lifecycle counters,
+                                // the retained-tombstone count and the two claim AGE gauges
+                                // (the pending-Disarm age and the outstanding-compensation
+                                // age; absent while nothing is pending, never a fabricated
+                                // 0). One helper, the ONE place this assembly lives
+                                // (guardian_health_heartbeat.hpp), so it is unit-tested and a
+                                // dropped call is a red test; never gated on prefer_spark_.
+                                yuzu::agent::collect_guardian_spark_health_tags(
+                                    *guardian_, tags, std::chrono::steady_clock::now());
                                 // F7 (#2298 rung 2): per-type CURRENT count of rules classified
                                 // Unsupported (neither backend enforces them) - fleet-loud via
                                 // mech_unsupported_total, sparse (0 omits its tag).
@@ -2658,6 +2657,19 @@ public:
                                 // routine per-rule Unsupported classification.
                                 emit_guardian_backend_heartbeat_tag(
                                     tags, guardian_->prefer_spark(), guardian_->spark_availability());
+                              } catch (...) {
+                                  // The fault may be an allocation failure, so the warn is
+                                  // itself contained: this handler must never re-open the
+                                  // termination path it exists to close.
+                                  if (!std::exchange(hb_guardian_emit_warned, true)) {
+                                      try {
+                                          spdlog::warn("Heartbeat Guardian tag emit failed; the "
+                                                       "remaining Guardian tags are skipped this "
+                                                       "tick (logged once per session)");
+                                      } catch (...) {
+                                      }
+                                  }
+                              }
                             }
 #if defined(_WIN32) || defined(__linux__) || defined(__APPLE__)
                             // DEX signal observer (every platform with a real observer —
