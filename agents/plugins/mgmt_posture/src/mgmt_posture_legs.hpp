@@ -209,7 +209,7 @@ inline Posture posture_linux(const LinuxFs& fs) {
     // --- SSSD: sssd.conf then conf.d snippets, concatenated in precedence order ---
     std::string text;
     bool sssd_present = false;
-    bool sssd_read_failed = false; // a non-refusal failure: the SSSD config was not fully obtained
+    bool config_read_failed = false; // a non-refusal failure: the SSSD config was not fully obtained
     const auto note = [&](int err, const char* part) {
         const std::string base = std::string("linux:mgmt_posture:") + part;
         if (refused(err)) {
@@ -219,7 +219,7 @@ inline Posture posture_linux(const LinuxFs& fs) {
         } else {
             acc.add_failure(base + ":" + errno_token(err));
             if (std::string_view{part}.starts_with("sssd_conf"))
-                sssd_read_failed = true;
+                config_read_failed = true;
         }
     };
 
@@ -281,13 +281,15 @@ inline Posture posture_linux(const LinuxFs& fs) {
         if (r.data.find('\0') != std::string::npos)
             acc.add_failure("linux:mgmt_posture:ipa_default_conf:invalid_bytes");
         ipa_present = parse_ipa_default_conf_has_realm(parse_ini(r.data));
-    } else if (r.err != ENOENT)
+    } else if (r.err != ENOENT) {
         acc.add_failure("linux:mgmt_posture:ipa_default_conf:" + errno_token(r.err));
+        config_read_failed = true; // the IPA realm could not be read: an absent plane would mislead
+    }
 
     auto plane = classify_linux(sssd, ipa_present);
     // A read that failed for a reason other than refusal or absence means the SSSD config was
     // not obtained: a "none" would read as "unmanaged", so say `unknown`.
-    if (plane == Plane::none && sssd_read_failed)
+    if (plane == Plane::none && config_read_failed)
         plane = Plane::unknown;
     return {acc.any_failure() ? StatusState::constrained : StatusState::supported, acc.reason(),
             linux_rows(plane, keytab)};

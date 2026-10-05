@@ -18,6 +18,8 @@ using namespace yuzu::agent;
 namespace {
 
 ReadResult ok(std::string text) { return {std::move(text), 0}; }
+/// A string literal with embedded NULs, length taken from the array (no hand-counted size).
+template <std::size_t N> std::string nul_text(const char (&lit)[N]) { return std::string(lit, N - 1); }
 ReadResult fail(int err) { return {{}, err}; }
 constexpr const char* kSnippet = "/etc/sssd/conf.d/10-b.conf";
 constexpr const char* kTwoDomains = "[sssd]\ndomains = a\n[domain/a]\nid_provider = ad\n"
@@ -137,7 +139,7 @@ TEST_CASE("L3b a failed conf.d listing reads none of the names it returned", "[m
 
 TEST_CASE("L3c a failed read of sssd.conf is constrained with plane unknown, never none",
           "[mgmt_posture]") {
-    // MUTATION: dropping sssd_read_failed reports `plane|none` (unmanaged) beside CONSTRAINED.
+    // MUTATION: dropping config_read_failed reports `plane|none` (unmanaged) beside CONSTRAINED.
     for (int err : {EIO, EMFILE, ENOTDIR, kErrNotRegular, kErrOversized}) {
         FakeFs f;
         f.files[kSssdConf] = fail(err);
@@ -145,6 +147,46 @@ TEST_CASE("L3c a failed read of sssd.conf is constrained with plane unknown, nev
         CHECK(p.status == StatusState::constrained);
         CHECK(has(p, "plane|unknown"));
     }
+}
+
+TEST_CASE("L3g a failed conf.d listing or snippet with nothing else found is plane unknown",
+          "[mgmt_posture]") {
+    // MUTATION: matching only the exact part name "sssd_conf" leaves `plane|none` for these.
+    FakeFs listing;
+    listing.list_err = EIO;
+    CHECK(has(listing.run(), "plane|unknown"));
+    FakeFs snippet;
+    snippet.list_err = 0;
+    snippet.names = {"10-a.conf"};
+    snippet.files["/etc/sssd/conf.d/10-a.conf"] = fail(EIO);
+    CHECK(has(snippet.run(), "plane|unknown"));
+    FakeFs ipa;
+    ipa.files[kIpaConf] = fail(EIO);
+    CHECK(has(ipa.run(), "plane|unknown"));
+}
+
+TEST_CASE("L3h an AD domain positively found keeps plane ad when a snippet read failed",
+          "[mgmt_posture]") {
+    FakeFs f;
+    f.files[kSssdConf] = ok("[sssd]\ndomains = corp\n[domain/corp]\nid_provider = ad\n");
+    f.list_err = 0;
+    f.names = {"10-a.conf"};
+    f.files["/etc/sssd/conf.d/10-a.conf"] = fail(EIO);
+    const auto p = f.run();
+    CHECK(p.status == StatusState::constrained);
+    CHECK(has(p, "plane|ad"));
+}
+
+TEST_CASE("L3i a refusal combined with another failure stays permission_denied and keeps both tokens",
+          "[mgmt_posture]") {
+    FakeFs f;
+    f.files[kSssdConf] = fail(EACCES);
+    f.keytab = EIO;
+    const auto p = f.run();
+    CHECK(p.status == StatusState::permission_denied);
+    CHECK(p.reason.find("linux:mgmt_posture:sssd_conf:permission_denied") != std::string::npos);
+    CHECK(p.reason.find("linux:mgmt_posture:krb5_keytab:eio") != std::string::npos);
+    CHECK(has(p, "plane|unknown"));
 }
 
 TEST_CASE("L3d two refused snippets name the token once", "[mgmt_posture]") {
@@ -181,7 +223,7 @@ TEST_CASE("L3f an IPA default.conf with an embedded NUL is constrained, never a 
           "[mgmt_posture]") {
     // MUTATION: dropping the NUL check reports `supported` + `plane|none` for a corrupt file.
     FakeFs f;
-    f.files[kIpaConf] = ok(std::string("[global]\nrealm = IPA\0.EXAMPLE.COM\n", 36));
+    f.files[kIpaConf] = ok(nul_text("[global]\nrealm = IPA\0.EXAMPLE.COM\n"));
     expect(f.run(), StatusState::constrained, "linux:mgmt_posture:ipa_default_conf:invalid_bytes");
 }
 
@@ -243,7 +285,7 @@ TEST_CASE("L9b an sssd.conf with an embedded NUL is constrained, never a clean n
           "[mgmt_posture]") {
     // MUTATION: dropping the NUL check reports `supported` + `plane|none` for a corrupt file.
     FakeFs f;
-    f.files[kSssdConf] = ok(std::string("[sssd]\ndomains = corp\0junk\n", 27));
+    f.files[kSssdConf] = ok(nul_text("[sssd]\ndomains = corp\0junk\n"));
     const auto p = f.run();
     expect(p, StatusState::constrained, "linux:mgmt_posture:sssd_conf:invalid_bytes");
     CHECK(p.rows.size() == 5);
@@ -273,6 +315,13 @@ TEST_CASE("M1 profiles is run with the exact argv and bounds", "[mgmt_posture]")
     CHECK(f.opts.max_lines == 16);
     CHECK(f.opts.output_cap_bytes == 16 * 1024);
     CHECK_FALSE(f.opts.merge_stderr);
+}
+
+TEST_CASE("M1b a DEP-only output is unrecognised, never a supported row with mdm_enrolled -",
+          "[mgmt_posture]") {
+    // MUTATION: accepting a DEP-only text reports `supported` with `mdm_enrolled|-`.
+    auto f = exited(0, "Enrolled via DEP: Yes\n");
+    check_constrained(f.run(), "macos:mgmt_posture:profiles:unrecognised_output");
 }
 
 TEST_CASE("M2 spawn failure is constrained with the runner's token", "[mgmt_posture]") {

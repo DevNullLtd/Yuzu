@@ -68,7 +68,7 @@ spec:
         platforms: [windows, linux, darwin]
       - name: field_1
         type: string
-        description: 'status: the literal "posture". plane: none, workgroup, ad, aad, hybrid, ipa or unknown (unknown only on a refused read; "-" on macOS). mdm_enrolled: true, false or "-". mdm_provider: the MDM server host, or "-". tenant_id: always "-" today. krb5_keytab: present, absent, or "-" when presence could not be determined.'
+        description: 'status: the literal "posture". plane: none, workgroup, ad, aad, hybrid, ipa or unknown (unknown when a read was refused, or the SSSD or IPA configuration could not be read because of a failed read; "-" on macOS). mdm_enrolled: true, false or "-". mdm_provider: the MDM server host, or "-". tenant_id: always "-" today. krb5_keytab: present, absent, or "-" when presence could not be determined.'
         example: none
         platforms: [windows, linux, darwin]
       - name: field_2

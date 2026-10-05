@@ -91,7 +91,7 @@
           ]
         },
         {
-          "description": "status: the literal \"posture\". plane: none, workgroup, ad, aad, hybrid, ipa or unknown (unknown only on a refused read; \"-\" on macOS). mdm_enrolled: true, false or \"-\". mdm_provider: the MDM server host, or \"-\". tenant_id: always \"-\" today. krb5_keytab: present, absent, or \"-\" when presence could not be determined.",
+          "description": "status: the literal \"posture\". plane: none, workgroup, ad, aad, hybrid, ipa or unknown (unknown when a read was refused, or the SSSD or IPA configuration could not be read because of a failed read; \"-\" on macOS). mdm_enrolled: true, false or \"-\". mdm_provider: the MDM server host, or \"-\". tenant_id: always \"-\" today. krb5_keytab: present, absent, or \"-\" when presence could not be determined.",
           "example": "none",
           "name": "field_1",
           "platforms": [
@@ -176,7 +176,7 @@
       "completeness": "partial",
       "provenance": "`linux:mgmt_posture:sssd_conf:<errno token>`, `linux:mgmt_posture:sssd_conf:no_domains_key`, `linux:mgmt_posture:sssd_conf:invalid_bytes`, `linux:mgmt_posture:ipa_default_conf:invalid_bytes`, `linux:mgmt_posture:sssd_conf_d:<errno token>`, `linux:mgmt_posture:sssd_conf_d:too_many`, `linux:mgmt_posture:ipa_default_conf:<errno token>`, `linux:mgmt_posture:krb5_keytab:<errno token>`",
       "status": "`CONSTRAINED`",
-      "when": "Linux: a read failed other than by refusal of `sssd.conf` or `conf.d` or by absence (an IPA file refusal is only constrained, the realm is also visible in `sssd.conf`; `too_many`: more than 32 `.conf` snippets, or more than 4096 directory entries, in `/etc/sssd/conf.d`); the plane is still classified from what was read. `<errno token>` is one of `permission_denied`, `eio`, `eloop`, `enotdir`, `enametoolong`, `not_regular`, `oversized` or `errno_<n>`"
+      "when": "Linux: a read failed other than by refusal of `sssd.conf` or `conf.d` or by absence (an IPA file refusal is only constrained, the realm is also visible in `sssd.conf`; `too_many`: more than 32 `.conf` snippets, or more than 4096 directory entries, in `/etc/sssd/conf.d`); the plane is classified from what was read, or `unknown` when nothing was found and a read failed (so a failure never reads as an unmanaged `none`). `<errno token>` is one of `permission_denied`, `eio`, `eloop`, `enotdir`, `enametoolong`, `not_regular`, `oversized` or `errno_<n>`"
     },
     {
       "completeness": "partial",

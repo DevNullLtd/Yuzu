@@ -224,6 +224,11 @@ TEST_CASE("mgmt_posture: profiles output without the MDM line is not recognised"
     CHECK(parse_profiles_status("MDM enrollment: No\n").recognised());
 }
 
+TEST_CASE("mgmt_posture: a duplicated domain in the domains list is one active domain", "[mgmt_posture]") {
+    const auto f = facts("[sssd]\ndomains = a, a\n[domain/a]\nid_provider = ad\n");
+    CHECK(f.active_domains == std::vector<std::string>{"a"});
+}
+
 TEST_CASE("mgmt_posture: the MDM host row carries only valid UTF-8", "[mgmt_posture]") {
     // MUTATION: dropping sanitize_utf8 lets invalid bytes reach the protobuf output row.
     const auto e = parse_profiles_status(std::string("MDM enrollment: Yes\nMDM server: https://h\xff\xfe.example.com/x\n"));
