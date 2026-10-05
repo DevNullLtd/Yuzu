@@ -734,6 +734,16 @@ public:
                     const nlohmann::json& attrs = {}, const nlohmann::json& payload_data = {},
                     Severity sev = Severity::kInfo);
 
+    /// #5342 Gate 8 (F4): the ONE refusal evidence for an MFA enrolment write
+    /// that found the account's credential changed (`AuthDBError::
+    /// CredentialChanged`) on the login-enforcement path — the bootstrap init in
+    /// `POST /login` and the confirm in `POST /login/mfa/enroll`. Writes the
+    /// `mfa.enroll.failed` / `error` / `credential_changed` audit row and the
+    /// matching `mfa.enroll.failed` event (reason `credential_changed`). The
+    /// caller answers the uniform 401 itself and reveals nothing.
+    void record_enroll_credential_changed(const httplib::Request& req,
+                                          const std::string& username, auth::Role role);
+
     // -- Route registration ---------------------------------------------------
 
     /// Register auth-related routes: GET/POST /login, POST /login/mfa,

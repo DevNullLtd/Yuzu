@@ -1486,6 +1486,17 @@ bool AuthRoutes::audit_log_for_principal(const httplib::Request& req, const std:
     return ok;
 }
 
+void AuthRoutes::record_enroll_credential_changed(const httplib::Request& req,
+                                                  const std::string& username, auth::Role role) {
+    audit_log_for_principal(req, "mfa.enroll.failed", "error", username,
+                            auth::role_to_string(role), "User", username, "credential_changed");
+    emit_event("mfa.enroll.failed", req,
+               {{"source_ip", req.remote_addr},
+                {"username", username},
+                {"reason", "credential_changed"}},
+               {}, Severity::kWarn);
+}
+
 bool AuthRoutes::deny_service_scoped_session(const httplib::Request& req, httplib::Response& res,
                                              const std::string& action,
                                              const std::string& message,
@@ -2241,7 +2252,22 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                     cfg_.mfa_enforcement, username);
                 return;
             }
-            auto init = db->mfa_init_enrollment(username, "Yuzu");
+            // #5342 Gate 8 (F4): anchor the provisional secret to the hash this
+            // password was PROVEN against — a credential change committed since
+            // (or while the mint waited on its row lock) refuses before any
+            // reveal or write.
+            auto init = db->mfa_init_enrollment(username, "Yuzu", verified_hash_hex);
+            if (!init && init.error() == AuthDBError::CredentialChanged) {
+                // The SAME uniform 401 as a wrong password (no oracle: the
+                // caller proved a password that is no longer the account's);
+                // the truth is in the audit detail. Nothing was revealed or
+                // written, and no pending token was issued.
+                res.status = 401;
+                res.set_content(detail::a4_error(res, "Invalid username or password"),
+                                "application/json");
+                record_enroll_credential_changed(req, username, *role_opt);
+                return;
+            }
             if (!init) {
                 // ★ SECURITY (architect BLOCK): a decrypt/store failure while
                 // (re-)revealing a provisional secret is 503, fail-closed —
@@ -2822,14 +2848,7 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
             // and no session is minted.
             res.status = 401;
             res.set_content(kFailureBody(res), "application/json");
-            audit_log_for_principal(req, "mfa.enroll.failed", "error", entry.username,
-                                    auth::role_to_string(entry.role), "User", entry.username,
-                                    "credential_changed");
-            emit_event("mfa.enroll.failed", req,
-                       {{"source_ip", req.remote_addr},
-                        {"username", entry.username},
-                        {"reason", "credential_changed"}},
-                       {}, Severity::kWarn);
+            record_enroll_credential_changed(req, entry.username, entry.role);
             return;
         }
 

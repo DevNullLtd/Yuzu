@@ -12,10 +12,15 @@
 /// Lock note for callers: `bump_generation_in_txn` takes the row lock on the
 /// single `session_store.session_meta` `write_generation` row and holds it to
 /// the caller's COMMIT. Every session create/revoke takes that same row, so a
-/// caller that holds it must not then WAIT on a lock some session writer could
-/// hold while waiting on `session_meta` (no session writer takes any other
-/// schema's lock, which is what keeps `CredentialChangeOwner`'s order —
-/// `auth.users` row, then `session_store` rows, then this row — acyclic).
+/// caller that holds it must not then WAIT on ANY other lock: whatever it waits
+/// on, every session writer in the fleet waits behind it. Take it LAST, right
+/// before COMMIT. `CredentialChangeOwner` therefore runs
+/// `delete_user_sessions_in_txn` early and `bump_generation_in_txn` only after
+/// its audit INSERTs — order `auth.users` row → `session_store.sessions` rows →
+/// `audit_store.audit_events` (INSERT) → this row → COMMIT (#5342 Gate 8 T1′:
+/// with the bump before the audit INSERT, a lock held on `audit_events` stalled
+/// every unrelated session create/revoke). No session writer takes any other
+/// schema's lock, which keeps that order acyclic.
 
 #include "pg/pg_exec.hpp"
 #include "pg/pg_raii.hpp"
@@ -41,16 +46,16 @@ inline bool bump_generation_in_txn(PGconn* c) {
     return r.status() == PGRES_COMMAND_OK || r.status() == PGRES_TUPLES_OK;
 }
 
-/// Delete every durable session of `username` and bump the write-generation, IN
-/// THE CALLER'S TXN. Returns the number of sessions deleted, or nullopt (with
-/// `err` set) on any statement failure — the caller must then abort its
-/// transaction. The ONE copy of "revoke every session of a user", shared by
-/// `SessionStore::invalidate_user` (its own transaction) and
-/// `CredentialChangeOwner::commit` (inside the credential-change transaction).
-/// Always bumps, even on a 0-row delete (the historical `invalidate_user`
-/// behaviour, kept byte-identical).
-inline std::optional<int> invalidate_user_in_txn(PGconn* c, const std::string& username,
-                                                 std::string& err) {
+/// Delete every durable session of `username`, IN THE CALLER'S TXN, WITHOUT
+/// bumping the write-generation. Returns the number of sessions deleted, or
+/// nullopt (with `err` set) on a statement failure — the caller must then abort
+/// its transaction. The ONE copy of the delete-by-user statement: used alone by
+/// `CredentialChangeOwner::commit` (which bumps the generation itself, LAST —
+/// see the lock note above) and inside `invalidate_user_in_txn`. A caller of
+/// this alone MUST still call `bump_generation_in_txn` before it commits, or a
+/// replica's validate-cache never learns the sessions are gone.
+inline std::optional<int> delete_user_sessions_in_txn(PGconn* c, const std::string& username,
+                                                      std::string& err) {
     pg::PgResult r = pg::exec_params(
         c, "DELETE FROM session_store.sessions WHERE username=$1 RETURNING token_hash",
         std::vector<std::string>{username});
@@ -58,7 +63,19 @@ inline std::optional<int> invalidate_user_in_txn(PGconn* c, const std::string& u
         err = std::string("session delete-by-user failed: ") + PQerrorMessage(c);
         return std::nullopt;
     }
-    const int count = PQntuples(r.get());
+    return PQntuples(r.get());
+}
+
+/// Delete every durable session of `username` and bump the write-generation, IN
+/// THE CALLER'S TXN — the composite `SessionStore::invalidate_user` runs in its
+/// own transaction. Returns the number of sessions deleted, or nullopt (with
+/// `err` set) on any statement failure. Always bumps, even on a 0-row delete
+/// (the historical `invalidate_user` behaviour, kept byte-identical).
+inline std::optional<int> invalidate_user_in_txn(PGconn* c, const std::string& username,
+                                                 std::string& err) {
+    const auto count = delete_user_sessions_in_txn(c, username, err);
+    if (!count)
+        return std::nullopt;
     if (!bump_generation_in_txn(c)) {
         err = std::string("session write-generation bump failed: ") + PQerrorMessage(c);
         return std::nullopt;

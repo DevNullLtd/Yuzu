@@ -279,17 +279,19 @@ writer of an existing local account's `auth.users.password_hash` (the self-servi
 administrative reset). One `pool.with_txn_for` on one lease, schema-qualified SQL across three
 schemas: `SELECT ... FROM auth.users ... FOR UPDATE` (classification under the lock), the guarded
 credential `UPDATE` (which also wipes a provisional TOTP secret and, for a reset, clears the
-lockout), `DELETE FROM session_store.sessions` + the `session_store.session_meta` write-generation
-bump, and the success audit row(s) in `audit_store.audit_events`. The change, the account's
+lockout), `DELETE FROM session_store.sessions`, the success audit row(s) in
+`audit_store.audit_events`, and LAST the `session_store.session_meta` write-generation bump (every
+session create/revoke shares that row, so the owner waits on nothing while holding it). The change, the account's
 sessions, its provisional MFA state, its lockout and the audit evidence therefore commit or abort
 together — there is no compensating write.
 
 Two own-schema seams were extracted so the owner reuses, never copies, each store's statements --
 the same shape `rbac_store_sql_helpers.hpp` gives `RbacAdminAuthorityOwner`:
 
-- `session_store_sql_helpers.hpp` (`session_sql::invalidate_user_in_txn`,
-  `session_sql::bump_generation_in_txn`) -- the ONE "revoke every session of a user" statement pair,
-  shared by `SessionStore::invalidate_user`.
+- `session_store_sql_helpers.hpp` (`session_sql::delete_user_sessions_in_txn`,
+  `session_sql::bump_generation_in_txn`, and their composite `session_sql::invalidate_user_in_txn`)
+  -- the ONE "revoke every session of a user" statement pair; `SessionStore::invalidate_user` runs
+  the composite, the owner runs the two halves split around its audit INSERT.
 - `AuditStore::log_in_txn(PGconn*, const AuditEvent&)` -- the same sanitize + INSERT as
   `AuditStore::log()` (which is now exactly "lease + `log_in_txn` + `count_committed`"), issued on
   the caller's open transaction; the caller bumps the success bucket via

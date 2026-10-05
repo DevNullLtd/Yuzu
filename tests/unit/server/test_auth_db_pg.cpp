@@ -29,6 +29,7 @@
 #include <yuzu/server/auth_db.hpp>
 
 #include "../test_helpers.hpp"
+#include "test_auth_db_pg_helper.hpp" // wait_for_pg_lock_waiter
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -37,6 +38,8 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <expected>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -363,7 +366,7 @@ TEST_CASE("AuthDB::mfa_verify_enrollment binds to the proven credential (Credent
     YUZU_REQUIRE_PG_DB_TPL(db, auth_db_tpl);
     Harness h{db.dsn()};
     REQUIRE(h.db.upsert_user("bind", "h0", "s0", yuzu::server::auth::Role::user).has_value());
-    auto init = h.db.mfa_init_enrollment("bind", "Yuzu");
+    auto init = h.db.mfa_init_enrollment("bind", "Yuzu", std::nullopt);
     REQUIRE(init.has_value());
     auto raw = yuzu::server::mfa::base32_decode(init->secret_base32);
     REQUIRE(raw.has_value());
@@ -386,21 +389,148 @@ TEST_CASE("AuthDB::mfa_verify_enrollment binds to the proven credential (Credent
     CHECK(h.db.mfa_status("bind")->enrolled);
 }
 
-TEST_CASE("AuthDB::mfa_verify_enrollment with no expected hash ignores the credential (Settings)",
+namespace {
+
+std::string totp_for(const std::string& secret_b32) {
+    auto raw = yuzu::server::mfa::base32_decode(secret_b32);
+    REQUIRE(raw.has_value());
+    return yuzu::server::mfa::generate(
+        std::string_view(reinterpret_cast<const char*>(raw->data()), raw->size()),
+        yuzu::server::mfa::current_counter(std::chrono::system_clock::now()));
+}
+
+} // namespace
+
+// #5342 Gate 8 (F4): the mint is anchored to the credential the caller proved.
+TEST_CASE("AuthDB::mfa_init_enrollment binds to the proven credential (CredentialChanged)",
           "[pg][auth_db][password][mfa]") {
     YUZU_REQUIRE_PG_DB_TPL(db, auth_db_tpl);
     Harness h{db.dsn()};
-    REQUIRE(h.db.upsert_user("sett", "h0", "s0", yuzu::server::auth::Role::user).has_value());
-    auto init = h.db.mfa_init_enrollment("sett", "Yuzu");
-    REQUIRE(init.has_value());
-    auto raw = yuzu::server::mfa::base32_decode(init->secret_base32);
-    REQUIRE(raw.has_value());
-    const auto code = yuzu::server::mfa::generate(
-        std::string_view(reinterpret_cast<const char*>(raw->data()), raw->size()),
-        yuzu::server::mfa::current_counter(std::chrono::system_clock::now()));
-    auto ok = h.db.mfa_verify_enrollment("sett", code, std::nullopt);
+    REQUIRE(h.db.upsert_user("ibind", "h0", "s0", yuzu::server::auth::Role::user).has_value());
+
+    // A proven hash that is no longer the stored one → refused BEFORE any mint.
+    auto stale = h.db.mfa_init_enrollment("ibind", "Yuzu", std::string("not-h0"));
+    REQUIRE_FALSE(stale.has_value());
+    CHECK(stale.error() == AuthDBError::CredentialChanged);
+    CHECK(read_secret_hex(h.conn.get(), "ibind").empty()); // mfa_totp_secret IS NULL
+
+    // The proven credential still stored → mints.
+    auto ok = h.db.mfa_init_enrollment("ibind", "Yuzu", std::string("h0"));
     REQUIRE(ok.has_value());
-    CHECK(h.db.mfa_status("sett")->enrolled);
+    CHECK_FALSE(read_secret_hex(h.conn.get(), "ibind").empty());
+
+    // ...and a stale anchor also refuses the REUSE reveal of that secret.
+    auto stale_reveal = h.db.mfa_init_enrollment("ibind", "Yuzu", std::string("not-h0"));
+    REQUIRE_FALSE(stale_reveal.has_value());
+    CHECK(stale_reveal.error() == AuthDBError::CredentialChanged);
+}
+
+// #5342 Gate 8 (F4): the guarded mint's `mfa_totp_secret IS NULL AND
+// mfa_enrolled_at IS NULL` pair. A mint that read "no secret" and then queued on
+// the row lock behind a writer that stored one must never overwrite it.
+TEST_CASE("AuthDB::mfa_init_enrollment never overwrites a secret written while its mint waited",
+          "[pg][auth_db][password][mfa]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, auth_db_tpl);
+    Harness h{db.dsn()};
+    REQUIRE(h.db.upsert_user("irace", "h0", "s0", yuzu::server::auth::Role::user).has_value());
+    // A genuine encrypted blob for this row (SecretId AAD = this row's id),
+    // then back to "no secret" so the racing init reads NULL.
+    auto first = h.db.mfa_init_enrollment("irace", "Yuzu", std::nullopt);
+    REQUIRE(first.has_value());
+    const std::string blob = read_secret_hex(h.conn.get(), "irace");
+    REQUIRE_FALSE(blob.empty());
+    {
+        PgResult n{PQexec(h.conn.get(),
+                          "UPDATE auth.users SET mfa_totp_secret = NULL WHERE username = 'irace'")};
+        REQUIRE(n.ok());
+    }
+
+    std::string writer_sql;
+    SECTION("a concurrent init's provisional secret is re-revealed, not rotated") {
+        writer_sql = "UPDATE auth.users SET mfa_totp_secret = decode('" + blob +
+                     "','hex') WHERE username = 'irace'";
+    }
+    SECTION("a just-enrolled secret is MfaAlreadyEnrolled, not overwritten") {
+        writer_sql = "UPDATE auth.users SET mfa_totp_secret = decode('" + blob +
+                     "','hex'), mfa_enrolled_at = now() WHERE username = 'irace'";
+    }
+    const bool enrolled_case = writer_sql.find("mfa_enrolled_at") != std::string::npos;
+
+    PgConn locker = connect(db.dsn());
+    { PgResult b{PQexec(locker.get(), "BEGIN")}; REQUIRE(b.ok()); }
+    { PgResult u{PQexec(locker.get(), writer_sql.c_str())}; REQUIRE(u.ok()); }
+    std::optional<std::expected<AuthDB::MfaEnrollmentInit, AuthDBError>> racing;
+    {
+        std::jthread initer(
+            [&] { racing = h.db.mfa_init_enrollment("irace", "Yuzu", std::nullopt); });
+        const bool waited = yuzu::test::wait_for_pg_lock_waiter(
+            db.dsn(), "%UPDATE auth.users SET mfa_totp_secret%");
+        PgResult c{PQexec(locker.get(), "COMMIT")};
+        CHECK(c.ok());
+        CHECK(waited);
+    } // jthread joins here
+    REQUIRE(racing.has_value());
+    CHECK(read_secret_hex(h.conn.get(), "irace") == blob); // never overwritten
+    if (enrolled_case) {
+        REQUIRE_FALSE(racing->has_value());
+        CHECK(racing->error() == AuthDBError::MfaAlreadyEnrolled);
+    } else {
+        REQUIRE(racing->has_value());
+        CHECK((*racing)->secret_base32 == first->secret_base32); // the stored secret, revealed
+    }
+}
+
+TEST_CASE("AuthDB::mfa_verify_enrollment with no expected hash anchors to the hash read in the "
+          "same call (Settings)",
+          "[pg][auth_db][password][mfa]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, auth_db_tpl);
+    Harness h{db.dsn()};
+
+    SECTION("a change BEFORE the call is honoured") {
+        REQUIRE(h.db.upsert_user("sett", "h0", "s0", yuzu::server::auth::Role::user).has_value());
+        auto init = h.db.mfa_init_enrollment("sett", "Yuzu", std::nullopt);
+        REQUIRE(init.has_value());
+        // A committed credential change between init and verify (a plain UPDATE
+        // stands in for the owner's) — the verify reads h1 and anchors to it.
+        PgResult upd{PQexec(h.conn.get(),
+                            "UPDATE auth.users SET password_hash = 'h1' WHERE username = 'sett'")};
+        REQUIRE(upd.ok());
+        auto ok = h.db.mfa_verify_enrollment("sett", totp_for(init->secret_base32), std::nullopt);
+        REQUIRE(ok.has_value());
+        CHECK(h.db.mfa_status("sett")->enrolled);
+    }
+
+    SECTION("a change DURING the call is CredentialChanged") {
+        REQUIRE(h.db.upsert_user("sett2", "h0", "s0", yuzu::server::auth::Role::user).has_value());
+        auto init = h.db.mfa_init_enrollment("sett2", "Yuzu", std::nullopt);
+        REQUIRE(init.has_value());
+        const auto code = totp_for(init->secret_base32);
+
+        // A second connection holds the row lock with an UNCOMMITTED credential
+        // change; the verify reads the committed h0, then its guarded UPDATE
+        // waits on the lock and re-evaluates against the committed h1.
+        PgConn locker = connect(db.dsn());
+        { PgResult b{PQexec(locker.get(), "BEGIN")}; REQUIRE(b.ok()); }
+        {
+            PgResult u{PQexec(locker.get(),
+                              "UPDATE auth.users SET password_hash = 'h1' WHERE username = 'sett2'")};
+            REQUIRE(u.ok());
+        }
+        std::optional<std::expected<std::vector<std::string>, AuthDBError>> during;
+        {
+            std::jthread verifier(
+                [&] { during = h.db.mfa_verify_enrollment("sett2", code, std::nullopt); });
+            const bool waited = yuzu::test::wait_for_pg_lock_waiter(
+                db.dsn(), "%UPDATE auth.users SET mfa_enrolled_at%");
+            PgResult c{PQexec(locker.get(), "COMMIT")};
+            CHECK(c.ok());
+            CHECK(waited);
+        } // jthread joins here
+        REQUIRE(during.has_value());
+        REQUIRE_FALSE(during->has_value());
+        CHECK(during->error() == AuthDBError::CredentialChanged);
+        CHECK_FALSE(h.db.mfa_status("sett2")->enrolled);
+    }
 }
 
 // ── fresh-start admin seeding ─────────────────────────────────────────────
@@ -1398,7 +1528,7 @@ TEST_CASE("AuthDB MFA enroll -> verify round trip is envelope-encrypted end to e
     REQUIRE(pre.has_value());
     CHECK_FALSE(pre->enrolled);
 
-    auto init = h.db.mfa_init_enrollment("mfauser", "Yuzu");
+    auto init = h.db.mfa_init_enrollment("mfauser", "Yuzu", std::nullopt);
     REQUIRE(init.has_value());
     CHECK_FALSE(init->secret_base32.empty());
     CHECK(init->otpauth_uri.find("otpauth://") == 0);
@@ -1411,7 +1541,7 @@ TEST_CASE("AuthDB MFA enroll -> verify round trip is envelope-encrypted end to e
     CHECK_FALSE(stored_hex.empty());
 
     // Re-init while still provisional REUSES the same secret (idempotent).
-    auto init2 = h.db.mfa_init_enrollment("mfauser", "Yuzu");
+    auto init2 = h.db.mfa_init_enrollment("mfauser", "Yuzu", std::nullopt);
     REQUIRE(init2.has_value());
     CHECK(init2->secret_base32 == init->secret_base32);
 
@@ -1426,7 +1556,7 @@ TEST_CASE("AuthDB MFA enroll -> verify round trip is envelope-encrypted end to e
     CHECK(verify->size() == 10);
 
     // Enrolling twice is rejected.
-    auto redo = h.db.mfa_init_enrollment("mfauser", "Yuzu");
+    auto redo = h.db.mfa_init_enrollment("mfauser", "Yuzu", std::nullopt);
     REQUIRE_FALSE(redo.has_value());
     CHECK(redo.error() == AuthDBError::MfaAlreadyEnrolled);
 
@@ -1471,7 +1601,7 @@ TEST_CASE("AuthDB MFA: concurrent enrollment verify enrolls exactly once, no orp
     Harness h{db.dsn()}; // pool size 4 — enough for two concurrent verifies
     REQUIRE(h.db.upsert_user("enrollrace", "h", "s", yuzu::server::auth::Role::user).has_value());
 
-    auto init = h.db.mfa_init_enrollment("enrollrace", "Yuzu");
+    auto init = h.db.mfa_init_enrollment("enrollrace", "Yuzu", std::nullopt);
     REQUIRE(init.has_value());
     auto raw_secret = yuzu::server::mfa::base32_decode(init->secret_base32);
     REQUIRE(raw_secret.has_value());
@@ -1609,7 +1739,7 @@ TEST_CASE("AuthDB MFA: disable then re-enroll succeeds — the guard does not we
     REQUIRE(h.db.upsert_user("reenroll", "h", "s", yuzu::server::auth::Role::user).has_value());
 
     auto enroll_once = [&]() {
-        auto init = h.db.mfa_init_enrollment("reenroll", "Yuzu");
+        auto init = h.db.mfa_init_enrollment("reenroll", "Yuzu", std::nullopt);
         REQUIRE(init.has_value());
         auto raw = yuzu::server::mfa::base32_decode(init->secret_base32);
         REQUIRE(raw.has_value());
@@ -1652,7 +1782,7 @@ TEST_CASE("AuthDB MFA: concurrent submission of one valid code succeeds exactly 
     Harness h{db.dsn()}; // pool size 4 — enough for two concurrent verifies
     REQUIRE(h.db.upsert_user("racer", "h", "s", yuzu::server::auth::Role::user).has_value());
 
-    auto init = h.db.mfa_init_enrollment("racer", "Yuzu");
+    auto init = h.db.mfa_init_enrollment("racer", "Yuzu", std::nullopt);
     REQUIRE(init.has_value());
     auto raw_secret = yuzu::server::mfa::base32_decode(init->secret_base32);
     REQUIRE(raw_secret.has_value());
@@ -1756,7 +1886,7 @@ TEST_CASE("AuthDB MFA fail-closed: corrupted ENROLLED secret -> SecretUnavailabl
     Harness h{db.dsn()};
     REQUIRE(h.db.upsert_user("corrupt1", "h", "s", yuzu::server::auth::Role::user).has_value());
 
-    auto init = h.db.mfa_init_enrollment("corrupt1", "Yuzu");
+    auto init = h.db.mfa_init_enrollment("corrupt1", "Yuzu", std::nullopt);
     REQUIRE(init.has_value());
     auto raw_secret = yuzu::server::mfa::base32_decode(init->secret_base32);
     REQUIRE(raw_secret.has_value());
@@ -1795,7 +1925,7 @@ TEST_CASE("AuthDB MFA fail-closed: ENROLLED but NULL secret is SecretUnavailable
     Harness h{db.dsn()};
     REQUIRE(h.db.upsert_user("nullsec1", "h", "s", yuzu::server::auth::Role::user).has_value());
 
-    auto init = h.db.mfa_init_enrollment("nullsec1", "Yuzu");
+    auto init = h.db.mfa_init_enrollment("nullsec1", "Yuzu", std::nullopt);
     REQUIRE(init.has_value());
     auto raw_secret = yuzu::server::mfa::base32_decode(init->secret_base32);
     REQUIRE(raw_secret.has_value());
@@ -1840,7 +1970,7 @@ TEST_CASE("AuthDB MFA fail-closed: a FAILED secret read is not 'no secret' — i
     Harness h{db.dsn()};
     REQUIRE(h.db.upsert_user("qfail1", "h", "s", yuzu::server::auth::Role::user).has_value());
 
-    auto init = h.db.mfa_init_enrollment("qfail1", "Yuzu");
+    auto init = h.db.mfa_init_enrollment("qfail1", "Yuzu", std::nullopt);
     REQUIRE(init.has_value());
     auto before_hex = read_secret_hex(h.conn.get(), "qfail1");
     REQUIRE_FALSE(before_hex.empty());
@@ -1850,7 +1980,7 @@ TEST_CASE("AuthDB MFA fail-closed: a FAILED secret read is not 'no secret' — i
     // Before the fix the failed statement returned the same empty answer as
     // "no provisional secret", and this call minted a FRESH secret over the
     // live one — silently invalidating a QR the operator had already scanned.
-    auto reinit = h.db.mfa_init_enrollment("qfail1", "Yuzu");
+    auto reinit = h.db.mfa_init_enrollment("qfail1", "Yuzu", std::nullopt);
     REQUIRE_FALSE(reinit.has_value());
     // The reuse guard preserves the actual store-unavailable error (here
     // QueryFailed — a failed statement, not an acquire timeout) rather than
@@ -1869,7 +1999,7 @@ TEST_CASE("AuthDB MFA fail-closed: a FAILED secret read surfaces as a store outa
     YUZU_REQUIRE_PG_DB_TPL(db, auth_db_tpl);
     Harness h{db.dsn()};
     REQUIRE(h.db.upsert_user("qfail2", "h", "s", yuzu::server::auth::Role::user).has_value());
-    REQUIRE(h.db.mfa_init_enrollment("qfail2", "Yuzu").has_value());
+    REQUIRE(h.db.mfa_init_enrollment("qfail2", "Yuzu", std::nullopt).has_value());
 
     break_load_mfa_row_only(h.conn.get());
 
@@ -1960,7 +2090,7 @@ TEST_CASE("AuthDB mfa_init_enrollment fails closed on a store outage, never over
     REQUIRE(h.db.upsert_user("busymfa", "h", "s", yuzu::server::auth::Role::user).has_value());
 
     // Mint a provisional secret with the pool free.
-    REQUIRE(h.db.mfa_init_enrollment("busymfa", "Yuzu").has_value());
+    REQUIRE(h.db.mfa_init_enrollment("busymfa", "Yuzu", std::nullopt).has_value());
     const std::string before = read_secret_hex(h.conn.get(), "busymfa");
     REQUIRE_FALSE(before.empty());
 
@@ -1972,7 +2102,7 @@ TEST_CASE("AuthDB mfa_init_enrollment fails closed on a store outage, never over
         REQUIRE(lease);
         held.push_back(std::move(lease));
     }
-    auto reinit = h.db.mfa_init_enrollment("busymfa", "Yuzu");
+    auto reinit = h.db.mfa_init_enrollment("busymfa", "Yuzu", std::nullopt);
     REQUIRE_FALSE(reinit.has_value());
     CHECK(yuzu::server::is_store_unavailable(reinit.error()));
 
@@ -2001,13 +2131,13 @@ TEST_CASE("AuthDB MFA fail-closed: mfa_init_enrollment never mints a fresh secre
     Harness h{db.dsn()};
     REQUIRE(h.db.upsert_user("corrupt2", "h", "s", yuzu::server::auth::Role::user).has_value());
 
-    auto init = h.db.mfa_init_enrollment("corrupt2", "Yuzu");
+    auto init = h.db.mfa_init_enrollment("corrupt2", "Yuzu", std::nullopt);
     REQUIRE(init.has_value());
 
     corrupt_secret(h.conn.get(), "corrupt2");
     auto corrupted_hex = read_secret_hex(h.conn.get(), "corrupt2");
 
-    auto reinit = h.db.mfa_init_enrollment("corrupt2", "Yuzu");
+    auto reinit = h.db.mfa_init_enrollment("corrupt2", "Yuzu", std::nullopt);
     REQUIRE_FALSE(reinit.has_value());
     CHECK(reinit.error() == AuthDBError::SecretUnavailable);
 
@@ -2023,7 +2153,7 @@ TEST_CASE("AuthDB MFA fail-closed: mfa_verify_enrollment refuses a corrupted pro
     Harness h{db.dsn()};
     REQUIRE(h.db.upsert_user("corrupt3", "h", "s", yuzu::server::auth::Role::user).has_value());
 
-    auto init = h.db.mfa_init_enrollment("corrupt3", "Yuzu");
+    auto init = h.db.mfa_init_enrollment("corrupt3", "Yuzu", std::nullopt);
     REQUIRE(init.has_value());
     corrupt_secret(h.conn.get(), "corrupt3");
 

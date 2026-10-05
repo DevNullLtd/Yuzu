@@ -197,7 +197,7 @@ struct AuthRoutesHarness {
     /// Enroll `username` (defaults to admin) in MFA. Returns the base32
     /// secret so the test can compute fresh TOTP codes against it.
     std::string enroll_mfa(const std::string& username = "admin") {
-        auto init = auth_db->mfa_init_enrollment(username, "Yuzu");
+        auto init = auth_db->mfa_init_enrollment(username, "Yuzu", std::nullopt);
         REQUIRE(init.has_value());
         auto code = totp_at(init->secret_base32, 0);
         REQUIRE(auth_db->mfa_verify_enrollment(username, code, std::nullopt).has_value());
@@ -1683,7 +1683,7 @@ TEST_CASE("POST /login/mfa/enroll: a valid code cannot enrol once the proven cre
     std::string pending = nlohmann::json::parse(step1->body).at("mfa_pending_token");
 
     h.admin_reset("alice", "reset-by-an-admin-1");
-    auto fresh = h.auth_db->mfa_init_enrollment("alice", "Yuzu"); // the new provisional secret
+    auto fresh = h.auth_db->mfa_init_enrollment("alice", "Yuzu", std::nullopt); // the new provisional secret
     REQUIRE(fresh.has_value());
 
     auto step2 = h.sink.Post(

@@ -402,7 +402,7 @@ TEST_CASE("commit_password_change: a provisional TOTP secret is wiped; an enroll
 
     SECTION("admin reset wipes a provisional secret; the next enrolment gets a NEW one") {
         seed_local(*f.db, "vic", kOld, Role::user);
-        auto s1 = f.db->mfa_init_enrollment("vic", "Yuzu");
+        auto s1 = f.db->mfa_init_enrollment("vic", "Yuzu", std::nullopt);
         REQUIRE(s1.has_value());
         const auto r = mgr.commit_password_change(mkreq(Kind::kAdminReset, "vic", kNew));
         REQUIRE(r.result == Result::kOk);
@@ -411,25 +411,25 @@ TEST_CASE("commit_password_change: a provisional TOTP secret is wiped; an enroll
         auto st = f.db->mfa_status("vic");
         REQUIRE(st.has_value());
         CHECK_FALSE(st->enrolled);
-        auto s2 = f.db->mfa_init_enrollment("vic", "Yuzu");
+        auto s2 = f.db->mfa_init_enrollment("vic", "Yuzu", std::nullopt);
         REQUIRE(s2.has_value());
         CHECK(s1->secret_base32 != s2->secret_base32);
     }
     SECTION("self change wipes a provisional secret too") {
         seed_local(*f.db, "pia", kOld, Role::user);
-        auto s1 = f.db->mfa_init_enrollment("pia", "Yuzu");
+        auto s1 = f.db->mfa_init_enrollment("pia", "Yuzu", std::nullopt);
         REQUIRE(s1.has_value());
         const auto r = mgr.commit_password_change(
             mkreq(Kind::kSelf, "pia", kNew, anchor_of(mgr, "pia", kOld)));
         REQUIRE(r.result == Result::kOk);
         CHECK(r.provisional_mfa_cleared);
-        auto s2 = f.db->mfa_init_enrollment("pia", "Yuzu");
+        auto s2 = f.db->mfa_init_enrollment("pia", "Yuzu", std::nullopt);
         REQUIRE(s2.has_value());
         CHECK(s1->secret_base32 != s2->secret_base32);
     }
     SECTION("an ENROLLED secret and its recovery codes survive a reset (F3)") {
         seed_local(*f.db, "eno", kOld, Role::user);
-        auto init = f.db->mfa_init_enrollment("eno", "Yuzu");
+        auto init = f.db->mfa_init_enrollment("eno", "Yuzu", std::nullopt);
         REQUIRE(init.has_value());
         auto codes = f.db->mfa_verify_enrollment("eno", code_for_now(init->secret_base32),
                                                  std::nullopt);
@@ -445,7 +445,7 @@ TEST_CASE("commit_password_change: a provisional TOTP secret is wiped; an enroll
         CHECK(after->enrolled);
         CHECK(after->recovery_codes_remaining == before->recovery_codes_remaining);
         // The enrolled secret still verifies a fresh code.
-        auto again = f.db->mfa_init_enrollment("eno", "Yuzu");
+        auto again = f.db->mfa_init_enrollment("eno", "Yuzu", std::nullopt);
         REQUIRE_FALSE(again.has_value());
         CHECK(again.error() == yuzu::server::AuthDBError::MfaAlreadyEnrolled);
     }
@@ -641,7 +641,9 @@ TEST_CASE("post-mint recheck WAITS on an uncommitted credential write and then d
     f.exec_on(a.get(), "DELETE FROM session_store.sessions WHERE username = 'mona'");
 
     std::string token = "unset";
-    std::thread b([&] { token = mgr.create_local_session("mona", Role::user, false, anchor); });
+    // jthread: joined on every exit path (a failed REQUIRE below never leaves a
+    // joinable std::thread to std::terminate; at worst B waits out lock_timeout).
+    std::jthread b([&] { token = mgr.create_local_session("mona", Role::user, false, anchor); });
     // Give B ample time to persist its session and reach the row-locked
     // re-read (where it blocks). At HEAD's plain read it would already have
     // returned a live token by now.

@@ -111,12 +111,16 @@ enum class AuthDBError : std::uint8_t {
     /// timeout as `QueryFailed`/`WriteFailed`; they emit no degrade metric, so
     /// the reason split does not reach them — see `is_store_unavailable`.)
     StoreBusy,
-    /// #5342 Gate 8 (F2): an MFA enrolment bound to a verified credential
-    /// (`mfa_verify_enrollment`'s `expected_password_hash_hex`) found the
-    /// account's stored password hash no longer matches — the password was
-    /// changed or reset after the login that started the enrolment. A
-    /// business outcome, NOT a store fault (`is_store_unavailable` is false):
-    /// the caller refuses (generic 401) and spends the pending token.
+    /// #5342 Gate 8 (F2/F4): an MFA enrolment write (`mfa_init_enrollment`'s
+    /// mint or `mfa_verify_enrollment`'s enrol) found the account's stored
+    /// password hash no longer equals the credential anchor — the caller's
+    /// proven hash (login bootstrap) or the hash read earlier in the SAME call
+    /// (Settings, `std::nullopt`). The password was changed or reset after the
+    /// enrolment's credential was established, or while the write waited on the
+    /// credential change's row lock. A business outcome, NOT a store fault
+    /// (`is_store_unavailable` is false): the caller refuses (generic 401 at
+    /// login, a "sign in again" fragment in Settings), reveals nothing and
+    /// spends any pending token.
     CredentialChanged,
 };
 
@@ -675,11 +679,24 @@ public:
     /// Generate a fresh TOTP secret and write it as provisional (encrypted).
     /// Returns the base32 form + otpauth URI for the enrollment UI.
     /// Idempotent on provisional rows (reuse, not rotate — see the file
-    /// header MFA note); returns UserAlreadyExists — er, MfaAlreadyEnrolled —
-    /// on already-enrolled rows; returns SecretUnavailable (never a fresh
-    /// mint) if an existing provisional secret fails to decrypt.
+    /// header MFA note); returns MfaAlreadyEnrolled on already-enrolled rows;
+    /// returns SecretUnavailable (never a fresh mint) if an existing
+    /// provisional secret fails to decrypt.
+    ///
+    /// `expected_password_hash_hex` (#5342 Gate 8, F4 — REQUIRED, no default,
+    /// so every caller decides) is the CREDENTIAL ANCHOR: the login bootstrap
+    /// passes the hash its password was proven against; Settings passes
+    /// `std::nullopt`, which anchors to the hash read in this same call. An
+    /// engaged anchor that no longer equals the stored hash is
+    /// `CredentialChanged` BEFORE any reveal or mint, and the mint itself is a
+    /// guarded `UPDATE ... WHERE mfa_totp_secret IS NULL AND mfa_enrolled_at IS
+    /// NULL AND password_hash = <anchor>` — so a mint that waited behind a
+    /// credential change's row lock lands as `CredentialChanged`, never as a
+    /// secret written over the change (and never over a secret a concurrent
+    /// init or verify just wrote).
     std::expected<MfaEnrollmentInit, AuthDBError>
-    mfa_init_enrollment(const std::string& username, std::string_view issuer);
+    mfa_init_enrollment(const std::string& username, std::string_view issuer,
+                        const std::optional<std::string>& expected_password_hash_hex);
 
     /// Verify the first code against the provisional secret. On success,
     /// stamps mfa_enrolled_at = now(), generates 10 recovery codes (returned
@@ -688,16 +705,17 @@ public:
     /// Returns SecretUnavailable if the provisional secret fails to decrypt
     /// (never silently rejects the code as wrong).
     ///
-    /// `expected_password_hash_hex` (#5342 Gate 8, F2 — REQUIRED, no default,
-    /// so every caller decides): when engaged, the guarded enrolment UPDATE
-    /// also requires `password_hash` to still equal it, binding the enrolment
-    /// to the credential the caller proved. The login-enforcement bootstrap
-    /// (`POST /login/mfa/enroll`) passes the pending login's verified hash, so
-    /// an enrolment started under a password that was since changed or reset
-    /// cannot complete; a 0-row result on an active, un-enrolled row whose hash
-    /// differs is `CredentialChanged`. The Settings enrolment (an already
-    /// authenticated session whose credential change would have revoked it)
-    /// passes `std::nullopt`.
+    /// `expected_password_hash_hex` (#5342 Gate 8, F2/F4 — REQUIRED, no
+    /// default, so every caller decides) is the CREDENTIAL ANCHOR, always
+    /// bound: the guarded enrolment UPDATE requires `password_hash` to still
+    /// equal `expected_password_hash_hex.value_or(<hash read in this call>)`.
+    /// The login-enforcement bootstrap (`POST /login/mfa/enroll`) passes the
+    /// pending login's verified hash, so an enrolment started under a password
+    /// that was since changed or reset cannot complete. The Settings enrolment
+    /// passes `std::nullopt` and anchors to the hash read in this call, so a
+    /// change committed while its UPDATE waited on the credential change's row
+    /// lock is refused too. A 0-row result on an active, un-enrolled row whose
+    /// hash differs from the anchor is `CredentialChanged`.
     std::expected<std::vector<std::string>, AuthDBError>
     mfa_verify_enrollment(const std::string& username, std::string_view code,
                           const std::optional<std::string>& expected_password_hash_hex);

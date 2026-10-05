@@ -151,7 +151,7 @@ struct HardenedHarness {
     }
 
     void enroll_mfa(const std::string& name) {
-        auto init = auth_db->mfa_init_enrollment(name, "Yuzu");
+        auto init = auth_db->mfa_init_enrollment(name, "Yuzu", std::nullopt);
         REQUIRE(init.has_value());
         // Complete enrollment with a code at the current counter. These tests
         // stop at the 202 challenge — they never submit a login TOTP — so the

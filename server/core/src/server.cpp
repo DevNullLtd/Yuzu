@@ -19287,7 +19287,7 @@ private:
         // The current-password proof is AuthRoutes' lockout-accounted check
         // (the SAME section POST /login runs — never a second copy); it and the
         // principal-explicit audit writer capture auth_routes_ (constructed
-        // above, outlives the route table). No session cookie is minted here
+        // above, outlives route dispatch). No session cookie is minted here
         // any more: a self-change deletes every session of the account in its
         // own transaction and the user signs in again (#5342 Gate 7/8).
         // The CSRF same-site gate uses the same trusted-origin allowlist as the

@@ -193,13 +193,20 @@ canonical list lives here. For broader auth/RBAC/crypto context, defer to the
 - **No session surface on `AuthDB` at all.** `create_session` /
   `validate_session` / `invalidate_session` / `invalidate_all_sessions` /
   `cleanup_expired_sessions` / `touch_session_activity` /
-  `mfa_mark_session_stepup` do not exist on the Postgres-backed `AuthDB` —
-  sessions are exclusively `AuthManager::sessions_` (in-memory,
-  authoritative, does not survive a restart). **A PR that reintroduces any
+  `mfa_mark_session_stepup` do not exist on the Postgres-backed `AuthDB`.
+  Operator sessions are durable rows in the SEPARATE `SessionStore`
+  (`session_store.{hpp,cpp}`, schema `session_store`, HA WS-1, ADR-2002 §4),
+  written through from `AuthManager`, whose in-memory `sessions_` map is only
+  a generation-gated validate cache. Sessions survive a restart and are shared
+  across replicas — but never through `AuthDB`. **A PR that reintroduces any
   session-persistence method on `AuthDB` is a design regression** — raise it
   as a HIGH finding requiring an explicit decision (this was a deliberate
   drop, not an oversight; see `docs/auth-architecture.md` "AuthDB —
-  persistent authentication store").
+  persistent authentication store"). The one cross-store writer is the
+  credential-change owner (`CredentialChangeOwner`, #5342), which deletes a
+  user's `session_store` rows in the same transaction as its `auth.users`
+  credential write — through `session_store_sql_helpers.hpp`, never an
+  `AuthDB` method.
 
 - **Cleanup thread now sweeps ONLY stale provisional MFA enrollments** (the
   session-expiry-reaping half of the old cadence is gone along with the

@@ -441,8 +441,10 @@ file it would write only seeds an empty database).
 
 **Fallback — direct SQL**, when no administrator can sign in at all (the only
 admin forgot their password). This writes no audit row and revokes no
-sessions; record it in your change-management system. Generate the hash the
-way the server does (PBKDF2-HMAC-SHA256, 100 000 iterations, 32-byte key,
+sessions; record it in your change-management system. Like the in-product
+reset, it discards an unfinished (never-enrolled) TOTP enrolment so nobody can
+complete it under the old password; an enrolled second factor is kept. Generate
+the hash the way the server does (PBKDF2-HMAC-SHA256, 100 000 iterations, 32-byte key,
 16-byte random salt, both hex-encoded):
 
 ```bash
@@ -454,6 +456,8 @@ salt = os.urandom(16)
 dk = hashlib.pbkdf2_hmac('sha256', os.environ['NEWPW'].encode(), salt, 100000, dklen=32)
 print(f"UPDATE auth.users SET password_hash = '{dk.hex()}', salt_hex = '{salt.hex()}', "
       "failed_login_count = 0, last_failed_login_at = NULL, locked_until = NULL, "
+      "mfa_totp_secret = CASE WHEN mfa_enrolled_at IS NULL THEN NULL ELSE mfa_totp_secret END, "
+      "mfa_last_counter = CASE WHEN mfa_enrolled_at IS NULL THEN 0 ELSE mfa_last_counter END, "
       "updated_at = now() WHERE username = 'admin' AND identity_source = 'local' "
       "AND provisioning_source = 'local' AND is_active;")
 PY
@@ -474,6 +478,8 @@ salt = os.urandom(16)
 dk = hashlib.pbkdf2_hmac('sha256', os.environ['NEWPW'].encode(), salt, 100000, dklen=32)
 print(f"UPDATE auth.users SET password_hash = '{dk.hex()}', salt_hex = '{salt.hex()}', "
       "failed_login_count = 0, last_failed_login_at = NULL, locked_until = NULL, "
+      "mfa_totp_secret = CASE WHEN mfa_enrolled_at IS NULL THEN NULL ELSE mfa_totp_secret END, "
+      "mfa_last_counter = CASE WHEN mfa_enrolled_at IS NULL THEN 0 ELSE mfa_last_counter END, "
       "updated_at = now() WHERE username = 'admin' AND identity_source = 'local' "
       "AND provisioning_source = 'local' AND is_active;")
 '@ | python -

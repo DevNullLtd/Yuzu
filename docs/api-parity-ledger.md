@@ -47,7 +47,8 @@ permanently (an MCP caller is a token, not the human), and the admin reset is
 deferred to #5357, an MCP tool that takes no password argument (a
 server-generated temporary password) because an approval ticket would store
 and display one. Both are also recorded in ADR-1005's exception ledger
-(`docs/adr-1005-execution-plan.md`). Every other v1 route stays out of the
+(`docs/adr/1005-headless-platform-use-case-engines.md`, "Grandfathered
+surfaces" item 3). Every other v1 route stays out of the
 ledger and is held to the OpenAPI check instead.
 
 **What populated this first PR.** Every row was extracted mechanically by

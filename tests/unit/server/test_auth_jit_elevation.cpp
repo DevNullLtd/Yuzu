@@ -413,7 +413,7 @@ struct JitHarness {
     }
 
     void enroll_mfa(const std::string& u) {
-        auto init = auth_db->mfa_init_enrollment(u, "Yuzu");
+        auto init = auth_db->mfa_init_enrollment(u, "Yuzu", std::nullopt);
         REQUIRE(init.has_value());
         auto bytes = mfa::base32_decode(init->secret_base32);
         REQUIRE(bytes.has_value());

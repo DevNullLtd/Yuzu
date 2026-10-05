@@ -228,9 +228,14 @@ process's caches (`users_` hash/salt, `sessions_`).
 **The invariant.** A local account's credential, its session set, its
 provisional MFA state, its lockout state (admin reset) and the audit evidence
 for the change commit or abort TOGETHER, in one transaction holding the
-`auth.users` row lock first — and every session mint re-reads that row under
-the same lock after persisting (below). Nothing proven under a retired
-credential is honoured, and no compensating write exists.
+`auth.users` row lock first — and every LOCAL session mint re-reads that row
+under the same lock after persisting (below). Nothing proven under a retired
+credential is honoured. Every enrolment
+write is anchored the same way (F4, below), so the store never honours a
+credential proven before the change; the only remaining window is a request a
+replica admitted on a session the change is revoking before its caches saw the
+revocation — the generic session-revocation propagation window (R14), not a
+credential-specific one — and no compensating write exists.
 
 The transaction, in order: `set_config('lock_timeout', …, true)` (every lock
 wait bounded, txn-scoped); `SELECT … FROM auth.users WHERE username=$1 AND
@@ -240,14 +245,15 @@ verified hash (`VerifiedCredential::hash_hex`, from the lockout-accounted
 `verify_password` — no second PBKDF2) no longer the stored one → `409
 conflict`. Then one guarded `UPDATE auth.users` (new hash/salt, `updated_at`,
 the provisional TOTP secret wiped, and — admin reset only — the lockout
-columns cleared); `DELETE FROM session_store.sessions WHERE username=$1` + the
-`session_meta` write-generation bump (`session_store_sql_helpers.hpp`, the ONE
-copy, shared with `SessionStore::invalidate_user`); and the success audit
-row(s) via `AuditStore::log_in_txn` — `user.password_change` /
-`user.password_reset` (detail `sessions_revoked=N provisional_mfa_cleared=…`)
-and, for an admin reset of an account that had a lockout (`locked_until` set —
-even if the lock has since expired — or a non-zero failure count),
-`auth.lockout.cleared` (detail `password_reset`). An
+columns cleared); `DELETE FROM session_store.sessions WHERE username=$1`
+(`session_store_sql_helpers.hpp`, the ONE copy, shared with
+`SessionStore::invalidate_user`); the success audit row(s) via
+`AuditStore::log_in_txn` — `user.password_change` / `user.password_reset`
+(detail `sessions_revoked=N provisional_mfa_cleared=…`) and, for an admin reset
+of an account that had a lockout (`locked_until` set — even if the lock has
+since expired — or a non-zero failure count), `auth.lockout.cleared` (detail
+`password_reset`); and LAST the `session_meta` write-generation bump (same
+helper file). An
 audit INSERT failure aborts everything → `503 audit_unavailable` +
 `Sec-Audit-Failed`; any other failure (lease, lock timeout, statement, COMMIT)
 → `503 store_unavailable`. A refusal changes NOTHING — the caller's session,
@@ -258,11 +264,16 @@ confirms the change, which is audited either way (the audit row is in the same
 commit).
 
 **Lock order** (documented in the owner header; a change inverting it can
-deadlock): the `auth.users` row → `session_store.sessions` rows → the
-`session_store.session_meta` `write_generation` row → `audit_store.audit_events`
-(INSERT). Nothing holds `session_meta` and then waits on `auth.users`: no
-`session_store` transaction touches another schema, and the post-mint re-read
-takes `auth.users` only after its session INSERT committed.
+deadlock): the `auth.users` row → `session_store.sessions` rows →
+`audit_store.audit_events` (INSERT) → the `session_store.session_meta`
+`write_generation` row → COMMIT. The generation row is last because every
+session create and revoke in the fleet takes it: holding it while waiting on
+anything else (formerly the audit INSERT, behind a lock someone held on
+`audit_events`) stalled every unrelated sign-in and sign-out until the owner's
+`lock_timeout` (T1′). Nothing holds `session_meta` or a `sessions` row and then
+waits on `auth.users` or `audit_events`: no `session_store` transaction touches
+another schema, no audit writer touches `session_store`, and the post-mint
+re-read takes `auth.users` only after its session INSERT committed.
 `RbacAdminAuthorityOwner` takes `principal_roles` → `auth.users` and never a
 session/audit lock. The owner requires AuthDB, SessionStore and AuditStore on
 ONE pool/database (ADR-0006; server.cpp builds all three on `*pg_pool_`); a
@@ -283,12 +294,24 @@ already run — the Gate 8 defect this closes. An empty anchor denies.
 
 **MFA.** The transaction wipes a provisional (never-enrolled) TOTP secret on
 both routes, so an enrolment begun under the retired credential cannot be
-finished and the account's next enrolment gets a fresh secret (F1). The
-login-enforcement bootstrap (`POST /login/mfa/enroll`) additionally binds its
-guarded enrolment UPDATE to the pending login's verified hash
-(`mfa_verify_enrollment(…, expected_password_hash_hex)`): a changed credential
-is `AuthDBError::CredentialChanged` → the generic `401`, audited
-`mfa.enroll.failed` detail `credential_changed`, the pending token spent (F2).
+finished and the account's next enrolment gets a fresh secret (F1). Every
+enrolment WRITE is anchored to a credential (F2/F4): the mint in
+`mfa_init_enrollment` (`… WHERE mfa_totp_secret IS NULL AND mfa_enrolled_at IS
+NULL AND password_hash = <anchor>`) and the enrol in `mfa_verify_enrollment`
+(`… AND password_hash = <anchor>`), both with a REQUIRED anchor argument. The
+login-enforcement path passes the hash its password was PROVEN against — the
+bootstrap init in `POST /login` and the confirm in `POST /login/mfa/enroll`
+(the pending entry carries it); Settings passes `std::nullopt`, which the store
+resolves to the hash it read in the SAME call. A stale proven anchor is refused
+before any reveal or mint, and a write that queued behind the credential
+change's row lock re-evaluates against the committed row and lands as
+`AuthDBError::CredentialChanged` — never a secret written, or an enrolment
+completed, over the change. At login that is the generic `401` with nothing
+revealed and no pending token kept; in Settings the fragment says "Your
+password changed during enrolment — sign in again"; every site audits
+`mfa.enroll.failed` result `error` detail `credential_changed`. (The `IS NULL`
+pair also stops a slow init overwriting a secret a concurrent init or verify
+just wrote — it re-reveals a concurrent init's secret instead.)
 An ENROLLED second factor and its recovery codes are not touched by a change or
 reset (F3); clearing one is `yuzu-server --mfa-reset` (an optional admin-reset
 flag is a follow-up).
@@ -298,6 +321,17 @@ before the transaction; an Administrator grant revoked in the PBKDF2 window
 between the gate and the commit lets that one in-flight reset complete under
 the revoked authority (the next request is refused) — the same lock-free regime
 check the A2/A1 handlers accept.
+
+**Accepted residual (R14).** A Settings MFA init or verify admitted on a
+session that a credential change is revoking — on the same replica between the
+change's COMMIT and its erase of the cached session, or on another replica
+before its next session-generation refresh (≤1 s) — anchors to the NEW hash it
+reads and so can mint and, with a second such request, enrol a secret. That is
+the generic session-revocation propagation window, not a credential-specific
+one. The controls are the compromise runbook (`yuzu-server --mfa-reset`) and
+the `mfa.enroll.*` audit rows adjacent to `user.password_reset`; full closure
+is a fifth credential-change owner step or a current-password field on the
+Settings enrolment form (new issue).
 
 **Route gates** (`rest_api_v1.cpp` `register_password_routes`): interactive
 cookie sessions only — any MCP tier, service-scoped token, engine principal or

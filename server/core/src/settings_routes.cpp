@@ -9,6 +9,7 @@
 
 #include <atomic>
 #include <cstdio>
+#include <format>
 
 #include "access_review_model.hpp" // Periodic Access Reviews (SOC 2 CC6.2) — pure read-model
 #include "access_review_store.hpp" // Periodic Access Reviews — campaign persistence
@@ -744,6 +745,11 @@ std::string SettingsRoutes::render_users_fragment(const std::string& current_use
 }
 
 namespace {
+// #5342 Gate 8 (F4): the Settings MFA init/verify refusal when the account's
+// password changed during the enrolment (AuthDBError::CredentialChanged).
+constexpr const char* kMfaCredentialChangedMsg =
+    "Your password changed during enrolment — sign in again";
+
 // Shown INSTEAD of a table when the enrollment store cannot be read (WS-6 6.2):
 // an outage must never render as an empty list ("No tokens created") — that
 // would tell an operator there is nothing to act on when the truth is unknown.
@@ -4923,27 +4929,29 @@ void SettingsRoutes::register_routes(
         // #5342: the over-max case gets its own message (the shared policy in
         // password_policy.hpp); upsert_user's `false` cannot distinguish it from
         // "too short".
+        // Messages built from the shared policy constants (password_policy.hpp),
+        // never a restated number that could drift from the check itself.
         if (auth::check_password_policy(password) == auth::PasswordPolicyVerdict::kTooLong) {
             audit_fn_(req, "user.create", "denied", "User", username, "too_long");
+            const auto msg =
+                std::format("Password must be at most {} bytes", auth::kMaxPasswordBytes);
             res.status = 400;
-            res.set_header(
-                "HX-Trigger",
-                R"({"showToast":{"message":"Password must be at most 1024 bytes","level":"error"}})");
-            res.set_content(detail::a4_error(res, "Password must be at most 1024 bytes"),
-                            "application/json");
+            res.set_header("HX-Trigger",
+                           std::format(R"({{"showToast":{{"message":"{}","level":"error"}}}})", msg));
+            res.set_content(detail::a4_error(res, msg), "application/json");
             return;
         }
         if (!auth_mgr_->upsert_user(username, password, role)) {
             spdlog::warn("POST /api/settings/users: upsert rejected for '{}' "
-                         "(weak_password — minimum 12 bytes)",
-                         username);
+                         "(weak_password — minimum {} bytes)",
+                         username, auth::kMinPasswordBytes);
             audit_fn_(req, "user.create", "denied", "User", username, "weak_password");
+            const auto msg =
+                std::format("Password must be at least {} bytes", auth::kMinPasswordBytes);
             res.status = 400;
-            res.set_header(
-                "HX-Trigger",
-                R"({"showToast":{"message":"Password must be at least 12 bytes","level":"error"}})");
-            res.set_content(detail::a4_error(res, "Password must be at least 12 bytes"),
-                            "application/json");
+            res.set_header("HX-Trigger",
+                           std::format(R"({{"showToast":{{"message":"{}","level":"error"}}}})", msg));
+            res.set_content(detail::a4_error(res, msg), "application/json");
             return;
         }
         if (!auth_mgr_->save_config()) {
@@ -6742,7 +6750,23 @@ void SettingsRoutes::register_routes(
                 "text/html; charset=utf-8");
             return;
         }
-        auto init = db->mfa_init_enrollment(session->username, "Yuzu");
+        // #5342 Gate 8 (F4): no proven hash here — the store anchors the mint
+        // to the hash it reads in this same call, so a password change/reset
+        // that commits while the mint waits on its row lock refuses it.
+        auto init = db->mfa_init_enrollment(session->username, "Yuzu",
+                                            /*expected_password_hash_hex=*/std::nullopt);
+        if (!init && init.error() == AuthDBError::CredentialChanged) {
+            // The credential change is revoking this session; nothing was
+            // revealed or written. ONE detail token across every
+            // credential_changed refusal site (login init, login confirm,
+            // Settings init/verify).
+            audit_fn_(req, "mfa.enroll.failed", "error", "User", session->username,
+                      "credential_changed");
+            res.set_content(render_mfa_fragment(session->username, {}, {}, {}, {},
+                                                kMfaCredentialChangedMsg),
+                            "text/html; charset=utf-8");
+            return;
+        }
         if (!init) {
             const char* msg = "Enrollment failed";
             if (init.error() == AuthDBError::MfaAlreadyEnrolled) {
@@ -6793,6 +6817,19 @@ void SettingsRoutes::register_routes(
                   }
                   auto codes_res = db->mfa_verify_enrollment(session->username, code,
                                                              /*expected_password_hash_hex=*/std::nullopt);
+                  if (!codes_res && codes_res.error() == AuthDBError::CredentialChanged) {
+                      // #5342 Gate 8 (F4): the password changed while (or
+                      // before) this enrolment was being confirmed — nothing
+                      // was enrolled and no recovery codes were issued. No
+                      // retry form (the provisional secret was discarded with
+                      // the credential change); the session is being revoked.
+                      audit_fn_(req, "mfa.enroll.failed", "error", "User", session->username,
+                                "credential_changed");
+                      res.set_content(render_mfa_fragment(session->username, {}, {}, {}, {},
+                                                          kMfaCredentialChangedMsg),
+                                      "text/html; charset=utf-8");
+                      return;
+                  }
                   if (!codes_res) {
                       // Re-render the verify form (no QR re-reveal — the
                       // provisional row survives so the operator's

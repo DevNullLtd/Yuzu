@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <format>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
@@ -420,9 +421,10 @@ bool AuthManager::first_run_setup(const std::filesystem::path& cfg_path) {
     if (const auto verdict = check_password_policy(admin_pw);
         verdict != PasswordPolicyVerdict::kOk) {
         if (verdict == PasswordPolicyVerdict::kTooShort)
-            std::cerr << "Password must be at least " << kMinPasswordBytes << " characters.\n";
+            std::cerr << std::format("Password must be at least {} bytes (UTF-8).\n",
+                                     kMinPasswordBytes);
         else
-            std::cerr << "Password must be at most " << kMaxPasswordBytes << " bytes.\n";
+            std::cerr << std::format("Password must be at most {} bytes.\n", kMaxPasswordBytes);
         return false;
     }
     auto admin_pw2 = prompt_password("Confirm admin password");
@@ -447,9 +449,10 @@ bool AuthManager::first_run_setup(const std::filesystem::path& cfg_path) {
     if (const auto verdict = check_password_policy(user_pw);
         verdict != PasswordPolicyVerdict::kOk) {
         if (verdict == PasswordPolicyVerdict::kTooShort)
-            std::cerr << "Password must be at least " << kMinPasswordBytes << " characters.\n";
+            std::cerr << std::format("Password must be at least {} bytes (UTF-8).\n",
+                                     kMinPasswordBytes);
         else
-            std::cerr << "Password must be at most " << kMaxPasswordBytes << " bytes.\n";
+            std::cerr << std::format("Password must be at most {} bytes.\n", kMaxPasswordBytes);
         return false;
     }
     auto user_pw2 = prompt_password("Confirm user password");

@@ -174,8 +174,9 @@ CredentialChangeOutcome CredentialChangeOwner::commit(const CredentialChangeRequ
                 return false;
             }
 
-            // c. Every session of the account, durably, + the generation bump.
-            const auto deleted = session_sql::invalidate_user_in_txn(c, req.username, err);
+            // c. Every session of the account, durably (the count feeds the
+            //    audit detail). The generation bump is NOT here — see e.
+            const auto deleted = session_sql::delete_user_sessions_in_txn(c, req.username, err);
             if (!deleted)
                 return false;
             revoked = *deleted;
@@ -204,7 +205,18 @@ CredentialChangeOutcome CredentialChangeOwner::commit(const CredentialChangeRequ
                 audit_rows = 2;
             }
 
-            // e. TEST-ONLY seam, every lock still held.
+            // e. #5342 Gate 8 T1′: the write-generation bump LAST, after every
+            //    audit INSERT. Its `session_meta` row lock is taken by every
+            //    session create/revoke in the fleet; taken before the audit
+            //    INSERT, a lock held on `audit_events` (a migration, a manual
+            //    LOCK, a stuck retention pass) stalled ALL of them until this
+            //    transaction's lock_timeout. Nothing waits after it but COMMIT.
+            if (!session_sql::bump_generation_in_txn(c)) {
+                err = std::string("session write-generation bump failed: ") + PQerrorMessage(c);
+                return false;
+            }
+
+            // f. TEST-ONLY seam, every lock still held.
             if (pre_commit_hook_for_test_)
                 pre_commit_hook_for_test_();
             return true;

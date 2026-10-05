@@ -35,25 +35,34 @@
 ///      and its recovery codes are untouched). Admin reset only: the lockout
 ///      columns are cleared too. Guarded `WHERE ... AND is_active AND
 ///      identity_source='local' AND provisioning_source='local' RETURNING id`.
-///   c. `session_sql::invalidate_user_in_txn` — DELETE every durable session of
-///      the account + bump `session_meta.write_generation` (the ONE copy,
-///      shared with `SessionStore::invalidate_user`).
+///   c. `session_sql::delete_user_sessions_in_txn` — DELETE every durable
+///      session of the account (the ONE copy of the statement, shared with
+///      `SessionStore::invalidate_user` via `invalidate_user_in_txn`); its
+///      count is the audit detail's `sessions_revoked=N`.
 ///   d. `AuditStore::log_in_txn` — the success row (`user.password_change` /
 ///      `user.password_reset`, detail carries `sessions_revoked=N` and
 ///      `provisional_mfa_cleared=`); admin reset of a previously-locked
 ///      account also writes `auth.lockout.cleared` (detail `password_reset`).
 ///      Any INSERT failure aborts the whole transaction → `kAuditUnavailable`.
-///   e. the TEST-ONLY pre-commit hook, then COMMIT.
+///   e. `session_sql::bump_generation_in_txn` — bump
+///      `session_meta.write_generation` LAST (#5342 Gate 8 T1′): every session
+///      create/revoke takes that row, so nothing may be waited on after it.
+///   f. the TEST-ONLY pre-commit hook, then COMMIT.
 /// Post-commit (outside the lease): `AuditStore::count_committed` per row. The
 /// caller (`AuthManager::commit_password_change`) then refreshes its own
 /// `users_`/`sessions_` caches.
 ///
 /// LOCK ORDER (a change that inverts it can deadlock): the `auth.users` row →
-/// `session_store.sessions` rows → the `session_store.session_meta`
-/// `write_generation` row → `audit_store.audit_events` (INSERT only). Verified
-/// acyclic against every other holder: no `session_store` transaction touches
-/// any other schema (session_store.cpp / session_store_sql_helpers.hpp), so
-/// nothing holds `session_meta` and then waits on an `auth.users` row; the
+/// `session_store.sessions` rows → `audit_store.audit_events` (INSERT only) →
+/// the `session_store.session_meta` `write_generation` row → COMMIT. The
+/// generation row is LAST on purpose (#5342 Gate 8 T1′): it is the one lock
+/// every session create/revoke in the fleet shares, so a wait taken while
+/// holding it (formerly the audit INSERT behind a lock on `audit_events`)
+/// stalled every unrelated sign-in and sign-out. Verified acyclic against every
+/// other holder: no `session_store` transaction touches any other schema
+/// (session_store.cpp / session_store_sql_helpers.hpp), so nothing holds
+/// `session_meta` or a `sessions` row and then waits on an `auth.users` row or
+/// `audit_events`; no audit writer touches `session_store`; the
 /// post-mint re-read takes `auth.users` only AFTER its session INSERT has
 /// committed (releasing `session_meta`); `RbacAdminAuthorityOwner` takes
 /// `principal_roles` → `auth.users` and never a `session_store`/`audit_store`

@@ -57,6 +57,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <expected>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -126,7 +127,11 @@ struct PasswordRoutesHarness {
     yuzu::server::test::TestRouteSink sink;
     RestApiV1 api;
 
-    explicit PasswordRoutesHarness(int lockout_threshold = 0) {
+    /// `login_audit_to_store`: wire the REAL audit_store into AuthRoutes too, so
+    /// a /login refusal row (e.g. `mfa.enroll.failed credential_changed`) is
+    /// readable through store_rows(). Off by default — the other cases count the
+    /// store's rows as the owner's alone.
+    explicit PasswordRoutesHarness(int lockout_threshold = 0, bool login_audit_to_store = false) {
         cfg.auth_lockout_threshold = lockout_threshold;
         cfg.auth_lockout_window_secs = 3600;
         cfg.https_enabled = false;
@@ -138,7 +143,7 @@ struct PasswordRoutesHarness {
         auth_mgr.set_metrics_registry(&metrics);
         auth_routes = std::make_unique<AuthRoutes>(cfg, auth_mgr, /*rbac_store=*/nullptr,
                                                    /*api_token_store=*/nullptr,
-                                                   /*audit_store=*/nullptr,
+                                                   login_audit_to_store ? &audit_store : nullptr,
                                                    /*mgmt_group_store=*/nullptr,
                                                    /*tag_store=*/nullptr,
                                                    /*analytics_store=*/nullptr, oidc_mu,
@@ -284,6 +289,24 @@ struct PasswordRoutesHarness {
         yuzu::server::pg::PgResult r{PQexec(conn.get(), sql.c_str())};
         INFO(sql << " -> " << PQresultErrorMessage(r.get()));
         REQUIRE(r.ok());
+    }
+
+    /// First column of the first row of `sql` ("<null>" for SQL NULL / no row).
+    std::string scalar(const std::string& sql) {
+        yuzu::server::pg::PgConn conn{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        yuzu::server::pg::PgResult r{PQexec(conn.get(), sql.c_str())};
+        INFO(sql << " -> " << PQresultErrorMessage(r.get()));
+        REQUIRE(r.status() == PGRES_TUPLES_OK);
+        if (PQntuples(r.get()) == 0 || PQgetisnull(r.get(), 0, 0))
+            return "<null>";
+        return PQgetvalue(r.get(), 0, 0);
+    }
+
+    /// True iff `user` has no TOTP secret at all (provisional or enrolled).
+    bool secret_is_null(const std::string& user) {
+        return scalar("SELECT (mfa_totp_secret IS NULL)::text FROM auth.users WHERE username = '" +
+                      user + "'") == "true";
     }
 
     /// REAL statement fault: every audit INSERT fails (42P01) until restored.
@@ -981,19 +1004,22 @@ TEST_CASE("password routes: a session minted with the OLD credential during the 
     const auto old_anchor = h.auth_mgr.verify_password("vic", kOld)->hash_hex;
 
     std::string minted = "unset";
-    std::thread racer;
+    // jthread: joined on every exit path (a throwing request or a failed
+    // REQUIRE never leaves a joinable std::thread to std::terminate).
+    std::jthread racer;
     std::atomic<bool> fired{false};
     h.owner.set_pre_commit_hook_for_test([&] {
         if (fired.exchange(true))
             return;
-        racer = std::thread(
+        racer = std::jthread(
             [&] { minted = h.auth_mgr.create_local_session("vic", Role::user, false, old_anchor); });
         std::this_thread::sleep_for(std::chrono::milliseconds(300));
     });
     auto res = h.reset("vic", kNew);
-    h.owner.set_pre_commit_hook_for_test(nullptr);
+    if (racer.joinable())
+        racer.join();
+    h.owner.set_pre_commit_hook_for_test(nullptr); // after the join: nothing can still fire it
     REQUIRE(fired);
-    racer.join();
     REQUIRE(res);
     CHECK(res->status == 200);
     CHECK((minted.empty() || !h.auth_mgr.validate_session(minted).has_value()));
@@ -1013,7 +1039,7 @@ TEST_CASE("password routes: an old-password MFA login challenge completed during
     h.auth_routes->register_routes(h.sink);
     h.as_admin();
     h.seed("mfa_vic", kOld, Role::user);
-    auto init = h.db->mfa_init_enrollment("mfa_vic", "Yuzu");
+    auto init = h.db->mfa_init_enrollment("mfa_vic", "Yuzu", std::nullopt);
     REQUIRE(init.has_value());
     REQUIRE(h.db->mfa_verify_enrollment("mfa_vic", totp_now(init->secret_base32), std::nullopt)
                 .has_value());
@@ -1024,12 +1050,12 @@ TEST_CASE("password routes: an old-password MFA login challenge completed during
     const std::string pending = nlohmann::json::parse(step1->body).at("mfa_pending_token");
 
     std::unique_ptr<httplib::Response> step2;
-    std::thread racer;
+    std::jthread racer; // joined on every exit path
     std::atomic<bool> fired{false};
     h.owner.set_pre_commit_hook_for_test([&] {
         if (fired.exchange(true))
             return;
-        racer = std::thread([&] {
+        racer = std::jthread([&] {
             step2 = h.sink.Post("/login/mfa",
                                 "mfa_pending_token=" + pending +
                                     "&code=" + totp_now(init->secret_base32, 1),
@@ -1038,15 +1064,197 @@ TEST_CASE("password routes: an old-password MFA login challenge completed during
         std::this_thread::sleep_for(std::chrono::milliseconds(300));
     });
     auto res = h.reset("mfa_vic", kNew);
-    h.owner.set_pre_commit_hook_for_test(nullptr);
+    if (racer.joinable())
+        racer.join();
+    h.owner.set_pre_commit_hook_for_test(nullptr); // after the join
     REQUIRE(fired);
-    racer.join();
     REQUIRE(res);
     CHECK(res->status == 200);
     REQUIRE(step2);
     CHECK(step2->status == 401);
     CHECK(step2->get_header_value("Set-Cookie").empty());
     CHECK(h.sessions_of("mfa_vic") == 0);
+}
+
+// ── #5342 Gate 8 iteration 3 (F4): every MFA enrolment write is anchored ────
+//
+// The credential change holds the account's auth.users row lock for its whole
+// transaction (and wipes a provisional secret). An enrolment write that read
+// the row before the change and then queued on that lock re-evaluates its
+// guarded WHERE against the committed row; the password_hash anchor makes it
+// match nothing → CredentialChanged. Every case below rendezvouses on the REAL
+// lock wait (wait_for_pg_lock_waiter), never a sleep.
+
+TEST_CASE("password routes: an MFA init queued behind a reset lands as CredentialChanged, never a "
+          "post-reset secret (chaos R4b inverted)",
+          "[pg][rest][password][mfa]") {
+    PasswordRoutesHarness h;
+    h.wire();
+    h.as_admin("rootA");
+    h.seed("vic", kOld, Role::user);
+    const auto old_hash = h.stored_hash("vic");
+
+    std::optional<std::expected<AuthDB::MfaEnrollmentInit, AuthDBError>> racing_result;
+    std::atomic<bool> init_returned{false};
+    std::atomic<bool> fired{false};
+    bool waiter_seen = false;
+    bool returned_before_commit = true;
+    std::jthread racer; // joined on every exit path
+    h.owner.set_pre_commit_hook_for_test([&] {
+        if (fired.exchange(true))
+            return;
+        // Settings shape (no proven hash): the store anchors to its own read.
+        racer = std::jthread([&] {
+            racing_result = h.db->mfa_init_enrollment("vic", "Yuzu", std::nullopt);
+            init_returned = true;
+        });
+        waiter_seen = yuzu::test::wait_for_pg_lock_waiter(
+            h.db.dsn(), "%UPDATE auth.users SET mfa_totp_secret%");
+        returned_before_commit = init_returned.load();
+    });
+    auto res = h.reset("vic", kNew);
+    if (racer.joinable())
+        racer.join();
+    h.owner.set_pre_commit_hook_for_test(nullptr); // after the join
+    REQUIRE(fired);
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    CHECK(waiter_seen);                  // the racing mint really queued on the row lock
+    CHECK_FALSE(returned_before_commit); // ...and resolved only after COMMIT
+    REQUIRE(racing_result.has_value());
+    REQUIRE_FALSE(racing_result->has_value()); // no secret was minted for the racer
+    CHECK(racing_result->error() == AuthDBError::CredentialChanged);
+    CHECK(h.secret_is_null("vic")); // no provisional secret survives the reset
+
+    // The victim's own enrolment works normally afterwards (no false refusal)...
+    auto victim = h.db->mfa_init_enrollment("vic", "Yuzu", std::nullopt);
+    REQUIRE(victim.has_value());
+    const auto code = totp_now(victim->secret_base32);
+    // ...but not under the RETIRED credential (the login-bootstrap anchor).
+    // Checked first: once enrolled, every verify answers MfaAlreadyEnrolled.
+    auto via_old = h.db->mfa_verify_enrollment("vic", code, old_hash);
+    REQUIRE_FALSE(via_old.has_value());
+    CHECK(via_old.error() == AuthDBError::CredentialChanged);
+    auto via_settings = h.db->mfa_verify_enrollment("vic", code, std::nullopt);
+    REQUIRE(via_settings.has_value());
+    CHECK(h.db->mfa_status("vic")->enrolled);
+}
+
+TEST_CASE("password routes: a Settings MFA verify queued behind a reset is CredentialChanged, "
+          "never an enrolment (F4)",
+          "[pg][rest][password][mfa]") {
+    PasswordRoutesHarness h;
+    h.wire();
+    h.as_admin("rootA");
+    h.seed("vic", kOld, Role::user);
+    auto init = h.db->mfa_init_enrollment("vic", "Yuzu", std::nullopt);
+    REQUIRE(init.has_value());
+    const auto code = totp_now(init->secret_base32);
+
+    std::optional<std::expected<std::vector<std::string>, AuthDBError>> during;
+    std::atomic<bool> fired{false};
+    bool waiter_seen = false;
+    std::jthread racer; // joined on every exit path
+    h.owner.set_pre_commit_hook_for_test([&] {
+        if (fired.exchange(true))
+            return;
+        racer = std::jthread(
+            [&] { during = h.db->mfa_verify_enrollment("vic", code, std::nullopt); });
+        waiter_seen = yuzu::test::wait_for_pg_lock_waiter(
+            h.db.dsn(), "%UPDATE auth.users SET mfa_enrolled_at%");
+    });
+    auto res = h.reset("vic", kNew);
+    if (racer.joinable())
+        racer.join();
+    h.owner.set_pre_commit_hook_for_test(nullptr); // after the join
+    REQUIRE(fired);
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    CHECK(waiter_seen);
+    REQUIRE(during.has_value());
+    REQUIRE_FALSE(during->has_value());
+    CHECK(during->error() == AuthDBError::CredentialChanged); // not a WriteFailed/503
+    CHECK_FALSE(h.db->mfa_status("vic")->enrolled);
+    CHECK(h.scalar("SELECT count(*) FROM auth.mfa_recovery_codes WHERE username = 'vic'") == "0");
+}
+
+TEST_CASE("password routes: a /login enrolment bootstrap queued behind a reset of its password is "
+          "a uniform 401 with no secret and no pending token (F4)",
+          "[pg][rest][password][mfa]") {
+    // mfa_enforcement=required, an un-enrolled victim, /login with the OLD
+    // password. To land the bootstrap's mint INSIDE the reset's transaction the
+    // login is first parked AFTER its password check (incl. the row-locked
+    // re-check) on a table lock only its MFA status read touches
+    // (auth.mfa_recovery_codes); the reset's pre-commit hook releases it and
+    // waits until the mint queues on the reset's row lock.
+    PasswordRoutesHarness h(/*lockout_threshold=*/0, /*login_audit_to_store=*/true);
+    h.wire();
+    h.auth_routes->register_routes(h.sink);
+    h.cfg.mfa_enforcement = "required"; // cfg_ is held by reference
+    h.auth_routes->set_mfa_pending_cap_for_test(1); // a leftover pending entry is observable
+    h.as_admin("rootA");
+    h.seed("vic", kOld, Role::user);
+    h.seed("probe", kOld, Role::user);
+
+    yuzu::server::pg::PgConn locker{PQconnectdb(h.db.dsn().c_str())};
+    REQUIRE(PQstatus(locker.get()) == CONNECTION_OK);
+    auto run = [&](const char* sql) {
+        yuzu::server::pg::PgResult r{PQexec(locker.get(), sql)};
+        return r.ok();
+    };
+    REQUIRE(run("BEGIN"));
+    REQUIRE(run("LOCK TABLE auth.mfa_recovery_codes IN ACCESS EXCLUSIVE MODE"));
+
+    std::unique_ptr<httplib::Response> login;
+    std::atomic<bool> fired{false};
+    bool released = false;
+    bool mint_waiter_seen = false;
+    std::jthread racer([&] {
+        login = h.sink.Post("/login", "username=vic&password=" + std::string(kOld),
+                            "application/x-www-form-urlencoded");
+    });
+    const bool parked = yuzu::test::wait_for_pg_lock_waiter(h.db.dsn(), "%mfa_recovery_codes%");
+    h.owner.set_pre_commit_hook_for_test([&] {
+        if (fired.exchange(true))
+            return;
+        released = run("ROLLBACK");
+        mint_waiter_seen = yuzu::test::wait_for_pg_lock_waiter(
+            h.db.dsn(), "%UPDATE auth.users SET mfa_totp_secret%");
+    });
+    auto res = h.reset("vic", kNew);
+    if (!fired)
+        (void)run("ROLLBACK"); // never leave the login parked
+    if (racer.joinable())
+        racer.join();
+    h.owner.set_pre_commit_hook_for_test(nullptr); // after the join
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    CHECK(parked);
+    CHECK(released);
+    CHECK(mint_waiter_seen);
+
+    // END STATE: the uniform /login 401, nothing revealed, nothing stored.
+    REQUIRE(login);
+    INFO("login=" << login->status << " " << login->body);
+    CHECK(login->status == 401);
+    CHECK(login->body.find("mfa_pending_token") == std::string::npos);
+    CHECK(login->body.find("secret_base32") == std::string::npos);
+    CHECK(login->get_header_value("Set-Cookie").empty());
+    CHECK(h.secret_is_null("vic"));
+    const bool login_failed = h.committed("auth.login_failed", "vic") > 0;
+    bool enroll_cc = false;
+    for (const auto& r : h.store_rows())
+        enroll_cc = enroll_cc || (r.action == "mfa.enroll.failed" && r.result == "error" &&
+                                  r.target_id == "vic" && r.detail == "credential_changed");
+    CHECK((login_failed || enroll_cc));
+    // The rendezvous above is deterministic, so it is the F4 refusal that fired.
+    CHECK(enroll_cc);
+    // mfa_pending_ is empty: with the cap at 1, another enforced login still
+    // gets its enrolment challenge (a leftover entry would load-shed it, 503).
+    auto probe = h.sink.Post("/login", "username=probe&password=" + std::string(kOld),
+                             "application/x-www-form-urlencoded");
+    REQUIRE(probe);
+    CHECK(probe->status == 202);
 }
 
 TEST_CASE("password routes: self change for an account with no row answers wrong_current",
@@ -1172,14 +1380,14 @@ TEST_CASE("password routes: admin reset wipes a provisional TOTP secret (F1)",
     h.wire();
     h.as_admin();
     h.seed("pend", kOld, Role::user);
-    auto s1 = h.db->mfa_init_enrollment("pend", "Yuzu");
+    auto s1 = h.db->mfa_init_enrollment("pend", "Yuzu", std::nullopt);
     REQUIRE(s1.has_value());
     auto res = h.reset("pend", kNew);
     REQUIRE(res);
     REQUIRE(res->status == 200);
     CHECK(data_of(*res)["provisional_mfa_cleared"] == true);
     CHECK_FALSE(h.db->mfa_status("pend")->enrolled);
-    auto s2 = h.db->mfa_init_enrollment("pend", "Yuzu");
+    auto s2 = h.db->mfa_init_enrollment("pend", "Yuzu", std::nullopt);
     REQUIRE(s2.has_value());
     CHECK(s1->secret_base32 != s2->secret_base32);
 }
@@ -1484,18 +1692,19 @@ TEST_CASE("password routes: two concurrent admin resets, the second's audit faul
     constexpr const char* kB = "admin-b-password-789";
 
     std::unique_ptr<httplib::Response> resA;
-    std::thread admin_a;
+    std::jthread admin_a; // joined on every exit path
     std::atomic<bool> fired{false};
     h.owner.set_pre_commit_hook_for_test([&] {
         if (fired.exchange(true))
             return;
-        admin_a = std::thread([&] { resA = h.reset_with_cookie(tokA, "vic", kA); });
+        admin_a = std::jthread([&] { resA = h.reset_with_cookie(tokA, "vic", kA); });
         std::this_thread::sleep_for(std::chrono::milliseconds(400)); // A queues on the row lock
     });
     auto resB = h.reset_with_cookie(tokB, "vic", kB);
-    h.owner.set_pre_commit_hook_for_test(nullptr);
+    if (admin_a.joinable())
+        admin_a.join();
+    h.owner.set_pre_commit_hook_for_test(nullptr); // after the join
     REQUIRE(fired);
-    admin_a.join();
     REQUIRE(resB);
     REQUIRE(resA);
     INFO("B=" << resB->status << " " << resB->body);
@@ -1526,18 +1735,19 @@ TEST_CASE("password routes: a victim's self-change then a faulted admin reset �
     constexpr const char* kA = "admin-a-password-012";
 
     std::unique_ptr<httplib::Response> resA;
-    std::thread admin_a;
+    std::jthread admin_a; // joined on every exit path
     std::atomic<bool> fired{false};
     h.owner.set_pre_commit_hook_for_test([&] {
         if (fired.exchange(true))
             return;
-        admin_a = std::thread([&] { resA = h.reset_with_cookie(tokA, "vic", kA); });
+        admin_a = std::jthread([&] { resA = h.reset_with_cookie(tokA, "vic", kA); });
         std::this_thread::sleep_for(std::chrono::milliseconds(400));
     });
     auto resSelf = h.change_with_cookie(*tokVic, kOld, kSelf);
-    h.owner.set_pre_commit_hook_for_test(nullptr);
+    if (admin_a.joinable())
+        admin_a.join();
+    h.owner.set_pre_commit_hook_for_test(nullptr); // after the join
     REQUIRE(fired);
-    admin_a.join();
     REQUIRE(resSelf);
     REQUIRE(resA);
     INFO("self=" << resSelf->status << " " << resSelf->body);
@@ -1549,6 +1759,72 @@ TEST_CASE("password routes: a victim's self-change then a faulted admin reset �
     CHECK_FALSE(h.password_works("vic", kA));
     CHECK(h.committed("user.password_change", "vic") == 1);
     CHECK(h.committed("user.password_reset", "vic") == 0);
+}
+
+TEST_CASE("password routes: a lock held on the audit table never stalls unrelated session writes "
+          "(chaos R18 inverted, T1')",
+          "[pg][rest][password][audit]") {
+    // #5342 Gate 8 iteration 3 (T1'). A second connection holds ACCESS
+    // EXCLUSIVE on audit_store.audit_events, so the reset's audit INSERT waits
+    // (and finally times out). The owner takes the fleet-shared
+    // session_store.session_meta row only AFTER that INSERT, so an UNRELATED
+    // account's session create and revoke complete promptly meanwhile. Before
+    // T1' the bump preceded the INSERT and both stalled for the owner's whole
+    // lock_timeout (~4 s).
+    PasswordRoutesHarness h;
+    h.wire();
+    h.as_admin("rootA");
+    h.seed("vic", kOld, Role::user);
+    h.seed("other", kOld, Role::user);
+    REQUIRE_FALSE(h.auth_mgr.create_local_session_for_test("other", Role::user, false).empty());
+    const auto h0 = h.stored_hash("vic");
+
+    yuzu::server::pg::PgConn locker{PQconnectdb(h.db.dsn().c_str())};
+    REQUIRE(PQstatus(locker.get()) == CONNECTION_OK);
+    auto run = [&](const char* sql) {
+        yuzu::server::pg::PgResult r{PQexec(locker.get(), sql)};
+        return r.ok();
+    };
+    REQUIRE(run("BEGIN"));
+    REQUIRE(run("LOCK TABLE audit_store.audit_events IN ACCESS EXCLUSIVE MODE"));
+
+    using Clock = std::chrono::steady_clock;
+    std::unique_ptr<httplib::Response> resV;
+    bool owner_waiting = false;
+    std::int64_t create_ms = -1;
+    std::int64_t revoke_ms = -1;
+    std::string tok2;
+    bool revoked_ok = false;
+    {
+        std::jthread tv([&] { resV = h.reset("vic", kNew); }); // joined on every exit path
+        owner_waiting = yuzu::test::wait_for_pg_lock_waiter(h.db.dsn(), "%INSERT INTO audit_store%");
+        auto t0 = Clock::now();
+        tok2 = h.auth_mgr.create_local_session_for_test("other", Role::user, false);
+        create_ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - t0).count();
+        t0 = Clock::now();
+        revoked_ok = h.auth_mgr.invalidate_user_sessions("other").db_persisted;
+        revoke_ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - t0).count();
+        // Keep the audit table locked until the reset gives up on it.
+        tv.join();
+    }
+    CHECK(run("ROLLBACK"));
+
+    INFO("create_ms=" << create_ms << " revoke_ms=" << revoke_ms);
+    CHECK(owner_waiting);
+    CHECK_FALSE(tok2.empty());
+    CHECK(revoked_ok);
+    CHECK(create_ms < 500);
+    CHECK(revoke_ms < 500);
+    REQUIRE(resV);
+    INFO("reset=" << resV->status << " " << resV->body);
+    CHECK(resV->status == 503);
+    CHECK(resV->get_header_value("Sec-Audit-Failed") == "true");
+    CHECK(h.has_audit("user.password_reset", "error", "audit_unavailable"));
+    CHECK(h.stored_hash("vic") == h0);
+    CHECK(h.committed("user.password_reset", "vic") == 0);
+    CHECK(h.password_works("vic", kOld));
 }
 
 TEST_CASE("password routes: the literal /me route wins over the {name} regex",
