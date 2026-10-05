@@ -156,7 +156,12 @@ config page), or fully unattended —
 `installers\YuzuAgentSetup-<v>.exe /VERYSILENT /SUPPRESSMSGBOXES /SERVER=<GATEWAY_HOST>:50051 /TOKEN=<TOKEN> /LOG=<path>`
 (the installer takes the gateway address as `/SERVER=`, not only the GUI page).
 Keep `/LOG=`: without it Setup writes no log, and the log is the only record of
-why an unattended install failed and what it did about the service.
+why an unattended install failed and what it did about the service. The log also
+records the enrollment token: Setup writes its whole command line, including the
+`/TOKEN=` value, and the service command line it registers. Tokens can be reused,
+so write the log where only Administrators and SYSTEM can read it, and restrict or
+delete it after the deployment; deployment tools (SCCM's AppEnforce.log, Intune)
+record the command line too.
 Service name `YuzuAgent`.
 If a silent install exits with code **7** and its `/LOG=` log says "The update
 trust-anchor directory is not secured", the installer refused to continue
