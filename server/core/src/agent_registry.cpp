@@ -2215,9 +2215,10 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
     // (see guardian_health_fleet_tags.hpp).
     for (const auto& m : kGuardianHealthMetrics)
         metrics.clear_gauge_family(m.gauge);
-    // #5403: the pending-Spark-Disarm AGE family (MAX). Same rule: the writer emits the tag
-    // only while a Disarm is pending, so a fleet with none pending must read ABSENT, and a
-    // stale series from a sweep that did have one must not outlive it.
+    // #5403, #4472: the Spark claim AGE family (MAX): the pending-Disarm age and the
+    // outstanding-compensation age. Same rule: the writer emits each tag only while one
+    // Disarm (or one compensating teardown) is pending, so a fleet with none pending must read
+    // ABSENT, and a stale series from a sweep that did have one must not outlive it.
     for (const auto& m : kGuardianHealthAgeMetrics)
         metrics.clear_gauge_family(m.gauge);
     // rung 9c PR-3: the arm-ledger re-statable-gauge pair (Decision 1) and the
@@ -2788,7 +2789,8 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
         }
         if (health_reported_any)
             ++gh_reporting;
-        // #5403: the pending-Disarm age, MAX accumulate. Same parse and the same
+        // #5403, #4472: the claim ages (pending Disarm, outstanding compensation), MAX
+        // accumulate. Same parse and the same
         // reject-not-clamp posture as the journal age family: a forged value above the
         // plausibility ceiling is counted in gh_tag_rejected, never allowed to own the
         // fleet MAX. DELIBERATELY not fed into health_reported_any/gh_reporting: that

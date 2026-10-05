@@ -1618,9 +1618,12 @@ public:
     /// #4472 hardening: the synchronous spdlog warns (a pending Disarm past
     /// kDisarmPendingObserveThreshold, a compensating teardown past its deadline, and one
     /// summary line when the per-pass cap, kDisarmPendingWarnsPerPass, left some unwarned)
-    /// run LAST, after claim_cv_ is notified and every refill / Disarm is dispatched. The
-    /// latch and counter for each are set under the lock first, so a warn that is skipped
-    /// or fails never loses the once-per-claim count.
+    /// run LAST, after claim_cv_ is notified and every refill / Disarm is dispatched, so a
+    /// slow log sink delays no dispatch or waiter wake-up; the warns still run under the
+    /// caller's locks (off registry_mu_, but under GuardianEngine's mtx_ on the heartbeat
+    /// thread when reached from the drain tick), at most 10 per pass. The latch and counter
+    /// for each are set under the lock first, so a warn that is skipped or fails never loses
+    /// the once-per-claim count.
     std::size_t expire_overdue_claims();
     /// #5403: the same pass against a caller-supplied steady_clock reading. The zero-arg form
     /// is this with steady_clock::now(); a test passes a later `now` to age claims without

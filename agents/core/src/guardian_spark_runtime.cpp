@@ -835,10 +835,21 @@ std::vector<std::string> GuardianSparkRuntime::invariant_violations_for_test(
         if (!keys_.contains(*key))
             out.push_back("rule '" + rule_id + "' maps to a key absent from keys_");
     }
-    // #4472 tripwire (arch-1): compensation_finished=true is written in the SAME critical
-    // section as the pop (or the dispatch -> Queued double-fault hand-back), so a claim that
-    // ever owed a compensation (deadline set) and now reads finished must not still be a
-    // Dispatched / Dispatching head. See is_wedge_k_eligible_locked's invariant comment.
+    // #4472 tripwire: compensation_finished=true is written in the SAME critical section as
+    // the pop (or the dispatch -> Queued double-fault hand-back), so a claim that ever owed a
+    // compensation (deadline set) and now reads finished must not still be a Dispatched /
+    // Dispatching head. See is_wedge_k_eligible_locked's invariant comment.
+    //
+    // Which writer legs the tripwire test drives: the normal finalize pop, finalize's catch
+    // when the claim already carries an outcome (the pop), and the direct-disarm fallback.
+    // NOT driven (no clean fault seam reaches them): the dispatch -> Queued hand-back, in
+    // finalize_arm_compensation's catch and in on_arm_complete's inline double-fault catch,
+    // which leaves a no-outcome claim Queued with finished=true and the deadline still set.
+    // Known false positive for that undriven leg: once such a claim is re-driven it reads
+    // Dispatched again with finished=true, which is a legitimate in-flight state this clause
+    // would flag. The clause is deliberately NOT narrowed (for example to require an outcome)
+    // because that would stop it catching a finished=true written early on a claim that has no
+    // outcome yet. Whoever adds a test that drives the hand-back must refine the clause then.
     for (const auto& [key, entry] : claims_)
         for (const auto& c : entry.fifo)
             if (c->compensation_finished &&
@@ -2304,7 +2315,7 @@ bool GuardianSparkRuntime::is_wedge_k_eligible_locked(
     // is compensation_finished, written in on_arm_complete's first critical section; NOT the
     // CompensationPermit, which is engaged for every in-flight arm (a genuinely hung arm
     // included) and would disable K for all of them.
-    // INVARIANT (arch-1, #4472): once a compensation was owed, compensation_finished=true is
+    // INVARIANT (#4472): once a compensation was owed, compensation_finished=true is
     // always written in the SAME registry_mu_ critical section as the pop of that claim (or the
     // dispatch -> Queued double-fault hand-back in finalize_arm_compensation's catch), never
     // alone. So a claim that reads finished here with its teardown behind it is already gone
@@ -2532,7 +2543,7 @@ std::size_t GuardianSparkRuntime::reap_stranded_claims_locked(
                 now >= c->compensation_deadline) {
                 c->compensation_deadline_observed = true;
                 compensation_deadline_elapsed_.fetch_add(1, std::memory_order_relaxed);
-                // #4472 hardening (sre-4): the latch and the counter above are set BEFORE
+                // #4472 hardening: the latch and the counter above are set BEFORE
                 // this copy, so a failed copy only drops the warn. One record per claim (the
                 // latch is once-only); the warn itself is emitted off-lock by the caller.
                 if (warns.compensations.size() >= kDisarmPendingWarnsPerPass) {
@@ -2797,9 +2808,14 @@ GuardianSparkRuntime::expire_overdue_claims_impl(std::chrono::steady_clock::time
         dispatch_arm_off_lock(key, refill);
     for (auto& d : disarms)
         submit_disarm_off_lock(d); // takes registry_mu_ itself
-    // #4472 hardening (safe-4): the synchronous warns run LAST, after the waiters are woken
-    // and every refill / Disarm has been dispatched, so a slow log sink can delay nothing
-    // that matters. Each is contained: a logging failure must never escape the reaper.
+    // #4472 hardening: the synchronous warns run LAST, after the waiters are woken and every
+    // refill / Disarm has been dispatched, so a slow log sink delays no dispatch or waiter
+    // wake-up. It is not free: the production caller reaches this from the heartbeat-cadence
+    // drain, so the warns still run under GuardianEngine's mtx_ on the heartbeat thread (off
+    // registry_mu_). One pass issues at most 10 warns (the Disarm and compensation warns, each
+    // capped at kDisarmPendingWarnsPerPass = 4, plus one summary line for each), and each claim
+    // warns once because of its latch; the production logger is async. Each warn is contained:
+    // a logging failure must never escape the reaper.
     for (const auto& w : warns.disarms) {
         try {
             spdlog::warn("Guardian spark: the Disarm for key '{}' has been pending for {} s "
@@ -2816,10 +2832,11 @@ GuardianSparkRuntime::expire_overdue_claims_impl(std::chrono::steady_clock::time
     }
     if (warns.disarms_more != 0) {
         try {
-            spdlog::warn("Guardian spark: and {} more pending Disarms past the {} s observation "
+            spdlog::warn("Guardian spark: and {} more pending {} past the {} s observation "
                          "threshold this pass (counted in the disarm deadline total, not "
                          "logged individually)",
-                         warns.disarms_more, kDisarmPendingObserveThreshold.count());
+                         warns.disarms_more, warns.disarms_more == 1 ? "Disarm" : "Disarms",
+                         kDisarmPendingObserveThreshold.count());
         } catch (...) {
         }
     }
@@ -2840,10 +2857,12 @@ GuardianSparkRuntime::expire_overdue_claims_impl(std::chrono::steady_clock::time
     }
     if (warns.compensations_more != 0) {
         try {
-            spdlog::warn("Guardian spark: and {} more compensating teardowns past their "
-                         "deadline this pass (counted in the compensation deadline total, not "
-                         "logged individually)",
-                         warns.compensations_more);
+            spdlog::warn("Guardian spark: and {} more compensating {} past {} deadline this "
+                         "pass (counted in the compensation deadline total, not logged "
+                         "individually)",
+                         warns.compensations_more,
+                         warns.compensations_more == 1 ? "teardown" : "teardowns",
+                         warns.compensations_more == 1 ? "its" : "their");
         } catch (...) {
         }
     }

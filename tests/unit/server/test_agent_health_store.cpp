@@ -2681,7 +2681,7 @@ TEST_CASE("REAL AgentHealthStore: compensation deadline count sums across agents
     CHECK_FALSE(has_unlabelled_series(m2.serialize(), kCompElapsedGauge));
 }
 
-// ── Wire-format edge values of the health tag parse (UP-11 / con-7) ──────────────────────
+// ── Wire-format edge values of the health tag parse ──────────────────────
 //
 // Pinned for BOTH a SUM row (a #5404 counter) and an AGE row (the #5403 Disarm age): each goes
 // through the shared parse_guardian_health_count, but the two accumulate in different loops of
@@ -2733,12 +2733,13 @@ TEST_CASE("REAL AgentHealthStore: health tag wire-format edge values - sign / ra
             CHECK(unlabelled_series(out, "yuzu_fleet_guardian_health_tag_rejected") == 0.0);
         }
         {
-            // DELIBERATE, ACCEPTED behaviour (UP-11): an EMPTY value is skipped before the
+            // DELIBERATE, ACCEPTED behaviour: an EMPTY value is skipped before the
             // parse, so it is neither a report nor a rejection. The agent's emitters never write
             // an empty value (a zero counter writes NO tag, an absent age writes NO tag), so an
             // empty value can only come from a hand-forged heartbeat; it is therefore a no-op,
-            // not a signal. If this is ever tightened to count empties, change this test and
-            // the HELP text of yuzu_fleet_guardian_health_tag_rejected together.
+            // not a signal. The HELP text of yuzu_fleet_guardian_health_tag_rejected and
+            // metrics.md state this; if it is ever tightened to count empties, change this
+            // test, that HELP and metrics.md together.
             yuzu::server::detail::AgentHealthStore store;
             yuzu::MetricsRegistry metrics;
             disarm_beat(store, "empty", {{e.tag, ""}});

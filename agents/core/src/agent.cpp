@@ -77,6 +77,7 @@ __declspec(allocate(".CRT$XCB"))
 #include <unistd.h>      // gethostname
 #endif
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -2405,10 +2406,37 @@ public:
                         // session ships no rate until it has ≥2 readings again).
                         netq::RetransWindow hb_net_retrans_window;
                         // #4472 hardening: the Guardian heartbeat emit block below is
-                        // wrapped in one try/catch (the heartbeat loop has no enclosing
-                        // one); this latches its log line so a persistent fault warns once
-                        // per session, not once per tick.
-                        bool hb_guardian_emit_warned = false;
+                        // split into independently contained groups (the heartbeat loop
+                        // has no enclosing try/catch). One failure counter per group,
+                        // lambda-local (a reconnect starts again); the warn fires on the
+                        // 1st failure and every 100th after it, so a persistent fault
+                        // stays visible without unbounded log volume. The text passed in
+                        // is always a string literal: never tag keys, values or what().
+                        enum HbGuardianGroup : std::size_t {
+                            kHbGuardianMaintenance,
+                            kHbGuardianLegacySink,
+                            kHbGuardianGeneration,
+                            kHbGuardianTags,
+                            kHbGuardianSparkHealth,
+                            kHbGuardianGroupCount
+                        };
+                        std::array<std::uint64_t, kHbGuardianGroupCount> hb_guardian_failures{};
+                        auto hb_guardian_contain = [&hb_guardian_failures](
+                                                       HbGuardianGroup group,
+                                                       const char* message) noexcept {
+                            const auto n = ++hb_guardian_failures[group];
+                            if (n != 1 && n % 100 != 0)
+                                return;
+                            // The fault may be an allocation failure, so the warn is
+                            // itself contained: this handler must never re-open the
+                            // termination path it exists to close.
+                            try {
+                                spdlog::warn("{} (failure count {}; logged on the first "
+                                             "and every 100th failure)",
+                                             message, n);
+                            } catch (...) {
+                            }
+                        };
                         while (!should_stop()) {
                             // Sleep in small increments for responsive shutdown
                             auto remaining = cfg_.heartbeat_interval;
@@ -2547,11 +2575,24 @@ public:
                             // generation 0 — so an agent that has never received a
                             // push still converges once rules exist server-side.
                             if (guardian_) {
-                              // One try/catch around the whole Guardian emit block (#4472
-                              // hardening, safe-2): a bad_alloc / system_error from a
-                              // guardian accessor or a tag insert must never terminate
-                              // the heartbeat thread. A throw skips the rest of this tick's
-                              // Guardian tags; the next tick retries. Never logs tag text.
+                              // The Guardian emit block is four independently contained
+                              // groups (#4472 hardening): a bad_alloc / system_error from a
+                              // guardian accessor or a tag insert must never terminate the
+                              // heartbeat thread, and one failing group must not silence the
+                              // others. Order matters: A maintenance (each call in its own
+                              // try), B the generation tag (heartbeat_ingestion.cpp reads it
+                              // to decide whether to run the M5 missed-push reconcile, so it
+                              // must survive an A throw), C the older tags, D the newer
+                              // monitor-only gauges LAST so a fault in them cannot drop the
+                              // older signals. A throw skips only the rest of its own group
+                              // for this tick; the next tick retries. Never logs tag text.
+                              // None of this has a unit test (no fault-injection seam in the
+                              // heartbeat loop, and none was added for it): the log lines
+                              // and group boundaries are verified by reading.
+                              // Group A1: lifecycle-journal maintenance + ack drain.
+                              // What can throw: only the std::mutex lock inside
+                              // journal_maintenance_tick() (std::system_error); its own
+                              // persist and drain passes are firewalled internally.
                               try {
                                 // Drive durable lifecycle-journal maintenance on the
                                 // heartbeat cadence: retry any persist a prior write left
@@ -2562,6 +2603,17 @@ public:
                                 // an acknowledgment this tick produces is visible on THIS
                                 // heartbeat rather than one late.
                                 guardian_->journal_maintenance_tick();
+                              } catch (...) {
+                                  hb_guardian_contain(kHbGuardianMaintenance,
+                                                      "Guardian heartbeat journal maintenance "
+                                                      "failed (the maintenance tick was skipped "
+                                                      "this tick)");
+                              }
+                              // Group A2: legacy-sink kick. legacy_sink_kick() is declared
+                              // noexcept (a throw would std::terminate before reaching this
+                              // handler), so the try is provably dead today; it is kept so
+                              // the group structure survives that signature being relaxed.
+                              try {
                                 // #4783 commit 4: legacy-sink loss visibility. Deliberately
                                 // NOT inside journal_maintenance_tick()'s prefer_spark_ gate
                                 // (nor any other prefer_spark_ conditional in this block) -
@@ -2571,8 +2623,25 @@ public:
                                 // every heartbeat, not only when Spark is preferred. See
                                 // GuardianEngine::legacy_sink_kick()'s own doc comment.
                                 guardian_->legacy_sink_kick();
+                              } catch (...) {
+                                  hb_guardian_contain(kHbGuardianLegacySink,
+                                                      "Guardian heartbeat legacy-sink kick "
+                                                      "failed (the kick was skipped this tick)");
+                              }
+                              // Group B: the generation tag, in its own try so it survives a
+                              // group-A throw. What can throw: only the std::mutex lock in
+                              // policy_generation() (std::system_error) or the tag insert.
+                              try {
                                 tags["yuzu.guardian_generation"] =
                                     std::to_string(guardian_->policy_generation());
+                              } catch (...) {
+                                  hb_guardian_contain(kHbGuardianGeneration,
+                                                      "Guardian heartbeat generation tag failed "
+                                                      "(the generation tag was skipped this "
+                                                      "tick)");
+                              }
+                              // Group C: the older Guardian tags, emitted exactly as before.
+                              try {
                                 // Sparse durable-journal telemetry (item 7 PR-Ag §8): only
                                 // non-zero counters ship, so a quiescent / inert journal adds
                                 // no heartbeat tags.
@@ -2637,15 +2706,6 @@ public:
                                         // collect_guardian_spark_health_tags below)
                                         .legacy_sink_dropped_unwired =
                                             guardian_->legacy_sink_dropped_unwired()});
-                                // #5404 / #5403 / #4472: the Spark claim-lifecycle counters,
-                                // the retained-tombstone count and the two claim AGE gauges
-                                // (the pending-Disarm age and the outstanding-compensation
-                                // age; absent while nothing is pending, never a fabricated
-                                // 0). One helper, the ONE place this assembly lives
-                                // (guardian_health_heartbeat.hpp), so it is unit-tested and a
-                                // dropped call is a red test; never gated on prefer_spark_.
-                                yuzu::agent::collect_guardian_spark_health_tags(
-                                    *guardian_, tags, std::chrono::steady_clock::now());
                                 // F7 (#2298 rung 2): per-type CURRENT count of rules classified
                                 // Unsupported (neither backend enforces them) - fleet-loud via
                                 // mech_unsupported_total, sparse (0 omits its tag).
@@ -2658,17 +2718,28 @@ public:
                                 emit_guardian_backend_heartbeat_tag(
                                     tags, guardian_->prefer_spark(), guardian_->spark_availability());
                               } catch (...) {
-                                  // The fault may be an allocation failure, so the warn is
-                                  // itself contained: this handler must never re-open the
-                                  // termination path it exists to close.
-                                  if (!std::exchange(hb_guardian_emit_warned, true)) {
-                                      try {
-                                          spdlog::warn("Heartbeat Guardian tag emit failed; the "
-                                                       "remaining Guardian tags are skipped this "
-                                                       "tick (logged once per session)");
-                                      } catch (...) {
-                                      }
-                                  }
+                                  hb_guardian_contain(kHbGuardianTags,
+                                                      "Guardian heartbeat tag emit failed (the "
+                                                      "rest of the older Guardian tags were "
+                                                      "skipped this tick)");
+                              }
+                              // Group D (LAST): #5404 / #5403 / #4472: the Spark claim-
+                              // lifecycle counters, the retained-tombstone count and the two
+                              // claim AGE gauges (the pending-Disarm age and the
+                              // outstanding-compensation age; absent while nothing is
+                              // pending, never a fabricated 0). One helper, the ONE place
+                              // this assembly lives (guardian_health_heartbeat.hpp); a call
+                              // dropped INSIDE the helper is a red unit test, but deleting
+                              // THIS single call site is not caught by any test. Never gated
+                              // on prefer_spark_.
+                              try {
+                                yuzu::agent::collect_guardian_spark_health_tags(
+                                    *guardian_, tags, std::chrono::steady_clock::now());
+                              } catch (...) {
+                                  hb_guardian_contain(kHbGuardianSparkHealth,
+                                                      "Guardian heartbeat claim-health gauges "
+                                                      "failed (the claim-health tags were "
+                                                      "skipped this tick)");
                               }
                             }
 #if defined(_WIN32) || defined(__linux__) || defined(__APPLE__)

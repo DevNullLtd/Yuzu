@@ -949,7 +949,7 @@ flip, with a red-first test each:
   the fix; non-blocking today because `prefer_spark_=false`).** Every figure below is
   an estimate from reading the code, not a measurement (the rate measurement is the
   first follow-up listed after this bullet).
-  - (UP-1) **A compensating teardown that never returns now holds the whole
+  - (AC-1) **A compensating teardown that never returns now holds the whole
     generation.** Before the fix, K ended the re-push churn after three identical
     re-applies (roughly 75 to 90 s at one re-apply per 25 to 30 s; an estimate). That
     bound was removed deliberately: K's premise is that the arm is physically stuck,
@@ -962,8 +962,9 @@ flip, with a red-first test each:
     or less); each push is at least two Postgres reads (the policy generation and the
     rule list) and writes one `guaranteed_state.reconcile` audit row, kept for the
     default audit retention of 365 days. The server applies no per-agent backoff
-    while the agent's generation is unchanged; that absence, not the heartbeat, is the
-    real bound on the rate. The exposure is a fleet-correlated hold: N held agents
+    while the agent's generation is unchanged, so the push rate stays at that 25 s
+    minimum for as long as the hold lasts; the hold's duration is bounded only by the
+    teardown returning (or an agent restart). The exposure is a fleet-correlated hold: N held agents
     give about N/30 reconciles per second, so 10,000 held agents give about 333
     pushes/s, at least about 667 Postgres reads/s and about 333 audit rows/s (about
     28.8 million rows/day). Agent side, at R=100 rules and per push: R kv puts, about
@@ -980,7 +981,7 @@ flip, with a red-first test each:
     `guaranteed_state.reconcile` audit rows for one `agent_id`. Recovery is an agent
     restart (with `--spark-disable` if the stuck mechanism is the cause). The
     accept-or-recover decision belongs to the operator.
-  - (UP-3) **K's retry budget can be spent by the hold.** `begin_application`
+  - (AC-2) **K's retry budget can be spent by the hold.** `begin_application`
     inherits and saturates `reapply_count` for identical content during a hold, so a
     later fresh hung arm on the same sick mechanism is K-waived at its FIRST drain with
     zero retries, which leaves the rule unarmed under an acknowledged generation (the
@@ -989,38 +990,41 @@ flip, with a red-first test each:
     application was held by an outstanding compensation, to be taken together with
     #5459. The ack-ledger waiver path is CATASTROPHIC-tier, so it is deliberately not
     changed here.
-  - (UP-2) Many hung compensations do not scale the hold (one application, one gate)
+  - (AC-3) Many hung compensations do not scale the hold (one application, one gate)
     but they exhaust the class quota (File 4, Registry 3, Service 3): admission for
     that class is refused, its arms park and expire `CongestionExpired` (not
     K-eligible), and the whole class is dark until a slot is released.
-  - (UP-4) Residual K window: between the arm call returning and `on_arm_complete`'s
+  - (AC-4) Residual K window: between the arm call returning and `on_arm_complete`'s
     first lock the claim still reads K-eligible. Reaching it needs at least 3
-    re-applies (at least about 75 s of hang, an estimate). The fix narrows this window
+    re-applies (roughly 75 to 90 s of hang, an estimate). The fix narrows this window
     and does not close it, and no test seam exists for it.
-  - (UP-5) A same-rule re-push can return Reobserved on a compensating head, leaving
+  - (AC-5) A same-rule re-push can return Reobserved on a compensating head, leaving
     the rule unarmed for about 25 to 30 s after the claim is popped (an estimate); a
     DIFFERENT rule sharing the key is refused with `kSparkKeyWedged` ("spark key wedged"), which misattributes
     the cause in `wedged_refusals_`.
-  - (UP-8) Absence is not healthy: a blocked heartbeat thread gets the agent
+  - (AC-6) Absence is not healthy: a blocked heartbeat thread gets the agent
     stale-evicted, so the MAX age gauge reads absent exactly when the agent is stuck.
-  - (UP-10) A server restart loses `guardian_last_reconcile_`, so every held agent
+  - (AC-7) A server restart loses `guardian_last_reconcile_`, so every held agent
     reconciles on its first heartbeat after the restart.
-  - (UP-11) A forged value up to 1e9 owns a MAX gauge, and one agent can skew an
+  - (AC-8) A forged value up to 1e9 owns a MAX gauge, and one agent can skew an
     unlabelled fleet SUM; nothing consumes these gauges today. An EMPTY tag value is
     skipped before parsing and is not counted in `yuzu_fleet_guardian_health_tag_rejected`; accepted
     (the agent never emits an empty value).
-- **Follow-ups (to be filed; no issue numbers yet).** (1) CH-1: measure the held-hold
+- **Follow-ups (to be filed; no issue numbers yet).** (1) F-1: measure the held-hold
   push rate and the endpoint journal eviction during a held period (a flip
-  precondition, see UP-1). (2) CH-2: hang a full class quota of compensations, then
-  re-push, and confirm releasing one slot restores admission in one pass. (3) CH-4: a
-  pre-lock hook seam so the UP-4 window can be tested. (4) CH-5: measure the unarmed
-  interval of a same-rule re-push on a compensating head (UP-5). (5) CH-8: server tag
+  precondition, see AC-1). (2) F-2: hang a full class quota of compensations, then
+  re-push, and confirm releasing one slot restores admission in one pass. (3) F-3: a
+  pre-lock hook seam so the AC-4 window can be tested. (4) F-4: measure the unarmed
+  interval of a same-rule re-push on a compensating head (AC-5). (5) F-5: server tag
   trust under a scrape during `recompute_metrics`, a restart herd of held agents,
-  forged and malformed values, and mixed agent versions. (6) Commented alert
+  forged and malformed values, and mixed agent versions. (6) F-6: commented alert
   templates for the two age gauges and the compensation count (needs fleet data; routes
-  to `sre`). (7) A count companion gauge for the MAX age gauges (agents holding), so
+  to `sre`). (7) F-7: a count companion gauge for the MAX age gauges (agents holding), so
   "absent after a value" can be told apart from evicted, recovered or never held.
-  (8) A constexpr row-table refactor of the heartbeat emit blocks.
+  (8) F-8: a constexpr row-table refactor of the heartbeat emit blocks. (9) F-9: a sparse
+  fault-count heartbeat tag for the agent's Guardian emit groups (each group logs its
+  first failure and every 100th, but ships no metric, so a persistent fault is visible
+  only in the agent log).
 
 ## 4. #2340 scenario contract
 

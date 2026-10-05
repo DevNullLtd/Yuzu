@@ -14558,8 +14558,11 @@ TEST_CASE("#4472: compensation age is nullopt before, starts at the owed instant
     for (int i = 0; i < 6; ++i)
         f.rt->expire_overdue_claims_at_for_test(t_after + 200s + std::chrono::seconds(i));
     CHECK(f.rt->compensation_deadline_elapsed() == 1);
-    // The compensating head is an ARM claim, far past the 30 s Disarm threshold: the Disarm
-    // observation must not count it (the `kind != Disarm` clause; see establish_wedge).
+    // The compensating head is an ARM claim, far past the 30 s Disarm threshold, and the
+    // Disarm observation must not count it. Here the head already carries an outcome (the
+    // wedge's), so either the `outcome` clause or the `kind != Disarm` clause alone filters
+    // it: this assertion does not test the kind clause. Only establish_wedge's +31 s pass on
+    // a live Arm head (no outcome yet) does.
     CHECK(f.rt->disarm_deadline_elapsed() == 0);
     CHECK(f.rt->claim_queue_depth_for_test(f.key) == 1);
     CHECK(f.b->disarm_entries.load() == 1);
@@ -14597,9 +14600,10 @@ TEST_CASE("#4472: the direct disarm fallback inside a compensation is covered by
 }
 
 // ---------------------------------------------------------------------------
-// #4472 governance hardening round: tests added after review (qe-1..qe-4, safe-3, CH-3, CH-6,
-// arch-1, arch-7). Same rigs, same conventions: a synthetic `now` ages claims, nothing sleeps to
-// age one, every wait is event-polled.
+// #4472 governance hardening round: tests added after review (latch ordering, begin_stop with
+// a compensation outstanding, the stress case, the reapply_count characterization, the tripwire,
+// the owed-instant identity). Same rigs, same conventions: a synthetic `now` ages claims, nothing
+// sleeps to age one, every wait is event-polled.
 // ---------------------------------------------------------------------------
 
 TEST_CASE("#5403 hardening: the once-per-claim latch and counter precede the per-pass warn cap, "
@@ -14638,12 +14642,12 @@ TEST_CASE("#5403 hardening: the once-per-claim latch and counter precede the per
 TEST_CASE("#4472: begin_stop with a compensating disarm outstanding keeps the hung worker "
           "counted, releases no claim, and the accessors and passes do not throw",
           "[spark][runtime][liveness][4472]") {
-    // CH-6 / qe-4. The compensating head is a Dispatched ARM claim whose compensating disarm is
+    // The compensating head is a Dispatched ARM claim whose compensating disarm is
     // parked inside the backend. begin_stop() drops only QUEUED claims, so this head stays; the
     // F3 contract (the hung worker stays counted in active_backend_op_workers) is what lets the
     // process hard_exit rather than race teardown against it.
     //
-    // NOT tested, by design (UP closed-by-reading): "compensation age across a Queued
+    // NOT tested, by design (confirmed by reading the code): "compensation age across a Queued
     // hand-back". finalize_arm_compensation's catch hands a head back to Queued only when it
     // has NO outcome, and abandon_claim_locked always writes an early outcome for a wedge, so a
     // wedged claim's compensation can never take that arm; the cases a compensation CAN reach
@@ -14684,13 +14688,19 @@ TEST_CASE("#4472: begin_stop with a compensating disarm outstanding keeps the hu
 TEST_CASE("#4472 stress: accessors, the zero-arg expiry and aged expiry passes racing arms "
           "that complete and compensate on workers stay consistent and leak nothing",
           "[spark][runtime][liveness][4472][stress]") {
-    // safe-3. Until now the heartbeat-cadence accessors were only ever read while workers were
+    // Until now the heartbeat-cadence accessors were only ever read while workers were
     // PARKED. Here the test thread reads them (and runs the zero-arg production expiry plus an
     // aged pass that abandons in-flight arms) continuously while a driver thread repeatedly
     // starts arms on workers, withdraws their rules mid-flight, and lets the late successes
     // return, so each one is compensated by a worker. Event-driven throughout (a keyed arm gate
     // and a drain poll); no sleep ages anything; bounded rounds. Meant for the TSan run
     // (filter [stress]); every Catch2 assertion stays on this thread.
+    //
+    // Deterministic overlap: before the driver starts, ONE compensation is held outstanding on a
+    // separate (Registry) key by hanging its compensating disarm. It stays outstanding for the
+    // whole racing phase, so EVERY read of oldest_outstanding_compensation_age must report an
+    // owed age (asserted below); without it, whether a read landed mid-compensation would be
+    // pure timing.
     using RT = GuardianSparkRuntime;
     using namespace std::chrono_literals;
     auto r = std::make_shared<FakeReader>();
@@ -14703,6 +14713,23 @@ TEST_CASE("#4472 stress: accessors, the zero-arg expiry and aged expiry passes r
         paths.push_back("/s" + std::to_string(i));
         keys.push_back(spark_key(file_spec(paths.back())));
         rids.push_back("s" + std::to_string(i));
+    }
+    // The held compensation (see above): a Registry key, so its hung compensating disarm
+    // occupies a Registry class slot and never competes with the driver's File arms.
+    const auto held_spec = reg_spec("HKLM", "Software\\yuzu_test_stress_held");
+    const auto held_key = spark_key(held_spec);
+    {
+        auto held_gate = b->park_next_arm_for_key(held_key);
+        auto res = rt->attach_rule(RT::NonWaiting{}, "held", held_spec,
+                                   registry_rule("held", "v", "1"), true);
+        REQUIRE(res.has_value());
+        REQUIRE(res->kind == RT::ArmOutcomeKind::Accepted);
+        REQUIRE(held_gate->wait_entered(10s));
+        rt->detach_rule("held"); // withdrawn while its arm is in flight: the late success is owed
+        b->hang_next_disarm.store(true);
+        held_gate->release(); // the late success returns; its compensating disarm hangs
+        REQUIRE(b->wait_entered_disarm_hang(10s));
+        REQUIRE(rt->oldest_outstanding_compensation_age(clk::now()).has_value());
     }
     std::atomic<bool> done{false};
     // 0 = ok; otherwise the first failing step (1 attach, 2 arm never entered, 3 claim never drained).
@@ -14754,6 +14781,7 @@ TEST_CASE("#4472 stress: accessors, the zero-arg expiry and aged expiry passes r
         GuardianSparkRuntime& rt;
         ~Cleanup() {
             backend.release_all_key_gates();
+            backend.release_disarm_hang(); // the held compensation, if a REQUIRE left it parked
             backend.arm_park.open();
             backend.disarm_park.open();
             if (driver.joinable())
@@ -14764,11 +14792,12 @@ TEST_CASE("#4472 stress: accessors, the zero-arg expiry and aged expiry passes r
     } cleanup{driver, *b, *rt};
 
     std::uint64_t iters = 0;
-    std::uint64_t observed_owed = 0;
+    std::uint64_t reads_without_owed_age = 0;
     while (!done.load(std::memory_order_acquire) || iters < 50) {
         const auto now = clk::now();
-        if (rt->oldest_outstanding_compensation_age(now).has_value())
-            ++observed_owed;
+        // The held compensation is outstanding for the whole loop, so this read can never miss.
+        if (!rt->oldest_outstanding_compensation_age(now).has_value())
+            ++reads_without_owed_age;
         (void)rt->oldest_pending_disarm_age(now);
         (void)rt->retained_tombstones();
         (void)rt->compensation_deadline_elapsed();
@@ -14787,7 +14816,14 @@ TEST_CASE("#4472 stress: accessors, the zero-arg expiry and aged expiry passes r
     INFO("driver step code (round*10 + 1 attach / 2 arm never entered / 3 claim never drained): "
          << driver_error.load());
     REQUIRE(driver_error.load() == 0);
-    (void)observed_owed; // informational only: whether a read landed mid-compensation is timing
+    // Every read overlapped the held compensation (and the accessors, the zero-arg pass and the
+    // aged passes all ran against it without popping it).
+    CHECK(reads_without_owed_age == 0);
+    CHECK(rt->claim_queue_depth_for_test(held_key) == 1);
+
+    // Release the held compensation: its teardown finishes and the claim pops.
+    b->release_disarm_hang();
+    REQUIRE(yuzu::test::spin_until([&] { return rt->claim_queue_depth_for_test(held_key) == 0; }, 10s));
 
     // Nothing leaked: every subscription any arm produced was disarmed, no rule or claim is left,
     // and the registry invariants (including the compensation tripwire) hold.
@@ -14798,13 +14834,13 @@ TEST_CASE("#4472 stress: accessors, the zero-arg expiry and aged expiry passes r
     auto disarmed = b->disarmed_ids();
     std::sort(armed.begin(), armed.end());
     std::sort(disarmed.begin(), disarmed.end());
-    CHECK(armed.size() == static_cast<std::size_t>(kKeys * kRounds));
+    CHECK(armed.size() == static_cast<std::size_t>(kKeys * kRounds + 1)); // +1: the held one
     CHECK(armed == disarmed);
     CHECK_FALSE(rt->oldest_outstanding_compensation_age(clk::now()).has_value());
     CHECK(rt->invariant_violations_for_test(/*allow_orphans=*/true).empty());
 }
 
-TEST_CASE("#4472 characterization (ACCEPTED COST, UP-3): reapply_count saturated by a compensation "
+TEST_CASE("#4472 characterization (ACCEPTED COST): reapply_count saturated by a compensation "
           "hold is inherited, so a fresh hung arm after the hold is K-waived at its FIRST drain",
           "[spark][runtime][liveness][4472][characterization]") {
     // This pins an accepted cost of the #4472 fix, it does not endorse it as desirable:
@@ -14847,12 +14883,13 @@ TEST_CASE("#4472 characterization (ACCEPTED COST, UP-3): reapply_count saturated
 TEST_CASE("#4472 tripwire: compensation_finished is written with the pop, never alone (normal "
           "finalize, finalize's publish throwing, and the direct-disarm fallback)",
           "[spark][runtime][liveness][4472][tripwire]") {
-    // arch-1. The invariant (see is_wedge_k_eligible_locked's comment): a claim that owed a
+    // The invariant (see is_wedge_k_eligible_locked's comment): a claim that owed a
     // compensation and now reads compensation_finished is not still a Dispatched/Dispatching
     // head. invariant_violations_for_test carries the clause; this drives each path that writes
-    // finished=true and checks it holds throughout. The dispatch -> Queued double-fault
-    // hand-back (publish AND the recovery both throwing) has no clean seam and is not driven;
-    // it is the one writer the clause is written to catch if a future change breaks it.
+    // finished=true with a pop and checks it holds throughout. The dispatch -> Queued
+    // double-fault hand-back (publish AND the recovery both throwing) has no clean seam and is
+    // not driven; invariant_violations_for_test's comment records that leg and the false
+    // positive the clause would give on a re-driven hand-back claim.
     using namespace std::chrono_literals;
     PostK4472Rig f;
     f.establish_wedge();
@@ -14892,7 +14929,7 @@ TEST_CASE("#4472 tripwire: compensation_finished is written with the pop, never 
 TEST_CASE("#4472: the compensation owed instant is compensation_deadline minus "
           "cfg.backend_op_deadline, for a non-default deadline too",
           "[spark][runtime][liveness][4472][compensation-age]") {
-    // arch-7. The age scan derives the owed instant as compensation_deadline -
+    // The age scan derives the owed instant as compensation_deadline -
     // cfg_.backend_op_deadline instead of storing a second timestamp, which couples the gauge to
     // how the guard builds the deadline (on_arm_complete's CompensationOwedMark: now() +
     // cfg_.backend_op_deadline, once). Pin the identity against a deadline that is NOT the rig's

@@ -278,8 +278,10 @@ void emit_guardian_health_age_tags(TagMap& tags, const GuardianHealthAgeStats& s
 /// The ONE place the heartbeat assembles the Guardian Spark claim-lifecycle tags (#5404, #5403,
 /// #4472): the sparse counters (including the engine-owned ack_maint_exceptions, filled by
 /// `eng.spark_claim_health_stats()`) and the two age gauges. agent.cpp's heartbeat and the unit
-/// tests both call it, so a dropped or swapped call is one red test rather than a silently-dead
-/// gauge. A template over the engine type so this header stays free of the engine's includes;
+/// tests both call it, so a call dropped or swapped INSIDE this helper is a red test rather than
+/// a silently-dead gauge. The single call SITE in agent.cpp has no unit test: deleting that one
+/// call is not caught by any test (the heartbeat loop is not unit-drivable), so it relies on
+/// review. A template over the engine type so this header stays free of the engine's includes;
 /// the real engine is GuardianEngine. `now` is the reading both ages are measured against
 /// (steady_clock::now() in production; a test passes a later one to age a claim without
 /// sleeping). Each engine call takes the engine's own locks; heartbeat cadence only.
