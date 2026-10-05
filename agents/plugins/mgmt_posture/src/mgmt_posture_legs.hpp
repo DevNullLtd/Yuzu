@@ -113,18 +113,21 @@ inline void report_posture(yuzu::CommandContext& ctx, const Posture& p) {
 using LegFn = int (*)(yuzu::CommandContext&);
 
 /// The WHOLE body of the plugin's execute(): dispatch and the single ABI containment.
-/// Status-row contract: exactly one per dispatch on every path but one. A leg that throws
-/// AFTER report_posture already wrote its row (allocation failure while emitting data rows)
-/// gets the catch arm's `unsupported` row appended, so the LAST status row wins -- the same
-/// documented behaviour as update_source_trust_legs.hpp. The recovery itself allocates, so
-/// it is guarded too: if it throws as well, the dispatch returns 1 (a failed command)
-/// rather than unwinding across the plugin ABI.
+/// Status-row contract: one status row per dispatch, with three exceptions. (1) An unknown
+/// action writes ONE non-status line (`unknown action: <name>`, the name made valid UTF-8 and
+/// escaped like every other caller-supplied value) and returns 1: no status row. (2) A leg that
+/// throws AFTER report_posture already wrote its row (allocation failure while emitting data
+/// rows) gets the catch arm's `unsupported` row appended, so there are TWO and the LAST status
+/// row wins -- the same documented behaviour as update_source_trust_legs.hpp. (3) The recovery
+/// itself allocates, so it is guarded too: if it throws as well, no status row is added and the
+/// dispatch returns 1 (a failed command) rather than unwinding across the plugin ABI.
 inline int execute_posture(yuzu::CommandContext& ctx, std::string_view action, LegFn leg,
                            std::string_view leg_exception_token) {
     try {
         if (action != "posture") {
             ctx.write_output(std::string{"unknown action: "} +
-                             yuzu::util::safe_output_field(action));
+                             yuzu::util::safe_output_field(
+                                 yuzu::util::sanitize_utf8(std::string{action})));
             return 1;
         }
         return leg(ctx);

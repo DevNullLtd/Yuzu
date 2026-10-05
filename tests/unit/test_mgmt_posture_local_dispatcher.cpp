@@ -245,6 +245,18 @@ TEST_CASE("mgmt_posture execute seam: unknown action is escaped; a throwing leg 
     REQUIRE(hrows.size() == 1);
     CHECK(hrows[0] == "unknown action: no\\|such/");
 
+    // ... and it is made valid UTF-8 first (a protobuf string field must be), exactly as
+    // posture_row does for its values: an invalid byte becomes '?', a valid sequence survives.
+    const auto binary = dispatcher.run(&throwing, "bad\xff!");
+    CHECK(binary.rc == 1);
+    const auto brows = captured_rows(binary.captured);
+    REQUIRE(brows.size() == 1);
+    CHECK(brows[0] == "unknown action: bad?!");
+    const auto accented = dispatcher.run(&throwing, "caf\xc3\xa9");
+    const auto arows = captured_rows(accented.captured);
+    REQUIRE(arows.size() == 1);
+    CHECK(arows[0] == "unknown action: caf\xc3\xa9");
+
     YuzuPluginDescriptor denied{};
     denied.execute = &seam_execute<&denied_leg>;
     const auto d = dispatcher.run(&denied, "posture");
