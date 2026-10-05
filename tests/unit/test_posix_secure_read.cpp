@@ -144,8 +144,10 @@ TEST_CASE("posix_secure_read: ScopedDir is move-only and move-assign releases th
     a.dir = std::move(b.dir);  // closes a's old directory, takes b's
     CHECK(a.dir.fd() == b_fd);
     CHECK(b.dir.fd() < 0);
-    CHECK(::fcntl(a_fd, F_GETFD) == -1);
-    CHECK(errno == EBADF);
+    const int closed_rc = ::fcntl(a_fd, F_GETFD);
+    const int closed_errno = errno;
+    CHECK(closed_rc == -1);
+    CHECK(closed_errno == EBADF);
 }
 
 TEST_CASE("posix_secure_read: symlink to directory at the leaf is refused", "[shared][posix_secure_read]") {

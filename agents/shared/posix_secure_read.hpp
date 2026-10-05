@@ -37,7 +37,8 @@
  * forms to confine. Both reject, with err = EINVAL before any syscall, a path
  * holding a NUL byte (it would silently open the prefix) and a path ending in
  * '/' or '/.' (the kernel follows a symlink leaf named that way, defeating
- * O_NOFOLLOW); the single path "/" is allowed.
+ * O_NOFOLLOW); the single path "/" is allowed. A caller that holds a root
+ * with a trailing separator must strip it first.
  *
  * Blocking: open and read carry no deadline of their own, so a path on a dead
  * hard network mount can pin the calling worker (#4875 tracks the host-level
