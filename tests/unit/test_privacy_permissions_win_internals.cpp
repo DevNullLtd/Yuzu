@@ -57,6 +57,7 @@ static_assert(!std::is_copy_constructible_v<FindHandle>);
 static_assert(!std::is_copy_constructible_v<LocalFreeGuard>);
 static_assert(!std::is_copy_constructible_v<StabilityWatch>);
 static_assert(!std::is_copy_constructible_v<Win32Registry>);
+static_assert(!std::is_copy_constructible_v<Win32HiveFileProbe>);
 
 namespace {
 
@@ -168,6 +169,13 @@ struct HiveCleanup {
     }
     ~HiveCleanup() { run(); }
 };
+
+/// A guard over the real Win32 probe, with the run budget's deadline injected.
+win::HiveFileGuard make_guard(Win32HiveFileProbe& probe, win::RetentionBudget& budget,
+                              std::string sid) {
+    return win::HiveFileGuard{probe, [&budget] { return budget.expired(); }, std::move(sid),
+                              std::nullopt};
+}
 
 const RawGrant* find(const std::vector<RawGrant>& v, std::string_view app, std::string_view cat) {
     for (const auto& g : v)
@@ -337,51 +345,59 @@ TEST_CASE("privacy_permissions win: HiveFileGuard checks the deadline before any
     SECTION("an expired deadline is refused as `timeout` with no file opened") {
         win::RetentionBudget budget;
         budget.deadline = std::chrono::steady_clock::now() - std::chrono::seconds{1};
-        HiveFileGuard guard{budget, sid, 0, std::nullopt};
+        Win32HiveFileProbe probe;
+        auto guard = make_guard(probe, budget, sid);
         CHECK(guard.before_load(file.wstring()) == "timeout");
-        CHECK(guard.opens == 0);
+        CHECK(probe.opens == 0);
         CHECK(budget.timed_out); // the side effect assemble_windows_rows relies on to end the run
     }
     SECTION("a regular file owned by the calling user is accepted, and its identity re-verifies") {
         win::RetentionBudget budget;
-        HiveFileGuard guard{budget, sid, 0, std::nullopt};
+        Win32HiveFileProbe probe;
+        auto guard = make_guard(probe, budget, sid);
         CHECK(guard.before_load(file.wstring()) == "");
         CHECK(guard.after_load(file.wstring()) == "");
     }
     SECTION("a doubled separator before the file name is still the same path") {
         win::RetentionBudget budget;
-        HiveFileGuard guard{budget, sid, 0, std::nullopt};
+        Win32HiveFileProbe probe;
+        auto guard = make_guard(probe, budget, sid);
         const std::wstring doubled = dir.wstring() + L"\\\\hive.bin";
         CHECK(guard.before_load(doubled) == "");
     }
     SECTION("a directory is not a regular file") {
         win::RetentionBudget budget;
-        HiveFileGuard guard{budget, sid, 0, std::nullopt};
+        Win32HiveFileProbe probe;
+        auto guard = make_guard(probe, budget, sid);
         CHECK(guard.before_load(dir.wstring()) == "hive_not_regular");
     }
     SECTION("a missing file is a stat failure carrying the Win32 code") {
         win::RetentionBudget budget;
-        HiveFileGuard guard{budget, sid, 0, std::nullopt};
+        Win32HiveFileProbe probe;
+        auto guard = make_guard(probe, budget, sid);
         CHECK(guard.before_load((dir / "missing.bin").wstring()) == "hive_stat_failed:win32_2");
     }
     SECTION("a path deeper than kMaxHivePathDepth is refused before any syscall") {
         win::RetentionBudget budget;
-        HiveFileGuard guard{budget, sid, 0, std::nullopt};
+        Win32HiveFileProbe probe;
+        auto guard = make_guard(probe, budget, sid);
         std::wstring deep = dir.wstring().substr(0, 3); // the drive root of a fixed disk
         for (std::size_t i = 0; i < win::kMaxHivePathDepth; ++i) deep += L"d\\";
         deep += L"NTUSER.DAT"; // kMaxHivePathDepth directories + the leaf = one over
         CHECK(guard.before_load(deep) == "hive_path_too_deep");
-        CHECK(guard.opens == 0);
+        CHECK(probe.opens == 0);
     }
     SECTION("a UNC path is refused before any syscall") {
         win::RetentionBudget budget;
-        HiveFileGuard guard{budget, sid, 0, std::nullopt};
+        Win32HiveFileProbe probe;
+        auto guard = make_guard(probe, budget, sid);
         CHECK(guard.before_load(L"\\\\server\\share\\NTUSER.DAT") == "hive_path_unc");
-        CHECK(guard.opens == 0);
+        CHECK(probe.opens == 0);
     }
     SECTION("a different file at the same path after the load is hive_identity_changed") {
         win::RetentionBudget budget;
-        HiveFileGuard guard{budget, sid, 0, std::nullopt};
+        Win32HiveFileProbe probe;
+        auto guard = make_guard(probe, budget, sid);
         REQUIRE(guard.before_load(file.wstring()) == "");
         const fs::path other = dir / "other.bin";
         { std::ofstream(other, std::ios::binary) << "regf"; }
@@ -391,7 +407,8 @@ TEST_CASE("privacy_permissions win: HiveFileGuard checks the deadline before any
     }
     SECTION("after_load with no before_load snapshot refuses") {
         win::RetentionBudget budget;
-        HiveFileGuard guard{budget, sid, 0, std::nullopt};
+        Win32HiveFileProbe probe;
+        auto guard = make_guard(probe, budget, sid);
         CHECK(guard.after_load(file.wstring()) == "hive_identity_changed");
     }
 }
@@ -422,10 +439,11 @@ TEST_CASE("privacy_permissions win: HiveFileGuard refuses a drive that is not a 
     }
     if (!letter) SKIP("every drive letter is mapped: no DRIVE_NO_ROOT_DIR root to refuse");
     win::RetentionBudget budget;
-    HiveFileGuard guard{budget, synthetic_sid(), 0, std::nullopt};
+    Win32HiveFileProbe probe;
+    auto guard = make_guard(probe, budget, synthetic_sid());
     CHECK(guard.before_load(std::wstring{letter} + L":\\Users\\x\\NTUSER.DAT") ==
           "hive_path_not_fixed");
-    CHECK(guard.opens == 0);
+    CHECK(probe.opens == 0);
 }
 
 TEST_CASE("privacy_permissions win: HiveFileGuard refuses a symlinked ancestor and a reparse-point "
@@ -447,17 +465,20 @@ TEST_CASE("privacy_permissions win: HiveFileGuard refuses a symlinked ancestor a
 
     SECTION("a directory symlink anywhere on the path is a reparse ancestor") {
         win::RetentionBudget budget;
-        HiveFileGuard guard{budget, sid, 0, std::nullopt};
+        Win32HiveFileProbe probe;
+        auto guard = make_guard(probe, budget, sid);
         CHECK(guard.before_load((link / "hive.bin").wstring()) == "hive_path_reparse_ancestor");
     }
     SECTION("a directory symlink as the leaf is a reparse point") {
         win::RetentionBudget budget;
-        HiveFileGuard guard{budget, sid, 0, std::nullopt};
+        Win32HiveFileProbe probe;
+        auto guard = make_guard(probe, budget, sid);
         CHECK(guard.before_load(link.wstring()) == "hive_reparse_point");
     }
     SECTION("a file symlink as the leaf is a reparse point") {
         win::RetentionBudget budget;
-        HiveFileGuard guard{budget, sid, 0, std::nullopt};
+        Win32HiveFileProbe probe;
+        auto guard = make_guard(probe, budget, sid);
         CHECK(guard.before_load(file_link.wstring()) == "hive_reparse_point");
     }
 }
@@ -478,7 +499,8 @@ TEST_CASE("privacy_permissions win: HiveFileGuard refuses a hive file over the s
         REQUIRE(SetEndOfFile(h.h));
     }
     win::RetentionBudget budget;
-    HiveFileGuard guard{budget, own_sid_string(), 0, std::nullopt};
+    Win32HiveFileProbe probe;
+    auto guard = make_guard(probe, budget, own_sid_string());
     CHECK(guard.before_load(hd.file.wstring()) == "hive_oversized");
 }
 
@@ -489,7 +511,8 @@ TEST_CASE("privacy_permissions win: HiveFileGuard refuses a reparse-point or har
     const std::string sid = own_sid_string();
     const fs::path log1 = hd.dir / "hive.bin.LOG1"; // `<hive file name>.LOG1`, as the kernel names it
     win::RetentionBudget budget;
-    HiveFileGuard guard{budget, sid, 0, std::nullopt};
+    Win32HiveFileProbe probe;
+    auto guard = make_guard(probe, budget, sid);
 
     SECTION("a regular sidecar is what the kernel creates: accepted") {
         { std::ofstream(log1, std::ios::binary) << "log"; }
@@ -534,7 +557,8 @@ TEST_CASE("privacy_permissions win: HiveFileGuard reads the owner from the file,
         rc != ERROR_SUCCESS)
         SKIP("cannot set the fixture file's owner to S-1-5-19 (win32 " << rc << ")");
     win::RetentionBudget budget;
-    HiveFileGuard guard{budget, synthetic_sid(), 0, std::nullopt};
+    Win32HiveFileProbe probe;
+    auto guard = make_guard(probe, budget, synthetic_sid());
     CHECK(guard.before_load(hd.file.wstring()) == "hive_owner_unexpected");
 }
 

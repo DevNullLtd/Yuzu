@@ -849,6 +849,12 @@ TEST_CASE("win::classify_hive_file: a stock hive is accepted; each refusal fires
         CHECK(token(cloud) == "hive_not_resident");
         cloud.is_directory = true; // not_regular is decided first
         CHECK(token(cloud) == "hive_not_regular");
+        auto placeholder = stock(); // not_resident outranks the owner, redirect and size refusals
+        placeholder.not_resident = true;
+        placeholder.owner_sid = "S-1-5-21-1-2-3-1002";
+        placeholder.final_path_matches = false;
+        placeholder.size = win::kMaxHiveBytes + 1;
+        CHECK(token(placeholder) == "hive_not_resident");
         auto own = stock();
         own.owner_sid = "S-1-5-21-1-2-3-1002";
         CHECK(token(own) == "hive_owner_unexpected");

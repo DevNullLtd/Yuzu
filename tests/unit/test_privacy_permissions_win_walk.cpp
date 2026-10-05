@@ -8,6 +8,7 @@
  */
 #include <catch2/catch_test_macros.hpp>
 
+#include "privacy_permissions_hive_guard.hpp"
 #include "privacy_permissions_win_walk.hpp"
 
 #include <algorithm>
@@ -397,4 +398,209 @@ TEST_CASE("win walk: an enumeration of exactly the cap is complete (one probe); 
     CHECK(over.verdict.outcome == win::EnumOutcome::truncated);
     REQUIRE(win::enum_failure("packaged", over.verdict).has_value());
     CHECK(win::enum_failure("packaged", over.verdict)->cause == "packaged_enum_truncated");
+}
+
+// ── hive-file guard over a fake probe ───────────────────────────────────
+
+namespace {
+
+const std::string kProfileSid = "S-1-5-21-1-2-3-1001";
+const std::wstring kHivePath = L"C:\\Users\\alice\\NTUSER.DAT";
+
+struct FakeHiveFileProbe final : win::HiveFileProbe {
+    std::uint32_t drive = win::kDriveFixed;
+    std::map<std::wstring, std::uint32_t> dir_attrs; // by ancestor path; default: a plain directory
+    long dir_rc = 0;
+    win::LeafFacts leaf;
+    long leaf_rc = 0;
+    std::vector<win::SidecarEntry> sidecars;
+    long list_rc = 0;
+    std::uint32_t sidecar_links = 1, sidecar_attrs = 0;
+    long sidecar_rc = 0;
+    std::size_t dir_calls = 0, leaf_calls = 0, list_calls = 0, sidecar_calls = 0;
+
+    FakeHiveFileProbe() {
+        leaf.owner_sid = kProfileSid;
+        leaf.id = {7, {1, 2, 3}};
+    }
+    std::uint32_t drive_type(const std::wstring&) override { return drive; }
+    long path_attributes(const std::wstring& path, std::uint32_t& attrs) override {
+        ++opens;
+        ++dir_calls;
+        const auto it = dir_attrs.find(path);
+        attrs = it == dir_attrs.end() ? win::kFileAttributeDirectory : it->second;
+        return dir_rc;
+    }
+    long leaf_facts(const std::wstring&, win::LeafFacts& out) override {
+        ++opens;
+        ++leaf_calls;
+        out = leaf;
+        return leaf_rc;
+    }
+    long list_sidecars(const std::wstring&, const std::wstring&, std::size_t limit,
+                       std::vector<win::SidecarEntry>& out) override {
+        ++list_calls;
+        for (const auto& e : sidecars)
+            if (out.size() < limit) out.push_back(e);
+        return list_rc;
+    }
+    long sidecar_facts(const std::wstring&, std::uint32_t& links, std::uint32_t& attrs) override {
+        ++opens;
+        ++sidecar_calls;
+        links = sidecar_links;
+        attrs = sidecar_attrs;
+        return sidecar_rc;
+    }
+};
+
+struct GuardRig {
+    FakeHiveFileProbe probe;
+    bool expired = false;
+    win::HiveFileGuard guard{probe, [this] { return expired; }, kProfileSid, std::nullopt};
+    std::string before(const std::wstring& path = kHivePath) { return guard.before_load(path); }
+};
+
+win::SidecarEntry sidecar(const wchar_t* name, std::uint32_t find_attrs = 0) {
+    return {name, find_attrs};
+}
+
+} // namespace
+
+TEST_CASE("hive guard: the injected deadline is checked first; UNC, depth and drive refusals make "
+          "no probe call",
+          "[privacy_permissions][win_walk]") {
+    GuardRig r;
+    SECTION("an expired deadline: `timeout`, no probe call at all") {
+        r.expired = true;
+        CHECK(r.before() == "timeout");
+        CHECK(r.probe.opens == 0);
+        CHECK(r.probe.list_calls == 0);
+    }
+    SECTION("a UNC path") {
+        CHECK(r.before(L"\\\\server\\share\\NTUSER.DAT") == "hive_path_unc");
+        CHECK(r.probe.opens == 0);
+    }
+    SECTION("deeper than kMaxHivePathDepth") {
+        std::wstring deep = L"C:\\";
+        for (std::size_t i = 0; i < win::kMaxHivePathDepth; ++i) deep += L"d\\";
+        deep += L"NTUSER.DAT";
+        CHECK(r.before(deep) == "hive_path_too_deep");
+        CHECK(r.probe.opens == 0);
+    }
+    SECTION("a drive that is not fixed") {
+        r.probe.drive = 4; // DRIVE_REMOTE
+        CHECK(r.before() == "hive_path_not_fixed");
+        CHECK(r.probe.opens == 0);
+    }
+    SECTION("a stock file is accepted") { CHECK(r.before().empty()); }
+}
+
+TEST_CASE("hive guard: attribute bits map to facts -- the not_resident mask, never SPARSE",
+          "[privacy_permissions][win_walk]") {
+    CHECK(win::kFileAttributeDirectory == 0x10);
+    CHECK(win::kFileAttributeReparsePoint == 0x400);
+    CHECK(win::kFileAttributeOffline == 0x1000);
+    CHECK(win::kFileAttributeRecallOnOpen == 0x40000);
+    CHECK(win::kFileAttributeRecallOnDataAccess == 0x400000);
+    win::HiveFileFacts f;
+    win::apply_attributes(win::kFileAttributeReparsePoint | win::kFileAttributeDirectory, f);
+    CHECK(f.is_reparse);
+    CHECK(f.is_directory);
+    CHECK_FALSE(f.not_resident);
+
+    GuardRig r;
+    for (const std::uint32_t bit : {win::kFileAttributeOffline, win::kFileAttributeRecallOnOpen,
+                                    win::kFileAttributeRecallOnDataAccess}) {
+        r.probe.leaf.attributes = bit;
+        CHECK(r.before() == "hive_not_resident");
+    }
+    r.probe.leaf.attributes = 0x200; // FILE_ATTRIBUTE_SPARSE_FILE: a resident file can be sparse
+    CHECK(r.before().empty());
+}
+
+TEST_CASE("hive guard: a sidecar is refused from the listing, again from its opened handle, and "
+          "when hard-linked -- in listing order",
+          "[privacy_permissions][win_walk]") {
+    GuardRig r;
+    r.probe.sidecars = {sidecar(L"NTUSER.DAT.LOG1")};
+
+    SECTION("the listing says regular, the opened handle says reparse point") {
+        r.probe.sidecar_attrs = win::kFileAttributeReparsePoint;
+        CHECK(r.before() == "hive_sidecar_reparse");
+        CHECK(r.probe.sidecar_calls == 1);
+    }
+    SECTION("the listing says reparse point: the sidecar is never opened") {
+        r.probe.sidecars = {sidecar(L"NTUSER.DAT.LOG1", win::kFileAttributeReparsePoint)};
+        CHECK(r.before() == "hive_sidecar_reparse");
+        CHECK(r.probe.sidecar_calls == 0);
+    }
+    SECTION("a hard-linked sidecar") {
+        r.probe.sidecar_links = 2;
+        CHECK(r.before() == "hive_sidecar_hardlinked");
+    }
+    SECTION("more than kMaxHiveSidecars: refused, with no probe past the cap") {
+        r.probe.sidecars.assign(win::kMaxHiveSidecars + 1, sidecar(L"NTUSER.DAT.LOGx"));
+        CHECK(r.before() == "hive_sidecar_count");
+        CHECK(r.probe.sidecar_calls == win::kMaxHiveSidecars);
+    }
+    SECTION("a sidecar that cannot be opened carries its Win32 code") {
+        r.probe.sidecar_rc = 5;
+        CHECK(r.before() == "hive_stat_failed:win32_5");
+    }
+    SECTION("a regular, single-link sidecar is fine") { CHECK(r.before().empty()); }
+}
+
+TEST_CASE("hive guard: an entry decided before a listing failure outranks it; a failure alone "
+          "is reported",
+          "[privacy_permissions][win_walk]") {
+    GuardRig r;
+    r.probe.list_rc = 5;
+    SECTION("regular, then a reparse entry, then the listing failed: the reparse decides") {
+        r.probe.sidecars = {sidecar(L"NTUSER.DAT.LOG1"),
+                            sidecar(L"NTUSER.DAT.LOG2", win::kFileAttributeReparsePoint)};
+        CHECK(r.before() == "hive_sidecar_reparse");
+    }
+    SECTION("one healthy entry, then the listing failed: the failure is reported") {
+        r.probe.sidecars = {sidecar(L"NTUSER.DAT.LOG1")};
+        CHECK(r.before() == "hive_stat_failed:win32_5");
+    }
+    SECTION("the listing failed with no entry: the failure is reported") {
+        CHECK(r.before() == "hive_stat_failed:win32_5");
+    }
+    SECTION("no failure and no entries: accepted") {
+        r.probe.list_rc = 0;
+        CHECK(r.before().empty());
+    }
+}
+
+TEST_CASE("hive guard: an ancestor reparse point is refused hop by hop, the identity is "
+          "re-verified after the load, and stat failures carry their code",
+          "[privacy_permissions][win_walk]") {
+    GuardRig r;
+    SECTION("the second hop is a reparse point: the leaf is never probed") {
+        r.probe.dir_attrs[L"C:\\Users\\alice"] = win::kFileAttributeReparsePoint;
+        CHECK(r.before() == "hive_path_reparse_ancestor");
+        CHECK(r.probe.dir_calls == 2);
+        CHECK(r.probe.leaf_calls == 0);
+    }
+    SECTION("an ancestor that cannot be opened carries its code") {
+        r.probe.dir_rc = 3;
+        CHECK(r.before() == "hive_stat_failed:win32_3");
+    }
+    SECTION("the leaf cannot be read") {
+        r.probe.leaf_rc = 2;
+        CHECK(r.before() == "hive_stat_failed:win32_2");
+    }
+    SECTION("the same file after the load re-verifies; a different one does not") {
+        REQUIRE(r.before().empty());
+        CHECK(r.guard.after_load(kHivePath).empty());
+        r.probe.leaf.id.file_id[0] = 9;
+        CHECK(r.guard.after_load(kHivePath) == "hive_identity_changed");
+        r.probe.leaf.id.file_id[0] = 1;
+        r.probe.leaf.id.volume_serial = 8;
+        CHECK(r.guard.after_load(kHivePath) == "hive_identity_changed");
+    }
+    SECTION("no snapshot from before_load: refused") {
+        CHECK(r.guard.after_load(kHivePath) == "hive_identity_changed");
+    }
 }

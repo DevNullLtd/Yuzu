@@ -22,9 +22,11 @@
  * its own handle (not a reparse point, a regular disk file, owner = the profile / LocalSystem /
  * Administrators, final path == requested path, size cap) and the `<leaf>*` transaction-log
  * sidecars beside it (a link there would be followed by the load) are refused if a
- * reparse point or hard-linked, or if there are more than 64. RegLoadKeyW is path-based, so the same
- * file identity is re-verified after the load and a mismatch is unloaded unread
- * (`hive_identity_changed`). Residual: the kernel parses whatever the path resolved to in that
+ * reparse point (from the directory listing and again from the opened handle) or hard-linked, or
+ * if there are more than 64. The guard's logic is privacy_permissions_hive_guard.hpp's
+ * HiveFileGuard over a HiveFileProbe, implemented here by Win32HiveFileProbe. RegLoadKeyW is
+ * path-based, so the same file identity is re-verified after the load and a mismatch is unloaded
+ * unread (`hive_identity_changed`). Residual: the kernel parses whatever the path resolved to in that
  * window, as it does for every `reg load`; a sidecar swapped in after its check is likewise open.
  *
  * STABILITY: a RegNotifyChangeKeyValue watch is armed on each ConsentStore root before its walk
@@ -81,6 +83,7 @@
  * (see the PR description); nothing in this file is claimed measured beyond that.
  */
 #include "privacy_permissions_legs.hpp"
+#include "privacy_permissions_hive_guard.hpp"
 #include "privacy_permissions_win_parsers.hpp"
 #include "privacy_permissions_win_walk.hpp"
 
@@ -126,6 +129,12 @@ static_assert(win::kRegQword == REG_QWORD);
 static_assert(win::kDriveFixed == DRIVE_FIXED);
 static_assert(win::kWaitObject0 == WAIT_OBJECT_0);
 static_assert(win::kWaitTimeout == WAIT_TIMEOUT);
+static_assert(win::kFileAttributeDirectory == FILE_ATTRIBUTE_DIRECTORY);
+static_assert(win::kFileAttributeReparsePoint == FILE_ATTRIBUTE_REPARSE_POINT);
+static_assert(win::kFileAttributeOffline == FILE_ATTRIBUTE_OFFLINE);
+static_assert(win::kFileAttributeRecallOnOpen == FILE_ATTRIBUTE_RECALL_ON_OPEN);
+static_assert(win::kFileAttributeRecallOnDataAccess == FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS);
+static_assert(sizeof(win::FileId::file_id) == sizeof(FILE_ID_128));
 
 /// Arms a RegNotifyChangeKeyValue watch on a ConsentStore root before the walk and polls it
 /// (zero timeout) after, so a change the API reports during the read is SHOWN, not assumed away.
@@ -265,21 +274,16 @@ struct LocalFreeGuard {
                                 TRUE) == CSTR_EQUAL;
 }
 
-[[nodiscard]] std::string stat_failed(unsigned long code) {
-    return "hive_stat_failed:win32_" + std::to_string(code);
+/// A failing call's code as the seam reports it: never 0 (success), even if the call left no
+/// last-error behind.
+[[nodiscard]] long failure_code(DWORD gle) noexcept {
+    return gle != 0 ? static_cast<long>(gle) : static_cast<long>(ERROR_GEN_FAILURE);
 }
 
-/// Verifies the NTUSER.DAT an offline load is about to use (the OfflineHiveFileCheck hooks).
-/// Every fact comes from an opened HANDLE. RegLoadKeyW has no handle-relative form, so the load
-/// is by path and the SAME FILE_ID_INFO is re-verified from a fresh attribute-only handle after
-/// it. Residual: the kernel parses whatever the path resolved to in that window (every
-/// `reg load` carries it); swapping the path needs write access to the profile directory.
-struct HiveFileGuard {
-    win::RetentionBudget& budget;
-    std::string profile_sid;
-    std::size_t opens = 0; // CreateFileW calls made (a test proves the deadline-first order)
-    std::optional<FILE_ID_INFO> snapshot;
-
+/// The OS side of the hive-file seam (privacy_permissions_hive_guard.hpp): each method is the
+/// Win32 sequence for one question the guard asks, nothing more. The unit tests drive HiveFileGuard
+/// through a fake probe; the rig tests drive it through this one.
+struct Win32HiveFileProbe final : win::HiveFileProbe {
     UniqueHandle open_attr(const std::wstring& path, DWORD access) {
         ++opens;
         return UniqueHandle{CreateFileW(path.c_str(), access,
@@ -289,38 +293,47 @@ struct HiveFileGuard {
                                         nullptr)};
     }
 
-    /// Fills the leaf facts and file identity from `path`'s attribute-only handle; "" or a token.
-    std::string read_leaf(const std::wstring& path, win::HiveFileFacts& f, FILE_ID_INFO& id) {
+    std::uint32_t drive_type(const std::wstring& root) override {
+        return GetDriveTypeW(root.c_str());
+    }
+
+    long path_attributes(const std::wstring& path, std::uint32_t& attrs) override {
+        const UniqueHandle dir = open_attr(path, FILE_READ_ATTRIBUTES);
+        if (!dir.ok()) return failure_code(GetLastError());
+        FILE_ATTRIBUTE_TAG_INFO tag{};
+        if (!GetFileInformationByHandleEx(dir.h, FileAttributeTagInfo, &tag, sizeof tag))
+            return failure_code(GetLastError());
+        attrs = tag.FileAttributes;
+        return 0;
+    }
+
+    long leaf_facts(const std::wstring& path, win::LeafFacts& out) override {
         const UniqueHandle leaf = open_attr(path, FILE_READ_ATTRIBUTES | READ_CONTROL);
-        if (!leaf.ok()) return stat_failed(GetLastError());
+        if (!leaf.ok()) return failure_code(GetLastError());
 
         FILE_ATTRIBUTE_TAG_INFO tag{};
         if (!GetFileInformationByHandleEx(leaf.h, FileAttributeTagInfo, &tag, sizeof tag))
-            return stat_failed(GetLastError());
-        f.is_reparse = (tag.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
-        f.is_directory = (tag.FileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
-        f.is_disk_file = GetFileType(leaf.h) == FILE_TYPE_DISK;
-        f.not_resident = (tag.FileAttributes & (FILE_ATTRIBUTE_OFFLINE |
-                                                FILE_ATTRIBUTE_RECALL_ON_OPEN |
-                                                FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS)) != 0;
+            return failure_code(GetLastError());
+        out.attributes = tag.FileAttributes;
+        out.is_disk_file = GetFileType(leaf.h) == FILE_TYPE_DISK;
 
         BY_HANDLE_FILE_INFORMATION info{};
-        if (!GetFileInformationByHandle(leaf.h, &info)) return stat_failed(GetLastError());
-        f.size = (static_cast<std::uint64_t>(info.nFileSizeHigh) << 32) | info.nFileSizeLow;
+        if (!GetFileInformationByHandle(leaf.h, &info)) return failure_code(GetLastError());
+        out.size = (static_cast<std::uint64_t>(info.nFileSizeHigh) << 32) | info.nFileSizeLow;
 
         PSID owner = nullptr;
         PSECURITY_DESCRIPTOR sd = nullptr;
         if (const DWORD rc = GetSecurityInfo(leaf.h, SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION,
                                              &owner, nullptr, nullptr, nullptr, &sd);
             rc != ERROR_SUCCESS)
-            return stat_failed(rc);
+            return failure_code(rc);
         const LocalFreeGuard sd_guard{sd}; // `owner` points into it: alive until this scope ends
         LPWSTR sid_str = nullptr;
         const BOOL converted = ConvertSidToStringSidW(owner, &sid_str);
         const LocalFreeGuard sid_guard{sid_str};
         // The return value is evaluated before the guards run, so GetLastError is read first.
-        if (!converted) return stat_failed(GetLastError());
-        f.owner_sid = yuzu::win::from_wide(sid_str);
+        if (!converted) return failure_code(GetLastError());
+        out.owner_sid = yuzu::win::from_wide(sid_str);
 
         std::wstring fin(MAX_PATH, L'\0');
         DWORD n = GetFinalPathNameByHandleW(leaf.h, fin.data(), static_cast<DWORD>(fin.size()),
@@ -332,30 +345,28 @@ struct HiveFileGuard {
         }
         // n >= size is a sizing result (the path grew between the two calls), not an API failure:
         // GetLastError is stale then, so name the documented "buffer still too small" code.
-        if (n == 0 || n >= fin.size()) return stat_failed(n == 0 ? GetLastError() : ERROR_MORE_DATA);
+        if (n == 0 || n >= fin.size())
+            return n == 0 ? failure_code(GetLastError()) : static_cast<long>(ERROR_MORE_DATA);
         fin.resize(n);
-        f.final_path_matches = final_path_matches(path, fin);
+        out.final_path_matches = final_path_matches(path, fin);
 
+        FILE_ID_INFO id{};
         if (!GetFileInformationByHandleEx(leaf.h, FileIdInfo, &id, sizeof id))
-            return stat_failed(GetLastError());
-        return {};
+            return failure_code(GetLastError());
+        out.id.volume_serial = id.VolumeSerialNumber;
+        std::memcpy(out.id.file_id.data(), &id.FileId, sizeof id.FileId);
+        return 0;
     }
 
-    /// Fills the sidecar facts from the `<leaf>*` entries of `dir` (the kernel's transaction-log
-    /// sidecars: `<hive>.LOG1`, `<hive>{guid}.TM.blf`, ...; RegLoadKeyW opens or creates them
-    /// following any link, so a link there is not safe to follow for a SYSTEM caller).
-    /// A reparse point is read from the find data (no open); a hard link needs an attribute-only
-    /// open. A sidecar that does not exist is fine. "" or a token.
-    std::string read_sidecars(const std::wstring& dir, const std::wstring& leaf,
-                              win::HiveFileFacts& f) {
+    long list_sidecars(const std::wstring& dir, const std::wstring& leaf, std::size_t limit,
+                       std::vector<win::SidecarEntry>& out) override {
         const std::wstring base = dir.ends_with(L'\\') ? dir : dir + L"\\";
         WIN32_FIND_DATAW fd{};
         const FindHandle find{FindFirstFileExW((base + leaf + L"*").c_str(), FindExInfoBasic, &fd,
                                                FindExSearchNameMatch, nullptr, 0)};
         if (!find.ok()) {
             const DWORD rc = GetLastError();
-            return (rc == ERROR_FILE_NOT_FOUND || rc == ERROR_NO_MORE_FILES) ? std::string{}
-                                                                             : stat_failed(rc);
+            return (rc == ERROR_FILE_NOT_FOUND || rc == ERROR_NO_MORE_FILES) ? 0 : failure_code(rc);
         }
         do {
             const std::wstring name = fd.cFileName;
@@ -363,89 +374,25 @@ struct HiveFileGuard {
                 CompareStringOrdinal(name.c_str(), static_cast<int>(name.size()), leaf.c_str(),
                                      static_cast<int>(leaf.size()), TRUE) == CSTR_EQUAL)
                 continue;
-            if (++f.sidecar_count > win::kMaxHiveSidecars) return {}; // classify_hive_file refuses
-            if (fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) {
-                f.sidecar_reparse = true;
-                return {};
-            }
-            const UniqueHandle h = open_attr(base + name, FILE_READ_ATTRIBUTES);
-            if (!h.ok()) return stat_failed(GetLastError());
-            BY_HANDLE_FILE_INFORMATION info{};
-            if (!GetFileInformationByHandle(h.h, &info)) return stat_failed(GetLastError());
-            if (info.nNumberOfLinks > 1) {
-                f.sidecar_hardlinked = true;
-                return {};
-            }
+            out.push_back({name, fd.dwFileAttributes});
+            if (out.size() >= limit) return 0;
         } while (FindNextFileW(find.h, &fd));
         const DWORD rc = GetLastError();
-        return rc == ERROR_NO_MORE_FILES ? std::string{} : stat_failed(rc);
+        return rc == ERROR_NO_MORE_FILES ? 0 : failure_code(rc);
     }
 
-    std::string before_load(const std::wstring& path) {
-        // FIRST: the deadline (after the lock wait and privilege enable, before any file syscall).
-        if (budget.expired()) return std::string{win::kHiveTimeout};
-
-        win::HiveFileFacts f;
-        f.profile_sid = profile_sid;
-        // Neutral leaf facts (owner = the profile, final_path_matches defaults true), so that only
-        // the path facts can trip this early classification.
-        f.owner_sid = profile_sid;
-        f.path_is_unc = path.starts_with(L"\\\\");
-
-        std::vector<std::wstring> parts;
-        std::wstring root;
-        if (!f.path_is_unc && path.size() >= 3 && path[1] == L':' && path[2] == L'\\') {
-            root = path.substr(0, 3);
-            f.drive_type = GetDriveTypeW(root.c_str());
-            std::size_t pos = 3;
-            while (pos <= path.size()) {
-                const auto end = path.find(L'\\', pos);
-                const auto part = path.substr(pos, end == std::wstring::npos ? end : end - pos);
-                if (!part.empty()) parts.push_back(part);
-                if (end == std::wstring::npos) break;
-                pos = end + 1;
-            }
-        } else {
-            f.drive_type = DRIVE_UNKNOWN; // no drive-letter root: not a fixed local path
-        }
-        f.depth = parts.size();
-        if (const auto t = win::classify_hive_file(f)) return *t;
-        if (parts.empty()) return std::string{win::kHiveNotRegular};
-
-        // Hop by hop from the drive root: no hop ever follows a junction/symlink.
-        std::wstring cur = root;
-        for (std::size_t i = 0; i + 1 < parts.size(); ++i) {
-            cur += (i ? L"\\" : L"") + parts[i];
-            const UniqueHandle dir = open_attr(cur, FILE_READ_ATTRIBUTES);
-            if (!dir.ok()) return stat_failed(GetLastError());
-            FILE_ATTRIBUTE_TAG_INFO tag{};
-            if (!GetFileInformationByHandleEx(dir.h, FileAttributeTagInfo, &tag, sizeof tag))
-                return stat_failed(GetLastError());
-            if (tag.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) {
-                f.ancestor_reparse = true;
-                break;
-            }
-        }
-        if (f.ancestor_reparse) return std::string{win::kHivePathReparseAncestor};
-
-        FILE_ID_INFO id{};
-        if (auto t = read_leaf(path, f, id); !t.empty()) return t;
-        // `cur` is the leaf's directory, already hop-verified above.
-        if (auto t = read_sidecars(cur, parts.back(), f); !t.empty()) return t;
-        if (const auto t = win::classify_hive_file(f)) return *t;
-        snapshot = id;
-        return {}; // the leaf handle is closed here: RegLoadKeyW needs exclusive access
-    }
-
-    std::string after_load(const std::wstring& path) {
-        if (!snapshot) return std::string{win::kHiveIdentityChanged};
-        win::HiveFileFacts unused;
-        FILE_ID_INFO id{};
-        if (auto t = read_leaf(path, unused, id); !t.empty()) return t;
-        if (id.VolumeSerialNumber != snapshot->VolumeSerialNumber ||
-            std::memcmp(&id.FileId, &snapshot->FileId, sizeof id.FileId) != 0)
-            return std::string{win::kHiveIdentityChanged};
-        return {};
+    long sidecar_facts(const std::wstring& path, std::uint32_t& links,
+                       std::uint32_t& attrs) override {
+        const UniqueHandle h = open_attr(path, FILE_READ_ATTRIBUTES);
+        if (!h.ok()) return failure_code(GetLastError());
+        FILE_ATTRIBUTE_TAG_INFO tag{};
+        if (!GetFileInformationByHandleEx(h.h, FileAttributeTagInfo, &tag, sizeof tag))
+            return failure_code(GetLastError());
+        BY_HANDLE_FILE_INFORMATION info{};
+        if (!GetFileInformationByHandle(h.h, &info)) return failure_code(GetLastError());
+        links = info.nNumberOfLinks;
+        attrs = tag.FileAttributes;
+        return 0;
     }
 };
 
@@ -488,7 +435,8 @@ int collect_windows_permissions(yuzu::CommandContext& ctx) {
     const win::ReadProfileFn read_profile = [&](const yuzu::profiles::ProfileInfo& profile) {
         win::ProfileRead rd;
         yuzu::win::HiveAccessReport report;
-        HiveFileGuard guard{budget, profile.sid, 0, std::nullopt};
+        Win32HiveFileProbe probe;
+        win::HiveFileGuard guard{probe, [&] { return budget.expired(); }, profile.sid, std::nullopt};
         const yuzu::win::OfflineHiveFileCheck check{
             [&](const std::wstring& p) { return guard.before_load(p); },
             [&](const std::wstring& p) { return guard.after_load(p); }};
