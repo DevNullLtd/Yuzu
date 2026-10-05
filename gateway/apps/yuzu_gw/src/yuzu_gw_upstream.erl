@@ -4,6 +4,24 @@
 %%% Proxies Register, Inventory, and stream status notifications
 %%% to the upstream server.
 %%%
+%%% Stream status notifications are held, not dropped (#4632):
+%%%   A notification is stored in a bounded pending store
+%%%   (yuzu_gw_notify_queue) and a drain step sends held entries first in first
+%%%   out, at most ?MAX_NOTIFY_INFLIGHT (10) at a time, each on its own
+%%%   monitored worker so the gen_server never blocks on one. Entries are held,
+%%%   not dropped, while the in-flight limit is reached and while the circuit
+%%%   breaker is open or half_open. The store key is {AgentId, SessionId,
+%%%   StreamHomeId}: a newer event for a held key replaces the held one (it
+%%%   keeps its place in the queue; counted as notify_coalesced), so a
+%%%   CONNECTED followed by a DISCONNECTED for one session sends only the
+%%%   DISCONNECTED, while two sessions of one agent are both kept. The cap
+%%%   notify_pending_max counts keys, not agents; a notification for a new key
+%%%   over the cap is dropped and counted (notify_dropped, reason at_capacity).
+%%%   The store is volatile: it is lost when this process stops or restarts.
+%%%   The cap bounds the retained keys only; it is not a memory ceiling, and
+%%%   casts still queue in the mailbox while a ProxyRegister, ProxyInventory or
+%%%   replay RPC runs inside this process.
+%%%
 %%% Includes a circuit breaker to prevent cascading failures when the
 %%% upstream server is unreachable. States:
 %%%   closed    — RPCs pass through; consecutive failures tracked
@@ -46,6 +64,9 @@
 %%%                                          queued again by a verdict
 %%%                                          (default 10000, valid 0..3600000)
 %%%   registration_replay_queue_max       - most agents the replay queue holds
+%%%                                          (default 10000, valid 1..1000000)
+%%%   notify_pending_max                  - most stream-status notification keys
+%%%                                          held while they cannot be sent
 %%%                                          (default 10000, valid 1..1000000)
 %%   cluster_id                          — this gateway's trust-zone/region id,
 %%                                          stamped on every StreamStatusNotification
@@ -96,6 +117,8 @@
 -define(MAX_REPLAY_SESSION_GUARD_MS, 3600000).
 -define(DEFAULT_REPLAY_QUEUE_MAX, 10000).
 -define(MAX_REPLAY_QUEUE_MAX, 1000000).
+-define(DEFAULT_NOTIFY_PENDING_MAX, 10000).
+-define(MAX_NOTIFY_PENDING_MAX, 1000000).
 %% Most session ids one replay_sessions cast may name. The same bound as
 %% ?MAX_VERDICT_IDS in yuzu_gw_heartbeat_buffer, which applies it before the
 %% cast; keep the two equal.
@@ -110,6 +133,10 @@
 
 -record(state, {
     notify_pids     :: #{pid() => true},
+    %% Stream-status notifications held until a worker slot is free and the
+    %% breaker is closed. Volatile: it does not outlive this process.
+    notify_pending  :: yuzu_gw_notify_queue:t(),
+    notify_pending_max :: pos_integer(),
     %% Circuit breaker state
     cb_state        :: closed | open | half_open,
     cb_failures     :: non_neg_integer(),
@@ -118,6 +145,11 @@
     cb_max_timeout  :: non_neg_integer(),
     cb_cur_timeout  :: non_neg_integer(),
     cb_timer        :: reference() | undefined,
+    %% Reserved for the half_open probe (not used yet): the number of times the
+    %% breaker entered half_open, and the held notification currently sent as
+    %% the probe.
+    cb_gen          = 0 :: non_neg_integer(),
+    notify_probe    = undefined :: undefined | map(),
     %% Registration replay on upstream reconnect
     replay_spacing  :: non_neg_integer(),
     replay_queue    :: [{binary(), binary() | undefined, map()}],  %% agents still to re-proxy ([] = idle)
@@ -233,15 +265,25 @@ init([]) ->
                                    ?MAX_REPLAY_SESSION_GUARD_MS),
     QueueMax = yuzu_gw_env:env_int(registration_replay_queue_max,
                                ?DEFAULT_REPLAY_QUEUE_MAX, 1, ?MAX_REPLAY_QUEUE_MAX),
+    NotifyPendingMax = yuzu_gw_env:env_int(notify_pending_max,
+                                           ?DEFAULT_NOTIFY_PENDING_MAX, 1,
+                                           ?MAX_NOTIFY_PENDING_MAX),
     ClusterId = ensure_binary(application:get_env(yuzu_gw, cluster_id, <<"default">>)),
 
     logger:info("Upstream client started (circuit breaker: threshold=~b, base_timeout=~bms, "
                 "replay_spacing=~bms, replay_session_guard=~bms, replay_queue_max=~b, "
-                "cluster_id=~s)",
-                [Threshold, BaseTimeout, ReplaySpacing, SessionGuard, QueueMax, ClusterId]),
+                "notify_pending_max=~b, cluster_id=~s)",
+                [Threshold, BaseTimeout, ReplaySpacing, SessionGuard, QueueMax,
+                 NotifyPendingMax, ClusterId]),
+
+    %% A restarted instance counts only its own workers, so the gauges start
+    %% from zero here (workers of an earlier instance are unlinked and uncounted).
+    emit_notify_queue(0, 0),
 
     {ok, #state{
         notify_pids     = #{},
+        notify_pending  = yuzu_gw_notify_queue:new(NotifyPendingMax),
+        notify_pending_max = NotifyPendingMax,
         cb_state        = closed,
         cb_failures     = 0,
         cb_threshold    = Threshold,
@@ -266,9 +308,10 @@ handle_call({proxy_register, RegisterReq}, _From, State) ->
         {reject, State1} ->
             {reply, {error, circuit_open}, State1};
         {allow, State1} ->
+            Before = notify_counts(State1),
             Result = do_rpc('ProxyRegister', RegisterReq, register),
-            State2 = record_result(Result, State1),
-            {reply, Result, State2}
+            State2 = drain(record_result(Result, State1)),
+            {reply, Result, report_notify_counts(Before, State2)}
     end;
 
 handle_call({proxy_inventory, InventoryReport}, _From, State) ->
@@ -276,73 +319,69 @@ handle_call({proxy_inventory, InventoryReport}, _From, State) ->
         {reject, State1} ->
             {reply, {error, circuit_open}, State1};
         {allow, State1} ->
+            Before = notify_counts(State1),
             Result = do_rpc('ProxyInventory', InventoryReport, inventory),
-            State2 = record_result(Result, State1),
-            {reply, Result, State2}
+            State2 = drain(record_result(Result, State1)),
+            {reply, Result, report_notify_counts(Before, State2)}
     end;
 
 handle_call(_Request, _From, State) ->
     {reply, {error, unknown_call}, State}.
 
 handle_cast({notify_stream_status, AgentId, SessionId, Event, PeerAddr, StreamHomeId},
-            #state{notify_pids = Pids, cb_state = CbState, cluster_id = ClusterId} = State) ->
-    %% Don't spawn notifications if circuit is open
-    case CbState of
-        open ->
-            logger:debug("Dropping stream status notification for ~s (circuit open)", [AgentId]),
-            %% HA WS-4 4.4 review fix (F2): this drop was previously
-            %% invisible — no telemetry, only a debug log line, matching
-            %% the guardian-forward path's own forward_dropped counter
-            %% (yuzu_gw_guardian_forward_tests.erl). A dropped CONNECTED for
-            %% an ADOPTED replay session (the reannounce mechanism this
-            %% slice added) means the server's placement stays wiped with
-            %% NO observable signal — an I6a false-assurance risk.
-            telemetry:execute([yuzu, gw, upstream, notify_dropped],
-                              #{count => 1}, #{reason => <<"circuit_open">>}),
-            {noreply, State};
-        _ ->
-            case map_size(Pids) >= ?MAX_NOTIFY_INFLIGHT of
-                true ->
-                    logger:debug("Dropping stream status notification for ~s (at capacity)", [AgentId]),
-                    telemetry:execute([yuzu, gw, upstream, notify_dropped],
-                                      #{count => 1}, #{reason => <<"at_capacity">>}),
-                    {noreply, State};
-                false ->
-                    Notification = #{
-                        agent_id     => AgentId,
-                        session_id   => ensure_binary(SessionId),
-                        event        => case Event of connected -> 'CONNECTED'; disconnected -> 'DISCONNECTED' end,
-                        peer_addr    => PeerAddr,
-                        gateway_node => atom_to_binary(node(), utf8),
-                        %% HA WS-4 4.1 — this gateway's configured cluster id
-                        %% (yuzu_gw env `cluster_id` / YUZU_GW_CLUSTER_ID), so
-                        %% the server's routing directory can record which
-                        %% cluster owns this agent's live stream.
-                        cluster_id   => ClusterId,
-                        %% CC-03: advertised on every notification (connect and
-                        %% disconnect alike) — the server only needs to observe
-                        %% it once per gateway build, and sending it unconditionally
-                        %% avoids a connect-only special case here.
-                        wire_capabilities => [?WIRE_CAP_DISPATCH_TAG_V1],
-                        %% HA WS-4 (#4324) — opaque id minted once per
-                        %% yuzu_gw_agent process instance and passed through
-                        %% verbatim here on both CONNECTED and DISCONNECTED,
-                        %% so the server can fence a stale DISCONNECTED from
-                        %% tearing down a newer re-home under the same
-                        %% reused session id.
-                        stream_home_id => StreamHomeId
-                    },
-                    {Pid, _MonRef} = spawn_monitor(fun() ->
-                        case do_rpc('NotifyStreamStatus', Notification, notify_stream) of
-                            {ok, _} -> ok;
-                            {error, Reason} ->
-                                logger:warning("Failed to notify stream status for ~s: ~p",
-                                               [AgentId, Reason])
-                        end
-                    end),
-                    {noreply, State#state{notify_pids = Pids#{Pid => true}}}
-            end
-    end;
+            #state{notify_pending = Pending, cluster_id = ClusterId} = State) ->
+    Before = notify_counts(State),
+    Notification = #{
+        agent_id     => AgentId,
+        session_id   => ensure_binary(SessionId),
+        event        => case Event of connected -> 'CONNECTED'; disconnected -> 'DISCONNECTED' end,
+        peer_addr    => PeerAddr,
+        gateway_node => atom_to_binary(node(), utf8),
+        %% HA WS-4 4.1 — this gateway's configured cluster id
+        %% (yuzu_gw env `cluster_id` / YUZU_GW_CLUSTER_ID), so
+        %% the server's routing directory can record which
+        %% cluster owns this agent's live stream.
+        cluster_id   => ClusterId,
+        %% CC-03: advertised on every notification (connect and
+        %% disconnect alike) — the server only needs to observe
+        %% it once per gateway build, and sending it unconditionally
+        %% avoids a connect-only special case here.
+        wire_capabilities => [?WIRE_CAP_DISPATCH_TAG_V1],
+        %% HA WS-4 (#4324) — opaque id minted once per
+        %% yuzu_gw_agent process instance and passed through
+        %% verbatim here on both CONNECTED and DISCONNECTED,
+        %% so the server can fence a stale DISCONNECTED from
+        %% tearing down a newer re-home under the same
+        %% reused session id.
+        stream_home_id => StreamHomeId
+    },
+    %% #4632: hold the notification instead of dropping it when no slot is free
+    %% or the breaker is not closed. Latest event wins within a key (so a
+    %% CONNECTED followed by a DISCONNECTED for one session sends only the
+    %% DISCONNECTED); two sessions of one agent are two keys. Nothing is reserved
+    %% yet (the half_open probe will hold one slot back).
+    Key = {AgentId, maps:get(session_id, Notification), StreamHomeId},
+    State1 =
+        case yuzu_gw_notify_queue:put(Key, {AgentId, Notification}, 0, Pending) of
+            {new, Pending1} ->
+                State#state{notify_pending = Pending1};
+            {replaced, Pending1} ->
+                telemetry:execute([yuzu, gw, upstream, notify_coalesced],
+                                  #{count => 1}, #{}),
+                State#state{notify_pending = Pending1};
+            {full, _Unchanged} ->
+                %% HA WS-4 4.4 review fix (F2): a drop is never invisible. A
+                %% dropped CONNECTED for an ADOPTED replay session (the
+                %% reannounce mechanism) leaves the server's placement wiped
+                %% with no other signal, so it is counted. This is admission
+                %% loss only: the store already holds notify_pending_max keys.
+                logger:debug("Dropping stream status notification for ~s (pending store full)",
+                             [AgentId]),
+                telemetry:execute([yuzu, gw, upstream, notify_dropped],
+                                  #{count => 1}, #{reason => <<"at_capacity">>}),
+                State
+        end,
+    {noreply, report_notify_counts(Before, drain(State1))};
 
 handle_cast({forward_guardian_message, AgentId, ResponseFrame},
             #state{guardian_pids = GPids, cb_state = CbState} = State) ->
@@ -442,6 +481,7 @@ handle_info(replay_next, #state{replay_queue = []} = State) ->
     {noreply, prune_recent_replays(State)};
 handle_info(replay_next, #state{replay_queue = [{AgentId, SessionId, RegisterReq} | Rest],
                                 replay_spacing = Spacing} = State) ->
+    Before = notify_counts(State),
     State2 =
         case check_circuit(State) of
             {reject, State1} ->
@@ -543,21 +583,26 @@ handle_info(replay_next, #state{replay_queue = [{AgentId, SessionId, RegisterReq
                         prune_recent_replays(State1#state{replay_queue = []})
                 end
         end,
-    {noreply, State2};
+    {noreply, report_notify_counts(Before, State2)};
 
 handle_info(circuit_half_open, State) ->
     logger:info("Circuit breaker: open -> half_open (allowing probe RPC)"),
     telemetry:execute([yuzu, gw, upstream, circuit_state],
                       #{count => 1},
                       #{state => <<"half_open">>}),
-    {noreply, State#state{cb_state = half_open, cb_timer = undefined}};
+    %% Held notifications stay held while half_open: drain/1 sends only when the
+    %% breaker is closed (a half_open probe by a held notification is a later step).
+    {noreply, drain(State#state{cb_state = half_open, cb_timer = undefined})};
 
 handle_info({'DOWN', _MonRef, process, Pid, _Reason},
             #state{notify_pids = Pids, guardian_pids = GPids} = State) ->
     %% A finished notify OR guardian-forward worker. Remove from whichever set
-    %% holds it (maps:remove on an absent key is a no-op, so both are safe).
-    {noreply, State#state{notify_pids = maps:remove(Pid, Pids),
-                          guardian_pids = maps:remove(Pid, GPids)}};
+    %% holds it (maps:remove on an absent key is a no-op, so both are safe). A
+    %% freed notify slot is refilled from the pending store at once.
+    Before = notify_counts(State),
+    State1 = State#state{notify_pids = maps:remove(Pid, Pids),
+                         guardian_pids = maps:remove(Pid, GPids)},
+    {noreply, report_notify_counts(Before, drain(State1))};
 
 handle_info(_Info, State) ->
     {noreply, State}.
@@ -654,7 +699,7 @@ do_replay_one(AgentId, Pid, SessionId, RegisterReq, QueueDepth, State) ->
     %% operator alert on a drip that never drains (UP-5 storm).
     telemetry:execute([yuzu, gw, upstream, registration_replay],
                       #{replayed => 1, queue_depth => QueueDepth}, #{}),
-    NewState.
+    drain(NewState).
 
 terminate(_Reason, _State) ->
     ok.
@@ -702,15 +747,26 @@ format_status(Status) ->
                 (_Key, Value)    -> Value
              end, Status).
 
-redact_state(#state{replay_queue = Queue, recent_replays = Recent} = State)
+redact_state(#state{replay_queue = Queue, recent_replays = Recent,
+                    notify_pending = Pending, notify_probe = Probe} = State)
   when is_list(Queue), is_map(Recent) ->
     Fields = maps:from_list(lists:zip(record_info(fields, state),
                                       tl(tuple_to_list(State)))),
-    (maps:without([replay_queue, recent_replays], Fields))#{
+    (maps:without([replay_queue, recent_replays, notify_pending, notify_probe], Fields))#{
         replay_queue_len => length(Queue),
-        recent_replays_size => map_size(Recent)};
+        recent_replays_size => map_size(Recent),
+        notify_pending_len => notify_pending_len(Pending),
+        notify_probe_held => Probe =/= undefined};
 redact_state(_Other) ->
     '$redacted'.
+
+%% The pending store is shown as a count; the held events carry session ids and
+%% peer addresses. A value that is not the store shows as '$redacted', so this
+%% callback stays total.
+notify_pending_len(Pending) ->
+    try yuzu_gw_notify_queue:size(Pending)
+    catch error:_ -> '$redacted'
+    end.
 
 %% The messages that carry a request, an inventory report, session ids or a
 %% guardian frame; anything else is shown as is.
@@ -878,6 +934,54 @@ trip_circuit(#state{cb_cur_timeout = CurTimeout, cb_max_timeout = MaxTimeout} = 
 
 cancel_timer(undefined) -> ok;
 cancel_timer(TRef) -> erlang:cancel_timer(TRef).
+
+%%%===================================================================
+%%% Pending stream-status notifications (#4632)
+%%%===================================================================
+
+%% @doc Send held notifications while the breaker is closed and a worker slot
+%% is free, first in first out. While the breaker is open or half_open nothing
+%% is sent: the entries stay held. Called at the end of every handler that can
+%% free a slot, close the breaker or add an entry, so there is one send path
+%% and a new arrival never overtakes a held one.
+-spec drain(#state{}) -> #state{}.
+drain(#state{cb_state = closed, notify_pids = Pids, notify_pending = Pending} = State)
+        when map_size(Pids) < ?MAX_NOTIFY_INFLIGHT ->
+    case yuzu_gw_notify_queue:take(Pending) of
+        empty ->
+            State;
+        {_Key, {AgentId, Notification}, Pending1} ->
+            {Pid, _MonRef} = spawn_monitor(fun() ->
+                case do_rpc('NotifyStreamStatus', Notification, notify_stream) of
+                    {ok, _} -> ok;
+                    {error, Reason} ->
+                        logger:warning("Failed to notify stream status for ~s: ~p",
+                                       [AgentId, Reason])
+                end
+            end),
+            drain(State#state{notify_pending = Pending1, notify_pids = Pids#{Pid => true}})
+    end;
+drain(State) ->
+    State.
+
+%% @doc The two numbers the notify_queue gauges report: held keys and workers.
+-spec notify_counts(#state{}) -> {non_neg_integer(), non_neg_integer()}.
+notify_counts(#state{notify_pending = Pending, notify_pids = Pids}) ->
+    {yuzu_gw_notify_queue:size(Pending), map_size(Pids)}.
+
+%% @doc Report the gauges once per handler, and only when the handler changed
+%% either number. Before is notify_counts/1 taken at the top of the handler.
+-spec report_notify_counts({non_neg_integer(), non_neg_integer()}, #state{}) -> #state{}.
+report_notify_counts(Before, State) ->
+    case notify_counts(State) of
+        Before                  -> ok;
+        {Pending, Inflight}     -> emit_notify_queue(Pending, Inflight)
+    end,
+    State.
+
+emit_notify_queue(Pending, Inflight) ->
+    telemetry:execute([yuzu, gw, upstream, notify_queue],
+                      #{pending => Pending, inflight => Inflight}, #{}).
 
 %% @doc Schedule the next replay step, unless the queue is now empty.
 %% Spacing the steps keeps each handle_info short and rate-limits the
