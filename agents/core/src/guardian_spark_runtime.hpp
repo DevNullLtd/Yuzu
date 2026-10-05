@@ -1242,15 +1242,19 @@ private:
         // ever submitted - see compensation_reserved_count_'s header comment.
         // `compensation_finished` defaults true (nothing to track yet);
         // dispatch_arm_off_lock() never touches it, on_arm_complete() sets it false
-        // the instant a live subscription becomes compensation-owed (entering the
-        // `if (compensating)` branch) and back to true - in the SAME critical
-        // section that pops/publishes the claim - once the compensating disarm has
-        // genuinely finished (or turned out never to be needed).
-        // expire_overdue_claims()'s terminal-recovery pass (up-4) reads it to know a
-        // terminal/stranded head is safe to reap: never touch one whose compensation
-        // is not yet finished. `compensation_deadline` is set ONCE, when
-        // compensation first becomes owed, from cfg_.backend_op_deadline - never
-        // reset on a fallback retry. `compensation_deadline_observed` is a
+        // the instant a live subscription becomes compensation-owed - in its FIRST
+        // registry_mu_ critical section, on every exit including an exception
+        // unwinding past staging (#4472; a scope guard, so there is no later
+        // acquisition in which a reader could see the owed disarm as not owed) - and
+        // back to true - in the SAME critical section that pops/publishes the claim -
+        // once the compensating disarm has genuinely finished (or turned out never to
+        // be needed). expire_overdue_claims()'s terminal-recovery pass (up-4) reads it
+        // to know a terminal/stranded head is safe to reap: never touch one whose
+        // compensation is not yet finished. is_wedge_k_eligible_locked() reads it too
+        // (#4472): a claim whose compensation is outstanding is never K-eligible.
+        // `compensation_deadline` is set ONCE, when compensation first becomes owed
+        // (the same guard), from cfg_.backend_op_deadline - never reset on a fallback
+        // retry. `compensation_deadline_observed` is a
         // once-only latch: in 5b, an elapsed deadline only increments
         // compensation_deadline_elapsed_ (see the class-level comment there) - it
         // does not, and must not, release the reservation, the subscription, the
@@ -1473,6 +1477,14 @@ public:
     /// a key whose front is a different claim entirely. Never mutates state (a query
     /// only, matching receipt_recovered()'s own contract) - registry_mu_ taken
     /// internally.
+    ///
+    /// #4472 (a third condition): AND no compensating disarm is outstanding for the
+    /// claim (`compensation_finished`). A late result that has returned and is being
+    /// disarmed leaves the claim FIFO-front until the teardown pops it, so the two
+    /// checks above alone would call it K-eligible; waiving it would acknowledge the
+    /// generation and stop the server's re-pushes, after which the pop leaves the rule
+    /// with no replacement arm. The marker is deliberately not the CompensationPermit
+    /// (engaged for every in-flight arm, a genuinely hung one included).
     [[nodiscard]] bool receipt_wedge_k_eligible(const ArmReceipt& receipt) const;
 
     /// rung 9c PR-5e (#4221, K-bound closeout - adversarial review finding, Kimi K3 +
@@ -1760,7 +1772,12 @@ private:
 
     /// rung 9c PR-5e (#4221, K-bound closeout - cpp-expert governance finding):
     /// the K-eligibility predicate (`end == WaiterTimedOutDispatched && dispatch
-    /// == Dispatched && still its key's FIFO front`) - factored out so
+    /// == Dispatched && still its key's FIFO front && no compensating disarm
+    /// outstanding`; the last term is #4472: K's premise is "the arm is physically
+    /// stuck", and a claim whose late result has returned and is in teardown is not
+    /// that - waiving it discards the server's re-push, the only owner left to re-arm
+    /// the rule once the teardown pops the claim, so the generation is held until the
+    /// teardown finishes) - factored out so
     /// receipt_wedge_k_eligible(), receipt_recovery_status() and
     /// receipt_status_wedge_aware() all read ONE definition instead of three
     /// independently-maintained copies (the drift risk classify_claim_end() was

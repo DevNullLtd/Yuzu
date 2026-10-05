@@ -245,6 +245,20 @@ public:
             gate_cv_.notify_all();
             gate_cv_.wait(gate_lk, [this] { return released_; });
         }
+        // #4472: an unwatch() hang with its OWN gate, so a test can hold a disarm after the
+        // shared gate above has already been released for a hung arm (that gate latches open).
+        bool isolated_hang = false;
+        {
+            std::lock_guard<std::mutex> lk{mu_};
+            isolated_hang = isolated_hang_next_unwatch_;
+            isolated_hang_next_unwatch_ = false;
+        }
+        if (isolated_hang) {
+            std::unique_lock<std::mutex> gate_lk{isolated_gate_mu_};
+            isolated_entered_ = true;
+            isolated_gate_cv_.notify_all();
+            isolated_gate_cv_.wait(gate_lk, [this] { return isolated_released_; });
+        }
         std::lock_guard<std::mutex> lk{mu_};
         watched_.erase(key);
     }
@@ -282,6 +296,22 @@ public:
     void hang_next_unwatch() {
         std::lock_guard<std::mutex> lk{mu_};
         hang_next_unwatch_ = true;
+    }
+    /// #4472: the next unwatch() parks on a gate independent of hang_next_watch()'s.
+    void hang_next_unwatch_isolated() {
+        std::lock_guard<std::mutex> lk{mu_};
+        isolated_hang_next_unwatch_ = true;
+    }
+    bool wait_entered_isolated_unwatch(std::chrono::seconds timeout) {
+        std::unique_lock<std::mutex> gate_lk{isolated_gate_mu_};
+        return isolated_gate_cv_.wait_for(gate_lk, timeout, [this] { return isolated_entered_; });
+    }
+    void release_isolated_unwatch_hang() {
+        {
+            std::lock_guard<std::mutex> gate_lk{isolated_gate_mu_};
+            isolated_released_ = true;
+        }
+        isolated_gate_cv_.notify_all();
     }
     /// Blocks until a hung watch()/unwatch() has actually entered its wait (avoids a
     /// racy sleep-based poll for "is it parked yet").
@@ -336,6 +366,11 @@ private:
     bool throw_next_watch_{false};
     bool hang_next_watch_{false};
     bool hang_next_unwatch_{false};
+    bool isolated_hang_next_unwatch_{false}; ///< #4472, guarded by mu_
+    std::mutex isolated_gate_mu_;
+    std::condition_variable isolated_gate_cv_;
+    bool isolated_entered_{false};  ///< guarded by isolated_gate_mu_
+    bool isolated_released_{false}; ///< guarded by isolated_gate_mu_
     // Gate is a SEPARATE lock from mu_ (see watch()'s comment) - release_hang() must
     // never need mu_, or a caller blocked trying to take mu_ mid-hang (e.g. a concurrent
     // is_watching() from the test's own polling) could never be released.
@@ -3275,6 +3310,127 @@ TEST_CASE("#2233 item 3: a timed-out arm holds policy_generation for retry, not 
     CHECK(f.engine->rule_count() == 1);        // persisted (put_rule_locked ran)
     CHECK(f.engine->spark_armed_rule_count() == 0);
     // (the parked mechanism is released by `release_parked` above on every exit path)
+}
+
+// ---------------------------------------------------------------------------
+// #4472 post-K stranding, engine level. An operator withdraws a rule whose arm is hung and
+// re-adds the identical rule while the arm's late success is compensated: the late success lands
+// after the withdrawal (so it is disarmed, not adopted) and its compensating disarm is parked
+// inside unwatch(). The server's identical re-pushes then re-observe the same retained Wedged
+// claim; on the fourth identical application the heartbeat drain finds that claim K-eligible
+// (still the key's FIFO front) and, with the disarm still outstanding, K-waives the generation.
+// The disarm then finishes and pops the claim with no replacement arm. Pass condition: the
+// generation is NOT acknowledged while the disarm is outstanding AND the rule ends armed on the
+// mechanism. The runtime-level twin (test_guardian_spark_runtime.cpp, "#4472: ...") drives the
+// same ledger decision with the late success landing inside a single full_sync's detach_all /
+// re-attach window, which an engine test cannot park.
+// ---------------------------------------------------------------------------
+namespace {
+/// `finish_disarm_before_drain` false: the compensating disarm is still parked when the fourth
+/// identical application's heartbeat drain runs (the repro). True: it is released after that
+/// application's re-attach but before the drain (the control).
+void run_post_k_4472_scenario(bool finish_disarm_before_drain) {
+    using namespace std::chrono_literals;
+    SparkReconcileFixture f;
+    struct ReleaseOnExit {
+        SparkReconcileFixture& fx;
+        ~ReleaseOnExit() {
+            fx.mechanism->release_isolated_unwatch_hang();
+            fx.mechanism->release_hang();
+        }
+    };
+    ReleaseOnExit release_parked{f};
+
+    const auto push = [&](std::uint64_t generation, bool with_rule) {
+        gpb::GuaranteedStatePush p;
+        p.set_full_sync(true);
+        p.set_policy_generation(generation);
+        if (with_rule)
+            *p.add_rules() = make_service_rule("r1");
+        auto dr = yuzu::agent::guardian_dispatch_push_bytes_for_test(*f.engine, p.SerializeAsString());
+        REQUIRE(dr.exit_code == 0);
+    };
+    const auto drain_pending = [&] {
+        REQUIRE(yuzu::test::spin_until(
+            [&] {
+                f.engine->journal_maintenance_tick();
+                return f.engine->ack_pending_count_for_test() == 0;
+            },
+            10s));
+    };
+
+    // The arm hangs inside the mechanism; the synthetic clock expires its claim to a retained
+    // Wedged head without any wait. Generation 5 is held.
+    f.mechanism->hang_next_watch();
+    push(5, true);
+    REQUIRE(f.mechanism->wait_entered_hang(30s));
+    REQUIRE(f.engine->spark_runtime_for_test() != nullptr);
+    REQUIRE(f.engine->spark_runtime_for_test()->expire_overdue_claims(
+                std::chrono::steady_clock::now() + 600s) == 1);
+    drain_pending();
+    REQUIRE(f.engine->policy_generation() == 0);
+
+    // Withdrawal (full_sync omitting r1): the wedge is deactivated. Then the hung arm returns its
+    // subscription; with the rule no longer wanted it is compensated, and that disarm parks.
+    push(6, false);
+    drain_pending();
+    f.mechanism->hang_next_unwatch_isolated();
+    f.mechanism->release_hang();
+    REQUIRE(f.mechanism->wait_entered_isolated_unwatch(30s));
+
+    // The identical re-add, then three more identical re-applications (reapply_count 0..3), each
+    // followed by the heartbeat drain.
+    for (int i = 0; i < 4; ++i) {
+        push(7, true);
+        if (i == 3 && finish_disarm_before_drain) {
+            f.mechanism->release_isolated_unwatch_hang();
+            REQUIRE(yuzu::test::spin_until([&] { return f.engine->active_io_workers() == 0; }, 10s));
+        }
+        drain_pending();
+        if (i < 3)
+            REQUIRE(f.engine->policy_generation() < 7);
+    }
+
+    // (a) With the disarm outstanding the generation must not have been acknowledged, or the
+    // server stops re-sending (agent_gen >= current). In the control it is held too: the claim
+    // is gone, so the Wedged receipt is no longer K-eligible.
+    const bool acknowledged = f.engine->policy_generation() >= 7;
+    CHECK_FALSE(acknowledged);
+    if (finish_disarm_before_drain)
+        REQUIRE_FALSE(acknowledged); // the retry below is only owed (and modelled) in this case
+
+    // The disarm completes; the compensated claim is popped.
+    f.mechanism->release_isolated_unwatch_hang();
+    REQUIRE(yuzu::test::spin_until([&] { return f.engine->active_io_workers() == 0; }, 10s));
+
+    // (b) With an acknowledged generation nothing re-sends the rule; with a held one the server's
+    // identical retry arrives. Either way the rule must end armed on the mechanism.
+    if (!acknowledged) {
+        push(7, true);
+        REQUIRE(yuzu::test::spin_until(
+            [&] {
+                f.engine->journal_maintenance_tick();
+                return f.engine->ack_pending_count_for_test() == 0 &&
+                       f.engine->active_io_workers() == 0;
+            },
+            10s));
+    }
+    CHECK(f.engine->rule_count() == 1);
+    CHECK(f.engine->spark_armed_rule_count() == 1);
+    CHECK(f.mechanism->watching_count() == 1);
+}
+} // namespace
+
+TEST_CASE("#4472: a compensating disarm still outstanding at the heartbeat drain must not "
+          "K-waive the generation, and the rule must end armed",
+          "[spark][guardian][reconcile][liveness][4472]") {
+    run_post_k_4472_scenario(/*finish_disarm_before_drain=*/false);
+}
+
+TEST_CASE("#4472 control: a compensating disarm that finished before the heartbeat drain holds "
+          "the generation, and the retry arms the rule",
+          "[spark][guardian][reconcile][liveness][4472]") {
+    run_post_k_4472_scenario(/*finish_disarm_before_drain=*/true);
 }
 
 #ifndef _WIN32

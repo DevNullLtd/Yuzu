@@ -1378,6 +1378,30 @@ void GuardianSparkRuntime::on_arm_complete(const std::string& key,
     try {
         {
             std::unique_lock<std::mutex> lk{registry_mu_};
+            // #4472: the compensation-owed marker is written in THIS critical section, on
+            // every exit (normal, or an exception unwinding past staging), never in a later
+            // acquisition. Between the two a heartbeat drain could read this claim as a
+            // K-eligible wedge with its compensating disarm already owed, and a K-waiver then
+            // acknowledges the generation and discards the server's re-push, the only owner
+            // left to re-arm the rule once the disarm pops the claim. Declared before the
+            // fallible gap_hook copy and every other fallible step below, so it covers all of
+            // them; non-throwing and non-allocating (a claim field write and a clock read),
+            // and destructed before `lk` releases. Reads `compensating` at scope exit: an
+            // adoption reset it, so an adopted claim is never marked, and a later fault with
+            // `compensating` already reset falls to the !published path that sets finished.
+            struct CompensationOwedMark {
+                const std::optional<std::uint64_t>& compensating;
+                KeyClaim& claim;
+                std::chrono::steady_clock::duration deadline_after;
+                ~CompensationOwedMark() noexcept {
+                    if (!compensating)
+                        return;
+                    claim.compensation_finished = false;
+                    // Set ONCE and never reset by a fallback retry (KeyClaim).
+                    if (claim.compensation_deadline == std::chrono::steady_clock::time_point{})
+                        claim.compensation_deadline = std::chrono::steady_clock::now() + deadline_after;
+                }
+            } owed_mark{compensating, *claim, cfg_.backend_op_deadline};
             gap_hook = drain_gap_hook_for_test_;
             const auto eit = claims_.find(key);
             const bool is_head = eit != claims_.end() && !eit->second.fifo.empty() &&
@@ -1787,17 +1811,12 @@ void GuardianSparkRuntime::on_arm_complete(const std::string& key,
         // `cont` null, one direct_disarm_fallback() runs, and the fallthrough
         // below is reached exactly as intended - `if (cont)` is a true single
         // discriminator again.
-        // up-3/up-4 (#4221): compensation is now owed for `claim` - mark it not-yet-
-        // finished (expire_overdue_claims()'s terminal-recovery pass must never reap
-        // a head whose compensation is still outstanding) and establish its ONE
-        // absolute observation deadline, set once and never reset by a later
-        // fallback retry.
-        {
-            std::lock_guard<std::mutex> lk{registry_mu_};
-            claim->compensation_finished = false;
-            if (claim->compensation_deadline == std::chrono::steady_clock::time_point{})
-                claim->compensation_deadline = std::chrono::steady_clock::now() + cfg_.backend_op_deadline;
-        }
+        // up-3/up-4 (#4221), #4472: `claim`'s compensation was marked owed (not-yet-
+        // finished, with its ONE absolute observation deadline) by CompensationOwedMark
+        // in the first critical section above, so no heartbeat drain can read this claim
+        // as a K-eligible wedge between the staging decision and here, and
+        // expire_overdue_claims()'s terminal-recovery pass never reaps a head whose
+        // compensation is still outstanding. There is deliberately no second marking site.
         const std::uint64_t sub = *compensating;
         compensating.reset(); // ownership from here is `cont` (below) or the direct
                                // disarm on the catch path - never this optional again
@@ -2235,6 +2254,15 @@ std::optional<bool> GuardianSparkRuntime::rule_active_for_test(const std::string
 bool GuardianSparkRuntime::is_wedge_k_eligible_locked(
     const std::shared_ptr<KeyClaim>& claim) const noexcept {
     if (claim->end != ClaimEnd::WaiterTimedOutDispatched || claim->dispatch != ClaimDispatch::Dispatched)
+        return false;
+    // #4472: K's premise is "the arm is physically stuck". A claim whose late result has
+    // already returned and is in compensating teardown is not that: waiving it
+    // acknowledges the generation, the server stops re-pushing, and the teardown then pops
+    // the claim with no replacement arm, so nothing is left to re-arm the rule. The marker
+    // is compensation_finished, written in on_arm_complete's first critical section; NOT the
+    // CompensationPermit, which is engaged for every in-flight arm (a genuinely hung arm
+    // included) and would disable K for all of them.
+    if (!claim->compensation_finished)
         return false;
     const auto eit = claims_.find(claim->key);
     return eit != claims_.end() && !eit->second.fifo.empty() && eit->second.fifo.front() == claim;
