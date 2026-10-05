@@ -524,13 +524,12 @@ place, **Hardware** and **Software**, each its own page:
   them any more — treat them as a legacy escape hatch, not a supported feature.
 
   - The catalogue store now serves exact numbers under filters: **Installs is the exact
-    number of distinct devices** carrying the title under the active kind/ecosystem/source
-    filters (a device carrying one title through two sources counts once), and **search
-    selects titles** — a matched title keeps its whole filtered slice. `%` and `_` in a
+    number of distinct devices** carrying the title under any kind/ecosystem/source
+    filter combination the store is given (a device carrying one title through two sources
+    counts once), and **search selects titles** — a matched title keeps its whole filtered slice. `%` and `_` in a
     search term are literal characters, the term is clamped to 128 bytes, and a search that
     exceeds its 5 s execution bound reports the catalogue as unavailable rather than showing
-    an empty table. The store's version drill now accepts the catalogue filters and a host
-    (the page wires them in a follow-up).
+    an empty table. The store's version drill now accepts the catalogue filters and a host.
 
 **On store degradation** the **`/software`** catalogue, its **devices ›** expansion, and
 the CI record's **Installed software** lens — the *authoritative* reads — show an
@@ -715,10 +714,11 @@ The **catalogue rollup** (the `/software` page's precomputed counts, refreshed
 hourly by the background `SoftwareCatalogRollup` thread) emits three further series:
 
 - `yuzu_inventory_catalog_rollup_total{outcome}` (counter, outcome ∈ `success` / `error`)
-  — one per recompute attempt. A rising `error` count with a frozen
+  — one per recompute attempt that completes or fails (a shutdown-cancelled attempt is
+  not counted). A rising `error` count with a frozen
   `…_last_success_timestamp` means recomputes are failing (PG outage / the 60s budget
-  exceeded at scale) and the catalogue is going stale; keep-last-good serves the prior
-  rollup meanwhile.
+  or the 10-minute whole-refresh budget exceeded at scale) and the catalogue is going
+  stale; keep-last-good serves the prior rollup meanwhile.
 - `yuzu_inventory_catalog_rollup_duration_seconds` (gauge) — the last recompute's
   wall-clock. A rising value approaching the 60s budget is the leading indicator to raise
   the budget (or shard the rollup) before recomputes start timing out. (A gauge, not a

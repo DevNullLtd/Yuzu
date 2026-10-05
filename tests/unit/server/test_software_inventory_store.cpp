@@ -2082,7 +2082,7 @@ TEST_CASE("catalogue Installs are exact distinct devices under every filter grai
     CHECK(meta->rpm_unsigned == 1);
 }
 
-TEST_CASE("q is literal, title-level and clamped", "[pg][software_inventory]") {
+TEST_CASE("q is literal and title-level and clamped", "[pg][software_inventory]") {
     SWINV_SHARED(store, pool);
     seed_grain_fixture(store);
     put(store, "q1",
@@ -2494,11 +2494,7 @@ TEST_CASE("equivalent version spellings: the more-installed spelling is the newe
 
 TEST_CASE("refreshing an empty fleet is fresh (refreshed_at > 0) with every KPI zero",
           "[pg][software_inventory]") {
-    YUZU_REQUIRE_PG_MIGRATION_DB(db);
-    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
-    REQUIRE(pool.valid());
-    SoftwareInventoryStore store{pool};
-    REQUIRE(store.is_open());
+    SWINV_SHARED(store, pool);
     REQUIRE(store.refresh_catalog_rollup());
     auto meta = store.catalog_rollup_meta();
     REQUIRE(meta.has_value());
@@ -2570,14 +2566,18 @@ TEST_CASE("migration v8 reshapes a v7-era rollup schema and re-runs idempotently
     auto exec = [&](const char* stmt) { run_sql(pool, stmt); };
     exec("INSERT INTO software_inventory_store.version_rollup (name, version, device_count) "
          "VALUES ('SentinelVR', '1.2.3', 42)");
+    constexpr const char* kSentinelRowSql =
+        "SELECT to_jsonb(i)::text FROM software_inventory_store.installed_software i "
+        "WHERE agent_id = 'sentinel-dev'";
+    const std::string sentinel_row = [&] {
+        auto r = run_sql(pool, kSentinelRowSql);
+        REQUIRE(PQntuples(r.get()) == 1);
+        return std::string(PQgetvalue(r.get(), 0, 0));
+    }();
     auto check_sentinels = [&] {
-        auto src = run_sql(pool, "SELECT name, version, publisher FROM "
-                                 "software_inventory_store.installed_software WHERE agent_id = "
-                                 "'sentinel-dev'");
+        auto src = run_sql(pool, kSentinelRowSql);
         REQUIRE(PQntuples(src.get()) == 1);
-        CHECK(std::string(PQgetvalue(src.get(), 0, 0)) == "SentinelApp");
-        CHECK(std::string(PQgetvalue(src.get(), 0, 1)) == "7.7");
-        CHECK(std::string(PQgetvalue(src.get(), 0, 2)) == "Sent");
+        CHECK(std::string(PQgetvalue(src.get(), 0, 0)) == sentinel_row); // whole-row identity
         auto vr = run_sql(pool, "SELECT device_count FROM software_inventory_store.version_rollup "
                                 "WHERE name = 'SentinelVR' AND version = '1.2.3'");
         REQUIRE(PQntuples(vr.get()) == 1);

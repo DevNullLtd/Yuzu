@@ -9703,11 +9703,12 @@ public:
         {
             using namespace std::chrono;
             // The two ROLL-UPS start no new work from here on (RD-1): the catalogue
-            // roll-up is told to stop without a join (an in-flight recompute finishes
-            // and is joined later, as before); the app-perf loop watches draining_
-            // itself. Those two are the maintenance passes whose join can wait out a
-            // long statement budget (120s / 60s); a recompute starting inside the
-            // grace would otherwise add that AFTER it. Other passes are unaffected —
+            // roll-up is told to stop without a join (an in-flight recompute is
+            // cancelled at its next poll, last-good kept, and joined by stop()); the
+            // app-perf loop watches draining_ itself. Those two are the maintenance
+            // passes whose join can wait out a long statement budget (120s / 60s); a
+            // recompute starting inside the grace would otherwise add that AFTER it.
+            // Other passes are unaffected —
             // their stops are already bounded (e.g. NVD sync's 5s cancel-then-detach).
             if (software_catalog_rollup_)
                 software_catalog_rollup_->request_stop();
