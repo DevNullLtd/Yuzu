@@ -3156,7 +3156,8 @@ so this is easy to hit.
 
 **Diagnosing a rejection.** The agent logs either `untrusted chain` or
 `invalid signature` — or, when its own trust bundle cannot be loaded at all
-(missing, unreadable by the agent's account, or not a PEM certificate file),
+(missing, unreadable by the agent's account, not a regular file, larger than
+1 MiB, or not a PEM certificate file),
 `the update trust bundle could not be loaded, so the signature was not checked`,
 counted as `reason="bundle_unreadable"`. That last one is a fault on the
 endpoint, not in your signing; fix the bundle file or its permissions. Agents
@@ -3242,13 +3243,27 @@ rather than running with enforcement silently inert.
 enforcing and the bundle path, for example
 `OTA update signature mode: bundle+require (trust bundle: /etc/yuzu-agent/certs/update-trust-bundle.pem)`,
 or `OTA update signature mode: off (…update binaries are NOT signature-checked)`
-when no bundle is set. It logs a warning beside it if the bundle is set but cannot
-be loaded, and a warning naming any environment variable that starts with
-`YUZU_UPDATE_` but is not one it reads, so a misspelt name no longer passes
-silently. The same mode (`off`, `bundle` or `bundle+require`) travels on every
-heartbeat as the status tag `yuzu.ota_signature_mode` (see
+when no bundle is set. That startup line is the verification: it says what this
+agent will enforce. Beside it the agent warns about any environment variable that
+starts with `YUZU_UPDATE_` but is not one it reads, so a misspelling after the
+prefix no longer passes silently. The names it accepts are
+`YUZU_UPDATE_TRUST_BUNDLE`, `YUZU_UPDATE_REQUIRE_SIGNATURE` and
+`YUZU_UPDATE_CHECK_INTERVAL` (the agent's own options) and `YUZU_UPDATE_DIR`
+(the server's update-directory option, accepted silently so a host that also runs
+a server is not warned about it).
+
+The bundle-load warning, `OTA update trust bundle cannot be loaded as of this
+check: …`, is NOT logged beside the mode line. The OTA update checker logs it once,
+when it first starts, after the agent first connects, and only when auto-update is
+enabled; the startup report does no file I/O because it runs before a Windows
+service reports itself started. The same mode (`off`, `bundle` or
+`bundle+require`) travels on every heartbeat as the status tag
+`yuzu.ota_signature_mode` (see
 [metrics.md → Agent-side signature refusals](metrics.md#agent-side-signature-refusals-4163807)).
-These signals arrived in 0.14.1 (#5249); an older agent logs none of them.
+The server stores that tag in the agent-health snapshot, but no REST endpoint, MCP
+tool or dashboard view exposes it yet, so the startup log line is the per-endpoint
+source of truth. These signals arrived in 0.14.1 (#5249); an older agent logs none
+of them.
 
 #### Windows: the service's `Environment` value
 
@@ -3350,10 +3365,14 @@ letters and let them through.
 **What `OK` does and does not mean.** It means the service is configured the way
 this section describes. It is not proof that the agent loaded that configuration.
 For that, use the agent's own signal (0.14.1 and later, #5249): after restarting
-the service, its log starts with `OTA update signature mode: bundle` (stage 1) or
+the service, its log carries `OTA update signature mode: bundle` (stage 1) or
 `OTA update signature mode: bundle+require` (stage 2) and the bundle path, with
-no `trust bundle cannot be loaded` or `YUZU_UPDATE_` warning after it, and its
-heartbeat carries the same mode as the status tag `yuzu.ota_signature_mode`. An
+no `YUZU_UPDATE_` warning after it. With auto-update enabled, also check that no
+`trust bundle cannot be loaded` warning follows `OTA update checker started` once
+the agent has connected — that warning comes from the update checker, not from
+the startup lines. The heartbeat carries the same mode as the status tag
+`yuzu.ota_signature_mode`, but the server only stores it today (no REST, MCP or
+dashboard view shows it), so the log is the check. An
 agent older than 0.14.1 logs none of this, so for it the script is the only check,
 and it assumes an agent recent enough to have these options (`yuzu-agent.exe --help`
 lists `--update-trust-bundle`). The script does not check the other entries'
@@ -3380,7 +3399,11 @@ changing that file must preserve all four.
    internal PKI issuing mTLS and S/MIME from one root, so the consequence is not
    hypothetical.
 3. **An unreadable trust bundle must fail CLOSED.** "Cannot check" is never
-   "checked out fine". The store load is the first check performed.
+   "checked out fine". The store load is the first check performed. It surfaces
+   as `CmsFailure::kBundleUnreadable` (`reason=bundle_unreadable`; the plugin
+   loader still reports it as untrusted), is refused in both modes, and — since
+   0.14.1 — the bundle is read bounded (regular file only, at most 1 MiB) and
+   parsed from memory.
 4. **OTA verification stays after the SHA-256 compare and before apply**, reading
    the HELD descriptor rather than re-opening the path. Apply is the point of no
    return — the execute bit on POSIX, the live-binary move on Windows. Reading the
