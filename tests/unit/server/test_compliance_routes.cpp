@@ -542,7 +542,7 @@ TEST_CASE("GET /api/v1/compliance/{id}: audit succeeds -> 200 with the per-agent
 
 // #4644 Gate 7: the policy-fragment and policy list routes read `limit` strictly.
 TEST_CASE("GET /api/v1/policy-fragments and /policies: a trailing-garbage or overflowing limit "
-          "is a 400, not its numeric prefix",
+          "is a 400 not its numeric prefix",
           "[pg][compliance][rest]") {
     YUZU_REQUIRE_PG_DB_TPL(db, policy_store_tpl);
     yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};

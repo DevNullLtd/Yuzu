@@ -39,7 +39,7 @@ TEST_CASE("parse_query_int: rejects every shape that is not one integer", "[quer
     CHECK_THROWS_AS(strict_stoll(bad), std::invalid_argument);
 }
 
-TEST_CASE("parse_query_int: an embedded or trailing NUL is garbage, not a terminator",
+TEST_CASE("parse_query_int: an embedded or trailing NUL is garbage not a terminator",
           "[query_int_parse]") {
     // %00 in a query string becomes a real NUL in the parameter value; a parser that stopped at
     // the first NUL (strtol over a c_str) would read the prefix.
@@ -54,7 +54,7 @@ TEST_CASE("parse_query_int: a default-constructed string_view is rejected", "[qu
     CHECK_FALSE(parse_query_int<long long>(std::string_view{}).has_value());
 }
 
-TEST_CASE("parse_query_int: exact int32 boundaries, no wrap and no clamp", "[query_int_parse]") {
+TEST_CASE("parse_query_int: exact int32 boundaries no wrap and no clamp", "[query_int_parse]") {
     CHECK(parse_query_int<int>("2147483647") == std::numeric_limits<int>::max());
     CHECK(parse_query_int<int>("-2147483648") == std::numeric_limits<int>::min());
     CHECK_FALSE(parse_query_int<int>("2147483648").has_value());
@@ -65,7 +65,7 @@ TEST_CASE("parse_query_int: exact int32 boundaries, no wrap and no clamp", "[que
     CHECK_FALSE(parse_query_int<int>("18446744073709551615").has_value());
 }
 
-TEST_CASE("parse_query_int: exact int64 boundaries, no wrap and no clamp", "[query_int_parse]") {
+TEST_CASE("parse_query_int: exact int64 boundaries no wrap and no clamp", "[query_int_parse]") {
     CHECK(parse_query_int<long long>("9223372036854775807") ==
           std::numeric_limits<long long>::max());
     CHECK(parse_query_int<long long>("-9223372036854775808") ==

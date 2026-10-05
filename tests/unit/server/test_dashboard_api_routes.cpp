@@ -633,7 +633,7 @@ TEST_CASE("dashboard_api_routes: /api/audit rejects a malformed since/until/limi
     CHECK(ok->status == 200);
 }
 
-TEST_CASE("dashboard_api_routes: /api/audit rejects a negative since or until with 400, zero stays "
+TEST_CASE("dashboard_api_routes: /api/audit rejects a negative since or until with 400 zero stays "
           "unbounded",
           "[pg][server][routes][dashboard_api_routes]") {
     YUZU_REQUIRE_PG_DB_TPL(db, dashapi_audit_tpl);

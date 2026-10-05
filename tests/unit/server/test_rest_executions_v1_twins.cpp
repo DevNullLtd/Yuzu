@@ -760,8 +760,8 @@ TEST_CASE("GET /api/v1/executions/:id/children: fleet_read_fn denial -> 403",
 // `since`/`limit` strictly. A malformed value used to be swallowed into the default
 // (`?since=junk` meant "from the beginning"), answering a different query than asked.
 
-TEST_CASE("GET /api/v1/execution-statistics/{agents,definitions}: a malformed since or limit is "
-          "a 400, not the default; a clean value still works (#4644)",
+TEST_CASE("GET /api/v1/execution-statistics/{agents|definitions}: a malformed since or limit is "
+          "a 400 not the default; a clean value still works (#4644)",
           "[pg][rest][executions][v1][statistics]") {
     YUZU_REQUIRE_PG_DB_TPL(db, execv1_responsestore_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
@@ -787,7 +787,7 @@ TEST_CASE("GET /api/v1/execution-statistics/{agents,definitions}: a malformed si
     CHECK(ok->status == 200);
 }
 
-TEST_CASE("GET /api/v1/executions: a trailing-garbage limit is a 400, not the numeric prefix "
+TEST_CASE("GET /api/v1/executions: a trailing-garbage limit is a 400 not the numeric prefix "
           "(#4644)",
           "[pg][rest][executions][v1]") {
     YUZU_REQUIRE_PG_DB_TPL(db, execv1_responsestore_tpl);
@@ -839,8 +839,8 @@ void stats_exec_for(ExecV1Harness& h, std::initializer_list<const char*> agents)
 }
 } // namespace
 
-TEST_CASE("GET /api/v1/execution-statistics/agents: an unconfined caller sees every agent, a "
-          "confined one sees exactly its visible set, deny-all sees none (#3526)",
+TEST_CASE("GET /api/v1/execution-statistics/agents: an unconfined caller sees every agent a "
+          "confined one sees exactly its visible set deny-all sees none (#3526)",
           "[pg][rest][executions][v1][statistics][security]") {
     YUZU_REQUIRE_PG_DB_TPL(db, execv1_responsestore_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
@@ -916,7 +916,7 @@ TEST_CASE("GET /api/v1/execution-statistics/agents: the visible set is applied B
 // REST-admits-a-service-scoped-token-as-a-confined-view behaviour (#3526) is pinned at the
 // route, not only at the gate (test_authz_gates.cpp pins the gate alone).
 TEST_CASE("GET /api/v1/execution-statistics/agents through the REAL require_fleet_read: a "
-          "service-scoped token sees exactly its service's agents, a gate denial serves no agent, "
+          "service-scoped token sees exactly its service's agents a gate denial serves no agent "
           "a degraded tag store is a 503 (#3526)",
           "[pg][rest][executions][v1][statistics][security][service_scope]") {
     YUZU_REQUIRE_PG_DB_TPL(db, execv1_responsestore_tpl);
@@ -1020,7 +1020,7 @@ TEST_CASE("GET /api/v1/execution-statistics/agents through the REAL require_flee
     CHECK(degraded->body.find("a_p") == std::string::npos);
 }
 
-TEST_CASE("GET /api/v1/execution-statistics/agents: an unwired fleet_read_fn fails closed with a 503, "
+TEST_CASE("GET /api/v1/execution-statistics/agents: an unwired fleet_read_fn fails closed with a 503 "
           "not an exception (#3526)",
           "[pg][rest][executions][v1][statistics]") {
     YUZU_REQUIRE_PG_DB_TPL(db, execv1_responsestore_tpl);
@@ -1032,7 +1032,7 @@ TEST_CASE("GET /api/v1/execution-statistics/agents: an unwired fleet_read_fn fai
     CHECK(r->body.find("agent") == std::string::npos);
 }
 
-TEST_CASE("GET /api/v1/execution-statistics/definitions: a negative since is a 400 like /agents, "
+TEST_CASE("GET /api/v1/execution-statistics/definitions: a negative since is a 400 like /agents "
           "zero and omitted stay unbounded (#4644)",
           "[pg][rest][executions][v1][statistics]") {
     YUZU_REQUIRE_PG_DB_TPL(db, execv1_responsestore_tpl);

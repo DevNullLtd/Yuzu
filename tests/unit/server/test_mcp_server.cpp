@@ -12768,6 +12768,44 @@ TEST_CASE("MCP list_executions: confined caller sees only own dispatches (#1634)
     CHECK(sc[0]["dispatched_by"] == "bob");
 }
 
+// param_int32 narrows its int64 reading by SATURATING: 4294967296 used to wrap to 0, which
+// list_executions then served as a zero-row page. Now a huge limit is a large limit and reaches
+// the tool's own ceiling (500), so the caller's two executions are both returned.
+TEST_CASE("MCP list_executions: a limit above INT_MAX reaches the ceiling instead of wrapping "
+          "to an empty page",
+          "[pg][mcp][integration][execution]") {
+    YUZU_REQUIRE_PG_DB_TPL(authz_db, yuzu::test::response_execution_authz_tpl);
+    yuzu::test::ResponseExecutionAuthzPgRig authz{authz_db.dsn()};
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    yuzu::server::ExecutionTracker& tracker = *tracker_bundle;
+    for (int i = 0; i < 2; ++i) {
+        yuzu::server::Execution e;
+        e.definition_id = "def-list-wrap";
+        e.dispatched_by = "bob";
+        e.status = "running";
+        REQUIRE(tracker.create_execution(e).has_value());
+    }
+    McpTestServer ts;
+    ts.execution_tracker_for_test = &tracker;
+    ts.fleet_read_fn_for_test = authz.fleet_read_fn();
+    ts.mock_username = "bob";
+    ts.start("operator");
+    const auto token = authz.mint_bob();
+    for (const char* limit : {"4294967296", "2147483648", "9223372036854775807",
+                              "18446744073709551615"}) {
+        INFO("limit=" << limit);
+        auto res = ts.call_raw(
+            "POST",
+            std::string(R"({"jsonrpc":"2.0","method":"tools/call","id":733,"params":{"name":"list_executions",)"
+                        R"("arguments":{"definition_id":"def-list-wrap","limit":)") + limit + "}}}",
+            {{"Authorization", "Bearer " + token}});
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        auto sc = nlohmann::json::parse(res->body)["result"]["structuredContent"]["executions"];
+        CHECK(sc.size() == 2);
+    }
+}
+
 TEST_CASE("MCP list_executions: confined caller's counts reflect only in-scope, "
           "TERMINAL agents (Doomgoose review, important)",
           "[pg][mcp][integration][execution][scope]") {
@@ -27932,6 +27970,42 @@ TEST_CASE("MCP get_execution_statistics_by_agent: reads LIVE per-agent rollup, s
     CHECK(ts.audit_log[0] == "mcp.get_execution_statistics_by_agent|success");
 }
 
+// The REST twin is confined through require_fleet_read and admits a service-scoped token as a
+// confined view; the MCP tool deliberately stays `denied` (the default ServiceScopeClass: it
+// is not classified `confined` because that needs a tested downstream mechanism on this
+// transport). Pin both halves of the decided divergence so flipping either is a visible,
+// reviewed change (the REST half is in test_rest_executions_v1_twins.cpp).
+TEST_CASE("MCP get_execution_statistics_by_agent: a service-scoped token is denied before "
+          "fleet_read_fn runs",
+          "[mcp][integration][security][service_scope]") {
+    yuzu::MetricsRegistry reg;
+    McpTestServer ts;
+    ts.mock_token_scope_service = "printers";
+    ts.metrics_for_test = &reg;
+    bool fleet_read_fn_reached = false; // captured bool: see the #4980 test above for why
+    ts.fleet_read_fn_for_test = [&fleet_read_fn_reached](
+                                    const httplib::Request&, httplib::Response&,
+                                    const std::string&,
+                                    const std::string&) -> yuzu::server::authz::FleetReadGate {
+        fleet_read_fn_reached = true;
+        return {.admitted = true, .scope = {}};
+    };
+    ts.start();
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":51,"params":{"name":)"
+        R"("get_execution_statistics_by_agent","arguments":{}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kPermissionDenied);
+    CHECK_FALSE(fleet_read_fn_reached);
+    bool saw_denied = false;
+    for (const auto& a : ts.audit_log)
+        if (a == "mcp.get_execution_statistics_by_agent|denied")
+            saw_denied = true;
+    CHECK(saw_denied);
+}
+
 TEST_CASE("MCP get_execution_statistics_by_agent: an invalid limit answers kInvalidParams, "
           "not a silent default (retry-hint-exempt: malformed input)",
           "[pg][mcp][integration][operator_surface]") {
@@ -31829,6 +31903,42 @@ TEST_CASE("MCP B5: create_offload_target rejects a non-integer batch_size",
     CHECK(body["error"]["message"].get<std::string>().find("batch_size") != std::string::npos);
 }
 
+// The lenient param_int saturates an unsigned value above INT64_MAX to INT64_MAX instead of
+// wrapping it to -1. get_offload_target reads `id` with it and treats anything below 1 as a
+// malformed id, so the wrapped value would answer "id must be a positive integer" where the
+// saturated one is a positive id that simply does not exist ("not found").
+TEST_CASE("MCP get_offload_target: an unsigned id above INT64_MAX saturates to a not-found id "
+          "never the -1 sentinel",
+          "[pg][mcp][integration][b5]") {
+    yuzu::test::OffloadTargetStorePg store;
+    McpTestServer ts;
+    ts.offload_target_store_for_test = store.get();
+    ts.start();
+    auto call = [&](const std::string& id_json) {
+        auto res = ts.call(
+            R"({"jsonrpc":"2.0","method":"tools/call","id":9,"params":{"name":"get_offload_target",)"
+            R"("arguments":{"id":)" + id_json + "}}}");
+        REQUIRE(res);
+        return nlohmann::json::parse(res->body);
+    };
+    for (const char* huge : {"18446744073709551615", "9223372036854775808", "9223372036854775807"}) {
+        INFO("id=" << huge);
+        auto b = call(huge);
+        REQUIRE(b.contains("error"));
+        const auto msg = b["error"]["message"].get<std::string>();
+        CHECK(msg.find("not found") != std::string::npos);
+        CHECK(msg.find("positive integer") == std::string::npos);
+    }
+    // Control: 0 and -1 are still the malformed-id answer.
+    for (const char* bad : {"0", "-1"}) {
+        INFO("id=" << bad);
+        auto b = call(bad);
+        REQUIRE(b.contains("error"));
+        CHECK(b["error"]["message"].get<std::string>().find("positive integer") !=
+              std::string::npos);
+    }
+}
+
 // #4644 Gate 8 round 2: the tool schema declares batch_size 1..10000. The saturating
 // narrowing turned 4294967296 (and UINT64_MAX) into INT_MAX, an accepted value that
 // lets the offload buffer grow without bound before its first flush. Enforce the range.
@@ -32789,7 +32899,7 @@ TEST_CASE("MCP B5: software-deployment mutations are tier-denied below supervise
 
 // ── #4644 Gate 7: MCP integer handling never wraps a value into a different one ──
 
-TEST_CASE("MCP query_audit_log: a wrong-typed or out-of-range since/until/limit is -32602, "
+TEST_CASE("MCP query_audit_log: a wrong-typed or out-of-range since/until/limit is -32602 "
           "never a wrapped or defaulted value",
           "[pg][mcp][integration][audit]") {
     YUZU_REQUIRE_PG_DB_TPL(db, mcp_audit_tpl);
@@ -32875,7 +32985,7 @@ TEST_CASE("MCP get_execution_statistics_by_agent: a limit above INT_MAX saturate
 // ── #3526 (ADR-0017): get_execution_statistics_by_agent is confined ────────
 
 TEST_CASE("MCP get_execution_statistics_by_agent: a confined caller sees exactly its visible "
-          "agents, deny-all sees none, the scope applies before the limit (#3526)",
+          "agents deny-all sees none the scope applies before the limit (#3526)",
           "[pg][mcp][integration][operator_surface][security]") {
     yuzu::test::ExecutionTrackerPg tracker_bundle;
     ExecutionTracker& tracker = *tracker_bundle;

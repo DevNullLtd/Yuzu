@@ -5096,7 +5096,7 @@ TEST_CASE("GET /api/v1/schedules: an unrecognized enabled_only value answers 400
 
 // #4644 Gate 7: the workflow list routes read `limit` strictly.
 TEST_CASE("GET /api/workflows and /api/v1/workflows: a trailing-garbage or overflowing limit is "
-          "a 400, not its numeric prefix",
+          "a 400 not its numeric prefix",
           "[pg][workflow][list]") {
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
@@ -5109,5 +5109,29 @@ TEST_CASE("GET /api/workflows and /api/v1/workflows: a trailing-garbage or overf
             REQUIRE(res);
             CHECK(res->status == 400);
         }
+    }
+}
+
+// The legacy product-pack list reads `limit` strictly too (a malformed value used to be its numeric
+// prefix). It answers 503 before the parse when no pack store is wired, so wire one.
+TEST_CASE("GET /api/product-packs: a trailing-garbage or overflowing limit is a 400 a clean one "
+          "is served",
+          "[pg][workflow][list][product_pack]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool, /*with_bus=*/true, /*budget=*/nullptr, /*wire_exec_visible=*/true,
+                  /*with_workflow_engine=*/true, /*wire_fleet_read_fn_arg=*/true,
+                  /*with_product_pack_store=*/true);
+    for (const char* bad : {"limit=100abc", "limit=1e3", "limit=0x10", "limit=", "limit=4294967296"}) {
+        INFO(bad);
+        auto res = h.sink.Get(std::string("/api/product-packs?") + bad);
+        REQUIRE(res);
+        CHECK(res->status == 400);
+    }
+    for (const char* ok : {"limit=10", "limit=007", ""}) {
+        INFO(ok);
+        auto res = h.sink.Get(std::string("/api/product-packs?") + ok);
+        REQUIRE(res);
+        CHECK(res->status == 200);
     }
 }
