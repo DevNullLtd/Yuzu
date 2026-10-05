@@ -84,6 +84,14 @@ inline constexpr std::string_view kSignatureRefusalReasons[] = {"missing", "untr
 /// citing this one in server code.
 inline constexpr std::size_t kMaxSignatureBytes = 64 * 1024;
 
+/// Upper bound on the PEM trust bundle the verifier reads (#5249 Gate 7).
+///
+/// Mozilla's full root store PEM is ~230 KiB; a code-signing anchor bundle is a
+/// handful of certificates. Over-cap is a REFUSAL (`kBundleUnreadable`), never a
+/// truncated parse: the reader bounds the bytes it actually reads, not only the
+/// size the file claims, so a file growing under the read cannot exceed it.
+inline constexpr std::size_t kMaxTrustBundleBytes = 1024 * 1024;
+
 /// Why a signature did not verify. Callers map this onto their own
 /// subject-specific reason strings, which is why this enum carries no prose.
 enum class CmsFailure {
@@ -93,7 +101,8 @@ enum class CmsFailure {
     /// carry the codeSigning EKU.
     kUntrusted,
     /// The configured trust bundle itself could not be loaded — missing,
-    /// unreadable, or holding no usable PEM certificate (#5249). Still a REFUSAL:
+    /// unreadable, not a regular file, larger than `kMaxTrustBundleBytes`, not a
+    /// valid PEM bundle, or holding no PEM certificate or CRL (#5249). Still a REFUSAL:
     /// an unreadable bundle proves nothing, so this fails CLOSED exactly as
     /// `kUntrusted` does. It is a separate kind only so the operator is pointed
     /// at a local configuration fault (the file, its path, its permissions)
@@ -164,14 +173,23 @@ verify_detached_cms_fd(int artifact_fd, std::string_view signature_pem,
 /// Load `trust_bundle_path` exactly as the verifier does, and report why it
 /// could not be loaded — `std::nullopt` when it loads.
 ///
-/// For STARTUP REPORTING ONLY (#5249): the agent warns at boot when its update
-/// trust bundle is configured but unusable, instead of the operator learning it
-/// from the first refused update hours later. It goes through the SAME loader as
-/// `verify_detached_cms*`, so "loadable" here means precisely "the verifier
-/// would get past its first check" — not a separate, weaker readability test
-/// that could disagree with it. It is NOT a gate and grants nothing: every
-/// verification re-loads the bundle and fails closed on its own.
-[[nodiscard]] YUZU_EXPORT std::optional<std::string>
+/// For REPORTING ONLY (#5249): the agent's OTA update checker warns when its
+/// update trust bundle is configured but unusable, instead of the operator
+/// learning it from the first refused update hours later. It goes through the
+/// SAME loader as `verify_detached_cms*`, so "loadable" here means precisely
+/// "the verifier would get past its first check" — not a separate, weaker
+/// readability test that could disagree with it. The returned `kind` is the one
+/// the verifier would report for the same load (`kBundleUnreadable` for a fault
+/// in the bundle file, `kUntrusted` for an internal OpenSSL failure), so a
+/// caller derives its refusal reason through `signature_refusal_reason()` rather
+/// than hardcoding one. It is NOT a gate and grants nothing: every verification
+/// re-loads the bundle and fails closed on its own.
+///
+/// It performs blocking-but-bounded file I/O (a non-blocking open, a regular
+/// file of at most `kMaxTrustBundleBytes`), so it must still never run before
+/// the Windows SCM hand-off (Gate 7 #5249): a bundle on an unreachable network
+/// share can stall the open itself.
+[[nodiscard]] YUZU_EXPORT std::optional<CmsVerifyError>
 probe_trust_bundle(const std::filesystem::path& trust_bundle_path);
 
 } // namespace yuzu::agent

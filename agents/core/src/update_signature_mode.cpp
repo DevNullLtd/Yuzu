@@ -1,11 +1,15 @@
 #include <yuzu/agent/update_signature_mode.hpp>
 
-#include <yuzu/agent/detached_signature.hpp> // probe_trust_bundle
+#include <yuzu/agent/detached_signature.hpp> // probe_trust_bundle, signature_refusal_reason
+
+#include <spdlog/spdlog.h>
 
 #include <algorithm>
 #include <cctype>
+#include <exception>
 #include <format>
 #include <memory>
+#include <utility>
 
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
@@ -115,13 +119,9 @@ std::vector<UpdateSignatureStartupLine> build_update_signature_startup_lines(
         const std::string bundle = cfg.signature_trust_bundle.string();
         lines.push_back({false, std::format("OTA update signature mode: {} (trust bundle: {})",
                                             mode_name, bundle)});
-        if (auto problem = probe_trust_bundle(cfg.signature_trust_bundle)) {
-            lines.push_back(
-                {true, std::format("OTA update trust bundle cannot be loaded: {}. Every signed "
-                                   "update will be REFUSED (reason=bundle_unreadable) until it is "
-                                   "fixed.",
-                                   *problem)});
-        }
+        // NO bundle probe here (#5249 Gate 7): this runs before the Windows SCM
+        // hand-off. The probe runs on the OTA update thread instead
+        // (log_update_trust_bundle_probe, agent.cpp step 4b).
     }
 
     for (const auto& name : unrecognised_update_env_names(env_names, names_case_insensitive)) {
@@ -132,6 +132,65 @@ std::vector<UpdateSignatureStartupLine> build_update_signature_startup_lines(
                                name, kUpdateEnvPrefix)});
     }
     return lines;
+}
+
+void log_update_signature_startup_report(const UpdateConfig& cfg) noexcept {
+    try {
+        const auto env_names = process_environment_names();
+        for (const auto& line :
+             build_update_signature_startup_lines(cfg, env_names, kEnvNamesCaseInsensitive)) {
+            if (line.warning)
+                spdlog::warn("{}", line.text);
+            else
+                spdlog::info("{}", line.text);
+        }
+    } catch (const std::exception& e) {
+        try {
+            spdlog::warn("OTA update signature startup report skipped: {} (reporting only; "
+                         "signature enforcement is unaffected)",
+                         e.what());
+        } catch (...) {}
+    } catch (...) {
+        try {
+            spdlog::warn("OTA update signature startup report skipped: non-standard exception "
+                         "(reporting only; signature enforcement is unaffected)");
+        } catch (...) {}
+    }
+}
+
+std::optional<UpdateSignatureStartupLine> update_trust_bundle_warning(const UpdateConfig& cfg) {
+    const auto mode = update_signature_mode(cfg);
+    if (mode == UpdateSignatureMode::kOff)
+        return std::nullopt;
+    const auto err = probe_trust_bundle(cfg.signature_trust_bundle);
+    if (!err)
+        return std::nullopt;
+    std::string text = std::format(
+        "OTA update trust bundle cannot be loaded as of this check: {}. Every SIGNED update will "
+        "be REFUSED (reason={}) until it loads",
+        err->detail, signature_refusal_reason(err->kind));
+    text += mode == UpdateSignatureMode::kBundle
+                ? "; unsigned updates are still accepted because --update-require-signature is off."
+                : ".";
+    return UpdateSignatureStartupLine{true, std::move(text)};
+}
+
+void log_update_trust_bundle_probe(const UpdateConfig& cfg) noexcept {
+    try {
+        if (const auto line = update_trust_bundle_warning(cfg))
+            spdlog::warn("{}", line->text);
+    } catch (const std::exception& e) {
+        try {
+            spdlog::warn("OTA update trust bundle check skipped: {} (reporting only; signature "
+                         "enforcement is unaffected)",
+                         e.what());
+        } catch (...) {}
+    } catch (...) {
+        try {
+            spdlog::warn("OTA update trust bundle check skipped: non-standard exception "
+                         "(reporting only; signature enforcement is unaffected)");
+        } catch (...) {}
+    }
 }
 
 } // namespace yuzu::agent

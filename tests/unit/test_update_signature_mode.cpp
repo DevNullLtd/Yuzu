@@ -6,8 +6,10 @@
  * main.cpp (which emits the startup lines) and agent.cpp's heartbeat lambda are
  * in no test target, so both are thin callers of the helpers pinned here: the
  * mode tag is written through emit_update_signature_mode_tag() into the same
- * map type contract the protobuf status_tags map satisfies, and the startup
- * lines are built by build_update_signature_startup_lines().
+ * map type contract the protobuf status_tags map satisfies, the startup lines
+ * are built by build_update_signature_startup_lines() and emitted by
+ * log_update_signature_startup_report(), and the OTA update thread's bundle
+ * warning is update_trust_bundle_warning() / log_update_trust_bundle_probe().
  */
 
 #include <yuzu/agent/update_signature_mode.hpp>
@@ -15,9 +17,11 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
+#include <chrono>
 #include <fstream>
 #include <map>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "cms_test_fixtures.hpp"
@@ -26,7 +30,9 @@
 #ifdef _WIN32
 #include <process.h> // _getpid
 #else
-#include <unistd.h> // getpid
+#include <fcntl.h>    // open (FIFO unblock)
+#include <sys/stat.h> // mkfifo
+#include <unistd.h>   // getpid
 #endif
 
 using yuzu::agent::UpdateConfig;
@@ -194,27 +200,43 @@ TEST_CASE("update signature startup lines: mode, bundle path, and warnings",
         }
     }
 
-    SECTION("bundle set but missing: a separate warning naming the fault") {
+    SECTION("startup lines perform no I/O: an absent bundle is not probed here") {
+        // #5249 Gate 7: the bundle probe moved to the OTA update thread, so the
+        // startup report (which runs before the Windows SCM hand-off) says only
+        // the mode — even for a bundle that does not exist.
         auto f = build_signing_fixtures();
         const auto missing = f.dir / "absent-bundle.pem";
         const auto lines = build_update_signature_startup_lines(cfg(missing, true), no_env, false);
-        REQUIRE(lines.size() == 2);
-        CHECK_FALSE(lines[0].warning); // the mode line is still emitted
+        REQUIRE(lines.size() == 1);
+        CHECK_FALSE(lines[0].warning);
         CHECK(lines[0].text.find("mode: bundle+require") != std::string::npos);
-        CHECK(lines[1].warning);
-        CHECK(lines[1].text.find("cannot be loaded") != std::string::npos);
-        CHECK(lines[1].text.find("not found") != std::string::npos);
-        CHECK(lines[1].text.find("bundle_unreadable") != std::string::npos);
     }
 
-    SECTION("bundle set but not PEM: warned too") {
+#ifndef _WIN32
+    SECTION("startup lines perform no I/O: a FIFO bundle with no writer does not block") {
+        // The Gate 7 blocker itself: a FIFO (or an unreachable share) as the
+        // bundle blocked the old startup probe's open forever, before the SCM
+        // hand-off. Bounded harness: a regression FAILs within 10s.
         auto f = build_signing_fixtures();
-        const auto junk = f.dir / "junk-bundle.pem";
-        std::ofstream(junk, std::ios::binary) << "junk";
-        const auto lines = build_update_signature_startup_lines(cfg(junk, false), no_env, false);
-        CHECK(warning_count(lines) == 1);
-        CHECK(any_line_contains(lines, true, "cannot be loaded"));
+        const auto fifo = f.dir / "fifo-bundle.pem";
+        REQUIRE(::mkfifo(fifo.c_str(), 0600) == 0);
+        using namespace std::chrono_literals;
+        auto lines = run_bounded(
+            [c = cfg(fifo, true)] {
+                return build_update_signature_startup_lines(c, std::vector<std::string>{}, false);
+            },
+            10s,
+            [fifo] {
+                const int w = ::open(fifo.c_str(), O_WRONLY | O_NONBLOCK);
+                if (w >= 0)
+                    ::close(w);
+            });
+        if (!lines)
+            FAIL("build_update_signature_startup_lines blocked on a FIFO trust bundle for 10s");
+        REQUIRE(lines->size() == 1);
+        CHECK_FALSE((*lines)[0].warning);
     }
+#endif
 
     SECTION("one warning per unrecognised YUZU_UPDATE_ name, names only") {
         const std::vector<std::string> env = {"YUZU_UPDATE_TRUST_BUNDEL", "PATH",
@@ -226,4 +248,72 @@ TEST_CASE("update signature startup lines: mode, bundle path, and warnings",
         CHECK(any_line_contains(lines, true, "'YUZU_UPDATE_REQUIRE_SIG'"));
         CHECK_FALSE(any_line_contains(lines, true, "'YUZU_UPDATE_REQUIRE_SIGNATURE'"));
     }
+}
+
+TEST_CASE("update trust bundle warning: logged by the OTA update thread, not at startup",
+          "[updater][signing][5249]") {
+    using yuzu::agent::update_trust_bundle_warning;
+    auto f = build_signing_fixtures();
+
+    SECTION("off: nothing to probe") {
+        CHECK_FALSE(update_trust_bundle_warning(cfg({}, false)).has_value());
+        CHECK_FALSE(update_trust_bundle_warning(cfg({}, true)).has_value());
+    }
+
+    SECTION("a loadable bundle: no warning in either mode") {
+        CHECK_FALSE(update_trust_bundle_warning(cfg(f.trust_bundle, false)).has_value());
+        CHECK_FALSE(update_trust_bundle_warning(cfg(f.trust_bundle, true)).has_value());
+    }
+
+    SECTION("a missing bundle, bundle+require: warns with the reason, no unsigned caveat") {
+        const auto missing = f.dir / "absent-bundle.pem";
+        const auto w = update_trust_bundle_warning(cfg(missing, true));
+        REQUIRE(w.has_value());
+        CHECK(w->warning);
+        CHECK(w->text.find("as of this check") != std::string::npos);
+        CHECK(w->text.find("not found") != std::string::npos);
+        CHECK(w->text.find("reason=bundle_unreadable") != std::string::npos);
+        CHECK(w->text.find("unsigned updates are still accepted") == std::string::npos);
+    }
+
+    SECTION("a missing bundle, bundle mode: says unsigned updates are still accepted") {
+        const auto missing = f.dir / "absent-bundle.pem";
+        const auto w = update_trust_bundle_warning(cfg(missing, false));
+        REQUIRE(w.has_value());
+        CHECK(w->text.find("reason=bundle_unreadable") != std::string::npos);
+        CHECK(w->text.find("unsigned updates are still accepted") != std::string::npos);
+    }
+
+    SECTION("a bundle that is not PEM: warned too") {
+        const auto junk = f.dir / "junk-bundle.pem";
+        std::ofstream(junk, std::ios::binary) << "junk";
+        const auto w = update_trust_bundle_warning(cfg(junk, false));
+        REQUIRE(w.has_value());
+        CHECK(w->text.find("reason=bundle_unreadable") != std::string::npos);
+    }
+}
+
+// A diagnostic must never stop boot (#5249 Gate 7): both emitters are noexcept,
+// so a throw inside them is caught by their own firewall, never std::terminate.
+static_assert(noexcept(
+    yuzu::agent::log_update_signature_startup_report(std::declval<const UpdateConfig&>())));
+static_assert(
+    noexcept(yuzu::agent::log_update_trust_bundle_probe(std::declval<const UpdateConfig&>())));
+
+TEST_CASE("update signature log emitters: never throw, even on a missing bundle",
+          "[updater][signing][5249]") {
+    auto f = build_signing_fixtures();
+    const auto missing = f.dir / "absent-bundle.pem";
+    for (const bool require : {false, true}) {
+        CHECK_NOTHROW(yuzu::agent::log_update_signature_startup_report(cfg(missing, require)));
+        CHECK_NOTHROW(yuzu::agent::log_update_trust_bundle_probe(cfg(missing, require)));
+    }
+#ifdef _WIN32
+    // A non-ACP path (Cyrillic) reaches the report via CLI11's UTF-8 widen; on
+    // MSVC path::string() throws for it. The firewall must turn that into a
+    // "report skipped" warning, not a terminated boot.
+    const fs::path non_acp = L"C:\\yuzu\\\u042F\\bundle.pem";
+    CHECK_NOTHROW(yuzu::agent::log_update_signature_startup_report(cfg(non_acp, true)));
+    CHECK_NOTHROW(yuzu::agent::log_update_trust_bundle_probe(cfg(non_acp, true)));
+#endif
 }

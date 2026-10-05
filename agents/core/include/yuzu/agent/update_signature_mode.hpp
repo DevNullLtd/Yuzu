@@ -17,11 +17,18 @@
 ///    agent ACTUALLY loaded (`off` / `bundle` / `bundle+require`), derived from
 ///    the same `UpdateConfig` the updater enforces from, never from a re-read of
 ///    the environment.
-///  * `emit_update_signature_mode_tag()` — the heartbeat tag, so the server and
-///    fleet views can find agents that are not enforcing.
+///  * `emit_update_signature_mode_tag()` — the heartbeat tag, so a fleet view
+///    CAN find agents that are not enforcing once the server surfaces the tag;
+///    today it is stored in the agent-health snapshot and read by nothing, so
+///    the startup log line is the per-endpoint source of truth.
 ///  * `unrecognised_update_env_names()` — the startup typo check.
 ///  * `build_update_signature_startup_lines()` — the startup log lines, built
-///    here (testable) and emitted by `main.cpp` (which is in no test target).
+///    here (testable, pure) and emitted through
+///    `log_update_signature_startup_report()` by `main.cpp` (which is in no
+///    test target).
+///  * `update_trust_bundle_warning()` / `log_update_trust_bundle_probe()` — the
+///    bundle-load warning, logged once per process by the OTA update thread
+///    (agent.cpp step 4b) when the update checker first starts, NOT at startup.
 ///
 /// REPORTING ONLY. Nothing here gates, grants or changes enforcement; the
 /// updater and `detached_signature.cpp` remain the sole decision points.
@@ -30,6 +37,7 @@
 
 #include <yuzu/agent/updater.hpp> // UpdateConfig
 
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -155,12 +163,41 @@ struct UpdateSignatureStartupLine {
 ///  * always one info line naming the mode and the bundle path (`off` says in
 ///    words that update binaries are not signature-checked — info, not warn,
 ///    because off is the shipped default);
-///  * a warning when the bundle is set but `probe_trust_bundle()` cannot load it
-///    (every update would then be refused as `bundle_unreadable`);
 ///  * one warning per unrecognised `YUZU_UPDATE_*` name in `env_names`.
+///
+/// Performs NO filesystem I/O; the bundle probe runs on the OTA update thread
+/// (agent.cpp step 4b) — see `log_update_trust_bundle_probe()`. This runs
+/// before the Windows SCM hand-off, where a blocking open would exceed the
+/// service START_PENDING hint (#5249 Gate 7).
 [[nodiscard]] YUZU_EXPORT std::vector<UpdateSignatureStartupLine>
 build_update_signature_startup_lines(const UpdateConfig& cfg,
                                      std::span<const std::string> env_names,
                                      bool names_case_insensitive);
+
+/// Emit the startup report for `cfg` (the process environment's names, the
+/// lines from `build_update_signature_startup_lines()`) to spdlog.
+///
+/// A DIAGNOSTIC MUST NEVER STOP BOOT: main() has no enclosing handler and this
+/// runs before the Windows SCM hand-off; a throw here (bad_alloc, or MSVC
+/// path::string() on a non-ACP path reached via CLI11's UTF-8 widen) would
+/// std::terminate every start (#5249 Gate 7). Every exception is caught and
+/// downgraded to one "report skipped" warning; enforcement is unaffected.
+YUZU_EXPORT void log_update_signature_startup_report(const UpdateConfig& cfg) noexcept;
+
+/// The bundle-load warning for `cfg`, or `std::nullopt` when the mode is off or
+/// the bundle loads through `probe_trust_bundle()` (the verifier's own loader).
+/// When present it is a warning line naming the fault and the refusal reason
+/// (`signature_refusal_reason()` of the probe's kind) every signed update will
+/// carry until the bundle loads. Performs bounded file I/O: never call it
+/// before the Windows SCM hand-off.
+[[nodiscard]] YUZU_EXPORT std::optional<UpdateSignatureStartupLine>
+update_trust_bundle_warning(const UpdateConfig& cfg);
+
+/// Log `update_trust_bundle_warning(cfg)` at warn level if present. Called once
+/// per process from the OTA update thread (agent.cpp step 4b), so the warning
+/// appears when the update checker starts — after the agent first connects, and
+/// only when auto-update is enabled. Same firewall as
+/// `log_update_signature_startup_report()`: reporting only, never throws.
+YUZU_EXPORT void log_update_trust_bundle_probe(const UpdateConfig& cfg) noexcept;
 
 } // namespace yuzu::agent

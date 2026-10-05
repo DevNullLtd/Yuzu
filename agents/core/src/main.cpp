@@ -727,24 +727,21 @@ int main(int argc, char* argv[]) {
     // per-agent HMAC key (k_agent) is NEVER logged (roadmap R16), only the mode.
     spdlog::info("software_licensing user_ref mode: {}", cfg.license_scan_user_ref);
     // #5249: say which OTA update-signature mode this process actually loaded
-    // (off / bundle / bundle+require) and the bundle path, warn if that bundle
-    // cannot be loaded, and warn on any YUZU_UPDATE_* variable this agent does not
-    // read (a misspelt name is otherwise silently ignored). Built from the same
-    // two Config fields agent.cpp hands the Updater, AFTER the fail-open guard
-    // above, so it reports what will be enforced. Sited here, before the Windows
-    // service hand-off, so the service and console paths both log it.
-    {
-        const auto env_names = yuzu::agent::process_environment_names();
-        for (const auto& line : yuzu::agent::build_update_signature_startup_lines(
-                 yuzu::agent::UpdateConfig{.signature_trust_bundle = cfg.update_trust_bundle,
-                                           .require_signature = cfg.update_require_signature},
-                 env_names, yuzu::agent::kEnvNamesCaseInsensitive)) {
-            if (line.warning)
-                spdlog::warn("{}", line.text);
-            else
-                spdlog::info("{}", line.text);
-        }
-    }
+    // (off / bundle / bundle+require) and the bundle path, and warn on any
+    // YUZU_UPDATE_* variable this agent does not read (a misspelt name is
+    // otherwise silently ignored). Built from the same two Config fields
+    // agent.cpp hands the Updater, AFTER the fail-open guard above, so it reports
+    // what will be enforced. Sited here, before the Windows service hand-off, so
+    // the service and console paths both log it.
+    //
+    // NO I/O here: this runs BEFORE the Windows SCM hand-off and a blocking open
+    // (FIFO, unreachable UNC) would exceed the 30s START_PENDING hint (error
+    // 1053) — Gate 7 #5249. The bundle probe runs on the OTA update thread. And
+    // the call is noexcept with its own firewall: a diagnostic must never stop
+    // boot (main() has no enclosing handler).
+    yuzu::agent::log_update_signature_startup_report(
+        yuzu::agent::UpdateConfig{.signature_trust_bundle = cfg.update_trust_bundle,
+                                  .require_signature = cfg.update_require_signature});
 
 #ifdef _WIN32
     // #1822: hand off to the SCM ServiceMain dispatcher instead of running the

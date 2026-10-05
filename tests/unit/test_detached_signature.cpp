@@ -11,6 +11,8 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
+#include <chrono>
 #include <fstream>
 #include <string>
 
@@ -18,6 +20,7 @@
 
 #ifndef _WIN32
 #include <fcntl.h>
+#include <sys/stat.h> // mkfifo
 #include <unistd.h>
 #endif
 
@@ -156,8 +159,9 @@ TEST_CASE("detached CMS: a genuinely untrusted signer is still kUntrusted, not b
 }
 
 TEST_CASE("probe_trust_bundle: agrees with the verifier's own load", "[signature][cms]") {
-    // The startup warning (#5249) uses this. It must go through the verifier's
-    // loader, so a bundle it calls loadable is one the verifier gets past.
+    // The OTA update checker's bundle warning (#5249) uses this. It must go
+    // through the verifier's loader, so a bundle it calls loadable is one the
+    // verifier gets past, and it reports the SAME kind the verifier would.
     auto f = build_signing_fixtures();
     CHECK_FALSE(yuzu::agent::probe_trust_bundle(f.trust_bundle).has_value());
     CHECK_FALSE(yuzu::agent::probe_trust_bundle(f.other_trust_bundle).has_value());
@@ -165,17 +169,81 @@ TEST_CASE("probe_trust_bundle: agrees with the verifier's own load", "[signature
     const auto missing = f.dir / "nope.pem";
     auto problem = yuzu::agent::probe_trust_bundle(missing);
     REQUIRE(problem.has_value());
-    CHECK(problem->find(missing.string()) != std::string::npos);
-    CHECK(problem->find("not found") != std::string::npos);
+    CHECK(problem->kind == CmsFailure::kBundleUnreadable);
+    CHECK(problem->detail.find(missing.string()) != std::string::npos);
+    CHECK(problem->detail.find("not found") != std::string::npos);
+    // And the verifier agrees on the kind for the same bundle.
+    auto verified = verify_detached_cms(f.artifact_file, read_file(f.sig_file), missing);
+    REQUIRE(verified.has_value());
+    CHECK(verified->kind == problem->kind);
 
     const auto garbage = f.dir / "garbage.pem";
     std::ofstream(garbage, std::ios::binary) << "junk";
-    CHECK(yuzu::agent::probe_trust_bundle(garbage).has_value());
+    auto garbage_problem = yuzu::agent::probe_trust_bundle(garbage);
+    REQUIRE(garbage_problem.has_value());
+    CHECK(garbage_problem->kind == CmsFailure::kBundleUnreadable);
+    CHECK(garbage_problem->detail.find("holds no PEM certificate or CRL") != std::string::npos);
+
+    // A PEM block whose body does not decode is "not a valid PEM bundle" —
+    // never reported as merely holding no certificate.
+    const auto broken = f.dir / "broken.pem";
+    std::ofstream(broken, std::ios::binary)
+        << "-----BEGIN CERTIFICATE-----\n!!!! not base64 !!!!\n-----END CERTIFICATE-----\n";
+    auto broken_problem = yuzu::agent::probe_trust_bundle(broken);
+    REQUIRE(broken_problem.has_value());
+    CHECK(broken_problem->kind == CmsFailure::kBundleUnreadable);
+    CHECK(broken_problem->detail.find("not a valid PEM bundle") != std::string::npos);
+    CHECK(broken_problem->detail.find("holds no") == std::string::npos);
 
     // A directory is not a bundle file.
     auto dir_problem = yuzu::agent::probe_trust_bundle(f.dir);
     REQUIRE(dir_problem.has_value());
-    CHECK(dir_problem->find("not a regular file") != std::string::npos);
+    CHECK(dir_problem->kind == CmsFailure::kBundleUnreadable);
+    CHECK(dir_problem->detail.find("not a regular file") != std::string::npos);
+}
+
+TEST_CASE("trust bundle: over the size cap is refused, never truncated", "[signature][cms][5249]") {
+    // #5249 Gate 7: the bundle is read bounded. One byte over the cap is a
+    // bundle fault naming the cap — not a parse of the first N bytes.
+    auto f = build_signing_fixtures();
+    const auto big = f.dir / "oversized-bundle.pem";
+    {
+        std::ofstream out(big, std::ios::binary);
+        const std::string chunk(64 * 1024, 'A');
+        std::size_t left = yuzu::agent::kMaxTrustBundleBytes + 1;
+        while (left > 0) {
+            const auto n = std::min(left, chunk.size());
+            out.write(chunk.data(), static_cast<std::streamsize>(n));
+            left -= n;
+        }
+    }
+    REQUIRE(fs::file_size(big) == yuzu::agent::kMaxTrustBundleBytes + 1);
+
+    auto problem = yuzu::agent::probe_trust_bundle(big);
+    REQUIRE(problem.has_value());
+    CHECK(problem->kind == CmsFailure::kBundleUnreadable);
+    CHECK(problem->detail.find("exceeds") != std::string::npos);
+
+    auto err = verify_detached_cms(f.artifact_file, read_file(f.sig_file), big);
+    REQUIRE(err.has_value());
+    CHECK(err->kind == CmsFailure::kBundleUnreadable);
+    CHECK(err->detail.find("exceeds") != std::string::npos);
+}
+
+TEST_CASE("trust bundle: in-memory parse keeps the file loader's tolerance",
+          "[signature][cms][5249]") {
+    // Parity guard for replacing X509_STORE_load_locations with a bounded read
+    // + PEM_X509_INFO_read_bio: text outside PEM blocks is skipped, and a CA
+    // listed twice is not an error. A bundle an operator already has must keep
+    // verifying.
+    auto f = build_signing_fixtures();
+    const std::string ca_pem = read_file(f.trust_bundle);
+    const auto commented = f.dir / "commented-bundle.pem";
+    std::ofstream(commented, std::ios::binary)
+        << "# Yuzu update signing anchors - not PEM, must be skipped\n"
+        << ca_pem << ca_pem;
+    CHECK_FALSE(yuzu::agent::probe_trust_bundle(commented).has_value());
+    CHECK_FALSE(verify_detached_cms(f.artifact_file, read_file(f.sig_file), commented).has_value());
 }
 
 TEST_CASE("signature_refusal_reason: every kind maps into the shared reason list",
@@ -275,6 +343,68 @@ TEST_CASE("detached CMS (fd): a bad descriptor is rejected, not dereferenced",
     auto err = verify_detached_cms_fd(-1, sig, f.trust_bundle);
     REQUIRE(err.has_value());
     CHECK(err->kind == CmsFailure::kInvalid);
+}
+
+TEST_CASE("trust bundle: a FIFO is refused promptly, not blocked on", "[signature][cms][5249]") {
+    // #5249 Gate 7. The old loader fopen()ed the bundle: a FIFO with no writer
+    // blocked that open forever — on the OTA update thread, and (before this
+    // fix) in main() ahead of the Windows SCM hand-off. Bounded harness: a
+    // regression FAILs within 10s rather than hanging the suite.
+    auto f = build_signing_fixtures();
+    const auto fifo = f.dir / "fifo-bundle.pem";
+    REQUIRE(::mkfifo(fifo.c_str(), 0600) == 0);
+    const auto unblock = [fifo] {
+        // Opening the write end releases a reader blocked in open().
+        const int w = ::open(fifo.c_str(), O_WRONLY | O_NONBLOCK);
+        if (w >= 0)
+            ::close(w);
+    };
+    using namespace std::chrono_literals;
+
+    auto probed =
+        run_bounded([fifo] { return yuzu::agent::probe_trust_bundle(fifo); }, 10s, unblock);
+    if (!probed)
+        FAIL("probe_trust_bundle blocked on a FIFO trust bundle for 10s");
+    REQUIRE(probed->has_value());
+    CHECK((*probed)->kind == CmsFailure::kBundleUnreadable);
+    CHECK((*probed)->detail.find("not a regular file") != std::string::npos);
+
+    const auto sig = read_file(f.sig_file);
+    auto verified = run_bounded([artifact = f.artifact_file, sig,
+                                 fifo] { return verify_detached_cms(artifact, sig, fifo); },
+                                10s, unblock);
+    if (!verified)
+        FAIL("verify_detached_cms blocked on a FIFO trust bundle for 10s");
+    REQUIRE(verified->has_value());
+    CHECK((*verified)->kind == CmsFailure::kBundleUnreadable);
+    CHECK((*verified)->detail.find("not a regular file") != std::string::npos);
+}
+
+TEST_CASE("trust bundle: a character device is not a regular file", "[signature][cms][5249]") {
+    // /dev/null reads as empty; /dev/zero would read without end. Neither is a
+    // bundle, and the type is checked on the HELD descriptor.
+    auto problem = yuzu::agent::probe_trust_bundle("/dev/null");
+    REQUIRE(problem.has_value());
+    CHECK(problem->kind == CmsFailure::kBundleUnreadable);
+    CHECK(problem->detail.find("not a regular file") != std::string::npos);
+}
+
+TEST_CASE("trust bundle: a permission-denied bundle says so", "[signature][cms][5249]") {
+    // The #5196 shape: the file exists but the agent's account cannot read it.
+    if (::geteuid() == 0)
+        SKIP("running as root: mode 000 does not deny read");
+    auto f = build_signing_fixtures();
+    const auto locked = f.dir / "locked-bundle.pem";
+    fs::copy_file(f.trust_bundle, locked);
+    REQUIRE(::chmod(locked.c_str(), 0000) == 0);
+    // Restore before the fixture's remove_all runs (declared after `f`, so it
+    // destructs first).
+    yuzu::test::ScopeExit restore{[&locked] { ::chmod(locked.c_str(), 0600); }};
+
+    auto problem = yuzu::agent::probe_trust_bundle(locked);
+    REQUIRE(problem.has_value());
+    CHECK(problem->kind == CmsFailure::kBundleUnreadable);
+    CHECK(problem->detail.find("permission denied") != std::string::npos);
 }
 
 #endif // !_WIN32

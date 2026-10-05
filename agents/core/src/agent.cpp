@@ -2119,6 +2119,13 @@ public:
                                                   updater = updater()]() {
                         spdlog::info("OTA update checker started (interval={}s)",
                                      cfg_.update_check_interval.count());
+                        // #5249 Gate 7: the trust-bundle load warning, here and not
+                        // in main() (which runs before the Windows SCM hand-off).
+                        // Once per process; noexcept, reporting only.
+                        if (!ota_bundle_probe_logged_.exchange(true))
+                            yuzu::agent::log_update_trust_bundle_probe(
+                                UpdateConfig{.signature_trust_bundle = cfg_.update_trust_bundle,
+                                             .require_signature = cfg_.update_require_signature});
                         while (!stop_requested_.load(std::memory_order_acquire)) {
                             auto result = updater->check_and_apply(raw_stub);
                             if (result.has_value() && result.value()) {
@@ -2481,9 +2488,12 @@ public:
                                     std::to_string(static_cast<int64_t>(refused));
                             }
                             // #5249: the OTA update-signature mode this process
-                            // enforces (off / bundle / bundle+require), so the
-                            // fleet can find agents that are NOT verifying update
-                            // signatures. Without it, an agent whose bundle flag
+                            // enforces (off / bundle / bundle+require), so a fleet
+                            // view CAN find agents that are NOT verifying update
+                            // signatures once the server surfaces the tag; today
+                            // it is stored in the agent-health snapshot and read
+                            // by nothing (the startup log line is the per-endpoint
+                            // verification). Without it, an agent whose bundle flag
                             // was dropped or misspelt looks exactly like an
                             // enforcing one: the refusal tag above stays 0 either
                             // way. Same two Config fields the Updater is built
@@ -4428,6 +4438,10 @@ private:
         }
     }
     std::thread update_thread_;
+    // #5249 Gate 7: the OTA trust-bundle warning is logged once per process: 4b
+    // re-spawns update_thread_ on every reconnect (the reconnect teardown joins it
+    // before the next spawn).
+    std::atomic<bool> ota_bundle_probe_logged_{false};
     std::thread heartbeat_thread_;
     std::thread sync_thread_; // ADR-0016 daily-sync thread (per-connection)
 
