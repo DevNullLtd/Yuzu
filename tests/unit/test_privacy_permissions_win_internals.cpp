@@ -28,6 +28,7 @@
 #include <fstream>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -50,6 +51,12 @@ namespace fs = std::filesystem;
 #include <winioctl.h> // FSCTL_SET_SPARSE (the sparse-file oversize fixture)
 
 using namespace yuzu::privacy_permissions;
+
+static_assert(!std::is_copy_constructible_v<UniqueHandle>);
+static_assert(!std::is_copy_constructible_v<FindHandle>);
+static_assert(!std::is_copy_constructible_v<LocalFreeGuard>);
+static_assert(!std::is_copy_constructible_v<StabilityWatch>);
+static_assert(!std::is_copy_constructible_v<Win32Registry>);
 
 namespace {
 
@@ -192,6 +199,7 @@ TEST_CASE("privacy_permissions win: walk_consent_store decodes a fixture Consent
           "missing store, and stops at an expired deadline",
           "[privacy_permissions][win_internals]") {
     TestKey key;
+    Win32Registry reg;
     const std::wstring store = kStorePath;
     set_sz(key.make(store + L"\\webcam").get(), L"Value", L"Allow");
     set_sz(key.make(store + L"\\webcam\\Pkg.App_1").get(), L"Value", L"Allow");
@@ -216,7 +224,7 @@ TEST_CASE("privacy_permissions win: walk_consent_store decodes a fixture Consent
 
     SECTION("the fixture is decoded level by level; unmodelled and missing keys stay visible") {
         win::RetentionBudget budget;
-        const auto w = walk_consent_store(key.root, budget);
+        const auto w = win::walk_consent_store(reg, key.root, budget);
         CHECK(w.root_rc == ERROR_SUCCESS);
         CHECK(w.refused.empty());
         CHECK(w.structural.empty());
@@ -243,7 +251,7 @@ TEST_CASE("privacy_permissions win: walk_consent_store decodes a fixture Consent
     }
     SECTION("hostile Value shapes are unreadable with a named cause, never decoded or allocated") {
         win::RetentionBudget budget;
-        const auto w = walk_consent_store(key.root, budget);
+        const auto w = win::walk_consent_store(reg, key.root, budget);
         const auto* big = find(w.grants, "Pkg.Big", "camera");
         REQUIRE(big);
         CHECK(big->state == PermissionState::unreadable);
@@ -258,10 +266,51 @@ TEST_CASE("privacy_permissions win: walk_consent_store decodes a fixture Consent
         CHECK(dword->state == PermissionState::unreadable);
         CHECK(dword->cause == "value_type_" + std::to_string(REG_DWORD));
     }
+    SECTION("key names fold the way the registry's own do: a lowercase pair, and a non-ASCII child") {
+        // (i) `nonpackaged` / `EXECUTABLES` differ from the canonical names only by ASCII case: the
+        // registry opens them as the same keys, so the walk must not read them as apps.
+        {
+            TestKey t;
+            set_sz(t.make(store + L"\\webcam").get(), L"Value", L"Allow");
+            set_sz(t.make(store + L"\\webcam\\nonpackaged").get(), L"Value", L"Allow");
+            t.make(store + L"\\webcam\\nonpackaged\\EXECUTABLES\\foo.exe");
+            win::RetentionBudget budget;
+            const auto w = win::walk_consent_store(reg, t.root, budget);
+            std::size_t toggles = 0;
+            for (const auto& g : w.grants) {
+                if (g.category != "camera") continue;
+                CHECK(g.app_id != "nonpackaged");
+                CHECK(g.app_id != "EXECUTABLES");
+                if (g.app_id == "NonPackaged") ++toggles;
+            }
+            CHECK(toggles == 1);
+            const auto* toggle = find(w.grants, "NonPackaged", "camera");
+            REQUIRE(toggle);
+            CHECK(toggle->state == PermissionState::allowed);
+            for (const auto& g : w.structural) CHECK(g.cause.find("duplicate_app_id") == std::string::npos);
+        }
+        // (ii) `Executable` + U+017F: whether it IS the container is the registry's call, so the
+        // registry is the oracle -- the canonical name opens it exactly when the registry folds it.
+        {
+            TestKey u;
+            const std::wstring odd = L"Executable\x017f";
+            set_sz(u.make(store + L"\\webcam").get(), L"Value", L"Allow");
+            const auto nonpkg = u.make(store + L"\\webcam\\NonPackaged");
+            set_sz(u.make(store + L"\\webcam\\NonPackaged\\" + odd).get(), L"Value", L"Allow");
+            HKEY probe = nullptr;
+            const bool reg_folds =
+                RegOpenKeyExW(nonpkg.get(), L"Executables", 0, KEY_READ, &probe) == ERROR_SUCCESS;
+            if (probe) RegCloseKey(probe);
+            CHECK(reg.key_name_equals(odd, win::kExecutablesContainerKeyName) == reg_folds);
+            win::RetentionBudget budget;
+            const auto w = win::walk_consent_store(reg, u.root, budget);
+            CHECK((find(w.grants, reg.utf8(odd), "camera") != nullptr) == !reg_folds);
+        }
+    }
     SECTION("a missing ConsentStore reads file-not-found and every category absent") {
         TestKey empty;
         win::RetentionBudget budget;
-        const auto w = walk_consent_store(empty.root, budget);
+        const auto w = win::walk_consent_store(reg, empty.root, budget);
         CHECK(w.root_rc == ERROR_FILE_NOT_FOUND);
         CHECK(w.grants.size() == win::kCapabilities.size());
         for (const auto& g : w.grants) CHECK(g.state == PermissionState::absent);
@@ -269,7 +318,7 @@ TEST_CASE("privacy_permissions win: walk_consent_store decodes a fixture Consent
     SECTION("an already-expired deadline stops the walk before any key is read") {
         win::RetentionBudget budget;
         budget.deadline = std::chrono::steady_clock::now() - std::chrono::seconds{1};
-        const auto w = walk_consent_store(key.root, budget);
+        const auto w = win::walk_consent_store(reg, key.root, budget);
         CHECK(budget.timed_out);
         CHECK(w.grants.empty());
     }

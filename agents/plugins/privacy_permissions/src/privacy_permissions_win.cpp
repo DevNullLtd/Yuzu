@@ -28,9 +28,10 @@
  * window, as it does for every `reg load`; a sidecar swapped in after its check is likewise open.
  *
  * STABILITY: a RegNotifyChangeKeyValue watch is armed on each ConsentStore root before its walk
- * and polled after; a change the API reports refuses that source (`changed_during_read`), and a
- * watch that cannot be created, armed or polled refuses it too -- failure to observe stability is
- * never stability. Residual: a RegRestoreKey-style whole-key replacement is not reported.
+ * and polled after; a change the API reports discards that read and the source is walked ONCE more
+ * (never once the deadline has passed); a source that changed again during its one re-walk, or
+ * whose deadline left no time for one, is refused (`changed_during_read`), and a watch that cannot
+ * be created, armed or polled refuses it too -- failure to observe stability is never stability. Residual: a RegRestoreKey-style whole-key replacement is not reported.
  *
  * DEADLINE: ~15 s, COOPERATIVE -- checked before each profile, first thing in the hive-file
  * guard's before_load, and before each capability and each app key open; there is no detached
@@ -38,6 +39,9 @@
  * wait behind a sibling plugin's offline arm, RegLoadKeyW/RegUnLoadKeyW) is not interrupted, nor
  * is one enumeration of at most 4,096 children, the capability-level key opens, or one key's
  * value reads, so a dispatch can overrun it.
+ *
+ * SEAMS: the registry walk (privacy_permissions_win_walk.hpp) reads the OS through win::RegistryReader,
+ * implemented here by Win32Registry; fake-registry tests lock its branches on every host.
  *
  * PRECEDENCE (win_parsers.hpp merge_with_hklm, unit-tested): Microsoft's documented Settings
  * model, confirmed on the-rig 2026-09-23 (a non-MDM Windows 11 host: HKLM `<capability>` `Value
@@ -52,7 +56,7 @@
  * (app_id `NonPackaged`) -- and each app key. A per-app NonPackaged key carries no `Value` (only
  * LastUsedTime*), so it reads `absent` with its timestamps: no per-app decision, governed by the
  * NonPackaged toggle row. `NonPackaged\Executables` is a container of per-exe prompt flags, not
- * an app, and is skipped (win::is_nonpackaged_container_key).
+ * an app, and is skipped by the registry's own (ordinal, case-insensitive) name compare.
  * `app_id` is qualified with the owning profile's name (qualify_app_id, never the SID --
  * ADR-0024 D11); an unqualified app_id is HKLM's own row.
  *
@@ -78,13 +82,16 @@
  */
 #include "privacy_permissions_legs.hpp"
 #include "privacy_permissions_win_parsers.hpp"
+#include "privacy_permissions_win_walk.hpp"
 
 #if defined(_WIN32)
 
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
+#include <memory>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -113,127 +120,18 @@ static_assert(win::kErrorSuccess == ERROR_SUCCESS);
 static_assert(win::kErrorFileNotFound == ERROR_FILE_NOT_FOUND);
 static_assert(win::kErrorAccessDenied == ERROR_ACCESS_DENIED);
 static_assert(win::kErrorNoMoreItems == ERROR_NO_MORE_ITEMS);
+static_assert(win::kErrorMoreData == ERROR_MORE_DATA);
 static_assert(win::kRegSz == REG_SZ);
 static_assert(win::kRegQword == REG_QWORD);
 static_assert(win::kDriveFixed == DRIVE_FIXED);
 static_assert(win::kWaitObject0 == WAIT_OBJECT_0);
 static_assert(win::kWaitTimeout == WAIT_TIMEOUT);
 
-constexpr wchar_t kConsentStorePath[] =
-    L"Software\\Microsoft\\Windows\\CurrentVersion\\CapabilityAccessManager\\ConsentStore";
-
-// A ConsentStore subtree is under the OWNING USER's write access (packaged/
-// NonPackaged app keys), so an unbounded enumeration lets that same user pin the instruction
-// worker -- and, on the offline-hive arm, hold the process-wide offline_hive_mutex() -- for as
-// long as they can keep stuffing subkeys. Same shape and same order-of-magnitude as
-// win_profiles.hpp's own kMaxEnumeratedValueNames (4096), the precedent this cap copies.
-inline constexpr DWORD kMaxEnumeratedSubkeys = 4096;
-
-struct SubkeyEnum {
-    std::vector<std::wstring> names;
-    win::EnumVerdict verdict;
-};
-
-/// Every child key name of `parent`, capped at kMaxEnumeratedSubkeys, plus how the walk ended
-/// (win::classify_subkey_enum decides). The code that ended the walk is never
-/// discarded -- a mid-enumeration ERROR_ACCESS_DENIED is not "every child enumerated".
-/// When the loop stops at the cap, one extra, uncounted RegEnumKeyExW probe at
-/// the next index tells "exactly cap children" (complete) from "more exist" (truncated) --
-/// win_profiles.hpp's enumerate_profile_records/profile_list_actually_truncated precedent.
-SubkeyEnum enumerate_subkey_names(HKEY parent) {
-    SubkeyEnum out{{}, {win::EnumOutcome::complete}};
-    constexpr DWORD kNameBufLen = 512;
-    wchar_t buf[kNameBufLen]{};
-    DWORD idx = 0, len = kNameBufLen;
-    LONG rc = ERROR_SUCCESS;
-    std::size_t embedded_nul = 0;
-    while (idx < kMaxEnumeratedSubkeys &&
-           (rc = RegEnumKeyExW(parent, idx++, buf, &len, nullptr, nullptr, nullptr, nullptr)) ==
-               ERROR_SUCCESS) {
-        // A counted name with an embedded NUL cannot be reopened by c_str() (the open and
-        // from_wide stop at the NUL, so it would read a prefix sibling or, with a leading NUL,
-        // the parent itself): skip it here, the one site both walks route through, and count it.
-        // A zero-length name is the same hazard: RegOpenKeyExW(parent, L"") reopens the PARENT.
-        if (len == 0 || std::wstring_view(buf, len).find(L'\0') != std::wstring_view::npos)
-            ++embedded_nul;
-        else
-            out.names.emplace_back(buf, len);
-        len = kNameBufLen;
-    }
-    LONG probe_rc = ERROR_NO_MORE_ITEMS;
-    if (rc == ERROR_SUCCESS) { // stopped by the cap alone
-        DWORD probe_len = kNameBufLen;
-        probe_rc = RegEnumKeyExW(parent, idx, buf, &probe_len, nullptr, nullptr, nullptr, nullptr);
-    }
-    out.verdict = win::classify_subkey_enum(rc, probe_rc);
-    out.verdict.embedded_nul_names = embedded_nul;
-    return out;
-}
-
-/// Reads one grant's `Value` (+ LastUsedTime*) from `app_key`. Every non-success outcome other
-/// than "no Value here" (absent) sets a `cause`, so it is reported, never silently kept.
-RawGrant read_one_grant(HKEY app_key, std::string app_id, std::string_view category) {
-    RawGrant g{std::move(app_id), category, PermissionState::unreadable, "-"};
-
-    DWORD type = 0, size = 0;
-    const LONG probe_rc = RegQueryValueExW(app_key, L"Value", nullptr, &type, nullptr, &size);
-    if (probe_rc == ERROR_SUCCESS && size > win::kMaxConsentValueBytes) {
-        // This subtree is under the OWNING USER's write access, so an unbounded
-        // allocation sized from a provider-reported DWORD would let that user make the
-        // privileged agent retain an arbitrarily large buffer per value -- capped at the small
-        // ConsentStore-literal bound (win::kMaxConsentValueBytes), reported, never truncated.
-        g.cause = "value_oversized";
-    } else if (probe_rc == ERROR_SUCCESS && size > 0) {
-        std::vector<wchar_t> buf(size / sizeof(wchar_t) + 1, L'\0');
-        DWORD sz = size;
-        const LONG real_rc = RegQueryValueExW(app_key, L"Value", nullptr, &type,
-                                              reinterpret_cast<BYTE*>(buf.data()), &sz);
-        if (real_rc == ERROR_SUCCESS) {
-            // `sz` (the size the SECOND read returned) bounds the decode, not the probe's size.
-            const std::string val = yuzu::win::reg_sz_to_utf8(buf.data(), sz);
-            g.state = win::decode_consent_value(val, type == REG_SZ);
-            g.raw_value = val.empty() ? "-" : val;
-            if (g.state == PermissionState::unreadable)
-                g.cause = (type != REG_SZ) ? "value_type_" + std::to_string(type) : "value_empty";
-        } else if (real_rc == ERROR_ACCESS_DENIED) {
-            // The second read can itself be refused even though the size probe
-            // succeeded (an ACL change between the two calls).
-            g.state = PermissionState::denied;
-            g.read_denied = true;
-            g.cause = "value_access_denied";
-        } else {
-            // ERROR_MORE_DATA (the value grew between the two calls) or any other error.
-            g.cause = "value_" + win::win32_cause(real_rc);
-        }
-    } else if (probe_rc == ERROR_SUCCESS) {
-        g.cause = "value_empty"; // a zero-size Value: present, but carries nothing to decode
-    } else if (probe_rc == ERROR_FILE_NOT_FOUND) {
-        g.state = PermissionState::absent; // no Value under this key -- genuinely not there
-    } else if (probe_rc == ERROR_ACCESS_DENIED) {
-        g.state = PermissionState::denied; // the read was refused, never collapsed into absent
-        g.read_denied = true;
-        g.cause = "value_access_denied";
-    } else {
-        g.cause = "value_" + win::win32_cause(probe_rc);
-    }
-
-    const auto read_last_used = [&](const wchar_t* name) {
-        std::uint64_t ft = 0;
-        DWORD t = 0, sz = sizeof(ft);
-        const LONG rc =
-            RegQueryValueExW(app_key, name, nullptr, &t, reinterpret_cast<BYTE*>(&ft), &sz);
-        return win::decode_last_used(rc, t, sz, ft);
-    };
-    g.last_used_start = read_last_used(L"LastUsedTimeStart");
-    g.last_used_stop = read_last_used(L"LastUsedTimeStop");
-    return g;
-}
-
 /// Arms a RegNotifyChangeKeyValue watch on a ConsentStore root before the walk and polls it
 /// (zero timeout) after, so a change the API reports during the read is SHOWN, not assumed away.
 /// Failure to observe is a fact classify_stability refuses on, never stability. Residual: the API
 /// does not report a RegRestoreKey-style whole-key replacement.
-struct StabilityWatch {
+struct StabilityWatch final : win::ConsentStoreWatch {
     HANDLE event = nullptr;
     win::StabilityFacts facts;
 
@@ -249,13 +147,13 @@ struct StabilityWatch {
             REG_NOTIFY_CHANGE_NAME | REG_NOTIFY_CHANGE_LAST_SET | REG_NOTIFY_THREAD_AGNOSTIC, event,
             TRUE);
     }
-    ~StabilityWatch() {
+    ~StabilityWatch() override {
         if (event) CloseHandle(event);
     }
     StabilityWatch(const StabilityWatch&) = delete;
     StabilityWatch& operator=(const StabilityWatch&) = delete;
 
-    [[nodiscard]] win::StabilityFacts poll() {
+    [[nodiscard]] win::StabilityFacts poll() override {
         if (!event || facts.arm_rc != 0) return facts;
         facts.wait_rc = WaitForSingleObject(event, 0);
         facts.wait_gle = facts.wait_rc == WAIT_FAILED ? GetLastError() : 0;
@@ -263,107 +161,52 @@ struct StabilityWatch {
     }
 };
 
-/// Walks every mapped CapabilityName under `hive`'s ConsentStore: the capability-level Value
-/// (an `absent` entry when the capability key itself is not there, so every category is
-/// represented) plus every packaged and NonPackaged app child. Every entry is charged against the
-/// `budget` BEFORE it is retained; once the budget stops the walk (a limit, or the run's time) it
-/// ends where it is and the collector reports which.
-ConsentWalk walk_consent_store(HKEY hive, win::RetentionBudget& budget) {
-    ConsentWalk w;
-    const auto keep = [&](std::vector<RawGrant>& into, RawGrant g) {
-        if (budget.charge(win::retained_bytes(g))) into.push_back(std::move(g));
-    };
-    yuzu::win::RegKey store;
-    w.root_rc = RegOpenKeyExW(hive, kConsentStorePath, 0, KEY_READ, store.put());
-    if (w.root_rc == ERROR_FILE_NOT_FOUND) {
-        for (const auto& cap : win::kCapabilities)
-            keep(w.grants, {"-", cap.category, PermissionState::absent, "-"});
-        return w;
+/// The OS side of the registry-walk seam (privacy_permissions_win_walk.hpp): each method is one
+/// Win32 call, nothing else. The unit tests drive the walk through a fake registry; the rig tests
+/// drive it through this one.
+struct Win32Registry final : win::RegistryReader {
+    long open_key(win::RegKeyHandle parent, const wchar_t* name, win::RegKeyHandle& out) override {
+        HKEY k = nullptr;
+        const LONG rc = RegOpenKeyExW(static_cast<HKEY>(parent), name, 0, KEY_READ, &k);
+        if (rc == ERROR_SUCCESS) out = k;
+        return rc;
     }
-    if (w.root_rc != ERROR_SUCCESS) return w; // the caller reports the whole-source row
-    StabilityWatch watch(store.get());
-
-    for (const auto& cap : win::kCapabilities) {
-        if (budget.walk_stopped()) break;
-        yuzu::win::RegKey cap_key;
-        const LONG cap_rc = RegOpenKeyExW(store.get(), yuzu::win::to_wide(cap.capability_name).c_str(),
-                                          0, KEY_READ, cap_key.put());
-        if (cap_rc == ERROR_FILE_NOT_FOUND) {
-            keep(w.grants, {"-", cap.category, PermissionState::absent, "-"});
-            continue;
-        }
-        if (cap_rc != ERROR_SUCCESS) {
-            keep(w.structural, win::structural_failure("-", cap.category,
-                                                       "capability:" + win::win32_cause(cap_rc),
-                                                       cap_rc == ERROR_ACCESS_DENIED));
-            continue;
-        }
-
-        // The capability-level grant itself (no specific app -- "the global default").
-        keep(w.grants, read_one_grant(cap_key.get(), "-", cap.category));
-
-        // One app child: a key that vanished since enumeration (FILE_NOT_FOUND) is simply gone;
-        // any other open failure is that app's own failure row.
-        const auto read_app = [&](HKEY parent, const std::wstring& child, std::string app_id,
-                                  std::string_view kind) {
-            yuzu::win::RegKey app_key;
-            const LONG rc = RegOpenKeyExW(parent, child.c_str(), 0, KEY_READ, app_key.put());
-            if (rc == ERROR_SUCCESS)
-                keep(w.grants, read_one_grant(app_key.get(), std::move(app_id), cap.category));
-            else if (rc != ERROR_FILE_NOT_FOUND)
-                keep(w.structural, win::structural_failure(
-                                       std::move(app_id), cap.category,
-                                       std::string{kind} + ":" + win::win32_cause(rc),
-                                       rc == ERROR_ACCESS_DENIED));
-        };
-        // Enumeration completeness (win::enum_failure): a complete walk -- including one of
-        // exactly the cap -- adds nothing; a truncated or failed one is a structural row.
-        const auto note_enum = [&](std::string_view kind, const win::EnumVerdict& v) {
-            if (const auto f = win::enum_failure(kind, v))
-                keep(w.structural, win::structural_failure("-", cap.category, f->cause, f->denied));
-        };
-
-        // Packaged apps: direct children of the capability key OTHER than "NonPackaged".
-        const auto packaged = enumerate_subkey_names(cap_key.get());
-        for (const auto& child : packaged.names) {
-            if (budget.walk_stopped()) break;
-            if (child == L"NonPackaged") continue;
-            read_app(cap_key.get(), child, yuzu::win::from_wide(child.c_str()), "packaged_app");
-        }
-        note_enum("packaged", packaged.verdict);
-
-        // Win32 (non-packaged) apps, keyed by an escaped executable path.
-        yuzu::win::RegKey nonpkg;
-        const LONG nonpkg_rc =
-            RegOpenKeyExW(cap_key.get(), L"NonPackaged", 0, KEY_READ, nonpkg.put());
-        if (nonpkg_rc == ERROR_SUCCESS) {
-            // The "let desktop apps access" toggle: the NonPackaged key's own Value, one row.
-            keep(w.grants, read_one_grant(nonpkg.get(), std::string{win::kNonPackagedToggleAppId},
-                                          cap.category));
-            const auto nonpackaged = enumerate_subkey_names(nonpkg.get());
-            for (const auto& child : nonpackaged.names) {
-                if (budget.walk_stopped()) break;
-                const std::string name = yuzu::win::from_wide(child.c_str());
-                if (win::is_nonpackaged_container_key(name)) continue;
-                read_app(nonpkg.get(), child, win::unescape_nonpackaged_app_id(name),
-                         "nonpackaged_app");
-            }
-            note_enum("nonpackaged", nonpackaged.verdict);
-        } else {
-            // A missing NonPackaged key is the toggle row reading `absent`; any other code is a
-            // structural failure (win::nonpackaged_open_failure decides).
-            auto g = win::nonpackaged_open_failure(cap.category, nonpkg_rc);
-            const bool toggle_absent = (g.state == PermissionState::absent);
-            keep(toggle_absent ? w.grants : w.structural, std::move(g));
-        }
+    void close_key(win::RegKeyHandle key) override { RegCloseKey(static_cast<HKEY>(key)); }
+    long enum_key(win::RegKeyHandle parent, std::uint32_t idx, std::wstring& name) override {
+        constexpr DWORD kNameBufLen = 512;
+        wchar_t buf[kNameBufLen]{};
+        DWORD len = kNameBufLen;
+        const LONG rc = RegEnumKeyExW(static_cast<HKEY>(parent), idx, buf, &len, nullptr, nullptr,
+                                      nullptr, nullptr);
+        if (rc == ERROR_SUCCESS) name.assign(buf, len);
+        return rc;
     }
-    if (const auto token = win::classify_stability(watch.poll())) {
-        w.refused = *token;
-        w.grants.clear();
-        w.structural.clear();
+    long query_value(win::RegKeyHandle key, const wchar_t* value_name, std::uint32_t& type,
+                     std::span<std::byte> buf, std::uint32_t& size) override {
+        DWORD t = 0;
+        DWORD sz = static_cast<DWORD>(buf.size());
+        const LONG rc = RegQueryValueExW(static_cast<HKEY>(key), value_name, nullptr, &t,
+                                         buf.empty() ? nullptr : reinterpret_cast<BYTE*>(buf.data()),
+                                         &sz);
+        type = t;
+        size = sz;
+        return rc;
     }
-    return w;
-}
+    std::unique_ptr<win::ConsentStoreWatch> watch(win::RegKeyHandle root) override {
+        return std::make_unique<StabilityWatch>(static_cast<HKEY>(root));
+    }
+    bool key_name_equals(std::wstring_view a, std::wstring_view b) const override {
+        return CompareStringOrdinal(a.data(), static_cast<int>(a.size()), b.data(),
+                                    static_cast<int>(b.size()), TRUE) == CSTR_EQUAL;
+    }
+    std::string utf8(std::wstring_view s) const override {
+        return yuzu::win::from_wide(s.data(), static_cast<int>(s.size()));
+    }
+    std::string reg_sz_utf8(std::span<const std::byte> payload) const override {
+        return yuzu::win::reg_sz_to_utf8(reinterpret_cast<const wchar_t*>(payload.data()),
+                                         static_cast<DWORD>(payload.size()));
+    }
+};
 
 // ── offline hive-file guard ───────────────────────────────────────────
 
@@ -619,8 +462,9 @@ int collect_windows_permissions(yuzu::CommandContext& ctx) {
     OutputBudget output;         // run-wide formatted-length bound, shared with the macOS leg
 
     // HKLM: machine-wide, collected once (win::assemble_windows_rows decides what becomes of it).
+    Win32Registry reg;
     budget.begin_profile();
-    const ConsentWalk hklm = walk_consent_store(HKEY_LOCAL_MACHINE, budget);
+    const ConsentWalk hklm = win::walk_consent_store(reg, HKEY_LOCAL_MACHINE, budget);
 
     // Real interactive users, not the agent process's own (LocalSystem) HKEY_CURRENT_USER --
     // see the file banner. Discovery keeps every code it saw and each is a row
@@ -661,7 +505,7 @@ int collect_windows_permissions(yuzu::CommandContext& ctx) {
         try {
             rd.status = yuzu::win::with_user_hive(
                 profile.sid, profile.profile_path,
-                [&](HKEY root) { rd.walk = walk_consent_store(root, budget); }, &report, &check);
+                [&](HKEY root) { rd.walk = win::walk_consent_store(reg, root, budget); }, &report, &check);
         } catch (...) {
             // The ABI catch turns this into `internal_error`, which carries no row token, so the
             // agent log is the only place the mount name (the actionable fact) can go.

@@ -59,13 +59,11 @@ inline constexpr std::array<CapabilityEntry, 4> kCapabilities{{
 /// this app_id (qualified `<user>\NonPackaged` per profile, bare on HKLM -- qualify_app_id).
 inline constexpr std::string_view kNonPackagedToggleAppId = "NonPackaged";
 
-/// NonPackaged children that are containers, not apps (measured on the-rig:
-/// `NonPackaged\Executables\<exe>` holds only a `GlobalPromptShown` DWORD per executable, never
-/// a `Value`). Skipped by name; any other child is read as an app key, so an unknown shape stays
-/// a visible row rather than vanishing.
-[[nodiscard]] constexpr bool is_nonpackaged_container_key(std::string_view name) noexcept {
-    return name == "Executables";
-}
+/// Name of the NonPackaged key, and of its child that is a container, not an app (measured on
+/// the-rig: `NonPackaged\Executables\<exe>` holds only a `GlobalPromptShown` DWORD per executable,
+/// never a `Value`). Both are compared with the registry's own case-insensitive key-name equality
+/// (privacy_permissions_win_walk.hpp); any other child is read as an app key, so an unknown shape
+/// stays a visible row rather than vanishing.
 
 /// The ConsentStore `Value` REG_SZ decoded to a PermissionState. `type_ok` = the registry
 /// value was actually REG_SZ (a wrong type is unreadable regardless of its bytes).

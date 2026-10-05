@@ -441,8 +441,6 @@ TEST_CASE("win: the three ConsentStore levels on the-rig's real shapes -- the No
     //   HKLM location Value Allow; HKLM location\NonPackaged (no Value);
     //   HKLM location\NonPackaged\C:#Windows#System32#svchost.exe   LastUsedTime* only
     CHECK(win::kNonPackagedToggleAppId == "NonPackaged");
-    CHECK(win::is_nonpackaged_container_key("Executables"));
-    CHECK_FALSE(win::is_nonpackaged_container_key("C:#Program Files#Mozilla Firefox#firefox.exe"));
     const std::string firefox =
         win::unescape_nonpackaged_app_id("C:#Program Files#Mozilla Firefox#firefox.exe");
     CHECK(firefox == "C:\\Program Files\\Mozilla Firefox\\firefox.exe");
