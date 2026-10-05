@@ -16,8 +16,11 @@
  * privacy_permissions_win_parsers.hpp for that decision block, and #5291 lifts the two together
  * into the shared hive loader.
  *
- * Every fact comes from an opened HANDLE. RegLoadKeyW has no handle-relative form, so the load is
- * by path and the SAME file identity is re-verified from a fresh attribute-only handle after it.
+ * The leaf's, every ancestor's and each sidecar's deciding facts come from a HANDLE opened for that
+ * step; the two handle-less sources are the drive type (GetDriveTypeW) and the sidecar listing, and
+ * a listing fact is never final -- a sidecar's reparse bit is re-read from its own handle.
+ * RegLoadKeyW has no handle-relative form, so the load is by path and the SAME file identity is
+ * re-verified from a fresh attribute-only handle after it.
  * Residual: the kernel parses whatever the path resolved to in that window (every `reg load`
  * carries it); swapping the path needs write access to the profile directory.
  */
@@ -174,7 +177,7 @@ struct HiveFileGuard {
                 pos = end + 1;
             }
         } else {
-            f.drive_type = 0; // DRIVE_UNKNOWN: no drive-letter root, not a fixed local path
+            f.drive_type = 0; // not kDriveFixed: classify_hive_file refuses (0 is DRIVE_UNKNOWN)
         }
         f.depth = parts.size();
         if (const auto t = classify_hive_file(f)) return *t;
