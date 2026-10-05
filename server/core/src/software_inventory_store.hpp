@@ -317,6 +317,9 @@ public:
     /// no rows match (or a negative cursor — a precondition miss); pair with
     /// `catalog_rollup_meta()` to tell a never-refreshed ("building") rollup from a genuinely
     /// empty fleet.
+    /// With `agent_id` the read is per-device: the route must additionally admit the device
+    /// through the scope chokepoint (`authorize_list_read`, routed-concerns-access-control
+    /// row 1) — the global gate alone is not sufficient for the host view.
     [[nodiscard]] std::optional<std::vector<SoftwareCatalogRow>>
     software_catalog(const SoftwareCatalogQuery& q);
 
@@ -326,6 +329,9 @@ public:
     /// the installs-then-string tie rule, and is never an empty version. AUTHORITATIVE read:
     /// `std::nullopt` on a store/pool/query degrade (the filtered path is bounded to 5 s). An
     /// empty `name` is a precondition miss -> empty value (not a degrade).
+    /// With `agent_id` the read is per-device: the route must additionally admit the device
+    /// through the scope chokepoint (`authorize_list_read`, routed-concerns-access-control
+    /// row 1) — the global gate alone is not sufficient for the host view.
     [[nodiscard]] std::optional<std::vector<SoftwareVersionCount>>
     software_versions(const SoftwareVersionsQuery& q);
 

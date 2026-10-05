@@ -445,14 +445,17 @@ struct SiteSamplers {
     DegradeSampler query;
 };
 
-// Run `body` in a transaction whose execution is bounded by SET LOCAL statement_timeout
-// (the count_stale_agents idiom): search-as-you-type reads must not run to the pool's 30 s
-// default. `body(conn, err)` returns false (filling `err`) on any failure. Returns false on a
-// degrade — pool timeout or query error, including the timeout itself — counted and sampled;
-// the caller maps that to nullopt, never an empty page.
-template <class Body>
-bool bounded_read(pg::PgPool& pool, yuzu::MetricsRegistry* metrics, const char* fn,
-                  SiteSamplers& sm, Body&& body) {
+// Run one bounded SELECT in a transaction whose execution is capped by SET LOCAL
+// statement_timeout (the count_stale_agents idiom): search-as-you-type reads must not run to
+// the pool's 30 s default. `parse(const PgResult&)` maps the rows. nullopt on any degrade —
+// pool timeout or query error, including the timeout itself — counted and sampled; the caller
+// maps that to nullopt, never an empty page.
+template <class Parse>
+auto bounded_query(pg::PgPool& pool, yuzu::MetricsRegistry* metrics, const char* fn,
+                   SiteSamplers& sm, const std::string& sql,
+                   const std::vector<std::string>& params, Parse&& parse)
+    -> std::optional<decltype(parse(std::declval<const pg::PgResult&>()))> {
+    std::optional<decltype(parse(std::declval<const pg::PgResult&>()))> out;
     bool entered = false;
     std::string err;
     const bool ok = pool.with_txn_for(kQueryAcquireTimeout, [&](PGconn* c) -> bool {
@@ -467,37 +470,22 @@ bool bounded_read(pg::PgPool& pool, yuzu::MetricsRegistry* metrics, const char* 
             err = PQerrorMessage(c);
             return false;
         }
-        return body(c, err);
+        pg::PgResult res = pg::exec_params(c, sql.c_str(), params);
+        if (res.status() != PGRES_TUPLES_OK) {
+            err = PQerrorMessage(c);
+            return false;
+        }
+        out = parse(res);
+        return true;
     });
     if (ok)
-        return true;
+        return out;
     if (const auto d = note_read_degrade(metrics, entered ? kReasonQueryError : kReasonPoolTimeout,
                                          entered ? sm.query : sm.pool);
         d.should_log)
         spdlog::warn("SoftwareInventoryStore: {} degraded — {} (occurrence {})", fn,
                      entered ? err : pool.last_error(), d.occurrence);
-    return false;
-}
-
-// bounded_read + the exec_params / status / parse tail every bounded SELECT shares. nullopt on
-// any degrade (never an empty page); `parse(const PgResult&)` maps the rows.
-template <class Parse>
-auto bounded_query(pg::PgPool& pool, yuzu::MetricsRegistry* metrics, const char* fn,
-                   SiteSamplers& sm, const std::string& sql,
-                   const std::vector<std::string>& params, Parse&& parse)
-    -> std::optional<decltype(parse(std::declval<const pg::PgResult&>()))> {
-    std::optional<decltype(parse(std::declval<const pg::PgResult&>()))> out;
-    if (!bounded_read(pool, metrics, fn, sm, [&](PGconn* c, std::string& err) {
-            pg::PgResult res = pg::exec_params(c, sql.c_str(), params);
-            if (res.status() != PGRES_TUPLES_OK) {
-                err = PQerrorMessage(c);
-                return false;
-            }
-            out = parse(res);
-            return true;
-        }))
-        return std::nullopt;
-    return out;
+    return std::nullopt;
 }
 
 // The comma-joined distinct non-empty values of one column/expression: the SINGLE definition
@@ -1446,28 +1434,30 @@ bool SoftwareInventoryStore::refresh_catalog_rollup(const std::function<bool()>&
         // by migration v8, so a plain UPDATE reaches it; sprawl = 3+ distinct versions.
         if (abort_requested())
             return false;
+        const std::string title_grain = std::to_string(sc::kGrainTitle);
         pg::PgResult m = pg::exec_params(
             c,
-            "UPDATE software_inventory_store.catalog_rollup_meta SET "
+            ("UPDATE software_inventory_store.catalog_rollup_meta SET "
             "refreshed_at = EXTRACT(EPOCH FROM now())::bigint, "
             "total_titles = (SELECT count(*) FROM software_inventory_store.catalog_rollup "
-            "WHERE grain = 7), "
+            "WHERE grain = " + title_grain + "), "
             "total_devices = (SELECT count(DISTINCT agent_id) FROM "
             "software_inventory_store.installed_software), "
             "total_publishers = $1::bigint, "
             "total_installs = (SELECT coalesce(sum(device_count), 0) FROM "
-            "software_inventory_store.catalog_rollup WHERE grain = 7), "
+            "software_inventory_store.catalog_rollup WHERE grain = " + title_grain + "), "
             "installs_windows = $2::bigint, installs_macos = $3::bigint, "
             "installs_linux = $4::bigint, installs_other = $5::bigint, "
             "current_installs = (SELECT coalesce(sum(newest_installs), 0) FROM newest_tmp), "
             "current_total = (SELECT coalesce(sum(c.device_count), 0) FROM "
             "software_inventory_store.catalog_rollup c JOIN newest_tmp nt ON nt.name = c.name "
-            "WHERE c.grain = 7), "
+            "WHERE c.grain = " + title_grain + "), "
             "current_titles = (SELECT count(*) FROM newest_tmp), "
             "sprawl_titles = (SELECT count(*) FROM software_inventory_store.catalog_rollup "
-            "WHERE grain = 7 AND version_count >= 3), "
+            "WHERE grain = " + title_grain + " AND version_count >= 3), "
             "rpm_total = $6::bigint, rpm_unsigned = $7::bigint "
-            "WHERE id = 1 RETURNING id",
+            "WHERE id = 1 RETURNING id")
+                .c_str(),
             std::vector<std::string>{
                 PQgetvalue(pubs.get(), 0, 0), PQgetvalue(fam.get(), 0, 0),
                 PQgetvalue(fam.get(), 0, 1), PQgetvalue(fam.get(), 0, 2),

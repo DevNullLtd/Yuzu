@@ -99,7 +99,8 @@ TEST_CASE("newer_than applies compare then the total tie rule", "[server][softwa
         REQUIRE_FALSE((newer_than(a, ai, b, bi) && newer_than(b, bi, a, ai)));
 }
 
-TEST_CASE("NewestFold picks per title and survives batch boundaries", "[server][software_catalog]") {
+TEST_CASE("NewestFold picks per title and survives batch boundaries",
+          "[server][software_catalog]") {
     struct Row {
         std::string name, version;
         std::int64_t installs;

@@ -500,19 +500,13 @@ place, **Hardware** and **Software**, each its own page:
     records that the *result view* was shown to the operator, not whether the
     underlying action itself succeeded) — see [Audit log](audit-log.md).
 
-- **`/software`** — the fleet software catalogue, unchanged in its rollup mechanics: a
-  background thread still precomputes the per-title/per-version counts hourly, the KPI
-  strip still shows Titles / Devices reporting / Stale / an "updated N ago" (or
-  "building") stamp for the catalogue, and the counts are still **fleet-wide, not
-  management-group scoped** — the same ADR-0017 gap the REST/MCP section above
-  describes. The catalogue store now serves exact numbers under filters (see "Catalogue
-  rollup grain and KPIs" under the rollup metrics below): **Installs is the exact number of
-  distinct devices** carrying the title under the active kind/ecosystem/source filters (a
-  device carrying one title through two sources counts once), and **search selects titles** —
-  a matched title keeps its whole filtered slice; `%` and `_` in a search term are literal
-  characters, the term is clamped to 128 bytes, and a search that exceeds its 5 s execution
-  bound reports the catalogue as unavailable rather than showing an empty table. Two things changed:
-  - The search box is now a **real server round-trip matching title OR publisher**
+- **`/software`** — the fleet software catalogue. A background thread still precomputes
+  the per-title/per-version counts hourly (the mechanics changed — see "Catalogue rollup
+  grain and KPIs" under the rollup metrics below), the KPI strip still shows Titles /
+  Devices reporting / Stale / an "updated N ago" (or "building") stamp for the catalogue,
+  and the counts are still **fleet-wide, not management-group scoped** — the same ADR-0017
+  gap the REST/MCP section above describes. Three things changed:
+  - The search box is now a **real server round-trip matching title, publisher, ecosystem or source**
     (was client-side and title-only), using the same debounced/narrow-swap-target
     pattern as the Hardware list's search box.
   - Each row grows a **"devices ›"** control that expands inline — independent of the
@@ -528,6 +522,15 @@ place, **Hardware** and **Software**, each its own page:
   sub-nav. Its routes, `/fragments/inventory/find` and `/fragments/inventory/find/results`,
   are still registered for old bookmarks and deep links, but nothing in the UI links to
   them any more — treat them as a legacy escape hatch, not a supported feature.
+
+  - The catalogue store now serves exact numbers under filters: **Installs is the exact
+    number of distinct devices** carrying the title under the active kind/ecosystem/source
+    filters (a device carrying one title through two sources counts once), and **search
+    selects titles** — a matched title keeps its whole filtered slice. `%` and `_` in a
+    search term are literal characters, the term is clamped to 128 bytes, and a search that
+    exceeds its 5 s execution bound reports the catalogue as unavailable rather than showing
+    an empty table. The store's version drill now accepts the catalogue filters and a host
+    (the page wires them in a follow-up).
 
 **On store degradation** the **`/software`** catalogue, its **devices ›** expansion, and
 the CI record's **Installed software** lens — the *authoritative* reads — show an

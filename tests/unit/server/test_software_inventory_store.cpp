@@ -23,6 +23,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <limits>
 #include <optional>
 #include <stdexcept>
@@ -838,6 +839,15 @@ TEST_CASE("query_software q/kind/ecosystem/source filters", "[pg][software_inven
     REQUIRE(store.apply_installed_software(
                 "agent-f", "", std::vector<SoftwareEntry>{full_extended_entry(), chrome}, 1000) ==
             InventoryIngestOutcome::kStored);
+    // Wildcard discriminators: '%' and '_' must match literally, so each term hits one row
+    // (an unescaped '100%' also hits "100 Proof"; an unescaped 'a_' also hits "ab").
+    REQUIRE(store.apply_installed_software(
+                "agent-w", "",
+                std::vector<SoftwareEntry>{{"100% Pure", "1", "", ""},
+                                           {"100 Proof", "1", "", ""},
+                                           {"a_b", "1", "", ""},
+                                           {"ab", "1", "", ""}},
+                1000) == InventoryIngestOutcome::kStored);
 
     auto count = [&](const SoftwareFleetQuery& q) {
         auto r = store.query_software(q);
@@ -855,6 +865,10 @@ TEST_CASE("query_software q/kind/ecosystem/source filters", "[pg][software_inven
     CHECK(count(q) == 2);
     q.q = "no-such-thing";
     CHECK(count(q) == 0);
+    q.q = "100%"; // literal percent
+    CHECK(count(q) == 1);
+    q.q = "a_"; // literal underscore
+    CHECK(count(q) == 1);
 
     q = {};
     q.kind = "app";
@@ -1829,6 +1843,27 @@ TEST_CASE("SoftwareInventoryStore catalogue + version aggregates", "[pg][softwar
     }
 }
 
+namespace {
+// Every KPI field of the meta row is 0 (the "building" sentinel and the refreshed-but-empty
+// fleet both read this way; refreshed_at tells them apart and is asserted by the caller).
+void check_kpis_zero(const yuzu::server::CatalogRollupMeta& m) {
+    CHECK(m.total_titles == 0);
+    CHECK(m.total_devices == 0);
+    CHECK(m.total_publishers == 0);
+    CHECK(m.total_installs == 0);
+    CHECK(m.installs_windows == 0);
+    CHECK(m.installs_macos == 0);
+    CHECK(m.installs_linux == 0);
+    CHECK(m.installs_other == 0);
+    CHECK(m.current_installs == 0);
+    CHECK(m.current_total == 0);
+    CHECK(m.current_titles == 0);
+    CHECK(m.sprawl_titles == 0);
+    CHECK(m.rpm_total == 0);
+    CHECK(m.rpm_unsigned == 0);
+}
+} // namespace
+
 TEST_CASE("SoftwareInventoryStore catalogue rollup is empty + 'building' before first refresh",
           "[pg][software_inventory]") {
     // Before any refresh_catalog_rollup(), the rollup tables are empty and the seeded meta
@@ -1844,6 +1879,7 @@ TEST_CASE("SoftwareInventoryStore catalogue rollup is empty + 'building' before 
     auto meta = store.catalog_rollup_meta();
     REQUIRE(meta.has_value());
     CHECK(meta->refreshed_at == 0);
+    check_kpis_zero(*meta);
     auto cat = store.software_catalog({});
     REQUIRE(cat.has_value());
     CHECK(cat->empty());
@@ -2046,12 +2082,12 @@ TEST_CASE("catalogue Installs are exact distinct devices under every filter grai
     CHECK(meta->rpm_unsigned == 1);
 }
 
-TEST_CASE("q is literal, title-level, clamped and bounded", "[pg][software_inventory]") {
+TEST_CASE("q is literal, title-level and clamped", "[pg][software_inventory]") {
     SWINV_SHARED(store, pool);
     seed_grain_fixture(store);
     put(store, "q1",
         Rows{ent("100% Pure", "1"), ent("100 Proof", "1"), ent("a_b", "1"), ent("ab", "1"),
-             ent("Widget", "1", "Zylofex Systems")});
+             ent("Widget", "1", "Zylofex Systems"), ent(std::string(128, 'a'), "1")});
     REQUIRE(store.refresh_catalog_rollup());
     auto names = [&](SoftwareCatalogQuery q) {
         auto c = store.software_catalog(q);
@@ -2081,6 +2117,18 @@ TEST_CASE("q is literal, title-level, clamped and bounded", "[pg][software_inven
     for (int i = 0; i < 150; ++i)
         big.q += "\xC3\xA9";
     CHECK(store.software_catalog(big).has_value());
+    // The 128-byte clamp is applied on both reads: a title of 128 'a' queried with 128 'a' + 72
+    // 'z' is found (the term is cut to the 128 'a'); unclamped the term would match nothing.
+    const std::string long_title(128, 'a');
+    SoftwareCatalogQuery clamped;
+    clamped.q = long_title + std::string(72, 'z');
+    CHECK(names(clamped) == std::vector<std::string>{long_title});
+    SoftwareFleetQuery raw;
+    raw.q = long_title + std::string(72, 'z');
+    auto hits = store.query_software(raw);
+    REQUIRE(hits.has_value());
+    REQUIRE(hits->size() == 1);
+    CHECK((*hits)[0].entry.name == long_title);
 }
 
 TEST_CASE("catalogue keyset walk is exact, bounded and rejects a negative cursor",
@@ -2245,7 +2293,8 @@ TEST_CASE("KPI meta is computed by the refresh from one snapshot", "[pg][softwar
     CHECK(m->total_titles == 4);
     CHECK(m->total_devices == 5);
     CHECK(m->total_publishers == 3); // Git SCM, Fedora, Google ('' excluded)
-    CHECK(m->total_installs == 6);   // git 3 + Chrome 1 + Dual 1 + NoVer 1 (d4's two Dual versions count once)
+    // git 3 + Chrome 1 + Dual 1 + NoVer 1 (d4's two Dual versions count once)
+    CHECK(m->total_installs == 6);
     CHECK(m->installs_windows == 0);
     CHECK(m->installs_macos == 5);
     CHECK(m->installs_linux == 1);
@@ -2307,6 +2356,168 @@ TEST_CASE("a cancelled refresh keeps the last-good rollup", "[pg][software_inven
     CHECK(title(store, "brand-new").has_value());
 }
 
+// The first-poll case above never reaches the DELETE. Cancel at the LAST poll instead (just
+// before the meta UPDATE, after catalog_rollup was deleted and re-filled in this transaction):
+// everything must roll back to the previous publication. The poll count is measured from an
+// uncancelled run, so the case follows the code instead of hard-coding a poll index.
+TEST_CASE("a refresh cancelled at its last poll rolls back the delete and re-insert",
+          "[pg][software_inventory]") {
+    SWINV_SHARED(store, pool);
+    seed_grain_fixture(store);
+    put(store, "c1", Rows{ent("second", "1")});
+    int polls = 0;
+    REQUIRE(store.refresh_catalog_rollup([&] {
+        ++polls;
+        return false;
+    }));
+    REQUIRE(polls > 1);
+    const auto published_rows = count_rows(pool, "catalog_rollup");
+    auto before = store.catalog_rollup_meta();
+    REQUIRE(before.has_value());
+
+    put(store, "c2", Rows{ent("third", "1")});
+    int calls = 0;
+    const int last = polls;
+    CHECK_FALSE(store.refresh_catalog_rollup([&] { return ++calls == last; }));
+    CHECK(calls == last);
+    CHECK(count_rows(pool, "catalog_rollup") == published_rows);
+    CHECK_FALSE(title(store, "third").has_value());
+    auto after = store.catalog_rollup_meta();
+    REQUIRE(after.has_value());
+    CHECK(after->refreshed_at == before->refreshed_at);
+    CHECK(after->total_titles == before->total_titles);
+    CHECK(store.is_open());
+    REQUIRE(store.refresh_catalog_rollup());
+    CHECK(title(store, "third").has_value());
+}
+
+// One snapshot: a peer commit that lands mid-refresh must be wholly absent from this
+// publication (REPEATABLE READ) and wholly present in the next. The cancel predicate is the
+// barrier (no sleeps): at its 6th poll — well after the advisory-lock SELECT and the snapshot —
+// it commits a new title through another pool lease, then lets the refresh continue.
+TEST_CASE("a title committed mid-refresh is absent from this publication and in the next",
+          "[pg][software_inventory]") {
+    SWINV_SHARED(store, pool);
+    seed_grain_fixture(store);
+    const auto version_rows = count_rows(pool, "version_rollup");
+    auto before = store.catalog_rollup_meta();
+    REQUIRE(before.has_value());
+    int polls = 0;
+    bool fired = false;
+    REQUIRE(store.refresh_catalog_rollup([&] {
+        if (++polls == 6) {
+            fired = true;
+            put(store, "late-dev", Rows{ent("LateTitle", "9", "Late", "package", "brew", kSrcPkg)});
+        }
+        return false;
+    }));
+    REQUIRE(fired); // fails loudly if the poll sequence ever shrinks below the barrier
+    CHECK_FALSE(title(store, "LateTitle").has_value());
+    CHECK(count_rows(pool, "catalog_rollup") == 27);
+    CHECK(count_rows(pool, "version_rollup") == version_rows);
+    auto during = store.catalog_rollup_meta();
+    REQUIRE(during.has_value());
+    CHECK(during->total_devices == before->total_devices);
+    CHECK(during->total_titles == before->total_titles);
+    CHECK(during->total_installs == before->total_installs);
+    REQUIRE(store.refresh_catalog_rollup());
+    CHECK(title(store, "LateTitle").has_value());
+    auto next = store.catalog_rollup_meta();
+    REQUIRE(next.has_value());
+    CHECK(next->total_devices == before->total_devices + 1);
+    CHECK(next->total_titles == before->total_titles + 1);
+}
+
+// Production-threshold case (the unit shards otherwise use tiny fixtures): one agent with
+// 10,003 version rows crosses the 10,000-row FETCH boundary and, with 5,001 newest picks, the
+// 5,000-pick flush. Title t04999 has three versions so its rows (9,999-10,001) straddle the
+// boundary and its newest ("3.0") is the row AFTER it. One bulk put + one 10k-row refresh,
+// about a second; no sleeps. kRollupRefreshBudget stays untested by design: it is one
+// steady_clock comparison inside the same abort_requested() lambda the cancel cases exercise.
+TEST_CASE("fleet-newest fold is correct across the FETCH boundary and a mid-loop flush",
+          "[pg][software_inventory]") {
+    constexpr int kTitles = 5001;
+    constexpr int kStraddle = 4999;
+    static_assert(2 * kTitles + 1 > sc::kNewestFetchRows);
+    static_assert(kTitles > static_cast<int>(sc::kNewestFlushRows));
+    SWINV_SHARED(store, pool);
+    Rows rows;
+    rows.reserve(2 * kTitles + 1);
+    char nm[16];
+    for (int i = 0; i < kTitles; ++i) {
+        std::snprintf(nm, sizeof nm, "t%05d", i);
+        rows.push_back(ent(nm, "1.0"));
+        rows.push_back(ent(nm, "2.0"));
+        if (i == kStraddle)
+            rows.push_back(ent(nm, "3.0"));
+    }
+    put(store, "big-agent", std::move(rows));
+    REQUIRE(store.refresh_catalog_rollup());
+    auto meta = store.catalog_rollup_meta();
+    REQUIRE(meta.has_value());
+    CHECK(meta->current_titles == kTitles);
+    SoftwareCatalogQuery q;
+    q.q = "t04999";
+    auto straddling = title(store, "t04999", q);
+    REQUIRE(straddling.has_value());
+    CHECK(straddling->newest_version == "3.0");
+    q.q = "t05000";
+    auto last = title(store, "t05000", q);
+    REQUIRE(last.has_value());
+    CHECK(last->newest_version == "2.0");
+    q.q = "t00000";
+    auto first = title(store, "t00000", q);
+    REQUIRE(first.has_value());
+    CHECK(first->newest_version == "2.0");
+}
+
+// Equivalent spellings compare equal under the catalogue order; the tie goes to the spelling
+// carried by more devices ('1.0' on 5 devices beats '1.0.0' on 1). Plain text order would pick
+// '1.0.0', so this is the case that pins the store-side use of newer_than's tie rule.
+TEST_CASE("equivalent version spellings: the more-installed spelling is the newest mark",
+          "[pg][software_inventory]") {
+    SWINV_SHARED(store, pool);
+    for (int i = 1; i <= 5; ++i)
+        put(store, "t" + std::to_string(i),
+            Rows{ent("Tie", "1.0", "P", "package", "brew", kSrcPkg)});
+    put(store, "t6", Rows{ent("Tie", "1.0.0", "P", "package", "brew", kSrcPkg)});
+    REQUIRE(store.refresh_catalog_rollup());
+    auto row = title(store, "Tie");
+    REQUIRE(row.has_value());
+    CHECK(row->newest_version == "1.0");
+    auto vers = store.software_versions({.name = "Tie"});
+    REQUIRE(vers.has_value());
+    REQUIRE(vers->size() == 2);
+    int marked = 0;
+    for (const auto& v : *vers)
+        if (v.newest) {
+            ++marked;
+            CHECK(v.version == "1.0");
+        }
+    CHECK(marked == 1);
+    auto meta = store.catalog_rollup_meta();
+    REQUIRE(meta.has_value());
+    CHECK(meta->current_installs == 5);
+    CHECK(meta->current_total == 6);
+}
+
+TEST_CASE("refreshing an empty fleet is fresh (refreshed_at > 0) with every KPI zero",
+          "[pg][software_inventory]") {
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    SoftwareInventoryStore store{pool};
+    REQUIRE(store.is_open());
+    REQUIRE(store.refresh_catalog_rollup());
+    auto meta = store.catalog_rollup_meta();
+    REQUIRE(meta.has_value());
+    CHECK(meta->refreshed_at > 0); // "refreshed but empty", not "building"
+    check_kpis_zero(*meta);
+    auto cat = store.software_catalog({});
+    REQUIRE(cat.has_value());
+    CHECK(cat->empty());
+}
+
 TEST_CASE("query_software honours version and scope push-down", "[pg][software_inventory]") {
     SWINV_SHARED(store, pool);
     put(store, "s1", Rows{ent("Tool", "1.0")});
@@ -2361,8 +2572,26 @@ TEST_CASE("migration v8 reshapes a v7-era rollup schema and re-runs idempotently
     {
         SoftwareInventoryStore s1{pool};
         REQUIRE(s1.is_open());
+        // Sentinels in the two tables v8 must NOT touch (it only reshapes catalog_rollup/meta).
+        put(s1, "sentinel-dev",
+            Rows{ent("SentinelApp", "7.7", "Sent", "app", "windows", kSrcApps)});
     }
     auto exec = [&](const char* stmt) { run_sql(pool, stmt); };
+    exec("INSERT INTO software_inventory_store.version_rollup (name, version, device_count) "
+         "VALUES ('SentinelVR', '1.2.3', 42)");
+    auto check_sentinels = [&] {
+        auto src = run_sql(pool, "SELECT name, version, publisher FROM "
+                                 "software_inventory_store.installed_software WHERE agent_id = "
+                                 "'sentinel-dev'");
+        REQUIRE(PQntuples(src.get()) == 1);
+        CHECK(std::string(PQgetvalue(src.get(), 0, 0)) == "SentinelApp");
+        CHECK(std::string(PQgetvalue(src.get(), 0, 1)) == "7.7");
+        CHECK(std::string(PQgetvalue(src.get(), 0, 2)) == "Sent");
+        auto vr = run_sql(pool, "SELECT device_count FROM software_inventory_store.version_rollup "
+                                "WHERE name = 'SentinelVR' AND version = '1.2.3'");
+        REQUIRE(PQntuples(vr.get()) == 1);
+        CHECK(std::string(PQgetvalue(vr.get(), 0, 0)) == "42");
+    };
     auto rewind = [&] {
         exec("UPDATE public.schema_meta SET version = 7 WHERE store = 'software_inventory_store'");
     };
@@ -2384,6 +2613,7 @@ TEST_CASE("migration v8 reshapes a v7-era rollup schema and re-runs idempotently
     auto meta = store.catalog_rollup_meta();
     REQUIRE(meta.has_value());
     CHECK(meta->refreshed_at == 0); // honest "building" until the next refresh
+    check_sentinels();
     {
         auto r = run_sql(
             pool,
@@ -2396,6 +2626,9 @@ TEST_CASE("migration v8 reshapes a v7-era rollup schema and re-runs idempotently
     rewind();
     SoftwareInventoryStore again{pool}; // idempotent re-run
     REQUIRE(again.is_open());
+    check_sentinels();
+    // The sentinel title would add its own rollup rows to the fixture's 27; drop it first.
+    exec("DELETE FROM software_inventory_store.installed_software WHERE agent_id = 'sentinel-dev'");
     seed_grain_fixture(again);
     CHECK(count_rows(pool, "catalog_rollup") == 27);
     auto built = again.catalog_rollup_meta();

@@ -3,9 +3,10 @@
 /// @file software_catalog_rollup.hpp
 /// Background driver for the `/inventory` Software-tab catalogue rollup. Owns a single
 /// thread that periodically calls `SoftwareInventoryStore::refresh_catalog_rollup()` —
-/// the expensive full-table passes (cancellable: it polls `stop_` between batches), run OFF the request path so page reads hit
-/// only the small precomputed rollup tables. The underlying `installed_software` changes
-/// only on the daily sync, so a periodic recompute is strictly fresh-enough.
+/// the expensive full-table passes (cancellable: it polls `stop_` between batches), run OFF
+/// the request path so page reads hit only the small precomputed rollup tables. The
+/// underlying `installed_software` changes only on the daily sync, so a periodic recompute is
+/// strictly fresh-enough.
 ///
 /// Lifecycle mirrors the app-perf roll-up thread: `start()` spawns the thread and runs
 /// ONE refresh immediately (so the catalogue populates at boot), then refreshes on a

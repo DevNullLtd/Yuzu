@@ -163,17 +163,20 @@ struct TokKey {
 
 } // namespace detail
 
-/// The catalogue's own TRANSITIVE total preorder on version strings (see the file comment for
-/// why the NVD comparator is not reused). Positional lexicographic compare with an END
-/// sentinel padding the shorter side; each position maps to (class, subkey): class 0
-/// recognised pre-release tag (dev < alpha < beta < pre = preview < rc), class 1 END or an
-/// all-zero numeric token, class 2 any other alpha token (case-insensitive lexicographic),
-/// class 3 non-zero numeric (leading zeros stripped, length then lexicographic, overflow-safe).
-/// The first unequal position decides; all equal -> 0. Resolves the cycle as
-/// 1.0rc < 1.0 < 1.0a. Agrees with nvd_version_compare on its documented examples (1.10 > 1.9;
-/// 2.0 > 2.0-rc1; 9.8p1 > 9.8; 1.0.2a > 1.0.2; 1.0 == 1.0.0; 1:2.3 == 2.3). The ONE
-/// documented divergence: a zero numeric token against an alpha token at the same position
-/// ("1.0.0" vs "1.0.a") orders the alpha higher, where NVD orders any numeric higher.
+/// The catalogue's own TRANSITIVE total preorder on version strings. nvd_version_compare is
+/// deliberately not reused: it is cyclic — "1.0" < "1.0a" (an unknown alpha tail ranks
+/// higher), "1.0a" < "1.0rc" (positional 'a' < 'r'), "1.0rc" < "1.0" (a pre-release tail
+/// ranks lower) — so a running max over it depends on input order.
+/// Positional lexicographic compare with an END sentinel padding the shorter side; each
+/// position maps to (class, subkey): class 0 recognised pre-release tag (dev < alpha < beta <
+/// pre = preview < rc), class 1 END or an all-zero numeric token, class 2 any other alpha
+/// token (case-insensitive lexicographic), class 3 non-zero numeric (leading zeros stripped,
+/// length then lexicographic, overflow-safe). The first unequal position decides; all equal
+/// -> 0. Orders that triple as 1.0rc < 1.0 < 1.0a whatever the input order. Agrees with
+/// nvd_version_compare on its documented examples (1.10 > 1.9; 2.0 > 2.0-rc1; 9.8p1 > 9.8;
+/// 1.0.2a > 1.0.2; 1.0 == 1.0.0; 1:2.3 == 2.3). The ONE documented divergence: a zero
+/// numeric token against an alpha token at the same position ("1.0.0" vs "1.0.a") orders the
+/// alpha higher, where NVD orders any numeric higher.
 [[nodiscard]] inline int catalog_version_compare(std::string_view a, std::string_view b) {
     const auto ta = detail::tokenize(a);
     const auto tb = detail::tokenize(b);
