@@ -3157,7 +3157,7 @@ so this is easy to hit.
 **Diagnosing a rejection.** The agent logs either `untrusted chain` or
 `invalid signature` — or, when its own trust bundle cannot be loaded at all
 (missing, unreadable by the agent's account, not a regular file, larger than
-1 MiB, or not a PEM certificate file),
+1 MiB, locked by another process on Windows, or not a PEM certificate file),
 `the update trust bundle could not be loaded, so the signature was not checked`,
 counted as `reason="bundle_unreadable"`. That last one is a fault on the
 endpoint, not in your signing; fix the bundle file or its permissions. Agents
