@@ -510,11 +510,12 @@ flip, with a red-first test each:
   `docs/spark-stage2-guardian-consumer-design.md` R5.2 amendment). Criteria for the flip: (1) a
   measured Service `watch()` p99 below the 5 s claim deadline (a large surplus of slow arms can
   still end congestion-expired); (2) the parked-arm signals exported as heartbeat tags -
-  `arms_parked_total`, `arm_redrives`, `compensation_reservation_refused`, `claim_drain_failures`,
-  the current parked depth (`arms_parked()`) and, from #4354, `claim_index_release_failures()`
-  (which counts release attempts, not claims) are runtime accessors only today, and no
-  retained-tombstone count is exported either (`retained_tombstones()`, added by the
-  #4605/#5322/#5323 fix, is a runtime accessor only), so
+  `claim_drain_failures`, `claim_index_release_failures()` (from #4354; counts release attempts,
+  not claims) and the retained-tombstone count `retained_tombstones()` (added by the
+  #4605/#5322/#5323 fix) are now exported (tag `yuzu.guardian_<same name>`, fleet gauge
+  `yuzu_fleet_guardian_<same name>`, sparse, fleet SUM), but `arms_parked_total`, `arm_redrives`,
+  `compensation_reservation_refused` and the current parked depth (`arms_parked()`) remain runtime
+  accessors only and are still owed, so
   `arm_pending > 0` cannot yet be told apart from ordinary in-flight arms; (3) a decision on the
   deferred faster redrive/expiry cadence (expiry lands between the deadline
   and the deadline plus one heartbeat interval (30 s by default), and the redrive sweep is a ~5 s
@@ -694,9 +695,11 @@ flip, with a red-first test each:
     releases and pops it on the next heartbeat pass.
   - Observability: new runtime accessors `retained_tombstones()` (live gauge),
     `tombstones_released_by_reaper()`, `orphan_disarms_started()` and
-    `dead_watchers_erased_on_lost()`. Their heartbeat export is not done by this fix: the accessors'
-    own header comments formerly assigned it to "the #5168 tags PR" (a closed issue); the work is now
-    tracked in #5404 (see the pre-flip rows below). A test-only
+    `dead_watchers_erased_on_lost()`. Their heartbeat export was not done by this fix: the accessors'
+    own header comments formerly assigned it to "the #5168 tags PR" (a closed issue); it was tracked
+    in #5404 and is now done, as heartbeat tags `yuzu.guardian_retained_tombstones`,
+    `yuzu.guardian_tombstones_released_by_reaper`, `yuzu.guardian_orphan_disarms_started` and
+    `yuzu.guardian_dead_watchers_erased_on_lost` (see the pre-flip rows below). A test-only
     `invariant_violations_for_test()` checks the registry's cross-structure invariants and has no
     production caller.
   - A retained owner tombstone that holds an orphan key's last mapping can still reach
@@ -729,10 +732,27 @@ flip, with a red-first test each:
       runtime; the drop is counted in `claims_dropped_at_stop_`, the same accepted shutdown behaviour
       as any retained Disarm dropped at stop.
     - An orphan Disarm whose backend disarm never returns stays at its key's head and queues any
-      later same-key arm behind it: `submit()` has no deadline, neither the overdue scan nor the
-      reaper touches a Disarm claim, and no age gauge exists. Tracked in #5403.
+      later same-key arm behind it: `submit()` has no deadline and neither the overdue scan nor the
+      reaper touches a Disarm claim. This is observation only by design: a hung orphan Disarm is NOT
+      released, popped or force-cancelled, because that would re-create the teardown-before-rearm
+      hazard. Its age is exported (`yuzu.guardian_disarm_pending_age_seconds`, fleet MAX gauge
+      `yuzu_fleet_guardian_disarm_pending_age_seconds_max`) together with a once-latched count of
+      Disarms pending past a fixed 30 s initial threshold
+      (`yuzu.guardian_disarm_deadline_elapsed`; the value is a policy choice, not a measured
+      bound). Blast radius, in order: the key, then the class quota (only while an admitted call is
+      running; a retained Queued Disarm holds only its key), then the mechanism-type lock. Recovery
+      is an agent restart or `--spark-disable`. The gauge does not cover a compensating teardown
+      (its own gauge is `yuzu_fleet_guardian_compensation_pending_age_seconds_max`),
+      `direct_disarm_fallback`, the synchronous residue fallback in `detach_rule_locked` (a hang
+      there stalls expiry and the age scan for all keys; documented, not fixed), or inline-type
+      teardown. The F3 orphan-drain grace (`kOrphanDrainGrace`, 3 s) is not a Disarm bound, and the
+      20 s `kShutdownDeadlineGrace` belongs to `ShutdownDeadlineGuard`, not to Disarm.
+      Tracked in #5403.
     - A throw out of `expire_overdue_claims()` (it is not noexcept) is caught by the engine's
-      maintenance firewall, counted in `ack_maint_exceptions_` (no accessor, not exported), and skips
+      maintenance firewall, counted in `ack_maint_exceptions_`, exposed as
+      `GuardianEngine::ack_maint_exceptions()` and exported as `yuzu.guardian_ack_maint_exceptions`
+      (sparse fleet SUM gauge `yuzu_fleet_guardian_ack_maint_exceptions`); test coverage is at the
+      plumbing level only, since no test seam can provoke the counter. The firewall skips
       the rest of that tick's ack drain, including the reaper and the orphan pass when the throw
       precedes them (for example a throw from the overdue abandon loop); a throw that recurs every
       tick repeats the skip.
@@ -756,10 +776,20 @@ flip, with a red-first test each:
       The residue fallback increments both `detach_sweep_left_residue()` and
       `detach_claim_failures()`. Steady-state expectation for the first three is 0 outside a
       failing index release; `claims_dropped_at_stop()` counts shutdown drops only.
-    - (P2) Export `ack_maint_exceptions_` (it has no accessor yet).
+      **Delivered:** all ten are exported as `yuzu.guardian_<same name>` heartbeat tags (sparse; the
+      gauge `yuzu_fleet_guardian_<same name>`, fleet SUM).
+    - (P2) Export `ack_maint_exceptions_` (it has no accessor yet). **Delivered:** the accessor
+      `GuardianEngine::ack_maint_exceptions()` exists and the counter is exported as
+      `yuzu.guardian_ack_maint_exceptions` / `yuzu_fleet_guardian_ack_maint_exceptions` (with P1,
+      eleven tag and gauge pairs in all).
     - (P3) Add an oldest-pending-Disarm age gauge, so a hung orphan Disarm is visible (#5403).
+      **Delivered:** `yuzu.guardian_disarm_pending_age_seconds` / fleet MAX
+      `yuzu_fleet_guardian_disarm_pending_age_seconds_max`, plus the deadline count
+      `yuzu.guardian_disarm_deadline_elapsed`; #4472 adds the compensation-teardown age
+      (`yuzu.guardian_compensation_pending_age_seconds`) and deadline count
+      (`yuzu.guardian_compensation_deadline_elapsed`).
     - (P4) The heartbeat-tag export work is tracked in #5404 (the accessors' header comments formerly
-      named "the #5168 tags PR", a closed issue).
+      named "the #5168 tags PR", a closed issue). **Delivered** (see P1 and P2).
 - **FIXED by the #4605/#5322/#5323 fix on branch `fix/4605-5322-claim-tombstone-state` (the PR that
   closes #5323) (was RECORDED, not flip-gating unless Dave rules otherwise; added
   2026-10-03)**: #5323,
@@ -798,7 +828,10 @@ flip, with a red-first test each:
   same-rule pending claim on another key, which means rewriting the "re-observation touches no
   index state" contract) and the adjacent already-committed-B / stale-adoption case (an adoption
   refused with `wedge_adopt_stale_refused` after another key committed). #4472 is NOT fixed by this
-  fix: its Reobserved branch re-observes the same claim and does not touch the index.
+  fix: its Reobserved branch re-observes the same claim and does not touch the index. #4472 itself
+  is fixed separately: by the #4472 K-eligibility fix on this branch (a claim whose compensating
+  disarm is outstanding is not K-eligible, so the generation is held and the server's re-push
+  re-arms the rule after the teardown).
 - **up-101 and cs-103 status (rung 9c PR-5a, #4221) - not previously listed as their
   own bullets in this section, added here for completeness.** up-101 (a same-rule
   re-attach behind a surviving tombstone leaking a watcher, `guardian_spark_
@@ -851,11 +884,21 @@ flip, with a red-first test each:
   this gap only lets that already-tolerated case happen one tick EARLIER,
   never a new unsafe state (full reasoning: R5.3's own "K-eligibility
   linearizes at the drain-time read" paragraph). Non-blocking today
-  (`prefer_spark_=false`). Criterion: before the flip, either re-confirm this
-  reasoning still holds against whatever the runtime's shape is at flip time,
-  or promote it from an implicit consequence of two design-doc sentences
-  agreeing with each other into an explicit, load-bearing invariant a
-  reviewer checks directly.
+  (`prefer_spark_=false`). Criterion: before the flip, the following executed
+  evidence is required, rather than a re-reading of this reasoning: (1) the
+  staging-gap guard, on both the normal path and the exception path (the
+  `CompensationOwedMark` scope guard); (2) the recovery-scan case (a wedge
+  retained in `failed_receipts` on an earlier drain goes Blocking once its
+  compensation starts); (3) no acknowledgment while a compensating disarm is
+  outstanding, at runtime plus ledger level and at engine level; (4) the
+  compensation-teardown observation (age and once-latched deadline count). The
+  `[4472]` tests cover these four on this branch; re-run them against whatever
+  the runtime's shape is at flip time. This does NOT close the post-K
+  late-failure recovery gap: a K-waived rule whose late result fails, or is not
+  adopted, has no engine recovery owner and the acknowledgment suppresses the
+  server's re-push (the "never a new unsafe state" sentence above holds for
+  resource ownership, not for desired-state recovery). That gap is #5459, and
+  needs an explicit accept-or-recover decision before `prefer_spark_` flips.
 - **NEW precondition for the F14 flip (added 2026-09-18, PR #4529 review
   finding): the `reapply_count` cross-rule funding consequence must become a
   named flip criterion, not stay implicit in a design-doc/ledger note.** A
