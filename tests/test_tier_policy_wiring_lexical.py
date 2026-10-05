@@ -91,13 +91,14 @@ class TierPolicyWiringLexical(unittest.TestCase):
     def test_source_is_clean(self):
         p = problems(self.src)
         for m in p:
-            print(f"::error::{TAG}: {m}", file=sys.stderr)
+            print(f"\n::error::{TAG}: {m}", file=sys.stderr)
         self.assertEqual(p, [])
 
     def test_mutations_are_caught(self):
         src = self.src
         for a in (DESIGNATED_LINE, POSITIONAL_LINE):
-            self.assertEqual(src.count(a), 1, f"mutation anchor not unique: {a!r}")
+            n = src.count(a)
+            self.assertEqual(n, 1, f"mutation anchor must match exactly once, found {n}; update the constant: {a!r}")
         # (name, mutated source, the clause fragments that must appear; len(p) pins that no other clause fires)
         cases = [
             ("T1 designated reverted to a lambda",

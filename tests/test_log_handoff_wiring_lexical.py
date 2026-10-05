@@ -36,10 +36,12 @@ that main.cpp's gate had no Windows-service equivalent:
 
 Static/text-only, no build required -- a lexical gate, not a semantic one: it cannot see a
 relocation that keeps the same tokens but changes the surrounding control flow (review-enforced).
-Line numbers are 1-based and comment lines count (no normalisation).
+`//` comment tails are blanked before matching (line numbers unchanged; `/* */` is not stripped),
+so a comment quoting a token can neither satisfy nor trip an invariant. Line numbers are 1-based.
 
 Usage: python3 tests/test_log_handoff_wiring_lexical.py
 """
+import re
 import sys
 import unittest
 from pathlib import Path
@@ -69,6 +71,8 @@ def last_before(lines, s, upto):
 def problems(main, win):
     """One message per violated invariant, in invariant order; [] when clean."""
     out = []
+    main = re.sub(r"//.*", "", main)
+    win = re.sub(r"//.*", "", win)
     ml = main.split("\n")
     wl = win.split("\n")
 
@@ -142,15 +146,15 @@ class LogHandoffWiringLexical(unittest.TestCase):
     def test_source_is_clean(self):
         p = problems(self.main, self.win)
         for m in p:
-            print(f"::error::{TAG}: {m}", file=sys.stderr)
+            print(f"\n::error::{TAG}: {m}", file=sys.stderr)
         self.assertEqual(p, [])
 
     def test_mutations_are_caught(self):
         main, win = self.main, self.win
-        for a in (EPILOGUE, MAKE_AGENT):
-            self.assertEqual(main.count(a), 1, f"mutation anchor not unique: {a!r}")
-        for a in (DONE_GUARD, F3_DRAIN):
-            self.assertEqual(win.count(a), 1, f"mutation anchor not unique: {a!r}")
+        for src, anchors in ((main, (EPILOGUE, MAKE_AGENT)), (win, (DONE_GUARD, F3_DRAIN))):
+            for a in anchors:
+                n = src.count(a)
+                self.assertEqual(n, 1, f"mutation anchor must match exactly once, found {n}; update the constant: {a!r}")
         # L5: the guard moves to just after the first `try {` line following service_main.
         sm = win.index("void WINAPI service_main(")
         l5 = win.replace(DONE_GUARD, "", 1)  # the guard precedes the try, so removal shifts it
@@ -171,6 +175,10 @@ class LogHandoffWiringLexical(unittest.TestCase):
             ("L5 done_guard after the outer try", main, l5, "must be declared BEFORE service_main's outer"),
             ("L6 catch before the F3 drain", main,
              win.replace(F3_DRAIN, "} catch (...) {\n" + F3_DRAIN, 1), "outside its guarding try"),
+            # A `//` comment quoting hard_exit(3) near the top must not hide the L6 regression.
+            ("L6 under an early hard_exit(3) comment", main,
+             win.replace("\n", "\n// see hard_exit(3) below\n", 1).replace(F3_DRAIN, "} catch (...) {\n" + F3_DRAIN, 1),
+             "outside its guarding try"),
         ]
         for name, m, w, expected in cases:
             with self.subTest(mutation=name):
@@ -178,6 +186,9 @@ class LogHandoffWiringLexical(unittest.TestCase):
                 p = problems(m, w)
                 self.assertTrue(p, "mutation was NOT detected by the gate")
                 self.assertIn(expected, p[0])
+
+    def test_comment_quoting_a_forbidden_call_stays_green(self):
+        self.assertEqual(problems(self.main + "// never call ->teardown( here\n", self.win), [])
 
 
 if __name__ == "__main__":

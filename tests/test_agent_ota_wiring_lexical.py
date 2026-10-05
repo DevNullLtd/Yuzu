@@ -19,7 +19,7 @@ refactor could silently stop CALLING them. This gate pins the call sites lexical
      `update_thread_.join()` after the sync thread. The post-publish predicate is only sound
      because of this flag-then-cancel order.
 
-Robustness: comments are stripped and whitespace is collapsed before matching, so line
+Robustness: `//` comments are stripped and whitespace is collapsed before matching, so line
 wrapping, re-indentation and comment text mentioning a token cannot satisfy or break a check.
 Patterns anchor on distinctive tokens, never line numbers.
 
@@ -35,6 +35,8 @@ Two controls of the bash original have no analogue here by construction and were
 the regex-error control (`re` raises at compile time, so a bad pattern is a hard error) and
 the >255 repetition-bound lint (BSD RE_DUP_MAX does not apply to `re`). Their absence is not
 lost coverage.
+Also dropped: the AGENT_CPP path override, --self-test-only, the distinct exit code 3 and the
+missing-file `::error::` line (a missing source now raises in setUp).
 
 agent.cpp has non-ASCII lines, so it is read as UTF-8.
 
@@ -148,7 +150,7 @@ class AgentOtaWiringLexical(unittest.TestCase):
     def test_source_is_clean(self):
         p = problems(self.raw)
         for m in p:
-            print(f"::error::{TAG}: {m}{HINT}", file=sys.stderr)
+            print(f"\n::error::{TAG}: {m}{HINT}", file=sys.stderr)
         self.assertEqual(p, [])
 
     def test_mutations_are_caught(self):

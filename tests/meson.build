@@ -2982,7 +2982,7 @@ test('flake-retry selftest',
 # a seeded raw-spawn fixture must fail and the sanctioned-runner allowlist case
 # must pass. Wired here so the gate's own matcher is enforced on every platform
 # with bash, mirroring the flake-retry selftest above. The Windows test job's default
-# shell is MSYS2 bash (ci.yml:1500), so its Test step runs these bash tests there;
+# shell is MSYS2 bash (set in ci.yml), so its Test step runs these bash tests there;
 # `required: false` only lets a bash-less developer host configure cleanly.
 _bash_test = find_program('bash', required: false)
 if _bash_test.found()
@@ -3002,7 +3002,7 @@ if _bash_test.found()
     timeout: 120,
   )
   # Registered off Windows only (#5428): both fork hundreds of subshells (about
-  # 1 s on macOS/Linux, 28-98 s under MSYS2 on the shared 4-runner Windows box)
+  # 1-3 s on macOS/Linux, 28-98 s under MSYS2 on the shared 4-runner Windows box)
   # and exercise scripts that never run on Windows -- start-UAT.sh is the
   # macOS/Linux rig (Windows uses scripts/win-start-UAT.sh) and the README
   # touch rule runs on hosted Ubuntu (docs-lint.yml).
