@@ -2698,6 +2698,16 @@ test('agent installer trust-anchor ACL lint',
   timeout: 30,
 )
 
+# Compose certs volume (#5370): every tracked compose that keeps Postgres on a
+# volume must also keep the server's /etc/yuzu/certs (CA + the secrets KEK,
+# registered in Postgres) on a named volume. Stdlib only, no Docker.
+test('compose certs volume',
+  _python3_test,
+  args: [files('test_compose_certs_volume.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
 # ── Repo hygiene tests ─────────────────────────────────────────────────────
 # Changelog promote --append (#5221): folds post-promotion hotfix fragments
 # into an already-promoted release section. Stdlib only.
