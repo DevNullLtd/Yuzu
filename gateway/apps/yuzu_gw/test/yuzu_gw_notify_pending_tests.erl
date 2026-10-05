@@ -1,6 +1,7 @@
 %%%-------------------------------------------------------------------
 %%% @doc EUnit tests for the bounded pending store behind stream-status
-%%% notifications (#4632), closed-state behaviour.
+%%% notifications (#4632): the closed-state drain, the reserved replay slot and
+%%% the half_open probe.
 %%%
 %%% yuzu_gw_upstream used to drop a NotifyStreamStatus when 10 were already in
 %%% flight and when the circuit breaker was open. It now holds them in
@@ -8,7 +9,12 @@
 %%% first insertion, cap notify_pending_max keys) and drains them as capacity
 %%% returns. These tests pin that wiring:
 %%%   - selection order, coalescing, the cap, the two-sessions case
-%%%   - an open or half_open breaker holds; a close drains first in first out
+%%%   - an open breaker holds; half_open sends ONE held entry as the probe, and
+%%%     its success closes the breaker and drains first in first out
+%%%   - the probe protocol: reopen and requeue at the head on error, a stale
+%%%     result or an older generation never touches the breaker, the reserved
+%%%     slot for the requeue, a killed or duplicated probe, the 10 worker budget
+%%%   - one slot is held back while a registration replay is active
 %%%   - the [yuzu,gw,upstream,notify_queue] gauge events
 %%%   - format_status shows a count, never the held events
 %%%   - an untrappable worker death, an upstream restart, terminate/2
@@ -78,10 +84,10 @@ closed_test_() ->
         fun coalescing_keeps_the_latest_event/0),
       t("two sessions of one agent are both kept and sent in order",
         fun two_sessions_of_one_agent_are_both_kept/0),
-      t("a circuit that is open holds notifications, closing it drains them first in first out",
+      t("an open circuit holds notifications; a half_open probe that succeeds drains them in order",
         fun open_circuit_holds_then_close_drains_in_order/0),
-      t("a half_open circuit holds notifications until a probe RPC closes it",
-        fun half_open_circuit_holds_until_closed/0),
+      t("a half_open circuit sends one held notification as the probe and holds the rest",
+        fun half_open_circuit_sends_one_probe_and_holds_the_rest/0),
       t("the notify_queue gauges follow a burst and settle at zero, with a zero emit from init",
         fun gauges_follow_a_burst/0),
       t("format_status shows notify_pending_len and never the held events",
@@ -130,6 +136,57 @@ replay_test_() ->
      [
       t("a refilled backlog does not starve an active replay: the replay head advances",
         fun replay_advances_while_the_backlog_is_refilled/0)
+     ]}.
+
+%% The half_open probe (#4632). The breaker's reset timer is a long way off (the
+%% tests move it to half_open by hand) but short of its cap, so one failed probe
+%% shows the backoff doubling. Replay spacing 1 ms.
+probe_env(Extra) ->
+    [{registration_replay_spacing_ms, 1},
+     {circuit_breaker_reset_timeout_ms, 100000},
+     {circuit_breaker_max_reset_timeout_ms, 1200000}] ++ Extra.
+
+probe_test_() ->
+    {foreach,
+     fun() -> setup(probe_env([])) end,
+     fun cleanup/1,
+     [
+      t("probe success closes the breaker, drains the held keys in order and fires the replay",
+        fun probe_success_closes_drains_and_replays/0),
+      t("probe error reopens the breaker with doubled backoff and requeues the event at the head",
+        fun probe_error_reopens_and_requeues_at_the_head/0),
+      t("a probe result after a call path RPC closed the circuit leaves the breaker alone (ok)",
+        fun stale_probe_ok_after_call_path_close/0),
+      t("a probe result after a call path RPC closed the circuit leaves the breaker alone (error)",
+        fun stale_probe_error_after_call_path_close/0),
+      t("an old generation probe ok does not close a newer half_open breaker",
+        fun older_generation_probe_ok_is_ignored_by_the_breaker/0),
+      t("an old generation probe error does not reopen a newer half_open breaker",
+        fun older_generation_probe_error_is_ignored_by_the_breaker/0),
+      t("a newer event for the probe's key supersedes the failed probe event, counted",
+        fun newer_same_key_event_supersedes_a_failed_probe/0),
+      t("a probe worker killed with no result is a failure, handled once",
+        fun killed_probe_worker_is_one_failure/0),
+      t("a duplicate or foreign probe result is ignored",
+        fun duplicate_and_foreign_probe_results_are_ignored/0),
+      t("a failed old probe is re-sent after the newer same-key event went out",
+        fun failed_old_probe_is_resent_after_the_newer_event/0),
+      t("while a probe is in flight nothing else drains, ordinary workers included",
+        fun nothing_else_drains_while_a_probe_is_in_flight/0),
+      t("the probe counts inside the ten worker budget and shows in the inflight gauge",
+        fun probe_counts_inside_the_budget/0),
+      t("format_status shows notify_probe_held and never the probe event",
+        fun format_status_hides_the_probe_event/0)
+     ]}.
+
+%% Cap 3: a failed probe's event always fits back.
+probe_cap_test_() ->
+    {foreach,
+     fun() -> setup(probe_env([{notify_pending_max, 3}])) end,
+     fun cleanup/1,
+     [
+      t("a probe in flight reserves one slot, so a failed probe's event fits back at the cap",
+        fun probe_reserves_a_slot_for_its_requeue/0)
      ]}.
 
 setup(Env) ->
@@ -233,6 +290,8 @@ release_parked(Workers) ->
     [W ! release || {W} <- ets:tab2list(Workers)],
     ok.
 
+await_dead(Pid) when is_pid(Pid) ->
+    await_dead([Pid]);
 await_dead(Pids) ->
     Refs = [erlang:monitor(process, P) || P <- Pids],
     lists:foreach(fun(Ref) ->
@@ -464,17 +523,23 @@ open_circuit_holds_then_close_drains_in_order() ->
     ?assertEqual({12, 0}, last_gauge()),
     ?assertEqual(0, map_size(up_get(notify_pids))),
     ?assertEqual(0, count(?EV_DROPPED)),
-    %% The reset timer is far away: half_open by hand, then a good RPC closes.
-    whereis(yuzu_gw_upstream) ! circuit_half_open,
+    %% The reset timer is far away: half_open by hand. Exactly one held entry
+    %% goes out, as the probe; the rest stay held until it closes the breaker.
+    enter_half_open(),
+    {Probe, ProbeReq} = await_entered(),
+    ?assertEqual(agent(1), maps:get(agent_id, ProbeReq)),
+    sync(),
+    ?assertEqual({11, 1}, last_gauge()),
+    ?assertEqual(half_open, yuzu_gw_upstream:circuit_state()),
     mock(ok),
-    {ok, _} = yuzu_gw_upstream:proxy_register(#{info => #{}}),
-    ?assertEqual(closed, yuzu_gw_upstream:circuit_state()),
-    ?assertEqual({2, ?INFLIGHT_MAX}, last_gauge()),
-    %% The first ten held keys went out (their entry order is not fixed), then
-    %% the rest one slot at a time, in order.
+    Probe ! release,
+    %% The first ten held keys after the probe went out (their entry order is
+    %% not fixed), then the rest one slot at a time, in order.
     First = await_entered(?INFLIGHT_MAX),
-    ?assertEqual(lists:sort(lists:sublist(Keys, ?INFLIGHT_MAX)),
+    ?assertEqual(closed, yuzu_gw_upstream:circuit_state()),
+    ?assertEqual(lists:sort(lists:sublist(Keys, 2, ?INFLIGHT_MAX)),
                  lists:sort([maps:get(agent_id, Req) || {_, Req} <- First])),
+    await_until(fun() -> last_gauge() =:= {1, ?INFLIGHT_MAX} end),
     Live0 = [W || {W, _} <- First],
     LiveN = lists:foldl(
               fun(Id, [W | Rest]) ->
@@ -482,37 +547,44 @@ open_circuit_holds_then_close_drains_in_order() ->
                   {W2, Req} = await_entered(),
                   ?assertEqual(Id, maps:get(agent_id, Req)),
                   Rest ++ [W2]
-              end, Live0, lists:nthtail(?INFLIGHT_MAX, Keys)),
+              end, Live0, lists:nthtail(?INFLIGHT_MAX + 1, Keys)),
     ?assertEqual(?INFLIGHT_MAX, length(LiveN)),
     ?assertEqual(0, count(?EV_DROPPED)),
     open_and_release_all(),
     await_until(fun() -> last_gauge() =:= {0, 0} end).
 
-half_open_circuit_holds_until_closed() ->
+half_open_circuit_sends_one_probe_and_holds_the_rest() ->
     watch(),
     trip_breaker(),
-    whereis(yuzu_gw_upstream) ! circuit_half_open,
-    ?assertEqual(half_open, yuzu_gw_upstream:circuit_state()),
+    enter_half_open(),
+    %% Empty store: nothing to probe with. The first arrival while already
+    %% half_open becomes the probe, the others are held behind it.
+    ?assertEqual([{0, 0}], gauges()),
     Keys = [agent(I) || I <- lists:seq(1, 12)],
     [cast_connected(Id) || Id <- Keys],
+    {Probe, ProbeReq} = await_entered(),
+    ?assertEqual(agent(1), maps:get(agent_id, ProbeReq)),
     sync(),
-    ?assertEqual({12, 0}, last_gauge()),
-    ?assertEqual(0, map_size(up_get(notify_pids))),
+    ?assertEqual({11, 1}, last_gauge()),
+    ?assertEqual(1, map_size(up_get(notify_pids))),
     ?assertEqual(half_open, yuzu_gw_upstream:circuit_state()),
     ?assertEqual(0, count(?EV_DROPPED)),
-    %% A failed RPC reopens it: still held.
-    {error, _} = yuzu_gw_upstream:proxy_register(#{info => #{}}),
+    %% The probe fails: the breaker reopens and the entry is back at the head.
+    fail_worker(Probe),
+    await_until(fun() -> last_gauge() =:= {12, 0} end),
     ?assertEqual(open, yuzu_gw_upstream:circuit_state()),
-    ?assertEqual({12, 0}, last_gauge()),
-    %% half_open again, a good RPC closes it, and the held keys drain.
-    whereis(yuzu_gw_upstream) ! circuit_half_open,
+    %% half_open again: the same entry is the probe, and a success closes the
+    %% breaker and drains the held keys.
+    enter_half_open(),
+    {Probe2, ProbeReq2} = await_entered(),
+    ?assertEqual(agent(1), maps:get(agent_id, ProbeReq2)),
     mock(ok),
-    {ok, _} = yuzu_gw_upstream:proxy_register(#{info => #{}}),
-    ?assertEqual(closed, yuzu_gw_upstream:circuit_state()),
+    Probe2 ! release,
     First = await_entered(?INFLIGHT_MAX),
-    ?assertEqual(lists:sort(lists:sublist(Keys, ?INFLIGHT_MAX)),
+    ?assertEqual(closed, yuzu_gw_upstream:circuit_state()),
+    ?assertEqual(lists:sort(lists:sublist(Keys, 2, ?INFLIGHT_MAX)),
                  lists:sort([maps:get(agent_id, Req) || {_, Req} <- First])),
-    ?assertEqual({2, ?INFLIGHT_MAX}, last_gauge()),
+    await_until(fun() -> last_gauge() =:= {1, ?INFLIGHT_MAX} end),
     open_and_release_all(),
     await_until(fun() -> last_gauge() =:= {0, 0} end).
 
@@ -727,6 +799,359 @@ env_case(Val, Kind) ->
     end.
 
 %%%===================================================================
+%%% Tests: the half_open probe
+%%%===================================================================
+
+%% Twelve keys are held behind an open breaker. half_open sends the head as the
+%% probe; its success closes the breaker, casts the replay, and the held keys
+%% drain first in first out. The replay is observed as its ProxyRegister.
+probe_success_closes_drains_and_replays() ->
+    watch(),
+    _ = bind_replay_agent(1),
+    trip_breaker(),
+    Keys = [agent(I) || I <- lists:seq(1, 12)],
+    [cast_connected(Id) || Id <- Keys],
+    sync(),
+    ?assertEqual({12, 0}, last_gauge()),
+    enter_half_open(),
+    {Probe, ProbeReq} = await_entered(),
+    ?assertEqual(agent(1), maps:get(agent_id, ProbeReq)),
+    sync(),
+    ?assertEqual({11, 1}, last_gauge()),
+    mock(ok),
+    Probe ! release,
+    First = await_entered(?INFLIGHT_MAX),
+    await_until(fun() -> last_gauge() =:= {1, ?INFLIGHT_MAX} end),
+    %% The gauge is reported after the replay cast was enqueued, and a call is
+    %% answered after it: the replay queue holds the one agent.
+    sync(),
+    ?assertEqual(closed, yuzu_gw_upstream:circuit_state()),
+    ?assertMatch([_], up_get(replay_queue)),
+    ?assertEqual(lists:sort(lists:sublist(Keys, 2, ?INFLIGHT_MAX)),
+                 lists:sort([maps:get(agent_id, Req) || {_, Req} <- First])),
+    %% Ten workers are in flight, so the replay waits; one slot opens and the
+    %% replay head goes out, then the last held key.
+    {W, _} = hd(First),
+    W ! release,
+    receive {proxied, _} -> ok
+    after ?AWAIT_MS -> erlang:error(replay_did_not_run)
+    end,
+    {_, Last} = await_entered(),
+    ?assertEqual(agent(12), maps:get(agent_id, Last)),
+    open_and_release_all(),
+    await_until(fun() -> last_gauge() =:= {0, 0} end),
+    Entered = [maps:get(agent_id, R) || R <- entered_reqs()],
+    ?assertEqual(lists:sort(Keys), lists:sort(Entered)).
+
+probe_error_reopens_and_requeues_at_the_head() ->
+    watch(),
+    trip_breaker(),
+    Keys = [agent(I) || I <- lists:seq(1, 12)],
+    [cast_connected(Id) || Id <- Keys],
+    sync(),
+    %% The first trip doubled the 100000 ms base once.
+    ?assertEqual(200000, up_get(cb_cur_timeout)),
+    enter_half_open(),
+    {Probe, ProbeReq} = await_entered(),
+    ?assertEqual(agent(1), maps:get(agent_id, ProbeReq)),
+    fail_worker(Probe),
+    await_until(fun() -> last_gauge() =:= {12, 0} end),
+    ?assertEqual(open, yuzu_gw_upstream:circuit_state()),
+    ?assertEqual(undefined, up_get(notify_probe)),
+    ?assertEqual(0, map_size(up_get(notify_pids))),
+    %% One failure, one doubling, one requeue, however the worker's exit lands.
+    await_dead(Probe),
+    sync(),
+    ?assertEqual(400000, up_get(cb_cur_timeout)),
+    ?assertEqual(0, count(?EV_COALESCED)),
+    ?assertEqual(12, pending_len()),
+    [{HeadKey, _} | _] = yuzu_gw_notify_queue:to_list(up_get(notify_pending)),
+    ?assertEqual({agent(1), <<"sess">>, <<"home">>}, HeadKey),
+    %% The next half_open probes with the same entry again.
+    enter_half_open(),
+    {_, Again} = await_entered(),
+    ?assertEqual(agent(1), maps:get(agent_id, Again)).
+
+%% half_open with a probe in flight; a call path RPC succeeds and closes the
+%% breaker, and the probe's own result arrives afterwards.
+stale_probe_ok_after_call_path_close() ->
+    watch(),
+    {Probe, Cb} = probe_then_call_path_close(),
+    Probe ! release,
+    await_until(fun() -> last_gauge() =:= {0, 4} end),
+    await_dead(Probe),
+    sync(),
+    ?assertEqual(Cb, breaker()),
+    ?assertEqual(undefined, up_get(notify_probe)),
+    %% Delivered: retired, not sent again.
+    ?assertEqual(1, length([x || R <- entered_reqs(), maps:get(agent_id, R) =:= agent(1)])).
+
+stale_probe_error_after_call_path_close() ->
+    watch(),
+    {Probe, Cb} = probe_then_call_path_close(),
+    fail_worker(Probe),
+    %% Not delivered: requeued, and the breaker being closed, sent again.
+    {_, Again} = await_entered(),
+    ?assertEqual(agent(1), maps:get(agent_id, Again)),
+    await_dead(Probe),
+    sync(),
+    ?assertEqual(Cb, breaker()),
+    ?assertEqual(undefined, up_get(notify_probe)).
+
+%% Five keys held, the head sent as the probe, then a good call path RPC closes
+%% the breaker (the other four keys drain). Returns the parked probe and the
+%% breaker state to compare against.
+probe_then_call_path_close() ->
+    trip_breaker(),
+    [cast_connected(agent(I)) || I <- lists:seq(1, 5)],
+    enter_half_open(),
+    {Probe, ProbeReq} = await_entered(),
+    ?assertEqual(agent(1), maps:get(agent_id, ProbeReq)),
+    mock(ok),
+    {ok, _} = yuzu_gw_upstream:proxy_register(#{info => #{}}),
+    ?assertEqual(closed, yuzu_gw_upstream:circuit_state()),
+    _ = await_entered(4),
+    sync(),
+    ?assertEqual({0, 5}, last_gauge()),
+    {Probe, breaker()}.
+
+older_generation_probe_ok_is_ignored_by_the_breaker() ->
+    watch(),
+    {Probe, Cur} = probe_then_newer_half_open(),
+    Probe ! release,
+    %% The breaker is untouched (still half_open); the probe event was
+    %% delivered and retired, so the next probe is the next key.
+    {_, Next} = await_entered(),
+    ?assertEqual(agent(2), maps:get(agent_id, Next)),
+    ?assertEqual(half_open, yuzu_gw_upstream:circuit_state()),
+    ?assertEqual({2, Cur}, {up_get(cb_gen), up_get(cb_cur_timeout)}).
+
+older_generation_probe_error_is_ignored_by_the_breaker() ->
+    watch(),
+    {Probe, Cur} = probe_then_newer_half_open(),
+    fail_worker(Probe),
+    %% The breaker is untouched (still half_open); the probe event was
+    %% requeued at the head, so the next probe is the same key again.
+    {_, Next} = await_entered(),
+    ?assertEqual(agent(1), maps:get(agent_id, Next)),
+    ?assertEqual(half_open, yuzu_gw_upstream:circuit_state()),
+    ?assertEqual({2, Cur}, {up_get(cb_gen), up_get(cb_cur_timeout)}).
+
+%% Generation 1 half_open with a probe in flight, a failing call path RPC
+%% reopens the breaker, and a second half_open (generation 2) follows while the
+%% first probe is still out. Returns that probe and the backoff at that point.
+probe_then_newer_half_open() ->
+    trip_breaker(),
+    [cast_connected(agent(I)) || I <- lists:seq(1, 4)],
+    enter_half_open(),
+    {Probe, ProbeReq} = await_entered(),
+    ?assertEqual(agent(1), maps:get(agent_id, ProbeReq)),
+    ?assertEqual(1, up_get(cb_gen)),
+    {error, _} = yuzu_gw_upstream:proxy_register(#{info => #{}}),
+    ?assertEqual(open, yuzu_gw_upstream:circuit_state()),
+    enter_half_open(),
+    ?assertEqual(2, up_get(cb_gen)),
+    ?assertEqual(half_open, yuzu_gw_upstream:circuit_state()),
+    {Probe, up_get(cb_cur_timeout)}.
+
+probe_reserves_a_slot_for_its_requeue() ->
+    watch(),
+    trip_breaker(),
+    [cast_connected(agent(I)) || I <- lists:seq(1, 3)],
+    sync(),
+    ?assertEqual({3, 0}, last_gauge()),
+    enter_half_open(),
+    {Probe, ProbeReq} = await_entered(),
+    ?assertEqual(agent(1), maps:get(agent_id, ProbeReq)),
+    sync(),
+    ?assertEqual({2, 1}, last_gauge()),
+    %% Two held keys and the probe's reserved slot fill the cap of 3.
+    cast_connected(agent(4)),
+    cast_connected(agent(5)),
+    sync(),
+    ?assertEqual(2, pending_len()),
+    ?assertEqual([<<"at_capacity">>, <<"at_capacity">>], dropped_reasons()),
+    %% A replacement of a held key still goes through.
+    notify_status(agent(2), <<"sess">>, disconnected, <<"peer">>, <<"home">>),
+    sync(),
+    ?assertEqual(2, pending_len()),
+    ?assertEqual(1, count(?EV_COALESCED)),
+    %% The probe fails: its event is back, at the head, within the cap.
+    fail_worker(Probe),
+    await_until(fun() -> last_gauge() =:= {3, 0} end),
+    ?assertEqual(3, pending_len()),
+    [{HeadKey, _} | _] = yuzu_gw_notify_queue:to_list(up_get(notify_pending)),
+    ?assertEqual({agent(1), <<"sess">>, <<"home">>}, HeadKey),
+    ?assertEqual(2, length(dropped_reasons())).
+
+newer_same_key_event_supersedes_a_failed_probe() ->
+    watch(),
+    trip_breaker(),
+    Agent = <<"co-agent">>,
+    notify_status(Agent, <<"co-session">>, connected, <<"peer-connect">>, <<"co-home">>),
+    sync(),
+    enter_half_open(),
+    {Probe, First} = await_entered(),
+    ?assertEqual('CONNECTED', maps:get(event, First)),
+    %% The probe took the key out of the store, so this is a new entry.
+    notify_status(Agent, <<"co-session">>, disconnected, <<"peer-disconnect">>, <<"co-home">>),
+    sync(),
+    ?assertEqual({1, 1}, last_gauge()),
+    ?assertEqual(0, count(?EV_COALESCED)),
+    %% The probe fails: its older event is superseded and dropped, counted.
+    fail_worker(Probe),
+    await_until(fun() -> last_gauge() =:= {1, 0} end),
+    ?assertEqual(1, count(?EV_COALESCED)),
+    ?assertEqual(open, yuzu_gw_upstream:circuit_state()),
+    enter_half_open(),
+    {_, Second} = await_entered(),
+    ?assertEqual('DISCONNECTED', maps:get(event, Second)),
+    ?assertEqual(<<"peer-disconnect">>, maps:get(peer_addr, Second)).
+
+killed_probe_worker_is_one_failure() ->
+    watch(),
+    trip_breaker(),
+    cast_connected(<<"kill-me">>),
+    cast_connected(agent(1)),
+    sync(),
+    ?assertEqual(200000, up_get(cb_cur_timeout)),
+    enter_half_open(),
+    {Probe, Killed} = await_entered(),
+    ?assertEqual(<<"kill-me">>, maps:get(agent_id, Killed)),
+    %% No result, no trap: the 'DOWN' alone is the failure.
+    await_until(fun() -> last_gauge() =:= {2, 0} end),
+    await_dead(Probe),
+    sync(),
+    ?assertEqual(open, yuzu_gw_upstream:circuit_state()),
+    ?assertEqual(400000, up_get(cb_cur_timeout)),
+    ?assertEqual(undefined, up_get(notify_probe)),
+    ?assertEqual(0, map_size(up_get(notify_pids))),
+    ?assertEqual(0, count(?EV_COALESCED)),
+    [{{HeadId, _, _}, _} | _] = yuzu_gw_notify_queue:to_list(up_get(notify_pending)),
+    ?assertEqual(<<"kill-me">>, HeadId).
+
+duplicate_and_foreign_probe_results_are_ignored() ->
+    watch(),
+    trip_breaker(),
+    [cast_connected(agent(I)) || I <- lists:seq(1, 3)],
+    enter_half_open(),
+    {Probe, _} = await_entered(),
+    fail_worker(Probe),
+    await_until(fun() -> last_gauge() =:= {3, 0} end),
+    await_dead(Probe),
+    sync(),
+    Up = whereis(yuzu_gw_upstream),
+    Settled = {breaker(), pending_len(), count(?EV_COALESCED), up_get(notify_probe)},
+    %% A second result of the finished probe: no probe is recorded, so nothing.
+    Up ! {notify_probe_result, Probe, 1, {error, again}},
+    sync(),
+    ?assertEqual(Settled, {breaker(), pending_len(), count(?EV_COALESCED), up_get(notify_probe)}),
+    %% A result from a pid that is not the recorded probe of a newer one.
+    enter_half_open(),
+    {Probe2, _} = await_entered(),
+    Up ! {notify_probe_result, Probe, 1, {ok, #{}}},
+    Up ! {notify_probe_result, Probe, 2, {error, again}},
+    sync(),
+    ?assertEqual(half_open, yuzu_gw_upstream:circuit_state()),
+    ?assertMatch(#{pid := Probe2}, up_get(notify_probe)),
+    ?assertEqual(Up, whereis(yuzu_gw_upstream)).
+
+%% The probe's event is sent, the breaker is closed by a call path RPC, the
+%% newer event for the same key goes out as an ordinary worker, and then the old
+%% probe fails: its event is sent again, after the newer one. The server
+%% tolerates the reorder; the breaker and the store stay consistent.
+failed_old_probe_is_resent_after_the_newer_event() ->
+    watch(),
+    trip_breaker(),
+    Agent = <<"co-agent">>,
+    notify_status(Agent, <<"co-session">>, connected, <<"peer-connect">>, <<"co-home">>),
+    sync(),
+    enter_half_open(),
+    {Probe, First} = await_entered(),
+    ?assertEqual('CONNECTED', maps:get(event, First)),
+    notify_status(Agent, <<"co-session">>, disconnected, <<"peer-disconnect">>, <<"co-home">>),
+    sync(),
+    mock(ok),
+    {ok, _} = yuzu_gw_upstream:proxy_register(#{info => #{}}),
+    {_, Newer} = await_entered(),
+    ?assertEqual('DISCONNECTED', maps:get(event, Newer)),
+    Up = whereis(yuzu_gw_upstream),
+    fail_worker(Probe),
+    {_, Older} = await_entered(),
+    ?assertEqual('CONNECTED', maps:get(event, Older)),
+    await_dead(Probe),
+    sync(),
+    ?assertEqual(Up, whereis(yuzu_gw_upstream)),
+    ?assertEqual({closed, 0}, {up_get(cb_state), up_get(cb_failures)}),
+    ?assertEqual(0, count(?EV_COALESCED)),
+    ?assertEqual(0, pending_len()).
+
+%% Three ordinary workers are in flight when the breaker goes half_open: the
+%% probe starts beside them, and neither a new arrival nor an ordinary worker
+%% finishing starts anything else.
+nothing_else_drains_while_a_probe_is_in_flight() ->
+    watch(),
+    [cast_connected(<<"early-", (integer_to_binary(I))/binary>>) || I <- lists:seq(1, 3)],
+    Early = await_entered(3),
+    trip_breaker(),
+    [cast_connected(agent(I)) || I <- lists:seq(1, 5)],
+    sync(),
+    ?assertEqual({5, 3}, last_gauge()),
+    enter_half_open(),
+    {_Probe, ProbeReq} = await_entered(),
+    ?assertEqual(agent(1), maps:get(agent_id, ProbeReq)),
+    sync(),
+    ?assertEqual({4, 4}, last_gauge()),
+    cast_connected(agent(6)),
+    cast_connected(agent(7)),
+    sync(),
+    ?assertEqual({6, 4}, last_gauge()),
+    %% An ordinary worker finishes: its slot is not refilled.
+    {W, _} = hd(Early),
+    W ! release,
+    await_until(fun() -> last_gauge() =:= {6, 3} end),
+    sync(),
+    ?assertEqual(6, pending_len()),
+    ?assertEqual(3, map_size(up_get(notify_pids))),
+    ?assertEqual(half_open, yuzu_gw_upstream:circuit_state()).
+
+probe_counts_inside_the_budget() ->
+    watch(),
+    Live0 = fill_slots(),
+    trip_breaker(),
+    cast_connected(agent(1)),
+    enter_half_open(),
+    sync(),
+    %% Ten workers are in flight: no room for a probe yet.
+    ?assertEqual({1, ?INFLIGHT_MAX}, last_gauge()),
+    ?assertEqual(undefined, up_get(notify_probe)),
+    hd(Live0) ! release,
+    {Probe, ProbeReq} = await_entered(),
+    ?assertEqual(agent(1), maps:get(agent_id, ProbeReq)),
+    await_until(fun() -> last_gauge() =:= {0, ?INFLIGHT_MAX} end),
+    ?assertEqual(?INFLIGHT_MAX, map_size(up_get(notify_pids))),
+    ?assertMatch(#{pid := Probe}, up_get(notify_probe)),
+    ?assert(maps:is_key(Probe, up_get(notify_pids))).
+
+format_status_hides_the_probe_event() ->
+    watch(),
+    trip_breaker(),
+    notify_status(<<"marker-agent">>, <<"marker-session">>, connected,
+                  <<"marker-peer">>, <<"marker-home">>),
+    sync(),
+    enter_half_open(),
+    {_Probe, _} = await_entered(),
+    Status = yuzu_gw_upstream:format_status(#{state => sys:get_state(yuzu_gw_upstream)}),
+    Shown = maps:get(state, Status),
+    ?assertEqual(true, maps:get(notify_probe_held, Shown)),
+    ?assertNot(maps:is_key(notify_probe, Shown)),
+    Text = lists:flatten(io_lib:format("~p", [Status])),
+    ?assertEqual(nomatch, string:find(Text, "marker-agent")),
+    ?assertEqual(nomatch, string:find(Text, "marker-peer")),
+    ?assertEqual(nomatch, string:find(Text, "marker-session")),
+    ?assertEqual(nomatch, string:find(Text, "marker-home")).
+
+%%%===================================================================
 %%% Helpers: driving the upstream
 %%%===================================================================
 
@@ -776,6 +1201,21 @@ release_until_proxied([W | Rest], Refills) ->
         {entered, W2, _Req} -> release_until_proxied(Rest ++ [W2], Refills + 1)
     after ?AWAIT_MS -> erlang:error({replay_never_advanced, Refills})
     end.
+
+%% half_open by hand (the reset timer is far away). The call is answered after
+%% the message was handled and the probe, if any, was started.
+enter_half_open() ->
+    whereis(yuzu_gw_upstream) ! circuit_half_open,
+    sync().
+
+%% Answer a parked worker with a transport error.
+fail_worker(W) ->
+    W ! {release, {error, boom}},
+    ok.
+
+%% The breaker fields a stale probe result must not move.
+breaker() ->
+    {up_get(cb_state), up_get(cb_gen), up_get(cb_failures), up_get(cb_cur_timeout)}.
 
 %% A call is answered after every earlier cast from this process was handled.
 sync() ->
