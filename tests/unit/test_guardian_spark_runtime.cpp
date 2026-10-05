@@ -14208,16 +14208,30 @@ struct PostK4472Rig {
 
     /// One full_sync application as apply_rules builds it for a single rule: a new identical
     /// application (reapply_count rises), the teardown, the re-attach.
+    /// Strict: this re-attach re-observes a retained Wedged claim (the key is NOT free), so it
+    /// can only ever be Accepted; anything else is a regression the caller must see.
     RT::ArmReceipt reapply_attach() {
+        const auto out = reapply_attach_outcome();
+        REQUIRE(out.kind == RT::ArmOutcomeKind::Accepted);
+        return out.receipt;
+    }
+    /// The teardown and re-attach with the outcome left to the caller. Only a re-attach onto a
+    /// FREE key may use this: there the fresh arm can complete before attach_rule resumes, so
+    /// Armed is as legal as Accepted.
+    RT::ArmOutcome reapply_attach_outcome() {
         ledger.begin_application(1, digest, /*full_sync=*/true, 1);
         rt->detach_all();
-        return attach_r1();
+        return attach_r1_outcome();
     }
-    RT::ArmReceipt attach_r1() {
+    RT::ArmOutcome attach_r1_outcome() {
         auto res = rt->attach_rule(RT::NonWaiting{}, "r1", file_spec("/a"), file_exists_rule("r1"), true);
         REQUIRE(res.has_value());
-        REQUIRE(res->kind == RT::ArmOutcomeKind::Accepted);
-        return res->receipt;
+        return *res;
+    }
+    RT::ArmReceipt attach_r1() {
+        const auto out = attach_r1_outcome();
+        REQUIRE(out.kind == RT::ArmOutcomeKind::Accepted);
+        return out.receipt;
     }
     /// The first application: the arm hangs inside the backend, passes its (synthetic)
     /// deadline, and the claim is a retained Wedged head that the ledger records as the sole,
@@ -14275,9 +14289,13 @@ struct PostK4472Rig {
     /// The server's heartbeat reconcile re-sends the identical push iff the agent still
     /// reports a generation behind its own (server.cpp), i.e. iff the ledger did not advance.
     /// A further identical application: same teardown, same re-attach, now against a free key.
+    /// The fresh arm may already be committed when attach_rule resumes (completion can precede
+    /// its resumption), in which case the outcome is Armed and, exactly as in
+    /// GuardianEngine::reconcile_rule_locked, there is no receipt to register with the ledger.
     void model_server_retry() {
-        const auto rc = reapply_attach();
-        ledger.add_pending("r1", rc);
+        const auto out = reapply_attach_outcome();
+        if (out.kind == RT::ArmOutcomeKind::Accepted)
+            ledger.add_pending("r1", out.receipt);
     }
 };
 } // namespace
