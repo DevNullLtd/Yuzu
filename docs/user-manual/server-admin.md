@@ -225,6 +225,12 @@ separately.
 
 ## Upgrade Notes
 
+### vNEXT — the shipped Docker Compose files keep `/etc/yuzu/certs` on a volume (#5370; action needed before you recreate a 0.14.0 container)
+
+**Action required before upgrading from 0.14.0 on Docker Compose: copy `/etc/yuzu/certs` out of the running server container first ([Upgrading](upgrading.md) → "Docker Compose: copy `/etc/yuzu/certs` out of the server container before you recreate it").** Affected: a 0.14.0 Docker Compose stack whose server has no named volume on `/etc/yuzu/certs` while Postgres has one — `deploy/docker/docker-compose.yml` (the README quickstart), `docker-compose.uat.yml`, `docker-compose.full-uat.yml`, `docker-compose.viz-uat.yml`, `docker-compose.demo.yml` used with `--keep`, any compose copied from them, and Compose Wizard output from before 0.14.1 in Plaintext mode, with 'Persist generated certs' unticked, or with named volumes off and an external Postgres. Not affected: `docker-compose.reference.yml` and `docker-compose.reference-gateway.yml` (their `certs` volume).
+
+`deploy/docker/docker-compose.yml`, `docker-compose.uat.yml`, `docker-compose.full-uat.yml`, `docker-compose.viz-uat.yml`, `docker-compose.demo.yml` and the Compose Wizard's Default and Plaintext output (with named volumes on, or with an external Postgres) now mount a `server-certs` volume on `/etc/yuzu/certs`, which holds the internal CA and the secrets KEK. In 0.14.0 that directory sat in the container's own layer, so recreating the container deleted the KEK. Postgres still had it registered, so the server refused to start (`kek_unresolvable`). The reference composes already persisted it, on their `certs` volume. The Upgrading section gives the copy-out commands, the diagnostics to run before anything destructive, a rollback that keeps the keys, and the recovery path if the files are already gone. See also [What must persist](#docker-compose).
+
 ### vNEXT — the Windows server installer locks its data directory and keeps secrets off the command line (#5196, #5210, #5272; breaking for unattended installs)
 
 Windows server is not a supported deployment (ADR-0035), and the `YuzuServer` service cannot yet run under the Service Control Manager at all (#5325). This note is for anyone using `YuzuServerSetup-*.exe` anyway.
@@ -4714,6 +4720,15 @@ docker compose logs -f        # follow logs
 docker compose down           # stop all services
 ```
 
+**What must persist.** Every shipped compose that keeps Postgres on a volume also keeps these two server directories on named volumes, and a compose you write needs the same two. (The sanitizer rig, `docker-compose.sanitizer-uat.yml`, keeps no state at all and is the one exception.)
+
+| Mount point | Volume (shipped composes) | Holds |
+|---|---|---|
+| `/var/lib/yuzu` | `server-data` | `--data-dir`: the `.cfg` files, `nvd_cves.db`, `agent-updates/`, `upload-blobs/` |
+| `/etc/yuzu/certs` | `server-certs` (`certs` in the two reference composes) | The server's default cert dir: the internal CA (`default-ca.key`), the default leaf certificates, the secrets KEK files `secrets-kek-v<N>.key`, the dashboard-uploaded TLS files `server.pem` / `server-key.pem` / `ca.pem`, and `plugin-trust-bundle.pem`. The last four are written here whatever `--ca-dir` says |
+
+The second is easy to miss, because the image never passes `--ca-dir` and the server falls back to `/etc/yuzu/certs`. The KEK is registered in Postgres, so this directory has to live exactly as long as the Postgres volume does. Without a volume, recreating the container (an image upgrade, `down` then `up`, `up --force-recreate`) deletes the key files, and the server then refuses to start with `kek_unresolvable` (#5370). `docker compose down` without `-v` keeps both volumes. `down -v` deletes them along with the Postgres volume, which is a full reset. The `yuzu-server` image creates `/etc/yuzu/certs` owned by the `yuzu` user, and a new named volume takes that owner, so no `chown` is needed. The chiselled image up to 0.14.0 has no such directory, so a new volume there is root-owned; the demo compose's one-shot `server-certs-init` service hands it to uid 1000. Keep `/etc/yuzu/certs` on a volume even if you pass `--ca-dir`; on an existing install do not move it (#5273): the CA store records the key's absolute path. The volume is lost to `docker volume rm`, `docker volume prune` / `docker system prune --volumes` (while no container uses it, such as after `down`), a Docker Desktop data purge, or renaming the compose project, and moving a stack between a reference compose and any other compose moves the keys too — use the copy-out recipe. Affected: a 0.14.0 Docker Compose stack whose server has no named volume on `/etc/yuzu/certs` while Postgres has one — `deploy/docker/docker-compose.yml` (the README quickstart), `docker-compose.uat.yml`, `docker-compose.full-uat.yml`, `docker-compose.viz-uat.yml`, `docker-compose.demo.yml` used with `--keep`, any compose copied from them, and Compose Wizard output from before 0.14.1 in Plaintext mode, with 'Persist generated certs' unticked, or with named volumes off and an external Postgres. Not affected: `docker-compose.reference.yml` and `docker-compose.reference-gateway.yml` (their `certs` volume). If yours is affected: [Upgrading](upgrading.md), "Docker Compose: copy `/etc/yuzu/certs` out of the server container before you recreate it". Back the directory up with the database as a pair: [the KEK pairing rule](../ops-runbooks/auth-db-recovery.md#backup--the-kek-pairing-rule).
+
 **Pinning a specific release with `docker-compose.uat.yml`:**
 
 The top-level UAT compose file parameterises its `ghcr.io/.../yuzu-server` and `yuzu-gateway` tags through `${YUZU_VERSION:-<default>}`. The default tracks the latest published release, but operators testing an earlier or newer image can override at the command line:
@@ -4738,7 +4753,7 @@ A GitHub Actions check (`scripts/check-compose-versions.sh`) runs as the first s
 | 9090 | Prometheus | Monitoring stack |
 | 3000 | Grafana (default login: admin/admin) | Monitoring stack |
 
-**Volumes:** `server-data`, `agent-data`, `prometheus-data`, and `grafana-data` are persisted across container restarts.
+**Volumes:** `server-data`, `server-certs` (`certs` in the reference composes), `postgres-data`, `agent-data`, `prometheus-data`, `grafana-data` are persisted across container restarts.
 
 ### systemd Units
 
