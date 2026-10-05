@@ -217,7 +217,7 @@ inline void fill_uncovered_categories(std::string_view os, std::vector<Permissio
     }
 }
 
-// ── run-wide output budget (shared by every leg) ────────────────────────
+// ── run-wide output budget (shared by the macOS and Windows legs) ────────────────────────
 
 inline constexpr std::size_t kMaxRunOutputBytes = 16u * 1024u * 1024u;
 inline constexpr std::string_view kBudgetExceededToken = "collection:budget_exceeded";

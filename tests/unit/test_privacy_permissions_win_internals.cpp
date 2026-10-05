@@ -561,6 +561,7 @@ TEST_CASE("privacy_permissions win: with_user_hive reads a loaded HKU hive first
             return std::string{"must_not_run"};
         }};
     yuzu::win::HiveAccessReport report;
+    report.live_open_rc = ERROR_INVALID_HANDLE; // not the member default: the CHECK discriminates
     // The profile path is deliberately bogus: if the live branch were skipped, the offline arm
     // would be entered (and refused by the first hook, or by a missing privilege) instead.
     const auto status = yuzu::win::with_user_hive(
@@ -617,6 +618,8 @@ TEST_CASE("privacy_permissions win: with_user_hive refuses on a before_load toke
     HookCounts n;
     yuzu::win::HiveAccessReport report;
     const auto status = run_offline("C:\\yuzu_bogus_profile_path", "forced_before", "", n, report);
+    // Recorded before the privilege check, so it holds on the privilege-missing path too.
+    CHECK(report.live_open_rc == ERROR_FILE_NOT_FOUND); // the synthetic SID is not loaded
     if (status == yuzu::win::HiveAccessStatus::privilege_missing)
         SKIP("the offline arm needs SeBackupPrivilege and SeRestorePrivilege: not held here");
     CHECK(status == yuzu::win::HiveAccessStatus::file_refused);
@@ -624,7 +627,6 @@ TEST_CASE("privacy_permissions win: with_user_hive refuses on a before_load toke
     CHECK(n.before == 1);
     CHECK(n.after == 0);
     CHECK(n.fn == 0);
-    CHECK(report.live_open_rc == ERROR_FILE_NOT_FOUND); // the synthetic SID is not loaded
     CHECK_FALSE(report.mounted_offline); // no mount was attempted
     CHECK(report.mount_name.empty());
     CHECK_FALSE(synthetic_mount_present());

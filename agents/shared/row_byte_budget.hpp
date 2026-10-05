@@ -7,7 +7,7 @@
  *
  * Plain arithmetic, deliberately NOT sticky:
  *   - An exact fill is admitted (rows + n_rows == max_rows, bytes + n_bytes ==
- *     max_bytes); the NEXT charge is refused.
+ *     max_bytes); the NEXT non-empty charge is refused.
  *   - `refused` is a RECORD that at least one charge() was refused. It does not
  *     gate later fits()/charge() calls. A consumer that must stop at the first
  *     refusal checks it (privacy_permissions RetentionBudget) or keeps its own
@@ -24,7 +24,7 @@
 namespace yuzu::shared {
 
 struct RowByteBudget {
-    static constexpr std::size_t kUnbounded = std::numeric_limits<std::size_t>::max();
+    static constexpr std::size_t kUnbounded = (std::numeric_limits<std::size_t>::max)();
 
     std::size_t max_rows = kUnbounded;
     std::size_t max_bytes = kUnbounded;
@@ -33,8 +33,8 @@ struct RowByteBudget {
     bool refused = false;
 
     [[nodiscard]] bool fits(std::size_t n_bytes, std::size_t n_rows = 1) const noexcept {
-        return n_rows <= max_rows - std::min(rows, max_rows) &&
-               n_bytes <= max_bytes - std::min(bytes, max_bytes);
+        return n_rows <= max_rows - (std::min)(rows, max_rows) &&
+               n_bytes <= max_bytes - (std::min)(bytes, max_bytes);
     }
 
     bool charge(std::size_t n_bytes, std::size_t n_rows = 1) noexcept {

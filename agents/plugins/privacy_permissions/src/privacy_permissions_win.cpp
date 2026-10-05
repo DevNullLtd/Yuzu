@@ -72,9 +72,10 @@
  * `denied` (refusal, PERMISSION_DENIED) or `unreadable` (CONSTRAINED) row carrying its own token
  * in `raw`; a capability or NonPackaged key that genuinely is not there is an `absent` row. One
  * source is capped on its own (win::RetentionBudget, `<profile>:budget_exceeded`, the walk goes
- * on); the run's output is bounded by the shared OutputBudget (`collection:budget_exceeded`,
- * HKLM's rows reserved first so a profile never starves them) and the run's time at ~15 s
- * (`collection:timeout`, hives unloaded normally). Only two failures are not rows of their own: a
+ * on); the run's output is bounded by the shared OutputBudget
+ * (`collection:budget_exceeded:profiles_skipped_<n>`, HKLM's rows reserved first so a profile
+ * never starves them) and the run's time at ~15 s (`collection:timeout:profiles_skipped_<n>`,
+ * hives unloaded normally). Only two failures are not rows of their own: a
  * failed hive UNLOAD (a token -- the read itself succeeded) and a LastUsedTime* failure (a token,
  * and the field itself reads `unreadable`; a refused one still promotes PERMISSION_DENIED).
  *

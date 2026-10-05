@@ -17,8 +17,9 @@
  * into the shared hive loader.
  *
  * The leaf's, every ancestor's and each sidecar's deciding facts come from a HANDLE opened for that
- * step; the two handle-less sources are the drive type (GetDriveTypeW) and the sidecar listing, and
- * a listing fact is never final -- a sidecar's reparse bit is re-read from its own handle.
+ * step; the two handle-less sources are the drive type (GetDriveTypeW) and the sidecar listing. A
+ * listing "not a reparse point" is never final -- it is re-read from the sidecar's own handle; a
+ * listing reparse hit and the entry count refuse on the listing alone.
  * RegLoadKeyW has no handle-relative form, so the load is by path and the SAME file identity is
  * re-verified from a fresh attribute-only handle after it.
  * Residual: the kernel parses whatever the path resolved to in that window (every `reg load`
@@ -80,11 +81,11 @@ struct SidecarEntry {
     std::uint32_t find_attributes = 0;
 };
 
-/// The file system as the guard sees it. Every method is one Win32 step and returns its code
-/// (0 = success); `opens` counts the handle opens an implementation made (a test proves the
-/// deadline-first order with it). Raw `long` codes and out-parameters by design, an exception to
-/// cpp-conventions' std::expected rule: each method mirrors one Win32 call, and list_sidecars
-/// returns a partial listing beside the code.
+/// The file system as the guard sees it. The code-returning methods each mirror one Win32 step and
+/// return its code (0 = success; drive_type returns the drive type); `opens` counts the handle
+/// opens an implementation made (a test proves the deadline-first order with it). Raw `long` codes
+/// and out-parameters by design, an exception to cpp-conventions' std::expected rule: each method
+/// mirrors one Win32 call, and list_sidecars returns a partial listing beside the code.
 struct HiveFileProbe {
     HiveFileProbe() = default;
     HiveFileProbe(const HiveFileProbe&) = delete;
@@ -135,8 +136,10 @@ struct HiveFileGuard {
                 break;
             }
             std::uint32_t links = 0, attrs = 0;
-            if (const long rc = probe.sidecar_facts(base + e.name, links, attrs); rc != 0)
+            if (const long rc = probe.sidecar_facts(base + e.name, links, attrs); rc != 0) {
+                if (rc == kErrorFileNotFound) continue; // listed, then gone: absent is fine
                 return stat_failed(rc);
+            }
             if (is_reparse_attribute(attrs)) {
                 f.sidecar_reparse = true;
                 break;

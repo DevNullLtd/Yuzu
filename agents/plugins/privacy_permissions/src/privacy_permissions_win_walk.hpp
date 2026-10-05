@@ -42,10 +42,10 @@ struct ConsentStoreWatch {
     [[nodiscard]] virtual StabilityFacts poll() = 0;
 };
 
-/// The registry as the walk sees it. Every method mirrors one Win32 call and returns its code.
-/// Raw `long` codes and out-parameters by design, an exception to cpp-conventions' std::expected
-/// rule: each method mirrors one Win32 call, and query_value returns a partial result (type and
-/// size) beside the code.
+/// The registry as the walk sees it. The code-returning methods each mirror one Win32 call and
+/// return its code (watch, key_name_equals, utf8 and reg_sz_utf8 are the helpers that return a
+/// value). Raw `long` codes and out-parameters by design, an exception to cpp-conventions'
+/// std::expected rule: query_value returns a partial result (type and size) beside the code.
 struct RegistryReader {
     RegistryReader() = default;
     RegistryReader(const RegistryReader&) = delete;
@@ -61,6 +61,7 @@ struct RegistryReader {
     /// a buffer too small is kErrorMoreData with `size` = the size needed.
     virtual long query_value(RegKeyHandle key, const wchar_t* value_name, std::uint32_t& type,
                              std::span<std::byte> buf, std::uint32_t& size) = 0;
+    /// Never null: a watch that cannot be created still reports through poll().
     [[nodiscard]] virtual std::unique_ptr<ConsentStoreWatch> watch(RegKeyHandle root) = 0;
     /// The registry's own key-name equality (ordinal, case-insensitive).
     [[nodiscard]] virtual bool key_name_equals(std::wstring_view a, std::wstring_view b) const = 0;
@@ -80,6 +81,10 @@ public:
     ScopedKey& operator=(const ScopedKey&) = delete;
 
     [[nodiscard]] long open(RegKeyHandle parent, const wchar_t* name) {
+        if (key_) { // a re-open closes the held key first; open_key sets `key_` only on success
+            reg_.close_key(key_);
+            key_ = nullptr;
+        }
         return reg_.open_key(parent, name, key_);
     }
     [[nodiscard]] RegKeyHandle get() const noexcept { return key_; }

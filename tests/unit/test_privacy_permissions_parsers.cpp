@@ -606,6 +606,16 @@ TEST_CASE("win::RetentionBudget: one source at its own cap stops only its own wa
     CHECK(win::retained_bytes(g) == std::string_view{"C:\\a.exe"}.size() + 5);
 }
 
+TEST_CASE("win::RetentionBudget: begin_profile restarts the source counters, never the run's clock",
+          "[privacy_permissions][win_parsers]") {
+    win::RetentionBudget b;
+    b.deadline = std::chrono::steady_clock::now() - std::chrono::seconds{1};
+    REQUIRE(b.expired());
+    b.begin_profile();
+    CHECK(b.timed_out);
+    CHECK(b.expired());
+}
+
 TEST_CASE("win::RetentionBudget: the run deadline is injectable, inclusive and sticky",
           "[privacy_permissions][win_parsers]") {
     using Clock = std::chrono::steady_clock;
@@ -1070,8 +1080,8 @@ TEST_CASE("win::assemble_windows_rows: HKLM's overriding Deny is one unqualified
     }
 }
 
-TEST_CASE("win::assemble_windows_rows: each hive-access outcome is its own row, a refused live peek "
-          "is a denial, and a failed unload is a token and no row",
+TEST_CASE("win::assemble_windows_rows: each hive-access outcome is its own row, a refused live "
+          "open is a denial, and a failed unload is a token and no row",
           "[privacy_permissions][win_parsers]") {
     AssembledRun run;
     const auto only = [&](win::ProfileRead rd, ProfileInfo p = profile_of("alice", kSidAlice)) {
@@ -1086,14 +1096,14 @@ TEST_CASE("win::assemble_windows_rows: each hive-access outcome is its own row, 
         REQUIRE(row_raw("alice:hive_mount_failed") == 1);
         CHECK_FALSE(any_denied(run.rows));
     }
-    SECTION("a refused live peek turns any failure into access_denied, denied") {
+    SECTION("a refused live open turns any failure into access_denied, denied") {
         auto rd = unreachable(HiveAccessStatus::not_found);
         rd.live_open_rc = win::kErrorAccessDenied;
         only(rd);
         REQUIRE(row_raw("alice:access_denied") == 1);
         CHECK(any_denied(run.rows));
     }
-    SECTION("a refused live peek beneath a hive-file refusal is still the denial") {
+    SECTION("a refused live open beneath a hive-file refusal is still the denial") {
         auto rd = unreachable(HiveAccessStatus::file_refused, "hive_reparse_point");
         rd.live_open_rc = win::kErrorAccessDenied;
         only(rd);
@@ -1162,6 +1172,20 @@ TEST_CASE("win::assemble_windows_rows: the run-wide output budget reserves HKLM'
         CHECK(run.rows_of("alice\\-") == kCategories.size());
         CHECK(run.rows_of("bobby\\") == 0);
         CHECK(run.markers(win::run_stop_token(kBudgetExceededToken, 1)) == 1);
+    }
+    SECTION("a `.bak` entry the cap has no room for stops the run and is counted as skipped") {
+        run.output.budget.max_bytes = reserved + 1; // HKLM's reservation fits; one more row doesn't
+        run.go({profile_of("alice", std::string{kSidAlice} + ".bak"),
+                profile_of("carol", kSidCarol)},
+               hklm, read);
+        CHECK(run.reads == 0);
+        CHECK(run.markers(win::run_stop_token(kBudgetExceededToken, 2)) == 1);
+    }
+    SECTION("a malformed-SID row the cap has no room for stops the run the same way") {
+        run.output.budget.max_bytes = reserved + 1;
+        run.go({profile_of("mallory", "S-1-5-"), profile_of("carol", kSidCarol)}, hklm, read);
+        CHECK(run.reads == 0);
+        CHECK(run.markers(win::run_stop_token(kBudgetExceededToken, 2)) == 1);
     }
     SECTION("filling the cap exactly with nothing left to read is complete, not truncated") {
         run.output.budget.max_bytes = reserved + per_profile;
@@ -1287,13 +1311,22 @@ TEST_CASE("win::assemble_windows_rows: the per-source budget marker, source-leve
         CHECK(run.output.budget.bytes - bare.output.budget.bytes == OutputBudget::cost(discovery));
     }
     SECTION("a profile refused with `timeout` ends the run: one collection:timeout row, no later read") {
+        // The read refuses `timeout` WITHOUT marking the budget (a deadline callback that is a
+        // plain clock compare): the assembler itself must mark the run.
         run.go(two, hklm_camera_deny(), [&](const ProfileInfo&) {
-            run.budget.timed_out = true; // what the guard's budget.expired() leaves behind
             return unreachable(HiveAccessStatus::file_refused, "timeout");
         });
         CHECK(run.reads == 1);
         CHECK(with_raw("alice:timeout") == 1);
         CHECK(run.markers(win::run_stop_token(win::kTimeoutToken, 1)) == 1);
+    }
+    SECTION("the LAST profile refused with `timeout` still leaves the run-level row") {
+        run.go({profile_of("alice", kSidAlice)}, hklm_camera_deny(), [&](const ProfileInfo&) {
+            return unreachable(HiveAccessStatus::file_refused, "timeout");
+        });
+        CHECK(run.reads == 1);
+        CHECK(with_raw("alice:timeout") == 1);
+        CHECK(run.markers(win::run_stop_token(win::kTimeoutToken, 0)) == 1);
     }
 }
 

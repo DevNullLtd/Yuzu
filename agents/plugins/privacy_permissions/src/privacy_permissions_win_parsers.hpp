@@ -171,7 +171,8 @@ enum class EnumOutcome { complete, truncated, failed };
 struct EnumVerdict {
     EnumOutcome outcome;
     long rc = kErrorSuccess; // the failing code when `failed`
-    /// Child names skipped for an embedded NUL (see enumerate_subkey_names); enum_failure reports them.
+    /// Child names skipped for an embedded NUL or zero length (see enumerate_subkey_names);
+    /// enum_failure reports them.
     std::size_t embedded_nul_names = 0;
 };
 
@@ -198,8 +199,8 @@ struct EnumFailure {
 
 /// The failure an enumeration contributes, or nullopt for a complete one -- a complete walk,
 /// including one of exactly the cap, never produces a failure token, unless it skipped an
-/// embedded-NUL name (`<kind>:name_embedded_nul`, one row per walk; a truncated or failed walk
-/// already reports the source as incomplete).
+/// embedded-NUL or empty name (`<kind>:name_embedded_nul`, one row per walk; a truncated or failed
+/// walk already reports the source as incomplete).
 [[nodiscard]] inline std::optional<EnumFailure> enum_failure(std::string_view kind,
                                                              const EnumVerdict& v) {
     switch (v.outcome) {
@@ -424,10 +425,11 @@ inline constexpr std::size_t kMaxHiveSidecars = 64;
 inline constexpr std::uint32_t kWaitObject0 = 0;  // WAIT_OBJECT_0
 inline constexpr std::uint32_t kWaitTimeout = 258; // WAIT_TIMEOUT
 
-/// What the shell learned about one NTUSER.DAT, every fact taken from an opened HANDLE (or, for
-/// the path facts, from the requested path before any syscall). `final_path_matches` is the
-/// shell's verdict that GetFinalPathNameByHandleW(VOLUME_NAME_DOS) equals `\\?\` + the requested
-/// path under Windows' own ordinal case-insensitive comparison (CompareStringOrdinal on the wide
+/// What the shell learned about one NTUSER.DAT, every handle-derived fact taken from an opened
+/// HANDLE (the drive type and the sidecar listing are the two handle-less sources; the path facts
+/// come from the requested path before any syscall). `final_path_matches` is the shell's verdict
+/// that GetFinalPathNameByHandleW(VOLUME_NAME_DOS) equals `\\?\` + the requested path under
+/// Windows' own ordinal case-insensitive comparison (CompareStringOrdinal on the wide
 /// strings: a non-ASCII case-only difference is the same path, which byte-wise ASCII folding on
 /// UTF-8 would misjudge). The default is the neutral `true`, so only the facts gathered so far can
 /// trip a classification.
@@ -691,9 +693,9 @@ using ReadProfileFn = std::function<ProfileRead(const profiles::ProfileInfo&)>;
         // must never read as "this profile has no grants" -- each failure is its own row.
         // `refused`: the cause is itself a refusal (a missing privilege): denied, token unchanged.
         const auto profile_failed = [&](std::string_view cause, bool refused = false) {
-            const bool peek_denied = (rd.live_open_rc == kErrorAccessDenied);
-            prof.push_back(failure_row("windows", profile_row_id, "-", peek_denied || refused,
-                                       pname + ":" + (peek_denied ? std::string{"access_denied"}
+            const bool live_denied = (rd.live_open_rc == kErrorAccessDenied);
+            prof.push_back(failure_row("windows", profile_row_id, "-", live_denied || refused,
+                                       pname + ":" + (live_denied ? std::string{"access_denied"}
                                                                   : std::string{cause}),
                                        acc));
         };
@@ -716,8 +718,10 @@ using ReadProfileFn = std::function<ProfileRead(const profiles::ProfileInfo&)>;
             break;
         case profiles::HiveAccessStatus::file_refused:
             // A hive-file refusal alone is unreadable, not denied (an unsafe file is not an ACL
-            // refusal); a refused live root beneath it is the denial. `timeout` also ends the run
-            // (the guard marks the budget, not this branch).
+            // refusal); a refused live root beneath it is the denial. `timeout` also ends the
+            // run: this branch marks the budget itself, so the run-level row never depends on the
+            // injected deadline callback's side effect.
+            if (rd.refusal == kHiveTimeout) budget.timed_out = true;
             profile_failed(rd.refusal);
             break;
         }

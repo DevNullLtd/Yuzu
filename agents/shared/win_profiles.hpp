@@ -441,7 +441,8 @@ struct HiveAccessReport {
     bool unload_failed{false};
     std::string mount_name;
     std::string refusal; // the OfflineHiveFileCheck token when status == file_refused
-    // The live HKU\<SID> RegOpenKeyExW code (status ok == success).
+    // ERROR_SUCCESS iff the live HKU\<SID> open succeeded; otherwise the live open's code, kept
+    // even when the offline arm then returned ok.
     LSTATUS live_open_rc{ERROR_SUCCESS};
 };
 

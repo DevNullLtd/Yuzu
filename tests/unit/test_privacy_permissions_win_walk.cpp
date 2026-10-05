@@ -4,7 +4,8 @@
  *   - privacy_permissions_win_walk.hpp: the ConsentStore walk over a fake RegistryReader;
  *   - privacy_permissions_hive_guard.hpp: the offline-hive file guard over a fake HiveFileProbe.
  * Both headers are windows.h-free, so nothing here touches a real registry, file, process or
- * clock: the fakes are in-memory trees and scripted tables, and every deadline is injected.
+ * clock: the fakes are in-memory trees and scripted tables; no case sleeps or waits on a clock
+ * (deadline-sensitive cases set `budget.deadline`, or the guard's injected `expired`).
  */
 #include <catch2/catch_test_macros.hpp>
 
@@ -19,6 +20,7 @@
 #include <deque>
 #include <map>
 #include <memory>
+#include <new>
 #include <string>
 #include <type_traits>
 #include <utility>
@@ -34,11 +36,14 @@ struct FakeValue {
     std::uint32_t type = win::kRegSz;
     std::vector<std::byte> bytes;
     bool more_data_on_read = false; // the size probe succeeds; the real read says ERROR_MORE_DATA
+    long probe_rc = 0;              // != 0: the size probe fails with this code
+    long read_rc = 0;               // != 0: the real read fails with this code
 };
 
 struct FakeNode {
     std::vector<std::pair<std::wstring, FakeNode*>> children; // counted names, in enumeration order
     std::map<std::wstring, FakeValue> values;
+    long open_rc = 0; // != 0: opening this key fails with this code
 };
 
 wchar_t fold(wchar_t c) { return (c >= L'A' && c <= L'Z') ? static_cast<wchar_t>(c + 32) : c; }
@@ -68,8 +73,17 @@ std::vector<std::byte> qword(std::uint64_t v) {
 
 struct FakeWatch final : win::ConsentStoreWatch {
     unsigned long wait_rc;
-    explicit FakeWatch(unsigned long rc) : wait_rc(rc) {}
-    win::StabilityFacts poll() override { return {0, 0, wait_rc, 0}; }
+    std::vector<std::string>& events;
+    std::size_t& live;
+    FakeWatch(unsigned long rc, std::vector<std::string>& ev, std::size_t& lv)
+        : wait_rc(rc), events(ev), live(lv) {
+        ++live;
+    }
+    ~FakeWatch() override { --live; }
+    win::StabilityFacts poll() override {
+        events.emplace_back("poll");
+        return {0, 0, wait_rc, 0};
+    }
 };
 
 struct FakeRegistry final : win::RegistryReader {
@@ -77,6 +91,9 @@ struct FakeRegistry final : win::RegistryReader {
     FakeNode* root = nullptr;
     std::vector<unsigned long> watch_script; // poll result of the Nth watch; timeout past the end
     std::size_t watches = 0, opens = 0, closes = 0, enum_calls = 0;
+    std::vector<std::string> events; // "open" / "query" / "watch" / "poll", in call order
+    std::size_t live_watches = 0;    // watches created and not yet destroyed
+    std::size_t queries = 0, throw_on_query_n = 0; // the Nth query_value throws (0: never)
     std::uint32_t max_enum_idx = 0;
     std::vector<std::wstring> opened_names;
     mutable std::vector<std::pair<std::wstring, std::wstring>> name_compares;
@@ -127,7 +144,9 @@ struct FakeRegistry final : win::RegistryReader {
             if (!cur) return win::kErrorFileNotFound;
             rest = cut == std::wstring_view::npos ? std::wstring_view{} : rest.substr(cut + 1);
         }
+        if (cur->open_rc != 0) return cur->open_rc;
         ++opens;
+        events.emplace_back("open");
         opened_names.emplace_back(name);
         out = cur;
         return win::kErrorSuccess;
@@ -143,11 +162,15 @@ struct FakeRegistry final : win::RegistryReader {
     }
     long query_value(win::RegKeyHandle key, const wchar_t* value_name, std::uint32_t& type,
                      std::span<std::byte> buf, std::uint32_t& size) override {
+        events.emplace_back("query");
+        if (++queries == throw_on_query_n) throw std::bad_alloc{};
         auto* n = static_cast<FakeNode*>(key);
         for (auto& [vn, v] : n->values) {
             if (!ascii_ieq(vn, value_name)) continue;
             type = v.type;
             size = static_cast<std::uint32_t>(v.bytes.size());
+            if (buf.empty() && v.probe_rc != 0) return v.probe_rc;
+            if (!buf.empty() && v.read_rc != 0) return v.read_rc;
             if (buf.empty()) return win::kErrorSuccess; // the size probe
             if (v.more_data_on_read || buf.size() < v.bytes.size()) {
                 size = static_cast<std::uint32_t>(v.bytes.size() + 8);
@@ -162,7 +185,8 @@ struct FakeRegistry final : win::RegistryReader {
         const unsigned long rc =
             watches < watch_script.size() ? watch_script[watches] : win::kWaitTimeout;
         ++watches;
-        return std::make_unique<FakeWatch>(rc);
+        events.emplace_back("watch");
+        return std::make_unique<FakeWatch>(rc, events, live_watches);
     }
     // A documented approximation of CompareStringOrdinal(..., TRUE): ASCII case folding only.
     bool key_name_equals(std::wstring_view a, std::wstring_view b) const override {
@@ -413,6 +437,158 @@ TEST_CASE("win walk: an enumeration of exactly the cap is complete (one probe); 
     CHECK(win::enum_failure("packaged", over.verdict)->cause == "packaged_enum_truncated");
 }
 
+TEST_CASE("win walk: a refused or failed read is a denied or unreadable entry, never absent",
+          "[privacy_permissions][win_walk]") {
+    FakeRegistry reg;
+    auto* st = reg.store();
+    reg.path(st, L"webcam");
+    // refused size probe / refused second read / any other probe error
+    FakeRegistry::set(reg.path(st, L"webcam\\Pkg.Probe"), L"Value",
+                      {win::kRegSz, sz16("Allow"), false, win::kErrorAccessDenied, 0});
+    FakeRegistry::set(reg.path(st, L"webcam\\Pkg.Read"), L"Value",
+                      {win::kRegSz, sz16("Allow"), false, 0, win::kErrorAccessDenied});
+    FakeRegistry::set(reg.path(st, L"webcam\\Pkg.Other"), L"Value",
+                      {win::kRegSz, sz16("Allow"), false, 1167, 0});
+    win::RetentionBudget budget;
+    const auto w = walk(reg, budget);
+    for (const char* app : {"Pkg.Probe", "Pkg.Read"}) {
+        const auto* g = find(w.grants, app, "camera");
+        REQUIRE(g);
+        CHECK(g->state == PermissionState::denied);
+        CHECK(g->read_denied);
+        CHECK(g->cause == "value_access_denied");
+    }
+    const auto* other = find(w.grants, "Pkg.Other", "camera");
+    REQUIRE(other);
+    CHECK(other->state == PermissionState::unreadable);
+    CHECK(other->cause == "value_win32_1167");
+}
+
+TEST_CASE("win walk: a key that cannot be opened is its own structural entry, never skipped or "
+          "merged",
+          "[privacy_permissions][win_walk]") {
+    FakeRegistry reg;
+    auto* st = reg.store();
+    reg.path(st, L"webcam");
+    reg.path(st, L"webcam\\Pkg.Locked")->open_rc = win::kErrorAccessDenied;
+    reg.path(st, L"microphone")->open_rc = win::kErrorAccessDenied;
+    reg.path(st, L"location\\NonPackaged")->open_rc = 1167;
+    reg.path(st, L"broadFileSystemAccess\\NonPackaged\\C:#a#b.exe")->open_rc = 1167;
+    win::RetentionBudget budget;
+    const auto w = walk(reg, budget);
+    const auto has = [&](std::string_view cat, std::string_view cause, PermissionState state) {
+        return std::any_of(w.structural.begin(), w.structural.end(), [&](const win::RawGrant& g) {
+            return g.category == cat && g.cause == cause && g.state == state;
+        });
+    };
+    CHECK(has("camera", "packaged_app:access_denied", PermissionState::denied));
+    CHECK(has("microphone", "capability:access_denied", PermissionState::denied));
+    CHECK(has("location", "nonpackaged_container:win32_1167", PermissionState::unreadable));
+    CHECK(has("full_disk_access", "nonpackaged_app:win32_1167", PermissionState::unreadable));
+    CHECK(find(w.grants, "NonPackaged", "location") == nullptr); // a failed toggle is not a grant
+}
+
+TEST_CASE("win walk: a ConsentStore root that cannot be opened is reported, not walked",
+          "[privacy_permissions][win_walk]") {
+    FakeRegistry reg;
+    FakeRegistry::set_sz(reg.path(reg.store(), L"webcam"), "Allow");
+    reg.store()->open_rc = win::kErrorAccessDenied;
+    win::RetentionBudget budget;
+    const auto w = walk(reg, budget);
+    CHECK(w.root_rc == win::kErrorAccessDenied);
+    CHECK(w.grants.empty());
+    CHECK(reg.watches == 0);
+}
+
+TEST_CASE("win walk: a NonPackaged enumeration that hits its cap is reported",
+          "[privacy_permissions][win_walk]") {
+    FakeRegistry reg;
+    auto* np = reg.path(reg.store(), L"webcam\\NonPackaged");
+    for (std::uint32_t i = 0; i <= win::kMaxEnumeratedSubkeys; ++i)
+        reg.add_raw(np, L"k" + std::to_wstring(i));
+    win::RetentionBudget budget;
+    const auto w = walk(reg, budget);
+    CHECK(has_cause(w.structural, "camera", "nonpackaged_enum_truncated"));
+}
+
+TEST_CASE("win walk: the per-source budget stops the walk where it is",
+          "[privacy_permissions][win_walk]") {
+    FakeRegistry reg;
+    auto* st = reg.store();
+    FakeRegistry::set_sz(reg.path(st, L"webcam"), "Allow");
+    for (int i = 0; i < 5; ++i)
+        FakeRegistry::set_sz(reg.path(st, L"webcam\\Pkg" + std::to_wstring(i)), "Allow");
+    win::RetentionBudget budget;
+    budget.source.max_rows = 3;
+    const auto w = walk(reg, budget);
+    CHECK(budget.source.refused);
+    CHECK(w.grants.size() == 3); // the capability's own row + two apps, then it stops
+}
+
+TEST_CASE("win walk: a watch that cannot observe is refused without a re-walk, and keeps nothing",
+          "[privacy_permissions][win_walk]") {
+    FakeRegistry reg;
+    auto* st = reg.store();
+    FakeRegistry::set_sz(reg.path(st, L"webcam"), "Allow");
+    reg.path(st, L"webcam\\Pkg.Locked")->open_rc = win::kErrorAccessDenied;
+    reg.watch_script = {0xFFFFFFFFul}; // WAIT_FAILED
+    win::RetentionBudget budget;
+    const auto w = walk(reg, budget);
+    CHECK(reg.watches == 1);
+    CHECK(w.refused == "notify_wait_failed:win32_0");
+    CHECK(w.grants.empty());
+    CHECK(w.structural.empty());
+}
+
+TEST_CASE("win walk: a ScopedKey opened twice closes the first key, and a failed re-open leaves it "
+          "empty",
+          "[privacy_permissions][win_walk]") {
+    FakeRegistry reg;
+    reg.path(reg.store(), L"webcam");
+    {
+        win::ScopedKey k(reg);
+        REQUIRE(k.open(reg.root, std::wstring{win::kConsentStorePath}.c_str()) ==
+                win::kErrorSuccess);
+        REQUIRE(k.open(reg.store(), L"webcam") == win::kErrorSuccess);
+        CHECK(reg.closes == 1); // the first key, closed by the re-open
+        REQUIRE(k.open(reg.store(), L"missing") == win::kErrorFileNotFound);
+        CHECK(k.get() == nullptr);
+        CHECK(reg.closes == 2);
+    }
+    CHECK(reg.opens == 2);
+    CHECK(reg.opens == reg.closes);
+}
+
+TEST_CASE("win walk: the watch is armed after the store root opens and before any read, and polled "
+          "after the last read",
+          "[privacy_permissions][win_walk]") {
+    FakeRegistry reg;
+    FakeRegistry::set_sz(reg.path(reg.store(), L"webcam"), "Allow");
+    win::RetentionBudget budget;
+    (void)walk(reg, budget);
+    const auto& ev = reg.events;
+    REQUIRE(ev.size() > 4);
+    CHECK(ev[0] == "open"); // the store root
+    CHECK(ev[1] == "watch");
+    CHECK(ev[2] == "open"); // the first capability key
+    CHECK(ev.back() == "poll");
+    CHECK(std::count(ev.begin(), ev.end(), "watch") == 1);
+    CHECK(std::count(ev.begin(), ev.end(), "poll") == 1);
+}
+
+TEST_CASE("win walk: an exception mid-walk releases every opened key and the watch",
+          "[privacy_permissions][win_walk]") {
+    FakeRegistry reg;
+    FakeRegistry::set_sz(reg.path(reg.store(), L"webcam"), "Allow");
+    reg.throw_on_query_n = 3; // the capability's LastUsedTimeStart read: store + capability open
+    win::RetentionBudget budget;
+    REQUIRE_THROWS_AS(win::walk_consent_store(reg, reg.root, budget), std::bad_alloc);
+    CHECK(reg.opens == 2);
+    CHECK(reg.opens == reg.closes);
+    CHECK(reg.watches == 1);
+    CHECK(reg.live_watches == 0);
+}
+
 // ── hive-file guard over a fake probe ───────────────────────────────────
 
 namespace {
@@ -529,6 +705,31 @@ TEST_CASE("hive guard: attribute bits map to facts -- the not_resident mask, nev
     CHECK(r.before().empty());
 }
 
+TEST_CASE("hive guard: each leaf fact the probe reports reaches its own refusal",
+          "[privacy_permissions][win_walk]") {
+    GuardRig r;
+    SECTION("a file over kMaxHiveBytes") {
+        r.probe.leaf.size = win::kMaxHiveBytes + 1;
+        CHECK(r.before() == "hive_oversized");
+    }
+    SECTION("a file owned by someone else") {
+        r.probe.leaf.owner_sid = "S-1-5-21-9-9-9-500";
+        CHECK(r.before() == "hive_owner_unexpected");
+    }
+    SECTION("a final path that is not the requested path") {
+        r.probe.leaf.final_path_matches = false;
+        CHECK(r.before() == "hive_path_redirected");
+    }
+    SECTION("a handle that is not a disk file") {
+        r.probe.leaf.is_disk_file = false;
+        CHECK(r.before() == "hive_not_regular");
+    }
+    SECTION("a file of exactly kMaxHiveBytes is accepted") {
+        r.probe.leaf.size = win::kMaxHiveBytes;
+        CHECK(r.before().empty());
+    }
+}
+
 TEST_CASE("hive guard: a sidecar is refused from the listing, again from its opened handle, and "
           "when hard-linked -- in listing order",
           "[privacy_permissions][win_walk]") {
@@ -557,6 +758,15 @@ TEST_CASE("hive guard: a sidecar is refused from the listing, again from its ope
     SECTION("a sidecar that cannot be opened carries its Win32 code") {
         r.probe.sidecar_rc = 5;
         CHECK(r.before() == "hive_stat_failed:win32_5");
+    }
+    SECTION("a sidecar listed and then gone is an absent sidecar, not a failure") {
+        r.probe.sidecar_rc = win::kErrorFileNotFound;
+        CHECK(r.before().empty());
+        CHECK(r.probe.sidecar_calls == 1);
+    }
+    SECTION("only FILE_NOT_FOUND is forgiven: PATH_NOT_FOUND still refuses") {
+        r.probe.sidecar_rc = 3;
+        CHECK(r.before() == "hive_stat_failed:win32_3");
     }
     SECTION("a regular, single-link sidecar is fine") { CHECK(r.before().empty()); }
 }
@@ -601,6 +811,11 @@ TEST_CASE("hive guard: an ancestor reparse point is refused hop by hop, the iden
     SECTION("the leaf cannot be read") {
         r.probe.leaf_rc = 2;
         CHECK(r.before() == "hive_stat_failed:win32_2");
+    }
+    SECTION("the leaf cannot be re-read after the load") {
+        REQUIRE(r.before().empty());
+        r.probe.leaf_rc = 5;
+        CHECK(r.guard.after_load(kHivePath) == "hive_stat_failed:win32_5");
     }
     SECTION("the same file after the load re-verifies; a different one does not") {
         REQUIRE(r.before().empty());

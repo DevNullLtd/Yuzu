@@ -1054,6 +1054,8 @@ struct Tally {
 
     // Formatted row bytes so far (each row plus its newline); byte-only, non-sticky: every row is
     // re-tested, so a smaller row after the cap marker is still admitted (unchanged behaviour).
+    // Rows are never empty (every caller passes a formatted row), so the zero-length-after-an-
+    // exact-fill corner of RowByteBudget::fits is unreachable here.
     yuzu::shared::RowByteBudget budget{.max_bytes = kMaxRowBytes};
     std::string marker_prefix{"local_security_policy"};
     std::size_t marker_fields{4};

@@ -13,8 +13,9 @@ using yuzu::shared::RowByteBudget;
 
 TEST_CASE("RowByteBudget: defaults are unbounded", "[row_byte_budget]") {
     RowByteBudget b;
-    CHECK(b.fits(std::size_t{1} << 40));
-    CHECK(b.charge(std::size_t{1} << 40, std::size_t{1} << 20));
+    CHECK(b.fits(std::numeric_limits<std::size_t>::max() / 2));
+    CHECK(b.charge(std::numeric_limits<std::size_t>::max() / 2,
+                   std::numeric_limits<std::size_t>::max() / 4));
     CHECK_FALSE(b.full());
     CHECK_FALSE(b.refused);
 }
@@ -76,4 +77,16 @@ TEST_CASE("RowByteBudget: reset clears counters, keeps limits", "[row_byte_budge
     CHECK_FALSE(b.refused);
     CHECK(b.max_rows == 3);
     CHECK(b.max_bytes == 7);
+}
+
+TEST_CASE("RowByteBudget: the row dimension saturates and never wraps back to room",
+          "[row_byte_budget]") {
+    RowByteBudget b{.max_rows = 2};
+    b.add(0, 5); // beyond the cap
+    CHECK_FALSE(b.fits(0));
+    b.add(0, std::numeric_limits<std::size_t>::max());
+    CHECK(b.rows == std::numeric_limits<std::size_t>::max());
+    RowByteBudget c;
+    CHECK(c.charge(1, 3));
+    CHECK(c.rows == 3);
 }
