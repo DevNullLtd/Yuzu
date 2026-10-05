@@ -866,6 +866,10 @@ const std::unordered_map<std::string, std::string>& AgentRegistry::action_descri
          "read-only, no subprocess; "
          "other package families are not read, so an empty result on them is not evidence of no "
          "sources"},
+        {"mgmt_posture.posture",
+         "Management-plane posture, facts only: which plane controls the device (none/ad/ipa on "
+         "Linux from sssd/ipa configuration as written), MDM enrolment on macOS; a refused read is "
+         "reported as permission_denied, never as not-joined; read-only, one bounded argv on macOS"},
         // status
         {"status.version", "Agent version, build number, and git commit hash"},
         {"status.info", "Platform OS, architecture, and hostname"},
