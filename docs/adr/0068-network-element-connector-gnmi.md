@@ -563,7 +563,9 @@ subscriptions only; there is no on-demand device RPC. So under D3 there is no *l
   only). gnmic's REST API server is disabled; its gNMI server is reachable from core only.
 - **Bootstrap order** (slice-1 deliverable, runbook in `server-admin.md`): core up with RBAC
   enabled → an admin creates the custom `NetworkCollector` role (exactly `NetworkElement:Collect`)
-  and the collector engine principal, and grants the role →
+  and the collector engine principal, and grants the role (the runbook says never to delete that
+  role — `principal_roles` has no FK, so deletion leaves an inert grant and the collector 403s,
+  observable via `NetworkCollectorFetchRejected`) →
   the bearer is minted and mounted as a secret → gnmic starts with the Yuzu-shipped reference
   config; on a 401/503 or an empty list at first boot gnmic simply has no targets and polls again.
   Core learns the gnmic endpoint and its client mTLS material from `--netcollector-endpoint` /
