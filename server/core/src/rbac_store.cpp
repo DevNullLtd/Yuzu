@@ -3045,14 +3045,18 @@ ListReadAuthorization RbacStore::authorize_list_read(const std::string& username
     return out;
 }
 
-bool RbacStore::check_role_has_permission(const std::string& role_name,
-                                          const std::string& securable_type,
-                                          const std::string& operation) const {
-    // Uses the fail-closed authoritative read: on a store error the checked
-    // variant returns unexpected → DENY (never a false allow).
+std::expected<bool, std::string>
+RbacStore::role_permission_allowed_checked(const std::string& role_name,
+                                           const std::string& securable_type,
+                                           const std::string& operation) const {
+    // THE one row loop for "does this role grant this pair" (extend, never fork):
+    // `check_role_has_permission` and `authz::service_ceiling_check` (authz_gates.cpp)
+    // both delegate here. First row for the pair decides: `allow` admits, `deny` or an
+    // absent pair (a revoked default is a DELETEd row) refuses. A failed read is an error,
+    // never a false allow.
     auto perms = get_role_permissions_checked(role_name);
     if (!perms)
-        return false;
+        return std::unexpected(std::move(perms.error()));
     for (const auto& p : *perms) {
         if (p.securable_type == securable_type && p.operation == operation) {
             if (p.effect == "deny")
@@ -3062,6 +3066,13 @@ bool RbacStore::check_role_has_permission(const std::string& role_name,
         }
     }
     return false;
+}
+
+bool RbacStore::check_role_has_permission(const std::string& role_name,
+                                          const std::string& securable_type,
+                                          const std::string& operation) const {
+    // Thin fail-closed wrapper: a store error (unexpected) folds into DENY.
+    return role_permission_allowed_checked(role_name, securable_type, operation).value_or(false);
 }
 
 } // namespace yuzu::server

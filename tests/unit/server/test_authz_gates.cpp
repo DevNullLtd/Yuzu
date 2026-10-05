@@ -1110,3 +1110,25 @@ TEST_CASE("service_scope_policy: service_scope_global_safe denies everything whi
     CHECK_FALSE(service_scope_global_safe("Execution", "Execute"));
     CHECK_FALSE(service_scope_global_safe("", ""));
 }
+
+// The closed reason-label mapping for yuzu_server_rbac_read_degrade_total on a failed
+// ITServiceOwner ceiling read. A pool-acquire timeout cannot be provoked on demand, so the
+// pure mapping function is pinned directly (the Degraded => 503 path itself is covered by
+// the degraded-read test above).
+TEST_CASE("authz::ceiling_degrade_reason: pool acquire timeout prefix maps to "
+          "pool_acquire_timeout, anything else to query_error",
+          "[authz_gates][authz]") {
+    using yuzu::server::authz::ceiling_degrade_reason;
+    CHECK(std::string_view{ceiling_degrade_reason("pool acquire timeout")} ==
+          "pool_acquire_timeout");
+    CHECK(std::string_view{ceiling_degrade_reason("pool acquire timeout after 5000ms")} ==
+          "pool_acquire_timeout");
+    CHECK(std::string_view{ceiling_degrade_reason("ERROR: relation does not exist")} ==
+          "query_error");
+    CHECK(std::string_view{ceiling_degrade_reason("")} == "query_error");
+    // The prefix is anchored: the phrase later in the message is not a pool timeout.
+    CHECK(std::string_view{ceiling_degrade_reason("query failed: pool acquire timeout")} ==
+          "query_error");
+    // Case-sensitive on purpose: the producer's message is a fixed string.
+    CHECK(std::string_view{ceiling_degrade_reason("Pool acquire timeout")} == "query_error");
+}

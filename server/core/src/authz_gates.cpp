@@ -13,36 +13,29 @@
 
 namespace yuzu::server {
 
+const char* authz::ceiling_degrade_reason(std::string_view read_error) noexcept {
+    // Closed label set of yuzu_server_rbac_read_degrade_total. A store that is not open
+    // never reaches here from a gate (they pre-check is_open()), so the only
+    // distinguishable cause is the pool acquire; everything else is a query error.
+    return read_error.starts_with("pool acquire timeout") ? "pool_acquire_timeout"
+                                                          : "query_error";
+}
+
 authz::CeilingVerdict authz::service_ceiling_check(const RbacStore& store,
                                                    const std::string& securable_type,
                                                    const std::string& operation,
                                                    const char** degrade_reason) {
-    // Same read and same row semantics as RbacStore::check_role_has_permission
-    // (rbac_store.cpp): get_role_permissions_checked, first row for the pair decides,
-    // `allow` admits, `deny` or an absent pair (a revoked default is a DELETEd row)
-    // refuses. Only a failed read differs: it is reported, not folded into a deny.
-    auto perms = store.get_role_permissions_checked("ITServiceOwner");
-    if (!perms) {
-        if (degrade_reason) {
-            // Closed label set of yuzu_server_rbac_read_degrade_total. A store that is
-            // not open never reaches here from a gate (they pre-check is_open()), so the
-            // only distinguishable cause is the pool acquire; everything else is a query
-            // error.
-            *degrade_reason = perms.error().starts_with("pool acquire timeout")
-                                  ? "pool_acquire_timeout"
-                                  : "query_error";
-        }
+    // The row loop lives in ONE place, RbacStore::role_permission_allowed_checked (first
+    // row for the pair decides, `allow` admits, `deny` or an absent pair refuses). Only a
+    // failed read is mapped differently here: reported as Degraded, not folded into a deny.
+    auto allowed = store.role_permission_allowed_checked("ITServiceOwner", securable_type,
+                                                         operation);
+    if (!allowed) {
+        if (degrade_reason)
+            *degrade_reason = ceiling_degrade_reason(allowed.error());
         return CeilingVerdict::Degraded;
     }
-    for (const auto& p : *perms) {
-        if (p.securable_type == securable_type && p.operation == operation) {
-            if (p.effect == "deny")
-                return CeilingVerdict::Deny;
-            if (p.effect == "allow")
-                return CeilingVerdict::Admit;
-        }
-    }
-    return CeilingVerdict::Deny;
+    return *allowed ? CeilingVerdict::Admit : CeilingVerdict::Deny;
 }
 
 std::expected<authz::ListAuthority, authz::GateFailure>
@@ -200,7 +193,7 @@ AuthRoutes::require_fleet_read(const httplib::Request& req, httplib::Response& r
     }
 
     // ITServiceOwner AUTHORITY CEILING (same check as require_permission's service branch,
-    // auth_routes.cpp: `check_role_has_permission("ITServiceOwner", securable, operation)`):
+    // auth_routes.cpp: `authz::service_ceiling_check`):
     // a service-scoped token can never exceed what that role grants, regardless of what its
     // minter holds. Without it this gate admitted a service token on the minter's grant plus
     // the tag meet alone, so an operator who revoked the pair from ITServiceOwner (the
@@ -210,10 +203,11 @@ AuthRoutes::require_fleet_read(const httplib::Request& req, httplib::Response& r
     // 2026-10-05): a definitive deny (explicit deny row or absent/revoked pair) is a 403
     // like theirs, but a FAILED ceiling read is a retryable 503 here (bumping
     // yuzu_server_rbac_read_degrade_total), whereas those two gates keep mapping a failed
-    // read to 403. Still fail CLOSED: never an admit. Deliberately NOT the second half of require_permission's service branch
-    // (`service_scope_admits` / `kServiceScopeGlobalSafe`): that allow-list guards routes that
-    // return fleet-wide data UNCONFINED, whereas this gate's service axis below always
-    // narrows to the tagged set, so the allow-list is neither applied nor widened here.
+    // read to 403. Still fail CLOSED: never an admit. Deliberately NOT the second half of
+    // require_permission's service branch (`service_scope_admits` / `kServiceScopeGlobalSafe`):
+    // that allow-list guards routes that return fleet-wide data UNCONFINED, whereas this
+    // gate's service axis below always narrows to the tagged set, so the allow-list is
+    // neither applied nor widened here.
     // Service axis only (non-service callers never reach it), after the elevated -> engine ->
     // mcp_tier branches and before the RBAC axis (branch order unchanged). No `.permission`
     // on the 403 (routed-concern clause 5): granting `perm` to the minter does not admit this

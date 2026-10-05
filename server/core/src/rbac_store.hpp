@@ -570,8 +570,18 @@ public:
                                   const std::string& operation,
                                   const ManagementGroupStore* mgmt_store) const;
 
-    /// Check if a specific role grants a permission (for service-scoped token
-    /// validation). FAIL-CLOSED: false on any store error.
+    /// The ONE row loop deciding whether a role grants a (securable, operation) pair
+    /// (extend, never fork). First matching row decides; `allow` => true, `deny` or an
+    /// absent pair => false; a failed read => `unexpected(msg)` (never a false allow).
+    /// `check_role_has_permission` and `authz::service_ceiling_check` both delegate here.
+    std::expected<bool, std::string>
+    role_permission_allowed_checked(const std::string& role_name,
+                                    const std::string& securable_type,
+                                    const std::string& operation) const;
+
+    /// Check if a specific role grants a permission. FAIL-CLOSED: false on any store
+    /// error. Thin wrapper over `role_permission_allowed_checked`; production service-token
+    /// gates use `authz::service_ceiling_check` (which keeps the failed-read case distinct).
     bool check_role_has_permission(const std::string& role_name, const std::string& securable_type,
                                    const std::string& operation) const;
 

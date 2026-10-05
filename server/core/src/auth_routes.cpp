@@ -747,7 +747,7 @@ bool AuthRoutes::require_permission(const httplib::Request& req, httplib::Respon
         // store or a genuinely-disabled one still denies here; a degraded
         // view (open, but a stale cached "disabled" that never observed a
         // real toggle) is treated as still-enforced and falls through to
-        // fail closed via `check_role_has_permission` on that same handle
+        // fail closed via `authz::service_ceiling_check` on that same handle
         // instead — deny-on-degrade either way, just a more accurate reason.
         if (!rbac_store_ || !rbac_enforcement_in_effect(rbac_store_)) {
             audit_log(req, "auth.permission_required", "denied", "", "",

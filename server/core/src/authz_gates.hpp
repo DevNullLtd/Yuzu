@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include <string>
+#include <string_view>
 #include <vector>
 
 /// @file authz_gates.hpp
@@ -62,7 +63,8 @@ enum class CeilingVerdict : std::uint8_t { Admit, Deny, Degraded };
 
 /// THE one ITServiceOwner ceiling check (extend, never fork): a service-scoped token can
 /// never exceed what the ITServiceOwner role grants, whatever its minter holds. Same
-/// semantics as `RbacStore::check_role_has_permission("ITServiceOwner", ...)` (first
+/// semantics as `RbacStore::check_role_has_permission("ITServiceOwner", ...)` (both
+/// delegate to `RbacStore::role_permission_allowed_checked`, the one row loop: first
 /// matching row decides, `allow` admits, `deny` or absent refuses) with the failed-read
 /// case separated out instead of folded into `false`. On Degraded, `degrade_reason` (if
 /// non-null) is set to a closed `yuzu_server_rbac_read_degrade_total` reason label
@@ -71,6 +73,12 @@ enum class CeilingVerdict : std::uint8_t { Admit, Deny, Degraded };
                                                    const std::string& securable_type,
                                                    const std::string& operation,
                                                    const char** degrade_reason = nullptr);
+
+/// Closed `yuzu_server_rbac_read_degrade_total` reason label for a failed role-permission
+/// read: a message starting "pool acquire timeout" => "pool_acquire_timeout", anything else
+/// => "query_error". Pure (no metrics, no store); split out of `service_ceiling_check` so
+/// the mapping is unit-testable without a store that can be made to time out.
+[[nodiscard]] const char* ceiling_degrade_reason(std::string_view read_error) noexcept;
 
 /// Why `require_fleet_read` did not produce a `ListAuthority`. This is
 /// structural bookkeeping, not a caller dispatch surface — every failure
