@@ -529,6 +529,73 @@ TEST_CASE("ResponseStore: query with time range", "[pg][response_store]") {
     CHECK(results->size() == 3);
 }
 
+TEST_CASE("ResponseStore: ResponseQuery since and until are presence-tracked, a literal 0 is "
+          "not the unbounded sentinel (#4644)",
+          "[pg][response_store][since_until]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore store(pool);
+    for (int64_t ts : {100, 200, 300}) {
+        StoredResponse r;
+        r.instruction_id = "cmd-presence";
+        r.agent_id = "agent-1";
+        r.status = 1;
+        r.output = "t" + std::to_string(ts);
+        r.timestamp = ts;
+        r.execution_id = "exec-presence";
+        store.store(r);
+    }
+
+    // Defaults are unset: no bound on either side.
+    ResponseQuery none;
+    CHECK_FALSE(none.since.has_value());
+    CHECK_FALSE(none.until.has_value());
+
+    ResponseQuery since_zero;
+    since_zero.since = 0; // literal bound at the epoch: matches every stored row, like unset
+    ResponseQuery until_set;
+    until_set.until = 200; // bounded subset: inclusive upper bound
+    ResponseQuery both;
+    both.since = 0;
+    both.until = 200;
+    ResponseQuery window;
+    window.since = 200;
+    window.until = 200;
+
+    const auto rows_via = [&](const ResponseQuery& q) {
+        auto a = store.query("cmd-presence", q);
+        auto b = store.query_by_execution("exec-presence", q);
+        auto c = store.query_bounded("cmd-presence", q, std::nullopt, 1u << 20);
+        REQUIRE(a.has_value());
+        REQUIRE(b.has_value());
+        REQUIRE(c.has_value());
+        AggregationQuery aq;
+        aq.group_by = "status";
+        aq.op = AggregateOp::Count;
+        auto d = store.aggregate("cmd-presence", aq, q);
+        REQUIRE(d.has_value());
+        int64_t agg_total = 0;
+        for (const auto& g : *d)
+            agg_total += g.count;
+        REQUIRE(static_cast<int64_t>(a->size()) == agg_total);
+        REQUIRE(a->size() == b->size());
+        REQUIRE(a->size() == c->rows.size());
+        return a->size();
+    };
+    CHECK(rows_via(none) == 3);
+    CHECK(rows_via(since_zero) == 3);
+    CHECK(rows_via(until_set) == 2);
+    CHECK(rows_via(both) == 2);
+    CHECK(rows_via(window) == 1);
+
+    // Presence, not a sentinel: a literal `until = 0` is an upper bound at the epoch that
+    // matches nothing. The REST edge rejects it before it can get here; the store must not
+    // quietly turn it back into "unbounded".
+    ResponseQuery until_zero;
+    until_zero.until = 0;
+    CHECK(rows_via(until_zero) == 0);
+}
+
 TEST_CASE("ResponseStore: multiple instructions", "[pg][response_store]") {
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};

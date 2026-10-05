@@ -72,12 +72,14 @@ enum ResponseNumericParam : unsigned {
 ///
 /// Returns false on the first malformed or out-of-domain value; `q` may then be
 /// partially filled and must not be used -- the caller answers its own route's 400
-/// and returns. `since`/`until` must be `>= 0`: 0 is the documented "unbounded that
-/// side" sentinel (ResponseQuery defaults both to 0, so the stores cannot tell an
-/// omitted bound from a literal 0 and apply the predicate only above 0), and a
-/// negative epoch is no timestamp at all. It used to be read as "unbounded" too, which
-/// let a computed window that underflowed silently return the whole result; it is a
-/// 400 now (#4644 Gate 7).
+/// and returns. `since`/`until` are PRESENCE-tracked (`ResponseQuery::since/until` are
+/// optionals): an absent parameter leaves that side unbounded, a present one is a literal
+/// bound. `since` must be `>= 0` (0 is a harmless literal lower bound: every stored timestamp
+/// is positive, so it matches exactly what an absent `since` matches); `until` must be `>= 1`
+/// -- `until=0` would bound the read at epoch zero and match nothing, which is never what a
+/// caller meant and, when 0 is a computed window that underflowed, would have been
+/// indistinguishable from "unbounded" under the old zero sentinel (#4644). A negative epoch is
+/// no timestamp at all, so both reject it.
 template <typename Req>
 [[nodiscard]] bool apply_response_numeric_params(const Req& req, ResponseQuery& q,
                                                  unsigned accepted) {
@@ -93,11 +95,23 @@ template <typename Req>
     };
     const auto any = [](auto) { return true; };
     const auto non_negative = [](auto v) { return v >= 0; };
+    const auto positive = [](auto v) { return v >= 1; };
+    // since/until are optionals on ResponseQuery: parse into a local, store on success.
+    const auto get_bound = [&req](const char* name, std::optional<int64_t>& out,
+                                  auto&& valid) -> bool {
+        if (!req.has_param(name))
+            return true;
+        const auto v = parse_query_int<int64_t>(req.get_param_value(name));
+        if (!v || !valid(*v))
+            return false;
+        out = *v;
+        return true;
+    };
     return (!(accepted & kRespParamStatus) ||
             get_int("status", q.status,
                     [](int v) { return is_valid_response_status_filter(v); })) &&
-           (!(accepted & kRespParamSince) || get_int("since", q.since, non_negative)) &&
-           (!(accepted & kRespParamUntil) || get_int("until", q.until, non_negative)) &&
+           (!(accepted & kRespParamSince) || get_bound("since", q.since, non_negative)) &&
+           (!(accepted & kRespParamUntil) || get_bound("until", q.until, positive)) &&
            (!(accepted & kRespParamLimit) || get_int("limit", q.limit, any)) &&
            (!(accepted & kRespParamOffset) || get_int("offset", q.offset, any));
 }

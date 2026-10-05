@@ -106,8 +106,14 @@ struct FacetFilter {
 struct ResponseQuery {
     std::string agent_id;
     int status{-1};   // -1 = any
-    int64_t since{0}; // epoch seconds, 0 = no lower bound
-    int64_t until{0}; // epoch seconds, 0 = no upper bound
+    /// Epoch-second bounds, PRESENCE-tracked (#4644): an unset optional is "no bound on that
+    /// side"; a set value is a literal bound (`timestamp >= *since`, `timestamp <= *until`).
+    /// A literal 0 is NOT a sentinel -- the old `int64_t{0}` default made an omitted bound and a
+    /// computed window that collapsed to 0 indistinguishable, so the latter silently returned
+    /// the whole table. The REST/MCP edge rejects `until <= 0`; `since == 0` is a harmless
+    /// literal bound (every stored timestamp is positive).
+    std::optional<int64_t> since;
+    std::optional<int64_t> until;
     int limit{100};
     int offset{0};
 };

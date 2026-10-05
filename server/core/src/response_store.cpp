@@ -748,13 +748,13 @@ std::optional<std::vector<StoredResponse>> ResponseStore::query(const std::strin
                 sql += " AND status = $" + std::to_string(idx++) + "::integer";
                 binds.push_back(std::to_string(q.status));
             }
-            if (q.since > 0) {
+            if (q.since) {
                 sql += " AND timestamp >= $" + std::to_string(idx++) + "::bigint";
-                binds.push_back(std::to_string(q.since));
+                binds.push_back(std::to_string(*q.since));
             }
-            if (q.until > 0) {
+            if (q.until) {
                 sql += " AND timestamp <= $" + std::to_string(idx++) + "::bigint";
-                binds.push_back(std::to_string(q.until));
+                binds.push_back(std::to_string(*q.until));
             }
             append_scope_clause(sql, binds, idx, scope);
             sql += " ORDER BY timestamp DESC LIMIT $" + std::to_string(idx++) + "::integer";
@@ -795,13 +795,13 @@ std::optional<BoundedResponses> ResponseStore::query_bounded(const std::string& 
                 where += " AND status = $" + std::to_string(idx++) + "::integer";
                 binds.push_back(std::to_string(q.status));
             }
-            if (q.since > 0) {
+            if (q.since) {
                 where += " AND timestamp >= $" + std::to_string(idx++) + "::bigint";
-                binds.push_back(std::to_string(q.since));
+                binds.push_back(std::to_string(*q.since));
             }
-            if (q.until > 0) {
+            if (q.until) {
                 where += " AND timestamp <= $" + std::to_string(idx++) + "::bigint";
-                binds.push_back(std::to_string(q.until));
+                binds.push_back(std::to_string(*q.until));
             }
             append_scope_clause(where, binds, idx, scope);
             // bigint, not integer: the statement computes limit + 1, and an integer
@@ -883,13 +883,13 @@ ResponseStore::query_by_execution(const std::string& execution_id, const Respons
                 sql += " AND status = $" + std::to_string(idx++) + "::integer";
                 binds.push_back(std::to_string(q.status));
             }
-            if (q.since > 0) {
+            if (q.since) {
                 sql += " AND timestamp >= $" + std::to_string(idx++) + "::bigint";
-                binds.push_back(std::to_string(q.since));
+                binds.push_back(std::to_string(*q.since));
             }
-            if (q.until > 0) {
+            if (q.until) {
                 sql += " AND timestamp <= $" + std::to_string(idx++) + "::bigint";
-                binds.push_back(std::to_string(q.until));
+                binds.push_back(std::to_string(*q.until));
             }
             append_scope_clause(sql, binds, idx, scope);
             sql += " ORDER BY timestamp DESC LIMIT $" + std::to_string(idx++) + "::integer";
@@ -976,13 +976,13 @@ ResponseStore::aggregate(const std::string& instruction_id, const AggregationQue
                 sql += " AND status = $" + std::to_string(idx++) + "::integer";
                 binds.push_back(std::to_string(filter.status));
             }
-            if (filter.since > 0) {
+            if (filter.since) {
                 sql += " AND timestamp >= $" + std::to_string(idx++) + "::bigint";
-                binds.push_back(std::to_string(filter.since));
+                binds.push_back(std::to_string(*filter.since));
             }
-            if (filter.until > 0) {
+            if (filter.until) {
                 sql += " AND timestamp <= $" + std::to_string(idx++) + "::bigint";
-                binds.push_back(std::to_string(filter.until));
+                binds.push_back(std::to_string(*filter.until));
             }
             sql += " GROUP BY " + aq.group_by + " ORDER BY COUNT(*) DESC";
 

@@ -32,6 +32,7 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -577,7 +578,7 @@ TEST_CASE("response routes: well-formed numerics still pass including zero-paddi
 
     const std::string route = GENERATE(as<std::string>{}, "", "/aggregate", "/export");
     const std::string query = GENERATE(as<std::string>{}, "status=007", "status=-1", "status=0",
-                                       "since=0&until=0", "since=50&until=200");
+                                       "since=0", "until=1", "since=50&until=200");
     INFO("route=" << route << " query=" << query);
     auto res = h.sink.Get("/api/v1/responses/instr-strict-ok" + route + "?" + query);
     REQUIRE(res);
@@ -848,8 +849,8 @@ TEST_CASE("GET /api/v1/responses/:id/export: the byte cap always serves one row 
     CHECK(v1_csv_trailer(many_csv->body) == "# result_truncated_by_cap cause=byte_cap,,,,,,,,,");
 }
 
-TEST_CASE("v1 response routes: since and until of zero mean unbounded a negative one is a 400 "
-          "(#4644)",
+TEST_CASE("v1 response routes: until of zero is a 400 since of zero is the same as omitting it "
+          "and a negative bound is a 400 (#4644)",
           "[pg][rest][responses][v1]") {
     YUZU_REQUIRE_PG_DB_TPL(db, respv1_responsestore_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
@@ -857,19 +858,27 @@ TEST_CASE("v1 response routes: since and until of zero mean unbounded a negative
     for (int i = 0; i < 3; ++i)
         h.response_store->store(
             mk_resp("instr-window", "agent-" + std::to_string(i), 0, "o", 100 + i));
-    // Zero is the documented "no bound on that side" sentinel: pinned.
+    const auto rows = [&h](const std::string& route, const std::string& q) -> std::size_t {
+        auto res = h.sink.Get("/api/v1/responses/instr-window" + route + (q.empty() ? "" : "?" + q));
+        REQUIRE(res);
+        REQUIRE(res->status == 200);
+        return nlohmann::json::parse(res->body)["data"].size();
+    };
     for (const char* route : {"", "/export"}) {
-        for (const char* q : {"since=0", "until=0", "since=0&until=0"}) {
-            INFO(route << " " << q);
-            auto res = h.sink.Get(std::string("/api/v1/responses/instr-window") + route + "?" + q);
-            REQUIRE(res);
-            REQUIRE(res->status == 200);
-            CHECK(nlohmann::json::parse(res->body)["data"].size() == 3);
-        }
+        INFO(route);
+        // Absent is unbounded; `since=0` matches exactly what absent matches.
+        CHECK(rows(route, "") == 3);
+        CHECK(rows(route, "since=0") == 3);
+        // A positive window is unchanged: both bounds inclusive.
+        CHECK(rows(route, "since=101") == 2);
+        CHECK(rows(route, "until=101") == 2);
+        CHECK(rows(route, "since=101&until=101") == 1);
+        CHECK(rows(route, "since=0&until=101") == 2);
     }
-    // A negative epoch is no timestamp; it used to widen to "unbounded".
+    // `until=0` is not a way to say unbounded, and a negative epoch is no timestamp: both 400.
     for (const char* route : {"", "/export", "/aggregate"}) {
-        for (const char* q : {"since=-5", "until=-5", "since=-1&until=0", "since=0&until=-9"}) {
+        for (const char* q : {"until=0", "until=000", "since=0&until=0", "since=5&until=0",
+                              "since=-5", "until=-5", "since=-1&until=0", "since=0&until=-9"}) {
             INFO(route << " " << q);
             auto res = h.sink.Get(std::string("/api/v1/responses/instr-window") + route + "?" + q);
             REQUIRE(res);
@@ -878,6 +887,9 @@ TEST_CASE("v1 response routes: since and until of zero mean unbounded a negative
                   "invalid numeric query parameter");
         }
     }
+    auto agg = h.sink.Get("/api/v1/responses/instr-window/aggregate?since=0");
+    REQUIRE(agg);
+    CHECK(agg->status == 200);
 }
 
 TEST_CASE("v1 response routes count rejected numeric params and cut exports by surface "
@@ -960,4 +972,61 @@ TEST_CASE("append_rows_until_byte_cap / parse_query_int: pure helper contracts (
     total = 0;
     CHECK_FALSE(append_rows_until_byte_cap(three, 21, [&](int r) { return total += static_cast<std::size_t>(r); }));
     CHECK(total == 30);
+}
+
+namespace {
+/// Duck-typed request for `apply_response_numeric_params` (it only needs `has_param` and
+/// `get_param_value`), so the since/until presence rule is pinned with no store or route.
+struct FakeNumericReq {
+    std::unordered_map<std::string, std::string> params;
+    [[nodiscard]] bool has_param(const char* n) const { return params.count(n) != 0; }
+    [[nodiscard]] std::string get_param_value(const char* n) const { return params.at(n); }
+};
+} // namespace
+
+TEST_CASE("apply_response_numeric_params: since and until are presence-tracked, until of zero is "
+          "rejected and since of zero is a literal bound (#4644)",
+          "[rest][responses][v1][numeric_params]") {
+    using yuzu::server::apply_response_numeric_params;
+    using yuzu::server::kRespParamSince;
+    using yuzu::server::kRespParamUntil;
+    constexpr unsigned kBoth = kRespParamSince | kRespParamUntil;
+
+    SECTION("absent leaves both sides unset") {
+        yuzu::server::ResponseQuery q;
+        REQUIRE(apply_response_numeric_params(FakeNumericReq{}, q, kBoth));
+        CHECK_FALSE(q.since.has_value());
+        CHECK_FALSE(q.until.has_value());
+    }
+    SECTION("since of zero is accepted and stored as a present literal 0") {
+        yuzu::server::ResponseQuery q;
+        REQUIRE(apply_response_numeric_params(FakeNumericReq{{{"since", "0"}}}, q, kBoth));
+        REQUIRE(q.since.has_value());
+        CHECK(*q.since == 0);
+        CHECK_FALSE(q.until.has_value());
+    }
+    SECTION("until of one is the smallest accepted upper bound") {
+        yuzu::server::ResponseQuery q;
+        REQUIRE(apply_response_numeric_params(FakeNumericReq{{{"until", "1"}}}, q, kBoth));
+        REQUIRE(q.until.has_value());
+        CHECK(*q.until == 1);
+    }
+    SECTION("until of zero in any spelling is rejected") {
+        for (const char* v : {"0", "000", "-0"}) {
+            INFO(v);
+            yuzu::server::ResponseQuery q;
+            CHECK_FALSE(apply_response_numeric_params(FakeNumericReq{{{"until", v}}}, q, kBoth));
+        }
+    }
+    SECTION("a negative bound is rejected on either side") {
+        yuzu::server::ResponseQuery a;
+        CHECK_FALSE(apply_response_numeric_params(FakeNumericReq{{{"since", "-1"}}}, a, kBoth));
+        yuzu::server::ResponseQuery b;
+        CHECK_FALSE(apply_response_numeric_params(FakeNumericReq{{{"until", "-1"}}}, b, kBoth));
+    }
+    SECTION("a parameter the route does not accept is ignored") {
+        yuzu::server::ResponseQuery q;
+        REQUIRE(apply_response_numeric_params(FakeNumericReq{{{"until", "0"}}}, q, kRespParamSince));
+        CHECK_FALSE(q.until.has_value());
+    }
 }

@@ -498,15 +498,16 @@ TEST_CASE("GET /api/v1/executions/:id/responses: a malformed numeric query param
     auto exec_id = h.make_exec_with_agents("def-resp-strict");
 
     const std::string bad = GENERATE(as<std::string>{}, "status=0x1", "status=-5", "since=1e9",
-                                     "since=-5", "until=-5", "until=100abc", "limit=1e3",
-                                     "limit=");
+                                     "since=-5", "until=-5", "until=0", "until=000", "since=5&until=0",
+                                     "until=100abc", "limit=1e3", "limit=");
     INFO(bad);
     auto res = h.sink.Get("/api/v1/executions/" + exec_id + "/responses?" + bad);
     REQUIRE(res);
     CHECK(res->status == 400);
     CHECK(nlohmann::json::parse(res->body)["error"]["message"] == "invalid numeric query parameter");
 
-    const std::string good = GENERATE(as<std::string>{}, "status=-1", "status=007", "limit=10");
+    const std::string good = GENERATE(as<std::string>{}, "status=-1", "status=007", "limit=10",
+                                      "since=0", "until=1", "since=0&until=4102444800");
     INFO(good);
     auto ok = h.sink.Get("/api/v1/executions/" + exec_id + "/responses?" + good);
     REQUIRE(ok);

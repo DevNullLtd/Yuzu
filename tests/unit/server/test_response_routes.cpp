@@ -522,7 +522,7 @@ TEST_CASE("legacy response routes: well-formed numerics still pass incl. zero-pa
 
     const std::string route = GENERATE(as<std::string>{}, "", "/aggregate", "/export");
     const std::string query = GENERATE(as<std::string>{}, "status=007", "status=-1", "status=1",
-                                       "since=0&until=0");
+                                       "since=0", "until=1");
     INFO("route=" << route << " query=" << query);
     auto res = h.sink.Get("/api/responses/instr-strict-ok" + route + "?" + query);
     REQUIRE(res);
@@ -785,8 +785,8 @@ TEST_CASE("GET /api/responses/:id/export: the byte cap always serves one row and
     CHECK(csv_trailer(many_csv->body) == "# result_truncated_by_cap cause=byte_cap,,,,,,");
 }
 
-TEST_CASE("legacy response routes: since and until of zero mean unbounded a negative one is a "
-          "400 (#4644)",
+TEST_CASE("legacy response routes: until of zero is a 400 since of zero is the same as omitting "
+          "it and a negative bound is a 400 (#4644)",
           "[server][routes][response_routes][rest][pg]") {
     PgHarness h;
     for (int i = 0; i < 3; ++i) {
@@ -798,26 +798,39 @@ TEST_CASE("legacy response routes: since and until of zero mean unbounded a nega
         r.timestamp = 100 + i;
         h.store->store(r);
     }
-    // Zero is the documented "no bound on that side" sentinel (ResponseQuery defaults both
-    // to 0, so the store cannot tell an omitted bound from a literal 0): pinned.
-    for (const char* q : {"since=0", "until=0", "since=0&until=0", "since=000"}) {
-        INFO(q);
-        auto res = h.sink.Get(std::string("/api/responses/instr-window/export?") + q);
+    const auto export_rows = [&h](const std::string& q) -> std::size_t {
+        auto res = h.sink.Get("/api/responses/instr-window/export" + (q.empty() ? "" : "?" + q));
         REQUIRE(res);
         REQUIRE(res->status == 200);
-        CHECK(json::parse(res->body)["responses"].size() == 3);
-    }
-    // A negative epoch is no timestamp: it used to widen to "unbounded", so a computed window
-    // that underflowed silently returned the whole result. Every route sharing the parser.
+        return json::parse(res->body)["responses"].size();
+    };
+    // ABSENT is unbounded; `since=0` is a literal lower bound at the epoch that matches exactly
+    // what absent matches (every stored timestamp is positive), including its zero-padded form.
+    CHECK(export_rows("") == 3);
+    for (const char* q : {"since=0", "since=000"})
+        CHECK(export_rows(q) == 3);
+    // A positive window is unchanged: both bounds inclusive.
+    CHECK(export_rows("since=101") == 2);
+    CHECK(export_rows("until=101") == 2);
+    CHECK(export_rows("since=101&until=101") == 1);
+    CHECK(export_rows("since=0&until=101") == 2);
+    // `until=0` is not a way to say unbounded: it is a 400 on every route sharing the parser
+    // (a computed window that collapsed to 0 used to return the whole table). A negative
+    // epoch on either side is no timestamp and is a 400 too.
     for (const char* route : {"/api/responses/instr-window", "/api/responses/instr-window/export",
                               "/api/responses/instr-window/aggregate"}) {
-        for (const char* q : {"since=-5", "until=-5", "since=-1&until=0", "since=0&until=-9"}) {
+        for (const char* q : {"until=0", "until=000", "since=0&until=0", "since=5&until=0",
+                              "since=-5", "until=-5", "since=-1&until=0", "since=0&until=-9"}) {
             INFO(route << "?" << q);
             auto res = h.sink.Get(std::string(route) + "?" + q);
             REQUIRE(res);
             CHECK(res->status == 400);
             CHECK(json::parse(res->body)["error"]["message"] == "invalid numeric query parameter");
         }
+        INFO(route << "?since=0");
+        auto ok = h.sink.Get(std::string(route) + "?since=0");
+        REQUIRE(ok);
+        CHECK(ok->status == 200);
     }
 }
 
