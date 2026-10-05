@@ -35,8 +35,8 @@ may be comma-separated). `--cert-san` is the supported way to make the built-in 
 valid for a deployment name a client actually dials — e.g. `--cert-san dns:gateway` so
 an agent reaching the gateway by that service name passes SNI hostname verification.
 Changing `--cert-san` does **not** rotate an existing set (the marker fast path returns
-the prior certs). For new SANs to take effect, delete `default-marker.json` from the cert dir
-and restart (the leaves are re-minted under the SAME root), or replace the certs. Never clear
+the prior certs). For new SANs to take effect, rename `default-marker.json` in the cert dir aside
+(moving it back undoes this) and restart (the leaves are re-minted under the SAME root), or replace the certs. Never clear
 the whole cert dir: it also holds the CA key and the secrets KEK (`secrets-kek-*.key`, #5370).
 (Implementation: `parse_extra_sans` validates the flag/`YUZU_CERT_SAN` values,
 `merge_sans` injects them into every default leaf, `pki::is_valid_ip_literal` does the

@@ -199,9 +199,20 @@ def check(region, compose_text, compose_rel, image_config, iterations):
         if ro or not src or src.startswith((".", "/", "$", "~")) or src not in top_volumes:
             bad.append(f"server's {CERTS} mount '{src}' is not a named, declared, writable volume")
 
+    # ── Operator guidance that must not regress (RD-N1, qe-N1).
+    if "Never clear `/etc/yuzu/certs`" not in region:
+        bad.append("the README no longer says never to clear /etc/yuzu/certs (#5370)")
+    if "upgrading.md#docker" not in region or "P=yuzu" not in region:
+        bad.append("backup does not point at the prefixed recipe in upgrading.md with P=yuzu "
+                   "(the 0.14.0 compose header recipe backs up nothing)")
+
     # ── Paste safety.
     first = [l for l in blocks[0].splitlines() if l.strip()]
-    if not first or not first[0].startswith("mkdir yuzu && cd yuzu &&"):
+    # UP-N2: step 1 first refuses when a `yuzu` project's volumes already exist,
+    # so a second same-named install never attaches to (or `down -v`s) the first.
+    if not first or first[0] != "! docker volume inspect yuzu_server-data >/dev/null 2>&1 &&":
+        bad.append("step 1 does not first refuse an existing yuzu_server-data volume")
+    if len(first) < 2 or not first[1].startswith("mkdir yuzu && cd yuzu &&"):
         bad.append("step 1 does not open with one `mkdir yuzu && cd yuzu && ...` chain")
     elif any(not l.rstrip().endswith("&&") for l in first[:-1]):
         bad.append("step 1 is not one && chain, so a failed mkdir/cd would not stop later lines")
@@ -361,11 +372,16 @@ class ReadmeQuickstart(unittest.TestCase):
             "no 8443": (r, re.sub(r'^\s*-\s*"8443:8443".*\n', "", compose, flags=re.M), rel),
             "command": (r, compose.replace(
                 "  server:\n", "  server:\n    command: [\"--no-tls\"]\n", 1), rel),
+            "no volume guard": (r.replace("! docker volume inspect yuzu_server-data >/dev/null 2>&1 &&\n", ""),
+                                compose, rel),
+            "header backup recipe": (r.replace("upgrading.md#docker", "upgrading.md"), compose, rel),
+            "cert dir clearable": (r.replace("Never clear `/etc/yuzu/certs`", "You may clear `/etc/yuzu/certs`"),
+                                   compose, rel),
             "unchained step 1": (r.replace("mkdir yuzu && cd yuzu &&", "mkdir yuzu && cd yuzu"),
                                  compose, rel),
             "cd later": (r.replace(COMPOSE_F + "up -d --wait &&",
                                    "cd yuzu && " + COMPOSE_F + "up -d --wait &&"), compose, rel),
-            "comment line": (r.replace("```bash\nmkdir", "```bash\n# 1. Set up\nmkdir"),
+            "comment line": (r.replace("```bash\n! docker", "```bash\n# 1. Set up\n! docker"),
                              compose, rel),
             "no -f": (r.replace(COMPOSE_F + "up -d --wait", "docker compose up -d --wait"),
                       compose, rel),
