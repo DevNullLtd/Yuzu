@@ -621,6 +621,28 @@ one reopen and the event went back to the head; and a `ProxyRegister` retry that
 arrived while the probe was out drove the breaker transition, the late probe
 result left the breaker alone, and the event was still requeued.
 
+The same behaviour was also measured with TLS on every hop that the notification
+path uses (OBSERVED on the same rig: the agent edge is one way TLS, the upstream
+channel and the management channel are mutual TLS, all from the server's default
+certificates, with a private certificate directory). A cold wave of 1000
+simulated agents over TLS dropped 0 notifications and had 1000 routable rows
+about 0.4 to 0.5 s after the burst (2.11 to 2.15 s to register against 1.88 to
+1.93 s without TLS; the pending peak was 574 to 904 held keys), with the
+handshakes either done before the burst or overlapping it. 30 real agents over
+TLS dropped 0, all enrolled (two `ProxyRegister` calls each, 60 in total, 30
+certificates issued) and answered commands, and a 5 minute steady state logged no
+warnings or errors. The breaker hold, single probe and FIFO flush, the failing
+probe by timeout and the probe refused by a restarted server behaved as without
+TLS; the probe that was the first caller back after a server restart paid a fresh
+TLS handshake (about 5.1 ms against 1.8 ms without TLS). With an untrusted
+upstream certificate authority every probe failed in about 2 ms with an
+`unknown_ca` handshake error, the 10 held notifications stayed held and the
+backoff doubled. A TLS handshake failure on the upstream channel is counted by
+`yuzu_gw_upstream_tls_handshake_failures_total` and feeds the breaker like any
+other transport error. Not covered: certificate signing requests from simulated
+agents (only the 30 real agents exercise enrollment), client certificates on the
+agent edge, TLS 1.3, certificate rotation or expiry, and multiple replicas.
+
 ---
 
 ## GatewayUpstream Service
