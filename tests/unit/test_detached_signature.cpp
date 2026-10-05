@@ -109,11 +109,94 @@ TEST_CASE("detached CMS: malformed and empty signatures are rejected", "[signatu
 TEST_CASE("detached CMS: an unreadable trust bundle fails CLOSED", "[signature][cms]") {
     // A bundle we cannot read proves nothing. The one outcome that must never
     // happen is treating "cannot check" as "checked out fine".
+    //
+    // #5249: it fails closed with its OWN kind, not kUntrusted. Lumping the two
+    // together made the rc1-rc5 Windows installer ACL bug (#5196) read as an
+    // untrusted signer in both the log and the refusal counter.
     auto f = build_signing_fixtures();
     const auto sig = read_file(f.sig_file);
-    auto err = verify_detached_cms(f.artifact_file, sig, f.dir / "does-not-exist.pem");
+    const auto missing = f.dir / "does-not-exist.pem";
+    auto err = verify_detached_cms(f.artifact_file, sig, missing);
+    REQUIRE(err.has_value());
+    CHECK(err->kind == CmsFailure::kBundleUnreadable);
+    CHECK(err->kind != CmsFailure::kUntrusted);
+    // The detail names the bundle and says what is wrong with it.
+    CHECK(err->detail.find(missing.string()) != std::string::npos);
+    CHECK(err->detail.find("not found") != std::string::npos);
+}
+
+TEST_CASE("detached CMS: a bundle that is not PEM is bundle_unreadable, not untrusted",
+          "[signature][cms]") {
+    // An existing, readable file holding no certificate is the other half of
+    // "cannot load the anchor" — a truncated copy, or the wrong file entirely.
+    auto f = build_signing_fixtures();
+    const auto sig = read_file(f.sig_file);
+
+    const auto garbage = f.dir / "garbage-bundle.pem";
+    std::ofstream(garbage, std::ios::binary) << "this is not a certificate\n";
+    auto err = verify_detached_cms(f.artifact_file, sig, garbage);
+    REQUIRE(err.has_value());
+    CHECK(err->kind == CmsFailure::kBundleUnreadable);
+
+    const auto empty = f.dir / "empty-bundle.pem";
+    std::ofstream(empty, std::ios::binary).flush();
+    auto err2 = verify_detached_cms(f.artifact_file, sig, empty);
+    REQUIRE(err2.has_value());
+    CHECK(err2->kind == CmsFailure::kBundleUnreadable);
+}
+
+TEST_CASE("detached CMS: a genuinely untrusted signer is still kUntrusted, not bundle_unreadable",
+          "[signature][cms]") {
+    // The other direction of the #5249 split: a READABLE bundle holding the
+    // wrong CA must keep reporting a chain failure.
+    auto f = build_signing_fixtures();
+    auto err = verify_detached_cms(f.artifact_file, read_file(f.sig_file), f.other_trust_bundle);
     REQUIRE(err.has_value());
     CHECK(err->kind == CmsFailure::kUntrusted);
+}
+
+TEST_CASE("probe_trust_bundle: agrees with the verifier's own load", "[signature][cms]") {
+    // The startup warning (#5249) uses this. It must go through the verifier's
+    // loader, so a bundle it calls loadable is one the verifier gets past.
+    auto f = build_signing_fixtures();
+    CHECK_FALSE(yuzu::agent::probe_trust_bundle(f.trust_bundle).has_value());
+    CHECK_FALSE(yuzu::agent::probe_trust_bundle(f.other_trust_bundle).has_value());
+
+    const auto missing = f.dir / "nope.pem";
+    auto problem = yuzu::agent::probe_trust_bundle(missing);
+    REQUIRE(problem.has_value());
+    CHECK(problem->find(missing.string()) != std::string::npos);
+    CHECK(problem->find("not found") != std::string::npos);
+
+    const auto garbage = f.dir / "garbage.pem";
+    std::ofstream(garbage, std::ios::binary) << "junk";
+    CHECK(yuzu::agent::probe_trust_bundle(garbage).has_value());
+
+    // A directory is not a bundle file.
+    auto dir_problem = yuzu::agent::probe_trust_bundle(f.dir);
+    REQUIRE(dir_problem.has_value());
+    CHECK(dir_problem->find("not a regular file") != std::string::npos);
+}
+
+TEST_CASE("signature_refusal_reason: every kind maps into the shared reason list",
+          "[signature][cms]") {
+    // The heartbeat sums over kSignatureRefusalReasons; a kind whose label is
+    // not in that list would be counted by neither the tag nor the fleet gauge.
+    using yuzu::agent::kSignatureRefusalReasons;
+    using yuzu::agent::signature_refusal_reason;
+    const auto in_list = [](std::string_view r) {
+        for (const auto known : kSignatureRefusalReasons)
+            if (known == r)
+                return true;
+        return false;
+    };
+    CHECK(signature_refusal_reason(CmsFailure::kInvalid) == "invalid");
+    CHECK(signature_refusal_reason(CmsFailure::kUntrusted) == "untrusted");
+    CHECK(signature_refusal_reason(CmsFailure::kBundleUnreadable) == "bundle_unreadable");
+    for (const auto kind :
+         {CmsFailure::kInvalid, CmsFailure::kUntrusted, CmsFailure::kBundleUnreadable})
+        CHECK(in_list(signature_refusal_reason(kind)));
+    CHECK(in_list("missing")); // the updater's no-signature reason, not a CmsFailure
 }
 
 #ifndef _WIN32

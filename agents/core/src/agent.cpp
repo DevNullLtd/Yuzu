@@ -24,6 +24,7 @@ __declspec(allocate(".CRT$XCB"))
 #include <yuzu/agent/subprocess_runner.hpp>
 #include <yuzu/agent/trigger_engine.hpp>
 #include <yuzu/agent/updater.hpp>
+#include <yuzu/agent/update_signature_mode.hpp>
 #include <yuzu/metrics.hpp>
 #include <yuzu/secure_zero.hpp>
 #include <yuzu/version.hpp>
@@ -2479,6 +2480,18 @@ public:
                                 tags["yuzu.ota_signature_refused"] =
                                     std::to_string(static_cast<int64_t>(refused));
                             }
+                            // #5249: the OTA update-signature mode this process
+                            // enforces (off / bundle / bundle+require), so the
+                            // fleet can find agents that are NOT verifying update
+                            // signatures. Without it, an agent whose bundle flag
+                            // was dropped or misspelt looks exactly like an
+                            // enforcing one: the refusal tag above stays 0 either
+                            // way. Same two Config fields the Updater is built
+                            // from, so the tag cannot disagree with enforcement.
+                            yuzu::agent::emit_update_signature_mode_tag(
+                                tags,
+                                UpdateConfig{.signature_trust_bundle = cfg_.update_trust_bundle,
+                                             .require_signature = cfg_.update_require_signature});
                             tags["yuzu.os"] = kAgentOs;
                             tags["yuzu.arch"] = kAgentArch;
                             tags["yuzu.agent_version"] = std::string{yuzu::kFullVersionString};

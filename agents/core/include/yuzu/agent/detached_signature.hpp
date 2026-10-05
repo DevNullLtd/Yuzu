@@ -58,7 +58,15 @@ namespace yuzu::agent {
 /// the heartbeat. Those were two hardcoded lists, so a fourth reason would have
 /// been counted by neither the tag nor the fleet gauge derived from it — a new
 /// failure mode that is invisible by construction.
-inline constexpr std::string_view kSignatureRefusalReasons[] = {"missing", "untrusted", "invalid"};
+///
+/// `bundle_unreadable` (#5249) is the AGENT'S OWN trust bundle failing to load
+/// (missing, unreadable, or not a PEM certificate bundle). It was previously
+/// counted as `untrusted`, which made the rc1-rc5 Windows installer ACL bug
+/// (#5196) indistinguishable from a genuinely untrusted signer. Appended, never
+/// reordered: the heartbeat sums over this array, so order is not load-bearing,
+/// but a reason must never be removed while an agent can still emit it.
+inline constexpr std::string_view kSignatureRefusalReasons[] = {"missing", "untrusted", "invalid",
+                                                                "bundle_unreadable"};
 
 /// Upper bound on a detached signature read from a FILE by this binary.
 ///
@@ -82,10 +90,34 @@ enum class CmsFailure {
     /// The signature is malformed, or the digest does not cover this file.
     kInvalid,
     /// The signer's certificate does not chain to the trust bundle, or does not
-    /// carry the codeSigning EKU, or the bundle itself could not be read (an
-    /// unreadable bundle proves nothing, so it is a trust failure, not a pass).
+    /// carry the codeSigning EKU.
     kUntrusted,
+    /// The configured trust bundle itself could not be loaded — missing,
+    /// unreadable, or holding no usable PEM certificate (#5249). Still a REFUSAL:
+    /// an unreadable bundle proves nothing, so this fails CLOSED exactly as
+    /// `kUntrusted` does. It is a separate kind only so the operator is pointed
+    /// at a local configuration fault (the file, its path, its permissions)
+    /// rather than at the signer's certificate chain. A caller with no separate
+    /// reason for it maps it onto its own "untrusted" reason (plugin_loader.cpp),
+    /// never onto a pass.
+    kBundleUnreadable,
 };
+
+/// The `yuzu_agent_ota_signature_refused_total{reason}` label for a verifier
+/// failure. One mapping, so the updater's counter and log line cannot disagree
+/// about which reason a failure is; every value it returns is a member of
+/// `kSignatureRefusalReasons` (pinned by a test).
+[[nodiscard]] constexpr std::string_view signature_refusal_reason(CmsFailure kind) noexcept {
+    switch (kind) {
+    case CmsFailure::kInvalid:
+        return "invalid";
+    case CmsFailure::kUntrusted:
+        return "untrusted";
+    case CmsFailure::kBundleUnreadable:
+        return "bundle_unreadable";
+    }
+    return "invalid"; // unreachable for a valid enumerator; never a pass either way
+}
 
 struct CmsVerifyError {
     CmsFailure kind;
@@ -128,5 +160,18 @@ verify_detached_cms(const std::filesystem::path& artifact_path, std::string_view
 [[nodiscard]] YUZU_EXPORT std::optional<CmsVerifyError>
 verify_detached_cms_fd(int artifact_fd, std::string_view signature_pem,
                        const std::filesystem::path& trust_bundle_path);
+
+/// Load `trust_bundle_path` exactly as the verifier does, and report why it
+/// could not be loaded — `std::nullopt` when it loads.
+///
+/// For STARTUP REPORTING ONLY (#5249): the agent warns at boot when its update
+/// trust bundle is configured but unusable, instead of the operator learning it
+/// from the first refused update hours later. It goes through the SAME loader as
+/// `verify_detached_cms*`, so "loadable" here means precisely "the verifier
+/// would get past its first check" — not a separate, weaker readability test
+/// that could disagree with it. It is NOT a gate and grants nothing: every
+/// verification re-loads the bundle and fails closed on its own.
+[[nodiscard]] YUZU_EXPORT std::optional<std::string>
+probe_trust_bundle(const std::filesystem::path& trust_bundle_path);
 
 } // namespace yuzu::agent

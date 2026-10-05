@@ -6,6 +6,8 @@
 #include <cstdio> // SEEK_SET / SEEK_CUR
 #include <limits>
 #include <memory>
+#include <string>
+#include <system_error>
 
 #ifdef _WIN32
 #include <io.h> // _lseeki64
@@ -79,18 +81,53 @@ DrainedErrors drain_openssl_errors() {
     return out;
 }
 
-openssl_ptr<X509_STORE> load_trust_store(const std::filesystem::path& bundle_path) {
+/// Why load_trust_store() returned no store.
+struct TrustStoreError {
+    /// True when the BUNDLE FILE is the problem (missing, unreadable, no usable
+    /// PEM certificate) — reported as CmsFailure::kBundleUnreadable (#5249).
+    /// False for an internal OpenSSL failure unrelated to the file (allocation,
+    /// setting the purpose), which stays CmsFailure::kUntrusted.
+    bool bundle_fault{false};
+    std::string detail;
+};
+
+/// A one-line, operator-facing reason the bundle FILE failed to load.
+///
+/// The filesystem probe runs only AFTER OpenSSL has already refused the file, to
+/// name the commonest causes plainly ("not found" rather than an OpenSSL
+/// system-library error string). It decides nothing — the refusal has already
+/// happened — so the gap between OpenSSL's open and this stat is irrelevant.
+std::string describe_bundle_fault(const std::filesystem::path& bundle_path,
+                                  const std::string& openssl_text) {
+    std::error_code ec;
+    const auto st = std::filesystem::status(bundle_path, ec);
+    std::string what;
+    if (st.type() == std::filesystem::file_type::not_found)
+        what = "not found";
+    else if (!ec && st.type() != std::filesystem::file_type::regular)
+        what = "not a regular file";
+    else
+        what = "not readable, or holds no PEM certificate";
+    std::string out = "trust bundle '" + bundle_path.string() + "' " + what;
+    if (!openssl_text.empty())
+        out += " (" + openssl_text + ")";
+    return out;
+}
+
+openssl_ptr<X509_STORE> load_trust_store(const std::filesystem::path& bundle_path,
+                                         TrustStoreError& err) {
     openssl_ptr<X509_STORE> store{X509_STORE_new()};
-    if (!store)
+    if (!store) {
+        err = {false, "cannot allocate X509 store: " + drain_openssl_errors().text};
         return nullptr;
+    }
 
     // X509_STORE_load_locations interprets a *file* parameter as one or more
     // concatenated PEM certs — exactly the format we promise the operator. The
     // third arg (path) lets OpenSSL also accept a hashed dir; we only support a
     // single bundle file today, so pass nullptr.
     if (X509_STORE_load_locations(store.get(), bundle_path.string().c_str(), nullptr) != 1) {
-        spdlog::error("Failed to load signature trust bundle '{}': {}", bundle_path.string(),
-                      drain_openssl_errors().text);
+        err = {true, describe_bundle_fault(bundle_path, drain_openssl_errors().text)};
         return nullptr;
     }
     // Signing certs MUST carry EKU=codeSigning (RFC 5280 §4.2.1.12). Setting the
@@ -102,7 +139,7 @@ openssl_ptr<X509_STORE> load_trust_store(const std::filesystem::path& bundle_pat
     // S/MIME from one root) becomes a signing authority too. Fixed in plugin
     // governance hardening round 1 (sec-LOW-2 / UP-8); preserved in the lift.
     if (X509_STORE_set_purpose(store.get(), X509_PURPOSE_CODE_SIGN) != 1) {
-        spdlog::error("Failed to set X509 purpose to codeSigning: {}", drain_openssl_errors().text);
+        err = {false, "cannot set X509 purpose to codeSigning: " + drain_openssl_errors().text};
         return nullptr;
     }
     return store;
@@ -123,12 +160,18 @@ std::optional<CmsVerifyError> verify_with_content_bio(BIO* content_bio,
     // return value, never from the queue. This only keeps the REASON honest.
     ERR_clear_error();
 
-    auto store = load_trust_store(trust_bundle_path);
+    TrustStoreError store_err;
+    auto store = load_trust_store(trust_bundle_path, store_err);
     if (!store) {
         // Bundle unreadable → we cannot prove anything, so refuse to trust.
         // Operator misconfiguration must surface, not silently pass artifacts
-        // through.
-        return CmsVerifyError{CmsFailure::kUntrusted, "trust bundle unreadable"};
+        // through. FAIL CLOSED is the invariant; the kind only says WHERE to look
+        // (#5249): the bundle file itself (kBundleUnreadable), or an internal
+        // OpenSSL failure unrelated to it (kUntrusted, as before). Both refuse.
+        spdlog::error("Failed to load signature trust bundle: {}", store_err.detail);
+        return CmsVerifyError{store_err.bundle_fault ? CmsFailure::kBundleUnreadable
+                                                     : CmsFailure::kUntrusted,
+                              store_err.detail};
     }
 
     if (signature_pem.empty())
@@ -181,6 +224,19 @@ std::optional<CmsVerifyError> verify_with_content_bio(BIO* content_bio,
 }
 
 } // namespace
+
+std::optional<std::string> probe_trust_bundle(const std::filesystem::path& trust_bundle_path) {
+    // Same queue discipline as the verifier: clear on entry so a stale entry
+    // from another OpenSSL user cannot leak into this detail, and on exit so we
+    // leave nothing behind for the next one.
+    ERR_clear_error();
+    TrustStoreError err;
+    auto store = load_trust_store(trust_bundle_path, err);
+    ERR_clear_error();
+    if (store)
+        return std::nullopt;
+    return err.detail;
+}
 
 std::optional<CmsVerifyError> verify_detached_cms(const std::filesystem::path& artifact_path,
                                                   std::string_view signature_pem,

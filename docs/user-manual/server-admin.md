@@ -3155,7 +3155,13 @@ for the X509 string finds nothing. Two-tier PKIs are the normal enterprise case,
 so this is easy to hit.
 
 **Diagnosing a rejection.** The agent logs either `untrusted chain` or
-`invalid signature`. Be aware that a certificate-*profile* problem — a
+`invalid signature` — or, when its own trust bundle cannot be loaded at all
+(missing, unreadable by the agent's account, or not a PEM certificate file),
+`the update trust bundle could not be loaded, so the signature was not checked`,
+counted as `reason="bundle_unreadable"`. That last one is a fault on the
+endpoint, not in your signing; fix the bundle file or its permissions. Agents
+before 0.14.1 reported it as `untrusted chain` (#5249). Be aware that a
+certificate-*profile* problem — a
 non-critical keyUsage, a missing codeSigning EKU, a missing intermediate — is
 reported as `untrusted chain`, the same as a genuinely wrong CA. Check the
 profile above before concluding the trust bundle is wrong. Verify a certificate
@@ -3232,6 +3238,18 @@ Every flag below has the environment variable shown beside it:
 Setting `--update-require-signature` **without** a trust bundle refuses to start,
 rather than running with enforcement silently inert.
 
+**Confirming what an agent loaded.** At startup the agent logs the mode it is
+enforcing and the bundle path, for example
+`OTA update signature mode: bundle+require (trust bundle: /etc/yuzu-agent/certs/update-trust-bundle.pem)`,
+or `OTA update signature mode: off (…update binaries are NOT signature-checked)`
+when no bundle is set. It logs a warning beside it if the bundle is set but cannot
+be loaded, and a warning naming any environment variable that starts with
+`YUZU_UPDATE_` but is not one it reads, so a misspelt name no longer passes
+silently. The same mode (`off`, `bundle` or `bundle+require`) travels on every
+heartbeat as the status tag `yuzu.ota_signature_mode` (see
+[metrics.md → Agent-side signature refusals](metrics.md#agent-side-signature-refusals-4163807)).
+These signals arrived in 0.14.1 (#5249); an older agent logs none of them.
+
 #### Windows: the service's `Environment` value
 
 The Service Control Manager merges a service's `Environment` value into the
@@ -3260,8 +3278,10 @@ Get these right, because several mistakes are silent:
   tool must write the value as a properly terminated multi-string too, every
   entry in `name=value` form and **no empty entry**: the service sees nothing
   after an empty entry.
-- **Names must be exact.** A misspelt name is ignored without any error, and
-  signing then stays off. Run the check below after every change.
+- **Names must be exact.** A misspelt name does not stop the agent, and signing
+  then stays off. From 0.14.1 the agent logs a warning at startup naming any
+  `YUZU_UPDATE_` variable it does not read, and logs the mode it loaded; check
+  that line, or run the check below, after every change.
 - **Set `YUZU_UPDATE_REQUIRE_SIGNATURE` to `1`.** The check below requires exactly
   that. A value the agent cannot read as on or off, such as `enabled` or `1`
   followed by a space, stops it at startup.
@@ -3295,7 +3315,15 @@ CONFIGURED. It prints `OK` and exits 0 only when all of these hold:
   exactly the ones for the stage set on its first line, with no duplicates (other
   variables are ignored);
 - the bundle file exists;
-- the binary path carries neither signing flag, in either form.
+- the binary path carries neither signing flag, in either form;
+- no environment entry whose name contains a non-ASCII character, no
+  `YUZU_UPDATE_` entry containing one, and no non-ASCII character in the binary
+  path. Windows can convert a lookalike character to a plain one (an ANSI
+  "best-fit" mapping) when it hands the service its environment and command
+  line, so a name or flag this check does not recognise could still reach the
+  agent as a real option;
+- `$stage` is `1` or `2`. Any other value reports `NOT CONFIGURED` rather than
+  silently checking stage 1.
 
 Otherwise it prints `NOT CONFIGURED` and exits 1. Save it as a `.ps1` and run that,
 or use it as a configuration-management compliance script, comparing its output
@@ -3304,23 +3332,37 @@ window.
 
 ```powershell
 $stage = 1   # 2 once the endpoint also refuses unsigned packages
+if ($stage -notin 1, 2) { 'NOT CONFIGURED'; exit 1 }
 $b = 'C:\ProgramData\Yuzu\agent-certs\update-trust-bundle.pem'
 $want = @("YUZU_UPDATE_TRUST_BUNDLE=$b") + @(if ($stage -eq 2) { 'YUZU_UPDATE_REQUIRE_SIGNATURE=1' })
 $k = Get-ItemProperty HKLM:\SYSTEM\CurrentControlSet\Services\YuzuAgent
 $have = @($k.Environment | Where-Object { $_ -match '^YUZU_UPDATE_(TRUST_BUNDLE|REQUIRE_SIGNATURE)=' })
-$ok = ($k.Environment -is [string[]]) -and -not ($k.Environment -contains '') -and ($have.Count -eq $want.Count) -and (@($want | Where-Object { $have -notcontains $_ }).Count -eq 0) -and (($k.ImagePath -replace '"', '') -notmatch '(--|/)update-(trust-bundle|require-signature)') -and (Test-Path -LiteralPath $b -PathType Leaf)
+$na = '[^\x20-\x7E]'
+$lookalike = @($k.Environment | Where-Object { (($_ -split '=', 2)[0] -cmatch $na) -or (($_ -match '^YUZU_UPDATE_') -and ($_ -cmatch $na)) }).Count -gt 0 -or ([string]$k.ImagePath -cmatch $na)
+$ok = ($k.Environment -is [string[]]) -and -not ($k.Environment -contains '') -and -not $lookalike -and ($have.Count -eq $want.Count) -and (@($want | Where-Object { $have -notcontains $_ }).Count -eq 0) -and (($k.ImagePath -replace '"', '') -notmatch '(--|/)update-(trust-bundle|require-signature)') -and (Test-Path -LiteralPath $b -PathType Leaf)
 if ($ok) { 'OK'; exit 0 } else { 'NOT CONFIGURED'; exit 1 }
 ```
 
+`-cmatch` (case-sensitive) is deliberate in the non-ASCII test: a case-insensitive
+match can fold some non-ASCII characters, such as the Kelvin sign, onto ASCII
+letters and let them through.
+
 **What `OK` does and does not mean.** It means the service is configured the way
-this section describes. It is not proof that the agent loaded that configuration,
-because the agent does not yet log its signing mode at startup, and it assumes an
-agent recent enough to have these options (`yuzu-agent.exe --help` lists
-`--update-trust-bundle`). It does not check the other entries' contents, only that
-none is empty, and it compares names case-insensitively, so type them in plain ASCII. It also does not
-check that the bundle file holds the right certificates: a wrong bundle makes the
-agent refuse signed updates, which shows in
-`yuzu_agent_ota_signature_refused_total` and the agent log.
+this section describes. It is not proof that the agent loaded that configuration.
+For that, use the agent's own signal (0.14.1 and later, #5249): after restarting
+the service, its log starts with `OTA update signature mode: bundle` (stage 1) or
+`OTA update signature mode: bundle+require` (stage 2) and the bundle path, with
+no `trust bundle cannot be loaded` or `YUZU_UPDATE_` warning after it, and its
+heartbeat carries the same mode as the status tag `yuzu.ota_signature_mode`. An
+agent older than 0.14.1 logs none of this, so for it the script is the only check,
+and it assumes an agent recent enough to have these options (`yuzu-agent.exe --help`
+lists `--update-trust-bundle`). The script does not check the other entries'
+contents beyond the non-ASCII rule, only that none is empty, and it compares names
+case-insensitively, so type them in plain ASCII. It also does not check that the
+bundle file holds the right certificates: a wrong bundle makes the agent refuse
+signed updates, which shows in `yuzu_agent_ota_signature_refused_total` and the
+agent log (`untrusted chain`), while a bundle the agent cannot read at all is
+logged and counted separately (`reason="bundle_unreadable"`).
 
 ### The verifier's catastrophic invariants
 
@@ -3445,7 +3487,8 @@ reported agent version is advancing.
 **A refusing agent still cannot tell you WHY.** There is no status-report RPC on
 the update path, so the reason appears only in that endpoint's own log — the
 gauge tells you how many are affected, not what to fix. The strings to grep for
-are `untrusted chain` and `invalid signature`; an unsigned package logs
+are `untrusted chain`, `invalid signature`, and `trust bundle could not be loaded`
+(the agent's own bundle is missing or unreadable, #5249); an unsigned package logs
 `update package is unsigned and --update-require-signature is set` (`missing` is
 the metric label for that case, not text that appears in the log). Verify on a pilot
 group before a fleet-wide flip.

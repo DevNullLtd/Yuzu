@@ -1115,14 +1115,25 @@ described below.
 
 | Metric | Type | Meaning |
 |---|---|---|
-| `yuzu_agent_ota_signature_refused_total{reason}` | counter | An OTA package was refused for a signature reason. `reason` is a closed set: `missing` (no signature, with `--update-require-signature` set), `untrusted` (the signer does not chain to the configured trust bundle, or its leaf lacks the codeSigning EKU, or **the trust bundle itself could not be read** — an unreadable or missing bundle proves nothing, so it is counted as a trust failure rather than a pass, and is the most likely cause if this counter jumps on a host right after a config change), `invalid` (the signature is malformed, or does not cover these bytes). Cumulative for the life of the agent process. |
+| `yuzu_agent_ota_signature_refused_total{reason}` | counter | An OTA package was refused for a signature reason. `reason` is a closed set: `missing` (no signature, with `--update-require-signature` set), `untrusted` (the signer does not chain to the configured trust bundle, or its leaf lacks the codeSigning EKU), `invalid` (the signature is malformed, or does not cover these bytes), `bundle_unreadable` (the agent's own trust bundle is missing, cannot be read, or holds no PEM certificate, so the signature was never checked — still a refusal, since an unreadable bundle proves nothing, but a local configuration fault rather than a signer problem, and the most likely cause if this counter jumps on a host right after a config change or reinstall; counted as `untrusted` before #5249). Cumulative for the life of the agent process. |
 
-**How it reaches you.** The total across all three reasons is carried on the
+**How it reaches you.** The total across all four reasons is carried on the
 agent heartbeat as the status tag `yuzu.ota_signature_refused`, and the server
 derives `yuzu_fleet_ota_signature_refusing_agents` from it. Nothing else reads
 the tag. If you need per-reason detail for a specific endpoint, it is in that
 endpoint's own log — the update path has no status-report RPC, so the reason
 does not travel to the server.
+
+**Which mode an agent is in (#5249).** The heartbeat also carries the status tag
+`yuzu.ota_signature_mode`: `off` (no trust bundle — update binaries are not
+signature-checked at all), `bundle` (bundle set, unsigned packages still
+accepted), or `bundle+require` (unsigned packages refused). It is the mode the
+agent process loaded at startup, which the agent also logs as `OTA update
+signature mode: …`. A refusal counter of 0 does not mean an agent is verifying:
+an `off` agent never refuses anything. The server keeps the tag in its
+in-memory agent-health snapshot with the agent's other heartbeat tags; no fleet
+gauge, REST field or dashboard view reads it yet, so today the per-endpoint
+source of truth is that startup log line.
 
 ## Histogram buckets
 
