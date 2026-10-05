@@ -27,6 +27,7 @@
 -define(PENDING,  yuzu_gw_pending).
 -define(HB_HANDLER, yuzu_gw_heartbeat_binding_tests_events).
 -define(EVENTS_TAB, yuzu_gw_heartbeat_binding_tests_events_tab).
+-define(HOLDERS_TAB, yuzu_gw_heartbeat_binding_tests_holders_tab).
 -define(LOG_HANDLER, yuzu_gw_heartbeat_binding_tests_logs).
 -define(CTX_KEY, yuzu_test_conn_key).
 
@@ -123,6 +124,9 @@ setup() ->
     %% would not be the one the test reads from.
     catch ets:delete(?EVENTS_TAB),
     ?EVENTS_TAB = ets:new(?EVENTS_TAB, [named_table, public, ordered_set]),
+    %% Every holder() is recorded so the fixture teardown can reap it.
+    catch ets:delete(?HOLDERS_TAB),
+    ?HOLDERS_TAB = ets:new(?HOLDERS_TAB, [named_table, public, set]),
     catch telemetry:detach(?HB_HANDLER),
     ok = telemetry:attach_many(?HB_HANDLER,
                                [[yuzu, gw, heartbeat, rejected],
@@ -134,8 +138,10 @@ setup() ->
     Prev.
 
 cleanup(Prev) ->
+    reap_holders(),
     catch telemetry:detach(?HB_HANDLER),
     catch ets:delete(?EVENTS_TAB),
+    catch ets:delete(?HOLDERS_TAB),
     case Prev of
         {ok, V}   -> application:set_env(yuzu_gw, telemetry_gauge_interval_ms, V);
         undefined -> application:unset_env(yuzu_gw, telemetry_gauge_interval_ms)
@@ -156,7 +162,25 @@ uid(Prefix) ->
     iolist_to_binary([Prefix, "-", integer_to_list(erlang:unique_integer([positive]))]).
 
 holder() ->
-    spawn(fun() -> receive stop -> ok end end).
+    Pid = spawn(fun() -> receive stop -> ok end end),
+    true = ets:insert(?HOLDERS_TAB, {Pid}),
+    Pid.
+
+%% Fixture teardown: kill every holder this module spawned and wait until the
+%% registry's `all_agents' / per-agent pg groups no longer list one. A holder
+%% that outlives the module stays a member of the VM-wide pg group, where it
+%% never answers `yuzu_gw_agent' calls: a later module's `yuzu_gw_app:stop/1'
+%% would then spend a second per member in its drain loop.
+reap_holders() ->
+    Pids = try [P || {P} <- ets:tab2list(?HOLDERS_TAB)] catch error:badarg -> [] end,
+    Mons = [monitor(process, P) || P <- Pids],
+    [exit(P, kill) || P <- Pids],
+    [receive {'DOWN', M, process, _, _} -> ok after 5000 -> ok end || M <- Mons],
+    _ = wait_until(fun() ->
+            Members = try pg:get_members(yuzu_gw, all_agents) catch _:_ -> [] end,
+            [] =:= [P || P <- Pids, lists:member(P, Members)]
+        end, 5000),
+    ok.
 
 ctx_with(Key) ->
     ctx:set(ctx:background(), ?CTX_KEY, Key).
