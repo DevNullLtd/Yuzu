@@ -3511,9 +3511,9 @@ TEST_CASE("#4472: the engine exports an outstanding compensating teardown's age 
     CHECK(*before == 0);
 
     // Latch: two passes well past the deadline observe it once.
-    const auto far = std::chrono::steady_clock::now() + 3600s;
-    f.engine->spark_runtime_for_test()->expire_overdue_claims(far);
-    f.engine->spark_runtime_for_test()->expire_overdue_claims(far + 5s);
+    const auto far_future = std::chrono::steady_clock::now() + 3600s;
+    f.engine->spark_runtime_for_test()->expire_overdue_claims(far_future);
+    f.engine->spark_runtime_for_test()->expire_overdue_claims(far_future + 5s);
     {
         const auto tags = emit_tags(later);
         REQUIRE(tags.count("yuzu.guardian_compensation_pending_age_seconds") == 1);
