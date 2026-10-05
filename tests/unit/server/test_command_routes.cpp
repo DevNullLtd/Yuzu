@@ -28,17 +28,27 @@
 #include "dispatch_caller.hpp"
 #include "dispatch_destructive_gate.hpp"
 #include "event_bus.hpp"
+#include "offline_endpoint_store.hpp"
+#include "pg/pg_exec.hpp"
+#include "pg/pg_pool.hpp"
+#include "pg/pg_raii.hpp"
+
+#include "../test_helpers.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 #include <nlohmann/json.hpp>
 
 #include <yuzu/metrics.hpp>
 
+#include <libpq-fe.h>
+
 #include <array>
+#include <chrono>
 #include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 using namespace yuzu::server;
@@ -136,6 +146,13 @@ struct CommandHarness {
     bool audit_quarantine_throws = false;
     bool audit_unknown_plugin_throws = false;
     int emit_event_calls = 0;
+    // #5294: the OS set the classified command carries, and what the two
+    // per-OS audit seams were called with.
+    std::unordered_set<std::string> kill_switched_os;
+    std::vector<std::size_t> kill_switched_os_audit_counts;
+    int os_gate_unreadable_audit_calls = 0;
+    std::string os_gate_unreadable_audit_command_id;
+    std::string os_gate_unreadable_audit_plugin;
     int publish_calls = 0;
     int forward_gateway_calls = 0;
 
@@ -241,7 +258,7 @@ struct CommandHarness {
             cmd.set_command_id(command_id);
             cmd.set_plugin(plugin);
             cmd.set_action(action);
-            return ClassifiedCommandTestAccess::make(cmd);
+            return ClassifiedCommandTestAccess::make(cmd, kill_switched_os);
         };
         deps.make_containment_gate_fn = [this](const std::string&,
                                                const std::string&) -> ContainmentGate {
@@ -311,6 +328,18 @@ struct CommandHarness {
                 if (audit_unknown_plugin_throws)
                     throw std::runtime_error("audit_unknown_plugin_dispatch threw");
             };
+        deps.audit_kill_switched_os_dispatch_fn =
+            [this](std::string_view, const std::string&, const std::string&, const std::string&,
+                   const std::string&, std::size_t count) {
+                kill_switched_os_audit_counts.push_back(count);
+            };
+        deps.audit_os_gate_unreadable_fn = [this](const std::string&, const std::string&,
+                                                  const std::string& command_id,
+                                                  const std::string& plugin) {
+            ++os_gate_unreadable_audit_calls;
+            os_gate_unreadable_audit_command_id = command_id;
+            os_gate_unreadable_audit_plugin = plugin;
+        };
         deps.audit_scope_resolution_failed_fn =
             [](const std::string&, const std::string&, const std::string&,
               const std::string&) {};
@@ -343,6 +372,33 @@ void grant_visibility(ManagementGroupStore& mg, std::initializer_list<std::strin
     ra.role_name = "ITServiceOwner";
     REQUIRE(mg.assign_role(ra).has_value());
 }
+
+// #5294: same-named template as test_os_kill_switch_dispatch_gate.cpp (the
+// registry builds each NAME once; the setup must stay identical).
+yuzu::test::PgTestTemplate os_presence_tpl{"os_kill_switch_presence", [](const std::string& dsn) {
+    yuzu::server::pg::PgPool pool{{.conninfo = dsn, .size = 1}};
+    OfflineEndpointStore store{pool};
+    if (!store.is_open())
+        throw std::runtime_error("os_kill_switch_presence template: store failed to migrate");
+}};
+
+/// Holds ACCESS EXCLUSIVE on the presence table so a presence read with a
+/// short lock timeout degrades deterministically (the #4981 PR-1 recipe).
+struct PresenceLocker {
+    yuzu::server::pg::PgConn conn;
+    explicit PresenceLocker(const std::string& dsn) : conn{PQconnectdb(dsn.c_str())} {
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        REQUIRE(yuzu::server::pg::exec_params(conn.get(), "BEGIN", std::vector<std::string>{})
+                    .status() == PGRES_COMMAND_OK);
+        REQUIRE(yuzu::server::pg::exec_params(
+                    conn.get(), "LOCK TABLE endpoint_state.endpoints IN ACCESS EXCLUSIVE MODE",
+                    std::vector<std::string>{})
+                    .status() == PGRES_COMMAND_OK);
+    }
+    ~PresenceLocker() {
+        (void)yuzu::server::pg::exec_params(conn.get(), "ROLLBACK", std::vector<std::string>{});
+    }
+};
 
 } // namespace
 
@@ -637,6 +693,111 @@ TEST_CASE("/api/command: audit_unknown_plugin_dispatch throwing still returns 20
     CHECK(res->status == 200);
     auto j = nlohmann::json::parse(res->body);
     CHECK(j.contains("command_id"));
+}
+
+// #5294: a classified command carrying a switched-off OS withholds exactly the
+// targets of that OS; the route reports the count and audits it once.
+TEST_CASE("/api/command: targets on a kill-switched OS are withheld and counted",
+          "[command_routes][5294]") {
+    CommandHarness h;
+    auto win = make_agent_info("windows-agent");
+    win.mutable_platform()->set_os("windows");
+    (void)h.registry.register_agent(win);
+    h.kill_switched_os = {"windows"};
+
+    auto res = h.sink.Post(
+        "/api/command",
+        R"({"plugin":"noop","action":"run","agent_ids":["windows-agent","dev-B"]})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto j = nlohmann::json::parse(res->body);
+    CHECK(j["withheld_kill_switched_os"] == 1);
+    CHECK(h.send_to_ids_called == std::vector<std::string>{"dev-B"});
+    CHECK(h.kill_switched_os_audit_counts == std::vector<std::size_t>{1});
+}
+
+TEST_CASE("/api/command: only kill-switched-OS targets reports 503 reason=kill_switched_os",
+          "[command_routes][5294]") {
+    CommandHarness h;
+    auto win = make_agent_info("windows-agent");
+    win.mutable_platform()->set_os("windows");
+    (void)h.registry.register_agent(win);
+    h.kill_switched_os = {"windows"};
+
+    auto res = h.sink.Post("/api/command",
+                           R"({"plugin":"noop","action":"run","agent_ids":["windows-agent"]})");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    auto j = nlohmann::json::parse(res->body);
+    CHECK(j["error"]["reason"] == "kill_switched_os");
+    CHECK(j["error"]["retry_after_ms"].is_null());
+    CHECK(h.send_to_ids_called.empty());
+    CHECK(h.kill_switched_os_audit_counts == std::vector<std::size_t>{1});
+}
+
+// #5294: presence unreadable while a per-OS switch is OFF fails the whole
+// dispatch closed -- 503 os_gate_unreadable, retryable, nothing sent, the
+// send-time entry discarded, one audit row, no per-OS withheld audit.
+TEST_CASE("/api/command: unreadable presence with a per-OS switch OFF refuses 503 "
+          "reason=os_gate_unreadable",
+          "[pg][command_routes][5294]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, os_presence_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 2, .lock_timeout_ms = 100}};
+    REQUIRE(pool.valid());
+    OfflineEndpointStore store{pool};
+    REQUIRE(store.is_open());
+
+    CommandHarness h;
+    h.registry.configure_presence(&store, std::chrono::hours(1));
+    auto win = make_agent_info("windows-agent");
+    win.mutable_platform()->set_os("windows");
+    (void)h.registry.register_agent(win);
+    h.kill_switched_os = {"windows"};
+
+    PresenceLocker locker{db.dsn()};
+    auto res = h.sink.Post("/api/command",
+                           R"({"plugin":"noop","action":"run","agent_ids":["windows-agent"]})");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    auto j = nlohmann::json::parse(res->body);
+    CHECK(j["error"]["reason"] == "os_gate_unreadable");
+    CHECK(j["error"]["retry_after_ms"] == 5000);
+    CHECK(h.send_to_ids_called.empty());
+    CHECK(h.discard_send_time_called);
+    CHECK(h.kill_switched_os_audit_counts.empty());
+    CHECK(h.os_gate_unreadable_audit_calls == 1);
+    CHECK(h.os_gate_unreadable_audit_plugin == "noop");
+}
+
+// #5294: both gates unreadable at once -- the fail-closed containment gate
+// already withholds every id, so it is the reported cause and the per-OS
+// presence read (and its audit row) is skipped.
+TEST_CASE("/api/command: a fail-closed containment gate outranks unreadable presence "
+          "(reason=containment_unreadable, no os_gate_unreadable audit)",
+          "[pg][command_routes][5294]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, os_presence_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 2, .lock_timeout_ms = 100}};
+    REQUIRE(pool.valid());
+    OfflineEndpointStore store{pool};
+    REQUIRE(store.is_open());
+
+    CommandHarness h;
+    h.registry.configure_presence(&store, std::chrono::hours(1));
+    auto win = make_agent_info("windows-agent");
+    win.mutable_platform()->set_os("windows");
+    (void)h.registry.register_agent(win);
+    h.kill_switched_os = {"windows"};
+    h.containment_fail_closed = true;
+
+    PresenceLocker locker{db.dsn()};
+    auto res = h.sink.Post("/api/command",
+                           R"({"plugin":"noop","action":"run","agent_ids":["windows-agent"]})");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    auto j = nlohmann::json::parse(res->body);
+    CHECK(j["error"]["reason"] == "containment_unreadable");
+    CHECK(h.send_to_ids_called.empty());
+    CHECK(h.os_gate_unreadable_audit_calls == 0);
 }
 
 TEST_CASE("/api/command: audit_quarantine_dispatch_denied_batch throwing still returns 200 "
