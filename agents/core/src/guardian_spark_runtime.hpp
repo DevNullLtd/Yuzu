@@ -882,7 +882,7 @@ public:
     /// mapping, index_held && owns()) whose mapping the expiry reaper released and
     /// popped. A non-owner claim or a committed suffix popped by the same pass is not
     /// counted. Runtime-only, NOT exported on the heartbeat yet (that export is owned
-    /// by the #5168 tags PR). Lock-free.
+    /// by #5404). Lock-free.
     [[nodiscard]] std::uint64_t tombstones_released_by_reaper() const noexcept {
         return tombstones_released_by_reaper_.load(std::memory_order_relaxed);
     }
@@ -1618,7 +1618,7 @@ public:
     /// commit_exception set) yet still hold a genuine ghost index mapping
     /// (index_held && index_->owns(key, rule_id, generation)). A live gauge under
     /// registry_mu_ by scanning claims_; runtime-only, NOT exported on the heartbeat
-    /// yet (owned by the #5168 tags PR). Diagnostic/test use, not a hot-path read.
+    /// yet (tracked in #5404). Diagnostic/test use, not a hot-path read.
     [[nodiscard]] std::size_t retained_tombstones() const;
     /// #5322 TEST-ONLY diagnostic (no production caller): the registry's cross-structure
     /// invariants, one human-readable line per violation, empty when all hold. Takes

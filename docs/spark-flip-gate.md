@@ -695,8 +695,8 @@ flip, with a red-first test each:
   - Observability: new runtime accessors `retained_tombstones()` (live gauge),
     `tombstones_released_by_reaper()`, `orphan_disarms_started()` and
     `dead_watchers_erased_on_lost()`. Their heartbeat export is not done by this fix: the accessors'
-    own header comments assign it to "the #5168 tags PR", for which no issue is cited (issue to be
-    filed before merge; see the pre-flip rows below). A test-only
+    own header comments formerly assigned it to "the #5168 tags PR" (a closed issue); the work is now
+    tracked in #5404 (see the pre-flip rows below). A test-only
     `invariant_violations_for_test()` checks the registry's cross-structure invariants and has no
     production caller.
   - A retained owner tombstone that holds an orphan key's last mapping can still reach
@@ -710,12 +710,12 @@ flip, with a red-first test each:
       (`set_index_remove_fault_for_test`) produces one. The #4605 commit-time ownership filter is the
       part of this fix that production code can reach.
     - S1 last-attach-wins and the adjacent stale-adoption case (see the #4605 bullet below): a
-      recorded follow-up, issue to be filed before merge.
+      recorded follow-up, tracked in #5401.
     - The `dispatch_arm_off_lock` entry-guard hand-back (a withdrawn or commit-exception claim handed
       back to `Queued`) does not drive the clean follower behind it: the follower waits for the next
       sweep that reaches the key (`redrive_parked_arms`' sweep-before-adopt on the ~5 s convergence
       lane, or the reaper on the ~30 s heartbeat) and ends `CongestionExpired` if its own claim
-      deadline passes first. Issue to be filed before merge.
+      deadline passes first. Tracked in #5402.
     - The orphan pass runs on the ~30 s heartbeat, inside `expire_overdue_claims()` (called from the
       ack-ledger drain under the engine's lock), after the reaper in one `registry_mu_` critical
       section; it is not on the ~5 s convergence lane. Rationale: it shares the reaper's locks and
@@ -730,7 +730,7 @@ flip, with a red-first test each:
       as any retained Disarm dropped at stop.
     - An orphan Disarm whose backend disarm never returns stays at its key's head and queues any
       later same-key arm behind it: `submit()` has no deadline, neither the overdue scan nor the
-      reaper touches a Disarm claim, and no age gauge exists. Issue to be filed before merge.
+      reaper touches a Disarm claim, and no age gauge exists. Tracked in #5403.
     - A throw out of `expire_overdue_claims()` (it is not noexcept) is caught by the engine's
       maintenance firewall, counted in `ack_maint_exceptions_` (no accessor, not exported), and skips
       the rest of that tick's ack drain, including the reaper and the orphan pass when the throw
@@ -757,9 +757,9 @@ flip, with a red-first test each:
       `detach_claim_failures()`. Steady-state expectation for the first three is 0 outside a
       failing index release; `claims_dropped_at_stop()` counts shutdown drops only.
     - (P2) Export `ack_maint_exceptions_` (it has no accessor yet).
-    - (P3) Add an oldest-pending-Disarm age gauge, so a hung orphan Disarm is visible.
-    - (P4) File and cite an issue for the heartbeat-tag export work: the accessors' header comments
-      name "the #5168 tags PR", and no issue is cited for it. Issue to be filed before merge.
+    - (P3) Add an oldest-pending-Disarm age gauge, so a hung orphan Disarm is visible (#5403).
+    - (P4) The heartbeat-tag export work is tracked in #5404 (the accessors' header comments formerly
+      named "the #5168 tags PR", a closed issue).
 - **FIXED by the #4605/#5322/#5323 fix on branch `fix/4605-5322-claim-tombstone-state` (PR number to
   be added at open) (was RECORDED, not flip-gating unless Dave rules otherwise; added
   2026-10-03)**: #5323,
