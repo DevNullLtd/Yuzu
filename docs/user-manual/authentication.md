@@ -8,6 +8,8 @@ Yuzu supports multiple authentication methods: local password auth with session 
 
 On first launch, the server prompts interactively for admin credentials. These are stored in `yuzu-server.cfg` with PBKDF2-hashed passwords.
 
+> **The config file is a seed, not the password store.** On the first boot against an empty PostgreSQL `auth` schema the server provisions the config file's admin into the AuthDB (`auth.users`). From then on the AuthDB row is the only credential that is checked at login: editing a hash in `yuzu-server.cfg` (or regenerating the file) no longer changes an existing account's password (#5274). Change or reset passwords in the product instead — see [Changing and resetting a local password](#changing-and-resetting-a-local-password).
+
 ```
 $ ./yuzu-server
 No admin account found. Let's create one.
@@ -45,6 +47,36 @@ curl -s -b cookies.txt http://localhost:8080/api/v1/me
 ```
 
 All REST API v1 responses are wrapped in this envelope. The `data` key holds the payload, and `meta` contains the API version. List endpoints also include a `pagination` key.
+
+### Changing and resetting a local password
+
+Local accounts (created in Settings → User Management, by `POST /api/settings/users`, or the first administrator provisioned from the config file on first boot) have a password that can be changed in the product (#5342). SSO accounts (OIDC/SAML principals) and SCIM-provisioned accounts have no local password; their credentials are managed at the identity provider, and both routes below refuse them with `409` "not a local account". (The second account first-run setup offers, and the Windows installer's `/OPERATOR_USER`, are written to the config file only and never provisioned into the auth store, so they cannot sign in — #5343.)
+
+**`yuzu-server.cfg` does not change a password (#5274).** Login reads the PostgreSQL auth store only. The config file seeds the first administrator into an **empty** database and is otherwise ignored for credentials, so editing it, regenerating it, or re-running the Windows installer does not change an existing account's password (the installer refuses `/ADMIN_PASS` on an upgrade). Because it re-seeds an empty database, a rebuild onto a fresh database brings back the password the file holds — change it in the product afterwards.
+
+**Password policy.** A new password must be **12 to 1024 bytes** (UTF-8 bytes, not characters). The same bounds apply to account creation, and `/login` answers a password over 1024 bytes exactly like a wrong one, without hashing it.
+
+**Change your own password.** In the dashboard: Settings → User Management → **Change password** on your own row (current password, new password, confirmation). Over REST: `POST /api/v1/users/me/password` with `{"current_password": "...", "new_password": "..."}`. Only a signed-in **local** dashboard session can do this — an OIDC/SAML session gets `409`, and an API, MCP, engine or service-scoped token gets `403`. If your account has MFA enrolled, a fresh step-up proof is required (see below).
+
+- A wrong current password counts as a failed login attempt for [account lockout](server-admin.md#server-cli-flags), exactly like a wrong password at `/login`. Wrong password and locked account both answer `403` "current password is incorrect" — there is no lock-state oracle; the audit row records which it was. If the password could not be checked at all (the auth store could not be read, or the password changed at that moment), the answer is a retryable `503` and nothing counts toward lockout.
+- **The new password and the sign-out of every session of the account — including the one you are using, and on every server in an HA cluster — happen in one step**, together with the audit record: all of it is saved, or none of it. No replacement session is issued: the response clears your cookie and you sign in again with the new password (the dashboard sends you to the sign-in page). If the change is refused or fails, nothing changed and your session still works. An unfinished MFA enrolment (a TOTP secret issued but never confirmed) is discarded (except the narrow revoked-session window described as R14 in [docs/auth-architecture.md](../auth-architecture.md)); an enrolled second factor is kept. API tokens are not affected.
+- Under `--auth-mode=sso-only` only the configured break-glass account, and only while it is armed, can change its own password; any other local account — or the break-glass account once disarmed — gets `403` without its password being checked.
+
+**Reset another user's password (admin).** In the dashboard: Settings → User Management → **Reset password** on any other local account's row (new password and confirmation). Over REST: `POST /api/v1/users/{username}/password` with `{"new_password": "..."}`. It requires a **durable Administrator**, checked the same way as RBAC role assignment — not an ordinary permission:
+
+- With RBAC off, your own account (re-read from the auth store) must hold the `admin` role. An OIDC session whose admin role comes only from IdP group mapping does not qualify.
+- With RBAC on, you must hold an `Administrator` grant as a user principal. A group-held grant, a JIT elevation, or a custom role holding `UserManagement:Write` does not qualify.
+
+A caller who does not qualify gets `403` (`durable_admin_required`); if the stores cannot confirm your authority, `503`. The same rule applies whatever the target's role. The request must come from an interactive dashboard session — tokens of every kind are refused — and passes the shared MFA step-up gate (a fresh proof when you are MFA-enrolled; a SAML session is refused `403` there, as SAML has no MFA attestation yet).
+
+- You cannot reset your **own** password this way (`403`); use the change route above, which requires your current password.
+- You cannot reset the configured break-glass account (`403`): it is re-keyed out of band, or by signing in as it while armed and changing its own password.
+- In one step, all-or-nothing together with the audit record: the new password is written, every dashboard session of the target is signed out, an unfinished MFA enrolment is discarded (except the narrow revoked-session window described as R14 in [docs/auth-architecture.md](../auth-architecture.md)), and any lockout on the account is cleared (`lockout_cleared` is `true` only when there was a lockout to clear). A refused or failed reset changes nothing. **The target's API tokens are NOT revoked**; the response reports how many are still active (`api_tokens_active`, or `null` with `api_tokens_unknown` when it could not tell), and the dashboard toast says so.
+- **If the account may be compromised**, a reset alone is not enough: an attacker may hold an **enrolled** second factor (a reset deliberately keeps an enrolled TOTP secret and its recovery codes) and API tokens. Also clear MFA on the server host with `yuzu-server --mfa-reset <username>` (see [Emergency MFA disable](../ops-runbooks/auth-db-recovery.md#emergency-mfa-disable-break-glass)) and revoke the account's tokens with `DELETE /api/v1/tokens/{id}`. `--mfa-reset` removes the enrolled second factor and its recovery codes and leaves the account **password-only**: the user is walked through a fresh enrolment at their next sign-in only when `--mfa-enforcement` covers them (`required`, or `admin-only` for an admin account). Under the default `optional` nobody is prompted — an admin re-enrols in Settings → Multi-Factor Authentication, and a non-admin account has no self-service enrolment page (#5353), so it stays password-only until enforcement is turned on.
+
+**Both routes:** the request must come from the dashboard's own origin (`Origin`/`Referer` checked; `403` otherwise) with `Content-Type: application/json` (`415` otherwise); the password is never logged, audited or echoed back. Setting the **same** password as the current one is accepted: it is stored with a fresh salt and, like any change or reset, signs out every session of the account. The change is recorded as `user.password_change` (self) or `user.password_reset` (admin) in the same database transaction as the change: if that audit row cannot be written, nothing is changed and the request fails with `503` (`audit_unavailable`, `Sec-Audit-Failed: true`) — there is no "changed but unrecorded" state. A `503` from either route means nothing was changed unless the server lost contact with the database at the very moment of saving; a successful sign-in with the new password confirms the change, which is then audited too. There is deliberately **no MCP tool** for either action — see `rest-api.md` for the full contract and the parity exception (#5357 tracks a temporary-password reset tool).
+
+Non-admin users cannot open Settings, so for them the self-service change is REST-only today (`POST /api/v1/users/me/password` from a signed-in browser session; #5353 tracks a self-service account page).
 
 ### Multi-Factor Authentication (TOTP)
 
@@ -123,7 +155,7 @@ Every MFA state transition emits an audit row (`docs/user-manual/audit-log.md` l
 
 #### Step-up on high-risk surfaces (PR 2)
 
-Twenty-four REST + Settings endpoints (token mint/revoke/rotate/confirm, admin session revoke, software package create / deployment start, Guardian rule create/update/delete/push, the full engine-principal lifecycle — create/delete, credential mint/rotate/confirm, role grant/revoke, transfer-owner — account unlock, user delete, user role change, and the two JIT admin-elevation endpoints, which use the same gate with the step-up window floored to 300s so elevation always requires a fresh proof) require a fresh MFA proof on the calling session before the mutation lands. If the proof is older than `--mfa-step-up-window-secs`, the endpoint returns HTTP `401` with an A4 envelope:
+Twenty-six REST + Settings endpoints (token mint/revoke/rotate/confirm, admin session revoke, software package create / deployment start, Guardian rule create/update/delete/push, the full engine-principal lifecycle — create/delete, credential mint/rotate/confirm, role grant/revoke, transfer-owner — account unlock, local password change and admin password reset, user delete, user role change, and the two JIT admin-elevation endpoints, which use the same gate with the step-up window floored to 300s so elevation always requires a fresh proof) require a fresh MFA proof on the calling session before the mutation lands. If the proof is older than `--mfa-step-up-window-secs`, the endpoint returns HTTP `401` with an A4 envelope:
 
 ```json
 {

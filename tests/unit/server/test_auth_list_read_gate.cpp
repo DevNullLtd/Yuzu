@@ -93,7 +93,7 @@ struct ListReadGateFixture {
 
     httplib::Request session_request(const std::string& username, auth::Role role) {
         REQUIRE(auth_mgr.upsert_user(username, "password1234", role));
-        auto token = auth_mgr.create_local_session(username, role, /*mfa_verified=*/true);
+        auto token = auth_mgr.create_local_session_for_test(username, role, /*mfa_verified=*/true);
         httplib::Request req;
         req.headers.emplace("Cookie", "yuzu_session=" + token);
         return req;
@@ -103,7 +103,7 @@ struct ListReadGateFixture {
     /// MFA-step-up gates that route itself owns.
     httplib::Request elevated_session_request(const std::string& username) {
         REQUIRE(auth_mgr.upsert_user(username, "password1234", auth::Role::user));
-        auto token = auth_mgr.create_local_session(username, auth::Role::user,
+        auto token = auth_mgr.create_local_session_for_test(username, auth::Role::user,
                                                     /*mfa_verified=*/true);
         REQUIRE(auth_mgr.elevate_session(token, std::chrono::seconds(300)).has_value());
         httplib::Request req;
@@ -196,7 +196,7 @@ TEST_CASE("require_list_read — no rbac_store wired admits unfiltered (exact le
                  /*analytics_store=*/nullptr, oidc_mu, oidc_provider);
     REQUIRE(auth_mgr.upsert_user("plain_user", "password1234", auth::Role::user));
     auto token =
-        auth_mgr.create_local_session("plain_user", auth::Role::user, /*mfa_verified=*/true);
+        auth_mgr.create_local_session_for_test("plain_user", auth::Role::user, /*mfa_verified=*/true);
     httplib::Request req;
     req.headers.emplace("Cookie", "yuzu_session=" + token);
     httplib::Response res;
@@ -261,7 +261,7 @@ TEST_CASE("require_list_read — a DenyAll denial writes a real audit row (gover
                  /*analytics_store=*/nullptr, oidc_mu, oidc_provider);
 
     REQUIRE(auth_mgr.upsert_user("audited_no_grant_user", "password1234", auth::Role::user));
-    auto token = auth_mgr.create_local_session("audited_no_grant_user", auth::Role::user,
+    auto token = auth_mgr.create_local_session_for_test("audited_no_grant_user", auth::Role::user,
                                                /*mfa_verified=*/true);
     httplib::Request req;
     req.headers.emplace("Cookie", "yuzu_session=" + token);

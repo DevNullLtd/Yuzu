@@ -221,6 +221,16 @@ Every SAML and OIDC login attempt — success or failure — increments its prov
 | `yuzu_auth_saml_deprovisioned_denied_store_unavailable_total` | counter, no labels | #3069 — SAML analogue of `yuzu_auth_oidc_deprovisioned_denied_store_unavailable_total`: the login was refused because the `ScimStore` could not be reached, not because of a real deprovision (`decision.scim_id` absent). An availability signal, not a termination event — correlate with Postgres health. |
 | `yuzu_saml_group_cap_truncated_total` | counter, no labels | Bumped once per SAML login (not once per dropped group value) when the assertion's `groups` attribute exceeded the 200-value cap and real group values were dropped. A non-zero rate means some SAML-asserted group-based RBAC role mappings may not be taking effect for the affected principal — check the assertion's attribute statement. OIDC has no equivalent counter: OIDC group claims are bounded by JWT/ID-token size rather than a fixed value-count cap, so the two providers hit different limits and are not expected to have parity here. |
 
+## Local password metrics (#5342, #5274)
+
+| Metric | Type | Meaning |
+|---|---|---|
+| `yuzu_auth_password_changes_total{kind, result}` | counter | Outcomes of the two local-password routes. `kind` is `self` (`POST /api/v1/users/me/password`) or `admin` (`POST /api/v1/users/{name}/password`). `result` is `ok`; `denied` — one series for **every** refusal the route itself writes: a wrong or locked current password, `token_session`, `csrf`, `not_local`, `sso_only_local_disabled`, `durable_admin_required`, `self_target`, `break_glass_target`, `not_found`, `conflict`, and the not-audited malformed body, out-of-policy password and wrong `Content-Type`; or `error` — the auth store, RBAC store or session store could not be used (`store_unavailable`, `verify_transient`, `admin_gate_unavailable`) or the mandatory audit row could not be written (`audit_unavailable` — the change was then not made). **Not counted at all:** an unauthenticated request (`401`) and a refusal by the MFA step-up gate, which answer before the route's own logic. The paired audit actions `user.password_change` / `user.password_reset` carry the refusal reason that `denied` lumps together. A sustained rise in `kind="self",result="denied"` can indicate password guessing through the change route (wrong current passwords are counted there alongside the other refusals, and also count toward account lockout). All six `kind`/`result` series are pre-seeded to 0 at startup, so an `increase()` alert sees the first event. |
+| `yuzu_auth_cfg_credentials_stale` | gauge, no labels | Set once at boot: the number of `yuzu-server.cfg` accounts whose password hash differs from their row in the auth store (#5274). The config file only seeds an empty database, so those config-file passwords no longer sign in; the boot log names each account. Non-zero is expected after any in-product password change (the old hash stays in the file) and is a cue to remove or rotate the stale entries. `0` on a server without the Postgres auth store. |
+| `yuzu_auth_credential_changed_during_verify_total` | counter, no labels | A login (or other credential check) whose password verified, but the row-locked re-check found the stored hash had changed underneath it — a password change or reset committed mid-login. The check is treated as transient: `/login` answers `503` with `Retry-After` (no `auth.login_failed` row, no lockout strike), the self-change route `503 verify_transient`, and the user retries. Expected to be rare and bursty around password changes; a steady rate is unexplained credential churn. Pre-seeded to 0 at startup. |
+
+The self-service change route's lockout check shares `/login`'s instrumentation: a fail-closed auth-store refusal there — the lockout counter could not be recorded, or the account could not be read to verify the current password — increments `yuzu_auth_secret_unavailable_total{route="password_change"}` and `yuzu_auth_read_degrade_total{route="password_change",reason}` (both pre-seeded to 0); at `/login` the same read failure now answers `503` instead of a `401` with a lockout strike (see `docs/auth-architecture.md`, login/Postgres decoupling).
+
 ## SCIM deprovision-linkage metrics (ADR-2001, CC6.8)
 
 Two detective counters for the SCIM↔OIDC identity-link revoke seam — a SCIM
@@ -2161,13 +2171,19 @@ with no evidence of ever having been sent.
 ### Plugin load + signing rejections (`yuzu_agent_plugin_rejected_total`)
 
 Counter incremented every time the agent rejects a plugin at scan time
-**before** the plugin's code runs. The `reason` label is bounded to a
+**before** its `init` runs (the allowlist and signature checks run before the
+library is even loaded; the name checks run once the library is mapped and its
+declared name read). The counter is agent-local: the agent has no `/metrics`
+endpoint, so a refusal is visible in that host's agent log, not as a scrapeable
+series. The `reason` label is bounded to a
 fixed set of stable string prefixes — alert rules SHOULD pin against
 the literal label values, not substring matches.
 
 | Reason label | Meaning | Operator action |
 |---|---|---|
 | `reserved_name` | Plugin declared a reserved name (`__guard__`, `__system__`, `__update__`, `__guardian_journal__`, `__guardian__`, `__sync__`). Possible plugin-author error or a malicious shadowing attempt (#453; the `kv_store`-namespace names added in #2303). | Investigate the plugin source / drop. |
+| `invalid_name` | Plugin declared a name that is empty, longer than 64 bytes, or outside `[A-Za-z0-9_]` (#822). The offending name is deliberately not logged: a crafted name can carry control bytes. | Investigate the plugin source / drop; a crafted name is a possible malicious-load attempt. |
+| `duplicate_name` | A second file in the plugin directory declared a name another file in the same scan had already claimed; the first file the directory walk encountered keeps the name, the later file is rejected and immediately unloaded without its plugin init being called. | Remove the duplicate from `--plugin-dir` (two builds of one plugin); which copy wins is filesystem order, so do not rely on it. |
 | `load_failed` | `dlopen` / `LoadLibrary` failed, missing `yuzu_plugin_descriptor` export, or ABI version mismatch. | Check the agent log for the dlopen error and rebuild the plugin against the current SDK ABI. |
 | `signature_missing` | `--plugin-trust-bundle` is set, `--plugin-require-signature` is set, and a plugin has no `<plugin>.so.sig` sibling. | Sign the plugin, deploy the `.sig` alongside, or relax the require flag. |
 | `signature_invalid` | `.sig` file exists but the CMS verification failed at the signature/digest layer (most commonly: the plugin file was modified after signing). | Re-sign the plugin or investigate tampering. |

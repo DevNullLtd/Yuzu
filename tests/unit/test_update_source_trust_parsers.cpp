@@ -145,8 +145,9 @@ TEST_CASE("redact_url_userinfo strips credentials from every URL in a list",
     // A replaced byte can create a URL shape apt never saw (`http:<NUL>//u:pw@h/`),
     // so url_field drops everything up to the last '@' of any word it had to scrub.
     const std::string poisoned("http:\0//u:pw@h.example/x", sizeof("http:\0//u:pw@h.example/x") - 1);
-    CHECK(ust::url_field(poisoned).find("pw") == std::string::npos);
-    CHECK(ust::url_field(std::string("http://a.example/x\xff")) == "http://a.example/x?");
+    std::size_t n = 0;
+    CHECK(ust::url_field(poisoned, n).find("pw") == std::string::npos);
+    CHECK(ust::url_field(std::string("http://a.example/x\xff"), n) == "http://a.example/x?");
 }
 
 // ── apt one-line ─────────────────────────────────────────────────────────
@@ -512,6 +513,47 @@ TEST_CASE("apt_rows_from_text emits the exact apt_source wire row (deb822) and c
                      "/usr/share/keyrings/debian-archive-keyring.gpg|yes|unset|yes");
 }
 
+TEST_CASE("altered counts only replaced bytes that reach the wire (after redaction)",
+          "[update_source_trust][parsers][wire]") {
+    // A bad byte INSIDE the userinfo is redacted away before the scrub: not counted.
+    // MUTATION: counting the raw parsed facts (the old pre-count) reports altered 1.
+    {
+        std::vector<std::string> rows;
+        std::size_t altered = 0;
+        const std::string text = "deb http://user:pa\xff" "ss@host.example/debian bookworm main\n";
+        CHECK(ust::apt_rows_from_text("/etc/apt/sources.list", ust::AptFormat::one_line, text,
+                                      rows, &altered) == 0);
+        REQUIRE(rows.size() == 1);
+        CHECK(rows[0].find("http://REDACTED@host.example/debian") != std::string::npos);
+        CHECK(rows[0].find('?') == std::string::npos);
+        CHECK(altered == 0);
+    }
+    // The same byte AFTER the '@' survives redaction, is replaced and is counted once.
+    {
+        std::vector<std::string> rows;
+        std::size_t altered = 0;
+        const std::string text = "deb http://user:pass@host\xff.example/debian bookworm main\n";
+        CHECK(ust::apt_rows_from_text("/etc/apt/sources.list", ust::AptFormat::one_line, text,
+                                      rows, &altered) == 0);
+        REQUIRE(rows.size() == 1);
+        CHECK(rows[0].find("host?.example/debian") != std::string::npos);
+        CHECK(altered == 1);
+    }
+    // A NUL in an emitted field (components) is replaced and counted.
+    {
+        std::vector<std::string> rows;
+        std::size_t altered = 0;
+        std::string text = "Types: deb\nURIs: http://h.example/\nSuites: s\nComponents: ma";
+        text += '\0';
+        text += "in\n";
+        CHECK(ust::apt_rows_from_text("/etc/apt/x.sources", ust::AptFormat::deb822, text, rows,
+                                      &altered) == 0);
+        REQUIRE(rows.size() == 1);
+        CHECK(rows[0].find("|ma?in|") != std::string::npos);
+        CHECK(altered == 1);
+    }
+}
+
 TEST_CASE("apt_source row: credentials are redacted; pipes and backslashes cannot shift fields",
           "[update_source_trust][parsers][wire]") {
     ust::AptSourceFacts f;
@@ -643,12 +685,24 @@ bool reason_has(const yuzu::shared::ConstraintAccumulator& acc, std::string_view
     return acc.reason().find(token) != std::string::npos;
 }
 
+// The walk entry points take the walk's InputBudget; these cases do not exercise it.
+std::vector<std::string> fresh_apt_rows(const fs::path& root,
+                                        yuzu::shared::ConstraintAccumulator& acc) {
+    pio::InputBudget budget;
+    return lnx::apt_rows_at(root, acc, budget);
+}
+std::vector<std::string> fresh_linux_rows(const fs::path& root,
+                                          yuzu::shared::ConstraintAccumulator& acc) {
+    pio::InputBudget budget;
+    return lnx::linux_rows_at(root, acc, budget);
+}
+
 } // namespace
 
 TEST_CASE("apt_rows_at over the real debian:bookworm tree: deb822 rows + armored keyring",
           "[update_source_trust][walk][apt]") {
     yuzu::shared::ConstraintAccumulator acc;
-    const auto rows = lnx::apt_rows_at(linux_fixture_root("debian-bookworm"), acc);
+    const auto rows = fresh_apt_rows(linux_fixture_root("debian-bookworm"), acc);
     // No sources.list, no legacy trusted.gpg, empty /etc/apt/keyrings: all absent,
     // none of them a failure.
     CHECK_FALSE(acc.any_failure());
@@ -670,7 +724,7 @@ TEST_CASE("apt_rows_at over the real debian:bookworm tree: deb822 rows + armored
     // /etc/yum.repos.d is absent on the image, so nothing was skipped and the leg
     // reports supported. MUTATION: an unconditional `planned` token fails here.
     yuzu::shared::ConstraintAccumulator leg_acc;
-    CHECK(lnx::linux_rows_at(linux_fixture_root("debian-bookworm"), leg_acc) == rows);
+    CHECK(fresh_linux_rows(linux_fixture_root("debian-bookworm"), leg_acc) == rows);
     CHECK_FALSE(leg_acc.any_failure());
     CHECK_FALSE(leg_acc.incomplete());
 }
@@ -678,7 +732,7 @@ TEST_CASE("apt_rows_at over the real debian:bookworm tree: deb822 rows + armored
 TEST_CASE("apt_rows_at over the real ubuntu:22.04 tree: one-line rows + binary keyring",
           "[update_source_trust][walk][apt]") {
     yuzu::shared::ConstraintAccumulator acc;
-    const auto rows = lnx::apt_rows_at(linux_fixture_root("ubuntu-2204"), acc);
+    const auto rows = fresh_apt_rows(linux_fixture_root("ubuntu-2204"), acc);
     CHECK_FALSE(acc.any_failure());
     CHECK_FALSE(acc.incomplete());
     REQUIRE(rows.size() == 11); // 10 active `deb` lines + the 2018 archive keyring
@@ -693,7 +747,7 @@ TEST_CASE("apt_rows_at over the real ubuntu:22.04 tree: one-line rows + binary k
 
     // No /etc/yum.repos.d on this image either: the whole leg stays supported.
     yuzu::shared::ConstraintAccumulator leg_acc;
-    CHECK(lnx::linux_rows_at(linux_fixture_root("ubuntu-2204"), leg_acc) == rows);
+    CHECK(fresh_linux_rows(linux_fixture_root("ubuntu-2204"), leg_acc) == rows);
     CHECK_FALSE(leg_acc.any_failure());
 }
 
@@ -701,7 +755,7 @@ TEST_CASE("an empty root is absent for every family: zero rows, no failure token
           "[update_source_trust][walk]") {
     const TempRoot root;
     yuzu::shared::ConstraintAccumulator acc;
-    CHECK(lnx::linux_rows_at(root.path, acc).empty());
+    CHECK(fresh_linux_rows(root.path, acc).empty());
     CHECK_FALSE(acc.any_failure());
     CHECK_FALSE(acc.incomplete());
 }
@@ -717,7 +771,7 @@ TEST_CASE("a FIFO at a scanned path is rejected promptly, never blocks in open()
     // timing assumption: the healthy path returns in microseconds).
     yuzu::shared::ConstraintAccumulator acc;
     std::vector<std::string> rows;
-    auto fut = std::async(std::launch::async, [&] { rows = lnx::apt_rows_at(root.path, acc); });
+    auto fut = std::async(std::launch::async, [&] { rows = fresh_apt_rows(root.path, acc); });
     if (fut.wait_for(std::chrono::seconds(20)) != std::future_status::ready) {
         // Release the blocked open() so the worker (and this process) can exit.
         const yuzu::agent::ScopedFd rel(
@@ -737,7 +791,7 @@ TEST_CASE("a symlink leaf is refused, not followed", "[update_source_trust][walk
     root.write("etc/apt/real.list", "deb http://x.example/ y main\n");
     fs::create_symlink("real.list", root.apt() / "sources.list");
     yuzu::shared::ConstraintAccumulator acc;
-    const auto rows = lnx::apt_rows_at(root.path, acc);
+    const auto rows = fresh_apt_rows(root.path, acc);
     // MUTATION: removing O_NOFOLLOW makes sources.list parse and drops the token.
     CHECK(rows.empty());
     CHECK(reason_has(acc, "linux:apt_sources:symlink_refused"));
@@ -756,7 +810,7 @@ TEST_CASE("a malformed apt entry is unparsed_entry, never silently absent (one-l
                "Types: deb\nURIs: http://x.example/\n\n" // stanza without Suites
                "Types: deb\nURIs: http://ok.example/\nSuites: s\n");
     yuzu::shared::ConstraintAccumulator acc;
-    const auto rows = lnx::apt_rows_at(root.path, acc);
+    const auto rows = fresh_apt_rows(root.path, acc);
     REQUIRE(rows.size() == 2);
     CHECK(rows[0] == "apt_source|/etc/apt/sources.list|one_line|deb|http://ok.example/|suite|main|-|"
                      "unset|unset|yes");
@@ -775,7 +829,7 @@ TEST_CASE("a file over 1 MiB is oversized, never silently truncated",
     root.write("etc/apt/sources.list", "deb http://x.example/ y main\n");
     fs::resize_file(root.apt() / "sources.list", pio::kMaxFileBytes + 1); // sparse
     yuzu::shared::ConstraintAccumulator acc;
-    CHECK(lnx::apt_rows_at(root.path, acc).empty());
+    CHECK(fresh_apt_rows(root.path, acc).empty());
     // MUTATION: removing the size guard parses (or truncates) the file instead.
     CHECK(reason_has(acc, "linux:apt_sources:oversized"));
     CHECK(acc.incomplete());
@@ -788,7 +842,7 @@ TEST_CASE("a directory over the entry cap reports entry_cap but keeps the names 
     for (std::size_t i = 0; i <= pio::kMaxDirEntries; ++i) // cap + 1 empty files
         std::ofstream(root.apt() / "sources.list.d" / ("f" + std::to_string(1000000 + i) + ".list"));
     yuzu::shared::ConstraintAccumulator acc;
-    CHECK(lnx::apt_rows_at(root.path, acc).empty()); // empty files: no sources
+    CHECK(fresh_apt_rows(root.path, acc).empty()); // empty files: no sources
     // MUTATION: ignoring walk.truncated loses this token.
     CHECK(reason_has(acc, "linux:apt_sources:entry_cap"));
     CHECK(acc.incomplete());
@@ -809,7 +863,7 @@ TEST_CASE("the rows of one walk share a budget: output_cap, newest rows dropped,
     fs::resize_file(root.apt() / "sources.list.d" / "d.list", pio::kMaxFileBytes + 1); // sparse
 
     yuzu::shared::ConstraintAccumulator acc;
-    const auto rows = lnx::apt_rows_at(root.path, acc);
+    const auto rows = fresh_apt_rows(root.path, acc);
     // MUTATIONS: no budget -> 3 rows and no token; a budget that does not trim ->
     // 3 rows; a budget that does not stop the walk -> the `oversized` token below.
     REQUIRE(rows.size() == 2);
@@ -838,7 +892,7 @@ TEST_CASE("sources are the files apt itself reads; keyrings are selected by suff
         root.write(std::string("etc/apt/trusted.gpg.d/") + name, "\x99\x01");
     root.write("etc/apt/keyrings/any name.txt", "text");
     yuzu::shared::ConstraintAccumulator acc;
-    const auto rows = lnx::apt_rows_at(root.path, acc);
+    const auto rows = fresh_apt_rows(root.path, acc);
     // MUTATION: suffix-only source selection reports the seven phantom sources; a name
     // filter on trusted.gpg.d hides three global trust anchors; a filter without ':' hides a:b.
     REQUIRE(rows.size() == 8);
@@ -858,7 +912,7 @@ TEST_CASE("the legacy /etc/apt/trusted.gpg is a keyring row",
     const TempRoot root;
     root.write("etc/apt/trusted.gpg", "\x99\x01\x0d");
     yuzu::shared::ConstraintAccumulator acc;
-    const auto rows = lnx::apt_rows_at(root.path, acc);
+    const auto rows = fresh_apt_rows(root.path, acc);
     // MUTATION: dropping the legacy read (or its scope name) leaves no row.
     REQUIRE(rows.size() == 1);
     CHECK(rows[0] == "apt_keyring|/etc/apt/trusted.gpg|legacy_trusted_gpg|binary|3");
@@ -871,7 +925,7 @@ TEST_CASE("a symlinked directory is refused, not followed",
     fs::create_directories(root.apt());
     fs::create_directory_symlink(root.path / "real.d", root.apt() / "sources.list.d");
     yuzu::shared::ConstraintAccumulator acc;
-    const auto rows = lnx::apt_rows_at(root.path, acc);
+    const auto rows = fresh_apt_rows(root.path, acc);
     // MUTATION: removing O_NOFOLLOW from the directory open follows the link and
     // reports x.list. The token differs by OS (ENOTDIR vs ELOOP); both are refusals.
     CHECK(rows.empty());
@@ -887,7 +941,7 @@ TEST_CASE("NUL and invalid UTF-8 in a sources file are replaced and reported, th
                            sizeof("deb [trusted=yes] http://a.example/x stable ma\0in universe\n") - 1));
     root.write("etc/apt/sources.list.d/b.list", "deb http://b.example/\xff stable main\n");
     yuzu::shared::ConstraintAccumulator acc;
-    const auto rows = lnx::apt_rows_at(root.path, acc);
+    const auto rows = fresh_apt_rows(root.path, acc);
     REQUIRE(rows.size() == 2);
     for (const auto& r : rows) {
         CHECK(r.find('\0') == std::string::npos);
@@ -912,8 +966,9 @@ TEST_CASE("a file rewritten while it is read is modified_during_read, never a cl
     // read and before the closing fstat. MUTATION: dropping the closing fstat
     // comparison returns ok with the pre-truncate text, an empty sources.list
     // being normal on a host with no apt sources.
+    pio::InputBudget budget;
     const auto rc = pio::read_file(path, pio::kMaxFileBytes, false, data, size, acc,
-                                   "linux:apt_sources",
+                                   "linux:apt_sources", budget, {},
                                    [&] { std::ofstream(path, std::ios::binary | std::ios::trunc); });
     CHECK(rc == pio::Outcome::failed);
     CHECK(reason_has(acc, "linux:apt_sources:modified_during_read"));
@@ -928,7 +983,7 @@ TEST_CASE("the output budget trims to fit: many small rows from one file, not ju
         text += "deb http://a b\n";
     root.write("etc/apt/sources.list", text);
     yuzu::shared::ConstraintAccumulator acc;
-    const auto rows = lnx::apt_rows_at(root.path, acc);
+    const auto rows = fresh_apt_rows(root.path, acc);
     std::size_t total = 0;
     for (const auto& r : rows)
         total += r.size() + 1;
@@ -947,7 +1002,7 @@ TEST_CASE("invalid_bytes names a replaced byte that reached a field, not bytes i
     root.write("etc/apt/sources.list.d/x.sources",
                std::string("Types: deb\nURIs: http://y.example/\nSuites: z\nX-Repolib-Name: caf\xe9\n"));
     yuzu::shared::ConstraintAccumulator acc;
-    const auto rows = lnx::apt_rows_at(root.path, acc);
+    const auto rows = fresh_apt_rows(root.path, acc);
     CHECK(rows.size() == 2);
     // MUTATION: scrubbing the whole file (or counting every replaced byte) makes every
     // legacy-encoded comment a constrained result on a healthy host.
@@ -966,7 +1021,7 @@ TEST_CASE("a keyring name with invalid bytes is invalid_bytes under the keyring 
             SKIP("this filesystem refuses a non-UTF-8 file name (APFS)");
     }
     yuzu::shared::ConstraintAccumulator acc;
-    const auto rows = lnx::apt_rows_at(root.path, acc);
+    const auto rows = fresh_apt_rows(root.path, acc);
     REQUIRE(rows.size() == 1);
     CHECK(rows[0].find("k?y.gpg") != std::string::npos);
     CHECK(reason_has(acc, "linux:apt_keyring:invalid_bytes")); // MUTATION: dropping it, or the wrong prefix
@@ -984,7 +1039,8 @@ TEST_CASE("a same-size rewrite is caught by the mtime, and a just-emptied text f
     std::uint64_t size = 0;
     // The hook rewrites the SAME bytes (the size is unchanged) and moves the mtime, the
     // real shape of an in-place writer. MUTATION: comparing sizes only misses it.
-    auto rc = pio::read_file(path, pio::kMaxFileBytes, false, data, size, acc, "linux:apt_sources", [&] {
+    pio::InputBudget budget;
+    auto rc = pio::read_file(path, pio::kMaxFileBytes, false, data, size, acc, "linux:apt_sources", budget, {}, [&] {
         { std::ofstream f(path, std::ios::binary | std::ios::trunc); f << body; }
         fs::last_write_time(path, orig + std::chrono::milliseconds(1500));
     });
@@ -997,12 +1053,12 @@ TEST_CASE("a same-size rewrite is caught by the mtime, and a just-emptied text f
     root.write("etc/apt/empty.list", "");
     const auto empty = root.apt() / "empty.list";
     yuzu::shared::ConstraintAccumulator fresh;
-    CHECK(pio::read_file(empty, pio::kMaxFileBytes, false, data, size, fresh, "linux:apt_sources") ==
+    CHECK(pio::read_file(empty, pio::kMaxFileBytes, false, data, size, fresh, "linux:apt_sources", budget) ==
           pio::Outcome::failed);
     CHECK(reason_has(fresh, "linux:apt_sources:modified_during_read"));
     fs::last_write_time(empty, fs::file_time_type::clock::now() - std::chrono::hours(1));
     yuzu::shared::ConstraintAccumulator old;
-    CHECK(pio::read_file(empty, pio::kMaxFileBytes, false, data, size, old, "linux:apt_sources") ==
+    CHECK(pio::read_file(empty, pio::kMaxFileBytes, false, data, size, old, "linux:apt_sources", budget) ==
           pio::Outcome::ok);
     CHECK_FALSE(old.any_failure());
 }
@@ -1019,7 +1075,7 @@ TEST_CASE("an unreadable file is constrained with permission_denied, never absen
         SKIP("running as root (or CAP_DAC_OVERRIDE): permission bits bypassed");
     }
     yuzu::shared::ConstraintAccumulator acc;
-    CHECK(lnx::apt_rows_at(root.path, acc).empty());
+    CHECK(fresh_apt_rows(root.path, acc).empty());
     // MUTATION: mapping EACCES to `absent` drops this token.
     CHECK(reason_has(acc, "linux:apt_sources:permission_denied"));
     CHECK(acc.incomplete());
