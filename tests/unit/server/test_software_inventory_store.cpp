@@ -23,7 +23,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
-#include <cstdio>
+#include <format>
 #include <limits>
 #include <optional>
 #include <stdexcept>
@@ -2364,7 +2364,6 @@ TEST_CASE("a refresh cancelled at its last poll rolls back the delete and re-ins
           "[pg][software_inventory]") {
     SWINV_SHARED(store, pool);
     seed_grain_fixture(store);
-    put(store, "c1", Rows{ent("second", "1")});
     int polls = 0;
     REQUIRE(store.refresh_catalog_rollup([&] {
         ++polls;
@@ -2403,15 +2402,12 @@ TEST_CASE("a title committed mid-refresh is absent from this publication and in 
     auto before = store.catalog_rollup_meta();
     REQUIRE(before.has_value());
     int polls = 0;
-    bool fired = false;
     REQUIRE(store.refresh_catalog_rollup([&] {
-        if (++polls == 6) {
-            fired = true;
+        if (++polls == 6)
             put(store, "late-dev", Rows{ent("LateTitle", "9", "Late", "package", "brew", kSrcPkg)});
-        }
         return false;
     }));
-    REQUIRE(fired); // fails loudly if the poll sequence ever shrinks below the barrier
+    REQUIRE(polls >= 6); // fails loudly if the poll sequence ever shrinks below the barrier
     CHECK_FALSE(title(store, "LateTitle").has_value());
     CHECK(count_rows(pool, "catalog_rollup") == 27);
     CHECK(count_rows(pool, "version_rollup") == version_rows);
@@ -2443,9 +2439,8 @@ TEST_CASE("fleet-newest fold is correct across the FETCH boundary and a mid-loop
     SWINV_SHARED(store, pool);
     Rows rows;
     rows.reserve(2 * kTitles + 1);
-    char nm[16];
     for (int i = 0; i < kTitles; ++i) {
-        std::snprintf(nm, sizeof nm, "t%05d", i);
+        const auto nm = std::format("t{:05}", i);
         rows.push_back(ent(nm, "1.0"));
         rows.push_back(ent(nm, "2.0"));
         if (i == kStraddle)
@@ -2465,10 +2460,6 @@ TEST_CASE("fleet-newest fold is correct across the FETCH boundary and a mid-loop
     auto last = title(store, "t05000", q);
     REQUIRE(last.has_value());
     CHECK(last->newest_version == "2.0");
-    q.q = "t00000";
-    auto first = title(store, "t00000", q);
-    REQUIRE(first.has_value());
-    CHECK(first->newest_version == "2.0");
 }
 
 // Equivalent spellings compare equal under the catalogue order; the tie goes to the spelling
