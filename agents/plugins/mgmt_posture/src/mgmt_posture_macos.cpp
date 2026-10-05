@@ -4,8 +4,9 @@
  *
  * No public API exposes enrolment state and /var/db/ConfigurationProfiles/Store is not
  * permitted, so the tool is the mechanism. This TU is only the runner binding; the
- * classification (runner failure, nonzero exit, truncation, unrecognised output ->
- * CONSTRAINED with no data rows) is `posture_macos` in mgmt_posture_legs.hpp. AD binding
+ * classification is `posture_macos` in mgmt_posture_legs.hpp: a tool that could not be
+ * started is UNAVAILABLE (an `unsupported` row); any other runner failure, a nonzero exit,
+ * truncation or unrecognised output is CONSTRAINED; neither carries data rows. AD binding
  * is device_identity.domain.
  */
 #include "mgmt_posture_legs.hpp"

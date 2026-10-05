@@ -152,7 +152,7 @@ TEST_CASE("mgmt_posture: no domains key activates only enabled = true domains", 
     CHECK(e.active_domains == std::vector<std::string>{"a", "b"});
     CHECK(classify_linux(e, false) == Plane::ad);
 
-    // Control: the key present but the domain unlisted was already none.
+    // Control: with the key present and the domain unlisted the plane is none.
     CHECK(plane_of("[sssd]\ndomains = other\n[domain/corp]\nid_provider=ad\n") == Plane::none);
 }
 

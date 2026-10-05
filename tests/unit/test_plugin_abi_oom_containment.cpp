@@ -36,9 +36,9 @@
  * surviving signal. The healthy-allocator behaviour (full `:bad_alloc` token)
  * is pinned by the two local-dispatcher tests and is not duplicated here.
  *
- * SEAM C differs in one respect: its recovery writes the status ROW before it sets the typed
+ * SEAM C differs in two respects. Its recovery writes the status ROW before it sets the typed
  * status, so under sustained failure the row build throws first and the surviving signal is
- * rc 1 (the double-throw arm), not a typed status. Its token (`<os>:leg:exception`) also
+ * rc 1 (the double-throw arm), not a typed status. And its token (`<os>:leg:exception`)
  * carries no `:bad_alloc` suffix, so the provenance-shape check above does not apply to it.
  */
 

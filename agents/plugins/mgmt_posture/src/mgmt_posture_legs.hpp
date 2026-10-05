@@ -114,13 +114,15 @@ using LegFn = int (*)(yuzu::CommandContext&);
 
 /// The WHOLE body of the plugin's execute(): dispatch and the single ABI containment.
 /// Status-row contract: one status row per dispatch, with three exceptions. (1) An unknown
-/// action writes ONE non-status line (`unknown action: <name>`, the name made valid UTF-8 and
-/// escaped like every other caller-supplied value) and returns 1: no status row. (2) A leg that
+/// action writes ONE non-status line (`unknown action: <name>`, with invalid UTF-8 bytes
+/// replaced and the rest escaped like every other caller-supplied value) and returns 1: no
+/// status row. (2) A leg that
 /// throws AFTER report_posture already wrote its row (allocation failure while emitting data
 /// rows) gets the catch arm's `unsupported` row appended, so there are TWO and the LAST status
 /// row wins -- the same documented behaviour as update_source_trust_legs.hpp. (3) The recovery
-/// itself allocates, so it is guarded too: if it throws as well, no status row is added and the
-/// dispatch returns 1 (a failed command) rather than unwinding across the plugin ABI.
+/// itself allocates, so it is guarded too: if it throws as well, the dispatch returns 1 (a
+/// failed command) rather than unwinding across the plugin ABI, and the recovery's status row
+/// or typed status may be missing.
 inline int execute_posture(yuzu::CommandContext& ctx, std::string_view action, LegFn leg,
                            std::string_view leg_exception_token) {
     try {
@@ -322,11 +324,14 @@ inline Posture posture_macos(const RunFn& run) {
     };
 
     // classify_runner_failure covers termination_reason only (spawn/deadline/cancel/
-    // signal/line_limit); exit code and truncation are named here. Its status is forwarded,
-    // as the sibling plugins do: a spawn failure read nothing, so it is UNAVAILABLE/UNKNOWN
-    // (an `unsupported` row); every other runner failure ran the tool, so it is CONSTRAINED.
-    // The runner pairs !tool_ran with spawn_error and timed_out with deadline/cancelled
-    // (subprocess_runner.cpp), so the classifier has already caught both before this point.
+    // signal/line_limit); exit code and truncation are named here. A spawn failure read
+    // nothing, so it maps to UNAVAILABLE/UNKNOWN (an `unsupported` row, the classifier's own
+    // UNAVAILABLE); every other runner failure is CONSTRAINED/PARTIAL, including line_limit,
+    // whose classifier status is OK: a cut-off `profiles` output cannot be parsed. A result the
+    // classifier passes (reason `exited`) always has tool_ran set and timed_out clear: the
+    // runner reports !tool_ran as spawn_error (or as the deadline/cancel kill that came first)
+    // and clears timed_out on a natural exit (subprocess_runner.cpp), so no separate
+    // !tool_ran / timed_out check is needed here.
     if (const auto f = yuzu::agent::classify_runner_failure(r)) {
         if (f->status == YUZU_RESULT_STATUS_UNAVAILABLE)
             return Posture{StatusState::unsupported, f->provenance, {}};

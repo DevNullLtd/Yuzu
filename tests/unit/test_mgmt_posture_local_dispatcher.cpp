@@ -245,8 +245,9 @@ TEST_CASE("mgmt_posture execute seam: unknown action is escaped; a throwing leg 
     REQUIRE(hrows.size() == 1);
     CHECK(hrows[0] == "unknown action: no\\|such/");
 
-    // ... and it is made valid UTF-8 first (a protobuf string field must be), exactly as
-    // posture_row does for its values: an invalid byte becomes '?', a valid sequence survives.
+    // ... and invalid UTF-8 bytes are replaced first (a protobuf string field must be UTF-8),
+    // exactly as posture_row does for its values: an invalid byte becomes '?', a valid sequence
+    // survives. sanitize_utf8 does not yet reject overlong or surrogate forms (#4864).
     const auto binary = dispatcher.run(&throwing, "bad\xff!");
     CHECK(binary.rc == 1);
     const auto brows = captured_rows(binary.captured);
