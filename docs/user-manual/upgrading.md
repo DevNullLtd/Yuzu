@@ -125,10 +125,14 @@ too large for its type were already `400`.
   `now - n` that went past the epoch silently returned the whole result. Omit the parameter for
   "no bound on that side". `since=0` stays valid and matches exactly what omitting `since`
   matches; no script that sends `since=0` changes behaviour.
-- Scripts that send a **negative** `since` or `until` to `GET /api/v1/execution-statistics/agents` or `/definitions` (`since`), to the legacy `GET /api/audit` (`since`/`until`) or to MCP `query_audit_log` (`since`/`until`, `-32602`): it is `400` now. It used
-  to be read as "unbounded", so a window computed as `now - n` that went past the epoch silently
-  returned the whole result. Send `0` (or omit the parameter) for "no bound on that side"; `0` stays
-  valid on those routes because their stores cannot yet tell an omitted bound from a literal `0`.
+- Scripts that send a **negative** `since` to `GET /api/v1/execution-statistics/agents` or `/definitions` or their MCP twins, a
+  negative `since` or `until`, or `until=0`, to the legacy `GET /api/audit` or MCP `query_audit_log` (`-32602`), `to=0` to
+  `GET /api/v1/audit/auth-sample`, or `until` of `0` or below (or a non-integer bound) in the body of `POST /api/v1/inventory/query` or
+  `POST /api/inventory/query`: it is `400` now. It used to be read as "unbounded", so a window
+  computed as `now - n` that went past the epoch silently returned the whole result. Omit the
+  parameter for "no bound on that side". `since=0` (`from=0`) stays valid and matches exactly what
+  omitting it matches. A non-integer `since`/`until` in an inventory query body made the body read throw
+  (nlohmann's `value()` throws on a type mismatch) and is a clean `400` now.
 - MCP clients that send `"limit": null` or `"status": null`, or a float or string for either: omit
   the key to get the default. A `status` above `2147483647` and an unsigned value above
   `9223372036854775807` are `-32602` too (the latter used to wrap to `-1`, "any status"; the same
@@ -193,11 +197,13 @@ for a `version` outside 1 to 2147483647, and `PUT /api/v1/guaranteed-state/rules
 `update_guardian_rule` refuse a rule whose stored version is already at 2147483647 (`409` on REST,
 `-32602` on MCP) instead of overflowing the version bump.
 
-A negative `since` or `until` is refused as well (`400`, `-32602` on MCP) on the legacy `GET
-/api/audit`, MCP `query_audit_log` and `GET /api/v1/execution-statistics/definitions`/`agents`
-(`since`): the store applies a bound only above zero, so `-3600` used to mean no bound and returned
-the whole log or statistics set. `0`, or omitting the parameter, still means no bound.
-`GET /api/v1/audit` takes no `since`/`until` and is unchanged.
+A negative `since`, and an `until` of `0` or below, are refused as well (`400`, `-32602` on MCP) on
+the legacy `GET /api/audit` and MCP `query_audit_log` (`until` of `0` is new there; a negative
+`since` or `until` was refused already), and a negative `since` on
+`GET /api/v1/execution-statistics/definitions`/`agents` and their MCP twins. The bounds are
+presence-tracked now: `-3600` and `until=0` used to mean no bound and returned the whole log or
+statistics set. Omit the parameter for no bound; `since=0` is accepted and matches the same rows as
+omitting it. `GET /api/v1/audit` takes no `since`/`until` and is unchanged.
 
 The same strictness now covers the dashboard fragments' `page`/`per_page`, the software
 inventory, DEX perf, network quality, hardware and CA-issued lists, the notification, webhook and

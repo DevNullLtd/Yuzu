@@ -250,7 +250,12 @@ answered a different question than the one asked. Rejected now: trailing charact
 exponent forms, decimals, whitespace, a leading `+` and a value too large for its type (an
 empty value and an overflow were already refused on most of these routes). Zero padding (`007`) is accepted.
 Omitting a parameter still means its default, and each route's existing clamping and sentinel
-values (for example `limit` clamped to a ceiling, `since=0` meaning "no lower bound") are unchanged.
+values (for example `limit` clamped to a ceiling) are unchanged. The epoch bounds `since`/`until` (and
+`from`/`to` on the auth-sample export) are presence-tracked: omitting one leaves that side
+unbounded, `since=0` is accepted as a harmless literal bound that matches exactly what omitting it
+matches, and `until=0` (or `to=0`), like any negative bound, is `400`: `0` is not an
+"unbounded" sentinel on the upper side, so a computed window that collapsed to `0` fails instead
+of silently returning everything.
 
 Routes that parse strictly (the response routes are listed in
 [Command/Instruction Responses](#commandinstruction-responses--v1-read-twins-2146-a2-r2) and
@@ -3581,8 +3586,8 @@ window, and how many rows) so evidence access stays on the audit chain.
 
 | Parameter | Type | Required | Description |
 |---|---|---|---|
-| `from` | integer | No | Window start, epoch seconds, digits only (omit for unbounded) |
-| `to` | integer | No | Window end, epoch seconds, digits only (omit for unbounded) |
+| `from` | integer | No | Window start, epoch seconds, digits only (omit for unbounded; `0` is accepted and matches the same rows as omitting it) |
+| `to` | integer | No | Window end, epoch seconds, digits only (omit for unbounded; `to=0` is `400`, `0` is not a way to say unbounded) |
 | `limit` | integer | No | Sample size (default 100, max 1000) |
 
 ```bash
@@ -6779,8 +6784,8 @@ Query inventory data across agents with filters.
 |---|---|---|---|
 | `agent_id` | string | No | Filter by agent ID |
 | `plugin` | string | No | Filter by plugin name |
-| `since` | integer | No | Unix timestamp — only records collected after this time |
-| `until` | integer | No | Unix timestamp — only records collected before this time |
+| `since` | integer | No | Unix timestamp, inclusive lower bound on collection time. Omit for no lower bound; `0` is accepted and matches the same rows as omitting it; a negative value or a non-integer is `400` |
+| `until` | integer | No | Unix timestamp, inclusive upper bound on collection time. Omit for no upper bound; `0`, a negative value or a non-integer is `400` (`0` is not a way to say unbounded) |
 | `limit` | integer | No | Max results (default 100, max 1000) |
 
 **Response:** List of inventory records matching the query, plus top-level
@@ -7283,7 +7288,7 @@ Get per-agent execution statistics.
 | Param | Type | Description |
 |---|---|---|
 | `agent_id` | string | Filter to a single agent |
-| `since` | integer | Unix timestamp — only executions after this time. `0` or omitted means no bound; a negative value is `400` (the store applies a bound only above zero, so it used to read as no bound) |
+| `since` | integer | Unix timestamp, inclusive lower bound on dispatch time. Omit for no bound; `0` is accepted and matches the same rows as omitting it; a negative value is `400` (it used to read as no bound) |
 | `limit` | integer | Max results (default 50, max 1000) |
 
 **Response:**
@@ -7316,7 +7321,7 @@ Get per-definition execution statistics.
 | Param | Type | Description |
 |---|---|---|
 | `definition_id` | string | Filter to a single definition |
-| `since` | integer | Unix timestamp — only executions after this time. `0` or omitted means no bound; a negative value is `400` (the store applies a bound only above zero, so it used to read as no bound) |
+| `since` | integer | Unix timestamp, inclusive lower bound on dispatch time. Omit for no bound; `0` is accepted and matches the same rows as omitting it; a negative value is `400` (it used to read as no bound) |
 | `limit` | integer | Max results (default 50, max 1000) |
 
 **Response:**
@@ -10035,9 +10040,10 @@ probably zero".
 
 **Errors:** `403` — caller lacks `AuditLog:Read`; `400` — a `since`/`until`/
 `limit`/`offset` query parameter is not a valid integer, `since` or `until`
-is negative (the store applies a bound only above zero, so a negative value used
-to read as no bound and returned the whole log; `0` or omitting the parameter
-still means no bound), or `limit < 1` / `offset < 0`; `503` — the audit store is closed, or the page-rows query
+is negative, or `until` is `0` or negative (a negative bound, and `until=0`, used
+to read as no bound and returned the whole log; omit the parameter for no bound,
+and `since=0` is accepted and matches the same rows as omitting it), or
+`limit < 1` / `offset < 0`; `503` — the audit store is closed, or the page-rows query
 degraded (ADR-0040 deny-on-degrade; never a false-empty `200`).
 
 ---

@@ -371,7 +371,7 @@ Note: the v1 endpoint supports `principal` and `action` filters only. For
 additional filters (`target_type`, `target_id`, `since`, `until`, `offset`),
 use the legacy `/api/audit` endpoint.
 
-A negative `since` or `until` is rejected (`400` on `/api/audit`, `-32602` on MCP `query_audit_log`): the store applies a bound only above zero, so a literal `-3600` used to mean no bound and returned the whole log. `0`, or omitting the parameter, still means no bound.
+A negative `since`, and an `until` of `0` or below, are rejected (`400` on `/api/audit`, `-32602` on MCP `query_audit_log`; `to=0` is `400` on `GET /api/v1/audit/auth-sample`): the bounds are presence-tracked, and a literal `-3600` or `until=0` used to mean no bound and returned the whole log. Omit the parameter for no bound; `since=0` (`from=0` on the auth sample) is accepted and matches the same rows as omitting it.
 
 **Example --- fetch the 20 most recent events:**
 
