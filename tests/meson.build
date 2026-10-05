@@ -866,7 +866,9 @@ if host_machine.system() != 'windows' and get_option('b_sanitize') == 'none'
     'yuzu_plugin_abi_oom_containment_tests',
     files('unit/test_plugin_abi_oom_containment.cpp'),
     include_directories: [include_directories('../agents/plugins/browser_policy/src'),
+                          include_directories('../agents/plugins/mgmt_posture/src'),
                           include_directories('../agents/plugins/update_source_trust/src'),
+                          include_directories('../agents/core/include'),  # yuzu/agent/runner_status.hpp, subprocess_runner.hpp (mgmt_posture_legs.hpp; header-only use)
                           include_directories('../agents/shared')],
     cpp_args: test_partial_init_args,
     dependencies: [yuzu_sdk_dep, nlohmann_dep, catch2_dep],
