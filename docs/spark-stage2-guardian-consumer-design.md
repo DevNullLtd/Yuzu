@@ -712,7 +712,8 @@ compensated (its compensating disarm is outstanding) is NOT K-eligible (#4472), 
 its generation is held, not acknowledged. And desired-state recovery after an
 unadopted late FAILURE (or any late result that is not adopted) on an already
 K-waived rule still depends on the server's re-push, which the acknowledgment
-suppresses: that gap has no engine recovery owner and is tracked in #5459.
+suppresses: that gap has no engine recovery owner and is tracked in #5459, an open
+accept-or-recover decision.
 **Three separate transitions, never collapsed:** wedge-release (the wedged
 worker's call returns and clears the marker), arm-recovery (a still-wanted rule's late
 success commits and clears its `arm_failed` entry), and policy-acknowledgment (the
@@ -952,8 +953,10 @@ explicit narrowing below.
   FIFO while `end` stays stuck at Wedged (the sticky-Wedged contract, PR-5d) -
   the "still-claimed" requirement this doc's own §A row already named in
   prose. `GuardianSparkRuntime::receipt_wedge_k_eligible()` closes both: `end
-  == WaiterTimedOutDispatched && dispatch == Dispatched &&` the claim is still
-  its key's FIFO front, evaluated under `registry_mu_` at TWO points -
+  == WaiterTimedOutDispatched && dispatch == Dispatched && compensation_finished &&`
+  the claim is still its key's FIFO front (the `compensation_finished` conjunct
+  is the #4472 addition: a claim whose compensating disarm is outstanding is not
+  K-eligible), evaluated under `registry_mu_` at TWO points -
   `GuardianArmAckLedger::drain_locked()`'s primary per-pending loop (never
   insert an unsettled classification into `failed_receipts` even for one
   tick), and its existing recovery-scan loop (re-validate every RETAINED entry
@@ -999,11 +1002,15 @@ explicit narrowing below.
   scope narrowing above). A completion that lands in that sub-tick gap - after
   the eligibility read, before `can_advance()`/`persist_generation_locked()` -
   does NOT revoke the current tick's decision: the eligibility read IS the
-  linearization point, not generation persistence. This produces the
-  acknowledged-but-unarmed state, which is accepted with telemetry only (see
-  #5459), the same state a completion landing one tick AFTER acknowledgment
-  produces for the ordinary case - the gap does not make a new state
-  reachable, only an earlier one. (The #4472 fix narrows K-eligibility, so a
+  linearization point, not generation persistence. This produces the same
+  state a completion landing one tick AFTER acknowledgment produces for the
+  ordinary case, which is the acknowledged-but-unarmed state. Whether that
+  state is acceptable is NOT decided: it is #5459, an open accept-or-recover
+  decision and a `prefer_spark_` flip precondition (`docs/spark-flip-gate.md`).
+  Its only signal today is `yuzu.guardian_arm_failed` > 0, which does not
+  distinguish a hung arm from an unowned late failure. The sub-tick gap
+  reaches the same state one tick earlier; it does not create a new one.
+  (The #4472 fix narrows K-eligibility, so a
   claim whose compensating disarm is already outstanding at the read is not
   eligible; it adds no runtime-owned waiver-permit latch, and the sub-tick gap
   itself is not closed.) Do not "fix" this into a
@@ -1076,12 +1083,15 @@ then. "Must bound blocking OS work" is a mechanism contract, not a
 runtime-enforced deadline: the runtime only observes a pending teardown
 (`yuzu.guardian_compensation_pending_age_seconds`,
 `yuzu.guardian_compensation_deadline_elapsed`) and never releases or cancels it.
-Tracked as #4472; the regression tests pinning this interleaving now exist (the
-`[4472]` tests, runtime plus ledger level and engine level), so what remains
-is the decision on whether it becomes a named Spark-flip-ladder precondition.
-The #4605 commit-time ownership check (R5.2 as implemented, #4605 / #5322 /
-#5323) does not change this: #4472 is unchanged, because the Reobserved
-branch re-observes the same claim and does not touch the index.
+Tracked as #4472. The permanent-stranding half is fixed by the K-eligibility
+change described above; the bounded window this paragraph describes remains. The
+regression tests pinning this interleaving exist (the `[4472]` tests, runtime
+plus ledger level and engine level), and `docs/spark-flip-gate.md` already names
+re-running them as a required flip criterion, so whether #4472 becomes a named
+flip-ladder precondition is no longer an open question. The #4605 commit-time
+ownership check (R5.2 as implemented, #4605 / #5322 / #5323) does not change
+this: it does not fix #4472, because the Reobserved branch re-observes the same
+claim and does not touch the index.
 
 **A late FAILURE (refusal, not success) on a still-desired wedged rule is a
 no-op by construction, not a third mechanism**: the claim was already terminal
@@ -1089,7 +1099,7 @@ no-op by construction, not a third mechanism**: the claim was already terminal
 answers with a failure, and the adoption branch above requires a live
 subscription to commit - nothing new is armed, nothing new fails, and
 `arm_failed` correctly stays set (no automatic re-arm is attempted; after K the
-server will not re-push either, see #5459).
+server will not re-push either; whether that is acceptable is the open decision #5459).
 
 **Telemetry-tag semantics, flagged not specified (SHOULD, Gate 6 sre):**
 `yuzu.guardian_arm_pending`/`yuzu.guardian_arm_failed` (introduced here, wired in
