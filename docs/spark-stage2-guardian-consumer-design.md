@@ -617,6 +617,33 @@ Unit 6; `GuardianArmAckLedger::drain_locked()` (R5.3) is the production caller o
 unreachable outside engine shutdown; every real backend arm failure now surfaces
 only asynchronously, through the ledger's drain (R5.3 below).
 
+**R5.2 as implemented (#4605 / #5322 / #5323): ownership is asked of the index, and a
+dead `Queued` claim is never dispatched.** (1) A claim's `index_held` is its own belief,
+not proof: a wedge adoption can move the rule's one `(rule_id -> key, generation)`
+mapping to another key while the claim keeps the flag. The drain therefore commits a
+claim only if `SparkKeyRuleIndex::owns()` agrees (#4605, S2: ownership decides the
+winner), and a claim that no longer owns its mapping releases as a successful no-op.
+(2) A dead `Queued` Arm claim (withdrawn, waiter-abandoned, outcome-bearing or carrying a
+commit exception) is never selected for dispatch (`is_dead_claim`); the dispatch entry
+guard is narrower (withdrawn or commit-exception only). `expire_overdue_claims()`'s
+reaper pops terminal `Queued` heads with one index-release attempt per tombstone per
+pass (at most two in the pass that synthesizes the outcome of a withdrawn or waiter-abandoned head
+that has none; the second is a no-op if the first succeeded) and refills the follower it
+exposes; a synthesized outcome wakes blocking waiters at once, even if the release that
+follows it fails; an attach on a key that already has a `keys_`
+entry joins that watcher instead of queuing; `on_subscription_lost` never leaves `keys_`
+holding the dead subscription id; and an orphan watcher (index refcount 0, no claim) of an
+io-class type (File, Registry, Service) is given a durable Disarm claim by the same
+heartbeat pass (an inline-type key is left alone). (3) An abandoned `Queued` claim whose
+release fails is retained as a tombstone instead of being erased with its mapping
+(#5323). Four distinctions the counters and `retained_tombstones()` rely on: a tombstone
+holds a genuine mapping (`index_held` AND `owns()`), a stale local flag does not; a pending
+clean claim is not a committed claim left in a fifo (the reaper pops the latter without
+counting it as a released tombstone); `orphan_disarms_started` counts an orphan Disarm claim
+queued, not a backend teardown completed; and the reaper leaves a key alone
+while its head claim is in flight (it only pops a `Queued` head), so recovery there waits for
+that claim's completion. The flip-gate rows are in `docs/spark-flip-gate.md`.
+
 **R5.3 - Ack model: accepted vs. acknowledged.** **Acknowledged ≠ compliant/enforced,
 stated explicitly (Gate 6 compliance-officer) — mirroring this codebase's own
 "flag ≠ revoke" precedent for a similarly-named-but-distinct signal** (Periodic Access
@@ -810,6 +837,14 @@ together in prose but which do not share one signal in code:
   increments `wedge_adopt_stale_refused` and compensates the stale subscription
   without touching the live generation. A re-observation after another key
   commits can reach this refusal during ordinary desired-state churn.
+  The hoisted Reobserved branch still touches no index state (#4605): a rule
+  re-observed on key A while a same-rule claim is in flight on key B is not
+  withdrawn from B, and when A's wedge then adopts, `index_->add` moves the
+  rule's mapping to A. B's claim keeps its stale `index_held`, but the drain
+  commits only a claim for which `SparkKeyRuleIndex::owns()` agrees, so B
+  cannot commit after a withdrawal or over the adopted rule (S2, ownership
+  decides the winner). Last-attach-wins for the same-rule case (S1) is a
+  recorded follow-up decision, not implemented here.
 
   **Cost:** let N be the total FIFO population, C the rule_ids with claims,
   R the committed rules, f the largest FIFO, and R_idx/K_idx the ordered
@@ -1012,6 +1047,9 @@ eventually re-desires the key once that disarm has landed, on whatever cadence
 already governs this codebase's pre-existing disarm path. Tracked as #4472 (a
 regression test pinning this exact interleaving, and a decision on whether it
 becomes a named Spark-flip-ladder precondition), not a merge blocker.
+The #4605 commit-time ownership check (R5.2 as implemented, #4605 / #5322 /
+#5323) does not change this: #4472 is unchanged, because the Reobserved
+branch re-observes the same claim and does not touch the index.
 
 **A late FAILURE (refusal, not success) on a still-desired wedged rule is a
 no-op by construction, not a third mechanism**: the claim was already terminal
