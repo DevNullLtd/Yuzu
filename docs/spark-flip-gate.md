@@ -610,8 +610,8 @@ flip, with a red-first test each:
   `tests/unit/test_guardian_spark_runtime.cpp`, at least one per fix site. This criterion is
   satisfied: PR #5337 merged to `dev` on 2026-10-04. The retained-tombstone gaps it left are the
   next bullets (#5322 and #5323, both fixed by the #4605/#5322/#5323 fix recorded there).
-- **RESOLVED by the #4605/#5322/#5323 fix on branch `fix/4605-5322-claim-tombstone-state` (PR number
-  to be added at open) (was a NEW flip criterion; added 2026-10-03, Dave's ruling; found while
+- **RESOLVED by the #4605/#5322/#5323 fix on branch `fix/4605-5322-claim-tombstone-state` (the PR that
+  closes #5322) (was a NEW flip criterion; added 2026-10-03, Dave's ruling; found while
   planning the #4354 fix; the problem text below is as recorded then, the fix is at the end of this
   bullet)**:
   #5322, a retained withdrawn tombstone can be re-dispatched, or can strand a clean follower
@@ -760,8 +760,8 @@ flip, with a red-first test each:
     - (P3) Add an oldest-pending-Disarm age gauge, so a hung orphan Disarm is visible (#5403).
     - (P4) The heartbeat-tag export work is tracked in #5404 (the accessors' header comments formerly
       named "the #5168 tags PR", a closed issue).
-- **FIXED by the #4605/#5322/#5323 fix on branch `fix/4605-5322-claim-tombstone-state` (PR number to
-  be added at open) (was RECORDED, not flip-gating unless Dave rules otherwise; added
+- **FIXED by the #4605/#5322/#5323 fix on branch `fix/4605-5322-claim-tombstone-state` (the PR that
+  closes #5323) (was RECORDED, not flip-gating unless Dave rules otherwise; added
   2026-10-03)**: #5323,
   `abandon_claim_locked`'s `Queued` branch erased the claim from the fifo after a failed index
   release, leaving a ghost mapping (the #4354 defect class on a different path). It now goes
