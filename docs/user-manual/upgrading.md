@@ -16,12 +16,13 @@ This guide covers upgrading Yuzu components (server, agent, gateway) between ver
 | 0.15.x (next) | 0.12.0 | 0.12.0 | **`PatchManager` now runs on PostgreSQL (ADR-0062).** `/api/patches/*` (patch inventory + deployment tracking) moved off its own `patches.db` SQLite file onto the shared Postgres substrate (schema `patch_manager`). **No data carries over from a pre-Postgres install** (fresh-start-by-default, ADR-0009) — any deployment record that existed before upgrade is gone and must be re-created via `POST /api/patches/deploy`. Server startup now fails closed if the `patch_manager` schema can't be created/opened — a posture upgrade from the SQLite era, where construction was unconditional/best-effort and no caller ever checked whether the store had actually opened; confirm success via `/readyz` (`patch_manager` is now reported by both `/readyz` and `/healthz`, absent from both before this release). **Removed: automatic patch-deployment orchestration.** `PatchManager::execute_deployment()` (the scan → install → verify → reboot workflow) had zero production callers on any released build — nothing ever wired a dispatch/OS-lookup callback to it — and is deleted, not ported; `POST /api/patches/deploy` still creates a deployment + per-target rows, but nothing in the server drives them through that workflow automatically (see #3669, filed alongside this change, and `docs/capability-map.md` §8.3/§8.4/§8.6). **Patch inventory (`GET /api/patches`) is separately unwired**: `record_patches()`, the only method that writes it, also has no production caller — this predates the migration and is not something upgrading changes — so `GET /api/patches` returns empty in every real deployment today; see `docs/capability-map.md` §8.5/§8.7 and #3676. No operator action required beyond re-creating any in-flight deployment after upgrade. |
 | 0.15.x (next) | 0.12.0 | 0.12.0 | **`WorkflowEngine` now runs on PostgreSQL (ADR-0064).** `/api/workflows*` and `/api/workflow-executions/*` moved off `workflows.db` SQLite onto the shared Postgres substrate (schema `workflow_engine`). **No data carries over from a pre-Postgres install** (fresh-start-by-default, ADR-0009) — any workflow definition and its execution history that existed before upgrade is gone; re-create workflows via `POST /api/workflows` (or product-pack re-install). Server startup now fails closed if the `workflow_engine` schema can't be created/opened — a posture upgrade from the SQLite era, where construction was unconditional/best-effort and no caller ever checked whether the store had actually opened; confirm success via `/readyz` (already reported before this release) and `/healthz` (newly reported — was absent before this release). **Delete semantics changed: `DELETE /api/workflows/:id` now soft-deletes.** The response shape is unchanged (`{"deleted": true|false}`), but a deleted workflow's row and its execution history are now retained internally rather than orphaned — this is not operator-visible today (no "show deleted workflows" surface exists), but a deleted workflow's `id` can never be reused. No operator action required. |
 | 0.15.x (next) | 0.12.0 | 0.12.0 | **Guardian file-hash `max_bytes` now has a hard ceiling (#2233).** An authored `file-hash-equals` rule's `max_bytes` (the hashing-DoS cap) was previously accepted unbounded from the authoring API. It is now clamped to 1 GiB (`kMaxFileHashBytes`) on the agent, and the server rejects a new/edited rule authoring a value above that ceiling in either JSON wire form (400). **Operator-visible only if you have a PRE-EXISTING `file-hash-equals` rule authored (before this release) with `max_bytes` above 1 GiB, watching a file at or above that size:** after upgrade, that file reports `<oversize>` instead of being hashed — a compliance-verdict change with no authoring-time signal (the rule already exists, so the new server-side reject cannot retroactively catch it). List your rules via `GET /api/v1/guaranteed-state/rules` (the route returns every rule; there is no server-side filter), check any `file-hash-equals` rule for `max_bytes` over 1073741824, and re-author within the ceiling if the larger cap was intentional. No operator action required otherwise. **DEX and management-group reads now fail closed on a degraded read instead of answering a healthy/empty result (#4855, #1762)** — see "Behaviour change: DEX device score and management-group member reads now fail closed on a degraded read (#4855, #1762)" below. |
-| 0.15.x (next) | 0.12.0 | 0.12.0 | **`BatchHeartbeatResponse` gains `unknown_session_ids` and `unknown_session_ids_truncated` (#1197) - no operator action.** The server now lists, per `BatchHeartbeat`, the session ids it does not hold. The gateway does not read the new fields yet (the gateway-side replay is tracked in #1197), so nothing visible changes in either skew: a new server with an OLD gateway is safe because the old gateway ignores the added response fields (proto3 unknown fields, field numbers 2 and 3); an OLD server with a NEW gateway is safe because the old server never sends the fields and the gateway does not act on them. The one operator-visible change is a new `yuzu_server_gateway_route_desync_total{op="batch_heartbeat",outcome="malformed_session_id"}` series (pre-seeded at 0, expected to stay 0, no alert): over-length (more than 64 bytes) unknown session ids in a `BatchHeartbeat` are now counted under that series, per entry, instead of under `op="renew_leases", outcome="unknown_session"`. This release does NOT fix the post-server-restart symptom described in the Known limitation under [Server-Side Setup](gateway.md#server-side-setup). |
+| 0.15.x (next) | 0.12.0 | 0.12.0 | **`BatchHeartbeatResponse` gains `unknown_session_ids` and `unknown_session_ids_truncated` (#1197), and the gateway now acts on them - restart the gateway to deploy (this disconnects every agent it holds, and released v0.13.0 and v0.14.0-rc6 agents stayed wedged after a graceful gateway restart in testing, so upgrade agents to a build with the #5183 fix first or expect to restart the agent service on them; see "Agent dependency" in [What happens when the server restarts](gateway.md#what-happens-when-the-server-restarts)); no wire change and no new required configuration.** The server lists, per `BatchHeartbeat`, the session ids it does not hold, and the new gateway reads that list and re-registers exactly the sessions it still holds (the registration-replay drip, bounded by a per-session guard and a queue cap). The behavioural change is that, after a server restart, agents behind a new gateway become known to the server again without operator action; before, they stayed unknown (`/health` `agents.online` stayed 0 in the observed runs). Any pairing interoperates: an OLD server never sends the fields, so a new gateway sees an empty list and does nothing; an OLD gateway ignores the added response fields (proto3 unknown fields, field numbers 2 and 3) and keeps the old behaviour. Recovery needs the new gateway and a server that sends the fields. Observed on a local rig: the agent was known again about 17 s after the server was healthy, on its first heartbeat after that; after an outage long enough to open the gateway circuit breaker, recovery waits for the breaker's remaining backoff (58 s observed after a 300 s outage with 1 agent; with 10 and 30 agents the breaker opened in later runs and the breaker's own replay recovered them, with all agents online 85.2 s and 50.4 s after the server was healthy; the backoff is capped at 300 s, and steps above 160 s were not observed). A second operator-visible change is a new `yuzu_server_gateway_route_desync_total{op="batch_heartbeat",outcome="malformed_session_id"}` series (pre-seeded at 0, expected to stay 0, no alert): over-length (more than 64 bytes) unknown session ids in a `BatchHeartbeat` are now counted under that series, per entry, instead of under `op="renew_leases", outcome="unknown_session"`. The gateway adds three counters and two optional application-env tunables, described under [What happens when the server restarts](gateway.md#what-happens-when-the-server-restarts), which also states what the reconcile does not promise (fleet completion inside a route lease, dispatch reachability after the session is adopted, several core replicas). |
+| 0.15.x (next) | 0.12.0 | 0.12.0 | **Gateway heartbeat admission is now bound to the connection that opened the session (gateway restart required; breaking for L7-fronted gateways).** The gateway admits an agent `Heartbeat` only on the HTTP/2 connection that opened the session's `Subscribe` stream; any other heartbeat is answered `NOT_FOUND` and not forwarded. Deploy with a gateway restart, and check for an HTTP/2-terminating hop in front of `:50051` first. A rejected agent recovers by re-registering. That logic exists from v0.13.0, but the released v0.13.0 and v0.14.0-rc6 agents wedge in their reconnect path with default settings (bug #2182, fixed by PR #5183, in no release yet) and recover only with `--no-auto-update`; v0.12.0 never recovers by itself (observed; older versions were not tested). Upgrade the agents first, then the gateway, with a build that includes the #2182 fix once released; until then restart an agent that stays rejected. Agents that do not connect through the gateway are not affected by this requirement (see Older agents). No wire or server change. See the section "Breaking: gateways fronted by an HTTP/2-terminating proxy or mesh sidecar" below and [Heartbeat admission](gateway.md#heartbeat-admission). |
 | 0.14.x | 0.12.0 | 0.12.0 | **Fleet visualization intra-cube edges (PR 8).** `/viz/fleet` now draws faint white lines (opacity `0.3`) inside each machine cube connecting process dots that are reciprocal ends of a loopback TCP socket (127.0.0.1 / ::1). Two operator-visible changes: (a) **wire shape** — `/api/v1/viz/fleet/topology` `schema_minor` bumps `1 → 2` and a new optional `dst_pid` field appears on `scope: local` connection edges. Renderers that ignore unknown keys per the contract see no break; strict-validating consumers pinned to `schema_minor == 1` should relax their validator to `minimum: 1`. (b) **dropped unmatched halves** — unpaired Local-scope edges (kernel snapshot race during teardown, agent's 4096-connection cap cutting a partner) are now dropped server-side before serialisation. Integrations counting `connections` array length per machine as a proxy for active IPC pairs should re-baseline after upgrade; the count trends marginally lower. Lines appear only when the host has active loopback flows (e.g. Prometheus scraping node_exporter, a client talking to local Redis / Postgres); a fresh agent with no inter-process loopback shows process dots but no lines — expected, not a regression. **Windows agent (#5196):** set update-signing options in the `YuzuAgent` service's `Environment` registry value, not its binary path. Every installer run rewrites the binary path and silently drops them, and uninstalling deletes the `Environment` value, so a deployment that uninstalls first must set it again (*Windows: the service's `Environment` value* in `server-admin.md`). Agent installers from 0.14.0-rc1 to rc5 also stop with exit code 7 wherever PowerShell runs in Constrained Language Mode; use this release's. **Before upgrading Windows agents:** this installer stops with exit code 7, naming the reason in its `/LOG=` file, if `C:\ProgramData\Yuzu\agent-certs` exists but is not secured (for example a folder created or pre-staged by hand, or one a Group Policy adds permissions to), if a file in it is not owned by Administrators or SYSTEM, or if it or anything in it is a junction, symbolic link, hard link or subdirectory (a backup subfolder, say). The agent service is left running when it stops. Provision the bundle after installing, by copying it in as an administrator. The trust-anchor procedure block in `server-admin.md` stops on the same conditions, naming the reason (and on a healthy or rc1–rc5 endpoint completes, repairing rc files, as long as each file in it is owned by Administrators or SYSTEM; `icacls "<file>" /setowner *S-1-5-32-544 /L` fixes one you placed yourself): run it on a few endpoints first, and pilot the upgrade before a fleet-wide push. **Linux native packages need a recent distribution:** the server needs Ubuntu 26.04 or Fedora 42 class, the agent Ubuntu 24.04 class or newer; Ubuntu 22.04, Debian 12 and RHEL/Rocky 9 are not supported by the native packages. Check before upgrading older hosts, or use the container images (*Supported Platforms* in the user manual README, #5143). |
 | 0.13.x | 0.12.0 | 0.12.0 | **Fleet visualization process layer.** `/viz/fleet` now renders interior process dots inside each machine cube, coloured by category (system/browser/database/web/runtime/other) — no operator action required, but operators upgrading from a 0.12.x build will see the dashboard suddenly populated with thousands of small spheres on next page load. Process data was already collected via `tar.fleet_snapshot` since 0.12.x; PR 7 only renders it. To suppress process visibility for specific agents (privacy-sensitive hosts, regulated workloads), set `process_enabled=false` on those agents via `tar.configure` — this also suppresses their dots on the visualization. Hover a dot to see pid/name/user/category; agent-controlled string fields are HTML-escaped and length-clamped before render. Per-cube dot count is soft-capped at 1000 for graceful degradation on heavily-threaded hosts; the cube tooltip still shows the true reported count. |
 | 0.12.x | 0.12.0 | 0.12.0 | **Build-time content auto-import.** All YAML files in `content/definitions/` (217 InstructionDefinitions) and `content/packs/` (10 InstructionSets at this version) are now embedded in the server binary and auto-imported on every startup. Existing operator-customised definitions with matching IDs are NEVER overwritten — conflicts are silently skipped. **Behaviour change for upgrades:** definitions that an operator previously DELETED via the REST API or dashboard will reappear after upgrade because the auto-import treats a missing row as "needs creation". To permanently suppress a shipped definition, set `enabled: false` via the dashboard or `PATCH /api/v1/definitions/{id}` rather than DELETE-ing the row. Each auto-import write emits an `audit_events.action="content.bundled_import"` row with `principal=system` so operators can audit which definitions were inserted at boot. **Yuzu dark navy palette + Inter webfont** (visual change every operator sees) and **Apache ECharts chart renderer** (replaces bespoke SVG; same payload contract — no operator migration required) ship in the same release. |
 
-**Rule of thumb:** agents and gateway should be the same minor version as the server, or one minor version behind. The server is always upgraded first. Upgrading the server first restarts it while gateways stay connected, which is the scenario in the known limitation under [Server-Side Setup](gateway.md#server-side-setup). That limitation was observed on one local rig after a SIGKILL restart (graceful upgrade restarts were not tested): agents behind a gateway can read offline, and dispatch worked only for the remaining route lease (up to about 90 s). The gateway-side fix is tracked in #1197.
+**Rule of thumb:** agents and gateway should be the same minor version as the server, or one minor version behind. The server is always upgraded first. Upgrading the server first restarts it while gateways stay connected. A gateway at this version re-registers the sessions the server reports unknown, so a server-only restart recovers without operator action once both sides are upgraded; see [What happens when the server restarts](gateway.md#what-happens-when-the-server-restarts). Behind a gateway that does not yet read that report (which includes the server restart that ships this fix, because the server is upgraded first; restart the gateway after upgrading it, and read the next sentence first), agents can read offline after a server restart (observed on one local rig after a SIGKILL restart; graceful upgrade restarts were not tested), and dispatch worked only for the remaining route lease (up to about 90 s). A gateway restart disconnects every agent that gateway holds, and the agent then has to register again by itself: in a graceful gateway restart test, released v0.13.0 and v0.14.0-rc6 agents with default settings stayed wedged and v0.12.0 never re-registered (bug #2182, fixed by #5183, which is in no release tag yet), while a build with the fix re-registered in 11 to 12 s. Upgrade the agents to a build that includes #5183 before the gateway restart where you have one, or expect to restart the agent service on the released agents behind it; see "Agent dependency" in [What happens when the server restarts](gateway.md#what-happens-when-the-server-restarts).
 
 ## Operator note: the software-inventory store migration (v7) is a hard cutover (#5172)
 
@@ -31,6 +32,56 @@ start after upgrade takes time that grows with the table (about 10-20 s at 4M ro
 not supported for this migration at this stage: above about 2 million rows stop every server replica,
 then start one and let it finish; below that, start one replica first. The procedure, the row-count query
 and the free-space guidance are in [Installed-Software Inventory](inventory.md) (Upgrading).
+
+## Behaviour change: `yuzu-server.cfg` no longer overrides a stored password (#5274); passwords are now changed in the product (#5342)
+
+**What changed.** Login now reads a local account's password from the PostgreSQL auth store (`auth.users`) **only**. Before this release the server loaded the password hashes in `yuzu-server.cfg` into memory at boot and checked them **first**, so a hash in the config file silently took precedence over the stored one on the server that loaded it. That is gone: the config file is now a **seed** — it provisions the first administrator into an empty `auth` schema, and is never consulted for an account the auth store already holds.
+
+**Who is affected — the password reverts.** Anyone who reset a password by editing (or regenerating) `yuzu-server.cfg` and restarting — including re-running the Windows server installer with a new `/ADMIN_PASS` on an existing install. **That no longer changes the password, and a password rotated that way reverts on upgrade:** the password that works is the one in the auth store, which for most installs is the one the account was first created with, and the rotated one stops working. If you had "reset" the admin password through the config file, sign in with the **original** password (or recover as below). **If you rotated it because the old one was exposed, reset it in the product immediately after upgrading** — until you do, the exposed password is the live one. At boot the server logs a warning naming each config-file account whose hash differs from the stored one ("#5274 cfg is seed-only; stored credential wins") and sets the gauge `yuzu_auth_cfg_credentials_stale` to their count, so you can see which accounts this affects.
+
+**The config file is still a bootstrap credential.** It seeds the first administrator whenever the auth schema is empty, so rebuilding onto an empty database (a lost or recreated Postgres, a restore onto a fresh database) brings back whatever password the file holds. Keep it protected, and change the administrator password in the product after any such rebuild. The reverse also holds: a **fresh install pointed at an already-populated database** (for example a reinstall, or a new server joining an existing cluster) seeds nothing — the installer's `/ADMIN_PASS` (or the first-run prompt) is written to the new config file but **ignored** by the server, and the accounts already in the database keep their passwords.
+
+**Windows server installer.** On an upgrade (a `yuzu-server.cfg` already exists in `%ProgramData%\Yuzu Server`), the installer now **refuses** a non-empty `/ADMIN_PASS=` or `/OPERATOR_PASS=` with **exit code 11** before it stops the service or changes anything, instead of writing a config file the server would ignore. The interactive wizard skips its account pages on an upgrade. Remove those parameters from your upgrade command lines (SCCM/Intune packages included); see the Windows server installer section of [Server Administration](server-admin.md) (#5196 note).
+
+**Rolling upgrades with more than one server.** A server still on the previous release keeps checking `yuzu-server.cfg` first and caching hashes, so it can keep accepting an old password after a change or reset made on an upgraded server, and it has no password routes (`404`). Upgrade every server before using **Change password** / **Reset password**, or before relying on a password change to lock someone out.
+
+**Passwords over 1024 bytes stop working.** The new maximum applies at sign-in too: `/login` answers a password longer than 1024 bytes as a wrong password, without hashing it, and the attempt counts toward [account lockout](server-admin.md#server-cli-flags). An account whose existing password is longer than that (only possible if it was set outside the product, for example a hand-generated config entry) can no longer sign in. An administrator resets it to a shorter one (Settings → User Management → **Reset password**, then **Unlock** if it locked); if it is the only administrator, use the direct-SQL fallback in the [auth-db-recovery runbook](../ops-runbooks/auth-db-recovery.md#password-reset).
+
+**What to use instead.**
+
+- Settings → User Management → **Change password** on your own row (`POST /api/v1/users/me/password`), or **Reset password** on another local account's row (`POST /api/v1/users/{name}/password` — a **durable Administrator** only: with RBAC off your own account must hold the `admin` role, with RBAC on you need a user `Administrator` grant; a JIT elevation, an IdP-group admin role or a custom role is refused; plus MFA step-up). See [Authentication](authentication.md#changing-and-resetting-a-local-password) and [REST API](rest-api.md#post-apiv1usersmepassword). Non-admin users have no dashboard page for their own change yet and use the REST call (#5353).
+- If no administrator can sign in at all: [auth-db-recovery runbook → Password reset](../ops-runbooks/auth-db-recovery.md#password-reset) (a direct-SQL fallback).
+
+**Also in this release.** Passwords must be 12–1024 bytes (UTF-8 bytes, not characters). A change or reset is **one database transaction**: the new password, the sign-out of every session of the account on every server, the discarding of an unfinished MFA enrolment, the target's lockout (reset only) and the audit row are saved together or not at all — a refusal or failure (`503 audit_unavailable` / `store_unavailable`) changes nothing. After changing your own password you are signed out and sign in again — no replacement session is issued. A reset leaves the target's API tokens and any enrolled second factor in place (the response reports the token count). The configured break-glass account cannot be reset over the API. Neither action has an MCP tool, by design (#5357 tracks a temporary-password tool). `/login` now answers `503` with `Retry-After` — not `401`, and with no lockout strike or `auth.login_failed` row — when a password cannot be verified because the auth store could not be read or the password changed while it was being checked; clients that treat every non-`401` as fatal should retry a `503`. New metrics: `yuzu_auth_password_changes_total{kind,result}`, `yuzu_auth_cfg_credentials_stale` and `yuzu_auth_credential_changed_during_verify_total`. New audit actions: `user.password_change`, `user.password_reset`.
+
+No config or data migration is required.
+
+## Behaviour change: per-OS plugin kill switch rows (#5294)
+
+The plugin kill switch can now be narrowed per agent OS (`windows`, `linux`, `darwin`). The
+`plugin_config_store` schema moves to v2 (`ALTER TABLE kill_switches ADD COLUMN os`). Existing
+plugin and action rows read back unchanged, so nothing flips on upgrade.
+
+- **Rollback.** v2 is an additive column and an older server starts on it without complaint (there
+  is no schema-ahead guard). A server older than this change ignores every `<plugin>@<os>` row:
+  per-OS OFF stops being enforced and its `GET` reports `enabled=true`.
+- **Mixed versions.** An older replica applies `PUT .../kill-switch?os=<os>` as the PLUGIN-LEVEL
+  row. `enabled=true` can therefore re-enable a plugin you stopped for the whole fleet, and
+  `enabled=false` stops the plugin on every OS. Set per-OS rows only after every replica runs this
+  build, and never write one from an older binary. After a rollback per-OS OFF rows stay stored
+  but are not enforced: if the plugin must stay stopped, set its plugin-level OFF row. Find your
+  rows in the `plugin_config.kill_switch.set` audit entries (`target_id`
+  `<plugin>[.<action>]@<os>`) and confirm each with `GET ...?os=<os>` once every replica is back on
+  this build.
+- **Limits.** An agent whose OS is unknown or empty is never withheld. The OS is what the agent
+  reports and is matched exactly (`windows`, `linux`, `darwin`). The MCP pre-dispatch dry run cannot
+  see the per-OS layer. Remote agents (connected through another replica) rely on the presence
+  snapshot.
+- **Integrations.** MCP clients should key on `status`, tolerate unknown fields and re-fetch
+  `tools/list`. `execute_instruction` has two new `status` values (`kill_switched_os`,
+  `os_gate_unreadable`) and its output schema now requires `agents_kill_switched_os` in every
+  zero-reach branch. The kill-switch REST responses gain additive `os` and `source` fields,
+  and the `/api/command` response gains `withheld_kill_switched_os`.
 
 ## Behaviour change: DEX device score and management-group member reads now fail closed on a degraded read (#4855, #1762)
 
@@ -76,6 +127,90 @@ here. See `docs/user-manual/audit-log.md`.
 `yuzu_server_ca_unpublished_revocation_check_failures_total` (the freshness pass's own
 self-heal *check* failing — distinct from a publish failing outright). See
 `docs/user-manual/metrics.md`. No operator action required; both are additive.
+
+## ⚠️ Breaking: gateways fronted by an HTTP/2-terminating proxy or mesh sidecar (#3869)
+
+Affects you only if you run the Erlang gateway and agents reach it through something that terminates
+HTTP/2: an HTTP/2-aware reverse proxy (for example nginx `grpc_pass`), an L7 load balancer, or a
+service-mesh sidecar. Agents that connect to `:50051` directly, or through an L4 / TLS-passthrough
+path that keeps one TCP connection per agent, are not affected by the proxy requirement; see Older
+agents and the registry restart note below.
+
+**Minimum agent version.** An agent rejected by the gateway recovers by re-registering through its
+`NOT_FOUND` handling. That logic exists from v0.13.0, but the released v0.13.0 and v0.14.0-rc6 agents
+wedge in their reconnect path with default settings (bug #2182, fixed by PR #5183, which is in no
+release yet) and recover only with `--no-auto-update` (observed with v0.13.0 and v0.14.0-rc6), or on a
+build that includes the fix. v0.12.0 never recovers by itself (observed; older versions were not tested). Upgrade the
+agents first, then the gateway, using a build that includes the #2182 fix once released; until then,
+restart an agent that stays rejected (restarting the agent service re-registers it). Agents that do
+not connect through the gateway are not affected by this requirement.
+
+The gateway now admits an agent `Heartbeat` only on the HTTP/2 connection that opened the session's
+`Subscribe` stream, and only for a session that gateway node holds. A heartbeat that arrives on any
+other connection is answered `NOT_FOUND` (`unknown session`), counted and not forwarded.
+HTTP/2-terminating proxies are unsupported: they may cause repeated heartbeat rejection or share
+gateway-side connections across agents, removing the per-agent connection separation this check
+requires. Observed in a test with nginx `grpc_pass` in front of two agents: every heartbeat was
+rejected, agents still enrolled and received commands, no heartbeat reached the server and the
+server's online count flickered; an L4 TCP forwarder (nginx `stream`) caused no rejections. Each rejection raises
+`yuzu_gw_heartbeat_session_mismatch_total{event="security"}` or `yuzu_gw_heartbeat_rejected_total{reason}`
+and appears in a rate-limited gateway summary log line (the `connection_mismatch=` count). The
+agent-facing message is the same `unknown session` for every reason, so diagnose from the counters
+and that log line.
+
+**Check before upgrading.** Look for an HTTP/2-terminating hop between the agents and `:50051`
+(reverse proxy, L7 load balancer, mesh sidecar). If there is one, move agents to an L4 or
+TLS-passthrough path first, or exempt `:50051` from the proxy. Also check the agent versions of
+your fleet (the Hardware list at `/hardware` shows each device's agent version) and upgrade every
+agent older than 0.13.0 that connects through the gateway before you deploy the new gateway, and
+plan to restart any released 0.13.0 or rc6 agent that stays rejected; see Older agents below.
+
+**Restart requirement.** Deploy the new gateway with a restart. The session index is created when the
+gateway registry starts and hot code upgrade is not supported for this change. A node that had the
+new code loaded without a restart has no index table, rejects every heartbeat as
+`registry_unavailable`, and reports `sessions_index` in `/readyz` (503 while the table is missing).
+
+**Rollback.** Redeploy the previous gateway release. The only new state is the in-memory session index,
+and there is no wire, agent or server change, so nothing needs migrating; agents with the reconnect
+fix re-register on their own (released agents may need a restart, see the next paragraph for older
+agents), and a rollback removes the connection check. This path
+is derived from the change and was not run.
+
+**Older agents.** A rejected agent recovers by re-registering through its `NOT_FOUND` handling
+(escalating cooldown, 2 s doubling to a 300 s cap). That logic exists from v0.13.0 (checked in the
+agent source), but in the released v0.13.0 and v0.14.0-rc6 agents it is blocked by bug #2182 (the
+update-check thread join wedges the reconnect teardown; inferred cause), fixed by PR #5183, which is
+in no release yet. With default settings those agents log `(#1894)` and `Heartbeat thread stopped`
+and then never re-register (observed, 19 minutes, reproduced on a second agent); with
+`--no-auto-update` they re-registered 20 to 21 s after a gateway registry restart (observed with
+v0.13.0 and v0.14.0-rc6; it is a command-line flag with no environment variable). Agent v0.12.0 only logs `Heartbeat failed` and never re-registers by itself (older versions were not tested)
+(observed with v0.12.0, 29 failures in 14.5 minutes with default settings; a `--no-auto-update` run was watched for only about 2 minutes and behaved the same; older than v0.12.0 was not tested), so for persistent missing state they stay
+rejected until restarted or upgraded (such agents were still counted online by the server's `/health` `agents.online` in the rig, so check the rejection counters and the agent log, not the online count; a heartbeat that falls in the short gap between the session
+leaving the pending table and its agent process registering can succeed later without
+re-registration). Upgrade the agents first, then the gateway, with a build that includes the #2182
+fix once released; until then, restart an agent that stays rejected (restarting the agent service
+re-registers it). Agents that do not connect through the gateway are not affected. This matters
+only when heartbeats are rejected, which happens in four cases:
+
+- a topology that breaks the one-connection assumption;
+- a gateway running without the session index;
+- a gateway registry process restart or crash while agent connections stay up. The registry
+  recreates its tables empty, so every heartbeat for the agents it held is rejected until they
+  re-register. A node failover that leaves the session not held by the surviving node is expected
+  to behave the same way (inferred, not tested);
+- for released agents, a gateway process restart. In a graceful SIGTERM and restart run the
+  released agents tested (v0.14.0-rc6, v0.13.0, v0.12.0, default settings) did not notice the lost
+  `Subscribe` stream, sent their next heartbeats over a re-established channel to the new gateway
+  and got `NOT_FOUND`; v0.14.0-rc6 and v0.13.0 then wedged (no re-register through the 1 minute
+  40 s the run watched them) and v0.12.0 kept logging failures. The agent built from the branch
+  tree noticed the lost stream and re-registered in 11 to 12 s with no rejections (observed).
+  Restart released agents after a gateway restart if they stay rejected.
+
+The registry-restart recovery in 17 to 37 s was observed with agents built from the branch tree
+(version 0.14.0, which includes the #2182 fix). Released agents were observed as described above.
+
+See [Heartbeat admission](gateway.md#heartbeat-admission) for the supported topologies, counters and
+runbook.
 
 ## ⚠️ Breaking: `GET /api/v1/openapi.json` now requires authentication (#2057)
 
@@ -3025,7 +3160,7 @@ genuine read-only dry run, matching its documented `readOnlyHint: true`.
 
 Always upgrade in this order:
 
-1. **Server** -- new server versions accept connections from older agents. Restarting the server while a gateway stays connected has a known limitation: see [Server-Side Setup](gateway.md#server-side-setup) (a gateway-only restart as a remedy was not tested)
+1. **Server** -- new server versions accept connections from older agents. A server-only restart while a gateway stays connected recovers without operator action once the gateway is also at this version; see [What happens when the server restarts](gateway.md#what-happens-when-the-server-restarts) (an older gateway keeps the previous behaviour described there)
 2. **Gateway** -- updated to match server protocol changes
 3. **Agents** -- can be upgraded via OTA or manually, in batches
 
@@ -3330,7 +3465,7 @@ Start-Service yuzu-server  # or start manually
 
 ## Upgrading the Gateway
 
-If the server was restarted while this gateway stayed connected, see the known limitation under [Server-Side Setup](gateway.md#server-side-setup) first; whether restarting only the gateway recovers it was not tested.
+If the server was restarted while this gateway stayed connected, see [What happens when the server restarts](gateway.md#what-happens-when-the-server-restarts) first. The server is upgraded first, so the server restart that ships this fix meets the OLD gateway, and agents behind it can read offline until the gateway is upgraded. Upgrade the gateway and restart it: this version's gateway then recovers a later server restart by itself. A gateway restart disconnects every agent that gateway holds, so it is a fleet-wide reconnect for it, and released v0.13.0 and v0.14.0-rc6 agents with default settings stayed wedged after a graceful gateway restart in testing (v0.12.0 never re-registered; bug #2182, fixed by #5183, in no release tag yet): upgrade the agents to a build that includes #5183 first, or expect to restart the agent service on those agents (see "Agent dependency" in the section linked above). Whether restarting only the gateway recovers agents stranded by an earlier server restart was not tested.
 
 ### Linux (systemd)
 

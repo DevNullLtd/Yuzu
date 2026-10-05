@@ -389,14 +389,11 @@ jobs:
           set +e
           rebar3 as test eunit --dir apps/yuzu_gw/test 2>&1 | tee eunit.log
           RC=${PIPESTATUS[0]}
-          # Allow exit 1 if all tests passed but meck fixtures were cancelled
-          if [ "$RC" -ne 0 ]; then
-            if grep -q "Failed: 0" eunit.log && grep -q "Passed:" eunit.log; then
-              echo "::warning::EUnit exited $RC but 0 tests failed (meck fixture cancellation)"
-            else
-              exit "$RC"
-            fi
-          fi
+          # One parser for every gateway test gate (scripts/gateway_test_summary.py,
+          # pinned by tests/test_gateway_test_summary.py): >= 1 test must have
+          # EXECUTED (#4800), and a non-zero exit is tolerated only for eunit's
+          # "Failed: 0" line with tests passed (meck fixture cancellation, #1005).
+          python3 ../scripts/gateway_test_summary.py cancel-tolerant "$RC" eunit.log --github
 
       - name: Run Dialyzer
         working-directory: gateway

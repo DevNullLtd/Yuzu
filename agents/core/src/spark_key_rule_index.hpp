@@ -16,7 +16,9 @@
  *      for MANY rules (governance UP-11 / happy-path Issue 2).
  *   2. Shared-watcher refcount. add() reports the 0->1 edge (arm the watcher)
  *      and remove_rule() reports the ->0 edge (disarm it), so withdrawing rule
- *      A never blinds rule B that shares the same key.
+ *      A never blinds rule B that shares the same key. (erase_rule() reports
+ *      that edge too; a caller that discards it owes the disarm some other way:
+ *      GuardianSparkRuntime's heartbeat orphan pass does for a discarded one.)
  *
  * Proto-free and lock-free by design: plain state owned by one consumer and
  * mutated only under that consumer's own serialisation. Each rule maps to
@@ -117,6 +119,18 @@ public:
 
     /// The key `rule_id` is currently mapped to, or nullopt if unknown.
     [[nodiscard]] std::optional<std::string> key_for_rule(std::string_view rule_id) const;
+
+    /// True IFF `rule_id` is mapped to exactly `spark_key` AND the mapping is currently
+    /// owned by `generation`. Does not mutate. erase_rule() tests the generation alone (it
+    /// has no key argument), so owns() is the stricter test; the two agree in practice
+    /// because a generation is unique per attach. Heterogeneous lookup, no allocation.
+    /// False for an unknown rule, a different key, or a stale generation.
+    [[nodiscard]] bool owns(std::string_view spark_key, std::string_view rule_id,
+                            std::uint64_t generation) const noexcept {
+        const auto it = by_rule_.find(rule_id);
+        return it != by_rule_.end() && it->second.key == spark_key &&
+               it->second.generation == generation;
+    }
 
     [[nodiscard]] bool empty() const noexcept { return by_rule_.empty(); }
     [[nodiscard]] std::size_t key_count() const noexcept { return by_key_.size(); }

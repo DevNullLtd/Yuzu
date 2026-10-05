@@ -198,6 +198,9 @@ struct FakeBackend : ISparkBackend {
     std::atomic<int> disarm_entries{0};
     std::atomic<bool> fail_arm{false};
     std::atomic<bool> throw_arm{false}; ///< arm() throws (a backend that throws, not just fails)
+    /// #5322: the NEXT disarm() call throws (consumed once), after it is counted at entry.
+    /// SparkEngine::disarm is non-throwing by design; this stands in for a backend that is not.
+    std::atomic<bool> throw_next_disarm{false};
     // #2233 item 3: park the NEXT arm() call (on whichever thread calls it - the
     // GuardianIoExecutor detached worker in production/these tests) until
     // release_hang() is called. Mirrors FakeServiceMechanism's hang idiom in
@@ -267,6 +270,8 @@ struct FakeBackend : ISparkBackend {
     }
     void disarm(std::uint64_t sub) override {
         disarm_entries.fetch_add(1);
+        if (throw_next_disarm.exchange(false))
+            throw std::runtime_error("disarm boom");
         if (hang_next_disarm.exchange(false)) {
             std::unique_lock<std::mutex> lk{disarm_gate_mu_};
             disarm_entered_hang_ = true;
@@ -7198,120 +7203,6 @@ TEST_CASE("rung 9c PR-5a (#4221 up-101/ch-101): a same-rule_id re-attach behind 
     rt->begin_stop();
 }
 
-// EXPLORATORY (not yet reviewed - do not treat as settled coverage): investigating
-// whether publish_arm_verdicts_locked's ORDINARY (non-firewall) pop loop can leave a
-// permanent ghost SparkKeyRuleIndex entry when a withdrawn sibling's
-// release_claim_index_locked call fails exactly once and is never retried. Unlike the
-// firewall branch (guardian_spark_runtime.cpp:602-620, which explicitly re-checks
-// index_held and keeps a release-failed claim as a retained tombstone), the ordinary
-// pop loop at :580-601 pops every finished claim based solely on outcome presence and
-// fifo-front identity - it does not check whether that claim's index release actually
-// succeeded. If confirmed, this produces an index entry with NO corresponding fifo
-// residue at all (unlike up-101's tombstone), so no existing sweep can ever find it.
-TEST_CASE("EXPLORATORY: a release failure on a withdrawn sibling during the ORDINARY "
-          "(non-firewall) publish path - does the claim get popped while its index "
-          "mapping survives?",
-          "[spark][runtime][liveness][.exploratory]") {
-    auto r = std::make_shared<FakeReader>();
-    auto b = std::make_shared<FakeBackend>();
-    b->hang_next_arm.store(true);
-    auto rt = make_rt(r, b, GuardianSparkRuntime::Config{.backend_op_deadline = std::chrono::seconds(30)});
-    const auto key = spark_key(file_spec("/a"));
-
-    // r1 hangs as the head. r2 queues behind it via a genuinely concurrent attach
-    // (NOT the gap-hook trick - r2 must be live/queued, not withdrawn, at the moment
-    // r1's arm resolves is NOT what we want here; we want r2 ALREADY withdrawn with a
-    // FAILED release before r1 resolves, so r1's own "withdrawn siblings" loop is what
-    // attempts r2's release).
-    QueuedAttach a1;
-    a1.t = std::thread{[&] { a1.gen = rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true); }};
-    REQUIRE(b->wait_entered_hang(std::chrono::seconds(30)));
-
-    QueuedAttach a2;
-    a2.t = std::thread{[&] { a2.gen = rt->attach_rule("r2", file_spec("/a"), file_exists_rule("r2"), true); }};
-    REQUIRE(yuzu::test::spin_until([&] { return rt->claim_queue_depth_for_test(key) == 2; },
-                                   std::chrono::seconds(10)));
-
-    // Withdraw r2 (Case-0: still Queued, behind r1) with its OWN index release forced
-    // to fail. It should become a retained tombstone (matches up-101's own finding).
-    rt->set_index_remove_fault_for_test(true);
-    rt->detach_rule("r2");
-    a2.t.join();
-    REQUIRE_FALSE(a2.gen.has_value());
-    CHECK(a2.gen.error() == "withdrawn");
-    CHECK(rt->claim_index_release_failures() == 1);
-    CHECK(rt->claim_queue_depth_for_test(key) == 2); // r1 (head) + r2 (retained tombstone)
-
-    // Re-arm the SAME seam again, from the main thread, BEFORE releasing r1's hang -
-    // so that when r1's own on_arm_complete pass retries r2's release (in its
-    // "withdrawn siblings" loop), THAT attempt fails too.
-    rt->set_index_remove_fault_for_test(true);
-    b->release_hang();
-    a1.t.join();
-    REQUIRE(a1.gen); // r1 itself succeeds and commits normally
-
-    CHECK(rt->claim_index_release_failures() == 2); // r2's release failed a SECOND time
-    CHECK(rt->rule_count() == 1);                   // only r1 is a real, live rule
-    CHECK(rt->armed_key_count() == 1);
-
-    // THE QUESTION: did r2 get popped from the fifo anyway, despite its release
-    // failing? If the ordinary pop loop pops unconditionally (as read from source),
-    // this should be 0 - r2 is gone from claims_[key] entirely, with NOTHING left to
-    // sweep, even though its index entry was never actually released.
-    INFO("claim_queue_depth after r1 commits: " << rt->claim_queue_depth_for_test(key));
-    CHECK(rt->claim_queue_depth_for_test(key) == 0);
-
-    // If the above is 0 (ghost with no fifo trace), r1's OWN eventual detach should
-    // find refcount(key) == 2 (r1 + the ghost "r2"), so remove_rule("r1") reports
-    // siblings remain and NEVER returns the ->0 edge - the real backend subscription
-    // for r1 should therefore NEVER get disarmed, even though r1 is the only rule
-    // left anywhere in rules_/keys_/claims_.
-    const auto arms_before_detach = b->arms.load();
-    const auto disarms_before_detach = b->disarms.load();
-    rt->detach_rule("r1");
-    CHECK(rt->rule_count() == 0);
-    // CORRECTED prediction (first run showed my original guess was wrong in the WORSE
-    // direction): armed_key_count() stays 1, not 0. keys_.erase() is gated on
-    // detach_rule_locked's own `disarm_key` (only set when index_->remove_rule reports
-    // the ->0 edge) - the ghost "r2" still counted in the index means remove_rule("r1")
-    // reports siblings remain, so keys_[key] (and its live PerKey/subscription) is
-    // NEVER erased, even though r1 was the only real rule left anywhere.
-    CHECK(rt->armed_key_count() == 1);
-    // Give any (unexpected) async disarm a moment to land, then check whether it did.
-    std::this_thread::sleep_for(std::chrono::milliseconds(200));
-    INFO("arms before=" << arms_before_detach << " after=" << b->arms.load()
-                        << " disarms before=" << disarms_before_detach
-                        << " after=" << b->disarms.load());
-    CHECK(b->disarms.load() == disarms_before_detach); // PREDICTED: no new disarm fired -
-                                                       // the real subscription is leaked,
-                                                       // permanently armed on the backend,
-                                                       // because remove_rule("r1") still
-                                                       // sees the ghost "r2" as a sibling.
-
-    // Confirm the ghost is PERMANENT: a fresh attach for a NEW rule on the SAME spec
-    // (same key) - does it see the key as already "claimed" or "armed" and behave
-    // oddly, given keys_[key] never went away? And can the key EVER be torn down
-    // again, e.g. via begin_stop's own teardown sweep?
-    const auto arms_before_r4 = b->arms.load();
-    auto gen_r4 = rt->attach_rule("r4", file_spec("/a"), file_exists_rule("r4"), true);
-    INFO("r4 attach: has_value=" << gen_r4.has_value()
-                                 << (gen_r4.has_value() ? "" : (" error=" + gen_r4.error()))
-                                 << " arms before=" << arms_before_r4 << " after=" << b->arms.load()
-                                 << " rule_count=" << rt->rule_count()
-                                 << " armed_key_count=" << rt->armed_key_count());
-    CHECK(gen_r4.has_value()); // does it even succeed?
-    CHECK(rt->rule_count() == 1); // r1 was properly erased from rules_ regardless (the
-                                  // ghost is index-only) - only r4 should be tracked
-    CHECK(b->arms.load() == arms_before_r4); // PREDICTED: r4 silently reuses r1's OLD,
-                                             // still-armed-on-the-backend subscription
-                                             // via the stale keys_[key] entry, WITHOUT
-                                             // a new backend arm() call - r4 ends up
-                                             // sharing a subscription nobody re-verified
-                                             // is even still valid for r4's OWN spec.
-
-    rt->begin_stop();
-}
-
 // rung 9c PR-2 Unit 4 (adversarial review C1, PR #4318 fjarvis): on_arm_complete's
 // compensating branch built the ArmCompensation continuation (a heap allocation plus
 // a string copy) entirely OUTSIDE any try, while a live, un-disarmed backend
@@ -7824,6 +7715,970 @@ TEST_CASE("rung 9c R5.2 (governance pass-3 cs-2): a firewalled drain whose index
     CHECK(rt->rule_count() == 1);
     CHECK(b->arms.load() == 2);
     CHECK(rt->claim_queue_depth_for_test(key) == 0); // tombstone swept, release retried
+}
+
+// #4354: publish_arm_verdicts_locked's ORDINARY (non-firewall) pop loop used to pop every
+// finished claim on fifo-front identity alone, so a claim whose index release had FAILED
+// (the retry at the end of on_arm_complete's success branch, or the compensating /
+// live.empty / adopted branches) left a (key, rule) mapping in index_ with no fifo
+// residue for any sweep to find. The firewall branch (cs-2 above) already keeps such a
+// claim as a withdrawn Queued tombstone; these cases pin the same for the ordinary pop.
+// Two things are pinned, and the titles say which. The RETAIN branch itself (a release
+// that fails at the pop) is hit by the adopted-wedge case, the two recovery-pop cases
+// and the firewalled-follower case at the end. The other cases pin the RETRY before the
+// pop: the one-shot seam is spent by an earlier staging release, so the pop-time release
+// succeeds and the claim is popped with its mapping gone.
+//
+// All of them observe the leak by consequence, not by counting failures (a failure count
+// does not prove the mapping was cleaned up): a ghost mapping makes the key's refcount
+// stay above zero, so the real owner's detach never reaches the 0-edge (no backend
+// disarm, armed_key_count stays 1) and a later attach joins a watcher nobody re-armed -
+// or, when the head never committed, throws out of keys_.at.
+namespace {
+/// Wait until `key`'s claim queue is empty and every executor worker has exited.
+/// FakeBackend::disarm bumps `disarms` BEFORE the runtime pops the Disarm claim, so
+/// spinning on `disarms` alone races a negative assertion or teardown.
+void settle_key_claims(GuardianSparkRuntime& rt, const std::string& key) {
+    REQUIRE(yuzu::test::spin_until([&] { return rt.claim_queue_depth_for_test(key) == 0; },
+                                   std::chrono::seconds(10)));
+    REQUIRE(yuzu::test::spin_until([&] { return rt.active_backend_op_workers() == 0; },
+                                   std::chrono::seconds(10)));
+}
+} // namespace
+
+TEST_CASE("#4354: a withdrawn sibling whose index release failed at staging is retried before "
+          "the ordinary pop, never popped with its mapping - the key still disarms and re-arms",
+          "[spark][runtime][liveness]") {
+    // Mutation: drop the release-or-retain at the ordinary pop (the pre-fix loop) -> r2's
+    // mapping outlives its pop; r1's detach never reaches the 0-edge (armed_key_count()
+    // stays 1, no disarm) and r4 joins the old watcher without a new backend arm.
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    b->hang_next_arm.store(true);
+    auto rt = make_rt(r, b, GuardianSparkRuntime::Config{.backend_op_deadline = std::chrono::seconds(30)});
+    const auto key = spark_key(file_spec("/a"));
+
+    // Threads before the guard (the file's idiom): on unwind the guard releases the parked
+    // backend first, then the QueuedAttach destructors join attaches that have returned.
+    QueuedAttach a1, a2;
+    struct Cleanup {
+        FakeBackend* backend;
+        ~Cleanup() { backend->release_hang(); }
+    } cleanup{b.get()};
+
+    a1.t = std::thread{[&] { a1.gen = rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true); }};
+    REQUIRE(b->wait_entered_hang(std::chrono::seconds(30)));
+    a2.t = std::thread{[&] { a2.gen = rt->attach_rule("r2", file_spec("/a"), file_exists_rule("r2"), true); }};
+    REQUIRE(yuzu::test::spin_until([&] { return rt->claim_queue_depth_for_test(key) == 2; },
+                                   std::chrono::seconds(10)));
+
+    // Withdraw r2 (Queued behind the hung head) with its own index release failing once:
+    // it stays as a withdrawn tombstone holding its mapping.
+    rt->set_index_remove_fault_for_test(true);
+    rt->detach_rule("r2");
+    a2.t.join();
+    REQUIRE_FALSE(a2.gen.has_value());
+    CHECK(a2.gen.error() == "withdrawn");
+    CHECK(rt->claim_index_release_failures() == 1);
+    CHECK(rt->claim_queue_depth_for_test(key) == 2); // r1 (head) + r2 (tombstone)
+
+    // Re-arm the one-shot seam BEFORE releasing the hang, so the first release of r2 in
+    // r1's own drain (the staging loop in its success branch) fails. The seam is then
+    // spent, so the pop-time retry succeeds: this case pins that retry, not the retain.
+    rt->set_index_remove_fault_for_test(true);
+    b->release_hang();
+    a1.t.join();
+    REQUIRE(a1.gen); // r1 itself commits normally
+
+    settle_key_claims(*rt, key);
+    CHECK(rt->claim_index_release_failures() == 2); // detach + the staging release; the pop-time retry succeeded
+    CHECK(rt->rule_count() == 1);
+    CHECK(rt->armed_key_count() == 1);
+
+    // r2's mapping must be gone: r1 is now the key's only owner, so its detach reaches the
+    // 0-edge synchronously (keys_.erase under detach's own lock) and disarms the watcher.
+    const auto disarms_before = b->disarms.load();
+    rt->detach_rule("r1");
+    CHECK(rt->rule_count() == 0);
+    REQUIRE(rt->armed_key_count() == 0); // a surviving ghost mapping keeps the key armed
+    CHECK(yuzu::test::spin_until([&] { return b->disarms.load() == disarms_before + 1; },
+                                 std::chrono::seconds(10)));
+    settle_key_claims(*rt, key);
+    CHECK(b->disarms.load() == disarms_before + 1);
+
+    // ...and a fresh attach on the key arms anew.
+    const auto arms_before = b->arms.load();
+    std::expected<std::uint64_t, std::string> gen4;
+    REQUIRE_NOTHROW(gen4 = rt->attach_rule("r4", file_spec("/a"), file_exists_rule("r4"), true));
+    REQUIRE(gen4);
+    CHECK(b->arms.load() == arms_before + 1);
+    CHECK(rt->rule_count() == 1);
+    CHECK(rt->armed_key_count() == 1);
+    CHECK(rt->claim_queue_depth_for_test(key) == 0);
+    rt->begin_stop();
+}
+
+TEST_CASE("#4354: a live follower queued behind a withdrawn tombstone commits as a sibling and "
+          "the queue drains in the same call once the pop-time retry of the tombstone's release "
+          "succeeds",
+          "[spark][runtime][liveness]") {
+    // Mutation: as the case above (r2's mapping leaks), and additionally pinning that the
+    // follower behind the retained claim is neither popped out of order nor stranded: the
+    // queue still drains to 0 and BOTH live rules commit onto the one watcher.
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    b->hang_next_arm.store(true);
+    auto rt = make_rt(r, b, GuardianSparkRuntime::Config{.backend_op_deadline = std::chrono::seconds(30)});
+    const auto key = spark_key(file_spec("/a"));
+
+    QueuedAttach a1, a2, a3;
+    struct Cleanup {
+        FakeBackend* backend;
+        ~Cleanup() { backend->release_hang(); }
+    } cleanup{b.get()};
+
+    a1.t = std::thread{[&] { a1.gen = rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true); }};
+    REQUIRE(b->wait_entered_hang(std::chrono::seconds(30)));
+    a2.t = std::thread{[&] { a2.gen = rt->attach_rule("r2", file_spec("/a"), file_exists_rule("r2"), true); }};
+    REQUIRE(yuzu::test::spin_until([&] { return rt->claim_queue_depth_for_test(key) == 2; },
+                                   std::chrono::seconds(10)));
+    a3.t = std::thread{[&] { a3.gen = rt->attach_rule("r3", file_spec("/a"), file_exists_rule("r3"), true); }};
+    REQUIRE(yuzu::test::spin_until([&] { return rt->claim_queue_depth_for_test(key) == 3; },
+                                   std::chrono::seconds(10)));
+
+    rt->set_index_remove_fault_for_test(true);
+    rt->detach_rule("r2");
+    a2.t.join();
+    REQUIRE_FALSE(a2.gen.has_value());
+    CHECK(rt->claim_index_release_failures() == 1);
+    CHECK(rt->claim_queue_depth_for_test(key) == 3); // r1 (head), r2 (tombstone), r3 (live)
+
+    rt->set_index_remove_fault_for_test(true);
+    b->release_hang();
+    a1.t.join();
+    a3.t.join();
+    REQUIRE(a1.gen);
+    REQUIRE(a3.gen); // r3 committed as a sibling of r1's watcher
+
+    settle_key_claims(*rt, key);
+    CHECK(rt->claim_index_release_failures() == 2);
+    CHECK(rt->rule_count() == 2);
+    CHECK(rt->armed_key_count() == 1);
+    CHECK(b->arms.load() == 1); // one shared watcher, r3 never armed its own
+
+    // No ghost: the key tears down only when the LAST live rule leaves, then disarms once.
+    const auto disarms_before = b->disarms.load();
+    rt->detach_rule("r1");
+    CHECK(rt->rule_count() == 1);
+    CHECK(rt->armed_key_count() == 1);
+    rt->detach_rule("r3");
+    CHECK(rt->rule_count() == 0);
+    REQUIRE(rt->armed_key_count() == 0); // a surviving ghost mapping keeps the key armed
+    CHECK(yuzu::test::spin_until([&] { return b->disarms.load() == disarms_before + 1; },
+                                 std::chrono::seconds(10)));
+    settle_key_claims(*rt, key);
+    CHECK(b->disarms.load() == disarms_before + 1);
+    rt->begin_stop();
+}
+
+TEST_CASE("#4354: an ADOPTED wedge's late success retains a withdrawn follower whose index "
+          "release fails, instead of popping it with its mapping",
+          "[spark][runtime][liveness]") {
+    // Mutation: drop the release-or-retain at the ordinary pop -> the adopted branch
+    // attempts no release on r2, so it is popped with its mapping (failures stays 1) and
+    // r1's detach never reaches the 0-edge. The seam is re-armed so that a helper which
+    // retried but IGNORED the result would leak too: the failed retry must keep the claim.
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    b->hang_next_arm.store(true);
+    auto rt = make_rt(r, b, GuardianSparkRuntime::Config{.backend_op_deadline =
+                                                         std::chrono::milliseconds(50)});
+    const auto key = spark_key(file_spec("/a"));
+
+    struct Cleanup {
+        FakeBackend* backend;
+        ~Cleanup() { backend->release_hang(); } // idempotent - the explicit release below still fires
+    } cleanup{b.get()};
+
+    auto res1 = rt->attach_rule(GuardianSparkRuntime::NonWaiting{}, "r1", file_spec("/a"),
+                                file_exists_rule("r1"), true);
+    REQUIRE(b->wait_entered_hang(std::chrono::seconds(30)));
+    REQUIRE(res1.has_value());
+    auto res2 = rt->attach_rule(GuardianSparkRuntime::NonWaiting{}, "r2", file_spec("/a"),
+                                file_exists_rule("r2"), true);
+    REQUIRE(res2.has_value());
+    REQUIRE(rt->claim_queue_depth_for_test(key) == 2);
+
+    // Withdraw r2 (Queued behind the hung head) with its release failing: a tombstone.
+    rt->set_index_remove_fault_for_test(true);
+    rt->detach_rule("r2");
+    CHECK(rt->claim_index_release_failures() == 1);
+    CHECK(rt->claim_queue_depth_for_test(key) == 2);
+
+    // Wedge r1 BEFORE re-arming the seam (the expiry releases r1's own index mapping, which
+    // would otherwise spend it). r2 withdrew, so r1 is a lone wedge and keeps rg->active.
+    // KeyClaim::deadline is steady_clock, so poll the expiry rather than sleeping.
+    REQUIRE(yuzu::test::spin_until([&] { return rt->expire_overdue_claims() >= 1; },
+                                   std::chrono::seconds(10)));
+    CHECK(rt->receipt_status(res1->receipt) == GuardianSparkRuntime::ReceiptStatus::Wedged);
+    CHECK(rt->claim_index_release_failures() == 1);
+
+    rt->set_index_remove_fault_for_test(true);
+    b->release_hang();
+    REQUIRE(yuzu::test::spin_until([&] { return rt->rule_count() == 1; }, std::chrono::seconds(10)));
+    settle_key_claims(*rt, key);
+    CHECK(b->disarms.load() == 0); // r1 adopted, not disarmed
+    CHECK(rt->claim_index_release_failures() == 2); // the drain DID retry r2's release
+    CHECK(rt->armed_key_count() == 1);
+
+    // r2's mapping is gone, so r1's detach reaches the 0-edge and disarms.
+    rt->detach_rule("r1");
+    CHECK(rt->rule_count() == 0);
+    REQUIRE(rt->armed_key_count() == 0); // a surviving ghost mapping keeps the key armed
+    CHECK(yuzu::test::spin_until([&] { return b->disarms.load() == 1; }, std::chrono::seconds(10)));
+    settle_key_claims(*rt, key);
+
+    const auto arms_before = b->arms.load();
+    std::expected<std::uint64_t, std::string> gen4;
+    REQUIRE_NOTHROW(gen4 = rt->attach_rule("r4", file_spec("/a"), file_exists_rule("r4"), true));
+    REQUIRE(gen4);
+    CHECK(b->arms.load() == arms_before + 1);
+    CHECK(rt->armed_key_count() == 1);
+    rt->begin_stop();
+}
+
+TEST_CASE("#4354: a withdrawn head whose late success is compensated (live.empty) and whose "
+          "staging release failed is retried before the pop, not popped as a ghost - the next "
+          "attach arms",
+          "[spark][runtime][liveness]") {
+    // Mutation: pop the compensated head regardless of its release result -> its mapping
+    // survives with no keys_ entry (the head never committed), so r4's attach takes the
+    // shared-watcher branch and throws std::out_of_range from keys_.at.
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    b->hang_next_arm.store(true);
+    auto rt = make_rt(r, b, GuardianSparkRuntime::Config{.backend_op_deadline = std::chrono::seconds(30)});
+    const auto key = spark_key(file_spec("/a"));
+
+    struct Cleanup {
+        FakeBackend* backend;
+        ~Cleanup() { backend->release_hang(); }
+    } cleanup{b.get()};
+
+    auto res1 = rt->attach_rule(GuardianSparkRuntime::NonWaiting{}, "r1", file_spec("/a"),
+                                file_exists_rule("r1"), true);
+    REQUIRE(b->wait_entered_hang(std::chrono::seconds(30)));
+    REQUIRE(res1.has_value());
+    REQUIRE(rt->claim_queue_depth_for_test(key) == 1);
+
+    // Withdraw the in-flight head: it stays as the key's Dispatched marker, its release
+    // failing once so it still holds its mapping.
+    rt->set_index_remove_fault_for_test(true);
+    rt->detach_rule("r1");
+    CHECK(rt->claim_index_release_failures() == 1);
+    CHECK(rt->claim_queue_depth_for_test(key) == 1);
+
+    // The late success finds no live claim (live.empty), whose own staging release of the
+    // head fails again (the seam is then spent, so the pop-time retry succeeds), and the
+    // subscription is disarmed by the deferred compensating path.
+    rt->set_index_remove_fault_for_test(true);
+    b->release_hang();
+    REQUIRE(yuzu::test::spin_until([&] { return b->disarms.load() == 1; }, std::chrono::seconds(10)));
+    settle_key_claims(*rt, key);
+    CHECK(rt->claim_index_release_failures() == 2);
+    CHECK(rt->rule_count() == 0);
+    CHECK(rt->armed_key_count() == 0);
+
+    const auto arms_before = b->arms.load();
+    std::expected<std::uint64_t, std::string> gen4;
+    REQUIRE_NOTHROW(gen4 = rt->attach_rule("r4", file_spec("/a"), file_exists_rule("r4"), true));
+    REQUIRE(gen4);
+    CHECK(b->arms.load() == arms_before + 1);
+    CHECK(rt->rule_count() == 1);
+    CHECK(rt->armed_key_count() == 1);
+    CHECK(rt->claim_queue_depth_for_test(key) == 0);
+    rt->begin_stop();
+}
+
+TEST_CASE("#4354: a head whose index release fails at the executor-throw staging site is retried "
+          "before the pop, not popped as a ghost - the next attach arms",
+          "[spark][runtime][liveness]") {
+    // Mutation: drop the release-or-retain at the ordinary pop -> the failed release at
+    // on_arm_complete's `!r` staging is never retried, r1 is popped with its mapping, and
+    // r4's attach takes the shared-watcher branch and throws std::out_of_range from keys_.at.
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    b->hang_next_arm.store(true);
+    auto rt = make_rt(r, b, GuardianSparkRuntime::Config{.backend_op_deadline = std::chrono::seconds(30)});
+    const auto key = spark_key(file_spec("/a"));
+
+    QueuedAttach a1;
+    struct Cleanup {
+        FakeBackend* backend;
+        ~Cleanup() { backend->release_hang(); }
+    } cleanup{b.get()};
+
+    a1.t = std::thread{[&] { a1.gen = rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true); }};
+    REQUIRE(b->wait_entered_hang(std::chrono::seconds(30)));
+    REQUIRE(rt->claim_queue_depth_for_test(key) == 1);
+
+    // The single-shot hang precedes the throw check, so the parked arm throws once released.
+    // The seam is armed only now: nothing releases r1's mapping before the staging site.
+    b->throw_arm.store(true);
+    rt->set_index_remove_fault_for_test(true);
+    b->release_hang();
+    a1.t.join();
+    REQUIRE_FALSE(a1.gen.has_value());
+
+    settle_key_claims(*rt, key);
+    CHECK(rt->claim_index_release_failures() == 1); // the staging release; the retry (if any) succeeds
+    CHECK(rt->rule_count() == 0);
+    CHECK(rt->armed_key_count() == 0);
+    CHECK(b->arms.load() == 0);
+
+    b->throw_arm.store(false);
+    std::expected<std::uint64_t, std::string> gen4;
+    REQUIRE_NOTHROW(gen4 = rt->attach_rule("r4", file_spec("/a"), file_exists_rule("r4"), true));
+    REQUIRE(gen4);
+    CHECK(b->arms.load() == 1);
+    CHECK(rt->rule_count() == 1);
+    CHECK(rt->armed_key_count() == 1);
+    CHECK(rt->claim_queue_depth_for_test(key) == 0);
+    rt->begin_stop();
+}
+
+TEST_CASE("#4354: a head whose index release fails at the backend-refused staging site is retried "
+          "before the pop, not popped as a ghost - the next attach arms",
+          "[spark][runtime][liveness]") {
+    // Mutation: as the case above, for on_arm_complete's `!armed_live` staging.
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    b->hang_next_arm.store(true);
+    auto rt = make_rt(r, b, GuardianSparkRuntime::Config{.backend_op_deadline = std::chrono::seconds(30)});
+    const auto key = spark_key(file_spec("/a"));
+
+    QueuedAttach a1;
+    struct Cleanup {
+        FakeBackend* backend;
+        ~Cleanup() { backend->release_hang(); }
+    } cleanup{b.get()};
+
+    a1.t = std::thread{[&] { a1.gen = rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true); }};
+    REQUIRE(b->wait_entered_hang(std::chrono::seconds(30)));
+    REQUIRE(rt->claim_queue_depth_for_test(key) == 1);
+
+    b->fail_arm.store(true);
+    rt->set_index_remove_fault_for_test(true);
+    b->release_hang();
+    a1.t.join();
+    REQUIRE_FALSE(a1.gen.has_value());
+
+    settle_key_claims(*rt, key);
+    CHECK(rt->claim_index_release_failures() == 1);
+    CHECK(rt->rule_count() == 0);
+    CHECK(rt->armed_key_count() == 0);
+    CHECK(b->arms.load() == 0);
+
+    b->fail_arm.store(false);
+    std::expected<std::uint64_t, std::string> gen4;
+    REQUIRE_NOTHROW(gen4 = rt->attach_rule("r4", file_spec("/a"), file_exists_rule("r4"), true));
+    REQUIRE(gen4);
+    CHECK(b->arms.load() == 1);
+    CHECK(rt->rule_count() == 1);
+    CHECK(rt->armed_key_count() == 1);
+    CHECK(rt->claim_queue_depth_for_test(key) == 0);
+    rt->begin_stop();
+}
+
+TEST_CASE("#4354: the double-fault recovery pop in on_arm_complete retains a head whose index "
+          "release fails, instead of popping it with its mapping",
+          "[spark][runtime][liveness]") {
+    // Mutation: drop the release-or-retain at the recovery pop in on_arm_complete's catch
+    // -> the head is popped with its mapping and r4's attach throws from keys_.at; omit
+    // `dispatch = Queued` from the helper -> the retained head is never swept, so the
+    // queue never drains. (A publish that throws at fault point 3 never reaches the
+    // ordinary pop loop, so this case does not exercise that loop.)
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    b->hang_next_arm.store(true);
+    auto rt = make_rt(r, b, GuardianSparkRuntime::Config{.backend_op_deadline = std::chrono::seconds(30)});
+    const auto key = spark_key(file_spec("/a"));
+
+    QueuedAttach a1;
+    struct Cleanup {
+        FakeBackend* backend;
+        ~Cleanup() { backend->release_hang(); }
+    } cleanup{b.get()};
+
+    a1.t = std::thread{[&] { a1.gen = rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true); }};
+    REQUIRE(b->wait_entered_hang(std::chrono::seconds(30)));
+    REQUIRE(rt->claim_queue_depth_for_test(key) == 1);
+
+    // Staging: the backend refuses and r1's release fails (seam shot 1), leaving r1 holding
+    // its mapping. Fault point 3 makes the first publish throw after the verdict is
+    // written; the gap hook (it fires because nothing was published) re-arms the seam and
+    // fault point 3 so the SECOND publish throws into the recovery catch, whose pop then
+    // releases r1 (seam shot 2). The hook only stores atomics: it runs on the detached
+    // worker, so no Catch2 assertion in here.
+    b->fail_arm.store(true);
+    rt->set_index_remove_fault_for_test(true);
+    rt->set_drain_fault_point_for_test(3);
+    rt->set_drain_gap_hook_for_test([rtp = rt.get()] {
+        rtp->set_index_remove_fault_for_test(true);
+        rtp->set_drain_fault_point_for_test(3);
+    });
+    b->release_hang();
+    a1.t.join();
+    REQUIRE_FALSE(a1.gen.has_value());
+
+    settle_key_claims(*rt, key);
+    CHECK(rt->claim_index_release_failures() == 2); // staging + recovery release
+    CHECK(rt->rule_count() == 0);
+    CHECK(rt->armed_key_count() == 0);
+    CHECK(b->arms.load() == 0);
+
+    b->fail_arm.store(false);
+    std::expected<std::uint64_t, std::string> gen4;
+    REQUIRE_NOTHROW(gen4 = rt->attach_rule("r4", file_spec("/a"), file_exists_rule("r4"), true));
+    REQUIRE(gen4);
+    CHECK(b->arms.load() == 1);
+    CHECK(rt->rule_count() == 1);
+    CHECK(rt->armed_key_count() == 1);
+    CHECK(rt->claim_queue_depth_for_test(key) == 0);
+    rt->set_drain_gap_hook_for_test({});
+    rt->begin_stop();
+}
+
+TEST_CASE("#4354: the double-fault recovery pop in finalize_arm_compensation retains a head whose "
+          "index release fails, instead of popping it with its mapping",
+          "[spark][runtime][liveness]") {
+    // Mutation: drop the release-or-retain at the recovery pop in finalize_arm_compensation's
+    // catch -> the head is popped with its mapping and r4's attach throws from keys_.at;
+    // omit `dispatch = Queued` from the helper -> the retained head is never swept.
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    b->hang_next_arm.store(true);
+    auto rt = make_rt(r, b, GuardianSparkRuntime::Config{.backend_op_deadline = std::chrono::seconds(30)});
+    const auto key = spark_key(file_spec("/a"));
+
+    struct Cleanup {
+        FakeBackend* backend;
+        ~Cleanup() { backend->release_hang(); }
+    } cleanup{b.get()};
+
+    auto res1 = rt->attach_rule(GuardianSparkRuntime::NonWaiting{}, "r1", file_spec("/a"),
+                                file_exists_rule("r1"), true);
+    REQUIRE(b->wait_entered_hang(std::chrono::seconds(30)));
+    REQUIRE(res1.has_value());
+    REQUIRE(rt->claim_queue_depth_for_test(key) == 1);
+
+    // Withdraw the in-flight head (the key's Dispatched marker), its release failing once.
+    rt->set_index_remove_fault_for_test(true);
+    rt->detach_rule("r1");
+    CHECK(rt->claim_index_release_failures() == 1);
+    CHECK(rt->claim_queue_depth_for_test(key) == 1);
+
+    // The late success is live.empty and its own release of the head fails again (seam
+    // shot 2); the subscription is owed a compensating disarm, so on_arm_complete skips
+    // its own publish and the ONLY publish is finalize_arm_compensation's. Fault point 3
+    // (nothing earlier consumes it) makes that publish throw into the recovery catch; the
+    // gap hook re-arms the seam so the recovery pop's release fails (seam shot 3). The hook
+    // only stores an atomic: it runs on the detached worker.
+    rt->set_index_remove_fault_for_test(true);
+    rt->set_drain_fault_point_for_test(3);
+    rt->set_drain_gap_hook_for_test([rtp = rt.get()] { rtp->set_index_remove_fault_for_test(true); });
+    b->release_hang();
+    REQUIRE(yuzu::test::spin_until([&] { return b->disarms.load() == 1; }, std::chrono::seconds(10)));
+    settle_key_claims(*rt, key);
+    CHECK(rt->claim_index_release_failures() == 3); // detach + live.empty + recovery release
+    CHECK(rt->rule_count() == 0);
+    CHECK(rt->armed_key_count() == 0);
+
+    const auto arms_before = b->arms.load();
+    std::expected<std::uint64_t, std::string> gen4;
+    REQUIRE_NOTHROW(gen4 = rt->attach_rule("r4", file_spec("/a"), file_exists_rule("r4"), true));
+    REQUIRE(gen4);
+    CHECK(b->arms.load() == arms_before + 1);
+    CHECK(rt->rule_count() == 1);
+    CHECK(rt->armed_key_count() == 1);
+    CHECK(rt->claim_queue_depth_for_test(key) == 0);
+    rt->set_drain_gap_hook_for_test({});
+    rt->begin_stop();
+}
+
+TEST_CASE("#4354: a firewalled drain whose head release fails does not fail a live follower "
+          "queued after the snapshot",
+          "[spark][runtime][liveness]") {
+    // Mutation: drop the `finished.empty()` guard on publish_arm_verdicts_locked's firewall
+    // branch -> the retained head (still at the fifo front after its failed release) makes
+    // the branch fire with a non-empty `finished` and fail EVERY fifo claim, so r2, queued
+    // in the drain gap (after the snapshot, hence not in `finished`), gets "arm drain
+    // failed" and loses its claim instead of being swept to the front and armed.
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    b->hang_next_arm.store(true);
+    auto rt = make_rt(r, b, GuardianSparkRuntime::Config{.backend_op_deadline = std::chrono::seconds(30)});
+    const auto key = spark_key(file_spec("/a"));
+    auto park = std::make_shared<DrainPark>();
+
+    // Threads before the guard (the file's idiom): on unwind the guard releases the parked
+    // backend and the gap hook first, then the QueuedAttach destructor joins a returned attach.
+    QueuedAttach a2;
+    struct Cleanup {
+        FakeBackend* backend;
+        DrainPark* park;
+        ~Cleanup() {
+            backend->release_hang();
+            park->release();
+        }
+    } cleanup{b.get(), park.get()};
+
+    auto res1 = rt->attach_rule(GuardianSparkRuntime::NonWaiting{}, "r1", file_spec("/a"),
+                                file_exists_rule("r1"), true);
+    REQUIRE(b->wait_entered_hang(std::chrono::seconds(30)));
+    REQUIRE(res1.has_value());
+    REQUIRE(rt->claim_queue_depth_for_test(key) == 1);
+
+    // Seam shot 1: withdraw the in-flight head. It stays as the key's Dispatched marker
+    // with its release failing, so it still holds its mapping.
+    rt->set_index_remove_fault_for_test(true);
+    rt->detach_rule("r1");
+    CHECK(rt->claim_index_release_failures() == 1);
+    CHECK(rt->claim_queue_depth_for_test(key) == 1);
+
+    // Seam shot 2: the late success finds no live claim (live.empty), so the compensating
+    // path owes a disarm and r1's own release fails again. Fault point 4 (nothing earlier
+    // consumes it) makes the continuation allocation throw: the drain is firewalled, the
+    // subscription is disarmed directly, and the publish runs inline with finished == [r1].
+    // The gap hook fires first (nothing is published yet). It parks until r2 has queued
+    // behind r1, which is therefore NOT in `finished`, and only then re-arms the seam
+    // (shot 3) so that the ordinary loop's release of r1 inside that publish fails and r1
+    // is retained at the front. The hook only touches atomics and the park: it runs on the
+    // detached worker, so no Catch2 assertion in here.
+    rt->set_index_remove_fault_for_test(true);
+    rt->set_drain_fault_point_for_test(4);
+    rt->set_drain_gap_hook_for_test([rtp = rt.get(), park] {
+        park->wait();
+        rtp->set_index_remove_fault_for_test(true);
+    });
+    b->release_hang();
+    REQUIRE(yuzu::test::spin_until([&] { return park->entered.load(); }, std::chrono::seconds(10)));
+
+    a2.t = std::thread{[&] { a2.gen = rt->attach_rule("r2", file_spec("/a"), file_exists_rule("r2"), true); }};
+    REQUIRE(yuzu::test::spin_until([&] { return rt->claim_queue_depth_for_test(key) == 2; },
+                                   std::chrono::seconds(10)));
+    park->release();
+    a2.t.join();
+    INFO("r2: " << (a2.gen.has_value() ? std::string{"armed"} : a2.gen.error()));
+    REQUIRE(a2.gen.has_value()); // not "arm drain failed": the live follower was armed
+
+    settle_key_claims(*rt, key);
+    // Three shots, each consumed by exactly one failing release: the detach, the live.empty
+    // release, and the ordinary loop's release of the firewalled head.
+    CHECK(rt->claim_index_release_failures() == 3);
+    CHECK(rt->rule_count() == 1);
+    CHECK(rt->armed_key_count() == 1);
+    CHECK(rt->claim_queue_depth_for_test(key) == 0);
+    CHECK(b->disarms.load() == 1); // r1's subscription, disarmed directly (firewalled)
+    CHECK(b->arms.load() == 2);    // r1's compensated arm, then r2's own
+
+    rt->set_drain_gap_hook_for_test({});
+    rt->begin_stop();
+}
+
+// #5322 WP0: the index-release fault seam is counted (n > 0: the next n releases fail) or
+// sticky (n < 0: every release fails until reset), and the old bool setter is still the
+// one-shot. The gauge is runtime-only and 0 on a quiescent runtime (its positive cases
+// arrive with the work packages that create retained tombstones).
+TEST_CASE("#5322: counted/sticky index-release fault seam", "[spark][runtime][liveness]") {
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    b->hang_next_arm.store(true);
+    auto rt = make_rt(r, b, GuardianSparkRuntime::Config{.backend_op_deadline = std::chrono::seconds(30)});
+    const auto key = spark_key(file_spec("/a"));
+
+    QueuedAttach a1;
+    // Clear the seam FIRST, then release the hang, so a failing assertion can neither
+    // leave releases failing nor leave the attach thread parked in the backend.
+    struct Cleanup {
+        GuardianSparkRuntime* rt;
+        FakeBackend* backend;
+        ~Cleanup() {
+            rt->set_index_remove_fault_count_for_test(0);
+            backend->release_hang();
+        }
+    } cleanup{rt.get(), b.get()};
+
+    CHECK(rt->retained_tombstones() == 0); // quiescent runtime
+
+    a1.t = std::thread{[&] { a1.gen = rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true); }};
+    REQUIRE(b->wait_entered_hang(std::chrono::seconds(30)));
+
+    // The hung head is Dispatched with its mapping held. detach_rule's Case 0 releases it
+    // (release attempt 1), and the hung arm's late completion takes the live.empty()
+    // branch (release attempt 2); the publish pop is attempt 3.
+    const auto failures_before = rt->claim_index_release_failures();
+
+    SECTION("counted: n = 2 fails exactly the first two release attempts") {
+        rt->set_index_remove_fault_count_for_test(2);
+        rt->detach_rule("r1");
+        a1.t.join();
+        REQUIRE_FALSE(a1.gen.has_value());
+        CHECK(a1.gen.error() == "withdrawn");
+        CHECK(rt->claim_index_release_failures() == failures_before + 1);
+
+        b->release_hang();
+        settle_key_claims(*rt, key);
+        CHECK(rt->claim_index_release_failures() == failures_before + 2);
+        CHECK(rt->claim_queue_depth_for_test(key) == 0);
+        CHECK(rt->retained_tombstones() == 0);
+        CHECK(rt->rule_count() == 0);
+    }
+
+    SECTION("sticky: n = -1 keeps failing, is never consumed, and 0 turns it off") {
+        rt->set_index_remove_fault_count_for_test(-1);
+        rt->detach_rule("r1");
+        a1.t.join();
+        REQUIRE_FALSE(a1.gen.has_value());
+        CHECK(rt->claim_index_release_failures() == failures_before + 1);
+
+        b->release_hang();
+        // The live.empty() release and the publish pop's release both fail as well: three
+        // attempts in all, none of which consumed the seam.
+        REQUIRE(yuzu::test::spin_until(
+            [&] { return rt->claim_index_release_failures() >= failures_before + 3; },
+            std::chrono::seconds(10)));
+        CHECK(rt->claim_queue_depth_for_test(key) == 1); // retained: its release never succeeded
+
+        rt->set_index_remove_fault_count_for_test(0);
+        // The next same-key attach sweeps the tombstone and retries its release, which now
+        // succeeds (a fresh attach is not a failure to be counted).
+        const auto failures_off = rt->claim_index_release_failures();
+        std::expected<std::uint64_t, std::string> gen2;
+        REQUIRE_NOTHROW(gen2 = rt->attach_rule("r2", file_spec("/a"), file_exists_rule("r2"), true));
+        REQUIRE(gen2);
+        settle_key_claims(*rt, key);
+        CHECK(rt->claim_index_release_failures() == failures_off);
+        CHECK(rt->claim_queue_depth_for_test(key) == 0);
+        CHECK(rt->retained_tombstones() == 0);
+    }
+
+    SECTION("bool setter: true is a one-shot (stores 1), false stores 0") {
+        rt->set_index_remove_fault_for_test(true);
+        rt->detach_rule("r1"); // consumes the single shot
+        a1.t.join();
+        REQUIRE_FALSE(a1.gen.has_value());
+        CHECK(rt->claim_index_release_failures() == failures_before + 1);
+
+        b->release_hang();
+        settle_key_claims(*rt, key);
+        CHECK(rt->claim_index_release_failures() == failures_before + 1); // spent: later releases succeed
+        CHECK(rt->claim_queue_depth_for_test(key) == 0);
+
+        rt->set_index_remove_fault_for_test(true);
+        rt->set_index_remove_fault_for_test(false); // stores 0: nothing fires
+        std::expected<std::uint64_t, std::string> gen2;
+        REQUIRE_NOTHROW(gen2 = rt->attach_rule("r2", file_spec("/a"), file_exists_rule("r2"), true));
+        REQUIRE(gen2);
+        rt->detach_rule("r2");
+        settle_key_claims(*rt, key);
+        CHECK(rt->claim_index_release_failures() == failures_before + 1);
+    }
+
+    rt->begin_stop();
+}
+
+// #4605 / #5322 WP1: steps 1-3 of the #4605 repro, shared by the T5 cases. One rule (r1)
+// has an arm wedged on key A (parked in the backend past its 50 ms deadline), a second
+// r1 arm in flight on key B (which moved r1's index mapping to B), and a re-attach on A
+// that re-observed the wedge. Per-key gates park each arm inside the backend, so the
+// test, not a clock, decides when each arm completes. Steps are methods, not a
+// constructor, so a failed REQUIRE still runs the destructor that frees the parked
+// workers (a throwing constructor never runs it).
+namespace {
+struct Repro4605 {
+    using RT = GuardianSparkRuntime;
+    std::shared_ptr<FakeReader> r = std::make_shared<FakeReader>();
+    std::shared_ptr<FakeBackend> b = std::make_shared<FakeBackend>();
+    std::shared_ptr<RT> rt =
+        make_rt(r, b, RT::Config{.backend_op_deadline = std::chrono::milliseconds(50)});
+    const std::string key_a = spark_key(file_spec("/a"));
+    const std::string key_b = spark_key(file_spec("/b"));
+    std::shared_ptr<FakeBackend::ArmGate> gate_a = b->park_next_arm_for_key(key_a);
+    std::shared_ptr<FakeBackend::ArmGate> gate_b = b->park_next_arm_for_key(key_b);
+    RT::ArmReceipt receipt_a; ///< r1's wedged claim on A
+    RT::ArmReceipt receipt_b; ///< r1's in-flight claim on B
+
+    // The seam is cleared FIRST, then the gates opened, so a failing assertion can
+    // neither leave releases failing nor leave a worker parked in the backend.
+    ~Repro4605() {
+        rt->set_index_remove_fault_count_for_test(0);
+        rt->set_drain_fault_point_for_test(0);
+        b->release_all_key_gates();
+        rt->begin_stop();
+    }
+
+    [[nodiscard]] std::size_t depth(const std::string& key) const {
+        return rt->claim_queue_depth_for_test(key);
+    }
+
+    /// Step 1: r1 on A, parked in the backend, then wedged by its 50 ms deadline.
+    void wedge_r1_on_a() {
+        using namespace std::chrono_literals;
+        auto a = rt->attach_rule(RT::NonWaiting{}, "r1", file_spec("/a"), file_exists_rule("r1"), true);
+        REQUIRE(a.has_value());
+        receipt_a = a->receipt;
+        REQUIRE(gate_a->wait_entered(10s));
+        REQUIRE(yuzu::test::spin_until(
+            [&] {
+                rt->expire_overdue_claims();
+                return rt->receipt_status(receipt_a) == RT::ReceiptStatus::Wedged;
+            },
+            10s));
+    }
+    /// Step 2: r1 re-attached on B. Its mapping moves to B; the arm parks in the backend.
+    void queue_r1_on_b() {
+        using namespace std::chrono_literals;
+        auto b1 = rt->attach_rule(RT::NonWaiting{}, "r1", file_spec("/b"), file_exists_rule("r1"), true);
+        REQUIRE(b1.has_value());
+        receipt_b = b1->receipt;
+        REQUIRE(gate_b->wait_entered(10s));
+        REQUIRE(rt->receipt_status(receipt_b) == RT::ReceiptStatus::Pending);
+    }
+    /// Step 3: r1 re-attached on A. Re-observes A's wedge and touches no index state.
+    void reobserve_r1_on_a() {
+        const auto before = rt->wedged_reobservations();
+        auto again = rt->attach_rule(RT::NonWaiting{}, "r1", file_spec("/a"), file_exists_rule("r1"), true);
+        REQUIRE(again.has_value());
+        REQUIRE(again->receipt.claim == receipt_a.claim);
+        REQUIRE(rt->wedged_reobservations() == before + 1);
+    }
+    /// Step 4: A's late success is adopted (its adoption moves r1's mapping from B to A).
+    void adopt_r1_on_a() {
+        using namespace std::chrono_literals;
+        gate_a->release();
+        REQUIRE(yuzu::test::spin_until([&] { return rt->rule_count() == 1; }, 10s));
+        REQUIRE(rt->armed_key_count() == 1);
+        REQUIRE(depth(key_a) == 0);
+        (void)drain_lifecycle(*rt); // boundary: the adoption's "armed" entry is spent
+    }
+};
+
+// T4a / T7: a hung head H on key K, a rule `r` queued behind it, and the sticky index-release
+// seam. On code that redispatches a tombstone the head loops arm/compensate, so `park_every`
+// is set (under the gate's own mutex, once workers are live) AFTER the hung head committed to
+// bound it. Cleanup clears the seam FIRST, then opens the park and the hang.
+struct SeamRig4605 {
+    using RT = GuardianSparkRuntime;
+    std::shared_ptr<FakeReader> r = std::make_shared<FakeReader>();
+    std::shared_ptr<FakeBackend> b = std::make_shared<FakeBackend>();
+    std::shared_ptr<RT> rt;
+    const std::string key = spark_key(file_spec("/a"));
+    SeamRig4605() {
+        b->hang_next_arm.store(true);
+        rt = make_rt(r, b, RT::Config{.backend_op_deadline = std::chrono::seconds(30)});
+    }
+    ~SeamRig4605() {
+        rt->set_index_remove_fault_count_for_test(0);
+        b->arm_park.open();
+        b->release_hang();
+        rt->begin_stop();
+    }
+    void bound_redispatch_loop() {
+        std::lock_guard<std::mutex> lk{b->arm_park.mu};
+        b->arm_park.park_every = 1;
+    }
+};
+} // namespace
+
+TEST_CASE("#4605: a claim whose index mapping moved away cannot commit after the rule is detached",
+          "[spark][runtime][liveness]") {
+    using namespace std::chrono_literals;
+    Repro4605 f;
+    f.wedge_r1_on_a();
+    f.queue_r1_on_b();
+    f.reobserve_r1_on_a();
+    f.adopt_r1_on_a(); // armed id 1 (A); r1's mapping now points at A
+    REQUIRE(f.b->armed_ids().size() == 1);
+
+    // Step 5: detach finds r1's mapping on A and disarms A. B's claim is not on that key,
+    // so Case 0 cannot see it and it stays in flight.
+    f.rt->detach_rule("r1");
+    CHECK(f.rt->rule_count() == 0);
+    REQUIRE(yuzu::test::spin_until([&] { return f.b->disarms.load() == 1; }, 10s));
+    CHECK(f.rt->armed_key_count() == 0);
+
+    // Step 6: B's arm completes after the withdrawal. It must not commit a rule nobody wants.
+    f.gate_b->release();
+    REQUIRE(yuzu::test::spin_until([&] { return f.depth(f.key_b) == 0; }, 10s));
+    CHECK(f.rt->rule_count() == 0);
+    CHECK(f.rt->armed_key_count() == 0);
+    CHECK(yuzu::test::spin_until([&] { return f.b->disarms.load() == 2; }, 10s));
+    REQUIRE(f.b->armed_ids().size() == 2);
+    CHECK(f.b->disarmed_ids() == f.b->armed_ids()); // both subscriptions, by exact id
+    const auto lc = drain_lifecycle(*f.rt);
+    CHECK(std::none_of(lc.begin(), lc.end(),
+                       [](const OutboxEntry& e) { return e.lifecycle_kind == "armed"; }));
+}
+
+TEST_CASE("#4605: a claim whose index mapping moved away does not commit over the adopted rule",
+          "[spark][runtime][liveness]") {
+    using namespace std::chrono_literals;
+    Repro4605 f;
+    f.wedge_r1_on_a();
+    f.queue_r1_on_b();
+    f.reobserve_r1_on_a();
+    f.adopt_r1_on_a(); // armed id 1 (A)
+
+    // No withdrawal: r1 stays wanted on A. B's late success must be disarmed, not committed.
+    f.gate_b->release();
+    REQUIRE(yuzu::test::spin_until([&] { return f.depth(f.key_b) == 0; }, 10s));
+    CHECK(yuzu::test::spin_until([&] { return f.b->disarms.load() == 1; }, 10s));
+    CHECK(f.rt->rule_count() == 1);
+    CHECK(f.rt->armed_key_count() == 1);
+    REQUIRE(f.b->armed_ids().size() == 2);
+    CHECK(f.b->disarmed_ids() == std::vector<std::uint64_t>{f.b->armed_ids()[1]}); // B's, not A's
+    CHECK(f.rt->keys_for_type(SparkType::File) == std::vector<std::string>{f.key_a});
+}
+
+// Pins the other order (S2: ownership decides the winner). Green on dev too.
+TEST_CASE("#4605: when the in-flight claim completes first it owns the rule and the wedge is refused",
+          "[spark][runtime][liveness]") {
+    using namespace std::chrono_literals;
+    Repro4605 f;
+    f.wedge_r1_on_a();
+    f.queue_r1_on_b();
+    f.reobserve_r1_on_a();
+
+    f.gate_b->release(); // armed id 1 (B)
+    REQUIRE(yuzu::test::spin_until([&] { return f.rt->rule_count() == 1 && f.depth(f.key_b) == 0; }, 10s));
+    CHECK(f.rt->keys_for_type(SparkType::File) == std::vector<std::string>{f.key_b});
+
+    f.gate_a->release(); // armed id 2 (A): its late success is stale
+    REQUIRE(yuzu::test::spin_until([&] { return f.rt->wedge_adopt_stale_refused() == 1; }, 10s));
+    CHECK(yuzu::test::spin_until([&] { return f.b->disarms.load() == 1; }, 10s));
+    REQUIRE(f.b->armed_ids().size() == 2);
+    CHECK(f.b->disarmed_ids() == std::vector<std::uint64_t>{f.b->armed_ids()[1]}); // A's
+    CHECK(f.rt->rule_count() == 1);
+    CHECK(f.rt->keys_for_type(SparkType::File) == std::vector<std::string>{f.key_b});
+    CHECK(f.rt->receipt_status(f.receipt_a) == GuardianSparkRuntime::ReceiptStatus::Wedged);
+}
+
+TEST_CASE("#4605: an adoption that fails after the mapping moved leaves no claim able to commit",
+          "[spark][runtime][liveness]") {
+    using namespace std::chrono_literals;
+    Repro4605 f;
+    f.wedge_r1_on_a();
+    f.queue_r1_on_b();
+    f.reobserve_r1_on_a();
+
+    // Fault 12 sits after index_->add (which moved r1's mapping from B to A) and before
+    // the PerKey is built; the catch erases the re-added mapping, so r1 maps nowhere.
+    f.rt->set_drain_fault_point_for_test(12);
+    f.gate_a->release(); // armed id 1 (A)
+    REQUIRE(yuzu::test::spin_until([&] { return f.b->disarms.load() == 1; }, 10s)); // A compensated
+    CHECK(f.rt->rule_count() == 0);
+    CHECK(f.rt->armed_key_count() == 0);
+
+    // B still believes it owns r1's mapping; the index says it does not.
+    f.gate_b->release(); // armed id 2 (B)
+    REQUIRE(yuzu::test::spin_until([&] { return f.depth(f.key_b) == 0; }, 10s));
+    CHECK(f.rt->rule_count() == 0);
+    CHECK(f.rt->armed_key_count() == 0);
+    CHECK(yuzu::test::spin_until([&] { return f.b->disarms.load() == 2; }, 10s));
+    REQUIRE(f.b->armed_ids().size() == 2);
+    CHECK(f.b->disarmed_ids() == f.b->armed_ids());
+}
+
+TEST_CASE("#4605: a non-owning claim with a live sibling is staged Withdrawn and the sibling commits",
+          "[spark][runtime][liveness]") {
+    using namespace std::chrono_literals;
+    using RT = GuardianSparkRuntime;
+    Repro4605 f;
+    f.wedge_r1_on_a();
+    f.queue_r1_on_b();
+    auto x = f.rt->attach_rule(RT::NonWaiting{}, "x", file_spec("/b"), file_exists_rule("x"), true);
+    REQUIRE(x.has_value()); // queues behind r1's claim on B
+    f.reobserve_r1_on_a();
+    f.adopt_r1_on_a(); // armed id 1 (A); r1's mapping now points at A
+
+    f.gate_b->release(); // armed id 2 (B): x adopts it as the owning sibling
+    REQUIRE(yuzu::test::spin_until([&] { return f.depth(f.key_b) == 0; }, 10s));
+    CHECK(f.rt->receipt_status(f.receipt_b) == RT::ReceiptStatus::Withdrawn);
+    CHECK(f.b->disarms.load() == 0);
+    CHECK(f.rt->rule_count() == 2);
+    CHECK(f.rt->armed_key_count() == 2);
+
+    // Identity via teardown: x holds B's subscription, r1 still holds A's.
+    f.rt->detach_rule("x");
+    REQUIRE(yuzu::test::spin_until([&] { return f.b->disarms.load() == 1; }, 10s));
+    REQUIRE(f.b->armed_ids().size() == 2);
+    CHECK(f.b->disarmed_ids() == std::vector<std::uint64_t>{f.b->armed_ids()[1]}); // B's
+    CHECK(f.rt->armed_key_count() == 1);
+    CHECK(f.rt->rule_count() == 1);
+    f.rt->detach_rule("r1");
+    CHECK(yuzu::test::spin_until([&] { return f.b->disarms.load() == 2; }, 10s));
+    CHECK(f.b->disarmed_ids() == (std::vector<std::uint64_t>{f.b->armed_ids()[1], f.b->armed_ids()[0]}));
+    CHECK(f.rt->rule_count() == 0);
+    CHECK(f.rt->armed_key_count() == 0);
+}
+
+TEST_CASE("#5322: a same-rule re-attach under the sticky seam leaves no residue to abort on",
+          "[spark][runtime][liveness]") {
+    using namespace std::chrono_literals;
+    using RT = GuardianSparkRuntime;
+    SeamRig4605 f;
+    auto g1 = f.rt->attach_rule(RT::NonWaiting{}, "r", file_spec("/a"), file_exists_rule("r"), true);
+    REQUIRE(g1.has_value());
+    REQUIRE(f.b->wait_entered_hang(10s));
+
+    f.rt->set_index_remove_fault_count_for_test(-1);
+    const auto failures_before = f.rt->claim_index_release_failures();
+    // Case 0 withdraws generation 1 in place (its release fails: 1), generation 2 queues and
+    // add() transfers the mapping to it.
+    auto g2 = f.rt->attach_rule(RT::NonWaiting{}, "r", file_spec("/a"), file_exists_rule("r"), true);
+    REQUIRE(g2.has_value());
+    CHECK(f.rt->claim_index_release_failures() == failures_before + 1);
+
+    f.b->release_hang(); // generation 2 commits as the owning sibling
+    REQUIRE(yuzu::test::spin_until([&] { return f.rt->rule_count() == 1; }, 10s));
+    f.bound_redispatch_loop();
+    CHECK(yuzu::test::spin_until([&] { return f.rt->claim_queue_depth_for_test(f.key) == 0; }, 10s));
+    CHECK(f.rt->retained_tombstones() == 0);
+    CHECK(f.rt->claim_index_release_failures() == failures_before + 1); // generation 1's later releases are no-ops
+    CHECK(f.rt->rule_count() == 1);
+
+    f.rt->detach_rule("r");
+    CHECK(f.rt->detach_sweep_left_residue() == 0);
+    CHECK(yuzu::test::spin_until([&] { return f.b->disarms.load() == 1; }, 10s));
+    CHECK(f.rt->armed_key_count() == 0);
+}
+
+TEST_CASE("#5322: releasing a claim that no longer owns its mapping cannot fail",
+          "[spark][runtime][liveness]") {
+    using namespace std::chrono_literals;
+    using RT = GuardianSparkRuntime;
+    SeamRig4605 f;
+    auto h = f.rt->attach_rule(RT::NonWaiting{}, "h", file_spec("/a"), file_exists_rule("h"), true);
+    REQUIRE(h.has_value());
+    REQUIRE(f.b->wait_entered_hang(10s));
+    auto g1 = f.rt->attach_rule(RT::NonWaiting{}, "r", file_spec("/a"), file_exists_rule("r"), true);
+    REQUIRE(g1.has_value()); // queued behind H
+
+    f.rt->set_index_remove_fault_count_for_test(-1);
+    const auto failures_before = f.rt->claim_index_release_failures();
+    // Case 0 withdraws generation 1 in the MIDDLE of the fifo (its release fails: 1),
+    // generation 2 queues behind it and the mapping transfers.
+    auto g2 = f.rt->attach_rule(RT::NonWaiting{}, "r", file_spec("/a"), file_exists_rule("r"), true);
+    REQUIRE(g2.has_value());
+    CHECK(f.rt->claim_index_release_failures() == failures_before + 1);
+
+    f.b->release_hang(); // H and generation 2 commit; generation 1 is a non-owner
+    REQUIRE(yuzu::test::spin_until([&] { return f.rt->rule_count() == 2; }, 10s));
+    f.bound_redispatch_loop();
+    CHECK(yuzu::test::spin_until([&] { return f.rt->claim_queue_depth_for_test(f.key) == 0; }, 10s));
+    CHECK(f.rt->retained_tombstones() == 0);
+    CHECK(f.rt->claim_index_release_failures() == failures_before + 1);
 }
 
 // adversarial round 4 K2/C5: index_add_rollback's .fn runs inside ~GuardianRollback,
@@ -11631,4 +12486,1341 @@ TEST_CASE("#4508 CH-2: candidate reads follow claim outcomes and dispatch state"
             CHECK(rt->wedge_candidate_count_for_test("r1") == 0);
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// #5322 WP2a: a dead Queued claim is never SELECTED for a fresh dispatch (INV-1), the
+// dispatch-entry guard is stop-aware, sweep-before-adopt, and ONE heartbeat sweep
+// (reap_stranded_claims_locked) releases tombstones and refills the follower behind them.
+// Every case here is `[liveness]`; positives use spin_until, deadline expiries are polled on
+// the TARGET receipt, and each rig clears the index-release seam FIRST so a failing
+// assertion can neither leave releases failing nor leave a worker parked.
+// The tombstone shapes below are produced only by the index-release test seam: production
+// erase_rule is noexcept, so a release cannot fail outside these tests.
+// ---------------------------------------------------------------------------
+namespace {
+/// SeamRig4605 (hung head `h` on key /a, 30 s deadline) plus the shared #5322 steps. The
+/// seam, the drain fault point and the entry hook are cleared before the base destructor
+/// opens the park and the hang.
+struct TombRig5322 : SeamRig4605 {
+    using RT = GuardianSparkRuntime;
+    std::shared_ptr<std::atomic<int>> dispatch_entries = std::make_shared<std::atomic<int>>(0);
+    ~TombRig5322() {
+        rt->set_index_remove_fault_count_for_test(0);
+        rt->set_drain_fault_point_for_test(0);
+        rt->set_dispatch_entry_hook_for_test({});
+    }
+    [[nodiscard]] std::size_t depth() const { return rt->claim_queue_depth_for_test(key); }
+    void attach(const std::string& rid) {
+        auto res = rt->attach_rule(RT::NonWaiting{}, rid, file_spec("/a"), file_exists_rule(rid), true);
+        REQUIRE(res.has_value());
+        REQUIRE(res->kind == RT::ArmOutcomeKind::Accepted);
+    }
+    /// For an attach NOT held behind the hung head or a full pool: the arm runs on a free
+    /// worker, so its claim may commit before the non-waiting attach returns (Armed, an empty
+    /// receipt) or still be in flight (Accepted). Both are a fresh arm; the caller's spin_until
+    /// conditions on the backend counts tell the outcomes apart from a join.
+    void attach_free_pool(const std::string& rid) {
+        auto res = rt->attach_rule(RT::NonWaiting{}, rid, file_spec("/a"), file_exists_rule(rid), true);
+        REQUIRE(res.has_value());
+        REQUIRE((res->kind == RT::ArmOutcomeKind::Accepted ||
+                 res->kind == RT::ArmOutcomeKind::Armed));
+    }
+    /// Hung head `h`, rule `ra` queued behind it, the seam sticky, `ra` detached: ra's claim
+    /// is a retained tombstone in the middle of the fifo (its release fails, so Case 0
+    /// leaves it withdrawn and Queued).
+    void tombstone_behind_hung_head() {
+        using namespace std::chrono_literals;
+        attach("h");
+        REQUIRE(b->wait_entered_hang(10s));
+        attach("ra");
+        rt->set_index_remove_fault_count_for_test(-1);
+        rt->detach_rule("ra");
+        REQUIRE(depth() == 2);
+        REQUIRE(rt->retained_tombstones() == 1);
+    }
+    /// Release the hang: `h` commits, its publish pops it and stops at the tombstone.
+    /// Returns once the publish is done (the boundary every later negative assertion needs).
+    void commit_head_leaving_tombstone() {
+        using namespace std::chrono_literals;
+        b->release_hang();
+        REQUIRE(yuzu::test::spin_until([&] { return rt->rule_count() == 1; }, 10s));
+        REQUIRE(yuzu::test::spin_until(
+            [&] { return rt->retained_tombstones() == 1 && depth() == 1; }, 10s));
+    }
+    /// Same, but the quiescence boundary is a CHECK: a caller whose own assertion names the
+    /// defect (a tombstone that was selected for dispatch never reaches the boundary) still
+    /// gets to run it.
+    void commit_head_leaving_tombstone_soft() {
+        using namespace std::chrono_literals;
+        b->release_hang();
+        REQUIRE(yuzu::test::spin_until([&] { return rt->rule_count() == 1; }, 10s));
+        CHECK(yuzu::test::spin_until(
+            [&] { return rt->retained_tombstones() == 1 && depth() == 1; }, 10s));
+    }
+    /// Count the dispatcher entries (the one-shot hook is consumed by the first dispatch; a
+    /// tombstone that is selected at all enters at least once).
+    void count_dispatcher_entries() {
+        rt->set_dispatch_entry_hook_for_test([n = dispatch_entries] { n->fetch_add(1); });
+    }
+};
+
+/// ParkedPoolRig with the seam cleared first. Declared AFTER the rig so it runs first.
+struct SeamOff5322 {
+    GuardianSparkRuntime* rt;
+    ~SeamOff5322() {
+        rt->set_index_remove_fault_count_for_test(0);
+        rt->set_drain_fault_point_for_test(0);
+        rt->set_dispatch_entry_hook_for_test({});
+    }
+};
+
+/// The pool is full, `ra` is parked on /x, `rb` queued behind it, the seam sticky and `ra`
+/// detached: a retained tombstone at the head of /x with a clean follower behind it.
+struct PoolTomb5322 {
+    using RT = GuardianSparkRuntime;
+    ParkedPoolRig rig;
+    SeamOff5322 off{rig.rt.get()};
+    const std::string key_x = spark_key(file_spec("/x"));
+    RT::ArmReceipt receipt_b;
+    explicit PoolTomb5322(RT::Config cfg = {}) : rig(cfg) {}
+    void build() {
+        rig.fill_pool();
+        (void)rig.park_rule("ra", "/x");
+        auto rb = rig.rt->attach_rule(RT::NonWaiting{}, "rb", file_spec("/x"), file_exists_rule("rb"), true);
+        REQUIRE(rb.has_value());
+        REQUIRE(rb->kind == RT::ArmOutcomeKind::Accepted);
+        receipt_b = rb->receipt;
+        REQUIRE(rig.rt->claim_queue_depth_for_test(key_x) == 2);
+        rig.rt->set_index_remove_fault_count_for_test(-1);
+        rig.rt->detach_rule("ra");
+        REQUIRE(rig.rt->claim_queue_depth_for_test(key_x) == 2);
+        REQUIRE(rig.rt->retained_tombstones() == 1);
+    }
+    [[nodiscard]] std::size_t depth() const { return rig.rt->claim_queue_depth_for_test(key_x); }
+};
+} // namespace
+
+// #5322: the registry cross-structure invariant checker (a test-only diagnostic) as a REQUIRE
+// whose failure prints the violation lines. The `ORPHANS_OK` form accepts a refcount-0 keys_
+// entry that no heartbeat pass has healed yet.
+#define REQUIRE_REGISTRY_INVARIANTS_5322(rtref) \
+    REQUIRE((rtref).invariant_violations_for_test() == std::vector<std::string>{})
+#define REQUIRE_REGISTRY_INVARIANTS_ORPHANS_OK_5322(rtref) \
+    REQUIRE((rtref).invariant_violations_for_test(true) == std::vector<std::string>{})
+
+// Guard isolation: this case does NOT isolate try_dispatch_head_locked's is_dead_claim
+// guard. Its tombstone is a withdrawn one (a detach whose index release failed), and it
+// asserts the backend arm count, the receipt statuses, the queue depth and
+// retained_tombstones (it counts no dispatcher entries), so removing just that guard
+// leaves it green: dispatch_arm_off_lock's entry guard (withdrawn / commit_exception) still
+// keeps the tombstone from reaching the backend. The dispatch_entries assertion in the
+// "behind a committed head" case below is what isolates the selector guard.
+TEST_CASE("#5322: a tombstone head is never redispatched while the pool is exhausted",
+          "[spark][runtime][liveness]") {
+    using namespace std::chrono_literals;
+    using RT = GuardianSparkRuntime;
+    ParkedPoolRig rig;
+    SeamOff5322 off{rig.rt.get()};
+    const auto key_x = spark_key(file_spec("/x"));
+    rig.fill_pool();
+    (void)rig.park_rule("ra", "/x");
+    rig.rt->set_index_remove_fault_count_for_test(-1);
+    rig.rt->detach_rule("ra");
+    REQUIRE(rig.rt->claim_queue_depth_for_test(key_x) == 1);
+    REQUIRE(rig.rt->retained_tombstones() == 1);
+
+    // A follower attaches: the attach drives the head. A tombstone must not be dispatched
+    // (the full pool would stamp the CLEAN follower AdmissionRejected).
+    auto rb = rig.rt->attach_rule(RT::NonWaiting{}, "rb", file_spec("/x"), file_exists_rule("rb"), true);
+    REQUIRE(rb.has_value());
+    REQUIRE(rb->kind == RT::ArmOutcomeKind::Accepted);
+    REQUIRE(rig.status(rb->receipt) == RT::ReceiptStatus::Pending);
+    CHECK(rig.rt->claim_queue_depth_for_test(key_x) == 2);
+    CHECK(rig.rt->retained_tombstones() == 1);
+    CHECK(rig.b->arm_entries.load() == ParkedPoolRig::kCapacity);
+
+    rig.rt->set_index_remove_fault_count_for_test(0);
+    (void)rig.rt->expire_overdue_claims(); // the heartbeat pops the tombstone; rb is refilled
+    CHECK(rig.rt->retained_tombstones() == 0);
+    CHECK(rig.rt->claim_queue_depth_for_test(key_x) == 1); // rb alone (parked: the pool is still full)
+    CHECK(rig.status(rb->receipt) == RT::ReceiptStatus::Pending);
+
+    rig.release_gate();
+    REQUIRE(yuzu::test::spin_until(
+        [&] { return rig.status(rb->receipt) == RT::ReceiptStatus::Committed; }, 10s));
+}
+
+// Guard isolation: this case isolates try_dispatch_head_locked's is_dead_claim guard (the
+// selector) via the dispatch_entries == 0 assertion. The entry hook it counts fires at the
+// top of dispatch_arm_off_lock, before that function's own entry guard, so a tombstone the
+// selector wrongly picks is counted even though the entry guard would still stop it from
+// arming; the arm_entries check alone could not tell the two guards apart.
+TEST_CASE("#5322: a tombstone behind a committed head is not dispatched and one pass releases it",
+          "[spark][runtime][liveness]") {
+    using namespace std::chrono_literals;
+    TombRig5322 f;
+    f.tombstone_behind_hung_head();
+    f.count_dispatcher_entries();
+    f.commit_head_leaving_tombstone_soft();
+
+    // Three heartbeats with the seam still failing: the tombstone is neither dispatched nor
+    // released, and the backend is never asked to arm again.
+    for (int i = 0; i < 3; ++i)
+        (void)f.rt->expire_overdue_claims();
+    REQUIRE(f.dispatch_entries->load() == 0);
+    CHECK(f.b->arm_entries.load() == 1);
+    CHECK(f.rt->retained_tombstones() == 1);
+    CHECK(f.depth() == 1);
+
+    f.rt->set_index_remove_fault_count_for_test(0);
+    (void)f.rt->expire_overdue_claims();
+    CHECK(f.rt->retained_tombstones() == 0);
+    CHECK(f.depth() == 0);
+    CHECK(f.rt->armed_key_count() == 1); // h's watcher is untouched
+    CHECK(f.b->arm_entries.load() == 1);
+}
+
+TEST_CASE("#5322: a clean follower behind a stuck tombstone is refilled after the seam clears",
+          "[spark][runtime][liveness]") {
+    using namespace std::chrono_literals;
+    using RT = GuardianSparkRuntime;
+    PoolTomb5322 f;
+    f.build();
+    f.rig.rt->set_index_remove_fault_count_for_test(0);
+    f.rig.release_gate();
+    (void)f.rig.rt->expire_overdue_claims();
+    CHECK(f.rig.rt->retained_tombstones() == 0);
+    REQUIRE(yuzu::test::spin_until(
+        [&] { return f.rig.status(f.receipt_b) == RT::ReceiptStatus::Committed; }, 10s));
+}
+
+TEST_CASE("#5322: a clean follower behind a stuck tombstone expires CongestionExpired never Failed",
+          "[spark][runtime][liveness]") {
+    using namespace std::chrono_literals;
+    using RT = GuardianSparkRuntime;
+    RT::Config cfg;
+    cfg.backend_op_deadline = 50ms;
+    PoolTomb5322 f{cfg};
+    f.build();
+    // The seam is never cleared: the follower's own deadline ends it. The poll is on the
+    // TARGET receipt, never on an expiry count (the fillers expire too).
+    REQUIRE(yuzu::test::spin_until(
+        [&] {
+            (void)f.rig.rt->expire_overdue_claims();
+            return f.rig.status(f.receipt_b) == RT::ReceiptStatus::CongestionExpired;
+        },
+        10s));
+    CHECK(f.rig.status(f.receipt_b) != RT::ReceiptStatus::Failed);
+    // #5323: the abandoned follower's own release also fails under the sticky seam, so it is
+    // RETAINED behind the stuck owner (it used to be erased with its mapping leaked).
+    CHECK(f.rig.rt->retained_tombstones() == 2);
+    CHECK(f.depth() == 2);
+    f.rig.rt->set_index_remove_fault_count_for_test(0);
+    (void)f.rig.rt->expire_overdue_claims(); // one pass releases both
+    CHECK(f.rig.rt->retained_tombstones() == 0);
+    CHECK(f.depth() == 0);
+}
+
+TEST_CASE("#5322: redrive_parked_arms sweeps a released tombstone first and drives the follower",
+          "[spark][runtime][liveness]") {
+    using namespace std::chrono_literals;
+    using RT = GuardianSparkRuntime;
+    PoolTomb5322 f;
+    f.build();
+    f.rig.rt->set_index_remove_fault_count_for_test(0);
+    f.rig.release_gate();
+    f.rig.settle();
+    REQUIRE(f.rig.rt->retained_tombstones() == 1);
+    // NOT the heartbeat: the redrive lane alone must pop the tombstone (sweep-first) and
+    // park-then-redrive the follower it exposes, in this one call.
+    (void)f.rig.rt->redrive_parked_arms();
+    CHECK(f.rig.rt->retained_tombstones() == 0);
+    REQUIRE(yuzu::test::spin_until(
+        [&] { return f.rig.status(f.receipt_b) == RT::ReceiptStatus::Committed; }, 10s));
+}
+
+TEST_CASE("#5322: a same-rule re-attach over an orphan watcher's tombstone re-arms in the same attach",
+          "[spark][runtime][liveness]") {
+    using namespace std::chrono_literals;
+    TombRig5322 f;
+    f.attach("y");
+    REQUIRE(f.b->wait_entered_hang(10s));
+    f.attach("z");
+    f.rt->set_index_remove_fault_count_for_test(-1);
+    f.rt->detach_rule("z"); // z's claim: a retained tombstone behind y
+    REQUIRE(f.depth() == 2);
+    REQUIRE(f.rt->retained_tombstones() == 1);
+    f.commit_head_leaving_tombstone();
+
+    // y goes: z's ghost mapping is the key's only one, so keys_ is an orphan watcher.
+    f.rt->detach_rule("y");
+    CHECK(f.rt->armed_key_count() == 1);
+    CHECK(f.b->disarms.load() == 0);
+
+    // z re-attaches (no park_every: the synchronous teardown below needs none).
+    const auto residue_before = f.rt->detach_sweep_left_residue();
+    const auto claim_failures_before = f.rt->detach_claim_failures();
+    f.attach_free_pool("z");
+    CHECK(f.rt->detach_sweep_left_residue() == residue_before + 1);
+    CHECK(f.rt->detach_claim_failures() == claim_failures_before + 1);
+    REQUIRE(yuzu::test::spin_until([&] { return f.b->disarms.load() == 1; }, 10s));
+    REQUIRE(yuzu::test::spin_until([&] { return f.b->arms.load() == 2; }, 10s));
+    REQUIRE(yuzu::test::spin_until([&] { return f.rt->rule_count() == 1; }, 10s));
+    (void)f.rt->expire_overdue_claims(); // N-3: nothing is left behind
+    CHECK(f.depth() == 0);
+    CHECK(f.rt->retained_tombstones() == 0);
+    CHECK(f.rt->armed_key_count() == 1);
+}
+
+TEST_CASE("#5322: heartbeat observability is one release attempt per tombstone per pass",
+          "[spark][runtime][liveness]") {
+    using namespace std::chrono_literals;
+    // One erase_rule attempt per terminal tombstone per reaper pass. Other same-key events
+    // each add their own attempt (an attach's sweep, sweep-before-adopt, a follower's own
+    // abandonment, a publish pop, a detach's sweep, the synthesis release), so +1 per pass
+    // is asserted only in this quiescent rig, after the drain's own attempts are spent.
+    TombRig5322 f;
+    f.tombstone_behind_hung_head();
+    f.commit_head_leaving_tombstone();
+    const auto base = f.rt->claim_index_release_failures();
+    for (int i = 1; i <= 3; ++i) {
+        (void)f.rt->expire_overdue_claims();
+        CHECK(f.rt->claim_index_release_failures() == base + static_cast<std::uint64_t>(i));
+    }
+    CHECK(f.rt->tombstones_released_by_reaper() == 0);
+    f.rt->set_index_remove_fault_count_for_test(0);
+    (void)f.rt->expire_overdue_claims();
+    CHECK(f.rt->retained_tombstones() == 0);
+    CHECK(f.rt->tombstones_released_by_reaper() == 1);
+}
+
+TEST_CASE("#5322: a dispatch whose claim was withdrawn before the arm is handed back and never armed",
+          "[spark][runtime][liveness]") {
+    using namespace std::chrono_literals;
+    using RT = GuardianSparkRuntime;
+    ParkedPoolRig rig;
+    // Shared and captured by value: the hook runs on an executor worker that may still be
+    // inside wait() when a failing REQUIRE unwinds this frame.
+    auto gate_sp = std::make_shared<DrainPark>();
+    DrainPark& gate = *gate_sp;
+    struct Cleanup {
+        RT* rt;
+        DrainPark* gate;
+        ~Cleanup() {
+            rt->set_dispatch_entry_hook_for_test({});
+            gate->release();
+        }
+    } cleanup{rig.rt.get(), gate_sp.get()};
+    const auto key_x = spark_key(file_spec("/x"));
+    rig.fill_pool();
+    const auto rc = rig.park_rule("r", "/x");
+
+    // The hook runs on the worker that redrives the parked claim, after the claim is the
+    // Dispatching head and before the reservation: a detach landing there withdraws it in
+    // place (it is Dispatching, so Case 0 keeps it as a marker).
+    rig.rt->set_dispatch_entry_hook_for_test([gate_sp, rt = rig.rt.get()] {
+        gate_sp->wait();
+        rt->detach_rule("r");
+    });
+    rig.release_gate();
+    REQUIRE(yuzu::test::spin_until([&] { return gate.entered.load(); }, 10s));
+    CHECK(rig.status(rc) == RT::ReceiptStatus::Pending); // the receipt, taken before the hook proceeds
+
+    // Refill the reservation pool while the hook holds r before its reservation: four new
+    // arms park inside the backend (each holds a permit once it has entered arm()), so the
+    // guard runs against a FULL pool. A guard that was not the first arm of the chain would
+    // fall through to the exhaustion branch and fail the key's claims.
+    {
+        std::lock_guard lk(rig.b->arm_park.mu);
+        rig.b->arm_park.park_every = 1;
+    }
+    for (int i = 0; i < ParkedPoolRig::kCapacity; ++i) {
+        const auto rid = "q" + std::to_string(i);
+        REQUIRE(rig.rt->attach_rule(RT::NonWaiting{}, rid, file_spec("/q" + std::to_string(i)),
+                                    file_exists_rule(rid), true));
+    }
+    REQUIRE(yuzu::test::spin_until(
+        [&] { return rig.b->arm_entries.load() == 2 * ParkedPoolRig::kCapacity; }, 10s));
+    const auto refused_before = rig.rt->compensation_reservation_refused();
+
+    gate.release();
+    // The pool stays full until the guard has run: the heartbeat pops r only once the guard
+    // handed it back to Queued (the reaper never touches a Dispatching head). Without the
+    // guard r reaches the exhaustion branch instead, which fails and erases the key.
+    REQUIRE(yuzu::test::spin_until(
+        [&] {
+            (void)rig.rt->expire_overdue_claims();
+            return rig.rt->claim_queue_depth_for_test(key_x) == 0;
+        },
+        10s));
+    CHECK(rig.rt->compensation_reservation_refused() == refused_before);
+    CHECK(rig.status(rc) == RT::ReceiptStatus::Withdrawn);
+    CHECK(rig.b->arm_entries.load() == 2 * ParkedPoolRig::kCapacity); // r never entered arm()
+    rig.release_gate(); // frees the q arms; settle() then waits out the hook's thread too
+    rig.settle();
+    CHECK(rig.b->arm_entries.load() == 2 * ParkedPoolRig::kCapacity);
+    CHECK(rig.b->disarms.load() == 0);
+}
+
+TEST_CASE("#5322: the dispatch entry guard on a stopping runtime drops the claim like begin_stop",
+          "[spark][runtime][liveness]") {
+    using namespace std::chrono_literals;
+    using RT = GuardianSparkRuntime;
+    ParkedPoolRig rig;
+    auto gate_sp = std::make_shared<DrainPark>(); // shared + captured by value, as above
+    DrainPark& gate = *gate_sp;
+    struct Cleanup {
+        RT* rt;
+        DrainPark* gate;
+        ~Cleanup() {
+            rt->set_dispatch_entry_hook_for_test({});
+            gate->release();
+        }
+    } cleanup{rig.rt.get(), gate_sp.get()};
+    const auto key_x = spark_key(file_spec("/x"));
+    rig.fill_pool();
+    const auto rc = rig.park_rule("r", "/x");
+    const auto dropped_before = rig.rt->claims_dropped_at_stop();
+
+    // begin_stop() only requests the reader's stop (nonblocking); detach_rule has no stop
+    // check. begin_stop's walk skips the claim (it is Dispatching), so the guard must drop it.
+    rig.rt->set_dispatch_entry_hook_for_test([gate_sp, rt = rig.rt.get()] {
+        gate_sp->wait();
+        rt->begin_stop();
+        rt->detach_rule("r");
+    });
+    rig.release_gate();
+    REQUIRE(yuzu::test::spin_until([&] { return gate.entered.load(); }, 10s));
+    gate.release();
+    rig.settle();
+    REQUIRE(yuzu::test::spin_until(
+        [&] { return rig.rt->claims_dropped_at_stop() == dropped_before + 1; }, 10s));
+    CHECK(rig.rt->claim_queue_depth_for_test(key_x) == 0);
+    CHECK(rig.status(rc) == RT::ReceiptStatus::Withdrawn); // Case 0's outcome is kept
+    CHECK(rig.b->arm_entries.load() == ParkedPoolRig::kCapacity);
+}
+
+TEST_CASE("#5322: a committed Queued suffix is reaped with its tombstone in one pass",
+          "[spark][runtime][liveness]") {
+    using namespace std::chrono_literals;
+    TombRig5322 f;
+    f.attach("y");
+    REQUIRE(f.b->wait_entered_hang(10s));
+    f.attach("z");
+    f.attach("l");
+    f.rt->set_index_remove_fault_count_for_test(-1);
+    f.rt->detach_rule("z"); // t in the middle: [y, t, l]
+    REQUIRE(f.depth() == 3);
+    f.b->release_hang(); // y and l commit; the publish pops y and stops at t
+    REQUIRE(yuzu::test::spin_until([&] { return f.rt->rule_count() == 2; }, 10s));
+    REQUIRE(yuzu::test::spin_until(
+        [&] { return f.rt->retained_tombstones() == 1 && f.depth() == 2; }, 10s));
+
+    f.rt->set_index_remove_fault_count_for_test(0);
+    (void)f.rt->expire_overdue_claims(); // t AND the committed l popped, the entry erased
+    CHECK(f.depth() == 0);
+    CHECK(f.rt->retained_tombstones() == 0);
+    CHECK(f.rt->armed_key_count() == 1);
+    CHECK(f.rt->rule_count() == 2);
+}
+
+TEST_CASE("#5322: begin_stop drops a retained tombstone and counts it",
+          "[spark][runtime][liveness]") {
+    TombRig5322 f;
+    f.tombstone_behind_hung_head();
+    f.commit_head_leaving_tombstone();
+    const auto dropped_before = f.rt->claims_dropped_at_stop();
+    const auto failures_before = f.rt->claim_index_release_failures();
+    f.rt->begin_stop();
+    CHECK(f.rt->claims_dropped_at_stop() == dropped_before + 1);
+    CHECK(f.rt->claim_index_release_failures() == failures_before + 1); // the mapping stayed held
+    CHECK(f.rt->retained_tombstones() == 0);
+    CHECK(f.depth() == 0);
+}
+
+TEST_CASE("#5322: a reaper refill whose push throws parks the exposed head instead of leaving it undriven",
+          "[spark][runtime][liveness]") {
+    using namespace std::chrono_literals;
+    using RT = GuardianSparkRuntime;
+    PoolTomb5322 f;
+    f.build();
+    f.rig.rt->set_index_remove_fault_count_for_test(0);
+    f.rig.release_gate();
+    f.rig.settle(); // the pool is no longer full
+
+    const auto parked_before = f.rig.rt->arms_parked();
+    const auto failures_before = f.rig.rt->claim_drain_failures();
+    f.rig.rt->set_drain_fault_point_for_test(16); // the refill collection push throws
+    (void)f.rig.rt->expire_overdue_claims();
+    CHECK(f.rig.rt->retained_tombstones() == 0); // the tombstone itself was popped
+    CHECK(f.rig.rt->claim_queue_depth_for_test(f.key_x) == 1);
+    CHECK(f.rig.status(f.receipt_b) == RT::ReceiptStatus::Pending); // rb was not dispatched
+    CHECK(f.rig.b->arm_entries.load() == ParkedPoolRig::kCapacity);
+    CHECK(f.rig.rt->arms_parked() == parked_before + 1); // the catch parked it
+    CHECK(f.rig.rt->claim_drain_failures() == failures_before + 1);
+
+    (void)f.rig.rt->expire_overdue_claims(); // the reaper never re-selects a clean head
+    CHECK(f.rig.rt->arms_parked() == parked_before + 1);
+    CHECK(f.rig.rt->claim_drain_failures() == failures_before + 1);
+
+    (void)f.rig.rt->redrive_parked_arms();
+    REQUIRE(yuzu::test::spin_until(
+        [&] { return f.rig.status(f.receipt_b) == RT::ReceiptStatus::Committed; }, 10s));
+}
+
+// An attach on a COMMITTED key joins its watcher whatever the fifo holds (INV-2). Here the
+// fifo holds a retained tombstone at the front; the attach used to queue behind it and be
+// refilled onto the committed key, where it CommitThrew at the keys_.emplace collision.
+TEST_CASE("#5322: an attach on a committed key behind a tombstone joins the watcher instead of queuing",
+          "[spark][runtime][liveness]") {
+    using namespace std::chrono_literals;
+    using RT = GuardianSparkRuntime;
+    TombRig5322 f;
+    f.tombstone_behind_hung_head();
+    f.commit_head_leaving_tombstone();
+    REQUIRE(f.b->arm_entries.load() == 1);
+
+    // A synchronous join returns an EMPTY receipt (which reads Failed by construction), so
+    // the outcome kind is the assertion, never the receipt.
+    auto w = f.rt->attach_rule(RT::NonWaiting{}, "w", file_spec("/a"), file_exists_rule("w"), true);
+    REQUIRE(w.has_value());
+    CHECK(w->kind == RT::ArmOutcomeKind::Armed);
+    CHECK(f.rt->rule_count() == 2);
+    CHECK(f.b->arms.load() == 1);
+    CHECK(f.b->arm_entries.load() == 1);
+    CHECK(f.depth() == 1); // the tombstone alone: w never queued
+
+    f.rt->set_index_remove_fault_count_for_test(0);
+    (void)f.rt->expire_overdue_claims(); // pops t; nothing is refilled
+    CHECK(f.rt->retained_tombstones() == 0);
+    CHECK(f.depth() == 0);
+    CHECK(f.rt->armed_key_count() == 1);
+    CHECK(f.rt->rule_count() == 2);
+    CHECK(f.b->arm_entries.load() == 1);
+    CHECK(f.b->disarms.load() == 0);
+    REQUIRE_REGISTRY_INVARIANTS_5322(*f.rt);
+}
+
+// Pins clause (1) of the committed-key invariant: the fault-2 gap leaves H committed in
+// keys_ but unpublished, and a different rule attaching there joins the watcher instead of
+// queuing behind H (it used to be dispatched as a second backend arm after the publish).
+TEST_CASE("#5322: an attach in the commit-to-publish gap joins the committed watcher",
+          "[spark][runtime][liveness]") {
+    using namespace std::chrono_literals;
+    using RT = GuardianSparkRuntime;
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = make_rt(r, b, RT::Config{.backend_op_deadline = std::chrono::seconds(30)});
+    auto park = std::make_shared<DrainPark>();
+    struct Cleanup {
+        RT* rt;
+        DrainPark* park;
+        ~Cleanup() {
+            rt->set_drain_fault_point_for_test(0);
+            park->release();
+            rt->set_drain_gap_hook_for_test({});
+        }
+    } cleanup{rt.get(), park.get()};
+    const auto key = spark_key(file_spec("/a"));
+    rt->set_drain_gap_hook_for_test([park] { park->wait(); });
+    rt->set_drain_fault_point_for_test(2);
+
+    auto h = rt->attach_rule(RT::NonWaiting{}, "h", file_spec("/a"), file_exists_rule("h"), true);
+    REQUIRE(h.has_value());
+    REQUIRE(yuzu::test::spin_until([&] { return park->entered.load(); }, 10s));
+    REQUIRE(rt->rule_count() == 1);
+    REQUIRE(rt->claim_queue_depth_for_test(key) == 1); // H: committed, unpublished
+
+    const auto failures_before = rt->claim_drain_failures();
+    // A synchronous join returns an EMPTY receipt (Failed by construction): assert the kind.
+    auto w = rt->attach_rule(RT::NonWaiting{}, "w", file_spec("/a"), file_exists_rule("w"), true);
+    REQUIRE(w.has_value());
+    CHECK(w->kind == RT::ArmOutcomeKind::Armed);
+    CHECK(rt->rule_count() == 2);
+    CHECK(rt->claim_queue_depth_for_test(key) == 1); // H alone: w never queued
+    CHECK(b->arms.load() == 1);
+
+    park->release();
+    REQUIRE(yuzu::test::spin_until([&] { return rt->claim_queue_depth_for_test(key) == 0; }, 10s));
+    CHECK(rt->receipt_status(h->receipt) == RT::ReceiptStatus::Committed);
+    CHECK(rt->claim_drain_failures() == failures_before + 1); // the firewall count
+    CHECK(b->arms.load() == 1);                               // no second backend arm
+    CHECK(b->disarms.load() == 0);
+    CHECK(rt->armed_key_count() == 1);
+    CHECK(rt->rule_count() == 2);
+    REQUIRE_REGISTRY_INVARIANTS_5322(*rt);
+}
+
+// A refcount-0 orphan (keys_[K] present, no rules on K, an empty claims entry) is joined by
+// the next attach: no second backend arm, the watcher survives the empty entry's erasure.
+TEST_CASE("#5322: an attach on an orphan watcher joins it instead of arming over it",
+          "[spark][runtime][liveness]") {
+    using namespace std::chrono_literals;
+    using RT = GuardianSparkRuntime;
+    TombRig5322 f;
+    f.attach("y");
+    REQUIRE(f.b->wait_entered_hang(10s));
+    f.attach("z");
+    f.rt->set_index_remove_fault_count_for_test(-1);
+    f.rt->detach_rule("z"); // z's claim: a retained tombstone behind y
+    REQUIRE(f.depth() == 2);
+    REQUIRE(f.rt->retained_tombstones() == 1);
+    f.commit_head_leaving_tombstone();
+
+    // y goes: z's ghost mapping is the key's only one, so keys_ is an orphan watcher
+    // (refcount 1). The seam clears and the redrive lane (NOT the heartbeat) pops the
+    // tombstone: the ->0 edge is discarded, the entry is left empty, nothing is disarmed.
+    f.rt->detach_rule("y");
+    REQUIRE(f.rt->armed_key_count() == 1);
+    REQUIRE(f.b->disarms.load() == 0);
+    f.rt->set_index_remove_fault_count_for_test(0);
+    (void)f.rt->redrive_parked_arms();
+    REQUIRE(f.rt->retained_tombstones() == 0);
+    REQUIRE(f.depth() == 0);
+    REQUIRE(f.rt->rule_count() == 0);
+    REQUIRE(f.rt->armed_key_count() == 1); // the orphan
+
+    auto w = f.rt->attach_rule(RT::NonWaiting{}, "w", file_spec("/a"), file_exists_rule("w"), true);
+    REQUIRE(w.has_value());
+    CHECK(w->kind == RT::ArmOutcomeKind::Armed);
+    CHECK(f.b->arms.load() == 1);
+    CHECK(f.rt->rule_count() == 1);
+    CHECK(f.rt->armed_key_count() == 1);
+
+    (void)f.rt->expire_overdue_claims(); // erases the empty entry; the watcher is KEPT
+    CHECK(f.rt->armed_key_count() == 1);
+    CHECK(f.rt->rule_count() == 1);
+    CHECK(f.b->arms.load() == 1);
+    CHECK(f.b->disarms.load() == 0);
+    CHECK(f.rt->orphan_disarms_started() == 0); // refcount 1: not an orphan any more
+    REQUIRE_REGISTRY_INVARIANTS_5322(*f.rt);
+}
+
+// Lost never leaves keys_ holding the dead id. Three orders of the detach loop, then the
+// refcount-0 orphan where the loop runs zero times.
+TEST_CASE("#5322: Lost with the ghost detached first leaves no dead watcher and the key re-arms",
+          "[spark][runtime][liveness]") {
+    using namespace std::chrono_literals;
+    using RT = GuardianSparkRuntime;
+    TombRig5322 f;
+    // rules_for(K) is sorted: "a_ghost" detaches before "z_live".
+    f.attach("z_live");
+    REQUIRE(f.b->wait_entered_hang(10s));
+    f.attach("a_ghost");
+    f.rt->set_index_remove_fault_count_for_test(-1);
+    f.rt->detach_rule("a_ghost");
+    REQUIRE(f.depth() == 2);
+    REQUIRE(f.rt->retained_tombstones() == 1);
+    f.commit_head_leaving_tombstone(); // no park_every: the synchronous teardown needs none
+    const auto sub = f.b->armed_ids().at(0);
+    const auto skipped_before = f.rt->dead_subscription_disarms_skipped();
+
+    f.rt->on_event(SparkEvent{.key = f.key, .kind = SparkEventKind::Lost, .subscription_id = sub});
+    CHECK(f.rt->armed_key_count() == 0);
+    CHECK(f.rt->rule_count() == 0);
+    CHECK(f.rt->dead_watchers_erased_on_lost() == 0); // the detach loop erased keys_ itself
+    CHECK(f.rt->dead_subscription_disarms_skipped() == skipped_before + 1);
+    CHECK(f.b->disarms.load() == 0);
+    CHECK(f.depth() == 0);
+
+    auto w = f.rt->attach_rule(RT::NonWaiting{}, "w", file_spec("/a"), file_exists_rule("w"), true);
+    REQUIRE(w.has_value());
+    // No kind assertion: Accepted (claim in flight) or Armed (a free-pool claim that committed
+    // before the attach returned) are both a fresh arm; a JOIN of the dead watcher is told
+    // apart by the backend arm count below.
+    REQUIRE(yuzu::test::spin_until([&] { return f.b->arms.load() == 2; }, 10s));
+    REQUIRE(yuzu::test::spin_until([&] { return f.rt->armed_key_count() == 1; }, 10s));
+    REQUIRE_REGISTRY_INVARIANTS_5322(*f.rt);
+}
+
+TEST_CASE("#5322: Lost with the ghost detached last leaves no dead watcher and the key re-arms",
+          "[spark][runtime][liveness]") {
+    using namespace std::chrono_literals;
+    using RT = GuardianSparkRuntime;
+    TombRig5322 f;
+    // "z_ghost" detaches after "a_live". Never park_every here: the last-resort disarm is
+    // synchronous and the test must not depend on a parked redispatch.
+    f.attach("a_live");
+    REQUIRE(f.b->wait_entered_hang(10s));
+    f.attach("z_ghost");
+    f.rt->set_index_remove_fault_count_for_test(-1);
+    f.rt->detach_rule("z_ghost");
+    REQUIRE(f.depth() == 2);
+    REQUIRE(f.rt->retained_tombstones() == 1);
+    f.commit_head_leaving_tombstone();
+    const auto sub = f.b->armed_ids().at(0);
+    const auto residue_before = f.rt->detach_sweep_left_residue();
+    const auto claim_failures_before = f.rt->detach_claim_failures();
+
+    f.rt->on_event(SparkEvent{.key = f.key, .kind = SparkEventKind::Lost, .subscription_id = sub});
+    CHECK(f.rt->armed_key_count() == 0);
+    CHECK(f.rt->rule_count() == 0);
+    CHECK(f.rt->dead_watchers_erased_on_lost() == 0);
+    CHECK(f.rt->detach_sweep_left_residue() == residue_before + 1);
+    CHECK(f.rt->detach_claim_failures() == claim_failures_before + 1);
+    // The last-resort disarm ran synchronously on the dead id (a pre-existing inefficiency).
+    CHECK(f.b->disarms.load() == 1);
+    CHECK(f.depth() == 1); // t stays until the next pass
+
+    (void)f.rt->expire_overdue_claims(); // N-3: the ghost mapping is gone, so t releases
+    CHECK(f.depth() == 0);
+    CHECK(f.rt->retained_tombstones() == 0);
+
+    auto w = f.rt->attach_rule(RT::NonWaiting{}, "w", file_spec("/a"), file_exists_rule("w"), true);
+    REQUIRE(w.has_value());
+    // No kind assertion: Accepted (claim in flight) or Armed (a free-pool claim that committed
+    // before the attach returned) are both a fresh arm; a JOIN of the dead watcher is told
+    // apart by the backend arm count below.
+    REQUIRE(yuzu::test::spin_until([&] { return f.b->arms.load() == 2; }, 10s));
+    REQUIRE(yuzu::test::spin_until([&] { return f.rt->armed_key_count() == 1; }, 10s));
+    REQUIRE_REGISTRY_INVARIANTS_5322(*f.rt);
+}
+
+TEST_CASE("#5322: Lost on an orphan watcher with no rules erases the dead watcher",
+          "[spark][runtime][liveness]") {
+    using namespace std::chrono_literals;
+    using RT = GuardianSparkRuntime;
+    TombRig5322 f;
+    f.attach("y");
+    REQUIRE(f.b->wait_entered_hang(10s));
+    f.attach("z");
+    f.rt->set_index_remove_fault_count_for_test(-1);
+    f.rt->detach_rule("z");
+    REQUIRE(f.depth() == 2);
+    f.commit_head_leaving_tombstone();
+    f.rt->detach_rule("y");
+    f.rt->set_index_remove_fault_count_for_test(0);
+    (void)f.rt->redrive_parked_arms(); // refcount 0, keys_[K] present, an empty entry
+    REQUIRE(f.rt->retained_tombstones() == 0);
+    REQUIRE(f.rt->armed_key_count() == 1);
+    REQUIRE(f.rt->rule_count() == 0);
+    const auto sub = f.b->armed_ids().at(0);
+    const auto skipped_before = f.rt->dead_subscription_disarms_skipped();
+
+    f.rt->on_event(SparkEvent{.key = f.key, .kind = SparkEventKind::Lost, .subscription_id = sub});
+    CHECK(f.rt->armed_key_count() == 0);
+    CHECK(f.rt->dead_watchers_erased_on_lost() == 1);
+    CHECK(f.b->disarms.load() == 0); // the dead id is never disarmed
+    CHECK(f.rt->dead_subscription_disarms_skipped() == skipped_before);
+
+    // No teardown idiom comparing disarmed_ids() with armed_ids() here: the dead id is not
+    // disarmed. The next attach arms anew rather than joining the dead watcher.
+    auto w = f.rt->attach_rule(RT::NonWaiting{}, "w", file_spec("/a"), file_exists_rule("w"), true);
+    REQUIRE(w.has_value());
+    // No kind assertion: Accepted (claim in flight) or Armed (a free-pool claim that committed
+    // before the attach returned) are both a fresh arm; a JOIN of the dead watcher is told
+    // apart by the backend arm count below.
+    REQUIRE(yuzu::test::spin_until([&] { return f.b->arms.load() == 2; }, 10s));
+    REQUIRE(yuzu::test::spin_until([&] { return f.rt->armed_key_count() == 1; }, 10s));
+    CHECK(f.rt->rule_count() == 1);
+    REQUIRE_REGISTRY_INVARIANTS_5322(*f.rt);
+}
+
+// The last-on-key sweep can RELEASE the detaching rule's own owner tombstone (the seam has
+// cleared since the tombstone was retained). remove_rule then finds no mapping and returns
+// nullopt although the key's last rule is going: the teardown is owed iff this was the key's
+// last rule, which the pre-sweep refcount says, not remove_rule's return. A live assert on the
+// two agreeing used to abort the agent (SIGABRT) here. Both cases leave arm_park.park_every
+// unset and assert detach_sweep_left_residue is unchanged, so neither takes the synchronous
+// backend disarm of the `!claim_pushed` residue fallback.
+TEST_CASE("#5322: Lost where the sweep releases the ghost's own tombstone tears the key down without aborting",
+          "[spark][runtime][liveness]") {
+    using namespace std::chrono_literals;
+    using RT = GuardianSparkRuntime;
+    TombRig5322 f;
+    // "z_ghost" detaches after "a_live" (rules_for(K) is sorted).
+    f.attach("a_live");
+    REQUIRE(f.b->wait_entered_hang(10s));
+    f.attach("z_ghost");
+    f.rt->set_index_remove_fault_count_for_test(-1);
+    f.rt->detach_rule("z_ghost");
+    REQUIRE(f.depth() == 2);
+    REQUIRE(f.rt->retained_tombstones() == 1);
+    f.commit_head_leaving_tombstone();
+    const auto sub = f.b->armed_ids().at(0);
+    const auto residue_before = f.rt->detach_sweep_left_residue();
+    const auto claim_failures_before = f.rt->detach_claim_failures();
+    const auto skipped_before = f.rt->dead_subscription_disarms_skipped();
+
+    f.rt->set_index_remove_fault_count_for_test(0); // the sweep now SUCCEEDS
+    f.rt->on_event(SparkEvent{.key = f.key, .kind = SparkEventKind::Lost, .subscription_id = sub});
+    CHECK(f.rt->armed_key_count() == 0);
+    CHECK(f.rt->rule_count() == 0);
+    CHECK(f.rt->dead_watchers_erased_on_lost() == 0); // the detach loop erased keys_ itself
+    CHECK(f.rt->detach_sweep_left_residue() == residue_before);
+    CHECK(f.rt->detach_claim_failures() == claim_failures_before);
+    CHECK(f.rt->dead_subscription_disarms_skipped() == skipped_before + 1);
+    CHECK(f.b->disarms.load() == 0); // the dead id is never disarmed
+    CHECK(f.depth() == 0);
+    CHECK(f.rt->retained_tombstones() == 0);
+    REQUIRE_REGISTRY_INVARIANTS_5322(*f.rt);
+
+    // The dead subscription is not left in keys_: a fresh attach arms anew (arms 2), it does
+    // not join the dead watcher (arms would stay 1).
+    auto w = f.rt->attach_rule(RT::NonWaiting{}, "w", file_spec("/a"), file_exists_rule("w"), true);
+    REQUIRE(w.has_value());
+    REQUIRE(yuzu::test::spin_until([&] { return f.b->arms.load() == 2; }, 10s));
+    REQUIRE(yuzu::test::spin_until([&] { return f.rt->armed_key_count() == 1; }, 10s));
+    REQUIRE(yuzu::test::spin_until([&] { return f.rt->rule_count() == 1; }, 10s));
+
+    (void)f.rt->expire_overdue_claims();
+    CHECK(f.rt->orphan_disarms_started() == 0); // nothing was left for the orphan pass
+    CHECK(f.rt->armed_key_count() == 1);
+    REQUIRE_REGISTRY_INVARIANTS_5322(*f.rt);
+}
+
+TEST_CASE("#5322: a same-rule re-attach where the sweep releases its own tombstone tears the key down without aborting",
+          "[spark][runtime][liveness]") {
+    using namespace std::chrono_literals;
+    TombRig5322 f;
+    f.attach("y");
+    REQUIRE(f.b->wait_entered_hang(10s));
+    f.attach("z");
+    f.rt->set_index_remove_fault_count_for_test(-1);
+    f.rt->detach_rule("z"); // z's claim: a retained tombstone behind y
+    REQUIRE(f.depth() == 2);
+    REQUIRE(f.rt->retained_tombstones() == 1);
+    f.commit_head_leaving_tombstone();
+
+    // y goes: z's ghost mapping is the key's only one, so keys_ is an orphan watcher.
+    f.rt->detach_rule("y");
+    REQUIRE(f.rt->armed_key_count() == 1);
+    REQUIRE(f.b->disarms.load() == 0);
+
+    f.rt->set_index_remove_fault_count_for_test(0); // z's own re-attach sweep now SUCCEEDS
+    const auto residue_before = f.rt->detach_sweep_left_residue();
+    const auto claim_failures_before = f.rt->detach_claim_failures();
+    // No kind assertion: queued behind the teardown (Accepted) or already committed are both
+    // a fresh arm; the backend counts below tell a join apart.
+    auto z = f.rt->attach_rule(GuardianSparkRuntime::NonWaiting{}, "z", file_spec("/a"),
+                               file_exists_rule("z"), true);
+    REQUIRE(z.has_value());
+    CHECK(f.rt->detach_sweep_left_residue() == residue_before);
+    CHECK(f.rt->detach_claim_failures() == claim_failures_before);
+    REQUIRE(yuzu::test::spin_until([&] { return f.b->disarms.load() == 1; }, 10s));
+    REQUIRE(yuzu::test::spin_until([&] { return f.b->arms.load() == 2; }, 10s));
+    REQUIRE(yuzu::test::spin_until([&] { return f.rt->rule_count() == 1; }, 10s));
+    REQUIRE(yuzu::test::spin_until([&] { return f.depth() == 0; }, 10s));
+    CHECK(f.rt->retained_tombstones() == 0);
+    CHECK(f.rt->armed_key_count() == 1);
+    (void)f.rt->expire_overdue_claims();
+    CHECK(f.rt->orphan_disarms_started() == 0);
+    CHECK(f.rt->armed_key_count() == 1);
+    REQUIRE_REGISTRY_INVARIANTS_5322(*f.rt);
+}
+
+// ---------------------------------------------------------------------------
+// WP3 (#5322): the orphan pass. A keys_ entry whose index refcount reached 0 through a
+// release nobody acted on (a reaper or redrive-lane pop of the last ghost mapping) is
+// disarmed by the heartbeat's pass: a durable Disarm claim, queued in the same critical
+// section that erases keys_[K].
+// ---------------------------------------------------------------------------
+namespace {
+/// Hung head `y` and rule `z` on /a; the seam is sticky and `z` detached (a retained tombstone
+/// behind `y`); `y` commits and is then detached. The key's only remaining index mapping is
+/// z's ghost, so keys_[K] is an orphan WATCHER whose refcount is still 1: nothing is disarmed
+/// and the tombstone is still queued. The caller decides who pops it.
+void orphan_awaiting_pop_5322(TombRig5322& f) {
+    using namespace std::chrono_literals;
+    f.attach("y");
+    REQUIRE(f.b->wait_entered_hang(10s));
+    f.attach("z");
+    f.rt->set_index_remove_fault_count_for_test(-1);
+    f.rt->detach_rule("z");
+    REQUIRE(f.depth() == 2);
+    REQUIRE(f.rt->retained_tombstones() == 1);
+    f.commit_head_leaving_tombstone();
+    f.rt->detach_rule("y");
+    REQUIRE(f.rt->armed_key_count() == 1);
+    REQUIRE(f.b->disarms.load() == 0);
+    REQUIRE(f.rt->orphan_disarms_started() == 0);
+}
+
+/// The redrive lane (NOT the heartbeat, whose orphan pass would disarm K) pops the tombstone:
+/// the ->0 edge is discarded and the claims entry is left empty. keys_[K] is a refcount-0
+/// orphan that no pass has seen yet.
+void orphan_after_redrive_5322(TombRig5322& f) {
+    orphan_awaiting_pop_5322(f);
+    f.rt->set_index_remove_fault_count_for_test(0);
+    (void)f.rt->redrive_parked_arms();
+    REQUIRE(f.rt->retained_tombstones() == 0);
+    REQUIRE(f.depth() == 0);
+    REQUIRE(f.rt->rule_count() == 0);
+    REQUIRE(f.rt->armed_key_count() == 1);
+    REQUIRE(f.b->disarms.load() == 0);
+}
+} // namespace
+
+TEST_CASE("#5322: an orphan watcher whose last mapping was released late is disarmed by the next pass",
+          "[spark][runtime][liveness]") {
+    using namespace std::chrono_literals;
+    using RT = GuardianSparkRuntime;
+    TombRig5322 f;
+    orphan_awaiting_pop_5322(f);
+
+    // One pass: the reaper pops the tombstone (the ->0 edge, discarded), erases the empty
+    // entry, and the orphan pass in the same call starts the teardown.
+    f.rt->set_index_remove_fault_count_for_test(0);
+    (void)f.rt->expire_overdue_claims();
+    CHECK(f.rt->retained_tombstones() == 0);
+    CHECK(f.rt->armed_key_count() == 0);
+    CHECK(f.rt->orphan_disarms_started() == 1);
+    REQUIRE(yuzu::test::spin_until([&] { return f.b->disarms.load() == 1; }, 10s));
+    REQUIRE(yuzu::test::spin_until([&] { return f.depth() == 0; }, 10s));
+    const auto first = f.b->armed_ids();
+    REQUIRE(first.size() == 1);
+    CHECK(f.b->disarmed_ids() == first); // the orphan's own subscription, exactly once
+
+    // The key re-arms anew (a claim in flight or one that already committed: both are a
+    // fresh arm; a JOIN of the doomed watcher would leave arms at 1).
+    auto w = f.rt->attach_rule(RT::NonWaiting{}, "w", file_spec("/a"), file_exists_rule("w"), true);
+    REQUIRE(w.has_value());
+    REQUIRE(yuzu::test::spin_until([&] { return f.b->arms.load() == 2; }, 10s));
+    REQUIRE(yuzu::test::spin_until([&] { return f.rt->rule_count() == 1; }, 10s));
+    CHECK(f.rt->armed_key_count() == 1);
+    CHECK(f.rt->orphan_disarms_started() == 1);
+    REQUIRE_REGISTRY_INVARIANTS_5322(*f.rt);
+}
+
+TEST_CASE("#5322: the orphan pass never disarms a key that still has a rule", "[spark][runtime][liveness]") {
+    using namespace std::chrono_literals;
+    using RT = GuardianSparkRuntime;
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = make_rt(r, b, RT::Config{.backend_op_deadline = std::chrono::seconds(30)});
+    for (const auto* rid : {"a", "b"}) {
+        auto res = rt->attach_rule(RT::NonWaiting{}, rid, file_spec("/a"), file_exists_rule(rid), true);
+        REQUIRE(res.has_value());
+    }
+    {
+        auto res = rt->attach_rule(RT::NonWaiting{}, "c", file_spec("/b"), file_exists_rule("c"), true);
+        REQUIRE(res.has_value());
+    }
+    REQUIRE(yuzu::test::spin_until([&] { return rt->rule_count() == 3; }, 10s));
+    REQUIRE(rt->armed_key_count() == 2);
+
+    for (int i = 0; i < 3; ++i) {
+        (void)rt->expire_overdue_claims();
+        (void)rt->redrive_parked_arms();
+    }
+    CHECK(rt->orphan_disarms_started() == 0);
+    CHECK(b->disarms.load() == 0);
+    CHECK(rt->armed_key_count() == 2);
+    CHECK(rt->rule_count() == 3);
+    rt->begin_stop();
+}
+
+// Deterministic: the attach waits for the teardown to FINISH (depth 0), so what it sees is a
+// key with no keys_ entry and no claim. If the pass had left keys_[K] behind, the attach
+// would join the doomed watcher instead of arming a new one.
+TEST_CASE("#5322: an attach after the orphan teardown arms a fresh watcher and does not join the doomed one",
+          "[spark][runtime][liveness]") {
+    using namespace std::chrono_literals;
+    using RT = GuardianSparkRuntime;
+    TombRig5322 f;
+    orphan_awaiting_pop_5322(f);
+    f.rt->set_index_remove_fault_count_for_test(0);
+    (void)f.rt->expire_overdue_claims();
+    REQUIRE(yuzu::test::spin_until([&] { return f.b->disarms.load() == 1; }, 10s));
+    REQUIRE(yuzu::test::spin_until([&] { return f.depth() == 0; }, 10s));
+    REQUIRE(f.rt->armed_key_count() == 0);
+
+    auto w = f.rt->attach_rule(RT::NonWaiting{}, "w", file_spec("/a"), file_exists_rule("w"), true);
+    REQUIRE(w.has_value());
+    // A free pool may commit the claim before attach_rule returns (Armed, an empty receipt);
+    // only a queued claim carries a receipt to wait on.
+    if (w->kind == RT::ArmOutcomeKind::Accepted)
+        REQUIRE(yuzu::test::spin_until(
+            [&] { return f.rt->receipt_status(w->receipt) == RT::ReceiptStatus::Committed; }, 10s));
+    REQUIRE(yuzu::test::spin_until([&] { return f.b->arms.load() == 2; }, 10s));
+    REQUIRE(yuzu::test::spin_until([&] { return f.b->armed_ids().size() == 2; }, 10s));
+    REQUIRE(yuzu::test::spin_until([&] { return f.rt->rule_count() == 1; }, 10s));
+    CHECK(f.rt->armed_key_count() == 1);
+    // Identity, not counts: the doomed subscription is the one that was disarmed, and the new
+    // watcher's subscription was never disarmed.
+    const auto armed = f.b->armed_ids();
+    CHECK(f.b->disarmed_ids() == std::vector<std::uint64_t>{armed.at(0)});
+    CHECK(f.b->disarms.load() == 1);
+    REQUIRE_REGISTRY_INVARIANTS_5322(*f.rt);
+}
+
+TEST_CASE("#5322: a throw building one orphan's Disarm leaves keys_ owning the watcher and the next pass retries",
+          "[spark][runtime][liveness]") {
+    using namespace std::chrono_literals;
+    TombRig5322 f;
+    orphan_after_redrive_5322(f);
+
+    const auto failures_before = f.rt->claim_drain_failures();
+    f.rt->set_drain_fault_point_for_test(13); // the Disarm build throws, inside the per-orphan try
+    (void)f.rt->expire_overdue_claims();
+    CHECK(f.rt->claim_drain_failures() == failures_before + 1);
+    CHECK(f.rt->armed_key_count() == 1); // keys_ still owns the watcher
+    CHECK(f.depth() == 0);               // no claim, no empty entry
+    // The unhealed orphan is exactly what the checker reports, and exactly what it accepts when
+    // told an orphan is expected here.
+    CHECK(f.rt->invariant_violations_for_test().size() == 1);
+    REQUIRE_REGISTRY_INVARIANTS_ORPHANS_OK_5322(*f.rt);
+    CHECK(f.rt->orphan_disarms_started() == 0);
+    CHECK(f.b->disarms.load() == 0);
+
+    (void)f.rt->expire_overdue_claims(); // the point is consumed: the retry disarms
+    CHECK(f.rt->armed_key_count() == 0);
+    CHECK(f.rt->orphan_disarms_started() == 1);
+    REQUIRE(yuzu::test::spin_until([&] { return f.b->disarms.load() == 1; }, 10s));
+    CHECK(f.rt->claim_drain_failures() == failures_before + 1);
+    REQUIRE_REGISTRY_INVARIANTS_5322(*f.rt);
+}
+
+TEST_CASE("#5322: a throw in the orphan pass's off-lock collection push leaves the Disarm durable and redriven",
+          "[spark][runtime][liveness]") {
+    using namespace std::chrono_literals;
+    TombRig5322 f;
+    orphan_after_redrive_5322(f);
+
+    const auto failures_before = f.rt->claim_drain_failures();
+    f.rt->set_drain_fault_point_for_test(14); // after the Disarm is durable and keys_ erased
+    (void)f.rt->expire_overdue_claims();
+    CHECK(f.rt->claim_drain_failures() == failures_before + 1);
+    CHECK(f.rt->armed_key_count() == 0); // keys_ erased in the same critical section as the push
+    CHECK(f.depth() == 1);               // the Disarm, durable in claims_
+    CHECK(f.rt->orphan_disarms_started() == 1);
+    CHECK(f.b->disarms.load() == 0);     // never submitted: the collection push threw
+    CHECK(f.rt->rule_count() == 0);
+
+    (void)f.rt->redrive_retained_disarms(); // the lane drives it
+    REQUIRE(yuzu::test::spin_until([&] { return f.b->disarms.load() == 1; }, 10s));
+    REQUIRE(yuzu::test::spin_until([&] { return f.depth() == 0; }, 10s));
+    const auto armed = f.b->armed_ids();
+    REQUIRE(armed.size() == 1);
+    CHECK(f.b->disarmed_ids() == armed);
+    REQUIRE_REGISTRY_INVARIANTS_5322(*f.rt);
+}
+
+// The throw is at the TOP of the orphan pass, outside the per-orphan try (point 13 cannot show
+// this: it is contained per orphan). The reaper's refill in the same call was already flipped
+// to Dispatching; if the throw unwound expire_overdue_claims it would never get a worker.
+TEST_CASE("#5322: a throw in the orphan pass itself does not strand the reaper's refill",
+          "[spark][runtime][liveness]") {
+    using namespace std::chrono_literals;
+    using RT = GuardianSparkRuntime;
+    PoolTomb5322 f{RT::Config{.backend_op_deadline = std::chrono::seconds(30)}};
+    auto& rt = *f.rig.rt;
+    const auto key_j = spark_key(file_spec("/j"));
+
+    // An orphan watcher on /j, built before the pool is filled.
+    f.rig.b->hang_next_arm.store(true);
+    {
+        auto jy = rt.attach_rule(RT::NonWaiting{}, "jy", file_spec("/j"), file_exists_rule("jy"), true);
+        REQUIRE(jy.has_value());
+        REQUIRE(jy->kind == RT::ArmOutcomeKind::Accepted);
+    }
+    REQUIRE(f.rig.b->wait_entered_hang(10s));
+    {
+        auto jz = rt.attach_rule(RT::NonWaiting{}, "jz", file_spec("/j"), file_exists_rule("jz"), true);
+        REQUIRE(jz.has_value());
+        REQUIRE(jz->kind == RT::ArmOutcomeKind::Accepted);
+    }
+    rt.set_index_remove_fault_count_for_test(-1);
+    rt.detach_rule("jz");
+    REQUIRE(rt.claim_queue_depth_for_test(key_j) == 2);
+    REQUIRE(rt.retained_tombstones() == 1);
+    f.rig.b->release_hang();
+    REQUIRE(yuzu::test::spin_until([&] { return rt.rule_count() == 1; }, 10s));
+    REQUIRE(yuzu::test::spin_until(
+        [&] { return rt.retained_tombstones() == 1 && rt.claim_queue_depth_for_test(key_j) == 1; }, 10s));
+    rt.detach_rule("jy");
+    rt.set_index_remove_fault_count_for_test(0);
+    (void)rt.redrive_parked_arms();
+    REQUIRE(rt.retained_tombstones() == 0);
+    REQUIRE(rt.claim_queue_depth_for_test(key_j) == 0);
+    REQUIRE(rt.rule_count() == 0);
+    REQUIRE(rt.armed_key_count() == 1); // J: refcount 0, no claim
+    f.rig.settle();                     // the workers are done: the pool can now be filled
+
+    // T2a's state on /x: ra a retained tombstone at the head, rb clean behind it.
+    f.build();
+    rt.set_index_remove_fault_count_for_test(0);
+    f.rig.release_gate();
+
+    const auto failures_before = rt.claim_drain_failures();
+    rt.set_drain_fault_point_for_test(15); // the walk throws before touching J
+    CHECK_NOTHROW((void)rt.expire_overdue_claims()); // contained: the refill still gets its worker
+    CHECK(rt.claim_drain_failures() == failures_before + 1);
+    REQUIRE(yuzu::test::spin_until(
+        [&] { return f.rig.status(f.receipt_b) == RT::ReceiptStatus::Committed; }, 10s));
+    f.rig.settle();
+    // J, the four fillers and /x. J is untouched by the faulted pass.
+    REQUIRE(yuzu::test::spin_until([&] { return rt.armed_key_count() == 6; }, 10s));
+    CHECK(rt.orphan_disarms_started() == 0);
+    CHECK(f.rig.b->disarms.load() == 0);
+
+    (void)rt.expire_overdue_claims(); // the next pass disarms J
+    CHECK(rt.orphan_disarms_started() == 1);
+    REQUIRE(yuzu::test::spin_until([&] { return f.rig.b->disarms.load() == 1; }, 10s));
+    CHECK(rt.armed_key_count() == 5);
+    REQUIRE_REGISTRY_INVARIANTS_5322(rt);
+}
+
+// begin_stop owns the shutdown path: an orphan pass after it starts no teardown (a queued
+// Disarm would be dropped by the stopped runtime anyway), and nothing here relies on the
+// runtime being usable after stop.
+TEST_CASE("#5322: the orphan pass is inert once the runtime is stopping",
+          "[spark][runtime][liveness]") {
+    TombRig5322 f;
+    orphan_after_redrive_5322(f);
+    f.rt->begin_stop();
+    const auto armed_before = f.rt->armed_key_count();
+    const auto disarms_before = f.b->disarms.load();
+    REQUIRE(armed_before == 1); // the orphan watcher is still in keys_
+
+    (void)f.rt->expire_overdue_claims();
+    CHECK(f.rt->orphan_disarms_started() == 0);
+    CHECK(f.depth() == 0); // no Disarm claim was queued
+    CHECK(f.rt->armed_key_count() == armed_before);
+    CHECK(f.b->disarms.load() == disarms_before);
+}
+
+// ---------------------------------------------------------------------------
+// #5323 WP4: abandon_claim_locked's Queued branch retains the claim when its index release
+// fails, instead of erasing it with the mapping still held (a ghost (key, rule) entry whose
+// refcount never reaches zero, so the key never disarms).
+// ---------------------------------------------------------------------------
+namespace {
+/// A hung head on /a with a SHORT claim deadline. The destructor clears the index-release
+/// seam FIRST, then opens the park and the hang, then stops.
+struct Abandon5323Rig {
+    using RT = GuardianSparkRuntime;
+    std::shared_ptr<FakeReader> r = std::make_shared<FakeReader>();
+    std::shared_ptr<FakeBackend> b = std::make_shared<FakeBackend>();
+    std::shared_ptr<RT> rt;
+    const std::string key = spark_key(file_spec("/a"));
+    Abandon5323Rig() {
+        b->hang_next_arm.store(true);
+        rt = make_rt(r, b, RT::Config{.backend_op_deadline = std::chrono::milliseconds(50)});
+    }
+    ~Abandon5323Rig() {
+        rt->set_index_remove_fault_count_for_test(0);
+        b->arm_park.open();
+        b->release_hang();
+        rt->begin_stop();
+    }
+    [[nodiscard]] std::size_t depth() const { return rt->claim_queue_depth_for_test(key); }
+    [[nodiscard]] RT::ArmReceipt attach_queued(const std::string& rid) {
+        auto res = rt->attach_rule(RT::NonWaiting{}, rid, file_spec("/a"), file_exists_rule(rid), true);
+        REQUIRE(res.has_value());
+        REQUIRE(res->kind == RT::ArmOutcomeKind::Accepted); // queued behind the hung head
+        return res->receipt;
+    }
+};
+} // namespace
+
+TEST_CASE("#5323: an abandoned Queued claim whose index release fails is retained and the key still disarms",
+          "[spark][runtime][liveness]") {
+    using namespace std::chrono_literals;
+    using RT = GuardianSparkRuntime;
+    Abandon5323Rig f;
+    const auto rch = f.attach_queued("H");
+    REQUIRE(f.b->wait_entered_hang(10s));
+    const auto rc2 = f.attach_queued("r2");
+    f.rt->set_index_remove_fault_count_for_test(-1);
+
+    // The hung head and r2 both pass their 50 ms deadline; poll the TARGET receipt.
+    const auto timeouts_before = f.rt->backend_op_timeouts();
+    REQUIRE(yuzu::test::spin_until(
+        [&] {
+            (void)f.rt->expire_overdue_claims();
+            return f.rt->receipt_status(rc2) == RT::ReceiptStatus::CongestionExpired;
+        },
+        10s));
+    CHECK(f.rt->receipt_status(rch) == RT::ReceiptStatus::Wedged);
+    // r2's release failed: it stays in the fifo as a withdrawn tombstone behind H.
+    CHECK(f.rt->retained_tombstones() == 1);
+    CHECK(f.depth() == 2);
+    // Counted once per abandonment: H (wedged) and r2.
+    CHECK(f.rt->backend_op_timeouts() == timeouts_before + 2);
+
+    // Reaper retries (which fail under the seam) are counted elsewhere, never here.
+    const auto timeouts_after = f.rt->backend_op_timeouts();
+    (void)f.rt->expire_overdue_claims();
+    (void)f.rt->expire_overdue_claims();
+    CHECK(f.rt->backend_op_timeouts() == timeouts_after);
+    CHECK(f.rt->retained_tombstones() == 1);
+
+    // H's late success takes the wedge path and commits; r2's tombstone is still held.
+    f.b->release_hang();
+    REQUIRE(yuzu::test::spin_until([&] { return f.rt->rule_count() == 1; }, 10s));
+    REQUIRE(yuzu::test::spin_until(
+        [&] { return f.rt->retained_tombstones() == 1 && f.depth() == 1; }, 10s));
+
+    // Seam clears: one pass releases r2's mapping and pops it.
+    f.rt->set_index_remove_fault_count_for_test(0);
+    (void)f.rt->expire_overdue_claims();
+    CHECK(f.rt->retained_tombstones() == 0);
+    CHECK(f.depth() == 0);
+    CHECK(f.rt->armed_key_count() == 1);
+
+    // H was the last rule on the key and r2's mapping is gone: detaching H disarms it.
+    f.rt->detach_rule("H");
+    CHECK(f.rt->armed_key_count() == 0);
+    REQUIRE(yuzu::test::spin_until([&] { return f.b->disarms.load() == 1; }, 10s));
+
+    // The key arms afresh.
+    (void)f.rt->attach_rule(RT::NonWaiting{}, "r3", file_spec("/a"), file_exists_rule("r3"), true);
+    REQUIRE(yuzu::test::spin_until([&] { return f.b->arms.load() == 2; }, 10s));
+}
+
+TEST_CASE("#5322: a blocking waiter is woken by the pass that reaper-synthesizes its outcome",
+          "[spark][runtime][liveness]") {
+    using namespace std::chrono_literals;
+    using RT = GuardianSparkRuntime;
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    // A LONG deadline: a missed notify leaves the waiter asleep far past the 2 s bound
+    // below, so the failure is unambiguous (the waiter is never woken by its own deadline).
+    auto rt = make_rt(r, b, RT::Config{.backend_op_deadline = 30s});
+    const auto key = spark_key(file_spec("/a"));
+
+    // The up-4 double-fault construction (see the "up-4 (#4221)" case above), but with the
+    // BLOCKING attach_rule overload on its own thread: fault point 1 fails the initial
+    // staging, the gap hook re-arms fault point 7 so the firewall loop throws after
+    // release_claim_index_locked failed (index_remove_fault) and marked the claim
+    // withdrawn+Queued, before its outcome is written. The waiter's claim is that residue.
+    std::atomic<bool> hook_fired{false};
+    rt->set_index_remove_fault_for_test(true);
+    rt->set_drain_fault_point_for_test(1);
+    rt->set_drain_gap_hook_for_test([&] {
+        rt->set_drain_fault_point_for_test(7);
+        hook_fired.store(true, std::memory_order_release);
+    });
+
+    std::atomic<bool> waiter_done{false};
+    std::optional<std::expected<std::uint64_t, std::string>> waiter_result;
+    std::thread waiter([&] {
+        waiter_result = rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true);
+        waiter_done.store(true, std::memory_order_release);
+    });
+    // On EVERY exit path (a RED run included): stop the runtime so a still-blocked waiter
+    // returns "stopping" instead of sleeping out its 30 s deadline, then join it.
+    yuzu::test::ScopeExit cleanup{[&] {
+        rt->set_drain_gap_hook_for_test({});
+        rt->begin_stop();
+        if (waiter.joinable())
+            waiter.join();
+    }};
+
+    REQUIRE(yuzu::test::spin_until([&] { return hook_fired.load(std::memory_order_acquire); },
+                                   10s));
+    // The compensating disarm has run (compensation_finished) and the residue is in place:
+    // one Queued claim, no outcome, so the waiter is still blocked.
+    REQUIRE(yuzu::test::spin_until([&] { return b->disarms.load() == 1; }, 10s));
+    REQUIRE(yuzu::test::spin_until([&] { return rt->claim_queue_depth_for_test(key) == 1; }, 10s));
+    REQUIRE_FALSE(waiter_done.load(std::memory_order_acquire));
+
+    // This pass expires nothing (the claim is not overdue) and refills nothing: the ONLY
+    // thing it does is reap the residue and write its fallback outcome. The waiter must be
+    // woken by it, not at its own 30 s deadline.
+    CHECK(rt->expire_overdue_claims() == 0);
+    CHECK(rt->claim_queue_depth_for_test(key) == 0);
+    REQUIRE(yuzu::test::spin_until([&] { return waiter_done.load(std::memory_order_acquire); },
+                                   2s));
+    waiter.join();
+    REQUIRE(waiter_result.has_value());
+    REQUIRE_FALSE(waiter_result->has_value());
+    CHECK(waiter_result->error() == "arm drain failed");
+}
+
+TEST_CASE("#5322: a blocking waiter is woken by a synthesizing pass even when the reaper's own release fails",
+          "[spark][runtime][liveness]") {
+    using namespace std::chrono_literals;
+    using RT = GuardianSparkRuntime;
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    // A LONG deadline: a missed notify leaves the waiter asleep far past the 2 s bound
+    // below, so the failure is unambiguous (the waiter is never woken by its own deadline).
+    auto rt = make_rt(r, b, RT::Config{.backend_op_deadline = 30s});
+    const auto key = spark_key(file_spec("/a"));
+
+    // The up-4 double-fault construction (see the "up-4 (#4221)" case above), but with the
+    // BLOCKING attach_rule overload on its own thread: fault point 1 fails the initial
+    // staging, the gap hook re-arms fault point 7 so the firewall loop throws after
+    // release_claim_index_locked failed (index_remove_fault) and marked the claim
+    // withdrawn+Queued, before its outcome is written. The waiter's claim is that residue.
+    std::atomic<bool> hook_fired{false};
+    rt->set_index_remove_fault_count_for_test(-1); // sticky: the reaper's releases fail too
+    rt->set_drain_fault_point_for_test(1);
+    rt->set_drain_gap_hook_for_test([&] {
+        rt->set_drain_fault_point_for_test(7);
+        hook_fired.store(true, std::memory_order_release);
+    });
+
+    std::atomic<bool> waiter_done{false};
+    std::optional<std::expected<std::uint64_t, std::string>> waiter_result;
+    std::thread waiter([&] {
+        waiter_result = rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true);
+        waiter_done.store(true, std::memory_order_release);
+    });
+    // On EVERY exit path (a RED run included): stop the runtime so a still-blocked waiter
+    // returns "stopping" instead of sleeping out its 30 s deadline, then join it.
+    yuzu::test::ScopeExit cleanup{[&] {
+        rt->set_index_remove_fault_count_for_test(0);
+        rt->set_drain_gap_hook_for_test({});
+        rt->begin_stop();
+        if (waiter.joinable())
+            waiter.join();
+    }};
+
+    REQUIRE(yuzu::test::spin_until([&] { return hook_fired.load(std::memory_order_acquire); },
+                                   10s));
+    // The compensating disarm has run (compensation_finished) and the residue is in place:
+    // one Queued claim, no outcome, so the waiter is still blocked.
+    REQUIRE(yuzu::test::spin_until([&] { return b->disarms.load() == 1; }, 10s));
+    REQUIRE(yuzu::test::spin_until([&] { return rt->claim_queue_depth_for_test(key) == 1; }, 10s));
+    REQUIRE_FALSE(waiter_done.load(std::memory_order_acquire));
+
+    // The seam stays sticky through the pass, so the reaper's own release of the residue fails
+    // AFTER it synthesized the outcome: the tombstone is kept (the depth check below). The pass must
+    // still wake the waiter (its outcome is now written), not leave it asleep to its 30 s
+    // deadline: no later pass would wake it either, since each reaps 0.
+    const auto release_failures_before = rt->claim_index_release_failures();
+    CHECK(rt->expire_overdue_claims() == 0);
+    CHECK(rt->claim_index_release_failures() == release_failures_before + 2); // synthesis + loop
+    CHECK(rt->claim_queue_depth_for_test(key) == 1); // retained: the release failed
+    REQUIRE(yuzu::test::spin_until([&] { return waiter_done.load(std::memory_order_acquire); },
+                                   2s));
+    waiter.join();
+    REQUIRE(waiter_result.has_value());
+    REQUIRE_FALSE(waiter_result->has_value());
+    CHECK(waiter_result->error() == "arm drain failed");
+}
+
+// An inline-type key (Startup here) is torn down by a synchronous backend disarm inside the
+// detach, the only teardown call that has no deferred claim. A throw from it must not skip
+// the keys_ erase: the rule and its index mapping are already gone, so a surviving refcount-0
+// keys_ entry would be JOINED by the next attach on that key (a stale watcher, no new arm).
+TEST_CASE("#5322: a throwing inline disarm in the last detach is contained and the key is erased",
+          "[spark][runtime][liveness]") {
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = make_rt(r, b);
+    const SparkSpec spec{SparkType::Startup, StartupSparkParams{}};
+
+    REQUIRE(rt->attach_rule("r1", spec, file_exists_rule("r1"), true));
+    REQUIRE(b->arms.load() == 1);
+    REQUIRE(rt->armed_key_count() == 1);
+
+    b->throw_next_disarm = true;
+    CHECK_NOTHROW(rt->detach_rule("r1"));
+    CHECK(b->disarm_entries.load() == 1); // the disarm was attempted, and it threw
+    CHECK_FALSE(b->throw_next_disarm.load());
+    CHECK(rt->detach_post_commit_failures() == 1); // the contained throw is counted
+    CHECK(rt->rule_count() == 0);
+    CHECK(rt->armed_key_count() == 0); // the keys_ entry is gone, not left at refcount 0
+    REQUIRE_REGISTRY_INVARIANTS_5322(*rt);
+
+    // A fresh attach on the same key arms anew; it does not join a stale watcher.
+    REQUIRE(rt->attach_rule("r2", spec, file_exists_rule("r2"), true));
+    CHECK(b->arms.load() == 2);
+    CHECK(rt->armed_key_count() == 1);
+    REQUIRE_REGISTRY_INVARIANTS_5322(*rt);
 }

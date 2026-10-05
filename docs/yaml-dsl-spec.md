@@ -1673,7 +1673,7 @@ This section enumerates the stable builtin primitives that content authors targe
 | Primitive | Backing Plugin | Win | Linux | macOS | Status |
 |---|---|:---:|:---:|:---:|---|
 | `network.config.get` | `network_config` | Y | Y | Y | Verified |
-| `network.route.list` | `network_config` | Y | Y | Y | Verified |
+| `network.route.list` | `network_config` (`routes` action) | Y | Y | Y | Verified |
 | `network.connection.list` | `netstat` | Y | Y | Y | Verified |
 | `network.socket.owner` | `netstat` (`attribution` action) | Y | Y | Y | Verified |
 | `network.dns.flush` | `network_actions` | Y | Y | Y | Verified |

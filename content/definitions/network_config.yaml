@@ -1,6 +1,6 @@
 ## Network Configuration Definitions
 ## Reports network adapter configuration, IP addresses, DNS, and proxy settings.
-## Plugin: network_config | Actions: adapters, ip_addresses, dns_servers, proxy, dns_cache
+## Plugin: network_config | Actions: adapters, ip_addresses, dns_servers, proxy, dns_cache, arp, routes
 ##
 ## Sources by platform:
 ##   Windows: IP Helper API (GetAdaptersAddresses), WinHTTP proxy API, dnsapi.dll
@@ -452,6 +452,122 @@ spec:
         - count
 
   readablePayload: "Get ARP / neighbour table"
+
+  gather:
+    ttlSeconds: 120
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 1.0.0
+    requiredPlugins: [network_config]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: device.network_config.routes
+  displayName: Routing Table
+  version: 1.0.0
+  description: >
+    Returns the host routing table, IPv4 and IPv6 together: destination
+    prefix, gateway, interface, metric, table, type and origin, capped at
+    20000 rows. On Linux reads one rtnetlink RTM_GETROUTE dump covering the
+    main table and any custom table (VPN and policy routing live there),
+    including blackhole, unreachable, prohibit and throw routes; the local
+    table, cloned entries and host-local route types are not reported, a
+    multipath route reports its first nexthop only and an "ip nexthop"
+    object route carries no resolved gateway (both flagged in the result
+    status). On macOS reads the PF_ROUTE NET_RT_DUMP sysctl for every address
+    family; macOS has no route metric or table id, so those are "-", and the
+    origin is only the static bit (which also covers connected-interface
+    routes), else the dynamic or redirect-modified bit; entries flagged as
+    neighbour, cloned, multicast, broadcast or own-address are not reported
+    (the limited-broadcast 255.255.255.255/32 route carries none of those
+    flags and is), and interface-scoped routes (one default per VPN tunnel,
+    say) are listed like any other. On Windows reads
+    GetIpForwardTable2; the metric is the route metric alone, without the
+    interface metric Windows adds when ranking routes, and the host's own
+    and broadcast addresses and the multicast prefixes are not reported. A
+    route table that cannot be read at all is reported as unavailable, never
+    as an empty table.
+  tags: [network, inventory, routing]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: network_config
+    action: routes
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    columns:
+      - name: family
+        type: string
+        description: "Address family of the route. Values: ipv4, ipv6."
+        example: "ipv4"
+        platforms: [windows, linux, darwin]
+      - name: destination
+        type: string
+        description: "Destination network address; the default route is 0.0.0.0 or ::. Values: IPv4 or IPv6 literal."
+        example: "192.0.2.0"
+        platforms: [windows, linux, darwin]
+      - name: prefix_len
+        type: int32
+        description: "Destination prefix length in bits; 0 is the default route, 32 or 128 a host route. Values: 0-32 (ipv4), 0-128 (ipv6)."
+        example: "24"
+        platforms: [windows, linux, darwin]
+      - name: gateway
+        type: string
+        description: "Next-hop address; '-' when the route is on-link (directly attached). Linux reports 'nhid:<n>' for a route that references an `ip nexthop` object whose gateway is not resolved, and the first nexthop's gateway for a multipath route. Values: IPv4 or IPv6 literal, 'nhid:<n>' (Linux only), or '-'."
+        example: "192.0.2.1"
+        platforms: [windows, linux, darwin]
+      - name: interface
+        type: string
+        description: "Outgoing interface name; '-' when the interface index no longer resolves on Linux and macOS (or, for a Linux blackhole/unreachable/prohibit/throw route or an `ip nexthop` object route, when the route carries none); Windows renders `if<index>` when the alias lookup fails. Values: interface name, `if<index>` (Windows), or '-'."
+        example: "eth0"
+        platforms: [windows, linux, darwin]
+      - name: metric
+        type: string
+        description: "Route metric (the Linux priority; the Windows route metric, without the interface metric); '-' on macOS, which has no route metric. Values: decimal integer, or '-' (macOS, always)."
+        example: "100"
+        platforms: [windows, linux, darwin]
+      - name: table
+        type: string
+        description: "Linux routing table; '-' on Windows and macOS, which have a single table. Values: main, default, or a decimal table id (Linux); '-' (Windows, macOS)."
+        example: "main"
+        platforms: [windows, linux, darwin]
+      - name: route_type
+        type: string
+        description: "Kind of route. Values: unicast, blackhole, unreachable, prohibit, throw, nat, xresolve, or type<N> for an unknown Linux rtm_type (Linux); unicast, blackhole, reject (macOS); unicast (Windows, always)."
+        example: "unicast"
+        platforms: [windows, linux, darwin]
+      - name: origin
+        type: string
+        description: "Who installed the route. Linux: the rtm_protocol name (kernel, boot, static, dhcp, ra, bgp, ospf, ...) or proto<N>. Windows: the NL_ROUTE_PROTOCOL name (local, netmgmt, dhcp, ...) or proto<N>. macOS: static when the kernel set RTF_STATIC (the kernel sets it on connected-interface routes too, which Linux calls kernel and Windows calls local), dynamic for RTF_DYNAMIC or RTF_MODIFIED, else other (the routing socket carries no protocol field). Values: protocol name, or proto<N>."
+        example: "kernel"
+        platforms: [windows, linux, darwin]
+    aggregation:
+      groupBy:
+        - family
+      operations:
+        - count
+
+  readablePayload: "Get routing table"
 
   gather:
     ttlSeconds: 120

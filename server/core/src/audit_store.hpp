@@ -44,6 +44,11 @@
 
 #include <yuzu/audit_retention_rules.hpp>
 
+// PGconn (`log_in_txn`'s caller-held connection): included directly rather
+// than forward-declaring libpq's private `pg_conn` tag — api_token_store.hpp's
+// rationale (#5342).
+#include <libpq-fe.h>
+
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -275,6 +280,28 @@ public:
     /// (store not open, pool-acquire timeout, or query error) `emit_failed_`
     /// increments and the row is lost. `[[nodiscard]]` makes any discard visible.
     [[nodiscard]] bool log(const AuditEvent& event);
+
+    /// The ADR-0012 §3 query-owner seam for this store (#5342): the SAME
+    /// sanitize + INSERT as `log()`, issued on a connection the CALLER already
+    /// holds inside ITS OWN open transaction (`pool.with_txn_for`'s `PGconn*`),
+    /// so an audit row commits or aborts together with the mutation it records.
+    /// `log()` is exactly "lease + `log_in_txn` + `count_committed`".
+    ///
+    /// Returns true iff the INSERT succeeded (the row is written but NOT yet
+    /// committed — the caller's COMMIT decides). On failure `emit_failed_`
+    /// increments (same accounting as `log()`) and the caller's transaction is
+    /// in the aborted state: it MUST roll back (return false from its
+    /// `with_txn_for` callback) — never "proceed without the row". Does NOT
+    /// touch the success buckets (`events_written`): the caller calls
+    /// `count_committed(result)` once per row AFTER its own commit is confirmed,
+    /// so a rolled-back row is never counted as written. Takes no lease and
+    /// never re-enters the pool (no nested acquire).
+    [[nodiscard]] bool log_in_txn(PGconn* conn, const AuditEvent& event);
+
+    /// Bump the `events_written(result)` bucket for ONE row whose transaction
+    /// has COMMITTED. Called by `log()` itself and by a `log_in_txn` caller
+    /// after its commit. Lock-free.
+    void count_committed(std::string_view result) noexcept;
 
     /// Degrade-distinguishable read: `std::nullopt` on a store/pool/query failure
     /// (evidence integrity — a blip must not read as "no audit activity"); an

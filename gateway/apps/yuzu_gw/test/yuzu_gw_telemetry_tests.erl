@@ -100,6 +100,25 @@ metrics_scrape_renders_test_() ->
            NonAscii = [L || L <- Help, lists:any(fun(B) -> B > 127 end,
                                                  binary_to_list(L))],
            ?assertEqual([], NonAscii)
+       end},
+      %% #1197: a family that is declared but missing from the scrape, or
+      %% missing its help text, would be invisible to every operator.
+      {"the three heartbeat-verdict families render with their HELP lines",
+       fun() ->
+           Out = prometheus_text_format:format(),
+           [?assertNotEqual(nomatch, binary:match(Out, Help))
+            || Help <- [<<"# HELP yuzu_gw_registration_replay_triggered_total ">>,
+                        <<"# HELP yuzu_gw_heartbeat_unknown_truncated_total ">>,
+                        <<"# HELP yuzu_gw_heartbeat_verdict_dropped_total ">>]]
+       end},
+      %% queue_full has two causes; the HELP must name both, or an operator
+      %% reading a rising series looks only at the replay queue.
+      {"verdict_dropped HELP names both causes of queue_full",
+       fun() ->
+           Out = prometheus_text_format:format(),
+           [?assertNotEqual(nomatch, binary:match(Out, Part))
+            || Part <- [<<"queue_full = the replay queue is at its cap, or the upstream ">>,
+                        <<"process already holds more than 100 unhandled messages">>]]
        end}
      ]}.
 
@@ -150,3 +169,219 @@ reject_atoms(Term) when is_tuple(Term) ->
 reject_atoms(Term) when is_list(Term) ->
     lists:append([reject_atoms(E) || E <- Term]);
 reject_atoms(_) -> [].
+
+%% Heartbeat admission counters. Both families must exist at 0 after setup()
+%% (a series that first appears already at 1 is invisible to increase()), the
+%% reason list must match the reject reasons yuzu_gw_heartbeat_admission can
+%% return, and the mismatch family carries event="security" so it routes to
+%% the SIEM like the server's own session-binding counters.
+heartbeat_admission_series_test_() ->
+    {setup,
+     fun() ->
+        {ok, S1} = application:ensure_all_started(prometheus),
+        {ok, S2} = application:ensure_all_started(telemetry),
+        catch telemetry:detach(yuzu_gw_prometheus),
+        ok = yuzu_gw_telemetry:setup(),
+        S1 ++ S2
+     end,
+     fun(_) -> catch telemetry:detach(yuzu_gw_prometheus) end,
+     [
+      {"every rejection reason has a series from startup",
+       fun() ->
+           Out = prometheus_text_format:format(),
+           [?assertNotEqual(nomatch,
+                            binary:match(Out, iolist_to_binary(
+                              ["yuzu_gw_heartbeat_rejected_total{reason=\"",
+                               atom_to_binary(R, utf8), "\"} 0"])))
+            || R <- yuzu_gw_telemetry:heartbeat_reject_reasons()]
+       end},
+      {"the mismatch family exists at 0 and carries event=\"security\"",
+       fun() ->
+           Out = prometheus_text_format:format(),
+           ?assertNotEqual(nomatch,
+                           binary:match(Out,
+                             <<"yuzu_gw_heartbeat_session_mismatch_total{event=\"security\"} 0">>))
+       end},
+      {"events increment the matching series",
+       fun() ->
+           Read = fun(Name, Labels) ->
+               prometheus_counter:value(Name, Labels)
+           end,
+           B1 = Read(yuzu_gw_heartbeat_rejected_total, [<<"unknown_session">>]),
+           B2 = Read(yuzu_gw_heartbeat_session_mismatch_total, [<<"security">>]),
+           telemetry:execute([yuzu, gw, heartbeat, rejected], #{count => 1},
+                             #{reason => unknown_session}),
+           telemetry:execute([yuzu, gw, heartbeat, session_mismatch], #{count => 1}, #{}),
+           ?assertEqual(B1 + 1,
+                        Read(yuzu_gw_heartbeat_rejected_total, [<<"unknown_session">>])),
+           ?assertEqual(B2 + 1,
+                        Read(yuzu_gw_heartbeat_session_mismatch_total, [<<"security">>]))
+       end},
+      {"the reason list matches every reject reason in yuzu_gw_heartbeat_admission",
+       fun() ->
+           Src = filename:join([code:lib_dir(yuzu_gw), "src",
+                                "yuzu_gw_heartbeat_admission.erl"]),
+           {ok, Forms} = epp:parse_file(Src, []),
+           Returned = lists:usort(admission_reject_atoms(Forms)),
+           ?assertNotEqual([], Returned),
+           %% connection_mismatch is its own family, so it is not a `reason'.
+           ?assertEqual(lists:usort([connection_mismatch |
+                                     yuzu_gw_telemetry:heartbeat_reject_reasons()]),
+                        Returned)
+       end}
+     ]}.
+
+%% Every literal atom A in a `{reject, A}' tuple expression in the parsed source.
+admission_reject_atoms(Term) when is_tuple(Term) ->
+    case Term of
+        {tuple, _, [{atom, _, reject}, {atom, _, A}]} -> [A];
+        _ -> admission_reject_atoms(tuple_to_list(Term))
+    end;
+admission_reject_atoms(Term) when is_list(Term) ->
+    lists:append([admission_reject_atoms(E) || E <- Term]);
+admission_reject_atoms(_) -> [].
+
+%% #1197: the heartbeat-verdict families. Real telemetry:execute through
+%% the real handler (the producers' own tests mock telemetry entirely, which
+%% cannot see a missing handler clause or a missing ?EVENTS entry, see the
+%% notify_dropped precedent at the top of this file). The labelled series must
+%% exist at 0 straight after setup(), or the first increment is invisible to
+%% increase(). The labels in the events are atoms, like the heartbeat
+%% admission events above.
+verdict_families_test_() ->
+    {setup,
+     fun() ->
+        {ok, S1} = application:ensure_all_started(prometheus),
+        {ok, S2} = application:ensure_all_started(telemetry),
+        catch telemetry:detach(yuzu_gw_prometheus),
+        ok = yuzu_gw_telemetry:setup(),
+        S1 ++ S2
+     end,
+     fun(_) -> catch telemetry:detach(yuzu_gw_prometheus) end,
+     [
+      {"every verdict series exists from startup",
+       fun() ->
+           Out = prometheus_text_format:format(),
+           [?assertNotEqual(nomatch, binary:match(Out, Line))
+            || Line <- [<<"yuzu_gw_registration_replay_triggered_total{trigger=\"breaker\"} ">>,
+                        <<"yuzu_gw_registration_replay_triggered_total{trigger=\"heartbeat\"} ">>,
+                        <<"yuzu_gw_heartbeat_unknown_truncated_total ">>,
+                        <<"yuzu_gw_heartbeat_verdict_dropped_total{reason=\"malformed\"} ">>,
+                        <<"yuzu_gw_heartbeat_verdict_dropped_total{reason=\"not_local\"} ">>,
+                        <<"yuzu_gw_heartbeat_verdict_dropped_total{reason=\"circuit_open\"} ">>,
+                        <<"yuzu_gw_heartbeat_verdict_dropped_total{reason=\"queue_full\"} ">>]]
+       end},
+      {"registration_replay_triggered moves the series of its trigger only",
+       fun() ->
+           Read = fun(T) -> prometheus_counter:value(yuzu_gw_registration_replay_triggered_total, [T]) end,
+           H0 = Read(<<"heartbeat">>), B0 = Read(<<"breaker">>),
+           telemetry:execute([yuzu, gw, upstream, registration_replay_triggered],
+                             #{count => 1}, #{trigger => heartbeat}),
+           ?assertEqual({H0 + 1, B0}, {Read(<<"heartbeat">>), Read(<<"breaker">>)}),
+           telemetry:execute([yuzu, gw, upstream, registration_replay_triggered],
+                             #{count => 1}, #{trigger => breaker}),
+           ?assertEqual({H0 + 1, B0 + 1}, {Read(<<"heartbeat">>), Read(<<"breaker">>)})
+       end},
+      {"a trigger or reason outside the closed set goes to unknown and the handler stays attached",
+       fun() ->
+           Read = fun(Name, L) ->
+               case prometheus_counter:value(Name, [L]) of
+                   undefined -> 0;
+                   V         -> V
+               end
+           end,
+           Replay = yuzu_gw_registration_replay_triggered_total,
+           Dropped = yuzu_gw_heartbeat_verdict_dropped_total,
+           R0 = Read(Replay, <<"unknown">>), D0 = Read(Dropped, <<"unknown">>),
+           Bad = [<<"binary">>, "string", 42, {tuple}, [list], not_in_the_set],
+           [begin
+                telemetry:execute([yuzu, gw, upstream, registration_replay_triggered],
+                                  #{count => 1}, #{trigger => B}),
+                telemetry:execute([yuzu, gw, heartbeat, verdict_dropped],
+                                  #{count => 2}, #{reason => B})
+            end || B <- Bad],
+           %% A missing label falls to unknown too.
+           telemetry:execute([yuzu, gw, upstream, registration_replay_triggered],
+                             #{count => 1}, #{}),
+           telemetry:execute([yuzu, gw, heartbeat, verdict_dropped], #{count => 2}, #{}),
+           N = length(Bad),
+           ?assertEqual({R0 + N + 1, D0 + 2 * (N + 1)},
+                        {Read(Replay, <<"unknown">>), Read(Dropped, <<"unknown">>)}),
+           %% The handler was not detached by any of them: the closed series still move.
+           H0 = Read(Replay, <<"heartbeat">>),
+           telemetry:execute([yuzu, gw, upstream, registration_replay_triggered],
+                             #{count => 1}, #{trigger => heartbeat}),
+           ?assertEqual(H0 + 1, Read(Replay, <<"heartbeat">>)),
+           ?assert(lists:any(fun(#{id := Id}) -> Id =:= yuzu_gw_prometheus;
+                                (_) -> false end,
+                             telemetry:list_handlers([yuzu, gw, upstream,
+                                                      registration_replay_triggered])))
+       end},
+      {"unknown_truncated moves the unlabelled counter",
+       fun() ->
+           V0 = prometheus_counter:value(yuzu_gw_heartbeat_unknown_truncated_total),
+           telemetry:execute([yuzu, gw, heartbeat, unknown_truncated], #{count => 1}, #{}),
+           ?assertEqual(V0 + 1, prometheus_counter:value(yuzu_gw_heartbeat_unknown_truncated_total))
+       end},
+      {"verdict_dropped adds its count to the series of its reason only",
+       fun() ->
+           Reasons = [malformed, not_local, circuit_open, queue_full],
+           Read = fun(R) ->
+               prometheus_counter:value(yuzu_gw_heartbeat_verdict_dropped_total,
+                                        [atom_to_binary(R, utf8)])
+           end,
+           Before = [Read(R) || R <- Reasons],
+           [telemetry:execute([yuzu, gw, heartbeat, verdict_dropped],
+                              #{count => N}, #{reason => R})
+            || {R, N} <- lists:zip(Reasons, [3, 4096, 2, 1])],
+           ?assertEqual([B + N || {B, N} <- lists:zip(Before, [3, 4096, 2, 1])],
+                        [Read(R) || R <- Reasons])
+       end},
+      {"every buffer_dropped reason exists at 0 from startup",
+       fun() ->
+           Out = prometheus_text_format:format(),
+           [?assertNotEqual(nomatch,
+                            binary:match(Out, iolist_to_binary(
+                                ["yuzu_gw_heartbeat_buffer_dropped_total{reason=\"",
+                                 R, "\"} "])))
+            || R <- ["buffer_full", "snapshot_oversize", "snapshot_evicted",
+                     "heartbeat_oversize", "heartbeat_invalid", "chunk_rejected"]]
+       end},
+      {"buffer_dropped adds to the series of its reason only, an unknown reason "
+       "goes to unknown",
+       fun() ->
+           Reasons = [buffer_full, snapshot_oversize, snapshot_evicted,
+                      heartbeat_oversize, heartbeat_invalid, chunk_rejected,
+                      unknown],
+           %% The unknown series is not pre-seeded: absent reads as 0.
+           Read = fun(R) ->
+               case prometheus_counter:value(yuzu_gw_heartbeat_buffer_dropped_total,
+                                             [atom_to_binary(R, utf8)]) of
+                   undefined -> 0;
+                   V         -> V
+               end
+           end,
+           Counts = [1, 2, 3, 4, 5, 6, 7],
+           Before = [Read(R) || R <- Reasons],
+           [telemetry:execute([yuzu, gw, heartbeat, buffer_dropped],
+                              #{count => N}, #{reason => R})
+            || {R, N} <- lists:zip(lists:droplast(Reasons), lists:droplast(Counts))],
+           %% A reason outside the closed set is folded into unknown.
+           telemetry:execute([yuzu, gw, heartbeat, buffer_dropped],
+                             #{count => 7}, #{reason => not_a_reason}),
+           ?assertEqual([B + N || {B, N} <- lists:zip(Before, Counts)],
+                        [Read(R) || R <- Reasons])
+       end},
+      %% Characterisation, not new behaviour: it passes without the verdict
+      %% replay and pins what it relies on, that the depth reports it adds
+      %% with replayed=0 (on append, skip and abort) move the gauge and leave
+      %% the replay counter.
+      {"a registration_replay event with replayed=0 sets the depth and adds no replay",
+       fun() ->
+           C0 = prometheus_counter:value(yuzu_gw_registration_replay_total, []),
+           telemetry:execute([yuzu, gw, upstream, registration_replay],
+                             #{replayed => 0, queue_depth => 7}, #{}),
+           ?assertEqual(C0, prometheus_counter:value(yuzu_gw_registration_replay_total, [])),
+           ?assertEqual(7, prometheus_gauge:value(yuzu_gw_registration_replay_queue_depth, [node()]))
+       end}
+     ]}.

@@ -51,6 +51,11 @@
 # against the inherited number. The fix it proves is still enormous (18.0s -> 8.5s), and the bound
 # still discriminates: 15s sits well below the 18.0s regression and well above the 9s healthy case.
 #
+# NOTE (2026-10-04): removing the asset_tags check thread's up-to-5s shutdown join (#5239) lowers
+# every figure above. Measured on macOS by the governance run, small n: single SIGTERM 5.0s -> 2.0s,
+# black-hole Register 3.7-8.7s -> 0.7s, second-signal escalation unchanged. The Linux figures above
+# predate the change and have NOT been re-measured; the bounds are upper limits and still hold.
+#
 # HANG_TIMEOUT is 30s -- above every one of those. It is a HANG DETECTOR, not a latency assertion.
 # The per-case latency bounds below ARE latency assertions and are set individually.
 #

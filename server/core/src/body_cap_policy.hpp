@@ -513,6 +513,23 @@ inline constexpr BodyCapEntry kBodyCapTable[] = {
     // the 4 MiB catch-all, which a toggle this small does not need.
     {kBodyCapAnyMethod, "/api/v1/rbac/enforcement", 1u * 1024, false, "rbac_enforcement"},
 
+    // /api/v1/users — the local-account user-management REST v1 subtree
+    // (#5342): POST /api/v1/users/me/password {current_password,
+    // new_password}, POST /api/v1/users/{name}/password {new_password}
+    // (rest_api_v1.cpp register_password_routes), plus the pre-existing
+    // POST /api/v1/users/{name}/unlock (bodyless) and
+    // POST /api/v1/users[/{name}]/elevation-eligibility ({"eligible": bool},
+    // auth_routes.cpp). The largest legitimate body is two passwords at
+    // password_policy.hpp's kMaxPasswordBytes (1024) each — worst-case JSON
+    // escaping (6 bytes per control byte as \u00XX) puts that near 12.3 KiB,
+    // so 16 KiB admits every policy-conformant request with framing headroom
+    // while keeping an unauthenticated flood against this subtree (whose
+    // gates all run in the handler, after httplib buffers the body) 256x
+    // under the 4 MiB catch-all it previously fell to. ANY method: the
+    // bodyless siblings share the prefix (rule 4 in the routed-concern row).
+    // requires_measurable stays OFF per the file-header default.
+    {kBodyCapAnyMethod, "/api/v1/users", 16u * 1024, false, "users"},
+
     // The catch-all default. ANY method, empty prefix — always matches, and
     // always loses a longest-match comparison against every entry above.
     // Ordinary JSON/form traffic (most REST mutation routes) lands here.

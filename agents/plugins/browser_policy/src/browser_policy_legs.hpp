@@ -3,17 +3,17 @@
  * and its three per-OS leg TUs (peripherals_legs.hpp / disk_actions_legs.hpp
  * are the sibling shape).
  *
- * Each `run_<os>` is a READ and returns 0 unconditionally: a degraded read
- * is not a failed command, and the degradation is reported through the CC-07
- * typed status (`mark_result_read`) AND as one in-band `status` row (the
- * response queries do not return the typed status today). Only the Linux leg
- * reads today; the Windows and macOS legs are PLANNED placeholders that report
- * `mark_result_planned` (UNAVAILABLE, one `status` row) so a host they cannot
- * yet inspect never reads as "no policy configured". Declared unconditionally so
- * the plugin TU and every leg TU see one signature on every OS; only the
- * DEFINITION is self-gated (each leg .cpp wraps its body in
- * `#if defined(_WIN32|__linux__|__APPLE__)`), and the plugin TU calls only
- * the host leg — a single-OS build never links the other two.
+ * Each `run_<os>` is a READ and returns 0 unconditionally: a degraded read is
+ * not a failed command, and the degradation is reported through the CC-07 typed
+ * status (`mark_result_read`) AND as in-band `status` rows (a summary row, then
+ * one per failing path; the response queries do not return the typed status
+ * today). Only the Linux leg reads today; the Windows and macOS legs are
+ * PLANNED placeholders that report `mark_result_planned` (UNAVAILABLE, one
+ * `status` row) so a host they cannot yet inspect never reads as "no policy
+ * configured". Declared unconditionally so the plugin TU and every leg TU see
+ * one signature on every OS; only the DEFINITION is self-gated (each leg .cpp
+ * wraps its body in `#if defined(_WIN32|__linux__|__APPLE__)`), and the plugin
+ * TU calls only the host leg — a single-OS build never links the other two.
  *
  * WHEN A LEG LANDS (Windows registry, macOS plist): replace its `mark_result_planned`
  * body with a real read that reports through `mark_result_read` BEFORE writing rows, then
@@ -25,7 +25,9 @@
  * status, Sensitivity, Sample, Caveats 3), the planned blocks in
  * test_browser_policy_local_dispatcher.cpp, docs/agent-privilege-model.md's row, the
  * capability matrix row and counts, the capability-map cell, the catalogue header comment,
- * the agent_registry description, and the changelog fragment. The grep is the actual
+ * the agent_registry description, and the changelog fragment. Also the hard-coded `linux:` in
+ * mark_result_read's status_rows_capped token (below) and the `"/etc"` root-failure path in
+ * browser_policy_linux_parsers.hpp -- both are Linux-only today. The grep is the actual
  * completeness check; this list is a starting point, not a closed set.
  */
 #pragma once
@@ -34,6 +36,9 @@
 
 #include <yuzu/plugin.hpp>
 
+#include <exception_category.hpp> // yuzu::shared::exception_category
+
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -44,8 +49,8 @@ int run_windows(yuzu::CommandContext& ctx);
 int run_linux(yuzu::CommandContext& ctx);
 int run_macos(yuzu::CommandContext& ctx);
 
-/// Reason literal for an exception that escaped a leg (never crosses the
-/// plugin ABI: run_guarded, below, catches it and reports it through this token).
+/// Reason PREFIX for an exception that escaped a leg (never crosses the plugin ABI:
+/// run_guarded, below, catches it and reports `<prefix>:<bad_alloc|std_exception|unknown>`).
 #if defined(_WIN32)
 inline constexpr std::string_view kExceptionToken = "windows:leg:exception";
 #elif defined(__APPLE__)
@@ -69,6 +74,16 @@ template <typename Leg>
     try {
         return leg(ctx);
     } catch (...) {
+        // exception_category() is noexcept, but the string build can throw on allocation
+        // failure: a failed build keeps the non-allocating bare-prefix view.
+        std::string owned;
+        std::string_view token = kExceptionToken;
+        try {
+            owned.reserve(kExceptionToken.size() + 14);
+            owned.append(kExceptionToken).append(1, ':').append(yuzu::shared::exception_category());
+            token = owned;
+        } catch (...) {
+        }
         // Each report is its own guard: building or writing the row, and the typed status
         // itself (the SDK copies the provenance into a std::string), can each throw on an
         // allocation failure, and none may let a second exception cross the plugin ABI. If the
@@ -77,12 +92,12 @@ template <typename Leg>
         // write_output) therefore leaves an `unavailable` row behind its own output: "written
         // first, at most one" holds for every outcome except that one.
         try {
-            ctx.write_output(format_status_row(kStateUnavailable, kExceptionToken));
+            ctx.write_output(format_status_row(kStateUnavailable, token));
         } catch (...) {
         }
         try {
             ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE,
-                                  YUZU_RESULT_COMPLETENESS_PARTIAL, kExceptionToken);
+                                  YUZU_RESULT_COMPLETENESS_PARTIAL, token);
         } catch (...) {
         }
         return 1;
@@ -102,16 +117,28 @@ inline void write_rows(yuzu::CommandContext& ctx, const std::vector<std::string>
 ///                            policy set (browser not installed, nothing
 ///                            managed) — no row of any kind is written for it.
 ///   failure_reason set    -> CONSTRAINED/PARTIAL with the (comma-joined,
-///                            `<os>:<detail>`) reason, AND one in-band
-///                            `status|...|constrained|...|<reason>` row: some
+///                            `<os>:<detail>`) reason, AND an in-band summary
+///                            `status|...|constrained|-|<reason>` row followed by per-path rows (below): some
 ///                            root, directory, file or value could not be read
 ///                            or decoded, so the rows are a lower bound, never
 ///                            proof of absence.
-inline void mark_result_read(yuzu::CommandContext& ctx, std::string_view failure_reason) {
+/// `per_path` names WHICH file/directory each failure token belongs to: after the summary
+/// row, up to kMaxPathFailureRows rows `status|-|-|-|policies|-|constrained|<logical_path>|
+/// <token>` follow. When more were recorded the summary reason gains `linux:status_rows_capped`
+/// (typed status and summary row alike).
+inline void mark_result_read(yuzu::CommandContext& ctx, std::string_view failure_reason,
+                             std::span<const PathFailure> per_path = {}) {
     if (!failure_reason.empty()) {
-        ctx.write_output(format_status_row(kStateConstrained, failure_reason));
+        const bool capped = per_path.size() > kMaxPathFailureRows;
+        std::string reason{failure_reason};
+        if (capped)
+            reason += ",linux:status_rows_capped";
+        ctx.write_output(format_status_row(kStateConstrained, reason));
+        for (std::size_t i = 0; i < per_path.size() && i < kMaxPathFailureRows; ++i)
+            ctx.write_output(format_status_row(kStateConstrained, per_path[i].token,
+                                               per_path[i].logical_path));
         ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
-                              failure_reason);
+                              reason);
         return;
     }
     ctx.set_result_status(YUZU_RESULT_STATUS_OK, YUZU_RESULT_COMPLETENESS_FULL, "");
