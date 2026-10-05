@@ -76,6 +76,18 @@ A small, source-agnostic seam:
   mass-deploy or a site's Monday-morning power-on does not herd); otherwise wait
   for the next phase fire.
 
+> **Update (2026-10-04, #5327):** a source whose collect yields nothing records
+> `skip_streak` / `last_skip` in the same `__sync__` KV. A source that opts in
+> (`skip_backoff`; today installed_software only — device_ci dispatches many
+> actions per attempt and software_licensing's single `license_scan.list` is a
+> full scan of every detection surface, so neither retry is cheap) retries after
+> the earlier of the next phase slot and 1 h · 2^(streak-1) while the streak is
+> at most 5, then once per daily slot; the others keep one full interval. The operator-facing schedule is stated once, in
+> `docs/user-manual/inventory.md`. The skip reason reaches the server only as a
+> heartbeat tag, never a report. KV writes are ordered skip fields first
+> (`save_state`), so an interrupted save never advances `next_fire` with the skip
+> unrecorded.
+
 ### 4. Hash-skip conditional protocol
 - The agent **always** sends a per-source `content_hash`; it **omits the full
   blob when the hash is unchanged** since the last successful sync.

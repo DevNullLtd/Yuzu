@@ -2161,13 +2161,19 @@ with no evidence of ever having been sent.
 ### Plugin load + signing rejections (`yuzu_agent_plugin_rejected_total`)
 
 Counter incremented every time the agent rejects a plugin at scan time
-**before** the plugin's code runs. The `reason` label is bounded to a
+**before** its `init` runs (the allowlist and signature checks run before the
+library is even loaded; the name checks run once the library is mapped and its
+declared name read). The counter is agent-local: the agent has no `/metrics`
+endpoint, so a refusal is visible in that host's agent log, not as a scrapeable
+series. The `reason` label is bounded to a
 fixed set of stable string prefixes — alert rules SHOULD pin against
 the literal label values, not substring matches.
 
 | Reason label | Meaning | Operator action |
 |---|---|---|
 | `reserved_name` | Plugin declared a reserved name (`__guard__`, `__system__`, `__update__`, `__guardian_journal__`, `__guardian__`, `__sync__`). Possible plugin-author error or a malicious shadowing attempt (#453; the `kv_store`-namespace names added in #2303). | Investigate the plugin source / drop. |
+| `invalid_name` | Plugin declared a name that is empty, longer than 64 bytes, or outside `[A-Za-z0-9_]` (#822). The offending name is deliberately not logged: a crafted name can carry control bytes. | Investigate the plugin source / drop; a crafted name is a possible malicious-load attempt. |
+| `duplicate_name` | A second file in the plugin directory declared a name another file in the same scan had already claimed; the first file the directory walk encountered keeps the name, the later file is rejected and immediately unloaded without its plugin init being called. | Remove the duplicate from `--plugin-dir` (two builds of one plugin); which copy wins is filesystem order, so do not rely on it. |
 | `load_failed` | `dlopen` / `LoadLibrary` failed, missing `yuzu_plugin_descriptor` export, or ABI version mismatch. | Check the agent log for the dlopen error and rebuild the plugin against the current SDK ABI. |
 | `signature_missing` | `--plugin-trust-bundle` is set, `--plugin-require-signature` is set, and a plugin has no `<plugin>.so.sig` sibling. | Sign the plugin, deploy the `.sig` alongside, or relax the require flag. |
 | `signature_invalid` | `.sig` file exists but the CMS verification failed at the signature/digest layer (most commonly: the plugin file was modified after signing). | Re-sign the plugin or investigate tampering. |
