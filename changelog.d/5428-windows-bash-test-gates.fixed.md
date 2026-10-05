@@ -1,0 +1,1 @@
+- CI: the agent OTA/ctx-slot, log-handoff and tier-policy source-text gates run as single-process Python (the OTA gate timed out at 90 s on the Windows leg and silently skipped its stale-pattern check for lack of cmp); the two bash-only selftests are registered off Windows (#5428)
