@@ -149,17 +149,40 @@ Prebuilt artifacts are published with every tagged release. If you just want to 
   - `ghcr.io/devnullltd/yuzu-server:<version>`
   - `ghcr.io/devnullltd/yuzu-agent-chisel:<version>`
   - `ghcr.io/devnullltd/yuzu-gateway:<version>`
-- **Docker Compose** quickstart: [`deploy/docker/docker-compose.yml`](deploy/docker/docker-compose.yml) stands up the full server + gateway + agent stack. Reference wiring for UAT is [`deploy/docker/docker-compose.reference.yml`](deploy/docker/docker-compose.reference.yml).
+- **Docker Compose** quickstart: [`deploy/docker/docker-compose.reference.yml`](deploy/docker/docker-compose.reference.yml) pulls the released `yuzu-server` and `yuzu-postgres` images at the tag in `YUZU_VERSION`. On first boot the server generates its own certificate authority and serves the dashboard over HTTPS on port 8443. Server state, the certificate authority and the secrets key (`/etc/yuzu/certs`) are kept in named volumes. You need Docker Compose v2, `curl`, `openssl` and `python3`.
 
 ```bash
-# Pull and run the latest stable release via compose
-curl -fsSL https://raw.githubusercontent.com/DevNullLtd/Yuzu/main/deploy/docker/docker-compose.yml -o docker-compose.yml
-YUZU_VERSION=0.14.0 docker compose up -d
+mkdir yuzu && cd yuzu
+curl -fsSL https://raw.githubusercontent.com/DevNullLtd/Yuzu/main/deploy/docker/docker-compose.reference.yml -o docker-compose.yml
+
+# 1. The release to run, and two different Postgres passwords (superuser and app role).
+touch .env yuzu-server.cfg && chmod 600 .env yuzu-server.cfg
+cat > .env <<EOF
+YUZU_VERSION=0.14.0
+YUZU_POSTGRES_PASSWORD=$(openssl rand -hex 24)
+YUZU_DB_PASSWORD=$(openssl rand -hex 24)
+EOF
+
+# 2. Create the first admin account. The server's first-run setup asks for it on a
+#    terminal, which a detached container does not have, so write the config file it
+#    would write (PBKDF2-HMAC-SHA256, 100,000 iterations). Keep yuzu-server.cfg as
+#    your recovery copy.
+python3 -c 'import getpass, hashlib, os, sys
+p = getpass.getpass("Admin password (at least 12 characters): ")
+if len(p) < 12: sys.exit("password too short")
+s = os.urandom(16)
+print("admin:admin:%s:%s" % (s.hex(), hashlib.pbkdf2_hmac("sha256", p.encode(), s, 100000).hex()))' > yuzu-server.cfg &&
+docker compose run --rm --no-deps -T --entrypoint sh server -c 'umask 077 && cat > /var/lib/yuzu/yuzu-server.cfg' < yuzu-server.cfg
+
+# 3. Start the stack, then check it against the server's own CA certificate.
+docker compose up -d --wait
+docker compose cp server:/etc/yuzu/certs/default-ca.pem .
+curl --cacert default-ca.pem https://localhost:8443/readyz
 ```
 
-This quickstart compose builds the server from source (`build: ../..`) and ignores `YUZU_VERSION`, so it is for evaluating Yuzu from a checkout of this repository, not a download-only install ([#5419](https://github.com/DevNullLtd/Yuzu/issues/5419)).
+Open `https://localhost:8443` and sign in as `admin` with the password you entered. The browser warns about the certificate until you import `default-ca.pem` into your trust store. The stack publishes ports 8443 (dashboard and REST API), 8080 (redirects to HTTPS), 50051 (agent gRPC) and 50052 (management gRPC). If one of them is already in use, change its host side in the `ports:` list of `docker-compose.yml`. Upgrading (`docker compose pull && docker compose up -d` after you change `YUZU_VERSION` in `.env`) and recreating the server keep the certificate authority and the secrets key. `docker compose down -v` deletes them, together with the database. The compose file's header explains backup and restore, and its agent section explains how to install agents natively on each endpoint.
 
-Open `http://localhost:8080` and sign in with the credentials set during first-run provisioning.
+[`deploy/docker/docker-compose.yml`](deploy/docker/docker-compose.yml) is a development stack, not a download-only install. It builds the server and Postgres images from a checkout of this repository (`build: context: ../..`), ignores `YUZU_VERSION`, and publishes port 8080 but not 8443. Run it from `deploy/docker/` in a clone ([#5419](https://github.com/DevNullLtd/Yuzu/issues/5419)).
 
 ## Building
 

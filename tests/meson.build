@@ -2475,6 +2475,17 @@ test('compose certs volume',
   timeout: 30,
 )
 
+# README Docker Compose quickstart (#5419): the compose the README downloads must
+# pull released images at ${YUZU_VERSION}, persist /etc/yuzu/certs, publish 8443,
+# and take the headless admin seed at the image's --config path. Stdlib only;
+# reuses test_compose_certs_volume.py's volume reader.
+test('readme quickstart compose',
+  _python3_test,
+  args: [files('test_readme_quickstart.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
 # ── Repo hygiene tests ─────────────────────────────────────────────────────
 # Changelog promote --append (#5221): folds post-promotion hotfix fragments
 # into an already-promoted release section. Stdlib only.
