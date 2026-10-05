@@ -584,7 +584,7 @@ alert-rule halves** (#4 RE-SCOPED, not closed — see its bullet):**
   (surfaced via `yuzu_server_gateway_route_desync_total{op="renew_leases",outcome="unknown_session"}`,
   new in this slice, rather than silently dropped) and stays that way until the #4246 #3 durable
   cross-replica session lookup lands under WS-5. Reached after a server-only restart (observed on one
-  rig; see the known limitation under Server-Side Setup in `docs/user-manual/gateway.md`).
+  rig; superseded, see the 2026-10-04 update in this section and "What happens when the server restarts" in `docs/user-manual/gateway.md`).
 - **Ship the write-failure fail-closed posture + alert rule** (#4246 #1 — **CLOSED, 4.2b**). The flip
   landed as a **per-site contract, not a uniform flip**: `record_route_store_failure`'s six call sites
   keep DIFFERENT postures by design — `register_fresh` (ProxyRegister's fresh-registration branch), the
@@ -1302,6 +1302,263 @@ previous gateway (the only new state is the in-memory index; derived from the ch
   one node for the life of a session; a failover that re-registers on a new channel mints a new session and
   is compatible. A future heartbeat-forwarding slice cannot reuse the connection pid as its key, because a pid
   is meaningful only on the node that owns the connection.
+
+**Update (2026-10-04, #1197 - the gateway now consumes the unknown-session verdict).** The
+gateway reads `unknown_session_ids` and `unknown_session_ids_truncated` from every successful
+`BatchHeartbeatResponse` and replays exactly the sessions it still holds through the existing
+registration-replay drip. The 2026-10-01 update above describes the state before this change (the
+consumer was pending) and is left as written; the wire is unchanged and no server code changes. The
+"known limitation under Server-Side Setup" cited in the #10 correlation bullet earlier in this section is
+likewise superseded: that gateway manual note is replaced by "What happens when the server restarts", and on
+one core replica a server-only restart now recovers through the replay described here.
+- **Mechanism.** `yuzu_gw_heartbeat_buffer` validates the listed ids (non-empty binaries of at most 64
+  bytes, de-duplicated, at most 4096), counts what it drops as malformed, and casts the rest to
+  `yuzu_gw_upstream:replay_sessions/1`. A flush never feeds the circuit breaker; the only coupling is that
+  one cast. The upstream client resolves the ids against this node's registry and queues one pending
+  entry per agent, subject to a per-session guard window (`registration_replay_session_guard_ms`, default
+  10000, valid 0..3600000) and a queue cap (`registration_replay_queue_max`, default 10000, valid
+  1..1000000); both are application-env keys read at start, an invalid value warns and falls back to the
+  default, and so does an invalid `registration_replay_spacing_ms` (default 20, valid 0..60000) or
+  `heartbeat_batch_interval_ms` (default 1000, valid 100..60000). The buffer also skips the cast while the
+  upstream client's mailbox holds more than 100 messages, and counts those ids as `queue_full` (so that
+  reason means a full replay queue or an upstream message backlog); the sessions are listed again by later
+  heartbeats (INFERRED). The truncated-verdict WARN is logged at most once per 60 s per heartbeat buffer process (the limit
+  resets when that process restarts), with a `suppressed N` count; the counter still counts every occurrence. The queue cap bounds only verdict appends: the snapshot a breaker recovery seeds is not
+  capped (bounded by the local agent count, as before), and while a snapshot of 10000 or more agents
+  drains, every verdict id for an agent not already queued counts as `queue_full`. A verdict that
+  arrives while the breaker is `open` is dropped and counted; one that arrives `half_open` is queued and
+  its first replay RPC is the probe. A replay the server answers with `accepted=false` (for example an
+  admin-denied or not yet approved enrollment; reached only when the agent is not already approved in the
+  enrollment store) makes the gateway disconnect that agent process, with no re-announce, so the agent
+  registers again by itself through the gateway and follows its own outcome. That disconnect has the shape
+  tracked in #4629 (no session-match guard). The `accepted=false` disconnect is a new branch of this change.
+  On `dev` the replay's `{ok, Response}` arm in `yuzu_gw_upstream.erl` has no `accepted` check (the only
+  disconnect there is the superseded `FAILED_PRECONDITION` arm), so an `accepted=false` answer took the adopt
+  arm, re-announced, and the server then refused the announcement as an unknown session (INFERRED from the
+  code, not run): the agent stayed stranded without a signal. The disconnect makes the strand visible and
+  lets the agent follow its own registration path. Released agents that wedge after any disconnect still
+  need the agent service restarted until a release containing #5183 ships.
+- **Replay failures feed the shared breaker (INFERRED from `yuzu_gw_upstream.erl`).** A flush never feeds
+  the circuit breaker, but a failed replay `ProxyRegister` does, like any other `ProxyRegister` (a server
+  answer of superseded or `accepted=false` counts as a success). The breaker policy is unchanged; verdict
+  replays are a new source of failures that count. With the default threshold of 5 and 20 ms spacing, a
+  failing server can open the breaker within about 100 ms plus the RPC time of five calls. An open breaker
+  gates `ProxyRegister` and `ProxyInventory`, drops stream-status notifications and makes the whole
+  `/readyz` answer 503 (its `circuit_breaker` check is false), which can take the node out of rotation for a
+  load balancer that probes `/readyz` (INFERRED from `yuzu_gw_health.erl`).
+- **Replaying a session the server already knows is not free (INFERRED from the code).** The server's
+  ADOPT calls `register_agent` for every replayed session, so a session it already holds is re-installed as
+  a fresh `AgentSession`: the agent loses its dispatch placement until its re-sent CONNECTED lands (the
+  `BatchHeartbeatResponse` comment in `gateway.proto` says the same), and the agent's device tokens are
+  revoked when a prior session exists and a device-token store is wired. No device-token store is wired in
+  the production server today (`set_device_token_store` has no production caller), so that revoke is
+  dormant until one is. Two cases replay a known session: (i) a verdict computed before a replay landed
+  arrives after it (the guard stamp is taken when the replay is sent, and a stale verdict can arrive up to the 5 s flush
+  deadline, the vendored grpcbox client default, plus the replay RPC time later, so do not set
+  `registration_replay_session_guard_ms` below 5000 plus the expected replay RPC time; the default 10000 is
+  safe, INFERRED); (ii) a double replay: a
+  verdict replay runs first (no prior session, nothing revoked) and a later full breaker-recovery replay
+  re-proxies the same sessions (a prior session now exists; the breaker-seeded snapshot is not filtered by
+  the guard). Neither was observed on the rig. An idempotent ADOPT is tracked in #5244.
+- **Two keys, two decisions.** The verdict is enqueued by SESSION: the server names sessions, and
+  `yuzu_gw_registry:entries_for_sessions/1` resolves each id through the node-local session index from
+  the 2026-10-02 update, then reads the agent row once and requires it to agree with the index (same
+  pid, same session). The drip pops by AGENT: `lookup_local_session/1` re-checks liveness immediately
+  before each send, so an agent that left or re-registered under another session while queued is
+  skipped. The replay path never writes the session index (`yuzu_gw_sessions` is a protected table written only by
+  the registry process: an entry is inserted by a registration through `register_agent/7` (the shorter
+  forms delegate to it), and removed by the cleanup of a superseded registration of the same agent, by
+  `deregister_agent/1`, by the fenced `deregister_agent/3` and when the monitored agent process goes down);
+  `entries_for_sessions/1` is read-only.
+- **Multi-replica statement (read from the code; no multi-replica run exists, so this is inferred).**
+  The verdict/replay reconcile is correct and bounded on one core replica. On several replicas it
+  converges in one round only if a gateway's `BatchHeartbeat`, replay `ProxyRegister` and reannounce
+  `NotifyStreamStatus` reach the SAME replica during the reconcile. The shipped gateway does this per
+  connection (one grpcbox channel, one endpoint, one HTTP/2 connection) through an L4 VIP. A
+  multi-endpoint node list (grpcbox round-robins per RPC) or an L7 per-RPC balancer breaks it: the
+  lacking replica keeps listing the session, an arbitrary replica receives each replay, a replica that
+  already holds the session re-installs it (placement wiped until its own reannounce lands on it), and
+  the lacking replica learns the session only when a replay happens to land there. Convergence is then
+  probabilistic, not bounded; the per-session guard limits how often a verdict can queue the same session
+  again (not within the guard window, 10 s by default, after its last replay was sent; INFERRED from
+  `enqueue_sessions`) and the drip paces the sends (20 ms spacing by default), but neither bounds the number
+  of rounds, and the guard does not filter the breaker-seeded snapshot. Signature:
+  `yuzu_server_gateway_route_desync_total{op="renew_leases",outcome="unknown_session"}` not decaying on
+  some replica after both sides are upgraded, with
+  `yuzu_gw_registration_replay_triggered_total{trigger="heartbeat"}` rising (it counts verdicts that queued
+  at least one agent, so at most once per flush; INFERRED). The
+  durable cross-replica session lookup (WS-5, `#4246` #3) is the fix; until it lands the safe-to-scale
+  gate forbids a second replica.
+- **Observed on a local rig, not reproducible from the repository (one real agent, one core replica,
+  debug builds).** After a server-only restart the replay came on the first agent heartbeat after the
+  server was healthy again (17.5 s in the 10 s outage runs, with the same session id and no agent
+  reconnect), and again 17.1 s after restart on a rig with gateway-to-server mutual TLS and
+  agent-to-gateway one-way TLS (web UI over plain HTTP; HTTPS on the web UI was not tested). After a 300 s
+  outage that had opened the gateway circuit breaker, recovery took 58 s: the first two verdicts were
+  dropped as `circuit_open`, and the replay ran once the breaker went half open (T0 + 54 s on the rig; INFERRED from the code:
+  the same transition recovered the gateway before this change, so a breaker-opening outage is bounded by
+  the breaker's remaining backoff, capped at 300 s, plus a heartbeat interval and a flush). With the breaker
+  never opened, the replay came 4.2 s after the server was healthy. A later rig run with 10 and 30 agents
+  behind one gateway saw the breaker open 72 s and 40 s into a 302 s and a 152 s outage, every verdict dropped
+  as `circuit_open` until the probe, and recovery through the breaker's own replay (`trigger="breaker"`) after
+  the probe at T0 + 84.5 s and T0 + 49.1 s (all agents online at T0 + 85.2 s and T0 + 50.4 s; backoff steps up
+  to 160 s observed, the 300 s cap not). Not tested: 100 or more
+  agents, scale, HA or several replicas, notify pressure, agents started with `--no-auto-update`, the `queue_full` and
+  `malformed` verdict reasons from a real server (injected verdicts only), a double replay, a verdict that arrives after a replay it predates, the
+  registry-unavailable abort, an `accepted=false` answer and a failing server feeding the breaker during a
+  drip (the same list as "Observed on a rig" in the gateway manual).
+- **Observed: a stuck heartbeat batch, and the buffer change that closes it (post-change rig run
+  observed).** OBSERVED on a rig with an agent that had the TAR plugin, before this change: such an
+  agent's heartbeat can carry a `fleet_snapshot_json` of 200 to 800 KB (a busy rig host), and the gateway
+  heartbeat buffer retained heartbeats on a failed flush capped by count only (10000). In an unplanned
+  15.6 minute server outage and in a 300 s outage (run E2a) the retained batch exceeded the server's gRPC
+  receive limit of 4194304 bytes (24805137 bytes in the first), every `BatchHeartbeat` failed with
+  `Received message larger than max` and none ever drained, so there was no verdict and no replay until the
+  gateway was restarted (in E2a `agents.online` stayed 0 for the whole observation and the route row was
+  tombstoned). This is existing buffer behaviour, not introduced by the replay, and it disabled the recovery
+  this section describes; the earlier rig runs used an agent without the TAR plugin and did not meet it.
+  The change: the buffer keeps one entry per session (a newer heartbeat replaces the fields of the older
+  one, except that the newest non-empty `fleet_snapshot_json` is kept, because the agent sends a snapshot
+  only when it has a new one); a flush is split into chunks of at most about 3 MiB (estimated), oldest
+  first, the verdict of each successful chunk is consumed, and a failed chunk and the unsent ones stay
+  buffered; the retained buffer has a byte cap (`max_heartbeat_buffer_bytes`, default 64 MiB, valid
+  1048576..1073741824, otherwise the default with a WARN naming the key), over which snapshots are dropped
+  oldest first and then whole sessions oldest first; a single heartbeat over 3 MiB is sent without its
+  snapshot; and `max_heartbeat_buffer` now counts sessions, dropping a heartbeat of a new session when full.
+  New counters: `yuzu_gw_heartbeat_buffer_dropped_total{reason}` (`buffer_full`, `snapshot_oversize`,
+  `snapshot_evicted`, and the later `heartbeat_oversize`, `heartbeat_invalid`, `chunk_rejected`) and
+  `yuzu_gw_heartbeat_coalesced_total`. A later review round added bounded handling for a heartbeat that cannot be
+  sent as it is: one still over the chunk limit without its snapshot (or with more than 512 status tags, or with
+  one tag key or value over about 64 KiB or more than about 256 KiB of tag bytes in total, a size
+  check made before any UTF-8 repair so the repair cost stays bounded) is
+  kept without its status tags, one with invalid UTF-8 in a status tag is kept with the bytes replaced, and
+  one rejected by the server with a non-transient status is dropped, so that none of them blocks newer
+  heartbeats or stops a session's lease renewal; the same round added a flush of at most 8 chunks per
+  cycle; transient failures still keep heartbeats buffered (probed against a fake server, not rig-run).
+  A per-connection cap on agent sessions (`max_sessions_per_connection`, default 8, valid 1 to 1000, read
+  once when the registry starts; a refused `Register` is answered `UNAVAILABLE` (14), a refused `Subscribe`
+  ends the stream (status 2 today, see the gateway manual's Known limits), and both are counted
+  in `yuzu_gw_session_limit_rejected_total`) keeps one connection from pushing other agents' snapshots out
+  of a full buffer (probed against a fake upstream, not rig-run). It counts session rows, pending plus
+  live: each unexpired reservation row is one slot, including the registering agent's own in-flight
+  reservations; another agent's live row counts one, and another agent's committed pending row counts one
+  only if that agent has no reservation in flight; the registering agent's own live row and committed
+  pending row never count (a commit supersedes them), and the `Subscribe` path leaves out all of the
+  agent's own rows. A connection therefore holds at most the cap of counted slots plus the registering
+  agent's own live row and committed pending row (stored rows can briefly exceed that by the committed
+  pending row of an agent with a retry in flight, which its commit removes). A repeated `Register` of the same
+  agent id on the same connection supersedes that agent's older committed pending rows; and the slot is reserved
+  atomically when a `Register` is admitted, before it is proxied to the server, so concurrent Registers on
+  one connection, with one agent id or several, admit at most the cap and nothing beyond it is proxied (the
+  reservation is released if the proxied `Register` fails or is not accepted, and by the pending time to live
+  otherwise). An adversarial review by two external models found that an earlier form of the count left out
+  the registering agent's own reservations, so concurrent Registers carrying one id were all proxied; both
+  reproduced it with probes (20 of 20 and 300 of 300 at cap 8, not rig runs), and it is fixed. The rows of a
+  connection that closed stay takeable for a grace (`dead_connection_grace_ms`, default 15000, valid 0 to
+  120000, read once when the registry starts) so that a `Subscribe` on a reconnected channel can still take a
+  pending session, and the rows its per-connection index names are deleted after it, by key and not by a table scan; a row stored and not yet committed is in no index and stays until its own commit or the pending time to live sweep removes it. A `Register` that a newer `Register` of the same agent id on the connection supersedes is answered `UNAVAILABLE` (it used to be `INTERNAL`, `registry_unavailable`, which stays for a registry that cannot be reached) (checked by eunit, dialyzer and scratch probes, not rig-run). Two review
+  probes against the real application and a fake upstream (not rig runs) found that an earlier form let the
+  same agent id store unlimited pending sessions and let a concurrent burst pass the pre-check and be
+  proxied upstream; both are fixed. Consequences: the server's
+  `yuzu_heartbeats_received_total{via="gateway"}` under-counts while a backlog is coalesced, and an agent's
+  topology snapshot can be one agent snapshot cycle older after an eviction. The server's 4 MiB receive
+  limit is unchanged and not raised. The post-change rig run (`990e57e48`, 1 to 30 agents, plaintext, debug builds) recovered where the old gateway did not; see the evidence record. A third rig pass (G1 to G5, build `f3e9d52a4`) recovered the same way; the heartbeat screening that keeps a session's lease renewing, the router timeout clamp and the session cap are not in that build, rig passes 4 (`ab01f4f2f`) and 5 (`e3cf6b38a`) ran later builds, and rig pass 6 (`c518edd93`) ran the nodelay change and server restarts at 1000 and 2000 simulated agents (the four review fix commits after it are in no rig build). Not tested and known limits: 100 or more real agents and a backlog that reaches the default byte cap; the
+  agent's snapshot size is not bounded here (the agent proto comment says 5 to 20 KB, 200 to 800 KB was
+  observed, the server accepts up to 2 MiB) and is a follow-up for the agent side; the server does not
+  configure its maximum receive size explicitly, so the chunk size relies on the library default (INFERRED
+  from the code, not run); `flush_sync`'s 5 s shutdown wait may be exceeded by a multi-chunk shutdown flush
+  (INFERRED from the code, not run). Evidence record: `docs/security-reviews/gateway-heartbeat-verdict-replay-2026-10-04.md`.
+- **Known limit (observed, not fixed here).** A route row the server's lease reaper tombstones while the
+  server stays up (observed after a 6.9 minute gateway-to-server partition) is not repaired: the verdict
+  is computed from the server's in-memory session map, which still holds the session (INFERRED from
+  `gateway_service_impl.cpp`), so no verdict and no replay follow. Commands kept working in the observed
+  run, and with one replica dispatch uses the in-memory map (INFERRED), so this is a gap for HA and
+  multi-replica routing, not for one replica. This is not fixed here. The observed run had no breaker transition and no replay, so an earlier
+  breaker-recovery full replay could not have repaired it, and the row is not caused by this change; the
+  next entry narrows an incidental repair path that exists only when a breaker transition happens to
+  coincide with a tombstoned row. It is related to #4627. Signal: a repeating `renew_leases` shortfall
+  warning on the server with no `Registration replay` line on the gateway after the partition heals. The
+  recovery action for that row is NOT tested (restarting the gateway or the agent was not tried).
+- **Known limit (INFERRED from the code, not observed).** While a verdict-seeded (targeted) drip is queued, a
+  breaker-recovery full replay trigger is dropped (the existing in-flight rule), and a targeted replay that is
+  the half open probe closes the breaker without seeding a full replay (`record_result_no_replay` discards
+  it; unit test `breaker_replay_during_targeted_drip_is_dropped`). The server lists only sessions missing
+  from its in-memory map, so a session it still knows whose durable route row was tombstoned is not repaired
+  by a verdict. A breaker-recovery full replay was an incidental repair path for such a row, existing only
+  when a breaker transition happens to coincide with a tombstoned row, and this change narrows it; it was
+  not observed to repair the row of the entry above, and that row is not caused by this change. The limit
+  stands: the row waits for the agent's own reconnect. Tracked as a follow-up (no issue yet), together with
+  the entry above.
+- **Planned follow-ups (tracked as follow-ups, no issue numbers yet), in this order.** (i) A bounded pending
+  queue for dropped notifications, a gateway-only change. (ii) A server-side re-arm of a tombstoned route
+  row when a lease renewal comes up short, with a new advisory list that the gateway answers by
+  re-announcing; this needs a protocol change and is planned to land before the safe-to-scale gate.
+  (iii) A session-match guard and a refusal counter for the `accepted=false` disconnect.
+- **Upgrade day.** The server is upgraded first, so the server restart that ships this fix meets the old
+  gateway and agents behind it can read offline (observed on one rig after a SIGKILL restart; a graceful
+  upgrade restart was not tested); restart the gateway after upgrading it. A gateway restart disconnects
+  every agent that node holds, and in a graceful gateway restart test released v0.13.0 and v0.14.0-rc6 agents
+  with default settings stayed wedged and v0.12.0 never re-registered (bug #2182, fixed by #5183, in no
+  release tag yet), while a build with the fix re-registered in 11 to 12 s. Upgrade agents to a build that
+  includes #5183 before the gateway restart where available, or expect to restart the agent service on the
+  released agents behind it. Whether restarting only the gateway recovers agents stranded by an earlier
+  server restart was NOT tested; INFERRED from the code that a reconnecting agent is accepted by the
+  running server, which holds only for an agent build that re-registers by itself.
+- **Known limit (crash report, narrowed not closed).** Three gateway processes hold or are sent a
+  registration request: the upstream client (each queued agent's request, and one in flight), the per-agent
+  process (its own agent's request) and the routing registry (the request in its `register` call, kept in an
+  ETS table). Three layers now cover those three processes. Their `format_status` callbacks redact the
+  stored request (for the upstream client also the queue, the recent-replay stamps, the last message, the
+  reason and the debug log; for the registry the request inside the `register` message). A request no longer
+  leaves through an exit reason: an exception inside the upstream client's own RPC calls is caught and
+  counted as a failed RPC, and the three caller side call sites that carry a request, namely
+  `yuzu_gw_upstream:proxy_register/1`, `proxy_inventory/1` and `yuzu_gw_registry:register_agent/7`, go
+  through one wrapper (`yuzu_gw_safe_call`) that catches an exit of the call (a crash, the call timeout, or
+  the process not running during a restart). The callers get `{error, upstream_unavailable}` or
+  `{error, registry_unavailable}`; the exit reason is never logged or returned, and one warning per second
+  per called process names only the class (`noproc`, `timeout` or `other`). The Register handler answers
+  `INTERNAL` for any `{error, _}` of the upstream call (as it does for `circuit_open`; a registration
+  refused by the per-connection session cap is `UNAVAILABLE`; a refused `Subscribe` ends its stream) and the agent retries on any non-OK status
+  (read in `yuzu_gw_agent_service.erl` and `agents/core/src/agent.cpp`, not run). A failed registry call in
+  the per-agent process's init used to exit with a reason that embedded the request, which the Subscribe
+  handler logged (INFERRED from the code, not run); that init now stops with the fixed reason
+  `registry_unavailable`. The application env key `upstream_call_timeout_ms` (default 30000) sets the call
+  timeout of the first two sites. A logger primary filter, `yuzu_gw_crash_redact`, installed when the
+  application starts, covers the processes `yuzu_gw_upstream`, `yuzu_gw_agent`, `yuzu_gw_registry`,
+  `yuzu_gw_router` and `yuzu_gw_heartbeat_buffer` (the last two hold command parameters and fleet status
+  tags, not registration requests), each matched by its registered name or by having been started by that
+  module's `init/1`: it rewrites the
+  `proc_lib` crash report (the mailbox and the process dictionary become counts, the exception keeps no
+  argument lists), the `gen_server` terminate report (upstream client and registry), the `gen_statem`
+  terminate report (per-agent process) and the supervisor reports that carry a reason. The filter and the
+  `format_status` callbacks are verified by unit tests on the real processes, not on a rig; the exit-reason
+  leak and the per-agent crash report were OBSERVED by a security reviewer running the real application
+  before this layer existed. The residual is: use of the modules outside the application (no filter is
+  installed there); a report shape the filter does not recognise; hot-loading the code into a running node
+  (hot code upgrade is not a supported gateway deployment path: the appup in the repository is an old
+  skeleton, no relup is built, and the runbook says to restart; INFERRED from a search of the repository);
+  and any other process that holds a registration request, since only the three processes that hold one
+  were checked and others (the gRPC handler processes) have not been audited.
+  In those cases a crash report can still print the token, certificate or CSR of a request. Operator
+  guidance (treat crash reports as sensitive; the `chars_limit` and `depth` logger options remain as defence
+  in depth) and the shipped logger settings are in `docs/user-manual/gateway.md`, Known limits.
+- **What it does not promise.** Fleet completion inside a route lease (the drip period is the
+  ProxyRegister RPC time plus the spacing, so the time to drain scales with the number of agents), and
+  dispatch reachability after the session is adopted (placement converges when the agent's re-sent
+  CONNECTED is delivered; a rise in `yuzu_gw_upstream_notify_dropped_total` marks agents that stay
+  acknowledged but unreachable until their next reconnect; the series has no agent label, and the in-flight
+  notification limit behind it is tracked in #4632). The operator runbook and the load table are in
+  `docs/user-manual/gateway.md`, "What happens when the server restarts". The evidence record (run table,
+  test results, mutation summary, ledger obligations and their status, not-tested list) is
+  `docs/security-reviews/gateway-heartbeat-verdict-replay-2026-10-04.md`.
+- **Registration rate per gateway (observed on a rig, commit `71ee2b02f`).** Every `ProxyRegister` runs one at a
+  time inside the single `yuzu_gw_upstream` process, and without `TCP_NODELAY` on the gateway-to-server socket each
+  call took about 41 to 43 ms, so one stock gateway registered about 24 agents per second and a burst of more than
+  about 700 agents could not finish inside the agents' 30 s `Register` deadline (1000 agents: 703 registered). The
+  gateway now sets `TCP_NODELAY` on that one upstream channel by default (`upstream_tcp_nodelay`, `sys.config` only);
+  running the proxy RPC outside the process, shedding requests whose caller is gone and a shorter upstream deadline
+  are planned follow-ups with no issue numbers yet. Rig pass 6 (`c518edd93`, simulated agents, loopback) registered 1000, 2000 and 5000 agents in 1.89 s, 4.16 s and 12.08 s with the shipped setting. Detail:
+  `docs/user-manual/gateway.md`, "Registration rate per gateway".
 
 ### 7d. Cross-cluster gateway fan-out — "rest of 4.3" (WS-4, 2026-09-21)
 

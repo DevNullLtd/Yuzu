@@ -161,6 +161,7 @@ heartbeat_batching_verification(_Config) ->
         AgentId = iolist_to_binary(io_lib:format("hb-agent-~4..0B", [I])),
         lists:foreach(fun(_) ->
             yuzu_gw_heartbeat_buffer:queue_heartbeat(#{
+                session_id => AgentId,
                 agent_id  => AgentId,
                 timestamp => #{seconds => erlang:system_time(second)}
             })
