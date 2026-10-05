@@ -179,9 +179,15 @@ Recommended order for a fresh install:
 > duplicate); REST `GET /api/v1/execution-statistics/agents` (tracked #3526). The
 > workflow executions LIST fragment `/fragments/executions` and MCP
 > `summarize_working_set` `kind=execution` were on this list and are now on
-> `require_fleet_read` too (a group-scoped-only operator gets a confined view
-> where it previously got `403`); neither was a reachable leak before, because the
-> flat gate only ever admitted global-grant callers, who are unfiltered anyway.
+> `require_fleet_read` too: on the dashboard fragment a group-scoped-only
+> operator gets a confined view where it previously got `403`, while
+> `summarize_working_set` keeps its plain `Infrastructure:Read` first gate (a
+> group-scoped-only operator still gets `403` there; only a caller with a global
+> `Infrastructure:Read` plus a group-scoped `Execution:Read` is newly admitted).
+> Neither was a reachable leak before, because the flat gate only ever admitted
+> global-grant callers, who are unfiltered anyway. The fragment's own failure
+> notes (a `data-degraded` note on the Executions panel) render at HTTP `200`
+> because the dashboard drops `4xx`/`5xx` bodies; see `upgrading.md`.
 > `summarize_working_set` `kind=fleet`/`result_set` still return an unscoped
 > whole-registry agent count. So
 > a degraded store looks like "no agents in scope" / "no responses" / `503`

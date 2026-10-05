@@ -132,9 +132,15 @@ This inventory covers gate-less routes, and `GET /fragments/executions` was not 
 `require_permission` caller. It has since moved onto `fleet_read_fn` (`require_fleet_read`) as its
 sole gate, the same shape as `/fragments/executions/{id}/detail`, so a service-scoped token is now
 ADMITTED and served the confined view (owner-or-visible rows, counters and `last_error_detail`
-projected to the in-scope agents, scope pushed into SQL before the 50-row limit). That is a
-deliberate admission change with a real mechanism behind it, not a widening of
-`kServiceScopeGlobalSafe`. It is also not a leak fix: before the change the route disclosed nothing
+projected to the in-scope agents, scope pushed into SQL before the 50-row limit). That holds only
+with RBAC enforcement ON (`authz_gates.cpp` still answers 403 with enforcement off) and a
+reachable `TagStore` (missing or degraded is 503, `retry_after_ms` 5000). It is a deliberate
+admission change with a real mechanism behind it, not a widening of `kServiceScopeGlobalSafe`.
+The owner disjunct also shows the token minter's own executions even outside the service scope
+(parity with `GET /api/v1/executions` and `/detail`). Separately, `require_fleet_read` applies the `ITServiceOwner` ceiling on its service axis (added by the
+preceding #3526 ceiling change, not by this one; see `docs/auth-architecture.md`, "`require_fleet_read`
+now applies the `ITServiceOwner` authority ceiling"), so the fragment inherits it; `kServiceScopeGlobalSafe`
+is still not applied or widened there. It is also not a leak fix: before the change the route disclosed nothing
 out of scope to any principal it admitted (global-grant callers are unfiltered by design). Tests:
 `test_workflow_executions_list_authz.cpp` (real `require_fleet_read`, exact served-id sets).
 
