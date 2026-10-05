@@ -110,7 +110,7 @@ struct FloorFixture {
     /// is keyed by username).
     httplib::Request session_request(const std::string& username, auth::Role role) {
         REQUIRE(auth_mgr.upsert_user(username, "password1234", role));
-        auto token = auth_mgr.create_local_session(username, role, /*mfa_verified=*/true);
+        auto token = auth_mgr.create_local_session_for_test(username, role, /*mfa_verified=*/true);
         httplib::Request req;
         req.headers.emplace("Cookie", "yuzu_session=" + token);
         return req;
@@ -122,7 +122,7 @@ struct FloorFixture {
     /// `elevate_session`'s own contract puts eligibility on the caller).
     httplib::Request elevated_session_request(const std::string& username) {
         REQUIRE(auth_mgr.upsert_user(username, "password1234", auth::Role::user));
-        auto token = auth_mgr.create_local_session(username, auth::Role::user, /*mfa_verified=*/true);
+        auto token = auth_mgr.create_local_session_for_test(username, auth::Role::user, /*mfa_verified=*/true);
         REQUIRE(auth_mgr.elevate_session(token, std::chrono::seconds(300)).has_value());
         httplib::Request req;
         req.headers.emplace("Cookie", "yuzu_session=" + token);

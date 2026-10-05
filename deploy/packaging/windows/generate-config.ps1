@@ -28,6 +28,11 @@
 # script rules for an install run by an administrator rather than SYSTEM). The
 # installer checks the language mode BEFORE loading this script and stops with
 # its own message; a credential-less upgrade never runs this script at all.
+#
+# FRESH INSTALLS ONLY, in effect: the file it writes only SEEDS the first
+# administrator into an empty auth database (#5274), so the installer refuses
+# a password on an upgrade (exit code 11) and never runs this script then. The
+# operator entry is not provisioned on a PostgreSQL auth store today (#5343).
 
 param(
     [Parameter(Mandatory=$true)][string]$ConfigPath,
@@ -57,6 +62,16 @@ function Test-Username([string]$Name, [string]$What) {
     if ($Name -match '[:\x00-\x1f\x7f]') { Fail "$What username may not contain ':' or control characters" }
 }
 
+# The server's password policy (server/core/src/password_policy.hpp) caps a
+# password at 1024 BYTES of UTF-8 -- what PBKDF2 hashes, and what
+# Rfc2898DeriveBytes(string, ...) encodes the string as. .Length counts UTF-16
+# code units, so the maximum is measured on the encoded bytes. The minimum stays
+# 12 characters (never fewer than 12 bytes, so never below the server's minimum).
+function Test-Password([string]$Password, [string]$What) {
+    if ([string]::IsNullOrEmpty($Password) -or $Password.Length -lt 12) { Fail "$What password must be at least 12 characters" }
+    if ([System.Text.Encoding]::UTF8.GetByteCount($Password) -gt 1024) { Fail "$What password must be at most 1024 bytes as UTF-8" }
+}
+
 function New-PBKDF2Entry([string]$Username, [string]$Password, [string]$Role) {
     $salt = [byte[]]::new(16)
     $rng = New-Object System.Security.Cryptography.RNGCryptoServiceProvider
@@ -82,7 +97,7 @@ try {
     $opPass = $env:YUZU_SETUP_OPERATOR_PASS
 
     Test-Username $adminUser 'admin'
-    if ([string]::IsNullOrEmpty($adminPass) -or $adminPass.Length -lt 12) { Fail 'admin password must be at least 12 characters' }
+    Test-Password $adminPass 'admin'
 
     $lines = @(
         '# Yuzu Server Configuration',
@@ -96,7 +111,7 @@ try {
     if (-not [string]::IsNullOrEmpty($opUser)) {
         Test-Username $opUser 'operator'
         if ($opUser -eq $adminUser) { Fail 'operator username must differ from the admin username' }
-        if ([string]::IsNullOrEmpty($opPass) -or $opPass.Length -lt 12) { Fail 'operator password must be at least 12 characters' }
+        Test-Password $opPass 'operator'
         $lines += New-PBKDF2Entry $opUser $opPass 'user'
     }
 

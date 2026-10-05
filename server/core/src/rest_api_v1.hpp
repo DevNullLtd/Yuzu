@@ -700,9 +700,79 @@ public:
     /// `device_ids` is unaffected either way.
     void set_all_agent_ids_fn(AllAgentIdsFn fn) { all_agent_ids_fn_ = std::move(fn); }
 
+    /// #5342 Gate 7 (C5) — an audit writer that stamps the principal
+    /// EXPLICITLY instead of re-resolving it from the request's session.
+    /// Wired from `AuthRoutes::audit_log_for_principal`. The password routes
+    /// capture the principal once, up front, and pass it to every REFUSAL row
+    /// they write (the success rows are written inside the credential-change
+    /// transaction from `AuditEventFn`'s event). Returns true iff the row
+    /// persisted (true in audit-off mode).
+    using AuditPrincipalFn = std::function<bool(
+        const httplib::Request& req, const std::string& action, const std::string& result,
+        const std::string& principal, const std::string& principal_role,
+        const std::string& target_type, const std::string& target_id, const std::string& detail)>;
+
+    /// #5342 Gate 8 — builds (does NOT write) the identity/request half of an
+    /// audit row for an explicit principal: `AuthRoutes::
+    /// make_audit_event_for_principal`. The password routes hand it to
+    /// `CredentialChangeOwner` as the template of the success row(s), which are
+    /// persisted INSIDE the credential-change transaction (`AuditStore::
+    /// log_in_txn`) so the change and its evidence commit or abort together.
+    using AuditEventFn = std::function<AuditEvent(
+        const httplib::Request& req, const std::string& principal,
+        const std::string& principal_role, const std::string& target_type,
+        const std::string& target_id)>;
+
+    /// #5342 — the local-account password routes' dependencies:
+    /// `POST /api/v1/users/me/password` (self-service, proves the current
+    /// password) and `POST /api/v1/users/{name}/password` (admin reset).
+    ///   * `auth_mgr` — `commit_password_change`, the ONE credential write
+    ///     (it delegates to `CredentialChangeOwner`: credential + sessions +
+    ///     provisional MFA + lockout + audit in one transaction).
+    ///   * `verify_current_fn` — `AuthRoutes::password_change_verify_fn()`: the
+    ///     ONE lockout-accounted password check `/login` also uses (incl. the
+    ///     sso-only gate), so this file never carries a second copy of the
+    ///     striped-lock section.
+    ///   * `audit_principal_fn` — `AuthRoutes::audit_log_for_principal` (see
+    ///     `AuditPrincipalFn`): every REFUSAL row these routes write goes
+    ///     through it.
+    ///   * `audit_event_fn` — `AuthRoutes::make_audit_event_for_principal` (see
+    ///     `AuditEventFn`): the template of the in-transaction success row(s).
+    ///   * `break_glass_user` — `Config::break_glass_user`; the admin reset
+    ///     refuses it as a target (403 `break_glass_target`) — the sealed
+    ///     escape hatch is re-keyed only out of band, never by a session an
+    ///     IdP compromise could have produced.
+    /// The admin route additionally uses `register_routes`' own `rbac_store`
+    /// and `auth_db` (the `is_rbac_administrator` gate); the lockout clear is
+    /// part of the credential-change transaction itself (not
+    /// `lockout_clear_fn`). Any required member unset ⇒ the route answers 503
+    /// (misconfiguration), never a partial write. MUST be called BEFORE
+    /// `register_routes()`, same timing contract as
+    /// `set_engine_principal_store`.
+    struct PasswordChangeDeps {
+        auth::AuthManager* auth_mgr{nullptr};
+        PasswordVerifyFn verify_current_fn;
+        AuditPrincipalFn audit_principal_fn;
+        std::string break_glass_user;
+        AuditEventFn audit_event_fn;
+    };
+    void set_password_change_deps(PasswordChangeDeps deps) { password_deps_ = std::move(deps); }
+
+    /// #5342 — the operator-declared trusted-origin allowlist (#2537,
+    /// `Config::csrf_trusted_origins`, normalised at boot) for the CSRF
+    /// same-site gate the password routes apply to their cookie sessions —
+    /// the same setter idiom as `CaRoutes`/`DashboardRoutes`. Unset = same-host
+    /// only (fail-closed behind a Host-rewriting proxy, never open). MUST be
+    /// called BEFORE `register_routes()` (captured by value).
+    void set_csrf_trusted_origins(std::vector<std::string> origins) {
+        csrf_trusted_origins_ = std::move(origins);
+    }
+
 private:
     EnginePrincipalStore* engine_principal_store_{nullptr};
     UserExistsFn user_exists_fn_;
+    PasswordChangeDeps password_deps_;
+    std::vector<std::string> csrf_trusted_origins_;
     ScopeEvaluateFn scope_evaluate_fn_;
     AllAgentIdsFn all_agent_ids_fn_;
 };

@@ -1453,7 +1453,7 @@ TEST_CASE("revoke_deprovision_credentials: revokes tokens and sessions for EVERY
     auto oidc_token = f.token_store->create_token("t2", oidc_principal);
     REQUIRE(oidc_token.has_value());
 
-    auto slug_session = f.auth_mgr.create_local_session("yolanda", auth::Role::user, true);
+    auto slug_session = f.auth_mgr.create_local_session_for_test("yolanda", auth::Role::user, true);
     auto oidc_session = f.auth_mgr.create_oidc_session("Yolanda", "y@example.com", "sub-yolanda",
                                                         "https://idp.example.com/");
     REQUIRE_FALSE(slug_session.empty());
@@ -1490,7 +1490,7 @@ TEST_CASE("ScimRoutes: PATCH active=false revokes API tokens AND sessions for BO
     auto oidc_token = f.token_store->create_token("oidc-token", oidc_principal);
     REQUIRE(oidc_token.has_value());
 
-    auto slug_session = f.auth_mgr.create_local_session("trent", auth::Role::user, true);
+    auto slug_session = f.auth_mgr.create_local_session_for_test("trent", auth::Role::user, true);
     auto oidc_session =
         f.auth_mgr.create_oidc_session("Trent", "trent@example.com", sub, iss);
     REQUIRE(f.auth_mgr.validate_session(slug_session).has_value());
@@ -3615,7 +3615,7 @@ TEST_CASE("Groups integration: PATCH rename OFF the admin group demotes every cu
     // effect (AuthManager::update_role) is directly checkable, not just
     // inferred from the role/audit outcome.
     auto session_token =
-        ts.auth_mgr.create_local_session("mia", auth::Role::admin, /*mfa_verified=*/true);
+        ts.auth_mgr.create_local_session_for_test("mia", auth::Role::admin, /*mfa_verified=*/true);
     REQUIRE_FALSE(session_token.empty());
     REQUIRE(ts.auth_mgr.validate_session(session_token).has_value());
 
@@ -3898,7 +3898,7 @@ TEST_CASE("Groups integration: PATCH rejected by the member cap must not commit 
     auto group_id = json::parse(group_post->body)["id"].get<std::string>();
     REQUIRE(ts.auth_mgr.get_user_role("admin_member").value() == auth::Role::admin);
 
-    auto session_token = ts.auth_mgr.create_local_session("admin_member", auth::Role::admin,
+    auto session_token = ts.auth_mgr.create_local_session_for_test("admin_member", auth::Role::admin,
                                                           /*mfa_verified=*/true);
     REQUIRE_FALSE(session_token.empty());
 
@@ -4210,7 +4210,7 @@ TEST_CASE("Groups integration: PATCH persist failure leaves displayName, members
     auto group_id = json::parse(group_post->body)["id"].get<std::string>();
     REQUIRE(ts.auth_mgr.get_user_role("faultowen").value() == auth::Role::admin);
 
-    auto session_token = ts.auth_mgr.create_local_session("faultowen", auth::Role::admin,
+    auto session_token = ts.auth_mgr.create_local_session_for_test("faultowen", auth::Role::admin,
                                                            /*mfa_verified=*/true);
     REQUIRE_FALSE(session_token.empty());
 
@@ -4289,7 +4289,7 @@ TEST_CASE("Groups integration: PUT persist failure leaves displayName, membershi
     auto group_id = json::parse(group_post->body)["id"].get<std::string>();
     REQUIRE(ts.auth_mgr.get_user_role("faultpia").value() == auth::Role::admin);
 
-    auto session_token = ts.auth_mgr.create_local_session("faultpia", auth::Role::admin,
+    auto session_token = ts.auth_mgr.create_local_session_for_test("faultpia", auth::Role::admin,
                                                            /*mfa_verified=*/true);
     REQUIRE_FALSE(session_token.empty());
 
