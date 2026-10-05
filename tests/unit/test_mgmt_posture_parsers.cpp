@@ -133,12 +133,46 @@ TEST_CASE("mgmt_posture: conf.d snippet last-wins override", "[mgmt_posture]") {
     CHECK(plane_of(merged.c_str()) == Plane::ad);
 }
 
-TEST_CASE("mgmt_posture: no domains key falls back to file order", "[mgmt_posture]") {
+// sssd.conf(5): a domain whose `enabled` is unset is enabled only if it is listed in `domains`,
+// so with no `domains` key nothing but an explicit `enabled = true` is active.
+TEST_CASE("mgmt_posture: no domains key activates only enabled = true domains", "[mgmt_posture]") {
     const auto f = facts("[sssd]\nservices = nss\n[domain/x]\nid_provider=ldap\n"
                          "[domain/y]\nid_provider=ipa\n[domain/z]\nid_provider=ad\nenabled=false\n");
     CHECK_FALSE(f.domains_key_present);
-    CHECK(f.active_domains == std::vector<std::string>{"x", "y"});
-    CHECK(classify_linux(f, false) == Plane::ipa);
+    CHECK(f.active_domains.empty());
+    CHECK(classify_linux(f, false) == Plane::none);
+
+    // An AD domain that is declared but neither listed nor enabled is not active.
+    CHECK(plane_of("[sssd]\n[domain/corp]\nid_provider=ad\n") == Plane::none);
+
+    // An explicit enabled = true still activates, in file order, and enabled = false still wins.
+    const auto e = facts("[sssd]\n[domain/a]\nid_provider=ldap\nenabled = true\n"
+                         "[domain/b]\nid_provider=ad\nenabled = true\n"
+                         "[domain/c]\nid_provider=ipa\nenabled = false\n");
+    CHECK(e.active_domains == std::vector<std::string>{"a", "b"});
+    CHECK(classify_linux(e, false) == Plane::ad);
+
+    // Control: the key present but the domain unlisted was already none.
+    CHECK(plane_of("[sssd]\ndomains = other\n[domain/corp]\nid_provider=ad\n") == Plane::none);
+}
+
+// `/` is forbidden in a domain name (sssd.conf(5)); [domain/forest/sub] is the trusted-subdomain
+// section shape, never a top-level domain SSSD starts.
+TEST_CASE("mgmt_posture: trusted-subdomain sections are not top-level domains", "[mgmt_posture]") {
+    const auto nokey = facts("[sssd]\n[domain/forest/sub]\nid_provider=ad\nenabled = true\n");
+    CHECK(nokey.active_domains.empty());
+    CHECK(nokey.id_provider_by_domain.empty());
+    CHECK(classify_linux(nokey, false) == Plane::none);
+
+    // Listing the full path does not make it one.
+    CHECK(plane_of("[sssd]\ndomains = forest/sub\n[domain/forest/sub]\nid_provider=ad\n") ==
+          Plane::none);
+
+    // A real domain beside one is unaffected.
+    const auto mixed = facts("[sssd]\ndomains = corp\n[domain/corp]\nid_provider=ipa\n"
+                             "[domain/corp/child]\nid_provider=ad\nenabled = true\n");
+    CHECK(mixed.active_domains == std::vector<std::string>{"corp"});
+    CHECK(classify_linux(mixed, false) == Plane::ipa);
 }
 
 TEST_CASE("mgmt_posture: mixed ad+ipa follows query order", "[mgmt_posture]") {

@@ -141,11 +141,14 @@ inline const std::string* find_key(const IniDoc& doc, const std::string& section
 
 } // namespace detail
 
-/// Declared domains are the `[domain/<name>]` sections. ACTIVE domains, in order: the
-/// names in `[sssd] domains = a, b` that have a declared section and are not
-/// `enabled = false`, then any declared domain with `enabled = true` not already
-/// listed. With no `domains` key every declared domain not `enabled = false` is
-/// active in file order. `id_provider` under `[sssd]` is meaningless and ignored.
+/// Declared domains are the `[domain/<name>]` sections whose name has no `/`: sssd.conf(5)
+/// forbids `/` in a domain name, so `[domain/parent/child]` (the trusted-subdomain section
+/// shape) is not a top-level domain. ACTIVE domains, in order: the names in
+/// `[sssd] domains = a, b` that have a declared section and are not `enabled = false`, then
+/// any declared domain with `enabled = true` not already listed. With no `domains` key only
+/// the `enabled = true` domains are active, in file order: sssd.conf(5) enables a domain
+/// whose `enabled` is unset only if it is listed in `domains`. `id_provider` under `[sssd]`
+/// is meaningless and ignored.
 inline SssdFacts sssd_facts(const IniDoc& doc) {
     constexpr std::string_view prefix = "domain/";
     SssdFacts f;
@@ -155,6 +158,8 @@ inline SssdFacts sssd_facts(const IniDoc& doc) {
         if (sec.size() <= prefix.size() || sec.compare(0, prefix.size(), prefix) != 0)
             continue;
         const std::string name = sec.substr(prefix.size());
+        if (name.find('/') != std::string::npos)
+            continue;
         declared.push_back(name);
         if (const auto* p = detail::find_key(doc, sec, "id_provider"))
             f.id_provider_by_domain[name] = detail::lower(*p);
@@ -184,7 +189,7 @@ inline SssdFacts sssd_facts(const IniDoc& doc) {
     f.domains_key_present = list != nullptr;
     if (!list) {
         for (const auto& n : declared)
-            if (enabled_of(n) != false)
+            if (enabled_of(n) == true)
                 activate(n);
         return f;
     }
