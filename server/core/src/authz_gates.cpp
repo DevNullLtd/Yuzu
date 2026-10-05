@@ -199,11 +199,12 @@ AuthRoutes::require_fleet_read(const httplib::Request& req, httplib::Response& r
     // the tag meet alone, so an operator who revoked the pair from ITServiceOwner (the
     // `revoked_seed_defaults` mechanism) still saw service tokens served on every fleet-read
     // route. The check is `authz::service_ceiling_check`, the ONE shared helper
-    // require_permission / require_scoped_permission also call. DIVERGENCE (user decision
-    // 2026-10-05): a definitive deny (explicit deny row or absent/revoked pair) is a 403
-    // like theirs, but a FAILED ceiling read is a retryable 503 here (bumping
-    // yuzu_server_rbac_read_degrade_total), whereas those two gates keep mapping a failed
-    // read to 403. Still fail CLOSED: never an admit. Deliberately NOT the second half of
+    // require_permission / require_scoped_permission also call. DIVERGENCE: a definitive
+    // deny (explicit deny row or absent/revoked pair) is a 403 like theirs, but a FAILED
+    // ceiling read is a retryable 503 here (bumping yuzu_server_rbac_read_degrade_total),
+    // because an outage is not a missing grant and the caller can retry. Those two gates
+    // keep mapping a failed read to 403, their documented fail-closed contract, and do
+    // not bump that counter for it. Still fail CLOSED: never an admit. Deliberately NOT the second half of
     // require_permission's service branch (`service_scope_admits` / `kServiceScopeGlobalSafe`):
     // that allow-list guards routes that return fleet-wide data UNCONFINED, whereas this
     // gate's service axis below always narrows to the tagged set, so the allow-list is

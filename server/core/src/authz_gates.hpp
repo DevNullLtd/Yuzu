@@ -57,7 +57,7 @@ namespace yuzu::server::authz {
 ///              `revoked_seed_defaults`, so a revoked default is simply absent here).
 ///   Degraded - the checked read itself failed (store closed, pool timeout, query error).
 /// `require_permission` / `require_scoped_permission` map Degraded to the same 403 as
-/// Deny (their documented fail-closed contract, unchanged); `require_fleet_read` maps it
+/// Deny (their documented fail-closed contract); `require_fleet_read` maps it
 /// to a retryable 503 because it is an infrastructure fault, not a definitive deny.
 enum class CeilingVerdict : std::uint8_t { Admit, Deny, Degraded };
 

@@ -760,8 +760,9 @@ bool AuthRoutes::require_permission(const httplib::Request& req, httplib::Respon
             return false;
         }
         // Shared ceiling helper (authz::service_ceiling_check). Degraded (a failed read)
-        // maps to the SAME 403 as Deny here: this gate's documented fail-closed contract is
-        // unchanged (require_fleet_read alone reports Degraded as a retryable 503).
+        // maps to the SAME 403 as Deny here: this gate's documented fail-closed contract holds
+        // (require_fleet_read alone reports Degraded as a retryable 503 and bumps
+        // yuzu_server_rbac_read_degrade_total for it; this gate records neither).
         if (authz::service_ceiling_check(*rbac_store_, securable_type, operation) !=
             authz::CeilingVerdict::Admit) {
             audit_log(req, "auth.permission_required", "denied", "", "",
@@ -1098,8 +1099,9 @@ bool AuthRoutes::require_scoped_permission(const httplib::Request& req, httplib:
         }
         // Check that the ITServiceOwner role grants this permission type
         // Shared ceiling helper (authz::service_ceiling_check). Degraded (a failed read)
-        // maps to the SAME 403 as Deny here: this gate's documented fail-closed contract is
-        // unchanged (require_fleet_read alone reports Degraded as a retryable 503).
+        // maps to the SAME 403 as Deny here: this gate's documented fail-closed contract holds
+        // (require_fleet_read alone reports Degraded as a retryable 503 and bumps
+        // yuzu_server_rbac_read_degrade_total for it; this gate records neither).
         if (authz::service_ceiling_check(*rbac_store_, securable_type, operation) !=
             authz::CeilingVerdict::Admit) {
             audit_log(req, "auth.scoped_permission_required", "denied", "", "",
