@@ -28,6 +28,7 @@
 
 #include "../test_helpers.hpp"
 
+#include <yuzu/metrics.hpp>
 #include <yuzu/server/auth.hpp>
 #include <yuzu/server/server.hpp>
 
@@ -564,6 +565,13 @@ TEST_CASE("require_fleet_read: service token, ITServiceOwner lacks the pair => F
               std::string::npos);
         // Clause 5: a grant to the minter would not admit this caller, so no `.permission`.
         CHECK(res.body.find("\"permission\"") == std::string::npos);
+        auto rows = r.audit_store.query({});
+        REQUIRE(rows.has_value());
+        REQUIRE(rows->size() == 1);
+        CHECK((*rows)[0].action == "auth.fleet_read_required");
+        CHECK((*rows)[0].result == "denied");
+        CHECK((*rows)[0].detail.find("lacks ITServiceOwner permission Response:Read") !=
+              std::string::npos);
     }
     // The same minter's NON-service token is unaffected (the ceiling is service-axis only).
     {
@@ -587,10 +595,13 @@ TEST_CASE("require_fleet_read: service token, ITServiceOwner lacks the pair => F
 }
 
 TEST_CASE("require_fleet_read: service token, degraded ITServiceOwner permission read => "
-          "Forbidden (fail closed, never an admit)",
+          "503 retryable with the degrade metric (fail closed, never an admit), while "
+          "require_permission and require_scoped_permission keep their 403",
           "[pg][auth_routes][authz_gates][service_scope]") {
     YUZU_REQUIRE_PG_DB_TPL(rbac_db_, rbac_gates_tpl);
     GatesRig r{rbac_db_.dsn()};
+    yuzu::MetricsRegistry metrics;
+    r.auth_mgr.set_metrics_registry(&metrics);
     REQUIRE(r.rbac.assign_role({"user", "minter", "RespReader"}).has_value());
     const auto svc = r.mint("printers");
 
@@ -602,6 +613,70 @@ TEST_CASE("require_fleet_read: service token, degraded ITServiceOwner permission
             PQexec(conn.get(), "DROP TABLE rbac_store.role_permissions CASCADE")};
         REQUIRE(d.ok());
     }
+    const auto degrade = [&](const char* reason) {
+        return metrics.counter("yuzu_server_rbac_read_degrade_total", {{"reason", reason}})
+            .value();
+    };
+
+    // Parity pin FIRST (and it must not touch the metric): the siblings still say 403.
+    {
+        auto req = bearer_request(svc);
+        httplib::Response res;
+        CHECK_FALSE(r.ar->require_permission(req, res, "Response", "Read"));
+        CHECK(res.status == 403);
+        CHECK(res.body.find("service-scoped token does not grant Response:Read") !=
+              std::string::npos);
+    }
+    {
+        auto req = bearer_request(svc);
+        httplib::Response res;
+        CHECK_FALSE(r.ar->require_scoped_permission(req, res, "Response", "Read", "a_p"));
+        CHECK(res.status == 403);
+        CHECK(res.body.find("service-scoped token does not grant Response:Read") !=
+              std::string::npos);
+    }
+    CHECK(degrade("query_error") == 0.0);
+    CHECK(degrade("pool_acquire_timeout") == 0.0);
+
+    auto req = bearer_request(svc);
+    httplib::Response res;
+    auto result = r.ar->require_fleet_read(req, res, "Response", "Read");
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error() == authz::GateFailure::Degraded);
+    CHECK(res.status == 503);
+    auto j = nlohmann::json::parse(res.body);
+    CHECK(j["error"]["retry_after_ms"].get<std::int64_t>() == 5000);
+    // An outage is not a missing grant: no `.permission` (clause 5) and no "does not grant".
+    CHECK(res.body.find("\"permission\"") == std::string::npos);
+    CHECK(res.body.find("does not grant") == std::string::npos);
+    CHECK(degrade("query_error") == 1.0);
+
+    // The audit row says the read degraded, never that the role lacks the permission.
+    auto rows = r.audit_store.query({});
+    REQUIRE(rows.has_value());
+    bool found = false;
+    for (const auto& row : *rows) {
+        if (row.action != "auth.fleet_read_required")
+            continue;
+        found = true;
+        CHECK(row.result == "denied");
+        CHECK(row.detail == "fleet read blocked: RBAC read degraded resolving the ITServiceOwner "
+                            "ceiling for Response:Read");
+        CHECK(row.detail.find("lacks ITServiceOwner") == std::string::npos);
+    }
+    CHECK(found);
+}
+
+TEST_CASE("require_fleet_read: explicit DENY row for ITServiceOwner on the pair => 403, not an "
+          "admit and not a degrade",
+          "[pg][auth_routes][authz_gates][service_scope]") {
+    YUZU_REQUIRE_PG_DB_TPL(rbac_db_, rbac_gates_tpl);
+    GatesRig r{rbac_db_.dsn()};
+    yuzu::MetricsRegistry metrics;
+    r.auth_mgr.set_metrics_registry(&metrics);
+    REQUIRE(r.rbac.assign_role({"user", "minter", "RespReader"}).has_value());
+    const auto svc = r.mint("printers");
+    REQUIRE(r.rbac.set_permission({"ITServiceOwner", "Response", "Read", "deny"}).has_value());
 
     auto req = bearer_request(svc);
     httplib::Response res;
@@ -609,9 +684,141 @@ TEST_CASE("require_fleet_read: service token, degraded ITServiceOwner permission
     REQUIRE_FALSE(result.has_value());
     CHECK(result.error() == authz::GateFailure::Forbidden);
     CHECK(res.status == 403);
-    // The ceiling's own body, so a later axis failing for the same reason cannot satisfy this.
     CHECK(res.body.find("service-scoped token does not grant Response:Read") !=
           std::string::npos);
+    CHECK(res.body.find("\"permission\"") == std::string::npos);
+    CHECK(metrics.counter("yuzu_server_rbac_read_degrade_total", {{"reason", "query_error"}})
+              .value() == 0.0);
+
+    // The audit row: exact verb, result and detail (and NOT the degrade wording).
+    {
+        auto rows = r.audit_store.query({});
+        REQUIRE(rows.has_value());
+        REQUIRE(rows->size() == 1);
+        const auto& row = (*rows)[0];
+        CHECK(row.action == "auth.fleet_read_required");
+        CHECK(row.result == "denied");
+        CHECK(row.detail == "fleet read blocked: service-scoped token lacks ITServiceOwner "
+                            "permission Response:Read");
+        CHECK(row.detail.find("degraded") == std::string::npos);
+    }
+
+    // Same verdict through the sibling gate (one helper, one answer).
+    auto req2 = bearer_request(svc);
+    httplib::Response res2;
+    CHECK_FALSE(r.ar->require_permission(req2, res2, "Response", "Read"));
+    CHECK(res2.status == 403);
+}
+
+TEST_CASE("require_fleet_read: service token through an MCP tier is not admitted by the "
+          "ceiling path on its own (branch order: tier falls through, ceiling still decides)",
+          "[pg][auth_routes][authz_gates][service_scope]") {
+    YUZU_REQUIRE_PG_DB_TPL(rbac_db_, rbac_gates_tpl);
+    GatesRig r{rbac_db_.dsn()};
+    REQUIRE(r.rbac.assign_role({"user", "minter", "RespReader"}).has_value());
+    auto raw = r.api_tokens->create_token("gates-test-svc-tier", "minter", now_epoch() + 3600,
+                                          /*scope_service=*/"printers", /*mcp_tier=*/"readonly");
+    REQUIRE(raw.has_value());
+
+    // Ceiling present: the tier allows Read, so the request falls through and is NARROWED to
+    // the service set (it is never promoted to unfiltered by the tier).
+    {
+        auto req = bearer_request(*raw);
+        httplib::Response res;
+        auto result = r.ar->require_fleet_read(req, res, "Response", "Read");
+        REQUIRE(result.has_value());
+        CHECK_FALSE(result->unfiltered());
+        CHECK(result->in_scope("a_p"));
+        CHECK_FALSE(result->in_scope("a_c2"));
+    }
+    // Ceiling revoked: the allowed tier admits nothing by itself.
+    REQUIRE(r.rbac.remove_permission("ITServiceOwner", "Response", "Read").has_value());
+    {
+        auto req = bearer_request(*raw);
+        httplib::Response res;
+        auto result = r.ar->require_fleet_read(req, res, "Response", "Read");
+        REQUIRE_FALSE(result.has_value());
+        CHECK(result.error() == authz::GateFailure::Forbidden);
+        CHECK(res.status == 403);
+        CHECK(res.body.find("service-scoped token does not grant Response:Read") !=
+              std::string::npos);
+    }
+}
+
+// Pins the documented Breaking change: ITServiceOwner is not seeded Enrollment:Read, so a
+// service-scoped token is refused on GET /api/v1/enrollment/pending-agents (the gate's pair)
+// even when its minter is an Administrator. A non-service Administrator is unaffected.
+TEST_CASE("require_fleet_read: Enrollment:Read under seeded defaults => 403 for a service "
+          "token with the ceiling body, an Administrator non-service token is unaffected",
+          "[pg][auth_routes][authz_gates][service_scope]") {
+    YUZU_REQUIRE_PG_DB_TPL(rbac_db_, rbac_gates_tpl);
+    GatesRig r{rbac_db_.dsn()};
+    REQUIRE(r.rbac.assign_role({"user", "minter", "Administrator"}).has_value());
+    const auto svc = r.mint("printers");
+    const auto plain = r.mint();
+    {
+        auto req = bearer_request(svc);
+        httplib::Response res;
+        auto result = r.ar->require_fleet_read(req, res, "Enrollment", "Read");
+        REQUIRE_FALSE(result.has_value());
+        CHECK(result.error() == authz::GateFailure::Forbidden);
+        CHECK(res.status == 403);
+        CHECK(res.body.find("service-scoped token does not grant Enrollment:Read") !=
+              std::string::npos);
+        CHECK(res.body.find("\"permission\"") == std::string::npos);
+    }
+    {
+        auto req = bearer_request(plain);
+        httplib::Response res;
+        auto result = r.ar->require_fleet_read(req, res, "Enrollment", "Read");
+        REQUIRE(result.has_value());
+        CHECK(result->unfiltered());
+    }
+}
+
+// The eight literal securables fleet-read callers use (all Read). Seeded ITServiceOwner holds
+// seven; Enrollment is the documented exception. Revoking one pair refuses only that pair.
+TEST_CASE("require_fleet_read: ceiling over the eight fleet-read securables, seeded and after "
+          "a single-pair revoke",
+          "[pg][auth_routes][authz_gates][service_scope]") {
+    YUZU_REQUIRE_PG_DB_TPL(rbac_db_, rbac_gates_tpl);
+    GatesRig r{rbac_db_.dsn()};
+    REQUIRE(r.rbac.assign_role({"user", "minter", "Administrator"}).has_value());
+    const auto svc = r.mint("printers");
+    const std::vector<std::string> securables = {"Execution", "Infrastructure", "Response",
+                                                 "Inventory", "Policy",         "GuaranteedState",
+                                                 "Workflow",  "Enrollment"};
+    const auto admitted = [&](const std::string& securable) {
+        auto req = bearer_request(svc);
+        httplib::Response res;
+        auto result = r.ar->require_fleet_read(req, res, securable, "Read");
+        if (result.has_value())
+            return true;
+        CHECK(result.error() == authz::GateFailure::Forbidden);
+        CHECK(res.status == 403);
+        return false;
+    };
+
+    int admits = 0;
+    for (const auto& s : securables) {
+        INFO("seeded: " << s);
+        if (s == "Enrollment") {
+            CHECK_FALSE(admitted(s));
+        } else {
+            CHECK(admitted(s));
+            ++admits;
+        }
+    }
+    CHECK(admits == 7);
+
+    REQUIRE(r.rbac.remove_permission("ITServiceOwner", "Policy", "Read").has_value());
+    for (const auto& s : securables) {
+        INFO("after revoking Policy:Read: " << s);
+        if (s == "Policy" || s == "Enrollment")
+            CHECK_FALSE(admitted(s));
+        else
+            CHECK(admitted(s));
+    }
 }
 
 TEST_CASE("require_fleet_read: null rbac store ⇒ Degraded (not a crash)",
@@ -660,6 +867,28 @@ TEST_CASE("require_fleet_read: service-scoped token, RBAC genuinely disabled "
     CHECK(result.error() == authz::GateFailure::Forbidden);
     CHECK(res.status == 403);
     CHECK(res.body.find("require RBAC to be enabled") != std::string::npos);
+}
+
+TEST_CASE("require_fleet_read: service token, RBAC disabled AND the pair revoked from "
+          "ITServiceOwner => the RBAC-must-be-enabled text, not the ceiling text (branch order)",
+          "[pg][auth_routes][authz_gates][service_scope]") {
+    YUZU_REQUIRE_PG_DB_TPL(rbac_db_, rbac_gates_tpl);
+    GatesRig r{rbac_db_.dsn()};
+    REQUIRE(r.rbac.remove_permission("ITServiceOwner", "Response", "Read").has_value());
+    r.rbac.set_rbac_enabled(false);
+    auto token = r.mint("printers");
+    auto req = bearer_request(token);
+    httplib::Response res;
+    auto result = r.ar->require_fleet_read(req, res, "Response", "Read");
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error() == authz::GateFailure::Forbidden);
+    CHECK(res.status == 403);
+    CHECK(res.body.find("require RBAC to be enabled") != std::string::npos);
+    CHECK(res.body.find("ITServiceOwner") == std::string::npos);
+    auto rows = r.audit_store.query({});
+    REQUIRE(rows.has_value());
+    REQUIRE(rows->size() == 1);
+    CHECK((*rows)[0].detail.find("requires RBAC to be enabled") != std::string::npos);
 }
 
 TEST_CASE("require_fleet_read: non-service token, RBAC genuinely disabled ⇒ "

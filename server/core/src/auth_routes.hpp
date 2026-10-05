@@ -498,6 +498,26 @@ public:
     /// and a silent full-fleet AdmitAll on a securable seeded admin-only —
     /// `Enrollment:Read` (GET /api/v1/enrollment/pending-agents) is the
     /// first floored securable ever routed through this gate.
+    ///
+    /// ITServiceOwner CEILING PARITY (round-3 fix, refined by the 2026-10-05 user
+    /// decisions): for a service-scoped token this gate applies the SAME authority
+    /// ceiling as `require_permission`/`require_scoped_permission`, through the ONE
+    /// shared helper `authz::service_ceiling_check` (authz_gates.hpp), after the
+    /// RBAC-enabled check and before the topology floor (branch order unchanged:
+    /// elevated -> engine -> mcp_tier -> service -> RBAC -> legacy). It does NOT apply
+    /// `kServiceScopeGlobalSafe`: that allow-list guards routes returning fleet-wide
+    /// data UNCONFINED, while this gate's service axis always narrows to the tagged
+    /// set. DELIBERATE DIVERGENCE on a failed read: a DEFINITIVE ceiling deny (an
+    /// explicit deny row, or the pair absent because the seeded default was revoked or
+    /// never granted) is 403 `Forbidden` exactly like the siblings, but a FAILED
+    /// `get_role_permissions_checked` read is 503 `Degraded` with `retry_after_ms`
+    /// 5000 and a `yuzu_server_rbac_read_degrade_total` increment, whereas
+    /// `require_permission`/`require_scoped_permission` keep mapping the same failure
+    /// to 403 (their documented fail-closed contract, unchanged). Both are fail CLOSED;
+    /// only the retry signal differs. Neither body names a `.permission`. Seeded
+    /// defaults: ITServiceOwner holds every fleet-read pair this gate is called with
+    /// EXCEPT `Enrollment:Read`, so a service token gets 403 on
+    /// GET /api/v1/enrollment/pending-agents (documented Breaking change).
     [[nodiscard]] std::expected<authz::ListAuthority, authz::GateFailure>
     require_fleet_read(const httplib::Request& req, httplib::Response& res,
                        const std::string& securable_type, const std::string& operation);

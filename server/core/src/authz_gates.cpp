@@ -13,6 +13,38 @@
 
 namespace yuzu::server {
 
+authz::CeilingVerdict authz::service_ceiling_check(const RbacStore& store,
+                                                   const std::string& securable_type,
+                                                   const std::string& operation,
+                                                   const char** degrade_reason) {
+    // Same read and same row semantics as RbacStore::check_role_has_permission
+    // (rbac_store.cpp): get_role_permissions_checked, first row for the pair decides,
+    // `allow` admits, `deny` or an absent pair (a revoked default is a DELETEd row)
+    // refuses. Only a failed read differs: it is reported, not folded into a deny.
+    auto perms = store.get_role_permissions_checked("ITServiceOwner");
+    if (!perms) {
+        if (degrade_reason) {
+            // Closed label set of yuzu_server_rbac_read_degrade_total. A store that is
+            // not open never reaches here from a gate (they pre-check is_open()), so the
+            // only distinguishable cause is the pool acquire; everything else is a query
+            // error.
+            *degrade_reason = perms.error().starts_with("pool acquire timeout")
+                                  ? "pool_acquire_timeout"
+                                  : "query_error";
+        }
+        return CeilingVerdict::Degraded;
+    }
+    for (const auto& p : *perms) {
+        if (p.securable_type == securable_type && p.operation == operation) {
+            if (p.effect == "deny")
+                return CeilingVerdict::Deny;
+            if (p.effect == "allow")
+                return CeilingVerdict::Admit;
+        }
+    }
+    return CeilingVerdict::Deny;
+}
+
 std::expected<authz::ListAuthority, authz::GateFailure>
 AuthRoutes::require_fleet_read(const httplib::Request& req, httplib::Response& res,
                                const std::string& securable_type, const std::string& operation) {
@@ -173,9 +205,12 @@ AuthRoutes::require_fleet_read(const httplib::Request& req, httplib::Response& r
     // minter holds. Without it this gate admitted a service token on the minter's grant plus
     // the tag meet alone, so an operator who revoked the pair from ITServiceOwner (the
     // `revoked_seed_defaults` mechanism) still saw service tokens served on every fleet-read
-    // route. `check_role_has_permission` is deny-on-error (a degraded read returns false), so
-    // a store failure here fails CLOSED as a 403, the same outcome require_permission gives.
-    // Deliberately NOT the second half of require_permission's service branch
+    // route. The check is `authz::service_ceiling_check`, the ONE shared helper
+    // require_permission / require_scoped_permission also call. DIVERGENCE (user decision
+    // 2026-10-05): a definitive deny (explicit deny row or absent/revoked pair) is a 403
+    // like theirs, but a FAILED ceiling read is a retryable 503 here (bumping
+    // yuzu_server_rbac_read_degrade_total), whereas those two gates keep mapping a failed
+    // read to 403. Still fail CLOSED: never an admit. Deliberately NOT the second half of require_permission's service branch
     // (`service_scope_admits` / `kServiceScopeGlobalSafe`): that allow-list guards routes that
     // return fleet-wide data UNCONFINED, whereas this gate's service axis below always
     // narrows to the tagged set, so the allow-list is neither applied nor widened here.
@@ -183,17 +218,45 @@ AuthRoutes::require_fleet_read(const httplib::Request& req, httplib::Response& r
     // mcp_tier branches and before the RBAC axis (branch order unchanged). No `.permission`
     // on the 403 (routed-concern clause 5): granting `perm` to the minter does not admit this
     // caller; only an ITServiceOwner grant does.
-    if (!session->token_scope_service.empty() &&
-        !rbac_store_->check_role_has_permission("ITServiceOwner", securable_type, operation)) {
-        audit_log(req, "auth.fleet_read_required", "denied", "", "",
-                  "fleet read blocked: service-scoped token lacks ITServiceOwner permission " +
-                      perm);
-        res.status = 403;
-        res.set_content(detail::a4_denial(res, 403,
-                                          "service-scoped token does not grant " + perm +
-                                              " (the ITServiceOwner role does not hold it)"),
-                        "application/json");
-        return std::unexpected(authz::GateFailure::Forbidden);
+    if (!session->token_scope_service.empty()) {
+        const char* degrade_reason = "query_error";
+        switch (authz::service_ceiling_check(*rbac_store_, securable_type, operation,
+                                             &degrade_reason)) {
+            case authz::CeilingVerdict::Admit:
+                break;
+            case authz::CeilingVerdict::Deny:
+                audit_log(req, "auth.fleet_read_required", "denied", "", "",
+                          "fleet read blocked: service-scoped token lacks ITServiceOwner "
+                          "permission " +
+                              perm);
+                res.status = 403;
+                res.set_content(detail::a4_denial(res, 403,
+                                                  "service-scoped token does not grant " + perm +
+                                                      " (the ITServiceOwner role does not hold "
+                                                      "it)"),
+                                "application/json");
+                return std::unexpected(authz::GateFailure::Forbidden);
+            case authz::CeilingVerdict::Degraded:
+                // The audit text deliberately does NOT say the role lacks the permission:
+                // the read failed, the role's grants are unknown.
+                if (auto* m = auth_mgr_.metrics_registry()) {
+                    m->counter("yuzu_server_rbac_read_degrade_total",
+                               {{"reason", degrade_reason}})
+                        .increment();
+                }
+                audit_log(req, "auth.fleet_read_required", "denied", "", "",
+                          "fleet read blocked: RBAC read degraded resolving the ITServiceOwner "
+                          "ceiling for " +
+                              perm);
+                res.status = 503;
+                // No `.permission` (clause 5): this is an outage, not a missing grant.
+                res.set_content(detail::a4_denial(res, 503,
+                                                  "authorization store degraded, cannot verify "
+                                                  "the service-token ceiling",
+                                                  detail::A4ErrorOpts{.retry_after_ms = 5000}),
+                                "application/json");
+                return std::unexpected(authz::GateFailure::Degraded);
+        }
     }
 
     // #4031 topology floor (authz_topology_floor.hpp): RbacStore::authorize_

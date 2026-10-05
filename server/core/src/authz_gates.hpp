@@ -42,9 +42,35 @@
 /// (`docs/security-reviews/service-scope-phase2-migrations-2026-08.md`).
 namespace yuzu::server {
 class AuthRoutes;
+class RbacStore;
 }
 
 namespace yuzu::server::authz {
+
+/// Outcome of the ITServiceOwner authority-ceiling read. TRI-STATE on purpose: the
+/// ceiling's callers disagree on what a failed read means, and the helper must not
+/// pre-decide it for them.
+///   Admit    - the role holds the pair as an `allow` row.
+///   Deny     - an explicit `deny` row, OR the pair is absent (which is also how an
+///              operator revoke looks: `remove_permission` DELETEs the row and records
+///              `revoked_seed_defaults`, so a revoked default is simply absent here).
+///   Degraded - the checked read itself failed (store closed, pool timeout, query error).
+/// `require_permission` / `require_scoped_permission` map Degraded to the same 403 as
+/// Deny (their documented fail-closed contract, unchanged); `require_fleet_read` maps it
+/// to a retryable 503 because it is an infrastructure fault, not a definitive deny.
+enum class CeilingVerdict : std::uint8_t { Admit, Deny, Degraded };
+
+/// THE one ITServiceOwner ceiling check (extend, never fork): a service-scoped token can
+/// never exceed what the ITServiceOwner role grants, whatever its minter holds. Same
+/// semantics as `RbacStore::check_role_has_permission("ITServiceOwner", ...)` (first
+/// matching row decides, `allow` admits, `deny` or absent refuses) with the failed-read
+/// case separated out instead of folded into `false`. On Degraded, `degrade_reason` (if
+/// non-null) is set to a closed `yuzu_server_rbac_read_degrade_total` reason label
+/// ("pool_acquire_timeout" or "query_error"); the helper itself never touches metrics.
+[[nodiscard]] CeilingVerdict service_ceiling_check(const RbacStore& store,
+                                                   const std::string& securable_type,
+                                                   const std::string& operation,
+                                                   const char** degrade_reason = nullptr);
 
 /// Why `require_fleet_read` did not produce a `ListAuthority`. This is
 /// structural bookkeeping, not a caller dispatch surface — every failure
@@ -61,7 +87,10 @@ enum class GateFailure : std::uint8_t {
     Degraded,        ///< 503 — infrastructure unavailable, retryable: a
                      ///< null/not-open RBAC store, or the service-scope
                      ///< axis's tag-store lookup failing (null `tag_store_`,
-                     ///< or a degraded/failed query).
+                     ///< or a degraded/failed query), or, for a service-scoped
+                     ///< token, the ITServiceOwner ceiling read failing
+                     ///< (`service_ceiling_check` returned Degraded; a
+                     ///< DEFINITIVE ceiling deny is Forbidden).
 };
 
 /// Move-only witness over an already-composed `VisibleSet` — the product of
