@@ -133,7 +133,7 @@
             <label>
               <input type="checkbox" id="persist-certs" checked disabled> Persist generated certs across recreates
             </label>
-            <small>Always on since 0.14.1: this directory holds the secrets KEK registered in Postgres and the per-install CA (#5370)</small>
+            <small>Always on since 0.14.1: this directory holds the secrets KEK registered in Postgres and the per-install CA (#5370). It is the named volume <code>server-certs</code> when named volumes are on or Postgres is external. With named volumes off and bundled Postgres it is an anonymous volume, discarded together with the database's anonymous volume.</small>
           </div>
         </fieldset>
 
@@ -146,6 +146,17 @@
             are <em>container</em> paths; the wizard bind-mounts a host <code>./certs</code>
             directory read-only at <code>/etc/yuzu/certs</code>. Put your files there, or
             edit the mount in the generated compose.
+          </div>
+
+          <div class="callout warning">
+            <strong>Known issue (#5420): this mode does not start as generated.</strong> The server
+            also writes its secrets KEK into <code>/etc/yuzu/certs</code>. Because the wizard mounts
+            <code>./certs</code> read-only, the server cannot write the KEK and stops at its first boot
+            with <code>provider_failure</code>, before it has encrypted anything. Until #5420 is fixed,
+            use <strong>Default certs</strong>, or edit the generated mount to drop <code>:ro</code> and
+            make <code>./certs</code> writable by the server's <code>yuzu</code> user (uid 999 in the
+            Debian <code>yuzu-server</code> image). Back up <code>./certs</code> with your database
+            from then on, because it holds the KEK.
           </div>
 
           <div class="field">

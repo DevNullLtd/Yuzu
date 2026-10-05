@@ -159,9 +159,10 @@ server is restart-looping, use
 In the affected 0.14.0 stacks there was no volume there, so recreating the
 container (an image upgrade, `down` then `up`, `--force-recreate`) deleted the
 key files, and `kek_unresolvable` follows on the next start (#5370).
-Affected: a 0.14.0 Docker Compose stack whose server has no volume on `/etc/yuzu/certs` while Postgres has one — `deploy/docker/docker-compose.yml` (the README quickstart), `docker-compose.uat.yml`, `docker-compose.full-uat.yml`, `docker-compose.viz-uat.yml`, `docker-compose.demo.yml` used with `--keep`, any compose copied from them, and Compose Wizard output from before 0.14.1 in Plaintext mode or with 'Persist generated certs' unticked. Not affected: `docker-compose.reference.yml` and `docker-compose.reference-gateway.yml` (their `certs` volume).
+Affected: a 0.14.0 Docker Compose stack whose server has no named volume on `/etc/yuzu/certs` while Postgres has one — `deploy/docker/docker-compose.yml` (the README quickstart), `docker-compose.uat.yml`, `docker-compose.full-uat.yml`, `docker-compose.viz-uat.yml`, `docker-compose.demo.yml` used with `--keep`, any compose copied from them, and Compose Wizard output from before 0.14.1 in Plaintext mode, with 'Persist generated certs' unticked, or with named volumes off and an external Postgres. Not affected: `docker-compose.reference.yml` and `docker-compose.reference-gateway.yml` (their `certs` volume).
 A `kek_unresolvable` there does not always mean the files are gone: a compose
-that lost its volume line, or files owned by the wrong uid, give the same error.
+that lost its volume line, files owned by the wrong uid, or keys left behind on
+a dangling anonymous volume give the same error.
 The diagnostic order, the copy-out procedure, and the options if the files are
 already gone are in `docs/user-manual/upgrading.md`, "Docker Compose: copy
 `/etc/yuzu/certs` out of the server container before you recreate it". Run the
@@ -182,41 +183,44 @@ point in time, and restore them as a pair.**
 
 Capture order: take the `pg_dump` first, then the keys directory; do not rotate the KEK between the two (key files only accumulate, so the archive stays a superset of what the dump references). Stopping the server for the pair guarantees it.
 
-```bash
-# Linux — run both, keep them together, encrypt the pair at rest.
-STAMP=$(date +%Y%m%dT%H%M%SZ)
-sudo -u _yuzu pg_dump "$YUZU_POSTGRES_DSN" --format=custom \
-     > /var/backups/yuzu/yuzu-$STAMP.dump
-sudo tar -czf /var/backups/yuzu/yuzu-keys-$STAMP.tar.gz \
-     -C /etc/yuzu certs
-```
+**Linux.** Both halves go to `/var/backups/yuzu`, which the block makes a root-owned `0700` directory, and both are written under `umask 077`, so the dump and the key archive are `0600` and owned by root. They stay root-owned: copy them off with `sudo`, keep them together, and encrypt the pair at rest. Use a directory that holds nothing else, since files already in it keep their own permissions. The block prints `OK:` only if both halves were written.
 
 ```bash
-# Docker Compose — run from the compose directory. The keys directory is the
-# server's /etc/yuzu/certs volume. Both halves go to an owner-only directory
-# outside any git checkout (the key archive holds the CA private key and the
-# KEK). The server is stopped for the pair, and `docker cp` reads the volume
-# from the stopped container, so this works on the chiselled image too.
+STAMP=$(date -u +%Y%m%dT%H%M%SZ)
+sudo install -d -m 0700 -o root -g root /var/backups/yuzu
+( set -o pipefail
+  sudo -u _yuzu pg_dump "$YUZU_POSTGRES_DSN" --format=custom \
+    | sudo sh -c "umask 077; cat > /var/backups/yuzu/yuzu-$STAMP.dump" &&
+  sudo sh -c "umask 077; tar -czf /var/backups/yuzu/yuzu-keys-$STAMP.tar.gz -C /etc/yuzu certs" ) &&
+  echo "OK: pair written to /var/backups/yuzu"
+```
+
+**Docker Compose.** Run from the compose directory. The keys directory is the server container's `/etc/yuzu/certs` volume. Both halves go to an owner-only directory outside any git checkout, because the key archive holds the CA private key and the KEK. The server is stopped for the pair, and `docker cp` reads the volume from the stopped container, so this works on the chiselled image too. The last line starts the server again whether or not the backup succeeded.
+
+```bash
 STAMP=$(date -u +%Y%m%dT%H%M%SZ)
 BK="$HOME/yuzu-keys-backup"; mkdir -p "$BK" && chmod 700 "$BK"
 docker compose stop server
 ( umask 077; set -o pipefail
-  docker compose exec -T postgres pg_dump -U yuzu --format=custom yuzu \
+  docker compose exec -T postgres pg_dump -U yuzu --format=custom yuzu < /dev/null \
        > "$BK/yuzu-$STAMP.dump" &&
   docker cp "$(docker compose ps -aq server)":/etc/yuzu/certs - | gzip \
        > "$BK/yuzu-keys-$STAMP.tar.gz" ) && echo "pair written to $BK"
 docker compose start server
 ```
 
+**Windows** (elevated PowerShell). The Windows installer stores the connection string in a file only Administrators and SYSTEM can read; a hand-configured server may use the `YUZU_POSTGRES_DSN` environment variable instead. The block first locks the backup directory to Administrators and SYSTEM (owner Administrators, inheritance removed, full control for those two only), the same grant the installer gives its own directories, so both halves inherit it. Use a new, empty directory: files already in it keep any permissions set on them directly. `pg_dump --file` writes the dump itself, because in Windows PowerShell 5.1 (and PowerShell before 7.4) `>` re-encodes a native command's output as text, which corrupts a custom-format dump.
+
 ```powershell
-# Windows (elevated). The Windows installer stores the connection string in
-# a file only Administrators and SYSTEM can read; a hand-configured server may
-# use the YUZU_POSTGRES_DSN environment variable instead.
 $Stamp = Get-Date -Format yyyyMMddTHHmmssZ
+$Bk = "C:\Backups\Yuzu"
+New-Item -ItemType Directory -Force -Path $Bk | Out-Null
+icacls $Bk /setowner '*S-1-5-32-544' /L /C /Q | Out-Null
+icacls $Bk /inheritance:r /grant:r '*S-1-5-32-544:(OI)(CI)F' '*S-1-5-18:(OI)(CI)F' /L /C /Q | Out-Null
 $DsnFile = "C:\ProgramData\Yuzu Server\postgres.dsn"
 $Dsn = if (Test-Path $DsnFile) { (Get-Content -LiteralPath $DsnFile -Raw).Trim() } else { $Env:YUZU_POSTGRES_DSN }
-pg_dump $Dsn --format=custom > "C:\Backups\Yuzu\yuzu-$Stamp.dump"
-Compress-Archive -Path C:\ProgramData\Yuzu\certs -DestinationPath "C:\Backups\Yuzu\yuzu-keys-$Stamp.zip"
+pg_dump $Dsn --format=custom --file "$Bk\yuzu-$Stamp.dump"
+Compress-Archive -Path C:\ProgramData\Yuzu\certs -DestinationPath "$Bk\yuzu-keys-$Stamp.zip"
 ```
 
 Rules that follow from the pairing:

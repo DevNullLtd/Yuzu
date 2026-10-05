@@ -61,22 +61,30 @@
 ## before any destructive operation; don't `down -v` unless you intend to
 ## re-root the CA and wipe state.
 ##
-## Backup (run from a dedicated backup directory so $PWD is predictable):
-##   mkdir -p ~/yuzu-backups && cd ~/yuzu-backups
-##   docker run --rm -v server-data:/data -v "$PWD":/backup alpine \
-##     tar czf "/backup/yuzu-data-$(date +%F).tar.gz" -C /data .
-##   # The CA + leaf certs — back these up too, or agents lose trust on re-root.
-##   docker run --rm -v certs:/certs -v "$PWD":/backup alpine \
-##     tar czf "/backup/yuzu-certs-$(date +%F).tar.gz" -C /certs .
-##   # Postgres state: pg_dump through the database — consistent against a
-##   # LIVE instance. Never tar the postgres-data volume while it runs (a
-##   # torn pg_wal/ copy is unrecoverable).
+## Backup (run from a dedicated backup directory so $PWD is predictable).
+## Compose prefixes volume names with the project name (the directory name
+## unless set with -p / COMPOSE_PROJECT_NAME): from deploy/docker they are
+## docker_server-data and docker_certs. `docker volume ls` prints the full
+## names; set P to the project name. `docker run -v <name>:...` silently
+## creates an EMPTY volume for a wrong name, hence the inspect first. Dump
+## Postgres FIRST, then the keys (key files only accumulate, so a keys
+## archive taken after the dump covers every key the dump references):
+##   P=docker; mkdir -p ~/yuzu-backups && chmod 700 ~/yuzu-backups && cd ~/yuzu-backups
+##   docker volume inspect "${P}_server-data" "${P}_certs" >/dev/null || echo STOP
 ##   docker exec yuzu-postgres pg_dump -U postgres --format=custom yuzu \
 ##     > "yuzu-pg-$(date +%F).dump"
+##   docker run --rm -v "${P}_server-data":/data -v "$PWD":/backup alpine \
+##     tar czf "/backup/yuzu-data-$(date +%F).tar.gz" -C /data .
+##   # The CA + leaf certs + secrets KEK — the keys half of the pair.
+##   docker run --rm -v "${P}_certs":/certs -v "$PWD":/backup alpine \
+##     sh -c "umask 077; tar czf /backup/yuzu-keys-$(date +%F).tar.gz -C / certs && chown $(id -u):$(id -g) /backup/yuzu-keys-$(date +%F).tar.gz"
+##   Never tar the postgres-data volume while it runs (a torn pg_wal/ copy is
+##   unrecoverable); pg_dump through the database is consistent against a
+##   LIVE instance.
 ##
 ## Restore (with server stopped):
 ##   docker compose -f docker-compose.reference.yml down server
-##   docker run --rm -v server-data:/data -v "$PWD":/backup alpine \
+##   docker run --rm -v "${P}_server-data":/data -v "$PWD":/backup alpine \
 ##     tar xzf "/backup/yuzu-data-YYYY-MM-DD.tar.gz" -C /data
 ##   docker exec -i yuzu-postgres pg_restore --clean --if-exists --no-owner \
 ##     --role=yuzu -U postgres --dbname=yuzu < "yuzu-pg-YYYY-MM-DD.dump"
