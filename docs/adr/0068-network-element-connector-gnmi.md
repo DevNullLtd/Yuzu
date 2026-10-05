@@ -277,7 +277,7 @@ annotations D10 states — they write Yuzu's own store, never an element.
   "accepted residual" — the controls above are the controls.
 - A "reference mode" (Yuzu stores only a secret-manager reference; the customer provisions gnmic
   from Vault) is named as a later option and not built — tracked as a follow-up issue filed with
-  this ADR (its number is recorded in the PR before merge).
+  this ADR: #5408.
 - `skip-verify` on an element target is **refused** by core's target publication: an element
   either presents a certificate the customer-supplied CA bundle verifies or is not dialled, so
   "TLS to devices with the customer's own PKI" is true as written and never silently downgraded.
@@ -651,8 +651,7 @@ subscriptions only; there is no on-demand device RPC. So under D3 there is no *l
   collector-class engine principals holding exactly `NetworkElement:Collect`, through one audited
   route, and they then live in the collector process's memory and transit the F1 response body
   over TLS; rotation is a credential `set` that reaches the collector on its next poll; a
-  customer-hosted secrets manager (reference mode) is a tracked roadmap item (issue number in the
-  PR); device-side TLS verifies against the customer's CA bundle with customer-issued client
+  customer-hosted secrets manager (reference mode) is a tracked roadmap item (#5408); device-side TLS verifies against the customer's CA bundle with customer-issued client
   certificates where the device requires them, and `skip-verify` is refused.
 - **Documentation deliverables (slice 1)**: `docs/user-manual/network-elements.md` (collector
   install and bootstrap, register an element, profiles and `no_profile`, credentials and rotation,
@@ -680,12 +679,13 @@ subscriptions only; there is no on-demand device RPC. So under D3 there is no *l
 - The fabric-level reachability seam in `CONTEXT.md` "Reachability" is **not** filled by this ADR:
   LLDP/FDB give physical adjacency, not what ACLs/VLANs *permit*. Config-analysis (Batfish) is the
   candidate filler for that seam and is a separate decision.
-- Follow-ups filed with this ADR: the containerlab + pinned-gnmic contract rig (shared by every
-  chaos scenario); gnmic clustering / multi-collector sharding; SNMP/SSH adapter (SuzieQ); the
-  `Set` write path with its Execution Plan and credential-egress hardening; site-confined elements
-  via generalised group membership; reference-mode credentials; non-compose install path and Helm
-  chart; the numeric constants (liveness bound, batch chunk, lease budget, backoff cap, retention
-  default, `kAccessPortMacCap`).
+- Follow-ups filed with this ADR: the containerlab + pinned-gnmic contract rig, shared by every
+  chaos scenario (#5406); the numeric constants — liveness bound, batch chunk, lease budget,
+  backoff cap, retention default, `kAccessPortMacCap`, alert thresholds (#5407); reference-mode
+  credentials (#5408); gnmic clustering / multi-collector sharding (#5409); the SNMP/SSH adapter via
+  SuzieQ (#5410); the `Set` write path with its Execution Plan and credential-egress hardening
+  (#5411); site-confined elements via generalised group membership (#5412); non-compose install
+  path and Helm chart (#5413).
 
 ## Binding status
 
