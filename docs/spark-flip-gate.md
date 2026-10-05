@@ -1010,21 +1010,29 @@ flip, with a red-first test each:
     unlabelled fleet SUM; nothing consumes these gauges today. An EMPTY tag value is
     skipped before parsing and is not counted in `yuzu_fleet_guardian_health_tag_rejected`; accepted
     (the agent never emits an empty value).
-- **Follow-ups (to be filed; no issue numbers yet).** (1) F-1: measure the held-hold
+- **Follow-ups (to be filed; no issue numbers yet).** (1) FU-1: measure the held-hold
   push rate and the endpoint journal eviction during a held period (a flip
-  precondition, see AC-1). (2) F-2: hang a full class quota of compensations, then
-  re-push, and confirm releasing one slot restores admission in one pass. (3) F-3: a
-  pre-lock hook seam so the AC-4 window can be tested. (4) F-4: measure the unarmed
-  interval of a same-rule re-push on a compensating head (AC-5). (5) F-5: server tag
+  precondition, see AC-1). (2) FU-2: hang a full class quota of compensations, then
+  re-push, and confirm releasing one slot restores admission in one pass. (3) FU-3: a
+  pre-lock hook seam so the AC-4 window can be tested. (4) FU-4: measure the unarmed
+  interval of a same-rule re-push on a compensating head (AC-5). (5) FU-5: server tag
   trust under a scrape during `recompute_metrics`, a restart herd of held agents,
-  forged and malformed values, and mixed agent versions. (6) F-6: commented alert
+  forged and malformed values, and mixed agent versions. (6) FU-6: commented alert
   templates for the two age gauges and the compensation count (needs fleet data; routes
-  to `sre`). (7) F-7: a count companion gauge for the MAX age gauges (agents holding), so
+  to `sre`). (7) FU-7: a count companion gauge for the MAX age gauges (agents holding), so
   "absent after a value" can be told apart from evicted, recovered or never held.
-  (8) F-8: a constexpr row-table refactor of the heartbeat emit blocks. (9) F-9: a sparse
+  (8) FU-8: a constexpr row-table refactor of the heartbeat emit blocks. (9) FU-9: a sparse
   fault-count heartbeat tag for the agent's Guardian emit groups (each group logs its
   first failure and every 100th, but ships no metric, so a persistent fault is visible
-  only in the agent log).
+  only in the agent log). The same follow-up covers two related items. First, a per-group
+  counter reset or recovery log on a clean tick: the per-group counters are never reset
+  while the heartbeat loop runs (they restart only on reconnect), so after a group's first
+  logged failure a returning transient fault stays silent until its 100th cumulative
+  failure, which is up to about 50 minutes at a 30 s heartbeat (100 x 30 s; an estimate
+  of the worst case, not a measurement). Second, cosmetic warn-text issues: the
+  group message and the appended failure-count text read as two parenthesised phrases in
+  a row, and the "was"/"were" wording differs between groups. No production code changes
+  with this entry.
 
 ## 4. #2340 scenario contract
 

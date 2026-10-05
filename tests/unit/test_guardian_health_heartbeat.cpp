@@ -401,9 +401,10 @@ struct FakeSparkEngine {
 TEST_CASE("health heartbeat: collect_guardian_spark_health_tags is the ONE assembly of every "
           "Spark claim-lifecycle tag (#5403/#5404/#4472)",
           "[guardian][health][heartbeat][claim]") {
-    // This is the function agent.cpp's heartbeat calls: a call dropped or swapped there is a
-    // call dropped or swapped here, so these assertions pin the wiring the engine tests used to
-    // re-assemble by hand (and under which the disarm_deadline_elapsed key was omitted).
+    // This is the function agent.cpp's heartbeat calls. These assertions pin the helper's
+    // output (the wiring the engine tests used to re-assemble by hand, and under which the
+    // disarm_deadline_elapsed key was omitted); the single call site in agent.cpp is not
+    // covered by any test.
     const FakeSparkEngine eng;
     const auto now = std::chrono::steady_clock::now() + std::chrono::hours(1);
     std::map<std::string, std::string> tags;

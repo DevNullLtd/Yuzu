@@ -14714,6 +14714,38 @@ TEST_CASE("#4472 stress: accessors, the zero-arg expiry and aged expiry passes r
         keys.push_back(spark_key(file_spec(paths.back())));
         rids.push_back("s" + std::to_string(i));
     }
+    // Shared state and the cleanup guard are declared BEFORE the pre-phase, so a failing REQUIRE
+    // there (a parked arm worker, the hung compensating disarm) is released on unwind instead of
+    // leaking a parked thread. `driver` is default-constructed here and started after the
+    // pre-phase; the guard is declared after everything the driver touches, so it joins the
+    // driver before any of that state is destroyed.
+    std::atomic<bool> done{false};
+    // 0 = ok; otherwise the first failing step (1 attach, 2 arm never entered, 3 claim never drained).
+    std::atomic<int> driver_error{0};
+    // The aged (abandoning) pass is only meaningful once every arm of the round is in flight in
+    // the backend: run earlier it would abandon a claim before its arm ever starts (the attach
+    // itself then reports "arm timed out" and no arm enters the gate). The reader runs it only
+    // while `window_open`, and the driver flips that under the same mutex, so a pass never
+    // overlaps an attach and the window never closes under a pass that is still running.
+    std::mutex window_mu;
+    bool window_open = false;
+    std::thread driver;
+    struct Cleanup {
+        std::thread& driver;
+        FakeBackend& backend;
+        GuardianSparkRuntime& rt;
+        ~Cleanup() {
+            backend.release_all_key_gates();
+            backend.release_disarm_hang(); // the held compensation, if a REQUIRE left it parked
+            backend.arm_park.open();
+            backend.disarm_park.open();
+            if (driver.joinable())
+                driver.join();
+            rt.begin_stop();
+            (void)yuzu::test::spin_until([&] { return rt.active_backend_op_workers() == 0; }, 10s);
+        }
+    } cleanup{driver, *b, *rt};
+
     // The held compensation (see above): a Registry key, so its hung compensating disarm
     // occupies a Registry class slot and never competes with the driver's File arms.
     const auto held_spec = reg_spec("HKLM", "Software\\yuzu_test_stress_held");
@@ -14731,17 +14763,7 @@ TEST_CASE("#4472 stress: accessors, the zero-arg expiry and aged expiry passes r
         REQUIRE(b->wait_entered_disarm_hang(10s));
         REQUIRE(rt->oldest_outstanding_compensation_age(clk::now()).has_value());
     }
-    std::atomic<bool> done{false};
-    // 0 = ok; otherwise the first failing step (1 attach, 2 arm never entered, 3 claim never drained).
-    std::atomic<int> driver_error{0};
-    // The aged (abandoning) pass is only meaningful once every arm of the round is in flight in
-    // the backend: run earlier it would abandon a claim before its arm ever starts (the attach
-    // itself then reports "arm timed out" and no arm enters the gate). The reader runs it only
-    // while `window_open`, and the driver flips that under the same mutex, so a pass never
-    // overlaps an attach and the window never closes under a pass that is still running.
-    std::mutex window_mu;
-    bool window_open = false;
-    std::thread driver([&] {
+    driver = std::thread([&] {
         for (int round = 0; round < kRounds && driver_error.load() == 0; ++round) {
             std::vector<std::shared_ptr<FakeBackend::ArmGate>> gates;
             for (int k = 0; k < kKeys; ++k) {
@@ -14775,21 +14797,6 @@ TEST_CASE("#4472 stress: accessors, the zero-arg expiry and aged expiry passes r
         }
         done.store(true, std::memory_order_release);
     });
-    struct Cleanup {
-        std::thread& driver;
-        FakeBackend& backend;
-        GuardianSparkRuntime& rt;
-        ~Cleanup() {
-            backend.release_all_key_gates();
-            backend.release_disarm_hang(); // the held compensation, if a REQUIRE left it parked
-            backend.arm_park.open();
-            backend.disarm_park.open();
-            if (driver.joinable())
-                driver.join();
-            rt.begin_stop();
-            (void)yuzu::test::spin_until([&] { return rt.active_backend_op_workers() == 0; }, 10s);
-        }
-    } cleanup{driver, *b, *rt};
 
     std::uint64_t iters = 0;
     std::uint64_t reads_without_owed_age = 0;

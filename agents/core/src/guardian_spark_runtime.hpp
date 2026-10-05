@@ -1679,7 +1679,7 @@ public:
     /// scanning claims_ - diagnostic/test use, not a hot-path read.
     [[nodiscard]] std::size_t arms_parked() const;
     /// #5322: retained tombstones - Queued Arm claims that are dead (outcome or
-    /// commit_exception set) yet still hold a genuine ghost index mapping
+    /// commit_exception set) that still hold their rule-to-key index entry
     /// (index_held && index_->owns(key, rule_id, generation)). A live gauge under
     /// registry_mu_ by scanning claims_; exported on the heartbeat as
     /// `yuzu.guardian_retained_tombstones` (#5404) once per heartbeat. Not a per-event read.
