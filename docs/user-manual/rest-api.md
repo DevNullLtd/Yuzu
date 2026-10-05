@@ -253,7 +253,8 @@ Omitting a parameter still means its default, and each route's existing clamping
 values (for example `limit` clamped to a ceiling, `since=0` meaning "no lower bound") are unchanged.
 
 Routes that parse strictly (the response routes are listed in
-[Response Store](#responses) below):
+[Command/Instruction Responses](#commandinstruction-responses--v1-read-twins-2146-a2-r2) and
+[Responses](#responses) below):
 
 | Family | Routes and parameters |
 |---|---|

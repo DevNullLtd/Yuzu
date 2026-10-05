@@ -5158,7 +5158,10 @@ pool-acquire timeout on a response read surfaces as `503` `response store degrad
 **Malformed filters.** `yuzu_server_response_param_rejected_total{surface}` counts requests refused
 for a malformed numeric parameter on the response routes and MCP `query_responses` only. A steady
 non-zero rate on one surface is a client sending fractional timestamps, `null`s or trailing
-characters; it is not a server fault.
+characters; it is not a server fault. The same strict parsing now answers `400` (or `-32602` on
+MCP) on about a dozen other route families and on MCP `query_audit_log`, and those rejections have
+no counter of their own: after an upgrade, a rise in 4xx on those routes is visible only in the
+generic request metrics.
 
 ## File Logging
 
