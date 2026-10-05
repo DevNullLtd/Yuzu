@@ -564,7 +564,14 @@ runs are marked below.)
   arrives after the breaker has moved on to a later half-open period does not
   change the breaker. Without the probe, held notifications could sit
   indefinitely after the server recovers, because a disconnected session produces
-  no heartbeat to trigger a replay.
+  no heartbeat to trigger a replay. A probe that timed out may still have reached
+  the server, and its notification is sent again after the requeue, so delivery of
+  a probe notification is at least once. OBSERVED on a rig: when the frozen server
+  was resumed after two timed-out probes, the same `DISCONNECTED` reached it three
+  times and the server counted one `deregister` `session_mismatch` and one
+  `unknown_session` for the extra copies, with no error and no change to the
+  final state. Only `DISCONNECTED` was held in that run, so a duplicate of any
+  other event type was not exercised.
 - **Cap.** `notify_pending_max` (default 10000, see "Upstream client tuning")
   bounds the number of held keys, not agents. A notification for a new key that
   arrives when the store is full is dropped and counted in
@@ -593,7 +600,16 @@ answered a real command; in an outage with the breaker open, 10 held
 `DISCONNECTED` notifications waited 55 to 59 s, then exactly one was sent as the
 probe when the breaker went half open, it closed the breaker, and the other 9
 followed in order, with the pending gauge back at 0 within 2 ms of the half open
-transition (four runs).
+transition (five runs, four with simulated and one with real agents plus a
+repeat). With the server kept frozen through the first two half open periods the
+probe failed twice by timeout (the breaker reopened with 120 s and then 240 s
+backoff, and the pending gauge dipped to 9 while the probe was out and returned
+to 10), the third probe closed the breaker, and all 10 held notifications were
+delivered in their original order. For contrast, the previous build dropped all 10
+(`reason="circuit_open"`) in three runs of the same outage, and the server still
+listed the 10 stopped agents as online about 2.6 minutes after the server resumed
+(10 route rows without a lease); the fixed build left none of them online and
+tombstoned their route rows.
 
 ---
 
