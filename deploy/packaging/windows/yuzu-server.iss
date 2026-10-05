@@ -821,7 +821,7 @@ begin
     Result := #13#10#13#10 + 'The Yuzu Server service has been stopped and DISABLED (see above).'
   else if StoppedRunningService then
     Result := #13#10#13#10 + 'The existing Yuzu Server service was stopped and has not been ' +
-              'restarted. It will start again at the next reboot, or run: sc start YuzuServer';
+              'restarted. It will start again at the next reboot, or run: sc.exe start YuzuServer';
 end;
 
 // The operator-facing refusal for a directory that is not, or could not be
@@ -1569,7 +1569,7 @@ begin
         Got := 'The service has been disabled rather than left to run with an old command line.'
       else
         Got := 'The service could NOT be disabled (or is not registered): if it exists, disable ' +
-               'it yourself (sc config YuzuServer start= disabled) until this is fixed.';
+               'it yourself (sc.exe config YuzuServer start= disabled) until this is fixed.';
       Log('CurStepChanged: the YuzuServer service could not be registered, or its command line ' +
           'could not be written and confirmed (security software may have blocked the change). ' +
           Got + ' Setup exits with code 10.');
@@ -1976,7 +1976,7 @@ begin
             Result := Result + ' The old directory could not be put back either: it is now ' +
                       Aside + '. Something else created ' + DataDir + ' in the meantime -- ' +
                       'inspect it. The YuzuServer service has been DISABLED so that it cannot ' +
-                      'start over that directory; re-enable it (sc config YuzuServer start= auto) ' +
+                      'start over that directory; re-enable it (sc.exe config YuzuServer start= auto) ' +
                       'only after moving the old directory back or running the installer again.';
           end;
         end;

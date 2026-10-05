@@ -274,9 +274,10 @@ var
   EnrollmentToken: string;
   NoTLS: Boolean;
   StartService: Boolean;
-  // Set when PrepareToInstall stopped a YuzuAgent service that was running
-  // (sc.exe stop returned 0), so DeinitializeSetup can start it again if the
-  // installation then fails (#5250).
+  // Set when PrepareToInstall took down a YuzuAgent service that was RUNNING
+  // or START_PENDING, so DeinitializeSetup can start it again if the
+  // installation then fails (#5250). Only ever set, never cleared: a second
+  // PrepareToInstall pass finds the service already stopped.
   StoppedRunningService: Boolean;
   // Set at ssPostInstall, which Inno reaches only after every file was
   // installed and the [Run] entries -- including the service start -- ran.
@@ -507,8 +508,16 @@ begin
               'blocked it. ' + Outcome + ' '
   else
     Result := Result + 'Nothing was changed. ';
-  Result := Result + 'The installation has been stopped; the Yuzu Agent service, if ' +
-            'installed, has not been touched.';
+  { StoppedRunningService is set here only on a second pass (Back from the
+    Restart Manager page, then Next): the first pass stopped the service, and
+    DeinitializeSetup starts it again when Setup exits. }
+  if StoppedRunningService then
+    Result := Result + 'The installation has been stopped. The Yuzu Agent service, which ' +
+              'Setup had already stopped, is started again when Setup exits; the Setup ' +
+              'log says whether that worked.'
+  else
+    Result := Result + 'The installation has been stopped; the Yuzu Agent service, if ' +
+              'installed, has not been touched.';
 end;
 
 { Run the PowerShell permission check on CertDir. '' on PASS, otherwise the
@@ -864,10 +873,60 @@ begin
   end;
 end;
 
+{ True when sc.exe query reports the YuzuAgent service in State (STOPPED,
+  STOP_PENDING, START_PENDING or RUNNING). Each program is named by its path
+  in the system directory, never looked up on the search path, which includes
+  Setup's own directory (#5250). The outer pair of quotes is cmd.exe's: /c
+  strips the first and the last quote and runs the rest as written. False when
+  the service does not exist, is in another state, or the query could not run:
+  callers treat that as "not in this state", never as proof of anything. }
+function AgentStateIs(const State: string): Boolean;
+var
+  Ran: Boolean;
+  ResultCode: Integer;
+begin
+  Ran := Exec(ExpandConstant('{sys}\cmd.exe'), '/c ""' + ExpandConstant('{sys}\sc.exe') +
+              '" query YuzuAgent | "' + ExpandConstant('{sys}\find.exe') + '" "' + State +
+              '" >nul"', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  Result := Ran and (ResultCode = 0);
+end;
+
+{ The YuzuAgent service's state as sc.exe query reports it: STOPPED,
+  STOP_PENDING, START_PENDING, RUNNING, or UNKNOWN (no such service, another
+  state, or the query could not run). }
+function AgentServiceState(): string;
+begin
+  if AgentStateIs('STOPPED') then
+    Result := 'STOPPED'
+  else if AgentStateIs('STOP_PENDING') then
+    Result := 'STOP_PENDING'
+  else if AgentStateIs('START_PENDING') then
+    Result := 'START_PENDING'
+  else if AgentStateIs('RUNNING') then
+    Result := 'RUNNING'
+  else
+    Result := 'UNKNOWN';
+end;
+
+{ How an Exec of sc.exe ended, for the log. Exec reports two different things
+  in the same ResultCode: the program's exit code when it ran, and the Windows
+  error from starting it when it did not -- so the two are never labelled the
+  same way (#5250). }
+function ScOutcome(const Ran: Boolean; const Code: Integer): string;
+begin
+  if Ran then
+    Result := 'sc.exe exit code ' + IntToStr(Code)
+  else
+    Result := 'sc.exe could not be run: ' + SysErrorMessage(Code) + ' (error ' +
+              IntToStr(Code) + ')';
+end;
+
 function PrepareToInstall(var NeedsRestart: Boolean): string;
 var
   StopResultCode: Integer;
-  ResultCode: Integer;
+  StopRan: Boolean;
+  PriorState: string;
+  Stopped: Boolean;
   i: Integer;
 begin
   { Establish the OTA trust-anchor directory and prove it, BEFORE any file is
@@ -893,20 +952,48 @@ begin
     eventually reach STOPPED, so it must still poll -- treating every non-zero
     code like "doesn't exist" would silently reproduce the old blind-race
     behavior for exactly the case this fix targets (Gate 3 release-deploy
-    finding, governance re-run). }
-  Exec('sc.exe', 'stop YuzuAgent', '', SW_HIDE, ewWaitUntilTerminated, StopResultCode);
-  { 0 means the stop control was accepted, so the service was running and this
-    run stopped it: if the installation fails from here on, DeinitializeSetup
-    starts it again (#5250). Any other code -- 1060 no such service, 1062 not
-    running, 1061 mid-transition -- is not counted as a running service. }
-  StoppedRunningService := (StopResultCode = 0);
-  if StopResultCode <> 1060 then
+    finding, governance re-run).
+
+    The state is read BEFORE the stop (#5250). A service that is RUNNING or
+    still START_PENDING is one this run takes down, whatever sc.exe stop then
+    returns: it refuses a START_PENDING service with 1061, and a stop control
+    the service does not answer in time gives 1053, so the exit code alone
+    would not count either, and a failed installation would leave the agent
+    stopped. A START_PENDING service is given up to 15s to finish starting and
+    then stopped again, so the file copy does not race a starting agent. }
+  PriorState := AgentServiceState();
+  StopRan := Exec(ExpandConstant('{sys}\sc.exe'), 'stop YuzuAgent', '', SW_HIDE,
+                  ewWaitUntilTerminated, StopResultCode);
+  if (PriorState = 'START_PENDING') and (StopResultCode = 1061) then
   begin
     for i := 1 to 15 do
     begin
-      Exec('cmd.exe', '/c sc query YuzuAgent | find "STOPPED" >nul', '', SW_HIDE,
-           ewWaitUntilTerminated, ResultCode);
-      if ResultCode = 0 then
+      if AgentServiceState() <> 'START_PENDING' then
+        Break;
+      Sleep(1000);
+    end;
+    StopRan := Exec(ExpandConstant('{sys}\sc.exe'), 'stop YuzuAgent', '', SW_HIDE,
+                    ewWaitUntilTerminated, StopResultCode);
+  end;
+  { If the installation fails from here on, DeinitializeSetup starts a service
+    this run took down again (#5250). The flag is only ever SET: Inno runs
+    PrepareToInstall again when the user goes Back from the Restart Manager
+    page and then Next, and by then the service this run stopped answers 1062 (not
+    running) -- clearing the flag there would leave it stopped after a later
+    failure. 1060 (no such service) and 1062 against a service that was
+    already stopped are not counted. }
+  if (StopRan and (StopResultCode = 0)) or (PriorState = 'RUNNING') or
+     (PriorState = 'START_PENDING') then
+    StoppedRunningService := True;
+  Log('PrepareToInstall: YuzuAgent service state before the stop: ' + PriorState + '; ' +
+      ScOutcome(StopRan, StopResultCode) + '.');
+  if StopResultCode <> 1060 then
+  begin
+    Stopped := False;
+    for i := 1 to 15 do
+    begin
+      Stopped := AgentStateIs('STOPPED');
+      if Stopped then
         Break;
       Sleep(1000);
     end;
@@ -919,7 +1006,7 @@ begin
       machine looked identical to a clean upgrade in aggregate reporting. Log it
       so a fleet log-aggregation pipeline (via /LOG=) can flag it (Gate 6 sre
       finding, governance re-run). }
-    if ResultCode <> 0 then
+    if not Stopped then
       Log('PrepareToInstall: prior YuzuAgent service did not reach STOPPED ' +
           'within the 15s poll window; proceeding with install regardless ' +
           '(CloseApplications=force will handle a still-locked executable).');
@@ -940,35 +1027,78 @@ end;
 { An installation that stopped a running agent and then did not complete
   starts it again, so a failed upgrade does not leave the endpoint offline
   until someone runs sc.exe start YuzuAgent or reboots (#5250). DeinitializeSetup
-  runs on every exit, including after a rollback.
+  runs on every exit Setup itself controls, including after a rollback (not
+  when the Setup process is killed from outside).
 
-  The trust-anchor refusal never gets here with StoppedRunningService set: it
-  runs, and aborts, before the service is stopped. What does is a failure
-  during the file copy -- for example a file that cannot be replaced; with
-  /SUPPRESSMSGBOXES Inno answers that error with Abort. Inno's rollback
-  removes only files this run created: a file it had already replaced keeps
-  the new version, so the agent restarted here may run with a mix of old and
-  new files. Restarting is still better than leaving it stopped -- every file
-  is a signed release file -- and the log says to run the installer again.
-  It is started whatever /NOSTART said: /NOSTART governs a completed
-  installation, and this one did not complete. }
+  The trust-anchor refusal on the first pass never gets here with
+  StoppedRunningService set: it runs, and aborts, before the service is
+  stopped. What does is a failure during the file copy -- for example a file
+  that cannot be replaced; with /SUPPRESSMSGBOXES Inno answers that error with
+  Abort (exit code 5). Inno's rollback removes only files this run created: a
+  file it had already replaced keeps the new version, so the agent restarted
+  here may run with a mix of old and new files. Restarting is still better
+  than leaving it stopped -- every file was placed by this or the previous
+  installation in an admin-only directory -- and the log says to run the
+  installer again. It is started whatever /NOSTART said: /NOSTART governs a
+  completed installation, and this one did not complete.
+
+  The log reports only the state sc.exe query OBSERVED, never what sc.exe start
+  returned. sc.exe start against a service that is still STOP_PENDING can
+  return 1056 (already running) while the service goes on to stop, and a start
+  that returns 0 can still fail while the agent starts up. So it first waits
+  (up to 45s) for the stop to finish, then starts the service and waits (up to
+  10s) to see RUNNING; "started again" is logged only when RUNNING was seen. }
 procedure DeinitializeSetup();
 var
-  ResultCode: Integer;
+  State: string;
+  StartRan: Boolean;
+  StartCode: Integer;
+  I: Integer;
 begin
   if StoppedRunningService and not InstallCompleted then
   begin
-    // 1056 = ERROR_SERVICE_ALREADY_RUNNING, which is also the state wanted.
-    if Exec(ExpandConstant('{sys}\sc.exe'), 'start YuzuAgent', '', SW_HIDE,
-            ewWaitUntilTerminated, ResultCode) and ((ResultCode = 0) or (ResultCode = 1056)) then
-      Log('DeinitializeSetup: the installation did not complete. The YuzuAgent service, ' +
-          'which was running before it, has been started again. Files the installation ' +
-          'had already replaced were not put back: run the installer again.')
+    State := AgentServiceState();
+    I := 0;
+    while ((State = 'STOP_PENDING') or (State = 'START_PENDING')) and (I < 45) do
+    begin
+      Sleep(1000);
+      I := I + 1;
+      State := AgentServiceState();
+    end;
+    Log('DeinitializeSetup: YuzuAgent service state before the restart: ' + State +
+        ' (waited ' + IntToStr(I) + 's for a pending stop or start to finish).');
+    StartRan := False;
+    StartCode := 0;
+    if State <> 'RUNNING' then
+    begin
+      StartRan := Exec(ExpandConstant('{sys}\sc.exe'), 'start YuzuAgent', '', SW_HIDE,
+                       ewWaitUntilTerminated, StartCode);
+      Log('DeinitializeSetup: sc.exe start YuzuAgent: ' + ScOutcome(StartRan, StartCode) + '.');
+      for I := 1 to 10 do
+      begin
+        State := AgentServiceState();
+        if State = 'RUNNING' then
+          Break;
+        Sleep(1000);
+      end;
+    end;
+    if State = 'RUNNING' then
+    begin
+      if StartRan then
+        Log('DeinitializeSetup: the installation did not complete. The YuzuAgent service, ' +
+            'which was running before it, has been started again and is RUNNING. Files the ' +
+            'installation had already replaced were not put back: run the installer again.')
+      else
+        Log('DeinitializeSetup: the installation did not complete. The YuzuAgent service, ' +
+            'which was running before it, is RUNNING again; Setup did not have to start it. ' +
+            'Files the installation had already replaced were not put back: run the ' +
+            'installer again.');
+    end
     else
       Log('DeinitializeSetup: the installation did not complete, and the YuzuAgent ' +
-          'service, which was running before it, could NOT be started again (sc.exe exit ' +
-          'code ' + IntToStr(ResultCode) + '). Start it with: sc.exe start YuzuAgent, or ' +
-          'run the installer again.');
+          'service, which was running before it, could NOT be started again: its state ' +
+          'is ' + State + ' after the start (' + ScOutcome(StartRan, StartCode) + '). ' +
+          'Start it with: sc.exe start YuzuAgent, or run the installer again.');
   end;
 end;
 

@@ -153,8 +153,10 @@ cd yuzu-agents\windows-x64\payload
 ```
 Persistent: run `installers\YuzuAgentSetup-<v>.exe` (enter gateway + token on the
 config page), or fully unattended —
-`installers\YuzuAgentSetup-<v>.exe /VERYSILENT /SUPPRESSMSGBOXES /SERVER=<GATEWAY_HOST>:50051 /TOKEN=<TOKEN>`
+`installers\YuzuAgentSetup-<v>.exe /VERYSILENT /SUPPRESSMSGBOXES /SERVER=<GATEWAY_HOST>:50051 /TOKEN=<TOKEN> /LOG=<path>`
 (the installer takes the gateway address as `/SERVER=`, not only the GUI page).
+Keep `/LOG=`: without it Setup writes no log, and the log is the only record of
+why an unattended install failed and what it did about the service.
 Service name `YuzuAgent`.
 If a silent install exits with code **7** and its `/LOG=` log says "The update
 trust-anchor directory is not secured", the installer refused to continue
@@ -179,18 +181,35 @@ A refusal never leaves `agent-certs` less protected than it was: a new directory
 is locked in the installer's private temporary folder and moved into place only
 once it passes the check, so if security software blocks the lock nothing is
 created at the path; an existing directory's own permissions are never changed,
-and the log line says which happened. If an installation fails after the service
-was stopped (for example, a file cannot be replaced), the installer starts the
-service again before it exits; files it had already replaced are not put back, so
-run the installer again. Installers up to 0.14.0 left the service stopped
-(#5250). Installers from
-0.14.0-rc1 to rc5 also hit this wherever PowerShell is restricted to
-Constrained Language Mode -- WDAC script enforcement, or AppLocker script rules
-for an install run by an administrator rather than as SYSTEM (#5196): use a
-later installer. Installers from 0.14.0-rc1 to rc3 also hit this when started from
+and the abort message says which happened.
+
+Installers from 0.14.0-rc1 to rc5 also refuse with code 7 wherever PowerShell
+is restricted to Constrained Language Mode -- WDAC script enforcement, or
+AppLocker script rules for an install run by an administrator rather than as
+SYSTEM (#5196): use a later installer. Installers from 0.14.0-rc1 to rc3 also hit this when started from
 PowerShell 7 through another process (#5176): run them from a new
 `powershell.exe` or `cmd.exe` window that was not itself started from
 PowerShell 7, or use a later installer.
+
+If an upgrade fails after the installer has stopped the agent service -- for
+example a file in the program directory cannot be replaced, which a
+`/SUPPRESSMSGBOXES` install answers with Abort -- Setup exits with code **5**.
+If the `YuzuAgent` service was running, or still starting, when the upgrade
+began, Setup starts it again before it exits. It does so even when `/NOSTART`
+was given: `/NOSTART` applies only to an installation that completed. The log
+records the outcome on its `DeinitializeSetup:` lines. "has been started again
+and is RUNNING" (or "is RUNNING again; Setup did not have to start it") means the
+agent is back up. "could NOT be started again" gives the state Setup saw and
+sc.exe's exit code: start the service with `sc.exe start YuzuAgent` (in
+PowerShell, plain `sc` is Set-Content), check
+`C:\Program Files\Yuzu\logs\yuzu-agent.log` if that fails too, or run the
+installer again. Setup reports only a state it observed: it waits up to 45
+seconds for a slow stop to finish and up to 10 seconds to see the service
+running. Either way, the files the failed installation had already replaced are
+not put back, so the agent may be running a mix of old and new files until you
+run the installer again. A service that was already stopped before the upgrade
+stays stopped. Installers up to 0.14.0 left the service stopped after a failed
+upgrade (#5250).
 
 Uninstall: `"C:\Program Files\Yuzu\unins000.exe" /VERYSILENT /SUPPRESSMSGBOXES`
 (add `/LOG=<path>` to keep a log; if the agent was installed to another
