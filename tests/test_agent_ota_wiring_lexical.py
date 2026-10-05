@@ -59,23 +59,15 @@ def normalise(src):
     return re.sub(r"[ \t\n\r\f\v]+", " ", re.sub(r"//.*", "", src))
 
 
-def count(t, pat):
-    # finditer, not findall: the heartbeat pattern has a capture group.
-    return sum(1 for _ in re.finditer(pat, t))
-
-
 def problems(src):
     """One message per violated invariant, in the bash gate's check() order; [] when clean."""
     t = normalise(src)
     out = []
 
-    def bad(msg):
-        out.append(msg + HINT)
-
-    if count(t, r"update_thread_\.stop_and_join\( ?updater\(\) ?\)") < 1:
-        bad("agent.cpp no longer calls update_thread_.stop_and_join(updater()) in the reconnect teardown (#2182)")
-    if count(t, r"update_thread_\.start\(") < 1:
-        bad("agent.cpp no longer starts the update thread via update_thread_.start( (#2182)")
+    if len(re.findall(r"update_thread_\.stop_and_join\( ?updater\(\) ?\)", t)) < 1:
+        out.append("agent.cpp no longer calls update_thread_.stop_and_join(updater()) in the reconnect teardown (#2182)")
+    if len(re.findall(r"update_thread_\.start\(", t)) < 1:
+        out.append("agent.cpp no longer starts the update thread via update_thread_.start( (#2182)")
 
     for name, ctxm in (
         ("hb_slot", "heartbeat_ctx_"),
@@ -84,29 +76,29 @@ def problems(src):
         ("sync_slot", "sync_ctx_"),
     ):
         if not re.search("CtxSlot " + name + r" ?\{ ?ctx_mu_, ?" + ctxm + r", ?&[a-z_]*ctx, ?[^}]", t):
-            bad(f"{name} is no longer built with CtxSlot's predicate constructor "
-                f"(CtxSlot {name}{{ctx_mu_, {ctxm}, &ctx, <stop predicate>}}) (#2182)")
+            out.append(f"{name} is no longer built with CtxSlot's predicate constructor "
+                       f"(CtxSlot {name}{{ctx_mu_, {ctxm}, &ctx, <stop predicate>}}) (#2182)")
         if not re.search("CtxSlot " + name + r" ?\{.*if \(" + name + r"\.stop_seen\(\)\) ?(break|return)", t):
-            bad(f"{name}.stop_seen() no longer gates a break/return after publishing (#2182)")
+            out.append(f"{name}.stop_seen() no longer gates a break/return after publishing (#2182)")
 
-    if count(t, r"heartbeat_stop_\.store\(true, ?std::memory_order_release\); ?"
-                r"(if \(auto u = updater\(\)\) u->stop\(\); ?)?cancel_ctx\(heartbeat_ctx_\);") < 2:
-        bad("expected heartbeat_stop_.store(true) immediately followed by cancel_ctx(heartbeat_ctx_) "
-            "at both the reconnect teardown and quiesce_run_workers (#2182)")
-    if count(t, r"sync_stop_\.store\(true, ?std::memory_order_release\); ?cancel_ctx\(sync_ctx_\);") < 2:
-        bad("expected sync_stop_.store(true) immediately followed by cancel_ctx(sync_ctx_) "
-            "at both the reconnect teardown and quiesce_run_workers (#2182)")
+    if len(re.findall(r"heartbeat_stop_\.store\(true, ?std::memory_order_release\); ?"
+                     r"(if \(auto u = updater\(\)\) u->stop\(\); ?)?cancel_ctx\(heartbeat_ctx_\);", t)) < 2:
+        out.append("expected heartbeat_stop_.store(true) immediately followed by cancel_ctx(heartbeat_ctx_) "
+                   "at both the reconnect teardown and quiesce_run_workers (#2182)")
+    if len(re.findall(r"sync_stop_\.store\(true, ?std::memory_order_release\); ?cancel_ctx\(sync_ctx_\);", t)) < 2:
+        out.append("expected sync_stop_.store(true) immediately followed by cancel_ctx(sync_ctx_) "
+                   "at both the reconnect teardown and quiesce_run_workers (#2182)")
     # The gap between the function head and the heartbeat store is [^}]* (no closing brace), so
     # the match cannot run past the function's first inner block into another copy of the sequence.
     if not re.search(r"quiesce_run_workers\(\) noexcept \{[^}]*heartbeat_stop_\.store\(true, ?std::memory_order_release\); ?"
                      r"if \(auto u = updater\(\)\) ?u->stop\(\); ?cancel_ctx\(heartbeat_ctx_\);", t):
-        bad("quiesce_run_workers() no longer calls u->stop() between heartbeat_stop_.store(true) "
-            "and cancel_ctx(heartbeat_ctx_) (#2182)")
+        out.append("quiesce_run_workers() no longer calls u->stop() between heartbeat_stop_.store(true) "
+                   "and cancel_ctx(heartbeat_ctx_) (#2182)")
     if not re.search(r"cancel_ctx\(sync_ctx_\); ?if \(sync_thread_\.joinable\(\)\) ?\{? ?sync_thread_\.join\(\); ?\}? ?"
                      r"update_thread_\.join\(\); ?\}", t):
-        bad("quiesce_run_workers() no longer ends with update_thread_.join() after the sync thread join (#2182)")
+        out.append("quiesce_run_workers() no longer ends with update_thread_.join() after the sync thread join (#2182)")
     if not re.search(r"cancel_ctx\(heartbeat_ctx_\); ?cancel_ctx\(sync_ctx_\); ?cancel_ctx\(register_ctx_\);", t):
-        bad("stop() no longer cancels heartbeat, sync and register contexts in sequence (#2182)")
+        out.append("stop() no longer cancels heartbeat, sync and register contexts in sequence (#2182)")
     return out
 
 
@@ -157,7 +149,7 @@ class AgentOtaWiringLexical(unittest.TestCase):
     def test_source_is_clean(self):
         p = problems(self.raw)
         for m in p:
-            print(f"::error::{TAG}: {m}", file=sys.stderr)
+            print(f"::error::{TAG}: {m}{HINT}", file=sys.stderr)
         self.assertEqual(p, [])
 
     def test_mutations_are_caught(self):

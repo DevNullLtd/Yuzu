@@ -38,9 +38,6 @@ Static/text-only, no build required -- a lexical gate, not a semantic one: it ca
 relocation that keeps the same tokens but changes the surrounding control flow (review-enforced).
 Line numbers are 1-based and comment lines count (no normalisation).
 
-Why Python: this replaces a bash gate that forked a grep/head/tail/cut pipeline per check; one
-process is cheaper on every OS, notably under MSYS2 on the Windows CI leg (#5428).
-
 Usage: python3 tests/test_log_handoff_wiring_lexical.py
 """
 import sys
@@ -138,10 +135,6 @@ DONE_GUARD = "    yuzu::agent::SemaphoreReleaseGuard done_guard{g_service_main_d
 F3_DRAIN = "                    yuzu::agent::drain_log_bounded(std::chrono::milliseconds{200});\n"
 
 
-def _once(test, src, anchor):
-    test.assertEqual(src.count(anchor), 1, f"mutation anchor not unique: {anchor!r}")
-
-
 class LogHandoffWiringLexical(unittest.TestCase):
     def setUp(self):
         self.main = MAIN_CPP.read_text(encoding="utf-8")
@@ -156,9 +149,9 @@ class LogHandoffWiringLexical(unittest.TestCase):
     def test_mutations_are_caught(self):
         main, win = self.main, self.win
         for a in (EPILOGUE, MAKE_AGENT):
-            _once(self, main, a)
+            self.assertEqual(main.count(a), 1, f"mutation anchor not unique: {a!r}")
         for a in (DONE_GUARD, F3_DRAIN):
-            _once(self, win, a)
+            self.assertEqual(win.count(a), 1, f"mutation anchor not unique: {a!r}")
         # L5: the guard moves to just after the first `try {` line following service_main.
         sm = win.index("void WINAPI service_main(")
         l5 = win.replace(DONE_GUARD, "", 1)  # the guard precedes the try, so removal shifts it

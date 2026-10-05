@@ -40,9 +40,6 @@ Lines are counted as grep -c did: split on "\\n", one count per line, never str.
 is read with universal newlines, so a CRLF checkout is matched the same as LF (more lenient than
 grep's `$` anchor was; all sources are LF today).
 
-Why Python: this replaces a bash gate; one process is cheaper on every OS, notably under MSYS2
-on the Windows CI leg (#5428).
-
 Usage: python3 tests/test_tier_policy_wiring_lexical.py
 """
 import re
@@ -101,32 +98,28 @@ class TierPolicyWiringLexical(unittest.TestCase):
         src = self.src
         for a in (DESIGNATED_LINE, POSITIONAL_LINE):
             self.assertEqual(src.count(a), 1, f"mutation anchor not unique: {a!r}")
-        indent_d = DESIGNATED_LINE[: len(DESIGNATED_LINE) - len(DESIGNATED_LINE.lstrip())]
-        indent_p = POSITIONAL_LINE[: len(POSITIONAL_LINE) - len(POSITIONAL_LINE.lstrip())]
-        # (name, mutated source, clause fragments that must all appear, fragments that must be absent)
+        # (name, mutated source, the clause fragments that must appear; len(p) pins that no other clause fires)
         cases = [
             ("T1 designated reverted to a lambda",
-             src.replace(DESIGNATED_LINE, f"{indent_d}.tier_policy_fn = {LAMBDA},\n", 1),
-             ["designated-init", "EXACTLY TWICE"], ["positional-arg"]),
+             src.replace(DESIGNATED_LINE, DESIGNATED_LINE.replace(CALL, LAMBDA), 1),
+             ["designated-init", "EXACTLY TWICE"]),
             ("T2 designated line commented out (anchoring proof: clause 1 only)",
              src.replace(DESIGNATED_LINE, "// " + DESIGNATED_LINE, 1),
-             ["designated-init"], ["positional-arg", "EXACTLY TWICE"]),
+             ["designated-init"]),
             ("T3 positional reverted to a lambda",
-             src.replace(POSITIONAL_LINE, f"{indent_p}{LAMBDA});\n", 1),
-             ["positional-arg", "EXACTLY TWICE"], ["designated-init"]),
+             src.replace(POSITIONAL_LINE, POSITIONAL_LINE.replace(CALL, LAMBDA), 1),
+             ["positional-arg", "EXACTLY TWICE"]),
             ("T4 third call appended (clause 3 only)",
              src + "    auth_routes_->gateless_tier_policy_fn();\n",
-             ["EXACTLY TWICE"], ["designated-init", "positional-arg"]),
+             ["EXACTLY TWICE"]),
         ]
-        for name, mutated, present, absent in cases:
+        for name, mutated, present in cases:
             with self.subTest(mutation=name):
                 p = problems(mutated)
                 self.assertTrue(p, "mutation was NOT detected by the gate")
                 joined = "\n".join(p)
                 for frag in present:
                     self.assertIn(frag, joined)
-                for frag in absent:
-                    self.assertNotIn(frag, joined)
                 self.assertEqual(len(p), len(present))
 
 
