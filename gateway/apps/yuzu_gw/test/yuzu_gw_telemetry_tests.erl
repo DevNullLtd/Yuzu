@@ -385,3 +385,67 @@ verdict_families_test_() ->
            ?assertEqual(7, prometheus_gauge:value(yuzu_gw_registration_replay_queue_depth, [node()]))
        end}
      ]}.
+
+%% #4632: the notify pending store's gauges and the coalesced counter. Same
+%% blind spot as notify_dropped above: the producer's own tests mock telemetry,
+%% so only a real telemetry:execute through the real attached handler can see a
+%% missing ?EVENTS entry, handler clause or declaration. The series are removed
+%% before setup() so "exists at 0" proves the pre-seed, not an earlier test's
+%% increment (the registry is shared across test modules in one VM).
+notify_queue_families_test_() ->
+    {setup,
+     fun() ->
+        {ok, S1} = application:ensure_all_started(prometheus),
+        {ok, S2} = application:ensure_all_started(telemetry),
+        catch telemetry:detach(yuzu_gw_prometheus),
+        catch prometheus_gauge:remove(yuzu_gw_upstream_notify_pending, [node()]),
+        catch prometheus_gauge:remove(yuzu_gw_upstream_notify_inflight, [node()]),
+        catch prometheus_counter:remove(yuzu_gw_upstream_notify_coalesced_total, []),
+        catch prometheus_counter:remove(yuzu_gw_upstream_notify_dropped_total,
+                                        [<<"at_capacity">>]),
+        ok = yuzu_gw_telemetry:setup(),
+        S1 ++ S2
+     end,
+     fun(_) -> catch telemetry:detach(yuzu_gw_prometheus) end,
+     [
+      {"every notify series exists at 0 straight after setup",
+       fun() ->
+           ?assertEqual(0, prometheus_gauge:value(yuzu_gw_upstream_notify_pending, [node()])),
+           ?assertEqual(0, prometheus_gauge:value(yuzu_gw_upstream_notify_inflight, [node()])),
+           ?assertEqual(0, prometheus_counter:value(yuzu_gw_upstream_notify_coalesced_total, [])),
+           ?assertEqual(0, prometheus_counter:value(yuzu_gw_upstream_notify_dropped_total,
+                                                    [<<"at_capacity">>]))
+       end},
+      {"a notify_queue event sets both gauges and a later zero event returns them to 0",
+       fun() ->
+           telemetry:execute([yuzu, gw, upstream, notify_queue],
+                             #{pending => 3, inflight => 7}, #{}),
+           ?assertEqual(3, prometheus_gauge:value(yuzu_gw_upstream_notify_pending, [node()])),
+           ?assertEqual(7, prometheus_gauge:value(yuzu_gw_upstream_notify_inflight, [node()])),
+           telemetry:execute([yuzu, gw, upstream, notify_queue],
+                             #{pending => 0, inflight => 0}, #{}),
+           ?assertEqual(0, prometheus_gauge:value(yuzu_gw_upstream_notify_pending, [node()])),
+           ?assertEqual(0, prometheus_gauge:value(yuzu_gw_upstream_notify_inflight, [node()]))
+       end},
+      {"a notify_coalesced event increments the unlabelled counter",
+       fun() ->
+           C0 = prometheus_counter:value(yuzu_gw_upstream_notify_coalesced_total, []),
+           telemetry:execute([yuzu, gw, upstream, notify_coalesced], #{count => 1}, #{}),
+           ?assertEqual(C0 + 1,
+                        prometheus_counter:value(yuzu_gw_upstream_notify_coalesced_total, []))
+       end},
+      {"the scrape renders every notify family with its HELP line and series",
+       fun() ->
+           Out = prometheus_text_format:format(),
+           Node = atom_to_binary(node(), utf8),
+           [?assertNotEqual(nomatch, binary:match(Out, Part))
+            || Part <- [<<"# HELP yuzu_gw_upstream_notify_pending ">>,
+                        <<"# HELP yuzu_gw_upstream_notify_inflight ">>,
+                        <<"# HELP yuzu_gw_upstream_notify_coalesced_total ">>,
+                        <<"# HELP yuzu_gw_upstream_notify_dropped_total ">>,
+                        <<"yuzu_gw_upstream_notify_pending{node=\"", Node/binary, "\"} ">>,
+                        <<"yuzu_gw_upstream_notify_inflight{node=\"", Node/binary, "\"} ">>,
+                        <<"yuzu_gw_upstream_notify_coalesced_total ">>,
+                        <<"yuzu_gw_upstream_notify_dropped_total{reason=\"at_capacity\"} ">>]]
+       end}
+     ]}.
