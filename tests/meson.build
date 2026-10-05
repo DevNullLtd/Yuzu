@@ -3066,18 +3066,16 @@ if _bash_test.found() and meson.can_run_host_binaries() and build_agent
   )
 endif
 
-# #4666 PR-2 W3a: static lexical gate over main.cpp's log-handoff wiring call sites (the
-# four textual invariants agent_log_wiring.hpp's/log_handoff.hpp's own header banners
-# describe -- see the script's own header). No build required, so gated only on bash
-# being present, same as the other lexical selftests above.
-if _bash_test.found()
-  test('log handoff wiring lexical gate (#4666 PR-2 W3a)',
-    _bash_test,
-    args: [files('shell/test_log_handoff_wiring_lexical.sh')],
-    suite: 'agent',
-    timeout: 60,
-  )
-endif
+# #4666 PR-2 W3a: static lexical gate over main.cpp's and service_win.cpp's log-handoff
+# wiring call sites (see the script's own header). No build required. Python, not bash:
+# one process on every OS instead of a grep/head/tail pipeline per check (#5428). Never
+# raise the budget -- port, split or host-gate instead.
+test('log handoff wiring lexical gate (#4666 PR-2 W3a)',
+  _python3_test,
+  args: [files('test_log_handoff_wiring_lexical.py')],
+  suite: 'agent',
+  timeout: 30,
+)
 
 # #2182: static lexical gate pinning that agent.cpp still CALLS the tested OtaUpdateThread /
 # CtxSlot stop_seen() primitives (no AgentImpl seam exists to test that, #1492) and keeps the
