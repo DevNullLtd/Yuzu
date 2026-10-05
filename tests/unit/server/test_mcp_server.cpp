@@ -11412,6 +11412,83 @@ TEST_CASE("MCP summarize_working_set execution: a status-read degrade under a co
         CHECK(a != "mcp.summarize_working_set|denied");
 }
 
+// Parity of BACKING READS: a confined caller's absent id must do the same status read as a
+// hidden id. The tracker has no counting seam, so parity is observed through a fault: break
+// ONLY the status read and both an absent id and a hidden id must surface the same degrade
+// error. A handler that skipped the status read for an absent id would answer "was not found"
+// for it, which is both an existence oracle (timing/fault differential) and a behavioural fork.
+TEST_CASE("MCP summarize_working_set execution: a confined absent id performs the same status "
+          "read as a hidden id (#3564 #3526)",
+          "[pg][mcp][integration][agentic-demo][scope][4753][notfound]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    yuzu::server::ExecutionTracker& tracker = *tracker_bundle;
+    const auto hidden_id = seed_summarize_exec(tracker, "alice", {{"agent-out", "failure"}});
+    const std::string missing_id = "exec-does-not-exist-parity-3526";
+
+    McpTestServer ts;
+    ts.execution_tracker_for_test = &tracker;
+    ts.fleet_read_fn_for_test = [](const httplib::Request&, httplib::Response&,
+                                   const std::string&,
+                                   const std::string&) -> yuzu::server::authz::FleetReadGate {
+        return {true, yuzu::server::authz::VisibleSet{std::unordered_set<std::string>{"agent-in"}}};
+    };
+    ts.mock_username = "bob";
+    ts.start("operator");
+    exec_tracker_ddl(tracker_bundle.dsn(),
+                     "ALTER TABLE execution_tracker.agent_exec_status RENAME COLUMN "
+                     "plugin_result_status TO plugin_result_status_hidden");
+    auto hidden = ts.call(summarize_exec_call_body(hidden_id));
+    auto missing = ts.call(summarize_exec_call_body(missing_id));
+    exec_tracker_ddl(tracker_bundle.dsn(),
+                     "ALTER TABLE execution_tracker.agent_exec_status RENAME COLUMN "
+                     "plugin_result_status_hidden TO plugin_result_status");
+    REQUIRE(hidden);
+    REQUIRE(missing);
+    for (const auto* r : {&hidden, &missing}) {
+        auto body = nlohmann::json::parse((*r)->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+        CHECK(body["error"]["data"]["retry_after_ms"].get<int64_t>() ==
+              yuzu::server::mcp::kMcpStoreFaultRetryMs);
+        CHECK((*r)->body.find("was not found") == std::string::npos);
+    }
+    for (const auto& a : ts.audit_log)
+        CHECK(a != "mcp.summarize_working_set|denied");
+}
+
+// Pins the success audit row (verb, result, target, exact detail) for a visible execution and
+// for an UNCONFINED absent id (the pre-existing `success` row; a83148630 deliberately keeps it).
+TEST_CASE("MCP summarize_working_set execution: success audit rows are pinned exactly (#4753)",
+          "[pg][mcp][integration][agentic-demo][scope][4753]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    yuzu::server::ExecutionTracker& tracker = *tracker_bundle;
+    const auto exec_id = seed_summarize_exec(tracker, "operator", {{"agent-in", "success"}});
+    const std::string absent_id = "exec-absent-audit-pin-4753";
+
+    McpTestServer ts;
+    ts.execution_tracker_for_test = &tracker;
+    ts.start("operator");
+    auto visible = ts.call(summarize_exec_call_body(exec_id));
+    auto absent = ts.call(summarize_exec_call_body(absent_id));
+    REQUIRE(visible);
+    REQUIRE(absent);
+    CHECK(narrative_of(visible->body).find("Execution " + exec_id + " is running") == 0);
+    CHECK(narrative_of(absent->body) == "Execution " + absent_id + " was not found.");
+
+    REQUIRE(ts.audit_log.size() == 2);
+    REQUIRE(ts.audit_details.size() == 2);
+    REQUIRE(ts.audit_target_ids.size() == 2);
+    REQUIRE(ts.audit_target_types.size() == 2);
+    CHECK(ts.audit_log[0] == "mcp.summarize_working_set|success");
+    CHECK(ts.audit_details[0] == "execution:" + exec_id);
+    CHECK(ts.audit_target_ids[0] == "summarize_working_set");
+    CHECK(ts.audit_target_types[0] == "mcp_tool");
+    CHECK(ts.audit_log[1] == "mcp.summarize_working_set|success");
+    CHECK(ts.audit_details[1] == "execution:" + absent_id);
+    CHECK(ts.audit_target_ids[1] == "summarize_working_set");
+    CHECK(ts.audit_target_types[1] == "mcp_tool");
+}
+
 // ServiceScopeClass for summarize_working_set stays the default `denied`: kind=agent and
 // kind=fleet have no mechanism on the service-scope axis, and `confined` needs a real
 // downstream mechanism for EVERY kind (routed row clause 3), so migrating kind=execution's

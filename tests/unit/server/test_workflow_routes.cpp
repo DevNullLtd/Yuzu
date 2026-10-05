@@ -1272,7 +1272,7 @@ TEST_CASE("executions list: perm_fn is not a second gate on the (Execution Read)
     CHECK(res->body.find("SoleGate") != std::string::npos);
 }
 
-TEST_CASE("executions list: unwired fleet_read_fn renders a 200 degrade note, fails closed",
+TEST_CASE("executions list: unwired fleet_read_fn renders a 200 degrade note and fails closed",
           "[pg][workflow][executions][list][rbac]") {
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
@@ -1451,7 +1451,7 @@ TEST_CASE("executions list: 60 newer invisible rows do not starve an older visib
     CHECK(std::find(open_ids.begin(), open_ids.end(), visible) == open_ids.end());
 }
 
-TEST_CASE("executions list: a tracker degrade is a 200 degrade note, never 'No executions yet'",
+TEST_CASE("executions list: a tracker degrade is a 200 degrade note and never reads as no executions",
           "[pg][workflow][executions][list][confinement]") {
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
@@ -1555,6 +1555,103 @@ TEST_CASE("executions list: full-cover scope renders the same bytes as unconfine
     CHECK(open_res->status == 200);
     CHECK(confined->body == open_res->body);
     CHECK(served_ids(open_res->body).size() == 2);
+}
+
+// Item: the confined branch must still honour ?definition_id= (the filter runs in the same
+// SQL as the scope predicate; dropping it from the confined branch serves other definitions).
+TEST_CASE("executions list: confined scope combined with a definition_id filter serves the exact set",
+          "[pg][workflow][executions][list][confinement]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
+    h.make_def("def-fa", "FilterA");
+    h.make_def("def-fb", "FilterB");
+    // In scope, requested definition.
+    auto a_in = h.make_exec("def-fa", "completed", 1, 1, 0, 1735689600, "carol");
+    h.agent_status(a_in, "agent-in", "success");
+    // In scope, a DIFFERENT definition: must not appear under the filter.
+    auto b_in = h.make_exec("def-fb", "completed", 1, 1, 0, 1735689601, "carol");
+    h.agent_status(b_in, "agent-in", "success");
+    // Out of scope, requested definition, someone else's: must not appear.
+    auto a_out = h.make_exec("def-fa", "completed", 1, 0, 1, 1735689602, "carol");
+    h.agent_status(a_out, "agent-out", "failure", 1, "SECRET-OUT-ERR-FILTER", 1735689670);
+    // Caller-owned, requested definition, every agent out of scope: visible via ownership.
+    auto a_own = h.make_exec("def-fa", "completed", 1, 0, 1, 1735689603, "tester");
+    h.agent_status(a_own, "agent-out", "failure", 1, "SECRET-OUT-ERR-FILTER-OWN", 1735689671);
+
+    h.fleet_read_scope = VS{std::unordered_set<std::string>{"agent-in"}};
+    auto res = h.sink.Get("/fragments/executions?definition_id=def-fa");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto ids = served_ids(res->body);
+    std::sort(ids.begin(), ids.end());
+    std::vector<std::string> want{a_in, a_own};
+    std::sort(want.begin(), want.end());
+    CHECK(ids == want);
+    CHECK(std::find(ids.begin(), ids.end(), b_in) == ids.end());
+    CHECK(std::find(ids.begin(), ids.end(), a_out) == ids.end());
+    CHECK(res->body.find("SECRET-OUT") == std::string::npos);
+
+    // Control: without the filter the other in-scope definition is served too.
+    auto all = h.sink.Get("/fragments/executions");
+    REQUIRE(all);
+    auto all_ids = served_ids(all->body);
+    CHECK(std::find(all_ids.begin(), all_ids.end(), b_in) != all_ids.end());
+}
+
+// HTML escaping on every attacker-influenced slot of the list fragment: the error detail
+// (title= attribute AND inline preview), dispatched_by, and the definition name. All three
+// values originate off-server (agent error text, a principal name, a definition's name).
+namespace {
+const std::string kXssPayload = "\"><script>alert(1)</script> & '";
+const std::string kXssEscaped = "&quot;&gt;&lt;script&gt;alert(1)&lt;/script&gt; &amp; &#39;";
+
+void check_list_body_escaped(const std::string& body) {
+    // No raw script element anywhere, and no attribute break-out sequence.
+    CHECK(body.find("<script") == std::string::npos);
+    CHECK(body.find("\"><script") == std::string::npos);
+    CHECK(body.find("alert(1)</script>") == std::string::npos);
+    // title= attribute carries the escaped error detail whole.
+    CHECK(body.find("title=\"" + kXssEscaped + "\"") != std::string::npos);
+    // The definition-name cell and the dispatched-by cell carry the escaped forms.
+    CHECK(body.find(">" + kXssEscaped + "</span>") != std::string::npos);
+    CHECK(body.find("<td>" + kXssEscaped + "</td>") != std::string::npos);
+}
+} // namespace
+
+TEST_CASE("executions list: markup in error detail and dispatched_by and definition name is escaped "
+          "for an unconfined caller",
+          "[pg][workflow][executions][list][xss]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
+    h.make_def("def-xss-list", kXssPayload);
+    auto eid = h.make_exec("def-xss-list", "completed", 1, 0, 1, 1735689600, kXssPayload);
+    h.agent_status(eid, "agent-in", "failure", 1, kXssPayload, 1735689650);
+
+    auto res = h.sink.Get("/fragments/executions");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(served_ids(res->body).size() == 1);
+    check_list_body_escaped(res->body);
+}
+
+TEST_CASE("executions list: markup in error detail and dispatched_by and definition name is escaped "
+          "for a confined caller",
+          "[pg][workflow][executions][list][confinement][xss]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
+    h.make_def("def-xss-list", kXssPayload);
+    auto eid = h.make_exec("def-xss-list", "completed", 1, 0, 1, 1735689600, kXssPayload);
+    h.agent_status(eid, "agent-in", "failure", 1, kXssPayload, 1735689650);
+
+    h.fleet_read_scope = VS{std::unordered_set<std::string>{"agent-in"}};
+    auto res = h.sink.Get("/fragments/executions");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(served_ids(res->body).size() == 1);
+    check_list_body_escaped(res->body);
 }
 
 // ── UP-1 / qa-S1: agent_id with single-quote does not produce JS injection ─
