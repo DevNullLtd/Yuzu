@@ -188,11 +188,18 @@ TEST_CASE("mgmt_posture plugin: status row first, fixed row order, rc 0 on the h
         CHECK(result.result_status == YUZU_RESULT_STATUS_OK);
         CHECK(result.result_completeness == YUZU_RESULT_COMPLETENESS_FULL);
     } else {
-        // Runner refused (e.g. a sandbox): constrained, no data rows, never an empty success.
-        CHECK(starts_with(rows[0], "status|posture|constrained|"));
+        // Runner refused (e.g. a sandbox): no data rows, never an empty success. A tool that
+        // could not be started is `unsupported` (UNAVAILABLE/UNKNOWN); any other runner
+        // failure, a bad exit or an unrecognised output is `constrained` (CONSTRAINED/PARTIAL).
         CHECK(rows.size() == 1);
-        CHECK(result.result_status == YUZU_RESULT_STATUS_CONSTRAINED);
-        CHECK(result.result_completeness == YUZU_RESULT_COMPLETENESS_PARTIAL);
+        if (starts_with(rows[0], "status|posture|unsupported|subprocess_runner:spawn_error")) {
+            CHECK(result.result_status == YUZU_RESULT_STATUS_UNAVAILABLE);
+            CHECK(result.result_completeness == YUZU_RESULT_COMPLETENESS_UNKNOWN);
+        } else {
+            CHECK(starts_with(rows[0], "status|posture|constrained|"));
+            CHECK(result.result_status == YUZU_RESULT_STATUS_CONSTRAINED);
+            CHECK(result.result_completeness == YUZU_RESULT_COMPLETENESS_PARTIAL);
+        }
     }
 #else
     // Linux: supported, constrained or permission_denied (an unprivileged run over a

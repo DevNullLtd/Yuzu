@@ -154,6 +154,20 @@ TEST_CASE("mgmt_posture: no domains key activates only enabled = true domains", 
 
     // Control: with the key present and the domain unlisted the plane is none.
     CHECK(plane_of("[sssd]\ndomains = other\n[domain/corp]\nid_provider=ad\n") == Plane::none);
+
+    // With no domains key, `enabled` is the only way a domain activates, so its parsing is
+    // pinned: the spelling is case-insensitive, and anything but true/false is not "true".
+    const auto cased = facts("[sssd]\n[domain/a]\nid_provider=ad\nenabled = True\n"
+                             "[domain/b]\nid_provider=ipa\nenabled = TRUE\n");
+    CHECK(cased.active_domains == std::vector<std::string>{"a", "b"});
+    CHECK(plane_of("[sssd]\n[domain/a]\nid_provider=ad\nenabled = yes\n") == Plane::none);
+
+    // An empty domains value is still a present key (no no_domains_key token); like the
+    // absent key it activates only enabled = true domains.
+    const auto blank = facts("[sssd]\ndomains =\n[domain/a]\nid_provider=ad\n"
+                             "[domain/b]\nid_provider=ipa\nenabled = true\n");
+    CHECK(blank.domains_key_present);
+    CHECK(blank.active_domains == std::vector<std::string>{"b"});
 }
 
 // `/` is forbidden in a domain name (sssd.conf(5)); [domain/forest/sub] is the trusted-subdomain

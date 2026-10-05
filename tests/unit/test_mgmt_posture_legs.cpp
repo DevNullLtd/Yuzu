@@ -281,6 +281,22 @@ TEST_CASE("L9 sssd.conf without [sssd] domains is constrained, rows kept", "[mgm
     CHECK(p.rows.size() == 5);
 }
 
+TEST_CASE("L9c a no-domains-key sssd.conf reports plane none unless a domain is enabled = true",
+          "[mgmt_posture]") {
+    // The operator-visible half of the sssd_facts fix: an AD domain that is declared but
+    // neither listed nor enabled is not the plane, and the file is still flagged.
+    FakeFs f;
+    f.files[kSssdConf] = ok("[sssd]\nservices = nss\n[domain/corp]\nid_provider = ad\n");
+    const auto declared = f.run();
+    expect(declared, StatusState::constrained, "linux:mgmt_posture:sssd_conf:no_domains_key");
+    CHECK(has(declared, "plane|none"));
+
+    f.files[kSssdConf] = ok("[sssd]\n[domain/corp]\nid_provider = ad\nenabled = true\n");
+    const auto enabled = f.run();
+    expect(enabled, StatusState::constrained, "linux:mgmt_posture:sssd_conf:no_domains_key");
+    CHECK(has(enabled, "plane|ad"));
+}
+
 TEST_CASE("L9b an sssd.conf with an embedded NUL is constrained, never a clean none",
           "[mgmt_posture]") {
     // MUTATION: dropping the NUL check reports `supported` + `plane|none` for a corrupt file.
