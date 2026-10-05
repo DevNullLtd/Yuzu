@@ -149,38 +149,45 @@ Prebuilt artifacts are published with every tagged release. If you just want to 
   - `ghcr.io/devnullltd/yuzu-server:<version>`
   - `ghcr.io/devnullltd/yuzu-agent-chisel:<version>`
   - `ghcr.io/devnullltd/yuzu-gateway:<version>`
-- **Docker Compose** quickstart: [`deploy/docker/docker-compose.reference.yml`](deploy/docker/docker-compose.reference.yml) pulls the released `yuzu-server` and `yuzu-postgres` images at the tag in `YUZU_VERSION`. On first boot the server generates its own certificate authority and serves the dashboard over HTTPS on port 8443. Server state, the certificate authority and the secrets key (`/etc/yuzu/certs`) are kept in named volumes. You need Docker Compose v2, `curl`, `openssl` and `python3`.
+- **Docker Compose** quickstart: an evaluation stack for one Docker host, not a production install (for production, read [Server administration](docs/user-manual/server-admin.md) and [Security hardening](docs/user-manual/security-hardening.md)). It downloads [`deploy/docker/docker-compose.reference.yml`](deploy/docker/docker-compose.reference.yml) from the release tag, which pulls the released `yuzu-server` and `yuzu-postgres` images at the tag in `YUZU_VERSION`. On first start the server creates its own certificate authority and serves the dashboard and REST API over HTTPS on port 8443. Server data, the certificate authority and the secrets key (`/etc/yuzu/certs`) are kept in named volumes. You need bash or zsh on Linux, macOS or WSL2, Docker Compose v2.1.1 or later, `curl`, `openssl` and `python3`. Run one install per Docker host: the Compose project name, and so the volume names, is the directory name, and the containers have fixed names.
+
+Step 1 creates a `yuzu` directory, downloads the compose file into it and writes `.env` with the release and two different Postgres passwords. It stops if `yuzu` already exists and never overwrites a file, so pasting it again cannot replace your passwords.
 
 ```bash
-mkdir yuzu && cd yuzu
-curl -fsSL https://raw.githubusercontent.com/DevNullLtd/Yuzu/main/deploy/docker/docker-compose.reference.yml -o docker-compose.yml
-
-# 1. The release to run, and two different Postgres passwords (superuser and app role).
-touch .env yuzu-server.cfg && chmod 600 .env yuzu-server.cfg
-cat > .env <<EOF
-YUZU_VERSION=0.14.0
-YUZU_POSTGRES_PASSWORD=$(openssl rand -hex 24)
-YUZU_DB_PASSWORD=$(openssl rand -hex 24)
-EOF
-
-# 2. Create the first admin account. The server's first-run setup asks for it on a
-#    terminal, which a detached container does not have, so write the config file it
-#    would write (PBKDF2-HMAC-SHA256, 100,000 iterations). Keep yuzu-server.cfg as
-#    your recovery copy.
-python3 -c 'import getpass, hashlib, os, sys
-p = getpass.getpass("Admin password (at least 12 characters): ")
-if len(p) < 12: sys.exit("password too short")
-s = os.urandom(16)
-print("admin:admin:%s:%s" % (s.hex(), hashlib.pbkdf2_hmac("sha256", p.encode(), s, 100000).hex()))' > yuzu-server.cfg &&
-docker compose run --rm --no-deps -T --entrypoint sh server -c 'umask 077 && cat > /var/lib/yuzu/yuzu-server.cfg' < yuzu-server.cfg
-
-# 3. Start the stack, then check it against the server's own CA certificate.
-docker compose up -d --wait
-docker compose cp server:/etc/yuzu/certs/default-ca.pem .
-curl --cacert default-ca.pem https://localhost:8443/readyz
+mkdir yuzu && cd yuzu &&
+curl -fsSL https://raw.githubusercontent.com/DevNullLtd/Yuzu/v0.14.0/deploy/docker/docker-compose.reference.yml -o docker-compose.yml &&
+(umask 077; set -C; printf 'YUZU_VERSION=0.14.0\nYUZU_POSTGRES_PASSWORD=%s\nYUZU_DB_PASSWORD=%s\n' "$(openssl rand -hex 24)" "$(openssl rand -hex 24)" > .env)
 ```
 
-Open `https://localhost:8443` and sign in as `admin` with the password you entered. The browser warns about the certificate until you import `default-ca.pem` into your trust store. The stack publishes ports 8443 (dashboard and REST API), 8080 (redirects to HTTPS), 50051 (agent gRPC) and 50052 (management gRPC). If one of them is already in use, change its host side in the `ports:` list of `docker-compose.yml`. Upgrading (`docker compose pull && docker compose up -d` after you change `YUZU_VERSION` in `.env`) and recreating the server keep the certificate authority and the secrets key. `docker compose down -v` deletes them, together with the database. The compose file's header explains backup and restore, and its agent section explains how to install agents natively on each endpoint.
+Step 2 creates the first admin account. The server's first-run setup asks for it on a terminal, which a detached container does not have, so this writes the file that setup would write, `yuzu-server.cfg` (PBKDF2-HMAC-SHA256, 100,000 iterations), and copies it into the server's data volume. It asks for the password twice and refuses to overwrite either copy.
+
+```bash
+python3 -c 'import getpass, hashlib, os, sys
+p = getpass.getpass("Admin password, at least 12 characters: ")
+if len(p) < 12 or p != getpass.getpass("Again: "): sys.exit("Too short or not the same. Nothing written.")
+s = os.urandom(16)
+line = "admin:admin:%s:%s\n" % (s.hex(), hashlib.pbkdf2_hmac("sha256", p.encode(), s, 100000).hex())
+os.write(os.open("yuzu-server.cfg", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), line.encode())' &&
+docker compose -f docker-compose.yml run --rm --no-deps -T --entrypoint sh server -c 'umask 077 && set -C && cat > /var/lib/yuzu/yuzu-server.cfg' < yuzu-server.cfg
+```
+
+If browsers or agents on other machines will reach the server by a name or address other than `localhost`, add it now, before the first start issues the certificates: put a line such as `YUZU_CERT_SAN: "dns:yuzu.example.com,ip:192.0.2.10"` under `environment:` in the `server` service of `docker-compose.yml`. Never clear `/etc/yuzu/certs`: besides the certificate authority it holds the key that encrypts the server's stored secrets, and the server cannot start without it ([#5370](https://github.com/DevNullLtd/Yuzu/issues/5370)). To add a name later, see `--cert-san` in [Server administration](docs/user-manual/server-admin.md).
+
+Step 3 starts the stack and checks it against the server's own CA certificate. It prints `{"status":"ready"}`.
+
+```bash
+docker compose -f docker-compose.yml up -d --wait &&
+docker compose -f docker-compose.yml cp server:/etc/yuzu/certs/default-ca.pem . &&
+curl -fsS --cacert default-ca.pem https://localhost:8443/readyz
+```
+
+If `up --wait` times out, for example on a slow first Postgres start, run `docker compose -f docker-compose.yml up -d --wait` again. Do not delete the directory and start over: new passwords do not match the database already in the volumes.
+
+Open `https://localhost:8443` and sign in as `admin`. The browser warns about the certificate until you import `default-ca.pem` into your trust store.
+
+On 0.14.x the admin password lives in `yuzu-server.cfg`, not only in the database: the server reads `/var/lib/yuzu/yuzu-server.cfg` at every start, and its entry wins over the database. Protect both copies like the password itself; the host copy is what you write back if the volume is lost. To change the password, delete the host copy, run step 2 again (its last line refuses to overwrite the volume copy), then run `docker compose -f docker-compose.yml exec -T server sh -c 'cat > /var/lib/yuzu/yuzu-server.cfg' < yuzu-server.cfg` and `docker compose -f docker-compose.yml restart server`. This changes in 0.15.0, which reads the file only on the first start and keeps the password in the database ([#5274](https://github.com/DevNullLtd/Yuzu/issues/5274)); a password changed this way on 0.14.x reverts to the first one after that upgrade.
+
+The stack publishes ports 8443 (dashboard and REST API), 8080 (redirects to HTTPS), 50051 (agent gRPC) and 50052 (management gRPC) on every interface. On a machine other people can reach, publish the ones you need only locally on `127.0.0.1`, for example `"127.0.0.1:8443:8443"` in the `ports:` list of `docker-compose.yml`; change the host side there too if a port is already in use. Upgrading (`docker compose -f docker-compose.yml pull && docker compose -f docker-compose.yml up -d` after you change `YUZU_VERSION` in `.env`) and recreating the server keep the certificate authority and the secrets key. `docker compose -f docker-compose.yml down -v` deletes them, together with the database. The compose file's header explains backup and restore, and its agent section explains how to install agents natively on each endpoint.
 
 [`deploy/docker/docker-compose.yml`](deploy/docker/docker-compose.yml) is a development stack, not a download-only install. It builds the server and Postgres images from a checkout of this repository (`build: context: ../..`), ignores `YUZU_VERSION`, and publishes port 8080 but not 8443. Run it from `deploy/docker/` in a clone ([#5419](https://github.com/DevNullLtd/Yuzu/issues/5419)).
 

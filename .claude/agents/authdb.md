@@ -120,9 +120,10 @@ canonical list lives here. For broader auth/RBAC/crypto context, defer to the
   `init()` before `AuthDB` construction) will fail the column-verification
   step and should be treated as a construction-order regression.
 
-- **`yuzu-server.cfg` is a one-shot fresh-start seed, not a live source of
-  truth — AND the seed only ever fires when `auth.users` is genuinely
-  empty.** `RbacStore::provision_first_admin` is the production seeder (a
+- **`yuzu-server.cfg` seeds `auth.users` once, on a fresh start — AND the
+  seed only ever fires when `auth.users` is genuinely empty.** (On 0.14.x
+  the file nevertheless stays a live password source — see the end of this
+  bullet.) `RbacStore::provision_first_admin` is the production seeder (a
   single `INSERT ... SELECT ... WHERE NOT EXISTS` plus the Administrator
   grant plus a durable `rbac.bootstrap.first_admin` audit row, one
   transaction for the account+grant, TOCTOU-free against a second server
@@ -132,8 +133,18 @@ canonical list lives here. For broader auth/RBAC/crypto context, defer to the
   block; the function stays exported for its own tests). After the first
   successful seed (or on
   any subsequent boot where the table is non-empty), edits to the config
-  file do NOT re-seed users — the dashboard (`POST /api/settings/users` for
-  create, the role endpoint for role change) is the only live mutation path.
+  file do NOT re-seed users into `auth.users` — the dashboard
+  (`POST /api/settings/users` for create, the role endpoint for role
+  change) is the only path that mutates the database. **But on 0.14.x
+  (main) the file is still the live password source:** `load_config`
+  re-reads it into the `users_` cache at every boot and
+  `find_user_or_hydrate` (`auth.cpp`) serves a cache hit before it ever
+  consults AuthDB, so rewriting a cfg entry and restarting changes that
+  account's password while `auth.users` keeps the old hash (verified on
+  the 0.14.0 image). The README quickstart documents this as the 0.14.x
+  admin-password change path. 0.15.0 changes it — DB-first lookup plus a
+  stale-cfg boot warning (#5274) and an audited password change (#5342) —
+  after which a cfg-only rotation made on 0.14.x reverts to the DB hash.
   **A seed failure at boot MUST be fatal** (`main.cpp` already does this —
   do not weaken it to a warning): a boot that silently fails to seed leaves
   an operator locked out of a brand-new deployment with no diagnosis.

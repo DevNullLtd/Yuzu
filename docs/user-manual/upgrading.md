@@ -24,7 +24,7 @@ This guide covers upgrading Yuzu components (server, agent, gateway) between ver
 
 ## ⚠️ Docker Compose: copy `/etc/yuzu/certs` out of the server container before you recreate it (0.14.0 → 0.14.1, #5370)
 
-**Who this affects.** Affected: a 0.14.0 Docker Compose stack whose server has no named volume on `/etc/yuzu/certs` while Postgres has one — `deploy/docker/docker-compose.yml` (the README quickstart), `docker-compose.uat.yml`, `docker-compose.full-uat.yml`, `docker-compose.viz-uat.yml`, `docker-compose.demo.yml` used with `--keep`, any compose copied from them, and Compose Wizard output from before 0.14.1 in Plaintext mode, with 'Persist generated certs' unticked, or with named volumes off and an external Postgres. Not affected: `docker-compose.reference.yml` and `docker-compose.reference-gateway.yml` (their `certs` volume).
+**Who this affects.** Affected: a 0.14.0 Docker Compose stack whose server has no named volume on `/etc/yuzu/certs` while Postgres has one — `deploy/docker/docker-compose.yml` (the 0.14.0 README quickstart), `docker-compose.uat.yml`, `docker-compose.full-uat.yml`, `docker-compose.viz-uat.yml`, `docker-compose.demo.yml` used with `--keep`, any compose copied from them, and Compose Wizard output from before 0.14.1 in Plaintext mode, with 'Persist generated certs' unticked, or with named volumes off and an external Postgres. Not affected: `docker-compose.reference.yml` (which the README quickstart saves as `docker-compose.yml` since #5419) and `docker-compose.reference-gateway.yml` (their `certs` volume).
 
 **Why.** The server keeps its internal CA, its default certificates and the secrets key-encryption key (KEK, `secrets-kek-v1.key`) in `/etc/yuzu/certs`. Since 0.14.0 the KEK is also registered in Postgres, whose data is on a volume. In the affected composes the key files sit in the container's own writable layer instead, so anything that replaces the container deletes them: an image upgrade, `docker compose down` then `up`, `up --force-recreate`, or an `up` after a change to the server's settings. Bumping only the image tag (or `YUZU_VERSION`) under the old compose file also triggers it. The next start then fails, on every restart, with:
 
@@ -4299,9 +4299,19 @@ enrollment tokens.
   the initial schema migration via `MigrationRunner`, then seeds users
   from `yuzu-server.cfg`. Subsequent boots read from `auth.db`
   directly; the config file is no longer the live source of truth.
-- The seed is one-shot. Editing `yuzu-server.cfg` after first boot
-  does NOT re-seed users into `auth.db` — use the dashboard or
-  `POST /api/settings/users` instead.
+- The seed into the database is one-shot: editing `yuzu-server.cfg`
+  after first boot does NOT re-seed users into `auth.db` (or, since
+  0.14.0, the Postgres `auth` schema). It is **not** a one-time read,
+  though. Through 0.14.x the server reads `yuzu-server.cfg` at every
+  start, and an account in the file takes precedence over the database
+  at login, so the file is the live password of every account it lists:
+  rewriting an entry and restarting changes that password, while the
+  database keeps the old hash. Protect the file like a password. This
+  changes in 0.15.0, which looks the account up in the database first
+  and logs a warning for a stale file entry (#5274); a password changed
+  through the file on 0.14.x reverts to the database copy after that
+  upgrade. Create new accounts with the dashboard or
+  `POST /api/settings/users`.
 - Existing in-flight sessions are NOT preserved across the upgrade
   (sessions live in memory before this release; `auth.db` starts fresh
   on first boot). Operators must log in again.

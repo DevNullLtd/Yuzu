@@ -1454,8 +1454,9 @@ groups:
             {{ $value | humanizeDuration }}. Renew it and place the new PEM files
             at the configured path (hot-reload picks up HTTPS automatically).
             Built-in default certs (cert="default-ca") do NOT auto-renew — replace
-            them with operator-provided certs, or clear the cert directory to
-            regenerate.
+            them with operator-provided certs, or follow the clean re-root in
+            docs/pki-architecture.md "Operator runbook". Never clear the whole
+            cert directory: it also holds the secrets KEK (#5370).
 
       - alert: YuzuCertificateExpiryCritical
         expr: |

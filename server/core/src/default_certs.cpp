@@ -422,7 +422,10 @@ void merge_sans(pki::SubjectAltNames& base, const pki::SubjectAltNames& extra) {
 // Best-effort operator-footgun guard for the idempotent fast path: if --cert-san
 // asks for names the EXISTING cert set does not carry, warn. Changing --cert-san
 // deliberately does NOT auto-rotate (that would mint a new CA and break every
-// enrolled agent's trust) — the operator must clear the dir to apply. DNS + IPv4
+// enrolled agent's trust). To apply, the operator deletes default-marker.json so
+// the next boot re-mints the leaves under the SAME root (the self-heal path in
+// ensure_default_certs); clearing the whole dir would lose the CA key and the
+// secrets KEK (#5370) and trip the B-2 re-root refusal. DNS + IPv4
 // only; IPv6 is skipped because the parsed-back form is uncompressed
 // (e.g. "0:0:0:0:0:0:0:1"), so a literal compare would false-positive.
 void warn_on_san_drift(const fs::path& representative_leaf,
@@ -455,9 +458,12 @@ void warn_on_san_drift(const fs::path& representative_leaf,
             joined += ", ";
         joined += m;
     }
-    spdlog::warn("default_certs: --cert-san requests [{}] not present in the existing default certs "
-                 "(they predate these SANs). Clear the cert directory to regenerate with them.",
-                 joined);
+    spdlog::warn(
+        "default_certs: --cert-san requests [{}] not present in the existing default certs "
+        "(they predate these SANs). To re-issue the default leaves with them under the "
+        "same CA, delete default-marker.json from the cert directory and restart. Do not "
+        "clear the directory: it also holds the CA key and secrets-kek-*.key.",
+        joined);
 }
 
 // Forward-declared: defined further down alongside the rest of the bootstrap
