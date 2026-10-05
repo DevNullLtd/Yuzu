@@ -11,6 +11,7 @@
 #include <cstring>
 #include <fstream>
 #include <sstream>
+#include <unordered_set>
 
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
@@ -379,6 +380,7 @@ PluginLoader::scan(const std::filesystem::path& plugin_dir,
                      signing.trust_bundle_path.string(), signing.require_signature);
     }
 
+    std::unordered_set<std::string> seen_names;
     for (const auto& entry : std::filesystem::recursive_directory_iterator(plugin_dir)) {
         if (!entry.is_regular_file())
             continue;
@@ -603,6 +605,16 @@ PluginLoader::scan(const std::filesystem::path& plugin_dir,
                               entry.path().string(), plugin_name);
                 result.errors.push_back(
                     LoadError{entry.path().string(), std::string{kReservedNameReason} + ": '" +
+                                                         std::string{plugin_name} + "'"});
+                continue;
+            }
+            if (!seen_names.insert(std::string{plugin_name}).second) {
+                // The handle destructs here and dlcloses the library (first file wins).
+                spdlog::warn("Plugin {} declares name '{}' already loaded from another file in "
+                             "this scan — rejecting (first file wins)",
+                             entry.path().string(), plugin_name);
+                result.errors.push_back(
+                    LoadError{entry.path().string(), std::string{kDuplicateNameReason} + ": '" +
                                                          std::string{plugin_name} + "'"});
                 continue;
             }

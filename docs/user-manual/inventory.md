@@ -16,13 +16,27 @@ cadences.
   account's own `HKCU`; Linux: `dpkg`/`rpm`/`pacman`/`apk`; macOS:
   `system_profiler`), `pkg_inventory` `packages` and `managers` (Homebrew), and
   `windows_optional_features` `list`. An action whose plugin is not loaded, or
-  that answers "unsupported on this OS", is skipped (except `installed_apps`:
-  without it the source stays idle, because it anchors the report); an action
-  that fails (non-zero exit, truncated output, a constrained or unavailable
-  answer, a malformed status row, no feature rows from
+  that answers "unsupported on this OS", is skipped. A plugin that is not
+  loaded is logged at warn (the rows its action produced are removed on the next
+  report); without `installed_apps` the source stays idle and sends nothing,
+  because it anchors the report.
+  An action that fails (non-zero exit, truncated output, a typed result
+  completeness of `PARTIAL` unless the action opts in, a `constrained` or
+  `unavailable` answer, a malformed status row, no feature rows from
   `windows_optional_features`, or no applications at all from `installed_apps`)
-  skips that day's
-  report and keeps the last good state — nothing is deleted. Every row's `source` names the
+  skips that day's report and keeps the last good state — nothing is deleted. A
+  `constrained` Homebrew `managers` answer that still names a present prefix is
+  accepted: the constraint concerns tap/Cellar/Caskroom facts the presence row
+  never carried. A skipped cycle is retried sooner on a phase-aligned backoff:
+  waits that double from 1 h after each consecutive skip (1 h, 2 h, 4 h, 8 h, …),
+  each retry capped so it never lands after the next daily slot — up to four
+  extra attempts — then one attempt per daily slot until a collection succeeds.
+  While it is skipping, the agent publishes the heartbeat tags
+  `yuzu.sync.installed_software.skip_streak` (consecutive skips since the last
+  success, uncapped) and `yuzu.sync.installed_software.last_skip` (the reason
+  token); the heartbeat carries them to the server, but no server page or API
+  returns them yet, so read the reason from the agent's own log. Every row's
+  `source` names the
   producing action (`installed_apps.list_inventory`, `pkg_inventory.packages`,
   `pkg_inventory.managers`, `windows_optional_features.list`); `package_id` is
   empty for these producers. The operator-facing `list` action keeps its
@@ -536,8 +550,10 @@ credentials.)
 ## Troubleshooting
 
 **The `installed_software` table is empty after upgrading agents.** Most likely
-the `installed_apps` plugin isn't loaded — the sync source then idles silently
-(it logs `sync: installed_apps plugin not loaded` only at **debug**). Verify the
+the `installed_apps` plugin isn't loaded — the sync source then idles
+(it logs `sync: installed_apps plugin not loaded` at **warn**, and publishes
+`installed_apps:not_loaded` as its `yuzu.sync.installed_software.last_skip`
+heartbeat tag). Verify the
 agent was built with `-Dbuild_agent=true` (the default for released binaries)
 and that `installed_apps` is present in the agent's `--plugin-dir`. The sync also
 only runs once per ~24 h per agent (spread across the fleet), so a freshly
@@ -549,10 +565,20 @@ actions failed, and a failure skips the WHOLE report for that day — the
 applications too — and keeps the last good inventory (nothing is deleted).
 Typical causes: Windows DISM busy or `api_unavailable` (the
 `windows_optional_features` action answers `feature|unavailable|…`), or a
-constrained Homebrew read on macOS. The warning names the action and the
-reason. A host that keeps skipping is flagged by `yuzu_inventory_stale_agents`
+constrained Homebrew `packages` read on macOS (a constrained `managers` answer
+with a present prefix no longer skips). The warning names the action and the
+reason. The same reason is published on the agent's heartbeat as
+`yuzu.sync.installed_software.last_skip` (characters outside
+`A-Z a-z 0-9 _ . : = , -` become `_`, and the value is cut at 64 bytes, so a long
+list of constraint tokens is shortened; no server page or API returns the tag
+yet), and
+`yuzu.sync.installed_software.skip_streak` counts consecutive skips (uncapped): an
+online host that is skipping publishes a non-zero streak, an offline host no
+heartbeat at all. The agent retries
+a skipped cycle on the bounded backoff described under *What is collected*, then
+falls back to one attempt per daily slot. A host that keeps skipping is flagged by `yuzu_inventory_stale_agents`
 after two missed daily cycles; fix the failing action, or remove its plugin,
-and the next daily sync recovers. A warning of the form `sync: <plugin>.<action>
+and the next retry or daily sync recovers. A warning of the form `sync: <plugin>.<action>
 read more than 20000 rows` (or a merged-entry or 3 MiB blob cap) is not an
 action failure: that host reports more software rows than one report can carry,
 so its report is skipped rather than sent truncated; review the host's

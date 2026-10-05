@@ -172,7 +172,9 @@ cfs::WinHandle open_candidate_relative(HANDLE root, const std::wstring& wide_nam
 
 ScratchSweepResult sweep_stale_scratch_dirs(const std::wstring& data_dir,
                                              std::int64_t now_unix_s,
-                                             std::int64_t stale_after_s) noexcept {
+                                             std::int64_t stale_after_s,
+                                             const SweepLimits& limits,
+                                             std::uint64_t pass_counter) noexcept {
     ScratchSweepResult res{};
     try {
         cfs::OpenRootResult opened = cfs::open_root(std::filesystem::path{data_dir});
@@ -188,11 +190,11 @@ ScratchSweepResult sweep_stale_scratch_dirs(const std::wstring& data_dir,
         // binding rule for why a re-derived deadline would let the wall-time
         // cap creep forward indefinitely.
         const auto deadline =
-            std::chrono::steady_clock::now() + std::chrono::milliseconds{kScratchSweepMaxWallMs};
+            std::chrono::steady_clock::now() + std::chrono::milliseconds{limits.max_wall_ms};
 
         cfs::EnumerateResult root_entries = cfs::enumerate_at(
             root.h_.get(), root.identity(),
-            cfs::EnumBudget{static_cast<std::uint64_t>(kScratchSweepMaxRootEntries), deadline});
+            cfs::EnumBudget{static_cast<std::uint64_t>(limits.max_root_entries), deadline});
 
         if (root_entries.reason == cfs::Reason::OsError) {
             res.enumerate_error = true;
@@ -207,7 +209,14 @@ ScratchSweepResult sweep_stale_scratch_dirs(const std::wstring& data_dir,
             ++res.deferred;
         }
 
-        for (const auto& entry : root_entries.entries) {
+        // Rotated start (#4504): one pass still visits each entry at most
+        // once; rotating the start reduces, but does not eliminate, the chance
+        // that persistently failing entries delay a removable orphan.
+        const std::size_t n_entries = root_entries.entries.size();
+        const std::size_t start =
+            n_entries == 0 ? 0 : static_cast<std::size_t>(pass_counter % n_entries);
+        for (std::size_t visited = 0; visited < n_entries; ++visited) {
+            const auto& entry = root_entries.entries[(start + visited) % n_entries];
             if (!is_scratch_dir_name(entry.name))
                 continue; // not ours to consider -- skip silently
 
@@ -239,12 +248,12 @@ ScratchSweepResult sweep_stale_scratch_dirs(const std::wstring& data_dir,
             }
 
             // Removed and failed are capped SEPARATELY (see
-            // kScratchSweepMaxFailures's doc comment): a run of persistent
+            // kScratchSweepMaxFailures' doc comment): a run of persistent
             // failures earlier in enumeration order must not be able to
             // starve a later, genuinely-removable orphan out of this same
             // pass by exhausting a shared budget.
-            if (res.removed >= kScratchSweepMaxRemovals ||
-                res.failed >= kScratchSweepMaxFailures) {
+            if (res.removed >= limits.max_removals ||
+                res.failed >= limits.max_failures) {
                 // Whichever cap was hit -- stop considering further entries
                 // this pass rather than acting past the configured blast
                 // radius.
@@ -296,7 +305,7 @@ ScratchSweepResult sweep_stale_scratch_dirs(const std::wstring& data_dir,
 
             cfs::EnumerateResult inner = cfs::enumerate_at(
                 candidate.get(), root.identity(),
-                cfs::EnumBudget{static_cast<std::uint64_t>(kScratchSweepMaxDirEntries), deadline});
+                cfs::EnumBudget{static_cast<std::uint64_t>(limits.max_dir_entries), deadline});
 
             bool candidate_flat_and_clean = inner.reason == cfs::Reason::None;
             if (candidate_flat_and_clean) {
