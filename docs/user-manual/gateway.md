@@ -543,6 +543,51 @@ When an agent's Subscribe stream connects or disconnects at the gateway, a
 `NotifyStreamStatus` RPC informs the C++ server so it can update its
 connectivity records.
 
+A notification is held, not dropped, when it cannot be sent at once (#4632).
+Each one goes into a bounded pending store in the upstream client, and a drain
+step sends the held entries first in first out, at most 10 at a time, each on
+its own worker so the upstream client never waits on one. A notification is held
+while 10 are already in flight and while the upstream circuit breaker is open or
+half open. (Read from the code: INFERRED, not measured on a rig; the measured
+runs are marked below.)
+
+- **Keys.** The store is keyed by agent id, session id and stream home id. A
+  newer notification for a key that is already held replaces the held one and
+  keeps its place in the queue, so a `CONNECTED` followed by a `DISCONNECTED` for
+  one session sends only the `DISCONNECTED`, and an identical repeated
+  `CONNECTED` is sent once. Two sessions of one agent are two keys and both are
+  kept. Replacements are counted in `yuzu_gw_upstream_notify_coalesced_total`.
+- **Probe.** While the breaker is half open exactly one held notification is
+  sent, as the probe. If it succeeds the breaker closes and the rest drain first
+  in first out; if it fails the breaker opens again with a doubled backoff and the
+  probe's notification goes back to the head of the queue. A probe result that
+  arrives after the breaker has moved on to a later half-open period does not
+  change the breaker. Without the probe, held notifications could sit
+  indefinitely after the server recovers, because a disconnected session produces
+  no heartbeat to trigger a replay.
+- **Cap.** `notify_pending_max` (default 10000, see "Upstream client tuning")
+  bounds the number of held keys, not agents. A notification for a new key that
+  arrives when the store is full is dropped and counted in
+  `yuzu_gw_upstream_notify_dropped_total{reason="at_capacity"}`. The cap bounds
+  the retained keys only: it is not a memory ceiling, and casts still queue in
+  the upstream client's mailbox while a `ProxyRegister`, `ProxyInventory` or
+  replay call runs synchronously.
+- **Replay fairness.** While a registration replay is active, one of the 10
+  in-flight slots is kept free for it, so a long backlog of held notifications
+  cannot stop the replay from advancing. Notification throughput is one slot
+  lower during a replay.
+- **Volatile.** The pending store is memory only. It is lost when the upstream
+  client process restarts and when the gateway stops; nothing is flushed at
+  shutdown. A notification that an ordinary worker started and that then failed (a
+  returned RPC error or a killed worker) is not retried and not counted as
+  dropped, as before; only the probe is requeued on failure. The gauges `yuzu_gw_upstream_notify_pending` and
+  `yuzu_gw_upstream_notify_inflight` report the held keys and the tracked workers
+  of the current upstream client process only.
+
+Measured evidence for this behaviour: `RIG-TBD(b)` (cold wave of 1000 simulated
+agents), `RIG-TBD(d)` (30 real agents), `RIG-TBD(e)` (outage with the breaker
+open, then the probe).
+
 ---
 
 ## GatewayUpstream Service
@@ -680,7 +725,7 @@ The gateway is configured via `gateway/config/sys.config`. Key settings:
 ]}
 ```
 
-**Registration replay tuning** (application env keys read by the upstream
+**Upstream client tuning** (registration replay and pending notifications; application env keys read by the upstream
 client at start, except `upstream_call_timeout_ms`, which is read on every call; set them in the `yuzu_gw` section of `sys.config`. No
 `YUZU_GW_*` environment variable maps to any of them):
 
@@ -689,6 +734,7 @@ client at start, except `upstream_call_timeout_ms`, which is read on every call;
 | `registration_replay_spacing_ms` | 20 | 0 to 60000 | Gap between two replay `ProxyRegister` calls in the replay drip |
 | `registration_replay_session_guard_ms` | 10000 | 0 to 3600000 | A session that was just replayed is not queued again by a heartbeat verdict until this many ms have passed. The stamp is taken when the replay is sent, so a stale verdict can arrive up to the 5 s flush deadline (the vendored grpcbox client default) plus the replay RPC time later (INFERRED from the code): do not set it below 5000 plus the expected replay RPC time, because a smaller guard lets such a stale verdict replay a session the server already knows; the default 10000 is safe (see "Replaying a session the server already knows is not free" under [What happens when the server restarts](#what-happens-when-the-server-restarts)) |
 | `registration_replay_queue_max` | 10000 | 1 to 1000000 | Most agents the replay queue holds when a heartbeat verdict appends to it; there is one pending entry per agent, and an id past the cap is counted in `yuzu_gw_heartbeat_verdict_dropped_total{reason="queue_full"}` (so is an id in a verdict that the heartbeat buffer did not cast because the upstream client's mailbox held more than 100 messages, see "Heartbeat batching interval" below). The cap bounds only verdict appends: the snapshot a breaker recovery seeds is not capped (it is bounded by the number of agents the node holds, as before), and while a snapshot of this size or larger drains, every verdict id for an agent not already queued counts as `queue_full` |
+| `notify_pending_max` | 10000 | 1 to 1000000 | Most stream-status notification keys (agent id, session id and stream home id) the upstream client holds while they cannot be sent, because 10 are already in flight or the circuit breaker is not closed. The cap counts keys, not agents. A notification for a new key past the cap is dropped and counted in `yuzu_gw_upstream_notify_dropped_total{reason="at_capacity"}`; a newer notification for a key already held replaces it and never counts against the cap. It bounds the retained keys only, not memory or the upstream client's mailbox. Read once at start and logged in the start line of the upstream client |
 | `upstream_call_timeout_ms` | 30000 | 100 to 300000 | How long `yuzu_gw_upstream:proxy_register/1` and `proxy_inventory/1` wait for the upstream client before the call gives up with `{error, upstream_unavailable}` and one caller-side warning that names the class `timeout`. Read on every call, not at start. It exists so a test can exercise the timeout without waiting 30 s, and it also works as a setting. A value outside the range, or one that is not an integer, falls back to the default with a WARN that names the key |
 
 An invalid value for any of these keys falls back to the default and logs a
@@ -1105,6 +1151,9 @@ agent build that re-registers by itself; released agents do not (see
 | gateway | WARN | `Registration replay: <agent> failed: <reason>` | A replay `ProxyRegister` failed. It counts as a failure for the shared circuit breaker (see "Replay failures feed the shared circuit breaker" below). |
 | gateway | metric | `yuzu_gw_registration_replay_triggered_total{trigger="breaker"}` rising | The circuit breaker closed after an outage and the gateway replayed every agent this node holds. Expected after a long outage when the breaker opened (see "Several agents and a long outage" below). No action. |
 | gateway | metric | `yuzu_gw_heartbeat_coalesced_total` rising | Newer heartbeats of a session are replacing older buffered ones, one at a time. Expected during a server outage: heartbeats pile up between failed flushes and are merged, so the buffer stays at one entry per session. No action. The server's `yuzu_heartbeats_received_total{via="gateway"}` falls short of the number of heartbeats the agents sent for the same reason; that is not a loss of agents. |
+| gateway | metric | `yuzu_gw_upstream_notify_pending` non-zero for longer than a connect burst or a breaker outage | Stream-status notifications are held and not draining (#4632). A short rise is normal during a cold `Subscribe` wave: the gauge counts held keys and falls as the 10 workers drain them first in first out (INFERRED from the code; measured: `RIG-TBD(b)`). If it stays above 0, read `yuzu_gw_upstream_notify_inflight` (at most 10; a value stuck at 10 means the workers are slow or stuck), `yuzu_gw_upstream_rpc_errors_total{rpc_name="notify_stream"}`, and the breaker (the `Circuit breaker:` lines above, `yuzu_gw_upstream_circuit_transitions_total`, and `/readyz`). While the breaker is open the entries are held by design, and one is sent as the probe when it goes half open. An agent reconnect recovers one agent. Both gauges describe the current upstream client process only: after it restarts they start at 0, held entries are gone, and workers of the old process are not counted. |
+| gateway | metric | `yuzu_gw_upstream_notify_dropped_total{reason="at_capacity"}` rising | The pending store held `notify_pending_max` keys and a notification for a new key was lost at admission (#4632). Each lost notification can leave one agent acknowledged by the server but not dispatchable until it registers again. Find out why so many distinct keys are held (a connect storm with the breaker open, or a server that answers too slowly for the 10 workers), or raise `notify_pending_max` in the `yuzu_gw` section of `sys.config` (read at start; a gateway restart disconnects every agent it holds, see "Upgrade day" above). The series has no agent label, so the affected agents cannot be listed from the metric. The counter does not include a notification lost after admission (a failed or killed worker, or a gateway stop with entries held). |
+| server | metric | An agent is acknowledged by the server (heartbeats accepted, `agents.online`) but commands to it fail with `503 no agent connected` | The second branch of #4632: the server knows the session but its dispatch placement was not published, because the `CONNECTED` notification was lost or refused. Read the server counters `yuzu_server_gateway_route_desync_total{op="notify_stream_status",outcome="unknown_session"}` (the notification named a session the answering replica does not hold), `{op="notify_stream_status",outcome="stale_connected_session"}` (a `CONNECTED` for a session that was no longer the current one) and `{op="deregister",outcome="session_mismatch"}` (a `DISCONNECTED` for a session that was already superseded; expected to rise a little when held `DISCONNECTED` notifications flush after an outage). Restarting the agent service recovers an agent (OBSERVED earlier for any agent). The 90 s route lease is how long the durable row stays valid after the last renewing heartbeat; it is not an expiry guarantee for the server's in-memory belief about a session, which can last until that agent registers again on that replica (INFERRED from the code, not run). Limit, stated plainly: with several core replicas, if replica A still holds an old session of an agent while replica B registered a newer one, A can accept a late `CONNECTED` for the old session into its own in-memory registry; the durable route update refuses it, but the in-memory publication is not undone. No gateway-side change closes that case (INFERRED from the code, not run). |
 | gateway | metric | `yuzu_gw_heartbeat_buffer_dropped_total{reason}` rising | The buffer is under pressure, typically after a long server outage. `snapshot_evicted`: older snapshots were dropped to stay under `max_heartbeat_buffer_bytes`, oldest first. `buffer_full`: the buffer held `max_heartbeat_buffer` sessions and a heartbeat of a new session was dropped, or it was still over `max_heartbeat_buffer_bytes` with no snapshot left and its oldest whole session was dropped. `snapshot_oversize`: one heartbeat larger than about 3 MiB was sent without its snapshot (see "Known limits" below for the agent side). `heartbeat_oversize`: a heartbeat still larger than about 3 MiB after its snapshot was removed, or with more than 512 status tags, or with a status tag key or value over about 64 KiB or more than about 256 KiB of tag bytes in total (checked before the UTF-8 repair, so such a heartbeat costs no repair work), lost all of its status tags and was forwarded without them. `heartbeat_invalid`: a heartbeat with a status tag that was not valid UTF-8 was forwarded with the invalid bytes replaced by replacement characters. The reason also counts tags removed because a tag was not a binary and a heartbeat dropped for a bad or empty session id (see "Heartbeat Batching"). `chunk_rejected`: one heartbeat that the server rejected with a non-transient status (for example `RESOURCE_EXHAUSTED`) was dropped so that it does not block newer heartbeats. `heartbeat_oversize` and `heartbeat_invalid` mean an agent, or a plugin on it, sent oversized or invalid status tags: only the tags of those heartbeats are lost or repaired, and liveness is unaffected because the heartbeat itself is forwarded and the session keeps renewing its lease. `chunk_rejected` means the server refused one heartbeat, which is lost; the agent sends the next on its own interval. The metric has no agent label, so identify the agent from the gateway log or debug log if one names it, and upgrade or fix that agent or the plugin that produces the tags; no other action is needed. Transient server trouble (server unreachable, timeouts) does not lose heartbeats: they stay buffered. The data lost for the first three reasons is only older heartbeat state, which the agents refresh on their own interval. No action unless `buffer_full`, `snapshot_oversize` or `snapshot_evicted` keeps rising after the server is back; if it does, check that the server is reachable and answering `BatchHeartbeat` (`yuzu_gw_upstream_rpc_errors_total{rpc_name}`), and consider raising `max_heartbeat_buffer_bytes` or `max_heartbeat_buffer` if your fleet is larger than the defaults assume. Do not restart the gateway for this: a restart disconnects every agent the node holds. |
 | gateway | metric | `yuzu_gw_session_limit_rejected_total` rising | A `Register` or `Subscribe` was refused because one gRPC connection already holds `max_sessions_per_connection` agent sessions (default 8; see "Per-connection session cap" for what counts). A stock agent holds one session per connection (INFERRED), so a rise means an L4 balancer, forwarder or client is carrying several agents on one connection (see "Per-connection session cap" under Configuration). A refused `Register` is answered `UNAVAILABLE` (14); a refused `Subscribe` ends the stream (status 2 today, see Known limits) and is counted the same. The agent retries either way. If the topology is legitimate, raise the key in `sys.config`; the key is read once when the registry starts, so the change needs a gateway restart, which disconnects every agent the node holds, so plan it. The metric has no agent label. A refused `Register` leaves nothing on the server and no row on the gateway. Rows of a connection that closed stay counted for the dead connection key only, which no new connection uses, until `dead_connection_grace_ms` (default 15 s) has passed, so a reconnecting client is not refused because of them. |
 | gateway | WARN | `Register failed: registry_unavailable` | The agent was answered `INTERNAL` (13) "Registration failed: registry unavailable". The gateway's registry process could not be reached for this `Register`: its table is missing, a call timed out, or the registry restarted and lost the row (see the `Registration replay aborted: registry unavailable` row). This line no longer covers a superseded `Register` (see the next row). The agent registers again with its reconnect backoff (read from the agent code). A sustained run of lines is not expected: check `/readyz` and the registry process. |
@@ -1298,9 +1347,9 @@ success. The breaker policy is unchanged, but verdict replays are a new source o
 failures that count. With the default threshold of 5 consecutive failures and
 20 ms spacing, a failing server can open the breaker within about 100 ms plus
 the RPC time of five calls (INFERRED: arithmetic on the code and the defaults,
-not measured). An open breaker gates `ProxyRegister` and `ProxyInventory`, drops
-stream-status notifications (`yuzu_gw_upstream_notify_dropped_total`, reason
-`circuit_open`) and makes the whole `/readyz` answer 503 `not_ready`, with
+not measured). An open breaker gates `ProxyRegister` and `ProxyInventory`, holds
+stream-status notifications in the pending store (see "Stream Status
+Notification"; they used to be dropped) and makes the whole `/readyz` answer 503 `not_ready`, with
 `circuit_breaker` false in its checks (`yuzu_gw_health.erl`, INFERRED; the
 shipped guidance is that a load balancer probes `/readyz`, so an open breaker can
 take the node out of rotation until it goes half open). A heartbeat flush never
@@ -1368,15 +1417,18 @@ failures now count toward the shared breaker (see below).
 - Dispatch reachability after the session is adopted. Adopting restores the
   server's knowledge of the session (heartbeats acknowledged, lease renewed,
   `agents.online`). Dispatch placement converges when the agent's re-sent
-  CONNECTED notification is delivered. A rise in
-  `yuzu_gw_upstream_notify_dropped_total` during recovery means some agents
-  stay acknowledged but unreachable for commands until their next reconnect.
-  The series has no sample until a notification is first dropped, so an
-  absent series means no drops. The series has no agent label, so the affected
-  agents cannot be identified from the metric. They recover at their next
-  reconnect; to force it, restart the agent service (OBSERVED: a restart
-  recovers any agent). The in-flight notification limit that causes the drop is
-  tracked in #4632; it is not fixed here.
+  CONNECTED notification is delivered. That notification is held, not dropped,
+  while 10 are in flight or the breaker is not closed, and is sent first in
+  first out (#4632; INFERRED from the code, measured: `RIG-TBD(b)`). It is still
+  lost when the pending store already holds `notify_pending_max` keys (counted in
+  `yuzu_gw_upstream_notify_dropped_total{reason="at_capacity"}`), when an
+  ordinary worker fails after taking it (not counted), and when the upstream
+  client process or the gateway stops while it is held (not counted). An agent
+  affected that way stays acknowledged but unreachable for commands until its
+  next reconnect. The dropped series is created at 0 at start, so a rise is
+  visible. It has no agent label, so the affected agents cannot be identified
+  from the metric. They recover at their next reconnect; to force it, restart
+  the agent service (OBSERVED: a restart recovers any agent).
 - Correctness on several core replicas (see below).
 - Any order beyond first-in, first-out in sorted session-id order. The gateway
   sorts the ids it keeps from one response, so each verdict's agents are queued
@@ -1477,9 +1529,14 @@ the raw rig logs are local only.
   recorded in the
   [evidence record](../security-reviews/gateway-heartbeat-verdict-replay-2026-10-04.md)
   on its `Post-fix rig run:` line.
-- **`yuzu_gw_upstream_notify_dropped_total`.** OBSERVED: the metric has HELP
-  and TYPE lines but no sample until a notification is first dropped, so an
-  absent series means no drops.
+- **`yuzu_gw_upstream_notify_dropped_total`.** OBSERVED on gateways built
+  before #4632: the metric has HELP and TYPE lines but no sample until a
+  notification is first dropped, so an absent series meant no drops. A gateway
+  with #4632 creates `reason="at_capacity"` at 0 at start (INFERRED from the
+  code), so there an absent series means an older gateway, and 0 means nothing
+  was lost at admission. Samples with `reason="circuit_open"` come only from an
+  older gateway: the new one holds a notification that arrives while the
+  breaker is not closed and no longer emits that reason.
 - **Not tested:** 100 or more real agents (rig pass 6 ran 1000 to 5000 simulated agents, a load generator that answers no commands and sends no inventory, see the K rows of the table below), HA or several replicas, notify
   pressure, agents started with `--no-auto-update`, the `queue_full` and
   `malformed` verdict reasons produced by a real server (only injected verdicts
@@ -1969,21 +2026,44 @@ env keys with defaults, which a reverted build ignores.
   the brief gap between `Subscribe` taking the pending row and the live insert
   (the agent retries, INFERRED about 2 s later). Details under "Per-connection
   session cap" in Configuration.
-- **Cold-start notifications are shed at the in-flight limit, so most route rows
-  stay tombstoned until the replay runs.** OBSERVED in rig pass 6 (runs K1 and K6
-  of that pass) and, per the local rig notes, in the cold start of pass 5 run J1;
-  pre-existing, not introduced by this change. After a cold `Subscribe` wave of
-  1000 simulated agents `yuzu_gw_upstream_notify_dropped_total{reason="at_capacity"}`
-  was 987 (989 and 988 in two repeats, and 1953 after 2000 agents).
-  `MAX_NOTIFY_INFLIGHT` is 10 in `yuzu_gw_upstream.erl`, so `CONNECTED`
-  notifications beyond 10 in flight are shed best effort. The server's route table
-  before the restart showed `live=13 tomb=987` for the 1000 agent run; the rows are
-  only filled when the replay (or a re-announce) runs, after which it showed
-  `live=1000 tomb=0`. With 30 real agents cold started the same effect gave 13
-  drops. The counter did not move during the restart itself. The consequence is
-  that the server's `online` count and its route rows disagree after a large cold
-  start. It is covered by the planned follow-up (i) below, a bounded pending queue
-  for dropped notifications, and by #4632 (the in-flight notification limit).
+- **Cold-start notifications were shed at the in-flight limit, so most route rows
+  stayed tombstoned until the replay ran. Fixed by #4632 (hold instead of
+  drop).** Before the fix, OBSERVED in rig pass 6 (runs K1 and K6 of that pass)
+  and, per the local rig notes, in the cold start of pass 5 run J1: after a cold
+  `Subscribe` wave of 1000 simulated agents
+  `yuzu_gw_upstream_notify_dropped_total{reason="at_capacity"}` was 987 (989 and
+  988 in two repeats, and 1953 after 2000 agents), the server's route table
+  before the restart showed `live=13 tomb=987`, and with 30 real agents cold
+  started the same effect gave 13 drops. `MAX_NOTIFY_INFLIGHT` is 10 in
+  `yuzu_gw_upstream.erl` and a `CONNECTED` beyond 10 in flight was shed. Now a
+  notification beyond 10 in flight is held and sent first in first out (see
+  "Stream Status Notification"). Measured after the fix: `RIG-TBD(a)` (control,
+  the same wave on the previous build), `RIG-TBD(b)` (the same wave with the fix:
+  drops, routable rows, drain time, peak held keys), `RIG-TBD(d)` (30 real agents)
+  and `RIG-TBD(f)` (steady state). The statements below are INFERRED from the
+  code. Residuals:
+  - The cap. A notification for a new key is still lost, and counted, when the
+    store already holds `notify_pending_max` keys.
+  - A worker that fails after taking a notification (a returned RPC error or a
+    killed worker) loses it. This is not new and is not counted. Ordinary
+    notification results do not drive the breaker either; only the probe
+    resolves its own failure. Measured: `RIG-TBD(e2)`.
+  - Shutdown loses the volatile store. Held entries are not flushed when the
+    upstream client process or the gateway stops.
+  - Workers orphaned by an upstream client restart are not counted by
+    `yuzu_gw_upstream_notify_inflight` or the pending gauge, which describe the
+    current process only.
+  - The cap bounds retained keys, not memory or mailbox size. `ProxyRegister`,
+    `ProxyInventory` and the replay still run synchronous RPCs inside the
+    upstream client process, so casts accumulate in its mailbox while one runs,
+    and a long mailbox makes the heartbeat buffer skip verdict casts (counted as
+    `yuzu_gw_heartbeat_verdict_dropped_total{reason="queue_full"}`). Peak mailbox
+    and memory during a slow-RPC burst: `RIG-TBD(b)`.
+  - With several core replicas, a late `CONNECTED` for an old session can still
+    be accepted into the in-memory registry of a replica that holds that old
+    session, while another replica registered a newer one (see the runbook row
+    for an agent that is acknowledged but not dispatchable). The gateway cannot
+    close that case.
 - **A refused `Subscribe` reaches the client as status 2 (`process exited without
   reason`), not as `NOT_FOUND`, and logs an error report.** OBSERVED in rig pass 6
   (run K5) with an Erlang probe client, not with a real agent: for a `Subscribe`
@@ -2009,16 +2089,25 @@ env keys with defaults, which a reverted build ignores.
   number yet: answer these refusals with a status returned from the handler rather
   than a throw.
 - Related tracked items: #5244 (an idempotent adopt: a re-adopt of a session the
-  server already holds wipes placement), #4632 (the in-flight notification limit
-  on the convergence path), #5278 (verdict follow-ups: the desync log seam and a
-  concurrent-handler test) and #5313 (re-registration load measurement).
+  server already holds wipes placement), #4632 (stream-status notifications held
+  instead of dropped, the change described under "Stream Status Notification";
+  its residuals are listed under the cold-start item above), #5278 (verdict
+  follow-ups: the desync log seam and a concurrent-handler test) and #5313
+  (re-registration load measurement).
 - Planned follow-ups, tracked as follow-ups (no issue numbers yet), in this
-  order: (i) a bounded pending queue for dropped notifications, a gateway-only
-  change; (ii) a server-side re-arm of a tombstoned route row when a lease renewal
+  order: (i) retry or breaker feedback for an ordinary notification worker that
+  fails (today the notification is lost and the result does not reach the
+  breaker; the probe is the one exception), to be sized with the worker-loss
+  measurement `RIG-TBD(e2)`, and replacing the replay's in-flight pre-check with
+  a pending-depth check; (ii) a server-side re-arm of a tombstoned route row when a lease renewal
   comes up short, with a new advisory list that the gateway answers by
   re-announcing, which needs a protocol change and is planned to land before the
   safe-to-scale gate; (iii) a session-match guard and a refusal counter for the
-  `accepted=false` disconnect.
+  `accepted=false` disconnect; (iv) a server test that runs two overlapping
+  `NotifyStreamStatus` handlers for one session (none was found in
+  `tests/unit/server`; the gateway's per-key replacement relies on the server
+  converging when a `CONNECTED` and a `DISCONNECTED` for one session overlap,
+  INFERRED from the code, not run).
 
 ---
 
@@ -2213,6 +2302,10 @@ that are actually emitted are listed.
 | `yuzu_gw_heartbeat_verdict_dropped_total` | counter | Session ids named by a heartbeat verdict that were not queued for replay (label `reason`, closed set: `malformed` = not a usable session id, `not_local` = this node does not hold the session, `circuit_open` = the upstream circuit breaker is open, `queue_full` = the replay queue is at its cap, or the upstream process already holds more than 100 unhandled messages so the ids were not handed to it; the cap bounds only verdict appends, so while a breaker-seeded snapshot of that size or larger drains, every verdict id for an agent not already queued counts here). Every reason is created at 0 at start. Ids already queued, or replayed within the session guard window, are not counted. |
 | `yuzu_gw_heartbeat_buffer_dropped_total` | counter | Heartbeat state the gateway's heartbeat buffer dropped instead of sending (label `reason`, closed set of six, all created at 0 at start: `buffer_full` = a heartbeat of a new session was dropped because the buffer held `max_heartbeat_buffer` sessions, or the oldest whole session was dropped because the buffer was still over `max_heartbeat_buffer_bytes` with no snapshot left to drop; `snapshot_oversize` = a single heartbeat larger than about 3 MiB was sent without its snapshot; `snapshot_evicted` = a retained snapshot was dropped, oldest first, because the buffer was over `max_heartbeat_buffer_bytes`; `heartbeat_oversize` = a heartbeat still larger than about 3 MiB after its snapshot was removed, or with more than 512 status tags, or with a status tag key or value over about 64 KiB or more than about 256 KiB of tag bytes in total (checked before the UTF-8 repair), was forwarded without its status tags; `heartbeat_invalid` = a heartbeat with a status tag that is not valid UTF-8 was forwarded with the invalid bytes replaced by replacement characters (the reason also counts tags removed because a tag was not a binary, and a heartbeat dropped for a bad or empty session id; see Heartbeat Batching); `chunk_rejected` = a single heartbeat the server rejected with a non-transient status was dropped). What is lost is older heartbeat state; for `heartbeat_oversize` the status tags of one heartbeat, for `heartbeat_invalid` only the invalid bytes, and for `chunk_rejected` one whole heartbeat. See [Heartbeat Batching](#heartbeat-batching). |
 | `yuzu_gw_heartbeat_coalesced_total` | counter | Buffered heartbeats replaced by a newer heartbeat of the same session (unlabelled). Expected to rise while the server is unreachable. While a backlog is coalesced, the server's `yuzu_heartbeats_received_total{via="gateway"}` under-counts, because it counts the heartbeats the server received. |
+| `yuzu_gw_upstream_notify_pending` | gauge | Stream-status notifications held because the in-flight limit is reached or the upstream circuit breaker is not closed; drained first in first out (0 = nothing held). Label `node`, created at 0 at start. Counts the current upstream client process only (the probe notification in flight is counted by `yuzu_gw_upstream_notify_inflight`, not here) |
+| `yuzu_gw_upstream_notify_inflight` | gauge | NotifyStreamStatus workers tracked by this gateway process (at most 10). Label `node`, created at 0 at start. Counts the current upstream client process only: workers of a previous process after an upstream client restart are not counted |
+| `yuzu_gw_upstream_notify_coalesced_total` | counter | Held stream-status notifications replaced by a newer event for the same agent session. Unlabelled, created at 0 at start. It measures suppression, not delivery: an identical repeated `CONNECTED` and a failed probe superseded by a newer event for its key also count |
+| `yuzu_gw_upstream_notify_dropped_total` | counter | Stream-status notifications lost at admission because the pending store already held `notify_pending_max` keys (label `reason`, closed set of one: `at_capacity`, created at 0 at start). The value `circuit_open` is retired: a notification that arrives while the breaker is not closed is held, and only an older gateway still exports it. It does not count delivery loss after admission (a failed or killed worker, a gateway stop) |
 | `yuzu_gw_cluster_peers_resolved` | gauge | Peer addresses found by the cluster-formation redial loop's most recent tick (label `node`; HA WS-4 `#4555`). 0 is expected for a genuinely single-node deployment. |
 | `yuzu_gw_cluster_peers_connected` | gauge | Distribution-connected peer nodes as of the most recent redial tick (label `node`; `#4555`). Compare against `peers_resolved` — a sustained gap most often means a distribution-cookie mismatch across replicas. |
 | `yuzu_gw_cluster_connect_failures_total` | counter | Total `net_kernel:connect_node/1` failures from the redial loop (`#4555`). |

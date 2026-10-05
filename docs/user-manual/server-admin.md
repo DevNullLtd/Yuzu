@@ -552,6 +552,14 @@ because the routing directory itself was degraded at that moment is not
 retried within that recovery cycle and can strand an agent server-unknown
 until its own next reconnect (`#4634`).
 
+Update (#4632, 2026-10-05): a gateway that includes #4632 holds a
+re-announcement it cannot send at once (10 notifications already in flight, or
+the circuit breaker not closed) and sends it first in first out, instead of
+dropping it as described above. It is dropped, and counted in
+`yuzu_gw_upstream_notify_dropped_total{reason="at_capacity"}`, only when
+`notify_pending_max` keys are already held. See "Stream Status Notification" in
+[gateway.md](gateway.md#stream-status-notification).
+
 ### vNEXT — multi-cluster gateway mode now binds each agent to its own cluster, closing a claim-then-answer hijack (#4669; NOT breaking, gateway-fronted multi-cluster deployments only)
 
 New, non-breaking, purely additive. No operator action required for single-gateway (non-multi-cluster) deployments — read on only if you run `--gateway-cluster-addr` (multi-cluster gateway mode).
