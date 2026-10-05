@@ -535,19 +535,19 @@ handle_info(replay_next, #state{replay_queue = [{AgentId, SessionId, RegisterReq
                 prune_recent_replays(State1#state{replay_queue = []});
             {allow, #state{notify_pids = Pids} = State1}
                     when map_size(Pids) >= ?MAX_NOTIFY_INFLIGHT ->
-                %% HA WS-4 4.4 review fix (F2): a replay-ADOPTED session
-                %% triggers a reannounce-driven CONNECTED
-                %% (yuzu_gw_agent:reannounce/2 -> notify_stream_status),
-                %% which shares the SAME ?MAX_NOTIFY_INFLIGHT budget as
-                %% every other stream-status notify. Driving the drip at a
-                %% fixed spacing regardless of that budget risks the
-                %% notify being silently DROPPED at capacity (see
-                %% handle_cast({notify_stream_status,...}) above) right
-                %% when 4.4's convergence mechanism needs it most — a
-                %% fleet-scale recovery replay is exactly when
-                %% notify_pids is busiest. Retry the SAME head entry
-                %% later (replay_queue is NOT advanced) rather than
-                %% popping it and risking a dropped reannounce. replay_queue
+                %% Back-pressure, not drop avoidance (#4632). A replay-ADOPTED
+                %% session triggers a reannounce-driven CONNECTED
+                %% (yuzu_gw_agent:reannounce/2 -> notify_stream_status). That
+                %% cast is now HELD in the pending store when every notify
+                %% slot is busy, so it can no longer be dropped at capacity;
+                %% it only waits its turn behind the held entries. This
+                %% check still paces the drip to the notify budget so a
+                %% fleet-scale replay does not pile thousands of
+                %% reannounce CONNECTEDs into the pending store at once.
+                %% drain/1 keeps one slot free while replay_queue is
+                %% non-empty, so this clause fires only when the slots were
+                %% already full before the replay armed. Retry the SAME head
+                %% entry later (replay_queue is NOT advanced). replay_queue
                 %% is untouched (still `[{AgentId, SessionId, RegisterReq} |
                 %% Rest]`), so the same head retries on the next tick.
                 schedule_replay_next(State1#state.replay_queue, Spacing),
