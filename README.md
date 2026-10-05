@@ -157,6 +157,8 @@ curl -fsSL https://raw.githubusercontent.com/DevNullLtd/Yuzu/main/deploy/docker/
 YUZU_VERSION=0.14.0 docker compose up -d
 ```
 
+This quickstart compose builds the server from source (`build: ../..`) and ignores `YUZU_VERSION`, so it is for evaluating Yuzu from a checkout of this repository, not a download-only install ([#5419](https://github.com/DevNullLtd/Yuzu/issues/5419)).
+
 Open `http://localhost:8080` and sign in with the credentials set during first-run provisioning.
 
 ## Building

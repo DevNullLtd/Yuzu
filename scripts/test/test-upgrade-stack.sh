@@ -535,16 +535,31 @@ record_timing "synthetic-uat-against-upgraded" "$(elapsed_ms "$T_START")"
 # in Postgres, and if that directory is not on a volume the recreated server
 # refuses to boot with kek_unresolvable. Asserts: the cert dir's contents are
 # byte-identical across the recreate, /readyz goes ready, and login works.
+# Negative control (#5370 review, server-certs line removed from the compose):
+# with --old-version 0.14.0 the run fails EARLIER, at "wait for /readyz after
+# upgrade" (the image swap already loses the registered KEK); with
+# --old-version 0.13.0 every earlier step passes and THIS step fails
+# ("/readyz never went ready after the recreate", kek_unresolvable in the log).
 # Only a digest of the per-file hashes is logged, never key material.
 
+# Host-side SHA-256: macOS before 14 ships `shasum`, not `sha256sum` (same
+# fallback as scripts/yuzu-backup.sh). The per-file hashes inside the container
+# use the server image's own sha256sum.
+host_sha256() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum | awk '{print $1}'
+    else
+        shasum -a 256 | awk '{print $1}'
+    fi
+}
 certs_digest() {
     YUZU_VERSION="$NEW_VERSION" YUZU_TEST_CONFIG="$CONFIG_FILE" \
         docker compose -f "$HERE/docker-compose.upgrade-test.yml" \
         --project-name "$PROJECT_NAME" exec -T server \
         bash -c 'cd /etc/yuzu/certs && test -f secrets-kek-v1.key && sha256sum -- *' \
-        2>/dev/null | sha256sum | awk '{print $1}'
+        2>/dev/null | host_sha256
 }
-EMPTY_DIGEST=$(printf '' | sha256sum | awk '{print $1}')
+EMPTY_DIGEST=$(printf '' | host_sha256)
 
 phase "step: recreate the server container at NEW ${NEW_VERSION} (#5370)"
 T_START=$(now_ms)
@@ -584,7 +599,9 @@ else
         LOGIN_HTTP=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 \
             "$DASHBOARD_URL/login" \
             -d "username=${USERNAME}&password=${PASSWORD}" 2>/dev/null || echo "000")
-        if [[ "$CERTS_AFTER" != "$CERTS_BEFORE" ]]; then
+        if [[ -z "$CERTS_AFTER" || "$CERTS_AFTER" == "$EMPTY_DIGEST" ]]; then
+            fl "could not read /etc/yuzu/certs (or secrets-kek-v1.key is missing) after the recreate"
+        elif [[ "$CERTS_AFTER" != "$CERTS_BEFORE" ]]; then
             fl "/etc/yuzu/certs changed across the recreate (before ${CERTS_BEFORE:0:12}, after ${CERTS_AFTER:0:12})"
         elif [[ ! "$LOGIN_HTTP" =~ ^[23] ]]; then
             fl "login HTTP $LOGIN_HTTP after the recreate"

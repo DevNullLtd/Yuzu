@@ -131,9 +131,9 @@
 
           <div class="field">
             <label>
-              <input type="checkbox" id="persist-certs" checked> Persist generated certs across recreates
+              <input type="checkbox" id="persist-certs" checked disabled> Persist generated certs across recreates
             </label>
-            <small>Mounts a volume at <code>/etc/yuzu/certs</code> (the default cert dir). Strongly recommended — without it the CA is regenerated on every container recreate.</small>
+            <small>Always on since 0.14.1: this directory holds the secrets KEK registered in Postgres and the per-install CA (#5370)</small>
           </div>
         </fieldset>
 

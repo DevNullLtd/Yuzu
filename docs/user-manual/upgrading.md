@@ -24,54 +24,93 @@ This guide covers upgrading Yuzu components (server, agent, gateway) between ver
 
 ## ⚠️ Docker Compose: copy `/etc/yuzu/certs` out of the server container before you recreate it (0.14.0 → 0.14.1, #5370)
 
-**Who this affects.** A Docker Compose deployment whose server keeps no volume on `/etc/yuzu/certs`. In 0.14.0 that is the build-from-source stack `deploy/docker/docker-compose.yml` (the one the README points at) and the single-file `docker-compose.uat.yml`, along with any compose you copied from them. The Compose Wizard's output has it too in Plaintext mode, or with "Persist generated certs" unticked. `docker-compose.reference.yml` and `docker-compose.reference-gateway.yml` already keep the directory on their `certs` volume and are not affected.
+**Who this affects.** Affected: a 0.14.0 Docker Compose stack whose server has no volume on `/etc/yuzu/certs` while Postgres has one — `deploy/docker/docker-compose.yml` (the README quickstart), `docker-compose.uat.yml`, `docker-compose.full-uat.yml`, `docker-compose.viz-uat.yml`, `docker-compose.demo.yml` used with `--keep`, any compose copied from them, and Compose Wizard output from before 0.14.1 in Plaintext mode or with 'Persist generated certs' unticked. Not affected: `docker-compose.reference.yml` and `docker-compose.reference-gateway.yml` (their `certs` volume).
 
-**Why.** The server keeps its internal CA, its default certificates and the secrets key-encryption key (KEK, `secrets-kek-v1.key`) in `/etc/yuzu/certs`. Since 0.14.0 the KEK is also registered in Postgres, whose data is on a volume. In the affected composes the key files sit in the container's own writable layer instead, so anything that replaces the container deletes them: an image upgrade, `docker compose down` then `up`, `up --force-recreate`, or an `up` after a change to the server's settings. The next start then fails, on every restart, with:
+**Why.** The server keeps its internal CA, its default certificates and the secrets key-encryption key (KEK, `secrets-kek-v1.key`) in `/etc/yuzu/certs`. Since 0.14.0 the KEK is also registered in Postgres, whose data is on a volume. In the affected composes the key files sit in the container's own writable layer instead, so anything that replaces the container deletes them: an image upgrade, `docker compose down` then `up`, `up --force-recreate`, or an `up` after a change to the server's settings. Bumping only the image tag (or `YUZU_VERSION`) under the old compose file also triggers it. The next start then fails, on every restart, with:
 
 ```
 SecretCodec::init() failed for the auth store bootstrap — kek_unresolvable: registered KEK 'secrets-kek-v1' does not resolve through the KekProvider
 ```
 
-The 0.14.1 composes add a `server-certs` volume on `/etc/yuzu/certs`. Switching to them still recreates the container, so copy the files out first. Do this before anything else touches the stack:
+The 0.14.1 composes add a `server-certs` volume on `/etc/yuzu/certs`. Switching to them still recreates the container, so copy the files out first. Do this before anything else touches the stack. Paste the blocks one at a time, and go on only when a block ends without printing `STOP`:
 
 ```bash
 # Run from the directory that holds your compose file (deploy/docker for the
 # build-from-source stack). If the file is not named docker-compose.yml, add
-# `-f <file>` to every docker compose command.
+# `-f <file>` to every docker compose command. For docker-compose.uat.yml, read
+# step 6 first: its variables must be exported before step 0.
+
+# 0. Pre-flight: exactly one server container, and the keys are in it.
+docker compose ps -a server
+docker compose exec -T server ls -ln /etc/yuzu/certs      # expect secrets-kek-v*.key (0600) + default-ca.key
 
 # 1. Stop the server, but do not remove it: its container still holds the keys.
 docker compose stop server
+```
 
-# 2. Copy the directory out of the stopped container. `docker cp ... -` writes a
-#    tar stream, which keeps each file's owner and mode. The archive holds the
-#    CA private key and the KEK: keep it as safe as the server itself.
-docker cp "$(docker compose ps -aq server)":/etc/yuzu/certs - > yuzu-certs-backup.tar
-tar -tvf yuzu-certs-backup.tar            # expect certs/secrets-kek-v1.key and certs/default-ca.key
-tar -xOf yuzu-certs-backup.tar certs/default-ca.pem | openssl x509 -noout -fingerprint -sha256
+```bash
+# 2. Copy the directory out of the stopped container: outside the checkout,
+#    owner-only, never over an existing file, and checked before it counts.
+#    `docker cp ... -` writes a tar stream, which keeps each file's owner and
+#    mode. The archive holds the CA private key and the KEK: keep it as safe as
+#    the server itself. The function returns instead of exiting, so a failure
+#    leaves your shell open; nothing is kept unless every check passes.
+BK="$HOME/yuzu-keys-backup"
+yuzu_copy_out() {
+  local cid out
+  mkdir -p "$BK" && chmod 700 "$BK" || { echo "STOP: cannot create $BK"; return 1; }
+  cid=$(docker compose ps -aq server)
+  [ -n "$cid" ] && [ "$(printf '%s\n' "$cid" | wc -l)" -eq 1 ] \
+    || { echo "STOP: expected exactly one server container, found: ${cid:-none}"; return 1; }
+  out="$BK/yuzu-certs-$(date -u +%Y%m%dT%H%M%SZ).tar"
+  ( umask 077; set -o noclobber; docker cp "$cid":/etc/yuzu/certs - > "$out.partial" ) \
+    || { echo "STOP: copy failed; do not continue"; rm -f "$out.partial"; return 1; }
+  tar -tf "$out.partial" | grep -qx 'certs/secrets-kek-v1.key' \
+    && tar -tf "$out.partial" | grep -qx 'certs/default-ca.key' \
+    || { echo "STOP: the archive lacks the KEK or the CA key; do not continue"; rm -f "$out.partial"; return 1; }
+  mv -n "$out.partial" "$out" && [ ! -e "$out.partial" ] \
+    || { echo "STOP: could not move the archive into place"; return 1; }
+  OUT="$out"; echo "OK: $OUT"
+}
+yuzu_copy_out
+# If you have ever rotated the KEK: every kek_version printed by
+#   docker compose exec -T postgres psql -U yuzu -d yuzu -tAc 'select kek_version from secrets.kek_meta'
+# must have a certs/secrets-kek-v<N>.key entry in `tar -tf "$OUT"`.
+tar -xOf "$OUT" certs/default-ca.pem | openssl x509 -noout -fingerprint -sha256   # note it
+```
 
+```bash
 # 3. Switch to the 0.14.1 compose file: `git pull` in a checkout, or download it
-#    again. For a compose of your own, add the volume yourself (see below).
+#    again into the SAME directory (a different directory is a different compose
+#    project, with its own empty volumes). For a compose of your own, add the
+#    volume yourself (see below).
 
 # 4. Fill the new volume from the copy. `docker compose run` creates the
 #    server-certs volume and mounts it in a one-off container, leaving the
-#    stopped server container alone.
+#    stopped server container alone. "$OUT" is the file step 2 printed.
 docker compose run --rm --no-deps -T --user 0 --entrypoint tar server \
     -x -p --same-owner --numeric-owner -C /etc/yuzu/certs --strip-components=1 \
-    -f - < yuzu-certs-backup.tar
+    -f - < "$OUT"
 
-# 5. Check the files arrived, owned by the image's yuzu user (uid 999).
+# 5. Check the files arrived, owned by the uid the server runs as: 999 for
+#    `yuzu-server`, 1000 for `yuzu-server-chisel`.
 docker compose run --rm --no-deps -T --entrypoint ls server -ln /etc/yuzu/certs
 
-# 6. Recreate the server. Add --build for the build-from-source stack; set
-#    YUZU_VERSION for docker-compose.uat.yml.
+# 6. Recreate the server. Add --build for the build-from-source stack. For
+#    `docker-compose.uat.yml` export `YUZU_VERSION=0.14.1` and the variables the
+#    file requires (e.g. `YUZU_GW_COOKIE`) for EVERY command in this recipe.
 docker compose up -d
 ```
 
-Then confirm the server came back on the same keys. `docker compose logs server | grep secret_codec` shows `verified 1 registered KEK version(s)` (one per KEK version you have), and this fingerprint matches the one step 2 printed:
+Never re-run step 2 once step 6 has run: from then on the server container is a new one. If you do, the checks stop it before anything is kept, and the first archive is untouched.
+
+Then confirm the server came back on the same keys. `docker compose logs server | grep secret_codec` shows `verified 1 registered KEK version(s)` (the count is of KEK versions, and the line repeats once per store that opens the codec), and this fingerprint matches the one step 2 printed:
 
 ```bash
 docker compose exec -T server cat /etc/yuzu/certs/default-ca.pem | openssl x509 -noout -fingerprint -sha256
 ```
+
+Keep the archive as the keys half of a paired backup ([the KEK pairing rule](../ops-runbooks/auth-db-recovery.md#backup--the-kek-pairing-rule)) or `shred -u` it; never commit it.
 
 For a compose of your own, the change is one volume on the server service:
 
@@ -84,9 +123,31 @@ volumes:
   server-certs:
 ```
 
-A new named volume takes its owner from the image's `/etc/yuzu/certs`, which the `yuzu-server` image creates owned by `yuzu`, so a fresh install needs no `chown`. The chiselled `yuzu-server-chisel` image creates that directory only from 0.14.1. The demo stack (`docker-compose.demo.yml`) runs a one-shot `server-certs-init` service that gives the volume to the server user, so it also works with older chiselled images.
+A new named volume takes its owner from the image's `/etc/yuzu/certs`, which the `yuzu-server` image creates owned by `yuzu`, so a fresh install needs no `chown`. The chiselled `yuzu-server-chisel` image creates that directory only from 0.14.1; on 0.14.0 and earlier chiselled images a new volume is owned by root and the server cannot write to it. The demo stack (`docker-compose.demo.yml`) runs a one-shot `server-certs-init` service that gives the volume to the server user, so it also works with older chiselled images.
 
-**If the server is already failing with `kek_unresolvable`.** Recreating the container deleted its key files. Nothing inside the server can rebuild them.
+**Rolling back.** To return to 0.14.0, change only the image tag/`YUZU_VERSION`; keep the 0.14.1 compose with its `server-certs` line. Reverting the compose file strands the keys on the undeclared volume, and `down -v` under the old file deletes Postgres while leaving the keys.
+
+**If the server is failing with `kek_unresolvable`.** Work out which failure it is before you touch anything; several of them leave the keys intact, and only the last one means they are gone.
+
+```bash
+docker compose ps server            # STATUS "Restarting": the server refuses to start
+docker compose logs server | grep -m1 -E 'kek_unresolvable|provider_failure|kek_orphaned'
+docker volume ls --filter name=server-certs
+#   (a) a volume is listed but `docker compose config | grep /etc/yuzu/certs` prints nothing
+#       → the compose lost the volume line (a rollback, or an old file). Restore the line,
+#       `docker compose up -d`. Never `down -v`.
+docker compose run --rm --no-deps -T --user 0 --entrypoint ls server -ln /etc/yuzu/certs
+#   (b) files present, owner ≠ the server's uid → chown them to that uid (999 for
+#       yuzu-server, 1000 for yuzu-server-chisel), `docker compose up -d`:
+#         docker compose run --rm --no-deps -T --user 0 --entrypoint chown server -R 999:999 /etc/yuzu/certs
+#   (c) provider_failure → the directory is not writable (a chiselled ≤0.14.0 image's
+#       root-owned volume, or an :ro mount) → chown it 1000:1000 / make it writable
+#   (d) empty → recovery below
+```
+
+The chiselled image has no `ls` or `chown`. For it, run the same commands in a throwaway container on the volume, for example `docker run --rm -v <project>_server-certs:/c busybox ls -ln /c` (`docker volume ls` prints the full name).
+
+Only case (d) means the key files are gone. Nothing inside the server can rebuild them.
 
 - **You have a copy of the directory**, from a backup taken with the database (see [the KEK pairing rule](../ops-runbooks/auth-db-recovery.md#backup--the-kek-pairing-rule)) or an archive like the one in step 2. Switch to the 0.14.1 compose and fill the volume. From a `docker cp` archive, use step 4 as written. From a copy that has passed through your own filesystem (an unpacked backup, say), the files now belong to your user rather than to the server, so hand them back to it:
 
@@ -97,7 +158,18 @@ A new named volume takes its owner from the image's `/etc/yuzu/certs`, which the
   ```
 
   Then run `docker compose up -d`. Restore the KEK and the `default-*` files together. If the KEK comes back but the CA files do not, the server refuses to mint a new CA over the one recorded in Postgres. Restore `default-*.{pem,key}` too, or follow the deliberate clean re-root in `docs/pki-architecture.md` "Operator runbook".
-- **You have no copy.** This database cannot be used again. Every start checks each registered KEK and refuses. The one-shot modes `--mfa-reset` and `--break-glass-arm` run after that check, so they stop with the same `kek_unresolvable` error. What is gone: the CA private key, so every agent certificate it issued no longer chains and every agent must enroll again; and every secret sealed under the KEK, including TOTP enrolments, webhook signing secrets and the other secret columns listed in `docs/user-manual/server-admin.md` "Key management (secrets KEK)". Passwords and API tokens are hashed, not sealed, but they live in the same database. The way forward is a new install: `docker compose down -v` deletes the Postgres volume along with the others. Then provision the admin account again, re-enroll your agents, and re-create your configuration. To keep the old data for reference, `pg_dump` it first. Do not restore that dump into the new install: it still registers the lost KEK, and the server would refuse to start again.
+- **You have no copy.** Work through these in order.
+  1. Dump the database first. It holds your audit log and configuration; the server cannot export it for you while it refuses to start. Keep the dump and query it offline, but never restore it into the new install (it registers the lost KEK).
+
+     ```bash
+     BK="$HOME/yuzu-keys-backup"; mkdir -p "$BK" && chmod 700 "$BK"
+     ( umask 077; docker compose exec -T postgres pg_dump -U yuzu --format=custom yuzu \
+         > "$BK/yuzu-final-$(date -u +%Y%m%dT%H%M%SZ).dump" ) && echo "dump written to $BK"
+     ```
+
+  2. **Do not delete rows from `secrets.kek_meta` to force a start.** The server then mints a new key under the same version number, every secret sealed under the lost key (webhook secrets, plugin and runtime config secrets, offload credentials) becomes permanently undecryptable with no error at boot, and a key file you later find cannot be used (#5421).
+  3. This database cannot be brought back by any supported means. Every start checks each registered KEK and refuses. The one-shot modes `--mfa-reset` and `--break-glass-arm` run after that check, so they stop with the same `kek_unresolvable` error. What is gone: the CA private key, so every agent certificate it issued no longer chains and every agent must enroll again; and every secret sealed under the KEK, including TOTP enrolments, webhook signing secrets and the other secret columns listed in `docs/user-manual/server-admin.md` "Key management (secrets KEK)". Passwords and API tokens are hashed, not sealed, but they live in the same database.
+  4. Start a new install: `docker compose down -v` deletes the Postgres volume along with the others. Then provision the admin account again, re-enroll your agents, and re-create your configuration.
 
 ## Behaviour change: DEX device score and management-group member reads now fail closed on a degraded read (#4855, #1762)
 
@@ -3297,7 +3369,7 @@ curl -s http://localhost:8080/livez
 
 ### Docker
 
-The reference deployment template lives at `deploy/docker/docker-compose.reference.yml` — copy it into your deployment directory next to a `.env` file, set `YUZU_VERSION`, and harden per the inline TLS checklist in the file header **before** exposing the stack to any untrusted network. The compose file declares a named volume (`server-data`) that survives container replacement and holds every piece of mutable state: `yuzu-server.cfg`, all SQLite databases, `enrollment-tokens.cfg`, `pending-agents.cfg`, `auto-approve.cfg`, and OTA binaries.
+The reference deployment template lives at `deploy/docker/docker-compose.reference.yml` — copy it into your deployment directory next to a `.env` file, set `YUZU_VERSION`, and harden per the inline TLS checklist in the file header **before** exposing the stack to any untrusted network. The compose file declares two named volumes for the server that survive container replacement: `server-data` holds `yuzu-server.cfg`, all SQLite databases, `enrollment-tokens.cfg`, `pending-agents.cfg`, `auto-approve.cfg`, and OTA binaries; `certs` holds `/etc/yuzu/certs`, the internal CA and the secrets KEK files that the Postgres data (on `postgres-data`) depends on.
 
 An upgrade is a pull-and-restart:
 
@@ -3322,9 +3394,15 @@ Schema migrations execute automatically during the first `up` with the new image
 **Back up before upgrading** (run from a dedicated backup directory so `$PWD` is predictable):
 
 ```bash
-mkdir -p ~/yuzu-backups && cd ~/yuzu-backups
+mkdir -p ~/yuzu-backups && chmod 700 ~/yuzu-backups && cd ~/yuzu-backups
 docker run --rm -v server-data:/data -v "$PWD":/backup alpine \
   tar czf "/backup/yuzu-data-$(date +%F).tar.gz" -C /data .
+
+# The keys directory (the certs volume: CA + secrets KEK). Its full name is
+# <project>_certs; `docker volume ls` prints it. The archive holds the CA private
+# key, so it is written owner-only and handed to you; keep it outside any git checkout.
+docker run --rm -v <project>_certs:/certs -v "$PWD":/backup alpine \
+  sh -c "umask 077; tar czf /backup/yuzu-keys-$(date +%F).tar.gz -C / certs && chown $(id -u):$(id -g) /backup/yuzu-keys-$(date +%F).tar.gz"
 
 # PostgreSQL state (the postgres-data volume) — pg_dump is consistent
 # against a LIVE database, no stop required:
@@ -3334,7 +3412,7 @@ docker exec yuzu-postgres pg_dump -U postgres --format=custom yuzu \
 
 > **Note:** this recipe is a cold-ish backup — SQLite is running in WAL mode and a filesystem-level `tar` of a live database may capture a torn snapshot. For strong consistency, `docker compose -f docker-compose.reference.yml stop server` before backup (seconds of downtime) and `start` after. A fully hot backup via SQLite's online-backup API is tracked in the roadmap. The `pg_dump` half has no such caveat — logical dumps are transactionally consistent by construction. **Never** back up Postgres by `tar`-ing the `postgres-data` volume while the database is running; a torn copy of `pg_wal/` is unrecoverable, which is why the procedure above dumps through the database instead.
 
-> **Restore-pairing (ADR-0010 — forward reference):** once envelope-encrypted secrets land, the Postgres dump contains ciphertext + wrapped DEKs only and is unusable without the matching `KeyProvider` keys directory. Back up and restore the two **as a pair** — full procedure in [Server Administration § PostgreSQL Substrate](server-admin.md#postgresql-substrate), key-management runbook tracked in #1341.
+> **Restore-pairing (ADR-0010):** since 0.14.0 the Postgres dump contains envelope-encrypted secrets (ciphertext + wrapped DEKs only) and is unusable without the matching `KeyProvider` keys directory, the `certs` volume above. Back up and restore the two **as a pair**: capture order and the full procedure are in [the KEK pairing rule](../ops-runbooks/auth-db-recovery.md#backup--the-kek-pairing-rule); see also [Server Administration § PostgreSQL Substrate](server-admin.md#postgresql-substrate).
 
 **Rollback if a migration fails** (Docker):
 
@@ -3357,7 +3435,7 @@ export YUZU_VERSION=0.9.0
 docker compose -f docker-compose.reference.yml up -d server
 ```
 
-**Never** run `docker compose down -v` unless you intend to delete `server-data`, `postgres-data` (the PostgreSQL substrate — the server's primary data store), and every bit of server state. `down` alone is safe; the `-v` flag removes named volumes.
+**Never** run `docker compose down -v` unless you intend to delete `server-data`, the keys volume (`certs` in the reference composes, `server-certs` in the others: the CA and the secrets KEK), `postgres-data` (the PostgreSQL substrate — the server's primary data store), and every bit of server state. `down` alone is safe; the `-v` flag removes named volumes.
 
 ### Windows
 
@@ -3433,7 +3511,7 @@ A new operator-managed plugin trust bundle ships in this release. **Default beha
 
 If you turn the feature on, three things change:
 
-1. **New on-disk artifact at `<cert-dir>/plugin-trust-bundle.pem`.** Linux/macOS: `/etc/yuzu/certs/plugin-trust-bundle.pem`; Windows: `C:\ProgramData\Yuzu\certs\plugin-trust-bundle.pem`. **Add this path to your backup procedure** alongside the SQLite databases. A backup that captures the DBs but not the cert dir restores `plugin_signing_required=true` (in `runtime_config`) without the bundle, and require-mode agents reject every plugin until the bundle is restored. The Docker reference `docker-compose.reference.yml` mounts only `server-data`; if your cert dir is outside that volume you must add a separate bind-mount or named volume and include it in the backup script.
+1. **New on-disk artifact at `<cert-dir>/plugin-trust-bundle.pem`.** Linux/macOS: `/etc/yuzu/certs/plugin-trust-bundle.pem`; Windows: `C:\ProgramData\Yuzu\certs\plugin-trust-bundle.pem`. **Add this path to your backup procedure** alongside the SQLite databases. A backup that captures the DBs but not the cert dir restores `plugin_signing_required=true` (in `runtime_config`) without the bundle, and require-mode agents reject every plugin until the bundle is restored. The Docker reference `docker-compose.reference.yml` mounts `server-data` and `certs` (the cert dir); include both in the backup script. A compose of your own must keep the cert dir on a named volume too.
 
 2. **Cert-dir filename collision check.** The server now treats `plugin-trust-bundle.pem` in the cert dir as authoritative. The filename was unused in prior releases, but if any deployment placed an unrelated PEM at that exact path for another purpose, it will be interpreted as the plugin trust bundle on first read after upgrade. Run `ls <cert-dir>/plugin-trust-bundle.pem` on every server host before upgrading and rename any pre-existing file.
 
