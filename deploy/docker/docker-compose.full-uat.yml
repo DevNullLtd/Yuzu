@@ -62,6 +62,11 @@ services:
     volumes:
       - ${UAT_CONFIG}:/etc/yuzu/yuzu-server.cfg:ro
       - server-data:/var/lib/yuzu
+      # CA, default certs and the secrets KEK (registered in Postgres) live in
+      # /etc/yuzu/certs. Persist it alongside the Postgres volume, or a server
+      # recreate loses the key file and the server refuses to boot with
+      # kek_unresolvable (#5370).
+      - server-certs:/etc/yuzu/certs
       # InstructionDefinitions are embedded into yuzu-server at build time
       # (server/core/scripts/embed_content.py); no host mount required.
     depends_on:
@@ -185,6 +190,7 @@ services:
 
 volumes:
   server-data:
+  server-certs:
   postgres-uat-data:
   prometheus-uat-data:
   grafana-uat-data:

@@ -61,28 +61,48 @@
 ## before any destructive operation; don't `down -v` unless you intend to
 ## re-root the CA and wipe state.
 ##
-## Backup (run from a dedicated backup directory so $PWD is predictable):
-##   mkdir -p ~/yuzu-backups && cd ~/yuzu-backups
-##   docker run --rm -v server-data:/data -v "$PWD":/backup alpine \
-##     tar czf "/backup/yuzu-data-$(date +%F).tar.gz" -C /data .
-##   # The CA + leaf certs — back these up too, or agents lose trust on re-root.
-##   docker run --rm -v certs:/certs -v "$PWD":/backup alpine \
-##     tar czf "/backup/yuzu-certs-$(date +%F).tar.gz" -C /certs .
-##   # Postgres state: pg_dump through the database — consistent against a
-##   # LIVE instance. Never tar the postgres-data volume while it runs (a
-##   # torn pg_wal/ copy is unrecoverable).
+## Backup (run from a dedicated backup directory so $PWD is predictable).
+## Compose prefixes volume names with the project name (the directory name
+## unless set with -p / COMPOSE_PROJECT_NAME): from deploy/docker they are
+## docker_server-data and docker_certs. `docker volume ls` prints the full
+## names; set P to the project name. `docker run -v <name>:...` silently
+## creates an EMPTY volume for a wrong name, hence the inspect first. Dump
+## Postgres FIRST, then the keys (key files only accumulate, so a keys
+## archive taken after the dump covers every key the dump references):
+## Set P, and C to this file's absolute path (the recipes cd away from it):
+##   P=docker; C=/path/to/deploy/docker/docker-compose.reference.yml
+##   mkdir -p ~/yuzu-backups && chmod 700 ~/yuzu-backups && cd ~/yuzu-backups
+## The last docker run archives the CA + leaf certs + secrets KEK (the keys
+## half of the pair). Go on only after "OK: backup written":
+##   docker volume inspect "${P}_server-data" "${P}_certs" >/dev/null && \
 ##   docker exec yuzu-postgres pg_dump -U postgres --format=custom yuzu \
-##     > "yuzu-pg-$(date +%F).dump"
+##     > "yuzu-pg-$(date +%F).dump" && \
+##   docker run --rm -v "${P}_server-data":/data -v "$PWD":/backup alpine \
+##     tar czf "/backup/yuzu-data-$(date +%F).tar.gz" -C /data . && \
+##   docker run --rm -v "${P}_certs":/certs -v "$PWD":/backup alpine \
+##     sh -c "umask 077; tar czf /backup/yuzu-keys-$(date +%F).tar.gz -C / certs && chown $(id -u):$(id -g) /backup/yuzu-keys-$(date +%F).tar.gz" && \
+##   echo "OK: backup written" || echo "STOP: backup incomplete, see the error above"
+##   Never tar the postgres-data volume while it runs (a torn pg_wal/ copy is
+##   unrecoverable); pg_dump through the database is consistent against a
+##   LIVE instance.
 ##
-## Restore (with server stopped):
-##   docker compose -f docker-compose.reference.yml down server
-##   docker run --rm -v server-data:/data -v "$PWD":/backup alpine \
-##     tar xzf "/backup/yuzu-data-YYYY-MM-DD.tar.gz" -C /data
+## Restore (from ~/yuzu-backups; the chain stops the server itself). It
+## puts back all three parts of the backup: the keys first, then the data
+## volume and the database. Go on only after "OK: restored":
+##   docker volume inspect "${P}_server-data" "${P}_certs" >/dev/null && \
+##   docker compose -f "$C" stop server && \
+##   docker run --rm -v "${P}_certs":/certs -v "$PWD":/backup alpine \
+##     tar xzf "/backup/yuzu-keys-YYYY-MM-DD.tar.gz" -C / && \
+##   docker run --rm -v "${P}_server-data":/data -v "$PWD":/backup alpine \
+##     tar xzf "/backup/yuzu-data-YYYY-MM-DD.tar.gz" -C /data && \
 ##   docker exec -i yuzu-postgres pg_restore --clean --if-exists --no-owner \
-##     --role=yuzu -U postgres --dbname=yuzu < "yuzu-pg-YYYY-MM-DD.dump"
-##   docker compose -f docker-compose.reference.yml up -d server
+##     --role=yuzu -U postgres --dbname=yuzu < "yuzu-pg-YYYY-MM-DD.dump" && \
+##   docker compose -f "$C" up -d server && \
+##   echo "OK: restored" || echo "STOP: restore incomplete, see the error above"
+## "OK" means the steps ran; then check the server reaches /readyz (a
+## kek_unresolvable start means the keys and the dump are not a pair).
 ##
-## Once envelope-encrypted secrets land (ADR-0010), the Postgres dump holds
+## Since 0.14.0 (ADR-0010) the Postgres dump holds
 ## ciphertext + wrapped DEKs only — DB and KeyProvider keys-dir backups are
 ## a PAIR and must be restored together. Full procedure + pairing invariant:
 ## docs/user-manual/server-admin.md "PostgreSQL Substrate".
