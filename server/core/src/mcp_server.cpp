@@ -19640,7 +19640,10 @@ McpServer::HandlerFn McpServer::build_handler(
                               "not found or outside caller's fleet-read scope: " +
                                   audit_token(std::string_view(target_id).substr(0, 128)));
                 else
-                    mcp_audit("success", kind + ":" + target_id);
+                    // Caller-supplied id (an unconfined absent id reaches here too):
+                    // neutralised (CRLF / k=v forgery) and capped like the denied row above.
+                    mcp_audit("success", kind + ":" +
+                                             audit_token(std::string_view(target_id).substr(0, 128)));
                 res.set_content(success_response(id, result), "application/json");
                 return;
             }

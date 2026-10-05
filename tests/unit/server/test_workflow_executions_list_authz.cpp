@@ -224,3 +224,40 @@ TEST_CASE("fragments/executions real gate: a principal with no Execution:Read is
     CHECK(anon.status == 401);
     CHECK(anon.ids.empty());
 }
+
+// ITServiceOwner AUTHORITY CEILING through the real fragment: the route's only gate is
+// require_fleet_read, whose service axis now applies the same ceiling as require_permission.
+// With the seeded defaults (ITServiceOwner holds Execution CRUD) nothing changes, which the
+// service-token case above pins; once an operator revokes Execution:Read from ITServiceOwner
+// a service token is refused even though its minter holds the grant, while a non-service
+// principal (global or group-scoped) is unaffected.
+TEST_CASE("fragments/executions real gate: revoking Execution:Read from ITServiceOwner refuses "
+          "service tokens only",
+          "[pg][workflow][executions][list][confinement][authz][service_scope]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::response_execution_authz_tpl);
+    ListRig r{db.dsn()};
+    const auto svc_gary = r.mint("gary", "printers");
+    const auto svc_bob = r.mint("bob", "scanners");
+
+    // Control (seeded defaults): admitted.
+    CHECK(r.get(svc_gary, /*use_tag_aware_auth=*/true).status == 200);
+
+    REQUIRE(r.rig.rbac.remove_permission("ITServiceOwner", "Execution", "Read").has_value());
+
+    auto g = r.get(svc_gary, /*use_tag_aware_auth=*/true);
+    CHECK(g.status == 403);
+    CHECK(g.ids.empty());
+    CHECK(has(g.body, "service-scoped token does not grant Execution:Read"));
+    CHECK_FALSE(has(g.body, "SECRET-ALICE"));
+    auto b = r.get(svc_bob, /*use_tag_aware_auth=*/true);
+    CHECK(b.status == 403);
+    CHECK(b.ids.empty());
+
+    // Non-service principals are unaffected: global gary unfiltered, group-scoped bob confined.
+    auto gary = r.get(r.mint("gary"), /*use_tag_aware_auth=*/true);
+    CHECK(gary.status == 200);
+    CHECK(gary.ids == ListRig::sorted({r.x_bob, r.x_mixed, r.x_alice, r.x_bob_own}));
+    auto bob = r.get(r.mint("bob"), /*use_tag_aware_auth=*/true);
+    CHECK(bob.status == 200);
+    CHECK(bob.ids == ListRig::sorted({r.x_bob, r.x_mixed, r.x_bob_own}));
+}

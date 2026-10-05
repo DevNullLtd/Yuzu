@@ -199,7 +199,7 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         if (!gate.admitted)
             return; // gate already wrote the A4 error body + status.
         if (!execution_tracker) {
-            res.set_content("<div class=\"empty-state\">Not available</div>", "text/html");
+            degraded("unavailable", "Not available");
             return;
         }
 

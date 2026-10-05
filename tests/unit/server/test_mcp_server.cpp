@@ -11327,6 +11327,45 @@ TEST_CASE("MCP summarize_working_set execution: the denied audit detail neutrali
     CHECK(ts.audit_details[1].substr(prefix.size()) == std::string(128, 'a'));
 }
 
+// The `success` row's detail embeds the same caller-supplied id (an UNCONFINED absent id
+// reaches it, and so does a visible id): neutralised and capped exactly like the denied row.
+TEST_CASE("MCP summarize_working_set execution: the success audit detail neutralises and caps "
+          "the caller-supplied id (#4753)",
+          "[pg][mcp][integration][agentic-demo][scope][4753][security]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    yuzu::server::ExecutionTracker& tracker = *tracker_bundle;
+    McpTestServer ts;
+    ts.execution_tracker_for_test = &tracker;
+    ts.start("readonly");
+    const std::string forged = std::string("x\r\nmcp.summarize_working_set|success result=ok");
+    const std::string long_id(5000, 'a');
+    for (const auto& id : {forged, long_id}) {
+        nlohmann::json body = {{"jsonrpc", "2.0"},
+                               {"method", "tools/call"},
+                               {"id", 312},
+                               {"params",
+                                {{"name", "summarize_working_set"},
+                                 {"arguments", {{"kind", "execution"}, {"id", id}}}}}};
+        auto res = ts.call(body.dump());
+        REQUIRE(res);
+    }
+    REQUIRE(ts.audit_log.size() == 2);
+    REQUIRE(ts.audit_details.size() == 2);
+    for (std::size_t i = 0; i < 2; ++i) {
+        CHECK(ts.audit_log[i] == "mcp.summarize_working_set|success");
+        const std::string& d = ts.audit_details[i];
+        REQUIRE(d.rfind("execution:", 0) == 0);
+        const auto tail = d.substr(std::string("execution:").size());
+        CHECK(tail.find('\r') == std::string::npos);
+        CHECK(tail.find('\n') == std::string::npos);
+        CHECK(tail.find(' ') == std::string::npos);
+        CHECK(tail.find('=') == std::string::npos);
+        CHECK(tail.size() <= 128);
+    }
+    CHECK(ts.audit_details[0] == "execution:x__mcp.summarize_working_set|success_result_ok");
+    CHECK(ts.audit_details[1] == "execution:" + std::string(128, 'a'));
+}
+
 TEST_CASE("MCP summarize_working_set execution: owner with zero visible agents sees an empty "
           "projection (#3526)",
           "[pg][mcp][integration][agentic-demo][scope][4753]") {

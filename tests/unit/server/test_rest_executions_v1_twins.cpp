@@ -29,6 +29,7 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 
 using namespace yuzu::server;
@@ -237,6 +238,92 @@ TEST_CASE("GET /api/v1/executions: fleet_read_fn denial → 403",
     auto res = h.sink.Get("/api/v1/executions");
     REQUIRE(res);
     CHECK(res->status == 403);
+}
+
+// Confined list (#3526): the handler pushes the caller's scope into the list query, reads the
+// per-agent status rows through the SAME visible set, and recomputes the counters from the
+// in-scope rows only. Exact ids and exact projected counts, so (a) a mutation that hands the
+// status read some other list (the owner, an empty set) zeroes the counters and (b) one that
+// drops the scope or the owner disjunct changes the id set. Fake gate (the harness has no real
+// chokepoint); the real-gate drive of the same decision is in
+// test_workflow_executions_list_authz.cpp.
+TEST_CASE("GET /api/v1/executions: a confined caller gets owner-or-visible rows with projected "
+          "counts",
+          "[pg][rest][executions][v1][confinement][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, execv1_responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecV1Harness h(pool);
+    h.fleet_read_scope = authz::VisibleSet{std::unordered_set<std::string>{"agent-A", "agent-C"}};
+    h.session_username = "bob";
+
+    auto make = [&](const std::string& by, int64_t at) {
+        Execution e;
+        e.definition_id = "def-rest-confined";
+        e.dispatched_by = by;
+        e.status = "completed";
+        e.dispatched_at = at;
+        e.agents_targeted = 9; // the unconfined counter: must never reach a confined caller
+        auto id = h.execution_tracker->create_execution(e);
+        REQUIRE(id.has_value());
+        return *id;
+    };
+    auto st = [&](const std::string& exec, const std::string& agent, const std::string& status,
+                  const std::string& err, int64_t done) {
+        AgentExecStatus a;
+        a.agent_id = agent;
+        a.status = status;
+        a.completed_at = done;
+        a.error_detail = err;
+        h.execution_tracker->update_agent_status(exec, a);
+    };
+    const auto x_mixed = make("carol", 1735689601); // A ok + B failed: visible via A
+    st(x_mixed, "agent-A", "success", "", 1735689610);
+    st(x_mixed, "agent-B", "failure", "SECRET-B-ERR", 1735689690);
+    const auto x_hidden = make("carol", 1735689602); // B only: invisible
+    st(x_hidden, "agent-B", "failure", "SECRET-B-ONLY", 1735689691);
+    const auto x_own = make("bob", 1735689603); // owner row, B only: visible, counters 0
+    st(x_own, "agent-B", "failure", "SECRET-B-OWN", 1735689692);
+    const auto x_two = make("carol", 1735689604); // A failed + C ok + B ok
+    st(x_two, "agent-A", "failure", "ERR-A", 1735689700);
+    st(x_two, "agent-C", "success", "", 1735689701);
+    st(x_two, "agent-B", "success", "", 1735689702);
+
+    auto res = h.sink.Get("/api/v1/executions");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(res->body.find("SECRET-B") == std::string::npos);
+    auto body = nlohmann::json::parse(res->body);
+    std::unordered_map<std::string, nlohmann::json> rows;
+    for (const auto& row : body["data"])
+        rows[row["id"].get<std::string>()] = row;
+    CHECK(rows.size() == 3);
+    CHECK(rows.count(x_hidden) == 0);
+    REQUIRE(rows.count(x_mixed) == 1);
+    CHECK(rows[x_mixed]["agents_targeted"] == 1);
+    CHECK(rows[x_mixed]["agents_responded"] == 1);
+    CHECK(rows[x_mixed]["agents_success"] == 1);
+    CHECK(rows[x_mixed]["agents_failure"] == 0);
+    CHECK(rows[x_mixed]["error_preview"] == "");
+    REQUIRE(rows.count(x_own) == 1);
+    CHECK(rows[x_own]["agents_targeted"] == 0);
+    CHECK(rows[x_own]["agents_responded"] == 0);
+    CHECK(rows[x_own]["error_preview"] == "");
+    REQUIRE(rows.count(x_two) == 1);
+    CHECK(rows[x_two]["agents_targeted"] == 2);
+    CHECK(rows[x_two]["agents_responded"] == 2);
+    CHECK(rows[x_two]["agents_success"] == 1);
+    CHECK(rows[x_two]["agents_failure"] == 1);
+    CHECK(rows[x_two]["error_preview"] == "ERR-A");
+
+    // The same caller with an empty visible set sees ONLY the row they dispatched.
+    h.fleet_read_scope = authz::VisibleSet{std::unordered_set<std::string>{}};
+    auto none = h.sink.Get("/api/v1/executions");
+    REQUIRE(none);
+    CHECK(none->status == 200);
+    auto nb = nlohmann::json::parse(none->body);
+    REQUIRE(nb["data"].size() == 1);
+    CHECK(nb["data"][0]["id"] == x_own);
+    CHECK(nb["data"][0]["agents_targeted"] == 0);
 }
 
 TEST_CASE("GET /api/v1/executions/:id: bare request has no agents/kpi and is unaudited",

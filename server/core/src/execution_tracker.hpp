@@ -395,11 +395,11 @@ public:
     /// zero of the requested executions have any status rows yet — a
     /// normal, non-degraded outcome for a just-dispatched execution
     /// (`agent_exec_status` is response-arrival-seeded, #3789 finding).
-    std::optional<std::unordered_map<std::string, std::vector<AgentExecStatus>>>
     ///
     /// `visible_agents` (optional, default unfiltered): same SQL-side agent filter as
     /// `get_agent_statuses_checked` -- a confined list caller passes its visible set so the
     /// read is bounded by the caller's scope, not by the fleet width of every execution.
+    std::optional<std::unordered_map<std::string, std::vector<AgentExecStatus>>>
     get_agent_statuses_for_executions_checked(
         const std::vector<std::string>& execution_ids,
         const std::optional<std::vector<std::string>>& visible_agents = std::nullopt) const;
