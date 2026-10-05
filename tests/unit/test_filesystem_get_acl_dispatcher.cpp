@@ -24,12 +24,12 @@
 #include <fstream>
 #include <memory>
 #include <optional>
-#include <set>
 #include <sstream>
 #include <string>
 #include <vector>
 
 #if defined(__linux__)
+#include <set>
 #include <sys/xattr.h>
 #endif
 #if defined(__APPLE__)
@@ -56,24 +56,6 @@ std::vector<std::string> captured_rows(const std::string& captured) {
 
 bool starts_with(const std::string& s, const std::string& p) { return s.rfind(p, 0) == 0; }
 
-/// Splits a row on unescaped '|' (a backslash-escaped pipe is data).
-std::vector<std::string> fields(const std::string& row) {
-    std::vector<std::string> out;
-    std::string cur;
-    for (std::size_t i = 0; i < row.size(); ++i) {
-        if (row[i] == '\\' && i + 1 < row.size() && row[i + 1] == '|') {
-            cur += '|';
-            ++i;
-        } else if (row[i] == '|') {
-            out.push_back(cur);
-            cur.clear();
-        } else {
-            cur += row[i];
-        }
-    }
-    out.push_back(cur);
-    return out;
-}
 
 #if defined(_WIN32)
 constexpr const char* kPluginExt = ".dll";
@@ -228,6 +210,25 @@ TEST_CASE("filesystem get_acl: a plain file reports owner, mode and an acl row, 
 #if defined(__linux__)
 namespace {
 
+/// Splits a row on unescaped '|' (a backslash-escaped pipe is data).
+std::vector<std::string> fields(const std::string& row) {
+    std::vector<std::string> out;
+    std::string cur;
+    for (std::size_t i = 0; i < row.size(); ++i) {
+        if (row[i] == '\\' && i + 1 < row.size() && row[i + 1] == '|') {
+            cur += '|';
+            ++i;
+        } else if (row[i] == '|') {
+            out.push_back(cur);
+            cur.clear();
+        } else {
+            cur += row[i];
+        }
+    }
+    out.push_back(cur);
+    return out;
+}
+
 /// The real captured xattr bytes (fixtures/wave11/filesystem_acl/linux/<name>.hex: `0x` + hex).
 std::string fixture_xattr_bytes(const std::string& name) {
     const auto path =
@@ -246,16 +247,15 @@ std::string fixture_xattr_bytes(const std::string& name) {
     return out;
 }
 
-/// Sets `xattr` to the captured bytes; false (and a WARN) when the temp filesystem refuses
-/// POSIX ACL xattrs, so the case skips instead of failing on such a runner.
-/// A filesystem that does not do POSIX ACLs (ENOTSUP/EOPNOTSUPP) skips the case; any other
-/// failure (EINVAL for an unmapped uid, EPERM, ...) is a real problem and fails it, so the test
-/// cannot go green having asserted nothing.
+/// Sets `xattr` to the captured bytes. Returns false (the caller SKIPs, visibly) when the temp
+/// filesystem does not do POSIX ACLs (ENOTSUP/EOPNOTSUPP) or the runner cannot map the fixture's
+/// uids/gids (EINVAL); any other failure (EPERM, ...) is a real problem and fails the case, so
+/// the test cannot go green having asserted nothing.
 bool set_acl_xattr(const fs::path& target, const char* xattr, const std::string& blob) {
     if (::setxattr(target.c_str(), xattr, blob.data(), blob.size(), 0) == 0)
         return true;
     const int e = errno;
-    if (e == ENOTSUP || e == EOPNOTSUPP)
+    if (e == ENOTSUP || e == EOPNOTSUPP || e == EINVAL)
         return false;
     FAIL("setxattr " << xattr << " failed unexpectedly: errno " << e);
     return false;

@@ -1,5 +1,5 @@
 File: acl_to_text.txt -- libSystem acl_to_text() output (ACL_TYPE_EXTENDED), one ACL.
-REAL CAPTURES, joined under one header. host braga (macOS 26.6.2 arm64), macOS 26.6.2, arm64, captured 2026-10-04.
+REAL CAPTURES, joined under one header. host braga (macOS 26.6.2 arm64), captured 2026-10-04.
 
 Entries 1-2 (resolved), on a scratch directory d:
   chmod +a "group:staff deny write,limit_inherit" d

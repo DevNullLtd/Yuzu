@@ -594,7 +594,7 @@ spec:
         platforms: [windows, linux, darwin]
       - name: access_mask
         type: string
-        description: "Windows-only. The ACE's access mask, hex-formatted. Values: hex integer."
+        description: "Windows-only. The ACE's access mask, hex-formatted. Values: hex integer, or - for an ACE type the plugin does not decode."
         example: "0x001f01ff"
         platforms: [windows]
       - name: owner
