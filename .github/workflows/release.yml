@@ -44,9 +44,69 @@ env:
   YUZU_BUILD_JOBS: "16"
 
 jobs:
+  # ── Refuse to publish over a released tag (#5282) ────────────────────
+  # Every image-publishing job (docker-publish, docker-publish-postgres,
+  # docker-publish-chisel, docker-publish-agent-bundle) and the release job
+  # list this job in `needs`, and so do the three build jobs, so a refused run
+  # stops before any build, attestation or push. Without it, a run started
+  # against an already-released tag (by mistake, or a superseded run) rebuilt
+  # everything and pushed new digests over :X.Y.Z (and :X.Y/:latest), which then
+  # no longer matched the published release's signed SHA256SUMS and SBOMs; the
+  # only existing-release check was the release job's own, after every push.
+  #
+  # There is deliberately NO override input. A published release's assets and
+  # signatures describe the images it shipped, so any re-push over it breaks
+  # verification. To redo a release, cut a new version; to redo a broken
+  # release from scratch, the operator deletes the GitHub release first (an
+  # explicit, destructive step the release skill gates on operator
+  # confirmation), and the fresh run then recreates the release together with
+  # the images it pushes.
+  #
+  # Fail-closed: only gh's exact "release not found" proceeds; any other gh
+  # failure (auth, rate limit, network, 5xx) fails the run. contents:read sees
+  # PUBLISHED releases only, not drafts; a hand-made draft for the tag is caught
+  # later by "Create GitHub Release" (after the pushes). Limit: "Re-run failed
+  # jobs" does not re-run a job that succeeded, so a re-run of an old attempt
+  # skips this check; the release skill forbids that (start a fresh run).
+  # Shell contract: tests/shell/test_release_guard.sh (runs this step body).
+  release-guard:
+    name: "Refuse re-publish over a released tag"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read   # gh release view (published releases)
+    steps:
+      - id: refuse-published-release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -uo pipefail
+          tag="${GITHUB_REF_NAME:-}"
+          if [[ -z "$tag" ]]; then
+            echo "::error::GITHUB_REF_NAME is empty; cannot check for an existing release (fail-closed)."
+            exit 1
+          fi
+          out="$(mktemp)"; err="$(mktemp)"
+          rc=0
+          gh release view "$tag" --repo "$GITHUB_REPOSITORY" \
+            --json tagName,isDraft,publishedAt,url >"$out" 2>"$err" || rc=$?
+          if [[ "$rc" -eq 0 ]]; then
+            echo "::error::Release $tag already exists ($(cat "$out")). Refusing to rebuild and push images over it: they would no longer match its signed SHA256SUMS and SBOMs (#5282). Cut a new version, or delete the release first if it must be redone (release skill, Recovery)."
+            exit 1
+          fi
+          # gh prints exactly "release not found" when the tag has no release.
+          # Anything else is an error we cannot interpret: fail closed.
+          if [[ "$(tr -d '\r' <"$err")" == "release not found" ]]; then
+            echo "No release exists for $tag; publishing may proceed."
+            exit 0
+          fi
+          echo "::error::Could not determine whether release $tag exists (gh exit $rc): $(tr '\r\n' '  ' <"$err"). Failing closed (#5282)."
+          exit 1
+
   # ── Linux x64 release build ──────────────────────────────────────────
   build-linux:
     name: "Build Linux x64"
+    needs: [release-guard]
     runs-on: [self-hosted, Linux, X64, yuzu-bigtam-linux]
     permissions:
       contents: read
@@ -517,10 +577,12 @@ jobs:
           retention-days: 3
 
   # ── Windows x64 release build ────────────────────────────────────────
-  # No needs: — runs on the Wee Tam Windows pool (a separate host from the Big
-  # Tam Linux build) so it can build in parallel with build-linux + build-gateway.
+  # Needs only release-guard (#5282) — runs on the Wee Tam Windows pool (a
+  # separate host from the Big Tam Linux build) so it can build in parallel with
+  # build-linux + build-gateway.
   build-windows:
     name: "Build Windows x64"
+    needs: [release-guard]
     runs-on: [self-hosted, Windows, X64, yuzu-weetam-windows]
     permissions:
       contents: read
@@ -874,6 +936,7 @@ jobs:
   # ── macOS ARM64 release build ────────────────────────────────────────
   build-macos:
     name: "Build macOS ARM64"
+    needs: [release-guard]
     # Pinned to the self-hosted BigMags macOS pool (Apple Silicon, Xcode 16 /
     # Apple Clang 16, accepts -std=c++23), matching how build-linux/build-gateway
     # pin Big Tam and build-windows pins Wee Tam. release.yml triggers only on
@@ -1251,7 +1314,7 @@ jobs:
   # across releases so repeat runs with unchanged vcpkg/rebar deps are fast.
   docker-publish:
     name: "Publish ${{ matrix.image }} image"
-    needs: [build-linux, build-gateway]
+    needs: [release-guard, build-linux, build-gateway]
     runs-on: [self-hosted, Linux, X64, yuzu-bigtam-linux]
     timeout-minutes: 90
     permissions:
@@ -1500,6 +1563,7 @@ jobs:
   #   3. Distinct local buildcache path (postgres suffix).
   docker-publish-postgres:
     name: "Publish postgres image"
+    needs: [release-guard]
     runs-on: [self-hosted, Linux, X64, yuzu-bigtam-linux]
     timeout-minutes: 60
     permissions:
@@ -1682,7 +1746,7 @@ jobs:
     # Recovery: a fresh run of the tag (gh workflow run release.yml --ref
     # <tag>), never "Re-run failed jobs" on an older run; see the release
     # skill.
-    needs: [build-linux, build-gateway]
+    needs: [release-guard, build-linux, build-gateway]
     runs-on: [self-hosted, Linux, X64, yuzu-bigtam-linux]
     # Job-level concurrency so a re-tagged release (same ref) cancels an
     # in-flight build instead of wedging the single self-hosted Linux runner
@@ -1955,7 +2019,7 @@ jobs:
   # (it depends on release, not vice-versa), so it never gates the release.
   docker-publish-agent-bundle:
     name: "Publish agent-bundle image"
-    needs: [release]
+    needs: [release-guard, release]
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     concurrency:
@@ -2099,7 +2163,7 @@ jobs:
     # docker-publish-agent-bundle is NOT, by design: it builds from this
     # release's published assets, so it can only run after it, and its SBOM is
     # not a release asset (it stays a workflow artifact).
-    needs: [build-linux, build-gateway, build-windows, build-macos, docker-publish, docker-publish-postgres, docker-publish-chisel]
+    needs: [release-guard, build-linux, build-gateway, build-windows, build-macos, docker-publish, docker-publish-postgres, docker-publish-chisel]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
@@ -2434,17 +2498,17 @@ jobs:
             WIZARD_ASSET+=(artifacts/yuzu-compose-wizard-*.zip)
           fi
 
-          # Idempotent on re-tag: if the release already exists (e.g.
-          # operator deleted + recreated the tag to backfill a CI bug
-          # like the chisel-publish concurrency miss in run 26413256206),
-          # skip the create+upload so the dependent docker-publish-*
-          # jobs can still run cleanly without "release already exists"
-          # blowing up Create Release. Asset re-upload would require
-          # --clobber per-file and risks signature drift on already-
-          # published artifacts; the safer behavior is leave the
-          # published release untouched.
+          # The release-guard job refused this run up front if a published
+          # release already existed (#5282), so finding one here means it
+          # appeared after the guard ran (another run of the tag, a hand-run
+          # `gh release create`, or a draft the guard's contents:read token
+          # cannot see). This run's images are already pushed and do not
+          # match that release's signed SHA256SUMS and SBOMs, so fail loudly
+          # instead of the old skip-with-a-notice that went green. Never
+          # re-upload over it either: --clobber would replace signed assets.
           if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
-            echo "::notice::Release ${GITHUB_REF_NAME} already exists; skipping create+upload (assets already published, signatures preserved)"
+            echo "::error::Release ${GITHUB_REF_NAME} appeared after release-guard passed; this run's pushed images do not match it. Investigate before anything else (#5282)."
+            exit 1
           else
             gh release create "${GITHUB_REF_NAME}" \
               --title "Yuzu ${GITHUB_REF_NAME}" \

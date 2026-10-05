@@ -26,6 +26,11 @@ Failure-mode runbook: `docs/ci-troubleshooting.md`.
   2026-08-28)**, the Windows matrix carries the identical `pg_mode` key via
   the same `include:` mechanism (debug=full, release=smoke) — Windows and
   Linux now share one `pg_mode` concept, not two independently-invented ones.
+  **Since #5320** the push trigger has no `paths` filter: a docs-only push
+  (for example a changelog-only release commit) runs `preflight` and the
+  `docs-required-checks` stubs instead of the matrix, so the required contexts
+  still appear on the `main` commit a release tags. See "Docs-only changes
+  (#1978, #5320)" below.
 - **Tier 3 — nightly cron** (`nightly.yml`, `0 6 * * *` UTC +
   `workflow_dispatch`): ASan+UBSan, TSan, coverage on the Big Tam pool
   (`yuzu-bigtam-linux`, gated on `bigtam_pool_healthy`), plus a Windows ASan
@@ -162,6 +167,40 @@ code.
 
 ## Gates outside the tier ladder
 
+### Release re-publish guard (`release-guard`, #5282)
+
+The first job in `release.yml`. It runs `gh release view "$GITHUB_REF_NAME"`
+and fails the run if the tag already has a published GitHub release. Every
+image-publishing job (`docker-publish`, `docker-publish-postgres`,
+`docker-publish-chisel`, `docker-publish-agent-bundle`), the `release` job and
+the three build jobs list it in `needs`, so a refused run stops before any
+build, provenance attestation or image push. Before it, a run started against
+an already-released tag (by mistake, or a superseded run) pushed new digests
+over `:X.Y.Z` (and `:X.Y`/`:latest` on a stable tag) that no longer matched the
+release's signed `SHA256SUMS` and SBOMs; the only existing-release check was in
+`Create GitHub Release`, after every push, and it skipped with a notice and
+went green. That step now fails instead, because a release appearing there
+means one arrived after the guard ran.
+
+It fails closed: the run proceeds only when gh prints exactly
+`release not found`. Any other gh failure (bad credentials, rate limit,
+network, a 5xx) fails the run. The step body is executed against a stubbed
+`gh` by `tests/shell/test_release_guard.sh` (in preflight's shell gate tests),
+which also checks that every job holding `packages: write` needs the guard.
+
+**There is no override.** A published release's assets and signatures describe
+the images it shipped, so any re-push over it breaks verification. To ship
+different images, cut a new version. To redo a release under the same tag,
+delete the GitHub release first (destructive; the release skill requires
+operator confirmation), then start a fresh run, which recreates the release
+with a `SHA256SUMS` that matches its images.
+
+Limits: the job's `contents: read` token cannot see draft releases, so a
+hand-made draft for the tag is caught only at `Create GitHub Release`, after
+the pushes. "Re-run failed jobs" does not re-run a guard that already passed,
+so it does not protect a re-run of an old attempt; release runs are never
+re-run that way (release skill, Recovery).
+
 ### Release artifact gate (`scripts/check-release-artifacts.sh`, release job)
 
 Runs in `release.yml`'s `release` job after the artifacts are downloaded and
@@ -194,8 +233,11 @@ Recovery: find the offending file in the error. For a stale file, clear the
 runner workspace and start a fresh run of the same tag with
 `gh workflow run release.yml --ref vX.Y.Z`, following the release skill's
 Recovery steps (no release exists for the tag, no other run for it is queued
-or running). Never use "Re-run failed jobs" on a release run: an older run can
-be superseded by a newer one and push images over a published release (#5242).
+or running). The workflow enforces the first of those itself: `release-guard`
+refuses a run when the tag already has a published release (#5282, above).
+Never use "Re-run failed jobs" on a release run: an older run can
+be superseded by a newer one and push images over a published release (#5242),
+and a re-run does not repeat a guard that already passed.
 For a builder naming defect, a fresh run builds the tag's original commit
 again, so fix the builder, then delete and re-push the tag at the fixed commit.
 Either way the images are rebuilt and re-pushed under the same tags.
@@ -1283,6 +1325,8 @@ pool causes nightly preflight to fail and the nightly alert opens
 `nightly-broken`; the repository discipline remains **no merge to main while
 that issue is open**. Follow `docs/ci-troubleshooting.md` before closing it.
 
+### Docs-only changes (#1978, #5320)
+
 As of #1978, preflight also emits a `code_changed` output (from
 `scripts/ci/detect-code-change.sh`); the build jobs additionally gate on
 `&& code_changed == 'true'`, so a docs-only PR skips the whole matrix. The
@@ -1290,8 +1334,38 @@ matrix-expanded required contexts (`Linux gcc-15 debug`, `Windows MSVC debug`,
 `macOS debug`) would otherwise stay "Expected" forever on a docs-only PR
 (a top-level-skipped matrix job emits none of its inner check names), so a
 `docs-required-checks` stub emits those exact names as success when
-`code_changed == 'false'`. `ci.yml` no longer path-filters `pull_request`;
-the `push:` trigger keeps its docs `paths-ignore`.
+`code_changed == 'false'`. `ci.yml` path-filters neither trigger.
+
+Since #5320 the same applies to a push to `main`/`dev`. The push trigger used
+to keep a docs `paths` allow-list, so a changelog-only push started no run and
+the required contexts never appeared on the commit; the v0.14.0 release commit
+(50a81af91) was tagged on an operator decision for that reason. Now every push
+runs, and the codegate step's push arm sets `code_changed=false` only when:
+
+1. the previous tip's newest `ci.yml` push run on the branch concluded
+   `success` — a newer pending run cancels an older pending one in this
+   workflow's concurrency group, so without this a docs push arriving behind a
+   running build would cancel a code push's pending run and the code would
+   never be built; it also stops a docs commit turning a red code commit
+   green;
+2. the compare API reports the push as a fast-forward (`ahead`) listing 1–299
+   files (empty is missing evidence; 300 is the API cap, so the list may be
+   truncated); and
+3. every listed path, and every rename's previous path, is docs-only.
+
+Any API error or other answer builds. The classification set is unchanged,
+including the BR-010 carve-out: a push touching `docs/os-capability-matrix.md`
+builds and runs its drift gate. A docs-only push therefore costs
+`trusted_inputs`, `preflight`, three stub jobs and `detect-ci-changes`, all
+GitHub-hosted. The required contexts on such a commit read `success`
+(Preflight, the three stubs, CHANGELOG order) or `skipped` (Proto
+backward-compat). A skipped required context satisfies the ruleset; an absent
+one does not, and the release skill's tag gate reads them the same way. The
+push arm is executed against a stubbed `gh` by
+`tests/shell/test_codegate_push.sh`.
+
+Which contexts are required is a repository ruleset setting ("Protect Main",
+"Protect Dev"), not part of `ci.yml`; #5320 did not change it.
 
 ## Postgres for server tests (`YUZU_TEST_POSTGRES_DSN`)
 
