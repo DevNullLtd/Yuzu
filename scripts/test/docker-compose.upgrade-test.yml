@@ -34,8 +34,9 @@
 ##                  up -d
 ##
 ## Volumes are scoped to the project name automatically, so two parallel
-## runs each get their own server-data volume that survives container
-## recreation but is isolated from siblings.
+## runs each get their own server-data / server-certs / postgres-data
+## volumes, which survive container recreation but are isolated from
+## siblings.
 ##
 ## DO NOT INVOKE THIS COMPOSE FILE DIRECTLY. It depends on
 ## YUZU_TEST_CONFIG being a valid host path (validated by the orchestrator)
@@ -58,6 +59,12 @@ services:
       - "50052"   # management gRPC
     volumes:
       - server-data:/var/lib/yuzu
+      # The internal CA, default certs and secrets KEK live in the server's
+      # default cert dir, /etc/yuzu/certs. From 0.14.0 the KEK is registered in
+      # Postgres, which survives the image swap on postgres-data — so the key
+      # file must survive it too, or the NEW server refuses to boot with
+      # kek_unresolvable (#5370). Same shape as the shipped composes.
+      - server-certs:/etc/yuzu/certs
       # Pre-bootstrapped admin credentials, mounted read-only at /etc/yuzu/
       # (NOT inside /var/lib/yuzu — see CRITICAL note in the header).
       - ${YUZU_TEST_CONFIG}:/etc/yuzu/yuzu-server.cfg:ro
@@ -141,4 +148,5 @@ services:
 
 volumes:
   server-data:
+  server-certs:
   postgres-data:

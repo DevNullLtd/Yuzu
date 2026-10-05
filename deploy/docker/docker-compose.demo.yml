@@ -74,6 +74,12 @@ services:
     volumes:
       - ${DEMO_SERVER_CONFIG:?Set DEMO_SERVER_CONFIG to an absolute path -- start-demo.sh handles this}:/etc/yuzu/yuzu-server.cfg:ro
       - server-data:/var/lib/yuzu
+      # CA, default certs and the secrets KEK (registered in Postgres) live in
+      # /etc/yuzu/certs. Persisted so a `--keep` restart, which recreates the
+      # container over the retained Postgres volume, does not lose the key file
+      # and refuse to boot with kek_unresolvable (#5370). Ownership is handed to
+      # the runtime user by server-certs-init below.
+      - server-certs:/etc/yuzu/certs
     healthcheck:
       # No shell or curl in the chiselled image — use the bundled static busybox.
       test: ["CMD", "/bin/busybox", "wget", "--spider", "-q", "http://127.0.0.1:8080/readyz"]
@@ -84,6 +90,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      server-certs-init:
+        condition: service_completed_successfully
     restart: unless-stopped
     # MCP streamed POST ships ON by default (docs/user-manual/server-admin.md
     # "Sizing"): a held-open SSE response's worst-case drain is the 120s
@@ -91,6 +99,23 @@ services:
     # (server.cpp set_write_timeout) = ~156s. Docker's 10s default SIGKILLs
     # it mid-drain; 210s matches the systemd unit's existing margin.
     stop_grace_period: 210s
+
+  # ── Tier 1a: one-shot ownership fix for the server-certs volume ────────
+  # The chiselled server image up to 0.14.0 has no /etc/yuzu/certs directory,
+  # so Docker creates the volume's mount point root-owned and the unprivileged
+  # server (uid 1000) cannot write its CA or KEK there. Images from 0.14.1
+  # pre-create the directory owned by uid 1000, which makes this a no-op; it
+  # stays so the pinned stack works on either. Same pinned image, run once as
+  # root with no network, chowning only the volume root (#5370).
+  server-certs-init:
+    image: ${YUZU_REGISTRY:-ghcr.io/devnullltd}/yuzu-server-chisel:${YUZU_VERSION:-0.14.0}
+    container_name: yuzu-demo-server-certs-init
+    user: "0:0"
+    entrypoint: ["/bin/busybox", "chown", "1000:1000", "/etc/yuzu/certs"]
+    network_mode: none
+    volumes:
+      - server-certs:/etc/yuzu/certs
+    restart: "no"
 
   # ── Tier 1b: PostgreSQL (server storage substrate, ADR-0006) ───────────
   # Release-pinned like every other image here (no -chisel variant — this is
@@ -195,4 +220,5 @@ services:
 
 volumes:
   server-data:
+  server-certs:
   postgres-data:
