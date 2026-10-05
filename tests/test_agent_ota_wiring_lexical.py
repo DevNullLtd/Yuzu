@@ -30,7 +30,7 @@ and sync sites) and requires problems() to be non-empty on each; a mutation whos
 longer matches agent.cpp fails loudly (stale pattern) rather than passing vacuously.
 
 Why Python: this replaces a bash gate that forked ~500-750 grep/tr/perl/cmp processes per run
-and timed out at 90 s on the Windows CI leg (#5428). This is one process, ~0.1 s on every OS.
+and timed out at 90 s on the Windows CI leg (#5428). This is one process, well under a second on every OS.
 Two controls of the bash original have no analogue here by construction and were dropped:
 the regex-error control (`re` raises at compile time, so a bad pattern is a hard error) and
 the >255 repetition-bound lint (BSD RE_DUP_MAX does not apply to `re`). Their absence is not
@@ -60,13 +60,13 @@ def normalise(src):
 
 
 def problems(src):
-    """One message per violated invariant, in the bash gate's check() order; [] when clean."""
+    """One message per violated invariant, in invariant order; [] when clean."""
     t = normalise(src)
     out = []
 
-    if len(re.findall(r"update_thread_\.stop_and_join\( ?updater\(\) ?\)", t)) < 1:
+    if not re.search(r"update_thread_\.stop_and_join\( ?updater\(\) ?\)", t):
         out.append("agent.cpp no longer calls update_thread_.stop_and_join(updater()) in the reconnect teardown (#2182)")
-    if len(re.findall(r"update_thread_\.start\(", t)) < 1:
+    if not re.search(r"update_thread_\.start\(", t):
         out.append("agent.cpp no longer starts the update thread via update_thread_.start( (#2182)")
 
     for name, ctxm in (
@@ -103,8 +103,7 @@ def problems(src):
 
 
 # Each row removes one invariant from agent.cpp: (pattern, repl, flags, count, expected substring of
-# the FIRST problem). count 0 = all matches (perl /g), 1 = first only. Translated 1:1 from the bash
-# gate's perl programs (${1} -> \g<1>, /m -> re.M, /s -> re.S).
+# the FIRST problem). count 0 = all matches, 1 = first only.
 MUTATIONS = [
     (r"update_thread_\.stop_and_join\(updater\(\)\);", "update_thread_.join();", 0, 0,
      "stop_and_join"),

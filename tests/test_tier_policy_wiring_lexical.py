@@ -36,9 +36,9 @@ gateless_tier_policy_fn() literal. A wholly new gate-less route wired with its O
 lambda -- one that never references gateless_tier_policy_fn() at all -- is invisible to this
 gate; that class of regression stays a plain-review concern.
 
-Lines are counted as grep -c did: split on "\\n", one count per line, never str.count. The file
-is read with universal newlines, so a CRLF checkout is matched the same as LF (more lenient than
-grep's `$` anchor was; all sources are LF today).
+Lines are counted per line: split on "\\n", one count per line, never str.count. The file
+is read with universal newlines, so a CRLF checkout is matched the same as LF (all sources are
+LF today).
 
 Usage: python3 tests/test_tier_policy_wiring_lexical.py
 """
@@ -56,7 +56,7 @@ POSITIONAL = r"[ \t\r\f\v]*auth_routes_->gateless_tier_policy_fn\(\)\);"
 
 
 def problems(src):
-    """One message per violated clause, in the bash gate's order (1, 2, 3); [] when clean."""
+    """One message per violated clause, in clause order (1, 2, 3); [] when clean."""
     lines = src.split("\n")
     total = sum(1 for ln in lines if CALL in ln)
     designated = sum(1 for ln in lines if re.fullmatch(DESIGNATED, ln))

@@ -67,7 +67,7 @@ def last_before(lines, s, upto):
 
 
 def problems(main, win):
-    """One message per violated invariant, in the bash gate's order; [] when clean."""
+    """One message per violated invariant, in invariant order; [] when clean."""
     out = []
     ml = main.split("\n")
     wl = win.split("\n")
@@ -124,8 +124,7 @@ def problems(main, win):
                 out.append(f"the drain_log_bounded( at line {d} (preceding hard_exit(3) at line {h}) sits AFTER a "
                            f"'}} catch' (line {lc}) with no intervening 'try {{' -- it is outside its guarding try. "
                            f"drain_log_bounded() is not noexcept; an exception there would skip hard_exit(3) "
-                           f"entirely (the exact defect this gate exists to catch, self-caught once already "
-                           f"during this PR's development)")
+                           f"entirely (the exact defect this gate exists to catch)")
     return out
 
 

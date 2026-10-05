@@ -2981,8 +2981,8 @@ test('flake-retry selftest',
 # PR1.2 (ADR-3002 Decision-10a): pure-logic selftest of the lexical spawn gate —
 # a seeded raw-spawn fixture must fail and the sanctioned-runner allowlist case
 # must pass. Wired here so the gate's own matcher is enforced on every platform
-# with bash, mirroring the flake-retry selftest above. The Windows CI leg runs
-# every step under MSYS2 bash (ci.yml), so these bash tests do run there;
+# with bash, mirroring the flake-retry selftest above. The Windows test job's default
+# shell is MSYS2 bash (ci.yml:1500), so its Test step runs these bash tests there;
 # `required: false` only lets a bash-less developer host configure cleanly.
 _bash_test = find_program('bash', required: false)
 if _bash_test.found()
@@ -3085,7 +3085,7 @@ test('log handoff wiring lexical gate (#4666 PR-2 W3a)',
 # #2182: static lexical gate pinning that agent.cpp still CALLS the tested OtaUpdateThread /
 # CtxSlot stop_seen() primitives (no AgentImpl seam exists to test that, #1492) and keeps the
 # flag-then-cancel_ctx() teardown order. Carries its own in-memory mutation self-test. No build
-# required. Python, not bash: one process (~0.1 s on every OS) instead of ~500-750 grep/tr/perl/cmp
+# required. Python, not bash: one process (well under a second on every OS) instead of ~500-750 grep/tr/perl/cmp
 # forks that timed out at 90 s on the Windows CI leg (#5428). Never raise the budget -- port,
 # split or host-gate instead.
 test('agent OTA/ctx-slot wiring lexical gate (#2182)',
@@ -3242,6 +3242,7 @@ test('spark evidence format lockstep (#4665)',
 # must call AuthRoutes::gateless_tier_policy_fn(), never a re-inlined local lambda (see
 # the script's own header for the clause-5 rationale). No build required, same class as
 # the RBAC cross-schema query-owner seam check above. Python, one process (#5428).
+# Never raise the budget -- port, split or host-gate instead.
 test('tier policy wiring lexical gate (#5047)',
   _python3_test,
   args: [files('test_tier_policy_wiring_lexical.py')],

@@ -2,6 +2,7 @@
 
 Routed doc for the **unit-test conventions** concern in `.claude/routed-concerns.md`.
 Loaded by `quality-engineer` on any change under `tests/unit/`.
+The "Shell and source-text gates" section also covers `test()` registrations in `tests/meson.build`, the `tests/test_*.py` source-text gates and `tests/shell/`.
 
 Companion: `docs/testing/integration-tests.md` covers the shell/E2E stack-bring-up layer.
 The authoritative statement of each helper's contract is its own doc comment at the source;
