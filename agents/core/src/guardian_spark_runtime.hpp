@@ -1218,6 +1218,18 @@ private:
         std::chrono::steady_clock::time_point deadline{};
         // Disarm payload.
         std::uint64_t subscription{0};
+        /// #5403: Disarm-claim-only. steady_clock reading taken where the claim is built
+        /// (disarm_orphan_keys_locked, detach_rule_locked), the origin of
+        /// oldest_pending_disarm_age(). Written once, before the claim is pushed; never
+        /// reset by an admission refusal, a worker throw or a redrive, so a retained
+        /// Disarm keeps aging from its creation. Meaningless (default) on an Arm claim.
+        std::chrono::steady_clock::time_point created_at{};
+        /// #5403: once-only latch for observe_pending_disarms_locked(): set, under
+        /// registry_mu_, the first pass that finds this claim pending longer than
+        /// kDisarmPendingObserveThreshold, so the counter and the warn happen once per claim
+        /// lifetime (the compensation_deadline_observed precedent below). Observation only:
+        /// it does not release anything.
+        bool disarm_deadline_observed{false};
 
         // up-3/up-4 (#4221, rung 9c PR-5b): Arm-claim-only compensation bookkeeping.
         // `compensation_permit`, when engaged, is this claim's held slot in the
@@ -1579,6 +1591,15 @@ public:
     /// exposure dispatch_parked_arm_guarded's note names for every off-lock dispatch site);
     /// there is no per-refill catch because the hand-back would retake the same mutex.
     std::size_t expire_overdue_claims();
+    /// #5403: the same pass against a caller-supplied steady_clock reading. The zero-arg form
+    /// is this with steady_clock::now(); a test passes a later `now` to age claims without
+    /// sleeping (it also moves the Arm-deadline comparison, so an Arm queued behind the
+    /// aged Disarm is judged against it too). The pass also runs the pending-Disarm
+    /// observation (observe_pending_disarms_locked): a Disarm pending longer than
+    /// kDisarmPendingObserveThreshold is counted once (disarm_deadline_elapsed()) and
+    /// warned about once, rate-limited per pass, naming the key only through
+    /// log_key_token. It changes no ownership, queue position, admission or receipt.
+    std::size_t expire_overdue_claims(std::chrono::steady_clock::time_point now);
 
     /// rung 9c PR-2 Unit 3 (Astra opine review Blocker 4): bounded, on-demand
     /// maintenance pass for retained disarms - one attempted re-submission per
@@ -1620,6 +1641,50 @@ public:
     /// registry_mu_ by scanning claims_; runtime-only, NOT exported on the heartbeat
     /// yet (tracked in #5404). Diagnostic/test use, not a hot-path read.
     [[nodiscard]] std::size_t retained_tombstones() const;
+
+    /// #5403: a Disarm pending longer than this is observed once (a counter and a warn).
+    /// A fixed initial policy choice - NOT derived from cfg_.backend_op_deadline, and not a
+    /// measured bound: nothing in the repository establishes how long a healthy Disarm may
+    /// legitimately stay pending, so the value is meant to be revisited against fleet data.
+    static constexpr std::chrono::seconds kDisarmPendingObserveThreshold{30};
+
+    /// #5403: the age of the oldest Disarm claim that is still pending, measured from its
+    /// creation (KeyClaim::created_at, kept across admission refusals and retries), or
+    /// nullopt when no Disarm is pending. Pending means the key's fifo head is a Disarm with
+    /// no outcome yet, whether it is Queued (including a retained one, refused at admission
+    /// or held back by a class quota), Dispatching, or Dispatched (its backend disarm has not
+    /// returned). The gauge cannot tell those apart: a large value means "pending too long",
+    /// not "the backend call hung". `now` before a claim's creation reads as zero for that
+    /// claim. Takes registry_mu_ and scans claims_ (O(claims)): heartbeat cadence, never a
+    /// hot path, and never to be called with registry_mu_ held (the scan has a _locked twin).
+    ///
+    /// POLICY (observation only). The runtime never releases, pops or force-cancels a
+    /// pending Disarm. While one is pending it holds, in order of blast radius: its KEY (a
+    /// same-key Arm queues behind it and, at its own deadline, ends CongestionExpired), the
+    /// executor QUOTA slot of its IoClass until the backend call returns (when a class's
+    /// slots are all held, every later arm of that class is refused and parked, #5168), and,
+    /// if the call is blocked inside a mechanism, SparkEngine's per-TYPE lock (every other
+    /// arm and disarm of that type waits behind it; the mechanism contract, not this class,
+    /// is what bounds that). Releasing the claim early would let the key's next Arm run while
+    /// the old teardown may still be running: the teardown-before-rearm hazard that
+    /// submit_disarm_off_lock's comment records as removed by construction; and it could not
+    /// free anything physical anyway, since the worker, the executor's key and the quota slot
+    /// stay held until the call returns. Recovery from a call that never returns is an agent
+    /// restart, or --spark-disable as the rollback lever.
+    ///
+    /// WHAT THIS DOES NOT SEE: a compensating disarm (tracked on an ARM claim, see
+    /// compensation_deadline_elapsed()), direct_disarm_fallback(), the synchronous teardown
+    /// fallback that detach_rule_locked runs under registry_mu_ (a hang there stalls this scan
+    /// and the expiry pass for every key, not just its own), and inline-type teardown.
+    [[nodiscard]] std::optional<std::chrono::steady_clock::duration>
+    oldest_pending_disarm_age(std::chrono::steady_clock::time_point now) const;
+    /// #5403: Disarm claims observed pending longer than kDisarmPendingObserveThreshold by
+    /// expire_overdue_claims(), counted once per claim (KeyClaim::disarm_deadline_observed
+    /// latches). Observation only - the claim, its worker and its quota slot are untouched;
+    /// the compensation_deadline_elapsed() precedent. Lock-free.
+    [[nodiscard]] std::uint64_t disarm_deadline_elapsed() const noexcept {
+        return disarm_deadline_elapsed_.load(std::memory_order_relaxed);
+    }
     /// #5322 TEST-ONLY diagnostic (no production caller): the registry's cross-structure
     /// invariants, one human-readable line per violation, empty when all hold. Takes
     /// registry_mu_. Checks (i) every rules_ entry has an index mapping that owns() with
@@ -2001,6 +2066,30 @@ private:
     /// caller contains any throw from here. Complexity: O(|keys_|) hash lookups plus one
     /// O(log |by_key_|) refcount query each; no allocation when there is no orphan.
     void disarm_orphan_keys_locked(std::vector<std::shared_ptr<KeyClaim>>& disarms);
+    /// registry_mu_ held. #5403: the scan behind oldest_pending_disarm_age(); that accessor
+    /// locks and calls this, so nothing ever calls the locking accessor under registry_mu_.
+    /// Only a key's fifo HEAD is considered: a Disarm claim is only ever pushed onto an empty
+    /// fifo (disarm_orphan_keys_locked, detach_rule_locked), anything later queues behind it,
+    /// and a Disarm that is not the head cannot dispatch. A head with an outcome is already
+    /// terminal (DisarmDone, Stopped, DeadSubscription) and is not pending.
+    [[nodiscard]] std::optional<std::chrono::steady_clock::duration>
+    oldest_pending_disarm_age_locked(std::chrono::steady_clock::time_point now) const;
+    /// One key whose pending Disarm this pass observed, copied under registry_mu_ so the
+    /// warn can be emitted after it releases.
+    struct DisarmObservation {
+        std::string key;
+        std::chrono::steady_clock::duration age{};
+    };
+    /// Per-pass cap on warns; claims past it are still latched and counted, never warned.
+    static constexpr std::size_t kDisarmPendingWarnsPerPass = 4;
+    /// registry_mu_ held. #5403: latch (KeyClaim::disarm_deadline_observed) and count
+    /// (disarm_deadline_elapsed_) every pending Disarm head older than
+    /// kDisarmPendingObserveThreshold at `now`, once per claim, and copy up to
+    /// kDisarmPendingWarnsPerPass of them into `warns` (a copy that throws only drops that
+    /// warn). Observation only: nothing is released, popped or cancelled. Returns nothing;
+    /// the latch and the counter are the record. O(|claims_|).
+    void observe_pending_disarms_locked(std::chrono::steady_clock::time_point now,
+                                        std::vector<DisarmObservation>& warns);
     /// Off-lock. Dispatch an ARM claim (already the Dispatching head) through
     /// io_executor_.submit(); on a synchronous admission refusal (or a throw building
     /// the call) fail the head and every arm queued behind it with today's strings.
@@ -2470,6 +2559,7 @@ private:
     std::atomic<std::uint64_t> arms_parked_total_{0};
     std::atomic<std::uint64_t> arm_redrives_{0};
     std::atomic<std::uint64_t> compensation_deadline_elapsed_{0};
+    std::atomic<std::uint64_t> disarm_deadline_elapsed_{0}; ///< #5403: see disarm_deadline_elapsed()
     /// up-2 (#4221, rung 9c PR-5c): a genuinely new claimant refused immediately
     /// against a Wedged key, vs. an identical (rule_id, spec) retry that
     /// re-observed the existing wedged head's receipt instead of queuing a new

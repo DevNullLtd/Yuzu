@@ -13824,3 +13824,341 @@ TEST_CASE("#5322: a throwing inline disarm in the last detach is contained and t
     CHECK(rt->armed_key_count() == 1);
     REQUIRE_REGISTRY_INVARIANTS_5322(*rt);
 }
+
+// ---------------------------------------------------------------------------
+// #5403: a Disarm that stays pending (a hung backend disarm, a retained one, a quota-held
+// one) blocks its key, holds its class quota slot and, if the hang is inside the mechanism,
+// the engine's per-type lock. The runtime never releases, pops or force-cancels it; it
+// reports the age of the oldest pending Disarm (oldest_pending_disarm_age) and counts, once
+// per claim, a Disarm pending past kDisarmPendingObserveThreshold (disarm_deadline_elapsed).
+// "Pending too long" is the claim: an old Queued Disarm is not evidence the backend hung.
+// Every case takes a synthetic `now` (created_at is the real steady_clock, so now + X is at
+// least X old) - nothing here sleeps to age a claim. The backend deadline is 120 s so a
+// synthetic now of +31 s does not also expire an Arm queued behind the Disarm (cases that
+// want the Arm expired pass +121 s).
+// ---------------------------------------------------------------------------
+namespace {
+using namespace std::chrono_literals;
+/// One File key /a armed by "r1". Cleanup (declared in the body, so it runs before rt and b
+/// are destroyed) releases every park and hang, stops the runtime and waits for the detached
+/// workers, so a failing REQUIRE cannot leave a worker parked.
+struct HungDisarmRig5403 {
+    using RT = GuardianSparkRuntime;
+    std::shared_ptr<FakeReader> r = std::make_shared<FakeReader>();
+    std::shared_ptr<FakeBackend> b = std::make_shared<FakeBackend>();
+    std::shared_ptr<RT> rt;
+    const std::string key = spark_key(file_spec("/a"));
+    HungDisarmRig5403()
+        : rt(make_rt(r, b, RT::Config{.backend_op_deadline = std::chrono::seconds(120)})) {
+        REQUIRE(rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true));
+    }
+    ~HungDisarmRig5403() {
+        b->release_disarm_hang();
+        b->disarm_park.open();
+        b->arm_park.open();
+        rt->begin_stop();
+        const auto end = clk::now() + 10s;
+        while (rt->active_backend_op_workers() != 0 && clk::now() < end)
+            std::this_thread::sleep_for(2ms);
+    }
+    /// Park the next backend disarm, detach r1 (its Disarm claim is admitted and then hangs
+    /// inside backend->disarm), and wait until the worker is really inside the hang.
+    void hang_disarm_of_r1() {
+        b->hang_next_disarm.store(true);
+        rt->detach_rule("r1");
+        REQUIRE(b->wait_entered_disarm_hang(10s));
+    }
+    /// A non-waiting same-key attach: it queues its Arm BEHIND the Disarm head.
+    RT::ArmReceipt attach_behind(const std::string& rid) {
+        auto res = rt->attach_rule(RT::NonWaiting{}, rid, file_spec("/a"), file_exists_rule(rid), true);
+        REQUIRE(res.has_value());
+        REQUIRE(res->kind == RT::ArmOutcomeKind::Accepted);
+        return res->receipt;
+    }
+    [[nodiscard]] std::size_t depth() const { return rt->claim_queue_depth_for_test(key); }
+    [[nodiscard]] static clk::time_point later(std::chrono::seconds s) { return clk::now() + s; }
+};
+} // namespace
+
+TEST_CASE("#5403: a Disarm hung inside the backend is aged by oldest_pending_disarm_age, an Arm "
+          "queued behind it stays Queued, and release commits the Arm and empties the gauge",
+          "[spark][runtime][liveness][5403]") {
+    using RT = GuardianSparkRuntime;
+    HungDisarmRig5403 f;
+    CHECK_FALSE(f.rt->oldest_pending_disarm_age(HungDisarmRig5403::later(1000s)).has_value());
+    const int arm_base = f.b->arm_entries.load();
+    const int disarm_base = f.b->disarm_entries.load();
+
+    f.hang_disarm_of_r1();
+    CHECK(f.b->disarm_entries.load() == disarm_base + 1);
+    const auto rc = f.attach_behind("r2");
+    CHECK(f.depth() == 2);
+    CHECK(f.rt->receipt_status(rc) == RT::ReceiptStatus::Pending);
+    // The backend ENTRY counts, not `arms` (which only counts calls past the gates): the
+    // Arm must not have entered the backend while the Disarm is still inside it.
+    CHECK(f.b->arm_entries.load() == arm_base);
+    CHECK(f.b->disarm_entries.load() == disarm_base + 1);
+
+    const auto age = f.rt->oldest_pending_disarm_age(HungDisarmRig5403::later(31s));
+    REQUIRE(age.has_value());
+    CHECK(*age >= 31s);
+    CHECK(*age > 0s);
+
+    // The observation past the threshold changes nothing but a counter (M5: a pop on timeout
+    // would dispatch the queued Arm into the backend while the Disarm is still inside it).
+    (void)f.rt->expire_overdue_claims(HungDisarmRig5403::later(31s));
+    CHECK(f.rt->disarm_deadline_elapsed() == 1);
+    CHECK(f.depth() == 2);
+    CHECK(f.rt->receipt_status(rc) == RT::ReceiptStatus::Pending);
+    CHECK(f.b->arm_entries.load() == arm_base);
+    CHECK(f.rt->disarm_retained() == 0);
+    CHECK(f.rt->claims_dropped_at_stop() == 0);
+    CHECK(f.rt->oldest_pending_disarm_age(HungDisarmRig5403::later(32s)).has_value());
+
+    f.b->release_disarm_hang();
+    REQUIRE(yuzu::test::spin_until(
+        [&] { return f.rt->receipt_status(rc) == RT::ReceiptStatus::Committed; }, 10s));
+    CHECK(f.b->arm_entries.load() == arm_base + 1);
+    REQUIRE(yuzu::test::spin_until(
+        [&] { return !f.rt->oldest_pending_disarm_age(HungDisarmRig5403::later(1000s)).has_value(); },
+        10s));
+    CHECK(f.rt->disarm_deadline_elapsed() == 1); // monotonic: the completion does not undo it
+}
+
+TEST_CASE("#5403: an orphan Disarm that hangs is started once, stays the only Disarm in its key's "
+          "fifo across repeated passes, and ages",
+          "[spark][runtime][liveness][5403]") {
+    TombRig5322 f;
+    struct DisarmRelease {
+        FakeBackend* backend;
+        ~DisarmRelease() { backend->release_disarm_hang(); }
+    } release{f.b.get()}; // declared after the rig: runs first
+    orphan_after_redrive_5322(f);
+    const int disarm_base = f.b->disarm_entries.load();
+    f.b->hang_next_disarm.store(true);
+
+    (void)f.rt->expire_overdue_claims(); // the orphan pass builds and submits the Disarm
+    REQUIRE(f.b->wait_entered_disarm_hang(10s));
+    for (int i = 0; i < 50; ++i)
+        (void)f.rt->expire_overdue_claims();
+    CHECK(f.rt->orphan_disarms_started() == 1);
+    CHECK(f.depth() == 1); // exactly one Disarm, no duplicate and no Arm
+    CHECK(f.b->disarm_entries.load() == disarm_base + 1);
+    CHECK(f.rt->armed_key_count() == 0); // keys_ erased in the same section that queued it
+
+    const auto a10 = f.rt->oldest_pending_disarm_age(HungDisarmRig5403::later(10s));
+    const auto a20 = f.rt->oldest_pending_disarm_age(HungDisarmRig5403::later(20s));
+    REQUIRE(a10.has_value());
+    REQUIRE(a20.has_value());
+    CHECK(*a20 > *a10);
+
+    f.b->release_disarm_hang();
+    REQUIRE(yuzu::test::spin_until([&] { return f.depth() == 0; }, 10s));
+    CHECK_FALSE(f.rt->oldest_pending_disarm_age(HungDisarmRig5403::later(1000s)).has_value());
+    CHECK(f.rt->orphan_disarms_started() == 1);
+    // The key is free again: a new rule arms a fresh watcher.
+    auto w = f.rt->attach_rule(GuardianSparkRuntime::NonWaiting{}, "w", file_spec("/a"),
+                               file_exists_rule("w"), true);
+    REQUIRE(w.has_value());
+    REQUIRE(yuzu::test::spin_until([&] { return f.rt->rule_count() == 1; }, 10s));
+    REQUIRE_REGISTRY_INVARIANTS_5322(*f.rt);
+}
+
+TEST_CASE("#5403: Disarms holding their class quota are reflected in the gauge while a different "
+          "key's Arm is parked, and finish when the quota frees",
+          "[spark][runtime][liveness][5403]") {
+    using RT = GuardianSparkRuntime;
+    ParkedPoolRig rig;
+    constexpr int kQuota = 4; // File class: Config{}.file_quota
+    for (int i = 0; i < kQuota; ++i) {
+        const auto rid = "r" + std::to_string(i);
+        REQUIRE(rig.rt->attach_rule(rid, file_spec("/k" + std::to_string(i)), file_exists_rule(rid), true));
+    }
+    struct GateCleanup {
+        FakeBackend* backend;
+        ~GateCleanup() { backend->disarm_park.open(); }
+    } gate_cleanup{rig.b.get()};
+    CHECK_FALSE(rig.rt->oldest_pending_disarm_age(HungDisarmRig5403::later(1s)).has_value());
+    rig.b->disarm_park.park_every = 1; // every disarm parks, holding its File-class quota
+    for (int i = 0; i < kQuota; ++i)
+        rig.rt->detach_rule("r" + std::to_string(i));
+    REQUIRE(yuzu::test::spin_until([&] { return rig.b->disarm_entries.load() == kQuota; }));
+
+    const auto rc = rig.park_rule("r9", "/k9");
+    CHECK(rig.rt->arms_parked() == 1);
+    const auto age = rig.rt->oldest_pending_disarm_age(HungDisarmRig5403::later(1s));
+    REQUIRE(age.has_value());
+    CHECK(*age >= 1s);
+    CHECK(*age > 0s);
+
+    {
+        std::lock_guard lk(rig.b->disarm_park.mu);
+        rig.b->disarm_park.park_every = 0;
+    }
+    rig.b->disarm_park.pulse();
+    REQUIRE(yuzu::test::spin_until(
+        [&] { return rig.status(rc) == RT::ReceiptStatus::Committed; }));
+    REQUIRE(yuzu::test::spin_until([&] {
+        return !rig.rt->oldest_pending_disarm_age(HungDisarmRig5403::later(1000s)).has_value();
+    }));
+    CHECK(rig.rt->arms_parked() == 0);
+}
+
+TEST_CASE("#5403: a retained Queued Disarm ages from its creation, not from its last retention",
+          "[spark][runtime][liveness][5403]") {
+    HungDisarmRig5403 f;
+    f.rt->set_io_executor_fail_launch_for_test(true); // LaunchFailed at admission
+    struct SeamOff {
+        GuardianSparkRuntime* rt;
+        ~SeamOff() { rt->set_io_executor_fail_launch_for_test(false); }
+    } seam_off{f.rt.get()};
+    f.rt->detach_rule("r1");
+    REQUIRE(f.rt->disarm_retained() == 1);
+    REQUIRE(f.depth() == 1);
+    REQUIRE(f.b->disarm_entries.load() == 0); // never reached the backend
+
+    // A fixed synthetic now: the age moves only if created_at does.
+    const auto now_fixed = HungDisarmRig5403::later(100s);
+    const auto a1 = f.rt->oldest_pending_disarm_age(now_fixed);
+    REQUIRE(a1.has_value());
+    CHECK(*a1 > 100s);
+
+    // Another refusal on the SAME claim (a re-retention, admission_rejections 2) must not
+    // restart its clock.
+    CHECK(f.rt->redrive_retained_disarms() == 1);
+    REQUIRE(f.rt->disarm_retained() == 1);
+    REQUIRE(f.depth() == 1);
+    const auto a2 = f.rt->oldest_pending_disarm_age(now_fixed);
+    REQUIRE(a2.has_value());
+    CHECK(*a2 == *a1);
+
+    // A retained Queued claim is pending too: a pass past the threshold counts it.
+    (void)f.rt->expire_overdue_claims(now_fixed);
+    CHECK(f.rt->disarm_deadline_elapsed() == 1);
+
+    f.rt->set_io_executor_fail_launch_for_test(false);
+    CHECK(f.rt->redrive_retained_disarms() == 1);
+    REQUIRE(yuzu::test::spin_until([&] { return f.depth() == 0; }, 10s));
+    CHECK_FALSE(f.rt->oldest_pending_disarm_age(now_fixed).has_value());
+}
+
+TEST_CASE("#5403: the deadline observation is counted once per claim and releases nothing "
+          "(Dispatched-hung and retained-Queued)",
+          "[spark][runtime][liveness][5403]") {
+    using RT = GuardianSparkRuntime;
+    SECTION("a Dispatched Disarm hung in the backend") {
+        HungDisarmRig5403 f;
+        const int arm_base = f.b->arm_entries.load();
+        f.hang_disarm_of_r1();
+        const auto rc = f.attach_behind("r2");
+        const int disarm_entries = f.b->disarm_entries.load();
+        // Below the threshold: nothing is observed.
+        (void)f.rt->expire_overdue_claims(HungDisarmRig5403::later(29s));
+        CHECK(f.rt->disarm_deadline_elapsed() == 0);
+        for (int i = 0; i < 25; ++i) {
+            (void)f.rt->expire_overdue_claims(HungDisarmRig5403::later(31s + std::chrono::seconds(i)));
+            REQUIRE(f.rt->disarm_deadline_elapsed() == 1);
+            REQUIRE(f.depth() == 2);
+            REQUIRE(f.rt->receipt_status(rc) == RT::ReceiptStatus::Pending);
+            REQUIRE(f.b->arm_entries.load() == arm_base);
+            REQUIRE(f.b->disarm_entries.load() == disarm_entries);
+            REQUIRE(f.rt->active_backend_op_workers() >= 1); // the hung worker is untouched
+        }
+        f.b->release_disarm_hang();
+        REQUIRE(yuzu::test::spin_until(
+            [&] { return f.rt->receipt_status(rc) == RT::ReceiptStatus::Committed; }, 10s));
+        CHECK(f.rt->disarm_deadline_elapsed() == 1);
+    }
+    SECTION("a retained Queued Disarm") {
+        HungDisarmRig5403 f;
+        f.rt->set_io_executor_fail_launch_for_test(true);
+        struct SeamOff {
+            GuardianSparkRuntime* rt;
+            ~SeamOff() { rt->set_io_executor_fail_launch_for_test(false); }
+        } seam_off{f.rt.get()};
+        f.rt->detach_rule("r1");
+        REQUIRE(f.rt->disarm_retained() == 1);
+        for (int i = 0; i < 25; ++i) {
+            (void)f.rt->expire_overdue_claims(HungDisarmRig5403::later(31s + std::chrono::seconds(i)));
+            REQUIRE(f.rt->disarm_deadline_elapsed() == 1);
+            REQUIRE(f.depth() == 1);
+            REQUIRE(f.rt->disarm_retained() == 1);
+            REQUIRE(f.b->disarm_entries.load() == 0);
+        }
+    }
+    SECTION("two claims on two keys are each counted once") {
+        HungDisarmRig5403 f;
+        REQUIRE(f.rt->attach_rule("r2", file_spec("/b"), file_exists_rule("r2"), true));
+        f.rt->set_io_executor_fail_launch_for_test(true);
+        struct SeamOff {
+            GuardianSparkRuntime* rt;
+            ~SeamOff() { rt->set_io_executor_fail_launch_for_test(false); }
+        } seam_off{f.rt.get()};
+        f.rt->detach_rule("r1");
+        f.rt->detach_rule("r2");
+        REQUIRE(f.rt->disarm_retained() == 2);
+        for (int i = 0; i < 5; ++i)
+            (void)f.rt->expire_overdue_claims(HungDisarmRig5403::later(31s));
+        CHECK(f.rt->disarm_deadline_elapsed() == 2);
+    }
+}
+
+TEST_CASE("#5403: begin_stop with a hung Dispatched Disarm drops only the Queued claims, keeps "
+          "the worker counted, and the gauge still reads",
+          "[spark][runtime][liveness][5403]") {
+    using RT = GuardianSparkRuntime;
+    HungDisarmRig5403 f;
+    REQUIRE(f.rt->attach_rule("r3", file_spec("/b"), file_exists_rule("r3"), true));
+    // /b: a retained Queued Disarm (admission refused once).
+    f.rt->set_io_executor_fail_launch_for_test(true);
+    f.rt->detach_rule("r3");
+    f.rt->set_io_executor_fail_launch_for_test(false);
+    REQUIRE(f.rt->disarm_retained() == 1);
+    // /a: the Dispatched Disarm hangs, an Arm queues behind it.
+    f.hang_disarm_of_r1();
+    const auto rc = f.attach_behind("r2");
+    REQUIRE(f.depth() == 2);
+    const auto dropped_before = f.rt->claims_dropped_at_stop();
+
+    f.rt->begin_stop();
+    CHECK(f.rt->claims_dropped_at_stop() == dropped_before + 2); // /b's Disarm and /a's Arm
+    CHECK(f.rt->receipt_status(rc) == RT::ReceiptStatus::Stopped);
+    CHECK(f.rt->active_backend_op_workers() > 0); // the hung worker stays counted (F3)
+    CHECK(f.depth() == 1);                        // only the Dispatched head remains
+    std::optional<std::chrono::steady_clock::duration> age;
+    CHECK_NOTHROW(age = f.rt->oldest_pending_disarm_age(HungDisarmRig5403::later(31s)));
+    REQUIRE(age.has_value());
+    CHECK(*age >= 31s);
+    CHECK_NOTHROW((void)f.rt->expire_overdue_claims(HungDisarmRig5403::later(31s)));
+
+    f.b->release_disarm_hang();
+    REQUIRE(yuzu::test::spin_until([&] { return f.rt->active_backend_op_workers() == 0; }, 10s));
+    CHECK_FALSE(f.rt->oldest_pending_disarm_age(HungDisarmRig5403::later(1000s)).has_value());
+}
+
+TEST_CASE("#5403: single-rule serialized retries behind a hung Disarm keep the key's fifo bounded "
+          "and every expired Arm is CongestionExpired",
+          "[spark][runtime][liveness][5403]") {
+    using RT = GuardianSparkRuntime;
+    HungDisarmRig5403 f;
+    const int arm_base = f.b->arm_entries.load();
+    f.hang_disarm_of_r1();
+    for (int i = 0; i < 12; ++i) {
+        const auto rc = f.attach_behind("r2"); // the same rule, retried
+        REQUIRE(f.depth() == 2);               // the head plus this cycle's one Arm
+        // Past the 120 s backend deadline: the Arm is abandoned (the existing Arm expiry),
+        // the Disarm head is untouched.
+        (void)f.rt->expire_overdue_claims(HungDisarmRig5403::later(121s));
+        REQUIRE(f.rt->receipt_status(rc) == RT::ReceiptStatus::CongestionExpired);
+        REQUIRE(f.depth() == 1);
+        REQUIRE(f.b->arm_entries.load() == arm_base);
+    }
+    CHECK(f.rt->disarm_deadline_elapsed() == 1); // one claim, however many passes and retries
+    CHECK(f.rt->oldest_pending_disarm_age(HungDisarmRig5403::later(121s)).has_value());
+
+    f.b->release_disarm_hang();
+    REQUIRE(yuzu::test::spin_until([&] { return f.depth() == 0; }, 10s));
+    // Recovery: the key accepts a fresh arm once the hung call returned.
+    REQUIRE(f.rt->attach_rule("r2", file_spec("/a"), file_exists_rule("r2"), true));
+    CHECK(f.b->arm_entries.load() == arm_base + 1);
+}

@@ -741,6 +741,54 @@ std::size_t GuardianSparkRuntime::retained_tombstones() const {
     return n;
 }
 
+std::optional<std::chrono::steady_clock::duration>
+GuardianSparkRuntime::oldest_pending_disarm_age_locked(
+    std::chrono::steady_clock::time_point now) const {
+    std::optional<std::chrono::steady_clock::duration> oldest;
+    for (const auto& [key, entry] : claims_) {
+        if (entry.fifo.empty())
+            continue;
+        const auto& head = entry.fifo.front();
+        if (head->kind != ClaimKind::Disarm || head->outcome)
+            continue;
+        // A `now` before the claim's creation (a caller-supplied clock) reads as zero.
+        const auto age = std::max(now - head->created_at, std::chrono::steady_clock::duration::zero());
+        if (!oldest || age > *oldest)
+            oldest = age;
+    }
+    return oldest;
+}
+
+std::optional<std::chrono::steady_clock::duration>
+GuardianSparkRuntime::oldest_pending_disarm_age(std::chrono::steady_clock::time_point now) const {
+    std::lock_guard<std::mutex> lk{registry_mu_};
+    return oldest_pending_disarm_age_locked(now);
+}
+
+void GuardianSparkRuntime::observe_pending_disarms_locked(
+    std::chrono::steady_clock::time_point now, std::vector<DisarmObservation>& warns) {
+    for (auto& [key, entry] : claims_) {
+        if (entry.fifo.empty())
+            continue;
+        auto& head = entry.fifo.front();
+        if (head->kind != ClaimKind::Disarm || head->outcome || head->disarm_deadline_observed)
+            continue;
+        const auto age = now - head->created_at;
+        if (age <= kDisarmPendingObserveThreshold)
+            continue;
+        // Latch and count first (neither can throw), so the once-per-claim contract holds
+        // even when the warn copy below fails or the per-pass warn cap is already spent.
+        head->disarm_deadline_observed = true;
+        disarm_deadline_elapsed_.fetch_add(1, std::memory_order_relaxed);
+        if (warns.size() >= kDisarmPendingWarnsPerPass)
+            continue;
+        try {
+            warns.push_back(DisarmObservation{key, age});
+        } catch (...) {
+        }
+    }
+}
+
 std::vector<std::string> GuardianSparkRuntime::invariant_violations_for_test(
     bool allow_orphans) const {
     std::lock_guard<std::mutex> lk{registry_mu_};
@@ -2537,6 +2585,7 @@ void GuardianSparkRuntime::disarm_orphan_keys_locked(
                 c->key = it->first;
                 c->io_class = *ioc;
                 c->subscription = pk->subscription;
+                c->created_at = std::chrono::steady_clock::now(); // #5403: the age gauge's origin
                 // Everything fallible runs BEFORE keys_.erase, while keys_ still owns the
                 // watcher (detach_rule_locked's order); an inserted empty entry is rolled
                 // back if the push throws.
@@ -2586,10 +2635,18 @@ void GuardianSparkRuntime::disarm_orphan_keys_locked(
 }
 
 std::size_t GuardianSparkRuntime::expire_overdue_claims() {
-    const auto now = std::chrono::steady_clock::now();
+    return expire_overdue_claims(std::chrono::steady_clock::now());
+}
+
+std::size_t GuardianSparkRuntime::expire_overdue_claims(std::chrono::steady_clock::time_point now) {
     std::vector<std::pair<std::string, std::shared_ptr<KeyClaim>>> overdue;
     std::vector<std::pair<std::string, std::shared_ptr<KeyClaim>>> refills;
     std::vector<std::shared_ptr<KeyClaim>> disarms;
+    std::vector<DisarmObservation> disarm_warns; // #5403: copied under the lock, warned after it
+    try {
+        disarm_warns.reserve(kDisarmPendingWarnsPerPass);
+    } catch (...) {
+    }
     std::size_t expired_count = 0;
     std::size_t reaped_count = 0;
     {
@@ -2628,6 +2685,22 @@ std::size_t GuardianSparkRuntime::expire_overdue_claims() {
             disarm_orphan_keys_locked(disarms);
         } catch (...) {
             claim_drain_failures_.fetch_add(1, std::memory_order_relaxed);
+        }
+        // #5403: observation only (a counter and a copied key); it releases, pops and
+        // cancels nothing, so it can neither strand the refills above nor change a receipt.
+        observe_pending_disarms_locked(now, disarm_warns);
+    }
+    for (const auto& w : disarm_warns) {
+        try {
+            spdlog::warn("Guardian spark: the Disarm for key '{}' has been pending for {} s "
+                         "(observation threshold {} s); its key, its class quota slot and, if "
+                         "the backend call is blocked inside a mechanism, that mechanism type "
+                         "stay held until it returns - nothing was released (pending-too-long, "
+                         "not proof the call hung)",
+                         ::yuzu::log_key_token(w.key),
+                         std::chrono::duration_cast<std::chrono::seconds>(w.age).count(),
+                         kDisarmPendingObserveThreshold.count());
+        } catch (...) {
         }
     }
     // A reaped claim may carry an outcome this pass just wrote (the synthesis arm), which a
@@ -3291,6 +3364,7 @@ GuardianSparkRuntime::withdraw_rule_after_wedge_sweep_locked(
                 c->key = *key_opt;
                 c->io_class = *ioc;
                 c->subscription = kit->second->subscription;
+                c->created_at = std::chrono::steady_clock::now(); // #5403: the age gauge's origin
                 const auto [eit, inserted] = claims_.try_emplace(*key_opt);
                 // A disarm is only ever created on a key with no LIVE claim (an arm
                 // never writes keys_ until it commits, and commit erases the entry);
