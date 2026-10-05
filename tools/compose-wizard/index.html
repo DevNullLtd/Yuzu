@@ -112,9 +112,9 @@
           <div class="callout info">
             The server generates a per-install CA and the https/agent/gateway leaf
             certs on first boot (<code>ensure_default_certs</code>). Nothing to supply.
-            The cert directory is persisted (see below) so the CA survives a
-            <code>docker compose down &amp;&amp; up</code> — otherwise every recreate
-            mints a fresh CA and breaks already-enrolled agents' trust.
+            The cert directory is always persisted (see below): it holds the per-install
+            CA and the secrets KEK registered in Postgres, and a recreated server without
+            it refuses to start (<code>kek_unresolvable</code>, #5370).
           </div>
 
           <div class="field">
