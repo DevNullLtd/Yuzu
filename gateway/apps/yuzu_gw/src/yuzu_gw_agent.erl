@@ -32,7 +32,7 @@
          reannounce/2]).
 
 %% gen_statem callbacks
--export([callback_mode/0, init/1, terminate/3, code_change/4]).
+-export([callback_mode/0, init/1, terminate/3, code_change/4, format_status/1]).
 -export([connecting/3, streaming/3, disconnected/3]).
 
 -record(data, {
@@ -151,9 +151,24 @@ init(#{agent_id := AgentId, agent_info := AgentInfo,
     %% when the upstream connection re-establishes.
     Hostname = maps:get(<<"hostname">>, AgentInfo,
                         maps:get(hostname, AgentInfo, <<>>)),
-    yuzu_gw_registry:register_agent(AgentId, self(), SessionId, Plugins,
-                                    Hostname, RegisterReq, ConnKey),
+    case yuzu_gw_registry:register_agent(AgentId, self(), SessionId, Plugins,
+                                         Hostname, RegisterReq, ConnKey) of
+        ok ->
+            announce_connected(Data);
+        {error, registry_unavailable} ->
+            %% A fixed reason: an init failure is printed by the supervisor and
+            %% by the Subscribe handler, and must not carry the request.
+            {stop, registry_unavailable};
+        {error, session_limit} ->
+            %% The connection holds its quota of other agents' sessions (the
+            %% registry counted and logged it): refuse this one. A fixed reason,
+            %% for the same reason as above.
+            {stop, session_limit}
+    end.
 
+%% The rest of init/1, once the agent is in the routing table.
+announce_connected(#data{agent_id = AgentId, session_id = SessionId, peer_addr = PeerAddr,
+                         stream_pid = StreamPid, stream_home_id = StreamHomeId} = Data) ->
     %% Notify WatchEvents subscribers.
     notify_watchers(#{agent_id    => AgentId,
                       occurred_at => #{millis_epoch => erlang:system_time(millisecond)},
@@ -350,6 +365,48 @@ terminate(_Reason, _State, Data) ->
 
 code_change(_OldVsn, State, Data, _Extra) ->
     {ok, State, Data}.
+
+%% What OTP prints for this process in a terminate or crash report and in
+%% sys:get_status/1: the data without the stored RegisterRequest, which holds
+%% the enrollment token, machine certificate and CSR (and is only the replay
+%% copy the registry also keeps). Only the reports are affected:
+%% sys:get_state/1 still returns the real record.
+%%
+%% NOT covered here, because OTP prints it from raw data outside this callback
+%% (the `reason' stacktrace, whose frames carry the argument list of a failing
+%% call and so the whole data record; the mailbox; the init arguments in the
+%% supervisor report): yuzu_gw_crash_redact, the logger primary filter
+%% yuzu_gw_app installs, rewrites those for the processes of this module. It is
+%% NOT in place when this module is used without the application.
+%%
+%% The queued events (`queue', whose head is the "Last event" of a terminate
+%% report) and the postponed ones are reduced to their type: an event can carry
+%% a request. No production sender delivers one to this process; this is the
+%% belt to that braces.
+-spec format_status(map()) -> map().
+format_status(Status) ->
+    maps:map(fun(data, Data)         -> redact_data(Data);
+                (queue, Events)      -> redact_events(Events);
+                (postponed, Events)  -> redact_events(Events);
+                (_Key, Value)        -> Value
+             end, Status).
+
+%% A gen_statem event is {Type, Content}; only the type is kept.
+redact_events(Events) when is_list(Events) ->
+    [redact_event(E) || E <- Events];
+redact_events(_Other) ->
+    '$redacted'.
+
+redact_event({Type, _Content}) -> {Type, '$redacted'};
+redact_event(_Other)           -> '$redacted'.
+
+%% Shown as a map of the fields (a record with register_req replaced would
+%% violate the field's declared type), the way yuzu_gw_upstream shows its state.
+redact_data(#data{} = Data) ->
+    Fields = maps:from_list(lists:zip(record_info(fields, data), tl(tuple_to_list(Data)))),
+    Fields#{register_req := '$redacted'};
+redact_data(_Other) ->
+    '$redacted'.
 
 %%%===================================================================
 %%% Internal functions

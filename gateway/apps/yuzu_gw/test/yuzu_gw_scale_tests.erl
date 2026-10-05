@@ -329,7 +329,7 @@ heartbeat_batch_scale() ->
     meck:expect(grpcbox_client, unary, fun(_, _, _, _, _) ->
         {ok, #{acknowledged_count => 0}, #{}}
     end),
-    application:set_env(yuzu_gw, heartbeat_batch_interval_ms, 600000),
+    application:set_env(yuzu_gw, heartbeat_batch_interval_ms, 60000),
     application:set_env(yuzu_gw, max_heartbeat_buffer, N),
     case whereis(yuzu_gw_heartbeat_buffer) of
         undefined -> {ok, _} = yuzu_gw_heartbeat_buffer:start_link();

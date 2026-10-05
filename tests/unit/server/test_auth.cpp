@@ -509,7 +509,7 @@ TEST_CASE("verify_password returns the DB role for a cold-cache DB hit (#4020)",
 
     auto role = cold_mgr.verify_password("cora", "password1234");
     REQUIRE(role.has_value());
-    REQUIRE(*role == Role::admin);
+    REQUIRE(role->role == Role::admin);
     REQUIRE(cold_mgr.get_user_role("cora") == Role::admin); // hydrated
 }
 
@@ -773,7 +773,7 @@ TEST_CASE("verify_password returns the CURRENT role after a cross-manager demoti
 
     auto role = mgr_a.verify_password("cora", "password1234");
     REQUIRE(role.has_value());
-    REQUIRE(*role == Role::user); // NOT the stale cached admin
+    REQUIRE(role->role == Role::user); // NOT the stale cached admin
     REQUIRE(mgr_a.get_user_role("cora") == Role::user);
 }
 
@@ -881,7 +881,7 @@ TEST_CASE("a hydrated entry is superseded by a later in-process role change (#40
     cold_mgr.set_auth_db(auth_db.get());
     auto role = cold_mgr.verify_password("cora", "password1234"); // hydrates
     REQUIRE(role.has_value());
-    REQUIRE(*role == Role::user);
+    REQUIRE(role->role == Role::user);
 
     // A role change through THIS manager replaces the hydrated entry in place
     // (find_user_or_hydrate's try_emplace does not clobber it — update_role
@@ -889,7 +889,7 @@ TEST_CASE("a hydrated entry is superseded by a later in-process role change (#40
     REQUIRE(cold_mgr.update_role("cora", Role::admin));
     role = cold_mgr.verify_password("cora", "password1234");
     REQUIRE(role.has_value());
-    REQUIRE(*role == Role::admin);
+    REQUIRE(role->role == Role::admin);
 }
 
 TEST_CASE("a demote that completed before the recheck starts is correctly "
@@ -1187,7 +1187,7 @@ TEST_CASE("create_local_session's own post-mint recheck denies a stale-role "
 
     // Mint with a STALE "admin" role, as if an earlier check had returned it
     // before a demote (or simply a bug upstream) landed.
-    auto token = mgr.create_local_session("frank", Role::admin, true);
+    auto token = mgr.create_local_session_for_test("frank", Role::admin, true);
     CHECK(token.empty()); // fail-safe empty-token contract (ADR-0007), same as a durable-write failure
     CHECK(mgr.get_user_role("frank") == Role::user); // DB-authoritative, unaffected
 }

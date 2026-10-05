@@ -111,7 +111,7 @@ init_per_group(heartbeat, Config) ->
         {ok, #{acknowledged_count => 0}, #{}}
     end),
     %% Long interval — tests trigger flush manually.
-    application:set_env(yuzu_gw, heartbeat_batch_interval_ms, 600000),
+    application:set_env(yuzu_gw, heartbeat_batch_interval_ms, 60000),
     application:set_env(yuzu_gw, max_heartbeat_buffer, 100000),
     {ok, HBPid} = yuzu_gw_heartbeat_buffer:start_link(),
     unlink(HBPid),
@@ -252,7 +252,8 @@ heartbeat_throughput(_Config) ->
     {WallUs, _} = yuzu_gw_perf_helpers:measure_wall_clock_us(fun() ->
         lists:foreach(fun(I) ->
             ok = yuzu_gw_heartbeat_buffer:queue_heartbeat(
-                     #{agent_id => integer_to_binary(I),
+                     #{session_id => integer_to_binary(I),
+                       agent_id => integer_to_binary(I),
                        timestamp => erlang:system_time(millisecond)})
         end, lists:seq(1, N))
     end),
@@ -274,7 +275,8 @@ batch_flush_latency(_Config) ->
     meck:reset(grpcbox_client),
     lists:foreach(fun(I) ->
         ok = yuzu_gw_heartbeat_buffer:queue_heartbeat(
-                 #{agent_id => integer_to_binary(I),
+                 #{session_id => integer_to_binary(I),
+                   agent_id => integer_to_binary(I),
                    timestamp => erlang:system_time(millisecond)})
     end, lists:seq(1, N)),
 
@@ -302,7 +304,7 @@ buffer_backpressure(_Config) ->
 
     lists:foreach(fun(I) ->
         ok = yuzu_gw_heartbeat_buffer:queue_heartbeat(
-                 #{agent_id => iolist_to_binary(io_lib:format("bp-~B", [I]))})
+                 #{session_id => iolist_to_binary(io_lib:format("bp-~B", [I]))})
     end, lists:seq(1, N)),
 
     trigger_hb_flush(),
@@ -311,7 +313,7 @@ buffer_backpressure(_Config) ->
     MaxBuf = application:get_env(yuzu_gw, max_heartbeat_buffer, 100000),
     lists:foreach(fun(I) ->
         ok = yuzu_gw_heartbeat_buffer:queue_heartbeat(
-                 #{agent_id => iolist_to_binary(io_lib:format("bp-more-~B", [I]))})
+                 #{session_id => iolist_to_binary(io_lib:format("bp-more-~B", [I]))})
     end, lists:seq(1, MaxBuf)),
 
     %% Make flush succeed.
@@ -456,7 +458,7 @@ reconnection_storm(_Config) ->
     end, {[], []}, lists:seq(1, Cycles)),
 
     %% Verify monitor_refs map — no leaks.
-    {state, MonRefs, _} = sys:get_state(yuzu_gw_registry),
+    MonRefs = element(2, sys:get_state(yuzu_gw_registry)),
     MonRefCount = maps:size(MonRefs),
     ?assertEqual(N, MonRefCount,
                  lists:flatten(io_lib:format(
@@ -518,7 +520,7 @@ monitor_map_stability(_Config) ->
         lists:foreach(fun(Pid) -> exit(Pid, kill) end, Pids),
         ok = yuzu_gw_perf_helpers:wait_for_registry_count(0, 30000),
 
-        {state, MonRefs, _} = sys:get_state(yuzu_gw_registry),
+        MonRefs = element(2, sys:get_state(yuzu_gw_registry)),
         MonRefCount = maps:size(MonRefs),
         ?assertEqual(0, MonRefCount,
                      lists:flatten(io_lib:format(
@@ -703,7 +705,7 @@ endurance_loop(Ids, EndTime, SampleSecs, ChurnSecs, Elapsed, Samples) ->
             %% 2) Queue some heartbeats.
             HBIds = lists:sublist(Ids, min(100, length(Ids))),
             lists:foreach(fun(Id) ->
-                yuzu_gw_heartbeat_buffer:queue_heartbeat(#{agent_id => Id})
+                yuzu_gw_heartbeat_buffer:queue_heartbeat(#{session_id => Id, agent_id => Id})
             end, HBIds),
 
             %% 3) Churn 10% of agents every ChurnSecs.

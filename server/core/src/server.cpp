@@ -48,6 +48,7 @@
 #include "rotation_warn_dedup.hpp"
 #include "approval_manager.hpp"
 #include "audit_store.hpp"
+#include "credential_change_owner.hpp" // #5342 — one-transaction local credential change
 #include "tar_corruption_audit.hpp" // #1567 corruption audit gate
 #include "body_cap_policy.hpp" // #2407: pre-auth request-body cap policy table
 #include "ca_routes.hpp"
@@ -1436,7 +1437,12 @@ public:
                           "explicit agent_ids on REST (route=command), MCP execute_instruction "
                           "(route=mcp) or the dashboard exec console (route=dashboard) (#3685). "
                           "Both labels are closed sets; every reachable pair "
-                          "is pre-seeded at boot so absent() stays meaningful.",
+                          "is pre-seeded at boot so absent() stays meaningful. The "
+                          "withhold reasons quarantined, unknown_plugin and "
+                          "kill_switched_os are deliberate withholds (containment, an "
+                          "absent plugin, operator policy) rather than malformed "
+                          "targeting, and are excluded from the "
+                          "YuzuDispatchTargetRejected alert.",
                           "counter");
         // The route-level reasons below are the literals in `kRouteRejectReasons`
         // (dispatch_target_shape.hpp). They are spelled out here rather than
@@ -1559,6 +1565,13 @@ public:
                              {{"route", route},
                               {"reason", std::string(yuzu::server::kReasonUnknownPlugin)}});
 
+        // #5294: same three routes, same discipline, for the per-OS kill-switch
+        // filter.
+        for (const char* route : {"dispatch_closure", "command", "legacy"})
+            metrics_.counter("yuzu_server_dispatch_target_rejected_total",
+                             {{"route", route},
+                              {"reason", std::string(yuzu::server::kReasonKillSwitchedOs)}});
+
         // Governance round 1 for #2557 (UP-1b): `yuzu_server_dispatch_fanout_
         // throw_total` was introduced by the #2557 extraction (the local
         // `audit_fn` wrapper in `command_routes.cpp`) but was never pre-seeded
@@ -1570,9 +1583,10 @@ public:
         // here rather than iterated from a shared array — unlike the `reason`
         // constants above, these are hardcoded per-call-site string literals
         // in `command_routes.cpp`, not sourced from a header constant: `success`/
-        // `denial` (the `audit_fn` wrapper) plus the seven `guarded()` site
+        // `denial` (the `audit_fn` wrapper) plus the nine `guarded()` site
         // names (`audit_quarantine_dispatch_fail_closed`,
         // `audit_quarantine_dispatch_denied_batch`, `audit_unknown_plugin_dispatch`,
+        // `audit_kill_switched_os_dispatch` (#5294), `audit_os_gate_unreadable` (#5294),
         // `forward_gateway_pending`, `publish(command-status)`,
         // `emit_event(command.dispatched)`, `thead_for_plugin`).
         metrics_.describe(
@@ -1585,7 +1599,9 @@ public:
             "counter");
         for (const char* phase : {"success", "denial", "audit_quarantine_dispatch_fail_closed",
                                   "audit_quarantine_dispatch_denied_batch",
-                                  "audit_unknown_plugin_dispatch", "forward_gateway_pending",
+                                  "audit_unknown_plugin_dispatch",
+                                  "audit_kill_switched_os_dispatch",
+                                  "audit_os_gate_unreadable", "forward_gateway_pending",
                                   "publish(command-status)", "emit_event(command.dispatched)",
                                   "thead_for_plugin"})
             metrics_.counter("yuzu_server_dispatch_fanout_throw_total",
@@ -2988,7 +3004,8 @@ public:
                           "Total requests refused 503 by an is_store_unavailable fail-closed "
                           "guard on the auth/MFA surface, by route",
                           "counter");
-        for (auto route : {"login", "mfa_verify", "mfa_stepup", "mfa_enroll", "elevate"}) {
+        for (auto route :
+             {"login", "mfa_verify", "mfa_stepup", "mfa_enroll", "elevate", "password_change"}) {
             metrics_.counter("yuzu_auth_secret_unavailable_total", {{"route", route}});
         }
         // #2396 / #2401: reason-labelled sibling of the counter above. Same
@@ -3000,21 +3017,63 @@ public:
         // (reason=query_error) vs an undecryptable/absent secret
         // (reason=secret_unavailable). Lets SRE tell a transient retry-storm
         // apart from a uniform outage, which the route-only counter above cannot
-        // (#2401). Only the initial POST /login handler is instrumented; the
-        // other is_store_unavailable->503 auth sites (login/mfa, stepup, enroll,
-        // elevate) keep only yuzu_auth_secret_unavailable_total{route}. Reason
+        // (#2401). Only the initial POST /login handler and the self-service
+        // password change (route=password_change, which shares its lockout
+        // helper, #5342) are instrumented; the other is_store_unavailable->503
+        // auth sites (login/mfa, stepup, enroll, elevate) keep only
+        // yuzu_auth_secret_unavailable_total{route}. Reason
         // token matches the yuzu_*_read_degrade_total family. Bounded, pre-seeded
         // closed label set per docs/observability-conventions.md so absent()
         // alerts stay meaningful.
         metrics_.describe("yuzu_auth_read_degrade_total",
                           "Requests refused 503 by an is_store_unavailable fail-closed guard in "
-                          "the initial POST /login handler, labelled by why the auth store was "
-                          "unavailable (pool_acquire_timeout / query_error / secret_unavailable)",
+                          "the initial POST /login handler or the self-service password change, "
+                          "by route and by why the auth store was unavailable "
+                          "(pool_acquire_timeout / query_error / secret_unavailable)",
                           "counter");
-        for (auto reason : {"pool_acquire_timeout", "query_error", "secret_unavailable"}) {
-            metrics_.counter("yuzu_auth_read_degrade_total",
-                             {{"route", "login"}, {"reason", reason}});
+        // route=password_change: POST /api/v1/users/me/password shares /login's
+        // lockout helper (AuthRoutes::verify_password_with_lockout), so its
+        // fail-closed refusals land here too (#5342).
+        for (auto route : {"login", "password_change"}) {
+            for (auto reason : {"pool_acquire_timeout", "query_error", "secret_unavailable"}) {
+                metrics_.counter("yuzu_auth_read_degrade_total",
+                                 {{"route", route}, {"reason", reason}});
+            }
         }
+        // #5342: outcomes of the two local-password routes. kind=self is
+        // POST /api/v1/users/me/password, kind=admin is
+        // POST /api/v1/users/{name}/password; result is ok / denied / error.
+        // kind=self,result=denied includes wrong current passwords (which can
+        // indicate guessing through the change route) alongside the other
+        // refusals; the closed 2x3 set is pre-seeded (#5177: increase() never
+        // sees the first event of a series born at 1).
+        metrics_.describe("yuzu_auth_password_changes_total",
+                          "Local-password change/reset outcomes, by kind (self|admin) and result "
+                          "(ok|denied|error)",
+                          "counter");
+        for (auto kind : {"self", "admin"}) {
+            for (auto result : {"ok", "denied", "error"}) {
+                metrics_.counter("yuzu_auth_password_changes_total",
+                                 {{"kind", kind}, {"result", result}});
+            }
+        }
+        // #5274: cfg users whose yuzu-server.cfg hash differs from their
+        // auth.users row at boot (dead cfg credentials; the stored one wins).
+        // Set once by AuthManager::report_stale_cfg_credentials after
+        // set_auth_db; pre-seeded to 0 for cfg-file-only boots.
+        metrics_.describe("yuzu_auth_cfg_credentials_stale",
+                          "yuzu-server.cfg users whose password hash differs from the auth "
+                          "store at boot (the cfg is seed-only; the stored credential wins)",
+                          "gauge");
+        metrics_.gauge("yuzu_auth_cfg_credentials_stale").set(0.0);
+        // #5342/#5274: a credential check that passed against the hash it read,
+        // then found a different hash under the row lock (the password changed
+        // mid-login), and was denied. Unlabelled; pre-seeded to 0.
+        metrics_.describe("yuzu_auth_credential_changed_during_verify_total",
+                          "Password verifications denied because the stored hash changed "
+                          "between the verify read and the row-locked recheck",
+                          "counter");
+        metrics_.counter("yuzu_auth_credential_changed_during_verify_total");
         // Gate 5 chaos-injector CH-3/UP-6 follow-up (#4020): the ONE
         // caller-visible signal that get_user_role() is about to floor a
         // legacy-API-token-authenticated request's role to Role::user
@@ -4869,6 +4928,13 @@ public:
                         startup_failed_ = true;
                     } else {
                         auth_mgr_.set_auth_db(auth_db_.get());
+                        // #5274 (#5342 Gate 7): the cfg file is seed-only now
+                        // that AuthDB is wired — warn, by name, about any cfg
+                        // user whose stored credential has since diverged, and
+                        // publish the count. Before any listener binds, so no
+                        // login has hydrated users_ yet (it holds cfg entries
+                        // only).
+                        (void)auth_mgr_.report_stale_cfg_credentials();
 
                         // WS-6 6.2: one-time import of the legacy per-replica
                         // enrollment-tokens.cfg / pending-agents.cfg into Postgres.
@@ -5378,6 +5444,18 @@ public:
                     legacy_sqlite_probe::warn_if_legacy_rows(cfg_.db_dir() / "audit.db",
                                                              "AuditStore", {"audit_events"});
                     audit_store_->start_cleanup();
+                    // #5342 Gate 8: the ADR-0012 §3 query owner for a local
+                    // account's credential change — the credential, its
+                    // sessions, provisional MFA, lockout and audit row(s) in
+                    // ONE transaction on the shared pool. Needs AuthDB,
+                    // SessionStore and AuditStore on THIS pool (all three are:
+                    // auth_db_/session_store_ above, audit_store_ here); the
+                    // one-pool assumption is what makes its cross-schema
+                    // transaction possible (credential_change_owner.hpp).
+                    // Nulled on auth_mgr_ at teardown beside set_auth_db.
+                    credential_change_owner_ =
+                        std::make_unique<CredentialChangeOwner>(*pg_pool_, audit_store_.get());
+                    auth_mgr_.set_credential_change_owner(credential_change_owner_.get());
                 }
             }
             // Internal-CA store — PostgreSQL (ADR-0053, schema ca_store): cert inventory + CRL
@@ -10076,6 +10154,10 @@ public:
         // set_session_store; null it before session_store_ destructs with the
         // rest of this object's members.
         auth_mgr_.set_session_store(nullptr);
+        // #5342: same contract for the credential-change owner (borrows
+        // pg_pool_ + audit_store_, both reset below).
+        auth_mgr_.set_credential_change_owner(nullptr);
+        credential_change_owner_.reset();
 
         // Release Phase 2 components (RAII handles close).
         execution_tracker_.reset();
@@ -12062,11 +12144,11 @@ private:
         auto finalized = yuzu::server::detail::finalize_classified_command(
             cap,
             plugin_config_store_ != nullptr
-                ? std::function<bool(std::string_view, std::string_view)>(
+                ? yuzu::server::detail::KillSwitchFn(
                       [this](std::string_view p, std::string_view a) {
-                          return plugin_config_store_->action_allowed(p, a);
+                          return plugin_config_store_->kill_switch_decision(p, a);
                       })
-                : std::function<bool(std::string_view, std::string_view)>{},
+                : yuzu::server::detail::KillSwitchFn{},
             plugin, action, command_id, parameters, payload, stagger_seconds, delay_seconds,
             target_arm, execution_id);
 
@@ -12483,6 +12565,11 @@ private:
         }
         audit_unknown_plugin_dispatch("dispatch_closure", caller.principal, caller.principal_role,
                                       command_id, plugin, outcome.unknown_plugin_count);
+        audit_kill_switched_os_dispatch("dispatch_closure", caller.principal,
+                                        caller.principal_role, command_id, plugin,
+                                        outcome.kill_switched_os_count);
+        if (outcome.os_gate_unreadable)
+            audit_os_gate_unreadable(caller.principal, caller.principal_role, command_id, plugin);
 
         forward_gateway_pending();
         if (outcome.sent > 0)
@@ -13474,16 +13561,57 @@ private:
                                        const std::string& principal_role,
                                        const std::string& command_id, const std::string& plugin,
                                        std::size_t count) {
+        audit_dispatch_withheld(route, principal, principal_role, command_id, plugin, count,
+                                yuzu::server::kReasonUnknownPlugin, "plugin_not_found");
+    }
+
+    // #5294: the per-OS kill-switch sibling -- same aggregate row and metric,
+    // its own `reason`.
+    void audit_kill_switched_os_dispatch(std::string_view route, const std::string& principal,
+                                         const std::string& principal_role,
+                                         const std::string& command_id, const std::string& plugin,
+                                         std::size_t count) {
+        audit_dispatch_withheld(route, principal, principal_role, command_id, plugin, count,
+                                yuzu::server::kReasonKillSwitchedOs, "kill_switched_os");
+    }
+
+    // #5294: a dispatch refused BEFORE targeting because presence could not be
+    // read while a per-OS kill switch is OFF. Like the fail-closed quarantine
+    // row it is ONE aggregate decision with no per-agent count. Audit row only:
+    // the scheduled-path outbox already counts the cause
+    // (`yuzu_server_command_outbox_deliver_retry_cause_total`), and
+    // `yuzu_server_dispatch_target_rejected_total` carries the per-target
+    // withhold reasons, and this refusal has no per-target count.
+    void audit_os_gate_unreadable(const std::string& principal, const std::string& principal_role,
+                                  const std::string& command_id, const std::string& plugin) {
+        write_withheld_row(principal, principal_role, command_id, plugin, "os_gate_unreadable");
+    }
+
+    // Shared body of `audit_unknown_plugin_dispatch` and
+    // `audit_kill_switched_os_dispatch`: `metric_reason` is the
+    // `yuzu_server_dispatch_target_rejected_total` label, `detail_reason` the
+    // token written into the audit row's detail.
+    void audit_dispatch_withheld(std::string_view route, const std::string& principal,
+                                 const std::string& principal_role, const std::string& command_id,
+                                 const std::string& plugin, std::size_t count,
+                                 std::string_view metric_reason, std::string_view detail_reason) {
         if (count == 0)
             return;
         metrics_
             .counter("yuzu_server_dispatch_target_rejected_total",
-                     {{"route", std::string(route)},
-                      {"reason", std::string(yuzu::server::kReasonUnknownPlugin)}})
+                     {{"route", std::string(route)}, {"reason", std::string(metric_reason)}})
             .increment(static_cast<double>(count));
-        spdlog::warn(
-            "dispatch withheld: route={} command={} plugin={} reason=unknown_plugin agents={}",
-            route, command_id, plugin, count);
+        spdlog::warn("dispatch withheld: route={} command={} plugin={} reason={} agents={}", route,
+                     command_id, plugin, metric_reason, count);
+        write_withheld_row(principal, principal_role, command_id, plugin,
+                           std::string(detail_reason) + " agents=" + std::to_string(count));
+    }
+
+    // The one `command.dispatch_withheld` audit row; `reason_tail` is the
+    // text after `reason=` (the cause token, plus `agents=N` where counted).
+    void write_withheld_row(const std::string& principal, const std::string& principal_role,
+                            const std::string& command_id, const std::string& plugin,
+                            const std::string& reason_tail) {
         if (!audit_store_)
             return;
         AuditEvent ev{};
@@ -13494,12 +13622,12 @@ private:
         ev.target_type = "Command";
         ev.target_id = "*";
         ev.detail = "COMMAND_DISPATCH_WITHHELD command=" + command_id + " plugin=" + plugin +
-                    " reason=plugin_not_found agents=" + std::to_string(count);
+                    " reason=" + reason_tail;
         ev.result = "denied";
         if (!audit_store_->log(ev))
             spdlog::error("audit write failed: command.dispatch_withheld (command={} plugin={}, "
-                          "agents={})",
-                          command_id, plugin, count);
+                          "reason={})",
+                          command_id, plugin, reason_tail);
     }
 
     // Apply stored runtime config overrides on startup. Returns false on a
@@ -14389,6 +14517,14 @@ private:
             is_login = is_login ||
                        (req.path == "/auth/saml/start" && req.method == "GET") ||
                        (req.path == "/saml/acs"        && req.method == "POST");
+            // #5342: POST /api/v1/users/me/password verifies the current
+            // password, so it is the same online-guessing surface as /login
+            // (lockout bounds it only while --auth-lockout-threshold > 0).
+            // The admin reset (/api/v1/users/{name}/password) rides the same
+            // bucket: one predicate for the pair, no cost to a human admin.
+            is_login = is_login ||
+                       (req.method == "POST" && req.path.starts_with("/api/v1/users/") &&
+                        req.path.ends_with("/password"));
             auto& limiter = is_login ? login_rate_limiter_ : api_rate_limiter_;
             if (!limiter.allow(req.remote_addr)) {
                 res.status = 429;
@@ -15633,6 +15769,18 @@ private:
                                const std::string& plugin, std::size_t count) {
                         audit_unknown_plugin_dispatch(route, principal, principal_role,
                                                       command_id, plugin, count);
+                    },
+                    .audit_kill_switched_os_dispatch_fn =
+                        [this](std::string_view route, const std::string& principal,
+                               const std::string& principal_role, const std::string& command_id,
+                               const std::string& plugin, std::size_t count) {
+                        audit_kill_switched_os_dispatch(route, principal, principal_role,
+                                                        command_id, plugin, count);
+                    },
+                    .audit_os_gate_unreadable_fn =
+                        [this](const std::string& principal, const std::string& principal_role,
+                               const std::string& command_id, const std::string& plugin) {
+                        audit_os_gate_unreadable(principal, principal_role, command_id, plugin);
                     },
                     .audit_scope_resolution_failed_fn =
                         [this](const std::string& principal, const std::string& principal_role,
@@ -19136,6 +19284,45 @@ private:
         // local-vs-presence mismatch one route over. MUST run BEFORE
         // register_routes(), same timing contract as the setters above.
         rest_api_v1_->set_all_agent_ids_fn([this] { return registry_.all_ids(); });
+        // #5342 — POST /api/v1/users/me/password + /api/v1/users/{name}/password.
+        // The current-password proof is AuthRoutes' lockout-accounted check
+        // (the SAME section POST /login runs — never a second copy); it and the
+        // principal-explicit audit writer capture auth_routes_ (constructed
+        // above, outlives route dispatch). No session cookie is minted here
+        // any more: a self-change deletes every session of the account in its
+        // own transaction and the user signs in again (#5342 Gate 7/8).
+        // The CSRF same-site gate uses the same trusted-origin allowlist as the
+        // dashboard/CA cookie POSTs (#2537). MUST run BEFORE register_routes(),
+        // same timing contract as the setters above.
+        // #5342 Gate 7/8: every audit row those routes write names the
+        // principal captured at the start of the request — refusal rows via
+        // AuthRoutes::audit_log_for_principal, the in-transaction success
+        // rows via make_audit_event_for_principal's template.
+        // The break-glass account is refused as an admin-reset target.
+        rest_api_v1_->set_password_change_deps(RestApiV1::PasswordChangeDeps{
+            &auth_mgr_, auth_routes_->password_change_verify_fn(),
+            [ar = auth_routes_.get()](const httplib::Request& req, const std::string& action,
+                                      const std::string& result, const std::string& principal,
+                                      const std::string& principal_role,
+                                      const std::string& target_type,
+                                      const std::string& target_id, const std::string& detail) {
+                return ar->audit_log_for_principal(req, action, result, principal,
+                                                   principal_role, target_type, target_id,
+                                                   detail);
+            },
+            cfg_.break_glass_user,
+            // #5342 Gate 8: the success row(s) are written INSIDE the
+            // credential-change transaction; this builds their identity half
+            // with the SAME builder audit_log_for_principal uses.
+            [ar = auth_routes_.get()](const httplib::Request& req, const std::string& principal,
+                                      const std::string& principal_role,
+                                      const std::string& target_type,
+                                      const std::string& target_id) {
+                return ar->make_audit_event_for_principal(req, /*action=*/{}, /*result=*/{},
+                                                          principal, principal_role,
+                                                          target_type, target_id);
+            }});
+        rest_api_v1_->set_csrf_trusted_origins(cfg_.csrf_trusted_origins);
         rest_api_v1_->register_routes(
             *web_server_,
             [this](const httplib::Request& req, httplib::Response& res)
@@ -19676,16 +19863,20 @@ private:
                         });
                     if (!decision)
                         return decision;
-                    const std::function<bool(std::string_view, std::string_view)> action_allowed =
+                    const yuzu::server::detail::KillSwitchFn action_allowed =
                         plugin_config_store_ != nullptr
-                            ? std::function<bool(std::string_view, std::string_view)>(
+                            ? yuzu::server::detail::KillSwitchFn(
                                   [this](std::string_view p, std::string_view a) {
-                                      return plugin_config_store_->action_allowed(p, a);
+                                      return plugin_config_store_->kill_switch_decision(p, a);
                                   })
-                            : std::function<bool(std::string_view, std::string_view)>{};
-                    if (auto denial =
-                            yuzu::server::detail::kill_switch_denial(*decision, action_allowed)) {
-                        return std::unexpected(*denial);
+                            : yuzu::server::detail::KillSwitchFn{};
+                    // The dry run has no target, so it cannot see the per-OS
+                    // layer (only the all-OS denial); a per-OS withhold shows
+                    // up at dispatch as kill_switched_os_count > 0.
+                    if (auto os_set =
+                            yuzu::server::detail::kill_switch_denial(*decision, action_allowed);
+                        !os_set) {
+                        return std::unexpected(os_set.error());
                     }
                     return decision;
                 });
@@ -20314,9 +20505,29 @@ private:
         // for this dispatch. BR-009: `classified->wire().plugin()`, not the
         // raw `plugin` local — see the /api/command sibling site's comment.
         const auto plugin_missing = registry_.ids_missing_plugin(classified->wire().plugin());
+        // #5294: per-OS kill-switch ids; a degraded presence read while a
+        // per-OS switch is OFF refuses the dispatch (fail closed). A fail-closed
+        // containment gate already withholds every id and is reported first
+        // below (`containment_unreadable`), so skip the presence read rather
+        // than let `os_gate_unreadable` shadow it.
+        static const std::unordered_set<std::string> kNoOsKillSwitch{};
+        const auto os_kill_switched = registry_.ids_with_os(
+            containment_gate.fail_closed ? kNoOsKillSwitch : classified->kill_switched_os());
+        if (!os_kill_switched) {
+            spdlog::error("legacy dispatch {}:{} refused: presence unreadable while a per-OS "
+                          "kill switch is OFF",
+                          plugin, action);
+            audit_os_gate_unreadable(caller.principal, caller.principal_role, command_id, plugin);
+            res.status = 503;
+            res.set_content(
+                R"({"error":{"code":503,"message":"agent presence could not be read while a per-OS kill switch is set — dispatch is failing closed and reaching no agent","reason":"os_gate_unreadable","retry_after_ms":5000},"meta":{"api_version":"v1"}})",
+                "application/json");
+            return;
+        }
         auto result = yuzu::server::dispatch_confined_arms(
             yuzu::server::DispatchArm::Broadcast, {}, exec_visible,
-            /*broadcast_on_none=*/false, containment_gate, sink, plugin_missing);
+            /*broadcast_on_none=*/false, containment_gate, sink, plugin_missing,
+            *os_kill_switched);
         int sent = result.sent;
 
         // #881: emitted BEFORE the sent==0 -> 503 branch below, so a
@@ -20334,6 +20545,8 @@ private:
         }
         audit_unknown_plugin_dispatch("legacy", caller.principal, caller.principal_role,
                                       command_id, plugin, result.unknown_plugin_count);
+        audit_kill_switched_os_dispatch("legacy", caller.principal, caller.principal_role,
+                                        command_id, plugin, result.kill_switched_os_count);
 
         if (sent == 0) {
             // Same five-way split as /api/command (command_routes.cpp as of
@@ -20368,6 +20581,10 @@ private:
             } else if (result.unknown_plugin_count > 0) {
                 res.set_content(
                     R"({"error":{"code":503,"message":"the dispatched plugin is not in any target's reported inventory — dispatch was withheld, not attempted","reason":"plugin_not_found","retry_after_ms":null},"meta":{"api_version":"v1"}})",
+                    "application/json");
+            } else if (result.kill_switched_os_count > 0) {
+                res.set_content(
+                    R"({"error":{"code":503,"message":"every target runs an OS for which this plugin action is switched off — dispatch was withheld, not attempted","reason":"kill_switched_os","retry_after_ms":null},"meta":{"api_version":"v1"}})",
                     "application/json");
             } else {
                 res.set_content(
@@ -20544,6 +20761,11 @@ private:
     /// Borrows pg_pool_ → declared after it; reset in stop() before the pool.
     std::unique_ptr<AccessReviewStore> access_review_store_;
     std::unique_ptr<AuditStore> audit_store_;
+    /// #5342: one-transaction credential-change query owner. Borrows pg_pool_
+    /// and audit_store_ — declared AFTER audit_store_ so it destructs first;
+    /// stop() also resets it explicitly (after nulling auth_mgr_'s pointer)
+    /// before audit_store_/pg_pool_ go.
+    std::unique_ptr<CredentialChangeOwner> credential_change_owner_;
     std::unique_ptr<TagStore> tag_store_;
 
     // Phase 2: Instruction system

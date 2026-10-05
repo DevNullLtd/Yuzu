@@ -251,7 +251,7 @@ struct SsoJitHarness {
     // with `UserAlreadyExists`.
     std::string admin_session() {
         REQUIRE(auth_mgr.upsert_user("admin", "adminpassword1", Role::admin));
-        return auth_mgr.create_local_session("admin", Role::admin, /*mfa_verified=*/true);
+        return auth_mgr.create_local_session_for_test("admin", Role::admin, /*mfa_verified=*/true);
     }
 };
 } // namespace
