@@ -209,21 +209,28 @@ docker compose stop server
 docker compose start server
 ```
 
-**Windows** (elevated PowerShell). The Windows installer stores the connection string in a file only Administrators and SYSTEM can read; a hand-configured server may use the `YUZU_POSTGRES_DSN` environment variable instead. The block first locks the backup directory to Administrators and SYSTEM (owner Administrators, inheritance removed, full control for those two only), the same grant the installer gives its own directories, so both halves inherit it. Use a new, empty directory: files already in it keep any permissions set on them directly. `pg_dump --file` writes the dump itself, because in Windows PowerShell 5.1 (and PowerShell before 7.4) `>` re-encodes a native command's output as text, which corrupts a custom-format dump.
+**Windows** (elevated PowerShell). The Windows installer stores the connection string in a file only Administrators and SYSTEM can read; a hand-configured server may use the `YUZU_POSTGRES_DSN` environment variable instead. The block first locks the backup directory to Administrators and SYSTEM (owner Administrators, inheritance removed, full control for those two only), the same grant the installer gives its own directories, so both halves inherit it. Each run writes to a new, timestamped directory (files already in a directory keep any permissions set on them directly, so the block refuses to reuse one). `pg_dump --file` writes the dump itself, because in Windows PowerShell 5.1 (and PowerShell before 7.4) `>` re-encodes a native command's output as text, which corrupts a custom-format dump.
 
 ```powershell
-$Stamp = Get-Date -Format yyyyMMddTHHmmssZ
-$Bk = "C:\Backups\Yuzu"
-New-Item -ItemType Directory -Force -Path $Bk | Out-Null
-icacls $Bk /setowner '*S-1-5-32-544' /L /C /Q | Out-Null
-if ($LASTEXITCODE) { throw 'icacls failed: the backup folder is not locked down, stop here' }
-icacls $Bk /inheritance:r /grant:r '*S-1-5-32-544:(OI)(CI)F' '*S-1-5-18:(OI)(CI)F' /L /C /Q | Out-Null
-if ($LASTEXITCODE) { throw 'icacls failed: the backup folder is not locked down, stop here' }
-$DsnFile = "C:\ProgramData\Yuzu Server\postgres.dsn"
-$Dsn = if (Test-Path $DsnFile) { (Get-Content -LiteralPath $DsnFile -Raw).Trim() } else { $Env:YUZU_POSTGRES_DSN }
-pg_dump $Dsn --format=custom --file "$Bk\yuzu-$Stamp.dump"
-Compress-Archive -Path C:\ProgramData\Yuzu\certs -DestinationPath "$Bk\yuzu-keys-$Stamp.zip"
+& {
+  $Stamp = (Get-Date).ToUniversalTime().ToString('yyyyMMddTHHmmssZ')
+  $Bk = "C:\Backups\Yuzu-$Stamp"
+  if (Test-Path -LiteralPath $Bk) { throw "$Bk already exists: use a new, empty folder" }
+  New-Item -ItemType Directory -Path $Bk | Out-Null
+  icacls $Bk /setowner '*S-1-5-32-544' /L /Q | Out-Null
+  if ($LASTEXITCODE) { throw 'icacls failed: the backup folder is not locked down, stop here' }
+  icacls $Bk /inheritance:r /grant:r '*S-1-5-32-544:(OI)(CI)F' '*S-1-5-18:(OI)(CI)F' /L /Q | Out-Null
+  if ($LASTEXITCODE) { throw 'icacls failed: the backup folder is not locked down, stop here' }
+  $DsnFile = "C:\ProgramData\Yuzu Server\postgres.dsn"
+  $Dsn = if (Test-Path $DsnFile) { (Get-Content -LiteralPath $DsnFile -Raw).Trim() } else { $Env:YUZU_POSTGRES_DSN }
+  pg_dump --format=custom --file "$Bk\yuzu-$Stamp.dump" $Dsn
+  if ($LASTEXITCODE) { throw 'pg_dump failed: no pair was written, stop here' }
+  Compress-Archive -Path C:\ProgramData\Yuzu\certs -DestinationPath "$Bk\yuzu-keys-$Stamp.zip" -ErrorAction Stop
+  Write-Output "OK: pair written to $Bk"
+}
 ```
+
+The block is one `& { ... }` script block, so a failure stops everything after it however it is pasted. Go on only after `OK: pair written to ...`.
 
 Rules that follow from the pairing:
 
