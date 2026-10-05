@@ -300,19 +300,17 @@ struct SubkeyEnum {
     return w;
 }
 
-/// walk_consent_store_once, tried again after a `changed_during_read` -- at most kStabilityRewalks
-/// times, and never once the run's deadline has passed (a timed-out first walk keeps its honest
-/// `changed_during_read` refusal rather than being replaced by an empty second walk). The re-walk
+/// walk_consent_store_once, tried again once after a `changed_during_read` -- and never once the
+/// run's deadline has passed (a timed-out first walk keeps its honest `changed_during_read`
+/// refusal rather than being replaced by an empty second walk). The re-walk
 /// starts the source's retention counters from zero (begin_profile), since the discarded walk
 /// charged them; the deadline is sticky and is not reset.
 [[nodiscard]] inline ConsentWalk walk_consent_store(RegistryReader& reg, RegKeyHandle hive,
                                                     RetentionBudget& budget) {
-    for (unsigned attempt = 0;; ++attempt) {
-        ConsentWalk w = walk_consent_store_once(reg, hive, budget);
-        if (w.refused != kChangedDuringRead || attempt >= kStabilityRewalks || budget.expired())
-            return w;
-        budget.begin_profile();
-    }
+    ConsentWalk w = walk_consent_store_once(reg, hive, budget);
+    if (w.refused != kChangedDuringRead || budget.expired()) return w;
+    budget.begin_profile();
+    return walk_consent_store_once(reg, hive, budget);
 }
 
 } // namespace yuzu::privacy_permissions::win

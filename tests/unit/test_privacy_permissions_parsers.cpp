@@ -612,7 +612,6 @@ TEST_CASE("win::RetentionBudget: the run deadline is injectable, inclusive and s
     CHECK(win::kRunBudget == std::chrono::seconds{15});
     CHECK(win::kTimeoutToken == "collection:timeout");
     CHECK(win::run_stop_token(win::kTimeoutToken, 0) == "collection:timeout:profiles_skipped_0");
-    CHECK(win::kStabilityRewalks == 1);
 
     win::RetentionBudget b;
     b.deadline = Clock::time_point::max();

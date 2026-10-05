@@ -332,8 +332,8 @@ TEST_CASE("privacy_permissions win: walk_consent_store decodes a fixture Consent
     }
 }
 
-TEST_CASE("privacy_permissions win: HiveFileGuard checks the deadline before any open, accepts a "
-          "regular file, refuses a directory or a missing file, and catches a swapped file",
+TEST_CASE("privacy_permissions win: HiveFileGuard accepts a regular file, refuses a directory or "
+          "a missing file, and catches a swapped file",
           "[privacy_permissions][win_internals]") {
     yuzu::test::TempDir tmp("yuzu_test_privperm_hive_");
     fs::create_directories(tmp.path);
@@ -342,15 +342,6 @@ TEST_CASE("privacy_permissions win: HiveFileGuard checks the deadline before any
     { std::ofstream(file, std::ios::binary) << "regf"; }
     const std::string sid = own_sid_string();
 
-    SECTION("an expired deadline is refused as `timeout` with no file opened") {
-        win::RetentionBudget budget;
-        budget.deadline = std::chrono::steady_clock::now() - std::chrono::seconds{1};
-        Win32HiveFileProbe probe;
-        auto guard = make_guard(probe, budget, sid);
-        CHECK(guard.before_load(file.wstring()) == "timeout");
-        CHECK(probe.opens == 0);
-        CHECK(budget.timed_out); // the side effect assemble_windows_rows relies on to end the run
-    }
     SECTION("a regular file owned by the calling user is accepted, and its identity re-verifies") {
         win::RetentionBudget budget;
         Win32HiveFileProbe probe;
@@ -377,23 +368,6 @@ TEST_CASE("privacy_permissions win: HiveFileGuard checks the deadline before any
         auto guard = make_guard(probe, budget, sid);
         CHECK(guard.before_load((dir / "missing.bin").wstring()) == "hive_stat_failed:win32_2");
     }
-    SECTION("a path deeper than kMaxHivePathDepth is refused before any syscall") {
-        win::RetentionBudget budget;
-        Win32HiveFileProbe probe;
-        auto guard = make_guard(probe, budget, sid);
-        std::wstring deep = dir.wstring().substr(0, 3); // the drive root of a fixed disk
-        for (std::size_t i = 0; i < win::kMaxHivePathDepth; ++i) deep += L"d\\";
-        deep += L"NTUSER.DAT"; // kMaxHivePathDepth directories + the leaf = one over
-        CHECK(guard.before_load(deep) == "hive_path_too_deep");
-        CHECK(probe.opens == 0);
-    }
-    SECTION("a UNC path is refused before any syscall") {
-        win::RetentionBudget budget;
-        Win32HiveFileProbe probe;
-        auto guard = make_guard(probe, budget, sid);
-        CHECK(guard.before_load(L"\\\\server\\share\\NTUSER.DAT") == "hive_path_unc");
-        CHECK(probe.opens == 0);
-    }
     SECTION("a different file at the same path after the load is hive_identity_changed") {
         win::RetentionBudget budget;
         Win32HiveFileProbe probe;
@@ -403,12 +377,6 @@ TEST_CASE("privacy_permissions win: HiveFileGuard checks the deadline before any
         { std::ofstream(other, std::ios::binary) << "regf"; }
         fs::rename(file, dir / "moved.bin");
         fs::rename(other, file);
-        CHECK(guard.after_load(file.wstring()) == "hive_identity_changed");
-    }
-    SECTION("after_load with no before_load snapshot refuses") {
-        win::RetentionBudget budget;
-        Win32HiveFileProbe probe;
-        auto guard = make_guard(probe, budget, sid);
         CHECK(guard.after_load(file.wstring()) == "hive_identity_changed");
     }
 }

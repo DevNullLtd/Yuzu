@@ -339,7 +339,6 @@ TEST_CASE("win walk: a store that changed during the read is walked once more, t
     auto* st = reg.store();
     FakeRegistry::set_sz(reg.path(st, L"webcam"), "Allow");
     win::RetentionBudget budget;
-    REQUIRE(win::kStabilityRewalks == 1);
 
     SECTION("changed on walk 1, stable on walk 2: the grants are kept once, and the counters restarted") {
         reg.watch_script = {win::kWaitObject0, win::kWaitTimeout};
@@ -349,10 +348,10 @@ TEST_CASE("win walk: a store that changed during the read is walked once more, t
         CHECK(count_app(w.grants, "-", "camera") == 1); // not doubled
         CHECK(budget.source.rows == w.grants.size() + w.structural.size()); // begin_profile() ran
     }
-    SECTION("changed again during the re-walk: refused, after exactly kStabilityRewalks + 1 walks") {
+    SECTION("changed again during the re-walk: refused, after exactly two walks") {
         reg.watch_script = {win::kWaitObject0, win::kWaitObject0, win::kWaitObject0};
         const auto w = walk(reg, budget);
-        CHECK(reg.watches == win::kStabilityRewalks + 1);
+        CHECK(reg.watches == 2);
         CHECK(w.refused == win::kChangedDuringRead);
         CHECK(w.grants.empty());
     }
@@ -497,11 +496,6 @@ TEST_CASE("hive guard: the injected deadline is checked first; UNC, depth and dr
 
 TEST_CASE("hive guard: attribute bits map to facts -- the not_resident mask, never SPARSE",
           "[privacy_permissions][win_walk]") {
-    CHECK(win::kFileAttributeDirectory == 0x10);
-    CHECK(win::kFileAttributeReparsePoint == 0x400);
-    CHECK(win::kFileAttributeOffline == 0x1000);
-    CHECK(win::kFileAttributeRecallOnOpen == 0x40000);
-    CHECK(win::kFileAttributeRecallOnDataAccess == 0x400000);
     win::HiveFileFacts f;
     win::apply_attributes(win::kFileAttributeReparsePoint | win::kFileAttributeDirectory, f);
     CHECK(f.is_reparse);

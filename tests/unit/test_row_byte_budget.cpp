@@ -14,8 +14,7 @@ using yuzu::shared::RowByteBudget;
 TEST_CASE("RowByteBudget: defaults are unbounded", "[row_byte_budget]") {
     RowByteBudget b;
     CHECK(b.fits(std::size_t{1} << 40));
-    for (int i = 0; i < (1 << 20); ++i)
-        REQUIRE(b.charge(1));
+    CHECK(b.charge(std::size_t{1} << 40, std::size_t{1} << 20));
     CHECK_FALSE(b.full());
     CHECK_FALSE(b.refused);
 }

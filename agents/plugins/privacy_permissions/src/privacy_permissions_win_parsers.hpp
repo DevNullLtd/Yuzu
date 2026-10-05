@@ -59,12 +59,6 @@ inline constexpr std::array<CapabilityEntry, 4> kCapabilities{{
 /// this app_id (qualified `<user>\NonPackaged` per profile, bare on HKLM -- qualify_app_id).
 inline constexpr std::string_view kNonPackagedToggleAppId = "NonPackaged";
 
-/// Name of the NonPackaged key, and of its child that is a container, not an app (measured on
-/// the-rig: `NonPackaged\Executables\<exe>` holds only a `GlobalPromptShown` DWORD per executable,
-/// never a `Value`). Both are compared with the registry's own case-insensitive key-name equality
-/// (privacy_permissions_win_walk.hpp); any other child is read as an app key, so an unknown shape
-/// stays a visible row rather than vanishing.
-
 /// The ConsentStore `Value` REG_SZ decoded to a PermissionState. `type_ok` = the registry
 /// value was actually REG_SZ (a wrong type is unreadable regardless of its bytes).
 [[nodiscard]] inline PermissionState decode_consent_value(std::string_view value, bool type_ok) noexcept {
@@ -514,9 +508,6 @@ struct StabilityFacts {
 
 /// The classify_stability token for a ConsentStore that changed while it was read.
 inline constexpr std::string_view kChangedDuringRead = "changed_during_read";
-/// How many times a source whose store changed mid-read is walked again before it is refused
-/// (never once the run's deadline has passed).
-inline constexpr unsigned kStabilityRewalks = 1;
 
 [[nodiscard]] inline std::optional<std::string> classify_stability(const StabilityFacts& f) {
     if (f.create_gle != 0) return "notify_event_failed:win32_" + std::to_string(f.create_gle);
@@ -653,20 +644,16 @@ using ReadProfileFn = std::function<ProfileRead(const profiles::ProfileInfo&)>;
     };
 
     const std::size_t n = profile_list.size();
-    std::size_t skipped = 0; // profiles never emitted when the run stopped
-    for (std::size_t i = 0; i < n; ++i) {
-        const auto& profile = profile_list[i];
+    std::size_t next = 0;
+    for (; next < n; ++next) {
+        const auto& profile = profile_list[next];
         // A cap the previous profile filled EXACTLY is still the budget stopping the run with
         // profiles left: it must say so, never end silently short.
         if (output.exhausted()) {
             budget_hit = true;
-            skipped = n - i;
             break;
         }
-        if (budget.expired()) { // `timed_out` is sticky: the run-level row is added below
-            skipped = n - i;
-            break;
-        }
+        if (budget.expired()) break; // `timed_out` is sticky: the run-level row is added below
         budget.begin_profile();
         const std::string pname = profile.profile_name.empty() ? "-" : profile.profile_name;
         const std::string profile_row_id = qualify_app_id(pname, "-");
@@ -680,19 +667,13 @@ using ReadProfileFn = std::function<ProfileRead(const profiles::ProfileInfo&)>;
         if (profiles::is_profile_backup_entry(profile.sid)) {
             prof.push_back(failure_row("windows", profile_row_id, "-", false,
                                        pname + ":" + std::string{kProfileListBackupSuffix}, acc));
-            if (!commit(prof, false)) {
-                skipped = n - i;
-                break;
-            }
+            if (!commit(prof, false)) break;
             continue;
         }
         if (!is_valid_sid_string(profile.sid)) {
             prof.push_back(
                 failure_row("windows", profile_row_id, "-", false, pname + ":invalid_sid", acc));
-            if (!commit(prof, false)) {
-                skipped = n - i;
-                break;
-            }
+            if (!commit(prof, false)) break;
             continue;
         }
 
@@ -751,15 +732,13 @@ using ReadProfileFn = std::function<ProfileRead(const profiles::ProfileInfo&)>;
                 truncated_row(prof, pname, profile_row_id);
             }
         }
-        if (!commit(prof, reachable)) {
-            skipped = n - i; // the dropped profile counts as skipped
-            break;
-        }
+        if (!commit(prof, reachable)) break; // the dropped profile counts as skipped
         if (budget.timed_out) {
-            skipped = n - (i + 1);
+            ++next;
             break;
         }
     }
+    const std::size_t skipped = n - next; // profiles never emitted when the run stopped
 
     // HKLM's own rows, unqualified, once (hklm_emitted_once), already charged: everything it
     // holds -- failures, Allow and unmodelled values, app-level entries and its definitive

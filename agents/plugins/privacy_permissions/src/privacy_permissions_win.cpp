@@ -385,13 +385,10 @@ struct Win32HiveFileProbe final : win::HiveFileProbe {
                        std::uint32_t& attrs) override {
         const UniqueHandle h = open_attr(path, FILE_READ_ATTRIBUTES);
         if (!h.ok()) return failure_code(GetLastError());
-        FILE_ATTRIBUTE_TAG_INFO tag{};
-        if (!GetFileInformationByHandleEx(h.h, FileAttributeTagInfo, &tag, sizeof tag))
-            return failure_code(GetLastError());
         BY_HANDLE_FILE_INFORMATION info{};
         if (!GetFileInformationByHandle(h.h, &info)) return failure_code(GetLastError());
         links = info.nNumberOfLinks;
-        attrs = tag.FileAttributes;
+        attrs = info.dwFileAttributes;
         return 0;
     }
 };
