@@ -174,7 +174,16 @@ file refused because of its owner: inspect it, and if it is yours, run
 `icacls "<file>" /setowner *S-1-5-32-544 /L`. A fresh install also refuses if
 the installing account's TEMP folder is on another drive: set TEMP and TMP to a
 folder on the system drive, or install as SYSTEM. The
-check runs before the agent service is stopped, so the service is left as it was. Installers from
+check runs before the agent service is stopped, so the service is left as it was.
+A refusal never leaves `agent-certs` less protected than it was: a new directory
+is locked in the installer's private temporary folder and moved into place only
+once it passes the check, so if security software blocks the lock nothing is
+created at the path; an existing directory's own permissions are never changed,
+and the log line says which happened. If an installation fails after the service
+was stopped (for example, a file cannot be replaced), the installer starts the
+service again before it exits; files it had already replaced are not put back, so
+run the installer again. Installers up to 0.14.0 left the service stopped
+(#5250). Installers from
 0.14.0-rc1 to rc5 also hit this wherever PowerShell is restricted to
 Constrained Language Mode -- WDAC script enforcement, or AppLocker script rules
 for an install run by an administrator rather than as SYSTEM (#5196): use a

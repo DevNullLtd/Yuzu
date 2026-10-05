@@ -32,6 +32,12 @@ What they pin, each verified on Windows Server 2022:
 - The script contains no double quote, which would end the -Command argument.
 - The abort messages say `sc.exe start`: in Windows PowerShell 5.1 `sc` is an
   alias for Set-Content, so `sc start YuzuAgent` would silently write a file.
+- An installation that stopped a running agent and then did not complete
+  starts it again (#5250): PrepareToInstall records that it stopped a running
+  service (sc.exe stop returned 0), ssPostInstall records completion, and
+  DeinitializeSetup runs sc.exe start YuzuAgent only when the first is set and
+  the second is not. Every abort raised after the installer tried to secure
+  the directory says what that attempt left there (a non-empty Outcome).
 
 Each check also runs against a mutated copy of the source and must fail there,
 so a check that has stopped matching anything cannot pass silently.
@@ -133,6 +139,16 @@ def pslit_body(iss: str) -> str:
     return iss[a:iss.index("end;", a)]
 
 
+def in_order(body: str, *needles) -> bool:
+    pos = -1
+    for n in needles:
+        nxt = body.find(n, pos + 1)
+        if nxt < 0:
+            return False
+        pos = nxt
+    return True
+
+
 def problems(iss: str, md: str) -> list:
     found = []
     code = re.sub(r"\{[^}]*\}|\(\*.*?\*\)|//[^\n]*|^;[^\n]*", "", iss, flags=re.S | re.M)
@@ -224,6 +240,18 @@ def problems(iss: str, md: str) -> list:
                         ("($Matches[1] -ne $Matches[2])", "two distinct accounts")):
         if needle not in verify:
             found.append(f"manual verify lost its {why}: {needle}")
+    if not (0 <= prep.find("'stop YuzuAgent'") < prep.find("StoppedRunningService := (StopResultCode = 0);")):
+        found.append("PrepareToInstall no longer records that it stopped a running service (#5250)")
+    step = iss.find("procedure CurStepChanged(")
+    if step < 0 or "if CurStep = ssPostInstall then\n    InstallCompleted := True;" not in iss[step:iss.find("\nend;", step)]:
+        found.append("ssPostInstall no longer records that the installation completed (#5250)")
+    deinit = iss.find("procedure DeinitializeSetup(")
+    body5250 = iss[deinit:iss.find("\nend;", deinit)] if deinit >= 0 else ""
+    if not in_order(body5250, "if StoppedRunningService and not InstallCompleted then",
+                   "Exec(ExpandConstant('{sys}\\sc.exe'), 'start YuzuAgent'"):
+        found.append("DeinitializeSetup no longer starts a service this run stopped when the installation did not complete (#5250)")
+    if re.search(r"NotSecuredMessage\([^;]*,\s*True,\s*''\)", secure_fn(iss), re.S):
+        found.append("an abort raised after securing was attempted does not say what it left at the path (#5250)")
     if re.search(r"(?i)\bsc\s+start\b", iss):
         found.append("an abort message says `sc start`, which is Set-Content in Windows PowerShell 5.1; use sc.exe")
     body = pslit_body(iss)
@@ -281,6 +309,12 @@ class InstallerAclLint(unittest.TestCase):
             "PsLit ASCII quote dropped": ("iss", "if (S[I] = '''') or ", "if "),
             "abort text says sc start": ("iss", "'installed, has not been touched.';", "'installed, has not been touched; run sc start YuzuAgent.';"),
             "PsLit stops doubling": ("iss", "Result := Result + S[I] + S[I]", "Result := Result + S[I]"),
+            "service not restarted on abort": ("iss", "  if StoppedRunningService and not InstallCompleted then", "  if False then"),
+            "service restarted after a completed install": ("iss", "if StoppedRunningService and not InstallCompleted then", "if StoppedRunningService then"),
+            "stop of a running service not recorded": ("iss", "  StoppedRunningService := (StopResultCode = 0);\n", ""),
+            "completion never recorded": ("iss", "    InstallCompleted := True;", "    Log('done');"),
+            "restart Exec dropped": ("iss", "Exec(ExpandConstant('{sys}\\sc.exe'), 'start YuzuAgent'", "Exec(ExpandConstant('{sys}\\sc.exe'), 'query YuzuAgent'"),
+            "attempted abort without outcome": ("iss", "True, NotCreated);", "True, '');"),
         }
         for name, (which, old, new) in mutations.items():
             with self.subTest(mutation=name):
