@@ -374,9 +374,10 @@ problem, not a performance tuning task.
 
 An exclusive lock on `audit_store.audit_events` (a migration, `VACUUM FULL`, a
 manual `LOCK TABLE`) makes every password change or reset fail closed with 503
-`audit_unavailable` within ~1.5 s (nothing changes; retry after the lock lifts)
-and delays same-account sign-ins by up to that long — schedule it outside
-sign-in peaks.
+`audit_unavailable` within ~1.5 s (nothing changes; retry after the lock lifts).
+It also stalls every other request that writes an audit row, sign-ins on any
+account included: their audit INSERT waits on the lock for up to the database
+connection's 10 s `lock_timeout`. Schedule it outside sign-in peaks.
 
 ## YuzuAuditRetentionNeverRan
 
