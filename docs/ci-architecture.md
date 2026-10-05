@@ -202,8 +202,10 @@ pass the guard, because no release exists yet. So every image push and the
 release creation run `scripts/ci/check-release-tag-sha.sh` immediately before
 acting: it reads the tag from `origin` with `git ls-remote` and refuses unless
 the tag (or its peeled commit) is still this run's `GITHUB_SHA`, failing closed
-on any error. Only the run whose commit the tag names right now may publish,
-and a re-run of a failed job re-checks too. The script is tested by
+on any error. A run whose tag has moved away from its commit refuses at its
+next publishing step, and a re-run of a failed job re-checks too. It cannot
+see a tag moved away and back again while two runs are in flight (A -> B -> A):
+cancel in-flight release runs for a tag before re-tagging it (#5478). The script is tested by
 `tests/shell/test_release_tag_sha.sh`; `test_release_guard.sh` checks that
 each publishing job runs it once, before its first push.
 
@@ -224,7 +226,9 @@ newest run.
 Residual paths that can still leave `:X.Y.Z` digests and the signed
 `SHA256SUMS` apart, none closed by this change: a draft release the guard
 cannot see; a hand-run `gh release create`; the seconds between a publish
-step's tag re-check and its push; and `:latest`/`:X.Y` landing on an older
+step's tag re-check and its push; a tag moved away and back again while two
+runs are in flight (#5478); re-running an OLDER run of the tag (#5242: a re-run
+does not repeat `release-guard`); and `:latest`/`:X.Y` landing on an older
 version when runs for two tags finish out of order (#5462).
 
 ### Release artifact gate (`scripts/check-release-artifacts.sh`, release job)

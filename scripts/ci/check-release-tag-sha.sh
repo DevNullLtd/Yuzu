@@ -4,18 +4,21 @@
 # in flight; a moved tag whose push webhook never fired) both pass release-guard
 # because no release exists yet; whichever pushes LAST would own :X.Y.Z while
 # the other's release job signs SHA256SUMS for different images. Every image
-# push and the release creation call this immediately before acting, so only
-# the run whose commit the tag names right now may publish.
+# push and the release creation call this immediately before acting, so a run
+# whose tag has moved away from its commit refuses at its next publishing step.
+# It does NOT detect a tag moved away and back again (A->B->A) while two runs
+# are in flight: cancel in-flight release runs for a tag before re-tagging it
+# (release skill, Recovery; digest check before signing: #5478).
 # Fail-closed: any error reading the tag refuses.
 # Shell contract: tests/shell/test_release_tag_sha.sh.
 set -uo pipefail
 tag="${GITHUB_REF_NAME:?}"; want="${GITHUB_SHA:?}"
-auth=()
-if [[ -n "${GH_TOKEN:-}" ]]; then
-  # Same mechanism actions/checkout uses; keeps this working if the repo goes private.
-  auth=(-c "http.https://github.com/.extraheader=AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)")
-fi
-if ! refs="$(git "${auth[@]}" ls-remote origin "refs/tags/$tag" "refs/tags/$tag^{}")"; then
+# No credential: the repository is public, and a token passed to git via -c
+# would sit in git's argv (visible to other processes on a self-hosted runner),
+# unmasked. If the repository ever goes private, read the ref with
+# `gh api repos/$GITHUB_REPOSITORY/git/ref/tags/$tag` instead (#5282, SEC-G8-1).
+# Bounded: a hung connection must not hold a runner slot (G8-CHAOS-1).
+if ! refs="$(timeout 60 git ls-remote origin "refs/tags/$tag" "refs/tags/$tag^{}")"; then
   echo "::error::Could not read refs/tags/$tag from origin; refusing to publish (fail-closed, #5282)."
   exit 1
 fi

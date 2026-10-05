@@ -234,6 +234,30 @@ while IFS='|' read -r job needs pkg nchk firstchk firstact; do
       "no (recheck line $firstchk, first act line $firstact)"
   fi
 done < "$TMP/jobs"
+# Each recheck step must be the plain, unconditional form: a step-level `if:`,
+# `continue-on-error`, or a `run:` that is not exactly the script call would
+# leave the check present in the file but unable to stop a push (G8-QE-1).
+python3 - "$WF" > "$TMP/stepshape" <<'PYEOF'
+import sys, yaml
+wf = yaml.safe_load(open(sys.argv[1]))
+for job, spec in (wf.get("jobs") or {}).items():
+    for st in spec.get("steps") or []:
+        run = st.get("run") or ""
+        if "check-release-tag-sha.sh" not in run:
+            continue
+        bad = []
+        if "if" in st: bad.append("if")
+        if st.get("continue-on-error") not in (None, False): bad.append("continue-on-error")
+        if run.strip() != "bash scripts/ci/check-release-tag-sha.sh": bad.append("run")
+        if "continue-on-error" in spec and spec["continue-on-error"] not in (False,): bad.append("job-continue-on-error")
+        print(f"{job}|{','.join(bad) or 'ok'}")
+PYEOF
+nshape=0
+while IFS='|' read -r job verdict; do
+  nshape=$((nshape+1))
+  check "$job tag-recheck step is unconditional and exact" ok "$verdict"
+done < "$TMP/stepshape"
+check "found the five tag-recheck steps" 5 "$nshape"
 # Guard against the scan going vacuous (e.g. a reindent that hides every job).
 if [ "$publishers" -ge 4 ]; then check "found the image-publishing jobs (>=4)" yes yes
 else check "found the image-publishing jobs (>=4)" ">=4" "$publishers"; fi

@@ -1447,8 +1447,6 @@ jobs:
         run: docker image rm -f "$IMAGE" || true
 
       - name: Refuse to publish if the tag moved (#5282)
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: bash scripts/ci/check-release-tag-sha.sh
 
       - name: Build and push
@@ -1644,8 +1642,6 @@ jobs:
             org.opencontainers.image.licenses=AGPL-3.0-or-later
 
       - name: Refuse to publish if the tag moved (#5282)
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: bash scripts/ci/check-release-tag-sha.sh
 
       - name: Build and push
@@ -1918,8 +1914,6 @@ jobs:
         run: docker image rm -f "$IMAGE" || true
 
       - name: Refuse to publish if the tag moved (#5282)
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: bash scripts/ci/check-release-tag-sha.sh
 
       - name: Build and push
@@ -2108,8 +2102,6 @@ jobs:
         uses: sigstore/cosign-installer@cad07c2e89fa2edd6e2d7bab4c1aa38e53f76003 # v4.1.1
 
       - name: Refuse to publish if the tag moved (#5282)
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: bash scripts/ci/check-release-tag-sha.sh
 
       # Reuse the maintainer script (download release artifacts -> verify by
@@ -2520,8 +2512,6 @@ jobs:
           sed -i 's/^          //' release-notes.md
 
       - name: Refuse to publish if the tag moved (#5282)
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: bash scripts/ci/check-release-tag-sha.sh
 
       - name: Create GitHub Release
@@ -2550,8 +2540,15 @@ jobs:
           # match that release's signed SHA256SUMS and SBOMs, so fail loudly
           # instead of the old skip-with-a-notice that went green. Never
           # re-upload over it either: --clobber would replace signed assets.
-          if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
-            echo "::error::Release ${GITHUB_REF_NAME} appeared after release-guard passed; this run's pushed images do not match it. Investigate before anything else (#5282)."
+          if existing_draft="$(gh release view "${GITHUB_REF_NAME}" --json isDraft --jq .isDraft 2>/dev/null)"; then
+            if [[ "$existing_draft" == "true" ]]; then
+              # gh release create makes a draft, uploads, then publishes; an
+              # interrupted upload (this job's own earlier attempt included)
+              # leaves the draft behind. Nothing was published.
+              echo "::error::A DRAFT release ${GITHUB_REF_NAME} already exists, most likely left by an interrupted 'gh release create' (an earlier attempt of this job, or a hand-made draft). Nothing has been published. Delete the draft (gh release delete ${GITHUB_REF_NAME} --yes), then Re-run failed jobs on this run (#5282)."
+            else
+              echo "::error::Release ${GITHUB_REF_NAME} is already PUBLISHED. If an earlier attempt of THIS run's release job published it and then failed, the release itself is complete (verify its assets against its SHA256SUMS), but docker-publish-agent-bundle, which needs this job, will not run on a re-run: see the release skill, Recovery, and #5479. Otherwise another run or a hand-run 'gh release create' published it after release-guard passed, and this run's pushed images may not match it: investigate before anything else. Refusing to re-upload over signed assets (#5282)."
+            fi
             exit 1
           else
             gh release create "${GITHUB_REF_NAME}" \

@@ -15,9 +15,9 @@
 #   lightweight tag != GITHUB_SHA                    -> exit 1
 #   no matching line (tag deleted)                   -> exit 1
 #   git exits 128 (network / auth)                   -> exit 1, fail-closed
-#   GH_TOKEN set   -> argv carries `-c http.https://github.com/.extraheader=
-#                     AUTHORIZATION: basic <b64>` and never the raw token
-#   GH_TOKEN unset -> no `-c`
+#   GH_TOKEN set or unset -> argv never carries a credential: no `-c`, no
+#                     extraheader, neither the raw nor the base64 token (SEC-G8-1)
+#   git runs under `timeout` (a hung connection cannot hold a runner slot)
 #   argv asks origin for exactly refs/tags/<tag> and refs/tags/<tag>^{}
 # The wiring (each publishing job runs it once, before its push) is pinned by
 # tests/shell/test_release_guard.sh.
@@ -82,10 +82,11 @@ check "annotated tag, peeled commit is this run's -> proceed (exit 0)" 0 "$rc"
 check "proceed message names the commit" yes "$(has "still points at $RUN_SHA" "$TMP/out")"
 check "asks origin for the tag and its peeled ref" \
   "ls-remote|origin|refs/tags/$TAG|refs/tags/$TAG^{}" "$(tail -n 4 "$TMP/args" | paste -sd'|')"
-check "GH_TOKEN set -> auth passed as a -c extraheader" yes \
-  "$(has 'http.https://github.com/.extraheader=AUTHORIZATION: basic ' "$TMP/args")"
-check "GH_TOKEN set -> the extraheader carries the base64 credential" yes \
+check "GH_TOKEN set -> no -c argument (no credential in argv)" no "$(grep -qx -- '-c' "$TMP/args" && echo yes || echo no)"
+check "GH_TOKEN set -> no extraheader in argv" no "$(has 'extraheader' "$TMP/args")"
+check "GH_TOKEN set -> the base64 credential never appears in argv" no \
   "$(has "$(printf 'x-access-token:%s' "$TOKEN" | base64 -w0)" "$TMP/args")"
+check "git ls-remote is bounded by timeout" yes "$(grep -q 'timeout [0-9][0-9]* git ls-remote' "$SCRIPT" && echo yes || echo no)"
 check "GH_TOKEN set -> the raw token never appears in git's argv" no "$(has "$TOKEN" "$TMP/args")"
 check "GH_TOKEN set -> the raw token never appears in the output" no "$(has "$TOKEN" "$TMP/out")"
 
