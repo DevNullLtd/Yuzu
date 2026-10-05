@@ -56,25 +56,34 @@ jobs:
   #
   # There is deliberately NO override input. A published release's assets and
   # signatures describe the images it shipped, so any re-push over it breaks
-  # verification. To redo a release, cut a new version; to redo a broken
-  # release from scratch, the operator deletes the GitHub release first (an
-  # explicit, destructive step the release skill gates on operator
-  # confirmation), and the fresh run then recreates the release together with
-  # the images it pushes.
+  # verification. To redo a release, cut a new version. Deleting a PUBLISHED
+  # release is never the recovery for a failed job (that is "Re-run failed
+  # jobs" on the newest run); it is only for a release whose published content
+  # is itself wrong, an explicit, destructive step the release skill gates on
+  # operator confirmation, after which a fresh run recreates the release
+  # together with the images it pushes.
   #
-  # Fail-closed: only gh's exact "release not found" proceeds; any other gh
-  # failure (auth, rate limit, network, 5xx) fails the run. contents:read sees
-  # PUBLISHED releases only, not drafts; a hand-made draft for the tag is caught
-  # later by "Create GitHub Release" (after the pushes). Limit: "Re-run failed
-  # jobs" does not re-run a job that succeeded, so a re-run of an old attempt
-  # skips this check; the release skill forbids that (start a fresh run).
+  # Only a release tag may run: the ref must be a tag (a workflow_dispatch from
+  # a branch is refused) shaped vX.Y.Z or vX.Y.Z-{alpha,beta,rc}N, the alphabet
+  # the release job's prerelease classifier and the `:latest` enable
+  # (!contains(ref_name, '-')) assume.
+  #
+  # Fail-closed: only an HTTP 404 status line from
+  # `gh api -i repos/.../releases/tags/<tag>` proceeds; 200 refuses; anything
+  # else — no status line, 401/403/429/5xx — fails the run. gh's exit code and
+  # stderr prose are never interpreted. contents:read sees PUBLISHED releases
+  # only, not drafts; a draft for the tag is caught later by "Create GitHub
+  # Release" (after the pushes). A re-run ("Re-run failed jobs" on the newest
+  # run, the release skill's Recovery) does not repeat this job; every push and
+  # the release creation instead re-check that the tag still points at the
+  # run's commit (scripts/ci/check-release-tag-sha.sh).
   # Shell contract: tests/shell/test_release_guard.sh (runs this step body).
   release-guard:
     name: "Refuse re-publish over a released tag"
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
-      contents: read   # gh release view (published releases)
+      contents: read   # gh api releases/tags/<tag> (sees published releases only)
     steps:
       - id: refuse-published-release
         env:
@@ -82,26 +91,36 @@ jobs:
         run: |
           set -uo pipefail
           tag="${GITHUB_REF_NAME:-}"
-          if [[ -z "$tag" ]]; then
-            echo "::error::GITHUB_REF_NAME is empty; cannot check for an existing release (fail-closed)."
+          # SEC-F1: only a release tag may publish. A branch ref (a workflow_dispatch
+          # without --ref vX.Y.Z) has no release, so the existence check alone passes it
+          # and docker-publish-postgres would push :latest from branch content.
+          if [[ "${GITHUB_REF_TYPE:-}" != "tag" ]]; then
+            echo "::error::release.yml must run from a release tag, not ${GITHUB_REF_TYPE:-<unset>} '${tag}' (dispatch with --ref vX.Y.Z). Refusing (#5282)."
             exit 1
           fi
-          out="$(mktemp)"; err="$(mktemp)"
-          rc=0
-          gh release view "$tag" --repo "$GITHUB_REPOSITORY" \
-            --json tagName,isDraft,publishedAt,url >"$out" 2>"$err" || rc=$?
-          if [[ "$rc" -eq 0 ]]; then
-            echo "::error::Release $tag already exists ($(cat "$out")). Refusing to rebuild and push images over it: they would no longer match its signed SHA256SUMS and SBOMs (#5282). Cut a new version, or delete the release first if it must be redone (release skill, Recovery)."
+          re='^v[0-9]+\.[0-9]+\.[0-9]+(-(alpha|beta|rc)[0-9]+)?$'
+          if [[ ! "$tag" =~ $re ]]; then
+            echo "::error::'$tag' is not a release tag (vX.Y.Z or vX.Y.Z-{alpha,beta,rc}N). Refusing (#5282)."
             exit 1
           fi
-          # gh prints exactly "release not found" when the tag has no release.
-          # Anything else is an error we cannot interpret: fail closed.
-          if [[ "$(tr -d '\r' <"$err")" == "release not found" ]]; then
-            echo "No release exists for $tag; publishing may proceed."
-            exit 0
-          fi
-          echo "::error::Could not determine whether release $tag exists (gh exit $rc): $(tr '\r\n' '  ' <"$err"). Failing closed (#5282)."
-          exit 1
+          out="$(mktemp)"; err="$(mktemp)"; rc=0
+          gh api -i "repos/$GITHUB_REPOSITORY/releases/tags/$tag" >"$out" 2>"$err" || rc=$?
+          # The HTTP status line is the ONLY evidence accepted: 200 = a published
+          # release exists; 404 = none visible to this token (REST returns 404 for a
+          # draft too). gh's exit code and stderr prose are never interpreted.
+          status="$(head -n1 "$out" | tr -d '\r' | awk '$1 ~ /^HTTP\// { print $2 }')"
+          case "$status" in
+            200)
+              body="$(sed '1,/^\r\{0,1\}$/d' "$out")"
+              echo "::error::Release $tag already exists ($(jq -c '{tag_name,published_at,html_url}' <<<"$body" 2>/dev/null || head -c 300 <<<"$body")). Refusing to rebuild and push images over it: they would no longer match its signed SHA256SUMS and SBOMs (#5282). Cut a new version; see the release skill, Recovery."
+              exit 1 ;;
+            404)
+              echo "No published release for $tag (HTTP 404); publishing may proceed."
+              exit 0 ;;
+            *)
+              echo "::error::Could not determine whether release $tag exists (gh exit $rc, HTTP status '${status:-none}'): $(tr '\r\n' '  ' <"$err"). Failing closed (#5282)."
+              exit 1 ;;
+          esac
 
   # ── Linux x64 release build ──────────────────────────────────────────
   build-linux:
@@ -1427,6 +1446,11 @@ jobs:
           IMAGE: yuzu-hc-verify/${{ matrix.image }}:${{ github.sha }}
         run: docker image rm -f "$IMAGE" || true
 
+      - name: Refuse to publish if the tag moved (#5282)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: bash scripts/ci/check-release-tag-sha.sh
+
       - name: Build and push
         id: build
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
@@ -1525,8 +1549,8 @@ jobs:
             yuzu-${{ matrix.image }}-image.spdx.json
           if-no-files-found: error
           retention-days: 3
-          # A re-run of this job (not a supported release recovery; see the
-          # release skill) pushes a new digest; replace the earlier attempt's
+          # A re-run of this job ("Re-run failed jobs" on the newest run, the
+          # release skill's Recovery) pushes a new digest; replace the earlier attempt's
           # SBOM. With no continue-on-error and
           # if-no-files-found: error, a re-run either uploads this attempt's
           # SBOM or fails the job (#5242).
@@ -1619,6 +1643,11 @@ jobs:
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.licenses=AGPL-3.0-or-later
 
+      - name: Refuse to publish if the tag moved (#5282)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: bash scripts/ci/check-release-tag-sha.sh
+
       - name: Build and push
         id: build
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
@@ -1697,8 +1726,8 @@ jobs:
             yuzu-postgres-image.spdx.json
           if-no-files-found: error
           retention-days: 3
-          # A re-run of this job (not a supported release recovery; see the
-          # release skill) pushes a new digest; replace the earlier attempt's
+          # A re-run of this job ("Re-run failed jobs" on the newest run, the
+          # release skill's Recovery) pushes a new digest; replace the earlier attempt's
           # SBOM. With no continue-on-error and
           # if-no-files-found: error, a re-run either uploads this attempt's
           # SBOM or fails the job (#5242).
@@ -1743,9 +1772,9 @@ jobs:
     # waits for these builds -- 1-16 min on rc1..rc6, all green; a cold cache
     # (vcpkg from source) takes longer, bounded by the timeout below -- and a
     # failed or cancelled chisel leg now skips the release (fail-closed).
-    # Recovery: a fresh run of the tag (gh workflow run release.yml --ref
-    # <tag>), never "Re-run failed jobs" on an older run; see the release
-    # skill.
+    # Recovery: "Re-run failed jobs" on the NEWEST run for the tag (digests of
+    # the succeeded legs are kept; each push re-checks the tag), never on an
+    # older run (#5242); a fresh run is the fallback. See the release skill.
     needs: [release-guard, build-linux, build-gateway]
     runs-on: [self-hosted, Linux, X64, yuzu-bigtam-linux]
     # Job-level concurrency so a re-tagged release (same ref) cancels an
@@ -1888,6 +1917,11 @@ jobs:
           IMAGE: yuzu-hc-verify/${{ matrix.image }}-chisel:${{ github.sha }}
         run: docker image rm -f "$IMAGE" || true
 
+      - name: Refuse to publish if the tag moved (#5282)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: bash scripts/ci/check-release-tag-sha.sh
+
       - name: Build and push
         id: build
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
@@ -1983,8 +2017,8 @@ jobs:
             yuzu-${{ matrix.image }}-chisel-image.spdx.json
           if-no-files-found: error
           retention-days: 3
-          # A re-run of this job (not a supported release recovery; see the
-          # release skill) pushes a new digest; replace the earlier attempt's
+          # A re-run of this job ("Re-run failed jobs" on the newest run, the
+          # release skill's Recovery) pushes a new digest; replace the earlier attempt's
           # SBOM. With no continue-on-error and
           # if-no-files-found: error, a re-run either uploads this attempt's
           # SBOM or fails the job (#5242).
@@ -2072,6 +2106,11 @@ jobs:
 
       - name: Install cosign
         uses: sigstore/cosign-installer@cad07c2e89fa2edd6e2d7bab4c1aa38e53f76003 # v4.1.1
+
+      - name: Refuse to publish if the tag moved (#5282)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: bash scripts/ci/check-release-tag-sha.sh
 
       # Reuse the maintainer script (download release artifacts -> verify by
       # sha256 -> lay out -> build host-arch (amd64) image -> push). GH_TOKEN
@@ -2479,6 +2518,11 @@ jobs:
           NOTES_EOF
           # Strip leading whitespace from heredoc indentation
           sed -i 's/^          //' release-notes.md
+
+      - name: Refuse to publish if the tag moved (#5282)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: bash scripts/ci/check-release-tag-sha.sh
 
       - name: Create GitHub Release
         env:

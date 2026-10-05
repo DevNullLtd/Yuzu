@@ -15,7 +15,9 @@ Failure-mode runbook: `docs/ci-troubleshooting.md`.
   the `yuzu-weetam-windows` pool), one macOS variant (appleclang debug on the
   `yuzu-bigmags-macos` pool), plus `proto-compat`. Wall target: <10 min per leg.
 - **Tier 2 — push to dev/main** (`ci.yml` on push): full 4-way Linux matrix
-  (gcc-15 / clang-21 × debug / release), 2-way Windows, 2-way macOS. **No
+  (gcc-15 / clang-21 × debug / release), 2-way Windows, 2-way macOS (except
+  a docs-only push, which runs preflight plus the required-check stubs, #5320).
+  **No
   sanitizers, no coverage** — those moved out (#410). **Since #3443 Phase 2**,
   the Linux matrix's `pg_mode` key (via `include:`, never a third axis) means
   only ONE leg (gcc-15/debug) runs the full 11-shard `server-pg` suite on a
@@ -169,37 +171,61 @@ code.
 
 ### Release re-publish guard (`release-guard`, #5282)
 
-The first job in `release.yml`. It runs `gh release view "$GITHUB_REF_NAME"`
-and fails the run if the tag already has a published GitHub release. Every
-image-publishing job (`docker-publish`, `docker-publish-postgres`,
-`docker-publish-chisel`, `docker-publish-agent-bundle`), the `release` job and
-the three build jobs list it in `needs`, so a refused run stops before any
-build, provenance attestation or image push. Before it, a run started against
-an already-released tag (by mistake, or a superseded run) pushed new digests
-over `:X.Y.Z` (and `:X.Y`/`:latest` on a stable tag) that no longer matched the
-release's signed `SHA256SUMS` and SBOMs; the only existing-release check was in
-`Create GitHub Release`, after every push, and it skipped with a notice and
-went green. That step now fails instead, because a release appearing there
-means one arrived after the guard ran.
+The first job in `release.yml`. It refuses any run whose ref is not a tag
+(a `workflow_dispatch` from a branch would otherwise pass, since a branch has
+no release, and push `:latest` from branch content) or whose tag is not shaped
+`vX.Y.Z` / `vX.Y.Z-{alpha,beta,rc}N` (the alphabet the prerelease classifier
+and the `:latest` enable assume). It then reads
+`gh api -i repos/<repo>/releases/tags/<tag>` and fails the run if the tag
+already has a published GitHub release. Every image-publishing job
+(`docker-publish`, `docker-publish-postgres`, `docker-publish-chisel`,
+`docker-publish-agent-bundle`), the `release` job and the three build jobs list
+it in `needs`, so a refused run stops before any build, provenance attestation
+or image push. Before it, a run started against an already-released tag (by
+mistake, or a superseded run) pushed new digests over `:X.Y.Z` (and
+`:X.Y`/`:latest` on a stable tag) that no longer matched the release's signed
+`SHA256SUMS` and SBOMs; the only existing-release check was in `Create GitHub
+Release`, after every push, and it skipped with a notice and went green. That
+step now fails instead, because a release appearing there means one arrived
+after the guard ran.
 
-It fails closed: the run proceeds only when gh prints exactly
-`release not found`. Any other gh failure (bad credentials, rate limit,
-network, a 5xx) fails the run. The step body is executed against a stubbed
-`gh` by `tests/shell/test_release_guard.sh` (in preflight's shell gate tests),
-which also checks that every job holding `packages: write` needs the guard.
+It fails closed on the HTTP status line alone: `404` proceeds, `200` refuses,
+and anything else (no status line, 401/403/429/5xx) fails the run. gh's exit
+code and stderr prose are never interpreted. The step body is executed against
+a stubbed `gh` by `tests/shell/test_release_guard.sh` (in preflight's shell
+gate tests), which also checks that every job holding `packages: write` needs
+the guard.
+
+**Per-push tag re-check.** Two runs for one tag at different commits (a re-tag
+while a run is in flight, or a moved tag whose push webhook never fired) both
+pass the guard, because no release exists yet. So every image push and the
+release creation run `scripts/ci/check-release-tag-sha.sh` immediately before
+acting: it reads the tag from `origin` with `git ls-remote` and refuses unless
+the tag (or its peeled commit) is still this run's `GITHUB_SHA`, failing closed
+on any error. Only the run whose commit the tag names right now may publish,
+and a re-run of a failed job re-checks too. The script is tested by
+`tests/shell/test_release_tag_sha.sh`; `test_release_guard.sh` checks that
+each publishing job runs it once, before its first push.
 
 **There is no override.** A published release's assets and signatures describe
 the images it shipped, so any re-push over it breaks verification. To ship
-different images, cut a new version. To redo a release under the same tag,
-delete the GitHub release first (destructive; the release skill requires
-operator confirmation), then start a fresh run, which recreates the release
-with a `SHA256SUMS` that matches its images.
+different images, cut a new version. To redo a release whose published content
+is itself wrong, delete the GitHub release first (destructive; the release
+skill requires operator confirmation), then start a fresh run, which recreates
+the release with a `SHA256SUMS` that matches its images.
 
-Limits: the job's `contents: read` token cannot see draft releases, so a
-hand-made draft for the tag is caught only at `Create GitHub Release`, after
-the pushes. "Re-run failed jobs" does not re-run a guard that already passed,
-so it does not protect a re-run of an old attempt; release runs are never
-re-run that way (release skill, Recovery).
+Limits: the guard's read-only token cannot see a **draft** release — one made
+by hand, or one `gh release create` leaves behind when interrupted while
+uploading assets (it creates a draft, uploads, then publishes). The `release`
+job's own check sees drafts and fails. Deleting an unpublished draft is not
+destructive (nothing was published): delete it, then re-run failed jobs on the
+newest run.
+
+Residual paths that can still leave `:X.Y.Z` digests and the signed
+`SHA256SUMS` apart, none closed by this change: a draft release the guard
+cannot see; a hand-run `gh release create`; the seconds between a publish
+step's tag re-check and its push; and `:latest`/`:X.Y` landing on an older
+version when runs for two tags finish out of order (#5462).
 
 ### Release artifact gate (`scripts/check-release-artifacts.sh`, release job)
 
@@ -233,11 +259,13 @@ Recovery: find the offending file in the error. For a stale file, clear the
 runner workspace and start a fresh run of the same tag with
 `gh workflow run release.yml --ref vX.Y.Z`, following the release skill's
 Recovery steps (no release exists for the tag, no other run for it is queued
-or running). The workflow enforces the first of those itself: `release-guard`
-refuses a run when the tag already has a published release (#5282, above).
-Never use "Re-run failed jobs" on a release run: an older run can
-be superseded by a newer one and push images over a published release (#5242),
-and a re-run does not repeat a guard that already passed.
+or running). "Re-run failed jobs" does not fix this case: it re-runs only the
+`release` job, which downloads the same stale artifact again. The workflow
+enforces the first of those steps itself: `release-guard` refuses a run when
+the tag already has a published release (#5282, above). For any other failed
+job, recovery is "Re-run failed jobs" on the NEWEST run for the tag (digests
+kept; each push re-checks the tag), never on an older run (#5242); a fresh run
+is the fallback (release skill, Recovery).
 For a builder naming defect, a fresh run builds the tag's original commit
 again, so fix the builder, then delete and re-push the tag at the fixed commit.
 Either way the images are rebuilt and re-pushed under the same tags.
@@ -1357,10 +1385,15 @@ Any API error or other answer builds. The classification set is unchanged,
 including the BR-010 carve-out: a push touching `docs/os-capability-matrix.md`
 builds and runs its drift gate. A docs-only push therefore costs
 `trusted_inputs`, `preflight`, three stub jobs and `detect-ci-changes`, all
-GitHub-hosted. The required contexts on such a commit read `success`
-(Preflight, the three stubs, CHANGELOG order) or `skipped` (Proto
-backward-compat). A skipped required context satisfies the ruleset; an absent
-one does not, and the release skill's tag gate reads them the same way. The
+GitHub-hosted (plus the CI canary when the push touches a workflow file — the
+CI-infrastructure classifier decides that separately). The required contexts on
+such a commit read `success` (Preflight, the three stubs, CHANGELOG order) or
+`skipped` (Proto backward-compat). `success` on those three names for a
+docs-only commit means *inherited from the predecessor's build*, not *built*;
+the run's summary says so. On a PR a skipped required context satisfies the
+ruleset and an absent one does not; a push commit is never evaluated by the
+ruleset, so on `main` the only consumer of these contexts is the release
+skill's tag gate, which reads them the same way. The
 push arm is executed against a stubbed `gh` by
 `tests/shell/test_codegate_push.sh`.
 

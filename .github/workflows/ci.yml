@@ -397,6 +397,13 @@ jobs:
             if ! nfiles=$(jq '.files // [] | length' "$cmp_json") || (( nfiles == 0 || nfiles >= 300 )); then
               build "Compare lists ${nfiles:-?} files (empty, or the 300-file API cap) — building (fail-closed)."
             fi
+            # A path with a control character (a newline, say) would be split
+            # into several lines below and could pass as docs; build instead.
+            # A jq error here builds too.
+            if ! ncntrl=$(jq '[.files[] | .filename, (.previous_filename // empty) | select(test("[[:cntrl:]]"))] | length' "$cmp_json") \
+                || [[ ! "$ncntrl" =~ ^[0-9]+$ ]] || (( ncntrl > 0 )); then
+              build "A changed path contains a control character, or the path list could not be read — building (fail-closed)."
+            fi
             if ! files=$(jq -r '.files[] | .filename, (.previous_filename // empty)' "$cmp_json"); then
               build "Could not read the compare file list — building (fail-closed)."
             fi
@@ -407,6 +414,9 @@ jobs:
             fi
             echo "code_changed=$code_changed" >> "$GITHUB_OUTPUT"
             echo "Result: code_changed=$code_changed"
+            if [[ "$code_changed" == "false" ]]; then
+              echo "Docs-only push (#5320): build skipped. Predecessor $PUSH_BEFORE_SHA push run: success. 'Linux gcc-15 debug' / 'Windows MSVC debug' / 'macOS debug' on $GITHUB_SHA are stubs, not builds." >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+            fi
             exit 0
           fi
           if [[ "${{ github.event_name }}" != "pull_request" ]]; then
@@ -415,19 +425,26 @@ jobs:
             exit 0
           fi
           # Fail-closed on any API/permission failure: build rather than block.
-          if ! files=$(gh api --paginate \
-                "repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/files" \
-                --jq '.[].filename'); then
-            echo "code_changed=true" >> "$GITHUB_OUTPUT"
-            echo "PR files API failed — building to be safe (fail-closed)."
-            exit 0
+          # The JSON is captured once and read twice: the file names (one line
+          # per file, so the changed_files total check below stays exact) and
+          # the renames' previous names.
+          pr_json="$RUNNER_TEMP/codegate-pr-files.json"
+          if ! gh api --paginate "repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/files" > "$pr_json"; then
+            build "PR files API failed — building to be safe (fail-closed)."
           fi
+          # jq reads the concatenated per-page arrays --paginate emits as a stream.
+          # A path with a control character (a newline, say) would be split into
+          # several lines and could pass as docs; build instead (a jq error too).
+          if ! ncntrl=$(jq -n '[inputs[] | .filename, (.previous_filename // empty) | select(test("[[:cntrl:]]"))] | length' "$pr_json") \
+              || [[ ! "$ncntrl" =~ ^[0-9]+$ ]] || (( ncntrl > 0 )); then
+            build "A changed path contains a control character, or the PR file list could not be read — building (fail-closed)."
+          fi
+          files=$(jq -r '.[].filename' "$pr_json") || build "Could not read the PR file list — building (fail-closed)."
+          prev=$(jq -r '.[] | .previous_filename // empty' "$pr_json") || build "Could not read the PR rename list — building (fail-closed)."
           echo "Changed files in PR #${{ github.event.pull_request.number }}:"
           printf '%s\n' "$files"
           if [[ -z "$files" ]]; then
-            echo "code_changed=true" >> "$GITHUB_OUTPUT"
-            echo "Empty changed-file list — building to be safe (fail-closed)."
-            exit 0
+            build "Empty changed-file list — building to be safe (fail-closed)."
           fi
           # changed_files is the authoritative total; the script fails closed if
           # the API list is shorter (truncated past the 3000-file cap). Wrap the
@@ -435,9 +452,18 @@ jobs:
           # PR), independent of the runner's default shell error mode.
           if ! code_changed=$(printf '%s\n' "$files" \
                 | bash scripts/ci/detect-code-change.sh "${{ github.event.pull_request.changed_files }}"); then
-            echo "code_changed=true" >> "$GITHUB_OUTPUT"
-            echo "Classifier errored — building to be safe (fail-closed)."
-            exit 0
+            build "Classifier errored — building to be safe (fail-closed)."
+          fi
+          if [[ "$code_changed" == "false" && -n "$prev" ]]; then
+            # A rename's previous path counts too (moving server/x.cpp to docs/ must still build).
+            # No TOTAL here: the total check above already covered the file list.
+            if ! prev_changed=$(printf '%s\n' "$prev" | bash scripts/ci/detect-code-change.sh); then
+              build "Classifier errored on rename sources — building (fail-closed)."
+            fi
+            if [[ "$prev_changed" == "true" ]]; then
+              echo "A rename's previous path is code-side — building."
+              code_changed=true
+            fi
           fi
           echo "code_changed=$code_changed" >> "$GITHUB_OUTPUT"
           echo "Result: code_changed=$code_changed"
@@ -505,8 +531,9 @@ jobs:
         run: |
           bash tests/shell/test_check_compose_versions.sh
           bash tests/shell/test_detect_code_change.sh   # docs-only gate classifier (#1978)
-          bash tests/shell/test_codegate_push.sh        # docs-only gate's push arm (#5320)
+          bash tests/shell/test_codegate_push.sh        # docs-only gate's push + PR arms (#5320)
           bash tests/shell/test_release_guard.sh        # release.yml re-publish guard (#5282)
+          bash tests/shell/test_release_tag_sha.sh      # release.yml per-push tag recheck (#5282)
           python3 scripts/ci/test_runner_health_check.py
           bash tests/shell/test_review_driver_substitution.sh  # patsub_replacement prompt corruption (#2644)
           bash tests/shell/test_trusted_inputs_validate.sh    # the step that picks the BUILD COMMIT (#2832)
@@ -2376,6 +2403,14 @@ jobs:
           echo "This stub emits the required check name as success so the change is"
           echo "not blocked on an absent matrix context. Any PR or push that touches"
           echo "code runs the real '${{ matrix.check }}' build instead."
+          # Say so on the run page too: `success` on this name means "inherited",
+          # not "built".
+          if [[ "$GITHUB_EVENT_NAME" == "push" ]]; then
+            why="docs-only push (#1978/#5320). This context is a stub: the result is inherited from the predecessor commit, whose push run succeeded."
+          else
+            why="docs-only ${GITHUB_EVENT_NAME}: the change touches only docs (#1978/#5320). This context is a stub, not a build."
+          fi
+          echo "**${{ matrix.check }}: not built** — $why" >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
 
   # ── CI canary (PR-8 of overhaul plan) ─────────────────────────────────
   # Detects whether a PR (or a push to main) touches CI infrastructure
