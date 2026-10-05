@@ -421,7 +421,7 @@ TEST_CASE("require_fleet_read: JIT-elevated non-service session ⇒ TOP, no "
     // must still admit, and require_fleet_read must NOT call
     // authorize_list_read for an elevated session (which would deny a
     // grant-less caller).
-    auto cookie_token = r.auth_mgr.create_local_session("minter", auth::Role::user,
+    auto cookie_token = r.auth_mgr.create_local_session_for_test("minter", auth::Role::user,
                                                         /*mfa_verified=*/true);
     REQUIRE(r.auth_mgr.elevate_session(cookie_token, std::chrono::seconds(300)).has_value());
     httplib::Request req;
@@ -600,7 +600,7 @@ TEST_CASE("require_fleet_read: RBAC genuinely disabled, floored securable (Enrol
     GatesRig r{rbac_db_.dsn()};
     r.rbac.set_rbac_enabled(false);
     auto cookie_token =
-        r.auth_mgr.create_local_session("minter", auth::Role::user, /*mfa_verified=*/true);
+        r.auth_mgr.create_local_session_for_test("minter", auth::Role::user, /*mfa_verified=*/true);
     httplib::Request req;
     req.headers.emplace("Cookie", "yuzu_session=" + cookie_token);
     httplib::Response res;
@@ -620,7 +620,7 @@ TEST_CASE("require_fleet_read: RBAC genuinely disabled, floored securable (Enrol
     GatesRig r{rbac_db_.dsn()};
     r.rbac.set_rbac_enabled(false);
     auto cookie_token =
-        r.auth_mgr.create_local_session("minter", auth::Role::admin, /*mfa_verified=*/true);
+        r.auth_mgr.create_local_session_for_test("minter", auth::Role::admin, /*mfa_verified=*/true);
     httplib::Request req;
     req.headers.emplace("Cookie", "yuzu_session=" + cookie_token);
     httplib::Response res;

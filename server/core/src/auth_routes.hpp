@@ -20,6 +20,7 @@
 #include <array>
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <expected>
 #include <functional>
 #include <memory>
@@ -100,6 +101,92 @@ struct ListReadGate {
 using TierPolicyFn =
     std::function<bool(const httplib::Request&, httplib::Response&, const auth::Session&,
                        const std::string& securable_type, const std::string& operation)>;
+
+/// Outcome of `AuthRoutes::verify_password_with_lockout` (#5342) — the ONE
+/// lockout-accounted password check, shared by `POST /login` and the
+/// self-service `POST /api/v1/users/me/password` current-password proof.
+enum class PasswordCheckOutcome : std::uint8_t {
+    /// Password matched (`PasswordCheckResult::role` engaged, DB-confirmed by
+    /// `AuthManager::verify_password`'s row-locked recheck). A non-zero (or
+    /// unknown) failure counter was cleared and audited.
+    kVerified,
+    /// The account is currently locked: PBKDF2 skipped, nothing audited (the
+    /// metric + rate-limited log line are the per-attempt signal; the
+    /// once-per-lock `auth.lockout.applied` row is the durable evidence).
+    kLocked,
+    /// The caller's `pre_verify_gate` refused (it has already written the
+    /// response). Neither verified nor counted as a failure.
+    kGateRejected,
+    /// Wrong password, unknown user, or an over-max password (#5342 — refused
+    /// without PBKDF2, indistinguishable from a wrong one). The failure was
+    /// recorded for lockout accounting (and `auth.lockout.applied` audited on
+    /// the threshold-crossing attempt).
+    kBadCredential,
+    /// A wrong-password failure could NOT be recorded because the auth store
+    /// is unavailable. Fail CLOSED (503 + retry hint): answering the ordinary
+    /// rejection would be an UNcounted attempt — a free guess while the store
+    /// is degraded (Hermes p2 MEDIUM).
+    kStoreUnavailable,
+    /// #5342 Gate 7 (sec-3): the password could not be VERIFIED at all — an
+    /// AuthDB read failed (`VerifyFailure::kStoreUnavailable`) or the stored
+    /// credential changed mid-verify (`kCredentialChanged`, a concurrent
+    /// password change). Not a credential verdict: `on_bad_credential` is NOT
+    /// run, nothing is counted toward lockout, no "login failed" evidence is
+    /// written. The caller answers a retryable 503. A store-unavailable read
+    /// also bumps `yuzu_auth_secret_unavailable_total` + `yuzu_auth_read_degrade_total`
+    /// for `opts.metric_route`; a credential change is counted by
+    /// `yuzu_auth_credential_changed_during_verify_total` (AuthManager).
+    kTransient,
+};
+
+struct PasswordCheckResult {
+    PasswordCheckOutcome outcome{PasswordCheckOutcome::kBadCredential};
+    std::optional<auth::Role> role; ///< engaged iff kVerified
+    /// kVerified only: the stored hash the password was verified against
+    /// (`VerifiedCredential::hash_hex`) — the anchor a session mint
+    /// (`create_local_session`) and a self-change CAS carry forward. Credential
+    /// material: never log, audit, or serialise it.
+    std::string verified_hash_hex;
+};
+
+/// Per-call knobs for `verify_password_with_lockout`. The defaults are the
+/// non-login shape; `POST /login` sets every field.
+struct PasswordCheckOptions {
+    /// Skip lockout accounting entirely for this call (the sso-only
+    /// break-glass exemption — see `POST /login`). The attempt is still
+    /// verified; a failure is still the caller's to audit.
+    bool lockout_exempt{false};
+    /// Runs AFTER the lockout pre-check and BEFORE PBKDF2, inside the
+    /// per-username stripe. Return false to refuse (having written the
+    /// response) → `kGateRejected`. `/login` uses this for its sso-only gate.
+    std::function<bool()> pre_verify_gate;
+    /// Runs on a bad credential BEFORE the lockout accounting, so a route's
+    /// own failure evidence precedes any `auth.lockout.applied` row (the
+    /// historical `/login` ordering).
+    std::function<void()> on_bad_credential;
+    /// `route` label for the store-unavailable counters
+    /// (`yuzu_auth_secret_unavailable_total`, `yuzu_auth_read_degrade_total`).
+    std::string metric_route{"login"};
+    /// Audit `detail` of the `auth.lockout.cleared` row written on success.
+    std::string cleared_detail{"reset_on_successful_login"};
+};
+
+/// The current-password proof handed to `RestApiV1` (#5342): bound by
+/// `AuthRoutes::password_change_verify_fn()` to `verify_password_with_lockout`
+/// with the self-change route's options, so RestApiV1 never re-implements the
+/// striped-lock section.
+using PasswordVerifyFn = std::function<PasswordCheckResult(
+    const std::string& username, const std::string& password, const httplib::Request& req)>;
+
+/// Verdict of `AuthRoutes::sso_only_local_password_gate` (#5342 Gate 7, C8):
+/// may a LOCAL password be evaluated for this username right now?
+enum class SsoOnlyLocalGate : std::uint8_t {
+    kOpen,            ///< not in `--auth-mode=sso-only`: local passwords are live
+    kBreakGlassArmed, ///< sso-only, but this is the configured break-glass account AND
+                      ///< it is currently armed — the one local password that is live
+    kRefused,         ///< sso-only and not an armed break-glass account (or the arm
+                      ///< state could not be read — fail CLOSED): never evaluate PBKDF2
+};
 
 /// Extracted auth helpers and route handlers (Phase 2 of god-object decomposition).
 ///
@@ -486,6 +573,47 @@ public:
     /// Secure".
     std::string session_cookie_attrs() const;
 
+    /// The ONE lockout-accounted password check (#5342; extracted,
+    /// behaviour-preserving, from `POST /login`'s lockout-critical section so
+    /// the self-service current-password proof can never drift from it).
+    /// Under the per-username login stripe (`login_lock_for`, held only when lockout is
+    /// enabled): lockout pre-check (fail-OPEN on a read error, remembered so a
+    /// later success clears defensively) → `opts.pre_verify_gate` → the
+    /// over-max short-circuit (`password_policy.hpp`) → `verify_password` →
+    /// on failure `opts.on_bad_credential` then `record_failed_login` (+ the
+    /// threshold-crossing `auth.lockout.applied` audit/event/metric; a store
+    /// outage → `kStoreUnavailable` with the degrade counters bumped) → on
+    /// success `clear_failed_logins` + `auth.lockout.cleared` audit when the
+    /// counter was non-zero or unknown. Writes NO response itself (except
+    /// whatever `pre_verify_gate` writes) — every outcome's wire shape stays
+    /// the caller's. Returns with the stripe released.
+    [[nodiscard]] PasswordCheckResult
+    verify_password_with_lockout(const std::string& username, const std::string& password,
+                                 const httplib::Request& req,
+                                 const PasswordCheckOptions& opts = {});
+
+    /// `verify_password_with_lockout` bound with the self-service
+    /// password-change options (metric route `password_change`, the sso-only
+    /// break-glass lockout exemption mirrored from `/login`, and
+    /// `sso_only_local_password_gate` as the `pre_verify_gate` — so under
+    /// sso-only a disarmed break-glass session can neither guess nor lock the
+    /// account through this route: `kGateRejected` before any PBKDF2 or
+    /// lockout write). Handed to `RestApiV1::set_password_change_deps`.
+    /// Captures `this`; the caller keeps this AuthRoutes alive so it outlives
+    /// route dispatch (ServerImpl owns both).
+    [[nodiscard]] PasswordVerifyFn password_change_verify_fn();
+
+    /// The ONE "may a local password be evaluated for `username`" decision
+    /// under `--auth-mode=sso-only` (#5342 Gate 7, C8 — extracted from POST
+    /// /login's hardened-mode gate so the self-service password change cannot
+    /// drift from it). Reads the break-glass arm state from AuthDB and fails
+    /// CLOSED (`kRefused`) on a read error or with no AuthDB: unlike lockout,
+    /// this gate IS the credential path. Pure decision — writes no response,
+    /// metric, log or audit; each caller keeps its own (`/login` its generic
+    /// 401 + `yuzu_auth_local_disabled_total`; the password route its 403
+    /// `sso_only_local_disabled`).
+    [[nodiscard]] SsoOnlyLocalGate sso_only_local_password_gate(const std::string& username);
+
     /// Construct an AuditEvent from HTTP request context.
     AuditEvent make_audit_event(const httplib::Request& req, const std::string& action,
                                 const std::string& result);
@@ -527,6 +655,19 @@ public:
                                  const std::string& target_id = {},
                                  const std::string& detail = {},
                                  const std::string& principal_class_override = {});
+
+    /// The `AuditEvent` `audit_log_for_principal` would write, built WITHOUT
+    /// writing it (#5342 Gate 8): the identity/request fields (principal,
+    /// role, class, source IP, user agent, session correlator, target) for a
+    /// caller that persists the row INSIDE its own transaction via
+    /// `AuditStore::log_in_txn` — the credential-change owner. ONE builder for
+    /// both, so an in-transaction row and an ordinary row for the same actor
+    /// can never disagree. Works in audit-off mode too (no store needed).
+    [[nodiscard]] AuditEvent make_audit_event_for_principal(
+        const httplib::Request& req, const std::string& action, const std::string& result,
+        const std::string& principal, const std::string& principal_role,
+        const std::string& target_type = {}, const std::string& target_id = {},
+        const std::string& detail = {}, const std::string& principal_class_override = {}) const;
 
     /// guardian-confinement-2298 PR3 §3e — server.cpp's shared deny gate for
     /// routes that reach agent/fleet/execution data via `require_auth`
@@ -592,6 +733,16 @@ public:
     void emit_event(const std::string& event_type, const httplib::Request& req,
                     const nlohmann::json& attrs = {}, const nlohmann::json& payload_data = {},
                     Severity sev = Severity::kInfo);
+
+    /// #5342 Gate 8 (F4): the ONE refusal evidence for an MFA enrolment write
+    /// that found the account's credential changed (`AuthDBError::
+    /// CredentialChanged`) on the login-enforcement path — the bootstrap init in
+    /// `POST /login` and the confirm in `POST /login/mfa/enroll`. Writes the
+    /// `mfa.enroll.failed` / `error` / `credential_changed` audit row and the
+    /// matching `mfa.enroll.failed` event (reason `credential_changed`). The
+    /// caller answers the uniform 401 itself and reveals nothing.
+    void record_enroll_credential_changed(const httplib::Request& req,
+                                          const std::string& username, auth::Role role);
 
     // -- Route registration ---------------------------------------------------
 
@@ -695,6 +846,13 @@ private:
     struct MfaPending {
         std::string username;
         auth::Role role{auth::Role::user};
+        /// #5342 Gate 7 (B4): the stored hash the step-1 password was verified
+        /// against (`PasswordCheckResult::verified_hash_hex`). Handed to
+        /// `create_local_session` at step 2, whose post-mint recheck denies if
+        /// the stored hash has since changed — so a pending login proven with
+        /// the OLD password cannot be completed after an admin reset or a
+        /// self-change. Credential material: never logged or serialised.
+        std::string hash_hex;
         std::chrono::steady_clock::time_point expires_at{};
         int attempts{0};
         /// Default is a login challenge. Each endpoint rejects the other's
