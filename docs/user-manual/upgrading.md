@@ -285,10 +285,13 @@ nothing changes with RBAC off for such a caller. What changes for every caller i
 audit behaviour below, plus one new prerequisite.**
 
 - **Admission prerequisite (applies to every caller on these two surfaces).** The fleet-read gate
-  needs both the authorization store and the management-group store open. When either is not open,
-  every non-elevated, non-engine caller, including a global-grant administrator, gets a retryable
-  `503` (`retry_after_ms` 5000) from the gate; the old plain gate never needed the management-group
-  store. On the dashboard fragment that `503` is the gate's own JSON error body, which the dashboard
+  needs both the authorization store and the management-group store open. When the RBAC store is
+  not open, every caller except a JIT-elevated non-service session (which returns before any store
+  check) gets a retryable `503` (`retry_after_ms` 5000) from the gate; when the management-group
+  store is not open, every caller except an elevated session and an engine principal does (an
+  engine principal is resolved from the RBAC store alone, and gets the `503` only when that store
+  is not open). A global-grant administrator is included in both cases; the old plain gate never
+  needed the management-group store. On the dashboard fragment that `503` is the gate's own JSON error body, which the dashboard
   drops, so the panel can stay on "Loading..." until the store recovers (the REST and MCP twins show
   the `503` itself).
 - **Group-scoped-only operators** (an `Execution:Read` grant held only through a management group)
@@ -300,11 +303,18 @@ audit behaviour below, plus one new prerequisite.**
   `Execution:Read` is newly admitted to the confined execution view, and its narrative carries the
   same projected counts.
 - **Service-scoped API tokens** get the same confined view from `GET /fragments/executions` where
-  they got `403`, but only when RBAC enforcement is ON and the tag store is reachable. With RBAC
+  they got `403`, but only when RBAC enforcement is ON, the `ITServiceOwner` role holds
+  `Execution:Read` (the seeded default; see the next item) and the tag store is reachable. With RBAC
   enforcement off the gate still answers `403` ("service-scoped tokens require RBAC to be
   enabled"), and a missing or degraded tag store answers `503` (`retry_after_ms` 5000). In a
   normal deployment the tag store always exists (the server refuses to boot without it).
   `summarize_working_set` is unchanged for service-scoped tokens: it stays denied.
+- **`ITServiceOwner` ceiling (applied by the preceding change, not this one).** A service-scoped
+  token is subject to the `ITServiceOwner` authority ceiling on the fleet-read gate, so this change
+  relies on that ceiling but does not add it. Its Breaking effect (`403` from
+  `GET /api/v1/enrollment/pending-agents` for a service-scoped token), the retryable `503` for a
+  failed ceiling read, the remediation and the audit search are in "Behaviour change:
+  service-scoped tokens and the `ITServiceOwner` ceiling on the fleet-read gate" below.
 - **Degraded store, fragment.** The fragment's own failure notes (tracker or status read failure,
   unwired gate, empty principal under a confined read) now render an honest operator-visible note
   at HTTP `200` (`<div class="empty-state" data-degraded="tracker|unavailable">`), because the
@@ -312,7 +322,9 @@ audit behaviour below, plus one new prerequisite.**
   with the `data-degraded` attribute; it is never the "No executions yet" text. The gate's own
   `403`/`503` JSON bodies are unchanged. **Runbook:** a degrade note on the Executions panel means
   the execution tracker read failed (check `ExecutionTracker` warnings in the server log and
-  PostgreSQL availability); it clears on the next successful poll.
+  PostgreSQL availability). The note does NOT clear on its own: the panel is loaded once, when the
+  Instructions page reveals it (`hx-trigger="revealed"`), so after the store recovers reload the
+  Instructions page (or reopen the Execution History section).
 - **Degraded store, MCP.** `summarize_working_set` returns an error carrying `retry_after_ms`
   where it used to say the execution "was not found".
 - **Empty confined page.** A confined caller who sees zero executions gets "No executions visible in
@@ -325,9 +337,11 @@ audit behaviour below, plus one new prerequisite.**
 - **Audit and SIEM.** For `kind=execution`, a CONFINED caller whose id is absent or outside scope
   now produces `action=mcp.summarize_working_set`, `result=denied`, detail
   `not found or outside caller's fleet-read scope: <id>` (the id is neutralised for `k=v` and
-  CR/LF forgery and capped at 128 bytes). Previously an absent id was audited `result=success`, so
-  a rule keyed on `mcp.summarize_working_set` + `result=success` will now see fewer rows for
-  confined callers. An UNCONFINED caller's absent id stays `result=success` (no denial occurred).
+  CR/LF forgery and capped at 128 bytes; the `success` row's id gets the same treatment for EVERY `summarize_working_set` kind, not only `execution`). Only callers newly admitted by this change can produce
+  that row (the plain gate admitted only unconfined, global-grant callers, and confined callers got
+  `403` before), so an existing rule keyed on `result=success` loses nothing for the callers it
+  already saw; a rule keyed on `result=denied` for this action may now see the new callers. An
+  UNCONFINED caller's absent id stays `result=success` (no denial occurred).
   The `denied` row cannot tell a typo from an out-of-scope probe; that is intentional (no
   existence oracle). The narrative for an absent id is a success-shaped result, unlike
   `get_execution_status`, which returns an error for the same input.

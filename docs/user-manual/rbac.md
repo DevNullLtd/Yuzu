@@ -176,20 +176,9 @@ Recommended order for a fresh install:
 > with no per-agent filter. Dashboard `/fragments/results/filter-bar`,
 > `/fragments/create-group-form`, and `POST /api/dashboard/group-from-results`
 > (tracked #3489; #3525 tracked the same finding and was closed as its
-> duplicate); REST `GET /api/v1/execution-statistics/agents` (tracked #3526). The
-> workflow executions LIST fragment `/fragments/executions` and MCP
-> `summarize_working_set` `kind=execution` were on this list and are now on
-> `require_fleet_read` too: on the dashboard fragment a group-scoped-only
-> operator gets a confined view where it previously got `403`, while
-> `summarize_working_set` keeps its plain `Infrastructure:Read` first gate (a
-> group-scoped-only operator still gets `403` there; only a caller with a global
-> `Infrastructure:Read` plus a group-scoped `Execution:Read` is newly admitted).
-> Neither was a reachable leak before, because the flat gate only ever admitted
-> global-grant callers, who are unfiltered anyway. The fragment's own failure
-> notes (a `data-degraded` note on the Executions panel) render at HTTP `200`
-> because the dashboard drops `4xx`/`5xx` bodies; see `upgrading.md`.
-> `summarize_working_set` `kind=fleet`/`result_set` still return an unscoped
-> whole-registry agent count. So
+> duplicate); REST `GET /api/v1/execution-statistics/agents` (tracked #3526);
+> `summarize_working_set` `kind=fleet`/`result_set` (an unscoped whole-registry
+> agent count, tracked #4753). So
 > a degraded store looks like "no agents in scope" / "no responses" / `503`
 > across every reader on this page now — check the server startup log for
 > `RbacStore` errors, the `/health` store status, and
@@ -237,6 +226,23 @@ Recommended order for a fresh install:
 > deferred item remains: the `authorize_list_read` supersede-to-intersect migration for the remaining callers
 > is tracked in `docs/security-reviews/service-scope-phase2-migrations-2026-08.md`, so "every fleet-read
 > route" above does not mean every route that lists per-agent data.
+>
+> **Executions panel and `summarize_working_set` (`kind=execution`).** The
+> workflow executions LIST fragment `/fragments/executions` and MCP
+> `summarize_working_set` `kind=execution` were on the "still not covered" list
+> and are now on `require_fleet_read` too: on the dashboard fragment a
+> group-scoped-only operator gets a confined view where it previously got `403`,
+> while `summarize_working_set` keeps its plain `Infrastructure:Read` first gate
+> (a group-scoped-only operator still gets `403` there; only a caller with a
+> global `Infrastructure:Read` plus a group-scoped `Execution:Read` is newly
+> admitted). Neither was a reachable leak before, because the flat gate only
+> ever admitted global-grant callers, who are unfiltered anyway. **Exception to
+> the degraded-store sentence above:** a degrade on the Executions panel is NOT a
+> `503` the operator sees. The fragment's own failure notes (tracker or status
+> read failure) render at HTTP `200` as a `data-degraded` note, because the
+> dashboard drops `4xx`/`5xx` bodies; the gate's own `403`/`503` JSON bodies
+> (store not open) are unchanged. See `upgrading.md`. The `ITServiceOwner` ceiling for service-scoped
+> tokens is applied by the preceding change (the paragraph above), not by this one.
 >
 > **Note (#1634):** the per-agent filter on `query_responses`/`aggregate_responses`/the
 > REST visualization+responses endpoints is, under *normal* RBAC operation, currently
