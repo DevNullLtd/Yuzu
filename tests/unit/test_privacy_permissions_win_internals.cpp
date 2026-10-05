@@ -1,13 +1,15 @@
 /**
- * test_privacy_permissions_win_internals.cpp -- TU-inclusion seam over
- * privacy_permissions_win.cpp's internal-linkage StabilityWatch, walk_consent_store and
- * HiveFileGuard. The pure classifiers (classify_stability, classify_hive_file, ...) are covered
- * in test_privacy_permissions_parsers.cpp; these cases prove the production WIRING around them:
- * that the watch is armed and polled, that the walk decodes a ConsentStore subtree and honours the
- * deadline, that the guard checks the deadline first and verifies the file identity, that
- * with_user_hive reads a loaded hive before ever entering the offline arm, and that the final-path
- * comparison is Windows' own ordinal one. No fake registry interface: a per-process-salted volatile
- * HKCU key and a TempDir file.
+ * test_privacy_permissions_win_internals.cpp -- TU-inclusion seam over privacy_permissions_win.cpp:
+ * its production Win32Registry and Win32HiveFileProbe shells (and the internal-linkage
+ * StabilityWatch and with_user_hive wiring) driven through the pure walk and guard headers
+ * (privacy_permissions_win_walk.hpp, privacy_permissions_hive_guard.hpp). The pure classifiers
+ * (classify_stability, classify_hive_file, ...) are covered in
+ * test_privacy_permissions_parsers.cpp, and the walk and guard logic (the deadline-first order
+ * among it) over fakes in test_privacy_permissions_win_walk.cpp; these cases prove the production
+ * WIRING around them: that the watch is armed and polled, that the walk decodes a ConsentStore
+ * subtree, that the guard verifies the file identity, that with_user_hive reads a loaded hive
+ * before ever entering the offline arm, and that the final-path comparison is Windows' own
+ * ordinal one. This TU uses no fake: a per-process-salted volatile HKCU key and a TempDir file.
  *
  * `#if defined(_WIN32)` guards the WHOLE body -- empty TU elsewhere (the same shape as
  * test_execution_artifacts_win_internals.cpp and test_privacy_permissions_macos_internals.cpp).
@@ -274,7 +276,8 @@ TEST_CASE("privacy_permissions win: walk_consent_store decodes a fixture Consent
         CHECK(dword->state == PermissionState::unreadable);
         CHECK(dword->cause == "value_type_" + std::to_string(REG_DWORD));
     }
-    SECTION("key names fold the way the registry's own do: a lowercase pair, and a non-ASCII child") {
+    SECTION("key names fold the way the registry's own do: a lowercase pair, and a non-ASCII "
+            "child") {
         // (i) `nonpackaged` / `EXECUTABLES` differ from the canonical names only by ASCII case: the
         // registry opens them as the same keys, so the walk must not read them as apps.
         {
@@ -295,7 +298,8 @@ TEST_CASE("privacy_permissions win: walk_consent_store decodes a fixture Consent
             const auto* toggle = find(w.grants, "NonPackaged", "camera");
             REQUIRE(toggle);
             CHECK(toggle->state == PermissionState::allowed);
-            for (const auto& g : w.structural) CHECK(g.cause.find("duplicate_app_id") == std::string::npos);
+            for (const auto& g : w.structural)
+                CHECK(g.cause.find("duplicate_app_id") == std::string::npos);
         }
         // (ii) `Executable` + U+017F: whether it IS the container is the registry's call, so the
         // registry is the oracle -- the canonical name opens it exactly when the registry folds it.
@@ -305,10 +309,10 @@ TEST_CASE("privacy_permissions win: walk_consent_store decodes a fixture Consent
             set_sz(u.make(store + L"\\webcam").get(), L"Value", L"Allow");
             const auto nonpkg = u.make(store + L"\\webcam\\NonPackaged");
             set_sz(u.make(store + L"\\webcam\\NonPackaged\\" + odd).get(), L"Value", L"Allow");
-            HKEY probe = nullptr;
+            yuzu::win::RegKey folded;
             const bool reg_folds =
-                RegOpenKeyExW(nonpkg.get(), L"Executables", 0, KEY_READ, &probe) == ERROR_SUCCESS;
-            if (probe) RegCloseKey(probe);
+                RegOpenKeyExW(nonpkg.get(), L"Executables", 0, KEY_READ, folded.put()) ==
+                ERROR_SUCCESS;
             CHECK(reg.key_name_equals(odd, win::kExecutablesContainerKeyName) == reg_folds);
             win::RetentionBudget budget;
             const auto w = win::walk_consent_store(reg, u.root, budget);
@@ -499,6 +503,11 @@ TEST_CASE("privacy_permissions win: HiveFileGuard refuses a reparse-point or har
             SKIP("a symlink needs SeCreateSymbolicLinkPrivilege or Developer Mode: " << ec.message());
         CHECK(guard.before_load(hd.file.wstring()) == "hive_sidecar_reparse");
         CHECK_FALSE(fs::exists(target));
+        // The production probe opens the link itself (FILE_FLAG_OPEN_REPARSE_POINT), so the
+        // opened handle's attribute word carries the reparse bit the guard re-checks.
+        std::uint32_t links = 0, attrs = 0;
+        CHECK(probe.sidecar_facts(log1.wstring(), links, attrs) == 0);
+        CHECK((attrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0);
     }
     SECTION("more than kMaxHiveSidecars sidecar-named entries are refused") {
         for (std::size_t i = 0; i <= win::kMaxHiveSidecars; ++i)

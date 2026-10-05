@@ -1254,7 +1254,8 @@ TEST_CASE("local_security_policy Tally: a byte budget bounds output independentl
     CHECK(total <= kMaxRowBytes + 64);
 }
 
-TEST_CASE("local_security_policy Tally: the byte boundary is exact (bytes + size == cap is admitted)",
+TEST_CASE("local_security_policy Tally: the byte boundary is exact (bytes + size == cap is "
+          "admitted)",
           "[local_security_policy][parsers][tally]") {
     detail::Tally t;
     const std::size_t big = 4000; // each admitted row is accounted at size + 1 (its newline)

@@ -1054,7 +1054,7 @@ struct Tally {
 
     // Formatted row bytes so far (each row plus its newline); byte-only, non-sticky: every row is
     // re-tested, so a smaller row after the cap marker is still admitted (unchanged behaviour).
-    yuzu::shared::RowByteBudget budget{yuzu::shared::RowByteBudget::npos, kMaxRowBytes};
+    yuzu::shared::RowByteBudget budget{.max_bytes = kMaxRowBytes};
     std::string marker_prefix{"local_security_policy"};
     std::size_t marker_fields{4};
     [[nodiscard]] std::string truncation_marker() const {

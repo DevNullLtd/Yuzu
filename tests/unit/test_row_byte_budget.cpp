@@ -20,7 +20,7 @@ TEST_CASE("RowByteBudget: defaults are unbounded", "[row_byte_budget]") {
 }
 
 TEST_CASE("RowByteBudget: row cap, exact fill admitted then refused", "[row_byte_budget]") {
-    RowByteBudget b{2, RowByteBudget::npos};
+    RowByteBudget b{.max_rows = 2};
     CHECK(b.charge(1));
     CHECK_FALSE(b.full());
     CHECK(b.charge(1));
@@ -31,7 +31,7 @@ TEST_CASE("RowByteBudget: row cap, exact fill admitted then refused", "[row_byte
 }
 
 TEST_CASE("RowByteBudget: byte cap, exact fill admitted, never wraps", "[row_byte_budget]") {
-    RowByteBudget b{RowByteBudget::npos, 10};
+    RowByteBudget b{.max_bytes = 10};
     CHECK(b.charge(6));
     CHECK(b.charge(4));
     CHECK(b.bytes == 10);
@@ -45,7 +45,7 @@ TEST_CASE("RowByteBudget: byte cap, exact fill admitted, never wraps", "[row_byt
 }
 
 TEST_CASE("RowByteBudget: refused is a record, not a gate", "[row_byte_budget]") {
-    RowByteBudget b{RowByteBudget::npos, 10};
+    RowByteBudget b{.max_bytes = 10};
     CHECK(b.charge(8));
     CHECK_FALSE(b.charge(5));
     CHECK(b.refused);
@@ -56,7 +56,7 @@ TEST_CASE("RowByteBudget: refused is a record, not a gate", "[row_byte_budget]")
 }
 
 TEST_CASE("RowByteBudget: add is unconditional and saturating", "[row_byte_budget]") {
-    RowByteBudget b{RowByteBudget::npos, 10};
+    RowByteBudget b{.max_bytes = 10};
     b.add(25);
     CHECK(b.full());
     CHECK_FALSE(b.fits(1));

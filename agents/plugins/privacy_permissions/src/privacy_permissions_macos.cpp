@@ -80,6 +80,7 @@
 #include <sqlite3.h>
 
 #include <posix_dir_walk.hpp>
+#include <row_byte_budget.hpp>
 #include <yuzu/agent/scoped_fd.hpp>
 
 namespace yuzu::privacy_permissions {
@@ -232,7 +233,7 @@ bool sidecar_present(int dirfd, const std::string& name) {
 std::vector<macos::TccServiceRead> read_services(sqlite3_stmt* stmt, Deadline& deadline,
                                                  std::size_t row_cap) {
     std::vector<macos::TccServiceRead> reads;
-    yuzu::shared::RowByteBudget source{yuzu::shared::RowByteBudget::npos, macos::kMaxSourceBytes};
+    yuzu::shared::RowByteBudget source{.max_bytes = macos::kMaxSourceBytes};
     for (const auto& svc : macos::kTccServices) {
         macos::TccServiceRead read{svc.category, {}, false, false, {}};
         if (deadline.expired()) {

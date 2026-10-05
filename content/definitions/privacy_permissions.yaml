@@ -46,7 +46,7 @@ metadata:
     off until enabled: macOS is expected to read `denied` until the agent has Full Disk Access (per-user rows are what that user's own TCC.db records, not what tccd enforces; homes outside /Users or on a network mount are not read),
     Windows reads each real profile's ConsentStore (constrained: a cooperative 15 s deadline, an
     opt-in hive-file guard on the offline NTUSER.DAT arm, and a ConsentStore change reported
-    during the read refuses that source), and Linux reports only the agent's own session, normally
+    during the read is walked once more, then refused if it changes again), and Linux reports only the agent's own session, normally
     `unavailable` under the shipped service.
   tags: [privacy_permissions, security, posture, privacy, forensics]
 

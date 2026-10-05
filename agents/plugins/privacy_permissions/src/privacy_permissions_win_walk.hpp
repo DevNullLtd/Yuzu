@@ -4,18 +4,16 @@
  * privacy_permissions_win_walk.hpp -- the ConsentStore registry walk behind an injectable seam.
  *
  * windows.h-free by design: the Win32 shell (privacy_permissions_win.cpp's Win32Registry) supplies
- * the OS through RegistryReader / ConsentStoreWatch, and everything that DECIDES -- enumeration with
- * its cap and probe, the per-value read and its size/type/error branches, the NonPackaged and
- * Executables key-name comparison, the stability watch and its one re-walk, the deadline order -- is
- * plain code over those interfaces, so a fake registry in tests/unit/test_privacy_permissions_win_walk.cpp
- * locks each branch on every host. The decode helpers it routes through live in
- * privacy_permissions_win_parsers.hpp.
+ * the OS through RegistryReader / ConsentStoreWatch, and everything that DECIDES -- enumeration
+ * with its cap and probe, the per-value read and its size/type/error branches, the NonPackaged and
+ * Executables key-name comparison, the stability watch and its one re-walk, the deadline order --
+ * is plain code over those interfaces, so a fake registry in
+ * tests/unit/test_privacy_permissions_win_walk.cpp locks each branch on every host. The decode
+ * helpers it routes through live in privacy_permissions_win_parsers.hpp.
  *
  * The codes the seam returns are Win32 codes carried as `long`; the shell static_asserts each
  * mirrored constant against its SDK value.
  */
-
-#include "privacy_permissions_win_parsers.hpp"
 
 #include <algorithm>
 #include <cstddef>
@@ -26,6 +24,8 @@
 #include <string_view>
 #include <utility>
 #include <vector>
+
+#include "privacy_permissions_win_parsers.hpp"
 
 namespace yuzu::privacy_permissions::win {
 
@@ -43,6 +43,9 @@ struct ConsentStoreWatch {
 };
 
 /// The registry as the walk sees it. Every method mirrors one Win32 call and returns its code.
+/// Raw `long` codes and out-parameters by design, an exception to cpp-conventions' std::expected
+/// rule: each method mirrors one Win32 call, and query_value returns a partial result (type and
+/// size) beside the code.
 struct RegistryReader {
     RegistryReader() = default;
     RegistryReader(const RegistryReader&) = delete;
@@ -121,7 +124,8 @@ struct SubkeyEnum {
     long rc = kErrorSuccess;
     std::size_t embedded_nul = 0;
     std::wstring name;
-    while (idx < kMaxEnumeratedSubkeys && (rc = reg.enum_key(parent, idx++, name)) == kErrorSuccess) {
+    while (idx < kMaxEnumeratedSubkeys &&
+           (rc = reg.enum_key(parent, idx++, name)) == kErrorSuccess) {
         if (name.empty() || name.find(L'\0') != std::wstring::npos)
             ++embedded_nul;
         else
@@ -189,7 +193,8 @@ struct SubkeyEnum {
         std::uint64_t ft = 0;
         std::uint32_t t = 0, sz = sizeof(ft);
         const long rc = reg.query_value(
-            app_key, name, t, std::span<std::byte>{reinterpret_cast<std::byte*>(&ft), sizeof ft}, sz);
+            app_key, name, t, std::span<std::byte>{reinterpret_cast<std::byte*>(&ft), sizeof ft},
+            sz);
         return decode_last_used(rc, t, sz, ft);
     };
     g.last_used_start = read_last_used(L"LastUsedTimeStart");
@@ -239,8 +244,8 @@ struct SubkeyEnum {
 
         // One app child: a key that vanished since enumeration (FILE_NOT_FOUND) is simply gone;
         // any other open failure is that app's own failure row.
-        const auto read_app = [&](RegKeyHandle parent, const std::wstring& child, std::string app_id,
-                                  std::string_view kind) {
+        const auto read_app = [&](RegKeyHandle parent, const std::wstring& child,
+                                  std::string app_id, std::string_view kind) {
             ScopedKey app_key(reg);
             const long rc = app_key.open(parent, child.c_str());
             if (rc == kErrorSuccess)
@@ -269,7 +274,8 @@ struct SubkeyEnum {
 
         // Win32 (non-packaged) apps, keyed by an escaped executable path.
         ScopedKey nonpkg(reg);
-        const long nonpkg_rc = nonpkg.open(cap_key.get(), std::wstring{kNonPackagedKeyName}.c_str());
+        const long nonpkg_rc =
+            nonpkg.open(cap_key.get(), std::wstring{kNonPackagedKeyName}.c_str());
         if (nonpkg_rc == kErrorSuccess) {
             // The "let desktop apps access" toggle: the NonPackaged key's own Value, one row.
             keep(w.grants, read_one_grant(reg, nonpkg.get(), std::string{kNonPackagedToggleAppId},

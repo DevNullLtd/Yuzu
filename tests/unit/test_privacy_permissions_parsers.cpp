@@ -754,12 +754,12 @@ TEST_CASE("OutputBudget reserve: rows charged first always fit, and a later sour
     const std::vector<PermissionRow> profile{
         {"windows", "jsmith/-", "camera", PermissionState::denied, "Deny", "-", "-", false}};
     OutputBudget b;
-    b.b.max_bytes = OutputBudget::cost(machine) + OutputBudget::cost(profile) - 1;
+    b.budget.max_bytes = OutputBudget::cost(machine) + OutputBudget::cost(profile) - 1;
     b.charge(machine); // reserved first
     CHECK_FALSE(b.exhausted());
     CHECK(b.would_exceed(profile)); // the profile does not fit beside the reservation...
-    CHECK(b.b.bytes == OutputBudget::cost(machine)); // ...and the reservation is untouched
-    b.b.max_bytes += 1;
+    CHECK(b.budget.bytes == OutputBudget::cost(machine)); // ...and the reservation is untouched
+    b.budget.max_bytes += 1;
     CHECK_FALSE(b.would_exceed(profile)); // exactly the cap fits
     b.charge(profile);
     CHECK(b.exhausted());
@@ -1053,7 +1053,9 @@ TEST_CASE("win::assemble_windows_rows: HKLM's overriding Deny is one unqualified
         run.go({profile_of("alice", bak), profile_of("carol", kSidCarol)}, hklm_camera_deny(),
                [](const ProfileInfo&) { return reachable_allow(); });
         CHECK(run.reads == 1); // carol only
-        CHECK(run.count([](const PermissionRow& r) { return r.raw == "alice:profile_list_backup"; }) == 1);
+        CHECK(run.count([](const PermissionRow& r) {
+                  return r.raw == "alice:profile_list_backup";
+              }) == 1);
         CHECK(run.count([](const PermissionRow& r) { return r.raw == "alice:invalid_sid"; }) == 0);
         const auto st = select_status(run.acc, any_denied(run.rows), false);
         CHECK(st.status == YUZU_RESULT_STATUS_CONSTRAINED);
@@ -1128,10 +1130,10 @@ TEST_CASE("win::assemble_windows_rows: the run-wide output budget reserves HKLM'
     // The cost of HKLM's reservation (R) and of one profile's rows (c), measured from real runs.
     AssembledRun none;
     none.go({}, hklm, read);
-    const std::size_t reserved = none.output.b.bytes;
+    const std::size_t reserved = none.output.budget.bytes;
     AssembledRun one;
     one.go({profile_of("alice", kSidAlice)}, hklm, read);
-    const std::size_t per_profile = one.output.b.bytes - reserved;
+    const std::size_t per_profile = one.output.budget.bytes - reserved;
     REQUIRE(reserved > 0);
     REQUIRE(per_profile > 0);
     CHECK(none.stops(kBudgetExceededToken) == 0);
@@ -1141,7 +1143,7 @@ TEST_CASE("win::assemble_windows_rows: the run-wide output budget reserves HKLM'
     AssembledRun run;
 
     SECTION("a second profile that would cross the cap is absent; the first and HKLM's rows stay") {
-        run.output.b.max_bytes = reserved + 2 * per_profile - 1;
+        run.output.budget.max_bytes = reserved + 2 * per_profile - 1;
         run.go(two, hklm, read);
         CHECK(run.markers(win::run_stop_token(kBudgetExceededToken, 1)) == 1);
         CHECK(run.rows_of("alice\\-") == kCategories.size());
@@ -1153,7 +1155,7 @@ TEST_CASE("win::assemble_windows_rows: the run-wide output budget reserves HKLM'
         CHECK(st.provenance.find(std::string{kBudgetExceededToken}) != std::string::npos);
     }
     SECTION("a cap the first profile fills EXACTLY still marks the profiles left unread") {
-        run.output.b.max_bytes = reserved + per_profile;
+        run.output.budget.max_bytes = reserved + per_profile;
         run.go(two, hklm, read);
         CHECK(run.output.exhausted());
         CHECK(run.reads == 1); // bobby is never read
@@ -1162,13 +1164,13 @@ TEST_CASE("win::assemble_windows_rows: the run-wide output budget reserves HKLM'
         CHECK(run.markers(win::run_stop_token(kBudgetExceededToken, 1)) == 1);
     }
     SECTION("filling the cap exactly with nothing left to read is complete, not truncated") {
-        run.output.b.max_bytes = reserved + per_profile;
+        run.output.budget.max_bytes = reserved + per_profile;
         run.go({profile_of("alice", kSidAlice)}, hklm, read);
         CHECK(run.stops(kBudgetExceededToken) == 0);
         CHECK(run.rows_of("alice\\-") == kCategories.size());
     }
     SECTION("HKLM is charged first: a profile that fits alone is dropped when HKLM's rows leave no room") {
-        run.output.b.max_bytes = per_profile;
+        run.output.budget.max_bytes = per_profile;
         run.go({profile_of("alice", kSidAlice)}, hklm, read);
         CHECK(run.markers(win::run_stop_token(kBudgetExceededToken, 1)) == 1);
         CHECK(run.rows_of("alice\\-") == 0);
@@ -1282,7 +1284,7 @@ TEST_CASE("win::assemble_windows_rows: the per-source budget marker, source-leve
         run.go({}, hklm_camera_deny(), allow, discovery);
         REQUIRE_FALSE(run.rows.empty());
         CHECK(run.rows.front().raw == "profile_list:win32_5");
-        CHECK(run.output.b.bytes - bare.output.b.bytes == OutputBudget::cost(discovery));
+        CHECK(run.output.budget.bytes - bare.output.budget.bytes == OutputBudget::cost(discovery));
     }
     SECTION("a profile refused with `timeout` ends the run: one collection:timeout row, no later read") {
         run.go(two, hklm_camera_deny(), [&](const ProfileInfo&) {
@@ -1642,11 +1644,11 @@ TEST_CASE("OutputBudget: counts the formatted row, escapes and separator include
     CHECK(kMaxRunOutputBytes == 16u * 1024u * 1024u);
     CHECK(kBudgetExceededToken == "collection:budget_exceeded");
     OutputBudget b;
-    b.b.max_bytes = 10;
+    b.budget.max_bytes = 10;
     const std::vector<PermissionRow> rows{
         {"macos", "abcd", "camera", PermissionState::allowed, "12", "-", "-", false}};
     b.charge(rows);
-    CHECK(b.b.bytes == format_row(rows[0]).size() + 1);
+    CHECK(b.budget.bytes == format_row(rows[0]).size() + 1);
     CHECK(b.exhausted()); // 45 bytes against a 10-byte cap: every field counts, not two of them
     // Escape expansion is charged: a pipe-dense client costs its escaped length.
     OutputBudget plain, dense;
@@ -1656,7 +1658,7 @@ TEST_CASE("OutputBudget: counts the formatted row, escapes and separator include
                                         "-", "-", false}};
     plain.charge(p);
     dense.charge(d);
-    CHECK(dense.b.bytes == plain.b.bytes + 4);
+    CHECK(dense.budget.bytes == plain.budget.bytes + 4);
     CHECK_FALSE(OutputBudget{}.exhausted());
 }
 
@@ -1816,5 +1818,5 @@ TEST_CASE("OutputBudget::charge allocates (format_row), so it must not be noexce
           "[privacy_permissions][macos_parsers]") {
     OutputBudget b;
     static_assert(!noexcept(b.charge(std::span<const PermissionRow>{})));
-    CHECK(b.b.bytes == 0);
+    CHECK(b.budget.bytes == 0);
 }

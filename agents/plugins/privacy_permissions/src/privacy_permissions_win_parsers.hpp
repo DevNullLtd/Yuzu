@@ -33,6 +33,8 @@
 #include <utility>
 #include <vector>
 
+#include <row_byte_budget.hpp>
+
 #include "privacy_permissions_parsers.hpp"
 #include "user_profile_model.hpp"
 
@@ -150,7 +152,8 @@ struct RetentionBudget {
 };
 
 inline constexpr std::string_view kTimeoutToken = "collection:timeout";
-/// The `<profile>:profile_list_backup` cause: a `<SID>.bak` ProfileList entry, named and never read.
+/// The `<profile>:profile_list_backup` cause: a `<SID>.bak` ProfileList entry, named and never
+/// read.
 inline constexpr std::string_view kProfileListBackupSuffix = "profile_list_backup";
 
 /// The run-level stop row: `<base>:profiles_skipped_<n>`, n = profiles never emitted (those after
@@ -584,9 +587,11 @@ using ReadProfileFn = std::function<ProfileRead(const profiles::ProfileInfo&)>;
 /// the shell used to make inline, so each is unit-observable on every host: HKLM's rows are
 /// RESERVED in the run-wide `output` before any profile is charged; a profile's rows are charged
 /// as a unit and one that would cross the cap is not emitted; the run stops, with exactly one
-/// `collection:budget_exceeded` row, when the cap is crossed OR already exactly filled with
-/// profiles left (the bytes check at the loop top, not only the commit refusal); an expired
-/// deadline stops it with one `collection:timeout` row; an overriding HKLM Deny is HKLM's own row
+/// `collection:budget_exceeded:profiles_skipped_<n>` row, when the cap is crossed OR already
+/// exactly filled with profiles left (the bytes check at the loop top, not only the commit
+/// refusal); an expired deadline stops it with one `collection:timeout:profiles_skipped_<n>` row
+/// (n = the profiles never emitted, see run_stop_token); a `<SID>.bak` ProfileList entry is named
+/// (`<profile>:profile_list_backup`) and never read; an overriding HKLM Deny is HKLM's own row
 /// only when no profile was reachable to carry it (a profile whose ConsentStore was refused as
 /// unstable is not reachable). `budget` is as the HKLM walk left it; `discovery_rows` (ProfileList
 /// failures, built by the shell) lead the profile rows. The caller runs fill_uncovered_categories
@@ -659,9 +664,6 @@ using ReadProfileFn = std::function<ProfileRead(const profiles::ProfileInfo&)>;
         const std::string profile_row_id = qualify_app_id(pname, "-");
         std::vector<PermissionRow> prof;
 
-        // The SID is appended to HKEY_USERS by the shell (and by with_user_hive): a malformed or
-        // empty one must never open the HKU root or some other key in place of this profile's own
-        // hive, so it is refused here, before any read is injected.
         // A `<SID>.bak` entry is named, not read (its folder may hold the user's real hive): it
         // must be tested first, since the suffix makes the string an invalid SID.
         if (profiles::is_profile_backup_entry(profile.sid)) {
@@ -670,6 +672,9 @@ using ReadProfileFn = std::function<ProfileRead(const profiles::ProfileInfo&)>;
             if (!commit(prof, false)) break;
             continue;
         }
+        // The SID is appended to HKEY_USERS by the shell (and by with_user_hive): a malformed or
+        // empty one must never open the HKU root or some other key in place of this profile's own
+        // hive, so it is refused here, before any read is injected.
         if (!is_valid_sid_string(profile.sid)) {
             prof.push_back(
                 failure_row("windows", profile_row_id, "-", false, pname + ":invalid_sid", acc));
@@ -754,7 +759,8 @@ using ReadProfileFn = std::function<ProfileRead(const profiles::ProfileInfo&)>;
         rows.push_back(failure_row("windows", "-", "-", false,
                                    run_stop_token(kBudgetExceededToken, skipped), acc));
     if (budget.timed_out)
-        rows.push_back(failure_row("windows", "-", "-", false, run_stop_token(kTimeoutToken, skipped), acc));
+        rows.push_back(failure_row("windows", "-", "-", false,
+                                   run_stop_token(kTimeoutToken, skipped), acc));
     return rows;
 }
 

@@ -847,7 +847,8 @@ TEST_CASE("privacy_permissions macOS: one run deadline covers every source, and 
             read_tcc_source({}, system_db, false, sys.rows, sys.acc);
             macos::OutputBudget probe;
             probe.charge(sys.rows);
-            output.b.max_bytes = probe.b.bytes + 1; // the system db stays under it; one home's rows do not
+            // The system db stays under it; one home's rows do not.
+            output.budget.max_bytes = probe.budget.bytes + 1;
         }
         read_all_sources(r.rows, r.acc, system_db, users.string(), {}, output);
         CHECK(from("a"));

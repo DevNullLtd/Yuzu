@@ -26,14 +26,16 @@
  * if there are more than 64. The guard's logic is privacy_permissions_hive_guard.hpp's
  * HiveFileGuard over a HiveFileProbe, implemented here by Win32HiveFileProbe. RegLoadKeyW is
  * path-based, so the same file identity is re-verified after the load and a mismatch is unloaded
- * unread (`hive_identity_changed`). Residual: the kernel parses whatever the path resolved to in that
- * window, as it does for every `reg load`; a sidecar swapped in after its check is likewise open.
+ * unread (`hive_identity_changed`). Residual: the kernel parses whatever the path resolved to in
+ * that window, as it does for every `reg load`; a sidecar swapped in after its check is likewise
+ * open.
  *
  * STABILITY: a RegNotifyChangeKeyValue watch is armed on each ConsentStore root before its walk
  * and polled after; a change the API reports discards that read and the source is walked ONCE more
  * (never once the deadline has passed); a source that changed again during its one re-walk, or
  * whose deadline left no time for one, is refused (`changed_during_read`), and a watch that cannot
- * be created, armed or polled refuses it too -- failure to observe stability is never stability. Residual: a RegRestoreKey-style whole-key replacement is not reported.
+ * be created, armed or polled refuses it too -- failure to observe stability is never stability.
+ * Residual: a RegRestoreKey-style whole-key replacement is not reported.
  *
  * DEADLINE: ~15 s, COOPERATIVE -- checked before each profile, first thing in the hive-file
  * guard's before_load, and before each capability and each app key open; there is no detached
@@ -42,8 +44,9 @@
  * is one enumeration of at most 4,096 children, the capability-level key opens, or one key's
  * value reads, so a dispatch can overrun it.
  *
- * SEAMS: the registry walk (privacy_permissions_win_walk.hpp) reads the OS through win::RegistryReader,
- * implemented here by Win32Registry; fake-registry tests lock its branches on every host.
+ * SEAMS: the registry walk (privacy_permissions_win_walk.hpp) reads the OS through
+ * win::RegistryReader, implemented here by Win32Registry; fake-registry tests lock its branches on
+ * every host.
  *
  * PRECEDENCE (win_parsers.hpp merge_with_hklm, unit-tested): Microsoft's documented Settings
  * model, confirmed on the-rig 2026-09-23 (a non-MDM Windows 11 host: HKLM `<capability>` `Value
@@ -102,7 +105,6 @@
 #include <spdlog/spdlog.h>
 
 #include <win_profiles.hpp>
-#include <win_reg_handle.hpp>
 #include <win_str.hpp>
 
 #include <aclapi.h>
@@ -194,9 +196,9 @@ struct Win32Registry final : win::RegistryReader {
                      std::span<std::byte> buf, std::uint32_t& size) override {
         DWORD t = 0;
         DWORD sz = static_cast<DWORD>(buf.size());
-        const LONG rc = RegQueryValueExW(static_cast<HKEY>(key), value_name, nullptr, &t,
-                                         buf.empty() ? nullptr : reinterpret_cast<BYTE*>(buf.data()),
-                                         &sz);
+        const LONG rc = RegQueryValueExW(
+            static_cast<HKEY>(key), value_name, nullptr, &t,
+            buf.empty() ? nullptr : reinterpret_cast<BYTE*>(buf.data()), &sz);
         type = t;
         size = sz;
         return rc;
@@ -212,6 +214,8 @@ struct Win32Registry final : win::RegistryReader {
         return yuzu::win::from_wide(s.data(), static_cast<int>(s.size()));
     }
     std::string reg_sz_utf8(std::span<const std::byte> payload) const override {
+        // payload is read_one_grant's heap vector (operator-new aligned, so wchar_t-aligned);
+        // a non-owning view.
         return yuzu::win::reg_sz_to_utf8(reinterpret_cast<const wchar_t*>(payload.data()),
                                          static_cast<DWORD>(payload.size()));
     }
@@ -433,7 +437,8 @@ int collect_windows_permissions(yuzu::CommandContext& ctx) {
         win::ProfileRead rd;
         yuzu::win::HiveAccessReport report;
         Win32HiveFileProbe probe;
-        win::HiveFileGuard guard{probe, [&] { return budget.expired(); }, profile.sid, std::nullopt};
+        win::HiveFileGuard guard{probe, [&] { return budget.expired(); }, profile.sid,
+                                 std::nullopt};
         const yuzu::win::OfflineHiveFileCheck check{
             [&](const std::wstring& p) { return guard.before_load(p); },
             [&](const std::wstring& p) { return guard.after_load(p); }};
@@ -450,7 +455,8 @@ int collect_windows_permissions(yuzu::CommandContext& ctx) {
         try {
             rd.status = yuzu::win::with_user_hive(
                 profile.sid, profile.profile_path,
-                [&](HKEY root) { rd.walk = win::walk_consent_store(reg, root, budget); }, &report, &check);
+                [&](HKEY root) { rd.walk = win::walk_consent_store(reg, root, budget); }, &report,
+                &check);
         } catch (...) {
             // The ABI catch turns this into `internal_error`, which carries no row token, so the
             // agent log is the only place the mount name (the actionable fact) can go.

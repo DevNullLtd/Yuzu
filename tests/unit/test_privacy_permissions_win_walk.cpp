@@ -44,9 +44,9 @@ struct FakeNode {
 wchar_t fold(wchar_t c) { return (c >= L'A' && c <= L'Z') ? static_cast<wchar_t>(c + 32) : c; }
 
 bool ascii_ieq(std::wstring_view a, std::wstring_view b) {
-    return a.size() == b.size() && std::equal(a.begin(), a.end(), b.begin(), [](wchar_t x, wchar_t y) {
-               return fold(x) == fold(y);
-           });
+    return a.size() == b.size() &&
+           std::equal(a.begin(), a.end(), b.begin(),
+                      [](wchar_t x, wchar_t y) { return fold(x) == fold(y); });
 }
 
 std::vector<std::byte> sz16(std::string_view ascii) { // UTF-16LE + NUL, as REG_SZ stores it
@@ -110,8 +110,12 @@ struct FakeRegistry final : win::RegistryReader {
         parent->children.emplace_back(std::move(name), n);
         return n;
     }
-    static void set(FakeNode* n, const wchar_t* name, FakeValue v) { n->values[name] = std::move(v); }
-    static void set_sz(FakeNode* n, std::string_view v) { set(n, L"Value", {win::kRegSz, sz16(v), false}); }
+    static void set(FakeNode* n, const wchar_t* name, FakeValue v) {
+        n->values[name] = std::move(v);
+    }
+    static void set_sz(FakeNode* n, std::string_view v) {
+        set(n, L"Value", {win::kRegSz, sz16(v), false});
+    }
     FakeNode* store() { return path(root, std::wstring{win::kConsentStorePath}); }
 
     long open_key(win::RegKeyHandle parent, const wchar_t* name, win::RegKeyHandle& out) override {
@@ -155,7 +159,8 @@ struct FakeRegistry final : win::RegistryReader {
         return win::kErrorFileNotFound;
     }
     std::unique_ptr<win::ConsentStoreWatch> watch(win::RegKeyHandle) override {
-        const unsigned long rc = watches < watch_script.size() ? watch_script[watches] : win::kWaitTimeout;
+        const unsigned long rc =
+            watches < watch_script.size() ? watch_script[watches] : win::kWaitTimeout;
         ++watches;
         return std::make_unique<FakeWatch>(rc);
     }
@@ -172,7 +177,8 @@ struct FakeRegistry final : win::RegistryReader {
     std::string reg_sz_utf8(std::span<const std::byte> payload) const override {
         std::string out;
         for (std::size_t i = 0; i + 1 < payload.size(); i += 2) {
-            const auto lo = static_cast<unsigned>(payload[i]), hi = static_cast<unsigned>(payload[i + 1]);
+            const auto lo = static_cast<unsigned>(payload[i]);
+            const auto hi = static_cast<unsigned>(payload[i + 1]);
             if (lo == 0 && hi == 0) break;
             out.push_back(hi == 0 && lo < 0x80 ? static_cast<char>(lo) : '?');
         }
@@ -180,20 +186,24 @@ struct FakeRegistry final : win::RegistryReader {
     }
 };
 
-const win::RawGrant* find(const std::vector<win::RawGrant>& v, std::string_view app, std::string_view cat) {
+const win::RawGrant* find(const std::vector<win::RawGrant>& v, std::string_view app,
+                          std::string_view cat) {
     for (const auto& g : v)
         if (g.app_id == app && g.category == cat) return &g;
     return nullptr;
 }
 
-std::size_t count_app(const std::vector<win::RawGrant>& v, std::string_view app, std::string_view cat) {
-    return static_cast<std::size_t>(std::count_if(
-        v.begin(), v.end(), [&](const win::RawGrant& g) { return g.app_id == app && g.category == cat; }));
+std::size_t count_app(const std::vector<win::RawGrant>& v, std::string_view app,
+                      std::string_view cat) {
+    return static_cast<std::size_t>(std::count_if(v.begin(), v.end(), [&](const win::RawGrant& g) {
+        return g.app_id == app && g.category == cat;
+    }));
 }
 
 bool has_cause(const std::vector<win::RawGrant>& v, std::string_view cat, std::string_view cause) {
-    return std::any_of(v.begin(), v.end(),
-                       [&](const win::RawGrant& g) { return g.category == cat && g.cause == cause; });
+    return std::any_of(v.begin(), v.end(), [&](const win::RawGrant& g) {
+        return g.category == cat && g.cause == cause;
+    });
 }
 
 win::ConsentWalk walk(FakeRegistry& reg, win::RetentionBudget& budget) {
@@ -260,8 +270,10 @@ TEST_CASE("win walk: value shapes -- ERROR_MORE_DATA, oversized, empty and wrong
     auto* st = reg.store();
     reg.path(st, L"webcam");
     auto* more = reg.path(st, L"webcam\\Pkg.More");
-    FakeRegistry::set(more, L"Value", {win::kRegSz, sz16("Allow"), true}); // grows between the calls
-    FakeRegistry::set(more, L"LastUsedTimeStart", {win::kRegQword, std::vector<std::byte>(16), false});
+    // Value grows between the calls.
+    FakeRegistry::set(more, L"Value", {win::kRegSz, sz16("Allow"), true});
+    FakeRegistry::set(more, L"LastUsedTimeStart",
+                      {win::kRegQword, std::vector<std::byte>(16), false});
     FakeRegistry::set(reg.path(st, L"webcam\\Pkg.Big"), L"Value",
                       {win::kRegSz, std::vector<std::byte>(win::kMaxConsentValueBytes + 2), false});
     FakeRegistry::set(reg.path(st, L"webcam\\Pkg.Empty"), L"Value", {win::kRegSz, {}, false});
@@ -286,8 +298,8 @@ TEST_CASE("win walk: value shapes -- ERROR_MORE_DATA, oversized, empty and wrong
     CHECK(find(w.grants, "Pkg.Dword", "camera")->cause == "value_type_4");
 }
 
-TEST_CASE("win walk: a zero-length or NUL-bearing child name is skipped and counted, never reopened "
-          "(an empty name would reopen the PARENT)",
+TEST_CASE("win walk: a zero-length or NUL-bearing child name is skipped and counted, never "
+          "reopened (an empty name would reopen the PARENT)",
           "[privacy_permissions][win_walk]") {
     FakeRegistry reg;
     auto* st = reg.store();
@@ -340,7 +352,8 @@ TEST_CASE("win walk: a store that changed during the read is walked once more, t
     FakeRegistry::set_sz(reg.path(st, L"webcam"), "Allow");
     win::RetentionBudget budget;
 
-    SECTION("changed on walk 1, stable on walk 2: the grants are kept once, and the counters restarted") {
+    SECTION("changed on walk 1, stable on walk 2: the grants are kept once, the counters "
+            "restarted") {
         reg.watch_script = {win::kWaitObject0, win::kWaitTimeout};
         const auto w = walk(reg, budget);
         CHECK(reg.watches == 2);
@@ -364,7 +377,8 @@ TEST_CASE("win walk: a store that changed during the read is walked once more, t
     }
 }
 
-TEST_CASE("win walk: an expired deadline stops the walk before any key past the store root is opened",
+TEST_CASE("win walk: an expired deadline stops the walk before any key past the store root "
+          "is opened",
           "[privacy_permissions][win_walk]") {
     FakeRegistry reg;
     FakeRegistry::set_sz(reg.path(reg.store(), L"webcam"), "Allow");
@@ -465,8 +479,8 @@ win::SidecarEntry sidecar(const wchar_t* name, std::uint32_t find_attrs = 0) {
 
 } // namespace
 
-TEST_CASE("hive guard: the injected deadline is checked first; UNC, depth and drive refusals make "
-          "no probe call",
+TEST_CASE("hive guard: the injected deadline is checked first; UNC, depth and drive refusals "
+          "open no handle and list nothing",
           "[privacy_permissions][win_walk]") {
     GuardRig r;
     SECTION("an expired deadline: `timeout`, no probe call at all") {
@@ -478,6 +492,7 @@ TEST_CASE("hive guard: the injected deadline is checked first; UNC, depth and dr
     SECTION("a UNC path") {
         CHECK(r.before(L"\\\\server\\share\\NTUSER.DAT") == "hive_path_unc");
         CHECK(r.probe.opens == 0);
+        CHECK(r.probe.list_calls == 0);
     }
     SECTION("deeper than kMaxHivePathDepth") {
         std::wstring deep = L"C:\\";
@@ -485,11 +500,13 @@ TEST_CASE("hive guard: the injected deadline is checked first; UNC, depth and dr
         deep += L"NTUSER.DAT";
         CHECK(r.before(deep) == "hive_path_too_deep");
         CHECK(r.probe.opens == 0);
+        CHECK(r.probe.list_calls == 0);
     }
     SECTION("a drive that is not fixed") {
         r.probe.drive = 4; // DRIVE_REMOTE
         CHECK(r.before() == "hive_path_not_fixed");
         CHECK(r.probe.opens == 0);
+        CHECK(r.probe.list_calls == 0);
     }
     SECTION("a stock file is accepted") { CHECK(r.before().empty()); }
 }

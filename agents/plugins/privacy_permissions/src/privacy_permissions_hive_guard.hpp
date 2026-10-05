@@ -6,21 +6,21 @@
  * windows.h-free by design. The Win32 shell (privacy_permissions_win.cpp's Win32HiveFileProbe)
  * answers one question per probe call -- an attribute word, a leaf's facts from its own handle, a
  * directory listing, a sidecar's link count -- and HiveFileGuard (the OfflineHiveFileCheck hooks'
- * logic) decides: its call order, every refusal token and the sidecar precedence are plain code over
- * HiveFileProbe, locked on every host by a fake probe in
+ * logic) decides: its call order, every refusal token and the sidecar precedence are plain code
+ * over HiveFileProbe, locked on every host by a fake probe in
  * tests/unit/test_privacy_permissions_win_walk.cpp. The pure decision block it routes through
  * (HiveFileFacts, the tokens, classify_hive_file) stays in privacy_permissions_win_parsers.hpp.
  *
- * The deadline is INJECTED (`expired`), so this header depends on neither the run's retention
- * budget nor the permission-row model: it is the unit another consumer can lift whole.
+ * The deadline is INJECTED (`expired`), so the guard's API depends on neither the run's retention
+ * budget nor the permission-row model. The include graph does: this header includes
+ * privacy_permissions_win_parsers.hpp for that decision block, and #5291 lifts the two together
+ * into the shared hive loader.
  *
  * Every fact comes from an opened HANDLE. RegLoadKeyW has no handle-relative form, so the load is
  * by path and the SAME file identity is re-verified from a fresh attribute-only handle after it.
  * Residual: the kernel parses whatever the path resolved to in that window (every `reg load`
  * carries it); swapping the path needs write access to the profile directory.
  */
-
-#include "privacy_permissions_win_parsers.hpp"
 
 #include <array>
 #include <cstddef>
@@ -29,6 +29,8 @@
 #include <optional>
 #include <string>
 #include <vector>
+
+#include "privacy_permissions_win_parsers.hpp"
 
 namespace yuzu::privacy_permissions::win {
 
@@ -43,8 +45,8 @@ inline constexpr std::uint32_t kFileAttributeRecallOnDataAccess = 0x400000;
     return (attrs & kFileAttributeReparsePoint) != 0;
 }
 
-/// Maps a leaf's attribute word to its HiveFileFacts bits. `not_resident` is OFFLINE, RECALL_ON_OPEN
-/// or RECALL_ON_DATA_ACCESS -- never SPARSE_FILE (a resident file can be sparse).
+/// Maps a leaf's attribute word to its HiveFileFacts bits. `not_resident` is OFFLINE,
+/// RECALL_ON_OPEN or RECALL_ON_DATA_ACCESS -- never SPARSE_FILE (a resident file can be sparse).
 inline void apply_attributes(std::uint32_t attrs, HiveFileFacts& f) noexcept {
     f.is_reparse = is_reparse_attribute(attrs);
     f.is_directory = (attrs & kFileAttributeDirectory) != 0;
@@ -77,7 +79,9 @@ struct SidecarEntry {
 
 /// The file system as the guard sees it. Every method is one Win32 step and returns its code
 /// (0 = success); `opens` counts the handle opens an implementation made (a test proves the
-/// deadline-first order with it).
+/// deadline-first order with it). Raw `long` codes and out-parameters by design, an exception to
+/// cpp-conventions' std::expected rule: each method mirrors one Win32 call, and list_sidecars
+/// returns a partial listing beside the code.
 struct HiveFileProbe {
     HiveFileProbe() = default;
     HiveFileProbe(const HiveFileProbe&) = delete;

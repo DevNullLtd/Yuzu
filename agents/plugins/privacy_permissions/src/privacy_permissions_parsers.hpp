@@ -227,18 +227,19 @@ inline constexpr std::string_view kBudgetExceededToken = "collection:budget_exce
 /// source that crosses it (itself bounded) is kept; Windows asks would_exceed() before a
 /// profile's rows are emitted, and charges the machine-wide rows first so they always fit.
 struct OutputBudget {
-    yuzu::shared::RowByteBudget b{yuzu::shared::RowByteBudget::npos, kMaxRunOutputBytes};
+    yuzu::shared::RowByteBudget budget{.max_bytes = kMaxRunOutputBytes};
 
-    [[nodiscard]] bool exhausted() const noexcept { return b.full(); }
+    [[nodiscard]] bool exhausted() const noexcept { return budget.full(); }
     [[nodiscard]] static std::size_t cost(std::span<const PermissionRow> rows) {
         std::size_t n = 0;
         for (const auto& r : rows) n += format_row(r).size() + 1; // +1: the row separator
         return n;
     }
     [[nodiscard]] bool would_exceed(std::span<const PermissionRow> rows) const {
-        return !b.fits(cost(rows), rows.size());
+        return !budget.fits(cost(rows), rows.size());
     }
-    void charge(std::span<const PermissionRow> rows) { b.add(cost(rows), rows.size()); } // allocates; unconditional reserve
+    // Allocates: the unconditional reserve.
+    void charge(std::span<const PermissionRow> rows) { budget.add(cost(rows), rows.size()); }
 };
 
 // ── status selection (pure; the one decision every leg shares) ──────────

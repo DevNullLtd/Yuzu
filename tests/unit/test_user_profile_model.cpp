@@ -43,7 +43,8 @@ TEST_CASE("is_system_sid: a real user SID is not a system SID", "[profiles]") {
 
 // ── is_profile_backup_entry ───────────────────────────────────────────────
 
-TEST_CASE("is_profile_backup_entry: a `.bak` suffix, any case, on a non-empty key name", "[profiles]") {
+TEST_CASE("is_profile_backup_entry: a `.bak` suffix, any case, on a non-empty key name",
+          "[profiles]") {
     CHECK(is_profile_backup_entry("S-1-5-21-1-2-3-1001.bak"));
     CHECK(is_profile_backup_entry("S-1-5-21-1-2-3-1001.BAK"));
     CHECK_FALSE(is_profile_backup_entry("S-1-5-21-1-2-3-1001"));

@@ -24,10 +24,10 @@
 namespace yuzu::shared {
 
 struct RowByteBudget {
-    static constexpr std::size_t npos = std::numeric_limits<std::size_t>::max();
+    static constexpr std::size_t kUnbounded = std::numeric_limits<std::size_t>::max();
 
-    std::size_t max_rows = npos;
-    std::size_t max_bytes = npos;
+    std::size_t max_rows = kUnbounded;
+    std::size_t max_bytes = kUnbounded;
     std::size_t rows = 0;
     std::size_t bytes = 0;
     bool refused = false;
@@ -47,8 +47,8 @@ struct RowByteBudget {
     }
 
     void add(std::size_t n_bytes, std::size_t n_rows = 1) noexcept {
-        rows = n_rows > npos - rows ? npos : rows + n_rows;
-        bytes = n_bytes > npos - bytes ? npos : bytes + n_bytes;
+        rows = n_rows > kUnbounded - rows ? kUnbounded : rows + n_rows;
+        bytes = n_bytes > kUnbounded - bytes ? kUnbounded : bytes + n_bytes;
     }
 
     [[nodiscard]] bool full() const noexcept { return rows >= max_rows || bytes >= max_bytes; }
