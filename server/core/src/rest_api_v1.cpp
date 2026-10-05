@@ -1054,7 +1054,7 @@ const std::string& openapi_spec() {
       "get": {"summary": "Query audit log", "tags": ["Audit"], "parameters": [{"name": "limit", "in": "query", "schema": {"type": "integer", "default": 100, "minimum": 1, "maximum": 1000}}, {"name": "principal", "in": "query", "schema": {"type": "string"}}, {"name": "action", "in": "query", "schema": {"type": "string"}}], "responses": {"200": {"description": "List of audit events"}, "400": {"description": "limit below 1 (a client error, deliberately NOT reported as a store degrade)"}, "503": {"description": "Audit store or connection pool unavailable — deny-on-degrade, never a false-empty 200"}}}
     },
     "/audit/auth-sample": {
-      "get": {"summary": "Sampled authentication-log evidence export (SOC 2 CC7.2)", "tags": ["Audit"], "description": "Pseudo-random sample of authentication-surface audit events (action prefixes auth./mfa./session.) over an optional [from,to] window. Requires AuditLog:Read. The export is itself audited as audit.auth_sample.exported. SAMPLING NOTE: the sample is drawn from at most the 10000 most-recent matching events in the window; when the window holds more than that, the sample is recency-biased (NOT uniform over the full window). The response `sampling` object reports `candidates_considered`, `scan_cap`, and `recency_capped` so evidence consumers can detect this. Samples are non-reproducible (no seed); the audited `audit.auth_sample.exported` row is the chain-of-custody record.", "parameters": [{"name": "from", "in": "query", "schema": {"type": "integer"}, "description": "Window start, epoch seconds (optional, digits only)"}, {"name": "to", "in": "query", "schema": {"type": "integer"}, "description": "Window end, epoch seconds (optional, digits only)"}, {"name": "limit", "in": "query", "schema": {"type": "integer", "default": 100, "maximum": 1000}}], "responses": {"200": {"description": "Sampled list of auth audit events; envelope adds a `sampling` object (candidates_considered, scan_cap, recency_capped)"}, "400": {"description": "from/to not non-negative digits, from>to, or non-integer limit"}, "503": {"description": "Audit store unavailable"}}}
+      "get": {"summary": "Sampled authentication-log evidence export (SOC 2 CC7.2)", "tags": ["Audit"], "description": "Pseudo-random sample of authentication-surface audit events (action prefixes auth./mfa./session.) over an optional [from,to] window. Requires AuditLog:Read. The export is itself audited as audit.auth_sample.exported. SAMPLING NOTE: the sample is drawn from at most the 10000 most-recent matching events in the window; when the window holds more than that, the sample is recency-biased (NOT uniform over the full window). The response `sampling` object reports `candidates_considered`, `scan_cap`, and `recency_capped` so evidence consumers can detect this. Samples are non-reproducible (no seed); the audited `audit.auth_sample.exported` row is the chain-of-custody record.", "parameters": [{"name": "from", "in": "query", "schema": {"type": "integer", "minimum": 0}, "description": "Window start, epoch seconds (optional, digits only). Omit for no lower bound; 0 is accepted and matches the same rows as omitting it."}, {"name": "to", "in": "query", "schema": {"type": "integer", "minimum": 1}, "description": "Window end, epoch seconds (optional, digits only). Omit for no upper bound; 0 is rejected with 400 (0 is not a way to say unbounded)."}, {"name": "limit", "in": "query", "schema": {"type": "integer", "default": 100, "maximum": 1000}}], "responses": {"200": {"description": "Sampled list of auth audit events; envelope adds a `sampling` object (candidates_considered, scan_cap, recency_capped)"}, "400": {"description": "from/to not non-negative digits, to=0, from>to, or non-integer limit"}, "503": {"description": "Audit store unavailable"}}}
     },)json"
         // Split again (MSVC C2026 16,380-byte cap) — A2's rbac/roles/{name}/
         // assignments entries pushed this segment over the limit; concatenated
@@ -1067,7 +1067,7 @@ const std::string& openapi_spec() {
       "get": {"summary": "Get inventory data for a specific agent and plugin", "tags": ["Inventory"], "parameters": [{"name": "agent_id", "in": "path", "required": true, "schema": {"type": "string"}}, {"name": "plugin", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Inventory record"}, "404": {"description": "No inventory data found"}}}
     },
     "/inventory/query": {
-      "post": {"summary": "Query inventory across agents with filter expression", "tags": ["Inventory"], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "properties": {"agent_id": {"type": "string", "description": "Filter by agent ID"}, "plugin": {"type": "string", "description": "Filter by plugin name"}, "since": {"type": "integer", "description": "Only records after this epoch"}, "until": {"type": "integer", "description": "Only records before this epoch"}, "limit": {"type": "integer", "default": 100}}}}}}, "responses": {"200": {"description": "Matching inventory records"}}}
+      "post": {"summary": "Query inventory across agents with filter expression", "tags": ["Inventory"], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "properties": {"agent_id": {"type": "string", "description": "Filter by agent ID"}, "plugin": {"type": "string", "description": "Filter by plugin name"}, "since": {"type": "integer", "minimum": 0, "description": "Inclusive lower bound on collected_at, epoch seconds. Omit for no lower bound; 0 is accepted and matches the same rows as omitting it; a negative value or a non-integer is rejected with 400."}, "until": {"type": "integer", "minimum": 1, "description": "Inclusive upper bound on collected_at, epoch seconds. Omit for no upper bound; 0, a negative value or a non-integer is rejected with 400 (0 is not a way to say unbounded)."}, "limit": {"type": "integer", "default": 100}}}}}}, "responses": {"200": {"description": "Matching inventory records"}}}
     },
     "/inventory/software": {
       "get": {"summary": "Fleet-wide installed-software inventory (typed daily-sync store, ADR-0016)", "tags": ["Inventory"], "description": "Installed-software rows across the fleet from the typed SoftwareInventoryStore (DISTINCT from the generic /inventory/* routes, which read the generic blob store). Rows carry name, version, publisher, install_date plus the blob-v2 package fields: kind (package|app|pkg|feat), ecosystem (rpm|deb|apk|pacman|windows|macos|macos_pkgutil|brew|optional_feature), epoch, release, arch, signature_status (rpm stored-tag), distro_id, distro_version — fields an ecosystem does not store are empty, never synthesised. Requires Inventory:Read (#3290 Phase 2: the SOLE gate is the ADR-0017 admit-then-filter fleet-read gate, never stacked with a separate permission check). Results are scoped to the caller's management groups AND, for a service-scoped API token, to that token's service-tagged agents (the intersection of both when both apply); out-of-scope devices are dropped and counted in devices_omitted (a positive value means matching software exists outside your scope — an empty/short result does NOT mean the software is absent fleet-wide). A correctly-confined service-scoped token now gets a real filtered read here rather than an outright 403. Capped at limit rows (max 1000); result_truncated_by_cap=true means more exist past the cap (keyset pagination is a follow-up). On store degradation, or the caller's tag-scope lookup degrading, the endpoint returns 503 (never an empty 200) so a vulnerability query cannot read a transient outage as 'installed nowhere'.", "parameters": [{"name": "name", "in": "query", "schema": {"type": "string"}, "description": "Exact software-name filter (optional)"}, {"name": "agent_id", "in": "query", "schema": {"type": "string"}, "description": "Exact agent filter (optional)"}, {"name": "limit", "in": "query", "schema": {"type": "integer", "default": 100, "maximum": 1000}}], "responses": {"200": {"description": "{data:{software[], count, devices_omitted, result_truncated_by_cap?, audit_persisted?}}"}, "400": {"description": "Non-integer limit"}, "401": {"description": "Unauthenticated"}, "403": {"description": "No management-group grant for Inventory:Read (or a service-scoped token whose RBAC/ITServiceOwner grant is missing/RBAC disabled)"}, "503": {"description": "Software inventory store unavailable/degraded, RBAC/management-group/tag store unavailable, or the fleet-read gate unwired"}}}
@@ -1493,10 +1493,10 @@ const std::string& openapi_spec() {
       "get": {"summary": "Fleet-wide execution summary", "tags": ["Executions"], "description": "Requires Execution:Read. Aggregate counters over the ExecutionTracker fleet summary.", "responses": {"200": {"description": "{total_executions, executions_today, active_agents, overall_success_rate, avg_duration_seconds}"}}}
     },
     "/execution-statistics/agents": {
-      "get": {"summary": "Per-agent execution statistics", "tags": ["Executions"], "description": "Requires Execution:Read, gated via the ADR-0017 admit-then-filter fleet-read chokepoint (#3526): a management-group-confined caller sees only rows for the agents it can see, filtered in SQL before the limit; a global grant sees every agent. A malformed since or limit is a 400, and a negative since is a 400.", "parameters": [{"name": "agent_id", "in": "query", "required": false, "schema": {"type": "string"}, "description": "Filter to a single agent"}, {"name": "since", "in": "query", "required": false, "schema": {"type": "integer"}, "description": "Unix timestamp — only executions after this time"}, {"name": "limit", "in": "query", "required": false, "schema": {"type": "integer"}, "description": "Max results (default 50, clamped to 1000)"}], "responses": {"200": {"description": "List, one row per agent: {agent_id, total_executions, success_count, failure_count, success_rate, avg_duration_seconds, last_execution_at}"}, "400": {"description": "since or limit is not one base-10 integer, or since is negative"}, "403": {"description": "Insufficient permission (Execution:Read)"}}}
+      "get": {"summary": "Per-agent execution statistics", "tags": ["Executions"], "description": "Requires Execution:Read, gated via the ADR-0017 admit-then-filter fleet-read chokepoint (#3526): a management-group-confined caller sees only rows for the agents it can see, filtered in SQL before the limit; a global grant sees every agent. A malformed since or limit is a 400, and a negative since is a 400.", "parameters": [{"name": "agent_id", "in": "query", "required": false, "schema": {"type": "string"}, "description": "Filter to a single agent"}, {"name": "since", "in": "query", "required": false, "schema": {"type": "integer", "minimum": 0}, "description": "Inclusive lower bound on dispatched_at, epoch seconds. Omit for no lower bound; 0 is accepted and matches the same rows as omitting it; a negative value is rejected with 400."}, {"name": "limit", "in": "query", "required": false, "schema": {"type": "integer"}, "description": "Max results (default 50, clamped to 1000)"}], "responses": {"200": {"description": "List, one row per agent: {agent_id, total_executions, success_count, failure_count, success_rate, avg_duration_seconds, last_execution_at}"}, "400": {"description": "since or limit is not one base-10 integer, or since is negative"}, "403": {"description": "Insufficient permission (Execution:Read)"}}}
     },
     "/execution-statistics/definitions": {
-      "get": {"summary": "Per-InstructionDefinition execution statistics", "tags": ["Executions"], "description": "Requires Execution:Read.", "parameters": [{"name": "definition_id", "in": "query", "required": false, "schema": {"type": "string"}, "description": "Filter to a single definition"}, {"name": "since", "in": "query", "required": false, "schema": {"type": "integer"}, "description": "Unix timestamp — only executions after this time"}, {"name": "limit", "in": "query", "required": false, "schema": {"type": "integer"}, "description": "Max results (default 50, clamped to 1000)"}], "responses": {"200": {"description": "List, one row per definition: {definition_id, total_executions, total_agents, success_rate, avg_duration_seconds}"}}}
+      "get": {"summary": "Per-InstructionDefinition execution statistics", "tags": ["Executions"], "description": "Requires Execution:Read.", "parameters": [{"name": "definition_id", "in": "query", "required": false, "schema": {"type": "string"}, "description": "Filter to a single definition"}, {"name": "since", "in": "query", "required": false, "schema": {"type": "integer", "minimum": 0}, "description": "Inclusive lower bound on dispatched_at, epoch seconds. Omit for no lower bound; 0 is accepted and matches the same rows as omitting it; a negative value is rejected with 400."}, {"name": "limit", "in": "query", "required": false, "schema": {"type": "integer"}, "description": "Max results (default 50, clamped to 1000)"}], "responses": {"200": {"description": "List, one row per definition: {definition_id, total_executions, total_agents, success_rate, avg_duration_seconds}"}}}
     },)json"
         // Fresh literal split (MSVC C2026 16,380-byte cap) — the merge of dev's
         // ROUTES-campaign OpenAPI additions with this branch's own #4027 entries
@@ -8166,9 +8166,9 @@ void RestApiV1::register_routes(
             // std::stoll throws std::out_of_range on overflow (unlike strtoll) — the
             // catch turns that into a 400, so no separate errno/ceiling check is
             // needed. out>=0 rejects negatives.
-            auto parse_epoch = [](const std::string& s, int64_t& out) -> bool {
+            auto parse_epoch = [](const std::string& s, std::optional<int64_t>& out) -> bool {
                 if (s.empty())
-                    return true; // optional — leave default (unbounded that side)
+                    return true; // optional — leave unset (unbounded that side)
                 // Reject leading whitespace / '+' / '-' that std::stoll would
                 // otherwise silently accept (cpp-expert S-1 / UP-9): a strict
                 // digits-only contract, so "non-numeric → 400" is literally true.
@@ -8176,8 +8176,11 @@ void RestApiV1::register_routes(
                     return false;
                 try {
                     size_t consumed = 0;
-                    out = std::stoll(s, &consumed);
-                    return consumed == s.size() && out >= 0; // reject trailing junk
+                    const long long v = std::stoll(s, &consumed);
+                    if (consumed != s.size() || v < 0)
+                        return false; // reject trailing junk and negatives
+                    out = v;
+                    return true;
                 } catch (const std::invalid_argument&) {
                     return false;
                 } catch (const std::out_of_range&) {
@@ -8195,8 +8198,20 @@ void RestApiV1::register_routes(
                     "application/json");
                 return;
             }
+            // `to=0` would bound the sample at the epoch and match nothing; a computed window
+            // that collapsed to 0 used to read as "unbounded" (#4644). `from=0` is a harmless
+            // literal bound (every stored timestamp is positive) and matches exactly what an
+            // omitted `from` matches.
+            if (q.until && *q.until == 0) {
+                res.status = 400;
+                res.set_content(
+                    detail::error_json_a4(400, "to must be a positive epoch second or omitted", cid,
+                                          "omit to for no upper bound, or pass a positive epoch"),
+                    "application/json");
+                return;
+            }
             // Inverted window is a client bug, not "no data" (Hermes L-3).
-            if (q.since > 0 && q.until > 0 && q.since > q.until) {
+            if (q.since && q.until && *q.since > *q.until) {
                 res.status = 400;
                 res.set_content(detail::error_json_a4(400, "from must be <= to", cid,
                                                       "ensure from <= to"),
@@ -8276,8 +8291,8 @@ void RestApiV1::register_routes(
             // the analogous self-auditing export `ca.root_csr.exported` (consistency S1).
             bool audit_emitted = false;
             try {
-                std::string detail = "from=" + std::to_string(q.since) +
-                                     " to=" + std::to_string(q.until) +
+                std::string detail = "from=" + std::to_string(q.since.value_or(0)) +
+                                     " to=" + std::to_string(q.until.value_or(0)) +
                                      " limit=" + std::to_string(q.limit) +
                                      " returned=" + std::to_string(events.size());
                 audit_emitted = audit_fn(req, "audit.auth_sample.exported", "success", "AuditLog",
@@ -8953,8 +8968,14 @@ void RestApiV1::register_routes(
         InventoryQuery q;
         q.agent_id = body.value("agent_id", "");
         q.plugin = body.value("plugin", "");
-        q.since = body.value("since", int64_t{0});
-        q.until = body.value("until", int64_t{0});
+        // #4644: since/until are presence-tracked: omitted is unbounded, a supplied value must be
+        // a JSON integer (`since >= 0`, `until >= 1`), else 400. `body.value()` threw on a
+        // wrong-typed value and treated an explicit 0 as "unbounded".
+        if (const auto bound_err = read_json_epoch_window(body, q.since, q.until)) {
+            res.status = 400;
+            res.set_content(detail::a4_error(res, *bound_err), "application/json");
+            return;
+        }
         q.limit = body.value("limit", 100);
         if (q.limit > 1000)
             q.limit = 1000;
@@ -9434,7 +9455,7 @@ void RestApiV1::register_routes(
                                      "application/json");
                      return;
                  }
-                 if (q.since < 0) {
+                 if (q.since && *q.since < 0) {
                      res.status = 400;
                      res.set_content(detail::a4_error(res, "since must not be negative"),
                                      "application/json");
@@ -9487,7 +9508,7 @@ void RestApiV1::register_routes(
                                      "application/json");
                      return;
                  }
-                 if (q.since < 0) {
+                 if (q.since && *q.since < 0) {
                      res.status = 400;
                      res.set_content(detail::a4_error(res, "since must not be negative"),
                                      "application/json");

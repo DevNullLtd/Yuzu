@@ -313,6 +313,23 @@ std::optional<int64_t> param_int_strict(const nlohmann::json& params, const char
     return params[key].get<int64_t>();
 }
 
+/// PRESENCE-tracked sibling of `param_int_strict` for the epoch-bound arguments (`since`/`until`)
+/// whose query structs hold `std::optional<int64_t>` (#4644). Absent -> `out` stays unset and the
+/// call succeeds (an omitted bound is unbounded); present -> stored as supplied, 0 included
+/// (a literal 0 is NOT a sentinel). Returns false for a present-but-malformed value (wrong JSON
+/// type, or above INT64_MAX): the caller answers -32602. Range rules (`since >= 0`,
+/// `until >= 1`) stay with the caller because they differ per side.
+bool read_optional_epoch_bound(const nlohmann::json& params, const char* key,
+                               std::optional<int64_t>& out) {
+    if (!params.contains(key))
+        return true;
+    const auto v = param_int_strict(params, key, 0);
+    if (!v)
+        return false;
+    out = *v;
+    return true;
+}
+
 /// Boolean sibling of `param_int_strict` above (#2146 A2-R1 governance
 /// finding, same defect class as #2970B): the plain `args.contains(key) &&
 /// args[key].is_boolean()` idiom used across most `*_only` filters silently
@@ -604,8 +621,11 @@ static const ToolDef kTools[] = {
      R"j({"type":"object","properties":{"agent_id":{"type":"string"},"hostname":{"type":"string"},"os":{"type":"string"},"arch":{"type":"string"},"agent_version":{"type":"string"},"tags":{"type":"array","items":{"type":"object","properties":{"key":{"type":"string"},"value":{"type":"string"},"source":{"type":"string"}},"required":["key","value","source"]}}},"required":["agent_id","hostname","os","arch","agent_version","tags"]})j"},
 
     {"query_audit_log",
-     "Query the audit log with filters. Returns timestamped entries showing who did what, when.",
-     R"({"type":"object","properties":{"principal":{"type":"string"},"action":{"type":"string"},"target_type":{"type":"string"},"since":{"type":"integer","description":"Unix epoch lower bound"},"until":{"type":"integer","description":"Unix epoch upper bound"},"limit":{"type":"integer","default":50,"minimum":1,"maximum":500}}})",
+     "Query the audit log with filters. Returns timestamped entries showing who did what, when. "
+     "since and until are inclusive epoch-second bounds: omit one for no bound on that side; "
+     "since of 0 is accepted and matches the same rows as omitting it; a negative since, an "
+     "until of 0 or below, or a bound that is not a JSON integer is rejected with -32602.",
+     R"({"type":"object","properties":{"principal":{"type":"string"},"action":{"type":"string"},"target_type":{"type":"string"},"since":{"type":"integer","minimum":0,"description":"Inclusive lower bound, Unix epoch seconds. Omit for no lower bound; 0 is accepted and matches the same rows as omitting it"},"until":{"type":"integer","minimum":1,"description":"Inclusive upper bound, Unix epoch seconds. Omit for no upper bound; 0 or a negative value is rejected with -32602"},"limit":{"type":"integer","default":50,"minimum":1,"maximum":500}}})",
      R"j({"type":"object","properties":{"entries":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"timestamp":{"type":"integer"},"principal":{"type":"string"},"action":{"type":"string"},"target_type":{"type":"string"},"target_id":{"type":"string"},"detail":{"type":"string"},"result":{"type":"string"}},"required":["id","timestamp","principal","action","target_type","target_id","detail","result"]}}},"required":["entries"]})j"},
 
     {"list_definitions",
@@ -3275,7 +3295,7 @@ static const ToolDef kTools[] = {
      "twin: only rows for agents the caller can see are returned, filtered before the limit, so "
      "a confined caller's empty data array can also mean none of their visible agents match. "
      "Requires Execution:Read.",
-     R"j({"type":"object","properties":{"agent_id":{"type":"string","maxLength":256,"description":"Filter to one agent; omit for every agent"},"since":{"type":"integer","minimum":0,"description":"Only count executions dispatched at/after this epoch-seconds timestamp"},"limit":{"type":"integer","minimum":1,"maximum":1000,"default":50,"description":"Max rows, highest total_executions first"}}})j",
+     R"j({"type":"object","properties":{"agent_id":{"type":"string","maxLength":256,"description":"Filter to one agent; omit for every agent"},"since":{"type":"integer","minimum":0,"description":"Only count executions dispatched at/after this epoch-seconds timestamp. Omit for no lower bound; 0 is accepted and matches the same rows as omitting it"},"limit":{"type":"integer","minimum":1,"maximum":1000,"default":50,"description":"Max rows, highest total_executions first"}}})j",
      R"j({"type":"object","properties":{"data":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"total_executions":{"type":"integer"},"success_count":{"type":"integer"},"failure_count":{"type":"integer"},"success_rate":{"type":"number","description":"Percent, 0-100"},"avg_duration_seconds":{"type":"number"},"last_execution_at":{"type":"integer"}},"required":["agent_id","total_executions","success_count","failure_count","success_rate","avg_duration_seconds","last_execution_at"]}}},"required":["data"]})j"},
 
     {"get_execution_statistics_by_definition",
@@ -3290,7 +3310,7 @@ static const ToolDef kTools[] = {
      "confined by the caller's own management-group scope -- like its REST twin, this "
      "fleet-wide rollup returns rows regardless of the caller's visible-agent set. Requires "
      "Execution:Read.",
-     R"j({"type":"object","properties":{"definition_id":{"type":"string","maxLength":256,"description":"Filter to one instruction definition; omit for every definition"},"since":{"type":"integer","minimum":0,"description":"Only count executions dispatched at/after this epoch-seconds timestamp"},"limit":{"type":"integer","minimum":1,"maximum":1000,"default":50,"description":"Max rows, highest total_executions first"}}})j",
+     R"j({"type":"object","properties":{"definition_id":{"type":"string","maxLength":256,"description":"Filter to one instruction definition; omit for every definition"},"since":{"type":"integer","minimum":0,"description":"Only count executions dispatched at/after this epoch-seconds timestamp. Omit for no lower bound; 0 is accepted and matches the same rows as omitting it"},"limit":{"type":"integer","minimum":1,"maximum":1000,"default":50,"description":"Max rows, highest total_executions first"}}})j",
      R"j({"type":"object","properties":{"data":{"type":"array","items":{"type":"object","properties":{"definition_id":{"type":"string"},"total_executions":{"type":"integer"},"total_agents":{"type":"integer"},"success_rate":{"type":"number","description":"Percent, 0-100"},"avg_duration_seconds":{"type":"number"}},"required":["definition_id","total_executions","total_agents","success_rate","avg_duration_seconds"]}}},"required":["data"]})j"},
 
     {"get_fleet_statistics",
@@ -8330,14 +8350,16 @@ McpServer::HandlerFn McpServer::build_handler(
                 aq.target_type = param_str(args, "target_type");
                 // #4644 Gate 7: the lenient reader turned a wrong-typed bound into 0
                 // ("unbounded") and, before it saturated, wrapped UINT64_MAX to -1, so a
-                // malformed window silently meant "the whole log". Strict: -32602. A
-                // negative bound is refused too: the store applies a bound only above
-                // zero, so a literal -3600 (an underflowed "an hour ago") read as no bound
-                // at all. Zero stays "no bound", like omitting the argument.
-                const auto since_opt = param_int_strict(args, "since", 0);
-                const auto until_opt = param_int_strict(args, "until", 0);
+                // malformed window silently meant "the whole log". Strict: -32602. The
+                // bounds are presence-tracked: omitted is unbounded, a supplied value is a
+                // literal inclusive bound. A negative bound is refused, and so is
+                // `until: 0` (it would bound the read at the epoch, and as a computed
+                // window that collapsed it used to read as "the whole log"). `since: 0` is
+                // a harmless literal bound (every stored timestamp is positive).
+                const bool since_ok = read_optional_epoch_bound(args, "since", aq.since);
+                const bool until_ok = read_optional_epoch_bound(args, "until", aq.until);
                 const auto audit_limit_opt = param_int_strict(args, "limit", 50);
-                if (!since_opt || !until_opt || !audit_limit_opt) {
+                if (!since_ok || !until_ok || !audit_limit_opt) {
                     // retry-hint-exempt: malformed client input (wrong JSON type or
                     // out of signed 64-bit range), not a store fault -- resending the
                     // same value fails identically.
@@ -8347,16 +8369,22 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
-                if (*since_opt < 0 || *until_opt < 0) {
+                if (aq.since && *aq.since < 0) {
+                    // retry-hint-exempt: malformed client input, not a store fault --
+                    // resending the same value fails identically.
+                    res.set_content(error_response(id, kInvalidParams, "since must not be negative"),
+                                    "application/json");
+                    return;
+                }
+                if (aq.until && *aq.until <= 0) {
                     // retry-hint-exempt: malformed client input, not a store fault --
                     // resending the same value fails identically.
                     res.set_content(
-                        error_response(id, kInvalidParams, "since and until must not be negative"),
+                        error_response(id, kInvalidParams,
+                                       "until must be a positive epoch second or omitted"),
                         "application/json");
                     return;
                 }
-                aq.since = *since_opt;
-                aq.until = *until_opt;
                 // Clamp BOTH bounds, in 64-bit BEFORE narrowing — the
                 // query_responses idiom (`:3660`). Upper alone left a
                 // negative or zero `limit` reaching `AuditStore::query`,
@@ -21242,8 +21270,10 @@ McpServer::HandlerFn McpServer::build_handler(
                         return;
                     }
                 }
-                const auto since_opt = param_int_strict(args, "since", 0);
-                if (!since_opt) {
+                // `since` is presence-tracked (#4644): omitted is unbounded, a supplied value
+                // is a literal inclusive bound on dispatched_at, and `since: 0` is a harmless
+                // literal bound (every stored dispatched_at is non-negative).
+                if (!read_optional_epoch_bound(args, "since", q.since)) {
                     // retry-hint-exempt: malformed client input (wrong JSON
                     // type), not a store/query fault -- resending the same value
                     // fails identically.
@@ -21251,14 +21281,13 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
-                if (*since_opt < 0) {
+                if (q.since && *q.since < 0) {
                     // retry-hint-exempt: schema declares minimum:0; param_int_strict
                     // itself does not range-check.
                     res.set_content(a4_error(kInvalidParams, "since must not be negative"),
                                     "application/json");
                     return;
                 }
-                q.since = *since_opt;
                 const auto limit_opt = param_int_strict(args, "limit", 50);
                 if (!limit_opt) {
                     // retry-hint-exempt: malformed client input (wrong JSON
@@ -21336,8 +21365,10 @@ McpServer::HandlerFn McpServer::build_handler(
                         return;
                     }
                 }
-                const auto since_opt = param_int_strict(args, "since", 0);
-                if (!since_opt) {
+                // `since` is presence-tracked (#4644): omitted is unbounded, a supplied value
+                // is a literal inclusive bound on dispatched_at, and `since: 0` is a harmless
+                // literal bound (every stored dispatched_at is non-negative).
+                if (!read_optional_epoch_bound(args, "since", q.since)) {
                     // retry-hint-exempt: malformed client input (wrong JSON
                     // type), not a store/query fault -- resending the same value
                     // fails identically.
@@ -21345,14 +21376,13 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
-                if (*since_opt < 0) {
+                if (q.since && *q.since < 0) {
                     // retry-hint-exempt: schema declares minimum:0; param_int_strict
                     // itself does not range-check.
                     res.set_content(a4_error(kInvalidParams, "since must not be negative"),
                                     "application/json");
                     return;
                 }
-                q.since = *since_opt;
                 const auto limit_opt = param_int_strict(args, "limit", 50);
                 if (!limit_opt) {
                     // retry-hint-exempt: malformed client input (wrong JSON

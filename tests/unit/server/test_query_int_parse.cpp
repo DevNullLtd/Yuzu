@@ -8,6 +8,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/generators/catch_generators.hpp>
+#include <nlohmann/json.hpp>
 
 #include <cstdint>
 #include <limits>
@@ -149,5 +150,72 @@ TEST_CASE("reject_bad_rollout_pct answers 400 with a constant toast and an A4 bo
               std::string::npos);
         CHECK(res.body.find("rollout_pct") != std::string::npos);
         CHECK(res.body.find("\"error\"") != std::string::npos);
+    }
+}
+
+// The JSON-body twin of `apply_response_numeric_params`' since/until rule, shared by the legacy and
+// v1 inventory query routes (#4644): omitted is unbounded, `since` is `>= 0`, `until` is `>= 1`.
+TEST_CASE("read_json_epoch_window: presence-tracked bounds, until of zero refused",
+          "[query_int_parse][numeric_params]") {
+    using yuzu::server::read_json_epoch_window;
+    const auto run = [](const char* body, std::optional<std::int64_t>& since,
+                        std::optional<std::int64_t>& until) {
+        return read_json_epoch_window(nlohmann::json::parse(body), since, until);
+    };
+    std::optional<std::int64_t> since;
+    std::optional<std::int64_t> until;
+
+    SECTION("empty body leaves both unset") {
+        CHECK_FALSE(run("{}", since, until).has_value());
+        CHECK_FALSE(since.has_value());
+        CHECK_FALSE(until.has_value());
+    }
+    SECTION("a non-object body leaves both unset (the route's own field reads reject it)") {
+        CHECK_FALSE(run("[]", since, until).has_value());
+        CHECK_FALSE(since.has_value());
+    }
+    SECTION("since of zero is accepted and stored as a present literal 0") {
+        CHECK_FALSE(run(R"({"since":0})", since, until).has_value());
+        REQUIRE(since.has_value());
+        CHECK(*since == 0);
+        CHECK_FALSE(until.has_value());
+    }
+    SECTION("until of one is the smallest accepted upper bound") {
+        CHECK_FALSE(run(R"({"until":1})", since, until).has_value());
+        REQUIRE(until.has_value());
+        CHECK(*until == 1);
+    }
+    SECTION("the largest int64 is accepted on both sides") {
+        CHECK_FALSE(run(R"({"since":9223372036854775807,"until":9223372036854775807})", since, until)
+                        .has_value());
+        CHECK(*since == std::numeric_limits<std::int64_t>::max());
+    }
+    SECTION("until of zero or below is refused with the positive-epoch message") {
+        for (const char* body : {R"({"until":0})", R"({"until":-1})", R"({"since":5,"until":0})"}) {
+            INFO(body);
+            std::optional<std::int64_t> s2;
+            std::optional<std::int64_t> u2;
+            const auto err = run(body, s2, u2);
+            REQUIRE(err.has_value());
+            CHECK(*err == "until must be a positive epoch second or omitted");
+        }
+    }
+    SECTION("a negative since is refused") {
+        const auto err = run(R"({"since":-1})", since, until);
+        REQUIRE(err.has_value());
+        CHECK(*err == "since must not be negative");
+    }
+    SECTION("a present but non-integer or out-of-range value is refused, never read as unbounded") {
+        for (const char* body :
+             {R"({"since":"1"})", R"({"since":1.5})", R"({"since":null})", R"({"since":true})",
+              R"({"since":18446744073709551615})", R"({"until":"x"})", R"({"until":null})",
+              R"({"until":9223372036854775808})"}) {
+            INFO(body);
+            std::optional<std::int64_t> s2;
+            std::optional<std::int64_t> u2;
+            const auto err = run(body, s2, u2);
+            REQUIRE(err.has_value());
+            CHECK(err->find("must be a JSON integer") != std::string::npos);
+        }
     }
 }

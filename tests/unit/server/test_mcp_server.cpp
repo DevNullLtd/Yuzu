@@ -28025,6 +28025,64 @@ TEST_CASE("MCP get_execution_statistics_by_agent: an invalid limit answers kInva
     CHECK(body["error"]["code"] == mcp::kInvalidParams);
 }
 
+TEST_CASE("MCP execution statistics tools: since is presence-tracked, since of zero matches what "
+          "omitting it matches, a negative or non-integer since is kInvalidParams (#4644)",
+          "[pg][mcp][integration][operator_surface]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
+
+    auto now = operator_surface_now();
+    auto e1 = b3_make_exec("def-since", "succeeded", 1, 1, 0, now - 300, now - 290);
+    auto id1 = tracker.create_execution(e1);
+    REQUIRE(id1.has_value());
+    b3_insert_agent_status(tracker, *id1, "agent-since-1", "success", 0, now - 300, now - 290);
+
+    McpTestServer ts;
+    ts.execution_tracker_for_test = &tracker;
+    ts.start();
+
+    int next_id = 100;
+    const auto call = [&](const char* tool, const std::string& args) {
+        auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/call","id":)" +
+                           std::to_string(next_id++) + R"(,"params":{"name":")" + tool +
+                           R"(","arguments":)" + args + "}}");
+        REQUIRE(res);
+        return nlohmann::json::parse(res->body);
+    };
+    for (const char* tool :
+         {"get_execution_statistics_by_agent", "get_execution_statistics_by_definition"}) {
+        INFO(tool);
+        const auto rows = [&](const std::string& args) {
+            auto body = call(tool, args);
+            REQUIRE_FALSE(body.contains("error"));
+            auto payload =
+                nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
+            return payload["data"].size();
+        };
+        const auto absent = rows("{}");
+        CHECK(absent == 1);
+        CHECK(rows(R"({"since":0})") == absent);
+        CHECK(rows(R"({"since":1})") == absent);
+        // A bound in the future excludes the row: a supplied since is a literal bound.
+        CHECK(rows("{\"since\":" + std::to_string(now + 3600) + "}") == 0);
+        for (const char* bad : {R"({"since":-1})", R"({"since":-9223372036854775807})"}) {
+            INFO(bad);
+            auto body = call(tool, bad);
+            REQUIRE(body.contains("error"));
+            CHECK(body["error"]["code"] == mcp::kInvalidParams);
+            CHECK(body["error"]["message"].get<std::string>() == "since must not be negative");
+        }
+        for (const char* bad : {R"({"since":"0"})", R"({"since":null})", R"({"since":1.5})",
+                                R"({"since":18446744073709551615})"}) {
+            INFO(bad);
+            auto body = call(tool, bad);
+            REQUIRE(body.contains("error"));
+            CHECK(body["error"]["code"] == mcp::kInvalidParams);
+            CHECK(body["error"]["message"].get<std::string>() == "since must be a JSON integer");
+        }
+    }
+}
+
 TEST_CASE("MCP get_execution_statistics_by_agent: a too-long or control-character "
           "agent_id is rejected, matching list_guardian_events' own floor",
           "[pg][mcp][integration][operator_surface]") {
@@ -32929,19 +32987,28 @@ TEST_CASE("MCP query_audit_log: a wrong-typed or out-of-range since/until/limit 
         REQUIRE(body.contains("error"));
         CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
     }
-    // A negative bound is refused too: the store applies a bound only above zero, so -3600
-    // used to mean "the whole log".
-    for (const char* neg : {R"({"since":-1})", R"({"until":-1})", R"({"since":-3600,"until":0})",
-                            R"({"since":0,"until":-9223372036854775807})"}) {
+    // The bounds are presence-tracked (#4644): a negative since is refused, and so is an `until`
+    // of zero or below -- a literal -3600 or 0 used to mean "the whole log".
+    for (const char* neg : {R"({"since":-1})", R"({"since":-3600,"until":5})",
+                            R"({"since":-9223372036854775807})"}) {
         INFO(neg);
         auto body = call(neg);
         REQUIRE(body.contains("error"));
         CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
-        CHECK(body["error"]["message"].get<std::string>().find("must not be negative") !=
-              std::string::npos);
+        CHECK(body["error"]["message"].get<std::string>() == "since must not be negative");
     }
-    // Omitted and well-formed values (including 0 = unbounded and the int64 maximum) still work.
-    for (const char* ok : {R"({})", R"({"since":0,"until":0,"limit":10})",
+    for (const char* bad_until : {R"({"until":0})", R"({"until":-1})", R"({"since":0,"until":0})",
+                                  R"({"since":5,"until":-9223372036854775807})"}) {
+        INFO(bad_until);
+        auto body = call(bad_until);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+        CHECK(body["error"]["message"].get<std::string>() ==
+              "until must be a positive epoch second or omitted");
+    }
+    // Omitted and well-formed values (including since 0, which matches what omitting it matches,
+    // and the int64 maximum) still work.
+    for (const char* ok : {R"({})", R"({"since":0,"until":1,"limit":10})", R"({"since":0})",
                            R"({"since":9223372036854775807})"}) {
         INFO(ok);
         auto body = call(ok);

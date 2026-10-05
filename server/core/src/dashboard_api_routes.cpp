@@ -125,13 +125,23 @@ void register_dashboard_api_routes(HttpRouteSink& sink, Deps deps) {
                 "application/json");
             return;
         }
-        // A negative bound is not a time: the store applies a bound only when it is above
-        // zero, so a literal `since=-3600` (an underflowed "an hour ago") used to mean
-        // "the whole log". Zero stays "no bound", exactly as omitting the parameter does.
-        if (q.since < 0 || q.until < 0) {
+        // The bounds are presence-tracked (`AuditQuery::since/until` are optionals): omitted
+        // is unbounded, a supplied value is a literal inclusive bound. A negative epoch is no
+        // time at all, and `until=0` would bound the read at the epoch and match nothing --
+        // when it is a computed window that collapsed it used to mean "the whole log" -- so
+        // both are a 400. `since=0` is a harmless literal bound (every stored timestamp is
+        // positive) and matches exactly what omitting `since` matches.
+        if (q.since && *q.since < 0) {
             res.status = 400;
             res.set_content(
-                R"({"error":{"code":400,"message":"since and until must not be negative"},"meta":{"api_version":"v1"}})",
+                R"({"error":{"code":400,"message":"since must not be negative"},"meta":{"api_version":"v1"}})",
+                "application/json");
+            return;
+        }
+        if (q.until && *q.until <= 0) {
+            res.status = 400;
+            res.set_content(
+                R"({"error":{"code":400,"message":"until must be a positive epoch second or omitted"},"meta":{"api_version":"v1"}})",
                 "application/json");
             return;
         }

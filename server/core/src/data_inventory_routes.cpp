@@ -4,6 +4,7 @@
 #include "inventory_store.hpp"
 #include "mcp_jsonrpc.hpp" // mcp::json_exceeds_depth / kMcpMaxJsonDepth: shared #2437 depth guard
 #include "on_behalf_guard.hpp" // onbehalf::sanitize_for_log
+#include "query_int_parse.hpp" // read_json_epoch_window (#4644)
 
 #include <nlohmann/json.hpp>
 
@@ -131,8 +132,17 @@ void register_data_inventory_routes(HttpRouteSink& sink, Deps deps) {
         InventoryQuery q;
         q.agent_id = body.value("agent_id", "");
         q.plugin = body.value("plugin", "");
-        q.since = body.value("since", int64_t{0});
-        q.until = body.value("until", int64_t{0});
+        // #4644: since/until are presence-tracked: omitted is unbounded, a supplied value must be
+        // a JSON integer (`since >= 0`, `until >= 1`), else 400. `body.value()` threw on a
+        // wrong-typed value and treated an explicit 0 as "unbounded".
+        if (const auto bound_err = read_json_epoch_window(body, q.since, q.until)) {
+            res.status = 400;
+            res.set_content(nlohmann::json{{"error", {{"code", 400}, {"message", *bound_err}}},
+                                           {"meta", {{"api_version", "v1"}}}}
+                                .dump(),
+                            "application/json");
+            return;
+        }
         q.limit = body.value("limit", 100);
         if (q.limit > 1000)
             q.limit = 1000;

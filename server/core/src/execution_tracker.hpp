@@ -173,8 +173,12 @@ struct FleetExecutionSummary {
 struct ExecutionStatsQuery {
     std::string agent_id;
     std::string definition_id;
-    int64_t since{0};
-    int64_t until{0};
+    /// Epoch-second bounds on `dispatched_at`, PRESENCE-tracked (#4644): unset = no bound on that
+    /// side, a set value is a literal inclusive bound; a literal 0 is not "unbounded". The REST
+    /// and MCP surfaces expose `since` only, reject a negative one, and accept `since=0` as a
+    /// harmless literal bound (every stored dispatched_at is positive).
+    std::optional<int64_t> since;
+    std::optional<int64_t> until;
     int limit{50};
     /// ADR-0017 admit-then-filter confinement for `get_agent_statistics` (#3526): `nullopt`
     /// = unconfined (a global grant); present = ONLY these agents' rows, applied in SQL
@@ -508,10 +512,10 @@ public:
     try_get_agent_statistics(const ExecutionStatsQuery& q = {}) const;
     [[nodiscard]] std::optional<std::vector<DefinitionExecutionStats>>
     try_get_definition_statistics(const ExecutionStatsQuery& q = {}) const;
-    [[nodiscard]] std::optional<FleetExecutionSummary> try_get_fleet_summary(int64_t since = 0) const;
+    [[nodiscard]] std::optional<FleetExecutionSummary> try_get_fleet_summary(std::optional<int64_t> since = std::nullopt) const;
     std::vector<AgentExecutionStats> get_agent_statistics(const ExecutionStatsQuery& q = {}) const;
     std::vector<DefinitionExecutionStats> get_definition_statistics(const ExecutionStatsQuery& q = {}) const;
-    FleetExecutionSummary get_fleet_summary(int64_t since = 0) const;
+    FleetExecutionSummary get_fleet_summary(std::optional<int64_t> since = std::nullopt) const;
 
     // ── Command <-> execution correlation (HA WS-1(1b), ADR-2002 section 5) ──
     //

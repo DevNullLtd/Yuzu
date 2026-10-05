@@ -636,6 +636,35 @@ TEST_CASE("#2500 — a supplied parent_id that names no parent is refused, not w
                            {{"route", "result_set_parent"}, {"reason", "parent_id_empty"}})
                   .value() == 1.0);
     }
+    SECTION("v1 inventory query: since and until are presence-tracked, until of zero and malformed "
+            "bounds are a 400 (#4644)") {
+        InventoryStore inventory{pool};
+        REQUIRE(inventory.is_open());
+        inventory.upsert("bound-agent-1", "bound_src", R"({"n":1})", 100);
+        inventory.upsert("bound-agent-2", "bound_src", R"({"n":2})", 200);
+        inventory.upsert("bound-agent-3", "bound_src", R"({"n":3})", 300);
+        AsyncHarness h(pool, /*with_dispatch=*/true, &inventory);
+        int status = 0;
+        const auto rows = [&](const std::string& extra) -> std::size_t {
+            auto j = h.post("/api/v1/inventory/query", R"({"plugin":"bound_src")" + extra + "}",
+                            status);
+            REQUIRE(status == 200);
+            return j["data"].size();
+        };
+        CHECK(rows("") == 3);
+        CHECK(rows(R"(,"since":0)") == 3);
+        CHECK(rows(R"(,"since":200)") == 2);
+        CHECK(rows(R"(,"until":200)") == 2);
+        CHECK(rows(R"(,"since":200,"until":200)") == 1);
+        for (const char* bad : {R"({"until":0})", R"({"until":-5})", R"({"since":-1})",
+                                R"({"since":"1"})", R"({"until":null})", R"({"since":1.5})",
+                                R"({"since":0,"until":0})",
+                                R"({"until":18446744073709551615})"}) {
+            INFO(bad);
+            h.post("/api/v1/inventory/query", bad, status);
+            CHECK(status == 400);
+        }
+    }
     SECTION("from-inventory-query refuses a byte-capped read without creating a set") {
         InventoryStore inventory{pool};
         REQUIRE(inventory.is_open());

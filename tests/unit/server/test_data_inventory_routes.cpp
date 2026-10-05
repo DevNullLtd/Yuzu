@@ -247,6 +247,46 @@ TEST_CASE("POST /api/inventory/query: happy path filters by agent_id",
     CHECK(body["results_excluded_by_poison"] == 0);
 }
 
+TEST_CASE("POST /api/inventory/query: since and until are presence-tracked, until of zero and "
+          "malformed bounds are a 400 (#4644)",
+          "[server][routes][data_inventory_routes][rest][pg]") {
+    PgHarness h;
+    h.store->upsert("agent-1", "bound_src", R"({"x":1})", 100);
+    h.store->upsert("agent-2", "bound_src", R"({"x":2})", 200);
+    h.store->upsert("agent-3", "bound_src", R"({"x":3})", 300);
+
+    const auto rows = [&h](const std::string& extra) -> std::size_t {
+        auto res = h.sink.Post("/api/inventory/query",
+                               R"({"plugin":"bound_src")" + extra + "}");
+        REQUIRE(res);
+        REQUIRE(res->status == 200);
+        auto body = json::parse(res->body, nullptr, false);
+        REQUIRE_FALSE(body.is_discarded());
+        return body["results"].size();
+    };
+    CHECK(rows("") == 3);
+    CHECK(rows(R"(,"since":0)") == 3); // a literal 0 lower bound matches what omitting it matches
+    CHECK(rows(R"(,"since":200)") == 2);
+    CHECK(rows(R"(,"until":200)") == 2);
+    CHECK(rows(R"(,"since":200,"until":200)") == 1);
+
+    for (const char* bad : {R"({"until":0})", R"({"until":-5})", R"({"since":-1})",
+                            R"({"since":"1"})", R"({"until":null})", R"({"since":1.5})",
+                            R"({"since":0,"until":0})"}) {
+        INFO(bad);
+        auto res = h.sink.Post("/api/inventory/query", bad);
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        auto body = json::parse(res->body, nullptr, false);
+        REQUIRE_FALSE(body.is_discarded());
+        CHECK(body["error"]["code"] == 400);
+    }
+    auto zero = h.sink.Post("/api/inventory/query", R"({"until":0})");
+    REQUIRE(zero);
+    CHECK(json::parse(zero->body)["error"]["message"] ==
+          "until must be a positive epoch second or omitted");
+}
+
 TEST_CASE("POST /api/inventory/query: invalid JSON body is a 400",
           "[server][routes][data_inventory_routes][rest][pg]") {
     PgHarness h;

@@ -2082,13 +2082,13 @@ ExecutionTracker::try_get_agent_statistics(const ExecutionStatsQuery& q) const {
         sql += " AND e.definition_id = $" + std::to_string(idx++);
         params.push_back(q.definition_id);
     }
-    if (q.since > 0) {
+    if (q.since) {
         sql += " AND a.dispatched_at >= $" + std::to_string(idx++);
-        params.push_back(std::to_string(q.since));
+        params.push_back(std::to_string(*q.since));
     }
-    if (q.until > 0) {
+    if (q.until) {
         sql += " AND a.dispatched_at <= $" + std::to_string(idx++);
-        params.push_back(std::to_string(q.until));
+        params.push_back(std::to_string(*q.until));
     }
     // ADR-0017 confinement (#3526): resolve the visible set INTO the WHERE clause so the
     // GROUP BY and LIMIT only ever see in-scope agents -- a post-fetch filter would hand a
@@ -2168,13 +2168,13 @@ ExecutionTracker::try_get_definition_statistics(const ExecutionStatsQuery& q) co
         sql += " AND e.definition_id = $" + std::to_string(idx++);
         params.push_back(q.definition_id);
     }
-    if (q.since > 0) {
+    if (q.since) {
         sql += " AND e.dispatched_at >= $" + std::to_string(idx++);
-        params.push_back(std::to_string(q.since));
+        params.push_back(std::to_string(*q.since));
     }
-    if (q.until > 0) {
+    if (q.until) {
         sql += " AND e.dispatched_at <= $" + std::to_string(idx++);
-        params.push_back(std::to_string(q.until));
+        params.push_back(std::to_string(*q.until));
     }
     sql += " GROUP BY e.definition_id ORDER BY total DESC LIMIT $" + std::to_string(idx++);
     params.push_back(std::to_string(q.limit > 0 ? q.limit : 50));
@@ -2197,11 +2197,11 @@ ExecutionTracker::try_get_definition_statistics(const ExecutionStatsQuery& q) co
     return results;
 }
 
-FleetExecutionSummary ExecutionTracker::get_fleet_summary(int64_t since) const {
+FleetExecutionSummary ExecutionTracker::get_fleet_summary(std::optional<int64_t> since) const {
     return try_get_fleet_summary(since).value_or(FleetExecutionSummary{});
 }
 
-std::optional<FleetExecutionSummary> ExecutionTracker::try_get_fleet_summary(int64_t since) const {
+std::optional<FleetExecutionSummary> ExecutionTracker::try_get_fleet_summary(std::optional<int64_t> since) const {
     FleetExecutionSummary s;
     if (!open_)
         return std::nullopt;
@@ -2220,9 +2220,9 @@ std::optional<FleetExecutionSummary> ExecutionTracker::try_get_fleet_summary(int
             FROM execution_tracker.executions WHERE status NOT IN ('pending','running')
         )";
         std::vector<std::string> params;
-        if (since > 0) {
+        if (since) {
             sql += " AND dispatched_at >= $1";
-            params.push_back(std::to_string(since));
+            params.push_back(std::to_string(*since));
         }
         pg::PgResult res = pg::exec_params(lease.get(), sql.c_str(), params);
         // Any failed sub-query is a degraded read: a half-populated summary would present
@@ -2253,9 +2253,9 @@ std::optional<FleetExecutionSummary> ExecutionTracker::try_get_fleet_summary(int
     {
         std::string sql = "SELECT COUNT(DISTINCT agent_id) FROM execution_tracker.agent_exec_status";
         std::vector<std::string> params;
-        if (since > 0) {
+        if (since) {
             sql += " WHERE dispatched_at >= $1";
-            params.push_back(std::to_string(since));
+            params.push_back(std::to_string(*since));
         }
         pg::PgResult res = pg::exec_params(lease.get(), sql.c_str(), params);
         if (res.status() != PGRES_TUPLES_OK)

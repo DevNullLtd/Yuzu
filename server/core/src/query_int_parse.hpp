@@ -89,4 +89,44 @@ struct SseReplayCursor {
     return *v < 0 ? 0 : (*v > 100 ? 100 : *v);
 }
 
+/// Read the OPTIONAL `since`/`until` epoch-second bounds from a JSON request body into
+/// presence-tracked optionals (#4644). `Json` is nlohmann's type, taken as a template parameter
+/// so this header never includes it. A key that is ABSENT leaves its side unset (unbounded). A
+/// PRESENT key must be one JSON integer in signed 64-bit range (a string, float, bool, null, or
+/// a value above INT64_MAX is refused: `body.value("since", 0)` threw on those, an uncaught
+/// exception, and a lenient reader would have turned them into "unbounded"). `since` must be
+/// `>= 0` (a literal 0 is a harmless bound: every stored timestamp is positive, so it matches
+/// exactly what an absent `since` matches); `until` must be `>= 1` (`until: 0` would bound the
+/// read at the epoch and match nothing, and as a computed window that collapsed it used to read as
+/// "the whole table"). Returns nullopt when accepted, else the 400 message for the caller to wrap
+/// in its route's error envelope. Shared by the legacy and v1 inventory query routes so the two
+/// cannot drift.
+template <typename Json>
+[[nodiscard]] std::optional<std::string> read_json_epoch_window(const Json& body,
+                                                                std::optional<std::int64_t>& since,
+                                                                std::optional<std::int64_t>& until) {
+    const auto read = [&body](const char* key, std::optional<std::int64_t>& out) -> bool {
+        if (!body.contains(key))
+            return true;
+        const auto& v = body[key];
+        if (!v.is_number_integer())
+            return false;
+        if (v.is_number_unsigned() &&
+            v.template get<std::uint64_t>() >
+                static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max()))
+            return false;
+        out = v.template get<std::int64_t>();
+        return true;
+    };
+    if (!read("since", since))
+        return "since must be a JSON integer that fits in a signed 64-bit value";
+    if (!read("until", until))
+        return "until must be a JSON integer that fits in a signed 64-bit value";
+    if (since && *since < 0)
+        return "since must not be negative";
+    if (until && *until <= 0)
+        return "until must be a positive epoch second or omitted";
+    return std::nullopt;
+}
+
 } // namespace yuzu::server

@@ -19,6 +19,7 @@
 #include <yuzu/metrics.hpp>
 
 #include <catch2/catch_test_macros.hpp>
+#include <nlohmann/json.hpp>
 
 #include <memory>
 #include <optional>
@@ -224,6 +225,29 @@ TEST_CASE("auth-sample: malformed from/to → 400", "[pg][auth-sample][rest]") {
     auto res2 = h.sink.Get("/api/v1/audit/auth-sample?to=123abc");
     REQUIRE(res2);
     CHECK(res2->status == 400);
+}
+
+TEST_CASE("auth-sample: to of zero is a 400, from of zero matches what omitting it matches (#4644)",
+          "[pg][auth-sample][rest]") {
+    AuthSampleHarness h;
+    for (const char* q : {"to=0", "to=000", "from=5&to=0", "from=0&to=0"}) {
+        INFO(q);
+        auto res = h.sink.Get(std::string("/api/v1/audit/auth-sample?") + q);
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        CHECK(res->body.find("to must be a positive epoch second or omitted") != std::string::npos);
+    }
+    // Absent and from=0 both reach every auth-surface row the fixture seeded.
+    const auto count = [&h](const std::string& q) {
+        auto res = h.sink.Get("/api/v1/audit/auth-sample?limit=100" + q);
+        REQUIRE(res);
+        REQUIRE(res->status == 200);
+        return nlohmann::json::parse(res->body)["data"].size();
+    };
+    const auto absent = count("");
+    CHECK(absent > 0);
+    CHECK(count("&from=0") == absent);
+    CHECK(count("&from=0&to=4102444800") == absent);
 }
 
 TEST_CASE("auth-sample: inverted window from>to → 400 (Hermes L-3)", "[pg][auth-sample][rest]") {

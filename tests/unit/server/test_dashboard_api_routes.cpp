@@ -628,13 +628,13 @@ TEST_CASE("dashboard_api_routes: /api/audit rejects a malformed since/until/limi
         CHECK(r->status == 400);
         CHECK(json::parse(r->body)["error"]["message"] == "invalid numeric query parameter");
     }
-    auto ok = h.sink.Get("/api/audit?since=0&until=0&limit=10&offset=0");
+    auto ok = h.sink.Get("/api/audit?since=0&until=1&limit=10&offset=0");
     REQUIRE(ok);
     CHECK(ok->status == 200);
 }
 
-TEST_CASE("dashboard_api_routes: /api/audit rejects a negative since or until with 400 zero stays "
-          "unbounded",
+TEST_CASE("dashboard_api_routes: /api/audit rejects a negative since and until of zero or below "
+          "with 400, since of zero is accepted",
           "[pg][server][routes][dashboard_api_routes]") {
     YUZU_REQUIRE_PG_DB_TPL(db, dashapi_audit_tpl);
     yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
@@ -645,16 +645,24 @@ TEST_CASE("dashboard_api_routes: /api/audit rejects a negative since or until wi
     h.audit_store = &audit;
     h.wire();
 
-    // The store applies a bound only above zero, so a literal -3600 used to mean "the whole log".
-    for (const char* bad : {"since=-1", "since=-3600", "until=-1", "since=-1&until=-1",
-                            "since=0&until=-5"}) {
+    // The bounds are presence-tracked: a literal -3600 or 0 used to mean "the whole log".
+    for (const char* bad : {"since=-1", "since=-3600", "since=-1&until=5", "since=-5&until=7"}) {
         INFO(bad);
         auto r = h.sink.Get(std::string("/api/audit?") + bad);
         REQUIRE(r);
         CHECK(r->status == 400);
-        CHECK(json::parse(r->body)["error"]["message"] == "since and until must not be negative");
+        CHECK(json::parse(r->body)["error"]["message"] == "since must not be negative");
     }
-    for (const char* ok : {"since=0", "until=0", "since=0&until=0", "", "since=1700000000"}) {
+    for (const char* bad : {"until=0", "until=000", "until=-1", "since=5&until=0",
+                            "since=0&until=0", "since=0&until=-5"}) {
+        INFO(bad);
+        auto r = h.sink.Get(std::string("/api/audit?") + bad);
+        REQUIRE(r);
+        CHECK(r->status == 400);
+        CHECK(json::parse(r->body)["error"]["message"] ==
+              "until must be a positive epoch second or omitted");
+    }
+    for (const char* ok : {"since=0", "until=1", "since=0&until=1", "", "since=1700000000"}) {
         INFO(ok);
         auto r = h.sink.Get(std::string("/api/audit?") + ok);
         REQUIRE(r);
