@@ -759,21 +759,20 @@ bool AuthRoutes::require_permission(const httplib::Request& req, httplib::Respon
                             "application/json");
             return false;
         }
-        // Shared ceiling helper (authz::service_ceiling_check). A Degraded verdict (a failed
-        // read) is a retryable 503 through the shared respond_ceiling_degraded, the same as
-        // require_fleet_read: an outage is not a missing grant. Still fail CLOSED (the request
-        // is refused). Only a definitive Deny is the 403 below.
+        // Shared ceiling helper (authz::service_ceiling_check). Unlike require_scoped_permission
+        // and require_fleet_read, this gate does NOT answer a Degraded verdict (a failed read)
+        // with a retryable 503 up front: the allow-list check below refuses every pair today
+        // (kServiceScopeGlobalSafe is empty), so a retry hint here would advertise a recovery that
+        // cannot happen. A Degraded read therefore continues to that allow-list check and is
+        // answered by its definitive default-deny 403, exactly as for a healthy read. A definitive
+        // Deny keeps its own 403 (and audit text) before the allow-list.
         const auto ceiling = authz::service_ceiling_check(*rbac_store_, securable_type, operation);
-        if (ceiling.verdict == authz::CeilingVerdict::Degraded) {
-            respond_ceiling_degraded(req, res, "auth.permission_required",
-                                     "service-scoped token blocked: RBAC read degraded "
-                                     "resolving the ITServiceOwner ceiling",
-                                     ceiling);
-            return false;
-        }
+        const bool ceiling_degraded = ceiling.verdict == authz::CeilingVerdict::Degraded;
         // Everything that is not an explicit Admit is refused: a Deny verdict, and any
-        // out-of-range value, which must never fall through to the admit.
-        if (ceiling.verdict != authz::CeilingVerdict::Admit) {
+        // out-of-range value, which must never fall through to the admit. A Degraded verdict is
+        // the one exception that continues (see above); it can only leave this function as a
+        // refusal through the allow-list check or the guard after it.
+        if (!ceiling_degraded && ceiling.verdict != authz::CeilingVerdict::Admit) {
             audit_log(req, "auth.permission_required", "denied", "", "",
                       "service-scoped token blocked: lacks ITServiceOwner permission");
             res.status = 403;
@@ -807,6 +806,17 @@ bool AuthRoutes::require_permission(const httplib::Request& req, httplib::Respon
                               "needs an explicit confined path via require_fleet_read/"
                               "confine_agent_target)";
             res.set_content(detail::a4_denial(res, 403, msg), "application/json");
+            return false;
+        }
+        // Safety net, unreachable today: the allow-list above is empty, so nothing gets past it.
+        // It exists so that a future populated allow-list can never admit on a failed ceiling
+        // read. Reaching here with a Degraded verdict means the allow-list alone would have
+        // admitted the request; refuse it as the retryable outage it is.
+        if (ceiling_degraded) {
+            respond_ceiling_degraded(req, res, "auth.permission_required",
+                                     "service-scoped token blocked: RBAC read degraded "
+                                     "resolving the ITServiceOwner ceiling",
+                                     ceiling);
             return false;
         }
         return true;

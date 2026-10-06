@@ -56,9 +56,12 @@ namespace yuzu::server::authz {
 ///              operator revoke looks: `remove_permission` DELETEs the row and records
 ///              `revoked_seed_defaults`, so a revoked default is simply absent here).
 ///   Degraded - the checked read itself failed (store closed, pool timeout, query error).
-/// `require_permission`, `require_scoped_permission` and `require_fleet_read` all map
-/// Degraded to a retryable 503 (an infrastructure fault, not a definitive deny), through
-/// `AuthRoutes::respond_ceiling_degraded`, and Deny to a 403. All three stay fail CLOSED.
+/// `require_scoped_permission` and `require_fleet_read` map Degraded to a retryable 503 (an
+/// infrastructure fault, not a definitive deny), through
+/// `AuthRoutes::respond_ceiling_degraded`, and Deny to a 403. `require_permission` maps Deny
+/// to its 403 too, but a Degraded read continues to its service-scope allow-list check, which
+/// refuses every pair today (a 403 with no retry hint); it answers 503 only where a populated
+/// allow-list would otherwise admit. All three stay fail CLOSED.
 enum class CeilingVerdict : std::uint8_t { Admit, Deny, Degraded };
 
 /// The ceiling verdict and, for a Degraded verdict, the closed

@@ -50,12 +50,13 @@ void AuthRoutes::respond_ceiling_degraded(const httplib::Request& req, httplib::
                                           const std::string& audit_detail,
                                           const authz::CeilingResult& ceiling) {
     // The ONE emission for a Degraded ITServiceOwner ceiling read, shared by
-    // require_fleet_read, require_permission and require_scoped_permission: an outage is
-    // not a missing grant, so it is a retryable 503 (never the 403 of a definitive deny),
-    // counted under the closed yuzu_server_rbac_read_degrade_total label, with an audit
-    // detail the caller words truthfully. The caller still refuses the request (fail
-    // CLOSED); this only writes the response. No `.permission`: an outage is not cured by
-    // any grant (routed-concern clause 5).
+    // require_fleet_read and require_scoped_permission (and require_permission's dormant
+    // guard where its allow-list would admit): an outage is not a missing grant, so it is a
+    // retryable 503 (never the 403 of a definitive deny), counted under the closed
+    // yuzu_server_rbac_read_degrade_total label, with an audit detail the caller words
+    // truthfully. The caller still refuses the request (fail CLOSED); this only writes the
+    // response. No `.permission`: an outage is not cured by any grant (routed-concern
+    // clause 5).
     if (auto* m = auth_mgr_.metrics_registry()) {
         m->counter("yuzu_server_rbac_read_degrade_total",
                    {{"reason", ceiling.degrade_reason ? ceiling.degrade_reason : "query_error"}})
