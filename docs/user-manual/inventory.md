@@ -61,9 +61,9 @@ cadences.
   `bundle_id` is `-` for rows the bounded bundle-id pass (30 s, at most 5000
   applications, one pass in flight) did not reach; that run leads with a
   `warning|bundle_id_*` row and reports CONSTRAINED -- never silently.
-  On Linux/macOS, a
-  degraded acquisition (timeout, kill, spawn failure, truncation, or a
-  nonzero exit) now emits a single `error|installed_apps: acquisition
+  A degraded acquisition on any OS (Linux/macOS: timeout, kill, spawn failure,
+  truncation, or a nonzero exit; Windows: an unreadable Uninstall root or
+  application subkey) now emits a single `error|installed_apps: acquisition
   degraded (...)` row and a nonzero result instead of an empty or partial
   `app|` list; on macOS a `list` may begin with a `warning|bundle_id_*` row --
   key on the first token `app`. See "Degraded collections are skipped, not
@@ -144,7 +144,7 @@ cadences.
   precision the receipt never recorded. Bounded at 5000 receipts per collection,
   again a runaway guard rather than a routine limit.
 
-  **On Linux and macOS, degraded collections are skipped, not published.** If
+  **On every OS, degraded collections are skipped, not published.** If
   any acquisition step does not complete on its own terms — a timeout, a spawn
   failure, a killed child, a capture truncation, a nonzero exit from a
   top-level enumerator, exhaustion of the 120-second whole-collection budget
@@ -156,17 +156,26 @@ cadences.
   once it reaches the server, so the omissions would be read as uninstalls. A
   stale inventory is recoverable; a confidently wrong one is not. Degraded
   cycles are logged as warnings, and a host that degrades every day will stop
-  updating — treat repeated warnings as actionable.
+  updating — treat repeated warnings as actionable. On Windows the degraded
+  conditions are the registry ones described below.
 
   The "ran but reported nothing" trigger is macOS-only by design: every Mac has
   GUI applications and installer receipts, so zero means the tool failed. On
   Linux an empty result is often honest — a host may legitimately have `rpm`
   installed and no rpm packages — so that check is not applied there.
 
-  **Windows has no degraded signal today.** Its inventory is collected natively
-  from the registry rather than through the subprocess runner, so none of the
-  above applies: a partial registry walk publishes as complete. Tracked as a
-  known gap, not closed by this release.
+  **Windows degrades the same way (#4711).** The registry walk is native, so the
+  subprocess cases above do not apply, but an Uninstall root that cannot be
+  opened or enumerated to the end, or an application subkey whose open fails
+  (access denied above all), marks the collection degraded: `list_inventory`
+  emits no rows and returns rc 1 (the daily sync skips the cycle; see the
+  troubleshooting entry), and `list`/`query` return one
+  `error|installed_apps: acquisition degraded (...)` row with rc 1 instead of a
+  partial list; `list_per_user` keeps the rows it read and appends
+  `warning|hive_read_failed`. A missing HKCU or WoW6432Node Uninstall key is
+  normal, not degraded. A value-level failure (a non-REG_SZ or over-64 KiB
+  DisplayName) is not distinguished from an absent value (plugin README caveat
+  1).
 - **Changes for rpm fleets vs the v1 (4-field) contract:** `publisher` is now
   the rpm **PACKAGER** tag (was VENDOR), and `version` is the upstream version
   only — the release moved to its own `release` column (was fused
@@ -808,14 +817,14 @@ you have observed your fleet's normal stale-count baseline and set the threshold
 ~5–10% of your expected active fleet; correlate with `yuzu_fleet_agents_healthy` to
 separate "agents offline" from "sync source broken / disabled".
 
-**A Windows device's software inventory stops updating although the agent is healthy.** Since the #4711 hardening, an Uninstall registry root that cannot be opened or enumerated to the end, or one application subkey whose open is denied, makes `list_inventory` return rc 1 and the daily sync skips that cycle rather than committing a shorter inventory as authoritative; the device keeps its last good inventory and `last_seen` stops advancing. The agent log carries both halves: `installed_apps: Uninstall root <HKLM-64|HKLM-32|HKCU> could not be fully read -- the collection is degraded` and `sync: installed_apps 'list_inventory' rc=1 -- skipping this cycle`. Fix the ACL (the agent runs as LocalSystem) and the next 24 h cycle re-collects; there is no fleet-visible counter for the skip yet.
+**A Windows device's software inventory stops updating although the agent is healthy.** Since the #4711 hardening, an Uninstall registry root that cannot be opened or enumerated to the end, or one application subkey whose open fails (access denied above all) or whose name exceeds 255 characters, makes `list_inventory` return rc 1 and the daily sync skips that cycle rather than committing a shorter inventory as authoritative; the device keeps its last good inventory and `last_seen` stops advancing. `list` and `query` return the `error|` row with rc 1 for the same condition. The agent log carries both halves: `installed_apps: Uninstall root <HKLM-64|HKLM-32|HKCU> could not be fully read -- the collection is degraded` and `sync: installed_apps.list_inventory rc=1 — skipping this cycle`. Fix the ACL (the agent runs as LocalSystem) and the next 24 h cycle re-collects. The only fleet-side signal is the indirect `yuzu_inventory_stale_agents{source="installed_software"}` gauge (two missed cycles; its alert `YuzuInventoryStaleAgents` ships disabled and a never-synced device is not counted); there is no direct skip counter yet.
 
 **`install_location` is `-` for many Windows applications and every Linux application.** `-` means the OS
 reported no location, not that collection failed. Windows reads each Uninstall key's `InstallLocation`, which many
 MSI-registered products, SDK and runtime component packages and some system components never populate (182 of
 241 rows on one developer workstation); Linux is always `-` by design, since a package installs to many prefixes.
-`-` also results from a Windows value longer than 64 KiB or stored with a non-string registry type, and
-for per-user installs, which the machine-scope `list` does not read. `bundle_id` is `-` on Windows
+`-` also results from a Windows value longer than 64 KiB or stored with a non-string registry type (applications installed only into a logged-in
+user's own hive produce no row at all; see `list_per_user`). `bundle_id` is `-` on Windows
 and Linux, and on macOS for a non-bundle location or for a row the bounded bundle-id pass (30 s, at most 5000 applications, one pass in flight) did not reach -- that run also carries a leading `warning|bundle_id_*` row and a CONSTRAINED status, so a `-` from a cut-short pass is never silent.
 
 **The results table shows column headers with nothing under them.** The dashboard splits `installed_apps` rows at
