@@ -370,8 +370,8 @@ implementation is.
 | filesystem | read | linux | supported | 1 | std::ifstream | - |
 | filesystem | read | macos | supported | 1 | std::ifstream | - |
 | filesystem | read | windows | supported | 1 | std::ifstream | - |
-| filesystem | get_acl | linux | constrained | 1 | posix_stat | stat()-only basic owner/group/permission bits; no ACL/ACE enumeration |
-| filesystem | get_acl | macos | constrained | 1 | posix_stat | stat()-only basic owner/group/permission bits; no ACL/ACE enumeration |
+| filesystem | get_acl | linux | supported | 1 | posix_stat+getxattr(system.posix_acl_*) | - |
+| filesystem | get_acl | macos | supported | 1 | posix_stat+acl_get_file(ACL_TYPE_EXTENDED) | - |
 | filesystem | get_acl | windows | supported | 1 | win32_acl | - |
 | filesystem | get_signature | linux | unsupported | - | - | - |
 | filesystem | get_signature | macos | supported | 2 | subprocess_runner:codesign | - |
