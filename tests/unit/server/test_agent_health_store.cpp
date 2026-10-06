@@ -2312,6 +2312,8 @@ TEST_CASE("REAL AgentHealthStore: yuzu_fleet_inventory_sync_skipping counts vali
     // series exists.
     store.recompute_metrics(metrics, std::chrono::seconds{0});
     CHECK(series_val(metrics.serialize(), gauge) == 0.0);
+}
+
 // ── #5403: pending-Spark-Disarm age (fleet MAX) and deadline count (fleet SUM) ────────────
 //
 // Driven through the REAL AgentHealthStore (see the journal block above for why). The age
