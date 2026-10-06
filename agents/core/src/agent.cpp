@@ -24,6 +24,7 @@ __declspec(allocate(".CRT$XCB"))
 #include <yuzu/agent/subprocess_runner.hpp>
 #include <yuzu/agent/trigger_engine.hpp>
 #include <yuzu/agent/updater.hpp>
+#include <yuzu/agent/update_signature_mode.hpp>
 #include <yuzu/metrics.hpp>
 #include <yuzu/secure_zero.hpp>
 #include <yuzu/version.hpp>
@@ -2135,6 +2136,14 @@ public:
                                          yuzu::agent::Updater::effective_check_interval(
                                              cfg_.update_check_interval)
                                              .count());
+                            // #5249 Gate 7: the trust-bundle load warning, here (on the
+                            // OTA update thread, before the check loop) and not in main()
+                            // (which runs before the Windows SCM hand-off). Once per
+                            // process; noexcept, reporting only.
+                            if (!ota_bundle_probe_logged_.exchange(true))
+                                yuzu::agent::log_update_trust_bundle_probe(UpdateConfig{
+                                    .signature_trust_bundle = cfg_.update_trust_bundle,
+                                    .require_signature = cfg_.update_require_signature});
                         },
                         [this]() {
                             spdlog::info("OTA update applied - agent will restart");
@@ -2564,6 +2573,21 @@ public:
                                 tags["yuzu.ota_signature_refused"] =
                                     std::to_string(static_cast<int64_t>(refused));
                             }
+                            // #5249: the OTA update-signature mode this process
+                            // enforces (off / bundle / bundle+require), so a fleet
+                            // view CAN find agents that are NOT verifying update
+                            // signatures once the server surfaces the tag; today
+                            // it is stored in the agent-health snapshot and read
+                            // by nothing (the startup log line is the per-endpoint
+                            // verification). Without it, an agent whose bundle flag
+                            // was dropped or misspelt looks exactly like an
+                            // enforcing one: the refusal tag above stays 0 either
+                            // way. Same two Config fields the Updater is built
+                            // from, so the tag cannot disagree with enforcement.
+                            yuzu::agent::emit_update_signature_mode_tag(
+                                tags,
+                                UpdateConfig{.signature_trust_bundle = cfg_.update_trust_bundle,
+                                             .require_signature = cfg_.update_require_signature});
                             tags["yuzu.os"] = kAgentOs;
                             tags["yuzu.arch"] = kAgentArch;
                             tags["yuzu.agent_version"] = std::string{yuzu::kFullVersionString};
@@ -4549,6 +4573,10 @@ private:
         }
     }
     OtaUpdateThread update_thread_;
+    // #5249 Gate 7: the OTA trust-bundle warning is logged once per process: 4b
+    // re-spawns update_thread_ on every reconnect (the reconnect teardown joins it
+    // before the next spawn).
+    std::atomic<bool> ota_bundle_probe_logged_{false};
     std::thread heartbeat_thread_;
     std::thread sync_thread_; // ADR-0016 daily-sync thread (per-connection)
 

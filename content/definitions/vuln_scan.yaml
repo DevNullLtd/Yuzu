@@ -16,7 +16,8 @@ metadata:
     software versions against a built-in rule database. Configuration
     checks verify security hardening settings (firewall state, password
     policy, remote desktop config, etc.). Each finding is classified by
-    severity (CRITICAL, HIGH, MEDIUM, LOW, INFO). Reports progress at
+    severity (CRITICAL, HIGH, MEDIUM, LOW, INFO, or UNREADABLE when the check
+    could not run; not an issue). Reports progress at
     0%, 50%, 90%, 100%.
   tags: [security, vulnerability, cve, compliance, audit]
 
@@ -37,8 +38,8 @@ spec:
     columns:
       - name: severity
         type: string
-        description: Finding severity assigned by the check that produced this row.
-        values: [CRITICAL, HIGH, MEDIUM, LOW, INFO]
+        description: Finding severity assigned by the check that produced this row. UNREADABLE means the check could not run; not an issue.
+        values: [CRITICAL, HIGH, MEDIUM, LOW, INFO, UNREADABLE]
         example: CRITICAL
         platforms: [windows, linux, darwin]
       - name: category
@@ -66,7 +67,7 @@ spec:
   visualization:
     # vuln_scan emits one row per finding on `scan`, format
     # `severity|category|title|detail`. labelField=0 picks severity so
-    # CRITICAL / HIGH / MEDIUM / LOW / INFO each become a pie slice and
+    # CRITICAL / HIGH / MEDIUM / LOW / INFO / UNREADABLE each become a pie slice and
     # findings are counted into them. Preferred over the summary action's
     # pie because summary also emits a TOTAL row that would dominate the
     # chart.
@@ -203,8 +204,8 @@ spec:
     columns:
       - name: severity
         type: string
-        description: Finding severity assigned by the compliance check that produced this row.
-        values: [CRITICAL, HIGH, MEDIUM, LOW, INFO]
+        description: Finding severity assigned by the compliance check that produced this row. UNREADABLE means the check could not run; not an issue.
+        values: [CRITICAL, HIGH, MEDIUM, LOW, INFO, UNREADABLE]
         example: HIGH
         platforms: [windows, linux, darwin]
       - name: category
@@ -258,7 +259,8 @@ metadata:
     only the severity summary counts. Provides a quick overview of
     the endpoint's security posture without the full finding details.
     Returns total findings, total issues, and per-severity counts
-    (CRITICAL, HIGH, MEDIUM, LOW, INFO).
+    (CRITICAL, HIGH, MEDIUM, LOW, INFO, UNREADABLE; UNREADABLE means the check
+    could not run and is not counted as an issue).
   tags: [security, vulnerability, compliance, dashboard]
 
 spec:
@@ -281,7 +283,7 @@ spec:
         description: >
           The severity this row counts, or the literal "TOTAL" for the first row emitted by
           every run.
-        values: [TOTAL, CRITICAL, HIGH, MEDIUM, LOW, INFO]
+        values: [TOTAL, CRITICAL, HIGH, MEDIUM, LOW, INFO, UNREADABLE]
         example: CRITICAL
         platforms: [windows, linux, darwin]
       - name: count

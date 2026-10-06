@@ -2235,6 +2235,14 @@ public:
                           "Agents reporting a plugin that failed init, by plugin name (absent "
                           "when none; at most 64 named labels, the rest under plugin=other)",
                           "gauge");
+        metrics_.describe("yuzu_fleet_inventory_sync_skipping",
+                          "Agents currently reporting heartbeats whose daily-sync source skipped "
+                          "its latest collection cycle(s) (heartbeat tag "
+                          "yuzu.sync.<source>.skip_streak > 0; agents that do not emit it are "
+                          "not counted), by source; correlate with "
+                          "yuzu_inventory_stale_agents, never subtract (different populations, "
+                          "see metrics.md)",
+                          "gauge");
         metrics_.describe("yuzu_fleet_agents_dex_observer_disarmed",
                           "Windows agents (DEX enabled) reporting their DEX signal observer is not "
                           "fully healthy (no channel armed, or a channel subscription dropped at "
