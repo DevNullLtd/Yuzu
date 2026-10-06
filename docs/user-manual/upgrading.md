@@ -3490,19 +3490,22 @@ Before upgrading any component:
     and ignores them).
   - **At the Spark flip (not part of this upgrade), upgraded agents.** They hold the policy generation and keep being re-pushed while a
     wedged rule or a compensating teardown is outstanding (each re-push writes a `guaranteed_state.reconcile` audit row, about once per
-    heartbeat per held agent; the agent suppresses the identical re-pushes and applies one in full about every 330 s; if a healthy rule of the hung call's mechanism type is in the push, every re-push after the first of those is applied in full, flip-gate AC-16).
-  - **At the Spark flip, agents without the #5459 retry suppression.** Every agent built before the #5459 change carries the earlier
-    three-re-apply waiver (PR #4529). Such an agent can acknowledge the generation after three re-applies of a wedged rule (and, without the
+    heartbeat per held agent; the agent suppresses the identical re-pushes and applies one in full about every 330 s; if a healthy rule of the hung call's mechanism type is in the push, every re-push after the first of those is applied in full; see the Same-type condition in the wedged-rule hold note of [Guaranteed State](guaranteed-state.md#sparkengine--the-next-generation-detection-engine-observe-only)).
+  - **At the Spark flip, agents without the #5459 retry suppression.** Every agent built from PR #4529 up to the #5459 change carries the
+    earlier three-re-apply waiver; builds from before PR #4529 (release 0.13.0 and earlier) have no waiver and no acknowledgment ledger at all.
+    Such an agent can acknowledge the generation after three re-applies of a wedged rule (and, without the
     #4472 fix, while a compensating teardown is outstanding), which can leave the rule unarmed under an acknowledged generation if the hung
     arm later fails (see the wedged-rule hold note in Guaranteed State).
   - **Telling the two kinds of build apart.** The base version number alone does not separate them: release 0.14.0 and its release
-    candidates, any 0.14.x hotfix cut from them, and dev or main builds from before the change all carry the waiver, and dev and main
+    candidates, any 0.14.x hotfix cut from them, and dev or main builds from after PR #4529 and before the change all carry the waiver, and dev and main
     builds report the base version set in `meson.build` (`0.14.0` when this entry was written) before and after the change. `yuzu-agent --version` and the agent's start-up log print the full version (`<version>+<build number>`)
     and the short commit hash, and the `yuzu.agent_version` heartbeat tag carries the same full version; a build from source carries the
     change only if its commit contains the #5459 change. The build number and commit hash are read
     from git when the build is configured, so a build from source that was not re-configured after
     pulling can report a stale commit hash. For a release build, use the release notes, which name the first release that
-    carries the #5459 change.
+    carries the #5459 change. The build number is `git rev-list --count HEAD` at configure time and the release workflow's checkouts do not
+    set a fetch depth, so a release artifact's `+<build number>` may not be a true commit count: compare build numbers only between builds
+    from the same checkout depth, and identify a release build by its release notes and commit hash.
   - See [Guaranteed State](guaranteed-state.md#sparkengine--the-next-generation-detection-engine-observe-only) and
     [Metrics](metrics.md#guardian-m1-health-stream-fleet-gauges).
 - [ ] **Changed agent signal handling (Linux/macOS):** graceful shutdown now runs

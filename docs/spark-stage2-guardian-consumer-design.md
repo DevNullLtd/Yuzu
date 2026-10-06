@@ -707,7 +707,8 @@ decision-count bound, not a wall-clock one: `decide_retry()` has one production 
 (`apply_rules()`), so it counts pushes. The push interval is
 `ceil(25 s / heartbeat) x heartbeat` (the server's 25 s minimum rounded up to a whole
 number of heartbeats), so at the 30 s default heartbeat the forced Reapply is about 330 s
-(eleven pushes) after the hold starts, about 275 s at a 25 s heartbeat, and other
+(eleven pushes) after the hold starts, about 275 s at a 25 s heartbeat (later if jitter
+delays a push to the next heartbeat), and other
 heartbeat intervals scale. The forced Reapply re-arms every
 rule in the push but does NOT unstick the wedged claim (an identical re-observation
 returns the existing claim); it bounds the dependence on the suppress classification
