@@ -1326,12 +1326,18 @@ struct FireOnExit {
 
 // The ceiling read waits for a free connection for the 250 ms authz budget, not the 2 s admin
 // budget. Both leases of a 2-connection pool are held, so the reader blocks inside the pool. A
-// helper thread frees one lease once the reader has finished, or after 750 ms if it has not:
-// the 250 ms budget has expired well before that, so the read fails and the helper's release
-// finds nobody waiting. A read that used the 2 s budget would still be waiting at 750 ms, get
-// the released connection and succeed. The pool's own saturated-pool clamp is raised to 5 s so
-// that only the caller's budget bounds the wait. The passing path takes about 250 ms and the
-// helper's timer is only reached on a regression.
+// helper thread frees one lease once the reader has finished, or after 750 ms if it has not.
+// What this pins is that the reader gives up well before the helper's 750 ms timer releases a
+// lease: a read that used the 2 s budget would still be waiting at 750 ms, get the released
+// connection and succeed. It does not pin the budget at exactly 250 ms; any budget comfortably
+// below 750 ms passes. The pool's own saturated-pool clamp is raised to 5 s so that only the
+// caller's budget bounds the wait. The passing path takes about 250 ms and the helper's timer
+// is only reached on a regression.
+//
+// A plain std::thread with an explicit join guard, not std::jthread: Apple Clang's libc++ has
+// no std::jthread, and a bare std::thread left joinable by a failed REQUIRE would call
+// std::terminate. The guards are declared after the thread so that on any unwind the reader-done
+// flag is set first and the join follows, before the lease objects, the pool and `done` die.
 TEST_CASE("ceiling read: the acquire budget is the 250 ms authz budget and not the 2 s admin "
           "budget",
           "[pg][authz_gates][service_scope]") {
@@ -1348,11 +1354,9 @@ TEST_CASE("ceiling read: the acquire budget is the 250 ms authz budget and not t
     REQUIRE(lease_b);
 
     ReaderDone done;
-    // Declared after `done` and before the guard: the guard fires first on unwind, then the
-    // jthread's destructor requests stop and joins.
-    std::jthread releaser{[&pool, &done, lease = std::move(lease_b)](std::stop_token st) mutable {
+    std::thread releaser{[&pool, &done, lease = std::move(lease_b)]() mutable {
         // Wait until the reader is parked inside the pool's bounded acquire.
-        while (pool.waiters() == 0 && !done.flag.load() && !st.stop_requested())
+        while (pool.waiters() == 0 && !done.flag.load())
             std::this_thread::yield();
         {
             std::unique_lock lk(done.mu);
@@ -1361,6 +1365,15 @@ TEST_CASE("ceiling read: the acquire budget is the 250 ms authz budget and not t
         }
         lease.reset();
     }};
+    // Destroyed in reverse order: FireOnExit sets the flag (waking the helper), then JoinGuard
+    // joins the helper.
+    struct JoinGuard {
+        std::thread& t;
+        ~JoinGuard() {
+            if (t.joinable())
+                t.join();
+        }
+    } join_guard{releaser};
     FireOnExit guard{done};
 
     auto result = rbac.role_permission_allowed_checked("ITServiceOwner", "Response", "Read");

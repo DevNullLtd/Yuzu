@@ -357,12 +357,12 @@ TEST_CASE("fleet-read routes real gate: each route answers the ceiling for exact
     }
 }
 
-// The Policy and Workflow call sites (#3526 ledger row qe-ceiling-route-wiring-pinned-for-one-of-
-// eight-securables): GET /api/v1/compliance/{id} (ComplianceRoutes, "Policy"), and the legacy
-// GET /api/workflow-executions/{id} plus its v1 twin GET /api/v1/workflow-executions/{id}
-// (WorkflowRoutes, "Workflow"). ITServiceOwner holds Policy CRUD and Workflow:Read under the
-// seeded defaults (rbac_store.cpp), so a service token minted by a user holding both pairs
-// passes the ceiling on all three. The rig wires neither a ComplianceApi, a WorkflowEngine nor a
+// The Policy and Workflow call sites (only five of the eight securables were pinned through a
+// real route before this case): GET /api/v1/compliance/{id} (ComplianceRoutes, "Policy"), and
+// the legacy GET /api/workflow-executions/{id} plus its v1 twin
+// GET /api/v1/workflow-executions/{id} (WorkflowRoutes, "Workflow"). ITServiceOwner holds Policy
+// CRUD and Workflow:Read under the seeded defaults (rbac_store.cpp), so a service token minted
+// by a user holding both pairs passes the ceiling on all three. The rig wires neither a ComplianceApi, a WorkflowEngine nor a
 // WorkflowApi, so a request the gate admits answers that route's own 503 "service unavailable".
 // Revoking one securable from ITServiceOwner must refuse exactly the sites that gate on it with
 // the ceiling's own 403, never touching the minter's ordinary session.

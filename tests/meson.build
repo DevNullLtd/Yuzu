@@ -1563,7 +1563,7 @@ if build_server
       'unit/server/test_rest_management_group_detail_degrade.cpp', # #1762 governance round-1: GET /management-groups/{id} fails closed on a degraded member read
       'unit/server/test_authz_model.cpp', # PR1.4: registry-independent authz model + #1788 per-device visibility (all four arms)
       'unit/server/test_authz_gates.cpp', # service-scope-confinement PR2: require_fleet_read / confine_agent_target
-      'unit/server/test_fleet_read_ceiling_routes_authz.cpp', # #3526: ITServiceOwner ceiling through real fleet-read routes (three Execution routes, the Enrollment route, a four-securable table)
+      'unit/server/test_fleet_read_ceiling_routes_authz.cpp', # #3526: ITServiceOwner ceiling through real fleet-read routes (Execution x3, Enrollment, a four-securable table, and the Policy and Workflow sites)
       'unit/server/test_upload_grants_service_scope.cpp', # #3526: GET /api/v1/upload-grants refuses a service-scoped token (real AuthRoutes)
       'unit/server/test_agent_properties_scope_authz.cpp', # #3700: require_scoped_permission on /api/agents/:id/properties
       'unit/server/test_authz_topology_floor.cpp', # #2376: the RBAC-off legacy-fallback topology floor (AccessReview/UserManagement/EnginePrincipal Read)
