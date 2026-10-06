@@ -2402,8 +2402,8 @@ env keys with defaults, which a reverted build ignores.
   `yuzu_gw_upstream_rpc_errors_total{code="encode"}` rises. The shipped
   `YuzuGatewayUpstreamErrors` alert (rate above 0.1 errors per second, no `code`
   filter) covers it only above that rate, so `YuzuGatewayUpstreamEncodeErrors`
-  (at least 10 increases of `code="encode"` in 10 minutes, so one malformed request
-  stays quiet) is the alert for this case. The `encode` series is pre-seeded to 0
+  (about ten increases of `code="encode"` in 10 minutes, `increase()` being
+  extrapolated, so one malformed request stays quiet) is the alert for this case. The `encode` series is pre-seeded to 0
   for `register`, `inventory`, `notify_stream` and `guardian`, and `exception` for
   those four plus `batch_heartbeat`; a marshal failure on the heartbeat buffer's
   flush is counted as `code="exception"` and is not covered by the encode alert.
