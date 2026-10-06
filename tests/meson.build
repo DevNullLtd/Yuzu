@@ -249,6 +249,7 @@ agent_test_exe = executable(
     'unit/test_updater.cpp',
     'unit/test_filesystem_read.cpp',
     'unit/test_filesystem_actions.cpp',
+    'unit/test_filesystem_local_dispatcher.cpp', # #4728: real filesystem plugin via LocalDispatcher -- `replace` through the shared atomic write
     'unit/test_confined_fs_rules.cpp',
     'unit/test_confined_fs_walk.cpp',
     'unit/test_confined_fs_posix.cpp',
@@ -564,6 +565,7 @@ agent_test_exe = executable(
     'unit/test_asset_tags_parsers.cpp',   # #232: pure cap/escape/apply_sync/snapshot helpers (asset_tags_parsers.hpp)
     'unit/test_asset_tags_store.cpp',   # #232: atomic state-file lifecycle (asset_tags_store.hpp), TempDir-based
     'unit/test_asset_tags_actions.cpp',   # #232: real asset_tags dylib/.so/.dll via LocalDispatcher, unguarded on every OS
+    'unit/test_tags_plugin.cpp',   # #4728: TU-inclusion seam over tags_plugin.cpp -- save_tags() through the shared atomic write
     'unit/test_asset_tags_sync_lock.cpp', # #232: TU-inclusion seam over asset_tags_plugin.cpp -- sync writes under g_mu (a condition-variable seam, no per-OS body, runs on every OS)
     'unit/test_system_hardening_parsers.cpp',            # Wave 8 PR8.1-b: pure state mappers + errno classifier over REAL CAPTURE fixtures
     'unit/test_system_hardening_win_parsers.cpp',        # Wave 8 PR8.1-b: pure mitigation-registry decoder over the-rig REAL CAPTURE fixtures
@@ -629,6 +631,7 @@ agent_test_exe = executable(
     include_directories('../agents/plugins/software_actions/src'), # software_actions_parsers.hpp (Wave 4 PR4.3b pure parser)
     include_directories('../agents/plugins/filesystem_posture/src'), # filesystem_posture_parsers.hpp / _legs.hpp (Wave 6 PR6.1-b pure headers)
     include_directories('../agents/plugins/asset_tags/src'),     # asset_tags_parsers.hpp / asset_tags_store.hpp (#232)
+    include_directories('../agents/plugins/tags/src'),           # tags_plugin.cpp (TU-inclusion, #4728)
   ],
   # agent_platform_args carries -DYUZU_HAVE_LIBSYSTEMD (Linux + libsystemd found)
   # so Linux real-mechanism Service spark tests can compile-gate on it, exactly
@@ -744,6 +747,7 @@ agent_test_exe = executable(
                 device_identity_plugin_lib,
                 echo_argv_fixture,
                 event_logs_plugin_lib,
+                filesystem_plugin_lib,  # #4728: test_filesystem_local_dispatcher.cpp loads the real filesystem plugin by path
                 filesystem_posture_plugin_lib,
                 hardware_plugin_lib,
                 installed_apps_plugin_lib,
@@ -2998,21 +3002,14 @@ test('flake-retry selftest',
 # PR1.2 (ADR-3002 Decision-10a): pure-logic selftest of the lexical spawn gate —
 # a seeded raw-spawn fixture must fail and the sanctioned-runner allowlist case
 # must pass. Wired here so the gate's own matcher is enforced on every platform
-# with bash, mirroring the flake-retry selftest above. Guarded so Windows (no
-# bash) skips cleanly rather than erroring at configure.
+# with bash, mirroring the flake-retry selftest above. The Windows test job's default
+# shell is MSYS2 bash (set in ci.yml), so its Test step runs these bash tests there;
+# `required: false` only lets a bash-less developer host configure cleanly.
 _bash_test = find_program('bash', required: false)
 if _bash_test.found()
   test('plugin-spawn lexical gate selftest',
     _bash_test,
     args: [files('../scripts/ci/check-plugin-spawn-lexical.sh'), '--selftest'],
-    suite: 'docs',
-    timeout: 60,
-  )
-  # docs/plugin-readme-standard.md rule 7 — the README touch rule's own
-  # fixture run (a fake `git` on PATH; no repository, no network).
-  test('plugin readme touch-rule selftest',
-    _bash_test,
-    args: [files('../scripts/ci/check-plugin-readme-touch.sh'), '--selftest'],
     suite: 'docs',
     timeout: 60,
   )
@@ -3025,19 +3022,31 @@ if _bash_test.found()
     suite: 'docs',
     timeout: 120,
   )
-  # #5333: start-UAT.sh kill_stale signals only PIDs it recorded and refuses on
-  # foreign port holders. Sources the script with kill/ps/pgrep/lsof/docker
-  # replaced by functions; spawns and signals nothing. The decoy command line
-  # contains yuzu-agent, as the `meson compile` the old pgrep -f killed did.
-  # Budget: about 1 s on macOS and Linux, but 38-45 s on the Windows runners
-  # and over 60 s when other jobs share the box. 180 s is 4x the slowest clean
-  # Windows run; a real hang still trips it.
-  test('start-UAT.sh kill_stale scoping (#5333)',
-    _bash_test,
-    args: [files('shell/test_start_uat_kill_stale.sh')],
-    suite: 'docs',
-    timeout: 180,
-  )
+  # Registered off Windows only (#5428): both fork hundreds of subshells (about
+  # 1-3 s on macOS/Linux, 28-98 s under MSYS2 on the shared 4-runner Windows box)
+  # and exercise scripts that never run on Windows -- start-UAT.sh is the
+  # macOS/Linux rig (Windows uses scripts/win-start-UAT.sh) and the README
+  # touch rule runs on hosted Ubuntu (docs-lint.yml).
+  if host_machine.system() != 'windows'
+    # docs/plugin-readme-standard.md rule 7 — the README touch rule's own
+    # fixture run (a fake `git` on PATH; no repository, no network).
+    test('plugin readme touch-rule selftest',
+      _bash_test,
+      args: [files('../scripts/ci/check-plugin-readme-touch.sh'), '--selftest'],
+      suite: 'docs',
+      timeout: 60,
+    )
+    # #5333: start-UAT.sh kill_stale signals only PIDs it recorded and refuses on
+    # foreign port holders. Sources the script with kill/ps/pgrep/lsof/docker
+    # replaced by functions; spawns and signals nothing. The decoy command line
+    # contains yuzu-agent, as the `meson compile` the old pgrep -f killed did.
+    test('start-UAT.sh kill_stale scoping (#5333)',
+      _bash_test,
+      args: [files('shell/test_start_uat_kill_stale.sh')],
+      suite: 'docs',
+      timeout: 60,
+    )
+  endif
 endif
 
 # QE-INFO / build-ci B3: tests/shell/test_capability_matrix_gate.sh (PR1.1
@@ -3083,34 +3092,29 @@ if _bash_test.found() and meson.can_run_host_binaries() and build_agent
   )
 endif
 
-# #4666 PR-2 W3a: static lexical gate over main.cpp's log-handoff wiring call sites (the
-# four textual invariants agent_log_wiring.hpp's/log_handoff.hpp's own header banners
-# describe -- see the script's own header). No build required, so gated only on bash
-# being present, same as the other lexical selftests above.
-if _bash_test.found()
-  test('log handoff wiring lexical gate (#4666 PR-2 W3a)',
-    _bash_test,
-    args: [files('shell/test_log_handoff_wiring_lexical.sh')],
-    suite: 'agent',
-    timeout: 60,
-  )
-endif
+# #4666 PR-2 W3a: static lexical gate over main.cpp's and service_win.cpp's log-handoff
+# wiring call sites (see the script's own header). No build required. Python, not bash:
+# one process on every OS instead of a grep/head/tail pipeline per check (#5428). Never
+# raise the budget -- port, split or host-gate instead.
+test('log handoff wiring lexical gate (#4666 PR-2 W3a)',
+  _python3_test,
+  args: [files('test_log_handoff_wiring_lexical.py')],
+  suite: 'agent',
+  timeout: 30,
+)
 
 # #2182: static lexical gate pinning that agent.cpp still CALLS the tested OtaUpdateThread /
 # CtxSlot stop_seen() primitives (no AgentImpl seam exists to test that, #1492) and keeps the
-# flag-then-cancel_ctx() teardown order. Carries its own negative-control self-test. No build
-# required, gated only on bash like the log-handoff gate above.
-if _bash_test.found()
-  test('agent OTA/ctx-slot wiring lexical gate (#2182)',
-    _bash_test,
-    args: [files('shell/test_agent_ota_wiring_lexical.sh')],
-    suite: 'agent',
-    # 90 s (was 60): this script spawns perl/grep per mutation and per invariant, so it is
-    # slow on Windows (17 s on a quiet MSVC box vs 1.4 s on Linux, 2026-10-02) and timed out
-    # at 60.23 s on a busy Windows CI leg (PR #5267) while running beside the agent shards.
-    timeout: 90,
-  )
-endif
+# flag-then-cancel_ctx() teardown order. Carries its own in-memory mutation self-test. No build
+# required. Python, not bash: one process (well under a second on every OS) instead of ~500-750 grep/tr/perl/cmp
+# forks that timed out at 90 s on the Windows CI leg (#5428). Never raise the budget -- port,
+# split or host-gate instead.
+test('agent OTA/ctx-slot wiring lexical gate (#2182)',
+  _python3_test,
+  args: [files('test_agent_ota_wiring_lexical.py')],
+  suite: 'agent',
+  timeout: 30,
+)
 
 # #4666 PR-2 W3a MI-2: report-only symbol-binding probe over the built exe/core-lib/
 # agent_actions plugin (see the script's own header for what it does and does not prove).
@@ -3258,15 +3262,14 @@ test('spark evidence format lockstep (#4665)',
 # #5047: static lexical gate over server.cpp's two TierPolicyFn wiring sites -- both
 # must call AuthRoutes::gateless_tier_policy_fn(), never a re-inlined local lambda (see
 # the script's own header for the clause-5 rationale). No build required, same class as
-# the RBAC cross-schema query-owner seam check above.
-if _bash_test.found()
-  test('tier policy wiring lexical gate (#5047)',
-    _bash_test,
-    args: [files('shell/test_tier_policy_wiring_lexical.sh')],
-    suite: 'docs',
-    timeout: 30,
-  )
-endif
+# the RBAC cross-schema query-owner seam check above. Python, one process (#5428).
+# Never raise the budget -- port, split or host-gate instead.
+test('tier policy wiring lexical gate (#5047)',
+  _python3_test,
+  args: [files('test_tier_policy_wiring_lexical.py')],
+  suite: 'docs',
+  timeout: 30,
+)
 
 # #4665 regression net: a position-aware lexical scanner over the Guardian/Spark
 # subsystem (agents/core/src + server/core/src + common/include, filtered to the
