@@ -7,19 +7,18 @@
 /// the Actions lens (generic action runner) is added on top of this `Deps` struct
 /// by feat/hardware-ci-actions without touching the routes registered here.
 ///
-/// Shares `InventoryDeviceRow`/`InventoryDevicesResult` with `InventoryRoutes` (the
-/// roster shape is identical; the roster's PRODUCTION source is the same
-/// `inv_devices_fn` roster body in server.cpp, extracted so both the Software tab's
-/// existing DevicesFn and this module's unfiltered RosterFn share one build). Query/
-/// sort/paginate/JSON logic lives in `hardware_list_model.hpp` (PURE, no httplib) —
-/// this class only wires HTTP semantics (auth, gates, audit) around it.
+/// `InventoryDeviceRow`/`InventoryDevicesResult` are declared in `inventory_routes.hpp`
+/// and shared with `hardware_list_model`/`inventory_ci_join` (the roster's PRODUCTION
+/// source is the `build_hw_roster` body in server.cpp, handed to this module as its
+/// unfiltered RosterFn). Query/sort/paginate/JSON logic lives in
+/// `hardware_list_model.hpp` (PURE, no httplib) — this class only wires HTTP semantics
+/// (auth, gates, audit) around it.
 ///
 /// AUTH: the list and REST twin gate SOLELY on `FleetReadFn` (admit-then-filter,
 /// ADR-0017 — never stacked with a second permission check for the same
 /// securable:operation, the BLOCKING defect `FleetReadFn`'s own contract exists to
 /// avoid). The CI record and its lenses gate on `scoped_perm_fn(Inventory,Read,id)`
-/// — the tier + management-group chokepoint, same as the Software tab's per-device
-/// drill.
+/// — the tier + management-group chokepoint.
 
 #include "authz_gates.hpp"           // authz::FleetReadGate
 #include "command_capability.hpp"    // CommandCapability, ClassificationError
@@ -171,7 +170,11 @@ std::string render_hardware_action_result(const std::string& plugin, const std::
 class HardwareRoutes {
 public:
     using AuthFn = InventoryRoutes::AuthFn;
-    using ScopedPermFn = InventoryRoutes::ScopedPermFn;
+    /// Per-device tier + management-group scope gate (wraps require_scoped_permission).
+    using ScopedPermFn =
+        std::function<bool(const httplib::Request&, httplib::Response&,
+                           const std::string& securable_type, const std::string& operation,
+                           const std::string& agent_id)>;
     using AuditFn = InventoryRoutes::AuditFn;
 
     /// The route's SOLE authorization gate for the fleet-wide list + its REST twin.

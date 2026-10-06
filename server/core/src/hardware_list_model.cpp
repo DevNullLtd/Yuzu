@@ -23,9 +23,8 @@ std::string to_lower_ascii(std::string_view s) {
 
 bool is_blank_sentinel(const std::string& s) { return s.empty() || s == "unknown"; }
 
-// inventory_ui.cpp has its own os_label() (anonymous-namespace, internal linkage) —
-// this file defines its own copy rather than exporting a shared one, since pulling
-// in the whole UI translation unit just for this one mapping isn't worth it.
+// Local OS-token -> display-label mapping (this pure model must not pull in a UI
+// translation unit just for it).
 std::string os_label(const std::string& os) {
     const std::string lower = to_lower_ascii(os);
     if (lower == "windows" || lower == "win")

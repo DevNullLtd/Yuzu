@@ -130,7 +130,7 @@ public:
     [[nodiscard]] std::expected<std::optional<DeviceCiRecord>, CiReadError>
     get_device_ci(std::string_view agent_id);
 
-    /// The whole device-CI roster (the PR2 devices tab source), hostname-sorted,
+    /// The whole device-CI roster (the Hardware list source), hostname-sorted,
     /// capped at a hard ceiling regardless of `limit`. Authoritative: `std::nullopt`
     /// on a store/pool/query degrade, NEVER a silent empty. An empty value = no rows.
     [[nodiscard]] std::optional<std::vector<DeviceCiRecord>> list_device_ci(int limit);
