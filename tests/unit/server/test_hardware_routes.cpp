@@ -306,6 +306,49 @@ TEST_CASE("route: dex/guardian lenses check scoped GuaranteedState:Read before r
     }
 }
 
+// ───────────────────────── Audit verbs: behavioural-PII tier ───────────────────
+
+TEST_CASE("route: hardware list + CI record emit the inventory.* behavioural-PII verbs",
+          "[hardware][route]") {
+    HwHarness h;
+    h.roster_rows = {make_row("agent-1", "AUDIT-HOST", "windows", true)};
+    h.ci_detail.identity = make_row("agent-1", "AUDIT-HOST", "windows", true);
+    auto has = [&](const std::string& row) {
+        for (auto& a : h.audit_full)
+            if (a == row)
+                return true;
+        return false;
+    };
+
+    REQUIRE(h.sink.Get("/fragments/hardware/list"));
+    REQUIRE(has("inventory.devices|success|Inventory|fleet"));
+
+    // The verb is inventory.device.ci for every lens EXCEPT software.
+    REQUIRE(h.sink.Get("/fragments/hardware/ci?id=agent-1&lens=software"));
+    REQUIRE(has("inventory.device.software|success|Agent|agent-1"));
+    REQUIRE_FALSE(has("inventory.device.ci|success|Agent|agent-1"));
+
+    REQUIRE(h.sink.Get("/fragments/hardware/ci?id=agent-1&lens=tags"));
+    REQUIRE(has("inventory.device.ci|success|Agent|agent-1"));
+}
+
+TEST_CASE("route: hardware list audit-persist failure — fragment sets Sec-Audit-Failed, REST "
+          "fails closed",
+          "[hardware][route]") {
+    HwHarness h;
+    h.roster_rows = {make_row("agent-1", "AUDIT-HOST", "windows", true)};
+    h.audit_should_fail = true;
+
+    auto frag = h.sink.Get("/fragments/hardware/list");
+    REQUIRE(frag);
+    REQUIRE(frag->status == 200); // set-and-proceed
+    REQUIRE(frag->get_header_value("Sec-Audit-Failed") == "true");
+
+    auto rest = h.sink.Get("/api/v1/hardware");
+    REQUIRE(rest);
+    REQUIRE(rest->status == 503); // fail-closed
+}
+
 // ───────────────────────── REST v1: JSON null-vs-value contract ────────────────
 
 TEST_CASE("route: GET /api/v1/hardware — new fields null-vs-value semantics",

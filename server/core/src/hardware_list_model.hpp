@@ -13,8 +13,8 @@
 /// zero network/store dependencies, and every function here is callable without
 /// ever touching an httplib type.
 ///
-/// Roster rows are the same `InventoryDeviceRow` the Software/Devices tab already
-/// produces (server.cpp's `inv_devices_fn` roster, endpoint_state + device_ci join);
+/// Roster rows are the same `InventoryDeviceRow` the Hardware roster source
+/// produces (server.cpp's `build_hw_roster`, endpoint_state + device_ci join);
 /// this header only orders, filters, and paginates that roster — it never fetches it.
 
 #include "device_inventory_store.hpp"    // DeviceCiRecord, CiReadError

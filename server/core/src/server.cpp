@@ -17441,17 +17441,14 @@ private:
                                     : DeviceLensRoutes::GuardianApiPtr{},
             audit_fn);
 
-        // InventoryRoutes — /inventory: the SOFTWARE inventory list (fleet catalogue +
-        // installs-per-version drill + find-by-name) over SoftwareInventoryStore, gated on
-        // the GLOBAL Inventory:Read (the catalogue/find aggregates are NOT mgmt-group
+        // InventoryRoutes — /software: the SOFTWARE inventory list (fleet catalogue +
+        // installs-per-version drill + "devices >" expansion) over SoftwareInventoryStore,
+        // gated on the GLOBAL Inventory:Read (the catalogue aggregates are NOT mgmt-group
         // scoped — ADR-0017 confinement inert under the global gate, caveated in the UI;
-        // FIND applies the SAME per-row Inventory:Read drop filter the REST sibling does).
-        // Plus a THIN device-CI tab sourced from the persisted, offline-survivable
-        // endpoint_state store (so offline devices still appear) joined to the registry's
-        // online set; the per-device software drill gates on scoped_perm_fn(Inventory,Read,id)
-        // and audits the access (set-and-proceed — machine-scope data). Reuses the shared
-        // auth/perm/scoped-perm/audit closures + the SAME check_scoped_permission predicate
-        // the REST /api/v1/inventory/software route uses (cross-surface parity).
+        // the expansion applies the SAME per-row Inventory:Read drop filter the REST
+        // sibling does). Reuses the shared auth/perm/audit closures + the SAME
+        // check_scoped_permission predicate the REST /api/v1/inventory/software route
+        // uses (cross-surface parity).
         auto inv_human_age = [](std::int64_t ms) -> std::string {
             if (ms < 0)
                 ms = 0;
@@ -17466,13 +17463,9 @@ private:
                 return std::to_string(h) + "h ago";
             return std::to_string(h / 24) + "d ago";
         };
-        // Extracted so both the Software tab's DevicesFn (scoped to one operator) and
-        // the Hardware tab's RosterFn (unfiltered — the FleetReadGate's own scope is
-        // the sole filter downstream, applied by HardwareRoutes) share ONE roster
-        // build. `visible` is nullopt for the unfiltered call.
-        auto build_hw_roster =
-            [this, inv_human_age](
-                const std::optional<std::set<std::string>>& visible) -> InventoryDevicesResult {
+        // The Hardware tab's RosterFn: unfiltered — the FleetReadGate's own scope is the
+        // sole filter downstream, applied by HardwareRoutes.
+        auto build_hw_roster = [this, inv_human_age]() -> InventoryDevicesResult {
             InventoryDevicesResult result;
             auto& out = result.rows;
             if (!offline_endpoint_store_) {
@@ -17493,8 +17486,6 @@ private:
                                             std::chrono::system_clock::now().time_since_epoch())
                                             .count();
             for (const auto& e : eps) {
-                if (visible && !visible->count(e.agent_id))
-                    continue; // out of the operator's management scope
                 InventoryDeviceRow r;
                 r.agent_id = e.agent_id;
                 r.hostname = e.hostname;
@@ -17515,11 +17506,11 @@ private:
             // clamped to DeviceInventoryStore's kListRowCap (100k)" per that store's own
             // limit-clamp contract, not "zero rows" — (symmetric with the full
             // offline_endpoint_store_ materialize above), joined by agent_id via the pure
-            // attach_device_ci (inventory_ci_join.cpp). `out` is ALREADY the
-            // visible-confined roster (the loop above already dropped out-of-scope
-            // agents) — attach_device_ci only ever looks up by an agent_id already in
-            // `out`, so a CI row for an out-of-scope agent riding along in the same read
-            // is never attached, never rendered. A degrade (nullopt) leaves CI columns
+            // attach_device_ci (inventory_ci_join.cpp). `out` is the
+            // UNFILTERED roster — confinement is HardwareRoutes' `scoped_roster` on the
+            // FleetReadGate scope, downstream of this join; attach_device_ci only ever
+            // looks up by an agent_id already in `out`, never re-deriving
+            // visibility. A degrade (nullopt) leaves CI columns
             // blank — the roster itself is still shown (this list is best-effort, unlike
             // the Software tab's authoritative reads; see the existing empty-roster note).
             // KNOWN FOLLOW-UP (#1783 — gov Gate 3 performance + architect + Gate 5 chaos
@@ -17532,7 +17523,7 @@ private:
             // `result.ci_degraded` (#1785 review HIGH-1) tells the route's audit whether
             // the CI columns above are genuinely enriched or blank because this join
             // failed/was unwired — an unwired store is treated the same as a live failure
-            // (mirrors AgentCiFn's documented contract for the per-device drill).
+            // (mirrors the Hardware CI record's CiDetailFn contract).
             if (device_inventory_store_) {
                 auto ci_list = device_inventory_store_->list_device_ci(0);
                 if (ci_list) {
@@ -17597,13 +17588,7 @@ private:
             }
             return result;
         };
-        auto inv_devices_fn = [visible_set_fn,
-                               build_hw_roster](const std::string& username) -> InventoryDevicesResult {
-            return build_hw_roster(visible_set_fn(username));
-        };
-        auto hw_roster_fn = [build_hw_roster]() -> InventoryDevicesResult {
-            return build_hw_roster(std::nullopt);
-        };
+        auto hw_roster_fn = build_hw_roster;
         // One device's identity row for the Hardware CI record — checks the live
         // registry first (online, authoritative hostname/OS), else falls back to a
         // linear scan of the same 30-day offline_endpoint_store_ roster the list
@@ -17685,7 +17670,7 @@ private:
         };
         inventory_routes_ = std::make_unique<InventoryRoutes>();
         inventory_routes_->register_routes(
-            *web_server_, auth_fn, perm_fn, scoped_perm_fn,
+            *web_server_, auth_fn, perm_fn,
             [this](const SoftwareCatalogQuery& q)
                 -> std::optional<std::vector<SoftwareCatalogRow>> {
                 if (!software_inventory_store_)
@@ -17708,13 +17693,7 @@ private:
                     return std::nullopt;
                 return software_inventory_store_->query_software(q);
             },
-            [this](const std::string& id) -> std::optional<std::vector<SoftwareEntry>> {
-                if (!software_inventory_store_)
-                    return std::nullopt;
-                return software_inventory_store_->get_agent_software(id);
-            },
-            inv_devices_fn,
-            // FIND per-row Inventory:Read management-group scope predicate — the SAME
+            // "devices >" per-row Inventory:Read management-group scope predicate — the SAME
             // check_scoped_permission chokepoint the REST route + MCP tool use.
             // FAIL-CLOSED on a corrupt/load-failed rbac.db (#1717): gates on
             // rbac_enforcement_in_effect, NOT raw !is_rbac_enabled() (which fails OPEN — a
@@ -17742,19 +17721,6 @@ private:
                 return software_inventory_store_->count_stale_agents(cutoff);
             },
             audit_fn,
-            // Per-device CI record (drill panel, post scoped_perm_fn gate). Mirrors
-            // agent_sw_fn_'s "unwired closure" fallback: not applicable here since this
-            // closure is always wired when device_inventory_store_ exists, and returns a
-            // live kDegraded when it doesn't (the store itself failed to construct/open).
-            // Appended after audit_fn (rather than inserted mid-signature) to match the
-            // DeviceRoutes/DexRoutes convention of growing register_routes by appending
-            // new closures with a `= {}` default (gov Gate 3 architect review).
-            [this](const std::string& id)
-                -> std::expected<std::optional<DeviceCiRecord>, CiReadError> {
-                if (!device_inventory_store_)
-                    return std::unexpected(CiReadError::kDegraded);
-                return device_inventory_store_->get_device_ci(id);
-            },
             // Round-3 item 8: agent_id -> hostname for the Software page's
             // "devices ›" expansion. One bulk read per render (never per-row) —
             // endpoint_state's hostname column is written on every heartbeat

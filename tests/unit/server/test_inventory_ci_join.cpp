@@ -4,7 +4,7 @@
 /// agent that isn't already present in the caller's visibility-filtered `rows` —
 /// proving the map can safely hold out-of-scope entries (from the same
 /// `list_device_ci(0)` read) without leaking them past the roster's confinement
-/// (the confinement itself is `inv_devices_fn`'s `visible_set_fn` filter, upstream
+/// (the confinement itself is HardwareRoutes' `scoped_roster`, downstream
 /// of this function — see inventory_ci_join.hpp).
 
 #include "inventory_ci_join.hpp"

@@ -518,10 +518,10 @@ place, **Hardware** and **Software**, each its own page:
     drop, 1000-row cap, `inventory.software.query` audit verb) — a short/zero result
     under a narrow scope is *incomplete*, not *absent*.
 
-  The expansion replaces the standalone **Find software** tab, which is gone from the
-  sub-nav. Its routes, `/fragments/inventory/find` and `/fragments/inventory/find/results`,
-  are still registered for old bookmarks and deep links, but nothing in the UI links to
-  them any more — treat them as a legacy escape hatch, not a supported feature.
+  The expansion replaces the standalone **Find software** tab and the old Devices-tab
+  fragments. Their routes (`/fragments/inventory/find`, `/fragments/inventory/find/results`,
+  `/fragments/inventory/devices`, `/fragments/inventory/device`) were removed and now
+  return `404`; `/inventory` itself still redirects (`302`) to `/hardware`.
 
 **On store degradation** the **`/software`** catalogue, its **devices ›** expansion, and
 the CI record's **Installed software** lens — the *authoritative* reads — show an

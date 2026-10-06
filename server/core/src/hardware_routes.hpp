@@ -8,9 +8,8 @@
 /// by feat/hardware-ci-actions without touching the routes registered here.
 ///
 /// Shares `InventoryDeviceRow`/`InventoryDevicesResult` with `InventoryRoutes` (the
-/// roster shape is identical; the roster's PRODUCTION source is the same
-/// `inv_devices_fn` roster body in server.cpp, extracted so both the Software tab's
-/// existing DevicesFn and this module's unfiltered RosterFn share one build). Query/
+/// roster shape is identical; the roster's PRODUCTION source is the `build_hw_roster`
+/// roster body in server.cpp, handed to this module as its unfiltered RosterFn). Query/
 /// sort/paginate/JSON logic lives in `hardware_list_model.hpp` (PURE, no httplib) —
 /// this class only wires HTTP semantics (auth, gates, audit) around it.
 ///

@@ -218,7 +218,9 @@ Therefore we **coexist, not replace**:
 > gate — a management-group-confined operator now gets a genuinely filtered result
 > instead of a 403, and a service-scoped token gets a filtered result instead of a
 > blanket deny. This closes ADR-0017's PR-D backlog item for these two surfaces; the
-> `/inventory` dashboard Find tab is unmigrated and stays global-gate-only for now.
+> `/inventory` dashboard Find tab is unmigrated and stays global-gate-only for now
+> (that tab's routes were since removed; the equivalent read is the `/software` page's
+> devices expansion, still global-gate-only).
 > See `docs/security-reviews/service-scope-phase2-migrations-2026-08.md`.
 
 ## Consequences
@@ -341,7 +343,8 @@ daily-sync thread).
 originally scoped the DPIA/Workstream-E entry as a "pre-correlation-PR assurance
 item" — written when this data was store-only (central Postgres, no operator
 surface). That framing is now stale: the `/inventory` Devices tab CI columns +
-per-device CI panel (PR2 of this ladder) make serial/system_uuid/primary_mac
+per-device CI panel (PR2 of this ladder; now the Hardware CI list/record — the
+`/inventory` Devices-tab fragments were removed) make serial/system_uuid/primary_mac
 **operator-visible** for the first time, which is a co-determination trigger
 point distinct from mere central storage (works-council review is about
 monitoring *capability becoming exercised*, not just data existing in a DB).

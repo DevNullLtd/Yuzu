@@ -1,45 +1,32 @@
 #pragma once
 
 /// @file inventory_routes.hpp
-/// Dedicated /inventory dashboard — the SOFTWARE inventory lens (installed-software
-/// list: title -> installs -> versions -> installs-per-version, daily-synced,
-/// ADR-0016) plus a device-CI inventory tab (host / OS / online / last-seen,
-/// sourced from the persisted, offline-survivable endpoint_state store so offline
-/// devices still appear) and a fleet "find software" tab (which devices run X).
-///
-/// The device tab's CI columns (serial / model / CPU / RAM) and the per-device CI
-/// panel are real (PR2) — sourced from `DeviceInventoryStore` (the `device_ci`
-/// daily-sync source, ADR-0016 source #3). Disk and owner/location are deliberately
-/// NOT shown yet: disk is deferred pending a macOS `do_disks` collection fix;
-/// owner/location are not agent-collected (future operator-set CMDB enrichment).
-/// Clicking a device shows its CI record + installed software (get_agent_software).
+/// /software dashboard — the SOFTWARE inventory lens (installed-software list:
+/// title -> installs -> versions -> installs-per-version, daily-synced, ADR-0016)
+/// plus the "devices >" expansion (which devices run title X). Devices and their CI
+/// record live on /hardware; /inventory only redirects there.
 ///
 /// Product UI: HTMX, server-rendered, dark-theme only, htmx core attrs only (CSP
 /// blocks hx-on — onclick/oninput helpers instead). Reuses the shared full-page
 /// shell (guardian_page_ui.cpp kGuardianDetailPageHtml) + its `.gp-*` component CSS.
 ///
-/// AUTH: the /inventory page shell is auth-only chrome. The data fragments gate on
+/// AUTH: the /software page shell is auth-only chrome. The data fragments gate on
 /// the GLOBAL `Inventory:Read` (the same securable + scope predicate the REST
 /// /api/v1/inventory/software route + the MCP query_installed_software tool use):
-///   * SOFTWARE catalogue / version drill / FIND are FLEET-WIDE aggregates — gated on
-///     global Inventory:Read; the catalogue/version counts are NOT management-group
-///     scoped (ADR-0017 confinement inert under the global gate — caveated in the UI),
-///     and FIND applies the same per-row management-group drop filter the REST sibling
-///     does (+ audits the omission);
-///   * the PER-DEVICE software drill gates on `scoped_perm_fn(Inventory,Read,id)` — the
-///     tier + management-group chokepoint — so an operator only reads a device inside
-///     their scope, and audits the access (set-and-proceed; machine-scope data, lower
-///     sensitivity than the behavioural-PII device lenses).
+/// the catalogue / version drill / "devices >" expansion are FLEET-WIDE aggregates;
+/// the catalogue/version counts are NOT management-group scoped (ADR-0017
+/// confinement inert under the global gate — caveated in the UI), and the expansion
+/// applies the same per-row management-group drop filter the REST sibling does
+/// (+ audits the omission).
 
 #include <yuzu/server/auth.hpp>
 
-#include "device_inventory_store.hpp"    // DeviceCiRecord / CiReadError (device-CI panel, PR2)
+#include "device_inventory_store.hpp"    // DeviceCiRecord / CiReadError (Hardware CI consumers)
 #include "software_inventory_store.hpp" // SoftwareCatalogRow / SoftwareVersionCount / SoftwareEntry / SoftwareFleetRow / *Query
 
 #include <httplib.h>
 
 #include <cstdint>
-#include <expected>
 #include <functional>
 #include <optional>
 #include <string>
@@ -55,8 +42,8 @@ class HttpRouteSink;
 /// device-CI enrichment (PR2, `DeviceInventoryStore`-backed, attached by
 /// `attach_device_ci` in `inventory_ci_join.cpp`). A `ci_*` field is an empty string
 /// OR the literal `"unknown"` sentinel when the agent hasn't synced yet / doesn't
-/// know it (e.g. a serial-less VM) — render via the shared `ci_disp()` helper
-/// (inventory_ui.cpp), never raw.
+/// know it (e.g. a serial-less VM) — render via hardware_ui.cpp's `ci_disp()`
+/// helper, never raw.
 struct InventoryDeviceRow {
     std::string agent_id;
     std::string hostname;
@@ -155,43 +142,13 @@ std::string render_inventory_software_fragment(
 std::string render_inventory_versions_fragment(
     const std::string& name, const std::optional<std::vector<SoftwareVersionCount>>& versions);
 
-/// DEVICES tab (thin CI): the device list + an empty drill container. `q`/`os_token`/
-/// `status_token` are echoed into the controls so the fragment is self-describing.
-std::string render_inventory_devices_fragment(const std::vector<InventoryDeviceRow>& rows,
-                                              const std::string& q, const std::string& os_token,
-                                              const std::string& status_token);
-
-/// PER-DEVICE drill: the CI record panel + installed software (get_agent_software).
-/// `online` drives the "live vs last daily sync" note for an offline device. `ci`
-/// mirrors `DeviceInventoryStore::get_device_ci`'s three-state authoritative read: a
-/// value holding a record renders the CI panel; a value holding `std::nullopt` renders
-/// an honest "no CI record yet"; `std::unexpected(kDegraded)` renders a degrade
-/// banner. `now_secs` lets the pure renderer format first/last-synced relative time
-/// without calling the clock itself (mirrors the software rollup's `now_secs`).
-std::string render_inventory_device_software_fragment(
-    const std::string& agent_id, const std::string& hostname,
-    const std::optional<std::vector<SoftwareEntry>>& software, bool online,
-    const std::expected<std::optional<DeviceCiRecord>, CiReadError>& ci, std::int64_t now_secs);
-
-/// FIND tab shell: the search box (hx-get -> the results endpoint) + an empty results
-/// container. No data read here (the shell is just chrome under Inventory:Read).
-std::string render_inventory_find_fragment(const std::string& initial_name);
-
-/// FIND results: which devices run software `name` (already scope-filtered). `hit_cap`
-/// flags a truncated page; `devices_omitted` is the management-group drop count.
-std::string render_inventory_find_results_fragment(
-    const std::string& name, const std::optional<std::vector<SoftwareFleetRow>>& rows, bool hit_cap,
-    std::size_t devices_omitted);
-
-/// SOFTWARE "devices ›" expansion (round-3 item 8): the same "which devices run
-/// this title" data as the (now-unlinked) Find tab, but rendered as an inline
-/// expansion under a catalogue row instead of a standalone page — Signature and
+/// SOFTWARE "devices ›" expansion (round-3 item 8): "which devices run this
+/// title", rendered as an inline expansion under a catalogue row — Signature and
 /// Ecosystem columns (both already on `SoftwareEntry`, previously unrendered
 /// anywhere) plus a client-side `gpSearch` filter box, since a popular title can
 /// have hundreds of installs. `hostnames` resolves `agent_id -> hostname` (best-
 /// effort; a miss renders the bare agent_id, never blocks the row). `nullopt` rows
-/// = store degrade; `devices_omitted` mirrors the Find results' management-group
-/// drop count.
+/// = store degrade; `devices_omitted` is the management-group drop count.
 std::string render_inventory_software_devices_fragment(
     const std::string& name, const std::optional<std::vector<SoftwareFleetRow>>& rows, bool hit_cap,
     std::size_t devices_omitted, const std::unordered_map<std::string, std::string>& hostnames);
@@ -223,26 +180,7 @@ public:
     using FleetSoftwareFn =
         std::function<std::optional<std::vector<SoftwareFleetRow>>(const SoftwareFleetQuery&)>;
 
-    /// One device's installed software (per-device drill, post-authz).
-    using AgentSoftwareFn =
-        std::function<std::optional<std::vector<SoftwareEntry>>(const std::string& agent_id)>;
-
-    /// The device-CI roster, scoped to `username` (offline-inclusive; assembled in
-    /// server.cpp from endpoint_state + the registry online set + the visible-agent
-    /// set + the device-CI enrichment join, `attach_device_ci`).
-    using DevicesFn = std::function<InventoryDevicesResult(const std::string& username)>;
-
-    /// One device's CI record (per-device drill's CI panel, post-authz — the
-    /// `scoped_perm_fn(Inventory,Read,id)` gate already ran). Mirrors
-    /// `DeviceInventoryStore::get_device_ci`'s three-state contract exactly: a value
-    /// holding a record = found; a value holding `std::nullopt` = absent (no CI
-    /// synced yet); `std::unexpected(kDegraded)` = store/pool/query failure —
-    /// including an unwired closure, which the route treats the same as a live
-    /// failure (mirrors `AgentSoftwareFn` unwired -> nullopt -> degrade banner).
-    using AgentCiFn = std::function<std::expected<std::optional<DeviceCiRecord>, CiReadError>(
-        const std::string& agent_id)>;
-
-    /// Per-(operator, agent) management-group predicate for the FIND per-row scope drop
+    /// Per-(operator, agent) management-group predicate for the "devices ›" per-row scope drop
     /// (the same Inventory:Read scope predicate the REST route uses). Empty = no filter.
     using ScopeFn =
         std::function<bool(const std::string& username, const std::string& agent_id)>;
@@ -265,32 +203,26 @@ public:
     using HostnamesFn = std::function<std::unordered_map<std::string, std::string>()>;
 
     void register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn perm_fn,
-                         ScopedPermFn scoped_perm_fn, CatalogFn catalog_fn,
-                         CatalogMetaFn catalog_meta_fn, VersionsFn versions_fn,
-                         FleetSoftwareFn fleet_fn, AgentSoftwareFn agent_sw_fn, DevicesFn devices_fn,
-                         ScopeFn scope_fn = {}, StaleFn stale_fn = {}, AuditFn audit_fn = {},
-                         AgentCiFn agent_ci_fn = {}, HostnamesFn hostnames_fn = {});
+                         CatalogFn catalog_fn, CatalogMetaFn catalog_meta_fn,
+                         VersionsFn versions_fn, FleetSoftwareFn fleet_fn, ScopeFn scope_fn = {},
+                         StaleFn stale_fn = {}, AuditFn audit_fn = {},
+                         HostnamesFn hostnames_fn = {});
 
     /// HttpRouteSink overload — testable in-process via TestRouteSink (no httplib
     /// acceptor; the #438 TSan trap). The httplib::Server& overload wraps + delegates.
     void register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_fn,
-                         ScopedPermFn scoped_perm_fn, CatalogFn catalog_fn,
-                         CatalogMetaFn catalog_meta_fn, VersionsFn versions_fn,
-                         FleetSoftwareFn fleet_fn, AgentSoftwareFn agent_sw_fn, DevicesFn devices_fn,
-                         ScopeFn scope_fn = {}, StaleFn stale_fn = {}, AuditFn audit_fn = {},
-                         AgentCiFn agent_ci_fn = {}, HostnamesFn hostnames_fn = {});
+                         CatalogFn catalog_fn, CatalogMetaFn catalog_meta_fn,
+                         VersionsFn versions_fn, FleetSoftwareFn fleet_fn, ScopeFn scope_fn = {},
+                         StaleFn stale_fn = {}, AuditFn audit_fn = {},
+                         HostnamesFn hostnames_fn = {});
 
 private:
     AuthFn auth_fn_;
     PermFn perm_fn_;
-    ScopedPermFn scoped_perm_fn_;
     CatalogFn catalog_fn_;
     CatalogMetaFn catalog_meta_fn_;
     VersionsFn versions_fn_;
     FleetSoftwareFn fleet_fn_;
-    AgentSoftwareFn agent_sw_fn_;
-    DevicesFn devices_fn_;
-    AgentCiFn agent_ci_fn_;
     ScopeFn scope_fn_;
     StaleFn stale_fn_;
     AuditFn audit_fn_;
