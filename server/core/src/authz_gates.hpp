@@ -76,10 +76,10 @@ struct CeilingResult {
 
 /// THE one ITServiceOwner ceiling check (extend, never fork): a service-scoped token can
 /// never exceed what the ITServiceOwner role grants, whatever its minter holds. Both this
-/// and `RbacStore::role_permission_allowed_checked` use the one row loop: first matching
-/// row decides, `allow` admits, `deny` or absent refuses; the failed-read case is reported
-/// as Degraded (with its reason label) instead of being folded into a deny. The helper
-/// itself never touches metrics.
+/// and `RbacStore::role_permission_allowed_checked` use the one single-row read: the pair's
+/// row, `allow` admits, `deny`, another effect text or absent refuses; the failed-read case
+/// is reported as Degraded (with its reason label) instead of being folded into a deny. The
+/// helper itself never touches metrics.
 [[nodiscard]] CeilingResult service_ceiling_check(const RbacStore& store,
                                                   const std::string& securable_type,
                                                   const std::string& operation);

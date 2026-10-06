@@ -35,8 +35,8 @@ const char* authz::ceiling_degrade_reason(std::string_view read_error) noexcept 
 authz::CeilingResult authz::service_ceiling_check(const RbacStore& store,
                                                   const std::string& securable_type,
                                                   const std::string& operation) {
-    // The row loop lives in ONE place, RbacStore::role_permission_allowed_checked (first
-    // row for the pair decides, `allow` admits, `deny` or an absent pair refuses). Only a
+    // The read lives in ONE place, RbacStore::role_permission_allowed_checked (the pair's one
+    // row: `allow` admits, `deny`, another effect text or an absent pair refuses). Only a
     // failed read is mapped differently here: reported as Degraded, not folded into a deny.
     auto allowed = store.role_permission_allowed_checked("ITServiceOwner", securable_type,
                                                          operation);

@@ -580,10 +580,12 @@ public:
                                   const std::string& operation,
                                   const ManagementGroupStore* mgmt_store) const;
 
-    /// The ONE row loop deciding whether a role grants a (securable, operation) pair
-    /// (extend, never fork). First matching row decides; `allow` => true, `deny` or an
-    /// absent pair => false; a failed read => `unexpected(msg)` (never a false allow).
-    /// `authz::service_ceiling_check` delegates here.
+    /// The ONE read deciding whether a role grants a (securable, operation) pair (extend,
+    /// never fork). It reads the single `role_permissions` row for the pair (the table's
+    /// primary key is `(role_name, securable_type, operation)`, so there is at most one):
+    /// `allow` => true; `deny`, any other effect text, or an absent pair => false; a failed
+    /// read => `unexpected(msg)` (never a false allow). `authz::service_ceiling_check`
+    /// delegates here.
     /// The read goes through the same breaker and short acquire budget as the hot authz
     /// reads, so a degraded store fails fast instead of pinning a worker: the error is then
     /// `kRbacErrCircuitBreakerOpen` or `kRbacErrPoolAcquireTimeout` (both map to the
@@ -602,12 +604,16 @@ public:
     std::vector<std::string> list_operations() const;
 
 private:
-    /// Breaker-gated, `kAuthzAcquireTimeout` variant of `get_role_permissions_checked` for
-    /// request-path callers (`role_permission_allowed_checked`). Admin reads keep the
-    /// wider `get_role_permissions_checked` budget. Errors: `kRbacErrStoreNotOpen`,
-    /// `kRbacErrCircuitBreakerOpen`, `kRbacErrPoolAcquireTimeout`, `"query failed: ..."`.
-    std::expected<std::vector<Permission>, std::string>
-    get_role_permissions_authz_checked(const std::string& role_name) const;
+    /// Breaker-gated, `kAuthzAcquireTimeout` read of the one `role_permissions` row for a
+    /// (role, securable, operation) triple, for request-path callers
+    /// (`role_permission_allowed_checked`): the effect text, or `nullopt` when the role has no
+    /// row for the pair. Admin reads keep the wider `get_role_permissions_checked` budget.
+    /// Errors: `kRbacErrStoreNotOpen`, `kRbacErrCircuitBreakerOpen`,
+    /// `kRbacErrPoolAcquireTimeout`, `"query failed: ..."`.
+    std::expected<std::optional<std::string>, std::string>
+    role_permission_effect_authz_checked(const std::string& role_name,
+                                         const std::string& securable_type,
+                                         const std::string& operation) const;
 
     // #2703 Gate 7 item 3 — same shape as PreflightRoutesTestAccess /
     // DashboardResultsColumnsTestAccess: user_rbac_group_names/role_effects_for

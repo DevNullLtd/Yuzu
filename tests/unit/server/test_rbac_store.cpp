@@ -3124,7 +3124,7 @@ TEST_CASE("RbacStore: user_rbac_group_names and role_effects_for record "
 // authz::ceiling_degrade_reason keys the `yuzu_server_rbac_read_degrade_total{reason}` label on it:
 // a hand-typed variant at any one producer would be counted as query_error. Three producers are
 // pinned above (user_rbac_group_names, role_effects_for) and in test_authz_gates.cpp
-// (get_role_permissions_authz_checked, through role_permission_allowed_checked); the two cases
+// (role_permission_effect_authz_checked, through role_permission_allowed_checked); the two cases
 // below pin the rest through the real accessors: every "store not open" producer here, and the
 // pool-acquire-timeout producers of the unbreakered reads.
 TEST_CASE("RbacStore: every checked read on a store that is not open reports the shared "
@@ -3151,7 +3151,7 @@ TEST_CASE("RbacStore: every checked read on a store that is not open reports the
     const auto r5 = broken.list_groups_checked();
     REQUIRE_FALSE(r5.has_value());
     CHECK(std::string_view{r5.error()} == kRbacErrStoreNotOpen);
-    // get_role_permissions_authz_checked, through its only public caller.
+    // role_permission_effect_authz_checked, through its only public caller.
     const auto r6 = broken.role_permission_allowed_checked("ITServiceOwner", "Response", "Read");
     REQUIRE_FALSE(r6.has_value());
     CHECK(std::string_view{r6.error()} == kRbacErrStoreNotOpen);
@@ -3195,6 +3195,153 @@ TEST_CASE("RbacStore: the checked reads without a breaker report the shared "
     const auto r5 = replica_b.list_groups_checked();
     REQUIRE_FALSE(r5.has_value());
     CHECK(std::string_view{r5.error()} == kRbacErrPoolAcquireTimeout);
+}
+
+namespace {
+// The whole-role loop `role_permission_allowed_checked` ran before it read the one row for the
+// pair: fetch every row of the role, the first row for the pair decides (`deny` false, `allow`
+// true, any other effect text keeps looking), and no row means false. Kept here as the oracle
+// the single-row read must agree with.
+std::expected<bool, std::string> whole_role_loop_oracle(const RbacStore& store,
+                                                        const std::string& role,
+                                                        const std::string& securable_type,
+                                                        const std::string& operation) {
+    auto perms = store.get_role_permissions_checked(role);
+    if (!perms)
+        return std::unexpected(perms.error());
+    for (const auto& p : *perms) {
+        if (p.securable_type == securable_type && p.operation == operation) {
+            if (p.effect == "deny")
+                return false;
+            if (p.effect == "allow")
+                return true;
+        }
+    }
+    return false;
+}
+
+void check_same_verdict(const RbacStore& store, const std::string& role,
+                        const std::string& securable_type, const std::string& operation) {
+    INFO(role << " " << securable_type << ":" << operation);
+    const auto want = whole_role_loop_oracle(store, role, securable_type, operation);
+    const auto got = store.role_permission_allowed_checked(role, securable_type, operation);
+    REQUIRE(want.has_value());
+    REQUIRE(got.has_value());
+    CHECK(*got == *want);
+}
+
+void exec_on_test_db(const std::string& dsn, const char* sql) {
+    pg::PgConn conn{PQconnectdb(dsn.c_str())};
+    REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+    pg::PgResult r{PQexec(conn.get(), sql)};
+    REQUIRE(r.ok());
+}
+} // namespace
+
+// role_permission_allowed_checked reads the single role_permissions row for the pair. It must
+// give the verdict the whole-role loop gave on every input, including the ones where the two
+// could differ if the single-row SELECT dropped a predicate or ignored the effect.
+TEST_CASE("RbacStore: the single-row role permission read agrees with the whole-role loop",
+          "[rbac_store][pg]") {
+    RBAC_STORE(store);
+
+    SECTION("every seeded role over the whole securable x operation catalogue") {
+        const auto securables = store.list_securable_types();
+        const auto operations = store.list_operations();
+        REQUIRE_FALSE(securables.empty());
+        REQUIRE_FALSE(operations.empty());
+        const auto roles = store.list_roles();
+        REQUIRE_FALSE(roles.empty());
+        std::size_t allowed = 0;
+        std::size_t refused = 0;
+        for (const auto& role : roles) {
+            for (const auto& sec : securables) {
+                for (const auto& op : operations) {
+                    check_same_verdict(store, role.name, sec, op);
+                    if (role.name == "ITServiceOwner") {
+                        const auto got = store.role_permission_allowed_checked(role.name, sec, op);
+                        REQUIRE(got.has_value());
+                        ++(*got ? allowed : refused);
+                    }
+                }
+            }
+        }
+        // Neither verdict is vacuous for the role the ceiling reads.
+        CHECK(allowed > 0);
+        CHECK(refused > 0);
+    }
+
+    SECTION("the eight fleet-read securables with Read, and a pair the role lacks") {
+        for (const char* sec : {"Execution", "Response", "Inventory", "Infrastructure", "Policy",
+                                "GuaranteedState", "Workflow"}) {
+            check_same_verdict(store, "ITServiceOwner", sec, "Read");
+            CHECK(store.role_permission_allowed_checked("ITServiceOwner", sec, "Read").value());
+        }
+        // The seeded ITServiceOwner role does not hold Enrollment:Read.
+        check_same_verdict(store, "ITServiceOwner", "Enrollment", "Read");
+        CHECK_FALSE(
+            store.role_permission_allowed_checked("ITServiceOwner", "Enrollment", "Read").value());
+    }
+
+    SECTION("an explicit deny row refuses") {
+        REQUIRE(store.role_permission_allowed_checked("ITServiceOwner", "Response", "Read").value());
+        REQUIRE(store.set_permission({"ITServiceOwner", "Response", "Read", "deny"}).has_value());
+        check_same_verdict(store, "ITServiceOwner", "Response", "Read");
+        CHECK_FALSE(
+            store.role_permission_allowed_checked("ITServiceOwner", "Response", "Read").value());
+    }
+
+    SECTION("a row whose effect is neither allow nor deny refuses") {
+        REQUIRE(store.role_permission_allowed_checked("ITServiceOwner", "Response", "Read").value());
+        exec_on_test_db(rbac_db_fx_.dsn(),
+                        "UPDATE rbac_store.role_permissions SET effect = 'bogus' "
+                        "WHERE role_name = 'ITServiceOwner' AND securable_type = 'Response' "
+                        "AND operation = 'Read'");
+        check_same_verdict(store, "ITServiceOwner", "Response", "Read");
+        CHECK_FALSE(
+            store.role_permission_allowed_checked("ITServiceOwner", "Response", "Read").value());
+    }
+
+    SECTION("a deleted role and a role that never existed refuse without an error") {
+        exec_on_test_db(rbac_db_fx_.dsn(),
+                        "DELETE FROM rbac_store.roles WHERE name = 'ITServiceOwner'");
+        check_same_verdict(store, "ITServiceOwner", "Response", "Read");
+        CHECK_FALSE(
+            store.role_permission_allowed_checked("ITServiceOwner", "Response", "Read").value());
+        check_same_verdict(store, "NoSuchRole", "Response", "Read");
+    }
+
+    SECTION("a parameter with an embedded NUL matches no row") {
+        // libpq takes text parameters as C strings; the key must not be truncated into one
+        // that does match ("Response" and "Read" both have rows for ITServiceOwner).
+        using namespace std::string_literals;
+        check_same_verdict(store, "ITServiceOwner", "Response\0x"s, "Read");
+        check_same_verdict(store, "ITServiceOwner", "Response", "Read\0x"s);
+        CHECK_FALSE(
+            store.role_permission_allowed_checked("ITServiceOwner", "Response\0x"s, "Read")
+                .value());
+        // The role name is the one parameter where the whole-role loop and the single-row read
+        // differ: the loop's own query truncated an embedded NUL into the real role name and
+        // matched it, while the single-row read refuses. The only caller passes the literal
+        // "ITServiceOwner", so this is not reachable from a request; the refusal is the
+        // fail-closed side, asserted here rather than compared with the oracle.
+        CHECK_FALSE(
+            store.role_permission_allowed_checked("ITServiceOwner\0x"s, "Response", "Read")
+                .value());
+    }
+
+    SECTION("a failed read is an error from both, never a verdict") {
+        exec_on_test_db(rbac_db_fx_.dsn(), "DROP TABLE rbac_store.role_permissions CASCADE");
+        const auto want = whole_role_loop_oracle(store, "ITServiceOwner", "Response", "Read");
+        const auto got =
+            store.role_permission_allowed_checked("ITServiceOwner", "Response", "Read");
+        REQUIRE_FALSE(want.has_value());
+        REQUIRE_FALSE(got.has_value());
+        // The SQL text differs, so the tail of PostgreSQL's message differs; the shared prefix
+        // is what authz::ceiling_degrade_reason sees.
+        CHECK(got.error().starts_with("query failed: "));
+        CHECK(want.error().starts_with("query failed: "));
+    }
 }
 
 // #2703 Gate 7 item Commit C (quality-engineer + consistency-auditor, Gate 3:

@@ -1813,8 +1813,9 @@ std::vector<Permission> RbacStore::get_role_permissions(const std::string& role_
 }
 
 namespace {
-// The one SELECT behind both per-role checked reads (the admin read and the breaker-gated
-// authz read below); they differ only in the acquire budget and breaker bookkeeping.
+// The SELECT behind get_role_permissions_checked (the admin read of a whole role). The
+// breaker-gated request-path read of one pair uses the narrower select_role_permission_effect
+// below.
 std::expected<std::vector<Permission>, std::string>
 select_role_permissions(PGconn* conn, const std::string& role_name) {
     pg::PgResult r = pg::exec_params(
@@ -1841,8 +1842,38 @@ RbacStore::get_role_permissions_checked(const std::string& role_name) const {
     return select_role_permissions(lease.get(), role_name);
 }
 
-std::expected<std::vector<Permission>, std::string>
-RbacStore::get_role_permissions_authz_checked(const std::string& role_name) const {
+namespace {
+// The one SELECT behind role_permission_effect_authz_checked: the effect of the single row for
+// the triple (`role_permissions` is keyed by exactly these three columns). A parameter that
+// contains a NUL byte is bound as SQL NULL: libpq takes text parameters as C strings, so the
+// bytes after the NUL would be dropped and the truncated key could match a different row,
+// whereas no row can match a key with an embedded NUL (`= NULL` is never true).
+std::expected<std::optional<std::string>, std::string>
+select_role_permission_effect(PGconn* conn, const std::string& role_name,
+                              const std::string& securable_type, const std::string& operation) {
+    const auto bind = [](const std::string& v) -> std::optional<std::string> {
+        if (v.find('\0') != std::string::npos)
+            return std::nullopt;
+        return v;
+    };
+    pg::PgResult r = pg::exec_params(
+        conn,
+        "SELECT effect FROM rbac_store.role_permissions "
+        "WHERE role_name = $1 AND securable_type = $2 AND operation = $3",
+        std::vector<std::optional<std::string>>{bind(role_name), bind(securable_type),
+                                                bind(operation)});
+    if (r.status() != PGRES_TUPLES_OK)
+        return std::unexpected(std::string("query failed: ") + PQerrorMessage(conn));
+    if (PQntuples(r.get()) == 0)
+        return std::optional<std::string>{};
+    return std::optional<std::string>{text_col(r.get(), 0, 0)};
+}
+} // namespace
+
+std::expected<std::optional<std::string>, std::string>
+RbacStore::role_permission_effect_authz_checked(const std::string& role_name,
+                                                const std::string& securable_type,
+                                                const std::string& operation) const {
     if (!open_)
         return std::unexpected(std::string(kRbacErrStoreNotOpen));
     // Same contract as the hot authz reads (user_rbac_group_names / role_effects_for):
@@ -1855,7 +1886,7 @@ RbacStore::get_role_permissions_authz_checked(const std::string& role_name) cons
         breaker_note_result(false);
         return std::unexpected(std::string(kRbacErrPoolAcquireTimeout));
     }
-    auto result = select_role_permissions(lease.get(), role_name);
+    auto result = select_role_permission_effect(lease.get(), role_name, securable_type, operation);
     breaker_note_result(result.has_value());
     return result;
 }
@@ -3082,24 +3113,16 @@ std::expected<bool, std::string>
 RbacStore::role_permission_allowed_checked(const std::string& role_name,
                                            const std::string& securable_type,
                                            const std::string& operation) const {
-    // THE one row loop for "does this role grant this pair" (extend, never fork):
-    // `authz::service_ceiling_check` (authz_gates.cpp) delegates here. First row for the
-    // pair decides: `allow` admits, `deny` or an absent pair (a revoked default is a
-    // DELETEd row) refuses. A failed read is an error, never a false allow. The read is
-    // the breaker-gated authz read: this runs on the request path of every service-token
-    // fleet read.
-    auto perms = get_role_permissions_authz_checked(role_name);
-    if (!perms)
-        return std::unexpected(std::move(perms.error()));
-    for (const auto& p : *perms) {
-        if (p.securable_type == securable_type && p.operation == operation) {
-            if (p.effect == "deny")
-                return false;
-            if (p.effect == "allow")
-                return true;
-        }
-    }
-    return false;
+    // THE one read for "does this role grant this pair" (extend, never fork):
+    // `authz::service_ceiling_check` (authz_gates.cpp) delegates here. The pair has at most
+    // one row (the primary key): `allow` admits; `deny`, any other effect text, or an absent
+    // pair (a revoked default is a DELETEd row) refuses. A failed read is an error, never a
+    // false allow. The read is the breaker-gated authz read: this runs on the request path of
+    // every service-token fleet read.
+    auto effect = role_permission_effect_authz_checked(role_name, securable_type, operation);
+    if (!effect)
+        return std::unexpected(std::move(effect.error()));
+    return effect->has_value() && **effect == "allow";
 }
 
 } // namespace yuzu::server
