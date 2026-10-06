@@ -39,6 +39,16 @@ Three things checked against the real, integrated tree:
      associate a gate with its row must read as a hard failure, never as
      an absent gate.
 
+Two more checks (question/catalogue classification, ADR-0033 section 1: a
+definition must not self-certify read-vs-effect):
+
+  4. QUESTION CLASS: every `spec.type: question` definition whose pair HAS a
+     catalogue row must map to a `DispatchClass::ReadOnly` row.
+  5. ROWLESS QUESTIONS: every `question` definition whose pair has NO
+     catalogue row must be named in the pinned `ROWLESS_QUESTION_IDS` (server-side
+     pseudo-plugins) or `ROWLESS_QUESTION_IDS_UNEXPLAINED` (anything else); an
+     unpinned id, or a stale pin, fails and says to update the pin deliberately.
+
 Mode-defaulting semantics are replicated EXACTLY from
 `server/core/scripts/embed_content.py`'s `def_envelope`
 (`approval.get("mode") or "auto"`) so a definition with no `approval:`
@@ -178,6 +188,50 @@ EXPECTED_TOTAL_ROWS = 231
 # agent-dispatch surface, so ExecuteGate is meaningless for them.
 NON_CATALOGUE_EXEMPT_PREFIXES = ("server", "server_internal", "_server")
 
+# `question` definitions with NO catalogue row, split by plugin name. Every
+# id below was derived by running `parse_content_questions` against
+# content/definitions/*.yaml and checking the pair against the
+# capability_decls/*.hpp rows (`parse_fragment_dispatch_classes`).
+#
+# ROWLESS_QUESTION_IDS: the plugin is a server-side pseudo-plugin (a
+# NON_CATALOGUE_EXEMPT_PREFIXES name). Nothing dispatches such a pair to an
+# agent, and `classify_and_authorize_dispatch` (agent_registry.hpp) denies it as
+# Unclassified, so these questions are NOT dispatchable to agents. The
+# browser/demo must not offer them as runnable agent dispatches. A new
+# rowless question, or a pinned id that gained a row, changed type or was
+# removed, fails the check: update this pin deliberately, in the same change.
+ROWLESS_QUESTION_IDS = (
+    "server.compliance.policy_detail",
+    "server.compliance.summary",
+    "server.deployment.list_jobs",
+    "server.directory.list_users",
+    "server.directory.sync_status",
+    "server.inventory.agent",
+    "server.inventory.query",
+    "server.inventory.tables",
+    "server.notifications.list",
+    "server.patches.deployment_status",
+    "server.patches.fleet_summary",
+    "server.patches.list_missing",
+    "server.policy.list",
+    "server.policy_fragment.list",
+    "server.product_pack.get",
+    "server.product_pack.list",
+    "server.webhooks.deliveries",
+    "server.webhooks.list",
+    "server.workflow.execution_status",
+    "server.workflow.get",
+    "server.workflow.list",
+)
+EXPECTED_ROWLESS_QUESTION_COUNT = 21
+
+# ROWLESS_QUESTION_IDS_UNEXPLAINED: rowless questions whose plugin is NOT a
+# server-side pseudo-plugin, i.e. a suspected catalogue gap (a real agent
+# plugin action with a question but no capability row). Empty today. A
+# non-empty entry here is a TODO for the catalogue author, not an approval;
+# pinning it only keeps the check fail-closed for a NEW such id.
+ROWLESS_QUESTION_IDS_UNEXPLAINED: tuple[str, ...] = ()
+
 RANK = {"auto": 0, "role-gated": 1, "always": 2}
 MODE_TO_GATE = {"auto": "None", "role-gated": "AdminOrApproval", "always": "AlwaysApproval"}
 
@@ -187,6 +241,14 @@ _ROW_RE = re.compile(
     r'(?:.*?)'
     r'\.execute_gate\s*=\s*ExecuteGate::(\w+)\s*,',
     re.DOTALL,
+)
+# `.dispatch_class` follows `.action` in every row, possibly after `//`
+# comment lines (plugin_action_catalogue_c.hpp's flush_dns row has one).
+_CLASS_RE = re.compile(
+    r'\.plugin\s*=\s*"([^"]+)"\s*,\s*'
+    r'\.action\s*=\s*"([^"]+)"\s*,'
+    r'(?:\s|//[^\n]*)*'
+    r'\.dispatch_class\s*=\s*DispatchClass::(\w+)\s*,'
 )
 _PAIR_ONLY_RE = re.compile(r'\.plugin\s*=\s*"([^"]+)"\s*,\s*\.action\s*=\s*"([^"]+)"')
 
@@ -266,6 +328,92 @@ def parse_fragment_pair_count(path: Path) -> int:
     """
     text = path.read_text(encoding="utf-8")
     return len(_PAIR_ONLY_RE.findall(text))
+
+
+def parse_fragment_dispatch_classes(path: Path) -> list[tuple[str, str, str]]:
+    """Every `(plugin, action, DispatchClass)` triple a fragment declares."""
+    return _CLASS_RE.findall(path.read_text(encoding="utf-8"))
+
+
+def parse_content_questions(content_root: Path) -> list[tuple[str, str, str]]:
+    """`(definition id, plugin, action)` for every `spec.type: question`
+    definition. Plugin/action resolution matches `parse_content_pair_modes`
+    (`spec.execution.*`, falling back to `spec.*`; action lower-cased); a
+    question naming no plugin/action yields empty strings, never a skip.
+    """
+    questions: list[tuple[str, str, str]] = []
+    for path in sorted(content_root.glob(CONTENT_GLOB)):
+        with path.open(encoding="utf-8") as f:
+            docs = list(yaml.safe_load_all(f))
+        for doc in docs:
+            if not isinstance(doc, dict):
+                continue
+            spec = doc.get("spec")
+            if not isinstance(spec, dict) or spec.get("type") != "question":
+                continue
+            exec_ = spec.get("execution") or {}
+            plugin = exec_.get("plugin") or spec.get("plugin") or ""
+            action = exec_.get("action") or spec.get("action") or ""
+            def_id = (doc.get("metadata") or {}).get("id", path.name)
+            questions.append((def_id, plugin, str(action).lower()))
+    return questions
+
+
+def check_questions(
+    questions: list[tuple[str, str, str]],
+    class_by_pair: dict[tuple[str, str], str],
+    pinned: tuple[str, ...],
+    pinned_unexplained: tuple[str, ...],
+    expected_count: int,
+) -> list[str]:
+    """Checks 4 and 5 (module docstring); pure, so the synthetic tests drive
+    it directly. Returns one message per problem, empty when clean.
+    """
+    problems: list[str] = []
+    rowless_server: set[str] = set()
+    rowless_other: set[str] = set()
+
+    for def_id, plugin, action in questions:
+        cls = class_by_pair.get((plugin, action))
+        if cls is None:
+            bucket = rowless_server if plugin.startswith(NON_CATALOGUE_EXEMPT_PREFIXES) else rowless_other
+            bucket.add(def_id)
+        elif cls != "ReadOnly":
+            problems.append(
+                f"QUESTION IS NOT READ-ONLY: definition {def_id} (spec.type: question) "
+                f"targets {plugin}.{action}, whose catalogue row is DispatchClass::{cls} "
+                "-- reclassify the definition as `action`, or fix the catalogue row if it "
+                "is wrong (a definition must not self-certify read-vs-effect, ADR-0033 section 1)"
+            )
+
+    for label, found, pin in (
+        ("ROWLESS_QUESTION_IDS", rowless_server, pinned),
+        ("ROWLESS_QUESTION_IDS_UNEXPLAINED", rowless_other, pinned_unexplained),
+    ):
+        for def_id in sorted(found - set(pin)):
+            problems.append(
+                f"UNPINNED ROWLESS QUESTION: definition {def_id} is a question with no "
+                f"capability_decls row and is not in {label} -- a question that cannot be "
+                "classified cannot run as an agent dispatch; add a catalogue row or update "
+                f"{label} (and its count) deliberately in this file"
+            )
+        for def_id in sorted(set(pin) - found):
+            problems.append(
+                f"STALE ROWLESS PIN: {def_id} is in {label} but is no longer a rowless "
+                "question of that kind (it gained a catalogue row, changed type, changed "
+                f"plugin or was removed) -- remove it from {label} deliberately"
+            )
+
+    for label, pin in (("ROWLESS_QUESTION_IDS", pinned), ("ROWLESS_QUESTION_IDS_UNEXPLAINED", pinned_unexplained)):
+        if list(pin) != sorted(set(pin)):
+            problems.append(f"{label} must be sorted and free of duplicates")
+    total = len(pinned) + len(pinned_unexplained)
+    if total != expected_count:
+        problems.append(
+            f"rowless-question pin count is {total}, expected {expected_count} -- update "
+            "EXPECTED_ROWLESS_QUESTION_COUNT together with the pin"
+        )
+    return problems
 
 
 def diff_gates(
@@ -389,6 +537,37 @@ class TestGateConsistencyOnRealTree(unittest.TestCase):
             self.fail("\n" + format_gaps(mismatches, unexempt_missing))
 
 
+class TestQuestionClassificationOnRealTree(unittest.TestCase):
+    """Checks 4 and 5: `spec.type: question` against the catalogue's
+    DispatchClass, and the pinned set of rowless questions.
+    """
+
+    def test_questions_are_read_only_and_rowless_ones_are_pinned(self) -> None:
+        class_rows: list[tuple[str, str, str]] = []
+        for rel in FRAGMENT_FILES:
+            class_rows.extend(parse_fragment_dispatch_classes(REPO_ROOT / rel))
+        # Parse integrity: a row whose `.dispatch_class` the regex missed would
+        # read as "no row" and wrongly land in the rowless set.
+        self.assertEqual(
+            len(class_rows), EXPECTED_TOTAL_ROWS,
+            f"parsed {len(class_rows)} (plugin, action, dispatch_class) rows, expected "
+            f"{EXPECTED_TOTAL_ROWS} -- the dispatch_class regex has drifted from the fragment format",
+        )
+        class_by_pair = {(p, a.lower()): c for p, a, c in class_rows}
+        questions = parse_content_questions(REPO_ROOT)
+        self.assertTrue(questions, "parsed zero question definitions -- the glob or spec.type read is broken")
+
+        problems = check_questions(
+            questions,
+            class_by_pair,
+            ROWLESS_QUESTION_IDS,
+            ROWLESS_QUESTION_IDS_UNEXPLAINED,
+            EXPECTED_ROWLESS_QUESTION_COUNT,
+        )
+        if problems:
+            self.fail("\n" + "\n".join(problems))
+
+
 class TestDefinitionValueVocabularies(unittest.TestCase):
     """Every `values:` entry of every shipped definition column is a string."""
 
@@ -489,6 +668,51 @@ class TestFailureModesOnSyntheticData(unittest.TestCase):
         mismatches, unexempt_missing = diff_gates(pair_modes, fragment_rows)
         self.assertEqual(mismatches, {("widget", "spin"): ("None", "AdminOrApproval")})
         self.assertFalse(unexempt_missing)
+
+    def test_question_on_a_destructive_row_is_named(self) -> None:
+        problems = check_questions(
+            [("widget.wipe", "widget", "wipe")], {("widget", "wipe"): "Destructive"}, (), (), 0
+        )
+        self.assertEqual(len(problems), 1)
+        for needle in ("widget.wipe", "DispatchClass::Destructive", "reclassify"):
+            self.assertIn(needle, problems[0])
+
+    def test_question_on_a_mutating_row_is_named(self) -> None:
+        problems = check_questions([("w.set", "widget", "set")], {("widget", "set"): "Mutating"}, (), (), 0)
+        self.assertIn("DispatchClass::Mutating", problems[0])
+
+    def test_readonly_question_with_a_row_is_clean(self) -> None:
+        self.assertEqual(
+            check_questions([("w.get", "widget", "get")], {("widget", "get"): "ReadOnly"}, (), (), 0), []
+        )
+
+    def test_extra_rowless_server_question_is_named(self) -> None:
+        questions = [("server.a", "server", "a"), ("server.b", "server", "b")]
+        problems = check_questions(questions, {}, ("server.a",), (), 1)
+        self.assertEqual(len(problems), 1)
+        self.assertIn("UNPINNED ROWLESS QUESTION", problems[0])
+        self.assertIn("server.b", problems[0])
+
+    def test_rowless_question_on_a_real_plugin_needs_the_unexplained_pin(self) -> None:
+        questions = [("w.ghost", "widget", "ghost")]
+        problems = check_questions(questions, {}, ("w.ghost",), (), 1)
+        self.assertTrue(any("UNPINNED" in p and "ROWLESS_QUESTION_IDS_UNEXPLAINED" in p for p in problems))
+        self.assertTrue(any("STALE ROWLESS PIN" in p for p in problems))
+        self.assertEqual(check_questions(questions, {}, (), ("w.ghost",), 1), [])
+
+    def test_pinned_id_that_gained_a_row_or_vanished_is_named(self) -> None:
+        gained = check_questions(
+            [("server.a", "server", "a")], {("server", "a"): "ReadOnly"}, ("server.a",), (), 1
+        )
+        self.assertEqual(len(gained), 1)
+        self.assertIn("STALE ROWLESS PIN", gained[0])
+        vanished = check_questions([], {}, ("server.a",), (), 1)
+        self.assertIn("STALE ROWLESS PIN", vanished[0])
+
+    def test_pin_count_and_ordering_are_enforced(self) -> None:
+        questions = [("server.a", "server", "a"), ("server.b", "server", "b")]
+        self.assertTrue(any("count" in p for p in check_questions(questions, {}, ("server.a", "server.b"), (), 3)))
+        self.assertTrue(any("sorted" in p for p in check_questions(questions, {}, ("server.b", "server.a"), (), 2)))
 
 
 if __name__ == "__main__":
