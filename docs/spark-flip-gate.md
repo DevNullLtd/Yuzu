@@ -934,7 +934,8 @@ flip, with a red-first test each:
   suppressed. It replaces `docs/spark-stage2-guardian-consumer-design.md` R5.3 decision 1
   (the rung 9c PR-5e K-bound, PR #4529) and accepts that recovery after a late failure
   depends on the next server re-push. *Options considered (letters as the coordinating
-  session first presented them on 2026-10-06):* A, accept the acknowledged-but-unarmed
+  session used them; A, B and C were presented first on 2026-10-06, D was added
+  afterwards):* A, accept the acknowledged-but-unarmed
   state with a risk-register entry (not really available: governance treats a derived HIGH
   as fixed or the change withdrawn); B, a small "re-open the generation" fix (evaluated; a
   source-read opinion judged it not safe without a recovery lifecycle); C, an engine-owned
