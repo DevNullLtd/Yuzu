@@ -26,3 +26,16 @@
 /tests/unit/test_guardian_*                          @FortitudeEtc
 /tests/unit/server/test_guaranteed_state*            @FortitudeEtc
 /tests/unit/server/test_rest_guaranteed*             @FortitudeEtc
+
+# Dispatch capability catalogue and its drift gates — owners @fjarvis @FortitudeEtc
+# The catalogue rows (DispatchClass, ExecuteGate) decide what a definition may run and
+# what needs approval; the tests below are the only automated check that content stays
+# consistent with them. Either owner can satisfy the review request, so the review is
+# still available when one of them authored the change.
+/server/core/src/capability_decls/                     @fjarvis @FortitudeEtc
+/server/core/src/command_capability.hpp                @fjarvis @FortitudeEtc
+/tests/test_capability_gate_consistency.py             @fjarvis @FortitudeEtc
+/tests/test_capability_catalogue_complete.py           @fjarvis @FortitudeEtc
+/tests/unit/server/test_capability_catalogue.cpp       @fjarvis @FortitudeEtc
+/tests/unit/server/test_command_capability.cpp         @fjarvis @FortitudeEtc
+/tests/unit/server/test_dispatch_destructive_gate.cpp  @fjarvis @FortitudeEtc
