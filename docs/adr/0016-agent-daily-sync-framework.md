@@ -5,6 +5,12 @@
 **Component:** Agent core (sync scheduler) · Server (inventory ingest + Postgres store) · Gateway (proxy)
 **Authors:** Dave Rae
 
+> **Amendment pending: ADR-3006 (capability enablement, proposed 2026-10-06).** ADR-3006 sets
+> the direction that `--inventory-disable` stops being the collection toggle: it becomes a
+> one-time starting-state input that the server adopts as a visible off-rule, and each daily-sync
+> source becomes a unit that can be switched off on its own. Nothing has changed in the product
+> yet: until the work that follows ADR-3006 lands, this ADR describes what ships.
+
 ## Context
 
 We are beginning to write endpoint-reported data to the server's **PostgreSQL**

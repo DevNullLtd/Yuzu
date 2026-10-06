@@ -6,9 +6,12 @@
 **Relates to:** ADR-0015 (ARP/DNS capture sources), `docs/tar-implementer.md`,
 `docs/user-manual/network.md` (netqual tier), ADR-0003 (telemetry capture model)
 
-> **Amended by ADR-3006 (capability enablement).** The opt-in default for `netqual` and
-> `netconn` is superseded for new installations, and look-back becomes a switchable unit of
-> its own. Existing installations keep their current state.
+> **Amendment pending: ADR-3006 (capability enablement, proposed 2026-10-06).** ADR-3006 sets
+> the direction that, for new installations, the opt-in default for `netqual` and `netconn` is
+> replaced by on-by-default with customer-controlled switch-off, and that look-back becomes a
+> switchable unit of its own. Existing installations keep their current state. Nothing has
+> changed in the product yet: until the work that follows ADR-3006 lands, this ADR describes
+> what ships.
 
 ## Context
 
