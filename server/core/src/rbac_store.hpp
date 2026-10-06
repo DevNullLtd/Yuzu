@@ -574,14 +574,21 @@ public:
     /// (extend, never fork). First matching row decides; `allow` => true, `deny` or an
     /// absent pair => false; a failed read => `unexpected(msg)` (never a false allow).
     /// `check_role_has_permission` and `authz::service_ceiling_check` both delegate here.
-    std::expected<bool, std::string>
+    /// The read goes through the same breaker and short acquire budget as the hot authz
+    /// reads, so a degraded store fails fast instead of pinning a worker: the error is then
+    /// `"circuit breaker open"` or `"pool acquire timeout"` (both map to the
+    /// `pool_acquire_timeout` degrade label in `authz::ceiling_degrade_reason`), or
+    /// `"query failed: ..."`.
+    [[nodiscard]] std::expected<bool, std::string>
     role_permission_allowed_checked(const std::string& role_name,
                                     const std::string& securable_type,
                                     const std::string& operation) const;
 
     /// Check if a specific role grants a permission. FAIL-CLOSED: false on any store
-    /// error. Thin wrapper over `role_permission_allowed_checked`; production service-token
-    /// gates use `authz::service_ceiling_check` (which keeps the failed-read case distinct).
+    /// error. Thin wrapper over `role_permission_allowed_checked`. It has no production
+    /// caller (it is used by tests); new service-token gates must call
+    /// `authz::service_ceiling_check`, which keeps the failed-read case distinct from a deny.
+    /// Not marked `[[deprecated]]` because the many remaining test callers build with -Werror.
     bool check_role_has_permission(const std::string& role_name, const std::string& securable_type,
                                    const std::string& operation) const;
 
@@ -593,6 +600,13 @@ public:
     std::vector<std::string> list_operations() const;
 
 private:
+    /// Breaker-gated, `kAuthzAcquireTimeout` variant of `get_role_permissions_checked` for
+    /// request-path callers (`role_permission_allowed_checked`). Admin reads keep the
+    /// wider `get_role_permissions_checked` budget. Errors: `"rbac store not open"`,
+    /// `"circuit breaker open"`, `"pool acquire timeout"`, `"query failed: ..."`.
+    std::expected<std::vector<Permission>, std::string>
+    get_role_permissions_authz_checked(const std::string& role_name) const;
+
     // #2703 Gate 7 item 3 — same shape as PreflightRoutesTestAccess /
     // DashboardResultsColumnsTestAccess: user_rbac_group_names/role_effects_for
     // are legitimately private (internal helpers `resolve_perm_groups` shares),

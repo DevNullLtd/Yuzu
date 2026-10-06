@@ -618,26 +618,6 @@ TEST_CASE("require_fleet_read: service token, degraded ITServiceOwner permission
             .value();
     };
 
-    // Parity pin FIRST (and it must not touch the metric): the siblings still say 403.
-    {
-        auto req = bearer_request(svc);
-        httplib::Response res;
-        CHECK_FALSE(r.ar->require_permission(req, res, "Response", "Read"));
-        CHECK(res.status == 403);
-        CHECK(res.body.find("service-scoped token does not grant Response:Read") !=
-              std::string::npos);
-    }
-    {
-        auto req = bearer_request(svc);
-        httplib::Response res;
-        CHECK_FALSE(r.ar->require_scoped_permission(req, res, "Response", "Read", "a_p"));
-        CHECK(res.status == 403);
-        CHECK(res.body.find("service-scoped token does not grant Response:Read") !=
-              std::string::npos);
-    }
-    CHECK(degrade("query_error") == 0.0);
-    CHECK(degrade("pool_acquire_timeout") == 0.0);
-
     auto req = bearer_request(svc);
     httplib::Response res;
     auto result = r.ar->require_fleet_read(req, res, "Response", "Read");
@@ -650,6 +630,30 @@ TEST_CASE("require_fleet_read: service token, degraded ITServiceOwner permission
     CHECK(res.body.find("\"permission\"") == std::string::npos);
     CHECK(res.body.find("does not grant") == std::string::npos);
     CHECK(degrade("query_error") == 1.0);
+    CHECK(degrade("pool_acquire_timeout") == 0.0);
+
+    // Parity pin: the siblings still say 403 for the same failed read and must not touch the
+    // metric. They run AFTER the gate call above: the first failed read leaves the authz
+    // breaker one step from open, so these answer from a failed query and then an open
+    // breaker; the gate's own query_error label is only reachable while the breaker is closed.
+    {
+        auto req2 = bearer_request(svc);
+        httplib::Response res2;
+        CHECK_FALSE(r.ar->require_permission(req2, res2, "Response", "Read"));
+        CHECK(res2.status == 403);
+        CHECK(res2.body.find("service-scoped token does not grant Response:Read") !=
+              std::string::npos);
+    }
+    {
+        auto req2 = bearer_request(svc);
+        httplib::Response res2;
+        CHECK_FALSE(r.ar->require_scoped_permission(req2, res2, "Response", "Read", "a_p"));
+        CHECK(res2.status == 403);
+        CHECK(res2.body.find("service-scoped token does not grant Response:Read") !=
+              std::string::npos);
+    }
+    CHECK(degrade("query_error") == 1.0);
+    CHECK(degrade("pool_acquire_timeout") == 0.0);
 
     // The audit row says the read degraded, never that the role lacks the permission.
     auto rows = r.audit_store.query({});
@@ -1126,9 +1130,95 @@ TEST_CASE("authz::ceiling_degrade_reason: pool acquire timeout prefix maps to "
     CHECK(std::string_view{ceiling_degrade_reason("ERROR: relation does not exist")} ==
           "query_error");
     CHECK(std::string_view{ceiling_degrade_reason("")} == "query_error");
+    // The breaker-gated read reports an open breaker under the pool label, matching the
+    // label the hot authz path uses for the same condition.
+    CHECK(std::string_view{ceiling_degrade_reason("circuit breaker open")} ==
+          "pool_acquire_timeout");
+    CHECK(std::string_view{ceiling_degrade_reason("rbac store not open")} == "query_error");
     // The prefix is anchored: the phrase later in the message is not a pool timeout.
     CHECK(std::string_view{ceiling_degrade_reason("query failed: pool acquire timeout")} ==
           "query_error");
     // Case-sensitive on purpose: the producer's message is a fixed string.
     CHECK(std::string_view{ceiling_degrade_reason("Pool acquire timeout")} == "query_error");
+}
+
+// The ceiling read has the same availability contract as the hot authz reads: a short acquire
+// budget plus the fail-fast breaker, so a degraded store cannot pin request workers. The pool
+// is starved by holding every lease, which makes the acquire time out deterministically.
+// Evidence is the breaker gauge and the error strings; only the third call is expected to be
+// answered by an open breaker (it follows the second within the 1 s probe cooldown).
+TEST_CASE("ceiling read: a starved pool trips the authz breaker and every degraded answer "
+          "is 503 with the pool_acquire_timeout label through the real gate",
+          "[pg][auth_routes][authz_gates][service_scope]") {
+    YUZU_REQUIRE_PG_DB_TPL(rbac_db_, rbac_gates_tpl);
+    yuzu::MetricsRegistry metrics;
+    GatesRig r{rbac_db_.dsn()};
+    r.auth_mgr.set_metrics_registry(&metrics);
+    r.rbac.set_metrics(&metrics);
+    REQUIRE(r.rbac.assign_role({"user", "minter", "RespReader"}).has_value());
+    const auto svc = r.mint("printers");
+    const auto degrade = [&](const char* reason) {
+        return metrics.counter("yuzu_server_rbac_read_degrade_total", {{"reason", reason}})
+            .value();
+    };
+
+    // Healthy first: the ceiling admits through the same accessor (a real allow).
+    {
+        auto ok = r.rbac.role_permission_allowed_checked("ITServiceOwner", "Response", "Read");
+        REQUIRE(ok.has_value());
+        CHECK(*ok);
+    }
+
+    // Starve the 4-connection pool.
+    std::vector<decltype(r.pool.acquire())> held;
+    for (int i = 0; i < 4; ++i) {
+        held.push_back(r.pool.acquire());
+        REQUIRE(held.back());
+    }
+
+    // Two failed acquires (streak 1 then 2) trip the breaker.
+    auto e1 = r.rbac.role_permission_allowed_checked("ITServiceOwner", "Response", "Read");
+    REQUIRE_FALSE(e1.has_value());
+    CHECK(e1.error() == "pool acquire timeout");
+    CHECK(metrics.gauge("yuzu_server_rbac_breaker_open").value() == 0.0);
+    auto e2 = r.rbac.role_permission_allowed_checked("ITServiceOwner", "Response", "Read");
+    REQUIRE_FALSE(e2.has_value());
+    CHECK(e2.error() == "pool acquire timeout");
+    CHECK(metrics.gauge("yuzu_server_rbac_breaker_open").value() == 1.0);
+
+    // Open: answered without a pool touch.
+    auto e3 = r.rbac.role_permission_allowed_checked("ITServiceOwner", "Response", "Read");
+    REQUIRE_FALSE(e3.has_value());
+    CHECK(e3.error() == "circuit breaker open");
+
+    // The helper forwards the reason out-param (a helper that ignored it would leave the
+    // caller's pre-set "query_error" in place).
+    {
+        const char* reason = "query_error";
+        CHECK(authz::service_ceiling_check(r.rbac, "Response", "Read", &reason) ==
+              authz::CeilingVerdict::Degraded);
+        CHECK(std::string_view{reason} == "pool_acquire_timeout");
+    }
+
+    // The real gate: 503 retryable, no `.permission`, counted under the pool label only.
+    auto req = bearer_request(svc);
+    httplib::Response res;
+    auto result = r.ar->require_fleet_read(req, res, "Response", "Read");
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error() == authz::GateFailure::Degraded);
+    CHECK(res.status == 503);
+    auto j = nlohmann::json::parse(res.body);
+    CHECK(j["error"]["retry_after_ms"].get<std::int64_t>() == 5000);
+    CHECK(res.body.find("\"permission\"") == std::string::npos);
+    CHECK(degrade("pool_acquire_timeout") == 1.0);
+    CHECK(degrade("query_error") == 0.0);
+
+    // A sibling gate keeps its 403 for the same failed read and does not touch the counter.
+    {
+        auto req2 = bearer_request(svc);
+        httplib::Response res2;
+        CHECK_FALSE(r.ar->require_permission(req2, res2, "Response", "Read"));
+        CHECK(res2.status == 403);
+    }
+    CHECK(degrade("pool_acquire_timeout") == 1.0);
 }
