@@ -324,9 +324,8 @@ public:
     /// `source_last_seen` for a page of agents in one read: agent_id -> server-receipt
     /// epoch-seconds of its last accepted `source` report (the value the Hardware record
     /// shows as `software_last_seen`). An agent with no row is ABSENT from the map (never a
-    /// 0). Empty `source`/`agent_ids` -> empty map (precondition miss); ids beyond
-    /// kBulkLastSeenMaxIds are not queried. AUTHORITATIVE read: `std::nullopt` on a degrade.
-    static constexpr std::size_t kBulkLastSeenMaxIds = 1000;
+    /// 0). Empty `source`/`agent_ids` -> empty map (precondition miss).
+    /// AUTHORITATIVE read: `std::nullopt` on a degrade.
     [[nodiscard]] std::optional<std::unordered_map<std::string, std::int64_t>>
     source_last_seen_bulk(std::string_view source, const std::vector<std::string>& agent_ids);
 

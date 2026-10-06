@@ -343,7 +343,6 @@ TEST_CASE("software page: confined host view blanks Newest in fleet once and say
           "[inventory][ui]") {
     auto d = page({row("A", 1), row("B", 1)});
     d.confined = true;
-    d.omit_newest = true;
     d.kpis.reset();
     SoftwarePageFilters f;
     f.agent_id = "a1";

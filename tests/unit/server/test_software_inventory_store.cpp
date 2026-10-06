@@ -2956,33 +2956,6 @@ TEST_CASE("source_last_seen_bulk: empty inputs are a precondition miss, not a de
     CHECK(no_source->empty());
 }
 
-TEST_CASE("source_last_seen_bulk: only the first kBulkLastSeenMaxIds ids are queried",
-          "[pg][software_inventory]") {
-    SWINV_SHARED(store, pool);
-    auto lease = pool.try_acquire_for(std::chrono::seconds{5});
-    REQUIRE(lease);
-    const std::size_t n = SoftwareInventoryStore::kBulkLastSeenMaxIds + 5;
-    auto ins = pg::exec_params(
-        lease.get(),
-        "INSERT INTO software_inventory_store.inventory_state "
-        "(agent_id, source, content_hash, first_seen, last_seen) "
-        "SELECT 'bulk-' || lpad(g::text, 5, '0'), 'installed_software', '', 1, 7 "
-        "FROM generate_series(1, $1::int) AS g",
-        std::vector<std::string>{std::to_string(n)});
-    REQUIRE(ins.status() == PGRES_COMMAND_OK);
-    std::vector<std::string> ids;
-    for (std::size_t i = 1; i <= n; ++i) {
-        char b[16];
-        std::snprintf(b, sizeof(b), "bulk-%05zu", i);
-        ids.emplace_back(b);
-    }
-    auto got = store.source_last_seen_bulk("installed_software", ids);
-    REQUIRE(got.has_value());
-    CHECK(got->size() == SoftwareInventoryStore::kBulkLastSeenMaxIds);
-    CHECK(got->contains(ids.front()));
-    CHECK_FALSE(got->contains(ids.back()));
-}
-
 TEST_CASE("source_last_seen_bulk: a store that never opened is a degrade", "[pg][software_inventory]") {
     SWINV_SHARED(store, pool);
     // Rename a column the open-time projection probes, so a second store fails closed (the

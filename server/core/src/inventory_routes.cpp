@@ -126,25 +126,14 @@ void InventoryRoutes::register_routes(httplib::Server& svr, Deps deps) {
 }
 
 void InventoryRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
-    auth_fn_ = std::move(deps.auth_fn);
-    fleet_read_fn_ = std::move(deps.fleet_read_fn);
-    catalog_fn_ = std::move(deps.catalog_fn);
-    catalog_meta_fn_ = std::move(deps.catalog_meta_fn);
-    totals_fn_ = std::move(deps.totals_fn);
-    versions_fn_ = std::move(deps.versions_fn);
-    fleet_fn_ = std::move(deps.fleet_fn);
-    stale_fn_ = std::move(deps.stale_fn);
-    connected_fn_ = std::move(deps.connected_fn);
-    hostnames_fn_ = std::move(deps.hostnames_fn);
-    last_synced_fn_ = std::move(deps.last_synced_fn);
-    audit_fn_ = std::move(deps.audit_fn);
+    deps_ = std::move(deps);
 
     // -- /inventory is retired in favour of /hardware (CI list) — a 302, not a
     // route removal, so bookmarks and the API-parity ledger's history stay intact.
     // Auth still gates first so an unauthenticated caller sees /login, not a
     // redirect loop through an authed-only destination.
     sink.Get("/inventory", [this](const httplib::Request& req, httplib::Response& res) {
-        auto session = auth_fn_(req, res);
+        auto session = deps_.auth_fn(req, res);
         if (!session) {
             res.set_redirect("/login");
             return;
@@ -155,7 +144,7 @@ void InventoryRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
     // -- Page shell: Software — the nav-split successor to the old /inventory shell's
     // default landing tab. Devices moved to /hardware.
     sink.Get("/software", [this](const httplib::Request& req, httplib::Response& res) {
-        auto session = auth_fn_(req, res);
+        auto session = deps_.auth_fn(req, res);
         if (!session) {
             res.set_redirect("/login");
             return;
@@ -184,12 +173,12 @@ void InventoryRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
     // fleet-read gate -> model parse -> scope rule -> reads -> audit -> render.
     sink.Get("/fragments/inventory/software", [this](const httplib::Request& req,
                                                       httplib::Response& res) {
-        auto session = auth_fn_(req, res);
+        auto session = deps_.auth_fn(req, res);
         if (!session)
             return;
-        if (deny_service_scoped(*session, req, res, audit_fn_, "inventory.software.catalog"))
+        if (deny_service_scoped(*session, req, res, deps_.audit_fn, "inventory.software.catalog"))
             return;
-        auto gate = admit(fleet_read_fn_, req, res);
+        auto gate = admit(deps_.fleet_read_fn, req, res);
         if (!gate)
             return;
         const auto mode = req.has_param("rows_only")      ? SoftwarePageMode::Rows
@@ -220,7 +209,7 @@ void InventoryRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         if (host ? !authz::in_scope(gate->scope, q.agent_id) : confined) {
             d.confined = true;
             d.caveat = kConfinedFleetMsg;
-            (void)detail::try_persist_audit(audit_fn_, req, "inventory.software.catalog", "denied",
+            (void)detail::try_persist_audit(deps_.audit_fn, req, "inventory.software.catalog", "denied",
                                             "Inventory", target,
                                             "scope: fleet-wide aggregate or out-of-scope device");
             reply();
@@ -228,20 +217,20 @@ void InventoryRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         }
 
         const swc::CatalogueReads io{
-            [&] { return catalog_meta_fn_ ? catalog_meta_fn_() : std::optional<CatalogRollupMeta>{}; },
+            [&] { return deps_.catalog_meta_fn ? deps_.catalog_meta_fn() : std::optional<CatalogRollupMeta>{}; },
             [&](const SoftwareCatalogQuery& c) {
-                return catalog_fn_ ? catalog_fn_(c)
+                return deps_.catalog_fn ? deps_.catalog_fn(c)
                                    : std::optional<std::vector<SoftwareCatalogRow>>{};
             },
             [&](const SoftwareCatalogQuery& c) {
-                return totals_fn_ ? totals_fn_(c) : std::optional<SoftwareCatalogTotals>{};
+                return deps_.totals_fn ? deps_.totals_fn(c) : std::optional<SoftwareCatalogTotals>{};
             }};
         swc::CataloguePage page;
         switch (swc::read_catalogue_page(io, rq, page)) {
         case swc::PageStatus::kOk:
             break;
         case swc::PageStatus::kDegraded:
-            (void)detail::try_persist_audit(audit_fn_, req, "inventory.software.catalog", "failure",
+            (void)detail::try_persist_audit(deps_.audit_fn, req, "inventory.software.catalog", "failure",
                                             "Inventory", target, "store degraded");
             reply(); // rows nullopt -> the retry banner, never an empty table
             return;
@@ -260,23 +249,23 @@ void InventoryRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         // and a COUNT, so only the full page pays for them.
         if (mode != SoftwarePageMode::Rows && !confined) {
             auto meta = page.meta;
-            if (!meta && catalog_meta_fn_) // unconfined host view: the model skips the meta read
-                meta = catalog_meta_fn_();
+            if (!meta && deps_.catalog_meta_fn) // unconfined host view: the model skips the meta read
+                meta = deps_.catalog_meta_fn();
             if (meta) {
                 swc::Coverage cov;
                 if (mode == SoftwarePageMode::Full) {
-                    if (connected_fn_)
-                        cov.connected = connected_fn_();
-                    if (stale_fn_)
-                        cov.stale = stale_fn_();
+                    if (deps_.connected_fn)
+                        cov.connected = deps_.connected_fn();
+                    if (deps_.stale_fn)
+                        cov.stale = deps_.stale_fn();
                 }
                 d.kpis = swc::derive_kpis(*meta, cov);
             }
         }
         // Names: the host view's display name and (Full) the type-ahead list. Never read for
         // a confined caller (a whole-fleet hostname map is fleet disclosure).
-        if (!confined && hostnames_fn_ && (mode == SoftwarePageMode::Full || host)) {
-            const auto names = hostnames_fn_();
+        if (!confined && deps_.hostnames_fn && (mode == SoftwarePageMode::Full || host)) {
+            const auto names = deps_.hostnames_fn();
             if (host) {
                 const auto it = names.find(q.agent_id);
                 f.host_display = (it != names.end() && !it->second.empty()) ? it->second : q.agent_id;
@@ -295,12 +284,11 @@ void InventoryRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         }
 
         d.confined = confined; // confined host view: no strip, no type-ahead
-        d.omit_newest = confined; // ... and Newest in fleet is blanked
         d.shown_before = int_hint(req, "shown").value_or(0);
         if (!page.next_cursor.empty())
             d.next_cursor = page.next_cursor;
         (void)detail::try_persist_audit(
-            audit_fn_, req, "inventory.software.catalog", "success", "Inventory", target,
+            deps_.audit_fn, req, "inventory.software.catalog", "success", "Inventory", target,
             "titles=" + std::to_string(page.rows.size()) + " totals=" +
                 std::to_string(page.totals.titles) + "/" + std::to_string(page.totals.installs) +
                 (continuation ? " page=continuation" : ""));
@@ -312,12 +300,12 @@ void InventoryRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
     // -- SOFTWARE version drill: installs per version for one title, inline under its row.
     sink.Get("/fragments/inventory/software/versions", [this](const httplib::Request& req,
                                                                httplib::Response& res) {
-        auto session = auth_fn_(req, res);
+        auto session = deps_.auth_fn(req, res);
         if (!session)
             return;
-        if (deny_service_scoped(*session, req, res, audit_fn_, "inventory.software.versions"))
+        if (deny_service_scoped(*session, req, res, deps_.audit_fn, "inventory.software.versions"))
             return;
-        auto gate = admit(fleet_read_fn_, req, res);
+        auto gate = admit(deps_.fleet_read_fn, req, res);
         if (!gate)
             return;
         auto parsed = swc::parse_versions_params(req.params);
@@ -331,7 +319,7 @@ void InventoryRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         const bool confined = gate->scope.has_value();
         const std::string target = swc::audit_target(q);
         if (host ? !authz::in_scope(gate->scope, q.agent_id) : confined) {
-            (void)detail::try_persist_audit(audit_fn_, req, "inventory.software.versions", "denied",
+            (void)detail::try_persist_audit(deps_.audit_fn, req, "inventory.software.versions", "denied",
                                             "Inventory", target,
                                             "scope: fleet-wide aggregate or out-of-scope device");
             send_html(res, caveat_div(kConfinedFleetMsg));
@@ -343,10 +331,10 @@ void InventoryRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         f.source = q.source;
         f.agent_id = q.agent_id;
         std::optional<std::vector<SoftwareVersionCount>> vers;
-        if (versions_fn_)
-            vers = versions_fn_(q);
+        if (deps_.versions_fn)
+            vers = deps_.versions_fn(q);
         (void)detail::try_persist_audit(
-            audit_fn_, req, "inventory.software.versions", vers ? "success" : "failure",
+            deps_.audit_fn, req, "inventory.software.versions", vers ? "success" : "failure",
             "Inventory", target, vers ? ("versions=" + std::to_string(vers->size())) : "store degraded");
         send_html(res, render_software_versions_expansion(f, q.name, vers, confined));
     });
@@ -356,12 +344,12 @@ void InventoryRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
     // gate's scope (pushed into SQL up to kScopePushdownMaxIds, post-filtered above it).
     sink.Get("/fragments/inventory/software/devices", [this](const httplib::Request& req,
                                                               httplib::Response& res) {
-        auto session = auth_fn_(req, res);
+        auto session = deps_.auth_fn(req, res);
         if (!session)
             return;
-        if (deny_service_scoped(*session, req, res, audit_fn_, "inventory.software.query"))
+        if (deny_service_scoped(*session, req, res, deps_.audit_fn, "inventory.software.query"))
             return;
-        auto gate = admit(fleet_read_fn_, req, res);
+        auto gate = admit(deps_.fleet_read_fn, req, res);
         if (!gate)
             return;
         auto parsed = swc::parse_devices_params(req.params);
@@ -404,10 +392,10 @@ void InventoryRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         };
 
         std::optional<std::vector<SoftwareFleetRow>> rows;
-        if (fleet_fn_)
-            rows = fleet_fn_(q);
+        if (deps_.fleet_fn)
+            rows = deps_.fleet_fn(q);
         if (!rows) {
-            (void)detail::try_persist_audit(audit_fn_, req, "inventory.software.query", "failure",
+            (void)detail::try_persist_audit(deps_.audit_fn, req, "inventory.software.query", "failure",
                                             "Inventory", target, "store degraded");
             reply(); // t.rows nullopt -> the retry banner
             return;
@@ -437,10 +425,10 @@ void InventoryRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         for (const auto& r : *rows)
             if (seen.insert(r.agent_id).second)
                 ids.push_back(r.agent_id);
-        if (hostnames_fn_)
-            t.hostnames = hostnames_fn_(); // ponytail: copies the whole 30-day map per page; a keyed lookup if it shows
-        if (last_synced_fn_)
-            t.last_synced = last_synced_fn_(ids);
+        if (deps_.hostnames_fn)
+            t.hostnames = deps_.hostnames_fn(); // ponytail: copies the whole 30-day map per page; a keyed lookup if it shows
+        if (deps_.last_synced_fn)
+            t.last_synced = deps_.last_synced_fn(ids);
         // `shown` hint + this page's DISTINCT devices (a device on two sources is two rows, one
         // device). ponytail: a device straddling a page boundary counts twice; exact dedupe
         // needs client state.
@@ -450,9 +438,9 @@ void InventoryRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
 
         if (dropped > 0)
             (void)detail::try_persist_audit(
-                audit_fn_, req, "inventory.software.query", "denied", "Inventory", target,
+                deps_.audit_fn, req, "inventory.software.query", "denied", "Inventory", target,
                 "scope: filtered " + std::to_string(dropped) + " out-of-scope device(s)");
-        (void)detail::try_persist_audit(audit_fn_, req, "inventory.software.query", "success",
+        (void)detail::try_persist_audit(deps_.audit_fn, req, "inventory.software.query", "success",
                                         "Inventory", target,
                                         "rows=" + std::to_string(rows->size()) +
                                             (continuation ? " page=continuation" : ""));

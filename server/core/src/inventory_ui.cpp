@@ -498,18 +498,35 @@ std::string controls(const SoftwarePageFilters& f, const SoftwarePageData& d) {
     return h;
 }
 
+// The devices-fragment query shared by the title rows, the version rows and the Load-more
+// sentinel; each caller appends its own tail (total, or cursor/total/shown).
+std::vector<std::pair<std::string, std::string>>
+devices_kv(const SoftwarePageFilters& f, const std::string& name,
+           const std::optional<std::string>& version) {
+    std::vector<std::pair<std::string, std::string>> kv{{"name", name}};
+    if (version)
+        kv.emplace_back("version", *version); // present-empty = the exact empty-version bucket
+    add_state(kv, f, false);
+    if (!f.agent_id.empty())
+        kv.emplace_back("agent_id", f.agent_id);
+    return kv;
+}
+
+std::string version_devices_url(const SoftwarePageFilters& f, const std::string& name,
+                                const std::optional<std::string>& version, std::int64_t total) {
+    auto kv = devices_kv(f, name, version);
+    kv.emplace_back("total", std::to_string(total));
+    return "/fragments/inventory/software/devices?" + query_of(kv);
+}
+
 std::string title_rows(const SoftwarePageFilters& f, const SoftwarePageData& d) {
     std::string h;
     std::int64_t i = d.shown_before;
     for (const auto& r : *d.rows) {
         const std::string id = id_safe(r.name), box = "exp-" + id;
-        std::vector<std::pair<std::string, std::string>> kv{{"name", r.name}};
-        add_state(kv, f, false);
-        if (!f.agent_id.empty())
-            kv.emplace_back("agent_id", f.agent_id);
-        const std::string vurl = "/fragments/inventory/software/versions?" + query_of(kv);
-        kv.emplace_back("total", std::to_string(r.device_count));
-        const std::string durl = "/fragments/inventory/software/devices?" + query_of(kv);
+        const std::string vurl =
+            "/fragments/inventory/software/versions?" + query_of(devices_kv(f, r.name, std::nullopt));
+        const std::string durl = version_devices_url(f, r.name, std::nullopt, r.device_count);
         std::string pills;
         for (std::size_t p = 0; p < r.ecosystems.size();) {
             const auto e = r.ecosystems.find(',', p);
@@ -533,7 +550,7 @@ std::string title_rows(const SoftwarePageFilters& f, const SoftwarePageData& d) 
              "</td><td>" + pills + "<span class=\"inv-grey\">" + esc(kinds) + "</span></td>"
              "<td class=\"inv-num\">" + fmt_int(r.device_count) + "</td><td class=\"inv-num\">" +
              fmt_int(r.version_count) + "</td><td class=\"inv-mono\">" +
-             ((r.newest_version.empty() || d.omit_newest) ? dash() : esc(r.newest_version)) +
+             ((r.newest_version.empty() || d.confined) ? dash() : esc(r.newest_version)) +
              "</td><td class=\"inv-mono\"><span class=\"inv-devbtn\" data-vers>versions &rsaquo;</span>"
              " &middot; <span class=\"inv-devbtn\" data-devs data-tog=\"d\" "
              "onclick=\"event.stopPropagation()\" hx-get=\"" + esc(durl) + "\" hx-target=\"#" + box +
@@ -581,15 +598,13 @@ std::string results_region(const SoftwarePageFilters& f, const SoftwarePageData&
              "daily, and a new agent reports within minutes of enrolling.</div></div>";
         return h;
     }
-    std::vector<std::pair<std::string, std::string>> inst, titles{{"format", "csv"}};
-    inst.emplace_back("format", "json");
-    for (auto* kv : {&inst, &titles}) {
-        if (!f.q.empty()) kv->emplace_back("q", f.q);
-        add_state(*kv, f, kv == &titles); // install exports omit versions_min
-        if (!f.agent_id.empty()) kv->emplace_back("agent_id", f.agent_id);
-    }
-    auto csv = inst;
-    csv.front().second = "csv";
+    const auto export_kv = [&](const char* fmt, bool with_vmin) { // install exports omit versions_min
+        std::vector<std::pair<std::string, std::string>> kv{{"format", fmt}};
+        if (!f.q.empty()) kv.emplace_back("q", f.q);
+        add_state(kv, f, with_vmin);
+        if (!f.agent_id.empty()) kv.emplace_back("agent_id", f.agent_id);
+        return query_of(kv);
+    };
     const std::string tip = "the matching install rows (up to " + fmt_int(swc::kExportCap) +
                             "); the file says if it was cut off; the sprawl filter is not applied to "
                             "install exports";
@@ -601,14 +616,14 @@ std::string results_region(const SoftwarePageFilters& f, const SoftwarePageData&
     h += "<div class=\"inv-resbar\"><div class=\"inv-count\" aria-live=\"polite\"><b>" +
          fmt_int(d.totals->titles) + "</b> titles &middot; <b>" + fmt_int(d.totals->installs) +
          "</b> installs" + (any_filter(f) ? " match your filters" : "") + " &middot; most installed first" +
-         (d.omit_newest ? " &middot; <span class=\"inv-grey\">Newest in fleet: your management groups "
+         (d.confined ? " &middot; <span class=\"inv-grey\">Newest in fleet: your management groups "
                           "only</span>"
                         : "") +
          "</div><div class=\"inv-exports\"><span>Export installs</span>" +
-         dl("json", "software-installs.json", "/api/v1/inventory/software?" + query_of(inst), tip, "JSON") +
-         dl("csv", "software-installs.csv", "/api/v1/inventory/software?" + query_of(csv), tip, "CSV") +
+         dl("json", "software-installs.json", "/api/v1/inventory/software?" + export_kv("json", false), tip, "JSON") +
+         dl("csv", "software-installs.csv", "/api/v1/inventory/software?" + export_kv("csv", false), tip, "CSV") +
          "<span style=\"margin-left:.5rem\">Export titles</span>" +
-         dl("titles", "software-titles.csv", "/api/v1/inventory/software/catalogue?" + query_of(titles),
+         dl("titles", "software-titles.csv", "/api/v1/inventory/software/catalogue?" + export_kv("csv", true),
             "one row per title with installs and versions", "CSV") +
          "</div></div>";
     if (d.rows->empty()) {
@@ -626,18 +641,6 @@ std::string results_region(const SoftwarePageFilters& f, const SoftwarePageData&
          "<th scope=\"col\"></th></tr></thead><tbody>" +
          title_rows(f, d) + "</tbody></table></div></div>";
     return h;
-}
-
-std::string version_devices_url(const SoftwarePageFilters& f, const std::string& name,
-                                const std::optional<std::string>& version, std::int64_t total) {
-    std::vector<std::pair<std::string, std::string>> kv{{"name", name}};
-    if (version)
-        kv.emplace_back("version", *version); // present-empty = the exact empty-version bucket
-    add_state(kv, f, false);
-    if (!f.agent_id.empty())
-        kv.emplace_back("agent_id", f.agent_id);
-    kv.emplace_back("total", std::to_string(total));
-    return "/fragments/inventory/software/devices?" + query_of(kv);
 }
 
 } // namespace
@@ -807,12 +810,7 @@ std::string render_software_devices_table(const SoftwarePageFilters& f, const So
     if (t.rows->empty())
         body += "<tr><td colspan=\"" + std::to_string(ncol) + "\" class=\"inv-empty\">No devices.</td></tr>";
     if (t.next_cursor) {
-        std::vector<std::pair<std::string, std::string>> kv{{"name", t.name}};
-        if (t.version)
-            kv.emplace_back("version", *t.version);
-        add_state(kv, f, false);
-        if (!f.agent_id.empty())
-            kv.emplace_back("agent_id", f.agent_id);
+        auto kv = devices_kv(f, t.name, t.version);
         kv.emplace_back("cursor", *t.next_cursor);
         if (t.total)
             kv.emplace_back("total", std::to_string(*t.total));

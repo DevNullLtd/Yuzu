@@ -879,9 +879,7 @@ SoftwareInventoryStore::source_last_seen_bulk(std::string_view source,
                          pool_.last_error(), d.occurrence);
         return std::nullopt;
     }
-    const std::size_t n = std::min(agent_ids.size(), kBulkLastSeenMaxIds);
-    std::vector<std::string_view> ids(agent_ids.begin(),
-                                      agent_ids.begin() + static_cast<std::ptrdiff_t>(n));
+    const std::vector<std::string_view> ids(agent_ids.begin(), agent_ids.end());
     pg::PgResult res = pg::exec_params(
         lease.get(),
         "SELECT agent_id, last_seen FROM software_inventory_store.inventory_state "

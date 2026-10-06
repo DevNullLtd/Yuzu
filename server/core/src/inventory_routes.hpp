@@ -155,7 +155,6 @@ struct SoftwarePageData {
     std::int64_t shown_before{0}; ///< titles already on the page (the `shown` hint)
     std::optional<std::string> caveat; ///< parse/cursor refusal: shown instead of a table
     bool confined{false};     ///< management-group-confined caller: no fleet figures
-    bool omit_newest{false};  ///< confined host view: Newest in fleet is blanked
 };
 
 struct SoftwareDevicesTable {
@@ -276,18 +275,7 @@ public:
     void register_routes(HttpRouteSink& sink, Deps deps);
 
 private:
-    AuthFn auth_fn_;
-    CatalogFn catalog_fn_;
-    CatalogMetaFn catalog_meta_fn_;
-    VersionsFn versions_fn_;
-    FleetSoftwareFn fleet_fn_;
-    StaleFn stale_fn_;
-    ConnectedFn connected_fn_;
-    LastSyncedFn last_synced_fn_;
-    FleetReadFn fleet_read_fn_;
-    TotalsFn totals_fn_;
-    AuditFn audit_fn_;
-    HostnamesFn hostnames_fn_;
+    Deps deps_;
 };
 
 } // namespace yuzu::server
