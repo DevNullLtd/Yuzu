@@ -1588,6 +1588,14 @@ earlier text of this section is left as written; the points below say what it no
   deterministically on its own payload would block the queue and keep the breaker cycling against a healthy
   server. Fields that an agent controls are therefore sanitised at admission; the agent-supplied peer address
   is the only one today (found in review: a value that is not valid UTF-8 cannot be encoded).
+- **Narrowed by the Gate 8 re-review (same update).** The invariant above is now enforced at one more layer:
+  a failure of the gateway's own request encoder (the request never left the gateway) is a local error that
+  feeds the breaker neither as a success nor as a failure, and a held notification whose probe ends that way is
+  evicted with a warning and the next head is probed at once, so such a notification no longer blocks the queue.
+  A server answer, a transport error and a killed probe worker still count as before. `cluster_id` is converted
+  with the unicode conversion and the gateway refuses to start when it cannot be represented. The peer address
+  stays sanitised so its notification is sent instead of evicted. Details: Known limits in
+  `docs/user-manual/gateway.md` and the evidence record.
 - **Residuals** are the ones listed under Known limits in `docs/user-manual/gateway.md`, among them: a probe
   success proves only the notification path, not registration; the synchronous RPCs still run inside the one
   upstream process, so casts queue in its mailbox while one runs; retry or breaker feedback for an ordinary
