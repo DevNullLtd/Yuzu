@@ -855,17 +855,41 @@ The gateway is configured via `gateway/config/sys.config`. Key settings:
 ```
 
 **`cluster_id`** (the `cluster_id` key above, or the `YUZU_GW_CLUSTER_ID` environment
-variable, which replaces it when set): the name is converted to UTF-8 with the unicode
-conversion, so a name given as a list of Unicode code points (for example one with an
-accented letter, or with characters above 255) is stamped on every notification as valid
-UTF-8; a name that cannot be represented (a code point above 16#10FFFF, a surrogate,
-or bytes that are not UTF-8) makes the gateway refuse to start, with a critical log line
-that names which of the two sources is wrong and never prints the value. It refuses
-rather than warns and falls back because the cluster id pins agents to a trust zone, so
-starting under a different id is wrong, and starting with an id that makes every
-notification fail to encode would silently lose all stream status (INFERRED from the
-code and unit tests, not run on a rig). An empty name is still accepted, and the default is
-`default`.
+variable, which replaces it when set): the name is stamped on every notification as
+UTF-8, and the two sources are read by different rules (INFERRED from the code and unit
+tests; the `sys.config` forms were also checked with `file:consult` and `erl -config`
+under a C locale and a UTF-8 locale, with identical results; none of it was run on a rig):
+
+- **Environment variable.** The VM hands the text over in its native name encoding,
+  which is latin1 in the shipped images (they set no `LANG` or `LC_ALL` and no `+fnu`)
+  and UTF-8 under a UTF-8 locale. The gateway recovers the original bytes using that
+  encoding and then requires them to be valid UTF-8, so a name typed in a shell gives
+  the same bytes on both. A code point above 255 under latin1, bytes that are not
+  UTF-8, a surrogate or a code point above 16#10FFFF are refused. Limit: on a node
+  with a UTF-8 native encoding the VM reads a byte sequence that is not valid UTF-8 as
+  latin1 characters, which cannot be told from valid text, so it becomes that (different,
+  valid) name; only a latin1 node can refuse non-UTF-8 bytes, and the shipped images are
+  latin1 nodes.
+- **`sys.config`.** Independent of the node's locale. A binary must already be valid
+  UTF-8; a string is read as Unicode code points. The forms that work for a name with a
+  non-ASCII character are the string `"Z\x{FC}rich"` (or the name typed as UTF-8 text
+  inside the quotes) and the binary `<<"Z\x{FC}rich"/utf8>>`. A plain binary
+  `<<"...">>` that holds the character is read as a single byte that is not valid
+  UTF-8, and is refused at boot.
+- **Refusal.** A name that cannot be represented makes the gateway refuse to start:
+  `yuzu_gw_app:start/2` returns `{error, {invalid_cluster_id, env}}` (the variable) or
+  `{error, {invalid_cluster_id, app_env}}` (the `cluster_id` setting) and logs a
+  critical line that names the source and never prints the value (the runbook row has
+  the line). Most refusals come from `sys.config`; the variable is refused only for
+  bytes that are not UTF-8 on a latin1 node. When the variable is set it replaces the
+  setting, so only it is checked. The environment override also logs
+  `ENV override: YUZU_GW_CLUSTER_ID cannot be represented as UTF-8; ignoring it (the
+  value is not logged)`: it never echoes the value.
+
+It refuses rather than warns and falls back because the cluster id pins agents to a
+trust zone, so starting under a different id is wrong, and starting with an id that
+makes every notification fail to encode would silently lose all stream status. An
+empty name is still accepted, and the default is `default`.
 
 **Upstream client tuning** (registration replay and pending notifications; application env keys read by the upstream
 client at start, except `upstream_call_timeout_ms`, which is read on every call; set them in the `yuzu_gw` section of `sys.config`. No
@@ -1036,7 +1060,7 @@ never below the base, see the max row):
 | Key | Environment override | Default | Meaning |
 |---|---|---|---|
 | `circuit_breaker_failure_threshold` | `YUZU_GW_CB_FAILURE_THRESHOLD` | 5 (valid range 1 to 1000) | Consecutive failed upstream calls that open the breaker. A value that is not an integer in 1 to 1000 logs `Invalid circuit_breaker_failure_threshold value <V> (expected an integer in 1..1000); using 5` and takes the default; before this check a threshold of 0 opened the breaker on the first failure. An environment override that is not an integer is ignored with the `ENV override` line, as for the timeouts (INFERRED from the code and unit tests, not run on a rig) |
-| `circuit_breaker_reset_timeout_ms` | `YUZU_GW_CB_RESET_TIMEOUT_MS` | 10000 (valid range 100 to 3600000) | How long the breaker stays open the first time before it goes half open and allows one probe: a call-path RPC or, when stream-status notifications are held, the head held notification. A successful probe closes the breaker and starts the registration replay of every agent the node holds (OBSERVED on a rig). A value that is not an integer in 100 to 3600000 (0, a negative number, a float, a string, more than an hour) logs a WARN that names the key (`Invalid circuit_breaker_reset_timeout_ms value <V> (expected an integer in 100..3600000); using 10000`) and takes the default. The floor is 100 because the probe is timer driven: 0 would stay 0 and make the half open probe a hot loop forever, and a base or cap of 1 ms would still give a probe loop of about 1000 attempts a second (the floor was 1 in an earlier build of this change). An environment override that is not an integer never reaches that check: `yuzu_gw_app` logs `ENV override: <VAR> has invalid value '<value>', ignoring` and the `sys.config` value (or the default) applies. An environment override that is an integer is stored and checked against the same range when the upstream client starts, so only an out-of-range integer produces the WARN above. A value above 3600000 does not clamp to one hour: it takes the default 10000, with the WARN (INFERRED from the code and unit tests, not run on a rig) |
+| `circuit_breaker_reset_timeout_ms` | `YUZU_GW_CB_RESET_TIMEOUT_MS` | 10000 (valid range 100 to 3600000) | How long the breaker stays open the first time before it goes half open and allows one probe: a call-path RPC or, when stream-status notifications are held, the head held notification. A successful probe closes the breaker and starts the registration replay of every agent the node holds (OBSERVED on a rig). A value that is not an integer in 100 to 3600000 (0, a negative number, a float, a string, more than an hour) logs a WARN that names the key (`Invalid circuit_breaker_reset_timeout_ms value <V> (expected an integer in 100..3600000); using 10000`) and takes the default. The floor is 100 because the probe is timer driven: 0 would stay 0 and make the half open probe a hot loop forever, and a base or cap of 1 ms would still give a probe loop of about 1000 attempts a second. An environment override that is not an integer never reaches that check: `yuzu_gw_app` logs `ENV override: <VAR> has invalid value '<value>', ignoring` and the `sys.config` value (or the default) applies. An environment override that is an integer is stored and checked against the same range when the upstream client starts, so only an out-of-range integer produces the WARN above. A value above 3600000 does not clamp to one hour: it takes the default 10000, with the WARN (INFERRED from the code and unit tests, not run on a rig) |
 | `circuit_breaker_max_reset_timeout_ms` | `YUZU_GW_CB_MAX_RESET_TIMEOUT_MS` | 300000 (valid range 100 to 3600000) | Cap on the open duration, which doubles each time a trip or a failed probe reopens the breaker (10 s, 20 s, 40 s, 80 s and so on) and returns to the first value when a probe succeeds. This is the 300 s the recovery bounds in "What happens when the server restarts" cite. An invalid value takes the default 300000 with a WARN that names the key (`Invalid circuit_breaker_max_reset_timeout_ms value <V> (expected an integer in 100..3600000); using 300000`), and an environment override that is not an integer is ignored with the `ENV override` line, both as for the reset timeout; a value above 3600000 takes the default, not the limit. When the validated cap is below the validated base, the effective cap is the base and one WARN names both keys: `circuit_breaker_max_reset_timeout_ms (<Max>) is below circuit_breaker_reset_timeout_ms (<Base>); using <Base> for both` (a base of 600000 with the default cap of 300000 used to stay open 600 s the first time and 300 s afterwards; it is now 600 s each time) |
 
 
@@ -1295,6 +1319,8 @@ agent build that re-registers by itself; released agents do not (see
 | gateway | WARN | `Register refused: the agent id is empty or longer than 256 bytes (size <N> bytes)` | A `Register` carried an agent id that the server would refuse (empty, missing, not a binary, or over 256 bytes) and was answered `INVALID_ARGUMENT` at the gateway edge with no upstream call; the circuit breaker is untouched. The line carries the byte size (0 for a value that is not a binary) and never the id. At most one line per second, with a ` (N similar line(s) suppressed since the last)` suffix. A few lines point at one broken or misconfigured client; a steady run means something is sending malformed registrations. No gateway action is needed, because these cannot move the breaker (INFERRED from the code and unit tests, not run on a rig). |
 | gateway | WARN | `Upstream Register failed: <reason>` (also `Upstream ReportInventory failed: <reason>` and `Upstream RPC <Method> failed: <Status> <message>`) | An upstream `ProxyRegister` or inventory call failed and the agent's request failed with it; the agent retries with its own backoff. The reason is `circuit_open` (the breaker is open), a server status, a transport reason, or `rpc exception <Class>:<Why>`. These lines are rate limited to one per second per kind, and the next line ends with ` (N similar line(s) suppressed since the last)`, so the number of lines is not the number of failed requests: during a genuine outage the per-event signal is the unlimited `Circuit breaker:` lines and `yuzu_gw_upstream_rpc_errors_total`, not a line per `Register`. `Upstream RPC <Method> failed: <Status> <message>` is limited only for the five request-fault statuses (3, 5, 6, 9, 11); the same line for any other status is not limited (INFERRED from the code and unit tests, not run on a rig). |
 | gateway | WARN | `Upstream RPC <Method> raised <Class>:<Why>` with `yuzu_gw_upstream_rpc_errors_total{code="encode"}` rising | The gateway's own request encoder failed, so the request was never sent and the breaker is untouched (`error:badarg` is a field that is not valid UTF-8; `error:request_too_large` is a request over 4194304 bytes). A few lines for one malformed registration are expected. A STEADY rise with every `Register` answered `INTERNAL` (`Upstream registration failed: {internal,<<"rpc exception <Class>:<Why>">>}`), the breaker CLOSED and `/readyz` ready is a systematic local encoder fault: nothing in the breaker or in readiness shows it, so this row is the discriminator. Read `<Class>:<Why>` first; if every agent is affected, roll back to the previous gateway build and escalate. A gateway restart does not help and reconnects every agent the node holds. No shipped alert covers `code="encode"` yet (follow-up, see Known limits). With `code="exception"` instead the exception came out of the client or transport and does count against the breaker (INFERRED from the code and unit tests, not run on a rig). |
+| gateway | CRITICAL | `Refusing to start: the cluster id (<source>) cannot be represented as UTF-8 (a code point above 16#10FFFF, a surrogate, or bytes that are not UTF-8). Set YUZU_GW_CLUSTER_ID, or cluster_id in sys.config, to a name made of valid Unicode characters.` | The gateway did not start: `<source>` is `YUZU_GW_CLUSTER_ID` or `the cluster_id application setting`, and the application start returned `{error, {invalid_cluster_id, env}}` or `{error, {invalid_cluster_id, app_env}}`. The value is never logged. Check the named source: for `sys.config`, a plain binary that holds a non-ASCII character (`<<"...">>`) is the usual cause, so write the name as a string (`"Z\x{FC}rich"`) or as `<<"Z\x{FC}rich"/utf8>>`; for the variable, check that the value is valid UTF-8 text. Correct it and start the gateway again; a restart without the fix will refuse again (see the `cluster_id` paragraph under "Configuration"; INFERRED from the code and unit tests, not run on a rig). |
+| gateway | WARN | `ENV override: YUZU_GW_CLUSTER_ID cannot be represented as UTF-8; ignoring it (the value is not logged)` | The variable could not be converted. It is not applied, and because the variable is still set the gateway then refuses to start with the critical line above. |
 | gateway | WARN | `Registration replay aborted: circuit open (N agent(s) not yet re-proxied)` | The breaker opened while the drip was running. The queue is dropped; the agents come back on a later verdict or on the next breaker recovery. |
 | gateway | WARN | `Registration replay aborted: registry unavailable (N queued entries dropped)` | The gateway's registry process was down when the drip popped an entry, so nothing queued could be re-verified and the queue was dropped. This abort disconnects no agent. INFERRED from the code (not tested): a registry that died has lost its tables (see [Heartbeat admission](#heartbeat-admission)), so a later verdict finds no local session for these agents and counts them `not_local`; they are not listed again into the replay. They come back only through their own `NOT_FOUND` re-register path, which released v0.13.0 and v0.14.0-rc6 agents do not complete (see "Agent dependency" below). |
 | gateway | WARN | `Registration replay: <agent> failed: <reason>` | A replay `ProxyRegister` failed. It counts as a failure for the shared circuit breaker (see "Replay failures feed the shared circuit breaker" below). |
