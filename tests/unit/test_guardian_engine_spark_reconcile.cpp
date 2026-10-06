@@ -4472,10 +4472,12 @@ TEST_CASE("#5459 held generation: identical pushes while a hung arm is outstandi
     {
         const auto s = r.f.engine->arm_stats();
         REQUIRE(s.has_value());
-        // A new Application: r1's re-observed (hung) claim stays pending for as long as the
-        // worker is parked, deterministically. r2's re-arm is a separate worker that may or may
-        // not have resolved by now (it did under load: pending 1), so only r1's contribution
-        // is asserted here; r2's re-arm is awaited event-driven just below.
+        // A new Application: r1's re-observed (hung) claim is registered in this application's
+        // pending set (its Wedged receipt is already terminal when registered, and it only moves
+        // to failed_receipts at the next drain tick, which has not run yet), so r1 contributes
+        // pending 1 deterministically. r2's re-arm is a separate worker that may or may not have
+        // resolved by now (it did under load: pending 1), so only r1's contribution is asserted
+        // here; r2's re-arm is awaited event-driven just below.
         CHECK(s->pending >= 1);
         CHECK(s->failed == 0);
     }
