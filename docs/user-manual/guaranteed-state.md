@@ -489,24 +489,31 @@ waited for a free start slot and was not started by its deadline.
     that changes nothing for that agent is identical to the automatic re-push and is suppressed like
     it, so change the rule first. **Warning: disabling the rule stops enforcing it everywhere it is
     deployed, narrowing its scope or OS target stops it on the agents that drop out, and a Re-deploy
-    re-applies every agent (see Costs).**
+    re-applies every agent (see Costs) and also publishes every other staged member edit on that
+    Baseline. On the held agent, other armed rules of the same mechanism type are torn down by the
+    full push and queue behind the hung call, then expire: they stay unenforced until it returns or
+    the agent restarts, and their expiries are never suppressed, so the agent gets a full re-apply
+    on every re-push (about one per heartbeat), with the baseline recapture described under the Safety valve (see the
+    Same-type condition below).**
   - **(3) The wedged rule is edited so that what it watches changes** (its file path, service name,
     or registry hive and key). It is then a different watch, is not matched to the hung call, and is
     armed afresh; a rule edit is live, so the next automatic re-push carries it. A registry rule's
-    value name and expected value belong to its assertion, not to what it watches, so editing them
-    does not do this (see the known limits).
+    value name and expected value are not part of what it watches, so editing them does not do this
+    (see the known limits).
   - **Same-type condition for (2) and (3).** While the hung call is still inside a mechanism call, it
     holds that mechanism type's call lock (the agent runs one watch or unwatch call at a time per
-    type, for example File, Registry or Service). Any OTHER rule of the same type in the new push, and
-    the edited rule itself under (3) when the edit leaves its type unchanged, then queues behind the
-    hung call and expires, so it holds the generation on a failure of its own (a congestion expiry is
-    re-applied in full on every re-push, not suppressed). The new application is therefore
-    acknowledged only if no other arm of that mechanism type is in it, or the hung call has already
-    left the mechanism. Otherwise the generation stays held until the hung call returns or the agent
-    restarts. Rules of other types are not affected.
+    type, for example File, Registry or Service). The call holding that lock can be ANY hung watch,
+    unwatch or compensating teardown of that type, including one that the wedged rule being exited
+    was itself only queued behind, not necessarily the wedged rule's own call. Any OTHER rule of the
+    same type in the new push, and the edited rule itself under (3) when the edit leaves its type
+    unchanged, then queues behind the hung call and expires, so it holds the generation on a failure
+    of its own (a congestion expiry is re-applied in full on every re-push, not suppressed). The new
+    application is therefore acknowledged only if no other arm of that mechanism type is in it, or
+    the hung call has already left the mechanism. Otherwise the generation stays held until the hung
+    call returns or the agent restarts. Rules of other types are not affected.
   - **What does not end a hold.** A new policy generation, a re-deploy of an unchanged Baseline, a
     different `full_sync` setting, or an edit that leaves what the rule watches the same (its
-    assertion, for example). The push is applied in full, but the wedged rule is recognised as the
+    expected value, for example). The push is applied in full, but the wedged rule is recognised as the
     same hung call and counted as failed again, so the new generation is held again with a fresh
     budget of suppressed re-pushes. A push with `full_sync=false` (the REST and MCP default) is the
     wrong tool for ending a hold: it leaves a rule that was removed from the Baseline armed, or
@@ -536,9 +543,9 @@ against, so a full push sent to end one agent's hold, including a Re-deploy to t
 disturbs the others too. And taking the rule out of the push stops enforcing it: disabling it, or
 removing it from the Baseline, stops it on every agent the Baseline delivers it to, and narrowing its
 scope or OS target stops it on the agents that drop out. A push with `full_sync=false` during a hold counts as different content, so it is applied in full, as is the next `full_sync=true` push after it, and the 10-push budget restarts.
-- **Known limits.** (1) A push with `full_sync=false` that omits a rule that is still unresolved replaces the open application and drops that rule's retry obligation; no current production route emits such a push (operator pushes carry the full deployed inventory). (2) A wedged rule is matched to its hung call by rule id and watch target only (#5512), so a rule edited without changing what it watches (its assertion, for example) is not applied afresh: when the hung call finally succeeds, the rule is armed with the content it had when the call started, not the edited content.
+- **Known limits.** (1) A push with `full_sync=false` that omits a rule that is still unresolved replaces the open application and drops that rule's retry obligation; no current production route emits such a push (operator pushes carry the full deployed inventory). (2) A wedged rule is matched to its hung call by rule id and watch target only (#5512), so a rule edited without changing what it watches (its expected value, for example) is not applied afresh: when the hung call finally succeeds, the rule is armed with the content it had when the call started, not the edited content.
 What counts as the watch target is the file path, the service name, or the registry hive and key; a registry rule's value
-name and expected value are in its assertion, so editing them does not re-key the rule. Once that late success is adopted, the
+name and expected value are not part of it, so editing them does not re-key the rule. Once that late success is adopted, the
 generation is acknowledged (the acknowledgment does not compare content) and the server stops re-pushing, so the edited
 content reaches the agent only with the next push that carries a new generation (any later policy change or Baseline deploy). (3) A re-arm that fails at boot is not retried (#5513). (4) A wedged rule whose late result lands before the agent has finished recording the wedge costs one avoidable full re-apply on the next identical push, never an acknowledgment: the agent records wedges at the heartbeat maintenance pass, which handles a bounded number of rules per pass, and a rule whose deadline passed just as its arm was being handed to its worker is recorded as a failure but not tracked as a hung call.
 - **Watching a hold.** The compensation deadline that the deadline counter uses is 5 s (the Spark runtime's backend-operation deadline: fixed in production, only tests change it), measured from the instant the compensation became owed; the pending-Disarm threshold, by contrast, is a fixed 30 s from the claim's creation. The count is observed at the next heartbeat maintenance pass (about 30 s, and only while `prefer_spark` is on), so it can lag the 5 s deadline by up to a heartbeat, and the age gauge can read well above 5 s before the count first fires. Watch `yuzu.guardian_compensation_pending_age_seconds` (fleet gauge `yuzu_fleet_guardian_compensation_pending_age_seconds_max`) and `yuzu.guardian_compensation_deadline_elapsed`; see [Metrics](metrics.md#guardian-m1-health-stream-fleet-gauges). These two are scoped to the claim and do not dip when the safety valve forces a full re-apply (only `arm_pending` and `arm_failed` are scoped to the application). The fleet gauges have no per-agent axis; to find the affected endpoint, look for repeated `guaranteed_state.reconcile` audit rows for the same `agent_id`. Any agent being re-pushed also produces repeated rows (for example one whose non-wedge arm failure holds its generation), and the store-degraded abort path writes rows with the same action (result `degraded`, detail starting `heartbeat reconcile ABORTED`), so this finds re-pushed agents, not specifically a wedge hold; confirm with that agent's `yuzu.guardian_compensation_pending_age_seconds` or `yuzu.guardian_compensation_deadline_elapsed` tag. (The server counters `yuzu_server_guardian_reconciles_total{result="sent"}` and `yuzu_server_guardian_pushes_dispatched_total{reason="reconcile"}` rise fleet-wide while agents are held.) No counter or log line is written for an individual suppressed re-push, and none marks the valve's forced re-apply: a suppressed push writes nothing on the agent, and a forced re-apply logs the ordinary `Guardian: apply_rules ok (...)` line like any full application. Full mechanism: `docs/spark-stage2-guardian-consumer-design.md` §R5.3.

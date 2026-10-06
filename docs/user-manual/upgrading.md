@@ -3483,7 +3483,9 @@ Before upgrading any component:
     candidates, any 0.14.x hotfix cut from them, and dev or main builds from before the change all carry the waiver, and dev and main
     builds report the base version set in `meson.build` (`0.14.0` when this entry was written) before and after the change. `yuzu-agent --version` and the agent's start-up log print the full version (`<version>+<build number>`)
     and the short commit hash, and the `yuzu.agent_version` heartbeat tag carries the same full version; a build from source carries the
-    change only if its commit contains the #5459 change. For a release build, use the release notes, which name the first release that
+    change only if its commit contains the #5459 change. The build number and commit hash are read
+    from git when the build is configured, so a build from source that was not re-configured after
+    pulling can report a stale commit hash. For a release build, use the release notes, which name the first release that
     carries the #5459 change.
   - See [Guaranteed State](guaranteed-state.md#sparkengine--the-next-generation-detection-engine-observe-only) and
     [Metrics](metrics.md#guardian-m1-health-stream-fleet-gauges).

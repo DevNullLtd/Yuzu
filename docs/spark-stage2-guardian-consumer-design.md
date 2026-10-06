@@ -740,9 +740,11 @@ service name, or registry hive and key) so it is no longer matched to the hung c
 the rule out of the push has an ordering rule: the push is built from the deployed snapshot
 and then filtered on the live rule row, so disabling the rule or narrowing its scope or OS
 target flows with the next automatic re-push, whereas removing a member from the Baseline is
-staged until a Re-deploy (a fleet-wide full push). Neither the full-push exit nor the re-key
-exit is unconditional: the hung call keeps the call lock of its mechanism type while it is
-inside a mechanism call, so any other rule of the same type in the new application, and the
+staged until a Re-deploy (a fleet-wide full push that also publishes every other staged member
+edit on that Baseline). Neither the full-push exit nor the re-key exit is unconditional: the
+hung call keeps the call lock of its mechanism type while it is inside a mechanism call (the
+holder can be any hung same-type watch, unwatch or compensating teardown, including one the
+wedge being exited was only queued behind), so any other rule of the same type in the new application, and the
 re-keyed rule itself when its type is unchanged, queues behind it and expires, and the new
 generation stays held until the hung call returns or the agent restarts (flip-gate AC-1,
 AC-16). A restart ends it only if the target is no longer hung. Neither the full-push exit nor
@@ -811,10 +813,11 @@ a push that omits a still-desired rule is; follow-up FU-12 in the flip gate, to 
 agent restart gap (the boot
 Application opens at the loaded acknowledged generation with an empty `content_id`,
 and a failed boot re-arm is never retried, #5513); a content-identity gap (an
-identical re-observation matches `rule_id` and spec only, #5512); a wedge still in
-`pending` when it is adopted or settles (before its first drain, beyond one tick's bound, or
-minted in the Dispatching window) is counted in `resolved_failed` but never retained in
-`failed_receipts`, so the next identical push is one avoidable Reapply (see the
+identical re-observation matches `rule_id` and spec only, #5512); a wedge that is adopted or
+settles before the agent has retained it costs one avoidable Reapply on the next identical
+push: one minted in the Dispatching window is counted in `resolved_failed` but never retained
+in `failed_receipts`, and one not yet drained (before its first drain, or beyond one tick's
+bound) stays in `pending`, not counted, until it is adopted or settles (see the
 "Known limits" bullets of "R5.3 as implemented ... as amended by #5459" below). See
 `docs/spark-flip-gate.md` for the accepted-cost rows.
 **Three separate transitions, never collapsed:** wedge-release (the wedged

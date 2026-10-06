@@ -971,7 +971,8 @@ flip, with a red-first test each:
     full push (`full_sync=true`) DROPS or EXCLUDES the wedged rule, so the fresh
     application no longer carries the wedged claim (subject to the same-type condition
     below); (c) the wedged rule's own spec is
-    edited so that its key changes (`spark_key()` encodes the whole spec, so the edited
+    edited so that its key changes (`spark_key()` encodes the spark type and the watch target:
+    the path, the service name, or the registry hive and key; the edited
     rule attaches to a different key and is not matched to the hung claim; the replaced
     claim's candidacy is withdrawn, so a late success on it is torn down, not adopted,
     while the old rule stays omitted; also subject to the same-type condition below); or
@@ -981,8 +982,10 @@ flip, with a red-first test each:
     **Same-type condition on (b) and (c).** `arm_impl()` holds the call lock of the rule's
     mechanism type (`mech_ops_mu_by_type_.at(spec.type)`) across `watch_guarded()`, and
     `unwatch()` takes the same lock, so while the hung call is inside a mechanism call every
-    other arm or disarm of that `SparkType` queues behind it (AC-16). In the application an
-    exit opens, any OTHER rule of the same type, and the re-keyed rule itself under (c) when
+    other arm or disarm of that `SparkType` queues behind it (AC-16). The lock holder can be
+    ANY hung same-type watch, unwatch or compensating teardown, including one that the wedge
+    being exited was itself only queued behind; it need not be the wedged rule's own call. In
+    the application an exit opens, any OTHER rule of the same type, and the re-keyed rule itself under (c) when
     the edit leaves its type unchanged, therefore queues behind the hung call and expires
     (an arm that was dispatched and blocks on the lock reads as a Wedged outcome; one parked
     past the class quota as `CongestionExpired`, which is never suppressed, AC-3). That failure
@@ -1033,7 +1036,9 @@ flip, with a red-first test each:
     no suppress-eligible hold, because `decide_retry()` answers Reapply for every push except
     an identical retry of an open application whose unresolved work is still Pending,
     Committed or an outstanding wedge; this is true of a full push sent for any reason, and
-    the Re-deploy sends one to every agent. Taking the rule out of the push also stops enforcing it: disabling it stops it
+    the Re-deploy sends one to every agent and also publishes every other staged member edit on
+    that Baseline, because it snapshots the current member set (`deploy_baseline`). Taking the
+    rule out of the push also stops enforcing it: disabling it stops it
     everywhere it is deployed, narrowing scope or OS target stops it on the agents that drop
     out, and removing it from the Baseline stops it on every agent the Baseline delivers it
     to. **State after an exit:** the hung call keeps its key (the FIFO head) and, while it is
@@ -1164,12 +1169,12 @@ flip, with a red-first test each:
     never retried (#5513); an acknowledgment persisted by the old waiver is not revoked.
   - (AC-14) **Content identity (#5512).** A re-observation of a wedged claim matches
     `rule_id` and spec only (the content-identity bug); recorded, not fixed here. Operator
-    consequence: a wedged rule edited without changing its spec (its assertion, for
+    consequence: a wedged rule edited without changing its spec (its expected value, for
     example) is re-observed, not rebuilt (`attach_core()` constructs nothing new on that
     path), so a late success arms the content the claim was created with, not the edit. The watch
     target that re-keys a rule is the path (File), the service name (Service) or the hive and
-    key (Registry), per `spark_key()`; a registry rule's value name and expected value are in
-    the assertion and do not re-key it. When that late success is adopted on the re-observed
+    key (Registry), per `spark_key()`; a registry rule's value name and expected value are not
+    part of that target and do not re-key it. When that late success is adopted on the re-observed
     claim the generation is acknowledged (`can_advance()` does not compare content) and the
     server stops re-pushing, so the stale content stays until the next push that carries a new
     generation.
@@ -1209,8 +1214,10 @@ flip, with a red-first test each:
     sweep them and add its own `docs/user-manual/upgrading.md` "Behaviour change" entry.
     Known sites (quoted text, checked to exist when this row was written): in
     `upgrading.md`'s claim-lifecycle telemetry entry, "No agent enables the Spark path
-    today", "Nothing about Guard detection or enforcement changes" and "No alert rule ships
-    with them", plus its "dormant in steady state until the Spark path is enabled"; in
+    today", "Nothing about Guard detection or enforcement changes" (line-wrapped in the file
+    between "Nothing about" and "Guard detection", so a single-line grep for the whole phrase
+    finds nothing; grep for "Guard detection or enforcement changes") and "No alert rule
+    ships with them", plus its "dormant in steady state until the Spark path is enabled"; in
     `guaranteed-state.md`, the `yuzu.guardian_backend` paragraph's "it reads `legacy`
     fleet-wide, since `prefer_spark` is not yet enabled anywhere in production", the
     "dormant until Guardian enforces through SparkEngine" labels on the wedged-rule hold note
