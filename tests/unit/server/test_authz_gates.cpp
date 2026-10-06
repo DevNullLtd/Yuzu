@@ -40,11 +40,15 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <memory>
+#include <mutex>
 #include <shared_mutex>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <unordered_set>
 #include <vector>
 
@@ -602,6 +606,7 @@ TEST_CASE("require_fleet_read: service token - degraded ITServiceOwner permissio
     yuzu::MetricsRegistry metrics; // declared before the rig: auth_mgr keeps a raw pointer to it
     GatesRig r{rbac_db_.dsn()};
     r.auth_mgr.set_metrics_registry(&metrics);
+    r.rbac.set_metrics(&metrics); // publishes the breaker gauge
     REQUIRE(r.rbac.assign_role({"user", "minter", "RespReader"}).has_value());
     const auto svc = r.mint("printers");
 
@@ -626,6 +631,8 @@ TEST_CASE("require_fleet_read: service token - degraded ITServiceOwner permissio
     CHECK(res.status == 503);
     auto j = nlohmann::json::parse(res.body);
     CHECK(j["error"]["retry_after_ms"].get<std::int64_t>() == 5000);
+    // One failed ceiling read is one step short of the breaker threshold.
+    CHECK(metrics.gauge("yuzu_server_rbac_breaker_open").value() == 0.0);
     // An outage is not a missing grant: no `.permission` (clause 5) and no "does not grant".
     CHECK(res.body.find("\"permission\"") == std::string::npos);
     CHECK(res.body.find("does not grant") == std::string::npos);
@@ -654,6 +661,8 @@ TEST_CASE("require_fleet_read: service token - degraded ITServiceOwner permissio
     }
     CHECK(degrade("query_error") == 1.0);
     CHECK(degrade("pool_acquire_timeout") == 0.0);
+    // The siblings' failed ceiling reads feed the same breaker: it is open now.
+    CHECK(metrics.gauge("yuzu_server_rbac_breaker_open").value() == 1.0);
 
     // The audit row says the read degraded, never that the role lacks the permission.
     auto rows = r.audit_store.query({});
@@ -1144,7 +1153,10 @@ TEST_CASE("authz::ceiling_degrade_reason: pool acquire timeout prefix maps to "
 
 // The ceiling read has the same availability contract as the hot authz reads: a short acquire
 // budget plus the fail-fast breaker, so a degraded store cannot pin request workers. The pool
-// is starved by holding every lease, which makes the acquire time out deterministically.
+// is starved by holding every lease. PgPool then waits out the caller's budget, clamped to
+// its 500 ms saturated-pool limit (the ceiling read's 250 ms budget is the smaller of the two),
+// and gives up, so every acquire fails. This test therefore does not distinguish the 250 ms
+// authz budget from the 2 s admin budget; the budget test further down does.
 // Evidence is the breaker gauge and the error strings; only the third call is expected to be
 // answered by an open breaker (it follows the second within the 1 s probe cooldown).
 TEST_CASE("ceiling read: a starved pool trips the authz breaker and every degraded answer "
@@ -1221,4 +1233,138 @@ TEST_CASE("ceiling read: a starved pool trips the authz breaker and every degrad
         CHECK(res2.status == 403);
     }
     CHECK(degrade("pool_acquire_timeout") == 1.0);
+}
+
+// The streak is reset by a successful ceiling read: one failed acquire, then a read that gets
+// through, then another failed acquire leaves the breaker closed (streak 1, not 2). Without
+// the success note after the SELECT the first failure would still be counted and the second
+// would open the breaker.
+TEST_CASE("ceiling read: a successful read resets the failure streak so a later single "
+          "failure leaves the breaker closed",
+          "[pg][authz_gates][service_scope]") {
+    YUZU_REQUIRE_PG_DB_TPL(rbac_db_, rbac_gates_tpl);
+    yuzu::MetricsRegistry metrics;
+    GatesRig r{rbac_db_.dsn()};
+    r.rbac.set_metrics(&metrics);
+    const auto breaker_open = [&] {
+        return metrics.gauge("yuzu_server_rbac_breaker_open").value();
+    };
+
+    std::vector<decltype(r.pool.acquire())> held;
+    const auto starve = [&] {
+        for (int i = 0; i < 4; ++i) {
+            held.push_back(r.pool.acquire());
+            REQUIRE(held.back());
+        }
+    };
+
+    starve();
+    auto e1 = r.rbac.role_permission_allowed_checked("ITServiceOwner", "Response", "Read");
+    REQUIRE_FALSE(e1.has_value());
+    CHECK(e1.error() == "pool acquire timeout");
+    CHECK(breaker_open() == 0.0);
+
+    held.clear(); // return every lease
+    auto ok = r.rbac.role_permission_allowed_checked("ITServiceOwner", "Response", "Read");
+    REQUIRE(ok.has_value());
+    CHECK(*ok);
+
+    starve();
+    auto e2 = r.rbac.role_permission_allowed_checked("ITServiceOwner", "Response", "Read");
+    REQUIRE_FALSE(e2.has_value());
+    CHECK(e2.error() == "pool acquire timeout");
+    CHECK(breaker_open() == 0.0);
+}
+
+// A failed SELECT on an acquired lease counts toward the breaker exactly like a failed acquire:
+// two consecutive query failures open it. Without the failure note after the SELECT the
+// gauge would stay 0 however many reads fail.
+TEST_CASE("ceiling read: two consecutive query failures open the authz breaker",
+          "[pg][authz_gates][service_scope]") {
+    YUZU_REQUIRE_PG_DB_TPL(rbac_db_, rbac_gates_tpl);
+    yuzu::MetricsRegistry metrics;
+    GatesRig r{rbac_db_.dsn()};
+    r.rbac.set_metrics(&metrics);
+    {
+        yuzu::server::pg::PgConn conn{PQconnectdb(rbac_db_.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        yuzu::server::pg::PgResult d{
+            PQexec(conn.get(), "DROP TABLE rbac_store.role_permissions CASCADE")};
+        REQUIRE(d.ok());
+    }
+
+    auto e1 = r.rbac.role_permission_allowed_checked("ITServiceOwner", "Response", "Read");
+    REQUIRE_FALSE(e1.has_value());
+    CHECK(e1.error().rfind("query failed:", 0) == 0);
+    CHECK(metrics.gauge("yuzu_server_rbac_breaker_open").value() == 0.0);
+    auto e2 = r.rbac.role_permission_allowed_checked("ITServiceOwner", "Response", "Read");
+    REQUIRE_FALSE(e2.has_value());
+    CHECK(e2.error().rfind("query failed:", 0) == 0);
+    CHECK(metrics.gauge("yuzu_server_rbac_breaker_open").value() == 1.0);
+}
+
+namespace {
+// Lets a helper thread learn that the reader has finished, on every path out of a test
+// (including a failed REQUIRE): the guard's destructor fires it.
+struct ReaderDone {
+    std::mutex mu;
+    std::condition_variable cv;
+    std::atomic<bool> flag{false};
+    void fire() {
+        {
+            std::lock_guard lk(mu);
+            flag.store(true);
+        }
+        cv.notify_all();
+    }
+};
+struct FireOnExit {
+    ReaderDone& d;
+    ~FireOnExit() { d.fire(); }
+};
+} // namespace
+
+// The ceiling read waits for a free connection for the 250 ms authz budget, not the 2 s admin
+// budget. Both leases of a 2-connection pool are held, so the reader blocks inside the pool. A
+// helper thread frees one lease once the reader has finished, or after 750 ms if it has not:
+// the 250 ms budget has expired well before that, so the read fails and the helper's release
+// finds nobody waiting. A read that used the 2 s budget would still be waiting at 750 ms, get
+// the released connection and succeed. The pool's own saturated-pool clamp is raised to 5 s so
+// that only the caller's budget bounds the wait. The passing path takes about 250 ms and the
+// helper's timer is only reached on a regression.
+TEST_CASE("ceiling read: the acquire budget is the 250 ms authz budget and not the 2 s admin "
+          "budget",
+          "[pg][authz_gates][service_scope]") {
+    YUZU_REQUIRE_PG_DB_TPL(rbac_db_, rbac_gates_tpl);
+    PgPool pool{{.conninfo = rbac_db_.dsn(),
+                 .size = 2,
+                 .saturated_fast_fail = std::chrono::milliseconds{5000}}};
+    RbacStore rbac{pool};
+    REQUIRE(rbac.is_open());
+
+    auto lease_a = pool.acquire();
+    auto lease_b = pool.acquire();
+    REQUIRE(lease_a);
+    REQUIRE(lease_b);
+
+    ReaderDone done;
+    // Declared after `done` and before the guard: the guard fires first on unwind, then the
+    // jthread's destructor requests stop and joins.
+    std::jthread releaser{[&pool, &done, lease = std::move(lease_b)](std::stop_token st) mutable {
+        // Wait until the reader is parked inside the pool's bounded acquire.
+        while (pool.waiters() == 0 && !done.flag.load() && !st.stop_requested())
+            std::this_thread::yield();
+        {
+            std::unique_lock lk(done.mu);
+            done.cv.wait_for(lk, std::chrono::milliseconds{750},
+                             [&done] { return done.flag.load(); });
+        }
+        lease.reset();
+    }};
+    FireOnExit guard{done};
+
+    auto result = rbac.role_permission_allowed_checked("ITServiceOwner", "Response", "Read");
+    done.fire();
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error() == "pool acquire timeout");
 }

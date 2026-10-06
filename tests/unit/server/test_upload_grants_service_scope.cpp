@@ -10,7 +10,9 @@
  * minter's ordinary session must keep seeing exactly the rows it saw before.
  */
 
+#include "audit_store.hpp"
 #include "file_retrieval_routes.hpp"
+#include "pg/pg_pool.hpp"
 #include "tag_store.hpp"
 #include "test_response_execution_authz_pg_helper.hpp"
 #include "test_route_sink.hpp"
@@ -36,13 +38,21 @@ struct UploadGrantScopeRig {
     yuzu::test::ResponseExecutionAuthzPgRig rig;
     TagStore tags;
     UploadGrantStore store;
+    // A real AuditStore on its own pool over the same clone (its own `audit_store` schema),
+    // so the denial row the shared closure writes is observable. The server.cpp line that
+    // wires `deny_service_scoped_fn` into this module's Deps cannot be pinned by this rig,
+    // because `make_deps` below builds its own Deps rather than using server.cpp's.
+    yuzu::server::pg::PgPool audit_pool;
+    AuditStore audit_store;
     std::unique_ptr<AuthRoutes> ar; // same stores + a TagStore: service tokens resolve
     yuzu::test::TempDir blob_dir{"yuzu_test_upload_blobs_"};
 
     explicit UploadGrantScopeRig(const std::string& dsn)
-        : rig{dsn}, tags{rig.pool}, store{rig.pool} {
+        : rig{dsn}, tags{rig.pool}, store{rig.pool}, audit_pool{{.conninfo = dsn, .size = 2}},
+          audit_store{audit_pool} {
         REQUIRE(tags.is_open());
         REQUIRE(store.is_open());
+        REQUIRE(audit_store.is_open());
         // gary: GLOBAL UploadGrant:Read and :Write, so his list view is AdmitAll.
         REQUIRE(rig.rbac.create_role({"UploadGrantOperator3526", "", false, 0}).has_value());
         REQUIRE(rig.rbac.set_permission({"UploadGrantOperator3526", "UploadGrant", "Read",
@@ -55,7 +65,7 @@ struct UploadGrantScopeRig {
         REQUIRE(rig.auth_mgr.upsert_user("gary", "correct-horse-battery-staple",
                                          auth::Role::user));
         ar = std::make_unique<AuthRoutes>(rig.cfg, rig.auth_mgr, &rig.rbac, rig.api_tokens.get(),
-                                          /*audit_store=*/nullptr, &rig.mgmt, &tags,
+                                          &audit_store, &rig.mgmt, &tags,
                                           /*analytics_store=*/nullptr, rig.oidc_mu,
                                           rig.oidc_provider);
     }
@@ -178,6 +188,21 @@ TEST_CASE("upload-grants list: a service-scoped token is refused and the minter'
     CHECK(res->body.find("\"permission\"") == std::string::npos);
     CHECK(res->body.find("agent-A") == std::string::npos);
     CHECK(res->body.find("grant_id") == std::string::npos);
+
+    // Exactly one denial row is written, by the shared closure (the route's own `audit_fn`
+    // is a stub here and did not produce it): action `upload_grant.list.access_denied`,
+    // result `denied`, target type `UploadGrant`. The ordinary session's list wrote none.
+    auto rows = r.audit_store.query({});
+    REQUIRE(rows.has_value());
+    std::size_t denied_rows = 0;
+    for (const auto& row : *rows) {
+        if (row.action != "upload_grant.list.access_denied")
+            continue;
+        ++denied_rows;
+        CHECK(row.result == "denied");
+        CHECK(row.target_type == "UploadGrant");
+    }
+    CHECK(denied_rows == 1);
 }
 
 TEST_CASE("upload-grants list: an unwired service-scope deny still refuses a service token",
