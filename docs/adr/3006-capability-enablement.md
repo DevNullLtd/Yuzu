@@ -3,8 +3,9 @@ status: proposed
 date: 2026-10-06
 owner: "@Doomgoose (Alex Young)"
 deciders: >-
-  @Doomgoose (author and product owner for this decision). Ratified by PR approval from the
-  engineering colleagues under the dev-branch protection rule (at least one non-author approval).
+  @Doomgoose (author and product owner for this decision). To be ratified by PR approval from
+  the engineering colleagues under the dev-branch protection rule (at least one non-author
+  approval).
 effective: >-
   Binding on merge as the direction for every change to how agent capabilities are shipped,
   enabled and disabled. Nothing in the product changes on merge: the existing kill switch,
@@ -113,7 +114,7 @@ practice is accepted; existing behaviour is retrofitted to match.
 - **Capability** — something the agent can do on an endpoint, on request or by itself.
 - **Unit** — the smallest thing that can be switched: a plugin, an action of a plugin, a
   capture source, a look-back, a sync source, a signal, an engine.
-- **Catalogue** — the single list of units, what contains what, and what requires what.
+- **Enablement catalogue** — the single list of units, what contains what, and what requires what.
 - **Shipped default** — the state a unit has when nobody has made a choice. It is on.
 - **Off-rule** — a customer's statement that named units are off for the endpoints a selector
   matches. There is no on-rule.
@@ -142,15 +143,15 @@ practice is accepted; existing behaviour is retrofitted to match.
 
 ### D1 — Everything ships
 
-Every installer, on every operating system, installs every plugin. A customer may deliberately
-leave plugins out at install. The server shows a left-out plugin as *not installed*, which is a
-state in its own right and is never confused with *off* or with a fault, and an upgrade respects
-the omission. Removing a plugin from the product has a defined retirement step on every
-platform, so that an old copy is not left behind and loaded.
+Every installer, on every operating system, contains every plugin and installs all of them unless
+told otherwise. A customer may deliberately leave plugins out at install. The server shows a
+left-out plugin as *not installed*, which is a state in its own right and is never confused with
+*off* or with a fault, and an upgrade respects the omission. Removing a plugin from the product has
+a defined retirement step on every platform, so that an old copy is not left behind and loaded.
 
-*Rejected:* delivering plugins to endpoints on demand when something targets them. It makes the endpoint's contents depend on server state at a moment in time, and it
-removes the customer's ability to review, before deployment, exactly what will be on the
-machine.
+*Rejected:* delivering plugins to endpoints on demand when something targets them. It makes the
+endpoint's contents depend on server state at a moment in time, and it removes the customer's
+ability to review, before deployment, exactly what will be on the machine.
 
 ### D2 — Everything is on by default
 
@@ -168,11 +169,11 @@ position, but it leaves the customer to discover which things are in which categ
 not the product direction. The risks it would have reduced are addressed instead by D8, D9 and
 D10.
 
-### D3 — One catalogue of switchable units
+### D3 — One enablement catalogue of switchable units
 
 Plugins, their actions, capture sources, look-backs, daily-sync sources, DEX signals and the
-Spark engine are all units in one catalogue, governed by one kind of rule, recorded in one audit
-trail and visible in one place. The catalogue records containment (a plugin contains its
+Spark engine are all units in one enablement catalogue, governed by one kind of rule, recorded in
+one audit trail and visible in one place. The catalogue records containment (a plugin contains its
 actions) and requirements (one unit needs another).
 
 - Switching off a container switches off what it contains.
@@ -184,8 +185,11 @@ actions) and requirements (one unit needs another).
 - Reading history from before a source was switched on is a unit of its own (a *look-back*),
   on by default like everything else and switched off in the same way.
 
-The existing start-up flags remain as a local shortcut and are reported as off-rules with their
-own provenance, so that they are visible.
+The existing start-up flags (inventory, DEX, Spark) become one-time starting-state inputs. They
+seed the endpoint's starting state at install, the server adopts them as off-rules with their own
+provenance (D8), and from then on they are not an independent veto: removing the off-rule
+switches the unit on, and a flag still present at restart supplies only the starting state the
+agent falls back to (D14).
 
 *Rejected:* leaving each mechanism its own switch. That is today's arrangement, and it is why
 nobody can answer what an endpoint is collecting.
@@ -231,19 +235,27 @@ enforces it and reports the version it is enforcing.
 - A unit runs only where both the server and the agent say it is on.
 - The agent's reported state is the record of what actually ran.
 - While the agent is behind, the server shows the endpoint as *pending*, with its age.
-- An agent too old to enforce is shown as protected by the server-side check only.
+- An agent too old to enforce is shown as *enforced at the server only*. It is never reported as
+  off, because it may still be doing the work on its own.
 - The check at dispatch stays, so an operator gets an immediate answer, and the server neither
   asks for nor accepts data from a unit it has resolved as off.
 
-*Rejected:* agents evaluating the rules themselves. It handles facts only the endpoint knows and reacts fastest, but it puts every rule on every
-endpoint, limits selectors to what an endpoint can see, and leaves the server unable to say why
-something is off without asking. Also rejected: a server-side check alone, which is today's
-kill switch and cannot stop anything the agent does by itself.
+*Rejected:* agents evaluating the rules themselves. It handles facts only the endpoint knows and
+reacts fastest, but it puts every rule on every endpoint, limits selectors to what an endpoint can
+see, and leaves the server unable to say why something is off without asking. Also rejected: a
+server-side check alone, which is today's kill switch and cannot stop anything the agent does by
+itself.
 
 ### D7 — Off means the endpoint does not do the work
 
 When a unit is switched off the agent stops doing it, at once, without a restart. The state
-survives a restart and holds while the endpoint is offline.
+survives a restart and holds while the endpoint is offline. This describes an agent that can
+enforce state; an older agent is covered by the server's check only (D6) and is reported that way.
+
+Once the agent has adopted a state that switches a unit off, no new work for that unit starts.
+Work already running is cancelled where it can be cancelled safely. Work that cannot be
+cancelled finishes, and what it produces is discarded rather than stored. An action that cannot
+be undone completes and is recorded as having run under the earlier state.
 
 What the unit already stored on the endpoint stays readable and keeps expiring under its normal
 retention period, so it is gone within one period with no further action. Deleting it
@@ -266,6 +278,11 @@ at two points before anything is collected:
   preset or a list of units to keep off — which the agent enforces from its first second,
   before it has spoken to the server.
 
+The two are one choice. The server can export its current off-rules as the starting state an
+install or enrolment carries, so a customer decides once. An agent installed without a starting
+state runs the shipped-on units until its first contact with the server, which is why a customer
+who needs a unit never to run carries the starting state.
+
 A starting state does not lapse at first contact. The server adopts it as an ordinary, visible
 off-rule marked as carried from the install, and from then on the server is the single
 authority; undoing it is an ordinary switch-on.
@@ -278,12 +295,14 @@ shortly after", never "did not run"); holding all collection back until first co
 by default for an endpoint that cannot reach the server); and a permanent local override on the
 endpoint (two authorities, and no central answer).
 
-### D9 — An upgrade starts nothing and stops nothing
+### D9 — An upgrade changes nothing that already exists
 
-Upgrading to a release that follows this ADR does not change what any existing endpoint does.
-Whatever is off at the moment of upgrade — because it shipped off, or because an operator
-turned it off — stays off, as off-rules the customer owns and can see, marked as carried over.
-Whatever was on stays on. New installations get the shipped default.
+Upgrading an existing installation — to the release that introduces this model and to every
+later one — does not change what any existing unit does on any existing endpoint. Whatever is
+off at the moment of upgrade — because it shipped off, or because an operator turned it off —
+stays off, as off-rules the customer owns and can see, marked as carried over. Whatever was on
+stays on. New installations get the shipped default. A unit that a release adds is not a change
+to an existing unit; it is governed by D10.
 
 This departs from the 2026-09-04 ruling, under which a move to default-on applied at upgrade.
 The reason is the same one behind D8: collection must not begin on a customer's endpoints
@@ -299,6 +318,9 @@ on, which is how the setting ships, or off. When it is off, additions are listed
 decision* until the customer accepts or keeps them off. A release that materially widens what
 an existing unit collects, or brings a unit to a new operating system, counts as an addition.
 Every release states what it adds.
+
+This is the one way an upgrade can start something, and only for a customer who has left the
+setting on and been told what the release adds.
 
 *Rejected:* additions always on (every upgrade could widen collection with no customer
 action); and plugins on but new capture sources off (two defaults to explain again).
@@ -329,12 +351,12 @@ holding such changes for review (a queue nobody could keep up with at fleet size
 
 ### D13 — Every answer explains itself
 
-For any unit on any endpoint the product can say what its state is, why, and which rules bear
-on it. The reason comes from a closed list: on by default, off by rule, off because a
-requirement is off, undetermined, pending, not installed, not applicable, awaiting decision,
-control plane unavailable. Because off-rules combine, the answer lists every matching rule
-with its provenance rather than naming a single deciding one. A fault in the control plane is
-always reported as a fault and never as an operator's decision.
+For any unit on any endpoint the product can say what its state is, why, and which rules bear on it.
+The reason comes from a closed list: on by default, off by rule, off because a requirement is off,
+undetermined, pending, enforced at the server only, state lost, not installed, not applicable,
+awaiting decision, control plane unavailable. Because off-rules combine, the answer lists every
+matching rule with its provenance rather than naming a single deciding one. A fault in the control
+plane is always reported as a fault and never as an operator's decision.
 
 *Rejected:* reporting a single deciding rule (under D4 removing one matching rule may change
 nothing); and letting each surface word a refusal its own way, which is how a switched-off
@@ -345,15 +367,21 @@ action came to read as "permission denied".
 - If the server cannot read its own enablement state, it refuses to dispatch, pushes no partial
   state and says the control plane is unavailable.
 - If an agent cannot reach the server, it keeps enforcing the last state it had.
-- If an agent cannot read its stored state, it falls back to its starting state and reports
-  that its state was lost.
+- An agent that has held state keeps a second durable copy of the last state it adopted. If it
+  cannot read either copy, it does not fall back to everything on: it runs no switchable unit
+  until it has the full state from the server again, reports that its state was lost, and asks
+  for it at once. An agent that has never held state uses its starting state.
 
 An endpoint that stays offline for a long time therefore keeps doing what was last on, and a
 switch-off made in the meantime does not reach it until it reconnects. This is accepted and
-shown, not hidden.
+shown, not hidden. Lost state is the opposite case and is deliberately handled the other way:
+an endpoint that has lost its record of what the customer switched off prefers doing too little
+to doing what the customer switched off.
 
-*Rejected:* failing open on the server; and having an agent switch everything off when its
-state grows old (it turns an outage of the control plane into an outage of the product).
+*Rejected:* failing open on the server; falling back to the starting state on lost state (an
+install without one would turn back on everything the customer had switched off); and having an
+agent switch everything off when its state merely grows old (it turns an outage of the control
+plane into an outage of the product).
 
 ### D15 — Cost follows change, not fleet size
 
@@ -429,7 +457,7 @@ point for the roadmap, which decides order and grouping.
 | Risk | Answer |
 |---|---|
 | Collection starts at install, before the customer has decided what they want running | D8: the choice is available at server deployment and at agent install |
-| An upgrade begins collection on existing endpoints | D9: an upgrade starts nothing |
+| An upgrade begins collection on existing endpoints | D9: an upgrade changes nothing that already exists; D10: new units follow the customer's setting and are stated |
 | A later release quietly adds collection | D10: the customer's setting decides, and each release states what it adds |
 | A source that is on reads history from before it was switched on | D3: look-back is its own unit and can be off from the start |
 | A switch-off that is not real | D6 and D7: enforced on the endpoint, immediately |
@@ -447,6 +475,11 @@ single-endpoint rule, audit and bounded reads.
   rule that depends on it takes effect after that provider next reports.
 - An endpoint whose facts are not yet known has the affected units off until they are.
 - A local administrator can stop the agent collecting; that is detected, not prevented.
+- An agent whose state is lost while it cannot reach the server stays quiet until it reconnects.
+- An agent too old to enforce state keeps doing its own work after a switch-off; it is shown as
+  enforced at the server only.
+- An agent installed without a starting state runs the shipped-on units until it first contacts
+  the server.
 - Until the retrofit completes, old and new mechanisms coexist. The roadmap must keep the
   period in which both exist short and must not ship the new defaults ahead of the new
   controls.
@@ -458,13 +491,17 @@ The decision is being followed when all of the following are true.
 1. On a fresh installation with no customer choices, every unit applicable to the endpoint's
    operating system is on, and the product can list them.
 2. A unit switched off for an endpoint does no work there: no rows are stored, no action runs,
-   and work the agent starts by itself stops too. This holds across an agent restart and while
-   the endpoint is offline.
+   and work the agent starts by itself stops too. This holds across an agent restart, while the
+   endpoint is offline, and when the agent's stored state is lost (it then runs nothing until
+   resynchronised). Work already running when the switch-off arrives produces nothing that is
+   stored.
 3. An agent installed with a starting state never runs the units it names, including before
    its first contact with the server.
 4. Off-rules set on the server before any agent enrols are in force on each agent from its
-   first contact.
-5. Upgrading an existing installation changes what no endpoint does.
+   first contact; an agent installed with the matching starting state is covered from its
+   first second.
+5. Upgrading an existing installation changes what no existing unit does on any endpoint; a
+   unit added by the release arrives in the state the additions setting says.
 6. For any unit on any endpoint, the product gives a state, a reason from the closed list and
    every matching rule. A fault in the control plane is never reported as a decision.
 7. Two rules that disagree always resolve to off, in any order.
@@ -473,6 +510,15 @@ The decision is being followed when all of the following are true.
 9. Every change to enablement appears in the audit trail, and a change that cannot be audited
    does not happen.
 10. Enablement behaves the same at any fleet size the product supports.
+11. A plugin left out at install stays out across upgrades and is shown as not installed.
+12. After a source is switched off its stored rows keep expiring under normal retention, and
+    deleting them is a separate, audited act.
+13. With the additions setting off, a unit added by a release is listed as awaiting decision and
+    does not run.
+14. An account holding the enablement permission changes enablement directly, on or off, with no
+    second approver.
+15. A unit that comes on because an endpoint's attribute changed is recorded with the endpoint,
+    the unit and the attribute.
 
 ## Open questions
 
