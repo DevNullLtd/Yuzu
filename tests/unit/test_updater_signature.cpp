@@ -360,6 +360,34 @@ TEST_CASE("updater: a tampered payload increments the INVALID refusal counter",
     CHECK(refused(metrics, "untrusted") == 0.0); // classified, not lumped together
 }
 
+TEST_CASE("updater: a missing trust bundle is refused as bundle_unreadable, not untrusted",
+          "[updater][signing][grpc]") {
+    // #5249. The rc1-rc5 Windows installer left the bundle unreadable by the
+    // agent (#5196), and every update was then logged and counted as an
+    // UNTRUSTED signer — the operator was sent to debug a certificate chain that
+    // was fine. A correctly signed package plus a bundle the agent cannot load
+    // must be refused (fail closed) under its own reason, in BOTH modes.
+    auto f = build_signing_fixtures();
+    for (const bool require : {false, true}) {
+        FakeExe exe;
+        Harness h;
+        h.svc.payload = read_file(f.artifact_file);
+        h.svc.signature = read_file(f.sig_file);
+        h.start();
+
+        yuzu::MetricsRegistry metrics;
+        Updater updater(cfg_with(f.dir / "no-such-bundle.pem", require, &metrics), "test-agent",
+                        "0.1.0", "linux", "x86_64", exe.path);
+        auto r = updater.check_and_apply(h.stub.get());
+        INFO("require_signature=" << require);
+        REQUIRE_FALSE(r.has_value());
+        CHECK(read_file(exe.path) == "old-binary"); // fail CLOSED: nothing applied
+        CHECK(refused(metrics, "bundle_unreadable") == 1.0);
+        CHECK(refused(metrics, "untrusted") == 0.0); // the distinction #5249 asks for
+        CHECK(refused(metrics, "invalid") == 0.0);
+    }
+}
+
 TEST_CASE("updater: a tampered payload is refused even with a real signature",
           "[updater][signing][grpc]") {
     auto f = build_signing_fixtures();

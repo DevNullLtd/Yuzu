@@ -15,7 +15,9 @@ Failure-mode runbook: `docs/ci-troubleshooting.md`.
   the `yuzu-weetam-windows` pool), one macOS variant (appleclang debug on the
   `yuzu-bigmags-macos` pool), plus `proto-compat`. Wall target: <10 min per leg.
 - **Tier 2 — push to dev/main** (`ci.yml` on push): full 4-way Linux matrix
-  (gcc-15 / clang-21 × debug / release), 2-way Windows, 2-way macOS. **No
+  (gcc-15 / clang-21 × debug / release), 2-way Windows, 2-way macOS (except
+  a docs-only push, which runs preflight plus the required-check stubs, #5320).
+  **No
   sanitizers, no coverage** — those moved out (#410). **Since #3443 Phase 2**,
   the Linux matrix's `pg_mode` key (via `include:`, never a third axis) means
   only ONE leg (gcc-15/debug) runs the full 11-shard `server-pg` suite on a
@@ -26,6 +28,11 @@ Failure-mode runbook: `docs/ci-troubleshooting.md`.
   2026-08-28)**, the Windows matrix carries the identical `pg_mode` key via
   the same `include:` mechanism (debug=full, release=smoke) — Windows and
   Linux now share one `pg_mode` concept, not two independently-invented ones.
+  **Since #5320** the push trigger has no `paths` filter: a docs-only push
+  (for example a changelog-only release commit) runs `preflight` and the
+  `docs-required-checks` stubs instead of the matrix, so the required contexts
+  still appear on the `main` commit a release tags. See "Docs-only changes
+  (#1978, #5320)" below.
 - **Tier 3 — nightly cron** (`nightly.yml`, `0 6 * * *` UTC +
   `workflow_dispatch`): ASan+UBSan, TSan, coverage on the Big Tam pool
   (`yuzu-bigtam-linux`, gated on `bigtam_pool_healthy`), plus a Windows ASan
@@ -162,6 +169,68 @@ code.
 
 ## Gates outside the tier ladder
 
+### Release re-publish guard (`release-guard`, #5282)
+
+The first job in `release.yml`. It refuses any run whose ref is not a tag
+(a `workflow_dispatch` from a branch would otherwise pass, since a branch has
+no release, and push `:latest` from branch content) or whose tag is not shaped
+`vX.Y.Z` / `vX.Y.Z-{alpha,beta,rc}N` (the alphabet the prerelease classifier
+and the `:latest` enable assume). It then reads
+`gh api -i repos/<repo>/releases/tags/<tag>` and fails the run if the tag
+already has a published GitHub release. Every image-publishing job
+(`docker-publish`, `docker-publish-postgres`, `docker-publish-chisel`,
+`docker-publish-agent-bundle`), the `release` job and the three build jobs list
+it in `needs`, so a refused run stops before any build, provenance attestation
+or image push. Before it, a run started against an already-released tag (by
+mistake, or a superseded run) pushed new digests over `:X.Y.Z` (and
+`:X.Y`/`:latest` on a stable tag) that no longer matched the release's signed
+`SHA256SUMS` and SBOMs; the only existing-release check was in `Create GitHub
+Release`, after every push, and it skipped with a notice and went green. That
+step now fails instead, because a release appearing there means one arrived
+after the guard ran.
+
+It fails closed on the HTTP status line alone: `404` proceeds, `200` refuses,
+and anything else (no status line, 401/403/429/5xx) fails the run. gh's exit
+code and stderr prose are never interpreted. The step body is executed against
+a stubbed `gh` by `tests/shell/test_release_guard.sh` (in preflight's shell
+gate tests), which also checks that every job holding `packages: write` needs
+the guard.
+
+**Per-push tag re-check.** Two runs for one tag at different commits (a re-tag
+while a run is in flight, or a moved tag whose push webhook never fired) both
+pass the guard, because no release exists yet. So every image push and the
+release creation run `scripts/ci/check-release-tag-sha.sh` immediately before
+acting: it reads the tag from `origin` with `git ls-remote` and refuses unless
+the tag (or its peeled commit) is still this run's `GITHUB_SHA`, failing closed
+on any error. A run whose tag has moved away from its commit refuses at its
+next publishing step, and a re-run of a failed job re-checks too. It cannot
+see a tag moved away and back again while two runs are in flight (A -> B -> A):
+cancel in-flight release runs for a tag before re-tagging it (#5478). The script is tested by
+`tests/shell/test_release_tag_sha.sh`; `test_release_guard.sh` checks that
+each publishing job runs it once, before its first push.
+
+**There is no override.** A published release's assets and signatures describe
+the images it shipped, so any re-push over it breaks verification. To ship
+different images, cut a new version. To redo a release whose published content
+is itself wrong, delete the GitHub release first (destructive; the release
+skill requires operator confirmation), then start a fresh run, which recreates
+the release with a `SHA256SUMS` that matches its images.
+
+Limits: the guard's read-only token cannot see a **draft** release — one made
+by hand, or one `gh release create` leaves behind when interrupted while
+uploading assets (it creates a draft, uploads, then publishes). The `release`
+job's own check sees drafts and fails. Deleting an unpublished draft is not
+destructive (nothing was published): delete it, then re-run failed jobs on the
+newest run.
+
+Residual paths that can still leave `:X.Y.Z` digests and the signed
+`SHA256SUMS` apart, none closed by this change: a draft release the guard
+cannot see; a hand-run `gh release create`; the seconds between a publish
+step's tag re-check and its push; a tag moved away and back again while two
+runs are in flight (#5478); re-running an OLDER run of the tag (#5242: a re-run
+does not repeat `release-guard`); and `:latest`/`:X.Y` landing on an older
+version when runs for two tags finish out of order (#5462).
+
 ### Release artifact gate (`scripts/check-release-artifacts.sh`, release job)
 
 Runs in `release.yml`'s `release` job after the artifacts are downloaded and
@@ -194,8 +263,13 @@ Recovery: find the offending file in the error. For a stale file, clear the
 runner workspace and start a fresh run of the same tag with
 `gh workflow run release.yml --ref vX.Y.Z`, following the release skill's
 Recovery steps (no release exists for the tag, no other run for it is queued
-or running). Never use "Re-run failed jobs" on a release run: an older run can
-be superseded by a newer one and push images over a published release (#5242).
+or running). "Re-run failed jobs" does not fix this case: it re-runs only the
+`release` job, which downloads the same stale artifact again. The workflow
+enforces the first of those steps itself: `release-guard` refuses a run when
+the tag already has a published release (#5282, above). For any other failed
+job, recovery is "Re-run failed jobs" on the NEWEST run for the tag (digests
+kept; each push re-checks the tag), never on an older run (#5242); a fresh run
+is the fallback (release skill, Recovery).
 For a builder naming defect, a fresh run builds the tag's original commit
 again, so fix the builder, then delete and re-push the tag at the fixed commit.
 Either way the images are rebuilt and re-pushed under the same tags.
@@ -1283,6 +1357,8 @@ pool causes nightly preflight to fail and the nightly alert opens
 `nightly-broken`; the repository discipline remains **no merge to main while
 that issue is open**. Follow `docs/ci-troubleshooting.md` before closing it.
 
+### Docs-only changes (#1978, #5320)
+
 As of #1978, preflight also emits a `code_changed` output (from
 `scripts/ci/detect-code-change.sh`); the build jobs additionally gate on
 `&& code_changed == 'true'`, so a docs-only PR skips the whole matrix. The
@@ -1290,8 +1366,43 @@ matrix-expanded required contexts (`Linux gcc-15 debug`, `Windows MSVC debug`,
 `macOS debug`) would otherwise stay "Expected" forever on a docs-only PR
 (a top-level-skipped matrix job emits none of its inner check names), so a
 `docs-required-checks` stub emits those exact names as success when
-`code_changed == 'false'`. `ci.yml` no longer path-filters `pull_request`;
-the `push:` trigger keeps its docs `paths-ignore`.
+`code_changed == 'false'`. `ci.yml` path-filters neither trigger.
+
+Since #5320 the same applies to a push to `main`/`dev`. The push trigger used
+to keep a docs `paths` allow-list, so a changelog-only push started no run and
+the required contexts never appeared on the commit; the v0.14.0 release commit
+(50a81af91) was tagged on an operator decision for that reason. Now every push
+runs, and the codegate step's push arm sets `code_changed=false` only when:
+
+1. the previous tip's newest `ci.yml` push run on the branch concluded
+   `success` — a newer pending run cancels an older pending one in this
+   workflow's concurrency group, so without this a docs push arriving behind a
+   running build would cancel a code push's pending run and the code would
+   never be built; it also stops a docs commit turning a red code commit
+   green;
+2. the compare API reports the push as a fast-forward (`ahead`) listing 1–299
+   files (empty is missing evidence; 300 is the API cap, so the list may be
+   truncated); and
+3. every listed path, and every rename's previous path, is docs-only.
+
+Any API error or other answer builds. The classification set is unchanged,
+including the BR-010 carve-out: a push touching `docs/os-capability-matrix.md`
+builds and runs its drift gate. A docs-only push therefore costs
+`trusted_inputs`, `preflight`, three stub jobs and `detect-ci-changes`, all
+GitHub-hosted (plus the CI canary when the push touches a workflow file — the
+CI-infrastructure classifier decides that separately). The required contexts on
+such a commit read `success` (Preflight, the three stubs, CHANGELOG order) or
+`skipped` (Proto backward-compat). `success` on those three names for a
+docs-only commit means *inherited from the predecessor's build*, not *built*;
+the run's summary says so. On a PR a skipped required context satisfies the
+ruleset and an absent one does not; a push commit is never evaluated by the
+ruleset, so on `main` the only consumer of these contexts is the release
+skill's tag gate, which reads them the same way. The
+push arm is executed against a stubbed `gh` by
+`tests/shell/test_codegate_push.sh`.
+
+Which contexts are required is a repository ruleset setting ("Protect Main",
+"Protect Dev"), not part of `ci.yml`; #5320 did not change it.
 
 ## Postgres for server tests (`YUZU_TEST_POSTGRES_DSN`)
 
@@ -1611,6 +1722,48 @@ to `known-flaky.json`), grep the junit failure text for
 (`[ApiTokenStorePgShared]`, `[AuthDbPgShared]`, `[EpLcShared]`,
 `[EpIntegShared]`, `[AccRevShared]`, `acc_rev_reset`) — a cluster of those in
 one file is one PG-instance event, not a test bug.
+
+## Agent unit-test shards (#5073)
+
+The agent suite's single `agent unit tests` entry (one serial Catch2 process,
+240 s budget) is three entries over the same `yuzu_agent_tests` binary:
+`agent unit tests shard A`, `shard B`, `shard C`, each `suite: ['agent',
+'agent-shard']`, one positional tag spec, `timeout: 240` (unchanged per shard,
+and conservative headroom rather than a measured need: the only measured
+contention figure is for the server `~[pg]` suite, 289 s with no other test
+phase running (c0) to 603 s with four overlapping (c4), about 2.1x, across jobs on
+the pre-#3443 combined step, per "Windows test-phase
+concurrency gate"; it has not been re-measured for the agent shards) and
+`--allow-running-no-tests`. That flag is what stops the zero-match shard C from
+failing when `meson test --suite agent --test-args '[tag]'` appends a second
+positional spec. It does not make that a targeted run: Catch2 binds the extra
+spec to the LAST comma-separated OR term only, so it is exact only for shard C,
+it widens shards A and B, and a mistyped tag is no longer loud. Run the binary
+directly for a targeted run (`build-*/tests/yuzu_agent_tests '[tag]'`, see
+`docs/build-guide.md` "Direct binary invocation"). Repro (2026-10-01, Linux
+`build-linux/tests/yuzu_agent_tests`, `<shard spec> '[nonexistent_zzz]'
+--list-tests --allow-running-no-tests`): shard A lists 319 cases, B 437, C 0.
+Every CI leg selects the shards by `--suite agent` (ci.yml Linux step and Windows step,
+nightly.yml windows-asan) or runs `meson test` unfiltered (macOS, nightly and
+sanitizer legs); none selects the old entry name. `agent tsan-heavy checkpoints`
+is unsharded and unchanged.
+
+Partition rule and measured balance live in the comment above the entries in
+`tests/meson.build`: a case runs in the lowest-numbered shard holding any of its
+tags, shard C is the AND-NOT complement so new tests land there, and every
+inclusion term ends `~[.]~[tsan-heavy]~[flaky-4086]` because an inclusion term
+does not drop hidden cases by itself. `'agent shard partition invariant'`
+(`suite: ['agent', 'agent-checks']`, defined outside `if build_server`) runs
+`scripts/ci/check-pg-shard-partition.py --family agent`, the same script and
+`check_partition()` as the server shards: it proves against the real binary that
+every case of `~[.]~[tsan-heavy]~[flaky-4086]` is in exactly one shard. It also
+fails if a shard spec term does not end with that suffix (the meson
+`agent_shard_suffix` and the script literal are hand-synced), if a spec is not a
+shape flake-retry's isolated retry can strip, or if two shard entry names are
+equal or one contains another. It proves exactness, not balance: it prints per-shard case counts as an informational
+notice, and the drift signal is the 80%-of-budget table above. Per-entry history
+in `test-runs.db` / `ci_test_suites` is keyed by entry name, so it restarts under
+the new names.
 
 ## Workflow-PR canary
 
