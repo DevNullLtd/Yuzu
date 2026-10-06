@@ -85,7 +85,7 @@ The following features are documented within the files listed above:
 
 > **Note:** macOS Intel (x64) builds are not currently produced or tested. Only Apple Silicon (ARM64) Macs running macOS 14+ are supported. If you require macOS Intel support, please open an issue.
 
-### Linux native packages: minimum distribution (0.14.0)
+### Linux native packages: minimum distribution (0.14.x)
 
 The Linux binaries in the `.deb`, `.rpm` and tarball releases are built with GCC 15 and link
 the system C and C++ runtimes dynamically, so they need a recent distribution. Measured on
@@ -107,7 +107,7 @@ The container images (`yuzu-server`, `yuzu-gateway`, `yuzu-agent` and their chis
 carry their own runtime libraries and are not affected; use them for the server and gateway
 on any other distribution. The exception is `yuzu-agent-bundle-chisel`, which delivers
 agent files: the Linux agent extracted from it has the tarball's requirements. Building the
-native packages to an older baseline is targeted for 0.14.1 (#5143).
+native packages to an older baseline is targeted for 0.15.0 (#5143).
 
 ## Quick Start
 
