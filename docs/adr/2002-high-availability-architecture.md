@@ -1596,6 +1596,14 @@ earlier text of this section is left as written; the points below say what it no
   with the unicode conversion and the gateway refuses to start when it cannot be represented. The peer address
   stays sanitised so its notification is sent instead of evicted. Details: Known limits in
   `docs/user-manual/gateway.md` and the evidence record.
+- **Narrowed again by the second re-review (2026-10-06, fix round 3).** The invariant now also covers a
+  server status that means the request itself was wrong. The gateway refuses an empty or over-256-byte
+  agent id at the edge (the same bound the server applies) before any upstream call, and server statuses
+  such as `INVALID_ARGUMENT` no longer count as breaker failures, so a registration the server refuses cannot
+  move the breaker; statuses that mean an unhealthy or unusable upstream still count. The `cluster_id`
+  environment text is interpreted in the VM's native name encoding (latin1 in the shipped images), because
+  the round above had assumed Unicode code points; the refusal to start for an unrepresentable value is
+  unchanged. Details: Known limits in `docs/user-manual/gateway.md` and the evidence record.
 - **Residuals** are the ones listed under Known limits in `docs/user-manual/gateway.md`, among them: a probe
   success proves only the notification path, not registration; the synchronous RPCs still run inside the one
   upstream process, so casts queue in its mailbox while one runs; retry or breaker feedback for an ordinary
