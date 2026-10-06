@@ -554,10 +554,10 @@ transport_failures_count_by_reason() ->
 %%% Request size
 %%%===================================================================
 
-%% The gateway edge accepts a message of any size and the server refuses one
-%% over 4 MiB with RESOURCE_EXHAUSTED before its handler runs. That is a fact
-%% about the request, not about the upstream: the gateway refuses the request
-%% itself, as a local encode failure, and RESOURCE_EXHAUSTED stays a failure.
+%% A request over 4 MiB can still arrive at the upstream module, and the server
+%% would refuse it with RESOURCE_EXHAUSTED. That is a fact about the request,
+%% not about the upstream: the gateway refuses the request itself, as a local
+%% encode failure, and RESOURCE_EXHAUSTED stays a failure.
 oversize_request_never_feeds_the_breaker() ->
     #{threshold := Threshold} = fixture_threshold(),
     Huge = binary:copy(<<"h">>, ?SERVER_MAX_MESSAGE + 1),
