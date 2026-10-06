@@ -170,7 +170,8 @@ boot_check_accepts_representable_values() ->
 
 %% The same value judged under each native encoding: UTF-8 bytes that a latin1 node
 %% returns as code points below 256 pass; the same list on a utf8 node would be
-%% the text "Ã¼" (valid), while a lone byte is refused under latin1.
+%% a two character text (valid, with an A tilde and a currency sign), while a lone
+%% byte is refused under latin1.
 boot_check_judges_the_env_in_the_native_encoding() ->
     ?assertEqual(ok, yuzu_gw_app:evaluate_cluster_id(<<"default">>,
                                                      [90, 195, 188, 114, 105, 99, 104], latin1)),
