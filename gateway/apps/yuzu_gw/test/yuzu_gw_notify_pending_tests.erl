@@ -97,6 +97,8 @@ closed_test_() ->
         fun gauges_follow_a_burst/0),
       t("format_status shows notify_pending_len and never the held events",
         fun format_status_shows_a_count_not_the_events/0),
+      t("format_status shows the agent id and event of a notify cast and redacts the rest",
+        fun format_status_redacts_the_notify_cast/0),
       t("a worker killed untrappably is removed and the next held entry is spawned",
         fun untrappable_worker_death_is_survived/0),
       t("an upstream restart starts its gauges at zero and loses the old pending entries",
@@ -201,6 +203,16 @@ probe_test_() ->
         fun poison_head_does_not_block_the_breaker/0),
       t("held notifications that all carry an unencodable peer address still drain",
         fun all_poison_heads_still_drain/0)
+     ]}.
+
+%% What a killed probe worker leaves in the log: logger handler at info level.
+probe_log_test_() ->
+    {foreach,
+     fun() -> setup_logs(probe_env([])) end,
+     fun cleanup_logs/1,
+     [
+      t("a probe worker killed with no result logs a warning naming the agent and the reason",
+        fun killed_probe_worker_is_logged/0)
      ]}.
 
 %% Cap 3: a failed probe's event always fits back.
@@ -728,6 +740,22 @@ gauges_follow_a_burst() ->
     ?assertEqual(lists:reverse(lists:sort(Pendings)), Pendings),
     ?assertEqual({0, 0}, lists:last(All)).
 
+format_status_redacts_the_notify_cast() ->
+    Cast = {notify_stream_status, <<"shown-agent">>, <<"marker-session">>, disconnected,
+            <<"marker-peer">>, <<"marker-home">>},
+    Redacted = {notify_stream_status, <<"shown-agent">>, '$redacted', disconnected,
+                '$redacted', '$redacted'},
+    [begin
+         #{message := Shown} = yuzu_gw_upstream:format_status(#{message => Msg}),
+         ?assertEqual(Want, Shown),
+         Text = lists:flatten(io_lib:format("~p", [Shown])),
+         [?assertEqual(nomatch, string:find(Text, Marker))
+          || Marker <- ["marker-session", "marker-peer", "marker-home"]]
+     end || {Msg, Want} <- [{Cast, Redacted},
+                            {{'$gen_cast', Cast}, {'$gen_cast', Redacted}},
+                            {{'$gen_call', {self(), tag}, {proxy_register, secret}},
+                             {'$gen_call', {self(), tag}, {proxy_register, '$redacted'}}}]].
+
 format_status_shows_a_count_not_the_events() ->
     watch(),
     _ = fill_slots(),
@@ -1174,6 +1202,26 @@ killed_probe_worker_is_one_failure() ->
     ?assertEqual(0, count(?EV_COALESCED)),
     [{{HeadId, _, _}, _} | _] = yuzu_gw_notify_queue:to_list(up_get(notify_pending)),
     ?assertEqual(<<"kill-me">>, HeadId).
+
+killed_probe_worker_is_logged() ->
+    watch(),
+    trip_breaker(),
+    cast_connected(<<"kill-me">>),
+    sync(),
+    enter_half_open(),
+    {Probe, _} = await_entered(),
+    await_until(fun() -> last_gauge() =:= {1, 0} end),
+    await_dead(Probe),
+    sync(),
+    Lines = [Text || {_, log, warning, Text} <- rows(),
+                     string:find(Text, "Notify probe worker") =/= nomatch],
+    ?assertMatch([_], Lines),
+    [Line] = Lines,
+    ?assertNotEqual(nomatch, string:find(Line, "kill-me")),
+    ?assertNotEqual(nomatch, string:find(Line, "killed")),
+    %% The payload (peer address, session id) is not in the line.
+    ?assertEqual(nomatch, string:find(Line, "peer")),
+    ?assertEqual(nomatch, string:find(Line, "sess")).
 
 duplicate_and_foreign_probe_results_are_ignored() ->
     watch(),

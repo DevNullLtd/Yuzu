@@ -668,8 +668,13 @@ handle_info({notify_probe_result, _Pid, _Gen, _Result}, State) ->
     {noreply, State};
 
 %% The probe worker ended with no result (killed): the same as an error, once.
-handle_info({'DOWN', MonRef, process, Pid, _Reason},
-            #state{notify_probe = #{pid := Pid, mref := MonRef, gen := Gen}} = State) ->
+handle_info({'DOWN', MonRef, process, Pid, Reason},
+            #state{notify_probe = #{pid := Pid, mref := MonRef, gen := Gen,
+                                    event := {AgentId, _Notification}}} = State) ->
+    %% Without this line the only trace of a killed probe is the half_open -> open
+    %% warning. The reason is redacted (a crash reason can carry the payload).
+    logger:warning("Notify probe worker for ~s exited without a result: ~p",
+                   [AgentId, redact_reason(Reason)]),
     Before = notify_counts(State),
     State1 = resolve_probe(Gen, {error, worker_down}, State),
     {noreply, report_notify_counts(Before, drain(State1))};
@@ -848,13 +853,15 @@ notify_pending_len(Pending) ->
     catch error:_ -> '$redacted'
     end.
 
-%% The messages that carry a request, an inventory report, session ids or a
-%% guardian frame; anything else is shown as is.
+%% The messages that carry a request, an inventory report, session ids, a peer
+%% address or a guardian frame; anything else is shown as is.
 redact_message({proxy_register, _Req})            -> {proxy_register, '$redacted'};
 redact_message({proxy_inventory, _Report})        -> {proxy_inventory, '$redacted'};
 redact_message({replay_sessions, _Ids})           -> {replay_sessions, '$redacted'};
 redact_message({forward_guardian_message, AgentId, _Frame}) ->
     {forward_guardian_message, AgentId, '$redacted'};
+redact_message({notify_stream_status, AgentId, _SessionId, Event, _PeerAddr, _Home}) ->
+    {notify_stream_status, AgentId, '$redacted', Event, '$redacted', '$redacted'};
 redact_message({'$gen_call', From, Msg})          -> {'$gen_call', From, redact_message(Msg)};
 redact_message({'$gen_cast', Msg})                -> {'$gen_cast', redact_message(Msg)};
 redact_message(Msg)                               -> Msg.
