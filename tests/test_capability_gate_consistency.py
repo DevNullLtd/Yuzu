@@ -54,8 +54,8 @@ definition must not self-certify read-vs-effect):
      stripped and lowercased on both sides (`fold`; see its docstring for how
      that differs from the runtime `classify()`). A shipped definition whose
      resolved type is neither `question` nor `action` is reported too (the
-     store rejects it at import). A (plugin, action) pair declared twice in the catalogue
-     is a hard failure, as is a fragment whose counts disagree: its
+     store rejects it at import). A (plugin, action) pair declared twice in the
+     catalogue is a hard failure, as is a fragment whose counts disagree: its
      `.dispatch_class` row count, its `.plugin`/`.action` pair count and its
      bare `.plugin =` count must be equal (the third, looser count catches a
      row written in a shape neither regex matches). The set of
@@ -75,7 +75,7 @@ generated bundle carries with the walk's (first occurrence of a repeated id),
 on the real tree and on the fabricated trees of
 `TestDefinitionParsingOnSyntheticTrees`. It compares nothing else (not names,
 approval modes or YAML sources). Like embed, the walk skips a document PyYAML
-cannot parse, but records it, and the real-tree tests of checks 1-5 report each
+cannot parse, but records it, and the real-tree tests of checks 1, 2, 4 and 5 report each
 one as an `UNPARSEABLE DEFINITION DOCUMENT` problem: a definition that embed
 skips ships nowhere, and must not silently drop out of the checks.
 
@@ -95,8 +95,8 @@ around the load, so no `__pycache__` is written) and runs its `main()` in this
 process, writing only inside a `TemporaryDirectory`. That run also reads
 content/plugin-docs/*.json (embed validates them; a bad manifest makes embed
 exit 1, which the exit-code and stderr message of `embedded_definitions`
-reports). No subprocess, no network, no clock. Requires PyYAML, an existing hard build dependency (see
-embed_content.py), not a new one for this repo.
+reports). No subprocess, no network, no clock. Requires PyYAML, an existing hard
+build dependency (see embed_content.py), not a new one for this repo.
 
 Demonstrating the failure modes is done on fabricated data only, per this
 package's boundary against editing real fragment/content files —
@@ -393,8 +393,8 @@ def format_unparseable(skipped: list[tuple[str, int, str]]) -> list[str]:
     / `content/packs` that PyYAML rejects (a tab indent, a `--- # comment`
     separator, an unclosed flow sequence). `embed_content.py` warns and skips
     such a document, so whatever it defines ships nowhere, and the walk skips it
-    the same way; this is what keeps it from vanishing from checks 1-5 without a
-    failing signal. The kind of a document that does not parse is unknown, so a
+    the same way; this is what keeps it from vanishing from checks 1, 2, 4 and 5
+    without a failing signal. The kind of a document that does not parse is unknown, so a
     rejected document of any kind is reported."""
     return [
         f"UNPARSEABLE DEFINITION DOCUMENT: {rel}#{index}: {error} -- embed_content.py skips it "
@@ -844,7 +844,7 @@ def collect_question_problems(
     problems.extend(check_definition_types(definitions))
     questions = [(i, p, a) for i, t, p, a in definitions if t == "question"]
     if not questions:
-        problems.append("parsed zero question definitions -- the glob or spec.type read is broken")
+        problems.append("parsed zero question definitions -- the definition walk or spec.type read is broken")
     problems.extend(check_questions(questions, class_by_pair, pinned, pinned_unexplained, expected_count))
     return problems
 
