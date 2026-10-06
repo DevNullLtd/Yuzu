@@ -67,6 +67,14 @@ do_start_services() ->
     %% which can start first; the lazy path in yuzu_gw_heartbeat_admission
     %% covers that window.
     ok = yuzu_gw_heartbeat_admission:init_summary_state(),
+    %% The same for the WARN limit of the calls that carry a registration
+    %% request (yuzu_gw_safe_call): a burst of first failures shares one limit.
+    ok = yuzu_gw_safe_call:init_limits(),
+
+    %% TCP_NODELAY on the upstream channel, before the supervision tree below
+    %% (the only caller of the channel) exists: grpcbox already started the
+    %% channel from sys.config, so this restarts it with the rewritten endpoints.
+    ok = yuzu_gw_upstream_channel:apply_nodelay(),
 
     %% Start Prometheus HTTP exporter for /metrics endpoint.
     Port = application:get_env(yuzu_gw, prometheus_port, 9568),
@@ -76,8 +84,14 @@ do_start_services() ->
     logger:info("Heartbeat admission is connection-bound: a heartbeat is "
                 "admitted only on the connection that opened its session"),
 
-    %% Start the supervision tree.
-    yuzu_gw_sup:start_link().
+    %% Start the supervision tree. The crash-report filter goes in first so
+    %% the upstream's first crash is already redacted (it holds registration
+    %% credentials in its mailbox); a tree that does not start removes it again.
+    ok = yuzu_gw_crash_redact:install(),
+    case yuzu_gw_sup:start_link() of
+        {ok, _} = Started -> Started;
+        Other             -> ok = yuzu_gw_crash_redact:remove(), Other
+    end.
 
 %%--------------------------------------------------------------------
 %% Distribution cookie guard (#659)
@@ -203,6 +217,9 @@ stop(_State) ->
         timer:sleep(500)
     end,
 
+    %% The filter outlives the supervision tree (already down by now), so the
+    %% upstream's shutdown reports are redacted too.
+    ok = yuzu_gw_crash_redact:remove(),
     logger:info("Gateway shutdown complete"),
     ok.
 

@@ -188,8 +188,6 @@ function buildReview() {
     }
   } else if (tlsMode === 'plaintext') {
     warnings.push('⚠️ Plaintext TLS mode: the agent↔server channel is unencrypted (--no-tls --no-https). Dev only — do not internet-expose port 50051.');
-  } else if (tlsMode === 'default' && !chk('persist-certs')) {
-    warnings.push('ℹ️ Default certs without persistence: the per-install CA will be regenerated on every container recreate, breaking already-enrolled agents. Enable "Persist generated certs".');
   }
   // Gateway + TLS is not generated yet (secure gateway topology is #1314).
   if (chk('include-gateway') && tlsMode !== 'plaintext') {

@@ -11,7 +11,7 @@ context-refs: ["#2568", "#2580", "docs/postgres-store-playbook.md"]
 
 # 3005 — Plugin config/secret plane + per-action kill switch
 
-> **Implementation status (2026-09-07 ADR reconciliation):** Shipped — `PluginConfigStore::get_kill_switch`/`set_kill_switch` (`server/core/src/plugin_config_store.hpp:29,188,192`) and `plugin_config_routes.{hpp,cpp}` exist and are wired. Shipped: PR #3134 ("feat(server): plugin config/secret/kill-switch plane + typed schedule params (PR1.5a/b)"), merged 2026-08-15.
+> **Implementation status (2026-09-07 ADR reconciliation):** Shipped — `PluginConfigStore::get_kill_switch`/`set_kill_switch` (`server/core/src/plugin_config_store.hpp:29,188,192`) and `plugin_config_routes.{hpp,cpp}` exist and are wired. Shipped: PR #3134 ("feat(server): plugin config/secret/kill-switch plane + typed schedule params (PR1.5a/b)"), merged 2026-08-15. Per-OS kill-switch rows (schema v2): see "Update (2026-10-03, #5294)".
 
 ## Context
 
@@ -146,6 +146,65 @@ kill-switchable like any ordinary plugin.action — an operator can still explic
 `__guard__.push_rules` (whole-plugin or action-level) via
 `PUT /api/v1/plugin-config/__guard__/kill-switch` (`?action=push_rules`) or the MCP twin
 `set_plugin_kill_switch`, and that switch is honored exactly as for any other capability.
+
+### Update (2026-10-03, #5294) — per-OS kill-switch rows
+
+A kill switch can now be narrowed to one agent OS, so a new OS leg can ship off where the plugin
+is already on.
+
+- **Schema v2.** `ALTER TABLE kill_switches ADD COLUMN os TEXT NOT NULL DEFAULT ''` (v1 is
+  unchanged; it shipped in a release). `scope_key` stays the unique identity and takes the form
+  `<plugin>[.<action>][@<os>]`; `@` is outside the identifier grammar, so no existing key can
+  collide. Existing rows read back as `os=''`: nothing flips on upgrade.
+- **Closed OS set.** `os` is one of `windows`, `linux`, `darwin` (`is_valid_agent_os`; the source
+  of truth is `kAgentOs` in `agents/core/src/agent.cpp`, so adding an agent OS means updating
+  both). `macos` or a typo is refused rather than becoming a silently ineffective row.
+- **AND of layers.** The effective state is the plugin/action layer AND the OS layer
+  (`resolve_kill_switch`, pure). A per-OS row only ever narrows; it never widens an OFF plugin or
+  action row, and a missing per-OS row falls back to the plugin/action state. Inside the OS layer
+  `<action>@<os>` wins over `<plugin>@<os>`.
+- **One read.** `kill_switch_decision(plugin, action)` is the single-statement, fail-closed read
+  behind `action_allowed` (which is now `kill_switch_decision(...).has_value()`). It returns
+  `nullopt` when killed for every OS or degraded, else the set of OS values whose per-OS switch
+  is OFF. `get_kill_switch(plugin, action, os)` reports the EFFECTIVE `enabled` and attributes
+  `reason`/`set_by`/`updated_at` to the row that produced the decision (never an ON row beside
+  `enabled=false`), naming it in `source`.
+- **Enforcement.** The set travels on `ClassifiedCommand::kill_switched_os()` and is turned into
+  a per-target filter in `dispatch_confined_arms` (priority: contained, then OS-killed, then
+  plugin-absent) from `AgentRegistry::ids_with_os`, which covers local sessions AND presence-backed
+  ids from other replicas (local wins). An id whose OS is unknown everywhere is not withheld
+  (absence of data is not a killed OS). Dispatches with no per-OS row pay nothing: an empty set
+  does no presence read and keeps the unfiltered broadcast fast path.
+- **Degraded presence fails closed.** With a non-empty OS set, an unreadable presence store
+  refuses the whole dispatch before targeting (`os_gate_unreadable`) instead of enforcing on local
+  sessions only. A fail-closed containment gate outranks it: containment already withholds every
+  id, so the presence read is skipped and the reported cause is `containment_unreadable`.
+- **Claims.** An OS-withheld id has already taken its per-device concurrency claim, so it is the
+  fourth bucket released with not-sent, quarantined and unknown-plugin ids.
+- **Dry run.** The MCP pre-dispatch authorization dry run has no target, so it cannot see the
+  per-OS layer; an "allowed" dry run followed by `sent=0` with `kill_switched_os_count > 0` is
+  expected.
+- **Operator surface.** `GET/PUT /api/v1/plugin-config/{plugin}/kill-switch` and the MCP
+  `get_plugin_kill_switch` / `set_plugin_kill_switch` take an optional `os`; the audit `target_id`
+  gains the `@<os>` suffix. The zero-reach cascades report `kill_switched_os` (permanent) and
+  `os_gate_unreadable` (retryable) as distinct causes.
+- **Send-time check.** `AgentRegistry::send_to` and the local-session loop of `send_to_all` also
+  refuse a session whose OS is in the command's set, so every local caller (including
+  `send_system_reserved`) is covered and a session that registers after the dispatch-time presence
+  snapshot is still withheld. The residual is `send_via_directory` (remote ids, no session), which
+  relies on the presence snapshot. A send-time refusal counts as undelivered.
+- **Presence ceiling.** `ids_with_os` reads `live_presence()`, which is `Truncated` above 100,000
+  rows. Above that, a plugin/action with a per-OS OFF row is refused fail-closed with
+  `os_gate_unreadable` until the fleet drops below the cap; this is the same cap `evaluate_scope`
+  already aborts on.
+- **Cascade order.** The aggregate zero-reach cascade keeps the pre-existing #3424 order and so
+  reports `plugin_not_found` ahead of `kill_switched_os`; the per-OS withhold is always disclosed
+  by the `agents_kill_switched_os` / `withheld_kill_switched_os` counts, so a mixed answer is
+  incomplete, not false.
+- **Rollback and mixed versions.** A server older than this change ignores `<plugin>@<os>` rows and
+  applies a `?os=` PUT as the plugin-level row; see the upgrading guide ("Behaviour change: per-OS
+  plugin kill switch rows (#5294)").
+- **Scope.** This is the mechanism only; no plugin is wired to a per-OS seed here.
 
 ### REST authorization — existing operations only
 

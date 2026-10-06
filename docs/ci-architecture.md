@@ -245,7 +245,7 @@ requests only, not a required check today) runs
 `agents/plugins/<name>/src/**` must also touch that README, or the PR body
 must carry a visible `docs-unchanged: <section> — <reason>` line, which
 the job prints. Both scripts carry a fixture self-test that the `docs`
-suite also runs.
+suite also runs (the touch-rule one off Windows only, #5428).
 
 ### ClusterFuzzLite (`cflite-pr.yml` + `cflite-batch.yml`)
 
@@ -1650,7 +1650,8 @@ it widens shards A and B, and a mistyped tag is no longer loud. Run the binary
 directly for a targeted run (`build-*/tests/yuzu_agent_tests '[tag]'`, see
 `docs/build-guide.md` "Direct binary invocation"). Repro (2026-10-01, Linux
 `build-linux/tests/yuzu_agent_tests`, `<shard spec> '[nonexistent_zzz]'
---list-tests --allow-running-no-tests`): shard A lists 319 cases, B 437, C 0.
+--list-tests --allow-running-no-tests`): shard A lists 319 cases, B 437, C 0 (B's count changed in
+the 2026-10-04 re-balance; A's did not).
 Every CI leg selects the shards by `--suite agent` (ci.yml Linux step and Windows step,
 nightly.yml windows-asan) or runs `meson test` unfiltered (macOS, nightly and
 sanitizer legs); none selects the old entry name. `agent tsan-heavy checkpoints`

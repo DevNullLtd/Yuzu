@@ -144,7 +144,7 @@ Yuzu/
 
 Prebuilt artifacts are published with every tagged release. If you just want to run Yuzu, start here — you do not need to build from source.
 
-- **Release binaries & installers** (server/agent for Linux, Windows, macOS; Compose Wizard zip): [GitHub Releases](https://github.com/DevNullLtd/Yuzu/releases). Latest stable is v0.12.0.
+- **Release binaries & installers** (server/agent for Linux, Windows, macOS; Compose Wizard zip): [GitHub Releases](https://github.com/DevNullLtd/Yuzu/releases). Latest stable is v0.14.0.
 - **Container images** (published to GHCR on every tag):
   - `ghcr.io/devnullltd/yuzu-server:<version>`
   - `ghcr.io/devnullltd/yuzu-agent-chisel:<version>`
@@ -154,8 +154,10 @@ Prebuilt artifacts are published with every tagged release. If you just want to 
 ```bash
 # Pull and run the latest stable release via compose
 curl -fsSL https://raw.githubusercontent.com/DevNullLtd/Yuzu/main/deploy/docker/docker-compose.yml -o docker-compose.yml
-YUZU_VERSION=0.12.0 docker compose up -d
+YUZU_VERSION=0.14.0 docker compose up -d
 ```
+
+This quickstart compose builds the server from source (`build: ../..`) and ignores `YUZU_VERSION`, so it is for evaluating Yuzu from a checkout of this repository, not a download-only install ([#5419](https://github.com/DevNullLtd/Yuzu/issues/5419)).
 
 Open `http://localhost:8080` and sign in with the credentials set during first-run provisioning.
 

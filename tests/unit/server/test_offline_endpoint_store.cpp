@@ -136,15 +136,22 @@ TEST_CASE("OfflineEndpointStore migrates and upserts", "[pg][offline]") {
     SECTION("v2 blank-preserve: a blank agent_version/arch does not clobber a known value") {
         REQUIRE(store.upsert("agent-v2b", "host-v2b", "linux", t - 1000, 0, "2.0.0", "arm64"));
         // A later heartbeat that raced the session lookup supplies blanks —
-        // hostname/os still update unconditionally, but the last-known
-        // version/arch must survive (see upsert()'s CASE WHEN doc comment).
-        REQUIRE(store.upsert("agent-v2b", "host-v2b-renamed", "linux", t, 0, "", ""));
+        // hostname still updates unconditionally, but the last-known
+        // version/arch/os must survive (see upsert()'s CASE WHEN doc comment).
+        REQUIRE(store.upsert("agent-v2b", "host-v2b-renamed", "", t, 0, "", ""));
         auto rows = store.query_stale_within(std::chrono::hours(1));
         const auto* v = find(rows, "agent-v2b");
         REQUIRE(v != nullptr);
         CHECK(v->hostname == "host-v2b-renamed"); // unconditional field still updates
         CHECK(v->agent_version == "2.0.0");       // preserved, not blanked
         CHECK(v->arch == "arm64");                // preserved, not blanked
+        CHECK(v->os == "linux");                  // #5294: preserved, not blanked
+        // A non-blank os still wins (a genuine OS change).
+        REQUIRE(store.upsert("agent-v2b", "host-v2b-renamed", "windows", t, 0, "", ""));
+        rows = store.query_stale_within(std::chrono::hours(1));
+        v = find(rows, "agent-v2b");
+        REQUIRE(v != nullptr);
+        CHECK(v->os == "windows");
     }
 
     SECTION("v2 pre-migration rows read back as empty version/arch") {

@@ -39,6 +39,7 @@
 #include <yuzu/string_utils.hpp>
 
 #include "filesystem_acl_parsers.hpp"
+#include <atomic_file_write.hpp> // yuzu::shared::write_file_atomic
 
 #include <spdlog/spdlog.h>
 
@@ -403,30 +404,16 @@ bool glob_match(std::string_view pattern, std::string_view text) {
 }
 
 // ── Atomic file write helper ───────────────────────────────────────────
-// Write content to a temp file in the same directory, then rename.
+// Delegates to the shared exclusive-create temp + fsync + rename helper.
 bool atomic_write_file(const fs::path& target, std::string_view content) {
-    auto dir = target.parent_path();
-    auto tmp = dir / (target.filename().string() + ".yuzu_tmp");
-    {
-        std::ofstream ofs(tmp, std::ios::binary | std::ios::trunc);
-        if (!ofs) return false;
-        ofs.write(content.data(), static_cast<std::streamsize>(content.size()));
-        if (!ofs) { std::error_code ec; fs::remove(tmp, ec); return false; }
+    // owner_only_mode=false: a new file is created at 0666 & ~umask; an existing
+    // regular file keeps its rwx bits (POSIX).
+    auto r = yuzu::shared::write_file_atomic(target, content, {.owner_only_mode = false});
+    if (!r) {
+        spdlog::warn("filesystem: atomic write failed: {}", r.error().message);
+        return false;
     }
-    std::error_code ec;
-#ifdef _WIN32
-    // On Windows, fs::rename may fail if target is open; try ReplaceFile first
-    // (#1681) only .c_str() is consumed by ReplaceFileW below, so the shared
-    // NUL-excluded convert is equivalent to the prior -1 convert.
-    const std::wstring wold = yuzu::win::to_wide(tmp.string());
-    const std::wstring wnew = yuzu::win::to_wide(target.string());
-    if (fs::exists(target, ec)) {
-        if (ReplaceFileW(wnew.c_str(), wold.c_str(), nullptr, 0, nullptr, nullptr))
-            return true;
-    }
-#endif
-    fs::rename(tmp, target, ec);
-    if (ec) { fs::remove(tmp, ec); return false; }
+    if (*r) spdlog::warn("filesystem: atomic write: {}", (*r)->message);
     return true;
 }
 

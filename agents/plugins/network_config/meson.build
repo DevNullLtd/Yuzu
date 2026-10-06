@@ -23,7 +23,14 @@ endif
 # as agents/plugins/users/meson.build's users_plugin_lib.
 network_config_plugin_lib = shared_library(
   'network_config',
-  files('src/network_config_plugin.cpp'),
+  files(
+    'src/network_config_plugin.cpp',
+    # `routes` legs: each TU is self-gated (#if defined(__linux__|__APPLE__|_WIN32)), so all
+    # three are listed unconditionally, as system_hardening/peripherals do.
+    'src/network_config_routes_linux.cpp',
+    'src/network_config_routes_macos.cpp',
+    'src/network_config_routes_win.cpp',
+  ),
   name_prefix: '',
   include_directories: include_directories('../../shared'),  # win_str.hpp (#1681); route_sysctl_arp.hpp (__APPLE__-gated)
   cpp_args: network_config_cpp_args,

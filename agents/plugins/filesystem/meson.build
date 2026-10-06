@@ -4,8 +4,8 @@ if host_machine.system() == 'windows'
   fs_extra_deps = [version_lib]
 endif
 
-# Named so tests/meson.build can list it in link_depends (the get_acl LocalDispatcher test
-# loads the built library by path); same shape as network_config_plugin_lib.
+# Named so tests/meson.build can list it in link_depends (the LocalDispatcher tests load the
+# built library by path); same shape as network_config_plugin_lib.
 filesystem_plugin_lib = shared_library(
   'filesystem',
   files('src/filesystem_plugin.cpp'),

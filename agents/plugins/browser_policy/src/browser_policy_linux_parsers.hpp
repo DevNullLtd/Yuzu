@@ -242,11 +242,11 @@ struct FileRead {
 /// order never depends on readdir order. Records an entry-cap truncation
 /// (`<prefix>:entry_cap`: the directory holds more entries than the cap —
 /// distinct from the per-leg `row_cap`) and real readdir errors
-/// (`<prefix>:readdir_error`) on `acc`.
-template <typename Keep>
+/// (`<prefix>:readdir_error`) through `on_failure(token)` (the caller's accumulator and
+/// per-path attribution: it knows the directory's logical path, this kit does not).
+template <typename Keep, typename OnFailure>
 [[nodiscard]] std::vector<std::string> list_names(const Dir& dir, Keep&& keep,
-                                                  yuzu::shared::ConstraintAccumulator& acc,
-                                                  std::string_view prefix,
+                                                  std::string_view prefix, OnFailure&& on_failure,
                                                   std::size_t max_entries = kMaxEntriesPerDir) {
     std::vector<std::string> names;
     const auto walk = yuzu::shared::walk_dir_capped(
@@ -256,9 +256,9 @@ template <typename Keep>
             return true;
         });
     if (walk.truncated)
-        acc.add_failure(std::string{prefix} + ":entry_cap");
+        on_failure(std::string{prefix} + ":entry_cap");
     if (walk.enumeration_error)
-        acc.add_failure(std::string{prefix} + ":readdir_error");
+        on_failure(std::string{prefix} + ":readdir_error");
     std::sort(names.begin(), names.end());
     // A directory rewritten while it is listed can return an entry twice; one file is one file.
     names.erase(std::unique(names.begin(), names.end()), names.end());
@@ -313,14 +313,24 @@ inline constexpr LevelDir kLevelDirs[] = {
 /// recommended}/*.json and returns one formatted `policy|` row per policy
 /// key. `failure_reason` is set (comma-joined `linux:<detail>` tokens) iff
 /// any directory, file or value could not be read/decoded; empty means the
-/// read was complete (possibly with zero rows: nothing managed).
+/// read was complete (possibly with zero rows: nothing managed). `per_path` receives
+/// one {logical path, token} for every failure (the SAME logical string the policy rows
+/// carry as `source`, never the injected root), kept to kMaxPathFailureRows + 1 entries:
+/// one past the cap is how mark_result_read learns the list was truncated.
 [[nodiscard]] inline std::vector<std::string>
 linux_policy_rows_at(const std::filesystem::path& root, std::string& failure_reason,
-                     const WalkLimits& limits = {}) {
+                     std::vector<PathFailure>& per_path, const WalkLimits& limits = {}) {
     yuzu::shared::ConstraintAccumulator acc;
     std::vector<std::string> rows;
     std::size_t total_bytes = 0; // policy-file content read so far, against limits.max_total_bytes
     failure_reason.clear();
+    per_path.clear();
+    // The one failure sink: the summary token (acc) and its per-path attribution.
+    auto fail = [&](std::string token, std::string_view logical_path) {
+        acc.add_failure(token);
+        if (per_path.size() <= kMaxPathFailureRows)
+            per_path.push_back({std::string{logical_path}, std::move(token)});
+    };
 
     auto finish = [&]() {
         failure_reason = acc.reason();
@@ -331,7 +341,7 @@ linux_policy_rows_at(const std::filesystem::path& root, std::string& failure_rea
     if (root_open.status == posix::OpenStatus::absent)
         return finish(); // no such root: nothing managed
     if (root_open.status == posix::OpenStatus::failed) {
-        acc.add_failure(linux_token(root_open.detail));
+        fail(linux_token(root_open.detail), "/etc"); // the root itself is never shown
         return finish();
     }
 
@@ -347,32 +357,34 @@ linux_policy_rows_at(const std::filesystem::path& root, std::string& failure_rea
             base += '/';
             base += part;
         }
-        base += '/';
 
         posix::DirOpen policies = posix::open_dir_chain(root_open.dir.fd(), chain);
         if (policies.status == posix::OpenStatus::failed)
-            acc.add_failure(linux_token(policies.detail));
+            fail(linux_token(policies.detail), base);
         if (policies.status != posix::OpenStatus::ok)
             continue;
 
         for (const auto& lvl : kLevelDirs) {
             posix::DirOpen level_dir = posix::open_dir_at(policies.dir.fd(), lvl.dir);
+            const std::string level_path = base + '/' + lvl.dir;
             if (level_dir.status == posix::OpenStatus::failed)
-                acc.add_failure(linux_token(level_dir.detail));
+                fail(linux_token(level_dir.detail), level_path);
             if (level_dir.status != posix::OpenStatus::ok)
                 continue;
 
             const auto names = posix::list_names(
                 level_dir.dir,
-                [](const struct dirent* e) { return std::string_view{e->d_name}.ends_with(".json"); }, acc,
-                "linux", limits.max_entries_per_dir);
+                [](const struct dirent* e) { return std::string_view{e->d_name}.ends_with(".json"); },
+                "linux", [&](std::string token) { fail(std::move(token), level_path); },
+                limits.max_entries_per_dir);
             for (const auto& fname : names) {
                 auto file = posix::read_file_at(level_dir.dir.fd(), fname.c_str(),
                                                 limits.max_file_bytes);
                 if (file.status == posix::OpenStatus::absent)
                     continue;
+                const std::string source = level_path + "/" + fname;
                 if (file.status == posix::OpenStatus::failed) {
-                    acc.add_failure(linux_token(file.detail));
+                    fail(linux_token(file.detail), source);
                     continue;
                 }
                 // The run's parser input (and, through it, the retained row text) scales with
@@ -381,10 +393,9 @@ linux_policy_rows_at(const std::filesystem::path& root, std::string& failure_rea
                 // walk stops: rows already read stand, the result is a lower bound.
                 total_bytes += file.bytes.size();
                 if (total_bytes > limits.max_total_bytes) {
-                    acc.add_failure("linux:byte_cap");
+                    fail("linux:byte_cap", source);
                     return finish();
                 }
-                const std::string source = base + lvl.dir + "/" + fname;
                 // Build at most one row past the budget that is left: enough to notice an
                 // overrun below, without turning every key of a huge file into a row first.
                 // (Saturating: a max_rows of SIZE_MAX must not wrap to "build no rows".)
@@ -394,12 +405,12 @@ linux_policy_rows_at(const std::filesystem::path& root, std::string& failure_rea
                 auto parsed = rows_from_json_policy_text(file.bytes, vendor.browser, lvl.level,
                                                          machine_scope(), source, rows_to_build);
                 if (parsed.failure) {
-                    acc.add_failure(*parsed.failure);
+                    fail(std::string{*parsed.failure}, source);
                     continue;
                 }
                 for (const auto& row : parsed.rows) {
                     if (rows.size() >= limits.max_rows) {
-                        acc.add_failure("linux:row_cap");
+                        fail("linux:row_cap", source);
                         return finish();
                     }
                     rows.push_back(format_policy_row(row));
@@ -408,6 +419,14 @@ linux_policy_rows_at(const std::filesystem::path& root, std::string& failure_rea
         }
     }
     return finish();
+}
+
+/// The pre-per-path signature, retained for the unit suite; production (run_linux_at) uses the per-path form.
+[[nodiscard]] inline std::vector<std::string>
+linux_policy_rows_at(const std::filesystem::path& root, std::string& failure_reason,
+                     const WalkLimits& limits = {}) {
+    std::vector<PathFailure> discarded;
+    return linux_policy_rows_at(root, failure_reason, discarded, limits);
 }
 
 } // namespace lnx
@@ -419,8 +438,9 @@ linux_policy_rows_at(const std::filesystem::path& root, std::string& failure_rea
 inline int run_linux_at(yuzu::CommandContext& ctx, const std::filesystem::path& root,
                         const WalkLimits& limits = {}) {
     std::string failure_reason;
-    const auto rows = lnx::linux_policy_rows_at(root, failure_reason, limits);
-    mark_result_read(ctx, failure_reason); // the outcome (status row + typed status) leads the stream
+    std::vector<PathFailure> per_path;
+    const auto rows = lnx::linux_policy_rows_at(root, failure_reason, per_path, limits);
+    mark_result_read(ctx, failure_reason, per_path); // the outcome (status row + typed status) leads the stream
     write_rows(ctx, rows);
     return 0;
 }

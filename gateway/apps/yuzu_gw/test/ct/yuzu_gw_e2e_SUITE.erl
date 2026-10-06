@@ -69,6 +69,9 @@ init_per_suite(Config) ->
     application:set_env(yuzu_gw, heartbeat_batch_interval_ms, 500),
     application:set_env(yuzu_gw, default_command_timeout_s, 5),
     application:set_env(yuzu_gw, telemetry_gauge_interval_ms, 60000),
+    %% Every case "arrives" on the one mocked connection (?CONN_KEY), and some
+    %% register more agents than the default per-connection session cap (8).
+    application:set_env(yuzu_gw, max_sessions_per_connection, 1000),
 
     %% Mock upstream so we don't need a real C++ server.
     meck:new(grpcbox_channel, [non_strict, no_link]),
@@ -100,6 +103,7 @@ end_per_suite(_Config) ->
 
     %% Unload mocks.
     meck:unload([grpcbox_channel, grpcbox_client, yuzu_gw_conn]),
+    application:unset_env(yuzu_gw, max_sessions_per_connection),
 
     ok.
 
