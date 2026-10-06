@@ -72,39 +72,47 @@ DEX is a read-only lens over what endpoints report about themselves.
   shutdowns, boot, shutdown and resume timing, logon problems, and disk, memory, battery, graphics
   and processor faults, as well as network and printing problems. Windows collects the whole
   catalogue; Linux and macOS collect a smaller subset. A new signal needs no new transport.
-- **Series.** Each day the agent also reports how much processor and working-set memory each
-  application version used. The server keeps it per device for about a month and rolled up
-  across the fleet for about half a year. It exists for Windows and Linux; macOS has no
-  per-process source yet.
-- **Usage.** A separate plugin reports, on request and per device, how long and how often each
-  executable ran. It is a forensic-tier read. Nothing in the product measures how long an
-  application has the user's focus; that is the subject of its own open decision.
+- **Series.** Where per-application sampling is switched on, which it is not by default, the
+  agent reports each day how much processor and working-set memory the heaviest applications on
+  the device used, by image name and version. The server keeps it per device for about a month
+  and rolled up across the fleet for about half a year. It exists for Windows and Linux, but only
+  Windows resolves a version: every Linux row falls into an unknown-version bucket. macOS has no
+  per-process source yet, and the fleet rollup carries no operating-system dimension (#4512).
+- **Usage.** A separate plugin records how long and how often each executable ran, by executable
+  name with no version. The agent syncs a trailing thirty-day summary each day and the server
+  replaces the last one. It is read one device at a time under the forensic permission, with an
+  audit record for each read. Nothing in the product measures how long an application has the
+  user's focus; that is the subject of its own open decision.
 - **Views.** The DEX area has eight views: Overview, Apps, Catalogue, Health score, Trends,
-  Performance, App Performance and Network. Each has a REST twin and MCP tools. Headline figures
-  are measured rates over the devices that are reporting, not scores. A secondary health
-  composite shows its decomposition, and the Overview splits it into fleet-wide device,
-  application and network sub-scores. A figure over too few devices shows a count only.
+  Performance, App Performance and Network. Each has a REST twin and MCP tools. The Health score
+  view leads with a measured rate and shows a composite beneath it, with its decomposition. The
+  Overview opens with an Experience block of scores (an overall figure with device, application
+  and network sub-scores) above its measured reliability tiles. Application-performance trend
+  points over too few devices show a count only; the signal views apply no floor today.
 
 The gaps, as the evidence stands today:
 
 - Crash and hang counts are per application. They are not joined to the version on the
   performance trend, so "is the new version worse than the old one?" cannot be answered on one
   page. That join was deferred when the per-application views shipped.
-- Boot and shutdown times are recorded, and an individual boot time is visible in the signal
-  drill-down, but there is no view of them over time, by hardware model or as a distribution. The
-  boot family is also deliberately excluded from the health composite, because its reports are
-  benign, so slow boots have no summary at all.
+- Boot and shutdown times are recorded, and an individual boot time is visible in a device's
+  signal history, but there is no view of them over time, by hardware model or as a distribution.
+  The boot family is excluded from the per-device score because its reports are routine, and the
+  fleet composite weights it lightly and by how many devices reported, never by how long boots
+  took, so slow boots have no summary at all.
 - Blue screens and unexpected shutdowns show as counts and as activity over time. They are not
   expressed as a rate per device-day, grouped by stop code or compared by hardware model, and the
   same shutdown can be reported by two sources.
 - Signals cannot be compared across hardware models. That comparison exists only for the
   performance series.
 - There is no source for logon duration.
-- There is no usage view across the fleet. Usage is read one device at a time.
+- There is no usage view across the fleet. Usage is read one device at a time, by executable name
+  with no version, and the server keeps one trailing thirty-day figure per device and executable
+  rather than a daily series, so neither a usage trend nor a per-version usage figure exists.
 - There is a health composite for the fleet and a score for a device, but none for one
   application or for one hardware model.
-- The capability map says composite scoring is deliberately not implemented, while the product
-  already ships a secondary composite. The two statements need reconciling.
+- The capability map says composite scoring is deliberately not implemented, while the Overview
+  and Health score views already show scores. The statement is out of date and needs reconciling.
 
 ### What the customer needs
 
@@ -166,8 +174,7 @@ Windows.
   deductions, shown with the deductions.
 - **Cohort floor** — the number of devices below which a figure shows a count only. Today it is
   ten.
-- **Usage** — how long an application version runs and how often it is launched, summed over
-  devices.
+- **Usage** — how long an application runs and how often it is launched, summed over devices.
 - **Hub** — the DEX view that holds this capability.
 
 ## Decision
@@ -178,8 +185,9 @@ DEX is the single place that answers how applications and hardware are performin
 capability extends it; it does not open a separate area. The dashboard presents one hub in the DEX
 area, organised by four questions: how stable are the applications (stability), what do they
 consume (resources), how stable is the hardware and how quickly does it start and stop (boot,
-shutdown and hardware stability), and how much are the applications used (usage). The existing
-Apps and Performance views fold into the hub. The other views stay where they are and link into it.
+shutdown and hardware stability), and how much are the applications used (usage). The hub replaces
+the App Performance view. The Apps and Performance views fold into it, Performance as the device
+side of resources. The other views stay where they are and link into it.
 
 *Rejected:* adding the new views as further tabs beside the existing eight. They overlap with what
 exists, and the team would move between tabs to see one application's crashes next to its resource
@@ -216,21 +224,24 @@ Nothing in the product acts on a score, and alerting stays with the routing an o
 The weights are shipped reference content: visible, and selectable by preset.
 
 *Rejected:* a score as the headline, because one number invites more precision than the evidence
-has, and the existing views deliberately lead with rates. Also rejected: a learned or opaque score,
-which cannot be defended in a service review and cannot say why it moved. Also rejected: no score,
-because the customer needs one figure to rank by and to report, and a ranking without a key is
-only a sorted list.
+has, and the Health score view deliberately leads with the measured rate. Also rejected: a
+learned or opaque score, which cannot be defended in a service review and cannot say why it
+moved. Also rejected: no score, because the customer needs one figure to rank by and to report,
+and a ranking without a key is only a sorted list.
 
 ### D4 — An application is its image and version; a hardware cohort is a model
 
 An application is identified by its executable's image name and its version in the canonical
-four-part form. That is the one identity the crash, hang and performance data already share, and
-it is matched exactly, never by similarity of names. Applications are read application first,
-then version, then device, so a rollout can be judged by setting a version beside the one before
-it. Hardware is read the same way: a cohort first (the model by default, or any other attribute
-devices have been tagged with), then the devices in it. Linking an image to an installed package
-in the software catalogue is intended and is decided later, when the catalogue exists. Until then
-the hub does not guess a display name.
+four-part form. That is the identity the crash, hang and performance data share on Windows, and it
+is matched exactly, never by similarity of names. On Linux neither carries a version, so a Linux
+application is one row with an unknown version. Applications are read application first, then
+version, then device, so a rollout can be judged by setting a version beside the one before it.
+Hardware is read the same way: a cohort first (the model by default, or any other attribute
+devices have been tagged with), then the devices in it. Today the model is a tag an operator
+populates, although the hardware inventory already records each device's manufacturer and model;
+which of the two is authoritative is left open. Linking an image to an installed package in the
+software catalogue is intended and is decided later, when the catalogue exists. Until then the hub
+does not guess a display name.
 
 *Rejected:* resolving each image to its installed package before showing it. It depends on a
 catalogue that has not landed and on new collection, and it guesses wrong where one image belongs
@@ -247,8 +258,8 @@ The failure directions are fixed:
 
 - No devices reporting gives a dash, not 100 and not 0.
 - A read that fails gives an error, never an empty or a perfect result.
-- A figure over fewer devices than the cohort floor gives a count only, because a rate over a
-  handful of devices says too little to rely on.
+- A figure this capability adds, over fewer devices than the cohort floor, gives a count only,
+  because a rate over a handful of devices says too little to rely on.
 
 *Rejected:* counting offline or silent devices as healthy, which inflates the headline exactly when
 telemetry is broken. Also rejected: estimating figures for an operating system that does not
@@ -269,28 +280,31 @@ rejected: presenting Windows figures as the whole fleet, which D5 forbids.
 
 Boot time, shutdown time, resume time, blue screens, kernel panics, unexpected shutdowns and the
 hardware faults that precede them are shown as trends and, for times, as distributions: by period,
-by hardware cohort, and for boot by what slowed it (application, driver, service or device). They
-are not shown as totals alone. A blue screen's stop code travels with the event and is a way to
-group them; where the platform also records what a stop implicates, that is carried too. An event
-reported by more than one source counts once in every rate: an unexpected shutdown seen both as a
-power loss and as a dirty shutdown is one shutdown.
+by hardware cohort, and, where the platform reports it, for boot by what slowed it (application,
+driver, service or device). They are not shown as totals alone. A blue screen's stop code travels
+with the event and is a way to group them; where the platform also records what a stop implicates,
+that is to be carried too. An event reported by more than one source counts once in every rate.
+One blue screen can surface as a bugcheck, as a power loss that names a bugcheck and as a dirty
+shutdown; it is one event.
 
 Logon duration is wanted. If a reliable source exists it is added as a signal in the same way. None
 exists today, and this ADR does not promise one.
 
 *Rejected:* totals only, which cannot show that boots are getting slower or that one model is
 worse. Also rejected: adding the sources together, which double counts the very event the catalogue
-already marks as co-firing.
+already marks as usually co-firing.
 
 ### D8 — Usage is run-time and launches, at machine scope
 
-Usage in this capability means how long each application version runs and how many times it is
-launched, summed across devices and cohorts. It is a view in its own right (the most used
-applications, use by group) and it is the denominator that turns a crash count into crashes per
-hour of use. Groups are the management groups and tag-defined cohorts that exist today; there is no
-directory integration. How long an application has the user's focus is a different measure with its
-own pending decision (#2744) and is not decided here. A device without an agent is not measured;
-the product has no evidence about it.
+Usage in this capability means how long each application runs and how many times it is launched,
+summed across devices and cohorts, by version once usage can be tied to one. It is a view in its
+own right (the most used applications, use by group) and it is the denominator that turns a crash
+count into crashes per hour of use, once usage is matched to an application. A usage trend, as
+opposed to the current thirty-day figure, needs the server to retain what it now replaces. Groups
+are the management groups and tag-defined cohorts that exist today; there is no directory
+integration. How long an application has the user's focus is a different measure with its own
+pending decision (#2744). This ADR takes run-time and launches, which leaves that decision focus
+time alone. A device without an agent is not measured; the product has no evidence about it.
 
 *Rejected:* deciding focus time here. It needs a component resident in each user's session, which
 is ADR-3003's territory, and it would hold the whole capability to that schedule. Also rejected:
@@ -301,7 +315,8 @@ about use unanswered.
 
 Fleet and cohort figures, usage aggregates included, are read under the permission that governs the
 rest of DEX, and only above the cohort floor. A per-device read of usage keeps the forensic
-permission, the approval and the audit it has today. No new permission is created.
+permission and the audit it has today, and the approval that gates the on-request plugin action is
+unchanged. No new permission is created.
 
 *Rejected:* keeping aggregates at the forensic tier. Most of the operators this capability is for
 could not see the usage view, and the score would lose its denominator for them. Also rejected: a
@@ -324,8 +339,9 @@ same reason; it measures the network path, not the endpoint.
 
 Every figure the hub shows is available through the REST API in the same change that introduces the
 view, under the same permission and with the same floor. The dashboard and the API read one shared
-computation. MCP tools for the same figures follow within the programme and are tracked until they
-do. No view is reachable only through the dashboard.
+computation. MCP tools for the same figures follow within the programme, each recorded as an
+exception to the rule that a capability has both, with a tracking issue, until it lands. No view is
+reachable only through the dashboard.
 
 *Rejected:* dashboard first and API later. It builds up a parity debt that ADR-1005 forbids and that
 the customer asked not to have.
@@ -348,7 +364,7 @@ Not in scope, and not changed by this ADR:
   read. Dump collection is a separate, forensic capability.
 - **A new permission**, including a dedicated DEX permission (#1355).
 - **Replacing the fleet health composite.** It stays; the stability score sits beside it.
-- **Boot duration on macOS**, for which no reliable source exists.
+- **Boot duration on macOS**, for which no reliable unprivileged source exists.
 - **Linking images to the software catalogue** (decided later, D4).
 - **Schemas, protocol, screen design and delivery order.** These belong to the roadmap.
 
@@ -357,7 +373,8 @@ Not in scope, and not changed by this ADR:
 ### What changes for customers
 
 - The first release collects nothing new on any endpoint. It adds views, a score and API routes
-  over data DEX already holds, so nothing changes on an endpoint when it lands.
+  over data DEX already holds, so nothing changes on an endpoint when it lands. Per-application
+  resource figures appear only for devices that have per-application sampling switched on.
 - Later releases add specific signals. Each is stated in the DEX signal catalogue, with the
   operating systems that collect it.
 - The existing API routes keep working; new ones are added beside them.
@@ -368,7 +385,8 @@ Not in scope, and not changed by this ADR:
 
 The following is the starting point for the roadmap, which decides order and grouping.
 
-- The DEX navigation: one hub replaces the Apps and Performance views and links to the rest.
+- The DEX navigation: one hub replaces App Performance, absorbs Apps and Performance, and links
+  to the rest.
 - The version joined onto crash and hang reads, so stability and resource use sit side by side per
   version.
 - A stability read for applications and for hardware cohorts, with its decomposition.
@@ -401,12 +419,19 @@ The following is the starting point for the roadmap, which decides order and gro
   Windows part, and say so.
 - A device whose platform crash reporting is switched off by policy reports no crashes and looks
   quiet. The product does not yet show such a device as not covered.
+- A device whose application-series or usage sync is skipped for being over a size cap reports
+  nothing and also looks quiet (#4489, #5059).
+- Per-application resource figures exist only for devices with per-application sampling switched
+  on, and the fleet rollup of them has no operating-system dimension yet (#4512).
+- The signal views apply no cohort floor today. This ADR sets the floor for the figures it adds and
+  leaves those views as they are.
 - Raw observations are kept for a limited period (thirty days by default). A trend longer than that
   depends on retained daily summaries, which exist for the application series and do not yet exist
-  for stability or boot.
+  for stability, boot or usage.
 - An image name shared by two different products is one application here.
-- A version that cannot be put into the canonical form falls into a shared unknown bucket.
-- The per-process source covers Windows and Linux only. macOS has none.
+- A version that cannot be put into the canonical form falls into a shared unknown bucket, and on
+  Linux every application is in it.
+- The per-process source covers Windows and Linux only. macOS has none today.
 
 ## Verification
 
@@ -419,10 +444,10 @@ The decision is being followed when all of the following are true.
 3. A source that no connected platform collects is shown as not collected. The first device of a
    platform that does collect it lights the figure, with no change elsewhere.
 4. Two sources reporting the same unexpected shutdown yield one event in every rate.
-5. A figure over fewer devices than the cohort floor shows a count only, on the dashboard and in
-   the API.
+5. A figure this capability adds, over fewer devices than the cohort floor, shows a count only, on
+   the dashboard and in the API.
 6. For every view the dashboard shows, the API returns the same figures with the same
-   suppression, and the parity ledger carries no planned entry for a hub view.
+   suppression. Every MCP tool still owed is a recorded exception with a tracking issue.
 7. An application version can be compared with the one before it on one page, by crash and hang
    rate and by resource use.
 8. A hardware model can be compared with others on blue-screen rate, unexpected-shutdown rate and
@@ -431,18 +456,24 @@ The decision is being followed when all of the following are true.
    trail. An aggregate read does not.
 10. Nothing in the product acts on a score: no alert, action or approval depends on one.
 11. A degraded read of any source gives an error, not an empty or a perfect figure.
-12. On a mixed fleet, the absence of a Linux or macOS device from a Windows-first measure is visible
-    on the page.
+12. On a mixed fleet, the absence of a Linux or macOS device from a Windows-first signal measure is
+    visible on the page. The application series shows the same once it carries an
+    operating-system dimension.
 
 ## Open questions
 
 - **Retention.** Raw observations age out after thirty days by default. Stability and boot trends
-  over a quarter need retained daily summaries like the application series has. How long, and at
-  what grain?
+  over a quarter need retained daily summaries like the application series has, and a usage trend
+  needs the server to keep what it now replaces. How long, and at what grain?
 - Whether the stability score's weights share the presets of the fleet health composite or are
   their own. This ADR requires only that they are visible and selectable.
+- Whether the fleet health composite should keep weighting the boot family, whose reports are
+  routine and which it counts by how many devices reported rather than by how long boots took.
 - Whether a device with crash reporting switched off should be shown as not covered, and on what
   evidence.
 - The hub's name in the navigation, and whether the "App Performance" label stays.
 - Whether logon duration has a reliable source on any platform.
-- Which attribute defines a hardware cohort for estates that do not tag models.
+- Whether a hardware model is read from the tag operators populate today or from the hardware
+  inventory that already records manufacturer and model.
+- How usage, which is recorded by lowercased executable name, is matched to an application's image
+  name and version, including where Linux truncates process names.
