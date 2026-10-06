@@ -419,6 +419,20 @@ void register_list(HttpRouteSink& sink, Deps deps) {
         auto session = deps.auth_fn ? deps.auth_fn(req, res) : std::nullopt;
         if (!session)
             return;
+        // A service-scoped token is refused outright, as the MCP twin's `perm_fn` gate does
+        // (its ITServiceOwner ceiling plus the empty `kServiceScopeGlobalSafe` allow-list).
+        // The list-admit resolver below evaluates the MINTER's username, so without this a
+        // service token would inherit its minter's UploadGrant:Read view (the whole fleet for
+        // a minter with a global grant). Non-service sessions skip this block entirely.
+        if (!session->token_scope_service.empty()) {
+            if (!deps.deny_service_scoped_fn ||
+                !deps.deny_service_scoped_fn(req, res, "upload_grant.list.access_denied",
+                                             "service-scoped tokens may not list upload grants",
+                                             "UploadGrant", ""))
+                send_generic(res, 403, "permission denied");
+            return;
+        }
+
         if (!require_store(deps, res))
             return;
 

@@ -19108,6 +19108,7 @@ private:
                         }
                         return out;
                     },
+                    .deny_service_scoped_fn = deny_service_scoped_fn,
                     .audit_fn = audit_fn,
                     .store = upload_grant_store_.get(),
                     .blob_root = cfg_.db_dir() / "upload-blobs",

@@ -75,6 +75,15 @@ struct Deps {
     /// only thing that turns `kDenyAll` into the actual 403 body. Unwired
     /// (empty) fails closed (`kDenyAll`).
     using ListReadFn = std::function<UploadGrantListAuthorization(const std::string& username)>;
+    /// Wraps `AuthRoutes::deny_service_scoped_session` (the shared server.cpp closure the
+    /// other route modules take, e.g. `health_routes.hpp`'s). Called by the list route
+    /// only for a service-scoped session: it writes the A4 403 (no `.permission`, since no
+    /// grant would admit the caller) and the audit row, and returns true iff the route must
+    /// return. Unwired (empty) still refuses a service-scoped session, with a generic 403.
+    using DenyServiceScopedFn =
+        std::function<bool(const httplib::Request&, httplib::Response&, const std::string& action,
+                           const std::string& message, const std::string& target_type,
+                           const std::string& target_id)>;
     /// Same shape as `DexRoutes::AuditFn` (dex_routes.hpp) — bool-returning
     /// so a dropped audit row is visible to the caller, not silently eaten.
     /// Called on every state-changing operator AND agent transition (mint,
@@ -94,6 +103,7 @@ struct Deps {
     AuthFn auth_fn;
     PermFn perm_fn;
     ListReadFn list_read_fn;
+    DenyServiceScopedFn deny_service_scoped_fn;
     AuditFn audit_fn;
     UploadGrantStore* store{nullptr};
 
