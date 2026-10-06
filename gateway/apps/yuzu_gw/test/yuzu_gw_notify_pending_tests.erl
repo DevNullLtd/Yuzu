@@ -1500,9 +1500,10 @@ unencodable_ordinary_worker_does_not_touch_the_breaker() ->
     Timeout = up_get(cb_cur_timeout),
     notify_status(<<255>>, <<"sess">>, connected, <<"peer">>, <<"home">>),
     cast_connected(agent(1)),
-    ?assertEqual({marshal_failed, <<255>>}, await_attempt()),
-    {entered, _W, Req} = await_attempt(),
-    ?assertEqual(agent(1), maps:get(agent_id, Req)),
+    %% Two workers run at once, so the two outcomes arrive in either order.
+    Attempts = [await_attempt(), await_attempt()],
+    ?assertEqual(1, length([x || {marshal_failed, <<255>>} <- Attempts])),
+    ?assertMatch([_], [Req || {entered, _W, #{agent_id := <<"agent-1">>} = Req} <- Attempts]),
     open_and_release_all(),
     await_until(fun() -> last_gauge() =:= {0, 0} end),
     ?assertEqual({closed, 0, 0, Timeout}, breaker()),
@@ -1531,17 +1532,17 @@ cluster_id_list_is_converted_to_utf8() ->
 
 %% The boot check in yuzu_gw_app refuses such a value first; this is the second
 %% line: init/1 itself stops with a reason that names the cause and never the
-%% value (the start_link caller is linked, so it traps exits for the call).
+%% value. The caller is linked, so it traps exits for the call (whether this OTP
+%% still delivers the exit signal of a failed init or not, none is left behind).
 cluster_id_unrepresentable_stops_init() ->
     stop_upstream(),
     application:set_env(yuzu_gw, cluster_id, [16#110000]),
     Prev = process_flag(trap_exit, true),
     try
         ?assertEqual({error, {invalid_cluster_id, app_env}}, yuzu_gw_upstream:start_link()),
-        receive {'EXIT', _Pid, {invalid_cluster_id, app_env}} -> ok
-        after ?AWAIT_MS -> erlang:error(no_exit_signal_from_the_failed_init)
-        end
+        ?assertEqual(undefined, whereis(yuzu_gw_upstream))
     after
+        receive {'EXIT', _Pid, _Reason} -> ok after 0 -> ok end,
         process_flag(trap_exit, Prev)
     end.
 

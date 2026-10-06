@@ -325,6 +325,17 @@ call_timeout() ->
 %%%===================================================================
 
 init([]) ->
+    %% cluster_id is stamped on every notification as a protobuf string, so it is
+    %% converted with the unicode conversion, not list_to_binary/1 (which would
+    %% truncate a code point above 127 to latin-1, not valid UTF-8). The boot
+    %% check in yuzu_gw_app refuses an unrepresentable value first; this is the
+    %% second line (the reason names the cause, never the value).
+    case yuzu_gw_env:utf8_binary(application:get_env(yuzu_gw, cluster_id, <<"default">>)) of
+        {ok, ClusterId} -> init_state(ClusterId);
+        error           -> {stop, {invalid_cluster_id, app_env}}
+    end.
+
+init_state(ClusterId) ->
     Threshold  = application:get_env(yuzu_gw, circuit_breaker_failure_threshold, ?DEFAULT_CB_THRESHOLD),
     BaseTimeout = application:get_env(yuzu_gw, circuit_breaker_reset_timeout_ms, ?DEFAULT_CB_RESET_MS),
     MaxTimeout  = application:get_env(yuzu_gw, circuit_breaker_max_reset_timeout_ms, ?DEFAULT_CB_MAX_RESET_MS),
@@ -338,11 +349,10 @@ init([]) ->
     NotifyPendingMax = yuzu_gw_env:env_int(notify_pending_max,
                                            ?DEFAULT_NOTIFY_PENDING_MAX, 1,
                                            ?MAX_NOTIFY_PENDING_MAX),
-    ClusterId = ensure_binary(application:get_env(yuzu_gw, cluster_id, <<"default">>)),
 
     logger:info("Upstream client started (circuit breaker: threshold=~b, base_timeout=~bms, "
                 "replay_spacing=~bms, replay_session_guard=~bms, replay_queue_max=~b, "
-                "notify_pending_max=~b, cluster_id=~s)",
+                "notify_pending_max=~b, cluster_id=~ts)",
                 [Threshold, BaseTimeout, ReplaySpacing, SessionGuard, QueueMax,
                  NotifyPendingMax, ClusterId]),
 

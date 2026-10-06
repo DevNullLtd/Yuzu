@@ -11,7 +11,7 @@
 %%%-------------------------------------------------------------------
 -module(yuzu_gw_env).
 
--export([env_int/4, env_bool/2, log_text/1]).
+-export([env_int/4, env_bool/2, log_text/1, utf8_binary/1]).
 
 %% @doc Read an integer application env key that must lie in Min..Max; an
 %% invalid value is logged (naming the key) and replaced by the default.
@@ -37,6 +37,22 @@ env_bool(Key, Default) ->
             logger:warning("Invalid ~s value ~p (expected true or false); using ~p",
                            [Key, Bad, Default]),
             Default
+    end.
+
+%% @doc Convert configuration text to a UTF-8 binary: a binary that is valid
+%% UTF-8, or a list of Unicode code points (or of such binaries), which is how
+%% the environment and sys.config give a name with a non-ASCII character.
+%% `list_to_binary/1' would truncate each code point to a byte and raise above
+%% 255. Anything that is not representable (a code point above 16#10FFFF or a
+%% surrogate, a binary that is not UTF-8, any other term) gives `error', never an
+%% exception and never a partial result.
+-spec utf8_binary(term()) -> {ok, binary()} | error.
+utf8_binary(Text) ->
+    try unicode:characters_to_binary(Text, utf8, utf8) of
+        Bin when is_binary(Bin) -> {ok, Bin};
+        _Other                  -> error
+    catch
+        error:_ -> error
     end.
 
 %% @doc Untrusted server text for a log line (shared by yuzu_gw_upstream and

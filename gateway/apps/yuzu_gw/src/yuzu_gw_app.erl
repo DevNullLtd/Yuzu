@@ -16,6 +16,7 @@
 -export([client_has_https/1, client_tls_posture/1, servers_have_tls/1]). %% for testing
 -export([evaluate_upstream_posture/2, listener_tls_traps/1]).            %% for testing
 -export([evaluate_mgmt_posture/3]).                                      %% for testing
+-export([evaluate_cluster_id/2]).                                         %% for testing
 
 %%--------------------------------------------------------------------
 %% application callbacks
@@ -34,6 +35,14 @@ do_start() ->
     %% Apply environment variable overrides (container deployment).
     apply_env_overrides(),
 
+    %% #4632: refuse to boot with a cluster_id that cannot be sent as a protobuf
+    %% string (see check_cluster_id/0), before anything is started.
+    case check_cluster_id() of
+        {error, ClusterReason} -> {error, ClusterReason};
+        ok                     -> do_start_checked()
+    end.
+
+do_start_checked() ->
     %% Log the ACTUAL transport TLS posture. grpcbox reads its own
     %% {grpcbox, client|servers} config at boot and is the source of truth; the
     %% yuzu_gw `tls`/`tls_enabled` env is advisory only (nothing wires it into
@@ -268,7 +277,10 @@ apply_env_overrides() ->
         {"YUZU_GW_CB_MAX_RESET_TIMEOUT_MS", circuit_breaker_max_reset_timeout_ms, fun list_to_integer/1},
         %% HA WS-4 4.1 — trust-zone/region cluster id (ADR-2002 §7), stamped
         %% on every StreamStatusNotification (yuzu_gw_upstream:handle_cast/2).
-        {"YUZU_GW_CLUSTER_ID", cluster_id, fun list_to_binary/1},
+        %% A name with a non-ASCII character arrives as code points: converted
+        %% to UTF-8, not truncated (#4632). A value that cannot be converted is
+        %% left unset here and refused by check_cluster_id/0.
+        {"YUZU_GW_CLUSTER_ID", cluster_id, fun cluster_id_from_env/1},
         %% HA WS-4 #4555 — gateway cluster FORMATION config (ADR-2002 §7b).
         {"YUZU_GW_SEED_DNS_NAME", cluster_seed_dns_name, fun list_to_binary/1},
         %% Explicit peer list; when non-empty REPLACES DNS resolution outright
@@ -297,7 +309,7 @@ apply_env_overrides() ->
                     logger:info("ENV override: ~s = ~p", [EnvVar, Parsed])
                 catch
                     _:_ ->
-                        logger:warning("ENV override: ~s has invalid value '~s', ignoring",
+                        logger:warning("ENV override: ~s has invalid value '~ts', ignoring",
                                        [EnvVar, Value])
                 end
         end
@@ -331,6 +343,52 @@ apply_env_overrides() ->
 
     %% TLS cert overrides (these set the tls proplist)
     apply_tls_overrides().
+
+cluster_id_from_env(Value) ->
+    {ok, Bin} = yuzu_gw_env:utf8_binary(Value),
+    Bin.
+
+%% @private Fail-closed guard (#4632): refuse to boot if the cluster id cannot be
+%% represented as UTF-8. It is stamped on every stream-status notification as a
+%% protobuf string; a value the encoder rejects would fail every notification,
+%% and a notification that is the half_open probe would keep the breaker from
+%% closing. Refusing at boot is preferred over booting with a different id (the
+%% id pins agents to a trust zone) or one that silently loses every
+%% notification. The message names the source, never the value.
+-spec check_cluster_id() -> ok | {error, {invalid_cluster_id, env | app_env}}.
+check_cluster_id() ->
+    AppValue = application:get_env(yuzu_gw, cluster_id, <<"default">>),
+    case evaluate_cluster_id(AppValue, os:getenv("YUZU_GW_CLUSTER_ID")) of
+        {error, {invalid_cluster_id, Source} = Reason} ->
+            logger:critical(
+                "Refusing to start: the cluster id (~s) cannot be represented as UTF-8 "
+                "(a code point above 16#10FFFF, a surrogate, or bytes that are not "
+                "UTF-8). Set YUZU_GW_CLUSTER_ID, or cluster_id in sys.config, to a "
+                "name made of valid Unicode characters.",
+                [case Source of
+                     env     -> "YUZU_GW_CLUSTER_ID";
+                     app_env -> "the cluster_id application setting"
+                 end]),
+            {error, Reason};
+        ok ->
+            ok
+    end.
+
+%% @doc Pure policy of check_cluster_id/0 (exported for testing). When the
+%% environment variable is set it is what applies (the override replaces the
+%% setting), so only it is checked; otherwise the application setting is.
+-spec evaluate_cluster_id(term(), string() | false) ->
+          ok | {error, {invalid_cluster_id, env | app_env}}.
+evaluate_cluster_id(AppValue, false) ->
+    case yuzu_gw_env:utf8_binary(AppValue) of
+        {ok, _}  -> ok;
+        error    -> {error, {invalid_cluster_id, app_env}}
+    end;
+evaluate_cluster_id(_AppValue, EnvValue) ->
+    case yuzu_gw_env:utf8_binary(EnvValue) of
+        {ok, _}  -> ok;
+        error    -> {error, {invalid_cluster_id, env}}
+    end.
 
 apply_tls_overrides() ->
     Cert = os:getenv("YUZU_GW_TLS_CERTFILE"),
