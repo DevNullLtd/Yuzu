@@ -157,6 +157,11 @@ canonical list lives here. For broader auth/RBAC/crypto context, defer to the
   any subsequent boot where the table is non-empty), edits to the config
   file do NOT re-seed users — the dashboard (`POST /api/settings/users` for
   create, the role endpoint for role change) is the only live mutation path.
+  (0.14.x behaved differently: there `find_user_or_hydrate` served the
+  cfg-warmed `users_` cache before AuthDB, so a cfg rewrite plus restart
+  changed a password while `auth.users` kept the old hash. #5274 made the
+  lookup DB-first, so a cfg-only rotation made on 0.14.x reverts to the DB
+  hash after upgrade; `report_stale_cfg_credentials` warns about it at boot.)
   **A seed failure at boot MUST be fatal** (`main.cpp` already does this —
   do not weaken it to a warning): a boot that silently fails to seed leaves
   an operator locked out of a brand-new deployment with no diagnosis.

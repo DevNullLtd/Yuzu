@@ -80,6 +80,7 @@
 #include <sqlite3.h>
 
 #include <posix_dir_walk.hpp>
+#include <row_byte_budget.hpp>
 #include <yuzu/agent/scoped_fd.hpp>
 
 namespace yuzu::privacy_permissions {
@@ -228,11 +229,11 @@ bool sidecar_present(int dirfd, const std::string& name) {
 }
 
 /// The per-service query over one prepared statement. A read that hits a bound stops there with
-/// `cut` set and keeps what it had; `retained` counts the scrubbed client text kept by the source.
+/// `cut` set and keeps what it had; `source` counts the scrubbed client text kept by the source.
 std::vector<macos::TccServiceRead> read_services(sqlite3_stmt* stmt, Deadline& deadline,
                                                  std::size_t row_cap) {
     std::vector<macos::TccServiceRead> reads;
-    std::size_t retained = 0;
+    yuzu::shared::RowByteBudget source{.max_bytes = macos::kMaxSourceBytes};
     for (const auto& svc : macos::kTccServices) {
         macos::TccServiceRead read{svc.category, {}, false, false, {}};
         if (deadline.expired()) {
@@ -278,11 +279,10 @@ std::vector<macos::TccServiceRead> read_services(sqlite3_stmt* stmt, Deadline& d
                                                       sqlite3_column_bytes(stmt, 1)));
             std::replace(raw_text.begin(), raw_text.end(), '\0', '?');
             auto text = sanitize_utf8(raw_text);
-            if (retained + text.size() > macos::kMaxSourceBytes) {
+            if (!source.charge(text.size())) { // per-source bytes; non-sticky, as before
                 read.cut = macos::kCutByteCap;
                 break;
             }
-            retained += text.size();
             read.grants.push_back({std::move(text), auth_value});
         }
         macos::sort_grants(read.grants);

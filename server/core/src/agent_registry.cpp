@@ -2442,6 +2442,7 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
     int ota_signature_refusing = 0;
     int tar_db_corruption_agents = 0;               // #1567
     std::map<std::string, int64_t> plugin_init_failed; // #1567: plugin -> agents
+    int sync_skipping = 0; // #5332: agents whose installed_software daily sync is skipping
 
     for (const auto& [id, snap] : snapshots_) {
         ++healthy_count;
@@ -2527,6 +2528,16 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
         static const std::string kKeySparkQueuedDropped{kSparkTagQueuedDropped};
         static const std::string kKeySparkConsumerErrors{kSparkTagConsumerErrors};
         static const std::string kKeySparkDisabled{kSparkTagDisabled};
+
+        // #5332: agents whose daily-sync source is skipping (skip_streak > 0). Same
+        // digits-only/>0 rule as the tar total above; its 18-char cap vs the emitter's 6 is
+        // harmless - the value is only counted, never summed or labelled.
+        // One source today (the agent emitter, #5327, is generic over every registered sync
+        // source, but only installed_software sets skip_reason); make this a table when a
+        // second source emits skip_streak.
+        static const std::string kKeySyncSkip{"yuzu.sync.installed_software.skip_streak"};
+        if (parse_tar_corruption_total(get_view(kKeySyncSkip)))
+            ++sync_skipping;
 
         auto os_val = get("yuzu.os");
         if (!os_val.empty())
@@ -2861,6 +2872,11 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
     // lexicographic order, the remainder summed under plugin="other".
     metrics.gauge("yuzu_fleet_tar_db_corruption_agents")
         .set(static_cast<double>(tar_db_corruption_agents));
+    // #5332: published every sweep, 0 included (a server-owned count over the reporting
+    // population, like yuzu_fleet_tar_db_corruption_agents above), so the fixed label set
+    // needs no clear_gauge_family.
+    metrics.gauge("yuzu_fleet_inventory_sync_skipping", {{"source", "installed_software"}})
+        .set(static_cast<double>(sync_skipping));
     {
         constexpr std::size_t kMaxPluginLabels = 64;
         std::size_t n = 0;

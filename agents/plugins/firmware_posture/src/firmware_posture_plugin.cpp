@@ -45,7 +45,7 @@ const YuzuActionDescriptor kActionDescriptors[] = {
         {YUZU_SUPPORT_CONSTRAINED, 1,
          "IOKit IORegistryEntryFromPath IODeviceTree:/rom then IODeviceTree:/chosen, "
          "IORegistryEntryCreateCFProperty under ScopedIOObject/ScopedCFRef, plus sysctlbyname "
-         "hw.model",
+         "hw.model and hw.optional.arm64 (the Apple Silicon gate for the /rom lookup)",
          "verified on Apple Silicon only (Mac16,10, macOS 26.6.2): there IODeviceTree:/rom "
          "does not exist and the version is IODeviceTree:/chosen system-firmware-version "
          "(an iBoot tag such as mBoot-18000.161.10, not a BIOS date); the Intel /rom "
