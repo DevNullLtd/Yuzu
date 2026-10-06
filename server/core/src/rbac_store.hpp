@@ -65,6 +65,16 @@ namespace yuzu::server {
 
 class ManagementGroupStore; // forward declaration
 
+/// Error strings the `RbacStore` read accessors return in `std::unexpected` when the read
+/// cannot be answered. They are a CONTRACT with `authz::ceiling_degrade_reason`
+/// (authz_gates.cpp), which maps a failed ceiling read to a `yuzu_server_rbac_read_degrade_total`
+/// reason label by matching these prefixes: every producer and that mapping use these
+/// constants, never a re-typed literal. A failed query is `"query failed: "` followed by the
+/// libpq message and has no constant (it is the label mapping's fallthrough).
+inline constexpr std::string_view kRbacErrStoreNotOpen = "rbac store not open";
+inline constexpr std::string_view kRbacErrPoolAcquireTimeout = "pool acquire timeout";
+inline constexpr std::string_view kRbacErrCircuitBreakerOpen = "circuit breaker open";
+
 struct RbacRole {
     std::string name;
     std::string description;
@@ -576,7 +586,7 @@ public:
     /// `check_role_has_permission` and `authz::service_ceiling_check` both delegate here.
     /// The read goes through the same breaker and short acquire budget as the hot authz
     /// reads, so a degraded store fails fast instead of pinning a worker: the error is then
-    /// `"circuit breaker open"` or `"pool acquire timeout"` (both map to the
+    /// `kRbacErrCircuitBreakerOpen` or `kRbacErrPoolAcquireTimeout` (both map to the
     /// `pool_acquire_timeout` degrade label in `authz::ceiling_degrade_reason`), or
     /// `"query failed: ..."`.
     [[nodiscard]] std::expected<bool, std::string>
@@ -602,8 +612,8 @@ public:
 private:
     /// Breaker-gated, `kAuthzAcquireTimeout` variant of `get_role_permissions_checked` for
     /// request-path callers (`role_permission_allowed_checked`). Admin reads keep the
-    /// wider `get_role_permissions_checked` budget. Errors: `"rbac store not open"`,
-    /// `"circuit breaker open"`, `"pool acquire timeout"`, `"query failed: ..."`.
+    /// wider `get_role_permissions_checked` budget. Errors: `kRbacErrStoreNotOpen`,
+    /// `kRbacErrCircuitBreakerOpen`, `kRbacErrPoolAcquireTimeout`, `"query failed: ..."`.
     std::expected<std::vector<Permission>, std::string>
     get_role_permissions_authz_checked(const std::string& role_name) const;
 

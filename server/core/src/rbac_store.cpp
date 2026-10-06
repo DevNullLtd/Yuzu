@@ -1834,26 +1834,26 @@ select_role_permissions(PGconn* conn, const std::string& role_name) {
 std::expected<std::vector<Permission>, std::string>
 RbacStore::get_role_permissions_checked(const std::string& role_name) const {
     if (!open_)
-        return std::unexpected("rbac store not open");
+        return std::unexpected(std::string(kRbacErrStoreNotOpen));
     auto lease = pool_.try_acquire_for(kReadTimeout);
     if (!lease)
-        return std::unexpected("pool acquire timeout");
+        return std::unexpected(std::string(kRbacErrPoolAcquireTimeout));
     return select_role_permissions(lease.get(), role_name);
 }
 
 std::expected<std::vector<Permission>, std::string>
 RbacStore::get_role_permissions_authz_checked(const std::string& role_name) const {
     if (!open_)
-        return std::unexpected("rbac store not open");
+        return std::unexpected(std::string(kRbacErrStoreNotOpen));
     // Same contract as the hot authz reads (user_rbac_group_names / role_effects_for):
     // breaker-gated, short acquire budget, outcome fed back to the breaker. The degrade
     // metric is NOT bumped here; the gate that consumes the error owns the counter.
     if (!breaker_admit())
-        return std::unexpected("circuit breaker open");
+        return std::unexpected(std::string(kRbacErrCircuitBreakerOpen));
     auto lease = pool_.try_acquire_for(kAuthzAcquireTimeout);
     if (!lease) {
         breaker_note_result(false);
-        return std::unexpected("pool acquire timeout");
+        return std::unexpected(std::string(kRbacErrPoolAcquireTimeout));
     }
     auto result = select_role_permissions(lease.get(), role_name);
     breaker_note_result(result.has_value());
@@ -1863,10 +1863,10 @@ RbacStore::get_role_permissions_authz_checked(const std::string& role_name) cons
 std::expected<std::vector<Permission>, std::string>
 RbacStore::list_all_role_permissions_checked() const {
     if (!open_)
-        return std::unexpected("rbac store not open");
+        return std::unexpected(std::string(kRbacErrStoreNotOpen));
     auto lease = pool_.try_acquire_for(kReadTimeout);
     if (!lease)
-        return std::unexpected("pool acquire timeout");
+        return std::unexpected(std::string(kRbacErrPoolAcquireTimeout));
     pg::PgResult r = pg::exec_params(
         lease.get(),
         "SELECT role_name, securable_type, operation, effect FROM rbac_store.role_permissions "
@@ -2018,10 +2018,10 @@ std::expected<std::vector<PrincipalRole>, std::string>
 RbacStore::get_principal_roles_checked(const std::string& principal_type,
                                        const std::string& principal_id) const {
     if (!open_)
-        return std::unexpected("rbac store not open");
+        return std::unexpected(std::string(kRbacErrStoreNotOpen));
     auto lease = pool_.try_acquire_for(kReadTimeout);
     if (!lease)
-        return std::unexpected("pool acquire timeout");
+        return std::unexpected(std::string(kRbacErrPoolAcquireTimeout));
     pg::PgResult r = pg::exec_params(
         lease.get(),
         "SELECT principal_type, principal_id, role_name FROM rbac_store.principal_roles "
@@ -2038,7 +2038,7 @@ RbacStore::get_principal_roles_checked(const std::string& principal_type,
 std::expected<std::vector<PrincipalRole>, std::string>
 RbacStore::list_all_principal_roles_checked() const {
     if (!open_)
-        return std::unexpected("rbac store not open");
+        return std::unexpected(std::string(kRbacErrStoreNotOpen));
     auto lease = pool_.try_acquire_for(kReadTimeout);
     if (!lease) {
         // sre (Gate 6, governance round 2026-09-28): this read had no
@@ -2049,7 +2049,7 @@ RbacStore::list_all_principal_roles_checked() const {
         static DegradeSampler sampler;
         if (note_read_degrade(metrics_, kReasonPoolTimeout, sampler))
             spdlog::warn("RbacStore::list_all_principal_roles_checked: pool acquire timed out");
-        return std::unexpected("pool acquire timeout");
+        return std::unexpected(std::string(kRbacErrPoolAcquireTimeout));
     }
     pg::PgResult r = pg::exec_params(
         lease.get(),
@@ -2278,10 +2278,10 @@ std::vector<RbacGroup> RbacStore::list_groups() const {
 
 std::expected<std::vector<RbacGroup>, std::string> RbacStore::list_groups_checked() const {
     if (!open_)
-        return std::unexpected("rbac store not open");
+        return std::unexpected(std::string(kRbacErrStoreNotOpen));
     auto lease = pool_.try_acquire_for(kReadTimeout);
     if (!lease)
-        return std::unexpected("pool acquire timeout");
+        return std::unexpected(std::string(kRbacErrPoolAcquireTimeout));
     pg::PgResult r = pg::exec_params(
         lease.get(),
         "SELECT name, description, source, external_id, created_at FROM rbac_store.groups "
@@ -2864,7 +2864,7 @@ std::expected<std::vector<std::string>, std::string>
 RbacStore::user_rbac_group_names(const std::string& username) const {
     std::vector<std::string> groups;
     if (!open_)
-        return std::unexpected("rbac store not open");
+        return std::unexpected(std::string(kRbacErrStoreNotOpen));
     // Breaker-gated (#2703 Gate 7 item 1 commit B) — see check_permission's
     // pool-fallback gate for the shared rationale.
     if (!breaker_admit()) {
@@ -2877,7 +2877,7 @@ RbacStore::user_rbac_group_names(const std::string& username) const {
         if (note_read_degrade(metrics_, kReasonPoolTimeout, sampler))
             spdlog::warn(
                 "RbacStore::user_rbac_group_names: circuit breaker open — DENY without pool touch");
-        return std::unexpected("circuit breaker open");
+        return std::unexpected(std::string(kRbacErrCircuitBreakerOpen));
     }
     auto lease = pool_.try_acquire_for(kAuthzAcquireTimeout);
     if (!lease) {
@@ -2885,7 +2885,7 @@ RbacStore::user_rbac_group_names(const std::string& username) const {
         static DegradeSampler sampler;
         if (note_read_degrade(metrics_, kReasonPoolTimeout, sampler))
             spdlog::warn("RbacStore::user_rbac_group_names: pool acquire timed out — DENY");
-        return std::unexpected("pool acquire timeout");
+        return std::unexpected(std::string(kRbacErrPoolAcquireTimeout));
     }
     pg::PgResult r = pg::exec_params(
         lease.get(), "SELECT group_name FROM rbac_store.group_members WHERE username = $1",
@@ -2908,7 +2908,7 @@ std::expected<std::unordered_map<std::string, int>, std::string>
 RbacStore::role_effects_for(const std::string& securable_type, const std::string& operation) const {
     std::unordered_map<std::string, int> role_effect; // -1 deny (wins), 1 allow, 0 none
     if (!open_)
-        return std::unexpected("rbac store not open");
+        return std::unexpected(std::string(kRbacErrStoreNotOpen));
     // Breaker-gated (#2703 Gate 7 item 1 commit B) — see check_permission's
     // pool-fallback gate for the shared rationale.
     if (!breaker_admit()) {
@@ -2918,7 +2918,7 @@ RbacStore::role_effects_for(const std::string& securable_type, const std::string
         if (note_read_degrade(metrics_, kReasonPoolTimeout, sampler))
             spdlog::warn(
                 "RbacStore::role_effects_for: circuit breaker open — DENY without pool touch");
-        return std::unexpected("circuit breaker open");
+        return std::unexpected(std::string(kRbacErrCircuitBreakerOpen));
     }
     auto lease = pool_.try_acquire_for(kAuthzAcquireTimeout);
     if (!lease) {
@@ -2926,7 +2926,7 @@ RbacStore::role_effects_for(const std::string& securable_type, const std::string
         static DegradeSampler sampler;
         if (note_read_degrade(metrics_, kReasonPoolTimeout, sampler))
             spdlog::warn("RbacStore::role_effects_for: pool acquire timed out — DENY");
-        return std::unexpected("pool acquire timeout");
+        return std::unexpected(std::string(kRbacErrPoolAcquireTimeout));
     }
     pg::PgResult r = pg::exec_params(
         lease.get(),

@@ -61,23 +61,31 @@ namespace yuzu::server::authz {
 /// to a retryable 503 because it is an infrastructure fault, not a definitive deny.
 enum class CeilingVerdict : std::uint8_t { Admit, Deny, Degraded };
 
+/// The ceiling verdict and, for a Degraded verdict, the closed
+/// `yuzu_server_rbac_read_degrade_total` reason label, returned as ONE value so the two
+/// cannot be separated or read before they are set. `degrade_reason` points only at a
+/// string literal ("pool_acquire_timeout" or "query_error") and is `nullptr` for any
+/// verdict other than Degraded.
+struct CeilingResult {
+    CeilingVerdict verdict = CeilingVerdict::Deny;
+    const char* degrade_reason = nullptr;
+};
+
 /// THE one ITServiceOwner ceiling check (extend, never fork): a service-scoped token can
-/// never exceed what the ITServiceOwner role grants, whatever its minter holds. Same
-/// semantics as `RbacStore::check_role_has_permission("ITServiceOwner", ...)` (both
-/// delegate to `RbacStore::role_permission_allowed_checked`, the one row loop: first
-/// matching row decides, `allow` admits, `deny` or absent refuses) with the failed-read
-/// case separated out instead of folded into `false`. On Degraded, `degrade_reason` (if
-/// non-null) is set to a closed `yuzu_server_rbac_read_degrade_total` reason label
-/// ("pool_acquire_timeout" or "query_error"); the helper itself never touches metrics.
-[[nodiscard]] CeilingVerdict service_ceiling_check(const RbacStore& store,
-                                                   const std::string& securable_type,
-                                                   const std::string& operation,
-                                                   const char** degrade_reason = nullptr);
+/// never exceed what the ITServiceOwner role grants, whatever its minter holds. Both this
+/// and `RbacStore::role_permission_allowed_checked` use the one row loop: first matching
+/// row decides, `allow` admits, `deny` or absent refuses; the failed-read case is reported
+/// as Degraded (with its reason label) instead of being folded into a deny. The helper
+/// itself never touches metrics.
+[[nodiscard]] CeilingResult service_ceiling_check(const RbacStore& store,
+                                                  const std::string& securable_type,
+                                                  const std::string& operation);
 
 /// Closed `yuzu_server_rbac_read_degrade_total` reason label for a failed role-permission
-/// read: a message starting "pool acquire timeout" => "pool_acquire_timeout", anything else
-/// => "query_error". Pure (no metrics, no store); split out of `service_ceiling_check` so
-/// the mapping is unit-testable without a store that can be made to time out.
+/// read: a message starting `kRbacErrPoolAcquireTimeout` or `kRbacErrCircuitBreakerOpen`
+/// (rbac_store.hpp) => "pool_acquire_timeout", anything else => "query_error". Pure (no
+/// metrics, no store); split out of `service_ceiling_check` so the mapping is unit-testable
+/// without a store that can be made to time out.
 [[nodiscard]] const char* ceiling_degrade_reason(std::string_view read_error) noexcept;
 
 /// Why `require_fleet_read` did not produce a `ListAuthority`. This is

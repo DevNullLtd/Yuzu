@@ -4,6 +4,7 @@
 #include "authz_model.hpp"
 #include "authz_topology_floor.hpp" // #4031: topology_floor_applies — see this gate's floor-check block
 #include "mcp_policy.hpp" // mcp::tier_allows — #3290 Phase 2 caller-class parity with require_permission/require_list_read
+#include "rbac_store.hpp" // kRbacErr* — the store error strings ceiling_degrade_reason matches
 #include "rest_a4_envelope_http.hpp"
 #include "service_scope_policy.hpp" // authz::kServiceTagKey — #3289 single confinement-key definition
 
@@ -20,33 +21,28 @@ namespace yuzu::server {
 const char* authz::ceiling_degrade_reason(std::string_view read_error) noexcept {
     // Closed label set of yuzu_server_rbac_read_degrade_total for the ceiling read:
     // {pool_acquire_timeout, query_error}. The read is breaker-gated, so an open breaker
-    // ("circuit breaker open") is reported under the same label the hot authz path uses
-    // for it (pool_acquire_timeout), as is a pool acquire that timed out. Everything else
-    // is a query error. require_fleet_read pre-checks is_open() and never reaches here
-    // with a store that is not open. require_permission and require_scoped_permission do
-    // not pre-check it and pass no out-param, so a "rbac store not open" error there is
-    // never mapped to a label.
-    return (read_error.starts_with("pool acquire timeout") ||
-            read_error.starts_with("circuit breaker open"))
+    // (kRbacErrCircuitBreakerOpen) is reported under the same label the hot authz path uses
+    // for it (pool_acquire_timeout), as is a pool acquire that timed out
+    // (kRbacErrPoolAcquireTimeout). Everything else, including kRbacErrStoreNotOpen and a
+    // "query failed: ..." message, is a query error. The constants are the producers' own
+    // (rbac_store.hpp); never re-type their text here.
+    return (read_error.starts_with(kRbacErrPoolAcquireTimeout) ||
+            read_error.starts_with(kRbacErrCircuitBreakerOpen))
                ? "pool_acquire_timeout"
                : "query_error";
 }
 
-authz::CeilingVerdict authz::service_ceiling_check(const RbacStore& store,
-                                                   const std::string& securable_type,
-                                                   const std::string& operation,
-                                                   const char** degrade_reason) {
+authz::CeilingResult authz::service_ceiling_check(const RbacStore& store,
+                                                  const std::string& securable_type,
+                                                  const std::string& operation) {
     // The row loop lives in ONE place, RbacStore::role_permission_allowed_checked (first
     // row for the pair decides, `allow` admits, `deny` or an absent pair refuses). Only a
     // failed read is mapped differently here: reported as Degraded, not folded into a deny.
     auto allowed = store.role_permission_allowed_checked("ITServiceOwner", securable_type,
                                                          operation);
-    if (!allowed) {
-        if (degrade_reason)
-            *degrade_reason = ceiling_degrade_reason(allowed.error());
-        return CeilingVerdict::Degraded;
-    }
-    return *allowed ? CeilingVerdict::Admit : CeilingVerdict::Deny;
+    if (!allowed)
+        return CeilingResult{CeilingVerdict::Degraded, ceiling_degrade_reason(allowed.error())};
+    return CeilingResult{*allowed ? CeilingVerdict::Admit : CeilingVerdict::Deny, nullptr};
 }
 
 std::expected<authz::ListAuthority, authz::GateFailure>
@@ -225,14 +221,14 @@ AuthRoutes::require_fleet_read(const httplib::Request& req, httplib::Response& r
     // on the 403 (routed-concern clause 5): granting `perm` to the minter does not admit this
     // caller; only an ITServiceOwner grant does.
     if (!session->token_scope_service.empty()) {
-        const char* degrade_reason = "query_error";
-        const auto verdict = authz::service_ceiling_check(*rbac_store_, securable_type, operation,
-                                                          &degrade_reason);
+        const auto ceiling = authz::service_ceiling_check(*rbac_store_, securable_type, operation);
+        const auto verdict = ceiling.verdict;
         if (verdict == authz::CeilingVerdict::Degraded) {
             // The audit text deliberately does NOT say the role lacks the permission:
             // the read failed, the role's grants are unknown.
             if (auto* m = auth_mgr_.metrics_registry()) {
-                m->counter("yuzu_server_rbac_read_degrade_total", {{"reason", degrade_reason}})
+                m->counter("yuzu_server_rbac_read_degrade_total",
+                           {{"reason", ceiling.degrade_reason}})
                     .increment();
             }
             audit_log(req, "auth.fleet_read_required", "denied", "", "",

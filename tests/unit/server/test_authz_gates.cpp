@@ -1177,6 +1177,13 @@ TEST_CASE("ceiling read: a starved pool trips the authz breaker and every degrad
         auto ok = r.rbac.role_permission_allowed_checked("ITServiceOwner", "Response", "Read");
         REQUIRE(ok.has_value());
         CHECK(*ok);
+        // A non-Degraded verdict carries no reason label.
+        const auto admit = authz::service_ceiling_check(r.rbac, "Response", "Read");
+        CHECK(admit.verdict == authz::CeilingVerdict::Admit);
+        CHECK(admit.degrade_reason == nullptr);
+        const auto deny = authz::service_ceiling_check(r.rbac, "NoSuchSecurable", "Read");
+        CHECK(deny.verdict == authz::CeilingVerdict::Deny);
+        CHECK(deny.degrade_reason == nullptr);
     }
 
     // Starve the 4-connection pool.
@@ -1204,13 +1211,13 @@ TEST_CASE("ceiling read: a starved pool trips the authz breaker and every degrad
     REQUIRE_FALSE(e3.has_value());
     CHECK(e3.error() == "circuit breaker open");
 
-    // The helper forwards the reason out-param (a helper that ignored it would leave the
-    // caller's pre-set "query_error" in place).
+    // The helper returns the reason together with the verdict (a helper that dropped it, or
+    // hard-coded "query_error", would fail here).
     {
-        const char* reason = "query_error";
-        CHECK(authz::service_ceiling_check(r.rbac, "Response", "Read", &reason) ==
-              authz::CeilingVerdict::Degraded);
-        CHECK(std::string_view{reason} == "pool_acquire_timeout");
+        const auto ceiling = authz::service_ceiling_check(r.rbac, "Response", "Read");
+        CHECK(ceiling.verdict == authz::CeilingVerdict::Degraded);
+        REQUIRE(ceiling.degrade_reason != nullptr);
+        CHECK(std::string_view{ceiling.degrade_reason} == "pool_acquire_timeout");
     }
 
     // The real gate: 503 retryable, no `.permission`, counted under the pool label only.

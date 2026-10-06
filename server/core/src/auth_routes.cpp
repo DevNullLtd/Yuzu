@@ -763,7 +763,7 @@ bool AuthRoutes::require_permission(const httplib::Request& req, httplib::Respon
         // maps to the SAME 403 as Deny here: this gate's documented fail-closed contract holds
         // (require_fleet_read alone reports Degraded as a retryable 503 and bumps
         // yuzu_server_rbac_read_degrade_total for it; this gate records neither).
-        if (authz::service_ceiling_check(*rbac_store_, securable_type, operation) !=
+        if (authz::service_ceiling_check(*rbac_store_, securable_type, operation).verdict !=
             authz::CeilingVerdict::Admit) {
             audit_log(req, "auth.permission_required", "denied", "", "",
                       "service-scoped token blocked: lacks ITServiceOwner permission");
@@ -1102,7 +1102,7 @@ bool AuthRoutes::require_scoped_permission(const httplib::Request& req, httplib:
         // maps to the SAME 403 as Deny here: this gate's documented fail-closed contract holds
         // (require_fleet_read alone reports Degraded as a retryable 503 and bumps
         // yuzu_server_rbac_read_degrade_total for it; this gate records neither).
-        if (authz::service_ceiling_check(*rbac_store_, securable_type, operation) !=
+        if (authz::service_ceiling_check(*rbac_store_, securable_type, operation).verdict !=
             authz::CeilingVerdict::Admit) {
             audit_log(req, "auth.scoped_permission_required", "denied", "", "",
                       "service-scoped token blocked: lacks ITServiceOwner permission");
