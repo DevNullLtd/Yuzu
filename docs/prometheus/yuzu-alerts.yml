@@ -178,12 +178,18 @@ groups:
       # malformed Register from an
       # unauthenticated peer, or one oversized daily-sync batch, counts once and
       # must not warn; a systematic encoder fault (every Register failing)
-      # reaches 10 quickly. A determined peer can also reach 10 in 10m, which is
-      # a flood worth a warning. Read the rate, not the existence.
+      # reaches 10 on a gateway fronting about 5 or more agents (one agent
+      # retries about 2.3 times per 10m at its steady 256 s backoff). A small
+      # gateway, or a low-rate RPC (inventory, notify_stream, guardian: the
+      # series is per rpc_name, there is no sum), can fault without reaching it:
+      # for those use the log line "Upstream RPC ... raised" and
+      # yuzu_gw_agents_current. A determined peer can also reach 10 in 10m, which
+      # is a flood worth a warning. Read the rate, not the existence.
       # increase() extrapolates to the window edges, so on a counter already
-      # above zero a burst of nine inside one 10m window reads as 10 and fires
-      # (pinned in the promtool cases); on the pre-seeded zero baseline nine stay
-      # quiet. Treat the threshold as "about ten", not "exactly ten".
+      # above zero a burst of nine inside one 10m window can read as 10 and fire.
+      # The promtool cases pin this at their 1m sample spacing; at the shipped
+      # 15 s scrape interval nine reads about 9.2 and stays quiet. Treat the
+      # threshold as "about ten", not "exactly ten".
       - alert: YuzuGatewayUpstreamEncodeErrors
         expr: |
           increase(yuzu_gw_upstream_rpc_errors_total{code="encode"}[10m]) >= 10

@@ -2403,7 +2403,7 @@ env keys with defaults, which a reverted build ignores.
   `YuzuGatewayUpstreamErrors` alert (rate above 0.1 errors per second, no `code`
   filter) covers it only above that rate, so `YuzuGatewayUpstreamEncodeErrors`
   (about ten increases of `code="encode"` in 10 minutes, `increase()` being
-  extrapolated, so one malformed request stays quiet) is the alert for this case. The `encode` series is pre-seeded to 0
+  extrapolated, so one malformed request stays quiet) is the alert for this case. It is per `rpc_name` with no sum and needs about one encode a minute, which a Register fault reaches on a gateway fronting about five or more agents; a small gateway, or an encode fault only on `inventory`, `notify_stream` or `guardian`, can stay under it, and for those the `Upstream RPC ... raised` log line and `yuzu_gw_agents_current` are the signals. The `encode` series is pre-seeded to 0
   for `register`, `inventory`, `notify_stream` and `guardian`, and `exception` for
   those four plus `batch_heartbeat`; a marshal failure on the heartbeat buffer's
   flush is counted as `code="exception"` and is not covered by the encode alert.

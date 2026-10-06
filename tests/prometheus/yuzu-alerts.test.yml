@@ -3089,7 +3089,9 @@ tests:
   # not extrapolate (the first sample is 0). On a counter already at 5, a burst of
   # nine (5 -> 14) is extrapolated by 10m / 9m and reads as 10, so it FIRES; a
   # burst of eight reads as 8.9 and stays quiet. This pins the threshold as it
-  # really behaves: about ten, not exactly ten.
+  # really behaves: about ten, not exactly ten. This holds at the 1m sample
+  # spacing used here; at the shipped 15 s scrape interval nine reads about 9.2
+  # and stays quiet.
   - interval: 1m
     name: gateway upstream encode errors - on a non-zero counter nine extrapolate to the threshold and eight do not
     input_series:
