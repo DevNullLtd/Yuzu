@@ -423,9 +423,11 @@ Mechanics:
 - Collection is a new `installed_apps` action **`list_inventory`** (13-token
   `inv|` rows); the operator-facing `list`/`query`/`list_per_user` output is a
   stable contract whose fields this ADR left byte-unchanged (rpm `list` keeps
-  VENDOR). On Windows, `get_installed_apps_windows()` feeds `list`, `query` AND
-  the hashed `inv|` rows, so any change to it must be checked against the
-  hashed rows. *Amended 2026-09-21:* `list` gained two trailing columns
+  VENDOR). On Windows, `get_installed_apps_windows()` feeds `list` and `query`, and
+  the hashed `inv|` rows come from the registry walk
+  (`reg_walk::collect_uninstall_apps`), so a change to either must be checked
+  against the hashed rows. *Amended 2026-10-06:* the hashed rows moved off
+  `get_installed_apps_windows()` onto the registry walk. *Amended 2026-09-21:* `list` gained two trailing columns
   (`install_location`, `bundle_id`) under ADR-0028's binding condition. Its
   `app` tag, `name`, `version`, `publisher` and `install_date` keep their
   position and value for every real value; every `list` field is now
