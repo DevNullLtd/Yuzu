@@ -85,7 +85,7 @@ The following features are documented within the files listed above:
 
 > **Note:** macOS Intel (x64) builds are not currently produced or tested. Only Apple Silicon (ARM64) Macs running macOS 14+ are supported. If you require macOS Intel support, please open an issue.
 
-### Linux native packages: minimum distribution (0.14.0)
+### Linux native packages: minimum distribution (0.14.x)
 
 The Linux binaries in the `.deb`, `.rpm` and tarball releases are built with GCC 15 and link
 the system C and C++ runtimes dynamically, so they need a recent distribution. Measured on
