@@ -10,6 +10,8 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <string>
+#include <unordered_set>
+#include <vector>
 
 using namespace yuzu::server::plugin_config;
 
@@ -270,4 +272,57 @@ TEST_CASE("#3265: every system_reserved dispatch capability's (plugin, action) i
         INFO("plugin=" << cap.plugin << " action=" << cap.action);
         CHECK(parse_kill_switch_scope(cap.plugin, cap.action).has_value());
     }
+}
+
+// ── #5294: per-OS kill-switch scope + resolver ───────────────────────────
+
+TEST_CASE("is_valid_agent_os / parse_kill_switch_scope: os is the closed set windows|linux|darwin",
+          "[plugin_config][parsers][killswitch]") {
+    for (const char* ok : {"windows", "linux", "darwin"}) {
+        CHECK(is_valid_agent_os(ok));
+        auto s = parse_kill_switch_scope("email", "send", ok);
+        REQUIRE(s.has_value());
+        CHECK(s->os == ok);
+    }
+    for (const std::string bad :
+         {std::string("Windows"), std::string("macos"), std::string("windwos"),
+          std::string("win-dows"), std::string("@"), std::string(65, 'a')}) {
+        CHECK_FALSE(is_valid_agent_os(bad));
+        CHECK_FALSE(parse_kill_switch_scope("email", "", bad).has_value());
+    }
+    CHECK(parse_kill_switch_scope("email", "", "").has_value()); // empty = all OSes
+    // The os grammar is independent of the plugin grammar.
+    CHECK(parse_kill_switch_scope("__guard__", "", "windows").has_value());
+}
+
+TEST_CASE("kill_switch_scope_key appends @<os> and never collides with an identifier key",
+          "[plugin_config][parsers][killswitch]") {
+    CHECK(kill_switch_scope_key({"p", "", ""}) == "p");
+    CHECK(kill_switch_scope_key({"p", "a", ""}) == "p.a");
+    CHECK(kill_switch_scope_key({"p", "", "windows"}) == "p@windows");
+    CHECK(kill_switch_scope_key({"p", "a", "windows"}) == "p.a@windows");
+    CHECK_FALSE(is_valid_identifier("p@windows"));
+}
+
+TEST_CASE("resolve_kill_switch: base layer ANDed with the per-OS layer",
+          "[plugin_config][parsers][killswitch]") {
+    using Rows = std::vector<KillSwitchRowView>;
+    using Set = std::unordered_set<std::string>;
+    const auto resolve = [](std::string_view action, const Rows& rows) {
+        return resolve_kill_switch(action, rows);
+    };
+
+    CHECK(resolve("a", {}) == Set{});
+    // plugin row OFF -> killed for everyone.
+    CHECK_FALSE(resolve("a", {{"", "", false}}).has_value());
+    // action row ON over plugin row OFF -> existing override preserved.
+    CHECK(resolve("a", {{"", "", false}, {"a", "", true}}) == Set{});
+    // plugin ON + plugin@windows OFF -> windows withheld.
+    CHECK(resolve("a", {{"", "", true}, {"", "windows", false}}) == Set{"windows"});
+    // action@windows ON beats plugin@windows OFF inside the OS layer.
+    CHECK(resolve("a", {{"", "windows", false}, {"a", "windows", true}}) == Set{});
+    // per-OS ON never widens an OFF plugin row.
+    CHECK_FALSE(resolve("a", {{"", "", false}, {"", "windows", true}}).has_value());
+    // rows for a different action are ignored.
+    CHECK(resolve("a", {{"b", "", false}, {"b", "linux", false}}) == Set{});
 }

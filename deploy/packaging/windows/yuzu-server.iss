@@ -4,11 +4,28 @@
 ;
 ; Silent parameters:
 ;   /ADMIN_USER=name       Admin username (required on a fresh install)
-;   /ADMIN_PASS=pass       Admin password (min 12 chars). On an upgrade, leave out
-;                          /ADMIN_USER, /ADMIN_PASS and the operator pair to keep
-;                          the existing accounts.
-;   /OPERATOR_USER=name    Operator username (optional; only with /ADMIN_PASS)
-;   /OPERATOR_PASS=pass    Operator password (required with /OPERATOR_USER, min 12 chars)
+;   /ADMIN_PASS=pass       Admin password, FRESH INSTALL ONLY: at least 12
+;                          characters and at most 1024 bytes as UTF-8 (a
+;                          character outside ASCII takes 2 to 4 bytes). It is
+;                          written to yuzu-server.cfg, which only SEEDS the first
+;                          administrator into an EMPTY auth database (#5274); on
+;                          an existing database the stored password wins and a
+;                          rewritten file would be ignored.
+;                          ON AN UPGRADE (yuzu-server.cfg already exists) leave
+;                          out /ADMIN_USER, /ADMIN_PASS and the operator pair:
+;                          the existing accounts are kept, and a non-empty
+;                          /ADMIN_PASS= or /OPERATOR_PASS= is REFUSED with exit
+;                          code 11 before anything changes. Change or reset a
+;                          password in the dashboard (Settings > User Management
+;                          > Change password / Reset password), or follow
+;                          docs/ops-runbooks/auth-db-recovery.md.
+;   /OPERATOR_USER=name    Operator username (optional; only with /ADMIN_PASS).
+;                          On a PostgreSQL auth store (every supported
+;                          deployment) this account is not provisioned and
+;                          cannot sign in today (#5343); create further
+;                          accounts in Settings > User Management instead.
+;   /OPERATOR_PASS=pass    Operator password (required with /OPERATOR_USER; same
+;                          length rules; fresh install only)
 ;   /POSTGRES_DSN_FILE=f   File holding the PostgreSQL connection string. One of
 ;                          this or /POSTGRES_DSN is required on a fresh install and
 ;                          on an upgrade from any earlier version (none stored one),
@@ -41,7 +58,11 @@
 ; the abort came before the old directory was moved (it is then restarted). 10
 ; the files were installed but the service could not be registered or its
 ; command line could not be written and confirmed; Setup disables the service
-; if it can, and says whether it did.
+; if it can, and says whether it did. 11 an upgrade (yuzu-server.cfg already
+; exists) was given a non-empty /ADMIN_PASS= or /OPERATOR_PASS=, which can no
+; longer change a stored password (#5274); nothing was stopped or changed, and
+; the reason is in the setup log on a line starting "InitializeSetup:".
+; (Inno Setup's own exit codes are 0-8.)
 ;
 ; THE SETUP LOG RECORDS THE FULL COMMAND LINE, including any /ADMIN_PASS=,
 ; /OPERATOR_PASS=, /POSTGRES_DSN= or /OIDC_CLIENT_SECRET= value. Prefer the
@@ -220,6 +241,83 @@ begin
                 (Pos(#0 + Uppercase(Name) + '=', Uppercase(V)) > 0);
 end;
 
+// ── Password rules and the upgrade refusal (#5274, #5342) ────────────────
+
+// The UTF-8 encoded length of S in bytes: the unit the server's password policy
+// measures (at most 1024 bytes, server/core/src/password_policy.hpp), and what
+// generate-config.ps1 hashes. Length() counts UTF-16 code units, so each half
+// of a surrogate pair (one character, 4 bytes in UTF-8) counts 2 here.
+function Utf8ByteLength(const S: string): Integer;
+var
+  I, C: Integer;
+begin
+  Result := 0;
+  for I := 1 to Length(S) do
+  begin
+    C := Ord(S[I]);
+    if C < $80 then
+      Result := Result + 1
+    else if C < $800 then
+      Result := Result + 2
+    else if (C >= $D800) and (C <= $DFFF) then
+      Result := Result + 2
+    else
+      Result := Result + 3;
+  end;
+end;
+
+const
+  MaxPasswordBytes = 1024;
+  // Inno Setup's own exit codes are 0-8; 7 and 10 carry this installer's
+  // meanings (see the header).
+  UpgradePasswordExitCode = 11;
+
+// True when this is an upgrade that keeps the existing accounts: a
+// yuzu-server.cfg is already in the data directory. The same test the wizard
+// and PrepareToInstall use for "there is an existing configuration to keep".
+function ExistingConfig: Boolean;
+begin
+  Result := FileExists(ExpandConstant('{commonappdata}\Yuzu Server\yuzu-server.cfg'));
+end;
+
+procedure ExitProcess(uExitCode: Cardinal);
+  external 'ExitProcess@kernel32.dll stdcall';
+
+// Since #5274 yuzu-server.cfg only SEEDS the first administrator into an
+// empty auth database; on an existing one the stored password wins and a
+// rewritten file is ignored. A new /ADMIN_PASS= or /OPERATOR_PASS= on an
+// upgrade would therefore be dropped without a word -- and a password rotated
+// because it leaked would stay valid. Refused here, before the wizard, before
+// the service is stopped and before anything is written, with its own exit
+// code (11) so an unattended deployment can tell it apart from code 7.
+// Inno Setup has no way to return a custom code from a refusal (its
+// GetCustomSetupExitCode runs only after a successful install), hence
+// ExitProcess: the setup log keeps the "InitializeSetup:" line, but Setup's
+// own temporary folder is left behind in %TEMP%.
+function InitializeSetup(): Boolean;
+var
+  Refusal: string;
+begin
+  Result := True;
+  if ExistingConfig and ((GetCmdParam('ADMIN_PASS') <> '') or (GetCmdParam('OPERATOR_PASS') <> '')) then
+  begin
+    Refusal := 'This is an upgrade (yuzu-server.cfg already exists), and /ADMIN_PASS= or ' +
+               '/OPERATOR_PASS= was given. The installer can no longer change a stored ' +
+               'password: the configuration file only seeds the first administrator into an ' +
+               'empty database, so the new password would be ignored and the old one would ' +
+               'stay valid. Run the installer again without /ADMIN_USER=, /ADMIN_PASS=, ' +
+               '/OPERATOR_USER= and /OPERATOR_PASS= (the existing accounts are kept), then ' +
+               'change or reset the password in the dashboard (Settings > User Management > ' +
+               'Change password / Reset password), or follow ' +
+               'docs/ops-runbooks/auth-db-recovery.md if no administrator can sign in.' + #13#10#13#10 +
+               'Nothing has been changed.';
+    Log('InitializeSetup: ' + Refusal);
+    SuppressibleMsgBox(Refusal, mbCriticalError, MB_OK, IDOK);
+    ExitProcess(UpgradePasswordExitCode);
+    Result := False;
+  end;
+end;
+
 // ── File browse helper ───────────────────────────────────────────────────
 function BrowsePEM(const Title: string): string;
 var
@@ -369,10 +467,11 @@ begin
     'Administrator Account',
     'Create the admin account for the Yuzu dashboard.',
     'The admin has full access to all server features including user management, ' +
-    'policy deployment, and agent commands. When upgrading, leave the password blank ' +
-    'to keep the existing accounts.');
+    'policy deployment, and agent commands. This page appears on a fresh install only: ' +
+    'an upgrade keeps the existing accounts, and passwords are changed in the dashboard ' +
+    '(Settings > User Management).');
   AdminPage.Add('Username:', False);
-  AdminPage.Add('Password (minimum 12 characters):', True);
+  AdminPage.Add('Password (at least 12 characters, at most 1024 bytes):', True);
   AdminPage.Add('Confirm password:', True);
   AdminPage.Values[0] := GetCmdParam('ADMIN_USER');
   if AdminPage.Values[0] = '' then AdminPage.Values[0] := 'admin';
@@ -386,7 +485,7 @@ begin
     'Operators can view fleet status, query responses, and monitor compliance ' +
     'but cannot execute instructions or change settings. Leave the username blank to skip.');
   OperatorPage.Add('Username:', False);
-  OperatorPage.Add('Password (minimum 12 characters):', True);
+  OperatorPage.Add('Password (at least 12 characters, at most 1024 bytes):', True);
   OperatorPage.Add('Confirm password:', True);
   OperatorPage.Values[0] := GetCmdParam('OPERATOR_USER');
   OperatorPage.Values[1] := GetCmdParam('OPERATOR_PASS');
@@ -544,12 +643,17 @@ begin
       Result := False;
       Exit;
     end;
-    if (AdminPage.Values[1] = '') and (AdminPage.Values[2] = '') and
-       FileExists(ExpandConstant('{commonappdata}\Yuzu Server\yuzu-server.cfg')) then
-      Exit;  // keep the existing accounts
+    // (On an upgrade this page is skipped: see ShouldSkipPage.)
     if Length(AdminPage.Values[1]) < 12 then
     begin
       MsgBox('Admin password must be at least 12 characters.', mbError, MB_OK);
+      Result := False;
+      Exit;
+    end;
+    if Utf8ByteLength(AdminPage.Values[1]) > MaxPasswordBytes then
+    begin
+      MsgBox('Admin password must be at most 1024 bytes as UTF-8 (a character outside ' +
+             'ASCII takes 2 to 4 bytes).', mbError, MB_OK);
       Result := False;
       Exit;
     end;
@@ -576,6 +680,13 @@ begin
       if Length(OperatorPage.Values[1]) < 12 then
       begin
         MsgBox('Operator password must be at least 12 characters.', mbError, MB_OK);
+        Result := False;
+        Exit;
+      end;
+      if Utf8ByteLength(OperatorPage.Values[1]) > MaxPasswordBytes then
+      begin
+        MsgBox('Operator password must be at most 1024 bytes as UTF-8 (a character outside ' +
+               'ASCII takes 2 to 4 bytes).', mbError, MB_OK);
         Result := False;
         Exit;
       end;
@@ -642,6 +753,10 @@ end;
 function ShouldSkipPage(PageID: Integer): Boolean;
 begin
   Result := False;
+  // An upgrade keeps the existing accounts: the installer cannot change a
+  // stored password (#5274), so the credential pages are not offered.
+  if ((PageID = AdminPage.ID) or (PageID = OperatorPage.ID)) and ExistingConfig then
+    Result := True;
   if WizardSilent then
   begin
     if (PageID = AdminPage.ID) or (PageID = OperatorPage.ID) or
@@ -821,7 +936,7 @@ begin
     Result := #13#10#13#10 + 'The Yuzu Server service has been stopped and DISABLED (see above).'
   else if StoppedRunningService then
     Result := #13#10#13#10 + 'The existing Yuzu Server service was stopped and has not been ' +
-              'restarted. It will start again at the next reboot, or run: sc start YuzuServer';
+              'restarted. It will start again at the next reboot, or run: sc.exe start YuzuServer';
 end;
 
 // The operator-facing refusal for a directory that is not, or could not be
@@ -1350,6 +1465,8 @@ begin
       Result := 'An admin username is required (/ADMIN_USER=), without '':'' or control characters.'
     else if Length(Inp.AdminPass) < 12 then
       Result := 'The admin password (/ADMIN_PASS=) must be at least 12 characters.'
+    else if Utf8ByteLength(Inp.AdminPass) > MaxPasswordBytes then
+      Result := 'The admin password (/ADMIN_PASS=) must be at most 1024 bytes as UTF-8.'
     else if Inp.OpUser <> '' then
     begin
       if BadUsername(Inp.OpUser) then
@@ -1357,7 +1474,9 @@ begin
       else if CompareText(Inp.OpUser, Inp.AdminUser) = 0 then
         Result := 'The operator username must differ from the admin username.'
       else if Length(Inp.OpPass) < 12 then
-        Result := 'The operator password (/OPERATOR_PASS=) must be at least 12 characters.';
+        Result := 'The operator password (/OPERATOR_PASS=) must be at least 12 characters.'
+      else if Utf8ByteLength(Inp.OpPass) > MaxPasswordBytes then
+        Result := 'The operator password (/OPERATOR_PASS=) must be at most 1024 bytes as UTF-8.';
     end;
   end
   else if WizardSilent and (Inp.AdminUser <> '') then
@@ -1569,7 +1688,7 @@ begin
         Got := 'The service has been disabled rather than left to run with an old command line.'
       else
         Got := 'The service could NOT be disabled (or is not registered): if it exists, disable ' +
-               'it yourself (sc config YuzuServer start= disabled) until this is fixed.';
+               'it yourself (sc.exe config YuzuServer start= disabled) until this is fixed.';
       Log('CurStepChanged: the YuzuServer service could not be registered, or its command line ' +
           'could not be written and confirmed (security software may have blocked the change). ' +
           Got + ' Setup exits with code 10.');
@@ -1976,7 +2095,7 @@ begin
             Result := Result + ' The old directory could not be put back either: it is now ' +
                       Aside + '. Something else created ' + DataDir + ' in the meantime -- ' +
                       'inspect it. The YuzuServer service has been DISABLED so that it cannot ' +
-                      'start over that directory; re-enable it (sc config YuzuServer start= auto) ' +
+                      'start over that directory; re-enable it (sc.exe config YuzuServer start= auto) ' +
                       'only after moving the old directory back or running the installer again.';
           end;
         end;

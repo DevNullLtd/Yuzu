@@ -696,6 +696,13 @@ bool AgentRegistry::send_to(const std::string& agent_id, const ClassifiedCommand
         auto it = agents_.find(agent_id);
         if (it == agents_.end())
             return false;
+        // #5294: a per-OS kill-switch OFF row is enforced here, at send time,
+        // so every local-session caller (including send_system_reserved) is
+        // covered and a session registered after the dispatch-time snapshot
+        // is still withheld. The set holds only validated windows|linux|darwin
+        // literals, so an empty/unknown session OS never matches.
+        if (cmd.kill_switched_os().contains(it->second->os))
+            return false;
         session = it->second;
     }
     if (!tag_is_valid(cmd.wire(), metrics_, agent_id))
@@ -746,6 +753,9 @@ int AgentRegistry::send_to_all(const ClassifiedCommand& cmd) {
         return 0;
     int count = 0;
     for (auto& s : snapshot) {
+        // #5294: mirror send_to()'s send-time per-OS enforcement.
+        if (cmd.kill_switched_os().contains(s->os))
+            continue;
         std::lock_guard slock(s->stream_mu);
         // #1004: mirror send_to() — gateway-pending path wins over any
         // Subscribe stream the gateway may also hold for the agent.
@@ -856,6 +866,10 @@ const std::unordered_map<std::string, std::string>& AgentRegistry::action_descri
          "read-only, no subprocess; "
          "other package families are not read, so an empty result on them is not evidence of no "
          "sources"},
+        {"mgmt_posture.posture",
+         "Management-plane posture, facts only: which plane controls the device (none/ad/ipa on "
+         "Linux from sssd/ipa configuration as written), MDM enrolment on macOS; a refused read is "
+         "reported as permission_denied, never as not-joined; read-only, one bounded argv on macOS"},
         // status
         {"status.version", "Agent version, build number, and git commit hash"},
         {"status.info", "Platform OS, architecture, and hostname"},
@@ -1606,6 +1620,28 @@ std::unordered_set<std::string> AgentRegistry::ids_missing_plugin(std::string_vi
     return missing;
 }
 
+std::expected<std::unordered_set<std::string>, PresenceReadError>
+AgentRegistry::ids_with_os(const std::unordered_set<std::string>& os_values) const {
+    std::unordered_set<std::string> out;
+    if (os_values.empty())
+        return out;
+    // live_presence() runs OFF mu_ (same discipline as all_ids / evaluate_scope).
+    auto presence = live_presence();
+    if (!presence)
+        return std::unexpected(presence.error());
+    std::lock_guard lock(mu_);
+    for (const auto& [id, s] : agents_) {
+        if (!s->os.empty() && os_values.contains(s->os))
+            out.insert(id);
+    }
+    for (const auto& p : *presence) {
+        // Local wins: a session on this replica is judged by its own os.
+        if (!agents_.contains(p.agent_id) && !p.os.empty() && os_values.contains(p.os))
+            out.insert(p.agent_id);
+    }
+    return out;
+}
+
 // Collect every from_result_set:<id> reference in a scope expression so the
 // resolver can preload owner-checked membership once per set. The scope AST is
 // a variant of Condition | Combinator (scope_engine.hpp); walk it recursively.
@@ -2170,12 +2206,20 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
     for (const auto& m : kGuardianJournalAgeMetrics)
         metrics.clear_gauge_family(m.gauge);
     // Guardian M1 health-stream telemetry (#2298 gate 3, item 6d; #2993 added a 4th
-    // family, #4783 added the 5th/6th/7th - legacy-sink loss visibility) - same
+    // family, #4783 added the 5th/6th/7th - legacy-sink loss visibility; #5403, #4472 and
+    // #5404 added the Spark rows; kGuardianHealthMetrics is authoritative for the set) - same
     // absent-not-zero rule and same reason it bites hardest here: the writer is
-    // sparse, so a healthy fleet must see all 7 families ABSENT, never a fabricated
-    // 0; an inert (prefer_spark off) fleet still reports the 3 legacy_sink_* families
-    // live (they don't depend on the Spark flip - see guardian_health_fleet_tags.hpp).
+    // sparse, so a healthy fleet must see every family ABSENT, never a fabricated
+    // 0. The 3 legacy_sink_* families do not depend on the Spark flip (prefer_spark),
+    // so they are live on an inert fleet but still sparse: absent while they read 0
+    // (see guardian_health_fleet_tags.hpp).
     for (const auto& m : kGuardianHealthMetrics)
+        metrics.clear_gauge_family(m.gauge);
+    // #5403, #4472: the Spark claim AGE family (MAX): the pending-Disarm age and the
+    // outstanding-compensation age. Same rule: the writer emits each tag only while one
+    // Disarm (or one compensating teardown) is pending, so a fleet with none pending must read
+    // ABSENT, and a stale series from a sweep that did have one must not outlive it.
+    for (const auto& m : kGuardianHealthAgeMetrics)
         metrics.clear_gauge_family(m.gauge);
     // rung 9c PR-3: the arm-ledger re-statable-gauge pair (Decision 1) and the
     // io-ceiling monitor-only counter (Decision 3, Option B). Same absent-not-
@@ -2366,6 +2410,20 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
         std::array<std::string, kNGuardianHealthMetrics> keys;
         for (std::size_t i = 0; i < kNGuardianHealthMetrics; ++i)
             keys[i] = kGuardianHealthMetrics[i].tag;
+        return keys;
+    }();
+    // #5403, #4472: the health family's AGE rows (kGuardianHealthAgeMetrics) accumulate as
+    // MAX, never SUM, exactly like the journal age family (gja_max): a sum of ages is
+    // meaningless and the question is "how long has the worst endpoint's Disarm (or
+    // compensating teardown) been pending". `reported` gates publish, so
+    // MAX over an empty set is absence, never a fabricated 0.
+    std::array<double, kNGuardianHealthAgeMetrics> gha_max{};
+    std::array<bool, kNGuardianHealthAgeMetrics> gha_reported{};
+    // Same static-destruction-safety rationale as gj_keys above.
+    static const std::array<std::string, kNGuardianHealthAgeMetrics> gha_keys = [] {
+        std::array<std::string, kNGuardianHealthAgeMetrics> keys;
+        for (std::size_t i = 0; i < kNGuardianHealthAgeMetrics; ++i)
+            keys[i] = kGuardianHealthAgeMetrics[i].tag;
         return keys;
     }();
     // `yuzu.os` is an agent-CONTROLLED heartbeat tag; using it raw as a metric
@@ -2731,6 +2789,24 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
         }
         if (health_reported_any)
             ++gh_reporting;
+        // #5403, #4472: the claim ages (pending Disarm, outstanding compensation), MAX
+        // accumulate. Same parse and the same
+        // reject-not-clamp posture as the journal age family: a forged value above the
+        // plausibility ceiling is counted in gh_tag_rejected, never allowed to own the
+        // fleet MAX. DELIBERATELY not fed into health_reported_any/gh_reporting: that
+        // meta-gauge's documented meaning is the counter family's coverage. An absent tag
+        // is skipped and does not contend.
+        for (std::size_t i = 0; i < kNGuardianHealthAgeMetrics; ++i) {
+            const auto raw = get_view(gha_keys[i]);
+            if (raw.empty())
+                continue;
+            if (auto v = parse_guardian_health_count(raw)) {
+                gha_max[i] = std::max(gha_max[i], *v);
+                gha_reported[i] = true;
+            } else {
+                ++gh_tag_rejected;
+            }
+        }
 
         // rung 9c PR-3 (Decision 1): arm-ledger pair. Same absent-vs-rejected
         // split as every family above - an empty view means this agent did not
@@ -2963,6 +3039,10 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
     for (std::size_t i = 0; i < kNGuardianHealthMetrics; ++i)
         if (gh_reported[i])
             metrics.gauge(kGuardianHealthMetrics[i].gauge).set(gh_sum[i]);
+    // #5403, #4472: the AGE rows' fleet MAX, same absent-when-unreported rule.
+    for (std::size_t i = 0; i < kNGuardianHealthAgeMetrics; ++i)
+        if (gha_reported[i])
+            metrics.gauge(kGuardianHealthAgeMetrics[i].gauge).set(gha_max[i]);
     metrics.gauge(kGuardianHealthReportingGauge).set(static_cast<double>(gh_reporting));
     metrics.gauge(kGuardianHealthTagRejectedGauge)
         .set(static_cast<double>(gh_tag_rejected));

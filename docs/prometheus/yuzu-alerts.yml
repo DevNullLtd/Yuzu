@@ -1353,7 +1353,7 @@ groups:
       - alert: YuzuDispatchTargetRejected
         expr: |
           sum by (route, reason) (
-            increase(yuzu_server_dispatch_target_rejected_total{reason!~"quarantined|unknown_plugin"}[15m])
+            increase(yuzu_server_dispatch_target_rejected_total{reason!~"quarantined|unknown_plugin|kill_switched_os"}[15m])
           ) > 3
         labels:
           severity: warning
@@ -1394,7 +1394,11 @@ groups:
             it silenced, and take the genuine near-miss signal with it - the
             outcome the >3 threshold above was chosen to avoid. Quarantine
             denials are observed on yuzu_server_quarantine_gate_total and audited
-            as quarantine.dispatch_denied. reason values
+            as quarantine.dispatch_denied. reason="unknown_plugin" (#3511) and
+            reason="kill_switched_os" (#5294) are excluded for the same reason:
+            a withheld dispatch to a plugin absent from the target, or to an OS
+            whose switch is off, is the control working, audited as
+            command.dispatch_withheld. reason values
             "query_truncated"/"poison_excluded"/"parse_error_excluded" (#4496 + follow-up,
             route="result_set_inventory_query") are NOT excluded from the
             expression, unlike quarantined above: a well-formed, correctly-targeted
@@ -1454,8 +1458,9 @@ groups:
             {{ $value | humanizeDuration }}. Renew it and place the new PEM files
             at the configured path (hot-reload picks up HTTPS automatically).
             Built-in default certs (cert="default-ca") do NOT auto-renew — replace
-            them with operator-provided certs, or clear the cert directory to
-            regenerate.
+            them with operator-provided certs, or follow the clean re-root in
+            docs/pki-architecture.md "Operator runbook". Never clear the whole
+            cert directory: it also holds the secrets KEK (#5370).
 
       - alert: YuzuCertificateExpiryCritical
         expr: |

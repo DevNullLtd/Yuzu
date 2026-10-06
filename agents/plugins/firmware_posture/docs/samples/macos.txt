@@ -1,4 +1,4 @@
-captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-21 · euid 501 · leg-hash e3b945e9e6db
+captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-10-03 · euid 501 · leg-hash 35cf8bb6e007
 == action=firmware
 firmware|vendor|Apple Inc.|iokit
 firmware|version|mBoot-18000.161.10|iokit

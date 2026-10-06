@@ -269,6 +269,10 @@ compute_delivered(const std::vector<std::string>& claimed,
         not_delivered.insert(a);
     for (const auto& a : outcome.unknown_plugin)
         not_delivered.insert(a);
+    // #5294: withheld by a per-OS kill switch, not delivered -- so the
+    // per-(policy,agent) CAS re-dispatches them once the switch is restored.
+    for (const auto& a : outcome.kill_switched_os)
+        not_delivered.insert(a);
     for (const auto& a : outcome.not_sent)
         not_delivered.insert(a);
 

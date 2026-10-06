@@ -5,6 +5,8 @@
 #include "pg/pg_migration_runner.hpp"
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
+#include "software_catalog_rules.hpp"
+#include "utf8_sanitize.hpp"
 
 #include <yuzu/metrics.hpp>
 
@@ -17,6 +19,7 @@
 #include <charconv>
 #include <chrono>
 #include <cstdint>
+#include <functional>
 #include <string_view>
 #include <system_error>
 #include <utility>
@@ -47,16 +50,22 @@ constexpr int kFleetQueryRowCap = 100000;
 // `limit`. The catalogue is one row per distinct title; the drill is one per
 // distinct version of a title — both bounded sets.
 constexpr int kCatalogRowCap = 2000;
-// Execution BUDGET (not a guarantee) for the BACKGROUND catalogue recompute
-// (refresh_catalog_rollup) — the single expensive full-table GROUP BY. It runs off the
-// request path on the SoftwareCatalogRollup thread (the page never waits on it) and
-// overrides the pool's 30s default for that one txn. 60s bounds BOTH the worst-case
-// pooled-connection hold AND the shutdown-join stall (stop() can't cancel an in-flight
-// statement, so the join waits up to this long). KEEP-LAST-GOOD on a timeout: the txn
-// rolls back, the prior rollup + freshness stamp survive (the "as of" stamp ages, and
-// yuzu_inventory_catalog_rollup_total{outcome="error"} increments). If a genuine 400k
-// recompute ever exceeds 60s it stays "building"/stale until it fits — observable via the
-// metrics; raise this then. The page READS hit the small precomputed tables, no bound.
+// Execution BUDGET (not a guarantee) PER STATEMENT of the BACKGROUND catalogue recompute
+// (refresh_catalog_rollup). It runs off the request path on the SoftwareCatalogRollup
+// thread (the page never waits on it) and overrides the pool's 30s default for that one
+// txn. The refresh is many statements in one txn, so the pooled-connection hold is up to
+// kRollupRefreshBudget (600 s) plus one statement; the shutdown-join stall stays bounded
+// by 60 s plus one batch (stop() cannot cancel an in-flight statement, so the join waits
+// out the current one). Both limits are compile-time constants, not flags.
+// KEEP-LAST-GOOD on a timeout: the txn rolls back, the prior rollup + freshness stamp
+// survive (the "as of" stamp ages, and yuzu_inventory_catalog_rollup_total{outcome="error"}
+// increments). The first refresh after migration v8 has no last-good (v8 drops the rollup
+// tables), so a failing first refresh leaves the catalogue "building".
+// Scale ceiling (measured on PG 18.6): the GROUPING SETS statement costs about 12.8x the
+// former catalogue GROUP BY (37 s vs 2.9 s at 1.8M rows) and reaches this flat 60 s cap at
+// about 2.7M installed rows (about 6,000 endpoints at about 450 titles each); beyond that
+// the catalogue stays "building" until the rollup is made incremental. The page READS hit
+// the small precomputed tables, no bound.
 constexpr const char* kRollupStatementTimeout = "60s";
 
 const std::vector<pg::PgMigration>& migrations() {
@@ -238,6 +247,73 @@ const std::vector<pg::PgMigration>& migrations() {
          "ALTER TABLE installed_software ADD COLUMN IF NOT EXISTS install_id       BIGSERIAL;"
          "CREATE INDEX IF NOT EXISTS installed_software_name_idx "
          "ON installed_software (name, agent_id, install_id);"},
+        {8,
+         // Software page uplift (M.9 PR-1): the catalogue rollup becomes one row per
+         // (title, grain, distinct dimension combination) so Installs is an EXACT distinct-
+         // device count under every kind/ecosystem/source filter (distinct counts are not
+         // additive, so nothing is ever summed). grain = GROUPING(kind, ecosystem, source):
+         // bit 2 kind, bit 1 ecosystem, bit 0 source, a SET bit = aggregated away (7 = title
+         // total, 0 = one exact combination); aggregated dims are stored '' and told apart
+         // from a genuine '' by the grain. One title yields 8 to 8xC rows (C = its finest-
+         // grain combination count). Derived data only: DROP + CREATE is safe because the
+         // next hourly refresh refills it; there is NO DDL on installed_software. Until the
+         // boot-time refresh the meta row reads refreshed_at = 0, the existing honest
+         // "building" state. version_rollup is untouched (shape unchanged, keeps its
+         // UNIQUE (name, version), which also serves the newest-version cursor order).
+         // grain carries DEFAULT 7 (the title-total grain) on purpose: the migration runner
+         // skips a version at or below the schema's, so an OLD binary can still run against
+         // v8. Its refresh INSERT names no grain column; with the default each of its rows
+         // lands as the title grain and it never rolls back on NOT NULL. Once its own refresh
+         // has run, its (grain-less) read lists each title once: a rollback to an older binary
+         // only is clean. A MIXED old/new window has three transient asymmetries until each
+         // side's next hourly refresh: the old read lists every grain row the new binary wrote
+         // (8 to 8xC per title) until the old binary's own refresh replaces them, and after an
+         // old refresh only grain-7 rows exist, so the new binary's filtered reads (grain != 7)
+         // are empty with refreshed_at > 0; and the old meta upsert sets only the stamp, the
+         // title count and the device count, so the KPI columns stay at their last new-binary
+         // values under a fresh stamp. The new refresh always writes grain explicitly
+         // from GROUPING().
+         // The expression index is what makes the (installs DESC, name) keyset an index
+         // seek: the read's row-value compare on ((-device_count), name) matches it; the
+         // unique key's leading `name` serves the per-title newest lookups.
+         "DROP TABLE IF EXISTS catalog_rollup;"
+         "DROP TABLE IF EXISTS catalog_rollup_meta;"
+         "CREATE TABLE catalog_rollup ("
+         "  name            TEXT     NOT NULL,"
+         "  grain           SMALLINT NOT NULL DEFAULT 7,"
+         "  kind            TEXT     NOT NULL DEFAULT '',"
+         "  ecosystem       TEXT     NOT NULL DEFAULT '',"
+         "  source          TEXT     NOT NULL DEFAULT '',"
+         "  publisher       TEXT     NOT NULL DEFAULT '',"
+         "  device_count    BIGINT   NOT NULL,"
+         "  version_count   BIGINT   NOT NULL,"
+         "  unsigned_count  BIGINT   NOT NULL DEFAULT 0,"
+         "  ecosystems      TEXT     NOT NULL DEFAULT '',"
+         "  kinds           TEXT     NOT NULL DEFAULT '',"
+         "  sources         TEXT     NOT NULL DEFAULT '',"
+         "  newest_version  TEXT     NOT NULL DEFAULT '',"
+         "  CONSTRAINT catalog_rollup_grain_key UNIQUE (name, grain, kind, ecosystem, source));"
+         "CREATE INDEX catalog_rollup_page_idx "
+         "ON catalog_rollup (grain, kind, ecosystem, source, (-device_count), name);"
+         "CREATE TABLE catalog_rollup_meta ("
+         "  id               INT    PRIMARY KEY,"
+         "  refreshed_at     BIGINT NOT NULL DEFAULT 0,"
+         "  total_titles     BIGINT NOT NULL DEFAULT 0,"
+         "  total_devices    BIGINT NOT NULL DEFAULT 0,"
+         "  total_publishers BIGINT NOT NULL DEFAULT 0,"
+         "  total_installs   BIGINT NOT NULL DEFAULT 0,"
+         "  installs_windows BIGINT NOT NULL DEFAULT 0,"
+         "  installs_macos   BIGINT NOT NULL DEFAULT 0,"
+         "  installs_linux   BIGINT NOT NULL DEFAULT 0,"
+         "  installs_other   BIGINT NOT NULL DEFAULT 0,"
+         "  current_installs BIGINT NOT NULL DEFAULT 0,"
+         "  current_total    BIGINT NOT NULL DEFAULT 0,"
+         "  current_titles   BIGINT NOT NULL DEFAULT 0,"
+         "  sprawl_titles    BIGINT NOT NULL DEFAULT 0,"
+         "  rpm_total        BIGINT NOT NULL DEFAULT 0,"
+         "  rpm_unsigned     BIGINT NOT NULL DEFAULT 0);"
+         "INSERT INTO catalog_rollup_meta (id, refreshed_at) VALUES (1, 0) "
+         "ON CONFLICT (id) DO NOTHING;"},
     };
     return kMigrations;
 }
@@ -381,6 +457,87 @@ DegradeLog note_read_degrade(yuzu::MetricsRegistry* metrics, const char* reason,
     return {new_episode || (n % kReadDegradeLogSample) == 0, n};
 }
 
+namespace sc = software_catalog;
+
+// Per-call-site degrade samplers for a bounded read (pool timeout / query error).
+struct SiteSamplers {
+    DegradeSampler pool;
+    DegradeSampler query;
+};
+
+// Run one bounded SELECT in a transaction whose execution is capped by SET LOCAL
+// statement_timeout (the count_stale_agents idiom): search-as-you-type reads must not run to
+// the pool's 30 s default. `parse(const PgResult&)` maps the rows. nullopt on any degrade —
+// pool timeout or query error, including the timeout itself — counted and sampled; the caller
+// maps that to nullopt, never an empty page.
+template <class Parse>
+auto bounded_query(pg::PgPool& pool, yuzu::MetricsRegistry* metrics, const char* fn,
+                   SiteSamplers& sm, const std::string& sql,
+                   const std::vector<std::string>& params, Parse&& parse)
+    -> std::optional<decltype(parse(std::declval<const pg::PgResult&>()))> {
+    std::optional<decltype(parse(std::declval<const pg::PgResult&>()))> out;
+    bool entered = false;
+    std::string err;
+    const bool ok = pool.with_txn_for(kQueryAcquireTimeout, [&](PGconn* c) -> bool {
+        entered = true;
+        pg::PgResult t = pg::exec_params(
+            c,
+            (std::string("SET LOCAL statement_timeout = '") +
+             std::string(sc::kSearchStatementTimeout) + "'")
+                .c_str(),
+            std::vector<std::string>{});
+        if (t.status() != PGRES_COMMAND_OK) {
+            err = PQerrorMessage(c);
+            return false;
+        }
+        pg::PgResult res = pg::exec_params(c, sql.c_str(), params);
+        if (res.status() != PGRES_TUPLES_OK) {
+            err = PQerrorMessage(c);
+            return false;
+        }
+        out = parse(res);
+        return true;
+    });
+    if (ok)
+        return out;
+    if (const auto d = note_read_degrade(metrics, entered ? kReasonQueryError : kReasonPoolTimeout,
+                                         entered ? sm.query : sm.pool);
+        d.should_log)
+        spdlog::warn("SoftwareInventoryStore: {} degraded — {} (occurrence {})", fn,
+                     entered ? err : pool.last_error(), d.occurrence);
+    return std::nullopt;
+}
+
+// The comma-joined distinct non-empty values of one column/expression: the SINGLE definition
+// of the list representation the catalogue stores (refresh) and the host view derives, so the
+// q predicate matches the same text on both paths (F7).
+std::string distinct_list(std::string_view col) {
+    const std::string c(col);
+    return "coalesce(string_agg(DISTINCT " + c + ", ',' ORDER BY " + c + ") FILTER (WHERE " + c +
+           " <> ''), '')";
+}
+
+// The search term the reads bind: invalid UTF-8 AND embedded NUL are scrubbed to U+FFFD BEFORE
+// the clamp (U+FFFD is 3 bytes, so the clamp must come after), then the LIKE metacharacters are
+// escaped. PG TEXT cannot hold a NUL and libpq's text-format bind truncates at the first one, so
+// an unscrubbed NUL-first q would bind as "" and run unfiltered; an invalid byte is a PG 22021
+// error (a false store degrade); an all-continuation prefix would clamp to "" and run unfiltered.
+std::string search_term(std::string_view q) {
+    std::string s = sanitize_utf8_strict(q);
+    for (std::size_t pos = 0; (pos = s.find('\0', pos)) != std::string::npos; pos += 3)
+        s.replace(pos, 1, "\xEF\xBF\xBD");
+    return sc::like_escape(sc::clamp_utf8(s, sc::kSearchMaxBytes));
+}
+
+// q arm: a title-level ILIKE over four columns/expressions with ONE bind (`ph`) reused;
+// ESCAPE '\' makes the like_escape'd term literal.
+std::string q_arms(const std::string& ph, std::string_view name, std::string_view pub,
+                   std::string_view eco, std::string_view src) {
+    const std::string pat = " ILIKE '%' || " + ph + " || '%' ESCAPE '\\'";
+    return " AND (" + std::string(name) + pat + " OR " + std::string(pub) + pat + " OR " +
+           std::string(eco) + pat + " OR " + std::string(src) + pat + ")";
+}
+
 } // namespace
 
 std::string SoftwareInventoryStore::canonical_hash(std::vector<SoftwareEntry> entries) {
@@ -467,9 +624,14 @@ SoftwareInventoryStore::SoftwareInventoryStore(pg::PgPool& pool) : pool_(pool) {
          "agent_id, name, version, publisher, install_date, kind, ecosystem, epoch, release, "
          "arch, signature_status, distro_id, distro_version, package_id, source, install_id"},
         {"inventory_state", "agent_id, source, content_hash, first_seen, last_seen"},
-        {"catalog_rollup", "name, publisher, device_count, version_count"},
+        {"catalog_rollup",
+         "name, grain, kind, ecosystem, source, publisher, device_count, version_count, "
+         "unsigned_count, ecosystems, kinds, sources, newest_version"},
         {"version_rollup", "name, version, device_count"},
-        {"catalog_rollup_meta", "id, refreshed_at, total_titles, total_devices"},
+        {"catalog_rollup_meta",
+         "id, refreshed_at, total_titles, total_devices, total_publishers, total_installs, "
+         "installs_windows, installs_macos, installs_linux, installs_other, current_installs, "
+         "current_total, current_titles, sprawl_titles, rpm_total, rpm_unsigned"},
     };
     for (const auto& p : kProjections) {
         const std::string sql = std::string("SELECT ") + p.columns +
@@ -773,15 +935,10 @@ SoftwareInventoryStore::query_software(const SoftwareFleetQuery& q) {
                          d.occurrence);
         return std::nullopt;
     }
-    auto lease = pool_.try_acquire_for(kQueryAcquireTimeout);
-    if (!lease) {
-        static DegradeSampler sampler;
-        if (const auto d = note_read_degrade(metrics_, kReasonPoolTimeout, sampler); d.should_log)
-            spdlog::warn("SoftwareInventoryStore: query_software degraded — no connection ({}) "
-                         "(occurrence {})",
-                         pool_.last_error(), d.occurrence);
-        return std::nullopt;
-    }
+    // ADR-0033 present-empty rule: an empty scope set is deny-all -> an empty VALUE with no
+    // SQL (nullopt means "unfiltered" and is the only thing that selects the whole fleet).
+    if (q.agent_ids && q.agent_ids->empty())
+        return std::vector<SoftwareFleetRow>{};
     // limit is clamped silently — callers page until an EMPTY page, never a short one.
     int limit = q.limit > 0 ? q.limit : 1000;
     if (limit > kFleetQueryRowCap)
@@ -803,15 +960,14 @@ SoftwareInventoryStore::query_software(const SoftwareFleetQuery& q) {
         params.push_back(q.name);
     }
     if (!q.q.empty()) {
-        // One bind reused across the four columns (software_catalog's idiom). `%`/`_`
-        // in q act as wildcards, exactly like name_filter there.
-        // Known ceiling: four seq-scan ILIKEs — fine to ~50k rows; add a pg_trgm GIN
-        // (CREATE EXTENSION is an operator decision) when the fleet passes that.
+        // One bind reused across the four columns (software_catalog's idiom). The term is
+        // clamped and LIKE-escaped, so `%`/`_` in q are literal characters, not wildcards.
+        // Known ceiling: four seq-scan ILIKEs — fine to ~50k rows, bounded by a 5 s
+        // statement timeout below; add a pg_trgm GIN (CREATE EXTENSION is an operator
+        // decision) when the fleet passes that.
         const std::string ph = "$" + std::to_string(++p);
-        sql += " AND (name ILIKE '%' || " + ph + " || '%' OR publisher ILIKE '%' || " + ph +
-               " || '%' OR ecosystem ILIKE '%' || " + ph + " || '%' OR source ILIKE '%' || " +
-               ph + " || '%')";
-        params.push_back(q.q);
+        sql += q_arms(ph, "name", "publisher", "ecosystem", "source");
+        params.push_back(search_term(q.q));
     }
     if (!q.kind.empty()) {
         sql += " AND kind = $" + std::to_string(++p);
@@ -824,6 +980,17 @@ SoftwareInventoryStore::query_software(const SoftwareFleetQuery& q) {
     if (!q.source.empty()) {
         sql += " AND source = $" + std::to_string(++p);
         params.push_back(q.source);
+    }
+    if (q.version) {
+        // Present (even "") is an exact bucket; nullopt = any version.
+        sql += " AND version = $" + std::to_string(++p);
+        params.push_back(*q.version);
+    }
+    if (q.agent_ids) {
+        // Scope push-down: filter in SQL so the last returned row IS the keyset cursor.
+        std::vector<std::string_view> ids(q.agent_ids->begin(), q.agent_ids->end());
+        sql += " AND agent_id = ANY($" + std::to_string(++p) + "::text[])";
+        params.push_back(pg::to_text_array(ids));
     }
     if (q.after) {
         // Row-value keyset over the stable sort tuple. install_id alone would reorder on
@@ -839,6 +1006,48 @@ SoftwareInventoryStore::query_software(const SoftwareFleetQuery& q) {
     sql += " ORDER BY name, agent_id, install_id LIMIT $" + std::to_string(++p) + "::bigint";
     params.push_back(std::to_string(limit));
 
+    auto parse = [](const pg::PgResult& res) {
+        std::vector<SoftwareFleetRow> out;
+        const int n = PQntuples(res.get());
+        out.reserve(static_cast<std::size_t>(n));
+        for (int i = 0; i < n; ++i) {
+            SoftwareFleetRow row;
+            row.agent_id = PQgetvalue(res.get(), i, 0);
+            row.entry.name = PQgetvalue(res.get(), i, 1);
+            row.entry.version = PQgetvalue(res.get(), i, 2);
+            row.entry.publisher = PQgetvalue(res.get(), i, 3);
+            row.entry.install_date = PQgetvalue(res.get(), i, 4);
+            row.entry.kind = PQgetvalue(res.get(), i, 5);
+            row.entry.ecosystem = PQgetvalue(res.get(), i, 6);
+            row.entry.epoch = PQgetvalue(res.get(), i, 7);
+            row.entry.release = PQgetvalue(res.get(), i, 8);
+            row.entry.arch = PQgetvalue(res.get(), i, 9);
+            row.entry.signature_status = PQgetvalue(res.get(), i, 10);
+            row.entry.distro_id = PQgetvalue(res.get(), i, 11);
+            row.entry.distro_version = PQgetvalue(res.get(), i, 12);
+            row.entry.package_id = PQgetvalue(res.get(), i, 13);
+            row.entry.source = PQgetvalue(res.get(), i, 14);
+            row.install_id = result_i64(res, i, 15);
+            out.push_back(std::move(row));
+        }
+        return out;
+    };
+
+    if (!q.q.empty()) {
+        // The seq-scan ILIKE arms are the only unbounded-cost path: bound them (5 s).
+        static SiteSamplers samplers;
+        return bounded_query(pool_, metrics_, "query_software", samplers, sql, params, parse);
+    }
+
+    auto lease = pool_.try_acquire_for(kQueryAcquireTimeout);
+    if (!lease) {
+        static DegradeSampler sampler;
+        if (const auto d = note_read_degrade(metrics_, kReasonPoolTimeout, sampler); d.should_log)
+            spdlog::warn("SoftwareInventoryStore: query_software degraded — no connection ({}) "
+                         "(occurrence {})",
+                         pool_.last_error(), d.occurrence);
+        return std::nullopt;
+    }
     pg::PgResult res = pg::exec_params(lease.get(), sql.c_str(), params);
     if (res.status() != PGRES_TUPLES_OK) {
         static DegradeSampler sampler;
@@ -848,39 +1057,17 @@ SoftwareInventoryStore::query_software(const SoftwareFleetQuery& q) {
                          PQerrorMessage(lease.get()), d.occurrence);
         return std::nullopt;
     }
-    std::vector<SoftwareFleetRow> out;
-    const int n = PQntuples(res.get());
-    out.reserve(static_cast<std::size_t>(n));
-    for (int i = 0; i < n; ++i) {
-        SoftwareFleetRow row;
-        row.agent_id = PQgetvalue(res.get(), i, 0);
-        row.entry.name = PQgetvalue(res.get(), i, 1);
-        row.entry.version = PQgetvalue(res.get(), i, 2);
-        row.entry.publisher = PQgetvalue(res.get(), i, 3);
-        row.entry.install_date = PQgetvalue(res.get(), i, 4);
-        row.entry.kind = PQgetvalue(res.get(), i, 5);
-        row.entry.ecosystem = PQgetvalue(res.get(), i, 6);
-        row.entry.epoch = PQgetvalue(res.get(), i, 7);
-        row.entry.release = PQgetvalue(res.get(), i, 8);
-        row.entry.arch = PQgetvalue(res.get(), i, 9);
-        row.entry.signature_status = PQgetvalue(res.get(), i, 10);
-        row.entry.distro_id = PQgetvalue(res.get(), i, 11);
-        row.entry.distro_version = PQgetvalue(res.get(), i, 12);
-        row.entry.package_id = PQgetvalue(res.get(), i, 13);
-        row.entry.source = PQgetvalue(res.get(), i, 14);
-        row.install_id = result_i64(res, i, 15);
-        out.push_back(std::move(row));
-    }
-    return out;
+    return parse(res);
 }
 
 std::optional<std::vector<SoftwareCatalogRow>>
 SoftwareInventoryStore::software_catalog(const SoftwareCatalogQuery& q) {
-    // AUTHORITATIVE read of the PRECOMPUTED catalog_rollup — a cheap indexed scan of a
-    // small table, NOT an on-demand GROUP BY (refresh_catalog_rollup writes it on a
-    // cadence). FLEET-WIDE (global rollup; caller gates GLOBAL Inventory:Read). nullopt on
-    // degrade, never a silent empty; an empty value = the rollup has no rows (pair with
-    // catalog_rollup_meta() to tell "building" from a genuinely empty fleet).
+    // AUTHORITATIVE read. Fleet path: ONE exact lookup per title in the PRECOMPUTED
+    // catalog_rollup at the grain matching the active filters (nothing is summed). Host path
+    // (agent_id set): the per-device view straight from installed_software. FLEET-WIDE (global
+    // rollup; caller gates GLOBAL Inventory:Read). nullopt on degrade (incl. the 5 s bound),
+    // never a silent empty; an empty value = no matching rows (pair with catalog_rollup_meta()
+    // to tell "building" from a genuinely empty fleet).
     if (!open_) {
         static DegradeSampler sampler;
         if (const auto d = note_read_degrade(metrics_, kReasonStoreNotOpen, sampler); d.should_log)
@@ -889,63 +1076,104 @@ SoftwareInventoryStore::software_catalog(const SoftwareCatalogQuery& q) {
                          d.occurrence);
         return std::nullopt;
     }
-    int limit = q.limit > 0 ? q.limit : 200;
+    // F5: the keyset negates the cursor's installs; a negative value is a precondition miss
+    // (the only producer is a previous page's last row, whose count is >= 1) -> empty value.
+    if (q.after && q.after->installs < 0)
+        return std::vector<SoftwareCatalogRow>{};
+    int limit = q.limit > 0 ? q.limit : 100;
     if (limit > kCatalogRowCap)
         limit = kCatalogRowCap;
-    auto lease = pool_.try_acquire_for(kQueryAcquireTimeout);
-    if (!lease) {
-        static DegradeSampler sampler;
-        if (const auto d = note_read_degrade(metrics_, kReasonPoolTimeout, sampler); d.should_log)
-            spdlog::warn("SoftwareInventoryStore: software_catalog degraded — no connection ({}) "
-                         "(occurrence {})",
-                         pool_.last_error(), d.occurrence);
-        return std::nullopt;
-    }
-    // Cheap read of the rollup. ILIKE '%'||$n||'%' is the optional case-insensitive
-    // filter, matched against EITHER title or publisher (round-3 item 8 — a search
-    // for "adobe" should surface every Adobe title, not just ones with "adobe" in
-    // the name) — ONE bind reused in both arms (Postgres allows repeating a
-    // parameter placeholder), never two separate params for the same input. Over a
-    // small (one-row-per-title) table the scan+sort is trivial either way.
-    std::string sql = "SELECT name, publisher, device_count, version_count "
-                      "FROM software_inventory_store.catalog_rollup ";
+    const int versions_min = q.versions_min < 0 ? 0 : q.versions_min;
+    const bool host = !q.agent_id.empty();
+    const std::string term = search_term(q.q);
+
     std::vector<std::string> params;
     int p = 0;
-    if (!q.name_filter.empty()) {
-        const std::string ph = "$" + std::to_string(++p);
-        sql += "WHERE (name ILIKE '%' || " + ph + " || '%' OR publisher ILIKE '%' || " + ph +
-              " || '%') ";
-        params.push_back(q.name_filter);
+    auto bind = [&](std::string v) {
+        params.push_back(std::move(v));
+        return "$" + std::to_string(++p);
+    };
+    std::string sql;
+    if (!host) {
+        const int grain = sc::grain_mask(q.kind, q.ecosystem, q.source);
+        // Named locals, not one operator+ chain: the order of unsequenced bind() calls in a
+        // single expression is compiler-defined, which would permute the $n numbering.
+        const std::string grain_ph = bind(std::to_string(grain));
+        const std::string kind_ph = bind(q.kind);
+        const std::string eco_ph = bind(q.ecosystem);
+        const std::string src_ph = bind(q.source);
+        sql = "SELECT name, publisher, device_count, version_count, ecosystems, kinds, "
+              "newest_version FROM software_inventory_store.catalog_rollup WHERE grain = " +
+              grain_ph + "::smallint AND kind = " + kind_ph + " AND ecosystem = " + eco_ph +
+              " AND source = " + src_ph;
+        if (versions_min > 0)
+            sql += " AND version_count >= " + bind(std::to_string(versions_min)) + "::bigint";
+        if (!term.empty())
+            sql += q_arms(bind(term), "name", "publisher", "ecosystems", "sources");
+        if (q.after) {
+            // Row-value compare on the page index's own expression: an index seek, not a
+            // filtered scan from the top (the write below must match the index expression).
+            const std::string ci = bind(std::to_string(-q.after->installs));
+            sql += " AND ((-device_count), name) > (" + ci + "::bigint, " + bind(q.after->name) +
+                   ")";
+        }
+        sql += " ORDER BY (-device_count), name LIMIT " + bind(std::to_string(limit)) + "::bigint";
+    } else {
+        const std::string eco_list = distinct_list("i.ecosystem");
+        const std::string src_list = distinct_list("i.source");
+        sql = "SELECT i.name, max(i.publisher), 1::bigint, count(DISTINCT i.version), " + eco_list +
+              ", " + distinct_list("i.kind") +
+              ", coalesce((SELECT c.newest_version FROM software_inventory_store.catalog_rollup c "
+              "WHERE c.name = i.name AND c.grain = " +
+              std::to_string(sc::kGrainTitle) +
+              "), '') FROM software_inventory_store.installed_software i WHERE i.agent_id = " +
+              bind(q.agent_id);
+        if (!q.kind.empty())
+            sql += " AND i.kind = " + bind(q.kind);
+        if (!q.ecosystem.empty())
+            sql += " AND i.ecosystem = " + bind(q.ecosystem);
+        if (!q.source.empty())
+            sql += " AND i.source = " + bind(q.source);
+        // One device => installs is 1 on every row, so the cursor's tiebreak is the name.
+        if (q.after)
+            sql += " AND i.name > " + bind(q.after->name);
+        sql += " GROUP BY i.name HAVING true";
+        if (versions_min > 0)
+            sql += " AND count(DISTINCT i.version) >= " + bind(std::to_string(versions_min)) +
+                   "::bigint";
+        if (!term.empty())
+            sql += q_arms(bind(term), "i.name", "max(i.publisher)", eco_list, src_list);
+        sql += " ORDER BY i.name LIMIT " + bind(std::to_string(limit)) + "::bigint";
     }
-    sql += "ORDER BY device_count DESC, name LIMIT $" + std::to_string(++p) + "::bigint";
-    params.push_back(std::to_string(limit));
-    pg::PgResult res = pg::exec_params(lease.get(), sql.c_str(), params);
-    if (res.status() != PGRES_TUPLES_OK) {
-        static DegradeSampler sampler;
-        if (const auto d = note_read_degrade(metrics_, kReasonQueryError, sampler); d.should_log)
-            spdlog::warn("SoftwareInventoryStore: software_catalog degraded — query failed: {} "
-                         "(occurrence {})",
-                         PQerrorMessage(lease.get()), d.occurrence);
-        return std::nullopt;
-    }
-    std::vector<SoftwareCatalogRow> out;
-    const int n = PQntuples(res.get());
-    out.reserve(static_cast<std::size_t>(n));
-    for (int i = 0; i < n; ++i) {
-        SoftwareCatalogRow r;
-        r.name = PQgetvalue(res.get(), i, 0);
-        r.publisher = PQgetvalue(res.get(), i, 1);
-        r.device_count = result_i64(res, i, 2);
-        r.version_count = result_i64(res, i, 3);
-        out.push_back(std::move(r));
-    }
-    return out;
+
+    auto parse = [](const pg::PgResult& res) {
+        std::vector<SoftwareCatalogRow> out;
+        const int n = PQntuples(res.get());
+        out.reserve(static_cast<std::size_t>(n));
+        for (int i = 0; i < n; ++i) {
+            SoftwareCatalogRow r;
+            r.name = PQgetvalue(res.get(), i, 0);
+            r.publisher = PQgetvalue(res.get(), i, 1);
+            r.device_count = result_i64(res, i, 2);
+            r.version_count = result_i64(res, i, 3);
+            r.ecosystems = PQgetvalue(res.get(), i, 4);
+            r.kinds = PQgetvalue(res.get(), i, 5);
+            r.newest_version = PQgetvalue(res.get(), i, 6);
+            out.push_back(std::move(r));
+        }
+        return out;
+    };
+    static SiteSamplers samplers;
+    return bounded_query(pool_, metrics_, "software_catalog", samplers, sql, params, parse);
 }
 
 std::optional<std::vector<SoftwareVersionCount>>
-SoftwareInventoryStore::software_versions(std::string_view name, int limit) {
-    // AUTHORITATIVE read of the precomputed version_rollup (title-scoped, name index). An
-    // empty name is a precondition miss → empty value, not a degrade.
+SoftwareInventoryStore::software_versions(const SoftwareVersionsQuery& q) {
+    // AUTHORITATIVE read. No filters -> the precomputed version_rollup (title-scoped, name
+    // index, exact fleet counts). Any kind/ecosystem/source/agent_id -> installed_software for
+    // this ONE title (exact distinct devices under the filters). The newest mark is always the
+    // title's fleet-wide grain-7 newest_version, never set on an empty version. An empty name
+    // is a precondition miss -> empty value, not a degrade.
     if (!open_) {
         static DegradeSampler sampler;
         if (const auto d = note_read_degrade(metrics_, kReasonStoreNotOpen, sampler); d.should_log)
@@ -954,59 +1182,145 @@ SoftwareInventoryStore::software_versions(std::string_view name, int limit) {
                          d.occurrence);
         return std::nullopt;
     }
-    if (name.empty())
+    if (q.name.empty())
         return std::vector<SoftwareVersionCount>{};
-    int lim = limit > 0 ? limit : 200;
+    int lim = q.limit > 0 ? q.limit : 200;
     if (lim > kCatalogRowCap)
         lim = kCatalogRowCap;
-    auto lease = pool_.try_acquire_for(kQueryAcquireTimeout);
-    if (!lease) {
-        static DegradeSampler sampler;
-        if (const auto d = note_read_degrade(metrics_, kReasonPoolTimeout, sampler); d.should_log)
-            spdlog::warn("SoftwareInventoryStore: software_versions degraded — no connection ({}) "
-                         "(occurrence {})",
-                         pool_.last_error(), d.occurrence);
-        return std::nullopt;
+    const bool filtered =
+        !q.kind.empty() || !q.ecosystem.empty() || !q.source.empty() || !q.agent_id.empty();
+
+    // Newest mark: the row's version equals the title's fleet-wide newest version (a scalar
+    // subquery). A NULL subquery (no grain-7 row) or '' parses as not-newest.
+    const std::string newest =
+        "(version <> '' AND version = (SELECT newest_version FROM "
+        "software_inventory_store.catalog_rollup WHERE name = $1 AND grain = " +
+        std::to_string(sc::kGrainTitle) + "))";
+    auto parse = [](const pg::PgResult& res) {
+        std::vector<SoftwareVersionCount> out;
+        const int n = PQntuples(res.get());
+        out.reserve(static_cast<std::size_t>(n));
+        for (int i = 0; i < n; ++i) {
+            SoftwareVersionCount v;
+            v.version = PQgetvalue(res.get(), i, 0);
+            v.device_count = result_i64(res, i, 1);
+            v.newest = std::string_view(PQgetvalue(res.get(), i, 2)) == "t";
+            out.push_back(std::move(v));
+        }
+        return out;
+    };
+
+    if (!filtered) {
+        auto lease = pool_.try_acquire_for(kQueryAcquireTimeout);
+        if (!lease) {
+            static DegradeSampler sampler;
+            if (const auto d = note_read_degrade(metrics_, kReasonPoolTimeout, sampler);
+                d.should_log)
+                spdlog::warn("SoftwareInventoryStore: software_versions degraded — no connection "
+                             "({}) (occurrence {})",
+                             pool_.last_error(), d.occurrence);
+            return std::nullopt;
+        }
+        const std::string sql = "SELECT version, device_count, " + newest +
+                                " FROM software_inventory_store.version_rollup WHERE name = $1 "
+                                "ORDER BY device_count DESC, version LIMIT $2::bigint";
+        pg::PgResult res = pg::exec_params(lease.get(), sql.c_str(),
+                                           std::vector<std::string>{q.name, std::to_string(lim)});
+        if (res.status() != PGRES_TUPLES_OK) {
+            static DegradeSampler sampler;
+            if (const auto d = note_read_degrade(metrics_, kReasonQueryError, sampler);
+                d.should_log)
+                spdlog::warn("SoftwareInventoryStore: software_versions degraded — query failed: "
+                             "{} (occurrence {})",
+                             PQerrorMessage(lease.get()), d.occurrence);
+            return std::nullopt;
+        }
+        return parse(res);
     }
-    pg::PgResult res = pg::exec_params(
-        lease.get(),
-        "SELECT version, device_count FROM software_inventory_store.version_rollup "
-        "WHERE name = $1 ORDER BY device_count DESC, version LIMIT $2::bigint",
-        std::vector<std::string>{std::string(name), std::to_string(lim)});
-    if (res.status() != PGRES_TUPLES_OK) {
-        static DegradeSampler sampler;
-        if (const auto d = note_read_degrade(metrics_, kReasonQueryError, sampler); d.should_log)
-            spdlog::warn("SoftwareInventoryStore: software_versions degraded — query failed: {} "
-                         "(occurrence {})",
-                         PQerrorMessage(lease.get()), d.occurrence);
-        return std::nullopt;
-    }
-    std::vector<SoftwareVersionCount> out;
-    const int n = PQntuples(res.get());
-    out.reserve(static_cast<std::size_t>(n));
-    for (int i = 0; i < n; ++i) {
-        SoftwareVersionCount v;
-        v.version = PQgetvalue(res.get(), i, 0);
-        v.device_count = result_i64(res, i, 1);
-        out.push_back(std::move(v));
-    }
-    return out;
+
+    // ponytail: scans one title's install rows (about the title's device count); add a
+    // (name, ecosystem, source, version, agent_id) grain to version_rollup if a universal
+    // title's filtered drill nears the 5 s bound at scale.
+    std::vector<std::string> params{q.name};
+    int p = 1;
+    std::string where;
+    auto add = [&](const char* col, const std::string& v) {
+        if (v.empty())
+            return;
+        where += std::string(" AND ") + col + " = $" + std::to_string(++p);
+        params.push_back(v);
+    };
+    add("agent_id", q.agent_id);
+    add("kind", q.kind);
+    add("ecosystem", q.ecosystem);
+    add("source", q.source);
+    const std::string sql = "SELECT version, count(DISTINCT agent_id) AS installs, " + newest +
+                            " FROM software_inventory_store.installed_software WHERE name = $1" +
+                            where + " GROUP BY version ORDER BY installs DESC, version LIMIT $" +
+                            std::to_string(++p) + "::bigint";
+    params.push_back(std::to_string(lim));
+    static SiteSamplers samplers;
+    return bounded_query(pool_, metrics_, "software_versions", samplers, sql, params, parse);
 }
 
-bool SoftwareInventoryStore::refresh_catalog_rollup() {
+bool SoftwareInventoryStore::refresh_catalog_rollup(const std::function<bool()>& cancelled) {
     if (!open_)
         return false;
-    // ONE transaction: bound execution with a GENEROUS background statement_timeout,
-    // recompute both rollup tables + the meta from installed_software, atomic replace.
-    // KEEP-LAST-GOOD: any lease/SQL failure (incl. timeout) returns false → with_txn_for
-    // ROLLs back → the prior rollup + freshness stamp survive untouched.
+    // Cancellation/budget contract: see the declaration in software_inventory_store.hpp.
+    const auto started = std::chrono::steady_clock::now();
+    const auto deadline = started + sc::kRollupRefreshBudget;
+    auto abort_requested = [&]() -> bool {
+        const auto now = std::chrono::steady_clock::now();
+        if (cancelled && cancelled()) {
+            spdlog::info("SoftwareInventoryStore: catalogue rollup refresh cancelled — keeping "
+                         "last-good");
+            return true;
+        }
+        if (now >= deadline) {
+            spdlog::warn("SoftwareInventoryStore: catalogue rollup refresh over its {} s budget "
+                         "(elapsed {} s) — keeping last-good",
+                         std::chrono::duration_cast<std::chrono::seconds>(sc::kRollupRefreshBudget)
+                             .count(),
+                         std::chrono::duration_cast<std::chrono::seconds>(now - started).count());
+            return true;
+        }
+        return false;
+    };
+    // A failed statement names its cause (the libpq error text) so a timeout, a serialization
+    // failure, a missing privilege and a pool problem are told apart in the log. A result
+    // that is OK but the wrong shape carries no libpq text; say so instead of logging "".
+    auto failed = [](std::string_view label, const pg::PgResult& r) -> bool {
+        const std::string_view err = PQresultErrorMessage(r.get());
+        spdlog::warn("SoftwareInventoryStore: catalogue rollup refresh statement '{}' failed: {}",
+                     label, err.empty() ? "unexpected result shape (no error text)" : err);
+        return false;
+    };
+    // ONE transaction: recompute the rollup tables + the meta from installed_software,
+    // atomic replace. KEEP-LAST-GOOD: any lease/SQL failure (incl. timeout) returns false ->
+    // with_txn_for ROLLs back -> the prior rollup + freshness stamp survive untouched.
     return pool_.with_txn_for(kQueryAcquireTimeout, [&](PGconn* c) -> bool {
-        pg::PgResult t = pg::exec_params(c, std::string("SET LOCAL statement_timeout = '")
-                                                .append(kRollupStatementTimeout)
-                                                .append("'")
-                                                .c_str(),
-                                         std::vector<std::string>{});
-        if (t.status() != PGRES_COMMAND_OK)
+        // Statement helper: poll abort first, then run a parameterless command.
+        auto cmd = [&](const std::string& sql) -> bool {
+            if (abort_requested())
+                return false;
+            const pg::PgResult res = pg::exec_params(c, sql.c_str(), std::vector<std::string>{});
+            if (res.status() == PGRES_COMMAND_OK)
+                return true;
+            // The label is the statement's first 48 bytes: enough to name it, bounded for the log.
+            return failed(std::string_view(sql).substr(0, 48), res);
+        };
+        // REPEATABLE READ as the FIRST statement: version_rollup, newest_tmp, catalog_rollup
+        // and every KPI come from ONE source snapshot. The snapshot itself is taken at the
+        // advisory-lock SELECT below (the first non-SET statement), so on a second replica a
+        // peer refresh that commits between our snapshot and our lock acquisition makes our
+        // DELETE face rows changed after the snapshot -> serialization error -> return false
+        // -> ROLLBACK (keep-last-good) -> next tick. Benign, two-replica-only.
+        if (pg::PgResult iso{PQexec(c, "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")};
+            iso.status() != PGRES_COMMAND_OK)
+            return failed("SET TRANSACTION ISOLATION LEVEL", iso);
+        if (!cmd(std::string("SET LOCAL statement_timeout = '")
+                     .append(kRollupStatementTimeout)
+                     .append("'")))
             return false;
         // Cluster-wide serialization (gov ARCH-1/UP-1): on a multi-instance shared-PG
         // deploy, only one server recomputes the SHARED rollup at a time. try_ (not
@@ -1016,58 +1330,213 @@ bool SoftwareInventoryStore::refresh_catalog_rollup() {
         // DELETE+INSERTs would otherwise produce. Transaction-scoped → auto-released at
         // COMMIT/ROLLBACK and self-healing if the holder dies. The UNIQUE constraints on
         // the rollup tables are the belt-and-braces correctness backstop behind this lock.
+        if (abort_requested())
+            return false;
         pg::PgResult lk =
             pg::exec_params(c,
                             "SELECT pg_try_advisory_xact_lock(hashtextextended('"
                             "software_catalog_rollup', 0))",
                             std::vector<std::string>{});
         if (lk.status() != PGRES_TUPLES_OK)
-            return false;
+            return failed("advisory lock", lk);
         if (PQntuples(lk.get()) == 1 && std::string_view(PQgetvalue(lk.get(), 0, 0)) == "f")
             return true; // a peer instance is refreshing the shared rollup — skip, success
-        // catalog_rollup: one row per title (device_count, version_count). max(publisher)
-        // picks a representative when a title carries >1 publisher across the fleet.
-        if (pg::exec_params(c, "DELETE FROM software_inventory_store.catalog_rollup",
-                            std::vector<std::string>{})
-                .status() != PGRES_COMMAND_OK)
+
+        // version_rollup: one row per (title, version), fleet-wide.
+        if (!cmd("DELETE FROM software_inventory_store.version_rollup"))
             return false;
-        if (pg::exec_params(
+        if (!cmd("INSERT INTO software_inventory_store.version_rollup (name, version, "
+                 "device_count) SELECT name, version, count(DISTINCT agent_id) "
+                 "FROM software_inventory_store.installed_software GROUP BY name, version"))
+            return false;
+
+        // Fleet-newest version of EVERY title, bounded memory: stream version_rollup in
+        // (name, version) order (a total order, served by version_rollup_nv_key) through a
+        // server-side cursor, fold title by title (running max under the catalogue's
+        // transitive comparator + the total tie rule) and batch the picks into a
+        // transaction-scoped temp table. Memory is one FETCH batch + one flush batch + one
+        // title's running best, independent of the title count. Needs the TEMPORARY privilege
+        // on the database (default PUBLIC grant; a hardened role without it fails 42501 here
+        // and the catalogue stays "building").
+        if (!cmd("CREATE TEMP TABLE newest_tmp (name TEXT PRIMARY KEY, newest_version TEXT NOT "
+                 "NULL, newest_installs BIGINT NOT NULL) ON COMMIT DROP"))
+            return false;
+        if (!cmd("DECLARE newest_cur NO SCROLL CURSOR FOR SELECT name, version, device_count "
+                 "FROM software_inventory_store.version_rollup ORDER BY name, version"))
+            return false;
+        std::vector<sc::NewestPick> picks;
+        auto flush_picks = [&]() -> bool {
+            if (picks.empty())
+                return true;
+            if (abort_requested())
+                return false;
+            std::vector<std::string> counts;
+            counts.reserve(picks.size());
+            std::vector<std::string_view> names;
+            std::vector<std::string_view> versions;
+            std::vector<std::string_view> counts_sv;
+            names.reserve(picks.size());
+            versions.reserve(picks.size());
+            for (const auto& pk : picks) {
+                names.emplace_back(pk.name);
+                versions.emplace_back(pk.version);
+                counts.push_back(std::to_string(pk.installs));
+            }
+            for (const auto& cnt : counts)
+                counts_sv.emplace_back(cnt);
+            pg::PgResult ins = pg::exec_params(
                 c,
-                "INSERT INTO software_inventory_store.catalog_rollup "
-                "(name, publisher, device_count, version_count) "
-                "SELECT name, max(publisher), count(DISTINCT agent_id), count(DISTINCT version) "
-                "FROM software_inventory_store.installed_software GROUP BY name",
-                std::vector<std::string>{})
-                .status() != PGRES_COMMAND_OK)
+                "INSERT INTO newest_tmp SELECT n, v, i FROM unnest($1::text[], $2::text[], "
+                "$3::bigint[]) AS t(n, v, i)",
+                std::vector<std::string>{pg::to_text_array(names), pg::to_text_array(versions),
+                                         pg::to_text_array(counts_sv)});
+            picks.clear();
+            return ins.status() == PGRES_COMMAND_OK || failed("INSERT INTO newest_tmp", ins);
+        };
+        sc::NewestFold fold;
+        const std::string fetch_sql =
+            "FETCH FORWARD " + std::to_string(sc::kNewestFetchRows) + " FROM newest_cur";
+        for (;;) {
+            if (abort_requested())
+                return false;
+            pg::PgResult page = pg::exec_params(c, fetch_sql.c_str(), std::vector<std::string>{});
+            if (page.status() != PGRES_TUPLES_OK)
+                return failed("FETCH newest_cur", page);
+            const int rows = PQntuples(page.get());
+            for (int i = 0; i < rows; ++i) {
+                fold.feed(PQgetvalue(page.get(), i, 0), PQgetvalue(page.get(), i, 1),
+                          result_i64(page, i, 2), picks);
+                if (picks.size() >= sc::kNewestFlushRows && !flush_picks())
+                    return false;
+            }
+            if (rows < sc::kNewestFetchRows)
+                break;
+        }
+        fold.finish(picks);
+        if (!flush_picks())
             return false;
-        // version_rollup: one row per (title, version).
-        if (pg::exec_params(c, "DELETE FROM software_inventory_store.version_rollup",
-                            std::vector<std::string>{})
-                .status() != PGRES_COMMAND_OK)
+        if (!cmd("CLOSE newest_cur") || !cmd("ANALYZE newest_tmp"))
             return false;
-        if (pg::exec_params(
-                c,
-                "INSERT INTO software_inventory_store.version_rollup (name, version, device_count) "
-                "SELECT name, version, count(DISTINCT agent_id) "
-                "FROM software_inventory_store.installed_software GROUP BY name, version",
-                std::vector<std::string>{})
-                .status() != PGRES_COMMAND_OK)
+
+        // catalog_rollup: ONE statement fills every filter grain (8 grouping sets), keyed by
+        // GROUPING(kind, ecosystem, source); every number is an exact distinct count within
+        // its own grouping set — nothing is summed across grains. The comma-joined lists
+        // are the distinct non-empty dimension values of THAT set's rows (the q predicate and
+        // the "spans" display read them). max(publisher) picks a representative publisher.
+        if (!cmd("DELETE FROM software_inventory_store.catalog_rollup"))
             return false;
-        // meta: server receipt clock (now()), titles from the just-built rollup, devices
-        // from the source table. RETURNING to carry the result (no sqlite3_changes-style
-        // count needed; #1033 idiom).
+        if (!cmd("INSERT INTO software_inventory_store.catalog_rollup (name, grain, kind, "
+                 "ecosystem, source, publisher, device_count, version_count, unsigned_count, "
+                 "ecosystems, kinds, sources, newest_version) "
+                 "SELECT g.name, g.grain, g.kind, g.ecosystem, g.source, g.publisher, "
+                 "g.device_count, g.version_count, g.unsigned_count, g.ecosystems, g.kinds, "
+                 "g.sources, coalesce(nt.newest_version, '') "
+                 "FROM (SELECT name, GROUPING(kind, ecosystem, source)::smallint AS grain, "
+                 "coalesce(kind, '') AS kind, coalesce(ecosystem, '') AS ecosystem, "
+                 "coalesce(source, '') AS source, max(publisher) AS publisher, "
+                 "count(DISTINCT agent_id) AS device_count, "
+                 "count(DISTINCT version) AS version_count, "
+                 "count(DISTINCT agent_id) FILTER (WHERE signature_status = 'unsigned') "
+                 "AS unsigned_count, "
+                 + distinct_list("ecosystem") + " AS ecosystems, " + distinct_list("kind") +
+                 " AS kinds, " + distinct_list("source") + " AS sources "
+                 "FROM software_inventory_store.installed_software "
+                 "GROUP BY GROUPING SETS ((name), (name, kind), (name, ecosystem), "
+                 "(name, source), (name, kind, ecosystem), (name, kind, source), "
+                 "(name, ecosystem, source), (name, kind, ecosystem, source))) g "
+                 "LEFT JOIN newest_tmp nt ON nt.name = g.name"))
+            return false;
+
+        // KPI inputs that are not a single scalar subquery of the meta update.
+        // (a) EXACT installs by OS family: distinct (device, title) pairs per family from ONE
+        // dedicated statement — ONE result row of four sums, never one row per title. One more
+        // full sort pass of installed_software (measured at 1.8M rows: the GROUPING SETS
+        // statement is about 12.8x the former GROUP BY, the whole refresh about 6.5x). The CASE
+        // comes from kEcosystemFamilies.
+        if (abort_requested())
+            return false;
+        auto fam_sum = [](std::string_view f) {
+            return "coalesce(sum(devices) FILTER (WHERE fam = '" + std::string(f) + "'), 0)";
+        };
+        pg::PgResult fam = pg::exec_params(
+            c,
+            ("SELECT " + fam_sum("windows") + ", " + fam_sum("macos") + ", " + fam_sum("linux") +
+             ", " + fam_sum("other") + " FROM (SELECT name, " + sc::os_family_case_sql() +
+             " AS fam, count(DISTINCT agent_id) AS devices FROM "
+             "software_inventory_store.installed_software GROUP BY name, fam) t")
+                .c_str(),
+            std::vector<std::string>{});
+        if (fam.status() != PGRES_TUPLES_OK || PQntuples(fam.get()) != 1)
+            return failed("KPI OS-family split", fam);
+        // (b) rpm: a single ecosystem at the ecosystem-only grain, exact.
+        if (abort_requested())
+            return false;
+        pg::PgResult rpm = pg::exec_params(
+            c,
+            ("SELECT coalesce(sum(device_count), 0), coalesce(sum(unsigned_count), 0) "
+             "FROM software_inventory_store.catalog_rollup WHERE grain = " +
+             std::to_string(sc::kGrainEcosystem) + " AND ecosystem = 'rpm'")
+                .c_str(),
+            std::vector<std::string>{});
+        if (rpm.status() != PGRES_TUPLES_OK || PQntuples(rpm.get()) != 1)
+            return failed("KPI rpm totals", rpm);
+        // (c) distinct non-empty publishers, from the source table (GROUP BY subselect: a hash
+        // aggregate, about 16x faster than count(DISTINCT) at 1.8M rows).
+        if (abort_requested())
+            return false;
+        pg::PgResult pubs = pg::exec_params(
+            c,
+            "SELECT count(*) FROM (SELECT publisher FROM "
+            "software_inventory_store.installed_software WHERE publisher <> '' "
+            "GROUP BY publisher) p",
+            std::vector<std::string>{});
+        if (pubs.status() != PGRES_TUPLES_OK || PQntuples(pubs.get()) != 1)
+            return failed("KPI publisher count", pubs);
+
+        // meta: server receipt clock (now()), everything else from the just-built snapshot.
+        // Empty fleet: every KPI 0 with refreshed_at > 0 ("refreshed but empty", distinct from
+        // "building"). RETURNING carries the result (#1033 idiom). The singleton row is seeded
+        // by migration v8, so a plain UPDATE reaches it; sprawl = 3+ distinct versions.
+        if (abort_requested())
+            return false;
+        const std::string title_grain = std::to_string(sc::kGrainTitle);
         pg::PgResult m = pg::exec_params(
             c,
-            "INSERT INTO software_inventory_store.catalog_rollup_meta "
-            "(id, refreshed_at, total_titles, total_devices) "
-            "VALUES (1, EXTRACT(EPOCH FROM now())::bigint, "
-            "  (SELECT count(*) FROM software_inventory_store.catalog_rollup), "
-            "  (SELECT count(DISTINCT agent_id) FROM software_inventory_store.installed_software)) "
-            "ON CONFLICT (id) DO UPDATE SET refreshed_at = EXCLUDED.refreshed_at, "
-            "  total_titles = EXCLUDED.total_titles, total_devices = EXCLUDED.total_devices "
-            "RETURNING id",
-            std::vector<std::string>{});
-        return m.status() == PGRES_TUPLES_OK;
+            ("UPDATE software_inventory_store.catalog_rollup_meta SET "
+             "refreshed_at = EXTRACT(EPOCH FROM now())::bigint, "
+             "total_titles = (SELECT count(*) FROM software_inventory_store.catalog_rollup "
+             "WHERE grain = " + title_grain + "), "
+             "total_devices = (SELECT count(DISTINCT agent_id) FROM "
+             "software_inventory_store.installed_software), "
+             "total_publishers = $1::bigint, "
+             "total_installs = (SELECT coalesce(sum(device_count), 0) FROM "
+             "software_inventory_store.catalog_rollup WHERE grain = " + title_grain + "), "
+             "installs_windows = $2::bigint, installs_macos = $3::bigint, "
+             "installs_linux = $4::bigint, installs_other = $5::bigint, "
+             "current_installs = (SELECT coalesce(sum(newest_installs), 0) FROM newest_tmp), "
+             "current_total = (SELECT coalesce(sum(c.device_count), 0) FROM "
+             "software_inventory_store.catalog_rollup c JOIN newest_tmp nt ON nt.name = c.name "
+             "WHERE c.grain = " + title_grain + "), "
+             "current_titles = (SELECT count(*) FROM newest_tmp), "
+             "sprawl_titles = (SELECT count(*) FROM software_inventory_store.catalog_rollup "
+             "WHERE grain = " + title_grain + " AND version_count >= 3), "
+             "rpm_total = $6::bigint, rpm_unsigned = $7::bigint "
+             "WHERE id = 1 RETURNING id")
+                .c_str(),
+            std::vector<std::string>{
+                PQgetvalue(pubs.get(), 0, 0), PQgetvalue(fam.get(), 0, 0),
+                PQgetvalue(fam.get(), 0, 1), PQgetvalue(fam.get(), 0, 2),
+                PQgetvalue(fam.get(), 0, 3), PQgetvalue(rpm.get(), 0, 0),
+                PQgetvalue(rpm.get(), 0, 1)});
+        if (m.status() != PGRES_TUPLES_OK)
+            return failed("catalog_rollup_meta update", m);
+        if (PQntuples(m.get()) != 1) {
+            spdlog::warn("SoftwareInventoryStore: catalogue rollup refresh found no "
+                         "catalog_rollup_meta id=1 row to update — keeping last-good (the "
+                         "catalogue stays 'building')");
+            return false;
+        }
+        return true;
     });
 }
 
@@ -1091,7 +1560,9 @@ std::optional<CatalogRollupMeta> SoftwareInventoryStore::catalog_rollup_meta() {
     }
     pg::PgResult res = pg::exec_params(
         lease.get(),
-        "SELECT refreshed_at, total_titles, total_devices "
+        "SELECT refreshed_at, total_titles, total_devices, total_publishers, total_installs, "
+        "installs_windows, installs_macos, installs_linux, installs_other, current_installs, "
+        "current_total, current_titles, sprawl_titles, rpm_total, rpm_unsigned "
         "FROM software_inventory_store.catalog_rollup_meta WHERE id = 1",
         std::vector<std::string>{});
     if (res.status() != PGRES_TUPLES_OK) {
@@ -1107,6 +1578,18 @@ std::optional<CatalogRollupMeta> SoftwareInventoryStore::catalog_rollup_meta() {
         m.refreshed_at = result_i64(res, 0, 0);
         m.total_titles = result_i64(res, 0, 1);
         m.total_devices = result_i64(res, 0, 2);
+        m.total_publishers = result_i64(res, 0, 3);
+        m.total_installs = result_i64(res, 0, 4);
+        m.installs_windows = result_i64(res, 0, 5);
+        m.installs_macos = result_i64(res, 0, 6);
+        m.installs_linux = result_i64(res, 0, 7);
+        m.installs_other = result_i64(res, 0, 8);
+        m.current_installs = result_i64(res, 0, 9);
+        m.current_total = result_i64(res, 0, 10);
+        m.current_titles = result_i64(res, 0, 11);
+        m.sprawl_titles = result_i64(res, 0, 12);
+        m.rpm_total = result_i64(res, 0, 13);
+        m.rpm_unsigned = result_i64(res, 0, 14);
     }
     return m;
 }

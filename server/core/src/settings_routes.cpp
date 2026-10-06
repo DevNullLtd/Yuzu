@@ -9,6 +9,7 @@
 
 #include <atomic>
 #include <cstdio>
+#include <format>
 
 #include "access_review_model.hpp" // Periodic Access Reviews (SOC 2 CC6.2) — pure read-model
 #include "access_review_store.hpp" // Periodic Access Reviews — campaign persistence
@@ -25,6 +26,7 @@
 #include "rbac_store.hpp"       // access-review read-model direct-grant reads
 #include "tag_store.hpp" // F2a PR3: TagStore::validate_key for the cohort export key
 #include "mfa_qr.hpp"
+#include "password_policy.hpp" // #5342 — the ONE local password length policy
 #include "plugin_signing_helpers.hpp"
 #include "rest_a4_envelope.hpp"      // #4028 — detail::error_json_a4 for the settings read-twins
 #include "rest_a4_envelope_http.hpp" // #4028 — detail::a4_error/ensure_correlation_id
@@ -537,7 +539,9 @@ std::string SettingsRoutes::render_users_fragment(const std::string& current_use
     if (users.empty()) {
         html += "<tr><td colspan=\"3\" style=\"color:#484f58\">No users</td></tr>";
     } else {
+        std::size_t row_index = 0;
         for (const auto& u : users) {
+            const std::size_t this_row = row_index++;
             auto role_str = auth::role_to_string(u.role);
             auto cls = (u.role == auth::Role::admin) ? "role-admin" : "role-user";
             const bool is_self = !current_username.empty() && u.username == current_username;
@@ -545,12 +549,30 @@ std::string SettingsRoutes::render_users_fragment(const std::string& current_use
             // an auto-provisioned `oidc:<iss>#<sub>` principal) now appears
             // in this list. Its `username` fails the STRICT
             // `is_valid_username` gate that guards local-account mutation
-            // routes (delete, password-reset, role-change — see
-            // auth_db.hpp's `is_valid_principal` doc), so those buttons are
-            // suppressed for it below rather than rendering a button that
-            // always 400s. Session-revoke and elevation-eligibility are
-            // principal-keyed (`is_valid_principal`) and stay available.
+            // routes (delete, role-change — see auth_db.hpp's
+            // `is_valid_principal` doc), so those buttons are suppressed for
+            // it below rather than rendering a button that always 400s. (The
+            // #5342 password routes, POST /api/v1/users/me/password and
+            // POST /api/v1/users/{name}/password, refuse SSO/SCIM accounts
+            // too — 409 "not a local account" — so their password buttons
+            // are suppressed on such rows as well.) Session-revoke and
+            // elevation-eligibility are principal-keyed (`is_valid_principal`)
+            // and stay available.
             const bool is_sso = u.identity_source != "local";
+            // #5342 — password buttons: own LOCAL row → "Change password"
+            // (current/new/confirm → POST /api/v1/users/me/password); any
+            // other LOCAL row → "Reset password" (new/confirm → POST
+            // /api/v1/users/{name}/password). A SCIM row carries
+            // identity_source='scim' (scim_routes.cpp), so `is_sso` covers it;
+            // the server's own local-account classification (409 not_local)
+            // stays authoritative for any row this view misjudges. The form
+            // is a hidden sibling <tr>, keyed by row index (never by the
+            // username, so no username reaches an id or a JS string); the
+            // username rides only in an html_escape'd data-username attribute
+            // read back with getAttribute. Submission is a body-level
+            // delegated listener in settings_ui.cpp — no hx-on (CSP).
+            const bool pw_button = !is_sso;
+            const std::string pw_row_id = "pw-row-" + std::to_string(this_row);
             html += "<tr><td>" + html_escape(u.username);
             if (is_sso) {
                 html += " <span class=\"role-badge\" style=\"background:#1f6feb22;"
@@ -583,13 +605,27 @@ std::string SettingsRoutes::render_users_fragment(const std::string& current_use
                         "Current user</span>"
                         "<button class=\"btn btn-secondary\" "
                         "style=\"padding:0.2rem 0.6rem;font-size:0.7rem\" "
-                        "hx-delete=\"/api/v1/sessions/me\" "
+                        "hx-delete=\"/api/v1/sessions/me\" hx-swap=\"none\" "
+                        "data-signout-everywhere=\"1\" "
                         "hx-confirm=\"Sign out of every device AND revoke "
                         "every API token you own? You will be redirected to "
                         "the login page; any of your CI/CD or automation "
-                        "tokens will need to be re-issued.\" "
-                        "hx-on::after-request=\"window.location='/login'\""
+                        "tokens will need to be re-issued.\""
                         ">Sign out everywhere</button>";
+                // The post-request redirect is a body-level
+                // `htmx:afterRequest` listener keyed on
+                // data-signout-everywhere (settings_ui.cpp): the former
+                // `hx-on::after-request` is compiled by htmx with
+                // `new Function()`, which the dashboard CSP (no
+                // 'unsafe-eval') blocks at runtime — the redirect silently
+                // never ran.
+                if (pw_button) {
+                    html += "<button type=\"button\" class=\"btn btn-secondary\" "
+                            "style=\"padding:0.2rem 0.6rem;font-size:0.7rem;"
+                            "margin-left:0.3rem\" "
+                            "data-pw-toggle=\"" +
+                            pw_row_id + "\">Change password</button>";
+                }
             } else {
                 // governance round (arch-S1) — the query-parameter VALUE
                 // must be URL-encoded, not HTML-escaped: `html_escape`
@@ -632,8 +668,51 @@ std::string SettingsRoutes::render_users_fragment(const std::string& current_use
                             "&quot;?\""
                             ">Remove</button>";
                 }
+                if (pw_button) {
+                    html += "<button type=\"button\" class=\"btn btn-secondary\" "
+                            "style=\"padding:0.2rem 0.6rem;font-size:0.7rem;"
+                            "margin-left:0.3rem\" "
+                            "data-pw-toggle=\"" +
+                            pw_row_id + "\">Reset password</button>";
+                }
             }
             html += "</td></tr>";
+            if (pw_button) {
+                const std::string esc_user = html_escape(u.username);
+                html += "<tr class=\"pw-form-row\" id=\"" + pw_row_id +
+                        "\" hidden><td colspan=\"3\">"
+                        "<form class=\"add-user-form pw-form\" data-pw-action=\"" +
+                        std::string(is_self ? "self" : "reset") + "\" data-username=\"" +
+                        esc_user + "\" data-pw-row=\"" + pw_row_id + "\">";
+                if (is_self) {
+                    // Hidden username field: lets a password manager file
+                    // the new credential under the right account.
+                    html += "<input type=\"text\" name=\"username\" value=\"" + esc_user +
+                            "\" autocomplete=\"username\" hidden readonly>"
+                            "<div class=\"mini-field\"><label>Current password</label>"
+                            "<input type=\"password\" name=\"current_password\" "
+                            "autocomplete=\"current-password\" maxlength=\"1024\" "
+                            "required></div>";
+                }
+                html += "<div class=\"mini-field\"><label>New password <span "
+                        "style=\"color:#8b949e;font-weight:normal;font-size:0.7rem\">"
+                        "(12-1024 bytes)</span></label>"
+                        "<input type=\"password\" name=\"new_password\" "
+                        "autocomplete=\"new-password\" minlength=\"12\" maxlength=\"1024\" "
+                        "required></div>"
+                        "<div class=\"mini-field\"><label>Confirm new password</label>"
+                        "<input type=\"password\" name=\"confirm_password\" "
+                        "autocomplete=\"new-password\" minlength=\"12\" maxlength=\"1024\" "
+                        "required></div>"
+                        "<button class=\"btn btn-primary\" type=\"submit\">" +
+                        std::string(is_self ? "Change password" : "Reset password") +
+                        "</button>"
+                        "<button class=\"btn btn-secondary\" type=\"button\" "
+                        "data-pw-toggle=\"" +
+                        pw_row_id +
+                        "\">Cancel</button>"
+                        "</form></td></tr>";
+            }
         }
     }
 
@@ -647,9 +726,9 @@ std::string SettingsRoutes::render_users_fragment(const std::string& current_use
             "  </div>"
             "  <div class=\"mini-field\">"
             "    <label>Password <span style=\"color:#8b949e;font-weight:normal;"
-            "font-size:0.7rem\">(min 12 chars)</span></label>"
+            "font-size:0.7rem\">(12-1024 bytes)</span></label>"
             "    <input type=\"password\" name=\"password\" placeholder=\"password\" "
-            "           minlength=\"12\" required>"
+            "           minlength=\"12\" maxlength=\"1024\" required>"
             "  </div>"
             "  <div class=\"mini-field\">"
             "    <label>Role</label>"
@@ -666,6 +745,11 @@ std::string SettingsRoutes::render_users_fragment(const std::string& current_use
 }
 
 namespace {
+// #5342 Gate 8 (F4): the Settings MFA init/verify refusal when the account's
+// password changed during the enrolment (AuthDBError::CredentialChanged).
+constexpr const char* kMfaCredentialChangedMsg =
+    "Your password changed during enrolment — sign in again";
+
 // Shown INSTEAD of a table when the enrollment store cannot be read (WS-6 6.2):
 // an outage must never render as an empty list ("No tokens created") — that
 // would tell an operator there is nothing to act on when the truth is unknown.
@@ -4832,21 +4916,42 @@ void SettingsRoutes::register_routes(
                             "application/json");
             return;
         }
-        // C1 FIX: Self-password-change is allowed, but role is always 'user' on creation.
-        // Role changes must go through POST /api/settings/users/:username/role.
-        // The self-demotion guard is no longer needed on this path since
-        // new users are always created as 'user' role.
+        // C1 FIX: this route CREATES users only — role is always 'user' on
+        // creation, and an existing username was already refused (409) above,
+        // so it can never change anyone's password (AuthDB::upsert_user is
+        // INSERT-only). Role changes go through POST
+        // /api/settings/users/:username/role; password changes go through the
+        // #5342 REST v1 routes — POST /api/v1/users/me/password (self, proves
+        // the current password) and POST /api/v1/users/{name}/password (admin
+        // reset). The self-demotion guard is not needed on this path since new
+        // users are always created as 'user' role.
+        //
+        // #5342: the over-max case gets its own message (the shared policy in
+        // password_policy.hpp); upsert_user's `false` cannot distinguish it from
+        // "too short".
+        // Messages built from the shared policy constants (password_policy.hpp),
+        // never a restated number that could drift from the check itself.
+        if (auth::check_password_policy(password) == auth::PasswordPolicyVerdict::kTooLong) {
+            audit_fn_(req, "user.create", "denied", "User", username, "too_long");
+            const auto msg =
+                std::format("Password must be at most {} bytes", auth::kMaxPasswordBytes);
+            res.status = 400;
+            res.set_header("HX-Trigger",
+                           std::format(R"({{"showToast":{{"message":"{}","level":"error"}}}})", msg));
+            res.set_content(detail::a4_error(res, msg), "application/json");
+            return;
+        }
         if (!auth_mgr_->upsert_user(username, password, role)) {
             spdlog::warn("POST /api/settings/users: upsert rejected for '{}' "
-                         "(weak_password — minimum 12 characters)",
-                         username);
+                         "(weak_password — minimum {} bytes)",
+                         username, auth::kMinPasswordBytes);
             audit_fn_(req, "user.create", "denied", "User", username, "weak_password");
+            const auto msg =
+                std::format("Password must be at least {} bytes", auth::kMinPasswordBytes);
             res.status = 400;
-            res.set_header(
-                "HX-Trigger",
-                R"({"showToast":{"message":"Password must be at least 12 characters","level":"error"}})");
-            res.set_content(detail::a4_error(res, "Password must be at least 12 characters"),
-                            "application/json");
+            res.set_header("HX-Trigger",
+                           std::format(R"({{"showToast":{{"message":"{}","level":"error"}}}})", msg));
+            res.set_content(detail::a4_error(res, msg), "application/json");
             return;
         }
         if (!auth_mgr_->save_config()) {
@@ -6645,7 +6750,23 @@ void SettingsRoutes::register_routes(
                 "text/html; charset=utf-8");
             return;
         }
-        auto init = db->mfa_init_enrollment(session->username, "Yuzu");
+        // #5342 Gate 8 (F4): no proven hash here — the store anchors the mint
+        // to the hash it reads in this same call, so a password change/reset
+        // that commits while the mint waits on its row lock refuses it.
+        auto init = db->mfa_init_enrollment(session->username, "Yuzu",
+                                            /*expected_password_hash_hex=*/std::nullopt);
+        if (!init && init.error() == AuthDBError::CredentialChanged) {
+            // The credential change is revoking this session; nothing was
+            // revealed or written. ONE detail token across every
+            // credential_changed refusal site (login init, login confirm,
+            // Settings init/verify).
+            audit_fn_(req, "mfa.enroll.failed", "error", "User", session->username,
+                      "credential_changed");
+            res.set_content(render_mfa_fragment(session->username, {}, {}, {}, {},
+                                                kMfaCredentialChangedMsg),
+                            "text/html; charset=utf-8");
+            return;
+        }
         if (!init) {
             const char* msg = "Enrollment failed";
             if (init.error() == AuthDBError::MfaAlreadyEnrolled) {
@@ -6694,7 +6815,21 @@ void SettingsRoutes::register_routes(
                                       "text/html; charset=utf-8");
                       return;
                   }
-                  auto codes_res = db->mfa_verify_enrollment(session->username, code);
+                  auto codes_res = db->mfa_verify_enrollment(session->username, code,
+                                                             /*expected_password_hash_hex=*/std::nullopt);
+                  if (!codes_res && codes_res.error() == AuthDBError::CredentialChanged) {
+                      // #5342 Gate 8 (F4): the password changed while this
+                      // enrolment was being confirmed — nothing
+                      // was enrolled and no recovery codes were issued. No
+                      // retry form (the provisional secret was discarded with
+                      // the credential change); the session is being revoked.
+                      audit_fn_(req, "mfa.enroll.failed", "error", "User", session->username,
+                                "credential_changed");
+                      res.set_content(render_mfa_fragment(session->username, {}, {}, {}, {},
+                                                          kMfaCredentialChangedMsg),
+                                      "text/html; charset=utf-8");
+                      return;
+                  }
                   if (!codes_res) {
                       // Re-render the verify form (no QR re-reveal — the
                       // provisional row survives so the operator's

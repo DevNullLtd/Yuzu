@@ -24,6 +24,7 @@ __declspec(allocate(".CRT$XCB"))
 #include <yuzu/agent/subprocess_runner.hpp>
 #include <yuzu/agent/trigger_engine.hpp>
 #include <yuzu/agent/updater.hpp>
+#include <yuzu/agent/update_signature_mode.hpp>
 #include <yuzu/metrics.hpp>
 #include <yuzu/secure_zero.hpp>
 #include <yuzu/version.hpp>
@@ -77,6 +78,7 @@ __declspec(allocate(".CRT$XCB"))
 #include <unistd.h>      // gethostname
 #endif
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -95,6 +97,7 @@ __declspec(allocate(".CRT$XCB"))
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 namespace yuzu::agent {
@@ -975,6 +978,8 @@ public:
                 // or outside [A-Za-z0-9_]) — distinct from a reserved-name
                 // attempt so operators can alert on crafted-name loads.
                 reason = "invalid_name";
+            } else if (err.reason.starts_with(yuzu::agent::kDuplicateNameReason)) {
+                reason = "duplicate_name";
             } else if (err.reason.starts_with(yuzu::agent::kSignatureMissingReason)) {
                 reason = "signature_missing";
             } else if (err.reason.starts_with(yuzu::agent::kSignatureUntrustedReason)) {
@@ -2131,6 +2136,14 @@ public:
                                          yuzu::agent::Updater::effective_check_interval(
                                              cfg_.update_check_interval)
                                              .count());
+                            // #5249 Gate 7: the trust-bundle load warning, here (on the
+                            // OTA update thread, before the check loop) and not in main()
+                            // (which runs before the Windows SCM hand-off). Once per
+                            // process; noexcept, reporting only.
+                            if (!ota_bundle_probe_logged_.exchange(true))
+                                yuzu::agent::log_update_trust_bundle_probe(UpdateConfig{
+                                    .signature_trust_bundle = cfg_.update_trust_bundle,
+                                    .require_signature = cfg_.update_require_signature});
                         },
                         [this]() {
                             spdlog::info("OTA update applied - agent will restart");
@@ -2161,6 +2174,9 @@ public:
                     const YuzuPluginDescriptor* app_usage_descriptor = nullptr;
                     for (const auto& handle : plugins_) {
                         const std::string_view pname{handle.descriptor()->name};
+                        // The loader rejects duplicate names at scan (kDuplicateNameReason),
+                        // so plugins_ carries unique names and emplace-first cannot diverge
+                        // from last-wins siblings (tar_descriptor-style lookups).
                         sync_plugins.emplace(std::string(pname), handle.descriptor());
                         if (pname == "tar")
                             tar_descriptor = handle.descriptor();
@@ -2398,6 +2414,38 @@ public:
                         // ratio. Lambda-local so a reconnect re-baselines (a new
                         // session ships no rate until it has ≥2 readings again).
                         netq::RetransWindow hb_net_retrans_window;
+                        // #4472 hardening: the Guardian heartbeat emit block below is
+                        // split into independently contained groups (the heartbeat loop
+                        // has no enclosing try/catch). One failure counter per group,
+                        // lambda-local (a reconnect starts again); the warn fires on the
+                        // 1st failure and every 100th after it, so a persistent fault
+                        // stays visible without unbounded log volume. The text passed in
+                        // is always a string literal: never tag keys, values or what().
+                        enum HbGuardianGroup : std::size_t {
+                            kHbGuardianMaintenance,
+                            kHbGuardianLegacySink,
+                            kHbGuardianGeneration,
+                            kHbGuardianTags,
+                            kHbGuardianSparkHealth,
+                            kHbGuardianGroupCount
+                        };
+                        std::array<std::uint64_t, kHbGuardianGroupCount> hb_guardian_failures{};
+                        auto hb_guardian_contain = [&hb_guardian_failures](
+                                                       HbGuardianGroup group,
+                                                       const char* message) noexcept {
+                            const auto n = ++hb_guardian_failures[group];
+                            if (n != 1 && n % 100 != 0)
+                                return;
+                            // The fault may be an allocation failure, so the warn is
+                            // itself contained: this handler must never re-open the
+                            // termination path it exists to close.
+                            try {
+                                spdlog::warn("{} (failure count {}; logged on the first "
+                                             "and every 100th failure)",
+                                             message, n);
+                            } catch (...) {
+                            }
+                        };
                         while (!should_stop()) {
                             // Sleep in small increments for responsive shutdown
                             auto remaining = cfg_.heartbeat_interval;
@@ -2455,6 +2503,19 @@ public:
                                             return kv_store_->get(p, k);
                                         });
                                 }
+                                // Skip streak/reason of each sync source, read from the
+                                // __sync__ KV (never the scheduler's own state).
+                                std::shared_ptr<SyncScheduler> sched;
+                                {
+                                    std::lock_guard<std::mutex> lk(sync_sched_mu_);
+                                    sched = sync_scheduler_;
+                                }
+                                if (sched && kv_store_)
+                                    yuzu::agent::emit_sync_skip_tags(
+                                        tags, sched->source_names(),
+                                        [this](const std::string& k) {
+                                            return kv_store_->get(kSyncKvNamespace, k);
+                                        });
                             } catch (const std::exception& e) {
                                 spdlog::warn("Heartbeat plugin-tag bridge failed: {}", e.what());
                             } catch (...) {
@@ -2512,6 +2573,21 @@ public:
                                 tags["yuzu.ota_signature_refused"] =
                                     std::to_string(static_cast<int64_t>(refused));
                             }
+                            // #5249: the OTA update-signature mode this process
+                            // enforces (off / bundle / bundle+require), so a fleet
+                            // view CAN find agents that are NOT verifying update
+                            // signatures once the server surfaces the tag; today
+                            // it is stored in the agent-health snapshot and read
+                            // by nothing (the startup log line is the per-endpoint
+                            // verification). Without it, an agent whose bundle flag
+                            // was dropped or misspelt looks exactly like an
+                            // enforcing one: the refusal tag above stays 0 either
+                            // way. Same two Config fields the Updater is built
+                            // from, so the tag cannot disagree with enforcement.
+                            yuzu::agent::emit_update_signature_mode_tag(
+                                tags,
+                                UpdateConfig{.signature_trust_bundle = cfg_.update_trust_bundle,
+                                             .require_signature = cfg_.update_require_signature});
                             tags["yuzu.os"] = kAgentOs;
                             tags["yuzu.arch"] = kAgentArch;
                             tags["yuzu.agent_version"] = std::string{yuzu::kFullVersionString};
@@ -2523,6 +2599,25 @@ public:
                             // generation 0 — so an agent that has never received a
                             // push still converges once rules exist server-side.
                             if (guardian_) {
+                              // The Guardian emit block is four independently contained
+                              // groups (#4472 hardening): a bad_alloc / system_error from a
+                              // guardian accessor or a tag insert must never terminate the
+                              // heartbeat thread, and one failing group must not silence the
+                              // others. Order matters: A maintenance (each call in its own
+                              // try), B the generation tag (heartbeat_ingestion.cpp reads it
+                              // to decide whether to run the M5 missed-push reconcile, so it
+                              // must survive an A throw), C the older tags, D the newer
+                              // monitor-only gauges LAST so a fault in them cannot drop the
+                              // older signals. A throw skips only the rest of its own group
+                              // for this tick; the next tick retries. Never logs tag text.
+                              // None of this has a unit test (no fault-injection seam in the
+                              // heartbeat loop, and none was added for it): the log lines
+                              // and group boundaries are verified by reading.
+                              // Group A1: lifecycle-journal maintenance + ack drain.
+                              // What can throw: only the std::mutex lock inside
+                              // journal_maintenance_tick() (std::system_error); its own
+                              // persist and drain passes are firewalled internally.
+                              try {
                                 // Drive durable lifecycle-journal maintenance on the
                                 // heartbeat cadence: retry any persist a prior write left
                                 // pending, so a failed write self-heals with no new push /
@@ -2532,6 +2627,17 @@ public:
                                 // an acknowledgment this tick produces is visible on THIS
                                 // heartbeat rather than one late.
                                 guardian_->journal_maintenance_tick();
+                              } catch (...) {
+                                  hb_guardian_contain(kHbGuardianMaintenance,
+                                                      "Guardian heartbeat journal maintenance "
+                                                      "failed (the maintenance tick was skipped "
+                                                      "this tick)");
+                              }
+                              // Group A2: legacy-sink kick. legacy_sink_kick() is declared
+                              // noexcept (a throw would std::terminate before reaching this
+                              // handler), so the try is provably dead today; it is kept so
+                              // the group structure survives that signature being relaxed.
+                              try {
                                 // #4783 commit 4: legacy-sink loss visibility. Deliberately
                                 // NOT inside journal_maintenance_tick()'s prefer_spark_ gate
                                 // (nor any other prefer_spark_ conditional in this block) -
@@ -2541,8 +2647,25 @@ public:
                                 // every heartbeat, not only when Spark is preferred. See
                                 // GuardianEngine::legacy_sink_kick()'s own doc comment.
                                 guardian_->legacy_sink_kick();
+                              } catch (...) {
+                                  hb_guardian_contain(kHbGuardianLegacySink,
+                                                      "Guardian heartbeat legacy-sink kick "
+                                                      "failed (the kick was skipped this tick)");
+                              }
+                              // Group B: the generation tag, in its own try so it survives a
+                              // group-A throw. What can throw: only the std::mutex lock in
+                              // policy_generation() (std::system_error) or the tag insert.
+                              try {
                                 tags["yuzu.guardian_generation"] =
                                     std::to_string(guardian_->policy_generation());
+                              } catch (...) {
+                                  hb_guardian_contain(kHbGuardianGeneration,
+                                                      "Guardian heartbeat generation tag failed "
+                                                      "(the generation tag was skipped this "
+                                                      "tick)");
+                              }
+                              // Group C: the older Guardian tags, emitted exactly as before.
+                              try {
                                 // Sparse durable-journal telemetry (item 7 PR-Ag §8): only
                                 // non-zero counters ship, so a quiescent / inert journal adds
                                 // no heartbeat tags.
@@ -2603,6 +2726,8 @@ public:
                                             guardian_->legacy_sink_events_lost(),
                                         .legacy_sink_gap_rules =
                                             guardian_->legacy_sink_gap_rules(),
+                                        // (the #5403 disarm_deadline_elapsed count rides
+                                        // collect_guardian_spark_health_tags below)
                                         .legacy_sink_dropped_unwired =
                                             guardian_->legacy_sink_dropped_unwired()});
                                 // F7 (#2298 rung 2): per-type CURRENT count of rules classified
@@ -2616,6 +2741,30 @@ public:
                                 // routine per-rule Unsupported classification.
                                 emit_guardian_backend_heartbeat_tag(
                                     tags, guardian_->prefer_spark(), guardian_->spark_availability());
+                              } catch (...) {
+                                  hb_guardian_contain(kHbGuardianTags,
+                                                      "Guardian heartbeat tag emit failed (the "
+                                                      "rest of the older Guardian tags were "
+                                                      "skipped this tick)");
+                              }
+                              // Group D (LAST): #5404 / #5403 / #4472: the Spark claim-
+                              // lifecycle counters, the retained-tombstone count and the two
+                              // claim AGE gauges (the pending-Disarm age and the
+                              // outstanding-compensation age; absent while nothing is
+                              // pending, never a fabricated 0). One helper, the ONE place
+                              // this assembly lives (guardian_health_heartbeat.hpp); a call
+                              // dropped INSIDE the helper is a red unit test, but deleting
+                              // THIS single call site is not caught by any test. Never gated
+                              // on prefer_spark_.
+                              try {
+                                yuzu::agent::collect_guardian_spark_health_tags(
+                                    *guardian_, tags, std::chrono::steady_clock::now());
+                              } catch (...) {
+                                  hb_guardian_contain(kHbGuardianSparkHealth,
+                                                      "Guardian heartbeat claim-health gauges "
+                                                      "failed (the claim-health tags were "
+                                                      "skipped this tick)");
+                              }
                             }
 #if defined(_WIN32) || defined(__linux__) || defined(__APPLE__)
                             // DEX signal observer (every platform with a real observer —
@@ -4424,6 +4573,10 @@ private:
         }
     }
     OtaUpdateThread update_thread_;
+    // #5249 Gate 7: the OTA trust-bundle warning is logged once per process: 4b
+    // re-spawns update_thread_ on every reconnect (the reconnect teardown joins it
+    // before the next spawn).
+    std::atomic<bool> ota_bundle_probe_logged_{false};
     std::thread heartbeat_thread_;
     std::thread sync_thread_; // ADR-0016 daily-sync thread (per-connection)
 

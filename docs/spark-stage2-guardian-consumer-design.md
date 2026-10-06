@@ -541,7 +541,11 @@ advisor, ruled by Dave; previously flagged open by round 7's adversarial review;
 waiter's own expiry nor a congestion refusal at dispatch (since #5168 parked as a
 Queued head and redriven, ending as a queue-wait expiry if it is never admitted) is
 K-qualifying; only a dispatched-and-timed-out operation
-whose claim is still retained is. Both congestion outcomes therefore hold the
+whose claim is still retained is. A claim whose late result has already returned and is in
+compensating teardown (its compensating disarm is outstanding) is not K-qualifying either
+(#4472): the arm is no longer physically stuck, and waiving it would acknowledge the
+generation while the teardown is about to pop the claim with no replacement arm. Both
+congestion outcomes therefore hold the
 acknowledgment, exactly as R5.3's "genuine refusal" list already did for "arm queue
 full" - the two sections now agree. Accepted cost, stated as a load consequence rather
 than a silent side effect: sustained same-type mechanism contention
@@ -617,6 +621,33 @@ Unit 6; `GuardianArmAckLedger::drain_locked()` (R5.3) is the production caller o
 unreachable outside engine shutdown; every real backend arm failure now surfaces
 only asynchronously, through the ledger's drain (R5.3 below).
 
+**R5.2 as implemented (#4605 / #5322 / #5323): ownership is asked of the index, and a
+dead `Queued` claim is never dispatched.** (1) A claim's `index_held` is its own belief,
+not proof: a wedge adoption can move the rule's one `(rule_id -> key, generation)`
+mapping to another key while the claim keeps the flag. The drain therefore commits a
+claim only if `SparkKeyRuleIndex::owns()` agrees (#4605, S2: ownership decides the
+winner), and a claim that no longer owns its mapping releases as a successful no-op.
+(2) A dead `Queued` Arm claim (withdrawn, waiter-abandoned, outcome-bearing or carrying a
+commit exception) is never selected for dispatch (`is_dead_claim`); the dispatch entry
+guard is narrower (withdrawn or commit-exception only). `expire_overdue_claims()`'s
+reaper pops terminal `Queued` heads with one index-release attempt per tombstone per
+pass (at most two in the pass that synthesizes the outcome of a withdrawn or waiter-abandoned head
+that has none; the second is a no-op if the first succeeded) and refills the follower it
+exposes; a synthesized outcome wakes blocking waiters at once, even if the release that
+follows it fails; an attach on a key that already has a `keys_`
+entry joins that watcher instead of queuing; `on_subscription_lost` never leaves `keys_`
+holding the dead subscription id; and an orphan watcher (index refcount 0, no claim) of an
+io-class type (File, Registry, Service) is given a durable Disarm claim by the same
+heartbeat pass (an inline-type key is left alone). (3) An abandoned `Queued` claim whose
+release fails is retained as a tombstone instead of being erased with its mapping
+(#5323). Four distinctions the counters and `retained_tombstones()` rely on: a tombstone
+holds a genuine mapping (`index_held` AND `owns()`), a stale local flag does not; a pending
+clean claim is not a committed claim left in a fifo (the reaper pops the latter without
+counting it as a released tombstone); `orphan_disarms_started` counts an orphan Disarm claim
+queued, not a backend teardown completed; and the reaper leaves a key alone
+while its head claim is in flight (it only pops a `Queued` head), so recovery there waits for
+that claim's completion. The flip-gate rows are in `docs/spark-flip-gate.md`.
+
 **R5.3 - Ack model: accepted vs. acknowledged.** **Acknowledged ≠ compliant/enforced,
 stated explicitly (Gate 6 compliance-officer) — mirroring this codebase's own
 "flag ≠ revoke" precedent for a similarly-named-but-distinct signal** (Periodic Access
@@ -676,6 +707,13 @@ admission-rejected rule counts as accepted-and-unresolved for the predicate.
 **Completion ownership survives K:** a K-waived rule's dispatched operation still has
 an owner (its retained per-key claim, R5.2), and its eventual result is applied under
 ruling 14(b); acknowledging the generation never discards or orphans that completion.
+That is resource ownership only. A claim whose late result has returned and is being
+compensated (its compensating disarm is outstanding) is NOT K-eligible (#4472), so
+its generation is held, not acknowledged. And desired-state recovery after an
+unadopted late FAILURE (or any late result that is not adopted) on an already
+K-waived rule still depends on the server's re-push, which the acknowledgment
+suppresses: that gap has no engine recovery owner and is tracked in #5459, an open
+accept-or-recover decision.
 **Three separate transitions, never collapsed:** wedge-release (the wedged
 worker's call returns and clears the marker), arm-recovery (a still-wanted rule's late
 success commits and clears its `arm_failed` entry), and policy-acknowledgment (the
@@ -810,6 +848,14 @@ together in prose but which do not share one signal in code:
   increments `wedge_adopt_stale_refused` and compensates the stale subscription
   without touching the live generation. A re-observation after another key
   commits can reach this refusal during ordinary desired-state churn.
+  The hoisted Reobserved branch still touches no index state (#4605): a rule
+  re-observed on key A while a same-rule claim is in flight on key B is not
+  withdrawn from B, and when A's wedge then adopts, `index_->add` moves the
+  rule's mapping to A. B's claim keeps its stale `index_held`, but the drain
+  commits only a claim for which `SparkKeyRuleIndex::owns()` agrees, so B
+  cannot commit after a withdrawal or over the adopted rule (S2, ownership
+  decides the winner). Last-attach-wins for the same-rule case (S1) is a
+  recorded follow-up decision, not implemented here.
 
   **Cost:** let N be the total FIFO population, C the rule_ids with claims,
   R the committed rules, f the largest FIFO, and R_idx/K_idx the ordered
@@ -907,8 +953,10 @@ explicit narrowing below.
   FIFO while `end` stays stuck at Wedged (the sticky-Wedged contract, PR-5d) -
   the "still-claimed" requirement this doc's own §A row already named in
   prose. `GuardianSparkRuntime::receipt_wedge_k_eligible()` closes both: `end
-  == WaiterTimedOutDispatched && dispatch == Dispatched &&` the claim is still
-  its key's FIFO front, evaluated under `registry_mu_` at TWO points -
+  == WaiterTimedOutDispatched && dispatch == Dispatched && compensation_finished &&`
+  the claim is still its key's FIFO front (the `compensation_finished` conjunct
+  is the #4472 addition: a claim whose compensating disarm is outstanding is not
+  K-eligible), evaluated under `registry_mu_` at TWO points -
   `GuardianArmAckLedger::drain_locked()`'s primary per-pending loop (never
   insert an unsettled classification into `failed_receipts` even for one
   tick), and its existing recovery-scan loop (re-validate every RETAINED entry
@@ -954,10 +1002,18 @@ explicit narrowing below.
   scope narrowing above). A completion that lands in that sub-tick gap - after
   the eligibility read, before `can_advance()`/`persist_generation_locked()` -
   does NOT revoke the current tick's decision: the eligibility read IS the
-  linearization point, not generation persistence. This produces the SAME end
-  state "Completion ownership survives K" already sanctions for the ordinary
-  case (a completion landing one tick AFTER acknowledgment) - the gap does not
-  make a new state reachable, only an earlier one. Do not "fix" this into a
+  linearization point, not generation persistence. This produces the same
+  state a completion landing one tick AFTER acknowledgment produces for the
+  ordinary case, which is the acknowledged-but-unarmed state. Whether that
+  state is acceptable is NOT decided: it is #5459, an open accept-or-recover
+  decision and a `prefer_spark_` flip precondition (`docs/spark-flip-gate.md`).
+  Its only signal today is `yuzu.guardian_arm_failed` > 0, which does not
+  distinguish a hung arm from an unowned late failure. The sub-tick gap
+  reaches the same state one tick earlier; it does not create a new one.
+  (The #4472 fix narrows K-eligibility, so a
+  claim whose compensating disarm is already outstanding at the read is not
+  eligible; it adds no runtime-owned waiver-permit latch, and the sub-tick gap
+  itself is not closed.) Do not "fix" this into a
   runtime-owned waiver-permit latch: the same sub-tick window would simply
   reopen between permit consumption and persistence, or during the interval
   before the server observes the acknowledgment - no achievable linearization
@@ -982,11 +1038,22 @@ explicit narrowing below.
   IDENTICAL server retry was never what un-wedges a key in the first place -
   up-2's Reobserved path re-observes the SAME existing claim without touching
   the stuck worker at all ("a wedged key stays wedged until its own worker
-  returns or the agent restarts" - unchanged by K-waiver). #4472's residual is
-  therefore UNCHANGED and UNAFFECTED by K-waiver: its mechanism, its healing
-  timeline (bounded by the compensating disarm's own I/O completion, not the
-  25s cadence), and its acceptance criteria all stand exactly as recorded
-  below, with no additional K-specific caveat needed.
+  returns or the agent restarts" - unchanged by K-waiver). **That
+  reassessment was wrong, and #4472 WAS affected by K-waiver.** A claim whose
+  compensating disarm was still outstanding at the heartbeat drain was
+  K-eligible (FIFO front, Dispatched, `WaiterTimedOutDispatched`), so the third
+  identical re-apply acknowledged the generation, the server stopped
+  re-pushing, and the compensation then popped the claim with no replacement
+  arm. Fixed: `is_wedge_k_eligible_locked` is false while
+  `compensation_finished` is false (set by `CompensationOwedMark` in
+  `on_arm_complete`'s first critical section), so the generation is held and
+  the server's re-push re-arms the rule after the teardown. While the teardown
+  is outstanding the generation is held and identical re-pushes continue, with
+  no bound other than the teardown returning. A K-waiver granted EARLIER for a
+  genuinely outstanding hung arm whose late result then fails, or is not
+  adopted, is NOT covered by this fix: no engine recovery owner exists for it,
+  and it is tracked in #5459. Reproduced by the `[4472]` tests (runtime plus
+  ledger level, and engine level).
 
 **Known accepted residual (governance Gate 4/8, rung 9c PR-5d /governance run,
 independently traced and REFUTED as permanent):** a withdraw immediately
@@ -995,8 +1062,10 @@ in-flight original claim's own eventual `on_arm_complete` - if the withdrawal's
 `rg->active = false` is observed by `on_arm_complete`'s adopt-check BEFORE the
 immediate re-add's Reobserved-restore runs, the restore reactivates a claim
 whose disposal is already decided (a compensating disarm is owed). This is
-NOT permanent: the disarm is bounded by the same I/O-completion class as the
-original `arm()` call, `finalize_arm_compensation()` unconditionally pops the
+NOT permanent: the K-waiver no longer opens this to permanent stranding (#4472 fix: a
+claim with an outstanding compensating disarm is not K-eligible, so the generation is
+held while the disarm is outstanding); the disarm is bounded by the same I/O-completion
+class as the original `arm()` call, `finalize_arm_compensation()` unconditionally pops the
 claim from its key's FIFO once that disarm completes regardless of
 `rg->active`'s value, and the re-add caller receives the ORIGINAL wedge's own
 already-decided outcome synchronously (never blocks, never silently succeeds)
@@ -1007,18 +1076,30 @@ flat ~25s cadence - it starts at the compensating disarm's own I/O completion,
 which is bounded by each mechanism's own `watch()`/`unwatch()` contract
 (`spark_mechanism.hpp`'s per-type-serialised, CATASTROPHIC-tier "must bound
 blocking OS work" invariant - unchanged and unweakened by this PR), not by the
-25s full-sync interval itself; the next full-sync Reapply is simply what
-eventually re-desires the key once that disarm has landed, on whatever cadence
-already governs this codebase's pre-existing disarm path. Tracked as #4472 (a
-regression test pinning this exact interleaving, and a decision on whether it
-becomes a named Spark-flip-ladder precondition), not a merge blocker.
+25s full-sync interval itself; the next full-sync Reapply AFTER the disarm lands
+is what re-desires the key, on whatever cadence already governs this codebase's
+pre-existing disarm path, and the generation is held (not acknowledged) until
+then. "Must bound blocking OS work" is a mechanism contract, not a
+runtime-enforced deadline: the runtime only observes a pending teardown
+(`yuzu.guardian_compensation_pending_age_seconds`,
+`yuzu.guardian_compensation_deadline_elapsed`) and never releases or cancels it.
+Tracked as #4472. The permanent-stranding half is fixed by the K-eligibility
+change described above; the bounded window this paragraph describes remains. The
+regression tests pinning this interleaving exist (the `[4472]` tests, runtime
+plus ledger level and engine level), and `docs/spark-flip-gate.md` already names
+re-running them as a required flip criterion, so whether #4472 becomes a named
+flip-ladder precondition is no longer an open question. The #4605 commit-time
+ownership check (R5.2 as implemented, #4605 / #5322 / #5323) does not change
+this: it does not fix #4472, because the Reobserved branch re-observes the same
+claim and does not touch the index.
 
 **A late FAILURE (refusal, not success) on a still-desired wedged rule is a
 no-op by construction, not a third mechanism**: the claim was already terminal
 (`Wedged`) at abandonment, `armed_live` is false when the backend eventually
 answers with a failure, and the adoption branch above requires a live
 subscription to commit - nothing new is armed, nothing new fails, and
-`arm_failed` correctly stays set (there is nothing to recover from a failure).
+`arm_failed` correctly stays set (no automatic re-arm is attempted; after K the
+server will not re-push either; whether that is acceptable is the open decision #5459).
 
 **Telemetry-tag semantics, flagged not specified (SHOULD, Gate 6 sre):**
 `yuzu.guardian_arm_pending`/`yuzu.guardian_arm_failed` (introduced here, wired in

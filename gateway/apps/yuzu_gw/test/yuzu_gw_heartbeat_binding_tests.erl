@@ -27,6 +27,7 @@
 -define(PENDING,  yuzu_gw_pending).
 -define(HB_HANDLER, yuzu_gw_heartbeat_binding_tests_events).
 -define(EVENTS_TAB, yuzu_gw_heartbeat_binding_tests_events_tab).
+-define(HOLDERS_TAB, yuzu_gw_heartbeat_binding_tests_holders_tab).
 -define(LOG_HANDLER, yuzu_gw_heartbeat_binding_tests_logs).
 -define(CTX_KEY, yuzu_test_conn_key).
 
@@ -89,6 +90,8 @@ binding_test_() ->
        fun lookup_session_contract/0},
       {"Register records the connection key in the pending row",
        fun register_records_conn_key/0},
+      {"Register with an upstream answer that is not a map fails without raising",
+       fun register_non_map_upstream_response/0},
       {"rejections produce a rate-limited summary log with no session id",
        fun rejection_log_is_rate_limited_and_id_free/0},
       {"Register and agent-connected info logs carry no session id",
@@ -121,6 +124,9 @@ setup() ->
     %% would not be the one the test reads from.
     catch ets:delete(?EVENTS_TAB),
     ?EVENTS_TAB = ets:new(?EVENTS_TAB, [named_table, public, ordered_set]),
+    %% Every holder() is recorded so the fixture teardown can reap it.
+    catch ets:delete(?HOLDERS_TAB),
+    ?HOLDERS_TAB = ets:new(?HOLDERS_TAB, [named_table, public, set]),
     catch telemetry:detach(?HB_HANDLER),
     ok = telemetry:attach_many(?HB_HANDLER,
                                [[yuzu, gw, heartbeat, rejected],
@@ -132,8 +138,10 @@ setup() ->
     Prev.
 
 cleanup(Prev) ->
+    reap_holders(),
     catch telemetry:detach(?HB_HANDLER),
     catch ets:delete(?EVENTS_TAB),
+    catch ets:delete(?HOLDERS_TAB),
     case Prev of
         {ok, V}   -> application:set_env(yuzu_gw, telemetry_gauge_interval_ms, V);
         undefined -> application:unset_env(yuzu_gw, telemetry_gauge_interval_ms)
@@ -154,7 +162,25 @@ uid(Prefix) ->
     iolist_to_binary([Prefix, "-", integer_to_list(erlang:unique_integer([positive]))]).
 
 holder() ->
-    spawn(fun() -> receive stop -> ok end end).
+    Pid = spawn(fun() -> receive stop -> ok end end),
+    true = ets:insert(?HOLDERS_TAB, {Pid}),
+    Pid.
+
+%% Fixture teardown: kill every holder this module spawned and wait until the
+%% registry's `all_agents' / per-agent pg groups no longer list one. A holder
+%% that outlives the module stays a member of the VM-wide pg group, where it
+%% never answers `yuzu_gw_agent' calls: a later module's `yuzu_gw_app:stop/1'
+%% would then spend a second per member in its drain loop.
+reap_holders() ->
+    Pids = try [P || {P} <- ets:tab2list(?HOLDERS_TAB)] catch error:badarg -> [] end,
+    Mons = [monitor(process, P) || P <- Pids],
+    [exit(P, kill) || P <- Pids],
+    [receive {'DOWN', M, process, _, _} -> ok after 5000 -> ok end || M <- Mons],
+    _ = wait_until(fun() ->
+            Members = try pg:get_members(yuzu_gw, all_agents) catch _:_ -> [] end,
+            [] =:= [P || P <- Pids, lists:member(P, Members)]
+        end, 5000),
+    ok.
 
 ctx_with(Key) ->
     ctx:set(ctx:background(), ?CTX_KEY, Key).
@@ -580,6 +606,27 @@ register_records_conn_key() ->
     ?assertEqual({ok, conn_a}, yuzu_gw_registry:lookup_pending_session(S)),
     ?assertMatch({ok, _, _}, beat(conn_a, S)),
     ?assertEqual(rejected(), beat(conn_b, S)).
+
+%% An OK from the upstream that is not a decoded response (no DATA frame):
+%% the handler answers INTERNAL like for an RPC error and stores nothing.
+register_non_map_upstream_response() ->
+    A = uid(<<"regnm">>),
+    Req = #{info => #{agent_id => A, hostname => <<"h">>}},
+    [begin
+         ok = meck:expect(yuzu_gw_upstream, proxy_register, fun(_) -> {ok, Bad} end),
+         Result = yuzu_gw_agent_service:register(ctx_with(conn_a), Req),
+         Lines = capture_logs(fun() ->
+             ?assertMatch({grpc_error, {?GRPC_STATUS_INTERNAL, _}},
+                          yuzu_gw_agent_service:register(ctx_with(conn_a), Req))
+         end),
+         ?assertMatch({grpc_error, {?GRPC_STATUS_INTERNAL, _}}, Result),
+         {grpc_error, {_, Message}} = Result,
+         ?assertEqual(nomatch, binary:match(Message, <<"body-marker">>)),
+         ?assertEqual([], [L || L <- Lines, binary:match(L, <<"body-marker">>) =/= nomatch]),
+         ?assertNotEqual([], [L || L <- Lines,
+                                   binary:match(L, <<"not a response message">>) =/= nomatch])
+     end || Bad <- [<<"body-marker">>, [<<"body-marker">>], undefined]],
+    ok.
 
 %%%===================================================================
 %%% Logging

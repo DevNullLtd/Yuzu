@@ -13809,6 +13809,7 @@ TEST_CASE("MCP execute_instruction: every target quarantined reports status="
     CHECK(sc["retry_after_ms"].is_null());
     CHECK(sc["agents_quarantined"] == 1);
     CHECK(sc["agents_unknown_plugin"] == 0);
+    CHECK(sc["agents_kill_switched_os"] == 0);
     auto text_str = sc["message"].get<std::string>();
     CHECK(text_str.find("quarantine") != std::string::npos);
     CHECK(text_str.find("permanent") != std::string::npos);
@@ -13964,6 +13965,61 @@ TEST_CASE("MCP execute_instruction: a plugin absent from every target's inventor
     CHECK(sc["agents_unknown_plugin"] == 1);
     REQUIRE_FALSE(ts.audit_details.empty());
     CHECK(ts.audit_details.back().find("plugin_not_found") != std::string::npos);
+}
+
+TEST_CASE("MCP execute_instruction: targets withheld by a per-OS kill switch report "
+          "status=kill_switched_os, non-retryable, with agents_kill_switched_os",
+          "[mcp][integration][execute][5294]") {
+    McpTestServer ts;
+    auto dispatch = [&](const std::string&, const std::string&, const std::vector<std::string>&,
+                        const std::string&, const std::unordered_map<std::string, std::string>&,
+                        const std::string&, const yuzu::server::DispatchCaller&)
+        -> yuzu::server::ConfinedDispatchOutcome {
+        return {.sent = 0,
+               .command_id = "cmd-osoff",
+               .kill_switched_os = {"agent-1"},
+               .kill_switched_os_count = 1};
+    };
+    ts.start_with_dispatch(dispatch, "operator");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":5294,"params":{"name":"execute_instruction","arguments":{"plugin":"os_info","action":"version"}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    auto& sc = body["result"]["structuredContent"];
+    CHECK(sc["status"] == "kill_switched_os");
+    CHECK(sc["agents_reached"] == 0);
+    CHECK(sc["retry_after_ms"].is_null());
+    CHECK(sc["agents_kill_switched_os"] == 1);
+    CHECK(sc["agents_unknown_plugin"] == 0);
+    REQUIRE_FALSE(ts.audit_details.empty());
+    CHECK(ts.audit_details.back().find("kill_switched_os") != std::string::npos);
+}
+
+TEST_CASE("MCP execute_instruction: an unreadable per-OS gate (degraded presence) reports "
+          "status=os_gate_unreadable, retryable after 5000 ms",
+          "[mcp][integration][execute][5294]") {
+    McpTestServer ts;
+    auto dispatch = [&](const std::string&, const std::string&, const std::vector<std::string>&,
+                        const std::string&, const std::unordered_map<std::string, std::string>&,
+                        const std::string&, const yuzu::server::DispatchCaller&)
+        -> yuzu::server::ConfinedDispatchOutcome {
+        return {.sent = 0, .command_id = "cmd-osgate", .os_gate_unreadable = true};
+    };
+    ts.start_with_dispatch(dispatch, "operator");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":5295,"params":{"name":"execute_instruction","arguments":{"plugin":"os_info","action":"version"}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    auto& sc = body["result"]["structuredContent"];
+    CHECK(sc["status"] == "os_gate_unreadable");
+    CHECK(sc["agents_reached"] == 0);
+    CHECK(sc["retry_after_ms"] == 5000);
+    REQUIRE_FALSE(ts.audit_details.empty());
+    CHECK(ts.audit_details.back().find("os_gate_unreadable") != std::string::npos);
 }
 
 TEST_CASE("MCP execute_instruction: a MIXED outcome (quarantined AND plugin-absent targets) "
@@ -17946,6 +18002,70 @@ TEST_CASE("MCP operator surface: set_plugin_kill_switch actually flips PluginCon
     CHECK(ts.audit_log[6] == "mcp.set_plugin_kill_switch|success");
 }
 
+TEST_CASE("MCP operator surface: set/get_plugin_kill_switch carry the os argument — a per-OS OFF "
+          "row withholds only that OS, audited under plugin@os; an unknown os is refused",
+          "[pg][mcp][integration][operator_surface]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, operator_surface_plugincfg_tpl);
+    PluginConfigPgWired w{db.dsn()};
+    McpTestServer ts;
+    ts.plugin_config_store_for_test = &w.store;
+    ts.start();
+
+    auto set_res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"set_plugin_kill_switch",)"
+        R"("arguments":{"plugin":"firewall","enabled":false,"reason":"windows leg","os":"windows"}}})");
+    REQUIRE(set_res);
+    CHECK(operator_surface_payload(set_res)["os"] == "windows");
+    // The real chokepoint decision: only windows is withheld.
+    CHECK(*w.store.kill_switch_decision("firewall", "block") ==
+          std::unordered_set<std::string>{"windows"});
+
+    auto win = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":2,"params":{"name":"get_plugin_kill_switch",)"
+        R"("arguments":{"plugin":"firewall","os":"windows"}}})");
+    REQUIRE(win);
+    auto win_payload = operator_surface_payload(win);
+    CHECK(win_payload["enabled"] == false);
+    CHECK(win_payload["os"] == "windows");
+    CHECK(win_payload["source"] == "firewall@windows");
+
+    auto lin = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":3,"params":{"name":"get_plugin_kill_switch",)"
+        R"("arguments":{"plugin":"firewall","os":"linux"}}})");
+    REQUIRE(lin);
+    CHECK(operator_surface_payload(lin)["enabled"] == true);
+
+    REQUIRE(ts.audit_log.size() >= 2);
+    CHECK(ts.audit_log[0] == "plugin_config.kill_switch.set|attempted");
+    CHECK(ts.audit_target_ids[0] == "firewall@windows");
+    CHECK(ts.audit_log[1] == "plugin_config.kill_switch.set|success");
+    CHECK(ts.audit_target_ids[1] == "firewall@windows");
+
+    // "macos" is not an agent OS value (windows|linux|darwin): refused on both tools.
+    for (const char* tool : {"set_plugin_kill_switch", "get_plugin_kill_switch"}) {
+        const std::string body =
+            std::string(R"({"jsonrpc":"2.0","method":"tools/call","id":4,"params":{"name":")") +
+            tool + R"(","arguments":{"plugin":"firewall","enabled":false,"os":"macos"}}})";
+        auto bad = ts.call(body);
+        REQUIRE(bad);
+        CHECK(bad->body.find("-32602") != std::string::npos); // kInvalidParams
+    }
+    // A present-but-non-string or empty os must not fall through to the all-OS row.
+    for (const char* tool : {"set_plugin_kill_switch", "get_plugin_kill_switch"}) {
+        for (const char* bad_os : {"1", "\"\""}) {
+            const std::string body =
+                std::string(R"({"jsonrpc":"2.0","method":"tools/call","id":5,"params":{"name":")") +
+                tool + R"(","arguments":{"plugin":"firewall","enabled":false,"os":)" + bad_os +
+                "}}}";
+            auto bad = ts.call(body);
+            REQUIRE(bad);
+            CHECK(bad->body.find("-32602") != std::string::npos); // kInvalidParams
+        }
+    }
+    CHECK(*w.store.kill_switch_decision("firewall", "block") ==
+          std::unordered_set<std::string>{"windows"});
+}
+
 // #3265 adversarial-review K1/C2-K1: the store/dispatch-chokepoint tests in
 // test_plugin_config_store_pg.cpp prove __guard__.push_rules is
 // kill-switch-addressable, but nothing exercised this SPECIFIC operator
@@ -20956,10 +21076,10 @@ TEST_CASE("MCP get_agent_app_usage: RBAC-off — ordinary session denied, admin 
 
     Config cfg{};
     auth::AuthManager auth_mgr{};
-    auto ordinary_token = auth_mgr.create_local_session("ordinary_user", auth::Role::user,
+    auto ordinary_token = auth_mgr.create_local_session_for_test("ordinary_user", auth::Role::user,
                                                          /*mfa_verified=*/true);
     auto admin_token =
-        auth_mgr.create_local_session("admin_user", auth::Role::admin, /*mfa_verified=*/true);
+        auth_mgr.create_local_session_for_test("admin_user", auth::Role::admin, /*mfa_verified=*/true);
     std::shared_mutex oidc_mu;
     std::unique_ptr<oidc::OidcProvider> oidc_provider;
     // A healthy, explicitly-disabled RbacStore reaches the production legacy

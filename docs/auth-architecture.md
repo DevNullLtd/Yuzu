@@ -12,12 +12,12 @@ Certificate setup instructions: `scripts/Certificate Instructions.txt`.
 
 ## Login and session management
 
-- **RBAC login** — session-cookie auth with PBKDF2-hashed passwords in `yuzu-server.cfg`. Legacy roles: `admin` (full access) and `user` (read-only). First-run interactive setup prompts for credentials.
+- **RBAC login** — session-cookie auth with PBKDF2-hashed passwords stored in the AuthDB (Postgres schema `auth`, `auth.users`). `yuzu-server.cfg` is a **seed only**: it provisions the first administrator into an empty `auth` schema and is never consulted for an existing account's credentials (#5274 — see "Local password change and reset" below). Legacy roles: `admin` (full access) and `user` (read-only). First-run interactive setup prompts for credentials and writes the seed file.
 - **Login page** — dark-themed, with greyed-out OIDC SSO stub where appropriate. Yuzu does not support Light Mode.
 - **Settings page** (admin-only) — TLS toggle, PEM cert upload, user management, enrollment tokens, pending agent approvals, AD/Entra section.
 - **Hamburger menu** — upper-right dropdown with Settings, About (popup), and Logout.
 - **Auth middleware** — `set_pre_routing_handler` redirects unauthenticated requests to `/login`, returns 401 for API calls.
-- **HTMX paradigm** — Settings page uses HTMX for all server interactions; server renders HTML fragments. Vanilla JS reserved only for clipboard copy. Dominant UI pattern going forward.
+- **HTMX paradigm** — Settings page uses HTMX for server interactions; server renders HTML fragments. Vanilla JS is reserved for what htmx cannot do CSP-safely: clipboard copy and `fetch()` to JSON REST v1 routes (engine principals, password change/reset). Never `hx-on` (the CSP has no `unsafe-eval`). Dominant UI pattern going forward.
 - **Session revocation REST surface (CC6.3 revocation, CC6.7 disposition, CC6.8 termination).**
   - `DELETE /api/v1/sessions?username=<name>` — admin-only via `UserManagement:Write`. Cookie sessions only; API tokens deliberately not revoked.
   - `DELETE /api/v1/sessions/me` — any interactive authenticated principal. Wipes cookie sessions AND revokes the caller's API tokens (lost-laptop UX). MCP-tier and service-scoped tokens rejected with 403. Response sets `Set-Cookie: yuzu_session=; Max-Age=0` so the client side completes the disposition.
@@ -204,6 +204,262 @@ scope here.
   load-shed).
 - **Metrics** — `yuzu_auth_lockout_applied_total`,
   `yuzu_auth_lockout_blocked_total`.
+
+## Local password change and reset (#5342, #5274)
+
+Two REST v1 routes write a local account's password; the dashboard's Settings
+→ User Management buttons call them with `fetch()` (no `hx-on` — CSP). Full
+wire contract: `docs/user-manual/rest-api.md` "Users".
+
+- `POST /api/v1/users/me/password` `{current_password, new_password}` — self-service.
+- `POST /api/v1/users/{name}/password` `{new_password}` — administrative reset
+  (the canonical durable-Administrator gate + MFA step-up — see "Route gates").
+
+**One writer, one transaction.** `CredentialChangeOwner`
+(`credential_change_owner.{hpp,cpp}`, #5342 Gate 8) is the only writer of
+`password_hash` on an existing row — `AuthDB` has no credential-write method
+(`upsert_user` is INSERT-only — `ON CONFLICT DO NOTHING`; the first-boot seed
+paths only INSERT a new row). It is an ADR-0012 §3 query owner (see that ADR's
+2026-10-04 Update): one pool lease, one `with_txn_for`, schema-qualified SQL
+across `auth`, `session_store` and `audit_store`. Both routes reach it through
+`AuthManager::commit_password_change`, which on success refreshes only this
+process's caches (`users_` hash/salt, `sessions_`).
+
+**The invariant.** A local account's credential, its session set, its
+provisional MFA state, its lockout state (admin reset) and the audit evidence
+for the change commit or abort TOGETHER, in one transaction holding the
+`auth.users` row lock first — and every LOCAL session mint re-reads that row
+under the same lock after persisting (below). Nothing proven under a retired
+credential is honoured. Every enrolment
+write is anchored the same way (F4, below), so the store never honours a
+credential proven before the change; the only remaining window is a request a
+replica admitted on a session the change is revoking before its caches saw the
+revocation — the generic session-revocation propagation window (R14), not a
+credential-specific one — and no compensating write exists.
+
+The transaction, in order: `set_config('lock_timeout', …, true)` (every lock
+wait bounded, txn-scoped); `SELECT … FROM auth.users WHERE username=$1 AND
+is_active FOR UPDATE` — classification **under the lock**: no row → `404`;
+non-local identity or provisioning source → `409 not_local`; the self route's
+verified hash (`VerifiedCredential::hash_hex`, from the lockout-accounted
+`verify_password` — no second PBKDF2) no longer the stored one → `409
+conflict`. Then one guarded `UPDATE auth.users` (new hash/salt, `updated_at`,
+the provisional TOTP secret wiped, and — admin reset only — the lockout
+columns cleared); `DELETE FROM session_store.sessions WHERE username=$1`
+(`session_store_sql_helpers.hpp`, the ONE copy, shared with
+`SessionStore::invalidate_user`); the success audit row(s) via
+`AuditStore::log_in_txn` — `user.password_change` / `user.password_reset`
+(detail `sessions_revoked=N provisional_mfa_cleared=…`) and, for an admin reset
+of an account that had a lockout (`locked_until` set — even if the lock has
+since expired — or a non-zero failure count), `auth.lockout.cleared` (detail
+`password_reset`); and LAST the `session_meta` write-generation bump (same
+helper file). An
+audit INSERT failure aborts everything → `503 audit_unavailable` +
+`Sec-Audit-Failed`; any other failure (lease, lock timeout, statement, COMMIT)
+→ `503 store_unavailable`. A refusal changes NOTHING — the caller's session,
+the target's sessions and the lockout are exactly as they were. The `503`
+bodies say what is true: nothing was changed unless the server lost contact
+with the database at commit; a successful sign-in with the new password
+confirms the change, which is audited either way (the audit row is in the same
+commit).
+
+**Lock order** (documented in the owner header; a change inverting it can
+deadlock): the `auth.users` row → `session_store.sessions` rows →
+`audit_store.audit_events` (INSERT) → the `session_store.session_meta`
+`write_generation` row → COMMIT. The generation row is last because every
+session create and revoke in the fleet takes it: holding it while waiting on
+anything else (formerly the audit INSERT, behind a lock someone held on
+`audit_events`) stalled every unrelated sign-in and sign-out until the owner's
+`lock_timeout` (T1′). Nothing holds `session_meta` or a `sessions` row and then
+waits on `auth.users` or `audit_events`: no `session_store` transaction touches
+another schema, no audit writer touches `session_store`, and the post-mint
+re-read takes `auth.users` only after its session INSERT committed.
+`RbacAdminAuthorityOwner` takes `principal_roles` → `auth.users` and never a
+session/audit lock. The owner requires AuthDB, SessionStore and AuditStore on
+ONE pool/database (ADR-0006; server.cpp builds all three on `*pg_pool_`); a
+split fails every statement closed, never a partial write.
+
+**The locking post-mint read.** `create_local_session(username, role,
+mfa_verified, expected_hash_hex)` takes the verified hash (no default; the MFA
+pending entry carries it across the TOTP round trip). After the session is
+persisted, `post_mint_role_recheck` re-reads the row with
+`AuthDB::recheck_role_locked` (`SELECT … FOR UPDATE`, bounded `lock_timeout`
+(deliberately longer than the owner's own `lock_timeout`, so a same-account mint
+queued behind a stalled change waits out its abort instead of failing closed —
+R22e)) and revokes-and-denies when the role or the stored hash diverged. Because the
+read is LOCKING, a credential change whose UPDATE has executed but not yet
+committed makes the mint wait for that commit and then see the new hash; a
+change that has not yet taken the lock will DELETE the (already committed)
+session row; one that committed earlier is simply seen. A plain read here
+would see the old hash past an uncommitted UPDATE whose session DELETE had
+already run — the Gate 8 defect this closes. An empty anchor denies.
+
+**MFA.** The transaction wipes a provisional (never-enrolled) TOTP secret on
+both routes, so an enrolment begun under the retired credential cannot be
+finished and the account's next enrolment gets a fresh secret (F1). Every
+enrolment WRITE is anchored to a credential (F2/F4): the mint in
+`mfa_init_enrollment` (`… WHERE mfa_totp_secret IS NULL AND mfa_enrolled_at IS
+NULL AND password_hash = <anchor>`) and the enrol in `mfa_verify_enrollment`
+(`… AND password_hash = <anchor>`), both with a REQUIRED anchor argument. The
+login-enforcement path passes the hash its password was PROVEN against — the
+bootstrap init in `POST /login` and the confirm in `POST /login/mfa/enroll`
+(the pending entry carries it); Settings passes `std::nullopt`, which the store
+resolves to the hash it read in the SAME call. A stale proven anchor is refused
+before any reveal or mint, and a write that queued behind the credential
+change's row lock re-evaluates against the committed row and lands as
+`AuthDBError::CredentialChanged` — never a secret written, or an enrolment
+completed, over the change. At login that is the generic `401` with nothing
+revealed and no pending token kept; in Settings the fragment says "Your
+password changed during enrolment — sign in again"; every site audits
+`mfa.enroll.failed` result `error` detail `credential_changed`. (The `IS NULL`
+pair also stops a slow init overwriting a secret a concurrent init or verify
+just wrote — it re-reveals a concurrent init's secret instead.)
+An ENROLLED second factor and its recovery codes are not touched by a change or
+reset (F3); clearing one is `yuzu-server --mfa-reset` (an optional admin-reset
+flag is a follow-up).
+
+**Accepted residual (R11).** The admin route's durable-Administrator gate runs
+before the transaction; an Administrator grant revoked in the PBKDF2 window
+between the gate and the commit lets that one in-flight reset complete under
+the revoked authority (the next request is refused) — the same lock-free regime
+check the A2/A1 handlers accept.
+
+**Accepted residual (R14).** A Settings MFA init or verify admitted on a
+session that a credential change is revoking — on the same replica between the
+change's COMMIT and its erase of the cached session, on another replica before
+its next session-generation refresh (≤1 s), or a request admitted before the
+COMMIT whose own store reads land after it, bounded by the store's read timeout
+plus its one retry, ≈4.2 s — mint only — anchors to the NEW hash it reads and so
+can mint and, with a second such request, enrol a secret. A mint alone makes the
+account's next enrolment re-reveal that provisional secret, so a secret the
+revoked session's holder saw can be enrolled by the legitimate user. The same
+window also covers `POST /api/settings/mfa/recovery-codes` and `/disable`. That
+is the generic session-revocation propagation window, not a credential-specific
+one. The controls are the compromise runbook (`yuzu-server --mfa-reset`) and
+the `mfa.enroll.*` audit rows adjacent to `user.password_reset`; full closure
+is a fifth credential-change owner step or a current-password field on the
+Settings enrolment form (#5392).
+
+**Route gates** (`rest_api_v1.cpp` `register_password_routes`): interactive
+cookie sessions only — any MCP tier, service-scoped token, engine principal or
+non-interactive `auth_source` is `403 token_session`; the self route
+additionally requires `auth_source == "local"` (`409 not_local` for OIDC/SAML).
+CSRF: `Origin`/`Referer` must be same-site (`origin_is_same_site`, honouring
+`--csrf-trusted-origins`) and a cookie request lacking **both** headers is
+refused — matching the other cookie-authorized state-changing POSTs
+(`ca_routes`, `dashboard_routes`). `Content-Type` must be `application/json`
+(`415`). The admin route then runs the **canonical durable-Administrator gate**
+— `is_rbac_administrator(kRest)` (`rbac_admin_predicate.hpp`, the A2/A1
+predicate) followed by `check_caller_authorized_under_current_regime`,
+REPLACING `perm_fn`, for every target: RBAC off, the caller's own local account
+must hold the admin role (an OIDC session whose `admin` role came from IdP
+group mapping does not — its `auth.users` row says `user`); RBAC on, the caller
+must hold a user-principal `Administrator` grant. A JIT elevation or a custom
+role holding `UserManagement:Write` is `403 durable_admin_required`; a store
+that cannot confirm is `503 admin_gate_unavailable`. It refuses a self-target
+(`403 self_target`, via the shared `is_self_target`) so a hijacked admin cookie
+cannot re-key its own account without the current password, and the configured
+break-glass account (`403 break_glass_target`) so a compromised IdP cannot
+invalidate the sealed escape hatch — both before step-up. The body is parsed
+with a non-throwing, type-guarded parse and never echoed; body/policy `400`s
+are not audited; passwords, hashes and lengths never reach a log or audit row.
+Every audit row both routes write names the principal captured at the start of
+the request (refusals via `AuthRoutes::audit_log_for_principal`; the
+in-transaction success rows from `make_audit_event_for_principal`'s template). (The session-revoke routes
+`DELETE /api/v1/sessions/me` and `DELETE /api/v1/sessions?username=` still
+write their row after revoking the caller's own session, with an empty
+principal — #5358.)
+
+**Lockout.** The self route's current-password check runs through
+`AuthRoutes::verify_password_with_lockout` — the striped `login_lock_for`
+lockout section extracted from `/login`, behaviour-preserving, and the ONE copy
+(no second striped-lock section). A wrong current password records a failed
+login exactly like `/login`; a locked account answers the SAME `403` "current
+password is incorrect" as a wrong password (audit detail `account_locked` vs
+`wrong_current` records the truth). Its store-unavailable branches count under
+`yuzu_auth_secret_unavailable_total{route="password_change"}` /
+`yuzu_auth_read_degrade_total{route="password_change",reason}`. Under
+`--auth-mode=sso-only` the same section runs `/login`'s hardened-mode gate
+(`AuthRoutes::sso_only_local_password_gate`) before PBKDF2: only an ARMED
+break-glass account may change its password; a disarmed one gets
+`403 sso_only_local_disabled` with no password evaluated and no strike. A
+verified current password clears a non-zero failure counter exactly as a
+successful login does (`auth.lockout.cleared`, detail
+`reset_on_password_change`) — before the write, so it stays cleared even if the
+write is then refused. Response timing can still tell a locked account from a
+wrong password, on `/login` and here alike (#5364).
+
+**Sessions and lockout.** The self route issues **no** replacement session: on
+success it answers with a clearing `Set-Cookie` (`Max-Age=0`) and
+`session_reissued:false` — the user signs in again with the new password (a
+refusal never clears the cookie: nothing changed). The admin reset clears the
+target's lockout inside the same transaction; `lockout_cleared` is `true` only
+when a lockout existed and was cleared (then an `auth.lockout.cleared` row is in
+the same commit). It reports `api_tokens_active`
+(`ApiTokenStore::list_active_for_principal_checked`; `null` +
+`api_tokens_unknown` when the read fails) — tokens are deliberately not
+auto-revoked.
+
+**#5274 — the config file can no longer shadow the AuthDB.** Before this change
+`find_user_or_hydrate` was cache-first, and `users_` is seeded from
+`yuzu-server.cfg` at boot (before `set_auth_db`) and never overwritten by a
+hydrate; the post-verify recheck compared role/active, never the hash. So after
+a password change (a) every restart re-seeded the OLD cfg hash, which then won,
+and (b) a second replica kept its cached old hash until restart. Now, with an
+AuthDB wired, `find_user_or_hydrate` reads the AuthDB and **never consults
+`users_` for credentials** (the `get_user_role` "always authoritative"
+precedent); `users_` remains the store only in cfg-only (no-AuthDB) mode. And
+`recheck_role_locked`'s row-locked `SELECT ... FOR UPDATE` now also returns
+`password_hash`; the credential check **denies** if it differs from the hash
+just verified: `verify_password` returns `kCredentialChanged` (a change
+committed mid-login), which is transient — `/login` answers `503` +
+`Retry-After` with no lockout strike and no `auth.login_failed` row, and the
+user retries; no re-verify. Counted by
+`yuzu_auth_credential_changed_during_verify_total`. The cfg file is therefore
+seed-only by construction: an operator can no longer reset a password by
+editing it, and a password rotated that way before this change reverts on
+upgrade to the stored one (behaviour change — see
+`docs/user-manual/upgrading.md`). The Windows server installer refuses a
+password on an upgrade for the same reason (exit code 11,
+`docs/user-manual/server-admin.md`). cfg-only non-admin accounts are a
+separate, pre-existing gap (only the cfg admin is provisioned on a fresh
+database; the second first-run account and the installer's `/OPERATOR_USER`
+can never sign in on Postgres — #5343) and are not changed here.
+
+**The cfg file is still a bootstrap credential.** It seeds the first
+administrator whenever the `auth` schema is empty, so an empty-database
+rebuild (a lost or recreated Postgres, a restore onto a fresh database)
+re-seeds whatever password hash the file holds — typically the original
+first-boot password, not the current one. Protect the file like the
+credential it is (the Windows installer locks it to Administrators and SYSTEM),
+and change the administrator password in the product after any rebuild. At
+boot, after `set_auth_db`, `AuthManager::report_stale_cfg_credentials` compares
+each cfg entry's hash with its `auth.users` row and logs a WARN naming every
+account whose stored credential differs ("#5274 cfg is seed-only; stored
+credential wins"), setting the gauge `yuzu_auth_cfg_credentials_stale` to their
+count. It writes no audit row (#5361).
+
+**Password policy.** `password_policy.hpp` is the ONE length policy:
+`kMinPasswordBytes = 12`, `kMaxPasswordBytes = 1024` (bytes). It replaces the
+three hand-copied `< 12` checks; `/login` answers an over-max password like a
+wrong one without running PBKDF2. Body cap: `kBodyCapTable` row `/api/v1/users`
+(any method, 16 KiB, `path_class="users"`). The Windows server installer and
+`generate-config.ps1` enforce the same 1024-byte maximum (UTF-8) on a fresh
+install; the Compose Wizard does not yet (#5363).
+
+**No MCP twin** (ADR-1005 parity-ledger `exception:` rows,
+`docs/api-parity-ledger.md`). Self-service change is permanently excluded: an
+MCP caller is a token, not the human, so a token able to change its owner's
+password converts token compromise into account takeover. Admin reset is
+deferred: `UserManagement:Write` is approval-gated at the supervised MCP tier,
+and an approval ticket persists the tool's `canonical_args` in plain text
+(`approvals.scope_expression`) and renders them to approvers — a password
+argument would be stored and displayed. The intended follow-up is a
+temp-password MCP tool that takes no password argument (a server-generated
+temporary password plus a must-change-at-next-sign-in flag, auth schema v3 —
+#5357).
+
+**Metric.** `yuzu_auth_password_changes_total{kind="self"|"admin", result="ok"|"denied"|"error"}`.
 
 ## Inactivity (idle) session timeout (SOC 2 CC6.3)
 
@@ -3738,7 +3994,7 @@ auto-renew once two-thirds of their lifetime has elapsed (evaluated at agent
 start; a fresh CSR rides the next `Register`). Issuance is audited
 (`ca.cert.issued`). On the agent, the leaf key is written `0600` via an atomic
 `O_EXCL` stage-and-rename on POSIX; **on Windows the key falls back to
-`std::ofstream` + a best-effort permissions tightening — an explicit owner-only
+`std::ofstream` with no DACL tightening — an explicit owner-only
 ACL (`SetNamedSecurityInfoW`) is a tracked follow-up shared with the server's
 `FileKeyProvider`, so on Windows run the agent under a dedicated service account
 with no inherited group-read on the cert directory until then.**

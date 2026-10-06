@@ -32,6 +32,7 @@
 
 #include <libpq-fe.h>
 
+#include <chrono>
 #include <cstdint>
 #include <fstream>
 #include <limits>
@@ -327,6 +328,60 @@ TEST_CASE("AuditStore: log and retrieve", "[pg][audit_store]") {
     CHECK((*results)[0].action == "auth.login");
     CHECK((*results)[0].result == "success");
     CHECK((*results)[0].source_ip == "192.168.1.1");
+}
+
+// #5342 Gate 8 (T2): log_in_txn is the ADR-0012 §3 owner seam — the row
+// commits or aborts with the CALLER's transaction, and the success bucket is
+// bumped only by count_committed after that commit.
+TEST_CASE("AuditStore: log_in_txn rides the caller's transaction (rollback = no row, no count)",
+          "[pg][audit_store][password]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, auditstore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    AuditStore store(pool);
+    REQUIRE(store.is_open());
+    const auto other_before = store.events_written("other");
+
+    SECTION("rolled back: no row and no success count") {
+        bool inserted = false;
+        const bool committed = pool.with_txn_for(std::chrono::milliseconds{2000},
+                                                 [&](PGconn* c) -> bool {
+                                                     inserted = store.log_in_txn(
+                                                         c, mk("alice", "user.password_change", "ok"));
+                                                     return false; // caller aborts
+                                                 });
+        CHECK(inserted);
+        CHECK_FALSE(committed);
+        CHECK(query_scalar(db.dsn(), "SELECT count(*) FROM audit_store.audit_events") == "0");
+        CHECK(store.events_written("other") == other_before);
+        CHECK(store.emit_failed_count() == 0);
+    }
+    SECTION("committed: exactly one row; counted only via count_committed") {
+        const bool committed = pool.with_txn_for(std::chrono::milliseconds{2000},
+                                                 [&](PGconn* c) -> bool {
+                                                     return store.log_in_txn(
+                                                         c, mk("alice", "user.password_change", "ok"));
+                                                 });
+        REQUIRE(committed);
+        CHECK(query_scalar(db.dsn(), "SELECT count(*) FROM audit_store.audit_events "
+                                     "WHERE action = 'user.password_change'") == "1");
+        CHECK(store.events_written("other") == other_before); // not yet counted
+        store.count_committed("ok");
+        CHECK(store.events_written("other") == other_before + 1);
+    }
+    SECTION("a failing INSERT reports false, counts emit_failed, and poisons the txn") {
+        exec_sql(db.dsn(), "ALTER TABLE audit_store.audit_events RENAME TO audit_events_gone");
+        bool inserted = true;
+        const bool committed = pool.with_txn_for(std::chrono::milliseconds{2000},
+                                                 [&](PGconn* c) -> bool {
+                                                     inserted = store.log_in_txn(
+                                                         c, mk("alice", "user.password_change", "ok"));
+                                                     return true; // even a careless caller cannot commit
+                                                 });
+        CHECK_FALSE(inserted);
+        CHECK_FALSE(committed); // PgPool refuses to COMMIT an aborted txn
+        CHECK(store.emit_failed_count() == 1);
+        CHECK(store.events_written("other") == other_before);
+    }
 }
 
 TEST_CASE("AuditStore: filter by principal / action / target", "[pg][audit_store]") {
