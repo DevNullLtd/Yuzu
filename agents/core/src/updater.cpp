@@ -790,19 +790,32 @@ std::expected<bool, UpdateError> Updater::check_and_apply(void* raw_stub) {
             if (sig_err) {
                 if (config_.metrics)
                     config_.metrics
-                        ->counter("yuzu_agent_ota_signature_refused_total",
-                                  {{"reason", sig_err->kind == CmsFailure::kUntrusted
-                                                  ? "untrusted"
-                                                  : "invalid"}})
+                        ->counter(
+                            "yuzu_agent_ota_signature_refused_total",
+                            {{"reason", std::string{signature_refusal_reason(sig_err->kind)}}})
                         .increment();
                 // Refused in BOTH modes. require_signature governs whether an
                 // ABSENT signature is tolerated; a signature that is present and
                 // does not verify is always an active integrity failure.
-                spdlog::error("OTA update {} signature verification FAILED ({}): {}",
-                              check_resp.latest_version(),
-                              sig_err->kind == CmsFailure::kUntrusted ? "untrusted chain"
-                                                                      : "invalid signature",
-                              sig_err->detail);
+                if (sig_err->kind == CmsFailure::kBundleUnreadable) {
+                    // #5249: the agent's OWN trust anchor failed to load, so the
+                    // signature was never examined. Logged apart from "untrusted
+                    // chain" so a missing or permission-locked bundle (the
+                    // rc1-rc5 Windows installer bug, #5196) is not mistaken for a
+                    // genuinely untrusted signer. Still refused: an anchor that
+                    // cannot be read proves nothing.
+                    spdlog::error("OTA update {} REFUSED: the update trust bundle could not be "
+                                  "loaded, so the signature was not checked ({}). This is a "
+                                  "local configuration fault on this endpoint, not an untrusted "
+                                  "signer: fix the bundle file or its permissions.",
+                                  check_resp.latest_version(), sig_err->detail);
+                } else {
+                    spdlog::error("OTA update {} signature verification FAILED ({}): {}",
+                                  check_resp.latest_version(),
+                                  sig_err->kind == CmsFailure::kUntrusted ? "untrusted chain"
+                                                                          : "invalid signature",
+                                  sig_err->detail);
+                }
                 cleanup_temp();
                 return std::unexpected(UpdateError{
                     std::format("update signature verification failed: {}", sig_err->detail)});
