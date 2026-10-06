@@ -152,7 +152,11 @@ env_test_() ->
       t("a cap below the initial duration is raised to it with one warning naming both keys",
         fun max_below_base_is_clamped_with_a_warning/0),
       t("a cap at or above the initial duration is kept and does not warn",
-        fun max_at_or_above_base_is_kept/0)
+        fun max_at_or_above_base_is_kept/0),
+      t("a base above the default cap, with no cap set, warns about the default and names no cap the operator did not set",
+        fun max_unset_below_base_names_the_default/0),
+      t("a reset timeout under the floor warns naming the key, the value, the range and the default used",
+        fun sub_floor_values_warn_with_the_default_used/0)
      ]}.
 
 %% A registration replay that is active while the pending store is refilled.
@@ -1113,6 +1117,40 @@ max_below_base_is_clamped_with_a_warning() ->
     trip_breaker(),
     ?assertEqual({open, 0, 3, 600000}, breaker()).
 
+%% With no cap set the effective cap is the default (300000), a value the operator
+%% never wrote. The warning says the default is what was raised and never prints
+%% it as the configured value of the cap key.
+max_unset_below_base_names_the_default() ->
+    Warnings = env_key_case(circuit_breaker_reset_timeout_ms, 600000,
+                            [{unset, circuit_breaker_max_reset_timeout_ms}]),
+    ?assertMatch([_], Warnings),
+    [Warning] = Warnings,
+    ?assertNotEqual(nomatch, binary:match(Warning, <<"circuit_breaker_max_reset_timeout_ms">>)),
+    ?assertNotEqual(nomatch, binary:match(Warning, <<"default">>)),
+    ?assertNotEqual(nomatch, binary:match(Warning, <<"600000">>)),
+    ?assertEqual(nomatch, binary:match(Warning, <<"circuit_breaker_max_reset_timeout_ms (300000)">>)),
+    ?assertEqual(600000, up_get(cb_max_timeout)).
+
+%% Values under the floor of 100 are not silent: the line names the key, echoes
+%% the integer (operator configuration, not agent data), gives the range and says
+%% which default took its place.
+sub_floor_values_warn_with_the_default_used() ->
+    [begin
+         [Warning] = env_key_case(Key, Bad, Extra),
+         Parts = [atom_to_binary(Key, utf8), integer_to_binary(Bad), <<"100..3600000">>,
+                  <<"using ", (integer_to_binary(Default))/binary>>],
+         [?assertEqual({Part, true}, {Part, binary:match(Warning, Part) =/= nomatch})
+          || Part <- Parts]
+     end || {Key, Bad, Default, Extra} <-
+                [{circuit_breaker_reset_timeout_ms, 50, 10000,
+                  [{circuit_breaker_max_reset_timeout_ms, 300000}]},
+                 {circuit_breaker_reset_timeout_ms, 99, 10000,
+                  [{circuit_breaker_max_reset_timeout_ms, 300000}]},
+                 {circuit_breaker_max_reset_timeout_ms, 1, 300000,
+                  [{circuit_breaker_reset_timeout_ms, 100}]},
+                 {circuit_breaker_max_reset_timeout_ms, 99, 300000,
+                  [{circuit_breaker_reset_timeout_ms, 100}]}]].
+
 max_at_or_above_base_is_kept() ->
     [begin
          Named = env_key_case(circuit_breaker_reset_timeout_ms, Base,
@@ -1131,7 +1169,11 @@ env_key_case(Key, Val) ->
 %% fixture's own, far-off timers; a case that needs a particular pair sets it).
 env_key_case(Key, Val, Extra) ->
     stop_upstream(),
-    [application:set_env(yuzu_gw, K, V) || {K, V} <- Extra],
+    %% {unset, K} removes a key the fixture set, so the default applies.
+    [case E of
+         {unset, K} -> application:unset_env(yuzu_gw, K);
+         {K, V}     -> application:set_env(yuzu_gw, K, V)
+     end || E <- Extra],
     application:set_env(yuzu_gw, Key, Val),
     Mark = last_key(),
     _ = start_upstream(),

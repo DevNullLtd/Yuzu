@@ -500,3 +500,99 @@ notify_queue_families_test_() ->
                         <<"yuzu_gw_upstream_notify_dropped_total{reason=\"unknown\"} ">>]]
        end}
      ]}.
+
+%% #4632 round 4: the edge refusal counter and the pre-seeded error codes. Same
+%% blind spot as notify_dropped above, so the events go through the real
+%% handler, and the series are removed before setup() so "exists at 0" proves
+%% the pre-seed and not an earlier test's increment.
+-define(RPC_ERROR_SEEDS,
+        [{<<"register">>, <<"encode">>}, {<<"register">>, <<"exception">>},
+         {<<"inventory">>, <<"encode">>}, {<<"inventory">>, <<"exception">>},
+         {<<"notify_stream">>, <<"encode">>}, {<<"notify_stream">>, <<"exception">>},
+         {<<"guardian">>, <<"encode">>}, {<<"guardian">>, <<"exception">>},
+         %% The batch heartbeat client has no local encode path of its own.
+         {<<"batch_heartbeat">>, <<"exception">>}]).
+%% Pairs that must NOT exist after setup(): a status code is a server answer, and
+%% the batch heartbeat client has no local encode path.
+-define(RPC_ERROR_NOT_SEEDED,
+        [{N, C} || N <- [<<"register">>, <<"inventory">>, <<"notify_stream">>,
+                         <<"guardian">>, <<"batch_heartbeat">>],
+                   C <- [<<"14">>, <<"13">>, <<"3">>, <<"9">>, <<"8">>]]
+        ++ [{<<"batch_heartbeat">>, <<"encode">>}]).
+
+register_refused_families_test_() ->
+    {setup,
+     fun() ->
+        {ok, S1} = application:ensure_all_started(prometheus),
+        {ok, S2} = application:ensure_all_started(telemetry),
+        catch telemetry:detach(yuzu_gw_prometheus),
+        [catch prometheus_counter:remove(yuzu_gw_register_refused_total, [R])
+         || R <- [<<"agent_id_length">>, <<"unknown">>, <<"other_reason">>]],
+        %% Other modules of this VM leave series behind (the registry is
+        %% shared), so every pair this module asserts on is removed first.
+        [catch prometheus_counter:remove(yuzu_gw_upstream_rpc_errors_total, [N, C])
+         || {N, C} <- ?RPC_ERROR_SEEDS ++ ?RPC_ERROR_NOT_SEEDED],
+        ok = yuzu_gw_telemetry:setup(),
+        S1 ++ S2
+     end,
+     fun(_) -> catch telemetry:detach(yuzu_gw_prometheus) end,
+     [
+      {"both refusal series exist at 0 straight after setup and no other series does",
+       fun() ->
+           ?assertEqual(0, prometheus_counter:value(yuzu_gw_register_refused_total,
+                                                    [<<"agent_id_length">>])),
+           ?assertEqual(0, prometheus_counter:value(yuzu_gw_register_refused_total,
+                                                    [<<"unknown">>])),
+           ?assertEqual(undefined, prometheus_counter:value(yuzu_gw_register_refused_total,
+                                                            [<<"other_reason">>]))
+       end},
+      {"a refusal moves the agent_id_length series only, whether the reason is a binary or an atom",
+       fun() ->
+           L0 = counter_val(yuzu_gw_register_refused_total, [<<"agent_id_length">>]),
+           U0 = counter_val(yuzu_gw_register_refused_total, [<<"unknown">>]),
+           telemetry:execute([yuzu, gw, register, refused], #{count => 1},
+                             #{reason => <<"agent_id_length">>}),
+           telemetry:execute([yuzu, gw, register, refused], #{count => 1},
+                             #{reason => agent_id_length}),
+           ?assertEqual({L0 + 2, U0},
+                        {counter_val(yuzu_gw_register_refused_total, [<<"agent_id_length">>]),
+                         counter_val(yuzu_gw_register_refused_total, [<<"unknown">>])})
+       end},
+      {"a reason outside the closed set, a missing reason and a non-binary reason fold into "
+       "unknown and create no series of their own",
+       fun() ->
+           U0 = counter_val(yuzu_gw_register_refused_total, [<<"unknown">>]),
+           telemetry:execute([yuzu, gw, register, refused], #{count => 1},
+                             #{reason => <<"other_reason">>}),
+           telemetry:execute([yuzu, gw, register, refused], #{count => 1}, #{}),
+           telemetry:execute([yuzu, gw, register, refused], #{count => 1},
+                             #{reason => {not_a, label}}),
+           ?assertEqual(U0 + 3, counter_val(yuzu_gw_register_refused_total, [<<"unknown">>])),
+           ?assertEqual(undefined, prometheus_counter:value(yuzu_gw_register_refused_total,
+                                                            [<<"other_reason">>]))
+       end},
+      {"every error code the gateway can emit locally exists at 0 for each RPC name that can emit it",
+       fun() ->
+           [?assertEqual({N, C, 0}, {N, C, prometheus_counter:value(
+                                               yuzu_gw_upstream_rpc_errors_total, [N, C])})
+            || {N, C} <- ?RPC_ERROR_SEEDS]
+       end},
+      {"no other code is pre-seeded for an RPC name",
+       fun() ->
+           [?assertEqual({N, C, undefined},
+                         {N, C, prometheus_counter:value(yuzu_gw_upstream_rpc_errors_total,
+                                                         [N, C])})
+            || {N, C} <- ?RPC_ERROR_NOT_SEEDED]
+       end},
+      {"the scrape renders the refusal family and the seeded error series",
+       fun() ->
+           Out = prometheus_text_format:format(),
+           [?assertNotEqual(nomatch, binary:match(Out, Part))
+            || Part <- [<<"# HELP yuzu_gw_register_refused_total ">>,
+                        <<"yuzu_gw_register_refused_total{reason=\"agent_id_length\"} ">>,
+                        <<"yuzu_gw_register_refused_total{reason=\"unknown\"} ">>,
+                        <<"yuzu_gw_upstream_rpc_errors_total{rpc_name=\"register\",code=\"encode\"} ">>,
+                        <<"yuzu_gw_upstream_rpc_errors_total{rpc_name=\"inventory\",code=\"exception\"} ">>,
+                        <<"yuzu_gw_upstream_rpc_errors_total{rpc_name=\"batch_heartbeat\",code=\"exception\"} ">>]]
+       end}
+     ]}.

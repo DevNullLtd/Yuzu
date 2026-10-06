@@ -28,10 +28,12 @@
 
 -export([log/2]).           %% logger handler callback (log capture)
 -export([handle_event/4]).  %% telemetry handler callback
+-export([handle_refused/4]).  %% telemetry handler callback (edge refusals)
 
 -define(CTX_KEY, yuzu_register_bound_conn_key).
 -define(LOG_HANDLER, yuzu_register_bound_tests_logs).
 -define(TELEMETRY_HANDLER, yuzu_register_bound_tests_events).
+-define(REFUSED_HANDLER, yuzu_register_bound_tests_refused).
 -define(WIRE_KEY, {?MODULE, wire}).
 -define(MAX_AGENT_ID, 256).
 %% The receive limit of a stock gRPC server (no override exists on the server).
@@ -67,6 +69,26 @@ bound_test_() ->
        t("a local encode failure is counted under code encode, an exception out of the client under exception",
          fun local_encode_failure_has_its_own_error_code/0)
       ]} || Threshold <- [3, 5]].
+
+%%% Round 4 (#4632): the edge bound counts what it refuses, is measured in bytes and
+%%% agrees with the server's constant, and the request bound is exact. One
+%%% threshold is enough here, none of these depends on the breaker's threshold.
+edge_test_() ->
+    {foreach,
+     fun() -> setup(3) end,
+     fun cleanup/1,
+     [
+      t("an edge refusal is counted once, by reason, and a valid Register is not counted",
+        fun edge_refusal_is_counted_once/0),
+      t("an agent id of 128 two-byte characters (256 bytes) is accepted",
+        fun two_byte_characters_at_the_bound_are_accepted/0),
+      t("an agent id of 129 two-byte characters (258 bytes) is refused: bytes, not characters",
+        fun two_byte_characters_over_the_bound_are_refused/0),
+      t("a request of exactly 4194304 bytes reaches the wire and one byte more is refused locally",
+        fun request_bound_is_exact/0),
+      t("the gateway's agent id bound equals the server's kMaxAgentIdLength",
+        fun agent_id_bound_matches_the_server/0)
+     ]}.
 
 %%% The warnings a malformed registration can provoke are limited (#4632): the
 %%% first occurrence logs, the rest of the interval is counted, and the next line
@@ -253,6 +275,132 @@ refusal_is_invalid_argument_without_the_id() ->
     {grpc_error, {Status, EmptyMessage}} =
         yuzu_gw_agent_service:register(ctx(), register_req(<<>>)),
     ?assertEqual(Message, EmptyMessage).
+
+%%%===================================================================
+%%% Round 4: counter, characters, exact bounds, drift
+%%%===================================================================
+
+%% The event is emitted by the calling process (telemetry runs the handler in the
+%% caller), so each message is already in the mailbox when register/2 returns.
+edge_refusal_is_counted_once() ->
+    catch telemetry:detach(?REFUSED_HANDLER),
+    ok = telemetry:attach(?REFUSED_HANDLER, [yuzu, gw, register, refused],
+                          fun ?MODULE:handle_refused/4, #{pid => self()}),
+    try
+        {grpc_error, _} = yuzu_gw_agent_service:register(
+                            ctx(), register_req(binary:copy(<<"r">>, ?MAX_AGENT_ID + 1))),
+        ?assertEqual([<<"agent_id_length">>], refused_reasons()),
+        %% Each other shape the edge refuses is one count too.
+        [begin
+             {grpc_error, _} = yuzu_gw_agent_service:register(ctx(), Req),
+             ?assertEqual([<<"agent_id_length">>], refused_reasons())
+         end || Req <- [register_req(<<>>), register_req(undefined), register_req(42), #{}]],
+        %% A valid Register, and one the server (not the edge) refuses, are not.
+        ?assertMatch({ok, #{session_id := _}, _}, good_register()),
+        mock_answer({error, {<<"3">>, <<"invalid enrollment request">>}, #{}}),
+        {grpc_error, _} = yuzu_gw_agent_service:register(ctx(), register_req(<<"a,b">>)),
+        ?assertEqual([], refused_reasons())
+    after
+        catch telemetry:detach(?REFUSED_HANDLER)
+    end.
+
+refused_reasons() ->
+    receive {register_refused, Reason} -> [Reason | refused_reasons()]
+    after 0 -> []
+    end.
+
+%% telemetry handler callback
+handle_refused(_Event, #{count := 1}, #{reason := Reason}, #{pid := Pid}) ->
+    Pid ! {register_refused, Reason},
+    ok.
+
+%% The server compares agent_id().size(), bytes. 128 x U+00E9 is 256 bytes.
+two_byte_characters_at_the_bound_are_accepted() ->
+    Id = binary:copy(<<"\x{E9}"/utf8>>, 128),
+    ?assertEqual(?MAX_AGENT_ID, byte_size(Id)),
+    ?assertEqual(128, string:length(Id)),
+    ?assertMatch({ok, #{session_id := _}, _},
+                 yuzu_gw_agent_service:register(ctx(), register_req(Id))),
+    ?assertEqual(1, wire_count()).
+
+two_byte_characters_over_the_bound_are_refused() ->
+    Id = binary:copy(<<"\x{E9}"/utf8>>, 129),
+    ?assertEqual(?MAX_AGENT_ID + 2, byte_size(Id)),
+    ?assertEqual(129, string:length(Id)),
+    ?assertMatch({grpc_error, {?GRPC_STATUS_INVALID_ARGUMENT, _}},
+                 yuzu_gw_agent_service:register(ctx(), register_req(Id))),
+    ?assertEqual(0, wire_count()),
+    ?assertEqual({closed, 0}, breaker()).
+
+%% A Register whose encoded size is exactly Size bytes: the hostname is padded,
+%% and the size is read back from the real encoder, never assumed.
+register_of_size(Size) ->
+    Make = fun(Pad) -> #{info => #{agent_id => <<"edge-agent">>,
+                                   hostname => binary:copy(<<"p">>, Pad)}} end,
+    Encoded = fun(Pad) -> byte_size(gateway_pb:encode_msg(Make(Pad), 'yuzu.agent.v1.RegisterRequest')) end,
+    Pad0 = Size - 1000,
+    Pad = Pad0 + (Size - Encoded(Pad0)),
+    ?assertEqual(Size, Encoded(Pad)),
+    Make(Pad).
+
+request_bound_is_exact() ->
+    Exact = register_of_size(?SERVER_MAX_MESSAGE),
+    ?assertMatch({ok, #{session_id := _}}, yuzu_gw_upstream:proxy_register(Exact)),
+    ?assertEqual(1, wire_count()),
+    ?assertEqual({closed, 0}, breaker()),
+    OneOver = register_of_size(?SERVER_MAX_MESSAGE + 1),
+    ?assertMatch({error, {internal, _}}, yuzu_gw_upstream:proxy_register(OneOver)),
+    ?assertEqual(1, wire_count()),
+    ?assertEqual({closed, 0}, breaker()),
+    %% 64 bytes under the bound is accepted too, so the bound is not a margin.
+    Under = register_of_size(?SERVER_MAX_MESSAGE - 64),
+    ?assertMatch({ok, #{session_id := _}}, yuzu_gw_upstream:proxy_register(Under)),
+    ?assertEqual(2, wire_count()).
+
+%% The server's constant lives in a C++ header; this reads it from the source
+%% tree, found by walking up from this file, and skips (it does not fail) when
+%% the header or the symbol is not there, as in a build from a gateway-only
+%% checkout. The test is behavioural, so a drift in either direction shows: an id
+%% of the server's size is accepted and one byte more is refused.
+agent_id_bound_matches_the_server() ->
+    case server_max_agent_id_length() of
+        {ok, ServerValue} ->
+            ?assertEqual(?MAX_AGENT_ID, ServerValue),
+            ?assertMatch({ok, #{session_id := _}, _},
+                         yuzu_gw_agent_service:register(
+                           ctx(), register_req(binary:copy(<<"s">>, ServerValue)))),
+            ?assertMatch({grpc_error, {?GRPC_STATUS_INVALID_ARGUMENT, _}},
+                         yuzu_gw_agent_service:register(
+                           ctx(), register_req(binary:copy(<<"s">>, ServerValue + 1))));
+        skip ->
+            ?debugMsg("kMaxAgentIdLength not found in the source tree: drift check skipped"),
+            ok
+    end.
+
+-define(SERVER_AUTH_HEADER, "server/core/include/yuzu/server/auth.hpp").
+
+server_max_agent_id_length() ->
+    Source = proplists:get_value(source, ?MODULE:module_info(compile), ?FILE),
+    case find_up(filename:dirname(filename:absname(Source)), ?SERVER_AUTH_HEADER) of
+        {ok, Path} ->
+            {ok, Text} = file:read_file(Path),
+            case re:run(Text, "kMaxAgentIdLength\\s*=\\s*([0-9]+)", [{capture, [1], binary}]) of
+                {match, [Digits]} -> {ok, binary_to_integer(Digits)};
+                nomatch           -> skip
+            end;
+        error ->
+            skip
+    end.
+
+find_up(Dir, Rel) ->
+    Candidate = filename:join(Dir, Rel),
+    case filelib:is_regular(Candidate) of
+        true  -> {ok, Candidate};
+        false -> case filename:dirname(Dir) of
+                     Dir    -> error;
+                     Parent -> find_up(Parent, Rel)
+                 end
+    end.
 
 %%%===================================================================
 %%% Status classification

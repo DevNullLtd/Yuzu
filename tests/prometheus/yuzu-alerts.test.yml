@@ -3005,3 +3005,48 @@ tests:
       - expr: 'ALERTS{alertname="YuzuGuardianReadDegraded"}'
         eval_time: 20m
         exp_samples: []
+
+  # ── YuzuGatewayUpstreamEncodeErrors (#4632 round 4) ───────────────────────
+  #
+  # A systematic local encode failure (every Register answered INTERNAL while
+  # the breaker stays closed and /readyz stays ready) is visible ONLY as
+  # yuzu_gw_upstream_rpc_errors_total{code="encode"}. The gateway pre-seeds the
+  # series at 0 (yuzu_gw_telemetry:declare_metrics/0), so the first increment
+  # has a baseline for increase() to diff against.
+
+  # CASE — one encode failure fires, no `for:` needed: any increase in 10m.
+  - interval: 1m
+    name: gateway upstream encode errors - a single encode failure fires
+    input_series:
+      - series: 'yuzu_gw_upstream_rpc_errors_total{job="yuzu-gateway",instance="g1",rpc_name="register",code="encode"}'
+        values: "0x5 1x30"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGatewayUpstreamEncodeErrors", alertstate="firing"}'
+        eval_time: 7m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGatewayUpstreamEncodeErrors", alertstate="firing", code="encode", instance="g1", job="yuzu-gateway", rpc_name="register", severity="warning"}'
+            value: 1
+      # Once the increment has aged out of the 10m window the alert resolves.
+      - expr: 'ALERTS{alertname="YuzuGatewayUpstreamEncodeErrors"}'
+        eval_time: 25m
+        exp_samples: []
+
+  # CASE — the healthy shape: pre-seeded at 0 and flat stays silent, and a
+  # rising counter of ANOTHER code (a server answer, an exception) does not fire
+  # this alert (those are the breaker's business and YuzuGatewayUpstreamErrors').
+  - interval: 1m
+    name: gateway upstream encode errors - flat zero-seeded encode series and other codes stay quiet
+    input_series:
+      - series: 'yuzu_gw_upstream_rpc_errors_total{job="yuzu-gateway",instance="g1",rpc_name="register",code="encode"}'
+        values: "0x30"
+      - series: 'yuzu_gw_upstream_rpc_errors_total{job="yuzu-gateway",instance="g1",rpc_name="register",code="exception"}'
+        values: "0+1x30"
+      - series: 'yuzu_gw_upstream_rpc_errors_total{job="yuzu-gateway",instance="g1",rpc_name="inventory",code="14"}'
+        values: "0+1x30"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGatewayUpstreamEncodeErrors"}'
+        eval_time: 15m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuGatewayUpstreamEncodeErrors"}'
+        eval_time: 29m
+        exp_samples: []

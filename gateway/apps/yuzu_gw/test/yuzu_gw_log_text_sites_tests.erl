@@ -10,9 +10,11 @@
 %%% modules, the registration replay lines by the replay module; this module pins
 %%% the rest, one group per source file:
 %%%   - yuzu_gw_agent: stream error, stream handler died, adopted replay
-%%%     re-announce, orphaned response, disconnect
+%%%     re-announce (streaming and connecting), stale re-announce ignored,
+%%%     orphaned response, disconnect
 %%%   - yuzu_gw_agent_service: Subscribe with a session id nobody registered
-%%%   - yuzu_gw_upstream: the guardian forward lines
+%%%   - yuzu_gw_upstream: the guardian forward lines (circuit open, at capacity,
+%%%     failed)
 %%%
 %%% Each test names an agent (or session or command) id made of a marker, CR, LF,
 %%% an injected word and ESC, provokes the line, waits for it to be logged (the
@@ -29,6 +31,10 @@
 
 -define(LOG_HANDLER, yuzu_gw_log_text_sites_tests_logs).
 -define(AWAIT_MS, 5000).
+%% The guardian at-capacity fixture: the table of blocked workers and the key that
+%% holds the test's pid.
+-define(BLOCKED, yuzu_log_text_blocked_workers).
+-define(BLOCKED_TEST, {?MODULE, blocked_test_pid}).
 %% The agents a test of the agent group started, reaped by its teardown.
 -define(STARTED, yuzu_log_text_started).
 -define(ENV_KEYS, [circuit_breaker_failure_threshold,
@@ -47,6 +53,8 @@ agent_test_() ->
       t("stream error", fun agent_stream_error_line/0),
       t("stream handler died", fun agent_stream_handler_died_line/0),
       t("adopted replay re-announce (streaming)", fun agent_reannounce_line/0),
+      t("adopted replay re-announce (still connecting)", fun agent_connecting_reannounce_line/0),
+      t("stale re-announce ignored", fun agent_stale_reannounce_line/0),
       t("orphaned response names the agent and the command id",
         fun agent_orphaned_response_line/0),
       t("disconnect", fun agent_disconnect_line/0)
@@ -109,6 +117,28 @@ agent_reannounce_line() ->
         yuzu_gw_agent:reannounce(Agent, <<"sess-", Id/binary>>)
     end, debug),
     assert_clean(Line, <<"agent-reann">>).
+
+%% An agent whose Subscribe handler has not yet reported its stream pid stays in
+%% `connecting', which has its own copy of the line.
+agent_connecting_reannounce_line() ->
+    Started = started(),
+    Id = control_id(<<"agent-conn-reann">>),
+    Line = capture_line(<<"(still connecting)">>, fun() ->
+        Agent = start_agent(Started, Id, undefined),
+        yuzu_gw_agent:reannounce(Agent, <<"sess-", Id/binary>>)
+    end, debug),
+    assert_clean(Line, <<"agent-conn-reann">>).
+
+%% A re-announce for a session this process has moved on from is ignored, and
+%% says so under the agent id.
+agent_stale_reannounce_line() ->
+    Started = started(),
+    Id = control_id(<<"agent-stale">>),
+    Line = capture_line(<<"ignoring stale upstream_reannounced">>, fun() ->
+        Agent = start_agent(Started, Id, self()),
+        yuzu_gw_agent:reannounce(Agent, <<"some-other-session">>)
+    end, debug),
+    assert_clean(Line, <<"agent-stale">>).
 
 %% The command id is read from the response frame, so it is the agent's text too.
 agent_orphaned_response_line() ->
@@ -187,6 +217,17 @@ guardian_test_() ->
         fun guardian_forward_failed_line/0)
      ]}.
 
+%% The in-flight budget of guardian forwards (50) is full: each worker blocks
+%% inside the mocked client until the test releases it.
+guardian_capacity_test_() ->
+    {foreach,
+     fun setup_guardian_blocked/0,
+     fun cleanup_guardian_blocked/1,
+     [
+      t("a guardian message dropped because the in-flight budget is full",
+        fun guardian_dropped_at_capacity_line/0)
+     ]}.
+
 setup_guardian() ->
     {ok, _} = application:ensure_all_started(telemetry),
     catch meck:unload(grpcbox_client),
@@ -210,6 +251,41 @@ cleanup_guardian(#{prev_env := Prev}) ->
                   end, Prev),
     ok.
 
+%% The mocked client reports each call to the test process and then waits for a
+%% release message, so the workers stay in flight for as long as the test needs.
+%% The fixture's setup does not run in the test's process (eunit starts the test
+%% in its own), so the test registers its pid under ?BLOCKED_TEST for the mock to
+%% read at call time, and the workers are kept in a public table the teardown
+%% releases (by exact pid) whatever the test did.
+setup_guardian_blocked() ->
+    {ok, _} = application:ensure_all_started(telemetry),
+    catch meck:unload(grpcbox_client),
+    stop_upstream(),
+    Prev = [{Key, application:get_env(yuzu_gw, Key)} || Key <- ?ENV_KEYS],
+    application:set_env(yuzu_gw, circuit_breaker_failure_threshold, 3),
+    application:set_env(yuzu_gw, circuit_breaker_reset_timeout_ms, 600000),
+    application:set_env(yuzu_gw, circuit_breaker_max_reset_timeout_ms, 600000),
+    catch ets:delete(?BLOCKED),
+    ?BLOCKED = ets:new(?BLOCKED, [named_table, public, set]),
+    ok = meck:new(grpcbox_client, [non_strict, no_link]),
+    ok = meck:expect(grpcbox_client, unary,
+                     fun(_Ctx, _Path, _Req, _Def, _Opts) ->
+                         true = ets:insert(?BLOCKED, {self()}),
+                         persistent_term:get(?BLOCKED_TEST) ! {guardian_call_entered, self()},
+                         receive release_guardian_call -> {error, {<<"3">>, <<"released">>}, #{}}
+                         after 60000 -> {error, {<<"3">>, <<"never released">>}, #{}}
+                         end
+                     end),
+    {ok, Pid} = yuzu_gw_upstream:start_link(),
+    unlink(Pid),
+    #{prev_env => Prev}.
+
+cleanup_guardian_blocked(Ctx) ->
+    [W ! release_guardian_call || {W} <- ets:tab2list(?BLOCKED)],
+    ets:delete(?BLOCKED),
+    catch persistent_term:erase(?BLOCKED_TEST),
+    cleanup_guardian(Ctx).
+
 stop_upstream() ->
     case whereis(yuzu_gw_upstream) of
         undefined -> ok;
@@ -227,6 +303,25 @@ guardian_dropped_circuit_open_line() ->
         yuzu_gw_upstream:forward_guardian_message(Id, #{})
     end, debug),
     assert_clean(Line, <<"guardian-open">>).
+
+guardian_dropped_at_capacity_line() ->
+    ok = persistent_term:put(?BLOCKED_TEST, self()),
+    Fill = [yuzu_gw_upstream:forward_guardian_message(<<"filler-", (integer_to_binary(I))/binary>>, #{})
+            || I <- lists:seq(1, 50)],
+    ?assertEqual(50, length(Fill)),
+    %% Every worker is inside the client before the next message is offered.
+    Workers = [receive {guardian_call_entered, W} -> W
+               after ?AWAIT_MS -> erlang:error(guardian_worker_not_entered)
+               end || _ <- Fill],
+    Id = control_id(<<"guardian-cap">>),
+    try
+        Line = capture_line(<<"(at capacity)">>, fun() ->
+            yuzu_gw_upstream:forward_guardian_message(Id, #{})
+        end, debug),
+        assert_clean(Line, <<"guardian-cap">>)
+    after
+        [W ! release_guardian_call || W <- Workers]
+    end.
 
 guardian_forward_failed_line() ->
     Id = control_id(<<"guardian-fail">>),
