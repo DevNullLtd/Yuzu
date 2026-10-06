@@ -311,7 +311,8 @@ read degraded resolving the ITServiceOwner ceiling", and `yuzu_server_rbac_read_
 increments) rather than `403`, because an outage is not a missing grant; it still fails closed.
 `require_permission` and `require_scoped_permission` keep answering `403` for the same failure. The
 ceiling read goes through the RBAC authz circuit breaker with a 250 ms acquire budget, so a degraded
-store fails quickly, and an open breaker is counted under the `pool_acquire_timeout` reason. The
+store fails quickly and, once the breaker is open, requests are answered without touching the pool; an
+open breaker is counted under the `pool_acquire_timeout` reason. The
 breaker bounds how many requests wait, not how long an already admitted read holds its connection:
 such a read can still wait up to the pool's `lock_timeout` (10 s default) or `statement_timeout`
 (30 s default). On a dark network path (no reply at all) the wait is bounded instead by the pool's
@@ -322,9 +323,12 @@ so ceiling-read failures can open it and an open breaker denies operators' cache
 closed).
 
 **The sibling gates changed their budget.** `require_permission` and `require_scoped_permission` now
-read the ceiling with the 250 ms authz acquire budget behind that shared breaker, where they used the
-2 s admin budget before. On a saturated or degraded pool a service-scoped request therefore turns into
-its `403` sooner (and an open breaker answers it without a pool touch).
+read the ceiling with the 250 ms authz acquire budget behind that shared breaker. Before, they acquired
+with the 2000 ms `kReadTimeout` and were not breaker-gated, but the pool clamps a bounded acquire to
+500 ms when it is already saturated at entry (`PgPool` `saturated_fast_fail`), so on a saturated pool the
+wait was up to about 500 ms, not 2 s (a pool that saturated only after the call entered it was bounded
+by the full 2 s). The change lowers that bound to 250 ms and, once the breaker is open, answers the
+request without a pool touch.
 
 **Rollback.** Downgrading the binary restores the previous behaviour for all of the above. The change
 adds no schema and persists no state.

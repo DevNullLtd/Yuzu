@@ -204,8 +204,8 @@ Recommended order for a fresh install:
 > A definitive deny is `403`; a FAILED permission read on the fleet-read gate is a
 > retryable `503` (`retry_after_ms` 5000), while `require_permission` and
 > `require_scoped_permission` keep answering `403` for the same failure. The ceiling read goes through the
-> RBAC authz circuit breaker with a 250 ms acquire budget, so a degraded store answers quickly (an open
-> breaker is counted under `pool_acquire_timeout`). It is the same breaker operator permission checks use, so
+> RBAC authz circuit breaker with a 250 ms acquire budget, so a degraded store answers quickly and, once
+> the breaker is open, without touching the pool (an open breaker is counted under `pool_acquire_timeout`). It is the same breaker operator permission checks use, so
 > repeated ceiling-read failures can open it and an open breaker denies operators' cache-miss checks too
 > (fail closed). A read that is already admitted and holds a connection can still wait up to the pool's
 > `lock_timeout` (10 s default) or `statement_timeout` (30 s default). On a dark network path (no reply at all)

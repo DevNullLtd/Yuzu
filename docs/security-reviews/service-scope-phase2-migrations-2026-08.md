@@ -197,8 +197,9 @@ not the numbers:
    The upload-grants REST route no longer reaches that resolver for a service-scoped token:
    `file_retrieval_routes.cpp`'s `register_list` refuses such a session with `403` before the
    resolver runs (the MCP twin already refused it through `perm_fn`), so the service-token reach
-   on that pair is closed. The supersede→intersect migration itself, for the callers that remain,
-   is still deferred.
+   on that pair is closed. That is an explicit deny shaped like the §3e denies, not this migration:
+   the supersede→intersect migration itself is still deferred for every caller listed here, the
+   upload-grants resolver included.
 5. **Bucket 3 — routes with no primary RBAC gate at all** (the `deny_service_scoped_session`
    family, the `/api/v1/result-sets` family, `/api/scope/estimate`, compliance fragments).
    **Explicitly out of scope for a `require_fleet_read` migration** — these need a gate added
