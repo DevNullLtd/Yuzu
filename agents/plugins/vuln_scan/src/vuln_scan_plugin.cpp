@@ -10,7 +10,8 @@
  * Output is pipe-delimited via write_output():
  *   <severity>|cve|<CVE-ID>: <description>|<product> <installed_ver> (fixed in <fixed_ver>)
  *   <severity>|config|<title>|<detail>
- *   summary|<severity>|<count>
+ *   UNREADABLE|config|<title>|<path>: <cause>   (a Linux file check that could not run; excluded from the issue tally)
+ *   summary|<severity>|<count>   (CRITICAL..INFO, then UNREADABLE; TOTAL first)
  */
 
 #include <yuzu/plugin.hpp>
@@ -20,7 +21,6 @@
 #include <cctype>
 #include <cstdio>
 #include <format>
-#include <map>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -417,31 +417,12 @@ void output_findings(yuzu::CommandContext& ctx, const std::vector<Finding>& find
 }
 
 void output_summary(yuzu::CommandContext& ctx, const std::vector<Finding>& findings) {
-    std::map<std::string, int> counts;
-    counts["CRITICAL"] = 0;
-    counts["HIGH"] = 0;
-    counts["MEDIUM"] = 0;
-    counts["LOW"] = 0;
-    counts["INFO"] = 0;
-
-    for (const auto& f : findings) {
-        counts[f.severity]++;
-    }
-
-    // Output total first
-    int total = 0;
-    int issues = 0;
-    for (const auto& [sev, count] : counts) {
-        total += count;
-        if (sev != "INFO")
-            issues += count;
-    }
-
-    ctx.write_output(std::format("summary|TOTAL|{} findings ({} issues)", total, issues));
-
-    for (const auto& sev : {"CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"}) {
-        ctx.write_output(std::format("summary|{}|{}", sev, counts[sev]));
-    }
+    std::vector<std::string> severities;
+    severities.reserve(findings.size());
+    for (const auto& f : findings)
+        severities.push_back(f.severity);
+    for (const auto& row : yuzu::vuln::summary_rows(severities))
+        ctx.write_output(row);
 }
 
 // ── ABI4 capability declarations (#2204) ─────────────────────────────────

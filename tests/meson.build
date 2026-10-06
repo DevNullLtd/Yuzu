@@ -242,6 +242,7 @@ agent_test_exe = executable(
     'unit/test_progress_listener.cpp', # #4018 per-test START/END progress log, env-gated
     'unit/test_detached_signature.cpp', # shared detached-CMS verifier (#416/#3807)
     'unit/test_updater_signature.cpp', # OTA signature gate, end to end (#416/#3807)
+    'unit/test_update_signature_mode.cpp', # OTA update-signature mode report + env typo check (#5249)
     'unit/test_plugin_loader.cpp',
     'unit/test_capability_registry_tables.cpp',
     'unit/test_sdk_utilities.cpp',
@@ -256,6 +257,7 @@ agent_test_exe = executable(
     'unit/test_confined_fs_win.cpp',
     'unit/test_string_utils.cpp',
     'unit/test_vuln_rules.cpp',
+    'unit/test_vuln_config_checks.cpp', # #4961: pure config-check decisions over injected reads (vuln_scan config_checks.hpp), portable
     'unit/test_metrics.cpp',
     'unit/test_metrics_perf.cpp',
     'unit/test_kv_store.cpp',
@@ -339,6 +341,7 @@ agent_test_exe = executable(
     'unit/test_launchctl_list.cpp',     # A0: shared launchctl-list row parser (agents/shared/launchctl_list.hpp)
     'unit/test_launchd_state.cpp',      # A0 fix round: launchd_state_for (yuzu/agent/launchd_state.hpp)
     'unit/test_wmi_bounded.cpp',        # shared bounded WMI helper (roadmap C-8 extraction); header-only, no separate .cpp to list
+    'unit/test_wmi_error_token.cpp',    # #4895: shared stage-aware WMI token classifier (agents/shared/wmi_error_token.hpp), portable
     'unit/test_installed_apps_registry_utf8.cpp',
     'unit/test_service_binpath.cpp',
     'unit/test_agent_log_options.cpp', # #4666 PR-2: make_log_handoff_options CLI-flags translator
@@ -376,6 +379,8 @@ agent_test_exe = executable(
     'unit/test_subprocess_launch_spec.cpp',   # PR1.2: host-agnostic pure launch-spec tests (run on Windows too)
     'unit/test_capability_descriptor.cpp',    # PR1.1: ABI4 descriptor + plugin->host result seam + declared-vs-observable honesty
     'unit/test_filesystem_macos_sig.cpp',     # #2273/1.14: pure codesign/plutil classifiers
+    'unit/test_filesystem_acl_parsers.cpp',   # filesystem get_acl: pure posix_acl xattr / acl_to_text / Windows ACE-row decoders over real-capture fixtures (+ real-syscall macOS cases under __APPLE__)
+    'unit/test_filesystem_get_acl_dispatcher.cpp',  # filesystem get_acl: real plugin via LocalDispatcher (row order, failure rows, Linux default-ACL-only aggregation)
     'unit/test_event_logs_macos.cpp',         # BR-08: pure `log show` SubprocessResult classifier
     'unit/test_event_logs_parsers.cpp',       # Wave 4 PR4.2: pure Windows event-XML / journal row parse+format helpers
     'unit/test_event_logs_journalctl.cpp',    # Wave 4 PR4.2: pure Linux journalctl-fallback outcome classifier (runs on every host)
@@ -479,6 +484,8 @@ agent_test_exe = executable(
     'unit/test_installed_apps_actions.cpp',   # Wave 4 PR4.3a remediation: real installed_apps.dylib/.so
                                                 # driven end to end via LocalDispatcher (POSIX-only; a
                                                 # no-op TU on Windows via the file's own #ifndef _WIN32 guard)
+    'unit/test_installed_apps_bundle_ids.cpp', # #4710: pure apply_bundle_ids composition + cap/status mapping (every OS)
+    'unit/test_bundle_id_read.cpp',            # #4710: agent-core bounded bundle-id pass driver (portable; the CF reader is injected)
     'unit/test_msi_packages_actions.cpp',     # Wave 4 PR4.3a remediation: real msi_packages.dylib driven
                                                 # end to end via LocalDispatcher (Darwin-only, self-gated)
     'unit/test_installed_apps_macos_enrich.cpp', # Wave 4 PR4.3a gate-1 fix: SecStaticCode signed/unsigned
@@ -538,9 +545,14 @@ agent_test_exe = executable(
     'unit/test_privacy_permissions_local_dispatcher.cpp', # Wave 8 PR8.5: real plugin via LocalDispatcher, unguarded on every OS
     'unit/test_privacy_permissions_macos_internals.cpp',  # TU-inclusion seam over privacy_permissions_macos.cpp, Apple-only body, unguarded TU
     'unit/test_privacy_permissions_win_internals.cpp',    # TU-inclusion seam over privacy_permissions_win.cpp (Windows-only body, empty TU elsewhere)
+    'unit/test_privacy_permissions_win_walk.cpp',  # fake-registry/fake-probe locks over privacy_permissions_win_walk.hpp + privacy_permissions_hive_guard.hpp, pure, every host
     'unit/test_posix_dir_walk.cpp',     # PR #4154 round-8 remediation: shared capped
                                         # directory-walk primitive (agents/shared/posix_dir_walk.hpp)
+    'unit/test_posix_secure_read.cpp',  # shared O_NOFOLLOW dir-open + bounded no-follow file read (agents/shared/posix_secure_read.hpp), POSIX-only bodies
+    'unit/test_sha256.cpp',             # shared in-memory SHA-256 (agents/shared/sha256.hpp), portable
+    'unit/test_email_redaction.cpp',    # shared [redacted-email] helper (agents/shared/email_redaction.hpp), portable
     'unit/test_wire_utf8.cpp',          # shared strict-UTF-8 scrubber (agents/shared/wire_utf8.hpp), portable
+    'unit/test_row_byte_budget.cpp',    # shared row/byte budget (agents/shared/row_byte_budget.hpp), portable
     'unit/test_wall_clock_step.cpp',    # #4503: shared consecutive-sample wall-vs-monotonic clock-step guard (agents/shared/wall_clock_step.hpp), portable
     'unit/test_printing_parsers.cpp',            # Wave 9 PR9.1b
     'unit/test_printing_local_dispatcher.cpp',   # Wave 9 PR9.1b
@@ -579,7 +591,7 @@ agent_test_exe = executable(
     '../agents/plugins/pkg_inventory/src/pkg_inventory_macos.cpp', # Wave 10 PR10.1-c: run_macos (the slot-guarded entry point execute() calls); self-gated to __APPLE__, empty elsewhere
   ),
   include_directories: [
-    include_directories('../agents/plugins/vuln_scan/src'),  # cve_rules.hpp
+    include_directories('../agents/plugins/vuln_scan/src'),  # cve_rules.hpp, config_checks.hpp
     include_directories('../agents/plugins/netprobe/src'),   # netprobe_stats.hpp (pure helpers)
     include_directories('../agents/plugins/antivirus/src'),  # antivirus_parsers.hpp (pure helpers)
     include_directories('../agents/plugins/firewall/src'),   # firewall_parsers.hpp (pure helpers)
@@ -612,7 +624,7 @@ agent_test_exe = executable(
     include_directories('../agents/plugins/services/src'),      # services_macos_launchd.hpp (P8 test)
     include_directories('../agents/plugins/msi_packages/src'),  # msi_packages_macos.hpp (P8 test)
     include_directories('../agents/plugins/bitlocker/src'),     # bitlocker_macos_apfs.hpp (P8 test); Wave 3: bitlocker_windows_wmi.hpp, bitlocker_linux_parsers.hpp
-    include_directories('../agents/plugins/filesystem/src'),    # filesystem_macos_sig.hpp (#2273/1.14)
+    include_directories('../agents/plugins/filesystem/src'),    # filesystem_macos_sig.hpp (#2273/1.14); filesystem_acl_parsers.hpp (get_acl parser + dispatcher tests)
     include_directories('../agents/plugins/event_logs/src'),    # event_logs_macos.hpp (BR-08)
     include_directories('../agents/plugins/certificates/src'),  # certificates_macos_parsers.hpp (Gate-7 FIX A: pure helpers shared with the plugin)
     include_directories('../agents/plugins/quarantine/src'),    # quarantine_parsers.hpp (Wave 2 WP-F)
@@ -747,7 +759,7 @@ agent_test_exe = executable(
                 device_identity_plugin_lib,
                 echo_argv_fixture,
                 event_logs_plugin_lib,
-                filesystem_plugin_lib,  # #4728: test_filesystem_local_dispatcher.cpp loads the real filesystem plugin by path
+                filesystem_plugin_lib,  # #4728 test_filesystem_local_dispatcher.cpp and the get_acl dispatcher test load the real filesystem plugin by path
                 filesystem_posture_plugin_lib,
                 hardware_plugin_lib,
                 installed_apps_plugin_lib,
@@ -2716,6 +2728,17 @@ test('agent installer trust-anchor ACL lint',
 test('compose certs volume',
   _python3_test,
   args: [files('test_compose_certs_volume.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
+# README Docker Compose quickstart (#5419): the compose the README downloads must
+# pull released images at ${YUZU_VERSION}, persist /etc/yuzu/certs, publish 8443,
+# and take the headless admin seed at the image's --config path. Stdlib only;
+# reuses test_compose_certs_volume.py's volume reader.
+test('readme quickstart compose',
+  _python3_test,
+  args: [files('test_readme_quickstart.py')],
   suite: 'docs',
   timeout: 30,
 )
