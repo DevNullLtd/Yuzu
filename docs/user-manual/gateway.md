@@ -629,8 +629,10 @@ half open periods, one probe each); a probe refused by a stopped server failed i
 under a millisecond and doubled the backoff; killing the probe worker produced
 one reopen and the event went back to the head; and a `ProxyRegister` retry that
 arrived while the probe was out drove the breaker transition, the late probe
-result left the breaker alone, and the event was still requeued. The statements
-that exactly one probe was sent, that the held entries were delivered in order
+result left the breaker alone, and the event was still requeued. The runs, their
+instruments and what they did not cover are in the
+[evidence record](../security-reviews/gateway-notify-pending-store-2026-10-05.md).
+The statements that exactly one probe was sent, that the held entries were delivered in order
 and how often each key was sent come from a temporary telemetry tracer loaded into
 the gateway, which has an observer effect; the 100 ms sampler cannot resolve a 2 ms
 event, and the gateway debug log has no line for a successful notification.
@@ -2136,7 +2138,10 @@ env keys with defaults, which a reverted build ignores.
 - **Cold-start notifications were shed at the in-flight limit, so most route rows
   had a session but no placement (never announced) until the replay ran. Fixed by
   #4632 (hold instead of drop).** Before the fix, OBSERVED in rig pass 6 (runs K1 and K6 of that pass)
-  and, per the local rig notes, in the cold start of pass 5 run J1: after a cold
+  and in the cold start of pass 5 run J1 (recorded in the
+  [verdict replay evidence record](../security-reviews/gateway-heartbeat-verdict-replay-2026-10-04.md)),
+  and it was measured again on the previous build for #4632 (see the
+  [evidence record](../security-reviews/gateway-notify-pending-store-2026-10-05.md)): after a cold
   `Subscribe` wave of 1000 simulated agents
   `yuzu_gw_upstream_notify_dropped_total{reason="at_capacity"}` was 987 (989 and
   988 in two repeats, and 1953 after 2000 agents), the server's route table
