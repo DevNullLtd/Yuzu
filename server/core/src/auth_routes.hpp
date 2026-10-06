@@ -506,18 +506,16 @@ public:
     /// elevated -> engine -> mcp_tier -> service -> RBAC -> legacy). It does NOT apply
     /// `kServiceScopeGlobalSafe`: that allow-list guards routes returning fleet-wide
     /// data UNCONFINED, while this gate's service axis always narrows to the tagged
-    /// set. DELIBERATE DIVERGENCE on a failed read: a DEFINITIVE ceiling deny (an
-    /// explicit deny row, or the pair absent because the seeded default was revoked or
-    /// never granted) is 403 `Forbidden` exactly like the siblings, but a FAILED
-    /// `get_role_permissions_checked` read is 503 `Degraded` with `retry_after_ms`
-    /// 5000 and a `yuzu_server_rbac_read_degrade_total` increment: an outage is not a
-    /// missing grant, so the caller is told to retry. `require_permission` and
-    /// `require_scoped_permission` map the same failure to 403 (their documented
-    /// fail-closed contract) and do not bump that counter for it. Both are fail CLOSED;
-    /// only the status, retry signal, audit text and counter differ. Neither body names a
-    /// `.permission`. Seeded defaults: ITServiceOwner holds every fleet-read pair this
-    /// gate is called with EXCEPT `Enrollment:Read`, so a service token gets 403 on
-    /// GET /api/v1/enrollment/pending-agents (documented Breaking change).
+    /// set. A DEFINITIVE ceiling deny (an explicit deny row, or the pair absent because
+    /// the seeded default was revoked or never granted) is 403 `Forbidden`, and a FAILED
+    /// ceiling read (`RbacStore::role_permission_allowed_checked`) is 503 `Degraded` with
+    /// `retry_after_ms` 5000 and a `yuzu_server_rbac_read_degrade_total` increment: an
+    /// outage is not a missing grant, so the caller is told to retry. `require_permission`
+    /// and `require_scoped_permission` answer the same way for the same failure, through
+    /// the one shared private `respond_ceiling_degraded`. Every case is fail CLOSED. No
+    /// body names a `.permission`. Seeded defaults: ITServiceOwner holds every fleet-read
+    /// pair this gate is called with EXCEPT `Enrollment:Read`, so a service token gets 403
+    /// on GET /api/v1/enrollment/pending-agents (documented Breaking change).
     [[nodiscard]] std::expected<authz::ListAuthority, authz::GateFailure>
     require_fleet_read(const httplib::Request& req, httplib::Response& res,
                        const std::string& securable_type, const std::string& operation);
@@ -924,6 +922,18 @@ private:
     /// the identical decision.
     [[nodiscard]] bool service_scope_admits(std::string_view securable_type,
                                             std::string_view operation) const;
+
+    /// The ONE response for a Degraded ITServiceOwner ceiling read (a failed read of the
+    /// role's permission rows, not a missing grant): bumps
+    /// `yuzu_server_rbac_read_degrade_total{reason=ceiling.degrade_reason}`, writes one
+    /// `denied` audit row (`audit_action`, `audit_detail`, which must NOT claim the role lacks
+    /// the permission) and answers 503 with `retry_after_ms` 5000 and no `.permission`.
+    /// Called by `require_fleet_read`, `require_permission` and `require_scoped_permission`
+    /// (extend, never fork); each caller still refuses the request itself.
+    void respond_ceiling_degraded(const httplib::Request& req, httplib::Response& res,
+                                  const std::string& audit_action,
+                                  const std::string& audit_detail,
+                                  const authz::CeilingResult& ceiling);
 
     std::optional<std::vector<authz::PermPair>> service_scope_global_safe_override_for_test_;
 

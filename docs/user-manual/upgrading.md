@@ -309,12 +309,12 @@ direct database `DELETE` of the row is re-seeded at the next boot unless the pai
 rule is the safeguard for a pair removed through `RbacStore::remove_permission` (which records it) and for
 any future surface that narrows the role.
 
-**Failure behaviour.** A FAILED permission read is different on the fleet-read gate: it answers a
-retryable `503` (`retry_after_ms` 5000, audit `auth.fleet_read_required` / `denied` with detail "RBAC
-read degraded resolving the ITServiceOwner ceiling", and `yuzu_server_rbac_read_degrade_total`
-increments) rather than `403`, because an outage is not a missing grant; it still fails closed.
-`require_permission` and `require_scoped_permission` keep answering `403` for the same failure. The
-ceiling read goes through the RBAC authz circuit breaker with a 250 ms acquire budget, so a degraded
+**Failure behaviour.** A FAILED read of the `ITServiceOwner` role's permissions is a retryable `503`
+(`retry_after_ms` 5000, an audit row with detail "RBAC read degraded resolving the ITServiceOwner
+ceiling", and `yuzu_server_rbac_read_degrade_total` increments) rather than `403`, because an outage
+is not a missing grant; it still fails closed. This holds on the fleet-read gate and equally on
+`require_permission` and `require_scoped_permission`, which answered `403` for this failure before
+this change; only a definitive deny is `403`. The ceiling read goes through the RBAC authz circuit breaker with a 250 ms acquire budget, so a degraded
 store fails quickly and, once the breaker is open, requests are answered without touching the pool; an
 open breaker is counted under the `pool_acquire_timeout` reason. The
 breaker bounds how many requests wait, not how long an already admitted read holds its connection:

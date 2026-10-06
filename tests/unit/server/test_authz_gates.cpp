@@ -595,9 +595,22 @@ TEST_CASE("require_fleet_read: service token - ITServiceOwner lacks the pair => 
     }
 }
 
+// What every gate must answer for a Degraded ceiling read: 503, a machine retry hint, no
+// `.permission` (an outage is not cured by a grant) and none of the definitive-deny wording.
+namespace {
+void check_ceiling_degraded_503(const httplib::Response& res) {
+    CHECK(res.status == 503);
+    const auto j = nlohmann::json::parse(res.body, nullptr, /*allow_exceptions=*/false);
+    REQUIRE_FALSE(j.is_discarded());
+    CHECK(j["error"]["retry_after_ms"].get<std::int64_t>() == 5000);
+    CHECK(res.body.find("\"permission\"") == std::string::npos);
+    CHECK(res.body.find("does not grant") == std::string::npos);
+}
+} // namespace
+
 TEST_CASE("require_fleet_read: service token - degraded ITServiceOwner permission read => "
-          "503 retryable with the degrade metric (fail closed and never an admit) while "
-          "require_permission and require_scoped_permission keep their 403",
+          "503 retryable with the degrade metric (fail closed and never an admit), and "
+          "require_permission and require_scoped_permission answer the same 503",
           "[pg][auth_routes][authz_gates][service_scope]") {
     YUZU_REQUIRE_PG_DB_TPL(rbac_db_, rbac_gates_tpl);
     yuzu::MetricsRegistry metrics; // declared before the rig: auth_mgr keeps a raw pointer to it
@@ -636,45 +649,60 @@ TEST_CASE("require_fleet_read: service token - degraded ITServiceOwner permissio
     CHECK(degrade("query_error") == 1.0);
     CHECK(degrade("pool_acquire_timeout") == 0.0);
 
-    // Parity pin: the siblings still say 403 for the same failed read and must not touch the
-    // metric. They run AFTER the gate call above: the first failed read leaves the authz
-    // breaker one step from open, so these answer from a failed query and then an open
-    // breaker; the gate's own query_error label is only reachable while the breaker is closed.
+    // Parity pin: the siblings answer the same failed read with the same 503 + retry hint and
+    // the same counter. They run AFTER the gate call above: the first failed read leaves the
+    // authz breaker one step from open, so these answer from a failed query (label
+    // query_error, which opens the breaker) and then an open breaker (label
+    // pool_acquire_timeout); the gate's own query_error label is only reachable while the
+    // breaker is closed.
     {
         auto req2 = bearer_request(svc);
         httplib::Response res2;
         CHECK_FALSE(r.ar->require_permission(req2, res2, "Response", "Read"));
-        CHECK(res2.status == 403);
-        CHECK(res2.body.find("service-scoped token does not grant Response:Read") !=
-              std::string::npos);
+        check_ceiling_degraded_503(res2);
     }
+    CHECK(degrade("query_error") == 2.0);
+    CHECK(degrade("pool_acquire_timeout") == 0.0);
     {
         auto req2 = bearer_request(svc);
         httplib::Response res2;
         CHECK_FALSE(r.ar->require_scoped_permission(req2, res2, "Response", "Read", "a_p"));
-        CHECK(res2.status == 403);
-        CHECK(res2.body.find("service-scoped token does not grant Response:Read") !=
-              std::string::npos);
+        check_ceiling_degraded_503(res2);
     }
-    CHECK(degrade("query_error") == 1.0);
-    CHECK(degrade("pool_acquire_timeout") == 0.0);
+    CHECK(degrade("query_error") == 2.0);
+    CHECK(degrade("pool_acquire_timeout") == 1.0);
     // The siblings' failed ceiling reads feed the same breaker: it is open now.
     CHECK(metrics.gauge("yuzu_server_rbac_breaker_open").value() == 1.0);
 
-    // The audit row says the read degraded, never that the role lacks the permission.
+    // Each audit row says the read degraded, never that the role lacks the permission.
     auto rows = r.audit_store.query({});
     REQUIRE(rows.has_value());
-    bool found = false;
-    for (const auto& row : *rows) {
-        if (row.action != "auth.fleet_read_required")
-            continue;
-        found = true;
-        CHECK(row.result == "denied");
-        CHECK(row.detail == "fleet read blocked: RBAC read degraded resolving the ITServiceOwner "
-                            "ceiling for Response:Read");
-        CHECK(row.detail.find("lacks ITServiceOwner") == std::string::npos);
-    }
-    CHECK(found);
+    const auto find_row = [&](const std::string& action) -> const AuditEvent* {
+        const AuditEvent* found = nullptr;
+        for (const auto& row : *rows) {
+            if (row.action != action)
+                continue;
+            CHECK(found == nullptr); // exactly one row per gate call
+            found = &row;
+        }
+        return found;
+    };
+    const auto* fleet_row = find_row("auth.fleet_read_required");
+    REQUIRE(fleet_row != nullptr);
+    CHECK(fleet_row->result == "denied");
+    CHECK(fleet_row->detail == "fleet read blocked: RBAC read degraded resolving the "
+                               "ITServiceOwner ceiling for Response:Read");
+    CHECK(fleet_row->detail.find("lacks ITServiceOwner") == std::string::npos);
+    const auto* perm_row = find_row("auth.permission_required");
+    REQUIRE(perm_row != nullptr);
+    CHECK(perm_row->result == "denied");
+    CHECK(perm_row->detail == "service-scoped token blocked: RBAC read degraded resolving the "
+                              "ITServiceOwner ceiling");
+    const auto* scoped_row = find_row("auth.scoped_permission_required");
+    REQUIRE(scoped_row != nullptr);
+    CHECK(scoped_row->result == "denied");
+    CHECK(scoped_row->detail == "service-scoped token blocked: RBAC read degraded resolving the "
+                                "ITServiceOwner ceiling");
 }
 
 TEST_CASE("require_fleet_read: explicit DENY row for ITServiceOwner on the pair => 403 - not an "
@@ -713,11 +741,55 @@ TEST_CASE("require_fleet_read: explicit DENY row for ITServiceOwner on the pair 
         CHECK(row.detail.find("degraded") == std::string::npos);
     }
 
-    // Same verdict through the sibling gate (one helper, one answer).
-    auto req2 = bearer_request(svc);
-    httplib::Response res2;
-    CHECK_FALSE(r.ar->require_permission(req2, res2, "Response", "Read"));
-    CHECK(res2.status == 403);
+    // Same verdict through both sibling gates (one helper, one answer): a definitive deny
+    // stays a 403 with the "does not grant" text and the "lacks ITServiceOwner" audit detail,
+    // with no retry hint, and it is never counted as a degraded read.
+    {
+        auto req2 = bearer_request(svc);
+        httplib::Response res2;
+        CHECK_FALSE(r.ar->require_permission(req2, res2, "Response", "Read"));
+        CHECK(res2.status == 403);
+        CHECK(res2.body.find("service-scoped token does not grant Response:Read (requires "
+                             "ITServiceOwner AND an explicit service-scope allow-list entry)") !=
+              std::string::npos);
+        CHECK(nlohmann::json::parse(res2.body)["error"]["retry_after_ms"].is_null());
+        CHECK(res2.body.find("\"permission\"") == std::string::npos);
+    }
+    {
+        auto req2 = bearer_request(svc);
+        httplib::Response res2;
+        CHECK_FALSE(r.ar->require_scoped_permission(req2, res2, "Response", "Read", "a_p"));
+        CHECK(res2.status == 403);
+        CHECK(res2.body.find("service-scoped token does not grant Response:Read (requires "
+                             "ITServiceOwner AND the target agent's service tag to match the "
+                             "token's scope)") != std::string::npos);
+        CHECK(nlohmann::json::parse(res2.body)["error"]["retry_after_ms"].is_null());
+        CHECK(res2.body.find("\"permission\"") == std::string::npos);
+    }
+    CHECK(metrics.counter("yuzu_server_rbac_read_degrade_total", {{"reason", "query_error"}})
+              .value() == 0.0);
+    CHECK(metrics.counter("yuzu_server_rbac_read_degrade_total",
+                          {{"reason", "pool_acquire_timeout"}})
+              .value() == 0.0);
+    {
+        auto rows = r.audit_store.query({});
+        REQUIRE(rows.has_value());
+        int perm_rows = 0;
+        int scoped_rows = 0;
+        for (const auto& row : *rows) {
+            if (row.action == "auth.permission_required") {
+                ++perm_rows;
+                CHECK(row.detail == "service-scoped token blocked: lacks ITServiceOwner "
+                                    "permission");
+            } else if (row.action == "auth.scoped_permission_required") {
+                ++scoped_rows;
+                CHECK(row.detail == "service-scoped token blocked: lacks ITServiceOwner "
+                                    "permission");
+            }
+        }
+        CHECK(perm_rows == 1);
+        CHECK(scoped_rows == 1);
+    }
 }
 
 TEST_CASE("require_fleet_read: service token through an MCP tier is not admitted by the "
@@ -1233,14 +1305,16 @@ TEST_CASE("ceiling read: a starved pool trips the authz breaker and every degrad
     CHECK(degrade("pool_acquire_timeout") == 1.0);
     CHECK(degrade("query_error") == 0.0);
 
-    // A sibling gate keeps its 403 for the same failed read and does not touch the counter.
+    // A sibling gate answers the same failed read with the same 503 + retry hint and counts
+    // it under the same label (the breaker is open, so the label is pool_acquire_timeout).
     {
         auto req2 = bearer_request(svc);
         httplib::Response res2;
         CHECK_FALSE(r.ar->require_permission(req2, res2, "Response", "Read"));
-        CHECK(res2.status == 403);
+        check_ceiling_degraded_503(res2);
     }
-    CHECK(degrade("pool_acquire_timeout") == 1.0);
+    CHECK(degrade("pool_acquire_timeout") == 2.0);
+    CHECK(degrade("query_error") == 0.0);
 }
 
 // The streak is reset by a successful ceiling read: one failed acquire, then a read that gets

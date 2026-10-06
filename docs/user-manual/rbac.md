@@ -206,9 +206,9 @@ Recommended order for a fresh install:
 >    removed through `RbacStore::remove_permission` (which records it) or recorded there by hand; the rule is
 >    the safeguard for that case and for a future authoring surface.
 >
-> A definitive deny is `403`; a FAILED permission read on the fleet-read gate is a
-> retryable `503` (`retry_after_ms` 5000), while `require_permission` and
-> `require_scoped_permission` keep answering `403` for the same failure. The ceiling read goes through the
+> A definitive deny is `403`; a FAILED read of the `ITServiceOwner` role's permissions is a
+> retryable `503` (`retry_after_ms` 5000) on the fleet-read gate and on `require_permission` and
+> `require_scoped_permission` alike (an outage is not a missing grant, and the request is still refused). The ceiling read goes through the
 > RBAC authz circuit breaker with a 250 ms acquire budget, so a degraded store answers quickly and, once
 > the breaker is open, without touching the pool (an open breaker is counted under `pool_acquire_timeout`). It is the same breaker operator permission checks use, so
 > repeated ceiling-read failures can open it and an open breaker denies operators' cache-miss checks too

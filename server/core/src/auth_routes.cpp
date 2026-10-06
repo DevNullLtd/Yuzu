@@ -759,12 +759,21 @@ bool AuthRoutes::require_permission(const httplib::Request& req, httplib::Respon
                             "application/json");
             return false;
         }
-        // Shared ceiling helper (authz::service_ceiling_check). Degraded (a failed read)
-        // maps to the SAME 403 as Deny here: this gate's documented fail-closed contract holds
-        // (require_fleet_read alone reports Degraded as a retryable 503 and bumps
-        // yuzu_server_rbac_read_degrade_total for it; this gate records neither).
-        if (authz::service_ceiling_check(*rbac_store_, securable_type, operation).verdict !=
-            authz::CeilingVerdict::Admit) {
+        // Shared ceiling helper (authz::service_ceiling_check). A Degraded verdict (a failed
+        // read) is a retryable 503 through the shared respond_ceiling_degraded, the same as
+        // require_fleet_read: an outage is not a missing grant. Still fail CLOSED (the request
+        // is refused). Only a definitive Deny is the 403 below.
+        const auto ceiling = authz::service_ceiling_check(*rbac_store_, securable_type, operation);
+        if (ceiling.verdict == authz::CeilingVerdict::Degraded) {
+            respond_ceiling_degraded(req, res, "auth.permission_required",
+                                     "service-scoped token blocked: RBAC read degraded "
+                                     "resolving the ITServiceOwner ceiling",
+                                     ceiling);
+            return false;
+        }
+        // Everything that is not an explicit Admit is refused: a Deny verdict, and any
+        // out-of-range value, which must never fall through to the admit.
+        if (ceiling.verdict != authz::CeilingVerdict::Admit) {
             audit_log(req, "auth.permission_required", "denied", "", "",
                       "service-scoped token blocked: lacks ITServiceOwner permission");
             res.status = 403;
@@ -1098,12 +1107,21 @@ bool AuthRoutes::require_scoped_permission(const httplib::Request& req, httplib:
             return false;
         }
         // Check that the ITServiceOwner role grants this permission type
-        // Shared ceiling helper (authz::service_ceiling_check). Degraded (a failed read)
-        // maps to the SAME 403 as Deny here: this gate's documented fail-closed contract holds
-        // (require_fleet_read alone reports Degraded as a retryable 503 and bumps
-        // yuzu_server_rbac_read_degrade_total for it; this gate records neither).
-        if (authz::service_ceiling_check(*rbac_store_, securable_type, operation).verdict !=
-            authz::CeilingVerdict::Admit) {
+        // Shared ceiling helper (authz::service_ceiling_check). A Degraded verdict (a failed
+        // read) is a retryable 503 through the shared respond_ceiling_degraded, the same as
+        // require_fleet_read: an outage is not a missing grant. Still fail CLOSED (the request
+        // is refused). Only a definitive Deny is the 403 below.
+        const auto ceiling = authz::service_ceiling_check(*rbac_store_, securable_type, operation);
+        if (ceiling.verdict == authz::CeilingVerdict::Degraded) {
+            respond_ceiling_degraded(req, res, "auth.scoped_permission_required",
+                                     "service-scoped token blocked: RBAC read degraded "
+                                     "resolving the ITServiceOwner ceiling",
+                                     ceiling);
+            return false;
+        }
+        // Everything that is not an explicit Admit is refused: a Deny verdict, and any
+        // out-of-range value, which must never fall through to the admit.
+        if (ceiling.verdict != authz::CeilingVerdict::Admit) {
             audit_log(req, "auth.scoped_permission_required", "denied", "", "",
                       "service-scoped token blocked: lacks ITServiceOwner permission");
             res.status = 403;
