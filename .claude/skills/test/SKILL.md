@@ -289,7 +289,7 @@ This keeps the upgrade baseline tracking whatever the last published stable
 tag is without needing a pipeline edit each release. Pass `--old-version
 X.Y.Z` to pin an older baseline for debugging.
 
-The script records its own gate row (`Upgrade vOLD->vNEW`) and sub-step timings (`pull-old-images`, `stack-up-old`, `fixtures-write`, `image-swap`, `ready-after-upgrade`, `fixtures-verify`, `synthetic-uat-against-upgraded`). The skill doesn't need to record anything additional.
+The script records its own gate row (`Upgrade vOLD->vNEW`) and sub-step timings (`pull-old-images`, `stack-up-old`, `fixtures-write`, `image-swap`, `ready-after-upgrade`, `fixtures-verify`, `synthetic-uat-against-upgraded`, `recreate-after-upgrade` — a same-image `--force-recreate` of the upgraded server that must come back ready with a byte-identical `/etc/yuzu/certs` and a working login, #5370). The skill doesn't need to record anything additional.
 
 **On failure**: Phase 2 failure is informative but not blocking — continue to Phase 4. The teardown reads gate counts at the end and the operator decides whether to commit.
 

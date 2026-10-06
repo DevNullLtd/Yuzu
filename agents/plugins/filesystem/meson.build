@@ -4,7 +4,7 @@ if host_machine.system() == 'windows'
   fs_extra_deps = [version_lib]
 endif
 
-shared_library(
+filesystem_plugin_lib = shared_library(
   'filesystem',
   files('src/filesystem_plugin.cpp'),
   name_prefix: '',

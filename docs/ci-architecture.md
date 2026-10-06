@@ -245,7 +245,7 @@ requests only, not a required check today) runs
 `agents/plugins/<name>/src/**` must also touch that README, or the PR body
 must carry a visible `docs-unchanged: <section> — <reason>` line, which
 the job prints. Both scripts carry a fixture self-test that the `docs`
-suite also runs.
+suite also runs (the touch-rule one off Windows only, #5428).
 
 ### ClusterFuzzLite (`cflite-pr.yml` + `cflite-batch.yml`)
 

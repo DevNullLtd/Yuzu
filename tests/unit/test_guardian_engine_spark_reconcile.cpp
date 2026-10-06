@@ -13,6 +13,7 @@
 #include "guardian_backend.hpp" // guardian_backend_from_state/label (#2298 F13)
 #include "guardian_convergence_scheduler.hpp" // ConvergenceScheduler (started_for_test, #2238)
 #include "guardian_journal_format.hpp" // kJournalNamespace, parse_journal_batch (item 7 PR-Ag)
+#include "guardian_health_heartbeat.hpp" // #5403: the pending-Disarm age / deadline-count emitters
 #include "guardian_joined_thread_role.hpp" // GuardianJoinedThreadRole (death test below)
 #include "guardian_io_executor.hpp" // GuardianIoExecutor::submit() (rung 9c R5.1 death test)
 #include "guardian_journal_heartbeat.hpp" // emit_guardian_journal_heartbeat_tags (aggregate inertness)
@@ -244,6 +245,20 @@ public:
             gate_cv_.notify_all();
             gate_cv_.wait(gate_lk, [this] { return released_; });
         }
+        // #4472: an unwatch() hang with its OWN gate, so a test can hold a disarm after the
+        // shared gate above has already been released for a hung arm (that gate latches open).
+        bool isolated_hang = false;
+        {
+            std::lock_guard<std::mutex> lk{mu_};
+            isolated_hang = isolated_hang_next_unwatch_;
+            isolated_hang_next_unwatch_ = false;
+        }
+        if (isolated_hang) {
+            std::unique_lock<std::mutex> gate_lk{isolated_gate_mu_};
+            isolated_entered_ = true;
+            isolated_gate_cv_.notify_all();
+            isolated_gate_cv_.wait(gate_lk, [this] { return isolated_released_; });
+        }
         std::lock_guard<std::mutex> lk{mu_};
         watched_.erase(key);
     }
@@ -281,6 +296,22 @@ public:
     void hang_next_unwatch() {
         std::lock_guard<std::mutex> lk{mu_};
         hang_next_unwatch_ = true;
+    }
+    /// #4472: the next unwatch() parks on a gate independent of hang_next_watch()'s.
+    void hang_next_unwatch_isolated() {
+        std::lock_guard<std::mutex> lk{mu_};
+        isolated_hang_next_unwatch_ = true;
+    }
+    bool wait_entered_isolated_unwatch(std::chrono::seconds timeout) {
+        std::unique_lock<std::mutex> gate_lk{isolated_gate_mu_};
+        return isolated_gate_cv_.wait_for(gate_lk, timeout, [this] { return isolated_entered_; });
+    }
+    void release_isolated_unwatch_hang() {
+        {
+            std::lock_guard<std::mutex> gate_lk{isolated_gate_mu_};
+            isolated_released_ = true;
+        }
+        isolated_gate_cv_.notify_all();
     }
     /// Blocks until a hung watch()/unwatch() has actually entered its wait (avoids a
     /// racy sleep-based poll for "is it parked yet").
@@ -335,6 +366,11 @@ private:
     bool throw_next_watch_{false};
     bool hang_next_watch_{false};
     bool hang_next_unwatch_{false};
+    bool isolated_hang_next_unwatch_{false}; ///< #4472, guarded by mu_
+    std::mutex isolated_gate_mu_;
+    std::condition_variable isolated_gate_cv_;
+    bool isolated_entered_{false};  ///< guarded by isolated_gate_mu_
+    bool isolated_released_{false}; ///< guarded by isolated_gate_mu_
     // Gate is a SEPARATE lock from mu_ (see watch()'s comment) - release_hang() must
     // never need mu_, or a caller blocked trying to take mu_ mid-hang (e.g. a concurrent
     // is_watching() from the test's own polling) could never be released.
@@ -3074,6 +3110,158 @@ TEST_CASE("rung 9c PR-2 Unit 3: a hung unwatch() no longer wedges apply_rules() 
                                    std::chrono::seconds(10)));
 }
 
+// #5403 export half, through the REAL GuardianEngine + SparkEngine + runtime: a Disarm whose
+// mechanism unwatch() is parked is reported by the engine's heartbeat accessors, aged with a
+// synthetic `now` (never a sleep), latched once past the observation threshold, and gone from
+// the age export when the call completes. The runtime-level semantics have their own tests in
+// test_guardian_spark_runtime.cpp; this one proves the engine forwards them and that the
+// agent's real emitters turn them into the pinned tags.
+TEST_CASE("#5403: the engine exports a hung Disarm's age and deadline count as heartbeat tags, "
+          "and the age disappears on completion",
+          "[spark][guardian][reconcile][liveness][disarm]") {
+    SparkReconcileFixture f;
+    // Release the parked mechanism on EVERY exit path, declared after `f` so it runs BEFORE
+    // the fixture tears down SparkEngine/GuardianEngine (same rationale as the #2233 test).
+    struct ReleaseHangOnExit {
+        SparkReconcileFixture& fx;
+        ~ReleaseHangOnExit() { fx.mechanism->release_hang(); }
+    };
+    ReleaseHangOnExit release_parked{f};
+
+    f.apply(make_service_rule("r1"));
+    REQUIRE(f.mechanism->watching_count() == 1);
+
+    // Quiet agent: no Disarm pending, so BOTH exports are silent (the age is absent, not 0).
+    CHECK_FALSE(f.engine->oldest_pending_disarm_age_seconds().has_value());
+    CHECK(f.engine->disarm_deadline_elapsed() == 0);
+    {
+        // Through the SAME helper agent.cpp's heartbeat calls (not a hand-assembled copy).
+        std::map<std::string, std::string> tags;
+        yuzu::agent::collect_guardian_spark_health_tags(*f.engine, tags,
+                                                         std::chrono::steady_clock::now());
+        CHECK(tags.empty());
+    }
+
+    f.mechanism->hang_next_unwatch();
+    // full_sync with the rule disabled: detach_all() -> off-lock Disarm -> parked unwatch().
+    auto dr = f.dispatch_raw(make_service_rule("r1", /*enabled=*/false));
+    REQUIRE(dr.exit_code == 0);
+    REQUIRE(f.mechanism->wait_entered_hang(std::chrono::seconds(30)));
+
+    // Pending: the age is present (young, so it floors to a small whole number of seconds).
+    REQUIRE(f.engine->oldest_pending_disarm_age_seconds().has_value());
+    // Synthetic clock, no sleep: 95 s after now the same claim reads at least 95 whole seconds.
+    const auto later = std::chrono::steady_clock::now() + std::chrono::seconds(95);
+    const auto aged = f.engine->oldest_pending_disarm_age_seconds(later);
+    REQUIRE(aged.has_value());
+    CHECK(*aged >= 95);
+    // A `now` that predates the claim clamps to zero rather than wrapping.
+    const auto before = f.engine->oldest_pending_disarm_age_seconds(
+        std::chrono::steady_clock::time_point{});
+    REQUIRE(before.has_value());
+    CHECK(*before == 0);
+
+    // Latch: a pass 31 s on observes the Disarm pending past the threshold, once.
+    REQUIRE(f.engine->spark_runtime_for_test() != nullptr);
+    const auto thirty_one = std::chrono::steady_clock::now() + std::chrono::seconds(31);
+    f.engine->spark_runtime_for_test()->expire_overdue_claims_at_for_test(thirty_one);
+    f.engine->spark_runtime_for_test()->expire_overdue_claims_at_for_test(thirty_one + std::chrono::seconds(5));
+    CHECK(f.engine->disarm_deadline_elapsed() == 1);
+
+    {
+        std::map<std::string, std::string> tags;
+        yuzu::agent::collect_guardian_spark_health_tags(*f.engine, tags, later);
+        REQUIRE(tags.count("yuzu.guardian_disarm_pending_age_seconds") == 1);
+        CHECK(std::stoull(tags.at("yuzu.guardian_disarm_pending_age_seconds")) >= 95);
+        CHECK(tags.at("yuzu.guardian_disarm_deadline_elapsed") == "1");
+    }
+
+    // Completion: the call returns, the claim pops, the age export disappears. The
+    // cumulative count is not undone.
+    f.mechanism->release_hang();
+    REQUIRE(yuzu::test::spin_until(
+        [&] { return !f.engine->oldest_pending_disarm_age_seconds(later).has_value(); },
+        std::chrono::seconds(10)));
+    CHECK(f.engine->disarm_deadline_elapsed() == 1);
+    // The age is gone; the cumulative count is not, so exactly that one tag remains.
+    std::map<std::string, std::string> after;
+    yuzu::agent::collect_guardian_spark_health_tags(*f.engine, after,
+                                                     std::chrono::steady_clock::now());
+    CHECK(after.count("yuzu.guardian_disarm_pending_age_seconds") == 0);
+    CHECK(after.size() == 1);
+    CHECK(after.at("yuzu.guardian_disarm_deadline_elapsed") == "1");
+}
+
+// #5404 export half, through the REAL GuardianEngine + runtime: the engine's claim-lifecycle
+// snapshot is all-zero on a healthy engine (so the sparse emitter ships NO tag), and a counter
+// the runtime bumps through its own production path reaches the snapshot and the pinned tag.
+// The accessor -> field mapping itself is pinned in test_guardian_health_heartbeat.cpp; this
+// proves the engine reads the wired runtime and forwards it.
+TEST_CASE("#5404: the engine's claim-lifecycle snapshot is silent when healthy and carries a "
+          "runtime counter bumped through the ack-drain tick",
+          "[spark][guardian][reconcile][claim]") {
+    SparkReconcileFixture f;
+    f.apply(make_service_rule("r1")); // a live armed rule: the healthy steady state
+    REQUIRE(f.mechanism->watching_count() == 1);
+
+    {
+        const auto quiet = f.engine->spark_claim_health_stats();
+        CHECK(quiet.orphan_disarms_started == 0);
+        CHECK(quiet.dead_watchers_erased_on_lost == 0);
+        CHECK(quiet.tombstones_released_by_reaper == 0);
+        CHECK(quiet.claim_index_release_failures == 0);
+        CHECK(quiet.claim_drain_failures == 0);
+        CHECK(quiet.retained_tombstones == 0);
+        CHECK(quiet.detach_sweep_left_residue == 0);
+        CHECK(quiet.detach_claim_failures == 0);
+        CHECK(quiet.detach_post_commit_failures == 0);
+        CHECK(quiet.claims_dropped_at_stop == 0);
+        CHECK(quiet.ack_maint_exceptions == 0);
+        CHECK(f.engine->ack_maint_exceptions() == 0);
+        std::map<std::string, std::string> tags;
+        yuzu::agent::emit_guardian_health_heartbeat_tags(tags, quiet);
+        CHECK(tags.empty()); // sparse: a healthy engine reports nothing
+    }
+
+    // The runtime's orphan pass (inside the ack-drain tick's expiry call) throws once at its
+    // top; the runtime contains it and counts it in claim_drain_failures. Nothing else moves.
+    REQUIRE(f.engine->spark_runtime_for_test() != nullptr);
+    f.engine->spark_runtime_for_test()->set_drain_fault_point_for_test(15);
+    f.engine->journal_maintenance_tick();
+    CHECK(f.engine->spark_runtime_for_test()->claim_drain_failures() == 1);
+
+    const auto stats = f.engine->spark_claim_health_stats();
+    CHECK(stats.claim_drain_failures == 1);
+    CHECK(stats.orphan_disarms_started == 0);
+    CHECK(stats.claim_index_release_failures == 0);
+    CHECK(stats.detach_claim_failures == 0);
+    CHECK(stats.ack_maint_exceptions == 0); // the runtime contained it; the ack firewall did not
+    std::map<std::string, std::string> tags;
+    yuzu::agent::emit_guardian_health_heartbeat_tags(tags, stats);
+    REQUIRE(tags.size() == 1);
+    CHECK(tags.at("yuzu.guardian_claim_drain_failures") == "1");
+}
+
+TEST_CASE("#5404: an engine with no Spark runtime wired reports an all-zero claim-lifecycle "
+          "snapshot",
+          "[spark][guardian][reconcile][claim]") {
+    yuzu::test::TempDbFile db{unique_kv_path()};
+    auto opened = KvStore::open(db.path);
+    REQUIRE(opened.has_value());
+    KvStore kv{std::move(*opened)};
+    GuardianEngine engine{&kv, "agent-test", /*prefer_spark=*/false};
+    REQUIRE(engine.start_local().has_value()); // never wire_spark_engine()'d: no runtime
+    CHECK(engine.spark_runtime_for_test() == nullptr);
+    const auto s = engine.spark_claim_health_stats();
+    CHECK(s.claim_drain_failures == 0);
+    CHECK(s.retained_tombstones == 0);
+    CHECK(s.ack_maint_exceptions == 0);
+    std::map<std::string, std::string> tags;
+    yuzu::agent::emit_guardian_health_heartbeat_tags(tags, s);
+    CHECK(tags.empty());
+    engine.stop();
+}
+
 // ---------------------------------------------------------------------------
 // #2233 item 3: the OTHER half of the liveness fix - a genuinely failed (timed
 // out) arm must be COUNTED, so apply_rules' policy_generation hold-on-failure
@@ -3119,6 +3307,227 @@ TEST_CASE("#2233 item 3: a timed-out arm holds policy_generation for retry, not 
     CHECK(f.engine->rule_count() == 1);        // persisted (put_rule_locked ran)
     CHECK(f.engine->spark_armed_rule_count() == 0);
     // (the parked mechanism is released by `release_parked` above on every exit path)
+}
+
+// ---------------------------------------------------------------------------
+// #4472 post-K stranding, engine level. An operator withdraws a rule whose arm is hung and
+// re-adds the identical rule while the arm's late success is compensated: the late success lands
+// after the withdrawal (so it is disarmed, not adopted) and its compensating disarm is parked
+// inside unwatch(). The server's identical re-pushes then re-observe the same retained Wedged
+// claim; on the fourth identical application the heartbeat drain finds that claim K-eligible
+// (still the key's FIFO front) and, with the disarm still outstanding, K-waives the generation.
+// The disarm then finishes and pops the claim with no replacement arm. Pass condition: the
+// generation is NOT acknowledged while the disarm is outstanding AND the rule ends armed on the
+// mechanism. The runtime-level twin (test_guardian_spark_runtime.cpp, "#4472: ...") drives the
+// same ledger decision with the late success landing inside a single full_sync's detach_all /
+// re-attach window, which an engine test cannot park.
+// ---------------------------------------------------------------------------
+namespace {
+/// `finish_disarm_before_drain` false: the compensating disarm is still parked when the fourth
+/// identical application's heartbeat drain runs (the repro). True: it is released after that
+/// application's re-attach but before the drain (the control).
+void run_post_k_4472_scenario(bool finish_disarm_before_drain) {
+    using namespace std::chrono_literals;
+    SparkReconcileFixture f;
+    struct ReleaseOnExit {
+        SparkReconcileFixture& fx;
+        ~ReleaseOnExit() {
+            fx.mechanism->release_isolated_unwatch_hang();
+            fx.mechanism->release_hang();
+        }
+    };
+    ReleaseOnExit release_parked{f};
+
+    const auto push = [&](std::uint64_t generation, bool with_rule) {
+        gpb::GuaranteedStatePush p;
+        p.set_full_sync(true);
+        p.set_policy_generation(generation);
+        if (with_rule)
+            *p.add_rules() = make_service_rule("r1");
+        auto dr = yuzu::agent::guardian_dispatch_push_bytes_for_test(*f.engine, p.SerializeAsString());
+        REQUIRE(dr.exit_code == 0);
+    };
+    const auto drain_pending = [&] {
+        REQUIRE(yuzu::test::spin_until(
+            [&] {
+                f.engine->journal_maintenance_tick();
+                return f.engine->ack_pending_count_for_test() == 0;
+            },
+            10s));
+    };
+
+    // The arm hangs inside the mechanism; the synthetic clock expires its claim to a retained
+    // Wedged head without any wait. Generation 5 is held.
+    f.mechanism->hang_next_watch();
+    push(5, true);
+    REQUIRE(f.mechanism->wait_entered_hang(30s));
+    REQUIRE(f.engine->spark_runtime_for_test() != nullptr);
+    REQUIRE(f.engine->spark_runtime_for_test()->expire_overdue_claims_at_for_test(
+                std::chrono::steady_clock::now() + 600s) == 1);
+    drain_pending();
+    REQUIRE(f.engine->policy_generation() == 0);
+
+    // Withdrawal (full_sync omitting r1): the wedge is deactivated. Then the hung arm returns its
+    // subscription; with the rule no longer wanted it is compensated, and that disarm parks.
+    push(6, false);
+    drain_pending();
+    f.mechanism->hang_next_unwatch_isolated();
+    f.mechanism->release_hang();
+    REQUIRE(f.mechanism->wait_entered_isolated_unwatch(30s));
+
+    // The identical re-add, then three more identical re-applications (reapply_count 0..3), each
+    // followed by the heartbeat drain.
+    for (int i = 0; i < 4; ++i) {
+        push(7, true);
+        if (i == 3 && finish_disarm_before_drain) {
+            f.mechanism->release_isolated_unwatch_hang();
+            REQUIRE(yuzu::test::spin_until([&] { return f.engine->active_io_workers() == 0; }, 10s));
+        }
+        drain_pending();
+        if (i < 3)
+            REQUIRE(f.engine->policy_generation() < 7);
+    }
+
+    // (a) With the disarm outstanding the generation must not have been acknowledged, or the
+    // server stops re-sending (agent_gen >= current). In the control it is held too: the claim
+    // is gone, so the Wedged receipt is no longer K-eligible.
+    const bool acknowledged = f.engine->policy_generation() >= 7;
+    CHECK_FALSE(acknowledged);
+    if (finish_disarm_before_drain)
+        REQUIRE_FALSE(acknowledged); // the retry below is only owed (and modelled) in this case
+
+    // The disarm completes; the compensated claim is popped.
+    f.mechanism->release_isolated_unwatch_hang();
+    REQUIRE(yuzu::test::spin_until([&] { return f.engine->active_io_workers() == 0; }, 10s));
+
+    // (b) With an acknowledged generation nothing re-sends the rule; with a held one the server's
+    // identical retry arrives. Either way the rule must end armed on the mechanism.
+    if (!acknowledged) {
+        push(7, true);
+        REQUIRE(yuzu::test::spin_until(
+            [&] {
+                f.engine->journal_maintenance_tick();
+                return f.engine->ack_pending_count_for_test() == 0 &&
+                       f.engine->active_io_workers() == 0;
+            },
+            10s));
+    }
+    CHECK(f.engine->rule_count() == 1);
+    CHECK(f.engine->spark_armed_rule_count() == 1);
+    CHECK(f.mechanism->watching_count() == 1);
+}
+} // namespace
+
+TEST_CASE("#4472: a compensating disarm still outstanding at the heartbeat drain must not "
+          "K-waive the generation, and the rule must end armed",
+          "[spark][guardian][reconcile][liveness][4472]") {
+    run_post_k_4472_scenario(/*finish_disarm_before_drain=*/false);
+}
+
+TEST_CASE("#4472 control: a compensating disarm that finished before the heartbeat drain holds "
+          "the generation, and the retry arms the rule",
+          "[spark][guardian][reconcile][liveness][4472]") {
+    run_post_k_4472_scenario(/*finish_disarm_before_drain=*/true);
+}
+
+// #4472 export half, through the REAL GuardianEngine + SparkEngine + runtime: a compensating
+// teardown whose mechanism unwatch() is parked is reported by the engine's heartbeat accessors
+// (an age from the instant the compensation became owed, never a plain-Disarm age), aged with a
+// synthetic `now` (never a sleep), latched once past its deadline, and gone from the age export
+// when the teardown completes. The agent's real emitters turn them into the pinned tags.
+TEST_CASE("#4472: the engine exports an outstanding compensating teardown's age and deadline "
+          "count as heartbeat tags, and the age disappears on completion",
+          "[spark][guardian][reconcile][liveness][4472]") {
+    using namespace std::chrono_literals;
+    SparkReconcileFixture f;
+    struct ReleaseOnExit {
+        SparkReconcileFixture& fx;
+        ~ReleaseOnExit() {
+            fx.mechanism->release_isolated_unwatch_hang();
+            fx.mechanism->release_hang();
+        }
+    };
+    ReleaseOnExit release_parked{f};
+
+    const auto push = [&](std::uint64_t generation, bool with_rule) {
+        gpb::GuaranteedStatePush p;
+        p.set_full_sync(true);
+        p.set_policy_generation(generation);
+        if (with_rule)
+            *p.add_rules() = make_service_rule("r1");
+        auto dr = yuzu::agent::guardian_dispatch_push_bytes_for_test(*f.engine, p.SerializeAsString());
+        REQUIRE(dr.exit_code == 0);
+    };
+    const auto drain_pending = [&] {
+        REQUIRE(yuzu::test::spin_until(
+            [&] {
+                f.engine->journal_maintenance_tick();
+                return f.engine->ack_pending_count_for_test() == 0;
+            },
+            10s));
+    };
+    const auto emit_tags = [&](std::chrono::steady_clock::time_point now) {
+        // The SAME helper agent.cpp's heartbeat calls, not a hand-assembled copy.
+        std::map<std::string, std::string> tags;
+        yuzu::agent::collect_guardian_spark_health_tags(*f.engine, tags, now);
+        return tags;
+    };
+
+    // Quiet agent: both exports are silent (the age is absent, not 0).
+    CHECK_FALSE(f.engine->oldest_outstanding_compensation_age_seconds().has_value());
+    CHECK(emit_tags(std::chrono::steady_clock::now()).empty());
+
+    // A hung arm that wedges, a withdrawal, then the arm's late success: compensated, and that
+    // disarm parks inside unwatch().
+    f.mechanism->hang_next_watch();
+    push(5, true);
+    REQUIRE(f.mechanism->wait_entered_hang(30s));
+    REQUIRE(f.engine->spark_runtime_for_test() != nullptr);
+    REQUIRE(f.engine->spark_runtime_for_test()->expire_overdue_claims_at_for_test(
+                std::chrono::steady_clock::now() + 600s) == 1);
+    drain_pending();
+    // A hung arm is not a compensation: still nothing to export.
+    CHECK_FALSE(f.engine->oldest_outstanding_compensation_age_seconds().has_value());
+    push(6, false);
+    drain_pending();
+    f.mechanism->hang_next_unwatch_isolated();
+    f.mechanism->release_hang();
+    REQUIRE(f.mechanism->wait_entered_isolated_unwatch(30s));
+
+    // Pending: present, young; a plain-Disarm age is absent (this is an Arm claim's teardown).
+    REQUIRE(f.engine->oldest_outstanding_compensation_age_seconds().has_value());
+    CHECK_FALSE(f.engine->oldest_pending_disarm_age_seconds().has_value());
+    const auto later = std::chrono::steady_clock::now() + 95s;
+    const auto aged = f.engine->oldest_outstanding_compensation_age_seconds(later);
+    REQUIRE(aged.has_value());
+    CHECK(*aged >= 95);
+    const auto before =
+        f.engine->oldest_outstanding_compensation_age_seconds(std::chrono::steady_clock::time_point{});
+    REQUIRE(before.has_value());
+    CHECK(*before == 0);
+
+    // Latch: two passes well past the deadline observe it once.
+    const auto far_future = std::chrono::steady_clock::now() + 3600s;
+    f.engine->spark_runtime_for_test()->expire_overdue_claims_at_for_test(far_future);
+    f.engine->spark_runtime_for_test()->expire_overdue_claims_at_for_test(far_future + 5s);
+    {
+        const auto tags = emit_tags(later);
+        REQUIRE(tags.count("yuzu.guardian_compensation_pending_age_seconds") == 1);
+        CHECK(std::stoull(tags.at("yuzu.guardian_compensation_pending_age_seconds")) >= 95);
+        REQUIRE(tags.count("yuzu.guardian_compensation_deadline_elapsed") == 1);
+        CHECK(tags.at("yuzu.guardian_compensation_deadline_elapsed") == "1");
+        CHECK(tags.count("yuzu.guardian_disarm_pending_age_seconds") == 0);
+    }
+
+    // Completion: the teardown returns, the claim pops, the age export disappears; the
+    // cumulative count is not undone.
+    f.mechanism->release_isolated_unwatch_hang();
+    REQUIRE(yuzu::test::spin_until(
+        [&] { return !f.engine->oldest_outstanding_compensation_age_seconds(later).has_value(); },
+        10s));
+    const auto after = emit_tags(later);
+    CHECK(after.count("yuzu.guardian_compensation_pending_age_seconds") == 0);
+    CHECK(after.at("yuzu.guardian_compensation_deadline_elapsed") == "1");
 }
 
 #ifndef _WIN32

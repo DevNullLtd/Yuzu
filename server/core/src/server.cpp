@@ -199,6 +199,7 @@
 #include "capability_decls/plugin_action_catalogue_privacy_permissions.hpp"
 #include "capability_decls/plugin_action_catalogue_system_hardening.hpp"
 #include "capability_decls/plugin_action_catalogue_pkg_inventory.hpp"
+#include "capability_decls/plugin_action_catalogue_mgmt_posture.hpp"
 #include "mcp_input_bounds.hpp" // kExecInstrBoundReasons — the boot pre-seed iterates it (#2437)
 #include "mcp_jsonrpc.hpp"
 #include "auth_routes.hpp"
@@ -2603,6 +2604,10 @@ public:
         // from (guardian_health_fleet_tags.hpp), same reason as the journal block
         // above: a new signal cannot ship with a gauge but no HELP.
         for (const auto& m : detail::kGuardianHealthMetrics)
+            metrics_.describe(m.gauge, m.help, "gauge");
+        // #5403, #4472: the pending-Spark-Disarm and compensating-teardown age rows, rolled
+        // up as MAX (their own table).
+        for (const auto& m : detail::kGuardianHealthAgeMetrics)
             metrics_.describe(m.gauge, m.help, "gauge");
         metrics_.describe(detail::kGuardianHealthReportingGauge,
                           detail::kGuardianHealthReportingHelp, "gauge");
@@ -9703,11 +9708,12 @@ public:
         {
             using namespace std::chrono;
             // The two ROLL-UPS start no new work from here on (RD-1): the catalogue
-            // roll-up is told to stop without a join (an in-flight recompute finishes
-            // and is joined later, as before); the app-perf loop watches draining_
-            // itself. Those two are the maintenance passes whose join can wait out a
-            // long statement budget (120s / 60s); a recompute starting inside the
-            // grace would otherwise add that AFTER it. Other passes are unaffected —
+            // roll-up is told to stop without a join (an in-flight recompute is
+            // cancelled at its next poll, last-good kept, and joined by stop()); the
+            // app-perf loop watches draining_ itself. Those two are the maintenance
+            // passes whose join can wait out a long statement budget (120s / 60s); a
+            // recompute starting inside the grace would otherwise add that AFTER it.
+            // Other passes are unaffected —
             // their stops are already bounded (e.g. NVD sync's 5s cancel-then-detach).
             if (software_catalog_rollup_)
                 software_catalog_rollup_->request_stop();
@@ -17696,7 +17702,8 @@ private:
                    int limit) -> std::optional<std::vector<SoftwareVersionCount>> {
                 if (!software_inventory_store_)
                     return std::nullopt;
-                return software_inventory_store_->software_versions(name, limit);
+                return software_inventory_store_->software_versions(
+                    SoftwareVersionsQuery{.name = name, .limit = limit});
             },
             [this](const SoftwareFleetQuery& q) -> std::optional<std::vector<SoftwareFleetRow>> {
                 if (!software_inventory_store_)
@@ -20647,6 +20654,7 @@ private:
         yuzu::server::capdecls::plugin_action_catalogue_privacy_permissions(),
         yuzu::server::capdecls::plugin_action_catalogue_system_hardening(),
         yuzu::server::capdecls::plugin_action_catalogue_pkg_inventory(),
+        yuzu::server::capdecls::plugin_action_catalogue_mgmt_posture(),
     };
     /// Shared Postgres connection pool — the server storage substrate (ADR-0006/
     /// 0007). Constructed in the ctor BEFORE any Postgres-backed store (fail

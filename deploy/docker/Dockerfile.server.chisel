@@ -137,6 +137,12 @@ RUN set -eux; \
     printf 'passwd: files\ngroup: files\nhosts: files dns\n' > /rootfs/etc/nsswitch.conf; \
     install -d -m 0755 -o 1000 -g 1000 /rootfs/var/lib/yuzu; \
     install -d -m 0755 -o 1000 -g 1000 /rootfs/etc/yuzu; \
+    # Pre-create the cert dir (CA, default certs, secrets KEK) owned by the
+    # runtime user, matching Dockerfile.server. A compose that persists it on a
+    # named volume (#5370) then gets a yuzu-owned volume: Docker copies the
+    # image directory's ownership into a new volume, but creates a root-owned
+    # mount point when the directory is absent from the image.
+    install -d -m 0755 -o 1000 -g 1000 /rootfs/etc/yuzu/certs; \
     install -d -m 0750 -o 1000 -g 1000 /rootfs/var/log/yuzu; \
     # RUNTIME INVARIANT (#751): this busybox + its `wget` applet ARE the
     # healthcheck. docker-compose.demo.yml probes this image with
