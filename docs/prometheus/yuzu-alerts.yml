@@ -168,26 +168,34 @@ groups:
       # server never sees it and the circuit breaker is not touched (a client
       # fault must not open it for the fleet). The consequence is that a
       # SYSTEMATIC local encode failure (every Register answered INTERNAL)
-      # leaves the breaker closed and /readyz ready, and this counter is its
-      # only signal. The series is pre-seeded at 0 per RPC name
-      # (yuzu_gw_telemetry:declare_metrics/0), so the first increase is visible.
-      # Any increase warns; one malformed Register is enough to count once, so
-      # read the rate, not the existence: a lone increment is a bad request, a
-      # repeating one is the gateway's encoder or its configuration.
+      # leaves the breaker closed and /readyz ready, and this counter is the
+      # signal for it. The series is pre-seeded at 0 for the RPC names that can
+      # fail to encode locally (register, inventory, notify_stream, guardian;
+      # yuzu_gw_telemetry:declare_metrics/0), so the first increase is visible.
+      # batch_heartbeat marshal failures are counted as code="exception", which
+      # this alert does not cover.
+      # Threshold: at least 10 increases in 10m. One malformed Register from an
+      # unauthenticated peer, or one oversized daily-sync batch, counts once and
+      # must not warn; a systematic encoder fault (every Register failing)
+      # reaches 10 quickly. A determined peer can also reach 10 in 10m, which is
+      # a flood worth a warning. Read the rate, not the existence.
       - alert: YuzuGatewayUpstreamEncodeErrors
         expr: |
-          increase(yuzu_gw_upstream_rpc_errors_total{code="encode"}[10m]) > 0
+          increase(yuzu_gw_upstream_rpc_errors_total{code="encode"}[10m]) >= 10
         labels:
           severity: warning
         annotations:
-          summary: "Gateway could not encode {{ $value }} {{ $labels.rpc_name }} request(s) in 10m"
+          summary: "Gateway could not encode at least 10 {{ $labels.rpc_name }} requests in 10m"
           description: >-
-            The gateway refused to send a request because it could not be
-            encoded here (a field that is not UTF-8, or a request over the 4 MiB
-            server limit). Such a failure leaves the circuit breaker closed and
-            /readyz ready, so this alert is the only signal of a systematic
-            local encode fault (every Register of one kind answered INTERNAL).
-            The gateway log line "Upstream RPC ... raised" names the RPC and the
+            The gateway refused to send at least 10 requests in 10 minutes
+            because it could not encode them here (a field that is not UTF-8,
+            or a request over the 4 MiB server limit). Such a failure leaves
+            the circuit breaker closed and /readyz ready, so this alert is the
+            signal for a systematic local encode fault (every Register of one
+            kind answered INTERNAL). A lone failure is most likely a single
+            malformed request and does not reach this alert, which needs at
+            least 10 in 10 minutes: read the rate, not the existence. The
+            gateway log line "Upstream RPC ... raised" names the RPC and the
             error class, never the request.
 
       # HA WS-4 4.2b — `#4246` item #1's alert-rule half. Emitted by the
