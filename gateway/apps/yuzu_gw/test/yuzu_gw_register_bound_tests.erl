@@ -26,10 +26,12 @@
 -include_lib("eunit/include/eunit.hrl").
 -include_lib("grpcbox/include/grpcbox.hrl").
 
--export([log/2]).  %% logger handler callback (log capture)
+-export([log/2]).           %% logger handler callback (log capture)
+-export([handle_event/4]).  %% telemetry handler callback
 
 -define(CTX_KEY, yuzu_register_bound_conn_key).
 -define(LOG_HANDLER, yuzu_register_bound_tests_logs).
+-define(TELEMETRY_HANDLER, yuzu_register_bound_tests_events).
 -define(WIRE_KEY, {?MODULE, wire}).
 -define(MAX_AGENT_ID, 256).
 %% The receive limit of a stock gRPC server (no override exists on the server).
@@ -61,7 +63,9 @@ bound_test_() ->
        t("an HTTP-level error, a timeout and a refused connection each count once",
          fun transport_failures_count_by_reason/0),
        t("a request over the server receive limit never feeds the breaker",
-         fun oversize_request_never_feeds_the_breaker/0)
+         fun oversize_request_never_feeds_the_breaker/0),
+       t("a local encode failure is counted under code encode, an exception out of the client under exception",
+         fun local_encode_failure_has_its_own_error_code/0)
       ]} || Threshold <- [3, 5]].
 
 %%% The warnings a malformed registration can provoke are limited (#4632): the
@@ -352,6 +356,54 @@ oversize_request_never_feeds_the_breaker() ->
     ?assertEqual(0, wire_count()),
     ?assertEqual({closed, 0}, breaker()),
     ?assertMatch({ok, #{session_id := _}, _}, good_register()).
+
+%%%===================================================================
+%%% The error code label
+%%%===================================================================
+
+%% rpc_errors_total{code} tells a systematic local encoder fault (the breaker
+%% stays closed, so nothing else shows it) from an exception out of the client
+%% or transport, which still opens the breaker. Each of the three local causes (a
+%% field that is not UTF-8, an oversize request) is "encode"; a dead channel is
+%% "exception"; a server status keeps its status code.
+local_encode_failure_has_its_own_error_code() ->
+    attach_events(),
+    try
+        BadUtf8 = #{info => #{agent_id => <<"enc-agent">>, hostname => <<255, 254>>}},
+        {error, _} = yuzu_gw_upstream:proxy_register(BadUtf8),
+        ?assertEqual([<<"encode">>], error_codes()),
+        Huge = #{info => #{agent_id => <<"big">>,
+                           hostname => binary:copy(<<"h">>, ?SERVER_MAX_MESSAGE + 1)}},
+        {error, _} = yuzu_gw_upstream:proxy_register(Huge),
+        ?assertEqual([<<"encode">>], error_codes()),
+        meck:expect(grpcbox_client, unary,
+                    fun(_Ctx, _Path, _Req, _Def, _Opts) -> exit(channel_down) end),
+        {error, _} = yuzu_gw_upstream:proxy_register(register_req(<<"agent">>)),
+        ?assertEqual([<<"exception">>], error_codes()),
+        mock_answer({error, {<<"14">>, <<"unavailable">>}, #{}}),
+        {error, _} = yuzu_gw_upstream:proxy_register(register_req(<<"agent">>)),
+        ?assertEqual([<<"14">>], error_codes())
+    after
+        catch telemetry:detach(?TELEMETRY_HANDLER)
+    end.
+
+attach_events() ->
+    catch telemetry:detach(?TELEMETRY_HANDLER),
+    ok = telemetry:attach(?TELEMETRY_HANDLER, [yuzu, gw, upstream, rpc_error],
+                          fun ?MODULE:handle_event/4, #{pid => self()}).
+
+%% The codes seen since the last call. The event is emitted by the upstream
+%% process before it answers the caller, so it is already in the mailbox when the
+%% call returns.
+error_codes() ->
+    receive {rpc_error, Code} -> [Code | error_codes()]
+    after 0 -> []
+    end.
+
+%% telemetry handler callback
+handle_event(_Event, #{count := 1}, #{code := Code}, #{pid := Pid}) ->
+    Pid ! {rpc_error, Code},
+    ok.
 
 %%%===================================================================
 %%% The fixture's threshold, read back from the running upstream

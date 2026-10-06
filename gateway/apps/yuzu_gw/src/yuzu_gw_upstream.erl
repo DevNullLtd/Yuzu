@@ -1247,7 +1247,7 @@ resolve_probe(_Gen, {local_error, {Class, Why}},
     %% the same way on every probe: requeueing it would reopen the breaker for
     %% ever. Evict it, once, and leave the breaker alone (it is not a fact about
     %% the upstream); the caller's drain/1 then probes the next head at once. The
-    %% failure is already counted by rpc_errors_total{code="exception"}.
+    %% failure is already counted by rpc_errors_total{code="encode"}.
     erlang:demonitor(MonRef, [flush]),
     logger:warning("Evicted held stream status notification for ~s: it cannot be "
                    "encoded (~p:~p); the circuit breaker is not affected",
@@ -1528,10 +1528,18 @@ do_rpc(Method, Request, Tag, Ctx) ->
     Duration = erlang:monotonic_time(millisecond) - StartTime,
     case Result of
         {rpc_exception, Origin, Class1, Why1} ->
+            %% A local encode failure is counted under its own code, so a
+            %% systematic encoder fault (every Register answered INTERNAL while the
+            %% breaker stays closed) can be told from an exception out of the
+            %% client or the transport, which keeps `exception' and does open the
+            %% breaker.
             telemetry:execute([yuzu, gw, upstream, rpc_error],
                               #{count => 1},
                               #{rpc_name => atom_to_binary(Tag, utf8),
-                                code => <<"exception">>}),
+                                code => case Origin of
+                                            local  -> <<"encode">>;
+                                            remote -> <<"exception">>
+                                        end}),
             yuzu_gw_safe_call:warn_limited(rpc_raised, "Upstream RPC ~s raised ~p:~p",
                                            [Method, Class1, Why1]),
             case Origin of
