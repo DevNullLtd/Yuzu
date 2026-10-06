@@ -8,13 +8,19 @@
 %%% 128 bytes, control characters become `?'). The connect, registered and
 %%% notification lines are pinned by the heartbeat-binding and notify-pending
 %%% modules, the registration replay lines by the replay module; this module pins
-%%% the rest, one group per source file:
+%%% the sites listed here and nothing else (a log_text/1 call at a site not named
+%%% here is not pinned by it):
 %%%   - yuzu_gw_agent: stream error, stream handler died, adopted replay
 %%%     re-announce (streaming and connecting), stale re-announce ignored,
 %%%     orphaned response, disconnect
 %%%   - yuzu_gw_agent_service: Subscribe with a session id nobody registered
 %%%   - yuzu_gw_upstream: the guardian forward lines (circuit open, at capacity,
-%%%     failed)
+%%%     failed); the notification lines (pending store full, peer address
+%%%     replaced, failed to notify from a closed-state worker and from the
+%%%     half_open probe, probe worker exited, evicted held notification); the
+%%%     registration replay line for a request that could not be encoded; and
+%%%     "Upstream RPC failed" with a server message (the request-fault branch and
+%%%     the other branch)
 %%%
 %%% Each test names an agent (or session or command) id made of a marker, CR, LF,
 %%% an injected word and ESC, provokes the line, waits for it to be logged (the
@@ -35,11 +41,17 @@
 %% holds the test's pid.
 -define(BLOCKED, yuzu_log_text_blocked_workers).
 -define(BLOCKED_TEST, {?MODULE, blocked_test_pid}).
+%% The agents the replay test registered ({Id, Pid}), reaped by its teardown.
+-define(NOTIFY_AGENTS, yuzu_log_text_notify_agents).
 %% The agents a test of the agent group started, reaped by its teardown.
 -define(STARTED, yuzu_log_text_started).
 -define(ENV_KEYS, [circuit_breaker_failure_threshold,
                    circuit_breaker_reset_timeout_ms,
-                   circuit_breaker_max_reset_timeout_ms]).
+                   circuit_breaker_max_reset_timeout_ms,
+                   notify_pending_max]).
+%% The tag of the exception yuzu_gw_upstream:encode_request/2 raises for a request
+%% that cannot be encoded here (?LOCAL_ENCODE_FAILED in that module).
+-define(LOCAL_ENCODE_FAILED, yuzu_gw_local_encode_failed).
 
 %%%===================================================================
 %%% yuzu_gw_agent
@@ -329,6 +341,211 @@ guardian_forward_failed_line() ->
         yuzu_gw_upstream:forward_guardian_message(Id, #{})
     end),
     assert_clean(Line, <<"guardian-fail">>).
+
+%%%===================================================================
+%%% yuzu_gw_upstream: the notification, replay and RPC failure lines
+%%%===================================================================
+
+%% Breaker thresholds as in the guardian fixture (3 failures to open, timers far
+%% beyond a test), so the breaker is tripped by three failed proxy_register calls
+%% and moved to half_open by the test, never by a timer. The mock fails every
+%% call until a test overrides it.
+notify_test_() ->
+    {foreach,
+     fun() -> setup_notify([]) end,
+     fun cleanup_notify/1,
+     [
+      t("a peer address that was replaced",
+        fun notify_peer_addr_replaced_line/0),
+      t("a notification a closed-state worker failed to send",
+        fun notify_failed_closed_line/0),
+      t("a notification the half_open probe failed to send",
+        fun notify_failed_probe_line/0),
+      t("a half_open probe worker that exited without a result",
+        fun notify_probe_worker_exited_line/0),
+      t("a held notification evicted because it cannot be encoded",
+        fun notify_evicted_line/0),
+      t("a registration replay whose stored request could not be encoded",
+        fun replay_not_encodable_line/0),
+      t("an upstream RPC answered with a request-fault status and a server message",
+        fun rpc_failed_request_fault_line/0),
+      t("an upstream RPC answered with another status and a server message",
+        fun rpc_failed_other_line/0)
+     ]}.
+
+%% Cap 1: one held key fills the store.
+notify_cap_test_() ->
+    {foreach,
+     fun() -> setup_notify([{notify_pending_max, 1}]) end,
+     fun cleanup_notify/1,
+     [
+      t("a held notification dropped because the pending store is full (cap 1)",
+        fun notify_pending_full_line/0)
+     ]}.
+
+setup_notify(Env) ->
+    {ok, _} = application:ensure_all_started(telemetry),
+    yuzu_gw_test_registry:ensure(),
+    catch meck:unload(grpcbox_client),
+    stop_upstream(),
+    Prev = [{Key, application:get_env(yuzu_gw, Key)} || Key <- ?ENV_KEYS],
+    application:set_env(yuzu_gw, circuit_breaker_failure_threshold, 3),
+    application:set_env(yuzu_gw, circuit_breaker_reset_timeout_ms, 600000),
+    application:set_env(yuzu_gw, circuit_breaker_max_reset_timeout_ms, 600000),
+    [application:set_env(yuzu_gw, K, V) || {K, V} <- Env],
+    catch ets:delete(?BLOCKED),
+    ?BLOCKED = ets:new(?BLOCKED, [named_table, public, set]),
+    ok = meck:new(grpcbox_client, [non_strict, no_link]),
+    ok = meck:expect(grpcbox_client, unary,
+                     fun(_Ctx, _Path, _Req, _Def, _Opts) -> {error, econnrefused} end),
+    {ok, Pid} = yuzu_gw_upstream:start_link(),
+    unlink(Pid),
+    catch ets:delete(?NOTIFY_AGENTS),
+    ?NOTIFY_AGENTS = ets:new(?NOTIFY_AGENTS, [named_table, public, set]),
+    #{prev_env => Prev}.
+
+cleanup_notify(Ctx) ->
+    [exit(W, kill) || {W} <- ets:tab2list(?BLOCKED)],
+    ets:delete(?BLOCKED),
+    [begin
+         yuzu_gw_registry:deregister_agent(Id),
+         exit(Pid, kill)
+     end || {Id, Pid} <- ets:tab2list(?NOTIFY_AGENTS)],
+    ets:delete(?NOTIFY_AGENTS),
+    cleanup_guardian(Ctx).
+
+%% Three failed registrations: the breaker is open.
+trip_breaker() ->
+    [{error, _} = yuzu_gw_upstream:proxy_register(#{info => #{agent_id => <<"a">>}})
+     || _ <- [1, 2, 3]],
+    open = yuzu_gw_upstream:circuit_state(),
+    ok.
+
+notify(AgentId, PeerAddr) ->
+    yuzu_gw_upstream:notify_stream_status(AgentId, <<"sess">>, connected, PeerAddr, <<"home">>).
+
+enter_half_open() ->
+    yuzu_gw_upstream ! circuit_half_open,
+    ok.
+
+%% The breaker is open, the one slot of the store holds another agent's
+%% notification, so the next one is refused.
+notify_pending_full_line() ->
+    Id = control_id(<<"notify-full">>),
+    trip_breaker(),
+    notify(<<"holder">>, <<"peer">>),
+    Line = capture_line(<<"Dropping stream status notification for">>, fun() ->
+        notify(Id, <<"peer">>)
+    end, debug),
+    assert_clean(Line, <<"notify-full">>).
+
+notify_peer_addr_replaced_line() ->
+    Id = control_id(<<"notify-peer">>),
+    Line = capture_line(<<"peer address replaced">>, fun() ->
+        notify(Id, <<255, 254, 200>>)
+    end, debug),
+    assert_clean(Line, <<"notify-peer">>).
+
+%% The breaker is closed, so the worker drain/1 spawns reports the failure.
+notify_failed_closed_line() ->
+    Id = control_id(<<"notify-closed">>),
+    Line = capture_line(<<"Failed to notify stream status for">>, fun() ->
+        notify(Id, <<"peer">>)
+    end),
+    assert_clean(Line, <<"notify-closed">>).
+
+%% The breaker is half_open, so the probe worker reports the failure.
+notify_failed_probe_line() ->
+    Id = control_id(<<"notify-probe">>),
+    trip_breaker(),
+    notify(Id, <<"peer">>),
+    Line = capture_line(<<"Failed to notify stream status for">>, fun() ->
+        enter_half_open()
+    end),
+    assert_clean(Line, <<"notify-probe">>).
+
+%% The probe worker parks inside the mocked client and is killed there.
+notify_probe_worker_exited_line() ->
+    Id = control_id(<<"notify-exited">>),
+    Test = self(),
+    trip_breaker(),
+    notify(Id, <<"peer">>),
+    ok = meck:expect(grpcbox_client, unary,
+                     fun(_Ctx, _Path, _Req, _Def, _Opts) ->
+                         true = ets:insert(?BLOCKED, {self()}),
+                         Test ! {probe_entered, self()},
+                         receive release_probe -> {error, econnrefused}
+                         after 60000 -> {error, econnrefused}
+                         end
+                     end),
+    Line = capture_line(<<"exited without a result">>, fun() ->
+        enter_half_open(),
+        Probe = receive {probe_entered, W} -> W
+                after ?AWAIT_MS -> erlang:error(probe_worker_not_entered)
+                end,
+        exit(Probe, kill)
+    end),
+    assert_clean(Line, <<"notify-exited">>).
+
+%% The probe's request cannot be encoded here: the held entry is evicted.
+notify_evicted_line() ->
+    Id = control_id(<<"notify-evicted">>),
+    trip_breaker(),
+    notify(Id, <<"peer">>),
+    ok = meck:expect(grpcbox_client, unary,
+                     fun(_Ctx, _Path, _Req, _Def, _Opts) ->
+                         erlang:error({?LOCAL_ENCODE_FAILED, error, boom})
+                     end),
+    Line = capture_line(<<"Evicted held stream status notification for">>, fun() ->
+        enter_half_open()
+    end),
+    assert_clean(Line, <<"notify-evicted">>).
+
+%% A stored registration request that cannot be encoded is skipped, and the line
+%% names the agent.
+replay_not_encodable_line() ->
+    Id = control_id(<<"replay-enc">>),
+    Pid = spawn(fun() -> receive stop -> ok end end),
+    true = ets:insert(?NOTIFY_AGENTS, {Id, Pid}),
+    ok = yuzu_gw_registry:register_agent(Id, Pid, <<"sess-replay-enc">>, [<<"svc">>],
+                                         <<"host">>, #{info => #{agent_id => Id}},
+                                         conn_log_text),
+    ok = meck:expect(grpcbox_client, unary,
+                     fun(_Ctx, _Path, _Req, _Def, _Opts) ->
+                         erlang:error({?LOCAL_ENCODE_FAILED, error, boom})
+                     end),
+    Line = capture_line(<<"could not be encoded">>, fun() ->
+        gen_server:cast(yuzu_gw_upstream, replay_registrations)
+    end),
+    assert_clean(Line, <<"replay-enc">>).
+
+%% A server message is the server's text: INVALID_ARGUMENT is a request fault and
+%% goes through the rate limited warning, which is told to log now.
+rpc_failed_request_fault_line() ->
+    Msg = control_id(<<"rpc-fault">>),
+    ok = meck:expect(grpcbox_client, unary,
+                     fun(_Ctx, _Path, _Req, _Def, _Opts) ->
+                         {error, {<<"3">>, Msg}, #{}}
+                     end),
+    ok = yuzu_gw_safe_call:expire_limit(rpc_answered_error),
+    Line = capture_line(<<"Upstream RPC">>, fun() ->
+        {error, _} = yuzu_gw_upstream:proxy_register(#{info => #{agent_id => <<"a">>}})
+    end),
+    ?assertNotEqual(nomatch, binary:match(Line, <<"failed">>)),
+    assert_clean(Line, <<"rpc-fault">>).
+
+%% INTERNAL is not a request fault: the plain warning.
+rpc_failed_other_line() ->
+    Msg = control_id(<<"rpc-other">>),
+    ok = meck:expect(grpcbox_client, unary,
+                     fun(_Ctx, _Path, _Req, _Def, _Opts) ->
+                         {error, {<<"13">>, Msg}, #{}}
+                     end),
+    Line = capture_line(<<"Upstream RPC">>, fun() ->
+        {error, _} = yuzu_gw_upstream:proxy_register(#{info => #{agent_id => <<"a">>}})
+    end),
+    ?assertNotEqual(nomatch, binary:match(Line, <<"failed">>)),
+    assert_clean(Line, <<"rpc-other">>).
 
 %%%===================================================================
 %%% Helpers
