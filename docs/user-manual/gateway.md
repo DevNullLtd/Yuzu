@@ -584,7 +584,10 @@ runs are marked below.)
 - **Cap.** `notify_pending_max` (default 10000, see "Upstream client tuning")
   bounds the number of held keys, not agents. A notification for a new key that
   arrives when the store is full is dropped and counted in
-  `yuzu_gw_upstream_notify_dropped_total{reason="at_capacity"}`. The cap bounds
+  `yuzu_gw_upstream_notify_dropped_total{reason="at_capacity"}`. While a half open
+  probe is out its key still counts as held, so the store admits a new key only
+  while the held keys plus the probe's key stay below the cap (one key fewer than
+  the cap). The cap bounds
   the retained keys only: it is not a memory ceiling, and casts still queue in
   the upstream client's mailbox while a `ProxyRegister`, `ProxyInventory` or
   replay call runs synchronously.
@@ -626,16 +629,24 @@ half open periods, one probe each); a probe refused by a stopped server failed i
 under a millisecond and doubled the backoff; killing the probe worker produced
 one reopen and the event went back to the head; and a `ProxyRegister` retry that
 arrived while the probe was out drove the breaker transition, the late probe
-result left the breaker alone, and the event was still requeued.
+result left the breaker alone, and the event was still requeued. The statements
+that exactly one probe was sent, that the held entries were delivered in order
+and how often each key was sent come from a temporary telemetry tracer loaded into
+the gateway, which has an observer effect; the 100 ms sampler cannot resolve a 2 ms
+event, and the gateway debug log has no line for a successful notification.
 
 The same behaviour was also measured with TLS on every hop that the notification
 path uses (OBSERVED on the same rig: the agent edge is one way TLS, the upstream
 channel and the management channel are mutual TLS, all from the server's default
 certificates, with a private certificate directory). A cold wave of 1000
-simulated agents over TLS dropped 0 notifications and had 1000 routable rows
-about 0.4 to 0.5 s after the burst (2.11 to 2.15 s to register against 1.88 to
-1.93 s without TLS; the pending peak was 574 to 904 held keys), with the
-handshakes either done before the burst or overlapping it. 30 real agents over
+simulated agents over TLS dropped 0 notifications. With the handshakes done
+before the burst, 1000 rows were routable at the first poll, 0.4 to 0.5 s after the
+last registration (all registered in 2.11 to 2.15 s against 1.88 to 1.93 s without
+TLS; 100 ms sample peaks of 574 to 904 held keys). With the handshakes overlapping
+the burst (the agents not preconnected), all 1000 registered on the first attempt
+in 2.45 and 2.52 s, 1000 rows were routable 0.6 to 0.7 s after the last
+registration, the sample peaks were 749 and 901, and there was no handshake error
+and no acceptor crash line. 30 real agents over
 TLS dropped 0, all enrolled (two `ProxyRegister` calls each, 60 in total, 30
 certificates issued) and answered commands, and a 5 minute steady state logged no
 warnings or errors. The breaker hold, single probe and FIFO flush, the failing
@@ -662,17 +673,20 @@ was clean: 1000 routable rows and no never-announced row left. Without a packet
 capture, TLS on each hop was shown with `openssl` client probes (OBSERVED): the
 agent edge is one way TLS 1.2 (a plaintext HTTP/2 preface got a TLS alert and no
 HTTP/2 settings); the server's upstream port rejected a missing client
-certificate and a certificate from another CA and accepted the gateway's; the
-management port rejected a missing or other-CA certificate, and a valid
+certificate and a certificate from another CA and accepted the gateway's, and it
+also accepted the server's own certificate: at the TLS layer that port admits any
+certificate that chains to the run's CA, so the gateway's identity is not pinned
+there (the gRPC layer of that port was not probed). The management port rejected a missing or other-CA certificate, and a valid
 certificate with the wrong pinned key got `UNAUTHENTICATED` with `pin_mismatch`
 counted. Under sustained command load over management mutual TLS, 179,081
 commands to 30 real agents all reached every targeted agent with results, with 0
 authentication errors and 0 handshake failures, and latency within noise of
 plaintext (p50 about 29 ms at concurrency 4; at 16 the debug-build server was
 the bound). Not covered: client certificates on the agent edge (the shipped edge
-does not verify them), TLS 1.3 on the edge and management listeners, certificate
-rotation or expiry, multiple replicas, a release-build server, and packet-level
-capture.
+does not verify them), certificate rotation or expiry, multiple replicas, a
+release-build server, and packet-level capture. TLS 1.3 is not offered on the agent
+edge (a TLS 1.3 client was refused with a protocol-version alert, OBSERVED) and was
+not tested on the management listener.
 
 ---
 
@@ -1772,8 +1786,10 @@ tracked in #5313.
 | 20 ms | 25 per second | 40 s | 400 s |
 | 100 ms | 8.3 per second | 120 s | 1200 s |
 
-The drip also waits while 10 stream-status notifications are in flight, so
-these rates are ceilings. The first verdict lists the agents that heartbeated
+The drip can also wait for a free stream-status notification slot, but now only
+when 10 notifications were already in flight before the replay armed, or when a
+half open probe took the tenth slot (the notification drain keeps one slot free
+while a replay is active), so these rates remain ceilings. The first verdict lists the agents that heartbeated
 in the first flush window, so synchronized heartbeats list more agents at
 once. Spacing is the gateway's only lever; the RPC time is the server's. A
 drain that runs past 270 s after the last heartbeat the previous server ingested (the
@@ -2118,14 +2134,20 @@ env keys with defaults, which a reverted build ignores.
   (the agent retries, INFERRED about 2 s later). Details under "Per-connection
   session cap" in Configuration.
 - **Cold-start notifications were shed at the in-flight limit, so most route rows
-  stayed tombstoned until the replay ran. Fixed by #4632 (hold instead of
-  drop).** Before the fix, OBSERVED in rig pass 6 (runs K1 and K6 of that pass)
+  had a session but no placement (never announced) until the replay ran. Fixed by
+  #4632 (hold instead of drop).** Before the fix, OBSERVED in rig pass 6 (runs K1 and K6 of that pass)
   and, per the local rig notes, in the cold start of pass 5 run J1: after a cold
   `Subscribe` wave of 1000 simulated agents
   `yuzu_gw_upstream_notify_dropped_total{reason="at_capacity"}` was 987 (989 and
   988 in two repeats, and 1953 after 2000 agents), the server's route table
-  before the restart showed `live=13 tomb=987`, and with 30 real agents cold
-  started the same effect gave 13 drops. `MAX_NOTIFY_INFLIGHT` is 10 in
+  before the restart showed `live=13 tomb=987` (the `tomb` label was wrong: a
+  later measurement of the previous build found 0 tombstones and 989 rows with a
+  session and no placement, never announced), and with 30 real agents cold
+  started the same effect gave 13 drops (not reproduced in the later control runs,
+  which dropped nothing at 30 real agents, where each notification took 1 to 2 ms
+  and the in-flight count never reached 10; a control run that started 30
+  simulated agents at the same instant did drop 20, so the earlier drops came
+  from simultaneous starts, INFERRED). `MAX_NOTIFY_INFLIGHT` is 10 in
   `yuzu_gw_upstream.erl` and a `CONNECTED` beyond 10 in flight was shed. Now a
   notification beyond 10 in flight is held and sent first in first out (see
   "Stream Status Notification"). Measured after the fix (OBSERVED on a loopback rig with a debug-built server,
@@ -2133,9 +2155,11 @@ env keys with defaults, which a reverted build ignores.
   notifications in each of two 1000-agent waves (11 routable rows, 989 rows with a
   session id but no placement, unchanged over 76 s) and 1935 in a 2000-agent wave
   (65 routable rows). The fixed build dropped 0 in five 1000-agent waves (1000
-  routable rows, all registered in about 1.9 s, held keys peaked at 762 and were
-  back to 0 within about 0.3 s, in-flight workers peaked at 10) and 0 in two
-  2000-agent waves (2000 routable rows, held keys peaked at 1906). With 30 real
+  routable rows, all registered in about 1.9 s, 100 ms samples of held keys peaked
+  at 660 to 762 (the one run traced event by event had a maximum of 989) and the
+  gauge was back to 0 within about 0.3 s, in-flight workers peaked at 10) and 0 in
+  two 2000-agent waves (2000 routable rows, 100 ms sample peaks of 1850 and 1906;
+  the event-level maximum was not measured at 2000). With 30 real
   agents neither build dropped anything (in-flight workers peaked at 4 and 2, below
   the limit of 10), so that scale does not separate them. A 5 minute steady state
   with 30 real agents logged no warnings or errors and both gauges stayed at 0.
