@@ -15,7 +15,9 @@
 %%%   keeps its place in the queue; counted as notify_coalesced), so a
 %%%   CONNECTED followed by a DISCONNECTED for one session sends only the
 %%%   DISCONNECTED, while two sessions of one agent are both kept. The cap
-%%%   notify_pending_max counts keys, not agents; a notification for a new key
+%%%   notify_pending_max counts keys, not agents, and the key of a half_open probe
+%%%   in flight still counts toward it (a new key is admitted only while the held
+%%%   keys plus the probe's key stay below the cap); a notification for a new key
 %%%   over the cap is dropped and counted (notify_dropped, reason at_capacity).
 %%%   The store is volatile: it is lost when this process stops or restarts.
 %%%   The cap bounds the retained keys only; it is not a memory ceiling, and
@@ -40,10 +42,12 @@
 %%%   sent as the probe, and the breaker is driven by its result. Without it a
 %%%   held entry could wait forever after the server recovered: a disconnected
 %%%   session sends no heartbeat, and a known session needs no verdict. Only one
-%%%   probe is out at a time, it counts in the ten worker budget, and nothing
-%%%   else drains while it is out. The probe worker sends its result to this
-%%%   process before it exits; the result carries the breaker generation
-%%%   (cb_gen, bumped on every entry into half_open) it was sent under.
+%%%   probe is out at a time, it counts in the ten worker budget, and while the
+%%%   breaker is half_open nothing else drains while it is out (if a call path RPC
+%%%   closes the breaker meanwhile, the closed drain runs as usual). The probe
+%%%   worker sends its result to this process before it exits; the result
+%%%   carries the breaker generation (cb_gen, bumped on every entry into
+%%%   half_open) it was sent under.
 %%%     - The event is retired on ok. On error it goes back to the head of the
 %%%       store (a newer event for the same key that arrived meanwhile wins and
 %%%       the old one is dropped, counted as notify_coalesced). One slot is held
@@ -428,7 +432,9 @@ handle_cast({notify_stream_status, AgentId, SessionId, Event, PeerAddr0, StreamH
                 %% dropped CONNECTED for an ADOPTED replay session (the
                 %% reannounce mechanism) leaves the server's placement wiped
                 %% with no other signal, so it is counted. This is admission
-                %% loss only: the store already holds notify_pending_max keys.
+                %% loss only: admitting the key would bring the held keys (plus the
+                %% key of a half_open probe in flight, which still counts) up to
+                %% notify_pending_max.
                 logger:debug("Dropping stream status notification for ~s (pending store full)",
                              [AgentId]),
                 telemetry:execute([yuzu, gw, upstream, notify_dropped],

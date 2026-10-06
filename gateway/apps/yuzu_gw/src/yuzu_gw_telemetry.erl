@@ -184,16 +184,18 @@ handle_event([yuzu, gw, upstream, registration_replay],
 
 %% HA WS-4 4.4 round-2 review (Gate 3 finding NEW-1 / Gate 6 COMP-2, NEW-2):
 %% yuzu_gw_upstream emits this when the notify pending store refuses a new
-%% key because it already holds `notify_pending_max` keys (#4632: reason is
+%% key because admitting it would reach `notify_pending_max` keys, counting the
+%% key of a half_open probe in flight (#4632: reason is
 %% `at_capacity` only; `circuit_open` is no longer emitted because a notify
 %% arriving with the breaker not closed is now held, not dropped). Without
 %% this clause the event fires into an unregistered telemetry event and never
 %% reaches Prometheus, same failure shape `forward_dropped` below exists to
 %% avoid. The label is a closed set: `at_capacity' is itself, and a missing
 %% reason or any other value (a non-binary included) folds to a pre-seeded
-%% `unknown' series, as verdict_dropped and buffer_dropped do, so a bug cannot
-%% widen the label set. yuzu_gw_upstream emits only the literal at_capacity
-%% today. The handler must never crash: telemetry detaches a handler that
+%% `unknown' series, so a bug cannot widen the label set. Only this metric
+%% pre-seeds its `unknown' series: verdict_dropped and buffer_dropped fold the
+%% same way but their `unknown' series is created on first use.
+%% yuzu_gw_upstream emits only the literal at_capacity today. The handler must never crash: telemetry detaches a handler that
 %% raises, which would silence every metric.
 handle_event([yuzu, gw, upstream, notify_dropped], #{count := N}, Meta, _Config) ->
     Reason = case maps:get(reason, Meta, unknown) of
@@ -463,8 +465,10 @@ declare_metrics() ->
         {name, yuzu_gw_upstream_notify_dropped_total},
         {labels, [reason]},
         {help, "Stream-status (CONNECTED/DISCONNECTED) notifications lost at "
-               "admission because the pending store already held "
-               "notify_pending_max keys. The label reason has the closed set "
+               "admission because the pending store was at its cap: a new key is "
+               "admitted only while the held keys plus the key of a half_open "
+               "probe in flight stay below notify_pending_max. The label reason "
+               "has the closed set "
                "at_capacity, plus unknown for any other value, which the "
                "gateway does not emit today (the circuit_open value is no longer "
                "emitted: a notification arriving while the breaker is not closed "
@@ -479,7 +483,8 @@ declare_metrics() ->
         {name, yuzu_gw_upstream_notify_coalesced_total},
         {labels, []},
         {help, "Held stream-status notifications replaced by a newer event for "
-               "the same agent session"}]),
+               "the same agent session and stream home, or a failed probe "
+               "notification superseded by one"}]),
     prometheus_counter:inc(yuzu_gw_upstream_notify_coalesced_total, [], 0),
     prometheus_counter:declare([
         {name, yuzu_gw_guardian_forward_accepted_total},
@@ -680,7 +685,9 @@ declare_metrics() ->
         {labels, [node]},
         {help, "Stream-status notifications held because the in-flight limit is "
                "reached or the upstream circuit breaker is not closed; drained "
-               "first in first out (0 = nothing held)"}]),
+               "first in first out (0 = nothing held). The key of a half_open "
+               "probe in flight is not counted here but still counts toward "
+               "the notify_pending_max cap"}]),
     prometheus_gauge:declare([
         {name, yuzu_gw_upstream_notify_inflight},
         {labels, [node]},
