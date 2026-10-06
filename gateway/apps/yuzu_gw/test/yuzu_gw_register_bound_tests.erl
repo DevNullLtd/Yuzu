@@ -11,9 +11,13 @@
 %%%   - the edge refuses an empty, missing, non-binary or over-long agent id
 %%%     itself, before any reservation and before any upstream call;
 %%%   - the breaker treats the server statuses that say "this request was wrong"
-%%%     as answers that neither fail nor recover it, and still counts every
-%%%     status, transport error and exception that says the upstream is
-%%%     unhealthy (the over-correction guards).
+%%%     as answers that neither fail nor recover it on a live call, and still
+%%%     counts every status, transport error and exception that says the
+%%%     upstream is unhealthy (the over-correction guards). The one exception is
+%%%     a registration replay answered FAILED_PRECONDITION (9), the server's
+%%%     authoritative "session superseded": it counts as a breaker success via
+%%%     record_result_no_replay({ok, superseded}); a replay answered with the
+%%%     other four request-fault statuses stays neutral.
 %%%
 %%% The mock of grpcbox_client:unary/5 runs the REAL request encoder the way
 %%% grpcbox does, then answers like the server: INVALID_ARGUMENT for a bad
