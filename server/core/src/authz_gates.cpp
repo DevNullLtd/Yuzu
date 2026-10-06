@@ -9,6 +9,10 @@
 
 #include <yuzu/metrics.hpp> // MetricsRegistry — #4031 topology-floor-denied counter
 
+#include <expected>
+#include <optional>
+#include <string>
+#include <string_view>
 #include <unordered_set>
 
 namespace yuzu::server {
@@ -246,7 +250,10 @@ AuthRoutes::require_fleet_read(const httplib::Request& req, httplib::Response& r
         }
         // Everything that is not an explicit Admit is refused: a Deny verdict, and any
         // out-of-range value, which must never fall through to the admit below.
-        if (verdict != authz::CeilingVerdict::Admit) {
+        // This is an if chain, not a switch over CeilingVerdict, so -Wswitch will not flag a
+        // new enumerator here: it would be refused with the 403 below. A new enumerator that
+        // needs its own answer (as Degraded has) must be handled above this branch.
+        if (verdict !=authz::CeilingVerdict::Admit) {
             audit_log(req, "auth.fleet_read_required", "denied", "", "",
                       "fleet read blocked: service-scoped token lacks ITServiceOwner "
                       "permission " +

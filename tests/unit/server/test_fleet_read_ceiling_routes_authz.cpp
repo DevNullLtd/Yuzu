@@ -23,6 +23,8 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <chrono>
+#include <memory>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -101,7 +103,9 @@ GateFns make_gate_fns(AuthRoutes& ar) {
         return ar.require_auth(req, res);
     };
     g.perm_fn = [&ar](const httplib::Request& req, httplib::Response& res, const std::string& t,
-                      const std::string& o) -> bool { return ar.require_permission(req, res, t, o); };
+                      const std::string& o) -> bool {
+        return ar.require_permission(req, res, t, o);
+    };
     g.fleet_fn = [&ar](const httplib::Request& req, httplib::Response& res, const std::string& t,
                        const std::string& o) -> authz::FleetReadGate {
         auto result = ar.require_fleet_read(req, res, t, o);
@@ -357,13 +361,13 @@ TEST_CASE("fleet-read routes real gate: each route answers the ceiling for exact
     }
 }
 
-// The Policy and Workflow call sites (only five of the eight securables were pinned through a
-// real route before this case): GET /api/v1/compliance/{id} (ComplianceRoutes, "Policy"), and
-// the legacy GET /api/workflow-executions/{id} plus its v1 twin
-// GET /api/v1/workflow-executions/{id} (WorkflowRoutes, "Workflow"). ITServiceOwner holds Policy
-// CRUD and Workflow:Read under the seeded defaults (rbac_store.cpp), so a service token minted
-// by a user holding both pairs passes the ceiling on all three. The rig wires neither a ComplianceApi, a WorkflowEngine nor a
-// WorkflowApi, so a request the gate admits answers that route's own 503 "service unavailable".
+// The Policy and Workflow call sites, pinned through real routes: GET /api/v1/compliance/{id}
+// (ComplianceRoutes, "Policy"), and the legacy GET /api/workflow-executions/{id} plus its v1
+// twin GET /api/v1/workflow-executions/{id} (WorkflowRoutes, "Workflow"). ITServiceOwner holds
+// Policy CRUD and Workflow:Read under the seeded defaults (rbac_store.cpp), so a service token
+// minted by a user holding both pairs passes the ceiling on all three. The rig wires neither a
+// ComplianceApi, a WorkflowEngine nor a WorkflowApi, so a request the gate admits answers that
+// route's own 503 "service unavailable".
 // Revoking one securable from ITServiceOwner must refuse exactly the sites that gate on it with
 // the ceiling's own 403, never touching the minter's ordinary session.
 TEST_CASE("fleet-read routes real gate: Policy and Workflow sites answer the ceiling for exactly "

@@ -19108,6 +19108,10 @@ private:
                         }
                         return out;
                     },
+                    // No test builds this Deps (the upload-grants tests construct their own),
+                    // so removing this line is not caught by a test. A service-scoped token is
+                    // still refused without it, with the route's generic 403; what is lost is
+                    // the `upload_grant.list.access_denied` audit row and the specific message.
                     .deny_service_scoped_fn = deny_service_scoped_fn,
                     .audit_fn = audit_fn,
                     .store = upload_grant_store_.get(),

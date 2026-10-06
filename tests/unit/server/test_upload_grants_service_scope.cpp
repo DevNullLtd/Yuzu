@@ -22,9 +22,10 @@
 
 #include <nlohmann/json.hpp>
 
-#include <algorithm>
 #include <chrono>
+#include <cstddef>
 #include <memory>
+#include <optional>
 #include <set>
 #include <string>
 #include <unordered_map>

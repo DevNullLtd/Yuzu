@@ -1,15 +1,12 @@
 /**
- * test_authz_gates.cpp — Unit tests for the service-scope-confinement Phase 0
- * primitives: `AuthRoutes::require_fleet_read` / `confine_agent_target`
- * (authz_gates.hpp/.cpp).
+ * test_authz_gates.cpp -- Unit tests for the service-scope-confinement primitives
+ * `AuthRoutes::require_fleet_read` / `confine_agent_target` (authz_gates.hpp/.cpp), including
+ * the ITServiceOwner authority ceiling (`authz::service_ceiling_check`) and how it behaves
+ * when the RBAC store is degraded.
  *
- * PR 2 of the durable service-scope-confinement fix
- * (.claude/plans/service-scope-confinement-review-2026-08-16.md,
- * .claude/plans/handover-written-to-claude-plans-guardia-piped-owl.md §2c/§2d):
- * these gates are wired here but called by NO route yet — zero behavior
- * change. This file is the net-new coverage implementation-plan §2d calls
- * out: no existing test drove a service-scoped token through the AuthRoutes
- * gates with RBAC enabled AND a real tag store.
+ * They drive a service-scoped token through the real AuthRoutes gates with RBAC enabled and a
+ * real tag store, which no other test file does at the chokepoint level. `require_fleet_read`
+ * is called by production routes; `confine_agent_target` has no production caller.
  */
 
 #include "audit_store.hpp"
@@ -724,7 +721,8 @@ TEST_CASE("require_fleet_read: explicit DENY row for ITServiceOwner on the pair 
 }
 
 TEST_CASE("require_fleet_read: service token through an MCP tier is not admitted by the "
-          "ceiling path on its own (branch order: the tier falls through and the ceiling still decides)",
+          "ceiling path on its own (branch order: the tier falls through and the ceiling "
+          "still decides)",
           "[pg][auth_routes][authz_gates][service_scope]") {
     YUZU_REQUIRE_PG_DB_TPL(rbac_db_, rbac_gates_tpl);
     GatesRig r{rbac_db_.dsn()};
@@ -1198,7 +1196,10 @@ TEST_CASE("ceiling read: a starved pool trips the authz breaker and every degrad
     CHECK(e2.error() == "pool acquire timeout");
     CHECK(metrics.gauge("yuzu_server_rbac_breaker_open").value() == 1.0);
 
-    // Open: answered without a pool touch.
+    // Open: answered without a pool touch. This string check assumes the read runs within the
+    // 1 s probe cooldown of the second failing read's admit (about 750 ms of margin after that
+    // read's 250 ms acquire wait); a read delayed past it would be the half-open probe and fail
+    // with "pool acquire timeout" instead. The gauge assertions above do not depend on it.
     auto e3 = r.rbac.role_permission_allowed_checked("ITServiceOwner", "Response", "Read");
     REQUIRE_FALSE(e3.has_value());
     CHECK(e3.error() == "circuit breaker open");
