@@ -5,8 +5,8 @@ Issue #1398: an `InstructionDefinition`'s `approval.mode` was enforced only
 on the governed `POST /api/instructions/:id/execute` path, never on raw
 dispatch (`POST /api/command`, MCP `execute_instruction`). The fix adds an
 `ExecuteGate` dimension to `CommandCapability` (`command_capability.hpp`),
-authored per `plugin.action` row across the eight `capability_decls/*.hpp`
-fragments, derived STRICTEST-WINS from every shipped definition targeting
+authored per `plugin.action` row across the `capability_decls/*.hpp`
+fragments (FRAGMENT_FILES below), derived STRICTEST-WINS from every shipped definition targeting
 that pair (`auto` -> `None`, `role-gated` -> `AdminOrApproval`, `always` ->
 `AlwaysApproval`). This script is the mechanical guarantee that the
 authored catalogue value and the derived content value never drift apart —
@@ -14,7 +14,9 @@ a content author tightening a definition's `approval.mode` without a
 matching catalogue change is exactly the shape of gap #1398 was filed for,
 just at the pair level instead of the platform level.
 
-Three things checked against the real, integrated tree:
+Five checks run against the real, integrated tree: checks 1-3 are the original
+gate-consistency set, checks 4 and 5 (after check 3) are the question
+classification set:
 
   1. GATE CONSISTENCY: for every `plugin.action` pair that both (a) has a
      shipped `InstructionDefinition` and (b) has a catalogue row, the
@@ -34,7 +36,9 @@ Three things checked against the real, integrated tree:
      an `.execute_gate` for must equal the number of rows it finds a
      `.plugin`/`.action` pair for, and both must equal EXPECTED_TOTAL_ROWS
      (see the itemized sum next to that constant's own definition below,
-     not repeated here — this second copy is what drifted stale first)
+     not repeated here — this second copy is what drifted stale first).
+     Checks 4 and 5 have their own per-fragment parity check (each fragment's
+     `.dispatch_class` row count must equal its plugin/action pair count)
      — architect review requirement: a regex that silently fails to
      associate a gate with its row must read as a hard failure, never as
      an absent gate.
@@ -42,12 +46,24 @@ Three things checked against the real, integrated tree:
 Two more checks (question/catalogue classification, ADR-0033 section 1: a
 definition must not self-certify read-vs-effect):
 
-  4. QUESTION CLASS: every `spec.type: question` definition whose pair HAS a
-     catalogue row must map to a `DispatchClass::ReadOnly` row.
-  5. ROWLESS QUESTIONS: every `question` definition whose pair has NO
-     catalogue row must be named in the pinned `ROWLESS_QUESTION_IDS` (server-side
-     pseudo-plugins) or `ROWLESS_QUESTION_IDS_UNEXPLAINED` (anything else); an
-     unpinned id, or a stale pin, fails and says to update the pin deliberately.
+  4. QUESTION CLASS: every question definition (`spec.type` missing, empty or
+     `question`, as `embed_content.py` defaults it) whose pair HAS a catalogue
+     row must map to a `DispatchClass::ReadOnly` row. Plugin and action are
+     case-folded on both sides, as the runtime `classify()` is
+     case-insensitive. A (plugin, action) pair declared twice in the catalogue
+     is a hard failure, as is a fragment whose class-row count differs from
+     its pair count.
+  5. ROWLESS QUESTIONS: every question definition whose pair has NO catalogue
+     row must be named in the pinned `ROWLESS_QUESTION_IDS` (plugin exactly one
+     of SERVER_SIDE_PSEUDO_PLUGINS) or `ROWLESS_QUESTION_IDS_UNEXPLAINED`
+     (anything else); an unpinned id, or a stale pin, fails and says to update
+     the pin deliberately. The pin sizes must sum to
+     `EXPECTED_ROWLESS_QUESTION_COUNT`.
+
+Checks 4 and 5 walk `content/definitions` and `content/packs` recursively and
+take only `kind: InstructionDefinition` documents, as `embed_content.py` does
+(`TestDefinitionWalkParityWithEmbed` compares the two); checks 1-3 keep the
+non-recursive `content/definitions/*.yaml` glob.
 
 Mode-defaulting semantics are replicated EXACTLY from
 `server/core/scripts/embed_content.py`'s `def_envelope`
@@ -58,7 +74,7 @@ what a defaulted definition means.
 
 Runnable standalone: `python3 tests/test_capability_gate_consistency.py`.
 Hermetic — reads only source files already on disk under this repository
-(content/definitions/*.yaml, the seven capability_decls fragments); no
+(content/definitions and content/packs YAML, the capability_decls fragments); no
 subprocess, no network, no clock. Requires PyYAML, an existing hard build
 dependency (see embed_content.py) — not a new one for this repo.
 
@@ -71,8 +87,13 @@ uses.
 
 from __future__ import annotations
 
+import contextlib
+import importlib.util
+import io
+import json
 import re
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -170,7 +191,7 @@ FRAGMENT_FILES = [
 # to name (adding this branch's own delta to a stale baseline undercounts by the other
 # side's own delta).
 # Wave 10 PR10.1-d: +1 update_source_trust (sources) on top of dev's 227 = 228, verified by
-# running parse_fragment_gate_rows over all 26 FRAGMENT_FILES and by a `grep -c` sum
+# running parse_fragment_gate_rows over FRAGMENT_FILES and by a `grep -c` sum
 # (both 228), not by adding to a possibly-stale baseline.
 # local_security_policy's `sudoers` action (+1, Medium risk tier) on top of that 228: the total is
 # 229, re-derived by running parse_fragment_gate_rows over FRAGMENT_FILES, not by adding to a
@@ -193,12 +214,10 @@ NON_CATALOGUE_EXEMPT_PREFIXES = ("server", "server_internal", "_server")
 # content/definitions/*.yaml and checking the pair against the
 # capability_decls/*.hpp rows (`parse_fragment_dispatch_classes`).
 #
-# ROWLESS_QUESTION_IDS: the plugin is a server-side pseudo-plugin (a
-# NON_CATALOGUE_EXEMPT_PREFIXES name). Nothing dispatches such a pair to an
-# agent, and `classify_and_authorize_dispatch` (agent_registry.hpp) denies it as
-# Unclassified, so these questions are NOT dispatchable to agents. The
-# browser/demo must not offer them as runnable agent dispatches. A new
-# rowless question, or a pinned id that gained a row, changed type or was
+# ROWLESS_QUESTION_IDS: the plugin is exactly one of SERVER_SIDE_PSEUDO_PLUGINS.
+# These pairs have no catalogue row, so `classify_and_authorize_dispatch`
+# (agent_registry.hpp, the `!classified` return) denies them as Unclassified.
+# A new rowless question, or a pinned id that gained a row, changed type or was
 # removed, fails the check: update this pin deliberately, in the same change.
 ROWLESS_QUESTION_IDS = (
     "server.compliance.policy_detail",
@@ -224,6 +243,15 @@ ROWLESS_QUESTION_IDS = (
     "server.workflow.list",
 )
 EXPECTED_ROWLESS_QUESTION_COUNT = 21
+
+# The plugin names check 5 treats as server-side, matched EXACTLY after case
+# folding. The pre-existing check 2 (`diff_gates`) keeps its looser
+# `startswith(NON_CATALOGUE_EXEMPT_PREFIXES)` match on purpose: it is Decision 1
+# of the #1398 design doc (docs/security-reviews/1398-dispatch-approval-gate-design.md,
+# which words it as "-prefixed") and changing it was outside this change's
+# scope. Consequence: a plugin such as `serverless` is exempt from check 2 but
+# lands in the UNEXPLAINED bucket here, so it still fails check 5 unless pinned.
+SERVER_SIDE_PSEUDO_PLUGINS = ("server", "server_internal", "_server")
 
 # ROWLESS_QUESTION_IDS_UNEXPLAINED: rowless questions whose plugin is NOT a
 # server-side pseudo-plugin, i.e. a suspected catalogue gap (a real agent
@@ -335,28 +363,128 @@ def parse_fragment_dispatch_classes(path: Path) -> list[tuple[str, str, str]]:
     return _CLASS_RE.findall(path.read_text(encoding="utf-8"))
 
 
-def parse_content_questions(content_root: Path) -> list[tuple[str, str, str]]:
-    """`(definition id, plugin, action)` for every `spec.type: question`
-    definition. Plugin/action resolution matches `parse_content_pair_modes`
-    (`spec.execution.*`, falling back to `spec.*`; action lower-cased); a
-    question naming no plugin/action yields empty strings, never a skip.
+def fold(value: object) -> str:
+    """Case-fold and strip a plugin/action name for the check 4/5 lookups.
+    The runtime `classify()` (command_capability.hpp) compares plugin AND
+    action case-insensitively; a non-string (malformed content) folds to "",
+    which matches no catalogue row and so surfaces as an unpinned rowless
+    question naming the definition.
     """
-    questions: list[tuple[str, str, str]] = []
-    for path in sorted(content_root.glob(CONTENT_GLOB)):
-        with path.open(encoding="utf-8") as f:
-            docs = list(yaml.safe_load_all(f))
-        for doc in docs:
-            if not isinstance(doc, dict):
+    return value.strip().lower() if isinstance(value, str) else ""
+
+
+_EMBED_MODULE = None
+
+
+def _embed_content():
+    """`server/core/scripts/embed_content.py`, loaded by path so the definition
+    walk reuses its `split_docs` instead of copying it."""
+    global _EMBED_MODULE
+    if _EMBED_MODULE is None:
+        spec = importlib.util.spec_from_file_location(
+            "embed_content_for_gate_test", REPO_ROOT / "server/core/scripts/embed_content.py"
+        )
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _EMBED_MODULE = module
+    return _EMBED_MODULE
+
+
+def parse_content_definitions(repo_root: Path) -> list[tuple[str, str, str, str]]:
+    """`(definition id, type, plugin, action)` for every `kind:
+    InstructionDefinition` document, in `embed_content.py`'s walk order.
+
+    Mirrors `embed_content.py` (the only source of shipped definitions): the
+    walk is `sorted(definitions rglob *.yaml + packs rglob *.yaml)` (its
+    `yaml_files`), documents come from its `split_docs`, a document that fails
+    to parse is skipped (it warns and continues), only `kind ==
+    "InstructionDefinition"` is taken, and `def_envelope` supplies the field
+    rules: `type` is `spec.get("type") or "question"`, plugin/action come from
+    `spec.execution.*` falling back to `spec.*`. Unlike `embed_content.py`
+    this never raises on malformed content (a non-dict `spec`/`execution`, a
+    non-string plugin/action): the field becomes empty and the definition
+    surfaces by id in check 5. A definition with no id gets the fallback id
+    `<path relative to the repo root>#<document index>`.
+    """
+    embed = _embed_content()
+    content_root = repo_root / "content"
+    files = sorted(
+        list((content_root / "definitions").rglob("*.yaml"))
+        + list((content_root / "packs").rglob("*.yaml"))
+    )
+    found: list[tuple[str, str, str, str]] = []
+    for path in files:
+        rel = path.relative_to(repo_root).as_posix()
+        for index, doc_text in enumerate(embed.split_docs(path.read_text(encoding="utf-8"))):
+            try:
+                doc = yaml.safe_load(doc_text)
+            except yaml.YAMLError:
                 continue
+            if not isinstance(doc, dict) or doc.get("kind") != "InstructionDefinition":
+                continue
+            meta = doc.get("metadata")
+            meta = meta if isinstance(meta, dict) else {}
             spec = doc.get("spec")
-            if not isinstance(spec, dict) or spec.get("type") != "question":
-                continue
-            exec_ = spec.get("execution") or {}
-            plugin = exec_.get("plugin") or spec.get("plugin") or ""
-            action = exec_.get("action") or spec.get("action") or ""
-            def_id = (doc.get("metadata") or {}).get("id", path.name)
-            questions.append((def_id, plugin, str(action).lower()))
-    return questions
+            spec = spec if isinstance(spec, dict) else {}
+            exec_ = spec.get("execution")
+            exec_ = exec_ if isinstance(exec_, dict) else {}
+            def_id = meta.get("id")
+            if not def_id or not isinstance(def_id, str):
+                def_id = f"{rel}#{index}"
+            found.append((
+                def_id,
+                str(spec.get("type") or "question"),
+                fold(exec_.get("plugin") or spec.get("plugin") or ""),
+                fold(exec_.get("action") or spec.get("action") or ""),
+            ))
+    return found
+
+
+def parse_content_questions(repo_root: Path) -> list[tuple[str, str, str]]:
+    """`(definition id, plugin, action)` for every question definition (see
+    `parse_content_definitions`); plugin/action are case-folded, and a question
+    naming no usable plugin/action yields empty strings, never a skip.
+    """
+    return [(i, p, a) for i, t, p, a in parse_content_definitions(repo_root) if t == "question"]
+
+
+def build_class_by_pair(
+    class_rows: list[tuple[str, str, str]],
+) -> tuple[dict[tuple[str, str], str], list[str]]:
+    """`(folded plugin, folded action) -> DispatchClass`, plus one message per
+    pair declared more than once. The runtime `classify()` returns `Ambiguous`
+    for such a pair, so it is a defect whether or not the classes agree. For a
+    conflicting pair the map keeps the first non-ReadOnly class, so check 4
+    still sees the stricter reading.
+    """
+    seen: dict[tuple[str, str], list[str]] = {}
+    for plugin, action, cls in class_rows:
+        seen.setdefault((fold(plugin), fold(action)), []).append(cls)
+    problems: list[str] = []
+    by_pair: dict[tuple[str, str], str] = {}
+    for (plugin, action), classes in seen.items():
+        by_pair[(plugin, action)] = next((c for c in classes if c != "ReadOnly"), classes[0])
+        if len(classes) > 1:
+            problems.append(
+                f"DUPLICATE CATALOGUE ROW: {plugin}.{action} is declared {len(classes)} times "
+                f"with DispatchClass::{' and DispatchClass::'.join(classes)} -- the runtime "
+                "classify() returns Ambiguous for a pair matched twice (case-insensitively)"
+            )
+    return by_pair, problems
+
+
+def check_fragment_class_parity(name: str, class_count: int, pair_count: int) -> str | None:
+    """Per-fragment parse integrity for check 4: every `.plugin`/`.action` pair
+    must have a `.dispatch_class` the regex found. None when they agree."""
+    if class_count == pair_count:
+        return None
+    return (
+        f"{name}: {pair_count} plugin/action pairs but {class_count} matched "
+        "`.dispatch_class` -- a row whose `.dispatch_class` the regex missed (a comment "
+        "in an unexpected place, a macro-built row) is the usual cause; such a row would "
+        "read as rowless and escape check 4"
+    )
 
 
 def check_questions(
@@ -370,34 +498,43 @@ def check_questions(
     it directly. Returns one message per problem, empty when clean.
     """
     problems: list[str] = []
-    rowless_server: set[str] = set()
-    rowless_other: set[str] = set()
+    rowless_server: dict[str, tuple[str, str]] = {}
+    rowless_other: dict[str, tuple[str, str]] = {}
 
-    for def_id, plugin, action in questions:
+    seen_ids: set[str] = set()
+    for def_id, raw_plugin, raw_action in questions:
+        if def_id in seen_ids:
+            problems.append(f"DUPLICATE QUESTION ID: {def_id} is defined by more than one question definition")
+        seen_ids.add(def_id)
+        plugin, action = fold(raw_plugin), fold(raw_action)
         cls = class_by_pair.get((plugin, action))
         if cls is None:
-            bucket = rowless_server if plugin.startswith(NON_CATALOGUE_EXEMPT_PREFIXES) else rowless_other
-            bucket.add(def_id)
+            bucket = rowless_server if plugin in SERVER_SIDE_PSEUDO_PLUGINS else rowless_other
+            bucket[def_id] = (plugin, action)
         elif cls != "ReadOnly":
             problems.append(
                 f"QUESTION IS NOT READ-ONLY: definition {def_id} (spec.type: question) "
                 f"targets {plugin}.{action}, whose catalogue row is DispatchClass::{cls} "
-                "-- reclassify the definition as `action`, or fix the catalogue row if it "
-                "is wrong (a definition must not self-certify read-vs-effect, ADR-0033 section 1)"
+                "-- reclassify the definition as `action` (a definition must not self-certify "
+                "read-vs-effect, ADR-0033 section 1); changing a catalogue row's "
+                "dispatch_class is a security decision that needs its own review"
             )
 
     for label, found, pin in (
         ("ROWLESS_QUESTION_IDS", rowless_server, pinned),
         ("ROWLESS_QUESTION_IDS_UNEXPLAINED", rowless_other, pinned_unexplained),
     ):
-        for def_id in sorted(found - set(pin)):
+        for def_id in sorted(set(found) - set(pin)):
+            plugin, action = found[def_id]
             problems.append(
-                f"UNPINNED ROWLESS QUESTION: definition {def_id} is a question with no "
-                f"capability_decls row and is not in {label} -- a question that cannot be "
-                "classified cannot run as an agent dispatch; add a catalogue row or update "
-                f"{label} (and its count) deliberately in this file"
+                f"UNPINNED ROWLESS QUESTION: definition {def_id} (plugin {plugin!r}, action "
+                f"{action!r}) is a question with no capability_decls row and is not in {label} "
+                "-- a question that cannot be classified cannot run as an agent dispatch; add a "
+                f"catalogue row or update {label} (and its count) deliberately in this file. "
+                "A question whose pair lives in a fragment missing from FRAGMENT_FILES also "
+                "looks rowless: check that list first"
             )
-        for def_id in sorted(set(pin) - found):
+        for def_id in sorted(set(pin) - set(found)):
             problems.append(
                 f"STALE ROWLESS PIN: {def_id} is in {label} but is no longer a rowless "
                 "question of that kind (it gained a catalogue row, changed type, changed "
@@ -488,7 +625,7 @@ def format_gaps(
 
 class TestGateConsistencyOnRealTree(unittest.TestCase):
     """The actual drift gate: parses the live repository and fails, naming
-    every gap, if content's approval.mode and the seven capability-catalogue
+    every gap, if content's approval.mode and the capability-catalogue
     fragments' execute_gate have drifted apart.
     """
 
@@ -544,20 +681,23 @@ class TestQuestionClassificationOnRealTree(unittest.TestCase):
 
     def test_questions_are_read_only_and_rowless_ones_are_pinned(self) -> None:
         class_rows: list[tuple[str, str, str]] = []
+        parity_problems: list[str] = []
         for rel in FRAGMENT_FILES:
-            class_rows.extend(parse_fragment_dispatch_classes(REPO_ROOT / rel))
-        # Parse integrity: a row whose `.dispatch_class` the regex missed would
-        # read as "no row" and wrongly land in the rowless set.
-        self.assertEqual(
-            len(class_rows), EXPECTED_TOTAL_ROWS,
-            f"parsed {len(class_rows)} (plugin, action, dispatch_class) rows, expected "
-            f"{EXPECTED_TOTAL_ROWS} -- the dispatch_class regex has drifted from the fragment format",
-        )
-        class_by_pair = {(p, a.lower()): c for p, a, c in class_rows}
+            path = REPO_ROOT / rel
+            rows = parse_fragment_dispatch_classes(path)
+            class_rows.extend(rows)
+            # Parse integrity, per fragment: a row whose `.dispatch_class` the regex
+            # missed would read as "no row" and wrongly land in the rowless set.
+            msg = check_fragment_class_parity(rel, len(rows), parse_fragment_pair_count(path))
+            if msg:
+                parity_problems.append(msg)
+        if parity_problems:
+            self.fail("\n" + "\n".join(parity_problems))
+        class_by_pair, duplicate_problems = build_class_by_pair(class_rows)
         questions = parse_content_questions(REPO_ROOT)
         self.assertTrue(questions, "parsed zero question definitions -- the glob or spec.type read is broken")
 
-        problems = check_questions(
+        problems = duplicate_problems + check_questions(
             questions,
             class_by_pair,
             ROWLESS_QUESTION_IDS,
@@ -566,6 +706,50 @@ class TestQuestionClassificationOnRealTree(unittest.TestCase):
         )
         if problems:
             self.fail("\n" + "\n".join(problems))
+
+
+def embedded_definition_types(content_root: Path) -> dict[str, str]:
+    """`id -> type` of every definition `embed_content.py` ingests from
+    `content_root`, read from its generated bundle (its `main()` run in-process
+    into a temp dir). Each envelope literal starts `{"id": ..., "name": ...,
+    "version": ..., "type": ...`, which is all this reads."""
+    embed = _embed_content()
+    with tempfile.TemporaryDirectory(prefix="yuzu_test_gate_parity_") as td:
+        out = Path(td) / "bundled_content.cpp"
+        saved_argv = sys.argv
+        sys.argv = ["embed_content.py", str(content_root), str(out)]
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                rc = embed.main()
+        finally:
+            sys.argv = saved_argv
+        if rc != 0:
+            raise AssertionError(f"embed_content.py exited {rc} on {content_root}")
+        text = out.read_text(encoding="utf-8")
+    section = text[text.index("kBundledDefinitions"):text.index("kBundledSets")]
+    pairs = re.findall(
+        r'R"BCT\(\{"id": ("(?:[^"\\]|\\.)*"), "name": .*?, "version": "[^"]*", '
+        r'"type": ("(?:[^"\\]|\\.)*")',
+        section,
+    )
+    return {json.loads(i): json.loads(t) for i, t in pairs}
+
+
+class TestDefinitionWalkParityWithEmbed(unittest.TestCase):
+    """Checks 4/5 must see the definitions the server actually ships."""
+
+    def test_gate_walk_sees_exactly_what_embed_content_ingests(self) -> None:
+        embedded = embedded_definition_types(REPO_ROOT / "content")
+        self.assertTrue(embedded, "embed_content.py ingested zero definitions -- the bundle read is broken")
+        walked: dict[str, str] = {}
+        for def_id, def_type, _plugin, _action in parse_content_definitions(REPO_ROOT):
+            walked.setdefault(def_id, def_type)  # embed_content.py keeps the first of a repeated id
+        self.assertEqual(
+            walked, embedded,
+            "the gate's definition walk and embed_content.py disagree about which "
+            "definitions ship (or their type) -- a question the gate cannot see is "
+            "a question it does not classify; update parse_content_definitions",
+        )
 
 
 class TestDefinitionValueVocabularies(unittest.TestCase):
@@ -713,6 +897,167 @@ class TestFailureModesOnSyntheticData(unittest.TestCase):
         questions = [("server.a", "server", "a"), ("server.b", "server", "b")]
         self.assertTrue(any("count" in p for p in check_questions(questions, {}, ("server.a", "server.b"), (), 3)))
         self.assertTrue(any("sorted" in p for p in check_questions(questions, {}, ("server.b", "server.a"), (), 2)))
+
+
+    def test_unexplained_pin_sorting_and_duplicates_are_enforced(self) -> None:
+        questions = [("w.a", "widget", "a"), ("w.b", "widget", "b")]
+        unsorted = check_questions(questions, {}, (), ("w.b", "w.a"), 2)
+        self.assertTrue(any("ROWLESS_QUESTION_IDS_UNEXPLAINED must be sorted" in p for p in unsorted))
+        duplicated = check_questions(questions, {}, (), ("w.a", "w.a"), 2)
+        self.assertTrue(any("ROWLESS_QUESTION_IDS_UNEXPLAINED must be sorted" in p for p in duplicated))
+
+    def test_unpinned_message_mentions_a_missing_fragment(self) -> None:
+        problems = check_questions([("w.a", "widget", "a")], {}, (), (), 0)
+        self.assertIn("FRAGMENT_FILES", problems[0])
+
+    def test_not_read_only_message_points_at_the_definition_not_the_row(self) -> None:
+        problems = check_questions([("w.x", "widget", "x")], {("widget", "x"): "Mutating"}, (), (), 0)
+        self.assertIn("reclassify the definition as `action`", problems[0])
+        self.assertIn("security decision", problems[0])
+
+    def test_exact_server_match_rejects_server_prefixed_lookalikes(self) -> None:
+        questions = [("s.a", "serverless", "a"), ("s.b", "serverfoo", "b")]
+        problems = check_questions(questions, {}, ("s.a", "s.b"), (), 2)
+        self.assertEqual(sum("UNPINNED ROWLESS QUESTION" in p for p in problems), 2)
+        self.assertTrue(all("ROWLESS_QUESTION_IDS_UNEXPLAINED" in p for p in problems if "UNPINNED" in p))
+        self.assertEqual(check_questions(questions, {}, (), ("s.a", "s.b"), 2), [])
+        for plugin in SERVER_SIDE_PSEUDO_PLUGINS:
+            self.assertEqual(check_questions([("x", plugin, "a")], {}, ("x",), (), 1), [])
+
+    def test_catalogue_and_definition_plugin_case_is_folded(self) -> None:
+        rows = [("Widget", "Wipe", "Destructive")]
+        by_pair, problems = build_class_by_pair(rows)
+        self.assertEqual((by_pair, problems), ({("widget", "wipe"): "Destructive"}, []))
+        found = check_questions([("w.wipe", " WIDGET ", "WIPE")], by_pair, (), (), 0)
+        self.assertEqual(len(found), 1)
+        self.assertIn("DispatchClass::Destructive", found[0])
+        # Server-side detection is folded too.
+        self.assertEqual(check_questions([("s.a", "Server", "a")], {}, ("s.a",), (), 1), [])
+
+    def test_conflicting_duplicate_catalogue_rows_name_both_classes(self) -> None:
+        by_pair, problems = build_class_by_pair(
+            [("widget", "wipe", "Destructive"), ("Widget", "WIPE", "ReadOnly")]
+        )
+        self.assertEqual(len(problems), 1)
+        for needle in ("DUPLICATE CATALOGUE ROW", "widget.wipe", "DispatchClass::Destructive", "DispatchClass::ReadOnly"):
+            self.assertIn(needle, problems[0])
+        # The stricter class survives, so a question on the pair still fails check 4.
+        self.assertEqual(by_pair[("widget", "wipe")], "Destructive")
+
+    def test_same_class_duplicate_catalogue_row_is_reported_too(self) -> None:
+        _, problems = build_class_by_pair([("w", "a", "ReadOnly"), ("w", "a", "ReadOnly")])
+        self.assertEqual(len(problems), 1)
+        self.assertIn("DUPLICATE CATALOGUE ROW", problems[0])
+
+    def test_fragment_class_parity_names_file_and_both_counts(self) -> None:
+        self.assertIsNone(check_fragment_class_parity("f.hpp", 3, 3))
+        msg = check_fragment_class_parity("f.hpp", 2, 3)
+        assert msg is not None
+        for needle in ("f.hpp", "3 plugin/action pairs", "2 matched", "`.dispatch_class`"):
+            self.assertIn(needle, msg)
+
+    def test_duplicate_question_ids_are_reported(self) -> None:
+        questions = [("w.a", "widget", "a"), ("w.a", "widget", "b")]
+        problems = check_questions(questions, {("widget", "a"): "ReadOnly", ("widget", "b"): "ReadOnly"}, (), (), 0)
+        self.assertEqual(len(problems), 1)
+        self.assertIn("DUPLICATE QUESTION ID: w.a", problems[0])
+
+
+def _definition_yaml(def_id: str | None, *, kind: str = "InstructionDefinition", type_line: str | None = None,
+                     plugin: str = "widget", action: str = "wipe") -> str:
+    lines = [f"kind: {kind}", "metadata:"]
+    lines.append(f"  id: {def_id}" if def_id else "  displayName: nameless")
+    lines.append("spec:")
+    if type_line is not None:
+        lines.append(f"  {type_line}")
+    lines += ["  execution:", f"    plugin: {plugin}", f"    action: {action}"]
+    return "\n".join(lines) + "\n"
+
+
+class TestDefinitionParsingOnSyntheticTrees(unittest.TestCase):
+    """`parse_content_questions` against fabricated content trees in a temp dir."""
+
+    def _parse(self, files: dict[str, str]) -> list[tuple[str, str, str]]:
+        with tempfile.TemporaryDirectory(prefix="yuzu_test_gate_content_") as td:
+            root = Path(td)
+            for rel, text in files.items():
+                path = root / "content" / rel
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(text, encoding="utf-8")
+            return parse_content_questions(root)
+
+    def test_missing_none_and_empty_type_count_as_question(self) -> None:
+        docs = "---\n".join([
+            _definition_yaml("a.missing"),
+            _definition_yaml("a.none", type_line="type: null"),
+            _definition_yaml("a.empty", type_line='type: ""'),
+            _definition_yaml("a.question", type_line="type: question"),
+            _definition_yaml("a.action", type_line="type: action"),
+        ])
+        got = self._parse({"definitions/x.yaml": docs})
+        self.assertEqual(
+            sorted(i for i, _, _ in got), ["a.empty", "a.missing", "a.none", "a.question"]
+        )
+
+    def test_nested_definitions_and_packs_are_walked(self) -> None:
+        got = self._parse({
+            "definitions/top.yaml": _definition_yaml("d.top"),
+            "definitions/sub/deeper/nested.yaml": _definition_yaml("d.nested"),
+            "packs/pack.yaml": _definition_yaml("p.pack"),
+            "packs/sub/inner.yaml": _definition_yaml("p.inner"),
+            "elsewhere/ignored.yaml": _definition_yaml("z.ignored"),
+        })
+        self.assertEqual(sorted(i for i, _, _ in got), ["d.nested", "d.top", "p.inner", "p.pack"])
+
+    def test_only_instruction_definitions_are_taken(self) -> None:
+        docs = "---\n".join([
+            _definition_yaml("k.def"),
+            _definition_yaml("k.set", kind="InstructionSet"),
+            _definition_yaml("k.pack", kind="ProductPack"),
+        ])
+        self.assertEqual([i for i, _, _ in self._parse({"packs/mixed.yaml": docs})], ["k.def"])
+
+    def test_plugin_and_action_are_folded_from_the_yaml(self) -> None:
+        got = self._parse({"definitions/c.yaml": _definition_yaml("c.one", plugin="Server", action="List")})
+        self.assertEqual(got, [("c.one", "server", "list")])
+
+    def test_malformed_definitions_do_not_crash_and_are_named(self) -> None:
+        docs = "---\n".join([
+            "kind: InstructionDefinition\nmetadata: {id: m.list}\nspec:\n  execution: [1, 2]\n",
+            "kind: InstructionDefinition\nmetadata: {id: m.scalar}\nspec: oops\n",
+            "kind: InstructionDefinition\nmetadata: {id: m.nonstr}\n"
+            "spec:\n  execution: {plugin: [a, b], action: {x: 1}}\n",
+            "kind: InstructionDefinition\nmetadata: oops\nspec: {plugin: p, action: a}\n",
+        ])
+        got = self._parse({"definitions/bad.yaml": docs})
+        self.assertEqual(
+            got,
+            [
+                ("m.list", "", ""),
+                ("m.scalar", "", ""),
+                ("m.nonstr", "", ""),
+                ("content/definitions/bad.yaml#3", "p", "a"),
+            ],
+        )
+        problems = check_questions(got[:3], {}, (), (), 0)
+        self.assertEqual(sum("UNPINNED ROWLESS QUESTION" in p for p in problems), 3)
+        for def_id in ("m.list", "m.scalar", "m.nonstr"):
+            self.assertTrue(any(def_id in p for p in problems))
+
+    def test_idless_definitions_do_not_collapse(self) -> None:
+        docs = "---\n".join([_definition_yaml(None), _definition_yaml(None)])
+        got = self._parse({"definitions/idless.yaml": docs})
+        self.assertEqual([i for i, _, _ in got], ["content/definitions/idless.yaml#0", "content/definitions/idless.yaml#1"])
+        self.assertFalse(any("DUPLICATE QUESTION ID" in p for p in check_questions(got, {}, (), (), 0)))
+
+    def test_a_typeless_destructive_question_under_packs_and_nested_definitions_fails(self) -> None:
+        got = self._parse({
+            "definitions/sub/x.yaml": _definition_yaml("n.wipe"),
+            "packs/y.yaml": _definition_yaml("p.wipe"),
+        })
+        problems = check_questions(got, {("widget", "wipe"): "Destructive"}, (), (), 0)
+        self.assertEqual(len(problems), 2)
+        self.assertTrue(all("QUESTION IS NOT READ-ONLY" in p for p in problems))
 
 
 if __name__ == "__main__":
