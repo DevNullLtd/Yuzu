@@ -17,7 +17,11 @@
 %%%     bytes that ends on a character boundary
 %%%   - a value that is not valid UTF-8 is replaced by the placeholder
 %%%
-%%% The result is always a valid UTF-8 binary of at most 255 bytes.
+%%% The result is always a valid UTF-8 binary of at most 255 bytes, and always a
+%%% copy: the input is typically a sub-binary of a large header block, and a
+%%% sub-binary keeps its whole parent alive for as long as it is held (a 255 byte
+%%% value would pin a multi-megabyte block for as long as the notification is
+%%% held), so the result never shares storage with it.
 %%% @end
 %%%-------------------------------------------------------------------
 -module(yuzu_gw_peer_addr).
@@ -40,9 +44,9 @@ max_bytes() -> ?MAX_BYTES.
 sanitize(Addr) when is_binary(Addr) ->
     case unicode:characters_to_binary(Addr, utf8, utf8) of
         Valid when is_binary(Valid), byte_size(Valid) =< ?MAX_BYTES ->
-            Valid;
+            binary:copy(Valid);
         Valid when is_binary(Valid) ->
-            binary:part(Valid, 0, boundary(Valid, ?MAX_BYTES));
+            binary:copy(binary:part(Valid, 0, boundary(Valid, ?MAX_BYTES)));
         _NotUtf8 ->
             ?PLACEHOLDER
     end;

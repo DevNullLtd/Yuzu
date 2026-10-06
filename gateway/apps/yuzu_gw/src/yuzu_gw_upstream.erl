@@ -1085,15 +1085,18 @@ cancel_timer(TRef) -> erlang:cancel_timer(TRef).
 %% never the value itself.
 -spec sanitize_peer_addr(binary(), term()) -> binary().
 sanitize_peer_addr(AgentId, PeerAddr0) ->
-    case yuzu_gw_peer_addr:sanitize(PeerAddr0) of
-        PeerAddr0 ->
-            PeerAddr0;
-        PeerAddr ->
+    %% The result is always the sanitiser's copy, also when the value is equal to
+    %% the input: the input may be a sub-binary that pins a large parent.
+    PeerAddr = yuzu_gw_peer_addr:sanitize(PeerAddr0),
+    case PeerAddr =:= PeerAddr0 of
+        true ->
+            ok;
+        false ->
             logger:debug("Stream status notification for ~s: peer address replaced "
                          "(original size ~b bytes)",
-                         [AgentId, peer_addr_size(PeerAddr0)]),
-            PeerAddr
-    end.
+                         [AgentId, peer_addr_size(PeerAddr0)])
+    end,
+    PeerAddr.
 
 peer_addr_size(Addr) when is_binary(Addr) -> byte_size(Addr);
 peer_addr_size(_Addr) -> 0.

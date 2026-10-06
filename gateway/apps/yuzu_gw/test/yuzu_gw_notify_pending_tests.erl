@@ -90,6 +90,8 @@ closed_test_() ->
         fun two_sessions_of_one_agent_are_both_kept/0),
       t("the peer address is made safe at admission: capped, replaced when invalid, else unchanged",
         fun peer_addr_is_sanitised_at_admission/0),
+      t("the held peer address is a copy: it does not keep the parent binary alive",
+        fun peer_addr_does_not_retain_its_parent_binary/0),
       t("an open circuit holds notifications; a half_open probe that succeeds drains them in order",
         fun open_circuit_holds_then_close_drains_in_order/0),
       t("a half_open circuit sends one held notification as the probe and holds the rest",
@@ -615,6 +617,16 @@ peer_addr_is_sanitised_at_admission() ->
     Entered = await_entered(length(Cases)),
     Got = maps:from_list([{maps:get(agent_id, R), maps:get(peer_addr, R)} || {_, R} <- Entered]),
     ?assertEqual(maps:from_list([{Id, Want} || {Id, _, Want} <- Cases]), Got).
+
+%% A peer address of 100 or 255 valid bytes read out of a large header block
+%% passes the sanitiser unchanged; it must still not pin the block while held.
+peer_addr_does_not_retain_its_parent_binary() ->
+    watch(),
+    Big = binary:copy(<<"a">>, 5 * 1024 * 1024),
+    [cast_status(<<"sub-", (integer_to_binary(Len))/binary>>, <<"sess">>,
+                 binary:part(Big, 0, Len)) || Len <- [100, 255, 1000]],
+    Entered = await_entered(3),
+    [?assert(binary:referenced_byte_size(maps:get(peer_addr, R)) =< 255) || {_, R} <- Entered].
 
 cap_drops_overflow_and_never_a_replacement() ->
     watch(),

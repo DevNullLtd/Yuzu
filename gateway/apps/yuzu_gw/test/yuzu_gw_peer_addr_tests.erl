@@ -79,6 +79,22 @@ a_huge_value_is_bounded_test_() ->
         ?assertEqual(?INVALID, yuzu_gw_peer_addr:sanitize(BigBad))
     end}.
 
+%% A peer address read out of a large request is a sub-binary that keeps the
+%% whole parent alive for as long as the notification is held. The result is a
+%% copy, whether the value passed unchanged, was cut, or was replaced.
+result_does_not_keep_the_parent_binary_alive_test_() ->
+    Big = binary:copy(<<"a">>, 5 * 1024 * 1024),
+    [{Name,
+      fun() ->
+          Sub = binary:part(Big, Start, Len),
+          ?assert(binary:referenced_byte_size(Sub) > 1024 * 1024),
+          Out = yuzu_gw_peer_addr:sanitize(Sub),
+          ?assert(binary:referenced_byte_size(Out) =< 255)
+      end}
+     || {Name, Start, Len} <- [{"a valid value within the limit", 0, 100},
+                               {"a valid value of exactly the limit", 10, 255},
+                               {"a valid value over the limit, cut", 0, 1000}]].
+
 result_is_always_encodable_test() ->
     %% The point of the module: the real encoder accepts the result of every
     %% input above, including the ones that used to raise.
