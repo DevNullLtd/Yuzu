@@ -639,9 +639,33 @@ upstream certificate authority every probe failed in about 2 ms with an
 `unknown_ca` handshake error, the 10 held notifications stayed held and the
 backoff doubled. A TLS handshake failure on the upstream channel is counted by
 `yuzu_gw_upstream_tls_handshake_failures_total` and feeds the breaker like any
-other transport error. Not covered: certificate signing requests from simulated
-agents (only the 30 real agents exercise enrollment), client certificates on the
-agent edge, TLS 1.3, certificate rotation or expiry, and multiple replicas.
+other transport error. 1000 simulated agents over TLS that each sent a
+certificate signing request in the first `Register` and registered again on a new
+connection with the issued certificate dropped 0 notifications, left 1000
+routable rows, made 2000 `ProxyRegister` calls and got 1000 certificates, with
+notifications in flight never above 10 (OBSERVED). All were registered in 4.6 to
+5.8 s against 1.95 s without a signing request: a signing-request `Register` took
+about 3.3 ms against 2.0 ms, and every `Register` runs one at a time in the
+gateway's upstream process. The 1000 first-`Register` entries stay in the
+gateway's pending registry until the bootstrap connection's dead-connection grace
+clears them (about 19 s after connect, with gateway memory about 75 MB higher
+meanwhile; the cause is INFERRED from the registry code and the 15 s default
+grace, since the simulated agents close that connection at once). The end state
+was clean: 1000 routable rows and no never-announced row left. Without a packet
+capture, TLS on each hop was shown with `openssl` client probes (OBSERVED): the
+agent edge is one way TLS 1.2 (a plaintext HTTP/2 preface got a TLS alert and no
+HTTP/2 settings); the server's upstream port rejected a missing client
+certificate and a certificate from another CA and accepted the gateway's; the
+management port rejected a missing or other-CA certificate, and a valid
+certificate with the wrong pinned key got `UNAUTHENTICATED` with `pin_mismatch`
+counted. Under sustained command load over management mutual TLS, 179,081
+commands to 30 real agents all reached every targeted agent with results, with 0
+authentication errors and 0 handshake failures, and latency within noise of
+plaintext (p50 about 29 ms at concurrency 4; at 16 the debug-build server was
+the bound). Not covered: client certificates on the agent edge (the shipped edge
+does not verify them), TLS 1.3 on the edge and management listeners, certificate
+rotation or expiry, multiple replicas, a release-build server, and packet-level
+capture.
 
 ---
 
