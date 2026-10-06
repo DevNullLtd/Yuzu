@@ -257,7 +257,7 @@ The server's own CA, default certificates and key-encryption keys stay where the
 - **An upgrade keeps the existing accounts** when `/ADMIN_USER`, `/ADMIN_PASS` and the operator pair are left out. It keeps the stored connection string unless a new one is given, and keeps the stored OIDC secret when `/OIDC_ISSUER` is given again. Repeat your other options (`/GATEWAY`, `/OIDC_ISSUER`, `/OIDC_CLIENT_ID`, …) on an upgrade: they are not remembered.
 - **Upgrade in place; do not uninstall the previous version first.** Uninstalling removes the service and the installation record but keeps the old, unlocked data directory. The new installer then cannot tell that an administrator created that directory, and refuses it.
 - **Exit code 7** means the install was stopped before any file was installed: an input was missing or invalid, or something could not be secured. The reason is in the setup log on a line starting `PrepareToInstall:`. If the existing service had been stopped by then, it is left stopped, and the message says so (and says if it was disabled). The exception is an upgrade from an unsecured directory that stops before the old directory is moved: the service is then started again. On an upgrade of an already-secured install, the message also lists any files in the data directory that had already been replaced.
-- **Exit code 10** means the files were installed but the service could not be registered or its command line could not be written. Setup disables the service if it can, and the message and log say whether it did; if not, disable it yourself (`sc config YuzuServer start= disabled`) until the cause is fixed.
+- **Exit code 10** means the files were installed but the service could not be registered or its command line could not be written. Setup disables the service if it can, and the message and log say whether it did; if not, disable it yourself (`sc.exe config YuzuServer start= disabled`) until the cause is fixed.
 - **Secrets on the command line are recorded** in the setup log (`/LOG=`) and by deployment tools such as SCCM (AppEnforce.log) and Intune, including any `/ADMIN_PASS=`, `/OPERATOR_PASS=`, `/POSTGRES_DSN=` or `/OIDC_CLIENT_SECRET=` value. Prefer `/POSTGRES_DSN_FILE=` and `/OIDC_CLIENT_SECRET_FILE=`. Stage those files in a pre-step, with permissions only Administrators and SYSTEM can read, and delete them afterwards: the installer copies them and leaves the originals. `/ADMIN_PASS=` and `/OPERATOR_PASS=` have no file form, so treat those logs as secrets: restrict or purge them after the deployment.
 
 **Upgrading from an earlier version.** Its data directory is not locked, so the installer builds a new, locked one. It copies across only plain files that are owned by Administrators or SYSTEM and that no other account can change, from folders that are owned by Administrators or SYSTEM and in which no other account can delete or rename anything: the configuration, `postgres.dsn`, `oidc-client-secret`, and the files directly in `certs\` and `data\`. Subdirectories stay behind. The old directory is renamed to `%ProgramData%\Yuzu Server.insecure-<date>-<time>`; it is never changed or deleted.
@@ -3155,7 +3155,14 @@ for the X509 string finds nothing. Two-tier PKIs are the normal enterprise case,
 so this is easy to hit.
 
 **Diagnosing a rejection.** The agent logs either `untrusted chain` or
-`invalid signature`. Be aware that a certificate-*profile* problem — a
+`invalid signature` — or, when its own trust bundle cannot be loaded at all
+(missing, unreadable by the agent's account, not a regular file, larger than
+1 MiB, held open by another process that denies shared reading (Windows), or not a PEM certificate file),
+`the update trust bundle could not be loaded, so the signature was not checked`,
+counted as `reason="bundle_unreadable"`. That last one is a fault on the
+endpoint, not in your signing; fix the bundle file or its permissions. Agents
+before 0.14.1 reported it as `untrusted chain` (#5249). Be aware that a
+certificate-*profile* problem — a
 non-critical keyUsage, a missing codeSigning EKU, a missing intermediate — is
 reported as `untrusted chain`, the same as a genuinely wrong CA. Check the
 profile above before concluding the trust bundle is wrong. Verify a certificate
@@ -3194,7 +3201,7 @@ both:
 |---|---|---|
 | Linux | `/etc/yuzu-agent/certs/` | `root:root`, mode 0755 |
 | macOS | `/etc/yuzu-agent/certs/` | `root:wheel`, mode 0755 |
-| Windows | `C:\ProgramData\Yuzu\agent-certs\` | Administrators + SYSTEM, owned by Administrators (or SYSTEM), and holding only files. The installer builds a new one in its private temporary folder, locks it there (`icacls /setowner /L` → `/reset /L` → `/inheritance:r /grant:r /L`), checks it, moves it into place and checks it again; an existing, secured directory is not re-locked. If it already exists, it must already be secured exactly; the installer refuses rather than take over a directory it did not secure, because whatever is in it already decides which updates are trusted. It also refuses a junction, symbolic link or subdirectory at or in it, and nothing it runs is recursive. Files in an existing, secured directory must already be owned by Administrators or SYSTEM, and not be hard links, before their permissions are reset to inherit the grant (this repairs the rc1..rc5 lock-out); the installer never takes ownership of a file, and refuses one someone else placed. The check runs before the agent service is stopped, so a refusal leaves the service as it was. Not covered: the parent `C:\ProgramData\Yuzu` (#5257), and a handle opened before the install (#5258). A pre-install check compares the security descriptor of the directory and of everything inside it exactly: the owner, and an entry list of Administrators and SYSTEM with full control and nothing else (no deny entries, no other accounts). It aborts the install otherwise. |
+| Windows | `C:\ProgramData\Yuzu\agent-certs\` | Administrators + SYSTEM, owned by Administrators (or SYSTEM), and holding only files. The installer builds a new one in its private temporary folder, locks it there (`icacls /setowner /L` → `/reset /L` → `/inheritance:r /grant:r /L`), checks it, moves it into place and checks it again; an existing, secured directory is not re-locked. If it already exists, it must already be secured exactly; the installer refuses rather than take over a directory it did not secure, because whatever is in it already decides which updates are trusted. It also refuses a junction, symbolic link or subdirectory at or in it, and nothing it runs is recursive. Files in an existing, secured directory must already be owned by Administrators or SYSTEM, and not be hard links, before their permissions are reset to inherit the grant (this repairs the rc1..rc5 lock-out); the installer never takes ownership of a file, and refuses one someone else placed. The check runs before the agent service is stopped, so a refusal leaves the service as it was. A refusal also never leaves the directory less protected than it was found: the lock is applied only to the private copy, so if security software blocks it nothing is created at the path, and an existing directory's own permissions are never changed (#5250). If the installation fails later, after the service was stopped (for example, a file cannot be replaced; Setup exits with code 5), the installer starts the service again before it exits if it was running or still starting -- even when `/NOSTART` was given, since `/NOSTART` applies only to a completed installation -- and its `/LOG=` log says on a `DeinitializeSetup:` line whether it saw the service RUNNING again or could NOT start it (then run `sc.exe start YuzuAgent`, never plain `sc`, which PowerShell reads as Set-Content). Files it had already replaced are not put back, so run the installer again. Installers up to 0.14.0 left the service stopped (see [the agent bundle guide](../agent-bundle.md)). Not covered: the parent `C:\ProgramData\Yuzu` (#5257), and a handle opened before the install (#5258). A pre-install check compares the security descriptor of the directory and of everything inside it exactly: the owner, and an entry list of Administrators and SYSTEM with full control and nothing else (no deny entries, no other accounts). It aborts the install otherwise. |
 
 **How much protection that directory gives you depends on the platform, and it is
 worth being precise about it.** On Linux the agent runs as the unprivileged
@@ -3232,6 +3239,32 @@ Every flag below has the environment variable shown beside it:
 Setting `--update-require-signature` **without** a trust bundle refuses to start,
 rather than running with enforcement silently inert.
 
+**Confirming what an agent loaded.** At startup the agent logs the mode it is
+enforcing and the bundle path, for example
+`OTA update signature mode: bundle+require (trust bundle: /etc/yuzu-agent/certs/update-trust-bundle.pem)`,
+or `OTA update signature mode: off (…update binaries are NOT signature-checked)`
+when no bundle is set. That startup line is the verification: it says what this
+agent will enforce. Beside it the agent warns about any environment variable that
+starts with `YUZU_UPDATE_` but is not one it reads, so a misspelling after the
+prefix no longer passes silently. The names it accepts are
+`YUZU_UPDATE_TRUST_BUNDLE`, `YUZU_UPDATE_REQUIRE_SIGNATURE` and
+`YUZU_UPDATE_CHECK_INTERVAL` (the agent's own options) and `YUZU_UPDATE_DIR`
+(the server's update-directory option, accepted silently so a host that also runs
+a server is not warned about it).
+
+The bundle-load warning, `OTA update trust bundle cannot be loaded as of this
+check: …`, is NOT logged beside the mode line. The OTA update checker logs it once,
+when it first starts, after the agent first connects, and only when auto-update is
+enabled; the startup report does no file I/O because it runs before a Windows
+service reports itself started. The same mode (`off`, `bundle` or
+`bundle+require`) travels on every heartbeat as the status tag
+`yuzu.ota_signature_mode` (see
+[metrics.md → Agent-side signature refusals](metrics.md#agent-side-signature-refusals-4163807)).
+The server stores that tag in the agent-health snapshot, but no REST endpoint, MCP
+tool or dashboard view exposes it yet, so the startup log line is the per-endpoint
+source of truth. These signals arrived in 0.14.1 (#5249); an older agent logs none
+of them.
+
 #### Windows: the service's `Environment` value
 
 The Service Control Manager merges a service's `Environment` value into the
@@ -3260,8 +3293,10 @@ Get these right, because several mistakes are silent:
   tool must write the value as a properly terminated multi-string too, every
   entry in `name=value` form and **no empty entry**: the service sees nothing
   after an empty entry.
-- **Names must be exact.** A misspelt name is ignored without any error, and
-  signing then stays off. Run the check below after every change.
+- **Names must be exact.** A misspelt name does not stop the agent, and signing
+  then stays off. From 0.14.1 the agent logs a warning at startup naming any
+  `YUZU_UPDATE_` variable it does not read, and logs the mode it loaded; check
+  that line, or run the check below, after every change.
 - **Set `YUZU_UPDATE_REQUIRE_SIGNATURE` to `1`.** The check below requires exactly
   that. A value the agent cannot read as on or off, such as `enabled` or `1`
   followed by a space, stops it at startup.
@@ -3295,7 +3330,15 @@ CONFIGURED. It prints `OK` and exits 0 only when all of these hold:
   exactly the ones for the stage set on its first line, with no duplicates (other
   variables are ignored);
 - the bundle file exists;
-- the binary path carries neither signing flag, in either form.
+- the binary path carries neither signing flag, in either form;
+- no environment entry whose name contains a non-ASCII character, no
+  `YUZU_UPDATE_` entry containing one, and no non-ASCII character in the binary
+  path. Windows can convert a lookalike character to a plain one (an ANSI
+  "best-fit" mapping) when it hands the service its environment and command
+  line, so a name or flag this check does not recognise could still reach the
+  agent as a real option;
+- `$stage` is `1` or `2`. Any other value reports `NOT CONFIGURED` rather than
+  silently checking stage 1.
 
 Otherwise it prints `NOT CONFIGURED` and exits 1. Save it as a `.ps1` and run that,
 or use it as a configuration-management compliance script, comparing its output
@@ -3304,23 +3347,41 @@ window.
 
 ```powershell
 $stage = 1   # 2 once the endpoint also refuses unsigned packages
+if ($stage -notin 1, 2) { 'NOT CONFIGURED'; exit 1 }
 $b = 'C:\ProgramData\Yuzu\agent-certs\update-trust-bundle.pem'
 $want = @("YUZU_UPDATE_TRUST_BUNDLE=$b") + @(if ($stage -eq 2) { 'YUZU_UPDATE_REQUIRE_SIGNATURE=1' })
 $k = Get-ItemProperty HKLM:\SYSTEM\CurrentControlSet\Services\YuzuAgent
 $have = @($k.Environment | Where-Object { $_ -match '^YUZU_UPDATE_(TRUST_BUNDLE|REQUIRE_SIGNATURE)=' })
-$ok = ($k.Environment -is [string[]]) -and -not ($k.Environment -contains '') -and ($have.Count -eq $want.Count) -and (@($want | Where-Object { $have -notcontains $_ }).Count -eq 0) -and (($k.ImagePath -replace '"', '') -notmatch '(--|/)update-(trust-bundle|require-signature)') -and (Test-Path -LiteralPath $b -PathType Leaf)
+$na = '[^\x20-\x7E]'
+$lookalike = @($k.Environment | Where-Object { (($_ -split '=', 2)[0] -cmatch $na) -or (($_ -match '^YUZU_UPDATE_') -and ($_ -cmatch $na)) }).Count -gt 0 -or ([string]$k.ImagePath -cmatch $na)
+$ok = ($k.Environment -is [string[]]) -and -not ($k.Environment -contains '') -and -not $lookalike -and ($have.Count -eq $want.Count) -and (@($want | Where-Object { $have -notcontains $_ }).Count -eq 0) -and (($k.ImagePath -replace '"', '') -notmatch '(--|/)update-(trust-bundle|require-signature)') -and (Test-Path -LiteralPath $b -PathType Leaf)
 if ($ok) { 'OK'; exit 0 } else { 'NOT CONFIGURED'; exit 1 }
 ```
 
+`-cmatch` (case-sensitive) is deliberate in the non-ASCII test: a case-insensitive
+match can fold some non-ASCII characters, such as the Kelvin sign, onto ASCII
+letters and let them through.
+
 **What `OK` does and does not mean.** It means the service is configured the way
-this section describes. It is not proof that the agent loaded that configuration,
-because the agent does not yet log its signing mode at startup, and it assumes an
-agent recent enough to have these options (`yuzu-agent.exe --help` lists
-`--update-trust-bundle`). It does not check the other entries' contents, only that
-none is empty, and it compares names case-insensitively, so type them in plain ASCII. It also does not
-check that the bundle file holds the right certificates: a wrong bundle makes the
-agent refuse signed updates, which shows in
-`yuzu_agent_ota_signature_refused_total` and the agent log.
+this section describes. It is not proof that the agent loaded that configuration.
+For that, use the agent's own signal (0.14.1 and later, #5249): after restarting
+the service, its log carries `OTA update signature mode: bundle` (stage 1) or
+`OTA update signature mode: bundle+require` (stage 2) and the bundle path, with
+no `YUZU_UPDATE_` warning after it. With auto-update enabled, also check that no
+`trust bundle cannot be loaded` warning follows `OTA update checker started` once
+the agent has connected — that warning comes from the update checker, not from
+the startup lines. The heartbeat carries the same mode as the status tag
+`yuzu.ota_signature_mode`, but the server only stores it today (no REST, MCP or
+dashboard view shows it), so the log is the check. An
+agent older than 0.14.1 logs none of this, so for it the script is the only check,
+and it assumes an agent recent enough to have these options (`yuzu-agent.exe --help`
+lists `--update-trust-bundle`). The script does not check the other entries'
+contents beyond the non-ASCII rule, only that none is empty, and it compares names
+case-insensitively, so type them in plain ASCII. It also does not check that the
+bundle file holds the right certificates: a wrong bundle makes the agent refuse
+signed updates, which shows in `yuzu_agent_ota_signature_refused_total` and the
+agent log (`untrusted chain`), while a bundle the agent cannot read at all is
+logged and counted separately (`reason="bundle_unreadable"`).
 
 ### The verifier's catastrophic invariants
 
@@ -3338,7 +3399,11 @@ changing that file must preserve all four.
    internal PKI issuing mTLS and S/MIME from one root, so the consequence is not
    hypothetical.
 3. **An unreadable trust bundle must fail CLOSED.** "Cannot check" is never
-   "checked out fine". The store load is the first check performed.
+   "checked out fine". The store load is the first check performed. It surfaces
+   as `CmsFailure::kBundleUnreadable` (`reason=bundle_unreadable`; the plugin
+   loader still reports it as untrusted), is refused in both modes, and — since
+   0.14.1 — the bundle is read bounded (regular file only, at most 1 MiB) and
+   parsed from memory.
 4. **OTA verification stays after the SHA-256 compare and before apply**, reading
    the HELD descriptor rather than re-opening the path. Apply is the point of no
    return — the execute bit on POSIX, the live-binary move on Windows. Reading the
@@ -3445,7 +3510,8 @@ reported agent version is advancing.
 **A refusing agent still cannot tell you WHY.** There is no status-report RPC on
 the update path, so the reason appears only in that endpoint's own log — the
 gauge tells you how many are affected, not what to fix. The strings to grep for
-are `untrusted chain` and `invalid signature`; an unsigned package logs
+are `untrusted chain`, `invalid signature`, and `trust bundle could not be loaded`
+(the agent's own bundle is missing or unreadable, #5249); an unsigned package logs
 `update package is unsigned and --update-require-signature is set` (`missing` is
 the metric label for that case, not text that appears in the log). Verify on a pilot
 group before a fleet-wide flip.
@@ -5105,7 +5171,7 @@ REM and exits 1639 ERROR_INVALID_COMMAND_LINE without touching the service. That
 REM #1468: the shipped installer had exactly that defect, and because Inno ignores
 REM [Run] exit codes it failed silently -- the service kept the argument-less binPath
 REM --install-service had written, so the agent ran with no --server and fail-closed
-REM on TLS. Check your work with `sc qc YuzuAgent`: every flag below must appear.
+REM on TLS. Check your work with `sc.exe qc YuzuAgent`: every flag below must appear.
 sc.exe config YuzuAgent binPath= "\"C:\Yuzu\bin\yuzu-agent.exe\" --service --server yuzu.example.com:50051 --data-dir \"C:\ProgramData\Yuzu\" --plugin-dir \"C:\Yuzu\plugins\" --log-file \"C:\Yuzu\logs\yuzu-agent.log\""
 
 sc.exe start YuzuAgent
@@ -5123,7 +5189,7 @@ Re-running `--install-service` is idempotent — it updates an existing registra
 
 > **Fleet-upgrade gotcha:** because `--install-service` always resets binPath to the bare minimal form, a silent/unattended re-run of the shipped installer (e.g. an SCCM/Intune package upgrade) that does **not** re-supply the original `/SERVER=`/`/TOKEN=`/`/NOTLS` parameters on that specific invocation will reconfigure the agent back to `localhost:50051` with TLS on — and because the SCM protocol now actually works (post-#1822), the service **starts successfully** against that wrong address instead of failing loudly the way it always did before this fix. The agent goes dark from the fleet with no installer-visible error. Always replay the same install-time parameters on every upgrade run, not just the first install. The installer has parameters for those three settings only, so any other flag you added to the binary path -- notably `--update-trust-bundle` and `--update-require-signature` -- is dropped by every installer run with nothing to show it; set those through the service's `Environment` registry value instead, which installing over the existing agent leaves alone, though uninstalling deletes it (see *Windows: the service's `Environment` value*).
 
-**If `sc start YuzuAgent` still fails after this fix:** check the log file first (`{app}\logs\yuzu-agent.log` via the installer; `<data-dir>\yuzu-agent.log` if you configured `--service` manually without `--log-file`), it has the actual reason. `sc query YuzuAgent`/Event Viewer only distinguish which of three generic buckets: **specific error 1** covers three distinct causes that land on the same code: the agent failed to construct (bad `agent.db`, SQLite/config problem), **or** startup completed but the gRPC channel couldn't be built under the fail-closed TLS posture (missing/unreadable CA or client cert/key, #1303), including, notably, the exact misconfiguration the fleet-upgrade gotcha above can introduce by silently flipping TLS back on, **or** a mid-life failure: the dispatch thread pool could not be re-created on a reconnect (host out of threads), which previously ended the service silently as a clean stop; **specific error 2** (the agent stopped on its own without a stop/shutdown request, unexpected, check the log for what `run()` returned early on); **specific error 3** (an unhandled exception reached the service dispatcher, check the log for the exception message). None of these three codes carry more detail on their own; the log file is where the actual cause lives. These SCM "specific error" buckets are a **separate namespace** from the agent's own process exit codes (1/3/4/5) described under *Stopping a wedged agent* above; they cover why `sc start` failed to bring the service up in the first place, not why a running service later stopped. In particular, a code-4 shutdown-watchdog exit (#2233 item 3) fired while `service_main` is still running happens via `TerminateProcess`, which bypasses `report_status` entirely, so it does not land in any of these three buckets; Event Viewer shows it as a generic unexpected termination, not "specific error N". A code-5, a code-4 fired by `run_service()`'s own post-dispatcher drain wait, or a code-3 fired by the EXPLICIT F3 orphan check on `service_main`'s normal path (#4666 PR-2) are stranger still: each fires strictly after `service_main` has already reported one of the buckets above (or a clean `SERVICE_STOPPED`), so it changes none of them and shows up in neither `sc query` nor Event Viewer as anything distinguishable from that already-reported outcome. One exception to that ordering, pre-existing and not introduced by PR-2: `OrphanExitGuard`'s destructor (`hard_exit.hpp`) is ALSO a fail-closed backstop covering an exception that unwinds out of `agent->run()` itself before the explicit F3 check is even reached; on that path a code-3 can fire from the destructor DURING unwind, before any `report_status` call, so this "already reported" property does not hold universally for every possible code-3, only for the ordinary explicit-check case.
+**If `sc.exe start YuzuAgent` still fails after this fix:** check the log file first (`{app}\logs\yuzu-agent.log` via the installer; `<data-dir>\yuzu-agent.log` if you configured `--service` manually without `--log-file`), it has the actual reason. `sc.exe query YuzuAgent`/Event Viewer only distinguish which of three generic buckets: **specific error 1** covers three distinct causes that land on the same code: the agent failed to construct (bad `agent.db`, SQLite/config problem), **or** startup completed but the gRPC channel couldn't be built under the fail-closed TLS posture (missing/unreadable CA or client cert/key, #1303), including, notably, the exact misconfiguration the fleet-upgrade gotcha above can introduce by silently flipping TLS back on, **or** a mid-life failure: the dispatch thread pool could not be re-created on a reconnect (host out of threads), which previously ended the service silently as a clean stop; **specific error 2** (the agent stopped on its own without a stop/shutdown request, unexpected, check the log for what `run()` returned early on); **specific error 3** (an unhandled exception reached the service dispatcher, check the log for the exception message). None of these three codes carry more detail on their own; the log file is where the actual cause lives. These SCM "specific error" buckets are a **separate namespace** from the agent's own process exit codes (1/3/4/5) described under *Stopping a wedged agent* above; they cover why `sc start` failed to bring the service up in the first place, not why a running service later stopped. In particular, a code-4 shutdown-watchdog exit (#2233 item 3) fired while `service_main` is still running happens via `TerminateProcess`, which bypasses `report_status` entirely, so it does not land in any of these three buckets; Event Viewer shows it as a generic unexpected termination, not "specific error N". A code-5, a code-4 fired by `run_service()`'s own post-dispatcher drain wait, or a code-3 fired by the EXPLICIT F3 orphan check on `service_main`'s normal path (#4666 PR-2) are stranger still: each fires strictly after `service_main` has already reported one of the buckets above (or a clean `SERVICE_STOPPED`), so it changes none of them and shows up in neither `sc query` nor Event Viewer as anything distinguishable from that already-reported outcome. One exception to that ordering, pre-existing and not introduced by PR-2: `OrphanExitGuard`'s destructor (`hard_exit.hpp`) is ALSO a fail-closed backstop covering an exception that unwinds out of `agent->run()` itself before the explicit F3 check is even reached; on that path a code-3 can fire from the destructor DURING unwind, before any `report_status` call, so this "already reported" property does not hold universally for every possible code-3, only for the ordinary explicit-check case.
 
 ### Server: sc.exe (native wrapper not yet available)
 
