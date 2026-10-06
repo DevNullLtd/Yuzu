@@ -313,8 +313,11 @@ any future surface that narrows the role.
 (`retry_after_ms` 5000, an audit row with detail "RBAC read degraded resolving the ITServiceOwner
 ceiling", and `yuzu_server_rbac_read_degrade_total` increments) rather than `403`, because an outage
 is not a missing grant; it still fails closed. This holds on the fleet-read gate and equally on
-`require_permission` and `require_scoped_permission`, which answered `403` for this failure before
-this change; only a definitive deny is `403`. The ceiling read goes through the RBAC authz circuit breaker with a 250 ms acquire budget, so a degraded
+`require_scoped_permission`, which answered `403` for this failure before this change; only a
+definitive deny is `403`. `require_permission` is different: a service-scoped token is refused there by
+the default-deny allow-list whatever the ceiling read returns, so a retry could not succeed, and a
+failed read answers the same default-deny `403` as a healthy one (no `retry_after_ms`, no
+`yuzu_server_rbac_read_degrade_total` increment). The ceiling read goes through the RBAC authz circuit breaker with a 250 ms acquire budget, so a degraded
 store fails quickly and, once the breaker is open, requests are answered without touching the pool; an
 open breaker is counted under the `pool_acquire_timeout` reason. The
 breaker bounds how many requests wait, not how long an already admitted read holds its connection:
@@ -341,7 +344,11 @@ adds no schema and persists no state.
 
 To find affected callers, search the audit log for `action=auth.fleet_read_required` with
 `result=denied` and a detail containing "ITServiceOwner permission" (definitive deny, `403`) versus
-"RBAC read degraded" (store fault, `503`), and for `action=upload_grant.list.access_denied`. For
+"RBAC read degraded" (store fault, `503`), for the sibling gate `action=auth.scoped_permission_required`
+with the same two details ("lacks ITServiceOwner permission" for the `403`, "RBAC read degraded" for
+the `503`), and for `action=upload_grant.list.access_denied`. `action=auth.permission_required` never
+carries the degraded detail: a service token on a route behind the plain permission gate is refused by
+the default-deny allow-list ("default-deny", `403`) whatever the ceiling read returns. For
 `Execution:Read` the affected routes are the executions drawer's
 `/fragments/executions/{id}/detail` fragment, the legacy `GET /api/executions*` routes,
 `GET /api/v1/executions` with its `/{id}`, `/children` and `/api/v1/events` twins, and the MCP tools on

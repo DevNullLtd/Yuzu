@@ -494,8 +494,9 @@ groups:
         # depends on the read that failed: an operator permission check or a
         # list-read confinement read is denied only on a permission-cache miss
         # (a decision already cached on that replica is still served), while a
-        # service-scoped API token is refused (503) whenever the ITServiceOwner
-        # ceiling read fails, because that read runs on every such request. The
+        # service-scoped API token on a fleet-read or scoped-permission route is
+        # refused (503) whenever the ITServiceOwner ceiling read fails, because
+        # that read runs on every such request. The
         # counter is per replica (the expr sums across replicas), so one
         # degraded replica can raise it while others keep answering. It is an
         # availability event, not a silent partial outage, but it does not by
@@ -538,8 +539,8 @@ groups:
             denied wherever their decision needed a read that failed: an
             operator permission or list-read check only on a permission-cache
             miss (a cached decision is still served), a service-scoped token on
-            every request whose ITServiceOwner ceiling read fails (a retryable
-            503). This does not by itself mean every caller is denied, and the
+            every fleet-read or scoped-permission request whose ITServiceOwner
+            ceiling read fails (a retryable 503). This does not by itself mean every caller is denied, and the
             counter is per replica (summed here), so check whether one replica
             or all are affected. pool_acquire_timeout /
             query_error correlate with yuzu_pg_* saturation or outage;

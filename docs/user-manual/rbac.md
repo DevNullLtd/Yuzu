@@ -207,8 +207,11 @@ Recommended order for a fresh install:
 >    the safeguard for that case and for a future authoring surface.
 >
 > A definitive deny is `403`; a FAILED read of the `ITServiceOwner` role's permissions is a
-> retryable `503` (`retry_after_ms` 5000) on the fleet-read gate and on `require_permission` and
-> `require_scoped_permission` alike (an outage is not a missing grant, and the request is still refused). The ceiling read goes through the
+> retryable `503` (`retry_after_ms` 5000) on the fleet-read gate and on `require_scoped_permission`
+> (an outage is not a missing grant, and the request is still refused). On a route behind the plain
+> permission gate (`require_permission`) a service-scoped token is refused by the default-deny
+> allow-list whatever the ceiling read returns, so a failed read there answers the same `403` as a
+> healthy one, with no retry hint. The ceiling read goes through the
 > RBAC authz circuit breaker with a 250 ms acquire budget, so a degraded store answers quickly and, once
 > the breaker is open, without touching the pool (an open breaker is counted under `pool_acquire_timeout`). It is the same breaker operator permission checks use, so
 > repeated ceiling-read failures can open it and an open breaker denies operators' cache-miss checks too
