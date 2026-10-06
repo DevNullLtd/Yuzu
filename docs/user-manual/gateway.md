@@ -605,9 +605,9 @@ runs are marked below.)
   becomes `invalid`, and a longer one is cut to 255 bytes at a character
   boundary. The sanitised value is the one kept in the pending registration, in
   the per-agent process, in the `Agent <id> connected from <address>` log line and in the
-  `peer_addr` of the notification, which is the only place it reaches the wire
-  (`ProxyRegister` forwards the agent's `RegisterRequest` as received and carries
-  no gateway peer address). A legitimate DNS name with a port can reach about 259
+  `peer_addr` of the notification, which is how the gateway sends it to the server.
+  The sanitised value is not sent in the registration request to the server
+  (`ProxyRegister` forwards the agent's `RegisterRequest` as received). A legitimate DNS name with a port can reach about 259
   bytes in the pathological maximum and would be cut: cosmetic, because the field
   is informational (an audit trail value) (INFERRED from the code). The
   `Agent <id> connected from <address>` line is a log copy only: it cuts the agent
