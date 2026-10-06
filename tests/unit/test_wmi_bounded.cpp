@@ -26,11 +26,17 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <string>
+#include <utility>
+#include <vector>
 
 using yuzu::shared::wmi::BoundedQueryOptions;
 using yuzu::shared::wmi::BoundedQueryResult;
 using yuzu::shared::wmi::WmiRow;
 using yuzu::shared::wmi::detail::clamp_call_timeout_ms;
+using yuzu::shared::wmi::detail::commit_row;
+using yuzu::shared::wmi::detail::extract_row;
+using yuzu::shared::wmi::detail::fail_enumeration;
+using yuzu::shared::wmi::detail::hr_hex;
 using yuzu::shared::wmi::exec_object_method;
 using yuzu::shared::wmi::run_bounded_wmi_query;
 namespace error_tokens = yuzu::shared::wmi::error_tokens;
@@ -95,6 +101,167 @@ TEST_CASE("Bounded WMI error tokens are stable") {
     REQUIRE(std::string(error_tokens::kWmiDeadlineExceeded) == "wmi_deadline_exceeded");
     REQUIRE(std::string(error_tokens::kWmiNextFailedPrefix) == "wmi_next_failed_");
     REQUIRE(std::string(error_tokens::kWmiPutParamFailedPrefix) == "wmi_put_param_failed_");
+    REQUIRE(std::string(error_tokens::kWmiPropertyEnumFailedPrefix) ==
+            "wmi_property_enum_failed_");
+}
+
+TEST_CASE("fail_enumeration clears the partial rows, records how many there were, and sets the "
+          "token") {
+    // The one helper every row-clearing exit of run_bounded_wmi_query goes through (deadline,
+    // Next() failure, property-enumeration failure): the stage-aware classifier needs
+    // rows_before_error to tell a missing class (fails at the FIRST Next) from a fault after data.
+    BoundedQueryResult r;
+    r.rows.push_back(WmiRow{{"k", "a"}});
+    r.rows.push_back(WmiRow{{"k", "b"}});
+    fail_enumeration(r, error_tokens::kWmiPropertyEnumFailedPrefix + hr_hex(static_cast<HRESULT>(WBEM_E_FAILED)));
+    REQUIRE(r.rows_before_error == 2);
+    REQUIRE(r.rows.empty());
+    REQUIRE(r.error.has_value());
+    REQUIRE(*r.error == "wmi_property_enum_failed_0x80041001");
+
+    BoundedQueryResult none; // failure before the first row
+    fail_enumeration(none, error_tokens::kWmiDeadlineExceeded);
+    REQUIRE(none.rows_before_error == 0);
+    REQUIRE(none.rows.empty());
+    REQUIRE(*none.error == "wmi_deadline_exceeded");
+}
+
+namespace {
+
+// WBEM_E_* are enumerators (wbemcli.h); HRESULT is the type extract_row traffics in.
+constexpr HRESULT kInvalidOperation = static_cast<HRESULT>(WBEM_E_INVALID_OPERATION);
+constexpr HRESULT kFailed = static_cast<HRESULT>(WBEM_E_FAILED);
+
+// Duck-typed stand-in for IWbemClassObject: exactly the three members extract_row calls, over a
+// scripted list of (name, VARIANT) and two injectable HRESULTs. Counters record the calls so the
+// tests can pin that EndEnumeration() runs only when BeginEnumeration() succeeded.
+struct FakeWbemObject {
+    std::vector<std::pair<std::wstring, VARIANT>> props;
+    HRESULT begin_hr = S_OK;
+    HRESULT end_hr = static_cast<HRESULT>(WBEM_S_NO_MORE_DATA); // what Next() returns when exhausted
+    size_t next_index = 0;
+    int end_calls = 0;
+
+    FakeWbemObject() = default;
+    FakeWbemObject(const FakeWbemObject&) = delete;
+    FakeWbemObject& operator=(const FakeWbemObject&) = delete;
+    ~FakeWbemObject() {
+        for (auto& p : props)
+            VariantClear(&p.second);
+    }
+
+    void add_i4(const wchar_t* name, long v) {
+        VARIANT var;
+        VariantInit(&var);
+        var.vt = VT_I4;
+        var.lVal = v;
+        props.emplace_back(name, var);
+    }
+    void add_null(const wchar_t* name) {
+        VARIANT var;
+        VariantInit(&var);
+        var.vt = VT_NULL;
+        props.emplace_back(name, var);
+    }
+
+    HRESULT BeginEnumeration(long) { return begin_hr; }
+    HRESULT Next(long, BSTR* name, VARIANT* val, CIMTYPE*, long*) {
+        if (next_index >= props.size())
+            return end_hr;
+        const auto& p = props[next_index++];
+        *name = SysAllocString(p.first.c_str());
+        VariantCopy(val, &p.second);
+        return S_OK;
+    }
+    HRESULT EndEnumeration() {
+        ++end_calls;
+        return S_OK;
+    }
+};
+
+} // namespace
+
+TEST_CASE("extract_row returns BeginEnumeration's FAILED HRESULT and does not end an enumeration "
+          "it never began") {
+    FakeWbemObject obj;
+    obj.add_i4(L"Count", 7); // never reached
+    obj.begin_hr = kInvalidOperation;
+    WmiRow row;
+    REQUIRE(extract_row(&obj, row) == kInvalidOperation);
+    REQUIRE(row.empty());
+    REQUIRE(obj.end_calls == 0);
+}
+
+TEST_CASE("extract_row returns Next's FAILED HRESULT after ending the enumeration; the caller "
+          "fails the query") {
+    FakeWbemObject obj;
+    obj.add_i4(L"Count", 7);
+    obj.end_hr = kFailed; // Next() faults after the one property
+    WmiRow row;
+    REQUIRE(extract_row(&obj, row) == kFailed);
+    REQUIRE(row == WmiRow{{"Count", "7"}}); // the property read before the fault
+    REQUIRE(obj.end_calls == 1);
+}
+
+TEST_CASE("an undocumented success code from Next() is returned as-is and fails the query, never "
+          "collapsed to S_OK") {
+    // Pins `hr == WBEM_S_NO_MORE_DATA ? S_OK : hr` in extract_row and `hr != S_OK` in commit_row:
+    // the old `FAILED(hr) ? hr : S_OK` collapse turns WBEM_S_FALSE into a clean (false-clean) row.
+    constexpr HRESULT kUndocumentedSuccess = static_cast<HRESULT>(WBEM_S_FALSE);
+    FakeWbemObject obj;
+    obj.add_i4(L"Count", 7);
+    obj.end_hr = kUndocumentedSuccess;
+    WmiRow row;
+    REQUIRE(extract_row(&obj, row) == kUndocumentedSuccess);
+    REQUIRE(row == WmiRow{{"Count", "7"}});
+    REQUIRE(obj.end_calls == 1);
+
+    BoundedQueryResult r;
+    FakeWbemObject good;
+    good.add_i4(L"Count", 6);
+    REQUIRE(commit_row(&good, r));
+    FakeWbemObject obj2;
+    obj2.add_i4(L"Count", 7);
+    obj2.end_hr = kUndocumentedSuccess;
+    REQUIRE_FALSE(commit_row(&obj2, r));
+    REQUIRE(r.error.has_value());
+    REQUIRE(*r.error == "wmi_property_enum_failed_0x00000001");
+    REQUIRE(r.rows.empty());
+    REQUIRE(r.rows_before_error == 1);
+}
+
+TEST_CASE("extract_row on a clean run returns S_OK with every non-null property") {
+    FakeWbemObject obj;
+    obj.add_i4(L"Count", 7);
+    obj.add_null(L"Nothing"); // VT_NULL is omitted, not a failure
+    obj.add_i4(L"Other", -3);
+    WmiRow row;
+    REQUIRE(extract_row(&obj, row) == S_OK);
+    REQUIRE(row == WmiRow{{"Count", "7"}, {"Other", "-3"}});
+    REQUIRE(obj.end_calls == 1);
+}
+
+TEST_CASE("commit_row appends a clean row; a FAILED extract_row fails the query with the "
+          "property-enum token and records the rows read so far") {
+    // commit_row is the one place both row loops (run_bounded_wmi_query, exec_object_method) turn
+    // a FAILED extract_row into a failed query: removing its FAILED check, or the
+    // fail_enumeration call, fails this test.
+    BoundedQueryResult r;
+    FakeWbemObject good;
+    good.add_i4(L"Count", 7);
+    REQUIRE(commit_row(&good, r));
+    REQUIRE_FALSE(r.error.has_value());
+    REQUIRE(r.rows.size() == 1);
+    REQUIRE(r.rows.front() == WmiRow{{"Count", "7"}});
+
+    FakeWbemObject bad;
+    bad.add_i4(L"Count", 8);
+    bad.end_hr = kFailed; // Next() faults after the one property
+    REQUIRE_FALSE(commit_row(&bad, r));
+    REQUIRE(r.error.has_value());
+    REQUIRE(*r.error == "wmi_property_enum_failed_0x80041001");
+    REQUIRE(r.rows.empty());           // failed, so no partial data
+    REQUIRE(r.rows_before_error == 1); // the one row appended before the fault
 }
 
 TEST_CASE("clamp_call_timeout_ms bounds the per-call wait to what remains of the "
