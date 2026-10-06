@@ -601,6 +601,8 @@ Policy: no critical vulnerabilities allowed:
 result.severity != 'critical' && result.severity != 'high'
 ```
 
+An `UNREADABLE` row means the check could not run (unreadable `/proc/sys` or `sshd_config`); treat it as not assessed — add `&& result.severity != 'UNREADABLE'` or gate on the `summary|UNREADABLE|<n>` count — rather than letting a "no critical/high" policy pass a host it never measured.
+
 Policy: CVSS score must be below threshold:
 
 ```cel
