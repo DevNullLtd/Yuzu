@@ -33,7 +33,9 @@ cluster_id_test_() ->
       {"boot check: a representable cluster_id passes, from either source",
        fun boot_check_accepts_representable_values/0},
       {"boot check: an unrepresentable cluster_id is refused, naming the source",
-       fun boot_check_refuses_unrepresentable_values/0}
+       fun boot_check_refuses_unrepresentable_values/0},
+      {"the application refuses to start with an unrepresentable cluster_id, before starting anything",
+       fun application_start_refuses_an_unrepresentable_cluster_id/0}
      ]}.
 
 setup() ->
@@ -92,3 +94,13 @@ boot_check_refuses_unrepresentable_values() ->
                  yuzu_gw_app:evaluate_cluster_id(<<"default">>, [16#110000])),
     ?assertEqual({error, {invalid_cluster_id, env}},
                  yuzu_gw_app:evaluate_cluster_id(<<"default">>, [$a | b])).
+
+%% start/2 returns the refusal before anything is started (the check runs right
+%% after the environment overrides, and the cookie guard before it passes on a
+%% node that is not distributed, as under eunit). A representable value is not
+%% tried here: it would start the whole application.
+application_start_refuses_an_unrepresentable_cluster_id() ->
+    os:unsetenv(?VAR),
+    application:set_env(yuzu_gw, cluster_id, [16#110000]),
+    ?assertEqual({error, {invalid_cluster_id, app_env}}, yuzu_gw_app:start(normal, [])),
+    ?assertEqual(undefined, whereis(yuzu_gw_sup)).
