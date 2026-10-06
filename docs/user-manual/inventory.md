@@ -704,6 +704,16 @@ ingest is failing. Four further series sharpen the picture:
   be **frozen, not genuinely low** — the freeze-detector that travels with the
   gauge (the freshness count uses a tighter 250 ms budget than the read paths, so
   it can stall while `yuzu_inventory_read_degrade_total` stays quiet).
+- `yuzu_fleet_inventory_sync_skipping{source}` (gauge) — agents currently
+  heartbeating whose `source` skipped its latest collection cycle(s), from the agent
+  heartbeat tag `yuzu.sync.<source>.skip_streak` (today only `source="installed_software"`,
+  written by agents that include the skip-visibility change, #5327). The cause is in the agent's own log (the `sync: … — skipping this cycle`
+  warning, or `sync: installed_apps plugin not loaded`); the agent also publishes it as the
+  `yuzu.sync.<source>.last_skip` heartbeat tag, which no server page or API returns yet.
+  Published every sweep, 0 included. The gauge only counts agents that emit the
+  skip-streak heartbeat tag: an agent that does not emit it (older agents, during a
+  rollout, or in a mixed-version fleet) contributes zero even when its collector is
+  skipping, so a zero gauge does not establish that all collectors are healthy.
 - `yuzu_inventory_ingest_dropped_total{reason}` (counter, reason ∈ `store_not_open` /
   `pool_acquire_timeout` / `query_error` / `invalid_key` / `stale`) — generic-store
   (ADR-0037) upsert calls that did not persist. Ingest is fail-soft (the next
@@ -815,7 +825,14 @@ threshold (`>50` is day-one noise on a 100-device pilot and 0.1% ambient churn o
 explicit `on()/group_left()` matching with a denominator caveat. **Enable it** once
 you have observed your fleet's normal stale-count baseline and set the threshold to
 ~5–10% of your expected active fleet; correlate with `yuzu_fleet_agents_healthy` to
-separate "agents offline" from "sync source broken / disabled".
+separate "agents offline" from "sync source broken / disabled". Also
+correlate with `yuzu_fleet_inventory_sync_skipping{source="installed_software"}`: a
+host counted there is online but its collector is skipping (the reason is in that agent's
+log, and in its `last_skip` heartbeat tag, which no server page or API returns yet). The two gauges count different populations (stored-receipt age over 48 h in
+Postgres vs live heartbeats, which include hosts skipping for less than 48 h and
+hosts that have never reported), so read them side by side and never subtract one
+from the other. Agents that do not emit the skip tag (older agents, or during a
+rollout) are not counted, so a zero there does not rule out a skipping collector.
 
 **A Windows device's software inventory stops updating although the agent is healthy.** Since the #4711 hardening, an Uninstall registry root that cannot be opened or enumerated to the end, or one application subkey whose open fails (access denied above all) or whose name exceeds 255 characters, makes `list_inventory` return rc 1 and the daily sync skips that cycle rather than committing a shorter inventory as authoritative; the device keeps its last good inventory and `last_seen` stops advancing. `list` and `query` return the `error|` row with rc 1 for the same condition. The agent log carries both halves: `installed_apps: Uninstall root <HKLM-64|HKLM-32|HKCU> could not be fully read -- the collection is degraded` and `sync: installed_apps.list_inventory rc=1 — skipping this cycle`. Fix the ACL (the agent runs as LocalSystem) and the next 24 h cycle re-collects. The only fleet-side signal is the indirect `yuzu_inventory_stale_agents{source="installed_software"}` gauge (two missed cycles; its alert `YuzuInventoryStaleAgents` ships disabled and a never-synced device is not counted); there is no direct skip counter yet.
 

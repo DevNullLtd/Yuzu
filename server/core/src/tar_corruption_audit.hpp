@@ -86,6 +86,8 @@ inline constexpr int64_t kTarCorruptionAuditMinRowInterval = 600;
 inline constexpr int64_t kTarCorruptionAuditDegradedRetry = 60;
 
 /// Parse `yuzu.plugin.tar.db_corruption_total`: digits only, <= 18 chars, > 0.
+/// Also the shape rule for the #5332 sync-skip gauge (agent_registry.cpp recompute_metrics):
+/// keep digits-only / > 0 if this changes.
 [[nodiscard]] inline std::optional<int64_t> parse_tar_corruption_total(std::string_view raw) noexcept {
     if (raw.empty() || raw.size() > 18)
         return std::nullopt;

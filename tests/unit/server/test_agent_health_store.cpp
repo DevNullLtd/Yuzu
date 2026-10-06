@@ -2277,6 +2277,43 @@ TEST_CASE("tar corruption audit detail: encode/decode round-trip and sink compos
     CHECK(rows.size() == 1);
 }
 
+// ── #5332: daily-sync skip fleet gauge (REAL store) ───────────────────────────
+
+TEST_CASE("REAL AgentHealthStore: yuzu_fleet_inventory_sync_skipping counts valid streaks > 0",
+          "[health_store][sync][skip][real]") {
+    AgentHealthStore store;
+    yuzu::MetricsRegistry metrics;
+    // The wire key the agent writes, pinned literally (not re-derived through a builder).
+    const char* const k = "yuzu.sync.installed_software.skip_streak";
+    const char* const gauge = "yuzu_fleet_inventory_sync_skipping{source=\"installed_software\"} ";
+    beat_tags(store, "a", {{k, "9"}});  // accepted: digits only, > 0 (9 = last digit)
+    beat_tags(store, "b", {{k, "10"}}); // accepted: multi-digit, contains a 0
+    beat_tags(store, "i", {{k, "999999999999999999"}}); // exactly 18 chars: accepted (the cap)
+    beat_tags(store, "c", {{k, "0"}});
+    beat_tags(store, "d", {});
+    beat_tags(store, "e", {{k, "abc"}});
+    beat_tags(store, "f", {{k, "-1"}});
+    beat_tags(store, "g", {{k, "1234567890123456789"}}); // > 18 chars: over-long, rejected
+    beat_tags(store, "h", {{k, ""}});
+    beat_tags(store, "j", {{k, "1x"}}); // trailing garbage: the whole value must be digits
+    beat_tags(store, "l", {{k, " 5"}}); // leading space: rejected
+    store.recompute_metrics(metrics, std::chrono::seconds{300});
+    CHECK(series_val(metrics.serialize(), gauge) == 3.0);
+
+    // Recovery: agent "a" heartbeats again without the tag. upsert replaces its tag map, so the
+    // count drops (a merge-instead-of-replace regression would leave it at 3).
+    beat_tags(store, "a", {});
+    store.recompute_metrics(metrics, std::chrono::seconds{300});
+    CHECK(series_val(metrics.serialize(), gauge) == 2.0);
+
+    // Every snapshot pruned (0 s window): still PUBLISHED, at 0 - never absent (a
+    // server-owned count over the reporting population, the deliberate exception to
+    // absent-not-zero, like yuzu_fleet_tar_db_corruption_agents); series_val REQUIREs the
+    // series exists.
+    store.recompute_metrics(metrics, std::chrono::seconds{0});
+    CHECK(series_val(metrics.serialize(), gauge) == 0.0);
+}
+
 // ── #5403: pending-Spark-Disarm age (fleet MAX) and deadline count (fleet SUM) ────────────
 //
 // Driven through the REAL AgentHealthStore (see the journal block above for why). The age
