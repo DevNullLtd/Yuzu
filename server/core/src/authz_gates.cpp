@@ -253,7 +253,7 @@ AuthRoutes::require_fleet_read(const httplib::Request& req, httplib::Response& r
         // This is an if chain, not a switch over CeilingVerdict, so -Wswitch will not flag a
         // new enumerator here: it would be refused with the 403 below. A new enumerator that
         // needs its own answer (as Degraded has) must be handled above this branch.
-        if (verdict !=authz::CeilingVerdict::Admit) {
+        if (verdict != authz::CeilingVerdict::Admit) {
             audit_log(req, "auth.fleet_read_required", "denied", "", "",
                       "fleet read blocked: service-scoped token lacks ITServiceOwner "
                       "permission " +
