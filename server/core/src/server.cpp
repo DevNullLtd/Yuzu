@@ -17738,9 +17738,8 @@ private:
                 return out;
             });
 
-        // HardwareRoutes — /hardware (ServiceNow-style CI list + record), the
-        // successor UI to the Inventory tab's Devices sub-tab (nav-split: Software
-        // stays under /inventory's old routes; Hardware is the new CI surface).
+        // HardwareRoutes — /hardware (ServiceNow-style CI list + record).
+        // Software lives at /software; /inventory redirects here.
         // `fleet_read_fn` is the SOLE gate on the list + REST twin (admit-then-filter,
         // ADR-0017) — `build_hw_roster` is deliberately UNFILTERED, matching
         // `FleetReadFn`'s own contract (never stack a second scope predicate).

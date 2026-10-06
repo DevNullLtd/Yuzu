@@ -443,3 +443,17 @@ TEST_CASE("route: software devices — fleet_fn_'s limit is clamped into the rou
     REQUIRE(h.last_fleet_query.has_value());
     REQUIRE(h.last_fleet_query->limit == 50); // a value already inside the bound passes through
 }
+
+TEST_CASE("route: the retired /fragments/inventory devices/device/find/find/results paths are "
+          "unregistered; /inventory still redirects to /hardware",
+          "[inventory][route]") {
+    InvHarness h;
+    for (const char* path : {"/fragments/inventory/devices", "/fragments/inventory/device",
+                             "/fragments/inventory/find", "/fragments/inventory/find/results"})
+        REQUIRE_FALSE(h.sink.Get(path));
+
+    auto r = h.sink.Get("/inventory");
+    REQUIRE(r);
+    REQUIRE(r->status == 302);
+    REQUIRE(r->get_header_value("Location") == "/hardware");
+}

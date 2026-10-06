@@ -332,11 +332,12 @@ TEST_CASE("route: hardware list + CI record emit the inventory.* behavioural-PII
     REQUIRE(has("inventory.device.ci|success|Agent|agent-1"));
 }
 
-TEST_CASE("route: hardware list audit-persist failure — fragment sets Sec-Audit-Failed, REST "
-          "fails closed",
+TEST_CASE("route: hardware list + CI record audit-persist failure — fragments set "
+          "Sec-Audit-Failed, REST fails closed",
           "[hardware][route]") {
     HwHarness h;
     h.roster_rows = {make_row("agent-1", "AUDIT-HOST", "windows", true)};
+    h.ci_detail.identity = make_row("agent-1", "AUDIT-HOST", "windows", true);
     h.audit_should_fail = true;
 
     auto frag = h.sink.Get("/fragments/hardware/list");
@@ -347,6 +348,15 @@ TEST_CASE("route: hardware list audit-persist failure — fragment sets Sec-Audi
     auto rest = h.sink.Get("/api/v1/hardware");
     REQUIRE(rest);
     REQUIRE(rest->status == 503); // fail-closed
+
+    auto ci_frag = h.sink.Get("/fragments/hardware/ci?id=agent-1");
+    REQUIRE(ci_frag);
+    REQUIRE(ci_frag->status == 200); // set-and-proceed
+    REQUIRE(ci_frag->get_header_value("Sec-Audit-Failed") == "true");
+
+    auto ci_rest = h.sink.Get("/api/v1/hardware/agent-1");
+    REQUIRE(ci_rest);
+    REQUIRE(ci_rest->status == 503); // fail-closed
 }
 
 // ───────────────────────── REST v1: JSON null-vs-value contract ────────────────

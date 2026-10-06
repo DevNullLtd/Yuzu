@@ -480,7 +480,7 @@ ahead of PR-A.)
    fallback (INV-6), replace with the permission-specific set. Six callers across dashboard + server
    + json — consider splitting REST vs dashboard.
 4. **PR-D — inventory.** `query_installed_software` + `GET /api/v1/inventory/software` —
-   **DONE (#3290)**. `/inventory` dashboard FIND remains open (its own conversion, see above).
+   **DONE (#3290)**. The `/software` devices expansion (`/fragments/inventory/software/devices`) remains open (its own conversion, see above).
 5. **PR-E — DEX / TAR / audit-log.** The DEX `VisibleSetFn` seam + remaining dashboard fragments +
    the `AuditLog:Read` surface.
 

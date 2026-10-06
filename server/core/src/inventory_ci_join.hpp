@@ -1,8 +1,8 @@
 #pragma once
 
 /// @file inventory_ci_join.hpp
-/// Pure device-CI enrichment for the /inventory Devices-tab roster (PR2). Attaches
-/// each already-visible `InventoryDeviceRow`'s CI fields (serial / model / CPU / RAM)
+/// Pure device-CI enrichment for the /hardware roster (PR2). Attaches each
+/// `InventoryDeviceRow`'s CI fields (serial / model / CPU / RAM)
 /// from a pre-fetched `agent_id -> DeviceCiRecord` map.
 ///
 /// Split out of server.cpp's `build_hw_roster` so the confinement contract is
@@ -22,9 +22,10 @@
 
 namespace yuzu::server {
 
-/// `rows` MUST already be the operator-visible roster (post `visible_set_fn` filter).
-/// `ci_by_agent` may hold entries for agents NOT present in `rows` — those are never
-/// looked up, so no CI ever attaches to a row the caller didn't already deem visible.
+/// `rows` is the UNFILTERED roster; confinement is HardwareRoutes' `scoped_roster`,
+/// downstream — this function never adds a row. `ci_by_agent` may hold entries for
+/// agents NOT present in `rows` — those are never looked up, so no CI ever attaches
+/// to a row that is not already in `rows`.
 /// A `rows` entry with no matching `ci_by_agent` key is left with its default-empty
 /// `ci_*` fields (not yet synced) — never treated as an error.
 void attach_device_ci(std::vector<InventoryDeviceRow>& rows,

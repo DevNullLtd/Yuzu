@@ -169,7 +169,8 @@ std::string scope_caveat() {
            "<b>not yet effective</b> under the global <span class=\"inv-mono\">Inventory:Read</span> "
            "gate, so these fleet-wide counts span all groups. A scope filter + access audit run on "
            "every read but do not narrow results today. (The Hardware list and CI record <b>are</b> "
-           "scope-correct; the devices expansion drops out-of-group rows per device.)</div>";
+           "scope-correct; the devices expansion is also fleet-wide under the same global gate — its "
+           "per-row filter does not narrow today.)</div>";
 }
 
 std::string page_head() {

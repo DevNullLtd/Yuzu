@@ -152,7 +152,7 @@ std::string render_inventory_software_devices_fragment(
     const std::string& name, const std::optional<std::vector<SoftwareFleetRow>>& rows, bool hit_cap,
     std::size_t devices_omitted, const std::unordered_map<std::string, std::string>& hostnames);
 
-/// /inventory routes — the page shell + the read-only HTMX fragments. Providers are
+/// /software routes — the `/inventory` 302, the page shell + the read-only HTMX fragments. Providers are
 /// injected closures (store-decoupled) so the handlers are unit-testable via
 /// TestRouteSink without a live Postgres.
 class InventoryRoutes {
