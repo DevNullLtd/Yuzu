@@ -724,13 +724,46 @@ TEST_CASE("require_fleet_read: service token - degraded ITServiceOwner permissio
     const auto* perm_row = find_row("auth.permission_required");
     REQUIRE(perm_row != nullptr);
     CHECK(perm_row->result == "denied");
+    // The default-deny row of a failed ceiling read ends with a marker that a healthy
+    // default-deny row lacks (pinned in the next test case); the text before it is identical.
     CHECK(perm_row->detail == "service-scoped token blocked: default-deny (Response:Read not on "
-                              "the service-scope global-safe allow-list)");
+                              "the service-scope global-safe allow-list); ceiling read degraded");
     const auto* scoped_row = find_row("auth.scoped_permission_required");
     REQUIRE(scoped_row != nullptr);
     CHECK(scoped_row->result == "denied");
     CHECK(scoped_row->detail == "service-scoped token blocked: RBAC read degraded resolving the "
                                 "ITServiceOwner ceiling");
+}
+
+// The healthy counterpart of the degraded default-deny audit row above: a ceiling read that
+// succeeds (ITServiceOwner holds the pair) and is then refused by the allow-list records the
+// default-deny detail WITHOUT the degraded marker, so the marker discriminates an outage.
+TEST_CASE("require_permission: a healthy default-deny audit row carries no degraded marker",
+          "[pg][auth_routes][authz_gates][service_scope]") {
+    YUZU_REQUIRE_PG_DB_TPL(rbac_db_, rbac_gates_tpl);
+    yuzu::MetricsRegistry metrics; // declared before the rig: auth_mgr keeps a raw pointer to it
+    GatesRig r{rbac_db_.dsn()};
+    r.auth_mgr.set_metrics_registry(&metrics);
+    REQUIRE(r.rbac.assign_role({"user", "minter", "RespReader"}).has_value());
+    const auto svc = r.mint("printers");
+
+    auto req = bearer_request(svc);
+    httplib::Response res;
+    CHECK_FALSE(r.ar->require_permission(req, res, "Response", "Read"));
+    check_default_deny_403(res);
+    CHECK(metrics
+              .counter("yuzu_auth_service_scope_default_denied_total",
+                       {{"permission", "Response:Read"}, {"path_class", "default"}})
+              .value() == 1.0);
+    CHECK(metrics.counter("yuzu_server_rbac_read_degrade_total", {{"reason", "query_error"}})
+              .value() == 0.0);
+    auto rows = r.audit_store.query({});
+    REQUIRE(rows.has_value());
+    REQUIRE(rows->size() == 1);
+    CHECK((*rows)[0].action == "auth.permission_required");
+    CHECK((*rows)[0].result == "denied");
+    CHECK((*rows)[0].detail == "service-scoped token blocked: default-deny (Response:Read not on "
+                               "the service-scope global-safe allow-list)");
 }
 
 // require_permission falls through a Degraded ceiling read to its service-scope allow-list,

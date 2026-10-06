@@ -764,7 +764,8 @@ bool AuthRoutes::require_permission(const httplib::Request& req, httplib::Respon
         // with a retryable 503 up front: the allow-list check below refuses every pair today
         // (kServiceScopeGlobalSafe is empty), so a retry hint here would advertise a recovery that
         // cannot happen. A Degraded read therefore continues to that allow-list check and is
-        // answered by its definitive default-deny 403, exactly as for a healthy read. A definitive
+        // answered by its definitive default-deny 403 with the same status, body and metrics as
+        // for a healthy read; only the audit detail differs, by a trailing marker. A definitive
         // Deny keeps its own 403 (and audit text) before the allow-list.
         const auto ceiling = authz::service_ceiling_check(*rbac_store_, securable_type, operation);
         const bool ceiling_degraded = ceiling.verdict == authz::CeilingVerdict::Degraded;
@@ -787,9 +788,14 @@ bool AuthRoutes::require_permission(const httplib::Request& req, httplib::Respon
             return false;
         }
         if (!service_scope_admits(securable_type, operation)) {
+            // The marker is audit-only: a Degraded ceiling read is answered by this same 403
+            // (status, body and metrics unchanged), so without it an outage would be
+            // indistinguishable from a healthy default-deny in the audit row. The text before
+            // the marker is the healthy row's detail, byte for byte.
             audit_log(req, "auth.permission_required", "denied", "", "",
                       "service-scoped token blocked: default-deny (" + perm +
-                          " not on the service-scope global-safe allow-list)");
+                          " not on the service-scope global-safe allow-list)" +
+                          (ceiling_degraded ? "; ceiling read degraded" : ""));
             if (auto* m = auth_mgr_.metrics_registry()) {
                 m->counter("yuzu_auth_service_scope_default_denied_total",
                            {{"permission", perm},
