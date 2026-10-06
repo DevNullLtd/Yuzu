@@ -966,8 +966,10 @@ flip, with a red-first test each:
     `yuzu.guardian_journal_evicted_no_send_evidence`), so sustained forced-Reapply churn
     could evict earlier `guard.armed` / `guard.disarmed` records before delivery: **a
     measurement of journal eviction during a held period is a flip precondition.** Trip
-    signal: `yuzu.guardian_generation` lag (now the reliable held-wedge signal, since a
-    wedge is never acknowledged) or the compensation age gauge above a chosen threshold
+    signal: `yuzu.guardian_generation` lag (necessary for a held wedge since a wedge is never
+    acknowledged, but not wedge-specific: an ordinary refusal, a congestion expiry or a
+    latched apply failure also holds the generation, so corroborate with
+    `yuzu.guardian_arm_failed`/`arm_pending`, the compensation tags and the agent log) or the compensation age gauge above a chosen threshold
     (no alert rule ships). Existing server signals to watch:
     `yuzu_server_guardian_reconciles_total{result="sent"}`,
     `yuzu_server_guardian_pushes_dispatched_total{reason="reconcile"}`, and repeated
@@ -1021,7 +1023,16 @@ flip, with a red-first test each:
     recapture by a forced Reapply.
   - (AC-11) **An operator delta push (`full_sync=false`) during a hold** changes the push
     identity (and the following full_sync push changes it back), so each is a Reapply and
-    the suppression budget restarts.
+    the suppression budget restarts. A delta push that OMITS a still-desired unresolved
+    rule replaces the sole application wholesale
+    (`GuardianArmAckLedger::begin_application`, `guardian_arm_ack.cpp:129-147`) and so
+    drops that rule's retry obligation: the fresh application can then satisfy
+    `can_advance()` and acknowledge, after which the omitted wedged claim has no owning
+    application. Pre-existing (the old waiver code replaced the application the same
+    way), the Spark path is dormant, and no current production route emits an omitting
+    delta (REST and MCP operator pushes default to `full_sync=false` but carry the full
+    OS/scope-filtered deployed inventory: `rest_api_v1.cpp:14928`, `mcp_server.cpp:14597`,
+    `server.cpp:19502-19569`). Follow-up issue to be filed.
   - (AC-12) **A push mixing a wedge with any non-wedge failure** (a congestion expiry, a
     refusal) is a Reapply every time: the suppression applies only when every unresolved
     item is an outstanding wedge (or a Pending/Committed sibling).

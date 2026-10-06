@@ -745,8 +745,14 @@ never acknowledged in between, the server's `full_sync` re-push (25 s minimum
 interval, `server.cpp`) keeps arriving and is the retry owner: an unadopted late
 failure can no longer leave an acknowledged-but-unarmed rule. **The costs, stated
 plainly:** (1) the hold is UNBOUNDED, a never-returning arm holds the generation
-forever (intended; `yuzu.guardian_generation` lag is now the reliable held-wedge
-signal); (2) the server applies no back-off (none is added by #5459), so a held agent
+forever (intended; `yuzu.guardian_generation` lag is NECESSARY for a held wedge but
+NOT specific to one, because an ordinary refusal, a congestion expiry or a latched
+apply failure also holds the generation (`can_advance()` needs `resolved_failed == 0`,
+`guardian_arm_ack.cpp:361-370`; `decide_retry()` answers Reapply on an ordinary
+failure, `:436-443`; `check_boot_inert_false_but_watch_refused_stays_failed` in
+`test_guardian_engine_spark_reconcile.cpp` holds `policy_generation() == 0` across
+retries), so corroborate with `yuzu.guardian_arm_failed`/`arm_pending`, the
+compensation age/deadline tags and the agent log before concluding wedge); (2) the server applies no back-off (none is added by #5459), so a held agent
 costs one `guaranteed_state.reconcile` audit row per push, about one per 30 s
 heartbeat (the 25 s floor only at a faster heartbeat), plus a forced full teardown and
 re-arm about every 330 s from the safety valve (re-arm recaptures only
@@ -754,7 +760,17 @@ Spark-first-captured, unpersisted `FileHashEquals` baselines, #4045: persisted
 baselines are re-seeded on every arm); (3) an operator delta push (`full_sync=false`)
 during a hold flips the push identity twice and resets the suppression budget;
 (4) recovery needs a live connection (the maintenance tick runs on the per-connection
-heartbeat thread). Known limits NOT fixed here: an agent restart gap (the boot
+heartbeat thread). Known limits NOT fixed here: a delta push (`full_sync=false`) that
+OMITS a still-desired unresolved rule replaces the sole application wholesale
+(`GuardianArmAckLedger::begin_application`, `guardian_arm_ack.cpp:129-147`) and so
+drops that rule's retry obligation: the fresh application can then satisfy
+`can_advance()` and acknowledge, after which the omitted wedged claim has no owning
+application (pre-existing, since the old waiver code replaced the application the same
+way; the Spark path is dormant; no current production route emits an omitting delta,
+because the REST and MCP operator pushes default to `full_sync=false` but carry the
+full OS/scope-filtered deployed inventory, `rest_api_v1.cpp:14928`,
+`mcp_server.cpp:14597`, `server.cpp:19502-19569`; follow-up issue to be filed); an
+agent restart gap (the boot
 Application opens at the loaded acknowledged generation with an empty `content_id`,
 and a failed boot re-arm is never retried, #5513); a content-identity gap (an
 identical re-observation matches `rule_id` and spec only, #5512). See
@@ -1075,7 +1091,12 @@ design is mentioned it is named as the earlier design.
   generation forever (intended). A push whose unresolved set mixes a wedge with a
   congestion or ordinary failure forces a Reapply every time. A delta push
   (`full_sync=false`) during a hold flips identity twice and resets the suppression
-  budget. Recovery needs a live connection (the maintenance tick runs on the
+  budget. A delta push that OMITS a still-desired unresolved rule replaces the sole
+  application (`begin_application`, `guardian_arm_ack.cpp:129-147`) and drops that
+  rule's retry obligation, so the fresh application can acknowledge while the omitted
+  wedged claim has no owning application; pre-existing (the old waiver code did the
+  same), dormant, and no current production route emits an omitting delta (see the
+  known-limits list above); follow-up issue to be filed. Recovery needs a live connection (the maintenance tick runs on the
   per-connection heartbeat thread). Content identity: an identical re-observation
   matches `rule_id` and spec only (#5512). #4045: a forced Reapply re-arms the whole
   push, but persisted baselines are re-seeded on every arm
