@@ -555,10 +555,12 @@ until its own next reconnect (`#4634`).
 Update (#4632, 2026-10-05): a gateway that includes #4632 holds a
 re-announcement it cannot send at once (10 notifications already in flight, or
 the circuit breaker not closed) and sends it first in first out, instead of
-dropping it as described above. It is dropped, and counted in
-`yuzu_gw_upstream_notify_dropped_total{reason="at_capacity"}`, only when
-`notify_pending_max` keys are already held. See "Stream Status Notification" in
-[gateway.md](gateway.md#stream-status-notification).
+dropping it as described above. It is lost at admission, and counted in
+`yuzu_gw_upstream_notify_dropped_total{reason="at_capacity"}`, only when the
+store is full: `notify_pending_max` keys are held, counting the key of a half
+open probe that is out. A notification lost after admission (a failed or killed
+worker, or a gateway stop with entries held) is not counted there. See
+"Stream Status Notification" in [gateway.md](gateway.md#stream-status-notification).
 
 ### vNEXT — multi-cluster gateway mode now binds each agent to its own cluster, closing a claim-then-answer hijack (#4669; NOT breaking, gateway-fronted multi-cluster deployments only)
 
