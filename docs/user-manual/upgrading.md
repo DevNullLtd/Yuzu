@@ -2064,8 +2064,9 @@ only in the old `auth.db` local-account tables is gone until re-established.
 
 - Prior local accounts, roles, and MFA enrolments that existed only in the
   pre-cutover `auth.db` are gone. The server re-seeds a single admin account
-  from `yuzu-server.cfg` (the same config-as-seed-only behavior as the
-  original v0.12.0 AuthDB bring-up).
+  from `yuzu-server.cfg` (the same seeding as the original v0.12.0 AuthDB
+  bring-up; on 0.14.x the cfg entry also keeps winning over the database
+  at every later start, and 0.15.0 makes it seed-only, #5274).
 - SCIM-provisioned users/groups are **not** lost long-term: `ScimStore`
   self-heals on the IdP's next scheduled sync cycle, which re-provisions
   everything from the IdP as the source of truth. There is a gap between
