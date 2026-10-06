@@ -3014,7 +3014,8 @@ tests:
   # series at 0 (yuzu_gw_telemetry:declare_metrics/0), so the first increment
   # has a baseline for increase() to diff against.
   #
-  # The threshold is at least 10 increases in 10 minutes: one malformed Register
+  # The threshold is about ten increases in 10 minutes (increase() >= 10, and
+  # increase() extrapolates: see the non-zero baseline case): one malformed Register
   # from an unauthenticated peer, or one oversized daily-sync batch, counts once
   # and must stay quiet. Each case below steps the counter at minute 6 (the
   # samples are one minute apart, left-open 10m window), so the sample at minute
@@ -3083,6 +3084,25 @@ tests:
       - expr: 'ALERTS{alertname="YuzuGatewayUpstreamEncodeErrors"}'
         eval_time: 25m
         exp_samples: []
+
+  # CASE: the zero-baseline cases above are the special case where increase() does
+  # not extrapolate (the first sample is 0). On a counter already at 5, a burst of
+  # nine (5 -> 14) is extrapolated by 10m / 9m and reads as 10, so it FIRES; a
+  # burst of eight reads as 8.9 and stays quiet. This pins the threshold as it
+  # really behaves: about ten, not exactly ten.
+  - interval: 1m
+    name: gateway upstream encode errors - on a non-zero counter nine extrapolate to the threshold and eight do not
+    input_series:
+      - series: 'yuzu_gw_upstream_rpc_errors_total{job="yuzu-gateway",instance="g1",rpc_name="register",code="encode"}'
+        values: "5x5 14x30"
+      - series: 'yuzu_gw_upstream_rpc_errors_total{job="yuzu-gateway",instance="g1",rpc_name="inventory",code="encode"}'
+        values: "5x5 13x30"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGatewayUpstreamEncodeErrors", alertstate="firing"}'
+        eval_time: 12m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGatewayUpstreamEncodeErrors", alertstate="firing", code="encode", instance="g1", job="yuzu-gateway", rpc_name="register", severity="warning"}'
+            value: 1
 
   # CASE: the healthy shape: pre-seeded at 0 and flat stays silent, and a
   # rising counter of ANOTHER code (a server answer, an exception) does not fire

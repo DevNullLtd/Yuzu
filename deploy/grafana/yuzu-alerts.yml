@@ -97,7 +97,8 @@ groups:
       # opens the circuit breaker, so a systematic local encode fault leaves the
       # breaker closed. The rate rule above has no code filter and fires only
       # above 0.1 errors/s for 5m, so a slow encode fault can stay under it.
-      # Threshold: at least 10 increases in 10m, so one malformed request does
+      # Threshold: increase() >= 10 over 10m (about ten: increase() extrapolates,
+      # so nine on a non-zero counter can reach it), so one malformed request does
       # not warn. batch_heartbeat marshal failures are counted as
       # code="exception" and are not covered here.
       - alert: YuzuGatewayUpstreamEncodeErrors
@@ -105,8 +106,8 @@ groups:
         labels:
           severity: warning
         annotations:
-          summary: "Gateway could not encode at least 10 {{ $labels.rpc_name }} requests in 10m"
-          description: "Gateway could not encode at least 10 {{ $labels.rpc_name }} requests in 10m. A systematic encode failure leaves the circuit breaker closed and /readyz ready; YuzuGatewayUpstreamErrors fires on any code only above 0.1 errors/s, so it can stay silent for a slow encode fault. A lone failure is most likely a single malformed request and does not reach this alert, which needs at least 10 in 10 minutes: read the rate, not the existence."
+          summary: "Gateway could not encode about 10 or more {{ $labels.rpc_name }} requests in 10m"
+          description: "Gateway could not encode about 10 or more {{ $labels.rpc_name }} requests in 10m. A systematic encode failure leaves the circuit breaker closed and /readyz ready; YuzuGatewayUpstreamErrors fires on any code only above 0.1 errors/s, so it can stay silent for a slow encode fault. A lone failure is most likely a single malformed request and does not reach this alert, which needs about 10 in 10 minutes (increase() extrapolates, so nine can reach it): read the rate, not the existence."
 
       # Gateway BEAM VM memory exceeds 4GB.
       - alert: YuzuGatewayMemoryHigh
