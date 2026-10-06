@@ -104,6 +104,10 @@ verdict_replay_test_() ->
         fun targeted_refuse_disconnects_the_agent/0),
       t("E9b REFUSE after the agent re-registered disconnects the captured old pid only",
         fun refuse_after_reregistration_disconnects_the_old_pid_only/0),
+      t("E9c a replay answered with a request-fault status leaves the breaker as it is",
+        fun targeted_request_fault_replay_leaves_the_breaker_alone/0),
+      t("E9d a replay answered with a status that says the upstream is unhealthy is a failure",
+        fun targeted_unhealthy_status_replay_counts_as_a_failure/0),
       t("E10 the heartbeat trigger is labelled heartbeat",
         fun triggered_event_is_labelled_heartbeat/0),
       t("E10 breaker recovery through proxy_register/1 is labelled breaker",
@@ -833,6 +837,53 @@ refuse_after_reregistration_disconnects_the_old_pid_only() ->
     ?assertEqual(IndexBefore, ets:lookup(yuzu_gw_sessions, sid(A2))),
     ?assertEqual(error, yuzu_gw_registry:lookup_session(sid(A))),
     ?assertMatch({ok, #{pid := _}}, yuzu_gw_registry:lookup_session(sid(A2))).
+
+%% E9c: INVALID_ARGUMENT and the other request-fault statuses (3, 5, 6, 11) are
+%% answers about the request, not about the upstream. On the replay path (which
+%% records through record_result_no_replay/2) they neither add to the failure
+%% count the earlier failed rpc left at 1 nor reset it, and nothing is torn down
+%% (only FAILED_PRECONDITION, status 9, means a superseded session).
+targeted_request_fault_replay_leaves_the_breaker_alone() ->
+    watch(),
+    cause_one_failure(),
+    lists:foreach(
+      fun(Status) ->
+          %% One agent per status: the same id and session would be inside the
+          %% replay guard window.
+          A = bind_agent(<<"e9c-", Status/binary>>),
+          mock_unary(fun(<<"ProxyRegister">>, _Req, _Hdr) ->
+                             {error, {Status, <<"the request was wrong">>}, #{}};
+                        (M, R, H) -> default_rpc(M, R, H)
+                     end),
+          ok = yuzu_gw_upstream:replay_sessions([sid(A)]),
+          await(fun() -> lists:member(sid(A), replay_hdrs()) end),
+          await_idle(),
+          ?assertEqual(closed, yuzu_gw_upstream:circuit_state()),
+          ?assertEqual(1, up_get(cb_failures)),
+          ?assertEqual([], disconnects())
+      end, [<<"3">>, <<"5">>, <<"6">>, <<"11">>]).
+
+%% E9d, the over-correction guard of E9c: a status that says the upstream is
+%% unhealthy is still a replay failure, each one adding to the count.
+targeted_unhealthy_status_replay_counts_as_a_failure() ->
+    watch(),
+    cause_one_failure(),
+    {_, Counted} =
+        lists:foldl(
+          fun(Status, {Want, _}) ->
+              A = bind_agent(<<"e9d-", Status/binary>>),
+              mock_unary(fun(<<"ProxyRegister">>, _Req, _Hdr) ->
+                                 {error, {Status, <<"upstream trouble">>}, #{}};
+                            (M, R, H) -> default_rpc(M, R, H)
+                         end),
+              ok = yuzu_gw_upstream:replay_sessions([sid(A)]),
+              await(fun() -> lists:member(sid(A), replay_hdrs()) end),
+              await_idle(),
+              ?assertEqual(Want + 1, up_get(cb_failures)),
+              ?assertEqual(closed, yuzu_gw_upstream:circuit_state()),
+              {Want + 1, ok}
+          end, {1, ok}, [<<"14">>, <<"13">>, <<"4">>]),
+    ?assertEqual(ok, Counted).
 
 %% E10.
 triggered_event_is_labelled_heartbeat() ->

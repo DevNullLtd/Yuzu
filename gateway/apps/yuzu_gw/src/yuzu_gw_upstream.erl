@@ -33,8 +33,9 @@
 %%%   controls must be made safe at admission (yuzu_gw_peer_addr, applied in the
 %%%   notify_stream_status cast handler and where the Register call reads the
 %%%   :authority header). The peer address is the only such field the gateway
-%%%   sanitises: the agent id is bounded and checked by the server before a
-%%%   session exists, the session id is minted by the server, the rest is gateway
+%%%   sanitises: the agent id is bounded (1 to 256 bytes) at the gateway edge by
+%%%   yuzu_gw_agent_service:register/2 with the same condition the server applies,
+%%%   the session id is minted by the server, the rest is gateway
 %%%   configuration (cluster_id is converted to UTF-8 at boot).
 %%%   The general rule behind it: a LOCAL encode exception (the request could not
 %%%   be encoded, so it never left the gateway) says nothing about the upstream,
@@ -43,6 +44,21 @@
 %%%   can take. A held notification that is the probe and fails that way can
 %%%   never encode, so it is evicted with a warning (not requeued) and the next
 %%%   head is probed at once; every other failure still requeues it.
+%%%   The same rule covers a server ANSWER that is about the request, not about the
+%%%   upstream (INVALID_ARGUMENT, NOT_FOUND, ALREADY_EXISTS, FAILED_PRECONDITION,
+%%%   OUT_OF_RANGE: the gRPC statuses for a wrong request; the server returns the
+%%%   first and the fourth on these RPCs today): it neither fails nor recovers the
+%%%   breaker, because a caller that can make the server say so would otherwise
+%%%   open the breaker for every agent, and a recovery on such an answer would
+%%%   reset real failures. A probe answered that way is retired, not requeued
+%%%   (requeueing would be answered the same way by every probe, for ever).
+%%%   Every other status still counts as a failure: UNAVAILABLE, INTERNAL,
+%%%   DEADLINE_EXCEEDED, UNKNOWN, PERMISSION_DENIED, UNAUTHENTICATED,
+%%%   RESOURCE_EXHAUSTED (a server out of memory answers it), CANCELLED,
+%%%   UNIMPLEMENTED, ABORTED and DATA_LOSS, and so does every transport error,
+%%%   HTTP-level error and exception out of the client. A request over the
+%%%   server's 4 MiB receive limit is refused here as a local encode failure
+%%%   (never sent), instead of being answered RESOURCE_EXHAUSTED by the server.
 %%%
 %%% The half_open probe (#4632):
 %%%   Held entries are not sent while the breaker is open. When it goes half_open
@@ -193,6 +209,29 @@
 %% The tag of the exception encode_request/2 raises: the request could not be
 %% encoded in this process (see do_rpc/4).
 -define(LOCAL_ENCODE_FAILED, yuzu_gw_local_encode_failed).
+
+%% The largest request the server accepts: the receive limit of a stock gRPC
+%% server (4 MiB; no SetMaxReceiveMessageSize override exists on the server). The
+%% gateway edge listener has no cap of its own, so a larger Register or
+%% InventoryReport reaches this module, and the server would answer
+%% RESOURCE_EXHAUSTED before its handler runs. That is a fact about the request,
+%% so encode_request/2 refuses it here as a local encode failure, and
+%% RESOURCE_EXHAUSTED stays a status that counts against the upstream (a server
+%% out of memory or threads answers it too).
+-define(MAX_REQUEST_BYTES, 4194304).
+
+%% The statuses that say the request was wrong, not that the upstream is
+%% unhealthy: INVALID_ARGUMENT (the server's agent id and enrollment field
+%% checks) and FAILED_PRECONDITION (a superseded replay) are the two the server
+%% returns on these RPCs today; NOT_FOUND, ALREADY_EXISTS and OUT_OF_RANGE are
+%% the same class by the gRPC definition (the server never returns them here).
+%% Such an answer proves nothing about the upstream, so it neither fails nor
+%% recovers the breaker (see record_result/2). Every other status counts.
+-define(IS_REQUEST_FAULT(Status), (Status =:= ?GRPC_STATUS_INVALID_ARGUMENT orelse
+                                   Status =:= ?GRPC_STATUS_NOT_FOUND orelse
+                                   Status =:= ?GRPC_STATUS_ALREADY_EXISTS orelse
+                                   Status =:= ?GRPC_STATUS_FAILED_PRECONDITION orelse
+                                   Status =:= ?GRPC_STATUS_OUT_OF_RANGE)).
 
 %% What do_rpc returns. A local_error is an exception raised by the request
 %% encoder in this process: the request never left the gateway.
@@ -1000,6 +1039,13 @@ record_result({ok, _}, State) ->
         {State1, noop} ->
             State1
     end;
+record_result({error, {Status, _Message}}, State) when ?IS_REQUEST_FAULT(Status) ->
+    %% The server answered that the request itself was wrong: a fact about the
+    %% request, not about the upstream. Neither a failure (a caller that sends
+    %% such requests would open the breaker for everyone) nor a success (it would
+    %% reset real failures, and a closed breaker's success after failures
+    %% triggers a replay): the state is untouched.
+    State;
 record_result({error, _}, State) ->
     on_failure(State);
 record_result({local_error, _}, State) ->
@@ -1014,6 +1060,8 @@ record_result({local_error, _}, State) ->
 record_result_no_replay({ok, _}, State) ->
     {State1, _Trigger} = on_success(State),
     State1;
+record_result_no_replay({error, {Status, _Message}}, State) when ?IS_REQUEST_FAULT(Status) ->
+    State;
 record_result_no_replay({error, _}, State) ->
     on_failure(State);
 record_result_no_replay({local_error, _}, State) ->
@@ -1204,6 +1252,17 @@ resolve_probe(_Gen, {local_error, {Class, Why}},
     logger:warning("Evicted held stream status notification for ~s: it cannot be "
                    "encoded (~p:~p); the circuit breaker is not affected",
                    [yuzu_gw_env:log_text(AgentId), Class, Why]),
+    State#state{notify_probe = undefined,
+                notify_pids = maps:remove(Pid, Pids)};
+resolve_probe(_Gen, {error, {Status, _Message}},
+              #state{notify_probe = #{pid := Pid, mref := MonRef},
+                     notify_pids = Pids} = State) when ?IS_REQUEST_FAULT(Status) ->
+    %% The server answered that this notification itself was wrong. Requeueing it
+    %% would be answered the same way by every probe, for ever (the breaker is
+    %% not touched by such an answer, so nothing would slow the loop), so it is
+    %% retired like an answered event. The worker already logged the failure; the
+    %% breaker is left as it is, as for a local encode exception.
+    erlang:demonitor(MonRef, [flush]),
     State#state{notify_probe = undefined,
                 notify_pids = maps:remove(Pid, Pids)};
 resolve_probe(Gen, Result,
@@ -1556,7 +1615,12 @@ do_rpc(Method, Request, Tag, Ctx) ->
 %% raises (a server answer cannot carry it), with the reason redacted, so do_rpc
 %% can tell it from an exception of the client or the transport.
 encode_request(Msg, InputType) ->
-    try gateway_pb:encode_msg(Msg, InputType)
+    try gateway_pb:encode_msg(Msg, InputType) of
+        Bin when byte_size(Bin) > ?MAX_REQUEST_BYTES ->
+            %% Raised from the `of' branch, so the catch below does not see it.
+            erlang:error({?LOCAL_ENCODE_FAILED, error, request_too_large});
+        Bin ->
+            Bin
     catch Class:Why ->
         erlang:error({?LOCAL_ENCODE_FAILED, Class, redact_why(Why)})
     end.

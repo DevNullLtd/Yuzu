@@ -259,7 +259,11 @@ probe_local_exception_test_() ->
       t("a probe that raises for any other reason is a failure: requeued, breaker reopened",
         fun other_probe_exception_is_a_failure/0),
       t("ordinary workers that cannot encode do not touch the breaker or block the rest",
-        fun unencodable_ordinary_worker_does_not_touch_the_breaker/0)
+        fun unencodable_ordinary_worker_does_not_touch_the_breaker/0),
+      t("a probe the server answers as a request fault is retired, the breaker untouched",
+        fun request_fault_probe_is_retired_and_leaves_the_breaker_alone/0),
+      t("a probe the server answers UNAVAILABLE is a failure: requeued, breaker reopened",
+        fun unavailable_probe_is_a_failure/0)
      ]}.
 
 %% cluster_id is stamped on every notification: a configured value that is a
@@ -1643,6 +1647,46 @@ other_probe_exception_is_a_failure() ->
     enter_half_open(),
     {Probe, _} = await_entered(),
     Probe ! {release, {raise, boom}},
+    await_until(fun() -> last_gauge() =:= {1, 0} end),
+    await_dead(Probe),
+    sync(),
+    ?assertEqual({open, 1, 3, 400000}, breaker()),
+    ?assertEqual(1, pending_len()).
+
+%% The server answered that this notification itself was wrong (INVALID_ARGUMENT):
+%% every probe of it would be answered the same way, and such an answer does not
+%% move the breaker, so requeueing it would loop for ever. It is retired, the
+%% breaker is left as the entry into half_open left it, and the next head is
+%% probed at once.
+request_fault_probe_is_retired_and_leaves_the_breaker_alone() ->
+    watch(),
+    trip_breaker(),
+    cast_connected(agent(1)),
+    cast_connected(agent(2)),
+    sync(),
+    enter_half_open(),
+    {First, FirstReq} = await_entered(),
+    ?assertEqual(agent(1), maps:get(agent_id, FirstReq)),
+    First ! {release, {error, {<<"3">>, <<"the request was wrong">>}, #{}}},
+    {Second, SecondReq} = await_entered(),
+    ?assertEqual(agent(2), maps:get(agent_id, SecondReq)),
+    ?assertEqual({half_open, 1, 3, 200000}, breaker()),
+    ?assertEqual(0, pending_len()),
+    ?assertEqual(0, count(?EV_COALESCED)),
+    Second ! release,
+    await_until(fun() -> up_get(cb_state) =:= closed end),
+    await_until(fun() -> last_gauge() =:= {0, 0} end).
+
+%% The over-correction guard of the test above: a status that says the upstream
+%% is unusable is a failure, like the exception case.
+unavailable_probe_is_a_failure() ->
+    watch(),
+    trip_breaker(),
+    cast_connected(agent(1)),
+    sync(),
+    enter_half_open(),
+    {Probe, _} = await_entered(),
+    Probe ! {release, {error, {<<"14">>, <<"unavailable">>}, #{}}},
     await_until(fun() -> last_gauge() =:= {1, 0} end),
     await_dead(Probe),
     sync(),

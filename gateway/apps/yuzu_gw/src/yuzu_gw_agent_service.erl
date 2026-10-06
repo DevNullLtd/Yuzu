@@ -27,11 +27,37 @@
          execute_command/2,
          report_inventory/2]).
 
+%% The bound on a Register's agent id, the same condition the server applies in
+%% GatewayUpstreamServiceImpl::ProxyRegister (and in the direct Register) before
+%% anything else: `info.agent_id().empty() || info.agent_id().size() >
+%% auth::kMaxAgentIdLength' (server/core/src/gateway_service_impl.cpp, the check
+%% under the "agent_id length bound" comment; kMaxAgentIdLength = 256 in
+%% server/core/include/yuzu/server/auth.hpp). Bytes, not characters. The gateway
+%% forwards the agent's RegisterRequest as it is, so without the same bound here
+%% an unauthenticated caller could have the server answer INVALID_ARGUMENT again
+%% and again. A change to the server's constant must change this one.
+-define(MAX_AGENT_ID_BYTES, 256).
+
 %%--------------------------------------------------------------------
 %% Register — proxy to C++ server
 %%--------------------------------------------------------------------
 
 register(Ctx, RegisterReq) ->
+    case check_agent_id(RegisterReq) of
+        ok ->
+            register_checked(Ctx, RegisterReq);
+        {refused, Size} ->
+            %% Answered here, before a reservation and before any upstream call:
+            %% the server would answer the same status, and the gateway used to
+            %% count that answer as a failure of the upstream (see
+            %% ?MAX_AGENT_ID_BYTES). The line carries the size, never the id.
+            logger:warning("Register refused: the agent id is empty or longer than ~b bytes "
+                           "(size ~b bytes)", [?MAX_AGENT_ID_BYTES, Size]),
+            {grpc_error, {?GRPC_STATUS_INVALID_ARGUMENT,
+                          <<"agent_id length exceeds 256 bytes or is empty">>}}
+    end.
+
+register_checked(Ctx, RegisterReq) ->
     Headers = grpcbox_metadata:from_incoming_ctx(Ctx),
     AgentInfo0 = maps:get(info, RegisterReq, maps:get(<<"info">>, RegisterReq, #{})),
     %% Agent supplied, and held in the pending store, logged and sent upstream
@@ -350,6 +376,30 @@ session_limit_error() ->
     {grpc_error, {?GRPC_STATUS_UNAVAILABLE,
                   <<"Too many agent sessions on this connection">>}}.
 
+%% The bound of ?MAX_AGENT_ID_BYTES, on the id as the request carries it, before
+%% any fallback: a missing `info', a missing id and a value that is not a binary
+%% are all "empty" (a request that came off the wire always has the id, <<>> when
+%% the agent sent none; only a hand built request can lack it). Returns the size
+%% to report (0 for a value that is not a binary).
+check_agent_id(RegisterReq) when is_map(RegisterReq) ->
+    Info = maps:get(info, RegisterReq, maps:get(<<"info">>, RegisterReq, #{})),
+    Raw = case is_map(Info) of
+              true  -> maps:get(<<"agent_id">>, Info, maps:get(agent_id, Info, undefined));
+              false -> undefined
+          end,
+    case Raw of
+        Id when is_binary(Id), byte_size(Id) >= 1, byte_size(Id) =< ?MAX_AGENT_ID_BYTES ->
+            ok;
+        Id when is_binary(Id) ->
+            {refused, byte_size(Id)};
+        _NotABinary ->
+            {refused, 0}
+    end;
+check_agent_id(_NotAMap) ->
+    {refused, 0}.
+
+%% The id as a log and registry key once the bound has passed. The fallback is
+%% only reachable for an `info' without the id, which check_agent_id/1 refuses.
 extract_agent_id(AgentInfo) ->
     maps:get(<<"agent_id">>, AgentInfo,
              maps:get(agent_id, AgentInfo, <<"unknown">>)).
