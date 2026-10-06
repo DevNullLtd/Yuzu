@@ -20,24 +20,19 @@ on:
   push:
     branches: [main, dev]
     tags-ignore: ['v*']
-    # BR-010: expressed as a `paths` ALLOW-list (not `paths-ignore`) precisely
-    # so docs/os-capability-matrix.md can be re-included after the docs
-    # exclusion. GitHub honours a trailing `!`-negation only in `paths`
-    # (last-match-wins); the same trick in `paths-ignore` is a silent no-op,
-    # which is why the earlier carve-out did nothing. `**` matches everything,
-    # the negations then re-exclude the ignore set, and the final positive
-    # pattern re-includes ONLY the generated matrix (whose drift gate must run
-    # on a push that touches just that file). Its generator/plugins/scripts are
-    # not in the ignore set, so they already trigger.
-    paths:
-      - '**'
-      - '!docs/**'
-      - '!*.md'
-      - '!LICENSE'
-      - '!.gitignore'
-      - '!.github/runner-inventory.json'
-      - '!.github/workflows/runner-inventory-sentinel.yml'
-      - 'docs/os-capability-matrix.md'
+    # No `paths` filter here either (#5320), for the same reason as
+    # pull_request below (#1978). The push trigger used to carry a docs `paths`
+    # allow-list on the reasoning that "post-merge docs pushes need no build and
+    # gate nothing" — but a release commit is often changelog-only, and with no
+    # run on it the six required contexts never appeared on the commit the
+    # release tags (v0.14.0's 50a81af91). Now every push runs, and preflight's
+    # `code_changed` output skips the heavy build jobs when the push changed
+    # only the docs set, exactly as on a PR; the build legs' required names then
+    # come from the `docs-required-checks` stub. That skip is fail-closed and
+    # additionally requires the previous commit's push run to have succeeded,
+    # so a docs push never stands in for an unbuilt or red code commit (see the
+    # codegate step). A push touching docs/os-capability-matrix.md still builds
+    # and runs its drift gate (BR-010): the classifier carves it out of docs.
   pull_request:
     branches: [main, dev]
     # No paths-ignore here (issue #1978). Filtering this whole workflow out
@@ -47,8 +42,8 @@ on:
     # (they had to be admin-bypassed). Instead the workflow always runs and
     # the `preflight` job's `code_changed` output gates the heavy build jobs:
     # a docs-only PR skips them, and a *skipped* required check is satisfied
-    # whereas an *absent* one is not. The `push:` trigger above keeps its
-    # paths-ignore — post-merge docs pushes need no build and gate nothing.
+    # whereas an *absent* one is not. The `push:` trigger above now does the
+    # same (#5320).
   workflow_call:
     inputs:
       pr_number:
@@ -294,9 +289,12 @@ jobs:
     # Job-level permissions REPLACE the workflow default (contents: read), so
     # both are listed. pull-requests: read is required by the code-vs-docs gate
     # below, which lists the PR's changed files via the REST API (issue #1978).
+    # actions: read is for the same gate's push arm (#5320), which reads the
+    # previous commit's ci.yml push run before it may skip the build.
     permissions:
       contents: read
       pull-requests: read
+      actions: read
     outputs:
       # Pool gate for the [self-hosted, Linux, X64] jobs (proto-compat, linux):
       # true iff >=1 eligible Linux runner (any yuzu-bigtam-* OR the yuzu-wsl2-linux
@@ -314,11 +312,13 @@ jobs:
       yuzu_wsl2_linux_healthy: ${{ steps.health.outputs.yuzu_wsl2_linux_healthy }}
       yuzu_local_windows_healthy: ${{ steps.health.outputs.yuzu_local_windows_healthy }}
       all_healthy: ${{ steps.health.outputs.all_healthy }}
-      # code_changed (issue #1978): false iff every changed file in a PR is in
-      # the docs/ignore set the pull_request trigger used to carry. Gates the
-      # heavy build jobs (proto-compat, linux, windows, macos) so a docs-only
-      # PR skips them instead of blocking forever on absent required checks.
-      # Always true for non-PR events (push / workflow_dispatch build always).
+      # code_changed (issue #1978): false iff every changed file in a PR, or
+      # in a push to main/dev (#5320), is in the docs-only set
+      # (scripts/ci/detect-code-change.sh). Gates the heavy build jobs
+      # (proto-compat, linux, windows, macos) so a docs-only change skips them
+      # instead of leaving required checks absent. A push additionally needs
+      # the previous commit's push run to have succeeded. Always true for any
+      # other event (workflow_call / trusted-fork builds always).
       code_changed: ${{ steps.codegate.outputs.code_changed }}
       checkout_repository: ${{ needs.trusted_inputs.outputs.checkout_repository }}
       checkout_ref: ${{ needs.trusted_inputs.outputs.checkout_ref }}
@@ -334,37 +334,117 @@ jobs:
           ref: ${{ github.workflow_sha }}
           persist-credentials: false
 
-      # ── Docs-only vs code gate (issue #1978) ───────────────────────────
-      # Decide whether the heavy build matrix runs for this PR. The
+      # ── Docs-only vs code gate (issue #1978, push arm #5320) ────────────
+      # Decide whether the heavy build matrix runs for this PR or push. The
       # classification (which paths count as docs-only, the 3000-file API-cap
       # truncation guard) lives in scripts/ci/detect-code-change.sh and is
-      # covered by tests/shell/test_detect_code_change.sh. Fail-closed
-      # throughout: a non-PR event, an API/permission failure, an empty list,
-      # or a truncated list all build rather than silently skip.
+      # covered by tests/shell/test_detect_code_change.sh; this step's own
+      # branches are executed by tests/shell/test_codegate_push.sh. Fail-closed
+      # throughout: an API/permission failure, an empty list, or a truncated
+      # list all build rather than silently skip.
       - name: Determine code-vs-docs change set (docs-only gate)
         id: codegate
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
         run: |
+          build() {
+            echo "code_changed=true" >> "$GITHUB_OUTPUT"
+            echo "$1"
+            exit 0
+          }
+          # ── Push to main/dev (#5320) ──────────────────────────────────────
+          # A docs-only push skips the build like a docs-only PR, so the
+          # required contexts still appear on the commit (the release tag gate
+          # needs them). Two conditions, both fail-closed:
+          #  1. The previous tip's ci.yml push run on this branch SUCCEEDED.
+          #     Without this, a docs push could stand in for an unbuilt code
+          #     commit: a newer pending run in this workflow's concurrency group
+          #     cancels an older pending one, so a code push still waiting
+          #     behind a running build is cancelled by a docs push arriving
+          #     next, and the code would never be built. Likewise a red code
+          #     commit followed by a docs commit must not turn green. By
+          #     induction a docs-only skip only ever follows a green build.
+          #  2. Every path between the previous tip and this commit is in the
+          #     docs-only set. Renames contribute both names, so moving a file
+          #     out of code into docs/ still builds.
+          if [[ "$GITHUB_EVENT_NAME" == "push" ]]; then
+            if [[ ! "$PUSH_BEFORE_SHA" =~ ^[0-9a-f]{40}$ || "$PUSH_BEFORE_SHA" =~ ^0{40}$ ]]; then
+              build "Push with no usable previous tip ('$PUSH_BEFORE_SHA') — building (fail-closed)."
+            fi
+            if ! prev=$(gh api -X GET "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs" \
+                  -f head_sha="$PUSH_BEFORE_SHA" -f event=push -f branch="$GITHUB_REF_NAME" -f per_page=100 \
+                  --jq '[.workflow_runs[]] | max_by(.run_number) | .conclusion // "none"'); then
+              build "Workflow-runs API failed — building to be safe (fail-closed)."
+            fi
+            if [[ "$prev" != "success" ]]; then
+              build "Previous tip $PUSH_BEFORE_SHA has no successful ci.yml push run on $GITHUB_REF_NAME (latest: '$prev') — building."
+            fi
+            cmp_json="$RUNNER_TEMP/codegate-compare.json"
+            if ! gh api -X GET "repos/$GITHUB_REPOSITORY/compare/${PUSH_BEFORE_SHA}...${GITHUB_SHA}" \
+                  -f per_page=1 > "$cmp_json"; then
+              build "Compare API failed — building to be safe (fail-closed)."
+            fi
+            # ahead = the previous tip is an ancestor, so the three-dot compare
+            # is exactly previous-tip..this-commit. Anything else (a force push)
+            # builds.
+            if [[ "$(jq -r '.status' "$cmp_json")" != "ahead" ]]; then
+              build "Push is not a fast-forward of $PUSH_BEFORE_SHA — building."
+            fi
+            # The compare API lists at most 300 files; at the cap the list may be
+            # truncated, so build. An empty list is missing evidence (and an
+            # empty commit is the usual way to re-trigger CI), so build too.
+            if ! nfiles=$(jq '.files // [] | length' "$cmp_json") || (( nfiles == 0 || nfiles >= 300 )); then
+              build "Compare lists ${nfiles:-?} files (empty, or the 300-file API cap) — building (fail-closed)."
+            fi
+            # A path with a control character (a newline, say) would be split
+            # into several lines below and could pass as docs; build instead.
+            # A jq error here builds too.
+            if ! ncntrl=$(jq '[.files[] | .filename, (.previous_filename // empty) | select(test("[[:cntrl:]]"))] | length' "$cmp_json") \
+                || [[ ! "$ncntrl" =~ ^[0-9]+$ ]] || (( ncntrl > 0 )); then
+              build "A changed path contains a control character, or the path list could not be read — building (fail-closed)."
+            fi
+            if ! files=$(jq -r '.files[] | .filename, (.previous_filename // empty)' "$cmp_json"); then
+              build "Could not read the compare file list — building (fail-closed)."
+            fi
+            echo "Changed paths since $PUSH_BEFORE_SHA (previous run: success):"
+            printf '%s\n' "$files"
+            if ! code_changed=$(printf '%s\n' "$files" | bash scripts/ci/detect-code-change.sh); then
+              build "Classifier errored — building to be safe (fail-closed)."
+            fi
+            echo "code_changed=$code_changed" >> "$GITHUB_OUTPUT"
+            echo "Result: code_changed=$code_changed"
+            if [[ "$code_changed" == "false" ]]; then
+              echo "Docs-only push (#5320): build skipped. Predecessor $PUSH_BEFORE_SHA push run: success. 'Linux gcc-15 debug' / 'Windows MSVC debug' / 'macOS debug' on $GITHUB_SHA are stubs, not builds." >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+            fi
+            exit 0
+          fi
           if [[ "${{ github.event_name }}" != "pull_request" ]]; then
             echo "code_changed=true" >> "$GITHUB_OUTPUT"
             echo "Non-PR event (${{ github.event_name }}) — building unconditionally."
             exit 0
           fi
           # Fail-closed on any API/permission failure: build rather than block.
-          if ! files=$(gh api --paginate \
-                "repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/files" \
-                --jq '.[].filename'); then
-            echo "code_changed=true" >> "$GITHUB_OUTPUT"
-            echo "PR files API failed — building to be safe (fail-closed)."
-            exit 0
+          # The JSON is captured once and read twice: the file names (one line
+          # per file, so the changed_files total check below stays exact) and
+          # the renames' previous names.
+          pr_json="$RUNNER_TEMP/codegate-pr-files.json"
+          if ! gh api --paginate "repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/files" > "$pr_json"; then
+            build "PR files API failed — building to be safe (fail-closed)."
           fi
+          # jq reads the concatenated per-page arrays --paginate emits as a stream.
+          # A path with a control character (a newline, say) would be split into
+          # several lines and could pass as docs; build instead (a jq error too).
+          if ! ncntrl=$(jq -n '[inputs[] | .filename, (.previous_filename // empty) | select(test("[[:cntrl:]]"))] | length' "$pr_json") \
+              || [[ ! "$ncntrl" =~ ^[0-9]+$ ]] || (( ncntrl > 0 )); then
+            build "A changed path contains a control character, or the PR file list could not be read — building (fail-closed)."
+          fi
+          files=$(jq -r '.[].filename' "$pr_json") || build "Could not read the PR file list — building (fail-closed)."
+          prev=$(jq -r '.[] | .previous_filename // empty' "$pr_json") || build "Could not read the PR rename list — building (fail-closed)."
           echo "Changed files in PR #${{ github.event.pull_request.number }}:"
           printf '%s\n' "$files"
           if [[ -z "$files" ]]; then
-            echo "code_changed=true" >> "$GITHUB_OUTPUT"
-            echo "Empty changed-file list — building to be safe (fail-closed)."
-            exit 0
+            build "Empty changed-file list — building to be safe (fail-closed)."
           fi
           # changed_files is the authoritative total; the script fails closed if
           # the API list is shorter (truncated past the 3000-file cap). Wrap the
@@ -372,9 +452,18 @@ jobs:
           # PR), independent of the runner's default shell error mode.
           if ! code_changed=$(printf '%s\n' "$files" \
                 | bash scripts/ci/detect-code-change.sh "${{ github.event.pull_request.changed_files }}"); then
-            echo "code_changed=true" >> "$GITHUB_OUTPUT"
-            echo "Classifier errored — building to be safe (fail-closed)."
-            exit 0
+            build "Classifier errored — building to be safe (fail-closed)."
+          fi
+          if [[ "$code_changed" == "false" && -n "$prev" ]]; then
+            # A rename's previous path counts too (moving server/x.cpp to docs/ must still build).
+            # No TOTAL here: the total check above already covered the file list.
+            if ! prev_changed=$(printf '%s\n' "$prev" | bash scripts/ci/detect-code-change.sh); then
+              build "Classifier errored on rename sources — building (fail-closed)."
+            fi
+            if [[ "$prev_changed" == "true" ]]; then
+              echo "A rename's previous path is code-side — building."
+              code_changed=true
+            fi
           fi
           echo "code_changed=$code_changed" >> "$GITHUB_OUTPUT"
           echo "Result: code_changed=$code_changed"
@@ -442,6 +531,9 @@ jobs:
         run: |
           bash tests/shell/test_check_compose_versions.sh
           bash tests/shell/test_detect_code_change.sh   # docs-only gate classifier (#1978)
+          bash tests/shell/test_codegate_push.sh        # docs-only gate's push + PR arms (#5320)
+          bash tests/shell/test_release_guard.sh        # release.yml re-publish guard (#5282)
+          bash tests/shell/test_release_tag_sha.sh      # release.yml per-push tag recheck (#5282)
           python3 scripts/ci/test_runner_health_check.py
           bash tests/shell/test_review_driver_substitution.sh  # patsub_replacement prompt corruption (#2644)
           bash tests/shell/test_trusted_inputs_validate.sh    # the step that picks the BUILD COMMIT (#2832)
@@ -2280,8 +2372,14 @@ jobs:
   # proto-compat is a NON-matrix job: its skipped run reports "Proto
   # backward-compat: skipped", which already satisfies the required check, so
   # it needs no stub. preflight always runs; "CHANGELOG order" (docs-lint.yml)
-  # runs on every PR. Together that satisfies all six required contexts on a
-  # docs-only PR without a build.
+  # runs on every PR and every push to main/dev. Together that satisfies all
+  # six required contexts on a docs-only PR without a build.
+  #
+  # Since #5320 the same holds for a docs-only PUSH to main/dev, so the commit a
+  # release tags carries every required context even when it changed only
+  # CHANGELOG.md. On a push the real matrix has more legs (release builds,
+  # clang-21); only the three required names are stubbed, because only they
+  # gate anything.
   docs-required-checks:
     name: ${{ matrix.check }}
     needs: [preflight]
@@ -2299,12 +2397,20 @@ jobs:
           - "Windows MSVC debug"
           - "macOS debug"
     steps:
-      - name: Satisfy required check (docs-only PR — no build)
+      - name: Satisfy required check (docs-only change — no build)
         run: |
-          echo "Docs-only PR (#1978): '${{ matrix.check }}' is not built."
-          echo "This stub emits the required check name as success so the PR is"
-          echo "not blocked on an absent matrix context. Any PR that touches"
+          echo "Docs-only ${GITHUB_EVENT_NAME} (#1978/#5320): '${{ matrix.check }}' is not built."
+          echo "This stub emits the required check name as success so the change is"
+          echo "not blocked on an absent matrix context. Any PR or push that touches"
           echo "code runs the real '${{ matrix.check }}' build instead."
+          # Say so on the run page too: `success` on this name means "inherited",
+          # not "built".
+          if [[ "$GITHUB_EVENT_NAME" == "push" ]]; then
+            why="docs-only push (#1978/#5320). This context is a stub: the result is inherited from the predecessor commit, whose push run succeeded."
+          else
+            why="docs-only ${GITHUB_EVENT_NAME}: the change touches only docs (#1978/#5320). This context is a stub, not a build."
+          fi
+          echo "**${{ matrix.check }}: not built** — $why" >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
 
   # ── CI canary (PR-8 of overhaul plan) ─────────────────────────────────
   # Detects whether a PR (or a push to main) touches CI infrastructure
