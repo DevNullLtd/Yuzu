@@ -32,9 +32,17 @@
 %%%   backoff, and it goes back to the head. So every payload field an agent
 %%%   controls must be made safe at admission (yuzu_gw_peer_addr, applied in the
 %%%   notify_stream_status cast handler and where the Register call reads the
-%%%   :authority header). The peer address is the only such field today: the
-%%%   agent id is bounded and checked by the server before a session exists, the
-%%%   session id is minted by the server, the rest is gateway configuration.
+%%%   :authority header). The peer address is the only such field the gateway
+%%%   sanitises: the agent id is bounded and checked by the server before a
+%%%   session exists, the session id is minted by the server, the rest is gateway
+%%%   configuration (cluster_id is converted to UTF-8 at boot).
+%%%   The general rule behind it: a LOCAL encode exception (the request could not
+%%%   be encoded, so it never left the gateway) says nothing about the upstream,
+%%%   so it never feeds the circuit breaker, as neither a success nor a failure.
+%%%   do_rpc returns it as {local_error, {Class, Why}}, a shape no server answer
+%%%   can take. A held notification that is the probe and fails that way can
+%%%   never encode, so it is evicted with a warning (not requeued) and the next
+%%%   head is probed at once; every other failure still requeues it.
 %%%
 %%% The half_open probe (#4632):
 %%%   Held entries are not sent while the breaker is open. When it goes half_open
@@ -52,10 +60,13 @@
 %%%       store (a newer event for the same key that arrived meanwhile wins and
 %%%       the old one is dropped, counted as notify_coalesced). One slot is held
 %%%       back from the cap while a probe is out, so that the give-back always
-%%%       fits.
+%%%       fits. On a local encode exception the event is evicted instead (a
+%%%       warning names the agent and the reason), it is neither retired as sent
+%%%       nor given back, and the breaker is not touched.
 %%%     - The breaker is moved only when it is still half_open under the SAME
 %%%       generation: ok closes it (and casts the replay), error reopens it with
-%%%       doubled backoff. In any other state or generation the result does not
+%%%       doubled backoff (a local encode exception does neither). In any other
+%%%       state or generation the result does not
 %%%       touch the breaker (a call path RPC may have closed or reopened it
 %%%       meanwhile; a breaker that is open has no on_success or on_failure).
 %%%     - A probe worker that dies without a result is an error (worker_down),
@@ -173,6 +184,14 @@
 %% CommandRequest.dispatch_tag = 9 and forwards it untouched. See
 %% encode_command_request/1 in yuzu_gw_proto.erl for the forwarding half.
 -define(WIRE_CAP_DISPATCH_TAG_V1, <<"command_dispatch_tag_v1">>).
+
+%% The tag of the exception encode_request/2 raises: the request could not be
+%% encoded in this process (see do_rpc/4).
+-define(LOCAL_ENCODE_FAILED, yuzu_gw_local_encode_failed).
+
+%% What do_rpc returns. A local_error is an exception raised by the request
+%% encoder in this process: the request never left the gateway.
+-type rpc_result() :: {ok, term()} | {error, term()} | {local_error, {atom(), term()}}.
 
 -type notify_probe() :: #{pid   := pid(),
                           mref  := reference(),
@@ -362,7 +381,7 @@ handle_call({proxy_register, RegisterReq}, _From, State) ->
             Before = notify_counts(State1),
             Result = do_rpc('ProxyRegister', RegisterReq, register),
             State2 = drain(record_result(Result, State1)),
-            {reply, Result, report_notify_counts(Before, State2)}
+            {reply, public_result(Result), report_notify_counts(Before, State2)}
     end;
 
 handle_call({proxy_inventory, InventoryReport}, _From, State) ->
@@ -373,7 +392,7 @@ handle_call({proxy_inventory, InventoryReport}, _From, State) ->
             Before = notify_counts(State1),
             Result = do_rpc('ProxyInventory', InventoryReport, inventory),
             State2 = drain(record_result(Result, State1)),
-            {reply, Result, report_notify_counts(Before, State2)}
+            {reply, public_result(Result), report_notify_counts(Before, State2)}
     end;
 
 handle_call(_Request, _From, State) ->
@@ -469,7 +488,8 @@ handle_cast({forward_guardian_message, AgentId, ResponseFrame},
                                       #{count => 1}, #{}),
                     Request = #{agent_id => AgentId, response => ResponseFrame},
                     {Pid, _MonRef} = spawn_monitor(fun() ->
-                        case do_rpc('ForwardGuardianMessage', Request, guardian) of
+                        case public_result(do_rpc('ForwardGuardianMessage', Request,
+                                                  guardian)) of
                             {ok, _} -> ok;
                             {error, Reason} ->
                                 logger:warning("Failed to forward guardian message for ~s: ~p",
@@ -715,6 +735,14 @@ do_replay_one(AgentId, Pid, SessionId, RegisterReq, QueueDepth, State) ->
     Result = do_rpc_replay('ProxyRegister', RegisterReq, register, SessionId),
     NewState =
         case Result of
+            {local_error, {Class, Why}} ->
+                %% The stored request could not be encoded here, so nothing was
+                %% sent: no verdict about the upstream, the breaker is not
+                %% touched (record_result_no_replay/2 ignores it).
+                logger:warning("Registration replay: ~s could not be encoded (~p:~p); "
+                               "skipped without touching the circuit breaker",
+                               [yuzu_gw_env:log_text(AgentId), Class, Why]),
+                record_result_no_replay(Result, State);
             {ok, #{accepted := false} = Response} ->
                 %% The server answered OK but did not install the session
                 %% (RegisterResponse.accepted = false, e.g. a rejected
@@ -952,7 +980,11 @@ record_result({ok, _}, State) ->
             State1
     end;
 record_result({error, _}, State) ->
-    on_failure(State).
+    on_failure(State);
+record_result({local_error, _}, State) ->
+    %% The request could not be encoded here and never left the gateway: not a
+    %% fact about the upstream, so neither a success nor a failure.
+    State.
 
 %% @doc Like record_result/2 but never triggers a registration replay.
 %% Used by the replay drip itself: a replay RPC must still advance the
@@ -962,7 +994,9 @@ record_result_no_replay({ok, _}, State) ->
     {State1, _Trigger} = on_success(State),
     State1;
 record_result_no_replay({error, _}, State) ->
-    on_failure(State).
+    on_failure(State);
+record_result_no_replay({local_error, _}, State) ->
+    State.
 
 %% @doc Returns {NewState, replay | noop}. `replay' means an RPC just
 %% succeeded after one or more failures — treat it as a reconnect.
@@ -1073,7 +1107,8 @@ drain(#state{cb_state = closed, notify_pids = Pids, notify_pending = Pending,
                     State;
                 {_Key, {AgentId, Notification}, Pending1} ->
                     {Pid, _MonRef} = spawn_monitor(fun() ->
-                        case do_rpc('NotifyStreamStatus', Notification, notify_stream) of
+                        case public_result(do_rpc('NotifyStreamStatus', Notification,
+                                                  notify_stream)) of
                             {ok, _} -> ok;
                             {error, Reason} ->
                                 logger:warning("Failed to notify stream status for ~s: ~p",
@@ -1102,7 +1137,10 @@ drain(#state{cb_state = half_open, notify_probe = undefined, notify_pids = Pids,
                     {ok, _} -> ok;
                     {error, Reason} ->
                         logger:warning("Failed to notify stream status for ~s: ~p",
-                                       [AgentId, Reason])
+                                       [AgentId, Reason]);
+                    {local_error, _} ->
+                        %% Logged once, by resolve_probe/3, when it evicts the event.
+                        ok
                 end,
                 Server ! {notify_probe_result, self(), Gen, Result}
             end),
@@ -1122,11 +1160,28 @@ drain(State) ->
 %% (the reserved slot guarantees it fits; a newer event for the same key wins and
 %% the old one is dropped and counted).
 %%
+%% A local encode exception ({local_error, _}) evicts the event instead and
+%% leaves the breaker untouched (the first clause).
+%%
 %% The breaker: moved only when it is still half_open AND Gen is the generation
 %% now current. In any other state the result is stale (a call path RPC closed or
 %% reopened the breaker meanwhile, or it went half_open again): the breaker is
 %% not touched, and on_success/on_failure have no clause for an open breaker.
--spec resolve_probe(non_neg_integer(), {ok, term()} | {error, term()}, #state{}) -> #state{}.
+-spec resolve_probe(non_neg_integer(), rpc_result(), #state{}) -> #state{}.
+resolve_probe(_Gen, {local_error, {Class, Why}},
+              #state{notify_probe = #{pid := Pid, mref := MonRef, event := {AgentId, _}},
+                     notify_pids = Pids} = State) ->
+    %% The head held entry could not be encoded here, and the same payload fails
+    %% the same way on every probe: requeueing it would reopen the breaker for
+    %% ever. Evict it, once, and leave the breaker alone (it is not a fact about
+    %% the upstream); the caller's drain/1 then probes the next head at once. The
+    %% failure is already counted by rpc_errors_total{code="exception"}.
+    erlang:demonitor(MonRef, [flush]),
+    logger:warning("Evicted held stream status notification for ~s: it cannot be "
+                   "encoded (~p:~p); the circuit breaker is not affected",
+                   [yuzu_gw_env:log_text(AgentId), Class, Why]),
+    State#state{notify_probe = undefined,
+                notify_pids = maps:remove(Pid, Pids)};
 resolve_probe(Gen, Result,
               #state{notify_probe = #{pid := Pid, mref := MonRef, key := Key, event := Event},
                      notify_pids = Pids, notify_pending = Pending,
@@ -1343,6 +1398,7 @@ rpc_types('NotifyStreamStatus') -> {'yuzu.gateway.v1.StreamStatusNotification',
 rpc_types('ForwardGuardianMessage') -> {'yuzu.gateway.v1.ForwardGuardianRequest',
                                         'yuzu.gateway.v1.ForwardGuardianAck'}.
 
+-spec do_rpc(atom(), map(), atom()) -> rpc_result().
 do_rpc(Method, Request, Tag) ->
     do_rpc(Method, Request, Tag, ctx:background()).
 
@@ -1361,12 +1417,13 @@ do_rpc_replay(Method, Request, Tag, SessionId) when is_binary(SessionId), Sessio
 do_rpc_replay(Method, Request, Tag, _SessionId) ->
     do_rpc(Method, Request, Tag, ctx:background()).
 
+-spec do_rpc(atom(), map(), atom(), term()) -> rpc_result().
 do_rpc(Method, Request, Tag, Ctx) ->
     {InputType, OutputType} = rpc_types(Method),
     Def = #grpcbox_def{
         service       = 'yuzu.gateway.v1.GatewayUpstream',
         message_type  = atom_to_binary(InputType, utf8),
-        marshal_fun   = fun(Msg) -> gateway_pb:encode_msg(Msg, InputType) end,
+        marshal_fun   = fun(Msg) -> encode_request(Msg, InputType) end,
         unmarshal_fun = fun(Bin) -> gateway_pb:decode_msg(Bin, OutputType) end
     },
     Path = <<"/yuzu.gateway.v1.GatewayUpstream/", (atom_to_binary(Method, utf8))/binary>>,
@@ -1378,19 +1435,26 @@ do_rpc(Method, Request, Tag, Ctx) ->
                  %% argument list (the request, with its credentials) in the
                  %% crash report if this exception reaches the gen_server.
                  %% Only the class and the redacted reason are kept.
+                 error:{?LOCAL_ENCODE_FAILED, Class, Why} ->
+                     %% Raised by encode_request/2 below, with the reason already
+                     %% redacted: the request never left this process.
+                     {rpc_exception, local, Class, Why};
                  Class:Why ->
-                     {rpc_exception, Class, redact_why(Why)}
+                     {rpc_exception, remote, Class, redact_why(Why)}
              end,
     Duration = erlang:monotonic_time(millisecond) - StartTime,
     case Result of
-        {rpc_exception, Class1, Why1} ->
+        {rpc_exception, Origin, Class1, Why1} ->
             telemetry:execute([yuzu, gw, upstream, rpc_error],
                               #{count => 1},
                               #{rpc_name => atom_to_binary(Tag, utf8),
                                 code => <<"exception">>}),
             logger:warning("Upstream RPC ~s raised ~p:~p", [Method, Class1, Why1]),
-            {error, {internal, iolist_to_binary(
-                                 io_lib:format("rpc exception ~p:~p", [Class1, Why1]))}};
+            case Origin of
+                %% Never reaches the breaker (record_result/2 ignores it).
+                local  -> {local_error, {Class1, Why1}};
+                remote -> {error, exception_reason(Class1, Why1)}
+            end;
         {ok, Response, _Headers} ->
             telemetry:execute([yuzu, gw, upstream, rpc_latency],
                               #{duration_ms => Duration},
@@ -1461,6 +1525,30 @@ do_rpc(Method, Request, Tag, Ctx) ->
                                 code => Reason}),
             {error, {internal, iolist_to_binary(io_lib:format("~p", [Reason]))}}
     end.
+
+%% The request encoder handed to the gRPC client. grpcbox runs it in the calling
+%% process, after a connection was obtained and before anything is sent, so an
+%% exception from it is local: it is re-raised under a tag only this module
+%% raises (a server answer cannot carry it), with the reason redacted, so do_rpc
+%% can tell it from an exception of the client or the transport.
+encode_request(Msg, InputType) ->
+    try gateway_pb:encode_msg(Msg, InputType)
+    catch Class:Why ->
+        erlang:error({?LOCAL_ENCODE_FAILED, Class, redact_why(Why)})
+    end.
+
+%% @doc The result as the callers of proxy_register/1 and proxy_inventory/1 and
+%% the log lines of the workers see it: a local encode exception reads as the
+%% same `{error, {internal, <<"rpc exception ...">>}}' as before. Only the breaker
+%% bookkeeping tells them apart.
+-spec public_result(rpc_result()) -> {ok, term()} | {error, term()}.
+public_result({local_error, {Class, Why}}) ->
+    {error, exception_reason(Class, Why)};
+public_result(Result) ->
+    Result.
+
+exception_reason(Class, Why) ->
+    {internal, iolist_to_binary(io_lib:format("rpc exception ~p:~p", [Class, Why]))}.
 
 %% @private Classify whether an upstream transport error is a TLS handshake
 %% failure, returning {true, KindBin} (the alert/cause, for the metric label) or
