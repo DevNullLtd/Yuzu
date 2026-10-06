@@ -87,6 +87,8 @@ closed_test_() ->
         fun coalescing_keeps_the_latest_event/0),
       t("two sessions of one agent are both kept and sent in order",
         fun two_sessions_of_one_agent_are_both_kept/0),
+      t("the peer address is made safe at admission: capped, replaced when invalid, else unchanged",
+        fun peer_addr_is_sanitised_at_admission/0),
       t("an open circuit holds notifications; a half_open probe that succeeds drains them in order",
         fun open_circuit_holds_then_close_drains_in_order/0),
       t("a half_open circuit sends one held notification as the probe and holds the rest",
@@ -505,6 +507,16 @@ two_sessions_of_one_agent_are_both_kept() ->
     ?assertEqual([<<"session-one">>, <<"session-two">>],
                  [maps:get(session_id, First), maps:get(session_id, Second)]),
     ?assertEqual([Agent, Agent], [maps:get(agent_id, First), maps:get(agent_id, Second)]).
+
+peer_addr_is_sanitised_at_admission() ->
+    watch(),
+    Cases = [{<<"p-long">>, binary:copy(<<"a">>, 5000), binary:copy(<<"a">>, 255)},
+             {<<"p-bad">>, ?POISON_PEER, <<"invalid">>},
+             {<<"p-ok">>, <<"gateway.example:443">>, <<"gateway.example:443">>}],
+    [cast_status(Id, <<"sess">>, Peer) || {Id, Peer, _} <- Cases],
+    Entered = await_entered(length(Cases)),
+    Got = maps:from_list([{maps:get(agent_id, R), maps:get(peer_addr, R)} || {_, R} <- Entered]),
+    ?assertEqual(maps:from_list([{Id, Want} || {Id, _, Want} <- Cases]), Got).
 
 cap_drops_overflow_and_never_a_replacement() ->
     watch(),

@@ -24,6 +24,16 @@
 %%%   one of the ten slots is held back, so a backlog that refills every freed
 %%%   slot cannot keep the replay drip waiting until the backlog is empty.
 %%%
+%%% Standing invariant (#4632): the head held notification is the breaker probe.
+%%%   A notification that fails deterministically for its own payload would block
+%%%   the whole queue: it fails every probe, the breaker reopens with a longer
+%%%   backoff, and it goes back to the head. So every payload field an agent
+%%%   controls must be made safe at admission (yuzu_gw_peer_addr, applied in the
+%%%   notify_stream_status cast handler and where the Register call reads the
+%%%   :authority header). The peer address is the only such field today: the
+%%%   agent id is bounded and checked by the server before a session exists, the
+%%%   session id is minted by the server, the rest is gateway configuration.
+%%%
 %%% The half_open probe (#4632):
 %%%   Held entries are not sent while the breaker is open. When it goes half_open
 %%%   (and when work first arrives while it is half_open) the HEAD held entry is
@@ -365,10 +375,14 @@ handle_call({proxy_inventory, InventoryReport}, _From, State) ->
 handle_call(_Request, _From, State) ->
     {reply, {error, unknown_call}, State}.
 
-handle_cast({notify_stream_status, AgentId, SessionId, Event, PeerAddr, StreamHomeId},
+handle_cast({notify_stream_status, AgentId, SessionId, Event, PeerAddr0, StreamHomeId},
             #state{notify_pending = Pending, notify_probe = Probe,
                    cluster_id = ClusterId} = State) ->
     Before = notify_counts(State),
+    %% The peer address is agent supplied: make it encodable and bounded before
+    %% anything is built from it, so the held notification can never fail the
+    %% same way on every send (see the standing invariant in the module header).
+    PeerAddr = sanitize_peer_addr(AgentId, PeerAddr0),
     Notification = #{
         agent_id     => AgentId,
         session_id   => ensure_binary(SessionId),
@@ -1008,6 +1022,24 @@ cancel_timer(TRef) -> erlang:cancel_timer(TRef).
 %%%===================================================================
 %%% Pending stream-status notifications (#4632)
 %%%===================================================================
+
+%% @doc The peer address of a notification, made safe by yuzu_gw_peer_addr. A
+%% change is logged at debug level with the agent id and the original size only,
+%% never the value itself.
+-spec sanitize_peer_addr(binary(), term()) -> binary().
+sanitize_peer_addr(AgentId, PeerAddr0) ->
+    case yuzu_gw_peer_addr:sanitize(PeerAddr0) of
+        PeerAddr0 ->
+            PeerAddr0;
+        PeerAddr ->
+            logger:debug("Stream status notification for ~s: peer address replaced "
+                         "(original size ~b bytes)",
+                         [AgentId, peer_addr_size(PeerAddr0)]),
+            PeerAddr
+    end.
+
+peer_addr_size(Addr) when is_binary(Addr) -> byte_size(Addr);
+peer_addr_size(_Addr) -> 0.
 
 %% @doc Send held notifications, first in first out, subject to the breaker.
 %% Closed: drain up to the notify budget. Open: nothing is sent, every entry

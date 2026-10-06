@@ -33,8 +33,11 @@
 
 register(Ctx, RegisterReq) ->
     Headers = grpcbox_metadata:from_incoming_ctx(Ctx),
-    PeerAddr = maps:get(<<":authority">>, Headers,
-                        maps:get(<<"x-forwarded-for">>, Headers, <<"unknown">>)),
+    %% Agent supplied, and held in the pending store, logged and sent upstream
+    %% later: sanitised here, at the source (see yuzu_gw_peer_addr).
+    PeerAddr = yuzu_gw_peer_addr:sanitize(
+                 maps:get(<<":authority">>, Headers,
+                          maps:get(<<"x-forwarded-for">>, Headers, <<"unknown">>))),
 
     %% A slot on the connection is RESERVED before the registration goes
     %% upstream: the check and the claim are one step in the registry, so
