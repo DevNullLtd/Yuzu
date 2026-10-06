@@ -370,6 +370,13 @@ endpoint are planned, not yet designed in detail — there is no `seed_kill_swit
 equivalent) anywhere in this tree today. Until it lands, `Forensics` exists as authorization
 infrastructure only.
 
+> **Amendment pending: ADR-3008 (application and hardware performance in DEX, proposed
+> 2026-10-06).** ADR-3008 sets the direction that usage figures which name no device, along
+> dimensions that no reader can change without also holding the forensic permission, become
+> readable at the DEX permission, which more roles hold than `Forensics:Read`. Per-device usage
+> reads keep `Forensics:Read` and their audit. Nothing has changed in the product yet: until the
+> work that follows ADR-3008 lands, this section describes what ships.
+
 **Wave 7 PR7b: application usage is the first live `Forensics` consumer, not `execution_artifacts`.**
 The `app_usage` plugin's dedicated read surface (single-target, `Forensics:Read`) is the first row
 to actually classify anything `Forensics` — application usage history (TAR's `usage_live`/

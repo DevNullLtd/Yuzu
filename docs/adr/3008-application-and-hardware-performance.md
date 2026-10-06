@@ -24,12 +24,14 @@ builds-on: >-
 amends: >-
   The capability map's statement (section 32.7) that composite experience scoring is
   deliberately not implemented and that the product positions evidence rather than scores.
-  This ADR changes that position: a transparent composite is permitted alongside measured
-  rates, while opaque and sentiment-based scoring stay out. For usage aggregates it also
-  supersedes the statement in the authorization model and the permission documents that usage
-  is reachable only through the administrator-only forensic surface (D9).
-related: ["0017-management-group-confinement-list-reads", "3003-user-session-helper"]
-context-refs: ["#1351", "#1355", "#1706", "#1766", "#2659", "#2744", "#4035", "#4489", "#4512", "#4513", "#4909", "#5059", "#5090"]
+  This ADR sets the direction that a transparent composite is permitted alongside measured
+  rates, while opaque and sentiment-based scoring stay out. For usage figures that name no
+  device it also sets the direction that the statement in the authorization model and the
+  permission documents, that usage is reachable only through the administrator-only forensic
+  surface, is restated (D9). It records a departure from ADR-0016 section 7, under which the
+  server keeps current state and no history, for the sources a decision names (D8).
+related: ["0017-management-group-confinement-list-reads", "0021-spark-reflex-architecture", "3003-user-session-helper"]
+context-refs: ["#1351", "#1355", "#1706", "#1766", "#2163", "#2659", "#2744", "#4035", "#4489", "#4512", "#4513", "#4909", "#5059", "#5090", "#5186"]
 ---
 
 # 3008 — Application and hardware performance in DEX
@@ -51,8 +53,8 @@ through MCP later. These points carry the direction:
 - Everything measured is a DEX signal or a DEX series. Applications and hardware travel the same
   path, and nothing DEX can observe itself is measured by a new plugin.
 - Measured rates lead. A transparent stability score summarises them, and it is one concept
-  applied to two subjects: an application version and a hardware model.
-- An application is identified by its image and version, and a hardware model by an
+  applied to applications and their versions and to hardware models.
+- An application version is identified by its image and version, and a hardware model by an
   operator-declared tag. Both are compared the same way: one against another.
 - Every figure is over the devices that report it, and what is not collected is shown as not
   collected. A figure that cannot be computed says so.
@@ -61,8 +63,9 @@ through MCP later. These points carry the direction:
 - Blue screens, power losses and unexpected shutdowns are counted once and trended, and the agent
   reads what the operating system wrote while it was not listening.
 - Usage means how long and how often an application runs; focus time is a separate decision.
-  Fleet and management-group usage figures become readable at the DEX permission, which more
-  roles hold than the forensic permission, and per-device usage keeps its forensic gate.
+  Usage figures along the fleet, and along other dimensions that no reader can change, become
+  readable at the DEX permission, which more roles hold than the forensic permission. Per-device
+  usage, and usage along anything a reader can change, keeps its forensic gate.
 - A browser is an application like any other. What happens inside it is outside this capability.
 
 This ADR records the direction and the reasons. It does not contain a schema, a protocol, a
@@ -118,9 +121,9 @@ The gaps, as the evidence stands today:
   same shutdown can be reported by two sources.
 - Whether those records are captured completely is unproven. The operating system writes them
   during the boot that follows the event, which can be before the agent is listening, and capture
-  is forward-only. The manual documents this limit, and the issue that raised it was closed on
-  that basis (#1351). Until capture at agent start is shown to work on a live host, rates built on
-  these records are lower bounds.
+  is forward-only. The manual documents this limit. The issue that raised it was folded into a
+  broader open one that scopes a catch-up read (#1351, #2163). Until capture at agent start is
+  shown to work on a live host, rates built on these records are lower bounds.
 - Signals cannot be compared across hardware models. That comparison exists only for the
   performance series.
 - Hardware has no retained series. Device performance is a current value.
@@ -190,19 +193,27 @@ release to Windows.
 - **Application** — an executable, identified by its image name.
 - **Application version** — an application together with its version in the canonical four-part
   form.
-- **Cohort** and **reporting population** — as the repository's domain glossary defines them. A
-  cohort is the devices sharing a value of an operator-chosen tag key; the reporting population
-  is the devices that actually contributed to a figure. A **hardware cohort** is a cohort keyed
-  on the model tag.
-- **Subject** — what a figure is about: an application version, a hardware cohort or one device.
-- **Not collected** — no connected platform reports the source. Different from zero.
+- **Cohort** — as the repository's domain glossary defines it: the devices sharing a value of an
+  operator-chosen tag key. A **hardware cohort** is a cohort keyed on the model tag.
+- **Reporting population** — the devices a figure is over. For a series it is, as the glossary
+  defines it, the devices that actually contributed values. For observations, which are events
+  and not values, it is the devices that were connected and listening in the period, whether or
+  not they raised one. Its size is the denominator of every rate.
+- **In scope** — the devices a view or a read covers: the fleet, or the devices of the selected
+  group or cohort that the reader may see.
+- **Resource-significant** — as the glossary defines it: an application version that was among a
+  device's top consumers of processor or memory when sampled. The series records nothing else, so
+  it is the only exposure the series gives.
+- **Subject** — what a figure is about: an application, an application version, a hardware
+  cohort or one device.
+- **Not collected** — no connected platform collects the source. Different from zero.
 - **Measured rate** — a figure counted directly from observations over a reporting population:
   the share of devices with no crash, events per 1,000 device-days, events per hour of use, the
   mean time between failures, or the median and 90th percentile of a time.
 - **Stability score** — a 0–100 summary of measured rates for one subject: 100 minus weighted
   deductions, shown with the deductions.
-- **Cohort floor** — the number of devices below which a figure shows a count only. Today it is
-  ten.
+- **Cohort floor** — the number of devices below which a figure shows a count only (the
+  glossary's statistical floor). Today it is ten.
 - **Usage** — how long an application runs and how often it is launched, summed over devices.
 - **Consolidated view** — the single view in the DEX area that holds this capability. Its
   navigation name is open.
@@ -223,10 +234,11 @@ ADR-1005 requires once a customer depends on a dashboard surface.
 
 The view and its score are read models on the existing DEX dashboard surface, built API-first
 (D11), as the shipped Health score is. ADR-1005 treats domain scoring baked into code as
-interpretation, and the in-server DEX dashboards as surfaces that migrate toward an engine over
-time. This work does not deepen the coupling to the core, and whether the score counts as
-mechanism or interpretation is a boundary question ADR-1005 leaves to the maintainer (see Open
-questions).
+interpretation that belongs in a use-case engine over time, and treats the in-server DEX
+dashboards as surfaces that migrate toward one, with new work moving toward that boundary and not
+deepening coupling to the core. This work follows that direction: it is API-first and adds no
+private seam, and it leaves the question of when the score moves to an engine to the maintainer,
+who arbitrates boundary disputes under ADR-1005 (see Open questions).
 
 *Rejected:* adding the new views as further tabs beside the existing eight. They overlap with what
 exists, and the team would move between tabs to see one application's crashes next to its resource
@@ -248,7 +260,7 @@ outside DEX's evidence.
 its own sync source and its own read surface, and its evidence would sit beside DEX's evidence
 instead of within it, under different permissions and retention.
 
-### D3 — Rates lead; a transparent score summarises them; one concept, two subjects
+### D3 — Rates lead; a transparent score summarises them; one concept for software and hardware
 
 The consolidated view leads with measured rates: the share of devices with no crash in the
 period; crashes and hangs per 1,000 device-days and, once usage is known, per hour of use; the
@@ -257,22 +269,23 @@ and shutdown times as a median and a 90th percentile. A stability score then sum
 one subject at a time.
 
 The score is 100 minus weighted deductions, with every deduction shown, a band, and the weighting
-in force. It applies in the same way to an application version and to a hardware cohort. It is
-secondary: it never replaces the rates or takes their place on the page, and any figure on the
-page can be taken apart into the observations or series points behind it, for as long as they are
-kept. It is evidence, not a decision. Nothing in the product acts on a score; the alerts DEX
-raises are driven by signal counts and operator-declared routing, as today, and none by a score.
-The weights are shipped reference content: visible, and selectable by preset where a preset
-applies. Deductions weigh how many devices are affected before how many events any one device
-raised, so one crash-looping device cannot dominate a score.
+in force. It applies in the same way to an application, an application version and a hardware
+cohort. It is secondary: it never replaces the rates or takes their place on the page, and any
+figure on the page can be taken apart into the observations or series points behind it, for as
+long as they are kept. It is evidence, not a decision. Nothing in the product acts on a score; the
+alerts DEX raises are driven by signal counts and operator-declared routing, as today, and none
+by a score. The weights are shipped reference content: visible, and selectable by preset where a
+preset applies. Deductions weigh how many devices are affected before how many events any one
+device raised, so one crash-looping device cannot dominate a score.
 
-The two subjects differ in what they can be divided by. A hardware cohort's figures are over the
-devices in the cohort. An application version's rate is over the devices known to have run that
-version, which today is known only for devices that have per-application sampling switched on.
-Where it is not known, the figure is breadth, the devices affected out of the reporting
-population, and is labelled breadth, not a rate. The fleet composite's weights are per signal
-family, which cannot tell one application from another, so an application's deductions are its
-own (see Open questions).
+The two kinds of subject differ in what they can be divided by. A hardware cohort's figures are
+over the reporting devices in the cohort. The rate for an application or an application version is
+over the devices on which it was resource-significant, which is known only for devices that have
+per-application sampling switched on and is a selected subset of the devices that run it, not a
+census. Where exposure is not known, the figure is breadth, the devices affected out of the
+reporting population, and is labelled breadth, not a rate. The fleet composite's weights are per
+signal family, which cannot tell one application from another, so the deductions for an
+application or an application version are its own (see Open questions).
 
 *Rejected:* a score as the headline, because one number invites more precision than the evidence
 has, and the Health score view deliberately leads with the measured rate. Also rejected: a
@@ -280,7 +293,7 @@ learned or opaque score, which cannot be defended in a service review and cannot
 moved. Also rejected: no score, because the customer needs one figure to rank by and to report,
 and a ranking without a key is only a sorted list.
 
-### D4 — Applications are identified by image and version; a hardware cohort is a model tag
+### D4 — An application version is its image and version; a hardware cohort is a model tag
 
 An application is identified by its executable's image name, and an application version by that
 name together with its version in the canonical four-part form. That is the identity the crash,
@@ -296,25 +309,28 @@ automatically today, although the hardware inventory already records each device
 and model; how the tag is populated is left open.
 
 Linking an image to an installed package in the software inventory is intended and is decided
-later. The inventory does not yet record where each package is installed, so an executable cannot
-yet be tied to its package. Until then the consolidated view does not guess a display name.
+later. The daily inventory does not carry where each package is installed: the field is reserved
+and always empty until its own decision (#5186), so an executable cannot yet be tied to its
+package. Until then the consolidated view does not guess a display name.
 
-*Rejected:* resolving each image to its installed package before showing it. It needs new
-collection (where each package is installed), and it guesses wrong where one image belongs to
-several packages. Also rejected: keying on the name alone, which loses the per-version comparison
-a rollout needs; listing hardware by device only, which cannot answer "which model"; and taking
-the model from what each device reports about itself, which an agent can misstate.
+*Rejected:* resolving each image to its installed package before showing it. It needs the
+inventory to carry where each package is installed, which waits on its own decision, and it
+guesses wrong where one image belongs to several packages. Also rejected: keying on the name
+alone, which loses the per-version comparison a rollout needs; listing hardware by device only,
+which cannot answer "which model"; and taking the model from what each device reports about
+itself, which an agent can misstate.
 
 ### D5 — The reporting population defines every figure, and failure directions are fixed
 
-Every rate and every score is computed over a reporting population: the devices that contributed
-to it in the period it covers. The number in it is shown beside the figure, together with how
-many in-scope devices are not in it. A device that is not connected is unknown, never healthy. A
-connected device whose source is switched off, whose sync was skipped, or whose observer is
-disabled cannot yet be told from a quiet one; it counts as quiet until a coverage signal exists,
-and the page names the population a figure is over. A source that no connected platform collects
-is shown as not collected, never as zero, even when nothing is reporting. The failure directions
-are fixed:
+Every rate and every score is computed over a reporting population (see Terminology) for the
+period it covers. The number in it is shown beside the figure, together with how many in-scope
+devices are not in it. A device that is not connected is unknown, never healthy. A device whose
+observer reports itself disarmed is not listening, and is left out of the population of
+observation-based figures. A connected device whose operating-system crash reporting is switched
+off cannot yet be told from a quiet one; it counts as quiet in that population until a coverage
+signal exists, and the page names the population a figure is over. A source that no connected
+platform collects is shown as not collected, never as zero, even when nothing is reporting. The
+failure directions are fixed:
 
 - No devices reporting a source that a connected platform collects gives a dash, not 100 and not
   0.
@@ -351,8 +367,10 @@ only from the moment its observer arms, and it drops an observation it raises wh
 cannot reach the server. Rates built on those records are therefore only as complete as the
 capture. This decision includes reading, when the agent starts, what the operating system has
 written since the agent last ran, and holding observations raised before the agent is connected
-until they can be sent. That is new collection on Windows, and until it is shown to work on a
-live host the figures built on these records are labelled as lower bounds.
+until they can be sent. That is new collection on Windows. How it is built is for the roadmap,
+which reconciles it with the Spark architecture (ADR-0021) rather than adding a collector or
+queue private to DEX. Until it is shown to work on a live host, the figures built on these
+records are labelled as lower bounds.
 
 Boot time, shutdown time, resume time, blue screens, kernel panics, unexpected shutdowns and the
 hardware faults that precede them are shown as trends and, for times, as distributions: by period,
@@ -377,9 +395,10 @@ which would hide a boot loop as a single event.
 
 Usage in this capability means how long each application runs and how many times it is launched,
 summed across devices and groups, by version once usage can be tied to one. It is a view in its
-own right (the most used applications, use by group) and it is the denominator that turns a crash
-count into crashes per hour of use, once usage is matched to an application. A usage trend, as
-opposed to the current thirty-day figure, needs the server to keep history that it now replaces.
+own right (the most used applications, and use by group where D9 allows) and it is the
+denominator that turns a crash count into crashes per hour of use, once usage is matched to an
+application. A usage trend, as opposed to the current thirty-day figure, needs the server to keep
+history that it now replaces.
 That departs from ADR-0016's rule that the server holds current state and leaves history to the
 endpoint (its section 7), as the application series already does; the departure is deliberate and
 is recorded per source. Groups are the management groups that exist today; this ADR does not draw
@@ -395,27 +414,34 @@ about use unanswered.
 
 ### D9 — Fleet figures are read at the DEX permission; per-device usage keeps its gate
 
-Fleet and management-group figures, usage aggregates included, are read under the permission that
-governs the rest of DEX. That permission is held by any authenticated session while access
-control is off, which is the default, and by most built-in roles when it is on. It is wider than
-the administrator-only forensic permission on which usage sits today, and for usage aggregates
-this ADR supersedes that restriction. Four rules bound the widening:
+Figures this capability adds are read under the permission that governs the rest of DEX, with one
+exception: usage figures are read there only along the dimensions the second rule below allows.
+That permission is held by any authenticated session while access control is off, which is the
+default, and by most built-in roles, the viewer among them, when it is on. It is wider than the
+administrator-only forensic permission on which usage sits today, and for the usage figures
+allowed below this ADR sets the direction that the restriction is lifted. Four rules bound the
+widening:
 
 - A figure over fewer devices than the cohort floor is shown as a count only, and published
   figures are arranged so that a figure withheld below the floor cannot be recovered from those
   shown by subtraction: fleet total against groups, a parent group against its child, or one
   cohort against another. The roadmap sets how.
-- Usage is published only along dimensions a reader cannot redefine: the fleet, the management
-  groups, and fixed attributes such as the operating system. A cohort is built from tags that
-  anyone who can write tags can change, so usage by tag cohort stays at the forensic permission.
-  Otherwise two cohorts that differ by one device would hand that device's usage to anyone able
-  to write tags.
-- A read that names devices is not an aggregate. It is admit-then-filter and audited, failing
-  closed when the audit record cannot be written, as the existing per-device drill-downs are, and
-  it is not floored. A drill into usage that names devices stays at the forensic permission.
+- Usage is published only along dimensions that no reader of the aggregate can change without
+  also holding the forensic permission. The fleet and fixed attributes such as the operating
+  system qualify, and so do static management groups, whose membership changes only under the
+  management-group write permission. A cohort does not, because anyone who can write tags can
+  change it, and neither does a group that is defined from tags or that a tag write creates.
+  Usage along those stays at the forensic permission. Otherwise two sets that differ by one
+  device would hand that device's usage to anyone able to create the difference.
+- A read this capability adds that names devices is not an aggregate. It is admit-then-filter and
+  audited, it fails closed when the audit record cannot be written, on every surface that offers
+  it, and it is not floored. Today only the REST forms of the existing drill-downs fail closed;
+  their dashboard and MCP forms proceed. A drill into usage that names devices stays at the
+  forensic permission, and for a usage figure, taking it apart into per-device values is that
+  read.
 - A management-group-confined operator is refused an aggregate, never shown an unfiltered one,
-  until per-caller slicing exists (#5090). A service-scoped token is denied, as on every DEX read
-  today.
+  until per-caller slicing exists (#5090). A service-scoped token is denied, as every DEX
+  aggregate read denies it today.
 
 A per-device read of usage keeps the forensic permission and the audit it has today, and the
 approval that gates the operator-requested plugin read is unchanged. No new permission is
@@ -423,9 +449,9 @@ created.
 
 *Rejected:* keeping aggregates at the forensic tier. Most of the operators this capability is for
 could not see the usage view, and the score would lose its denominator for them. Also rejected:
-publishing usage sums with only a floor on each figure, which subtraction undoes; and a new
-permission dedicated to usage, which is heavier than the need and is not what is being decided
-here.
+publishing usage sums with only a floor on each figure, or along dimensions a reader can change,
+which subtraction undoes; and a new permission dedicated to usage, which is heavier than the need
+and is not what is being decided here.
 
 ### D10 — A browser is an application; nothing inside it is measured
 
@@ -483,8 +509,9 @@ Not in scope, and not changed by this ADR:
   have per-application sampling switched on, and usage figures are forward-only and cover the
   retained window. The blue-screen, power-loss and unexpected-shutdown figures depend on the
   capture at agent start in D7, which is new collection on Windows endpoints.
-- Fleet and management-group usage figures become readable by everyone who can read DEX, where
-  usage is administrator-only today. An upgrade note says so when it ships.
+- Usage figures for the fleet, and along dimensions no reader can change, become readable by
+  everyone who can read DEX, where usage is administrator-only today. An upgrade note says so
+  when it ships.
 - Later releases add specific signals. Each is stated in the DEX signal catalogue, with the
   operating systems that collect it.
 - REST routes and MCP tools keep working and keep their meaning. Pages the consolidated view
@@ -500,8 +527,8 @@ The following is the starting point for the roadmap, which decides order and gro
   Performance, and links to the rest, with redirects and an upgrade note.
 - The version joined onto crash and hang reads, so stability and resource use sit side by side per
   version.
-- A stability read for applications and for hardware cohorts, with its decomposition. An
-  application's deductions are its own.
+- A stability read for applications, application versions and hardware cohorts, with its
+  decomposition. The deductions for an application or an application version are its own.
 - Trend and distribution reads for boot, shutdown and stop events, and a cohort dimension for
   signals, which today exists only for the performance series.
 - A fleet usage read, published so that nothing withheld can be recovered by subtraction, and
@@ -532,7 +559,7 @@ The following is the starting point for the roadmap, which decides order and gro
 | Blue screens and shutdowns written during boot are never seen | D7: capture at agent start, with the figures labelled as lower bounds until it is proven |
 | A rollout looks better or worse than it is because exposure is unknown | D3: breadth is labelled as breadth, and a rate needs a known exposure |
 | A version is mistaken for another, or one application reads as two | D4: exact identity on image and canonical version, never similarity of names; the residuals name the known splits |
-| Widening usage to more readers lets one device's usage be worked out | D9: no recoverable subtraction, no reader-defined cohorts, and a per-device read keeps its gate |
+| Widening usage to more readers lets one device's usage be worked out | D9: no recoverable subtraction, no dimension a reader can change, and a per-device read keeps its gate |
 | A read is slow or silently truncated at fleet scale | D5: reads say when they are capped; retained summaries are an open question |
 | The dashboard gets ahead of the API | D11: the same change |
 | Someone reads the score as a verdict | D3: nothing acts on a score |
@@ -541,10 +568,11 @@ The following is the starting point for the roadmap, which decides order and gro
 
 - Until the other operating systems have their own legs, a mixed fleet's rates describe its
   Windows part, and say so.
-- A connected device whose crash reporting is switched off, whose observer is disabled, or whose
-  application-series or usage sync is skipped for being over a size cap looks quiet, and counts as
-  quiet in its population (#4489, #5059). A skipped usage sync leaves the server holding the
-  device's last figure, which then ages unnoticed.
+- A connected device whose operating-system crash reporting is switched off looks quiet, and
+  counts as quiet in the population of observation-based figures. A device whose
+  application-series sync is skipped for being over a size cap shows only among the in-scope
+  devices not reporting, with no reason given, and one whose usage sync is skipped leaves the
+  server holding its last figure, which then ages unnoticed (#4489, #5059).
 - Until capture at agent start exists and is shown to work on a live host, blue-screen,
   power-loss and dirty-shutdown figures are lower bounds. Agents also cap how many records of one
   type they report each hour and drop the overflow, so a storm's count is a lower bound too.
@@ -557,6 +585,10 @@ The following is the starting point for the roadmap, which decides order and gro
 - Usage is recorded from when collection starts and covers the retained window only.
 - The signal views apply no cohort floor today. This ADR sets the floor for the figures it adds and
   leaves those views as they are.
+- The shipped group and tag-cohort resource trends publish a mean and a count above the floor,
+  from which two sets that differ by one device give that device's value. The same figures per
+  device are already readable at the same permission through the drill-down that names devices,
+  so nothing is lost, and this ADR holds only the figures it adds to the stricter rule.
 - Raw observations are kept for a limited period (thirty days by default). A trend longer than that
   depends on retained daily summaries, which exist for the application series and do not yet exist
   for stability, boot or usage.
@@ -579,13 +611,14 @@ The decision is being followed when all of the following are true.
 2. A new measurement is added without a new transport and without a plugin whose job is to measure
    it.
 3. For any figure in the consolidated view, the observations or series points behind it can be
-   listed while they are kept, up to the read limit. For an older figure the retained daily values
-   are listed and the view says the observations have aged out. A retained summary keeps each
-   day's reporting population.
+   listed while they are kept, up to the read limit; for a usage figure, listing them is the
+   forensic read. For an older figure the retained daily values are listed and the view says the
+   observations have aged out. A retained summary keeps each day's reporting population.
 4. Nothing in the product acts on a score: no alert, action or approval depends on one.
 5. An application version can be compared with the one before it on one page, by devices affected
-   and by crash and hang rate over the devices known to have run each, with the exposure source
-   named. Where exposure is unknown the figure is labelled as breadth, not as a rate.
+   and by crash and hang rate over the devices on which each was resource-significant, with the
+   exposure source named. Where exposure is unknown the figure is labelled as breadth, not as a
+   rate.
 6. A hardware model can be compared with others on blue-screen rate, unexpected-shutdown rate and
    boot time. Two versions of one application are two rows, and the same image on Linux is one row
    with an unknown version.
@@ -607,13 +640,16 @@ The decision is being followed when all of the following are true.
 12. A blue screen, a power loss or a dirty shutdown that happened while the agent was not running
     is in the figures once the agent starts and connects. Two sources reporting the same
     unexpected shutdown yield one event in every rate, and two failures on two boots are two.
-13. Usage is available as run-time and launches by application and by group, and no figure claims
-    to be focus time.
+13. Usage is available as run-time and launches by application, and by group where D9 allows,
+    and no figure claims to be focus time.
 14. A per-device usage read still requires the forensic permission and leaves its audit record,
-    failing closed when the record cannot be written. An aggregate read needs the DEX permission
-    only and names no device. A read that names devices is audited and is not floored.
+    failing closed when the record cannot be written. A usage aggregate along a dimension D9
+    allows needs the DEX permission only and names no device. A read this capability adds that
+    names devices is audited, fails closed on every surface that offers it, and is not floored.
 15. A management-group-confined operator and a service-scoped token are refused an aggregate, not
-    shown an unfiltered one. Usage by tag cohort is refused below the forensic permission.
+    shown an unfiltered one. Usage along a dimension a reader can change, a tag cohort, a group
+    defined from tags or a group that a tag write creates, is refused below the forensic
+    permission.
 16. A browser appears as an application with its crashes, hangs and resource use, and nothing
     reports what happened inside it.
 17. For every view the dashboard shows, the API returns the same figures with the same
@@ -626,11 +662,13 @@ The decision is being followed when all of the following are true.
   over a quarter need retained daily summaries like the application series has, and a usage trend
   needs the server to keep what it now replaces. Which figures are served from summaries at any
   horizon, for how long, and at what grain? A summary must keep each day's reporting population.
-- Which deductions and bands does an application's score use, given that the fleet composite's
-  per-family weights cannot separate one application from another, and do presets apply to it?
-- Is the stability score mechanism or interpretation under ADR-1005's boundary test, which the
-  maintainer arbitrates? Until it is ruled on, the score is built as a read model on the existing
-  DEX surface.
+- Which deductions and bands do the scores for an application and an application version use,
+  given that the fleet composite's per-family weights cannot separate one application from
+  another, and do presets apply to them?
+- ADR-1005's boundary test reads domain scoring baked into code as interpretation, which belongs
+  in a use-case engine, while the in-server DEX dashboards are surfaces that migrate toward one.
+  Does the maintainer rule that the new score is built in the server now, as the shipped Health
+  score is, and when does it move?
 - Should the fleet health composite keep weighting the boot family, whose reports are routine and
   which it counts by how many devices reported rather than by how long boots took? A change would
   alter what the existing health routes return, which counts as a change in their meaning.
@@ -639,8 +677,13 @@ The decision is being followed when all of the following are true.
   stay?
 - Does logon duration have a reliable source on any platform?
 - How does the model tag get populated for estates that have not tagged models, given that
-  cohorts come from operator-declared tags and not from what a device reports? If the hardware
-  inventory is the source, only the model value would cross to the DEX permission.
+  cohorts come from operator-declared tags and not from what a device reports? Copying the model
+  from the hardware inventory into the tag, by an operator or an automation, keeps the cohort
+  operator-declared, and would carry only the model value across to the DEX permission.
 - How is usage, which is recorded by lowercased executable name, matched to an application's image
   name and version, including where Linux truncates process names, and over which window is a
   rate per hour of use computed?
+- Usage by department: departments are usually tags or tag-defined groups, and D9 keeps usage
+  along those at the forensic permission. Is it published from static groups an administrator
+  maintains, from tag keys that only administrators may write, or left at the forensic
+  permission?
