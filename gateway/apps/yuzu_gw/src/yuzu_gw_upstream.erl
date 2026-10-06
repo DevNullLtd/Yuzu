@@ -400,10 +400,18 @@ init_state(ClusterId) ->
     MaxTimeout0 = yuzu_gw_env:env_int(circuit_breaker_max_reset_timeout_ms,
                                       ?DEFAULT_CB_MAX_RESET_MS,
                                       ?MIN_CB_TIMEOUT_MS, ?MAX_CB_TIMEOUT_MS),
+    %% Whether the operator set a usable cap: an unset or rejected key left the
+    %% default in force, and the clamp warning must not present that default as a
+    %% value the operator configured.
+    MaxConfigured = case application:get_env(yuzu_gw, circuit_breaker_max_reset_timeout_ms) of
+                        {ok, V} when is_integer(V), V >= ?MIN_CB_TIMEOUT_MS,
+                                     V =< ?MAX_CB_TIMEOUT_MS -> true;
+                        _                                   -> false
+                    end,
     %% The cap is never below the initial duration: trip_circuit takes the first
     %% open period from the base but caps the NEXT one, so a base above the cap
     %% would open for the base and then shorten (the default cap is 300000).
-    MaxTimeout  = clamp_max_timeout(BaseTimeout, MaxTimeout0),
+    MaxTimeout  = clamp_max_timeout(BaseTimeout, MaxTimeout0, MaxConfigured),
     ReplaySpacing = yuzu_gw_env:env_int(registration_replay_spacing_ms,
                                     ?DEFAULT_REPLAY_SPACING_MS, 0, ?MAX_REPLAY_SPACING_MS),
     SessionGuard = yuzu_gw_env:env_int(registration_replay_session_guard_ms,
@@ -446,14 +454,22 @@ init_state(ClusterId) ->
     }}.
 
 %% The effective cap: the configured one, or the initial duration when the cap is
-%% below it (named in a warning, so the configuration that did not take effect is
-%% visible).
-clamp_max_timeout(Base, Max) when Max >= Base ->
+%% below it. The warning names the configuration that did not take effect: the
+%% configured cap when the operator set one, otherwise the default cap, said to
+%% be the default (the operator never wrote that number).
+clamp_max_timeout(Base, Max, _Configured) when Max >= Base ->
     Max;
-clamp_max_timeout(Base, Max) ->
+clamp_max_timeout(Base, Max, true) ->
     logger:warning("circuit_breaker_max_reset_timeout_ms (~b) is below "
                    "circuit_breaker_reset_timeout_ms (~b); using ~b for both",
                    [Max, Base, Base]),
+    Base;
+clamp_max_timeout(Base, Max, false) ->
+    logger:warning("circuit_breaker_reset_timeout_ms (~b) is above the default "
+                   "circuit_breaker_max_reset_timeout_ms (~b, not set or rejected); the maximum "
+                   "backoff is raised to ~b. Set circuit_breaker_max_reset_timeout_ms "
+                   "to choose it.",
+                   [Base, Max, Base]),
     Base.
 
 handle_call(circuit_state, _From, #state{cb_state = CbState} = State) ->

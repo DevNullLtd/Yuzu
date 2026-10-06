@@ -51,6 +51,8 @@ register(Ctx, RegisterReq) ->
             %% the server would answer the same status, and the gateway used to
             %% count that answer as a failure of the upstream (see
             %% ?MAX_AGENT_ID_BYTES). The line carries the size, never the id.
+            telemetry:execute([yuzu, gw, register, refused],
+                              #{count => 1}, #{reason => <<"agent_id_length">>}),
             yuzu_gw_safe_call:warn_limited(
               register_refused,
               "Register refused: the agent id is empty or longer than ~b bytes (size ~b bytes)",

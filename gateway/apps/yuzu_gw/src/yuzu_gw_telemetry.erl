@@ -57,6 +57,9 @@
     %% Registrations refused by the per-connection session quota
     [yuzu, gw, session, limit_rejected],
 
+    %% Registers refused at the edge, before any upstream call (#4632)
+    [yuzu, gw, register, refused],
+
     %% Mgmt-plane peer authorization (#1422)
     [yuzu, gw, mgmt_auth, rejected],
     [yuzu, gw, mgmt_auth, pin_unresolved],
@@ -204,6 +207,21 @@ handle_event([yuzu, gw, upstream, notify_dropped], #{count := N}, Meta, _Config)
         _ -> <<"unknown">>
     end,
     prometheus_counter:inc(yuzu_gw_upstream_notify_dropped_total, [Reason], N);
+
+%% #4632: a Register the gateway edge refused itself (an agent id that is empty,
+%% missing, not a binary or over 256 bytes), before any reservation and before
+%% any upstream call. The label is a closed set: `agent_id_length' is itself, and
+%% a missing reason or any other value (a non-binary included) folds to a
+%% pre-seeded `unknown' series, so a caller cannot widen the label set and a bug
+%% cannot crash this handler (telemetry detaches a handler that raises). The
+%% event carries no agent data: the id is the caller's text.
+handle_event([yuzu, gw, register, refused], #{count := N}, Meta, _Config) ->
+    Reason = case maps:get(reason, Meta, unknown) of
+        <<"agent_id_length">> -> <<"agent_id_length">>;
+        agent_id_length       -> <<"agent_id_length">>;
+        _                     -> <<"unknown">>
+    end,
+    prometheus_counter:inc(yuzu_gw_register_refused_total, [Reason], N);
 
 %% #4632: size of the notify pending store and the number of NotifyStreamStatus
 %% workers the upstream gen_server tracks, reported together because every
@@ -422,7 +440,36 @@ declare_metrics() ->
     prometheus_counter:declare([
         {name, yuzu_gw_upstream_rpc_errors_total},
         {labels, [rpc_name, code]},
-        {help, "Upstream RPC errors by method and status code"}]),
+        {help, "Upstream RPC errors by method and status code. code is a gRPC "
+               "status (a binary digit string), a transport error reason, "
+               "exception (an exception out of the client or transport) or "
+               "encode (the request could not be encoded in this gateway, so it "
+               "never left it; the breaker is not touched). encode and exception "
+               "are pre-seeded at 0 for each RPC name that can emit them; a "
+               "sustained encode increase is a systematic local fault that "
+               "leaves the breaker closed and /readyz ready"}]),
+    %% A series that first appears already at 1 is invisible to increase(), so
+    %% the two codes a gateway fault produces (no server answer, so no status
+    %% code) start at 0. The RPC names are the do_rpc/3 tags of yuzu_gw_upstream
+    %% (register, inventory, notify_stream, guardian) and the heartbeat buffer's
+    %% batch_heartbeat, which has no local encode path of its own, so only
+    %% exception exists for it. Status codes are never pre-seeded.
+    [prometheus_counter:inc(yuzu_gw_upstream_rpc_errors_total, [Name, Code], 0)
+     || {Name, Code} <- [{N, C} || N <- [<<"register">>, <<"inventory">>,
+                                         <<"notify_stream">>, <<"guardian">>],
+                                   C <- [<<"encode">>, <<"exception">>]]
+                        ++ [{<<"batch_heartbeat">>, <<"exception">>}]],
+    prometheus_counter:declare([
+        {name, yuzu_gw_register_refused_total},
+        {labels, [reason]},
+        {help, "Registers the gateway edge refused itself before any upstream "
+               "call (the agent id is empty, missing, not a binary or longer "
+               "than 256 bytes), answered INVALID_ARGUMENT. The label reason has "
+               "the closed set agent_id_length, plus unknown for any other value, "
+               "which the gateway does not emit today. These refusals never "
+               "reach the circuit breaker or yuzu_gw_upstream_rpc_errors_total."}]),
+    [prometheus_counter:inc(yuzu_gw_register_refused_total, [R], 0)
+     || R <- [<<"agent_id_length">>, <<"unknown">>]],
     prometheus_counter:declare([
         {name, yuzu_gw_upstream_tls_handshake_failures_total},
         {labels, [rpc_name, kind]},

@@ -342,7 +342,7 @@ streaming(cast, {upstream_reannounced, _OtherSessionId}, Data) ->
     %% drip and a genuine agent reconnect. Ignore; the reconnect's own
     %% CONNECTED already carries the correct, current placement.
     logger:debug("Agent ~s: ignoring stale upstream_reannounced for a superseded session",
-                [Data#data.agent_id]),
+                [yuzu_gw_env:log_text(Data#data.agent_id)]),
     keep_state_and_data.
 
 %%--------------------------------------------------------------------
