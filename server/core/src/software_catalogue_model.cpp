@@ -1,12 +1,9 @@
 #include "software_catalogue_model.hpp"
 
-#include "oidc_provider.hpp"
-
 #include <yuzu/log_token.hpp>
 
 #include <algorithm>
 #include <charconv>
-#include <climits>
 #include <cmath>
 #include <format>
 
@@ -59,15 +56,43 @@ constexpr std::string_view kB64 =
     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
 
 std::string b64url_encode(std::string_view in) {
-    return oidc::OidcProvider::base64url_encode(std::vector<std::uint8_t>(in.begin(), in.end()));
+    std::string out;
+    out.reserve((in.size() + 2) / 3 * 4);
+    std::size_t i = 0;
+    for (; i + 3 <= in.size(); i += 3) {
+        const std::uint32_t v = static_cast<std::uint8_t>(in[i]) << 16 |
+                                static_cast<std::uint8_t>(in[i + 1]) << 8 |
+                                static_cast<std::uint8_t>(in[i + 2]);
+        for (const int shift : {18, 12, 6, 0})
+            out += kB64[(v >> shift) & 63];
+    }
+    if (const auto rest = in.size() - i; rest > 0) {
+        std::uint32_t v = static_cast<std::uint8_t>(in[i]) << 16;
+        if (rest == 2)
+            v |= static_cast<std::uint8_t>(in[i + 1]) << 8;
+        for (std::size_t k = 0; k <= rest; ++k)
+            out += kB64[(v >> (18 - 6 * k)) & 63];
+    }
+    return out;
 }
 
-// Strict: alphabet only (no '=' padding), tail length != 1 mod 4. OidcProvider's decoder skips
-// non-alphabet bytes and pads any length, so both refusals are made here before delegating.
+// Strict: alphabet only (no '=' padding, no skipped bytes), tail length != 1 mod 4.
 std::optional<std::string> b64url_decode(std::string_view in) {
     if (in.size() % 4 == 1 || in.find_first_not_of(kB64) != std::string_view::npos)
         return std::nullopt;
-    return oidc::OidcProvider::base64url_decode(std::string(in));
+    std::string out;
+    out.reserve(in.size() / 4 * 3 + 2);
+    std::uint32_t acc = 0;
+    int bits = 0;
+    for (const char c : in) {
+        acc = acc << 6 | static_cast<std::uint32_t>(kB64.find(c));
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            out += static_cast<char>((acc >> bits) & 0xFF);
+        }
+    }
+    return out;
 }
 
 // ── Fingerprints and tokens ──────────────────────────────────────────────────
@@ -188,6 +213,9 @@ std::expected<CatalogueRequest, std::string> parse_catalogue_params(const Params
     if (r.cursor.size() > kCursorMaxBytes)
         return std::unexpected("invalid cursor");
     const bool csv = r.format == "csv";
+    // An export is one whole walk: a continuation token has no meaning there, never a silent drop.
+    if (csv && !r.cursor.empty())
+        return std::unexpected("cursor is not accepted with format=csv");
     // For csv the limit is the TOTAL export cap (default and ceiling kExportCap).
     const auto lim = read_limit(limit, csv ? kExportCap : kCatalogueDefaultLimit,
                                 csv ? kExportCap : kCataloguePageMax);
@@ -439,9 +467,9 @@ std::string titles_csv(const std::vector<SoftwareCatalogRow>& rows, bool omit_ne
     return out;
 }
 
-std::optional<std::string> titles_export(const CatalogueReader& read, SoftwareCatalogQuery q,
-                                         std::int64_t cap, bool omit_newest, bool& truncated) {
-    truncated = false;
+std::optional<TitlesExport> titles_export(const CatalogueReader& read, SoftwareCatalogQuery q,
+                                          std::int64_t cap, bool omit_newest) {
+    TitlesExport out;
     std::vector<SoftwareCatalogRow> all;
     q.after.reset();
     while (static_cast<std::int64_t>(all.size()) < cap) {
@@ -459,99 +487,99 @@ std::optional<std::string> titles_export(const CatalogueReader& read, SoftwareCa
         // A full read that reaches the cap may have left rows behind: report it, as the raw
         // route does whenever rows == the effective limit.
         if (static_cast<std::int64_t>(all.size()) >= cap) {
-            truncated = true;
+            out.truncated = true;
             break;
         }
         q.after = SoftwareCatalogCursor{all.back().device_count, all.back().name};
     }
-    return titles_csv(all, omit_newest);
+    out.rows = static_cast<std::int64_t>(all.size());
+    out.csv = titles_csv(all, omit_newest);
+    return out;
 }
 
-PageStatus read_catalogue_page(const CatalogueReads& io, const CatalogueRequest& rq,
-                               CataloguePage& out) {
+std::expected<CataloguePage, PageError> read_catalogue_page(const CatalogueReads& io,
+                                                            const CatalogueRequest& rq) {
     const auto& q = rq.query;
     const bool host = !q.agent_id.empty();
     const bool continuation = !rq.cursor.empty();
     const std::string fp = filter_fingerprint(q);
     bool moved = false; // generation moved under a first page: re-read once
-    auto attempt = [&]() -> PageStatus {
-        out = {};
+    auto attempt = [&]() -> std::expected<CataloguePage, PageError> {
+        CataloguePage out;
         std::int64_t gen = 0;
         if (!host) {
             out.meta = io.meta();
             if (!out.meta)
-                return PageStatus::kDegraded;
+                return std::unexpected(PageError{PageStatus::kDegraded});
             gen = out.meta->refreshed_at;
         }
         auto query = q;
         if (continuation) {
             auto cur = decode_catalogue_cursor(rq.cursor, fp, gen);
-            if (!cur) {
-                out.cursor_error = cur.error();
-                return cur.error() == CursorError::kStale ? PageStatus::kStale
-                                                          : PageStatus::kBadCursor;
-            }
+            if (!cur)
+                return std::unexpected(PageError{cur.error() == CursorError::kStale
+                                                     ? PageStatus::kStale
+                                                     : PageStatus::kBadCursor,
+                                                 cur.error()});
             query.after = *cur;
         }
         auto rows = io.rows(query);
         if (!rows)
-            return PageStatus::kDegraded;
+            return std::unexpected(PageError{PageStatus::kDegraded});
         auto totals = io.totals(query);
         if (!totals)
-            return PageStatus::kDegraded;
+            return std::unexpected(PageError{PageStatus::kDegraded});
         out.rows = std::move(*rows);
         out.totals = *totals;
         if (!host) {
             const auto after = io.meta();
             if (!after)
-                return PageStatus::kDegraded;
+                return std::unexpected(PageError{PageStatus::kDegraded});
             if (after->refreshed_at != gen) {
                 // A continuation never re-pages an old keyset over a new snapshot.
-                if (continuation) {
-                    out.cursor_error = CursorError::kStale;
-                    return PageStatus::kStale;
-                }
+                if (continuation)
+                    return std::unexpected(PageError{PageStatus::kStale, CursorError::kStale});
                 moved = true;
-                return PageStatus::kDegraded; // a second move stays kDegraded (503)
+                return std::unexpected(PageError{PageStatus::kDegraded}); // a second move: 503
             }
         }
         if (static_cast<int>(out.rows.size()) == q.limit)
             out.next_cursor = encode_catalogue_cursor(out.rows.back(), fp, gen);
-        return PageStatus::kOk;
+        return out;
     };
-    auto st = attempt();
+    auto page = attempt();
     if (moved) {
         moved = false;
-        st = attempt();
+        page = attempt();
     }
-    return st;
+    return page;
 }
 
-PageStatus read_titles_export(const CatalogueReads& io, const CatalogueRequest& rq,
-                              bool omit_newest, std::string& csv, bool& truncated) {
+std::expected<TitlesExport, PageError> read_titles_export(const CatalogueReads& io,
+                                                          const CatalogueRequest& rq,
+                                                          bool omit_newest) {
     const bool host = !rq.query.agent_id.empty();
     for (int attempt = 0; attempt < 2; ++attempt) {
         std::int64_t gen = 0;
         if (!host) {
             const auto before = io.meta();
             if (!before)
-                return PageStatus::kDegraded;
+                break;
             gen = before->refreshed_at;
         }
-        auto body = titles_export(io.rows, rq.query, rq.query.limit, omit_newest, truncated);
+        auto body = titles_export(io.rows, rq.query, rq.query.limit, omit_newest);
         if (!body)
-            return PageStatus::kDegraded;
+            break;
         if (!host) {
             const auto after = io.meta();
             if (!after)
-                return PageStatus::kDegraded;
+                break;
             if (after->refreshed_at != gen)
                 continue; // moved under the walk: restart once
         }
-        csv = std::move(*body);
-        return PageStatus::kOk;
+        return std::move(*body);
     }
-    return PageStatus::kDegraded;
+    return std::unexpected(PageError{PageStatus::kDegraded});
 }
 
 } // namespace yuzu::server::software_catalogue

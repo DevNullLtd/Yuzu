@@ -110,6 +110,12 @@ document's generated block going stale relative to a fresh render. See
 unit-test half (RestApiV1's own `register_routes()` vs `openapi_spec()`,
 plus `$ref` validity) - the #842 companion to this whole-tree script.
 
+**REST-only exports.** The `format=csv` titles export on
+`GET /api/v1/inventory/software/catalogue` is REST-only by design and has no MCP
+twin: a CSV body is a download for a person or a pipeline, not a structured tool
+result (the same reason is recorded beside `BASELINE_UNTWINNED` in
+`check-api-parity.py`).
+
 ## Summary
 
 <!-- BEGIN GENERATED: check-api-parity.py - do not hand-edit; regenerate with `python3 scripts/ci/check-api-parity.py --render-doc` and splice between these markers -->

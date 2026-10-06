@@ -1065,6 +1065,7 @@ SoftwareInventoryStore::query_software(const SoftwareFleetQuery& q) {
 // from the rows it counts. Fleet: WHERE grain/kind/eco/src [versions_min] [q arms]. Host: WHERE
 // agent_id + dimension filters GROUP BY name HAVING true [versions_min] [q arms]. `bind`
 // registers a parameter and returns its placeholder; binds follow emission order.
+namespace {
 template <class Bind>
 std::string catalogue_predicate(const SoftwareCatalogQuery& q, bool host,
                                 std::int64_t versions_min, std::string_view term, Bind&& bind) {
@@ -1102,6 +1103,7 @@ std::string catalogue_predicate(const SoftwareCatalogQuery& q, bool host,
         sql += q_arms(bind(std::string(term)), "i.name", "max(i.publisher)", eco_list, src_list);
     return sql;
 }
+} // namespace
 
 std::optional<std::vector<SoftwareCatalogRow>>
 SoftwareInventoryStore::software_catalog(const SoftwareCatalogQuery& q) {

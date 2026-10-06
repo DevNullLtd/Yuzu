@@ -60,8 +60,8 @@ struct CatalogueRequest {
 /// Keys: q, kind, ecosystem, source, agent_id, versions_min, limit, cursor, format. A repeated
 /// key, a non-integer limit/versions_min, an unknown format or an oversize cursor is refused (the
 /// error is the 400 message). Empty kind/ecosystem/source mean "no filter". `limit` is clamped;
-/// for format=csv it is the TOTAL export cap (default and ceiling kExportCap). Unknown keys are
-/// ignored.
+/// for format=csv it is the TOTAL export cap (default and ceiling kExportCap), and a `cursor`
+/// is refused (an export is one whole walk with no continuation). Unknown keys are ignored.
 [[nodiscard]] std::expected<CatalogueRequest, std::string> parse_catalogue_params(const Params& p);
 
 struct VersionsRequest {
@@ -134,13 +134,20 @@ catalogue_response_json(const std::vector<SoftwareCatalogRow>& rows,
 
 using CatalogueReader =
     std::function<std::optional<std::vector<SoftwareCatalogRow>>(const SoftwareCatalogQuery&)>;
+/// One titles export: the CSV body, whether the cap cut the walk short, and the number of data
+/// rows in it (the audit's `rows=`; a cell holding a newline must not inflate it).
+struct TitlesExport {
+    std::string csv;
+    bool truncated{false};
+    std::int64_t rows{0};
+};
+
 /// Titles export: loops `read` with the in-process keyset cursor (each read asks for
 /// min(cap - collected, kCatalogReadMax) rows) and returns the CSV; `truncated` is set when the
 /// cap cut the walk short. nullopt when any read degrades (never a partial body).
-[[nodiscard]] std::optional<std::string> titles_export(const CatalogueReader& read,
-                                                       SoftwareCatalogQuery q, std::int64_t cap,
-                                                       bool omit_newest, bool& truncated);
-
+[[nodiscard]] std::optional<TitlesExport> titles_export(const CatalogueReader& read,
+                                                        SoftwareCatalogQuery q, std::int64_t cap,
+                                                        bool omit_newest);
 
 // ── One consistent catalogue read ────────────────────────────────────────────
 
@@ -153,10 +160,15 @@ struct CatalogueReads {
 };
 
 enum class PageStatus {
-    kOk,
     kDegraded,  ///< any read returned nullopt, or the generation moved twice (503 + retry)
-    kBadCursor, ///< malformed / different filter set: `cursor_error` says which
+    kBadCursor, ///< malformed / different filter set: `PageError::cursor_error` says which
     kStale,     ///< the generation moved under a continuation page: restart from page one
+};
+
+/// Why a page or export read failed. `cursor_error` is meaningful only for kBadCursor / kStale.
+struct PageError {
+    PageStatus status{PageStatus::kDegraded};
+    CursorError cursor_error{CursorError::kMalformed};
 };
 
 struct CataloguePage {
@@ -164,19 +176,18 @@ struct CataloguePage {
     SoftwareCatalogTotals totals;
     std::optional<CatalogRollupMeta> meta; ///< fleet path only (nullopt on the host path)
     std::string next_cursor;               ///< non-empty iff rows.size() == query.limit
-    CursorError cursor_error{CursorError::kMalformed};
 };
 
 /// Reads {meta, rows, totals, meta} for one catalogue page. Fleet path: the rollup generation
 /// brackets the reads; a move on a first page re-reads ONCE (a second move is kDegraded), a
 /// move under a continuation is kStale. The cursor is decoded against the generation read
 /// first. Host path (query.agent_id set): no meta, generation 0.
-[[nodiscard]] PageStatus read_catalogue_page(const CatalogueReads& io, const CatalogueRequest& rq,
-                                             CataloguePage& out);
+[[nodiscard]] std::expected<CataloguePage, PageError>
+read_catalogue_page(const CatalogueReads& io, const CatalogueRequest& rq);
 
 /// Titles export: the whole walk is bracketed by the generation (restart once, then
-/// kDegraded). `rq.query.limit` is the TOTAL row cap; `csv` is the body, `truncated` the cap flag.
-[[nodiscard]] PageStatus read_titles_export(const CatalogueReads& io, const CatalogueRequest& rq,
-                                            bool omit_newest, std::string& csv, bool& truncated);
+/// kDegraded). `rq.query.limit` is the TOTAL row cap.
+[[nodiscard]] std::expected<TitlesExport, PageError>
+read_titles_export(const CatalogueReads& io, const CatalogueRequest& rq, bool omit_newest);
 
 } // namespace yuzu::server::software_catalogue

@@ -61,7 +61,7 @@
 #include "rotation_sweep_naming.hpp" // kApiTokenConfirmTotalMetric
 #include "web_utils.hpp"  // audit_token (H1 — neutralise k=v audit-field forgery)
 #include "response_templates_engine.hpp"
-#include "software_catalogue_model.hpp" // M.9: shared software catalogue model
+#include "software_catalogue_model.hpp" // shared software catalogue model
 #include "software_inventory_store.hpp" // ADR-0016: typed installed-software fleet read
 #include "store_errors.hpp"
 #include "visualization_engine.hpp"
@@ -1084,10 +1084,10 @@ const std::string& openapi_spec() {
     "/compliance/{id}": {
       "get": {"summary": "Per-policy compliance detail + per-agent status fan-out (api-parity #4034)", "tags": ["Compliance"], "description": "REST v1 twin of legacy GET /api/compliance/{policy_id}, plus a policy_id sibling field. AUTHORIZATION IS require_fleet_read (Policy:Read), NOT a bare permission check — the agents array is a fan-out read of per-agent data (routed-concerns RBAC row): a management-group/service-scope-confined caller sees only its own visible agents, and summary is tallied from exactly that filtered set, never the store's unfiltered fleet-wide aggregate. MCP twin get_policy_agent_statuses (same shape); get_compliance_summary covers the summary-only half. Audited as compliance.agent_statuses.view, FAIL-CLOSED (503 on an audit-persist miss, never a Sec-Audit-Failed set-and-proceed) — check_result carries raw, unrestricted agent-instruction output (the bound fragment's check_instruction is operator-authored and unconstrained), so this route cannot make the same not-behavioural-PII claim GET /api/v1/inventory/software genuinely can.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "{data:{policy_id,summary:{compliant,non_compliant,unknown,fixing,error,total},agents:[{agent_id,status,last_check_at,last_fix_at,check_result}]}}"}, "401": {"description": "Unauthenticated"}, "403": {"description": "No management-group grant for Policy:Read (or a service-scoped token whose RBAC/ITServiceOwner grant is missing/RBAC disabled)"}, "503": {"description": "Policy store not available/degraded, the fleet-read gate unwired, or the audit write for this read failed (fail-closed)"}}}
     },)json"
-        // M.9 PR-2: the software catalogue twins. Own segment (MSVC C2026 16,380-byte cap).
+        // The software catalogue twins. Own segment (MSVC C2026 16,380-byte cap).
         R"json(
-    "/inventory/software/catalogue": {"get": {"summary": "Fleet software title catalogue with totals and KPIs (M.9)", "tags": ["Inventory"], "description": "One row per software title rolled up across the whole fleet from the precomputed catalogue rollup, ordered by installs descending then name (per-device view: by name). totals{titles,installs} cover EVERY row matching the filters (not just this page), so a page can say N of M; installs sums each title's distinct-device count. kpis (first page only; null on continuation pages and the per-device view) carries the headline numbers computed by the hourly refresh plus derived percentages, and coverage{reporting,connected,stale} as counts (reporting = devices with stored inventory, connected = devices currently connected, stale = not seen in 48 hours; null when that figure is unavailable). Requires a GLOBAL Inventory:Read for the fleet view: a management-group-confined caller gets 403 with permission Inventory:Read (the rollup is fleet-wide and cannot be scoped); the per-device view (agent_id) is admitted for an in-scope device, an out-of-scope device returns an empty page with devices_omitted 1, and a confined caller sees newest_version blank with newest_omitted true. Service-scoped API tokens are denied (403, no permission field). Pagination is keyset: next_cursor is non-null when the page is full; a cursor presented with a different filter set, a malformed cursor, or one issued before the latest catalogue refresh (1 second generation granularity) is a 400 and the walk must restart from the first page. Every call is audited (inventory.software.catalog success, continuation pages tagged page=continuation). format=csv exports the titles (total cap 10000, X-Result-Truncated-By-Cap when cut; audited as inventory.software.export). An empty kind, ecosystem or source means no filter. A degraded rows, totals or refresh-metadata read is a 503 with retry_after_ms, never an empty 200.", "parameters": [{"name": "q", "in": "query", "schema": {"type": "string", "maxLength": 128}, "description": "Case-insensitive literal substring over title name, publisher, ecosystems and sources (% and _ are not wildcards); clamped to 128 bytes"}, {"name": "kind", "in": "query", "schema": {"type": "string", "enum": ["package", "app", "pkg", "feat"]}, "description": "Exact kind filter; empty means no filter"}, {"name": "ecosystem", "in": "query", "schema": {"type": "string", "enum": ["rpm", "deb", "apk", "pacman", "windows", "macos", "macos_pkgutil", "brew", "optional_feature"]}, "description": "Exact ecosystem filter; empty means no filter"}, {"name": "source", "in": "query", "schema": {"type": "string", "maxLength": 256}, "description": "Exact source filter (open set, <plugin>.<action>); empty means no filter"}, {"name": "agent_id", "in": "query", "schema": {"type": "string", "maxLength": 256}, "description": "Per-device view of one device's titles (installs are 1)"}, {"name": "versions_min", "in": "query", "schema": {"type": "integer", "minimum": 0, "maximum": 100000}, "description": "Only titles with at least this many distinct versions"}, {"name": "limit", "in": "query", "schema": {"type": "integer", "minimum": 1, "maximum": 1000, "default": 100}, "description": "Page size; with format=csv it is the TOTAL export cap (max 10000, default 10000)"}, {"name": "cursor", "in": "query", "schema": {"type": "string", "maxLength": 2048}, "description": "Opaque next_cursor from the previous page; bound to the filter set and to the catalogue refresh generation"}, {"name": "format", "in": "query", "schema": {"type": "string", "enum": ["json", "csv"], "default": "json"}, "description": "csv streams a titles export (REST only; audited as inventory.software.export)"}], "responses": {"200": {"description": "{data:{titles[{name,publisher,installs,versions,ecosystems[],kinds[],newest_version}],count,next_cursor,totals{titles,installs},kpis|null,devices_omitted,newest_omitted?,audit_persisted?}}"}, "400": {"description": "Repeated or malformed parameter, non-integer limit or versions_min, unknown format, or a refused cursor: invalid cursor, different filter set, or predates the current catalogue refresh (A4 envelope)", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "401": {"description": "Unauthenticated"}, "403": {"description": "Confined caller on the fleet view (permission Inventory:Read) or a service-scoped token (no permission field) (A4 envelope)", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "503": {"description": "Store unavailable or degraded, refresh metadata or totals read failed, or the fleet-read gate unwired; retry_after_ms 5000 (A4 envelope)", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}}}},
-    "/inventory/software/catalogue/versions": {"get": {"summary": "Installs per version for one software title (M.9)", "tags": ["Inventory"], "description": "Distinct-device install counts per version of one title under the same filters as the catalogue; the newest flag marks the title's fleet-wide newest version. truncated is true when the limit was reached. Same access posture as the catalogue: a global Inventory:Read for the fleet view (a confined caller gets 403), the per-device view for an in-scope device (newest is false on every row and newest_omitted is true for a confined caller; an out-of-scope device returns an empty list), service-scoped tokens denied. Every call is audited (inventory.software.versions). A degraded read is a 503 with retry_after_ms, never an empty 200.", "parameters": [{"name": "name", "in": "query", "schema": {"type": "string"}, "description": "Exact title name (required)"}, {"name": "kind", "in": "query", "schema": {"type": "string", "enum": ["package", "app", "pkg", "feat"]}, "description": "Exact kind filter; empty means no filter"}, {"name": "ecosystem", "in": "query", "schema": {"type": "string", "enum": ["rpm", "deb", "apk", "pacman", "windows", "macos", "macos_pkgutil", "brew", "optional_feature"]}, "description": "Exact ecosystem filter; empty means no filter"}, {"name": "source", "in": "query", "schema": {"type": "string", "maxLength": 256}, "description": "Exact source filter (open set, <plugin>.<action>); empty means no filter"}, {"name": "agent_id", "in": "query", "schema": {"type": "string", "maxLength": 256}, "description": "Per-device view of one device's versions of the title"}, {"name": "limit", "in": "query", "schema": {"type": "integer", "minimum": 1, "maximum": 1000, "default": 200}, "description": "Maximum versions returned"}], "responses": {"200": {"description": "{data:{name,versions[{version,installs,newest}],count,truncated,newest_omitted?,audit_persisted?}}"}, "400": {"description": "name missing, repeated or malformed parameter (A4 envelope)", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "401": {"description": "Unauthenticated"}, "403": {"description": "Confined caller on the fleet view (permission Inventory:Read) or a service-scoped token (A4 envelope)", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "503": {"description": "Store unavailable or degraded, or the fleet-read gate unwired; retry_after_ms 5000 (A4 envelope)", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}}}},)json"
+    "/inventory/software/catalogue": {"get": {"summary": "Fleet software title catalogue with totals and KPIs", "tags": ["Inventory"], "description": "One row per software title rolled up across the whole fleet from the precomputed catalogue rollup, ordered by installs descending then name (per-device view: by name). totals{titles,installs} cover EVERY row matching the filters (not just this page), so a page can say N of M; installs sums each title's distinct-device count. kpis (first page only; null on continuation pages and the per-device view) carries the headline numbers computed by the hourly refresh plus derived percentages, and coverage{reporting,connected,stale} as counts (reporting = devices with stored inventory, connected = devices currently connected, stale = not seen in 48 hours; null when that figure is unavailable). Requires a GLOBAL Inventory:Read for the fleet view: a management-group-confined caller gets 403 with permission Inventory:Read (the rollup is fleet-wide and cannot be scoped); the per-device view (agent_id) is admitted for an in-scope device, an out-of-scope device returns an empty page with devices_omitted 1, and a confined caller sees newest_version blank with newest_omitted true. Service-scoped API tokens are denied (403, no permission field). Pagination is keyset: next_cursor is non-null when the page is full; a cursor presented with a different filter set, a malformed cursor, or one issued before the latest catalogue refresh (1 second generation granularity) is a 400 and the walk must restart from the first page. Every call is audited (inventory.software.catalog success, continuation pages tagged page=continuation). format=csv exports the titles (total cap 10000, X-Result-Truncated-By-Cap when cut; audited as inventory.software.export). An empty kind, ecosystem or source means no filter. A degraded rows, totals or refresh-metadata read is a 503 with retry_after_ms, never an empty 200.", "parameters": [{"name": "q", "in": "query", "schema": {"type": "string", "maxLength": 128}, "description": "Case-insensitive literal substring over title name, publisher, ecosystems and sources (% and _ are not wildcards); clamped to 128 bytes"}, {"name": "kind", "in": "query", "schema": {"type": "string", "enum": ["package", "app", "pkg", "feat"]}, "description": "Exact kind filter; empty means no filter"}, {"name": "ecosystem", "in": "query", "schema": {"type": "string", "enum": ["rpm", "deb", "apk", "pacman", "windows", "macos", "macos_pkgutil", "brew", "optional_feature"]}, "description": "Exact ecosystem filter; empty means no filter"}, {"name": "source", "in": "query", "schema": {"type": "string", "maxLength": 256}, "description": "Exact source filter (open set, <plugin>.<action>); empty means no filter"}, {"name": "agent_id", "in": "query", "schema": {"type": "string", "maxLength": 256}, "description": "Per-device view of one device's titles (installs are 1)"}, {"name": "versions_min", "in": "query", "schema": {"type": "integer", "minimum": 0, "maximum": 100000}, "description": "Only titles with at least this many distinct versions"}, {"name": "limit", "in": "query", "schema": {"type": "integer", "minimum": 1, "maximum": 1000, "default": 100}, "description": "Page size; with format=csv it is the TOTAL export cap (max 10000, default 10000)"}, {"name": "cursor", "in": "query", "schema": {"type": "string", "maxLength": 2048}, "description": "Opaque next_cursor from the previous page; bound to the filter set and to the catalogue refresh generation"}, {"name": "format", "in": "query", "schema": {"type": "string", "enum": ["json", "csv"], "default": "json"}, "description": "csv streams a titles export (REST only; audited as inventory.software.export)"}], "responses": {"200": {"description": "{data:{titles[{name,publisher,installs,versions,ecosystems[],kinds[],newest_version}],count,next_cursor,totals{titles,installs},kpis|null,devices_omitted,newest_omitted?,audit_persisted?}}; with format=csv the body is text/csv", "headers": {"Content-Disposition": {"schema": {"type": "string"}, "description": "format=csv only: attachment; filename=software-titles.csv"}, "X-Result-Truncated-By-Cap": {"schema": {"type": "string", "enum": ["true"]}, "description": "format=csv only: present when the total export cap cut the walk short"}, "Sec-Audit-Failed": {"schema": {"type": "string", "enum": ["true"]}, "description": "format=csv only: present when the export audit row did not persist (the export is still served)"}}}, "400": {"description": "Repeated or malformed parameter, non-integer limit or versions_min, unknown format, a cursor sent with format=csv, or a refused cursor: invalid cursor, different filter set, or predates the current catalogue refresh (A4 envelope)", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "401": {"description": "Unauthenticated"}, "403": {"description": "Confined caller on the fleet view (permission Inventory:Read) or a service-scoped token (no permission field) (A4 envelope)", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "503": {"description": "Store unavailable or degraded, refresh metadata or totals read failed, or the fleet-read gate unwired; retry_after_ms 5000 (A4 envelope)", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}}}},
+    "/inventory/software/catalogue/versions": {"get": {"summary": "Installs per version for one software title", "tags": ["Inventory"], "description": "Distinct-device install counts per version of one title under the same filters as the catalogue; the newest flag marks the title's fleet-wide newest version. truncated is true when the limit was reached. Same access posture as the catalogue: a global Inventory:Read for the fleet view (a confined caller gets 403), the per-device view for an in-scope device (newest is false on every row and newest_omitted is true for a confined caller; an out-of-scope device returns an empty list), service-scoped tokens denied. Every call is audited (inventory.software.versions). A degraded read is a 503 with retry_after_ms, never an empty 200.", "parameters": [{"name": "name", "in": "query", "schema": {"type": "string"}, "description": "Exact title name (required)"}, {"name": "kind", "in": "query", "schema": {"type": "string", "enum": ["package", "app", "pkg", "feat"]}, "description": "Exact kind filter; empty means no filter"}, {"name": "ecosystem", "in": "query", "schema": {"type": "string", "enum": ["rpm", "deb", "apk", "pacman", "windows", "macos", "macos_pkgutil", "brew", "optional_feature"]}, "description": "Exact ecosystem filter; empty means no filter"}, {"name": "source", "in": "query", "schema": {"type": "string", "maxLength": 256}, "description": "Exact source filter (open set, <plugin>.<action>); empty means no filter"}, {"name": "agent_id", "in": "query", "schema": {"type": "string", "maxLength": 256}, "description": "Per-device view of one device's versions of the title"}, {"name": "limit", "in": "query", "schema": {"type": "integer", "minimum": 1, "maximum": 1000, "default": 200}, "description": "Maximum versions returned"}], "responses": {"200": {"description": "{data:{name,versions[{version,installs,newest}],count,truncated,newest_omitted?,audit_persisted?}}"}, "400": {"description": "name missing, repeated or malformed parameter (A4 envelope)", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "401": {"description": "Unauthenticated"}, "403": {"description": "Confined caller on the fleet view (permission Inventory:Read) or a service-scoped token (A4 envelope)", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "503": {"description": "Store unavailable or degraded, or the fleet-read gate unwired; retry_after_ms 5000 (A4 envelope)", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}}}},)json"
         // #4029 (api-parity Batch A content/catalog half) — GET /api/v1/instructions*
         // and GET /api/v1/product-packs*. Own segment (MSVC C2026 16,380-byte cap).
         R"json(
@@ -8885,7 +8885,7 @@ void RestApiV1::register_routes(
     // `/api/v1/inventory/{agent_id}/{plugin}` regex route below, and the first registered match
     // wins — so the catalogue twins are registered BEFORE it (`.../catalogue/versions` has three
     // segments and is not shadowed, but lives with its sibling).
-    // ── Software catalogue twins (M.9 PR-2) ───────────────────────────────
+    // ── Software catalogue twins ───────────────────────────────
     // GET /api/v1/inventory/software/catalogue         — fleet title catalogue + totals + KPIs
     // GET /api/v1/inventory/software/catalogue/versions — installs-per-version drill
     // Both shape their answers through the shared pure model (software_catalogue_model.hpp), the
@@ -8905,11 +8905,11 @@ void RestApiV1::register_routes(
         (void)detail::try_persist_audit(audit_fn, req, verb, "failure", "Inventory", target,
                                         std::string(what) + " degraded; cid=" + cid);
         res.status = 503;
-        res.set_content(detail::error_json_a4(503,
-                                              std::string("software inventory store degraded — ") +
-                                                  what + " failed",
-                                              cid, 5000, "retry the request"),
-                        "application/json");
+        res.set_content(
+            detail::a4_error(res,
+                             std::string("software inventory store degraded — ") + what + " failed",
+                             {.retry_after_ms = 5000, .remediation = "retry the request"}),
+            "application/json");
     };
     auto sw_deny_confined = [audit_fn](const httplib::Request& req, httplib::Response& res,
                                        const std::string& cid, const char* verb,
@@ -8919,11 +8919,11 @@ void RestApiV1::register_routes(
                                             cid);
         res.status = 403;
         res.set_content(
-            detail::error_json_a4(
-                403,
+            detail::a4_denial(
+                res, 403,
                 "the fleet-wide software catalogue requires a global Inventory:Read grant; pass "
                 "agent_id for a per-device view",
-                cid, detail::A4ErrorOpts{.permission = "Inventory:Read"}),
+                {.permission = "Inventory:Read"}),
             "application/json");
     };
     // The prologue both routes share: service-token deny -> unwired 503 -> fleet-read gate ->
@@ -8941,8 +8941,7 @@ void RestApiV1::register_routes(
                           "cid={}",
                           verb, cid);
             res.status = 503;
-            res.set_content(detail::error_json_a4(503, "service unavailable", cid),
-                            "application/json");
+            res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
             return std::nullopt;
         }
         auto gate = fleet_read_fn(req, res, "Inventory", "Read");
@@ -8950,9 +8949,8 @@ void RestApiV1::register_routes(
             return std::nullopt;
         if (!software_inventory_store) {
             res.status = 503;
-            res.set_content(
-                detail::error_json_a4(503, "software inventory store not available", cid),
-                "application/json");
+            res.set_content(detail::a4_error(res, "software inventory store not available"),
+                            "application/json");
             return std::nullopt;
         }
         return gate;
@@ -8974,15 +8972,14 @@ void RestApiV1::register_routes(
             auto parsed = swc::parse_catalogue_params(req.params);
             if (!parsed) {
                 res.status = 400;
-                res.set_content(detail::error_json_a4(400, parsed.error(), cid),
-                                "application/json");
+                res.set_content(detail::a4_error(res, parsed.error()), "application/json");
                 return;
             }
             const auto& rq = *parsed;
             const auto& q = rq.query;
             const bool host = !q.agent_id.empty();
             const bool csv = rq.format == "csv";
-            const bool continuation = !rq.cursor.empty() && !csv;
+            const bool continuation = !rq.cursor.empty(); // never with csv (parse refuses it)
             const std::string target = swc::audit_target(q);
             const char* const verb = csv ? "inventory.software.export" : "inventory.software.catalog";
             const bool omit_newest = gate.scope.has_value();
@@ -8999,23 +8996,24 @@ void RestApiV1::register_routes(
             }
 
             bool audit_ok = true;
-            auto send_csv = [&](const std::string& body, bool truncated) {
-                const auto rows = static_cast<std::int64_t>(std::ranges::count(body, '\n')) - 1;
+            // Set-and-proceed on an audit miss (`Sec-Audit-Failed`, the file is still served):
+            // machine-scope inventory data, not behavioural PII.
+            auto send_csv = [&](const swc::TitlesExport& ex) {
                 audit_ok = detail::try_persist_audit(
                     audit_fn, req, "inventory.software.export", "success", "Inventory", target,
-                    "titles format=csv rows=" + std::to_string(rows) +
-                        " truncated=" + (truncated ? "true" : "false") + " cid=" + cid);
+                    "titles format=csv rows=" + std::to_string(ex.rows) +
+                        " truncated=" + (ex.truncated ? "true" : "false") + " cid=" + cid);
                 res.set_header("Content-Disposition",
                                "attachment; filename=\"software-titles.csv\"");
-                if (truncated)
+                if (ex.truncated)
                     res.set_header("X-Result-Truncated-By-Cap", "true");
                 if (!audit_ok)
                     res.set_header("Sec-Audit-Failed", "true");
-                res.set_content(body, "text/csv; charset=utf-8");
+                res.set_content(ex.csv, "text/csv; charset=utf-8");
             };
             if (out_of_scope) {
                 if (csv) {
-                    send_csv(swc::titles_csv({}, true), false);
+                    send_csv({swc::titles_csv({}, true), false, 0});
                     return;
                 }
                 res.set_content(
@@ -9032,33 +9030,32 @@ void RestApiV1::register_routes(
                     return software_inventory_store->software_catalog_totals(c);
                 }};
             if (csv) {
-                std::string body;
-                bool truncated = false;
-                if (swc::read_titles_export(io, rq, omit_newest, body, truncated) !=
-                    swc::PageStatus::kOk) {
+                const auto ex = swc::read_titles_export(io, rq, omit_newest);
+                if (!ex) {
                     sw_fail_degraded(req, res, cid, verb, target, "catalogue read");
                     return;
                 }
-                send_csv(body, truncated);
+                send_csv(*ex);
                 return;
             }
 
-            swc::CataloguePage page;
-            switch (swc::read_catalogue_page(io, rq, page)) {
-            case swc::PageStatus::kOk:
-                break;
-            case swc::PageStatus::kDegraded:
-                sw_fail_degraded(req, res, cid, verb, target, "catalogue read");
-                return;
-            case swc::PageStatus::kBadCursor:
-            case swc::PageStatus::kStale:
-                res.status = 400;
-                res.set_content(
-                    detail::error_json_a4(
-                        400, std::string(swc::cursor_error_message(page.cursor_error)), cid),
-                    "application/json");
-                return;
+            const auto read = swc::read_catalogue_page(io, rq);
+            if (!read) {
+                switch (read.error().status) {
+                case swc::PageStatus::kDegraded:
+                    sw_fail_degraded(req, res, cid, verb, target, "catalogue read");
+                    return;
+                case swc::PageStatus::kBadCursor:
+                case swc::PageStatus::kStale:
+                    res.status = 400;
+                    res.set_content(
+                        detail::a4_error(
+                            res, std::string(swc::cursor_error_message(read.error().cursor_error))),
+                        "application/json");
+                    return;
+                }
             }
+            const auto& page = *read;
 
             // Coverage + KPIs only on a first fleet page (continuation pages carry kpis:null).
             std::optional<swc::KpiFigures> kpis;
@@ -9099,8 +9096,7 @@ void RestApiV1::register_routes(
             auto parsed = swc::parse_versions_params(req.params);
             if (!parsed) {
                 res.status = 400;
-                res.set_content(detail::error_json_a4(400, parsed.error(), cid),
-                                "application/json");
+                res.set_content(detail::a4_error(res, parsed.error()), "application/json");
                 return;
             }
             const auto& q = parsed->query;

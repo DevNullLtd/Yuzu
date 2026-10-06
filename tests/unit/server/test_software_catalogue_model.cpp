@@ -1,8 +1,8 @@
 /**
- * test_software_catalogue_model.cpp — pure coverage for software_catalogue_model.hpp (M.9
- * PR-2): parameter parsing, audit targets, the opaque cursor codecs, the one-consistent-read
- * orchestration and its generation-skew handling (with fake readers), KPI
- * derivation and the JSON/CSV shaping. No store, no libpq, no clock, no network.
+ * test_software_catalogue_model.cpp — pure coverage for software_catalogue_model.hpp: parameter
+ * parsing, audit targets, the opaque cursor codecs, the one-consistent-read orchestration and its
+ * generation-skew handling (with fake readers), KPI derivation and the JSON/CSV shaping. No
+ * store, no libpq, no clock, no network.
  */
 
 #include <catch2/catch_test_macros.hpp>
@@ -18,11 +18,11 @@ using namespace yuzu::server::software_catalogue;
 
 namespace {
 
-Params P(std::initializer_list<std::pair<const std::string, std::string>> kv) {
+Params params(std::initializer_list<std::pair<const std::string, std::string>> kv) {
     return Params(kv);
 }
 
-SoftwareCatalogRow Row(std::string name, std::int64_t installs, std::string newest = "1.0") {
+SoftwareCatalogRow row(std::string name, std::int64_t installs, std::string newest = "1.0") {
     SoftwareCatalogRow r;
     r.name = std::move(name);
     r.publisher = "Acme";
@@ -58,9 +58,9 @@ std::string b64url_of(std::string_view in) {
 
 } // namespace
 
-TEST_CASE("parse_catalogue_params: defaults, clamps and refusals", "[server][software_catalogue_model]") {
+TEST_CASE("parse_catalogue_params: defaults / clamps / refusals", "[server][software_catalogue_model]") {
     SECTION("defaults") {
-        auto r = parse_catalogue_params(P({}));
+        auto r = parse_catalogue_params(params({}));
         REQUIRE(r);
         CHECK(r->query.limit == 100);
         CHECK(r->format == "json");
@@ -69,34 +69,41 @@ TEST_CASE("parse_catalogue_params: defaults, clamps and refusals", "[server][sof
         CHECK(r->cursor.empty());
     }
     SECTION("limit is clamped in int64 before narrowing") {
-        CHECK(parse_catalogue_params(P({{"limit", "-5"}}))->query.limit == 1);
-        CHECK(parse_catalogue_params(P({{"limit", "99999999999"}}))->query.limit == 1000);
-        CHECK(parse_catalogue_params(P({{"limit", "250"}}))->query.limit == 250);
+        CHECK(parse_catalogue_params(params({{"limit", "-5"}}))->query.limit == 1);
+        CHECK(parse_catalogue_params(params({{"limit", "99999999999"}}))->query.limit == 1000);
+        CHECK(parse_catalogue_params(params({{"limit", "250"}}))->query.limit == 250);
     }
     SECTION("csv limit is the TOTAL export cap, default and ceiling 10000") {
-        auto d = parse_catalogue_params(P({{"format", "csv"}}));
+        auto d = parse_catalogue_params(params({{"format", "csv"}}));
         REQUIRE(d);
         CHECK(d->query.limit == 10000);
-        auto c = parse_catalogue_params(P({{"format", "csv"}, {"limit", "2"}}));
+        auto c = parse_catalogue_params(params({{"format", "csv"}, {"limit", "2"}}));
         CHECK(c->query.limit == 2);
-        CHECK(parse_catalogue_params(P({{"format", "csv"}, {"limit", "99999999"}}))->query.limit ==
+        CHECK(parse_catalogue_params(params({{"format", "csv"}, {"limit", "99999999"}}))->query.limit ==
               10000);
     }
     SECTION("non-integer or malformed values are a 400") {
-        CHECK_FALSE(parse_catalogue_params(P({{"limit", "12abc"}})));
-        CHECK_FALSE(parse_catalogue_params(P({{"versions_min", "abc"}})));
-        CHECK_FALSE(parse_catalogue_params(P({{"versions_min", "-1"}})));
-        CHECK_FALSE(parse_catalogue_params(P({{"format", "xml"}})));
-        CHECK_FALSE(parse_catalogue_params(P({{"cursor", std::string(2049, 'a')}})));
-        CHECK_FALSE(parse_catalogue_params(P({{"limit", "x"}})).error().empty());
+        CHECK_FALSE(parse_catalogue_params(params({{"limit", "12abc"}})));
+        CHECK_FALSE(parse_catalogue_params(params({{"versions_min", "abc"}})));
+        CHECK_FALSE(parse_catalogue_params(params({{"versions_min", "-1"}})));
+        CHECK_FALSE(parse_catalogue_params(params({{"format", "xml"}})));
+        CHECK_FALSE(parse_catalogue_params(params({{"cursor", std::string(2049, 'a')}})));
+        CHECK_FALSE(parse_catalogue_params(params({{"limit", "x"}})).error().empty());
+    }
+    SECTION("a cursor with format=csv is a 400, never silently dropped") {
+        auto r = parse_catalogue_params(params({{"format", "csv"}, {"cursor", "garbage"}}));
+        REQUIRE_FALSE(r);
+        CHECK(r.error() == "cursor is not accepted with format=csv");
+        // a json page still takes one
+        CHECK(parse_catalogue_params(params({{"format", "json"}, {"cursor", "garbage"}})));
     }
     SECTION("a repeated key is a 400 naming the key") {
-        auto r = parse_catalogue_params(P({{"kind", "app"}, {"kind", "pkg"}}));
+        auto r = parse_catalogue_params(params({{"kind", "app"}, {"kind", "pkg"}}));
         REQUIRE_FALSE(r);
         CHECK(r.error() == "repeated query parameter kind");
     }
     SECTION("empty dimension filters mean no filter; unknown keys are ignored") {
-        auto r = parse_catalogue_params(P({{"kind", ""}, {"ecosystem", ""}, {"source", ""},
+        auto r = parse_catalogue_params(params({{"kind", ""}, {"ecosystem", ""}, {"source", ""},
                                             {"nope", "1"}}));
         REQUIRE(r);
         CHECK(r->query.kind.empty());
@@ -106,23 +113,23 @@ TEST_CASE("parse_catalogue_params: defaults, clamps and refusals", "[server][sof
     SECTION("q is clamped to 128 bytes at a UTF-8 boundary") {
         std::string q(127, 'a');
         q += "\xC3\xA9\xC3\xA9"; // two 2-byte code points straddling the 128-byte mark
-        auto r = parse_catalogue_params(P({{"q", q}}));
+        auto r = parse_catalogue_params(params({{"q", q}}));
         REQUIRE(r);
         CHECK(r->query.q.size() == 127);
     }
 }
 
 TEST_CASE("parse_versions_params", "[server][software_catalogue_model]") {
-    CHECK_FALSE(parse_versions_params(P({})));
-    CHECK(parse_versions_params(P({{"name", ""}})).error() == "name is required");
-    auto r = parse_versions_params(P({{"name", "git"}, {"ecosystem", "brew"}, {"agent_id", "a1"}}));
+    CHECK_FALSE(parse_versions_params(params({})));
+    CHECK(parse_versions_params(params({{"name", ""}})).error() == "name is required");
+    auto r = parse_versions_params(params({{"name", "git"}, {"ecosystem", "brew"}, {"agent_id", "a1"}}));
     REQUIRE(r);
     CHECK(r->query.name == "git");
     CHECK(r->query.ecosystem == "brew");
     CHECK(r->query.agent_id == "a1");
     CHECK(r->query.limit == 200);
-    CHECK_FALSE(parse_versions_params(P({{"name", "a"}, {"name", "b"}})));
-    CHECK(parse_versions_params(P({{"name", "a"}, {"limit", "9999"}}))->query.limit == 1000);
+    CHECK_FALSE(parse_versions_params(params({{"name", "a"}, {"name", "b"}})));
+    CHECK(parse_versions_params(params({{"name", "a"}, {"limit", "9999"}}))->query.limit == 1000);
 }
 
 TEST_CASE("audit_target: fixed field order", "[server][software_catalogue_model]") {
@@ -153,7 +160,7 @@ TEST_CASE("audit_target neutralises forged k=v fields in caller text",
     CHECK(t == "fleet;q=a;kind_admin_b_c");
 }
 
-TEST_CASE("fingerprints are stable, sensitive to every field and blind to paging",
+TEST_CASE("fingerprints are stable and sensitive to every field and blind to paging",
           "[server][software_catalogue_model]") {
     SoftwareCatalogQuery a;
     const auto base = filter_fingerprint(a);
@@ -175,7 +182,7 @@ TEST_CASE("fingerprints are stable, sensitive to every field and blind to paging
 TEST_CASE("catalogue cursor round trip", "[server][software_catalogue_model]") {
     const std::string fp = filter_fingerprint({});
     for (const std::string& name : std::vector<std::string>{"plain", "has:colon", std::string("sep\x1f" "inside"), "eq=/+", "caf\xC3\xA9", ""}) {
-        const auto tok = encode_catalogue_cursor(Row(name, 42), fp, 1700000000);
+        const auto tok = encode_catalogue_cursor(row(name, 42), fp, 1700000000);
         auto cur = decode_catalogue_cursor(tok, fp, 1700000000);
         REQUIRE(cur);
         CHECK(cur->installs == 42);
@@ -185,13 +192,13 @@ TEST_CASE("catalogue cursor round trip", "[server][software_catalogue_model]") {
 
 TEST_CASE("worst-case cursors stay within kCursorMaxBytes", "[server][software_catalogue_model]") {
     const std::string name(1024, '\xFF'); // ingest allows 1024-byte names
-    SoftwareCatalogRow r = Row(name, INT64_MAX);
+    SoftwareCatalogRow r = row(name, INT64_MAX);
     CHECK(encode_catalogue_cursor(r, kHeadFp, INT64_MAX).size() <= kCursorMaxBytes);
 }
 
 TEST_CASE("catalogue cursor decoder refusals", "[server][software_catalogue_model]") {
     const std::string fp = filter_fingerprint({});
-    const std::string good = encode_catalogue_cursor(Row("t", 5), fp, 100);
+    const std::string good = encode_catalogue_cursor(row("t", 5), fp, 100);
     REQUIRE(decode_catalogue_cursor(good, fp, 100));
 
     auto code = [&](std::string_view tok, std::string_view f = {}, std::int64_t gen = 100) {
@@ -291,17 +298,17 @@ TEST_CASE("derive_kpis zero guards and the building state", "[server][software_c
 }
 
 TEST_CASE("catalogue/versions JSON shaping", "[server][software_catalogue_model]") {
-    const auto row = catalogue_row_json(Row("git", 9), false);
-    CHECK(row["installs"] == 9);
-    CHECK(row["ecosystems"] == nlohmann::json::array({"brew", "deb"}));
-    CHECK(row["newest_version"] == "1.0");
-    CHECK(catalogue_row_json(Row("git", 9), true)["newest_version"] == "");
-    SoftwareCatalogRow none = Row("x", 1);
+    const auto git = catalogue_row_json(row("git", 9), false);
+    CHECK(git["installs"] == 9);
+    CHECK(git["ecosystems"] == nlohmann::json::array({"brew", "deb"}));
+    CHECK(git["newest_version"] == "1.0");
+    CHECK(catalogue_row_json(row("git", 9), true)["newest_version"] == "");
+    SoftwareCatalogRow none = row("x", 1);
     none.ecosystems.clear();
     CHECK(catalogue_row_json(none, false)["ecosystems"].empty());
 
     const SoftwareCatalogTotals t{30, 99};
-    auto full = catalogue_response_json({Row("a", 2)}, t, std::nullopt, "tok", false, 0);
+    auto full = catalogue_response_json({row("a", 2)}, t, std::nullopt, "tok", false, 0);
     CHECK(full["next_cursor"] == "tok");
     CHECK(full["totals"]["installs"] == 99);
     CHECK(full["kpis"].is_null());
@@ -326,22 +333,22 @@ TEST_CASE("catalogue/versions JSON shaping", "[server][software_catalogue_model]
 }
 
 TEST_CASE("titles_csv", "[server][software_catalogue_model]") {
-    SoftwareCatalogRow r = Row("caf\xC3\xA9", 3);
+    SoftwareCatalogRow r = row("caf\xC3\xA9", 3);
     const auto titles = titles_csv({r}, false);
     CHECK(titles == std::string(kTitlesCsvHeader) + "\ncaf\xC3\xA9,Acme,3,2,brew;deb,pkg,1.0\n");
     CHECK(titles_csv({r}, true).ends_with(",pkg,\n"));
 
-    SoftwareCatalogRow hostile = Row("=cmd", 1);
+    SoftwareCatalogRow hostile = row("=cmd", 1);
     hostile.publisher = "Ac\"me,Inc";
     const auto h = titles_csv({hostile}, false);
     CHECK(h.find("'=cmd") != std::string::npos);            // formula neutralised
     CHECK(h.find("\"Ac\"\"me,Inc\"") != std::string::npos); // quote doubled, comma quoted
 }
 
-TEST_CASE("titles_export: cap, truncation and degrade", "[server][software_catalogue_model]") {
+TEST_CASE("titles_export: cap / truncation / degrade", "[server][software_catalogue_model]") {
     std::vector<SoftwareCatalogRow> all;
     for (int i = 0; i < 7; ++i)
-        all.push_back(Row("t" + std::to_string(i), 100 - i));
+        all.push_back(row("t" + std::to_string(i), 100 - i));
     int reads = 0;
     CatalogueReader fake = [&](const SoftwareCatalogQuery& q) -> std::optional<std::vector<SoftwareCatalogRow>> {
         ++reads;
@@ -357,19 +364,25 @@ TEST_CASE("titles_export: cap, truncation and degrade", "[server][software_catal
         }
         return out;
     };
-    bool truncated = false;
-    auto cut = titles_export(fake, {}, 3, false, truncated);
+    auto cut = titles_export(fake, {}, 3, false);
     REQUIRE(cut);
-    CHECK(truncated);
-    CHECK(std::ranges::count(*cut, '\n') == 4); // header + 3 rows
-    truncated = false;
-    auto whole = titles_export(fake, {}, 10, false, truncated);
+    CHECK(cut->truncated);
+    CHECK(cut->rows == 3);
+    CHECK(std::ranges::count(cut->csv, '\n') == 4); // header + 3 rows
+    auto whole = titles_export(fake, {}, 10, false);
     REQUIRE(whole);
-    CHECK_FALSE(truncated);
-    CHECK(std::ranges::count(*whole, '\n') == 8);
+    CHECK_FALSE(whole->truncated);
+    CHECK(whole->rows == 7);
+    CHECK(std::ranges::count(whole->csv, '\n') == 8);
+
+    // rows counts titles, not newlines: a quoted cell holding '\n' must not inflate it
+    all = {row("multi\nline", 5)};
+    auto quoted = titles_export(fake, {}, 10, false);
+    REQUIRE(quoted);
+    CHECK(quoted->rows == 1);
 
     CatalogueReader failing = [](const SoftwareCatalogQuery&) { return std::nullopt; };
-    CHECK_FALSE(titles_export(failing, {}, 5, false, truncated).has_value());
+    CHECK_FALSE(titles_export(failing, {}, 5, false).has_value());
 }
 
 namespace {
@@ -400,7 +413,7 @@ struct FakeIo {
     }
 };
 
-CatalogueRequest Req(int limit, std::string cursor = {}) {
+CatalogueRequest req(int limit, std::string cursor = {}) {
     CatalogueRequest r;
     r.query.limit = limit;
     r.cursor = std::move(cursor);
@@ -412,125 +425,141 @@ CatalogueRequest Req(int limit, std::string cursor = {}) {
 TEST_CASE("read_catalogue_page: stable generation", "[server][software_catalogue_model]") {
     FakeIo f;
     f.gens = {10};
-    f.rows = {Row("a", 3), Row("b", 2)};
-    CataloguePage page;
-    REQUIRE(read_catalogue_page(f.io(), Req(2), page) == PageStatus::kOk);
-    CHECK(page.rows.size() == 2);
-    CHECK(page.totals.installs == 5);
-    REQUIRE(page.meta.has_value());
+    f.rows = {row("a", 3), row("b", 2)};
+    auto page = read_catalogue_page(f.io(), req(2));
+    REQUIRE(page);
+    CHECK(page->rows.size() == 2);
+    CHECK(page->totals.installs == 5);
+    REQUIRE(page->meta.has_value());
     // full page -> a cursor bound to generation 10 that the same filters accept
-    REQUIRE_FALSE(page.next_cursor.empty());
-    CHECK(decode_catalogue_cursor(page.next_cursor, filter_fingerprint({}), 10));
+    REQUIRE_FALSE(page->next_cursor.empty());
+    CHECK(decode_catalogue_cursor(page->next_cursor, filter_fingerprint({}), 10));
     // short page -> no cursor
-    CataloguePage shorter;
-    REQUIRE(read_catalogue_page(f.io(), Req(5), shorter) == PageStatus::kOk);
-    CHECK(shorter.next_cursor.empty());
+    auto shorter = read_catalogue_page(f.io(), req(5));
+    REQUIRE(shorter);
+    CHECK(shorter->next_cursor.empty());
 }
 
 TEST_CASE("read_catalogue_page: a refresh landing mid-read", "[server][software_catalogue_model]") {
     SECTION("first page retries ONCE and carries the new generation") {
         FakeIo f;
         f.gens = {10, 11, 11, 11}; // before, after (moved) -> retry: before, after (stable)
-        f.rows = {Row("a", 3)};
-        CataloguePage page;
-        REQUIRE(read_catalogue_page(f.io(), Req(1), page) == PageStatus::kOk);
+        f.rows = {row("a", 3)};
+        auto page = read_catalogue_page(f.io(), req(1));
+        REQUIRE(page);
         CHECK(f.rows_reads == 2);
-        CHECK(decode_catalogue_cursor(page.next_cursor, filter_fingerprint({}), 11));
+        CHECK(decode_catalogue_cursor(page->next_cursor, filter_fingerprint({}), 11));
     }
     SECTION("moving twice is a degrade, never a third read") {
         FakeIo f;
         f.gens = {10, 11, 11, 12};
-        f.rows = {Row("a", 3)};
-        CataloguePage page;
-        CHECK(read_catalogue_page(f.io(), Req(1), page) == PageStatus::kDegraded);
+        f.rows = {row("a", 3)};
+        auto page = read_catalogue_page(f.io(), req(1));
+        REQUIRE_FALSE(page);
+        CHECK(page.error().status == PageStatus::kDegraded);
         CHECK(f.rows_reads == 2);
     }
     SECTION("a continuation page never re-pages an old keyset over a new snapshot") {
-        const auto tok = encode_catalogue_cursor(Row("a", 3), filter_fingerprint({}), 10);
+        const auto tok = encode_catalogue_cursor(row("a", 3), filter_fingerprint({}), 10);
         FakeIo f;
         f.gens = {10, 11};
-        f.rows = {Row("b", 2)};
-        CataloguePage page;
-        CHECK(read_catalogue_page(f.io(), Req(1, tok), page) == PageStatus::kStale);
+        f.rows = {row("b", 2)};
+        auto page = read_catalogue_page(f.io(), req(1, tok));
+        REQUIRE_FALSE(page);
+        CHECK(page.error().status == PageStatus::kStale);
         CHECK(f.rows_reads == 1);
+        // Two meta reads only (before, after): without the continuation branch the moved
+        // generation would trigger a retry whose re-read of meta is a third.
+        CHECK(f.gen_i == 2);
     }
 }
 
 TEST_CASE("read_catalogue_page: cursor and degrade outcomes", "[server][software_catalogue_model]") {
     SECTION("a cursor from an older generation is stale before any row read") {
-        const auto tok = encode_catalogue_cursor(Row("a", 3), filter_fingerprint({}), 9);
+        const auto tok = encode_catalogue_cursor(row("a", 3), filter_fingerprint({}), 9);
         FakeIo f;
         f.gens = {10};
-        CataloguePage page;
-        CHECK(read_catalogue_page(f.io(), Req(1, tok), page) == PageStatus::kStale);
-        CHECK(page.cursor_error == CursorError::kStale);
+        auto page = read_catalogue_page(f.io(), req(1, tok));
+        REQUIRE_FALSE(page);
+        CHECK(page.error().status == PageStatus::kStale);
+        CHECK(page.error().cursor_error == CursorError::kStale);
         CHECK(f.rows_reads == 0);
     }
     SECTION("a cursor for other filters or garbage is a bad cursor") {
         SoftwareCatalogQuery other;
         other.kind = "app";
-        const auto tok = encode_catalogue_cursor(Row("a", 3), filter_fingerprint(other), 10);
+        const auto tok = encode_catalogue_cursor(row("a", 3), filter_fingerprint(other), 10);
         FakeIo f;
         f.gens = {10};
-        CataloguePage page;
-        CHECK(read_catalogue_page(f.io(), Req(1, tok), page) == PageStatus::kBadCursor);
-        CHECK(page.cursor_error == CursorError::kFilterMismatch);
-        CHECK(read_catalogue_page(f.io(), Req(1, "garbage"), page) == PageStatus::kBadCursor);
-        CHECK(page.cursor_error == CursorError::kMalformed);
+        auto mismatch = read_catalogue_page(f.io(), req(1, tok));
+        REQUIRE_FALSE(mismatch);
+        CHECK(mismatch.error().status == PageStatus::kBadCursor);
+        CHECK(mismatch.error().cursor_error == CursorError::kFilterMismatch);
+        auto garbage = read_catalogue_page(f.io(), req(1, "garbage"));
+        REQUIRE_FALSE(garbage);
+        CHECK(garbage.error().status == PageStatus::kBadCursor);
+        CHECK(garbage.error().cursor_error == CursorError::kMalformed);
     }
     SECTION("any nullopt read is a degrade") {
         FakeIo rows_down;
         rows_down.gens = {10};
         rows_down.rows_ok = false;
-        CataloguePage page;
-        CHECK(read_catalogue_page(rows_down.io(), Req(1), page) == PageStatus::kDegraded);
+        auto a = read_catalogue_page(rows_down.io(), req(1));
+        REQUIRE_FALSE(a);
+        CHECK(a.error().status == PageStatus::kDegraded);
         FakeIo totals_down;
         totals_down.gens = {10};
         totals_down.totals_ok = false;
-        CHECK(read_catalogue_page(totals_down.io(), Req(1), page) == PageStatus::kDegraded);
+        auto b = read_catalogue_page(totals_down.io(), req(1));
+        REQUIRE_FALSE(b);
+        CHECK(b.error().status == PageStatus::kDegraded);
     }
     SECTION("the host path reads no meta and uses generation 0") {
         FakeIo f;
         f.gens = {10};
-        f.rows = {Row("a", 1)};
-        auto rq = Req(1);
+        f.rows = {row("a", 1)};
+        auto rq = req(1);
         rq.query.agent_id = "dev-1";
-        CataloguePage page;
-        REQUIRE(read_catalogue_page(f.io(), rq, page) == PageStatus::kOk);
-        CHECK_FALSE(page.meta.has_value());
+        auto page = read_catalogue_page(f.io(), rq);
+        REQUIRE(page);
+        CHECK_FALSE(page->meta.has_value());
         CHECK(f.gen_i == 0);
-        CHECK(decode_catalogue_cursor(page.next_cursor, filter_fingerprint(rq.query), 0));
+        CHECK(decode_catalogue_cursor(page->next_cursor, filter_fingerprint(rq.query), 0));
     }
 }
 
 TEST_CASE("read_titles_export brackets the walk by the generation",
           "[server][software_catalogue_model]") {
-    auto rq = Req(100);
+    auto rq = req(100);
     rq.format = "csv";
     rq.query.limit = 10;
-    std::string csv;
-    bool truncated = false;
     SECTION("stable") {
         FakeIo f;
         f.gens = {10};
-        f.rows = {Row("a", 3)};
-        REQUIRE(read_titles_export(f.io(), rq, false, csv, truncated) == PageStatus::kOk);
-        CHECK(csv.find("a,Acme,3") != std::string::npos);
+        f.rows = {row("a", 3)};
+        auto ex = read_titles_export(f.io(), rq, false);
+        REQUIRE(ex);
+        CHECK(ex->csv.find("a,Acme,3") != std::string::npos);
+        CHECK(ex->rows == 1);
     }
     SECTION("moved once restarts, moved twice degrades") {
         FakeIo once;
         once.gens = {10, 11, 11, 11};
-        once.rows = {Row("a", 3)};
-        CHECK(read_titles_export(once.io(), rq, false, csv, truncated) == PageStatus::kOk);
+        once.rows = {row("a", 3)};
+        CHECK(read_titles_export(once.io(), rq, false));
         FakeIo twice;
         twice.gens = {10, 11, 11, 12};
-        twice.rows = {Row("a", 3)};
-        CHECK(read_titles_export(twice.io(), rq, false, csv, truncated) == PageStatus::kDegraded);
+        twice.rows = {row("a", 3)};
+        auto ex = read_titles_export(twice.io(), rq, false);
+        REQUIRE_FALSE(ex);
+        CHECK(ex.error().status == PageStatus::kDegraded);
     }
     SECTION("a degraded read never yields a partial body") {
         FakeIo f;
         f.gens = {10};
         f.rows_ok = false;
-        CHECK(read_titles_export(f.io(), rq, false, csv, truncated) == PageStatus::kDegraded);
+        auto ex = read_titles_export(f.io(), rq, false);
+        REQUIRE_FALSE(ex);
+        CHECK(ex.error().status == PageStatus::kDegraded);
     }
 }

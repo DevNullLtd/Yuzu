@@ -6767,7 +6767,7 @@ The **fleet software title catalogue**: one row per title rolled up across the w
 | `cursor` | string | Opaque `next_cursor` from the previous page |
 | `format` | `json` \| `csv` | `csv` exports the titles (REST-only) |
 
-A repeated parameter, a non-integer `limit`/`versions_min`, an unknown `format` or a cursor over 2048 bytes is a `400`. An empty `kind`/`ecosystem`/`source` means "no filter", so those values cannot be selected as `''`.
+A repeated parameter, a non-integer `limit`/`versions_min`, an unknown `format`, a cursor over 2048 bytes, or a `cursor` sent with `format=csv` (an export is one whole walk and takes no continuation) is a `400`. An empty `kind`/`ecosystem`/`source` means "no filter", so those values cannot be selected as `''`.
 
 **Response (200):**
 
@@ -6780,7 +6780,7 @@ A repeated parameter, a non-integer `limit`/`versions_min`, an unknown `format` 
        "newest_version": "2.41"}
     ],
     "count": 1,
-    "next_cursor": "c1:9a1c0e5d7b3f2a68:1790000000:MwBnaXQ",
+    "next_cursor": "c1:9a1c0e5d7b3f2a68:1790000000:Mx9naXQ",
     "totals": {"titles": 2, "installs": 4},
     "kpis": {
       "titles": 2, "publishers": 2, "installs": 4,
@@ -6804,14 +6804,14 @@ A repeated parameter, a non-integer `limit`/`versions_min`, an unknown `format` 
 - `kpis` is present on the **first fleet page only** — it is `null` on continuation pages and on the per-device view. The headline numbers come from the hourly refresh; percentages are derived (`os_pct` of installs, rounded; `stay_current.pct` is `null` when no title has a known version; `sprawl.pct` to one decimal). `coverage` is **counts**, not a ratio: `reporting` = devices with stored inventory, `connected` = devices currently connected (a registry read, `null` when unavailable), `stale` = devices not seen in 48 hours (`null` when that bounded count is unavailable). There is deliberately no coverage percentage — no honest denominator exists. `building: true` with zero counts means the rollup has never been computed (a `200`, not an error).
 - **Cursor.** `next_cursor` is non-null when the page is full. It is bound to the filter set **and to the catalogue refresh generation** (`kpis.refreshed_at`, 1-second granularity — two refreshes inside one second share a generation). A malformed cursor, a cursor from a different filter set, or one issued **before the latest refresh** is a `400` (`invalid cursor` / `cursor was issued for a different filter set` / `cursor predates the current catalogue refresh; restart from the first page`) — a client holding a stale cursor restarts from the first page. If a refresh lands *during* a first-page read the server re-reads once; a second move is a `503`.
 - **Per-device view** (`agent_id`): admitted for an in-scope device. For a confined caller `newest_version` is blank and `newest_omitted: true` (the newest version is a fleet-wide fact). A device outside the caller's scope returns an empty page with `devices_omitted: 1` and a `denied` audit row (no oracle on whether the device exists).
-- **Export** (`format=csv`): `text/csv; charset=utf-8`, `Content-Disposition: attachment; filename="software-titles.csv"`, header `name,publisher,installs,versions,ecosystems,kinds,newest_version` (lists `;`-joined). `limit` is the total cap (default and max 10000); `X-Result-Truncated-By-Cap: true` when the cap was reached. Audited as `inventory.software.export`.
+- **Export** (`format=csv`): `text/csv; charset=utf-8`, `Content-Disposition: attachment; filename="software-titles.csv"`, header `name,publisher,installs,versions,ecosystems,kinds,newest_version` (lists `;`-joined). `limit` is the total cap (default and max 10000); `X-Result-Truncated-By-Cap: true` when the cap was reached. Audited as `inventory.software.export` (`rows=` is the number of titles written). **Set-and-proceed:** `Sec-Audit-Failed: true` is set, and the export is still served, when the export audit row did not persist (machine-scope data, not behavioural PII).
 - **Audit.** Every call writes `inventory.software.catalog` `success` — first **and** continuation pages (the latter tagged `page=continuation`) — with detail `titles=N totals=T/I`. `audit_persisted: false` is added when the row could not be persisted.
 
 **Error responses** (A4 envelope with `correlation_id`):
 
 | Status | Condition |
 |---|---|
-| 400 | Repeated/malformed parameter, unknown `format`, or a refused cursor (see above) |
+| 400 | Repeated/malformed parameter, unknown `format`, a `cursor` with `format=csv`, or a refused cursor (see above) |
 | 401 | Unauthenticated |
 | 403 | Confined caller on the fleet view (`permission: "Inventory:Read"`), or a service-scoped token |
 | 503 | Store unavailable or degraded — rows, totals or refresh-metadata read failed, or the gate is unwired — `retry_after_ms: 5000`; **never an empty 200**. A degraded totals read fails the whole page |
