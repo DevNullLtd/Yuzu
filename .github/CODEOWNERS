@@ -27,7 +27,7 @@
 /tests/unit/server/test_guaranteed_state*            @FortitudeEtc
 /tests/unit/server/test_rest_guaranteed*             @FortitudeEtc
 
-# Dispatch capability catalogue and its drift gates — owners @fjarvis @FortitudeEtc
+# Dispatch capability catalogue and its drift gates: owners @fjarvis @FortitudeEtc
 # The catalogue rows (DispatchClass, ExecuteGate) decide what a definition may run and
 # what needs approval; the tests below are the only automated check that content stays
 # consistent with them. Either owner can satisfy the review request, so the review is
