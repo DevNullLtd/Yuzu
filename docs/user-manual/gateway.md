@@ -839,6 +839,19 @@ The gateway is configured via `gateway/config/sys.config`. Key settings:
 ]}
 ```
 
+**`cluster_id`** (the `cluster_id` key above, or the `YUZU_GW_CLUSTER_ID` environment
+variable, which replaces it when set): the name is converted to UTF-8 with the unicode
+conversion, so a name given as a list of Unicode code points (for example one with an
+accented letter, or with characters above 255) is stamped on every notification as valid
+UTF-8; a name that cannot be represented (a code point above 16#10FFFF, a surrogate,
+or bytes that are not UTF-8) makes the gateway refuse to start, with a critical log line
+that names which of the two sources is wrong and never prints the value. It refuses
+rather than warns and falls back because the cluster id pins agents to a trust zone, so
+starting under a different id is wrong, and starting with an id that makes every
+notification fail to encode would silently lose all stream status (INFERRED from the
+code and unit tests, not run on a rig). An empty name is still accepted, and the default is
+`default`.
+
 **Upstream client tuning** (registration replay and pending notifications; application env keys read by the upstream
 client at start, except `upstream_call_timeout_ms`, which is read on every call; set them in the `yuzu_gw` section of `sys.config`. No
 `YUZU_GW_*` environment variable maps to any of them):
@@ -999,14 +1012,16 @@ near the cap and with an L4 forwarder multiplexing agents was not run, and the
 default of 8 is a chosen value, not one derived from fleet data.
 
 **Circuit breaker tuning** (the breaker the replay and the other upstream calls
-share; read once when the upstream client starts, not range-checked, and each key
-has an environment override, unlike the replay keys above):
+share; read once when the upstream client starts, and each key has an environment
+override, unlike the replay keys above. The two reset timeouts are range-checked
+(1 to 3600000 ms); `circuit_breaker_failure_threshold` is not, and 0 would open
+the breaker on the first failure):
 
 | Key | Environment override | Default | Meaning |
 |---|---|---|---|
 | `circuit_breaker_failure_threshold` | `YUZU_GW_CB_FAILURE_THRESHOLD` | 5 | Consecutive failed upstream calls that open the breaker |
-| `circuit_breaker_reset_timeout_ms` | `YUZU_GW_CB_RESET_TIMEOUT_MS` | 10000 | How long the breaker stays open the first time before it goes half open and allows one probe: a call-path RPC or, when stream-status notifications are held, the head held notification. A successful probe closes the breaker and starts the registration replay of every agent the node holds (OBSERVED on a rig) |
-| `circuit_breaker_max_reset_timeout_ms` | `YUZU_GW_CB_MAX_RESET_TIMEOUT_MS` | 300000 | Cap on the open duration, which doubles each time a trip or a failed probe reopens the breaker (10 s, 20 s, 40 s, 80 s and so on) and returns to the first value when a probe succeeds. This is the 300 s the recovery bounds in "What happens when the server restarts" cite |
+| `circuit_breaker_reset_timeout_ms` | `YUZU_GW_CB_RESET_TIMEOUT_MS` | 10000 (valid range 1 to 3600000) | How long the breaker stays open the first time before it goes half open and allows one probe: a call-path RPC or, when stream-status notifications are held, the head held notification. A successful probe closes the breaker and starts the registration replay of every agent the node holds (OBSERVED on a rig). A value that is not an integer in 1 to 3600000 (0, a negative number, a float, a string, more than an hour) logs a WARN that names the key (`Invalid circuit_breaker_reset_timeout_ms value <V> (expected an integer in 1..3600000); using 10000`) and takes the default. The floor is 1 because the probe is timer driven and a trip doubles the interval: 0 would stay 0 and make the half open probe a hot loop forever. An environment override is converted to an integer and then checked against the same range when the upstream client starts (INFERRED from the code and unit tests, not run on a rig) |
+| `circuit_breaker_max_reset_timeout_ms` | `YUZU_GW_CB_MAX_RESET_TIMEOUT_MS` | 300000 (valid range 1 to 3600000) | Cap on the open duration, which doubles each time a trip or a failed probe reopens the breaker (10 s, 20 s, 40 s, 80 s and so on) and returns to the first value when a probe succeeds. This is the 300 s the recovery bounds in "What happens when the server restarts" cite. An invalid value takes the default with a WARN that names the key, as for the reset timeout |
 
 
 **`YUZU_GW_ADVERTISE_ADDR`** (env var only, no `sys.config` key — consumed by
