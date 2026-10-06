@@ -1352,6 +1352,8 @@ ListReadGate AuthRoutes::require_list_read(const httplib::Request& req, httplib:
     // flat list-read gate has no single agent_id to scope the token's
     // service against, so admitting it would hand a service-scoped token the
     // WHOLE fleet's data.
+    // No `.permission` on the body (routed-concern clause 5): this is a blanket deny of the
+    // credential class, so granting `perm` to anyone would not admit this caller.
     if (!session->token_scope_service.empty()) {
         audit_log(req, "auth.permission_required", "denied", "", "",
                   "service-scoped token '" + session->token_scope_service +
@@ -1359,8 +1361,7 @@ ListReadGate AuthRoutes::require_list_read(const httplib::Request& req, httplib:
         res.status = 403;
         res.set_content(
             detail::a4_denial(res, 403,
-                              "service-scoped tokens cannot read the fleet-wide status rollup",
-                              detail::A4ErrorOpts{.permission = perm}),
+                              "service-scoped tokens cannot read the fleet-wide status rollup"),
             "application/json");
         return gate;
     }

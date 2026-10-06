@@ -3257,8 +3257,8 @@ unfiltered.**
    policy-table entry, never inferred from one route being changed. The ceiling half is ONE shared
    check, `authz::service_ceiling_check` (`authz_gates.{hpp,cpp}`), called by `require_permission`,
    `require_scoped_permission` and `require_fleet_read` alike: extend it, never fork it.
-   `RbacStore::check_role_has_permission` has no production caller (tests only); a new service-token
-   gate calls `authz::service_ceiling_check`, which keeps a failed read distinct from a deny.
+   A new service-token gate calls `authz::service_ceiling_check`, which keeps a failed read distinct
+   from a deny; there is no `bool` wrapper over the role-permission row loop that would fold the two.
 
 2. **Branch order in `require_permission`/`require_scoped_permission` is fixed — `elevated → engine →
    mcp_tier → service → RBAC-enforced → legacy` — never reorder it.** The elevated branch is guarded
@@ -3299,7 +3299,7 @@ unfiltered.**
    `ComplianceRoutes::deny_service_scoped_`, `WorkflowRoutes`'
    `deny_service_scoped_schedule_list`/`deny_service_scoped_scope_estimate`,
    `GuardianRoutes::deny_service_scoped_`/`deny_service_scoped_mutation_`,
-   `DexRoutes::deny_service_scoped_`, `DeploymentRoutes::deny_service_scoped_`. #3167 closed the
+   `DexRoutes::deny_service_scoped_`, `DeploymentRoutes::deny_service_scoped_`, and `AuthRoutes::require_list_read`'s inline service-scoped deny (it refuses the whole credential class, so its body carries no `.permission`). #3167 closed the
    remainder — `PreflightRoutes::deny_service_scoped_`'s 3 call sites plus its separate inline deny on
    the MUTATING `POST /fragments/auto/run`, `schedule_routes.*`'s `deny_service_scoped_schedule` and
    its 4 call sites (each already passed a correctly-typed permission per operation — the defect was
@@ -4348,7 +4348,7 @@ shared pool, so it adds **no new flag or environment variable**.
 authz read keeps its `bool`/deny-on-error contract: a store-not-open,
 pool-acquire timeout, or query error returns **deny** (`false` for the
 `check_permission` / `check_scoped_permission` / `holds_permission_via_any_group`
-/ `check_role_has_permission` bool checks; the empty/most-restrictive result for
+bool checks; the empty/most-restrictive result for
 the list/scope reads), NEVER allow. Where a caller needs to distinguish "denied"
 from "store degraded" for a 403-vs-503 decision (e.g. `authorize_list_read`),
 that is exposed via a **separate** tri-state / `std::expected` accessor — the

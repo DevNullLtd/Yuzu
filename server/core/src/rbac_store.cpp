@@ -3083,11 +3083,11 @@ RbacStore::role_permission_allowed_checked(const std::string& role_name,
                                            const std::string& securable_type,
                                            const std::string& operation) const {
     // THE one row loop for "does this role grant this pair" (extend, never fork):
-    // `check_role_has_permission` and `authz::service_ceiling_check` (authz_gates.cpp)
-    // both delegate here. First row for the pair decides: `allow` admits, `deny` or an
-    // absent pair (a revoked default is a DELETEd row) refuses. A failed read is an error,
-    // never a false allow. The read is the breaker-gated authz read: this runs on the
-    // request path of every service-token fleet read.
+    // `authz::service_ceiling_check` (authz_gates.cpp) delegates here. First row for the
+    // pair decides: `allow` admits, `deny` or an absent pair (a revoked default is a
+    // DELETEd row) refuses. A failed read is an error, never a false allow. The read is
+    // the breaker-gated authz read: this runs on the request path of every service-token
+    // fleet read.
     auto perms = get_role_permissions_authz_checked(role_name);
     if (!perms)
         return std::unexpected(std::move(perms.error()));
@@ -3100,13 +3100,6 @@ RbacStore::role_permission_allowed_checked(const std::string& role_name,
         }
     }
     return false;
-}
-
-bool RbacStore::check_role_has_permission(const std::string& role_name,
-                                          const std::string& securable_type,
-                                          const std::string& operation) const {
-    // Thin fail-closed wrapper: a store error (unexpected) folds into DENY.
-    return role_permission_allowed_checked(role_name, securable_type, operation).value_or(false);
 }
 
 } // namespace yuzu::server

@@ -27,6 +27,7 @@
 #include <memory>
 #include <optional>
 #include <set>
+#include <stdexcept>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -206,18 +207,21 @@ TEST_CASE("upload-grants list: a service-scoped token is refused and the minter'
     CHECK(denied_rows == 1);
 }
 
-TEST_CASE("upload-grants list: an unwired service-scope deny still refuses a service token",
+TEST_CASE("upload-grants list: an unwired service-scope deny is refused at registration, "
+          "before any route is added",
           "[pg][authz][service_scope][upload]") {
     YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::response_execution_authz_tpl);
     UploadGrantScopeRig r{db.dsn()};
     yuzu::server::test::TestRouteSink sink;
-    register_file_retrieval_routes(sink, r.make_deps(/*wire_deny=*/false));
-
-    const auto svc = r.mint_token("printers");
-    auto res = sink.dispatch("GET", "/api/v1/upload-grants", {}, "application/json",
-                             {{"Authorization", "Bearer " + svc}});
-    REQUIRE(res);
-    CHECK(res->status == 403);
-    CHECK(res->body.find("\"permission\"") == std::string::npos);
-    CHECK(res->body.find("\"data\"") == std::string::npos);
+    CHECK_THROWS_AS(register_file_retrieval_routes(sink, r.make_deps(/*wire_deny=*/false)),
+                    std::invalid_argument);
+    try {
+        register_file_retrieval_routes(sink, r.make_deps(/*wire_deny=*/false));
+    } catch (const std::invalid_argument& e) {
+        CHECK(std::string{e.what()} ==
+              "register_file_retrieval_routes: deps.deny_service_scoped_fn must be bound");
+    }
+    // Nothing was registered: neither the list route nor the operator routes before it.
+    CHECK(sink.dispatch("GET", "/api/v1/upload-grants") == nullptr);
+    CHECK(sink.dispatch("POST", "/api/v1/upload-grants", "{}") == nullptr);
 }

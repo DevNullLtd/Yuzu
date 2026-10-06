@@ -15,8 +15,8 @@
 ///
 /// Failure posture (ADR-0041), the load-bearing invariant:
 ///  - **Authz reads FAIL CLOSED.** `check_permission` /
-///    `check_scoped_permission` / `holds_permission_via_any_group` /
-///    `check_role_has_permission` keep their `bool`/DENY-on-error contract: a
+///    `check_scoped_permission` / `holds_permission_via_any_group` keep their
+///    `bool`/DENY-on-error contract: a
 ///    store-not-open, pool-acquire timeout, or query error returns `false`
 ///    (deny), NEVER `true`. The list/scope reads return the empty /
 ///    most-restrictive result on degrade. Callers that must distinguish
@@ -583,7 +583,7 @@ public:
     /// The ONE row loop deciding whether a role grants a (securable, operation) pair
     /// (extend, never fork). First matching row decides; `allow` => true, `deny` or an
     /// absent pair => false; a failed read => `unexpected(msg)` (never a false allow).
-    /// `check_role_has_permission` and `authz::service_ceiling_check` both delegate here.
+    /// `authz::service_ceiling_check` delegates here.
     /// The read goes through the same breaker and short acquire budget as the hot authz
     /// reads, so a degraded store fails fast instead of pinning a worker: the error is then
     /// `kRbacErrCircuitBreakerOpen` or `kRbacErrPoolAcquireTimeout` (both map to the
@@ -593,14 +593,6 @@ public:
     role_permission_allowed_checked(const std::string& role_name,
                                     const std::string& securable_type,
                                     const std::string& operation) const;
-
-    /// Check if a specific role grants a permission. FAIL-CLOSED: false on any store
-    /// error. Thin wrapper over `role_permission_allowed_checked`. It has no production
-    /// caller (it is used by tests); new service-token gates must call
-    /// `authz::service_ceiling_check`, which keeps the failed-read case distinct from a deny.
-    /// Not marked `[[deprecated]]` because the many remaining test callers build with -Werror.
-    bool check_role_has_permission(const std::string& role_name, const std::string& securable_type,
-                                   const std::string& operation) const;
 
     /// All effective permissions for a user (for UI display).
     std::vector<Permission> get_effective_permissions(const std::string& username) const;

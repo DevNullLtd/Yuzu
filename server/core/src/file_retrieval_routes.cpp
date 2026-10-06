@@ -21,6 +21,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <system_error>
 #include <unordered_map>
@@ -424,9 +425,11 @@ void register_list(HttpRouteSink& sink, Deps deps) {
         // The list-admit resolver below evaluates the MINTER's username, so without this a
         // service token would inherit its minter's UploadGrant:Read view (the whole fleet for
         // a minter with a global grant). Non-service sessions skip this block entirely.
+        // `register_file_retrieval_routes` refuses to register with an unwired closure, so it
+        // is bound here. A closure that did not write the denial (returned false) still
+        // refuses: the generic 403 below is the fail-closed fallback for that.
         if (!session->token_scope_service.empty()) {
-            if (!deps.deny_service_scoped_fn ||
-                !deps.deny_service_scoped_fn(req, res, "upload_grant.list.access_denied",
+            if (!deps.deny_service_scoped_fn(req, res, "upload_grant.list.access_denied",
                                              "service-scoped tokens may not list upload grants",
                                              "UploadGrant", ""))
                 send_generic(res, 403, "permission denied");
@@ -1061,6 +1064,12 @@ void register_cancel(HttpRouteSink& sink, Deps deps) {
 } // namespace
 
 void register_file_retrieval_routes(HttpRouteSink& sink, Deps deps) {
+    // The list route refuses a service-scoped token through this closure. Refuse at
+    // registration, before any route is added, rather than substituting a different answer
+    // at request time (the same convention as register_health_routes).
+    if (!deps.deny_service_scoped_fn)
+        throw std::invalid_argument(
+            "register_file_retrieval_routes: deps.deny_service_scoped_fn must be bound");
     register_mint(sink, deps);
     register_list(sink, deps);
     register_revoke(sink, deps);

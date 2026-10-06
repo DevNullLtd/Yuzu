@@ -105,6 +105,7 @@ struct Deps {
     AuthFn auth_fn;
     PermFn perm_fn;
     ListReadFn list_read_fn;
+    /// REQUIRED: `register_file_retrieval_routes` throws `std::invalid_argument` if unbound.
     DenyServiceScopedFn deny_service_scoped_fn;
     AuditFn audit_fn;
     UploadGrantStore* store{nullptr};
@@ -133,7 +134,8 @@ struct Deps {
 
 /// Register the upload-grant + chunked-receive REST surface. A free
 /// function (not a class method) — the frozen deliverable signature;
-/// server.cpp constructs one `Deps` and calls this once.
+/// server.cpp constructs one `Deps` and calls this once. Throws `std::invalid_argument`
+/// before registering any route when `deps.deny_service_scoped_fn` is unbound.
 void register_file_retrieval_routes(HttpRouteSink& sink, Deps deps);
 
 /// Live entry count of the process-static per-upload write-lock map.
