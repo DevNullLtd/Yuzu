@@ -144,7 +144,7 @@ Yuzu/
 
 Prebuilt artifacts are published with every tagged release. If you just want to run Yuzu, start here — you do not need to build from source.
 
-- **Release binaries & installers** (server/agent for Linux, Windows, macOS; Compose Wizard zip): [GitHub Releases](https://github.com/DevNullLtd/Yuzu/releases). Latest stable is v0.14.0.
+- **Release binaries & installers** (server/agent for Linux, Windows, macOS; Compose Wizard zip): [GitHub Releases](https://github.com/DevNullLtd/Yuzu/releases). Latest stable is v0.14.1.
 - **Container images** (published to GHCR on every tag):
   - `ghcr.io/devnullltd/yuzu-server:<version>`
   - `ghcr.io/devnullltd/yuzu-postgres:<version>`
@@ -157,8 +157,8 @@ Step 1 creates a `yuzu` directory, downloads the compose file into it and writes
 ```bash
 [ -z "$(docker volume inspect -f '{{.Name}}' yuzu_server-data yuzu_certs yuzu_postgres-data 2>/dev/null)" ] &&
 mkdir yuzu && cd yuzu &&
-curl -fsSL https://raw.githubusercontent.com/DevNullLtd/Yuzu/v0.14.0/deploy/docker/docker-compose.reference.yml -o docker-compose.yml &&
-(umask 077; set -C; p1=$(openssl rand -hex 24) && p2=$(openssl rand -hex 24) && [ ${#p1} -eq 48 ] && [ ${#p2} -eq 48 ] && printf 'YUZU_VERSION=0.14.0\nYUZU_POSTGRES_PASSWORD=%s\nYUZU_DB_PASSWORD=%s\n' "$p1" "$p2" > .env)
+curl -fsSL https://raw.githubusercontent.com/DevNullLtd/Yuzu/v0.14.1/deploy/docker/docker-compose.reference.yml -o docker-compose.yml &&
+(umask 077; set -C; p1=$(openssl rand -hex 24) && p2=$(openssl rand -hex 24) && [ ${#p1} -eq 48 ] && [ ${#p2} -eq 48 ] && printf 'YUZU_VERSION=0.14.1\nYUZU_POSTGRES_PASSWORD=%s\nYUZU_DB_PASSWORD=%s\n' "$p1" "$p2" > .env)
 ```
 
 Step 2 creates the first admin account. The server's first-run setup asks for it on a terminal, which a detached container does not have, so this writes the file that setup would write, `yuzu-server.cfg` (PBKDF2-HMAC-SHA256, 100,000 iterations), and copies it into the server's data volume. It asks for the password twice and refuses to overwrite either copy.
