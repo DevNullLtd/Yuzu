@@ -322,13 +322,13 @@ TEST_CASE("route: software fragment results_only=1 returns only the #sw-results 
     REQUIRE_FALSE(contains(res->body, "inv-h1"));
 }
 
-TEST_CASE("route: software fragment forwards q into the store's name_filter",
+TEST_CASE("route: software fragment forwards q into the store's q",
           "[inventory][route]") {
     InvHarness h;
     auto res = h.sink.Get("/fragments/inventory/software?q=adobe");
     REQUIRE(res);
     REQUIRE(h.last_catalog_query.has_value());
-    REQUIRE(h.last_catalog_query->name_filter == "adobe");
+    REQUIRE(h.last_catalog_query->q == "adobe");
 }
 
 TEST_CASE("route: software devices — hostname resolution, columns, filter-group id",

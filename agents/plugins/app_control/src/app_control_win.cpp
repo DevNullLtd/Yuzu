@@ -104,6 +104,16 @@ static_assert(kMaxValueBytes % sizeof(wchar_t) == 0, "the value buffer is sized 
 static_assert(sizeof(void*) == 8);
 // plan_cim consumes the bounded query's rows directly.
 static_assert(std::is_same_v<yuzu::app_control::WmiRow, yuzu::shared::wmi::WmiRow>);
+// classify_wmi_error_token spells wmi_bounded's stage prefixes as literals (it must stay
+// OS-header-free); pin them so a renamed prefix fails the Windows build instead of silently
+// misclassifying a stage (mirrors firmware_posture_win.cpp).
+static_assert(std::string_view{yuzu::shared::wmi::error_tokens::kWmiConnectFailedPrefix} ==
+                      "wmi_connect_failed_" &&
+                  std::string_view{yuzu::shared::wmi::error_tokens::kWmiQueryFailedPrefix} ==
+                      "wmi_query_failed_" &&
+                  std::string_view{yuzu::shared::wmi::error_tokens::kWmiNextFailedPrefix} ==
+                      "wmi_next_failed_",
+              "classify_wmi_error_token's stage prefixes must match wmi_bounded.hpp's error_tokens");
 
 struct Outcome {
     yuzu::shared::ConstraintAccumulator acc;
@@ -316,7 +326,7 @@ int collect_applocker(yuzu::CommandContext& ctx) {
 
     // The shell only performs the query; plan_cim decides what its result means.
     const auto q = bounded_cim_query(kCimNamespace, kCimApplockerWql);
-    const auto plan = plan_cim(q.error, q.rows, q.truncated);
+    const auto plan = plan_cim(q.error, q.rows, q.truncated, q.rows_before_error);
     for (const auto& r : plan.rows)
         ctx.write_output(format_applocker_row(r));
 

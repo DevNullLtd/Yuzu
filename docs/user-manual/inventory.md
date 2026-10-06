@@ -500,13 +500,13 @@ place, **Hardware** and **Software**, each its own page:
     records that the *result view* was shown to the operator, not whether the
     underlying action itself succeeded) — see [Audit log](audit-log.md).
 
-- **`/software`** — the fleet software catalogue, unchanged in its rollup mechanics: a
-  background thread still precomputes the per-title/per-version counts hourly, the KPI
-  strip still shows Titles / Devices reporting / Stale / an "updated N ago" (or
-  "building") stamp for the catalogue, and the counts are still **fleet-wide, not
-  management-group scoped** — the same ADR-0017 gap the REST/MCP section above
-  describes. Two things changed:
-  - The search box is now a **real server round-trip matching title OR publisher**
+- **`/software`** — the fleet software catalogue. A background thread still precomputes
+  the per-title/per-version counts hourly (the mechanics changed — see "Catalogue rollup
+  grain and KPIs" under the rollup metrics below), the KPI strip still shows Titles /
+  Devices reporting / Stale / an "updated N ago" (or "building") stamp for the catalogue,
+  and the counts are still **fleet-wide, not management-group scoped** — the same ADR-0017
+  gap the REST/MCP section above describes. Three things changed:
+  - The search box is now a **real server round-trip matching title, publisher, ecosystem or source**
     (was client-side and title-only), using the same debounced/narrow-swap-target
     pattern as the Hardware list's search box.
   - Each row grows a **"devices ›"** control that expands inline — independent of the
@@ -526,6 +526,14 @@ place, **Hardware** and **Software**, each its own page:
   return `404` for an authenticated caller (an unauthenticated request is redirected to
   the login page first, like any other dashboard path); `/inventory` itself still
   redirects (`302`) to `/hardware`.
+
+  - The catalogue store now serves exact numbers under filters: **Installs is the exact
+    number of distinct devices** carrying the title under any kind/ecosystem/source
+    filter combination the store is given (a device carrying one title through two sources
+    counts once), and **search selects titles** — a matched title keeps its whole filtered slice. `%` and `_` in a
+    search term are literal characters, the term is clamped to 128 bytes, and a search that
+    exceeds its 5 s execution bound reports the catalogue as unavailable rather than showing
+    an empty table. The store's version drill now accepts the catalogue filters and a host.
 
 **On store degradation** the **`/software`** catalogue, its **devices ›** expansion, and
 the CI record's **Installed software** lens — the *authoritative* reads — show an
@@ -689,6 +697,16 @@ ingest is failing. Four further series sharpen the picture:
   be **frozen, not genuinely low** — the freeze-detector that travels with the
   gauge (the freshness count uses a tighter 250 ms budget than the read paths, so
   it can stall while `yuzu_inventory_read_degrade_total` stays quiet).
+- `yuzu_fleet_inventory_sync_skipping{source}` (gauge) — agents currently
+  heartbeating whose `source` skipped its latest collection cycle(s), from the agent
+  heartbeat tag `yuzu.sync.<source>.skip_streak` (today only `source="installed_software"`,
+  written by agents that include the skip-visibility change, #5327). The cause is in the agent's own log (the `sync: … — skipping this cycle`
+  warning, or `sync: installed_apps plugin not loaded`); the agent also publishes it as the
+  `yuzu.sync.<source>.last_skip` heartbeat tag, which no server page or API returns yet.
+  Published every sweep, 0 included. The gauge only counts agents that emit the
+  skip-streak heartbeat tag: an agent that does not emit it (older agents, during a
+  rollout, or in a mixed-version fleet) contributes zero even when its collector is
+  skipping, so a zero gauge does not establish that all collectors are healthy.
 - `yuzu_inventory_ingest_dropped_total{reason}` (counter, reason ∈ `store_not_open` /
   `pool_acquire_timeout` / `query_error` / `invalid_key` / `stale`) — generic-store
   (ADR-0037) upsert calls that did not persist. Ingest is fail-soft (the next
@@ -711,13 +729,17 @@ The **catalogue rollup** (the `/software` page's precomputed counts, refreshed
 hourly by the background `SoftwareCatalogRollup` thread) emits three further series:
 
 - `yuzu_inventory_catalog_rollup_total{outcome}` (counter, outcome ∈ `success` / `error`)
-  — one per recompute attempt. A rising `error` count with a frozen
-  `…_last_success_timestamp` means recomputes are failing (PG outage / the 60s budget
-  exceeded at scale) and the catalogue is going stale; keep-last-good serves the prior
-  rollup meanwhile.
+  — one per recompute attempt that completes or fails (a shutdown-cancelled attempt is
+  not counted as an error). A rising `error` count with a frozen
+  `…_last_success_timestamp` means recomputes are failing (PG outage, a statement over
+  its 60 s limit, or the 10-minute whole-refresh limit exceeded at scale) and the
+  catalogue is going stale; keep-last-good serves the prior rollup meanwhile, except for
+  the first refresh after the v8 upgrade, which has no last-good and leaves the catalogue
+  "building". The failing statement and its cause are in the server log (warning).
 - `yuzu_inventory_catalog_rollup_duration_seconds` (gauge) — the last recompute's
-  wall-clock. A rising value approaching the 60s budget is the leading indicator to raise
-  the budget (or shard the rollup) before recomputes start timing out. (A gauge, not a
+  whole-refresh wall-clock. Compare it with the two compile-time limits (not flags): 60 s
+  per statement and 600 s for the whole refresh. A value rising towards either is the
+  leading indicator that the fleet is nearing the ceiling below. (A gauge, not a
   histogram: at one sample/hour percentiles add nothing.)
 - `yuzu_inventory_catalog_rollup_last_success_timestamp` (gauge, epoch seconds) — the
   primary liveness signal; it is the source of the Software tab's "updated N ago" stamp.
@@ -725,6 +747,47 @@ hourly by the background `SoftwareCatalogRollup` thread) emits three further ser
   still alertable). Alert on `time() - this > 7200` **guarded by `and this > 0`** — the
   `> 0` guard skips the cold-boot "building" window (epoch 0); the never-succeeded /
   ongoing-failure case is caught by `…_rollup_total{outcome="error"}` instead.
+
+**Catalogue rollup grain and KPIs.** The rollup keeps one precomputed row per title x
+filter grain x distinct dimension combination, where the grain is which of kind, ecosystem
+and source are fixed (eight grains, from "title total" to "one exact combination"); a title
+therefore has between 8 and 8 x C rows (C = its count of distinct kind/ecosystem/source
+combinations), and every read is one exact lookup, never a sum. The refresh runs in one
+`REPEATABLE READ` transaction: one `GROUPING SETS` pass fills every grain (about three sorted
+passes of `installed_software`), one further pass computes the exact per-OS-family split, and
+the fleet-newest version of every title is folded from `version_rollup` through a server-side
+cursor into a transaction-scoped temp table with memory bounded by the batch size, not the
+title count. The refresh keeps the 60 s per-statement limit, gains a 10-minute whole-refresh
+limit (both compile-time), and aborts cleanly (last-good rollup kept) on shutdown.
+Scale ceiling (measured on PostgreSQL 18.6 with synthetic data at about 450 rows per
+endpoint, on one M-series host with a warm cache and 4 MB `work_mem`; read it as plus or
+minus 40%): the `GROUPING SETS` statement costs about 12.8 times the former single
+`GROUP BY` (37 s against 2.9 s at 1.8M installed rows; the whole refresh about 6.5 times)
+and reaches the flat 60 s statement limit at about 2.7M installed rows, roughly 6,000
+endpoints. A fleet already over that size at the v8 upgrade has no last-good rollup, so its
+catalogue stays "building" until the rollup is made incremental; a fleet that outgrows it
+later keeps serving the last-good rollup while its "updated N ago" stamp ages. The server's
+database role needs the `TEMPORARY` privilege (the default `PUBLIC` grant; re-grant it after
+a `REVOKE TEMP` hardening), because the refresh uses a transaction-scoped temporary table;
+without it every refresh fails with a permission-denied error (SQLSTATE 42501) and the
+catalogue stays "building". A rollback to an older binary is clean: its grain-less refresh
+and read treat every row as a title-grain row (each title once). On an upgrade with older
+replicas still running, restart them promptly: the v8 `DROP` queues behind an old replica's
+refresh and dies at the pool's 10 s `lock_timeout` (the new server then refuses to start,
+fail-closed). A mixed old/new window has three transient asymmetries until each side's next
+hourly refresh: an old replica's read lists every grain row the new binary wrote (8 to
+8 x C per title), and after an old replica's refresh the new binary's filtered reads are
+empty (not "building"), and the KPI numbers stay at their last new-binary values under a
+fresh "updated" stamp.
+
+KPI definitions: total installs = distinct (device, title) pairs; the OS split counts each
+(device, title) pair once per OS family derived from the ecosystem; stay-current = distinct devices on each title's exact newest
+version string divided by distinct devices carrying the title, over every title with a known
+version (equivalent spellings such as `1.0` and `1.0.0` are not merged); "newest" is decided
+by the catalogue's own transitive version order, which agrees with the NVD comparator on its
+documented examples; version sprawl = titles on three or more versions; rpm unsigned = the
+unsigned share of rpm installs. After an upgrade the catalogue reads "building" until the
+first refresh completes (the rollup tables are derived data and are rebuilt, never migrated).
 
 Shipped alert rules live in the `yuzu-inventory` group of
 `docs/prometheus/yuzu-alerts.yml`: `YuzuInventorySustainedIngestErrors` (a non-zero
@@ -755,7 +818,14 @@ threshold (`>50` is day-one noise on a 100-device pilot and 0.1% ambient churn o
 explicit `on()/group_left()` matching with a denominator caveat. **Enable it** once
 you have observed your fleet's normal stale-count baseline and set the threshold to
 ~5–10% of your expected active fleet; correlate with `yuzu_fleet_agents_healthy` to
-separate "agents offline" from "sync source broken / disabled".
+separate "agents offline" from "sync source broken / disabled". Also
+correlate with `yuzu_fleet_inventory_sync_skipping{source="installed_software"}`: a
+host counted there is online but its collector is skipping (the reason is in that agent's
+log, and in its `last_skip` heartbeat tag, which no server page or API returns yet). The two gauges count different populations (stored-receipt age over 48 h in
+Postgres vs live heartbeats, which include hosts skipping for less than 48 h and
+hosts that have never reported), so read them side by side and never subtract one
+from the other. Agents that do not emit the skip tag (older agents, or during a
+rollout) are not counted, so a zero there does not rule out a skipping collector.
 
 **`install_location` is `-` for many Windows applications and every Linux application.** `-` means the OS
 reported no location, not that collection failed. Windows reads each Uninstall key's `InstallLocation`, which many

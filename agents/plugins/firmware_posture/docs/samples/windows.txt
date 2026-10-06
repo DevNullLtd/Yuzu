@@ -1,4 +1,4 @@
-captured: windows Windows 10.0.26200 x86_64 · bare-metal · 2026-09-21 · LocalSystem (elevated) · leg-hash e3b945e9e6db
+captured: windows Windows 10.0.26200 x86_64 · bare-metal · 2026-09-21 · LocalSystem (elevated) · leg-hash 35cf8bb6e007
 == action=firmware
 firmware|vendor|American Megatrends Inc.|wmi
 firmware|version|3801|wmi

@@ -1,0 +1,1 @@
+- **The Windows CI leg no longer times out, or comes close, on the bash test gates.** The agent OTA/ctx-slot, log-handoff and tier-policy source-text gates are now single-process Python, the two bash-only selftests (README touch-rule, `start-UAT.sh` `kill_stale`) are registered off Windows, and the OTA stale-pattern check now runs on every OS (#5428).
