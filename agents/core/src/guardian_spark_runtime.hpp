@@ -719,7 +719,7 @@ public:
     /// #4508: read-only claims_ walk; W1 requires at most one candidate per rule.
     [[nodiscard]] std::size_t wedge_candidate_count_for_test(const std::string& rule_id) const;
     /// Requires both FIFO-front identity membership and is_wedge_candidate_locked.
-    /// Reuses only is_wedge_k_eligible_locked's membership shape, not its Dispatched
+    /// Reuses only wedge_episode_locked's membership shape, not its Dispatched
     /// gate: is_retained_wedge (defined in the .cpp) also accepts Dispatching.
     /// A refused, popped claim can retain every candidate field under a different
     /// committed generation (CH-4); receipt history alone cannot prove membership.
@@ -1167,7 +1167,7 @@ private:
     /// adoption-catch cleanup of a mapping it re-added.
     ///
     /// `end` is a PR-5 plug point: a FACT about how the claim ended, recorded so the
-    /// fault-wiring rung (wedge marking / K-bound / arm_failed reason) has something to
+    /// fault-wiring rung (wedge marking / retry suppression / arm_failed reason) has something to
     /// classify. PR-1 carries NO classification logic on it; the only reads are the
     /// bookkeeping guards (a `Committed` claim is a rules_ entry, never "pending":
     /// detach_rule_locked's Case-0 skip, and the drain's publish fill-in).
@@ -1258,8 +1258,9 @@ private:
         // once the compensating disarm has genuinely finished (or turned out never to
         // be needed). expire_overdue_claims()'s terminal-recovery pass (up-4) reads it
         // to know a terminal/stranded head is safe to reap: never touch one whose
-        // compensation is not yet finished. is_wedge_k_eligible_locked() reads it too
-        // (#4472): a claim whose compensation is outstanding is never K-eligible.
+        // compensation is not yet finished. wedge_episode_locked() reads it too
+        // (#4472, #5459): it splits an outstanding wedge into Eligible (arm still
+        // hung) and CompensationPending (late result returned, teardown outstanding).
         // `compensation_deadline` is set ONCE, when compensation first becomes owed
         // (the same guard), from cfg_.backend_op_deadline - never reset on a fallback
         // retry. The instant compensation became owed is therefore
@@ -1412,7 +1413,7 @@ public:
     /// Convenience: receipt_status(receipt) != ReceiptStatus::Pending.
     bool is_terminal(const ArmReceipt& receipt) const;
 
-    /// rung 9c PR-5e (#4221, K-bound closeout - adversarial-review-class finding,
+    /// rung 9c PR-5e (#4221 - adversarial-review-class finding,
     /// cpp-safety): `status` exactly as receipt_status() would report, and
     /// `wedge_eligible` (meaningful ONLY when `status == Wedged`, false otherwise)
     /// exactly as receipt_wedge_k_eligible() would report - both computed under
@@ -1430,9 +1431,20 @@ public:
     /// the genuine success for this specific application (self-heals only on the
     /// NEXT identical retry, via decide_retry()'s forced Reapply once
     /// resolved_failed>0 - not truly unbounded, but a real, avoidable gap).
+    ///
+    /// #5459 (option D): `compensation_pending` (meaningful ONLY when `status ==
+    /// Wedged`, false otherwise, and never true together with `wedge_eligible`) is
+    /// the sibling observation for a wedge whose late result has RETURNED and whose
+    /// compensating teardown is still outstanding (`compensation_finished` false, the
+    /// claim still the Dispatched FIFO front). Both flags read the same single
+    /// registry_mu_ acquisition and the same private classification. The ledger
+    /// treats `wedge_eligible || compensation_pending` as "an outstanding wedge" for
+    /// RETRY SUPPRESSION only; neither flag ever authorises acknowledging a
+    /// generation (GuardianArmAckLedger::can_advance() has no wedge escape).
     struct WedgeAwareStatus {
         ReceiptStatus status{ReceiptStatus::Failed};
         bool wedge_eligible{false};
+        bool compensation_pending{false};
     };
     [[nodiscard]] WedgeAwareStatus receipt_status_wedge_aware(const ArmReceipt& receipt) const;
     /// rung 9c PR-5d (concern 2, arm-recovery): true iff `receipt`'s own claim has
@@ -1443,7 +1455,7 @@ public:
     /// receipt stays Wedged - a per-episode historical fact, docs/spark-stage2-
     /// guardian-consumer-design.md R5.3), so this is a SEPARATE signal for
     /// noticing a late-success recovery on a claim still held as a retained
-    /// failure. rung 9c PR-5e (#4221, K-bound closeout - governance Gate 4/
+    /// failure. rung 9c PR-5e (#4221 - governance Gate 4/
     /// consistency-auditor finding): `GuardianArmAckLedger::drain_locked()`'s
     /// recovery-scan loop, this accessor's own original motivating caller, now
     /// calls the atomic `receipt_recovery_status()` below instead (this standalone
@@ -1455,9 +1467,10 @@ public:
     /// internally.
     [[nodiscard]] bool receipt_recovered(const ArmReceipt& receipt) const;
 
-    /// rung 9c PR-5e (#4221, K-bound closeout): true iff `receipt`'s own claim is a
-    /// CURRENTLY, GENUINELY outstanding Wedged episode - the narrow subset of "sticky
-    /// Wedged" (see receipt_status()'s own doc comment) that K-bound may waive.
+    /// rung 9c PR-5e (#4221), reframed by #5459 (option D): true iff `receipt`'s own
+    /// claim is a CURRENTLY, GENUINELY outstanding Wedged episode whose arm is still
+    /// hung - the narrow subset of "sticky Wedged" (see receipt_status()'s own doc
+    /// comment) that decide_retry() may suppress an identical retry for.
     /// `end == ClaimEnd::WaiterTimedOutDispatched` alone is NOT sufficient - `end` is
     /// sticky (never un-Wedges) but the underlying episode is NOT: (1) a caller-side
     /// timeout can stamp WaiterTimedOutDispatched while the claim is still mid-dispatch
@@ -1477,7 +1490,7 @@ public:
     /// transitions, never collapsed") but POPS the claim from its key's FIFO the
     /// instant that resolution is published - so requiring `claim` to still be
     /// `claims_[claim->key]`'s FIFO FRONT is the "still-claimed" test
-    /// docs/spark-legacy-delta-registry.md's own K-bound row names: once popped, this
+    /// docs/spark-legacy-delta-registry.md's "still-claimed" rule: once popped, this
     /// reads false forever for that claim, regardless of what `end` still says. Both
     /// checks together, evaluated atomically under registry_mu_ (the same lock every
     /// FIFO pop and every reclassify_dispatching_race_locked() call already holds), are
@@ -1491,13 +1504,20 @@ public:
     /// #4472 (a third condition): AND no compensating disarm is outstanding for the
     /// claim (`compensation_finished`). A late result that has returned and is being
     /// disarmed leaves the claim FIFO-front until the teardown pops it, so the two
-    /// checks above alone would call it K-eligible; waiving it would acknowledge the
-    /// generation and stop the server's re-pushes, after which the pop leaves the rule
-    /// with no replacement arm. The marker is deliberately not the CompensationPermit
-    /// (engaged for every in-flight arm, a genuinely hung one included).
+    /// checks above alone cannot tell it from a hung arm; that case is reported by
+    /// `WedgeAwareStatus::compensation_pending` / `RecoveryStatus::CompensationPending`
+    /// instead (#5459), never by this predicate. The marker is deliberately not the
+    /// CompensationPermit (engaged for every in-flight arm, a genuinely hung one
+    /// included).
+    ///
+    /// #5459 (option D): the "K" in the name is historical - the K-bound waiver that
+    /// acknowledged a wedge's generation is DELETED. This predicate now answers one
+    /// question only: is this a genuinely-hung, still-claimed wedge whose late result
+    /// has NOT returned (so GuardianArmAckLedger::decide_retry() may Suppress an
+    /// identical retry on its account). It is never a licence to acknowledge.
     [[nodiscard]] bool receipt_wedge_k_eligible(const ArmReceipt& receipt) const;
 
-    /// rung 9c PR-5e (#4221, K-bound closeout - adversarial review finding, Kimi K3 +
+    /// rung 9c PR-5e (#4221 - adversarial review finding, Kimi K3 +
     /// Codex Sol independently converging): the ATOMIC combination of
     /// receipt_recovered() and receipt_wedge_k_eligible(), for a caller that needs
     /// BOTH questions answered about the exact same instant. Calling the two
@@ -1517,10 +1537,17 @@ public:
     /// SAME claim - but the priority is stated for clarity, not because the case is
     /// reachable). `Blocking` covers every other case: an empty receipt, a claim
     /// neither recovered nor currently wedge-eligible (settled to a genuine
-    /// refusal/rejection/withdrawal, already popped by a resolution nobody
-    /// adopted, or - #4472 - still the key's front but with a compensating disarm
-    /// outstanding). registry_mu_ taken ONCE, internally; never mutates state.
-    enum class RecoveryStatus { Recovered, WedgeEligible, Blocking };
+    /// refusal/rejection/withdrawal, or already popped by a resolution nobody
+    /// adopted). registry_mu_ taken ONCE, internally; never mutates state.
+    ///
+    /// #5459 (option D): `CompensationPending` is the #4472 case that used to read as
+    /// Blocking - the claim is still the key's Dispatched front with a compensating
+    /// disarm outstanding. It is a SEPARATE value so the ledger can keep tracking the
+    /// receipt (and keep suppressing identical retries) until the teardown pops the
+    /// claim, rather than erasing the only handle it has. Priority order is
+    /// Recovered, then WedgeEligible / CompensationPending (mutually exclusive), then
+    /// Blocking.
+    enum class RecoveryStatus { Recovered, WedgeEligible, CompensationPending, Blocking };
     [[nodiscard]] RecoveryStatus receipt_recovery_status(const ArmReceipt& receipt) const;
 
     enum class ArmOutcomeKind { Armed, Accepted };
@@ -1752,7 +1779,7 @@ public:
     /// (it counts as an alive worker against the executor's physical ceiling, not against a
     /// class quota) and, if blocked inside a mechanism, that type's engine lock; and before
     /// the teardown is submitted no slot is held at all. (#4472)
-    /// The claim is not K-eligible, so the generation is held while it is outstanding. `now` before the owed instant reads as zero. Takes registry_mu_ and
+    /// The generation is held while it is outstanding (nothing acknowledges it). `now` before the owed instant reads as zero. Takes registry_mu_ and
     /// scans claims_ (O(claims)); heartbeat cadence only, and never to be called with
     /// registry_mu_ held (it has a _locked twin). The once-per-claim elapsed count is the
     /// existing compensation_deadline_elapsed().
@@ -1821,7 +1848,7 @@ private:
     /// waiter_abandoned claim that carries an outcome still reaches the reservation.)
     [[nodiscard]] static bool is_dead_claim(const KeyClaim& claim) noexcept;
 
-    /// rung 9c PR-5e (#4221, K-bound closeout): the pure ClaimEnd->ReceiptStatus
+    /// rung 9c PR-5e (#4221): the pure ClaimEnd->ReceiptStatus
     /// mapping receipt_status() applies - factored out so
     /// receipt_status_wedge_aware() can compute the SAME mapping under its own
     /// single registry_mu_ acquisition without duplicating the switch (and
@@ -1830,23 +1857,26 @@ private:
     /// registry_mu_.
     [[nodiscard]] static ReceiptStatus classify_claim_end(ClaimEnd end) noexcept;
 
-    /// rung 9c PR-5e (#4221, K-bound closeout - cpp-expert governance finding):
-    /// the K-eligibility predicate (`end == WaiterTimedOutDispatched && dispatch
-    /// == Dispatched && still its key's FIFO front && no compensating disarm
-    /// outstanding`; the last term is #4472: K's premise is "the arm is physically
-    /// stuck", and a claim whose late result has returned and is in teardown is not
-    /// that - waiving it discards the server's re-push, the only owner left to re-arm
-    /// the rule once the teardown pops the claim, so the generation is held until the
-    /// teardown finishes) - factored out so
+    /// rung 9c PR-5e (#4221, cpp-expert governance finding), reshaped by #5459 (option
+    /// D): the ONE classification of a Wedged claim's outstanding-ness - `end ==
+    /// WaiterTimedOutDispatched && dispatch == Dispatched && still its key's FIFO
+    /// front` is the common base (the claim is a genuinely launched, still-claimed
+    /// episode), split by `compensation_finished` (#4472):
+    ///   - Eligible: base && compensation_finished - the arm is physically stuck, its
+    ///     late result has not returned;
+    ///   - CompensationPending: base && !compensation_finished - the late result has
+    ///     returned and its compensating disarm is outstanding (the claim stays the
+    ///     FIFO front until that teardown pops it);
+    ///   - NotOutstanding: anything else (settled to a real outcome, popped, or still
+    ///     mid-dispatch).
     /// receipt_wedge_k_eligible(), receipt_recovery_status() and
-    /// receipt_status_wedge_aware() all read ONE definition instead of three
-    /// independently-maintained copies (the drift risk classify_claim_end() was
-    /// already extracted to prevent for the ClaimEnd->ReceiptStatus mapping,
-    /// applied here to the eligibility predicate too). registry_mu_ held by the
-    /// CALLER - every call site already holds it - not this function's own
-    /// responsibility, since it never touches shared state itself beyond the
-    /// read-only `claims_` lookup a caller already has the right to make.
-    [[nodiscard]] bool is_wedge_k_eligible_locked(const std::shared_ptr<KeyClaim>& claim) const noexcept;
+    /// receipt_status_wedge_aware() all read this ONE definition, never three
+    /// independently-maintained copies. The two outstanding values are what
+    /// GuardianArmAckLedger::decide_retry() may suppress on; NEITHER ever authorises an
+    /// acknowledgement (can_advance() has no wedge escape). registry_mu_ held by the
+    /// CALLER; never touches shared state beyond a read-only `claims_` lookup.
+    enum class WedgeEpisode { NotOutstanding, Eligible, CompensationPending };
+    [[nodiscard]] WedgeEpisode wedge_episode_locked(const std::shared_ptr<KeyClaim>& claim) const noexcept;
 
     /// registry_mu_ held. Exact generation ownership, including unpublished commits.
     [[nodiscard]] bool generation_committed_locked(const KeyClaim& claim) const noexcept;
