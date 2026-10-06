@@ -16,7 +16,8 @@
 -export([client_has_https/1, client_tls_posture/1, servers_have_tls/1]). %% for testing
 -export([evaluate_upstream_posture/2, listener_tls_traps/1]).            %% for testing
 -export([evaluate_mgmt_posture/3]).                                      %% for testing
--export([evaluate_cluster_id/2]).                                         %% for testing
+-export([evaluate_cluster_id/2, evaluate_cluster_id/3]).                  %% for testing
+-export([apply_env_overrides/1]).                                          %% for testing
 
 %%--------------------------------------------------------------------
 %% application callbacks
@@ -262,6 +263,11 @@ drain_pending(Deadline) ->
 %%--------------------------------------------------------------------
 
 apply_env_overrides() ->
+    apply_env_overrides(file:native_name_encoding()).
+
+%% The environment text is interpreted in the node's native name encoding
+%% (yuzu_gw_env:env_utf8_binary/2); the parameter lets a test run both.
+apply_env_overrides(Encoding) ->
     Overrides = [
         {"YUZU_GW_UPSTREAM_ADDR",    upstream_addr,    fun(V) -> V end},
         {"YUZU_GW_UPSTREAM_PORT",    upstream_port,    fun list_to_integer/1},
@@ -277,10 +283,13 @@ apply_env_overrides() ->
         {"YUZU_GW_CB_MAX_RESET_TIMEOUT_MS", circuit_breaker_max_reset_timeout_ms, fun list_to_integer/1},
         %% HA WS-4 4.1 — trust-zone/region cluster id (ADR-2002 §7), stamped
         %% on every StreamStatusNotification (yuzu_gw_upstream:handle_cast/2).
-        %% A name with a non-ASCII character arrives as code points: converted
-        %% to UTF-8, not truncated (#4632). A value that cannot be converted is
-        %% left unset here and refused by check_cluster_id/0.
-        {"YUZU_GW_CLUSTER_ID", cluster_id, fun cluster_id_from_env/1},
+        %% The variable's text is read in the node's native name encoding and
+        %% its bytes must be valid UTF-8 (yuzu_gw_env:env_utf8_binary/2: a latin1
+        %% node, the default of the shipped images, gets the bytes one per
+        %% element, a utf8 node the characters). A value that cannot be
+        %% represented is left unset here, without printing it, and refused by
+        %% check_cluster_id/0 (#4632).
+        {"YUZU_GW_CLUSTER_ID", cluster_id, fun(V) -> cluster_id_from_env(V, Encoding) end},
         %% HA WS-4 #4555 — gateway cluster FORMATION config (ADR-2002 §7b).
         {"YUZU_GW_SEED_DNS_NAME", cluster_seed_dns_name, fun list_to_binary/1},
         %% Explicit peer list; when non-empty REPLACES DNS resolution outright
@@ -308,6 +317,12 @@ apply_env_overrides() ->
                     application:set_env(yuzu_gw, AppKey, Parsed),
                     logger:info("ENV override: ~s = ~p", [EnvVar, Parsed])
                 catch
+                    error:invalid_cluster_id ->
+                        %% Never the value: it is the text that could not be
+                        %% represented, and check_cluster_id/0 refuses to boot
+                        %% for it right after the overrides.
+                        logger:warning("ENV override: ~s cannot be represented as UTF-8; "
+                                       "ignoring it (the value is not logged)", [EnvVar]);
                     _:_ ->
                         logger:warning("ENV override: ~s has invalid value '~ts', ignoring",
                                        [EnvVar, Value])
@@ -344,9 +359,11 @@ apply_env_overrides() ->
     %% TLS cert overrides (these set the tls proplist)
     apply_tls_overrides().
 
-cluster_id_from_env(Value) ->
-    {ok, Bin} = yuzu_gw_env:utf8_binary(Value),
-    Bin.
+cluster_id_from_env(Value, Encoding) ->
+    case yuzu_gw_env:env_utf8_binary(Value, Encoding) of
+        {ok, Bin} -> Bin;
+        error     -> error(invalid_cluster_id)
+    end.
 
 %% @private Fail-closed guard (#4632): refuse to boot if the cluster id cannot be
 %% represented as UTF-8. It is stamped on every stream-status notification as a
@@ -358,7 +375,8 @@ cluster_id_from_env(Value) ->
 -spec check_cluster_id() -> ok | {error, {invalid_cluster_id, env | app_env}}.
 check_cluster_id() ->
     AppValue = application:get_env(yuzu_gw, cluster_id, <<"default">>),
-    case evaluate_cluster_id(AppValue, os:getenv("YUZU_GW_CLUSTER_ID")) of
+    case evaluate_cluster_id(AppValue, os:getenv("YUZU_GW_CLUSTER_ID"),
+                             file:native_name_encoding()) of
         {error, {invalid_cluster_id, Source} = Reason} ->
             logger:critical(
                 "Refusing to start: the cluster id (~s) cannot be represented as UTF-8 "
@@ -377,15 +395,36 @@ check_cluster_id() ->
 %% @doc Pure policy of check_cluster_id/0 (exported for testing). When the
 %% environment variable is set it is what applies (the override replaces the
 %% setting), so only it is checked; otherwise the application setting is.
+%%
+%% The two sources are different kinds of text:
+%%  - the ENVIRONMENT value is os:getenv/1 text, interpreted in the node's native
+%%    name encoding (yuzu_gw_env:env_utf8_binary/2): its bytes must be valid
+%%    UTF-8. Only bytes that are not UTF-8 (or, on a latin1 node, a code point
+%%    above 255) are refused, so a refusal from this source is rare;
+%%  - the APPLICATION setting (sys.config) is Erlang data, converted with
+%%    yuzu_gw_env:utf8_binary/1 and independent of the node's locale. The file is
+%%    read as UTF-8 (file:consult), so the working literals for a non-ASCII name
+%%    are a string (code points: the name typed as UTF-8 text, or "Z\x{FC}rich")
+%%    or a binary with the utf8 modifier (<<"Z\x{FC}rich"/utf8>>). A plain binary
+%%    literal holding the same character is truncated to one byte per character
+%%    (252 for the u with umlaut), which is not valid UTF-8 and is refused
+%%    (checked with file:consult and `erl -config' under LC_ALL=C and
+%%    LC_ALL=C.UTF-8: the same on both). Most refusals come from
+%%    this source.
 -spec evaluate_cluster_id(term(), string() | false) ->
           ok | {error, {invalid_cluster_id, env | app_env}}.
-evaluate_cluster_id(AppValue, false) ->
+evaluate_cluster_id(AppValue, EnvValue) ->
+    evaluate_cluster_id(AppValue, EnvValue, file:native_name_encoding()).
+
+-spec evaluate_cluster_id(term(), string() | false, latin1 | utf8) ->
+          ok | {error, {invalid_cluster_id, env | app_env}}.
+evaluate_cluster_id(AppValue, false, _Encoding) ->
     case yuzu_gw_env:utf8_binary(AppValue) of
         {ok, _}  -> ok;
         error    -> {error, {invalid_cluster_id, app_env}}
     end;
-evaluate_cluster_id(_AppValue, EnvValue) ->
-    case yuzu_gw_env:utf8_binary(EnvValue) of
+evaluate_cluster_id(_AppValue, EnvValue, Encoding) ->
+    case yuzu_gw_env:env_utf8_binary(EnvValue, Encoding) of
         {ok, _}  -> ok;
         error    -> {error, {invalid_cluster_id, env}}
     end.

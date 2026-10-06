@@ -165,7 +165,7 @@ boot_check_accepts_representable_values() ->
      || {App, Var} <- [{<<"default">>, false},
                        {"default", false},
                        {[90, 252, 114, 105, 99, 104], false},
-                       {<<"default">>, [90, 252, 114, 105, 99, 104]},
+                       {<<"default">>, env_text(<<90, 195, 188, 114, 105, 99, 104>>)},
                        {<<255>>, "env-wins"}]].
 
 %% The same value judged under each native encoding: UTF-8 bytes that a latin1 node
