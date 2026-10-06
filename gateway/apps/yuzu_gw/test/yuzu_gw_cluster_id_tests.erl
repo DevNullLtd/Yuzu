@@ -9,34 +9,55 @@
 %%% yuzu_gw_env:utf8_binary/1) and the boot refusal for a value that cannot be
 %%% represented (yuzu_gw_app:evaluate_cluster_id/2).
 %%%
+%%% The environment text is read in the VM's native name encoding: os:getenv/1
+%%% returns the variable's BYTES as code points when the node runs with a latin1
+%%% native encoding (what a container with no LANG/LC_ALL and no +fnu gets), so
+%%% UTF-8 bytes come back as a list of code points below 256, while a UTF-8 node
+%%% returns the decoded characters. The tests put the variable in through
+%%% env_text/1, the form the real environment takes under the running node's
+%%% encoding, and the encoding-parameterised function pins both encodings on
+%%% whatever locale the runner has.
+%%%
 %%% Every test restores the application env key and the OS variable it touched.
 %%% @end
 %%%-------------------------------------------------------------------
 -module(yuzu_gw_cluster_id_tests).
 -include_lib("eunit/include/eunit.hrl").
 
+-export([log/2]).  %% logger handler callback (log capture)
+
 -define(VAR, "YUZU_GW_CLUSTER_ID").
+-define(LOG_HANDLER, yuzu_gw_cluster_id_tests_logs).
 
 cluster_id_test_() ->
     {foreach,
      fun setup/0,
      fun cleanup/1,
      [
-      {"the env override converts code points to UTF-8",
-       fun env_override_converts_to_utf8/0},
-      {"the env override converts code points above 255 too",
-       fun env_override_converts_wide_characters/0},
+      {"the env override keeps the original UTF-8 bytes whatever the native encoding",
+       t(fun env_override_converts_to_utf8/0)},
+      {"the env override keeps UTF-8 text with characters above 255 too",
+       t(fun env_override_converts_wide_characters/0)},
       {"an ASCII env override is unchanged",
-       fun env_override_ascii_is_unchanged/0},
+       t(fun env_override_ascii_is_unchanged/0)},
+      {"the env text is interpreted in the given native encoding, then must be UTF-8",
+       t(fun env_text_by_encoding/0)},
+      {"the env override that cannot be represented is not applied and its warning never prints the value",
+       t(fun env_override_warning_never_echoes_the_value/0)},
       {"utf8_binary accepts valid chardata and nothing else",
-       fun utf8_binary_contract/0},
+       t(fun utf8_binary_contract/0)},
       {"boot check: a representable cluster_id passes, from either source",
-       fun boot_check_accepts_representable_values/0},
+       t(fun boot_check_accepts_representable_values/0)},
       {"boot check: an unrepresentable cluster_id is refused, naming the source",
-       fun boot_check_refuses_unrepresentable_values/0},
+       t(fun boot_check_refuses_unrepresentable_values/0)},
+      {"boot check: the env value is judged in the native encoding",
+       t(fun boot_check_judges_the_env_in_the_native_encoding/0)},
       {"the application refuses to start with an unrepresentable cluster_id, before starting anything",
-       fun application_start_refuses_an_unrepresentable_cluster_id/0}
+       t(fun application_start_refuses_an_unrepresentable_cluster_id/0)}
      ]}.
+
+t(Fun) ->
+    {timeout, 30, Fun}.
 
 setup() ->
     {application:get_env(yuzu_gw, cluster_id), os:getenv(?VAR)}.
@@ -58,12 +79,72 @@ override(Chars) ->
     yuzu_gw_app:apply_env_overrides(),
     application:get_env(yuzu_gw, cluster_id).
 
+%% What os:getenv/1 returns for a variable whose bytes are the UTF-8 text, on the
+%% running node: the bytes themselves under a latin1 native encoding (os:putenv/1
+%% stores a latin1 list as those bytes), the decoded characters under utf8.
+env_text(Utf8) when is_binary(Utf8) ->
+    case file:native_name_encoding() of
+        utf8   -> unicode:characters_to_list(Utf8);
+        latin1 -> binary_to_list(Utf8)
+    end.
+
 env_override_converts_to_utf8() ->
     ?assertEqual({ok, <<90, 195, 188, 114, 105, 99, 104>>},
-                 override([90, 252, 114, 105, 99, 104])).
+                 override(env_text(<<90, 195, 188, 114, 105, 99, 104>>))).
 
 env_override_converts_wide_characters() ->
-    ?assertEqual({ok, <<228, 184, 173, 230, 150, 135>>}, override([16#4E2D, 16#6587])).
+    ?assertEqual({ok, <<228, 184, 173, 230, 150, 135>>},
+                 override(env_text(<<228, 184, 173, 230, 150, 135>>))).
+
+%% What the running locale returns is not assumed: both encodings are pinned with
+%% the encoding as a parameter. Under latin1 the text is bytes (code points below
+%% 256) and the bytes must be valid UTF-8; under utf8 the text is characters.
+env_text_by_encoding() ->
+    Zurich = <<90, 195, 188, 114, 105, 99, 104>>,
+    ?assertEqual({ok, Zurich},
+                 yuzu_gw_env:env_utf8_binary([90, 195, 188, 114, 105, 99, 104], latin1)),
+    ?assertEqual({ok, Zurich},
+                 yuzu_gw_env:env_utf8_binary([90, 252, 114, 105, 99, 104], utf8)),
+    ?assertEqual({ok, <<228, 184, 173, 230, 150, 135>>},
+                 yuzu_gw_env:env_utf8_binary([16#4E2D, 16#6587], utf8)),
+    ?assertEqual({ok, <<228, 184, 173, 230, 150, 135>>},
+                 yuzu_gw_env:env_utf8_binary([228, 184, 173, 230, 150, 135], latin1)),
+    ?assertEqual({ok, <<"eu-west-1">>}, yuzu_gw_env:env_utf8_binary("eu-west-1", latin1)),
+    ?assertEqual({ok, <<"eu-west-1">>}, yuzu_gw_env:env_utf8_binary("eu-west-1", utf8)),
+    ?assertEqual({ok, <<>>}, yuzu_gw_env:env_utf8_binary([], latin1)),
+    %% Bytes that are not UTF-8 are refused, not reinterpreted.
+    ?assertEqual(error, yuzu_gw_env:env_utf8_binary([90, 252], latin1)),
+    ?assertEqual(error, yuzu_gw_env:env_utf8_binary([195], latin1)),
+    ?assertEqual(error, yuzu_gw_env:env_utf8_binary([255, 254], latin1)),
+    %% A latin1 node cannot return a code point above 255; if one is asked for,
+    %% it is refused (never truncated).
+    ?assertEqual(error, yuzu_gw_env:env_utf8_binary([16#4E2D], latin1)),
+    ?assertEqual(error, yuzu_gw_env:env_utf8_binary([90, 16#100], latin1)),
+    %% Not text at all.
+    [?assertEqual(error, yuzu_gw_env:env_utf8_binary(Bad, Enc))
+     || Enc <- [latin1, utf8],
+        Bad <- [[16#D800], [16#110000], [-1], [$a | b], foo, 12, undefined, <<"abc">>, {a}]].
+
+%% A value that cannot be represented is not applied, and the warning says which
+%% variable and never the value (the critical refusal line never prints it
+%% either). Driven with the encoding as a parameter, so it runs the same on a
+%% latin1 and on a utf8 node: the marker followed by a lone 0xFC byte is not UTF-8
+%% as latin1 bytes.
+env_override_warning_never_echoes_the_value() ->
+    Marker = <<"secret-marker-id">>,
+    Lines = capture_logs(fun() ->
+        application:unset_env(yuzu_gw, cluster_id),
+        os:putenv(?VAR, binary_to_list(Marker) ++ [252]),
+        yuzu_gw_app:apply_env_overrides(latin1)
+    end),
+    ?assertEqual(undefined, application:get_env(yuzu_gw, cluster_id)),
+    ?assertMatch([_ | _], [L || L <- Lines, binary:match(L, <<?VAR>>) =/= nomatch]),
+    ?assertEqual([], [L || L <- Lines, binary:match(L, Marker) =/= nomatch]),
+    %% The same variable read as utf8 characters is a valid name and applies.
+    application:unset_env(yuzu_gw, cluster_id),
+    yuzu_gw_app:apply_env_overrides(utf8),
+    ?assertEqual({ok, <<"secret-marker-id", 195, 188>>},
+                 application:get_env(yuzu_gw, cluster_id)).
 
 env_override_ascii_is_unchanged() ->
     ?assertEqual({ok, <<"eu-west-1">>}, override("eu-west-1")).
@@ -86,6 +167,24 @@ boot_check_accepts_representable_values() ->
                        {[90, 252, 114, 105, 99, 104], false},
                        {<<"default">>, [90, 252, 114, 105, 99, 104]},
                        {<<255>>, "env-wins"}]].
+
+%% The same value judged under each native encoding: UTF-8 bytes that a latin1 node
+%% returns as code points below 256 pass; the same list on a utf8 node would be
+%% the text "Ã¼" (valid), while a lone byte is refused under latin1.
+boot_check_judges_the_env_in_the_native_encoding() ->
+    ?assertEqual(ok, yuzu_gw_app:evaluate_cluster_id(<<"default">>,
+                                                     [90, 195, 188, 114, 105, 99, 104], latin1)),
+    ?assertEqual(ok, yuzu_gw_app:evaluate_cluster_id(<<"default">>,
+                                                     [90, 252, 114, 105, 99, 104], utf8)),
+    ?assertEqual({error, {invalid_cluster_id, env}},
+                 yuzu_gw_app:evaluate_cluster_id(<<"default">>, [90, 252, 114], latin1)),
+    ?assertEqual({error, {invalid_cluster_id, env}},
+                 yuzu_gw_app:evaluate_cluster_id(<<"default">>, [16#4E2D], latin1)),
+    %% The application setting is not an environment text: the encoding does not
+    %% apply to it.
+    ?assertEqual(ok, yuzu_gw_app:evaluate_cluster_id([90, 252, 114], false, latin1)),
+    ?assertEqual({error, {invalid_cluster_id, app_env}},
+                 yuzu_gw_app:evaluate_cluster_id(<<255>>, false, latin1)).
 
 boot_check_refuses_unrepresentable_values() ->
     [?assertEqual({error, {invalid_cluster_id, app_env}}, yuzu_gw_app:evaluate_cluster_id(App, false))
@@ -115,3 +214,38 @@ application_start_refuses_an_unrepresentable_cluster_id() ->
             Val   -> os:putenv("YUZU_GW_ALLOW_DEFAULT_COOKIE", Val)
         end
     end.
+
+%%%===================================================================
+%%% Log capture
+%%%===================================================================
+
+%% Run Fun with a capturing logger handler at warning level; returns the rendered
+%% text of every event logged meanwhile. The handler runs in the logging process
+%% and sends before the logging call returns, so nothing is pending afterwards.
+capture_logs(Fun) ->
+    Prev = maps:get(level, logger:get_primary_config()),
+    ok = logger:set_primary_config(level, warning),
+    ok = logger:add_handler(?LOG_HANDLER, ?MODULE,
+                            #{config => #{pid => self()}, level => warning}),
+    try
+        Fun(),
+        collect_logs([])
+    after
+        logger:remove_handler(?LOG_HANDLER),
+        logger:set_primary_config(level, Prev)
+    end.
+
+collect_logs(Acc) ->
+    receive {captured_log, Text} -> collect_logs([Text | Acc])
+    after 0 -> lists:reverse(Acc)
+    end.
+
+%% logger handler callback
+log(#{msg := Msg, meta := _}, #{config := #{pid := Pid}}) ->
+    Text = case Msg of
+        {string, S} -> unicode:characters_to_binary(S);
+        {report, R} -> unicode:characters_to_binary(io_lib:format("~p", [R]));
+        {Fmt, Args} -> unicode:characters_to_binary(io_lib:format(Fmt, Args))
+    end,
+    Pid ! {captured_log, Text},
+    ok.
