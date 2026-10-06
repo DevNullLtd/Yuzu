@@ -808,11 +808,13 @@ you have observed your fleet's normal stale-count baseline and set the threshold
 ~5–10% of your expected active fleet; correlate with `yuzu_fleet_agents_healthy` to
 separate "agents offline" from "sync source broken / disabled".
 
+**A Windows device's software inventory stops updating although the agent is healthy.** Since the #4711 hardening, an Uninstall registry root that cannot be opened or enumerated to the end, or one application subkey whose open is denied, makes `list_inventory` return rc 1 and the daily sync skips that cycle rather than committing a shorter inventory as authoritative; the device keeps its last good inventory and `last_seen` stops advancing. The agent log carries both halves: `installed_apps: Uninstall root <HKLM-64|HKLM-32|HKCU> could not be fully read -- the collection is degraded` and `sync: installed_apps 'list_inventory' rc=1 -- skipping this cycle`. Fix the ACL (the agent runs as LocalSystem) and the next 24 h cycle re-collects; there is no fleet-visible counter for the skip yet.
+
 **`install_location` is `-` for many Windows applications and every Linux application.** `-` means the OS
 reported no location, not that collection failed. Windows reads each Uninstall key's `InstallLocation`, which many
 MSI-registered products, SDK and runtime component packages and some system components never populate (182 of
 241 rows on one developer workstation); Linux is always `-` by design, since a package installs to many prefixes.
-`-` also results from a Windows value longer than 511 characters or stored with a non-string registry type, and
+`-` also results from a Windows value longer than 64 KiB or stored with a non-string registry type, and
 for per-user installs, which the machine-scope `list` does not read. `bundle_id` is `-` on Windows
 and Linux, and on macOS for a non-bundle location or for a row the bounded bundle-id pass (30 s, at most 5000 applications, one pass in flight) did not reach -- that run also carries a leading `warning|bundle_id_*` row and a CONSTRAINED status, so a `-` from a cut-short pass is never silent.
 
