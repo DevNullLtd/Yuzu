@@ -554,6 +554,46 @@ groups:
             "RbacStore — the authorization substrate".
           runbook_url: "https://docs.yuzu.io/runbooks/rbac-read-degraded"
 
+      - alert: YuzuRbacBreakerOpen
+        # The per-replica authorization fail-fast breaker has stayed open.
+        # It opens after two consecutive failed authorization reads (a pool
+        # acquire timeout or a query error), and while it is open that
+        # replica's authorization reads that miss the permission cache are
+        # refused without touching the pool, apart from one probe per ~1 s
+        # (kRbacGenerationRefreshMs). The service-token ceiling read
+        # (ITServiceOwner) feeds and is shed by the same breaker. Decisions
+        # already cached on the replica are still served, so this is not
+        # "every caller denied". The gauge is published per replica and only
+        # changes when an authorization read reports its outcome, so a
+        # replica that receives no authorization checks keeps its last value.
+        # A breaker that half-opens and closes again within five minutes is
+        # a transient blip and does not page; one that stays open means
+        # authorization reads keep failing. It complements
+        # YuzuRbacReadDegraded (a rate summed across replicas by reason): this
+        # rule names the replica whose breaker is open.
+        expr: |
+          max by (instance) (yuzu_server_rbac_breaker_open) == 1
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "RBAC authorization breaker open on {{ $labels.instance }}"
+          description: >-
+            yuzu_server_rbac_breaker_open has been 1 on {{ $labels.instance }}
+            for 5m: authorization reads on this replica keep failing (pool
+            acquire timeout or query error against the PostgreSQL rbac_store),
+            so the fail-fast breaker has not closed. While it is open, this
+            replica refuses (fail closed) the operator permission checks that
+            miss its permission cache and sheds the service-scoped token
+            ceiling reads (a retryable 503), except for about one probe per
+            second; permissions already cached on the replica are still served
+            (bounded by the ~5s stale-serve window if the cache-coherence
+            refresh is also failing). Check Postgres availability and pool
+            saturation (yuzu_pg_*) and the server RbacStore warnings; the
+            breaker closes on its own after the next successful read. See
+            the RbacStore authorization substrate section of
+            docs/auth-architecture.md.
+
       - alert: YuzuBreakGlassLogin
         # The armed break-glass account passed the password gate under
         # --auth-mode=sso-only. Rare by design, so ANY increment pages
