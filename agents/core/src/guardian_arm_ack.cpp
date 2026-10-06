@@ -241,6 +241,17 @@ std::size_t GuardianArmAckLedger::drain_locked(GuardianSparkRuntime& runtime,
             // failure, only its membership in the Wedged-only carve-out changes. This
             // is what keeps can_advance()'s `resolved_failed == failed_receipts.size()`
             // check a SAFE predicate rather than a stale one.
+            //
+            // #4472: this is also where a wedge whose late result has returned and
+            // whose compensating teardown is outstanding settles (compensation_finished is
+            // false, so it is not K-eligible). Erasing it from failed_receipts while
+            // resolved_failed stays counted is conservative: the generation stays HELD until
+            // a later application, so the server keeps re-pushing. That conservatism, and any
+            // future recovery owner for the unarmed-after-K class (#5459), depends on ONE
+            // runtime invariant: compensation_finished=true is always written in the same
+            // critical section as the pop of the claim (or the dispatch -> Queued
+            // double-fault hand-back), so a Blocking reading never races a claim that is
+            // finished but still the Dispatched head.
             it = current_->failed_receipts.erase(it);
             break;
         }
