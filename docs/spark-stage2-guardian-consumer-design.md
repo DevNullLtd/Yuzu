@@ -726,12 +726,24 @@ document's own F3 × `Restart=always` crash-loop finding above, "a security find
 not only an ops one"; an operator paged on this tag should not treat restart as a
 default first action without first checking whether the target is transient or
 permanently dead**); a later policy change re-evaluates the rule but cannot by itself
-re-attempt the arm. What CAN end the generation hold without a restart is a push
-that makes `decide_retry()` answer Reapply and so opens a fresh Application: a different
-generation, changed content (for example the wedged rule removed from or excluded from
-the deployed Baseline) or a different `full_sync` kind. That ends the hold, not the hung
-call, and an omitting delta push additionally drops the retry obligation (known limit
-below), so the operator route is a full push. A genuine refusal
+re-attempt the arm. A push at a different generation, with different content or of a
+different `full_sync` kind makes `decide_retry()` answer Reapply and opens a fresh
+Application, but that alone does NOT end the hold: `attach_core()` finds the retained
+wedge at the head of the key (same rule id, same spec) and re-observes it, so the rule
+is counted failed again, `can_advance()` stays false and the new generation is held with
+a fresh `kWedgeSuppressMaxDecisions` budget. What ends the hold without a restart: the
+hung call returning; a full push (`full_sync=true`) that no longer contains the wedged
+rule (removed from or excluded from the deployed Baseline: `apply_rules()` tears down and
+rebuilds only on a full push, so a `full_sync=false` push is additive and leaves the rule
+armed or wedged); or an edit to the wedged rule's own spec, which changes its key
+(`spark_key()` encodes the whole spec) so it is no longer matched to the hung claim. A
+restart ends it only if the target is no longer hung. None of these releases the hung
+call: it keeps its key and, while inside a mechanism call, the same-type serialisation
+until it returns; re-adding the same rule and spec re-observes it and re-wedges at once;
+a different rule id on that key is refused (`kSparkKeyWedged`) and becomes an ordinary
+failure. The operator-facing statement is in the user manual's wedged-rule hold note and
+flip-gate AC-1. An omitting delta push additionally drops the retry obligation (known limit
+below). A genuine refusal
 (a DISPATCHED call that returned a failure - backend refused or worker threw - or an
 admission rejection that is TERMINAL - `AlreadyRunning`, `LaunchFailed` or
 `Stopped` - where no call was attempted; a congestion rejection is parked and redriven
@@ -782,8 +794,10 @@ drops that rule's retry obligation: the fresh application can then satisfy
 application (pre-existing, since the old waiver code replaced the application the same
 way; the Spark path is dormant; no current production route emits an omitting delta,
 because the REST and MCP operator pushes default to `full_sync=false` but carry the
-full OS/scope-filtered deployed inventory, the REST `POST /api/v1/guaranteed-state/push` handler in `rest_api_v1.cpp`, the MCP
-`push_guardian_rules` tool in `mcp_server.cpp` and the `guardian_push_fn_` fan-out in `server.cpp`; follow-up issue to be filed); an
+full OS/scope-filtered deployed inventory, the REST `POST /api/v1/guaranteed-state/push`
+handler in `rest_api_v1.cpp`, the MCP `push_guardian_rules` tool in `mcp_server.cpp` and the
+`guardian_push_fn_` fan-out in `server.cpp`; so the default flag is not itself the hazard,
+a push that omits a still-desired rule is; follow-up FU-12 in the flip gate, to be filed); an
 agent restart gap (the boot
 Application opens at the loaded acknowledged generation with an empty `content_id`,
 and a failed boot re-arm is never retried, #5513); a content-identity gap (an
@@ -1111,13 +1125,17 @@ design is mentioned it is named as the earlier design.
 - **Known limit (accepted, flip-gate AC-15): a wedge still in `pending` costs one
   avoidable Reapply.** `drain_locked()` retains a wedge in `failed_receipts` only when
   its classification is still outstanding at the drain (wedge-eligible or compensation
-  pending). A wedge that has not been drained yet (its first drain has not run, it lies
-  beyond the per-tick bound `kAckDrainMaxPerTick`, or it was minted in the Dispatching
-  window, where `expire_overdue_claims()` can stamp `Wedged` before the dispatch settles)
-  is counted in `resolved_failed` without being retained. If it is then ADOPTED (its late
-  success commits), `decide_retry()` finds `resolved_failed != failed_receipts.size()` or a
-  settled `Wedged` receipt in `pending`, and the next identical push is a Reapply: a
-  teardown and re-arm of the rule that has just armed, which was avoidable. (A claim that
+  pending). Two shapes differ. A wedge minted in the Dispatching window
+  (`expire_overdue_claims()` can stamp `Wedged` before the dispatch settles) is counted in
+  `resolved_failed` at the drain without being retained, so `decide_retry()` finds
+  `resolved_failed != failed_receipts.size()` and answers Reapply. A wedge not yet drained
+  (its first drain has not run, or it lies beyond the per-tick bound `kAckDrainMaxPerTick`)
+  stays in `pending` and is NOT counted in `resolved_failed`; the pending loop of
+  `decide_retry()` treats it as outstanding while it still reads wedge-eligible or
+  compensation pending, and answers Reapply once it has been ADOPTED (its late success
+  commits) or has settled, because a settled `Wedged` receipt is no longer outstanding.
+  Either way the next identical push is a Reapply: a teardown and re-arm of the rule that
+  has just armed, which was avoidable. (A claim that
   pops without recovery is a genuine failure, for which the Reapply is correct.) The safe
   direction: the Reapply never acknowledges anything, and the application it opens
   re-observes the true state. Accepted by the operator; retaining such entries in
@@ -1134,8 +1152,9 @@ design is mentioned it is named as the earlier design.
   rule's retry obligation, so the fresh application can acknowledge while the omitted
   wedged claim has no owning application; pre-existing (the old waiver code did the
   same), dormant, and no current production route emits an omitting delta (see the
-  known-limits list above); follow-up issue to be filed. Recovery needs a live connection (the maintenance tick runs on the
-  per-connection heartbeat thread). Content identity: an identical re-observation
+  known-limits list above); follow-up FU-12 in the flip gate (to be filed). Recovery needs a
+  live connection (the maintenance tick runs on the per-connection heartbeat thread).
+  Content identity: an identical re-observation
   matches `rule_id` and spec only (#5512). #4045: a forced Reapply re-arms the whole
   push, but persisted baselines are re-seeded on every arm
   (`guardian_engine.cpp`), so only Spark-first-captured, unpersisted `FileHashEquals`

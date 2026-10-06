@@ -964,20 +964,52 @@ flip, with a red-first test each:
     to 90 s at one re-apply per 25 to 30 s; an estimate), and the #4472 fix had already
     removed that bound for a compensating claim. Option D removes it for both, on purpose:
     acknowledging a generation while an arm is hung is what stranded rules (#5459). Now
-    the hold ends when the claim pops; or when a push replaces the open Application
-    (`decide_retry()` answers Reapply for a different generation, changed content such as the
-    wedged rule removed from or excluded from the deployed Baseline, or a different
-    `full_sync` kind, and the next push is applied in full under a fresh application, though
-    the hung call itself is not released); or when the agent restarts. A never-returning arm
-    holds the generation forever unless one of those happens (intended). To end a hold on a
-    permanently wedged target without restarting, redeploy the Baseline at a new generation,
-    or remove or exclude the wedged rule from the deployed Baseline, using a full push (not
-    a partial/delta push): a delta push that omits a rule that is still desired also ends the
-    hold but drops that rule's retry obligation (AC-11). Per held agent: the server re-pushes at most
-    once per 25 s (`kGuardianReconcileMinInterval`), which at the default 30 s heartbeat is
-    one push per heartbeat, 2880 pushes per day (the push interval is
-    `ceil(25 s / heartbeat) x heartbeat`, so a 25 s heartbeat gives 3456 per day and other
-    intervals scale); each push is at least two Postgres reads (the policy generation and the
+    the hold ends only when: (a) the claim pops, that is the hung call returns (a late
+    success is adopted and acknowledged; a late failure, or a late success that is not
+    adopted, ends the claim, the latter once the compensating teardown has finished); (b) a
+    full push (`full_sync=true`) DROPS or EXCLUDES the wedged rule, so the fresh
+    application contains nothing that waits on it; (c) the wedged rule's own spec is
+    edited so that its key changes (`spark_key()` encodes the whole spec, so the edited
+    rule attaches to a different key and is not matched to the hung claim; the replaced
+    claim's candidacy is withdrawn, so a late success on it is torn down, not adopted); or
+    (d) the agent restarts and the target is no longer hung (against a dead target the
+    boot re-arm is held again). A never-returning arm holds the generation forever unless
+    one of those happens (intended).
+    **What does NOT end it:** a new generation, a different `full_sync` kind, or a content
+    change that leaves the wedged rule's rule id and spec unchanged. `decide_retry()`
+    answers Reapply for each and a fresh Application opens, but `attach_core()` finds the
+    retained wedge at the head of the key (same rule id, same spec) and RE-OBSERVES it,
+    returning the same hung claim; the rule is counted failed again, `can_advance()` stays
+    false, and the new generation is held with a fresh `kWedgeSuppressMaxDecisions`
+    budget.
+    **Operator route.** The server's automatic heartbeat re-push is a full push
+    (`server.cpp`, `build_agent_push(..., /*full_sync=*/true, ...)`); the dashboard
+    Baseline Re-deploy (`GuardianRoutes::deploy_baseline`) bumps the generation and sends
+    `push_fn_("", true)`, fleet-wide; REST `POST /api/v1/guaranteed-state/push` and MCP
+    `push_guardian_rules` DEFAULT to `full_sync=false` and take an optional `scope`
+    that can target one agent. Both defaults still carry the agent's full OS/scope-filtered
+    deployed rule set (`build_agent_push` only sets the flag), so the default is not
+    itself dangerous; the omission hazard (AC-11) is a push that omits a still-desired
+    rule. A `full_sync=false` push is ADDITIVE on the agent (`apply_rules()` tears down
+    only inside `if (push.full_sync())`), so a rule removed from the Baseline stays armed
+    or wedged there. A full push that changes nothing for the agent has the same
+    generation and content as the automatic re-push and is suppressed like it, so route
+    (b) needs the Baseline to change first (remove the rule from the deployed Baseline,
+    disable it, or narrow its scope or OS target so the per-agent push omits it).
+    **Cost to others:** a full push at a new generation re-applies every in-scope agent
+    (the AC-9/AC-10 baseline-recapture and AC-16 same-type effects), and removing the rule
+    drops its enforcement for that Baseline. **State after an exit:** the hung call keeps
+    its key (the FIFO head) and, while it is inside a mechanism call, the same-type
+    mechanism serialisation (AC-16), until it returns or the agent restarts; re-adding the
+    same rule and spec re-observes the same hung claim and re-wedges at once; a
+    DIFFERENT rule id on that key is refused (`kSparkKeyWedged`, "spark key wedged") and
+    becomes an ordinary arm failure; after a successful exit the acknowledged generation
+    catches up and `arm_failed` returns to 0. A delta push (AC-11) that omits the rule also
+    ends the hold in the ledger, but it drops that rule's retry obligation. Per held agent:
+    the server re-pushes at most once per 25 s (`kGuardianReconcileMinInterval`), which at
+    the default 30 s heartbeat is one push per heartbeat, 2880 pushes per day (the push
+    interval is `ceil(25 s / heartbeat) x heartbeat`, so a 25 s heartbeat gives 3456 per
+    day and other intervals scale); each push is at least two Postgres reads (the policy generation and the
     rule list), writes one `guaranteed_state.reconcile` audit row (a synchronous
     `AuditStore::log` insert on the heartbeat-ingestion path), kept for the default audit
     retention of 365 days, and logs one `spdlog::info` line ("Guardian: reconciled agent
@@ -998,7 +1030,7 @@ flip, with a red-first test each:
     `yuzu.guardian_journal_evicted_sent_unacked`,
     `yuzu.guardian_journal_evicted_no_send_evidence`), so sustained forced-Reapply churn
     could evict earlier `guard.armed` / `guard.disarmed` records before delivery: **a
-    measurement of journal eviction during a held period is a flip precondition.** Trip
+    measurement of journal eviction during a held period (FU-1) is a flip precondition.** Trip
     signal: `yuzu.guardian_generation` lag (necessary for a held wedge since a wedge is never
     acknowledged, but not wedge-specific: an ordinary refusal, a congestion expiry or a
     latched apply failure also holds the generation, so corroborate with
@@ -1010,8 +1042,8 @@ flip, with a red-first test each:
     the full-push route above; an agent restart also ends the hold (with `--spark-disable`
     if the stuck mechanism is the cause), but against a permanently dead target the new
     arm is held again. A server-side
-    back-off (it would cut the push, Postgres and audit cost but delay the re-arm after
-    a late failure by up to its interval, and would not remove the pre-throttle
+    back-off (FU-13; it would cut the push, Postgres and audit cost but delay the re-arm
+    after a late failure by up to its interval, and would not remove the pre-throttle
     generation read) is deliberately NOT part of #5459; a later server change should
     reset it on policy changes.
   - (AC-2) **OBSOLETE (kept so the AC numbers other rows cite still resolve).** It
@@ -1073,8 +1105,13 @@ flip, with a red-first test each:
     application. Pre-existing (the old waiver code replaced the application the same
     way), the Spark path is dormant, and no current production route emits an omitting
     delta (REST and MCP operator pushes default to `full_sync=false` but carry the full
-    OS/scope-filtered deployed inventory: the REST `POST /api/v1/guaranteed-state/push` handler in `rest_api_v1.cpp`, the MCP
-    `push_guardian_rules` tool in `mcp_server.cpp` and the `guardian_push_fn_` fan-out in `server.cpp`). Follow-up issue to be filed.
+    OS/scope-filtered deployed inventory, so the default flag is not itself the hazard; the
+    hazard is a push that omits a still-desired rule. The REST
+    `POST /api/v1/guaranteed-state/push` handler in `rest_api_v1.cpp`, the MCP
+    `push_guardian_rules` tool in `mcp_server.cpp` and the `guardian_push_fn_` fan-out in
+    `server.cpp` all build the push from the deployed set.)
+    A `full_sync=false` push is also additive on the agent: a rule removed from the
+    Baseline stays armed or wedged until a full push. Follow-up FU-12 (to be filed).
   - (AC-12) **A push mixing a wedge with any non-wedge failure** (a congestion expiry, a
     refusal) is a Reapply every time: the suppression applies only when every unresolved
     item is an outstanding wedge (or a Pending/Committed sibling).
@@ -1084,16 +1121,23 @@ flip, with a red-first test each:
     loaded acknowledged generation with an empty `content_id`, and a failed boot re-arm is
     never retried (#5513); an acknowledgment persisted by the old waiver is not revoked.
   - (AC-14) **Content identity (#5512).** A re-observation of a wedged claim matches
-    `rule_id` and spec only (the content-identity bug); recorded, not fixed here.
-  - (AC-15) **A wedge still in `pending` that is adopted or settles costs one avoidable
-    Reapply (accepted by the operator).** `drain_locked()` retains a wedge in
-    `failed_receipts` only if it still reads wedge-eligible or compensation-pending at the
-    drain. A wedge not yet drained (its first drain has not run, it lies beyond the per-tick
-    bound `kAckDrainMaxPerTick`, or it was minted in the Dispatching window, where
-    `expire_overdue_claims()` can stamp `Wedged` before the dispatch settles) is counted in
-    `resolved_failed` but not retained. If it is then adopted, the next identical push is a
-    Reapply (`resolved_failed != failed_receipts.size()`, or a settled `Wedged` receipt in
-    `pending`): a teardown and re-arm of the rule that has just armed. Safe direction: it
+    `rule_id` and spec only (the content-identity bug); recorded, not fixed here. Operator
+    consequence: a wedged rule edited without changing its spec (its assertion, for
+    example) is re-observed, not rebuilt (`attach_core()` constructs nothing new on that
+    path), so a late success arms the content the claim was created with, not the edit.
+  - (AC-15) **A wedge that is adopted or settles before the agent has retained it costs one
+    avoidable Reapply (accepted by the operator; follow-up FU-14, to be filed).**
+    `drain_locked()` retains a wedge in `failed_receipts` only if it still reads
+    wedge-eligible or compensation-pending at the drain. Two shapes differ. (1) A wedge in the
+    Dispatching window (`expire_overdue_claims()` can stamp `Wedged` before the dispatch
+    settles) is counted in `resolved_failed` at the drain but NOT retained, so the next
+    identical push finds `resolved_failed != failed_receipts.size()` and is a Reapply.
+    (2) A wedge not yet drained (its first drain has not run, or it lies beyond the per-tick
+    bound `kAckDrainMaxPerTick`) stays in `pending`, NOT counted in `resolved_failed`; the
+    pending loop of `decide_retry()` treats it as outstanding while it still reads
+    wedge-eligible or compensation-pending, and answers Reapply once it has been adopted or
+    has settled (a settled `Wedged` receipt that is no longer outstanding). Either way
+    the Reapply is a teardown and re-arm of a rule that has just armed. Safe direction: it
     never acknowledges, and the new application re-observes the true state. The
     suppression statements for `Recovered`/`WedgeEligible` apply to RETAINED entries only.
   - (AC-16) **A forced Reapply during a hung same-type mechanism call can withdraw healthy
@@ -1102,7 +1146,9 @@ flip, with a red-first test each:
     armed rule of that type queues behind it, so its detection is logically off at once and
     its re-arm may expire as `CongestionExpired` (the AC-12 class). Not new: before #5459
     every Reapply did the same; option D reduces it to the forced Reapply, at most about
-    every 330 s. Its severity depends on `prefer_spark_` staying off in production (it
+    every 330 s for a hold whose pushes are all retained-wedge suppressions (an AC-15
+    Reapply, a `full_sync=false` push, a mixed-failure push or an exit push adds Reapplies
+    on top). Its severity depends on `prefer_spark_` staying off in production (it
     defaults to `false` and no production code passes `true`; a code-read condition, not an
     executed one). **Flip
     precondition:** the same-type sibling test (FU-10) and the journal-eviction
@@ -1141,7 +1187,9 @@ flip, with a red-first test each:
   acknowledgment (a flip precondition). FU-12: the delta-omission obligation loss (AC-11):
   a partial push that omits a still-unresolved rule drops its retry obligation. FU-13: an
   escalating server back-off for held agents (AC-1), reset on policy change, weighed
-  against the delay it adds to the re-arm after a late failure.
+  against the delay it adds to the re-arm after a late failure. FU-14: the AC-15
+  avoidable Reapply (a wedge adopted or settled before the agent has retained it): retain such
+  entries so that adoption costs no teardown.
 
 ## 4. #2340 scenario contract
 
