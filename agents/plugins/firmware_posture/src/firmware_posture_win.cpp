@@ -28,10 +28,10 @@
  * the same pure formatter (wmi_bios_rows / smbios_rows) an empty result maps
  * through -- with NO failure token; a refused call (ERROR_ACCESS_DENIED /
  * WBEM access denied) and any other failure go through FirmwareReport::fail
- * as an `unreadable` row plus a `<source>:<cause>` token (the refusal also
+ * as `unreadable` rows (one per field, like Linux) plus one `<source>:<cause>` token (the refusal also
  * sets the denial flag).
  * Every classification (classify_win32_error / classify_hresult /
- * classify_wmi_error_token), the failed-call mappings (apply_wmi_error_token /
+ * classify_wmi_error_token, shared: agents/shared/wmi_error_token.hpp), the failed-call mappings (apply_wmi_error_token /
  * apply_smbios_call_failed) and row mapping (wmi_bios_rows /
  * parse_smbios_type0 / smbios_rows) is a pure function in the parsers header;
  * this TU performs the calls, records the truncation and size tokens
@@ -161,7 +161,7 @@ void collect_smbios(FirmwareReport& report) {
             return;
         }
         if (need > kMaxSmbiosBytes) {
-            report.fail("vendor", kSrcSmbios, "smbios:oversized");
+            report.fail_all(kSmbiosFields, kSrcSmbios, "smbios:oversized");
             return;
         }
 
@@ -179,12 +179,15 @@ void collect_smbios(FirmwareReport& report) {
 
         const Smbios0Result r = parse_smbios_type0(std::span<const std::uint8_t>{table});
         if (r.constrained)
-            report.fail("vendor", kSrcSmbios, r.token); // smbios:truncated|malformed|no_type0
-        else
-            report.add_all(smbios_rows(r.data));
+            report.fail_all(kSmbiosFields, kSrcSmbios, r.token); // smbios:truncated|malformed|no_type0
+        else {
+            std::vector<std::string> partial; // smbios:<field>:partial (half-specified release pair)
+            report.add_all(smbios_rows(r.data, kSrcSmbios, &partial));
+            for (const auto& t : partial) report.note_failure(t);
+        }
         return;
     }
-    report.fail("vendor", kSrcSmbios, "smbios:size_race");
+    report.fail_all(kSmbiosFields, kSrcSmbios, "smbios:size_race");
 }
 
 } // namespace

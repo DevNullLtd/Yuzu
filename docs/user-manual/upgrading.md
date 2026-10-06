@@ -273,6 +273,14 @@ Only case (e) means the key files are gone. Nothing inside the server can rebuil
   3. This database cannot be brought back by any supported means. Every start checks each registered KEK and refuses. The one-shot modes `--mfa-reset` and `--break-glass-arm` run after that check, so they stop with the same `kek_unresolvable` error. What is gone: the CA private key, so every agent certificate it issued no longer chains and every agent must enroll again; and every secret sealed under the KEK, including TOTP enrolments, webhook signing secrets and the other secret columns listed in `docs/user-manual/server-admin.md` "Key management (secrets KEK)". Passwords and API tokens are hashed, not sealed, but they live in the same database.
   4. Start a new install. With the bundled Postgres, `docker compose down -v` deletes the Postgres volume along with the others. `down -v` does not reset an external Postgres: that database still registers the lost KEK, so a new install against it fails the same way. Give the new install a new, empty database. Then provision the admin account again, re-enroll your agents, and re-create your configuration.
 
+## Behaviour change: vuln_scan reports an unreadable config check as UNREADABLE and adds a summary row (#4961)
+
+On Linux, `vuln_scan` (`scan`, `config_scan`) now reports a config file it could not read (`/proc/sys/kernel/randomize_va_space`, `/proc/sys/fs/suid_dumpable`, `/etc/ssh/sshd_config`, `/proc/mounts`) as `UNREADABLE|config|<title>|<path>: <cause>` instead of a HIGH/MEDIUM finding. `summary` always emits a seventh row, `summary|UNREADABLE|<n>`, and an absent `sshd_config` reads INFO "not applicable" with the SSH password row now emitted.
+
+- **Affected:** scripts that index `summary` positionally or assert six rows; CEL or severity filters (a "no critical/high" policy passes a host it could not measure); dashboards keyed on MEDIUM counts on RHEL-family hosts where a non-root agent cannot read a mode-0600 `sshd_config`.
+- **Recommended:** treat `UNREADABLE` as not assessed, and use `summary|UNREADABLE|<n>` as the coverage signal.
+- No operator action is required, and rollback is safe (output strings only).
+
 ## Behaviour change: OTA refusal reason for an unreadable agent trust bundle (0.14.0 → 0.14.1, #5249)
 
 - An OTA update refused because the agent cannot load its own update trust bundle (missing, permission-denied, or not a PEM certificate bundle) is now counted as `yuzu_agent_ota_signature_refused_total{reason="bundle_unreadable"}`, no longer `reason="untrusted"`.
