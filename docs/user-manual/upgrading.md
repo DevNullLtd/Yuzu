@@ -324,7 +324,9 @@ such a read can still wait up to the pool's `lock_timeout` (10 s default) or `st
 until two failures have returned, up to the pool size (16 by default, `--postgres-pool-size`) of these
 reads can each hold a connection for that long. The breaker is the one operator permission checks use,
 so ceiling-read failures can open it and an open breaker denies operators' cache-miss checks too (fail
-closed).
+closed). The breaker counts consecutive failures and any successful authz read, a ceiling read
+included, resets the count, so a partial fault that lets the `role_permissions` read succeed while
+other authz reads fail can delay the breaker opening for operators' cache-miss checks.
 
 **The sibling gates changed their budget.** `require_permission` and `require_scoped_permission` now
 read the ceiling with the 250 ms authz acquire budget behind that shared breaker. Before, they acquired

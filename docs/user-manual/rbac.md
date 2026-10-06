@@ -212,7 +212,9 @@ Recommended order for a fresh install:
 > RBAC authz circuit breaker with a 250 ms acquire budget, so a degraded store answers quickly and, once
 > the breaker is open, without touching the pool (an open breaker is counted under `pool_acquire_timeout`). It is the same breaker operator permission checks use, so
 > repeated ceiling-read failures can open it and an open breaker denies operators' cache-miss checks too
-> (fail closed). A read that is already admitted and holds a connection can still wait up to the pool's
+> (fail closed). The breaker counts consecutive failures and any successful authz read, a ceiling read
+> included, resets the count, so a partial fault that lets the `role_permissions` read succeed while other
+> authz reads fail can delay the breaker opening for operators' cache-miss checks. A read that is already admitted and holds a connection can still wait up to the pool's
 > `lock_timeout` (10 s default) or `statement_timeout` (30 s default). On a dark network path (no reply at all)
 > the wait is bounded instead by the pool's `tcp_user_timeout` (10 s), which is confirmed on Linux, unconfirmed
 > on Windows and a no-op on macOS; and until two failures have returned, up to the pool size (16 by default,

@@ -3257,6 +3257,8 @@ unfiltered.**
    policy-table entry, never inferred from one route being changed. The ceiling half is ONE shared
    check, `authz::service_ceiling_check` (`authz_gates.{hpp,cpp}`), called by `require_permission`,
    `require_scoped_permission` and `require_fleet_read` alike: extend it, never fork it.
+   `RbacStore::check_role_has_permission` has no production caller (tests only); a new service-token
+   gate calls `authz::service_ceiling_check`, which keeps a failed read distinct from a deny.
 
 2. **Branch order in `require_permission`/`require_scoped_permission` is fixed — `elevated → engine →
    mcp_tier → service → RBAC-enforced → legacy` — never reorder it.** The elevated branch is guarded
@@ -4387,7 +4389,10 @@ failure treated as "assume changed" (cache cleared) and counted as a
 `ITServiceOwner` ceiling read behind service-scoped tokens) independently bounds how long an
 **uncached** check can block on a doomed pool — it denies such checks
 immediately once open, but it does not itself clear the cache or shorten the
-5 s bound; a cache hit is served regardless of breaker state. **The bound is
+5 s bound; a cache hit is served regardless of breaker state. The breaker counts
+*consecutive* failures and any successful authz read, a ceiling read included, resets the count, so a
+partial fault that lets the `role_permissions` read succeed while other authz reads fail can delay the
+breaker opening for operators' cache-miss checks. **The bound is
 tight only for pool-acquisition failure** (no connection available within
 the 250ms acquire budget — well under a second for 2 consecutive attempts).
 A query that acquires a connection and then blocks on a PostgreSQL-side lock

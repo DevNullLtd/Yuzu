@@ -46,10 +46,13 @@ using rbac_sql::kWriteTimeout;
 // `check_permission`'s own acquire, and `resolve_perm_groups`'s two acquires via
 // `user_rbac_group_names`/`role_effects_for`) is on the request-serving critical
 // path for EVERY confined operator action, so it uses this short acquire budget
-// instead of `kReadTimeout` — under a saturated pool a wave of concurrent authz
-// checks pins each HTTP worker for at most ~250ms instead of ~2s, bounding how
-// much of the shared `http_worker` pool a Postgres degrade can exhaust before
-// the item-1-commit-B breaker (next commit) trips. CRUD/admin RbacStore calls
+// instead of `kReadTimeout` (2 s). PgPool clamps a bounded acquire that finds the
+// pool already saturated at entry to its `saturated_fast_fail` (500ms by default),
+// so `kReadTimeout` alone would wait up to ~500ms there, and the full 2 s only for
+// a pool that saturates after the call entered it. This budget bounds the acquire
+// wait at ~250ms in both cases, limiting how much of the shared `http_worker`
+// pool a Postgres degrade can exhaust before the breaker below trips (an open
+// breaker answers without a pool touch). CRUD/admin RbacStore calls
 // (`assign_role`, `set_permission`, catalogue listings, etc.) are operator-driven,
 // not per-request, and keep the wider `kReadTimeout` — matches
 // `docs/postgres-store-playbook.md`'s hot-path-vs-admin acquire-budget split.
@@ -113,8 +116,10 @@ constexpr std::int64_t kRbacStaleServeBoundMs = 5000;
 // touching the pool until one probe per cooldown succeeds. Deliberately
 // small (2, not e.g. 5) — the goal is bounding the FIRST wave's exposure,
 // not waiting for a confident failure signal; kAuthzAcquireTimeout above
-// already keeps a single failed attempt cheap (~250ms), so trip-fast costs
-// little even on a false-positive (one genuinely-slow-but-healthy query).
+// bounds a single failed acquire at ~250ms, so trip-fast costs little even on
+// a false-positive (one genuinely-slow-but-healthy query). The count is of
+// CONSECUTIVE failures: any success on the authz path, including the
+// ITServiceOwner ceiling read, resets it (see breaker_note_result).
 constexpr int kBreakerTripThreshold = 2;
 
 // Read-degrade reason labels (ADR-0037 convention). A !open_ store fails boot
