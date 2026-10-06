@@ -3006,7 +3006,7 @@ tests:
         eval_time: 20m
         exp_samples: []
 
-  # ── YuzuGatewayUpstreamEncodeErrors (#4632 round 4) ───────────────────────
+  # YuzuGatewayUpstreamEncodeErrors (#4632 round 4)
   #
   # A systematic local encode failure (every Register answered INTERNAL while
   # the breaker stays closed and /readyz stays ready) is visible ONLY as
@@ -3014,7 +3014,7 @@ tests:
   # series at 0 (yuzu_gw_telemetry:declare_metrics/0), so the first increment
   # has a baseline for increase() to diff against.
 
-  # CASE — one encode failure fires, no `for:` needed: any increase in 10m.
+  # CASE: one encode failure fires, no `for:` needed: any increase in 10m.
   - interval: 1m
     name: gateway upstream encode errors - a single encode failure fires
     input_series:
@@ -3031,7 +3031,7 @@ tests:
         eval_time: 25m
         exp_samples: []
 
-  # CASE — the healthy shape: pre-seeded at 0 and flat stays silent, and a
+  # CASE: the healthy shape: pre-seeded at 0 and flat stays silent, and a
   # rising counter of ANOTHER code (a server answer, an exception) does not fire
   # this alert (those are the breaker's business and YuzuGatewayUpstreamErrors').
   - interval: 1m
