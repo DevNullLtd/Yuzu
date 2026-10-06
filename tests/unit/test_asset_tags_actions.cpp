@@ -31,18 +31,24 @@
 #include <yuzu/plugin.h>
 #include <yuzu/plugin.hpp>
 
+// Real definitions first (pragma once keeps them real inside the plugin TU
+// pulled in below, where the macro never reaches them).
 #include "asset_tags_parsers.hpp"
 #include "asset_tags_store.hpp"
 #include "local_dispatcher.hpp"
 #include "test_helpers.hpp"
 
+#include <array>
 #include <chrono>
 #include <cstdlib>
+#include <expected>
 #include <filesystem>
 #include <fstream>
+#include <mutex>
 #include <optional>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -51,6 +57,64 @@ namespace fs = std::filesystem;
 using namespace yuzu::asset_tags;
 
 namespace {
+
+// TU-inclusion seam (precedent: test_asset_tags_sync_lock.cpp) for the typed
+// WriteWarning escalation: do_sync's one persist call is renamed to a function
+// that performs the REAL write and then substitutes a chosen warning, because
+// fchmod/directory-fsync failures cannot be provoked on a real fd portably.
+// Everything else -- the flag reads, the decision, the retained diagnostic, the
+// status rows -- is the production plugin code.
+std::optional<WriteWarning> g_injected_warning;
+
+std::expected<std::optional<WriteWarning>, IoError>
+test_write_state_file_atomic(const fs::path& dest, std::string_view bytes) {
+    auto r = write_state_file_atomic(dest, bytes);
+    if (r && g_injected_warning)
+        return g_injected_warning;
+    return r;
+}
+
+} // namespace
+
+#undef YUZU_PLUGIN_EXPORT
+#define YUZU_PLUGIN_EXPORT(ClassName) /* no C export in the test executable */
+#define write_state_file_atomic test_write_state_file_atomic
+// AssetTagsPlugin has external linkage; test_asset_tags_sync_lock.cpp includes the
+// same TU into this executable, so give this copy its own class name (else the
+// linker coalesces the two differing definitions -- ODR violation).
+#define AssetTagsPlugin AssetTagsPluginActionsSeam
+#include "asset_tags_plugin.cpp"
+#undef AssetTagsPlugin
+#undef write_state_file_atomic
+#undef YUZU_PLUGIN_EXPORT
+
+namespace {
+
+AssetTagsPluginActionsSeam& tu_plugin() {
+    static AssetTagsPluginActionsSeam p;
+    return p;
+}
+
+int tu_execute(YuzuCommandContext* ctx, const char* action, const YuzuParam* params,
+               size_t param_count) {
+    yuzu::CommandContext cmd_ctx{ctx};
+    yuzu::Params p{{params, param_count}};
+    return tu_plugin().execute(cmd_ctx, action, p);
+}
+
+const YuzuPluginDescriptor kTuDescriptor{
+    .abi_version = YUZU_PLUGIN_ABI_VERSION,
+    .name = "asset_tags",
+    .version = "0.1.0",
+    .description = "asset_tags (TU-inclusion seam)",
+    .actions = tu_plugin().actions(),
+    .init = nullptr,
+    .shutdown = nullptr,
+    .execute = tu_execute,
+    .sdk_version = YUZU_PLUGIN_SDK_VERSION,
+    .action_descriptors = nullptr,
+    .action_descriptor_count = 0,
+};
 
 std::vector<std::string> captured_rows(const std::string& captured) {
     std::vector<std::string> out;
@@ -233,7 +297,7 @@ TEST_CASE("asset_tags plugin: sync/status/get/changes route every field through 
     r = run(*plugin, "status");
     CHECK(r.rc == 0);
     rows = captured_rows(r.captured);
-    REQUIRE(rows.size() == 8);
+    REQUIRE(rows.size() == 10);
     CHECK(rows[0] == "tag|role|" + capped);
     CHECK(rows[1] == "tag|environment|a  b");
     CHECK(rows[2] == "tag|location|Rack A\\|3");
@@ -242,6 +306,8 @@ TEST_CASE("asset_tags plugin: sync/status/get/changes route every field through 
     CHECK(rows[5] == "stale|false");
     CHECK(rows[6].rfind("check_interval|", 0) == 0);
     CHECK(rows[7].rfind("change_count|", 0) == 0);
+    CHECK(rows[8] == "persist_failures|0");
+    CHECK(rows[9] == "last_persist_error|-");
 
     // get: value escaped; caller echo in the error row escaped; missing key.
     std::string key = "location";
@@ -334,12 +400,14 @@ TEST_CASE("asset_tags plugin: init() recovery, persistence and the typed sync st
         yuzu::test::ScopeExit shutdown_on_exit{[&] { plugin->descriptor->shutdown(ctx.get()); }};
 
         auto rows = captured_rows(run(*plugin, "status").captured);
-        REQUIRE(rows.size() == 8);
+        REQUIRE(rows.size() == 10);
         CHECK(rows[0] == "tag|role|");
         CHECK(rows[4] == "last_sync|0");
         CHECK(rows[5] == "stale|true");
         CHECK(rows[6] == "check_interval|300"); // malformed value: default kept
         CHECK(rows[7] == "change_count|0");
+        CHECK(rows[8] == "persist_failures|0");
+        CHECK(rows[9] == "last_persist_error|-");
 
         auto r = sync(*plugin, SyncParams{"db", "", "", ""});
         CHECK(r.rc == 0);
@@ -376,6 +444,15 @@ TEST_CASE("asset_tags plugin: init() recovery, persistence and the typed sync st
         CHECK(has_row(rows, "tag|role|web"));
         rows = captured_rows(run(*plugin, "status").captured);
         CHECK(has_row(rows, "tag|role|web"));
+        CHECK(has_row(rows, "persist_failures|1"));
+        // A non-empty, non-"-" message; no rows count dependence.
+        const std::string err_prefix = "last_persist_error|";
+        bool saw_err = false;
+        for (const auto& row : rows)
+            if (row.rfind(err_prefix, 0) == 0 && row.size() > err_prefix.size() &&
+                row != "last_persist_error|-")
+                saw_err = true;
+        CHECK(saw_err);
     }
 
     // ── Cycle 2: a valid snapshot and a below-floor interval load. ─────────
@@ -396,7 +473,7 @@ TEST_CASE("asset_tags plugin: init() recovery, persistence and the typed sync st
         yuzu::test::ScopeExit shutdown_on_exit{[&] { plugin->descriptor->shutdown(ctx.get()); }};
 
         auto rows = captured_rows(run(*plugin, "status").captured);
-        REQUIRE(rows.size() == 8);
+        REQUIRE(rows.size() == 10);
         CHECK(rows[0] == "tag|role|db");
         CHECK(rows[1] == "tag|environment|Production");
         CHECK(rows[2] == "tag|location|");
@@ -405,7 +482,113 @@ TEST_CASE("asset_tags plugin: init() recovery, persistence and the typed sync st
         CHECK(rows[5] == "stale|false");
         CHECK(rows[6] == "check_interval|30"); // floored
         CHECK(rows[7] == "change_count|2");
+        // Process-lifetime counters: cycle 1's failure is still counted.
+        CHECK(rows[8] == "persist_failures|1");
+        CHECK(rows[9] != "last_persist_error|-");
+        CHECK(rows[9].rfind("last_persist_error|", 0) == 0);
     }
+}
+
+TEST_CASE("asset_tags sync: typed WriteWarning flags escalate the result status through the "
+          "production do_sync path",
+          "[agent][asset_tags_actions]") {
+    yuzu::test::TempDir dir{"yuzu_test_asset_tags_warn_"};
+    {
+        std::lock_guard<std::mutex> lock(g_mu);
+        g_state = {};
+        g_store_path = dir.path / "asset_tags.json";
+        g_persist_failures = 0;
+        g_last_persist_error.clear();
+    }
+    yuzu::test::ScopeExit reset_globals{[] {
+        std::lock_guard<std::mutex> lock(g_mu);
+        g_state = {};
+        g_store_path.clear();
+        g_persist_failures = 0;
+        g_last_persist_error.clear();
+        g_injected_warning.reset();
+    }};
+
+    struct Case {
+        const char* name;
+        bool mode, dir;
+        YuzuResultCompleteness completeness;
+        const char* provenance;
+        const char* row_prefix;
+    };
+    const Case cases[] = {
+        {"mode only", true, false, YUZU_RESULT_COMPLETENESS_FULL,
+         "asset_tags:persist_mode_reassert_failed", "last_persist_error|mode_reassert_failed: "},
+        {"dir only", false, true, YUZU_RESULT_COMPLETENESS_FULL, "asset_tags:persist_dir_unsynced",
+         "last_persist_error|dir_fsync_failed: "},
+        {"both", true, true, YUZU_RESULT_COMPLETENESS_FULL, "asset_tags:persist_mode_reassert_failed",
+         "last_persist_error|mode_reassert_failed+dir_fsync_failed: "},
+    };
+
+    int i = 0;
+    for (const auto& c : cases) {
+        INFO(c.name);
+        // First cause deliberately longer than the diagnostic cap: the second
+        // cause must still be visible through the typed labels.
+        g_injected_warning =
+            WriteWarning{std::string(kMaxValueBytes * 2, 'p') + "; fsync of d failed", c.mode, c.dir};
+        const std::string role = "r" + std::to_string(i++);
+        const std::array<YuzuParam, 1> params{{{"role", role.c_str()}}};
+
+        yuzu::agent::LocalDispatcher dispatcher;
+        auto r = dispatcher.run(&kTuDescriptor, "sync", params);
+        CHECK(r.rc == 0);
+        CHECK(r.result_status == YUZU_RESULT_STATUS_CONSTRAINED);
+        CHECK(r.result_completeness == c.completeness);
+        CHECK(r.result_provenance == c.provenance);
+
+        auto rows = captured_rows(dispatcher.run(&kTuDescriptor, "status", {}).captured);
+        CHECK(has_row(rows, "persist_failures|0")); // a warning is not a failed write
+        auto err = row_with_prefix(rows, "last_persist_error|");
+        REQUIRE(err.has_value());
+        CHECK(err->rfind(c.row_prefix, 0) == 0);
+    }
+
+    // No warning: OK/FULL again; the retained diagnostic is the last one seen.
+    g_injected_warning.reset();
+    const std::array<YuzuParam, 1> params{{{"role", "r-clean"}}};
+    yuzu::agent::LocalDispatcher dispatcher;
+    auto r = dispatcher.run(&kTuDescriptor, "sync", params);
+    CHECK(r.result_status == YUZU_RESULT_STATUS_OK);
+    CHECK(r.result_completeness == YUZU_RESULT_COMPLETENESS_FULL);
+    CHECK(r.result_provenance.empty());
+}
+
+TEST_CASE("asset_tags status: last_persist_error is escaped by safe_output_field",
+          "[agent][asset_tags_actions]") {
+    yuzu::test::TempDir dir{"yuzu_test_asset_tags_escape_"};
+    {
+        std::lock_guard<std::mutex> lock(g_mu);
+        g_state = {};
+        g_store_path = dir.path / "asset_tags.json";
+        g_persist_failures = 0;
+        g_last_persist_error.clear();
+    }
+    yuzu::test::ScopeExit reset_globals{[] {
+        std::lock_guard<std::mutex> lock(g_mu);
+        g_state = {};
+        g_store_path.clear();
+        g_persist_failures = 0;
+        g_last_persist_error.clear();
+        g_injected_warning.reset();
+    }};
+
+    // Pipe, backslash and CR/LF are the bytes the row grammar cannot carry raw.
+    g_injected_warning = WriteWarning{"a|b\\c\r\nd", false, true};
+    const std::array<YuzuParam, 1> params{{{"role", "r-esc"}}};
+    yuzu::agent::LocalDispatcher dispatcher;
+    CHECK(dispatcher.run(&kTuDescriptor, "sync", params).rc == 0);
+
+    auto rows = captured_rows(dispatcher.run(&kTuDescriptor, "status", {}).captured);
+    auto err = row_with_prefix(rows, "last_persist_error|");
+    REQUIRE(err.has_value());
+    // '|' -> "\|", '\' -> '/', CR and LF -> one space each.
+    CHECK(*err == "last_persist_error|dir_fsync_failed: a\\|b/c  d");
 }
 
 TEST_CASE("asset_tags plugin: shutdown() wakes the check thread at once, not after its sleep",
