@@ -3006,27 +3006,80 @@ tests:
         eval_time: 20m
         exp_samples: []
 
-  # YuzuGatewayUpstreamEncodeErrors (#4632 round 4)
+  # YuzuGatewayUpstreamEncodeErrors (#4632 rounds 4 and 5)
   #
   # A systematic local encode failure (every Register answered INTERNAL while
   # the breaker stays closed and /readyz stays ready) is visible ONLY as
   # yuzu_gw_upstream_rpc_errors_total{code="encode"}. The gateway pre-seeds the
   # series at 0 (yuzu_gw_telemetry:declare_metrics/0), so the first increment
   # has a baseline for increase() to diff against.
+  #
+  # The threshold is at least 10 increases in 10 minutes: one malformed Register
+  # from an unauthenticated peer, or one oversized daily-sync batch, counts once
+  # and must stay quiet. Each case below steps the counter at minute 6 (the
+  # samples are one minute apart, left-open 10m window), so the sample at minute
+  # 5 is the last one that still holds the old value: a 10m window sees both
+  # values through minute 14 and only the new one from minute 15, a 5m window
+  # stops seeing the old one at minute 10, and a 20m window keeps seeing it
+  # until minute 24.
 
-  # CASE: one encode failure fires, no `for:` needed: any increase in 10m.
+  # CASE: one encode failure stays quiet (kills a `> 0` threshold).
   - interval: 1m
-    name: gateway upstream encode errors - a single encode failure fires
+    name: gateway upstream encode errors - a single encode failure stays quiet
     input_series:
       - series: 'yuzu_gw_upstream_rpc_errors_total{job="yuzu-gateway",instance="g1",rpc_name="register",code="encode"}'
         values: "0x5 1x30"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGatewayUpstreamEncodeErrors"}'
+        eval_time: 7m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuGatewayUpstreamEncodeErrors"}'
+        eval_time: 12m
+        exp_samples: []
+
+  # CASE: nine in the window stay quiet (kills `>= 9`).
+  - interval: 1m
+    name: gateway upstream encode errors - nine encode failures stay quiet
+    input_series:
+      - series: 'yuzu_gw_upstream_rpc_errors_total{job="yuzu-gateway",instance="g1",rpc_name="register",code="encode"}'
+        values: "0x5 9x30"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGatewayUpstreamEncodeErrors"}'
+        eval_time: 7m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuGatewayUpstreamEncodeErrors"}'
+        eval_time: 12m
+        exp_samples: []
+
+  # CASE: ten in the window fire, no `for:` (kills `>= 11` and `> 10`), for as
+  # long as the 10m window still holds the sample before the step (kills `[5m]`
+  # at minute 12), and resolve once it does not (kills `[20m]` at minute 17).
+  - interval: 1m
+    name: gateway upstream encode errors - ten encode failures fire for exactly the 10m window
+    input_series:
+      - series: 'yuzu_gw_upstream_rpc_errors_total{job="yuzu-gateway",instance="g1",rpc_name="register",code="encode"}'
+        values: "0x5 10x30"
     promql_expr_test:
       - expr: 'ALERTS{alertname="YuzuGatewayUpstreamEncodeErrors", alertstate="firing"}'
         eval_time: 7m
         exp_samples:
           - labels: 'ALERTS{alertname="YuzuGatewayUpstreamEncodeErrors", alertstate="firing", code="encode", instance="g1", job="yuzu-gateway", rpc_name="register", severity="warning"}'
             value: 1
-      # Once the increment has aged out of the 10m window the alert resolves.
+      - expr: 'ALERTS{alertname="YuzuGatewayUpstreamEncodeErrors", alertstate="firing"}'
+        eval_time: 12m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGatewayUpstreamEncodeErrors", alertstate="firing", code="encode", instance="g1", job="yuzu-gateway", rpc_name="register", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuGatewayUpstreamEncodeErrors", alertstate="firing"}'
+        eval_time: 14m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGatewayUpstreamEncodeErrors", alertstate="firing", code="encode", instance="g1", job="yuzu-gateway", rpc_name="register", severity="warning"}'
+            value: 1
+      # The sample before the step has left the 10m window: it resolves. A 20m
+      # window would still hold it here.
+      - expr: 'ALERTS{alertname="YuzuGatewayUpstreamEncodeErrors"}'
+        eval_time: 17m
+        exp_samples: []
       - expr: 'ALERTS{alertname="YuzuGatewayUpstreamEncodeErrors"}'
         eval_time: 25m
         exp_samples: []
