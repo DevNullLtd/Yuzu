@@ -226,11 +226,10 @@
 -define(LOCAL_ENCODE_FAILED, yuzu_gw_local_encode_failed).
 
 %% The largest request the server accepts: the receive limit of a stock gRPC
-%% server (4 MiB; no SetMaxReceiveMessageSize override exists on the server). The
-%% gateway edge listener has no cap of its own, so a larger Register or
-%% InventoryReport reaches this module, and the server would answer
-%% RESOURCE_EXHAUSTED before its handler runs. That is a fact about the request,
-%% so encode_request/2 refuses it here as a local encode failure, and
+%% server (4 MiB; no SetMaxReceiveMessageSize override exists on the server). A
+%% request over that bound can still arrive at this module, and the server would
+%% answer RESOURCE_EXHAUSTED before its handler runs. That is a fact about the
+%% request, so encode_request/2 refuses it here as a local encode failure, and
 %% RESOURCE_EXHAUSTED stays a status that counts against the upstream (a server
 %% out of memory or threads answers it too).
 -define(MAX_REQUEST_BYTES, 4194304).

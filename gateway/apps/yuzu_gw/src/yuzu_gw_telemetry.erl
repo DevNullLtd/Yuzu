@@ -452,8 +452,11 @@ declare_metrics() ->
     %% the two codes a gateway fault produces (no server answer, so no status
     %% code) start at 0. The RPC names are the do_rpc/3 tags of yuzu_gw_upstream
     %% (register, inventory, notify_stream, guardian) and the heartbeat buffer's
-    %% batch_heartbeat, which has no local encode path of its own, so only
-    %% exception exists for it. Status codes are never pre-seeded.
+    %% batch_heartbeat, whose marshal failure is counted as code="exception"
+    %% (yuzu_gw_heartbeat_buffer do_flush, the {caught, Class} branch), so only
+    %% exception is seeded for it; an invalid heartbeat is dropped as
+    %% heartbeat_invalid instead. Neither is covered by the encode alert. Status
+    %% codes are never pre-seeded.
     [prometheus_counter:inc(yuzu_gw_upstream_rpc_errors_total, [Name, Code], 0)
      || {Name, Code} <- [{N, C} || N <- [<<"register">>, <<"inventory">>,
                                          <<"notify_stream">>, <<"guardian">>],

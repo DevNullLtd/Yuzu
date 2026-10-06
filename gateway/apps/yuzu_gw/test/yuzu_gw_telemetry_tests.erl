@@ -510,10 +510,11 @@ notify_queue_families_test_() ->
          {<<"inventory">>, <<"encode">>}, {<<"inventory">>, <<"exception">>},
          {<<"notify_stream">>, <<"encode">>}, {<<"notify_stream">>, <<"exception">>},
          {<<"guardian">>, <<"encode">>}, {<<"guardian">>, <<"exception">>},
-         %% The batch heartbeat client has no local encode path of its own.
+         %% A batch heartbeat marshal failure is counted as code="exception",
+         %% so only exception is seeded for it.
          {<<"batch_heartbeat">>, <<"exception">>}]).
 %% Pairs that must NOT exist after setup(): a status code is a server answer, and
-%% the batch heartbeat client has no local encode path.
+%% a batch heartbeat marshal failure is code="exception", never "encode".
 -define(RPC_ERROR_NOT_SEEDED,
         [{N, C} || N <- [<<"register">>, <<"inventory">>, <<"notify_stream">>,
                          <<"guardian">>, <<"batch_heartbeat">>],
