@@ -3462,7 +3462,31 @@ Before upgrading any component:
   `--spark-disable` / `YUZU_AGENT_SPARK_DISABLE` (the opt-out itself stays
   visible as `yuzu_fleet_spark_disabled`). See
   [Guaranteed State](guaranteed-state.md#sparkengine--the-next-generation-detection-engine-observe-only).
-- [ ] **New Guardian claim-lifecycle health telemetry (auto-on, sparse; dormant in steady state until the Spark path is enabled, #5403, #5404, #4472):** on agent upgrade, agents gain 15 new `yuzu.guardian_*` heartbeat tags (13 sparse count tags and 2 pending-age tags), and the server exposes the matching `yuzu_fleet_guardian_*` gauges (13 fleet sums and 2 fleet maxima, the latter ending `_max`). No agent enables the Spark path today, so on an inert fleet every one of these is **absent in steady state** (`yuzu.guardian_ack_maint_exceptions` is the one that can appear on an inert fleet: its push-apply source runs whether or not the Spark path is enabled, and ships only if that step throws); an absent gauge means nothing to report, never a measured `0`. Nothing about Guard detection or enforcement changes, and the tags carry no user, process or path identity. No alert rule ships with them. **Mixed versions:** a not-yet-upgraded agent omits the tags, so the absence of a gauge from an old agent reads as healthy even when it is not; upgrade the **server first** so the gauges exist when the first upgraded agent reports (an older server stores the unknown tags and ignores them). **At the Spark flip** (not part of this upgrade) the two kinds of agent behave differently: upgraded agents hold the policy generation and keep being re-pushed while a wedged rule or a compensating teardown is outstanding (each re-push writes a `guaranteed_state.reconcile` audit row, about once per heartbeat per held agent; the agent suppresses the identical re-pushes and applies one in full about every 330 s), whereas agents without the #5459 retry suppression (every agent built before the #5459 change carries the earlier three-re-apply waiver, PR #4529: that includes release 0.14.0 and its release candidates, any 0.14.x hotfix cut from them, and dev or main builds from before the change, which still report version 0.14.0 because the version string carries no suffix; check the release notes for the first release that carries the #5459 change) can acknowledge the generation after three re-applies of a wedged rule (and, without the #4472 fix, while a compensating teardown is outstanding), which can leave the rule unarmed under an acknowledged generation if the hung arm later fails (see the wedged-rule hold note in Guaranteed State). See [Guaranteed State](guaranteed-state.md#sparkengine--the-next-generation-detection-engine-observe-only) and [Metrics](metrics.md#guardian-m1-health-stream-fleet-gauges).
+- [ ] **New Guardian claim-lifecycle health telemetry (auto-on, sparse; dormant in steady state until the Spark path is enabled, #5403, #5404, #4472):** on
+  agent upgrade, agents gain 15 new `yuzu.guardian_*` heartbeat tags (13 sparse count tags and 2 pending-age tags), and the server exposes the matching
+  `yuzu_fleet_guardian_*` gauges (13 fleet sums and 2 fleet maxima, the latter ending `_max`).
+  - **Steady state.** No agent enables the Spark path today, so on an inert fleet every one of these is **absent in steady state**
+    (`yuzu.guardian_ack_maint_exceptions` is the one that can appear on an inert fleet: its push-apply source runs whether or not the Spark
+    path is enabled, and ships only if that step throws); an absent gauge means nothing to report, never a measured `0`. Nothing about
+    Guard detection or enforcement changes, and the tags carry no user, process or path identity. No alert rule ships with them.
+  - **Mixed versions.** A not-yet-upgraded agent omits the tags, so the absence of a gauge from an old agent reads as healthy even when it
+    is not; upgrade the **server first** so the gauges exist when the first upgraded agent reports (an older server stores the unknown tags
+    and ignores them).
+  - **At the Spark flip (not part of this upgrade), upgraded agents.** They hold the policy generation and keep being re-pushed while a
+    wedged rule or a compensating teardown is outstanding (each re-push writes a `guaranteed_state.reconcile` audit row, about once per
+    heartbeat per held agent; the agent suppresses the identical re-pushes and applies one in full about every 330 s).
+  - **At the Spark flip, agents without the #5459 retry suppression.** Every agent built before the #5459 change carries the earlier
+    three-re-apply waiver (PR #4529). Such an agent can acknowledge the generation after three re-applies of a wedged rule (and, without the
+    #4472 fix, while a compensating teardown is outstanding), which can leave the rule unarmed under an acknowledged generation if the hung
+    arm later fails (see the wedged-rule hold note in Guaranteed State).
+  - **Telling the two kinds of build apart.** The base version number alone does not separate them: release 0.14.0 and its release
+    candidates, any 0.14.x hotfix cut from them, and dev or main builds from before the change all carry the waiver, and dev and main
+    builds report the base version set in `meson.build` (`0.14.0` when this entry was written) before and after the change. `yuzu-agent --version` and the agent's start-up log print the full version (`<version>+<build number>`)
+    and the short commit hash, and the `yuzu.agent_version` heartbeat tag carries the same full version; a build from source carries the
+    change only if its commit contains the #5459 change. For a release build, use the release notes, which name the first release that
+    carries the #5459 change.
+  - See [Guaranteed State](guaranteed-state.md#sparkengine--the-next-generation-detection-engine-observe-only) and
+    [Metrics](metrics.md#guardian-m1-health-stream-fleet-gauges).
 - [ ] **Changed agent signal handling (Linux/macOS):** graceful shutdown now runs
   on a dedicated watcher thread (fixes an abort/hang class on `SIGTERM`), and a
   **second** `SIGTERM`/`SIGINT` immediately hard-exits the agent (exit 1) —

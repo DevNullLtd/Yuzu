@@ -733,17 +733,27 @@ wedge at the head of the key (same rule id, same spec) and re-observes it, so th
 is counted failed again, `can_advance()` stays false and the new generation is held with
 a fresh `kWedgeSuppressMaxDecisions` budget. What ends the hold without a restart: the
 hung call returning; a full push (`full_sync=true`) that no longer contains the wedged
-rule (removed from or excluded from the deployed Baseline: `apply_rules()` tears down and
-rebuilds only on a full push, so a `full_sync=false` push is additive and leaves the rule
-armed or wedged); or an edit to the wedged rule's own spec, which changes its key
-(`spark_key()` encodes the whole spec) so it is no longer matched to the hung claim. A
-restart ends it only if the target is no longer hung. None of these releases the hung
-call: it keeps its key and, while inside a mechanism call, the same-type serialisation
-until it returns; re-adding the same rule and spec re-observes it and re-wedges at once;
-a different rule id on that key is refused (`kSparkKeyWedged`) and becomes an ordinary
-failure. The operator-facing statement is in the user manual's wedged-rule hold note and
-flip-gate AC-1. An omitting delta push additionally drops the retry obligation (known limit
-below). A genuine refusal
+rule (`apply_rules()` tears down and rebuilds only on a full push, so a `full_sync=false`
+push is additive and leaves the rule armed or wedged); or an edit to the wedged rule's own
+spec, which changes its key (`spark_key()` encodes the type and the whole watch target: path,
+service name, or registry hive and key) so it is no longer matched to the hung claim. Getting
+the rule out of the push has an ordering rule: the push is built from the deployed snapshot
+and then filtered on the live rule row, so disabling the rule or narrowing its scope or OS
+target flows with the next automatic re-push, whereas removing a member from the Baseline is
+staged until a Re-deploy (a fleet-wide full push). Neither the full-push exit nor the re-key
+exit is unconditional: the hung call keeps the call lock of its mechanism type while it is
+inside a mechanism call, so any other rule of the same type in the new application, and the
+re-keyed rule itself when its type is unchanged, queues behind it and expires, and the new
+generation stays held until the hung call returns or the agent restarts (flip-gate AC-1,
+AC-16). A restart ends it only if the target is no longer hung. Neither the full-push exit nor
+the re-key exit releases the hung call itself: it keeps its key and, while inside a mechanism
+call, the same-type serialisation until it returns; while the rule stays omitted a late
+success is torn down, whereas re-adding the same rule and spec re-observes the claim, re-wedges
+at once and lets a late success be adopted; a different rule id on that key is refused
+(`kSparkKeyWedged`) and becomes an ordinary failure. The operator-facing statement is in the
+user manual's wedged-rule hold note and flip-gate AC-1. An omitting delta push is a
+different case: it ends the hold in the ledger without a full push but drops the retry
+obligation (known limit below; flip-gate AC-1 and AC-11). A genuine refusal
 (a DISPATCHED call that returned a failure - backend refused or worker threw - or an
 admission rejection that is TERMINAL - `AlreadyRunning`, `LaunchFailed` or
 `Stopped` - where no call was attempted; a congestion rejection is parked and redriven
@@ -778,7 +788,7 @@ apply failure also holds the generation (`can_advance()` needs `resolved_failed 
 `resolved_failed != failed_receipts.size()` check; `check_boot_inert_false_but_watch_refused_stays_failed` in
 `test_guardian_engine_spark_reconcile.cpp` holds `policy_generation() == 0` across
 retries), so corroborate with `yuzu.guardian_arm_failed`/`arm_pending`, the
-compensation age/deadline tags and the agent log before concluding wedge); (2) the server applies no back-off (none is added by #5459), so a held agent
+compensation age/deadline tags and the agent log before concluding wedge); (2) the server applies no back-off (none is added by #5459; FU-13 in the flip gate), so a held agent
 costs one `guaranteed_state.reconcile` audit row per push, about one per 30 s
 heartbeat at the default (the push interval is `ceil(25 s / heartbeat) x heartbeat`, so other intervals scale), plus a forced full teardown and
 re-arm about every 330 s from the safety valve (re-arm recaptures only
@@ -1155,7 +1165,11 @@ design is mentioned it is named as the earlier design.
   known-limits list above); follow-up FU-12 in the flip gate (to be filed). Recovery needs a
   live connection (the maintenance tick runs on the per-connection heartbeat thread).
   Content identity: an identical re-observation
-  matches `rule_id` and spec only (#5512). #4045: a forced Reapply re-arms the whole
+  matches `rule_id` and spec only (#5512): an edit that leaves the watch target the same
+  (a registry rule's value name lives in the assertion, not the spec) is not rebuilt, so the
+  late success arms the content the claim started with; the adopted claim is acknowledged
+  (`can_advance()` ignores content) and the server stops re-pushing, so the stale content
+  stays until the next generation. #4045: a forced Reapply re-arms the whole
   push, but persisted baselines are re-seeded on every arm
   (`guardian_engine.cpp`), so only Spark-first-captured, unpersisted `FileHashEquals`
   baselines are exposed to a baseline recapture.
