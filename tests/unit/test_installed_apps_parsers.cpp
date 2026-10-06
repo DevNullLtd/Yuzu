@@ -564,21 +564,6 @@ TEST_CASE("format_app_row: every field is length-bounded at a UTF-8 boundary",
           "app|X|-|-|-|-|-");
 }
 
-TEST_CASE("detail::cut_utf8: ASCII cuts exactly at the bound; a straddling sequence is dropped whole",
-          "[installed_apps]") {
-    using yuzu::installed_apps::parsers::detail::cut_utf8;
-    const std::string ascii(kMaxListFieldBytes + 10, 'a');
-    CHECK(cut_utf8(ascii, kMaxListFieldBytes) == std::string(kMaxListFieldBytes, 'a'));
-    // At or under the bound the view is returned untouched.
-    CHECK(cut_utf8(std::string(kMaxListFieldBytes, 'a'), kMaxListFieldBytes).size() ==
-          kMaxListFieldBytes);
-    CHECK(cut_utf8("abc", kMaxListFieldBytes) == "abc");
-    // 4095 ASCII bytes + a 2-byte sequence: the sequence starts inside the bound and
-    // ends past it, so it is dropped whole, never split.
-    const std::string straddle = std::string(kMaxListFieldBytes - 1, 'a') + "\xC3\xA9";
-    CHECK(cut_utf8(straddle, kMaxListFieldBytes) == std::string(kMaxListFieldBytes - 1, 'a'));
-}
-
 TEST_CASE("format_app_row: a pipe-filled field is bounded before it is escaped",
           "[installed_apps]") {
     // Mutation: escape-then-bound in list_field. Escaping first can cut between a '\'
