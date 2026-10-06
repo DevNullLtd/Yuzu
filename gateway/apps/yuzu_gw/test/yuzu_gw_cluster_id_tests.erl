@@ -96,11 +96,22 @@ boot_check_refuses_unrepresentable_values() ->
                  yuzu_gw_app:evaluate_cluster_id(<<"default">>, [$a | b])).
 
 %% start/2 returns the refusal before anything is started (the check runs right
-%% after the environment overrides, and the cookie guard before it passes on a
-%% node that is not distributed, as under eunit). A representable value is not
-%% tried here: it would start the whole application.
+%% after the environment overrides). Another test module may have made this node
+%% distributed with a weak cookie, which the cookie guard ahead of the check would
+%% refuse first, so the documented dev/CI override is set for the call and put
+%% back. A representable value is not tried here: it would start the whole
+%% application.
 application_start_refuses_an_unrepresentable_cluster_id() ->
-    os:unsetenv(?VAR),
-    application:set_env(yuzu_gw, cluster_id, [16#110000]),
-    ?assertEqual({error, {invalid_cluster_id, app_env}}, yuzu_gw_app:start(normal, [])),
-    ?assertEqual(undefined, whereis(yuzu_gw_sup)).
+    PrevAllow = os:getenv("YUZU_GW_ALLOW_DEFAULT_COOKIE"),
+    os:putenv("YUZU_GW_ALLOW_DEFAULT_COOKIE", "1"),
+    try
+        os:unsetenv(?VAR),
+        application:set_env(yuzu_gw, cluster_id, [16#110000]),
+        ?assertEqual({error, {invalid_cluster_id, app_env}}, yuzu_gw_app:start(normal, [])),
+        ?assertEqual(undefined, whereis(yuzu_gw_sup))
+    after
+        case PrevAllow of
+            false -> os:unsetenv("YUZU_GW_ALLOW_DEFAULT_COOKIE");
+            Val   -> os:putenv("YUZU_GW_ALLOW_DEFAULT_COOKIE", Val)
+        end
+    end.
