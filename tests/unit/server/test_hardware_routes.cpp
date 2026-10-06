@@ -332,10 +332,24 @@ TEST_CASE("route: hardware list + CI record emit the inventory.* behavioural-PII
 
     REQUIRE(h.sink.Get("/fragments/hardware/ci?id=agent-1&lens=tags"));
     REQUIRE(has("inventory.device.ci|success|Agent|agent-1"));
+
+    // The REST twins emit the same tuples. Clear the capture first so the fragment
+    // calls above cannot satisfy these assertions.
+    h.audit_full.clear();
+    auto rest_list = h.sink.Get("/api/v1/hardware");
+    REQUIRE(rest_list);
+    REQUIRE(rest_list->status == 200);
+    REQUIRE(has("inventory.devices|success|Inventory|fleet"));
+
+    h.audit_full.clear();
+    auto rest_ci = h.sink.Get("/api/v1/hardware/agent-1");
+    REQUIRE(rest_ci);
+    REQUIRE(rest_ci->status == 200);
+    REQUIRE(has("inventory.device.ci|success|Agent|agent-1"));
 }
 
 TEST_CASE("route: hardware list + CI record audit-persist failure — fragments set "
-          "Sec-Audit-Failed, REST fails closed",
+          "Sec-Audit-Failed; REST fails closed",
           "[hardware][route]") {
     HwHarness h;
     h.roster_rows = {make_row("agent-1", "AUDIT-HOST", "windows", true)};
@@ -350,6 +364,8 @@ TEST_CASE("route: hardware list + CI record audit-persist failure — fragments 
     auto rest = h.sink.Get("/api/v1/hardware");
     REQUIRE(rest);
     REQUIRE(rest->status == 503); // fail-closed
+    CHECK(rest->get_header_value("Sec-Audit-Failed") == "true");
+    CHECK_FALSE(contains(rest->body, "AUDIT-HOST")); // nothing served
 
     auto ci_frag = h.sink.Get("/fragments/hardware/ci?id=agent-1");
     REQUIRE(ci_frag);
@@ -359,11 +375,13 @@ TEST_CASE("route: hardware list + CI record audit-persist failure — fragments 
     auto ci_rest = h.sink.Get("/api/v1/hardware/agent-1");
     REQUIRE(ci_rest);
     REQUIRE(ci_rest->status == 503); // fail-closed
+    CHECK(ci_rest->get_header_value("Sec-Audit-Failed") == "true");
+    CHECK_FALSE(contains(ci_rest->body, "AUDIT-HOST")); // nothing served
 }
 
 // ───────────────────────── Gate denial + management-group confinement ──────────
 
-TEST_CASE("route: fleet-read denied — 403, no roster body, no inventory.devices audit row",
+TEST_CASE("route: fleet-read denied — 403; no roster body; no inventory.devices audit row",
           "[hardware][route]") {
     HwHarness h;
     h.roster_rows = {make_row("agent-1", "DENY-HOST", "windows", true)};

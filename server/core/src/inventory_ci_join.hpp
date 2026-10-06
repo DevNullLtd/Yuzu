@@ -1,7 +1,7 @@
 #pragma once
 
 /// @file inventory_ci_join.hpp
-/// Pure device-CI enrichment for the /hardware roster (PR2). Attaches each
+/// Pure device-CI enrichment for the /hardware roster. Attaches each
 /// `InventoryDeviceRow`'s CI fields (serial / model / CPU / RAM)
 /// from a pre-fetched `agent_id -> DeviceCiRecord` map.
 ///

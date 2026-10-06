@@ -102,8 +102,11 @@ struct InventoryDeviceRow {
 /// columns on the affected rows (the endpoint_state roster and the device-CI
 /// enrichment are two independent reads; see `attach_device_ci`). `ci_degraded` is
 /// true when the CI-enrichment read itself failed (or was never wired), so any CI
-/// columns on `rows` are blank rather than genuinely absent — the audit layer needs
-/// this bit to avoid recording "success" over a partial read (#1785 review HIGH-1).
+/// columns on `rows` are blank rather than genuinely absent — the Hardware list's
+/// "CI columns unavailable" banner and the REST `ci_degraded` field read this bit so a
+/// partial read is never shown as genuinely-empty columns (#1785 review HIGH-1). The
+/// `inventory.devices` audit row is emitted as `success` regardless; this bit does not
+/// gate it.
 struct InventoryDevicesResult {
     std::vector<InventoryDeviceRow> rows;
     bool ci_degraded = false;

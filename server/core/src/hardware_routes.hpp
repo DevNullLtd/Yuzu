@@ -8,11 +8,11 @@
 /// by feat/hardware-ci-actions without touching the routes registered here.
 ///
 /// `InventoryDeviceRow`/`InventoryDevicesResult` are declared in `inventory_routes.hpp`
-/// and shared with `hardware_list_model`/`inventory_ci_join` (the
-/// roster's PRODUCTION source is the `build_hw_roster`
-/// roster body in server.cpp, handed to this module as its unfiltered RosterFn). Query/
-/// sort/paginate/JSON logic lives in `hardware_list_model.hpp` (PURE, no httplib) —
-/// this class only wires HTTP semantics (auth, gates, audit) around it.
+/// and shared with `hardware_list_model`/`inventory_ci_join` (the roster's PRODUCTION
+/// source is the `build_hw_roster` body in server.cpp, handed to this module as its
+/// unfiltered RosterFn). Query/sort/paginate/JSON logic lives in
+/// `hardware_list_model.hpp` (PURE, no httplib) — this class only wires HTTP semantics
+/// (auth, gates, audit) around it.
 ///
 /// AUTH: the list and REST twin gate SOLELY on `FleetReadFn` (admit-then-filter,
 /// ADR-0017 — never stacked with a second permission check for the same

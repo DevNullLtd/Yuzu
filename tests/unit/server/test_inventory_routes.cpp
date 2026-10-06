@@ -102,7 +102,7 @@ TEST_CASE("software fragment: capped shows the list-capped banner", "[inventory]
     REQUIRE(contains(html, "list capped"));
 }
 
-TEST_CASE("software devices fragment: hit_cap shows the truncation pill, uncapped does not",
+TEST_CASE("software devices fragment: hit_cap shows the truncation pill; uncapped does not",
           "[inventory][ui]") {
     const std::optional<std::vector<SoftwareFleetRow>> rows{
         std::vector<SoftwareFleetRow>{fleet_row("agent-1", "Chrome", "120")}};
@@ -380,10 +380,11 @@ TEST_CASE("route: software devices — service-scoped token denied, no data leak
     CHECK(res->get_header_value("X-Correlation-Id") ==
          body["error"]["correlation_id"].get<std::string>());
     bool denied = false;
-    for (const auto& a : h.audits) {
-        if (a == "inventory.software.query|denied")
+    for (const auto& a : h.audit_full) {
+        // The full documented tuple (audit-log.md): action|result|target_type|target_id.
+        if (a == "inventory.software.query|denied|Inventory|fleet")
             denied = true;
-        REQUIRE(a != "inventory.software.query|success");
+        REQUIRE_FALSE(a.starts_with("inventory.software.query|success"));
     }
     REQUIRE(denied);
 }

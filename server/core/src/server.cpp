@@ -17445,10 +17445,10 @@ private:
         // installs-per-version drill + "devices >" expansion) over SoftwareInventoryStore,
         // gated on the GLOBAL Inventory:Read (the catalogue aggregates are NOT mgmt-group
         // scoped — ADR-0017 confinement inert under the global gate, caveated in the UI;
-        // the expansion applies the SAME per-row Inventory:Read drop filter the REST
-        // sibling does). Reuses the shared auth/perm/audit closures + the SAME
-        // check_scoped_permission predicate the REST /api/v1/inventory/software route
-        // uses (cross-surface parity).
+        // the expansion applies a per-row Inventory:Read drop filter). Reuses the shared
+        // auth/perm/audit closures + a fail-closed check_scoped_permission predicate
+        // (below). The REST /api/v1/inventory/software route and MCP tool have since
+        // migrated onto require_fleet_read; this page has not, so it does not match them.
         auto inv_human_age = [](std::int64_t ms) -> std::string {
             if (ms < 0)
                 ms = 0;
@@ -17463,7 +17463,7 @@ private:
                 return std::to_string(h) + "h ago";
             return std::to_string(h / 24) + "d ago";
         };
-        // The Hardware tab's RosterFn: unfiltered — the FleetReadGate's own scope is the
+        // The Hardware page's RosterFn: unfiltered — the FleetReadGate's own scope is the
         // sole filter downstream, applied by HardwareRoutes.
         auto build_hw_roster = [this, inv_human_age]() -> InventoryDevicesResult {
             InventoryDevicesResult result;
@@ -17520,9 +17520,10 @@ private:
             // read-cadence-vs-write-cadence mismatch for daily-synced data. Deferred rather
             // than fixed here to keep this PR scoped to dashboard-read enrichment.
             //
-            // `result.ci_degraded` (#1785 review HIGH-1) tells the route's audit whether
-            // the CI columns above are genuinely enriched or blank because this join
-            // failed/was unwired — an unwired store is treated the same as a live failure
+            // `result.ci_degraded` (#1785 review HIGH-1) tells the route's UI banner and
+            // the REST `ci_degraded` field whether the CI columns above are genuinely
+            // enriched or blank because this join failed/was unwired (the audit row is
+            // emitted regardless) — an unwired store is treated the same as a live failure
             // (mirrors the Hardware CI record's CiDetailFn contract).
             if (device_inventory_store_) {
                 auto ci_list = device_inventory_store_->list_device_ci(0);
@@ -17693,13 +17694,13 @@ private:
                 return software_inventory_store_->query_software(q);
             },
             // "devices >" per-row Inventory:Read management-group scope predicate — the SAME
-            // check_scoped_permission chokepoint the REST route + MCP tool use.
+            // check_scoped_permission chokepoint.
             // FAIL-CLOSED on a corrupt/load-failed rbac.db (#1717): gates on
             // rbac_enforcement_in_effect, NOT raw !is_rbac_enabled() (which fails OPEN — a
             // null db reads as "RBAC off → no filter" → cross-operator IDOR). Mirrors
-            // response_agent_in_scope (server.cpp); the REST/MCP siblings still carry the raw
-            // form pending the #1717 global-gate fix, but each new list-read takes the safe
-            // primitive now (ADR-0017 ship-now, decision-independent hardening).
+            // response_agent_in_scope (server.cpp). The REST/MCP siblings have since moved
+            // onto require_fleet_read (ADR-0017); this page still gates on the global
+            // Inventory:Read, so this per-row filter does not narrow results today.
             [this](const std::string& username, const std::string& agent_id) -> bool {
                 if (!rbac_enforcement_in_effect(rbac_store_.get()))
                     return true; // loaded & explicitly disabled → legacy-open

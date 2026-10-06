@@ -368,6 +368,41 @@ TEST_CASE("hardware CI overview lens: CPU cores/threads and RAM humanised; unkno
           std::string::npos);
 }
 
+TEST_CASE("hardware CI record: store degrade, not-yet-synced and found render distinct states",
+          "[hardware][ui]") {
+    // ADR-0016 §7: an empty page must never mean failure. The three Overview states
+    // must stay distinguishable (this replaces the HTML-level pins that lived with the
+    // retired /inventory device renderers).
+    HwCiAffordances aff;
+
+    HardwareCiDetail degraded; // default ci = std::unexpected(kDegraded): store unreadable
+    const auto deg = render_hardware_lens_body("a1", degraded, "", 0, aff);
+    CHECK(deg.find("CI record unavailable") != std::string::npos);
+    CHECK(deg.find("hw-degrade") != std::string::npos);
+    CHECK(deg.find("No CI record synced") == std::string::npos);
+
+    HardwareCiDetail absent;
+    absent.ci = std::optional<DeviceCiRecord>{}; // read fine, device has not synced yet
+    const auto abs = render_hardware_lens_body("a1", absent, "", 0, aff);
+    CHECK(abs.find("No CI record synced yet") != std::string::npos);
+    CHECK(abs.find("CI record unavailable") == std::string::npos);
+
+    HardwareCiDetail found;
+    found.ci = std::optional<DeviceCiRecord>(DeviceCiRecord{});
+    const auto ok = render_hardware_lens_body("a1", found, "", 0, aff);
+    CHECK(ok.find("CI record unavailable") == std::string::npos);
+    CHECK(ok.find("No CI record synced") == std::string::npos);
+
+    HardwareCiDetail sw_degraded; // software == nullopt on the Installed software lens
+    const auto sw = render_hardware_lens_body("a1", sw_degraded, "software", 0, aff);
+    CHECK(sw.find("Installed software unavailable") != std::string::npos);
+    HardwareCiDetail sw_empty;
+    sw_empty.software.emplace();
+    const auto sw_none = render_hardware_lens_body("a1", sw_empty, "software", 0, aff);
+    CHECK(sw_none.find("Installed software unavailable") == std::string::npos);
+    CHECK(sw_none.find("No installed-software inventory") != std::string::npos);
+}
+
 // ── Lens tab bar ───────────────────────────────────────────────────────────────
 
 TEST_CASE("hardware lens bar: id, fixed 7-tab order, active class, oob gated on the parameter",
