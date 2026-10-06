@@ -1060,6 +1060,49 @@ SoftwareInventoryStore::query_software(const SoftwareFleetQuery& q) {
     return parse(res);
 }
 
+// The WHOLE catalogue predicate (everything between FROM <table> and the keyset/ORDER BY),
+// shared by software_catalog and software_catalog_totals so a filtered total can never diverge
+// from the rows it counts. Fleet: WHERE grain/kind/eco/src [versions_min] [q arms]. Host: WHERE
+// agent_id + dimension filters GROUP BY name HAVING true [versions_min] [q arms]. `bind`
+// registers a parameter and returns its placeholder; binds follow emission order.
+template <class Bind>
+std::string catalogue_predicate(const SoftwareCatalogQuery& q, bool host,
+                                std::int64_t versions_min, std::string_view term, Bind&& bind) {
+    std::string sql;
+    if (!host) {
+        const int grain = sc::grain_mask(q.kind, q.ecosystem, q.source);
+        // Named locals, not one operator+ chain: the order of unsequenced bind() calls in a
+        // single expression is compiler-defined, which would permute the $n numbering.
+        const std::string grain_ph = bind(std::to_string(grain));
+        const std::string kind_ph = bind(q.kind);
+        const std::string eco_ph = bind(q.ecosystem);
+        const std::string src_ph = bind(q.source);
+        sql = "WHERE grain = " + grain_ph + "::smallint AND kind = " + kind_ph +
+              " AND ecosystem = " + eco_ph + " AND source = " + src_ph;
+        if (versions_min > 0)
+            sql += " AND version_count >= " + bind(std::to_string(versions_min)) + "::bigint";
+        if (!term.empty())
+            sql += q_arms(bind(std::string(term)), "name", "publisher", "ecosystems", "sources");
+        return sql;
+    }
+    const std::string eco_list = distinct_list("i.ecosystem");
+    const std::string src_list = distinct_list("i.source");
+    sql = "WHERE i.agent_id = " + bind(q.agent_id);
+    if (!q.kind.empty())
+        sql += " AND i.kind = " + bind(q.kind);
+    if (!q.ecosystem.empty())
+        sql += " AND i.ecosystem = " + bind(q.ecosystem);
+    if (!q.source.empty())
+        sql += " AND i.source = " + bind(q.source);
+    sql += " GROUP BY i.name HAVING true";
+    if (versions_min > 0)
+        sql += " AND count(DISTINCT i.version) >= " + bind(std::to_string(versions_min)) +
+               "::bigint";
+    if (!term.empty())
+        sql += q_arms(bind(std::string(term)), "i.name", "max(i.publisher)", eco_list, src_list);
+    return sql;
+}
+
 std::optional<std::vector<SoftwareCatalogRow>>
 SoftwareInventoryStore::software_catalog(const SoftwareCatalogQuery& q) {
     // AUTHORITATIVE read. Fleet path: ONE exact lookup per title in the PRECOMPUTED
@@ -1093,23 +1136,13 @@ SoftwareInventoryStore::software_catalog(const SoftwareCatalogQuery& q) {
         params.push_back(std::move(v));
         return "$" + std::to_string(++p);
     };
+    // The predicate is shared with software_catalog_totals; `after` and ORDER BY/LIMIT are this
+    // read's own. The host path's `after` lives in HAVING (the GROUP BY key is i.name).
     std::string sql;
     if (!host) {
-        const int grain = sc::grain_mask(q.kind, q.ecosystem, q.source);
-        // Named locals, not one operator+ chain: the order of unsequenced bind() calls in a
-        // single expression is compiler-defined, which would permute the $n numbering.
-        const std::string grain_ph = bind(std::to_string(grain));
-        const std::string kind_ph = bind(q.kind);
-        const std::string eco_ph = bind(q.ecosystem);
-        const std::string src_ph = bind(q.source);
         sql = "SELECT name, publisher, device_count, version_count, ecosystems, kinds, "
-              "newest_version FROM software_inventory_store.catalog_rollup WHERE grain = " +
-              grain_ph + "::smallint AND kind = " + kind_ph + " AND ecosystem = " + eco_ph +
-              " AND source = " + src_ph;
-        if (versions_min > 0)
-            sql += " AND version_count >= " + bind(std::to_string(versions_min)) + "::bigint";
-        if (!term.empty())
-            sql += q_arms(bind(term), "name", "publisher", "ecosystems", "sources");
+              "newest_version FROM software_inventory_store.catalog_rollup " +
+              catalogue_predicate(q, false, versions_min, term, bind);
         if (q.after) {
             // Row-value compare on the page index's own expression: an index seek, not a
             // filtered scan from the top (the write below must match the index expression).
@@ -1120,29 +1153,16 @@ SoftwareInventoryStore::software_catalog(const SoftwareCatalogQuery& q) {
         sql += " ORDER BY (-device_count), name LIMIT " + bind(std::to_string(limit)) + "::bigint";
     } else {
         const std::string eco_list = distinct_list("i.ecosystem");
-        const std::string src_list = distinct_list("i.source");
         sql = "SELECT i.name, max(i.publisher), 1::bigint, count(DISTINCT i.version), " + eco_list +
               ", " + distinct_list("i.kind") +
               ", coalesce((SELECT c.newest_version FROM software_inventory_store.catalog_rollup c "
               "WHERE c.name = i.name AND c.grain = " +
               std::to_string(sc::kGrainTitle) +
-              "), '') FROM software_inventory_store.installed_software i WHERE i.agent_id = " +
-              bind(q.agent_id);
-        if (!q.kind.empty())
-            sql += " AND i.kind = " + bind(q.kind);
-        if (!q.ecosystem.empty())
-            sql += " AND i.ecosystem = " + bind(q.ecosystem);
-        if (!q.source.empty())
-            sql += " AND i.source = " + bind(q.source);
+              "), '') FROM software_inventory_store.installed_software i " +
+              catalogue_predicate(q, true, versions_min, term, bind);
         // One device => installs is 1 on every row, so the cursor's tiebreak is the name.
         if (q.after)
             sql += " AND i.name > " + bind(q.after->name);
-        sql += " GROUP BY i.name HAVING true";
-        if (versions_min > 0)
-            sql += " AND count(DISTINCT i.version) >= " + bind(std::to_string(versions_min)) +
-                   "::bigint";
-        if (!term.empty())
-            sql += q_arms(bind(term), "i.name", "max(i.publisher)", eco_list, src_list);
         sql += " ORDER BY i.name LIMIT " + bind(std::to_string(limit)) + "::bigint";
     }
 
@@ -1165,6 +1185,48 @@ SoftwareInventoryStore::software_catalog(const SoftwareCatalogQuery& q) {
     };
     static SiteSamplers samplers;
     return bounded_query(pool_, metrics_, "software_catalog", samplers, sql, params, parse);
+}
+
+std::optional<SoftwareCatalogTotals>
+SoftwareInventoryStore::software_catalog_totals(const SoftwareCatalogQuery& q) {
+    // Same predicate as software_catalog (limit/after ignored). Fleet: titles = matching rows,
+    // installs = SUM(device_count). Host: both are the host's matching distinct titles.
+    // nullopt on degrade (incl. the 5 s bound), never a zero.
+    if (!open_) {
+        static DegradeSampler sampler;
+        if (const auto d = note_read_degrade(metrics_, kReasonStoreNotOpen, sampler); d.should_log)
+            spdlog::warn("SoftwareInventoryStore: software_catalog_totals degraded — store not "
+                         "open (occurrence {})",
+                         d.occurrence);
+        return std::nullopt;
+    }
+    const int versions_min = q.versions_min < 0 ? 0 : q.versions_min;
+    const bool host = !q.agent_id.empty();
+    const std::string term = search_term(q.q);
+    std::vector<std::string> params;
+    int p = 0;
+    auto bind = [&](std::string v) {
+        params.push_back(std::move(v));
+        return "$" + std::to_string(++p);
+    };
+    const std::string pred = catalogue_predicate(q, host, versions_min, term, bind);
+    const std::string sql =
+        host ? "SELECT count(*), count(*) FROM (SELECT i.name FROM "
+               "software_inventory_store.installed_software i " +
+                   pred + ") t"
+             : "SELECT count(*), coalesce(sum(device_count), 0) FROM "
+               "software_inventory_store.catalog_rollup " +
+                   pred;
+    auto parse = [](const pg::PgResult& res) {
+        SoftwareCatalogTotals t;
+        if (PQntuples(res.get()) > 0) {
+            t.titles = result_i64(res, 0, 0);
+            t.installs = result_i64(res, 0, 1);
+        }
+        return t;
+    };
+    static SiteSamplers samplers;
+    return bounded_query(pool_, metrics_, "software_catalog_totals", samplers, sql, params, parse);
 }
 
 std::optional<std::vector<SoftwareVersionCount>>

@@ -172,7 +172,14 @@ VERBS = ("Get", "Post", "Put", "Delete", "Patch", "Options")
 # with a deliberate, reviewed "no MCP twin" reason). They are genuinely new
 # routes, never expected to flip to "twinned", so the count rises 203 -> 205
 # by design rather than regressing.
-BASELINE_UNTWINNED = 205
+#
+# M.9 PR-2 (software catalogue REST routes): get.fragments-inventory-software-versions
+# flips "planned:#2146" -> "twinned" (GET /api/v1/inventory/software/catalogue/versions;
+# REST only, no MCP twin yet) and the title-catalogue row get.fragments-inventory-software
+# is repointed at GET /api/v1/inventory/software/catalogue (already "twinned", count
+# unchanged). The catalogue route's format=csv titles export is REST-only by design.
+# Measured post-flip at 204 (205 - 1), not hand-picked.
+BASELINE_UNTWINNED = 204
 
 # ── OpenAPI-missing allowlist (seed for F2) ──────────────────────────────
 # Every /api/v1/* route registered today that has no OpenAPI `paths` entry.

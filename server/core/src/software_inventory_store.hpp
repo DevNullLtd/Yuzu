@@ -163,6 +163,14 @@ struct SoftwareCatalogQuery {
     std::optional<SoftwareCatalogCursor> after;
 };
 
+/// Totals for a catalogue query's filters, ignoring `limit`/`after`: matching titles and
+/// installs = SUM of the per-title exact distinct-device counts (a device carrying two
+/// matching titles counts twice; unfiltered fleet installs equal CatalogRollupMeta::total_installs).
+struct SoftwareCatalogTotals {
+    std::int64_t titles{0};
+    std::int64_t installs{0};
+};
+
 /// Installs-per-version drill for one title under the same filters as the catalogue.
 /// No kind/ecosystem/source/agent_id -> precomputed `version_rollup` (exact fleet counts);
 /// any of them -> `installed_software` for that one title (exact distinct devices under the
@@ -323,6 +331,11 @@ public:
     /// row 1) — the global gate alone is not sufficient for the host view.
     [[nodiscard]] std::optional<std::vector<SoftwareCatalogRow>>
     software_catalog(const SoftwareCatalogQuery& q);
+    /// Totals for the same filters as `software_catalog` (shared predicate; host `after` lives in
+    /// HAVING). Ignores `limit`/`after`. installs = sum of per-title exact distinct-device
+    /// counts. `std::nullopt` on degrade (incl. the 5 s bound), never a zero.
+    [[nodiscard]] std::optional<SoftwareCatalogTotals>
+    software_catalog_totals(const SoftwareCatalogQuery& q);
 
     /// Installs-per-version for ONE title under the filters of `SoftwareVersionsQuery`, most
     /// installed first, with the fleet-wide newest mark. The newest version is chosen by
