@@ -200,6 +200,8 @@ TEST_CASE("parse_acl_to_text: header flags, inherited, malformed", "[filesystem]
     CHECK_FALSE(parse_acl_to_text("user:UUID:u:501:allow:read\n").has_value());  // no header
     CHECK_FALSE(parse_acl_to_text("").has_value());
     CHECK_FALSE(parse_acl_to_text("!#acl 12\n").has_value());
+    // RECONSTRUCTION (not a verbatim capture): hand-written in the 5-field layout real acl_to_text()
+    // calls print for an empty-permission ACE on macOS 26 (no perms field, verdict last).
     // MUTATION: requiring six fields rejects an ACE with an empty permission set, which makes
     // the whole get_acl fail (acl_to_text prints no perms field for it).
     auto no_perms = parse_acl_to_text("!#acl 1\nuser:FFFFEEEE-DDDD-CCCC-BBBB-AAAA00000046:_www:70:deny\n"
