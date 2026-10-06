@@ -139,12 +139,20 @@ env_test_() ->
         fun env_valid_is_kept/0),
       t("a bad circuit_breaker_reset_timeout_ms warns naming the key and falls back to 10000",
         fun reset_timeout_invalid_falls_back/0),
-      t("a circuit_breaker_reset_timeout_ms inside 1..3600000 is kept and does not warn",
+      t("a circuit_breaker_reset_timeout_ms inside 100..3600000 is kept and does not warn",
         fun reset_timeout_valid_is_kept/0),
       t("a bad circuit_breaker_max_reset_timeout_ms warns naming the key and falls back to 300000",
         fun max_reset_timeout_invalid_falls_back/0),
-      t("a circuit_breaker_max_reset_timeout_ms inside 1..3600000 is kept and does not warn",
-        fun max_reset_timeout_valid_is_kept/0)
+      t("a circuit_breaker_max_reset_timeout_ms inside 100..3600000 is kept and does not warn",
+        fun max_reset_timeout_valid_is_kept/0),
+      t("a bad circuit_breaker_failure_threshold warns naming the key and falls back to 5",
+        fun threshold_invalid_falls_back/0),
+      t("a circuit_breaker_failure_threshold inside 1..1000 is kept and does not warn",
+        fun threshold_valid_is_kept/0),
+      t("a cap below the initial duration is raised to it with one warning naming both keys",
+        fun max_below_base_is_clamped_with_a_warning/0),
+      t("a cap at or above the initial duration is kept and does not warn",
+        fun max_at_or_above_base_is_kept/0)
      ]}.
 
 %% A registration replay that is active while the pending store is refilled.
@@ -1036,37 +1044,94 @@ env_case(Val, Kind) ->
 %% replay keys: 1..3600000, anything else warns naming the key and takes the
 %% default. cb_base_timeout is what init/1 settled on.
 reset_timeout_invalid_falls_back() ->
+    %% 1 and 99 are under the floor of 100: a 1 ms base would make the half_open
+    %% probe a ~1 kHz loop. The cap is set to the default so the fallback base
+    %% (10000) does not meet a smaller cap.
     [begin
-         Named = env_key_case(circuit_breaker_reset_timeout_ms, Bad),
+         Named = env_key_case(circuit_breaker_reset_timeout_ms, Bad,
+                              [{circuit_breaker_max_reset_timeout_ms, 300000}]),
          ?assertEqual(10000, up_get(cb_base_timeout)),
          ?assertEqual(10000, up_get(cb_cur_timeout)),
          ?assertMatch([_], Named)
-     end || Bad <- [0, -1, -10000, 3600001, "10000", 1.5, undefined_atom, <<"5">>]].
+     end || Bad <- [0, 1, 99, -1, -10000, 3600001, "10000", 1.5, undefined_atom, <<"5">>]].
 
 reset_timeout_valid_is_kept() ->
+    %% The cap is the largest value so none of these meets a smaller cap.
     [begin
-         Named = env_key_case(circuit_breaker_reset_timeout_ms, Good),
+         Named = env_key_case(circuit_breaker_reset_timeout_ms, Good,
+                              [{circuit_breaker_max_reset_timeout_ms, 3600000}]),
          ?assertEqual(Good, up_get(cb_base_timeout)),
          ?assertEqual([], Named)
-     end || Good <- [1, 100, 10000, 3600000]].
+     end || Good <- [100, 101, 10000, 3600000]].
 
 max_reset_timeout_invalid_falls_back() ->
+    %% A base of 100 keeps the default cap (300000) at or above it.
     [begin
-         Named = env_key_case(circuit_breaker_max_reset_timeout_ms, Bad),
+         Named = env_key_case(circuit_breaker_max_reset_timeout_ms, Bad,
+                              [{circuit_breaker_reset_timeout_ms, 100}]),
          ?assertEqual(300000, up_get(cb_max_timeout)),
          ?assertMatch([_], Named)
-     end || Bad <- [0, -1, 3600001, "300000", 2.5, undefined_atom]].
+     end || Bad <- [0, 1, 99, -1, 3600001, "300000", 2.5, undefined_atom]].
 
 max_reset_timeout_valid_is_kept() ->
     [begin
-         Named = env_key_case(circuit_breaker_max_reset_timeout_ms, Good),
+         Named = env_key_case(circuit_breaker_max_reset_timeout_ms, Good,
+                              [{circuit_breaker_reset_timeout_ms, 100}]),
          ?assertEqual(Good, up_get(cb_max_timeout)),
          ?assertEqual([], Named)
-     end || Good <- [1, 500, 3600000]].
+     end || Good <- [100, 500, 3600000]].
+
+%% A threshold of 0 trips the breaker on the first failure; 1001 is no threshold.
+threshold_invalid_falls_back() ->
+    [begin
+         Named = env_key_case(circuit_breaker_failure_threshold, Bad),
+         ?assertEqual(5, up_get(cb_threshold)),
+         ?assertMatch([_], Named)
+     end || Bad <- [0, -1, 1001, 100000, "5", 2.5, undefined_atom, <<"5">>]].
+
+threshold_valid_is_kept() ->
+    [begin
+         Named = env_key_case(circuit_breaker_failure_threshold, Good),
+         ?assertEqual(Good, up_get(cb_threshold)),
+         ?assertEqual([], Named)
+     end || Good <- [1, 3, 5, 1000]].
+
+%% trip_circuit takes the first open period from the base and caps only the next
+%% one, so a base above the cap opened for the base and then SHORTENED to the cap
+%% (600000 then 300000 with the default cap). The cap is raised to the base: one
+%% warning naming both keys, and the backoff never shortens.
+max_below_base_is_clamped_with_a_warning() ->
+    Warnings = env_key_case(circuit_breaker_reset_timeout_ms, 600000,
+                            [{circuit_breaker_max_reset_timeout_ms, 300000}]),
+    ?assertMatch([_], Warnings),
+    [Warning] = Warnings,
+    ?assertNotEqual(nomatch, binary:match(Warning, <<"circuit_breaker_max_reset_timeout_ms">>)),
+    ?assertNotEqual(nomatch, binary:match(Warning, <<"circuit_breaker_reset_timeout_ms">>)),
+    ?assertEqual(600000, up_get(cb_base_timeout)),
+    ?assertEqual(600000, up_get(cb_max_timeout)),
+    %% The first open period is the base and the next one is not shorter.
+    trip_breaker(),
+    ?assertEqual({open, 0, 3, 600000}, breaker()).
+
+max_at_or_above_base_is_kept() ->
+    [begin
+         Named = env_key_case(circuit_breaker_reset_timeout_ms, Base,
+                              [{circuit_breaker_max_reset_timeout_ms, Max}]),
+         ?assertEqual([], Named),
+         ?assertEqual(Base, up_get(cb_base_timeout)),
+         ?assertEqual(Max, up_get(cb_max_timeout))
+     end || {Base, Max} <- [{100, 100}, {100, 300000}, {10000, 10000}, {600000, 600000},
+                            {3600000, 3600000}]].
 
 %% Restart the upstream with Key = Val; returns the warnings that name the key.
 env_key_case(Key, Val) ->
+    env_key_case(Key, Val, []).
+
+%% The same with the Extra application env set first (the setup values are the
+%% fixture's own, far-off timers; a case that needs a particular pair sets it).
+env_key_case(Key, Val, Extra) ->
     stop_upstream(),
+    [application:set_env(yuzu_gw, K, V) || {K, V} <- Extra],
     application:set_env(yuzu_gw, Key, Val),
     Mark = last_key(),
     _ = start_upstream(),

@@ -125,11 +125,14 @@
 %%%   that arrives half_open is queued, and its first replay RPC is the probe.
 %%%
 %%% Configuration (sys.config / application env):
-%%%   circuit_breaker_failure_threshold   — consecutive failures to trip (default 5)
+%%%   circuit_breaker_failure_threshold   - consecutive failures to trip
+%%%                                          (default 5, valid 1..1000)
 %%%   circuit_breaker_reset_timeout_ms    - initial open duration
-%%%                                          (default 10000, valid 1..3600000)
+%%%                                          (default 10000, valid 100..3600000)
 %%%   circuit_breaker_max_reset_timeout_ms - max backoff cap
-%%%                                          (default 300000, valid 1..3600000)
+%%%                                          (default 300000, valid 100..3600000;
+%%%                                          raised to the initial duration when
+%%%                                          it is below it, with a warning)
 %%%   registration_replay_spacing_ms      - gap between replay RPCs
 %%%                                          (default 20, valid 0..60000)
 %%%   registration_replay_session_guard_ms - how long a replayed session is not
@@ -181,10 +184,16 @@
 -define(MIN_CALL_TIMEOUT_MS, 100).
 -define(MAX_CALL_TIMEOUT_MS, 300000).
 -define(DEFAULT_CB_THRESHOLD, 5).
+%% The valid range of circuit_breaker_failure_threshold: 0 would trip the breaker
+%% on the first failure, and a value past 1000 is not a threshold.
+-define(MIN_CB_THRESHOLD, 1).
+-define(MAX_CB_THRESHOLD, 1000).
 -define(DEFAULT_CB_RESET_MS, 10000).
 -define(DEFAULT_CB_MAX_RESET_MS, 300000).
-%% The valid range of both circuit_breaker_*reset_timeout_ms keys (1 ms to 1 h).
--define(MIN_CB_TIMEOUT_MS, 1).
+%% The valid range of both circuit_breaker_*reset_timeout_ms keys (100 ms to 1 h).
+%% The floor keeps the half_open probe from becoming a ~1 kHz loop (a 1 ms base
+%% or cap reopens and re-probes every millisecond).
+-define(MIN_CB_TIMEOUT_MS, 100).
 -define(MAX_CB_TIMEOUT_MS, 3600000).
 -define(DEFAULT_REPLAY_SPACING_MS, 20).
 -define(MAX_REPLAY_SPACING_MS, 60000).
@@ -380,15 +389,21 @@ init([]) ->
     end.
 
 init_state(ClusterId) ->
-    Threshold  = application:get_env(yuzu_gw, circuit_breaker_failure_threshold, ?DEFAULT_CB_THRESHOLD),
-    %% Both timeouts are validated: a reset timeout of 0 would make the half_open
-    %% probe a hot loop for ever (trip_circuit doubles 0). Anything outside the
-    %% range warns naming the key and takes the default.
+    %% The threshold and both timeouts are validated. A threshold of 0 would trip
+    %% the breaker on the first failure; a reset timeout under the floor would make
+    %% the half_open probe a near hot loop (trip_circuit doubles a tiny base).
+    %% Anything outside the range warns naming the key and takes the default.
+    Threshold   = yuzu_gw_env:env_int(circuit_breaker_failure_threshold, ?DEFAULT_CB_THRESHOLD,
+                                      ?MIN_CB_THRESHOLD, ?MAX_CB_THRESHOLD),
     BaseTimeout = yuzu_gw_env:env_int(circuit_breaker_reset_timeout_ms, ?DEFAULT_CB_RESET_MS,
                                       ?MIN_CB_TIMEOUT_MS, ?MAX_CB_TIMEOUT_MS),
-    MaxTimeout  = yuzu_gw_env:env_int(circuit_breaker_max_reset_timeout_ms,
+    MaxTimeout0 = yuzu_gw_env:env_int(circuit_breaker_max_reset_timeout_ms,
                                       ?DEFAULT_CB_MAX_RESET_MS,
                                       ?MIN_CB_TIMEOUT_MS, ?MAX_CB_TIMEOUT_MS),
+    %% The cap is never below the initial duration: trip_circuit takes the first
+    %% open period from the base but caps the NEXT one, so a base above the cap
+    %% would open for the base and then shorten (the default cap is 300000).
+    MaxTimeout  = clamp_max_timeout(BaseTimeout, MaxTimeout0),
     ReplaySpacing = yuzu_gw_env:env_int(registration_replay_spacing_ms,
                                     ?DEFAULT_REPLAY_SPACING_MS, 0, ?MAX_REPLAY_SPACING_MS),
     SessionGuard = yuzu_gw_env:env_int(registration_replay_session_guard_ms,
@@ -429,6 +444,17 @@ init_state(ClusterId) ->
         guardian_pids   = #{},
         cluster_id      = ClusterId
     }}.
+
+%% The effective cap: the configured one, or the initial duration when the cap is
+%% below it (named in a warning, so the configuration that did not take effect is
+%% visible).
+clamp_max_timeout(Base, Max) when Max >= Base ->
+    Max;
+clamp_max_timeout(Base, Max) ->
+    logger:warning("circuit_breaker_max_reset_timeout_ms (~b) is below "
+                   "circuit_breaker_reset_timeout_ms (~b); using ~b for both",
+                   [Max, Base, Base]),
+    Base.
 
 handle_call(circuit_state, _From, #state{cb_state = CbState} = State) ->
     {reply, CbState, State};
