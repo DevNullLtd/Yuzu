@@ -1391,6 +1391,13 @@ Cohort-floor suppression on fleet/group app-perf reads (no singling-out below th
 
 ### 32.7 Experience Scoring and Sentiment :x: `T3` *(verified 2026-09-07)*
 
+> **Amendment pending: ADR-3008 (application and hardware performance in DEX, proposed
+> 2026-10-06).** ADR-3008 changes the position stated below: a transparent composite score is
+> permitted alongside measured rates, while opaque and sentiment-based scoring stay out. The
+> Overview and Health score views already show scores, so the text below is out of date. Nothing
+> has changed in the product yet: this section is restated when the work that follows ADR-3008
+> lands.
+
 Not implemented — deliberately. Composite 0-100 experience scores (with sentiment surveys as an input) are a DEX-market pattern; Yuzu currently positions evidence-not-scores. Would additionally require the §14.4 survey primitive as an input (now shipped, but no scoring/sentiment engine consumes it).
 
 ---
