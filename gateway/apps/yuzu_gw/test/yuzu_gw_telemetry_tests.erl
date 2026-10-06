@@ -35,15 +35,32 @@ notify_dropped_test_() ->
      end,
      fun(_) -> catch telemetry:detach(yuzu_gw_prometheus) end,
      [
-      {"a drop with a reason outside the closed set still reaches its own label",
+      {"a drop with a reason outside the closed set counts as unknown and "
+       "creates no series of its own",
        fun() ->
            Before = counter_val(yuzu_gw_upstream_notify_dropped_total,
-                                 [<<"other_reason">>]),
+                                 [<<"unknown">>]),
            telemetry:execute([yuzu, gw, upstream, notify_dropped],
                              #{count => 1}, #{reason => <<"other_reason">>}),
            ?assertEqual(Before + 1,
                         counter_val(yuzu_gw_upstream_notify_dropped_total,
-                                    [<<"other_reason">>]))
+                                    [<<"unknown">>])),
+           ?assertEqual(undefined,
+                        prometheus_counter:value(yuzu_gw_upstream_notify_dropped_total,
+                                                 [<<"other_reason">>]))
+       end},
+      {"a missing or non-binary reason also counts as unknown without crashing "
+       "the handler",
+       fun() ->
+           Before = counter_val(yuzu_gw_upstream_notify_dropped_total,
+                                 [<<"unknown">>]),
+           telemetry:execute([yuzu, gw, upstream, notify_dropped],
+                             #{count => 2}, #{}),
+           telemetry:execute([yuzu, gw, upstream, notify_dropped],
+                             #{count => 3}, #{reason => {not_a, label}}),
+           ?assertEqual(Before + 5,
+                        counter_val(yuzu_gw_upstream_notify_dropped_total,
+                                    [<<"unknown">>]))
        end},
       {"at_capacity drop reaches the real Prometheus counter, labeled "
        "distinctly from any other reason",
@@ -403,6 +420,8 @@ notify_queue_families_test_() ->
         catch prometheus_counter:remove(yuzu_gw_upstream_notify_coalesced_total, []),
         catch prometheus_counter:remove(yuzu_gw_upstream_notify_dropped_total,
                                         [<<"at_capacity">>]),
+        catch prometheus_counter:remove(yuzu_gw_upstream_notify_dropped_total,
+                                        [<<"unknown">>]),
         ok = yuzu_gw_telemetry:setup(),
         S1 ++ S2
      end,
@@ -414,7 +433,9 @@ notify_queue_families_test_() ->
            ?assertEqual(0, prometheus_gauge:value(yuzu_gw_upstream_notify_inflight, [node()])),
            ?assertEqual(0, prometheus_counter:value(yuzu_gw_upstream_notify_coalesced_total, [])),
            ?assertEqual(0, prometheus_counter:value(yuzu_gw_upstream_notify_dropped_total,
-                                                    [<<"at_capacity">>]))
+                                                    [<<"at_capacity">>])),
+           ?assertEqual(0, prometheus_counter:value(yuzu_gw_upstream_notify_dropped_total,
+                                                    [<<"unknown">>]))
        end},
       {"a notify_queue event sets both gauges and a later zero event returns them to 0",
        fun() ->
@@ -446,6 +467,7 @@ notify_queue_families_test_() ->
                         <<"yuzu_gw_upstream_notify_pending{node=\"", Node/binary, "\"} ">>,
                         <<"yuzu_gw_upstream_notify_inflight{node=\"", Node/binary, "\"} ">>,
                         <<"yuzu_gw_upstream_notify_coalesced_total ">>,
-                        <<"yuzu_gw_upstream_notify_dropped_total{reason=\"at_capacity\"} ">>]]
+                        <<"yuzu_gw_upstream_notify_dropped_total{reason=\"at_capacity\"} ">>,
+                        <<"yuzu_gw_upstream_notify_dropped_total{reason=\"unknown\"} ">>]]
        end}
      ]}.
