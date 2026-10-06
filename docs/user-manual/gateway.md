@@ -2237,6 +2237,17 @@ env keys with defaults, which a reverted build ignores.
   exponential growth, because a success resets the backoff. Judge such a server by
   the `Upstream Register failed` and `Registration replay` lines, not by the
   breaker state alone.
+- **The server's upstream port does not pin the gateway's identity, and TLS 1.3
+  is not offered on the agent edge.** OBSERVED on a loopback rig with `openssl`
+  and gRPC client probes (not a packet capture): at the TLS layer the server's
+  upstream port admitted a client certificate that chains to the run's CA,
+  including the server's own certificate, so a certificate is checked for its
+  chain and not for being the gateway's (the management listener is the one that
+  pins a key; the gRPC layer of the upstream port was not probed). The agent edge
+  speaks one way TLS 1.2 only: a TLS 1.3 client was refused with a
+  protocol-version alert. Do not write or repeat an assurance statement that the
+  gateway identity is pinned on the upstream port, or that the agent edge
+  negotiates TLS 1.3; neither is true of the shipped build.
 - **A refused `Subscribe` reaches the client as status 2 (`process exited without
   reason`), not as `NOT_FOUND`, and logs an error report.** OBSERVED in rig pass 6
   (run K5) with an Erlang probe client, not with a real agent: for a `Subscribe`
