@@ -3120,6 +3120,83 @@ TEST_CASE("RbacStore: user_rbac_group_names and role_effects_for record "
               .value() == 4.0);
 }
 
+// The error text of the degraded-read producers is a shared constant because
+// authz::ceiling_degrade_reason keys the `yuzu_server_rbac_read_degrade_total{reason}` label on it:
+// a hand-typed variant at any one producer would be counted as query_error. Three producers are
+// pinned above (user_rbac_group_names, role_effects_for) and in test_authz_gates.cpp
+// (get_role_permissions_authz_checked, through role_permission_allowed_checked); the two cases
+// below pin the rest through the real accessors: every "store not open" producer here, and the
+// pool-acquire-timeout producers of the unbreakered reads.
+TEST_CASE("RbacStore: every checked read on a store that is not open reports the shared "
+          "not-open error text",
+          "[rbac_store][pg]") {
+    PgPool bad{{.conninfo = "host=127.0.0.1 port=1 dbname=nope user=nope connect_timeout=1",
+                .size = 1}};
+    RbacStore broken{bad};
+    REQUIRE_FALSE(broken.is_open());
+    RbacStoreTestAccess acc{broken};
+
+    const auto r1 = broken.get_role_permissions_checked("ITServiceOwner");
+    REQUIRE_FALSE(r1.has_value());
+    CHECK(std::string_view{r1.error()} == kRbacErrStoreNotOpen);
+    const auto r2 = broken.list_all_role_permissions_checked();
+    REQUIRE_FALSE(r2.has_value());
+    CHECK(std::string_view{r2.error()} == kRbacErrStoreNotOpen);
+    const auto r3 = broken.get_principal_roles_checked("user", "bob");
+    REQUIRE_FALSE(r3.has_value());
+    CHECK(std::string_view{r3.error()} == kRbacErrStoreNotOpen);
+    const auto r4 = broken.list_all_principal_roles_checked();
+    REQUIRE_FALSE(r4.has_value());
+    CHECK(std::string_view{r4.error()} == kRbacErrStoreNotOpen);
+    const auto r5 = broken.list_groups_checked();
+    REQUIRE_FALSE(r5.has_value());
+    CHECK(std::string_view{r5.error()} == kRbacErrStoreNotOpen);
+    // get_role_permissions_authz_checked, through its only public caller.
+    const auto r6 = broken.role_permission_allowed_checked("ITServiceOwner", "Response", "Read");
+    REQUIRE_FALSE(r6.has_value());
+    CHECK(std::string_view{r6.error()} == kRbacErrStoreNotOpen);
+    const auto r7 = acc.user_rbac_group_names("bob");
+    REQUIRE_FALSE(r7.has_value());
+    CHECK(std::string_view{r7.error()} == kRbacErrStoreNotOpen);
+    const auto r8 = acc.role_effects_for("Infrastructure", "Read");
+    REQUIRE_FALSE(r8.has_value());
+    CHECK(std::string_view{r8.error()} == kRbacErrStoreNotOpen);
+}
+
+TEST_CASE("RbacStore: the checked reads without a breaker report the shared "
+          "pool-acquire-timeout error text on a starved pool",
+          "[rbac_store][pg]") {
+    RBAC_STORE(replica_a);
+    (void)replica_a;
+
+    // A one-connection pool, held by the test, so every acquire finds it saturated; the
+    // saturated fast-fail is shortened so each read gives up after 50 ms, not 500 ms.
+    PgPool pool_b{{.conninfo = rbac_db_fx_.dsn(),
+                   .size = 1,
+                   .saturated_fast_fail = std::chrono::milliseconds{50}}};
+    REQUIRE(pool_b.valid());
+    RbacStore replica_b{pool_b};
+    REQUIRE(replica_b.is_open());
+    auto held = pool_b.acquire();
+    REQUIRE(held);
+
+    const auto r1 = replica_b.get_role_permissions_checked("ITServiceOwner");
+    REQUIRE_FALSE(r1.has_value());
+    CHECK(std::string_view{r1.error()} == kRbacErrPoolAcquireTimeout);
+    const auto r2 = replica_b.list_all_role_permissions_checked();
+    REQUIRE_FALSE(r2.has_value());
+    CHECK(std::string_view{r2.error()} == kRbacErrPoolAcquireTimeout);
+    const auto r3 = replica_b.get_principal_roles_checked("user", "bob");
+    REQUIRE_FALSE(r3.has_value());
+    CHECK(std::string_view{r3.error()} == kRbacErrPoolAcquireTimeout);
+    const auto r4 = replica_b.list_all_principal_roles_checked();
+    REQUIRE_FALSE(r4.has_value());
+    CHECK(std::string_view{r4.error()} == kRbacErrPoolAcquireTimeout);
+    const auto r5 = replica_b.list_groups_checked();
+    REQUIRE_FALSE(r5.has_value());
+    CHECK(std::string_view{r5.error()} == kRbacErrPoolAcquireTimeout);
+}
+
 // #2703 Gate 7 item Commit C (quality-engineer + consistency-auditor, Gate 3:
 // zero test coverage for the generation_refresh_failed /
 // generation_refresh_failed_within_bound reason split — the exact
