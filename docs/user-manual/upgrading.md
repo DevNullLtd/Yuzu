@@ -288,7 +288,10 @@ it)", no `permission` field, audit `auth.fleet_read_required` / `denied`) unless
 the pair, whatever its minter holds. `ITServiceOwner` does not hold `Enrollment:Read`, so a
 service-scoped token that used to receive a pending-agent view narrowed to its tagged agents now gets
 the `403`. **Remediation:** `Enrollment:Read` is intentionally NOT granted to `ITServiceOwner`; use an
-Administrator-minted non-service token for that route.
+Administrator-minted non-service token for that route. The cost is that this replaces a confined
+credential with an Administrator-grade one, and there is no narrower option today: `Enrollment:Read` is
+Administrator-only by default and custom-role authoring is not reachable through REST, MCP or the
+dashboard yet.
 
 **Breaking for service-scoped tokens, 2: `GET /api/v1/upload-grants` now answers `403`.** The route's
 only gate evaluated the minter's username, so a service-scoped token inherited its minter's
@@ -300,10 +303,11 @@ token. **Remediation:** list grants with a non-service token. Non-service sessio
 **The ceiling applies wherever a seeded `ITServiceOwner` permission is absent.** With the seeded
 defaults `ITServiceOwner` holds every other pair the fleet-read routes pass, so nothing else changes
 for `Execution`, `Response`, `Inventory`, `Infrastructure`, `Policy`, `GuaranteedState` and
-`Workflow:Read`. No REST, MCP or CLI surface removes a seeded `ITServiceOwner` permission today, so a
-refusal on one of those pairs does not arise in a default deployment unless the `rbac_store` rows are
-edited directly in the database; the rule is the safeguard for that case and for any future surface
-that narrows the role.
+`Workflow:Read`. No REST, MCP or CLI surface removes a seeded `ITServiceOwner` permission today, and a
+direct database `DELETE` of the row is re-seeded at the next boot unless the pair is recorded in
+`revoked_seed_defaults`, so a refusal on one of those pairs does not arise in a default deployment; the
+rule is the safeguard for a pair removed through `RbacStore::remove_permission` (which records it) and for
+any future surface that narrows the role.
 
 **Failure behaviour.** A FAILED permission read is different on the fleet-read gate: it answers a
 retryable `503` (`retry_after_ms` 5000, audit `auth.fleet_read_required` / `denied` with detail "RBAC

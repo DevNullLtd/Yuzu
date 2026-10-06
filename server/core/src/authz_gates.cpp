@@ -202,9 +202,10 @@ AuthRoutes::require_fleet_read(const httplib::Request& req, httplib::Response& r
     // ITServiceOwner AUTHORITY CEILING (the same `authz::service_ceiling_check` that
     // require_permission and require_scoped_permission call): a service-scoped token can never
     // exceed what that role grants, regardless of what its minter holds. Without it this gate
-    // admitted a service token on the minter's grant plus the tag meet alone, so an operator
-    // who revoked the pair from ITServiceOwner (the `revoked_seed_defaults` mechanism) still
-    // saw service tokens served on every fleet-read route.
+    // admitted a service token on the minter's grant plus the tag meet alone, so a pair absent
+    // from ITServiceOwner (never seeded, or removed through RbacStore::remove_permission, which
+    // records it in `revoked_seed_defaults` so the next boot does not re-seed it) still saw
+    // service tokens served on every fleet-read route.
     // DIVERGENCE from those two gates: a definitive deny (explicit deny row or an absent or
     // revoked pair) is a 403 like theirs, but a FAILED ceiling read is a retryable 503 here
     // (bumping yuzu_server_rbac_read_degrade_total), because an outage is not a missing grant

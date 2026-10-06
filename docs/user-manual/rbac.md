@@ -193,13 +193,18 @@ Recommended order for a fresh install:
 >
 > 1. **Breaking:** `ITServiceOwner` does not hold `Enrollment:Read`, so a service-scoped token is refused with
 >    `403` on `GET /api/v1/enrollment/pending-agents` (it used to receive a view narrowed to its tagged agents).
->    Use an Administrator-minted non-service token for that route.
+>    Use an Administrator-minted non-service token for that route. This replaces a confined credential with an
+>    Administrator-grade one, and there is no narrower option today: `Enrollment:Read` is Administrator-only by
+>    default and custom-role authoring is not reachable through REST, MCP or the dashboard yet (see "Custom Roles"
+>    below).
 > 2. **Breaking:** `GET /api/v1/upload-grants` refuses a service-scoped token with `403` (no `permission`
 >    field); it used to return the minter's `UploadGrant:Read` view. Same remedy: list with a non-service token.
 > 3. The ceiling applies wherever a seeded `ITServiceOwner` permission is absent. No REST, MCP or CLI surface
 >    removes a seeded `ITServiceOwner` permission today (narrowing a seeded role's permission set is planned,
->    see "Custom Roles" below), so a refusal on one of those pairs arises only if the `rbac_store` rows are
->    edited directly in the database; the rule is the safeguard for that case and for a future authoring surface.
+>    see "Custom Roles" below). A direct database `DELETE` of the row is re-seeded at the next boot unless the
+>    pair is recorded in `revoked_seed_defaults`, so a refusal on one of those pairs arises only for a pair
+>    removed through `RbacStore::remove_permission` (which records it) or recorded there by hand; the rule is
+>    the safeguard for that case and for a future authoring surface.
 >
 > A definitive deny is `403`; a FAILED permission read on the fleet-read gate is a
 > retryable `503` (`retry_after_ms` 5000), while `require_permission` and
