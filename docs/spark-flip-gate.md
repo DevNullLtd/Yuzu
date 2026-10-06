@@ -1010,7 +1010,7 @@ flip, with a red-first test each:
     unlabelled fleet SUM; nothing consumes these gauges today. An EMPTY tag value is
     skipped before parsing and is not counted in `yuzu_fleet_guardian_health_tag_rejected`; accepted
     (the agent never emits an empty value).
-- **Follow-ups (to be filed; no issue numbers yet).** (1) FU-1: measure the held-hold
+- **Follow-ups (filed after #5497 merged: FU-1 is #5504; FU-2 to FU-5 are #5505; FU-6 and FU-7 are #5506; FU-8 and FU-9 are #5507).** (1) FU-1: measure the held-hold
   push rate and the endpoint journal eviction during a held period (a flip
   precondition, see AC-1). (2) FU-2: hang a full class quota of compensations, then
   re-push, and confirm releasing one slot restores admission in one pass. (3) FU-3: a

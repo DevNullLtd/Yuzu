@@ -2,6 +2,7 @@
 
 Routed doc for the **unit-test conventions** concern in `.claude/routed-concerns.md`.
 Loaded by `quality-engineer` on any change under `tests/unit/`.
+The "Shell and source-text gates" section also covers `test()` registrations in `tests/meson.build`, the `tests/test_*.py` source-text gates and `tests/shell/`.
 
 Companion: `docs/testing/integration-tests.md` covers the shell/E2E stack-bring-up layer.
 The authoritative statement of each helper's contract is its own doc comment at the source;
@@ -56,3 +57,10 @@ For server tests needing live **PostgreSQL**, use `PostgresTestDb` + `YUZU_REQUI
 ## Prometheus alert rules — parse vs behaviour
 
 **Prometheus alert rules are PARSE-checked by `promtool` for all rules, BEHAVIOUR-checked only for the alerts that have cases** in `tests/prometheus/yuzu-alerts.test.yml` (today: the `YuzuAuditRetention*` liveness pair). Nothing enforces that a rule change ships a case, so a green check on an edit to any other rule proves parseability only — and `prometheus-rules` is **not a required status check**, so a red one merges until branch protection says otherwise. The run does refuse to report success vacuously: no rules, no cases, no assertions, a stale `rule_files:` glob, or a behaviour suite that stays green against a deliberately broken copy of the rules file all fail it — `check rules` and `test rules` are handed DIFFERENT paths and otherwise disagree silently while printing a rule count (#2553). The opt-in `YUZU_TEST_ENABLE_PROMTOOL_DOCKER` (**presence-checked, so `=0` also enables it** — matching `YUZU_TEST_ENABLE_PG`) exists because `scripts/ci/flake-retry.py` runs `meson test` with **no `--suite` filter** on three REQUIRED legs, so any docker-dependent `docs`-suite test would put a container registry on all three — that shape was shipped once and reverted (#2553). **A new test here that pulls an image must be opt-in gated the same way.** Everything else — the skip-vs-fail contract, the check name, alert-authoring conventions — is in `tests/prometheus/run_promtool_tests.py`'s docstring and `docs/observability-conventions.md`.
+
+## Shell and source-text gates registered in tests/meson.build
+
+- **A gate that only reads source text is written in Python** (one process, `_python3_test`, `timeout: 30`), never bash. Every `grep`/`sed`/`perl` is a fork costing about 2 ms on Linux and 30-200 ms under MSYS2 on the shared Windows runner; the agent OTA gate's ~500-750 forks timed out at 90 s there (#5428). Model new gates on `tests/test_agent_ota_wiring_lexical.py` (a pure `problems()` function over the source text plus a clean-source test and in-memory mutations, each asserting its pattern still matches).
+- **A bash test that must stay bash** (it sources or re-execs the script under test) is registered only on the hosts whose script it exercises when the script is host-specific, e.g. `host_machine.system() != 'windows'` for `start-UAT.sh` and the README touch-rule selftest; a cross-platform script's selftest stays on every leg while it meets the budget rule below.
+- **Budget rule:** an entry sits under 50% of its timeout (headroom for the 3-6x I/O amplification the shared runners show under load) on the slowest leg it is registered on. Past that it is ported, split or host-gated, never given more time (the one recorded exception, the #3582 shard bump, is documented as deliberate and temporary in `docs/ci-architecture.md`).
+- `scripts/ci/flake-retry.py`'s 80%-of-timeout watchdog is a warning, not a retry; non-Catch2 entries are never retried.
