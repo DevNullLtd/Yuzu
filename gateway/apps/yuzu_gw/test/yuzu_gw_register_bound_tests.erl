@@ -358,10 +358,13 @@ request_bound_is_exact() ->
     ?assertEqual(2, wire_count()).
 
 %% The server's constant lives in a C++ header; this reads it from the source
-%% tree, found by walking up from this file, and skips (it does not fail) when
-%% the header or the symbol is not there, as in a build from a gateway-only
-%% checkout. The test is behavioural, so a drift in either direction shows: an id
-%% of the server's size is accepted and one byte more is refused.
+%% tree, found by walking up from this file to the directory that holds both
+%% `gateway/' and `server/'. It skips (with a message) ONLY when no such directory
+%% exists, as in a build from a gateway-only checkout. When the server tree is
+%% there but the header is unreadable or the symbol is missing, the test FAILS:
+%% a rename of kMaxAgentIdLength must not turn the drift check into a silent
+%% skip. The test is behavioural, so a drift in either direction shows: an id of
+%% the server's size is accepted and one byte more is refused.
 agent_id_bound_matches_the_server() ->
     case server_max_agent_id_length() of
         {ok, ServerValue} ->
@@ -373,34 +376,96 @@ agent_id_bound_matches_the_server() ->
                          yuzu_gw_agent_service:register(
                            ctx(), register_req(binary:copy(<<"s">>, ServerValue + 1))));
         skip ->
-            ?debugMsg("kMaxAgentIdLength not found in the source tree: drift check skipped"),
-            ok
+            ?debugMsg("no server/ tree above the gateway checkout: drift check skipped"),
+            ok;
+        {error, Why} ->
+            erlang:error({server_tree_found_but_drift_check_cannot_read_it, Why})
     end.
 
 -define(SERVER_AUTH_HEADER, "server/core/include/yuzu/server/auth.hpp").
 
 server_max_agent_id_length() ->
     Source = proplists:get_value(source, ?MODULE:module_info(compile), ?FILE),
-    case find_up(filename:dirname(filename:absname(Source)), ?SERVER_AUTH_HEADER) of
-        {ok, Path} ->
-            {ok, Text} = file:read_file(Path),
-            case re:run(Text, "kMaxAgentIdLength\\s*=\\s*([0-9]+)", [{capture, [1], binary}]) of
-                {match, [Digits]} -> {ok, binary_to_integer(Digits)};
-                nomatch           -> skip
-            end;
+    server_max_agent_id_length(filename:dirname(filename:absname(Source))).
+
+%% {ok, Value} | skip (no repository root above Dir) | {error, Why} (the root is
+%% there, the header or the symbol is not).
+server_max_agent_id_length(StartDir) ->
+    case find_repo_root(StartDir) of
         error ->
-            skip
+            skip;
+        {ok, Root} ->
+            Header = filename:join(Root, ?SERVER_AUTH_HEADER),
+            case file:read_file(Header) of
+                {ok, Text} ->
+                    case re:run(Text, "kMaxAgentIdLength\\s*=\\s*([0-9]+)",
+                                [{capture, [1], binary}]) of
+                        {match, [Digits]} -> {ok, binary_to_integer(Digits)};
+                        nomatch           -> {error, {symbol_not_found, Header}}
+                    end;
+                {error, Reason} ->
+                    {error, {header_unreadable, Header, Reason}}
+            end
     end.
 
-find_up(Dir, Rel) ->
-    Candidate = filename:join(Dir, Rel),
-    case filelib:is_regular(Candidate) of
-        true  -> {ok, Candidate};
+%% The nearest directory above (or at) Dir that has both a gateway/ and a server/
+%% directory: the repository root.
+find_repo_root(Dir) ->
+    case filelib:is_dir(filename:join(Dir, "gateway"))
+         andalso filelib:is_dir(filename:join(Dir, "server")) of
+        true  -> {ok, Dir};
         false -> case filename:dirname(Dir) of
                      Dir    -> error;
-                     Parent -> find_up(Parent, Rel)
+                     Parent -> find_repo_root(Parent)
                  end
     end.
+
+%% The three states of the drift check, on throwaway trees (no source tree needed):
+%% a header with the symbol is read, a server tree whose header lacks the symbol
+%% or is missing is an error (the test above then fails), and a tree with no
+%% server/ directory is the only skip.
+drift_check_states_test_() ->
+    {foreach,
+     fun() ->
+         Root = filename:join(os:getenv("TMPDIR", "/tmp"),
+                              "yuzu_test_drift_" ++ os:getpid() ++ "_"
+                              ++ integer_to_list(erlang:unique_integer([positive]))),
+         Deep = filename:join([Root, "gateway", "apps", "yuzu_gw", "test"]),
+         ok = filelib:ensure_dir(filename:join(Deep, "x")),
+         {Root, Deep}
+     end,
+     fun({Root, _Deep}) -> ok = file:del_dir_r(Root) end,
+     [fun({Root, Deep}) ->
+          {"header present: the value is read",
+           fun() ->
+               write_auth_header(Root, "constexpr std::size_t kMaxAgentIdLength = 256;"),
+               ?assertEqual({ok, 256}, server_max_agent_id_length(Deep))
+           end}
+      end,
+      fun({Root, Deep}) ->
+          {"server tree present, symbol renamed: an error, not a skip",
+           fun() ->
+               write_auth_header(Root, "constexpr std::size_t kMaxAgentIdBytes = 256;"),
+               ?assertMatch({error, {symbol_not_found, _}}, server_max_agent_id_length(Deep))
+           end}
+      end,
+      fun({Root, Deep}) ->
+          {"server tree present, header missing: an error, not a skip",
+           fun() ->
+               ok = filelib:ensure_dir(filename:join([Root, "server", "x"])),
+               ?assertMatch({error, {header_unreadable, _, enoent}},
+                            server_max_agent_id_length(Deep))
+           end}
+      end,
+      fun({_Root, Deep}) ->
+          {"no server tree above the gateway checkout: skip",
+           fun() -> ?assertEqual(skip, server_max_agent_id_length(Deep)) end}
+      end]}.
+
+write_auth_header(Root, Line) ->
+    Path = filename:join(Root, ?SERVER_AUTH_HEADER),
+    ok = filelib:ensure_dir(Path),
+    ok = file:write_file(Path, [Line, "\n"]).
 
 %%%===================================================================
 %%% Status classification
