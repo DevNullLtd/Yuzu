@@ -32,6 +32,7 @@
 %%%-------------------------------------------------------------------
 -module(yuzu_gw_notify_pending_tests).
 -include_lib("eunit/include/eunit.hrl").
+-include_lib("grpcbox/include/grpcbox.hrl").
 
 -export([handle_event/4, log/2]).  %% telemetry handler and logger handler callbacks
 
@@ -54,6 +55,8 @@
                    circuit_breaker_max_reset_timeout_ms]).
 
 -define(INFLIGHT_MAX, 10).
+%% A peer address that is not UTF-8: the protobuf string encoder raises on it.
+-define(POISON_PEER, <<255, 254, 200>>).
 %% A worker parked in the mock gives up after this long, so a test that dies
 %% cannot leave a parked process behind. Teardown releases them long before.
 -define(PARK_MS, 20000).
@@ -176,7 +179,11 @@ probe_test_() ->
       t("the probe counts inside the ten worker budget and shows in the inflight gauge",
         fun probe_counts_inside_the_budget/0),
       t("format_status shows notify_probe_held and never the probe event",
-        fun format_status_hides_the_probe_event/0)
+        fun format_status_hides_the_probe_event/0),
+      t("a held notification whose peer address cannot be encoded does not block the breaker",
+        fun poison_head_does_not_block_the_breaker/0),
+      t("held notifications that all carry an unencodable peer address still drain",
+        fun all_poison_heads_still_drain/0)
      ]}.
 
 %% Cap 3: a failed probe's event always fits back.
@@ -321,9 +328,14 @@ settled(Log) ->
 %% ProxyMode is what every RPC other than NotifyStreamStatus answers: `ok' or
 %% `fail' (a transport error, which feeds the breaker).
 mock(ProxyMode) ->
-    meck:expect(grpcbox_client, unary, fun(_Ctx, Path, Req, _Def, _Opts) ->
+    meck:expect(grpcbox_client, unary, fun(_Ctx, Path, Req, Def, _Opts) ->
         case lists:last(binary:split(Path, <<"/">>, [global])) of
             <<"NotifyStreamStatus">> ->
+                %% The real encoder runs here, in the calling worker, as it does
+                %% inside grpcbox_client:unary/5 (send_msg calls the marshal fun
+                %% in the caller), so an unencodable field raises out of this
+                %% mock exactly as it does out of the real client.
+                marshal_like_grpcbox(Def, Req),
                 notify_rpc(Req);
             _Other when ProxyMode =:= ok ->
                 notify({proxied, Path}),
@@ -332,6 +344,16 @@ mock(ProxyMode) ->
                 {error, connection_refused}
         end
     end).
+
+%% Runs the request through the marshal fun yuzu_gw_upstream handed the client.
+%% On a raise the test hears {marshal_failed, AgentId} first, then the original
+%% exception continues to the caller (do_rpc turns it into an error result).
+marshal_like_grpcbox(#grpcbox_def{marshal_fun = Marshal}, Req) ->
+    try Marshal(Req)
+    catch Class:Why:Stack ->
+        notify({marshal_failed, maps:get(agent_id, Req)}),
+        erlang:raise(Class, Why, Stack)
+    end.
 
 %% Runs in the worker the upstream spawned. Counts itself in, tells the test it
 %% entered, then parks until released (or until the gates are open). `release'
@@ -1150,6 +1172,76 @@ format_status_hides_the_probe_event() ->
     ?assertEqual(nomatch, string:find(Text, "marker-peer")),
     ?assertEqual(nomatch, string:find(Text, "marker-session")),
     ?assertEqual(nomatch, string:find(Text, "marker-home")).
+
+%% A held notification whose payload cannot be encoded (an agent supplied peer
+%% address that is not UTF-8) sits at the head of the store. The head is the
+%% half_open probe, so if it fails the same way every time the breaker reopens
+%% with a doubled backoff and the same head is probed again, for ever, while the
+%% server is healthy and the five good notifications behind it are never sent.
+%% The server answers fine here (mock(ok)); only the encoding of the head fails.
+poison_head_does_not_block_the_breaker() ->
+    watch(),
+    trip_breaker(),
+    notify_status(<<"poison">>, <<"sess">>, disconnected, ?POISON_PEER, <<"home">>),
+    Good = [agent(I) || I <- lists:seq(1, 5)],
+    [cast_connected(Id) || Id <- Good],
+    sync(),
+    ?assertEqual({6, 0}, last_gauge()),
+    mock(ok),
+    {W, Head} = probe_until_encodable(3),
+    ?assertEqual(<<"poison">>, maps:get(agent_id, Head)),
+    ?assertEqual(<<"invalid">>, maps:get(peer_addr, Head)),
+    W ! release,
+    await_until(fun() -> up_get(cb_state) =:= closed end),
+    await_until(fun() -> length(entered_reqs()) =:= 6 end),
+    ?assertEqual(lists:sort(Good),
+                 lists:sort([maps:get(agent_id, R) || R <- entered_reqs(),
+                                                      maps:get(agent_id, R) =/= <<"poison">>])),
+    open_and_release_all(),
+    await_until(fun() -> last_gauge() =:= {0, 0} end).
+
+%% The same with no good notification at all: every held key is poison.
+all_poison_heads_still_drain() ->
+    watch(),
+    trip_breaker(),
+    Ids = [<<"poison-", (integer_to_binary(I))/binary>> || I <- lists:seq(1, 3)],
+    [notify_status(Id, <<"sess">>, disconnected, ?POISON_PEER, <<"home">>) || Id <- Ids],
+    sync(),
+    ?assertEqual({3, 0}, last_gauge()),
+    mock(ok),
+    {W, _Head} = probe_until_encodable(3),
+    W ! release,
+    await_until(fun() -> up_get(cb_state) =:= closed end),
+    await_until(fun() -> length(entered_reqs()) =:= 3 end),
+    open_and_release_all(),
+    await_until(fun() -> last_gauge() =:= {0, 0} end).
+
+%% Up to N half_open cycles: each sends the head as the probe and waits for what
+%% the mock saw. An encodable head enters the mock and is returned (parked). A
+%% head that fails to encode reopens the breaker; wait for that to be settled so
+%% the next half_open is a new cycle. Fails loud, with the breaker fields (state,
+%% generation, failures, current backoff), when no cycle ever probes an
+%% encodable head.
+probe_until_encodable(0) ->
+    erlang:error({breaker_never_probed_an_encodable_head, breaker()});
+probe_until_encodable(N) ->
+    enter_half_open(),
+    case await_attempt() of
+        {entered, W, Req} ->
+            {W, Req};
+        {marshal_failed, _AgentId} ->
+            await_until(fun() -> up_get(notify_probe) =:= undefined end),
+            probe_until_encodable(N - 1)
+    end.
+
+%% What the next NotifyStreamStatus worker did: entered the mock, or failed to
+%% encode its request.
+await_attempt() ->
+    receive
+        {entered, W, Req}      -> {entered, W, Req};
+        {marshal_failed, Id}   -> {marshal_failed, Id}
+    after ?AWAIT_MS -> erlang:error(no_notify_attempt_reached_the_mock)
+    end.
 
 %%%===================================================================
 %%% Helpers: driving the upstream
