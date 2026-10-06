@@ -5612,7 +5612,7 @@ Audited (`enrollment.auto_approve.view`, non-blocking) — the rule set is auto-
 
 #### `GET /api/v1/enrollment/pending-agents`
 
-**Permission:** `Enrollment:Read` (Administrator only in the default seed)
+**Permission:** `Enrollment:Read` (Administrator only in the default seed). A service-scoped API token is refused `403` (`service-scoped token does not grant Enrollment:Read (the ITServiceOwner role does not hold it)`, no `permission` field), whoever minted it, because the `ITServiceOwner` role does not hold `Enrollment:Read`; use an Administrator-minted non-service token. If the read of the `ITServiceOwner` role itself fails, the route answers a retryable `503` (`retry_after_ms` 5000) instead.
 
 Do not conflate with the unrelated existing MCP tool `list_pending_approvals`, which serves `ApprovalManager`'s maker-checker action-approval queue — a different domain entirely. Audited (`enrollment.pending_agents.view`, non-blocking) — device-identity fingerprint data, a lighter version of the `device_ci` GDPR-personal-data-adjacent class the agent daily-sync framework already flags for serial/UUID/MAC.
 
@@ -8192,7 +8192,9 @@ SHA-256 digest.
 
 List upload grants. **Permission:** `UploadGrant:Read`, routed through
 `RbacStore::authorize_list_read` (admit-then-filter — never a bare global
-permission check).
+permission check). A service-scoped API token is refused `403` before any grant is
+read (`service-scoped tokens may not list upload grants`, no `permission` field, audit
+`upload_grant.list.access_denied`), whoever minted it; list with a non-service token.
 
 #### `DELETE /api/v1/upload-grants/{grant_id}`
 

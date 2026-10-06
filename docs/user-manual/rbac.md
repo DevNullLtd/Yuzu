@@ -186,15 +186,29 @@ Recommended order for a fresh install:
 > show zero rows after an upgrade or restart, check for `RbacStore` open/migrate
 > errors first.)
 >
-> **Service-scoped tokens and `ITServiceOwner` (the fleet-read authority ceiling, #3526).** Every fleet-read route
-> now applies the `ITServiceOwner` authority ceiling on a service token, so revoking a `Read` pair from
-> `ITServiceOwner` (for example `Execution:Read`) refuses service-scoped tokens on every fleet-read route for
-> that pair, whatever their minter holds; non-service callers are unaffected. A
-> definitive deny is `403`; a FAILED permission read on the fleet-read gate is a
+> **Service-scoped tokens and `ITServiceOwner` (the fleet-read authority ceiling; found while working #3526).**
+> Every fleet-read route applies the `ITServiceOwner` authority ceiling to a service-scoped token, the check
+> `require_permission` already made: the token is refused unless that role itself holds the pair, whatever its
+> minter holds. Non-service callers are unaffected. Effects today:
+>
+> 1. **Breaking:** `ITServiceOwner` does not hold `Enrollment:Read`, so a service-scoped token is refused with
+>    `403` on `GET /api/v1/enrollment/pending-agents` (it used to receive a view narrowed to its tagged agents).
+>    Use an Administrator-minted non-service token for that route.
+> 2. **Breaking:** `GET /api/v1/upload-grants` refuses a service-scoped token with `403` (no `permission`
+>    field); it used to return the minter's `UploadGrant:Read` view. Same remedy: list with a non-service token.
+> 3. The ceiling applies wherever a seeded `ITServiceOwner` permission is absent. No REST, MCP or CLI surface
+>    removes one today (narrowing a seeded role's permission set is planned, see "Custom Roles" below), so
+>    this is a safeguard for a future authoring surface, not something an operator can trigger now.
+>
+> A definitive deny is `403`; a FAILED permission read on the fleet-read gate is a
 > retryable `503` (`retry_after_ms` 5000), while `require_permission` and
-> `require_scoped_permission` keep answering `403` for the same failure. `ITServiceOwner`
-> does not hold `Enrollment:Read`, so a service-scoped token is refused with `403` on
-> `GET /api/v1/enrollment/pending-agents`.
+> `require_scoped_permission` keep answering `403` for the same failure. The ceiling read goes through the
+> RBAC authz circuit breaker with a 250 ms acquire budget, so a degraded store answers quickly (an open
+> breaker is counted under `pool_acquire_timeout`); a read that is already admitted and holds a connection can
+> still wait up to the pool's `lock_timeout` (10 s default) or `statement_timeout` (30 s default). One
+> deferred item remains: the `authorize_list_read` supersede-to-intersect migration for the remaining callers
+> is tracked in `docs/security-reviews/service-scope-phase2-migrations-2026-08.md`, so "every fleet-read
+> route" above does not mean every route that lists per-agent data.
 >
 > **Note (#1634):** the per-agent filter on `query_responses`/`aggregate_responses`/the
 > REST visualization+responses endpoints is, under *normal* RBAC operation, currently

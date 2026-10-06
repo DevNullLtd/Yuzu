@@ -194,6 +194,11 @@ not the numbers:
    upload-grants resolver at `server.cpp:17722`/`:18307`). Separate stream — the
    plugin-config pair has no agent dimension, so it needs a `kServiceScopeGlobalSafe`-style
    policy decision rather than a `meet()`, unlike upload-grants' clean intersection.
+   The upload-grants REST route no longer reaches that resolver for a service-scoped token:
+   `file_retrieval_routes.cpp`'s `register_list` refuses such a session with `403` before the
+   resolver runs (the MCP twin already refused it through `perm_fn`), so the service-token reach
+   on that pair is closed. The supersede→intersect migration itself, for the callers that remain,
+   is still deferred.
 5. **Bucket 3 — routes with no primary RBAC gate at all** (the `deny_service_scoped_session`
    family, the `/api/v1/result-sets` family, `/api/scope/estimate`, compliance fragments).
    **Explicitly out of scope for a `require_fleet_read` migration** — these need a gate added

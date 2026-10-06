@@ -273,40 +273,57 @@ Only case (e) means the key files are gone. Nothing inside the server can rebuil
   3. This database cannot be brought back by any supported means. Every start checks each registered KEK and refuses. The one-shot modes `--mfa-reset` and `--break-glass-arm` run after that check, so they stop with the same `kek_unresolvable` error. What is gone: the CA private key, so every agent certificate it issued no longer chains and every agent must enroll again; and every secret sealed under the KEK, including TOTP enrolments, webhook signing secrets and the other secret columns listed in `docs/user-manual/server-admin.md` "Key management (secrets KEK)". Passwords and API tokens are hashed, not sealed, but they live in the same database.
   4. Start a new install. With the bundled Postgres, `docker compose down -v` deletes the Postgres volume along with the others. `down -v` does not reset an external Postgres: that database still registers the lost KEK, so a new install against it fails the same way. Give the new install a new, empty database. Then provision the admin account again, re-enroll your agents, and re-create your configuration.
 
-## Behaviour change: service-scoped tokens and the `ITServiceOwner` ceiling on the fleet-read gate (#3526)
+## Behaviour change: service-scoped tokens, the `ITServiceOwner` ceiling on the fleet-read gate, and `GET /api/v1/upload-grants`
 
-The management-group-aware fleet-read gate (`require_fleet_read`, ADR-0017) did not apply the
-`ITServiceOwner` authority ceiling that `require_permission` applies to a service-scoped API token.
-It now does. This is a chokepoint fix, and it is a tightening for service-scoped tokens only;
+Two chokepoints let a service-scoped API token reach more than the `ITServiceOwner` role allows (found
+while working #3526). Both now refuse it. This is a tightening for service-scoped tokens only;
 non-service callers, elevated sessions and engine principals are unaffected.
 
-**Breaking for service-scoped tokens: the `ITServiceOwner` ceiling now applies on every fleet-read route
-(chokepoint fix).** `require_fleet_read` now applies the same `ITServiceOwner` authority ceiling
-as `require_permission` to a service-scoped token, through one shared helper
-(`authz::service_ceiling_check`): the token is refused (`403`, "service-scoped token does not
-grant <securable>:<operation> (the ITServiceOwner role does not hold it)", no `permission` field,
-audit `auth.fleet_read_required` / `denied`) unless that role itself holds the pair, whatever its
-minter holds. **A FAILED permission read is different on this gate:** it answers a retryable
-`503` (`retry_after_ms` 5000, audit `auth.fleet_read_required` / `denied` with detail "RBAC read
-degraded resolving the ITServiceOwner ceiling", and `yuzu_server_rbac_read_degrade_total`
+**Breaking for service-scoped tokens, 1: `GET /api/v1/enrollment/pending-agents` now answers `403`.**
+The management-group-aware fleet-read gate (`require_fleet_read`, ADR-0017) did not apply the
+`ITServiceOwner` authority ceiling that `require_permission` applies to a service-scoped token. It now
+does, through one shared helper (`authz::service_ceiling_check`): the token is refused (`403`,
+"service-scoped token does not grant <securable>:<operation> (the ITServiceOwner role does not hold
+it)", no `permission` field, audit `auth.fleet_read_required` / `denied`) unless that role itself holds
+the pair, whatever its minter holds. `ITServiceOwner` does not hold `Enrollment:Read`, so a
+service-scoped token that used to receive a pending-agent view narrowed to its tagged agents now gets
+the `403`. **Remediation:** `Enrollment:Read` is intentionally NOT granted to `ITServiceOwner`; use an
+Administrator-minted non-service token for that route.
+
+**Breaking for service-scoped tokens, 2: `GET /api/v1/upload-grants` now answers `403`.** The route's
+only gate evaluated the minter's username, so a service-scoped token inherited its minter's
+`UploadGrant:Read` view (every grant, for a minter holding a global grant). It is now refused before any
+grant is read (`403`, "service-scoped tokens may not list upload grants", no `permission` field, audit
+`upload_grant.list.access_denied`). The MCP tool `list_upload_grants` already refused a service-scoped
+token. **Remediation:** list grants with a non-service token. Non-service sessions are unchanged.
+
+**The ceiling applies wherever a seeded `ITServiceOwner` permission is absent.** With the seeded
+defaults `ITServiceOwner` holds every other pair the fleet-read routes pass, so nothing else changes
+for `Execution`, `Response`, `Inventory`, `Infrastructure`, `Policy`, `GuaranteedState` and
+`Workflow:Read`. No REST, MCP or CLI surface removes a permission from `ITServiceOwner` today, so a
+refusal on one of those pairs cannot arise in a default deployment; the rule is a safeguard for any
+future surface that narrows the role.
+
+**Failure behaviour.** A FAILED permission read is different on the fleet-read gate: it answers a
+retryable `503` (`retry_after_ms` 5000, audit `auth.fleet_read_required` / `denied` with detail "RBAC
+read degraded resolving the ITServiceOwner ceiling", and `yuzu_server_rbac_read_degrade_total`
 increments) rather than `403`, because an outage is not a missing grant; it still fails closed.
-`require_permission` and `require_scoped_permission` keep answering `403` for the same failure.
-**With the seeded defaults nothing changes** for `Execution`, `Response`, `Inventory`, `Infrastructure`, `Policy`,
-`GuaranteedState` and `Workflow:Read`, which `ITServiceOwner` holds. **One seeded-default change:**
-`ITServiceOwner` does not hold `Enrollment:Read`, so a service-scoped token now gets `403` from
-`GET /api/v1/enrollment/pending-agents`, where it used to receive a view narrowed to its tagged
-agents. **Remediation:** `Enrollment:Read` is intentionally NOT granted to `ITServiceOwner`; use
-an Administrator-minted non-service token for that route. **Under a non-default revocation** (an
-operator removed a pair from `ITServiceOwner` with `remove_permission`, which also records it in
-`revoked_seed_defaults`), service-scoped tokens are refused on every route that gates on that pair
-through the fleet-read gate; to restore access, re-grant the pair to `ITServiceOwner`. To find
-affected callers, search the audit log for `action=auth.fleet_read_required` with
-`result=denied` and a detail containing "ITServiceOwner permission" (definitive deny, `403`)
-versus "RBAC read degraded" (store fault, `503`). For `Execution:Read` the affected routes are
-the executions drawer's `/fragments/executions/{id}/detail` fragment, the legacy `/api/executions*` routes
-(the GET routes and the POST `/rerun` and `/cancel` routes, all on the fleet-read gate), `GET /api/v1/executions` with its `/{id}`, `/children` and
-`/api/v1/events` twins, and the MCP tools on that gate that service tokens can reach at all.
-Non-service callers are unaffected. `kServiceScopeGlobalSafe` is not widened.
+`require_permission` and `require_scoped_permission` keep answering `403` for the same failure. The
+ceiling read goes through the RBAC authz circuit breaker with a 250 ms acquire budget, so a degraded
+store fails quickly, and an open breaker is counted under the `pool_acquire_timeout` reason. The
+breaker bounds how many requests wait, not how long an already admitted read holds its connection:
+such a read can still wait up to the pool's `lock_timeout` (10 s default) or `statement_timeout`
+(30 s default).
+
+To find affected callers, search the audit log for `action=auth.fleet_read_required` with
+`result=denied` and a detail containing "ITServiceOwner permission" (definitive deny, `403`) versus
+"RBAC read degraded" (store fault, `503`), and for `action=upload_grant.list.access_denied`. For
+`Execution:Read` the affected routes are the executions drawer's
+`/fragments/executions/{id}/detail` fragment, the legacy `GET /api/executions*` routes,
+`GET /api/v1/executions` with its `/{id}`, `/children` and `/api/v1/events` twins, and the MCP tools on
+that gate that service tokens can reach at all. `POST /api/executions/{id}/rerun` and `/cancel` are not
+affected: a service-scoped token is already refused at their first gate, `Execution:Execute`.
+`kServiceScopeGlobalSafe` is not widened.
 
 ## Behaviour change: DEX device score and management-group member reads now fail closed on a degraded read (#4855, #1762)
 
