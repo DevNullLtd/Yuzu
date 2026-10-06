@@ -6750,7 +6750,7 @@ On a `503` the store (or the confinement check itself) could not be read; do **n
 
 #### `GET /api/v1/inventory/software/catalogue`
 
-The **fleet software title catalogue**: one row per title rolled up across the whole fleet from the precomputed catalogue rollup (refreshed hourly), ordered by installs descending then name. MCP twin: `query_software_catalogue` — both are shaped by one shared model, so the JSON cannot drift.
+The **fleet software title catalogue**: one row per title rolled up across the whole fleet from the precomputed catalogue rollup (refreshed hourly), ordered by installs descending then name.
 
 **Permission:** a **global** `Inventory:Read` (via `require_fleet_read`). The rollup is fleet-wide and cannot be scoped, so a management-group-confined caller gets `403` (`permission: "Inventory:Read"`, audited `denied`) on the fleet view — but may pass `agent_id` for a per-device view of an in-scope device (see below). **Service-scoped API tokens are denied** (`403`, no `permission` field — no grant would admit them), unlike the raw `GET /api/v1/inventory/software` above, which keeps admitting them confined: the asymmetry is deliberate.
 
@@ -6818,7 +6818,7 @@ A repeated parameter, a non-integer `limit`/`versions_min`, an unknown `format` 
 
 #### `GET /api/v1/inventory/software/catalogue/versions`
 
-Installs per version for one title: distinct devices per version, most-installed first. MCP twin: `get_software_versions`.
+Installs per version for one title: distinct devices per version, most-installed first.
 
 **Permission and posture:** identical to the catalogue — a global `Inventory:Read` for the fleet view (`403` for a confined caller), the per-device view for an in-scope device (`newest` is `false` on every row and `newest_omitted: true` for a confined caller; an out-of-scope device returns an empty list with a `denied` audit row), service-scoped tokens denied.
 

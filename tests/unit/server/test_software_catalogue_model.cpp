@@ -259,7 +259,7 @@ TEST_CASE("fingerprints are stable, sensitive to every field and blind to paging
 
 TEST_CASE("catalogue cursor round trip", "[server][software_catalogue_model]") {
     const std::string fp = filter_fingerprint({});
-    for (const std::string name : std::vector<std::string>{"plain", "has:colon", std::string("sep\x1f" "inside"), "eq=/+", "caf\xC3\xA9", ""}) {
+    for (const std::string& name : std::vector<std::string>{"plain", "has:colon", std::string("sep\x1f" "inside"), "eq=/+", "caf\xC3\xA9", ""}) {
         const auto tok = encode_catalogue_cursor(Row(name, 42), fp, 1700000000);
         auto cur = decode_catalogue_cursor(tok, fp, 1700000000);
         REQUIRE(cur);
@@ -665,7 +665,7 @@ TEST_CASE("read_titles_export brackets the walk by the generation",
     }
 }
 
-TEST_CASE("strict_args_error: MCP refuses what REST clamps", "[server][software_catalogue_model]") {
+TEST_CASE("strict_args_error: a strict caller refuses what REST clamps", "[server][software_catalogue_model]") {
     using nlohmann::json;
     CHECK_FALSE(strict_args_error(json::object()));
     CHECK_FALSE(strict_args_error(json{{"limit", 1000}, {"versions_min", 0}, {"kind", "pkg"},
