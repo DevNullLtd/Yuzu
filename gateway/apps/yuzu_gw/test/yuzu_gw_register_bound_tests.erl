@@ -390,12 +390,14 @@ agent_id_bound_matches_the_server() ->
 
 server_max_agent_id_length() ->
     Source = proplists:get_value(source, ?MODULE:module_info(compile), ?FILE),
-    server_max_agent_id_length(filename:dirname(filename:absname(Source))).
+    server_max_agent_id_length(filename:dirname(filename:absname(Source)), undefined).
 
 %% {ok, Value} | skip (no repository root above Dir) | {error, Why} (the root is
-%% there, the header or the symbol is not).
-server_max_agent_id_length(StartDir) ->
-    case find_repo_root(StartDir) of
+%% there, the header or the symbol is not). StopAt bounds the upward walk (the
+%% throwaway trees below pass their own root, so a TMPDIR inside a real checkout
+%% cannot make the walk escape into it); the real check passes `undefined`.
+server_max_agent_id_length(StartDir, StopAt) ->
+    case find_repo_root(StartDir, StopAt) of
         error ->
             skip;
         {ok, Root} ->
@@ -414,13 +416,14 @@ server_max_agent_id_length(StartDir) ->
 
 %% The nearest directory above (or at) Dir that has both a gateway/ and a server/
 %% directory: the repository root.
-find_repo_root(Dir) ->
+find_repo_root(Dir, StopAt) ->
     case filelib:is_dir(filename:join(Dir, "gateway"))
          andalso filelib:is_dir(filename:join(Dir, "server")) of
         true  -> {ok, Dir};
+        false when Dir =:= StopAt -> error;
         false -> case filename:dirname(Dir) of
                      Dir    -> error;
-                     Parent -> find_repo_root(Parent)
+                     Parent -> find_repo_root(Parent, StopAt)
                  end
     end.
 
@@ -443,14 +446,15 @@ drift_check_states_test_() ->
           {"header present: the value is read",
            fun() ->
                write_auth_header(Root, "constexpr std::size_t kMaxAgentIdLength = 256;"),
-               ?assertEqual({ok, 256}, server_max_agent_id_length(Deep))
+               ?assertEqual({ok, 256}, server_max_agent_id_length(Deep, Root))
            end}
       end,
       fun({Root, Deep}) ->
           {"server tree present, symbol renamed: an error, not a skip",
            fun() ->
                write_auth_header(Root, "constexpr std::size_t kMaxAgentIdBytes = 256;"),
-               ?assertMatch({error, {symbol_not_found, _}}, server_max_agent_id_length(Deep))
+               ?assertMatch({error, {symbol_not_found, _}},
+                            server_max_agent_id_length(Deep, Root))
            end}
       end,
       fun({Root, Deep}) ->
@@ -458,12 +462,12 @@ drift_check_states_test_() ->
            fun() ->
                ok = filelib:ensure_dir(filename:join([Root, "server", "x"])),
                ?assertMatch({error, {header_unreadable, _, enoent}},
-                            server_max_agent_id_length(Deep))
+                            server_max_agent_id_length(Deep, Root))
            end}
       end,
-      fun({_Root, Deep}) ->
+      fun({Root, Deep}) ->
           {"no server tree above the gateway checkout: skip",
-           fun() -> ?assertEqual(skip, server_max_agent_id_length(Deep)) end}
+           fun() -> ?assertEqual(skip, server_max_agent_id_length(Deep, Root)) end}
       end]}.
 
 write_auth_header(Root, Line) ->
