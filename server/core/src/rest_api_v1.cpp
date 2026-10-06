@@ -8926,45 +8926,55 @@ void RestApiV1::register_routes(
                 cid, detail::A4ErrorOpts{.permission = "Inventory:Read"}),
             "application/json");
     };
+    // The prologue both routes share: service-token deny -> unwired 503 -> fleet-read gate ->
+    // null-store 503. Returns the admitted gate, or nullopt once the response has been written.
+    auto sw_admit = [fleet_read_fn, software_inventory_store, deny_fleet_wide_service_scoped](
+                        const httplib::Request& req, httplib::Response& res, const std::string& cid,
+                        const char* verb, const char* deny_detail)
+        -> std::optional<authz::FleetReadGate> {
+        if (deny_fleet_wide_service_scoped(
+                req, res, verb, "Inventory", deny_detail,
+                "service-scoped tokens may not read the software catalogue", "fleet", ""))
+            return std::nullopt;
+        if (!fleet_read_fn) {
+            spdlog::error("{}: fleet_read_fn unwired — misconfigured call site; failing closed; "
+                          "cid={}",
+                          verb, cid);
+            res.status = 503;
+            res.set_content(detail::error_json_a4(503, "service unavailable", cid),
+                            "application/json");
+            return std::nullopt;
+        }
+        auto gate = fleet_read_fn(req, res, "Inventory", "Read");
+        if (!gate.admitted)
+            return std::nullopt;
+        if (!software_inventory_store) {
+            res.status = 503;
+            res.set_content(
+                detail::error_json_a4(503, "software inventory store not available", cid),
+                "application/json");
+            return std::nullopt;
+        }
+        return gate;
+    };
 
     sink.Get(
         "/api/v1/inventory/software/catalogue",
-        [fleet_read_fn, audit_fn, software_inventory_store, device_api,
-         deny_fleet_wide_service_scoped, sw_fail_degraded,
+        [audit_fn, software_inventory_store, device_api, sw_admit, sw_fail_degraded,
          sw_deny_confined](const httplib::Request& req, httplib::Response& res) {
             namespace swc = software_catalogue;
             const auto cid = detail::make_correlation_id();
             res.set_header("X-Correlation-Id", cid); // echo on every path (A3)
 
-            if (deny_fleet_wide_service_scoped(
-                    req, res, "inventory.software.catalog", "Inventory",
-                    "service-scoped token denied on the software catalogue",
-                    "service-scoped tokens may not read the software catalogue", "fleet", ""))
+            const auto gate_opt = sw_admit(req, res, cid, "inventory.software.catalog",
+                                           "service-scoped token denied on the software catalogue");
+            if (!gate_opt)
                 return;
-            if (!fleet_read_fn) {
-                spdlog::error("inventory.software.catalog: fleet_read_fn unwired — misconfigured "
-                              "call site; failing closed; cid={}",
-                              cid);
-                res.status = 503;
-                res.set_content(detail::error_json_a4(503, "service unavailable", cid),
-                                "application/json");
-                return;
-            }
-            auto gate = fleet_read_fn(req, res, "Inventory", "Read");
-            if (!gate.admitted)
-                return;
-            if (!software_inventory_store) {
-                res.status = 503;
-                res.set_content(
-                    detail::error_json_a4(503, "software inventory store not available", cid),
-                    "application/json");
-                return;
-            }
+            const auto& gate = *gate_opt;
             auto parsed = swc::parse_catalogue_params(req.params);
             if (!parsed) {
-                res.status = parsed.error().status;
-                res.set_content(detail::error_json_a4(parsed.error().status,
-                                                      parsed.error().message, cid),
+                res.status = 400;
+                res.set_content(detail::error_json_a4(400, parsed.error(), cid),
                                 "application/json");
                 return;
             }
@@ -9074,42 +9084,22 @@ void RestApiV1::register_routes(
 
     sink.Get(
         "/api/v1/inventory/software/catalogue/versions",
-        [fleet_read_fn, audit_fn, software_inventory_store, deny_fleet_wide_service_scoped,
-         sw_fail_degraded, sw_deny_confined](const httplib::Request& req,
-                                             httplib::Response& res) {
+        [audit_fn, software_inventory_store, sw_admit, sw_fail_degraded,
+         sw_deny_confined](const httplib::Request& req, httplib::Response& res) {
             namespace swc = software_catalogue;
             const auto cid = detail::make_correlation_id();
             res.set_header("X-Correlation-Id", cid);
 
-            if (deny_fleet_wide_service_scoped(
-                    req, res, "inventory.software.versions", "Inventory",
-                    "service-scoped token denied on the software catalogue versions",
-                    "service-scoped tokens may not read the software catalogue", "fleet", ""))
+            const auto gate_opt =
+                sw_admit(req, res, cid, "inventory.software.versions",
+                         "service-scoped token denied on the software catalogue versions");
+            if (!gate_opt)
                 return;
-            if (!fleet_read_fn) {
-                spdlog::error("inventory.software.versions: fleet_read_fn unwired — misconfigured "
-                              "call site; failing closed; cid={}",
-                              cid);
-                res.status = 503;
-                res.set_content(detail::error_json_a4(503, "service unavailable", cid),
-                                "application/json");
-                return;
-            }
-            auto gate = fleet_read_fn(req, res, "Inventory", "Read");
-            if (!gate.admitted)
-                return;
-            if (!software_inventory_store) {
-                res.status = 503;
-                res.set_content(
-                    detail::error_json_a4(503, "software inventory store not available", cid),
-                    "application/json");
-                return;
-            }
+            const auto& gate = *gate_opt;
             auto parsed = swc::parse_versions_params(req.params);
             if (!parsed) {
-                res.status = parsed.error().status;
-                res.set_content(detail::error_json_a4(parsed.error().status,
-                                                      parsed.error().message, cid),
+                res.status = 400;
+                res.set_content(detail::error_json_a4(400, parsed.error(), cid),
                                 "application/json");
                 return;
             }

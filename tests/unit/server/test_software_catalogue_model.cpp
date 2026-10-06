@@ -1,8 +1,8 @@
 /**
  * test_software_catalogue_model.cpp — pure coverage for software_catalogue_model.hpp (M.9
- * PR-2): parameter parsing, the scope push-down rule, audit targets, the opaque cursor codecs,
- * the generation-skew decision, the one-consistent-read orchestration (with fake readers),
- * KPI derivation and the JSON/CSV shaping. No store, no libpq, no clock, no network.
+ * PR-2): parameter parsing, audit targets, the opaque cursor codecs, the one-consistent-read
+ * orchestration and its generation-skew handling (with fake readers), KPI
+ * derivation and the JSON/CSV shaping. No store, no libpq, no clock, no network.
  */
 
 #include <catch2/catch_test_macros.hpp>
@@ -15,7 +15,6 @@
 
 using namespace yuzu::server;
 using namespace yuzu::server::software_catalogue;
-using yuzu::server::authz::VisibleSet;
 
 namespace {
 
@@ -32,16 +31,6 @@ SoftwareCatalogRow Row(std::string name, std::int64_t installs, std::string newe
     r.ecosystems = "brew,deb";
     r.kinds = "pkg";
     r.newest_version = std::move(newest);
-    return r;
-}
-
-SoftwareFleetRow FleetRow(std::string name, std::string agent, std::int64_t id) {
-    SoftwareFleetRow r;
-    r.agent_id = std::move(agent);
-    r.entry.name = std::move(name);
-    r.entry.version = "1.2";
-    r.entry.source = "installed_apps.list_inventory";
-    r.install_id = id;
     return r;
 }
 
@@ -87,10 +76,10 @@ TEST_CASE("parse_catalogue_params: defaults, clamps and refusals", "[server][sof
     SECTION("csv limit is the TOTAL export cap, default and ceiling 10000") {
         auto d = parse_catalogue_params(P({{"format", "csv"}}));
         REQUIRE(d);
-        CHECK(d->export_cap == 10000);
+        CHECK(d->query.limit == 10000);
         auto c = parse_catalogue_params(P({{"format", "csv"}, {"limit", "2"}}));
-        CHECK(c->export_cap == 2);
-        CHECK(parse_catalogue_params(P({{"format", "csv"}, {"limit", "99999999"}}))->export_cap ==
+        CHECK(c->query.limit == 2);
+        CHECK(parse_catalogue_params(P({{"format", "csv"}, {"limit", "99999999"}}))->query.limit ==
               10000);
     }
     SECTION("non-integer or malformed values are a 400") {
@@ -99,12 +88,12 @@ TEST_CASE("parse_catalogue_params: defaults, clamps and refusals", "[server][sof
         CHECK_FALSE(parse_catalogue_params(P({{"versions_min", "-1"}})));
         CHECK_FALSE(parse_catalogue_params(P({{"format", "xml"}})));
         CHECK_FALSE(parse_catalogue_params(P({{"cursor", std::string(2049, 'a')}})));
-        CHECK(parse_catalogue_params(P({{"limit", "x"}})).error().status == 400);
+        CHECK_FALSE(parse_catalogue_params(P({{"limit", "x"}})).error().empty());
     }
     SECTION("a repeated key is a 400 naming the key") {
         auto r = parse_catalogue_params(P({{"kind", "app"}, {"kind", "pkg"}}));
         REQUIRE_FALSE(r);
-        CHECK(r.error().message == "repeated query parameter kind");
+        CHECK(r.error() == "repeated query parameter kind");
     }
     SECTION("empty dimension filters mean no filter; unknown keys are ignored") {
         auto r = parse_catalogue_params(P({{"kind", ""}, {"ecosystem", ""}, {"source", ""},
@@ -125,7 +114,7 @@ TEST_CASE("parse_catalogue_params: defaults, clamps and refusals", "[server][sof
 
 TEST_CASE("parse_versions_params", "[server][software_catalogue_model]") {
     CHECK_FALSE(parse_versions_params(P({})));
-    CHECK(parse_versions_params(P({{"name", ""}})).error().message == "name is required");
+    CHECK(parse_versions_params(P({{"name", ""}})).error() == "name is required");
     auto r = parse_versions_params(P({{"name", "git"}, {"ecosystem", "brew"}, {"agent_id", "a1"}}));
     REQUIRE(r);
     CHECK(r->query.name == "git");
@@ -134,60 +123,6 @@ TEST_CASE("parse_versions_params", "[server][software_catalogue_model]") {
     CHECK(r->query.limit == 200);
     CHECK_FALSE(parse_versions_params(P({{"name", "a"}, {"name", "b"}})));
     CHECK(parse_versions_params(P({{"name", "a"}, {"limit", "9999"}}))->query.limit == 1000);
-}
-
-TEST_CASE("parse_devices_params: legacy first-value semantics", "[server][software_catalogue_model]") {
-    SECTION("present-empty version is the exact empty bucket; absent is any") {
-        auto a = parse_devices_params(P({{"version", ""}}));
-        REQUIRE(a);
-        REQUIRE(a->query.version.has_value());
-        CHECK(a->query.version->empty());
-        CHECK_FALSE(parse_devices_params(P({}))->query.version.has_value());
-    }
-    SECTION("export mode caps at 10000 and defaults to it; page caps at 1000") {
-        auto e = parse_devices_params(P({{"format", "csv"}}));
-        CHECK(e->export_mode);
-        CHECK(e->query.limit == 10000);
-        CHECK_FALSE(parse_devices_params(P({}))->export_mode);
-        CHECK(parse_devices_params(P({{"limit", "50000"}}))->query.limit == 1000);
-        CHECK(parse_devices_params(P({}))->query.limit == 100);
-    }
-    SECTION("limit parses with full consume") {
-        CHECK_FALSE(parse_devices_params(P({{"limit", "12abc"}})));
-    }
-    SECTION("a repeated key keeps the FIRST value") {
-        auto r = parse_devices_params(P({{"name", "first"}, {"name", "second"}}));
-        REQUIRE(r);
-        CHECK(r->query.name == "first");
-    }
-}
-
-TEST_CASE("apply_scope: the four push-down outcomes", "[server][software_catalogue_model]") {
-    SoftwareFleetQuery q;
-    SECTION("TOP") {
-        CHECK(apply_scope(q, std::nullopt) == ScopeApply::kUnfiltered);
-        CHECK_FALSE(q.agent_ids.has_value());
-    }
-    SECTION("engaged-empty is deny-all") {
-        CHECK(apply_scope(q, authz::deny_all()) == ScopeApply::kDenyAll);
-        REQUIRE(q.agent_ids.has_value());
-        CHECK(q.agent_ids->empty());
-    }
-    SECTION("engaged within the bound is pushed down") {
-        VisibleSet v = std::unordered_set<std::string>{"a", "b", "c"};
-        CHECK(apply_scope(q, v) == ScopeApply::kPushedDown);
-        REQUIRE(q.agent_ids.has_value());
-        auto ids = *q.agent_ids;
-        std::ranges::sort(ids);
-        CHECK(ids == std::vector<std::string>{"a", "b", "c"});
-    }
-    SECTION("engaged beyond the bound falls back to the post-filter") {
-        std::unordered_set<std::string> big;
-        for (std::size_t i = 0; i <= kScopePushdownMaxIds; ++i)
-            big.insert("agent-" + std::to_string(i));
-        CHECK(apply_scope(q, VisibleSet{std::move(big)}) == ScopeApply::kPostFilter);
-        CHECK_FALSE(q.agent_ids.has_value());
-    }
 }
 
 TEST_CASE("audit_target: fixed field order", "[server][software_catalogue_model]") {
@@ -205,16 +140,6 @@ TEST_CASE("audit_target: fixed field order", "[server][software_catalogue_model]
     v.name = "git";
     v.ecosystem = "brew";
     CHECK(audit_target(v) == "name=git;ecosystem=brew");
-
-    SoftwareFleetQuery f;
-    CHECK(audit_target(f) == "fleet");
-    f.agent_id = "dev-1";
-    CHECK(audit_target(f) == "agent=dev-1");
-    f.name = "git";
-    CHECK(audit_target(f) == "name=git");
-    f.version = "";
-    f.q = "x";
-    CHECK(audit_target(f) == "name=git;version=;q=x");
 }
 
 TEST_CASE("audit_target neutralises forged k=v fields in caller text",
@@ -245,16 +170,6 @@ TEST_CASE("fingerprints are stable, sensitive to every field and blind to paging
     a.limit = 5;
     a.after = SoftwareCatalogCursor{3, "x"};
     CHECK(filter_fingerprint(a) == base);
-
-    SoftwareFleetQuery f;
-    const auto fbase = devices_fingerprint(f);
-    SoftwareFleetQuery fv;
-    fv.version = ""; // present-empty differs from absent
-    CHECK(devices_fingerprint(fv) != fbase);
-    f.limit = 7;
-    f.agent_ids = std::vector<std::string>{"a"};
-    f.after = SoftwareCursor{"n", "a", 1};
-    CHECK(devices_fingerprint(f) == fbase);
 }
 
 TEST_CASE("catalogue cursor round trip", "[server][software_catalogue_model]") {
@@ -270,11 +185,8 @@ TEST_CASE("catalogue cursor round trip", "[server][software_catalogue_model]") {
 
 TEST_CASE("worst-case cursors stay within kCursorMaxBytes", "[server][software_catalogue_model]") {
     const std::string name(1024, '\xFF'); // ingest allows 1024-byte names
-    const std::string agent(256, 'z');
     SoftwareCatalogRow r = Row(name, INT64_MAX);
     CHECK(encode_catalogue_cursor(r, kHeadFp, INT64_MAX).size() <= kCursorMaxBytes);
-    SoftwareFleetRow f = FleetRow(name, agent, INT64_MAX);
-    CHECK(encode_devices_cursor(f, kHeadFp).size() <= kCursorMaxBytes);
 }
 
 TEST_CASE("catalogue cursor decoder refusals", "[server][software_catalogue_model]") {
@@ -314,36 +226,6 @@ TEST_CASE("catalogue cursor decoder refusals", "[server][software_catalogue_mode
         CHECK(r->installs == INT64_MAX);
         CHECK(r->name.empty());
     }
-}
-
-TEST_CASE("devices cursor round trip and refusals", "[server][software_catalogue_model]") {
-    const std::string fp = devices_fingerprint({});
-    const auto row = FleetRow(std::string("na\x1f" "me"), "agent:1", 77);
-    const auto tok = encode_devices_cursor(row, fp);
-    auto cur = decode_devices_cursor(tok, fp);
-    REQUIRE(cur);
-    CHECK(cur->name == row.entry.name);
-    CHECK(cur->agent_id == "agent:1");
-    CHECK(cur->install_id == 77);
-
-    CHECK(decode_devices_cursor(tok, "ffffffffffffffff").error() == CursorError::kFilterMismatch);
-    CHECK(decode_devices_cursor("c1:" + fp + ":x", fp).error() == CursorError::kMalformed);
-    CHECK(decode_devices_cursor("d1:" + fp, fp).error() == CursorError::kMalformed);
-    CHECK(decode_devices_cursor("d1:" + fp + ":" + b64url_of("onlyone"), fp).error() ==
-          CursorError::kMalformed);
-    CHECK(decode_devices_cursor("d1:" + fp + ":" + b64url_of("n\x1f" "a\x1f" "x"), fp).error() ==
-          CursorError::kMalformed);
-    CHECK(decode_devices_cursor("d1:" + fp + ":" + b64url_of("n\x1f" "a\x1f" "1") + "=", fp).error() ==
-          CursorError::kMalformed);
-    // hand-made head: name "", agent "", id 0
-    CHECK(decode_devices_cursor("d1:" + fp + ":" + b64url_of(std::string("\x1f\x1f") + "0"), fp));
-}
-
-TEST_CASE("skew_action", "[server][software_catalogue_model]") {
-    CHECK(skew_action(false, 5, 5) == SkewAction::kNone);
-    CHECK(skew_action(true, 5, 5) == SkewAction::kNone);
-    CHECK(skew_action(true, 5, 6) == SkewAction::kStale);
-    CHECK(skew_action(false, 5, 6) == SkewAction::kRetry);
 }
 
 TEST_CASE("derive_kpis maps every figure", "[server][software_catalogue_model]") {
@@ -408,7 +290,7 @@ TEST_CASE("derive_kpis zero guards and the building state", "[server][software_c
     CHECK(j["building"] == true);
 }
 
-TEST_CASE("catalogue/versions/devices JSON shaping", "[server][software_catalogue_model]") {
+TEST_CASE("catalogue/versions JSON shaping", "[server][software_catalogue_model]") {
     const auto row = catalogue_row_json(Row("git", 9), false);
     CHECK(row["installs"] == 9);
     CHECK(row["ecosystems"] == nlohmann::json::array({"brew", "deb"}));
@@ -441,31 +323,19 @@ TEST_CASE("catalogue/versions/devices JSON shaping", "[server][software_catalogu
     CHECK(vr["newest_omitted"] == true);
     CHECK(vr["count"] == 1);
     CHECK_FALSE(versions_response_json("git", {v}, false, false).contains("newest_omitted"));
-
-    const auto dr = device_row_json(FleetRow("git", "a1", 3));
-    CHECK(dr.size() == 14);
-    CHECK(dr["source"] == "installed_apps.list_inventory");
-    auto dj = devices_response_json({FleetRow("git", "a1", 3)}, "", 2, true);
-    CHECK(dj["next_cursor"].is_null());
-    CHECK(dj["devices_omitted"] == 2);
-    CHECK(dj["result_truncated_by_cap"] == true);
-    CHECK_FALSE(devices_response_json({}, "c", 0, false).contains("result_truncated_by_cap"));
 }
 
-TEST_CASE("CSV writers", "[server][software_catalogue_model]") {
-    auto fr = FleetRow("=cmd", "a,1", 1);
-    fr.entry.publisher = "Ac\"me";
-    const auto csv = installs_csv({fr});
-    CHECK(csv.starts_with(std::string(kInstallsCsvHeader) + "\n"));
-    CHECK(csv.find("a1") == std::string::npos);
-    CHECK(csv.find("\"a,1\"") != std::string::npos);  // comma -> quoted
-    CHECK(csv.find("'=cmd") != std::string::npos);    // formula neutralised
-    CHECK(csv.find("\"Ac\"\"me\"") != std::string::npos);
-
+TEST_CASE("titles_csv", "[server][software_catalogue_model]") {
     SoftwareCatalogRow r = Row("caf\xC3\xA9", 3);
     const auto titles = titles_csv({r}, false);
     CHECK(titles == std::string(kTitlesCsvHeader) + "\ncaf\xC3\xA9,Acme,3,2,brew;deb,pkg,1.0\n");
     CHECK(titles_csv({r}, true).ends_with(",pkg,\n"));
+
+    SoftwareCatalogRow hostile = Row("=cmd", 1);
+    hostile.publisher = "Ac\"me,Inc";
+    const auto h = titles_csv({hostile}, false);
+    CHECK(h.find("'=cmd") != std::string::npos);            // formula neutralised
+    CHECK(h.find("\"Ac\"\"me,Inc\"") != std::string::npos); // quote doubled, comma quoted
 }
 
 TEST_CASE("titles_export: cap, truncation and degrade", "[server][software_catalogue_model]") {
@@ -637,7 +507,7 @@ TEST_CASE("read_titles_export brackets the walk by the generation",
           "[server][software_catalogue_model]") {
     auto rq = Req(100);
     rq.format = "csv";
-    rq.export_cap = 10;
+    rq.query.limit = 10;
     std::string csv;
     bool truncated = false;
     SECTION("stable") {
@@ -663,27 +533,4 @@ TEST_CASE("read_titles_export brackets the walk by the generation",
         f.rows_ok = false;
         CHECK(read_titles_export(f.io(), rq, false, csv, truncated) == PageStatus::kDegraded);
     }
-}
-
-TEST_CASE("strict_args_error: a strict caller refuses what REST clamps", "[server][software_catalogue_model]") {
-    using nlohmann::json;
-    CHECK_FALSE(strict_args_error(json::object()));
-    CHECK_FALSE(strict_args_error(json{{"limit", 1000}, {"versions_min", 0}, {"kind", "pkg"},
-                                       {"ecosystem", "brew"}, {"q", "git"}, {"name", "git"}}));
-    CHECK(strict_args_error(json{{"limit", 0}}));
-    CHECK(strict_args_error(json{{"limit", 1001}}));
-    CHECK(strict_args_error(json{{"limit", "5"}}));
-    CHECK(strict_args_error(json{{"limit", 2.5}}));
-    CHECK(strict_args_error(json{{"versions_min", -1}}));
-    CHECK(strict_args_error(json{{"versions_min", 100001}}));
-    CHECK(strict_args_error(json{{"kind", "nope"}}));
-    CHECK(strict_args_error(json{{"kind", ""}})); // the enum has no empty member
-    CHECK(strict_args_error(json{{"ecosystem", "nope"}}));
-    CHECK(strict_args_error(json{{"q", 5}}));
-    CHECK(strict_args_error(json{{"q", std::string(129, 'a')}}));
-    CHECK(strict_args_error(json{{"source", std::string(257, 'a')}}));
-    CHECK(strict_args_error(json{{"cursor", std::string(2049, 'a')}}));
-    for (const char* eco : {"rpm", "deb", "apk", "pacman", "windows", "macos", "macos_pkgutil",
-                            "brew", "optional_feature"})
-        CHECK_FALSE(strict_args_error(json{{"ecosystem", eco}}));
 }

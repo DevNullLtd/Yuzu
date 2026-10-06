@@ -74,21 +74,13 @@ def extract_enumeration(text, field):
 
 
 def extract_json_enums(text, field):
-    """Every JSON-schema `enum` array published for `<field>`, as a list of sets.
+    """Every OpenAPI parameter `enum` array published for `<field>`, as a list of sets.
 
-    Two shapes: a JSON-schema `"<field>": {... "enum": [...]}` property, and the OpenAPI
-    parameter `{"name": "<field>", ... "schema": {... "enum": [...]}}`. The span between the key
+    Matches `{"name": "<field>", ... "schema": {... "enum": [...]}}`; the span between the name
     and its `enum` never crosses a closing brace, so a later field's enum is never attributed to
     this one."""
-    patterns = (
-        rf'"{field}":\s*\{{[^{{}}]*?"enum":\s*\[([^\]]*)\]',
-        rf'"name":\s*"{field}"[^{{}}]*"schema":\s*\{{[^{{}}]*?"enum":\s*\[([^\]]*)\]',
-    )
-    found = []
-    for pat in patterns:
-        for m in re.finditer(pat, text):
-            found.append(set(re.findall(r'"([a-z_]+)"', m.group(1))))
-    return found
+    pat = rf'"name":\s*"{field}"[^{{}}]*"schema":\s*\{{[^{{}}]*?"enum":\s*\[([^\]]*)\]'
+    return [set(re.findall(r'"([a-z_]+)"', m.group(1))) for m in re.finditer(pat, text)]
 
 
 def extract_table_row(text, field):
@@ -132,19 +124,18 @@ class VocabularyConsistency(unittest.TestCase):
     def test_json_enum_arrays_equal_vocabulary(self):
         # Anti-vacuous: the file must carry at least one `kind` and one `ecosystem` enum array
         # (the catalogue routes' parameters); every one must equal the agreed vocabulary.
-        for rel in (OPENAPI_SRC,):
-            text = read(rel)
-            # Other tools reuse the field name `kind` for unrelated enums (e.g. the orientation
-            # tool's fleet|agent|...): an array is a software-vocabulary array iff it shares a
-            # value with the vocabulary, so a drifted copy (a dropped value) is still caught.
-            kinds = [k for k in extract_json_enums(text, "kind") if k & EXPECTED_KINDS]
-            ecos = [e for e in extract_json_enums(text, "ecosystem") if e & EXPECTED_ECOSYSTEMS]
-            self.assertGreaterEqual(len(kinds), 1, f"{rel}: no JSON `kind` enum found")
-            self.assertGreaterEqual(len(ecos), 1, f"{rel}: no JSON `ecosystem` enum found")
-            for k in kinds:
-                self.assertEqual(k, EXPECTED_KINDS, rel)
-            for e in ecos:
-                self.assertEqual(e, EXPECTED_ECOSYSTEMS, rel)
+        text = read(OPENAPI_SRC)
+        # Other routes reuse the field name `kind` for unrelated enums: an array is a
+        # software-vocabulary array iff it shares a value with the vocabulary, so a drifted copy
+        # (a dropped value) is still caught.
+        kinds = [k for k in extract_json_enums(text, "kind") if k & EXPECTED_KINDS]
+        ecos = [e for e in extract_json_enums(text, "ecosystem") if e & EXPECTED_ECOSYSTEMS]
+        self.assertGreaterEqual(len(kinds), 1, f"{OPENAPI_SRC}: no JSON `kind` enum found")
+        self.assertGreaterEqual(len(ecos), 1, f"{OPENAPI_SRC}: no JSON `ecosystem` enum found")
+        for k in kinds:
+            self.assertEqual(k, EXPECTED_KINDS, OPENAPI_SRC)
+        for e in ecos:
+            self.assertEqual(e, EXPECTED_ECOSYSTEMS, OPENAPI_SRC)
 
     def test_manual_table(self):
         text = read(MANUAL)
