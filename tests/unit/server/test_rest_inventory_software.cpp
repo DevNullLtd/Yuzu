@@ -41,6 +41,7 @@
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
 #include "rbac_store.hpp"
+#include "software_catalogue_model.hpp"
 #include "software_inventory_store.hpp"
 #include "tag_store.hpp"
 #include "test_api_token_pg_helper.hpp"  // ApiTokenStorePg
@@ -59,10 +60,12 @@
 
 #include "../test_helpers.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <functional>
 #include <memory>
 #include <optional>
+#include <set>
 #include <shared_mutex>
 #include <stdexcept>
 #include <string>
@@ -288,6 +291,16 @@ TEST_CASE("REST inventory/software: path is in the OpenAPI spec (A1 discoverabil
 // ── Live-PG branches ─────────────────────────────────────────────────────────
 
 namespace {
+// A confined scope WIDER than the SQL push-down bound (software_catalogue::kScopePushdownMaxIds),
+// so the route takes the in-process post-filter arm. `keep` are the agents it admits.
+std::unordered_set<std::string> wide_scope(std::initializer_list<std::string> keep) {
+    std::unordered_set<std::string> ids;
+    for (std::size_t i = 0; i <= software_catalogue::kScopePushdownMaxIds; ++i)
+        ids.insert("pad-" + std::to_string(i));
+    ids.insert(keep);
+    return ids;
+}
+
 // Seed one agent's machine-scope software via the store's own ingest path.
 void seed(SoftwareInventoryStore& store, const std::string& agent,
           std::vector<SoftwareEntry> rows) {
@@ -393,7 +406,8 @@ TEST_CASE("REST inventory/software: name filter narrows the fleet result",
         CHECK(row.at("name").get<std::string>() == "Google Chrome");
 }
 
-TEST_CASE("REST inventory/software: scope filter drops out-of-scope agent + audits denied",
+TEST_CASE("REST inventory/software: a confined scope is pushed into SQL — complete page, "
+          "nothing omitted, no denied row",
           "[pg][rest][inventory_software][security]") {
     YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
@@ -404,7 +418,7 @@ TEST_CASE("REST inventory/software: scope filter drops out-of-scope agent + audi
     seed(store, "dev-b", {{"Google Chrome", "120", "Google", ""}});
 
     InvHarness h{&store};
-    // Operator may see dev-a only — dev-b's row must be dropped (not leaked).
+    // Operator may see dev-a only — dev-b's row is never read (not leaked, not even scanned).
     h.fleet_scope = std::unordered_set<std::string>{"dev-a"};
 
     auto res = h.sink.Get("/api/v1/inventory/software?name=Google Chrome");
@@ -414,8 +428,32 @@ TEST_CASE("REST inventory/software: scope filter drops out-of-scope agent + audi
     const auto& data = body.at("data");
     REQUIRE(data.at("software").size() == 1);
     CHECK(data.at("software")[0].at("agent_id").get<std::string>() == "dev-a");
-    // The false-negative guard: a positive count tells the caller matching software
-    // exists outside their scope (not "absent fleet-wide").
+    // devices_omitted now means "hidden by the in-process post-filter": 0 under push-down.
+    CHECK(data.at("devices_omitted").get<int>() == 0);
+    CHECK_FALSE(h.has_audit("denied"));
+    CHECK(h.has_audit("success"));
+}
+
+TEST_CASE("REST inventory/software: a scope wider than the push-down bound post-filters, "
+          "reports devices_omitted and audits denied",
+          "[pg][rest][inventory_software][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    SoftwareInventoryStore store{pool};
+    REQUIRE(store.is_open());
+    seed(store, "dev-a", {{"Google Chrome", "119", "Google", ""}});
+    seed(store, "dev-b", {{"Google Chrome", "120", "Google", ""}});
+
+    InvHarness h{&store};
+    h.fleet_scope = wide_scope({"dev-a"});
+
+    auto res = h.sink.Get("/api/v1/inventory/software?name=Google Chrome");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    const auto data = nlohmann::json::parse(res->body).at("data");
+    REQUIRE(data.at("software").size() == 1);
+    CHECK(data.at("software")[0].at("agent_id").get<std::string>() == "dev-a");
     CHECK(data.at("devices_omitted").get<int>() == 1);
     CHECK(h.has_audit("denied"));
     CHECK(h.has_audit("success"));
@@ -542,7 +580,7 @@ TEST_CASE("REST inventory/software: devices_omitted counts DISTINCT dropped agen
     seed(store, "dev-b", {{"Common", "1", "", ""}, {"Common", "2", "", ""}});
 
     InvHarness h{&store};
-    h.fleet_scope = std::unordered_set<std::string>{"dev-a"};
+    h.fleet_scope = wide_scope({"dev-a"}); // post-filter arm: the distinct-count guard only runs there
     auto res = h.sink.Get("/api/v1/inventory/software?name=Common");
     REQUIRE(res);
     CHECK(res->status == 200);
@@ -809,7 +847,7 @@ TEST_CASE("REST inventory/software [e2e]: service-scoped token gets a real filte
     for (const auto& row : sw)
         seen.insert(row.at("agent_id").get<std::string>());
     CHECK(seen == std::unordered_set<std::string>{"a_p", "a_c1", "a_s"});
-    CHECK(body.at("data").at("devices_omitted").get<int>() == 1); // a_c2 dropped
+    CHECK(body.at("data").at("devices_omitted").get<int>() == 0); // pushed into SQL: a_c2 never scanned
 }
 
 TEST_CASE("REST inventory/software [e2e]: management-group-confined operator gets a "
@@ -833,7 +871,7 @@ TEST_CASE("REST inventory/software [e2e]: management-group-confined operator get
     for (const auto& row : sw)
         seen.insert(row.at("agent_id").get<std::string>());
     CHECK(seen == std::unordered_set<std::string>{"a_p", "a_c1", "a_c2"}); // INV-4 descendant expansion
-    CHECK(body.at("data").at("devices_omitted").get<int>() == 1); // a_s dropped
+    CHECK(body.at("data").at("devices_omitted").get<int>() == 0); // pushed into SQL: a_s never scanned
 }
 
 TEST_CASE("REST inventory/software [e2e]: unscoped operator (global grant) sees the "
@@ -924,4 +962,262 @@ TEST_CASE("REST inventory/software [e2e]: a genuine gate deny gets exactly one "
     CHECK(row.result == "denied");
     CHECK(row.target_type.empty());
     CHECK(row.target_id.empty());
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// M.9 PR-2: version filter, source, keyset cursor, push-down completeness, export
+// ═══════════════════════════════════════════════════════════════════════════
+
+namespace {
+
+std::size_t count_audit(const InvHarness& h, const std::string& action, const std::string& result,
+                        const std::string& needle = {}) {
+    std::size_t n = 0;
+    for (const auto& a : h.audit_log)
+        if (a.action == action && a.result == result &&
+            (needle.empty() || a.detail.find(needle) != std::string::npos))
+            ++n;
+    return n;
+}
+
+std::string b64url(std::string_view in) {
+    static constexpr char tbl[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    std::string out;
+    std::uint32_t acc = 0;
+    int bits = 0;
+    for (unsigned char c : in) {
+        acc = (acc << 8) | c;
+        bits += 8;
+        while (bits >= 6) {
+            bits -= 6;
+            out += tbl[(acc >> bits) & 63];
+        }
+    }
+    if (bits > 0)
+        out += tbl[(acc << (6 - bits)) & 63];
+    return out;
+}
+
+} // namespace
+
+TEST_CASE("REST inventory/software: ?version= selects an exact version; present-empty selects the "
+          "empty bucket",
+          "[pg][rest][inventory_software]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    SoftwareInventoryStore store{pool};
+    REQUIRE(store.is_open());
+    seed(store, "dev-a", {{"App", "1.0", "", ""}, {"Bare", "", "", ""}});
+    seed(store, "dev-b", {{"App", "2.0", "", ""}});
+
+    InvHarness h{&store};
+    auto exact = nlohmann::json::parse(h.sink.Get("/api/v1/inventory/software?version=2.0")->body);
+    REQUIRE(exact.at("data").at("software").size() == 1);
+    CHECK(exact.at("data").at("software")[0].at("agent_id") == "dev-b");
+    auto empty = nlohmann::json::parse(h.sink.Get("/api/v1/inventory/software?version=")->body);
+    REQUIRE(empty.at("data").at("software").size() == 1);
+    CHECK(empty.at("data").at("software")[0].at("name") == "Bare");
+    auto any = nlohmann::json::parse(h.sink.Get("/api/v1/inventory/software")->body);
+    CHECK(any.at("data").at("software").size() == 3);
+}
+
+TEST_CASE("REST inventory/software: rows carry the 14 documented fields incl. source",
+          "[pg][rest][inventory_software]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    SoftwareInventoryStore store{pool};
+    REQUIRE(store.is_open());
+    SoftwareEntry e{"App", "1.0", "Acme", ""};
+    e.source = "installed_apps.list_inventory";
+    seed(store, "dev-a", {e});
+
+    InvHarness h{&store};
+    auto body = nlohmann::json::parse(h.sink.Get("/api/v1/inventory/software")->body);
+    const auto& row = body.at("data").at("software")[0];
+    CHECK(row.size() == 14);
+    CHECK(row.at("source") == "installed_apps.list_inventory");
+}
+
+TEST_CASE("REST inventory/software: keyset walk pages without duplicates or gaps, and every page "
+          "is audited",
+          "[pg][rest][inventory_software]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    SoftwareInventoryStore store{pool};
+    REQUIRE(store.is_open());
+    seed(store, "dev-a", {{"A", "1", "", ""}, {"B", "1", "", ""}, {"C", "1", "", ""}});
+    seed(store, "dev-b", {{"A", "1", "", ""}, {"B", "1", "", ""}});
+
+    InvHarness h{&store};
+    std::vector<std::string> seen;
+    std::string cursor;
+    int pages = 0;
+    for (;;) {
+        std::string url = "/api/v1/inventory/software?limit=2";
+        if (!cursor.empty())
+            url += "&cursor=" + cursor;
+        auto res = h.sink.Get(url);
+        REQUIRE(res);
+        REQUIRE(res->status == 200);
+        const auto data = nlohmann::json::parse(res->body).at("data");
+        REQUIRE(data.at("software").size() <= 2);
+        for (const auto& r : data.at("software"))
+            seen.push_back(r.at("agent_id").get<std::string>() + "/" + r.at("name").get<std::string>());
+        ++pages;
+        if (data.at("next_cursor").is_null())
+            break;
+        cursor = data.at("next_cursor").get<std::string>();
+        REQUIRE(pages < 10);
+    }
+    CHECK(seen.size() == 5);
+    CHECK(std::set<std::string>(seen.begin(), seen.end()).size() == 5); // no duplicates
+    CHECK(pages == 3);
+    // success on EVERY call; continuation pages tagged
+    CHECK(count_audit(h, "inventory.software.query", "success") == 3);
+    CHECK(count_audit(h, "inventory.software.query", "success", "page=continuation") == 2);
+}
+
+TEST_CASE("REST inventory/software: cursor refusals — tampered, wrong filter set; forged head "
+          "cursor works but is audited",
+          "[pg][rest][inventory_software][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    SoftwareInventoryStore store{pool};
+    REQUIRE(store.is_open());
+    seed(store, "dev-a", {{"A", "1", "", ""}, {"B", "1", "", ""}, {"C", "1", "", ""}});
+
+    InvHarness h{&store};
+    const auto first = nlohmann::json::parse(h.sink.Get("/api/v1/inventory/software?limit=1")->body);
+    const auto cursor = first.at("data").at("next_cursor").get<std::string>();
+
+    CHECK(h.sink.Get("/api/v1/inventory/software?limit=1&cursor=" + cursor + "!")->status == 400);
+    CHECK(h.sink.Get("/api/v1/inventory/software?limit=1&cursor=garbage")->status == 400);
+    auto wrong = h.sink.Get("/api/v1/inventory/software?limit=1&name=A&cursor=" + cursor);
+    REQUIRE(wrong);
+    CHECK(wrong->status == 400);
+    CHECK(wrong->body.find("different filter set") != std::string::npos);
+
+    // A hand-made head cursor (name "", agent "", id 0) over the unfiltered query is accepted by
+    // design — opaque is not authenticated — so the audit row is what keeps it from being silent.
+    const auto fp = software_catalogue::devices_fingerprint(SoftwareFleetQuery{});
+    const auto before = count_audit(h, "inventory.software.query", "success", "page=continuation");
+    auto forged = h.sink.Get("/api/v1/inventory/software?limit=1&cursor=d1:" + fp + ":" +
+                             b64url(std::string("\x1f\x1f") + "0"));
+    REQUIRE(forged);
+    CHECK(forged->status == 200);
+    CHECK(nlohmann::json::parse(forged->body).at("data").at("software")[0].at("name") == "A");
+    CHECK(count_audit(h, "inventory.software.query", "success", "page=continuation") == before + 1);
+}
+
+TEST_CASE("REST inventory/software: push-down returns COMPLETE pages of the caller's own scope",
+          "[pg][rest][inventory_software][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    SoftwareInventoryStore store{pool};
+    REQUIRE(store.is_open());
+    // Five agents; the two in scope sort AFTER three out-of-scope agents, so a post-filter over a
+    // limit-2 scan would return an empty page. Push-down returns the full 2.
+    for (const char* a : {"a1", "a2", "a3", "z1", "z2"})
+        seed(store, a, {{"Common", "1", "", ""}});
+
+    InvHarness h{&store};
+    h.fleet_scope = std::unordered_set<std::string>{"z1", "z2"};
+    const auto data = nlohmann::json::parse(h.sink.Get("/api/v1/inventory/software?limit=2")->body).at("data");
+    CHECK(data.at("software").size() == 2);
+    CHECK(data.at("devices_omitted") == 0);
+    CHECK_FALSE(h.has_audit("denied"));
+
+    // Engaged-empty scope: deny-all -> 200, empty, nothing omitted, no oracle.
+    InvHarness none{&store};
+    none.fleet_scope = std::unordered_set<std::string>{};
+    const auto empty = nlohmann::json::parse(none.sink.Get("/api/v1/inventory/software")->body).at("data");
+    CHECK(empty.at("software").empty());
+    CHECK(empty.at("devices_omitted") == 0);
+}
+
+TEST_CASE("REST inventory/software: post-filter arm advances the cursor from the last scanned row",
+          "[pg][rest][inventory_software][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    SoftwareInventoryStore store{pool};
+    REQUIRE(store.is_open());
+    for (const char* a : {"a1", "a2", "z1"})
+        seed(store, a, {{"Common", "1", "", ""}});
+
+    InvHarness h{&store};
+    h.fleet_scope = wide_scope({"z1"});
+    const auto page1 = nlohmann::json::parse(h.sink.Get("/api/v1/inventory/software?limit=2")->body).at("data");
+    CHECK(page1.at("software").empty());          // both scanned rows were out of scope
+    CHECK(page1.at("devices_omitted") == 2);
+    REQUIRE(page1.at("next_cursor").is_string()); // ...but the walk still advances
+    const auto page2 = nlohmann::json::parse(
+        h.sink.Get("/api/v1/inventory/software?limit=2&cursor=" + page1.at("next_cursor").get<std::string>())->body).at("data");
+    REQUIRE(page2.at("software").size() == 1);
+    CHECK(page2.at("software")[0].at("agent_id") == "z1");
+}
+
+TEST_CASE("REST inventory/software: limit=12abc → 400 against a live store",
+          "[pg][rest][inventory_software]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    SoftwareInventoryStore store{pool};
+    REQUIRE(store.is_open());
+    InvHarness h{&store};
+    CHECK(h.sink.Get("/api/v1/inventory/software?limit=12abc")->status == 400);
+}
+
+TEST_CASE("REST inventory/software: exports — csv, truncation, json, bad format, audit verb",
+          "[pg][rest][inventory_software]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    SoftwareInventoryStore store{pool};
+    REQUIRE(store.is_open());
+    seed(store, "dev-a", {{"A", "1", "", ""}, {"B", "1", "", ""}, {"C", "1", "", ""}});
+
+    InvHarness h{&store};
+    auto csv = h.sink.Get("/api/v1/inventory/software?format=csv");
+    REQUIRE(csv);
+    CHECK(csv->status == 200);
+    CHECK(csv->get_header_value("Content-Type").find("text/csv") == 0);
+    CHECK(csv->get_header_value("Content-Disposition").find("software-installs.csv") != std::string::npos);
+    CHECK(csv->body.starts_with(std::string(software_catalogue::kInstallsCsvHeader) + "\n"));
+    CHECK(csv->get_header_value("X-Result-Truncated-By-Cap").empty());
+
+    auto cut = h.sink.Get("/api/v1/inventory/software?format=csv&limit=2");
+    REQUIRE(cut);
+    CHECK(cut->get_header_value("X-Result-Truncated-By-Cap") == "true");
+    CHECK(std::ranges::count(cut->body, '\n') == 3); // header + 2 rows
+
+    auto json = nlohmann::json::parse(h.sink.Get("/api/v1/inventory/software?format=json&limit=2")->body);
+    CHECK(json.at("data").at("result_truncated_by_cap") == true);
+
+    CHECK(h.sink.Get("/api/v1/inventory/software?format=xml")->status == 400);
+    CHECK(count_audit(h, "inventory.software.export", "success") == 3);
+    CHECK(count_audit(h, "inventory.software.export", "success", "truncated=true") == 2);
+}
+
+TEST_CASE("REST inventory/software: success audit target equals audit_target(query)",
+          "[pg][rest][inventory_software]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    SoftwareInventoryStore store{pool};
+    REQUIRE(store.is_open());
+    seed(store, "dev-a", {{"A", "1", "", ""}});
+    InvHarness h{&store};
+    REQUIRE(h.sink.Get("/api/v1/inventory/software?agent_id=dev-a&q=A")->status == 200);
+    REQUIRE_FALSE(h.audit_log.empty());
+    SoftwareFleetQuery q;
+    q.agent_id = "dev-a";
+    q.q = "A";
+    CHECK(h.audit_log.back().target_id == software_catalogue::audit_target(q));
 }

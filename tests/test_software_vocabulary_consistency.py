@@ -9,7 +9,7 @@ against the real tree, that:
 
   1. every published surface equals the agreed vocabulary (EXPECTED_*) — the one prose
      `kind (a|b)` enumeration per source file AND every JSON `enum` array the M.9 catalogue
-     routes publish for `kind`/`ecosystem` (OpenAPI parameters);
+     twins publish for `kind`/`ecosystem` (MCP input schemas, OpenAPI parameters);
   2. the values the agents emit are exactly that vocabulary (emitted == published);
   3. every non-Lane-1 ecosystem and Lane-3 kind is named in `is_os_native`, and `pkg`
      is NOT a kind-level trigger (it is routed by its ecosystem).
@@ -76,7 +76,7 @@ def extract_enumeration(text, field):
 def extract_json_enums(text, field):
     """Every JSON-schema `enum` array published for `<field>`, as a list of sets.
 
-    Two shapes: a JSON-schema `"<field>": {... "enum": [...]}` property, and the OpenAPI
+    Two shapes: the MCP tool schemas' `"<field>": {... "enum": [...]}` property, and the OpenAPI
     parameter `{"name": "<field>", ... "schema": {... "enum": [...]}}`. The span between the key
     and its `enum` never crosses a closing brace, so a later field's enum is never attributed to
     this one."""
@@ -130,9 +130,9 @@ class VocabularyConsistency(unittest.TestCase):
         self.assertEqual(extract_enumeration(text, "ecosystem"), EXPECTED_ECOSYSTEMS)
 
     def test_json_enum_arrays_equal_vocabulary(self):
-        # Anti-vacuous: the file must carry at least one `kind` and one `ecosystem` enum array
-        # (the catalogue routes' parameters); every one must equal the agreed vocabulary.
-        for rel in (OPENAPI_SRC,):
+        # Anti-vacuous: each file must carry at least one `kind` and one `ecosystem` enum array
+        # (the catalogue twins' schemas); every one must equal the agreed vocabulary.
+        for rel in (MCP_SRC, OPENAPI_SRC):
             text = read(rel)
             # Other tools reuse the field name `kind` for unrelated enums (e.g. the orientation
             # tool's fleet|agent|...): an array is a software-vocabulary array iff it shares a

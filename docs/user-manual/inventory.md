@@ -348,17 +348,17 @@ workers, gated SOLELY by `AuthRoutes::require_fleet_read` (#3290 Phase 2):
 
 - Filter by software `name` and/or `agent_id`; omit both for a fleet-wide scan.
 - Returns up to `limit` rows (max 1000). When `result_truncated_by_cap` is
-  `true`, more rows exist past the cap (keyset pagination is a follow-up).
-- **A per-agent scope drop filter is applied** — out-of-scope devices are
-  dropped (and the omission audited), with the count returned as
-  `devices_omitted` (absent when zero). This confinement is **effective**: the
-  gate composes management-group visibility with the caller's service-scope tag
+  `true` the page is full: pass `next_cursor` back as `cursor` to continue the keyset walk
+  (the cursor is opaque and bound to the filter set). Optional `version` filter; each row
+  also carries `source`.
+- **The caller's scope is applied in SQL** — the gate composes management-group
+  visibility with the caller's service-scope tag
   (`meet(management-group, service-scope)`), so a management-group-confined
   operator and a correctly-confined service-scoped API token both get a real
   filtered result — a service-scoped token is no longer denied outright as it
-  was before #3290. When present, a positive `devices_omitted` means matching
-  software exists outside your scope — an empty or short result does
-  **not** mean the software is absent fleet-wide. This is distinct from the generic
+  was before #3290. `devices_omitted` counts only the devices hidden by the
+  in-process post-filter used for a scope wider than 10 000 devices (`0` under
+  push-down, where the result is complete for the caller's own devices). This is distinct from the generic
   `query_inventory` / `get_agent_inventory` tools, which read a *separate*
   generic blob store on `Infrastructure:Read` and do **not** surface this typed
   software data.
@@ -393,15 +393,13 @@ curl -H "Authorization: Bearer $TOKEN" \
   release, arch, signature_status, distro_id, distro_version}` — the v2 fields
   are `""` where the ecosystem does not store them (see the availability matrix
   above). The MCP tool's rows carry the identical field set.
-- **Carries the same per-agent scope drop filter as the MCP tool**
-  (out-of-scope devices dropped, omission audited, `devices_omitted` reports the
-  count) — the SAME `require_fleet_read` gate, so REST and MCP cannot observe a
-  different admit/filter decision for the same caller (see the MCP note above).
-  When present, a positive `devices_omitted` means matching software exists
-  outside your scope — an empty or short result does **not** mean the software
-  is absent fleet-wide.
-- `result_truncated_by_cap: true` (present only when set) means more rows exist past
-  `limit` (keyset pagination is a follow-up, #1634).
+- **Carries the same scope push-down as the MCP tool** — the SAME
+  `require_fleet_read` gate, so REST and MCP cannot observe a different
+  admit/filter decision for the same caller (see the MCP note above). A positive
+  `devices_omitted` appears only on the wide-scope post-filter path and is
+  audited as `denied`.
+- `result_truncated_by_cap: true` (present only when set) means the page is full; continue
+  with `next_cursor` (keyset pagination, opaque cursor bound to the filter set).
 - **On store degradation** the endpoint returns **`503`** (an A4 error envelope with a
   `correlation_id`), **never** an empty `200` — so a vulnerability query cannot read a
   transient Postgres outage as "installed nowhere" (ADR-0016 §7 authoritative reads).
@@ -412,15 +410,12 @@ curl -H "Authorization: Bearer $TOKEN" \
   degrade, not an authorization problem; retry once it clears (sre, governance run
   2026-08-20).
 
-**Narrow scope on a large fleet (applies to *both* the MCP tool and the REST
-endpoint).** The 1000-row cap is applied by the store *before* the management-group
-scope filter runs. So a narrow-scope operator querying a popular title across a large
-fleet can see `result_truncated_by_cap: true` together with few — or **zero** — of
-their own rows, because the cap was consumed by out-of-scope devices that sort ahead
-of yours. **That is "incomplete", not "absent in your scope."** Until keyset
-pagination lands (#1634), narrow the query: pass `agent_id` (`?agent_id=<id>` on REST,
-the `agent_id` arg on MCP) to read a specific device, or a more selective `name`
-filter, so your in-scope rows fit under the cap.
+**Scope is applied in SQL.** A confined caller's visible-device set is pushed into the query
+for up to 10 000 devices, so it gets **complete pages of its own devices** — the old
+"the cap was consumed by out-of-scope devices" short page no longer occurs, and
+`devices_omitted` is `0`. Only a scope wider than 10 000 devices falls back to the in-process
+post-filter, where `devices_omitted` counts the hidden devices and `next_cursor` still advances
+from the last row scanned, so keep paging until `next_cursor` is `null`.
 
 ### Dashboard (`/inventory` → `/hardware` / `/software`)
 

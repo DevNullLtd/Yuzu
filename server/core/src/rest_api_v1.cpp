@@ -1067,7 +1067,7 @@ const std::string& openapi_spec() {
       "post": {"summary": "Query inventory across agents with filter expression", "tags": ["Inventory"], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "properties": {"agent_id": {"type": "string", "description": "Filter by agent ID"}, "plugin": {"type": "string", "description": "Filter by plugin name"}, "since": {"type": "integer", "description": "Only records after this epoch"}, "until": {"type": "integer", "description": "Only records before this epoch"}, "limit": {"type": "integer", "default": 100}}}}}}, "responses": {"200": {"description": "Matching inventory records"}}}
     },
     "/inventory/software": {
-      "get": {"summary": "Fleet-wide installed-software inventory (typed daily-sync store, ADR-0016)", "tags": ["Inventory"], "description": "Installed-software rows across the fleet from the typed SoftwareInventoryStore (DISTINCT from the generic /inventory/* routes, which read the generic blob store). Rows carry name, version, publisher, install_date plus the blob-v2 package fields: kind (package|app|pkg|feat), ecosystem (rpm|deb|apk|pacman|windows|macos|macos_pkgutil|brew|optional_feature), epoch, release, arch, signature_status (rpm stored-tag), distro_id, distro_version — fields an ecosystem does not store are empty, never synthesised. Requires Inventory:Read (#3290 Phase 2: the SOLE gate is the ADR-0017 admit-then-filter fleet-read gate, never stacked with a separate permission check). Results are scoped to the caller's management groups AND, for a service-scoped API token, to that token's service-tagged agents (the intersection of both when both apply); out-of-scope devices are dropped and counted in devices_omitted (a positive value means matching software exists outside your scope — an empty/short result does NOT mean the software is absent fleet-wide). A correctly-confined service-scoped token now gets a real filtered read here rather than an outright 403. Capped at limit rows (max 1000); result_truncated_by_cap=true means more exist past the cap (keyset pagination is a follow-up). On store degradation, or the caller's tag-scope lookup degrading, the endpoint returns 503 (never an empty 200) so a vulnerability query cannot read a transient outage as 'installed nowhere'.", "parameters": [{"name": "name", "in": "query", "schema": {"type": "string"}, "description": "Exact software-name filter (optional)"}, {"name": "agent_id", "in": "query", "schema": {"type": "string"}, "description": "Exact agent filter (optional)"}, {"name": "limit", "in": "query", "schema": {"type": "integer", "default": 100, "maximum": 1000}}], "responses": {"200": {"description": "{data:{software[], count, devices_omitted, result_truncated_by_cap?, audit_persisted?}}"}, "400": {"description": "Non-integer limit"}, "401": {"description": "Unauthenticated"}, "403": {"description": "No management-group grant for Inventory:Read (or a service-scoped token whose RBAC/ITServiceOwner grant is missing/RBAC disabled)"}, "503": {"description": "Software inventory store unavailable/degraded, RBAC/management-group/tag store unavailable, or the fleet-read gate unwired"}}}
+      "get": {"summary": "Fleet-wide installed-software inventory (typed daily-sync store, ADR-0016)", "tags": ["Inventory"], "description": "Installed-software rows across the fleet from the typed SoftwareInventoryStore (DISTINCT from the generic /inventory/* routes, which read the generic blob store). Rows carry name, version, publisher, install_date plus the blob-v2 package fields: kind (package|app|pkg|feat), ecosystem (rpm|deb|apk|pacman|windows|macos|macos_pkgutil|brew|optional_feature), epoch, release, arch, signature_status (rpm stored-tag), distro_id, distro_version — fields an ecosystem does not store are empty, never synthesised. Requires Inventory:Read (#3290 Phase 2: the SOLE gate is the ADR-0017 admit-then-filter fleet-read gate, never stacked with a separate permission check). Results are scoped to the caller's management groups AND, for a service-scoped API token, to that token's service-tagged agents (the intersection of both when both apply); the scope is applied in SQL (up to 10000 visible devices) so a confined caller gets COMPLETE pages of its own devices; devices_omitted counts only the devices hidden by the in-process post-filter used for a scope wider than that bound (0 under push-down — it is no longer an 'exists outside your scope' signal), and only then is a denied audit row written. A correctly-confined service-scoped token gets a real filtered read here (incl. export), unlike the two catalogue routes which deny service-scoped tokens. Each row also carries source (<plugin>.<action>, an open set). Optional filters: version (present-empty selects the empty-version rows), q, kind, ecosystem, source. Keyset pagination: next_cursor is non-null when the page is full (result_truncated_by_cap=true, also in export mode); pass it back as cursor — a malformed cursor or one issued for a different filter set is a 400. format=json|csv is an export (limit is the TOTAL cap, default and max 10000; csv adds Content-Disposition and X-Result-Truncated-By-Cap) audited as inventory.software.export. Every call is audited (inventory.software.query success, continuation pages tagged page=continuation). Repeated query parameters keep the first value; a non-integer limit is a 400. On store degradation, or the caller's tag-scope lookup degrading, the endpoint returns 503 (never an empty 200) so a vulnerability query cannot read a transient outage as 'installed nowhere'.", "parameters": [{"name": "name", "in": "query", "schema": {"type": "string"}, "description": "Exact software-name filter (optional)"}, {"name": "agent_id", "in": "query", "schema": {"type": "string"}, "description": "Exact agent filter (optional)"}, {"name": "version", "in": "query", "schema": {"type": "string"}, "description": "Exact version filter; present-empty selects the empty-version rows"}, {"name": "q", "in": "query", "schema": {"type": "string", "maxLength": 128}, "description": "Case-insensitive literal substring over name, publisher, ecosystem and source"}, {"name": "kind", "in": "query", "schema": {"type": "string", "enum": ["package", "app", "pkg", "feat"]}}, {"name": "ecosystem", "in": "query", "schema": {"type": "string", "enum": ["rpm", "deb", "apk", "pacman", "windows", "macos", "macos_pkgutil", "brew", "optional_feature"]}}, {"name": "source", "in": "query", "schema": {"type": "string", "maxLength": 256}, "description": "Exact source filter (open set, <plugin>.<action>)"}, {"name": "cursor", "in": "query", "schema": {"type": "string", "maxLength": 2048}, "description": "Opaque next_cursor from the previous page"}, {"name": "format", "in": "query", "schema": {"type": "string", "enum": ["json", "csv"]}, "description": "Export mode (limit is the total cap, max 10000)"}, {"name": "limit", "in": "query", "schema": {"type": "integer", "default": 100, "maximum": 1000}}], "responses": {"200": {"description": "{data:{software[], count, next_cursor, devices_omitted, result_truncated_by_cap?, audit_persisted?}}"}, "400": {"description": "Non-integer limit, unknown format, or a refused cursor"}, "401": {"description": "Unauthenticated"}, "403": {"description": "No management-group grant for Inventory:Read (or a service-scoped token whose RBAC/ITServiceOwner grant is missing/RBAC disabled)"}, "503": {"description": "Software inventory store unavailable/degraded, RBAC/management-group/tag store unavailable, or the fleet-read gate unwired"}}}
     },
     "/policy-fragments": {
       "get": {"summary": "List policy fragments (api-parity #4034)", "tags": ["Compliance"], "description": "REST v1 twin of legacy GET /api/policy-fragments; MCP twin list_policy_fragments. Requires Policy:Read.", "parameters": [{"name": "name", "in": "query", "schema": {"type": "string"}, "description": "Substring name filter (optional)"}, {"name": "limit", "in": "query", "schema": {"type": "integer", "default": 100}}], "responses": {"200": {"description": "{data:[{id,name,description,check_instruction,check_compliance,fix_instruction,post_check_instruction,created_at,updated_at}], pagination}"}, "400": {"description": "Non-integer limit"}, "503": {"description": "Policy store not available/degraded"}}}
@@ -9320,32 +9320,42 @@ void RestApiV1::register_routes(
                      return;
                  }
 
-                 SoftwareFleetQuery q;
-                 q.agent_id = req.has_param("agent_id") ? req.get_param_value("agent_id") : "";
-                 q.name = req.has_param("name") ? req.get_param_value("name") : "";
-                 // Clamp in 64-bit BEFORE narrowing (mirror the MCP tool / query_responses):
-                 // limit<1 clamps to 1 and limit>1000 clamps to 1000; clamping in int64
-                 // first stops a negative/wrapped value from binding unbounded and defeating
-                 // the cap. No offset — the scope filter runs AFTER the store LIMIT, so paging
-                 // would yield unstable windows over a sync-mutating table; keyset is the
-                 // #1634 follow-up.
-                 std::int64_t want = 100;
-                 if (req.has_param("limit")) {
-                     try {
-                         want = std::stoll(req.get_param_value("limit"));
-                     } catch (...) {
+                 namespace swc = software_catalogue;
+                 auto parsed = swc::parse_devices_params(req.params);
+                 if (!parsed) {
+                     res.status = parsed.error().status;
+                     res.set_content(detail::error_json_a4(parsed.error().status,
+                                                           parsed.error().message, cid),
+                                     "application/json");
+                     return;
+                 }
+                 auto& rq = *parsed;
+                 auto& q = rq.query;
+                 const bool csv = rq.format == "csv";
+                 const bool continuation = !rq.cursor.empty();
+                 const char* const verb =
+                     rq.export_mode ? "inventory.software.export" : "inventory.software.query";
+
+                 // The cursor is bound to the filter set (never to the scope: the scope only
+                 // narrows what the same keyset position yields).
+                 const std::string fp = swc::devices_fingerprint(q);
+                 if (continuation) {
+                     auto cur = swc::decode_devices_cursor(rq.cursor, fp);
+                     if (!cur) {
                          res.status = 400;
                          res.set_content(
-                             detail::error_json_a4(400, "invalid limit (expected integer)", cid),
+                             detail::error_json_a4(
+                                 400, std::string(swc::cursor_error_message(cur.error())), cid),
                              "application/json");
                          return;
                      }
+                     q.after = *cur;
                  }
-                 q.limit = static_cast<int>(std::clamp<std::int64_t>(want, 1, 1000));
 
-                 const std::string audit_key = !q.name.empty()      ? ("name=" + q.name)
-                                               : !q.agent_id.empty() ? ("agent=" + q.agent_id)
-                                                                     : std::string("fleet");
+                 // Scope: pushed into SQL up to kScopePushdownMaxIds (complete pages, nothing
+                 // hidden); only a wider scope falls back to the in-process post-filter below.
+                 const auto scope_mode = swc::apply_scope(q, gate.scope);
+                 const std::string audit_key = swc::audit_target(q);
 
                  auto rows_opt = software_inventory_store->query_software(q);
                  if (!rows_opt) {
@@ -9356,9 +9366,8 @@ void RestApiV1::register_routes(
                      // outage must still leave a who/when/what trail. Routed through the #1647
                      // throw-safe kernel (NOT raw audit_fn) so a throwing audit sink can't eat
                      // the 503 — exact parity with the MCP sibling's mcp_audit (gov chaos CH-3).
-                     (void)detail::try_persist_audit(audit_fn, req, "inventory.software.query",
-                                                     "failure", "Inventory", audit_key,
-                                                     "store degraded; cid=" + cid);
+                     (void)detail::try_persist_audit(audit_fn, req, verb, "failure", "Inventory",
+                                                     audit_key, "store degraded; cid=" + cid);
                      res.status = 503;
                      res.set_content(
                          detail::error_json_a4(503,
@@ -9369,97 +9378,74 @@ void RestApiV1::register_routes(
                  }
                  auto& rows = *rows_opt;
 
-                 // Cap hit BEFORE scope filtering → result incomplete (the store's hard ceiling
-                 // >> 1000, so the binding cap is q.limit). Captured pre-filter: the filter
-                 // shrinks `rows`. As with the MCP sibling, an empty-filter call is an unbounded
-                 // fleet scan capped at q.limit on a global ORDER BY *before* the per-agent scope
-                 // filter, so a narrow-scope operator may see few of their own rows in one page
-                 // (signalled by result_truncated_by_cap). Narrow-scope completeness over a wide
-                 // fleet is the keyset follow-up (#1634).
+                 // Cap hit BEFORE any post-filtering → the page is full (page mode) or the
+                 // export was cut (export mode). The next keyset position is the LAST SCANNED
+                 // row, so a post-filtered page still advances.
                  const bool hit_cap = rows.size() == static_cast<std::size_t>(q.limit);
+                 const std::string next =
+                     hit_cap ? swc::encode_devices_cursor(rows.back(), fp) : std::string();
 
-                 // Scope filter — the gate's own composed meet(management-group,
-                 // service-scope) VisibleSet (#3290, replaces the retired per-row
-                 // inventory_scope_fn predicate; mirrors the MCP tool /
-                 // query_responses #1550's per-agent-ownership intent, now on the
-                 // real ADR-0017 admit-then-filter mechanism instead of a filter
-                 // layered under a global gate). nullopt (TOP) ⇒ unfiltered — a
-                 // global grant or RBAC-off, byte-identical to the pre-#3290 no-op
-                 // filter path for that caller class.
-                 bool scope_filtered = false;
+                 // Post-filter only for a scope wider than the push-down bound — the gate's own
+                 // composed meet(management-group, service-scope) VisibleSet (#3290).
+                 // `devices_omitted` is DEFINED as the devices hidden by THIS filter (0 under
+                 // push-down, where the SQL already returned only in-scope rows).
                  std::size_t dropped_agents = 0;
-                 if (gate.scope) {
+                 if (scope_mode == swc::ScopeApply::kPostFilter) {
                      std::unordered_set<std::string> dropped_ids;
                      std::vector<SoftwareFleetRow> visible;
                      visible.reserve(rows.size());
                      for (auto& r : rows) {
-                         if (authz::in_scope(gate.scope, r.agent_id)) {
+                         if (authz::in_scope(gate.scope, r.agent_id))
                              visible.push_back(std::move(r));
-                         } else {
-                             scope_filtered = true;
-                             dropped_ids.insert(r.agent_id); // count each DISTINCT dropped device once
-                         }
+                         else
+                             dropped_ids.insert(r.agent_id); // count each DISTINCT device once
                      }
                      rows.swap(visible);
                      dropped_agents = dropped_ids.size();
                  }
 
-                 JArr arr;
-                 for (const auto& r : rows) {
-                     // Blob contract v2 fields ride along; a field the ecosystem
-                     // does not store is "" (honest-empty, never synthesised).
-                     arr.add(JObj()
-                                 .add("agent_id", r.agent_id)
-                                 .add("name", r.entry.name)
-                                 .add("version", r.entry.version)
-                                 .add("publisher", r.entry.publisher)
-                                 .add("install_date", r.entry.install_date)
-                                 .add("kind", r.entry.kind)
-                                 .add("ecosystem", r.entry.ecosystem)
-                                 .add("epoch", r.entry.epoch)
-                                 .add("release", r.entry.release)
-                                 .add("arch", r.entry.arch)
-                                 .add("signature_status", r.entry.signature_status)
-                                 .add("distro_id", r.entry.distro_id)
-                                 .add("distro_version", r.entry.distro_version));
-                 }
-
                  // Audit posture: SET-AND-PROCEED (see route header) — capture the persist
                  // bool, surface audit_persisted:false, never withhold. Routed through the
-                 // #1647 throw-safe kernel `try_persist_audit` (NOT raw audit_fn) so a throwing
-                 // audit sink returns false → audit_persisted:false instead of escaping the
-                 // lambda as a 500 with no trail — exact throw-safety parity with the MCP
-                 // sibling's mcp_audit (gov chaos CH-3). We use the kernel, NOT the fail-closed
-                 // emit_behavioral_audit, because this machine-scope data is set-and-proceed.
-                 // A scope-dropped read is security-relevant → audit it distinctly with the
-                 // DISTINCT dropped count.
+                 // #1647 throw-safe kernel `try_persist_audit` so a throwing audit sink returns
+                 // false instead of escaping as a 500 with no trail. `success` is written on
+                 // EVERY call (continuation pages tagged page=continuation): the cursor is
+                 // opaque but unauthenticated, so per-call audit keeps a forged cursor from
+                 // walking the fleet unrecorded. A post-filter drop is audited distinctly.
                  bool denied_ok = true;
-                 if (scope_filtered)
+                 if (dropped_agents > 0)
                      denied_ok = detail::try_persist_audit(
-                         audit_fn, req, "inventory.software.query", "denied", "Inventory", audit_key,
+                         audit_fn, req, verb, "denied", "Inventory", audit_key,
                          "scope: filtered " + std::to_string(dropped_agents) +
                              " out-of-scope device(s) (management-group and/or service-tag "
                              "axis); cid=" +
                              cid);
+                 const std::string detail_text =
+                     (rq.export_mode ? "installs format=" + (csv ? std::string("csv")
+                                                                  : std::string("json")) +
+                                           " rows=" + std::to_string(rows.size()) +
+                                           " truncated=" + (hit_cap ? "true" : "false")
+                                     : "rows=" + std::to_string(rows.size())) +
+                     (continuation ? " page=continuation" : "") + " cid=" + cid;
                  const bool audit_ok =
-                     detail::try_persist_audit(audit_fn, req, "inventory.software.query", "success",
-                                               "Inventory", audit_key,
-                                               "rows=" + std::to_string(arr.size()) + " cid=" + cid) &&
+                     detail::try_persist_audit(audit_fn, req, verb, "success", "Inventory",
+                                               audit_key, detail_text) &&
                      denied_ok;
 
-                 JObj data;
-                 data.raw("software", arr.str());
-                 data.add("count", arr.size());
-                 // Surface the count of devices dropped by the scope filter (0 when none) so an
-                 // agentic caller can tell "out of my scope" from "not installed anywhere": a
-                 // positive value means matching software exists outside the caller's scope
-                 // (gov UP-12 false-negative guard). The audit row carries it too.
-                 data.add("devices_omitted", static_cast<int64_t>(dropped_agents));
-                 if (hit_cap)
-                     data.add("result_truncated_by_cap", true);
+                 if (csv) {
+                     res.set_header("Content-Disposition",
+                                    "attachment; filename=\"software-installs.csv\"");
+                     if (hit_cap)
+                         res.set_header("X-Result-Truncated-By-Cap", "true");
+                     if (!audit_ok)
+                         res.set_header("Sec-Audit-Failed", "true");
+                     res.set_content(swc::installs_csv(rows), "text/csv; charset=utf-8");
+                     return;
+                 }
+                 auto body = swc::devices_response_json(
+                     rows, next, static_cast<std::int64_t>(dropped_agents), hit_cap);
                  if (!audit_ok)
-                     data.add("audit_persisted", false);
-                 res.set_content(ok_json(data.str()), "application/json");
+                     body["audit_persisted"] = false;
+                 res.set_content(ok_json(swc::dump_safe(body)), "application/json");
              });
 
     // ── Devices (#4033, #2146 API-parity Batch A) ─────────────────────────

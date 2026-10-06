@@ -110,6 +110,13 @@ document's generated block going stale relative to a fresh render. See
 unit-test half (RestApiV1's own `register_routes()` vs `openapi_spec()`,
 plus `$ref` validity) - the #842 companion to this whole-tree script.
 
+**REST-only exports (deliberate).** The software catalogue's exports - `format=csv` on
+`GET /api/v1/inventory/software/catalogue` and `format=csv|json` on
+`GET /api/v1/inventory/software` - have no MCP tool. An agent reads the same data page by page
+through the cursor on `query_software_catalogue` / `query_installed_software`; a bulk file
+download is a human/automation convenience, so the ledger rows for those routes are `twinned` on
+the paged shape and the export mode is recorded here rather than as a separate row.
+
 ## Summary
 
 <!-- BEGIN GENERATED: check-api-parity.py - do not hand-edit; regenerate with `python3 scripts/ci/check-api-parity.py --render-doc` and splice between these markers -->
@@ -117,7 +124,7 @@ plus `$ref` validity) - the #842 companion to this whole-tree script.
 | Domain | Rows | Twinned | Untwinned |
 |---|---:|---:|---:|
 | devices | 14 | 9 | 5 |
-| inventory | 7 | 2 | 5 |
+| inventory | 7 | 3 | 4 |
 | dex | 26 | 18 | 8 |
 | guardian | 16 | 6 | 10 |
 | tar | 12 | 4 | 8 |
@@ -139,11 +146,11 @@ plus `$ref` validity) - the #842 companion to this whole-tree script.
 | ota | 15 | 0 | 15 |
 | enrollment | 19 | 5 | 14 |
 | other | 74 | 13 | 61 |
-| **Total** | **286** | **82** | **204** |
+| **Total** | **286** | **83** | **203** |
 
-Registered `/api/vN/*` routes: 246. OpenAPI `paths` entries: 245. Missing from OpenAPI: 1 (1 carried in `check-api-parity.py`'s `ALLOWLIST_OPENAPI_MISSING` pending F2, 0 unallowlisted). MCP tools: 184.
+Registered `/api/vN/*` routes: 246. OpenAPI `paths` entries: 245. Missing from OpenAPI: 1 (1 carried in `check-api-parity.py`'s `ALLOWLIST_OPENAPI_MISSING` pending F2, 0 unallowlisted). MCP tools: 186.
 
-Ratchet baseline (untwinned rows; shrinks as routes are twinned, or rises only with a reviewed reason stated in the change that raises it): 204.
+Ratchet baseline (untwinned rows; shrinks as routes are twinned, or rises only with a reviewed reason stated in the change that raises it): 203.
 
 <!-- END GENERATED -->
 

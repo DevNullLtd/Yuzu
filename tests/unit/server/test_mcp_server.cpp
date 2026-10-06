@@ -86,6 +86,7 @@
 #include "test_offload_target_store_pg_helper.hpp" // OffloadTargetStorePg — shared PG+SecretCodec fixture
 
 #include <yuzu/metrics.hpp>
+#include <algorithm>
 
 #include <catch2/catch_approx.hpp>
 #include <catch2/catch_test_macros.hpp>
@@ -796,6 +797,7 @@ TEST_CASE("MCP AuditStore: query with mcp_tool field", "[pg][mcp][audit]") {
 
 #include "pg/pg_exec.hpp"               // exec_params — degrade the store in the [pg] degrade test
 #include "pg/pg_pool.hpp"               // PgPool for the query_installed_software [pg] test
+#include "software_catalogue_model.hpp"  // kScopePushdownMaxIds / the catalogue twins
 #include "pg/pg_raii.hpp"               // PgResult
 #include "dex_app_perf_model.hpp"      // the app-perf read types
 #include "software_inventory_store.hpp"  // typed daily-sync store (ADR-0016)
@@ -19402,7 +19404,9 @@ TEST_CASE("MCP query_installed_software: fleet rows scoped to the caller's group
     CHECK(row.at("distro_id").get<std::string>().empty());
     CHECK(row.at("distro_version").get<std::string>().empty());
 
-    // The drop is audited distinctly as a denied event, alongside the success row.
+    // The scope {agent-in} is within the SQL push-down bound, so agent-out was never read and
+    // nothing was dropped: NO denied entry (that row now means the post-filter hid devices),
+    // only the success row.
     bool saw_denied = false, saw_success = false;
     for (const auto& a : ts.audit_log) {
         if (a == "mcp.query_installed_software|denied")
@@ -19410,8 +19414,9 @@ TEST_CASE("MCP query_installed_software: fleet rows scoped to the caller's group
         if (a == "mcp.query_installed_software|success")
             saw_success = true;
     }
-    CHECK(saw_denied);
+    CHECK_FALSE(saw_denied);
     CHECK(saw_success);
+    CHECK(row.at("source").get<std::string>().empty()); // 14th field present, honest-empty
 
     // #2712/adversarial-review-of-PR#2978: structuredContent wraps the SAME
     // rows under "software" (content[0].text stays the legacy bare array),
@@ -19424,8 +19429,122 @@ TEST_CASE("MCP query_installed_software: fleet rows scoped to the caller's group
     CHECK(sc["software"] == rows_json);
     REQUIRE(sc.contains("devices_omitted"));
     CHECK(sc["devices_omitted"].is_number_integer());
-    CHECK(sc["devices_omitted"].get<int>() == 1); // agent-out, the one dropped device
+    CHECK(sc["devices_omitted"].get<int>() == 0); // pushed into SQL: agent-out never scanned
     CHECK_FALSE(sc.contains("audit_persisted")); // fake test audit_fn succeeds
+    REQUIRE(sc.contains("next_cursor"));
+    CHECK(sc["next_cursor"].is_null());
+    CHECK(envelope.at("result").at("next_cursor").is_null());
+}
+
+TEST_CASE("MCP query_installed_software: a scope wider than the push-down bound post-filters, "
+          "reports devices_omitted and audits denied",
+          "[mcp][pg][inventory]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::SoftwareInventoryStore store{pool};
+    REQUIRE(store.is_open());
+    std::vector<yuzu::server::SoftwareEntry> rows = {{"Chrome", "119", "Google", ""}};
+    for (const char* agent : {"agent-in", "agent-out"})
+        REQUIRE(store.apply_installed_software(
+                    agent, yuzu::server::SoftwareInventoryStore::canonical_hash(rows), rows, 1000) ==
+                yuzu::server::InventoryIngestOutcome::kStored);
+
+    McpTestServer ts;
+    ts.software_inventory_store_for_test = &store;
+    ts.fleet_read_fn_for_test = [](const httplib::Request&, httplib::Response&,
+                                   const std::string&,
+                                   const std::string&) -> yuzu::server::authz::FleetReadGate {
+        std::unordered_set<std::string> ids{"agent-in"};
+        for (std::size_t i = 0; i <= yuzu::server::software_catalogue::kScopePushdownMaxIds; ++i)
+            ids.insert("pad-" + std::to_string(i));
+        return {true, std::move(ids)};
+    };
+    ts.start();
+
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/call","id":77,)"
+                       R"("params":{"name":"query_installed_software","arguments":{"name":"Chrome"}}})");
+    REQUIRE(res->status == 200);
+    auto sc = nlohmann::json::parse(res->body).at("result").at("structuredContent");
+    CHECK(sc["software"].size() == 1);
+    CHECK(sc["devices_omitted"].get<int>() == 1);
+    bool saw_denied = false;
+    for (const auto& a : ts.audit_log)
+        saw_denied = saw_denied || a == "mcp.query_installed_software|denied";
+    CHECK(saw_denied);
+}
+
+TEST_CASE("MCP query_installed_software: version, cursor walk and source; legacy envelope kept",
+          "[mcp][pg][inventory]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::SoftwareInventoryStore store{pool};
+    REQUIRE(store.is_open());
+    yuzu::server::SoftwareEntry a{"A", "1.0", "", ""}, b{"B", "2.0", "", ""}, c{"C", "", "", ""};
+    a.source = b.source = c.source = "installed_apps.list_inventory";
+    std::vector<yuzu::server::SoftwareEntry> rows = {a, b, c};
+    REQUIRE(store.apply_installed_software(
+                "agent-1", yuzu::server::SoftwareInventoryStore::canonical_hash(rows), rows, 1000) ==
+            yuzu::server::InventoryIngestOutcome::kStored);
+
+    McpTestServer ts;
+    ts.software_inventory_store_for_test = &store;
+    ts.start();
+    auto call = [&](const std::string& args) {
+        auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/call","id":9,)"
+                           R"("params":{"name":"query_installed_software","arguments":)" + args + "}}");
+        REQUIRE(res->status == 200);
+        return nlohmann::json::parse(res->body);
+    };
+    // version filter (present-empty selects the empty-version rows)
+    CHECK(call(R"({"version":"2.0"})").at("result").at("structuredContent")["software"].size() == 1);
+    CHECK(call(R"({"version":""})").at("result").at("structuredContent")["software"][0]["name"] == "C");
+
+    // keyset walk: legacy content[0].text stays the BARE rows array; next_cursor rides beside it
+    auto p1 = call(R"({"limit":2})");
+    auto rows1 = nlohmann::json::parse(p1.at("result").at("content").at(0).at("text").get<std::string>());
+    REQUIRE(rows1.is_array());
+    CHECK(rows1.size() == 2);
+    CHECK(rows1[0].at("source") == "installed_apps.list_inventory");
+    const auto cursor = p1.at("result").at("next_cursor").get<std::string>();
+    CHECK(p1.at("result").at("structuredContent").at("next_cursor") == cursor);
+    auto p2 = call(R"({"limit":2,"cursor":")" + cursor + R"("})");
+    CHECK(p2.at("result").at("structuredContent")["software"].size() == 1);
+    CHECK(p2.at("result").at("next_cursor").is_null());
+
+    // a refused cursor is kInvalidParams
+    auto bad = call(R"({"limit":2,"cursor":"garbage"})");
+    REQUIRE(bad.contains("error"));
+    CHECK(bad["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+}
+
+TEST_CASE("MCP query_installed_software: a confined scope gets a COMPLETE page (push-down)",
+          "[mcp][pg][inventory]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::SoftwareInventoryStore store{pool};
+    REQUIRE(store.is_open());
+    std::vector<yuzu::server::SoftwareEntry> rows = {{"Common", "1", "", ""}};
+    for (const char* agent : {"a1", "a2", "a3", "z1", "z2"})
+        REQUIRE(store.apply_installed_software(
+                    agent, yuzu::server::SoftwareInventoryStore::canonical_hash(rows), rows, 1000) ==
+                yuzu::server::InventoryIngestOutcome::kStored);
+    McpTestServer ts;
+    ts.software_inventory_store_for_test = &store;
+    ts.fleet_read_fn_for_test = [](const httplib::Request&, httplib::Response&,
+                                   const std::string&,
+                                   const std::string&) -> yuzu::server::authz::FleetReadGate {
+        return {true, std::unordered_set<std::string>{"z1", "z2"}};
+    };
+    ts.start();
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/call","id":9,)"
+                       R"("params":{"name":"query_installed_software","arguments":{"limit":2}}})");
+    REQUIRE(res->status == 200);
+    auto sc = nlohmann::json::parse(res->body).at("result").at("structuredContent");
+    CHECK(sc["software"].size() == 2); // a post-filter over a limit-2 scan would have returned 0
+    CHECK(sc["devices_omitted"].get<int>() == 0);
 }
 
 // require_fleet_read's own doc comment: unwired = misconfiguration, FAILS
@@ -19502,6 +19621,238 @@ TEST_CASE("MCP query_installed_software: a degraded store errors, never success+
         if (a == "mcp.query_installed_software|failure") // file-wide audit-status convention
             saw_failure_audit = true;
     CHECK(saw_failure_audit);
+}
+
+// ── M.9 PR-2: query_software_catalogue / get_software_versions ───────────────
+
+namespace {
+using yuzu::server::SoftwareEntry;
+using yuzu::server::SoftwareInventoryStore;
+
+void catalogue_seed(SoftwareInventoryStore& store) {
+    auto put = [&](const char* agent, std::vector<SoftwareEntry> rows) {
+        REQUIRE(store.apply_installed_software(
+                    agent, SoftwareInventoryStore::canonical_hash(rows), rows, 1000) ==
+                yuzu::server::InventoryIngestOutcome::kStored);
+    };
+    SoftwareEntry git1{"git", "2.40", "Git SCM", ""}, git2{"git", "2.39", "Git SCM", ""},
+        git3{"git", "2.41", "Fedora", ""}, chrome{"Chrome", "126", "Google", ""};
+    git1.kind = git2.kind = git3.kind = "package";
+    git1.ecosystem = git2.ecosystem = "brew";
+    git3.ecosystem = "rpm";
+    chrome.kind = "app";
+    chrome.ecosystem = "macos";
+    put("d1", {git1, chrome});
+    put("d2", {git2});
+    put("d3", {git3});
+    REQUIRE(store.refresh_catalog_rollup());
+}
+
+nlohmann::json mcp_tool_call(McpTestServer& ts, const std::string& name, const std::string& args) {
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/call","id":7,"params":{"name":")" + name +
+                       R"(","arguments":)" + args + "}}");
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    return nlohmann::json::parse(res->body);
+}
+
+std::size_t mcp_audits(const McpTestServer& ts, const std::string& entry) {
+    return static_cast<std::size_t>(std::ranges::count(ts.audit_log, entry));
+}
+} // namespace
+
+TEST_CASE("MCP catalogue twins: tools/list advertises both, read-only, with typed schemas and "
+          "vocabulary enums",
+          "[mcp][inventory]") {
+    McpTestServer ts;
+    ts.start();
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/list","id":1})");
+    const auto tools = nlohmann::json::parse(res->body)["result"]["tools"];
+    int found = 0;
+    for (const auto& t : tools) {
+        const auto name = t["name"].get<std::string>();
+        if (name != "query_software_catalogue" && name != "get_software_versions")
+            continue;
+        ++found;
+        CHECK(t["annotations"]["readOnlyHint"] == true);
+        CHECK(t["annotations"]["idempotentHint"] == true);
+        CHECK_FALSE(t["inputSchema"]["properties"].empty());
+        CHECK_FALSE(t["outputSchema"]["properties"].empty());
+        CHECK(t["inputSchema"]["properties"]["kind"]["enum"] ==
+              nlohmann::json::array({"package", "app", "pkg", "feat"}));
+        CHECK(t["inputSchema"]["properties"]["ecosystem"]["enum"].size() == 9);
+        if (name == "query_software_catalogue")
+            CHECK(t["outputSchema"]["properties"].contains("totals"));
+    }
+    CHECK(found == 2);
+}
+
+TEST_CASE("MCP catalogue twins: a service-scoped token is denied at C8 before the handler",
+          "[mcp][inventory][security][service_scope]") {
+    McpTestServer ts;
+    ts.mock_token_scope_service = "printers";
+    ts.start("readonly");
+    for (const char* tool : {"query_software_catalogue", "get_software_versions"}) {
+        auto body = mcp_tool_call(ts, tool, R"({"name":"git"})");
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kPermissionDenied);
+    }
+}
+
+TEST_CASE("MCP catalogue twins: unwired store is an internal error", "[mcp][inventory]") {
+    McpTestServer ts; // no software_inventory_store wired
+    ts.start();
+    for (const char* tool : {"query_software_catalogue", "get_software_versions"}) {
+        auto body = mcp_tool_call(ts, tool, R"({"name":"git"})");
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+    }
+}
+
+TEST_CASE("MCP catalogue twins: fleet rows, totals and kpis; cursor continuation; strict input",
+          "[mcp][pg][inventory]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    SoftwareInventoryStore store{pool};
+    REQUIRE(store.is_open());
+    catalogue_seed(store);
+
+    McpTestServer ts;
+    ts.software_inventory_store_for_test = &store;
+    ts.start();
+
+    auto first = mcp_tool_call(ts, "query_software_catalogue", R"({"limit":1})");
+    REQUIRE_FALSE(first.contains("error"));
+    const auto sc = first["result"]["structuredContent"];
+    CHECK(sc["titles"].size() == 1);
+    CHECK(sc["titles"][0]["name"] == "git");
+    CHECK(sc["totals"]["titles"] == 2);
+    CHECK(sc["totals"]["installs"] == 4);
+    CHECK(sc["kpis"]["installs"] == 4);
+    CHECK_FALSE(sc["kpis"]["coverage"].contains("pct"));
+    // content[0].text is the dump of the same object
+    CHECK(nlohmann::json::parse(first["result"]["content"][0]["text"].get<std::string>()) == sc);
+    const auto cursor = sc["next_cursor"].get<std::string>();
+
+    auto second = mcp_tool_call(ts, "query_software_catalogue",
+                                R"({"limit":1,"cursor":")" + cursor + R"("})");
+    REQUIRE_FALSE(second.contains("error"));
+    CHECK(second["result"]["structuredContent"]["kpis"].is_null());
+    CHECK(second["result"]["structuredContent"]["titles"][0]["name"] == "Chrome");
+    // audited on the first AND the continuation page
+    CHECK(mcp_audits(ts, "mcp.query_software_catalogue|success") == 2);
+
+    // a tampered cursor and a cursor for other filters are kInvalidParams
+    auto bad = mcp_tool_call(ts, "query_software_catalogue",
+                             R"({"limit":1,"cursor":")" + cursor + R"(!"})");
+    REQUIRE(bad.contains("error"));
+    CHECK(bad["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    auto other = mcp_tool_call(ts, "query_software_catalogue",
+                               R"({"limit":1,"kind":"app","cursor":")" + cursor + R"("})");
+    REQUIRE(other.contains("error"));
+    CHECK(other["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+
+    // strict schema (documented divergence from REST's clamp)
+    for (const char* args : {R"({"limit":0})", R"({"limit":5000})", R"({"kind":"nope"})"}) {
+        CAPTURE(args);
+        auto r = mcp_tool_call(ts, "query_software_catalogue", args);
+        REQUIRE(r.contains("error"));
+        CHECK(r["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    }
+}
+
+TEST_CASE("MCP catalogue twins: confined caller — fleet denied, in-scope host admitted with newest "
+          "omitted, out-of-scope host empty",
+          "[mcp][pg][inventory][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    SoftwareInventoryStore store{pool};
+    REQUIRE(store.is_open());
+    catalogue_seed(store);
+
+    McpTestServer ts;
+    ts.software_inventory_store_for_test = &store;
+    ts.fleet_read_fn_for_test = [](const httplib::Request&, httplib::Response&,
+                                   const std::string&,
+                                   const std::string&) -> yuzu::server::authz::FleetReadGate {
+        return {true, std::unordered_set<std::string>{"d1"}};
+    };
+    ts.start();
+
+    for (const char* tool : {"query_software_catalogue", "get_software_versions"}) {
+        auto body = mcp_tool_call(ts, tool, R"({"name":"git"})");
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kPermissionDenied);
+    }
+    auto host = mcp_tool_call(ts, "query_software_catalogue", R"({"agent_id":"d1"})");
+    REQUIRE_FALSE(host.contains("error"));
+    const auto h = host["result"]["structuredContent"];
+    CHECK(h["titles"].size() == 2);
+    CHECK(h["titles"][1]["newest_version"] == "");
+    CHECK(h["newest_omitted"] == true);
+    auto ver = mcp_tool_call(ts, "get_software_versions", R"({"name":"git","agent_id":"d1"})");
+    const auto v = ver["result"]["structuredContent"];
+    CHECK(v["newest_omitted"] == true);
+    for (const auto& row : v["versions"])
+        CHECK(row["newest"] == false);
+
+    auto out = mcp_tool_call(ts, "query_software_catalogue", R"({"agent_id":"d2"})");
+    const auto o = out["result"]["structuredContent"];
+    CHECK(o["titles"].empty());
+    CHECK(o["devices_omitted"] == 1);
+    CHECK(mcp_audits(ts, "mcp.query_software_catalogue|denied") >= 1);
+}
+
+TEST_CASE("MCP get_software_versions: newest mark, filters and truncation", "[mcp][pg][inventory]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    SoftwareInventoryStore store{pool};
+    REQUIRE(store.is_open());
+    catalogue_seed(store);
+
+    McpTestServer ts;
+    ts.software_inventory_store_for_test = &store;
+    ts.start();
+    auto all = mcp_tool_call(ts, "get_software_versions", R"({"name":"git"})");
+    const auto a = all["result"]["structuredContent"];
+    CHECK(a["count"] == 3);
+    CHECK(a["truncated"] == false);
+    int newest = 0;
+    for (const auto& r : a["versions"])
+        newest += r["newest"].get<bool>() ? 1 : 0;
+    CHECK(newest == 1);
+    CHECK(mcp_tool_call(ts, "get_software_versions", R"({"name":"git","ecosystem":"brew"})")
+              ["result"]["structuredContent"]["count"] == 2);
+    CHECK(mcp_tool_call(ts, "get_software_versions", R"({"name":"git","limit":2})")
+              ["result"]["structuredContent"]["truncated"] == true);
+    CHECK(mcp_audits(ts, "mcp.get_software_versions|success") == 3);
+}
+
+TEST_CASE("MCP catalogue twins: a degraded store is a retryable internal error, never an empty "
+          "result",
+          "[mcp][pg][inventory]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 1}};
+    REQUIRE(pool.valid());
+    SoftwareInventoryStore store{pool};
+    REQUIRE(store.is_open());
+
+    auto held = pool.acquire(); // starve the pool
+    McpTestServer ts;
+    ts.software_inventory_store_for_test = &store;
+    ts.start();
+    for (const char* tool : {"query_software_catalogue", "get_software_versions"}) {
+        auto body = mcp_tool_call(ts, tool, R"({"name":"git"})");
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+        CHECK(body["error"]["data"]["retry_after_ms"] == yuzu::server::mcp::kMcpStoreFaultRetryMs);
+        CHECK_FALSE(body.contains("result"));
+    }
+    CHECK(mcp_audits(ts, "mcp.query_software_catalogue|failure") == 1);
+    CHECK(mcp_audits(ts, "mcp.get_software_versions|failure") == 1);
 }
 
 // ── preview_management_group_agent_count (#4033, #2146 API-parity Batch A) ──
