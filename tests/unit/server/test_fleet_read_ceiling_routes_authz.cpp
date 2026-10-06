@@ -10,6 +10,7 @@
  * is revoked from ITServiceOwner, so a route that passed some other pair to the gate fails.
  */
 
+#include "compliance_routes.hpp"
 #include "enrollment_directory_routes.hpp"
 #include "execution_routes.hpp"
 #include "execution_tracker.hpp"
@@ -351,6 +352,101 @@ TEST_CASE("fleet-read routes real gate: each route answers the ceiling for exact
                 CHECK(has(body, kCeilingSuffix));
             } else {
                 CHECK_FALSE(ceiling_refused(sites[j]));
+            }
+        }
+    }
+}
+
+// The Policy and Workflow call sites (#3526 ledger row qe-ceiling-route-wiring-pinned-for-one-of-
+// eight-securables): GET /api/v1/compliance/{id} (ComplianceRoutes, "Policy"), and the legacy
+// GET /api/workflow-executions/{id} plus its v1 twin GET /api/v1/workflow-executions/{id}
+// (WorkflowRoutes, "Workflow"). ITServiceOwner holds Policy CRUD and Workflow:Read under the
+// seeded defaults (rbac_store.cpp), so a service token minted by a user holding both pairs
+// passes the ceiling on all three. The rig wires neither a ComplianceApi, a WorkflowEngine nor a
+// WorkflowApi, so a request the gate admits answers that route's own 503 "service unavailable".
+// Revoking one securable from ITServiceOwner must refuse exactly the sites that gate on it with
+// the ceiling's own 403, never touching the minter's ordinary session.
+TEST_CASE("fleet-read routes real gate: Policy and Workflow sites answer the ceiling for exactly "
+          "their own securable",
+          "[pg][workflow][compliance][confinement][authz][service_scope]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::response_execution_authz_tpl);
+    CeilingRouteRig r{db.dsn()};
+    REQUIRE(r.rig.rbac.create_role({"PolicyWorkflowReader3526", "", false, 0}).has_value());
+    for (const char* securable : {"Policy", "Workflow"})
+        REQUIRE(r.rig.rbac.set_permission({"PolicyWorkflowReader3526", securable, "Read", "allow"})
+                    .has_value());
+    REQUIRE(r.rig.rbac.assign_role({"user", "gary", "PolicyWorkflowReader3526"}).has_value());
+
+    GateFns g = make_gate_fns(*r.svc_auth);
+    yuzu::server::test::TestRouteSink sink;
+
+    ComplianceRoutes compliance;
+    compliance.register_routes(sink, g.auth_fn, g.perm_fn, g.audit_fn, /*api=*/nullptr,
+                               /*agents_json_fn=*/{}, g.fleet_fn);
+
+    WorkflowRoutes wf;
+    WorkflowRoutes::Deps wd;
+    wd.auth_fn = g.auth_fn;
+    wd.perm_fn = g.perm_fn;
+    wd.fleet_read_fn = g.fleet_fn;
+    wd.audit_fn = [](const httplib::Request&, const std::string&, const std::string&,
+                     const std::string&, const std::string&, const std::string&) {};
+    wd.execution_tracker = &r.tracker;
+    wf.register_routes(sink, std::move(wd));
+
+    struct Site {
+        const char* securable;
+        std::string path;
+    };
+    // Policy is listed first, so after the first revoke the Workflow sites must still pass the
+    // ceiling (a Workflow site handed "Policy" is refused there) and after the second the Policy
+    // site must still be refused (a Policy site handed "Workflow" would have passed at the first).
+    const std::vector<Site> sites = {
+        {"Policy", "/api/v1/compliance/pol-3526"},
+        {"Workflow", "/api/workflow-executions/wx-3526"},
+        {"Workflow", "/api/v1/workflow-executions/wx-3526"},
+    };
+    const auto svc = r.mint_service("gary", "printers");
+    const auto ordinary = r.mint_service("gary", "");
+    const auto get = [&](const Site& site, const std::string& token) {
+        auto res = sink.dispatch("GET", site.path, {}, "application/json",
+                                 {{"Authorization", "Bearer " + token}});
+        REQUIRE(res);
+        return std::pair{res->status, res->body};
+    };
+    // Admitted by the gate: the route's own unwired-dependency 503, neither the ceiling's 403
+    // nor a 401.
+    const auto passes_gate = [&](const Site& site, const std::string& token) {
+        auto [code, body] = get(site, token);
+        return code == 503 && has(body, "service unavailable") && !has(body, kCeilingSuffix);
+    };
+
+    for (const auto& site : sites) {
+        INFO("seeded defaults: " << site.path);
+        CHECK(passes_gate(site, ordinary));
+        CHECK(passes_gate(site, svc));
+    }
+
+    // Revoke one securable at a time, in the order of the first appearance in `sites`.
+    for (const char* revoked : {"Policy", "Workflow"}) {
+        REQUIRE(r.rig.rbac.remove_permission("ITServiceOwner", revoked, "Read").has_value());
+        for (const auto& site : sites) {
+            INFO("revoked ITServiceOwner " << revoked << ":Read, probing " << site.path);
+            // The minter's ordinary session never meets the ceiling.
+            CHECK(passes_gate(site, ordinary));
+            // Policy goes first, so the Policy site is refused from the first revoke on; the
+            // Workflow sites are refused only once Workflow itself has been revoked.
+            const bool refused =
+                std::string(revoked) == "Workflow" || std::string(site.securable) == "Policy";
+            if (refused) {
+                auto [code, body] = get(site, svc);
+                CHECK(code == 403);
+                CHECK(has(body, std::string("service-scoped token does not grant ") +
+                                    site.securable + ":Read"));
+                CHECK(has(body, kCeilingSuffix));
+                CHECK_FALSE(has(body, "\"permission\""));
+            } else {
+                CHECK(passes_gate(site, svc));
             }
         }
     }
