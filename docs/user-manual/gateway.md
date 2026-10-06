@@ -595,6 +595,18 @@ runs are marked below.)
   in-flight slots is kept free for it, so a long backlog of held notifications
   cannot stop the replay from advancing. Notification throughput is one slot
   lower during a replay.
+- **Peer address.** The peer address of a notification is the agent's
+  `:authority` header (or `x-forwarded-for`), so the agent controls every byte of
+  it. The gateway sanitises it where the `Register` call reads it and again where
+  the notification is admitted to the store: a value that is not valid UTF-8
+  becomes `invalid`, and a longer one is cut to 255 bytes at a character
+  boundary. The sanitised value is the one kept in the pending registration, in
+  the per-agent process, in the `Agent <id> connected from <address>` log line and in the
+  `peer_addr` of the notification, which is the only place it reaches the wire
+  (`ProxyRegister` forwards the agent's `RegisterRequest` as received and carries
+  no gateway peer address). A legitimate DNS name with a port can reach about 259
+  bytes in the pathological maximum and would be cut: cosmetic, because the field
+  is informational (an audit trail value) (INFERRED from the code).
 - **Volatile.** The pending store is memory only. It is lost when the upstream
   client process restarts and when the gateway stops; nothing is flushed at
   shutdown. A notification that an ordinary worker started and that then failed (a
@@ -2181,7 +2193,9 @@ env keys with defaults, which a reverted build ignores.
     killed worker) loses it. This is not new and is not counted. Ordinary
     notification results do not drive the breaker either; only the probe
     resolves its own failure. Measured (OBSERVED): with the server stopped by SIGSTOP and resumed 12 s later,
-    10 of 10 notification workers timed out after about 6 s and logged `Failed to
+    10 of 10 notification workers timed out (the 5 s call timeout; the 6.05 s in
+    the rig notes is measured from the SIGSTOP, and the requests were dispatched
+    about 1 s later) and logged `Failed to
     notify stream status`, yet all 10 events still took effect at the server,
     because the requests were already in the frozen server's socket buffer. When
     the frozen server was killed and restarted instead, 0 of 10 stop notifications
