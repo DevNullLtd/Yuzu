@@ -110,9 +110,9 @@
 %%%
 %%% Configuration (sys.config / application env):
 %%%   circuit_breaker_failure_threshold   — consecutive failures to trip (default 5)
-%%%   circuit_breaker_reset_timeout_ms    — initial open duration
+%%%   circuit_breaker_reset_timeout_ms    - initial open duration
 %%%                                          (default 10000, valid 1..3600000)
-%%%   circuit_breaker_max_reset_timeout_ms — max backoff cap
+%%%   circuit_breaker_max_reset_timeout_ms - max backoff cap
 %%%                                          (default 300000, valid 1..3600000)
 %%%   registration_replay_spacing_ms      - gap between replay RPCs
 %%%                                          (default 20, valid 0..60000)
