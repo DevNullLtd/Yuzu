@@ -170,7 +170,11 @@ std::string render_hardware_action_result(const std::string& plugin, const std::
 class HardwareRoutes {
 public:
     using AuthFn = InventoryRoutes::AuthFn;
-    using ScopedPermFn = InventoryRoutes::ScopedPermFn;
+    /// Per-device tier + management-group scope gate (wraps require_scoped_permission).
+    using ScopedPermFn =
+        std::function<bool(const httplib::Request&, httplib::Response&,
+                           const std::string& securable_type, const std::string& operation,
+                           const std::string& agent_id)>;
     using AuditFn = InventoryRoutes::AuditFn;
 
     /// The route's SOLE authorization gate for the fleet-wide list + its REST twin.

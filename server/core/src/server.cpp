@@ -17588,7 +17588,6 @@ private:
             }
             return result;
         };
-        auto hw_roster_fn = build_hw_roster;
         // One device's identity row for the Hardware CI record — checks the live
         // registry first (online, authoritative hostname/OS), else falls back to a
         // linear scan of the same 30-day offline_endpoint_store_ roster the list
@@ -17743,7 +17742,7 @@ private:
         // successor UI to the Inventory tab's Devices sub-tab (nav-split: Software
         // stays under /inventory's old routes; Hardware is the new CI surface).
         // `fleet_read_fn` is the SOLE gate on the list + REST twin (admit-then-filter,
-        // ADR-0017) — `hw_roster_fn` is deliberately UNFILTERED, matching
+        // ADR-0017) — `build_hw_roster` is deliberately UNFILTERED, matching
         // `FleetReadFn`'s own contract (never stack a second scope predicate).
         hardware_routes_ = std::make_unique<HardwareRoutes>();
         hardware_routes_->register_routes(
@@ -17752,7 +17751,7 @@ private:
                              .scoped_perm_fn = scoped_perm_fn,
                              .fleet_read_fn = fleet_read_fn,
                              .audit_fn = audit_fn,
-                             .roster_fn = hw_roster_fn,
+                             .roster_fn = build_hw_roster,
                              .ci_detail_fn = hw_ci_detail_fn,
                              // Actions lens (generic action runner): the connected
                              // agent's advertised plugins/actions, copied into the

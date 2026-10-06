@@ -21,7 +21,6 @@
 
 #include <yuzu/server/auth.hpp>
 
-#include "device_inventory_store.hpp"    // DeviceCiRecord / CiReadError (Hardware CI consumers)
 #include "software_inventory_store.hpp" // SoftwareCatalogRow / SoftwareVersionCount / SoftwareEntry / SoftwareFleetRow / *Query
 
 #include <httplib.h>
@@ -162,11 +161,6 @@ public:
         std::function<std::optional<auth::Session>(const httplib::Request&, httplib::Response&)>;
     using PermFn = std::function<bool(const httplib::Request&, httplib::Response&,
                                       const std::string& securable_type, const std::string& operation)>;
-    /// Per-device tier + management-group scope gate (wraps require_scoped_permission).
-    using ScopedPermFn =
-        std::function<bool(const httplib::Request&, httplib::Response&,
-                           const std::string& securable_type, const std::string& operation,
-                           const std::string& agent_id)>;
 
     /// FLEET-WIDE software catalogue / version drill / fleet name query. Each returns
     /// nullopt on a store degrade (the renderer shows the banner). Empty closures =

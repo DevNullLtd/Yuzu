@@ -14,7 +14,8 @@
 /// riding along in the same `list_device_ci(0)` read is inert — it is looked at,
 /// never attached, and never rendered.
 
-#include "inventory_routes.hpp" // InventoryDeviceRow; DeviceCiRecord (via device_inventory_store.hpp)
+#include "device_inventory_store.hpp" // DeviceCiRecord
+#include "inventory_routes.hpp"       // InventoryDeviceRow
 
 #include <unordered_map>
 #include <vector>
