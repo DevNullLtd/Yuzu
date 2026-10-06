@@ -110,8 +110,10 @@
 %%%
 %%% Configuration (sys.config / application env):
 %%%   circuit_breaker_failure_threshold   — consecutive failures to trip (default 5)
-%%%   circuit_breaker_reset_timeout_ms    — initial open duration (default 10000)
-%%%   circuit_breaker_max_reset_timeout_ms — max backoff cap (default 300000)
+%%%   circuit_breaker_reset_timeout_ms    — initial open duration
+%%%                                          (default 10000, valid 1..3600000)
+%%%   circuit_breaker_max_reset_timeout_ms — max backoff cap
+%%%                                          (default 300000, valid 1..3600000)
 %%%   registration_replay_spacing_ms      - gap between replay RPCs
 %%%                                          (default 20, valid 0..60000)
 %%%   registration_replay_session_guard_ms - how long a replayed session is not
@@ -165,6 +167,9 @@
 -define(DEFAULT_CB_THRESHOLD, 5).
 -define(DEFAULT_CB_RESET_MS, 10000).
 -define(DEFAULT_CB_MAX_RESET_MS, 300000).
+%% The valid range of both circuit_breaker_*reset_timeout_ms keys (1 ms to 1 h).
+-define(MIN_CB_TIMEOUT_MS, 1).
+-define(MAX_CB_TIMEOUT_MS, 3600000).
 -define(DEFAULT_REPLAY_SPACING_MS, 20).
 -define(MAX_REPLAY_SPACING_MS, 60000).
 -define(DEFAULT_REPLAY_SESSION_GUARD_MS, 10000).
@@ -337,8 +342,14 @@ init([]) ->
 
 init_state(ClusterId) ->
     Threshold  = application:get_env(yuzu_gw, circuit_breaker_failure_threshold, ?DEFAULT_CB_THRESHOLD),
-    BaseTimeout = application:get_env(yuzu_gw, circuit_breaker_reset_timeout_ms, ?DEFAULT_CB_RESET_MS),
-    MaxTimeout  = application:get_env(yuzu_gw, circuit_breaker_max_reset_timeout_ms, ?DEFAULT_CB_MAX_RESET_MS),
+    %% Both timeouts are validated: a reset timeout of 0 would make the half_open
+    %% probe a hot loop for ever (trip_circuit doubles 0). Anything outside the
+    %% range warns naming the key and takes the default.
+    BaseTimeout = yuzu_gw_env:env_int(circuit_breaker_reset_timeout_ms, ?DEFAULT_CB_RESET_MS,
+                                      ?MIN_CB_TIMEOUT_MS, ?MAX_CB_TIMEOUT_MS),
+    MaxTimeout  = yuzu_gw_env:env_int(circuit_breaker_max_reset_timeout_ms,
+                                      ?DEFAULT_CB_MAX_RESET_MS,
+                                      ?MIN_CB_TIMEOUT_MS, ?MAX_CB_TIMEOUT_MS),
     ReplaySpacing = yuzu_gw_env:env_int(registration_replay_spacing_ms,
                                     ?DEFAULT_REPLAY_SPACING_MS, 0, ?MAX_REPLAY_SPACING_MS),
     SessionGuard = yuzu_gw_env:env_int(registration_replay_session_guard_ms,

@@ -134,7 +134,15 @@ env_test_() ->
       t("a bad notify_pending_max warns naming the key and falls back to 10000",
         fun env_invalid_falls_back/0),
       t("a notify_pending_max inside 1..1000000 is kept, logged, and does not warn",
-        fun env_valid_is_kept/0)
+        fun env_valid_is_kept/0),
+      t("a bad circuit_breaker_reset_timeout_ms warns naming the key and falls back to 10000",
+        fun reset_timeout_invalid_falls_back/0),
+      t("a circuit_breaker_reset_timeout_ms inside 1..3600000 is kept and does not warn",
+        fun reset_timeout_valid_is_kept/0),
+      t("a bad circuit_breaker_max_reset_timeout_ms warns naming the key and falls back to 300000",
+        fun max_reset_timeout_invalid_falls_back/0),
+      t("a circuit_breaker_max_reset_timeout_ms inside 1..3600000 is kept and does not warn",
+        fun max_reset_timeout_valid_is_kept/0)
      ]}.
 
 %% A registration replay that is active while the pending store is refilled.
@@ -987,6 +995,49 @@ env_case(Val, Kind) ->
             Expect = iolist_to_binary(["notify_pending_max=", integer_to_binary(Val)]),
             ?assertMatch([_ | _], [T || {info, T} <- Lines, binary:match(T, Expect) =/= nomatch])
     end.
+
+%% A reset timeout of 0 would make the half_open probe a hot loop for ever
+%% (trip_circuit doubles 0), so the key is validated like the other breaker and
+%% replay keys: 1..3600000, anything else warns naming the key and takes the
+%% default. cb_base_timeout is what init/1 settled on.
+reset_timeout_invalid_falls_back() ->
+    [begin
+         Named = env_key_case(circuit_breaker_reset_timeout_ms, Bad),
+         ?assertEqual(10000, up_get(cb_base_timeout)),
+         ?assertEqual(10000, up_get(cb_cur_timeout)),
+         ?assertMatch([_], Named)
+     end || Bad <- [0, -1, -10000, 3600001, "10000", 1.5, undefined_atom, <<"5">>]].
+
+reset_timeout_valid_is_kept() ->
+    [begin
+         Named = env_key_case(circuit_breaker_reset_timeout_ms, Good),
+         ?assertEqual(Good, up_get(cb_base_timeout)),
+         ?assertEqual([], Named)
+     end || Good <- [1, 100, 10000, 3600000]].
+
+max_reset_timeout_invalid_falls_back() ->
+    [begin
+         Named = env_key_case(circuit_breaker_max_reset_timeout_ms, Bad),
+         ?assertEqual(300000, up_get(cb_max_timeout)),
+         ?assertMatch([_], Named)
+     end || Bad <- [0, -1, 3600001, "300000", 2.5, undefined_atom]].
+
+max_reset_timeout_valid_is_kept() ->
+    [begin
+         Named = env_key_case(circuit_breaker_max_reset_timeout_ms, Good),
+         ?assertEqual(Good, up_get(cb_max_timeout)),
+         ?assertEqual([], Named)
+     end || Good <- [1, 500, 3600000]].
+
+%% Restart the upstream with Key = Val; returns the warnings that name the key.
+env_key_case(Key, Val) ->
+    stop_upstream(),
+    application:set_env(yuzu_gw, Key, Val),
+    Mark = last_key(),
+    _ = start_upstream(),
+    KeyText = atom_to_binary(Key, utf8),
+    [T || {Key1, log, warning, T} <- rows(), Key1 > Mark,
+          binary:match(T, KeyText) =/= nomatch].
 
 %%%===================================================================
 %%% Tests: the half_open probe
