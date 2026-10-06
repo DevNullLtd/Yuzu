@@ -58,13 +58,16 @@ cadences.
   sortable or filterable there; read them from the raw `output` on
   `GET /api/v1/responses/{id}` or MCP `query_responses`. A macOS `list` payload
   is about three times larger than before (14 KB to 42 KB for 323 applications);
-  `bundle_id` is `-` past the 5000-application / 120 s enrichment cap, which the
-  agent logs but does not report as degraded.
+  `bundle_id` is `-` for rows the bounded bundle-id pass (30 s, at most 5000
+  applications, one pass in flight) did not reach; that run leads with a
+  `warning|bundle_id_*` row and reports CONSTRAINED -- never silently.
   On Linux/macOS, a
   degraded acquisition (timeout, kill, spawn failure, truncation, or a
   nonzero exit) now emits a single `error|installed_apps: acquisition
   degraded (...)` row and a nonzero result instead of an empty or partial
-  `app|` list — see "Degraded collections are skipped, not published" below.
+  `app|` list; on macOS a `list` may begin with a `warning|bundle_id_*` row --
+  key on the first token `app`. See "Degraded collections are skipped, not
+  published" below.
   Automation that only parses `app|` rows and ignores `error|` is
   unaffected; automation that assumed `list` always succeeds needs an
   update. See `docs/user-manual/agent-plugins.md`'s `installed_apps`/
@@ -828,7 +831,7 @@ MSI-registered products, SDK and runtime component packages and some system comp
 241 rows on one developer workstation); Linux is always `-` by design, since a package installs to many prefixes.
 `-` also results from a Windows value longer than 511 characters or stored with a non-string registry type, and
 for per-user installs, which the machine-scope `list` does not read. `bundle_id` is `-` on Windows
-and Linux, and on macOS for a non-bundle location or beyond the 5000-application / 120 s enrichment cap.
+and Linux, and on macOS for a non-bundle location or for a row the bounded bundle-id pass (30 s, at most 5000 applications, one pass in flight) did not reach -- that run also carries a leading `warning|bundle_id_*` row and a CONSTRAINED status, so a `-` from a cut-short pass is never silent.
 
 **The results table shows column headers with nothing under them.** The dashboard splits `installed_apps` rows at
 the first `|` (`app` plus one merged cell) while the headers come from the definition. Nothing is lost: read the

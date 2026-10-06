@@ -27,6 +27,7 @@
 #include <vector>
 
 #include <subprocess_degradation.hpp>
+#include <yuzu/plugin.h>         // YUZU_RESULT_STATUS_CONSTRAINED / _COMPLETENESS_PARTIAL
 #include <yuzu/string_utils.hpp> // yuzu::util::safe_output_field
 
 namespace yuzu::installed_apps::parsers {
@@ -388,6 +389,58 @@ constexpr unsigned long kRegExpandSz = 2;
 [[nodiscard]] constexpr bool reg_string_type_accepted(unsigned long type,
                                                       bool accept_expand_sz) noexcept {
     return type == kRegSz || (accept_expand_sz && type == kRegExpandSz);
+}
+
+// ── Degraded-acquisition contract (every OS; wired on Linux/macOS here) ─────
+// ONE place declares what a degraded acquisition looks like to the caller, so
+// list / query / list_per_user / list_inventory cannot drift. Templated on the
+// context so a unit test drives it with a recording fake instead of a plugin
+// load (yuzu::CommandContext satisfies the same two members).
+inline constexpr const char* kDegradedProvenance = "installed_apps:acquisition_degraded";
+
+template <class Ctx> void declare_acquisition_degraded(Ctx& ctx) {
+    ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                          kDegradedProvenance);
+}
+
+// What a degraded Linux/macOS acquisition means (the wording in docs/samples).
+inline constexpr std::string_view kSubprocessCauses =
+    "tool timed out, was killed, failed to start, exited nonzero, or its output was truncated";
+// The Windows registry-walk equivalent (Uninstall root/app key unreadable); declared
+// for the Windows leg, not wired on this branch.
+inline constexpr std::string_view kRegistryCauses =
+    "an Uninstall registry key could not be fully read";
+
+// list / query: true when healthy (caller proceeds); otherwise the typed status
+// plus the honest error row, and the caller returns rc 1.
+template <class Ctx>
+bool report_degraded(Ctx& ctx, bool degraded, std::string_view causes = kSubprocessCauses) {
+    if (!degraded)
+        return true;
+    declare_acquisition_degraded(ctx);
+    std::string row = "error|installed_apps: acquisition degraded (";
+    row += causes;
+    row += ") -- result withheld rather than reported as complete";
+    ctx.write_output(row);
+    return false;
+}
+
+// list_inventory: a degraded collection emits NO rows and returns rc 1 (the
+// daily sync, sync_source_installed_software.cpp, skips the cycle on any
+// nonzero rc, so a partial snapshot is never committed as authoritative).
+// `fmt` renders one record to its wire row; a record with no name is dropped.
+template <class Ctx, class Rec, class Fmt>
+int emit_inventory(Ctx& ctx, bool degraded, const std::vector<Rec>& records, Fmt&& fmt) {
+    if (degraded) {
+        declare_acquisition_degraded(ctx);
+        return 1;
+    }
+    for (const auto& r : records) {
+        if (r.name.empty())
+            continue;
+        ctx.write_output(fmt(r));
+    }
+    return 0;
 }
 
 // ── Windows: the name+version dedupe shared by list / query / inv| ──────────

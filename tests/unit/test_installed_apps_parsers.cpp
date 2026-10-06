@@ -23,6 +23,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <string>
+#include <string_view>
 #include <vector>
 
 using namespace yuzu::installed_apps::parsers;
@@ -684,4 +685,67 @@ TEST_CASE("dedupe_uninstall_records: a location never leaks across versions of o
     CHECK(v[0].install_location.empty());
     CHECK(v[1].version == "2.0");
     CHECK(v[1].install_location == "C:\\Tool2\\");
+}
+
+namespace {
+// Recording stand-in for yuzu::CommandContext: the degraded-acquisition helpers
+// are templated on the context so this pins the contract with no plugin load.
+struct RecCtx {
+    std::vector<std::string> lines;
+    int status_calls = 0;
+    YuzuResultStatus status = YUZU_RESULT_STATUS_UNDECLARED;
+    YuzuResultCompleteness completeness = YUZU_RESULT_COMPLETENESS_UNKNOWN;
+    std::string provenance;
+    void write_output(std::string_view l) { lines.emplace_back(l); }
+    void set_result_status(YuzuResultStatus s, YuzuResultCompleteness c,
+                           std::string_view p = {}) {
+        ++status_calls;
+        status = s;
+        completeness = c;
+        provenance = std::string{p};
+    }
+};
+struct Rec {
+    std::string name;
+};
+} // namespace
+
+TEST_CASE("report_degraded: healthy proceeds silently; degraded declares status + error row",
+          "[installed_apps]") {
+    RecCtx ok;
+    CHECK(report_degraded(ok, false));
+    CHECK(ok.lines.empty());
+    CHECK(ok.status_calls == 0);
+
+    RecCtx bad;
+    CHECK_FALSE(report_degraded(bad, true));
+    CHECK(bad.status == YUZU_RESULT_STATUS_CONSTRAINED);
+    CHECK(bad.completeness == YUZU_RESULT_COMPLETENESS_PARTIAL);
+    CHECK(bad.provenance == "installed_apps:acquisition_degraded");
+    REQUIRE(bad.lines.size() == 1);
+    CHECK(bad.lines[0].rfind("error|installed_apps: acquisition degraded (", 0) == 0);
+    CHECK(bad.lines[0].find(std::string{kSubprocessCauses}) != std::string::npos);
+
+    RecCtx reg;
+    CHECK_FALSE(report_degraded(reg, true, kRegistryCauses));
+    REQUIRE(reg.lines.size() == 1);
+    CHECK(reg.lines[0].find(std::string{kRegistryCauses}) != std::string::npos);
+}
+
+TEST_CASE("emit_inventory: degraded is rc 1 with no rows and the typed status",
+          "[installed_apps]") {
+    const std::vector<Rec> recs{{"AppA"}, {""}, {"AppB"}};
+    const auto fmt = [](const Rec& r) { return "inv|" + r.name; };
+
+    RecCtx good;
+    CHECK(emit_inventory(good, false, recs, fmt) == 0);
+    CHECK(good.lines == std::vector<std::string>{"inv|AppA", "inv|AppB"}); // nameless dropped
+    CHECK(good.status_calls == 0);
+
+    RecCtx bad;
+    CHECK(emit_inventory(bad, true, recs, fmt) == 1);
+    CHECK(bad.lines.empty());
+    CHECK(bad.status == YUZU_RESULT_STATUS_CONSTRAINED);
+    CHECK(bad.completeness == YUZU_RESULT_COMPLETENESS_PARTIAL);
+    CHECK(bad.provenance == "installed_apps:acquisition_degraded");
 }
