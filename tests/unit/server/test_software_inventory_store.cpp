@@ -2720,7 +2720,7 @@ TEST_CASE("migration v8 reshapes a v7-era rollup schema and re-runs idempotently
     }
 }
 
-// ── M.9 PR-2: software_catalog_totals ────────────────────────────────────────
+// ── software_catalog_totals ────────────────────────────────────────
 
 TEST_CASE("catalogue totals: unfiltered totals equal the refreshed meta", "[pg][software_inventory]") {
     SWINV_SHARED(store, pool);

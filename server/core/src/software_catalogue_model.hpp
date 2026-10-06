@@ -143,8 +143,9 @@ struct TitlesExport {
 };
 
 /// Titles export: loops `read` with the in-process keyset cursor (each read asks for
-/// min(cap - collected, kCatalogReadMax) rows) and returns the CSV; `truncated` is set when the
-/// cap cut the walk short. nullopt when any read degrades (never a partial body).
+/// min(cap - collected, kCatalogReadMax) rows) and returns a TitlesExport (csv, truncated, rows);
+/// `truncated` is set when the cap cut the walk short. nullopt when any read degrades (never a
+/// partial body).
 [[nodiscard]] std::optional<TitlesExport> titles_export(const CatalogueReader& read,
                                                         SoftwareCatalogQuery q, std::int64_t cap,
                                                         bool omit_newest);

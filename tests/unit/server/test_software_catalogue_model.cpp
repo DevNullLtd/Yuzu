@@ -188,6 +188,15 @@ TEST_CASE("catalogue cursor round trip", "[server][software_catalogue_model]") {
         CHECK(cur->installs == 42);
         CHECK(cur->name == name);
     }
+    // Known answer: the rest-api.md example token. "Mx9naXQ" is RFC 4648 section 5 base64url of
+    // "3\x1fgit", so a wire-format change cannot silently re-break the documented example.
+    const std::string doc_fp = "9a1c0e5d7b3f2a68";
+    constexpr const char* kDocToken = "c1:9a1c0e5d7b3f2a68:1790000000:Mx9naXQ";
+    CHECK(encode_catalogue_cursor(row("git", 3), doc_fp, 1790000000) == kDocToken);
+    auto doc = decode_catalogue_cursor(kDocToken, doc_fp, 1790000000);
+    REQUIRE(doc);
+    CHECK(doc->installs == 3);
+    CHECK(doc->name == "git");
 }
 
 TEST_CASE("worst-case cursors stay within kCursorMaxBytes", "[server][software_catalogue_model]") {
@@ -213,7 +222,10 @@ TEST_CASE("catalogue cursor decoder refusals", "[server][software_catalogue_mode
         CHECK(code("c1:" + fp + ":100:" + payload + ":extra") == CursorError::kMalformed);
         CHECK(code("c1:" + fp + ":100:" + payload + "=") == CursorError::kMalformed);
         CHECK(code("c1:" + fp + ":100:" + payload + "+") == CursorError::kMalformed);
-        CHECK(code("c1:" + fp + ":100:A") == CursorError::kMalformed); // tail length 1 mod 4
+        CHECK(code("c1:" + fp + ":100:A") == CursorError::kMalformed); // too short to carry the 0x1F separator
+        // The strict decoder's two rules, each pinned alone on an otherwise-valid 4-char payload:
+        CHECK(code("c1:" + fp + ":100:" + payload + "A") == CursorError::kMalformed); // tail length 1 mod 4 only
+        CHECK(code("c1:" + fp + ":100:NR9=") == CursorError::kMalformed); // non-alphabet byte only, valid length
         CHECK(code("c1:ABCDEF0123456789:100:" + payload) == CursorError::kMalformed); // uppercase
         CHECK(code("c1:" + fp + ":1x0:" + payload) == CursorError::kMalformed);
         CHECK(code("c1:" + fp + ":100:" + b64url_of("nosep")) == CursorError::kMalformed);

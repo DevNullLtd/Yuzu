@@ -9013,7 +9013,7 @@ void RestApiV1::register_routes(
             };
             if (out_of_scope) {
                 if (csv) {
-                    send_csv({swc::titles_csv({}, true), false, 0});
+                    send_csv({.csv = swc::titles_csv({}, true)});
                     return;
                 }
                 res.set_content(

@@ -8,7 +8,7 @@ Lane-3 predicate (`is_os_native`, cpe_normalize.hpp) routes them. This script ch
 against the real tree, that:
 
   1. every published surface equals the agreed vocabulary (EXPECTED_*) — the one prose
-     `kind (a|b)` enumeration per source file AND every JSON `enum` array the M.9 catalogue
+     `kind (a|b)` enumeration per source file AND every JSON `enum` array the catalogue
      routes publish for `kind`/`ecosystem` (OpenAPI parameters);
   2. the values the agents emit are exactly that vocabulary (emitted == published);
   3. every non-Lane-1 ecosystem and Lane-3 kind is named in `is_os_native`, and `pkg`

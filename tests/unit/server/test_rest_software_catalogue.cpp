@@ -232,6 +232,7 @@ TEST_CASE("catalogue routes: null store is 503 'not available' with no audit row
         CHECK(r->status == 503);
         CHECK(err_of(r).at("message") == "software inventory store not available");
         CHECK_FALSE(r->get_header_value("X-Correlation-Id").empty());
+        CHECK(err_of(r).at("correlation_id").get<std::string>() == r->get_header_value("X-Correlation-Id"));
     }
     CHECK(h.audit_log.empty());
 }
@@ -290,6 +291,7 @@ TEST_CASE("catalogue routes: a confined caller is denied the fleet view (403 + I
         REQUIRE(r);
         CHECK(r->status == 403);
         CHECK(err_of(r).at("permission") == "Inventory:Read");
+        CHECK(err_of(r).at("correlation_id").get<std::string>() == r->get_header_value("X-Correlation-Id"));
         CHECK_FALSE(nlohmann::json::parse(r->body).contains("data"));
     }
     CHECK(h.audits("inventory.software.catalog", "denied") == 1);
@@ -325,7 +327,7 @@ TEST_CASE("catalogue routes: malformed parameters are 400 with a correlation id"
         REQUIRE(r);
         CHECK(r->status == 400);
         CHECK_FALSE(r->get_header_value("X-Correlation-Id").empty());
-        CHECK_FALSE(err_of(r).at("correlation_id").get<std::string>().empty());
+        CHECK(err_of(r).at("correlation_id").get<std::string>() == r->get_header_value("X-Correlation-Id"));
     }
 }
 
@@ -689,6 +691,23 @@ TEST_CASE("catalogue: titles CSV: header / disposition / cap truncation / audit 
 
     CHECK(h.audits("inventory.software.export", "success") == 2);
     CHECK(h.audits("inventory.software.export", "success", "truncated=true") == 1);
+    // The route's own row count reaches the audit detail (3 titles served; 2 when cut by limit).
+    CHECK(h.audits("inventory.software.export", "success", "rows=3") == 1);
+    CHECK(h.audits("inventory.software.export", "success", "rows=2") == 1);
+
+    // An export whose audit row did not persist is still served, flagged on the wire.
+    h.audit_ok = false;
+    auto unaudited = h.sink.Get(std::string(kCat) + "?format=csv");
+    REQUIRE(unaudited);
+    CHECK(unaudited->status == 200);
+    CHECK(unaudited->get_header_value("Sec-Audit-Failed") == "true");
+    CHECK(unaudited->get_header_value("Content-Disposition").find("software-titles.csv") !=
+          std::string::npos);
+    h.audit_ok = true;
+    auto audited = h.sink.Get(std::string(kCat) + "?format=csv");
+    REQUIRE(audited);
+    CHECK(audited->status == 200);
+    CHECK(audited->get_header_value("Sec-Audit-Failed").empty());
 
     h.token_scope_service = "printers";
     CHECK(h.sink.Get(std::string(kCat) + "?format=csv")->status == 403);
