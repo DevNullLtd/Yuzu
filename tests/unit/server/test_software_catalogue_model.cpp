@@ -665,7 +665,7 @@ TEST_CASE("read_titles_export brackets the walk by the generation",
     }
 }
 
-TEST_CASE("strict_args_error: a strict caller refuses what REST clamps", "[server][software_catalogue_model]") {
+TEST_CASE("strict_args_error: MCP refuses what REST clamps", "[server][software_catalogue_model]") {
     using nlohmann::json;
     CHECK_FALSE(strict_args_error(json::object()));
     CHECK_FALSE(strict_args_error(json{{"limit", 1000}, {"versions_min", 0}, {"kind", "pkg"},

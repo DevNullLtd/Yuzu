@@ -1,12 +1,11 @@
 #pragma once
 
 /// @file software_catalogue_model.hpp
-/// The ONE pure model behind the software catalogue's REST routes, built to be shared by every
-/// other surface that serves the same data (for example the `/inventory` Software page):
-/// query-parameter parsing, the scope push-down rule, audit targets, opaque keyset cursors, the
-/// generation-skew decision, KPI derivation and the JSON/CSV shaping. No httplib, no MCP, no
-/// libpq - every transport shapes its answer through these functions so the wire shapes cannot
-/// drift (docs/api-twin-recipe.md Rule 1).
+/// The ONE pure model behind the software catalogue's REST and MCP twins and the
+/// `/inventory` Software page: query-parameter parsing, the scope push-down rule, audit
+/// targets, opaque keyset cursors, the generation-skew decision, KPI derivation and the
+/// JSON/CSV shaping. No httplib, no MCP, no libpq - every transport shapes its answer through
+/// these functions so the wire shapes cannot drift (docs/api-twin-recipe.md Rule 1).
 ///
 /// Cursors are OPAQUE, not authenticated: a well-formed hand-made head cursor is accepted. That
 /// is harmless only because every page is audited (success on EVERY call, continuation pages
@@ -40,7 +39,7 @@ inline constexpr std::int64_t kVersionsDefaultLimit = 200;
 inline constexpr std::int64_t kVersionsMax = 1000;
 inline constexpr std::int64_t kDevicesPageMax = 1000;
 inline constexpr std::int64_t kExportCap = 10000;
-inline constexpr std::size_t kCursorMaxBytes = 2048; ///< longest cursor token accepted; a longer one is refused
+inline constexpr std::size_t kCursorMaxBytes = 2048; ///< == kMcpCursorMaxLen (static_assert in mcp_server.cpp)
 inline constexpr std::size_t kScopePushdownMaxIds = 10000;
 inline constexpr std::int64_t kStaleWindowSecs = 172800; ///< 48 h
 inline constexpr std::size_t kSourceMaxBytes = 256;
@@ -92,10 +91,10 @@ struct DevicesRequest {
 /// is a 400); page cap kDevicesPageMax, export cap kExportCap (default kExportCap).
 [[nodiscard]] std::expected<DevicesRequest, ParseError> parse_devices_params(const Params& p);
 
-/// STRICT JSON-argument check for callers that refuse rather than clamp (the REST routes clamp
-/// instead): a present argument of the wrong JSON type, an out-of-range `limit`/`versions_min`,
-/// an over-long string, or a `kind`/`ecosystem` outside the closed vocabulary is refused rather
-/// than clamped or ignored. nullopt = acceptable; otherwise the invalid-arguments message.
+/// MCP's STRICT argument check for the two catalogue tools (the REST twins clamp instead): a
+/// present argument of the wrong JSON type, an out-of-range `limit`/`versions_min`, an
+/// over-long string, or a `kind`/`ecosystem` outside the closed vocabulary is refused rather
+/// than clamped or ignored. nullopt = acceptable; otherwise the kInvalidParams message.
 [[nodiscard]] std::optional<std::string> strict_args_error(const nlohmann::json& args);
 
 // ── Scope ────────────────────────────────────────────────────────────────────
@@ -119,7 +118,7 @@ enum class ScopeApply { kUnfiltered, kPushedDown, kDenyAll, kPostFilter };
 
 enum class CursorError { kMalformed, kFilterMismatch, kStale };
 
-/// Wire message for a refused cursor (an HTTP 400 on the REST routes).
+/// Wire message for a refused cursor (always HTTP 400 / kInvalidParams).
 [[nodiscard]] std::string_view cursor_error_message(CursorError e);
 
 [[nodiscard]] std::string filter_fingerprint(const SoftwareCatalogQuery& q);
