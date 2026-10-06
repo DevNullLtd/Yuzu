@@ -16,10 +16,11 @@ just at the pair level instead of the platform level.
 
 Five checks run against the real, integrated tree: checks 1-3 are the original
 gate-consistency set, checks 4 and 5 (after check 3) are the question
-classification set. Checks 1-5 all read the shipped definitions through one
-shared walk (`parse_content_definitions` / `walk_definition_docs`, see below):
-`content/definitions` and `content/packs`, recursively, `kind:
-InstructionDefinition` documents only.
+classification set. Checks 1, 2, 4 and 5 (and the `values:` vocabulary scan) read
+the shipped definitions through one shared walk (`parse_content_definitions` /
+`walk_definition_docs`, see below): `content/definitions` and `content/packs`,
+recursively, `kind: InstructionDefinition` documents only. Check 3 reads the
+capability fragments only.
 
   1. GATE CONSISTENCY: for every `plugin.action` pair that both (a) has a
      shipped `InstructionDefinition` and (b) has a catalogue row, the
@@ -50,8 +51,10 @@ definition must not self-certify read-vs-effect):
   4. QUESTION CLASS: every question definition (`spec.type` missing, empty or
      `question`, as `embed_content.py` defaults it) whose pair HAS a catalogue
      row must map to a `DispatchClass::ReadOnly` row. Plugin and action are
-     case-folded on both sides, as the runtime `classify()` is
-     case-insensitive. A (plugin, action) pair declared twice in the catalogue
+     stripped and lowercased on both sides (`fold`; see its docstring for how
+     that differs from the runtime `classify()`). A shipped definition whose
+     resolved type is neither `question` nor `action` is reported too (the
+     store rejects it at import). A (plugin, action) pair declared twice in the catalogue
      is a hard failure, as is a fragment whose counts disagree: its
      `.dispatch_class` row count, its `.plugin`/`.action` pair count and its
      bare `.plugin =` count must be equal (the third, looser count catches a
@@ -71,7 +74,10 @@ in-process and compares, per definition id, the `(type, plugin, action)` its
 generated bundle carries with the walk's (first occurrence of a repeated id),
 on the real tree and on the fabricated trees of
 `TestDefinitionParsingOnSyntheticTrees`. It compares nothing else (not names,
-approval modes or YAML sources).
+approval modes or YAML sources). Like embed, the walk skips a document PyYAML
+cannot parse, but records it, and the real-tree tests of checks 1-5 report each
+one as an `UNPARSEABLE DEFINITION DOCUMENT` problem: a definition that embed
+skips ships nowhere, and must not silently drop out of the checks.
 
 Mode-defaulting semantics are replicated EXACTLY from
 `server/core/scripts/embed_content.py`'s `def_envelope`
@@ -86,8 +92,10 @@ and content/packs YAML, the capability_decls fragments). The one exception to
 "read only" is `TestDefinitionWalkParityWithEmbed`, which loads
 `server/core/scripts/embed_content.py` by path (bytecode writing disabled
 around the load, so no `__pycache__` is written) and runs its `main()` in this
-process, writing only inside a `TemporaryDirectory`. No subprocess, no network,
-no clock. Requires PyYAML, an existing hard build dependency (see
+process, writing only inside a `TemporaryDirectory`. That run also reads
+content/plugin-docs/*.json (embed validates them; a bad manifest makes embed
+exit 1, which the exit-code and stderr message of `embedded_definitions`
+reports). No subprocess, no network, no clock. Requires PyYAML, an existing hard build dependency (see
 embed_content.py), not a new one for this repo.
 
 Demonstrating the failure modes is done on fabricated data only, per this
@@ -121,7 +129,6 @@ except ImportError:
     sys.exit(1)
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-CONTENT_GLOB = "content/definitions/*.yaml"
 
 FRAGMENT_FILES = [
     "server/core/src/capability_decls/core_dispatch_capabilities.hpp",
@@ -222,9 +229,9 @@ EXPECTED_TOTAL_ROWS = 231
 NON_CATALOGUE_EXEMPT_PREFIXES = ("server", "server_internal", "_server")
 
 # `question` definitions with NO catalogue row, split by plugin name. Every
-# id below was derived by running `parse_content_questions` against
-# content/definitions/*.yaml and checking the pair against the
-# capability_decls/*.hpp rows (`parse_fragment_dispatch_classes`).
+# id below is a question `parse_content_questions` finds (content/definitions and
+# content/packs, recursively) whose pair has no capability_decls/*.hpp row
+# (`parse_fragment_dispatch_classes`).
 #
 # ROWLESS_QUESTION_IDS: the plugin is exactly one of SERVER_SIDE_PSEUDO_PLUGINS.
 # These pairs have no catalogue row, so `classify_and_authorize_dispatch`
@@ -302,27 +309,33 @@ DECLS_DIR = "server/core/src/capability_decls"
 _EMBED_MODULE = None
 
 
+def _load_module_from_path(name: str, path: Path):
+    """Load the script at `path` as module `name`. The module is registered in
+    `sys.modules` while it executes (a dataclass in a future refactor needs that)
+    and removed again afterwards, and bytecode writing is off so the load leaves
+    no `__pycache__` next to the script. Both are restored even if it raises."""
+    spec = importlib.util.spec_from_file_location(name, path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    saved_dont_write = sys.dont_write_bytecode
+    sys.dont_write_bytecode = True
+    sys.modules[name] = module
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        sys.dont_write_bytecode = saved_dont_write
+        sys.modules.pop(name, None)
+    return module
+
+
 def _embed_content():
-    """`server/core/scripts/embed_content.py`, loaded by path so the definition
-    walk reuses its `split_docs` instead of copying it. The module is registered
-    in `sys.modules` while it executes (a dataclass in a future refactor needs
-    that) and removed again afterwards, and bytecode writing is off so the load
-    leaves no `__pycache__` in the source tree."""
+    """`server/core/scripts/embed_content.py`, loaded by path (once) so the
+    definition walk reuses its `split_docs` instead of copying it."""
     global _EMBED_MODULE
     if _EMBED_MODULE is None:
-        name = "embed_content_for_gate_test"
-        spec = importlib.util.spec_from_file_location(name, REPO_ROOT / "server/core/scripts/embed_content.py")
-        assert spec is not None and spec.loader is not None
-        module = importlib.util.module_from_spec(spec)
-        saved_dont_write = sys.dont_write_bytecode
-        sys.dont_write_bytecode = True
-        sys.modules[name] = module
-        try:
-            spec.loader.exec_module(module)
-        finally:
-            sys.dont_write_bytecode = saved_dont_write
-            sys.modules.pop(name, None)
-        _EMBED_MODULE = module
+        _EMBED_MODULE = _load_module_from_path(
+            "embed_content_for_gate_test", REPO_ROOT / "server/core/scripts/embed_content.py"
+        )
     return _EMBED_MODULE
 
 
@@ -330,7 +343,9 @@ def _as_dict(value: object) -> dict:
     return value if isinstance(value, dict) else {}
 
 
-def walk_definition_docs(repo_root: Path) -> list[tuple[str, dict]]:
+def walk_definition_docs(
+    repo_root: Path, unparseable: list[tuple[str, int, str]] | None = None
+) -> list[tuple[str, dict]]:
     """`(definition id, document)` for every `kind: InstructionDefinition`
     document, in `embed_content.py`'s walk order.
 
@@ -340,6 +355,11 @@ def walk_definition_docs(repo_root: Path) -> list[tuple[str, dict]]:
     to parse is skipped (it warns and continues) and only `kind ==
     "InstructionDefinition"` is taken. A definition with no usable id gets the
     fallback id `<path relative to the repo root>#<document index>`.
+
+    The skip is silent in what this returns, so a caller that must not lose a
+    definition passes `unparseable`: every skipped document is appended to it
+    as `(path relative to the repo root, document index, first line of the YAML
+    error)` (see `format_unparseable`).
     """
     embed = _embed_content()
     content_root = repo_root / "content"
@@ -353,7 +373,10 @@ def walk_definition_docs(repo_root: Path) -> list[tuple[str, dict]]:
         for index, doc_text in enumerate(embed.split_docs(path.read_text(encoding="utf-8"))):
             try:
                 doc = yaml.safe_load(doc_text)
-            except yaml.YAMLError:
+            except yaml.YAMLError as err:
+                if unparseable is not None:
+                    lines = str(err).splitlines()
+                    unparseable.append((rel, index, lines[0] if lines else type(err).__name__))
                 continue
             if not isinstance(doc, dict) or doc.get("kind") != "InstructionDefinition":
                 continue
@@ -362,6 +385,22 @@ def walk_definition_docs(repo_root: Path) -> list[tuple[str, dict]]:
                 def_id = f"{rel}#{index}"
             found.append((def_id, doc))
     return found
+
+
+def format_unparseable(skipped: list[tuple[str, int, str]]) -> list[str]:
+    """One `UNPARSEABLE DEFINITION DOCUMENT` message per document
+    `walk_definition_docs` collected: a YAML document under `content/definitions`
+    / `content/packs` that PyYAML rejects (a tab indent, a `--- # comment`
+    separator, an unclosed flow sequence). `embed_content.py` warns and skips
+    such a document, so whatever it defines ships nowhere, and the walk skips it
+    the same way; this is what keeps it from vanishing from checks 1-5 without a
+    failing signal. The kind of a document that does not parse is unknown, so a
+    rejected document of any kind is reported."""
+    return [
+        f"UNPARSEABLE DEFINITION DOCUMENT: {rel}#{index}: {error} -- embed_content.py skips it "
+        "with a warning, so it ships nowhere; fix the YAML or remove the document"
+        for rel, index, error in skipped
+    ]
 
 
 def definition_fields(doc: dict) -> tuple[str, str, str]:
@@ -385,10 +424,26 @@ def definition_fields(doc: dict) -> tuple[str, str, str]:
     )
 
 
-def parse_content_definitions(repo_root: Path) -> list[tuple[str, str, str, str]]:
+def parse_content_definitions(
+    repo_root: Path, unparseable: list[tuple[str, int, str]] | None = None
+) -> list[tuple[str, str, str, str]]:
     """`(definition id, type, plugin, action)` for every shipped definition,
-    via `walk_definition_docs` and `definition_fields`."""
-    return [(def_id, *definition_fields(doc)) for def_id, doc in walk_definition_docs(repo_root)]
+    via `walk_definition_docs` (which fills `unparseable`) and
+    `definition_fields`."""
+    return [(def_id, *definition_fields(doc)) for def_id, doc in walk_definition_docs(repo_root, unparseable)]
+
+
+def check_definition_types(definitions: list[tuple[str, str, str, str]]) -> list[str]:
+    """One `UNKNOWN DEFINITION TYPE` message per `(id, type, plugin, action)` whose
+    resolved type is neither `question` nor `action`. `embed_content.py` does not
+    validate the type, but `InstructionStore::validate_and_prepare`
+    (instruction_store.cpp) rejects any other value, so such a definition would
+    fail the runtime import of the bundle."""
+    return [
+        f"UNKNOWN DEFINITION TYPE: {def_id} has spec.type '{def_type}', expected question or action"
+        for def_id, def_type, _plugin, _action in definitions
+        if def_type not in ("question", "action")
+    ]
 
 
 def parse_content_questions(repo_root: Path) -> list[tuple[str, str, str]]:
@@ -400,21 +455,22 @@ def parse_content_questions(repo_root: Path) -> list[tuple[str, str, str]]:
     return [(i, p, a) for i, t, p, a in parse_content_definitions(repo_root) if t == "question"]
 
 
-def parse_content_pair_modes(repo_root: Path) -> dict[tuple[str, str], list[str]]:
+def parse_content_pair_modes(
+    repo_root: Path, unparseable: list[tuple[str, int, str]] | None = None
+) -> dict[tuple[str, str], list[str]]:
     """Every `(plugin, action) -> [approval.mode, ...]` across every definition
     `walk_definition_docs` returns. Mode-defaulting matches `embed_content.py`'s
     `def_envelope` exactly: `approval.get("mode") or "auto"`. A definition with
     no plugin or no action is left out (checks 1-2 compare pairs).
     """
     pair_modes: dict[tuple[str, str], list[str]] = {}
-    for _def_id, doc in walk_definition_docs(repo_root):
+    for _def_id, doc in walk_definition_docs(repo_root, unparseable):
         _type, plugin, action = definition_fields(doc)
         if not plugin or not action:
             continue
         mode = _as_dict(_as_dict(doc.get("spec")).get("approval")).get("mode") or "auto"
         pair_modes.setdefault((plugin, action), []).append(str(mode))
     return pair_modes
-
 
 
 def non_string_column_values(doc: object, fallback_id: str) -> list[str]:
@@ -478,11 +534,13 @@ def parse_fragment_dispatch_classes(path: Path) -> list[tuple[str, str, str]]:
 
 
 def fold(value: object) -> str:
-    """Case-fold and strip a plugin/action name for the check 4/5 lookups.
-    The runtime `classify()` (command_capability.hpp) compares plugin AND
-    action case-insensitively; a non-string (malformed content) folds to "",
-    which matches no catalogue row and so surfaces as an unpinned rowless
-    question naming the definition.
+    """Strip and lowercase a plugin/action name for the check 4/5 lookups.
+    The runtime `classify()` (command_capability.hpp `ci_equal`) is an ASCII
+    case-insensitive, size-equal compare that does NOT strip, so this is more
+    lenient than the runtime on whitespace: a padded name matches a row here but
+    is Unclassified at runtime (the safe direction). A non-string (malformed
+    content) folds to "", which matches no catalogue row and so surfaces as an
+    unpinned rowless question naming the definition.
     """
     return value.strip().lower() if isinstance(value, str) else ""
 
@@ -570,8 +628,9 @@ def check_questions(
         plugin, action = fold(raw_plugin), fold(raw_action)
         cls = class_by_pair.get((plugin, action))
         if cls is None:
-            # The catalogue lookup above folds (strip + lowercase) like classify(); the
-            # server-side bucket lowercases only, so a plugin "Server " is NOT server-side.
+            # The catalogue lookup above strips and lowercases (more lenient than
+            # classify() on whitespace, see `fold`); the server-side bucket lowercases
+            # only, so a plugin "Server " is NOT server-side.
             plugin_key = raw_plugin.lower() if isinstance(raw_plugin, str) else ""
             bucket = rowless_server if plugin_key in SERVER_SIDE_PSEUDO_PLUGINS else rowless_other
             bucket[def_id] = (plugin_key, action)
@@ -687,6 +746,21 @@ def format_gaps(
     return "\n".join(lines)
 
 
+def gate_problems(
+    pair_modes: dict[tuple[str, str], list[str]],
+    skipped: list[tuple[str, int, str]],
+    fragment_rows: list[tuple[str, str, str]],
+) -> list[str]:
+    """Everything checks 1 and 2 report: one message per unparseable document
+    (`format_unparseable`), then the gate mismatches and unexempt pairs
+    (`diff_gates` / `format_gaps`) as one message. Empty when clean."""
+    problems = format_unparseable(skipped)
+    gaps = format_gaps(*diff_gates(pair_modes, fragment_rows))
+    if gaps:
+        problems.append(gaps)
+    return problems
+
+
 class TestGateConsistencyOnRealTree(unittest.TestCase):
     """The actual drift gate: parses the live repository and fails, naming
     every gap, if content's approval.mode and the capability-catalogue
@@ -694,7 +768,8 @@ class TestGateConsistencyOnRealTree(unittest.TestCase):
     """
 
     def test_no_gate_gaps_between_content_and_catalogue(self) -> None:
-        pair_modes = parse_content_pair_modes(REPO_ROOT)
+        skipped: list[tuple[str, int, str]] = []
+        pair_modes = parse_content_pair_modes(REPO_ROOT, skipped)
         self.assertTrue(pair_modes, "parsed zero content definitions — the glob is broken")
 
         fragment_rows: list[tuple[str, str, str]] = []
@@ -732,10 +807,9 @@ class TestGateConsistencyOnRealTree(unittest.TestCase):
             "broken or a row was authored with the sentinel value explicitly",
         )
 
-        mismatches, unexempt_missing = diff_gates(pair_modes, fragment_rows)
-
-        if mismatches or unexempt_missing:
-            self.fail("\n" + format_gaps(mismatches, unexempt_missing))
+        problems = gate_problems(pair_modes, skipped, fragment_rows)
+        if problems:
+            self.fail("\n" + "\n".join(problems))
 
 
 def collect_question_problems(
@@ -764,7 +838,11 @@ def collect_question_problems(
             problems.append(msg)
     class_by_pair, duplicate_problems = build_class_by_pair(class_rows)
     problems.extend(duplicate_problems)
-    questions = parse_content_questions(repo_root)
+    skipped: list[tuple[str, int, str]] = []
+    definitions = parse_content_definitions(repo_root, skipped)
+    problems.extend(format_unparseable(skipped))
+    problems.extend(check_definition_types(definitions))
+    questions = [(i, p, a) for i, t, p, a in definitions if t == "question"]
     if not questions:
         problems.append("parsed zero question definitions -- the glob or spec.type read is broken")
     problems.extend(check_questions(questions, class_by_pair, pinned, pinned_unexplained, expected_count))
@@ -825,20 +903,58 @@ def embedded_definitions(content_root: Path) -> dict[str, tuple[str, str, str]]:
     }
 
 
+def first_by_id(definitions: list[tuple[str, str, str, str]]) -> dict[str, tuple[str, str, str]]:
+    """`id -> (type, plugin, action)` keeping the FIRST of a repeated id, as
+    `embed_content.py` does (`seen_def_ids`)."""
+    first: dict[str, tuple[str, str, str]] = {}
+    for def_id, def_type, plugin, action in definitions:
+        first.setdefault(def_id, (def_type, plugin, action))
+    return first
+
+
+_UNREADABLE_BY_REGEX = (
+    "the bundle envelope regex (_BUNDLE_ENVELOPE_RE) could not read embed's output for this id: "
+    "a non-string id/displayName/type/plugin, or a displayName over embed's 12000-byte chunk "
+    "size, breaks the envelope shape it matches (or embed does not ship the definition at all)"
+)
+
+
+def parity_problems(
+    walked: dict[str, tuple[str, str, str]], embedded: dict[str, tuple[str, str, str]]
+) -> list[str]:
+    """One message per definition id on which the gate's walk and the envelopes
+    read from `embed_content.py`'s bundle disagree: a different `(type, plugin,
+    action)`, or an id present on only one side. An empty `embedded` is itself a
+    problem (nothing was read, so nothing can be compared). Empty when they
+    agree. Pure, so the synthetic tests drive it with deliberately differing
+    pairs."""
+    if not embedded:
+        return [
+            "the bundle envelope regex (_BUNDLE_ENVELOPE_RE) read zero definitions from embed's "
+            "output: the bundle format changed, or every definition has a non-string "
+            "id/displayName/type/plugin or a displayName over embed's 12000-byte chunk size"
+        ]
+    problems: list[str] = []
+    for def_id in sorted(set(walked) | set(embedded)):
+        w, e = walked.get(def_id), embedded.get(def_id)
+        if w == e:
+            continue
+        if e is None:
+            problems.append(f"  {def_id}: walk={w}; {_UNREADABLE_BY_REGEX}")
+        elif w is None:
+            problems.append(f"  {def_id}: embed={e}, but the gate's walk did not find it")
+        else:
+            problems.append(f"  {def_id}: walk={w} embed={e}")
+    return problems
+
+
 def assert_walk_matches_embed(case: unittest.TestCase, repo_root: Path) -> None:
     """The gate's definition walk and `embed_content.py` must agree, for every
     definition id, on `(type, plugin, action)` as written (no folding), and on
     which ids exist. Nothing else is compared."""
-    embedded = embedded_definitions(repo_root / "content")
-    case.assertTrue(embedded, "embed_content.py ingested zero definitions -- the bundle read is broken")
-    walked: dict[str, tuple[str, str, str]] = {}
-    for def_id, def_type, plugin, action in parse_content_definitions(repo_root):
-        walked.setdefault(def_id, (def_type, plugin, action))  # embed_content.py keeps the first of a repeated id
-    differing = [
-        f"  {i}: walk={walked.get(i)} embed={embedded.get(i)}"
-        for i in sorted(set(walked) | set(embedded))
-        if walked.get(i) != embedded.get(i)
-    ]
+    differing = parity_problems(
+        first_by_id(parse_content_definitions(repo_root)), embedded_definitions(repo_root / "content")
+    )
     case.assertFalse(
         differing,
         f"the gate's definition walk and embed_content.py disagree on {len(differing)} definition "
@@ -849,7 +965,7 @@ def assert_walk_matches_embed(case: unittest.TestCase, repo_root: Path) -> None:
 
 
 class TestDefinitionWalkParityWithEmbed(unittest.TestCase):
-    """Checks 1-5 must see the definitions the server actually ships."""
+    """Checks 1, 2, 4 and 5 must see the definitions the server actually ships."""
 
     def test_gate_walk_sees_exactly_what_embed_content_ingests(self) -> None:
         assert_walk_matches_embed(self, REPO_ROOT)
@@ -911,6 +1027,15 @@ class TestFailureModesOnSyntheticData(unittest.TestCase):
         fragment_rows = [("tar", "sql", "None")]
         mismatches, unexempt_missing = diff_gates(pair_modes, fragment_rows)
         self.assertEqual(mismatches, {("tar", "sql"): ("None", "AdminOrApproval")})
+
+    def test_gate_problems_reports_an_unparseable_document_alongside_gate_gaps(self) -> None:
+        skipped = [("content/definitions/tab.yaml", 2, "while scanning for the next token")]
+        pair_modes = {("widget", "spin"): ["role-gated"]}
+        problems = gate_problems(pair_modes, skipped, [("widget", "spin", "None")])
+        self.assertEqual(len(problems), 2)
+        self.assertTrue(problems[0].startswith("UNPARSEABLE DEFINITION DOCUMENT: content/definitions/tab.yaml#2: "))
+        self.assertIn("GATE MISMATCH for widget.spin", problems[1])
+        self.assertEqual(gate_problems(pair_modes, [], [("widget", "spin", "AdminOrApproval")]), [])
 
     def test_matching_gate_is_not_reported(self) -> None:
         pair_modes = {("rdp_control", "set_state"): ["role-gated"]}
@@ -1081,13 +1206,20 @@ class TestFailureModesOnSyntheticData(unittest.TestCase):
 
 
 def _definition_yaml(def_id: str | None, *, kind: str = "InstructionDefinition", type_line: str | None = None,
-                     plugin: str = "widget", action: str = "wipe") -> str:
+                     plugin: str | None = "widget", action: str | None = "wipe",
+                     flat_plugin: str | None = None, flat_action: str | None = None) -> str:
+    """`plugin`/`action` fill `spec.execution.*`, `flat_plugin`/`flat_action` fill
+    the flat `spec.*` form; None omits that line (and `execution:` when both are
+    None)."""
     lines = [f"kind: {kind}", "metadata:"]
     lines.append(f"  id: {def_id}" if def_id else "  displayName: nameless")
     lines.append("spec:")
     if type_line is not None:
         lines.append(f"  {type_line}")
-    lines += ["  execution:", f"    plugin: {plugin}", f"    action: {action}"]
+    lines += [f"  {key}: {value}" for key, value in (("plugin", flat_plugin), ("action", flat_action)) if value is not None]
+    nested = [f"    {key}: {value}" for key, value in (("plugin", plugin), ("action", action)) if value is not None]
+    if nested:
+        lines += ["  execution:", *nested]
     return "\n".join(lines) + "\n"
 
 
@@ -1098,6 +1230,50 @@ def _write_tree(root: Path, files: dict[str, str]) -> None:
         path.write_text(text, encoding="utf-8")
 
 
+class TestParityComparatorOnSyntheticPairs(unittest.TestCase):
+    """`parity_problems`, the comparator behind every parity run, fed deliberately
+    differing (walk, embed) pairs: a comparator that is vacuous, compares only
+    which ids exist, or compares only the ids both sides have must fail here.
+    Pure; embed is not run."""
+
+    BASE = {"d.one": ("question", "widget", "get")}
+
+    def test_agreeing_sides_report_nothing(self) -> None:
+        self.assertEqual(parity_problems(self.BASE, dict(self.BASE)), [])
+
+    def test_a_differing_type_plugin_or_action_names_the_id(self) -> None:
+        for embedded in (
+            {"d.one": ("action", "widget", "get")},
+            {"d.one": ("question", "gadget", "get")},
+            {"d.one": ("question", "widget", "put")},
+        ):
+            problems = parity_problems(self.BASE, embedded)
+            self.assertEqual(len(problems), 1, embedded)
+            self.assertIn("d.one", problems[0])
+            self.assertIn(str(embedded["d.one"]), problems[0])
+
+    def test_an_id_only_the_walk_has_is_named(self) -> None:
+        problems = parity_problems({**self.BASE, "d.walk_only": ("question", "w", "a")}, dict(self.BASE))
+        self.assertEqual(len(problems), 1)
+        self.assertIn("d.walk_only", problems[0])
+        self.assertIn("_BUNDLE_ENVELOPE_RE", problems[0])
+
+    def test_an_id_only_embed_has_is_named(self) -> None:
+        problems = parity_problems(dict(self.BASE), {**self.BASE, "d.embed_only": ("action", "w", "a")})
+        self.assertEqual(len(problems), 1)
+        self.assertIn("d.embed_only", problems[0])
+
+    def test_an_empty_embed_side_is_a_problem_even_with_an_empty_walk(self) -> None:
+        for walked in (self.BASE, {}):
+            problems = parity_problems(walked, {})
+            self.assertEqual(len(problems), 1, walked)
+            self.assertIn("zero definitions", problems[0])
+
+    def test_first_by_id_keeps_the_first_of_a_repeated_id(self) -> None:
+        got = first_by_id([("x", "action", "p1", "a1"), ("x", "question", "p2", "a2"), ("y", "question", "p", "a")])
+        self.assertEqual(got, {"x": ("action", "p1", "a1"), "y": ("question", "p", "a")})
+
+
 class TestDefinitionParsingOnSyntheticTrees(unittest.TestCase):
     """The definition walk against fabricated content trees in a temp dir. A tree
     `embed_content.py` accepts is also checked for parity with it (`parity=True`),
@@ -1105,13 +1281,16 @@ class TestDefinitionParsingOnSyntheticTrees(unittest.TestCase):
     asserted here; malformed trees embed rejects pass `parity=False`.
     """
 
-    def _parse(self, files: dict[str, str], *, parity: bool = True) -> list[tuple[str, str, str]]:
+    def _parse_definitions(self, files: dict[str, str], *, parity: bool = True) -> list[tuple[str, str, str, str]]:
         with tempfile.TemporaryDirectory(prefix="yuzu_test_gate_content_") as td:
             root = Path(td)
             _write_tree(root, {f"content/{rel}": text for rel, text in files.items()})
             if parity:
                 assert_walk_matches_embed(self, root)
-            return parse_content_questions(root)
+            return parse_content_definitions(root)
+
+    def _parse(self, files: dict[str, str], *, parity: bool = True) -> list[tuple[str, str, str]]:
+        return [(i, p, a) for i, t, p, a in self._parse_definitions(files, parity=parity) if t == "question"]
 
     def test_missing_none_and_empty_type_count_as_question(self) -> None:
         docs = "---\n".join([
@@ -1204,12 +1383,217 @@ class TestDefinitionParsingOnSyntheticTrees(unittest.TestCase):
             mismatches, _ = diff_gates(pair_modes, [("widget", "wipe", "None")])
             self.assertEqual(mismatches, {("widget", "wipe"): ("None", "AlwaysApproval")})
 
+    def test_flat_spec_plugin_and_action_are_read_when_there_is_no_execution_block(self) -> None:
+        doc = _definition_yaml(
+            "f.flat", type_line="type: action", plugin=None, action=None, flat_plugin="FlatPlug", flat_action="Flat_Act"
+        )
+        self.assertEqual(
+            self._parse_definitions({"definitions/flat.yaml": doc}), [("f.flat", "action", "FlatPlug", "flat_act")]
+        )
+
+    def test_execution_form_wins_over_the_flat_form_per_field(self) -> None:
+        both = _definition_yaml("b.both", plugin="nestplug", action="nestact", flat_plugin="flatplug", flat_action="flatact")
+        # `exec_.get("x") or spec.get("x")` is per field: execution has only a plugin here.
+        mixed = _definition_yaml("b.mixed", plugin="nestplug", action=None, flat_plugin="flatplug", flat_action="flatact")
+        got = self._parse_definitions({"definitions/b.yaml": "---\n".join([both, mixed])})
+        self.assertEqual(
+            got,
+            [("b.both", "question", "nestplug", "nestact"), ("b.mixed", "question", "nestplug", "flatact")],
+        )
+
+    def test_the_first_of_a_repeated_id_wins_on_both_sides(self) -> None:
+        first = _definition_yaml("dup.id", type_line="type: action", plugin="firstplug", action="first")
+        second = _definition_yaml("dup.id", type_line="type: question", plugin="secondplug", action="second")
+        third = _definition_yaml("dup.id", type_line="type: question", plugin="thirdplug", action="third")
+        with tempfile.TemporaryDirectory(prefix="yuzu_test_gate_content_") as td:
+            root = Path(td)
+            # Within a file, then across definitions/ -> packs/ (sorted path order).
+            _write_tree(root, {
+                "content/definitions/z.yaml": "---\n".join([first, second]),
+                "content/packs/a.yaml": third,
+            })
+            assert_walk_matches_embed(self, root)
+            # Pin what embed itself ships, so a repeated id that flips to last-wins in BOTH
+            # the comparator and embed together is still caught.
+            self.assertEqual(
+                embedded_definitions(root / "content"), {"dup.id": ("action", "firstplug", "first")}
+            )
+            walked = parse_content_definitions(root)
+            self.assertEqual([i for i, _, _, _ in walked], ["dup.id"] * 3)
+            self.assertEqual(first_by_id(walked), {"dup.id": ("action", "firstplug", "first")})
+
+    def test_an_unparseable_document_is_skipped_like_embed_but_reported(self) -> None:
+        tab = "kind: InstructionDefinition\nmetadata:\n\tid: t.wipe\nspec:\n  execution: {plugin: widget, action: wipe}\n"
+        sep = _definition_yaml("s.one") + "--- # next\n" + _definition_yaml("s.two")
+        unclosed = "kind: InstructionDefinition\nmetadata: {id: u.open}\nspec: [unclosed\n"
+        ok = _definition_yaml("ok.get", plugin="widget", action="get")
+        with tempfile.TemporaryDirectory(prefix="yuzu_test_gate_content_") as td:
+            root = Path(td)
+            _write_tree(root, {
+                "content/definitions/tab.yaml": tab,
+                "content/definitions/ok.yaml": ok,
+                "content/packs/sep.yaml": sep,
+                "content/packs/sub/open.yaml": unclosed,
+            })
+            assert_walk_matches_embed(self, root)  # embed skips the same documents
+            skipped: list[tuple[str, int, str]] = []
+            self.assertEqual([i for i, *_ in parse_content_definitions(root, skipped)], ["ok.get"])
+            self.assertEqual([(rel, idx) for rel, idx, _ in skipped], [
+                ("content/definitions/tab.yaml", 0),
+                ("content/packs/sep.yaml", 0),
+                ("content/packs/sub/open.yaml", 0),
+            ])
+            problems = format_unparseable(skipped)
+            self.assertEqual(len(problems), 3)
+            for problem, needle in zip(problems, ("while scanning for the next token", "expected a single document", "while parsing a flow sequence")):
+                self.assertTrue(problem.startswith("UNPARSEABLE DEFINITION DOCUMENT: content/"), problem)
+                self.assertIn(needle, problem)
+                self.assertIn("-- embed_content.py skips it with a warning, so it ships nowhere", problem)
+                self.assertEqual(len(problem.splitlines()), 1, problem)
+            # The same skip, reported through both real-tree entry points.
+            via_pairs: list[tuple[str, int, str]] = []
+            parse_content_pair_modes(root, via_pairs)
+            self.assertEqual(via_pairs, skipped)
+            rel = f"{DECLS_DIR}/a.hpp"
+            _write_tree(root, {rel: _ROW.format(plugin="widget", action="get", cls="ReadOnly")})
+            found = [p for p in collect_question_problems(root, [rel], (), (), 0) if "UNPARSEABLE" in p]
+            self.assertEqual(found, problems)
+
+    def test_the_parity_run_itself_fails_on_a_tree_where_the_walk_and_embed_disagree(self) -> None:
+        # A non-string id: the walk falls back to `<file>#<index>`, but embed ships the
+        # definition under the raw value, which the envelope regex cannot read.
+        bad = "kind: InstructionDefinition\nmetadata: {id: 5}\nspec: {execution: {plugin: widget, action: get}}\n"
+        with tempfile.TemporaryDirectory(prefix="yuzu_test_gate_content_") as td:
+            root = Path(td)
+            _write_tree(root, {
+                "content/definitions/ok.yaml": _definition_yaml("ok.get", plugin="widget", action="get"),
+                "content/definitions/bad.yaml": bad,
+            })
+            with self.assertRaises(AssertionError) as caught:
+                assert_walk_matches_embed(self, root)
+        self.assertIn("content/definitions/bad.yaml#0", str(caught.exception))
+        self.assertIn("_BUNDLE_ENVELOPE_RE", str(caught.exception))
+
+    def test_a_document_that_parses_is_not_reported(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="yuzu_test_gate_content_") as td:
+            root = Path(td)
+            _write_tree(root, {"content/definitions/a.yaml": "---\n".join([_definition_yaml("a.one"), "# only a comment\n"])})
+            skipped: list[tuple[str, int, str]] = []
+            parse_content_definitions(root, skipped)
+            self.assertEqual(skipped, [])
+
+    def test_a_definition_type_outside_the_store_vocabulary_is_named(self) -> None:
+        docs = "---\n".join([
+            _definition_yaml("v.ok_q"),
+            _definition_yaml("v.ok_a", type_line="type: action"),
+            _definition_yaml("v.case", type_line="type: Action"),
+            _definition_yaml("v.other", type_line="type: delete"),
+        ])
+        got = self._parse_definitions({"definitions/v.yaml": docs})
+        self.assertEqual(
+            check_definition_types(got),
+            [
+                "UNKNOWN DEFINITION TYPE: v.case has spec.type 'Action', expected question or action",
+                "UNKNOWN DEFINITION TYPE: v.other has spec.type 'delete', expected question or action",
+            ],
+        )
+        # A non-string type has no readable embed envelope, so no parity run.
+        odd = self._parse_definitions({"definitions/o.yaml": _definition_yaml("v.num", type_line="type: 5")}, parity=False)
+        self.assertEqual(check_definition_types(odd), [
+            "UNKNOWN DEFINITION TYPE: v.num has spec.type '5', expected question or action"
+        ])
+
+    def test_a_missing_or_null_approval_mode_resolves_to_auto_like_embed(self) -> None:
+        def with_approval(action: str, approval: str) -> str:
+            return _definition_yaml(f"m.{action}", plugin="widget", action=action) + approval
+
+        docs = "---\n".join([
+            with_approval("none", ""),
+            with_approval("nullblock", "  approval:\n"),
+            with_approval("nullmode", "  approval:\n    mode: null\n"),
+            with_approval("emptymode", '  approval:\n    mode: ""\n'),
+            with_approval("othermode", "  approval:\n    note: x\n"),
+            with_approval("always", "  approval:\n    mode: always\n"),
+        ])
+        with tempfile.TemporaryDirectory(prefix="yuzu_test_gate_content_") as td:
+            root = Path(td)
+            _write_tree(root, {"content/definitions/m.yaml": docs})
+            got = parse_content_pair_modes(root)
+            embed = _embed_content()
+            for _def_id, doc in walk_definition_docs(root):
+                _t, plugin, action = definition_fields(doc)
+                self.assertEqual(got[(plugin, action)], [embed.def_envelope(doc, "")["approval_mode"]], action)
+        self.assertEqual(
+            {action: modes for (_plugin, action), modes in got.items()},
+            {"none": ["auto"], "nullblock": ["auto"], "nullmode": ["auto"], "emptymode": ["auto"],
+             "othermode": ["auto"], "always": ["always"]},
+        )
+
     def test_non_string_column_values_are_found_under_packs(self) -> None:
         doc = _definition_yaml("p.cols") + "  result:\n    columns:\n      - {name: state, values: [enabled, on]}\n"
         with tempfile.TemporaryDirectory(prefix="yuzu_test_gate_content_") as td:
             root = Path(td)
             _write_tree(root, {"content/packs/p.yaml": doc})
             self.assertEqual(find_non_string_column_values(root), ["p.cols.state: True"])
+
+
+class TestLoaderAndRunHygiene(unittest.TestCase):
+    """What `_load_module_from_path` and `embedded_definitions` promise to leave
+    untouched: `sys.modules`, `sys.dont_write_bytecode`, `sys.argv`, stdout and
+    stderr. The load is exercised on a fixture script through the same code path
+    `_embed_content` uses."""
+
+    MODULE = "yuzu_test_gate_fixture_module"
+    # Records, while it executes, whether it was registered in sys.modules (as itself)
+    # and whether bytecode writing was off; optionally raises afterwards.
+    PROBE = (
+        "import json, sys\n"
+        "from pathlib import Path\n"
+        "Path(__file__).with_suffix('.probe').write_text(json.dumps({\n"
+        "    'registered': getattr(sys.modules.get(__name__), '__dict__', None) is globals(),\n"
+        "    'dont_write': sys.dont_write_bytecode}))\n"
+    )
+
+    def _load(self, extra: str, expect_raise: bool) -> None:
+        saved_dont_write = sys.dont_write_bytecode
+        try:
+            for initial in (False, True):
+                sys.dont_write_bytecode = initial
+                with tempfile.TemporaryDirectory(prefix="yuzu_test_gate_fixture_") as td:
+                    script = Path(td) / "fixture_script.py"
+                    script.write_text(self.PROBE + extra, encoding="utf-8")
+                    if expect_raise:
+                        with self.assertRaises(RuntimeError):
+                            _load_module_from_path(self.MODULE, script)
+                    else:
+                        _load_module_from_path(self.MODULE, script)
+                    probe = json.loads(script.with_suffix(".probe").read_text(encoding="utf-8"))
+                    self.assertEqual(probe, {"registered": True, "dont_write": True}, f"initial={initial}")
+                    self.assertNotIn(self.MODULE, sys.modules, f"initial={initial}")
+                    self.assertIs(sys.dont_write_bytecode, initial)
+                    self.assertFalse((Path(td) / "__pycache__").exists(), f"initial={initial}")
+        finally:
+            sys.dont_write_bytecode = saved_dont_write
+
+    def test_load_registers_the_module_and_disables_bytecode_only_while_executing(self) -> None:
+        self._load("", expect_raise=False)
+
+    def test_load_restores_state_when_the_script_raises(self) -> None:
+        self._load("raise RuntimeError('boom')\n", expect_raise=True)
+
+    def test_embedded_definitions_restores_argv_and_streams_on_success_and_failure(self) -> None:
+        saved = (sys.argv, list(sys.argv), sys.stdout, sys.stderr)
+        with tempfile.TemporaryDirectory(prefix="yuzu_test_gate_content_") as td:
+            root = Path(td)
+            _write_tree(root, {"content/definitions/ok.yaml": _definition_yaml("h.ok")})
+            self.assertEqual(embedded_definitions(root / "content"), {"h.ok": ("question", "widget", "wipe")})
+            self.assertEqual((sys.argv, list(sys.argv), sys.stdout, sys.stderr), saved)
+            self.assertIs(sys.argv, saved[0])
+            (root / "empty").mkdir()
+            with self.assertRaisesRegex(AssertionError, "exited 1"):
+                embedded_definitions(root / "empty")  # no .yaml files: embed refuses with rc 1
+            self.assertEqual((sys.argv, list(sys.argv), sys.stdout, sys.stderr), saved)
+            self.assertIs(sys.argv, saved[0])
 
 
 _ROW = '    {{ .plugin = "{plugin}", .action = "{action}", .dispatch_class = DispatchClass::{cls}, }},\n'
@@ -1254,6 +1638,22 @@ class TestQuestionProblemCollectionOnSyntheticTree(unittest.TestCase):
             self.assertEqual(collect_question_problems(root, [rel], (), (), 0), [])
             (root / "content/definitions/q.yaml").unlink()
             self.assertTrue(any("zero question definitions" in p for p in collect_question_problems(root, [rel], (), (), 0)))
+
+    def test_an_unknown_definition_type_is_reported_by_the_collector(self) -> None:
+        rel = f"{DECLS_DIR}/a.hpp"
+        with tempfile.TemporaryDirectory(prefix="yuzu_test_gate_repo_") as td:
+            root = Path(td)
+            _write_tree(root, {
+                rel: _ROW.format(plugin="widget", action="get", cls="ReadOnly"),
+                "content/definitions/q.yaml": "---\n".join([
+                    _definition_yaml("w.get", plugin="widget", action="get"),
+                    _definition_yaml("w.bad", type_line="type: Action", plugin="widget", action="get"),
+                ]),
+            })
+            problems = collect_question_problems(root, [rel], (), (), 0)
+        self.assertEqual(
+            problems, ["UNKNOWN DEFINITION TYPE: w.bad has spec.type 'Action', expected question or action"]
+        )
 
 
 class TestFragmentListing(unittest.TestCase):
