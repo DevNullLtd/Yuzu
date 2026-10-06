@@ -49,6 +49,7 @@
 %% The application env keys a test here may set: saved in setup, restored (or
 %% unset, when they were not set) in teardown.
 -define(ENV_KEYS, [notify_pending_max,
+                   cluster_id,
                    registration_replay_spacing_ms,
                    circuit_breaker_failure_threshold,
                    circuit_breaker_reset_timeout_ms,
@@ -241,6 +242,19 @@ probe_local_exception_test_() ->
         fun other_probe_exception_is_a_failure/0),
       t("ordinary workers that cannot encode do not touch the breaker or block the rest",
         fun unencodable_ordinary_worker_does_not_touch_the_breaker/0)
+     ]}.
+
+%% cluster_id is stamped on every notification: a configured value that is a
+%% list of Unicode code points must reach the encoder as UTF-8.
+cluster_id_test_() ->
+    {foreach,
+     fun() -> setup([]) end,
+     fun cleanup/1,
+     [
+      t("a cluster_id configured as code points is converted to UTF-8 and encodes",
+        fun cluster_id_list_is_converted_to_utf8/0),
+      t("a cluster_id that cannot be represented stops the upstream at init, naming the cause",
+        fun cluster_id_unrepresentable_stops_init/0)
      ]}.
 
 %% Cap 3: a failed probe's event always fits back.
@@ -1493,6 +1507,43 @@ unencodable_ordinary_worker_does_not_touch_the_breaker() ->
     await_until(fun() -> last_gauge() =:= {0, 0} end),
     ?assertEqual({closed, 0, 0, Timeout}, breaker()),
     ?assertEqual(0, pending_len()).
+
+%% The upstream is restarted per case: cluster_id is read once, at init. A value
+%% converted with list_to_binary (a latin-1 truncation) is not valid UTF-8 for a
+%% code point above 127 and fails the real encoder on every notification.
+cluster_id_list_is_converted_to_utf8() ->
+    watch(),
+    Cases = [{[90, 252, 114, 105, 99, 104], <<90, 195, 188, 114, 105, 99, 104>>},
+             {[16#4E2D, 16#6587], <<228, 184, 173, 230, 150, 135>>},
+             {"ascii-id", <<"ascii-id">>},
+             {<<"binary-id">>, <<"binary-id">>}],
+    lists:foreach(
+      fun({{Configured, Expected}, N}) ->
+          stop_upstream(),
+          application:set_env(yuzu_gw, cluster_id, Configured),
+          _ = start_upstream(),
+          cast_connected(agent(N)),
+          {entered, W, Req} = await_attempt(),
+          ?assertEqual(Expected, maps:get(cluster_id, Req)),
+          ?assertEqual(Expected, unicode:characters_to_binary(Expected, utf8, utf8)),
+          W ! release
+      end, lists:zip(Cases, lists:seq(1, length(Cases)))).
+
+%% The boot check in yuzu_gw_app refuses such a value first; this is the second
+%% line: init/1 itself stops with a reason that names the cause and never the
+%% value (the start_link caller is linked, so it traps exits for the call).
+cluster_id_unrepresentable_stops_init() ->
+    stop_upstream(),
+    application:set_env(yuzu_gw, cluster_id, [16#110000]),
+    Prev = process_flag(trap_exit, true),
+    try
+        ?assertEqual({error, {invalid_cluster_id, app_env}}, yuzu_gw_upstream:start_link()),
+        receive {'EXIT', _Pid, {invalid_cluster_id, app_env}} -> ok
+        after ?AWAIT_MS -> erlang:error(no_exit_signal_from_the_failed_init)
+        end
+    after
+        process_flag(trap_exit, Prev)
+    end.
 
 %% A held notification whose payload cannot be encoded (an agent supplied peer
 %% address that is not UTF-8) sits at the head of the store. The head is the
