@@ -4881,6 +4881,10 @@ TEST_CASE("#5459 FU-10 (AC-16): the forced Reapply during a hung same-type watch
     m.set_park_all_watches();
     r.push();
     REQUIRE(yuzu::test::spin_until([&] { return m.parked_watch_count() == 1; }, 10s));
+    // Acknowledgments happen only in the maintenance tick, so tick while the re-arms are parked:
+    // an acknowledgment with an arm still pending would be observed here, not just eventually.
+    for (int i = 0; i < 20; ++i)
+        r.f.engine->journal_maintenance_tick();
     r.require_generation_held();
     CHECK(r.f.engine->spark_armed_rule_count() == 0);
     m.release_park_all();
