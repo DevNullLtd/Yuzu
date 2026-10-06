@@ -2911,3 +2911,95 @@ TEST_CASE("catalogue totals degrade to nullopt and never a zero", "[pg][software
         CHECK_FALSE(store.software_catalog_totals({.agent_id = "d1"}).has_value());
     }
 }
+
+TEST_CASE("source_last_seen_bulk returns the receipt time per agent and omits the unreported",
+          "[pg][software_inventory]") {
+    SWINV_SHARED(store, pool);
+    std::vector<SoftwareEntry> rows = {{"Chrome", "119", "Google", ""}};
+    const std::string h = SoftwareInventoryStore::canonical_hash(rows);
+    REQUIRE(store.apply_installed_software("agent-a", h, rows, 1000) ==
+            InventoryIngestOutcome::kStored);
+    REQUIRE(store.apply_installed_software("agent-b", h, rows, 2000) ==
+            InventoryIngestOutcome::kStored);
+    // A hash-only touch advances last_seen.
+    REQUIRE(store.apply_installed_software("agent-b", h, std::nullopt, 3000) ==
+            InventoryIngestOutcome::kTouched);
+
+    auto got = store.source_last_seen_bulk("installed_software",
+                                           {"agent-a", "agent-b", "agent-never"});
+    REQUIRE(got.has_value());
+    REQUIRE(got->size() == 2);
+    // last_seen is the SERVER receipt time (#1685), never the caller-supplied timestamp.
+    CHECK(got->at("agent-a") > 0);
+    CHECK(got->at("agent-b") >= got->at("agent-a"));
+    CHECK_FALSE(got->contains("agent-never")); // absent, never a 0
+    // Same datum the Hardware record shows, read one device at a time.
+    for (const char* id : {"agent-a", "agent-b"}) {
+        auto one = store.source_last_seen(id, "installed_software");
+        REQUIRE(one.has_value());
+        CHECK(got->at(id) == *one);
+    }
+    // Another source is a different row set.
+    auto other = store.source_last_seen_bulk("device_ci", {"agent-a"});
+    REQUIRE(other.has_value());
+    CHECK(other->empty());
+}
+
+TEST_CASE("source_last_seen_bulk: empty inputs are a precondition miss, not a degrade",
+          "[pg][software_inventory]") {
+    SWINV_SHARED(store, pool);
+    auto no_ids = store.source_last_seen_bulk("installed_software", {});
+    REQUIRE(no_ids.has_value());
+    CHECK(no_ids->empty());
+    auto no_source = store.source_last_seen_bulk("", {"agent-a"});
+    REQUIRE(no_source.has_value());
+    CHECK(no_source->empty());
+}
+
+TEST_CASE("source_last_seen_bulk: only the first kBulkLastSeenMaxIds ids are queried",
+          "[pg][software_inventory]") {
+    SWINV_SHARED(store, pool);
+    auto lease = pool.try_acquire_for(std::chrono::seconds{5});
+    REQUIRE(lease);
+    const std::size_t n = SoftwareInventoryStore::kBulkLastSeenMaxIds + 5;
+    auto ins = pg::exec_params(
+        lease.get(),
+        "INSERT INTO software_inventory_store.inventory_state "
+        "(agent_id, source, content_hash, first_seen, last_seen) "
+        "SELECT 'bulk-' || lpad(g::text, 5, '0'), 'installed_software', '', 1, 7 "
+        "FROM generate_series(1, $1::int) AS g",
+        std::vector<std::string>{std::to_string(n)});
+    REQUIRE(ins.status() == PGRES_COMMAND_OK);
+    std::vector<std::string> ids;
+    for (std::size_t i = 1; i <= n; ++i) {
+        char b[16];
+        std::snprintf(b, sizeof(b), "bulk-%05zu", i);
+        ids.emplace_back(b);
+    }
+    auto got = store.source_last_seen_bulk("installed_software", ids);
+    REQUIRE(got.has_value());
+    CHECK(got->size() == SoftwareInventoryStore::kBulkLastSeenMaxIds);
+    CHECK(got->contains(ids.front()));
+    CHECK_FALSE(got->contains(ids.back()));
+}
+
+TEST_CASE("source_last_seen_bulk: a store that never opened is a degrade", "[pg][software_inventory]") {
+    SWINV_SHARED(store, pool);
+    // Rename a column the open-time projection probes, so a second store fails closed (the
+    // same technique the schema-guard test uses), then put it back.
+    auto alter = [&](const char* sql) {
+        auto lease = pool.try_acquire_for(std::chrono::seconds{5});
+        REQUIRE(lease);
+        pg::PgResult r = pg::exec_params(lease.get(), sql, std::vector<std::string>{});
+        REQUIRE(r.status() == PGRES_COMMAND_OK);
+    };
+    alter("ALTER TABLE software_inventory_store.inventory_state RENAME COLUMN last_seen TO "
+          "last_seen_gone");
+    {
+        SoftwareInventoryStore broken{pool};
+        REQUIRE_FALSE(broken.is_open());
+        CHECK_FALSE(broken.source_last_seen_bulk("installed_software", {"agent-a"}).has_value());
+    }
+    alter("ALTER TABLE software_inventory_store.inventory_state RENAME COLUMN last_seen_gone TO "
+          "last_seen");
+}
