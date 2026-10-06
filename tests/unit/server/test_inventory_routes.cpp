@@ -708,6 +708,28 @@ TEST_CASE("software routes: devices table scope arms", "[inventory][route]") {
         REQUIRE(contains(p2->body, "id=a100"));        // page 2 resumes after the cursor...
         REQUIRE_FALSE(contains(p2->body, "id=a098"));  // ...and never re-serves page 1
     }
+    {   // A FULL scanned page with NO row in scope is incomplete, not terminal: the empty table
+        // still carries the sentinel and the cursor follows the last SCANNED row (a099).
+        InvHarness h;
+        authz::VisibleSet big{std::unordered_set<std::string>{}};
+        for (std::size_t i = 0; i <= swc::kScopePushdownMaxIds; ++i)
+            big->insert("syn" + std::to_string(i));
+        big->insert(dev_id(100)); // only the row beyond page 1 is in scope
+        h.scope = big;
+        for (int i = 0; i <= 100; ++i)
+            h.fleet_rows.push_back(fleet_row(dev_id(i), "Chrome", "1"));
+        auto p1 = h.sink.Get(url);
+        REQUIRE(p1);
+        REQUIRE_FALSE(h.last_fleet_query->agent_ids); // post-filter arm
+        REQUIRE(contains(p1->body, "No host matches."));
+        REQUIRE(contains(p1->body, "data-act=\"dmore\""));
+        REQUIRE_FALSE(contains(p1->body, "id=a0"));
+        auto p2 = h.sink.Get(next_url(p1->body, "dmore"));
+        REQUIRE(p2);
+        REQUIRE(h.last_fleet_query->after);
+        REQUIRE(h.last_fleet_query->after->agent_id == "a099");
+        REQUIRE(contains(p2->body, "id=a100"));
+    }
 }
 
 TEST_CASE("software routes: devices parameters, cursor and audit", "[inventory][route]") {
