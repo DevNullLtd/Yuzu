@@ -31,6 +31,7 @@
 #include <algorithm>
 #include <format>
 #include <string>
+#include <span>
 #include <string_view>
 #include <tuple>
 #include <vector>
@@ -84,6 +85,11 @@
 // would change output bytes for interior-NUL values. Both headers carry the
 // do-not-merge note.
 #include "installed_apps_registry_utf8.hpp"
+// The Uninstall-key walk with typed hive-read status (#4711); a header so a
+// unit test drives it against a scratch key.
+#include "installed_apps_registry_walk.hpp"
+
+#include <spdlog/spdlog.h>
 
 // Shared per-user profile/hive ladder (#2771) — the canonical implementation
 // this plugin's private copy was replaced by.
@@ -268,92 +274,31 @@ bool icontains(const std::string& haystack, const std::string& needle) {
 // namespace so the existing unqualified call sites resolve unchanged.
 using namespace yuzu::installed_apps::reg_utf8;
 
-// RAII closer for an HKEY. Closing every handle into a RegLoadKeyW-mounted hive
-// BEFORE the unload is load-bearing: RegUnLoadKeyW fails (ERROR_ACCESS_DENIED)
-// while any subtree handle is open, so a leaked HKEY on a throw path would defeat
-// the unload guard. Destruction order guarantees these callee handles close as
-// the exception leaves enumerate_uninstall_key, before the caller's unload guard
-// runs (#1662 Gate-8). Since #2771 that guard is agents/shared/win_reg_handle.hpp's
-// ScopedUserHive (do_list_per_user's own HiveUnloadGuard was deleted, migrated
-// onto the shared ladder) -- this file's HKeyCloser itself is unchanged and still
-// used for every enumerate_uninstall_key call, hive-mounted or not.
-struct HKeyCloser {
-    HKEY h;
-    explicit HKeyCloser(HKEY k) : h(k) {}
-    ~HKeyCloser() {
-        if (h)
-            RegCloseKey(h);
-    }
-    HKeyCloser(const HKeyCloser&) = delete;
-    HKeyCloser& operator=(const HKeyCloser&) = delete;
-};
+namespace reg_walk = yuzu::installed_apps::reg_walk;
 
-void enumerate_uninstall_key(HKEY root, const char* subkey, REGSAM extra_sam,
-                             std::vector<AppInfo>& apps) {
-    HKEY hkey{};
-    if (RegOpenKeyExW(root, to_wide(subkey).c_str(), 0,
-                      KEY_READ | KEY_ENUMERATE_SUB_KEYS | extra_sam, &hkey) != ERROR_SUCCESS) {
-        return;
-    }
-    HKeyCloser hkey_guard{hkey};
+const std::wstring kUninstallKey = L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall";
 
-    // RegEnumKeyExW's lpcchName is a WCHAR COUNT, not a byte size. Bind the array
-    // size and every reset to one constant so the byte-vs-count unit cannot skew —
-    // the #1662 A->W conversion missed one reset site (gov Gate 3/4 BLOCKING).
-    constexpr DWORD kNameBufLen = 256;
-    wchar_t name_buf[kNameBufLen]{};
-    DWORD idx = 0;
-    DWORD name_len = kNameBufLen;
+std::span<const reg_walk::UninstallRoot> windows_roots() {
+    static const reg_walk::UninstallRoot roots[] = {
+        {HKEY_LOCAL_MACHINE, kUninstallKey, KEY_WOW64_64KEY, false}, // 64-bit HKLM
+        {HKEY_LOCAL_MACHINE, kUninstallKey, KEY_WOW64_32KEY, false}, // 32-bit HKLM (WoW6432Node)
+        {HKEY_CURRENT_USER, kUninstallKey, 0, true},                 // current user
+    };
+    return roots;
+}
 
-    while (RegEnumKeyExW(hkey, idx++, name_buf, &name_len, nullptr, nullptr, nullptr, nullptr) ==
-           ERROR_SUCCESS) {
-        HKEY app_key{};
-        if (RegOpenKeyExW(hkey, name_buf, 0, KEY_READ | extra_sam, &app_key) == ERROR_SUCCESS) {
-            HKeyCloser app_guard{app_key};
-            // Policy per value: see read_reg_string. Only InstallLocation accepts
-            // REG_EXPAND_SZ; the four hashed fields and SystemComponent stay REG_SZ-only.
-            auto read_str = [&](const char* value_name, bool accept_expand_sz) {
-                return read_reg_string(app_key, value_name, accept_expand_sz);
-            };
-
-            auto display_name = read_str("DisplayName", false);
-            if (!display_name.empty()) {
-                // Meant to skip system components, but SystemComponent is a
-                // REG_DWORD and read_reg_string accepts strings only, so this test
-                // never matches today (tracked separately).
-                auto sys_component = read_str("SystemComponent", false);
-                if (sys_component == "1") {
-                    name_len = kNameBufLen;
-                    continue; // app_guard closes app_key
-                }
-
-                AppInfo app;
-                app.name = std::move(display_name);
-                app.version = read_str("DisplayVersion", false);
-                app.publisher = read_str("Publisher", false);
-                app.install_date = read_str("InstallDate", false);
-                app.install_location = read_str("InstallLocation", /*accept_expand_sz=*/true);
-                apps.push_back(std::move(app));
-            }
-        }
-        name_len = kNameBufLen;
-    }
+void log_failed_root(std::size_t i) {
+    static constexpr const char* kRootNames[] = {"HKLM-64", "HKLM-32", "HKCU"};
+    spdlog::warn("installed_apps: Uninstall root {} could not be fully read -- the "
+                 "collection is degraded",
+                 kRootNames[i]);
 }
 
 AppCollection get_installed_apps_windows() {
-    std::vector<AppInfo> apps;
-    // Native registry reads: no subprocess outcome to propagate. See
-    // do_list_inventory for why that is NOT a claim this leg cannot
-    // under-report.
-    const bool degraded = false;
-    static const char* kUninstallKey = "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall";
-
-    // 64-bit HKLM
-    enumerate_uninstall_key(HKEY_LOCAL_MACHINE, kUninstallKey, KEY_WOW64_64KEY, apps);
-    // 32-bit HKLM (WoW6432Node)
-    enumerate_uninstall_key(HKEY_LOCAL_MACHINE, kUninstallKey, KEY_WOW64_32KEY, apps);
-    // Current user
-    enumerate_uninstall_key(HKEY_CURRENT_USER, kUninstallKey, 0, apps);
+    auto walk = reg_walk::collect_uninstall_apps(windows_roots());
+    for (const auto i : walk.failed_roots)
+        log_failed_root(i);
+    auto apps = std::move(walk.apps);
 
     // Sort, `list`-only location layer, unique(): one pure pass shared with the
     // tests (installed_apps_parsers.hpp). The comparator and survivor are the
@@ -362,7 +307,7 @@ AppCollection get_installed_apps_windows() {
     // lexicographically smallest populated one in its run).
     parsers::dedupe_uninstall_records(apps);
 
-    return AppCollection{std::move(apps), degraded};
+    return AppCollection{std::move(apps), walk.degraded};
 }
 #endif
 
@@ -464,27 +409,6 @@ AppCollection get_installed_apps_macos() {
 // ── list_inventory collectors (blob contract v2) ──────────────────────────
 
 namespace inv = yuzu::installed_apps::inventory;
-
-#ifdef _WIN32
-InvCollection get_inventory_windows() {
-    std::vector<inv::InvRecord> recs;
-    auto win = get_installed_apps_windows();
-    for (auto& app : win.apps) {
-        inv::InvRecord r;
-        r.name = std::move(app.name);
-        r.version = std::move(app.version);
-        r.publisher = std::move(app.publisher);
-        r.install_date = std::move(app.install_date);
-        r.kind = "app";
-        r.ecosystem = "windows";
-        // epoch/release/signature honest-empty: the Uninstall hive stores no
-        // NEVRA and no signature. arch stays empty too — inferring x64/x86
-        // from which hive a key sat in would be synthesis, not storage.
-        recs.push_back(std::move(r));
-    }
-    return InvCollection{std::move(recs), false};
-}
-#endif
 
 #ifdef __linux__
 InvCollection get_inventory_linux() {
@@ -1002,16 +926,14 @@ int do_list_inventory(yuzu::CommandContext& ctx) {
     // already skips the whole cycle on a nonzero rc; this reports into that
     // existing contract rather than inventing a new signal.
 #ifdef _WIN32
-    // Windows acquires natively (registry), so there is no SUBPROCESS outcome to
-    // propagate and `degraded` stays false here. That is NOT a claim the Windows
-    // leg cannot under-report: enumerate_uninstall_key returns silently if
-    // RegOpenKeyExW fails and stops at the first non-ERROR_SUCCESS from
-    // RegEnumKeyExW, so a partial registry walk publishes as complete. That is
-    // pre-existing behaviour this PR does not touch or worsen, and closing it
-    // needs its own change plus Windows-side testing -- flagged in the gate
-    // report rather than silently implied to be covered here.
-    auto collected = get_inventory_windows();
-#elif defined(__linux__)
+    // Windows acquires natively (registry). A root that could not be opened or
+    // enumerated to the end, or an app key that was denied, marks the walk
+    // degraded: reg_walk::list_inventory then emits no rows, declares
+    // CONSTRAINED/PARTIAL and returns rc 1 -- the same contract as below.
+    return reg_walk::list_inventory(ctx, windows_roots(), reg_walk::RealRegOps{},
+                                    log_failed_root);
+#else
+#if defined(__linux__)
     auto collected = get_inventory_linux();
 #elif defined(__APPLE__)
     auto collected = get_inventory_macos();
@@ -1019,12 +941,10 @@ int do_list_inventory(yuzu::CommandContext& ctx) {
     InvCollection collected;
 #endif
 
-#if defined(__linux__) || defined(__APPLE__)
     if (collected.degraded)
         spdlog::warn("installed_apps: list_inventory acquisition was degraded -- reporting "
                      "rc=1 so the daily sync skips this cycle instead of committing a "
                      "partial inventory as authoritative");
-#endif
 
     // No sentinel row: an empty result is empty output + rc 0. The sync
     // source's empty-parse guard skips the cycle rather than wiping state.
@@ -1032,21 +952,23 @@ int do_list_inventory(yuzu::CommandContext& ctx) {
                                    [](const inv::InvRecord& r) {
                                        return yuzu::util::sanitize_utf8(inv::format_inv_row(r));
                                    });
+#endif
 }
 
 // Emit an honest failure row for a degraded operator-facing action and tell
 // the caller to bail. Returns true when the collection is healthy and the
 // action should proceed. Kept as one helper so `list`, `query` and
 // `list_per_user` cannot drift apart on the wording or the rc.
-bool report_if_degraded(yuzu::CommandContext& ctx, bool degraded,
-                        [[maybe_unused]] std::string_view action) {
-#if defined(__linux__) || defined(__APPLE__)
+bool report_if_degraded(yuzu::CommandContext& ctx, bool degraded, std::string_view action) {
     if (degraded)
         spdlog::warn("installed_apps: '{}' acquisition was degraded -- reporting an error "
                      "rather than presenting a partial or empty list as authoritative",
                      action);
-#endif
+#ifdef _WIN32
+    return parsers::report_degraded(ctx, degraded, parsers::kRegistryCauses);
+#else
     return parsers::report_degraded(ctx, degraded);
+#endif
 }
 
 // ── list action ───────────────────────────────────────────────────────────
@@ -1247,8 +1169,6 @@ private:
         // SeRestore, and fell back to the SID as a display name in violation
         // of ADR-0024 D11. It now rides the shared ladder in
         // agents/shared/win_profiles.hpp, which is the canonical one.
-        static const char* kUninstallKey =
-            "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall";
 
         bool profiles_ok = false;
         bool truncated = false;
@@ -1263,12 +1183,20 @@ private:
         const auto profiles = yuzu::profiles::build_profile_list(records, hku_subkeys);
 
         std::size_t privilege_missing = 0;
+        std::size_t hive_read_failed = 0;
         for (const auto& profile : profiles) {
             std::vector<AppInfo> user_apps;
             yuzu::win::HiveAccessReport report;
             const auto status = yuzu::win::with_user_hive(
                 profile.sid, profile.profile_path,
-                [&](HKEY root) { enumerate_uninstall_key(root, kUninstallKey, 0, user_apps); },
+                [&](HKEY root) {
+                    // A user hive often has no Uninstall key (absent_ok); anything
+                    // else (e.g. access denied) under-reports this profile.
+                    const reg_walk::UninstallRoot r{root, kUninstallKey, 0, true};
+                    if (reg_walk::enumerate_uninstall_key(r, user_apps) ==
+                        reg_walk::HiveRead::failed)
+                        ++hive_read_failed;
+                },
                 &report);
 
             // A leaked mount is the same system-wide fact wherever it happens,
@@ -1314,6 +1242,7 @@ private:
             ctx.write_output(yuzu::profiles::render_profile_list_truncated_warning(
                 yuzu::win::kMaxProfiles));
         }
+        parsers::report_hive_read_failed(ctx, hive_read_failed);
         if (privilege_missing > 0) {
             ctx.write_output(std::format(
                 "warning|privilege_missing: SeBackupPrivilege/SeRestorePrivilege could not be "

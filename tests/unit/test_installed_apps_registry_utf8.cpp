@@ -184,14 +184,23 @@ TEST_CASE("installed_apps read_reg_string: a REG_DWORD reads as empty under eith
     CHECK(read_reg_string(scratch.key, "SystemComponent", true).empty());
 }
 
-TEST_CASE("installed_apps read_reg_string: a value over 511 WCHARs reads as empty, never "
-          "truncated (ERROR_MORE_DATA; a larger-buffer retry is a tracked follow-up)",
+TEST_CASE("installed_apps read_reg_string: a value over 511 WCHARs reads back in full "
+          "after one ERROR_MORE_DATA retry",
           "[installed_apps][registry][windows]") {
     ScratchKey scratch;
     REQUIRE(scratch.ok);
     const std::wstring big(600, L'a');
     set_sz(scratch.key, L"Long", big.c_str());
-    CHECK(read_reg_string(scratch.key, "Long", true).empty());
+    CHECK(read_reg_string(scratch.key, "Long", true) == std::string(600, 'a'));
+}
+
+TEST_CASE("installed_apps read_reg_string: a value over the 64 KiB cap reads as empty",
+          "[installed_apps][registry][windows]") {
+    ScratchKey scratch;
+    REQUIRE(scratch.ok);
+    const std::wstring huge(40000, L'a'); // 80 KB > kMaxValueBytes
+    set_sz(scratch.key, L"Huge", huge.c_str());
+    CHECK(read_reg_string(scratch.key, "Huge", true).empty());
 }
 
 #endif // _WIN32

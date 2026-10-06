@@ -30,6 +30,7 @@
 #endif
 #include <windows.h>
 
+#include <algorithm>
 #include <string>
 #include <string_view>
 
@@ -87,23 +88,41 @@ inline std::string reg_sz_to_utf8(const wchar_t* buf, DWORD size_bytes) {
 // accept_expand_sz=false is the ADR-0016 hashed-field policy (REG_SZ only,
 // unchanged since #1662); only InstallLocation passes true, and the value is
 // returned RAW (an unexpanded "%ProgramFiles%\..." stays as written). A value
-// larger than the 512-WCHAR buffer (ERROR_MORE_DATA; a terminated value is over
-// 511 characters), of any other type, or absent reads as empty -- the same "-" the
-// row renders for a missing value (README caveats).
+// larger than the 512-WCHAR stack buffer (ERROR_MORE_DATA) is re-read ONCE into
+// a heap buffer sized from the reported byte count, capped at kMaxValueBytes
+// (64 KiB); above the cap, or of any other type, or absent, it reads as empty --
+// the same "-" the row renders for a missing value (README caveats).
 // Lives here, not in the plugin's lambda, so test_installed_apps_registry_utf8
 // exercises the same code the plugin runs, rather than a re-implementation that
 // could silently diverge.
+inline constexpr DWORD kMaxValueBytes = 64 * 1024;
+
 inline std::string read_reg_string(HKEY key, const char* value_name, bool accept_expand_sz) {
+    const std::wstring wname = to_wide(value_name);
     wchar_t buf[512]{};
     DWORD size = sizeof(buf); // BYTES; buf is written as bytes and read back through
     DWORD type = 0;           // its declared wchar_t lvalue (LPBYTE is align-1)
-    // The single byte-type aliasing cast (docs/cpp-conventions.md asks for this
-    // proof): `buf` is a local that outlives the call and `size` bounds the write.
-    if (RegQueryValueExW(key, to_wide(value_name).c_str(), nullptr, &type,
-                         reinterpret_cast<LPBYTE>(buf), &size) == ERROR_SUCCESS &&
+    // The byte-type aliasing casts (docs/cpp-conventions.md asks for this
+    // proof): each buffer is a local that outlives its call and `size` bounds the write.
+    LSTATUS rc = RegQueryValueExW(key, wname.c_str(), nullptr, &type,
+                                  reinterpret_cast<LPBYTE>(buf), &size);
+    if (rc == ERROR_SUCCESS) {
+        if (yuzu::installed_apps::parsers::reg_string_type_accepted(type, accept_expand_sz) &&
+            size >= sizeof(wchar_t))
+            return reg_sz_to_utf8(buf, size);
+        return {};
+    }
+    if (rc != ERROR_MORE_DATA || size > kMaxValueBytes)
+        return {};
+    std::wstring big(size / sizeof(wchar_t) + 1, L'\0');
+    // Advertise at most the cap: a value that grew between the two reads gets
+    // ERROR_MORE_DATA (-> empty), never a buffer larger than the documented bound.
+    DWORD big_size = (std::min)(static_cast<DWORD>(big.size() * sizeof(wchar_t)), kMaxValueBytes);
+    if (RegQueryValueExW(key, wname.c_str(), nullptr, &type, reinterpret_cast<LPBYTE>(big.data()),
+                         &big_size) == ERROR_SUCCESS &&
         yuzu::installed_apps::parsers::reg_string_type_accepted(type, accept_expand_sz) &&
-        size >= sizeof(wchar_t)) {
-        return reg_sz_to_utf8(buf, size);
+        big_size >= sizeof(wchar_t)) {
+        return reg_sz_to_utf8(big.data(), big_size);
     }
     return {};
 }
