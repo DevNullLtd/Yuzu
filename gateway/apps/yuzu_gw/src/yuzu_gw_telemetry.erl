@@ -189,9 +189,18 @@ handle_event([yuzu, gw, upstream, registration_replay],
 %% arriving with the breaker not closed is now held, not dropped). Without
 %% this clause the event fires into an unregistered telemetry event and never
 %% reaches Prometheus, same failure shape `forward_dropped` below exists to
-%% avoid. The reason label is taken as given, so the handler stays generic.
+%% avoid. The label is a closed set: `at_capacity' is itself, and a missing
+%% reason or any other value (a non-binary included) folds to a pre-seeded
+%% `unknown' series, as verdict_dropped and buffer_dropped do, so a bug cannot
+%% widen the label set. yuzu_gw_upstream emits only the literal at_capacity
+%% today. The handler must never crash: telemetry detaches a handler that
+%% raises, which would silence every metric.
 handle_event([yuzu, gw, upstream, notify_dropped], #{count := N}, Meta, _Config) ->
-    Reason = maps:get(reason, Meta, <<"unknown">>),
+    Reason = case maps:get(reason, Meta, unknown) of
+        <<"at_capacity">> -> <<"at_capacity">>;
+        at_capacity -> <<"at_capacity">>;
+        _ -> <<"unknown">>
+    end,
     prometheus_counter:inc(yuzu_gw_upstream_notify_dropped_total, [Reason], N);
 
 %% #4632: size of the notify pending store and the number of NotifyStreamStatus
@@ -455,16 +464,17 @@ declare_metrics() ->
         {labels, [reason]},
         {help, "Stream-status (CONNECTED/DISCONNECTED) notifications lost at "
                "admission because the pending store already held "
-               "notify_pending_max keys. The label reason has the single value "
-               "at_capacity (the circuit_open value is no longer emitted: a "
-               "notification arriving while the breaker is not closed is held). "
-               "It does not count delivery loss after admission (worker failure, "
+               "notify_pending_max keys. The label reason has the closed set "
+               "at_capacity, plus unknown for any other value, which the "
+               "gateway does not emit today (the circuit_open value is no longer "
+               "emitted: a notification arriving while the breaker is not closed "
+               "is held). It does not count delivery loss after admission (worker failure, "
                "gateway shutdown). A sustained non-zero rate means agents are "
                "converging their gateway_node placement slower than expected, or "
                "not at all, during a connect burst or recovery replay."}]),
     %% A series that first appears already at 1 is invisible to increase().
-    prometheus_counter:inc(yuzu_gw_upstream_notify_dropped_total,
-                           [<<"at_capacity">>], 0),
+    [prometheus_counter:inc(yuzu_gw_upstream_notify_dropped_total, [R], 0)
+     || R <- [<<"at_capacity">>, <<"unknown">>]],
     prometheus_counter:declare([
         {name, yuzu_gw_upstream_notify_coalesced_total},
         {labels, []},
