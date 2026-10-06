@@ -14,10 +14,10 @@
 -define(GRIN, <<240, 159, 152, 128>>).
 
 ascii_is_unchanged_test() ->
-    ?assertEqual(<<"gateway.example:50051">>,
-                 yuzu_gw_peer_addr:sanitize(<<"gateway.example:50051">>)),
-    ?assertEqual(<<"gateway.example:443">>,
-                 yuzu_gw_peer_addr:sanitize(<<"gateway.example:443">>)).
+    ?assertEqual(<<"peer-a:1">>,
+                 yuzu_gw_peer_addr:sanitize(<<"peer-a:1">>)),
+    ?assertEqual(<<"peer-b:2">>,
+                 yuzu_gw_peer_addr:sanitize(<<"peer-b:2">>)).
 
 empty_is_unchanged_test() ->
     ?assertEqual(<<>>, yuzu_gw_peer_addr:sanitize(<<>>)).
@@ -35,9 +35,11 @@ valid_multibyte_within_the_limit_is_unchanged_test() ->
     ?assertEqual(Addr, yuzu_gw_peer_addr:sanitize(Addr)).
 
 cut_never_splits_a_multibyte_character_test_() ->
-    %% A multibyte character that starts before byte 255 and ends after it: the
-    %% result stops before it. Pad so the character begins at offset Pad, for
-    %% every offset where it straddles the limit.
+    %% A multibyte character that starts before byte 255 and ends at or after it:
+    %% the result stops before it. Pad so the character begins at offset Pad, for
+    %% every offset where it straddles the limit (the first is the one where only
+    %% its last byte lies past the limit, which needs the longest step back) and
+    %% for the offset where it starts exactly at the limit.
     [{lists:flatten(io_lib:format("~b-byte char at offset ~b", [byte_size(Char), Pad])),
       fun() ->
           Addr = <<(binary:copy(<<"a">>, Pad))/binary, Char/binary, "tail">>,
@@ -47,7 +49,7 @@ cut_never_splits_a_multibyte_character_test_() ->
           ?assert(is_binary(unicode:characters_to_binary(Out, utf8, utf8)))
       end}
      || Char <- [?EURO, ?GRIN],
-        Pad <- lists:seq(255 - byte_size(Char) + 2, 255)].
+        Pad <- lists:seq(256 - byte_size(Char), 255)].
 
 cut_keeps_a_character_that_ends_exactly_at_the_limit_test() ->
     Addr = <<(binary:copy(<<"a">>, 252))/binary, ?EURO/binary, "tail">>,

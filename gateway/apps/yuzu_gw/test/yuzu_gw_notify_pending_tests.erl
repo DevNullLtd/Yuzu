@@ -90,6 +90,8 @@ closed_test_() ->
         fun two_sessions_of_one_agent_are_both_kept/0),
       t("the peer address is made safe at admission: capped, replaced when invalid, else unchanged",
         fun peer_addr_is_sanitised_at_admission/0),
+      t("the notification carries exactly the known keys, every binary valid UTF-8",
+        fun notification_key_set_and_utf8/0),
       t("the held peer address is a copy: it does not keep the parent binary alive",
         fun peer_addr_does_not_retain_its_parent_binary/0),
       t("an open circuit holds notifications; a half_open probe that succeeds drains them in order",
@@ -624,11 +626,38 @@ peer_addr_is_sanitised_at_admission() ->
     watch(),
     Cases = [{<<"p-long">>, binary:copy(<<"a">>, 5000), binary:copy(<<"a">>, 255)},
              {<<"p-bad">>, ?POISON_PEER, <<"invalid">>},
-             {<<"p-ok">>, <<"gateway.example:443">>, <<"gateway.example:443">>}],
+             {<<"p-ok">>, <<"peer-a:1">>, <<"peer-a:1">>}],
     [cast_status(Id, <<"sess">>, Peer) || {Id, Peer, _} <- Cases],
     Entered = await_entered(length(Cases)),
     Got = maps:from_list([{maps:get(agent_id, R), maps:get(peer_addr, R)} || {_, R} <- Entered]),
     ?assertEqual(maps:from_list([{Id, Want} || {Id, _, Want} <- Cases]), Got).
+
+%% The notification map built in the cast handler has exactly these keys. A
+%% future field that carries agent supplied or configured text is a new way for
+%% every send to fail the same way, so adding a key must be a decision: update
+%% this list together with the admission rules in yuzu_gw_upstream's header (the
+%% standing invariant) and decide whether the new field needs sanitising.
+-define(NOTIFICATION_KEYS, [agent_id, cluster_id, event, gateway_node, peer_addr,
+                            session_id, stream_home_id, wire_capabilities]).
+
+notification_key_set_and_utf8() ->
+    watch(),
+    Odd = [{<<"k-ok">>, <<"sess">>, <<"peer-a:1">>},
+           {<<"k-bad">>, <<"sess">>, ?POISON_PEER},
+           {<<"k-long">>, <<"sess">>, binary:copy(<<226, 130, 172>>, 200)},
+           {<<"k-nonbin">>, <<"sess">>, not_a_binary},
+           {<<"k-nosession">>, undefined, <<"peer-a:1">>}],
+    [notify_status(Id, Sess, connected, Peer, <<"home">>) || {Id, Sess, Peer} <- Odd],
+    Entered = await_entered(length(Odd)),
+    lists:foreach(
+      fun({_, Req}) ->
+          ?assertEqual(?NOTIFICATION_KEYS, lists:sort(maps:keys(Req))),
+          Texts = [V || V <- maps:values(Req), is_binary(V)] ++ maps:get(wire_capabilities, Req),
+          [?assertEqual(V, unicode:characters_to_binary(V, utf8, utf8)) || V <- Texts],
+          %% And the real encoder takes it: the mock already ran it, and so does this.
+          ?assert(is_binary(iolist_to_binary(
+                    gateway_pb:encode_msg(Req, 'yuzu.gateway.v1.StreamStatusNotification'))))
+      end, Entered).
 
 %% A peer address of 100 or 255 valid bytes read out of a large header block
 %% passes the sanitiser unchanged; it must still not pin the block while held.
