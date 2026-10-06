@@ -14,7 +14,8 @@
 -define(GRIN, <<240, 159, 152, 128>>).
 
 ascii_is_unchanged_test() ->
-    ?assertEqual(<<"10.0.0.1:50051">>, yuzu_gw_peer_addr:sanitize(<<"10.0.0.1:50051">>)),
+    ?assertEqual(<<"gateway.example:50051">>,
+                 yuzu_gw_peer_addr:sanitize(<<"gateway.example:50051">>)),
     ?assertEqual(<<"gateway.example:443">>,
                  yuzu_gw_peer_addr:sanitize(<<"gateway.example:443">>)).
 
