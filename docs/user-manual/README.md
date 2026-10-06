@@ -107,7 +107,7 @@ The container images (`yuzu-server`, `yuzu-gateway`, `yuzu-agent` and their chis
 carry their own runtime libraries and are not affected; use them for the server and gateway
 on any other distribution. The exception is `yuzu-agent-bundle-chisel`, which delivers
 agent files: the Linux agent extracted from it has the tarball's requirements. Building the
-native packages to an older baseline is targeted for 0.14.1 (#5143).
+native packages to an older baseline is targeted for 0.15.0 (#5143).
 
 ## Quick Start
 
