@@ -34,6 +34,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -78,6 +79,17 @@ yuzu::test::PgTestTemplate rbac_tpl{"rbacstore", [](const std::string& dsn) {
 bool role_grants(const RbacStore& store, const std::string& role, const std::string& securable_type,
                  const std::string& operation) {
     return store.role_permission_allowed_checked(role, securable_type, operation).value_or(false);
+}
+
+// Whether `role` definitively does NOT grant `(securable_type, operation)`: unlike
+// `!role_grants(...)` a failed read is a test failure here, not a pass, so a negative assertion
+// cannot go green on a broken read. Use `role_grants` only where the case deliberately asserts
+// that a broken store must not grant.
+bool role_denies(const RbacStore& store, const std::string& role, const std::string& securable_type,
+                 const std::string& operation) {
+    auto result = store.role_permission_allowed_checked(role, securable_type, operation);
+    REQUIRE(result.has_value());
+    return !*result;
 }
 
 // Seed a group row DIRECTLY (bypassing create_group's reserved-prefix guard) to
@@ -774,14 +786,14 @@ TEST_CASE("RbacStore: remove permission deletes the row and survives a reseed",
     // THE FIX: the row is genuinely gone — absent, not tombstoned.
     for (const auto& p : store.get_role_permissions("Operator"))
         CHECK_FALSE((p.securable_type == "AuditLog" && p.operation == "Read"));
-    CHECK_FALSE(role_grants(store, "Operator", "AuditLog", "Read"));
+    CHECK(role_denies(store, "Operator", "AuditLog", "Read"));
 
     // THE REGRESSION THIS CLOSES: a second construction against the SAME
     // pool runs the REAL seed_defaults() (unconditional on every boot,
     // ON CONFLICT DO NOTHING) — its grant() now consults
     // revoked_seed_defaults and skips re-inserting the revoked row.
     RbacStore reopened{rbac_pool_fx_};
-    CHECK_FALSE(role_grants(reopened, "Operator", "AuditLog", "Read"));
+    CHECK(role_denies(reopened, "Operator", "AuditLog", "Read"));
 }
 
 // chaos-injector (Gate 5, #2703, HIGH — CHAOS-1, verified against live PG):
@@ -883,7 +895,7 @@ TEST_CASE("RbacStore: seed_defaults()'s grant() cannot resurrect a permission mi
     CHECK(b_open.load());
 
     // THE FIX: the permission must stay revoked.
-    CHECK_FALSE(role_grants(store, "Operator", "AuditLog", "Read"));
+    CHECK(role_denies(store, "Operator", "AuditLog", "Read"));
 }
 
 // fable (Gate 4, #2703, HIGH): a principal holding BOTH a role whose default
@@ -905,7 +917,7 @@ TEST_CASE("RbacStore: revoking one role's default does not veto a different role
     REQUIRE(store.check_permission("dualuser", "AuditLog", "Read"));
 
     REQUIRE(store.remove_permission("PlatformEngineer", "AuditLog", "Read").has_value());
-    CHECK_FALSE(role_grants(store, "PlatformEngineer", "AuditLog", "Read"));
+    CHECK(role_denies(store, "PlatformEngineer", "AuditLog", "Read"));
     // Operator's independent grant is untouched...
     CHECK(role_grants(store, "Operator", "AuditLog", "Read"));
     // ...and dualuser, holding both roles, is STILL granted — Operator's
@@ -2306,7 +2318,7 @@ TEST_CASE("RbacStore: a decommission-ability revocation via an old conjunct gran
     // exact real-world action the finding describes.
     auto removed = store.remove_permission("ITServiceOwner", "SoftwareLicensing", "Delete");
     REQUIRE(removed.has_value());
-    REQUIRE_FALSE(role_grants(store, "ITServiceOwner", "SoftwareLicensing", "Delete"));
+    REQUIRE(role_denies(store, "ITServiceOwner", "SoftwareLicensing", "Delete"));
     // The old conjunct grant's sibling ability was never seeded on Decommission
     // by remove_permission() itself — only seed_defaults() carries it forward.
     REQUIRE(role_grants(store, "ITServiceOwner", "Decommission", "Delete"));
@@ -2317,7 +2329,7 @@ TEST_CASE("RbacStore: a decommission-ability revocation via an old conjunct gran
     RbacStore reopened{rbac_pool_fx_};
     REQUIRE(reopened.is_open());
 
-    CHECK_FALSE(role_grants(reopened, "ITServiceOwner", "Decommission", "Delete"));
+    CHECK(role_denies(reopened, "ITServiceOwner", "Decommission", "Delete"));
     // The other two old conjunct grants (never revoked) should be untouched.
     CHECK(role_grants(reopened, "ITServiceOwner", "Inventory", "Delete"));
     CHECK(role_grants(reopened, "ITServiceOwner", "GuaranteedState", "Delete"));
@@ -2351,8 +2363,8 @@ TEST_CASE("RbacStore: an operator's explicit re-grant of Decommission:Delete sur
     {
         RbacStore first_reopen{rbac_pool_fx_};
         REQUIRE(first_reopen.is_open());
-        REQUIRE_FALSE(
-            role_grants(first_reopen, "ITServiceOwner", "Decommission", "Delete"));
+        REQUIRE(
+            role_denies(first_reopen, "ITServiceOwner", "Decommission", "Delete"));
 
         // Operator explicitly re-grants Decommission:Delete via the RBAC
         // editor's own path — set_permission() writes role_permissions
@@ -2441,8 +2453,8 @@ TEST_CASE("RbacStore: a fault during the Decommission carry-forward DELETE does 
     }
     RbacStore second_reopen{rbac_pool_fx_};
     REQUIRE(second_reopen.is_open());
-    CHECK_FALSE(
-        role_grants(second_reopen, "ITServiceOwner", "Decommission", "Delete"));
+    CHECK(
+        role_denies(second_reopen, "ITServiceOwner", "Decommission", "Delete"));
 }
 
 TEST_CASE("RbacStore: a fault at COMMIT itself (not an earlier statement) must not let the "
@@ -2490,7 +2502,7 @@ TEST_CASE("RbacStore: a fault at COMMIT itself (not an earlier statement) must n
                        "operation = 'Delete';")};
         REQUIRE(del_res.ok());
     }
-    REQUIRE_FALSE(role_grants(store, "ITServiceOwner", "Decommission", "Delete"));
+    REQUIRE(role_denies(store, "ITServiceOwner", "Decommission", "Delete"));
 
     auto removed = store.remove_permission("ITServiceOwner", "SoftwareLicensing", "Delete");
     REQUIRE(removed.has_value());
@@ -2529,8 +2541,8 @@ TEST_CASE("RbacStore: a fault at COMMIT itself (not an earlier statement) must n
     {
         RbacStore first_reopen{rbac_pool_fx_};
         REQUIRE(first_reopen.is_open());
-        CHECK_FALSE(
-            role_grants(first_reopen, "ITServiceOwner", "Decommission", "Delete"));
+        CHECK(
+            role_denies(first_reopen, "ITServiceOwner", "Decommission", "Delete"));
     }
 
     // No marker was durably recorded (the whole transaction, including the
@@ -2546,8 +2558,8 @@ TEST_CASE("RbacStore: a fault at COMMIT itself (not an earlier statement) must n
     }
     RbacStore second_reopen{rbac_pool_fx_};
     REQUIRE(second_reopen.is_open());
-    CHECK_FALSE(
-        role_grants(second_reopen, "ITServiceOwner", "Decommission", "Delete"));
+    CHECK(
+        role_denies(second_reopen, "ITServiceOwner", "Decommission", "Delete"));
 }
 
 // ── check_scoped_permission ──────────────────────────────────────────────────
@@ -2646,7 +2658,7 @@ TEST_CASE("RbacStore: revoking one role's default does not create a scoped deny_
     REQUIRE(role_grants(rbac, "ITServiceOwner", "Tag", "Write"));
     REQUIRE(role_grants(rbac, "Operator", "Tag", "Write"));
     REQUIRE(rbac.remove_permission("ITServiceOwner", "Tag", "Write").has_value());
-    CHECK_FALSE(role_grants(rbac, "ITServiceOwner", "Tag", "Write"));
+    CHECK(role_denies(rbac, "ITServiceOwner", "Tag", "Write"));
 
     ManagementGroup g;
     g.name = "Service: CRM";
@@ -3063,6 +3075,9 @@ TEST_CASE("RbacStore: user_rbac_group_names and role_effects_for record "
     // reason=pool_acquire_timeout.
     auto r1 = acc.user_rbac_group_names("bob");
     REQUIRE_FALSE(r1.has_value());
+    // The error text is the shared constant: authz::ceiling_degrade_reason matches on it, so a
+    // hand-typed variant would be labelled query_error instead of pool_acquire_timeout.
+    CHECK(std::string_view{r1.error()} == kRbacErrPoolAcquireTimeout);
     CHECK(metrics.counter("yuzu_server_rbac_read_degrade_total",
                           {{"reason", "pool_acquire_timeout"}})
               .value() == 1.0);
@@ -3072,6 +3087,7 @@ TEST_CASE("RbacStore: user_rbac_group_names and role_effects_for record "
     // closed->open transition, reason=pool_acquire_timeout again.
     auto r2 = acc.role_effects_for("Infrastructure", "Read");
     REQUIRE_FALSE(r2.has_value());
+    CHECK(std::string_view{r2.error()} == kRbacErrPoolAcquireTimeout);
     CHECK(metrics.counter("yuzu_server_rbac_read_degrade_total",
                           {{"reason", "pool_acquire_timeout"}})
               .value() == 2.0);
@@ -3085,6 +3101,7 @@ TEST_CASE("RbacStore: user_rbac_group_names and role_effects_for record "
     // breaker-denied branch, not a distinct reason — see the HELP text).
     auto r3 = acc.user_rbac_group_names("bob");
     REQUIRE_FALSE(r3.has_value());
+    CHECK(std::string_view{r3.error()} == kRbacErrCircuitBreakerOpen);
     CHECK(metrics.counter("yuzu_server_rbac_read_degrade_total",
                           {{"reason", "pool_acquire_timeout"}})
               .value() == 3.0);
@@ -3097,6 +3114,7 @@ TEST_CASE("RbacStore: user_rbac_group_names and role_effects_for record "
     // pool touch too.
     auto r4 = acc.role_effects_for("Infrastructure", "Read");
     REQUIRE_FALSE(r4.has_value());
+    CHECK(std::string_view{r4.error()} == kRbacErrCircuitBreakerOpen);
     CHECK(metrics.counter("yuzu_server_rbac_read_degrade_total",
                           {{"reason", "pool_acquire_timeout"}})
               .value() == 4.0);

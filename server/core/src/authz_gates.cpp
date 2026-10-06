@@ -10,8 +10,8 @@
 
 #include <yuzu/metrics.hpp> // MetricsRegistry — #4031 topology-floor-denied counter
 
+#include <cassert>
 #include <expected>
-#include <optional>
 #include <string>
 #include <string_view>
 #include <unordered_set>
@@ -57,6 +57,11 @@ void AuthRoutes::respond_ceiling_degraded(const httplib::Request& req, httplib::
     // truthfully. The caller still refuses the request (fail CLOSED); this only writes the
     // response. No `.permission`: an outage is not cured by any grant (routed-concern
     // clause 5).
+    // Precondition: every caller passes a Degraded verdict. A misuse is a programming error
+    // caught in debug builds; in release the response below is still a refusal (fail CLOSED,
+    // never an admit), with the counter label falling back to query_error.
+    assert(ceiling.verdict == authz::CeilingVerdict::Degraded &&
+           "respond_ceiling_degraded: caller must pass a Degraded ceiling verdict");
     if (auto* m = auth_mgr_.metrics_registry()) {
         m->counter("yuzu_server_rbac_read_degrade_total",
                    {{"reason", ceiling.degrade_reason ? ceiling.degrade_reason : "query_error"}})

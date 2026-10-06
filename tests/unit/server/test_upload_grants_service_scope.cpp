@@ -207,16 +207,15 @@ TEST_CASE("upload-grants list: a service-scoped token is refused and the minter'
     CHECK(denied_rows == 1);
 }
 
+// Needs no database: the guard runs before anything else in the public function, so a Deps with
+// no store and no closures is enough, and the case runs when YUZU_TEST_POSTGRES_DSN is unset.
 TEST_CASE("upload-grants list: an unwired service-scope deny is refused at registration, "
           "before any route is added",
-          "[pg][authz][service_scope][upload]") {
-    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::response_execution_authz_tpl);
-    UploadGrantScopeRig r{db.dsn()};
+          "[authz][service_scope][upload]") {
     yuzu::server::test::TestRouteSink sink;
-    CHECK_THROWS_AS(register_file_retrieval_routes(sink, r.make_deps(/*wire_deny=*/false)),
-                    std::invalid_argument);
+    CHECK_THROWS_AS(register_file_retrieval_routes(sink, Deps{}), std::invalid_argument);
     try {
-        register_file_retrieval_routes(sink, r.make_deps(/*wire_deny=*/false));
+        register_file_retrieval_routes(sink, Deps{});
     } catch (const std::invalid_argument& e) {
         CHECK(std::string{e.what()} ==
               "register_file_retrieval_routes: deps.deny_service_scoped_fn must be bound");

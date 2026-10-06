@@ -1655,6 +1655,36 @@ tests:
           - labels: 'ALERTS{alertname="YuzuRbacReadDegraded", alertstate="firing", reason="query_error", severity="critical"}'
             value: 1
 
+  # CASE 48b -- the other two denying reasons page as well, so a regression of
+  # the alert's reason regex that drops one of them is caught (the ceiling
+  # read's breaker-open and pool-timeout denials are counted under
+  # pool_acquire_timeout; a generation refresh failure past the stale-serve
+  # window is generation_refresh_failed).
+  - interval: 1m
+    name: rbac read degraded - pool_acquire_timeout still pages
+    input_series:
+      - series: 'yuzu_server_rbac_read_degrade_total{job="yuzu",instance="s1",reason="pool_acquire_timeout"}'
+        values: "0+1x20"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuRbacReadDegraded", alertstate="firing"}'
+        eval_time: 15m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuRbacReadDegraded", alertstate="firing", reason="pool_acquire_timeout", severity="critical"}'
+            value: 1
+
+  # CASE 48c -- generation_refresh_failed (denying) pages.
+  - interval: 1m
+    name: rbac read degraded - generation_refresh_failed still pages
+    input_series:
+      - series: 'yuzu_server_rbac_read_degrade_total{job="yuzu",instance="s1",reason="generation_refresh_failed"}'
+        values: "0+1x20"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuRbacReadDegraded", alertstate="firing"}'
+        eval_time: 15m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuRbacReadDegraded", alertstate="firing", reason="generation_refresh_failed", severity="critical"}'
+            value: 1
+
   # ── YuzuRbacEnforcementChanged (A1) ──────────────────────────────────────
   #
   # Threshold-free by design: fires on ANY observed change to the gauge
