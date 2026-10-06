@@ -155,7 +155,9 @@ replay_test_() ->
      fun cleanup/1,
      [
       t("a refilled backlog does not starve an active replay: the replay head advances",
-        fun replay_advances_while_the_backlog_is_refilled/0)
+        fun replay_advances_while_the_backlog_is_refilled/0),
+      t("a replayed registration that cannot be encoded does not touch the breaker",
+        fun replay_local_encode_exception_leaves_the_breaker_alone/0)
      ]}.
 
 %% The reserved replay slot has a size, and a long replay spacing keeps the
@@ -1700,6 +1702,24 @@ cluster_id_unrepresentable_stops_init() ->
         process_flag(trap_exit, Prev)
     end.
 
+%% A stored registration whose request cannot be encoded here is skipped by the
+%% replay drip: nothing was sent, so the breaker (closed, no failures) is
+%% untouched, and the drip finishes.
+replay_local_encode_exception_leaves_the_breaker_alone() ->
+    mock(encode),
+    Id = <<"replay-agent-1">>,
+    Sid = bind_replay_agent(1, #{info => #{agent_id => Id, hostname => <<255, 254>>}}),
+    Fresh = breaker(),
+    ?assertMatch({closed, 0, 0, _}, Fresh),
+    ok = yuzu_gw_upstream:replay_sessions([Sid]),
+    %% replay_next is queued behind the first call by the cast handler, and the
+    %% second call is behind replay_next.
+    sync(),
+    sync(),
+    ?assertEqual([], up_get(replay_queue)),
+    ?assertEqual(1, meck:num_calls(grpcbox_client, unary, '_')),
+    ?assertEqual(Fresh, breaker()).
+
 %% A held notification whose payload cannot be encoded (an agent supplied peer
 %% address that is not UTF-8) sits at the head of the store. The head is the
 %% half_open probe, so if it fails the same way every time the breaker reopens
@@ -1799,6 +1819,10 @@ fill_slots() ->
 %% process; clear_registry/0 removes the row in teardown. Returns the session id.
 bind_replay_agent(I) ->
     Id = <<"replay-agent-", (integer_to_binary(I))/binary>>,
+    bind_replay_agent(I, #{info => #{agent_id => Id}}).
+
+bind_replay_agent(I, RegisterReq) ->
+    Id = <<"replay-agent-", (integer_to_binary(I))/binary>>,
     Sid = <<"replay-session-", (integer_to_binary(I))/binary>>,
     Owner = self(),
     Pid = spawn(fun() ->
@@ -1806,7 +1830,7 @@ bind_replay_agent(I) ->
                     receive {'DOWN', MRef, process, _, _} -> ok end
                 end),
     ok = yuzu_gw_registry:register_agent(Id, Pid, Sid, [<<"svc">>], <<"host">>,
-                                         #{info => #{agent_id => Id}}, conn_test),
+                                         RegisterReq, conn_test),
     Sid.
 
 %% Release the oldest parked worker and wait for what follows: a new notify
