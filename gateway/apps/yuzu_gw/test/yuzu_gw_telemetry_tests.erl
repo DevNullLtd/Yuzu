@@ -62,6 +62,35 @@ notify_dropped_test_() ->
                         counter_val(yuzu_gw_upstream_notify_dropped_total,
                                     [<<"unknown">>]))
        end},
+      {"a circuit_open reason, retired from the emitters, folds into unknown "
+       "and creates no series of its own",
+       fun() ->
+           Before = counter_val(yuzu_gw_upstream_notify_dropped_total,
+                                 [<<"unknown">>]),
+           telemetry:execute([yuzu, gw, upstream, notify_dropped],
+                             #{count => 1}, #{reason => <<"circuit_open">>}),
+           ?assertEqual(Before + 1,
+                        counter_val(yuzu_gw_upstream_notify_dropped_total,
+                                    [<<"unknown">>])),
+           ?assertEqual(undefined,
+                        prometheus_counter:value(yuzu_gw_upstream_notify_dropped_total,
+                                                 [<<"circuit_open">>]))
+       end},
+      {"the atom at_capacity counts in the at_capacity series, not unknown",
+       fun() ->
+           BeforeCap = counter_val(yuzu_gw_upstream_notify_dropped_total,
+                                    [<<"at_capacity">>]),
+           BeforeUnknown = counter_val(yuzu_gw_upstream_notify_dropped_total,
+                                        [<<"unknown">>]),
+           telemetry:execute([yuzu, gw, upstream, notify_dropped],
+                             #{count => 1}, #{reason => at_capacity}),
+           ?assertEqual(BeforeCap + 1,
+                        counter_val(yuzu_gw_upstream_notify_dropped_total,
+                                    [<<"at_capacity">>])),
+           ?assertEqual(BeforeUnknown,
+                        counter_val(yuzu_gw_upstream_notify_dropped_total,
+                                    [<<"unknown">>]))
+       end},
       {"at_capacity drop reaches the real Prometheus counter, labeled "
        "distinctly from any other reason",
        fun() ->

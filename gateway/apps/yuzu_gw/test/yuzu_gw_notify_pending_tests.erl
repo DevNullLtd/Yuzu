@@ -143,6 +143,17 @@ replay_test_() ->
         fun replay_advances_while_the_backlog_is_refilled/0)
      ]}.
 
+%% The reserved replay slot has a size, and a long replay spacing keeps the
+%% drip parked (queue non-empty, nothing advancing) so the size can be observed.
+replay_reserve_test_() ->
+    {foreach,
+     fun() -> setup([{registration_replay_spacing_ms, 60000}]) end,
+     fun cleanup/1,
+     [
+      t("while a replay is active the reserve is exactly one slot: refills stop at nine",
+        fun replay_reserve_is_exactly_one_slot/0)
+     ]}.
+
 %% The half_open probe (#4632). The breaker's reset timer is a long way off (the
 %% tests move it to half_open by hand) but short of its cap, so one failed probe
 %% shows the backoff doubling. Replay spacing 1 ms.
@@ -207,7 +218,9 @@ setup(Env) ->
     yuzu_gw_test_registry:ensure(),
     catch meck:unload(grpcbox_client),
     catch meck:unload(telemetry),
-    %% Fail loud at the boundary if a prior module leaked the real upstream.
+    %% A prior module may have leaked the real upstream. Stop it (stop_upstream/0
+    %% does so silently, it does not report the leak) so this fixture owns the
+    %% registered name.
     stop_upstream(),
     clear_registry(),
     Prev = [{Key, application:get_env(yuzu_gw, Key)} || Key <- ?ENV_KEYS],
@@ -247,10 +260,13 @@ cleanup(#{log := Log, workers := Workers, atoms := Atoms, prev_env := Prev}) ->
     wait_until(fun() -> settled(Log) end, ?AWAIT_MS),
     stop_upstream(),
     release_parked(Workers),
-    await_dead([W || {W} <- ets:tab2list(Workers)]),
+    %% A wait that fails is reported, but only after the rest of the teardown
+    %% ran, so one stuck process cannot leave the mock, the tables and the env
+    %% behind for the next test.
+    Dead = guarded(fun() -> await_dead([W || {W} <- ets:tab2list(Workers)]) end),
     catch telemetry:detach(?TELEMETRY_HANDLER),
     meck:unload(grpcbox_client),
-    clear_registry(),
+    Cleared = guarded(fun clear_registry/0),
     ets:delete(Log),
     ets:delete(Workers),
     lists:foreach(fun({Key, {ok, V}}) -> application:set_env(yuzu_gw, Key, V);
@@ -259,7 +275,15 @@ cleanup(#{log := Log, workers := Workers, atoms := Atoms, prev_env := Prev}) ->
     persistent_term:erase(?CTXK),
     persistent_term:erase(?SUBK),
     persistent_term:erase(?FIELDSK),
-    ok.
+    case [F || F <- [Dead, Cleared], F =/= ok] of
+        []       -> ok;
+        Failures -> erlang:error({teardown_failed, Failures})
+    end.
+
+guarded(Fun) ->
+    try Fun(), ok
+    catch Class:Reason -> {Class, Reason}
+    end.
 
 %% setup/1 plus a logger handler at info level; the primary level is raised for
 %% the group and put back by cleanup_logs/1.
@@ -297,7 +321,10 @@ stop_upstream() ->
 clear_registry() ->
     lists:foreach(fun(Id) -> yuzu_gw_registry:deregister_agent(Id) end,
                   yuzu_gw_registry:all_agents()),
-    wait_until(fun() -> yuzu_gw_registry:agent_count() =:= 0 end, 2000).
+    case wait_until(fun() -> yuzu_gw_registry:agent_count() =:= 0 end, 2000) of
+        ok               -> ok;
+        {error, timeout} -> erlang:error({registry_not_empty, yuzu_gw_registry:all_agents()})
+    end.
 
 release_parked(Workers) ->
     [W ! release || {W} <- ets:tab2list(Workers)],
@@ -306,10 +333,10 @@ release_parked(Workers) ->
 await_dead(Pid) when is_pid(Pid) ->
     await_dead([Pid]);
 await_dead(Pids) ->
-    Refs = [erlang:monitor(process, P) || P <- Pids],
-    lists:foreach(fun(Ref) ->
+    Refs = [{erlang:monitor(process, P), P} || P <- Pids],
+    lists:foreach(fun({Ref, P}) ->
                       receive {'DOWN', Ref, process, _, _} -> ok
-                      after ?AWAIT_MS -> ok
+                      after ?AWAIT_MS -> erlang:error({process_did_not_exit, P})
                       end
                   end, Refs).
 
@@ -651,6 +678,32 @@ replay_advances_while_the_backlog_is_refilled() ->
      end || _ <- [2, 3]],
     await_until(fun() -> last_gauge() =:= {Backlog - Refills - 1, ?INFLIGHT_MAX} end),
     ?assertEqual([], up_get(replay_queue)).
+
+%% Ten workers are parked, 30 keys are held and a replay of three agents is armed;
+%% the 60 s spacing leaves the drip waiting, so the replay queue stays non-empty.
+%% Three workers finish. The first leaves nine in flight, which is the budget while
+%% the replay is active, so nothing is refilled; each of the next two leaves eight
+%% and is refilled to nine from the backlog. A reserve of more than one slot would
+%% stop at fewer than nine, and no reserve would refill to ten.
+replay_reserve_is_exactly_one_slot() ->
+    watch(),
+    Live0 = fill_slots(),
+    Backlog = 30,
+    [cast_connected(agent(I)) || I <- lists:seq(1, Backlog)],
+    Sids = [bind_replay_agent(I) || I <- lists:seq(1, 3)],
+    ok = yuzu_gw_upstream:replay_sessions(Sids),
+    sync(),
+    ?assertEqual({Backlog, ?INFLIGHT_MAX}, last_gauge()),
+    ?assertMatch([_, _, _], up_get(replay_queue)),
+    [W1, W2, W3 | _] = Live0,
+    W1 ! release,
+    W2 ! release,
+    W3 ! release,
+    await_until(fun() -> last_gauge() =:= {Backlog - 2, ?INFLIGHT_MAX - 1} end),
+    sync(),
+    ?assertEqual(?INFLIGHT_MAX - 1, map_size(up_get(notify_pids))),
+    ?assertEqual(Backlog - 2, pending_len()),
+    ?assertMatch([_, _, _], up_get(replay_queue)).
 
 gauges_follow_a_burst() ->
     watch(),

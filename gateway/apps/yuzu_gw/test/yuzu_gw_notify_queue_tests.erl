@@ -269,13 +269,14 @@ run_steps(SeqNo, Step, Len, Q, Model, Trace) ->
     Event = {SeqNo, Step},
     Op = rand:uniform(4),
     Reserved = rand:uniform(2) - 1,
-    {Q2, Model2, Action} = apply_op(Op, Key, Event, Reserved, Q, Model),
+    Where = where(SeqNo, Step, [{Step, {op, Op}, Key, Event, Reserved} | Trace]),
+    {Q2, Model2, Action} = apply_op(Op, Key, Event, Reserved, Q, Model, Where),
     Trace2 = [{Step, Action, Key, Event, Reserved} | Trace],
     check_step(SeqNo, Step, Q2, Model2, Trace2),
     run_steps(SeqNo, Step + 1, Len, Q2, Model2, Trace2).
 
 %% put (twice as likely as the others, so the store reaches the cap)
-apply_op(Op, Key, Event, Reserved, Q, Model) when Op =:= 1; Op =:= 2 ->
+apply_op(Op, Key, Event, Reserved, Q, Model, Where) when Op =:= 1; Op =:= 2 ->
     {Result, Q2} = yuzu_gw_notify_queue:put(Key, Event, Reserved, Q),
     Present = lists:keymember(Key, 1, Model),
     {ExpResult, Model2} =
@@ -287,32 +288,37 @@ apply_op(Op, Key, Event, Reserved, Q, Model) when Op =:= 1; Op =:= 2 ->
             false ->
                 {new, Model ++ [{Key, Event}]}
         end,
-    ?assertEqual({put, ExpResult}, {put, Result}),
+    ?assertEqual({Where, {put, ExpResult}}, {Where, {put, Result}}),
     {Q2, Model2, put};
-apply_op(3, _Key, _Event, _Reserved, Q, Model) ->
+apply_op(3, _Key, _Event, _Reserved, Q, Model, Where) ->
     case {yuzu_gw_notify_queue:take(Q), Model} of
         {empty, []} ->
             {Q, Model, take_empty};
         {{K, E, Q2}, [{K, E} | Rest]} ->
             {Q2, Rest, take};
         {Got, _} ->
-            erlang:error({take_mismatch, Got, Model})
+            erlang:error({take_mismatch, Where, Got, Model})
     end;
-apply_op(4, Key, Event, _Reserved, Q, Model) ->
+apply_op(4, Key, Event, _Reserved, Q, Model, Where) ->
     {Result, Q2} = yuzu_gw_notify_queue:push_front(Key, Event, Q),
     case lists:keymember(Key, 1, Model) of
         true ->
-            ?assertEqual({push_front, superseded}, {push_front, Result}),
+            ?assertEqual({Where, {push_front, superseded}}, {Where, {push_front, Result}}),
             {Q2, Model, push_front};
         false ->
-            ?assertEqual({push_front, inserted}, {push_front, Result}),
+            ?assertEqual({Where, {push_front, inserted}}, {Where, {push_front, Result}}),
             {Q2, [{Key, Event} | Model], push_front}
     end.
 
+%% Where a failure happened: the seed, the sequence, the step, and the last five
+%% operations, newest first.
+where(SeqNo, Step, Trace) ->
+    lists:flatten(io_lib:format(
+                    "seed ~w sequence ~w step ~w (last 5 ops, newest first: ~w)",
+                    [?SEED, SeqNo, Step, lists:sublist(Trace, 5)])).
+
 check_step(SeqNo, Step, Q, Model, Trace) ->
-    Where = lists:flatten(io_lib:format(
-                            "seed ~w sequence ~w step ~w (last 5 ops, newest first: ~w)",
-                            [?SEED, SeqNo, Step, lists:sublist(Trace, 5)])),
+    Where = where(SeqNo, Step, Trace),
     List = yuzu_gw_notify_queue:to_list(Q),
     Keys = [K || {K, _} <- List],
     ?assertEqual({Where, length(Model)}, {Where, yuzu_gw_notify_queue:size(Q)}),
