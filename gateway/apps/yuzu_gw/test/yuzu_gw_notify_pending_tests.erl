@@ -215,6 +215,34 @@ probe_log_test_() ->
         fun killed_probe_worker_is_logged/0)
      ]}.
 
+%% A request that cannot be encoded never left the gateway, so it says nothing
+%% about the upstream: it must not move the breaker, whichever threshold is set.
+%% Run with the test threshold (3) and with the default one (5).
+local_exception_test_() ->
+    [{foreach,
+      fun() -> setup(Env) end,
+      fun cleanup/1,
+      [
+       t("a request that cannot be encoded never feeds the breaker, however many arrive",
+         fun register_encode_exception_never_feeds_the_breaker/0)
+      ]} || Env <- [[], [{circuit_breaker_failure_threshold, 5}]]].
+
+%% The same on the half_open probe path, with the log recorded.
+probe_local_exception_test_() ->
+    {foreach,
+     fun() -> setup_logs(probe_env([])) end,
+     fun cleanup_logs/1,
+     [
+      t("a probe that cannot be encoded is evicted with a warning, the breaker is untouched",
+        fun unencodable_probe_is_evicted_not_requeued/0),
+      t("held notifications that all cannot be encoded are evicted one after the other",
+        fun all_unencodable_probes_drain_to_empty/0),
+      t("a probe that raises for any other reason is a failure: requeued, breaker reopened",
+        fun other_probe_exception_is_a_failure/0),
+      t("ordinary workers that cannot encode do not touch the breaker or block the rest",
+        fun unencodable_ordinary_worker_does_not_touch_the_breaker/0)
+     ]}.
+
 %% Cap 3: a failed probe's event always fits back.
 probe_cap_test_() ->
     {foreach,
@@ -370,8 +398,9 @@ settled(Log) ->
 %%% The mock
 %%%===================================================================
 
-%% ProxyMode is what every RPC other than NotifyStreamStatus answers: `ok' or
-%% `fail' (a transport error, which feeds the breaker).
+%% ProxyMode is what every RPC other than NotifyStreamStatus answers: `ok',
+%% `fail' (a transport error, which feeds the breaker) or `encode' (the real
+%% encoder runs on the request first, as for NotifyStreamStatus, then `ok').
 mock(ProxyMode) ->
     meck:expect(grpcbox_client, unary, fun(_Ctx, Path, Req, Def, _Opts) ->
         case lists:last(binary:split(Path, <<"/">>, [global])) of
@@ -383,6 +412,10 @@ mock(ProxyMode) ->
                 marshal_like_grpcbox(Def, Req),
                 notify_rpc(Req);
             _Other when ProxyMode =:= ok ->
+                notify({proxied, Path}),
+                {ok, #{}, #{}};
+            _Other when ProxyMode =:= encode ->
+                marshal_only(Def, Req),
                 notify({proxied, Path}),
                 {ok, #{}, #{}};
             _Other ->
@@ -399,6 +432,12 @@ marshal_like_grpcbox(#grpcbox_def{marshal_fun = Marshal}, Req) ->
         notify({marshal_failed, maps:get(agent_id, Req)}),
         erlang:raise(Class, Why, Stack)
     end.
+
+%% The same for a request that has no agent id of its own (ProxyRegister,
+%% ProxyInventory): the marshal fun runs and any raise continues to the caller.
+marshal_only(#grpcbox_def{marshal_fun = Marshal}, Req) ->
+    _ = Marshal(Req),
+    ok.
 
 %% Runs in the worker the upstream spawned. Counts itself in, tells the test it
 %% entered, then parks until released (or until the gates are open). `release'
@@ -422,6 +461,8 @@ notify_rpc(Req) ->
         1 -> {ok, #{}, #{}};
         0 -> receive
                  release           -> {ok, #{}, #{}};
+                 {release, {raise, Why}} -> atomics:sub(Atoms, 1, 1),
+                                            erlang:error(Why);
                  {release, Answer} -> Answer
              after ?PARK_MS -> {ok, #{}, #{}}
              end
@@ -1343,6 +1384,115 @@ format_status_hides_the_probe_event() ->
     ?assertEqual(nomatch, string:find(Text, "marker-peer")),
     ?assertEqual(nomatch, string:find(Text, "marker-session")),
     ?assertEqual(nomatch, string:find(Text, "marker-home")).
+
+%% A local encode exception (the request never left the gateway) is neither a
+%% success nor a failure of the upstream. Found by review: a Register whose
+%% request carried text that is not valid UTF-8 raised in the real encoder and
+%% was counted, so a handful of them opened the breaker for the whole fleet.
+register_encode_exception_never_feeds_the_breaker() ->
+    mock(encode),
+    Threshold = up_get(cb_threshold),
+    Timeout = up_get(cb_cur_timeout),
+    Fresh = {closed, 0, 0, Timeout},
+    ?assertEqual(Fresh, breaker()),
+    BadReg = #{info => #{agent_id => <<"bad-reg">>, hostname => <<255, 254>>}},
+    BadInv = #{session_id => <<255>>},
+    Rounds = lists:seq(1, Threshold + 2),
+    [?assertEqual({error, {internal, <<"rpc exception error:badarg">>}},
+                  yuzu_gw_upstream:proxy_register(BadReg)) || _ <- Rounds],
+    ?assertEqual(Fresh, breaker()),
+    [?assertEqual({error, {internal, <<"rpc exception error:badarg">>}},
+                  yuzu_gw_upstream:proxy_inventory(BadInv)) || _ <- Rounds],
+    ?assertEqual(Fresh, breaker()),
+    ?assertMatch({ok, _}, yuzu_gw_upstream:proxy_register(
+                            #{info => #{agent_id => <<"good-reg">>, hostname => <<"host">>}})),
+    ?assertMatch({ok, _}, yuzu_gw_upstream:proxy_inventory(#{session_id => <<"good-session">>})),
+    ?assertEqual(Fresh, breaker()).
+
+%% The head held entry is the half_open probe. One that can never be encoded
+%% (here an agent id that is not UTF-8, which the peer address sanitiser does
+%% not cover) is evicted: requeueing it would fail every probe for ever. The
+%% breaker is not touched, and the next head is probed at once.
+unencodable_probe_is_evicted_not_requeued() ->
+    watch(),
+    trip_breaker(),
+    notify_status(<<255>>, <<"sess">>, connected, <<"peer">>, <<"home">>),
+    Good = [agent(I) || I <- lists:seq(1, 3)],
+    [cast_connected(Id) || Id <- Good],
+    sync(),
+    ?assertEqual({4, 0}, last_gauge()),
+    ?assertEqual({open, 0, 3, 200000}, breaker()),
+    enter_half_open(),
+    ?assertEqual({marshal_failed, <<255>>}, await_attempt()),
+    {entered, W, Next} = await_attempt(),
+    ?assertEqual(agent(1), maps:get(agent_id, Next)),
+    %% Only the entry into half_open moved the breaker: no failure, no doubling.
+    ?assertEqual({half_open, 1, 3, 200000}, breaker()),
+    ?assertEqual(2, pending_len()),
+    ?assertEqual(0, count(?EV_COALESCED)),
+    Evicted = [T || {_, log, warning, T} <- rows(),
+                    string:find(T, "Evicted held stream status notification") =/= nomatch],
+    ?assertMatch([_], Evicted),
+    [Line] = Evicted,
+    ?assertNotEqual(nomatch, string:find(Line, "cannot be encoded")),
+    ?assertEqual(nomatch, string:find(Line, "peer")),
+    ?assertEqual(nomatch, string:find(Line, "sess")),
+    W ! release,
+    await_until(fun() -> up_get(cb_state) =:= closed end),
+    open_and_release_all(),
+    await_until(fun() -> last_gauge() =:= {0, 0} end),
+    ?assertEqual(lists:sort(Good),
+                 lists:sort([maps:get(agent_id, R) || R <- entered_reqs()])).
+
+all_unencodable_probes_drain_to_empty() ->
+    watch(),
+    trip_breaker(),
+    Ids = [<<255, I>> || I <- lists:seq(1, 3)],
+    [cast_connected(Id) || Id <- Ids],
+    sync(),
+    ?assertEqual({3, 0}, last_gauge()),
+    enter_half_open(),
+    [?assertEqual({marshal_failed, Id}, await_attempt()) || Id <- Ids],
+    await_until(fun() -> last_gauge() =:= {0, 0} end),
+    ?assertEqual(undefined, up_get(notify_probe)),
+    %% Nothing moved the breaker: it is still waiting for a probe that can answer.
+    ?assertEqual({half_open, 1, 3, 200000}, breaker()),
+    cast_connected(agent(1)),
+    {entered, W, _} = await_attempt(),
+    W ! release,
+    await_until(fun() -> up_get(cb_state) =:= closed end),
+    await_until(fun() -> last_gauge() =:= {0, 0} end).
+
+%% Control: any other exception out of the client is a failure of the upstream
+%% path, as before: the probe goes back to the head and the breaker reopens.
+other_probe_exception_is_a_failure() ->
+    watch(),
+    trip_breaker(),
+    cast_connected(agent(1)),
+    sync(),
+    enter_half_open(),
+    {Probe, _} = await_entered(),
+    Probe ! {release, {raise, boom}},
+    await_until(fun() -> last_gauge() =:= {1, 0} end),
+    await_dead(Probe),
+    sync(),
+    ?assertEqual({open, 1, 3, 400000}, breaker()),
+    ?assertEqual(1, pending_len()).
+
+%% A worker outside the half_open probe never reports to the breaker, with or
+%% without a local exception: the unencodable entry is lost, the rest is sent.
+unencodable_ordinary_worker_does_not_touch_the_breaker() ->
+    watch(),
+    Timeout = up_get(cb_cur_timeout),
+    notify_status(<<255>>, <<"sess">>, connected, <<"peer">>, <<"home">>),
+    cast_connected(agent(1)),
+    ?assertEqual({marshal_failed, <<255>>}, await_attempt()),
+    {entered, _W, Req} = await_attempt(),
+    ?assertEqual(agent(1), maps:get(agent_id, Req)),
+    open_and_release_all(),
+    await_until(fun() -> last_gauge() =:= {0, 0} end),
+    ?assertEqual({closed, 0, 0, Timeout}, breaker()),
+    ?assertEqual(0, pending_len()).
 
 %% A held notification whose payload cannot be encoded (an agent supplied peer
 %% address that is not UTF-8) sits at the head of the store. The head is the
