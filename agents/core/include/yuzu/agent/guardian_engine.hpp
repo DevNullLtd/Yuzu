@@ -355,8 +355,8 @@ public:
     /// `yuzu.guardian_compensation_pending_age_seconds` via
     /// emit_guardian_health_age_tags, which emits nothing for nullopt, so "none
     /// outstanding" is an ABSENCE, never a 0. It measures "teardown pending too long", not proof
-    /// of a hang; while a teardown is outstanding its generation is held (the claim is not
-    /// K-eligible). Observation only. `now` defaults to the steady clock; a test passes a later
+    /// of a hang; while a teardown is outstanding its generation is held (nothing
+    /// acknowledges it, #5459) and identical re-pushes are suppressed. Observation only. `now` defaults to the steady clock; a test passes a later
     /// reading to age a claim without sleeping. Takes mtx_ then the runtime's registry_mu_, the
     /// same order attach_rule/detach_rule already use.
     [[nodiscard]] std::optional<std::uint64_t> oldest_outstanding_compensation_age_seconds(

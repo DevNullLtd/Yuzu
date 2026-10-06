@@ -838,9 +838,10 @@ flip, with a red-first test each:
   index state" contract) and the adjacent already-committed-B / stale-adoption case (an adoption
   refused with `wedge_adopt_stale_refused` after another key committed). #4472 is NOT fixed by this
   fix: its Reobserved branch re-observes the same claim and does not touch the index. #4472 itself
-  is fixed separately, by the #4472 K-eligibility fix (a claim whose compensating
-  disarm is outstanding is not K-eligible, so the generation is held and the server's re-push
-  re-arms the rule after the teardown).
+  is fixed separately, by the #4472 fix (a claim whose compensating
+  disarm is outstanding is never acknowledged, so the generation is held and the server's re-push
+  re-arms the rule after the teardown; since #5459 that hold also suppresses the identical
+  re-pushes, see the #5459 bullet below).
 - **up-101 and cs-103 status (rung 9c PR-5a, #4221) - not previously listed as their
   own bullets in this section, added here for completeness.** up-101 (a same-rule
   re-attach behind a surviving tombstone leaking a watcher, `guardian_spark_
@@ -853,13 +854,17 @@ flip, with a red-first test each:
   Lost notification). Both closed by PR #4359, full governance pass, zero open
   BLOCKING findings on this PR at merge.
 - **K=3 wedge waiver / decision 1 status (rung 9c PR-5e, #4221): implemented,
-  MERGED as PR #4529 (`869ea6a29`, 2026-09-18).** Full mechanism, K-eligibility settling
-  requirement, and explicit scope narrowing documented in
-  `docs/spark-stage2-guardian-consumer-design.md`'s "R5.3 as implemented (rung
-  9c PR-5e)" stamp - not restated here. That PR was the LAST in the 5a-5e
+  MERGED as PR #4529 (`869ea6a29`, 2026-09-18), then REPLACED by #5459 (option D,
+  Dave ruling 21; see the #5459 bullet below).** The waiver (acknowledge a wedged
+  generation after three identical re-applies) is deleted: a wedge now holds the
+  generation and has identical re-pushes suppressed. The mechanism as it stands is in
+  `docs/spark-stage2-guardian-consumer-design.md`'s "R5.3 as implemented ... as
+  amended by #5459" stamp, not restated here. PR-5e was the LAST in the 5a-5e
   sub-ladder and carried `Closes #4221`; #4221 is CLOSED (2026-09-18).
 - **#4279 disposition (rung 9c PR-5e, per this row's own criterion above):
-  ASSESSED against the landed K-bound logic, not resolved, remains open.** The
+  ASSESSED against the landed K-bound logic, not resolved, remains open (the K-bound
+  logic assessed here was deleted by #5459, which does not change the conclusion: the
+  mechanisms were already unrelated).** The
   lane-cap-overshoot observation (`SparkDetachedLane`'s shared admission
   primitive, `max_active=9 > cap=8`, 1-in-~10 real-hardware storm-load runs,
   root cause undetermined) and K-bound are DIFFERENT mechanisms with a narrow,
@@ -875,130 +880,121 @@ flip, with a red-first test each:
   needs the real Windows/MSVC storm scenario repeated on DGRHP hardware, not
   BigColin. K-bound's only real interaction with #4279's scenario: sustained
   same-type load may delay arming or produce non-Wedged congestion/admission
-  failures, and those stay non-K-waivable exactly as R5.3's "K is not a
-  generation-wide liveness bound" already requires - K-bound does not widen
+  failures, and those stay non-waivable (and, since #5459, non-suppressible) exactly as
+  R5.3's "a held generation is not a generation-wide liveness bound" requires (the
+  original wording was "K is not a generation-wide liveness bound") - K-bound did not widen
   #4279's exposure in any way. No code fix landed in this PR for #4279; it
   stays open, P2, tracked independently.
-- **NEW precondition for the F14 flip (added 2026-09-18, PR #4529 review
-  finding): K-eligibility's drain-time linearization must become a named flip
-  criterion, not stay implicit in a design-doc note.** `can_advance()` reads
-  only the K-eligibility membership `drain_locked()` computed at its LAST
-  tick under `registry_mu_` - it never re-queries the runtime, so a worker
-  completion landing in the gap between that drain read and
-  `persist_generation_locked()` isn't observed until the NEXT tick. Resource-safe
-  today (it is a statement about resource ownership only; desired-state
-  recovery is the separate #5459 precondition below), independently re-verified
-  against the true pre-PR-5e
-  merge-base (`9cf3907b3`): `docs/spark-stage2-guardian-consumer-design.md`'s
-  own PRE-EXISTING "Completion ownership survives K" sentence already
-  tolerates a completion landing any number of ticks after acknowledgment -
-  this gap only lets that already-tolerated case happen one tick EARLIER,
-  never a new unsafe resource-ownership state (full reasoning: R5.3's own "K-eligibility
-  linearizes at the drain-time read" paragraph). Non-blocking today
-  (`prefer_spark_=false`). Criterion: before the flip, the following executed
-  evidence is required, rather than a re-reading of this reasoning: (1) the
-  staging-gap guard, on both the normal path and the exception path (the
-  `CompensationOwedMark` scope guard); (2) the recovery-scan case (a wedge
-  retained in `failed_receipts` on an earlier drain goes Blocking once its
-  compensation starts); (3) no acknowledgment while a compensating disarm is
-  outstanding, at runtime plus ledger level and at engine level; (4) the
-  compensation-teardown observation (age and once-latched deadline count). The
-  `[4472]` tests cover these four; re-run them against whatever
-  the runtime's shape is at flip time. This does NOT close the post-K
-  late-failure recovery gap, which is its own precondition in the next bullet
-  (#5459): the "resource-safe" claim above covers resource ownership, not
-  desired-state recovery.
-- **NEW precondition for the F14 flip (#5459, added with the #4472 fix): the
-  post-K late-failure recovery gap needs an explicit accept-or-recover
-  decision.** A rule that was K-waived while its arm was genuinely hung, and
-  whose late result then fails or is not adopted, has no engine recovery owner:
-  the acknowledgment has already stopped the server's re-push, so the rule stays
-  unarmed under an acknowledged generation until a distinct push reaches the
-  agent or the agent restarts. That is the acknowledged-but-unarmed state. Its
-  only signal today is `yuzu.guardian_arm_failed` > 0, which does not tell a
-  hung arm from an unowned late failure. The #4472 fix does not close it: that
-  fix narrows K-eligibility only, and a K-waiver granted earlier for a genuinely
-  hung arm is unaffected. Whether the state is acceptable is NOT decided.
-  Non-blocking today (`prefer_spark_=false`). Criterion: before the flip, an
-  explicit decision, recorded in this doc, to accept the state as shipped or to
-  add an engine recovery owner for it, rather than letting it ride on dormancy.
-  The decision belongs to the operator. The operator-facing note is the K-bound
-  paragraph in `docs/user-manual/guaranteed-state.md`. Any fix that bounds the
-  hold described in the accepted-cost row below is the same decision.
-- **NEW precondition for the F14 flip (added 2026-09-18, PR #4529 review
-  finding): the `reapply_count` cross-rule funding consequence must become a
-  named flip criterion, not stay implicit in a design-doc/ledger note.** A
-  rule's own wedge can be K-waived on its very first observation if an
-  unrelated sibling rule's ordinary (non-Wedged, now-cleared) failure already
-  funded the shared per-application-sequence counter - a direct, reviewed
-  consequence of decision 1's shared-counter shape, not an exotic race (full
-  mechanism: `docs/spark-stage2-guardian-consumer-design.md`'s R5.3 "as
-  implemented" stamp). Does NOT violate the single safety invariant K-waiver
-  must never break - a waived receipt is, at the moment of waiver, still
-  genuinely Wedged and still its key's FIFO-front claim - it only affects how
-  many of the OPERATOR's own retries a freshly-wedged rule is guaranteed
-  before waiver becomes possible. Non-blocking today (`prefer_spark_=false`);
-  recorded without a self-granted severity downgrade per the governance
-  ledger's own independence rule
-  (`governance.d/4221-spark-9c-pr5e-kbound-closeout.JdLKyl.jsonl`). Criterion:
-  before the flip, an explicit decision - accept this tradeoff as-shipped, or
-  add the per-rule wedge-observation floor decision 1 deliberately rejected
-  as too invasive for this PR - rather than letting it ride on dormancy
-  alone.
-- **ACCEPTED COSTS of the #4472 fix (design consequences, not defects; added with
-  the fix; non-blocking today because `prefer_spark_=false`).** Every figure below is
+- **F14 precondition (added 2026-09-18, PR #4529 review finding) - the drain-time
+  linearization of the K-eligibility read: RESOLVED by #5459 (option D); the gap no
+  longer exists.** The finding was that `can_advance()` read only the eligibility
+  membership `drain_locked()` computed at its last tick, so a worker completion landing
+  between that read and `persist_generation_locked()` was not observed until the next
+  tick; that was resource-safe but produced the acknowledged-but-unarmed state one tick
+  earlier. Under option D no eligibility observation authorizes an acknowledgment at
+  all (the waiver is deleted; `can_advance()` is the conservative branch only, see the
+  design doc's "R5.3 as implemented ... as amended by #5459"), so there is no
+  linearization point to race: a completion after `decide_retry()`'s live read can cost
+  one extra suppressed push, never a false advancement (and a late success adopted
+  between the last drain and the next push reads `Recovered`, which `decide_retry()`
+  treats as outstanding work: Suppress, not a teardown of the rule that just armed). Criterion (kept, restated for
+  the new design): before the flip, executed evidence rather than a re-reading of this
+  reasoning for (1) a compensating wedge is retained in `failed_receipts` by BOTH drain
+  loops and keeps suppressing identical pushes until its teardown pops the claim; (2) no
+  acknowledgment while a wedge or a compensating disarm is outstanding, at runtime plus
+  ledger level and at engine level (including the staging-gap guard, the
+  `CompensationOwedMark` scope guard, on both the normal and the exception path);
+  (3) the compensation-teardown observation (age and once-latched deadline count);
+  (4) the safety valve's bound and its resets. Re-run the `[4472]` and `[5459*]` tests
+  against whatever the runtime's shape is at flip time.
+- **F14 precondition (#5459, added with the #4472 fix): the post-K late-failure
+  recovery gap. RESOLVED by option D (Dave ruling 21), with its costs recorded
+  below.** The gap: a rule K-waived while its arm was genuinely hung, whose late result
+  then failed or was not adopted, had no engine recovery owner, because the
+  acknowledgment had already stopped the server's re-push (the acknowledged-but-unarmed
+  state). Option D removes the waiver, so the agent HOLDS the generation while a wedge
+  is outstanding and suppresses the identical re-pushes (no teardown, the Application
+  survives); when the wedged claim pops without recovery the next push is a Reapply and
+  the rule re-arms. Resolved for the three sub-classes (a hung arm that later refuses or
+  throws; a late success that cannot be adopted; a failure between an eligibility drain
+  and the generation persist, which no longer exists). This is a design conclusion from
+  the code, not a finding-closure or merge-readiness claim: the executed evidence is the
+  `[5459*]` tests and the governance run, neither of which is recorded in this row. The
+  accepted costs are AC-1 (the hold is unbounded and the server keeps re-pushing) and
+  AC-9 to AC-14 (the safety valve and the known limits). The operator-facing note is the
+  hold paragraph in `docs/user-manual/guaranteed-state.md`.
+- **F14 precondition (added 2026-09-18, PR #4529 review finding) - the
+  `reapply_count` cross-rule funding consequence: OBSOLETE, the mechanism is
+  deleted.** The finding was that a rule's own wedge could be K-waived on its very first
+  observation if an unrelated sibling's ordinary, now-cleared failure had funded the
+  shared per-application-sequence counter. #5459 deleted `Application::reapply_count`,
+  `kReapplyWaiverThreshold` and the carry-forward in `begin_application()`, so there is
+  no counter to fund and nothing to accept or fix; the question is moot rather than
+  accepted. (The governance record for the original finding is
+  `governance.d/4221-spark-9c-pr5e-kbound-closeout.JdLKyl.jsonl`, unchanged.)
+- **ACCEPTED COSTS of the #4472 fix and of #5459 option D (design consequences, not
+  defects; non-blocking today because `prefer_spark_=false`).** Every figure below is
   an estimate from reading the code, not a measurement (the rate measurement is the
   first follow-up listed after this bullet).
-  - (AC-1) **A compensating teardown that never returns now holds the whole
-    generation.** Before the fix, K ended the re-push churn after three identical
-    re-applies (roughly 75 to 90 s at one re-apply per 25 to 30 s; an estimate). That
-    bound was removed deliberately: K's premise is that the arm is physically stuck,
-    which is false for a compensating claim, and waiving it strands the rule
-    (#4472). Now only the teardown returning, or an agent restart, ends the hold.
-    Any "bound the hold" fix is the same accept-or-recover decision as #5459 and is
-    not coded here. Per held agent: the server re-pushes at most once per 25 s
-    (`kGuardianReconcileMinInterval`), which at the default 30 s heartbeat is one
-    push per heartbeat, 2880 pushes per day (3456 per day only at a heartbeat of 25 s
+  - (AC-1) **A wedge, or a compensating teardown, that never returns holds the whole
+    generation, UNBOUNDED, and the server keeps re-pushing.** Before #5459 a K-waiver
+    ended the re-push churn after three identical re-applies for a hung arm (roughly 75
+    to 90 s at one re-apply per 25 to 30 s; an estimate), and the #4472 fix had already
+    removed that bound for a compensating claim. Option D removes it for both, on purpose:
+    acknowledging a generation while an arm is hung is what stranded rules (#5459). Now
+    only the claim popping, or an agent restart, ends the hold, and a never-returning arm
+    holds the generation forever (intended). Per held agent: the server re-pushes at most
+    once per 25 s (`kGuardianReconcileMinInterval`), which at the default 30 s heartbeat is
+    one push per heartbeat, 2880 pushes per day (3456 per day only at a heartbeat of 25 s
     or less); each push is at least two Postgres reads (the policy generation and the
     rule list) and writes one `guaranteed_state.reconcile` audit row, kept for the
-    default audit retention of 365 days. The server applies no per-agent backoff
-    while the agent's generation is unchanged, so the push rate stays at that 25 s
-    minimum for as long as the hold lasts; the hold's duration is bounded only by the
-    teardown returning (or an agent restart). The exposure is a fleet-correlated hold: N held agents
-    give about N/30 reconciles per second, so 10,000 held agents give about 333
-    pushes/s, at least about 667 Postgres reads/s and about 333 audit rows/s (about
-    28.8 million rows/day). Agent side, at R=100 rules and per push: R kv puts, about
-    2R lifecycle journal records and R compliant-edge events (unmeasured). The
-    lifecycle journal on the endpoint keeps evidence within
-    `kMaxJournalBatches`=1000 / 32 MiB / 7 days and evicts the oldest first (the
-    evictions are counted: `yuzu.guardian_journal_evicted_sent_unacked`,
-    `yuzu.guardian_journal_evicted_no_send_evidence`), so sustained churn could evict
-    earlier `guard.armed` / `guard.disarmed` records before delivery: **a measurement
-    of journal eviction during a held period is a flip precondition.** Trip signal:
-    the compensation age gauge above a chosen threshold (no alert rule ships).
-    Existing server signals to watch: `yuzu_server_guardian_reconciles_total{result="sent"}`,
+    default audit retention of 365 days. The server applies no per-agent backoff while the
+    agent's generation is unchanged and #5459 adds none, so the push rate stays at that
+    25 s minimum for as long as the hold lasts. The exposure is a fleet-correlated hold: N
+    held agents give about N/30 reconciles per second, so 10,000 held agents give about 333
+    pushes/s, at least about 667 Postgres reads/s and about 333 audit rows/s (about 28.8
+    million rows/day). Agent side, what changed is who pays: a SUPPRESSED push returns at
+    the retry gate (`apply_rules()` returns before `begin_application()`, before any
+    teardown or re-arm), so the per-rule kv puts, lifecycle journal records and
+    compliant-edge events of a re-arm are not produced. Only the safety valve's forced Reapply
+    (one push in eleven, about every 330 s at the 30 s heartbeat) pays the full
+    teardown and re-arm, which at R=100 rules is R kv puts, about 2R lifecycle journal
+    records and R compliant-edge events (unmeasured). The lifecycle journal on the
+    endpoint keeps evidence within `kMaxJournalBatches`=1000 / 32 MiB / 7 days and evicts
+    the oldest first (the evictions are counted:
+    `yuzu.guardian_journal_evicted_sent_unacked`,
+    `yuzu.guardian_journal_evicted_no_send_evidence`), so sustained forced-Reapply churn
+    could evict earlier `guard.armed` / `guard.disarmed` records before delivery: **a
+    measurement of journal eviction during a held period is a flip precondition.** Trip
+    signal: `yuzu.guardian_generation` lag (now the reliable held-wedge signal, since a
+    wedge is never acknowledged) or the compensation age gauge above a chosen threshold
+    (no alert rule ships). Existing server signals to watch:
+    `yuzu_server_guardian_reconciles_total{result="sent"}`,
     `yuzu_server_guardian_pushes_dispatched_total{reason="reconcile"}`, and repeated
     `guaranteed_state.reconcile` audit rows for one `agent_id`. Recovery is an agent
-    restart (with `--spark-disable` if the stuck mechanism is the cause). The
-    accept-or-recover decision belongs to the operator.
-  - (AC-2) **K's retry budget can be spent by the hold.** `begin_application`
-    inherits and saturates `reapply_count` for identical content during a hold, so a
-    later fresh hung arm on the same sick mechanism is K-waived at its FIRST drain with
-    zero retries, which leaves the rule unarmed under an acknowledged generation (the
-    #5459 state). Characterised by a test in this change (accepted behaviour, not a
-    defect). Cheapest future fix: do not increment `reapply_count` when the previous
-    application was held by an outstanding compensation, to be taken together with
-    #5459. The ack-ledger waiver path is CATASTROPHIC-tier, so it is deliberately not
-    changed here.
+    restart (with `--spark-disable` if the stuck mechanism is the cause). A server-side
+    back-off (it would cut the push, Postgres and audit cost but delay the re-arm after
+    a late failure by up to its interval, and would not remove the pre-throttle
+    generation read) is deliberately NOT part of #5459; a later server change should
+    reset it on policy changes.
+  - (AC-2) **OBSOLETE (kept so the AC numbers other rows cite still resolve).** It
+    recorded that `begin_application` inherited and saturated `reapply_count` during a
+    hold, so a later fresh hung arm was K-waived at its first drain. `reapply_count` is
+    deleted by #5459, so a hold cannot spend any retry budget.
   - (AC-3) Many hung compensations do not scale the hold (one application, one gate)
     but they exhaust the class quota (File 4, Registry 3, Service 3): admission for
-    that class is refused, its arms park and expire `CongestionExpired` (not
-    K-eligible), and the whole class is dark until a slot is released.
-  - (AC-4) Residual K window: between the arm call returning and `on_arm_complete`'s
-    first lock the claim still reads K-eligible. Reaching it needs at least 3
-    re-applies (roughly 75 to 90 s of hang, an estimate). The fix narrows this window
-    and does not close it, and no test seam exists for it.
-  - (AC-5) A same-rule re-push can return Reobserved on a compensating head, leaving
+    that class is refused, its arms park and expire `CongestionExpired` (never a
+    suppressible wedge, so each such push is a Reapply), and the whole class is dark
+    until a slot is released.
+  - (AC-4) **OBSOLETE (kept so the AC numbers other rows cite still resolve; FU-3 below
+    is the test seam it motivated).** It recorded a residual window in which a
+    compensating claim still read K-eligible between the arm call returning and
+    `on_arm_complete`'s first lock, which a waiver could then have acted on. There is
+    no waiver, and both outstanding classifications (hung, compensation pending) only
+    suppress and never acknowledge, so a misread across that window changes nothing
+    observable.
+  - (AC-5) A same-rule re-push that is NOT suppressed (a forced or mixed-failure
+    Reapply, since #5459) can return Reobserved on a compensating head, leaving
     the rule unarmed for about 25 to 30 s after the claim is popped (an estimate); a
     DIFFERENT rule sharing the key is refused with `kSparkKeyWedged` ("spark key wedged"), which misattributes
     the cause in `wedged_refusals_`.
@@ -1010,6 +1006,32 @@ flip, with a red-first test each:
     unlabelled fleet SUM; nothing consumes these gauges today. An EMPTY tag value is
     skipped before parsing and is not counted in `yuzu_fleet_guardian_health_tag_rejected`; accepted
     (the agent never emits an empty value).
+  - (AC-9) **The safety valve forces a full Reapply about every 330 s of a hold.**
+    After `kWedgeSuppressMaxDecisions` (10) suppressed pushes `decide_retry()` returns one
+    Reapply (a decision-count bound, one count per push: about 330 s at the 30 s
+    heartbeat, about 275 s only at a heartbeat of 25 s or less). The Reapply re-arms every
+    rule in the push but does NOT unstick the wedged claim (an identical re-observation
+    returns the existing claim), so it buys nothing against a genuinely hung arm; it only
+    bounds the dependence on the suppress classification (it is not a recovery guarantee
+    against a classifier that misidentifies a dead claim). The counter resets only in
+    `begin_application()`/`retire()`.
+  - (AC-10) **#4045 baseline relaunder, narrow.** Persisted baselines are re-seeded on
+    every arm (`guardian_engine.cpp`, the arm-time re-seed), so only
+    Spark-first-captured, unpersisted `FileHashEquals` baselines are exposed to a
+    recapture by a forced Reapply.
+  - (AC-11) **An operator delta push (`full_sync=false`) during a hold** changes the push
+    identity (and the following full_sync push changes it back), so each is a Reapply and
+    the suppression budget restarts.
+  - (AC-12) **A push mixing a wedge with any non-wedge failure** (a congestion expiry, a
+    refusal) is a Reapply every time: the suppression applies only when every unresolved
+    item is an outstanding wedge (or a Pending/Committed sibling).
+  - (AC-13) **Recovery needs a live connection and a generation-tracking server.** The
+    maintenance tick runs on the per-connection heartbeat thread, and the retry owner is
+    the server's `full_sync` re-push. Agent restart gap: the boot Application opens at the
+    loaded acknowledged generation with an empty `content_id`, and a failed boot re-arm is
+    never retried (#5513); an acknowledgment persisted by the old waiver is not revoked.
+  - (AC-14) **Content identity (#5512).** A re-observation of a wedged claim matches
+    `rule_id` and spec only (the content-identity bug); recorded, not fixed here.
 - **Follow-ups (filed after #5497 merged: FU-1 is #5504; FU-2 to FU-5 are #5505; FU-6 and FU-7 are #5506; FU-8 and FU-9 are #5507).** (1) FU-1: measure the held-hold
   push rate and the endpoint journal eviction during a held period (a flip
   precondition, see AC-1). (2) FU-2: hang a full class quota of compensations, then
