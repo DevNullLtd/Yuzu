@@ -334,7 +334,7 @@ public:
     /// receipt_recovery_status() (retained failures) and receipt_status_wedge_aware()
     /// (pending receipts), each taking its own brief registry_mu_ internally. Call it under
     /// the same engine lock as drain_locked(). Calling it after drain_locked() is not
-    /// required for correctness: every read is a LIVE read of `runtime`, so a count a
+    /// required for correctness: every read of `runtime` is live, so a count a
     /// drain has not caught up with yet is always resolved by the live re-read (the one
     /// production caller, GuardianEngine::apply_rules(), does not drain first).
     ///

@@ -105,7 +105,7 @@ struct FakeBackend : ISparkBackend {
     /// test can hold a wedge's compensating teardown outstanding (the claim stays the
     /// Dispatched FIFO front with compensation_finished false). `hang_next_disarm` is an
     /// atomic exchanged without gate_mu_; `disarm_entered_` / `disarm_released_` are
-    /// guarded by gate_mu_. Single-use per rig unless reset_disarm() is called.
+    /// guarded by gate_mu_. Single-use per rig: the gate latches open once released.
     std::atomic<bool> hang_next_disarm{false};
     bool disarm_entered_{false};
     bool disarm_released_{false};
@@ -127,14 +127,6 @@ struct FakeBackend : ISparkBackend {
             disarm_released_ = true;
         }
         gate_cv_.notify_all();
-    }
-    /// Re-arms the disarm gate after a previous release_disarm() (precedent: reset_hang()):
-    /// without it a second start-compensation on one rig would see disarm_released_ still
-    /// true and not park. Only valid while no disarm is parked on the gate.
-    void reset_disarm() {
-        std::lock_guard<std::mutex> lk{gate_mu_};
-        disarm_entered_ = false;
-        disarm_released_ = false;
     }
 
     bool wait_entered_hang(std::chrono::seconds timeout) {

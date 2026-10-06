@@ -127,6 +127,10 @@ struct ScopedTestSqlite3 {
 void drop_kv_store_table_for_test(const std::filesystem::path& db_path) {
     ScopedTestSqlite3 db;
     REQUIRE(sqlite3_open(db_path.string().c_str(), &db.raw) == SQLITE_OK);
+    // The engine's own KvStore connection holds this file open in WAL mode with a 5 s busy
+    // timeout; this second connection must wait for it too, or the DDL races a checkpoint
+    // or a commit under load and fails SQLITE_BUSY (observed as rc 5 at 24-40 parallel runs).
+    sqlite3_busy_timeout(db.raw, 5000);
     char* err = nullptr;
     const int rc = sqlite3_exec(db.raw, "DROP TABLE kv_store", nullptr, nullptr, &err);
     if (err)
@@ -136,6 +140,10 @@ void drop_kv_store_table_for_test(const std::filesystem::path& db_path) {
 void recreate_kv_store_table_for_test(const std::filesystem::path& db_path) {
     ScopedTestSqlite3 db;
     REQUIRE(sqlite3_open(db_path.string().c_str(), &db.raw) == SQLITE_OK);
+    // The engine's own KvStore connection holds this file open in WAL mode with a 5 s busy
+    // timeout; this second connection must wait for it too, or the DDL races a checkpoint
+    // or a commit under load and fails SQLITE_BUSY (observed as rc 5 at 24-40 parallel runs).
+    sqlite3_busy_timeout(db.raw, 5000);
     char* err = nullptr;
     const int rc = sqlite3_exec(db.raw,
                                 "CREATE TABLE IF NOT EXISTS kv_store ("
@@ -4464,7 +4472,11 @@ TEST_CASE("#5459 held generation: identical pushes while a hung arm is outstandi
     {
         const auto s = r.f.engine->arm_stats();
         REQUIRE(s.has_value());
-        CHECK(s->pending == 2); // a new Application: r1 re-observed and r2 re-armed, undrained
+        // A new Application: r1's re-observed (hung) claim stays pending for as long as the
+        // worker is parked, deterministically. r2's re-arm is a separate worker that may or may
+        // not have resolved by now (it did under load: pending 1), so only r1's contribution
+        // is asserted here; r2's re-arm is awaited event-driven just below.
+        CHECK(s->pending >= 1);
         CHECK(s->failed == 0);
     }
     CHECK(r.f.mechanism->watch_call_count() == 1);
@@ -4642,7 +4654,24 @@ TEST_CASE("#5459 valve spent, then the late success is adopted: the next identic
 
     // The valve is spent, so this identical push is a forced Reapply: a fresh application, so
     // the stale one's arm_stats (failed 1) is gone, and the push itself acknowledges nothing.
+    //
+    // The replacement arm is PARKED inside the mechanism for the duration of the push, so the
+    // "held, not acknowledged" state is observable deterministically. Without the park the
+    // re-armed rule could go live inside the push window and apply_rules would then legitimately
+    // acknowledge the generation inline: a timing-dependent outcome under load, not the property
+    // under test. (The one-shot hang gate latches open once released, so the re-armable park-all
+    // gate is the one to use here.)
+    struct ReleaseParkOnExit {
+        FakeServiceMechanism& m;
+        ~ReleaseParkOnExit() { m.release_park_all(); }
+    } release_park{*r.f.mechanism};
+    r.f.mechanism->set_park_all_watches();
     r.push();
+    REQUIRE(yuzu::test::spin_until([&] { return r.f.mechanism->parked_watch_count() == 1; },
+                                   std::chrono::seconds(10)));
+    CHECK(r.f.mechanism->watch_call_count() == 2);        // the replacement arm, in flight
+    CHECK(r.f.mechanism->unwatch_completed_count() == 1); // the just-armed one was torn down
+    CHECK(r.f.engine->spark_armed_rule_count() == 0);
     r.require_generation_held();
     {
         const auto s = r.f.engine->arm_stats();
@@ -4650,9 +4679,10 @@ TEST_CASE("#5459 valve spent, then the late success is adopted: the next identic
         CHECK(s->failed == 0); // a NEW application (a Suppress would have kept failed == 1)
     }
 
-    // The following ticks re-arm and only then acknowledge; the whole cost is ONE teardown of
-    // the just-armed subscription and ONE replacement watch(), never an acknowledgment of the
-    // stale state.
+    // Release the replacement arm. The following ticks acknowledge only once it is live; the
+    // whole cost is ONE teardown of the just-armed subscription and ONE replacement watch(),
+    // never an acknowledgment of the stale state.
+    r.f.mechanism->release_park_all();
     REQUIRE(r.recovers_by_maintenance_only());
     r.check_live_correct_subscription(/*expected_watch_calls=*/2);
     r.require_acknowledged_after_arm();
@@ -4661,9 +4691,9 @@ TEST_CASE("#5459 valve spent, then the late success is adopted: the next identic
 }
 
 TEST_CASE("#5459 valve spent, then the KV store fails mid-push: every push is a real Reapply "
-          "while the fault lasts (the rules stay torn down, the generation stays held in memory "
-          "and on disk), and once the store is back the next push re-arms every rule and only "
-          "then acknowledges",
+          "while the fault lasts (the rules stay torn down, the generation stays held in memory, "
+          "and on disk up to the fault), and once the store is back the next push re-arms every "
+          "rule and only then acknowledges",
           "[spark][guardian][reconcile][5459][5459kv]") {
     using namespace std::chrono_literals;
     // r1 hangs (Service); r2 is a healthy sibling on its own mechanism, so a teardown is
@@ -4673,6 +4703,10 @@ TEST_CASE("#5459 valve spent, then the KV store fails mid-push: every push is a 
     auto& sib = *r.f.sibling_mechanism;
     REQUIRE(r.f.engine->spark_armed_rule_count() == 1); // r2 only; r1 is the hung arm
     r.suppressed_repushes(static_cast<int>(yuzu::agent::kWedgeSuppressMaxDecisions)); // budget spent
+
+    // Before the fault the generation is held both in memory and on disk (a real, readable
+    // store: this is the only point at which the on-disk half is meaningful).
+    r.require_generation_held();
 
     // The store fails. The next identical push is the valve's forced Reapply: it tears the
     // active set down (full_sync), then its rule persist fails and the push is refused.
@@ -4691,9 +4725,10 @@ TEST_CASE("#5459 valve spent, then the KV store fails mid-push: every push is a 
         r.f.engine->journal_maintenance_tick();
         CHECK(r.f.engine->policy_generation() == 0); // held in memory (never published)
     }
-    // Held on disk too: once the store is back the durable generation has never moved.
+    // The recreated table is empty, so nothing about the durable value can be read back here;
+    // the on-disk half was asserted before the fault, and the acknowledged-and-persisted
+    // generation is asserted after recovery below.
     recreate_kv_store_table_for_test(r.f.db_.path);
-    CHECK(r.persisted_generation().value_or(0) == 0);
 
     // The store is healthy: the next push is applied in full. r1 re-observes its still-hung
     // claim; r2 re-arms. Nothing is acknowledged until every rule is live.

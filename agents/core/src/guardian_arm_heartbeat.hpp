@@ -56,9 +56,11 @@ struct GuardianArmStats {
     /// Reapply path is driven by the existing ~25s full_sync retry cadence and
     /// predates PR-5d. A HELD WEDGE is the exception (#5459): while a wedge is
     /// outstanding decide_retry() Suppresses the identical retry, so the application
-    /// is NOT replaced and this field holds steady until the claim pops, the
-    /// recovery scan clears it, or the safety valve (kWedgeSuppressMaxDecisions)
-    /// forces a Reapply. Recovery is scoped to THIS application's own bookkeeping
+    /// is NOT replaced and this field holds steady while the wedge is held. The
+    /// safety valve (kWedgeSuppressMaxDecisions) forces a Reapply that may dip it
+    /// within one application, but the dip is normally not visible at the heartbeat
+    /// cadence (the drain runs before the sample); it falls when the claim pops or
+    /// the recovery scan clears the wedge. Recovery is scoped to THIS application's own bookkeeping
     /// only (see Application::failed_receipts' own doc comment) - a durable,
     /// cross-application "last known outcome for every currently-desired rule"
     /// gauge is a separate, stronger semantic 5e's own scope owns, not delivered
