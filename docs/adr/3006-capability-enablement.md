@@ -93,8 +93,8 @@ decision.
 
 - To know, before deploying, exactly what the product will do on an endpoint, and to be able to
   rule parts of it out before it ever runs.
-- To switch a capability off for the endpoints it does not suit — a server estate, a country, a
-  works-council scope, the machines that run a fragile application — without redeploying.
+- To switch a capability off for the endpoints it does not suit — a server estate, a country,
+  the machines that run a fragile application — without redeploying.
 - To be able to answer "what is this endpoint collecting, and why is that one thing off?" from
   one place.
 - For "off" to be true on the endpoint, not only in the console.
@@ -107,45 +107,6 @@ level, that this includes the operating-system level and further levels such as 
 address, tag and installed application through a modular mechanism, and that the choice of what
 is off must be available at deployment and not only on a live fleet. Departing from current
 practice is accepted; existing behaviour is retrofitted to match.
-
-## How others do it
-
-A survey of established products was made for this decision. The points that shaped it:
-
-| Product | What ships | Unit of control | How endpoints are targeted | When rules overlap |
-|---|---|---|---|---|
-| 1E Tachyon / 1E Platform | One client; platform features and nearly every capture source on | Capture source, by configuration property; a master switch wins over per-source settings | Scope expressions over operating system, name, address and tags; rule-based groups that can use installed software | Master switch only |
-| Tanium | Small core client; tools arrive when a module targets the endpoint | Tool, profile, recorder event type | Groups defined by sensor filters; the endpoint re-evaluates its targeting every five minutes | Explicit priority; one profile wins |
-| HCL BigFix | Core client plus subscribed content; analyses are off until activated | Site, analysis, client setting | Relevance evaluated on the endpoint | The newer setting wins |
-| Ivanti Neurons | Agent with selectable capabilities | Capability in a policy | Device groups, re-evaluated about daily | Device, then ordered groups, then default |
-| Elastic Defend | Most event categories on | Event category per operating system, in one policy | One policy per agent | Not applicable |
-| osquery and Fleet | Tables on, event sources off | Query, pack, table | Discovery queries the agent runs against its own state; labels | Disabling takes precedence |
-| Wazuh | Inventory on | Module | Groups with operating-system and name selectors | File order; the last group wins |
-| CrowdStrike, SentinelOne, Microsoft Defender | — | Policy | Dynamic groups | A single winner by rank |
-| Microsoft Intune | — | Setting | Assignment filters evaluated at check-in | Exclude wins |
-
-Lessons taken:
-
-- **1E is the nearest product to this direction and shows the trap.** One binary, everything
-  on, per-source switches. But a change is pushed as an instruction and needs a client restart,
-  and there is no desired state, so endpoints drift. This ADR keeps the first half and rejects
-  the second.
-- **"Block" must stop work that is already running.** Tanium documents that blocking a tool
-  does not stop it if it is already installed. For a privacy-motivated switch-off that is the
-  wrong behaviour.
-- **One sentence should settle a conflict.** "Exclude wins" (Intune), "disabling takes
-  precedence" (osquery) and explicit deny (cloud access policies) are easy to state and do not
-  depend on order. Order-dependent merges (Wazuh), newest-wins (BigFix) and overrides that
-  silently replace rather than merge (Fleet) are the recurring source of "why is this still
-  on?".
-- **A capture source that does not exist on an operating system should be absent, not
-  ignored.** Elastic Defend's per-operating-system list does this.
-- **Every answer should carry its reason.** The OpenFeature specification requires a reason on
-  every flag evaluation; products that lack one cannot explain themselves.
-- **Privacy controls are thin across the field.** None of the surveyed endpoint-management
-  products documents guidance for a works council or a data-protection impact assessment. A
-  product that makes its collection visible, switchable before first run and explainable has
-  something the others do not.
 
 ## Terminology
 
@@ -187,8 +148,7 @@ state in its own right and is never confused with *off* or with a fault, and an 
 the omission. Removing a plugin from the product has a defined retirement step on every
 platform, so that an old copy is not left behind and loaded.
 
-*Rejected:* delivering plugins to endpoints on demand when something targets them (the Tanium
-model). It makes the endpoint's contents depend on server state at a moment in time, and it
+*Rejected:* delivering plugins to endpoints on demand when something targets them. It makes the endpoint's contents depend on server state at a moment in time, and it
 removes the customer's ability to review, before deployment, exactly what will be on the
 machine.
 
@@ -203,10 +163,10 @@ runs an action — permission, approval where an action requires it, the single-
 forensic reads, and audit — are untouched by this ADR. Enablement is not an access control and
 must never be argued as one.
 
-*Rejected:* keeping the most sensitive categories off inside an otherwise-on product. It is the
-most common industry position and a defensible one, but it leaves the customer to discover
-which things are in which category, and it is not the product direction. The risks it would
-have reduced are addressed instead by D8, D9 and D10.
+*Rejected:* keeping some categories off inside an otherwise-on product. It is a defensible
+position, but it leaves the customer to discover which things are in which category, and it is
+not the product direction. The risks it would have reduced are addressed instead by D8, D9 and
+D10.
 
 ### D3 — One catalogue of switchable units
 
@@ -239,8 +199,8 @@ machines"), never as a second rule that switches something back on.
 
 *Rejected:* a fixed order of tiers in which the narrowest rule wins, and an ordered priority
 list in which the first match decides. Both allow an exception to be a separate rule, and both
-let a later or narrower rule quietly defeat a switch-off made for a privacy reason. Both also
-make the answer depend on order, which is the failure seen most often in the products surveyed.
+let a later or narrower rule quietly defeat a switch-off made higher up. Both also make the
+answer depend on order, which is the usual source of "why is this still on?".
 
 ### D5 — Targeting is the scope language, extended by attribute providers
 
@@ -257,8 +217,8 @@ When a selector cannot be evaluated for an endpoint because a fact is not yet kn
 is treated as matching, the unit is off, and the state is reported as *undetermined* rather
 than as a decision.
 
-*Rejected:* a fixed list of criteria (limiting, and the reason other products' groups cannot be
-extended); a separate selector language for enablement (two languages to learn and keep
+*Rejected:* a fixed list of criteria (it cannot be extended without changing the product); a
+separate selector language for enablement (two languages to learn and keep
 consistent); and treating an unknown fact as "does not match" (an endpoint would collect before
 anyone could tell whether a rule covers it).
 
@@ -275,8 +235,7 @@ enforces it and reports the version it is enforcing.
 - The check at dispatch stays, so an operator gets an immediate answer, and the server neither
   asks for nor accepts data from a unit it has resolved as off.
 
-*Rejected:* agents evaluating the rules themselves (the Tanium, BigFix and osquery model). It
-handles facts only the endpoint knows and reacts fastest, but it puts every rule on every
+*Rejected:* agents evaluating the rules themselves. It handles facts only the endpoint knows and reacts fastest, but it puts every rule on every
 endpoint, limits selectors to what an endpoint can see, and leaves the server unable to say why
 something is off without asking. Also rejected: a server-side check alone, which is today's
 kill switch and cannot stop anything the agent does by itself.
@@ -353,9 +312,8 @@ operator is shown what will turn on or be deleted, and where.
 
 There is no second-person approval in this model.
 
-*Rejected:* two-person approval, whether mandatory or optional. It was considered — two of the
-surveyed products offer it — and ruled out by the product owner: a suitably privileged account
-should be able to do this.
+*Rejected:* two-person approval, whether mandatory or optional. It was considered and ruled out
+by the product owner: a suitably privileged account should be able to do this.
 
 ### D12 — Change that comes from the endpoint is accepted and recorded
 
@@ -414,9 +372,9 @@ endpoint; who may change it and how it is recorded and explained.
 
 Not in scope, and not changed by this ADR:
 
-- **Who may read collected data.** That is purview and access control. Enablement governs
-  whether something is collected or available; purview governs who may read it; both must
-  permit. This pairs with the co-determination work proposed separately.
+- **Who may read collected data.** That is access control. Enablement governs whether
+  something is collected or available; access control governs who may read it; both must
+  permit.
 - **The checks made when an action is run** — permission, approval where an action requires
   it, the single-endpoint rule, audit.
 - **Preventing a local administrator from interfering with the agent.** A difference between
@@ -425,7 +383,7 @@ Not in scope, and not changed by this ADR:
 - **Signing the desired state separately from the channel that carries it**, and expiry of
   state held by an agent.
 - **Schedules and time-limited rules**, and enablement per user rather than per endpoint.
-- **Retention periods and erasure of an individual's data.**
+- **Retention periods.**
 - **Tuning a unit beyond on and off.**
 - **Rules written by operators who are confined to a management group.** Enablement is a
   fleet-level permission in this ADR. Collection switches scoped to a management group remain
@@ -436,9 +394,9 @@ Not in scope, and not changed by this ADR:
 
 ### What changes for customers
 
-- A new installation does more out of the box than it does today, including capture sources
-  that record usage. The release that delivers this must say so plainly, and must be delivered
-  together with the deployment-time choice in D8, not before it.
+- A new installation does more out of the box than it does today. The release that delivers
+  this must say so plainly, and must be delivered together with the deployment-time choice in
+  D8, not before it.
 - An existing installation does exactly what it did before, and gains a visible list of what
   it has switched off and why.
 - "Off" becomes true on the endpoint.
@@ -463,42 +421,24 @@ point for the roadmap, which decides order and grouping.
   today.
 - The kill switch's known defects: the fleet-size ceiling, no way to list what is off,
   refusals that read as something else, and a degraded store that reads as a decision.
-- The data inventory, which must list every unit, what it collects, its default and its
-  retention.
+- The product's published list of units, which must state for each one what it collects, its
+  default and its retention.
 
-### Privacy and employment law
-
-This section is engineering background for the decision, not legal advice.
-
-Shipping everything on does not, by itself, put the product in breach of data-protection law:
-the duty to process only what is necessary by default falls on the customer as controller.
-But it moves work to every customer. Regulators' guidance expects a controller using
-off-the-shelf software to switch off functions it has no basis for, before going live. In
-Germany, a tool that is objectively able to monitor behaviour or performance is subject to
-works-council co-determination whether or not the monitoring is switched on, so the default
-does not decide whether co-determination applies; it decides what happens if a customer
-installs before agreeing anything.
-
-The risks of this direction, and what answers each:
+### Risks of shipping everything on, and what answers each
 
 | Risk | Answer |
 |---|---|
-| Collection starts at install, before the customer has an agreement or an assessment in place | D8: the choice is available at server deployment and at agent install |
+| Collection starts at install, before the customer has decided what they want running | D8: the choice is available at server deployment and at agent install |
 | An upgrade begins collection on existing endpoints | D9: an upgrade starts nothing |
 | A later release quietly adds collection | D10: the customer's setting decides, and each release states what it adds |
 | A source that is on reads history from before it was switched on | D3: look-back is its own unit and can be off from the start |
 | A switch-off that is not real | D6 and D7: enforced on the endpoint, immediately |
-| Nobody can show what was collected, where and why | D13 and the data inventory |
+| Nobody can show what an endpoint collects and why | D13 and the published list of units |
 
 The safeguards that the three forensic plugins rely on today were written with "off by
 default" as one of them. Before those plugins come on for new installations, each such
 argument must be made again on the safeguards that remain — permission, approval, the
 single-endpoint rule, audit and bounded reads.
-
-The products surveyed that have reversed a default-on collection decision after release did so
-because customers discovered it afterwards. The deployment-time choice, the visible list of
-what is on and the release statement of what is new are what stand between this direction and
-that outcome.
 
 ### Accepted residuals
 
@@ -539,7 +479,5 @@ The decision is being followed when all of the following are true.
 - Whether collection switches scoped to a management group, set by operators confined to that
   group, should follow, and how they would combine with fleet-level rules.
 - Which presets ship for the starting state, and what each contains.
-- How the reconciliation with the proposed co-determination ADR is recorded once that ADR is
-  accepted.
 - Whether plugin signature enforcement (#4915) should become a precondition for a plugin being
   on.

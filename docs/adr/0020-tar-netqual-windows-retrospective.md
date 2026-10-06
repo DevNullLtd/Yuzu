@@ -8,8 +8,7 @@
 
 > **Amended by ADR-3006 (capability enablement).** The opt-in default for `netqual` and
 > `netconn` is superseded for new installations, and look-back becomes a switchable unit of
-> its own. Existing installations keep their current state. The privacy note below still
-> describes the reach of look-back and remains the reason it can be switched off.
+> its own. Existing installations keep their current state.
 
 ## Context
 

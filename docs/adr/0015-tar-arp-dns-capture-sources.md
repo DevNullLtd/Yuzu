@@ -12,7 +12,7 @@
 > **Amended by ADR-3006 (capability enablement).** The default state in Amendment 1
 > ("opt-in, not default-on") is superseded for new installations: capture sources ship on
 > and the customer switches them off. Existing installations keep their current state.
-> The data classification and audit rules here are unchanged.
+> Everything else here is unchanged.
 
 ## Context
 
