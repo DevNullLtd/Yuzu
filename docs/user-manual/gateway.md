@@ -1587,8 +1587,9 @@ the raw rig logs are local only.
 - **`yuzu_gw_upstream_notify_dropped_total`.** OBSERVED on gateways built
   before #4632: the metric has HELP and TYPE lines but no sample until a
   notification is first dropped, so an absent series meant no drops. A gateway
-  with #4632 creates `reason="at_capacity"` at 0 at start (INFERRED from the
-  code), so there an absent series means an older gateway, and 0 means nothing
+  with #4632 creates `reason="at_capacity"` and `reason="unknown"` at 0 at
+  start (INFERRED from the code; `unknown` is the overflow bucket for an
+  unexpected value and is not emitted today), so there an absent series means an older gateway, and 0 means nothing
   was lost at admission. Samples with `reason="circuit_open"` come only from an
   older gateway: the new one holds a notification that arrives while the
   breaker is not closed and no longer emits that reason.
@@ -2376,7 +2377,7 @@ that are actually emitted are listed.
 | `yuzu_gw_upstream_notify_pending` | gauge | Stream-status notifications held because the in-flight limit is reached or the upstream circuit breaker is not closed; drained first in first out (0 = nothing held). Label `node`, created at 0 at start. Counts the current upstream client process only (the probe notification in flight is counted by `yuzu_gw_upstream_notify_inflight`, not here) |
 | `yuzu_gw_upstream_notify_inflight` | gauge | NotifyStreamStatus workers tracked by this gateway process (at most 10). Label `node`, created at 0 at start. Counts the current upstream client process only: workers of a previous process after an upstream client restart are not counted |
 | `yuzu_gw_upstream_notify_coalesced_total` | counter | Held stream-status notifications replaced by a newer event for the same agent session. Unlabelled, created at 0 at start. It measures suppression, not delivery: an identical repeated `CONNECTED` and a failed probe superseded by a newer event for its key also count |
-| `yuzu_gw_upstream_notify_dropped_total` | counter | Stream-status notifications lost at admission because the pending store already held `notify_pending_max` keys (label `reason`, closed set of one: `at_capacity`, created at 0 at start). The value `circuit_open` is retired: a notification that arrives while the breaker is not closed is held, and only an older gateway still exports it. It does not count delivery loss after admission (a failed or killed worker, a gateway stop) |
+| `yuzu_gw_upstream_notify_dropped_total` | counter | Stream-status notifications lost at admission because the pending store already held `notify_pending_max` keys (label `reason`, closed set `at_capacity` and `unknown`, both created at 0 at start; `unknown` catches an unexpected value and is not emitted today). The value `circuit_open` is retired: a notification that arrives while the breaker is not closed is held, and only an older gateway still exports it. It does not count delivery loss after admission (a failed or killed worker, a gateway stop) |
 | `yuzu_gw_cluster_peers_resolved` | gauge | Peer addresses found by the cluster-formation redial loop's most recent tick (label `node`; HA WS-4 `#4555`). 0 is expected for a genuinely single-node deployment. |
 | `yuzu_gw_cluster_peers_connected` | gauge | Distribution-connected peer nodes as of the most recent redial tick (label `node`; `#4555`). Compare against `peers_resolved` — a sustained gap most often means a distribution-cookie mismatch across replicas. |
 | `yuzu_gw_cluster_connect_failures_total` | counter | Total `net_kernel:connect_node/1` failures from the redial loop (`#4555`). |
