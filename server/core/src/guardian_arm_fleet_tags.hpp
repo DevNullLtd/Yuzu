@@ -105,7 +105,7 @@ inline constexpr GuardianArmMetric kGuardianArmMetrics[] = {
      "(the safety valve, about every 330 s at the 30 s heartbeat) may dip it within "
      "one application, but the dip is normally not visible at the heartbeat cadence, "
      "and the gauge falls when the wedge recovers or its hold ends by an omit or "
-     "re-key exit; "
+     "re-key exit (provided the new application has no other failure); "
      "the generation is never acknowledged while a wedge is outstanding, so "
      "yuzu.guardian_generation lag (a per-agent heartbeat tag, not a fleet gauge) is "
      "NECESSARY for a held wedge but NOT specific to one: an ordinary arm refusal, "

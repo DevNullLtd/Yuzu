@@ -60,7 +60,9 @@ struct GuardianArmStats {
     /// safety valve (kWedgeSuppressMaxDecisions) forces a Reapply that may dip it
     /// within one application, but the dip is normally not visible at the heartbeat
     /// cadence (the drain runs before the sample); it falls when the claim pops or
-    /// the recovery scan clears the wedge. Recovery is scoped to THIS application's
+    /// the recovery scan clears the wedge, or when the hold ends by a full push that
+    /// omits or re-keys the wedged rule and the new application has no other failure.
+    /// Recovery is scoped to THIS application's
     /// own bookkeeping only (see Application::failed_receipts' own doc comment) - a durable,
     /// cross-application "last known outcome for every currently-desired rule"
     /// gauge is a separate, stronger semantic 5e's own scope owns, not delivered
