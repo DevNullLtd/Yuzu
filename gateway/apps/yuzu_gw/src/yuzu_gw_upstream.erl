@@ -545,9 +545,14 @@ handle_info(replay_next, #state{replay_queue = [{AgentId, SessionId, RegisterReq
                 %% fleet-scale replay does not pile thousands of
                 %% reannounce CONNECTEDs into the pending store at once.
                 %% drain/1 keeps one slot free while replay_queue is
-                %% non-empty, so this clause fires only when the slots were
-                %% already full before the replay armed. Retry the SAME head
-                %% entry later (replay_queue is NOT advanced). replay_queue
+                %% non-empty, so this clause normally fires only when the slots
+                %% were already full before the replay armed. It can also fire
+                %% when a half_open notify probe takes the tenth slot after a
+                %% verdict armed the replay (drain/1's half_open clause checks
+                %% ?MAX_NOTIFY_INFLIGHT directly, not notify_budget/1); the
+                %% same-head retry bounds the effect to one spacing tick or
+                %% until the probe resolves, and nothing is lost. Retry the
+                %% SAME head entry later (replay_queue is NOT advanced). replay_queue
                 %% is untouched (still `[{AgentId, SessionId, RegisterReq} |
                 %% Rest]`), so the same head retries on the next tick.
                 schedule_replay_next(State1#state.replay_queue, Spacing),
@@ -894,7 +899,11 @@ redact_log(_Other)                 -> [].
 check_circuit(#state{cb_state = closed} = State) ->
     {allow, State};
 check_circuit(#state{cb_state = half_open} = State) ->
-    %% Allow exactly one probe RPC
+    %% Allows any call-path or replay RPC while half_open; this clause does not
+    %% count probes. The single-probe discipline for notifications lives in
+    %% drain/1 (one held entry at a time), and resolve_probe/3 guards the result
+    %% with the generation and state checks, because a call-path RPC can overlap
+    %% the notify probe and move the breaker first.
     {allow, State};
 check_circuit(#state{cb_state = open} = State) ->
     {reject, State}.
@@ -1000,11 +1009,13 @@ cancel_timer(TRef) -> erlang:cancel_timer(TRef).
 %%% Pending stream-status notifications (#4632)
 %%%===================================================================
 
-%% @doc Send held notifications while the breaker is closed and a worker slot
-%% is free, first in first out. While the breaker is open or half_open nothing
-%% is sent: the entries stay held. Called at the end of every handler that can
-%% free a slot, close the breaker or add an entry, so there is one send path
-%% and a new arrival never overtakes a held one.
+%% @doc Send held notifications, first in first out, subject to the breaker.
+%% Closed: drain up to the notify budget. Open: nothing is sent, every entry
+%% stays held. Half_open: only the single generation-aware probe is sent (the
+%% head held entry, one at a time) and every other entry stays held until the
+%% probe resolves. Called at the end of every handler that can free a slot,
+%% close the breaker or add an entry, so there is one send path and a new
+%% arrival never overtakes a held one.
 -spec drain(#state{}) -> #state{}.
 drain(#state{cb_state = closed, notify_pids = Pids, notify_pending = Pending,
              replay_queue = Replay} = State) ->
