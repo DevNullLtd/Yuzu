@@ -530,14 +530,16 @@ handle_cast({forward_guardian_message, AgentId, ResponseFrame},
     %% can't block the gen_server, and the count is bounded.
     case CbState of
         open ->
-            logger:debug("Dropping guardian message for ~s (circuit open)", [AgentId]),
+            logger:debug("Dropping guardian message for ~s (circuit open)",
+                         [yuzu_gw_env:log_text(AgentId)]),
             telemetry:execute([yuzu, gw, guardian, forward_dropped],
                               #{count => 1}, #{reason => <<"circuit_open">>}),
             {noreply, State};
         _ ->
             case map_size(GPids) >= ?MAX_GUARDIAN_INFLIGHT of
                 true ->
-                    logger:debug("Dropping guardian message for ~s (at capacity)", [AgentId]),
+                    logger:debug("Dropping guardian message for ~s (at capacity)",
+                                 [yuzu_gw_env:log_text(AgentId)]),
                     telemetry:execute([yuzu, gw, guardian, forward_dropped],
                                       #{count => 1}, #{reason => <<"at_capacity">>}),
                     {noreply, State};
@@ -553,7 +555,7 @@ handle_cast({forward_guardian_message, AgentId, ResponseFrame},
                             {ok, _} -> ok;
                             {error, Reason} ->
                                 logger:warning("Failed to forward guardian message for ~s: ~p",
-                                               [AgentId, Reason])
+                                               [yuzu_gw_env:log_text(AgentId), Reason])
                         end
                     end),
                     {noreply, State#state{guardian_pids = GPids#{Pid => true}}}
@@ -667,7 +669,7 @@ handle_info(replay_next, #state{replay_queue = [{AgentId, SessionId, RegisterReq
                             %% (older caller / test). Nothing to send — skip
                             %% it without disturbing the breaker.
                             logger:debug("Registration replay: skipping ~s (no stored request)",
-                                        [AgentId]),
+                                        [yuzu_gw_env:log_text(AgentId)]),
                             emit_queue_depth(length(Rest)),
                             {done, State1};
                         _ ->
@@ -715,7 +717,8 @@ handle_info(replay_next, #state{replay_queue = [{AgentId, SessionId, RegisterReq
                                     logger:debug(
                                         "Registration replay: skipping ~s (no longer live "
                                         "locally, or reconnected under a different session, "
-                                        "since this drip was queued)", [AgentId]),
+                                        "since this drip was queued)",
+                                        [yuzu_gw_env:log_text(AgentId)]),
                                     emit_queue_depth(length(Rest)),
                                     {done, State1}
                             end
@@ -820,7 +823,7 @@ do_replay_one(AgentId, Pid, SessionId, RegisterReq, QueueDepth, State) ->
                 %% session id is logged.
                 logger:warning("Registration replay: ~s was not accepted by the server (~s); "
                                "disconnecting so the agent follows its own registration path",
-                               [AgentId, reject_reason_for_log(Response)]),
+                               [yuzu_gw_env:log_text(AgentId), reject_reason_for_log(Response)]),
                 yuzu_gw_agent:disconnect(Pid),
                 record_result_no_replay({ok, Response}, State);
             {ok, Response} when is_map(Response) ->
@@ -834,7 +837,7 @@ do_replay_one(AgentId, Pid, SessionId, RegisterReq, QueueDepth, State) ->
                 AdoptedSession = maps:get(session_id, Response,
                                           maps:get(<<"session_id">>, Response, SessionId)),
                 logger:debug("Registration replay: re-proxied ~s (adopted session ~s)",
-                            [AgentId, AdoptedSession]),
+                            [yuzu_gw_env:log_text(AgentId), yuzu_gw_env:log_text(AdoptedSession)]),
                 %% Tell the process (confirmed live and holding SessionId by
                 %% the caller's lookup_local_session/1 check) to re-send its
                 %% own CONNECTED — this is what converges the server's
@@ -851,7 +854,7 @@ do_replay_one(AgentId, Pid, SessionId, RegisterReq, QueueDepth, State) ->
                 %% answered the registration, so this is a replay FAILURE like
                 %% an RPC error. Neither the body nor the session id is logged.
                 logger:warning("Registration replay: ~s got an upstream answer that is "
-                               "not a response message", [AgentId]),
+                               "not a response message", [yuzu_gw_env:log_text(AgentId)]),
                 record_result_no_replay({error, malformed_response}, State);
             {error, {Status, _Message}} when Status =:= ?GRPC_STATUS_FAILED_PRECONDITION ->
                 %% The presented session was superseded by a DIFFERENT, LIVE
@@ -866,11 +869,12 @@ do_replay_one(AgentId, Pid, SessionId, RegisterReq, QueueDepth, State) ->
                 %% tearing down this process's stream; the agent's own
                 %% subsequent fresh Register carries no stale metadata.
                 logger:warning("Registration replay: ~s's presented session was superseded — "
-                              "forcing a fresh reconnect", [AgentId]),
+                              "forcing a fresh reconnect", [yuzu_gw_env:log_text(AgentId)]),
                 yuzu_gw_agent:disconnect(Pid),
                 record_result_no_replay({ok, superseded}, State);
             {error, Reason} ->
-                logger:warning("Registration replay: ~s failed: ~p", [AgentId, Reason]),
+                logger:warning("Registration replay: ~s failed: ~p",
+                               [yuzu_gw_env:log_text(AgentId), Reason]),
                 record_result_no_replay(Result, State)
         end,
     %% Gate 7 sre OBS-4 — registration-replay observability. `replayed`

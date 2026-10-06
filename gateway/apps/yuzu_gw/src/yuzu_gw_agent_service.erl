@@ -185,7 +185,7 @@ subscribe(Ref, State) ->
 
                 undefined ->
                     logger:warning("Subscribe: no pending registration for session ~s",
-                                   [SessionId]),
+                                   [yuzu_gw_env:log_text(SessionId)]),
                     throw({grpc_error, {?GRPC_STATUS_NOT_FOUND,
                                         <<"No pending registration for session">>}});
 
