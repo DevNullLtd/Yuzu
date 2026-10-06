@@ -741,6 +741,84 @@ std::size_t GuardianSparkRuntime::retained_tombstones() const {
     return n;
 }
 
+std::optional<std::chrono::steady_clock::duration>
+GuardianSparkRuntime::oldest_pending_disarm_age_locked(
+    std::chrono::steady_clock::time_point now) const {
+    std::optional<std::chrono::steady_clock::duration> oldest;
+    for (const auto& [key, entry] : claims_) {
+        if (entry.fifo.empty())
+            continue;
+        const auto& head = entry.fifo.front();
+        if (head->kind != ClaimKind::Disarm || head->outcome)
+            continue;
+        // A `now` before the claim's creation (a caller-supplied clock) reads as zero.
+        const auto age = std::max(now - head->created_at, std::chrono::steady_clock::duration::zero());
+        if (!oldest || age > *oldest)
+            oldest = age;
+    }
+    return oldest;
+}
+
+std::optional<std::chrono::steady_clock::duration>
+GuardianSparkRuntime::oldest_pending_disarm_age(std::chrono::steady_clock::time_point now) const {
+    std::lock_guard<std::mutex> lk{registry_mu_};
+    return oldest_pending_disarm_age_locked(now);
+}
+
+std::optional<std::chrono::steady_clock::duration>
+GuardianSparkRuntime::oldest_outstanding_compensation_age_locked(
+    std::chrono::steady_clock::time_point now) const {
+    std::optional<std::chrono::steady_clock::duration> oldest;
+    for (const auto& [key, entry] : claims_) {
+        for (const auto& c : entry.fifo) {
+            if (c->compensation_finished ||
+                c->compensation_deadline == std::chrono::steady_clock::time_point{})
+                continue;
+            // The deadline was set once, at the owed instant, plus backend_op_deadline.
+            const auto owed_at = c->compensation_deadline - cfg_.backend_op_deadline;
+            // A `now` before the owed instant (a caller-supplied clock) reads as zero.
+            const auto age = std::max(now - owed_at, std::chrono::steady_clock::duration::zero());
+            if (!oldest || age > *oldest)
+                oldest = age;
+        }
+    }
+    return oldest;
+}
+
+std::optional<std::chrono::steady_clock::duration>
+GuardianSparkRuntime::oldest_outstanding_compensation_age(
+    std::chrono::steady_clock::time_point now) const {
+    std::lock_guard<std::mutex> lk{registry_mu_};
+    return oldest_outstanding_compensation_age_locked(now);
+}
+
+void GuardianSparkRuntime::observe_pending_disarms_locked(
+    std::chrono::steady_clock::time_point now, ExpireWarns& warns) {
+    for (auto& [key, entry] : claims_) {
+        if (entry.fifo.empty())
+            continue;
+        auto& head = entry.fifo.front();
+        if (head->kind != ClaimKind::Disarm || head->outcome || head->disarm_deadline_observed)
+            continue;
+        const auto age = now - head->created_at;
+        if (age <= kDisarmPendingObserveThreshold)
+            continue;
+        // Latch and count first (neither can throw), so the once-per-claim contract holds
+        // even when the warn copy below fails or the per-pass warn cap is already spent.
+        head->disarm_deadline_observed = true;
+        disarm_deadline_elapsed_.fetch_add(1, std::memory_order_relaxed);
+        if (warns.disarms.size() >= kDisarmPendingWarnsPerPass) {
+            ++warns.disarms_more; // counted, not warned individually: the summary line says so
+            continue;
+        }
+        try {
+            warns.disarms.push_back(DisarmObservation{key, age});
+        } catch (...) {
+            ++warns.disarms_more;
+        }
+    }
+}
+
 std::vector<std::string> GuardianSparkRuntime::invariant_violations_for_test(
     bool allow_orphans) const {
     std::lock_guard<std::mutex> lk{registry_mu_};
@@ -757,6 +835,29 @@ std::vector<std::string> GuardianSparkRuntime::invariant_violations_for_test(
         if (!keys_.contains(*key))
             out.push_back("rule '" + rule_id + "' maps to a key absent from keys_");
     }
+    // #4472 tripwire: compensation_finished=true is written in the SAME critical section as
+    // the pop (or the dispatch -> Queued double-fault hand-back), so a claim that ever owed a
+    // compensation (deadline set) and now reads finished must not still be a Dispatched /
+    // Dispatching head. See is_wedge_k_eligible_locked's invariant comment.
+    //
+    // Which writer legs the tripwire test drives: the normal finalize pop, finalize's catch
+    // when the claim already carries an outcome (the pop), and the direct-disarm fallback.
+    // NOT driven (no clean fault seam reaches them): the dispatch -> Queued hand-back, in
+    // finalize_arm_compensation's catch and in on_arm_complete's inline double-fault catch,
+    // which leaves a no-outcome claim Queued with finished=true and the deadline still set.
+    // Known false positive for that undriven leg: once such a claim is re-driven it reads
+    // Dispatched again with finished=true, which is a legitimate in-flight state this clause
+    // would flag. The clause is deliberately NOT narrowed (for example to require an outcome)
+    // because that would stop it catching a finished=true written early on a claim that has no
+    // outcome yet. Whoever adds a test that drives the hand-back must refine the clause then.
+    for (const auto& [key, entry] : claims_)
+        for (const auto& c : entry.fifo)
+            if (c->compensation_finished &&
+                c->compensation_deadline != std::chrono::steady_clock::time_point{} &&
+                (c->dispatch == ClaimDispatch::Dispatched ||
+                 c->dispatch == ClaimDispatch::Dispatching))
+                out.push_back("claim on a key reads compensation_finished while still in flight "
+                              "(finished must be written with the pop)");
     for (const auto& [key, pk] : keys_) {
         if (index_->refcount(key) > 0)
             continue;
@@ -1330,6 +1431,30 @@ void GuardianSparkRuntime::on_arm_complete(const std::string& key,
     try {
         {
             std::unique_lock<std::mutex> lk{registry_mu_};
+            // #4472: the compensation-owed marker is written in THIS critical section, on
+            // every exit (normal, or an exception unwinding past staging), never in a later
+            // acquisition. Between the two a heartbeat drain could read this claim as a
+            // K-eligible wedge with its compensating disarm already owed, and a K-waiver then
+            // acknowledges the generation and discards the server's re-push, the only owner
+            // left to re-arm the rule once the disarm pops the claim. Declared before the
+            // fallible gap_hook copy and every other fallible step below, so it covers all of
+            // them; non-throwing and non-allocating (a claim field write and a clock read),
+            // and destructed before `lk` releases. Reads `compensating` at scope exit: an
+            // adoption reset it, so an adopted claim is never marked, and a later fault with
+            // `compensating` already reset falls to the !published path that sets finished.
+            struct CompensationOwedMark {
+                const std::optional<std::uint64_t>& compensating;
+                KeyClaim& claim;
+                std::chrono::steady_clock::duration deadline_after;
+                ~CompensationOwedMark() noexcept {
+                    if (!compensating)
+                        return;
+                    claim.compensation_finished = false;
+                    // Set ONCE and never reset by a fallback retry (KeyClaim).
+                    if (claim.compensation_deadline == std::chrono::steady_clock::time_point{})
+                        claim.compensation_deadline = std::chrono::steady_clock::now() + deadline_after;
+                }
+            } owed_mark{compensating, *claim, cfg_.backend_op_deadline};
             gap_hook = drain_gap_hook_for_test_;
             const auto eit = claims_.find(key);
             const bool is_head = eit != claims_.end() && !eit->second.fifo.empty() &&
@@ -1739,17 +1864,12 @@ void GuardianSparkRuntime::on_arm_complete(const std::string& key,
         // `cont` null, one direct_disarm_fallback() runs, and the fallthrough
         // below is reached exactly as intended - `if (cont)` is a true single
         // discriminator again.
-        // up-3/up-4 (#4221): compensation is now owed for `claim` - mark it not-yet-
-        // finished (expire_overdue_claims()'s terminal-recovery pass must never reap
-        // a head whose compensation is still outstanding) and establish its ONE
-        // absolute observation deadline, set once and never reset by a later
-        // fallback retry.
-        {
-            std::lock_guard<std::mutex> lk{registry_mu_};
-            claim->compensation_finished = false;
-            if (claim->compensation_deadline == std::chrono::steady_clock::time_point{})
-                claim->compensation_deadline = std::chrono::steady_clock::now() + cfg_.backend_op_deadline;
-        }
+        // up-3/up-4 (#4221), #4472: `claim`'s compensation was marked owed (not-yet-
+        // finished, with its ONE absolute observation deadline) by CompensationOwedMark
+        // in the first critical section above, so no heartbeat drain can read this claim
+        // as a K-eligible wedge between the staging decision and here, and
+        // expire_overdue_claims()'s terminal-recovery pass never reaps a head whose
+        // compensation is still outstanding. There is deliberately no second marking site.
         const std::uint64_t sub = *compensating;
         compensating.reset(); // ownership from here is `cont` (below) or the direct
                                // disarm on the catch path - never this optional again
@@ -2188,6 +2308,24 @@ bool GuardianSparkRuntime::is_wedge_k_eligible_locked(
     const std::shared_ptr<KeyClaim>& claim) const noexcept {
     if (claim->end != ClaimEnd::WaiterTimedOutDispatched || claim->dispatch != ClaimDispatch::Dispatched)
         return false;
+    // #4472: K's premise is "the arm is physically stuck". A claim whose late result has
+    // already returned and is in compensating teardown is not that: waiving it
+    // acknowledges the generation, the server stops re-pushing, and the teardown then pops
+    // the claim with no replacement arm, so nothing is left to re-arm the rule. The marker
+    // is compensation_finished, written in on_arm_complete's first critical section; NOT the
+    // CompensationPermit, which is engaged for every in-flight arm (a genuinely hung arm
+    // included) and would disable K for all of them.
+    // INVARIANT (#4472): once a compensation was owed, compensation_finished=true is
+    // always written in the SAME registry_mu_ critical section as the pop of that claim (or the
+    // dispatch -> Queued double-fault hand-back in finalize_arm_compensation's catch), never
+    // alone. So a claim that reads finished here with its teardown behind it is already gone
+    // from the head or no longer Dispatched, and this predicate cannot read "K-eligible" for
+    // a compensated claim. A future writer of compensation_finished=true that is not paired
+    // with the pop breaks that, and with it the ack-ledger waiver path's safety (the
+    // RecoveryStatus::Blocking handling in guardian_arm_ack.cpp depends on it too). Tripwire:
+    // invariant_violations_for_test's compensation clause and the "#4472 tripwire" test.
+    if (!claim->compensation_finished)
+        return false;
     const auto eit = claims_.find(claim->key);
     return eit != claims_.end() && !eit->second.fifo.empty() && eit->second.fifo.front() == claim;
 }
@@ -2381,8 +2519,9 @@ void GuardianSparkRuntime::synthesize_fallback_outcome_locked(KeyClaim& c) {
 }
 
 std::size_t GuardianSparkRuntime::reap_stranded_claims_locked(
-    std::vector<std::pair<std::string, std::shared_ptr<KeyClaim>>>& refills) {
-    const auto now = std::chrono::steady_clock::now();
+    std::chrono::steady_clock::time_point now,
+    std::vector<std::pair<std::string, std::shared_ptr<KeyClaim>>>& refills,
+    ExpireWarns& warns) {
     std::size_t reaped = 0;
     bool release_failed = false;
     // The key of the first claim whose release failed this pass, for the rate-limited warn.
@@ -2404,6 +2543,20 @@ std::size_t GuardianSparkRuntime::reap_stranded_claims_locked(
                 now >= c->compensation_deadline) {
                 c->compensation_deadline_observed = true;
                 compensation_deadline_elapsed_.fetch_add(1, std::memory_order_relaxed);
+                // #4472 hardening: the latch and the counter above are set BEFORE
+                // this copy, so a failed copy only drops the warn. One record per claim (the
+                // latch is once-only); the warn itself is emitted off-lock by the caller.
+                if (warns.compensations.size() >= kDisarmPendingWarnsPerPass) {
+                    ++warns.compensations_more;
+                } else {
+                    try {
+                        warns.compensations.push_back(DisarmObservation{
+                            it->first,
+                            now - (c->compensation_deadline - cfg_.backend_op_deadline)});
+                    } catch (...) {
+                        ++warns.compensations_more;
+                    }
+                }
             }
             // NOTE: deliberately Queued-only, never Dispatched/Dispatching - a
             // Dispatched head can carry an outcome that abandon_claim_locked wrote
@@ -2537,6 +2690,7 @@ void GuardianSparkRuntime::disarm_orphan_keys_locked(
                 c->key = it->first;
                 c->io_class = *ioc;
                 c->subscription = pk->subscription;
+                c->created_at = std::chrono::steady_clock::now(); // #5403: the age gauge's origin
                 // Everything fallible runs BEFORE keys_.erase, while keys_ still owns the
                 // watcher (detach_rule_locked's order); an inserted empty entry is rolled
                 // back if the push throws.
@@ -2586,10 +2740,20 @@ void GuardianSparkRuntime::disarm_orphan_keys_locked(
 }
 
 std::size_t GuardianSparkRuntime::expire_overdue_claims() {
-    const auto now = std::chrono::steady_clock::now();
+    return expire_overdue_claims_impl(std::chrono::steady_clock::now());
+}
+
+std::size_t
+GuardianSparkRuntime::expire_overdue_claims_impl(std::chrono::steady_clock::time_point now) {
     std::vector<std::pair<std::string, std::shared_ptr<KeyClaim>>> overdue;
     std::vector<std::pair<std::string, std::shared_ptr<KeyClaim>>> refills;
     std::vector<std::shared_ptr<KeyClaim>> disarms;
+    ExpireWarns warns; // #5403/#4472: copied under the lock, warned after the dispatch loops
+    try {
+        warns.disarms.reserve(kDisarmPendingWarnsPerPass);
+        warns.compensations.reserve(kDisarmPendingWarnsPerPass);
+    } catch (...) {
+    }
     std::size_t expired_count = 0;
     std::size_t reaped_count = 0;
     {
@@ -2621,7 +2785,7 @@ std::size_t GuardianSparkRuntime::expire_overdue_claims() {
         // up-4 (#4221): the terminal-recovery safety net (see this function's own
         // doc comment) - separate from the overdue-live-claim pass above, which
         // deliberately excludes anything already outcome/commit_exception/abandoned.
-        reaped_count = reap_stranded_claims_locked(refills);
+        reaped_count = reap_stranded_claims_locked(now, refills, warns);
         // #5322: the owner of a ->0 edge a release dropped. Contained here so the
         // reaper's refills (already flipped Dispatching) always reach their dispatch.
         try {
@@ -2629,6 +2793,9 @@ std::size_t GuardianSparkRuntime::expire_overdue_claims() {
         } catch (...) {
             claim_drain_failures_.fetch_add(1, std::memory_order_relaxed);
         }
+        // #5403: observation only (a counter and a copied key); it releases, pops and
+        // cancels nothing, so it can neither strand the refills above nor change a receipt.
+        observe_pending_disarms_locked(now, warns);
     }
     // A reaped claim may carry an outcome this pass just wrote (the synthesis arm), which a
     // blocking waiter in wait_for_claim() is waiting on, so a reap alone must wake it. The
@@ -2641,6 +2808,64 @@ std::size_t GuardianSparkRuntime::expire_overdue_claims() {
         dispatch_arm_off_lock(key, refill);
     for (auto& d : disarms)
         submit_disarm_off_lock(d); // takes registry_mu_ itself
+    // #4472 hardening: the synchronous warns run LAST, after the waiters are woken and every
+    // refill / Disarm has been dispatched, so a slow log sink delays no dispatch or waiter
+    // wake-up. It is not free: the production caller reaches this from the heartbeat-cadence
+    // drain, so the warns still run under GuardianEngine's mtx_ on the heartbeat thread (off
+    // registry_mu_). One pass issues at most 10 warns (the Disarm and compensation warns, each
+    // capped at kDisarmPendingWarnsPerPass = 4, plus one summary line for each), and each claim
+    // warns once because of its latch; the production logger is async. Each warn is contained:
+    // a logging failure must never escape the reaper.
+    for (const auto& w : warns.disarms) {
+        try {
+            spdlog::warn("Guardian spark: the Disarm for key '{}' has been pending for {} s "
+                         "(observation threshold {} s); its key stays held. If its backend "
+                         "call was admitted, its class quota slot stays held and, if the call "
+                         "is blocked inside a mechanism, that mechanism type's engine lock "
+                         "stays held until it returns. Nothing was released (pending too long, "
+                         "not proof the call hung)",
+                         ::yuzu::log_key_token(w.key),
+                         std::chrono::duration_cast<std::chrono::seconds>(w.age).count(),
+                         kDisarmPendingObserveThreshold.count());
+        } catch (...) {
+        }
+    }
+    if (warns.disarms_more != 0) {
+        try {
+            spdlog::warn("Guardian spark: and {} more pending {} past the {} s observation "
+                         "threshold this pass (counted in the disarm deadline total, not "
+                         "logged individually)",
+                         warns.disarms_more, warns.disarms_more == 1 ? "Disarm" : "Disarms",
+                         kDisarmPendingObserveThreshold.count());
+        } catch (...) {
+        }
+    }
+    for (const auto& w : warns.compensations) {
+        try {
+            spdlog::warn("Guardian spark: the compensating teardown for key '{}' has been "
+                         "outstanding for {} s (past its {} s compensation deadline); its key "
+                         "stays held and its generation is held, not acknowledged, until the "
+                         "teardown finishes. Nothing was released (pending too long, not "
+                         "proof the call hung)",
+                         ::yuzu::log_key_token(w.key),
+                         std::chrono::duration_cast<std::chrono::seconds>(w.age).count(),
+                         std::chrono::duration_cast<std::chrono::seconds>(
+                             cfg_.backend_op_deadline)
+                             .count());
+        } catch (...) {
+        }
+    }
+    if (warns.compensations_more != 0) {
+        try {
+            spdlog::warn("Guardian spark: and {} more compensating {} past {} deadline this "
+                         "pass (counted in the compensation deadline total, not logged "
+                         "individually)",
+                         warns.compensations_more,
+                         warns.compensations_more == 1 ? "teardown" : "teardowns",
+                         warns.compensations_more == 1 ? "its" : "their");
+        } catch (...) {
+        }
+    }
     return expired_count;
 }
 
@@ -3291,6 +3516,7 @@ GuardianSparkRuntime::withdraw_rule_after_wedge_sweep_locked(
                 c->key = *key_opt;
                 c->io_class = *ioc;
                 c->subscription = kit->second->subscription;
+                c->created_at = std::chrono::steady_clock::now(); // #5403: the age gauge's origin
                 const auto [eit, inserted] = claims_.try_emplace(*key_opt);
                 // A disarm is only ever created on a key with no LIVE claim (an arm
                 // never writes keys_ until it commits, and commit erases the entry);
