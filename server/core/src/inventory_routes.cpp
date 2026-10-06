@@ -127,7 +127,7 @@ void InventoryRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermF
                  if (!perm_fn_(req, res, "Inventory", "Read"))
                      return;
                  SoftwareCatalogQuery q;
-                 q.name_filter = req.has_param("q") ? req.get_param_value("q") : "";
+                 q.q = req.has_param("q") ? req.get_param_value("q") : "";
                  q.limit = clamp_limit(req, 200, 2000);
                  // results_only=1 (round-3 item 8, mirrors hardware_ui.cpp's fix for
                  // the same class of bug): the search box's own hx-get swaps ONLY
@@ -150,9 +150,9 @@ void InventoryRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermF
                  // audit sink → false, never an httplib 500): parity with the REST sibling.
                  (void)detail::try_persist_audit(
                      audit_fn_, req, "inventory.software.catalog", cat ? "success" : "failure",
-                     "Inventory", q.name_filter.empty() ? "fleet" : ("q=" + q.name_filter),
+                     "Inventory", q.q.empty() ? "fleet" : ("q=" + q.q),
                      cat ? ("titles=" + std::to_string(cat->size())) : "store degraded");
-                 send_html(res, render_inventory_software_fragment(cat, meta, q.name_filter, stale,
+                 send_html(res, render_inventory_software_fragment(cat, meta, q.q, stale,
                                                                    capped, now, results_only));
              });
 

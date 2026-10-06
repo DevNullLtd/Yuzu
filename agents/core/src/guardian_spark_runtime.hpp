@@ -647,7 +647,8 @@ public:
         return disarm_retained_.load(std::memory_order_relaxed);
     }
     /// rung 9c R5.2: queued (never dispatched) claims dropped by begin_stop(), plus
-    /// disarm claims the executor refused with Stopped. Lock-free.
+    /// disarm claims the executor refused with Stopped. Increments only during shutdown
+    /// and resets on restart, so it is rarely observable on the fleet. Lock-free.
     [[nodiscard]] std::uint64_t claims_dropped_at_stop() const noexcept {
         return claims_dropped_at_stop_.load(std::memory_order_relaxed);
     }
@@ -788,7 +789,17 @@ public:
     /// Dispatching-window race deterministically. Set before triggering the
     /// dispatch; consumed (moved out, resetting to empty) under registry_mu_.
     void set_dispatch_entry_hook_for_test(std::function<void()> hook);
-    /// R5.2 drain fault seam (C2/K5): consumed once by the next on_arm_complete.
+    /// R5.2 drain fault seam (C2/K5): a point is consumed once, the next time execution
+    /// reaches its call site; it is not tied to one entry point. Points 1, 2, 4, 5, 8 and
+    /// 12 are in on_arm_complete. Points 3, 6 and 7 are in publish_arm_verdicts_locked,
+    /// which on_arm_complete calls and finalize_arm_compensation (the compensation worker)
+    /// also calls; on the compensating path on_arm_complete returns before publishing.
+    /// Point 9 is in synthesize_fallback_outcome_locked (the reaper), 10 in
+    /// dispatch_parked_arm_guarded (reached from several callers, among them
+    /// redrive_parked_arms and finalize_arm_compensation's class_refill dispatch), 11 in
+    /// park_congested_arm_locked (a congested-arm parking push), 16 in
+    /// reap_stranded_claims_locked's refill push, and 13-15 in the orphan pass (see each
+    /// below).
     /// 1 = std::bad_alloc before the fifo snapshot (after `compensating` took ownership
     /// of a successful arm); 2 = a throw right after the first commit adopted the
     /// subscription (before its verdict is staged); 3 = a throw inside the publish
@@ -805,7 +816,15 @@ public:
     /// continuation branch below run on top of an already-issued direct disarm AND
     /// made finalize_arm_compensation()'s claims_.find("") miss the real key,
     /// permanently wedging it - `cont` is now assigned only as the LAST statement
-    /// of the try, so points 4 and 5 both leave it null identically). 0 = off.
+    /// of the try, so points 4 and 5 both leave it null identically). 12 = a throw in a
+    /// wedge adoption AFTER index_->add moved the rule's mapping to the adopted key and
+    /// before the PerKey is built (the adoption's catch then erases that mapping); 16 = a
+    /// throw in the reaper's refill push (reap_stranded_claims_locked), before the
+    /// exposed head is flipped to Dispatching; 13 = a throw while the orphan pass builds
+    /// one orphan's Disarm claim (inside the per-orphan containment); 14 = a throw in the
+    /// orphan pass's off-lock collection push, after the Disarm is already durable in
+    /// claims_ and keys_ has been erased; 15 = a throw at the top of the orphan pass,
+    /// outside the per-orphan containment (the walk itself). 0 = off.
     void set_drain_fault_point_for_test(int point) noexcept;
     /// R5.2 detach fault seam (adversarial re-review r2 C1): consumed once by the next
     /// detach_rule_locked that builds a DISARM claim - throws std::bad_alloc at the
@@ -813,9 +832,15 @@ public:
     void set_detach_fault_for_test(bool on) noexcept;
     /// R5.2 index-release fault seam (adversarial re-review r2 C2): consumed once by
     /// the next release_claim_index_locked - throws std::bad_alloc where
-    /// index_->remove_rule's own key-copy allocation would, BEFORE the mapping or the
+    /// index_->remove_rule's own key-copy allocation would have (the release now calls
+    /// erase_rule/owns, both noexcept, so this seam is the ONLY throw source inside
+    /// release_claim_index_locked's try in production code), BEFORE the mapping or the
     /// claim's index_held flag is touched.
     void set_index_remove_fault_for_test(bool on) noexcept;
+    /// #5322: counted/sticky form of the index-release fault seam. n > 0 = the next n
+    /// releases throw (decremented as each fires), n < 0 = every release throws until
+    /// reset (never decremented), 0 = off. The bool setter above is `n = on ? 1 : 0`.
+    void set_index_remove_fault_count_for_test(int n) noexcept;
     /// R5.2 detach post-mutation fault seam (adversarial re-review r3 C4): consumed
     /// once by the next detach_rule_locked. 1 = std::bad_alloc where the lifecycle-kind
     /// string copy allocates (now BEFORE the durable mutation: the detach fails cleanly
@@ -823,9 +848,13 @@ public:
     /// allocation would (AFTER the mutation: contained and counted, the queued disarm
     /// is still handed to the caller). 0 = off.
     void set_detach_post_fault_point_for_test(int point) noexcept;
-    /// R5.2 (r3 C4): a post-mutation, non-durable step of detach_rule_locked
-    /// (outbox_.drop_rule) threw and was contained; the teardown and the queued disarm
-    /// completed regardless. Expected 0. Lock-free.
+    /// R5.2 (r3 C4): a post-mutation step of detach_rule_locked threw and was contained:
+    /// outbox_.drop_rule (non-durable), or the inline-type synchronous backend disarm
+    /// (keys_ is still erased, #5322). The queued disarm, if any, was still handed to the
+    /// caller. A nonzero count means "inspect", not "teardown completed": a throw from the
+    /// inline backend disarm can leave the engine subscription live and unowned (the
+    /// std::system_error may come from a lock acquisition before or after SparkEngine's
+    /// bookkeeping). Expected 0. Lock-free.
     [[nodiscard]] std::uint64_t detach_post_commit_failures() const noexcept {
         return detach_post_commit_failures_.load(std::memory_order_relaxed);
     }
@@ -844,26 +873,46 @@ public:
     [[nodiscard]] std::uint64_t detach_claim_failures() const noexcept {
         return detach_claim_failures_.load(std::memory_order_relaxed);
     }
-    /// R5.2 (adversarial re-review r3 C2/C3): a claim's index release threw inside
-    /// index_->remove_rule (its key-copy allocation) and was CONTAINED instead of
-    /// crossing a noexcept boundary (the drain, a refill's admission-failure cleanup,
-    /// begin_stop from the destructor); the claim keeps its index ownership for the
-    /// next release to retry. Expected 0. Lock-free.
+    /// R5.2 (adversarial re-review r3 C2/C3): a claim's index release threw and was
+    /// CONTAINED instead of crossing a noexcept boundary (the drain, a refill's
+    /// admission-failure cleanup, begin_stop from the destructor); the claim keeps its
+    /// index ownership for the next release to retry. DEFENCE-IN-DEPTH CONTAINMENT,
+    /// expected permanently 0 in production: the release calls SparkKeyRuleIndex::
+    /// erase_rule and owns(), both noexcept, so the only throw source inside the try is
+    /// the test seam (set_index_remove_fault_for_test). Lock-free.
     [[nodiscard]] std::uint64_t claim_index_release_failures() const noexcept {
         return claim_index_release_failures_.load(std::memory_order_relaxed);
     }
+    /// #5322: tombstones (dead Queued Arm claims that still hold a genuine index
+    /// mapping, index_held && owns()) whose mapping the expiry reaper released and
+    /// popped. A non-owner claim or a committed suffix popped by the same pass is not
+    /// counted. Exported on the heartbeat as `yuzu.guardian_tombstones_released_by_reaper`
+    /// (#5404). A tombstone only exists after a release failed, and the release cannot fail
+    /// in production (see claim_index_release_failures()), so this is expected permanently
+    /// 0 outside tests. Lock-free.
+    [[nodiscard]] std::uint64_t tombstones_released_by_reaper() const noexcept {
+        return tombstones_released_by_reaper_.load(std::memory_order_relaxed);
+    }
+    /// #5322: orphan-key Disarm claims queued by the reaper's orphan pass (a Disarm claim
+    /// was queued and keys_ erased; the backend disarm itself runs later, off-lock).
+    /// Exported on the heartbeat as `yuzu.guardian_orphan_disarms_started` (#5404). Lock-free.
+    [[nodiscard]] std::uint64_t orphan_disarms_started() const noexcept {
+        return orphan_disarms_started_.load(std::memory_order_relaxed);
+    }
+    /// #5322: dead watchers erased by on_subscription_lost for a key with no rules.
+    /// Exported on the heartbeat as `yuzu.guardian_dead_watchers_erased_on_lost` (#5404).
+    /// Lock-free.
+    [[nodiscard]] std::uint64_t dead_watchers_erased_on_lost() const noexcept {
+        return dead_watchers_erased_on_lost_.load(std::memory_order_relaxed);
+    }
     /// rung 9c PR-5a (#4221 cs-103): detach_rule_locked's last-on-key branch sweeps
-    /// claims_[key] before constructing a new Disarm claim, on the belief (see the
-    /// reachability note at that call site) that nothing survives the sweep. This
-    /// counts every time that belief was WRONG - i.e. every time the debug-only
-    /// assert() next to this counter's increment site would have fired in a debug
-    /// build. Expected 0; unlike a bare assert() (compiled out under NDEBUG in a
-    /// release build), this counter and its accompanying log line survive into
-    /// release, matching this file's own established precedent at
-    /// dispatch_arm_off_lock's "not an Arm claim" guard for a should-never-happen
-    /// branch. A nonzero value here means the reachability note's call-graph
-    /// argument was incomplete somewhere - re-open the investigation rather than
-    /// assume it is safe to ignore.
+    /// claims_[key] before constructing a new Disarm claim. This counts every time
+    /// the sweep left the fifo non-empty (the new Disarm claim is then not pushed and
+    /// the real disarm runs through the synchronous last-resort fallback). The branch
+    /// is reachable - a retained owner tombstone holding an orphan key's last mapping
+    /// - and the counted, logged fallback is its accepted outcome; the debug-only
+    /// assert that used to sit next to the increment site is gone (see the reachability
+    /// note at that call site). Expected 0 outside a failing index release.
     [[nodiscard]] std::uint64_t detach_sweep_left_residue() const noexcept {
         return detach_sweep_left_residue_.load(std::memory_order_relaxed);
     }
@@ -1092,16 +1141,30 @@ private:
     /// fifo is always `[optional Disarm head] + [Arm claims...]` - "arm queued behind
     /// a disarm" is the real rearm-after-teardown shape, "disarm behind an arm" is
     /// unreachable. Asserted in debug; the code handles the general push regardless.
+    /// An Arm claim on a key whose keys_ entry exists is a terminal residue or an
+    /// in-flight drain's own head; a new attach on such a key joins instead of queuing.
     ///
-    /// Index ownership: an Arm claim that is neither withdrawn nor abandoned holds
-    /// exactly one index_ (key, rule_id) mapping (`index_held`), added when it is
-    /// queued (index_->add is the 0->1 detector and detach_rule_locked finds claimed
-    /// rules through key_for_rule) and released by whichever code marks it withdrawn,
-    /// abandoned, failed, or committed (commit passes ownership to the normal
-    /// rules_/keys_ state). Every index_->remove_rule for a claim is guarded by that
-    /// flag because remove_rule() removes the CURRENT mapping with no generation
-    /// check (spark_key_rule_index.hpp) - a stale claim must never remove a
-    /// replacement's mapping.
+    /// Index ownership: an Arm claim holds exactly one index_ (key, rule_id) mapping
+    /// while `index_held` is set, added when it is queued (index_->add is the 0->1
+    /// detector and detach_rule_locked finds claimed rules through key_for_rule) and
+    /// released when the claim is withdrawn, abandoned, failed, or committed (commit
+    /// passes ownership to the normal rules_/keys_ state). A release that fails (test
+    /// seam / defence in depth) leaves `index_held` set: the claim is then withdrawn
+    /// (never re-committed) yet still holds its mapping, and stays in its fifo as a
+    /// tombstone until a later release or sweep succeeds, so `withdrawn` does not by
+    /// itself mean the mapping is gone. A release of a claim's held mapping goes through
+    /// release_claim_index_locked, is guarded by that flag, and calls
+    /// erase_rule(rule_id, generation), which erases only while the claim's generation
+    /// is still the recorded owner (spark_key_rule_index.hpp) - a stale claim must never
+    /// remove a replacement's mapping. `index_held` is the claim's own belief: a
+    /// same-rule re-attach or a wedge adoption can move the mapping to another claim or
+    /// key while the flag stays set, so ownership is asked of the index
+    /// (SparkKeyRuleIndex::owns). A claim that no longer owns the mapping releases as a
+    /// no-op - `index_held` is cleared, the release succeeds and is never counted as a
+    /// failure - and the drain commits only a claim that owns its mapping at commit time.
+    /// Two other sites call erase_rule directly, both generation-guarded and idempotent:
+    /// attach_core's rollback of a mapping it just added, and on_arm_complete's
+    /// adoption-catch cleanup of a mapping it re-added.
     ///
     /// `end` is a PR-5 plug point: a FACT about how the claim ended, recorded so the
     /// fault-wiring rung (wedge marking / K-bound / arm_failed reason) has something to
@@ -1127,7 +1190,8 @@ private:
         ClaimDispatch dispatch{ClaimDispatch::Queued};
         std::string key;
         IoClass io_class{};
-        bool withdrawn{false};        ///< Arm: its rule was detached while claimed (Case 0 generalised)
+        bool withdrawn{false};        ///< Arm: never re-commit (rule detached while claimed, or a retained tombstone
+                                      ///< after a failed index release); may still hold its mapping until released
         bool waiter_abandoned{false}; ///< the PR-1 synchronous waiter gave up (deadline / stop)
         bool index_held{false};       ///< Arm: owns index_'s (key, rule_id) mapping (see above)
         std::uint32_t admission_rejections{0}; ///< Disarm: retained-after-refusal count
@@ -1162,6 +1226,19 @@ private:
         std::chrono::steady_clock::time_point deadline{};
         // Disarm payload.
         std::uint64_t subscription{0};
+        /// #5403: Disarm-claim-only. steady_clock reading taken where the claim is built
+        /// (disarm_orphan_keys_locked, and withdraw_rule_after_wedge_sweep_locked, which
+        /// detach_rule_locked and detach_all both reach), the origin of
+        /// oldest_pending_disarm_age(). Written once, before the claim is pushed; never
+        /// reset by an admission refusal, a worker throw or a redrive, so a retained
+        /// Disarm keeps aging from its creation. Meaningless (default) on an Arm claim.
+        std::chrono::steady_clock::time_point created_at{};
+        /// #5403: once-only latch for observe_pending_disarms_locked(): set, under
+        /// registry_mu_, the first pass that finds this claim pending longer than
+        /// kDisarmPendingObserveThreshold, so the counter and the warn happen once per claim
+        /// lifetime (the compensation_deadline_observed precedent below). Observation only:
+        /// it does not release anything.
+        bool disarm_deadline_observed{false};
 
         // up-3/up-4 (#4221, rung 9c PR-5b): Arm-claim-only compensation bookkeeping.
         // `compensation_permit`, when engaged, is this claim's held slot in the
@@ -1173,15 +1250,21 @@ private:
         // ever submitted - see compensation_reserved_count_'s header comment.
         // `compensation_finished` defaults true (nothing to track yet);
         // dispatch_arm_off_lock() never touches it, on_arm_complete() sets it false
-        // the instant a live subscription becomes compensation-owed (entering the
-        // `if (compensating)` branch) and back to true - in the SAME critical
-        // section that pops/publishes the claim - once the compensating disarm has
-        // genuinely finished (or turned out never to be needed).
-        // expire_overdue_claims()'s terminal-recovery pass (up-4) reads it to know a
-        // terminal/stranded head is safe to reap: never touch one whose compensation
-        // is not yet finished. `compensation_deadline` is set ONCE, when
-        // compensation first becomes owed, from cfg_.backend_op_deadline - never
-        // reset on a fallback retry. `compensation_deadline_observed` is a
+        // the instant a live subscription becomes compensation-owed - in its FIRST
+        // registry_mu_ critical section, on every exit including an exception
+        // unwinding past staging (#4472; a scope guard, so there is no later
+        // acquisition in which a reader could see the owed disarm as not owed) - and
+        // back to true - in the SAME critical section that pops/publishes the claim -
+        // once the compensating disarm has genuinely finished (or turned out never to
+        // be needed). expire_overdue_claims()'s terminal-recovery pass (up-4) reads it
+        // to know a terminal/stranded head is safe to reap: never touch one whose
+        // compensation is not yet finished. is_wedge_k_eligible_locked() reads it too
+        // (#4472): a claim whose compensation is outstanding is never K-eligible.
+        // `compensation_deadline` is set ONCE, when compensation first becomes owed
+        // (the same guard), from cfg_.backend_op_deadline - never reset on a fallback
+        // retry. The instant compensation became owed is therefore
+        // compensation_deadline - cfg_.backend_op_deadline, which
+        // oldest_outstanding_compensation_age() measures from. `compensation_deadline_observed` is a
         // once-only latch: in 5b, an elapsed deadline only increments
         // compensation_deadline_elapsed_ (see the class-level comment there) - it
         // does not, and must not, release the reservation, the subscription, the
@@ -1404,6 +1487,14 @@ public:
     /// a key whose front is a different claim entirely. Never mutates state (a query
     /// only, matching receipt_recovered()'s own contract) - registry_mu_ taken
     /// internally.
+    ///
+    /// #4472 (a third condition): AND no compensating disarm is outstanding for the
+    /// claim (`compensation_finished`). A late result that has returned and is being
+    /// disarmed leaves the claim FIFO-front until the teardown pops it, so the two
+    /// checks above alone would call it K-eligible; waiving it would acknowledge the
+    /// generation and stop the server's re-pushes, after which the pop leaves the rule
+    /// with no replacement arm. The marker is deliberately not the CompensationPermit
+    /// (engaged for every in-flight arm, a genuinely hung one included).
     [[nodiscard]] bool receipt_wedge_k_eligible(const ArmReceipt& receipt) const;
 
     /// rung 9c PR-5e (#4221, K-bound closeout - adversarial review finding, Kimi K3 +
@@ -1426,8 +1517,9 @@ public:
     /// SAME claim - but the priority is stated for clarity, not because the case is
     /// reachable). `Blocking` covers every other case: an empty receipt, a claim
     /// neither recovered nor currently wedge-eligible (settled to a genuine
-    /// refusal/rejection/withdrawal, or already popped by a resolution nobody
-    /// adopted). registry_mu_ taken ONCE, internally; never mutates state.
+    /// refusal/rejection/withdrawal, already popped by a resolution nobody
+    /// adopted, or - #4472 - still the key's front but with a compensating disarm
+    /// outstanding). registry_mu_ taken ONCE, internally; never mutates state.
     enum class RecoveryStatus { Recovered, WedgeEligible, Blocking };
     [[nodiscard]] RecoveryStatus receipt_recovery_status(const ArmReceipt& receipt) const;
 
@@ -1511,7 +1603,46 @@ public:
     /// exactly like every other refill site in this file. This return value's
     /// meaning is unchanged - it still counts only THIS function's own overdue-
     /// live-claim expiries, not the terminal-recovery pass's reaps.
+    ///
+    /// #5322: the same acquisition then runs disarm_orphan_keys_locked() (contained: a
+    /// throw is counted and cannot strand the reaper's refills), and after the lock
+    /// releases submits the Disarm claims it queued (submit_disarm_off_lock). The reaper's
+    /// pop set is widened to every terminal Queued Arm head (see
+    /// reap_stranded_claims_locked). A reaped claim, or a synthesized outcome (even one
+    /// whose release then failed), wakes blocking waiters via claim_cv_. The refill
+    /// dispatch loop after the lock shares the file-wide exposure to a throw from
+    /// dispatch_arm_off_lock (a std::lock_guard failure, not reachable in practice, the same
+    /// exposure dispatch_parked_arm_guarded's note names for every off-lock dispatch site);
+    /// there is no per-refill catch because the hand-back would retake the same mutex.
+    ///
+    /// #4472 hardening: the synchronous spdlog warns (a pending Disarm past
+    /// kDisarmPendingObserveThreshold, a compensating teardown past its deadline, and one
+    /// summary line when the per-pass cap, kDisarmPendingWarnsPerPass, left some unwarned)
+    /// run LAST, after claim_cv_ is notified and every refill / Disarm is dispatched, so a
+    /// slow log sink delays no dispatch or waiter wake-up; the warns still run under the
+    /// caller's locks (off registry_mu_, but under GuardianEngine's mtx_ on the heartbeat
+    /// thread when reached from the drain tick), at most 10 per pass. The latch and counter
+    /// for each are set under the lock first, so a warn that is skipped or fails never loses
+    /// the once-per-claim count.
     std::size_t expire_overdue_claims();
+    /// #5403: the same pass against a caller-supplied steady_clock reading. The zero-arg form
+    /// is this with steady_clock::now(); a test passes a later `now` to age claims without
+    /// sleeping (it also moves the Arm-deadline comparison, so an Arm queued behind the
+    /// aged Disarm is judged against it too, and so is the outstanding-compensation deadline
+    /// observation, #4472). The pass also runs the pending-Disarm
+    /// observation (observe_pending_disarms_locked): a Disarm pending longer than
+    /// kDisarmPendingObserveThreshold is counted once (disarm_deadline_elapsed()) and
+    /// warned about once, rate-limited per pass, naming the key only through
+    /// log_key_token. It changes no ownership, queue position, admission or receipt for a
+    /// Disarm. CAUTION: `now` is not an observation-only input. It drives the same pass the
+    /// zero-arg form runs, so it ALSO abandons every in-flight Arm claim whose own deadline is
+    /// before `now` (a future-dated `now` abandons every arm in flight) and reaps terminal
+    /// heads against it. That is why this state-mutating overload is a test seam, named
+    /// `_for_test` like the file's other seams, and production calls only the zero-arg form
+    /// (guardian_arm_ack.cpp's drain).
+    std::size_t expire_overdue_claims_at_for_test(std::chrono::steady_clock::time_point now) {
+        return expire_overdue_claims_impl(now);
+    }
 
     /// rung 9c PR-2 Unit 3 (Astra opine review Blocker 4): bounded, on-demand
     /// maintenance pass for retained disarms - one attempted re-submission per
@@ -1547,6 +1678,96 @@ public:
     /// arm_parked set, no outcome). A live gauge, computed under registry_mu_ by
     /// scanning claims_ - diagnostic/test use, not a hot-path read.
     [[nodiscard]] std::size_t arms_parked() const;
+    /// #5322: retained tombstones - Queued Arm claims that are dead (outcome or
+    /// commit_exception set) that still hold their rule-to-key index entry
+    /// (index_held && index_->owns(key, rule_id, generation)). A live gauge under
+    /// registry_mu_ by scanning claims_; exported on the heartbeat as
+    /// `yuzu.guardian_retained_tombstones` (#5404) once per heartbeat. Not a per-event read.
+    /// A tombstone requires a failed index release, which cannot happen in production (see
+    /// claim_index_release_failures()), so this is expected permanently 0 outside tests.
+    [[nodiscard]] std::size_t retained_tombstones() const;
+
+    /// #5403: a Disarm pending longer than this is observed once (a counter and a warn).
+    /// A fixed initial policy choice - NOT derived from cfg_.backend_op_deadline, and not a
+    /// measured bound: nothing in the repository establishes how long a healthy Disarm may
+    /// legitimately stay pending, so the value is meant to be revisited against fleet data.
+    static constexpr std::chrono::seconds kDisarmPendingObserveThreshold{30};
+
+    /// #5403: the age of the oldest Disarm claim that is still pending, measured from its
+    /// creation (KeyClaim::created_at, kept across admission refusals and retries), or
+    /// nullopt when no Disarm is pending. Pending means the key's fifo head is a Disarm with
+    /// no outcome yet, whether it is Queued (including a retained one, refused at admission
+    /// or held back by a class quota), Dispatching, or Dispatched (its backend disarm has not
+    /// returned). The gauge cannot tell those apart: a large value means "pending too long",
+    /// not "the backend call hung". `now` before a claim's creation reads as zero for that
+    /// claim. Takes registry_mu_ and scans claims_ (O(claims)): heartbeat cadence, never a
+    /// hot path, and never to be called with registry_mu_ held (the scan has a _locked twin).
+    ///
+    /// POLICY (observation only). The runtime never releases, pops or force-cancels a
+    /// pending Disarm. What a pending Disarm holds depends on its state. In every state it
+    /// holds its KEY (a same-key Arm queues behind it and, at its own deadline, ends
+    /// CongestionExpired). Only while an ADMITTED backend call is running (Dispatched) does
+    /// it also hold the executor QUOTA slot of its IoClass, until fn() returns (when a
+    /// class's slots are all held, every later arm of that class is refused and parked,
+    /// #5168), and, if that call is blocked inside a mechanism, SparkEngine's per-TYPE lock
+    /// (every other arm and disarm of that type waits behind it; the mechanism contract, not
+    /// this class, is what bounds that). A Queued Disarm, including a retained one (refused
+    /// at admission, so the backend call never ran, or its worker threw), holds only its key:
+    /// it has no admitted call and so no slot. Releasing the claim early would let the key's
+    /// next Arm run while the old teardown may still be running: the teardown-before-rearm
+    /// hazard that submit_disarm_off_lock's comment records as removed by construction; and,
+    /// for an admitted call, it could not free anything physical anyway, since the worker,
+    /// the executor's key and the quota slot stay held until the call returns. Recovery from
+    /// a call that never returns is an agent restart, or --spark-disable as the rollback
+    /// lever.
+    ///
+    /// WHAT THIS DOES NOT SEE: a compensating disarm (tracked on an ARM claim; see
+    /// oldest_outstanding_compensation_age() and compensation_deadline_elapsed()),
+    /// direct_disarm_fallback() when it runs outside a compensation, the synchronous teardown
+    /// fallback that detach_rule_locked runs under registry_mu_ (a hang there stalls this scan
+    /// and the expiry pass for every key, not just its own), and inline-type teardown.
+    [[nodiscard]] std::optional<std::chrono::steady_clock::duration>
+    oldest_pending_disarm_age(std::chrono::steady_clock::time_point now) const;
+    /// #5403: Disarm claims observed pending longer than kDisarmPendingObserveThreshold by
+    /// expire_overdue_claims(), counted once per claim (KeyClaim::disarm_deadline_observed
+    /// latches). Observation only - the claim, its worker and any quota slot are untouched;
+    /// the compensation_deadline_elapsed() precedent. Lock-free.
+    [[nodiscard]] std::uint64_t disarm_deadline_elapsed() const noexcept {
+        return disarm_deadline_elapsed_.load(std::memory_order_relaxed);
+    }
+    /// #4472: the age of the oldest compensating teardown still outstanding, measured from
+    /// the instant the compensation became owed (the late arm result returned and nobody
+    /// adopted it), NOT from the original arm's creation, or nullopt when none is. A claim is
+    /// counted from that instant until finalize_arm_compensation (or the !published recovery
+    /// path) marks it finished, so this covers the asynchronous compensating disarm AND the
+    /// direct_disarm_fallback() runs that happen inside a compensation, which execute with the
+    /// claim's flag already false. It is the Arm-claim counterpart of oldest_pending_disarm_age(),
+    /// which selects ClaimKind::Disarm only and by design never sees these. Like it, it
+    /// measures "teardown pending too long", not proof of a hang, and is OBSERVATION ONLY: it
+    /// changes no ownership, queue position, admission, receipt or ack. While outstanding the
+    /// claim stays its key's fifo head, so the key stays held. What else it holds depends on
+    /// the teardown's form: an asynchronous compensating disarm holds the executor quota slot
+    /// of its class only while its backend call runs (and, if that call is blocked inside a
+    /// mechanism, that mechanism type's engine lock); direct_disarm_fallback() holds no quota
+    /// (it counts as an alive worker against the executor's physical ceiling, not against a
+    /// class quota) and, if blocked inside a mechanism, that type's engine lock; and before
+    /// the teardown is submitted no slot is held at all. (#4472)
+    /// The claim is not K-eligible, so the generation is held while it is outstanding. `now` before the owed instant reads as zero. Takes registry_mu_ and
+    /// scans claims_ (O(claims)); heartbeat cadence only, and never to be called with
+    /// registry_mu_ held (it has a _locked twin). The once-per-claim elapsed count is the
+    /// existing compensation_deadline_elapsed().
+    [[nodiscard]] std::optional<std::chrono::steady_clock::duration>
+    oldest_outstanding_compensation_age(std::chrono::steady_clock::time_point now) const;
+    /// #5322 TEST-ONLY diagnostic (no production caller): the registry's cross-structure
+    /// invariants, one human-readable line per violation, empty when all hold. Takes
+    /// registry_mu_. Checks (i) every rules_ entry has an index mapping that owns() with
+    /// the rule's generation and whose key is present in keys_, and (ii) every keys_
+    /// entry has an index refcount above 0 or a non-empty claim fifo. A refcount-0 keys_
+    /// entry with an empty fifo is an ORPHAN WATCHER, legitimate only between the release
+    /// that dropped its last mapping and the next heartbeat pass
+    /// (disarm_orphan_keys_locked); pass `allow_orphans` to accept one in such a state.
+    [[nodiscard]] std::vector<std::string> invariant_violations_for_test(
+        bool allow_orphans = false) const;
     /// #5168 test seam: total entries across the per-class waiter deques (live and
     /// stale), to pin that they stay bounded.
     [[nodiscard]] std::size_t parked_arm_waiter_depth_for_test() const;
@@ -1591,6 +1812,15 @@ private:
     /// function's, since it never touches shared state itself.
     [[nodiscard]] static bool is_retained_wedge(const KeyClaim& head) noexcept;
 
+    /// #5322: a claim that can never be selected for a fresh dispatch - withdrawn,
+    /// its waiter abandoned, or already carrying a terminal outcome / commit throw.
+    /// Pure read of `claim`'s own fields; registry_mu_ is the caller's concern.
+    /// INV-1: try_dispatch_head_locked() never selects a dead Queued head and
+    /// reap_stranded_claims_locked() never refills one. (dispatch_arm_off_lock's entry
+    /// guard is deliberately narrower: withdrawn || commit_exception only, so a
+    /// waiter_abandoned claim that carries an outcome still reaches the reservation.)
+    [[nodiscard]] static bool is_dead_claim(const KeyClaim& claim) noexcept;
+
     /// rung 9c PR-5e (#4221, K-bound closeout): the pure ClaimEnd->ReceiptStatus
     /// mapping receipt_status() applies - factored out so
     /// receipt_status_wedge_aware() can compute the SAME mapping under its own
@@ -1602,7 +1832,12 @@ private:
 
     /// rung 9c PR-5e (#4221, K-bound closeout - cpp-expert governance finding):
     /// the K-eligibility predicate (`end == WaiterTimedOutDispatched && dispatch
-    /// == Dispatched && still its key's FIFO front`) - factored out so
+    /// == Dispatched && still its key's FIFO front && no compensating disarm
+    /// outstanding`; the last term is #4472: K's premise is "the arm is physically
+    /// stuck", and a claim whose late result has returned and is in teardown is not
+    /// that - waiving it discards the server's re-push, the only owner left to re-arm
+    /// the rule once the teardown pops the claim, so the generation is held until the
+    /// teardown finishes) - factored out so
     /// receipt_wedge_k_eligible(), receipt_recovery_status() and
     /// receipt_status_wedge_aware() all read ONE definition instead of three
     /// independently-maintained copies (the drift risk classify_claim_end() was
@@ -1749,7 +1984,10 @@ private:
     /// #5168, registry_mu_ held. If `entry`'s front is a clean Queued Arm claim that is
     /// not parked, park it: such a head has no dispatcher (heads are flipped to
     /// Dispatching under the lock that queues them), so it is a follower left behind
-    /// by an erased parked head, a failed deque push, or a redrive that threw.
+    /// by an erased parked head, a failed deque push, or a redrive that threw. #5322:
+    /// sweeps terminal Queued heads first (sweep_terminal_queued_locked), so a released
+    /// tombstone exposes its follower to this call; an entry the sweep empties is left
+    /// in place, never erased (callers range-for claims_).
     void adopt_undriven_arm_head_locked(KeyClaimQueue& entry) noexcept;
     /// #5168, registry_mu_ held. Pop the oldest still-valid parked arm of class `c`
     /// IF the reservation pool would still have a free permit after `reserved_extra`
@@ -1782,10 +2020,16 @@ private:
     /// Pop every TERMINAL, never-dispatched claim at the front of `entry` (a Queued
     /// claim that already carries an outcome or a commit exception: a withdrawn or
     /// release-failed tombstone), retrying its index release. Governance pass-3
-    /// sg-3/ar-4/cs-5: such a tombstone must never be re-dispatched as an arm, never
-    /// re-committed by the live sweep, and never sit ahead of a Disarm claim. Called
-    /// by try_dispatch_head_locked (refill) and detach_rule_locked (before it queues a
-    /// Disarm). noexcept by construction (iterator erases + a noexcept release).
+    /// sg-3/ar-4/cs-5: such a tombstone must not be re-dispatched as an arm,
+    /// re-committed by the live sweep, or sit ahead of a Disarm claim. A tombstone whose
+    /// index release fails again AT this sweep is not popped - the sweep stops at it
+    /// (unreachable in production, erase_rule being noexcept; constructible only through
+    /// the index-remove test seam). It is NOT then dispatched: try_dispatch_head_locked
+    /// returns nullptr for a dead head (INV-1, #5322), so it stays Queued, blocking its
+    /// key, until a later sweep or reap_stranded_claims_locked() releases it. Called by
+    /// try_dispatch_head_locked (refill), adopt_undriven_arm_head_locked
+    /// (sweep-before-adopt) and detach_rule_locked (before it queues a Disarm). noexcept
+    /// by construction (iterator erases + a noexcept release).
     void sweep_terminal_queued_locked(KeyClaimQueue& entry) noexcept;
     /// up-4 (#4221, rung 9c PR-5b): registry_mu_ held. Write a claim's fallback
     /// outcome exactly as publish_arm_verdicts_locked's own fill-in loop would have,
@@ -1809,18 +2053,68 @@ private:
     /// non-noexcept sibling line in publish_arm_verdicts_locked's own fill-in loop
     /// this function mirrors).
     void synthesize_fallback_outcome_locked(KeyClaim& c);
-    /// up-4 (#4221): registry_mu_ held. Reaps ONE residue shape neither
-    /// sweep_terminal_queued_locked (Queued-only, requires an outcome already
-    /// present), expire_overdue_claims's own overdue-live-claim pass (skips any
-    /// claim with an outcome/commit_exception/waiter_abandoned already set), nor
-    /// redrive_retained_disarms (Disarm claims only) ever reaches: a Queued,
-    /// withdrawn-or-waiter_abandoned head with NO outcome yet - a CONFIRMED real
-    /// defect (Fable review): on_arm_complete's and finalize_arm_compensation's own
-    /// deep-catch recovery hands a claim back to Queued, forever, when a double-
-    /// fault interrupts its own fill-in verdict; reachable via a genuine
-    /// std::bad_alloc, not a test-only seam. Left alone, a future same-key attach
-    /// would spuriously re-arm an already-resolved spec; a key nothing ever
-    /// revisits stays wedged.
+    /// One key whose pending Disarm (or outstanding compensating teardown) this pass
+    /// observed, copied under registry_mu_ so the warn can be emitted after it releases.
+    struct DisarmObservation {
+        std::string key;
+        std::chrono::steady_clock::duration age{};
+    };
+    /// Per-pass cap on each kind of warn; claims past it are still latched and counted,
+    /// never warned individually (the pass emits one summary line with the remainder).
+    static constexpr std::size_t kDisarmPendingWarnsPerPass = 4;
+    /// What one expire_overdue_claims pass collected under registry_mu_ for its off-lock warn
+    /// phase. `*_more` counts claims latched and counted this pass whose own warn was NOT
+    /// recorded (past the per-pass cap, or a failed copy), so the summary line is truthful.
+    struct ExpireWarns {
+        std::vector<DisarmObservation> disarms;       ///< pending-Disarm observations (#5403)
+        std::size_t disarms_more{0};
+        std::vector<DisarmObservation> compensations; ///< compensation deadline observations (#4472)
+        std::size_t compensations_more{0};
+    };
+    /// Not a clock-guarded retention pass: it uses a monotonic in-memory claim lifecycle
+    /// with no wall clock, no persisted anchor and no age-based delete, so parts 1-4, 6 and
+    /// 7 of the clock-guarded-retention rule and its SINGLE-WRITER note do not apply; part 5
+    /// (an unconditional per-pass cap) is declined: the work is bounded by |claims_| /
+    /// |keys_| under registry_mu_, and a partial pass would only lengthen recovery.
+    /// up-4 (#4221) + #5322: registry_mu_ held. The heartbeat's ONE sweep of claims_
+    /// (expire_overdue_claims calls it after its overdue pass). Per key it pops from
+    /// the front of the fifo every Queued Arm claim that is terminal - one carrying an
+    /// outcome or a commit exception: a retained tombstone, a non-owner claim (its
+    /// release is a no-op), a committed Queued suffix, a terminal hand-back - plus a
+    /// Queued, withdrawn-or-waiter_abandoned head with NO outcome yet, whose fallback
+    /// outcome is written first (synthesize_fallback_outcome_locked). Which
+    /// classification the withdrawn variant of that shape gets depends on which pass
+    /// reaches it first: expire_overdue_claims' overdue scan skips an outcome,
+    /// commit_exception or waiter_abandoned claim but NOT a withdrawn one, so if the scan
+    /// runs first it abandons the claim (WaiterTimedOutQueued, receipt CongestionExpired);
+    /// if this pass's synthesis runs first it ends CommitThrew (receipt Failed). That
+    /// shape is up-4's
+    /// CONFIRMED real defect (Fable review): on_arm_complete's and
+    /// finalize_arm_compensation's deep-catch recovery hands a claim back to Queued,
+    /// forever, when a double-fault interrupts its own fill-in verdict; reachable via
+    /// a genuine std::bad_alloc, not a test-only seam. The walk stops at a Disarm head
+    /// (redrive_retained_disarms' job), a non-Queued head (a drain owns it), a clean
+    /// head (awaiting its turn) and a head whose index release fails again.
+    ///
+    /// Retry bound: one erase_rule attempt per terminal tombstone per pass; the pass that
+    /// SYNTHESIZES the outcome makes at most two (synthesize_fallback_outcome_locked
+    /// attempts a release only on its not-committed branch, then the loop releases again). A stuck OWNER tombstone
+    /// blocks its key (its clean followers wait for the heartbeat and, if the release never
+    /// succeeds, expire CongestionExpired). Other same-key events each add their own
+    /// attempt: an attach's sweep (try_dispatch_head_locked), sweep-before-adopt, a
+    /// follower's own abandonment, a publish pop and a detach's sweep. A release that
+    /// keeps failing logs a rate-limited warning naming the first affected key (every
+    /// 64th consecutive pass). A successful synthesis wakes blocking waiters at once
+    /// (claim_cv_), even if the release then fails and nothing is reaped.
+    ///
+    /// After a key's pops the exposed head, if a clean Queued Arm, is pushed to
+    /// `refills` BEFORE it is flipped to Dispatching. If that push throws it stays a
+    /// clean Queued head and is parked (adopt_undriven_arm_head_locked), so the
+    /// permit-release hooks, redrive_parked_arms() and a same-key attach's head drive
+    /// reach it; this pass never re-selects a clean head. try_dispatch_head_locked is
+    /// never called inside the claims_ iteration, and the ONLY erase of a claims_ entry
+    /// here is the loop's own erase of an empty fifo (which also removes an empty entry
+    /// sweep-before-adopt left behind).
     ///
     /// Deliberately does NOT also reap a Dispatched, terminal (outcome/
     /// commit_exception already written) head - the kickoff's own literal ask, kept
@@ -1845,7 +2139,63 @@ private:
     /// about that claim - up-3's own deadline-semantics contract. Returns the number
     /// of claims actually reaped. `refills` collects any newly-dispatchable head
     /// (an arm queued behind a reaped entry) for the caller to dispatch off-lock.
-    std::size_t reap_stranded_claims_locked(std::vector<std::pair<std::string, std::shared_ptr<KeyClaim>>>& refills);
+    /// #4472: `now` is the pass's own reading (expire_overdue_claims' parameter, the real
+    /// steady clock in production), so the compensation-deadline observation above is judged
+    /// against the same instant a test passes to oldest_outstanding_compensation_age().
+    /// `warns.compensations` receives (up to the per-pass cap) the claims whose compensation
+    /// deadline this pass latched (#4472: one warn per claim, key via log_key_token only).
+    std::size_t reap_stranded_claims_locked(std::chrono::steady_clock::time_point now,
+                                            std::vector<std::pair<std::string, std::shared_ptr<KeyClaim>>>& refills,
+                                            ExpireWarns& warns);
+    /// Not a clock-guarded retention pass: it uses a monotonic in-memory claim lifecycle
+    /// with no wall clock, no persisted anchor and no age-based delete, so parts 1-4, 6 and
+    /// 7 of the clock-guarded-retention rule and its SINGLE-WRITER note do not apply; part 5
+    /// (an unconditional per-pass cap) is declined: the work is bounded by |claims_| /
+    /// |keys_| under registry_mu_, and a partial pass would only lengthen recovery.
+    /// registry_mu_ held. #5322: the owner of the index's ->0 edge when a release (the
+    /// reaper, a sweep, a publish pop, an abandonment) dropped it without a caller to act
+    /// on it. An ORPHAN is a keys_ entry whose index refcount is 0 and whose claims_
+    /// entry is absent or empty. An io-class orphan gets a durable Disarm claim pushed
+    /// (queued in the SAME critical section that erases keys_[key], the shape of
+    /// detach_rule_locked) and appended to `disarms` for the caller to submit off-lock,
+    /// with one warn line per orphan naming the key. An inline-type key (no io class) is
+    /// left alone: it never carries claims or ghost mappings and its refcount reaches 0
+    /// only inside detach_rule_locked, which tears it down synchronously (a throw from the
+    /// backend disarm is swallowed and counted, and keys_ is still erased), so none is
+    /// expected here. Does nothing once stopping_ is set. Invariant: after the pass either
+    /// keys_ still owns the watcher (a failed build or push is counted and retried next
+    /// pass) or a durable Disarm claim owns its teardown; and no refill selected by
+    /// reap_stranded_claims_locked is left Dispatching without a worker, because the
+    /// caller contains any throw from here. Complexity: O(|keys_|) hash lookups plus one
+    /// O(log |by_key_|) refcount query each; no allocation when there is no orphan.
+    void disarm_orphan_keys_locked(std::vector<std::shared_ptr<KeyClaim>>& disarms);
+    /// registry_mu_ held. #5403: the scan behind oldest_pending_disarm_age(); that accessor
+    /// locks and calls this, so nothing ever calls the locking accessor under registry_mu_.
+    /// Only a key's fifo HEAD is considered: a Disarm claim is only ever pushed onto an empty
+    /// fifo (disarm_orphan_keys_locked, detach_rule_locked), anything later queues behind it,
+    /// and a Disarm that is not the head cannot dispatch. A head with an outcome is already
+    /// terminal (DisarmDone, Stopped, DeadSubscription) and is not pending.
+    [[nodiscard]] std::optional<std::chrono::steady_clock::duration>
+    oldest_pending_disarm_age_locked(std::chrono::steady_clock::time_point now) const;
+    /// registry_mu_ held. #4472: the scan behind oldest_outstanding_compensation_age(); that
+    /// accessor locks and calls this. Every claim in every fifo is considered (a compensating
+    /// claim is its key's head by construction, but nothing here depends on it): one with
+    /// compensation_finished false and a compensation_deadline set. The instant compensation
+    /// became owed is compensation_deadline - cfg_.backend_op_deadline (the deadline is set
+    /// once, from that same reading plus that same constant), so no second timestamp is kept.
+    [[nodiscard]] std::optional<std::chrono::steady_clock::duration>
+    oldest_outstanding_compensation_age_locked(std::chrono::steady_clock::time_point now) const;
+    /// Impl of expire_overdue_claims() / expire_overdue_claims_at_for_test().
+    std::size_t expire_overdue_claims_impl(std::chrono::steady_clock::time_point now);
+    /// registry_mu_ held. #5403: latch (KeyClaim::disarm_deadline_observed) and count
+    /// (disarm_deadline_elapsed_) every pending Disarm head older than
+    /// kDisarmPendingObserveThreshold at `now`, once per claim, and copy up to
+    /// kDisarmPendingWarnsPerPass of them into `warns.disarms` (a copy that throws only drops
+    /// that warn; every claim the cap or a failed copy leaves unrecorded is counted in
+    /// `warns.disarms_more`). Observation only: nothing is released, popped or cancelled.
+    /// Returns nothing; the latch and the counter are the record. O(|claims_|).
+    void observe_pending_disarms_locked(std::chrono::steady_clock::time_point now,
+                                        ExpireWarns& warns);
     /// Off-lock. Dispatch an ARM claim (already the Dispatching head) through
     /// io_executor_.submit(); on a synchronous admission refusal (or a throw building
     /// the call) fail the head and every arm queued behind it with today's strings.
@@ -1883,8 +2233,12 @@ private:
     /// path (nothing to disarm) and finalize_arm_compensation()'s deferred path
     /// (rung 9c PR-2 Unit 4 - previously a local lambda inside on_arm_complete,
     /// extracted so both paths run the identical logic instead of duplicating it).
-    /// PUBLISH `verdicts` onto the matching claims in `finished`, pop the finished
-    /// prefix from `key`'s fifo, and on `firewall` sweep a never-finished head too.
+    /// PUBLISH `verdicts` onto the matching claims in `finished`, then pop `finished`
+    /// from the front of `key`'s fifo, stopping at the first claim whose index release
+    /// fails (#4354): that claim stays as a retained tombstone, with everything behind
+    /// it, for the same-call sweep in try_dispatch_head_locked. On `firewall` with an
+    /// empty `finished` (the drain threw before its fifo snapshot) every claim in the
+    /// fifo is failed instead, a never-finished head included.
     /// `refill` is an OUT param: an arm queued behind the finished prefix, for the
     /// caller to dispatch off-lock once unlocked. Returns true once this call has
     /// done everything it is going to do (including the "entry already vanished"
@@ -1925,8 +2279,12 @@ private:
     /// the compensating disarm itself. When nothing is owed a disarm, this function
     /// finishes the job itself, immediately, exactly as before. Firewalled: an
     /// exception in its own staging still eventually publishes a terminal outcome on
-    /// every claim and drops the entry (claim_drain_failures_), whichever path reaches
-    /// that publish.
+    /// every claim it snapshotted (claim_drain_failures_), whichever path reaches that
+    /// publish; when the exception came before the snapshot, nothing was snapshotted,
+    /// so the publish fails every claim in the fifo and drops the entry. A claim whose
+    /// index release fails is retained as a tombstone rather than dropped, on both
+    /// paths (the snapshotted head in the ordinary pop, and any fifo claim in the
+    /// before-snapshot branch).
     void on_arm_complete(const std::string& key, const std::shared_ptr<KeyClaim>& claim,
                          IoResult<std::expected<std::uint64_t, std::string>>&& r) noexcept;
     /// The drain_fault_point_for_test_ seam on_arm_complete's own staging (and, since
@@ -1951,8 +2309,46 @@ private:
     /// Never throws (r3 C2/C3): a throw inside index_->remove_rule is counted
     /// (claim_index_release_failures_) and reported as false, with index_held left
     /// true so the next release retries.
-    /// Callers may ignore the result: retry is implicit in the retained ownership.
+    /// The result MUST be consulted before a claim is popped or erased: retry is
+    /// implicit only while the claim stays in its fifo, so a caller that pops/erases
+    /// on `false` leaks the mapping (a ghost (key, rule) entry; #4354). Use
+    /// release_or_retain_tombstone_locked where the claim is popped. The remaining
+    /// callers that ignore the result fall into two groups. (1) They leave the claim in
+    /// place, so a later release or sweep retries it: on_arm_complete's staging
+    /// releases (they run before publish_arm_verdicts_locked); publish_arm_verdicts_
+    /// locked's own fill-in; synthesize_fallback_outcome_locked; the dispatched branch
+    /// of abandon_claim_locked. (2) They run at sticky-stop time, where the leak is
+    /// moot: begin_stop; dispatch_parked_arm_guarded's stop path; dispatch_arm_off_lock's
+    /// stopping entry-guard path (#5322). abandon_claim_locked's Queued branch (#5323)
+    /// consults it through release_or_retain_tombstone_locked: a failed release keeps the
+    /// abandoned claim in its fifo as a withdrawn tombstone.
+    /// Accounting: backend_op_timeouts_ is incremented once, at the abandonment itself;
+    /// the retries that later pop the tombstone are counted in
+    /// claim_index_release_failures_, never in backend_op_timeouts_.
     bool release_claim_index_locked(KeyClaim& claim) noexcept;
+    /// registry_mu_ held (#4354). Retry c's index release; on failure keep c as a
+    /// retained tombstone. The same-call sweep (try_dispatch_head_locked ->
+    /// sweep_terminal_queued_locked, which every caller reaches next) retries the
+    /// release immediately; if that retry also fails the tombstone stays retained and
+    /// is never dispatched (INV-1) until a later sweep or the heartbeat's
+    /// reap_stranded_claims_locked() releases it. "withdrawn" here means "never
+    /// re-commit" (the convention of fail_all_claims_locked's tombstones; the `live`
+    /// filter in on_arm_complete excludes withdrawn claims). It is set even on a claim
+    /// nobody withdrew (e.g. a non-adopted wedge). The helper also writes
+    /// dispatch = Queued (the sweep requires it), and is_retained_wedge reads
+    /// dispatch, so for a retained wedge head that predicate's answer changes; this is
+    /// intended and harmless because the claim is terminal at every call site except
+    /// one transient window: the firewall loop in publish_arm_verdicts_locked calls
+    /// the helper before it fills a missing outcome, so a throw in that gap
+    /// (fault_here_for_test(7) or an allocation failure) leaves a withdrawn claim with
+    /// no outcome. `withdrawn` is what keeps a retained claim from being re-committed
+    /// or re-selected: most readers also test the outcome, but not all of them test
+    /// commit_exception (the claimed-rules list in detach_all and the Case-0 search in
+    /// withdraw_rule_after_wedge_sweep_locked check outcome only), so for a claim that
+    /// carries only a commit_exception, and in the firewall-loop gap, `withdrawn` is
+    /// the only guard. It also matches fail_all_claims_locked's convention. Returns
+    /// true iff c no longer owns a mapping and may be popped/erased.
+    [[nodiscard]] bool release_or_retain_tombstone_locked(KeyClaim& c) noexcept;
     /// registry_mu_ held. The waiter gave up on `claim` (deadline or stop): a Queued
     /// claim is erased outright, a dispatched one is marked waiter_abandoned for its
     /// completion to finish. Returns the string outcome for the caller.
@@ -2269,6 +2665,7 @@ private:
     std::atomic<std::uint64_t> arms_parked_total_{0};
     std::atomic<std::uint64_t> arm_redrives_{0};
     std::atomic<std::uint64_t> compensation_deadline_elapsed_{0};
+    std::atomic<std::uint64_t> disarm_deadline_elapsed_{0}; ///< #5403: see disarm_deadline_elapsed()
     /// up-2 (#4221, rung 9c PR-5c): a genuinely new claimant refused immediately
     /// against a Wedged key, vs. an identical (rule_id, spec) retry that
     /// re-observed the existing wedged head's receipt instead of queuing a new
@@ -2289,12 +2686,16 @@ private:
     std::atomic<std::uint64_t> detach_claim_failures_{0}; ///< R5.2: detach_rule_locked rollback / last resort fired
     std::atomic<std::uint64_t> dead_subscription_disarms_skipped_{0}; ///< cs-1: Disarm claims completed for an id already reported dead
     std::atomic<std::uint64_t> claim_index_release_failures_{0}; ///< r3 C2/C3: contained remove_rule throw
-    std::atomic<std::uint64_t> detach_sweep_left_residue_{0}; ///< PR-5a #4221 cs-103: last-on-key sweep left the fifo non-empty (should never happen)
+    std::atomic<std::uint64_t> detach_sweep_left_residue_{0}; ///< PR-5a #4221 cs-103: last-on-key sweep left the fifo non-empty (a retained owner tombstone; see detach_sweep_left_residue())
     std::function<void()> drain_gap_hook_for_test_; ///< registry_mu_-guarded; see the setter
     std::function<void()> dispatch_entry_hook_for_test_; ///< registry_mu_-guarded; see the setter
     std::atomic<int> drain_fault_point_for_test_{0};  ///< see the setter
     std::atomic<bool> detach_fault_for_test_{false};  ///< see the setter
-    std::atomic<bool> index_remove_fault_for_test_{false}; ///< see the setter
+    std::atomic<std::uint64_t> tombstones_released_by_reaper_{0}; ///< #5322: runtime-only, incremented by reap_stranded_claims_locked
+    std::atomic<std::uint64_t> orphan_disarms_started_{0};        ///< #5322: runtime-only, incremented by disarm_orphan_keys_locked
+    std::atomic<std::uint64_t> dead_watchers_erased_on_lost_{0};  ///< #5322: runtime-only, incremented by on_subscription_lost's post-condition guard
+    std::uint32_t reaper_release_failed_passes_{0}; ///< #5322: registry_mu_-guarded; consecutive reaper passes whose release failed (rate-limited warn)
+    std::atomic<int> index_remove_fault_for_test_{0}; ///< see the setters (>0 counted, <0 sticky, 0 off)
     std::atomic<std::uint64_t> detach_post_commit_failures_{0}; ///< r3 C4: contained drop_rule throw
     std::atomic<int> detach_post_fault_point_for_test_{0}; ///< see the setter
     /// Seam body for set_detach_post_fault_point_for_test; consumed once at `point`.
@@ -2303,10 +2704,17 @@ private:
         if (detach_post_fault_point_for_test_.compare_exchange_strong(expected, 0))
             throw std::bad_alloc{};
     }
-    /// Seam body for set_index_remove_fault_for_test; consumed once.
+    /// Seam body for set_index_remove_fault_for_test / ..._count_for_test: n > 0 fires
+    /// and decrements (compare-exchange, so concurrent callers never over-fire), n < 0
+    /// fires without decrementing, 0 never fires.
     void index_remove_fault_here_for_test() {
-        if (index_remove_fault_for_test_.exchange(false))
-            throw std::bad_alloc{};
+        int n = index_remove_fault_for_test_.load();
+        while (n != 0) {
+            if (n < 0)
+                throw std::bad_alloc{};
+            if (index_remove_fault_for_test_.compare_exchange_weak(n, n - 1))
+                throw std::bad_alloc{};
+        }
     }
     /// Seam body for set_detach_fault_for_test; consumed once.
     void detach_fault_here_for_test() {

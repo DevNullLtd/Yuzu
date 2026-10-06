@@ -24,6 +24,7 @@
 #include "update_source_trust_parsers.hpp"
 
 #include <constraint_accumulator.hpp>
+#include <exception_category.hpp>
 #include <yuzu/plugin.hpp>
 #include <yuzu/string_utils.hpp>
 
@@ -59,8 +60,10 @@ inline void report_sources(yuzu::CommandContext& ctx, const std::vector<std::str
 
 /// A leg that reads nothing reports ONE exact `unsupported` status row and an
 /// UNAVAILABLE/UNKNOWN result carrying the same token -- never an empty
-/// success. Two callers: the Windows and macOS legs (planned; their tokens
-/// below) and execute_sources' catch arm (a leg that threw, `<os>:leg:exception`).
+/// success. Called by the Windows and macOS legs (planned; their tokens below).
+/// execute_sources' catch arm (a leg that threw, `<os>:leg:exception`) does NOT use it:
+/// it hand-pairs the same UNAVAILABLE/UNKNOWN under a separate guard per call, because
+/// there the allocator may be failing and one throw must not skip the other report.
 /// Kept here (not in the per-OS TUs) so the row is unit-testable on every host.
 inline constexpr const char* kWindowsPlannedToken = "windows:planned";
 inline constexpr const char* kMacosPlannedToken = "macos:planned";
@@ -77,7 +80,10 @@ using LegFn = int (*)(yuzu::CommandContext&);
 /// The WHOLE body of the plugin's execute(): action dispatch, the host leg and
 /// the ABI containment. No exception may cross the plugin ABI, so everything --
 /// the unknown-action write included -- sits inside the try, and the catch arm
-/// reports the leg as unavailable instead of unwinding into the host.
+/// reports the leg as unavailable instead of unwinding into the host. rc: 1 for an unknown
+/// action; otherwise the leg's own; after a throw, 0 once the typed status landed and 1 only
+/// if set_result_status itself threw. Under sustained allocation failure the status row may
+/// be lost while the typed status (or rc 1) still reaches the host.
 /// `leg_exception_token` is the host OS's `<os>:leg:exception`. The unit suite
 /// drives this through a real CommandContext with a throwing leg and with an
 /// unknown action (test_update_source_trust_local_dispatcher.cpp).
@@ -94,8 +100,30 @@ inline int execute_sources(yuzu::CommandContext& ctx, std::string_view action, L
         }
         return leg(ctx);
     } catch (...) {
-        report_unavailable(ctx, leg_exception_token);
-        return 0;
+        // `<os>:leg:exception:<bad_alloc|std_exception|unknown>` -- what() never travels.
+        // exception_category() is noexcept; everything else here can allocate and throw again
+        // under sustained allocation failure, and nothing may cross the plugin ABI. The token
+        // falls back to the bare `<os>:leg:exception` view, and each report is its own guard
+        // (report_unavailable is not used: it pairs both calls in one unguarded body).
+        std::string owned;
+        std::string_view token = leg_exception_token;
+        try {
+            owned.reserve(leg_exception_token.size() + 14);
+            owned.append(leg_exception_token).append(1, ':').append(yuzu::shared::exception_category());
+            token = owned;
+        } catch (...) {
+        }
+        try {
+            ctx.write_output(format_status_row(StatusState::unsupported, token));
+        } catch (...) {
+        }
+        try {
+            ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_UNKNOWN,
+                                  token);
+            return 0; // reported: a leg that threw is a degraded read, not a failed command
+        } catch (...) {
+            return 1; // the typed status never reached the host; rc is the only signal left
+        }
     }
 }
 

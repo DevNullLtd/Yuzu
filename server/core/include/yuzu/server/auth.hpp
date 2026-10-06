@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <expected>
 #include <filesystem>
@@ -46,6 +47,9 @@ class AuthDB;
 class SessionStore;       // HA WS-1/1a — durable operator sessions (Postgres, ADR-2002 §4)
 struct SessionRow;        // session_store.hpp — the durable row shape
 struct SessionWriteParams; // session_store.hpp — duration-based create params (DB-clock authoring)
+class CredentialChangeOwner;    // credential_change_owner.hpp — #5342 one-transaction credential change
+struct CredentialChangeRequest; // credential_change_owner.hpp
+struct CredentialChangeOutcome; // credential_change_owner.hpp
 } // namespace yuzu::server
 
 namespace yuzu::server::auth {
@@ -501,6 +505,38 @@ enum class RemovePendingOutcome : std::uint8_t {
     wrong_status, ///< A row exists but is `approved`/`denied` — refused, not deleted.
 };
 
+/// Why `AuthManager::verify_password` refused (#5342 Gate 7, sec-3). The two
+/// TRANSIENT kinds (`kStoreUnavailable`, `kCredentialChanged`) are NOT a wrong
+/// password: a caller must answer them with a retryable 503 and must NEVER
+/// count them toward account lockout or write a "login failed" evidence row —
+/// a store blip or a concurrent password change is not a guess.
+enum class VerifyFailure : std::uint8_t {
+    kBadCredential,     ///< the password did not match the stored hash (or was over the max)
+    kUnknownUser,       ///< no ACTIVE account by that name (incl. one removed mid-verify)
+    kStoreUnavailable,  ///< an AuthDB read failed — transient, fail closed, retry
+    kCredentialChanged, ///< the stored hash changed between the read and the row-locked
+                        ///< recheck (a password change committed concurrently) — retry
+};
+
+/// True for the `VerifyFailure` kinds that are not a credential verdict.
+[[nodiscard]] constexpr bool is_transient(VerifyFailure f) noexcept {
+    return f == VerifyFailure::kStoreUnavailable || f == VerifyFailure::kCredentialChanged;
+}
+
+/// A successful `verify_password`: the DB-confirmed role AND the exact stored
+/// hash the password was verified against. The hash is the anchor every later
+/// step of the same login carries forward — the session mint's post-mint
+/// recheck (`create_local_session`, a row-LOCKED re-read) denies if the stored
+/// hash is no longer this one, the MFA enrolment bootstrap binds its guarded
+/// UPDATE to it, and the self-service change compares it under the
+/// `auth.users` row lock (`CredentialChangeOwner`) — so a password reset that
+/// lands mid-flow can never be "completed" with the OLD credential.
+/// Credential material: never log, audit, or serialise it.
+struct VerifiedCredential {
+    Role role{Role::user};
+    std::string hash_hex;
+};
+
 class AuthManager {
 public:
     static constexpr auto kSessionDuration = std::chrono::hours(8);
@@ -525,14 +561,18 @@ public:
     std::optional<std::string> authenticate(const std::string& username,
                                             const std::string& password);
 
-    /// Verify a username+password without creating a session. Returns the
-    /// user's legacy role on match, nullopt on failure (unknown user /
-    /// bad password / user soft-deleted in AuthDB). Used by the MFA-aware
-    /// login flow at AuthRoutes::POST /login to decide between "mint full
-    /// session now" (no MFA enrolled) and "issue a pending token, wait
+    /// Verify a username+password without creating a session. On match returns
+    /// the DB-confirmed role and the stored hash it verified against
+    /// (`VerifiedCredential`); on failure a TYPED reason (#5342 Gate 7) — a
+    /// wrong password / unknown user is a credential verdict, an AuthDB read
+    /// failure or a concurrent credential change is TRANSIENT (`is_transient`)
+    /// and must never be counted or audited as a failed guess. Used by the
+    /// MFA-aware login flow at AuthRoutes::POST /login to decide between "mint
+    /// full session now" (no MFA enrolled) and "issue a pending token, wait
     /// for TOTP" (MFA enrolled). Histogram metrics observed on every call
     /// using the same labels as authenticate().
-    std::optional<Role> verify_password(const std::string& username, const std::string& password);
+    [[nodiscard]] std::expected<VerifiedCredential, VerifyFailure>
+    verify_password(const std::string& username, const std::string& password);
 
     /// Create a session for a user who has already cleared the password
     /// and any required MFA checks. Mirrors create_oidc_session but with
@@ -550,7 +590,29 @@ public:
     /// the row exists; calling this directly for an account with no row
     /// (e.g. a test synthesizing a session for an OIDC/SCIM-only
     /// principal) will always be denied (#4107 CI finding, 38cc33b88).
-    std::string create_local_session(const std::string& username, Role role, bool mfa_verified);
+    ///
+    /// `expected_hash_hex` (#5342 Gate 7, REQUIRED — no default): the stored
+    /// hash the caller's `verify_password` verified the password against
+    /// (`VerifiedCredential::hash_hex`, carried through any MFA round trip on
+    /// the pending entry). The post-mint recheck also requires the stored hash
+    /// to STILL be this one, constant-time compared, and revokes-and-denies
+    /// otherwise — so a pending login proven with the OLD password cannot be
+    /// completed after an admin reset or a self-change committed in between.
+    /// An empty value never matches a stored hash and so DENIES (fail closed);
+    /// it never disables the check. Ignored in cfg-file-only mode (no AuthDB,
+    /// no concurrent credential writer).
+    std::string create_local_session(const std::string& username, Role role, bool mfa_verified,
+                                     const std::string& expected_hash_hex);
+
+    /// TEST-ONLY: `create_local_session` WITHOUT the credential anchor — the
+    /// post-mint role/active recheck still runs, only the stored-hash compare
+    /// is skipped. For tests that synthesise a session for a principal whose
+    /// password they never verified (fixtures for unrelated route suites).
+    /// Production code MUST NOT call this — no caller in `server/core/src/**`
+    /// references it; every production mint follows a real password
+    /// verification and passes its hash to `create_local_session`.
+    std::string create_local_session_for_test(const std::string& username, Role role,
+                                              bool mfa_verified);
 
     /// Stamp `mfa_verified_at = system_clock::now()` on the named session.
     /// Returns true if the session existed and was updated. Used by the
@@ -763,8 +825,54 @@ public:
     /// List all configured users (password hashes omitted from caller view).
     std::vector<UserEntry> list_users() const;
 
-    /// Add or overwrite a user.
+    /// Create a user (or, in config-file-only mode, add-or-overwrite the
+    /// in-memory/cfg entry). Returns false when the password fails the length
+    /// policy (`password_policy.hpp`) OR the store write fails — the two are
+    /// indistinguishable here (historical contract; the #5342 password routes
+    /// use the typed `commit_password_change` instead).
+    ///
+    /// With AuthDB configured this NEVER changes an existing account's
+    /// password: `AuthDB::upsert_user` is INSERT-only (`ON CONFLICT DO
+    /// NOTHING` → `UserAlreadyExists` → this returns false). Password changes
+    /// go through `commit_password_change` (#5342).
     bool upsert_user(const std::string& username, const std::string& password, Role role);
+
+    /// Wire the #5342 credential-change query owner (server.cpp, built after
+    /// the audit store on the shared pool). Null (the default, and cfg-file-only
+    /// mode) ⇒ `commit_password_change` answers `kStoreUnavailable`. The owner
+    /// must outlive every call; server.cpp nulls this at teardown before the
+    /// owner destructs (same contract as `set_auth_db`). Set during
+    /// single-threaded startup only.
+    void set_credential_change_owner(CredentialChangeOwner* owner) noexcept {
+        credential_change_owner_ = owner;
+    }
+
+    /// The ONE local-account credential write (#5342, Gate 8 class fix) —
+    /// self-service change AND administrative reset. Delegates to
+    /// `CredentialChangeOwner::commit`: the credential, every durable session,
+    /// the provisional MFA state, the lockout (admin reset) and the audit
+    /// row(s) commit or abort together in one transaction under the
+    /// `auth.users` row lock (see credential_change_owner.hpp). On `kOk` only,
+    /// AFTER the commit and outside every lock it took, refreshes this
+    /// process's caches: the `users_` entry's hash/salt (if cached) and every
+    /// in-memory `sessions_` entry of the account (other replicas drop theirs
+    /// via the bumped session write-generation). The caller computes the new
+    /// hash (PBKDF2, no lock held) and enforces the length policy before
+    /// calling. Caller must NOT hold `mu_` or any database lock.
+    [[nodiscard]] CredentialChangeOutcome
+    commit_password_change(const CredentialChangeRequest& request);
+
+    /// #5274 boot signal (#5342 Gate 7): with AuthDB wired, `yuzu-server.cfg`
+    /// is seed-only and the stored credential always wins. Compares every
+    /// cfg-seeded `users_` entry against its `auth.users` row and, for each
+    /// one whose hash DIFFERS (a dead cfg password an operator may still think
+    /// is live), logs a `spdlog::warn` naming the user. Sets the
+    /// `yuzu_auth_cfg_credentials_stale` gauge to the count and returns it.
+    /// A cfg user with no row, or whose row read fails, is not counted (the
+    /// latter is logged). Call once at boot, right after `set_auth_db`, before
+    /// any login can hydrate `users_`. 0 in cfg-file-only mode. Caller must
+    /// NOT hold `mu_`.
+    std::size_t report_stale_cfg_credentials();
 
     /// Remove a user by name.
     bool remove_user(const std::string& username);
@@ -1050,18 +1158,26 @@ private:
     /// is never logged or counted as a bad username.
     enum class UserLookupMiss { NotFound, DbError };
 
-    /// Look a user up for a credential check, hydrating `users_` from AuthDB on
-    /// a cache miss (#4020). `users_` is warmed only by load_config() and by THIS
-    /// process's own per-username writes, so a row created anywhere else (a
-    /// dashboard `POST /api/settings/users` before a restart, SCIM, another
-    /// replica) is invisible to a cache-only lookup - authenticate() and
-    /// verify_password() reported "unknown user" for a genuinely active account
-    /// until the next cfg-file boot. The AuthDB row is authoritative and the map
-    /// is a read-optimisation layered on top (the remove_user / update_role /
-    /// reactivate_user contract). PG I/O runs OUTSIDE `mu_`; the insert never
-    /// overwrites an entry an in-process write installed while that read was in
-    /// flight. Returns a COPY so callers run PBKDF2 without holding `mu_`.
-    /// Caller must NOT hold `mu_`.
+    /// Look a user up for a credential check.
+    ///
+    /// AuthDB mode (#5274): DB-FIRST on every call — the credential (hash +
+    /// salt) and role come from `AuthDB::get_user`, NEVER from `users_`
+    /// (precedent: `get_user_role`, "ALWAYS authoritative"). `users_` is seeded
+    /// at boot from `yuzu-server.cfg` by `load_config()` and is never
+    /// invalidated across replicas, so a cache-first read let (a) every restart
+    /// re-seed a pre-change cfg hash that then shadowed a password changed in
+    /// AuthDB, and (b) a second replica keep accepting the old password until
+    /// it restarted. The cfg file is therefore seed-only by construction. A
+    /// store error fails closed (`DbError`) — never a cache fallback, which
+    /// would reopen exactly that gap while the store degrades. On a miss the
+    /// row is still `try_emplace`d into `users_` (the #4020 warm-up other
+    /// readers rely on); an existing entry is left alone (the write paths own
+    /// cache refresh), since its credentials are never consulted here.
+    ///
+    /// Config-file-only mode (no AuthDB): unchanged — the map IS the truth.
+    ///
+    /// PG I/O runs OUTSIDE `mu_`. Returns a COPY so callers run PBKDF2 without
+    /// holding `mu_`. Caller must NOT hold `mu_`.
     [[nodiscard]] std::expected<UserEntry, UserLookupMiss>
     find_user_or_hydrate(const std::string& username);
 
@@ -1160,9 +1276,22 @@ private:
     /// `context` is the log-message prefix ("Auth failed" / "verify_password
     /// failed") so both callers keep their existing distinct wording. Caller
     /// must NOT hold `mu_`.
-    [[nodiscard]] std::optional<Role>
+    ///
+    /// #5274: `verified_hash_hex` is the stored hash the caller just verified
+    /// the supplied password against. The row-locked read also returns the
+    /// row's CURRENT `password_hash`; if it differs (a password change
+    /// committed between the caller's read and this lock) the check DENIES —
+    /// no re-verify against the new hash; the user simply retries. Ignored in
+    /// cfg-file mode.
+    ///
+    /// Typed (#5342 Gate 7): `kUnknownUser` when the row is no longer active
+    /// (a credential verdict, like an unknown name), `kStoreUnavailable` on a
+    /// store error, `kCredentialChanged` on the hash mismatch above — the last
+    /// two are transient and never a failed guess.
+    [[nodiscard]] std::expected<Role, VerifyFailure>
     recheck_role_after_credential_check(const std::string& username, Role pre_check_role,
                                         std::uint64_t pre_check_version,
+                                        const std::string& verified_hash_hex,
                                         std::string_view context);
 
     /// Closes the #4107 check-then-mint gap: `recheck_role_after_credential_
@@ -1189,8 +1318,28 @@ private:
     ///
     /// Returns `true` unconditionally in cfg-file mode (`!auth_db_`) - no
     /// separate authority exists to diverge from. Caller must NOT hold `mu_`.
+    ///
+    /// `expected_hash_hex` (#5342 Gate 7): when engaged, the stored hash must
+    /// ALSO still equal it (constant-time compare) — a password change/reset
+    /// that committed after the caller verified the password revokes and
+    /// denies exactly like a role divergence. Disengaged only for
+    /// `create_local_session_for_test` (no password was ever verified).
+    ///
+    /// #5342 Gate 8 (M1): the re-read is ROW-LOCKED
+    /// (`AuthDB::recheck_role_locked`, `SELECT ... FOR UPDATE`, bounded
+    /// `lock_timeout`), never a plain autocommit read — so a credential change
+    /// whose UPDATE has executed but not yet committed makes this call WAIT for
+    /// that commit and then see the new hash (deny + revoke), instead of
+    /// reading the old hash past an uncommitted write whose session DELETE
+    /// already ran before this session existed.
     [[nodiscard]] bool post_mint_role_recheck(const std::string& username, Role minted_role,
+                                              const std::optional<std::string>& expected_hash_hex,
                                               std::string_view context);
+
+    /// Shared body of `create_local_session` / `create_local_session_for_test`.
+    [[nodiscard]] std::string
+    mint_local_session(const std::string& username, Role role, bool mfa_verified,
+                       const std::optional<std::string>& expected_hash_hex);
 
     /// Backing field for `set_role_recheck_race_hook_for_test` - see that
     /// method's doc. Invoked (if set) from inside
@@ -1213,6 +1362,10 @@ private:
     /// as `role_recheck_race_hook_for_test_` above - see that field's
     /// Resource Ledger entry, which covers this one too.
     std::function<void()> post_mint_race_hook_for_test_;
+
+    /// #5342: the credential-change query owner (`set_credential_change_owner`).
+    /// Borrowed, never owned; null ⇒ no credential writes.
+    CredentialChangeOwner* credential_change_owner_{nullptr};
 
     /// Backing counter for `next_role_version_()` - see `UserEntry::role_version`'s
     /// doc for why this is process-wide, not per-username. `std::atomic` since

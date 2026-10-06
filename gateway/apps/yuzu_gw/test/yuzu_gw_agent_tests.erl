@@ -25,6 +25,31 @@
 %%% Test fixture
 %%%===================================================================
 
+%% format_status/1 shows the queued and postponed events by type only (the
+%% head of the queue is the "Last event" of a terminate report); the other keys
+%% pass through untouched.
+format_status_reduces_events_to_their_type_test() ->
+    Secret = <<"MARKER-enrollment-token">>,
+    From = {self(), make_ref()},
+    Status = #{state => streaming, data => not_a_data_record,
+               reason => {error, badarg},
+               queue => [{cast, #{enrollment_token => Secret}},
+                         {{call, From}, {dispatch, Secret}},
+                         {info, {tag, Secret}}, junk],
+               postponed => [{cast, Secret}],
+               log => []},
+    Out = yuzu_gw_agent:format_status(Status),
+    ?assertEqual([{cast, '$redacted'}, {{call, From}, '$redacted'},
+                  {info, '$redacted'}, '$redacted'], maps:get(queue, Out)),
+    ?assertEqual([{cast, '$redacted'}], maps:get(postponed, Out)),
+    ?assertEqual({error, badarg}, maps:get(reason, Out)),
+    ?assertEqual(streaming, maps:get(state, Out)),
+    ?assertEqual('$redacted', maps:get(data, Out)),
+    ?assertEqual(nomatch, binary:match(iolist_to_binary(io_lib:format("~0p", [Out])), Secret)),
+    %% A queue that is not a list is not shown; an absent queue stays absent.
+    ?assertEqual('$redacted', maps:get(queue, yuzu_gw_agent:format_status(#{queue => x}))),
+    ?assertNot(maps:is_key(queue, yuzu_gw_agent:format_status(#{state => s}))).
+
 agent_test_() ->
     {setup,
      fun setup/0,
