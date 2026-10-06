@@ -411,6 +411,9 @@ cleanup_notify(Ctx) ->
          yuzu_gw_registry:deregister_agent(Id),
          exit(Pid, kill)
      end || {Id, Pid} <- ets:tab2list(?NOTIFY_AGENTS)],
+    %% deregister_agent/1 is a cast: a call to the registry is handled after it
+    %% (same sender), so its reply proves the agents are gone.
+    _ = sys:get_state(yuzu_gw_registry, 5000),
     ets:delete(?NOTIFY_AGENTS),
     cleanup_guardian(Ctx).
 
