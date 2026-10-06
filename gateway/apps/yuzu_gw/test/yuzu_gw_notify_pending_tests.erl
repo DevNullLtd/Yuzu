@@ -156,7 +156,9 @@ env_test_() ->
       t("a base above the default cap, with no cap set, warns about the default and names no cap the operator did not set",
         fun max_unset_below_base_names_the_default/0),
       t("a reset timeout under the floor warns naming the key, the value, the range and the default used",
-        fun sub_floor_values_warn_with_the_default_used/0)
+        fun sub_floor_values_warn_with_the_default_used/0),
+      t("a cap outside the range, with a base above the default cap, gets the default-raised warning and not the operator-cap one",
+        fun max_out_of_range_names_the_default_not_the_rejected_value/0)
      ]}.
 
 %% A registration replay that is active while the pending store is refilled.
@@ -1132,6 +1134,31 @@ max_unset_below_base_names_the_default() ->
     ?assertNotEqual(nomatch, binary:match(Warning, <<"600000">>)),
     ?assertEqual(nomatch, binary:match(Warning, <<"circuit_breaker_max_reset_timeout_ms (300000)">>)),
     ?assertEqual(600000, up_get(cb_max_timeout)).
+
+%% A cap the operator set OUTSIDE 100..3600000 is rejected (one warning naming
+%% the key and the value, the default takes its place), so what the clamp then
+%% raises is the default cap, never a value the operator configured: its warning
+%% must say the default was raised and must not use the "is below" wording of an
+%% operator-set cap nor print the rejected value. A floor or ceiling that let the
+%% value through (50, 4000000) would make the clamp present the default as the
+%% operator's cap.
+max_out_of_range_names_the_default_not_the_rejected_value() ->
+    [begin
+         Warnings = env_key_case(circuit_breaker_max_reset_timeout_ms, Bad,
+                                 [{circuit_breaker_reset_timeout_ms, 600000}]),
+         Rejected = [W || W <- Warnings, binary:match(W, <<"Invalid ">>) =/= nomatch],
+         Clamp = Warnings -- Rejected,
+         ?assertMatch([_], Rejected),
+         ?assertMatch([_], Clamp),
+         [C] = Clamp,
+         ?assertNotEqual(nomatch, binary:match(C, <<"default">>)),
+         ?assertNotEqual(nomatch, binary:match(C, <<"raised to 600000">>)),
+         ?assertEqual(nomatch, binary:match(C, <<"is below">>)),
+         %% The rejected value as a whole number, not inside another number.
+         ?assertEqual(nomatch, re:run(C, "(^|[^0-9])" ++ integer_to_list(Bad) ++ "([^0-9]|$)",
+                                      [{capture, none}])),
+         ?assertEqual(600000, up_get(cb_max_timeout))
+     end || Bad <- [50, 4000000]].
 
 %% Values under the floor of 100 are not silent: the line names the key, echoes
 %% the integer (operator configuration, not agent data), gives the range and says
