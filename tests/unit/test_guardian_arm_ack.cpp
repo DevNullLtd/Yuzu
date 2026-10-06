@@ -103,7 +103,9 @@ struct FakeBackend : ISparkBackend {
     }
     /// #5459: parks the NEXT disarm() call (single-shot) until release_disarm(), so a
     /// test can hold a wedge's compensating teardown outstanding (the claim stays the
-    /// Dispatched FIFO front with compensation_finished false). Guarded by gate_mu_.
+    /// Dispatched FIFO front with compensation_finished false). `hang_next_disarm` is an
+    /// atomic exchanged without gate_mu_; `disarm_entered_` / `disarm_released_` are
+    /// guarded by gate_mu_. Single-use per rig unless reset_disarm() is called.
     std::atomic<bool> hang_next_disarm{false};
     bool disarm_entered_{false};
     bool disarm_released_{false};
@@ -125,6 +127,14 @@ struct FakeBackend : ISparkBackend {
             disarm_released_ = true;
         }
         gate_cv_.notify_all();
+    }
+    /// Re-arms the disarm gate after a previous release_disarm() (precedent: reset_hang()):
+    /// without it a second start-compensation on one rig would see disarm_released_ still
+    /// true and not park. Only valid while no disarm is parked on the gate.
+    void reset_disarm() {
+        std::lock_guard<std::mutex> lk{gate_mu_};
+        disarm_entered_ = false;
+        disarm_released_ = false;
     }
 
     bool wait_entered_hang(std::chrono::seconds timeout) {
@@ -240,13 +250,19 @@ struct Rig5459 {
 
     Rig5459() = default;
     // Releases every park before the runtime stops, so a failing REQUIRE cannot leave a
-    // detached worker parked.
+    // detached worker parked. A worker still alive after the bounded wait is a LEAK (a gate
+    // this destructor does not release), which must never read green: FAIL_CHECK records a
+    // failed assertion without throwing (safe in a destructor, including during the unwind
+    // of a failing REQUIRE).
     ~Rig5459() {
         b->release_disarm();
         b->release_hang();
         rt->begin_stop();
-        (void)yuzu::test::spin_until([&] { return rt->active_backend_op_workers() == 0; },
-                                     std::chrono::seconds(10));
+        const bool drained = yuzu::test::spin_until(
+            [&] { return rt->active_backend_op_workers() == 0; }, std::chrono::seconds(10));
+        if (!drained)
+            FAIL_CHECK("Rig5459: a backend worker was still alive after every gate was released "
+                       "(leaked parked worker)");
     }
 
     [[nodiscard]] static std::string key_of(const std::string& path) { return spark_key(file_spec(path)); }
@@ -1386,6 +1402,63 @@ TEST_CASE("GuardianArmAckLedger::decide_retry(): safety valve - kWedgeSuppressMa
         CHECK(g.retry() == RD::Suppress);
 }
 
+// The operator docs (user manual and flip gate) state the valve as "10 suppressions, about
+// 330 s at the 30 s heartbeat". Pin the number itself so a change to the constant is a
+// decision that has to touch those docs, not an accident (the budget tests below are written
+// in terms of the constant and would follow it silently).
+static_assert(kWedgeSuppressMaxDecisions == 10,
+              "the operator docs state the wedge-suppression valve as 10 decisions (~330 s at a "
+              "30 s heartbeat): update them in the same change");
+
+TEST_CASE("GuardianArmAckLedger::decide_retry(): the safety valve bounds EVERY wedge Suppress "
+          "branch - a retained compensating wedge, and an outstanding wedge (hung or "
+          "compensating) still in `pending` - never an unbounded second path (#5459)",
+          "[spark][ack][5459]") {
+    // Exhausts the budget through whatever branch the rig set up: exactly
+    // kWedgeSuppressMaxDecisions Suppresses, then Reapply, and the budget does not come
+    // back (a Reapply decision is not a reset, only begin_application()/retire() are).
+    auto exhaust = [](Rig5459& f) {
+        for (std::size_t i = 0; i < kWedgeSuppressMaxDecisions; ++i)
+            REQUIRE(f.retry() == RD::Suppress);
+        for (int i = 0; i < 3; ++i)
+            CHECK(f.retry() == RD::Reapply);
+        CHECK_FALSE(f.ledger.can_advance()); // the valve forces a re-apply, never an ack
+    };
+
+    SECTION("retained compensating wedge (CompensationPending, pending empty)") {
+        Rig5459 f;
+        auto w = f.wedge("r1", "/a");
+        f.start_compensation("/a");
+        f.open_app();
+        f.ledger.add_pending("r1", w);
+        REQUIRE(f.ledger.drain_locked(*f.rt, 10) == 1);
+        REQUIRE(f.ledger.pending_count_for_test() == 0);
+        REQUIRE(f.ledger.failed_receipt_count_for_test() == 1);
+        REQUIRE(f.rt->receipt_recovery_status(w) == RT::RecoveryStatus::CompensationPending);
+        exhaust(f);
+    }
+    SECTION("outstanding hung wedge still in `pending` (pending loop, wedge_eligible)") {
+        Rig5459 f;
+        auto w = f.wedge("r1", "/a");
+        f.open_app();
+        f.ledger.add_pending("r1", w); // deliberately NOT drained
+        REQUIRE(f.ledger.pending_count_for_test() == 1);
+        REQUIRE(f.ledger.failed_receipt_count_for_test() == 0);
+        exhaust(f);
+    }
+    SECTION("compensating wedge still in `pending` (pending loop, compensation_pending)") {
+        Rig5459 f;
+        auto w = f.wedge("r1", "/a");
+        f.start_compensation("/a");
+        f.open_app();
+        f.ledger.add_pending("r1", w); // deliberately NOT drained
+        REQUIRE(f.ledger.pending_count_for_test() == 1);
+        REQUIRE(f.ledger.failed_receipt_count_for_test() == 0);
+        REQUIRE(f.rt->receipt_status_wedge_aware(w).compensation_pending);
+        exhaust(f);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // #5459 (option D), compensation-aware suppression: #4472 made a wedge whose late
 // result has RETURNED, with a compensating teardown outstanding, not K-eligible. The
@@ -1634,8 +1707,8 @@ TEST_CASE("GuardianArmAckLedger::decide_retry(): a retained wedge whose late suc
 TEST_CASE("GuardianArmAckLedger::decide_retry(): a Recovered entry spends the safety-valve "
           "budget like any other Suppress (#5459)",
           "[spark][ack][5459]") {
-    // Deliberate: the Recovered window is one heartbeat tick long so the valve is never the
-    // binding bound for it in production, but an uncounted Suppress would be a second
+    // Deliberate: the Recovered window is one heartbeat tick long so the valve is usually not
+    // the binding bound for it in production, but an uncounted Suppress would be a second
     // unbounded suppression path. Pinned so a change is a decision, not an accident.
     Rig5459 f;
     auto w = f.wedge("r1", "/a");
@@ -1650,6 +1723,38 @@ TEST_CASE("GuardianArmAckLedger::decide_retry(): a Recovered entry spends the sa
         CHECK(f.retry() == RD::Suppress);
     CHECK(f.retry() == RD::Reapply);
     CHECK_FALSE(f.ledger.can_advance()); // still held until a drain records the recovery
+}
+
+TEST_CASE("GuardianArmAckLedger::decide_retry(): budget spent on a hung wedge, then its late "
+          "success is adopted (Recovered) - the next push is the ONE forced Reapply, never an "
+          "acknowledgment, and the recovery scan still acknowledges the old application "
+          "(#5459)",
+          "[spark][ack][5459]") {
+    Rig5459 f;
+    auto w = f.wedge("r1", "/a");
+    f.open_app();
+    f.ledger.add_pending("r1", w);
+    REQUIRE(f.ledger.drain_locked(*f.rt, 10) == 1);
+    for (std::size_t i = 0; i < kWedgeSuppressMaxDecisions; ++i)
+        REQUIRE(f.retry() == RD::Suppress); // the whole budget, spent while the arm is hung
+
+    // The hung arm now succeeds and nobody withdrew the rule: ADOPTED (Recovered). No drain
+    // has run since.
+    f.b->release_path("/a");
+    REQUIRE(yuzu::test::spin_until([&] { return f.rt->rule_count() == 1; }, std::chrono::seconds(10)));
+    REQUIRE(f.rt->receipt_recovery_status(w) == RT::RecoveryStatus::Recovered);
+
+    // The valve is already spent, so the Recovered entry is NOT held: this is the single
+    // forced Reapply (in production a teardown of the rule that just armed - the safe
+    // direction, one wasted teardown). It acknowledges nothing.
+    CHECK(f.retry() == RD::Reapply);
+    CHECK_FALSE(f.ledger.can_advance());
+
+    // The recovery scan of the next tick clears the counted failure and acknowledges; no
+    // further forced Reapply is needed to get there.
+    CHECK(f.ledger.drain_locked(*f.rt, 10) == 0);
+    CHECK(f.ledger.failed_receipt_count_for_test() == 0);
+    CHECK(f.ledger.can_advance());
 }
 
 TEST_CASE("GuardianArmAckLedger::decide_retry(): a Blocking failed_receipts entry is Reapply "

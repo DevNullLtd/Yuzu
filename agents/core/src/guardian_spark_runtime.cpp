@@ -1435,13 +1435,18 @@ void GuardianSparkRuntime::on_arm_complete(const std::string& key,
             // every exit (normal, or an exception unwinding past staging), never in a later
             // acquisition. Between the two a heartbeat drain could read this claim as a
             // still-hung wedge (Eligible) with its compensating disarm already owed, rather
-            // than CompensationPending - a misclassification the ledger's retry suppression
-            // would then carry (#5459). Declared before the
-            // fallible gap_hook copy and every other fallible step below, so it covers all of
-            // them; non-throwing and non-allocating (a claim field write and a clock read),
-            // and destructed before `lk` releases. Reads `compensating` at scope exit: an
-            // adoption reset it, so an adopted claim is never marked, and a later fault with
-            // `compensating` already reset falls to the !published path that sets finished.
+            // than CompensationPending. Under #5459 decide_retry() and can_advance() treat
+            // the two identically (both outstanding, neither ever acknowledges), so the mark
+            // no longer protects a suppression or acknowledgment decision. It keeps the
+            // Eligible/CompensationPending classification and the readers of
+            // !compensation_finished accurate (the compensation pending-age and deadline
+            // observation, the expiry sweep's "teardown still outstanding" break). Declared
+            // before the fallible gap_hook copy and every other fallible step below, so it
+            // covers all of them; non-throwing and non-allocating (a claim field write and a
+            // clock read), and destructed before `lk` releases. Reads `compensating` at scope
+            // exit: an adoption reset it, so an adopted claim is never marked, and a later
+            // fault with `compensating` already reset falls to the !published path that sets
+            // finished.
             struct CompensationOwedMark {
                 const std::optional<std::uint64_t>& compensating;
                 KeyClaim& claim;

@@ -1873,8 +1873,8 @@ private:
     /// receipt_status_wedge_aware() all read this ONE definition, never three
     /// independently-maintained copies. The two outstanding values are what
     /// GuardianArmAckLedger::decide_retry() may suppress on; NEITHER ever authorises an
-    /// acknowledgement (can_advance() has no wedge escape). registry_mu_ held by the
-    /// CALLER; never touches shared state beyond a read-only `claims_` lookup.
+    /// acknowledgment (can_advance() has no wedge escape). registry_mu_ is held by the
+    /// CALLER; this reads only the claim and a read-only `claims_` lookup.
     enum class WedgeEpisode { NotOutstanding, Eligible, CompensationPending };
     [[nodiscard]] WedgeEpisode wedge_episode_locked(const std::shared_ptr<KeyClaim>& claim) const noexcept;
 

@@ -144,7 +144,10 @@ public:
     /// map<string,string> spark params). `applied` is the count the caller's
     /// own apply_rules() already computed for this push - stashed so a
     /// Suppress decision (decide_retry(), below) can hand it straight back
-    /// without recomputing anything.
+    /// without recomputing anything. Known limit of the delta-push case (a partial push
+    /// that omits an unresolved rule drops that rule's retry obligation, because this
+    /// replaces the open application wholesale): design doc R5.3 known limits, flip-gate
+    /// AC-11.
     void begin_application(std::uint64_t generation, std::string content_id, bool full_sync,
                            std::size_t applied);
 
@@ -329,8 +332,11 @@ public:
     /// Not const: the Suppress-on-wedge branch increments
     /// Application::wedge_suppress_count. `runtime` is read via
     /// receipt_recovery_status() (retained failures) and receipt_status_wedge_aware()
-    /// (pending receipts), each taking its own brief registry_mu_ internally; call this AFTER drain_locked() so a receipt that resolved this tick
-    /// is reflected, and under the same engine lock as drain_locked().
+    /// (pending receipts), each taking its own brief registry_mu_ internally. Call it under
+    /// the same engine lock as drain_locked(). Calling it after drain_locked() is not
+    /// required for correctness: every read is a LIVE read of `runtime`, so a count a
+    /// drain has not caught up with yet is always resolved by the live re-read (the one
+    /// production caller, GuardianEngine::apply_rules(), does not drain first).
     ///
     /// `runtime` is consulted directly, not just `resolved_failed`, because
     /// drain_locked() is BOUNDED: a receipt past one tick's max_per_tick cap
@@ -338,8 +344,9 @@ public:
     /// anything else), and Suppress must mean "every pending receipt is
     /// still genuinely Pending or an outstanding wedge" - not merely
     /// "drain_locked hasn't gotten to it yet".
-    RetryDecision decide_retry(std::uint64_t generation, const std::string& content_id,
-                               bool full_sync, const GuardianSparkRuntime& runtime);
+    [[nodiscard]] RetryDecision decide_retry(std::uint64_t generation,
+                                             const std::string& content_id, bool full_sync,
+                                             const GuardianSparkRuntime& runtime);
 
     /// Stop-time: drop the current application without resolving it further.
     /// Its receipts' claims remain the runtime's own problem exactly as
@@ -389,7 +396,7 @@ private:
         /// `resolved_failed == failed_receipts.size()` means "every counted failure
         /// has a retained retry-deferral candidate", a NECESSARY condition for
         /// decide_retry()'s wedge Suppress - never sufficient (each entry is
-        /// re-read live) and never an acknowledgement gate.
+        /// re-read live) and never an acknowledgment gate.
         std::map<std::string, GuardianSparkRuntime::ArmReceipt> failed_receipts;
         /// #5459 (option D): how many times decide_retry() has returned Suppress on
         /// account of an outstanding wedge for THIS application. Bounded by

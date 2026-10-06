@@ -137,7 +137,9 @@ void GuardianArmAckLedger::begin_application(std::uint64_t generation, std::stri
     // a make_unique/allocation throw here leaves current_ completely untouched,
     // matching apply_rules()'s own firewall around this call. A fresh Application also
     // starts wedge_suppress_count at 0 (#5459): the safety valve's budget is reset ONLY
-    // here and in retire().
+    // here and in retire(). Replacing the open application wholesale also drops the
+    // retry obligation of any rule a partial (delta) push omits: a known limit, see the
+    // design doc R5.3 known limits and flip-gate AC-11.
     auto next = std::make_unique<Application>();
     next->generation = generation;
     next->content_id = std::move(content_id);
@@ -279,7 +281,7 @@ std::size_t GuardianArmAckLedger::drain_locked(GuardianSparkRuntime& runtime,
         // application can still count the same wedge again - nothing about up-2's
         // re-observation changes that (re-observation exists so a TYPED Wedged
         // status reaches this ledger at all, not to change what it means once it
-        // arrives). #5459 (option D) removed the K-bound acknowledgement entirely: a
+        // arrives). #5459 (option D) removed the K-bound acknowledgment entirely: a
         // counted wedge holds the generation until recovered or replaced.
         using S = GuardianSparkRuntime::ReceiptStatus;
         switch (status) {
@@ -462,8 +464,10 @@ GuardianArmAckLedger::RetryDecision GuardianArmAckLedger::decide_retry(
             // counted until the next tick's recovery scan decrements it, after which
             // can_advance() acks), and this push is suppressed until then. It counts toward
             // the safety valve like any other Suppress below (deliberate: the window is one
-            // heartbeat tick, so the valve is never the binding bound for it, and an
-            // uncounted Suppress would be a second unbounded path).
+            // heartbeat tick, so the valve is usually not the binding bound for it; if the
+            // budget is already spent, a forced Reapply re-arms the just-recovered rule
+            // (safe direction: one wasted teardown, never an acknowledgment); an uncounted
+            // Suppress would be a second unbounded path).
             outstanding_wedge = true;
             break;
         case GuardianSparkRuntime::RecoveryStatus::Blocking:
