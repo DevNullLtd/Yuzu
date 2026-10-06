@@ -202,6 +202,12 @@ inline constexpr std::string_view kReasonQuarantined{"quarantined"};
 /// a quarantine denial is.
 inline constexpr std::string_view kReasonUnknownPlugin{"unknown_plugin"};
 
+/// #5294: a dispatch target withheld because the per-OS kill switch for its
+/// agent OS is OFF. Same standing as `kReasonUnknownPlugin` -- a policy
+/// withholding, not a targeting-shape violation, so deliberately NOT a member
+/// of either array above, and emitted from the same three routes.
+inline constexpr std::string_view kReasonKillSwitchedOs{"kill_switched_os"};
+
 /// #4496: the from-inventory-query result-set producer (REST and its MCP
 /// twin) refused because the underlying inventory read hit its row/byte cap.
 /// Deliberately NOT a member of either array above, same reasoning as

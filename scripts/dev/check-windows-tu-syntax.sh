@@ -61,6 +61,7 @@ tus=(
     agents/plugins/tar/src/tar_removable_collector.cpp
     agents/plugins/execution_artifacts/src/execution_artifacts_win.cpp
     agents/plugins/update_source_trust/src/update_source_trust_win.cpp
+    agents/plugins/mgmt_posture/src/mgmt_posture_win.cpp
     agents/plugins/runtimes/src/runtimes_win.cpp
     agents/plugins/runtimes/src/runtimes_linux.cpp # empty on Windows: checks the portable half of the Linux walk header
     agents/core/src/dism_bounded_call.cpp
@@ -71,6 +72,9 @@ tus=(
     agents/plugins/platform_security/src/platform_security_win.cpp
     agents/plugins/system_hardening/src/system_hardening_plugin.cpp
     agents/plugins/system_hardening/src/system_hardening_win.cpp
+    agents/plugins/privacy_permissions/src/privacy_permissions_win.cpp
+    agents/plugins/privacy_permissions/src/privacy_permissions_plugin.cpp
+     agents/plugins/license_scan/src/licensing_win.cpp agents/plugins/registry/src/registry_plugin.cpp agents/plugins/installed_apps/src/installed_apps_plugin.cpp agents/plugins/tar/src/tar_mapdrive_collector.cpp agents/plugins/users/src/users_plugin.cpp
 )
 [ "$#" -gt 0 ] && tus+=("$@")
 

@@ -53,7 +53,7 @@ client-identity binding becomes cryptographic with no new mechanism.
 | `server/core/src/key_provider.{hpp,cpp}` | `KeyProvider` interface + `FileKeyProvider` (0600 PEM in a 0700 dir). The HSM/PKCS#11 seam — `key_ref` is an opaque token (the absolute path today). |
 | `server/core/src/ca_store.{hpp,cpp}` (Postgres schema `ca_store`, ADR-0053) | Inventory + lifecycle: `ca_root`, `ca_issued`, `ca_crl_versions`. **Metadata only — the root private key is never in the DB**, only its opaque `key_ref`. |
 | `server/core/src/default_certs.{hpp,cpp}` | First-boot bootstrap: root + 3 server leaves + `default-marker.json`. Idempotent; regenerate-whole-set on corruption / clock-skew. |
-| `agents/core/src/agent_csr.{hpp,cpp}` | Agent-side, self-contained OpenSSL (the agent cannot link `x509_ca`): EC P-256 keypair + CSR generation, 0600 leaf persistence, renew-at-2/3 inspection. |
+| `agents/core/src/agent_csr.{hpp,cpp}` | Agent-side, self-contained OpenSSL (the agent cannot link `x509_ca`): EC P-256 keypair + CSR generation, 0600 key persistence (leaf and chain 0644), renew-at-2/3 inspection (a cert/key mismatch or unreadable key counts as missing and re-enrols). |
 | `server/core/src/ca_routes.{hpp,cpp}` | The `/api/v1/ca/*` REST surface (PR4). |
 
 ## The `ca_store` Postgres schema (schema + invariants)
@@ -368,7 +368,7 @@ source:
 | Hop | M1 TLS | Why |
 |---|---|---|
 | gateway → server upstream (`GatewayUpstream`, :50055) | **mutual TLS** | Both peers hold CA-issued certs (the gateway uses the `default-gateway` leaf, which has `serverAuth`+`clientAuth`). No bootstrap problem. |
-| agent → gateway (:50051) | **one-way TLS (PR5c; live in the reference composes, #1314)** | The vendored+patched grpcbox (`_checkouts/grpcbox`) lets the agent listener run **server-authenticated** TLS (`verify_none` + `fail_if_no_peer_cert=false`) — encrypted + gateway-authenticated, **no client cert required**, so an unenrolled agent still bootstraps. Enabled in `sys.config.prod` and shipped live in `docker-compose.reference-gateway.yml`: the gateway mounts the grpcbox TLS `sys.config` + the shared CA volume, and the agent auto-discovers the install CA at `/etc/yuzu/certs/default-ca.pem` (#1314). **Caveat (#1291):** the transport is driven by the mounted grpcbox `sys.config`, NOT the `YUZU_GW_TLS_*` env vars, which are still inert — an operator who only sets those env vars has NOT enabled gateway TLS. Agent identity stays app-layer (`gateway_observed_peer`, #1064), not transport. |
+| agent → gateway (:50051) | **one-way TLS (PR5c; live in the reference gateway compose, #1314)** | The vendored+patched grpcbox (`_checkouts/grpcbox`) lets the agent listener run **server-authenticated** TLS (`verify_none` + `fail_if_no_peer_cert=false`) — encrypted + gateway-authenticated, **no client cert required**, so an unenrolled agent still bootstraps. Enabled in `sys.config.prod` and shipped live in `docker-compose.reference-gateway.yml`: the gateway mounts the grpcbox TLS `sys.config` + the shared CA volume, and the agent auto-discovers the install CA at `/etc/yuzu/certs/default-ca.pem` (#1314). **Caveat (#1291):** the transport is driven by the mounted grpcbox `sys.config`, NOT the `YUZU_GW_TLS_*` env vars, which are still inert — an operator who only sets those env vars has NOT enabled gateway TLS. Agent identity stays app-layer (`gateway_observed_peer`, #1064), not transport. Agent `Heartbeat` admission is bound to the HTTP/2 connection that opened the session's `Subscribe` stream (connection key = the connection process, not a certificate); the listener still does not authenticate agents. |
 | server → gateway mgmt (:50063) | **strict mutual TLS + SPKI peer pin (#1314, #1422)** | The privileged command-fan-out plane. Strict mTLS (the patched grpcbox's `verify_peer`+`fail_if_no_peer_cert` defaults) admits only CA-issued client certs; the C++ server's command-forwarding client presents its server leaf and verifies the gateway against the install CA (`build_gateway_command_credentials`, fail-closed if the certs are missing). On top of that, the mgmt listener's grpcbox `auth_fun` (`yuzu_gw_authz:check_mgmt_peer/1`) **pins the peer to the server's KEY** — SPKI SHA-256 against `{yuzu_gw, mgmt_peer_pins}` — and requires the `serverAuth` EKU (agent leaves are `clientAuth`-only by construction, so no agent leaf can ever qualify). This closes the #1314 M-1 residual: a stolen per-agent leaf, an enrollment-minted CN-collision leaf (`--agent-id` is endpoint-chosen and lands in the CN verbatim), and the group-readable `default-gateway` leaf all get `UNAUTHENTICATED` — pre-handler, so the RPC never executes. Pins: `{cert_file, Path}` (default `default-server.pem` in the shared cert volume; mtime+size-cached re-read, so server leaf rotation self-heals; a same-second, same-size rewrite is the one undetected shape — fail-closed (stale pin rejects, never admits wrongly), a gateway restart recovers — the pin is the **first** certificate in the PEM, so REPLACE the file on rotation, never append the new leaf below the old) or `{spki_sha256, "hex"}` for bring-your-own-cert installs (`openssl x509 -in cert.pem -pubkey -noout \| openssl pkey -pubin -outform DER \| openssl dgst -sha256`); list two pins to overlap a rotation; empty/unresolvable pins fail **closed**. A `yuzu_gw_app` boot guard refuses a network-reachable mgmt listener lacking this posture (loopback exempt; `{allow_insecure_mgmt, true}` is the lab-rig acknowledgement, seeded in the UAT/demo configs whose composes keep :50063 unpublished). **Residual (#1422):** no CRL/OCSP on this path — a revoked-but-stolen *server* leaf passes until rotation. A plaintext stack (`--no-tls`) keeps the plane insecure and must stay on a trusted network. |
 
 > **⚠ SECURITY — do not expose the plaintext gateway agent edge to an untrusted
@@ -394,11 +394,20 @@ source:
 > the UAT/demo/sanitizer rigs (which pass `--no-tls` deliberately), a hand-rolled
 > compose, or one that relied on the still-inert `YUZU_GW_TLS_*` env vars (#1291)
 > instead of a mounted `sys.config` — has an unprotected `:50051`.** For any such
-> gateway exposed to an untrusted network, MUST still do one of: (a) terminate TLS
-> in front of the gateway (reverse proxy on :50051, forwarding plaintext only over
-> loopback/a trusted segment); or (b) keep the agent port on a trusted network
-> (VPN / private subnet / service mesh). The QUIC transport (#376) is the
-> longer-term native path.
+> gateway exposed to an untrusted network, MUST still do one of: (a) front the
+> gateway at L4 or with TLS passthrough only (one TCP connection per agent end to
+> end, with the gateway's own agent-listener TLS enabled; an HTTP/2-terminating
+> reverse proxy, including a service-mesh sidecar that terminates HTTP/2, is not
+> supported for heartbeat admission, see
+> [Heartbeat admission](user-manual/gateway.md#heartbeat-admission)); or (b) keep
+> the agent port on a trusted network (VPN / private subnet / a mesh policy that does not
+> terminate HTTP/2; see [Heartbeat admission](user-manual/gateway.md#heartbeat-admission)).
+> Observed in a test with two agents: behind an HTTP/2-terminating proxy (nginx
+> `grpc_pass`) every heartbeat was rejected as a connection mismatch (counted, never
+> forwarded) while the agents still enrolled and received commands; behind an L4 TCP
+> forwarder (nginx `stream`) there were no rejections. The agent sees the same
+> `unknown session` for every rejection reason, so diagnose from the gateway
+> counters and summary log. The QUIC transport (#376) is the longer-term native path.
 
 The canonical correct gateway TLS config is `gateway/config/sys.config.prod`
 (upstream `{https,...}` mutual TLS + **one-way TLS on the agent listener** (PR5c) +

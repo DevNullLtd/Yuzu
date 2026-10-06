@@ -34,6 +34,8 @@ health_nf_test_() ->
          [
           {"readyz 503 when registry process is dead",
            fun() -> readyz_503_dead_process(Port) end},
+          {"readyz 503 when the registry's session index table is missing",
+           fun() -> readyz_503_missing_session_index(Port) end},
           {"readyz 503 when circuit breaker is open",
            fun() -> readyz_503_circuit_open(Port) end},
           {"concurrent health checks complete without error",
@@ -79,7 +81,7 @@ setup() ->
     MockPids = lists:filtermap(fun(Name) ->
         case whereis(Name) of
             undefined ->
-                Pid = spawn(fun() -> mock_loop() end),
+                Pid = spawn(mock_for(Name)),
                 register(Name, Pid),
                 {true, {Name, Pid, true}};
             Existing ->
@@ -152,6 +154,10 @@ cleanup({_Port, HealthPid, UpPid, MockPids}) ->
     catch meck:unload(telemetry),
     process_flag(trap_exit, false),
     ok.
+
+%% The registry stand-in also owns the session index table readiness checks.
+mock_for(yuzu_gw_registry) -> fun yuzu_gw_test_registry:mock_registry_loop/0;
+mock_for(_Name)            -> fun mock_loop/0.
 
 mock_loop() ->
     receive
@@ -232,9 +238,29 @@ readyz_503_dead_process(Port) ->
     ?assert(binary:match(Body, <<"not_ready">>) =/= nomatch),
     ?assert(binary:match(Body, <<"\"registry\":false">>) =/= nomatch),
     %% Re-register a mock so cleanup and subsequent tests don't fail.
-    NewPid = spawn(fun() -> mock_loop() end),
+    NewPid = spawn(mock_for(yuzu_gw_registry)),
     register(yuzu_gw_registry, NewPid),
     process_flag(trap_exit, false).
+
+%% The registry process is alive but its session index table is missing (the
+%% state after new code is loaded into a running node): not ready, and the
+%% registry check itself still reports the process as alive.
+readyz_503_missing_session_index(Port) ->
+    Registry = whereis(yuzu_gw_registry),
+    ?assert(is_pid(Registry)),
+    ok = yuzu_gw_test_registry:mock_registry_drop_index(Registry),
+    try
+        {Status, Body} = http_get(Port, "/readyz"),
+        ?assertEqual(503, Status),
+        ?assert(binary:match(Body, <<"not_ready">>) =/= nomatch),
+        ?assert(binary:match(Body, <<"\"registry\":true">>) =/= nomatch),
+        ?assert(binary:match(Body, <<"\"sessions_index\":false">>) =/= nomatch)
+    after
+        ok = yuzu_gw_test_registry:mock_registry_restore_index(Registry)
+    end,
+    {Status2, Body2} = http_get(Port, "/readyz"),
+    ?assertEqual(200, Status2),
+    ?assert(binary:match(Body2, <<"\"sessions_index\":true">>) =/= nomatch).
 
 readyz_503_circuit_open(Port) ->
     %% Trip the circuit breaker to open state.
@@ -253,8 +279,9 @@ readyz_503_circuit_open(Port) ->
     ?assert(binary:match(Body, <<"\"circuit_breaker\":false">>) =/= nomatch),
 
     %% Restore the circuit to closed for other tests.
-    %% Wait for half_open, then succeed a probe.
-    timer:sleep(350),
+    %% Wait for the timer-driven half_open, then succeed a probe. A fixed
+    %% sleep(350) here raced the timer on a loaded runner (see await_state/1).
+    ?assertEqual(half_open, await_state(half_open)),
     meck:expect(grpcbox_client, unary, fun(_, _, _, _, _) ->
         {ok, #{session_id => <<"recovered">>}, #{}}
     end),
@@ -306,6 +333,29 @@ readyz_response_time(Port) ->
     AvgUs = lists:sum(Timings) / length(Timings),
     %% Average should be under 20ms (20000 us) — includes gen_server call.
     ?assert(AvgUs < 20000).
+
+%% The open -> half_open transition is driven by an erlang:send_after timer in
+%% yuzu_gw_upstream (the 200ms reset timeout set in setup), so on a loaded
+%% runner the timer can fire late, or its message can queue behind this test's
+%% circuit_state call. A fixed `timer:sleep(350)` then `half_open` check is an
+%% UPPER-bound race of the kind that flaked on the first macOS CI runs (#4841,
+%% #4851; BigMags shares its CPU between two agents, and macOS coalesces
+%% background timers). Poll every 10ms up to a 2s deadline instead. The caller only
+%% needs the circuit restored for later tests, so the deadline changes
+%% nothing it asserts (the backoff AMOUNTS are pinned in
+%% yuzu_gw_circuit_breaker_nf_tests).
+await_state(Want) ->
+    poll_state(Want, erlang:monotonic_time(millisecond) + 2000).
+
+poll_state(Want, Deadline) ->
+    case yuzu_gw_upstream:circuit_state() of
+        Want -> Want;
+        Other ->
+            case erlang:monotonic_time(millisecond) >= Deadline of
+                true -> Other;
+                false -> timer:sleep(10), poll_state(Want, Deadline)
+            end
+    end.
 
 %%%===================================================================
 %%% HTTP client helper (minimal, no deps)

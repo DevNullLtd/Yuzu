@@ -556,6 +556,7 @@ if build_agent
   subdir('agents/plugins/printing')  # Wave 9 PR9.1b
   subdir('agents/plugins/browser_policy')  # Wave 10 PR10.2-b
   subdir('agents/plugins/update_source_trust')  # Wave 10 PR10.1-d
+  subdir('agents/plugins/mgmt_posture')  # management-plane posture (Linux + macOS legs; Windows planned)
   subdir('agents/plugins/runtimes')  # Wave 10 PR10.1-b
   subdir('agents/plugins/browser_inventory')  # Wave 10 P2a
   subdir('agents/plugins/local_security_policy')  # Wave 8 PR8.3
@@ -669,15 +670,32 @@ if _rebar3.found()
     timeout: 600,
     env: {'REBAR_BASE_DIR': _gw_src / '_build_eunit'},
   )
+  # Timeout 600s — must stay ABOVE test_gateway.py's per-suite
+  # `_SUITE_DEADLINE_SECS['ct']` (540) so the wrapper's process-tree dump
+  # fires before meson's blind kill; the old 300s sat below the wrapper's
+  # then-shared 540s deadline, making the dump unreachable (#4800). Measured
+  # 2026-09-23 with the suites actually running (52 cases, cold _build_ct,
+  # self-hosted CI concurrently busy on the same host): 65s Windows, 44s
+  # Linux. Change this and the wrapper's value together.
   test('gateway ct',
     _python3,
     args: [_gw_test_script, _gw_src, 'ct'],
     suite: 'gateway',
-    timeout: 300,
+    timeout: 600,
     env: {'REBAR_BASE_DIR': _gw_src / '_build_ct'},
   )
   message('Erlang gateway: enabled (rebar3 found)')
 else
+  if get_option('require_gateway')
+    # A skipped gateway is invisible: the build and every test leg stay green
+    # with no gateway compiled and no gateway test registered. macOS CI ran
+    # that way from the start (#4841). This option is for local fresh setups;
+    # CI legs use scripts/ci/assert-gateway-tests.py after configure instead,
+    # because a non-default option stored in a persistent, branch-shared CI build
+    # dir makes every older branch's --reconfigure fail ("Unknown options").
+    error('Erlang gateway required (-Drequire_gateway=true) but rebar3 was not '
+          + 'found on PATH. Install Erlang/OTP 28 + rebar3 (CI: erlef/setup-beam).')
+  endif
   message('Erlang gateway: skipped (rebar3 not found)')
 endif
 

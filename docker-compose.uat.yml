@@ -238,6 +238,11 @@ services:
         target: /etc/yuzu/yuzu-server.cfg
     volumes:
       - server-data:/var/lib/yuzu
+      # CA, default certs and the secrets KEK (registered in Postgres) live in
+      # /etc/yuzu/certs. Persist it alongside the Postgres volume, or a server
+      # recreate loses the key file and the server refuses to boot with
+      # kek_unresolvable (#5370).
+      - server-certs:/etc/yuzu/certs
     # Healthcheck uses bash's /dev/tcp pseudo-device (issue #622).
     # `curl` is not installed in the server runtime image, and `CMD-SHELL`
     # invokes `/bin/sh` which on Ubuntu 24.04 is `dash` and does not
@@ -402,6 +407,7 @@ services:
 
 volumes:
   server-data:
+  server-certs:
   postgres-data:
   prometheus-data:
   grafana-data:

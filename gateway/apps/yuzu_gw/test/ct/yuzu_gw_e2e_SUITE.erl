@@ -35,6 +35,12 @@
 -define(AGENT_PORT, 50151).  %% Test port for agent service
 -define(MGMT_PORT, 50152).   %% Test port for management service
 
+%% These cases call the agent service handlers in-process (no real
+%% connection), so the connection key heartbeat admission compares is
+%% supplied by a mock of yuzu_gw_conn. Every call "arrives" on this one
+%% connection; the sessions below are bound to it.
+-define(CONN_KEY, e2e_test_connection).
+
 %%%===================================================================
 %%% CT Callbacks
 %%%===================================================================
@@ -63,12 +69,19 @@ init_per_suite(Config) ->
     application:set_env(yuzu_gw, heartbeat_batch_interval_ms, 500),
     application:set_env(yuzu_gw, default_command_timeout_s, 5),
     application:set_env(yuzu_gw, telemetry_gauge_interval_ms, 60000),
+    %% Every case "arrives" on the one mocked connection (?CONN_KEY), and some
+    %% register more agents than the default per-connection session cap (8).
+    application:set_env(yuzu_gw, max_sessions_per_connection, 1000),
 
     %% Mock upstream so we don't need a real C++ server.
     meck:new(grpcbox_channel, [non_strict, no_link]),
     meck:expect(grpcbox_channel, pick, fun(_, _) -> {ok, mock_channel} end),
     meck:new(grpcbox_client, [non_strict, no_link]),
     setup_upstream_mocks(),
+
+    %% Connection key for the in-process agent service calls (see ?CONN_KEY).
+    meck:new(yuzu_gw_conn, [passthrough, no_link]),
+    meck:expect(yuzu_gw_conn, key_from_ctx, fun(_Ctx) -> ?CONN_KEY end),
 
     %% Start pg scope (unlink so it outlives the CT setup process).
     case whereis(yuzu_gw) of
@@ -89,7 +102,8 @@ end_per_suite(_Config) ->
     stop_gateway_processes(),
 
     %% Unload mocks.
-    meck:unload([grpcbox_channel, grpcbox_client]),
+    meck:unload([grpcbox_channel, grpcbox_client, yuzu_gw_conn]),
+    application:unset_env(yuzu_gw, max_sessions_per_connection),
 
     ok.
 
@@ -147,7 +161,9 @@ full_agent_lifecycle(_Config) ->
         session_id => SessionId,
         stream_pid => self(),  %% We act as the stream handler
         agent_info => maps:get(agent_info, PendingData),
-        peer_addr => maps:get(peer_addr, PendingData)
+        peer_addr => maps:get(peer_addr, PendingData),
+        %% Register recorded the connection it arrived on.
+        conn_key => maps:get(conn_key, PendingData)
     },
     {ok, AgentPid} = yuzu_gw_agent:start_link(Args),
     unlink(AgentPid),
@@ -207,7 +223,8 @@ concurrent_agent_connections(_Config) ->
                 session_id => SessionId,
                 stream_pid => self(),
                 agent_info => maps:get(agent_info, Pending),
-                peer_addr => <<"127.0.0.1">>
+                peer_addr => <<"127.0.0.1">>,
+                conn_key => maps:get(conn_key, Pending)
             },
             {ok, _Pid} = yuzu_gw_agent:start_link(Args),
 
@@ -244,7 +261,18 @@ heartbeat_batching_e2e(_Config) ->
     %% Reset meck history so we can check for new BatchHeartbeat calls.
     meck:reset(grpcbox_client),
 
-    %% Send multiple heartbeats.
+    %% Heartbeats are admitted only for sessions this node holds, on the
+    %% connection that opened them: hold ten live sessions bound to
+    %% ?CONN_KEY, then send one heartbeat for each.
+    Holders = lists:map(fun(I) ->
+        SessionId = iolist_to_binary(io_lib:format("sess-~b", [I])),
+        AgentId = iolist_to_binary(io_lib:format("hb-batch-~b", [I])),
+        Holder = spawn(fun() -> receive stop -> ok end end),
+        ok = yuzu_gw_registry:register_agent(AgentId, Holder, SessionId, [],
+                                             <<>>, #{}, ?CONN_KEY),
+        Holder
+    end, lists:seq(1, 10)),
+
     Ctx = ctx:background(),
     lists:foreach(fun(I) ->
         HbReq = #{session_id => iolist_to_binary(io_lib:format("sess-~b", [I]))},
@@ -263,6 +291,8 @@ heartbeat_batching_e2e(_Config) ->
     HBs = maps:get(heartbeats, LastBatch, []),
     ct:pal("Batch contained ~b heartbeats", [length(HBs)]),
     ?assert(length(HBs) >= 1),
+
+    lists:foreach(fun(H) -> H ! stop end, Holders),
 
     ct:pal("Heartbeat batching test passed").
 
@@ -410,7 +440,8 @@ connect_agent(AgentId) ->
         session_id => SessionId,
         stream_pid => self(),
         agent_info => maps:get(agent_info, Pending),
-        peer_addr => <<"127.0.0.1">>
+        peer_addr => <<"127.0.0.1">>,
+        conn_key => maps:get(conn_key, Pending)
     },
     {ok, Pid} = yuzu_gw_agent:start_link(Args),
     unlink(Pid),

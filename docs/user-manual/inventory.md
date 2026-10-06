@@ -10,10 +10,36 @@ cadences.
 ## What is collected
 
 - **Machine-wide installed software** (blob contract v2): name, version,
-  publisher, install date, plus the package-manager fields below. Collected by
-  the `installed_apps` plugin via its `list_inventory` action (Windows: `HKLM` +
-  the agent service account's own `HKCU`; Linux: `dpkg`/`rpm`/`pacman`/`apk`;
-  macOS: `system_profiler`). The operator-facing `list` action keeps its
+  publisher, install date, plus the package-manager fields below. The daily
+  sync calls four inventory actions in-process and merges their rows:
+  `installed_apps` `list_inventory` (Windows: `HKLM` + the agent service
+  account's own `HKCU`; Linux: `dpkg`/`rpm`/`pacman`/`apk`; macOS:
+  `system_profiler`), `pkg_inventory` `packages` and `managers` (Homebrew), and
+  `windows_optional_features` `list`. An action whose plugin is not loaded, or
+  that answers "unsupported on this OS", is skipped. A plugin that is not
+  loaded is logged at warn (the rows its action produced are removed on the next
+  report); without `installed_apps` the source stays idle and sends nothing,
+  because it anchors the report.
+  An action that fails (non-zero exit, truncated output, a typed result
+  completeness of `PARTIAL` unless the action opts in, a `constrained` or
+  `unavailable` answer, a malformed status row, no feature rows from
+  `windows_optional_features`, or no applications at all from `installed_apps`)
+  skips that day's report and keeps the last good state — nothing is deleted. A
+  `constrained` Homebrew `managers` answer that still names a present prefix is
+  accepted: the constraint concerns tap/Cellar/Caskroom facts the presence row
+  never carried. A skipped cycle is retried sooner on a phase-aligned backoff:
+  waits that double from 1 h after each consecutive skip (1 h, 2 h, 4 h, 8 h, …),
+  each retry capped so it never lands after the next daily slot — up to four
+  extra attempts — then one attempt per daily slot until a collection succeeds.
+  While it is skipping, the agent publishes the heartbeat tags
+  `yuzu.sync.installed_software.skip_streak` (consecutive skips since the last
+  success, uncapped) and `yuzu.sync.installed_software.last_skip` (the reason
+  token); the heartbeat carries them to the server, but no server page or API
+  returns them yet, so read the reason from the agent's own log. Every row's
+  `source` names the
+  producing action (`installed_apps.list_inventory`, `pkg_inventory.packages`,
+  `pkg_inventory.managers`, `windows_optional_features.list`); `package_id` is
+  empty for these producers. The operator-facing `list` action keeps its
   original four columns (`name`, `version`, `publisher`, `install_date`) in
   the same order and appends two trailing columns, `install_location` and
   `bundle_id` (ADR-0028). A response's raw `output` holds many rows joined by
@@ -47,28 +73,42 @@ cadences.
   empty string, **never synthesised** (no `-` placeholders, no guessed `0`
   epoch). Per-ecosystem availability:
 
-  | Field | rpm | deb | apk | pacman | Windows | macOS apps | macOS pkgutil |
-  |---|---|---|---|---|---|---|---|
-  | `kind` | `package` | `package` | `package` | `package` | `app` | `app` | `pkg` |
-  | `ecosystem` | `rpm` | `deb` | `apk` | `pacman` | `windows` | `macos` | `macos_pkgutil` |
-  | `name` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ (receipt id) |
-  | `version` (upstream, release stripped) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-  | `epoch` | ✓ (empty if none) | ✓ (empty if none) | — | ✓ (empty if none) | — | — | — |
-  | `release` | ✓ | ✓ (empty for native pkgs) | ✓ (pkgrel) | ✓ | — | — | — |
-  | `arch` | ✓ | ✓ | — | — | — | — | — |
-  | `publisher` | PACKAGER | Maintainer | — | — | Publisher | signing leaf CN | — |
-  | `install_date` | ✓ | — | — | — | ✓ | Last Modified | epoch seconds |
-  | `signature_status` | `signed`/`unsigned` (stored header tags) | — | — | — | — | `signed`/`unsigned`; empty = not read | — |
-  | `distro_id` / `distro_version` | ✓ | ✓ | ✓ | ✓ | — | — | — |
+  | Field | rpm | deb | apk | pacman | Windows | macOS apps | macOS pkgutil | Homebrew formula | Homebrew cask | Windows feature |
+  |---|---|---|---|---|---|---|---|---|---|---|
+  | `kind` | `package` | `package` | `package` | `package` | `app` | `app` | `pkg` | `pkg` | `app` | `feat` |
+  | `ecosystem` | `rpm` | `deb` | `apk` | `pacman` | `windows` | `macos` | `macos_pkgutil` | `brew` | `brew` | `optional_feature` |
+  | `name` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ (receipt id) | ✓ | ✓ | ✓ |
+  | `version` (upstream, release stripped) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | DISM state |
+  | `epoch` | ✓ (empty if none) | ✓ (empty if none) | — | ✓ (empty if none) | — | — | — | — | — | — |
+  | `release` | ✓ | ✓ (empty for native pkgs) | ✓ (pkgrel) | ✓ | — | — | — | — | — | — |
+  | `arch` | ✓ | ✓ | — | — | — | — | — | — | — | — |
+  | `publisher` | PACKAGER | Maintainer | — | — | Publisher | signing leaf CN | — | — | — | — |
+  | `install_date` | ✓ | — | — | — | ✓ | Last Modified | epoch seconds | — | — | — |
+  | `signature_status` | `signed`/`unsigned` (stored header tags) | — | — | — | — | `signed`/`unsigned`; empty = not read | — | — | — | — |
+  | `distro_id` / `distro_version` | ✓ | ✓ | ✓ | ✓ | — | — | — | — | — | — |
 
   Notes: rpm `signature_status` reflects the **stored** signature header tags in
   the rpmdb (is a signature recorded), never a live `rpm -K` cryptographic
   verification. `distro_id`/`distro_version` are host-level (`/etc/os-release`
   `ID`/`VERSION_ID`), stamped on every Linux row. deb rows include **held**
-  packages (they are installed). `homebrew` is a reserved `ecosystem` value —
-  not collected yet (per-user Homebrew stores are out of scope; the sync is machine-scope). The
-  `pkg_inventory` plugin reads the machine-scope Homebrew prefix on demand
-  (an instruction result, not a daily-sync source).
+  packages (they are installed). Machine-scope Homebrew
+  is collected through `pkg_inventory` with `ecosystem` `brew`: each formula is
+  `kind` `pkg`, each cask `kind` `app` (`source` `pkg_inventory.packages`), plus
+  one `kind` `app` row named `homebrew` with `source` `pkg_inventory.managers`
+  that records Homebrew itself is present — one row however many prefixes
+  exist (`/opt/homebrew` and `/usr/local` on one Mac collapse to one). Per-user
+  Homebrew stores are out of scope; the sync is machine-scope. Only Homebrew is
+  mapped today; other package managers `pkg_inventory` may report are not
+  collected here.
+
+  **Windows optional features** are collected with `ecosystem`
+  `optional_feature` and `kind` `feat`, every feature the host knows, enabled or
+  not. For these rows `version` carries the DISM feature state verbatim
+  (`enabled`, `disabled`, `pending_enable`, `pending_disable`, `superseded`,
+  `partially_installed`, `unknown`) because a feature has no version of its own;
+  `publisher` is empty. A host with a disabled feature therefore still lists
+  it, so the `/software` catalogue count (grouped by name) counts a host with a
+  DISABLED feature as having it — read `version` to tell them apart.
 
   **macOS `app` rows** carry `publisher` and `signature_status` read natively
   through CoreFoundation + Security.framework (`CFBundleCreate`,
@@ -182,8 +222,8 @@ The data lands in the Postgres schema **`software_inventory_store`**:
   — one row per installed package per device. Every column except `agent_id`,
   `name` and `install_id` may be empty (`''`) per the honest-empty contract above; rows
   synced by a pre-v2 agent carry `''` in all eight v2 columns until that
-  agent's next full resend. Rows from agents that do not yet emit the extended
-  tail carry `''` in `package_id` and `source`; `install_id` (a row id, reassigned
+  agent's next full resend. Rows from agents older than this release
+  carry `''` in `package_id` and `source`; `install_id` (a row id, reassigned
   on each full report) is always populated.
 - `inventory_state(agent_id, source, content_hash, first_seen, last_seen)` — per
   device sync bookkeeping. `first_seen`/`last_seen` are **server receipt times**
@@ -244,7 +284,13 @@ SELECT version FROM public.schema_meta WHERE store = 'software_inventory_store';
 
 Deploy the server before any agent that emits the new fields.
 
-Today it is queried with **direct SQL**, e.g.:
+**Agent upgrade.** An agent that collects the extra actions (`source`,
+Homebrew, optional features) changes its content hash, so its first report after
+the upgrade is a full one. It arrives at the agent's existing phase-spread slot
+(within about 24 h), not all at once, and carries the new rows; hash-skip
+resumes afterwards.
+
+The inventory is queried today with **direct SQL**, e.g.:
 
 ```sql
 -- Which devices have Google Chrome, and what version?
@@ -454,13 +500,13 @@ place, **Hardware** and **Software**, each its own page:
     records that the *result view* was shown to the operator, not whether the
     underlying action itself succeeded) — see [Audit log](audit-log.md).
 
-- **`/software`** — the fleet software catalogue, unchanged in its rollup mechanics: a
-  background thread still precomputes the per-title/per-version counts hourly, the KPI
-  strip still shows Titles / Devices reporting / Stale / an "updated N ago" (or
-  "building") stamp for the catalogue, and the counts are still **fleet-wide, not
-  management-group scoped** — the same ADR-0017 gap the REST/MCP section above
-  describes. Two things changed:
-  - The search box is now a **real server round-trip matching title OR publisher**
+- **`/software`** — the fleet software catalogue. A background thread still precomputes
+  the per-title/per-version counts hourly (the mechanics changed — see "Catalogue rollup
+  grain and KPIs" under the rollup metrics below), the KPI strip still shows Titles /
+  Devices reporting / Stale / an "updated N ago" (or "building") stamp for the catalogue,
+  and the counts are still **fleet-wide, not management-group scoped** — the same ADR-0017
+  gap the REST/MCP section above describes. Three things changed:
+  - The search box is now a **real server round-trip matching title, publisher, ecosystem or source**
     (was client-side and title-only), using the same debounced/narrow-swap-target
     pattern as the Hardware list's search box.
   - Each row grows a **"devices ›"** control that expands inline — independent of the
@@ -476,6 +522,14 @@ place, **Hardware** and **Software**, each its own page:
   sub-nav. Its routes, `/fragments/inventory/find` and `/fragments/inventory/find/results`,
   are still registered for old bookmarks and deep links, but nothing in the UI links to
   them any more — treat them as a legacy escape hatch, not a supported feature.
+
+  - The catalogue store now serves exact numbers under filters: **Installs is the exact
+    number of distinct devices** carrying the title under any kind/ecosystem/source
+    filter combination the store is given (a device carrying one title through two sources
+    counts once), and **search selects titles** — a matched title keeps its whole filtered slice. `%` and `_` in a
+    search term are literal characters, the term is clamped to 128 bytes, and a search that
+    exceeds its 5 s execution bound reports the catalogue as unavailable rather than showing
+    an empty table. The store's version drill now accepts the catalogue filters and a host.
 
 **On store degradation** the **`/software`** catalogue, its **devices ›** expansion, and
 the CI record's **Installed software** lens — the *authoritative* reads — show an
@@ -504,12 +558,39 @@ credentials.)
 ## Troubleshooting
 
 **The `installed_software` table is empty after upgrading agents.** Most likely
-the `installed_apps` plugin isn't loaded — the sync source then idles silently
-(it logs `sync: installed_apps plugin not loaded` only at **debug**). Verify the
+the `installed_apps` plugin isn't loaded — the sync source then idles
+(it logs `sync: installed_apps plugin not loaded` at **warn**, and publishes
+`installed_apps:not_loaded` as its `yuzu.sync.installed_software.last_skip`
+heartbeat tag). Verify the
 agent was built with `-Dbuild_agent=true` (the default for released binaries)
 and that `installed_apps` is present in the agent's `--plugin-dir`. The sync also
 only runs once per ~24 h per agent (spread across the fleet), so a freshly
 enrolled agent populates within minutes (jittered first sync), not instantly.
+
+**One host stopped reporting after upgrading agents; its log shows
+`sync: <plugin>.<action> … — skipping this cycle`.** One of the collected
+actions failed, and a failure skips the WHOLE report for that day — the
+applications too — and keeps the last good inventory (nothing is deleted).
+Typical causes: Windows DISM busy or `api_unavailable` (the
+`windows_optional_features` action answers `feature|unavailable|…`), or a
+constrained Homebrew `packages` read on macOS (a constrained `managers` answer
+with a present prefix no longer skips). The warning names the action and the
+reason. The same reason is published on the agent's heartbeat as
+`yuzu.sync.installed_software.last_skip` (characters outside
+`A-Z a-z 0-9 _ . : = , -` become `_`, and the value is cut at 64 bytes, so a long
+list of constraint tokens is shortened; no server page or API returns the tag
+yet), and
+`yuzu.sync.installed_software.skip_streak` counts consecutive skips (uncapped): an
+online host that is skipping publishes a non-zero streak, an offline host no
+heartbeat at all. The agent retries
+a skipped cycle on the bounded backoff described under *What is collected*, then
+falls back to one attempt per daily slot. A host that keeps skipping is flagged by `yuzu_inventory_stale_agents`
+after two missed daily cycles; fix the failing action, or remove its plugin,
+and the next retry or daily sync recovers. A warning of the form `sync: <plugin>.<action>
+read more than 20000 rows` (or a merged-entry or 3 MiB blob cap) is not an
+action failure: that host reports more software rows than one report can carry,
+so its report is skipped rather than sent truncated; review the host's
+inventory rather than removing a plugin.
 
 **Non-ASCII app names show as `?` after upgrading from a pre-#1662 build.** The
 initial `installed_apps` plugin read the Windows registry with the ANSI `Reg*A`
@@ -633,13 +714,17 @@ The **catalogue rollup** (the `/software` page's precomputed counts, refreshed
 hourly by the background `SoftwareCatalogRollup` thread) emits three further series:
 
 - `yuzu_inventory_catalog_rollup_total{outcome}` (counter, outcome ∈ `success` / `error`)
-  — one per recompute attempt. A rising `error` count with a frozen
-  `…_last_success_timestamp` means recomputes are failing (PG outage / the 60s budget
-  exceeded at scale) and the catalogue is going stale; keep-last-good serves the prior
-  rollup meanwhile.
+  — one per recompute attempt that completes or fails (a shutdown-cancelled attempt is
+  not counted as an error). A rising `error` count with a frozen
+  `…_last_success_timestamp` means recomputes are failing (PG outage, a statement over
+  its 60 s limit, or the 10-minute whole-refresh limit exceeded at scale) and the
+  catalogue is going stale; keep-last-good serves the prior rollup meanwhile, except for
+  the first refresh after the v8 upgrade, which has no last-good and leaves the catalogue
+  "building". The failing statement and its cause are in the server log (warning).
 - `yuzu_inventory_catalog_rollup_duration_seconds` (gauge) — the last recompute's
-  wall-clock. A rising value approaching the 60s budget is the leading indicator to raise
-  the budget (or shard the rollup) before recomputes start timing out. (A gauge, not a
+  whole-refresh wall-clock. Compare it with the two compile-time limits (not flags): 60 s
+  per statement and 600 s for the whole refresh. A value rising towards either is the
+  leading indicator that the fleet is nearing the ceiling below. (A gauge, not a
   histogram: at one sample/hour percentiles add nothing.)
 - `yuzu_inventory_catalog_rollup_last_success_timestamp` (gauge, epoch seconds) — the
   primary liveness signal; it is the source of the Software tab's "updated N ago" stamp.
@@ -647,6 +732,47 @@ hourly by the background `SoftwareCatalogRollup` thread) emits three further ser
   still alertable). Alert on `time() - this > 7200` **guarded by `and this > 0`** — the
   `> 0` guard skips the cold-boot "building" window (epoch 0); the never-succeeded /
   ongoing-failure case is caught by `…_rollup_total{outcome="error"}` instead.
+
+**Catalogue rollup grain and KPIs.** The rollup keeps one precomputed row per title x
+filter grain x distinct dimension combination, where the grain is which of kind, ecosystem
+and source are fixed (eight grains, from "title total" to "one exact combination"); a title
+therefore has between 8 and 8 x C rows (C = its count of distinct kind/ecosystem/source
+combinations), and every read is one exact lookup, never a sum. The refresh runs in one
+`REPEATABLE READ` transaction: one `GROUPING SETS` pass fills every grain (about three sorted
+passes of `installed_software`), one further pass computes the exact per-OS-family split, and
+the fleet-newest version of every title is folded from `version_rollup` through a server-side
+cursor into a transaction-scoped temp table with memory bounded by the batch size, not the
+title count. The refresh keeps the 60 s per-statement limit, gains a 10-minute whole-refresh
+limit (both compile-time), and aborts cleanly (last-good rollup kept) on shutdown.
+Scale ceiling (measured on PostgreSQL 18.6 with synthetic data at about 450 rows per
+endpoint, on one M-series host with a warm cache and 4 MB `work_mem`; read it as plus or
+minus 40%): the `GROUPING SETS` statement costs about 12.8 times the former single
+`GROUP BY` (37 s against 2.9 s at 1.8M installed rows; the whole refresh about 6.5 times)
+and reaches the flat 60 s statement limit at about 2.7M installed rows, roughly 6,000
+endpoints. A fleet already over that size at the v8 upgrade has no last-good rollup, so its
+catalogue stays "building" until the rollup is made incremental; a fleet that outgrows it
+later keeps serving the last-good rollup while its "updated N ago" stamp ages. The server's
+database role needs the `TEMPORARY` privilege (the default `PUBLIC` grant; re-grant it after
+a `REVOKE TEMP` hardening), because the refresh uses a transaction-scoped temporary table;
+without it every refresh fails with a permission-denied error (SQLSTATE 42501) and the
+catalogue stays "building". A rollback to an older binary is clean: its grain-less refresh
+and read treat every row as a title-grain row (each title once). On an upgrade with older
+replicas still running, restart them promptly: the v8 `DROP` queues behind an old replica's
+refresh and dies at the pool's 10 s `lock_timeout` (the new server then refuses to start,
+fail-closed). A mixed old/new window has three transient asymmetries until each side's next
+hourly refresh: an old replica's read lists every grain row the new binary wrote (8 to
+8 x C per title), and after an old replica's refresh the new binary's filtered reads are
+empty (not "building"), and the KPI numbers stay at their last new-binary values under a
+fresh "updated" stamp.
+
+KPI definitions: total installs = distinct (device, title) pairs; the OS split counts each
+(device, title) pair once per OS family derived from the ecosystem; stay-current = distinct devices on each title's exact newest
+version string divided by distinct devices carrying the title, over every title with a known
+version (equivalent spellings such as `1.0` and `1.0.0` are not merged); "newest" is decided
+by the catalogue's own transitive version order, which agrees with the NVD comparator on its
+documented examples; version sprawl = titles on three or more versions; rpm unsigned = the
+unsigned share of rpm installs. After an upgrade the catalogue reads "building" until the
+first refresh completes (the rollup tables are derived data and are rebuilt, never migrated).
 
 Shipped alert rules live in the `yuzu-inventory` group of
 `docs/prometheus/yuzu-alerts.yml`: `YuzuInventorySustainedIngestErrors` (a non-zero

@@ -151,7 +151,7 @@ struct HardenedHarness {
     }
 
     void enroll_mfa(const std::string& name) {
-        auto init = auth_db->mfa_init_enrollment(name, "Yuzu");
+        auto init = auth_db->mfa_init_enrollment(name, "Yuzu", std::nullopt);
         REQUIRE(init.has_value());
         // Complete enrollment with a code at the current counter. These tests
         // stop at the 202 challenge — they never submit a login TOTP — so the
@@ -160,7 +160,7 @@ struct HardenedHarness {
         REQUIRE(bytes.has_value());
         std::string raw(reinterpret_cast<const char*>(bytes->data()), bytes->size());
         auto code = mfa::generate(raw, mfa::current_counter(std::chrono::system_clock::now()));
-        REQUIRE(auth_db->mfa_verify_enrollment(name, code).has_value());
+        REQUIRE(auth_db->mfa_verify_enrollment(name, code, std::nullopt).has_value());
     }
 
     void arm(const std::string& name, int window_secs = 3600) {

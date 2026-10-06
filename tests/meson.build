@@ -222,7 +222,7 @@ endif
 agent_test_openssl_dep = dependency('openssl', required: true, include_type: 'system')
 
 # Test fixtures deliberately partial-aggregate-init wide inventory structs
-# (SwEntry is 12 fields, SoftwareEntry 14 stored members (16 wire slots); a 4-field
+# (SwEntry and SoftwareEntry are 14 members each (16 wire slots); a 4-field
 # init IS the contract — "the rest stays empty"). -Wextra's
 # missing-field-initializers would flag every such fixture; suppress it for
 # the TEST targets only — production code stays fully warned.
@@ -249,6 +249,7 @@ agent_test_exe = executable(
     'unit/test_updater.cpp',
     'unit/test_filesystem_read.cpp',
     'unit/test_filesystem_actions.cpp',
+    'unit/test_filesystem_local_dispatcher.cpp', # #4728: real filesystem plugin via LocalDispatcher -- `replace` through the shared atomic write
     'unit/test_confined_fs_rules.cpp',
     'unit/test_confined_fs_walk.cpp',
     'unit/test_confined_fs_posix.cpp',
@@ -330,6 +331,7 @@ agent_test_exe = executable(
     'unit/test_cert_discovery.cpp',
     'unit/test_env_util.cpp',
     'unit/test_inventory_sync.cpp',
+    'unit/test_inventory_sync_action_table.cpp',
     'unit/test_agent_sync_command.cpp', # round-3 remediation: decide_sync_now pure-core extraction
                                           # from agent.cpp's __sync__.now reserved-command branch
     'unit/test_device_ci_sync.cpp',
@@ -435,6 +437,8 @@ agent_test_exe = executable(
     'unit/test_discovery_scan_plan.cpp',      # Wave 2 WP-C: pure sweep bounds + honest-degrade decisions
     'unit/test_network_config_parsers.cpp',   # PKG-NC: pure /proc/net/arp, dns_cache line filters,
                                                 # rtnetlink + PF_ROUTE default-route binary decoders
+    'unit/test_network_config_routes.cpp',    # Wave 11 PR11.2-a: `routes` row format + rtnetlink/PF_ROUTE
+                                                # full-table decoders (real-capture fixtures)
     'unit/test_network_config_local_dispatcher.cpp', # PKG-NC: real network_config.dylib/.so driven
                                                 # end to end via LocalDispatcher (POSIX-only; a no-op
                                                 # TU on Windows via the file's own #ifndef _WIN32 guard)
@@ -532,12 +536,14 @@ agent_test_exe = executable(
     'unit/test_execution_artifacts_win_local.cpp',  # Wave 7b PR7b.1: Windows leg shape assertions, unguarded TU
     'unit/test_execution_artifacts_scratch_sweep.cpp',  # #4390: portable scratch-dir selection policy (every OS) + Windows handle-relative sweep, init()/dispatch e2e
     'unit/test_execution_artifacts_win_internals.cpp',  # #4392: TU-inclusion seam over execution_artifacts_win.cpp (Windows-only body, empty TU elsewhere)
-    'unit/test_privacy_permissions_parsers.cpp',          # Wave 8 PR8.5: pure state/category/row tests, no OS call (Linux + macOS leg; Windows follows in its own PR's test file)
+    'unit/test_privacy_permissions_parsers.cpp',          # Wave 8 PR8.5: pure state/category/row tests, no OS call (all three legs' OS-free parsers)
     'unit/test_privacy_permissions_local_dispatcher.cpp', # Wave 8 PR8.5: real plugin via LocalDispatcher, unguarded on every OS
     'unit/test_privacy_permissions_macos_internals.cpp',  # TU-inclusion seam over privacy_permissions_macos.cpp, Apple-only body, unguarded TU
+    'unit/test_privacy_permissions_win_internals.cpp',    # TU-inclusion seam over privacy_permissions_win.cpp (Windows-only body, empty TU elsewhere)
     'unit/test_posix_dir_walk.cpp',     # PR #4154 round-8 remediation: shared capped
                                         # directory-walk primitive (agents/shared/posix_dir_walk.hpp)
     'unit/test_wire_utf8.cpp',          # shared strict-UTF-8 scrubber (agents/shared/wire_utf8.hpp), portable
+    'unit/test_wall_clock_step.cpp',    # #4503: shared consecutive-sample wall-vs-monotonic clock-step guard (agents/shared/wall_clock_step.hpp), portable
     'unit/test_printing_parsers.cpp',            # Wave 9 PR9.1b
     'unit/test_printing_local_dispatcher.cpp',   # Wave 9 PR9.1b
     'unit/test_browser_policy_parsers.cpp',         # Wave 10 PR10.2-b: pure policy-row model (every OS) + injected-root Linux JSON walk (POSIX-only bodies)
@@ -545,6 +551,9 @@ agent_test_exe = executable(
     'unit/test_update_source_trust_parsers.cpp',        # Wave 10 PR10.1-d: pure apt/deb822 row parsers, portable
     'unit/test_update_source_trust_linux_parsers.cpp',  # Wave 10 PR10.1-d: injected-root apt walk + rpm-planned tripwire over committed fixture trees (bodies POSIX-only)
     'unit/test_update_source_trust_local_dispatcher.cpp',  # Wave 10 PR10.1-d: real update_source_trust dylib/.so/.dll via LocalDispatcher, unguarded on every OS
+    'unit/test_mgmt_posture_parsers.cpp',           # mgmt_posture: pure sssd/ipa/profiles parsers, plane classifier, row formatters; portable
+    'unit/test_mgmt_posture_legs.cpp',              # mgmt_posture: OS-free posture_linux/posture_macos decision seams over injected fakes; portable
+    'unit/test_mgmt_posture_local_dispatcher.cpp',  # mgmt_posture: real plugin via LocalDispatcher + execute seam, unguarded on every OS
     'unit/test_firmware_posture_parsers.cpp',           # Wave 8 PR8.4: pure SMBIOS/DMI/fwupd/IODeviceTree decoders over REAL CAPTURE fixtures
     'unit/test_firmware_posture_local_dispatcher.cpp',  # Wave 8 PR8.4: real firmware_posture plugin via LocalDispatcher, unguarded on every OS
     'unit/test_platform_security_parsers.cpp',            # Wave 8 PR8.1-a1: pure decoders/classifiers/status over REAL CAPTURE fixtures
@@ -558,7 +567,8 @@ agent_test_exe = executable(
     'unit/test_asset_tags_parsers.cpp',   # #232: pure cap/escape/apply_sync/snapshot helpers (asset_tags_parsers.hpp)
     'unit/test_asset_tags_store.cpp',   # #232: atomic state-file lifecycle (asset_tags_store.hpp), TempDir-based
     'unit/test_asset_tags_actions.cpp',   # #232: real asset_tags dylib/.so/.dll via LocalDispatcher, unguarded on every OS
-    'unit/test_asset_tags_sync_lock.cpp', # #232: TU-inclusion seam over asset_tags_plugin.cpp -- sync writes under g_mu (POSIX body, empty TU on Windows)
+    'unit/test_tags_plugin.cpp',   # #4728: TU-inclusion seam over tags_plugin.cpp -- save_tags() through the shared atomic write
+    'unit/test_asset_tags_sync_lock.cpp', # #232: TU-inclusion seam over asset_tags_plugin.cpp -- sync writes under g_mu (a condition-variable seam, no per-OS body, runs on every OS)
     'unit/test_system_hardening_parsers.cpp',            # Wave 8 PR8.1-b: pure state mappers + errno classifier over REAL CAPTURE fixtures
     'unit/test_system_hardening_win_parsers.cpp',        # Wave 8 PR8.1-b: pure mitigation-registry decoder over the-rig REAL CAPTURE fixtures
     'unit/test_system_hardening_local_dispatcher.cpp',   # Wave 8 PR8.1-b: real system_hardening dylib/.so/.dll via LocalDispatcher, unguarded on every OS
@@ -586,6 +596,7 @@ agent_test_exe = executable(
     include_directories('../agents/plugins/windows_optional_features/src'),  # windows_optional_features_plugin.cpp (Wave 9 PR9.2b)
     include_directories('../agents/plugins/peripherals/src'),  # peripherals_*_parsers.hpp (pure helpers)
     include_directories('../agents/plugins/update_source_trust/src'),  # update_source_trust_*.hpp (Wave 10 PR10.1-d)
+    include_directories('../agents/plugins/mgmt_posture/src'),  # mgmt_posture_parsers.hpp / _legs.hpp
     include_directories('../agents/plugins/firmware_posture/src'),  # firmware_posture_parsers.hpp (pure helpers)
     include_directories('../agents/plugins/platform_security/src'),  # platform_security_*parsers.hpp / _legs.hpp (pure helpers), Wave 8 PR8.1-a1
     include_directories('../agents/plugins/system_hardening/src'),  # system_hardening_*parsers.hpp (pure helpers), Wave 8 PR8.1-b
@@ -622,6 +633,7 @@ agent_test_exe = executable(
     include_directories('../agents/plugins/software_actions/src'), # software_actions_parsers.hpp (Wave 4 PR4.3b pure parser)
     include_directories('../agents/plugins/filesystem_posture/src'), # filesystem_posture_parsers.hpp / _legs.hpp (Wave 6 PR6.1-b pure headers)
     include_directories('../agents/plugins/asset_tags/src'),     # asset_tags_parsers.hpp / asset_tags_store.hpp (#232)
+    include_directories('../agents/plugins/tags/src'),           # tags_plugin.cpp (TU-inclusion, #4728)
   ],
   # agent_platform_args carries -DYUZU_HAVE_LIBSYSTEMD (Linux + libsystemd found)
   # so Linux real-mechanism Service spark tests can compile-gate on it, exactly
@@ -655,6 +667,11 @@ agent_test_exe = executable(
              # CAPTURE tree manifest via this same define.
              '-DYUZU_TEST_FIXTURE_DIR="' +
              (meson.project_source_root() / 'tests' / 'unit' / 'fixtures').replace('\\', '/') +
+             '"',
+             # test_inventory_sync.cpp reads the plugins' REAL CAPTURE samples
+             # (agents/plugins/*/docs/samples/*.txt) at run time via this define.
+             '-DYUZU_PLUGIN_SRC_DIR="' +
+             (meson.project_source_root() / 'agents' / 'plugins').replace('\\', '/') +
              '"'] +
             # /bigobj: test_spark_mechanism.cpp (15k lines) and test_guardian_spark_runtime.cpp
             # hit MSVC's hard C1128 limit (65,279 sections per object) in the nightly
@@ -732,6 +749,7 @@ agent_test_exe = executable(
                 device_identity_plugin_lib,
                 echo_argv_fixture,
                 event_logs_plugin_lib,
+                filesystem_plugin_lib,  # #4728: test_filesystem_local_dispatcher.cpp loads the real filesystem plugin by path
                 filesystem_posture_plugin_lib,
                 hardware_plugin_lib,
                 installed_apps_plugin_lib,
@@ -764,6 +782,7 @@ agent_test_exe = executable(
                 printing_plugin_lib,  # Wave 9 PR9.1b
                 browser_policy_plugin_lib,  # Wave 10 PR10.2-b
                 update_source_trust_plugin_lib,  # Wave 10 PR10.1-d
+                mgmt_posture_plugin_lib,  # management-plane posture
                 firmware_posture_plugin_lib,  # Wave 8 PR8.4
                 browser_inventory_plugin_lib,  # Wave 10 P2a
                 local_security_policy_plugin_lib,  # Wave 8 PR8.3
@@ -840,6 +859,35 @@ if host_machine.system() == 'linux' and get_option('b_sanitize') == 'none'
   )
 endif
 
+# ── Plugin ABI containment under allocation failure (separate binary, deliberately) ──
+# test_plugin_abi_oom_containment.cpp replaces the global operator new/delete and defines the
+# yuzu_ctx_* host entry points itself (the real ones allocate), so it is not a source of
+# yuzu_agent_tests and must be ABSENT from sanitizer builds (they own the allocator). Not
+# built on Windows: plugin.h declares YUZU_EXPORT as dllimport there unless
+# YUZU_AGENT_CORE_BUILDING, so a test exe cannot define yuzu_ctx_* without posing as agent
+# core. Unlike the spark probe it is not Linux-only (header-inline seams, no .so
+# interposition), so macOS runs it too. Same --allow-running-no-tests rationale as above.
+if host_machine.system() != 'windows' and get_option('b_sanitize') == 'none'
+  plugin_abi_oom_exe = executable(
+    'yuzu_plugin_abi_oom_containment_tests',
+    files('unit/test_plugin_abi_oom_containment.cpp'),
+    include_directories: [include_directories('../agents/plugins/browser_policy/src'),
+                          include_directories('../agents/plugins/mgmt_posture/src'),
+                          include_directories('../agents/plugins/update_source_trust/src'),
+                          include_directories('../agents/core/include'),  # yuzu/agent/runner_status.hpp, subprocess_runner.hpp (mgmt_posture_legs.hpp; header-only use)
+                          include_directories('../agents/shared')],
+    cpp_args: test_partial_init_args,
+    dependencies: [yuzu_sdk_dep, nlohmann_dep, catch2_dep],
+  )
+  test(
+    'plugin ABI containment under allocation failure',
+    plugin_abi_oom_exe,
+    args: ['--allow-running-no-tests'],
+    suite: 'agent',
+    timeout: 30,
+  )
+endif
+
 # ── Agent unit tests: 3 tag-partitioned shards (#5073) ───────────────────────
 # The single 'agent unit tests' entry (one Catch2 process, serial) was the
 # Windows suite's longest and had no headroom left: 2026-10-01 case-level sum
@@ -872,8 +920,7 @@ endif
 # without the suffix a carved tag pulls in cases the old single entry never ran.
 # Linux, 2026-10-01: the one `[tsan-heavy]` case (test_guardian_spark_runtime.cpp
 # ~2721, tagged [runtime][liveness], both carved here) would run twice, here and in
-# 'agent tsan-heavy checkpoints'; and the one hidden `[.]` case (same file, ~7194,
-# tagged [runtime][liveness]) would run although it is hidden. On Windows the
+# 'agent tsan-heavy checkpoints'. On Windows the
 # `[.][flaky-4086][guardian][guard]...` case (test_guard_file.cpp ~1110, under
 # #ifdef _WIN32) carries [guard], which shard A carves, so there the suffix is what
 # keeps it out; that Windows leak was reasoned from the tags, NOT observed. The
@@ -898,12 +945,25 @@ endif
 # shards run 3-wide by `meson test`:
 # 29.9 / 30.8 / 32.0s, against 92.6s for the old single-spec run of the same
 # binary. Windows startup cost, and what concurrent shards cost each other under
-# CI's smaller pools, were not measured.
+# CI's smaller pools, were not measured. (All counts and times in this paragraph predate the
+# 2026-10-04 re-balance below.)
 # The carve uses only tags with >=25 cases (hand-pruned from a simulated-annealing
 # fit that used tiny tags and was 1-3% tighter): A is guarded by [ack],[actions],
 # [browser_policy],[drain],[execution_artifacts],[guard],[runtime]; B by [agent],
-# [liveness],[mechanism],[trigger_engine]. Re-balance by moving a tag between the
-# two variables below, never by hand-editing a spec string.
+# [liveness],[mechanism],[trigger_engine] plus the tags the 2026-10-04 re-balance below added.
+# agent_shard_a_tags / agent_shard_b_tags below are authoritative. Re-balance by moving a tag
+# between the two variables, never by hand-editing a spec string.
+#
+# RE-BALANCE 2026-10-04: [log_handoff] and [posix_actions] moved from C to B. Shard C alone was
+# the macOS "Test" step (~100s of case time against ~53s and ~10s for A and B once B's own fixed
+# waits were gone); both tags move whole ([log_handoff] has 29 cases and [posix_actions] 37 on
+# macOS; [posix_actions] has fewer on Windows, where its real-tool cases are not compiled). The
+# before/after case-sums are in the message of commit d19658f2e, not here, because they rot.
+# TO REGENERATE: run yuzu_agent_tests with YUZU_TEST_PROGRESS=1 YUZU_TEST_PROGRESS_FILE=<f>
+# (the `[progress] ... END <case> <ms>` lines, tests/unit/test_progress_listener.cpp; CI
+# uploads meson-logs/progress.log with a RED run's artifact), take each case's tags from
+# `yuzu_agent_tests --list-tests -r xml '~[.]~[tsan-heavy]~[flaky-4086]'`, place it by the
+# partition rule above, and sum per shard. Count is not time: use the sums, not the counts.
 #
 # The real-DISM cases ([actions][windows_optional_features] in
 # test_windows_optional_features_local_dispatcher.cpp ~157-237) stay in ONE shard
@@ -922,7 +982,8 @@ endif
 # fails loudly (the old single entry matched zero cases and exited 2). Measured on
 # build-linux's yuzu_agent_tests at HEAD 79344ceae, 2026-10-01, `<shard spec>
 # '[nonexistent_zzz]' --list-tests --allow-running-no-tests`: A lists 319 cases, B
-# 437, C 0; appending '[spark]' to A still lists all 539 of A's cases (the
+# 437 (B's count and last OR term changed in the 2026-10-04 re-balance; A's did
+# not), C 0; appending '[spark]' to A still lists all 539 of A's cases (the
 # reference set has 704 [spark] cases). So `--test-args '[tag]'` is exact
 # only for shard C. For a targeted run call the binary directly,
 # `build-*/tests/yuzu_agent_tests '[tag]'` (docs/build-guide.md, "Direct binary
@@ -955,7 +1016,7 @@ endif
 # shard spec does not end with it, so edit both together (an edit to only one is caught).
 agent_shard_suffix = '~[.]~[tsan-heavy]~[flaky-4086]'
 agent_shard_a_tags = ['ack', 'actions', 'browser_policy', 'drain', 'execution_artifacts', 'guard', 'runtime']
-agent_shard_b_tags = ['agent', 'liveness', 'mechanism', 'trigger_engine']
+agent_shard_b_tags = ['agent', 'liveness', 'mechanism', 'trigger_engine', 'log_handoff', 'posix_actions']
 _agent_a_terms = []
 _agent_a_excl = ''
 foreach t : agent_shard_a_tags
@@ -1260,6 +1321,7 @@ if build_server
       'unit/server/test_auth_lockout.cpp',
       'unit/server/test_auth_break_glass.cpp',
       'unit/server/test_auth_db_pg.cpp',
+      'unit/server/test_auth_password.cpp',   # #5342/#5274: AuthManager password change/reset + DB-first credential read
       'unit/server/test_auto_approve.cpp',
       'unit/server/test_cidr_match.cpp',
       'unit/server/test_runtime_config_secret_redaction.cpp',
@@ -1297,6 +1359,7 @@ if build_server
       'unit/server/test_tag_routes.cpp', # #2542 PR-11: the 4-route Tags API, extracted onto the HttpRouteSink seam
       'unit/server/test_scope_engine.cpp',
       'unit/server/test_web_utils.cpp',
+      'unit/server/test_secret_file.cpp', # #5272 --postgres-dsn-file / --oidc-client-secret-file
       'unit/server/test_mcp_body_cap.cpp',
       'unit/server/test_dispatch_target_shape.cpp',
       'unit/server/test_sensitive_instruction_params.cpp',
@@ -1415,6 +1478,7 @@ if build_server
       'unit/server/test_quarantine_dispatch_decision.cpp', # #3127: pure write/response classification — no Postgres, no MCP transport, no agent
       'unit/server/test_quarantine_dispatch_gate.cpp',     # #881: containment gate at the dispatch chokepoint — pure arm/degradation logic, no store
       'unit/server/test_plugin_presence_dispatch_gate.cpp', # #3424/#3511: plugin-presence filter at the dispatch chokepoint — mirrors test_quarantine_dispatch_gate.cpp
+      'unit/server/test_os_kill_switch_dispatch_gate.cpp', # #5294: per-OS kill-switch filter at the dispatch chokepoint — mirrors test_plugin_presence_dispatch_gate.cpp
       'unit/server/test_quarantine_reapply.cpp',           # #3425: shared stored-containment re-dispatch recipe (Layer A) — pure, no store
       'unit/server/test_quarantine_containment_reconciler.cpp', # #3425: reconnect re-application state machine — real store/registry, mock dispatch
       'unit/server/test_result_set_store.cpp',
@@ -1548,6 +1612,7 @@ if build_server
       'unit/server/test_rest_devices.cpp',   # #4033 (#2146 Batch A): GET /api/v1/devices[/{id}] + agent-count-preview
       'unit/server/test_group_agent_count_preview.cpp',   # #4033: pure shared create-group-preview model
       'unit/server/test_rest_sessions.cpp',
+      'unit/server/test_rest_password_routes.cpp',   # #5342: POST /api/v1/users/me/password + /users/{name}/password
       'unit/server/test_rest_guaranteed_state.cpp',
       'unit/server/test_deployment_store.cpp', # ADR-0043: deployment_jobs Postgres migration
       'unit/server/test_discovery_routes.cpp', # A2 discovery surface (Issue 17.1)
@@ -1605,6 +1670,7 @@ if build_server
       'unit/server/test_agent_registry_presence.cpp',
       'unit/server/test_secret_codec.cpp',
       'unit/server/test_software_inventory_store.cpp',
+      'unit/server/test_software_catalog_rules.cpp',
       'unit/server/test_vuln_finding_store.cpp',
       'unit/server/test_vuln_finding_store_adversarial.cpp',
       'unit/server/test_product_normalize.cpp',
@@ -2401,11 +2467,19 @@ if build_server
   # reuse this shard's shared exclusion suffix EXCEPT `~[dex]` — every one
   # of these 28 cases carries the [dex] tag, so keeping that exclusion would
   # match zero of them.
+  #
+  # 2026-10-04 (#5342 Gate 7 fix round, E10): one clause added — `[pg][password]`
+  # (the local-password change/reset suites: test_auth_password.cpp,
+  # test_rest_password_routes.cpp, test_auth_db_pg.cpp's set_password cases),
+  # moved off the comma-free complement shard C (888 cases on this branch, the
+  # heaviest Windows shard) onto this light one. Same shared exclusion suffix,
+  # so the [password] cases already homed elsewhere (e.g. the [audit]-tagged
+  # rollback cases in shard J) stay there; shard C gains `~[password]`.
   test('server pg unit tests shard L', server_test_exe,
-       args: ['[pg][approval_manager]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[dex]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar]~[policy_store]~[instruction_store]~[ca_store]~[device_token]~[tag_store]~[bundle]~[pki]~[offload_store]~[webhook_store]~[baseline_store],[pg][execution_tracker]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[dex]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar]~[policy_store]~[instruction_store]~[ca_store]~[device_token]~[tag_store]~[bundle]~[pki]~[offload_store]~[webhook_store]~[baseline_store],[pg][execution_statistics]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[dex]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar]~[policy_store]~[instruction_store]~[ca_store]~[device_token]~[tag_store]~[bundle]~[pki]~[offload_store]~[webhook_store]~[baseline_store],[pg][schedule_engine]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[dex]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar]~[policy_store]~[instruction_store]~[ca_store]~[device_token]~[tag_store]~[bundle]~[pki]~[offload_store]~[webhook_store]~[baseline_store],[pg][schedule]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[dex]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar]~[policy_store]~[instruction_store]~[ca_store]~[device_token]~[tag_store]~[bundle]~[pki]~[offload_store]~[webhook_store]~[baseline_store],[pg][events]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[dex]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar]~[policy_store]~[instruction_store]~[ca_store]~[device_token]~[tag_store]~[bundle]~[pki]~[offload_store]~[webhook_store]~[baseline_store],[pg][rest_api_t2]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[dex]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar]~[policy_store]~[instruction_store]~[ca_store]~[device_token]~[tag_store]~[bundle]~[pki]~[offload_store]~[webhook_store]~[baseline_store],[pg][golden]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar]~[policy_store]~[instruction_store]~[ca_store]~[device_token]~[tag_store]~[bundle]~[pki]~[offload_store]~[webhook_store]~[baseline_store],[pg][catalogue]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar]~[policy_store]~[instruction_store]~[ca_store]~[device_token]~[tag_store]~[bundle]~[pki]~[offload_store]~[webhook_store]~[baseline_store]'],
+       args: ['[pg][approval_manager]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[dex]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar]~[policy_store]~[instruction_store]~[ca_store]~[device_token]~[tag_store]~[bundle]~[pki]~[offload_store]~[webhook_store]~[baseline_store],[pg][execution_tracker]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[dex]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar]~[policy_store]~[instruction_store]~[ca_store]~[device_token]~[tag_store]~[bundle]~[pki]~[offload_store]~[webhook_store]~[baseline_store],[pg][execution_statistics]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[dex]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar]~[policy_store]~[instruction_store]~[ca_store]~[device_token]~[tag_store]~[bundle]~[pki]~[offload_store]~[webhook_store]~[baseline_store],[pg][schedule_engine]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[dex]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar]~[policy_store]~[instruction_store]~[ca_store]~[device_token]~[tag_store]~[bundle]~[pki]~[offload_store]~[webhook_store]~[baseline_store],[pg][schedule]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[dex]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar]~[policy_store]~[instruction_store]~[ca_store]~[device_token]~[tag_store]~[bundle]~[pki]~[offload_store]~[webhook_store]~[baseline_store],[pg][events]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[dex]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar]~[policy_store]~[instruction_store]~[ca_store]~[device_token]~[tag_store]~[bundle]~[pki]~[offload_store]~[webhook_store]~[baseline_store],[pg][rest_api_t2]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[dex]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar]~[policy_store]~[instruction_store]~[ca_store]~[device_token]~[tag_store]~[bundle]~[pki]~[offload_store]~[webhook_store]~[baseline_store],[pg][golden]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar]~[policy_store]~[instruction_store]~[ca_store]~[device_token]~[tag_store]~[bundle]~[pki]~[offload_store]~[webhook_store]~[baseline_store],[pg][catalogue]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar]~[policy_store]~[instruction_store]~[ca_store]~[device_token]~[tag_store]~[bundle]~[pki]~[offload_store]~[webhook_store]~[baseline_store],[pg][password]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[dex]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar]~[policy_store]~[instruction_store]~[ca_store]~[device_token]~[tag_store]~[bundle]~[pki]~[offload_store]~[webhook_store]~[baseline_store]'],
        suite: ['server', 'server-pg'], timeout: 700, priority: 92)
   test('server pg unit tests shard C', server_test_exe,
-       args: ['[pg]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[dex]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar]~[policy_store]~[instruction_store]~[ca_store]~[device_token]~[tag_store]~[bundle]~[pki]~[offload_store]~[webhook_store]~[baseline_store]~[approval_manager]~[execution_tracker]~[execution_statistics]~[schedule_engine]~[schedule]~[events]~[rest_api_t2]'],
+       args: ['[pg]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[dex]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar]~[policy_store]~[instruction_store]~[ca_store]~[device_token]~[tag_store]~[bundle]~[pki]~[offload_store]~[webhook_store]~[baseline_store]~[approval_manager]~[execution_tracker]~[execution_statistics]~[schedule_engine]~[schedule]~[events]~[rest_api_t2]~[password]'],
        suite: ['server', 'server-pg'], timeout: 700, priority: 100)
 
   # #3443 Phase 2: PG portability smoke subset - runs INSTEAD of the 11 shards
@@ -2638,6 +2712,16 @@ test('agent installer trust-anchor ACL lint',
   timeout: 30,
 )
 
+# Compose certs volume (#5370): every tracked compose that keeps Postgres on a
+# volume must also keep the server's /etc/yuzu/certs (CA + the secrets KEK,
+# registered in Postgres) on a named volume. Stdlib only, no Docker.
+test('compose certs volume',
+  _python3_test,
+  args: [files('test_compose_certs_volume.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
 # ── Repo hygiene tests ─────────────────────────────────────────────────────
 # Changelog promote --append (#5221): folds post-promotion hotfix fragments
 # into an already-promoted release section. Stdlib only.
@@ -2664,6 +2748,15 @@ test('capability catalogue completeness',
   timeout: 30,
 )
 
+# Wave 11 PR11.2-a: the network_config `routes` instruction definition exists and matches the
+# row the plugin emits (id, dispatch pair, approval mode, platforms, ordered columns). Hermetic.
+test('network_config routes definition',
+  _python3_test,
+  args: [files('test_network_config_routes_definition.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
 # #1398 data-gate: every capability-catalogue row's authored ExecuteGate
 # matches the strictest approval.mode any shipped InstructionDefinition
 # declares for that plugin.action pair, and a content-declared pair with no
@@ -2674,6 +2767,27 @@ test('capability gate consistency',
   args: [files('test_capability_gate_consistency.py')],
   suite: 'docs',
   timeout: 30,
+)
+
+# #5328: the installed-software kind/ecosystem vocabulary the agents emit is a subset of
+# what MCP, OpenAPI and the manual publish, and the CPE Lane-3 predicate covers it.
+# Hermetic — parses sources, builds nothing.
+test('installed-software vocabulary consistency',
+  _python3_test,
+  args: [files('test_software_vocabulary_consistency.py')],
+  suite: 'docs',
+  timeout: 10,
+)
+
+# server/core/scripts/embed_content.py must not rewrite an unchanged
+# bundled_content.cpp: the custom_target is build_always_stale, so a rewrite
+# would recompile and relink the server on every ninja run. Runs the real
+# generator against content/ into a temp dir; ~8 s, hence the wider timeout.
+test('embed_content idempotent',
+  _python3_test,
+  args: [files('test_embed_content_idempotent.py')],
+  suite: 'docs',
+  timeout: 60,
 )
 
 # The /test --instructions gate broadcasts every default-risk definition; the server refuses a
@@ -2726,6 +2840,26 @@ test('browser_policy definition columns',
 test('update_source_trust definition columns',
   _python3_test,
   args: [files('test_update_source_trust_definition.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
+# mgmt_posture's definition-column contract (content/definitions/mgmt_posture.yaml): row_kind must be
+# the first result column and the generic field_1..field_N sequence is pinned to the wire rows
+# mgmt_posture_parsers.hpp emits (the test holds the expected literals; it does not read the C++).
+test('mgmt_posture definition columns',
+  _python3_test,
+  args: [files('test_mgmt_posture_definition.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
+# update_source_trust's failure-token contract (#4874): every `note_failure` literal and every
+# errno_detail token in the plugin headers is named in the README's Result status row and gloss
+# table, and nothing in those tables is undefined in the source.
+test('update_source_trust failure tokens',
+  _python3_test,
+  args: [files('test_update_source_trust_tokens.py')],
   suite: 'docs',
   timeout: 30,
 )
@@ -2790,6 +2924,17 @@ test('prometheus alert rules',
 test('prometheus harness selftest',
   _python3_test,
   args: [files('prometheus/run_promtool_tests.py'), '--selftest'],
+  suite: 'docs',
+  timeout: 30,
+)
+
+# #4800: pins scripts/test_gateway.py's zero-executed guard, the ct --dir that
+# points at apps/yuzu_gw/test/ct, and each gateway suite's wrapper deadline
+# sitting below its meson timeout. Hermetic (parses sources, runs no
+# rebar3), so it runs on every leg, including ones without Erlang.
+test('gateway wrapper guard selftest',
+  _python3_test,
+  args: [files('test_gateway_test_summary.py')],
   suite: 'docs',
   timeout: 30,
 )
@@ -2860,21 +3005,14 @@ test('flake-retry selftest',
 # PR1.2 (ADR-3002 Decision-10a): pure-logic selftest of the lexical spawn gate —
 # a seeded raw-spawn fixture must fail and the sanctioned-runner allowlist case
 # must pass. Wired here so the gate's own matcher is enforced on every platform
-# with bash, mirroring the flake-retry selftest above. Guarded so Windows (no
-# bash) skips cleanly rather than erroring at configure.
+# with bash, mirroring the flake-retry selftest above. The Windows test job's default
+# shell is MSYS2 bash (set in ci.yml), so its Test step runs these bash tests there;
+# `required: false` only lets a bash-less developer host configure cleanly.
 _bash_test = find_program('bash', required: false)
 if _bash_test.found()
   test('plugin-spawn lexical gate selftest',
     _bash_test,
     args: [files('../scripts/ci/check-plugin-spawn-lexical.sh'), '--selftest'],
-    suite: 'docs',
-    timeout: 60,
-  )
-  # docs/plugin-readme-standard.md rule 7 — the README touch rule's own
-  # fixture run (a fake `git` on PATH; no repository, no network).
-  test('plugin readme touch-rule selftest',
-    _bash_test,
-    args: [files('../scripts/ci/check-plugin-readme-touch.sh'), '--selftest'],
     suite: 'docs',
     timeout: 60,
   )
@@ -2887,6 +3025,31 @@ if _bash_test.found()
     suite: 'docs',
     timeout: 120,
   )
+  # Registered off Windows only (#5428): both fork hundreds of subshells (about
+  # 1-3 s on macOS/Linux, 28-98 s under MSYS2 on the shared 4-runner Windows box)
+  # and exercise scripts that never run on Windows -- start-UAT.sh is the
+  # macOS/Linux rig (Windows uses scripts/win-start-UAT.sh) and the README
+  # touch rule runs on hosted Ubuntu (docs-lint.yml).
+  if host_machine.system() != 'windows'
+    # docs/plugin-readme-standard.md rule 7 — the README touch rule's own
+    # fixture run (a fake `git` on PATH; no repository, no network).
+    test('plugin readme touch-rule selftest',
+      _bash_test,
+      args: [files('../scripts/ci/check-plugin-readme-touch.sh'), '--selftest'],
+      suite: 'docs',
+      timeout: 60,
+    )
+    # #5333: start-UAT.sh kill_stale signals only PIDs it recorded and refuses on
+    # foreign port holders. Sources the script with kill/ps/pgrep/lsof/docker
+    # replaced by functions; spawns and signals nothing. The decoy command line
+    # contains yuzu-agent, as the `meson compile` the old pgrep -f killed did.
+    test('start-UAT.sh kill_stale scoping (#5333)',
+      _bash_test,
+      args: [files('shell/test_start_uat_kill_stale.sh')],
+      suite: 'docs',
+      timeout: 60,
+    )
+  endif
 endif
 
 # QE-INFO / build-ci B3: tests/shell/test_capability_matrix_gate.sh (PR1.1
@@ -2932,34 +3095,29 @@ if _bash_test.found() and meson.can_run_host_binaries() and build_agent
   )
 endif
 
-# #4666 PR-2 W3a: static lexical gate over main.cpp's log-handoff wiring call sites (the
-# four textual invariants agent_log_wiring.hpp's/log_handoff.hpp's own header banners
-# describe -- see the script's own header). No build required, so gated only on bash
-# being present, same as the other lexical selftests above.
-if _bash_test.found()
-  test('log handoff wiring lexical gate (#4666 PR-2 W3a)',
-    _bash_test,
-    args: [files('shell/test_log_handoff_wiring_lexical.sh')],
-    suite: 'agent',
-    timeout: 60,
-  )
-endif
+# #4666 PR-2 W3a: static lexical gate over main.cpp's and service_win.cpp's log-handoff
+# wiring call sites (see the script's own header). No build required. Python, not bash:
+# one process on every OS instead of a grep/head/tail pipeline per check (#5428). Never
+# raise the budget -- port, split or host-gate instead.
+test('log handoff wiring lexical gate (#4666 PR-2 W3a)',
+  _python3_test,
+  args: [files('test_log_handoff_wiring_lexical.py')],
+  suite: 'agent',
+  timeout: 30,
+)
 
 # #2182: static lexical gate pinning that agent.cpp still CALLS the tested OtaUpdateThread /
 # CtxSlot stop_seen() primitives (no AgentImpl seam exists to test that, #1492) and keeps the
-# flag-then-cancel_ctx() teardown order. Carries its own negative-control self-test. No build
-# required, gated only on bash like the log-handoff gate above.
-if _bash_test.found()
-  test('agent OTA/ctx-slot wiring lexical gate (#2182)',
-    _bash_test,
-    args: [files('shell/test_agent_ota_wiring_lexical.sh')],
-    suite: 'agent',
-    # 90 s (was 60): this script spawns perl/grep per mutation and per invariant, so it is
-    # slow on Windows (17 s on a quiet MSVC box vs 1.4 s on Linux, 2026-10-02) and timed out
-    # at 60.23 s on a busy Windows CI leg (PR #5267) while running beside the agent shards.
-    timeout: 90,
-  )
-endif
+# flag-then-cancel_ctx() teardown order. Carries its own in-memory mutation self-test. No build
+# required. Python, not bash: one process (well under a second on every OS) instead of ~500-750 grep/tr/perl/cmp
+# forks that timed out at 90 s on the Windows CI leg (#5428). Never raise the budget -- port,
+# split or host-gate instead.
+test('agent OTA/ctx-slot wiring lexical gate (#2182)',
+  _python3_test,
+  args: [files('test_agent_ota_wiring_lexical.py')],
+  suite: 'agent',
+  timeout: 30,
+)
 
 # #4666 PR-2 W3a MI-2: report-only symbol-binding probe over the built exe/core-lib/
 # agent_actions plugin (see the script's own header for what it does and does not prove).
@@ -3107,15 +3265,14 @@ test('spark evidence format lockstep (#4665)',
 # #5047: static lexical gate over server.cpp's two TierPolicyFn wiring sites -- both
 # must call AuthRoutes::gateless_tier_policy_fn(), never a re-inlined local lambda (see
 # the script's own header for the clause-5 rationale). No build required, same class as
-# the RBAC cross-schema query-owner seam check above.
-if _bash_test.found()
-  test('tier policy wiring lexical gate (#5047)',
-    _bash_test,
-    args: [files('shell/test_tier_policy_wiring_lexical.sh')],
-    suite: 'docs',
-    timeout: 30,
-  )
-endif
+# the RBAC cross-schema query-owner seam check above. Python, one process (#5428).
+# Never raise the budget -- port, split or host-gate instead.
+test('tier policy wiring lexical gate (#5047)',
+  _python3_test,
+  args: [files('test_tier_policy_wiring_lexical.py')],
+  suite: 'docs',
+  timeout: 30,
+)
 
 # #4665 regression net: a position-aware lexical scanner over the Guardian/Spark
 # subsystem (agents/core/src + server/core/src + common/include, filtered to the
@@ -3143,11 +3300,13 @@ test('ci telemetry selftest',
 # Windows SDK is selected at four independent boundaries: native MSYS2,
 # runner provisioning/manifest, GHA environment activation, and documentation.
 # Keep them exact and keep the GHA action itself visible to Dependabot.
+# Budget: 4-5 s on a clean Windows runner, 7-8 s when other jobs share the box;
+# the old 10 s limit tripped (#4164, #4171).
 test('windows sdk contract',
   _python3_test,
   args: [files('test_windows_sdk_contract.py')],
   suite: 'docs',
-  timeout: 10,
+  timeout: 30,
 )
 
 # The nightly TSan gdb capture's pure-logic selftest (#1038): junit -> failing

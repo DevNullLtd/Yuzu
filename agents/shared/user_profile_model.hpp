@@ -253,6 +253,8 @@ enum class HiveAccessStatus {
                        // could not both be enabled
     mount_failed,      // an offline mount was attempted (privileges ok) and
                        // RegLoadKeyW (or the subsequent root open) failed
+    file_refused,      // the caller's OfflineHiveFileCheck refused the hive file
+                       // (before the load, or after it -- then unloaded unread)
 };
 
 /// Outcome of resolving one value inside a reached user hive. Folds the
@@ -324,6 +326,9 @@ enum class UserKeyStatus {
         break;
     case HiveAccessStatus::mount_failed:
         out.push_back(std::format("error|failed to load hive for sid '{}'", safe_sid));
+        break;
+    case HiveAccessStatus::file_refused:
+        out.push_back(std::format("error|hive file refused for sid '{}'", safe_sid));
         break;
     case HiveAccessStatus::ok:
         break;

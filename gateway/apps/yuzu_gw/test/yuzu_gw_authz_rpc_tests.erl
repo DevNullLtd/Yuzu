@@ -49,10 +49,10 @@ rpc_test_() ->
                   fun() -> certless_mgmt_blocked(State) end},
                  {"certless peer completes RPCs on the agent-listener posture",
                   fun() -> certless_agent_listener_ok(State) end}];
-            _ ->
-                %% openssl unavailable — same skip posture as the sibling
-                %% suites that mint real certs.
-                []
+            {error, Why} ->
+                %% openssl unavailable: no tests, announced, or a failing
+                %% test when YUZU_REQUIRE_TLS_TESTS=1.
+                yuzu_gw_authz_tests:certs_unavailable("yuzu_gw_authz_rpc_tests", Why)
         end
      end}.
 

@@ -861,6 +861,7 @@ Every plugin and action at a glance. Use Part 1 walkthroughs for detailed exampl
 | `device.network_config.dns_servers` | dns_servers | Q | WLM | *(none)* | adapter:string, server:string, type:string |
 | `device.network_config.proxy` | proxy | Q | WLM | *(none)* | proxy_type:string, proxy_address:string, bypass:string |
 | `device.network_config.dns_cache` | dns_cache | Q | WLM | *(none)* | name:string, record_type:string, ttl:int32 |
+| `device.network_config.routes` | routes | Q | WLM | *(none)* | family:string, destination:string, prefix_len:int32, gateway:string, interface:string, metric:string, table:string, route_type:string, origin:string |
 | `device.network.netstat_list` | netstat | Q | WLM | *(none)* | proto:string, local_addr:string, local_port:int32, remote_addr:string, remote_port:int32, state:string, pid:int32 |
 | `device.network_diag.listening` | listening | Q | WLM | *(none)* | proto:string, local_addr:string, local_port:int32, pid:int32 |
 | `device.network_diag.connections` | connections | Q | WLM | *(none)* | proto:string, local_addr:string, remote_addr:string, remote_port:int32, pid:int32 |

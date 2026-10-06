@@ -263,6 +263,8 @@ content_embed = custom_target(
     '@OUTPUT@',
   ],
   build_always_stale: true,  # always re-scan content/ for edits
+  # embed_content.py skips the write when bytes are unchanged, so always-stale does not
+  # relink; guarded by tests/test_embed_content_idempotent.py.
 )
 
 # Build-time embed of the curated CPE map (PR 3, ADR-0018). Lives under
@@ -404,6 +406,8 @@ yuzu_server_core_lib = static_library(
     'src/bundle_service.cpp',
     'src/bundle_orchestrator.cpp',
     'src/audit_store.cpp',
+    'src/credential_change_owner.cpp', # #5342: ADR-0012 §3 query owner — one-transaction
+                                       # local credential change (auth + session_store + audit_store)
     'src/tag_store.cpp',
     'src/tag_routes.cpp',
     'src/scope_engine.cpp',

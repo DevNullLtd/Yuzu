@@ -235,7 +235,7 @@ constexpr std::string_view kSelfDemoteToast =
 constexpr std::string_view kDuplicateUsernameToast =
     R"({"showToast":{"message":"Username already exists","level":"error"}})";
 constexpr std::string_view kShortPasswordToast =
-    R"({"showToast":{"message":"Password must be at least 12 characters","level":"error"}})";
+    R"({"showToast":{"message":"Password must be at least 12 bytes","level":"error"}})";
 
 } // namespace
 
@@ -458,16 +458,19 @@ TEST_CASE("SettingsRoutes POST /api/settings/users: role parameter ignored on cr
     CHECK(h.has_audit("user.create", "success", "User", "newadmin"));
 }
 
-TEST_CASE("SettingsRoutes POST /api/settings/users: admin self-password-change allowed",
+TEST_CASE("SettingsRoutes POST /api/settings/users: re-posting your own username is a 409 "
+          "and never a password change",
           "[settings][users]") {
     SettingsRoutesHarness h;
     h.session_user = "admin";
     h.session_role = auth::Role::admin;
 
-    // Self-password-change via the POST create endpoint is now a duplicate
-    // username rejection (C1 fix: creation always uses 'user' role, duplicates blocked).
-    // Self-password-change should use a dedicated endpoint in future.
-    // For now, creating with an existing username returns 409.
+    // The create endpoint can NEVER change a password — an existing username
+    // (here the caller's own) is a duplicate-username 409 (C1 fix: creation
+    // always uses 'user' role, duplicates blocked; AuthDB::upsert_user is
+    // INSERT-only). Changing your own password is POST
+    // /api/v1/users/me/password (#5342, test_rest_password_routes.cpp), which
+    // demands the current password.
     auto res = h.Post("/api/settings/users",
                         "username=admin&password=anotherpass12&role=admin",
                         "application/x-www-form-urlencoded");
@@ -712,7 +715,7 @@ TEST_CASE("SettingsRoutes /fragments/settings/users: add-user form carries minle
     REQUIRE(res);
     REQUIRE(res->status == 200);
     CHECK(res->body.find("minlength=\"12\"") != std::string::npos);
-    CHECK(res->body.find("min 12 chars") != std::string::npos);
+    CHECK(res->body.find("(12-1024 bytes)") != std::string::npos);
 }
 
 // ── Self-deletion guard — UI side (#403) ─────────────────────────────────────
@@ -970,4 +973,97 @@ TEST_CASE("SettingsRoutes DELETE /api/settings/users: revokes a SCIM-linked OIDC
             found_success = true;
     }
     CHECK(found_success);
+}
+
+// ── #5342 password buttons + CSP (no hx-on) ─────────────────────────────────
+//
+// Own LOCAL row → "Change password" (data-pw-action="self"); every other LOCAL
+// row → "Reset password" (data-pw-action="reset"); SSO and SCIM rows → no
+// password control at all. The fragment must never carry an `hx-on`
+// attribute: htmx compiles hx-on:* with new Function(), which the dashboard
+// CSP (no 'unsafe-eval') blocks at runtime, so the handler silently does
+// nothing (CLAUDE.md "No htmx hx-on").
+
+namespace {
+std::size_t count_of(const std::string& hay, std::string_view needle) {
+    std::size_t n = 0;
+    for (auto pos = hay.find(needle); pos != std::string::npos;
+         pos = hay.find(needle, pos + needle.size()))
+        ++n;
+    return n;
+}
+} // namespace
+
+TEST_CASE("SettingsRoutes GET /fragments/settings/users: password buttons on local rows only, "
+          "no hx-on",
+          "[settings][users][ui][password]") {
+    SettingsRoutesHarness h;
+    h.session_user = "admin";
+    h.session_role = auth::Role::admin;
+    REQUIRE(h.auth_mgr.upsert_user("carol", "carolpassword1", auth::Role::user));
+
+    auto res = h.Get("/fragments/settings/users");
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    const auto& body = res->body;
+
+    // Exactly one self form, on the caller's own row; one reset form per
+    // other local account.
+    CHECK(count_of(body, "data-pw-action=\"self\"") == 1);
+    CHECK(body.find("data-pw-action=\"self\" data-username=\"admin\"") != std::string::npos);
+    CHECK(count_of(body, "data-pw-action=\"reset\"") == 2);
+    CHECK(body.find("data-pw-action=\"reset\" data-username=\"bob\"") != std::string::npos);
+    CHECK(body.find("data-pw-action=\"reset\" data-username=\"carol\"") != std::string::npos);
+    CHECK(body.find("data-pw-action=\"reset\" data-username=\"admin\"") == std::string::npos);
+    CHECK(count_of(body, ">Change password</button>") == 2); // toggle + submit
+    CHECK(count_of(body, ">Reset password</button>") == 4);  // 2 x (toggle + submit)
+    // Only the self form asks for the current password.
+    CHECK(count_of(body, "name=\"current_password\"") == 1);
+    CHECK(count_of(body, "name=\"confirm_password\"") == 3);
+    // The forms are hidden until toggled and carry the policy bounds.
+    CHECK(count_of(body, "class=\"pw-form-row\"") == 3);
+    // self: current+new+confirm; 2 x reset: new+confirm; + the add-user form's password.
+    CHECK(count_of(body, "maxlength=\"1024\"") == 8);
+    // No CSP-blocked inline htmx handlers anywhere in the fragment —
+    // including the "Sign out everywhere" button, which used one before.
+    CHECK(body.find("hx-on") == std::string::npos);
+    CHECK(body.find("data-signout-everywhere") != std::string::npos);
+    CHECK(body.find("hx-delete=\"/api/v1/sessions/me\" hx-swap=\"none\"") != std::string::npos);
+}
+
+TEST_CASE("SettingsRoutes GET /fragments/settings/users: no password controls on SSO or SCIM rows",
+          "[pg][settings][users][ui][password]") {
+    SettingsAdr2001Harness h;
+    const std::string principal = "oidc:https://idp.example#sub-77";
+    REQUIRE(h.auth_db->upsert_sso_identity(principal, "https://idp.example", "sub-77", "Ola", "oidc")
+                .has_value());
+    REQUIRE(h.auth_mgr.upsert_user("scimmy", "scimpassword12", auth::Role::user));
+    REQUIRE(h.auth_db->set_identity_source("scimmy", "scim").has_value());
+    REQUIRE(h.auth_db->set_provisioning_source("scimmy", "scim").has_value());
+
+    SECTION("local admin viewing") {
+        auto res = h.sink.Get("/fragments/settings/users");
+        REQUIRE(res);
+        REQUIRE(res->status == 200);
+        const auto& body = res->body;
+        CHECK(body.find("data-pw-action=\"self\" data-username=\"admin\"") != std::string::npos);
+        CHECK(body.find("data-pw-action=\"reset\" data-username=\"bob\"") != std::string::npos);
+        CHECK(body.find("data-username=\"scimmy\"") == std::string::npos);
+        CHECK(body.find("data-username=\"oidc:") == std::string::npos);
+        CHECK(count_of(body, "data-pw-action=") == 2);
+        CHECK(body.find("hx-on") == std::string::npos);
+    }
+    SECTION("an SSO admin viewing has no self form (409 not_local on the route)") {
+        h.session_user = principal;
+        auto res = h.sink.Get("/fragments/settings/users");
+        REQUIRE(res);
+        REQUIRE(res->status == 200);
+        const auto& body = res->body;
+        CHECK(body.find("data-pw-action=\"self\"") == std::string::npos);
+        // Both local accounts are "other" rows for this caller.
+        CHECK(body.find("data-pw-action=\"reset\" data-username=\"admin\"") != std::string::npos);
+        CHECK(body.find("data-pw-action=\"reset\" data-username=\"bob\"") != std::string::npos);
+        CHECK(count_of(body, "data-pw-action=") == 2);
+        CHECK(body.find("hx-on") == std::string::npos);
+    }
 }

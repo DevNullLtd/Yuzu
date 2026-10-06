@@ -69,7 +69,9 @@ When it is up:
 
 The launcher does a **clean start by default** (`down -v` then `up`) so every
 run yields an identical fleet of exactly N agents. Pass `--keep` to preserve
-state across restarts.
+state across restarts. The state `--keep` preserves includes the server's CA
+and secrets key on the `server-certs` volume, which a one-shot
+`server-certs-init` service hands to the server user before it starts (#5370).
 
 ## The stability contract
 

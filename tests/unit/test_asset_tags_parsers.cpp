@@ -251,3 +251,45 @@ TEST_CASE("asset_tags parse_check_interval", "[agent][asset_tags_parsers]") {
     CHECK_FALSE(parse_check_interval("").has_value());
     CHECK_FALSE(parse_check_interval(" 30").has_value());
 }
+
+TEST_CASE("asset_tags: decide_sync_status pins the combined-warning precedence",
+          "[agent][asset_tags_parsers]") {
+    for (bool mode : {false, true}) {
+        for (bool dir : {false, true}) {
+            // A failed write wins over any warning flag.
+            auto d = decide_sync_status(false, mode, dir);
+            CHECK(d.status == YUZU_RESULT_STATUS_CONSTRAINED);
+            CHECK(d.completeness == YUZU_RESULT_COMPLETENESS_PARTIAL);
+            CHECK(d.provenance == "asset_tags:persist_failed");
+
+            d = decide_sync_status(true, mode, dir);
+            if (mode) { // security outranks durability
+                CHECK(d.status == YUZU_RESULT_STATUS_CONSTRAINED);
+                CHECK(d.completeness == YUZU_RESULT_COMPLETENESS_FULL);
+                CHECK(d.provenance == "asset_tags:persist_mode_reassert_failed");
+            } else if (dir) {
+                CHECK(d.status == YUZU_RESULT_STATUS_CONSTRAINED);
+                CHECK(d.completeness == YUZU_RESULT_COMPLETENESS_FULL);
+                CHECK(d.provenance == "asset_tags:persist_dir_unsynced");
+            } else {
+                CHECK(d.status == YUZU_RESULT_STATUS_OK);
+                CHECK(d.completeness == YUZU_RESULT_COMPLETENESS_FULL);
+                CHECK(d.provenance.empty());
+            }
+        }
+    }
+}
+
+TEST_CASE("asset_tags: format_write_warning keeps every typed cause label under the cap",
+          "[agent][asset_tags_parsers]") {
+    CHECK(format_write_warning(true, false, "m") == "mode_reassert_failed: m");
+    CHECK(format_write_warning(false, true, "d") == "dir_fsync_failed: d");
+    CHECK(format_write_warning(true, true, "m; d") == "mode_reassert_failed+dir_fsync_failed: m; d");
+
+    // A first cause carrying a path longer than the cap truncates the detail,
+    // never the labels.
+    const std::string long_detail(kMaxValueBytes * 2, 'p');
+    const auto out = format_write_warning(true, true, long_detail + "; fsync of d failed");
+    CHECK(out.size() <= kMaxValueBytes);
+    CHECK(out.rfind("mode_reassert_failed+dir_fsync_failed: ", 0) == 0);
+}

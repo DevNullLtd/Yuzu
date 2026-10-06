@@ -101,12 +101,15 @@ them into the existing section:
 
 Each fragment's bullets are appended to the end of their `###` subsection in
 `## [X.Y.Z]` (a missing subsection is created in canonical order), the
-fragment files are deleted, and the header takes the given date (omit
-`--date` to keep the existing one; pass it only at the final release).
-Commit the result. It refuses if `[Unreleased]` is missing or still holds
-legacy subsections, if there is nothing to append, if `X.Y.Z` is not the newest
-released section (so a mistyped version cannot fold fragments into an older
-release; `--allow-older-section` overrides), if more than one `## [X.Y.Z]`
-header exists, or if a fragment's whole text already appears in the section
-(an interrupted earlier append: compare it with the section before deleting
-the fragment). Everything on `main` at tag time ships in `X.Y.Z`.
+fragment files are deleted, and the header takes the given date (omit `--date`
+to keep the existing one; pass it only at the final release). If an earlier RC
+already folded every fragment, the final still needs its date: with no
+fragments, `--append --date YYYY-MM-DD` re-dates the header and changes
+nothing else. Commit the result. It refuses if `[Unreleased]` is missing or
+still holds legacy subsections, if there is nothing to append (and no
+`--date`), if `X.Y.Z` is not the newest released section (so a mistyped
+version cannot fold fragments into an older release; `--allow-older-section`
+overrides), if more than one `## [X.Y.Z]` header exists, or if a fragment's
+whole text already appears in the section (an interrupted earlier append:
+compare it with the section before deleting the fragment). Everything on
+`main` at tag time ships in `X.Y.Z`.
