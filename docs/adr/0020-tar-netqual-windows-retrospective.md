@@ -6,6 +6,11 @@
 **Relates to:** ADR-0015 (ARP/DNS capture sources), `docs/tar-implementer.md`,
 `docs/user-manual/network.md` (netqual tier), ADR-0003 (telemetry capture model)
 
+> **Amended by ADR-3006 (capability enablement).** The opt-in default for `netqual` and
+> `netconn` is superseded for new installations, and look-back becomes a switchable unit of
+> its own. Existing installations keep their current state. The privacy note below still
+> describes the reach of look-back and remains the reason it can be switched off.
+
 ## Context
 
 The `netqual` TAR source (per-connection TCP quality: smoothed RTT, jitter,
