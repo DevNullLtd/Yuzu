@@ -808,10 +808,11 @@ bool AuthRoutes::require_permission(const httplib::Request& req, httplib::Respon
             res.set_content(detail::a4_denial(res, 403, msg), "application/json");
             return false;
         }
-        // Safety net, unreachable today: the allow-list above is empty, so nothing gets past it.
-        // It exists so that a future populated allow-list can never admit on a failed ceiling
-        // read. Reaching here with a Degraded verdict means the allow-list alone would have
-        // admitted the request; refuse it as the retryable outage it is.
+        // Safety net, unreachable in production: the allow-list above is empty, so nothing gets
+        // past it. It exists so that a future populated allow-list can never admit on a failed
+        // ceiling read; test_authz_gates.cpp pins it through the allow-list's test override.
+        // Reaching here with a Degraded verdict means the allow-list alone would have admitted
+        // the request; refuse it as the retryable outage it is.
         if (ceiling_degraded) {
             respond_ceiling_degraded(req, res, "auth.permission_required",
                                      "service-scoped token blocked: RBAC read degraded "
