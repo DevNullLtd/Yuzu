@@ -2,9 +2,10 @@
  * test_plugin_abi_oom_containment.cpp -- no exception crosses the plugin ABI
  * when the allocator keeps failing after a leg throws std::bad_alloc.
  *
- * Seams under test (both header-inline, so they are compiled into THIS TU):
+ * Seams under test (all header-inline, so they are compiled into THIS TU):
  *   A. yuzu::browser_policy::run_guarded
  *   B. yuzu::update_source_trust::execute_sources
+ *   C. yuzu::mgmt_posture::execute_posture
  * Their catch arms must build a token, write a status row and set the typed
  * status without letting a second bad_alloc escape. The SDK export wrapper
  * (plugin.hpp) and the test-side LocalDispatcher::run (agent.cpp) do not catch, so an
@@ -34,9 +35,15 @@
  * failure: its 30+ byte row cannot be built. The typed status or rc 1 is the
  * surviving signal. The healthy-allocator behaviour (full `:bad_alloc` token)
  * is pinned by the two local-dispatcher tests and is not duplicated here.
+ *
+ * SEAM C differs in two respects. Its recovery writes the status ROW before it sets the typed
+ * status, so under sustained failure the row build throws first and the surviving signal is
+ * rc 1 (the double-throw arm), not a typed status. And its token (`<os>:leg:exception`)
+ * carries no `:bad_alloc` suffix, so the provenance-shape check above does not apply to it.
  */
 
 #include "browser_policy_legs.hpp"
+#include "mgmt_posture_legs.hpp"
 #include "update_source_trust_legs.hpp"
 
 #include <catch2/catch_test_macros.hpp>
@@ -172,4 +179,27 @@ TEST_CASE("update_source_trust execute_sources contains a leg that throws under 
     REQUIRE(g_status_calls == 1);
     CHECK(std::string_view{g_provenance} == kPrefix);
 #endif
+}
+
+TEST_CASE("mgmt_posture execute_posture contains a leg that throws under sustained OOM",
+          "[plugin][abi][oom][mgmt_posture]") {
+    yuzu::CommandContext ctx{nullptr};
+    reset_stubs();
+    bool escaped = false;
+    int rc = -1;
+    try {
+        rc = yuzu::mgmt_posture::execute_posture(ctx, "posture", &oom_leg, "linux:leg:exception");
+    } catch (...) {
+        escaped = true;
+    }
+    g_fail_alloc = false;
+
+    REQUIRE_FALSE(escaped);
+    // The recovery's status row (well past every SSO size) must have hit the failing allocator,
+    // or this case proves nothing on a stdlib whose containment is never exercised.
+    REQUIRE(g_injected > 0);
+    // The host must still learn of the failure: rc 1 from the double-throw arm, or a typed
+    // UNAVAILABLE/UNKNOWN status if the recovery managed to land.
+    CHECK((rc == 1 || (g_status == YUZU_RESULT_STATUS_UNAVAILABLE &&
+                       g_completeness == YUZU_RESULT_COMPLETENESS_UNKNOWN)));
 }

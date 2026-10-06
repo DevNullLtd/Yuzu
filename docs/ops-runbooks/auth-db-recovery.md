@@ -37,7 +37,7 @@ the Windows event log shows one of these, and they mean different things:
 | `[PG] Refusing to start: no PostgreSQL DSN` | `--postgres-dsn` / `YUZU_POSTGRES_DSN` is unset | [Config](#no-dsn-configured) |
 | `[PG] Refusing to start: cannot reach PostgreSQL substrate: …` | Postgres down, wrong DSN, network/auth failure | [Substrate down](#postgres-substrate-unreachable) |
 | `[PG] Refusing to start: auth store (AuthDB) migration/open failed` | Database reachable, `auth` schema could not be created/opened | [Migration failure](#auth-schema-migration-failure) |
-| `[PG] Refusing to start: SecretCodec::init() failed — …` | The secrets seam could not initialise — usually a missing or unreadable KEK | [KEK problems](#kek-missing-or-unreadable) |
+| `SecretCodec::init() failed for the auth store bootstrap — …` or `[PG] Refusing to start: SecretCodec::init() failed — …` | The secrets seam could not initialise — usually a missing or unreadable KEK | [KEK problems](#kek-missing-or-unreadable) |
 | `[auth] Refusing to start: the 'engine:' namespace …` | An `engine:`-prefixed principal collides with the reserved namespace | `docs/ops-runbooks/engine-principal-store-recovery.md` |
 
 If the shipped systemd unit is in use it retries `StartLimitBurst=3` times
@@ -149,6 +149,25 @@ sudo -u _yuzu ls -l /etc/yuzu/certs/secrets-kek-v*.key
   server generate a new one and consider it fixed: a new KEK cannot decrypt
   existing blobs. Go to [KEK permanently lost](#kek-permanently-lost).
 
+**Docker Compose.** In the container the directory is `/etc/yuzu/certs` (the
+images pass no `--ca-dir`), and it must sit on a named volume: `server-certs`
+in the shipped composes from 0.14.1, `certs` in the two reference composes.
+Check it with `docker compose exec server ls -l /etc/yuzu/certs`; while the
+server is restart-looping, use
+`docker compose run --rm --no-deps -T --user 0 --entrypoint ls server -ln /etc/yuzu/certs`
+(as root, so a wrong owner shows as such instead of `Permission denied`).
+In the affected 0.14.0 stacks there was no volume there, so recreating the
+container (an image upgrade, `down` then `up`, `--force-recreate`) deleted the
+key files, and `kek_unresolvable` follows on the next start (#5370).
+Affected: a 0.14.0 Docker Compose stack whose server has no named volume on `/etc/yuzu/certs` while Postgres has one — `deploy/docker/docker-compose.yml` (the README quickstart), `docker-compose.uat.yml`, `docker-compose.full-uat.yml`, `docker-compose.viz-uat.yml`, `docker-compose.demo.yml` used with `--keep`, any compose copied from them, and Compose Wizard output from before 0.14.1 in Plaintext mode, with 'Persist generated certs' unticked, or with named volumes off and an external Postgres. Not affected: `docker-compose.reference.yml` and `docker-compose.reference-gateway.yml` (their `certs` volume).
+A `kek_unresolvable` there does not always mean the files are gone: a compose
+that lost its volume line, files owned by the wrong uid, or keys left behind on
+a dangling anonymous volume give the same error.
+The diagnostic order, the copy-out procedure, and the options if the files are
+already gone are in `docs/user-manual/upgrading.md`, "Docker Compose: copy
+`/etc/yuzu/certs` out of the server container before you recreate it". Run the
+diagnostics before anything destructive.
+
 ## Backup — the KEK pairing rule
 
 **A Postgres dump alone is not a complete auth backup.** TOTP secrets in
@@ -162,25 +181,56 @@ counter climbing.
 So: **capture the database dump and the keys directory as a pair, from the same
 point in time, and restore them as a pair.**
 
+Capture order: take the `pg_dump` first, then the keys directory; do not rotate the KEK between the two (key files only accumulate, so the archive stays a superset of what the dump references). Stopping the server for the pair guarantees it.
+
+**Linux.** Both halves go to `/var/backups/yuzu`, which the block makes a root-owned `0700` directory, and both are written under `umask 077`, so the dump and the key archive are `0600` and owned by root. They stay root-owned: copy them off with `sudo`, keep them together, and encrypt the pair at rest. Use a directory that holds nothing else, since files already in it keep their own permissions. The block prints `OK:` only if both halves were written.
+
 ```bash
-# Linux — run both, keep them together, encrypt the pair at rest.
-STAMP=$(date +%Y%m%dT%H%M%SZ)
-sudo -u _yuzu pg_dump "$YUZU_POSTGRES_DSN" --format=custom \
-     > /var/backups/yuzu/yuzu-$STAMP.dump
-sudo tar -czf /var/backups/yuzu/yuzu-keys-$STAMP.tar.gz \
-     -C /etc/yuzu certs
+STAMP=$(date -u +%Y%m%dT%H%M%SZ)
+sudo install -d -m 0700 -o root -g root /var/backups/yuzu
+( set -o pipefail
+  sudo -u _yuzu pg_dump "$YUZU_POSTGRES_DSN" --format=custom \
+    | sudo sh -c "umask 077; cat > /var/backups/yuzu/yuzu-$STAMP.dump" &&
+  sudo sh -c "umask 077; tar -czf /var/backups/yuzu/yuzu-keys-$STAMP.tar.gz -C /etc/yuzu certs" ) &&
+  echo "OK: pair written to /var/backups/yuzu"
 ```
 
-```powershell
-# Windows (elevated). The Windows installer stores the connection string in
-# a file only Administrators and SYSTEM can read; a hand-configured server may
-# use the YUZU_POSTGRES_DSN environment variable instead.
-$Stamp = Get-Date -Format yyyyMMddTHHmmssZ
-$DsnFile = "C:\ProgramData\Yuzu Server\postgres.dsn"
-$Dsn = if (Test-Path $DsnFile) { (Get-Content -LiteralPath $DsnFile -Raw).Trim() } else { $Env:YUZU_POSTGRES_DSN }
-pg_dump $Dsn --format=custom > "C:\Backups\Yuzu\yuzu-$Stamp.dump"
-Compress-Archive -Path C:\ProgramData\Yuzu\certs -DestinationPath "C:\Backups\Yuzu\yuzu-keys-$Stamp.zip"
+**Docker Compose.** Run from the compose directory. The keys directory is the server container's `/etc/yuzu/certs` volume. Both halves go to an owner-only directory outside any git checkout, because the key archive holds the CA private key and the KEK. The server is stopped for the pair, and `docker cp` reads the volume from the stopped container, so this works on the chiselled image too. The last line starts the server again whether or not the backup succeeded.
+
+```bash
+STAMP=$(date -u +%Y%m%dT%H%M%SZ)
+BK="$HOME/yuzu-keys-backup"; mkdir -p "$BK" && chmod 700 "$BK"
+docker compose stop server
+( umask 077; set -o pipefail
+  docker compose exec -T postgres pg_dump -U yuzu --format=custom yuzu < /dev/null \
+       > "$BK/yuzu-$STAMP.dump" &&
+  docker cp "$(docker compose ps -aq server)":/etc/yuzu/certs - | gzip \
+       > "$BK/yuzu-keys-$STAMP.tar.gz" ) && echo "pair written to $BK"
+docker compose start server
 ```
+
+**Windows** (elevated PowerShell). The Windows installer stores the connection string in a file only Administrators and SYSTEM can read; a hand-configured server may use the `YUZU_POSTGRES_DSN` environment variable instead. The block first locks the backup directory to Administrators and SYSTEM (owner Administrators, inheritance removed, full control for those two only), the same grant the installer gives its own directories, so both halves inherit it. Each run writes to a new, timestamped directory (files already in a directory keep any permissions set on them directly, so the block refuses to reuse one). `pg_dump --file` writes the dump itself, because in Windows PowerShell 5.1 (and PowerShell before 7.4) `>` re-encodes a native command's output as text, which corrupts a custom-format dump.
+
+```powershell
+& {
+  $Stamp = (Get-Date).ToUniversalTime().ToString('yyyyMMddTHHmmssZ')
+  $Bk = "C:\Backups\Yuzu-$Stamp"
+  if (Test-Path -LiteralPath $Bk) { throw "$Bk already exists: use a new, empty folder" }
+  New-Item -ItemType Directory -Path $Bk | Out-Null
+  icacls $Bk /setowner '*S-1-5-32-544' /L /Q | Out-Null
+  if ($LASTEXITCODE) { throw 'icacls failed: the backup folder is not locked down, stop here' }
+  icacls $Bk /inheritance:r /grant:r '*S-1-5-32-544:(OI)(CI)F' '*S-1-5-18:(OI)(CI)F' /L /Q | Out-Null
+  if ($LASTEXITCODE) { throw 'icacls failed: the backup folder is not locked down, stop here' }
+  $DsnFile = "C:\ProgramData\Yuzu Server\postgres.dsn"
+  $Dsn = if (Test-Path $DsnFile) { (Get-Content -LiteralPath $DsnFile -Raw).Trim() } else { $Env:YUZU_POSTGRES_DSN }
+  pg_dump --format=custom --file "$Bk\yuzu-$Stamp.dump" $Dsn
+  if ($LASTEXITCODE) { throw 'pg_dump failed: no pair was written, stop here' }
+  Compress-Archive -Path C:\ProgramData\Yuzu\certs -DestinationPath "$Bk\yuzu-keys-$Stamp.zip" -ErrorAction Stop
+  Write-Output "OK: pair written to $Bk"
+}
+```
+
+The block is one `& { ... }` script block, so a failure stops everything after it however it is pasted. Go on only after `OK: pair written to ...`.
 
 Rules that follow from the pairing:
 
@@ -699,15 +749,32 @@ sudo systemctl restart yuzu-server
   `yuzu-server --first-run-setup` to create a new admin interactively and write
   a fresh config.
 
-- <a id="kek-permanently-lost"></a>**KEK permanently lost.** Painful, but not a
-  total lockout — the blast radius is narrower than it first looks:
-  - **Admin sign-in survives.** MFA recovery codes are verify-only PBKDF2
-    hashes and need no KEK. Sign in with a recovery code, then re-enroll TOTP.
-  - **Password login is unaffected** — password hashes are PBKDF2, not
-    envelope-encrypted.
-  - **TOTP secrets are unrecoverable.** Every enrolled user must re-enroll.
-    Clear the dead ciphertext with the [fallback SQL](#fallback-direct-sql)
-    above (writing NULL needs no key), then have users re-enroll.
+- <a id="kek-permanently-lost"></a>**KEK permanently lost.** First, the server
+  **will not start** on a database that still registers the lost version.
+  Every boot verifies each registered KEK and stops with `kek_unresolvable`.
+  The one-shot modes `--mfa-reset` and `--break-glass-arm` run after that check
+  and fail the same way, and there is no supported way to deregister a KEK
+  version. Without the key file, this database cannot be brought back by any
+  supported means; it is usable again only with the key file restored from a
+  backup. **Do not delete rows from `secrets.kek_meta` to force a start.** The
+  server then mints a new key under the same version number, every secret
+  sealed under the lost key (webhook secrets, plugin and runtime config
+  secrets, offload credentials) becomes permanently undecryptable with no error
+  at boot, and a key file you later find cannot be used (#5421). Take a
+  `pg_dump` before you discard the database: it holds the audit log and
+  configuration, but never restore it into a new install, because it registers
+  the lost KEK. Otherwise you start over with a fresh database, and the CA in
+  the same directory is usually gone too, which means a full agent
+  re-enrolment. The Docker Compose case is worked through in
+  `docs/user-manual/upgrading.md` (#5370). What the KEK does and does not
+  protect:
+  - **Not sealed under the KEK:** password hashes and MFA recovery codes are
+    verify-only PBKDF2 hashes. They are lost only if you start over with a
+    fresh database.
+  - **Sealed, and unrecoverable without the key file:** TOTP secrets, so every
+    enrolled user must re-enroll, and the other secret columns listed in
+    `docs/user-manual/server-admin.md` "Key management (secrets KEK)", such as
+    webhook signing secrets.
   - Any future envelope-encrypted column follows the same rule: re-enrollable
     or re-issuable by design, which is why ADR-0010 requires it.
 

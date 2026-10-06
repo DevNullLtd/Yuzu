@@ -199,6 +199,7 @@
 #include "capability_decls/plugin_action_catalogue_privacy_permissions.hpp"
 #include "capability_decls/plugin_action_catalogue_system_hardening.hpp"
 #include "capability_decls/plugin_action_catalogue_pkg_inventory.hpp"
+#include "capability_decls/plugin_action_catalogue_mgmt_posture.hpp"
 #include "mcp_input_bounds.hpp" // kExecInstrBoundReasons — the boot pre-seed iterates it (#2437)
 #include "mcp_jsonrpc.hpp"
 #include "auth_routes.hpp"
@@ -20647,6 +20648,7 @@ private:
         yuzu::server::capdecls::plugin_action_catalogue_privacy_permissions(),
         yuzu::server::capdecls::plugin_action_catalogue_system_hardening(),
         yuzu::server::capdecls::plugin_action_catalogue_pkg_inventory(),
+        yuzu::server::capdecls::plugin_action_catalogue_mgmt_posture(),
     };
     /// Shared Postgres connection pool — the server storage substrate (ADR-0006/
     /// 0007). Constructed in the ctor BEFORE any Postgres-backed store (fail
