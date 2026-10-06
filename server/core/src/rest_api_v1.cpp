@@ -9041,19 +9041,15 @@ void RestApiV1::register_routes(
 
             const auto read = swc::read_catalogue_page(io, rq);
             if (!read) {
-                switch (read.error().status) {
-                case swc::PageStatus::kDegraded:
+                if (!read.error()) {
                     sw_fail_degraded(req, res, cid, verb, target, "catalogue read");
                     return;
-                case swc::PageStatus::kBadCursor:
-                case swc::PageStatus::kStale:
-                    res.status = 400;
-                    res.set_content(
-                        detail::a4_error(
-                            res, std::string(swc::cursor_error_message(read.error().cursor_error))),
-                        "application/json");
-                    return;
                 }
+                res.status = 400;
+                res.set_content(
+                    detail::a4_error(res, std::string(swc::cursor_error_message(*read.error()))),
+                    "application/json");
+                return;
             }
             const auto& page = *read;
 

@@ -456,7 +456,7 @@ TEST_CASE("read_catalogue_page: a refresh landing mid-read", "[server][software_
         f.rows = {row("a", 3)};
         auto page = read_catalogue_page(f.io(), req(1));
         REQUIRE_FALSE(page);
-        CHECK(page.error().status == PageStatus::kDegraded);
+        CHECK_FALSE(page.error());
         CHECK(f.rows_reads == 2);
     }
     SECTION("a continuation page never re-pages an old keyset over a new snapshot") {
@@ -466,7 +466,7 @@ TEST_CASE("read_catalogue_page: a refresh landing mid-read", "[server][software_
         f.rows = {row("b", 2)};
         auto page = read_catalogue_page(f.io(), req(1, tok));
         REQUIRE_FALSE(page);
-        CHECK(page.error().status == PageStatus::kStale);
+        CHECK(page.error() == CursorError::kStale);
         CHECK(f.rows_reads == 1);
         // Two meta reads only (before, after): without the continuation branch the moved
         // generation would trigger a retry whose re-read of meta is a third.
@@ -481,8 +481,7 @@ TEST_CASE("read_catalogue_page: cursor and degrade outcomes", "[server][software
         f.gens = {10};
         auto page = read_catalogue_page(f.io(), req(1, tok));
         REQUIRE_FALSE(page);
-        CHECK(page.error().status == PageStatus::kStale);
-        CHECK(page.error().cursor_error == CursorError::kStale);
+        CHECK(page.error() == CursorError::kStale);
         CHECK(f.rows_reads == 0);
     }
     SECTION("a cursor for other filters or garbage is a bad cursor") {
@@ -493,12 +492,10 @@ TEST_CASE("read_catalogue_page: cursor and degrade outcomes", "[server][software
         f.gens = {10};
         auto mismatch = read_catalogue_page(f.io(), req(1, tok));
         REQUIRE_FALSE(mismatch);
-        CHECK(mismatch.error().status == PageStatus::kBadCursor);
-        CHECK(mismatch.error().cursor_error == CursorError::kFilterMismatch);
+        CHECK(mismatch.error() == CursorError::kFilterMismatch);
         auto garbage = read_catalogue_page(f.io(), req(1, "garbage"));
         REQUIRE_FALSE(garbage);
-        CHECK(garbage.error().status == PageStatus::kBadCursor);
-        CHECK(garbage.error().cursor_error == CursorError::kMalformed);
+        CHECK(garbage.error() == CursorError::kMalformed);
     }
     SECTION("any nullopt read is a degrade") {
         FakeIo rows_down;
@@ -506,13 +503,13 @@ TEST_CASE("read_catalogue_page: cursor and degrade outcomes", "[server][software
         rows_down.rows_ok = false;
         auto a = read_catalogue_page(rows_down.io(), req(1));
         REQUIRE_FALSE(a);
-        CHECK(a.error().status == PageStatus::kDegraded);
+        CHECK_FALSE(a.error());
         FakeIo totals_down;
         totals_down.gens = {10};
         totals_down.totals_ok = false;
         auto b = read_catalogue_page(totals_down.io(), req(1));
         REQUIRE_FALSE(b);
-        CHECK(b.error().status == PageStatus::kDegraded);
+        CHECK_FALSE(b.error());
     }
     SECTION("the host path reads no meta and uses generation 0") {
         FakeIo f;
@@ -551,15 +548,13 @@ TEST_CASE("read_titles_export brackets the walk by the generation",
         twice.gens = {10, 11, 11, 12};
         twice.rows = {row("a", 3)};
         auto ex = read_titles_export(twice.io(), rq, false);
-        REQUIRE_FALSE(ex);
-        CHECK(ex.error().status == PageStatus::kDegraded);
+        CHECK_FALSE(ex);
     }
     SECTION("a degraded read never yields a partial body") {
         FakeIo f;
         f.gens = {10};
         f.rows_ok = false;
         auto ex = read_titles_export(f.io(), rq, false);
-        REQUIRE_FALSE(ex);
-        CHECK(ex.error().status == PageStatus::kDegraded);
+        CHECK_FALSE(ex);
     }
 }

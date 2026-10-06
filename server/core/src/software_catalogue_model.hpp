@@ -159,18 +159,6 @@ struct CatalogueReads {
     std::function<std::optional<SoftwareCatalogTotals>(const SoftwareCatalogQuery&)> totals;
 };
 
-enum class PageStatus {
-    kDegraded,  ///< any read returned nullopt, or the generation moved twice (503 + retry)
-    kBadCursor, ///< malformed / different filter set: `PageError::cursor_error` says which
-    kStale,     ///< the generation moved under a continuation page: restart from page one
-};
-
-/// Why a page or export read failed. `cursor_error` is meaningful only for kBadCursor / kStale.
-struct PageError {
-    PageStatus status{PageStatus::kDegraded};
-    CursorError cursor_error{CursorError::kMalformed};
-};
-
 struct CataloguePage {
     std::vector<SoftwareCatalogRow> rows;
     SoftwareCatalogTotals totals;
@@ -179,15 +167,17 @@ struct CataloguePage {
 };
 
 /// Reads {meta, rows, totals, meta} for one catalogue page. Fleet path: the rollup generation
-/// brackets the reads; a move on a first page re-reads ONCE (a second move is kDegraded), a
-/// move under a continuation is kStale. The cursor is decoded against the generation read
-/// first. Host path (query.agent_id set): no meta, generation 0.
-[[nodiscard]] std::expected<CataloguePage, PageError>
+/// brackets the reads; a move on a first page re-reads ONCE. The cursor is decoded against the
+/// generation read first. Host path (query.agent_id set): no meta, generation 0.
+/// Error: nullopt = degraded (any read returned nullopt, or the generation moved twice: 503 +
+/// retry); a CursorError = the cursor was refused (malformed / other filter set / stale: the
+/// generation moved under a continuation page, restart from page one) -> 400.
+[[nodiscard]] std::expected<CataloguePage, std::optional<CursorError>>
 read_catalogue_page(const CatalogueReads& io, const CatalogueRequest& rq);
 
 /// Titles export: the whole walk is bracketed by the generation (restart once, then
-/// kDegraded). `rq.query.limit` is the TOTAL row cap.
-[[nodiscard]] std::expected<TitlesExport, PageError>
+/// degraded = nullopt, never a partial body). `rq.query.limit` is the TOTAL row cap.
+[[nodiscard]] std::optional<TitlesExport>
 read_titles_export(const CatalogueReads& io, const CatalogueRequest& rq, bool omit_newest);
 
 } // namespace yuzu::server::software_catalogue
