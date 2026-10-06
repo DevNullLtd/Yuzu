@@ -1045,8 +1045,10 @@ env_case(Val, Kind) ->
 
 %% A reset timeout of 0 would make the half_open probe a hot loop for ever
 %% (trip_circuit doubles 0), so the key is validated like the other breaker and
-%% replay keys: 1..3600000, anything else warns naming the key and takes the
-%% default. cb_base_timeout is what init/1 settled on.
+%% replay keys: both reset timeouts take 100..3600000 (the floor of 100 keeps the
+%% probe from becoming a hot loop) and the failure threshold takes 1..1000;
+%% anything else warns naming the key and takes the default. cb_base_timeout is
+%% what init/1 settled on.
 reset_timeout_invalid_falls_back() ->
     %% 1 and 99 are under the floor of 100: a 1 ms base would make the half_open
     %% probe a ~1 kHz loop. The cap is set to the default so the fallback base

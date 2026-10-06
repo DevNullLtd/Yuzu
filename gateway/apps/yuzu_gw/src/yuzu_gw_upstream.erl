@@ -47,11 +47,17 @@
 %%%   The same rule covers a server ANSWER that is about the request, not about the
 %%%   upstream (INVALID_ARGUMENT, NOT_FOUND, ALREADY_EXISTS, FAILED_PRECONDITION,
 %%%   OUT_OF_RANGE: the gRPC statuses for a wrong request; the server returns the
-%%%   first and the fourth on these RPCs today): it neither fails nor recovers the
-%%%   breaker, because a caller that can make the server say so would otherwise
-%%%   open the breaker for every agent, and a recovery on such an answer would
-%%%   reset real failures. A probe answered that way is retired, not requeued
-%%%   (requeueing would be answered the same way by every probe, for ever).
+%%%   first and the fourth on these RPCs today): on a live call it neither fails
+%%%   nor recovers the breaker, because a caller that can make the server say so
+%%%   would otherwise open the breaker for every agent, and a recovery on such an
+%%%   answer would reset real failures. A probe answered that way is retired, not
+%%%   requeued (requeueing would be answered the same way by every probe, for
+%%%   ever). The one exception is a registration REPLAY answered
+%%%   FAILED_PRECONDITION: that is the server's authoritative answer that the
+%%%   presented session was superseded, and do_replay_one counts it as a breaker
+%%%   SUCCESS (record_result_no_replay({ok, superseded}, State)), so a run of
+%%%   stale replays after a reconnect storm cannot trip the breaker. A replay
+%%%   answered with any other request-fault status stays neutral.
 %%%   Every other status still counts as a failure: UNAVAILABLE, INTERNAL,
 %%%   DEADLINE_EXCEEDED, UNKNOWN, PERMISSION_DENIED, UNAUTHENTICATED,
 %%%   RESOURCE_EXHAUSTED (a server out of memory answers it), CANCELLED,
@@ -234,8 +240,10 @@
 %% checks) and FAILED_PRECONDITION (a superseded replay) are the two the server
 %% returns on these RPCs today; NOT_FOUND, ALREADY_EXISTS and OUT_OF_RANGE are
 %% the same class by the gRPC definition (the server never returns them here).
-%% Such an answer proves nothing about the upstream, so it neither fails nor
-%% recovers the breaker (see record_result/2). Every other status counts.
+%% Such an answer proves nothing about the upstream, so on a live call it neither
+%% fails nor recovers the breaker (see record_result/2); the one exception, a
+%% replay answered FAILED_PRECONDITION, is a breaker success (do_replay_one).
+%% Every other status counts.
 -define(IS_REQUEST_FAULT(Status), (Status =:= ?GRPC_STATUS_INVALID_ARGUMENT orelse
                                    Status =:= ?GRPC_STATUS_NOT_FOUND orelse
                                    Status =:= ?GRPC_STATUS_ALREADY_EXISTS orelse

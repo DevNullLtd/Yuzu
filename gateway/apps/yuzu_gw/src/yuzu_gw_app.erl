@@ -406,11 +406,15 @@ check_cluster_id() ->
 %%    read as UTF-8 (file:consult), so the working literals for a non-ASCII name
 %%    are a string (code points: the name typed as UTF-8 text, or "Z\x{FC}rich")
 %%    or a binary with the utf8 modifier (<<"Z\x{FC}rich"/utf8>>). A plain binary
-%%    literal holding the same character is truncated to one byte per character
-%%    (252 for the u with umlaut), which is not valid UTF-8 and is refused
-%%    (checked with file:consult and `erl -config' under LC_ALL=C and
-%%    LC_ALL=C.UTF-8: the same on both). Most refusals come from
-%%    this source.
+%%    literal (<<"...">>) is not a working form: it holds ONE BYTE per character,
+%%    and a character above 255 is truncated to its low 8 bits (by the compiler,
+%%    and by file:consult for a sys.config literal). It is accepted only if the
+%%    surviving bytes happen to be valid UTF-8, so the name it holds is generally
+%%    not the one typed (<<"\x{4E2D}">> becomes the single byte 45, a hyphen,
+%%    and is accepted); <<"Z\x{FC}rich">> is the byte 252, not valid UTF-8, and is
+%%    refused. Use the utf8 form. Checked with file:consult and with `erl -config'
+%%    plus application:load/1 under LC_ALL=C and LC_ALL=C.UTF-8: the same bytes
+%%    on both. Most refusals come from this source.
 -spec evaluate_cluster_id(term(), string() | false) ->
           ok | {error, {invalid_cluster_id, env | app_env}}.
 evaluate_cluster_id(AppValue, EnvValue) ->
