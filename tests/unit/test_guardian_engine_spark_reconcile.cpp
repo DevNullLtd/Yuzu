@@ -4262,7 +4262,9 @@ struct LateFailureRig5459 {
             fx.mechanism->release_hang();
             // A worker still alive after both gates are open is a leak that must not read
             // green. FAIL_CHECK records a failure without throwing (safe in a destructor,
-            // including during a failing REQUIRE's unwind).
+            // including during a failing REQUIRE's unwind) unless the binary runs with
+            // Catch2's --abort/-x, which makes it throw (then a real leak terminates the
+            // process instead of reporting a red assertion; nothing here uses -x).
             if (auto* rt = fx.engine->spark_runtime_for_test()) {
                 const bool drained = yuzu::test::spin_until(
                     [&] { return rt->active_backend_op_workers() == 0; }, std::chrono::seconds(10));
@@ -4881,8 +4883,11 @@ TEST_CASE("#5459 FU-10 (AC-16): the forced Reapply during a hung same-type watch
     m.set_park_all_watches();
     r.push();
     REQUIRE(yuzu::test::spin_until([&] { return m.parked_watch_count() == 1; }, 10s));
-    // Acknowledgments happen only in the maintenance tick, so tick while the re-arms are parked:
-    // an acknowledgment with an arm still pending would be observed here, not just eventually.
+    // Tick while the re-arms are parked. This loop is redundant by construction: both re-arms
+    // sit in `pending`, so can_advance() is already false through pending.empty() alone (the
+    // tick and the apply_rules tail both gate on it), and an early acknowledgment would
+    // already have failed the rig's earlier hold checks. It documents the held state at this
+    // phase rather than adding an observation the earlier phases do not make.
     for (int i = 0; i < 20; ++i)
         r.f.engine->journal_maintenance_tick();
     r.require_generation_held();

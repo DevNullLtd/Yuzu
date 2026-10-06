@@ -245,7 +245,9 @@ struct Rig5459 {
     // detached worker parked. A worker still alive after the bounded wait is a LEAK (a gate
     // this destructor does not release), which must never read green: FAIL_CHECK records a
     // failed assertion without throwing (safe in a destructor, including during the unwind
-    // of a failing REQUIRE).
+    // of a failing REQUIRE) unless the binary runs with Catch2's --abort/-x, which makes
+    // FAIL_CHECK throw: that combination plus a real leak would terminate the process
+    // instead of reporting a red assertion. Nothing in scripts/ or the workflows uses -x.
     ~Rig5459() {
         b->release_disarm();
         b->release_hang();
@@ -1612,7 +1614,7 @@ TEST_CASE("GuardianArmAckLedger::decide_retry(): identity is checked BEFORE any 
         REQUIRE(f.ledger.pending_count_for_test() == 1);
         check_identity(f);
     }
-    SECTION("a sentinel on the OPEN application never matches, even a sentinel") {
+    SECTION("a sentinel on the OPEN application never matches, even against a sentinel") {
         Rig5459 f;
         auto w = f.wedge("r1", "/a");
         f.ledger.begin_application(1, not_hex, false, 1);
