@@ -539,7 +539,7 @@ rules were not enforced until a later push, including at pre-network boot.
 **Resolved (ruling 14, 2026-09-08 - routed to Astra via `/codex opine`, then Fable as
 advisor, ruled by Dave; previously flagged open by round 7's adversarial review; closes
 #4148):** (a) **Congestion-only outcomes are EXCLUDED from the wedge treatment.** This
-ruling was written against the K=3 wedge waiver ("K"); #5459 (option D, ruling 21)
+ruling was written against the K=3 wedge waiver ("K"); #5459 (option D, the operator ruling of 2026-10-06)
 DELETED that waiver (see R5.3 "as implemented, as amended by #5459"), and the
 exclusion now reads as follows. Neither a queued
 waiter's own expiry nor a congestion refusal at dispatch (since #5168 parked as a
@@ -683,7 +683,7 @@ retry landing mid-drain (R5.3's own bounded drain, below, routinely spans severa
 ticks) — and only triggers a full re-apply once something has actually failed,
 expired, or the push's content has changed underneath it.
 **A wedged key HOLDS the generation and suppresses identical re-pushes; it is never
-waived (#5459, option D, Dave ruling 21; the decision record is in `docs/spark-flip-gate.md` §3a).** Only a dispatched-and-timed-out key
+waived (#5459, option D, the operator ruling of 2026-10-06; the decision record is in `docs/spark-flip-gate.md` §3a, sources in `docs/reviews/5459-optionD-decision-record/README.md`).** Only a dispatched-and-timed-out key
 qualifies (a congestion-expired or admission-rejected rule never does, ruling 14(a)).
 While such a wedge is outstanding - its arm is still hung, or its late result has
 returned and a compensating teardown is outstanding (#4472) - the agent never
@@ -1016,7 +1016,7 @@ is the durable, cross-application "last known arm outcome for every currently-
 desired rule" gauge a fleet-wide dashboard would need.
 
 **R5.3 as implemented (rung 9c PR-5e, #4221, decision 1), as amended by #5459
-(option D, Dave ruling 21).** Rung 9c PR-5e (PR #4529) built the K=3 wedge waiver this
+(option D, the operator ruling of 2026-10-06).** Rung 9c PR-5e (PR #4529) built the K=3 wedge waiver this
 section's original text named ("A wedged key is K-bounded, not held forever"): after
 three identical same-generation re-applies whose only unresolved rules were wedged,
 the generation acknowledged anyway. #5459 REPLACED it. The waiver acknowledged a

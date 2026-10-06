@@ -855,7 +855,7 @@ flip, with a red-first test each:
   BLOCKING findings on this PR at merge.
 - **K=3 wedge waiver / decision 1 status (rung 9c PR-5e, #4221): implemented,
   MERGED as PR #4529 (`869ea6a29`, 2026-09-18), then REPLACED by #5459 (option D,
-  Dave ruling 21; see the #5459 bullet below).** The waiver (acknowledge a wedged
+  the operator ruling of 2026-10-06; see the #5459 bullet below).** The waiver (acknowledge a wedged
   generation after three identical re-applies) is deleted: a wedge now holds the
   generation and has identical re-pushes suppressed. The mechanism as it stands is in
   `docs/spark-stage2-guardian-consumer-design.md`'s "R5.3 as implemented ... as
@@ -909,7 +909,7 @@ flip, with a red-first test each:
   (4) the safety valve's bound and its resets. Re-run the `[4472]` and `[5459]` tests (one run, `[5459],[4472]`; a wildcard in the tag filter matches no tag and runs no tests)
   against whatever the runtime's shape is at flip time.
 - **F14 precondition (#5459, added with the #4472 fix): the post-K late-failure
-  recovery gap. RESOLVED by option D (Dave ruling 21), with its costs recorded
+  recovery gap. RESOLVED by option D (the operator ruling of 2026-10-06), with its costs recorded
   below.** The gap: a rule K-waived while its arm was genuinely hung, whose late result
   then failed or was not adopted, had no engine recovery owner, because the
   acknowledgment had already stopped the server's re-push (the acknowledged-but-unarmed
@@ -925,27 +925,38 @@ flip, with a red-first test each:
   AC-9 to AC-17 (the safety valve, the known limits and the flip-time documentation sweep).
   The operator-facing note is the
   hold paragraph in `docs/user-manual/guaranteed-state.md`.
-- **Decision record: #5459, ruling 21 (Dave, 2026-10-06).** *What was ruled:* option D,
-  delete the K=3 wedge waiver and move its predicate from the acknowledge gate
-  (`can_advance()`) to the retry gate (`decide_retry()`), so a wedge holds the generation and
-  its identical re-pushes are suppressed. This reverses ruling 14 decision 1 (the PR-5e
-  K-bound, PR #4529) and accepts that recovery after a late failure depends on the next
-  server re-push. *Options considered (as named in the sources of this record):* (1) accept
-  the acknowledged-but-unarmed state as shipped, the alternative the precondition text
-  before the ruling named; (2) design C, an engine-owned recovery obligation per waived rule
-  (a recovery lifecycle spanning runtime claims, desired content, application replacement,
-  accounting and restart), with a planning estimate of 620 to 1,100 production lines plus
-  roughly 1,000 to 2,000 test lines (about one to two engineering weeks), rejected for the
-  freeze because of that size and risk, not because it is unsound; (3) a revocable
-  acknowledgment hybrid, which is not a cheap variant (it needs a protocol change and
-  server work); (4) option D, chosen as the smaller change with its cost accepted. *Reviewer
+- **Decision record: #5459, option D (operator ruling, 2026-10-06).** *What was ruled:* the
+  operator (Dave Rae) chose option D in a terminal chat with the coordinating Claude Code
+  session; his words, verbatim: "Go with D, have Astra review the suppress condition". The
+  ruling was not posted as an issue comment at the time. Option D deletes the K=3 wedge
+  waiver and moves its predicate from the acknowledge gate (`can_advance()`) to the retry
+  gate (`decide_retry()`), so a wedge holds the generation and its identical re-pushes are
+  suppressed. It replaces `docs/spark-stage2-guardian-consumer-design.md` R5.3 decision 1
+  (the rung 9c PR-5e K-bound, PR #4529) and accepts that recovery after a late failure
+  depends on the next server re-push. *Options considered (letters as the coordinating
+  session first presented them on 2026-10-06):* A, accept the acknowledged-but-unarmed
+  state with a risk-register entry (not really available: governance treats a derived HIGH
+  as fixed or the change withdrawn); B, a small "re-open the generation" fix (evaluated; a
+  source-read opinion judged it not safe without a recovery lifecycle); C, an engine-owned
+  tick-driven recovery obligation per waived rule, with a planning estimate of 620 to 1,100
+  production lines plus roughly 1,000 to 2,000 test lines (about one to two engineering
+  weeks), rejected for the freeze on size and risk, not because it is unsound; D, chosen on
+  schedule grounds knowing the design-C opinion preferred C. Also rejected: a revocable
+  acknowledgment hybrid (needs a server protocol change) and a bounded hold then waive
+  (reintroduces #5459). *Not ruled on by the operator at that time:* the safety-valve value
+  of 10 and the compensation-aware extension came from the design-D review; counting a
+  `Recovered` late success as outstanding work came from the Fable review of the
+  implementation plan and was approved by the operator in the implementing session. *Reviewer
   dispositions (source-read opinions, no code run, no governance run):* the design-C opinion
   recommended C with the flip held through the freeze, and called D the smaller
   implementation change with an explicitly accepted endpoint-wide disruption cost, not low
   operational risk; the design-D opinion called D a credible freeze-sized fix with two
   qualifications (compensation-aware suppression needs a small runtime classification change,
   and a forced full re-apply still carries the baseline-recapture risk). Both qualifications
-  are in the implementation (`CompensationPending`; the safety valve and AC-9/AC-10).
+  are in the implementation (`CompensationPending`; the safety valve and AC-9/AC-10). *Sources
+  and numbering:* the verbatim words, the options, the reviews and the numbering caveat
+  (the coordinating session's own local ruling numbers are not a committed authority)
+  are in `docs/reviews/5459-optionD-decision-record/README.md`.
 - **F14 precondition (added 2026-09-18, PR #4529 review finding) - the
   `reapply_count` cross-rule funding consequence: OBSOLETE, the mechanism is
   deleted.** The finding was that a rule's own wedge could be K-waived on its very first
