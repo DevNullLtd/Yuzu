@@ -164,6 +164,10 @@ probe_test_() ->
         fun stale_probe_ok_after_call_path_close/0),
       t("a probe result after a call path RPC closed the circuit leaves the breaker alone (error)",
         fun stale_probe_error_after_call_path_close/0),
+      t("a probe result after a call path failure reopened the breaker leaves it alone (error)",
+        fun stale_probe_error_while_open/0),
+      t("a probe result after a call path failure reopened the breaker leaves it alone (ok)",
+        fun stale_probe_ok_while_open/0),
       t("an old generation probe ok does not close a newer half_open breaker",
         fun older_generation_probe_ok_is_ignored_by_the_breaker/0),
       t("an old generation probe error does not reopen a newer half_open breaker",
@@ -948,6 +952,60 @@ probe_then_call_path_close() ->
     sync(),
     ?assertEqual({0, 5}, last_gauge()),
     {Probe, breaker()}.
+
+%% half_open with a probe in flight; a call path RPC fails and reopens the
+%% breaker under the SAME generation, and the probe's own result arrives while
+%% the breaker is open. The breaker has no transition for a result in that state,
+%% so the upstream process must neither restart nor touch the breaker; only the
+%% event is settled.
+stale_probe_error_while_open() ->
+    watch(),
+    {Probe, Up, Before} = probe_then_call_path_reopen(),
+    fail_worker(Probe),
+    %% Not delivered: back at the head of the store, the breaker still open.
+    await_until(fun() -> last_gauge() =:= {3, 0} end),
+    await_dead(Probe),
+    sync(),
+    ?assertEqual(Up, whereis(yuzu_gw_upstream)),
+    ?assertEqual(Before, breaker()),
+    ?assertEqual(open, yuzu_gw_upstream:circuit_state()),
+    ?assertEqual(undefined, up_get(notify_probe)),
+    ?assertEqual(0, map_size(up_get(notify_pids))),
+    ?assertEqual(3, pending_len()),
+    [{HeadKey, _} | _] = yuzu_gw_notify_queue:to_list(up_get(notify_pending)),
+    ?assertEqual({agent(1), <<"sess">>, <<"home">>}, HeadKey).
+
+stale_probe_ok_while_open() ->
+    watch(),
+    {Probe, Up, Before} = probe_then_call_path_reopen(),
+    Probe ! release,
+    %% Delivered: retired, not held again, the breaker still open.
+    await_until(fun() -> last_gauge() =:= {2, 0} end),
+    await_dead(Probe),
+    sync(),
+    ?assertEqual(Up, whereis(yuzu_gw_upstream)),
+    ?assertEqual(Before, breaker()),
+    ?assertEqual(open, yuzu_gw_upstream:circuit_state()),
+    ?assertEqual(undefined, up_get(notify_probe)),
+    ?assertEqual(0, map_size(up_get(notify_pids))),
+    ?assertEqual(2, pending_len()),
+    [{HeadKey, _} | _] = yuzu_gw_notify_queue:to_list(up_get(notify_pending)),
+    ?assertEqual({agent(2), <<"sess">>, <<"home">>}, HeadKey).
+
+%% Three keys held, the head sent as the probe (parked in the mock), then a
+%% failing call path RPC reopens the breaker. Returns the parked probe, the
+%% upstream pid and the breaker fields to compare against.
+probe_then_call_path_reopen() ->
+    trip_breaker(),
+    [cast_connected(agent(I)) || I <- lists:seq(1, 3)],
+    enter_half_open(),
+    {Probe, ProbeReq} = await_entered(),
+    ?assertEqual(agent(1), maps:get(agent_id, ProbeReq)),
+    {error, _} = yuzu_gw_upstream:proxy_register(#{info => #{}}),
+    ?assertEqual(open, yuzu_gw_upstream:circuit_state()),
+    sync(),
+    ?assertEqual({2, 1}, last_gauge()),
+    {Probe, whereis(yuzu_gw_upstream), breaker()}.
 
 older_generation_probe_ok_is_ignored_by_the_breaker() ->
     watch(),
