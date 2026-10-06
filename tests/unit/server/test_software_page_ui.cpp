@@ -300,7 +300,7 @@ TEST_CASE("software page: active pills, Clear all and the REST line", "[inventor
     REQUIRE(has(h, "data-act=\"clear\""));
     const std::string call = software_rest_call(f);
     REQUIRE(call == "/api/v1/inventory/software/catalogue?q=a%26b%20c&kind=app&ecosystem=brew&"
-                    "source=pkg_inventory.packages&versions_min=3&agent_id=id-1&limit=100");
+                    "source=pkg_inventory.packages&agent_id=id-1&versions_min=3&limit=100");
     REQUIRE(has(h, "data-copy=\"" + call.substr(0, 20))); // the copy button carries the same text
     REQUIRE(has(h, ">GET</span>"));
     // No filter -> no pills, no Clear all, the REST line is still there.
@@ -317,10 +317,18 @@ TEST_CASE("software page: table columns, row attributes and number formatting", 
                                           ""};
     std::size_t last = 0;
     for (const char* c : cols) {
-        const auto p = h.find(std::string("<th scope=\"col\"") , last);
+        const auto p = h.find("<th scope=\"col\"", last);
         REQUIRE(p != std::string::npos);
-        last = p + 1;
-        (void)c;
+        const auto gt = h.find('>', p);
+        const auto end = h.find("</th>", gt);
+        REQUIRE(gt != std::string::npos);
+        REQUIRE(end != std::string::npos);
+        // The header text starts with the expected label (Installs carries a trailing span).
+        const std::string label = c;
+        REQUIRE(h.compare(gt + 1, label.size(), label) == 0);
+        if (label.empty())
+            REQUIRE(end == gt + 1);
+        last = end;
     }
     REQUIRE(count_of(h, "<th scope=\"col\"") == 7);
     REQUIRE(has(h, "counted exactly under the active filters"));
@@ -354,6 +362,8 @@ TEST_CASE("software page: confined host view blanks Newest in fleet once and say
     REQUIRE_FALSE(has(h, "<div class=\"inv-kpi"));
     REQUIRE_FALSE(has(h, "<datalist"));
     REQUIRE_FALSE(has(h, "list=\"hostlist\""));
+    // The fleet-wide scope banner is never drawn on a confined view (no fleet counts there).
+    REQUIRE_FALSE(has(h, "Scope (ADR-0017)"));
 }
 
 TEST_CASE("software page: exports are download links; install exports omit versions_min",
@@ -438,6 +448,8 @@ TEST_CASE("software page: degrade, empty, filtered-empty and caveat states", "[i
     h = full(f, d);
     REQUIRE(has(h, "No software matches these filters."));
     REQUIRE(has(h, "Clear all filters"));
+    // No zero count line: the live region is drawn empty.
+    REQUIRE(has(h, "<div class=\"inv-count\" aria-live=\"polite\"></div>"));
 
     d = page();
     d.caveat = "versions_min must be an integer";
@@ -453,6 +465,15 @@ TEST_CASE("software page: degrade, empty, filtered-empty and caveat states", "[i
     REQUIRE(has(h, "<div id=\"sw-kpis\"><div class=\"inv-caveat\">fleet-wide aggregate"));
     REQUIRE_FALSE(has(h, "<table"));
     REQUIRE_FALSE(has(h, "<div class=\"inv-kpi"));
+    REQUIRE_FALSE(has(h, "Scope (ADR-0017)"));
+
+    // Rows mode with the rows read degraded: a retry row, never a table.
+    d = page();
+    d.rows.reset();
+    h = render_software_page({}, d, SoftwarePageMode::Rows);
+    REQUIRE(h.starts_with("<tr"));
+    REQUIRE(has(h, "inv-degrade"));
+    REQUIRE_FALSE(has(h, "<table"));
 }
 
 TEST_CASE("software page: hostile text is escaped everywhere it lands", "[inventory][ui]") {
@@ -542,17 +563,23 @@ TEST_CASE("software devices table: header, columns, host links and last synced",
     REQUIRE(has(h, ">a2</a>"));
     REQUIRE(has(h, "<span class=\"inv-pill win\">Windows</span>"));
     REQUIRE(has(h, "<span class=\"inv-pill lin\">Linux</span>"));
-    REQUIRE(has(h, "60m ago"));
-    REQUIRE(has(h, "2d ago <span class=\"inv-pill stale\">stale</span>"));
+    REQUIRE(has(h, "<span class=\"inv-grey\">60m ago</span>"));
+    REQUIRE(has(h, "<span class=\"inv-pill stale\" title=\"last sync more than 48h ago\">2d ago</span>"));
     REQUIRE_FALSE(has(h, "inv-devfilter")); // <= 8 rows: no filter box
     // One version: no Version column, the version shows in the head.
     t.version = "1.0";
     h = render_software_devices_table({}, t, false);
     REQUIRE_FALSE(has(h, "<th>Version</th>"));
     REQUIRE(has(h, "<span class=\"inv-mono\">1.0</span>"));
-    // Bulk read degraded: every cell is a dash, never a fake time.
+    // A device missing from a present map was never synced: a plain dash, no degrade tooltip.
+    t.last_synced = std::unordered_map<std::string, std::int64_t>{{"a1", kNow - 3600}};
+    h = render_software_devices_table({}, t, false);
+    REQUIRE_FALSE(has(h, "last sync time unavailable"));
+    // Bulk read degraded: every cell is a distinguishable dash, never a fake time.
     t.last_synced.reset();
     h = render_software_devices_table({}, t, false);
+    REQUIRE(has(h, "<table class=\"inv-tbl inv-sub\">"));
+    REQUIRE(has(h, "title=\"last sync time unavailable"));
     REQUIRE_FALSE(has(h, "ago"));
 }
 
@@ -597,8 +624,34 @@ TEST_CASE("software devices table: filter box, sentinel, rows_only and scoped ou
     SoftwareDevicesTable bad;
     bad.name = "Chrome";
     REQUIRE(has(render_software_devices_table({}, bad, false), "unavailable"));
+    // rows_only degrade: one row carrying the banner, never a table.
+    const auto degraded_rows = render_software_devices_table({}, bad, true);
+    REQUIRE(degraded_rows.starts_with("<tr><td colspan="));
+    REQUIRE(has(degraded_rows, "unavailable"));
+    REQUIRE_FALSE(has(degraded_rows, "<table"));
     bad.rows = std::vector<SoftwareFleetRow>{};
-    REQUIRE(has(render_software_devices_table({}, bad, false), "No devices."));
+    REQUIRE(has(render_software_devices_table({}, bad, false), "No host matches."));
+}
+
+TEST_CASE("software devices table: hostile text is escaped everywhere it lands", "[inventory][ui]") {
+    SoftwareDevicesTable t;
+    t.name = "<script>";
+    t.now_secs = kNow;
+    auto r = fleet("a&b", "<b>", "windows");
+    r.entry.source = "\"x\"";
+    t.rows = std::vector<SoftwareFleetRow>{r};
+    t.hostnames = {{"a&b", "<img src=x onerror=alert(1)>\""}};
+    const std::string h = render_software_devices_table({}, t, false);
+    REQUIRE_FALSE(has(h, "<img"));
+    REQUIRE_FALSE(has(h, "<script"));
+    REQUIRE_FALSE(has(h, "<td class=\"inv-mono\"><b>"));
+    REQUIRE_FALSE(has(h, ">\"x\"<"));
+    REQUIRE(has(h, "&lt;img src=x onerror=alert(1)&gt;&quot;"));
+    REQUIRE(has(h, "<b>&lt;script&gt;</b>"));
+    REQUIRE(has(h, "<td class=\"inv-mono\">&lt;b&gt;</td>"));
+    REQUIRE(has(h, "&quot;x&quot;"));
+    REQUIRE(has(h, "href=\"/hardware/ci?id=a%26b\""));
+    REQUIRE(has(h, "data-gpname=\"&lt;img src=x onerror=alert(1)&gt;&quot;\""));
 }
 
 TEST_CASE("software page: shell script is CSP-safe and wires the page's behaviour",

@@ -103,6 +103,8 @@ constexpr const char* kConfinedFleetMsg =
     "The software catalogue is a fleet-wide aggregate that cannot be narrowed to your "
     "management groups, so it is not shown to a group-scoped account. Open a device from "
     "Hardware to see its software, or ask for fleet-wide Inventory:Read.";
+constexpr const char* kConfinedHostMsg =
+    "This device is outside your management groups (or unknown), so its software is not shown.";
 constexpr const char* kStaleCursorMsg =
     "The catalogue was refreshed since this page loaded; reload to restart from the first page.";
 
@@ -208,7 +210,7 @@ void InventoryRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         // device in scope. Anything else is refused (and audited), never silently narrowed.
         if (host ? !authz::in_scope(gate->scope, q.agent_id) : confined) {
             d.confined = true;
-            d.caveat = kConfinedFleetMsg;
+            d.caveat = host ? kConfinedHostMsg : kConfinedFleetMsg;
             (void)detail::try_persist_audit(deps_.audit_fn, req, "inventory.software.catalog", "denied",
                                             "Inventory", target,
                                             "scope: fleet-wide aggregate or out-of-scope device");
@@ -251,16 +253,20 @@ void InventoryRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             auto meta = page.meta;
             if (!meta && deps_.catalog_meta_fn) // unconfined host view: the model skips the meta read
                 meta = deps_.catalog_meta_fn();
-            if (meta) {
-                swc::Coverage cov;
-                if (mode == SoftwarePageMode::Full) {
-                    if (deps_.connected_fn)
-                        cov.connected = deps_.connected_fn();
-                    if (deps_.stale_fn)
-                        cov.stale = deps_.stale_fn();
-                }
-                d.kpis = swc::derive_kpis(*meta, cov);
+            if (!meta) { // the strip cannot render: a whole-page degrade, audited as the failure it is
+                (void)detail::try_persist_audit(deps_.audit_fn, req, "inventory.software.catalog", "failure",
+                                                "Inventory", target, "meta degraded");
+                reply(); // rows unset -> the retry banner
+                return;
             }
+            swc::Coverage cov;
+            if (mode == SoftwarePageMode::Full) {
+                if (deps_.connected_fn)
+                    cov.connected = deps_.connected_fn();
+                if (deps_.stale_fn)
+                    cov.stale = deps_.stale_fn();
+            }
+            d.kpis = swc::derive_kpis(*meta, cov);
         }
         // Names: the host view's display name and (Full) the type-ahead list. Never read for
         // a confined caller (a whole-fleet hostname map is fleet disclosure).
@@ -322,7 +328,7 @@ void InventoryRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             (void)detail::try_persist_audit(deps_.audit_fn, req, "inventory.software.versions", "denied",
                                             "Inventory", target,
                                             "scope: fleet-wide aggregate or out-of-scope device");
-            send_html(res, caveat_div(kConfinedFleetMsg));
+            send_html(res, caveat_div(host ? kConfinedHostMsg : kConfinedFleetMsg));
             return;
         }
         SoftwarePageFilters f;

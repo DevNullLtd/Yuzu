@@ -163,7 +163,8 @@ struct SoftwareDevicesTable {
     std::optional<std::vector<SoftwareFleetRow>> rows;
     std::unordered_map<std::string, std::string> hostnames;
     /// agent_id -> server-receipt epoch of the last installed-software sync; nullopt = the
-    /// bulk read degraded (every cell renders a dash), a missing key = never synced.
+    /// bulk read degraded (every cell renders a dash with a "last sync time unavailable"
+    /// tooltip, distinct from the plain dash of a never-synced device), a missing key = never synced.
     std::optional<std::unordered_map<std::string, std::int64_t>> last_synced;
     std::optional<std::string> next_cursor;
     std::optional<std::int64_t> total; ///< the catalogue row's exact distinct device_count

@@ -78,6 +78,7 @@ struct InvHarness {
     std::unordered_map<std::string, std::string> hostnames;
     std::unordered_map<std::string, std::int64_t> last_synced;
     bool last_synced_degrade = false;
+    bool meta_degrade = false; // only the rollup-meta read fails (every other provider answers)
     std::int64_t refreshed_at = 1000;
     int bump_refreshed_on_meta_call = 0; // 1-based: that meta read returns refreshed_at + 1
     std::vector<std::string> calls;      // provider order: "meta" | "catalog" | "totals" | ...
@@ -128,7 +129,7 @@ struct InvHarness {
         };
         auto catalog_meta = [this]() -> std::optional<CatalogRollupMeta> {
             calls.push_back("meta");
-            if (degrade)
+            if (degrade || meta_degrade)
                 return std::nullopt;
             CatalogRollupMeta m{refreshed_at, 1, 5};
             if (bump_refreshed_on_meta_call == count("meta"))
@@ -155,11 +156,16 @@ struct InvHarness {
                 return std::nullopt;
             if (q.agent_ids && q.agent_ids->empty())
                 return std::vector<SoftwareFleetRow>{}; // deny-all: the store returns empty, no SQL
+            // Honours `after` and `limit` like the store (one title's fleet_rows, kept in agent_id order).
             std::vector<SoftwareFleetRow> out;
             for (const auto& r : fleet_rows) {
+                if (q.after && r.agent_id <= q.after->agent_id)
+                    continue;
                 if (q.agent_ids &&
                     std::ranges::find(*q.agent_ids, r.agent_id) == q.agent_ids->end())
                     continue;
+                if (static_cast<int>(out.size()) == q.limit)
+                    break;
                 out.push_back(r);
             }
             return out;
@@ -258,6 +264,12 @@ std::vector<SoftwareCatalogRow> many_titles(int n) {
         v.push_back(cat_row(name, "P", 1000 - i, 1));
     }
     return v;
+}
+
+std::string dev_id(int i) { // a000, a001, ... (agent_id order == numeric order)
+    char id[8];
+    std::snprintf(id, sizeof(id), "a%03d", i);
+    return id;
 }
 
 authz::VisibleSet ids(std::initializer_list<const char*> v) {
@@ -397,6 +409,7 @@ TEST_CASE("software routes: confined caller is refused the fleet aggregate, audi
     auto v = h.sink.Get(std::string(kVersions) + "?name=Chrome");
     REQUIRE(contains(v->body, "cannot be narrowed to your management groups"));
     REQUIRE_FALSE(h.last_versions_query);
+    REQUIRE(h.audited("inventory.software.versions|denied"));
 }
 
 TEST_CASE("software routes: confined host view reads no fleet figures", "[inventory][route]") {
@@ -419,8 +432,11 @@ TEST_CASE("software routes: confined host view reads no fleet figures", "[invent
     REQUIRE(contains(res->body, "your management groups only"));
     // An out-of-scope device is refused and audited, never answered.
     auto out = h.sink.Get(std::string(kSoftware) + "?agent_id=a2");
-    REQUIRE(contains(out->body, "cannot be narrowed to your management groups"));
+    REQUIRE(contains(out->body, "This device is outside your management groups (or unknown)"));
+    REQUIRE_FALSE(contains(out->body, "cannot be narrowed to your management groups"));
     REQUIRE(h.audited("inventory.software.catalog|denied"));
+    auto vout = h.sink.Get(std::string(kVersions) + "?name=Chrome&agent_id=a2");
+    REQUIRE(contains(vout->body, "This device is outside your management groups (or unknown)"));
 }
 
 TEST_CASE("software routes: an unfiltered caller gets the strip on the host view too",
@@ -432,6 +448,40 @@ TEST_CASE("software routes: an unfiltered caller gets the strip on the host view
     REQUIRE(contains(res->body, "<div class=\"inv-kpi"));
     REQUIRE(contains(res->body, "value=\"WIN-1\"")); // the host box shows the name
     REQUIRE(contains(res->body, "host: WIN-1"));
+}
+
+TEST_CASE("software routes: a degraded rollup-meta read on the host view is a whole-page degrade",
+          "[inventory][route]") {
+    InvHarness h;
+    h.meta_degrade = true; // the model skips the meta read on an unfiltered host view; the route reads it
+    auto res = h.sink.Get(std::string(kSoftware) + "?agent_id=a1");
+    REQUIRE(res);
+    REQUIRE(contains(res->body, "Inventory store unavailable."));
+    REQUIRE_FALSE(contains(res->body, "<table"));
+    REQUIRE(h.audited("inventory.software.catalog|failure"));
+    REQUIRE_FALSE(h.audited("inventory.software.catalog|success"));
+}
+
+TEST_CASE("software routes: the host type-ahead is sorted, capped at 1000 and skips unnamed hosts",
+          "[inventory][route]") {
+    InvHarness h;
+    for (int i = 1001; i >= 0; --i) { // inserted out of order: the route sorts
+        char name[16];
+        std::snprintf(name, sizeof(name), "h%04d", i);
+        h.hostnames["id" + std::to_string(i)] = name;
+    }
+    h.hostnames["emptyid"] = "";
+    auto res = h.sink.Get(kSoftware);
+    REQUIRE(res);
+    std::size_t options = 0;
+    for (auto p = res->body.find("<option value=\""); p != std::string::npos;
+         p = res->body.find("<option value=\"", p + 1))
+        ++options;
+    REQUIRE(options == 1000);
+    REQUIRE(contains(res->body, "<option value=\"h0000\""));
+    REQUIRE(res->body.find("<option value=\"h0000\"") == res->body.find("<option value=\""));
+    REQUIRE_FALSE(contains(res->body, "<option value=\"h1001\""));
+    REQUIRE_FALSE(contains(res->body, "data-id=\"emptyid\""));
 }
 
 TEST_CASE("software routes: keyset paging walks the catalogue 100 at a time", "[inventory][route]") {
@@ -610,7 +660,7 @@ TEST_CASE("software routes: devices table scope arms", "[inventory][route]") {
         h.fleet_rows = rows();
         auto res = h.sink.Get(url);
         REQUIRE(res);
-        REQUIRE(contains(res->body, "No devices."));
+        REQUIRE(contains(res->body, "No host matches."));
         REQUIRE(contains(h.audit_details.back(), "rows=0"));
     }
     {   // Wider than the push-down bound: the route filters itself, the cursor follows the
@@ -633,6 +683,31 @@ TEST_CASE("software routes: devices table scope arms", "[inventory][route]") {
         REQUIRE(h.audited("inventory.software.query|denied")); // the post-filter drop is audited
         REQUIRE(h.audited("inventory.software.query|success"));
     }
+    {   // A FULL scanned page whose last row is out of scope still carries the sentinel, and the
+        // cursor follows that last SCANNED row (a099), never the last visible one (a098).
+        InvHarness h;
+        authz::VisibleSet big{std::unordered_set<std::string>{}};
+        for (std::size_t i = 0; i <= swc::kScopePushdownMaxIds; ++i)
+            big->insert("syn" + std::to_string(i));
+        for (int i = 0; i < 99; ++i)
+            big->insert(dev_id(i)); // a000..a098 in scope; a099 is not
+        big->insert(dev_id(100));
+        h.scope = big;
+        for (int i = 0; i <= 100; ++i)
+            h.fleet_rows.push_back(fleet_row(dev_id(i), "Chrome", "1"));
+        auto p1 = h.sink.Get(url);
+        REQUIRE(p1);
+        REQUIRE_FALSE(h.last_fleet_query->agent_ids); // post-filter arm
+        REQUIRE(contains(p1->body, "id=a098"));
+        REQUIRE_FALSE(contains(p1->body, "id=a099"));
+        REQUIRE(contains(p1->body, "data-act=\"dmore\""));
+        auto p2 = h.sink.Get(next_url(p1->body, "dmore"));
+        REQUIRE(p2);
+        REQUIRE(h.last_fleet_query->after);
+        REQUIRE(h.last_fleet_query->after->agent_id == "a099");
+        REQUIRE(contains(p2->body, "id=a100"));        // page 2 resumes after the cursor...
+        REQUIRE_FALSE(contains(p2->body, "id=a098"));  // ...and never re-serves page 1
+    }
 }
 
 TEST_CASE("software routes: devices parameters, cursor and audit", "[inventory][route]") {
@@ -652,9 +727,11 @@ TEST_CASE("software routes: devices parameters, cursor and audit", "[inventory][
             "inventory.software.query|success|Inventory|" + swc::audit_target(*h.last_fleet_query));
     h.sink.Get(std::string(kDevices) + "?name=Chrome");
     REQUIRE_FALSE(h.last_fleet_query->version); // absent = any version
-    // An unreadable bulk sync read dashes the cell rather than inventing a time.
+    // An unreadable bulk sync read dashes the cell (with its own tooltip) rather than inventing a time.
     h.last_synced_degrade = true;
     auto dash = h.sink.Get(std::string(kDevices) + "?name=Chrome");
+    REQUIRE(contains(dash->body, "inv-tbl"));
+    REQUIRE(contains(dash->body, "title=\"last sync time unavailable"));
     REQUIRE_FALSE(contains(dash->body, "ago"));
     // A bad cursor is a caveat, never a read.
     h.last_fleet_query.reset();

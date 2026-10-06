@@ -15,12 +15,14 @@
 
 #include "web_utils.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cctype>
 #include <cstddef>
 #include <charconv>
 #include <cstdint>
 #include <cstdio>
+#include <format>
 #include <string_view>
 #include <string>
 #include <unordered_map>
@@ -205,14 +207,18 @@ std::string degrade_banner(const std::string& what) {
 
 // ── Software page (M.9) ──────────────────────────────────────────────────────────
 // Mock-up v2.2 + the accepted v2.3 list, rendered from the PR-2 catalogue model. The page does
-// no arithmetic of its own (KpiFigures carries every percentage) and parses nothing. Every
-// interpolation goes through esc()/url_encode()/id_safe(); no JS string is ever built from data.
+// no KPI arithmetic (KpiFigures carries every percentage); the one ratio computed here is the
+// versions share-bar width, a display proportion of two counts on the same row. It parses
+// nothing. Every interpolation goes through esc()/url_encode()/id_safe(); no JS string is ever
+// built from data.
 
 namespace {
 
 namespace swc = software_catalogue;
 
 constexpr std::int64_t kStaleSecs = swc::kStaleWindowSecs; // 48 h: the Last synced stale pill
+// Two missed hourly refreshes: the 'stale —' prefix.
+constexpr std::int64_t kRollupStaleSecs = 7200;
 constexpr const char* kEm = "\xE2\x80\x94";                // U+2014
 
 std::string dash() { return std::string("<span class=\"inv-grey\">") + kEm + "</span>"; }
@@ -225,11 +231,7 @@ std::string fmt_int(std::int64_t n) {
     return n < 0 ? "-" + s : s;
 }
 
-std::string fmt_pct1(double v) {
-    char b[32];
-    std::snprintf(b, sizeof(b), "%.1f", v);
-    return b;
-}
+std::string fmt_pct1(double v) { return std::format("{:.1f}", v); }
 
 // The OS family an ecosystem belongs to, from the ONE table the rollup SQL is generated from.
 std::string_view eco_family(std::string_view eco) {
@@ -388,13 +390,13 @@ std::string kpi_strip(const SoftwarePageFilters& f, const swc::KpiFigures& k, st
         h += std::string("<div class=\"inv-kpi later\" hidden title=\"") + l.title + "\"><div class=\"h\">" +
              l.h + "</div><div class=\"big\">" + kEm + "</div><div class=\"s2\">" + l.s2 + "</div></div>";
     h += "</div>";
-    const bool stale = m.refreshed_at > 0 && (now - m.refreshed_at) > 7200;
+    const bool stale = m.refreshed_at > 0 && (now - m.refreshed_at) > kRollupStaleSecs;
     h += "<div class=\"inv-fresh\">Catalogue rollup " +
          std::string(stale ? "stale " + std::string(kEm) + " " : "") +
          (k.building ? "building&hellip;" : "updated " + rel_time(now, m.refreshed_at)) +
          " &middot; refreshes hourly &middot; counts are fleet-wide; the filters below narrow the "
-         "table &middot; <button type=\"button\" class=\"inv-link\" data-act=\"later\" "
-         "onclick=\"swLater(this)\">show metrics that need data we do not hold yet</button></div>";
+         "table</div><button type=\"button\" class=\"inv-link\" data-act=\"later\" "
+         "onclick=\"swLater(this)\">show metrics that need data we do not hold yet</button>";
     return h;
 }
 
@@ -519,6 +521,18 @@ std::string version_devices_url(const SoftwarePageFilters& f, const std::string&
     return "/fragments/inventory/software/devices?" + query_of(kv);
 }
 
+// Calls fn(item) for each non-empty item of a comma-separated list.
+template <class Fn>
+void for_each_csv(std::string_view csv, Fn&& fn) {
+    for (std::size_t p = 0; p < csv.size();) {
+        const auto e = csv.find(',', p);
+        const auto one = csv.substr(p, e == std::string_view::npos ? e : e - p);
+        if (!one.empty())
+            fn(one);
+        p = e == std::string_view::npos ? csv.size() : e + 1;
+    }
+}
+
 std::string title_rows(const SoftwarePageFilters& f, const SoftwarePageData& d) {
     std::string h;
     std::int64_t i = d.shown_before;
@@ -527,22 +541,11 @@ std::string title_rows(const SoftwarePageFilters& f, const SoftwarePageData& d) 
         const std::string vurl =
             "/fragments/inventory/software/versions?" + query_of(devices_kv(f, r.name, std::nullopt));
         const std::string durl = version_devices_url(f, r.name, std::nullopt, r.device_count);
-        std::string pills;
-        for (std::size_t p = 0; p < r.ecosystems.size();) {
-            const auto e = r.ecosystems.find(',', p);
-            const std::string one = r.ecosystems.substr(p, e == std::string::npos ? e : e - p);
-            if (!one.empty())
-                pills += eco_pill(one) + " ";
-            p = e == std::string::npos ? r.ecosystems.size() : e + 1;
-        }
-        std::string kinds;
-        for (std::size_t p = 0; p < r.kinds.size();) {
-            const auto e = r.kinds.find(',', p);
-            const std::string one = r.kinds.substr(p, e == std::string::npos ? e : e - p);
-            if (!one.empty())
-                kinds += (kinds.empty() ? "" : "/") + one;
-            p = e == std::string::npos ? r.kinds.size() : e + 1;
-        }
+        std::string pills, kinds;
+        for_each_csv(r.ecosystems, [&](std::string_view one) { pills += eco_pill(one) + " "; });
+        for_each_csv(r.kinds, [&](std::string_view one) {
+            kinds += (kinds.empty() ? "" : "/") + std::string(one);
+        });
         h += "<tr class=\"click\" data-t=\"" + std::to_string(i++) + "\" aria-expanded=\"false\" "
              "data-tog=\"v\" title=\"Click for installs per version\" hx-get=\"" + esc(vurl) +
              "\" hx-target=\"#" + box + "\" hx-swap=\"innerHTML\"><td class=\"inv-name\">" +
@@ -613,12 +616,17 @@ std::string results_region(const SoftwarePageFilters& f, const SoftwarePageData&
         return std::string("<a class=\"inv-btn sm\" data-act=\"export\" data-f=\"") + fmt + "\" download=\"" +
                file + "\" href=\"" + esc(href) + "\" title=\"" + esc(title) + "\">" + label + "</a>";
     };
-    h += "<div class=\"inv-resbar\"><div class=\"inv-count\" aria-live=\"polite\"><b>" +
-         fmt_int(d.totals->titles) + "</b> titles &middot; <b>" + fmt_int(d.totals->installs) +
-         "</b> installs" + (any_filter(f) ? " match your filters" : "") + " &middot; most installed first" +
-         (d.confined ? " &middot; <span class=\"inv-grey\">Newest in fleet: your management groups "
-                          "only</span>"
-                        : "") +
+    // The mock-up draws no count line when nothing matches (an empty live region).
+    const std::string count =
+        d.rows->empty()
+            ? std::string()
+            : "<b>" + fmt_int(d.totals->titles) + "</b> titles &middot; <b>" + fmt_int(d.totals->installs) +
+                  "</b> installs" + (any_filter(f) ? " match your filters" : "") +
+                  " &middot; most installed first" +
+                  (d.confined ? " &middot; <span class=\"inv-grey\">Newest in fleet: your management "
+                                "groups only</span>"
+                              : "");
+    h += "<div class=\"inv-resbar\"><div class=\"inv-count\" aria-live=\"polite\">" + count +
          "</div><div class=\"inv-exports\"><span>Export installs</span>" +
          dl("json", "software-installs.json", "/api/v1/inventory/software?" + export_kv("json", false), tip, "JSON") +
          dl("csv", "software-installs.csv", "/api/v1/inventory/software?" + export_kv("csv", false), tip, "CSV") +
@@ -668,9 +676,11 @@ std::string software_rest_call(const SoftwarePageFilters& f) {
     std::vector<std::pair<std::string, std::string>> kv;
     if (!f.q.empty())
         kv.emplace_back("q", f.q);
-    add_state(kv, f, true);
+    add_state(kv, f, false);
     if (!f.agent_id.empty())
         kv.emplace_back("agent_id", f.agent_id);
+    if (f.versions_min > 0)
+        kv.emplace_back("versions_min", std::to_string(f.versions_min));
     kv.emplace_back("limit", std::to_string(swc::kCatalogueDefaultLimit));
     return "/api/v1/inventory/software/catalogue?" + query_of(kv);
 }
@@ -724,10 +734,12 @@ std::string render_software_page(const SoftwarePageFilters& f, const SoftwarePag
     } else {
         h += kpi_strip(f, *d.kpis, d.now_secs);
     }
-    h += "<div class=\"inv-caveat\">Scope (ADR-0017): management-group confinement is <b>not yet "
-         "effective</b> under the global <span class=\"inv-mono\">Inventory:Read</span> gate, so "
-         "these fleet-wide counts span all groups. A scope filter + access audit run on every read "
-         "but do not narrow results today.</div>";
+    // A confined caller never reaches here with fleet counts (that view printed its own notice).
+    if (!d.confined)
+        h += "<div class=\"inv-caveat\">Scope (ADR-0017): these fleet-wide counts need a global "
+             "<span class=\"inv-mono\">Inventory:Read</span> grant. A management-group-confined "
+             "account is refused the fleet view and sees only the devices in its own groups; every "
+             "read is audited.</div>";
     h += controls(f, d);
     h += active_region(f, false);
     h += results_region(f, d);
@@ -783,12 +795,19 @@ std::string render_software_devices_table(const SoftwarePageFilters& f, const So
         const bool named = hn != t.hostnames.end() && !hn->second.empty();
         const std::string host = named ? hn->second : r.agent_id;
         const auto fam = eco_family(r.entry.ecosystem);
-        std::string synced = dash();
+        // Last synced: a degraded bulk read (no map) is told apart from "never synced" (a plain dash).
+        std::string synced = t.last_synced ? dash()
+                                           : std::string("<span class=\"inv-grey\" title=\"last sync time "
+                                                         "unavailable: the inventory store read degraded\">") +
+                                                 kEm + "</span>";
         if (t.last_synced) {
             const auto it = t.last_synced->find(r.agent_id);
-            if (it != t.last_synced->end() && it->second > 0)
-                synced = esc(rel_time(t.now_secs, it->second)) +
-                         (t.now_secs - it->second > kStaleSecs ? " <span class=\"inv-pill stale\">stale</span>" : "");
+            if (it != t.last_synced->end() && it->second > 0) {
+                const std::string ago = esc(rel_time(t.now_secs, it->second));
+                synced = t.now_secs - it->second > kStaleSecs
+                             ? "<span class=\"inv-pill stale\" title=\"last sync more than 48h ago\">" + ago + "</span>"
+                             : "<span class=\"inv-grey\">" + ago + "</span>";
+            }
         }
         body += "<tr data-gpf=\"" + grp + "\" data-gpname=\"" + esc(lc(host)) + "\"><td><a class=\"inv-hostlink" +
                 (named ? "" : " inv-unnamed") + "\" href=\"/hardware/ci?id=" + url_encode(r.agent_id) +
@@ -808,7 +827,7 @@ std::string render_software_devices_table(const SoftwarePageFilters& f, const So
                 "</td></tr>";
     }
     if (t.rows->empty())
-        body += "<tr><td colspan=\"" + std::to_string(ncol) + "\" class=\"inv-empty\">No devices.</td></tr>";
+        body += "<tr><td colspan=\"" + std::to_string(ncol) + "\" class=\"inv-empty\">No host matches.</td></tr>";
     if (t.next_cursor) {
         auto kv = devices_kv(f, t.name, t.version);
         kv.emplace_back("cursor", *t.next_cursor);

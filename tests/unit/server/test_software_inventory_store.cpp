@@ -2957,22 +2957,23 @@ TEST_CASE("source_last_seen_bulk: empty inputs are a precondition miss, not a de
 }
 
 TEST_CASE("source_last_seen_bulk: a store that never opened is a degrade", "[pg][software_inventory]") {
-    SWINV_SHARED(store, pool);
-    // Rename a column the open-time projection probes, so a second store fails closed (the
-    // same technique the schema-guard test uses), then put it back.
-    auto alter = [&](const char* sql) {
+    // DDL, so a private template clone (the macro drops it): nothing to restore if a REQUIRE throws.
+    YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    // Rename a column the open-time projection probes, so a store fails closed (the same
+    // technique the schema-guard test uses).
+    {
         auto lease = pool.try_acquire_for(std::chrono::seconds{5});
         REQUIRE(lease);
-        pg::PgResult r = pg::exec_params(lease.get(), sql, std::vector<std::string>{});
+        pg::PgResult r = pg::exec_params(
+            lease.get(),
+            "ALTER TABLE software_inventory_store.inventory_state RENAME COLUMN last_seen TO "
+            "last_seen_gone",
+            std::vector<std::string>{});
         REQUIRE(r.status() == PGRES_COMMAND_OK);
-    };
-    alter("ALTER TABLE software_inventory_store.inventory_state RENAME COLUMN last_seen TO "
-          "last_seen_gone");
-    {
-        SoftwareInventoryStore broken{pool};
-        REQUIRE_FALSE(broken.is_open());
-        CHECK_FALSE(broken.source_last_seen_bulk("installed_software", {"agent-a"}).has_value());
     }
-    alter("ALTER TABLE software_inventory_store.inventory_state RENAME COLUMN last_seen_gone TO "
-          "last_seen");
+    SoftwareInventoryStore broken{pool};
+    REQUIRE_FALSE(broken.is_open());
+    CHECK_FALSE(broken.source_last_seen_bulk("installed_software", {"agent-a"}).has_value());
 }
