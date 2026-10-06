@@ -8,8 +8,10 @@
 /// for the design rationale.
 ///
 /// Two trust domains on one surface:
-///   * Operator routes (mint/list/revoke) — `AuthFn`/`PermFn`-gated exactly
-///     like every other REST securable (`UploadGrant:Write/Read/Delete`).
+///   * Operator routes (mint/list/revoke): mint and revoke are `AuthFn`/`PermFn`-gated
+///     like every other REST securable (`UploadGrant:Write/Delete`). The list route
+///     refuses a service-scoped token through `deny_service_scoped_fn` and is otherwise
+///     gated by the `list_read_fn` list-admit resolver (`UploadGrant:Read`), not `PermFn`.
 ///   * Agent routes (session open/chunk/status/commit/cancel) — there is NO
 ///     authenticated agent REST transport (see the parsers header's WHY THE
 ///     DESIGN CHANGED note), so these gate on the grant/session BEARER

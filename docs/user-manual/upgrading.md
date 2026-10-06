@@ -300,9 +300,10 @@ token. **Remediation:** list grants with a non-service token. Non-service sessio
 **The ceiling applies wherever a seeded `ITServiceOwner` permission is absent.** With the seeded
 defaults `ITServiceOwner` holds every other pair the fleet-read routes pass, so nothing else changes
 for `Execution`, `Response`, `Inventory`, `Infrastructure`, `Policy`, `GuaranteedState` and
-`Workflow:Read`. No REST, MCP or CLI surface removes a permission from `ITServiceOwner` today, so a
-refusal on one of those pairs cannot arise in a default deployment; the rule is a safeguard for any
-future surface that narrows the role.
+`Workflow:Read`. No REST, MCP or CLI surface removes a seeded `ITServiceOwner` permission today, so a
+refusal on one of those pairs does not arise in a default deployment unless the `rbac_store` rows are
+edited directly in the database; the rule is the safeguard for that case and for any future surface
+that narrows the role.
 
 **Failure behaviour.** A FAILED permission read is different on the fleet-read gate: it answers a
 retryable `503` (`retry_after_ms` 5000, audit `auth.fleet_read_required` / `denied` with detail "RBAC
@@ -313,7 +314,20 @@ ceiling read goes through the RBAC authz circuit breaker with a 250 ms acquire b
 store fails quickly, and an open breaker is counted under the `pool_acquire_timeout` reason. The
 breaker bounds how many requests wait, not how long an already admitted read holds its connection:
 such a read can still wait up to the pool's `lock_timeout` (10 s default) or `statement_timeout`
-(30 s default).
+(30 s default). On a dark network path (no reply at all) the wait is bounded instead by the pool's
+`tcp_user_timeout` (10 s), which is confirmed on Linux, unconfirmed on Windows and a no-op on macOS, and
+until two failures have returned, up to the pool size (16 by default, `--postgres-pool-size`) of these
+reads can each hold a connection for that long. The breaker is the one operator permission checks use,
+so ceiling-read failures can open it and an open breaker denies operators' cache-miss checks too (fail
+closed).
+
+**The sibling gates changed their budget.** `require_permission` and `require_scoped_permission` now
+read the ceiling with the 250 ms authz acquire budget behind that shared breaker, where they used the
+2 s admin budget before. On a saturated or degraded pool a service-scoped request therefore turns into
+its `403` sooner (and an open breaker answers it without a pool touch).
+
+**Rollback.** Downgrading the binary restores the previous behaviour for all of the above. The change
+adds no schema and persists no state.
 
 To find affected callers, search the audit log for `action=auth.fleet_read_required` with
 `result=denied` and a detail containing "ITServiceOwner permission" (definitive deny, `403`) versus

@@ -191,7 +191,7 @@ not the numbers:
    `require_scoped_permission`, single-agent-shaped, not `require_fleet_read`).
 4. **§3d — the `authorize_list_read` supersede→intersect migration** (ADR-1006's deferred
    item; two twin-pairs, `plugin_config_routes.cpp`/MCP `list_plugin_config` and the
-   upload-grants resolver at `server.cpp:17722`/`:18307`). Separate stream — the
+   upload-grants list resolvers in `server.cpp`, the `authorize_list_read(username, "UploadGrant", "Read", ...)` call sites). Separate stream — the
    plugin-config pair has no agent dimension, so it needs a `kServiceScopeGlobalSafe`-style
    policy decision rather than a `meet()`, unlike upload-grants' clean intersection.
    The upload-grants REST route no longer reaches that resolver for a service-scoped token:

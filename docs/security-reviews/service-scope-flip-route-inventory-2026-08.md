@@ -101,7 +101,7 @@ default-deny (§3c); `resources/read` bypasses C8 structurally but calls
 | `POST /api/scope/validate` | Pure syntax check (`yuzu::scope::validate`) — never touches `scope_fn`, a store, or any data | handler-read (re-verified this session) |
 | `POST /api/v1/rbac/check` | Echoes only the caller's own resolved permission boolean, no fleet/agent data — belongs to the authz-topology-floor concern (`docs/security-reviews/authz-topology-floor-2026-08-05.md`), not this one | sweep-heuristic |
 | 16 auth-only dashboard page shells | Static chrome; data reaches the page only via already-gated fragments | sweep-heuristic (per original plan enumeration) |
-| Health probes, CA root/CRL, SCIM, upload-grant planes | Exempt by design (pre-auth or separate trust boundary) | sweep-heuristic (per original plan enumeration) |
+| Health probes, CA root/CRL, SCIM, upload-grant planes | Exempt by design (pre-auth or separate trust boundary); **except** the operator-facing list `GET /api/v1/upload-grants`, which is session-authenticated and not exempt (see the correction note on that route below) | sweep-heuristic (per original plan enumeration) |
 
 ## Sweep accounting (rest_api_v1.cpp, 74 `auth_fn` call sites)
 

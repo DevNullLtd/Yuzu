@@ -197,15 +197,21 @@ Recommended order for a fresh install:
 > 2. **Breaking:** `GET /api/v1/upload-grants` refuses a service-scoped token with `403` (no `permission`
 >    field); it used to return the minter's `UploadGrant:Read` view. Same remedy: list with a non-service token.
 > 3. The ceiling applies wherever a seeded `ITServiceOwner` permission is absent. No REST, MCP or CLI surface
->    removes one today (narrowing a seeded role's permission set is planned, see "Custom Roles" below), so
->    this is a safeguard for a future authoring surface, not something an operator can trigger now.
+>    removes a seeded `ITServiceOwner` permission today (narrowing a seeded role's permission set is planned,
+>    see "Custom Roles" below), so a refusal on one of those pairs arises only if the `rbac_store` rows are
+>    edited directly in the database; the rule is the safeguard for that case and for a future authoring surface.
 >
 > A definitive deny is `403`; a FAILED permission read on the fleet-read gate is a
 > retryable `503` (`retry_after_ms` 5000), while `require_permission` and
 > `require_scoped_permission` keep answering `403` for the same failure. The ceiling read goes through the
 > RBAC authz circuit breaker with a 250 ms acquire budget, so a degraded store answers quickly (an open
-> breaker is counted under `pool_acquire_timeout`); a read that is already admitted and holds a connection can
-> still wait up to the pool's `lock_timeout` (10 s default) or `statement_timeout` (30 s default). One
+> breaker is counted under `pool_acquire_timeout`). It is the same breaker operator permission checks use, so
+> repeated ceiling-read failures can open it and an open breaker denies operators' cache-miss checks too
+> (fail closed). A read that is already admitted and holds a connection can still wait up to the pool's
+> `lock_timeout` (10 s default) or `statement_timeout` (30 s default). On a dark network path (no reply at all)
+> the wait is bounded instead by the pool's `tcp_user_timeout` (10 s), which is confirmed on Linux, unconfirmed
+> on Windows and a no-op on macOS; and until two failures have returned, up to the pool size (16 by default,
+> `--postgres-pool-size`) of these reads can each hold a connection for that long. One
 > deferred item remains: the `authorize_list_read` supersede-to-intersect migration for the remaining callers
 > is tracked in `docs/security-reviews/service-scope-phase2-migrations-2026-08.md`, so "every fleet-read
 > route" above does not mean every route that lists per-agent data.
