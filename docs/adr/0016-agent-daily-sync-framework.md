@@ -359,8 +359,8 @@ leaving it as prose here.
 
 **Binding requirement for a future CMDB-correlation PR (unscheduled) — do NOT
 correlate on `"unknown"`.** (Note: the ladder's actual "PR2" — the `/inventory`
-Devices tab CI columns + per-device CI panel — is dashboard-**read**-only; it joins
-purely on `agent_id` and does not implement CMDB correlation/merge, so this
+Devices tab CI columns + per-device CI panel, now the Hardware CI list/record — is
+dashboard-**read**-only; it joins purely on `agent_id` and does not implement CMDB correlation/merge, so this
 requirement does not apply to it and remains open for whichever future PR adds
 cross-device correlation.) When the platform identity subsystem is unavailable, or
 a host genuinely has no SMBIOS serial (many VMs; Linux without the capability),

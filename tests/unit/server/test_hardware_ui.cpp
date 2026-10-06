@@ -339,6 +339,35 @@ TEST_CASE("hardware CI overview lens: MAC chips render one span per address",
     CHECK(empty_html.find("<span class=\"hw-tag\">") == std::string::npos);
 }
 
+TEST_CASE("hardware CI overview lens: CPU cores/threads and RAM humanised; unknown is a dash",
+          "[hardware][ui]") {
+    DeviceCiRecord rec;
+    rec.cpu_cores = "8";
+    rec.cpu_threads = "16";
+    rec.ram_bytes = "17179869184"; // 16 GiB
+    HardwareCiDetail detail;
+    detail.ci = std::optional<DeviceCiRecord>(rec);
+    HwCiAffordances aff;
+
+    const auto html = render_hardware_lens_body("a1", detail, /*lens=*/"", /*now_secs=*/0, aff);
+    CHECK(html.find("Cores / threads: </span>8c/16t") != std::string::npos);
+    CHECK(html.find("Memory: </span>16.0 GB") != std::string::npos);
+
+    DeviceCiRecord unk;
+    unk.cpu_cores = "unknown";
+    unk.cpu_threads = "unknown";
+    unk.ram_bytes = "unknown";
+    HardwareCiDetail unk_detail;
+    unk_detail.ci = std::optional<DeviceCiRecord>(unk);
+    const auto unk_html = render_hardware_lens_body("a1", unk_detail, "", 0, aff);
+    CHECK(unk_html.find("8c/16t") == std::string::npos);
+    CHECK(unk_html.find(" GB") == std::string::npos);
+    CHECK(unk_html.find("Cores / threads: </span><span class=\"inv-grey\">&mdash;</span>") !=
+          std::string::npos);
+    CHECK(unk_html.find("Memory: </span><span class=\"inv-grey\">&mdash;</span>") !=
+          std::string::npos);
+}
+
 // ── Lens tab bar ───────────────────────────────────────────────────────────────
 
 TEST_CASE("hardware lens bar: id, fixed 7-tab order, active class, oob gated on the parameter",

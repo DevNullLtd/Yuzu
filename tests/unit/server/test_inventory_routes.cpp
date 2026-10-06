@@ -102,6 +102,20 @@ TEST_CASE("software fragment: capped shows the list-capped banner", "[inventory]
     REQUIRE(contains(html, "list capped"));
 }
 
+TEST_CASE("software devices fragment: hit_cap shows the truncation pill, uncapped does not",
+          "[inventory][ui]") {
+    const std::optional<std::vector<SoftwareFleetRow>> rows{
+        std::vector<SoftwareFleetRow>{fleet_row("agent-1", "Chrome", "120")}};
+    const std::unordered_map<std::string, std::string> hostnames;
+
+    REQUIRE(contains(render_inventory_software_devices_fragment("Chrome", rows, /*hit_cap=*/true, 0,
+                                                                hostnames),
+                     "truncated at cap"));
+    REQUIRE_FALSE(contains(render_inventory_software_devices_fragment("Chrome", rows, /*hit_cap=*/false,
+                                                                      0, hostnames),
+                           "truncated at cap"));
+}
+
 TEST_CASE("versions fragment: degrade banner vs empty vs share bars", "[inventory][ui]") {
     // nullopt = store degrade → banner.
     REQUIRE(contains(render_inventory_versions_fragment("Chrome", std::nullopt), "unavailable"));
