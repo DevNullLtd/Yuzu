@@ -2030,8 +2030,13 @@ env keys with defaults, which a reverted build ignores.
   receives the request in the message of its `register` call and keeps it in an
   ETS table). Three layers now cover those three processes. First, `format_status`
   exists for all three and redacts the stored request: for the upstream client the
-  replay queue and the recent-replay stamps (shown as sizes), the last message, the
-  reason and the debug log; for the per-agent process the stored registration
+  replay queue and the recent-replay stamps (shown as sizes), the held
+  stream-status store and the probe record (shown only as `notify_pending_len`, a
+  count, and `notify_probe_held`, true or false, so `sys:get_status(yuzu_gw_upstream)`
+  shows no session id or peer address), the last message (the
+  `notify_stream_status` cast is redacted too: the agent id and the event are
+  kept, the session id, peer address and stream home are replaced), the
+  reason and the debug log (INFERRED from `format_status` and unit tests, not run on a rig); for the per-agent process the stored registration
   request; for the registry the request inside the `register` message. Second, a
   request can no longer leave through an exit reason: an exception raised inside
   the upstream client's own RPC calls is caught and counted as a failed RPC (code
