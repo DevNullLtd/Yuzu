@@ -10,6 +10,7 @@
  * is revoked from ITServiceOwner, so a route that passed some other pair to the gate fails.
  */
 
+#include "enrollment_directory_routes.hpp"
 #include "execution_routes.hpp"
 #include "execution_tracker.hpp"
 #include "rest_api_v1.hpp"
@@ -79,6 +80,37 @@ struct CeilingRouteRig {
 
 bool has(const std::string& hay, const std::string& needle) {
     return hay.find(needle) != std::string::npos;
+}
+
+// The suffix only require_fleet_read's ceiling writes on its 403.
+constexpr const char* kCeilingSuffix = "(the ITServiceOwner role does not hold it)";
+
+/// The three callbacks every route module takes, bound to one real AuthRoutes.
+struct GateFns {
+    RestApiV1::AuthFn auth_fn;
+    RestApiV1::PermFn perm_fn;
+    RestApiV1::FleetReadFn fleet_fn;
+    RestApiV1::AuditFn audit_fn;
+};
+
+GateFns make_gate_fns(AuthRoutes& ar) {
+    GateFns g;
+    g.auth_fn = [&ar](const httplib::Request& req,
+                      httplib::Response& res) -> std::optional<auth::Session> {
+        return ar.require_auth(req, res);
+    };
+    g.perm_fn = [&ar](const httplib::Request& req, httplib::Response& res, const std::string& t,
+                      const std::string& o) -> bool { return ar.require_permission(req, res, t, o); };
+    g.fleet_fn = [&ar](const httplib::Request& req, httplib::Response& res, const std::string& t,
+                       const std::string& o) -> authz::FleetReadGate {
+        auto result = ar.require_fleet_read(req, res, t, o);
+        if (!result)
+            return {};
+        return {true, result->visible_for_query()};
+    };
+    g.audit_fn = [](const httplib::Request&, const std::string&, const std::string&,
+                    const std::string&, const std::string&, const std::string&) { return true; };
+    return g;
 }
 
 } // namespace
@@ -178,5 +210,148 @@ TEST_CASE("fleet-read routes real gate: revoking Execution:Read from ITServiceOw
         auto [code, body] = status_of(path);
         CHECK(code == 403);
         CHECK(has(body, "service-scoped token does not grant Execution:Read"));
+        // The suffix only the fleet-read ceiling writes: attributes the 403 to the ceiling,
+        // not to require_permission's identical prefix.
+        CHECK(has(body, "(the ITServiceOwner role does not hold it)"));
+    }
+}
+
+// Enrollment:Read is the one pair ITServiceOwner does NOT hold under the seeded defaults, so a
+// service token is refused with the ceiling's own body until an operator grants it. The
+// minter's ordinary (non-service) token is unaffected throughout.
+TEST_CASE("fleet-read routes real gate: Enrollment:Read is refused to a service token under the "
+          "seeded defaults and admitted past the ceiling once ITServiceOwner holds it",
+          "[pg][enrollment][confinement][authz][service_scope]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::response_execution_authz_tpl);
+    CeilingRouteRig r{db.dsn()};
+    REQUIRE(r.rig.rbac.create_role({"EnrollmentReader3526", "", false, 0}).has_value());
+    REQUIRE(r.rig.rbac.set_permission({"EnrollmentReader3526", "Enrollment", "Read", "allow"})
+                .has_value());
+    REQUIRE(r.rig.rbac.assign_role({"user", "gary", "EnrollmentReader3526"}).has_value());
+
+    GateFns g = make_gate_fns(*r.svc_auth);
+    yuzu::server::test::TestRouteSink sink;
+    EnrollmentDirectoryRoutes routes;
+    routes.register_routes(sink, g.auth_fn, g.perm_fn, g.audit_fn, /*directory_sync=*/nullptr,
+                           /*auto_approve=*/nullptr, &r.rig.auth_mgr, &r.rig.cfg, r.rig.oidc_mu,
+                           g.fleet_fn);
+
+    const auto svc = r.mint_service("gary", "printers");
+    const auto ordinary = r.mint_service("gary", "");
+    const auto get = [&](const std::string& token) {
+        auto res = sink.dispatch("GET", "/api/v1/enrollment/pending-agents", {},
+                                 "application/json", {{"Authorization", "Bearer " + token}});
+        REQUIRE(res);
+        return std::pair{res->status, res->body};
+    };
+
+    {
+        auto [code, body] = get(svc);
+        CHECK(code == 403);
+        CHECK(has(body, "service-scoped token does not grant Enrollment:Read"));
+        CHECK(has(body, kCeilingSuffix));
+        CHECK_FALSE(has(body, "\"permission\""));
+    }
+    // Admitted by the gate. This rig wires no enrollment store, so the handler's own read
+    // answers "enrollment store unavailable" (503); what matters here is that it is neither
+    // the ceiling's 403 nor a 401.
+    {
+        auto [code, body] = get(ordinary);
+        CHECK(code == 503);
+        CHECK(has(body, "enrollment store unavailable"));
+    }
+
+    REQUIRE(r.rig.rbac.set_permission({"ITServiceOwner", "Enrollment", "Read", "allow"})
+                .has_value());
+    {
+        auto [code, body] = get(svc);
+        CHECK(code == 503);
+        CHECK(has(body, "enrollment store unavailable"));
+        CHECK_FALSE(has(body, kCeilingSuffix));
+    }
+}
+
+// One real route per remaining fleet-read securable that is cheap to construct. Each route
+// answers the ceiling's 403 (naming exactly its own pair) after THAT pair alone is revoked
+// from ITServiceOwner, and keeps passing the ceiling while only other pairs are revoked, so a
+// call site that hands the gate the wrong securable string turns this red.
+TEST_CASE("fleet-read routes real gate: each route answers the ceiling for exactly its own "
+          "securable",
+          "[pg][confinement][authz][service_scope]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::response_execution_authz_tpl);
+    CeilingRouteRig r{db.dsn()};
+    REQUIRE(r.rig.rbac.create_role({"FleetReader3526", "", false, 0}).has_value());
+    for (const char* securable : {"Response", "Inventory", "Infrastructure", "GuaranteedState"})
+        REQUIRE(r.rig.rbac.set_permission({"FleetReader3526", securable, "Read", "allow"})
+                    .has_value());
+    REQUIRE(r.rig.rbac.assign_role({"user", "gary", "FleetReader3526"}).has_value());
+
+    GateFns g = make_gate_fns(*r.svc_auth);
+    yuzu::server::test::TestRouteSink sink;
+    RestApiV1 api;
+    api.register_routes(sink, g.auth_fn, g.perm_fn, g.audit_fn,
+                        /*rbac_store=*/nullptr, /*mgmt_store=*/nullptr, /*token_store=*/nullptr,
+                        /*quarantine_store=*/nullptr, /*response_store=*/nullptr,
+                        /*instruction_store=*/nullptr, &r.tracker, /*schedule_engine=*/nullptr,
+                        /*approval_manager=*/nullptr, /*tag_store=*/nullptr,
+                        /*audit_store=*/nullptr, /*service_group_fn=*/{}, /*tag_push_fn=*/{},
+                        /*inventory_store=*/nullptr, /*product_pack_store=*/nullptr,
+                        /*sw_deploy_store=*/nullptr, /*device_token_store=*/nullptr,
+                        /*license_store=*/nullptr, /*guaranteed_state_store=*/nullptr,
+                        /*metrics_registry=*/nullptr, /*session_revoke_fn=*/{},
+                        /*execution_event_bus=*/nullptr, /*result_set_store=*/nullptr,
+                        /*command_dispatch_fn=*/{}, /*step_up_fn=*/{}, /*guardian_push_fn=*/{},
+                        /*dex_perf_fn=*/{}, /*network_api=*/{}, /*lockout_clear_fn=*/{},
+                        /*baseline_store=*/nullptr, /*scoped_perm_fn=*/{},
+                        /*software_inventory_store=*/nullptr, /*response_scope_fn=*/{},
+                        /*engine_principal_store=*/nullptr, /*access_review_store=*/nullptr,
+                        /*auth_db=*/nullptr, /*directory_sync=*/nullptr, /*stream_budget=*/nullptr,
+                        /*exec_visible_fn=*/{}, /*list_read_fn=*/{},
+                        /*fleet_read_fn=*/g.fleet_fn);
+
+    struct Site {
+        const char* securable;
+        std::string path;
+    };
+    // Every gate call sits before the route's own store/registry null check, so these answer
+    // a non-ceiling status (a 503 for the unwired store) while the ceiling admits.
+    const std::vector<Site> sites = {
+        {"Response", "/api/v1/executions/x1/responses"},
+        {"Inventory", "/api/v1/inventory/software"},
+        {"Infrastructure", "/api/v1/devices"},
+        {"GuaranteedState", "/api/v1/dex/perf/app/devices?app=a&version=1.0"},
+    };
+    const auto svc = r.mint_service("gary", "printers");
+    const std::unordered_map<std::string, std::string> hdrs{{"Authorization", "Bearer " + svc}};
+    const auto get = [&](const Site& site) {
+        auto res = sink.dispatch("GET", site.path, {}, "application/json", hdrs);
+        REQUIRE(res);
+        return std::pair{res->status, res->body};
+    };
+    const auto ceiling_refused = [&](const Site& site) {
+        auto [code, body] = get(site);
+        return code == 403 && has(body, kCeilingSuffix);
+    };
+
+    for (const auto& site : sites) {
+        INFO("seeded defaults: " << site.path);
+        CHECK_FALSE(ceiling_refused(site));
+        CHECK(get(site).first != 401);
+    }
+    for (size_t i = 0; i < sites.size(); ++i) {
+        REQUIRE(r.rig.rbac.remove_permission("ITServiceOwner", sites[i].securable, "Read")
+                    .has_value());
+        for (size_t j = 0; j < sites.size(); ++j) {
+            INFO("revoked through " << sites[i].securable << ", probing " << sites[j].path);
+            if (j <= i) {
+                auto [code, body] = get(sites[j]);
+                CHECK(code == 403);
+                CHECK(has(body, std::string("service-scoped token does not grant ") +
+                                    sites[j].securable + ":Read"));
+                CHECK(has(body, kCeilingSuffix));
+            } else {
+                CHECK_FALSE(ceiling_refused(sites[j]));
+            }
+        }
     }
 }

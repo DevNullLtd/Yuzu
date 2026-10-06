@@ -531,7 +531,7 @@ TEST_CASE("require_fleet_read: genuinely empty service set ⇒ admitted-empty wi
 // service branch). The minter holds a GLOBAL grant and the tag meet would admit, so only the
 // ceiling can produce the 403. `remove_permission` is the operator revoke (it records the
 // `revoked_seed_defaults` marker so a reboot does not re-seed the pair).
-TEST_CASE("require_fleet_read: service token, ITServiceOwner lacks the pair => Forbidden even "
+TEST_CASE("require_fleet_read: service token - ITServiceOwner lacks the pair => Forbidden even "
           "when the minter holds it and the tag meet would admit",
           "[pg][auth_routes][authz_gates][service_scope]") {
     YUZU_REQUIRE_PG_DB_TPL(rbac_db_, rbac_gates_tpl);
@@ -594,13 +594,13 @@ TEST_CASE("require_fleet_read: service token, ITServiceOwner lacks the pair => F
     }
 }
 
-TEST_CASE("require_fleet_read: service token, degraded ITServiceOwner permission read => "
-          "503 retryable with the degrade metric (fail closed, never an admit), while "
+TEST_CASE("require_fleet_read: service token - degraded ITServiceOwner permission read => "
+          "503 retryable with the degrade metric (fail closed and never an admit) while "
           "require_permission and require_scoped_permission keep their 403",
           "[pg][auth_routes][authz_gates][service_scope]") {
     YUZU_REQUIRE_PG_DB_TPL(rbac_db_, rbac_gates_tpl);
+    yuzu::MetricsRegistry metrics; // declared before the rig: auth_mgr keeps a raw pointer to it
     GatesRig r{rbac_db_.dsn()};
-    yuzu::MetricsRegistry metrics;
     r.auth_mgr.set_metrics_registry(&metrics);
     REQUIRE(r.rbac.assign_role({"user", "minter", "RespReader"}).has_value());
     const auto svc = r.mint("printers");
@@ -671,12 +671,12 @@ TEST_CASE("require_fleet_read: service token, degraded ITServiceOwner permission
     CHECK(found);
 }
 
-TEST_CASE("require_fleet_read: explicit DENY row for ITServiceOwner on the pair => 403, not an "
+TEST_CASE("require_fleet_read: explicit DENY row for ITServiceOwner on the pair => 403 - not an "
           "admit and not a degrade",
           "[pg][auth_routes][authz_gates][service_scope]") {
     YUZU_REQUIRE_PG_DB_TPL(rbac_db_, rbac_gates_tpl);
+    yuzu::MetricsRegistry metrics; // declared before the rig: auth_mgr keeps a raw pointer to it
     GatesRig r{rbac_db_.dsn()};
-    yuzu::MetricsRegistry metrics;
     r.auth_mgr.set_metrics_registry(&metrics);
     REQUIRE(r.rbac.assign_role({"user", "minter", "RespReader"}).has_value());
     const auto svc = r.mint("printers");
@@ -715,7 +715,7 @@ TEST_CASE("require_fleet_read: explicit DENY row for ITServiceOwner on the pair 
 }
 
 TEST_CASE("require_fleet_read: service token through an MCP tier is not admitted by the "
-          "ceiling path on its own (branch order: tier falls through, ceiling still decides)",
+          "ceiling path on its own (branch order: the tier falls through and the ceiling still decides)",
           "[pg][auth_routes][authz_gates][service_scope]") {
     YUZU_REQUIRE_PG_DB_TPL(rbac_db_, rbac_gates_tpl);
     GatesRig r{rbac_db_.dsn()};
@@ -753,7 +753,7 @@ TEST_CASE("require_fleet_read: service token through an MCP tier is not admitted
 // service-scoped token is refused on GET /api/v1/enrollment/pending-agents (the gate's pair)
 // even when its minter is an Administrator. A non-service Administrator is unaffected.
 TEST_CASE("require_fleet_read: Enrollment:Read under seeded defaults => 403 for a service "
-          "token with the ceiling body, an Administrator non-service token is unaffected",
+          "token with the ceiling body - an Administrator non-service token is unaffected",
           "[pg][auth_routes][authz_gates][service_scope]") {
     YUZU_REQUIRE_PG_DB_TPL(rbac_db_, rbac_gates_tpl);
     GatesRig r{rbac_db_.dsn()};
@@ -782,7 +782,7 @@ TEST_CASE("require_fleet_read: Enrollment:Read under seeded defaults => 403 for 
 
 // The eight literal securables fleet-read callers use (all Read). Seeded ITServiceOwner holds
 // seven; Enrollment is the documented exception. Revoking one pair refuses only that pair.
-TEST_CASE("require_fleet_read: ceiling over the eight fleet-read securables, seeded and after "
+TEST_CASE("require_fleet_read: ceiling over the eight fleet-read securables - seeded and after "
           "a single-pair revoke",
           "[pg][auth_routes][authz_gates][service_scope]") {
     YUZU_REQUIRE_PG_DB_TPL(rbac_db_, rbac_gates_tpl);
@@ -873,8 +873,8 @@ TEST_CASE("require_fleet_read: service-scoped token, RBAC genuinely disabled "
     CHECK(res.body.find("require RBAC to be enabled") != std::string::npos);
 }
 
-TEST_CASE("require_fleet_read: service token, RBAC disabled AND the pair revoked from "
-          "ITServiceOwner => the RBAC-must-be-enabled text, not the ceiling text (branch order)",
+TEST_CASE("require_fleet_read: service token - RBAC disabled AND the pair revoked from "
+          "ITServiceOwner => the RBAC-must-be-enabled text - not the ceiling text (branch order)",
           "[pg][auth_routes][authz_gates][service_scope]") {
     YUZU_REQUIRE_PG_DB_TPL(rbac_db_, rbac_gates_tpl);
     GatesRig r{rbac_db_.dsn()};
@@ -1120,7 +1120,7 @@ TEST_CASE("service_scope_policy: service_scope_global_safe denies everything whi
 // pure mapping function is pinned directly (the Degraded => 503 path itself is covered by
 // the degraded-read test above).
 TEST_CASE("authz::ceiling_degrade_reason: pool acquire timeout prefix maps to "
-          "pool_acquire_timeout, anything else to query_error",
+          "pool_acquire_timeout - anything else to query_error",
           "[authz_gates][authz]") {
     using yuzu::server::authz::ceiling_degrade_reason;
     CHECK(std::string_view{ceiling_degrade_reason("pool acquire timeout")} ==
