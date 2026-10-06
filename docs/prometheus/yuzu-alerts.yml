@@ -487,11 +487,19 @@ groups:
 
       - alert: YuzuRbacReadDegraded
         # An authorization read against the PostgreSQL rbac_store (ADR-0041)
-        # could not resolve and therefore DENIED (reads fail closed —
-        # deny-on-degrade). Because require_permission / authorize_list_read /
-        # require_fleet_read all route through this store, a degrade denies
-        # authorization FLEET-WIDE —
-        # it is an availability event, not a silent partial outage. /readyz stays
+        # could not resolve and therefore DENIED the request that needed it
+        # (reads fail closed — deny-on-degrade). require_permission /
+        # require_scoped_permission / authorize_list_read / require_fleet_read
+        # all resolve through this store, but WHICH callers a degrade denies
+        # depends on the read that failed: an operator permission check or a
+        # list-read confinement read is denied only on a permission-cache miss
+        # (a decision already cached on that replica is still served), while a
+        # service-scoped API token is refused (503) whenever the ITServiceOwner
+        # ceiling read fails, because that read runs on every such request. The
+        # counter is per replica (the expr sums across replicas), so one
+        # degraded replica can raise it while others keep answering. It is an
+        # availability event, not a silent partial outage, but it does not by
+        # itself mean every caller is denied. /readyz stays
         # green under pure pool saturation (it trips only on connection failure,
         # to avoid false LB evictions), so this is otherwise dashboard-invisible.
         # reason = pool_acquire_timeout | query_error | generation_refresh_failed.
@@ -510,24 +518,30 @@ groups:
         # this rule exists to prevent, just via a different reason value.
         # Splitting it keeps generation_refresh_failed denial-only. Folding
         # any of the three observe-only reasons into this alert's reason=~match
-        # would page "callers being denied fleet-wide" for a condition that
-        # denies nobody — a false alarm during exactly the kind of incident
-        # this alert exists to page accurately for. If any ever needs its own
-        # alert, it must NOT claim fleet-wide denial.
+        # would page "requests being denied" for a condition that denies
+        # nobody — a false alarm during exactly the kind of incident this
+        # alert exists to page accurately for. If any ever needs its own
+        # alert, it must NOT claim that anything is being denied.
         expr: |
           sum(rate(yuzu_server_rbac_read_degrade_total{reason=~"pool_acquire_timeout|query_error|generation_refresh_failed"}[5m])) by (reason) > 0
         for: 5m
         labels:
           severity: critical
         annotations:
-          summary: "RBAC authorization reads degrading — callers being denied ({{ $labels.reason }})"
+          summary: "RBAC authorization reads degrading — requests that need a failed read are being denied ({{ $labels.reason }})"
           description: >-
             yuzu_server_rbac_read_degrade_total{reason="{{ $labels.reason }}"} is
             non-zero: authorization reads against the PostgreSQL rbac_store are
             failing and therefore DENYING (fail-closed / deny-on-degrade,
-            ADR-0041). Because require_permission / require_scoped_permission /
-            authorize_list_read / require_fleet_read all resolve through this
-            store, operators and agentic callers are being denied fleet-wide. pool_acquire_timeout /
+            ADR-0041). Each failed read denies the request that needed it, so
+            operators, agentic callers and service-scoped tokens are being
+            denied wherever their decision needed a read that failed: an
+            operator permission or list-read check only on a permission-cache
+            miss (a cached decision is still served), a service-scoped token on
+            every request whose ITServiceOwner ceiling read fails (a retryable
+            503). This does not by itself mean every caller is denied, and the
+            counter is per replica (summed here), so check whether one replica
+            or all are affected. pool_acquire_timeout /
             query_error correlate with yuzu_pg_* saturation or outage;
             generation_refresh_failed means the cross-replica cache-coherence
             token could not be re-read PAST the bounded ~5s stale-serve window

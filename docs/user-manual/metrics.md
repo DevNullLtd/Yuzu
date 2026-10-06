@@ -1970,8 +1970,9 @@ The `RbacStore` — the PostgreSQL authorization substrate (schema `rbac_store`)
 that backs `require_permission` / `require_scoped_permission` /
 `authorize_list_read` — exports two counters, a histogram, and a gauge.
 Authorization reads **fail closed (deny-on-degrade)**: when the store cannot
-answer, it **denies** rather than allowing, so a degrade is a **fleet-wide
-authorization-availability event**, not a silent partial outage.
+answer, it **denies** rather than allowing, so a degrade is an
+**authorization-availability event** for the requests whose read failed (not
+necessarily every caller), not a silent partial outage.
 
 | Metric | Type | Labels | Description |
 |---|---|---|---|
@@ -2046,13 +2047,13 @@ yuzu_server_rbac_enforcement_toggle_total{transport="mcp",result="refused"} 0
 yuzu_server_rbac_enforcement_toggle_total{transport="mcp",result="failed"} 0
 ```
 
-**Suggested alert (a degrade on one of the three denying reasons denies authz fleet-wide):**
+**Suggested alert (a degrade on one of the three denying reasons denies the requests whose authorization read failed):**
 
 ```promql
 # Scoped to the three DENYING reasons only — rbac_enabled_non_canonical,
 # stale_beyond_accepted_bound, and generation_refresh_failed_within_bound
 # share this metric but deny nothing, so folding them into this expression
-# would page a false "callers denied fleet-wide".
+# would page a false "requests being denied".
 sum(rate(yuzu_server_rbac_read_degrade_total{reason=~"pool_acquire_timeout|query_error|generation_refresh_failed"}[5m])) by (reason) > 0
 ```
 

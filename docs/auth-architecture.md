@@ -4482,9 +4482,12 @@ mechanism's failure modes, is deleted along with it.
 
 **Metrics.** `yuzu_server_rbac_read_degrade_total{reason}` — three
 DENYING reasons (`pool_acquire_timeout` / `query_error` /
-`generation_refresh_failed`): a degrade denies authz fleet-wide, so a
-non-zero rate on one of these is a fleet-wide authorization-availability
-event, and the `YuzuRbacReadDegraded` alert pages on exactly this subset.
+`generation_refresh_failed`): each failed read denies the request that
+needed it (operator permission and list-read checks on a permission-cache
+miss, service-scoped tokens on every request whose `ITServiceOwner` ceiling
+read fails), so a non-zero rate on one of these is an authorization-availability
+event, though not necessarily one that denies every caller, and the
+`YuzuRbacReadDegraded` alert pages on exactly this subset.
 Two OBSERVE-ONLY reasons share the same metric but deny nothing — the read
 still proceeds — and are deliberately excluded from that alert:
 `rbac_enabled_non_canonical` (a periodic refresh saw a non-canonical value;
