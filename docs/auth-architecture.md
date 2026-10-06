@@ -3907,7 +3907,8 @@ Security review record: `docs/security-reviews/authdb-2026-04-30.md`
 
 The hard invariants for AuthDB-touching changes (schema/`PgPool`
 construction, fail-closed posture, `SecretCodec` registration,
-config-as-seed-only / fresh-start, role-field ignored, gate-level audit,
+config-as-seed / fresh-start (on 0.14.x the cfg entry still wins over the
+database at every start; seed-only from 0.15.0, #5274), role-field ignored, gate-level audit,
 MFA fail-closed on secret-read failure, cleanup cadence, snapshot-and-release
 publishing) live in `.claude/agents/authdb.md` — the AuthDB review agent
 loads them on any change to `auth_db.{hpp,cpp}` / `auth_routes.{hpp,cpp}` /
