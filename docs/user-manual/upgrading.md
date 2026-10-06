@@ -3474,7 +3474,7 @@ Before upgrading any component:
     and ignores them).
   - **At the Spark flip (not part of this upgrade), upgraded agents.** They hold the policy generation and keep being re-pushed while a
     wedged rule or a compensating teardown is outstanding (each re-push writes a `guaranteed_state.reconcile` audit row, about once per
-    heartbeat per held agent; the agent suppresses the identical re-pushes and applies one in full about every 330 s).
+    heartbeat per held agent; the agent suppresses the identical re-pushes and applies one in full about every 330 s; if a healthy rule of the hung call's mechanism type is in the push, every re-push after the first of those is applied in full, flip-gate AC-16).
   - **At the Spark flip, agents without the #5459 retry suppression.** Every agent built before the #5459 change carries the earlier
     three-re-apply waiver (PR #4529). Such an agent can acknowledge the generation after three re-applies of a wedged rule (and, without the
     #4472 fix, while a compensating teardown is outstanding), which can leave the rule unarmed under an acknowledged generation if the hung

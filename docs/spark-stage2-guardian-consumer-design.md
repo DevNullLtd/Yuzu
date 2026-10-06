@@ -717,7 +717,12 @@ every rule can recapture unpersisted Spark-first `FileHashEquals` baselines (#40
 while a same-type mechanism call is hung, the Disarm of a healthy same-type rule queues
 behind it on `SparkEngine`'s per-type mechanism lock, so that rule is logically
 withdrawn at once and its re-arm may expire as `CongestionExpired`; the same collateral
-already occurred on every Reapply before #5459 and now occurs at most about every 330 s.
+already occurred on every Reapply before #5459. It occurs at most about every 330 s only
+while no same-type sibling's re-arm expires (a pure retained-wedge hold). With a healthy
+same-type sibling in the push the valve only delays its onset: the first forced Reapply
+withdraws the sibling, the sibling's expired re-arm is a counted non-wedge failure, so the
+`resolved_failed != failed_receipts.size()` check below answers Reapply on every later push
+(about one per heartbeat) for as long as the hang lasts. Pinned by `[5459fu10]`.
 A wedged key stays wedged until its own worker returns or the agent restarts
 (**restart is a
 remediation only for a *transient* wedge — for a *permanently* wedged target, restart
@@ -793,7 +798,9 @@ retries), so corroborate with `yuzu.guardian_arm_failed`/`arm_pending`, the
 compensation age/deadline tags and the agent log before concluding wedge); (2) the server applies no back-off (none is added by #5459; FU-13 in the flip gate), so a held agent
 costs one `guaranteed_state.reconcile` audit row per push, about one per 30 s
 heartbeat at the default (the push interval is `ceil(25 s / heartbeat) x heartbeat`, so other intervals scale), plus a forced full teardown and
-re-arm about every 330 s from the safety valve (re-arm recaptures only
+re-arm about every 330 s from the safety valve (for a pure retained-wedge hold; with a
+healthy same-type sibling in the push, every push after the first forced one is a full
+teardown and re-arm, AC-16) (re-arm recaptures only
 Spark-first-captured, unpersisted `FileHashEquals` baselines, #4045: persisted
 baselines are re-seeded on every arm); (3) an operator delta push (`full_sync=false`)
 during a hold flips the push identity twice and resets the suppression budget;
