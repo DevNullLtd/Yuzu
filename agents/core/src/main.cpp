@@ -11,6 +11,7 @@ __declspec(allocate(".CRT$XCB")) [[maybe_unused]] static void(__cdecl* p_diag_in
 #endif
 
 #include <yuzu/agent/updater.hpp>
+#include <yuzu/agent/update_signature_mode.hpp>
 #include <yuzu/agent/agent.hpp>
 #include <yuzu/agent/env_util.hpp>
 #include <yuzu/agent/identity_store.hpp>
@@ -725,6 +726,22 @@ int main(int argc, char* argv[]) {
     // SLE (ADR-0024 D11): echo the effective user_ref mode ONCE at startup — the
     // per-agent HMAC key (k_agent) is NEVER logged (roadmap R16), only the mode.
     spdlog::info("software_licensing user_ref mode: {}", cfg.license_scan_user_ref);
+    // #5249: say which OTA update-signature mode this process actually loaded
+    // (off / bundle / bundle+require) and the bundle path, and warn on any
+    // YUZU_UPDATE_* variable this agent does not read (a misspelt name is
+    // otherwise silently ignored). Built from the same two Config fields
+    // agent.cpp hands the Updater, AFTER the fail-open guard above, so it reports
+    // what will be enforced. Sited here, before the Windows service hand-off, so
+    // the service and console paths both log it.
+    //
+    // NO I/O here: this runs BEFORE the Windows SCM hand-off and a blocking open
+    // (FIFO, unreachable UNC) would exceed the 30s START_PENDING hint (error
+    // 1053) — Gate 7 #5249. The bundle probe runs on the OTA update thread. And
+    // the call is noexcept with its own firewall: a diagnostic must never stop
+    // boot (main() has no enclosing handler).
+    yuzu::agent::log_update_signature_startup_report(
+        yuzu::agent::UpdateConfig{.signature_trust_bundle = cfg.update_trust_bundle,
+                                  .require_signature = cfg.update_require_signature});
 
 #ifdef _WIN32
     // #1822: hand off to the SCM ServiceMain dispatcher instead of running the

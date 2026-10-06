@@ -242,6 +242,7 @@ agent_test_exe = executable(
     'unit/test_progress_listener.cpp', # #4018 per-test START/END progress log, env-gated
     'unit/test_detached_signature.cpp', # shared detached-CMS verifier (#416/#3807)
     'unit/test_updater_signature.cpp', # OTA signature gate, end to end (#416/#3807)
+    'unit/test_update_signature_mode.cpp', # OTA update-signature mode report + env typo check (#5249)
     'unit/test_plugin_loader.cpp',
     'unit/test_capability_registry_tables.cpp',
     'unit/test_sdk_utilities.cpp',
@@ -2720,6 +2721,17 @@ test('agent installer trust-anchor ACL lint',
 test('compose certs volume',
   _python3_test,
   args: [files('test_compose_certs_volume.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
+# README Docker Compose quickstart (#5419): the compose the README downloads must
+# pull released images at ${YUZU_VERSION}, persist /etc/yuzu/certs, publish 8443,
+# and take the headless admin seed at the image's --config path. Stdlib only;
+# reuses test_compose_certs_volume.py's volume reader.
+test('readme quickstart compose',
+  _python3_test,
+  args: [files('test_readme_quickstart.py')],
   suite: 'docs',
   timeout: 30,
 )

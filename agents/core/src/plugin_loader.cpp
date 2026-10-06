@@ -195,9 +195,11 @@ std::optional<std::string> verify_plugin_signature(const std::filesystem::path& 
     if (!err)
         return std::nullopt; // verified
 
-    const std::string_view prefix = err->kind == CmsFailure::kUntrusted
-                                        ? kSignatureUntrustedReason
-                                        : kSignatureInvalidReason;
+    // An unreadable trust bundle (#5249's kBundleUnreadable) stays an
+    // "untrusted" refusal here, exactly as before that kind existed: the plugin
+    // reason set is unchanged, and the detail string names the bundle fault.
+    const std::string_view prefix =
+        err->kind == CmsFailure::kInvalid ? kSignatureInvalidReason : kSignatureUntrustedReason;
     return std::string{prefix} + ": " + err->detail;
 }
 
