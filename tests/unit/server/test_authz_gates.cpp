@@ -733,6 +733,50 @@ TEST_CASE("require_fleet_read: service token - degraded ITServiceOwner permissio
                                 "ITServiceOwner ceiling");
 }
 
+// require_permission falls through a Degraded ceiling read to its service-scope allow-list,
+// which is empty in production, so no production input reaches the guard where the allow-list
+// would admit. The allow-list's existing test override (set_service_scope_global_safe_override_
+// for_test, the same seam test_auth_routes.cpp uses for the admit path) lets this pin the guard:
+// a populated allow-list must never admit on a failed ceiling read.
+TEST_CASE("require_permission: a degraded ceiling read is never admitted even when the "
+          "allow-list would admit the pair (503 with retry_after_ms and the degrade metric)",
+          "[pg][auth_routes][authz_gates][service_scope]") {
+    YUZU_REQUIRE_PG_DB_TPL(rbac_db_, rbac_gates_tpl);
+    yuzu::MetricsRegistry metrics; // declared before the rig: auth_mgr keeps a raw pointer to it
+    GatesRig r{rbac_db_.dsn()};
+    r.auth_mgr.set_metrics_registry(&metrics);
+    REQUIRE(r.rbac.assign_role({"user", "minter", "RespReader"}).has_value());
+    const auto svc = r.mint("printers");
+    {
+        yuzu::server::pg::PgConn conn{PQconnectdb(rbac_db_.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        yuzu::server::pg::PgResult d{
+            PQexec(conn.get(), "DROP TABLE rbac_store.role_permissions CASCADE")};
+        REQUIRE(d.ok());
+    }
+    r.ar->set_service_scope_global_safe_override_for_test(
+        std::vector<authz::PermPair>{{"Response", "Read"}});
+
+    auto req = bearer_request(svc);
+    httplib::Response res;
+    CHECK_FALSE(r.ar->require_permission(req, res, "Response", "Read"));
+    check_ceiling_degraded_503(res);
+    CHECK(metrics.counter("yuzu_server_rbac_read_degrade_total", {{"reason", "query_error"}})
+              .value() == 1.0);
+    // The allow-list admitted the pair, so the default-deny counter did not move.
+    CHECK(metrics
+              .counter("yuzu_auth_service_scope_default_denied_total",
+                       {{"permission", "Response:Read"}, {"path_class", "default"}})
+              .value() == 0.0);
+    auto rows = r.audit_store.query({});
+    REQUIRE(rows.has_value());
+    REQUIRE(rows->size() == 1);
+    CHECK((*rows)[0].action == "auth.permission_required");
+    CHECK((*rows)[0].result == "denied");
+    CHECK((*rows)[0].detail == "service-scoped token blocked: RBAC read degraded resolving the "
+                               "ITServiceOwner ceiling");
+}
+
 TEST_CASE("require_fleet_read: explicit DENY row for ITServiceOwner on the pair => 403 - not an "
           "admit and not a degrade",
           "[pg][auth_routes][authz_gates][service_scope]") {
