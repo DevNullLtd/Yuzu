@@ -225,3 +225,45 @@ TEST_CASE("upload-grants list: an unwired service-scope deny is refused at regis
     CHECK(sink.dispatch("GET", "/api/v1/upload-grants") == nullptr);
     CHECK(sink.dispatch("POST", "/api/v1/upload-grants", "{}") == nullptr);
 }
+
+// A BOUND deny closure that returns false without writing a response must still refuse a
+// service-scoped session: the route's own generic 403 is the fail-closed fallback, and no
+// grant row reaches the body. (An unbound closure never gets this far: registration throws.)
+TEST_CASE("upload-grants list: a bound service-scope deny that writes nothing still refuses "
+          "with a 403 and no rows",
+          "[pg][authz][service_scope][upload]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::response_execution_authz_tpl);
+    UploadGrantScopeRig r{db.dsn()};
+    yuzu::server::test::TestRouteSink sink;
+    auto deps = r.make_deps(/*wire_deny=*/true);
+    int deny_calls = 0;
+    deps.deny_service_scoped_fn = [&deny_calls](const httplib::Request&, httplib::Response&,
+                                                const std::string&, const std::string&,
+                                                const std::string&, const std::string&) -> bool {
+        ++deny_calls;
+        return false; // writes no response and claims the route need not return
+    };
+    register_file_retrieval_routes(sink, std::move(deps));
+
+    const auto ordinary = r.mint_token("");
+    const auto svc = r.mint_token("printers");
+    const std::unordered_map<std::string, std::string> ordinary_hdrs{
+        {"Authorization", "Bearer " + ordinary}};
+    const std::unordered_map<std::string, std::string> svc_hdrs{
+        {"Authorization", "Bearer " + svc}};
+
+    auto minted = sink.dispatch("POST", "/api/v1/upload-grants",
+                                nlohmann::json{{"agent_id", "agent-A"}, {"declared_max_size", 100}}
+                                    .dump(),
+                                "application/json", ordinary_hdrs);
+    REQUIRE(minted);
+    REQUIRE(minted->status == 201);
+
+    auto res = sink.dispatch("GET", "/api/v1/upload-grants", {}, "application/json", svc_hdrs);
+    REQUIRE(res);
+    CHECK(deny_calls == 1);
+    CHECK(res->status == 403);
+    CHECK(res->body.find("agent-A") == std::string::npos);
+    CHECK(res->body.find("grant_id") == std::string::npos);
+    CHECK(res->body.find("\"data\"") == std::string::npos);
+}

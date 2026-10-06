@@ -4,7 +4,7 @@
 #include "authz_model.hpp"
 #include "authz_topology_floor.hpp" // #4031: topology_floor_applies — see this gate's floor-check block
 #include "mcp_policy.hpp" // mcp::tier_allows — #3290 Phase 2 caller-class parity with require_permission/require_list_read
-#include "rbac_store.hpp" // kRbacErr* — the store error strings ceiling_degrade_reason matches
+#include "rbac_store.hpp" // kRbacErr*: the store error strings ceiling_degrade_reason matches
 #include "rest_a4_envelope_http.hpp"
 #include "service_scope_policy.hpp" // authz::kServiceTagKey — #3289 single confinement-key definition
 

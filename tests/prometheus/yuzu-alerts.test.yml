@@ -1628,9 +1628,9 @@ tests:
   # that scoping, both directions.
 
   # CASE 47 -- the two observe-only reasons alone must not page
-  # YuzuRbacReadDegraded ("callers being denied fleet-wide" would be false).
+  # YuzuRbacReadDegraded ("requests are being denied" would be false).
   - interval: 1m
-    name: rbac read degraded - observe-only reasons do not page fleet-wide-denial
+    name: rbac read degraded - observe-only reasons do not page the denying-reasons alert
     input_series:
       - series: 'yuzu_server_rbac_read_degrade_total{job="yuzu",instance="s1",reason="rbac_enabled_non_canonical"}'
         values: "0+1x20"

@@ -1945,8 +1945,8 @@ public:
                           "histogram");
         // RbacStore observability (ADR-0041). Described + zero-seeded up front so
         // the HELP/TYPE lines and closed dims exist on an idle server — critical
-        // here because a degrade means fleet-wide authz DENY (a PG blip denies
-        // every authorized request), so absent-series alerting must work before
+        // here because a degrade refuses the requests whose authorization read
+        // failed (fail-closed), so absent-series alerting must work before
         // the first degrade ever fires (Gate 6 sre BLOCKING / Gate 4 consistency).
         metrics_.describe("yuzu_server_rbac_read_degrade_total",
                           "Authorization reads/refreshes that hit a degraded store, by reason "
@@ -1959,8 +1959,11 @@ public:
                           "its existing decision from cache, this counts a data-quality or "
                           "staleness condition rather than a denied check - see the alert's "
                           "reason filter before assuming any nonzero rate here pages). "
-                          "A sustained non-zero rate in the denying reasons is a fleet-wide authz "
-                          "availability event, not mass access-denial - alert on it. "
+                          "A sustained non-zero rate in the denying reasons means authorization "
+                          "reads are failing and the requests that needed a failed read are "
+                          "refused (an operator check only on a permission-cache miss; a "
+                          "service-scoped token on every fleet-read or scoped-permission "
+                          "request whose ITServiceOwner ceiling read fails) - alert on it. "
                           "A circuit-breaker-open denial (#2703 Gate 7 item 1 commit B) is recorded "
                           "under pool_acquire_timeout, not a distinct reason - it is one of that "
                           "reason's own two contributing failure modes (see "
@@ -19108,10 +19111,9 @@ private:
                         }
                         return out;
                     },
-                    // No test builds this Deps (the upload-grants tests construct their own),
-                    // so removing this line is not caught by a test. A service-scoped token is
-                    // still refused without it, with the route's generic 403; what is lost is
-                    // the `upload_grant.list.access_denied` audit row and the specific message.
+                    // REQUIRED: `register_file_retrieval_routes` throws
+                    // `std::invalid_argument` at registration if this is unbound (pinned by
+                    // test_upload_grants_service_scope.cpp).
                     .deny_service_scoped_fn = deny_service_scoped_fn,
                     .audit_fn = audit_fn,
                     .store = upload_grant_store_.get(),

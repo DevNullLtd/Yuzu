@@ -81,7 +81,8 @@ struct Deps {
     /// other route modules take, e.g. `health_routes.hpp`'s). Called by the list route
     /// only for a service-scoped session: it writes the A4 403 (no `.permission`, since no
     /// grant would admit the caller) and the audit row, and returns true iff the route must
-    /// return. Unwired (empty) still refuses a service-scoped session, with a generic 403.
+    /// return. REQUIRED: registration throws if it is unbound. A bound closure that returns
+    /// false without writing a response still gets the route's generic 403.
     using DenyServiceScopedFn =
         std::function<bool(const httplib::Request&, httplib::Response&, const std::string& action,
                            const std::string& message, const std::string& target_type,
@@ -105,7 +106,8 @@ struct Deps {
     AuthFn auth_fn;
     PermFn perm_fn;
     ListReadFn list_read_fn;
-    /// REQUIRED: `register_file_retrieval_routes` throws `std::invalid_argument` if unbound.
+    /// REQUIRED: registration throws if unbound (`register_file_retrieval_routes` throws
+    /// `std::invalid_argument` before adding any route).
     DenyServiceScopedFn deny_service_scoped_fn;
     AuditFn audit_fn;
     UploadGrantStore* store{nullptr};

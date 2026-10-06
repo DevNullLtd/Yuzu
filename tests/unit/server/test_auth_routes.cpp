@@ -1294,7 +1294,7 @@ TEST_CASE("AuthRoutes::require_list_read — a dual-attribute token "
 // Clause 5 of the service-scoped confinement row: a blanket deny must not name a `.permission`
 // that would not admit the caller. This gate refuses the whole credential class, so granting
 // Response:Read to anyone would not admit a service-scoped token.
-TEST_CASE("AuthRoutes::require_list_read — the service-scoped-token 403 names no `permission` "
+TEST_CASE("AuthRoutes::require_list_read: the service-scoped-token 403 names no `permission` "
           "field and keeps its message",
           "[pg][auth_routes][service_scope]") {
     YUZU_REQUIRE_PG_DB_TPL(rbac_db_, service_scope_flip_rbac_tpl);
@@ -1308,7 +1308,8 @@ TEST_CASE("AuthRoutes::require_list_read — the service-scoped-token 403 names 
     CHECK(res.status == 403);
     const auto j = nlohmann::json::parse(res.body, nullptr, /*allow_exceptions=*/false);
     REQUIRE_FALSE(j.is_discarded());
-    CHECK(j["error"]["message"] == "service-scoped tokens cannot read the fleet-wide status rollup");
+    CHECK(j["error"]["message"] ==
+          "service-scoped tokens cannot read the fleet-wide status rollup");
     CHECK_FALSE(j["error"].contains("permission"));
     CHECK(res.body.find("\"permission\"") == std::string::npos);
 }
