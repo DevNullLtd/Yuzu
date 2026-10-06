@@ -1731,8 +1731,10 @@ tests:
       - series: 'yuzu_server_rbac_breaker_open{job="yuzu",instance="s1"}'
         values: "0x5 1x3 0x15"
     promql_expr_test:
+      # Evaluated while the breaker is still open (minutes 5 to 7), so a rule without `for:` would
+      # be firing here; with `for: 5m` it is only pending.
       - expr: 'ALERTS{alertname="YuzuRbacBreakerOpen", alertstate="firing"}'
-        eval_time: 12m
+        eval_time: 7m
         exp_samples: []
 
   # ── YuzuRbacEnforcementChanged (A1) ──────────────────────────────────────
