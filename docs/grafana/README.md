@@ -64,7 +64,8 @@ Scraped from the gateway's Prometheus endpoint (default `:9568`). Duration histo
 | `yuzu_gw_command_duration_ms` | histogram | Command dispatch duration in ms, labeled by `plugin`, `status` |
 | `yuzu_gw_agent_session_duration_ms` | histogram | Agent session duration in ms |
 | `yuzu_gw_upstream_rpc_duration_ms` | histogram | Upstream (gateway→server) RPC latency in ms, labeled by `rpc_name` |
-| `yuzu_gw_upstream_rpc_errors_total` | counter | Upstream RPC errors, labeled by `rpc_name`, `code` |
+| `yuzu_gw_upstream_rpc_errors_total` | counter | Upstream RPC errors, labeled by `rpc_name`, `code`. `code="encode"` (a request that failed in the gateway's own encoder: local, never sent, no breaker effect) and `code="exception"` are pre-seeded to 0 for every `rpc_name` the gateway emits; other codes appear at their first occurrence. The shipped `YuzuGatewayUpstreamErrors` alert fires above 0.1 errors/s with no `code` filter, and `YuzuGatewayUpstreamEncodeErrors` fires on any `code="encode"` increase over 10 minutes |
+| `yuzu_gw_register_refused_total` | counter | `Register` calls refused at the gateway edge before any upstream call (empty or over-256-byte agent id), labeled by `reason` (`agent_id_length`, `unknown`; both created at 0 at start) |
 | `yuzu_gw_registration_replay_total` | counter | Total registration replay attempts by the drip, any outcome |
 | `yuzu_gw_registration_replay_queue_depth` | gauge | Pending registration-replay entries (queued by an upstream recovery or a heartbeat verdict), labeled by `node` |
 | `yuzu_gw_registration_replay_triggered_total` | counter | Registration replays started, labeled by `trigger` (`breaker`, `heartbeat`; both created at 0 at start). A `breaker` trigger is dropped while a verdict-seeded drip is queued |
