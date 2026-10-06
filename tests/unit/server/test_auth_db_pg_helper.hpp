@@ -49,10 +49,12 @@
 #include <libpq-fe.h>
 
 #include <atomic>
+#include <chrono>
 #include <memory>
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace yuzu::test {
@@ -382,5 +384,33 @@ private:
     std::unique_ptr<yuzu::server::pg::SecretCodec> codec_;
     std::unique_ptr<yuzu::server::AuthDB> authdb_;
 };
+
+/// Poll `pg_stat_activity` until some backend in `dsn`'s database is waiting on
+/// a heavyweight lock (`wait_event_type = 'Lock'` — a row lock, a table lock)
+/// with a current query matching the ILIKE pattern `like` (#5342 Gate 8).
+/// The deterministic rendezvous for a race test — "the racing statement really
+/// is queued on the held lock" — in place of a sleep standing in for ordering.
+/// Filtered on `current_database()` because template-cloned test databases
+/// share one cluster. `like` is a test-authored literal, never input. Returns
+/// false on timeout (the caller CHECKs it, then releases the lock either way so
+/// nothing hangs).
+inline bool wait_for_pg_lock_waiter(const std::string& dsn, const std::string& like,
+                                    std::chrono::milliseconds limit = std::chrono::seconds(10)) {
+    yuzu::server::pg::PgConn conn{PQconnectdb(dsn.c_str())};
+    if (PQstatus(conn.get()) != CONNECTION_OK)
+        return false;
+    const std::string sql = "SELECT count(*) FROM pg_stat_activity WHERE datname = "
+                            "current_database() AND wait_event_type = 'Lock' AND query ILIKE '" +
+                            like + "'";
+    const auto end = std::chrono::steady_clock::now() + limit;
+    while (std::chrono::steady_clock::now() < end) {
+        yuzu::server::pg::PgResult r{PQexec(conn.get(), sql.c_str())};
+        if (r.status() == PGRES_TUPLES_OK && PQntuples(r.get()) == 1 &&
+            std::string(PQgetvalue(r.get(), 0, 0)) != "0")
+            return true;
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    return false;
+}
 
 } // namespace yuzu::test

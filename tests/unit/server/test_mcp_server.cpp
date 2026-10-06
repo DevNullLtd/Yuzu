@@ -21076,10 +21076,10 @@ TEST_CASE("MCP get_agent_app_usage: RBAC-off — ordinary session denied, admin 
 
     Config cfg{};
     auth::AuthManager auth_mgr{};
-    auto ordinary_token = auth_mgr.create_local_session("ordinary_user", auth::Role::user,
+    auto ordinary_token = auth_mgr.create_local_session_for_test("ordinary_user", auth::Role::user,
                                                          /*mfa_verified=*/true);
     auto admin_token =
-        auth_mgr.create_local_session("admin_user", auth::Role::admin, /*mfa_verified=*/true);
+        auth_mgr.create_local_session_for_test("admin_user", auth::Role::admin, /*mfa_verified=*/true);
     std::shared_mutex oidc_mu;
     std::unique_ptr<oidc::OidcProvider> oidc_provider;
     // A healthy, explicitly-disabled RbacStore reaches the production legacy

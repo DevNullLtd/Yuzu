@@ -23,6 +23,7 @@
 #include "mfa_step_up.hpp"
 #include "oidc_principal.hpp" // oidc_principal_id — ADR-2001 §5 single principal-string builder
 #include "oidc_scim_link.hpp" // link_oidc_login_to_scim — ADR-2001 §2/D2 login-site orchestration
+#include "password_policy.hpp" // #5342 — password_exceeds_max (the /login max)
 #include "principal_class.hpp"
 #include "rest_a4_envelope_http.hpp" // detail::a4_denial — the unified A4 denial wrapper (#1470)
 #include "saml_principal.hpp"  // saml_principal_id / is_valid_saml_component — ADR-2001 PR4a
@@ -1437,15 +1438,11 @@ bool AuthRoutes::audit_log(const httplib::Request& req, const std::string& actio
     return ok;
 }
 
-bool AuthRoutes::audit_log_for_principal(const httplib::Request& req, const std::string& action,
-                                         const std::string& result, const std::string& principal,
-                                         const std::string& principal_role,
-                                         const std::string& target_type,
-                                         const std::string& target_id,
-                                         const std::string& detail,
-                                         const std::string& principal_class_override) {
-    if (!audit_store_)
-        return true;
+AuditEvent AuthRoutes::make_audit_event_for_principal(
+    const httplib::Request& req, const std::string& action, const std::string& result,
+    const std::string& principal, const std::string& principal_role,
+    const std::string& target_type, const std::string& target_id, const std::string& detail,
+    const std::string& principal_class_override) const {
     AuditEvent event;
     event.action = action;
     event.result = result;
@@ -1465,6 +1462,21 @@ bool AuthRoutes::audit_log_for_principal(const httplib::Request& req, const std:
     // Stamped like make_audit_event so a row written by this path carries the same
     // session correlator. Empty at the pre-session login sites, which is correct there.
     event.session_id = extract_session_cookie(req);
+    return event;
+}
+
+bool AuthRoutes::audit_log_for_principal(const httplib::Request& req, const std::string& action,
+                                         const std::string& result, const std::string& principal,
+                                         const std::string& principal_role,
+                                         const std::string& target_type,
+                                         const std::string& target_id,
+                                         const std::string& detail,
+                                         const std::string& principal_class_override) {
+    if (!audit_store_)
+        return true;
+    const auto event =
+        make_audit_event_for_principal(req, action, result, principal, principal_role, target_type,
+                                       target_id, detail, principal_class_override);
     auto ok = audit_store_->log(event);
     if (!ok) {
         spdlog::warn("audit_log_for_principal: AuditStore::log failed for action='{}' "
@@ -1472,6 +1484,17 @@ bool AuthRoutes::audit_log_for_principal(const httplib::Request& req, const std:
                      action, principal, target_id);
     }
     return ok;
+}
+
+void AuthRoutes::record_enroll_credential_changed(const httplib::Request& req,
+                                                  const std::string& username, auth::Role role) {
+    audit_log_for_principal(req, "mfa.enroll.failed", "error", username,
+                            auth::role_to_string(role), "User", username, "credential_changed");
+    emit_event("mfa.enroll.failed", req,
+               {{"source_ip", req.remote_addr},
+                {"username", username},
+                {"reason", "credential_changed"}},
+               {}, Severity::kWarn);
 }
 
 bool AuthRoutes::deny_service_scoped_session(const httplib::Request& req, httplib::Response& res,
@@ -1607,6 +1630,268 @@ std::mutex& AuthRoutes::login_lock_for(const std::string& username) {
 }
 
 // ---------------------------------------------------------------------------
+// Lockout-accounted password check (#5342)
+// ---------------------------------------------------------------------------
+// Extracted from POST /login's lockout-critical section, behaviour-preserving
+// (the one addition is the #5342 over-max short-circuit), so the self-service
+// password change's current-password proof runs through the same striped lock,
+// pre-check, accounting and evidence — there is no second copy of this section
+// anywhere. See the header for the contract.
+PasswordCheckResult AuthRoutes::verify_password_with_lockout(const std::string& username,
+                                                             const std::string& password,
+                                                             const httplib::Request& req,
+                                                             const PasswordCheckOptions& opts) {
+    const bool lockout_active = cfg_.auth_lockout_threshold > 0 && !opts.lockout_exempt;
+
+    // Serialize concurrent attempts for THIS username across the whole
+    // lockout-critical section below (pre-check → verify_password →
+    // record/clear), so a synchronized burst cannot all pass the stale
+    // pre-check and verify more than `threshold` passwords before the lock
+    // arms (adversarial C1). Held only when lockout is enabled, and released
+    // when this function returns — before the caller's MFA branching, which
+    // does not touch lockout state. Striped per-username (login_lock_for) so
+    // unrelated usernames log in fully in parallel — only a burst against one
+    // account is serialized, which is the intended throttle. (Taken whenever
+    // the threshold is on, INCLUDING for a lockout-exempt break-glass attempt,
+    // exactly as the pre-extraction /login did.)
+    std::unique_lock<std::mutex> login_lk;
+    if (cfg_.auth_lockout_threshold > 0) {
+        login_lk = std::unique_lock<std::mutex>(login_lock_for(username));
+    }
+
+    // ── Account-lockout pre-check (SOC 2 CC6.3) ──────────────────────
+    // Brute-force / credential-stuffing guard. When the account is currently
+    // locked the caller rejects with the SAME generic response as a bad
+    // password (no Retry-After, no "locked" wording) so the response is not a
+    // username-enumeration / lock-state oracle, and verify_password is skipped
+    // entirely — the ~100 ms PBKDF2 is never burned on a locked account (a
+    // free anti-DoS win). The lock is observable only server-side via the
+    // audit row + metric below. Fail-open on a read error: lockout protects
+    // against *wrong* passwords, so a transient auth.db read failure must not
+    // wedge logins — verify_password is still the real credential gate.
+    // prior_failed_count is captured so the success path knows whether to emit
+    // a "cleared" audit.
+    int prior_failed_count = 0;
+    // Set when the lockout pre-check read itself fails (fail-open path): we
+    // then cannot know the user's prior failure count, so on a subsequent
+    // successful login we clear defensively rather than leave a stale counter
+    // that could lock a legitimate user on their very next slip (Hermes
+    // cyber-review F4).
+    bool lockout_read_failed = false;
+    if (lockout_active) {
+        if (auto* db = auth_mgr_.auth_db_ptr()) {
+            if (auto st = db->lockout_status(username)) {
+                prior_failed_count = st->failed_count;
+                if (st->locked) {
+                    // Metric + a rate-limited log line ONLY — deliberately no
+                    // audit row AND no analytics event per blocked attempt.
+                    // Under a sustained brute-force against a locked account,
+                    // an `emit_event` per attempt would amplify the
+                    // analytics/SSE pipeline exactly the way a per-attempt
+                    // audit row would amplify the audit log (governance
+                    // UP-15). The aggregate signal is the counter; the
+                    // once-per-lock `auth.lockout.applied` audit row is the
+                    // durable evidence; the source IP for forensics is in the
+                    // spdlog line below (bounded by the 10/s/IP login
+                    // rate-limiter).
+                    if (auto* m = auth_mgr_.metrics_registry()) {
+                        m->counter("yuzu_auth_lockout_blocked_total").increment();
+                    }
+                    spdlog::warn("Login blocked: account '{}' is locked (source {})", username,
+                                 req.remote_addr);
+                    return {PasswordCheckOutcome::kLocked, std::nullopt, {}};
+                }
+            } else {
+                // Fail-open: lockout protects against *wrong* passwords, so a
+                // transient auth.db read error must not wedge logins —
+                // verify_password remains the real credential gate. Make the
+                // degradation observable (was silent) and remember it so the
+                // success path below clears the counter defensively.
+                lockout_read_failed = true;
+                spdlog::warn("lockout_status read failed for '{}' (error={}) — pre-check "
+                             "fail-open; brute-force throttle degraded for this attempt",
+                             username, static_cast<int>(st.error()));
+            }
+        }
+    }
+
+    if (opts.pre_verify_gate && !opts.pre_verify_gate())
+        return {PasswordCheckOutcome::kGateRejected, std::nullopt, {}};
+
+    // #5342: an over-max password can never match a stored hash (no setting
+    // site accepts one), so it is answered exactly like a wrong password — same
+    // evidence, same lockout accounting — without running PBKDF2 over it.
+    std::expected<auth::VerifiedCredential, auth::VerifyFailure> verified =
+        std::unexpected(auth::VerifyFailure::kBadCredential);
+    if (!auth::password_exceeds_max(password))
+        verified = auth_mgr_.verify_password(username, password);
+    if (!verified && auth::is_transient(verified.error())) {
+        // #5342 Gate 7 (sec-3): the password was never VERIFIED — an AuthDB
+        // read failed, or the stored credential changed under the row lock (a
+        // concurrent password change). Not a guess: no on_bad_credential (no
+        // "login failed" evidence row), no record_failed_login strike. The
+        // caller answers a retryable 503. A store read failure moves the same
+        // two degrade series the record-failure 503 below does, so an alert on
+        // the coarse series sees every store-driven 503 on this path; a
+        // credential change is counted by AuthManager's own
+        // yuzu_auth_credential_changed_during_verify_total.
+        if (verified.error() == auth::VerifyFailure::kStoreUnavailable) {
+            if (auto* m = auth_mgr_.metrics_registry()) {
+                m->counter("yuzu_auth_secret_unavailable_total", {{"route", opts.metric_route}})
+                    .increment();
+                // AuthDB::get_user / recheck_role_locked report every lease or
+                // query failure as QueryFailed, hence the fixed reason token.
+                m->counter("yuzu_auth_read_degrade_total",
+                           {{"route", opts.metric_route},
+                            {"reason", degrade_reason(AuthDBError::QueryFailed)}})
+                    .increment();
+            }
+        }
+        spdlog::warn("password verification for '{}' could not complete ({}) - transient, not "
+                     "counted toward lockout (source {})",
+                     username,
+                     verified.error() == auth::VerifyFailure::kStoreUnavailable
+                         ? "auth store unavailable"
+                         : "credential changed concurrently",
+                     req.remote_addr);
+        return {PasswordCheckOutcome::kTransient, std::nullopt, {}};
+    }
+    if (!verified) {
+        if (opts.on_bad_credential)
+            opts.on_bad_credential();
+        // Record the failed attempt for lockout accounting. Only the
+        // threshold-crossing failure emits an audit row — subsequent blocked
+        // attempts are counted via the metric above, NOT audited.
+        // record_failed_login is a no-op for unknown / malformed usernames, so
+        // it never creates a row for a non-existent account (anti-enumeration
+        // + no storage growth). Skipped for a lockout-exempt attempt (the
+        // caller's own failure evidence is kept — evidence kept, lock dropped).
+        if (lockout_active) {
+            if (auto* db = auth_mgr_.auth_db_ptr()) {
+                auto rec = db->record_failed_login(username, cfg_.auth_lockout_threshold,
+                                                   cfg_.auth_lockout_window_secs);
+                if (rec && rec->just_locked) {
+                    // result uses the canonical ok|denied|error envelope
+                    // vocabulary (the lock was applied successfully); the
+                    // warning *severity* is carried by the emit_event + metric,
+                    // not the audit result token. The applied row is the
+                    // primary CC6.3 lock evidence, so a lost write is surfaced
+                    // (governance UP-14 / compliance SHOULD-1).
+                    if (!audit_log_for_principal(
+                            req, "auth.lockout.applied", "ok", username, "", "User", username,
+                            "threshold=" + std::to_string(cfg_.auth_lockout_threshold) +
+                                " window_secs=" + std::to_string(cfg_.auth_lockout_window_secs))) {
+                        spdlog::error("audit emission FAILED for auth.lockout.applied user='{}' "
+                                      "— CC6.3 lock-event evidence lost",
+                                      username);
+                    }
+                    emit_event("auth.lockout.applied", req,
+                               {{"source_ip", req.remote_addr}, {"username", username}}, {},
+                               Severity::kWarn);
+                    if (auto* m = auth_mgr_.metrics_registry()) {
+                        m->counter("yuzu_auth_lockout_applied_total").increment();
+                    }
+                    spdlog::warn("Account '{}' locked after {} failed login attempts", username,
+                                 cfg_.auth_lockout_threshold);
+                } else if (!rec) {
+                    spdlog::warn("record_failed_login failed for '{}': error={}", username,
+                                 static_cast<int>(rec.error()));
+                    if (is_store_unavailable(rec.error())) {
+                        // ★ Hermes p2 MEDIUM: the counter could not be
+                        // persisted — the caller must refuse fail-closed (503),
+                        // never the ordinary rejection (an UNcounted attempt).
+                        if (auto* m = auth_mgr_.metrics_registry()) {
+                            // Both counters, matching the mfa_status / mfa_init
+                            // sites: the coarse route-level total (every
+                            // store-unavailable 503) AND the reason split.
+                            // #2396 adv-review CDX-P1-01 — the coarse series must
+                            // move at every such 503 so an alert on it does not
+                            // undercount an outage.
+                            m->counter("yuzu_auth_secret_unavailable_total",
+                                       {{"route", opts.metric_route}})
+                                .increment();
+                            m->counter("yuzu_auth_read_degrade_total",
+                                       {{"route", opts.metric_route},
+                                        {"reason", degrade_reason(rec.error())}})
+                                .increment();
+                        }
+                        return {PasswordCheckOutcome::kStoreUnavailable, std::nullopt, {}};
+                    }
+                }
+            }
+        }
+        return {PasswordCheckOutcome::kBadCredential, std::nullopt, {}};
+    }
+
+    // Password verified — reset the lockout counter (the brute-force window is
+    // per-consecutive-failure, so any success clears it). Done before the
+    // caller's MFA branching, so it covers every success exit. Clear when there
+    // was a known non-zero counter, OR when the pre-check read failed and the
+    // count is unknown (F4 — never leave a stale counter behind a success). Only
+    // routine successes with a known zero counter skip the write, so they don't
+    // spam the audit log.
+    if (cfg_.auth_lockout_threshold > 0 && (prior_failed_count > 0 || lockout_read_failed)) {
+        if (auto* db = auth_mgr_.auth_db_ptr()) {
+            if (auto cl = db->clear_failed_logins(username); !cl) {
+                spdlog::warn("clear_failed_logins failed for '{}': error={}", username,
+                             static_cast<int>(cl.error()));
+            } else {
+                if (!audit_log_for_principal(req, "auth.lockout.cleared", "ok", username,
+                                             auth::role_to_string(verified->role), "User",
+                                             username, opts.cleared_detail)) {
+                    spdlog::warn("audit emission failed for auth.lockout.cleared user='{}'",
+                                 username);
+                }
+                emit_event("auth.lockout.cleared", req,
+                           {{"source_ip", req.remote_addr}, {"username", username}});
+            }
+        }
+    }
+    // Lockout-critical section complete; the stripe releases on return.
+    return {PasswordCheckOutcome::kVerified, verified->role, std::move(verified->hash_hex)};
+}
+
+PasswordVerifyFn AuthRoutes::password_change_verify_fn() {
+    return [this](const std::string& username, const std::string& password,
+                  const httplib::Request& req) -> PasswordCheckResult {
+        PasswordCheckOptions opts;
+        // Mirror /login's sso-only break-glass exemption (see its comment): the
+        // escape-hatch account must not be lockable through this route either.
+        opts.lockout_exempt = cfg_.auth_mode == "sso-only" && !cfg_.break_glass_user.empty() &&
+                              username == cfg_.break_glass_user;
+        // #5342 Gate 7 (C8): the SAME hardened-mode gate /login runs, at the
+        // same point (after the lockout pre-check, before PBKDF2). Under
+        // sso-only only an ARMED break-glass account may have its password
+        // evaluated; once disarmed, a still-live break-glass session cannot
+        // use this route as a guessing oracle (no PBKDF2) or to lock the
+        // account (no record_failed_login). The route answers kGateRejected
+        // with 403 sso_only_local_disabled; this lambda writes nothing.
+        opts.pre_verify_gate = [this, &username]() {
+            return sso_only_local_password_gate(username) != SsoOnlyLocalGate::kRefused;
+        };
+        opts.metric_route = "password_change";
+        opts.cleared_detail = "reset_on_password_change";
+        return verify_password_with_lockout(username, password, req, opts);
+    };
+}
+
+SsoOnlyLocalGate AuthRoutes::sso_only_local_password_gate(const std::string& username) {
+    if (cfg_.auth_mode != "sso-only")
+        return SsoOnlyLocalGate::kOpen;
+    if (!cfg_.break_glass_user.empty() && username == cfg_.break_glass_user) {
+        if (auto* db = auth_mgr_.auth_db_ptr()) {
+            // Fail CLOSED on a read error: unlike lockout (which guards against
+            // wrong passwords and so fails open), this gate is the credential
+            // path itself — a transient read error must not become a free pass
+            // to the disabled local-login path.
+            if (auto bg = db->break_glass_status(username); bg && bg->armed)
+                return SsoOnlyLocalGate::kBreakGlassArmed;
+        }
+    }
+    return SsoOnlyLocalGate::kRefused;
+}
+
+// ---------------------------------------------------------------------------
 // Route registration
 // ---------------------------------------------------------------------------
 
@@ -1657,79 +1942,15 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                                                 !cfg_.break_glass_user.empty() &&
                                                 username == cfg_.break_glass_user;
 
-        // Serialize concurrent attempts for THIS username across the whole
-        // lockout-critical section below (pre-check → verify_password →
-        // record/clear), so a synchronized burst cannot all pass the stale
-        // pre-check and verify more than `threshold` passwords before the lock
-        // arms (adversarial C1). Held only when lockout is enabled; released
-        // explicitly before the MFA branching, which does not touch lockout
-        // state. Striped per-username (login_lock_for) so unrelated usernames
-        // log in fully in parallel — only a burst against one account is
-        // serialized, which is the intended throttle.
-        std::unique_lock<std::mutex> login_lk;
-        if (cfg_.auth_lockout_threshold > 0) {
-            login_lk = std::unique_lock<std::mutex>(login_lock_for(username));
-        }
-
-        // ── Account-lockout pre-check (SOC 2 CC6.3) ──────────────────────
-        // Brute-force / credential-stuffing guard. When the account is
-        // currently locked we reject with the SAME generic 401 as a bad
-        // password (no Retry-After, no "locked" wording) so the response is
-        // not a username-enumeration / lock-state oracle, and we skip
-        // verify_password entirely — the ~100 ms PBKDF2 is never burned on a
-        // locked account (a free anti-DoS win). The lock is observable only
-        // server-side via the audit row + metric below. Fail-open on a read
-        // error: lockout protects against *wrong* passwords, so a transient
-        // auth.db read failure must not wedge logins — verify_password is
-        // still the real credential gate. prior_failed_count is captured so
-        // the success path knows whether to emit a "cleared" audit.
-        int prior_failed_count = 0;
-        // Set when the lockout pre-check read itself fails (fail-open path): we
-        // then cannot know the user's prior failure count, so on a subsequent
-        // successful login we clear defensively rather than leave a stale
-        // counter that could lock a legitimate user on their very next slip
-        // (Hermes cyber-review F4).
-        bool lockout_read_failed = false;
-        if (cfg_.auth_lockout_threshold > 0 && !break_glass_lockout_exempt) {
-            if (auto* db = auth_mgr_.auth_db_ptr()) {
-                if (auto st = db->lockout_status(username)) {
-                    prior_failed_count = st->failed_count;
-                    if (st->locked) {
-                        res.status = 401;
-                        res.set_content(detail::a4_error(res, "Invalid username or password"),
-                                        "application/json");
-                        // Metric + a rate-limited log line ONLY — deliberately
-                        // no audit row AND no analytics event per blocked
-                        // attempt. Under a sustained brute-force against a
-                        // locked account, an `emit_event` per attempt would
-                        // amplify the analytics/SSE pipeline exactly the way a
-                        // per-attempt audit row would amplify the audit log
-                        // (governance UP-15). The aggregate signal is the
-                        // counter; the once-per-lock `auth.lockout.applied`
-                        // audit row is the durable evidence; the source IP for
-                        // forensics is in the spdlog line below (bounded by the
-                        // 10/s/IP login rate-limiter).
-                        if (auto* m = auth_mgr_.metrics_registry()) {
-                            m->counter("yuzu_auth_lockout_blocked_total").increment();
-                        }
-                        spdlog::warn("Login blocked: account '{}' is locked (source {})", username,
-                                     req.remote_addr);
-                        return;
-                    }
-                } else {
-                    // Fail-open: lockout protects against *wrong* passwords, so
-                    // a transient auth.db read error must not wedge logins —
-                    // verify_password remains the real credential gate. Make the
-                    // degradation observable (was silent) and remember it so the
-                    // success path below clears the counter defensively.
-                    lockout_read_failed = true;
-                    spdlog::warn("lockout_status read failed for '{}' (error={}) — pre-check "
-                                 "fail-open; brute-force throttle degraded for this attempt",
-                                 username, static_cast<int>(st.error()));
-                }
-            }
-        }
-
+        // #5342: the lockout-critical section (striped per-username lock →
+        // lockout pre-check → [sso-only gate] → verify_password →
+        // record/clear) lives in verify_password_with_lockout, shared with the
+        // self-service password change so the two can never drift. This route
+        // keeps every response shape: the gate and failure-evidence callbacks
+        // below run INSIDE the helper at exactly the points they always ran.
+        bool break_glass_login = false;
+        PasswordCheckOptions check_opts;
+        check_opts.lockout_exempt = break_glass_lockout_exempt;
         // ── Hardened mode: local-password login disabled (SOC 2 CC6.3) ───
         // Under --auth-mode=sso-only the local-password path is closed
         // fleet-wide; only SSO (OIDC /auth/callback or SAML /saml/acs, both
@@ -1752,19 +1973,17 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         // ~100 ms of server CPU — for a residue that leaks only operational
         // state, never a secret. Same trade-off the shipped lockout pre-check
         // already makes (see docs/auth-architecture.md "Account lockout").
-        bool break_glass_login = false;
-        if (cfg_.auth_mode == "sso-only") {
-            if (!cfg_.break_glass_user.empty() && username == cfg_.break_glass_user) {
-                if (auto* db = auth_mgr_.auth_db_ptr()) {
-                    // Fail CLOSED on a read error: unlike lockout (which guards
-                    // against wrong passwords and so fails open), this gate is
-                    // the credential path itself — a transient read error must
-                    // not become a free pass to the disabled local-login path.
-                    if (auto bg = db->break_glass_status(username); bg && bg->armed) {
-                        break_glass_login = true;
-                    }
-                }
-            }
+        // Runs AFTER the lockout pre-check (a locked account answers first,
+        // exactly as before the extraction) and BEFORE PBKDF2.
+        // The arm-state decision itself is the shared, response-free
+        // sso_only_local_password_gate (#5342 Gate 7, C8 — the self-service
+        // password change runs the SAME gate); the 401, metric and log line
+        // below stay HERE, at the /login site.
+        check_opts.pre_verify_gate = [&]() -> bool {
+            const auto gate = sso_only_local_password_gate(username);
+            if (gate == SsoOnlyLocalGate::kOpen)
+                return true;
+            break_glass_login = gate == SsoOnlyLocalGate::kBreakGlassArmed;
             if (!break_glass_login) {
                 res.status = 401;
                 res.set_content(detail::a4_error(res, "Invalid username or password"),
@@ -1789,17 +2008,20 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                 spdlog::warn("Local-password login blocked (auth-mode=sso-only){} from source {}",
                              probed_break_glass ? " [break-glass account, not armed]" : "",
                              req.remote_addr);
-                return;
+                return false;
             }
             // break_glass_login stays true → the success audit + metric + warn
             // fire only AFTER verify_password below confirms the credential, so a
             // wrong-password attempt against the armed account audits as a normal
             // auth.login_failed (and counts toward lockout), never a spurious
             // "ok" break-glass row.
-        }
-
-        auto role_opt = auth_mgr_.verify_password(username, password);
-        if (!role_opt) {
+            return true;
+        };
+        // Route-specific failure evidence, written BEFORE the helper's lockout
+        // accounting (so `auth.login_failed` precedes any threshold-crossing
+        // `auth.lockout.applied` row, as it always has). The lockout-exempt
+        // break-glass account still gets this row — evidence kept, lock dropped.
+        check_opts.on_bad_credential = [&]() {
             res.status = 401;
             res.set_content(detail::a4_error(res, "Invalid username or password"),
                             "application/json");
@@ -1807,82 +2029,60 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
             emit_event("auth.login_failed", req,
                        {{"source_ip", req.remote_addr}, {"username", username}}, {},
                        Severity::kWarn);
-            // Record the failed attempt for lockout accounting. Only the
-            // threshold-crossing failure emits an audit row — subsequent
-            // blocked attempts are counted via the metric above, NOT audited.
-            // record_failed_login is a no-op for unknown / malformed
-            // usernames, so it never creates a row for a non-existent account
-            // (anti-enumeration + no storage growth). Skipped for the
-            // lockout-exempt break-glass account (the wrong attempt is still
-            // audited as auth.login_failed above — evidence kept, lock dropped).
-            if (cfg_.auth_lockout_threshold > 0 && !break_glass_lockout_exempt) {
-                if (auto* db = auth_mgr_.auth_db_ptr()) {
-                    auto rec = db->record_failed_login(username, cfg_.auth_lockout_threshold,
-                                                       cfg_.auth_lockout_window_secs);
-                    if (rec && rec->just_locked) {
-                        // result uses the canonical ok|denied|error envelope
-                        // vocabulary (the lock was applied successfully); the
-                        // warning *severity* is carried by the emit_event +
-                        // metric, not the audit result token. The applied row
-                        // is the primary CC6.3 lock evidence, so a lost write
-                        // is surfaced (governance UP-14 / compliance SHOULD-1).
-                        if (!audit_log_for_principal(
-                                req, "auth.lockout.applied", "ok", username, "", "User", username,
-                                "threshold=" + std::to_string(cfg_.auth_lockout_threshold) +
-                                    " window_secs=" +
-                                    std::to_string(cfg_.auth_lockout_window_secs))) {
-                            spdlog::error("audit emission FAILED for auth.lockout.applied user='{}' "
-                                          "— CC6.3 lock-event evidence lost",
-                                          username);
-                        }
-                        emit_event("auth.lockout.applied", req,
-                                   {{"source_ip", req.remote_addr}, {"username", username}}, {},
-                                   Severity::kWarn);
-                        if (auto* m = auth_mgr_.metrics_registry()) {
-                            m->counter("yuzu_auth_lockout_applied_total").increment();
-                        }
-                        spdlog::warn("Account '{}' locked after {} failed login attempts", username,
-                                     cfg_.auth_lockout_threshold);
-                    } else if (!rec) {
-                        spdlog::warn("record_failed_login failed for '{}': error={}", username,
-                                     static_cast<int>(rec.error()));
-                        if (is_store_unavailable(rec.error())) {
-                            // ★ Hermes p2 MEDIUM: the lockout counter could not
-                            // be persisted (PG outage) — refuse fail-closed with
-                            // a 503 rather than return the already-built 401,
-                            // which would be an UNcounted attempt and let a
-                            // password-spray brute-force unlimited tries while
-                            // the store is degraded.
-                            res.status = 503;
-                            // #2396: honest backoff hint on a transient
-                            // store-unavailable 503 (header + A4-style body
-                            // field), and a reason-labelled degrade counter so
-                            // a retry-storm is distinguishable from a uniform
-                            // outage. Does NOT change the fail-closed decision.
-                            res.set_header("Retry-After", "2");
-                            res.set_content(
-                                detail::a4_error(res, "authentication store is temporarily unavailable",
-                                                 {.retry_after_ms = 2000}),
-                                "application/json");
-                            if (auto* m = auth_mgr_.metrics_registry()) {
-                                // Both counters, matching the mfa_status / mfa_init
-                                // sites: the coarse route-level total (every
-                                // store-unavailable login 503) AND the reason
-                                // split. #2396 adv-review CDX-P1-01 — the coarse
-                                // series must move at every login-path 503 so an
-                                // alert on it does not undercount an outage.
-                                m->counter("yuzu_auth_secret_unavailable_total",
-                                           {{"route", "login"}})
-                                    .increment();
-                                m->counter(
-                                     "yuzu_auth_read_degrade_total",
-                                     {{"route", "login"}, {"reason", degrade_reason(rec.error())}})
-                                    .increment();
-                            }
-                        }
-                    }
-                }
-            }
+        };
+
+        const auto check = verify_password_with_lockout(username, password, req, check_opts);
+        switch (check.outcome) {
+        case PasswordCheckOutcome::kVerified:
+            break;
+        case PasswordCheckOutcome::kLocked:
+            // SAME generic 401 as a bad password (no Retry-After, no "locked"
+            // wording) — not a username-enumeration / lock-state oracle. The
+            // metric + log line were emitted by the helper.
+            res.status = 401;
+            res.set_content(detail::a4_error(res, "Invalid username or password"),
+                            "application/json");
+            return;
+        case PasswordCheckOutcome::kGateRejected:
+            return; // the sso-only gate above wrote the 401
+        case PasswordCheckOutcome::kBadCredential:
+            return; // on_bad_credential wrote the 401 + auth.login_failed
+        case PasswordCheckOutcome::kTransient:
+            // #5342 Gate 7 (sec-3): the password could not be VERIFIED (auth
+            // store read failed, or the credential changed mid-verify). Same
+            // retryable 503 as below — but no auth.login_failed row and no
+            // lockout strike were written (the helper skipped both), because
+            // nothing was guessed. Previously this answered the ordinary 401
+            // and counted a strike, so a store blip could lock a legitimate
+            // user out.
+            [[fallthrough]];
+        case PasswordCheckOutcome::kStoreUnavailable:
+            // ★ Hermes p2 MEDIUM: the lockout counter could not be persisted
+            // (PG outage) — refuse fail-closed with a 503 rather than return
+            // the already-built 401, which would be an UNcounted attempt and
+            // let a password-spray brute-force unlimited tries while the store
+            // is degraded. #2396: honest backoff hint (header + A4-style body
+            // field); the reason-labelled degrade counters were bumped by the
+            // helper. Does NOT change the fail-closed decision.
+            res.status = 503;
+            res.set_header("Retry-After", "2");
+            res.set_content(detail::a4_error(res, "authentication store is temporarily unavailable",
+                                             {.retry_after_ms = 2000}),
+                            "application/json");
+            return;
+        }
+        const auto role_opt = check.role;
+        // #5342 Gate 7 (B4): the stored hash this password was verified
+        // against, carried to every mint below (directly, or on the pending
+        // entry across the MFA round trip) so a credential change landing in
+        // between denies the mint.
+        const std::string& verified_hash_hex = check.verified_hash_hex;
+        if (!role_opt) {
+            // Unreachable: kVerified always carries the role. Defensive, but
+            // never an empty 200 that a client could read as a login success.
+            spdlog::error("POST /login: verified credential carried no role");
+            res.status = 500;
+            res.set_content(detail::a4_error(res, "internal error"), "application/json");
             return;
         }
 
@@ -1890,39 +2090,6 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         // hard-deny — so an un-enrolled armed break-glass user that proved its
         // password gets ONLY the `auth.breakglass.denied` row, never a
         // contradictory `login`-then-`denied` pair.)
-
-        // Password verified — reset the lockout counter (the brute-force
-        // window is per-consecutive-failure, so any success clears it). Done
-        // here, before the MFA branching below, so it covers all three
-        // success exits (no-MFA mint, MFA challenge, enforced enrollment).
-        // Clear when there was a known non-zero counter, OR when the pre-check
-        // read failed and the count is unknown (F4 — never leave a stale
-        // counter behind a successful login). Only routine logins with a known
-        // zero counter skip the write, so they don't spam the audit log.
-        if (cfg_.auth_lockout_threshold > 0 && (prior_failed_count > 0 || lockout_read_failed)) {
-            if (auto* db = auth_mgr_.auth_db_ptr()) {
-                if (auto cl = db->clear_failed_logins(username); !cl) {
-                    spdlog::warn("clear_failed_logins failed for '{}': error={}", username,
-                                 static_cast<int>(cl.error()));
-                } else {
-                    if (!audit_log_for_principal(req, "auth.lockout.cleared", "ok", username,
-                                                 auth::role_to_string(*role_opt), "User", username,
-                                                 "reset_on_successful_login")) {
-                        spdlog::warn("audit emission failed for auth.lockout.cleared user='{}'",
-                                     username);
-                    }
-                    emit_event("auth.lockout.cleared", req,
-                               {{"source_ip", req.remote_addr}, {"username", username}});
-                }
-            }
-        }
-
-        // Lockout-critical section complete (password verified, counter
-        // cleared). Release the per-username lock BEFORE the MFA branching so a
-        // TOTP challenge for this user doesn't hold the stripe across the rest
-        // of the flow — MFA state has its own (`mfa_pending_mu_`) guard.
-        if (login_lk.owns_lock())
-            login_lk.unlock();
 
         // Decide whether this user must complete a TOTP challenge before we
         // mint a real session. ★ SECURITY (architect BLOCK, Postgres
@@ -2085,7 +2252,22 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                     cfg_.mfa_enforcement, username);
                 return;
             }
-            auto init = db->mfa_init_enrollment(username, "Yuzu");
+            // #5342 Gate 8 (F4): anchor the provisional secret to the hash this
+            // password was PROVEN against — a credential change committed since
+            // (or while the mint waited on its row lock) refuses before any
+            // reveal or write.
+            auto init = db->mfa_init_enrollment(username, "Yuzu", verified_hash_hex);
+            if (!init && init.error() == AuthDBError::CredentialChanged) {
+                // The SAME uniform 401 as a wrong password (no oracle: the
+                // caller proved a password that is no longer the account's);
+                // the truth is in the audit detail. Nothing was revealed or
+                // written, and no pending token was issued.
+                res.status = 401;
+                res.set_content(detail::a4_error(res, "Invalid username or password"),
+                                "application/json");
+                record_enroll_credential_changed(req, username, *role_opt);
+                return;
+            }
             if (!init) {
                 // ★ SECURITY (architect BLOCK): a decrypt/store failure while
                 // (re-)revealing a provisional secret is 503, fail-closed —
@@ -2132,6 +2314,7 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                     MfaPending entry;
                     entry.username = username;
                     entry.role = *role_opt;
+                    entry.hash_hex = verified_hash_hex;
                     entry.kind = PendingKind::enrollment;
                     entry.expires_at = std::chrono::steady_clock::now() +
                                        std::chrono::seconds(cfg_.mfa_login_pending_secs);
@@ -2186,7 +2369,8 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         }
 
         if (!mfa_enrolled) {
-            auto token = auth_mgr_.create_local_session(username, *role_opt, false);
+            auto token =
+                auth_mgr_.create_local_session(username, *role_opt, false, verified_hash_hex);
             if (token.empty()) {
                 // #4107 Gate 8 finding (security-guardian): create_local_
                 // session's empty-token sentinel (durable-persist failure,
@@ -2252,6 +2436,7 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                 MfaPending entry;
                 entry.username = username;
                 entry.role = *role_opt;
+                entry.hash_hex = verified_hash_hex;
                 entry.expires_at = std::chrono::steady_clock::now() +
                                    std::chrono::seconds(cfg_.mfa_login_pending_secs);
                 mfa_pending_[pending_token] = std::move(entry);
@@ -2492,7 +2677,10 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                     {"username", entry.username},
                     {"auth_method", used_recovery ? "password+recovery" : "password+totp"}});
         // Mint the real session marked as MFA-verified.
-        auto token = auth_mgr_.create_local_session(entry.username, entry.role, true);
+        // #5342 Gate 7 (B4): the step-1 credential anchor — a password reset
+        // or change committed since the pending /login denies this mint.
+        auto token =
+            auth_mgr_.create_local_session(entry.username, entry.role, true, entry.hash_hex);
         if (token.empty()) {
             // #4107 Gate 8 finding (security-guardian) - see the plain-
             // password-login call site's identical comment above (also
@@ -2619,11 +2807,19 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         bool verified = false;
         bool store_unavailable = false;
         bool already_enrolled = false;
+        bool credential_changed = false;
         if (is_totp) {
-            auto r = db->mfa_verify_enrollment(entry.username, code);
+            // #5342 Gate 8 (F2): bind the enrolment to the credential this
+            // pending login PROVED (the B4 hash carry) — a password change or
+            // reset committed since makes the guarded UPDATE match nothing
+            // (CredentialChanged), so an enrolment begun under a retired
+            // password can never complete.
+            auto r = db->mfa_verify_enrollment(entry.username, code, entry.hash_hex);
             if (r) {
                 recovery_codes = std::move(*r);
                 verified = true;
+            } else if (r.error() == AuthDBError::CredentialChanged) {
+                credential_changed = true;
             } else if (r.error() == AuthDBError::MfaAlreadyEnrolled) {
                 // The account is already enrolled — a concurrent verify won the
                 // race (or it was enrolled before this pending token committed).
@@ -2641,6 +2837,19 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                 // instead of burning an attempt on a transient outage.
                 store_unavailable = true;
             }
+        }
+
+        if (credential_changed) {
+            // #5342 Gate 8 (F2): the account's password changed after the login
+            // that issued this token. Uniform 401 (no oracle for the attacker
+            // who may hold an old-password token); the truth is in the audit
+            // detail. The token was move-erased on take-ownership above and is
+            // deliberately NOT re-inserted — it is spent. Nothing was enrolled
+            // and no session is minted.
+            res.status = 401;
+            res.set_content(kFailureBody(res), "application/json");
+            record_enroll_credential_changed(req, entry.username, entry.role);
+            return;
         }
 
         if (already_enrolled) {
@@ -2752,7 +2961,10 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                    {{"source_ip", req.remote_addr}, {"username", entry.username}});
         // Mint the MFA-verified session and return the recovery codes for
         // the one-time reveal.
-        auto token = auth_mgr_.create_local_session(entry.username, entry.role, true);
+        // #5342 Gate 7 (B4): the step-1 credential anchor — a password reset
+        // or change committed since the pending /login denies this mint.
+        auto token =
+            auth_mgr_.create_local_session(entry.username, entry.role, true, entry.hash_hex);
         if (token.empty()) {
             // #4107 Gate 8 finding (security-guardian) - see the plain-
             // password-login call site's identical comment. Enrollment

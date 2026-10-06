@@ -43,6 +43,7 @@
 #include "capability_decls/plugin_action_catalogue_privacy_permissions.hpp"
 #include "capability_decls/plugin_action_catalogue_system_hardening.hpp"
 #include "capability_decls/plugin_action_catalogue_pkg_inventory.hpp"
+#include "capability_decls/plugin_action_catalogue_mgmt_posture.hpp"
 #include "command_capability.hpp"
 
 #include <catch2/catch_test_macros.hpp>
@@ -162,6 +163,7 @@ struct LabeledSpan {
         {"privacy_permissions", capdecls::plugin_action_catalogue_privacy_permissions(), false},
         {"system_hardening", capdecls::plugin_action_catalogue_system_hardening(), false},
         {"pkg_inventory", capdecls::plugin_action_catalogue_pkg_inventory(), false},
+        {"mgmt_posture", capdecls::plugin_action_catalogue_mgmt_posture(), false},
         {"core", capdecls::core_dispatch_capabilities(), true},
     };
 }
@@ -170,7 +172,7 @@ struct LabeledSpan {
     // CommandCapabilityRegistry's constructor only accepts a brace-enclosed
     // std::initializer_list (see command_capability.hpp), so this can't be
     // built from the vector programmatically — it mirrors all_labeled_sources()
-    // literally, twenty-six sources exactly as a live composition site would use.
+    // literally, twenty-seven sources exactly as a live composition site would use.
     return CommandCapabilityRegistry{
         capdecls::plugin_action_catalogue_content_dist(),
         capdecls::plugin_action_catalogue_a(),
@@ -197,6 +199,7 @@ struct LabeledSpan {
         capdecls::plugin_action_catalogue_privacy_permissions(),
         capdecls::plugin_action_catalogue_system_hardening(),
         capdecls::plugin_action_catalogue_pkg_inventory(),
+        capdecls::plugin_action_catalogue_mgmt_posture(),
         capdecls::core_dispatch_capabilities(),
     };
 }
@@ -364,6 +367,26 @@ TEST_CASE("capability catalogue: update_source_trust.sources pins its exact clas
     CHECK(row.dispatch_class == DispatchClass::ReadOnly);
     CHECK(row.mutability == Mutability::None);
     CHECK(row.securable == "Security");
+    CHECK(row.operation == authz::Operation::Read);
+    CHECK(row.risk_tier == authz::RiskTier::Low);
+    CHECK(row.system_reserved == false);
+    CHECK(row.execute_gate == ExecuteGate::None);
+}
+
+/// Exact-row pin for `mgmt_posture.posture`. A read-only management-plane fact
+/// under `Inventory`:Read with no execute gate. Pinning it directly means a
+/// silent drift to a mutating class, a different securable, or a gate on a
+/// facts-only read fails here.
+TEST_CASE("capability catalogue: mgmt_posture.posture pins its exact classification",
+          "[server][dispatch][capability]") {
+    const auto rows = capdecls::plugin_action_catalogue_mgmt_posture();
+    REQUIRE(rows.size() == 1);
+    const auto& row = rows.front();
+    CHECK(row.plugin == "mgmt_posture");
+    CHECK(row.action == "posture");
+    CHECK(row.dispatch_class == DispatchClass::ReadOnly);
+    CHECK(row.mutability == Mutability::None);
+    CHECK(row.securable == "Inventory");
     CHECK(row.operation == authz::Operation::Read);
     CHECK(row.risk_tier == authz::RiskTier::Low);
     CHECK(row.system_reserved == false);

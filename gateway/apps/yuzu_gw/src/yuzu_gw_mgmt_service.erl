@@ -65,6 +65,14 @@ send_command(Request, Stream) ->
             %% Stream responses back to the operator as they arrive.
             stream_responses(Stream, FanoutRef, CommandId);
 
+        {error, router_unavailable} ->
+            %% The router is not running or did not answer: transient, so
+            %% UNAVAILABLE (a client may retry). yuzu_gw_safe_call has already
+            %% logged one rate-limited WARN naming only the class of the exit
+            %% (noproc, timeout, other): the request is never logged.
+            {error, #{status => 14,  %% UNAVAILABLE
+                      message => <<"Command router unavailable">>}};
+
         {error, Reason} ->
             {error, #{status => 13,
                       message => iolist_to_binary(

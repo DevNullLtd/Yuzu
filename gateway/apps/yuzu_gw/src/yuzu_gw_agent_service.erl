@@ -36,8 +36,33 @@ register(Ctx, RegisterReq) ->
     PeerAddr = maps:get(<<":authority">>, Headers,
                         maps:get(<<"x-forwarded-for">>, Headers, <<"unknown">>)),
 
+    %% A slot on the connection is RESERVED before the registration goes
+    %% upstream: the check and the claim are one step in the registry, so
+    %% concurrent Registers on one connection admit at most the quota and a
+    %% refused one leaves nothing on the server. The reservation becomes the
+    %% pending row in store_pending/3 and is released here on every other way out
+    %% (a reservation of a crashed handler is swept after the pending TTL).
+    AgentInfo0 = maps:get(info, RegisterReq, maps:get(<<"info">>, RegisterReq, #{})),
+    case yuzu_gw_registry:reserve_session(yuzu_gw_conn:key_from_ctx(Ctx),
+                                          extract_agent_id(AgentInfo0)) of
+        {ok, Reservation} ->
+            try
+                register_upstream(Ctx, RegisterReq, PeerAddr, Reservation)
+            after
+                yuzu_gw_registry:release_session(Reservation)
+            end;
+        {error, session_limit} ->
+            session_limit_error();
+        {error, registry_unavailable} ->
+            %% Nothing was proxied: the session could not be matched by Subscribe.
+            logger:warning("Register failed: registry_unavailable"),
+            {grpc_error, {?GRPC_STATUS_INTERNAL,
+                          <<"Registration failed: registry unavailable">>}}
+    end.
+
+register_upstream(Ctx, RegisterReq, PeerAddr, Reservation) ->
     case yuzu_gw_upstream:proxy_register(RegisterReq) of
-        {ok, Response} ->
+        {ok, Response} when is_map(Response) ->
             %% Stash the session_id and agent_info; the agent process is
             %% created when Subscribe arrives (matched by session_id).
             SessionId = maps:get(session_id, Response,
@@ -52,16 +77,42 @@ register(Ctx, RegisterReq) ->
             %% for upstream-reconnect replay. conn_key is the connection
             %% this Register arrived on: until Subscribe is admitted, a
             %% heartbeat for the pending session is admitted only on it.
-            yuzu_gw_registry:store_pending(SessionId,
+            case yuzu_gw_registry:store_pending(SessionId,
                                 #{agent_id  => AgentId,
                                   agent_info => AgentInfo,
                                   register_req => RegisterReq,
                                   peer_addr  => PeerAddr,
                                   conn_key   => yuzu_gw_conn:key_from_ctx(Ctx),
-                                  registered_at => erlang:system_time(millisecond)}),
+                                  registered_at => erlang:system_time(millisecond)},
+                                Reservation) of
+                ok ->
+                    logger:info("Agent ~s registered, awaiting Subscribe", [AgentId]),
+                    {ok, Response, Ctx};
+                {error, superseded} ->
+                    %% A newer Register of this agent id on the connection
+                    %% committed first: this session will never be matched by
+                    %% Subscribe, and the registry is healthy. The agent retries
+                    %% on any non-OK status; UNAVAILABLE is the retryable class
+                    %% (the session cap answers it too), not a server fault.
+                    logger:info("Register superseded by a newer registration"),
+                    {grpc_error, {?GRPC_STATUS_UNAVAILABLE,
+                                  <<"Registration superseded by a newer registration">>}};
+                {error, registry_unavailable} ->
+                    %% The registry is not running: the session cannot be
+                    %% matched by Subscribe, so the agent must register again.
+                    logger:warning("Register failed: registry_unavailable"),
+                    {grpc_error, {?GRPC_STATUS_INTERNAL,
+                                  <<"Registration failed: registry unavailable">>}};
+                {error, session_limit} ->
+                    session_limit_error()
+            end;
 
-            logger:info("Agent ~s registered, awaiting Subscribe", [AgentId]),
-            {ok, Response, Ctx};
+        {ok, _NotAMap} ->
+            %% An OK whose message is not a decoded response: the same failure
+            %% as an RPC error, with no body in the log or in the error.
+            logger:warning("Upstream Register failed: answer is not a response message"),
+            {grpc_error, {?GRPC_STATUS_INTERNAL,
+                          <<"Upstream registration failed: malformed response">>}};
 
         {error, Reason} ->
             logger:warning("Upstream Register failed: ~p", [Reason]),
@@ -94,6 +145,11 @@ subscribe(Ref, State) ->
                                 <<"Missing x-yuzu-session-id header">>}});
         _ ->
             case yuzu_gw_registry:take_pending(SessionId) of
+                {error, registry_unavailable} ->
+                    logger:warning("Subscribe failed: registry_unavailable"),
+                    throw({grpc_error, {?GRPC_STATUS_INTERNAL,
+                                        <<"Internal: registry unavailable">>}});
+
                 undefined ->
                     logger:warning("Subscribe: no pending registration for session ~s",
                                    [SessionId]),
@@ -122,9 +178,24 @@ subscribe(Ref, State) ->
                              peer_addr    => PeerAddr,
                              conn_key     => yuzu_gw_conn:key_from_stream(State)},
 
+                    %% The connection's session quota is asked before the agent
+                    %% process is started: a refusal then costs no process and
+                    %% no crash report. The registry asks again at the live
+                    %% insert, where the decision is made.
+                    case yuzu_gw_registry:session_admission(maps:get(conn_key, Args),
+                                                            AgentId) of
+                        ok                     -> ok;
+                        {error, session_limit} -> throw(session_limit_error())
+                    end,
+
                     case yuzu_gw_agent_sup:start_agent(Args) of
                         {ok, AgentPid} ->
                             stream_loop(Ref, State, AgentPid);
+
+                        {error, session_limit} ->
+                            %% Counted and logged by the registry (one WARN per
+                            %% second, naming only the cap).
+                            throw(session_limit_error());
 
                         {error, Reason} ->
                             logger:error("Failed to start agent process for ~s: ~p",
@@ -246,6 +317,13 @@ report_inventory(Ctx, InventoryReport) ->
 %%--------------------------------------------------------------------
 %% Internal
 %%--------------------------------------------------------------------
+
+%% The answer to a session refused by the per-connection quota: UNAVAILABLE, the
+%% retryable status (the agent backs off and registers again; the quota frees as
+%% the connection's other sessions end). No request in it, and no id.
+session_limit_error() ->
+    {grpc_error, {?GRPC_STATUS_UNAVAILABLE,
+                  <<"Too many agent sessions on this connection">>}}.
 
 extract_agent_id(AgentInfo) ->
     maps:get(<<"agent_id">>, AgentInfo,
