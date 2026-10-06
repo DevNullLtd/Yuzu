@@ -621,6 +621,9 @@ register_non_map_upstream_response() ->
     [begin
          ok = meck:expect(yuzu_gw_upstream, proxy_register, fun(_) -> {ok, Bad} end),
          Result = yuzu_gw_agent_service:register(ctx_with(conn_a), Req),
+         %% The warning is limited to one per interval: start the capture with a
+         %% fresh limit.
+         yuzu_gw_safe_call:reset_limits(),
          Lines = capture_logs(fun() ->
              ?assertMatch({grpc_error, {?GRPC_STATUS_INTERNAL, _}},
                           yuzu_gw_agent_service:register(ctx_with(conn_a), Req))
@@ -645,6 +648,8 @@ register_sanitises_the_peer_address_and_warns_once() ->
       fun({Raw, Want, SizeText}) ->
           A = uid(<<"peer-marker">>),
           Req = #{info => #{agent_id => A, hostname => <<"h">>}},
+          %% One warning per interval per kind: each case starts with a fresh limit.
+          yuzu_gw_safe_call:reset_limits(),
           Lines = capture_logs(fun() ->
               {ok, _, _} = yuzu_gw_agent_service:register(ctx_authority(conn_a, Raw), Req)
           end),

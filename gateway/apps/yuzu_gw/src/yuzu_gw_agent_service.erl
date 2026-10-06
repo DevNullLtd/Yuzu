@@ -51,8 +51,10 @@ register(Ctx, RegisterReq) ->
             %% the server would answer the same status, and the gateway used to
             %% count that answer as a failure of the upstream (see
             %% ?MAX_AGENT_ID_BYTES). The line carries the size, never the id.
-            logger:warning("Register refused: the agent id is empty or longer than ~b bytes "
-                           "(size ~b bytes)", [?MAX_AGENT_ID_BYTES, Size]),
+            yuzu_gw_safe_call:warn_limited(
+              register_refused,
+              "Register refused: the agent id is empty or longer than ~b bytes (size ~b bytes)",
+              [?MAX_AGENT_ID_BYTES, Size]),
             {grpc_error, {?GRPC_STATUS_INVALID_ARGUMENT,
                           <<"agent_id length exceeds 256 bytes or is empty">>}}
     end.
@@ -139,12 +141,14 @@ register_upstream(Ctx, RegisterReq, PeerAddr, Reservation) ->
         {ok, _NotAMap} ->
             %% An OK whose message is not a decoded response: the same failure
             %% as an RPC error, with no body in the log or in the error.
-            logger:warning("Upstream Register failed: answer is not a response message"),
+            yuzu_gw_safe_call:warn_limited(
+              register_failed, "Upstream Register failed: answer is not a response message", []),
             {grpc_error, {?GRPC_STATUS_INTERNAL,
                           <<"Upstream registration failed: malformed response">>}};
 
         {error, Reason} ->
-            logger:warning("Upstream Register failed: ~p", [Reason]),
+            yuzu_gw_safe_call:warn_limited(register_failed,
+                                           "Upstream Register failed: ~p", [Reason]),
             {grpc_error, {?GRPC_STATUS_INTERNAL,
                           iolist_to_binary(
                               io_lib:format("Upstream registration failed: ~p", [Reason]))}}
@@ -337,7 +341,8 @@ report_inventory(Ctx, InventoryReport) ->
         {ok, Response} ->
             {ok, Response, Ctx};
         {error, Reason} ->
-            logger:warning("Upstream ReportInventory failed: ~p", [Reason]),
+            yuzu_gw_safe_call:warn_limited(inventory_failed,
+                                           "Upstream ReportInventory failed: ~p", [Reason]),
             {grpc_error, {?GRPC_STATUS_INTERNAL,
                           iolist_to_binary(
                               io_lib:format("Upstream inventory report failed: ~p", [Reason]))}}
@@ -360,9 +365,11 @@ register_peer_addr(Headers, AgentId) ->
         true ->
             ok;
         false ->
-            logger:warning("Register from agent ~s: the peer address was replaced or cut "
-                           "to fit (original size ~b bytes)",
-                           [yuzu_gw_env:log_text(AgentId), raw_size(Raw)])
+            yuzu_gw_safe_call:warn_limited(
+              register_peer_addr,
+              "Register from agent ~s: the peer address was replaced or cut "
+              "to fit (original size ~b bytes)",
+              [yuzu_gw_env:log_text(AgentId), raw_size(Raw)])
     end,
     PeerAddr.
 

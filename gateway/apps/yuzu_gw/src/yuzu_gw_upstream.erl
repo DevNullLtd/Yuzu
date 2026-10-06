@@ -1532,7 +1532,8 @@ do_rpc(Method, Request, Tag, Ctx) ->
                               #{count => 1},
                               #{rpc_name => atom_to_binary(Tag, utf8),
                                 code => <<"exception">>}),
-            logger:warning("Upstream RPC ~s raised ~p:~p", [Method, Class1, Why1]),
+            yuzu_gw_safe_call:warn_limited(rpc_raised, "Upstream RPC ~s raised ~p:~p",
+                                           [Method, Class1, Why1]),
             case Origin of
                 %% Never reaches the breaker (record_result/2 ignores it).
                 local  -> {local_error, {Class1, Why1}};
@@ -1567,7 +1568,16 @@ do_rpc(Method, Request, Tag, Ctx) ->
                               #{count => 1},
                               #{rpc_name => atom_to_binary(Tag, utf8),
                                 code => Status}),
-            logger:warning("Upstream RPC ~s failed: ~p ~s", [Method, Status, yuzu_gw_env:log_text(Message)]),
+            case is_request_fault(Status) of
+                true ->
+                    %% Provoked by the request, so by whoever sent it: limited.
+                    yuzu_gw_safe_call:warn_limited(rpc_answered_error,
+                                                   "Upstream RPC ~s failed: ~p ~s",
+                                                   [Method, Status, yuzu_gw_env:log_text(Message)]);
+                false ->
+                    logger:warning("Upstream RPC ~s failed: ~p ~s",
+                                   [Method, Status, yuzu_gw_env:log_text(Message)])
+            end,
             {error, {Status, Message}};
         {http_error, {Status, _}, _Trailers} ->
             %% HA WS-4 4.4 round-2 review fix (consistency-auditor c-1 /
@@ -1634,6 +1644,9 @@ public_result({local_error, {Class, Why}}) ->
     {error, exception_reason(Class, Why)};
 public_result(Result) ->
     Result.
+
+is_request_fault(Status) when ?IS_REQUEST_FAULT(Status) -> true;
+is_request_fault(_Status) -> false.
 
 exception_reason(Class, Why) ->
     {internal, iolist_to_binary(io_lib:format("rpc exception ~p:~p", [Class, Why]))}.

@@ -26,7 +26,10 @@
 -include_lib("eunit/include/eunit.hrl").
 -include_lib("grpcbox/include/grpcbox.hrl").
 
+-export([log/2]).  %% logger handler callback (log capture)
+
 -define(CTX_KEY, yuzu_register_bound_conn_key).
+-define(LOG_HANDLER, yuzu_register_bound_tests_logs).
 -define(WIRE_KEY, {?MODULE, wire}).
 -define(MAX_AGENT_ID, 256).
 %% The receive limit of a stock gRPC server (no override exists on the server).
@@ -61,8 +64,39 @@ bound_test_() ->
          fun oversize_request_never_feeds_the_breaker/0)
       ]} || Threshold <- [3, 5]].
 
+%%% The warnings a malformed registration can provoke are limited (#4632): the
+%%% first occurrence logs, the rest of the interval is counted, and the next line
+%%% carries the count. Each kind is driven the way a caller would provoke it.
+limit_test_() ->
+    {foreach,
+     fun() -> setup_limits(3) end,
+     fun cleanup_limits/1,
+     [
+      t("a refused agent id logs once per interval, then the count rides the next line",
+        fun refused_agent_id_warning_is_limited/0),
+      t("a replaced peer address logs once per interval, then the count rides the next line",
+        fun peer_address_warning_is_limited/0),
+      t("a Register that cannot be encoded: both its lines are limited",
+        fun local_encode_warnings_are_limited/0),
+      t("a Register the server answers as a request fault: its lines are limited",
+        fun request_fault_warnings_are_limited/0),
+      t("a failure that says the upstream is unhealthy is not limited",
+        fun unhealthy_status_warning_is_not_limited/0),
+      t("a burst of concurrent malformed Registers writes a small bounded number of lines",
+        fun concurrent_burst_is_bounded/0)
+     ]}.
+
 t(Name, Fun) ->
     {timeout, 30, {Name, Fun}}.
+
+setup_limits(Threshold) ->
+    Ctx = setup(Threshold),
+    yuzu_gw_safe_call:reset_limits(),
+    Ctx.
+
+cleanup_limits(Ctx) ->
+    yuzu_gw_safe_call:reset_limits(),
+    cleanup(Ctx).
 
 setup(Threshold) ->
     {ok, _} = application:ensure_all_started(telemetry),
@@ -326,3 +360,149 @@ oversize_request_never_feeds_the_breaker() ->
 fixture_threshold() ->
     {ok, Threshold} = application:get_env(yuzu_gw, circuit_breaker_failure_threshold),
     #{threshold => Threshold}.
+
+%%%===================================================================
+%%% Limited warnings
+%%%===================================================================
+
+%% One provoking call for a kind, and the text its limited line starts with.
+%% Pattern is matched against the lines a call writes; the call is repeated
+%% N times while the kind is held quiet, so the interval cannot pass mid burst.
+refused_agent_id_warning_is_limited() ->
+    limited_kind(register_refused, <<"Register refused: the agent id is empty">>,
+                 fun() ->
+                     {grpc_error, _} = yuzu_gw_agent_service:register(
+                                         ctx(), register_req(binary:copy(<<"r">>, 300)))
+                 end).
+
+peer_address_warning_is_limited() ->
+    limited_kind(register_peer_addr, <<"the peer address was replaced or cut">>,
+                 fun() ->
+                     Ctx = ctx:with_value(ctx(), md_incoming_key,
+                                          #{<<":authority">> => <<255, 254, 200>>}),
+                     {ok, _, _} = yuzu_gw_agent_service:register(
+                                    Ctx, register_req(unique(<<"peer-agent">>)))
+                 end).
+
+%% Two kinds fire for one Register that cannot be encoded: the client line and
+%% the handler line. Each is limited by its own kind.
+local_encode_warnings_are_limited() ->
+    Provoke = fun() ->
+                  Req = #{info => #{agent_id => unique(<<"enc-agent">>),
+                                    hostname => <<255, 254>>}},
+                  {grpc_error, _} = yuzu_gw_agent_service:register(ctx(), Req)
+              end,
+    limited_kind(rpc_raised, <<"Upstream RPC ProxyRegister raised">>, Provoke),
+    yuzu_gw_safe_call:reset_limits(),
+    limited_kind(register_failed, <<"Upstream Register failed">>, Provoke).
+
+%% An agent id with a comma is inside the edge bound and is refused by the
+%% server's enrollment field check with INVALID_ARGUMENT.
+request_fault_warnings_are_limited() ->
+    mock_answer({error, {<<"3">>, <<"invalid enrollment request">>}, #{}}),
+    Provoke = fun() ->
+                  {grpc_error, _} = yuzu_gw_agent_service:register(
+                                      ctx(), register_req(<<"a,b">>))
+              end,
+    limited_kind(rpc_answered_error, <<"Upstream RPC ProxyRegister failed">>, Provoke),
+    yuzu_gw_safe_call:reset_limits(),
+    limited_kind(register_failed, <<"Upstream Register failed">>, Provoke),
+    %% The breaker stayed closed through all of it.
+    ?assertEqual({closed, 0}, breaker()).
+
+%% The counterpart: a status that says the upstream is unhealthy is the line an
+%% operator needs on every occurrence, so it is not limited. Two calls, two lines.
+unhealthy_status_warning_is_not_limited() ->
+    mock_answer({error, {<<"14">>, <<"unavailable">>}, #{}}),
+    Lines = capture_logs(fun() ->
+        {error, _} = yuzu_gw_upstream:proxy_register(register_req(<<"agent">>)),
+        {error, _} = yuzu_gw_upstream:proxy_register(register_req(<<"agent">>))
+    end),
+    ?assertEqual(2, length(matching(Lines, <<"Upstream RPC ProxyRegister failed">>))).
+
+concurrent_burst_is_bounded() ->
+    N = 200,
+    Parent = self(),
+    Pids = [spawn_monitor(fun() ->
+                Parent ! {burst_ready, self()},
+                receive go -> ok end,
+                {grpc_error, _} = yuzu_gw_agent_service:register(
+                                    ctx(), register_req(binary:copy(<<"x">>, 400)))
+            end) || _ <- lists:seq(1, N)],
+    [receive {burst_ready, P} -> ok after 5000 -> error(burst_not_ready) end
+     || {P, _} <- Pids],
+    %% The interval cannot pass mid burst: the kind is held after its first line.
+    yuzu_gw_safe_call:reset_limits(),
+    Lines = capture_logs(fun() ->
+        [P ! go || {P, _} <- Pids],
+        [receive {'DOWN', M, process, P, normal} -> ok
+         after 5000 -> error({burst_caller_failed, P})
+         end || {P, M} <- Pids]
+    end),
+    Refused = matching(Lines, <<"Register refused">>),
+    %% One line per interval; a second only if the burst straddled the interval.
+    ?assert(length(Refused) >= 1),
+    ?assert(length(Refused) =< 2),
+    ?assertEqual({closed, 0}, breaker()).
+
+%% The first call logs, the kind is then held quiet, Count - 1 more calls log
+%% nothing, and after the interval passes the next call logs a line that says how
+%% many were suppressed.
+limited_kind(Kind, Pattern, Provoke) ->
+    Count = 50,
+    First = capture_logs(fun() -> Provoke(), yuzu_gw_safe_call:hold_limit(Kind) end),
+    ?assertMatch([_ | _], matching(First, Pattern)),
+    [Line | _] = matching(First, Pattern),
+    ?assertEqual(nomatch, binary:match(Line, <<"suppressed">>)),
+    Quiet = capture_logs(fun() -> [Provoke() || _ <- lists:seq(2, Count)] end),
+    ?assertEqual([], matching(Quiet, Pattern)),
+    yuzu_gw_safe_call:expire_limit(Kind),
+    Next = capture_logs(fun() -> Provoke() end),
+    Lines = matching(Next, Pattern),
+    ?assertMatch([_ | _], Lines),
+    Expected = iolist_to_binary(io_lib:format("~b similar line(s) suppressed since the last",
+                                              [Count - 1])),
+    ?assertMatch([_ | _], [L || L <- Lines, binary:match(L, Expected) =/= nomatch]).
+
+matching(Lines, Pattern) ->
+    [L || L <- Lines, binary:match(L, Pattern) =/= nomatch].
+
+%%%===================================================================
+%%% Log capture
+%%%===================================================================
+
+%% Run Fun and return the rendered text of every warning logged meanwhile. The
+%% handler runs in the logging process and sends before the logging call
+%% returns; every body waits for the processes that log, so nothing is pending.
+capture_logs(Fun) ->
+    Prev = maps:get(level, logger:get_primary_config()),
+    ok = logger:set_primary_config(level, warning),
+    catch logger:remove_handler(?LOG_HANDLER),
+    ok = logger:add_handler(?LOG_HANDLER, ?MODULE,
+                            #{config => #{pid => self()}, level => warning}),
+    try
+        flush_logs(),
+        Fun(),
+        collect_logs([])
+    after
+        logger:remove_handler(?LOG_HANDLER),
+        logger:set_primary_config(level, Prev)
+    end.
+
+flush_logs() ->
+    receive {captured_log, _} -> flush_logs() after 0 -> ok end.
+
+collect_logs(Acc) ->
+    receive {captured_log, Text} -> collect_logs([Text | Acc])
+    after 0 -> lists:reverse(Acc)
+    end.
+
+%% logger handler callback
+log(#{msg := Msg, meta := _}, #{config := #{pid := Pid}}) ->
+    Text = case Msg of
+        {string, S} -> unicode:characters_to_binary(S);
+        {report, R} -> unicode:characters_to_binary(io_lib:format("~p", [R]));
+        {Fmt, Args} -> unicode:characters_to_binary(io_lib:format(Fmt, Args))
+    end,
+    Pid ! {captured_log, Text},
+    ok.
