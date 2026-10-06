@@ -215,7 +215,11 @@ probe_log_test_() ->
      fun cleanup_logs/1,
      [
       t("a probe worker killed with no result logs a warning naming the agent and the reason",
-        fun killed_probe_worker_is_logged/0)
+        fun killed_probe_worker_is_logged/0),
+      t("the killed probe warning redacts an exit reason that carries payload bytes",
+        fun killed_probe_warning_redacts_the_reason/0),
+      t("an agent id with control characters never reaches a notify log line raw",
+        fun notify_log_lines_carry_no_raw_control_characters/0)
      ]}.
 
 %% A request that cannot be encoded never left the gateway, so it says nothing
@@ -1289,6 +1293,64 @@ killed_probe_worker_is_logged() ->
     %% The payload (peer address, session id) is not in the line.
     ?assertEqual(nomatch, string:find(Line, "peer")),
     ?assertEqual(nomatch, string:find(Line, "sess")).
+
+%% The worker is parked inside the mock, so an exit signal with a reason is the
+%% only thing that ends it: the reason is what the 'DOWN' carries. It holds
+%% payload-looking bytes in the places redact_reason/1 must drop: the offending
+%% term of a badmatch and the argument list of a stacktrace frame.
+killed_probe_warning_redacts_the_reason() ->
+    watch(),
+    trip_breaker(),
+    cast_connected(agent(1)),
+    sync(),
+    enter_half_open(),
+    {Probe, _} = await_entered(),
+    exit(Probe, {{badmatch, <<"peer-secret">>},
+                 [{some_module, some_fun, [<<"sess-secret">>, <<"home-secret">>], []}]}),
+    await_until(fun() -> last_gauge() =:= {1, 0} end),
+    await_dead(Probe),
+    sync(),
+    Lines = [Text || {_, log, warning, Text} <- rows(),
+                     string:find(Text, "Notify probe worker") =/= nomatch],
+    ?assertMatch([_], Lines),
+    [Line] = Lines,
+    ?assertNotEqual(nomatch, string:find(Line, "agent-1")),
+    ?assertNotEqual(nomatch, string:find(Line, "badmatch")),
+    [?assertEqual(nomatch, string:find(Line, Secret))
+     || Secret <- ["peer-secret", "sess-secret", "home-secret"]].
+
+%% A carriage return or line feed in an agent id must not start a second log
+%% line: the eviction line and the failed-notify line carry it through log_text.
+notify_log_lines_carry_no_raw_control_characters() ->
+    watch(),
+    Evil = <<"crlf-marker", 13, 10, "INJECTED">>,
+    %% Evicted as the probe (the id is not UTF-8, so it cannot be encoded).
+    Unencodable = <<255, 13, 10, "crlf-marker">>,
+    trip_breaker(),
+    notify_status(Unencodable, <<"sess">>, connected, <<"peer">>, <<"home">>),
+    sync(),
+    enter_half_open(),
+    ?assertEqual({marshal_failed, Unencodable}, await_attempt()),
+    await_until(fun() -> last_gauge() =:= {0, 0} end),
+    %% Closed again by a good probe, then a failed ordinary notification.
+    cast_connected(agent(1)),
+    {entered, Good, _} = await_attempt(),
+    Good ! release,
+    await_until(fun() -> up_get(cb_state) =:= closed end),
+    cast_connected(Evil),
+    {entered, Failing, _} = await_attempt(),
+    fail_worker(Failing),
+    await_until(fun() -> last_gauge() =:= {0, 0} end),
+    await_dead(Failing),
+    sync(),
+    Lines = [Text || {_, log, warning, Text} <- rows(),
+                     string:find(Text, "crlf-marker") =/= nomatch],
+    %% Each control character became one `?': the rest of a ~p rendering may
+    %% wrap, so the id is checked as rendered rather than by looking for a
+    %% line feed anywhere in the line.
+    ?assertEqual(2, length(Lines)),
+    ?assertMatch([_], [L || L <- Lines, string:find(L, "??crlf-marker") =/= nomatch]),
+    ?assertMatch([_], [L || L <- Lines, string:find(L, "crlf-marker??INJECTED") =/= nomatch]).
 
 duplicate_and_foreign_probe_results_are_ignored() ->
     watch(),

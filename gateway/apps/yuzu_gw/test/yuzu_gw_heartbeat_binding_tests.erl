@@ -92,6 +92,12 @@ binding_test_() ->
        fun register_records_conn_key/0},
       {"Register with an upstream answer that is not a map fails without raising",
        fun register_non_map_upstream_response/0},
+      {"Register sanitises the peer address and warns once when it changed it",
+       fun register_sanitises_the_peer_address_and_warns_once/0},
+      {"Register keeps an ordinary peer address and does not warn",
+       fun register_keeps_an_ordinary_peer_address/0},
+      {"agent id and peer address are logged without raw control characters",
+       fun agent_text_is_logged_without_control_characters/0},
       {"rejections produce a rate-limited summary log with no session id",
        fun rejection_log_is_rate_limited_and_id_free/0},
       {"Register and agent-connected info logs carry no session id",
@@ -627,6 +633,75 @@ register_non_map_upstream_response() ->
                                    binary:match(L, <<"not a response message">>) =/= nomatch])
      end || Bad <- [<<"body-marker">>, [<<"body-marker">>], undefined]],
     ok.
+
+%% The :authority header is agent supplied. Register makes it safe before it is
+%% stored (the pending row, later the notification) and says so once, naming the
+%% agent and the original size and never the bytes.
+register_sanitises_the_peer_address_and_warns_once() ->
+    Long = binary:copy(<<"a">>, 5000),
+    Cases = [{<<255, 254, 200>>, <<"invalid">>, <<"original size 3 bytes">>},
+             {Long, binary:copy(<<"a">>, 255), <<"original size 5000 bytes">>}],
+    lists:foreach(
+      fun({Raw, Want, SizeText}) ->
+          A = uid(<<"peer-marker">>),
+          Req = #{info => #{agent_id => A, hostname => <<"h">>}},
+          Lines = capture_logs(fun() ->
+              {ok, _, _} = yuzu_gw_agent_service:register(ctx_authority(conn_a, Raw), Req)
+          end),
+          ?assertEqual(Want, pending_peer_addr(<<"reg-session-", A/binary>>)),
+          Warned = [L || L <- Lines, binary:match(L, <<"the peer address was replaced">>) =/= nomatch],
+          ?assertMatch([_], Warned),
+          [Line] = Warned,
+          ?assertNotEqual(nomatch, binary:match(Line, A)),
+          ?assertNotEqual(nomatch, binary:match(Line, SizeText)),
+          %% Never the value: neither the long run of a's nor the raw bytes.
+          ?assertEqual(nomatch, binary:match(Line, <<"aaaaaaaaaa">>)),
+          ?assertEqual(nomatch, binary:match(Line, <<255, 254>>))
+      end, Cases).
+
+register_keeps_an_ordinary_peer_address() ->
+    A = uid(<<"peer-marker">>),
+    Req = #{info => #{agent_id => A, hostname => <<"h">>}},
+    Lines = capture_logs(fun() ->
+        {ok, _, _} = yuzu_gw_agent_service:register(ctx_authority(conn_a, <<"peer-a:1">>), Req)
+    end),
+    ?assertEqual(<<"peer-a:1">>, pending_peer_addr(<<"reg-session-", A/binary>>)),
+    ?assertEqual([], [L || L <- Lines, binary:match(L, <<"the peer address was replaced">>) =/= nomatch]).
+
+%% A carriage return or line feed in an agent id or peer address must not start
+%% a second log line: the connect and register lines carry both through log_text.
+agent_text_is_logged_without_control_characters() ->
+    Uid = uid(<<"u">>),
+    A = <<"crlf-marker", 13, 10, "INJECTED-", Uid/binary>>,
+    Peer = <<"peer-marker", 13, 10, "INJECTED:1">>,
+    S = <<"reg-session-", A/binary>>,
+    Req = #{info => #{agent_id => A, hostname => <<"h">>}},
+    Lines = capture_logs(fun() ->
+        {ok, _, _} = yuzu_gw_agent_service:register(ctx_authority(conn_a, Peer), Req),
+        Args = #{agent_id => A, session_id => S, stream_pid => self(),
+                 agent_info => #{agent_id => A}, peer_addr => Peer, conn_key => conn_a},
+        {ok, Agent} = yuzu_gw_agent:start_link(Args),
+        unlink(Agent),
+        {ok, _} = yuzu_gw_agent:get_info(Agent),
+        yuzu_gw_agent:disconnect(Agent),
+        ok = wait_until(fun() -> not is_process_alive(Agent) end, 2000)
+    end),
+    Registered = [L || L <- Lines, binary:match(L, <<"registered, awaiting Subscribe">>) =/= nomatch,
+                       binary:match(L, <<"crlf-marker">>) =/= nomatch],
+    Connected = [L || L <- Lines, binary:match(L, <<"connected from">>) =/= nomatch,
+                      binary:match(L, <<"crlf-marker">>) =/= nomatch],
+    ?assertMatch([_], Registered),
+    ?assertMatch([_], Connected),
+    [?assertEqual(nomatch, binary:match(L, [<<13>>, <<10>>])) || L <- Registered ++ Connected],
+    ?assertNotEqual(nomatch, binary:match(hd(Connected), <<"peer-marker">>)).
+
+%% The :authority header of a Register, as grpcbox hands it to the handler.
+ctx_authority(Key, Authority) ->
+    ctx:with_value(ctx_with(Key), md_incoming_key, #{<<":authority">> => Authority}).
+
+pending_peer_addr(SessionId) ->
+    [{_, Info, _}] = ets:lookup(?PENDING, SessionId),
+    maps:get(peer_addr, Info).
 
 %%%===================================================================
 %%% Logging

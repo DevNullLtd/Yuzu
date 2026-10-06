@@ -465,7 +465,7 @@ handle_cast({notify_stream_status, AgentId, SessionId, Event, PeerAddr0, StreamH
                 %% key of a half_open probe in flight, which still counts) up to
                 %% notify_pending_max.
                 logger:debug("Dropping stream status notification for ~s (pending store full)",
-                             [AgentId]),
+                             [yuzu_gw_env:log_text(AgentId)]),
                 telemetry:execute([yuzu, gw, upstream, notify_dropped],
                                   #{count => 1}, #{reason => <<"at_capacity">>}),
                 State
@@ -710,7 +710,7 @@ handle_info({'DOWN', MonRef, process, Pid, Reason},
     %% Without this line the only trace of a killed probe is the half_open -> open
     %% warning. The reason is redacted (a crash reason can carry the payload).
     logger:warning("Notify probe worker for ~s exited without a result: ~p",
-                   [AgentId, redact_reason(Reason)]),
+                   [yuzu_gw_env:log_text(AgentId), redact_reason(Reason)]),
     Before = notify_counts(State),
     State1 = resolve_probe(Gen, {error, worker_down}, State),
     {noreply, report_notify_counts(Before, drain(State1))};
@@ -1094,7 +1094,7 @@ sanitize_peer_addr(AgentId, PeerAddr0) ->
         false ->
             logger:debug("Stream status notification for ~s: peer address replaced "
                          "(original size ~b bytes)",
-                         [AgentId, peer_addr_size(PeerAddr0)])
+                         [yuzu_gw_env:log_text(AgentId), peer_addr_size(PeerAddr0)])
     end,
     PeerAddr.
 
@@ -1125,7 +1125,7 @@ drain(#state{cb_state = closed, notify_pids = Pids, notify_pending = Pending,
                             {ok, _} -> ok;
                             {error, Reason} ->
                                 logger:warning("Failed to notify stream status for ~s: ~p",
-                                               [AgentId, Reason])
+                                               [yuzu_gw_env:log_text(AgentId), Reason])
                         end
                     end),
                     drain(State#state{notify_pending = Pending1,
@@ -1150,7 +1150,7 @@ drain(#state{cb_state = half_open, notify_probe = undefined, notify_pids = Pids,
                     {ok, _} -> ok;
                     {error, Reason} ->
                         logger:warning("Failed to notify stream status for ~s: ~p",
-                                       [AgentId, Reason]);
+                                       [yuzu_gw_env:log_text(AgentId), Reason]);
                     {local_error, _} ->
                         %% Logged once, by resolve_probe/3, when it evicts the event.
                         ok

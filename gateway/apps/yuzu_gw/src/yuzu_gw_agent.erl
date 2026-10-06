@@ -179,7 +179,8 @@ announce_connected(#data{agent_id = AgentId, session_id = SessionId, peer_addr =
                       #{agent_id => AgentId, node => node(),
                         session_id => SessionId}),
 
-    logger:info("Agent ~s connected from ~s", [AgentId, PeerAddr]),
+    logger:info("Agent ~s connected from ~s",
+                [yuzu_gw_env:log_text(AgentId), yuzu_gw_env:log_text(PeerAddr)]),
 
     %% Notify C++ server about the stream connection.
     yuzu_gw_upstream:notify_stream_status(AgentId, SessionId, connected, PeerAddr,

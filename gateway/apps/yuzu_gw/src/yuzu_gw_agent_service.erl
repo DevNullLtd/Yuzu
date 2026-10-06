@@ -33,11 +33,11 @@
 
 register(Ctx, RegisterReq) ->
     Headers = grpcbox_metadata:from_incoming_ctx(Ctx),
+    AgentInfo0 = maps:get(info, RegisterReq, maps:get(<<"info">>, RegisterReq, #{})),
     %% Agent supplied, and held in the pending store, logged and sent upstream
-    %% later: sanitised here, at the source (see yuzu_gw_peer_addr).
-    PeerAddr = yuzu_gw_peer_addr:sanitize(
-                 maps:get(<<":authority">>, Headers,
-                          maps:get(<<"x-forwarded-for">>, Headers, <<"unknown">>))),
+    %% later: sanitised here, at the source (see yuzu_gw_peer_addr). A change is
+    %% logged once, with the agent and the original size.
+    PeerAddr = register_peer_addr(Headers, extract_agent_id(AgentInfo0)),
 
     %% A slot on the connection is RESERVED before the registration goes
     %% upstream: the check and the claim are one step in the registry, so
@@ -45,7 +45,6 @@ register(Ctx, RegisterReq) ->
     %% refused one leaves nothing on the server. The reservation becomes the
     %% pending row in store_pending/3 and is released here on every other way out
     %% (a reservation of a crashed handler is swept after the pending TTL).
-    AgentInfo0 = maps:get(info, RegisterReq, maps:get(<<"info">>, RegisterReq, #{})),
     case yuzu_gw_registry:reserve_session(yuzu_gw_conn:key_from_ctx(Ctx),
                                           extract_agent_id(AgentInfo0)) of
         {ok, Reservation} ->
@@ -89,7 +88,8 @@ register_upstream(Ctx, RegisterReq, PeerAddr, Reservation) ->
                                   registered_at => erlang:system_time(millisecond)},
                                 Reservation) of
                 ok ->
-                    logger:info("Agent ~s registered, awaiting Subscribe", [AgentId]),
+                    logger:info("Agent ~s registered, awaiting Subscribe",
+                                [yuzu_gw_env:log_text(AgentId)]),
                     {ok, Response, Ctx};
                 {error, superseded} ->
                     %% A newer Register of this agent id on the connection
@@ -202,7 +202,7 @@ subscribe(Ref, State) ->
 
                         {error, Reason} ->
                             logger:error("Failed to start agent process for ~s: ~p",
-                                         [AgentId, Reason]),
+                                         [yuzu_gw_env:log_text(AgentId), Reason]),
                             throw({grpc_error, {?GRPC_STATUS_INTERNAL,
                                                 <<"Internal: agent process start failed">>}})
                     end
@@ -320,6 +320,28 @@ report_inventory(Ctx, InventoryReport) ->
 %%--------------------------------------------------------------------
 %% Internal
 %%--------------------------------------------------------------------
+
+%% The peer address of a Register: the :authority header (else x-forwarded-for),
+%% made safe by yuzu_gw_peer_addr. When that changed the value (an address that
+%% is not UTF-8, or one over the limit) the operator is told once, with the agent
+%% and the original size, never the bytes: the address reads `invalid' or is cut
+%% in the logs and in the server, and this is the only place that says why.
+register_peer_addr(Headers, AgentId) ->
+    Raw = maps:get(<<":authority">>, Headers,
+                   maps:get(<<"x-forwarded-for">>, Headers, <<"unknown">>)),
+    PeerAddr = yuzu_gw_peer_addr:sanitize(Raw),
+    case PeerAddr =:= Raw of
+        true ->
+            ok;
+        false ->
+            logger:warning("Register from agent ~s: the peer address was replaced or cut "
+                           "to fit (original size ~b bytes)",
+                           [yuzu_gw_env:log_text(AgentId), raw_size(Raw)])
+    end,
+    PeerAddr.
+
+raw_size(Raw) when is_binary(Raw) -> byte_size(Raw);
+raw_size(_Raw) -> 0.
 
 %% The answer to a session refused by the per-connection quota: UNAVAILABLE, the
 %% retryable status (the agent backs off and registers again; the quota frees as
