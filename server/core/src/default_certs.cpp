@@ -461,7 +461,8 @@ void warn_on_san_drift(const fs::path& representative_leaf,
     spdlog::warn(
         "default_certs: --cert-san requests [{}] not present in the existing default certs "
         "(they predate these SANs). To re-issue the default leaves with them under the "
-        "same CA, rename default-marker.json in the cert directory aside and restart. Do not "
+        "same CA, rename default-marker.json in the cert directory aside and restart (move it "
+        "back if the next start refuses). Do not "
         "clear the directory: it also holds the CA key and secrets-kek-*.key.",
         joined);
 }

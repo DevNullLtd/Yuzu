@@ -4306,7 +4306,8 @@ enrollment tokens.
   the file with mode `0600` (Linux) or restricted ACL (Windows), runs
   the initial schema migration via `MigrationRunner`, then seeds users
   from `yuzu-server.cfg`. Subsequent boots read from `auth.db`
-  directly; the config file is no longer the live source of truth.
+  directly, but through 0.14.x the config file's entries still win over
+  the database at every start (see below).
 - The seed into the database is one-shot: editing `yuzu-server.cfg`
   after first boot does NOT re-seed users into `auth.db` (or, since
   0.14.0, the Postgres `auth` schema). It is **not** a one-time read,

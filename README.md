@@ -147,17 +147,19 @@ Prebuilt artifacts are published with every tagged release. If you just want to 
 - **Release binaries & installers** (server/agent for Linux, Windows, macOS; Compose Wizard zip): [GitHub Releases](https://github.com/DevNullLtd/Yuzu/releases). Latest stable is v0.14.0.
 - **Container images** (published to GHCR on every tag):
   - `ghcr.io/devnullltd/yuzu-server:<version>`
+  - `ghcr.io/devnullltd/yuzu-postgres:<version>`
   - `ghcr.io/devnullltd/yuzu-agent-chisel:<version>`
   - `ghcr.io/devnullltd/yuzu-gateway:<version>`
 - **Docker Compose** quickstart: an evaluation stack for one Docker host, not a production install (for production, read [Server administration](docs/user-manual/server-admin.md) and [Security hardening](docs/user-manual/security-hardening.md)). It downloads [`deploy/docker/docker-compose.reference.yml`](deploy/docker/docker-compose.reference.yml) from the release tag, which pulls the released `yuzu-server` and `yuzu-postgres` images at the tag in `YUZU_VERSION`. On first start the server creates its own certificate authority and serves the dashboard and REST API over HTTPS on port 8443. Server data, the certificate authority and the secrets key (`/etc/yuzu/certs`) are kept in named volumes. You need bash or zsh on Linux, macOS or WSL2, Docker Compose v2.1.1 or later, `curl`, `openssl` and `python3`. Run one install per Docker host: the Compose project name, and so the volume names, is the directory name, and the containers have fixed names.
 
-Step 1 creates a `yuzu` directory, downloads the compose file into it and writes `.env` with the release and two different Postgres passwords. It stops if a `yuzu` Compose project's volumes already exist on this Docker host or the directory already exists, and never overwrites a file, so pasting it again cannot replace your passwords or attach to another install's data.
+Step 1 creates a `yuzu` directory, downloads the compose file into it and writes `.env` with the release and two different Postgres passwords. It stops if any of a `yuzu` Compose project's volumes (`yuzu_server-data`, `yuzu_certs`, `yuzu_postgres-data`) already exists on this Docker host or the directory already exists, writes `.env` only after both passwords were generated, and never overwrites a file, so pasting it again cannot replace your passwords or attach to another install's data.
 
 ```bash
-! docker volume inspect yuzu_server-data >/dev/null 2>&1 &&
+[ -z "$(docker volume inspect -f '{{.Name}}' yuzu_server-data yuzu_certs yuzu_postgres-data 2>/dev/null)" ] &&
 mkdir yuzu && cd yuzu &&
 curl -fsSL https://raw.githubusercontent.com/DevNullLtd/Yuzu/v0.14.0/deploy/docker/docker-compose.reference.yml -o docker-compose.yml &&
-(umask 077; set -C; printf 'YUZU_VERSION=0.14.0\nYUZU_POSTGRES_PASSWORD=%s\nYUZU_DB_PASSWORD=%s\n' "$(openssl rand -hex 24)" "$(openssl rand -hex 24)" > .env)
+p1=$(openssl rand -hex 24) && p2=$(openssl rand -hex 24) && [ ${#p1} -eq 48 ] && [ ${#p2} -eq 48 ] &&
+(umask 077; set -C; printf 'YUZU_VERSION=0.14.0\nYUZU_POSTGRES_PASSWORD=%s\nYUZU_DB_PASSWORD=%s\n' "$p1" "$p2" > .env)
 ```
 
 Step 2 creates the first admin account. The server's first-run setup asks for it on a terminal, which a detached container does not have, so this writes the file that setup would write, `yuzu-server.cfg` (PBKDF2-HMAC-SHA256, 100,000 iterations), and copies it into the server's data volume. It asks for the password twice and refuses to overwrite either copy.
@@ -168,7 +170,8 @@ p = getpass.getpass("Admin password, at least 12 characters: ")
 if len(p) < 12 or p != getpass.getpass("Again: "): sys.exit("Too short or not the same. Nothing written.")
 s = os.urandom(16)
 line = "admin:admin:%s:%s\n" % (s.hex(), hashlib.pbkdf2_hmac("sha256", p.encode(), s, 100000).hex())
-os.write(os.open("yuzu-server.cfg", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), line.encode())' &&
+fd = os.open("yuzu-server.cfg", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+if os.write(fd, line.encode()) != len(line): sys.exit("Short write: delete yuzu-server.cfg and run this step again.")' &&
 docker compose -f docker-compose.yml run --rm --no-deps -T --entrypoint sh server -c 'umask 077 && set -C && cat > /var/lib/yuzu/yuzu-server.cfg' < yuzu-server.cfg
 ```
 

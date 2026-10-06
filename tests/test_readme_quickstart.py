@@ -41,6 +41,7 @@ Container paths are handled with posixpath: on the Windows docs leg
 pathlib.Path would turn /var/lib/yuzu into \\var\\lib\\yuzu.
 """
 
+import os
 import posixpath
 import re
 import subprocess
@@ -137,6 +138,11 @@ def image_cmd_config(dockerfile_text):
     return args[args.index("--config") + 1] if "--config" in args else None
 
 
+GUARD = ("[ -z \"$(docker volume inspect -f '{{.Name}}' yuzu_server-data yuzu_certs "
+         "yuzu_postgres-data 2>/dev/null)\" ] &&")
+AUTH_CPP = ROOT / "server/core/src/auth.cpp"
+
+
 def check(region, compose_text, compose_rel, image_config, iterations):
     """Return a list of reasons the quickstart is broken (empty when it holds)."""
     bad = []
@@ -210,8 +216,9 @@ def check(region, compose_text, compose_rel, image_config, iterations):
     first = [l for l in blocks[0].splitlines() if l.strip()]
     # UP-N2: step 1 first refuses when a `yuzu` project's volumes already exist,
     # so a second same-named install never attaches to (or `down -v`s) the first.
-    if not first or first[0] != "! docker volume inspect yuzu_server-data >/dev/null 2>&1 &&":
-        bad.append("step 1 does not first refuse an existing yuzu_server-data volume")
+    if not first or first[0] != GUARD:
+        bad.append("step 1 does not first refuse when any of yuzu_server-data, yuzu_certs, "
+                   "yuzu_postgres-data exists")
     if len(first) < 2 or not first[1].startswith("mkdir yuzu && cd yuzu &&"):
         bad.append("step 1 does not open with one `mkdir yuzu && cd yuzu && ...` chain")
     elif any(not l.rstrip().endswith("&&") for l in first[:-1]):
@@ -236,6 +243,12 @@ def check(region, compose_text, compose_rel, image_config, iterations):
     if len(re.findall(r"\$\(openssl rand -hex \d+\)", code)) < 2 or \
             "YUZU_POSTGRES_PASSWORD=" not in code or "YUZU_DB_PASSWORD=" not in code:
         bad.append("README does not generate two separate Postgres passwords")
+    if not re.search(r"\[ \$\{#p1\} -eq 48 \] && \[ \$\{#p2\} -eq 48 \] &&", code):
+        bad.append("README writes .env without checking both generated passwords")
+    # Bind the README's variable names to their consumer, the compose file.
+    for var in ("YUZU_POSTGRES_PASSWORD", "YUZU_DB_PASSWORD", "YUZU_VERSION"):
+        if "${" + var not in compose_text:
+            bad.append(f"the compose never reads {var}, which the README's .env sets")
 
     # ── The admin seed.
     seed = re.search(r"run --rm --no-deps -T --entrypoint sh server -c "
@@ -253,6 +266,9 @@ def check(region, compose_text, compose_rel, image_config, iterations):
     if '"admin:admin:%s:%s\\n" % (s.hex(), hashlib.pbkdf2_hmac(' not in code or \
             "s = os.urandom(16)" not in code:
         bad.append("the seed is not an admin:admin:<salt hex>:<hash hex> line with a 16-byte salt")
+    # Bind the seed grammar to its consumer, the server's config loader.
+    if "Format: username:role:salt_hex:hash_hex" not in AUTH_CPP.read_text(encoding="utf-8"):
+        bad.append("auth.cpp's config loader no longer documents username:role:salt_hex:hash_hex")
     pbkdf2 = re.search(r'pbkdf2_hmac\("sha256", p\.encode\(\), s, (\d+)\)\.hex\(\)', code)
     if not pbkdf2 or int(pbkdf2.group(1)) != iterations:
         bad.append(f"README's PBKDF2-SHA256 call does not use the server's {iterations} iterations")
@@ -324,6 +340,14 @@ class ReadmeQuickstart(unittest.TestCase):
         # CI clones carry no tags, so this check only runs where the tag exists.
         region, _, rel, tag, image_config, iterations = live_inputs()
         tagged = at_tag(tag, rel) if tag else None
+        if tagged is None and tag and os.environ.get("GITHUB_ACTIONS") == "true":
+            # CI checkouts are shallow and carry no tags: fetch this one rather than
+            # silently skipping the only check of the compose users actually download.
+            subprocess.run(["git", "-C", str(ROOT), "fetch", "--no-tags", "--depth=1", "origin",
+                            f"refs/tags/v{tag}:refs/tags/v{tag}"], check=False,
+                           capture_output=True, timeout=120)
+            tagged = at_tag(tag, rel)
+            self.assertIsNotNone(tagged, f"could not fetch tag v{tag} in CI (#5419)")
         if tagged is None:
             self.skipTest(f"tag v{tag} is not in this clone")
         bad = check(region, tagged, rel, image_config, iterations)
@@ -372,8 +396,11 @@ class ReadmeQuickstart(unittest.TestCase):
             "no 8443": (r, re.sub(r'^\s*-\s*"8443:8443".*\n', "", compose, flags=re.M), rel),
             "command": (r, compose.replace(
                 "  server:\n", "  server:\n    command: [\"--no-tls\"]\n", 1), rel),
-            "no volume guard": (r.replace("! docker volume inspect yuzu_server-data >/dev/null 2>&1 &&\n", ""),
-                                compose, rel),
+            "no volume guard": (r.replace(GUARD + "\n", ""), compose, rel),
+            "one-volume guard": (r.replace(GUARD, "! docker volume inspect yuzu_server-data >/dev/null 2>&1 &&"),
+                                 compose, rel),
+            "unchecked passwords": (r.replace(" && [ ${#p1} -eq 48 ] && [ ${#p2} -eq 48 ]", ""), compose, rel),
+            "renamed db password": (r, compose.replace("YUZU_DB_PASSWORD", "YUZU_DBPW"), rel),
             "header backup recipe": (r.replace("upgrading.md#docker", "upgrading.md"), compose, rel),
             "cert dir clearable": (r.replace("Never clear `/etc/yuzu/certs`", "You may clear `/etc/yuzu/certs`"),
                                    compose, rel),
@@ -381,7 +408,7 @@ class ReadmeQuickstart(unittest.TestCase):
                                  compose, rel),
             "cd later": (r.replace(COMPOSE_F + "up -d --wait &&",
                                    "cd yuzu && " + COMPOSE_F + "up -d --wait &&"), compose, rel),
-            "comment line": (r.replace("```bash\n! docker", "```bash\n# 1. Set up\n! docker"),
+            "comment line": (r.replace("```bash\n[ -z", "```bash\n# 1. Set up\n[ -z"),
                              compose, rel),
             "no -f": (r.replace(COMPOSE_F + "up -d --wait", "docker compose up -d --wait"),
                       compose, rel),
@@ -396,8 +423,7 @@ class ReadmeQuickstart(unittest.TestCase):
             "iterations": (r.replace("s, 100000)", "s, 1000)"), compose, rel),
             "sha1": (r.replace('pbkdf2_hmac("sha256"', 'pbkdf2_hmac("sha1"'), compose, rel),
             "short pw": (r.replace("len(p) < 12", "len(p) < 8"), compose, rel),
-            "one pg password": (r.replace('"$(openssl rand -hex 24)" "$(openssl rand -hex 24)"',
-                                          '"$(openssl rand -hex 24)" x'), compose, rel),
+            "one pg password": (r.replace("p2=$(openssl rand -hex 24)", "p2=$p1"), compose, rel),
             "no version": (r.replace("YUZU_VERSION=0.14.0\\n", ""), compose, rel),
             "san after up": (r.replace("YUZU_CERT_SAN", "CERT_NAMES"), compose, rel),
             "no --wait": (r.replace("up -d --wait &&", "up -d &&"), compose, rel),
