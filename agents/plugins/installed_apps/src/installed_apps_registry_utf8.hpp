@@ -75,12 +75,17 @@ inline std::string from_wide(const wchar_t* ws, int len = -1) {
 // Convert a REG_SZ payload (size is in BYTES, may include trailing NUL(s)) to
 // UTF-8. Length-aware: the trailing NUL(s) are stripped on the WCHAR side first,
 // so the conversion never depends on the value being NUL-terminated (a valid
-// REG_SZ may be stored without one).
+// REG_SZ may be stored without one). The result is cut at kMaxListFieldBytes on a
+// UTF-8 boundary (the same cut `list` applies per field), so every registry string
+// the plugin carries -- query/list_per_user rows, `inv|` rows, the AppInfo vectors --
+// is bounded at its source, not only in `list`.
 inline std::string reg_sz_to_utf8(const wchar_t* buf, DWORD size_bytes) {
     size_t nch = size_bytes / sizeof(wchar_t);
     while (nch > 0 && buf[nch - 1] == L'\0')
         --nch;
-    return from_wide(buf, static_cast<int>(nch));
+    const std::string utf8 = from_wide(buf, static_cast<int>(nch));
+    return std::string{yuzu::installed_apps::parsers::detail::cut_utf8(
+        utf8, yuzu::installed_apps::parsers::kMaxListFieldBytes)};
 }
 
 // The plugin's ONE registry string read (every Uninstall value: DisplayName,
@@ -91,7 +96,10 @@ inline std::string reg_sz_to_utf8(const wchar_t* buf, DWORD size_bytes) {
 // larger than the 512-WCHAR stack buffer (ERROR_MORE_DATA) is re-read ONCE into
 // a heap buffer sized from the reported byte count, capped at kMaxValueBytes
 // (64 KiB); above the cap, or of any other type, or absent, it reads as empty --
-// the same "-" the row renders for a missing value (README caveats).
+// the same "-" the row renders for a missing value (README caveats). A value that
+// is read is then cut to kMaxListFieldBytes (4 KiB) by reg_sz_to_utf8: 64 KiB is
+// the READ bound (so a long DisplayName is read, not dropped, #4714), 4 KiB is what
+// any action carries per field.
 // Lives here, not in the plugin's lambda, so test_installed_apps_registry_utf8
 // exercises the same code the plugin runs, rather than a re-implementation that
 // could silently diverge.

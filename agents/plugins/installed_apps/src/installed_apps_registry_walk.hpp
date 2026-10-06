@@ -51,7 +51,9 @@ struct UninstallRoot {
     HKEY root;
     std::wstring subkey;
     REGSAM extra_sam;
-    bool absent_ok; // true for HKCU: a user hive often has no Uninstall key
+    // true for HKCU and HKLM-32: a user hive often has no Uninstall key, a host
+    // without WoW64 has no WOW6432Node one
+    bool absent_ok;
 };
 
 struct WalkResult {
@@ -141,7 +143,7 @@ HiveRead enumerate_uninstall_key(const UninstallRoot& r, std::vector<AppInfo>& a
             continue;
         // Meant to skip system components, but SystemComponent is a REG_DWORD and
         // read_reg_string accepts strings only, so this test never matches today
-        // (tracked separately).
+        // (#4715).
         if (read_str("SystemComponent", false) == "1")
             continue;
 
@@ -176,7 +178,7 @@ WalkResult collect_uninstall_apps(std::span<const UninstallRoot> roots,
 // ONE tested path rather than glue in an untestable action. `on_failed_root`
 // receives each failed root's index (the caller logs; this header stays
 // spdlog-free).
-template <class Ctx, class Ops = RealRegOps, class OnFailedRoot>
+template <class Ctx, class Ops, class OnFailedRoot>
 int list_inventory(Ctx& ctx, std::span<const UninstallRoot> roots, const Ops& ops,
                    OnFailedRoot&& on_failed_root) {
     auto walk = collect_uninstall_apps(roots, ops);

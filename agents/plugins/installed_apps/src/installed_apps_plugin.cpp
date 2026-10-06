@@ -281,8 +281,12 @@ const std::wstring kUninstallKey = L"SOFTWARE\\Microsoft\\Windows\\CurrentVersio
 std::span<const reg_walk::UninstallRoot> windows_roots() {
     static const reg_walk::UninstallRoot roots[] = {
         {HKEY_LOCAL_MACHINE, kUninstallKey, KEY_WOW64_64KEY, false}, // 64-bit HKLM
-        {HKEY_LOCAL_MACHINE, kUninstallKey, KEY_WOW64_32KEY, false}, // 32-bit HKLM (WoW6432Node)
-        {HKEY_CURRENT_USER, kUninstallKey, 0, true},                 // current user
+        // 32-bit HKLM (WoW6432Node): absent on a host without WoW64. A key that does not
+        // exist has no entries, so ERROR_FILE_NOT_FOUND cannot under-report (every other
+        // status still degrades). HKLM-64 stays strict: setup always creates it, so its
+        // absence is a broken hive.
+        {HKEY_LOCAL_MACHINE, kUninstallKey, KEY_WOW64_32KEY, true},
+        {HKEY_CURRENT_USER, kUninstallKey, 0, true}, // current user
     };
     return roots;
 }

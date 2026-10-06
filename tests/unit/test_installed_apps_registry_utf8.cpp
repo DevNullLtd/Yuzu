@@ -57,7 +57,7 @@ using yuzu::installed_apps::reg_utf8::read_reg_string;
 // (the registry analog of unique_temp_path -- avoids the #473/#482 fixed-path
 // flake class). Non-copyable/non-movable so the single-HKEY-owner contract is
 // enforced, not assumed (a copy would double-close/double-delete the same HKEY)
-// -- matches the HKeyCloser idiom in installed_apps_plugin.cpp.
+// -- matches the Guard idiom in installed_apps_registry_walk.hpp.
 struct ScratchKey {
     std::wstring sub;
     HKEY key{};
@@ -201,6 +201,30 @@ TEST_CASE("installed_apps read_reg_string: a value over the 64 KiB cap reads as 
     const std::wstring huge(40000, L'a'); // 80 KB > kMaxValueBytes
     set_sz(scratch.key, L"Huge", huge.c_str());
     CHECK(read_reg_string(scratch.key, "Huge", true).empty());
+}
+
+TEST_CASE("installed_apps read_reg_string: a value over the 4 KiB field bound reads back cut at a "
+          "UTF-8 boundary",
+          "[installed_apps][registry][windows]") {
+    // The read bound is 64 KiB (the value IS read), but what the plugin carries per
+    // field is cut to kMaxListFieldBytes at read, so query/list_per_user/inv| rows
+    // and the AppInfo vectors are bounded too.
+    ScratchKey scratch;
+    REQUIRE(scratch.ok);
+    const std::wstring ascii(10000, L'a');
+    set_sz(scratch.key, L"Ascii", ascii.c_str());
+    CHECK(read_reg_string(scratch.key, "Ascii", false) == std::string(4096, 'a'));
+
+    // 3000 x U+20AC (3 UTF-8 bytes each): 4096 bytes lands inside the 1366th euro, so
+    // the cut backs off to 4095 and every sequence stays intact.
+    const std::wstring euros(3000, L'\u20AC');
+    set_sz(scratch.key, L"Euros", euros.c_str());
+    std::string expected;
+    for (int i = 0; i < 1365; ++i)
+        expected += "\xE2\x82\xAC";
+    const auto got = read_reg_string(scratch.key, "Euros", false);
+    CHECK(got.size() == 4095);
+    CHECK(got == expected);
 }
 
 #endif // _WIN32

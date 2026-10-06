@@ -523,17 +523,31 @@ inline void dedupe_uninstall_records(std::vector<Rec>& apps) {
                apps.end());
 }
 
-// Per-field bound for `list` rows. Above every legitimate source: a macOS path is
-// at most PATH_MAX (1,024), and the Windows registry reader admits values up to
-// 64 KiB (installed_apps_registry_utf8.hpp kMaxValueBytes), so this is the only
-// bound on an oversized registry string; the longest field in the
-// three reference captures is 135 bytes. It exists because CoreFoundation returns
-// a hostile multi-MiB CFBundleIdentifier in full and one such row would exceed the
-// 4 MiB gRPC receive default and tear the agent stream. The raw value is cut here,
-// before escaping, so an emitted field can reach 8 KiB (every byte a `|`).
+// Per-field bound for every row an action emits. Above every legitimate source: a
+// macOS path is at most PATH_MAX (1,024); the longest field in the three reference
+// captures is 135 bytes. It exists because a hostile registry string (the Windows
+// reader admits values up to 64 KiB) or a multi-MiB CFBundleIdentifier would
+// otherwise exceed the 4 MiB gRPC receive default in one row and tear the agent
+// stream. The bound is applied at FORMAT time by detail::list_field and at READ time
+// by the Windows registry reader (installed_apps_registry_utf8.hpp reg_sz_to_utf8)
+// and the CoreFoundation reader (agents/core cf_bundle_id.hpp kMaxCFStringBytes), so
+// `query`/`list_per_user` rows, the `inv|` rows and the in-memory AppInfo vectors are
+// bounded too. The raw value is cut before escaping, so an emitted `list` field can
+// reach 8 KiB (every byte a `|`).
 constexpr std::size_t kMaxListFieldBytes = 4096;
 
 namespace detail {
+// `v` cut to at most `max_bytes` bytes, backing up so a UTF-8 sequence is never split.
+// Pure; the one boundary cut shared by list_field and the Windows registry reader.
+inline std::string_view cut_utf8(std::string_view v, std::size_t max_bytes) {
+    if (v.size() <= max_bytes)
+        return v;
+    std::size_t cut = max_bytes;
+    while (cut > 0 && (static_cast<unsigned char>(v[cut]) & 0xC0) == 0x80)
+        --cut;
+    return v.substr(0, cut);
+}
+
 // One `list` field on the wire: cut at the first NUL (write_output hands the row
 // to a C string, so an interior NUL would otherwise truncate the whole ROW and
 // strand the later columns), bound the length at a UTF-8 sequence boundary,
@@ -541,13 +555,7 @@ namespace detail {
 // The NUL cut and the bound MUST precede the escape: escaping first can cut
 // between a '\' and its '|', and the stranded '\' then swallows the delimiter.
 inline std::string list_field(std::string_view v) {
-    v = v.substr(0, v.find('\0'));
-    if (v.size() > kMaxListFieldBytes) {
-        std::size_t cut = kMaxListFieldBytes;
-        while (cut > 0 && (static_cast<unsigned char>(v[cut]) & 0xC0) == 0x80)
-            --cut;
-        v = v.substr(0, cut);
-    }
+    v = cut_utf8(v.substr(0, v.find('\0')), kMaxListFieldBytes);
     return v.empty() ? std::string("-") : yuzu::util::safe_output_field(v);
 }
 } // namespace detail
