@@ -294,41 +294,11 @@ TEST_CASE("OfflineEndpointStore reports !is_open on a migration failure", "[pg][
 // #4981 PR-1 (Finding B1): query_live_ids's typed failure surface. Genuine
 // backend failure (DbError, deterministic lock-timeout fault injection — the
 // established pattern in this repo, see test_result_set_store.cpp) and the
-// new row-cap truncation case (Truncated).
-TEST_CASE("OfflineEndpointStore query_live_ids reports DbError on a genuine query failure, "
-          "not a silent empty vector",
-          "[pg][offline]") {
-    YUZU_REQUIRE_PG_DB_TPL(db, offline_tpl);
-
-    PgPool short_lock_pool{{.conninfo = db.dsn(), .size = 2, .lock_timeout_ms = 100}};
-    REQUIRE(short_lock_pool.valid());
-    OfflineEndpointStore degraded_store{short_lock_pool};
-    REQUIRE(degraded_store.is_open());
-
-    yuzu::server::pg::PgConn locker{PQconnectdb(db.dsn().c_str())};
-    REQUIRE(PQstatus(locker.get()) == CONNECTION_OK);
-    REQUIRE(yuzu::server::pg::exec_params(locker.get(), "BEGIN", std::vector<std::string>{})
-                .status() == PGRES_COMMAND_OK);
-    REQUIRE(yuzu::server::pg::exec_params(
-                locker.get(), "LOCK TABLE endpoint_state.endpoints IN ACCESS EXCLUSIVE MODE",
-                std::vector<std::string>{})
-                .status() == PGRES_COMMAND_OK);
-
-    auto degraded = degraded_store.query_live_ids(std::chrono::hours(1));
-    REQUIRE_FALSE(degraded.has_value());
-    CHECK(degraded.error() == PresenceReadError::DbError);
-
-    REQUIRE(yuzu::server::pg::exec_params(locker.get(), "ROLLBACK", std::vector<std::string>{})
-                .status() == PGRES_COMMAND_OK);
-
-    auto recovered = degraded_store.query_live_ids(std::chrono::hours(1));
-    REQUIRE(recovered.has_value());
-}
-
-// #5531: query_stale_within's typed failure surface — a failed roster read is
-// never an empty vector, and is counted under op=query_stale_within.
-TEST_CASE("OfflineEndpointStore query_stale_within reports DbError on a genuine query failure, "
-          "counts op=query_stale_within, never a silent empty vector",
+// new row-cap truncation case (Truncated). #5531: query_stale_within (the
+// roster read) shares the same held lock — a failed read is never an empty
+// vector and is counted under op=query_stale_within.
+TEST_CASE("OfflineEndpointStore query_live_ids and query_stale_within report DbError on a "
+          "genuine query failure, not a silent empty vector",
           "[pg][offline]") {
     YUZU_REQUIRE_PG_DB_TPL(db, offline_tpl);
 
@@ -348,9 +318,13 @@ TEST_CASE("OfflineEndpointStore query_stale_within reports DbError on a genuine 
                 std::vector<std::string>{})
                 .status() == PGRES_COMMAND_OK);
 
-    auto degraded = degraded_store.query_stale_within(std::chrono::hours(1));
+    auto degraded = degraded_store.query_live_ids(std::chrono::hours(1));
     REQUIRE_FALSE(degraded.has_value());
     CHECK(degraded.error() == PresenceReadError::DbError);
+
+    auto degraded_stale = degraded_store.query_stale_within(std::chrono::hours(1));
+    REQUIRE_FALSE(degraded_stale.has_value());
+    CHECK(degraded_stale.error() == PresenceReadError::DbError);
 
     // Release the lock immediately: it also stalls heartbeat upserts.
     REQUIRE(yuzu::server::pg::exec_params(locker.get(), "ROLLBACK", std::vector<std::string>{})
@@ -365,8 +339,10 @@ TEST_CASE("OfflineEndpointStore query_stale_within reports DbError on a genuine 
                        {{"op", "query_stale_within"}, {"reason", "store_unavailable"}})
               .value() == 0);
 
-    auto recovered = degraded_store.query_stale_within(std::chrono::hours(1));
+    auto recovered = degraded_store.query_live_ids(std::chrono::hours(1));
     REQUIRE(recovered.has_value());
+    auto recovered_stale = degraded_store.query_stale_within(std::chrono::hours(1));
+    REQUIRE(recovered_stale.has_value());
 }
 
 TEST_CASE("OfflineEndpointStore query_live_ids reports Truncated past kQueryRowCap, "

@@ -31,8 +31,7 @@
 /// membership. `evaluate_scope_local` never calls into presence at all and so
 /// can never fail this way (see its own doc comment). `query_stale_within`
 /// (the roster read: Hardware list/record, viz, MCP) is typed the same way
-/// (#5531) — a failed read is `std::unexpected`, never an empty roster —
-/// but never produces `Truncated` (its row cap keeps the newest rows).
+/// (#5531) — a failed read is `std::unexpected`, never an empty roster.
 ///
 /// Substrate contract (ADR-0008): the store holds a `PgPool&` (not a
 /// `sqlite3*`), runs its schema migration at construction on a pinned lease,
@@ -166,8 +165,6 @@ public:
     /// `LIMIT kQueryRowCap` newest-first and serves the capped set. A failure
     /// is counted on `yuzu_server_agent_presence_store_failed_total`
     /// (`op=query_stale_within`) and logged at warn once per failed call.
-    /// Consumers decide: Hardware surfaces show a roster-unavailable banner /
-    /// 503; viz and MCP render live-only with `offline_roster_degraded`.
     [[nodiscard]] std::expected<std::vector<OfflineEndpoint>, PresenceReadError>
     query_stale_within(std::chrono::seconds window);
 

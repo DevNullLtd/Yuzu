@@ -204,6 +204,7 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                           "direction, OS, or status filter.</div>");
             return;
         }
+        const bool results_only = req.has_param("results_only") && req.get_param_value("results_only") == "1";
         if (all.roster_degraded) {
             // 200, not 5xx: htmx does not swap a failed response, so the banner
             // would never render. Mirrors the unwired arm above.
@@ -211,8 +212,7 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                                             "Inventory", "fleet", "hardware roster read failed");
             HardwareListPage degraded;
             degraded.query = *normalised;
-            const bool ro = req.has_param("results_only") && req.get_param_value("results_only") == "1";
-            send_html(res, render_hardware_list_fragment(degraded, false, /*roster_unavailable=*/true, ro));
+            send_html(res, render_hardware_list_fragment(degraded, false, /*roster_unavailable=*/true, results_only));
             return;
         }
         HardwareListPage page = build_hardware_list_page(std::move(scoped), *normalised);
@@ -229,7 +229,6 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                 " omitted=" + std::to_string(omitted));
         (void)persisted; // HTML fragment: set-and-proceed — the header is the signal
 
-        const bool results_only = req.has_param("results_only") && req.get_param_value("results_only") == "1";
         send_html(res, render_hardware_list_fragment(page, all.ci_degraded, false, results_only, all.tags_degraded));
     });
 
