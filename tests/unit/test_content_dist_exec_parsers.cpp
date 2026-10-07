@@ -448,6 +448,10 @@ TEST_CASE("a parsed huge or negative cleanup cutoff is never in the future",
     // wrap back into the past, and very negative values wrap the other way).
     const auto now = std::filesystem::file_time_type::clock::now();
     for (const char* text : {"1500000", "2000000000", "2147483647", "99999999999", "-4000000",
-                             "-2147483648", "0", "-1"})
-        CHECK(now - std::chrono::hours(parse_cleanup_hours(text, 24)) <= now);
+                             "-2147483648", "0", "-1"}) {
+        // Compare into a bool: Catch2 cannot stringify a file_clock time_point
+        // on libc++ (its rep is __int128, which has no operator<<).
+        const bool in_future = now < now - std::chrono::hours(parse_cleanup_hours(text, 24));
+        CHECK_FALSE(in_future);
+    }
 }
