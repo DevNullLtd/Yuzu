@@ -345,8 +345,11 @@ public:
         stop_budget_ = stop;
     }
     /// TEST-ONLY: runs after EACH tuple's write attempt (inside the pass, persist_mu_ held), so
-    /// a test can advance an injected clock per write instead of sleeping. Same contract.
+    /// a test can advance an injected clock per write instead of sleeping. Safe against a live
+    /// worker (the setter takes persist_mu_, which a pass holds while it reads the hook), so it
+    /// WAITS for a pass in flight, and must not be called from inside a hook.
     void set_post_write_hook_for_test(std::function<void()> hook) {
+        std::lock_guard<std::mutex> lk{persist_mu_};
         post_write_hook_ = std::move(hook);
     }
     /// TEST-ONLY: Worker passes that yielded (Outcome::yielded), at any point.
@@ -375,8 +378,10 @@ public:
     }
     /// TEST-ONLY: runs inside a pass, with persist_mu_ held, right after the snapshot is taken
     /// and before the first write: the deterministic stand-in for "a worker pass is mid-flight".
-    /// Must not re-enter the persister. Set before use (not synchronised). No production caller.
+    /// Must not re-enter the persister. Safe against a live worker, like set_post_write_hook_for_test
+    /// (waits for a pass in flight; not callable from inside a hook). No production caller.
     void set_post_snapshot_hook_for_test(std::function<void()> hook) {
+        std::lock_guard<std::mutex> lk{persist_mu_};
         post_snapshot_hook_ = std::move(hook);
     }
 

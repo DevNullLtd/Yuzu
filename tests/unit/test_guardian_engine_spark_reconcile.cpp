@@ -7892,21 +7892,26 @@ TEST_CASE("#4045 E42: engine stop() marks its start before joining the worker, s
     REQUIRE(persister != nullptr);
     REQUIRE(rt != nullptr);
     REQUIRE(worker != nullptr);
-    FakeClock4045 clock{*persister};
     std::atomic<int> attempts{0};
     std::atomic<bool> in_hook{false};
     HookGuard4045 hooks{*f.engine};
-    stage_n_4045(*rt, 3, "e42");
+    // A stop wall budget of zero makes EVERY failed write count as slow (a failed write is slow
+    // when it took at least that long), so the test needs neither the real clock to burn a
+    // second nor an injected one the live worker could race.
+    persister->set_budgets_for_test(yuzu::agent::kBaselinePassBudget,
+                                    {(std::numeric_limits<std::size_t>::max)(), 1,
+                                     std::chrono::milliseconds{0}});
     fail_baseline_writes_4045(f.db_.path);
-    // The worker's first write fails and "takes" 5 s of the injected clock, but only once
-    // stop() has been requested: that is after GuardianEngine::stop() marked its start.
+    // The worker's first write parks until stop() has been requested, which is after
+    // GuardianEngine::stop() marked its start. Installed BEFORE anything is staged, so whichever
+    // wake runs the first pass sees it.
     persister->set_post_write_hook_for_test([&] {
         if (++attempts != 1)
             return;
         in_hook.store(true);
         (void)yuzu::test::spin_until([&] { return worker->stop_requested_for_test(); });
-        clock.advance(5000);
     });
+    stage_n_4045(*rt, 3, "e42");
     worker->notify();
     REQUIRE(yuzu::test::spin_until([&] { return in_hook.load(); }));
     f.engine->stop();
