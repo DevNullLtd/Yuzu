@@ -7398,3 +7398,34 @@ TEST_CASE("#4045 E33: a throw out of the snapshot widens the worker backoff, so 
     clock.advance(5000);
     CHECK(persister->persist_staged(*rt, Trig::Worker).written == 1); // due again: it persists
 }
+
+TEST_CASE("#4045 E34: a pass polls its stop predicate before every tuple: a stop request ends it "
+          "with nothing written, nothing lost and no re-run request",
+          "[spark][guardian][baseline][reconcile]") {
+    SparkReconcileFixture f{3'600'000, std::nullopt, SparkType::File};
+    f.engine->drain_worker_for_test()->stop();
+    auto* persister = f.engine->baseline_persister_for_test();
+    auto* rt = f.engine->spark_runtime_for_test();
+    REQUIRE(persister != nullptr);
+    REQUIRE(rt != nullptr);
+    using Trig = GuardianBaselinePersister::Trigger;
+    stage_n_4045(*rt, 3, "e34");
+
+    int polls = 0;
+    const auto out = persister->persist_staged(*rt, Trig::Worker, [&polls] {
+        ++polls;
+        return true; // stop() is already joining this worker
+    });
+    CHECK(polls == 1);
+    CHECK(out.written == 0);
+    CHECK(out.failed == 0);
+    CHECK_FALSE(out.budget_exhausted); // a stop is neither a failure nor a request to re-run
+    CHECK(rt->staged_baseline_count_for_test() == 3);
+    CHECK(persister->backoff_for_test() == std::chrono::seconds{0});
+
+    // Stop requested only AFTER the first tuple: that one is persisted, the rest stay staged.
+    int calls = 0;
+    const auto partial = persister->persist_staged(*rt, Trig::Worker, [&calls] { return ++calls > 1; });
+    CHECK(partial.written == 1);
+    CHECK(rt->staged_baseline_count_for_test() == 2);
+}
