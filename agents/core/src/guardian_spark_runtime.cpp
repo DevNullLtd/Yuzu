@@ -3060,7 +3060,9 @@ GuardianSparkRuntime::attach_core(const std::string& key, std::string rule_id, S
                 sit != staged_baselines_.end() &&
                 sit->second.path == std::get<FileSparkParams>(spec.params).path)
                 rg->assertion.expected_hash = sit->second.hash; // may throw bad_alloc: unwinds
-                                                                // through the armed rollbacks
+                                                                // through prior_disarm_rollback
+                                                                // only (the index and claim
+                                                                // rollbacks are armed below)
         }
 
         gen = ++gen_counter_;
