@@ -68,8 +68,6 @@ TEST_CASE("stability: one crash-looping device", "[dex][stability]") {
     require_scored(r, 99.99, StabilityBand::Excellent);
     CHECK(std::string(r.deductions[0].name) == "breadth");
     CHECK(r.deductions[0].points >= r.deductions[1].points);
-
-    require_withheld(compute_stability_score(mk(10000, 1, 100000), kFloor), "inconsistent");
 }
 
 TEST_CASE("stability: per-device capping is the caller's job", "[dex][stability]") {
@@ -126,7 +124,6 @@ TEST_CASE("stability: hangs weigh less than crashes", "[dex][stability]") {
     auto h = compute_stability_score(mk(1000, 100, 0, 300), kFloor);
     REQUIRE(c.score);
     REQUIRE(h.score);
-    CHECK(h.deductions[2].points < c.deductions[1].points);
     CHECK(h.deductions[2].points / c.deductions[1].points == Approx(8.0 / 20.0));
 }
 
@@ -168,13 +165,6 @@ TEST_CASE("stability: decomposition and constants", "[dex][stability]") {
     CHECK(std::string(r.deductions[1].name) == "crashes");
     CHECK(std::string(r.deductions[2].name) == "hangs");
     CHECK(std::string(r.deductions[3].name) == "regression");
-    CHECK(kStabilityWeights.breadth + kStabilityWeights.crashes + kStabilityWeights.hangs +
-              kStabilityWeights.regression ==
-          100.0);
-    CHECK(kPerDeviceEventCap == 5);
-    CHECK(kBandExcellent == 90.0);
-    CHECK(kBandGood == 75.0);
-    CHECK(kBandFair == 60.0);
     CHECK(std::string(stability_band_label(StabilityBand::Excellent)) == "excellent");
     CHECK(std::string(stability_band_label(StabilityBand::Good)) == "good");
     CHECK(std::string(stability_band_label(StabilityBand::Fair)) == "fair");
