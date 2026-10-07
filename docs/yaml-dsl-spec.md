@@ -1438,7 +1438,7 @@ InstructionDefinition parameters and PolicyFragment inputs use the following typ
 | `datetime` | ISO 8601 timestamp | String | `"2026-03-17T18:20:00Z"` |
 | `guid` | UUID / GUID | String | `"550e8400-e29b-41d4-a716-446655440000"` |
 
-Parameters are transmitted as `map<string, string>` in the `CommandRequest` protobuf message. The server validates parameter values against the declared type and constraints before dispatch.
+Parameters are transmitted as `map<string, string>` in the `CommandRequest` protobuf message. `POST /api/instructions/{id}/execute` validates the request's parameter values against the declared type and constraints before dispatch; no other dispatch surface does yet.
 
 ### Validation Constraints
 

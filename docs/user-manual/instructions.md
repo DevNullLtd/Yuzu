@@ -429,22 +429,36 @@ definition on an existing install), delete the definition and import it again wi
 
 1. `GET /api/instructions/{id}/export` (`InstructionDefinition:Read`) and keep the document. It carries
    the fields import reads, including `yaml_source`, `instruction_set_id` and
-   `response_templates_spec`, which the delete removes.
-2. Edit its `parameter_schema` (a string holding the schema JSON).
-3. `DELETE /api/instructions/{id}` (`InstructionDefinition:Delete`, audit action `instruction.delete`).
-4. `POST /api/instructions/import` with the edited document (`InstructionDefinition:Write`, audit action
+   `response_templates_spec`, which the delete removes (the delete and re-import also reset `created_at`,
+   which import never reads). It carries **no** `signature` or `publicKey`.
+2. Edit its `parameter_schema` (a string holding the schema JSON). Unless the server runs with
+   `--allow-unsigned-definitions`, the edited document must also be signed before import, or the import
+   answers `400` as unsigned: add a hex `signature` and `publicKey` (an Ed25519 signature over the exact
+   bytes of `yaml_source`, 128 and 64 hex characters).
+3. Rehearse the import, because step 5 cannot be rehearsed (an existing id answers `409`) and a refused
+   import leaves the definition deleted: `POST /api/instructions/import` the corrected, signed document
+   once with a different `id` (import reads `id` from the document and accepts any id that is free), confirm
+   it is accepted, then `DELETE` that temporary id. The signature covers only the `yaml_source` bytes, so it
+   stays valid. The temporary definition is live until it is deleted.
+4. `DELETE /api/instructions/{id}` (`InstructionDefinition:Delete`, audit action `instruction.delete`).
+5. `POST /api/instructions/import` with the edited document (`InstructionDefinition:Write`, audit action
    `instruction.import`). The schema is checked as it is written, so a bad one is refused with a `400`.
 
-Import refuses an unsigned document unless the server runs with `--allow-unsigned-definitions`; a signed one
-carries `signature` and `publicKey`, an Ed25519 signature over the bytes of `yaml_source`. See
-[REST API](rest-api.md).
+The signature covers only the `yaml_source` bytes (not the schema, plugin, action, `approval_mode` or
+`created_by`), and the verifier takes `publicKey` from the request, so it is an integrity check and not
+publisher authentication. See [REST API](rest-api.md).
 
 - A bundled definition is tombstoned by the delete, so the bundled reseed does not bring the old one back.
-  The signed import path does not consult the tombstone, so the replacement lands, and later boots leave it
-  alone.
+  Any public import skips the tombstone, whether signed or unsigned under `--allow-unsigned-definitions`
+  (both run as a non-seed insert), so the replacement lands and later boots leave it alone. The tombstone is
+  permanent: a replaced bundled definition never receives later bundled corrections from the reseed.
 - The delete removes only the definition row. A schedule that references the id has its occurrences skipped
-  and audited as `definition_unknown` until the id exists again.
-- Between steps 3 and 4 the definition does not exist, and a refused import leaves it deleted. Have the corrected (and, unless the unsigned flag is set, signed) document ready before step 3, and do both in one maintenance window.
+  and audited as `definition_unknown` until the id exists again. Policy check, fix and verify dispatches
+  that name it log `unknown check/fix instruction` and send nothing, `POST /api/workflows/{id}/execute` for
+  a workflow with a step that names it answers `400` (`references unknown instruction`), and a pending
+  approval keeps its `definition_id` (no foreign key was found). Check policies, stored workflows and
+  pending approvals for the id before deleting. Other references were not checked.
+- Between steps 4 and 5 the definition does not exist, and a refused import leaves it deleted. Have the corrected (and, unless the unsigned flag is set, signed) document ready and rehearsed before step 4, and do both in one maintenance window.
 
 ---
 
