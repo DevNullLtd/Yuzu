@@ -448,6 +448,12 @@ TEST_CASE("software routes: an unfiltered caller gets the strip on the host view
     REQUIRE(contains(res->body, "<div class=\"inv-kpi"));
     REQUIRE(contains(res->body, "value=\"WIN-1\"")); // the host box shows the name
     REQUIRE(contains(res->body, "host: WIN-1"));
+    REQUIRE(h.count("hostnames") == 1);
+    // The Load-more page never renders a host name, so it never reads the hostname map.
+    auto more = h.sink.Get(std::string(kSoftware) + "?rows_only=1&agent_id=a1");
+    REQUIRE(more);
+    REQUIRE(more->body.rfind("<tr", 0) == 0);
+    REQUIRE(h.count("hostnames") == 1);
 }
 
 TEST_CASE("software routes: a degraded rollup-meta read on the host view is a whole-page degrade",
@@ -482,6 +488,11 @@ TEST_CASE("software routes: the host type-ahead is sorted, capped at 1000 and sk
     REQUIRE(res->body.find("<option value=\"h0000\"") == res->body.find("<option value=\""));
     REQUIRE_FALSE(contains(res->body, "<option value=\"h1001\""));
     REQUIRE_FALSE(contains(res->body, "data-id=\"emptyid\""));
+    // The cap is disclosed with the true named-host count (1002 named: h0000..h1001).
+    REQUIRE(contains(res->body, "type-ahead lists the first 1,000 of 1,002 named hosts"));
+    InvHarness few; // under the cap: no note
+    few.hostnames = {{"id1", "alpha"}};
+    REQUIRE_FALSE(contains(few.sink.Get(kSoftware)->body, "type-ahead lists"));
 }
 
 TEST_CASE("software routes: keyset paging walks the catalogue 100 at a time", "[inventory][route]") {
@@ -611,6 +622,22 @@ TEST_CASE("software routes: versions drill", "[inventory][route]") {
     REQUIRE(h.audit_full.back() == "inventory.software.versions|success|Inventory|" +
                                        swc::audit_target(*h.last_versions_query));
     REQUIRE(contains(h.audit_details.back(), "versions=1"));
+    REQUIRE_FALSE(contains(res->body, "most-installed")); // one row: nothing was cut
+    // A read that returns exactly its limit may have more rows: the fragment says so.
+    const auto vers_of = [](int n) {
+        std::vector<SoftwareVersionCount> v;
+        for (int i = 0; i < n; ++i)
+            v.push_back({"v" + std::to_string(i), 1000 - i, false});
+        return v;
+    };
+    InvHarness full_read;
+    full_read.versions = vers_of(200);
+    REQUIRE(contains(full_read.sink.Get(std::string(kVersions) + "?name=Chrome")->body,
+                     "showing the 200 most-installed versions; this title has more"));
+    InvHarness short_read;
+    short_read.versions = vers_of(199);
+    REQUIRE_FALSE(contains(short_read.sink.Get(std::string(kVersions) + "?name=Chrome")->body,
+                           "most-installed"));
     h.degrade = true;
     auto bad = h.sink.Get(std::string(kVersions) + "?name=Chrome");
     REQUIRE(contains(bad->body, "unavailable"));
@@ -663,8 +690,9 @@ TEST_CASE("software routes: devices table scope arms", "[inventory][route]") {
         REQUIRE(contains(res->body, "No host matches."));
         REQUIRE(contains(h.audit_details.back(), "rows=0"));
     }
-    {   // Wider than the push-down bound: the route filters itself, the cursor follows the
-        // last SCANNED row, and nothing out of scope leaks.
+    {   // Wider than the push-down bound: the route filters itself and no out-of-scope ROW is
+        // rendered. (The cursor token still names the last scanned row, which may be out of scope:
+        // a follow-up issue tracks that; this case does not pin it as intended.)
         InvHarness h;
         authz::VisibleSet big{std::unordered_set<std::string>{}};
         for (std::size_t i = 0; i <= swc::kScopePushdownMaxIds; ++i)
@@ -683,8 +711,10 @@ TEST_CASE("software routes: devices table scope arms", "[inventory][route]") {
         REQUIRE(h.audited("inventory.software.query|denied")); // the post-filter drop is audited
         REQUIRE(h.audited("inventory.software.query|success"));
     }
-    {   // A FULL scanned page whose last row is out of scope still carries the sentinel, and the
-        // cursor follows that last SCANNED row (a099), never the last visible one (a098).
+    {   // A FULL scanned page whose last row is out of scope still carries the sentinel and the
+        // next page resumes after the last SCANNED row (a099), never the last visible one (a098):
+        // no out-of-scope ROW is rendered; the cursor token itself still names a scanned row
+        // (a follow-up issue tracks that).
         InvHarness h;
         authz::VisibleSet big{std::unordered_set<std::string>{}};
         for (std::size_t i = 0; i <= swc::kScopePushdownMaxIds; ++i)
@@ -797,6 +827,23 @@ TEST_CASE("software routes: devices paging follows the keyset and tags continuat
     REQUIRE(contains(h.audit_details[1], "page=continuation"));
 }
 
+TEST_CASE("software routes: a full devices page hands the last-synced read its distinct ids",
+          "[inventory][route]") {
+    InvHarness h;
+    h.fleet_rows.push_back(fleet_row(dev_id(0), "Chrome", "1")); // a device on two sources: 2 rows
+    h.fleet_rows.push_back(fleet_row(dev_id(0), "Chrome", "2"));
+    h.fleet_rows.back().entry.source = "pkg_inventory.packages";
+    for (int i = 1; i < 99; ++i)
+        h.fleet_rows.push_back(fleet_row(dev_id(i), "Chrome", "1"));
+    REQUIRE(h.fleet_rows.size() == 100); // a full page
+    REQUIRE(h.sink.Get(std::string(kDevices) + "?name=Chrome"));
+    std::vector<std::string> expect;
+    for (int i = 0; i < 99; ++i)
+        expect.push_back(dev_id(i));
+    REQUIRE(h.last_synced_ids == expect);
+    REQUIRE(h.last_synced_ids.size() <= 100);
+}
+
 TEST_CASE("software routes: device counts are distinct devices and hints are strict",
           "[inventory][route]") {
     InvHarness h;
@@ -814,6 +861,22 @@ TEST_CASE("software routes: device counts are distinct devices and hints are str
     g.fleet_rows = {fleet_row("a1", "Chrome", "1"), fleet_row("a1", "Chrome", "2")};
     auto one = g.sink.Get(std::string(kDevices) + "?name=Chrome&total=1");
     REQUIRE(contains(one->body, "<b>1</b> devices run"));
+    // An absurd hint is dropped like a malformed one (never clamped, never overflowed): the
+    // sentinel carries the page's own count.
+    InvHarness big;
+    for (int i = 0; i < 100; ++i)
+        big.fleet_rows.push_back(fleet_row(dev_id(i), "Chrome", "1"));
+    auto huge = big.sink.Get(std::string(kDevices) + "?name=Chrome&total=9223372036854775807&"
+                                                       "shown=9223372036854775807");
+    REQUIRE(huge);
+    REQUIRE(contains(huge->body, "shown=100"));
+    REQUIRE_FALSE(contains(huge->body, "9223372036854775807"));
+    InvHarness cat;
+    cat.titles = many_titles(150);
+    auto crows = cat.sink.Get(std::string(kSoftware) + "?rows_only=1&shown=9223372036854775807");
+    REQUIRE(crows);
+    REQUIRE(contains(crows->body, "shown=100"));
+    REQUIRE_FALSE(contains(crows->body, "9223372036854775807"));
     // Non-numeric / negative / exponent hints are ignored and never echoed.
     InvHarness b;
     b.fleet_rows = {fleet_row("a1", "Chrome", "1")};

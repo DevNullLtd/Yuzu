@@ -22,6 +22,8 @@
 #include <charconv>
 #include <chrono>
 #include <cstdint>
+#include <expected>
+#include <limits>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -58,7 +60,10 @@ std::optional<std::int64_t> int_hint(const httplib::Request& req, const char* ke
     const std::string v = req.get_param_value(key);
     std::int64_t n = 0;
     const auto [p, ec] = std::from_chars(v.data(), v.data() + v.size(), n);
-    if (ec != std::errc{} || p != v.data() + v.size() || n < 0)
+    // The ceiling keeps the callers' `+ ids.size()` / negation arithmetic far from overflow:
+    // an absurd hint is dropped like a malformed one, never clamped into a fake count.
+    if (ec != std::errc{} || p != v.data() + v.size() || n < 0 ||
+        n > std::numeric_limits<std::int64_t>::max() / 4)
         return std::nullopt;
     return n;
 }
@@ -268,9 +273,12 @@ void InventoryRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             }
             d.kpis = swc::derive_kpis(*meta, cov);
         }
-        // Names: the host view's display name and (Full) the type-ahead list. Never read for
-        // a confined caller (a whole-fleet hostname map is fleet disclosure).
-        if (!confined && deps_.hostnames_fn && (mode == SoftwarePageMode::Full || host)) {
+        // Names: the host view's display name (Results/Full) and (Full) the type-ahead list.
+        // Rows pages never render either. Never read for a confined caller (a whole-fleet
+        // hostname map is fleet disclosure). The devices handler below reads the map per
+        // visible row for confined callers by design.
+        if (!confined && deps_.hostnames_fn &&
+            (mode == SoftwarePageMode::Full || (host && mode == SoftwarePageMode::Results))) {
             const auto names = deps_.hostnames_fn();
             if (host) {
                 const auto it = names.find(q.agent_id);
@@ -282,6 +290,7 @@ void InventoryRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                     if (!name.empty())
                         d.hosts.emplace_back(name, id);
                 std::ranges::sort(d.hosts);
+                d.hosts_total = d.hosts.size();
                 if (d.hosts.size() > 1000)
                     d.hosts.resize(1000);
             }
@@ -342,7 +351,9 @@ void InventoryRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         (void)detail::try_persist_audit(
             deps_.audit_fn, req, "inventory.software.versions", vers ? "success" : "failure",
             "Inventory", target, vers ? ("versions=" + std::to_string(vers->size())) : "store degraded");
-        send_html(res, render_software_versions_expansion(f, q.name, vers, confined));
+        // Same rule as the REST twin: a full read may have more rows than it returned.
+        const bool truncated = vers && vers->size() == static_cast<std::size_t>(q.limit);
+        send_html(res, render_software_versions_expansion(f, q.name, vers, confined, truncated));
     });
 
     // -- SOFTWARE devices table: which devices run a title (optionally one version), 100 per

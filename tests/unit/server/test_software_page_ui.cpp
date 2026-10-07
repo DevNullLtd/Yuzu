@@ -281,6 +281,12 @@ TEST_CASE("software page: host type-ahead pairs a datalist with a hidden agent i
     REQUIRE(has(h, "<option value=\"alpha\" data-id=\"id-1\">"));
     REQUIRE(has(h, "<option value=\"beta &quot;q&quot;\" data-id=\"id-2\">")); // escaped
     REQUIRE(has(h, "onchange=\"swHost(this)\""));
+    REQUIRE(has(h, "oninput=\"this.setCustomValidity('')\""));
+    REQUIRE_FALSE(has(h, "type-ahead lists")); // nothing was cut: no note
+    // A capped list discloses the cap and the true named-host count.
+    d.hosts_total = 1002;
+    REQUIRE(has(full({}, d), "type-ahead lists the first 2 of 1,002 named hosts (by name); other "
+                             "devices open from Hardware"));
 }
 
 TEST_CASE("software page: active pills, Clear all and the REST line", "[inventory][ui]") {
@@ -457,6 +463,12 @@ TEST_CASE("software page: degrade, empty, filtered-empty and caveat states", "[i
     REQUIRE(has(h, "versions_min must be an integer"));
     REQUIRE_FALSE(has(h, "<table"));
     REQUIRE(has(render_software_page({}, d, SoftwarePageMode::Rows), "<tr><td colspan=\"7\">"));
+    // The controls-less Full caveat offers a reset (the URL hash cannot be repaired from the page);
+    // the swap regions do not.
+    REQUIRE(has(h, "<a class=\"inv-link\" href=\"/software\" "
+                   "onclick=\"history.replaceState(null,'',location.pathname)\">Clear all filters and reload</a>"));
+    REQUIRE_FALSE(has(render_software_page({}, d, SoftwarePageMode::Results), "Clear all filters and reload"));
+    REQUIRE_FALSE(has(render_software_page({}, d, SoftwarePageMode::Rows), "Clear all filters and reload"));
 
     d = page();
     d.confined = true;
@@ -538,6 +550,16 @@ TEST_CASE("software page: versions expansion", "[inventory][ui]") {
         return s.substr(p, s.find('"', p + 17) - p);
     };
     REQUIRE(idof(one) != idof(two));
+    // A truncated read says so (the row's Versions column carries the true count); a full list does not.
+    const std::string cut_line = "showing the 200 most-installed versions; this title has more";
+    std::vector<SoftwareVersionCount> many;
+    for (int i = 0; i < 200; ++i)
+        many.push_back({"v" + std::to_string(i), 200 - i, i == 0});
+    REQUIRE(has(render_software_versions_expansion(f, "Chrome", many, false, true),
+                "<div class=\"inv-grey\">" + cut_line + "</div>"));
+    REQUIRE_FALSE(has(render_software_versions_expansion(f, "Chrome", many, false, false), "most-installed"));
+    many.pop_back();
+    REQUIRE_FALSE(has(render_software_versions_expansion(f, "Chrome", many, false), "most-installed"));
     // Degrade / empty.
     REQUIRE(has(render_software_versions_expansion(f, "C", std::nullopt, false), "unavailable"));
     REQUIRE(has(render_software_versions_expansion(f, "C", std::vector<SoftwareVersionCount>{}, false),
@@ -571,6 +593,12 @@ TEST_CASE("software devices table: header, columns, host links and last synced",
     h = render_software_devices_table({}, t, false);
     REQUIRE_FALSE(has(h, "<th>Version</th>"));
     REQUIRE(has(h, "<span class=\"inv-mono\">1.0</span>"));
+    // The empty-version bucket reads "(unknown)", as it does in the versions table.
+    t.version = std::optional<std::string>("");
+    h = render_software_devices_table({}, t, false);
+    REQUIRE(has(h, "<span class=\"inv-mono\">(unknown)</span>"));
+    REQUIRE_FALSE(has(h, "<span class=\"inv-mono\"></span>"));
+    t.version = "1.0";
     // A device missing from a present map was never synced: a plain dash, no degrade tooltip.
     t.last_synced = std::unordered_map<std::string, std::int64_t>{{"a1", kNow - 3600}};
     h = render_software_devices_table({}, t, false);
@@ -658,7 +686,8 @@ TEST_CASE("software page: shell script is CSP-safe and wires the page's behaviou
           "[inventory][ui]") {
     const std::string s = software_page_script();
     for (const char* need : {"htmx:configRequest", "htmx:afterSettle", "htmx:beforeRequest",
-                             "replaceState", "swLater", "swHost", "swClear", "swClose", "gpSearch("})
+                             "replaceState", "swLater", "swHost", "swClear", "swClose", "gpSearch(",
+                             "setCustomValidity('Not a listed host name')", "reportValidity()"})
         REQUIRE(has(s, need));
     for (const char* never : {"hx-on", "new Function", "eval("})
         REQUIRE_FALSE(has(s, never));

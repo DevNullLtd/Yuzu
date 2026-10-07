@@ -151,6 +151,7 @@ struct SoftwarePageData {
     std::optional<std::string> next_cursor;
     /// (hostname, agent_id) pairs for the host type-ahead, sorted, capped by the route.
     std::vector<std::pair<std::string, std::string>> hosts;
+    std::size_t hosts_total{0}; ///< named hosts BEFORE the route's cap (> hosts.size() = truncated)
     std::int64_t now_secs{0};
     std::int64_t shown_before{0}; ///< titles already on the page (the `shown` hint)
     std::optional<std::string> caveat; ///< parse/cursor refusal: shown instead of a table
@@ -176,10 +177,11 @@ struct SoftwareDevicesTable {
 [[nodiscard]] std::string render_software_page(const SoftwarePageFilters& f,
                                                const SoftwarePageData& d, SoftwarePageMode mode);
 /// `confined` blanks the "newest in fleet" mark (mirrors the REST `newest_omitted`).
+/// `truncated` = the read hit its row limit: one muted line says the list is the top slice.
 [[nodiscard]] std::string
 render_software_versions_expansion(const SoftwarePageFilters& f, const std::string& name,
                                    const std::optional<std::vector<SoftwareVersionCount>>& v,
-                                   bool confined);
+                                   bool confined, bool truncated = false);
 [[nodiscard]] std::string render_software_devices_table(const SoftwarePageFilters& f,
                                                         const SoftwareDevicesTable& t,
                                                         bool rows_only);

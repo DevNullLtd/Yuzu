@@ -2921,7 +2921,7 @@ TEST_CASE("source_last_seen_bulk returns the receipt time per agent and omits th
             InventoryIngestOutcome::kStored);
     REQUIRE(store.apply_installed_software("agent-b", h, rows, 2000) ==
             InventoryIngestOutcome::kStored);
-    // A hash-only touch advances last_seen.
+    // A hash-only touch never regresses last_seen.
     REQUIRE(store.apply_installed_software("agent-b", h, std::nullopt, 3000) ==
             InventoryIngestOutcome::kTouched);
 

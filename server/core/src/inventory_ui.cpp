@@ -486,7 +486,7 @@ std::string controls(const SoftwarePageFilters& f, const SoftwarePageData& d) {
          "class=\"inv-hostin\" placeholder=\"Type a host name to see its software"
          "\xE2\x80\xA6\" aria-label=\"Host\" value=\"" +
          esc(f.host_display) + "\"" + (d.confined ? "" : " list=\"hostlist\"") +
-         " onchange=\"swHost(this)\" hx-get=\"" + esc(base) +
+         " onchange=\"swHost(this)\" oninput=\"this.setCustomValidity('')\" hx-get=\"" + esc(base) +
          "\" hx-target=\"#sw-results\" hx-swap=\"outerHTML\" hx-trigger=\"change\" "
          "hx-include=\"#sw-state,#sw-q,#sw-agent\"><input id=\"sw-agent\" type=\"hidden\" "
          "name=\"agent_id\" value=\"" + esc(f.agent_id) + "\">";
@@ -495,6 +495,11 @@ std::string controls(const SoftwarePageFilters& f, const SoftwarePageData& d) {
         for (const auto& [name, id] : d.hosts)
             h += "<option value=\"" + esc(name) + "\" data-id=\"" + esc(id) + "\">";
         h += "</datalist>";
+        // The route caps the list; say so rather than leave an unlisted host a silent no-op.
+        if (d.hosts.size() < d.hosts_total)
+            h += "<span class=\"inv-grey\">type-ahead lists the first " + fmt_int(d.hosts.size()) +
+                 " of " + fmt_int(static_cast<std::int64_t>(d.hosts_total)) +
+                 " named hosts (by name); other devices open from Hardware</span>";
     }
     h += "</div></div>";
     return h;
@@ -726,7 +731,12 @@ std::string render_software_page(const SoftwarePageFilters& f, const SoftwarePag
         if (d.caveat)
             return h + "</div>";
     } else if (d.caveat) {
-        return h + caveat(*d.caveat) + "</div>";
+        // No controls here, so a bad filter in the URL hash could not be repaired from the page:
+        // offer the reset. replaceState first makes the click a real navigation, not a fragment change.
+        return h + "<div class=\"inv-caveat\">" + esc(*d.caveat) +
+               " <a class=\"inv-link\" href=\"/software\" "
+               "onclick=\"history.replaceState(null,'',location.pathname)\">Clear all filters and "
+               "reload</a></div></div>";
     } else if (!d.rows || !d.totals || !d.kpis) {
         return h + sw_degrade() + "</div>";
     } else if (d.kpis->building || (d.totals->titles == 0 && !any_filter(f))) {
@@ -749,7 +759,7 @@ std::string render_software_page(const SoftwarePageFilters& f, const SoftwarePag
 
 std::string render_software_versions_expansion(
     const SoftwarePageFilters& f, const std::string& name,
-    const std::optional<std::vector<SoftwareVersionCount>>& v, bool confined) {
+    const std::optional<std::vector<SoftwareVersionCount>>& v, bool confined, bool truncated) {
     std::string h = "<div class=\"inv-exp-body\"><span class=\"inv-close\" data-close "
                     "onclick=\"swClose(this)\">close \xE2\x9C\x95</span><b>" +
                     esc(name) + "</b> <span class=\"inv-grey\">&middot; installs per version</span>";
@@ -775,7 +785,11 @@ std::string render_software_versions_expansion(
              "\" hx-swap=\"innerHTML\">devices &rsaquo;</span></td></tr><tr class=\"inv-exp\">"
              "<td colspan=\"4\"><div id=\"" + box + "\"></div></td></tr>";
     }
-    return h + "</tbody></table></div>";
+    h += "</tbody></table>";
+    if (truncated)
+        h += "<div class=\"inv-grey\">showing the " + fmt_int(static_cast<std::int64_t>(v->size())) +
+             " most-installed versions; this title has more</div>";
+    return h + "</div>";
 }
 
 std::string render_software_devices_table(const SoftwarePageFilters& f, const SoftwareDevicesTable& t,
@@ -847,7 +861,7 @@ std::string render_software_devices_table(const SoftwarePageFilters& f, const So
     std::string h = "<div class=\"inv-devs\"><div class=\"inv-devhead\">";
     h += t.scoped ? "Devices run <b>" : "<b>" + (t.total ? fmt_int(*t.total) : std::string(kEm)) + "</b> devices run <b>";
     h += esc(t.name) + "</b>";
-    h += t.version ? " <span class=\"inv-mono\">" + esc(*t.version) + "</span>"
+    h += t.version ? " <span class=\"inv-mono\">" + (t.version->empty() ? "(unknown)" : esc(*t.version)) + "</span>"
                    : " <span class=\"inv-grey\">(all versions)</span>";
     if (t.scoped)
         h += " <span class=\"inv-grey\">your management groups only</span>";
@@ -917,7 +931,10 @@ document.body.addEventListener('htmx:beforeRequest', function (e) {
   if (!el || !el.getAttribute) return;
   if (el.id === 'sw-host') {  /* only a known host (or an emptied box) re-queries */
     var a = document.getElementById('sw-agent');
-    if (el.value.trim() && a && !a.value) e.preventDefault();
+    if (el.value.trim() && a && !a.value) {
+      e.preventDefault();
+      el.setCustomValidity('Not a listed host name'); el.reportValidity();  /* visible, not a silent no-op */
+    }
     return;
   }
   var m = el.getAttribute('data-tog');
