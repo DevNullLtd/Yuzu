@@ -67,14 +67,14 @@ std::vector<Row> golden_rows() {
     acc("agent.content_dist.cleanup", {{"hours", "168"}}, "cleanup hours as a GUI string");
     acc("agent.content_dist.cleanup", {{"filename", "x.msi"}}, "the dead filename stays declared");
     rej("agent.content_dist.cleanup", {{"hours", "soon"}}, "unparsable hours");
-    // 0 and below are documented as "remove everything"; above the maximum the plugin's cutoff
-    // arithmetic overflows into the future on Linux/libstdc++ (1500000 measured) and does the
-    // same by accident.
+    // 0 and below are documented as "remove everything". Above the maximum the server refuses
+    // on execute-by-id; the plugin clamps independently (parse_cleanup_hours saturates at
+    // 876000), so the cutoff arithmetic can no longer wrap into the future.
     acc("agent.content_dist.cleanup", {{"hours", 0}}, "hours 0 removes everything, as documented");
     acc("agent.content_dist.cleanup", {{"hours", -1}}, "negative hours, as documented");
     acc("agent.content_dist.cleanup", {{"hours", 876000}}, "hours at its maximum");
     rej("agent.content_dist.cleanup", {{"hours", 876001}}, "hours one over its maximum");
-    rej("agent.content_dist.cleanup", {{"hours", 1500000}}, "hours past the overflow point");
+    rej("agent.content_dist.cleanup", {{"hours", 1500000}}, "hours far above its maximum");
     // The dashboard sends digit strings; coercion runs before the bound check.
     acc("agent.content_dist.cleanup", {{"hours", "876000"}}, "hours digit string at its maximum");
     rej("agent.content_dist.cleanup", {{"hours", "876001"}},

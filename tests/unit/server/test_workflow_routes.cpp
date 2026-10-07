@@ -2669,8 +2669,8 @@ TEST_CASE("instruction execute: an uncompilable stored schema fails closed with 
     CHECK(body["error"]["message"] == "stored parameter schema for this instruction is invalid");
     CHECK(body["error"]["remediation"] ==
           "An administrator must export the definition, delete it and import it again with a "
-          "corrected parameter_schema; see \"Replacing a stored parameter schema\" in the "
-          "Instructions documentation.");
+          "corrected parameter_schema (signed, unless the server allows unsigned definitions); "
+          "see \"Replacing a stored parameter schema\" in the Instructions documentation.");
     CHECK(res->body.find("SECRET") == std::string::npos);
     CHECK(h.dispatch_calls == 0);
     CHECK(h.tracker->query_executions(ExecutionQuery{}).empty());

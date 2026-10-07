@@ -53,9 +53,10 @@
 //     kMaxEnumMembers per enum; a user pattern <= kMaxPatternBytes.
 //   * a pattern compiles under mcp::kPatternMaxMem, has <= kMaxPatternProgramSize RE2
 //     instructions, and one schema's programs sum to <= kMaxSchemaPatternProgramSize (a short
-//     pattern can compile to a large program: `a{1000}` is 7 bytes and 1004 instructions, 32 in
-//     a row are 32004 and pass the per-pattern cap, 33 reach 33004 and are refused, and RE2's own budget refuses `\pL{300}x`
-//     outright). The first over-budget pattern ends the pre-compile.
+//     pattern can compile to a large program: `a{1000}` is 7 bytes and 1004 instructions).
+//     32 of them in a row are 32004 and pass the per-pattern cap; 33 reach 33004 and are
+//     refused. RE2's own budget refuses `\pL{300}x` outright. The first over-budget pattern
+//     ends the pre-compile.
 //   * an integer minimum/maximum satisfies |bound| < kIntegerBoundLimit: the shared validator
 //     compares as doubles, exact only below 2^53.
 //   * a string matched against a pattern is <= kMaxPatternMatchedStringBytes, and
