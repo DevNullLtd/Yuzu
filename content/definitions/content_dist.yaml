@@ -108,6 +108,17 @@ spec:
           Optional whitespace-separated argv tail, e.g. "/quiet /norestart".
           Never shell-parsed (no quoting/escaping); rejected outright if it
           contains a shell metacharacter such as ; | & ` $ ( ) { } < >.
+      expected_hash:
+        type: string
+        displayName: Expected SHA256
+        description: >
+          Optional lowercase hex SHA-256 (64 characters) the caller believes
+          the staged file has, e.g. to detect orchestration drift. Compared
+          to the hash recorded at stage time; a mismatch fails the action
+          before anything runs. The recorded hash, not this value, is what
+          authorises execution.
+        validation:
+          pattern: "^[0-9a-f]{64}$"
   result:
     columns:
       - name: status
@@ -203,11 +214,10 @@ metadata:
   description: >
     Remove staged files older than an age cutoff (default 24 hours) from the
     agent's staging directory, evicting each removed file's KV-recorded hash
-    alongside it. NOTE: content_dist_plugin.cpp's do_cleanup reads only an
-    "hours" value (undeclared below) to pick the cutoff — it never reads the
-    filename parameter this definition declares, so a per-file targeted
-    removal is not implemented today; see the plugin README's Caveats
-    section.
+    alongside it. NOTE: content_dist_plugin.cpp's do_cleanup reads only the
+    "hours" parameter to pick the cutoff - it never reads the filename
+    parameter this definition also declares, so a per-file targeted removal
+    is not implemented today; see the plugin README's Caveats section.
   tags: [content, staging, cleanup]
 spec:
   type: action
@@ -228,6 +238,16 @@ spec:
           this parameter has no effect on which files are removed. Left in
           place for API compatibility; see the plugin README's Caveats
           section.
+      hours:
+        type: int32
+        displayName: Age Cutoff (hours)
+        description: >
+          Remove staged files whose last-write time is older than this many
+          hours, e.g. 24 or 168. Default: 24. A value of 0 or less removes
+          every staged file. Whole numbers only: the server rejects any other
+          form with a 400 (the plugin on its own would silently fall back to
+          24 on an unparsable value).
+        default: 24
   result:
     columns:
       - name: status

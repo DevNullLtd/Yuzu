@@ -132,7 +132,7 @@
     }
   ],
   "caveats": [
-    "**`cleanup`'s `filename` parameter is dead code.** The definition declares `filename` for targeted removal, but `do_cleanup` (`content_dist_plugin.cpp:1179-1209`) only ever reads an undeclared `hours` parameter and sweeps the whole staging directory by age (default 24h) — a single-file removal is not implemented today. The definition's description and the `filename` parameter now disclose this.",
+    "**`cleanup`'s `filename` parameter is dead code.** The definition declares `filename` for targeted removal, but `do_cleanup` (`content_dist_plugin.cpp:1179-1209`) only ever reads `hours` and sweeps the whole staging directory by age (default 24h) - a single-file removal is not implemented today. The definition's description and the `filename` parameter disclose this. `filename` stays declared so a call that sends it is not rejected by the server's parameter validation.",
     "**`cleanup`'s declared result columns don't match its wire output.** `status` is never emitted — there is no `status|` line anywhere in `do_cleanup`, including on an hours-parse failure (silently ignored, not reported) — and the declared `files_removed` column is actually wired as `removed|<n>`.",
     "**`execute_staged` rejects Linux shebang scripts by design — do not \"fix\" this.** B6 fd-exec (`execveat` with `AT_EMPTY_PATH`) gives the kernel no resolvable path for `binfmt_script` to build the interpreter's argv from; a `#!`-interpreted staged file is refused up front (`content_dist_exec_seam.hpp:81-105`) rather than spawn-failing opaquely. Stage a native executable instead.",
     "**A residual hash-time-to-exec-time swap window is accepted, not closed (CDX-001).** The #808 KV hash re-verification and the seam's independent B6 open both target the same path but not the same fd; full closure needs the runner itself to accept a caller-supplied digest, deferred to a follow-up runner package (`content_dist_plugin.cpp:628-652`).",
@@ -144,7 +144,7 @@
       "author_roles": [
         "content-author"
       ],
-      "description": "Remove staged files older than an age cutoff (default 24 hours) from the agent's staging directory, evicting each removed file's KV-recorded hash alongside it. NOTE: content_dist_plugin.cpp's do_cleanup reads only an \"hours\" value (undeclared below) to pick the cutoff — it never reads the filename parameter this definition declares, so a per-file targeted removal is not implemented today; see the plugin README's Caveats section.",
+      "description": "Remove staged files older than an age cutoff (default 24 hours) from the agent's staging directory, evicting each removed file's KV-recorded hash alongside it. NOTE: content_dist_plugin.cpp's do_cleanup reads only the \"hours\" parameter to pick the cutoff - it never reads the filename parameter this definition also declares, so a per-file targeted removal is not implemented today; see the plugin README's Caveats section.",
       "display_name": "Cleanup Staged Files",
       "execute_roles": [
         "endpoint-admin"
@@ -247,6 +247,15 @@
     },
     {
       "constraints": null,
+      "default": 24,
+      "definition_id": "agent.content_dist.cleanup",
+      "description": "Remove staged files whose last-write time is older than this many hours, e.g. 24 or 168. Default: 24. A value of 0 or less removes every staged file. Whole numbers only: the server rejects any other form with a 400 (the plugin on its own would silently fall back to 24 on an unparsable value).\n",
+      "name": "hours",
+      "required": false,
+      "type": "int32"
+    },
+    {
+      "constraints": null,
       "default": null,
       "definition_id": "agent.content_dist.execute_staged",
       "description": "Name of a previously staged file, e.g. pkg-1.2.3.msi. Must already have a verified hash on record from a prior stage action (agent KV key staged_hash:<filename>) — the hash is re-verified against that record, not against this parameter, before anything runs.\n",
@@ -260,6 +269,17 @@
       "definition_id": "agent.content_dist.execute_staged",
       "description": "Optional whitespace-separated argv tail, e.g. \"/quiet /norestart\". Never shell-parsed (no quoting/escaping); rejected outright if it contains a shell metacharacter such as ; | & ` $ ( ) { } < >.\n",
       "name": "args",
+      "required": false,
+      "type": "string"
+    },
+    {
+      "constraints": {
+        "pattern": "^[0-9a-f]{64}$"
+      },
+      "default": null,
+      "definition_id": "agent.content_dist.execute_staged",
+      "description": "Optional lowercase hex SHA-256 (64 characters) the caller believes the staged file has, e.g. to detect orchestration drift. Compared to the hash recorded at stage time; a mismatch fails the action before anything runs. The recorded hash, not this value, is what authorises execution.\n",
+      "name": "expected_hash",
       "required": false,
       "type": "string"
     },
@@ -341,7 +361,7 @@
       },
       "default": 100,
       "definition_id": "agent.content_dist.upload_file",
-      "description": "Maximum allowed file size in megabytes, checked locally before the session opens. Default: 100.\n",
+      "description": "Maximum allowed file size in megabytes, checked locally before the session opens. Default: 100. Out-of-range values are rejected with a 400 by POST /api/instructions/{id}/execute.\n",
       "name": "max_size_mb",
       "required": false,
       "type": "int32"

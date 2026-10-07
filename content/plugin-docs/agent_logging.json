@@ -109,7 +109,7 @@
       "constraints": null,
       "default": 50,
       "definition_id": "device.agent_logging.get_log",
-      "description": "Number of trailing log lines to return, 1-500 (e.g. 100). Defaults to 50; values above 500 are clamped, values below 1 are rejected with a status|error result.\n",
+      "description": "Number of trailing log lines to return, 1-500 (e.g. 100). Defaults to 50. A value outside 1-500 is rejected with a 400 by POST /api/instructions/{id}/execute. A caller that bypasses that route reaches the plugin, which clamps values above 500 and rejects values below 1 with a status|error result.\n",
       "name": "lines",
       "required": false,
       "type": "int32"
