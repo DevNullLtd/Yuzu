@@ -1184,6 +1184,7 @@ private:
                 hours = std::stoi(std::string{hours_str});
             } catch (...) {}
         }
+        hours = yuzu::content_dist::exec::clamp_cleanup_hours(hours);
 
         auto dir = staging_dir();
         auto cutoff = fs::file_time_type::clock::now() - std::chrono::hours(hours);

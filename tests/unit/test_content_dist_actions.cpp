@@ -44,9 +44,11 @@
 #include <yuzu/plugin.h>
 
 #include "local_dispatcher.hpp"
+#include "test_helpers.hpp"
 
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <optional>
 #include <string>
 #include <vector>
@@ -174,6 +176,35 @@ TEST_CASE("content_dist plugin: execute_staged reports file-not-staged for a wel
     CHECK(result.captured.find("error|file not staged: "
                                "test-content-dist-actions-nonexistent-payload.bin") !=
           std::string::npos);
+}
+
+TEST_CASE("content_dist plugin: cleanup clamps a huge hours value instead of wrapping the "
+          "cutoff into the future",
+          "[agent][content_dist][posix_actions]") {
+    auto plugin = load_content_dist_plugin();
+    REQUIRE(plugin.has_value());
+
+    // Un-init()'d plugin stages under temp_directory_path()/"yuzu-staged";
+    // point TMPDIR at a private dir so the sweep cannot touch a shared one.
+    yuzu::test::TempDir tmp{"yuzu_test_cd_cleanup_"};
+    const auto staged = tmp.path / "yuzu-staged";
+    fs::create_directories(staged);
+    { std::ofstream{staged / "recent.bin"} << "x"; }
+    const char* old_tmpdir = std::getenv("TMPDIR");
+    const std::string saved = old_tmpdir ? old_tmpdir : "";
+    setenv("TMPDIR", tmp.path.c_str(), 1);
+
+    yuzu::agent::LocalDispatcher dispatcher;
+    std::vector<YuzuParam> params{{"hours", "2000000000"}};
+    auto result = dispatcher.run(plugin->descriptor, "cleanup", params);
+
+    if (old_tmpdir)
+        setenv("TMPDIR", saved.c_str(), 1);
+    else
+        unsetenv("TMPDIR");
+    CHECK(result.rc == 0);
+    CHECK(result.captured.find("removed|0") != std::string::npos);
+    CHECK(fs::exists(staged / "recent.bin"));
 }
 
 #endif // !_WIN32

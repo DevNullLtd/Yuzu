@@ -19,6 +19,9 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <cerrno>
+#include <chrono>
+#include <climits>
+#include <filesystem>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -410,4 +413,27 @@ TEST_CASE("build_execution_options keeps exec_verify Linux-only while inherit_pa
     CHECK(lin.inherit_parent_env);
     CHECK_FALSE(win.exec_verify.enabled);
     CHECK(win.inherit_parent_env);
+}
+
+// -- clamp_cleanup_hours ----------------------------------------
+
+TEST_CASE("clamp_cleanup_hours caps above 876000 and leaves everything else alone",
+          "[agent][content_dist][exec]") {
+    CHECK(clamp_cleanup_hours(876000) == 876000);
+    CHECK(clamp_cleanup_hours(876001) == 876000);
+    CHECK(clamp_cleanup_hours(INT_MAX) == 876000);
+    CHECK(clamp_cleanup_hours(24) == 24);
+    // Documented "remove every staged file" values must pass through.
+    CHECK(clamp_cleanup_hours(0) == 0);
+    CHECK(clamp_cleanup_hours(-1) == -1);
+    CHECK(clamp_cleanup_hours(INT_MIN) == INT_MIN);
+}
+
+TEST_CASE("a clamped huge cleanup cutoff is not in the future", "[agent][content_dist][exec]") {
+    // Same arithmetic as do_cleanup. Unclamped, 1500000 and 2000000000 hours
+    // wrap the cutoff into the future on Linux/libstdc++ (INT_MAX happens to
+    // wrap back into the past, so it is not a reliable discriminator alone).
+    const auto now = std::filesystem::file_time_type::clock::now();
+    for (const int hours : {1500000, 2000000000, INT_MAX})
+        CHECK(now - std::chrono::hours(clamp_cleanup_hours(hours)) < now);
 }

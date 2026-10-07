@@ -362,4 +362,16 @@ map_execution_result(const yuzu::agent::SubprocessResult& result) {
                                std::move(output)};
 }
 
+/// Upper bound for cleanup's `hours`. Matches `maximum` in
+/// content/definitions/content_dist.yaml; keeps the cutoff arithmetic far
+/// below the point (1.3 million hours measured on Linux/libstdc++) where
+/// `now - hours(h)` wraps into the future and removes every staged file.
+inline constexpr int kMaxCleanupHours = 876000;
+
+/// Clamp the parsed cleanup `hours` to `kMaxCleanupHours`. Zero and negative
+/// values (documented "remove every staged file") pass through unchanged.
+[[nodiscard]] constexpr int clamp_cleanup_hours(int hours) noexcept {
+    return hours > kMaxCleanupHours ? kMaxCleanupHours : hours;
+}
+
 } // namespace yuzu::content_dist::exec
