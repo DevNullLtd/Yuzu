@@ -370,10 +370,8 @@ struct DexInterval {
 /// (events_a / exposure_a) / (events_b / exposure_b); `estimate` is that ratio
 /// and `reliable` needs BOTH arms >= kDexStatsReliableMinEvents events. Given the
 /// total, events_a is binomial, so the interval is the exact conditional
-/// (Clopper-Pearson) interval mapped onto the ratio, from the regularised
-/// incomplete beta for every arm up to kDexRateRatioMaxEvents, evaluated in
-/// double to within 5e-6 relative of the exact rational bounds (measured worst
-/// 2.4e-6, at 1e9 events against 1).
+/// (Clopper-Pearson) interval mapped onto the ratio; accuracy and the per-arm
+/// limit are in the file banner.
 /// nullopt iff a count is negative or above kDexRateRatioMaxEvents, an exposure
 /// is non-finite or below kDexRateRatioMinExposure, both counts are zero (no
 /// conditional distribution), or a result is not representable. events_b == 0
