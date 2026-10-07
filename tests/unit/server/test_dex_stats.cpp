@@ -4,7 +4,7 @@
  *
  * Invariants pinned here:
  *  - The pinned normal quantile matches the declared 95 percent level.
- *  - detail::log_gamma agrees with std::lgamma (single-threaded oracle only;
+ *  - dex_stats_detail::log_gamma agrees with std::lgamma (single-threaded oracle only;
  *    the header itself must never call it).
  *  - The incomplete gamma / beta kernels satisfy their closed-form identities
  *    and their bisection quantiles round-trip.
@@ -12,8 +12,10 @@
  *    Garwood 1936 limits for the exact Poisson interval) AND an independent
  *    high-precision computation (Python Decimal bisection on the exact
  *    Poisson / binomial CDF, 60 digits, 2026-10-07).
- *  - The exact kernels and the large-count closed forms agree at the switch
- *    and nothing returns a statistic after a convergence failure or overflow.
+ *  - The exact Poisson kernels and the large-count closed forms agree at the
+ *    switch, rate ratios stay exact (Clopper-Pearson) up to their own limit and
+ *    return nothing beyond it, and nothing returns a statistic after a
+ *    convergence failure or overflow.
  *  - Absent-not-zero: invalid input and unrepresentable results are nullopt;
  *    below the cohort floor only counts survive.
  */
@@ -70,39 +72,42 @@ double sf_ge(double k, double lam) {
 } // namespace
 
 TEST_CASE("DexStats: constants lock the pinned z to the declared level", "[dex][stats]") {
-    CHECK(0.5 * std::erfc(-kDexStatsZ / std::sqrt(2.0)) == Approx(0.975).epsilon(1e-12));
+    CHECK(0.5 * std::erfc(-kDexStatsZ / std::sqrt(2.0)) ==
+          Approx(1.0 - (1.0 - kDexStatsConfidence) / 2.0).epsilon(1e-12));
 }
 
 TEST_CASE("DexStats: log_gamma matches the lgamma oracle", "[dex][stats]") {
     for (double n : {1.0, 2.0, 3.0, 7.0, 14.0, 15.0, 16.0, 100.0, 1000.0, 1e6}) {
         const double want = std::lgamma(n);
-        CHECK(detail::log_gamma(n) == Approx(want).epsilon(1e-13).margin(1e-14));
+        CHECK(dex_stats_detail::log_gamma(n) == Approx(want).epsilon(1e-13).margin(1e-14));
     }
-    CHECK(std::fabs(detail::log_gamma(1.0)) < 1e-15);
-    CHECK(std::fabs(detail::log_gamma(2.0)) < 1e-15);
+    CHECK(std::fabs(dex_stats_detail::log_gamma(1.0)) < 1e-15);
+    CHECK(std::fabs(dex_stats_detail::log_gamma(2.0)) < 1e-15);
 }
 
 TEST_CASE("DexStats: incomplete gamma and beta identities and quantile round trips",
           "[dex][stats]") {
     for (double x : {0.1, 1.0, 5.0})
-        CHECK(detail::regularized_gamma_p(1.0, x) == Approx(1.0 - std::exp(-x)).epsilon(1e-12));
+        CHECK(dex_stats_detail::regularized_gamma_p(1.0, x) ==
+              Approx(1.0 - std::exp(-x)).epsilon(1e-12));
     for (double x : {0.2, 0.5, 0.9})
-        CHECK(detail::regularized_beta(x, 1.0, 1.0) == Approx(x).epsilon(1e-12));
-    CHECK(detail::regularized_beta(0.3, 2.5, 4.0) ==
-          Approx(1.0 - detail::regularized_beta(0.7, 4.0, 2.5)).epsilon(1e-12));
+        CHECK(dex_stats_detail::regularized_beta(x, 1.0, 1.0) == Approx(x).epsilon(1e-12));
+    CHECK(dex_stats_detail::regularized_beta(0.3, 2.5, 4.0) ==
+          Approx(1.0 - dex_stats_detail::regularized_beta(0.7, 4.0, 2.5)).epsilon(1e-12));
     for (double p : {0.025, 0.5, 0.975}) {
-        const double gx = detail::gamma_quantile(7.0, p);
-        CHECK(detail::regularized_gamma_p(7.0, gx) == Approx(p).epsilon(1e-10));
-        const double bx = detail::beta_quantile(3.0, 9.0, p);
-        CHECK(detail::regularized_beta(bx, 3.0, 9.0) == Approx(p).epsilon(1e-10));
+        const double gx = dex_stats_detail::gamma_quantile(7.0, p);
+        CHECK(dex_stats_detail::regularized_gamma_p(7.0, gx) == Approx(p).epsilon(1e-10));
+        const double bx = dex_stats_detail::beta_quantile(3.0, 9.0, p);
+        CHECK(dex_stats_detail::regularized_beta(bx, 3.0, 9.0) == Approx(p).epsilon(1e-10));
     }
 }
 
 TEST_CASE("DexStats: exact and large-count Poisson bounds agree at the switch", "[dex][stats]") {
-    const auto ex = detail::poisson_bounds_exact(1e6);
-    const auto lg = detail::poisson_bounds_large(1e6);
-    CHECK(ex.lower == Approx(lg.lower).epsilon(1e-9));
-    CHECK(ex.upper == Approx(lg.upper).epsilon(1e-9));
+    const auto ex = dex_stats_detail::poisson_bounds_exact(1e6);
+    const auto lg = dex_stats_detail::poisson_bounds_large(1e6);
+    // Measured 1.6e-11 relative at the switch.
+    CHECK(ex.lower == Approx(lg.lower).epsilon(1e-10));
+    CHECK(ex.upper == Approx(lg.upper).epsilon(1e-10));
 
     // Continuity: one more event moves each bound by about one event.
     const auto at = dex_rate(kDexStatsExactMaxEvents, 1.0);
@@ -115,11 +120,11 @@ TEST_CASE("DexStats: exact and large-count Poisson bounds agree at the switch", 
 
 TEST_CASE("DexStats: a convergence failure is NaN never a number", "[dex][stats]") {
     // A cap of one iteration cannot converge for these arguments.
-    CHECK(std::isnan(detail::regularized_gamma_p(5.0, 3.0, 1)));
-    CHECK(std::isnan(detail::regularized_gamma_p(5.0, 30.0, 1)));
-    CHECK(std::isnan(detail::regularized_beta(0.4, 20.0, 30.0, 1)));
-    CHECK(std::isnan(detail::gamma_quantile(5.0, 0.5, 1)));
-    CHECK(std::isnan(detail::beta_quantile(20.0, 30.0, 0.5, 1)));
+    CHECK(std::isnan(dex_stats_detail::regularized_gamma_p(5.0, 3.0, 1)));
+    CHECK(std::isnan(dex_stats_detail::regularized_gamma_p(5.0, 30.0, 1)));
+    CHECK(std::isnan(dex_stats_detail::regularized_beta(0.4, 20.0, 30.0, 1)));
+    CHECK(std::isnan(dex_stats_detail::gamma_quantile(5.0, 0.5, 1)));
+    CHECK(std::isnan(dex_stats_detail::beta_quantile(20.0, 30.0, 0.5, 1)));
 }
 
 TEST_CASE("DexStats: dex_proportion Wilson known answers", "[dex][stats]") {
@@ -217,7 +222,10 @@ TEST_CASE("DexStats: dex_rate scaling validity overflow and flag", "[dex][stats]
 
 TEST_CASE("DexStats: dex_rate bounds satisfy the Poisson tail definition", "[dex][stats]") {
     // Independent of any table: the upper bound leaves alpha/2 in the lower
-    // tail P(X <= k) and the lower bound leaves alpha/2 in P(X >= k).
+    // tail P(X <= k) and the lower bound leaves alpha/2 in P(X >= k). The
+    // tolerance is 1e-7, not tighter: the oracle's pmf uses std::lgamma, which
+    // at k = 1e6 (lgamma ~ 1.3e7) carries ~1e-9 relative error of its own, so a
+    // tighter bound would test the oracle rather than the kernel.
     for (std::int64_t k : {3, 100000, 1000000}) {
         const auto r = dex_rate(k, 1.0);
         REQUIRE(r);
@@ -283,19 +291,59 @@ TEST_CASE("DexStats: dex_rate_ratio guards and overflow", "[dex][stats]") {
     CHECK_FALSE(dex_rate_ratio(30, 10.0, 1, DBL_MAX));
 }
 
-TEST_CASE("DexStats: dex_rate_ratio large-count branch", "[dex][stats]") {
+TEST_CASE("DexStats: dex_rate_ratio one large arm matches the exact bounds", "[dex][stats]") {
+    // Exact conditional (Clopper-Pearson) bounds on the odds a / b, equal
+    // exposures so the scale is 1. Vectors: Python Decimal (90 digits) bisection
+    // on the exact binomial CDF, 2026-10-07 (script not committed). A small arm
+    // makes the tail a short sum: P(X <= a) = 1 - P(Y <= b - 1) with Y = n - X,
+    // and P(X >= a) = 1 - P(X <= a - 1); for b = 1 or a = 1 the bounds have the
+    // closed forms p_U = 0.975^(1/n) and p_L = 1 - 0.975^(1/n). A closed-form
+    // Wilson stand-in is 86 percent low on the first row and 600 percent high
+    // on the second, which is what these rows pin.
+    struct V {
+        std::int64_t a, b;
+        bool upper;
+        double want, tol;
+    };
+    for (const V& v : {V{1'000'001, 1, true, 39497968.70098762, 1e-7},
+                       V{1, 1'000'001, false, 2.5317757669269599e-8, 1e-7},
+                       V{1'000'000'000, 1, true, 39497890244.205102, 5e-6},
+                       V{1, 1'000'000'000, false, 2.5317807959292563e-11, 5e-6},
+                       V{20, 1'000'000'000, false, 1.2216519531752164e-8, 5e-6}}) {
+        const auto r = dex_rate_ratio(v.a, 100.0, v.b, 100.0);
+        REQUIRE(r);
+        CHECK(r->estimate == Approx(static_cast<double>(v.a) / static_cast<double>(v.b)));
+        CHECK((v.upper ? r->upper : r->lower) == Approx(v.want).epsilon(v.tol));
+        CHECK(r->lower < r->estimate);
+        CHECK(r->estimate < r->upper);
+    }
+}
+
+TEST_CASE("DexStats: dex_rate_ratio balanced arms above a million events", "[dex][stats]") {
+    // 2,000,000 against 2,000,000 events, equal exposures. Decimal (70 digits)
+    // bisection on the binomial tail summed only over the terms within 30
+    // sigma of the mode (omitted mass < 1e-100), 2026-10-07; script not
+    // committed. Odds, so the bounds are 1 / upper and 1 / lower of each other.
     const auto r = dex_rate_ratio(2'000'000, 100.0, 2'000'000, 100.0);
     REQUIRE(r);
     CHECK(r->estimate == 1.0);
-    CHECK(std::isfinite(r->lower));
-    CHECK(std::isfinite(r->upper));
-    CHECK(r->lower < 1.0);
-    CHECK(r->upper > 1.0);
+    CHECK(r->lower == Approx(0.99804145643536860).epsilon(1e-7));
+    CHECK(r->upper == Approx(1.0019623869850322).epsilon(1e-7));
+    CHECK(r->reliable);
+}
 
-    // No int64 sum: both arms at the maximum.
-    const auto m = dex_rate_ratio(kI64Max, 10.0, kI64Max, 10.0);
-    REQUIRE(m);
-    CHECK(m->estimate == 1.0);
+TEST_CASE("DexStats: dex_rate_ratio domain limit", "[dex][stats]") {
+    // Both arms at the limit still produce a statistic that brackets 1.
+    const auto edge = dex_rate_ratio(kDexRateRatioMaxEvents, 100.0, kDexRateRatioMaxEvents, 100.0);
+    REQUIRE(edge);
+    CHECK(edge->estimate == 1.0);
+    CHECK(edge->lower < 1.0);
+    CHECK(edge->upper > 1.0);
+
+    // One event past it in either arm, or int64 extremes: no statistic.
+    CHECK_FALSE(dex_rate_ratio(kDexRateRatioMaxEvents + 1, 100.0, 1, 100.0));
+    CHECK_FALSE(dex_rate_ratio(1, 100.0, kDexRateRatioMaxEvents + 1, 100.0));
+    CHECK_FALSE(dex_rate_ratio(kI64Max, 10.0, kI64Max, 10.0));
 
     // Reliable only when both arms reach the threshold.
     CHECK(dex_rate_ratio(20, 100.0, 20, 100.0)->reliable);
