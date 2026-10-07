@@ -551,7 +551,7 @@ TEST_CASE("software page: versions expansion", "[inventory][ui]") {
     };
     REQUIRE(idof(one) != idof(two));
     // A truncated read says so (the row's Versions column carries the true count); a full list does not.
-    const std::string cut_line = "showing the 200 most-installed versions; this title has more";
+    const std::string cut_line = "showing the 200 most-installed versions; this title may have more";
     std::vector<SoftwareVersionCount> many;
     for (int i = 0; i < 200; ++i)
         many.push_back({"v" + std::to_string(i), 200 - i, i == 0});

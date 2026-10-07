@@ -788,7 +788,7 @@ std::string render_software_versions_expansion(
     h += "</tbody></table>";
     if (truncated)
         h += "<div class=\"inv-grey\">showing the " + fmt_int(static_cast<std::int64_t>(v->size())) +
-             " most-installed versions; this title has more</div>";
+             " most-installed versions; this title may have more</div>";
     return h + "</div>";
 }
 

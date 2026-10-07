@@ -567,7 +567,7 @@ place, **Hardware** and **Software**, each its own page:
     **Load more**. **Installs** is the exact number of distinct devices carrying the
     title under the active filters (a device carrying one title through two sources
     counts once), and the count line gives the exact totals across every page. Click a
-    row for **installs per version** (share bars and a "newest in fleet" mark) inline, and
+    row for **installs per version** (share bars and a "newest in fleet" mark; the 200 most-installed versions, and the table says when a title may have more) inline, and
     **devices** on a title or on one version for the hosts running it. The devices table
     links each host to its Hardware record and shows OS, version, ecosystem and source,
     install date and **Last synced** — the device's installed-software sync time, the same
@@ -592,7 +592,8 @@ place, **Hardware** and **Software**, each its own page:
   - **Degraded or refused.** A store that cannot answer shows an unavailable banner with
     a Retry button, never an empty table. A malformed filter, or a Load-more token from a
     different filter set or from before the latest hourly refresh, shows a notice and
-    reads nothing; reload to restart from the first page.
+    reads nothing; use the **Clear all filters and reload** link, which drops the stored
+    filters, to restart from the first page.
   - **Removed routes.** The standalone **Find software** tab and the old Devices-tab
     fragments are gone: `/fragments/inventory/find`, `/fragments/inventory/find/results`,
     `/fragments/inventory/devices` and `/fragments/inventory/device` return `404` for an

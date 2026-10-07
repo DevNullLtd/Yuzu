@@ -449,11 +449,16 @@ TEST_CASE("software routes: an unfiltered caller gets the strip on the host view
     REQUIRE(contains(res->body, "value=\"WIN-1\"")); // the host box shows the name
     REQUIRE(contains(res->body, "host: WIN-1"));
     REQUIRE(h.count("hostnames") == 1);
+    // A Results-mode refresh of the host view (every control's request) shows the name too.
+    auto results = h.sink.Get(std::string(kSoftware) + "?results_only=1&agent_id=a1");
+    REQUIRE(results);
+    REQUIRE(contains(results->body, "host: WIN-1"));
+    REQUIRE(h.count("hostnames") == 2);
     // The Load-more page never renders a host name, so it never reads the hostname map.
     auto more = h.sink.Get(std::string(kSoftware) + "?rows_only=1&agent_id=a1");
     REQUIRE(more);
     REQUIRE(more->body.rfind("<tr", 0) == 0);
-    REQUIRE(h.count("hostnames") == 1);
+    REQUIRE(h.count("hostnames") == 2);
 }
 
 TEST_CASE("software routes: a degraded rollup-meta read on the host view is a whole-page degrade",
@@ -632,7 +637,7 @@ TEST_CASE("software routes: versions drill", "[inventory][route]") {
     InvHarness full_read;
     full_read.versions = vers_of(200);
     REQUIRE(contains(full_read.sink.Get(std::string(kVersions) + "?name=Chrome")->body,
-                     "showing the 200 most-installed versions; this title has more"));
+                     "showing the 200 most-installed versions; this title may have more"));
     InvHarness short_read;
     short_read.versions = vers_of(199);
     REQUIRE_FALSE(contains(short_read.sink.Get(std::string(kVersions) + "?name=Chrome")->body,
@@ -691,7 +696,7 @@ TEST_CASE("software routes: devices table scope arms", "[inventory][route]") {
     }
     {   // Wider than the push-down bound: the route filters itself and no out-of-scope ROW is
         // rendered. (The cursor token still names the last scanned row, which may be out of scope:
-        // a follow-up issue tracks that; this case does not pin it as intended.)
+        // a known gap, not pinned by this case.)
         InvHarness h;
         authz::VisibleSet big{std::unordered_set<std::string>{}};
         for (std::size_t i = 0; i <= swc::kScopePushdownMaxIds; ++i)
@@ -713,7 +718,7 @@ TEST_CASE("software routes: devices table scope arms", "[inventory][route]") {
     {   // A FULL scanned page whose last row is out of scope still carries the sentinel and the
         // next page resumes after the last SCANNED row (a099), never the last visible one (a098):
         // no out-of-scope ROW is rendered; the cursor token itself still names a scanned row
-        // (a follow-up issue tracks that).
+        // (a known gap, not pinned by this case).
         InvHarness h;
         authz::VisibleSet big{std::unordered_set<std::string>{}};
         for (std::size_t i = 0; i <= swc::kScopePushdownMaxIds; ++i)

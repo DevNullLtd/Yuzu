@@ -60,8 +60,9 @@ std::optional<std::int64_t> int_hint(const httplib::Request& req, const char* ke
     const std::string v = req.get_param_value(key);
     std::int64_t n = 0;
     const auto [p, ec] = std::from_chars(v.data(), v.data() + v.size(), n);
-    // The ceiling keeps the callers' `+ ids.size()` / negation arithmetic far from overflow:
-    // an absurd hint is dropped like a malformed one, never clamped into a fake count.
+    // The ceiling keeps the devices handler's `shown + ids.size()` and the catalogue
+    // renderer's `shown_before + rows.size()` far from overflow: an absurd hint is dropped
+    // like a malformed one, never clamped into a fake count.
     if (ec != std::errc{} || p != v.data() + v.size() || n < 0 ||
         n > std::numeric_limits<std::int64_t>::max() / 4)
         return std::nullopt;
@@ -104,6 +105,7 @@ std::optional<authz::FleetReadGate> admit(const InventoryRoutes::FleetReadFn& fl
     return gate;
 }
 
+constexpr std::size_t kHostTypeaheadCap = 1000;
 constexpr const char* kConfinedFleetMsg =
     "The software catalogue is a fleet-wide aggregate that cannot be narrowed to your "
     "management groups, so it is not shown to a group-scoped account. Open a device from "
@@ -275,8 +277,8 @@ void InventoryRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         }
         // Names: the host view's display name (Results/Full) and (Full) the type-ahead list.
         // Rows pages never render either. Never read for a confined caller (a whole-fleet
-        // hostname map is fleet disclosure). The devices handler below reads the map per
-        // visible row for confined callers by design.
+        // hostname map is fleet disclosure). The devices handler below copies the whole map
+        // once per call and looks it up per visible row, for confined callers by design.
         if (!confined && deps_.hostnames_fn &&
             (mode == SoftwarePageMode::Full || (host && mode == SoftwarePageMode::Results))) {
             const auto names = deps_.hostnames_fn();
@@ -285,14 +287,14 @@ void InventoryRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                 f.host_display = (it != names.end() && !it->second.empty()) ? it->second : q.agent_id;
             }
             if (mode == SoftwarePageMode::Full) {
-                // ponytail: a 1000-name datalist; a server-side host search when fleets outgrow it
+                // ponytail: a kHostTypeaheadCap-name datalist; a server-side host search when fleets outgrow it
                 for (const auto& [id, name] : names)
                     if (!name.empty())
                         d.hosts.emplace_back(name, id);
                 std::ranges::sort(d.hosts);
                 d.hosts_total = d.hosts.size();
-                if (d.hosts.size() > 1000)
-                    d.hosts.resize(1000);
+                if (d.hosts.size() > kHostTypeaheadCap)
+                    d.hosts.resize(kHostTypeaheadCap);
             }
         } else if (host) {
             f.host_display = q.agent_id;
@@ -418,7 +420,8 @@ void InventoryRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             return;
         }
         // The page is full when the SCANNED count hits the limit; the next keyset position is
-        // the last scanned row, so a post-filtered page still advances.
+        // the last scanned row, so a post-filtered page still advances. Known gap: that token
+        // may name a row outside the caller's scope (the rendered rows never do).
         const bool full = rows->size() == static_cast<std::size_t>(q.limit);
         if (full)
             t.next_cursor = swc::encode_devices_cursor(rows->back(), fp);
