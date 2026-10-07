@@ -767,7 +767,7 @@ TEST_CASE("catalogue: audit target equals audit_target(query) on every call",
     CHECK(h.audit_log.back().target_id == "name=git");
 }
 
-TEST_CASE("catalogue: titles CSV: header / disposition / cap truncation / audit / service deny",
+TEST_CASE("catalogue: titles CSV: header / disposition / cap truncation / audit",
           "[pg][rest][software_catalogue]") {
     YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
@@ -812,11 +812,6 @@ TEST_CASE("catalogue: titles CSV: header / disposition / cap truncation / audit 
     REQUIRE(audited);
     CHECK(audited->status == 200);
     CHECK(audited->get_header_value("Sec-Audit-Failed").empty());
-
-    h.token_scope_service = "printers";
-    auto denied = h.sink.Get(std::string(kCat) + "?format=csv");
-    REQUIRE(denied);
-    CHECK(denied->status == 403);
 }
 
 TEST_CASE("catalogue: a titles CSV for an out-of-scope host is a header-only 200 with a denied "

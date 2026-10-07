@@ -8902,28 +8902,28 @@ void RestApiV1::register_routes(
     //   * a never-built rollup (refreshed_at == 0) is a 503 + retry_after_ms for the CSV export and
     //     the unfiltered versions read, never an authoritative-looking empty 200; the JSON
     //     catalogue still answers 200 with kpis.building (the page must render).
-    auto sw_fail_degraded = [audit_fn](const httplib::Request& req, httplib::Response& res,
-                                       const std::string& cid, const char* verb,
-                                       const std::string& target, const char* what) {
+    auto sw_503 = [audit_fn](const httplib::Request& req, httplib::Response& res,
+                             const std::string& cid, const char* verb, const std::string& target,
+                             const std::string& detail, const std::string& message) {
         (void)detail::try_persist_audit(audit_fn, req, verb, "failure", "Inventory", target,
-                                        std::string(what) + " degraded; cid=" + cid);
+                                        detail + "; cid=" + cid);
         res.status = 503;
         res.set_content(
-            detail::a4_error(res,
-                             std::string("software inventory store degraded — ") + what + " failed",
+            detail::a4_error(res, message,
                              {.retry_after_ms = 5000, .remediation = "retry the request"}),
             "application/json");
     };
-    auto sw_building = [audit_fn](const httplib::Request& req, httplib::Response& res,
-                                  const std::string& cid, const char* verb,
-                                  const std::string& target) {
-        (void)detail::try_persist_audit(audit_fn, req, verb, "failure", "Inventory", target,
-                                        "building; cid=" + cid);
-        res.status = 503;
-        res.set_content(detail::a4_error(res, "software catalogue is being built; retry",
-                                         {.retry_after_ms = 5000,
-                                          .remediation = "retry the request"}),
-                        "application/json");
+    auto sw_fail_degraded = [sw_503](const httplib::Request& req, httplib::Response& res,
+                                     const std::string& cid, const char* verb,
+                                     const std::string& target, const char* what) {
+        sw_503(req, res, cid, verb, target, std::string(what) + " degraded",
+               std::string("software inventory store degraded — ") + what + " failed");
+    };
+    auto sw_building = [sw_503](const httplib::Request& req, httplib::Response& res,
+                                const std::string& cid, const char* verb,
+                                const std::string& target) {
+        sw_503(req, res, cid, verb, target, "building",
+               "software catalogue is being built; retry");
     };
     auto sw_deny_confined = [audit_fn](const httplib::Request& req, httplib::Response& res,
                                        const std::string& cid, const char* verb,
