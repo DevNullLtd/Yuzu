@@ -33,6 +33,7 @@
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace yuzu::server {
@@ -263,7 +264,7 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             // execution_visible/confined_projection ignore out-of-scope rows, so the
             // served result is identical to the unfiltered read.
             auto statuses_opt = execution_tracker->get_agent_statuses_for_executions_checked(
-                ids, std::vector<std::string>(gate.scope->begin(), gate.scope->end()));
+                ids, scope_arg->visible_agents);
             if (!statuses_opt) {
                 degraded("tracker", "Execution tracker degraded, retry shortly.");
                 return;
@@ -311,6 +312,13 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                "<th>Time</th>"
                "</tr></thead><tbody>";
 
+        // Per-request memo of the resolved (label, title) per definition_id: a page lists up
+        // to 50 rows but typically few distinct definitions, and each get_definition is a
+        // pool lease bounded at 2 s. The outcome is cached whatever it was (including the
+        // id-truncated fallback after a DB error), so a failing id is attempted once per
+        // request, not once per row.
+        std::unordered_map<std::string, std::pair<std::string, std::string>> def_labels;
+
         for (const auto& e : execs) {
             // Status hue + row stripe.
             std::string row_class = "exec-row exec-row--" + e.status;
@@ -328,24 +336,31 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             int pending = targeted > responded ? (targeted - responded) : 0;
             int running = 0; // distinguishable only in the detail drawer
 
-            // Definition name (or fallback to truncated id).
-            std::string def_label;
-            std::string def_title;
-            if (instruction_store && instruction_store->is_open() && !e.definition_id.empty()) {
-                // ADR-0058: a DB-error outer result falls through to the id-truncated
-                // fallback below, same as a not-found inner optional did pre-migration
-                // — this is a best-effort display label, not a security/dispatch path.
-                auto def_result = instruction_store->get_definition(e.definition_id);
-                if (def_result && *def_result && !(*def_result)->name.empty()) {
-                    def_label = (*def_result)->name;
-                    def_title = e.definition_id;
+            // Definition name (or fallback to truncated id), memoized per request.
+            auto memo = def_labels.find(e.definition_id);
+            if (memo == def_labels.end()) {
+                std::string label;
+                std::string title;
+                if (instruction_store && instruction_store->is_open() && !e.definition_id.empty()) {
+                    // ADR-0058: a DB-error outer result falls through to the id-truncated
+                    // fallback below, same as a not-found inner optional did pre-migration
+                    // - this is a best-effort display label, not a security/dispatch path.
+                    auto def_result = instruction_store->get_definition(e.definition_id);
+                    if (def_result && *def_result && !(*def_result)->name.empty()) {
+                        label = (*def_result)->name;
+                        title = e.definition_id;
+                    }
                 }
-            }
-            if (def_label.empty()) {
-                def_label = e.definition_id.empty() ? std::string{"<unknown>"}
+                if (label.empty()) {
+                    label = e.definition_id.empty() ? std::string{"<unknown>"}
                                                     : e.definition_id.substr(0, 12);
-                def_title = e.definition_id;
+                    title = e.definition_id;
+                }
+                memo = def_labels.emplace(e.definition_id, std::pair{std::move(label), std::move(title)})
+                           .first;
             }
+            const std::string& def_label = memo->second.first;
+            const std::string& def_title = memo->second.second;
 
             std::string first_error;
             if (failed > 0 && !e.last_error_detail.empty()) {

@@ -10645,6 +10645,16 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 }
                 auto exec_id = param_str(args, "execution_id");
+                // A NUL byte would make the store lookup (a C-string parameter, truncated at
+                // the NUL) resolve a different id than the audit rows record (the full id):
+                // reject it before any store read (same hazard and wording as
+                // summarize_working_set kind=execution).
+                if (exec_id.find('\0') != std::string::npos) {
+                    res.set_content(error_response(id, kInvalidParams,
+                                                   "id must not contain a NUL byte"),
+                                    "application/json");
+                    return;
+                }
                 // Governance fix (#2146 A2-R1 re-review): was the plain
                 // get_execution(), which collapses "row genuinely absent" and
                 // "read degraded" (pool/query failure) to the same nullopt --
@@ -10692,7 +10702,8 @@ McpServer::HandlerFn McpServer::build_handler(
                     auto agents_opt = execution_tracker->get_agent_statuses_checked(exec_id);
                     if (!agents_opt) {
                         res.set_content(
-                            error_response(id, kInternalError, "execution tracker degraded"),
+                            a4_error(kInternalError, "execution tracker degraded", {},
+                                     /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
                             "application/json");
                         return;
                     }
@@ -11046,7 +11057,8 @@ McpServer::HandlerFn McpServer::build_handler(
                 auto execs_opt = execution_tracker->query_executions_checked(eq);
                 if (!execs_opt) {
                     res.set_content(
-                        error_response(id, kInternalError, "execution tracker degraded"),
+                        a4_error(kInternalError, "execution tracker degraded", {},
+                                 /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
                         "application/json");
                     return;
                 }
@@ -11074,7 +11086,8 @@ McpServer::HandlerFn McpServer::build_handler(
                             std::vector<std::string>(gate.scope->begin(), gate.scope->end()));
                     if (!statuses_opt) {
                         res.set_content(
-                            error_response(id, kInternalError, "execution tracker degraded"),
+                            a4_error(kInternalError, "execution tracker degraded", {},
+                                     /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
                             "application/json");
                         return;
                     }

@@ -11495,6 +11495,123 @@ TEST_CASE("MCP summarize_working_set execution: a confined absent id performs th
         CHECK(a != "mcp.summarize_working_set|denied");
 }
 
+namespace {
+std::string get_execution_status_call_body(const std::string& exec_id, bool include_agents) {
+    nlohmann::json args = {{"execution_id", exec_id}};
+    if (include_agents)
+        args["include"] = nlohmann::json::array({"agents"});
+    return nlohmann::json{{"jsonrpc", "2.0"},
+                          {"method", "tools/call"},
+                          {"id", 314},
+                          {"params", {{"name", "get_execution_status"}, {"arguments", args}}}}
+        .dump();
+}
+} // namespace
+
+// The agent-status read degrade must carry the same honest retry hint as the sibling
+// execution-row degrade and the summarize_working_set execution branch.
+TEST_CASE("MCP get_execution_status: a status-read degrade is an error with a retry hint "
+          "(#3526)",
+          "[pg][mcp][integration][execution][scope][4753]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    yuzu::server::ExecutionTracker& tracker = *tracker_bundle;
+    const auto exec_id = seed_summarize_exec(tracker, "operator", {{"agent-in", "success"}});
+
+    McpTestServer ts;
+    ts.execution_tracker_for_test = &tracker;
+    ts.start("operator");
+    // Break ONLY the status read (see the summarize status-read degrade test above); the
+    // unconfined caller reaches it through include=["agents"].
+    exec_tracker_ddl(tracker_bundle.dsn(),
+                     "ALTER TABLE execution_tracker.agent_exec_status RENAME COLUMN "
+                     "plugin_result_status TO plugin_result_status_hidden");
+    auto res = ts.call(get_execution_status_call_body(exec_id, /*include_agents=*/true));
+    exec_tracker_ddl(tracker_bundle.dsn(),
+                     "ALTER TABLE execution_tracker.agent_exec_status RENAME COLUMN "
+                     "plugin_result_status_hidden TO plugin_result_status");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+    REQUIRE(body["error"]["data"].contains("retry_after_ms"));
+    CHECK(body["error"]["data"]["retry_after_ms"].get<int64_t>() ==
+          yuzu::server::mcp::kMcpStoreFaultRetryMs);
+    CHECK(res->body.find("not found") == std::string::npos);
+    for (const auto& a : ts.audit_log)
+        CHECK(a != "mcp.get_execution_status|denied");
+}
+
+// An id with an embedded NUL reaches the store as a C string truncated at the NUL, so it
+// would resolve the real execution while the audit rows record the full id. It must be
+// rejected as invalid params before any store read, with no audit row of any result.
+TEST_CASE("MCP get_execution_status: an id with an embedded NUL byte is rejected, not "
+          "resolved to the truncated real id (#3526)",
+          "[pg][mcp][integration][execution][security][4753]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    yuzu::server::ExecutionTracker& tracker = *tracker_bundle;
+    const auto exec_id = seed_summarize_exec(tracker, "operator", {{"agent-in", "success"}});
+
+    McpTestServer ts;
+    ts.execution_tracker_for_test = &tracker;
+    ts.start("operator");
+
+    // Control: the real id resolves and writes its success audit row.
+    auto ok = ts.call(get_execution_status_call_body(exec_id, /*include_agents=*/false));
+    REQUIRE(ok);
+    CHECK(nlohmann::json::parse(ok->body).contains("result"));
+    const auto audit_rows_before = ts.audit_log.size();
+
+    std::string nul_id = exec_id;
+    nul_id.push_back('\0');
+    nul_id += "tail";
+    REQUIRE(nul_id.size() == exec_id.size() + 5);
+    auto res = ts.call(get_execution_status_call_body(nul_id, /*include_agents=*/false));
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK_FALSE(body.contains("result"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    CHECK(body["error"]["message"].get<std::string>().find("NUL byte") != std::string::npos);
+    CHECK(ts.audit_log.size() == audit_rows_before);
+}
+
+TEST_CASE("MCP list_executions: a confined status-read degrade is an error with a retry hint "
+          "(#3526)",
+          "[pg][mcp][integration][execution][scope][4753]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    yuzu::server::ExecutionTracker& tracker = *tracker_bundle;
+    // Confined lists filter on dispatched_by == session username (default "test-user").
+    const auto exec_id = seed_summarize_exec(tracker, "test-user", {{"agent-in", "success"}});
+    REQUIRE_FALSE(exec_id.empty());
+
+    McpTestServer ts;
+    ts.execution_tracker_for_test = &tracker;
+    ts.fleet_read_fn_for_test = [](const httplib::Request&, httplib::Response&,
+                                   const std::string&,
+                                   const std::string&) -> yuzu::server::authz::FleetReadGate {
+        return {true, yuzu::server::authz::VisibleSet{std::unordered_set<std::string>{"agent-in"}}};
+    };
+    ts.start("operator");
+    // Break ONLY the status read: the executions query itself keeps working, so the
+    // degrade lands on the batched confined status step.
+    exec_tracker_ddl(tracker_bundle.dsn(),
+                     "ALTER TABLE execution_tracker.agent_exec_status RENAME COLUMN "
+                     "plugin_result_status TO plugin_result_status_hidden");
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":734,"params":{"name":"list_executions"}})");
+    exec_tracker_ddl(tracker_bundle.dsn(),
+                     "ALTER TABLE execution_tracker.agent_exec_status RENAME COLUMN "
+                     "plugin_result_status_hidden TO plugin_result_status");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK_FALSE(body.contains("result"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+    REQUIRE(body["error"]["data"].contains("retry_after_ms"));
+    CHECK(body["error"]["data"]["retry_after_ms"].get<int64_t>() ==
+          yuzu::server::mcp::kMcpStoreFaultRetryMs);
+}
+
 // Pins the success audit row (verb, result, target, exact detail) for a visible execution and
 // for an UNCONFINED absent id (the pre-existing `success` row; a83148630 deliberately keeps it).
 TEST_CASE("MCP summarize_working_set execution: success audit rows are pinned exactly (#4753)",
@@ -12595,6 +12712,8 @@ TEST_CASE("MCP list_executions: a degraded tracker surfaces a store-fault "
     auto body = nlohmann::json::parse(res->body);
     REQUIRE(body.contains("error"));
     CHECK(body["error"]["code"] == kInternalError);
+    REQUIRE(body["error"]["data"].contains("retry_after_ms"));
+    CHECK(body["error"]["data"]["retry_after_ms"].get<int64_t>() == mcp::kMcpStoreFaultRetryMs);
     // Never the pre-fix shape: a "success" result with an empty executions
     // array, indistinguishable from a genuinely-empty fleet.
     CHECK_FALSE(body.contains("result"));
