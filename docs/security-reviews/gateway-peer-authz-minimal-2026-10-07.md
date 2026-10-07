@@ -36,7 +36,14 @@ What this record claims, and what it does not.
   `[default_certs]` 21 cases with 272 assertions, all passing (POSIX-only sections are not
   compiled on Windows). Both Python gates pass on all three platforms. The alert rules were
   checked with promtool on Linux only (the pinned container image); promtool was not available on
-  Windows. These runs are recorded in the governance run record committed with this change.
+  Windows. ThreadSanitizer with an instrumented gRPC and OpenSSL (Linux): all 121 `[gateway_peer]`
+  cases pass, the two concurrency cases ran 30 times with no warning, and no warning in 40
+  random-order runs has a frame in the guard, the audit budget, the evidence code or a test
+  helper; about 40 percent of random-order runs exit non-zero from an OpenSSL process-exit race
+  that a control suite containing no guard code reproduces at the same rate, so it predates this
+  change. An AddressSanitizer build of the full test binary was not completed (a standalone
+  AddressSanitizer and UndefinedBehaviorSanitizer run covered the parsers, the policy and the
+  guard test). These runs are recorded in the governance run record committed with this change.
 - **Installer.** `deploy/packaging/windows/yuzu-server.iss` was edited on a Linux host. At the final
   tip it was compiled with Inno Setup 6.7.3 and silent-installed on a Windows 11 test host:
   34 of 34 silent-install cases (including upgrade, refusal and uninstall cases, the refusal of
