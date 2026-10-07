@@ -17,7 +17,7 @@
  * What is NOT proven here: the real handlers' behaviour (their own suites) and the production
  * wiring in server.cpp (`setup_gateway_peer_guard` and the single registration site); that is
  * covered by tests/shell/test_gateway_peer_boot_refusal.sh and
- * tests/shell/test_gateway_peer_registration_lexical.sh.
+ * tests/test_gateway_peer_registration_lexical.py.
  */
 
 #include <catch2/catch_test_macros.hpp>

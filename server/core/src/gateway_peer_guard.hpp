@@ -21,7 +21,7 @@
 /// gateway-upstream service. The guard wraps the SERVICE, so it covers every listener
 /// the shared builder serves it on, including a listener that only requests (does not
 /// require) a client certificate. `ServerImpl::setup_gateway_peer_guard` (server.cpp) builds
-/// it and `tests/shell/test_gateway_peer_registration_lexical.sh` pins that it is the only
+/// it and `tests/test_gateway_peer_registration_lexical.py` pins that it is the only
 /// registration.
 ///
 /// ACKNOWLEDGED MODE. The `AcknowledgedInsecure` constructor builds a guard that

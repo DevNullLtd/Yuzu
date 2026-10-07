@@ -401,8 +401,9 @@ Each is a separate decision; none is a prerequisite for the control.
   review triggers (guard sources, the `RegisterService` site in `server.cpp`, the shell tests, and any
   new use of `--insecure-gateway-peer` or `YUZU_INSECURE_GATEWAY_PEER`). Re-adding reload, freshness
   or a revocation read on this path requires re-opening this record first.
-- A lexical shell gate (a Meson test in the `docs` suite) fails if the gateway-upstream service is
-  registered other than through the guard or if the registration count changes; a boot-refusal shell
+- A lexical Python gate (`tests/test_gateway_peer_registration_lexical.py`, a Meson test in the
+  `docs` suite) fails if the gateway-upstream service is registered other than through the guard or
+  if the registration count changes; a boot-refusal shell
   test (`tests/shell/test_gateway_peer_boot_refusal.sh`, a step in `.github/workflows/ci.yml`; it
   needs the server binary and Postgres) exercises the refusal and acknowledgement rows against the
   real binary.

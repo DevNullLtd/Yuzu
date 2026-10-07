@@ -841,6 +841,7 @@ jobs:
             sudo apt-get -o DPkg::Lock::Timeout=300 install -y \
               cmake ninja-build pkg-config curl zip unzip tar python3-pip ccache \
               bison flex libsystemd-dev libblkid-dev autoconf automake libtool \
+              postgresql-client \
               ${{ matrix.compiler == 'gcc-15' && 'gcc-15 g++-15' || 'clang-21' }}
           ) 9>/tmp/yuzu-ci-apt.lock
           pip3 install --user --break-system-packages --require-hashes -r requirements-ci.txt
@@ -1481,12 +1482,18 @@ jobs:
       # server must exit non-zero before binding any listener for the refused configurations
       # (--no-tls without --insecure-gateway-peer, acknowledgement plus a pin, operator certs
       # with no pin, no client CA, a broken explicit pin source, HTTPS-only defaults) and must
-      # boot for the permitted ones. Not exercisable by the Catch2 suite (which never
-      # constructs ServerImpl); needs the binary and Postgres, like the step above.
+      # boot for the permitted ones. It also makes an ANONYMOUS gateway-upstream call (curl, no
+      # client certificate) to the real binary: refused (grpc-status 16, denial counter on
+      # /metrics) when enforcing, answered when acknowledged-off. Not exercisable by the Catch2
+      # suite (which never constructs ServerImpl); needs the binary and Postgres, like the step
+      # above. YUZU_REQUIRE_PSQL makes a missing `psql` a failure, never a skip: the test creates
+      # one database per row through it, and a skipped step would be a green job that never ran
+      # (the sibling CLI steps above skip when psql is absent; this one must not).
       - name: Gateway peer boot-decision CLI test
         timeout-minutes: 10
         env:
           YUZU_SERVER_BIN: build-linux-${{ matrix.compiler }}-${{ matrix.build_type }}/server/core/yuzu-server
+          YUZU_REQUIRE_PSQL: "1"
         run: bash tests/shell/test_gateway_peer_boot_refusal.sh
 
       # Graceful shutdown is not exercisable by the Catch2 suite (which never drives main(), so

@@ -8380,7 +8380,7 @@ public:
             builder.AddListeningPort(cfg_.gateway_upstream_address, mgmt_creds);
             // REGISTER THE GUARD, NEVER gateway_service_: the guard is the only registration
             // of the gateway-upstream service. It wraps the inner handler and decides who may
-            // call. tests/shell/test_gateway_peer_registration_lexical.sh fails if this site
+            // call. tests/test_gateway_peer_registration_lexical.py fails if this site
             // registers anything else.
             builder.RegisterService(gateway_peer_guard_.get());
             spdlog::info("Gateway upstream service enabled on {}", cfg_.gateway_upstream_address);

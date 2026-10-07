@@ -3151,17 +3151,16 @@ test('agent OTA/ctx-slot wiring lexical gate (#2182)',
 # Gateway-upstream peer authorization: static lexical gate pinning that server.cpp registers
 # the gateway-upstream service ONLY through GatewayPeerGuardedService (nothing constructs
 # ServerImpl, so no unit test can see the registration site). Carries its own negative-control
-# self-test. No build required, gated only on bash like the OTA gate above. Suite 'docs', like the
-# tier-policy wiring gate below: scripts/ci/assert-suite-cover.py has no bare 'server' entry in its
-# --suite lists, so a no-build gate labelled 'server' fails that check on the Windows legs.
-if _bash_test.found()
-  test('gateway-upstream guard registration lexical gate',
-    _bash_test,
-    args: [files('shell/test_gateway_peer_registration_lexical.sh')],
-    suite: 'docs',
-    timeout: 90,
-  )
-endif
+# self-test (in-memory mutated copies, plus benign controls). No build required. Python, not
+# bash, like the OTA gate above (#5428): one process on every OS. Suite 'docs', like the
+# tier-policy wiring gate below: scripts/ci/assert-suite-cover.py has no bare 'server' entry in
+# its --suite lists, so a no-build gate labelled 'server' fails that check on the Windows legs.
+test('gateway-upstream guard registration lexical gate',
+  _python3_test,
+  args: [files('test_gateway_peer_registration_lexical.py')],
+  suite: 'docs',
+  timeout: 30,
+)
 
 # #4666 PR-2 W3a MI-2: report-only symbol-binding probe over the built exe/core-lib/
 # agent_actions plugin (see the script's own header for what it does and does not prove).
@@ -3241,6 +3240,16 @@ test('assert-suite-cover selftest',
 test('issue lifecycle docs',
   _python3_test,
   args: [files('test_issue_docs.py')],
+  suite: 'docs',
+  timeout: 10,
+)
+
+# Gateway-upstream peer authorization docs lint: every place that tells an operator to restart the
+# gateway after a refusal carries its #5183 caveat and a conditional marker in the same paragraph,
+# and the expiry runbook says a gateway redial is required. No build required.
+test('gateway peer restart-advice docs lint',
+  _python3_test,
+  args: [files('test_gateway_peer_restart_advice_lint.py')],
   suite: 'docs',
   timeout: 10,
 )
