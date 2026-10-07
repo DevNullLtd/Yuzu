@@ -332,6 +332,14 @@ closed). The breaker counts consecutive failures and any successful authz read, 
 included, resets the count, so a partial fault that lets the `role_permissions` read succeed while
 other authz reads fail can delay the breaker opening for operators' cache-miss checks.
 
+**New alert: `YuzuRbacBreakerOpen` (critical).** `docs/prometheus/yuzu-alerts.yml` now ships a per-replica
+alert that fires when `yuzu_server_rbac_breaker_open` has stayed at `1` on a replica for 5 minutes. It
+means authorization reads on that replica keep failing. While the breaker is open the replica refuses
+(fail closed) the operator permission checks that miss its permission cache and sheds service-token
+ceiling reads; decisions already cached there are served only until the stale bound of about 5 seconds.
+A breaker that closes again within 5 minutes does not page. Load the updated rule file if you maintain
+your own copy of the shipped alerts.
+
 **The sibling gates changed their budget.** `require_permission` and `require_scoped_permission` now
 read the ceiling with the 250 ms authz acquire budget behind that shared breaker. Before, they acquired
 with the 2000 ms `kReadTimeout` and were not breaker-gated, but the pool clamps a bounded acquire to
