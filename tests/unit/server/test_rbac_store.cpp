@@ -3283,8 +3283,20 @@ TEST_CASE("RbacStore: the single-row role permission read agrees with the whole-
             store.role_permission_allowed_checked("ITServiceOwner", "Enrollment", "Read").value());
     }
 
+    SECTION("role names match case-sensitively and exactly") {
+        // The exact name grants; a lookalike differing only in case or by a trailing space names
+        // no role, so the read succeeds (no error) and the verdict is a refusal.
+        CHECK(role_grants(store, "ITServiceOwner", "Response", "Read"));
+        CHECK(role_denies(store, "itserviceowner", "Response", "Read"));
+        CHECK(role_denies(store, "ITSERVICEOWNER", "Response", "Read"));
+        CHECK(role_denies(store, "ITServiceOwner ", "Response", "Read"));
+        check_same_verdict(store, "itserviceowner", "Response", "Read");
+        check_same_verdict(store, "ITServiceOwner ", "Response", "Read");
+    }
+
     SECTION("an explicit deny row refuses") {
-        REQUIRE(store.role_permission_allowed_checked("ITServiceOwner", "Response", "Read").value());
+        REQUIRE(
+            store.role_permission_allowed_checked("ITServiceOwner", "Response", "Read").value());
         REQUIRE(store.set_permission({"ITServiceOwner", "Response", "Read", "deny"}).has_value());
         check_same_verdict(store, "ITServiceOwner", "Response", "Read");
         CHECK_FALSE(
@@ -3292,7 +3304,8 @@ TEST_CASE("RbacStore: the single-row role permission read agrees with the whole-
     }
 
     SECTION("a row whose effect is neither allow nor deny refuses") {
-        REQUIRE(store.role_permission_allowed_checked("ITServiceOwner", "Response", "Read").value());
+        REQUIRE(
+            store.role_permission_allowed_checked("ITServiceOwner", "Response", "Read").value());
         exec_on_test_db(rbac_db_fx_.dsn(),
                         "UPDATE rbac_store.role_permissions SET effect = 'bogus' "
                         "WHERE role_name = 'ITServiceOwner' AND securable_type = 'Response' "
