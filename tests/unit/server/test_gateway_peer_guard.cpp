@@ -326,8 +326,15 @@ std::unique_ptr<grpc::ClientContext> ctx_with_deadline() {
     return c;
 }
 
-/// Calls RPC `idx` with a payload carrying the fields the real handler acts on.
-grpc::Status call_rpc(gw::GatewayUpstream::Stub& stub, int idx) {
+/// Calls RPC `idx` with a payload carrying the fields the real handler acts on, and returns the
+/// status. It contains NO Catch2 assertion (assertions are not thread-safe in this build), so it is
+/// the variant worker threads use. When the call succeeds, `payload_ok` (if given) is cleared if the
+/// response body is not the one the recording delegate returns.
+grpc::Status call_rpc_status(gw::GatewayUpstream::Stub& stub, int idx, bool* payload_ok = nullptr) {
+    const auto expect = [payload_ok](bool cond) {
+        if (payload_ok != nullptr && !cond)
+            *payload_ok = false;
+    };
     auto ctx = ctx_with_deadline();
     switch (idx) {
     case 0: {
@@ -340,8 +347,8 @@ grpc::Status call_rpc(gw::GatewayUpstream::Stub& stub, int idx) {
         apb::RegisterResponse resp;
         auto st = stub.ProxyRegister(ctx.get(), req, &resp);
         if (st.ok()) {
-            CHECK(resp.session_id() == "recorded-session");
-            CHECK(resp.accepted());
+            expect(resp.session_id() == "recorded-session");
+            expect(resp.accepted());
         }
         return st;
     }
@@ -354,7 +361,7 @@ grpc::Status call_rpc(gw::GatewayUpstream::Stub& stub, int idx) {
         gw::BatchHeartbeatResponse resp;
         auto st = stub.BatchHeartbeat(ctx.get(), req, &resp);
         if (st.ok())
-            CHECK(resp.acknowledged_count() == 7);
+            expect(resp.acknowledged_count() == 7);
         return st;
     }
     case 2: {
@@ -364,7 +371,7 @@ grpc::Status call_rpc(gw::GatewayUpstream::Stub& stub, int idx) {
         apb::InventoryAck resp;
         auto st = stub.ProxyInventory(ctx.get(), req, &resp);
         if (st.ok())
-            CHECK(resp.received());
+            expect(resp.received());
         return st;
     }
     case 3: {
@@ -376,7 +383,7 @@ grpc::Status call_rpc(gw::GatewayUpstream::Stub& stub, int idx) {
         gw::StreamStatusAck resp;
         auto st = stub.NotifyStreamStatus(ctx.get(), req, &resp);
         if (st.ok())
-            CHECK(resp.acknowledged());
+            expect(resp.acknowledged());
         return st;
     }
     default: {
@@ -387,10 +394,19 @@ grpc::Status call_rpc(gw::GatewayUpstream::Stub& stub, int idx) {
         gw::ForwardGuardianAck resp;
         auto st = stub.ForwardGuardianMessage(ctx.get(), req, &resp);
         if (st.ok())
-            CHECK(resp.acknowledged());
+            expect(resp.acknowledged());
         return st;
     }
     }
+}
+
+/// Single-thread form: the status of `call_rpc_status` plus a CHECK that a successful call carried
+/// the expected response body. Do NOT call this from a worker thread.
+grpc::Status call_rpc(gw::GatewayUpstream::Stub& stub, int idx) {
+    bool payload_ok = true;
+    auto st = call_rpc_status(stub, idx, &payload_ok);
+    CHECK(payload_ok);
+    return st;
 }
 
 /// Every RPC over `stub` must be refused with the fixed UNAUTHENTICATED answer.
@@ -1308,7 +1324,7 @@ TEST_CASE("gateway_peer_guard: concurrent denials over the wire keep the counter
     });
     const auto worker = [&](gw::GatewayUpstream::Stub* stub) {
         for (int i = 0; i < kCallsPerThread; ++i) {
-            const auto st = call_rpc(*stub, 1);
+            const auto st = call_rpc_status(*stub, 1);
             if (st.error_code() != grpc::StatusCode::UNAUTHENTICATED ||
                 st.error_message() != std::string{kGatewayPeerDeniedMessage})
                 wrong_status.fetch_add(1);

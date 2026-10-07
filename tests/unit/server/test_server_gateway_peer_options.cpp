@@ -204,6 +204,13 @@ TEST_CASE("gateway peer options: normalize keeps a supplied-but-blank pin value 
             normalize_gateway_peer_options(cfg);
             CHECK(cfg.gateway_peer_pins.empty()); // CLI11 does not treat an empty variable as set
         }
+        {
+            yuzu::test::ScopedEnv e("YUZU_GATEWAY_PEER_PIN_FILE", "");
+            Config cfg;
+            REQUIRE(parse({}, cfg));
+            normalize_gateway_peer_options(cfg);
+            CHECK(cfg.gateway_peer_pin_files.empty());
+        }
         for (const char* blank : {" ", ",", " , "}) {
             yuzu::test::ScopedEnv e("YUZU_GATEWAY_PEER_PINS", blank);
             Config cfg;
@@ -244,8 +251,8 @@ constexpr const char* kBlankPinText = "gateway peer pin option supplied but cont
 
 } // namespace
 
-TEST_CASE("gateway peer options: a supplied-but-blank pin value refuses at boot in every form, "
-          "never reads as 'not supplied'",
+TEST_CASE("gateway peer options: a supplied-but-blank pin value refuses at boot (non-empty blank "
+          "values and the command-line form; a zero-length environment value is unset to CLI11)",
           "[gateway_peer][options][boot]") {
     for (const bool default_creds : {true, false}) {
         INFO("default gRPC credentials: " << default_creds);

@@ -195,10 +195,12 @@ struct FakeFs {
 };
 
 /// Runs `fn` on a worker thread and waits up to `limit` for it. Returns its result, or nullopt
-/// if it had not finished (the worker is then detached after one more grace period): a
-/// regression that blocks must FAIL the test, not hang the suite. `on_timeout` runs once after
-/// the limit, to unblock the worker. `fn` must capture by value and must not use Catch macros
-/// (assertions are not made off the test thread).
+/// if it had not finished within `limit`: a regression that blocks must FAIL the test, not pass.
+/// `on_timeout` runs once after the limit, to unblock the worker. The worker is ALWAYS joined
+/// before this returns and is never detached, so a worker that stays blocked even after
+/// `on_timeout` shows as the meson test timeout (a hang), not as a leaked thread running past the
+/// end of the test. `fn` must capture by value and must not use Catch macros (assertions are not
+/// made off the test thread).
 template <class Fn>
 auto run_bounded(Fn fn, std::chrono::milliseconds limit,
                  const std::function<void()>& on_timeout = {}) -> std::optional<decltype(fn())> {
@@ -212,17 +214,12 @@ auto run_bounded(Fn fn, std::chrono::milliseconds limit,
             promise->set_exception(std::current_exception());
         }
     });
-    if (future.wait_for(limit) != std::future_status::ready) {
-        if (on_timeout)
-            on_timeout();
-        if (future.wait_for(std::chrono::seconds(2)) != std::future_status::ready) {
-            worker.detach();
-            return std::nullopt;
-        }
-        worker.join();
-        return std::nullopt;
-    }
+    const bool in_time = future.wait_for(limit) == std::future_status::ready;
+    if (!in_time && on_timeout)
+        on_timeout();
     worker.join();
+    if (!in_time)
+        return std::nullopt; // finished only after the bound (or after on_timeout unblocked it)
     return future.get();
 }
 
@@ -230,20 +227,45 @@ auto run_bounded(Fn fn, std::chrono::milliseconds limit,
 /// Replaces the process's stdin with the read end of a pipe that nothing writes to, so a call
 /// that PROMPTS (reads a passphrase from stdin) blocks instead of failing fast on EOF, which is
 /// what lets a test tell "refused" from "asked". `release()` closes the write end (EOF) to
-/// unblock a reader that did ask. Restores the real stdin on destruction.
+/// unblock a reader that did ask. Restores the real stdin on destruction. If stdin cannot be
+/// duplicated (it is closed), the swap is skipped: `swapped()` is false, a prompt would then fail
+/// fast on EOF instead of blocking, and the caller's refusal assertion still runs.
 class BlockedStdin {
 public:
     BlockedStdin() {
+        // Every descriptor is owned locally until the last step, so a failed REQUIRE (which
+        // throws) closes them; only then are they released into the members, with no assertion
+        // after that point.
+        struct Owned {
+            int fd{-1};
+            Owned() = default;
+            explicit Owned(int f) : fd(f) {}
+            Owned(const Owned&) = delete;
+            Owned& operator=(const Owned&) = delete;
+            ~Owned() {
+                if (fd >= 0)
+                    ::close(fd);
+            }
+            int release() {
+                const int f = fd;
+                fd = -1;
+                return f;
+            }
+        };
+        Owned saved(::dup(0));
+        if (saved.fd < 0)
+            return; // stdin is closed: skip the swap
         int fds[2] = {-1, -1};
         REQUIRE(::pipe(fds) == 0);
-        saved_ = ::dup(0);
-        REQUIRE(saved_ >= 0);
-        REQUIRE(::dup2(fds[0], 0) >= 0);
-        ::close(fds[0]);
-        write_end_ = fds[1];
+        Owned read_end(fds[0]);
+        Owned write_end(fds[1]);
+        REQUIRE(::dup2(read_end.fd, 0) >= 0);
+        saved_ = saved.release();
+        write_end_ = write_end.release();
     }
     BlockedStdin(const BlockedStdin&) = delete;
     BlockedStdin& operator=(const BlockedStdin&) = delete;
+    bool swapped() const { return saved_ >= 0; }
     void release() {
         if (write_end_ >= 0) {
             ::close(write_end_);
@@ -830,6 +852,22 @@ TEST_CASE("gateway_peer_pinset: the default reader decides from one open and nev
         if (!std::filesystem::exists("/dev/zero"))
             SKIP("no /dev/zero on this host");
         CHECK(gp::read_file_bounded("/dev/zero", 100).status == St::Unreadable);
+    }
+    SECTION("a file whose fstat size is 0 but whose read yields more than the bound is TooLarge") {
+        // The size pre-check cannot catch this (st_size is 0 for a procfs file), so only the
+        // post-read bound stops it being returned truncated as Ok.
+        const char* const proc_file = "/proc/self/status";
+        struct stat sb{};
+        if (::stat(proc_file, &sb) != 0 || !S_ISREG(sb.st_mode) || sb.st_size != 0)
+            SKIP("no zero-size regular /proc/self/status on this host");
+        const auto over = gp::read_file_bounded(proc_file, 16);
+        CHECK(over.status == St::TooLarge);
+        CHECK(over.content.empty());
+        // Control: with a generous bound the same file reads fine, so the line above is the bound
+        // being enforced and not an unreadable file.
+        const auto roomy = gp::read_file_bounded(proc_file, gp::kMaxPinFileBytes);
+        CHECK(roomy.status == St::Ok);
+        CHECK(roomy.content.size() > 16);
     }
 #endif
 }

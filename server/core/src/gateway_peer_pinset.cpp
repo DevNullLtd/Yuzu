@@ -249,7 +249,7 @@ FileReadResult read_file_bounded(const std::string& path, std::size_t max_bytes)
         return r; // Unreadable
     int raw = -1;
     do {
-        raw = ::open(path.c_str(), O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+        raw = ::open(path.c_str(), O_RDONLY | O_NONBLOCK | O_CLOEXEC | O_NOCTTY);
     } while (raw < 0 && errno == EINTR);
     if (raw < 0) {
         if (errno == ENOENT || errno == ENOTDIR)

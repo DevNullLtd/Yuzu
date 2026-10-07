@@ -53,9 +53,12 @@
 ///     `reason=<reason> rpc=<rpc> spki=<first 16 hex>`: hex and closed labels only, never PEM,
 ///     subject names or serials. `principal_class` stays empty (this is not an HTTP session or
 ///     token principal). NO row is written for `null_context`, `not_authenticated`, `no_cert`
-///     or `bad_cert`: an unauthenticated caller costs nothing to produce, so those denials are
-///     the counter plus a rate-limited warning log only (that warning carries `peer=<ip>`, the
-///     only attribution such a caller has). Rows go through the keyed
+///     or `bad_cert`. The first three are callers the transport never authenticated (or that
+///     presented nothing), which cost nothing to produce; `bad_cert` is reached only after the
+///     transport DID authenticate the peer (`peer_authenticated`), but its certificate does not
+///     parse, so no SPKI key exists to attribute or budget a row to. Those denials are the
+///     counter plus a rate-limited warning log only (that warning carries `peer=<ip>`, the only
+///     attribution such a caller has). Rows go through the keyed
 ///     `DenialAuditBudget` (key `<reason>|<8 hex of the peer key>`, overflow bucket
 ///     `<reason>|*`); the budget bounds the rows and never gates the refusal;
 ///   * rows the budget refused are counted in
@@ -137,7 +140,9 @@ static_assert(kGatewayUpstreamRpcNames.size() == static_cast<std::size_t>(Gatewa
 /// transport authenticated the peer and its certificate parsed: `no_server_auth_eku`,
 /// `not_pinned`, `outside_validity`), plus `internal_error`, which can occur at any stage and
 /// therefore relies on the key requirement. Never true for `null_context`, `not_authenticated`,
-/// `no_cert` or `bad_cert`: those are the counter plus a rate-limited warning line only.
+/// `no_cert` or `bad_cert`: those are the counter plus a rate-limited warning line only (the
+/// first three are not an authenticated certificate holder; `bad_cert` is an authenticated peer
+/// whose certificate does not parse, so it has no key to attribute a row to).
 [[nodiscard]] constexpr bool denial_may_carry_audit_row(gateway_peer::DenyReason r) {
     return gateway_peer::reason_proves_authenticated_cert_holder(r) ||
            r == gateway_peer::DenyReason::InternalError;

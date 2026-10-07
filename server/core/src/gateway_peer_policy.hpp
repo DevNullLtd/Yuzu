@@ -87,9 +87,10 @@ static_assert(
 
 /// Whether `r` can only be produced for a TLS-authenticated peer whose certificate parsed: the
 /// three reasons `decide` reaches only after the transport authenticated the peer AND the
-/// certificate parsed. A caller that has not got that far (no context, unauthenticated, no
-/// certificate, an unparseable one) costs nothing to produce, which is what an audit row must
-/// never be offered to. `InternalError` is NOT in this set: it can occur before any parse. A
+/// certificate parsed. A caller that has not got that far costs nothing to produce (no context,
+/// unauthenticated, no certificate), which is what an audit row must never be offered to; an
+/// unparseable certificate (`BadCert`) arrives from a transport-authenticated peer but has no
+/// key to attribute a row to. `InternalError` is NOT in this set: it can occur before any parse. A
 /// reason added without a decision here defaults to "not proven authenticated", the direction
 /// that writes fewer rows.
 [[nodiscard]] constexpr bool reason_proves_authenticated_cert_holder(DenyReason r) {

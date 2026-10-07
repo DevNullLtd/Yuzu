@@ -48,14 +48,15 @@ inline void register_gateway_peer_options(CLI::App& app, Config& cfg) {
                    "same key keeps matching.")
         ->envname(std::string{kGatewayPeerPinEnv});
     app.add_option(std::string{kGatewayPeerPinFileFlag}, cfg.gateway_peer_pin_files,
-                   "File of gateway pins: one or more PEM CERTIFICATE blocks (no other text), or hex "
-                   "pins one per line. Repeatable; the environment form is a single path. Read "
-                   "ONCE at boot: changing the pins means restarting the server.")
+                   "File of gateway pins: one or more PEM CERTIFICATE blocks (no other text), or "
+                   "hex pins one per line. Repeatable; the environment form is a single path. "
+                   "Read ONCE at boot: changing the pins means restarting the server.")
         ->envname(std::string{kGatewayPeerPinFileEnv});
     app.add_flag(std::string{kInsecureGatewayPeerFlag}, cfg.insecure_gateway_peer,
                  "Run the gateway-upstream service with peer authorization DISABLED. The only way "
-                 "to use --gateway-upstream with --no-tls, or on operator certificates without a pin. Refused together with "
-                 "any --gateway-peer-pin / --gateway-peer-pin-file. Development rigs only.")
+                 "to use --gateway-upstream with --no-tls, or on operator certificates without a "
+                 "pin. Refused together with any --gateway-peer-pin / --gateway-peer-pin-file. "
+                 "Development rigs only.")
         ->envname(std::string{kInsecureGatewayPeerEnv});
 }
 
@@ -63,13 +64,17 @@ inline void register_gateway_peer_options(CLI::App& app, Config& cfg) {
 /// use. Call once after parsing. Tokens are NOT validated here (`load_boot_pins` rejects a
 /// malformed one).
 ///
-/// A SUPPLIED value that holds no pin at all (`""`, `" "`, `","`, in the command-line or the
-/// environment form) is kept as ONE empty element rather than dropped. Dropping it would turn
-/// "the operator gave a pin option and it is blank" into "no pin option was given", which on the
-/// default certificates silently selects the automatic pin and on operator certificates reports a
-/// missing pin instead of the blank one. An empty element keeps the option marked as supplied, and
-/// `load_boot_pins` refuses it. A blank piece NEXT TO a real pin in the same value (`a,,` or
-/// `a, ,b`) stays harmless: only a value with no pin in it is kept.
+/// A SUPPLIED value that holds no pin at all (a non-empty blank value such as `" "` or `","` in
+/// the environment form, or any blank value, including `""`, in the command-line form) is kept as
+/// ONE empty element rather than dropped. A ZERO-LENGTH environment value
+/// (`YUZU_GATEWAY_PEER_PINS=` or `YUZU_GATEWAY_PEER_PIN_FILE=`) is the exception, and a documented
+/// limit: CLI11 treats it as unset, so it never reaches this function as a supplied value and is
+/// not refused. Dropping a supplied blank would turn "the operator gave a pin option and it is
+/// blank" into "no pin option was given", which on the default certificates silently selects the
+/// automatic pin and on operator certificates reports a missing pin instead of the blank one. An
+/// empty element keeps the option marked as supplied, and `load_boot_pins` refuses it. A blank
+/// piece NEXT TO a real pin in the same value (`a,,` or `a, ,b`) stays harmless: only a value with
+/// no pin in it is kept.
 inline void normalize_gateway_peer_options(Config& cfg) {
     std::vector<std::string> flat;
     for (const auto& token : cfg.gateway_peer_pins) {
