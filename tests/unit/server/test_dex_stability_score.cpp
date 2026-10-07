@@ -2,6 +2,7 @@
  * test_dex_stability_score.cpp — the pure application/version stability score
  * (dex_stability_score.hpp). Known-answer cases; no store, no process, no I/O.
  */
+#include "dex_perf_model.hpp" // kDexCohortFloor
 #include "dex_stability_score.hpp"
 
 #include <catch2/catch_approx.hpp>
@@ -16,8 +17,11 @@ using namespace yuzu::server;
 using Catch::Approx;
 
 namespace {
-constexpr std::int64_t kFloor = 10;
+constexpr std::int64_t kFloor = kDexCohortFloor;
+constexpr double kNaN = std::numeric_limits<double>::quiet_NaN();
+constexpr double kInf = std::numeric_limits<double>::infinity();
 
+// mk(N reporting, A affected, capped crashes, capped hangs, rate-ratio interval)
 StabilityInputs mk(std::int64_t n, std::int64_t a, std::int64_t crash, std::int64_t hang = 0,
                    std::optional<RateRatioInterval> rr = std::nullopt) {
     StabilityInputs i;
@@ -80,12 +84,25 @@ TEST_CASE("stability: cross-field consistency", "[dex][stability]") {
     require_withheld(compute_stability_score(mk(1000, 0, 100000), kFloor), "inconsistent");
     require_withheld(compute_stability_score(mk(1000, 10, 3, 2), kFloor), "inconsistent");
     require_withheld(compute_stability_score(mk(1000, 10, 51), kFloor), "inconsistent");
+    require_withheld(compute_stability_score(mk(1000, 10, 0, 51), kFloor), "inconsistent");
+    // Only the hang < 0 guard catches this one.
+    require_withheld(compute_stability_score(mk(1000, 1, 5, -1), kFloor), "inconsistent");
+    // Only the crash < 0 guard catches this one.
+    require_withheld(compute_stability_score(mk(1000, 1, -1, 5), kFloor), "inconsistent");
     CHECK(compute_stability_score(mk(1000, 10, 50, 50), kFloor).score.has_value());
     require_scored(compute_stability_score(mk(10, 0, 0), kFloor), 100.0,
                    StabilityBand::Excellent);
 }
 
-TEST_CASE("stability: rare, widespread-mild and half-fleet cases", "[dex][stability]") {
+TEST_CASE("stability: int64 extremes", "[dex][stability]") {
+    const auto big = std::numeric_limits<std::int64_t>::max();
+    auto r = compute_stability_score(mk(big, big, big, 0), kFloor);
+    require_scored(r, 36.0, StabilityBand::Poor);
+    CHECK(r.deductions[0].points == Approx(60.0));
+    CHECK(r.deductions[1].points == Approx(4.0));
+}
+
+TEST_CASE("stability: rare widespread-mild and half-fleet cases", "[dex][stability]") {
     require_scored(compute_stability_score(mk(1000, 20, 25, 5), kFloor), 98.7,
                    StabilityBand::Excellent);
     require_scored(compute_stability_score(mk(1000, 300, 300), kFloor), 80.8, StabilityBand::Good);
@@ -103,12 +120,22 @@ TEST_CASE("stability: withheld ladder", "[dex][stability]") {
 
 TEST_CASE("stability: weight contract", "[dex][stability]") {
     CHECK(stability_weights_valid(kStabilityWeights));
-    const double nan = std::numeric_limits<double>::quiet_NaN();
-    require_withheld(compute_stability_score(mk(1000, 1, 1), kFloor, {nan, 20, 8, 12}),
+    require_withheld(compute_stability_score(mk(1000, 1, 1), kFloor, {kNaN, 20, 8, 12}),
+                     "invalid_weights");
+    require_withheld(compute_stability_score(mk(1000, 1, 1), kFloor, {60, 20, kNaN, 12}),
+                     "invalid_weights");
+    require_withheld(compute_stability_score(mk(1000, 1, 1), kFloor, {60, 20, 8, -1}),
+                     "invalid_weights");
+    require_withheld(compute_stability_score(mk(1000, 1, 1), kFloor, {kInf, 20, 8, 12}),
+                     "invalid_weights");
+    // invalid_weights outranks inconsistent and below_floor.
+    require_withheld(compute_stability_score(mk(1000, 1001, 1001), kFloor, {kNaN, 20, 8, 12}),
+                     "invalid_weights");
+    require_withheld(compute_stability_score(mk(5, 1, 1), kFloor, {kNaN, 20, 8, 12}),
                      "invalid_weights");
     require_withheld(compute_stability_score(mk(1000, 1, 1), kFloor, {60, -1, 8, 12}),
                      "invalid_weights");
-    require_withheld(compute_stability_score(mk(0, 0, 0), kFloor, {nan, 20, 8, 12}),
+    require_withheld(compute_stability_score(mk(0, 0, 0), kFloor, {kNaN, 20, 8, 12}),
                      "no_population");
 
     auto over = compute_stability_score(mk(1000, 1000, 5000), kFloor, {200, 20, 8, 12});
@@ -146,9 +173,9 @@ TEST_CASE("stability: regression term", "[dex][stability]") {
     require_scored(f, 86.8, StabilityBand::Good);
     CHECK(reg(RateRatioInterval{3.0, 9.0}).deductions[3].points == Approx(12.0));
 
-    const double nan = std::numeric_limits<double>::quiet_NaN();
-    for (auto rr : {RateRatioInterval{5.0, 2.0}, RateRatioInterval{nan, 2.0},
-                    RateRatioInterval{-1.0, 2.0}}) {
+    for (auto rr : {RateRatioInterval{5.0, 2.0}, RateRatioInterval{kNaN, 2.0},
+                    RateRatioInterval{-1.0, 2.0}, RateRatioInterval{0.8, kNaN},
+                    RateRatioInterval{0.8, kInf}}) {
         auto r = reg(rr);
         CHECK_FALSE(r.deductions[3].assessed);
         CHECK(r.deductions[3].points == 0.0);
@@ -190,6 +217,12 @@ TEST_CASE("stability: rank flip under perturbed weights", "[dex][stability]") {
     CHECK(f->first == 0);
     CHECK(f->second == 1);
 
+    // Custom base: x outranks y under pert, so the default weights reverse it.
+    auto h = stability_rank_flip({x, y}, kFloor, kStabilityWeights, pert);
+    REQUIRE(h.has_value());
+    CHECK(h->first == 0);
+    CHECK(h->second == 1);
+
     CHECK_FALSE(stability_rank_flip({x, y}, kFloor, kStabilityWeights).has_value());
     CHECK_FALSE(stability_rank_flip({x, x}, kFloor, pert).has_value());
 
@@ -199,6 +232,5 @@ TEST_CASE("stability: rank flip under perturbed weights", "[dex][stability]") {
     CHECK(g->first == 1);
     CHECK(g->second == 2);
 
-    const double nan = std::numeric_limits<double>::quiet_NaN();
-    CHECK_FALSE(stability_rank_flip({x, y}, kFloor, {nan, 70, 8, 12}).has_value());
+    CHECK_FALSE(stability_rank_flip({x, y}, kFloor, {kNaN, 70, 8, 12}).has_value());
 }

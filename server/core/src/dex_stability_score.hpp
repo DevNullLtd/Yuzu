@@ -18,8 +18,8 @@
  *
  * - Breadth comes first: how many devices are hit matters more than how often
  *   one device is hit. Intensity is capped per device (cap = 5 events, the
- *   same "full severity at 5" the device score uses), so one crash-looping
- *   device cannot outweigh a widespread problem.
+ *   same "full severity at 5" the device score uses in dex_read_model.cpp),
+ *   so one crash-looping device cannot outweigh a widespread problem.
  * - The per-device cap is the CALLER's job: crash_events and hang_events must
  *   be sums of min(events_d, kPerDeviceEventCap) over devices. A sum above
  *   A * cap proves the cap was skipped, and is withheld as "inconsistent"
@@ -27,7 +27,15 @@
  * - Regression is assessed only when a rate-ratio interval against the
  *   previous version is supplied. It uses the interval's LOWER bound, so only
  *   a regression the data supports counts. An interval containing 1 or lying
- *   below 1 scores 0 points: an improving version earns no credit.
+ *   below 1 scores 0 points: an improving version earns no credit. Regression
+ *   takes its full weight at a 3x lower-bound rate ratio (kRegressionFullRatio);
+ *   2x takes half.
+ * - Bands: excellent >= 90, good >= 75, fair >= 60, else poor. These are the
+ *   same edges and labels as the device health band, so one vocabulary serves
+ *   both pages.
+ * - `floor` is the reporting-device minimum (callers pass kDexCohortFloor):
+ *   fewer devices withholds the score as below_floor rather than showing a
+ *   noisy number.
  * - Missing or contradictory data is withheld (score and band empty, `withheld`
  *   names why), never shown as 0 or 100.
  * - With the default weights (sum 100) every term lies in [0, 1] of its
@@ -42,6 +50,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <optional>
 #include <vector>
 
@@ -60,6 +69,8 @@ static_assert(kStabilityWeights.breadth + kStabilityWeights.crashes + kStability
                   100.0,
               "default weights must sum to 100");
 
+// Mirrors dex_read_model.cpp's function-local kCap (the same "full severity at
+// 5"); the two are kept in step by hand.
 inline constexpr std::int64_t kPerDeviceEventCap = 5;
 inline constexpr double kRegressionFullRatio = 3.0;
 inline constexpr double kBandExcellent = 90.0;
@@ -141,9 +152,9 @@ namespace stability_detail {
 
 /// Withheld reasons, checked in this order: no_population, invalid_weights,
 /// inconsistent, below_floor.
-[[nodiscard]] inline StabilityScore compute_stability_score(const StabilityInputs& in,
-                                                            std::int64_t floor,
-                                                            const StabilityWeights& w = kStabilityWeights) {
+[[nodiscard]] inline StabilityScore
+compute_stability_score(const StabilityInputs& in, std::int64_t floor,
+                        const StabilityWeights& w = kStabilityWeights) {
     const std::int64_t N = in.reporting_devices;
     const std::int64_t A = in.devices_affected;
     const std::int64_t crash = in.crash_events;
@@ -153,9 +164,13 @@ namespace stability_detail {
         return stability_detail::withheld_result("no_population");
     if (!stability_weights_valid(w))
         return stability_detail::withheld_result("invalid_weights");
-    if (A < 0 || crash < 0 || hang < 0 || A > N || crash > A * kPerDeviceEventCap ||
-        hang > A * kPerDeviceEventCap || A > crash + hang ||
-        (A == 0 && crash + hang > 0))
+    // Overflow-safe: above INT64_MAX / cap every representable count is under
+    // A * cap, so skipping the multiply is exact. After the non-negative checks
+    // A - crash cannot overflow.
+    const bool cap_checkable = A <= std::numeric_limits<std::int64_t>::max() / kPerDeviceEventCap;
+    if (A < 0 || crash < 0 || hang < 0 || A > N ||
+        (cap_checkable && (crash > A * kPerDeviceEventCap || hang > A * kPerDeviceEventCap)) ||
+        A - crash > hang || (A == 0 && (crash > 0 || hang > 0)))
         return stability_detail::withheld_result("inconsistent");
     if (N < floor)
         return stability_detail::withheld_result("below_floor");
