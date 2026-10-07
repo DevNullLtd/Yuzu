@@ -167,7 +167,7 @@ compute_stability_score(const StabilityInputs& in, std::int64_t floor,
     // Overflow-safe: above INT64_MAX / cap every representable count is under
     // A * cap, so skipping the multiply is exact. After the non-negative checks
     // A - crash cannot overflow.
-    const bool cap_checkable = A <= std::numeric_limits<std::int64_t>::max() / kPerDeviceEventCap;
+    const bool cap_checkable = A <= (std::numeric_limits<std::int64_t>::max)() / kPerDeviceEventCap;
     if (A < 0 || crash < 0 || hang < 0 || A > N ||
         (cap_checkable && (crash > A * kPerDeviceEventCap || hang > A * kPerDeviceEventCap)) ||
         A - crash > hang || (A == 0 && (crash > 0 || hang > 0)))
@@ -180,9 +180,9 @@ compute_stability_score(const StabilityInputs& in, std::int64_t floor,
     const double cap = static_cast<double>(kPerDeviceEventCap);
 
     StabilityScore r;
-    r.deductions.push_back({"breadth", w.breadth * a / n, true});
-    r.deductions.push_back({"crashes", w.crashes * static_cast<double>(crash) / (n * cap), true});
-    r.deductions.push_back({"hangs", w.hangs * static_cast<double>(hang) / (n * cap), true});
+    r.deductions.push_back({"breadth", w.breadth * (a / n), true});
+    r.deductions.push_back({"crashes", w.crashes * (static_cast<double>(crash) / (n * cap)), true});
+    r.deductions.push_back({"hangs", w.hangs * (static_cast<double>(hang) / (n * cap)), true});
 
     StabilityDeduction reg{"regression", 0.0, false};
     if (in.rate_ratio) {

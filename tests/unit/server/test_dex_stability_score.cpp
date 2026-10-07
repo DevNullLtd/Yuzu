@@ -146,6 +146,16 @@ TEST_CASE("stability: weight contract", "[dex][stability]") {
     CHECK(over.deductions[1].points == Approx(20.0));
 }
 
+TEST_CASE("stability: extreme finite weights never give an infinite row", "[dex][stability]") {
+    auto r = compute_stability_score(mk(1000, 1000, 5000, 5000), kFloor, {1e308, 1e308, 1e308, 0});
+    REQUIRE(r.score.has_value());
+    CHECK(*r.score == 0.0);
+    for (std::size_t i = 0; i < 3; ++i) {
+        CHECK(std::isfinite(r.deductions[i].points));
+        CHECK(r.deductions[i].points == Approx(1e308));
+    }
+}
+
 TEST_CASE("stability: hangs weigh less than crashes", "[dex][stability]") {
     auto c = compute_stability_score(mk(1000, 100, 300, 0), kFloor);
     auto h = compute_stability_score(mk(1000, 100, 0, 300), kFloor);
@@ -225,6 +235,11 @@ TEST_CASE("stability: rank flip under perturbed weights", "[dex][stability]") {
 
     CHECK_FALSE(stability_rank_flip({x, y}, kFloor, kStabilityWeights).has_value());
     CHECK_FALSE(stability_rank_flip({x, x}, kFloor, pert).has_value());
+
+    // One-sided ties: all-zero weights score every app 100. The strictly
+    // higher-scoring app comes first so a deleted tie guard would report a flip.
+    CHECK_FALSE(stability_rank_flip({y, x}, kFloor, {0, 0, 0, 0}).has_value());
+    CHECK_FALSE(stability_rank_flip({y, x}, kFloor, kStabilityWeights, {0, 0, 0, 0}).has_value());
 
     const StabilityInputs tiny = mk(5, 1, 1);
     auto g = stability_rank_flip({tiny, x, y}, kFloor, pert);
