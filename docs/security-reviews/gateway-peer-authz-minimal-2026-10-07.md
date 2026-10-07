@@ -25,24 +25,30 @@ What this record claims, and what it does not.
   earlier, larger design that was withdrawn as too complex to review (its relation to this one is
   under "What was left out"). Every finding they report is code-derived, not experimentally
   reproduced.
-- **Test runs.** Linux: the `[gateway_peer]` tests, 104 cases with 1909 assertions, and the full
-  server suite, 8824 cases (8821 passed, 3 skipped), at the code before the review-fix round.
-  macOS: the full test binary, 8830 cases (8825 passed, 5 skipped), and `[gateway_peer]`, 104
-  cases with 1907 assertions, at an earlier tip. Windows: `[gateway_peer]`, 104 cases with 1909
-  assertions. These counts predate the review-fix rounds, which add tests, so re-run before
-  quoting them; the final counts at the shipped tip are recorded in the governance run record committed with this change. [TO BE FILLED BY LEAD: counts]
-- **Installer.** `deploy/packaging/windows/yuzu-server.iss` was edited on a Linux host. It was then
-  compiled with Inno Setup 6.7.3 and silent-installed on a Windows 11 test host: about 55
-  silent-install cases (including upgrade, refusal and uninstall cases) plus server command-line
-  runs, at a pre-rebase tip, the installer file being unchanged between that run and the start of
-  the review-fix round. The review-fix round then edited the installer (the refusal of `/NOTLS`
-  together with a pin, the wizard-path refusal wording, header comments); those edits are not
-  covered by those runs. Not tested at all: starting the service under the Windows service
-  manager, because the server binary does not implement the service control protocol
-  (pre-existing; open issue #1835, "Windows server binary has the identical SCM control-protocol
-  defect as #1822 (agent)", which prevents the installed service from starting under the Windows
-  service manager), and the interactive wizard path. Install behaviour on macOS and Linux does not apply: the installer is
-  Windows-only.
+- **Test runs.** At the final tip (19 commits over `origin/dev` at `7d72de6d8`): Linux, `[gateway_peer]`
+  121 cases with 2502 assertions, and the full server suite with Postgres, 8866 cases (8863 passed,
+  3 skipped) with 165900 of 165900 assertions passing, plus the real-binary boot-refusal test
+  (60 of 60 checks) and the three sibling command-line shell tests (2, 11 and 3 checks passing).
+  macOS (arm64, Apple Clang): `[gateway_peer]` 121 cases (120 passed, 1 skipped because macOS has
+  no procfs) with 2498 assertions, the full test binary with Postgres 8872 cases (8866 passed, 6
+  skipped) with 165898 of 165898 assertions, and the boot-refusal test 60 of 60 on three
+  consecutive runs. Windows (MSVC): `[gateway_peer]` 121 cases with 2488 assertions and
+  `[default_certs]` 21 cases with 272 assertions, all passing (POSIX-only sections are not
+  compiled on Windows). Both Python gates pass on all three platforms. The alert rules were
+  checked with promtool on Linux only (the pinned container image); promtool was not available on
+  Windows. These runs are recorded in the governance run record committed with this change.
+- **Installer.** `deploy/packaging/windows/yuzu-server.iss` was edited on a Linux host. At the final
+  tip it was compiled with Inno Setup 6.7.3 and silent-installed on a Windows 11 test host:
+  34 of 34 silent-install cases (including upgrade, refusal and uninstall cases, the refusal of
+  `/NOTLS` together with a pin, and the wizard-path refusal wording, which is shared with the
+  silent path), plus eight direct runs of the server executable covering the new boot refusals.
+  An earlier run of about 55 cases covered the installer before the last edits. Not tested at all:
+  starting the service under the Windows service manager, because the server binary does not
+  implement the service control protocol (pre-existing; open issue #1835, "Windows server binary
+  has the identical SCM control-protocol defect as #1822 (agent)", which prevents the installed
+  service from starting under the Windows service manager), and the interactive wizard path
+  (only the shared refusal function was exercised, through the silent path). Install behaviour on
+  macOS and Linux does not apply: the installer is Windows-only.
 - **Citations.** Statements about existing code cite `origin/dev` at `056f01a20` by symbol. The
   line numbers in "The gap" were read at an earlier base and can be a few lines off (for example
   the `RegisterService` calls are at `server.cpp:8221` to `8228` on `056f01a20`). A reviewer should
