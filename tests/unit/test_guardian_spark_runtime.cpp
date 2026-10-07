@@ -15204,22 +15204,40 @@ TEST_CASE("#4045 R8: a throwing snapshot leaves staging exactly as it was",
     CHECK(rt->snapshot_staged_baselines().size() == 3); // the seam fires once
 }
 
-TEST_CASE("#4045 R9: an allocation failure while staging is a COUNTED drop and the commit "
-          "still happens",
+TEST_CASE("#4045 R9: an allocation failure while staging is a COUNTED drop and the capture is "
+          "NOT committed (the rule re-captures at its next evaluation and stages it then)",
           "[spark][runtime][baseline]") {
+    // Staging is fallible BEFORE the commit (governance Gate 8 SEC F-1): a capture that could
+    // be neither staged nor persisted must not become the live baseline, or the next full_sync
+    // or restart would re-baseline drifted content as compliant with nothing on record.
     auto r = std::make_shared<FakeReader>();
     auto b = std::make_shared<FakeBackend>();
     auto rt = make_rt(r, b);
     REQUIRE(rt->attach_rule("r1", file_spec("/a"), file_hash_rule("r1"), true));
     rt->fail_next_stage_baseline_for_test();
     rt->evaluate_key(spark_key(file_spec("/a")), EvalReason::Initial);
-    CHECK(rt->staged_baseline_count_for_test() == 0); // the capture is gone...
+    CHECK(rt->staged_baseline_count_for_test() == 0); // staging failed...
     CHECK(rt->staged_baseline_drops() == 1);          // ...and it is counted, never silent
-    // The rule's own verdict was committed regardless (the compliant edge is on the outbox).
+    // The rule's own verdict was still committed (the compliant edge is on the outbox).
     bool compliant = false;
     for (const auto& e : drain_all(*rt))
         compliant = compliant || (e.domain == OutboxDomain::Compliance && e.drift.compliant);
     CHECK(compliant);
+
+    // ...but the BASELINE was not: the next evaluation captures again and this time it stages.
+    // (Before the fix the baseline had been committed, so the capture edge never fired again
+    // and the rule ran on a baseline that was neither staged nor durable.)
+    rt->evaluate_key(spark_key(file_spec("/a")), EvalReason::Event);
+    {
+        const auto again = rt->snapshot_staged_baselines();
+        REQUIRE(again.size() == 1);
+        CHECK(same_capture(again[0], "r1", "/a", "h"));
+    }
+    CHECK(rt->staged_baseline_drops() == 1); // the retry staged cleanly: no second drop
+    // And once staged the baseline is committed like any other: no further capture edge.
+    rt->erase_staged_baselines_if_unchanged(rt->snapshot_staged_baselines());
+    rt->evaluate_key(spark_key(file_spec("/a")), EvalReason::Convergence);
+    CHECK(rt->snapshot_staged_baselines().empty());
 
     // stage_baseline_for_test goes through the same rule (first capture wins on one path).
     rt->stage_baseline_for_test("r2", "/x", "h1");

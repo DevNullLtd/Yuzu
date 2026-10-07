@@ -4196,11 +4196,22 @@ void GuardianSparkRuntime::evaluate_key(const std::string& key, EvalReason reaso
             // `accepted` check and before the commit so the persisted hash is always the hash the
             // live RuleEvalState committed: a rejected enqueue leaves scratch uncommitted and the
             // next pass re-captures. `spec` is the local copy; std::get is safe because is_file.
+            //
+            // Staging is FALLIBLE BEFORE the commit (Gate 8 SEC F-1): if the capture cannot be
+            // staged (allocation failure, counted) the baseline is NOT committed. Committing it
+            // anyway would leave a live baseline that is neither staged nor durable, and the next
+            // full_sync or restart would re-baseline drifted content as compliant. The rest of
+            // the scratch (the verdict, the emit state) still commits, so the compliant edge that
+            // was just enqueued is not re-emitted; the next evaluation simply captures again, and
+            // `!rg->eval.baseline_set` makes that a fresh capture edge that stages again.
             if (is_file && rg->assertion.kind == AssertionKind::FileHashEquals &&
-                scratch.baseline_set && !rg->eval.baseline_set)
-                stage_baseline_locked(rg->assertion.rule_id,
-                                      std::get<FileSparkParams>(spec.params).path,
-                                      scratch.baseline_hash);
+                scratch.baseline_set && !rg->eval.baseline_set &&
+                !stage_baseline_locked(rg->assertion.rule_id,
+                                       std::get<FileSparkParams>(spec.params).path,
+                                       scratch.baseline_hash)) {
+                scratch.baseline_set = false;
+                scratch.baseline_hash.clear();
+            }
 
             rg->eval = std::move(scratch); // COMMIT
             // M1: every committed repeat Unknown is counted on exactly one of these two
@@ -4479,7 +4490,7 @@ GuardianSparkRuntime::PendingSnapshot GuardianSparkRuntime::snapshot_pending() c
 
 // #4045: staged baseline captures. The runtime only STAGES (no I/O, no KvStore); the
 // engine-owned GuardianBaselinePersister drains via snapshot/erase-if-unchanged (header block).
-void GuardianSparkRuntime::stage_baseline_locked(const std::string& rule_id, const std::string& path,
+bool GuardianSparkRuntime::stage_baseline_locked(const std::string& rule_id, const std::string& path,
                                                  const std::string& hash) noexcept {
     try {
         if (fail_next_stage_baseline_.exchange(false, std::memory_order_relaxed))
@@ -4496,11 +4507,16 @@ void GuardianSparkRuntime::stage_baseline_locked(const std::string& rule_id, con
                 it->second = std::move(replacement);
                 staged_baseline_drops_->fetch_add(1, std::memory_order_relaxed);
             }
-            return;
+            return true;
         }
         staged_baselines_.emplace(rule_id, CapturedBaseline{rule_id, path, hash});
-    } catch (...) { // bad_alloc: a counted drop, never a throw out of the commit section
+        return true;
+    } catch (...) {
+        // bad_alloc: counted, and reported to the caller, which must NOT commit the baseline
+        // this capture established (evaluate_key clears it, so the rule re-captures at its next
+        // evaluation). Never a throw out of the commit section.
         staged_baseline_drops_->fetch_add(1, std::memory_order_relaxed);
+        return false;
     }
 }
 
@@ -4518,6 +4534,8 @@ GuardianSparkRuntime::snapshot_staged_baselines() const {
             std::lock_guard<std::mutex> lk{registry_mu_};
             want = staged_baselines_.size();
         }
+        if (want == 0)
+            return out; // a valid snapshot of the empty instant: one lock take, no allocation
         out.reserve(want + 8); // slack: a capture staged between the two holds
         std::lock_guard<std::mutex> lk{registry_mu_};
         if (staged_baselines_.size() > out.capacity())

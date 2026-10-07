@@ -629,7 +629,8 @@ public:
     void stage_baseline_for_test(const std::string& rule_id, const std::string& path,
                                  const std::string& hash);
     /// TEST-ONLY: make the next stage_baseline_locked allocation-failure path fire once (the
-    /// capture is dropped and counted). No production caller.
+    /// capture is not staged, so evaluate_key does not commit its baseline, and the failure is
+    /// counted). No production caller.
     void fail_next_stage_baseline_for_test() noexcept {
         fail_next_stage_baseline_.store(true, std::memory_order_relaxed);
     }
@@ -641,9 +642,11 @@ public:
     /// True iff at least one capture is staged (registry_mu_ standalone). The persister's
     /// no-store branch uses it to count a capture that has nowhere to go.
     [[nodiscard]] bool has_staged_baselines() const;
-    /// Captures DROPPED from staging: an allocation failure while staging, or a retarget that
-    /// replaced a still-unpersisted capture of another path (that capture is gone; legacy
-    /// loses it on any failed write too, with no retry). GuardianBaselinePersister reads this
+    /// Captures that did not reach staging or were displaced from it: an allocation failure
+    /// while staging (the baseline is then NOT committed and the rule re-captures at its next
+    /// evaluation, so nothing is left live-but-undurable), or a retarget that replaced a
+    /// still-unpersisted capture of another path (that capture is gone; legacy loses it on any
+    /// failed write too, with no retry). GuardianBaselinePersister reads this
     /// through staged_baseline_drops_source() so the heartbeat getter needs no runtime lock.
     /// A retarget landing in the instant between a capture's write and its erase also counts:
     /// the count is an upper bound on lost captures, never an under-count.
@@ -2576,9 +2579,11 @@ private:
     std::atomic<bool> fail_next_stage_baseline_{false}; ///< TEST-ONLY allocation-failure seam
     mutable std::atomic<bool> fail_next_snapshot_{false}; ///< TEST-ONLY snapshot-throw seam
     /// registry_mu_ held. First capture wins on one path; a different path (a retarget)
-    /// replaces the unpersisted capture and counts a drop. Never throws: an allocation failure
-    /// is a counted drop, so a throw cannot split evaluate_key's enqueue from its commit.
-    void stage_baseline_locked(const std::string& rule_id, const std::string& path,
+    /// replaces the unpersisted capture and counts a drop. Never throws, so a throw cannot split
+    /// evaluate_key's enqueue from its commit. Returns false iff the capture could NOT be staged
+    /// (an allocation failure, counted as a drop): the caller must then not commit the baseline
+    /// that capture established, or it would be neither staged nor durable.
+    bool stage_baseline_locked(const std::string& rule_id, const std::string& path,
                                const std::string& hash) noexcept;
     std::unique_ptr<SparkKeyRuleIndex> index_;                          // key <-> rule fan-out + refcount
     std::unordered_map<std::string, std::shared_ptr<RuleGeneration>> rules_; // rule_id -> generation
