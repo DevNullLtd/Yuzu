@@ -24,7 +24,9 @@ amends: >-
   of ADR-0015 Amendment 1 and of ADR-0020 (which capture sources ship off). Amends ADR-0016
   (the start-up flag stops being the collection toggle) and ADR-0021 Decision 11 with the Spark
   rollback ruling (the start-up flag stops being the only rollback lever). Departs from the
-  2026-09-04 ruling that a default-on change applies at upgrade.
+  2026-09-04 ruling in two ways: a default-on change no longer applies at upgrade (D9), and the
+  look-back control, to which that ruling moved the opt-in reasoning, runs by default for
+  the sources that ship off today (D3).
 related: ["3005-plugin-config-store", "0015-tar-arp-dns-capture-sources", "0020-tar-netqual-windows-retrospective", "0016-agent-daily-sync-framework", "0021-spark-reflex-architecture"]
 context-refs: ["#5294", "#5355", "#5371", "#5372", "#5373", "#5374", "#5375", "#4867", "#4915", "#4975", "#5057", "docs/yuzu-guardian-design-v1.1.md", "docs/asset-tagging-guide.md", "docs/tar-implementer.md"]
 ---
@@ -140,12 +142,22 @@ practice is accepted; existing behaviour is retrofitted to match.
 - **Pending** — the server's desired state is newer than the agent's effective state.
 - **Not installed** — the unit's code is not on the endpoint. Different from off.
 - **Not applicable** — the unit does not exist for that operating system.
+- **Off by starting state** — off because the install carried it, or because an upgraded agent's
+  existing flags say so, before the server has adopted it as a rule (D8, D9).
+- **Not covered** — a unit that the state an agent holds does not cover, which the agent keeps
+  off until a state that covers it arrives (D10).
+- **Usage class** — the capture sources that record what users do on the endpoint, such as the
+  use of applications, DNS lookups, connections and mapped drives. The enablement catalogue
+  assigns every source to a class (D8).
+- **Unknown** — the reason shown when state is lost or cannot be read (D13, D14).
+- **Provider fault** — an attribute provider cannot be read (D14).
 - **Awaiting decision** — a unit that arrived in a release and is held off until the customer
   decides. It is held by the additions setting, not by an off-rule.
 - **Additions setting** — the one fleet-level setting that says whether a unit added by a
   release arrives on or awaiting decision (D10).
 - **Protective state** — a state that an action has put an endpoint into so that it stays
   contained or protected until the state is lifted, such as the network containment of a device.
+  Starting a protective state is a unit; everything done to one already in force is not (D3).
 - **Control channel** — what the model itself rides on: registration, delivery of state,
   delivery of updates, and signature verification. It is not a unit.
 - **Failed to load** — a plugin's code is on the endpoint and the agent refused to load it.
@@ -187,7 +199,9 @@ must never be argued as one.
 
 The new defaults are delivered only together with what makes them safe: enforcement on the
 endpoint (D6, D7), the choice at deployment (D8) and carry-over for existing installations
-(D9). No release ships a default of on ahead of any of them.
+(D9). No release ships a default of on ahead of any of them. Until enforcement, the choice at
+deployment and carry-over are all delivered, the defaults, invariants and rulings in force
+today govern every unit, including one added in the interim.
 
 *Rejected:* keeping some categories off inside an otherwise-on product. It is a defensible
 position, but it leaves the customer to discover which things are in which category, and it is
@@ -209,15 +223,29 @@ actions) and requirements (one unit needs another).
   that operating system's view, not shown as off.
 - Reading history from before a source was switched on is a unit of its own (a *look-back*),
   on by default like everything else and switched off in the same way. It applies to a source's
-  first baseline on an endpoint (D7), and this ADR does not change how far back it reads.
-- A rule cannot switch off a unit that supplies a fact its own selector reads. Otherwise the
-  rule could never be released.
-- Off stops new protective action. Lifting, inspecting or repairing a protective state that is
-  already in force — releasing a contained device is the case that matters — is never a unit,
-  and neither is the control channel. An off-rule that would stop a protective state being
-  re-applied is shown in the preview (D11), and the endpoint reports why.
+  first baseline on an endpoint (D7), and this ADR does not change how far back it reads. That
+  includes the sources that ship off today, whose look-back therefore runs by default on new
+  installations; this departs from the 2026-09-04 ruling, which moved the opt-in reasoning onto
+  the look-back control, and it is why D8 delivers a preset that keeps those sources off.
+- A rule is refused at authoring if it would switch off a unit that supplies a fact read by a
+  rule that switches that unit off. The catalogue records which unit supplies each provider's
+  facts, so this is checked when the rule is written, through containment, requirements and
+  other rules alike. Rules adopted from an install or carried over are not refused; they are
+  shown with the latching they cause. A supplier that is off, absent or lost leaves its facts
+  stale (D5), shown with their age.
+- Whether a protective action starts something or acts on something already in force is decided
+  from the record of the protective state, not from the name of the action. Everything done to
+  a state that is already recorded — lifting it, inspecting it, repairing it and re-applying
+  it, such as re-isolating a contained device when it reconnects — is outside the unit model
+  and is never switched off. These are the actions the product's containment gate already
+  exempts, and widening that set is a security decision. An action that would start a
+  protective state where none is recorded is a unit like any other, and is refused before the
+  record is written. The control channel is likewise not a unit.
+- For the Spark engine, off means the engine is not used and the existing detection path
+  carries on; it never means no detection. Each rule stays armed in at most one path.
 - Retention and purge of what a unit stored are not work of that unit. They carry on when the
-  unit is off or not installed (D7).
+  unit is off, and where the plugin that owns the store is not installed the agent itself
+  carries them out (D7).
 
 The existing start-up flags (inventory, DEX, Spark) become one-time starting-state inputs, and so
 do the capture flags each agent already holds (D9). They seed the endpoint's starting state, the
@@ -262,8 +290,11 @@ reported as *undetermined* rather than as a decision.
 
 A fact is unknown only until its provider has reported. A provider that has answered "none" —
 no tag is set, no such application is installed — has answered. A fact that was known and has
-gone stale keeps its last value, shown with its age. A provider that cannot be read is a fault
-in the control plane (D13, D14), never "undetermined" and never "does not match".
+gone stale keeps its last value, shown with its age. A provider that cannot be read is treated
+like a stale one: the facts it has already supplied keep their last value, kept with the rest
+of the durable state (D6), and the facts it has not yet supplied stay unknown. The fault is
+reported as a provider fault (D13, D14), never as an operator's decision, and it does not
+refuse dispatch (D14).
 
 *Rejected:* a fixed list of criteria (it cannot be extended without changing the product); a
 separate selector language for enablement (two languages to learn and keep
@@ -279,7 +310,9 @@ versioned desired state — the same pattern Guardian rules already use, with on
 endpoint rather than Guardian's single fleet-wide counter. The agent stores it, enforces it and
 reports the version it is enforcing.
 
-- A unit runs only where both the server and the agent say it is on.
+- A unit runs only where both the server and the agent say it is on. What the agent says is
+  the state it has adopted from the server, or its starting state before it has any; it is
+  never a separate local veto.
 - The agent's reported state is what the server records as enforced.
 - While the agent is behind, the server shows the endpoint as *pending*, with its age.
 - An agent too old to enforce is shown as *enforced at the server only*. It is never reported as
@@ -289,7 +322,8 @@ reports the version it is enforcing.
   already running, or one that cannot be undone, completed under the earlier state (D7). For a
   daily-sync source the refusal is acknowledged and does not ask the agent for a full resend.
 - Every server replica answers from the same durable desired state, never from its own memory,
-  and the server reports itself not ready while it cannot read it.
+  and the server reports itself not ready to take new work while it cannot read it, while still
+  answering agents as D14 requires.
 - An agent that reconnects reports the version it holds, and one that already holds the current
   version is sent nothing. Full state is delivered at a pace the server sets and the agent
   jitters, and delivery cannot starve the read that dispatch depends on.
@@ -313,8 +347,11 @@ be undone completes and is recorded as having run under the earlier state.
 
 What the unit already stored on the endpoint stays readable and keeps expiring under its normal
 retention period, so it is gone within one period with no further action. Retention is
-housekeeping, not work of the unit: it carries on while the unit is off or not installed, and an
-agent whose state is lost prunes nothing until it has state again. For a daily-sync source the
+housekeeping, not work of the unit: it carries on while the unit is off or not installed, and the
+agent itself, not the plugin, expires what a plugin that is not installed left behind. The one
+exception is an agent whose state is lost, which prunes nothing for any switchable unit until
+it has state again: it
+cannot tell what the customer switched off, and expiry cannot be undone. For a daily-sync source the
 stored data is the central copy, which is kept and marked as not collected since the switch-off;
 an off source is reported as off, never as stale or silent.
 
@@ -344,21 +381,29 @@ at two points:
   before it has spoken to the server.
 
 The two are one choice. The server can export its current off-rules as the starting state an
-install or enrolment carries, so a customer decides once. An agent installed without a starting
-state runs the shipped-on units until its first contact with the server, which is why a customer
-who needs a unit never to run carries the starting state.
+install or enrolment carries, so a customer decides once. An exported starting state refers to
+the server's rules rather than copying them. A reference binds only when the enrolment that
+carried it was issued by the server: it then attaches the endpoint to the rule as the rule
+stands at adoption, and if the rule has since been deleted the exported content is adopted as a
+rule of its own, so that a unit the customer kept off is never silently dropped. Any other
+starting state is adopted as a rule that covers only the endpoint that presented it. An agent
+installed without a starting state runs the shipped-on units until it first receives state from
+the server, which is why a customer who needs a unit never to run carries the starting state.
+
+At least one preset ships with this decision: the one that keeps off every source in the usage
+class, which is the sources that record what users do on the endpoint, and the catalogue
+assigns each source that ships off today to a class. It is how a customer deploys with those
+sources off from the first second. Further presets remain open.
 
 Every route by which an agent is installed or enrolled can carry a starting state; a route that
 cannot is a defect against this ADR.
 
 A starting state does not lapse at first contact. The server adopts it as an ordinary, visible
 off-rule marked as carried from the install, and from then on the server is the single
-authority; undoing it is an ordinary switch-on. Adoption happens once, at the agent's first
-contact with a server that runs this model. The
-adopted rule covers the endpoint that presented it, can only switch units off, is labelled as
-asserted by the install, and never overrides an operator's rule; only an enrolment the server
-itself issued can carry a rule for more than one endpoint. A restart never adopts it again, so
-once the operator has removed the rule the unit stays on.
+authority; undoing it is an ordinary switch-on. Adoption happens once, at the first contact at
+which the server can adopt it. An adopted rule can only switch units off, is labelled as
+asserted by the install, and never overrides an operator's rule. A restart never adopts it
+again, so once the operator has removed the rule the unit stays on.
 
 Switching things off on a live fleet remains available. It is the second way to do it, not the
 only one.
@@ -380,13 +425,29 @@ collection a release widens, is not a change to an existing unit; it is governed
 Carry-over is of each endpoint's actual state, not of the shipped defaults. The server does not
 hold the state of capture sources that operators have set on individual agents, so it is taken
 from the agent itself: on its first run as an agent that enforces state, the agent's existing
-flags are its starting state, and the server adopts them through the path D8 describes. Until an
-endpoint has done so it is left exactly as it was, and the server shows how many endpoints have
-not yet been carried over. An endpoint that is reimaged or enrolled again is a new installation
-and gets the shipped default, unless its install carries a starting state or a rule selects it.
-Enablement state written by a newer version is tolerated by an older one, and a server replica
-still on the older version never dispatches on a view weaker than the one an agent holds. Going
-back to the previous mechanism stays possible until carry-over has completed.
+flags are its starting state, and the server adopts them through the path D8 describes. If the
+agent cannot read its existing flags, that is lost state (D14), never an empty set of flags.
+Until an endpoint has been carried over it is left exactly as it was, and the server shows how
+many of the endpoints it has seen recently have not yet been carried over.
+
+An endpoint is identified by its agent identifier: the one pinned at install if there is one,
+otherwise the one generated at first run. An installation is new when the first run finds no
+earlier agent record on the endpoint. An endpoint that keeps its identifier through a reimage
+and has lost its state is a lost-state case (D14); one that comes back with a new identifier is
+a new installation, even from an older image, and gets the shipped default unless its install
+carries a starting state or a rule selects it. The record of the old identifier is retired after
+a stated period without contact, so that it does not hold the carry-over count above zero.
+Rules adopted from an install are bound to the identifier that presented them.
+
+Enablement state written by a newer version is tolerated by an older one. What stops an older
+server replica undoing a newer one's switch-off is the agent, not the replica: the agent never
+adopts a state older than the one it holds. States are ordered by a generation that changes
+whenever the server's enablement store is restored or rebuilt, and then by a counter within it,
+so a state issued after an operator has resolved a regression (D14) is newer than every state
+issued before it. Going back to the previous mechanism stays possible until carry-over has
+completed. Going back writes each endpoint's adopted switch-offs back as its own flags and makes
+those flags authoritative again for agents that hold adopted state, so nothing switched off is
+lost.
 
 This departs from the 2026-09-04 ruling, under which a move to default-on applied at upgrade.
 The reason is the same one behind D8: collection must not begin on a customer's endpoints
@@ -404,9 +465,10 @@ an existing unit collects, or brings a unit to a new operating system, counts as
 Every release states what it adds.
 
 This is the one way an upgrade can start something, and only for a customer who has left the
-setting on and been told what the release adds. The release that introduces this model is the
-exception: no customer has yet been able to set the setting, so what it adds to an existing
-installation arrives awaiting decision.
+setting on and been told what the release adds. The first release in which the setting exists
+is the exception: until then no customer has been able to set it, so what that release adds to
+an existing installation arrives awaiting decision, and before it no release adds a unit that
+runs by default (D2).
 
 - Switching the setting from off to on never switches on a unit that is awaiting decision; each
   stays held until it is accepted.
@@ -415,7 +477,10 @@ installation arrives awaiting decision.
 - State covers a stated catalogue. Once an agent holds state, it runs a unit it knows only if
   that state covers it, and holds any other until a state that covers it arrives, so a unit
   newer than the server that resolved the state is never on by omission. Before it holds any
-  state, an agent runs the shipped defaults of its own catalogue, or its starting state.
+  state, a newly installed agent runs the shipped defaults of its catalogue, or its starting
+  state. An agent upgraded from before this model runs only the units that were in its
+  catalogue before the upgrade, with its existing flags as its starting state, and holds any
+  unit the release adds until state covers it.
 
 *Rejected:* additions always on (every upgrade could widen collection with no customer
 action); and plugins on but new capture sources off (two defaults to explain again).
@@ -429,20 +494,26 @@ as changing plugin configuration does today. Reading enablement state follows th
 existing read gating.
 
 Every change is audited, and an operator's change that cannot be audited is refused. The record
-names the account and the surface it came through, the units, the selector and the number of
-endpoints it resolved to, what changed from and to, when, the reason the operator gave, and what
-the preview showed. Changes that no operator made — carry-over, adoption of an install's
-starting state, additions, a change that follows an attribute (D12), lost state — are recorded
-with the system as the actor and a link to the event that caused them. If one of those cannot be
-audited, it resolves toward less collection and never silently toward more. The history of
-rules, of attribute-driven changes and of the state version each endpoint adopted is kept at
-least as long as the audit trail, so that "what was this endpoint set to collect on that date"
-can be answered.
+names the account and the surface it came through, the units, the selector, what changed from
+and to, when, the reason the operator gave, and a reference to what the preview showed, which
+is kept as long as the audit trail. The number of endpoints the change resolved to follows as a
+linked system record from the process that resolves it (D15), with an outcome of pending,
+complete, failed or superseded, so that resolution never has to happen inside the operator's
+request. Changes that no operator made — carry-over, a return to the previous mechanism,
+adoption of an install's starting state, additions, a change that follows an attribute (D12),
+lost state — are recorded with the system as the actor and a link to the event that caused
+them. If one of those cannot be audited, it resolves toward less collection and never silently
+toward more. The history of rules, of attribute-driven changes and of the state version each
+endpoint adopted is kept at least as long as the audit trail, so that "what was this endpoint
+set to collect on that date" can be answered.
 
-Before a change that switches something on, or that deletes stored data, is applied, the
-operator is shown what will turn on or be deleted, and where, and the change applies the set
-that was shown or is shown again. The preview also lists any protective state that an off-rule
-would stop being re-applied (D3).
+Before a change that switches something on, that deletes stored data, or that switches off an
+engine or a unit that starts a protective action, is applied, the operator is shown what will
+turn on, be deleted or stop, and where, and the change applies the set that was shown or is
+shown again. This preview takes the place of the staged-then-push step that capture-source
+toggles have today. The switch-off preview is a view of reach, not an approval: one account can
+still switch such a unit off fleet-wide. That is an accepted residual, and it is audited under
+an action of its own so that it can be alerted on.
 
 Deleting stored data is not an enablement change. It is the existing destructive action, with
 its own permission, its own targeting rules and its own confirmation, and the enablement
@@ -472,12 +543,14 @@ holding such changes for review (a queue nobody could keep up with at fleet size
 ### D13 — Every answer explains itself
 
 For any unit on any endpoint the product can say what its state is, why, and which rules bear on
-it. The reason comes from a closed list: on by default, off by rule, off because a requirement
-is off, undetermined, not installed, failed to load, not applicable, awaiting decision.
-Alongside the reason the answer carries any status that applies: pending, enforced at the server
-only, state lost, control plane unavailable. Because off-rules combine, the answer lists every
-matching rule with its provenance rather than naming a single deciding one. A fault in the
-control plane is always reported as a fault and never as an operator's decision.
+it. The reason comes from a closed list: on by default, off by rule, off by starting state, off
+because a requirement is off, undetermined, not covered by the state, unknown, not installed,
+failed to load, not applicable, awaiting decision. Unknown means the state is lost or cannot be
+read. Alongside the reason the answer carries any status that applies: pending, enforced at the
+server only, state lost, control plane unavailable, provider fault. Because off-rules combine,
+the answer lists every matching rule with its provenance rather than naming a single deciding
+one. A fault in the control plane is always reported as a fault and never as an operator's
+decision.
 
 The same answers are available in aggregate: counts by reason, unit class and operating system,
 and how many endpoints are pending and for how long, split by connected and offline. Everything
@@ -491,26 +564,41 @@ action came to read as "permission denied".
 
 ### D14 — Failure directions are fixed
 
-- If the server cannot read its own enablement state, it refuses to dispatch any unit, pushes no
-  partial state and says the control plane is unavailable. Recovering a protective state (D3)
-  does not depend on that state and is not refused. The refusal is a retryable cause: it uses up
-  no schedule, approval or retry budget, and data refused for that reason is retried later,
-  neither dropped nor answered with a request for a full resend. An agent that holds no state
-  and reaches the server in this condition is told so and runs no switchable unit until it has
-  state.
+- If the server cannot read its own enablement state, it stops dispatching any unit, pushes no
+  partial state and says the control plane is unavailable; it still answers agents, so that
+  they can be told. Starting a protective state is refused like any other unit. Everything done
+  to a protective state that is already recorded (D3) does not depend on enablement state and
+  is not refused. The refusal is a retryable cause: it uses up no schedule, approval or retry
+  budget, and data refused for that reason is retried later, neither dropped nor answered with
+  a request for a full resend. An agent that holds no state and reaches the server in this
+  condition is told so and runs no switchable unit until it has state; an agent upgraded from
+  before this model keeps running its pre-upgrade units on its existing flags (D9).
+- If an attribute provider cannot be read, dispatch is not refused and nothing is pushed for
+  it beyond the fault. The facts it has already supplied keep their last value, and the facts
+  it has not yet supplied leave the selector undetermined, so the unit stays off (D5). The
+  fault is reported as a provider fault. Only a failure of the server's own enablement state
+  stops dispatch.
 - If an agent cannot reach the server, it keeps enforcing the last state it had.
 - An agent that has received state from the server has held state. It records that fact with its
   enrolment, and the server records it too, so that the fact survives anything that happens to
   the agent's state files. It keeps a second durable copy of the last state it adopted. If it
   cannot read either copy, whether they are damaged or missing, it does not fall back to
   everything on: it runs no switchable unit until it has the full state from the server again,
-  reports that its state was lost, and asks for it. Only an agent that has never received state
-  uses its starting state, which for an agent upgraded from before this model is its existing
-  flags (D9).
+  reports that its state was lost, and asks for it. An agent upgraded from before this model
+  that cannot read its existing flags before first contact is in the same position. Only an
+  agent that has never received state uses its starting state, which for an agent upgraded from
+  before this model is its existing flags (D9).
 - A server whose enablement state is behind what its agents report — restored from an older
   backup, or rebuilt empty while enrolled agents hold newer state — switches nothing on, says
-  that the store has regressed, and waits for an operator's decision. It never pushes a weaker
-  view over a stronger one. The enablement state is part of what the server backs up.
+  that the store has regressed, and waits for an operator's decision. A state is weaker than
+  another for an endpoint when it leaves on a unit the other has off. Where the server cannot
+  compare, because an endpoint has reported no state or neither state is weaker than the other,
+  it treats that endpoint as needing the decision. While the decision is pending the server
+  dispatches, for each endpoint, on whichever view leaves fewer units on, pushes nothing, and an
+  agent that has lost its state stays quiet until the decision is made. The operator chooses
+  between restoring the store from a newer backup and accepting the regressed state, which is
+  previewed as any switch-on and starts a new generation (D9). The enablement state is part of
+  what the server backs up.
 
 An endpoint that stays offline for a long time therefore keeps doing what was last on, and a
 switch-off made in the meantime does not reach it until it reconnects. This is accepted and
@@ -595,9 +683,10 @@ point for the roadmap, which decides order and grouping.
 - Capture-source flags held only on each agent, changed only by instruction.
 - The freeze on expiry when a capture source is disabled.
 - The three all-or-nothing agent start-up flags.
-- The agent's engines (Spark and the activity recorder): a runtime way to arm and disarm them
-  that does not use the engine's sticky stop, and the amended rulings for their start-up flags
-  (ADR-0016, ADR-0021).
+- The Spark engine: a runtime way to arm and disarm it that does not use the engine's sticky
+  stop, and the amended rulings for the start-up flags (ADR-0016, ADR-0021).
+- The agent's own expiry of what a plugin that is not installed left behind, which today only
+  that plugin performs.
 - The Windows installer's fixed set of plugins and its missing plugins (custom and minimal
   installs stay a supported choice, D1); plugin retirement on every platform.
 - The scope language: new attributes for address and installed application; a registry of
@@ -622,7 +711,7 @@ point for the roadmap, which decides order and grouping.
 | A later release quietly adds collection | D10: the customer's setting decides, and each release states what it adds |
 | A source that is on reads history from before it was switched on | D3: look-back is its own unit and can be off from the start |
 | A switch-off that is not real | D6 and D7: enforced on the endpoint as soon as the agent adopts the state |
-| A switch-off strands a protected device, or removes the means to switch back on | D3: recovering a protective state and the control channel are never units |
+| A switch-off strands a protected device, or removes the means to switch back on | D3: everything done to a protective state already in force, and the control channel, are never units |
 | A restored or lost state turns back on what the customer had switched off | D14: a regressed store switches nothing on; an agent that has lost state runs nothing until it is resynchronised |
 | Nobody can show what an endpoint collects and why | D13 and the enablement catalogue |
 
@@ -645,12 +734,24 @@ plugins (#5057) is closed first.
 - An agent whose state is lost while it cannot reach the server stays quiet until it reconnects.
 - An agent too old to enforce state keeps doing its own work after a switch-off; it is shown as
   enforced at the server only.
-- An agent installed without a starting state runs the shipped-on units until it first contacts
-  the server.
+- An agent installed without a starting state runs the shipped-on units until it first receives
+  state from the server.
+- A switch-off of a unit that starts a protective action follows the same rules as one that
+  stops collection, including an undetermined selector, an attribute change and the audit
+  outage rule. The preview and the audit trail are the safeguards.
+- A fact that has gone stale keeps its last value, so a rule that depends on the absence of
+  something, such as a tag, can hold a unit on after the fact has changed, until the provider
+  reports again.
 - Switching a unit off starts the expiry of what it stored, whoever or whatever caused the
   switch-off, including a change that follows an attribute and an undetermined selector. There
   is no hold: where evidence must be kept, it is exported or protected before the switch-off.
 - While audit is unavailable no operator can change enablement, in either direction.
+- One privileged account can switch off an engine or a protective unit fleet-wide. The preview
+  shows the reach and the change is audited; no second person approves it (D11).
+- An endpoint can bring a unit on or off by changing an attribute it controls, such as
+  installing or removing an application. That is accepted as what targeting by attribute means
+  (D12), and it is also a way for someone with control of an endpoint to affect what is
+  collected from it. It is audited, not prevented.
 - Delegated administration by management group is not yet possible (see the open questions).
 - Until the retrofit completes, old and new mechanisms coexist. The roadmap must keep the
   period in which both exist short and must not ship the new defaults ahead of the controls D2
@@ -682,21 +783,24 @@ The decision is being followed when all of the following are true.
 8. A new kind of selector can be added by registering an attribute provider, with no change to
    the rules.
 9. Every change to enablement appears in the audit trail with the account and surface, the
-   units, the selector and the number of endpoints, what changed, the reason and the preview; an
-   operator's change that cannot be audited does not happen, and one that no operator made and
-   that cannot be audited resolves toward less collection.
-10. Enablement behaves the same at any fleet size.
+   units, the selector, what changed, the reason and a reference to the preview, and the number
+   of endpoints follows as a linked record with an outcome; an operator's change that cannot be
+   audited does not happen, and one that no operator made and that cannot be audited resolves
+   toward less collection.
+10. No enablement operation refuses or fails because of the number of endpoints, and the cost
+    of a change grows with the endpoints it affects, not with the size of the fleet.
 11. A plugin left out at install stays out across upgrades and is shown as not installed.
-12. After a source is switched off its stored rows keep expiring under normal retention, and
-    deleting them is a separate, audited act.
+12. After a source is switched off, or its plugin is not installed, its stored rows keep
+    expiring under normal retention, and deleting them is a separate, audited act.
 13. With the additions setting off, a unit added by a release is listed as awaiting decision and
     does not run.
 14. An account holding the enablement permission changes enablement directly, on or off, with no
     second approver.
 15. A unit that comes on or goes off because an endpoint's attribute changed is audited with
     the endpoint, the unit, the attribute and where the attribute came from.
-16. A device in a protective state can always be released, whatever the enablement state says,
-    and the control channel is never off.
+16. Everything done to a device already in a protective state — release, inspection, repair,
+    re-isolation on reconnect — works whatever the enablement state says, and the control
+    channel is never off.
 17. An agent that has held state and whose stored state is missing behaves as an agent that has
     lost state. A server whose store is behind what its agents report switches nothing on and
     says so.
@@ -708,6 +812,23 @@ The decision is being followed when all of the following are true.
     choice and carry-over.
 21. The history of rules, attribute-driven changes and adopted state versions is kept at least
     as long as the audit trail.
+22. An endpoint whose state is behind the server's shows as pending with its age, and an agent
+    too old to enforce state shows as enforced at the server only; neither is shown as off.
+23. When the server cannot read its own enablement state it refuses dispatch with a retryable
+    cause, and when only an attribute provider cannot be read it stops no dispatch on that
+    account and reports a provider fault.
+24. A rule that would switch off a unit that supplies a fact read by a rule switching it off is
+    refused when it is written.
+25. Resolving a change that affects many endpoints runs as a paced job outside the operator's
+    request, and the operator's audit record does not wait for it.
+26. An agent upgraded from before this model runs no unit that was not in its catalogue before
+    the upgrade until state covers it.
+27. A preset that keeps off every usage-class source is available at server deployment and at
+    agent install.
+28. Before an engine or a unit that starts a protective action is switched off, the operator
+    is shown where it would stop, and the change is audited under an action of its own.
+29. After an operator resolves a regressed store, no endpoint adopts a state issued before the
+    resolution.
 
 ## Open questions
 
@@ -715,6 +836,6 @@ The decision is being followed when all of the following are true.
   group, should follow, and how they would combine with fleet-level rules.
 - Whether an operator may switch a unit off while audit is unavailable, with the record made
   when audit recovers.
-- Which presets ship for the starting state, and what each contains.
+- Which further presets ship for the starting state, beyond the usage-class one D8 delivers.
 - Whether plugin signature enforcement (#4915) should become a precondition for a plugin being
   on.
