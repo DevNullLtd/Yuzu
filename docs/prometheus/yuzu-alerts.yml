@@ -490,7 +490,7 @@ groups:
       # calls the gateway-upstream service refused (every closed rpc x reason pair is
       # pre-seeded to 0 at boot, so increase() sees the first denial). The reasons
       # split by what they mean:
-      #   * Reasons about a certificate that reached the guard (bad_cert,
+      #   * Reasons that are not anonymous refusals (bad_cert,
       #     no_server_auth_eku, not_pinned, outside_validity, internal_error):
       #     YuzuGatewayPeerDenied, a warning. The rule lists them positively, so a
       #     reason added to the closed set later is NOT alerted until it is added

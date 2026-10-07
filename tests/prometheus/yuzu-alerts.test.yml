@@ -3132,7 +3132,7 @@ tests:
   # yuzu_server_gateway_peer_denied_total is pre-seeded to 0 at boot for every
   # closed rpc x reason pair, so the first real denial is an increase and not a
   # series that first appears at N. YuzuGatewayPeerDenied pages on the five reasons
-  # about a certificate that reached the guard (bad_cert, no_server_auth_eku,
+  # that are not anonymous refusals (bad_cert, no_server_auth_eku,
   # not_pinned, outside_validity, internal_error). The three reasons with no usable
   # client certificate (null_context, not_authenticated, no_cert) are deliberately
   # not alerted: each has its own quiet case below, so a reason added to or dropped

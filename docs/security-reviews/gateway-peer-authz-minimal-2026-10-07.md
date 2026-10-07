@@ -16,15 +16,16 @@ mistaken for oversights. It is a decision record, not a design proposal.
 
 ## Provenance and limits of this record
 
-- It was written while the code commits of this change (certificate/pin/policy, guard, boot
-  resolution and wiring) were being built in parallel. Statements about the new code come from the
-  agreed plan and from the earlier reference implementation (branch `fix/gateway-peer-authz-pr1`, tip
-  `36eb970e6`), which the new code reuses with revocation and reload removed. Statements about
-  existing code cite `origin/dev` `70cb9e70e`. A reviewer should check each behavioural claim here
-  against the final code of this change; a claim that disagrees with that code is a defect in this
-  record.
+- It was first written while the code commits of this change (certificate/pin/policy, guard, boot
+  resolution and wiring) were being built in parallel, from the agreed plan and from the earlier
+  reference implementation (branch `fix/gateway-peer-authz-pr1`, tip `36eb970e6`), which the new code
+  reuses with revocation and reload removed. It was then reconciled by reading against the landed
+  sources of this change (pin set, guard, boot resolution and wiring, deploy files, alert rules and
+  the shell tests). Statements about existing code cite `origin/dev` `70cb9e70e`. A reviewer should
+  still check each behavioural claim here against the final code; a claim that disagrees with that
+  code is a defect in this record.
 - Nothing here was run: no build, test, promtool, compose, installer or governance run is claimed
-  by this document. The review inputs (a security consult on the reference implementation, two
+  by this document, and the reconciliation was a reading of the final sources, not a run. The review inputs (a security consult on the reference implementation, two
   independent consults on the minimal design, and a plan review) were read-only analyses of source;
   every finding they report is code-derived, not experimentally reproduced.
 
@@ -105,8 +106,8 @@ exists to stop (derived CRITICAL in the plan review).
    (`server.gateway_peer_authz_disabled`) and a mode gauge.
 5. **Evidence, kept small.** `yuzu_server_gateway_peer_denied_total{rpc,reason}` (pre-seeded, 5 by 8
    series), a log line, a bounded audit row only for peers whose key hash is known, the mode gauge,
-   and two alerts (sustained authenticated-peer denials; acknowledged-insecure mode on a TLS server
-   with a client CA). Anonymous refusals are counter and log only, the same split the OTA
+   and two alerts (sustained denials that are not anonymous refusals; acknowledged-insecure mode on a TLS
+   server with a client CA). Anonymous refusals are counter and log only, the same split the OTA
    `no_client_identity` rejection already makes (`docs/user-manual/audit-log.md`,
    `session.ota_identity_rejected`), recorded in `docs/observability-conventions.md` so that the
    convention's attributable-denial rule is not read as violated.
@@ -148,9 +149,10 @@ corrected the first written design in these ways, each of which is part of this 
    state on every run (`deploy/packaging/windows/yuzu-server.iss`, `GetServiceArgs`), so a flag
    appended by hand disappears at the next upgrade, and `/GATEWAY` is re-read each run. The change
    adopts a storage convention without a parser: the pin lives at `certs\gateway-peer-pin`,
-   `--gateway-peer-pin-file` is passed whenever that file exists, `/GATEWAY` with `/NOTLS` adds the
-   acknowledgement, and an install that would start gateway mode on operator gRPC certificates with
-   no pin is refused before anything changes.
+   `--gateway-peer-pin-file` is passed whenever gateway mode is selected, TLS is not skipped and that
+   file exists, `/GATEWAY` with `/NOTLS` adds the acknowledgement (and no pin file, which the server
+   would refuse together with it), and an install that would start gateway mode on operator gRPC
+   certificates with no pin is refused before anything changes.
 5. **Replace "restart recovers automatically" with a runbook.** The unchanged gateway logs a failed
    `NotifyStreamStatus` and drops it (`gateway/apps/yuzu_gw/src/yuzu_gw_upstream.erl:335-343`), and
    heartbeats for a session the server already knows are acknowledged, so a session whose CONNECTED
@@ -179,24 +181,78 @@ immutable pin set that cannot be empty by construction, and boot refuses an empt
 - **Pin identifies, does not scope.** A compromised pinned gateway can still relay another agent's
   identity (R-5 in `docs/security-reviews/pki-pr5-gateway-tls.md`; per-gateway scoping, #1292).
 - **Key custody is only as good as its deployment.** Anyone in `--cert-group` holds the gateway key
-  on the generated defaults; the server warns at boot when it is set. Production installs should use
+  on the generated defaults; the server warns at boot when `--cert-group` is set while the default
+  gateway key is in use. Production installs should use
   a gateway-only certificate with a 0600 key, pinned explicitly.
 - **Breaking for custom certificates.** Bring-your-own gateway certificate installs must supply a pin
   or acknowledge before upgrading; the Linux unit passes `--gateway-upstream` unconditionally, so an
   own-certificate install that runs no gateway refuses to start until it omits the flag or pins.
-- **CI does not exercise a pinned gateway hop end to end.** The integration rig keeps the
-  acknowledgement in its `--tls` branch. The guard is exercised by unit tests over a real mTLS
+- **CI does not exercise a pinned gateway hop end to end.** The integration rig
+  (`scripts/integration-test.sh`) keeps the acknowledgement in its `--tls` branch, and no workflow
+  under `.github/` invokes that script. The guard is exercised by unit tests over a real mTLS
   harness on both listener modes, not by the rig.
-- **TLS session resumption is not claimed as a bypass or a proof.** gRPC's session cache cannot be
-  observed from its public API; a test can show identical evidence and decisions across two
-  channels sharing a cache, not that reuse happened. The only pin-withdrawal path is a restart, which
-  invalidates every session ticket (tickets are keyed per process).
+- **Two reasons are covered at the predicate level only.** Over a real gRPC connection the guard's
+  wire tests produce `not_authenticated`, `no_server_auth_eku`, `not_pinned` and `outside_validity`
+  (and `null_context` by a direct call with no context). `no_cert` and `bad_cert` could not be
+  produced over a real connection in that harness; they are covered only by the policy-function
+  table (`tests/unit/server/test_gateway_peer_policy.cpp`) and by the label and audit-eligibility
+  tests, so a wiring fault that made them unreachable or mis-attributed over the wire would not be
+  caught by a wire test.
+- **The Windows installer change is not compiled.** `deploy/packaging/windows/yuzu-server.iss` was
+  edited on a Linux host with no Inno Setup compiler. It needs a compile and a silent-install check
+  (`/GATEWAY` with and without `/NOTLS`, with and without a pin, and an upgrade over an install
+  carrying operator certificates) on a Windows host before it is relied on.
+- **No pin-file permission or ownership warning.** The earlier implementation warned when a pin file
+  was a symbolic link, writable by group or others, or owned by an unexpected user. This one does
+  not: the server reads the file once, bounded, and the operator guide tells the administrator to
+  protect it. Whoever can write the file at boot decides which gateway key is admitted.
+- **TLS session resumption.** See the next section; it is a question for the independent review.
 - **Acknowledged mode is a deliberate off switch.** It disables the guard on every port and is
   detectable (error line, audit row, gauge, alert on TLS servers with a client CA) but not preventable.
 - **Anonymous refusals have no audit row.** They are counter and log only.
 - **Rollback loses the control.** The previous binary has no guard; rolling back is a recorded risk
   acceptance, and the new flags must be removed before a binary rollback (an older binary rejects an
   unknown flag but ignores an unknown environment variable).
+
+## TLS session resumption
+
+What the guard judges. The guard judges the peer certificate that gRPC reports for the call
+(`x509_pem_cert` in the auth context, `grpc_peer_evidence.hpp`). It cannot tell whether that
+certificate was presented in this connection's handshake or restored from a resumed TLS session, and
+gRPC's public API does not expose resumption.
+
+What the test showed. `tests/unit/server/test_gateway_peer_guard.cpp`, test case "two sequential
+channels sharing an LRU session cache give identical evidence and identical decisions" (tags
+`[session]`), opens two sequential client channels with an LRU session cache attached
+(`GRPC_SSL_SESSION_CACHE_ARG`) for a pinned and for an unpinned gateway leaf, on both listener modes.
+In a first draft of that test one cache was shared by the pinned and the unpinned client identity, and
+the unpinned leaf was then admitted. That is consistent with the unpinned identity's channel resuming
+the pinned identity's cached session, so that the guard judged the certificate the session restored;
+resumption itself was not separately confirmed, because it is not observable from gRPC's public API
+(the test's own comment says so). The test was then changed to one cache per client identity. The
+first-draft observation is recorded only in that test comment; no test pins it.
+
+What it means, stated without overclaiming. The shared cache was in one process, set up by the test
+harness. A client channel can only reuse another identity's cached session if it holds that
+identity's session state (the ticket and its secret), so the exposure requires the pinned peer's
+own session state, which is equivalent to holding that peer's session secret. It does not require the
+gateway's private key, so it is a weaker credential than the key, but it is the pinned peer's own
+state and not something a network caller who merely reaches the port holds. How long such a session
+stays resumable is bounded by the OpenSSL server context's session lifetime, which was not measured
+here.
+
+What bounds it on the server. In gRPC 1.76's TSI server factory (`src/core/tsi/ssl_transport_security.cc`,
+read in the vcpkg build tree, around lines 2750 to 2770) the server sets a session-id context and
+installs a session-ticket key only when one is supplied through the TSI options; nothing in the gRPC
+core tree supplies one, and this server configures none, so ticket keys are the ones OpenSSL generates
+for each server context, per process. The only pin-withdrawal path in this design is a restart, which
+therefore invalidates every ticket issued before it. This is read from source, not tested here.
+
+Question for the independent review. Is it acceptable that admission is decided on the certificate
+gRPC reports for the call, without knowing whether it was presented fresh in this handshake or
+restored from a resumed session, given that reuse requires the pinned peer's own session state and a
+restart invalidates it? If not, what binds a decision to the current handshake through gRPC's public
+API (or is a server-side option to disable ticket issuance on the gateway-upstream listener required)?
 
 ## Deferred follow-ups
 
@@ -228,4 +284,6 @@ Each is a separate decision; none is a prerequisite for this change.
   or a revocation read on this path requires re-opening this record first.
 - A lexical shell gate (a Meson test in the `docs` suite) fails if the gateway-upstream service is
   registered other than through the guard or if the registration count changes; a boot-refusal shell
-  test exercises the refusal and acknowledgement rows against the real binary.
+  test (`tests/shell/test_gateway_peer_boot_refusal.sh`, a step in `.github/workflows/ci.yml`; it
+  needs the server binary and Postgres) exercises the refusal and acknowledgement rows against the
+  real binary.
