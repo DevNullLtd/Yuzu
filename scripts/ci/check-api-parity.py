@@ -173,6 +173,11 @@ VERBS = ("Get", "Post", "Put", "Delete", "Patch", "Options")
 # routes, never expected to flip to "twinned", so the count rises 203 -> 205
 # by design rather than regressing.
 #
+# 2026-10-06 (legacy /inventory fragment removal): the four dead
+# /fragments/inventory/{devices,device,find,find/results} rows are deleted along
+# with their routes (two `planned:#2146`, two `composed-of:`), so the count
+# falls 205 -> 201 -- the value the checker itself reported after the deletion.
+#
 # Software catalogue REST routes: get.fragments-inventory-software-versions
 # flips "planned:#2146" -> "twinned" (GET /api/v1/inventory/software/catalogue/versions;
 # REST only, no MCP twin yet) and the title-catalogue row get.fragments-inventory-software
@@ -181,7 +186,10 @@ VERBS = ("Get", "Post", "Put", "Delete", "Patch", "Options")
 # body is a download for a person or a pipeline, not a structured tool result (MCP workers
 # page the JSON with `cursor`).
 # Measured post-flip at 204 (205 - 1), not hand-picked.
-BASELINE_UNTWINNED = 204
+#
+# Merge of the two changes above: 205 - 4 (legacy rows deleted) - 1 (versions row twinned)
+# = 200, the value the checker itself reported on the merged tree.
+BASELINE_UNTWINNED = 200
 
 # ── OpenAPI-missing allowlist (seed for F2) ──────────────────────────────
 # Every /api/v1/* route registered today that has no OpenAPI `paths` entry.

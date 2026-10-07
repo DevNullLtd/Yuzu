@@ -441,8 +441,6 @@ TEST_CASE("win: the three ConsentStore levels on the-rig's real shapes -- the No
     //   HKLM location Value Allow; HKLM location\NonPackaged (no Value);
     //   HKLM location\NonPackaged\C:#Windows#System32#svchost.exe   LastUsedTime* only
     CHECK(win::kNonPackagedToggleAppId == "NonPackaged");
-    CHECK(win::is_nonpackaged_container_key("Executables"));
-    CHECK_FALSE(win::is_nonpackaged_container_key("C:#Program Files#Mozilla Firefox#firefox.exe"));
     const std::string firefox =
         win::unescape_nonpackaged_app_id("C:#Program Files#Mozilla Firefox#firefox.exe");
     CHECK(firefox == "C:\\Program Files\\Mozilla Firefox\\firefox.exe");
@@ -573,16 +571,16 @@ TEST_CASE("win::RetentionBudget: one source at its own cap stops only its own wa
     CHECK(win::kMaxConsentValueBytes == 64);
     CHECK(win::kMaxConsentValueBytes >= (std::string_view{"Prompt"}.size() + 1) * 2);
     const win::RetentionBudget defaults;
-    CHECK(defaults.max_profile_grants == 8192);
-    CHECK(defaults.max_profile_bytes == 2u * 1024u * 1024u);
+    CHECK(defaults.source.max_rows == 8192);
+    CHECK(defaults.source.max_bytes == 2u * 1024u * 1024u);
 
     win::RetentionBudget b;
-    b.max_profile_grants = 2;
+    b.source.max_rows = 2;
     b.begin_profile();
     CHECK(b.charge(1));
     CHECK(b.charge(1));
     CHECK_FALSE(b.charge(1)); // the cap-th grant fits, one more is refused
-    CHECK(b.profile_exhausted);
+    CHECK(b.source.refused);
     CHECK(b.walk_stopped());
     CHECK_FALSE(b.charge(0)); // sticky for the rest of this source
 
@@ -590,21 +588,32 @@ TEST_CASE("win::RetentionBudget: one source at its own cap stops only its own wa
     CHECK_FALSE(b.walk_stopped());
     const win::RawGrant deny{"-", "camera", PermissionState::denied, "Deny"};
     CHECK(b.charge(win::retained_bytes(deny)));
-    CHECK(b.profile_grants == 1);
+    CHECK(b.source.rows == 1);
 
     win::RetentionBudget bytes;
-    bytes.max_profile_bytes = 10;
+    bytes.source.max_bytes = 10;
     CHECK(bytes.charge(6));
     CHECK(bytes.charge(4)); // exactly the cap fits
-    CHECK(bytes.profile_bytes == 10);
+    CHECK(bytes.source.bytes == 10);
     CHECK_FALSE(bytes.charge(1));
-    CHECK(bytes.profile_exhausted);
+    CHECK(bytes.source.refused);
+    CHECK_FALSE(bytes.charge(0)); // sticky per source: even a charge that would fit is refused
     bytes.begin_profile();
     CHECK_FALSE(bytes.charge(static_cast<std::size_t>(-1))); // an oversized grant never wraps
-    CHECK(bytes.profile_exhausted);
+    CHECK(bytes.source.refused);
 
     const win::RawGrant g{"C:\\a.exe", "camera", PermissionState::allowed, "Allow"};
     CHECK(win::retained_bytes(g) == std::string_view{"C:\\a.exe"}.size() + 5);
+}
+
+TEST_CASE("win::RetentionBudget: begin_profile restarts the source counters, never the run's clock",
+          "[privacy_permissions][win_parsers]") {
+    win::RetentionBudget b;
+    b.deadline = std::chrono::steady_clock::now() - std::chrono::seconds{1};
+    REQUIRE(b.expired());
+    b.begin_profile();
+    CHECK(b.timed_out);
+    CHECK(b.expired());
 }
 
 TEST_CASE("win::RetentionBudget: the run deadline is injectable, inclusive and sticky",
@@ -612,6 +621,7 @@ TEST_CASE("win::RetentionBudget: the run deadline is injectable, inclusive and s
     using Clock = std::chrono::steady_clock;
     CHECK(win::kRunBudget == std::chrono::seconds{15});
     CHECK(win::kTimeoutToken == "collection:timeout");
+    CHECK(win::run_stop_token(win::kTimeoutToken, 0) == "collection:timeout:profiles_skipped_0");
 
     win::RetentionBudget b;
     b.deadline = Clock::time_point::max();
@@ -754,12 +764,12 @@ TEST_CASE("OutputBudget reserve: rows charged first always fit, and a later sour
     const std::vector<PermissionRow> profile{
         {"windows", "jsmith/-", "camera", PermissionState::denied, "Deny", "-", "-", false}};
     OutputBudget b;
-    b.max_bytes = OutputBudget::cost(machine) + OutputBudget::cost(profile) - 1;
+    b.budget.max_bytes = OutputBudget::cost(machine) + OutputBudget::cost(profile) - 1;
     b.charge(machine); // reserved first
     CHECK_FALSE(b.exhausted());
     CHECK(b.would_exceed(profile)); // the profile does not fit beside the reservation...
-    CHECK(b.bytes == OutputBudget::cost(machine)); // ...and the reservation is untouched
-    b.max_bytes += 1;
+    CHECK(b.budget.bytes == OutputBudget::cost(machine)); // ...and the reservation is untouched
+    b.budget.max_bytes += 1;
     CHECK_FALSE(b.would_exceed(profile)); // exactly the cap fits
     b.charge(profile);
     CHECK(b.exhausted());
@@ -848,6 +858,12 @@ TEST_CASE("win::classify_hive_file: a stock hive is accepted; each refusal fires
         CHECK(token(cloud) == "hive_not_resident");
         cloud.is_directory = true; // not_regular is decided first
         CHECK(token(cloud) == "hive_not_regular");
+        auto placeholder = stock(); // not_resident outranks the owner, redirect and size refusals
+        placeholder.not_resident = true;
+        placeholder.owner_sid = "S-1-5-21-1-2-3-1002";
+        placeholder.final_path_matches = false;
+        placeholder.size = win::kMaxHiveBytes + 1;
+        CHECK(token(placeholder) == "hive_not_resident");
         auto own = stock();
         own.owner_sid = "S-1-5-21-1-2-3-1002";
         CHECK(token(own) == "hive_owner_unexpected");
@@ -903,7 +919,7 @@ TEST_CASE("win::classify_stability: stable only on a created event, an armed wat
         return t ? *t : std::string{"<stable>"};
     };
     CHECK(token(F{0, 0, win::kWaitTimeout, 0}) == "<stable>");
-    CHECK(token(F{0, 0, win::kWaitObject0, 0}) == "changed_during_read");
+    CHECK(token(F{0, 0, win::kWaitObject0, 0}) == win::kChangedDuringRead);
     CHECK(token(F{0, 0, 0xFFFFFFFFul /* WAIT_FAILED */, 6}) == "notify_wait_failed:win32_6");
     CHECK(token(F{0, 0, 0x80ul /* WAIT_ABANDONED */, 0}) == "notify_wait_failed:win32_0");
     CHECK(token(F{8, 0, win::kWaitTimeout, 0}) == "notify_event_failed:win32_8");
@@ -985,6 +1001,13 @@ struct AssembledRun {
             return r.app_id == "-" && r.category == "-" && r.raw == token;
         });
     }
+    /// Run-level stop rows for `base`, whatever their `:profiles_skipped_<n>` count.
+    [[nodiscard]] std::size_t stops(std::string_view base) const {
+        const std::string prefix = std::string{base} + ":profiles_skipped_";
+        return count([&](const PermissionRow& r) {
+            return r.app_id == "-" && r.category == "-" && r.raw.rfind(prefix, 0) == 0;
+        });
+    }
     [[nodiscard]] std::size_t rows_of(std::string_view app_prefix) const {
         return count([&](const PermissionRow& r) { return r.app_id.rfind(app_prefix, 0) == 0; });
     }
@@ -1028,12 +1051,25 @@ TEST_CASE("win::assemble_windows_rows: HKLM's overriding Deny is one unqualified
     SECTION("a profile refused as unstable is not reachable: nothing merged, so HKLM keeps the Deny") {
         run.go({profile_of("alice", kSidAlice)}, hklm_camera_deny(), [](const ProfileInfo&) {
             auto rd = reachable_allow();
-            rd.walk.refused = "changed_during_read";
+            rd.walk.refused = std::string{win::kChangedDuringRead};
             return rd;
         });
         CHECK(run.count(hklm_row) == 1);
         CHECK(run.count([](const PermissionRow& r) { return r.raw == "alice:changed_during_read"; }) == 1);
         CHECK(run.rows_of("alice\\-") == 1); // the refusal row alone: no Allow row for the discarded read
+    }
+    SECTION("a `.bak` ProfileList entry is named, never read, and never `invalid_sid`") {
+        const std::string bak = std::string{kSidAlice} + ".bak";
+        run.go({profile_of("alice", bak), profile_of("carol", kSidCarol)}, hklm_camera_deny(),
+               [](const ProfileInfo&) { return reachable_allow(); });
+        CHECK(run.reads == 1); // carol only
+        CHECK(run.count([](const PermissionRow& r) {
+                  return r.raw == "alice:profile_list_backup";
+              }) == 1);
+        CHECK(run.count([](const PermissionRow& r) { return r.raw == "alice:invalid_sid"; }) == 0);
+        const auto st = select_status(run.acc, any_denied(run.rows), false);
+        CHECK(st.status == YUZU_RESULT_STATUS_CONSTRAINED);
+        CHECK(st.completeness == YUZU_RESULT_COMPLETENESS_PARTIAL);
     }
     SECTION("a malformed SID is refused before any read is injected, and is not reachable") {
         run.go({profile_of("mallory", "S-1-5-"), profile_of("carol", kSidCarol)}, hklm_camera_deny(),
@@ -1044,8 +1080,8 @@ TEST_CASE("win::assemble_windows_rows: HKLM's overriding Deny is one unqualified
     }
 }
 
-TEST_CASE("win::assemble_windows_rows: each hive-access outcome is its own row, a refused live peek "
-          "is a denial, and a failed unload is a token and no row",
+TEST_CASE("win::assemble_windows_rows: each hive-access outcome is its own row, a refused live "
+          "open is a denial, and a failed unload is a token and no row",
           "[privacy_permissions][win_parsers]") {
     AssembledRun run;
     const auto only = [&](win::ProfileRead rd, ProfileInfo p = profile_of("alice", kSidAlice)) {
@@ -1060,16 +1096,16 @@ TEST_CASE("win::assemble_windows_rows: each hive-access outcome is its own row, 
         REQUIRE(row_raw("alice:hive_mount_failed") == 1);
         CHECK_FALSE(any_denied(run.rows));
     }
-    SECTION("a refused live peek turns any failure into access_denied, denied") {
+    SECTION("a refused live open turns any failure into access_denied, denied") {
         auto rd = unreachable(HiveAccessStatus::not_found);
-        rd.peek_rc = win::kErrorAccessDenied;
+        rd.live_open_rc = win::kErrorAccessDenied;
         only(rd);
         REQUIRE(row_raw("alice:access_denied") == 1);
         CHECK(any_denied(run.rows));
     }
-    SECTION("a refused live peek beneath a hive-file refusal is still the denial") {
+    SECTION("a refused live open beneath a hive-file refusal is still the denial") {
         auto rd = unreachable(HiveAccessStatus::file_refused, "hive_reparse_point");
-        rd.peek_rc = win::kErrorAccessDenied;
+        rd.live_open_rc = win::kErrorAccessDenied;
         only(rd);
         REQUIRE(row_raw("alice:access_denied") == 1);
         CHECK(row_raw("alice:hive_reparse_point") == 0);
@@ -1104,22 +1140,22 @@ TEST_CASE("win::assemble_windows_rows: the run-wide output budget reserves HKLM'
     // The cost of HKLM's reservation (R) and of one profile's rows (c), measured from real runs.
     AssembledRun none;
     none.go({}, hklm, read);
-    const std::size_t reserved = none.output.bytes;
+    const std::size_t reserved = none.output.budget.bytes;
     AssembledRun one;
     one.go({profile_of("alice", kSidAlice)}, hklm, read);
-    const std::size_t per_profile = one.output.bytes - reserved;
+    const std::size_t per_profile = one.output.budget.bytes - reserved;
     REQUIRE(reserved > 0);
     REQUIRE(per_profile > 0);
-    CHECK(none.markers(kBudgetExceededToken) == 0);
-    CHECK(one.markers(kBudgetExceededToken) == 0);
+    CHECK(none.stops(kBudgetExceededToken) == 0);
+    CHECK(one.stops(kBudgetExceededToken) == 0);
 
     const std::vector<ProfileInfo> two{profile_of("alice", kSidAlice), profile_of("bobby", kSidBobby)};
     AssembledRun run;
 
     SECTION("a second profile that would cross the cap is absent; the first and HKLM's rows stay") {
-        run.output.max_bytes = reserved + 2 * per_profile - 1;
+        run.output.budget.max_bytes = reserved + 2 * per_profile - 1;
         run.go(two, hklm, read);
-        CHECK(run.markers(kBudgetExceededToken) == 1);
+        CHECK(run.markers(win::run_stop_token(kBudgetExceededToken, 1)) == 1);
         CHECK(run.rows_of("alice\\-") == kCategories.size());
         CHECK(run.rows_of("bobby\\") == 0);
         CHECK(run.count([](const PermissionRow& r) { return r.app_id == "-" && r.category == "microphone"; }) == 1);
@@ -1129,24 +1165,38 @@ TEST_CASE("win::assemble_windows_rows: the run-wide output budget reserves HKLM'
         CHECK(st.provenance.find(std::string{kBudgetExceededToken}) != std::string::npos);
     }
     SECTION("a cap the first profile fills EXACTLY still marks the profiles left unread") {
-        run.output.max_bytes = reserved + per_profile;
+        run.output.budget.max_bytes = reserved + per_profile;
         run.go(two, hklm, read);
         CHECK(run.output.exhausted());
         CHECK(run.reads == 1); // bobby is never read
         CHECK(run.rows_of("alice\\-") == kCategories.size());
         CHECK(run.rows_of("bobby\\") == 0);
-        CHECK(run.markers(kBudgetExceededToken) == 1);
+        CHECK(run.markers(win::run_stop_token(kBudgetExceededToken, 1)) == 1);
+    }
+    SECTION("a `.bak` entry the cap has no room for stops the run and is counted as skipped") {
+        run.output.budget.max_bytes = reserved + 1; // HKLM's reservation fits; one more row doesn't
+        run.go({profile_of("alice", std::string{kSidAlice} + ".bak"),
+                profile_of("carol", kSidCarol)},
+               hklm, read);
+        CHECK(run.reads == 0);
+        CHECK(run.markers(win::run_stop_token(kBudgetExceededToken, 2)) == 1);
+    }
+    SECTION("a malformed-SID row the cap has no room for stops the run the same way") {
+        run.output.budget.max_bytes = reserved + 1;
+        run.go({profile_of("mallory", "S-1-5-"), profile_of("carol", kSidCarol)}, hklm, read);
+        CHECK(run.reads == 0);
+        CHECK(run.markers(win::run_stop_token(kBudgetExceededToken, 2)) == 1);
     }
     SECTION("filling the cap exactly with nothing left to read is complete, not truncated") {
-        run.output.max_bytes = reserved + per_profile;
+        run.output.budget.max_bytes = reserved + per_profile;
         run.go({profile_of("alice", kSidAlice)}, hklm, read);
-        CHECK(run.markers(kBudgetExceededToken) == 0);
+        CHECK(run.stops(kBudgetExceededToken) == 0);
         CHECK(run.rows_of("alice\\-") == kCategories.size());
     }
     SECTION("HKLM is charged first: a profile that fits alone is dropped when HKLM's rows leave no room") {
-        run.output.max_bytes = per_profile;
+        run.output.budget.max_bytes = per_profile;
         run.go({profile_of("alice", kSidAlice)}, hklm, read);
-        CHECK(run.markers(kBudgetExceededToken) == 1);
+        CHECK(run.markers(win::run_stop_token(kBudgetExceededToken, 1)) == 1);
         CHECK(run.rows_of("alice\\-") == 0);
         // every HKLM row survived, and its Deny is HKLM's own row since no profile carried it
         CHECK(run.count([](const PermissionRow& r) {
@@ -1172,8 +1222,8 @@ TEST_CASE("win::assemble_windows_rows: an expired deadline stops the run with on
         CHECK(run.reads == 1);
         CHECK(run.rows_of("alice\\-") == kCategories.size()); // what was read is kept
         CHECK(run.rows_of("bobby\\") == 0);
-        CHECK(run.markers(win::kTimeoutToken) == 1);
-        CHECK(run.markers(kBudgetExceededToken) == 0);
+        CHECK(run.markers(win::run_stop_token(win::kTimeoutToken, 2)) == 1);
+        CHECK(run.stops(kBudgetExceededToken) == 0);
         const auto st = select_status(run.acc, any_denied(run.rows), false);
         CHECK(st.status == YUZU_RESULT_STATUS_CONSTRAINED);
         CHECK(st.completeness == YUZU_RESULT_COMPLETENESS_PARTIAL);
@@ -1182,14 +1232,14 @@ TEST_CASE("win::assemble_windows_rows: an expired deadline stops the run with on
         run.budget.deadline = std::chrono::steady_clock::now() - std::chrono::seconds{1};
         run.go(three, hklm_camera_deny(), [](const ProfileInfo&) { return reachable_allow(); });
         CHECK(run.reads == 0);
-        CHECK(run.markers(win::kTimeoutToken) == 1);
+        CHECK(run.markers(win::run_stop_token(win::kTimeoutToken, 3)) == 1);
         CHECK(run.count([](const PermissionRow& r) { return r.app_id == "-" && r.category != "-"; }) ==
               kCategories.size());
     }
     SECTION("a run that finishes in time has no timeout row") {
         run.go(three, hklm_camera_deny(), [](const ProfileInfo&) { return reachable_allow(); });
         CHECK(run.reads == 3);
-        CHECK(run.markers(win::kTimeoutToken) == 0);
+        CHECK(run.stops(win::kTimeoutToken) == 0);
     }
 }
 
@@ -1204,13 +1254,13 @@ TEST_CASE("win::assemble_windows_rows: the per-source budget marker, source-leve
     const std::vector<ProfileInfo> two{profile_of("alice", kSidAlice), profile_of("bobby", kSidBobby)};
 
     SECTION("HKLM that hit its own cap is one `hklm:budget_exceeded` row") {
-        run.budget.profile_exhausted = true; // as the HKLM walk leaves it when its cap was hit
+        run.budget.source.refused = true; // as the HKLM walk leaves it when its cap was hit
         run.go({}, win::ConsentWalk{}, allow);
         CHECK(with_raw("hklm:budget_exceeded") == 1);
     }
     SECTION("a profile that hit its own cap is one `<profile>:budget_exceeded` row; the next is untouched") {
         run.go(two, hklm_camera_deny(), [&](const ProfileInfo& p) {
-            if (p.sid == kSidAlice) run.budget.profile_exhausted = true; // set after begin_profile()
+            if (p.sid == kSidAlice) run.budget.source.refused = true; // set after begin_profile()
             return reachable_allow();
         });
         CHECK(with_raw("alice:budget_exceeded") == 1);
@@ -1233,7 +1283,7 @@ TEST_CASE("win::assemble_windows_rows: the per-source budget marker, source-leve
     }
     SECTION("an HKLM store refused as unstable is one `hklm:<token>` row") {
         win::ConsentWalk h;
-        h.refused = "changed_during_read";
+        h.refused = std::string{win::kChangedDuringRead};
         run.go({}, h, allow);
         CHECK(with_raw("hklm:changed_during_read") == 1);
     }
@@ -1258,16 +1308,25 @@ TEST_CASE("win::assemble_windows_rows: the per-source budget marker, source-leve
         run.go({}, hklm_camera_deny(), allow, discovery);
         REQUIRE_FALSE(run.rows.empty());
         CHECK(run.rows.front().raw == "profile_list:win32_5");
-        CHECK(run.output.bytes - bare.output.bytes == OutputBudget::cost(discovery));
+        CHECK(run.output.budget.bytes - bare.output.budget.bytes == OutputBudget::cost(discovery));
     }
     SECTION("a profile refused with `timeout` ends the run: one collection:timeout row, no later read") {
+        // The read refuses `timeout` WITHOUT marking the budget (a deadline callback that is a
+        // plain clock compare): the assembler itself must mark the run.
         run.go(two, hklm_camera_deny(), [&](const ProfileInfo&) {
-            run.budget.timed_out = true; // what the guard's budget.expired() leaves behind
             return unreachable(HiveAccessStatus::file_refused, "timeout");
         });
         CHECK(run.reads == 1);
         CHECK(with_raw("alice:timeout") == 1);
-        CHECK(run.markers(win::kTimeoutToken) == 1);
+        CHECK(run.markers(win::run_stop_token(win::kTimeoutToken, 1)) == 1);
+    }
+    SECTION("the LAST profile refused with `timeout` still leaves the run-level row") {
+        run.go({profile_of("alice", kSidAlice)}, hklm_camera_deny(), [&](const ProfileInfo&) {
+            return unreachable(HiveAccessStatus::file_refused, "timeout");
+        });
+        CHECK(run.reads == 1);
+        CHECK(with_raw("alice:timeout") == 1);
+        CHECK(run.markers(win::run_stop_token(win::kTimeoutToken, 0)) == 1);
     }
 }
 
@@ -1618,11 +1677,11 @@ TEST_CASE("OutputBudget: counts the formatted row, escapes and separator include
     CHECK(kMaxRunOutputBytes == 16u * 1024u * 1024u);
     CHECK(kBudgetExceededToken == "collection:budget_exceeded");
     OutputBudget b;
-    b.max_bytes = 10;
+    b.budget.max_bytes = 10;
     const std::vector<PermissionRow> rows{
         {"macos", "abcd", "camera", PermissionState::allowed, "12", "-", "-", false}};
     b.charge(rows);
-    CHECK(b.bytes == format_row(rows[0]).size() + 1);
+    CHECK(b.budget.bytes == format_row(rows[0]).size() + 1);
     CHECK(b.exhausted()); // 45 bytes against a 10-byte cap: every field counts, not two of them
     // Escape expansion is charged: a pipe-dense client costs its escaped length.
     OutputBudget plain, dense;
@@ -1632,7 +1691,7 @@ TEST_CASE("OutputBudget: counts the formatted row, escapes and separator include
                                         "-", "-", false}};
     plain.charge(p);
     dense.charge(d);
-    CHECK(dense.bytes == plain.bytes + 4);
+    CHECK(dense.budget.bytes == plain.budget.bytes + 4);
     CHECK_FALSE(OutputBudget{}.exhausted());
 }
 
@@ -1792,5 +1851,5 @@ TEST_CASE("OutputBudget::charge allocates (format_row), so it must not be noexce
           "[privacy_permissions][macos_parsers]") {
     OutputBudget b;
     static_assert(!noexcept(b.charge(std::span<const PermissionRow>{})));
-    CHECK(b.bytes == 0);
+    CHECK(b.budget.bytes == 0);
 }

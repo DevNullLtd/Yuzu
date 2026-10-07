@@ -35,7 +35,9 @@ may be comma-separated). `--cert-san` is the supported way to make the built-in 
 valid for a deployment name a client actually dials — e.g. `--cert-san dns:gateway` so
 an agent reaching the gateway by that service name passes SNI hostname verification.
 Changing `--cert-san` does **not** rotate an existing set (the marker fast path returns
-the prior certs); clear the cert dir or replace the certs for new SANs to take effect.
+the prior certs). For new SANs to take effect, rename `default-marker.json` in the cert dir aside
+(moving it back undoes this) and restart (the leaves are re-minted under the SAME root), or replace the certs. Never clear
+the whole cert dir: it also holds the CA key and the secrets KEK (`secrets-kek-*.key`, #5370).
 (Implementation: `parse_extra_sans` validates the flag/`YUZU_CERT_SAN` values,
 `merge_sans` injects them into every default leaf, `pki::is_valid_ip_literal` does the
 IP-shape check.)
@@ -53,7 +55,7 @@ client-identity binding becomes cryptographic with no new mechanism.
 | `server/core/src/key_provider.{hpp,cpp}` | `KeyProvider` interface + `FileKeyProvider` (0600 PEM in a 0700 dir). The HSM/PKCS#11 seam — `key_ref` is an opaque token (the absolute path today). |
 | `server/core/src/ca_store.{hpp,cpp}` (Postgres schema `ca_store`, ADR-0053) | Inventory + lifecycle: `ca_root`, `ca_issued`, `ca_crl_versions`. **Metadata only — the root private key is never in the DB**, only its opaque `key_ref`. |
 | `server/core/src/default_certs.{hpp,cpp}` | First-boot bootstrap: root + 3 server leaves + `default-marker.json`. Idempotent; regenerate-whole-set on corruption / clock-skew. |
-| `agents/core/src/agent_csr.{hpp,cpp}` | Agent-side, self-contained OpenSSL (the agent cannot link `x509_ca`): EC P-256 keypair + CSR generation, 0600 leaf persistence, renew-at-2/3 inspection. |
+| `agents/core/src/agent_csr.{hpp,cpp}` | Agent-side, self-contained OpenSSL (the agent cannot link `x509_ca`): EC P-256 keypair + CSR generation, 0600 key persistence (leaf and chain 0644), renew-at-2/3 inspection (a cert/key mismatch or unreadable key counts as missing and re-enrols). |
 | `server/core/src/ca_routes.{hpp,cpp}` | The `/api/v1/ca/*` REST surface (PR4). |
 
 ## The `ca_store` Postgres schema (schema + invariants)

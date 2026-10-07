@@ -201,6 +201,30 @@ TEST_CASE("every documented Guardian heartbeat tag is one the emitter actually e
     emit_guardian_health_heartbeat_tags(
         emitted, GuardianHealthStats{
                      .unhealthy_suppressed = 1, .unhealthy_refreshed = 1, .priority_demoted = 1});
+    // #5403: metrics.md now names the pending-Spark-Disarm deadline count and age tags, so
+    // union their emitters too (the ages have their own struct + emitter, not GuardianHealthStats fields).
+    emit_guardian_health_heartbeat_tags(emitted, GuardianHealthStats{.disarm_deadline_elapsed = 1});
+    emit_guardian_health_age_tags(
+        emitted, GuardianHealthAgeStats{.disarm_pending_age_seconds = std::uint64_t{1}});
+    // #4472: metrics.md also names the compensation-teardown deadline count and age tags.
+    emit_guardian_health_heartbeat_tags(emitted,
+                                        GuardianHealthStats{.compensation_deadline_elapsed = 1});
+    emit_guardian_health_age_tags(
+        emitted, GuardianHealthAgeStats{.compensation_pending_age_seconds = std::uint64_t{1}});
+    // #5404: metrics.md names the eleven Spark claim-lifecycle tags (all GuardianHealthStats
+    // fields), so union a fully-populated block through the same emitter.
+    emit_guardian_health_heartbeat_tags(
+        emitted, GuardianHealthStats{.orphan_disarms_started = 1,
+                                     .dead_watchers_erased_on_lost = 1,
+                                     .tombstones_released_by_reaper = 1,
+                                     .claim_index_release_failures = 1,
+                                     .claim_drain_failures = 1,
+                                     .retained_tombstones = 1,
+                                     .detach_sweep_left_residue = 1,
+                                     .detach_claim_failures = 1,
+                                     .detach_post_commit_failures = 1,
+                                     .claims_dropped_at_stop = 1,
+                                     .ack_maint_exceptions = 1});
     emit_guardian_backend_heartbeat_tag(emitted, /*prefer_spark=*/true,
                                         GuardianEngine::SparkAvailability::SparkFailed);
     // rung 9c PR-3: union in the arm-ledger + io-ceiling emitters too - both are

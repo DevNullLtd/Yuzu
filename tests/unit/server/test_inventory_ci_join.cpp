@@ -4,7 +4,7 @@
 /// agent that isn't already present in the caller's visibility-filtered `rows` —
 /// proving the map can safely hold out-of-scope entries (from the same
 /// `list_device_ci(0)` read) without leaking them past the roster's confinement
-/// (the confinement itself is `inv_devices_fn`'s `visible_set_fn` filter, upstream
+/// (the confinement itself is HardwareRoutes' `scoped_roster`, downstream
 /// of this function — see inventory_ci_join.hpp).
 
 #include "inventory_ci_join.hpp"
@@ -41,7 +41,8 @@ TEST_CASE("attach_device_ci: fills a visible row's CI fields", "[inventory][ci-j
 
 TEST_CASE("attach_device_ci: out-of-scope CI in the map is never attached or manufactured",
           "[inventory][ci-join]") {
-    // `rows` is the ALREADY-confined roster (as if visible_set_fn dropped "a2").
+    // `rows` holds only "a1" (as if the roster never contained "a2"); confinement is
+    // HardwareRoutes' scoped_roster, downstream of this function.
     std::vector<InventoryDeviceRow> rows(1);
     rows[0].agent_id = "a1";
 

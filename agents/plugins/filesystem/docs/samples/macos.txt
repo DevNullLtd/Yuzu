@@ -1,4 +1,4 @@
-captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (jsmith) · leg-hash 4db605b6c689
+captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-10-04 · euid 501 (jsmith) · leg-hash c8a3100adc66
 == action=exists path=/etc/hosts
 exists|true
 type|file
@@ -91,12 +91,12 @@ size|213
 [result_status] UNDECLARED / UNKNOWN / 
 
 == action=create_temp
-path|/var/folders/hq/lc3t_rsx2blfc8rhys6kzh4r0000gn/T//yuzu-ayE16A.tmp
+path|/var/folders/hq/lc3t_rsx2blfc8rhys6kzh4r0000gn/T//yuzu-oqRhjd.tmp
 persist|true
 [result_status] UNDECLARED / UNKNOWN / 
 
 == action=create_temp_dir
-path|/var/folders/hq/lc3t_rsx2blfc8rhys6kzh4r0000gn/T//yuzu-R7qEuY
+path|/var/folders/hq/lc3t_rsx2blfc8rhys6kzh4r0000gn/T//yuzu-sPr64l
 persist|true
 [result_status] UNDECLARED / UNKNOWN / 
 
@@ -114,11 +114,14 @@ total_lines|9
 file_size|213
 [result_status] UNDECLARED / UNKNOWN / 
 
-== action=get_acl path=/etc/hosts
-owner|root
+== action=get_acl path=/tmp/yuzu_test_acl_Rw0R2f/acl_file
+owner|jsmith
 group|wheel
 permissions|rw-r--r--
 mode|0644
+acl|extended|-
+ace|deny|group:staff|delete|-
+ace|allow|user:_www|read,write|file_inherit
 [result_status] UNDECLARED / UNKNOWN / 
 
 == action=get_signature path=/bin/ls
@@ -145,25 +148,25 @@ match|9|::1             localhost
 total_matches|3
 [result_status] UNDECLARED / UNKNOWN / 
 
-== action=replace path=/var/folders/hq/lc3t_rsx2blfc8rhys6kzh4r0000gn/T/yuzu_capture_8s9wf1vr/yuzu_capture_tmp.txt search=yuzu-capture replace=yuzu-replaced
+== action=replace path=/var/folders/hq/lc3t_rsx2blfc8rhys6kzh4r0000gn/T//yuzu_capture_MaI1z1B3/yuzu_capture_tmp.txt search=yuzu-capture replace=yuzu-replaced
 replacements_made|2
-file_size_before|40
-file_size_after|16
+file_size_before|37
+file_size_after|13
 [result_status] UNDECLARED / UNKNOWN / 
 
-== action=write_content path=/var/folders/hq/lc3t_rsx2blfc8rhys6kzh4r0000gn/T/yuzu_capture_8s9wf1vr/yuzu_capture_tmp.txt content="yuzu-capture written" overwrite=true
+== action=write_content path=/var/folders/hq/lc3t_rsx2blfc8rhys6kzh4r0000gn/T//yuzu_capture_MaI1z1B3/yuzu_capture_tmp.txt content="yuzu-capture written" overwrite=true
 status|ok
 bytes_written|20
-path|/private/var/folders/hq/lc3t_rsx2blfc8rhys6kzh4r0000gn/T/yuzu_capture_8s9wf1vr/yuzu_capture_tmp.txt
+path|/private/var/folders/hq/lc3t_rsx2blfc8rhys6kzh4r0000gn/T/yuzu_capture_MaI1z1B3/yuzu_capture_tmp.txt
 [result_status] UNDECLARED / UNKNOWN / 
 
-== action=append path=/var/folders/hq/lc3t_rsx2blfc8rhys6kzh4r0000gn/T/yuzu_capture_8s9wf1vr/yuzu_capture_tmp.txt content="yuzu-capture appended"
+== action=append path=/var/folders/hq/lc3t_rsx2blfc8rhys6kzh4r0000gn/T//yuzu_capture_MaI1z1B3/yuzu_capture_tmp.txt content="yuzu-capture appended"
 status|ok
 bytes_appended|22
 total_size|20
 [result_status] UNDECLARED / UNKNOWN / 
 
-== action=delete_lines path=/var/folders/hq/lc3t_rsx2blfc8rhys6kzh4r0000gn/T/yuzu_capture_8s9wf1vr/yuzu_capture_tmp.txt start_line=1 end_line=1
+== action=delete_lines path=/var/folders/hq/lc3t_rsx2blfc8rhys6kzh4r0000gn/T//yuzu_capture_MaI1z1B3/yuzu_capture_tmp.txt start_line=1 end_line=1
 lines_deleted|1
 total_lines_before|2
 total_lines_after|1

@@ -3994,7 +3994,7 @@ auto-renew once two-thirds of their lifetime has elapsed (evaluated at agent
 start; a fresh CSR rides the next `Register`). Issuance is audited
 (`ca.cert.issued`). On the agent, the leaf key is written `0600` via an atomic
 `O_EXCL` stage-and-rename on POSIX; **on Windows the key falls back to
-`std::ofstream` + a best-effort permissions tightening — an explicit owner-only
+`std::ofstream` with no DACL tightening — an explicit owner-only
 ACL (`SetNamedSecurityInfoW`) is a tracked follow-up shared with the server's
 `FileKeyProvider`, so on Windows run the agent under a dedicated service account
 with no inherited group-read on the cert directory until then.**

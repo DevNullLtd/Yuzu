@@ -538,8 +538,10 @@ metadata:
   description: >
     Retrieve access control list (ACL) or permissions for a file or
     directory. On Windows, returns the SDDL representation and individual
-    ACE entries (allow/deny, account, access mask). On Linux/macOS,
-    returns POSIX owner, group, and permission mode (rwxrwxrwx).
+    ACE entries (type, account, access mask, inheritance flags) and a `control` row. On Linux/macOS,
+    returns owner, group and permission mode (rwxrwxrwx) plus the extended
+    ACL: POSIX access and default entries on Linux, allow/deny entries with
+    principal, rights and inheritance flags on macOS.
   tags: [filesystem, security, compliance, acl]
 
 spec:
@@ -579,21 +581,20 @@ spec:
         platforms: [windows]
       - name: ace_type
         type: string
-        description: >
-          Windows-only. One access-control-entry row's effect; the plugin
-          emits one ace row per DACL entry.
-        values: [allow, deny, other]
+        description: >-
+          One access-control-entry row's kind; the plugin emits one ace row per entry on every OS. Windows - allow, deny, allow_conditional, deny_conditional, allow_object, deny_object, other (any other ACE type). macOS - allow or deny. Linux - user, group, mask or other (the POSIX ACL tag).
+        values: [allow, deny, allow_conditional, deny_conditional, allow_object, deny_object, other, user, group, mask]
         example: allow
-        platforms: [windows]
+        platforms: [windows, linux, darwin]
       - name: account
         type: string
         description: >-
-          Windows-only. The DOMAIN\account the ACE names, or the SID string when the account cannot be resolved. Values: free text.
+          The principal: DOMAIN\account or SID on Windows; <kind>:<name>, <kind>:#<id> or <kind>:<UUID> (unresolved) on macOS, <kind> being user or group; the qualifier name or numeric id, or - for the owner/owning-group/mask/other entries on Linux. Values: free text.
         example: "NT AUTHORITY\\SYSTEM"
-        platforms: [windows]
+        platforms: [windows, linux, darwin]
       - name: access_mask
         type: string
-        description: "Windows-only. The ACE's access mask, hex-formatted. Values: hex integer."
+        description: "Windows-only. The ACE's access mask, hex-formatted. Values: hex integer, or - for an ACE type the plugin does not decode."
         example: "0x001f01ff"
         platforms: [windows]
       - name: owner
@@ -618,6 +619,40 @@ spec:
         description: 'POSIX-only. Octal permission bits. Values: 4-digit octal.'
         example: "0644"
         platforms: [linux, darwin]
+      - name: ace_perms
+        type: string
+        description: >-
+          POSIX-only. The ACE's permissions: r/w/x triple on Linux, comma-separated ACL permission names on macOS (- when none). Values: free text.
+        example: "r-x"
+        platforms: [linux, darwin]
+      - name: ace_flags
+        type: string
+        description: >-
+          The ACE's flags, comma-joined, or - when none. Windows - object_inherit, container_inherit, no_propagate, inherit_only, inherited. macOS - inherited, file_inherit, directory_inherit, limit_inherit, only_inherit. Linux - default for an entry of the directory default ACL.
+        values: [object_inherit, container_inherit, no_propagate, inherit_only, inherited, file_inherit, directory_inherit, limit_inherit, only_inherit, default, "-"]
+        example: "-"
+        platforms: [windows, linux, darwin]
+      - name: acl
+        type: string
+        description: >-
+          POSIX-only. Whether the path carries an extended ACL: none, extended, or unsupported (the filesystem cannot carry an ACL, not that none is set). Single-value row.
+        values: [none, extended, unsupported]
+        example: extended
+        platforms: [linux, darwin]
+      - name: acl_flags
+        type: string
+        description: >-
+          macOS-only. ACL-level flags, comma-joined, or - when none. Single-value field of the acl row.
+        values: [no_inherit, defer_inherit, "-"]
+        example: "-"
+        platforms: [darwin]
+      - name: control
+        type: string
+        description: >-
+          Windows-only. DACL control flags from the security descriptor, comma-joined, or - when none. Single-value row.
+        values: [protected, auto_inherited, "-"]
+        example: protected
+        platforms: [windows]
 
   readablePayload: "Get ACL/permissions for ${path}"
 

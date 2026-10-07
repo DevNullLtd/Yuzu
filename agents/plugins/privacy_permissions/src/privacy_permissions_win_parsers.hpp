@@ -33,6 +33,8 @@
 #include <utility>
 #include <vector>
 
+#include <row_byte_budget.hpp>
+
 #include "privacy_permissions_parsers.hpp"
 #include "user_profile_model.hpp"
 
@@ -58,14 +60,6 @@ inline constexpr std::array<CapabilityEntry, 4> kCapabilities{{
 /// `Value`, the "let desktop apps access" toggle. That toggle is reported as its own row under
 /// this app_id (qualified `<user>\NonPackaged` per profile, bare on HKLM -- qualify_app_id).
 inline constexpr std::string_view kNonPackagedToggleAppId = "NonPackaged";
-
-/// NonPackaged children that are containers, not apps (measured on the-rig:
-/// `NonPackaged\Executables\<exe>` holds only a `GlobalPromptShown` DWORD per executable, never
-/// a `Value`). Skipped by name; any other child is read as an app key, so an unknown shape stays
-/// a visible row rather than vanishing.
-[[nodiscard]] constexpr bool is_nonpackaged_container_key(std::string_view name) noexcept {
-    return name == "Executables";
-}
 
 /// The ConsentStore `Value` REG_SZ decoded to a PermissionState. `type_ok` = the registry
 /// value was actually REG_SZ (a wrong type is unreadable regardless of its bytes).
@@ -102,6 +96,7 @@ inline constexpr long kErrorSuccess = 0;
 inline constexpr long kErrorFileNotFound = 2;
 inline constexpr long kErrorAccessDenied = 5;
 inline constexpr long kErrorNoMoreItems = 259;
+inline constexpr long kErrorMoreData = 234;
 inline constexpr std::uint32_t kRegSz = 1;
 inline constexpr std::uint32_t kRegQword = 11;
 
@@ -137,18 +132,11 @@ inline constexpr std::chrono::milliseconds kRunBudget{15'000};
 /// source stops; begin_profile() starts the next source from zero. `deadline`/`expired(now)` are
 /// injectable so a test never sleeps; expiry is sticky.
 struct RetentionBudget {
-    std::size_t max_profile_grants = kMaxProfileGrants;
-    std::size_t max_profile_bytes = kMaxProfileBytes;
-    std::size_t profile_grants = 0;
-    std::size_t profile_bytes = 0;
-    bool profile_exhausted = false;
+    yuzu::shared::RowByteBudget source{kMaxProfileGrants, kMaxProfileBytes};
     std::chrono::steady_clock::time_point deadline = std::chrono::steady_clock::now() + kRunBudget;
     bool timed_out = false;
 
-    void begin_profile() noexcept {
-        profile_grants = profile_bytes = 0;
-        profile_exhausted = false;
-    }
+    void begin_profile() noexcept { source.reset(); }
 
     [[nodiscard]] bool expired(
         std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now()) noexcept {
@@ -156,21 +144,23 @@ struct RetentionBudget {
     }
 
     /// Whether the walk of the current source must stop where it is.
-    [[nodiscard]] bool walk_stopped() noexcept { return profile_exhausted || expired(); }
+    [[nodiscard]] bool walk_stopped() noexcept { return source.refused || expired(); }
 
     [[nodiscard]] bool charge(std::size_t n_bytes) noexcept {
-        if (profile_exhausted || profile_grants + 1 > max_profile_grants ||
-            n_bytes > max_profile_bytes - profile_bytes) {
-            profile_exhausted = true;
-            return false;
-        }
-        ++profile_grants;
-        profile_bytes += n_bytes;
-        return true;
+        return !source.refused && source.charge(n_bytes); // refusal sticky per source
     }
 };
 
 inline constexpr std::string_view kTimeoutToken = "collection:timeout";
+/// The `<profile>:profile_list_backup` cause: a `<SID>.bak` ProfileList entry, named and never
+/// read.
+inline constexpr std::string_view kProfileListBackupSuffix = "profile_list_backup";
+
+/// The run-level stop row: `<base>:profiles_skipped_<n>`, n = profiles never emitted (those after
+/// the stop, plus one whose rows were dropped). Bounded by kMaxProfiles.
+[[nodiscard]] inline std::string run_stop_token(std::string_view base, std::size_t skipped) {
+    return std::string{base} + ":profiles_skipped_" + std::to_string(skipped);
+}
 /// `<profile>:budget_exceeded` (or `hklm:budget_exceeded`): that one source's rows are truncated.
 inline constexpr std::string_view kSourceBudgetExceededSuffix = "budget_exceeded";
 
@@ -181,7 +171,8 @@ enum class EnumOutcome { complete, truncated, failed };
 struct EnumVerdict {
     EnumOutcome outcome;
     long rc = kErrorSuccess; // the failing code when `failed`
-    /// Child names skipped for an embedded NUL (see enumerate_subkey_names); enum_failure reports them.
+    /// Child names skipped for an embedded NUL or zero length (see enumerate_subkey_names);
+    /// enum_failure reports them.
     std::size_t embedded_nul_names = 0;
 };
 
@@ -208,8 +199,8 @@ struct EnumFailure {
 
 /// The failure an enumeration contributes, or nullopt for a complete one -- a complete walk,
 /// including one of exactly the cap, never produces a failure token, unless it skipped an
-/// embedded-NUL name (`<kind>:name_embedded_nul`, one row per walk; a truncated or failed walk
-/// already reports the source as incomplete).
+/// embedded-NUL or empty name (`<kind>:name_embedded_nul`, one row per walk; a truncated or failed
+/// walk already reports the source as incomplete).
 [[nodiscard]] inline std::optional<EnumFailure> enum_failure(std::string_view kind,
                                                              const EnumVerdict& v) {
     switch (v.outcome) {
@@ -434,10 +425,11 @@ inline constexpr std::size_t kMaxHiveSidecars = 64;
 inline constexpr std::uint32_t kWaitObject0 = 0;  // WAIT_OBJECT_0
 inline constexpr std::uint32_t kWaitTimeout = 258; // WAIT_TIMEOUT
 
-/// What the shell learned about one NTUSER.DAT, every fact taken from an opened HANDLE (or, for
-/// the path facts, from the requested path before any syscall). `final_path_matches` is the
-/// shell's verdict that GetFinalPathNameByHandleW(VOLUME_NAME_DOS) equals `\\?\` + the requested
-/// path under Windows' own ordinal case-insensitive comparison (CompareStringOrdinal on the wide
+/// What the shell learned about one NTUSER.DAT, every handle-derived fact taken from an opened
+/// HANDLE (the drive type and the sidecar listing are the two handle-less sources; the path facts
+/// come from the requested path before any syscall). `final_path_matches` is the shell's verdict
+/// that GetFinalPathNameByHandleW(VOLUME_NAME_DOS) equals `\\?\` + the requested path under
+/// Windows' own ordinal case-insensitive comparison (CompareStringOrdinal on the wide
 /// strings: a non-ASCII case-only difference is the same path, which byte-wise ASCII folding on
 /// UTF-8 would misjudge). The default is the neutral `true`, so only the facts gathered so far can
 /// trip a classification.
@@ -519,11 +511,14 @@ struct StabilityFacts {
     unsigned long wait_gle = 0;   // GetLastError after a WAIT_FAILED
 };
 
+/// The classify_stability token for a ConsentStore that changed while it was read.
+inline constexpr std::string_view kChangedDuringRead = "changed_during_read";
+
 [[nodiscard]] inline std::optional<std::string> classify_stability(const StabilityFacts& f) {
     if (f.create_gle != 0) return "notify_event_failed:win32_" + std::to_string(f.create_gle);
     if (f.arm_rc != 0) return "notify_failed:win32_" + std::to_string(f.arm_rc);
     if (f.wait_rc == kWaitTimeout) return std::nullopt;
-    if (f.wait_rc == kWaitObject0) return std::string{"changed_during_read"};
+    if (f.wait_rc == kWaitObject0) return std::string{kChangedDuringRead};
     return "notify_wait_failed:win32_" + std::to_string(f.wait_gle);
 }
 
@@ -577,14 +572,14 @@ inline void emit_root_failure(std::string_view source, std::string app_id, long 
 }
 
 /// What reading ONE profile produced: how its hive was (or was not) reached and, when it was, its
-/// ConsentStore walk. `peek_rc` is the open code of the live HKU\<SID> root, which
-/// with_user_hive's own `== ERROR_SUCCESS` test cannot tell from "not loaded": it recovers a
-/// refused live hive whose offline fallback then also failed.
+/// ConsentStore walk. `live_open_rc` is the open code of the live HKU\<SID> root (fed from
+/// HiveAccessReport::live_open_rc), which with_user_hive's own `== ERROR_SUCCESS` test cannot tell
+/// from "not loaded": it recovers a refused live hive whose offline fallback then also failed.
 struct ProfileRead {
     profiles::HiveAccessStatus status = profiles::HiveAccessStatus::not_found;
     std::string refusal;          // the hive-file refusal token when status == file_refused
     bool unload_failed = false;   // the read completed; a mount was left behind
-    long peek_rc = kErrorSuccess;
+    long live_open_rc = kErrorSuccess;
     ConsentWalk walk;             // meaningful only when status == ok
 };
 
@@ -594,9 +589,11 @@ using ReadProfileFn = std::function<ProfileRead(const profiles::ProfileInfo&)>;
 /// the shell used to make inline, so each is unit-observable on every host: HKLM's rows are
 /// RESERVED in the run-wide `output` before any profile is charged; a profile's rows are charged
 /// as a unit and one that would cross the cap is not emitted; the run stops, with exactly one
-/// `collection:budget_exceeded` row, when the cap is crossed OR already exactly filled with
-/// profiles left (the bytes check at the loop top, not only the commit refusal); an expired
-/// deadline stops it with one `collection:timeout` row; an overriding HKLM Deny is HKLM's own row
+/// `collection:budget_exceeded:profiles_skipped_<n>` row, when the cap is crossed OR already
+/// exactly filled with profiles left (the bytes check at the loop top, not only the commit
+/// refusal); an expired deadline stops it with one `collection:timeout:profiles_skipped_<n>` row
+/// (n = the profiles never emitted, see run_stop_token); a `<SID>.bak` ProfileList entry is named
+/// (`<profile>:profile_list_backup`) and never read; an overriding HKLM Deny is HKLM's own row
 /// only when no profile was reachable to carry it (a profile whose ConsentStore was refused as
 /// unstable is not reachable). `budget` is as the HKLM walk left it; `discovery_rows` (ProfileList
 /// failures, built by the shell) lead the profile rows. The caller runs fill_uncovered_categories
@@ -610,7 +607,7 @@ using ReadProfileFn = std::function<ProfileRead(const profiles::ProfileInfo&)>;
     // A source that hit its own cap keeps the rows it charged; this row says it is incomplete.
     const auto truncated_row = [&](std::vector<PermissionRow>& into, const std::string& source,
                                    const std::string& row_id) {
-        if (budget.profile_exhausted)
+        if (budget.source.refused)
             into.push_back(failure_row("windows", row_id, "-", false,
                                        source + ":" + std::string{kSourceBudgetExceededSuffix}, acc));
     };
@@ -653,7 +650,10 @@ using ReadProfileFn = std::function<ProfileRead(const profiles::ProfileInfo&)>;
         return true;
     };
 
-    for (const auto& profile : profile_list) {
+    const std::size_t n = profile_list.size();
+    std::size_t next = 0;
+    for (; next < n; ++next) {
+        const auto& profile = profile_list[next];
         // A cap the previous profile filled EXACTLY is still the budget stopping the run with
         // profiles left: it must say so, never end silently short.
         if (output.exhausted()) {
@@ -666,6 +666,14 @@ using ReadProfileFn = std::function<ProfileRead(const profiles::ProfileInfo&)>;
         const std::string profile_row_id = qualify_app_id(pname, "-");
         std::vector<PermissionRow> prof;
 
+        // A `<SID>.bak` entry is named, not read (its folder may hold the user's real hive): it
+        // must be tested first, since the suffix makes the string an invalid SID.
+        if (profiles::is_profile_backup_entry(profile.sid)) {
+            prof.push_back(failure_row("windows", profile_row_id, "-", false,
+                                       pname + ":" + std::string{kProfileListBackupSuffix}, acc));
+            if (!commit(prof, false)) break;
+            continue;
+        }
         // The SID is appended to HKEY_USERS by the shell (and by with_user_hive): a malformed or
         // empty one must never open the HKU root or some other key in place of this profile's own
         // hive, so it is refused here, before any read is injected.
@@ -685,9 +693,9 @@ using ReadProfileFn = std::function<ProfileRead(const profiles::ProfileInfo&)>;
         // must never read as "this profile has no grants" -- each failure is its own row.
         // `refused`: the cause is itself a refusal (a missing privilege): denied, token unchanged.
         const auto profile_failed = [&](std::string_view cause, bool refused = false) {
-            const bool peek_denied = (rd.peek_rc == kErrorAccessDenied);
-            prof.push_back(failure_row("windows", profile_row_id, "-", peek_denied || refused,
-                                       pname + ":" + (peek_denied ? std::string{"access_denied"}
+            const bool live_denied = (rd.live_open_rc == kErrorAccessDenied);
+            prof.push_back(failure_row("windows", profile_row_id, "-", live_denied || refused,
+                                       pname + ":" + (live_denied ? std::string{"access_denied"}
                                                                   : std::string{cause}),
                                        acc));
         };
@@ -710,8 +718,10 @@ using ReadProfileFn = std::function<ProfileRead(const profiles::ProfileInfo&)>;
             break;
         case profiles::HiveAccessStatus::file_refused:
             // A hive-file refusal alone is unreadable, not denied (an unsafe file is not an ACL
-            // refusal); a refused live root beneath it is the denial. `timeout` also ends the run
-            // (the guard marks the budget, not this branch).
+            // refusal); a refused live root beneath it is the denial. `timeout` also ends the
+            // run: this branch marks the budget itself, so the run-level row never depends on the
+            // injected deadline callback's side effect.
+            if (rd.refusal == kHiveTimeout) budget.timed_out = true;
             profile_failed(rd.refusal);
             break;
         }
@@ -731,9 +741,13 @@ using ReadProfileFn = std::function<ProfileRead(const profiles::ProfileInfo&)>;
                 truncated_row(prof, pname, profile_row_id);
             }
         }
-        if (!commit(prof, reachable)) break;
-        if (budget.timed_out) break;
+        if (!commit(prof, reachable)) break; // the dropped profile counts as skipped
+        if (budget.timed_out) {
+            ++next;
+            break;
+        }
     }
+    const std::size_t skipped = n - next; // profiles never emitted when the run stopped
 
     // HKLM's own rows, unqualified, once (hklm_emitted_once), already charged: everything it
     // holds -- failures, Allow and unmodelled values, app-level entries and its definitive
@@ -746,9 +760,11 @@ using ReadProfileFn = std::function<ProfileRead(const profiles::ProfileInfo&)>;
     // The run-wide output budget stopped the walk: every row read so far is above; what was never
     // walked is covered by this one whole-source row.
     if (budget_hit)
-        rows.push_back(failure_row("windows", "-", "-", false, std::string{kBudgetExceededToken}, acc));
+        rows.push_back(failure_row("windows", "-", "-", false,
+                                   run_stop_token(kBudgetExceededToken, skipped), acc));
     if (budget.timed_out)
-        rows.push_back(failure_row("windows", "-", "-", false, std::string{kTimeoutToken}, acc));
+        rows.push_back(failure_row("windows", "-", "-", false,
+                                   run_stop_token(kTimeoutToken, skipped), acc));
     return rows;
 }
 

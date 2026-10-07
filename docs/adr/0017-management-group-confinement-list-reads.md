@@ -281,10 +281,10 @@ gate.
 - **Inventory** — `query_installed_software` (MCP) + `GET /api/v1/inventory/software` (REST):
   **DONE (#3290, 2026-08-20)** — migrated onto `require_fleet_read`, the admit-then-filter gate
   this ADR designed; confinement is now effective on both surfaces.
-  - **`/inventory` dashboard FIND** (`InventoryRoutes`, `inventory_routes.cpp` find/results) shares
-    the SAME per-row drop filter + omission audit as the REST/MCP siblings above — it converts the
-    same way (swap its `Inventory:Read` gate to admit-then-filter; the per-row filter is already
-    present).
+  - **`/inventory` dashboard FIND** — retired: its routes were deleted. The per-row drop filter +
+    omission audit now live on `/fragments/inventory/software/devices` (`InventoryRoutes`), which
+    shares them with the REST/MCP siblings above and converts the same way (swap its
+    `Inventory:Read` gate to admit-then-filter; the per-row filter is already present).
   - **⚠ `SoftwareInventoryStore::software_catalog` / `software_versions`** (the `/inventory`
     Software-tab fleet aggregates) are a DIFFERENT shape: they read a **precomputed, fleet-wide
     rollup** (`catalog_rollup` / `version_rollup`, recomputed across ALL agents by the background
@@ -480,7 +480,7 @@ ahead of PR-A.)
    fallback (INV-6), replace with the permission-specific set. Six callers across dashboard + server
    + json — consider splitting REST vs dashboard.
 4. **PR-D — inventory.** `query_installed_software` + `GET /api/v1/inventory/software` —
-   **DONE (#3290)**. `/inventory` dashboard FIND remains open (its own conversion, see above).
+   **DONE (#3290)**. The `/software` devices expansion (`/fragments/inventory/software/devices`) remains open (its own conversion, see above).
 5. **PR-E — DEX / TAR / audit-log.** The DEX `VisibleSetFn` seam + remaining dashboard fragments +
    the `AuditLog:Read` surface.
 

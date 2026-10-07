@@ -1,0 +1,1 @@
+- Shared agent primitives in agents/shared: hop-by-hop O_NOFOLLOW directory open and bounded no-follow regular-file read (posix_secure_read.hpp, single-component dir-fd contract), in-memory SHA-256 (sha256.hpp, moved from license_scan) and the [redacted-email] helper (email_redaction.hpp, moved from browser_inventory); no plugin output changes (#4866).

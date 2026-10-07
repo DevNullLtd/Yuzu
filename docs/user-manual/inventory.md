@@ -58,13 +58,16 @@ cadences.
   sortable or filterable there; read them from the raw `output` on
   `GET /api/v1/responses/{id}` or MCP `query_responses`. A macOS `list` payload
   is about three times larger than before (14 KB to 42 KB for 323 applications);
-  `bundle_id` is `-` past the 5000-application / 120 s enrichment cap, which the
-  agent logs but does not report as degraded.
+  `bundle_id` is `-` for rows the bounded bundle-id pass (30 s, at most 5000
+  applications, one pass in flight) did not reach; that run leads with a
+  `warning|bundle_id_*` row and reports CONSTRAINED -- never silently.
   On Linux/macOS, a
   degraded acquisition (timeout, kill, spawn failure, truncation, or a
   nonzero exit) now emits a single `error|installed_apps: acquisition
   degraded (...)` row and a nonzero result instead of an empty or partial
-  `app|` list — see "Degraded collections are skipped, not published" below.
+  `app|` list; on macOS a `list` may begin with a `warning|bundle_id_*` row --
+  key on the first token `app`. See "Degraded collections are skipped, not
+  published" below.
   Automation that only parses `app|` rows and ignores `error|` is
   unaffected; automation that assumed `list` always succeeds needs an
   update. See `docs/user-manual/agent-plugins.md`'s `installed_apps`/
@@ -513,15 +516,19 @@ place, **Hardware** and **Software**, each its own page:
     row's own click-to-drill-into-**installs-per-version** action — to list every device
     running that title: hostname (linking to its Hardware CI record), version,
     publisher, install date, signature status, ecosystem, and architecture, with its own
-    client-side filter for a popular title with many installs. This inline expansion is
-    server-scoped the same way the old Find results were (per-row management-group
-    drop, 1000-row cap, `inventory.software.query` audit verb) — a short/zero result
-    under a narrow scope is *incomplete*, not *absent*.
+    client-side filter for a popular title with many installs. The expansion carries a
+    per-row management-group drop, a 1000-row cap and the `inventory.software.query`
+    audit verb, but that per-row filter does not narrow the result today: the page sits
+    behind the global `Inventory:Read` gate, so a group-confined operator is denied before
+    the filter runs and a global operator's filter is a no-op. The page says so in its
+    own scope caveat.
 
-  The expansion replaces the standalone **Find software** tab, which is gone from the
-  sub-nav. Its routes, `/fragments/inventory/find` and `/fragments/inventory/find/results`,
-  are still registered for old bookmarks and deep links, but nothing in the UI links to
-  them any more — treat them as a legacy escape hatch, not a supported feature.
+  The expansion replaces the standalone **Find software** tab and the old Devices-tab
+  fragments. Their routes (`/fragments/inventory/find`, `/fragments/inventory/find/results`,
+  `/fragments/inventory/devices`, `/fragments/inventory/device`) were removed and now
+  return `404` for an authenticated caller (an unauthenticated request is redirected to
+  the login page first, like any other dashboard path); `/inventory` itself still
+  redirects (`302`) to `/hardware`.
 
   - The catalogue store now serves exact numbers under filters: **Installs is the exact
     number of distinct devices** carrying the title under any kind/ecosystem/source
@@ -541,8 +548,9 @@ CI and Tags columns layered on top from a best-effort `DeviceInventoryStore`/tag
 read — a *whole-store* degrade there is now its own explicit "CI columns unavailable" /
 "Tags unavailable" banner (an improvement on the old Devices tab, where a
 `DeviceInventoryStore` degrade during the list render was indistinguishable from "not
-yet synced"); the roster read itself being wholly unavailable shows a dedicated "roster
-unavailable" banner rather than an empty table. The **per-device CI record's Overview
+yet synced"); the dedicated "roster unavailable" banner appears only when the roster
+provider is not wired at all — a failed roster read currently renders as an empty table
+(tracked in #5531). The **per-device CI record's Overview
 lens**, by contrast, has always been an authoritative three-state read: found /
 genuinely-not-yet-synced ("no CI record synced yet") / degraded (an explicit "CI record
 unavailable" banner) are never conflated.
@@ -692,6 +700,16 @@ ingest is failing. Four further series sharpen the picture:
   be **frozen, not genuinely low** — the freeze-detector that travels with the
   gauge (the freshness count uses a tighter 250 ms budget than the read paths, so
   it can stall while `yuzu_inventory_read_degrade_total` stays quiet).
+- `yuzu_fleet_inventory_sync_skipping{source}` (gauge) — agents currently
+  heartbeating whose `source` skipped its latest collection cycle(s), from the agent
+  heartbeat tag `yuzu.sync.<source>.skip_streak` (today only `source="installed_software"`,
+  written by agents that include the skip-visibility change, #5327). The cause is in the agent's own log (the `sync: … — skipping this cycle`
+  warning, or `sync: installed_apps plugin not loaded`); the agent also publishes it as the
+  `yuzu.sync.<source>.last_skip` heartbeat tag, which no server page or API returns yet.
+  Published every sweep, 0 included. The gauge only counts agents that emit the
+  skip-streak heartbeat tag: an agent that does not emit it (older agents, during a
+  rollout, or in a mixed-version fleet) contributes zero even when its collector is
+  skipping, so a zero gauge does not establish that all collectors are healthy.
 - `yuzu_inventory_ingest_dropped_total{reason}` (counter, reason ∈ `store_not_open` /
   `pool_acquire_timeout` / `query_error` / `invalid_key` / `stale`) — generic-store
   (ADR-0037) upsert calls that did not persist. Ingest is fail-soft (the next
@@ -803,7 +821,14 @@ threshold (`>50` is day-one noise on a 100-device pilot and 0.1% ambient churn o
 explicit `on()/group_left()` matching with a denominator caveat. **Enable it** once
 you have observed your fleet's normal stale-count baseline and set the threshold to
 ~5–10% of your expected active fleet; correlate with `yuzu_fleet_agents_healthy` to
-separate "agents offline" from "sync source broken / disabled".
+separate "agents offline" from "sync source broken / disabled". Also
+correlate with `yuzu_fleet_inventory_sync_skipping{source="installed_software"}`: a
+host counted there is online but its collector is skipping (the reason is in that agent's
+log, and in its `last_skip` heartbeat tag, which no server page or API returns yet). The two gauges count different populations (stored-receipt age over 48 h in
+Postgres vs live heartbeats, which include hosts skipping for less than 48 h and
+hosts that have never reported), so read them side by side and never subtract one
+from the other. Agents that do not emit the skip tag (older agents, or during a
+rollout) are not counted, so a zero there does not rule out a skipping collector.
 
 **`install_location` is `-` for many Windows applications and every Linux application.** `-` means the OS
 reported no location, not that collection failed. Windows reads each Uninstall key's `InstallLocation`, which many
@@ -811,7 +836,7 @@ MSI-registered products, SDK and runtime component packages and some system comp
 241 rows on one developer workstation); Linux is always `-` by design, since a package installs to many prefixes.
 `-` also results from a Windows value longer than 511 characters or stored with a non-string registry type, and
 for per-user installs, which the machine-scope `list` does not read. `bundle_id` is `-` on Windows
-and Linux, and on macOS for a non-bundle location or beyond the 5000-application / 120 s enrichment cap.
+and Linux, and on macOS for a non-bundle location or for a row the bounded bundle-id pass (30 s, at most 5000 applications, one pass in flight) did not reach -- that run also carries a leading `warning|bundle_id_*` row and a CONSTRAINED status, so a `-` from a cut-short pass is never silent.
 
 **The results table shows column headers with nothing under them.** The dashboard splits `installed_apps` rows at
 the first `|` (`app` plus one merged cell) while the headers come from the definition. Nothing is lost: read the

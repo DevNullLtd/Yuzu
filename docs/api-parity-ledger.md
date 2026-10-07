@@ -123,7 +123,7 @@ result (the same reason is recorded beside `BASELINE_UNTWINNED` in
 | Domain | Rows | Twinned | Untwinned |
 |---|---:|---:|---:|
 | devices | 14 | 9 | 5 |
-| inventory | 7 | 2 | 5 |
+| inventory | 3 | 2 | 1 |
 | dex | 26 | 18 | 8 |
 | guardian | 16 | 6 | 10 |
 | tar | 12 | 4 | 8 |
@@ -145,11 +145,11 @@ result (the same reason is recorded beside `BASELINE_UNTWINNED` in
 | ota | 15 | 0 | 15 |
 | enrollment | 19 | 5 | 14 |
 | other | 74 | 13 | 61 |
-| **Total** | **286** | **82** | **204** |
+| **Total** | **282** | **82** | **200** |
 
 Registered `/api/vN/*` routes: 246. OpenAPI `paths` entries: 245. Missing from OpenAPI: 1 (1 carried in `check-api-parity.py`'s `ALLOWLIST_OPENAPI_MISSING` pending F2, 0 unallowlisted). MCP tools: 184.
 
-Ratchet baseline (untwinned rows; shrinks as routes are twinned, or rises only with a reviewed reason stated in the change that raises it): 204.
+Ratchet baseline (untwinned rows; shrinks as routes are twinned, or rises only with a reviewed reason stated in the change that raises it): 200.
 
 <!-- END GENERATED -->
 

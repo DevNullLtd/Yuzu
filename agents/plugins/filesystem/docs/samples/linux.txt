@@ -1,8 +1,8 @@
-captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-07 · euid 0 · leg-hash 4db605b6c689
+captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-10-04 · euid 0 · leg-hash c8a3100adc66
 == action=exists path=/etc/hosts
 exists|true
 type|file
-size|172
+size|177
 [result_status] UNDECLARED / UNKNOWN / 
 
 == action=list_dir path=/etc
@@ -61,12 +61,12 @@ entry|bindresvport.blacklist|file|367
 entry|ld.so.cache|file|9187
 entry|motd|file|286
 entry|kernel|directory|0
-entry|hostname|file|13
+entry|hostname|file|18
 entry|selinux|directory|0
 entry|pam.conf|file|552
 entry|rcS.d|directory|0
 entry|mtab|file|0
-entry|hosts|file|172
+entry|hosts|file|177
 entry|ca-certificates.conf|file|6422
 entry|mime.types|file|78282
 entry|emacs|directory|0
@@ -91,18 +91,18 @@ entry|protocols|file|3144
 [result_status] UNDECLARED / UNKNOWN / 
 
 == action=file_hash path=/etc/hosts
-hash|60aae00e788a173131b105d5694045ac736b668be86396d4991d1dbe3d70ef38
+hash|5ed49ae76ca451e9f063a9b28d11f6e8784a851e983664cb495206b75453c412
 algorithm|sha256
-size|172
+size|177
 [result_status] UNDECLARED / UNKNOWN / 
 
 == action=create_temp
-path|/tmp/yuzu-UPhb03.tmp
+path|/tmp/yuzu-GqGF5B.tmp
 persist|true
 [result_status] UNDECLARED / UNKNOWN / 
 
 == action=create_temp_dir
-path|/tmp/yuzu-7OcS9w
+path|/tmp/yuzu-CtDWtd
 persist|true
 [result_status] UNDECLARED / UNKNOWN / 
 
@@ -113,16 +113,23 @@ line|3|fe00::	ip6-localnet
 line|4|ff00::	ip6-mcastprefix
 line|5|ff02::1	ip6-allnodes
 line|6|ff02::2	ip6-allrouters
-line|7|172.17.0.3	5bd4336fc14e
+line|7|172.17.0.3	yuzu-capture-host
 total_lines|7
-file_size|172
+file_size|177
 [result_status] UNDECLARED / UNKNOWN / 
 
-== action=get_acl path=/etc/hosts
+== action=get_acl path=/tmp/yuzu_test_acl/f
 owner|root
 group|root
-permissions|rw-r--r--
-mode|0644
+permissions|rw-rwxr--
+mode|0674
+acl|extended|-
+ace|user|-|rw-|-
+ace|user|1001|rw-|-
+ace|group|-|r--|-
+ace|group|1002|r-x|-
+ace|mask|-|rwx|-
+ace|other|-|r--|-
 [result_status] UNDECLARED / UNKNOWN / 
 
 == action=get_signature path=/bin/ls
@@ -130,8 +137,9 @@ error|code signature verification is not supported on this platform
 [result_status] UNDECLARED / UNKNOWN / 
 [rc] 1
 
-== action=find_by_hash directory=/etc sha256=c7dd0e2ed261ce76d76f852596c5b54026b9a894fa481381ffd399b556c0e2da
-matches_found|0
+== action=find_by_hash directory=/etc sha256=5ed49ae76ca451e9f063a9b28d11f6e8784a851e983664cb495206b75453c412
+match|/etc/hosts|177
+matches_found|1
 [result_status] UNDECLARED / UNKNOWN / 
 
 == action=search_dir root=/etc pattern=*hosts*
@@ -149,25 +157,25 @@ match|2|::1	localhost ip6-localhost ip6-loopback
 total_matches|2
 [result_status] UNDECLARED / UNKNOWN / 
 
-== action=replace path=/tmp/yuzu_capture/yuzu_capture_tmp.txt search=yuzu-capture replace=yuzu-replaced
+== action=replace path=/tmp/yuzu_capture_vySwPCm6/yuzu_capture_tmp.txt search=yuzu-capture replace=yuzu-replaced
 replacements_made|2
-file_size_before|40
-file_size_after|16
+file_size_before|37
+file_size_after|13
 [result_status] UNDECLARED / UNKNOWN / 
 
-== action=write_content path=/tmp/yuzu_capture/yuzu_capture_tmp.txt content="yuzu-capture written" overwrite=true
+== action=write_content path=/tmp/yuzu_capture_vySwPCm6/yuzu_capture_tmp.txt content="yuzu-capture written" overwrite=true
 status|ok
 bytes_written|20
-path|/tmp/yuzu_capture/yuzu_capture_tmp.txt
+path|/tmp/yuzu_capture_vySwPCm6/yuzu_capture_tmp.txt
 [result_status] UNDECLARED / UNKNOWN / 
 
-== action=append path=/tmp/yuzu_capture/yuzu_capture_tmp.txt content="yuzu-capture appended"
+== action=append path=/tmp/yuzu_capture_vySwPCm6/yuzu_capture_tmp.txt content="yuzu-capture appended"
 status|ok
-bytes_appended|21
-total_size|40
+bytes_appended|22
+total_size|20
 [result_status] UNDECLARED / UNKNOWN / 
 
-== action=delete_lines path=/tmp/yuzu_capture/yuzu_capture_tmp.txt start_line=1 end_line=1
+== action=delete_lines path=/tmp/yuzu_capture_vySwPCm6/yuzu_capture_tmp.txt start_line=1 end_line=1
 lines_deleted|1
 total_lines_before|2
 total_lines_after|1

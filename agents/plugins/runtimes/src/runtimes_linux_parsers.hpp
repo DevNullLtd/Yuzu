@@ -97,6 +97,7 @@
 #include <yuzu/agent/scoped_fd.hpp> // yuzu::agent::ScopedFd (agents/core; POSIX-only header)
 
 #include <posix_dir_walk.hpp> // yuzu::shared::walk_dir_capped (agents/shared)
+#include <row_byte_budget.hpp> // yuzu::shared::RowByteBudget (agents/shared)
 
 #include <dirent.h>
 #include <fcntl.h>
@@ -539,10 +540,9 @@ inline DirHandle open_path(const std::string& root, std::string_view rel,
 /// every loop to stop.
 struct WalkBudget {
     explicit WalkBudget(const WalkLimits& l) noexcept
-        : limits(l), rows_left(l.rows), bytes_left(l.row_bytes), entries_left(l.entries_visited) {}
+        : limits(l), output{l.rows, l.row_bytes}, entries_left(l.entries_visited) {}
     WalkLimits limits;
-    std::size_t rows_left;
-    std::size_t bytes_left;
+    yuzu::shared::RowByteBudget output; // rows + row bytes; `exhausted` below is the stop flag
     std::size_t entries_left;
     bool exhausted = false;
 };
@@ -550,13 +550,11 @@ struct WalkBudget {
 /// Appends `row` unless the row or byte budget is spent (then `row_cap`, and the walk stops).
 inline bool push_row(std::vector<std::string>& rows, std::string&& row, WalkBudget& b,
                      ConstraintAccumulator& acc) {
-    if (b.rows_left == 0 || row.size() > b.bytes_left) {
+    if (!b.output.charge(row.size())) {
         b.exhausted = true;
         acc.add_failure(kTokRowCap);
         return false;
     }
-    --b.rows_left;
-    b.bytes_left -= row.size();
     rows.push_back(std::move(row));
     return true;
 }

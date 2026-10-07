@@ -44,7 +44,9 @@ metadata:
     version, publisher or install date, so such a row can split into any
     count: accept a row only when it has exactly 5 or exactly 7 tokens under
     the escape-aware split, reject any other count, and read the sixth and
-    seventh columns only for agents known to run plugin 1.2.0 or later.
+    seventh columns only for agents known to run plugin 1.2.0 or later. A
+    macOS list may lead with a warning|bundle_id_* row; ignore lines whose
+    first token is not app.
   tags: [software, inventory, compliance]
 
 spec:
@@ -89,7 +91,7 @@ spec:
         platforms: [windows, darwin]
       - name: bundle_id
         type: string
-        description: "The macOS CFBundleIdentifier read in-process from the bundle at install_location (reverse-DNS form). Always \"-\" on Windows and Linux, which have no bundle identifier concept; \"-\" on macOS when the location is not a bundle or carries no identifier, and for rows beyond the per-run enrichment cap (5000 applications / 120 s), which is not reported as degraded. The value is as reported by the OS: untrusted, as reported by the local bundle — a local user can plant a bundle whose identifier is any string. Values: bundle identifier or \"-\"."
+        description: "The macOS CFBundleIdentifier read in-process from the bundle at install_location (reverse-DNS form). Always \"-\" on Windows and Linux, which have no bundle identifier concept; \"-\" on macOS when the location is not a bundle or carries no identifier, and for rows the bounded bundle-id pass did not reach (30 s deadline, at most 5000 applications submitted, one pass in flight per agent process (one per device)) -- a cut-short or capped pass is reported by a leading warning|bundle_id_* row and a CONSTRAINED / PARTIAL status, never silently. An identifier is cut at 4 KiB at read. The value is as reported by the OS: untrusted, as reported by the local bundle — a local user can plant a bundle whose identifier is any string. Values: bundle identifier or \"-\"."
         example: "com.apple.ActivityMonitor"
         platforms: [darwin]
     aggregation:

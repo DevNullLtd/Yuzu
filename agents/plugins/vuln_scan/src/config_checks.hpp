@@ -1,10 +1,18 @@
 #pragma once
 
 #include <array>
+#include <cerrno>
 #include <cstdio>
+#include <expected>
 #include <fstream>
+#include <format>
+#include <istream>
+#include <map>
+#include <optional>
 #include <string>
 #include <string_view>
+#include <type_traits>
+#include <utility>
 #include <vector>
 
 #if defined(__linux__) || defined(__APPLE__)
@@ -33,6 +41,190 @@ struct ConfigCheckResult {
     bool passed;
 };
 
+// ── Portable read results and pure decisions (#4961) ───────────────────────
+//
+// A read that FAILED must never look like a read that returned an empty or
+// unexpected value: the former is "the check could not run" (UNREADABLE), the
+// latter is a real finding. Readers return the value or the errno; the checks
+// below are pure so every OS's unit suite exercises them.
+
+using ReadResult = std::expected<std::string, int>;                // value or errno
+using LinesResult = std::expected<std::vector<std::string>, int>;  // lines or errno
+
+inline std::string errno_name(int e) {
+    switch (e) {
+    case EACCES: return "eacces";
+    case EPERM: return "eperm";
+    case ENOENT: return "enoent";
+    case EIO: return "eio";
+    case ENOTDIR: return "enotdir";
+    case EISDIR: return "eisdir";
+    default: return "errno_" + std::to_string(e);
+    }
+}
+
+// badbit = an I/O fault mid-read (libstdc++ records a read() error as badbit with
+// errno set). failbit+eofbit on a short or empty file is a VALUE (empty string)
+// here; libc++ also reports a read fault that way, which is why
+// aslr_check/suid_dumpable_check treat an empty /proc/sys value as a fault.
+inline ReadResult read_value_from(std::istream& in) {
+    std::string val;
+    std::getline(in, val);
+    if (in.bad())
+        return std::unexpected(EIO);
+    return val;
+}
+
+inline LinesResult read_lines_from(std::istream& in) {
+    std::vector<std::string> lines;
+    std::string line;
+    while (std::getline(in, line))
+        lines.push_back(line);
+    if (in.bad())
+        return std::unexpected(EIO);
+    return lines;
+}
+
+// Pure summary output (one string per output line): the TOTAL row first, then
+// one row per severity. UNREADABLE (the check could not run)
+// is counted separately and is NOT an issue, nor is INFO.
+inline std::vector<std::string> summary_rows(const std::vector<std::string>& severities) {
+    static constexpr const char* kSeverities[] = {"CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO", "UNREADABLE"};
+    std::map<std::string, int> counts;
+    for (const char* sev : kSeverities)
+        counts[sev] = 0;
+    for (const auto& s : severities)
+        counts[s]++;
+
+    int total = 0;
+    int issues = 0;
+    for (const auto& [sev, count] : counts) {
+        total += count;
+        if (sev != "INFO" && sev != "UNREADABLE")
+            issues += count;
+    }
+
+    std::vector<std::string> rows;
+    rows.push_back(std::format("summary|TOTAL|{} findings ({} issues)", total, issues));
+    for (const char* sev : kSeverities)
+        rows.push_back(std::format("summary|{}|{}", sev, counts[sev]));
+    return rows;
+}
+
+namespace detail {
+
+inline ConfigCheckResult unreadable(std::string_view title, std::string_view path, int err) {
+    return {"UNREADABLE", title, std::string(path) + ": " + errno_name(err), false};
+}
+
+// Comment lines (first non-blank char '#') never count as a directive.
+inline bool directive_present(const std::vector<std::string>& lines, std::string_view needle) {
+    for (const auto& line : lines) {
+        auto pos = line.find_first_not_of(" \t");
+        if (pos != std::string::npos && line[pos] == '#')
+            continue;
+        if (line.find(needle) != std::string::npos)
+            return true;
+    }
+    return false;
+}
+
+inline constexpr std::string_view kAslrPath = "/proc/sys/kernel/randomize_va_space";
+inline constexpr std::string_view kSuidPath = "/proc/sys/fs/suid_dumpable";
+inline constexpr std::string_view kSshdConfigPath = "/etc/ssh/sshd_config";
+inline constexpr std::string_view kMountsPath = "/proc/mounts";
+
+// An absent sshd_config means no SSH server config to weaken -- not a finding.
+inline ConfigCheckResult sshd_not_applicable(std::string_view title) {
+    return {"INFO", title, std::string(kSshdConfigPath) + " not present; check not applicable",
+            true};
+}
+
+} // namespace detail
+
+inline ConfigCheckResult aslr_check(const ReadResult& r) {
+    constexpr std::string_view title = "ASLR (Address Space Layout Randomization)";
+    if (!r)
+        return detail::unreadable(title, detail::kAslrPath, r.error());
+    const auto& val = *r;
+    // A /proc/sys value is never empty: an empty read is a fault the stream did not
+    // flag (libc++ surfaces a read error as EOF, not badbit; a masked file reads
+    // empty), never a value to judge.
+    if (val.empty())
+        return detail::unreadable(title, detail::kAslrPath, EIO);
+    bool ok = !val.empty() && val[0] == '2';
+    return {ok ? "INFO" : "HIGH", title,
+            ok ? "Full randomization enabled (value=2)"
+               : "Not fully enabled (value=" + val + ") - should be 2",
+            ok};
+}
+
+inline ConfigCheckResult suid_dumpable_check(const ReadResult& r) {
+    constexpr std::string_view title = "SUID Core Dumps";
+    if (!r)
+        return detail::unreadable(title, detail::kSuidPath, r.error());
+    const auto& val = *r;
+    if (val.empty())
+        return detail::unreadable(title, detail::kSuidPath, EIO); // see aslr_check
+    bool ok = !val.empty() && val[0] == '0';
+    return {ok ? "INFO" : "MEDIUM", title,
+            ok ? "Restricted (suid_dumpable=0)"
+               : "Not restricted (suid_dumpable=" + val + ") - SUID programs may dump core",
+            ok};
+}
+
+inline ConfigCheckResult ssh_root_login_check(const LinesResult& r) {
+    constexpr std::string_view title = "SSH Root Login";
+    if (!r) {
+        if (r.error() == ENOENT)
+            return detail::sshd_not_applicable(title);
+        return detail::unreadable(title, detail::kSshdConfigPath, r.error());
+    }
+    // Explicit "no" wins; "yes" is insecure; neither -> default depends on
+    // distro, so flag as a warning.
+    if (detail::directive_present(*r, "PermitRootLogin no"))
+        return {"INFO", title, "PermitRootLogin is set to no", true};
+    if (detail::directive_present(*r, "PermitRootLogin yes"))
+        return {"HIGH", title,
+                "PermitRootLogin is set to yes - direct root access via SSH is enabled", false};
+    return {"MEDIUM", title,
+            "PermitRootLogin not explicitly set - may default to prohibit-password", false};
+}
+
+// nullopt when neither directive is present: no row is emitted (unchanged).
+inline std::optional<ConfigCheckResult> ssh_password_auth_check(const LinesResult& r) {
+    constexpr std::string_view title = "SSH Password Authentication";
+    if (!r) {
+        if (r.error() == ENOENT)
+            return detail::sshd_not_applicable(title);
+        return detail::unreadable(title, detail::kSshdConfigPath, r.error());
+    }
+    if (detail::directive_present(*r, "PasswordAuthentication no"))
+        return ConfigCheckResult{"INFO", title, "Disabled - key-based auth only", true};
+    if (detail::directive_present(*r, "PasswordAuthentication yes"))
+        return ConfigCheckResult{"MEDIUM", title,
+                                 "Enabled - consider using key-based authentication only", false};
+    return std::nullopt;
+}
+
+// nullopt when /proc/mounts has no separate /tmp mount: no row is emitted (unchanged).
+inline std::optional<ConfigCheckResult> tmp_noexec_check(const LinesResult& r) {
+    constexpr std::string_view title = "/tmp noexec";
+    if (!r)
+        return detail::unreadable(title, detail::kMountsPath, r.error());
+    for (const auto& line : *r) {
+        if (line.find(" /tmp ") == std::string::npos)
+            continue;
+        const bool has_noexec = line.find("noexec") != std::string::npos;
+        return ConfigCheckResult{
+            has_noexec ? "INFO" : "MEDIUM", title,
+            has_noexec ? "/tmp is mounted with noexec"
+                       : "/tmp is not mounted with noexec - executables can run from /tmp",
+            has_noexec};
+    }
+    return std::nullopt;
+}
+
 // ── Subprocess helper (Linux / macOS) ──────────────────────────────────────
 
 #if defined(__linux__) || defined(__APPLE__)
@@ -54,29 +246,28 @@ inline std::string run_cmd(const char* cmd) {
     return result;
 }
 
-inline bool file_contains(const char* path, std::string_view needle) {
+// Open failure -> errno from open. A fault after open (badbit, libstdc++) -> the
+// errno the kernel set during the read, else EIO. (libc++ reports a read fault as
+// EOF; the /proc/sys checks close that in the pure layer.)
+template <typename Reader>
+inline auto read_file_with(const char* path, Reader reader)
+    -> std::invoke_result_t<Reader, std::ifstream&> {
     std::ifstream f(path);
     if (!f.is_open())
-        return false;
-    std::string line;
-    while (std::getline(f, line)) {
-        // Skip comment lines
-        auto pos = line.find_first_not_of(" \t");
-        if (pos != std::string::npos && line[pos] == '#')
-            continue;
-        if (line.find(needle) != std::string::npos)
-            return true;
-    }
-    return false;
+        return std::unexpected(errno ? errno : EIO);
+    errno = 0;
+    auto r = reader(f);
+    if (!r && errno != 0)
+        return std::unexpected(errno);
+    return r;
 }
 
-inline std::string read_proc_value(const char* path) {
-    std::ifstream f(path);
-    if (!f.is_open())
-        return {};
-    std::string val;
-    std::getline(f, val);
-    return val;
+inline ReadResult read_proc_value(const char* path) {
+    return read_file_with(path, [](std::istream& in) { return read_value_from(in); });
+}
+
+inline LinesResult read_lines(const char* path) {
+    return read_file_with(path, [](std::istream& in) { return read_lines_from(in); });
 }
 
 } // namespace detail
@@ -224,82 +415,19 @@ inline std::vector<ConfigCheckResult> run_windows_checks() {
 inline std::vector<ConfigCheckResult> run_linux_checks() {
     std::vector<ConfigCheckResult> results;
 
-    // SSH: PermitRootLogin
+    // SSH: sshd_config is read ONCE; both SSH checks decide from that read.
     {
-        bool root_login = detail::file_contains("/etc/ssh/sshd_config", "PermitRootLogin yes");
-        bool no_root = detail::file_contains("/etc/ssh/sshd_config", "PermitRootLogin no");
-        // If explicit "no" found, it's secure. If "yes" found, it's insecure.
-        // If neither, default depends on distro but flag as warning.
-        if (no_root) {
-            results.push_back({"INFO", "SSH Root Login", "PermitRootLogin is set to no", true});
-        } else if (root_login) {
-            results.push_back(
-                {"HIGH", "SSH Root Login",
-                 "PermitRootLogin is set to yes - direct root access via SSH is enabled", false});
-        } else {
-            results.push_back(
-                {"MEDIUM", "SSH Root Login",
-                 "PermitRootLogin not explicitly set - may default to prohibit-password", false});
-        }
+        const auto sshd = detail::read_lines(detail::kSshdConfigPath.data());
+        results.push_back(ssh_root_login_check(sshd));
+        if (auto pw = ssh_password_auth_check(sshd))
+            results.push_back(std::move(*pw));
     }
 
-    // SSH: PasswordAuthentication
-    {
-        bool pw_yes = detail::file_contains("/etc/ssh/sshd_config", "PasswordAuthentication yes");
-        bool pw_no = detail::file_contains("/etc/ssh/sshd_config", "PasswordAuthentication no");
-        if (pw_no) {
-            results.push_back(
-                {"INFO", "SSH Password Authentication", "Disabled - key-based auth only", true});
-        } else if (pw_yes) {
-            results.push_back({"MEDIUM", "SSH Password Authentication",
-                               "Enabled - consider using key-based authentication only", false});
-        }
-    }
+    results.push_back(aslr_check(detail::read_proc_value(detail::kAslrPath.data())));
+    results.push_back(suid_dumpable_check(detail::read_proc_value(detail::kSuidPath.data())));
 
-    // ASLR
-    {
-        auto val = detail::read_proc_value("/proc/sys/kernel/randomize_va_space");
-        bool ok = !val.empty() && val[0] == '2';
-        results.push_back({ok ? "INFO" : "HIGH", "ASLR (Address Space Layout Randomization)",
-                           ok ? "Full randomization enabled (value=2)"
-                              : "Not fully enabled (value=" + val + ") - should be 2",
-                           ok});
-    }
-
-    // Core dumps restricted
-    {
-        auto val = detail::read_proc_value("/proc/sys/fs/suid_dumpable");
-        bool ok = !val.empty() && val[0] == '0';
-        results.push_back(
-            {ok ? "INFO" : "MEDIUM", "SUID Core Dumps",
-             ok ? "Restricted (suid_dumpable=0)"
-                : "Not restricted (suid_dumpable=" + val + ") - SUID programs may dump core",
-             ok});
-    }
-
-    // /tmp mounted noexec
-    {
-        std::ifstream mounts("/proc/mounts");
-        bool found_tmp = false;
-        bool has_noexec = false;
-        if (mounts.is_open()) {
-            std::string line;
-            while (std::getline(mounts, line)) {
-                if (line.find(" /tmp ") != std::string::npos) {
-                    found_tmp = true;
-                    has_noexec = line.find("noexec") != std::string::npos;
-                    break;
-                }
-            }
-        }
-        if (found_tmp) {
-            results.push_back(
-                {has_noexec ? "INFO" : "MEDIUM", "/tmp noexec",
-                 has_noexec ? "/tmp is mounted with noexec"
-                            : "/tmp is not mounted with noexec - executables can run from /tmp",
-                 has_noexec});
-        }
-    }
+    if (auto t = tmp_noexec_check(detail::read_lines(detail::kMountsPath.data())))
+        results.push_back(std::move(*t));
 
     // Firewall (iptables/nftables)
     {

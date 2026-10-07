@@ -339,6 +339,70 @@ TEST_CASE("hardware CI overview lens: MAC chips render one span per address",
     CHECK(empty_html.find("<span class=\"hw-tag\">") == std::string::npos);
 }
 
+TEST_CASE("hardware CI overview lens: CPU cores/threads and RAM humanised; unknown is a dash",
+          "[hardware][ui]") {
+    DeviceCiRecord rec;
+    rec.cpu_cores = "8";
+    rec.cpu_threads = "16";
+    rec.ram_bytes = "17179869184"; // 16 GiB
+    HardwareCiDetail detail;
+    detail.ci = std::optional<DeviceCiRecord>(rec);
+    HwCiAffordances aff;
+
+    const auto html = render_hardware_lens_body("a1", detail, /*lens=*/"", /*now_secs=*/0, aff);
+    CHECK(html.find("Cores / threads: </span>8c/16t") != std::string::npos);
+    CHECK(html.find("Memory: </span>16.0 GB") != std::string::npos);
+
+    DeviceCiRecord unk;
+    unk.cpu_cores = "unknown";
+    unk.cpu_threads = "unknown";
+    unk.ram_bytes = "unknown";
+    HardwareCiDetail unk_detail;
+    unk_detail.ci = std::optional<DeviceCiRecord>(unk);
+    const auto unk_html = render_hardware_lens_body("a1", unk_detail, "", 0, aff);
+    CHECK(unk_html.find("8c/16t") == std::string::npos);
+    CHECK(unk_html.find(" GB") == std::string::npos);
+    CHECK(unk_html.find("Cores / threads: </span><span class=\"inv-grey\">&mdash;</span>") !=
+          std::string::npos);
+    CHECK(unk_html.find("Memory: </span><span class=\"inv-grey\">&mdash;</span>") !=
+          std::string::npos);
+}
+
+TEST_CASE("hardware CI record: store degrade, not-yet-synced and found render distinct states",
+          "[hardware][ui]") {
+    // ADR-0016 §7: an empty page must never mean failure. The three Overview states
+    // must stay distinguishable (this replaces the HTML-level pins that lived with the
+    // retired /inventory device renderers).
+    HwCiAffordances aff;
+
+    HardwareCiDetail degraded; // default ci = std::unexpected(kDegraded): store unreadable
+    const auto deg = render_hardware_lens_body("a1", degraded, "", 0, aff);
+    CHECK(deg.find("CI record unavailable") != std::string::npos);
+    CHECK(deg.find("hw-degrade") != std::string::npos);
+    CHECK(deg.find("No CI record synced") == std::string::npos);
+
+    HardwareCiDetail absent;
+    absent.ci = std::optional<DeviceCiRecord>{}; // read fine, device has not synced yet
+    const auto abs = render_hardware_lens_body("a1", absent, "", 0, aff);
+    CHECK(abs.find("No CI record synced yet") != std::string::npos);
+    CHECK(abs.find("CI record unavailable") == std::string::npos);
+
+    HardwareCiDetail found;
+    found.ci = std::optional<DeviceCiRecord>(DeviceCiRecord{});
+    const auto ok = render_hardware_lens_body("a1", found, "", 0, aff);
+    CHECK(ok.find("CI record unavailable") == std::string::npos);
+    CHECK(ok.find("No CI record synced") == std::string::npos);
+
+    HardwareCiDetail sw_degraded; // software == nullopt on the Installed software lens
+    const auto sw = render_hardware_lens_body("a1", sw_degraded, "software", 0, aff);
+    CHECK(sw.find("Installed software unavailable") != std::string::npos);
+    HardwareCiDetail sw_empty;
+    sw_empty.software.emplace();
+    const auto sw_none = render_hardware_lens_body("a1", sw_empty, "software", 0, aff);
+    CHECK(sw_none.find("Installed software unavailable") == std::string::npos);
+    CHECK(sw_none.find("No installed-software inventory") != std::string::npos);
+}
+
 // ── Lens tab bar ───────────────────────────────────────────────────────────────
 
 TEST_CASE("hardware lens bar: id, fixed 7-tab order, active class, oob gated on the parameter",

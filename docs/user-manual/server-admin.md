@@ -48,7 +48,7 @@ The Yuzu server binary accepts the following command-line flags. All flags are o
 | `--key` | *(none)* | Path to PEM-encoded gRPC server private key for the agent listener. The file must not be world-readable (Unix: `chmod 600`). Env: `YUZU_KEY`. |
 | `--no-default-certs` | off | Do **not** auto-generate built-in default certificates on first boot. Restores the legacy refuse-to-start: the server will not start unless `--cert`/`--key` (and `--https-cert`/`--https-key` when HTTPS is enabled) are supplied. Use where operator- or HSM-provided certs are mandatory policy. (Defaults emit a startup banner, the audit actions `server.default_certs_generated` + `server.default_certs_in_use`, and the Prometheus gauge `yuzu_server_default_certs_active`.) Env: `YUZU_NO_DEFAULT_CERTS`. |
 | `--ca-dir` | *(platform cert dir)* | Directory for the built-in CA root + default leaf certs (`default-ca.pem`/`.key`, `default-server.pem`, `default-https.pem`, …). Default: `/etc/yuzu/certs` (Linux; macOS running as root — matches the packaged-install convention), `~/Library/Application Support/Yuzu/certs` (macOS running as a non-root user — e.g. a native `scripts/start-UAT.sh` dev run, since `/etc/yuzu` is root-owned and macOS has no packaged server installer), `C:\ProgramData\Yuzu\certs` (Windows). The CA root key is `0600` — back it up (losing it forces a full fleet re-enrollment). Env: `YUZU_CA_DIR`. |
-| `--cert-san` | *(none)* | **Repeatable.** Extra Subject Alternative Name to add to *every* auto-generated default leaf (dashboard HTTPS, agent/management gRPC, and gateway), on top of the base `localhost` / `127.0.0.1` / `::1` / `<hostname>`. Forms: `dns:<name>`, `ip:<addr>`, or a bare value (auto-classified as IP vs DNS by shape); a single value may be comma-separated. Use this so the built-in certs validate for a name a client actually dials — e.g. `--cert-san dns:gateway` so an agent reaching the gateway by that service name passes TLS hostname verification, or `--cert-san dns:yuzu.corp.example --cert-san ip:10.0.0.5` for a load-balancer name / VIP. An `ip:` value that is not an IP literal is ignored with a warning. **Ignored** when operator certs are supplied or `--no-default-certs` is set; **changing it does not rotate an existing cert set** — clear `--ca-dir` (or replace the certs) for new SANs to take effect (in a container the cert dir lives in the image layer unless a volume is mounted there, so *recreate* the container — a restart alone won't regenerate). Env: `YUZU_CERT_SAN`. |
+| `--cert-san` | *(none)* | **Repeatable.** Extra Subject Alternative Name to add to *every* auto-generated default leaf (dashboard HTTPS, agent/management gRPC, and gateway), on top of the base `localhost` / `127.0.0.1` / `::1` / `<hostname>`. Forms: `dns:<name>`, `ip:<addr>`, or a bare value (auto-classified as IP vs DNS by shape); a single value may be comma-separated. Use this so the built-in certs validate for a name a client actually dials — e.g. `--cert-san dns:gateway` so an agent reaching the gateway by that service name passes TLS hostname verification, or `--cert-san dns:yuzu.corp.example --cert-san ip:10.0.0.5` for a load-balancer name / VIP. An `ip:` value that is not an IP literal is ignored with a warning. **Ignored** when operator certs are supplied or `--no-default-certs` is set; **changing it does not rotate an existing cert set** — the server logs a warning naming the missing SANs. To re-issue the default leaves with them under the same CA, rename `default-marker.json` in `--ca-dir` aside (for example to `default-marker.json.bak`; moving it back undoes this if the next start refuses) and restart the server. With Compose, add `YUZU_CERT_SAN` to the `server` environment, run `docker compose up -d server` so the new environment applies (`restart` keeps the old one), then rename the marker and run `docker compose restart server`. **Never clear the whole `--ca-dir`:** it also holds the CA key and the secrets key-encryption key (`secrets-kek-*.key`); without the KEK the server refuses to start (`kek_unresolvable`, #5370), and without the CA key it refuses to mint a new CA over the root recorded in Postgres. Env: `YUZU_CERT_SAN`. |
 | `--ca-cert` | *(none)* | Path to PEM-encoded CA certificate used to verify agent client certificates (full mTLS). Without this, the agent listener has no client-cert verification — `--insecure-skip-client-verify` plus `YUZU_ALLOW_INSECURE_TLS=1` is required to start in that posture. Env: `YUZU_CA_CERT`. |
 | `--insecure-skip-client-verify` | off | Allow gRPC TLS without `--ca-cert` (one-way TLS — server cert is presented but client certs are not verified). Applies to BOTH the agent listener and the management listener. **Requires `YUZU_ALLOW_INSECURE_TLS=1` in the environment as a second confirmation** — the server refuses to start without it. Renamed from `--allow-one-way-tls` in v0.12.0; the old name is still accepted with a deprecation warning. |
 | `--allow-one-way-tls` | off | **[DEPRECATED]** Renamed to `--insecure-skip-client-verify`. Still accepted for backward compatibility with a startup deprecation warning; will be removed in a future release. |
@@ -171,7 +171,7 @@ The server's configuration file (`--config`, default `/etc/yuzu/yuzu-server.cfg`
 
 | File | Purpose |
 |---|---|
-| `yuzu-server.cfg` | First-boot seed for the initial admin. Holds the initial admin credential as PBKDF2-SHA256 with a per-user salt, which is seeded into the PostgreSQL `auth` schema on first boot. After that the `auth` schema is authoritative — keep this file as the seed for disaster recovery. |
+| `yuzu-server.cfg` | First-boot seed for the initial admin. Holds the initial admin credential as PBKDF2-SHA256 with a per-user salt, which is seeded into the PostgreSQL `auth` schema on first boot. After that the `auth` schema is authoritative and this file is seed-only (#5274): editing it does not change a stored password — change passwords in the product (Settings → User Management, or `POST /api/v1/users/me/password`, #5342). Keep this file as the seed for disaster recovery. |
 | `auto-approve.cfg` | Auto-approve enrollment policy rules and match mode. |
 | `nvd_cves.db` | NVD CVE cache. The one remaining server SQLite store — a recorded deferral, not a permanent exemption (`docs/postgres-migration-ladder.md`). |
 | `agent-updates/` | Agent OTA package binaries. The package records (`update_registry.update_packages`) are in PostgreSQL; the files they name live here. Relocated by `--update-dir` when that flag is set. |
@@ -180,7 +180,7 @@ The server's configuration file (`--config`, default `/etc/yuzu/yuzu-server.cfg`
 > **Backup recommendation:** A complete backup is a `pg_dump --format=custom` of the Yuzu database **plus the entire CA/cert directory `--ca-dir`**, captured at the same point in time and restored as a pair — `--ca-dir` holds `default-ca.key` (the per-install CA private key) and the secrets KEK files `secrets-kek-v<N>.key`, without which the secret columns in the dump (TOTP secrets, webhook and plugin-config secrets, runtime-config and offload-target secrets) cannot be decrypted. See [Backup — the KEK pairing rule](../ops-runbooks/auth-db-recovery.md#backup--the-kek-pairing-rule) and [PostgreSQL Substrate](#postgresql-substrate) for the procedure. Retain old KEK versions for as long as the backups that need them. Also back up the `--data-dir` `.cfg` files above, `nvd_cves.db` (use `sqlite3 nvd_cves.db ".backup ..."`, NEVER `cp` against a live DB), and the two blob directories `agent-updates/` (or your `--update-dir`) and `upload-blobs/` — the dump holds only the package and upload records that point into them, so restoring the dump without these directories leaves records with no files behind them. **Losing `default-ca.key` forces a full fleet re-enrollment** (every agent's cert chains to that root, and the server refuses to silently re-root — see below). Losing the Postgres `auth` schema AND `yuzu-server.cfg` requires re-running `--first-run-setup` to create a new admin. Losing authentication state alone is a Postgres restore — see `docs/ops-runbooks/auth-db-recovery.md`. **The internal-CA inventory + CRL history (`ca_store` schema, ADR-0053) is one of the migrated Postgres stores** — back it up with `pg_dump`/`pg_restore`, not as a separate local file.
 
 > **Built-in default certificates — convenience, not production.** With no `--cert`/`--key`/`--https-cert` supplied (and without `--no-default-certs`), the server generates a per-install ECDSA CA + server leaves on first boot so a fresh install is encrypted with zero config. Operational caveats:
-> - **10-year, no auto-renewal.** The server leaves do not auto-renew; the `yuzu_server_cert_expiry_timestamp_seconds{cert="default-ca"}` gauge + the `YuzuCertificateExpiringSoon`/`…Critical` alerts (`docs/prometheus/yuzu-alerts.yml`) warn ahead of expiry. **Replace defaults before production rollout** with operator-provided certs (`--cert`/`--key`, `--https-cert`/`--https-key`) or, to rotate the built-in set, clear `--ca-dir` (after backing it up) and restart.
+> - **10-year, no auto-renewal.** The server leaves do not auto-renew; the `yuzu_server_cert_expiry_timestamp_seconds{cert="default-ca"}` gauge + the `YuzuCertificateExpiringSoon`/`…Critical` alerts (`docs/prometheus/yuzu-alerts.yml`) warn ahead of expiry. **Replace defaults before production rollout** with operator-provided certs (`--cert`/`--key`, `--https-cert`/`--https-key`) or, to rotate the built-in set, follow the clean re-root in [PKI architecture](../pki-architecture.md) "Operator runbook", which removes the `default-*` files and `default-marker.json` and also clears the CA inventory in Postgres (`ca_store`). Never clear the whole `--ca-dir`: it also holds the secrets key-encryption key (`secrets-kek-*.key`), and the server refuses to start without it (`kek_unresolvable`, #5370).
 > - **SAN limitation.** Default leaf SANs cover `localhost`, `127.0.0.1`, `::1`, and the boot-time hostname only. Reaching the dashboard/agent listener by a LAN IP or a different FQDN needs operator-provided certs (or DNS that resolves to a covered name). A host rename invalidates the SAN — rotate the certs after renaming.
 > - **No silent re-root.** If `ca_store` (the internal-CA Postgres store, ADR-0053) already holds a CA root but the on-disk certs in `--ca-dir` are missing/corrupt (e.g. a wiped cert dir on a persistent data volume, or ordinary later damage to an established install — a bad partial restore, a lost leaf file), the server **refuses to start** rather than mint a new CA that would orphan every enrolled agent — **unless this exact instance can prove it minted the still-incomplete root** (its local CA key file still resolves and cryptographically pairs with the stored root), in which case it resumes automatically and re-mints its own default leaves under the same root (ADR-0053). When that self-heal condition does not hold, restore `default-*.{pem,key}` from backup (matching the `ca_store` root), or perform a deliberate clean re-root by clearing `ca_store.ca_root`/`ca_issued`/`ca_crl_versions` directly against Postgres — see `docs/pki-architecture.md` "Operator runbook" for the full procedure.
 
@@ -231,7 +231,7 @@ separately.
 
 ### vNEXT — the shipped Docker Compose files keep `/etc/yuzu/certs` on a volume (#5370; action needed before you recreate a 0.14.0 container)
 
-**Action required before upgrading from 0.14.0 on Docker Compose: copy `/etc/yuzu/certs` out of the running server container first ([Upgrading](upgrading.md) → "Docker Compose: copy `/etc/yuzu/certs` out of the server container before you recreate it").** Affected: a 0.14.0 Docker Compose stack whose server has no named volume on `/etc/yuzu/certs` while Postgres has one — `deploy/docker/docker-compose.yml` (the README quickstart), `docker-compose.uat.yml`, `docker-compose.full-uat.yml`, `docker-compose.viz-uat.yml`, `docker-compose.demo.yml` used with `--keep`, any compose copied from them, and Compose Wizard output from before 0.14.1 in Plaintext mode, with 'Persist generated certs' unticked, or with named volumes off and an external Postgres. Not affected: `docker-compose.reference.yml` and `docker-compose.reference-gateway.yml` (their `certs` volume).
+**Action required before upgrading from 0.14.0 on Docker Compose: copy `/etc/yuzu/certs` out of the running server container first ([Upgrading](upgrading.md) → "Docker Compose: copy `/etc/yuzu/certs` out of the server container before you recreate it").** Affected: a 0.14.0 Docker Compose stack whose server has no named volume on `/etc/yuzu/certs` while Postgres has one — `deploy/docker/docker-compose.yml` (the 0.14.0 README quickstart), `docker-compose.uat.yml`, `docker-compose.full-uat.yml`, `docker-compose.viz-uat.yml`, `docker-compose.demo.yml` used with `--keep`, any compose copied from them, and Compose Wizard output from before 0.14.1 in Plaintext mode, with 'Persist generated certs' unticked, or with named volumes off and an external Postgres. Not affected: `docker-compose.reference.yml` (which the README quickstart saves as `docker-compose.yml` since #5419) and `docker-compose.reference-gateway.yml` (their `certs` volume).
 
 `deploy/docker/docker-compose.yml`, `docker-compose.uat.yml`, `docker-compose.full-uat.yml`, `docker-compose.viz-uat.yml`, `docker-compose.demo.yml` and the Compose Wizard's Default and Plaintext output (with named volumes on, or with an external Postgres) now mount a `server-certs` volume on `/etc/yuzu/certs`, which holds the internal CA and the secrets KEK. In 0.14.0 that directory sat in the container's own layer, so recreating the container deleted the KEK. Postgres still had it registered, so the server refused to start (`kek_unresolvable`). The reference composes already persisted it, on their `certs` volume. The Upgrading section gives the copy-out commands, the diagnostics to run before anything destructive, a rollback that keeps the keys, and the recovery path if the files are already gone. See also [What must persist](#docker-compose).
 
@@ -290,7 +290,7 @@ The server's own CA, default certificates and key-encryption keys stay where the
 - **An upgrade keeps the existing accounts; leave out `/ADMIN_USER`, `/ADMIN_PASS` and the operator pair.** An upgrade is any run where `%ProgramData%\Yuzu Server\yuzu-server.cfg` already exists, including an upgrade from an earlier version. The installer can no longer change a stored password: `yuzu-server.cfg` only seeds the first administrator into an empty database and is not consulted for an account the PostgreSQL auth store already holds (#5274), so a new hash written there would be ignored and the old password would stay valid. A non-empty `/ADMIN_PASS=` or `/OPERATOR_PASS=` on an upgrade is therefore **refused with exit code 11** before anything is stopped or changed, and the interactive wizard skips the account pages on an upgrade. Change or reset passwords in the product instead (Settings → User Management → **Change password** / **Reset password**), or with the direct-SQL fallback in `docs/ops-runbooks/auth-db-recovery.md` if no administrator can sign in. On a fresh install the passwords must be at least 12 characters and at most 1024 bytes of UTF-8 (the server's limit; a character outside ASCII takes 2–4 bytes). The optional `/OPERATOR_USER` account is written to `yuzu-server.cfg` but is never provisioned into the PostgreSQL auth store, so it cannot sign in (#5343); create further accounts in Settings → User Management. An upgrade keeps the stored connection string unless a new one is given, and keeps the stored OIDC secret when `/OIDC_ISSUER` is given again. Repeat your other options (`/GATEWAY`, `/OIDC_ISSUER`, `/OIDC_CLIENT_ID`, …) on an upgrade: they are not remembered.
 - **Upgrade in place; do not uninstall the previous version first.** Uninstalling removes the service and the installation record but keeps the old, unlocked data directory. The new installer then cannot tell that an administrator created that directory, and refuses it.
 - **Exit code 7** means the install was stopped before any file was installed: an input was missing or invalid, or something could not be secured. The reason is in the setup log on a line starting `PrepareToInstall:`. If the existing service had been stopped by then, it is left stopped, and the message says so (and says if it was disabled). The exception is an upgrade from an unsecured directory that stops before the old directory is moved: the service is then started again. On an upgrade of an already-secured install, the message also lists any files in the data directory that had already been replaced.
-- **Exit code 10** means the files were installed but the service could not be registered or its command line could not be written. Setup disables the service if it can, and the message and log say whether it did; if not, disable it yourself (`sc config YuzuServer start= disabled`) until the cause is fixed.
+- **Exit code 10** means the files were installed but the service could not be registered or its command line could not be written. Setup disables the service if it can, and the message and log say whether it did; if not, disable it yourself (`sc.exe config YuzuServer start= disabled`) until the cause is fixed.
 - **Exit code 11** means an upgrade was given a non-empty `/ADMIN_PASS=` or `/OPERATOR_PASS=` (see above). Setup stopped before the wizard, before the service was stopped and before anything was written; the reason is in the setup log on a line starting `InitializeSetup:`. Run it again without the account parameters, then change the password in the product. (Setup's own temporary folder in `%TEMP%` is left behind in this case; it holds nothing secret.)
 - **Secrets on the command line are recorded** in the setup log (`/LOG=`) and by deployment tools such as SCCM (AppEnforce.log) and Intune, including any `/ADMIN_PASS=`, `/OPERATOR_PASS=`, `/POSTGRES_DSN=` or `/OIDC_CLIENT_SECRET=` value. Prefer `/POSTGRES_DSN_FILE=` and `/OIDC_CLIENT_SECRET_FILE=`. Stage those files in a pre-step, with permissions only Administrators and SYSTEM can read, and delete them afterwards: the installer copies them and leaves the originals. `/ADMIN_PASS=` and `/OPERATOR_PASS=` have no file form, so treat those logs as secrets: restrict or purge them after the deployment.
 
@@ -3330,7 +3330,14 @@ for the X509 string finds nothing. Two-tier PKIs are the normal enterprise case,
 so this is easy to hit.
 
 **Diagnosing a rejection.** The agent logs either `untrusted chain` or
-`invalid signature`. Be aware that a certificate-*profile* problem — a
+`invalid signature` — or, when its own trust bundle cannot be loaded at all
+(missing, unreadable by the agent's account, not a regular file, larger than
+1 MiB, held open by another process that denies shared reading (Windows), or not a PEM certificate file),
+`the update trust bundle could not be loaded, so the signature was not checked`,
+counted as `reason="bundle_unreadable"`. That last one is a fault on the
+endpoint, not in your signing; fix the bundle file or its permissions. Agents
+before 0.14.1 reported it as `untrusted chain` (#5249). Be aware that a
+certificate-*profile* problem — a
 non-critical keyUsage, a missing codeSigning EKU, a missing intermediate — is
 reported as `untrusted chain`, the same as a genuinely wrong CA. Check the
 profile above before concluding the trust bundle is wrong. Verify a certificate
@@ -3369,7 +3376,7 @@ both:
 |---|---|---|
 | Linux | `/etc/yuzu-agent/certs/` | `root:root`, mode 0755 |
 | macOS | `/etc/yuzu-agent/certs/` | `root:wheel`, mode 0755 |
-| Windows | `C:\ProgramData\Yuzu\agent-certs\` | Administrators + SYSTEM, owned by Administrators (or SYSTEM), and holding only files. The installer builds a new one in its private temporary folder, locks it there (`icacls /setowner /L` → `/reset /L` → `/inheritance:r /grant:r /L`), checks it, moves it into place and checks it again; an existing, secured directory is not re-locked. If it already exists, it must already be secured exactly; the installer refuses rather than take over a directory it did not secure, because whatever is in it already decides which updates are trusted. It also refuses a junction, symbolic link or subdirectory at or in it, and nothing it runs is recursive. Files in an existing, secured directory must already be owned by Administrators or SYSTEM, and not be hard links, before their permissions are reset to inherit the grant (this repairs the rc1..rc5 lock-out); the installer never takes ownership of a file, and refuses one someone else placed. The check runs before the agent service is stopped, so a refusal leaves the service as it was. Not covered: the parent `C:\ProgramData\Yuzu` (#5257), and a handle opened before the install (#5258). A pre-install check compares the security descriptor of the directory and of everything inside it exactly: the owner, and an entry list of Administrators and SYSTEM with full control and nothing else (no deny entries, no other accounts). It aborts the install otherwise. |
+| Windows | `C:\ProgramData\Yuzu\agent-certs\` | Administrators + SYSTEM, owned by Administrators (or SYSTEM), and holding only files. The installer builds a new one in its private temporary folder, locks it there (`icacls /setowner /L` → `/reset /L` → `/inheritance:r /grant:r /L`), checks it, moves it into place and checks it again; an existing, secured directory is not re-locked. If it already exists, it must already be secured exactly; the installer refuses rather than take over a directory it did not secure, because whatever is in it already decides which updates are trusted. It also refuses a junction, symbolic link or subdirectory at or in it, and nothing it runs is recursive. Files in an existing, secured directory must already be owned by Administrators or SYSTEM, and not be hard links, before their permissions are reset to inherit the grant (this repairs the rc1..rc5 lock-out); the installer never takes ownership of a file, and refuses one someone else placed. The check runs before the agent service is stopped, so a refusal leaves the service as it was. A refusal also never leaves the directory less protected than it was found: the lock is applied only to the private copy, so if security software blocks it nothing is created at the path, and an existing directory's own permissions are never changed (#5250). If the installation fails later, after the service was stopped (for example, a file cannot be replaced; Setup exits with code 5), the installer starts the service again before it exits if it was running or still starting -- even when `/NOSTART` was given, since `/NOSTART` applies only to a completed installation -- and its `/LOG=` log says on a `DeinitializeSetup:` line whether it saw the service RUNNING again or could NOT start it (then run `sc.exe start YuzuAgent`, never plain `sc`, which PowerShell reads as Set-Content). Files it had already replaced are not put back, so run the installer again. Installers up to 0.14.0 left the service stopped (see [the agent bundle guide](../agent-bundle.md)). Not covered: the parent `C:\ProgramData\Yuzu` (#5257), and a handle opened before the install (#5258). A pre-install check compares the security descriptor of the directory and of everything inside it exactly: the owner, and an entry list of Administrators and SYSTEM with full control and nothing else (no deny entries, no other accounts). It aborts the install otherwise. |
 
 **How much protection that directory gives you depends on the platform, and it is
 worth being precise about it.** On Linux the agent runs as the unprivileged
@@ -3407,6 +3414,32 @@ Every flag below has the environment variable shown beside it:
 Setting `--update-require-signature` **without** a trust bundle refuses to start,
 rather than running with enforcement silently inert.
 
+**Confirming what an agent loaded.** At startup the agent logs the mode it is
+enforcing and the bundle path, for example
+`OTA update signature mode: bundle+require (trust bundle: /etc/yuzu-agent/certs/update-trust-bundle.pem)`,
+or `OTA update signature mode: off (…update binaries are NOT signature-checked)`
+when no bundle is set. That startup line is the verification: it says what this
+agent will enforce. Beside it the agent warns about any environment variable that
+starts with `YUZU_UPDATE_` but is not one it reads, so a misspelling after the
+prefix no longer passes silently. The names it accepts are
+`YUZU_UPDATE_TRUST_BUNDLE`, `YUZU_UPDATE_REQUIRE_SIGNATURE` and
+`YUZU_UPDATE_CHECK_INTERVAL` (the agent's own options) and `YUZU_UPDATE_DIR`
+(the server's update-directory option, accepted silently so a host that also runs
+a server is not warned about it).
+
+The bundle-load warning, `OTA update trust bundle cannot be loaded as of this
+check: …`, is NOT logged beside the mode line. The OTA update checker logs it once,
+when it first starts, after the agent first connects, and only when auto-update is
+enabled; the startup report does no file I/O because it runs before a Windows
+service reports itself started. The same mode (`off`, `bundle` or
+`bundle+require`) travels on every heartbeat as the status tag
+`yuzu.ota_signature_mode` (see
+[metrics.md → Agent-side signature refusals](metrics.md#agent-side-signature-refusals-4163807)).
+The server stores that tag in the agent-health snapshot, but no REST endpoint, MCP
+tool or dashboard view exposes it yet, so the startup log line is the per-endpoint
+source of truth. These signals arrived in 0.14.1 (#5249); an older agent logs none
+of them.
+
 #### Windows: the service's `Environment` value
 
 The Service Control Manager merges a service's `Environment` value into the
@@ -3435,8 +3468,10 @@ Get these right, because several mistakes are silent:
   tool must write the value as a properly terminated multi-string too, every
   entry in `name=value` form and **no empty entry**: the service sees nothing
   after an empty entry.
-- **Names must be exact.** A misspelt name is ignored without any error, and
-  signing then stays off. Run the check below after every change.
+- **Names must be exact.** A misspelt name does not stop the agent, and signing
+  then stays off. From 0.14.1 the agent logs a warning at startup naming any
+  `YUZU_UPDATE_` variable it does not read, and logs the mode it loaded; check
+  that line, or run the check below, after every change.
 - **Set `YUZU_UPDATE_REQUIRE_SIGNATURE` to `1`.** The check below requires exactly
   that. A value the agent cannot read as on or off, such as `enabled` or `1`
   followed by a space, stops it at startup.
@@ -3470,7 +3505,15 @@ CONFIGURED. It prints `OK` and exits 0 only when all of these hold:
   exactly the ones for the stage set on its first line, with no duplicates (other
   variables are ignored);
 - the bundle file exists;
-- the binary path carries neither signing flag, in either form.
+- the binary path carries neither signing flag, in either form;
+- no environment entry whose name contains a non-ASCII character, no
+  `YUZU_UPDATE_` entry containing one, and no non-ASCII character in the binary
+  path. Windows can convert a lookalike character to a plain one (an ANSI
+  "best-fit" mapping) when it hands the service its environment and command
+  line, so a name or flag this check does not recognise could still reach the
+  agent as a real option;
+- `$stage` is `1` or `2`. Any other value reports `NOT CONFIGURED` rather than
+  silently checking stage 1.
 
 Otherwise it prints `NOT CONFIGURED` and exits 1. Save it as a `.ps1` and run that,
 or use it as a configuration-management compliance script, comparing its output
@@ -3479,23 +3522,41 @@ window.
 
 ```powershell
 $stage = 1   # 2 once the endpoint also refuses unsigned packages
+if ($stage -notin 1, 2) { 'NOT CONFIGURED'; exit 1 }
 $b = 'C:\ProgramData\Yuzu\agent-certs\update-trust-bundle.pem'
 $want = @("YUZU_UPDATE_TRUST_BUNDLE=$b") + @(if ($stage -eq 2) { 'YUZU_UPDATE_REQUIRE_SIGNATURE=1' })
 $k = Get-ItemProperty HKLM:\SYSTEM\CurrentControlSet\Services\YuzuAgent
 $have = @($k.Environment | Where-Object { $_ -match '^YUZU_UPDATE_(TRUST_BUNDLE|REQUIRE_SIGNATURE)=' })
-$ok = ($k.Environment -is [string[]]) -and -not ($k.Environment -contains '') -and ($have.Count -eq $want.Count) -and (@($want | Where-Object { $have -notcontains $_ }).Count -eq 0) -and (($k.ImagePath -replace '"', '') -notmatch '(--|/)update-(trust-bundle|require-signature)') -and (Test-Path -LiteralPath $b -PathType Leaf)
+$na = '[^\x20-\x7E]'
+$lookalike = @($k.Environment | Where-Object { (($_ -split '=', 2)[0] -cmatch $na) -or (($_ -match '^YUZU_UPDATE_') -and ($_ -cmatch $na)) }).Count -gt 0 -or ([string]$k.ImagePath -cmatch $na)
+$ok = ($k.Environment -is [string[]]) -and -not ($k.Environment -contains '') -and -not $lookalike -and ($have.Count -eq $want.Count) -and (@($want | Where-Object { $have -notcontains $_ }).Count -eq 0) -and (($k.ImagePath -replace '"', '') -notmatch '(--|/)update-(trust-bundle|require-signature)') -and (Test-Path -LiteralPath $b -PathType Leaf)
 if ($ok) { 'OK'; exit 0 } else { 'NOT CONFIGURED'; exit 1 }
 ```
 
+`-cmatch` (case-sensitive) is deliberate in the non-ASCII test: a case-insensitive
+match can fold some non-ASCII characters, such as the Kelvin sign, onto ASCII
+letters and let them through.
+
 **What `OK` does and does not mean.** It means the service is configured the way
-this section describes. It is not proof that the agent loaded that configuration,
-because the agent does not yet log its signing mode at startup, and it assumes an
-agent recent enough to have these options (`yuzu-agent.exe --help` lists
-`--update-trust-bundle`). It does not check the other entries' contents, only that
-none is empty, and it compares names case-insensitively, so type them in plain ASCII. It also does not
-check that the bundle file holds the right certificates: a wrong bundle makes the
-agent refuse signed updates, which shows in
-`yuzu_agent_ota_signature_refused_total` and the agent log.
+this section describes. It is not proof that the agent loaded that configuration.
+For that, use the agent's own signal (0.14.1 and later, #5249): after restarting
+the service, its log carries `OTA update signature mode: bundle` (stage 1) or
+`OTA update signature mode: bundle+require` (stage 2) and the bundle path, with
+no `YUZU_UPDATE_` warning after it. With auto-update enabled, also check that no
+`trust bundle cannot be loaded` warning follows `OTA update checker started` once
+the agent has connected — that warning comes from the update checker, not from
+the startup lines. The heartbeat carries the same mode as the status tag
+`yuzu.ota_signature_mode`, but the server only stores it today (no REST, MCP or
+dashboard view shows it), so the log is the check. An
+agent older than 0.14.1 logs none of this, so for it the script is the only check,
+and it assumes an agent recent enough to have these options (`yuzu-agent.exe --help`
+lists `--update-trust-bundle`). The script does not check the other entries'
+contents beyond the non-ASCII rule, only that none is empty, and it compares names
+case-insensitively, so type them in plain ASCII. It also does not check that the
+bundle file holds the right certificates: a wrong bundle makes the agent refuse
+signed updates, which shows in `yuzu_agent_ota_signature_refused_total` and the
+agent log (`untrusted chain`), while a bundle the agent cannot read at all is
+logged and counted separately (`reason="bundle_unreadable"`).
 
 ### The verifier's catastrophic invariants
 
@@ -3513,7 +3574,11 @@ changing that file must preserve all four.
    internal PKI issuing mTLS and S/MIME from one root, so the consequence is not
    hypothetical.
 3. **An unreadable trust bundle must fail CLOSED.** "Cannot check" is never
-   "checked out fine". The store load is the first check performed.
+   "checked out fine". The store load is the first check performed. It surfaces
+   as `CmsFailure::kBundleUnreadable` (`reason=bundle_unreadable`; the plugin
+   loader still reports it as untrusted), is refused in both modes, and — since
+   0.14.1 — the bundle is read bounded (regular file only, at most 1 MiB) and
+   parsed from memory.
 4. **OTA verification stays after the SHA-256 compare and before apply**, reading
    the HELD descriptor rather than re-opening the path. Apply is the point of no
    return — the execute bit on POSIX, the live-binary move on Windows. Reading the
@@ -3620,7 +3685,8 @@ reported agent version is advancing.
 **A refusing agent still cannot tell you WHY.** There is no status-report RPC on
 the update path, so the reason appears only in that endpoint's own log — the
 gauge tells you how many are affected, not what to fix. The strings to grep for
-are `untrusted chain` and `invalid signature`; an unsigned package logs
+are `untrusted chain`, `invalid signature`, and `trust bundle could not be loaded`
+(the agent's own bundle is missing or unreadable, #5249); an unsigned package logs
 `update package is unsigned and --update-require-signature is set` (`missing` is
 the metric label for that case, not text that appears in the log). Verify on a pilot
 group before a fleet-wide flip.
@@ -4904,7 +4970,7 @@ docker compose down           # stop all services
 | `/var/lib/yuzu` | `server-data` | `--data-dir`: the `.cfg` files, `nvd_cves.db`, `agent-updates/`, `upload-blobs/` |
 | `/etc/yuzu/certs` | `server-certs` (`certs` in the two reference composes) | The server's default cert dir: the internal CA (`default-ca.key`), the default leaf certificates, the secrets KEK files `secrets-kek-v<N>.key`, the dashboard-uploaded TLS files `server.pem` / `server-key.pem` / `ca.pem`, and `plugin-trust-bundle.pem`. The last four are written here whatever `--ca-dir` says |
 
-The second is easy to miss, because the image never passes `--ca-dir` and the server falls back to `/etc/yuzu/certs`. The KEK is registered in Postgres, so this directory has to live exactly as long as the Postgres volume does. Without a volume, recreating the container (an image upgrade, `down` then `up`, `up --force-recreate`) deletes the key files, and the server then refuses to start with `kek_unresolvable` (#5370). `docker compose down` without `-v` keeps both volumes. `down -v` deletes them along with the Postgres volume, which is a full reset. The `yuzu-server` image creates `/etc/yuzu/certs` owned by the `yuzu` user, and a new named volume takes that owner, so no `chown` is needed. The chiselled image up to 0.14.0 has no such directory, so a new volume there is root-owned; the demo compose's one-shot `server-certs-init` service hands it to uid 1000. Keep `/etc/yuzu/certs` on a volume even if you pass `--ca-dir`; on an existing install do not move it (#5273): the CA store records the key's absolute path. The volume is lost to `docker volume rm`, `docker volume prune` / `docker system prune --volumes` (while no container uses it, such as after `down`), a Docker Desktop data purge, or renaming the compose project, and moving a stack between a reference compose and any other compose moves the keys too — use the copy-out recipe. Affected: a 0.14.0 Docker Compose stack whose server has no named volume on `/etc/yuzu/certs` while Postgres has one — `deploy/docker/docker-compose.yml` (the README quickstart), `docker-compose.uat.yml`, `docker-compose.full-uat.yml`, `docker-compose.viz-uat.yml`, `docker-compose.demo.yml` used with `--keep`, any compose copied from them, and Compose Wizard output from before 0.14.1 in Plaintext mode, with 'Persist generated certs' unticked, or with named volumes off and an external Postgres. Not affected: `docker-compose.reference.yml` and `docker-compose.reference-gateway.yml` (their `certs` volume). If yours is affected: [Upgrading](upgrading.md), "Docker Compose: copy `/etc/yuzu/certs` out of the server container before you recreate it". Back the directory up with the database as a pair: [the KEK pairing rule](../ops-runbooks/auth-db-recovery.md#backup--the-kek-pairing-rule).
+The second is easy to miss, because the image never passes `--ca-dir` and the server falls back to `/etc/yuzu/certs`. The KEK is registered in Postgres, so this directory has to live exactly as long as the Postgres volume does. Without a volume, recreating the container (an image upgrade, `down` then `up`, `up --force-recreate`) deletes the key files, and the server then refuses to start with `kek_unresolvable` (#5370). `docker compose down` without `-v` keeps both volumes. `down -v` deletes them along with the Postgres volume, which is a full reset. The `yuzu-server` image creates `/etc/yuzu/certs` owned by the `yuzu` user, and a new named volume takes that owner, so no `chown` is needed. The chiselled image up to 0.14.0 has no such directory, so a new volume there is root-owned; the demo compose's one-shot `server-certs-init` service hands it to uid 1000. Keep `/etc/yuzu/certs` on a volume even if you pass `--ca-dir`; on an existing install do not move it (#5273): the CA store records the key's absolute path. The volume is lost to `docker volume rm`, `docker volume prune` / `docker system prune --volumes` (while no container uses it, such as after `down`), a Docker Desktop data purge, or renaming the compose project, and moving a stack between a reference compose and any other compose moves the keys too — use the copy-out recipe. Affected: a 0.14.0 Docker Compose stack whose server has no named volume on `/etc/yuzu/certs` while Postgres has one — `deploy/docker/docker-compose.yml` (the 0.14.0 README quickstart), `docker-compose.uat.yml`, `docker-compose.full-uat.yml`, `docker-compose.viz-uat.yml`, `docker-compose.demo.yml` used with `--keep`, any compose copied from them, and Compose Wizard output from before 0.14.1 in Plaintext mode, with 'Persist generated certs' unticked, or with named volumes off and an external Postgres. Not affected: `docker-compose.reference.yml` (which the README quickstart saves as `docker-compose.yml` since #5419) and `docker-compose.reference-gateway.yml` (their `certs` volume). If yours is affected: [Upgrading](upgrading.md), "Docker Compose: copy `/etc/yuzu/certs` out of the server container before you recreate it". Back the directory up with the database as a pair: [the KEK pairing rule](../ops-runbooks/auth-db-recovery.md#backup--the-kek-pairing-rule).
 
 **Pinning a specific release with `docker-compose.uat.yml`:**
 
@@ -5284,7 +5350,7 @@ REM and exits 1639 ERROR_INVALID_COMMAND_LINE without touching the service. That
 REM #1468: the shipped installer had exactly that defect, and because Inno ignores
 REM [Run] exit codes it failed silently -- the service kept the argument-less binPath
 REM --install-service had written, so the agent ran with no --server and fail-closed
-REM on TLS. Check your work with `sc qc YuzuAgent`: every flag below must appear.
+REM on TLS. Check your work with `sc.exe qc YuzuAgent`: every flag below must appear.
 sc.exe config YuzuAgent binPath= "\"C:\Yuzu\bin\yuzu-agent.exe\" --service --server yuzu.example.com:50051 --data-dir \"C:\ProgramData\Yuzu\" --plugin-dir \"C:\Yuzu\plugins\" --log-file \"C:\Yuzu\logs\yuzu-agent.log\""
 
 sc.exe start YuzuAgent
@@ -5302,7 +5368,7 @@ Re-running `--install-service` is idempotent — it updates an existing registra
 
 > **Fleet-upgrade gotcha:** because `--install-service` always resets binPath to the bare minimal form, a silent/unattended re-run of the shipped installer (e.g. an SCCM/Intune package upgrade) that does **not** re-supply the original `/SERVER=`/`/TOKEN=`/`/NOTLS` parameters on that specific invocation will reconfigure the agent back to `localhost:50051` with TLS on — and because the SCM protocol now actually works (post-#1822), the service **starts successfully** against that wrong address instead of failing loudly the way it always did before this fix. The agent goes dark from the fleet with no installer-visible error. Always replay the same install-time parameters on every upgrade run, not just the first install. The installer has parameters for those three settings only, so any other flag you added to the binary path -- notably `--update-trust-bundle` and `--update-require-signature` -- is dropped by every installer run with nothing to show it; set those through the service's `Environment` registry value instead, which installing over the existing agent leaves alone, though uninstalling deletes it (see *Windows: the service's `Environment` value*).
 
-**If `sc start YuzuAgent` still fails after this fix:** check the log file first (`{app}\logs\yuzu-agent.log` via the installer; `<data-dir>\yuzu-agent.log` if you configured `--service` manually without `--log-file`), it has the actual reason. `sc query YuzuAgent`/Event Viewer only distinguish which of three generic buckets: **specific error 1** covers three distinct causes that land on the same code: the agent failed to construct (bad `agent.db`, SQLite/config problem), **or** startup completed but the gRPC channel couldn't be built under the fail-closed TLS posture (missing/unreadable CA or client cert/key, #1303), including, notably, the exact misconfiguration the fleet-upgrade gotcha above can introduce by silently flipping TLS back on, **or** a mid-life failure: the dispatch thread pool could not be re-created on a reconnect (host out of threads), which previously ended the service silently as a clean stop; **specific error 2** (the agent stopped on its own without a stop/shutdown request, unexpected, check the log for what `run()` returned early on); **specific error 3** (an unhandled exception reached the service dispatcher, check the log for the exception message). None of these three codes carry more detail on their own; the log file is where the actual cause lives. These SCM "specific error" buckets are a **separate namespace** from the agent's own process exit codes (1/3/4/5) described under *Stopping a wedged agent* above; they cover why `sc start` failed to bring the service up in the first place, not why a running service later stopped. In particular, a code-4 shutdown-watchdog exit (#2233 item 3) fired while `service_main` is still running happens via `TerminateProcess`, which bypasses `report_status` entirely, so it does not land in any of these three buckets; Event Viewer shows it as a generic unexpected termination, not "specific error N". A code-5, a code-4 fired by `run_service()`'s own post-dispatcher drain wait, or a code-3 fired by the EXPLICIT F3 orphan check on `service_main`'s normal path (#4666 PR-2) are stranger still: each fires strictly after `service_main` has already reported one of the buckets above (or a clean `SERVICE_STOPPED`), so it changes none of them and shows up in neither `sc query` nor Event Viewer as anything distinguishable from that already-reported outcome. One exception to that ordering, pre-existing and not introduced by PR-2: `OrphanExitGuard`'s destructor (`hard_exit.hpp`) is ALSO a fail-closed backstop covering an exception that unwinds out of `agent->run()` itself before the explicit F3 check is even reached; on that path a code-3 can fire from the destructor DURING unwind, before any `report_status` call, so this "already reported" property does not hold universally for every possible code-3, only for the ordinary explicit-check case.
+**If `sc.exe start YuzuAgent` still fails after this fix:** check the log file first (`{app}\logs\yuzu-agent.log` via the installer; `<data-dir>\yuzu-agent.log` if you configured `--service` manually without `--log-file`), it has the actual reason. `sc.exe query YuzuAgent`/Event Viewer only distinguish which of three generic buckets: **specific error 1** covers three distinct causes that land on the same code: the agent failed to construct (bad `agent.db`, SQLite/config problem), **or** startup completed but the gRPC channel couldn't be built under the fail-closed TLS posture (missing/unreadable CA or client cert/key, #1303), including, notably, the exact misconfiguration the fleet-upgrade gotcha above can introduce by silently flipping TLS back on, **or** a mid-life failure: the dispatch thread pool could not be re-created on a reconnect (host out of threads), which previously ended the service silently as a clean stop; **specific error 2** (the agent stopped on its own without a stop/shutdown request, unexpected, check the log for what `run()` returned early on); **specific error 3** (an unhandled exception reached the service dispatcher, check the log for the exception message). None of these three codes carry more detail on their own; the log file is where the actual cause lives. These SCM "specific error" buckets are a **separate namespace** from the agent's own process exit codes (1/3/4/5) described under *Stopping a wedged agent* above; they cover why `sc start` failed to bring the service up in the first place, not why a running service later stopped. In particular, a code-4 shutdown-watchdog exit (#2233 item 3) fired while `service_main` is still running happens via `TerminateProcess`, which bypasses `report_status` entirely, so it does not land in any of these three buckets; Event Viewer shows it as a generic unexpected termination, not "specific error N". A code-5, a code-4 fired by `run_service()`'s own post-dispatcher drain wait, or a code-3 fired by the EXPLICIT F3 orphan check on `service_main`'s normal path (#4666 PR-2) are stranger still: each fires strictly after `service_main` has already reported one of the buckets above (or a clean `SERVICE_STOPPED`), so it changes none of them and shows up in neither `sc query` nor Event Viewer as anything distinguishable from that already-reported outcome. One exception to that ordering, pre-existing and not introduced by PR-2: `OrphanExitGuard`'s destructor (`hard_exit.hpp`) is ALSO a fail-closed backstop covering an exception that unwinds out of `agent->run()` itself before the explicit F3 check is even reached; on that path a code-3 can fire from the destructor DURING unwind, before any `report_status` call, so this "already reported" property does not hold universally for every possible code-3, only for the ordinary explicit-check case.
 
 ### Server: sc.exe (native wrapper not yet available)
 
