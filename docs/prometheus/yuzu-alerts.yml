@@ -590,7 +590,13 @@ groups:
             (bounded by the ~5s stale-serve window if the cache-coherence
             refresh is also failing). Check Postgres availability and pool
             saturation (yuzu_pg_*) and the server RbacStore warnings; the
-            breaker closes on its own after the next successful read. See
+            breaker closes on its own after the next successful read. The
+            gauge changes only when an authorization read reports its
+            outcome, so a replica that receives no authorization checks keeps
+            its last value after the database recovers; to confirm the
+            recovery, send that replica an authenticated request that needs a
+            permission check it has not cached (a decision already cached
+            there does not read the database). See
             the RbacStore authorization substrate section of
             docs/auth-architecture.md.
 

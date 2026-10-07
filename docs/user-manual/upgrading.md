@@ -2168,7 +2168,13 @@ a rollback is genuinely needed.
   probe succeeds (the next attempt after its ~1 s cooldown), it closes
   again automatically and normal service resumes. Watch
   `yuzu_server_rbac_breaker_open` (gauge) and
-  `yuzu_server_rbac_authz_check_seconds` (histogram) after upgrade.
+  `yuzu_server_rbac_authz_check_seconds` (histogram) after upgrade. The
+  shipped `YuzuRbacBreakerOpen` alert (`docs/prometheus/yuzu-alerts.yml`) fires,
+  per replica, when the gauge stays at `1` for 5 minutes; it complements
+  `YuzuRbacReadDegraded`, which is a rate summed across replicas by reason.
+  The gauge changes only when an authorization read reports its outcome, so a
+  replica that receives no authorization checks keeps its last value after the
+  database recovers.
 - **If you alert on the raw `generation_refresh_failed` reason label,
   re-baseline after upgrade.** This release splits what was previously a
   single reason into two: `generation_refresh_failed` (still denying —
