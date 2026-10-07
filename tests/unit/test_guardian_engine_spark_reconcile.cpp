@@ -5863,6 +5863,12 @@ TEST_CASE("#4685 AC3 (Registry, real mechanism): an already-armed rule undergoin
 // drive the real engine + a REAL temp file through the fixture's File-typed fake mechanism
 // (the real File mechanism is Windows-only; GuardianStateReader::read_file is not).
 //
+// ARM-TIME EVAL: an accepted arm evaluates the key once itself (the "T_detect ... via=callback-arm"
+// pass inside apply()), so a target that EXISTS when apply() runs is captured before the test
+// can do anything. The failure-path cases (E2/E3/E5/E8) therefore apply against an ABSENT
+// target, break the KV, and only then create the file and evaluate: the capture lands with the
+// store already failing. The explicit evaluate_key calls elsewhere are redundant but harmless.
+//
 // Waiting discipline: the persist seam (persist_staged_baselines_once) and evaluate_key make
 // the flow synchronous. The background drain worker may ALSO persist after an enqueue wake
 // (its backstop is pinned to one hour, so only the wake can run it), so every assertion is on
@@ -5919,6 +5925,15 @@ std::optional<OutboxEntry> first_drift_4045(SparkReconcileFixture& f, const std:
             return e;
     return std::nullopt;
 }
+/// A sent content-drift entry (expected baseline `expected`, observed `detected`).
+bool has_drift_4045(SparkReconcileFixture& f, const std::string& rule_id,
+                    const std::string& expected, const std::string& detected) {
+    for (const auto& e : compliance_4045(f, rule_id))
+        if (!e.drift.compliant && e.drift.expected_value == expected &&
+            e.drift.detected_value == detected)
+            return true;
+    return false;
+}
 std::optional<nlohmann::json> baseline_record_4045(KvStore& kv, const std::string& rule_id) {
     auto v = kv.get(GuardianEngine::kv_namespace(), "baseline:" + rule_id);
     if (!v)
@@ -5972,32 +5987,44 @@ TEST_CASE("#4045 E2: the apply_rules drain persists a failed-then-recovered capt
           "[spark][guardian][baseline][reconcile]") {
     Spark4045Target t;
     SparkReconcileFixture f{3'600'000, std::nullopt, SparkType::File};
-    const fs::path target = t.file();
-    Spark4045Target::write(target, "content A");
-    const std::string h_a = hash_of_4045(target);
+    const fs::path target = t.file(); // ABSENT at apply(): see the ARM-TIME EVAL note above
     const auto rule = make_file_hash_rule("r1", target.string());
 
-    f.apply(rule);
-    // AFTER apply() returns (its own rule write needs the table) and BEFORE the first eval:
-    // the capture's persist attempt must fail and restage.
+    f.apply(rule); // apply()'s own rule write needs the table, so break it AFTER
     drop_kv_store_table_for_test(f.db_.path);
+    Spark4045Target::write(target, "content A"); // the first good read: the capture's persist
+    const std::string h_a = hash_of_4045(target); // attempt must fail and restage
     eval_initial_4045(*f.engine, target);
     auto* persister = f.engine->baseline_persister_for_test();
+    auto* rt = f.engine->spark_runtime_for_test();
     REQUIRE(persister != nullptr);
-    // The single enqueue-triggered worker attempt has provably run (backstop is one hour and
-    // restage fires no waker, so nothing else wakes the worker from here on).
+    REQUIRE(rt != nullptr);
+    // The enqueue-triggered worker attempt has provably run and failed...
     REQUIRE(yuzu::test::spin_until([&] { return persister->persist_failures() >= 1; }));
+    // ...and the worker is now parked for good. Without this the worker, woken by the re-arm's
+    // own teardown enqueues, could persist the restaged capture before apply_rules reaches its
+    // seed read and the test would pass without apply_rules' drain. From here ONLY that drain
+    // can persist A, and entries are read straight off the runtime (no worker to send them).
+    f.engine->drain_worker_for_test()->stop();
 
     Spark4045Target::write(target, "content B, longer");
+    const std::string h_b = hash_of_4045(target);
     recreate_kv_store_table_for_test(f.db_.path);
-    // IMMEDIATELY re-arm, with NO seam call: only apply_rules' own pre-teardown drain can
-    // persist A before the seed read. (A second worker cycle landing in the microsecond gap
-    // between the recreate and this call would persist A itself - same end state.)
-    f.apply(rule, /*full_sync=*/true);
+    f.apply(rule, /*full_sync=*/true); // no seam call
     eval_initial_4045(*f.engine, target);
 
-    REQUIRE(yuzu::test::spin_until([&] { return first_drift_4045(f, "r1").has_value(); }));
-    CHECK(first_drift_4045(f, "r1")->drift.expected_value == h_a);
+    std::vector<OutboxEntry> drained;
+    REQUIRE(yuzu::test::spin_until([&] {
+        rt->drain([&](const OutboxEntry& e) {
+            drained.push_back(e);
+            return SendResult::Sent;
+        });
+        for (const auto& e : drained)
+            if (e.domain == yuzu::agent::OutboxDomain::Compliance && !e.drift.compliant &&
+                e.drift.expected_value == h_a && e.drift.detected_value == h_b)
+                return true;
+        return false;
+    }));
     const auto rec = baseline_record_4045(*f.kv, "r1");
     REQUIRE(rec.has_value());
     CHECK(rec->value("hash", std::string{}) == h_a);
@@ -6007,12 +6034,12 @@ TEST_CASE("#4045 E3: a failed persist is counted, restaged and retried; success 
           "[spark][guardian][baseline][reconcile]") {
     Spark4045Target t;
     SparkReconcileFixture f{3'600'000, std::nullopt, SparkType::File};
-    const fs::path target = t.file();
-    Spark4045Target::write(target, "content A");
-    const std::string h_a = hash_of_4045(target);
+    const fs::path target = t.file(); // ABSENT at apply(): see the ARM-TIME EVAL note above
 
     f.apply(make_file_hash_rule("r1", target.string()));
     drop_kv_store_table_for_test(f.db_.path);
+    Spark4045Target::write(target, "content A");
+    const std::string h_a = hash_of_4045(target);
     eval_initial_4045(*f.engine, target);
     persist_now_4045(*f.engine);
 
@@ -6071,11 +6098,11 @@ TEST_CASE("#4045 E5: the overwrite guard holds on the Spark path (a refusal is n
           "[spark][guardian][baseline][reconcile]") {
     Spark4045Target t;
     SparkReconcileFixture f{3'600'000, std::nullopt, SparkType::File};
-    const fs::path target = t.file();
-    Spark4045Target::write(target, "content A");
+    const fs::path target = t.file(); // ABSENT at apply(): see the ARM-TIME EVAL note above
 
     f.apply(make_file_hash_rule("r1", target.string())); // Absent record: the capture path
     drop_kv_store_table_for_test(f.db_.path);
+    Spark4045Target::write(target, "content A");
     eval_initial_4045(*f.engine, target); // capture staged; the worker's attempt fails, restages
     auto* persister = f.engine->baseline_persister_for_test();
     auto* rt = f.engine->spark_runtime_for_test();
@@ -6231,12 +6258,12 @@ TEST_CASE("#4045 E8: stop() flushes a still-staged capture",
           "[spark][guardian][baseline][reconcile]") {
     Spark4045Target t;
     SparkReconcileFixture f{3'600'000, std::nullopt, SparkType::File};
-    const fs::path target = t.file();
-    Spark4045Target::write(target, "content A");
-    const std::string h_a = hash_of_4045(target);
+    const fs::path target = t.file(); // ABSENT at apply(): see the ARM-TIME EVAL note above
 
     f.apply(make_file_hash_rule("r1", target.string()));
     drop_kv_store_table_for_test(f.db_.path);
+    Spark4045Target::write(target, "content A");
+    const std::string h_a = hash_of_4045(target);
     eval_initial_4045(*f.engine, target); // staged; the worker's attempt fails, restages
     auto* persister = f.engine->baseline_persister_for_test();
     auto* rt = f.engine->spark_runtime_for_test();
