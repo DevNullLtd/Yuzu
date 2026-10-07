@@ -162,9 +162,10 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
     //
     // Confinement (ADR-0017): the SOLE gate is `fleet_read_fn`
     // (require_fleet_read) -- never stacked with perm_fn on the same
-    // (Execution, Read) pair. A confined caller (management-group or
-    // service-scoped) gets the SAME owner-or-visible view as the v1 twin
-    // GET /api/v1/executions: the admission predicate is pushed into SQL
+    // (Execution, Read) pair. A confined caller gets the SAME owner-or-visible
+    // view as the v1 twin GET /api/v1/executions, except service-scoped
+    // sessions, which get visible-only (the owner rule would expose the
+    // minter's identity; #5557): the admission predicate is pushed into SQL
     // BEFORE the LIMIT (a page of 50 invisible rows must not starve the
     // visible ones), each surviving row's counters and error preview are
     // recomputed from the in-scope agent rows only (so neither the preview

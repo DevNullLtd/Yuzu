@@ -267,7 +267,8 @@ gate.
   the sole gate on `(Execution, Read)` (hardening plus an admission change; an author-run reachability
   probe, not independently adjudicated, found no leak through the old gate; see
   `docs/auth-architecture.md`'s "Sixth migration"). With RBAC off both surfaces are unconfined for every
-  authenticated non-service caller. The fragment suppresses the owner disjunct for service-scoped sessions
+  authenticated non-service, non-engine caller whose tier allows it (an engine principal is refused
+  with 403 with RBAC off). The fragment suppresses the owner disjunct for service-scoped sessions
   (a service-scoped token's session username is its minter); the other execution read surfaces still show
   a minter's executions to a service-scoped token (#5557). The fragment pushes the scope into SQL
   before its LIMIT and bounds the agent-status read to the visible agents; MCP's first gate stays a

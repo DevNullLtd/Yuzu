@@ -1,12 +1,13 @@
 # Reachability probe: executions-list fragment and summarize_working_set (#3526, #4753)
 
-Evidence record committed for the governance ledger (`governance.d/3526-executions-list-fleet-read.*.jsonl`).
-It backs the `refuted` disposition of two external-review claims that `GET /fragments/executions` and MCP
-`summarize_working_set` kind=execution were confinement escapes before the executions-list migration.
+Evidence record committed for the governance ledger, recorded in this change's governance ledger fragment.
+It is the author-run evidence recorded against two external-review claims (not an independent refutation) that
+`GET /fragments/executions` and MCP `summarize_working_set` kind=execution were confinement escapes before the
+executions-list migration.
 
 ## Provenance and limits (read before relying on it)
 
-- Run on 2026-10-04 against the base `5698aff3b` (origin/dev at branch creation) with real Postgres stores
+- Run on 2026-10-04 (written up 2026-10-05) against the base `5698aff3b` (origin/dev at branch creation) with real Postgres stores
   (`YUZU_TEST_POSTGRES_DSN`), the real `AuthRoutes::require_permission` and `require_fleet_read`, the real
   `WorkflowRoutes`, `McpServer::build_handler` and `register_response_routes`. No mocks on the authorisation path.
 - It was run by a subagent of the session that authored the migration, so it is an author-run probe. The author

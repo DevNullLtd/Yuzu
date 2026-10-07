@@ -239,7 +239,8 @@ Recommended order for a fresh install:
 > found no out-of-scope disclosure through the old gate, because the flat gate
 > only ever admitted global-grant callers, who are unfiltered anyway. With RBAC
 > off (the shipped default) both surfaces are unconfined for every authenticated
-> non-service caller, and a service-scoped token gets `403`. A service-scoped
+> non-service, non-engine caller whose tier allows it (an engine principal is refused with
+> `403` with RBAC off), and a service-scoped token gets `403`. A service-scoped
 > token sees on the fragment only executions that touched an in-scope agent: the
 > owner disjunct (a principal's own dispatches) is suppressed for it, because its
 > session username is the account that minted it (the other execution read

@@ -282,14 +282,14 @@ hardening plus an admission change, not a fix for a leak: the old gate only admi
 holding a global grant, and those callers were never filtered. An author-run reachability probe
 (not independently adjudicated; the JIT-elevated case was checked by code reading only) found nothing
 served through the old gate that the unconfined `GET /api/v1/executions` would not serve the same
-principal, with RBAC on or off (with RBAC off every non-service caller is unconfined by design)
+principal, with RBAC on or off (with RBAC off every non-service, non-engine caller whose tier allows it is unconfined by design; an engine principal is refused with 403)
 (`docs/security-reviews/3526-confinement-reachability-probe-2026-10-05.md`). **There is no
 admission change for a caller with a global `Execution:Read` grant, and nothing changes with RBAC
 off for such a caller. What changes for every caller is the degrade and audit behaviour below,
 plus one new prerequisite.**
 
-- **RBAC off (the shipped default).** With RBAC off, both surfaces are unconfined for every
-  authenticated non-service caller, before and after the move to the fleet-read gate; a service-scoped token is refused
+- **RBAC off (the shipped default).** With RBAC off, both surfaces are unconfined for every authenticated non-service, non-engine caller whose tier allows it (an engine principal is refused with 403 with RBAC off),
+  before and after the move to the fleet-read gate; a service-scoped token is refused
   with `403`. Confinement on these two surfaces takes effect only with RBAC enforcement on.
 - **Admission prerequisite (applies to every caller on these two surfaces).** The fleet-read gate
   needs both the authorization store and the management-group store open. When the RBAC store is
@@ -342,25 +342,34 @@ plus one new prerequisite.**
 - **Runbook, panel stuck on "Loading...".** That is the gate's own `403`/`503` JSON body being
   dropped by the dashboard, not a fragment note. Look for: audit rows `auth.fleet_read_required`
   with `result=denied` (detail `fleet read blocked: management-group store unavailable`, or the
-  ceiling detail from the `ITServiceOwner` section below); `yuzu_http_requests_total{status="503"}`;
-  `yuzu_server_rbac_read_degrade_total`; and a `503` on `/fragments/executions` in the access log.
-  After the store recovers, reload the Instructions page.
+  ceiling detail from the `ITServiceOwner` section below); `yuzu_http_requests_total{status="503"}`
+  (fleet-wide, not per route); `yuzu_server_rbac_read_degrade_total` (it moves ONLY for the
+  `ITServiceOwner` ceiling-read case: the management-group-store-unavailable `503` writes an audit
+  row and a `503` but does not move it); and, outside the server, a `503` on
+  `/fragments/executions` in your reverse-proxy access log or the browser network tab. The server
+  keeps no per-request access log. After the store recovers, reload the Instructions page.
 - **Degraded store, MCP.** `summarize_working_set` returns an error carrying `retry_after_ms`
   where it used to say the execution "was not found".
 - **Empty confined page.** A confined caller who sees zero executions gets "No executions visible in
-  your scope." instead of "No executions yet.", because out-of-scope executions may exist. A
-  confined caller who did not dispatch an execution sees nothing of it, so possibly this text,
-  until an in-scope agent replies, because the per-agent status rows are written when responses arrive. The
+  your scope." instead of "No executions yet.", because out-of-scope executions may exist. Until an
+  in-scope agent replies, a confined caller sees no trace of an execution they did not dispatch,
+  because per-agent status rows are written as responses arrive; the panel can therefore show this
+  text while an execution is in flight. MCP `list_executions` shows a confined caller only the
+  executions they dispatched, not the in-scope executions of others (see
+  `docs/user-manual/mcp.md`). The
   per-row status badge is still the execution's fleet-wide status while the counters are projected
   to the caller's agents (the same as the REST twin, SSE and the MCP detail view).
 - **Owner disjunct.** Ordinary callers keep it: a principal's own dispatches are shown even when
   none of their agents replied, with the counters still projected. Service-scoped tokens do NOT get
   it on `GET /fragments/executions`. **Known limit (#5557):** a service-scoped token's session
   username is the account that minted it. On `GET /api/v1/executions`, `/{id}`, `/children`, MCP
-  `get_execution_status`, MCP `list_executions`, legacy `/api/executions*` and the detail fragment,
-  a service-scoped token is therefore also shown executions its MINTER dispatched, even outside the
-  service scope (counters projected, but id, definition, status and timing visible). Mint service
-  tokens from an account that dispatches only inside the service scope.
+  `get_execution_status`, MCP `list_executions`, legacy `/api/executions*`, the detail fragment,
+  the SSE channel `/sse/executions/{id}` and `GET /api/v1/events`, a service-scoped token is
+  therefore also shown executions its MINTER dispatched, even outside the service scope (counters
+  projected, but id, definition, status and timing visible). Mint service tokens from an account
+  that dispatches only inside the service scope. Executions the minting account has already
+  dispatched stay visible to its service tokens on those surfaces, so a token minted from an
+  account with unscoped history is exposed to that history.
 - **Audit and SIEM.** For `kind=execution`, a CONFINED caller whose id is absent or outside scope
   now produces `action=mcp.summarize_working_set`, `result=denied`, detail
   `not found or outside caller's fleet-read scope: <id>` (the id is neutralised for `k=v` and
@@ -368,8 +377,14 @@ plus one new prerequisite.**
   that row (the plain gate admitted only unconfined, global-grant callers, and confined callers got
   `403` before), so an existing rule keyed on `result=success` loses nothing for the callers it
   already saw; a rule keyed on `result=denied` for this action may now see the new callers. An
-  UNCONFINED caller's absent id stays `result=success` (no denial occurred). With RBAC off every
-  caller is unconfined, so no `denied` row for this action is ever written.
+  UNCONFINED caller's absent id stays `result=success` (no denial occurred). The scope-collapse
+  `denied` row (detail `not found or outside caller's fleet-read scope: <id>`) is written only for
+  a CONFINED caller on `kind=execution`, so it is never written with RBAC off. Other `denied` rows
+  on this action (tier refusal, permission-gate refusal, service-scoped default-deny) are separate
+  and can occur regardless of RBAC state. The same neutralise-and-cap (128 bytes) now applies to
+  the id in the `get_execution_status` `denied` rows and the `get_agent_details` `denied` and
+  `failure` rows. A NUL byte in a `summarize_working_set` `kind=execution` id is rejected with an
+  invalid-params error before any lookup.
   The `denied` row cannot tell a typo from an out-of-scope probe; that is intentional (no
   existence oracle). The narrative for an absent id is a success-shaped result, unlike
   `get_execution_status`, which returns an error for the same input.

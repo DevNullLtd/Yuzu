@@ -140,7 +140,8 @@ The owner disjunct (`dispatched_by == username`) is suppressed for service-scope
 fragment, because a service-scoped token's session username is the account that minted it and the
 disjunct would list the minter's executions outside the service scope. Known limit (#5557): on
 `GET /api/v1/executions`, `/{id}`, `/children`, MCP `get_execution_status`, MCP `list_executions`,
-legacy `/api/executions*` and the detail fragment, a service-scoped token is still also shown
+legacy `/api/executions*`, the detail fragment, the SSE channel `/sse/executions/{id}` and
+`GET /api/v1/events`, a service-scoped token is still also shown
 executions its minter dispatched, outside the service scope (counters projected, but id, definition,
 status and timing visible); closing that needs dispatch-time token attribution. Separately,
 `require_fleet_read` applies the `ITServiceOwner` ceiling on its service axis (added by
