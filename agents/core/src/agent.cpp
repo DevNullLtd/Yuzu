@@ -61,6 +61,7 @@ __declspec(allocate(".CRT$XCB"))
 #include "guardian_arm_heartbeat.hpp"     // emit_guardian_arm_heartbeat_tags (rung 9c PR-3)
 #include "guardian_backend.hpp"           // GuardianBackend, guardian_backend_from_state/label (F7)
 #include "guardian_health_heartbeat.hpp"  // emit_guardian_health_heartbeat_tags (M1)
+#include "guardian_baseline_heartbeat.hpp" // emit_guardian_baseline_persist_heartbeat_tags (#4045)
 #include "guardian_io_ceiling_heartbeat.hpp" // emit_guardian_io_ceiling_heartbeat_tags (rung 9c PR-3)
 #include "guardian_journal_heartbeat.hpp" // emit_guardian_journal_heartbeat_tags (item 7 PR-Ag)
 #include "guardian_legacy_sink_executor.hpp" // #4783: LegacySendOutcome (EventSink's return type)
@@ -2695,6 +2696,11 @@ public:
                                 // dormant or has simply never hit the ceiling.
                                 emit_guardian_io_ceiling_heartbeat_tags(
                                     tags, guardian_->io_ceiling_rejections());
+                                // #4045: failed Spark baseline-capture persists (sparse, 0 omits
+                                // the tag). Not gated on prefer_spark_: the count is 0 while
+                                // Spark is inert, equally truthful as "never failed".
+                                emit_guardian_baseline_persist_heartbeat_tags(
+                                    tags, guardian_->baseline_persist_failures());
                                 // M1: a rule stuck Unknown re-evals every ~5s; guard.unhealthy is
                                 // edge-emitted, each suppressed repeat is counted (unhealthy_
                                 // suppressed), and each errored_refresh_ms-cadence re-emission is

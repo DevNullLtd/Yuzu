@@ -11,6 +11,7 @@
 
 #include "guaranteed_state.pb.h"
 #include "guardian_arm_ack.hpp" // kWedgeSuppressMaxDecisions (#5459: the held-generation valve test)
+#include "guardian_baseline_heartbeat.hpp" // emit_guardian_baseline_persist_heartbeat_tags (#4045)
 #include "guardian_baseline_persister.hpp" // GuardianBaselinePersister (#4045)
 #include "guardian_arm_heartbeat.hpp" // GuardianArmStats complete type (rung 9c PR-3)
 #include "guardian_backend.hpp" // guardian_backend_from_state/label (#2298 F13)
@@ -6278,4 +6279,54 @@ TEST_CASE("#4045 E8: stop() flushes a still-staged capture",
     REQUIRE(rec.has_value());
     CHECK(rec->value("hash", std::string{}) == h_a);
     CHECK(rt->staged_baseline_count_for_test() == 0);
+}
+
+TEST_CASE("#4045 E9: the drain worker alone persists a capture (no seam, no apply_rules, no stop)",
+          "[spark][guardian][baseline][reconcile]") {
+    Spark4045Target t;
+    SparkReconcileFixture f{3'600'000, std::nullopt, SparkType::File};
+    const fs::path target = t.file();
+    Spark4045Target::write(target, "content A"); // PRESENT at apply(): the capture lands inside it
+    const std::string h_a = hash_of_4045(target);
+
+    f.apply(make_file_hash_rule("r1", target.string()));
+
+    // The periodic backstop is pinned at one hour, so only the capture's compliant-edge enqueue
+    // can wake the worker: nothing here calls the persist seam, re-enters apply_rules, or stops
+    // the engine, so this fails if the worker loop does not run the persist step.
+    REQUIRE(yuzu::test::spin_until(
+        [&] { return baseline_record_4045(*f.kv, "r1").has_value(); }));
+    const auto rec = baseline_record_4045(*f.kv, "r1");
+    REQUIRE(rec.has_value());
+    CHECK(rec->value("hash", std::string{}) == h_a);
+    CHECK(f.engine->spark_runtime_for_test()->staged_baseline_count_for_test() == 0);
+
+    // A healthy persist is a zero count, and a zero count ships no heartbeat tag.
+    CHECK(f.engine->baseline_persist_failures() == 0);
+    std::map<std::string, std::string> tags;
+    yuzu::agent::emit_guardian_baseline_persist_heartbeat_tags(tags, f.engine->baseline_persist_failures());
+    CHECK(tags.empty());
+}
+
+TEST_CASE("#4045 E10: a failing baseline persist surfaces on the heartbeat tag",
+          "[spark][guardian][baseline][reconcile]") {
+    Spark4045Target t;
+    SparkReconcileFixture f{3'600'000, std::nullopt, SparkType::File};
+    const fs::path target = t.file(); // ABSENT at apply(): see the ARM-TIME EVAL note above
+
+    f.apply(make_file_hash_rule("r1", target.string()));
+    drop_kv_store_table_for_test(f.db_.path);
+    Spark4045Target::write(target, "content A");
+    eval_initial_4045(*f.engine, target); // staged; the persist attempt fails and restages
+    auto* persister = f.engine->baseline_persister_for_test();
+    REQUIRE(persister != nullptr);
+    REQUIRE(yuzu::test::spin_until([&] { return persister->persist_failures() >= 1; }));
+
+    // The heartbeat reads the engine accessor; it must carry the persister's failure count.
+    CHECK(f.engine->baseline_persist_failures() >= 1);
+    std::map<std::string, std::string> tags;
+    yuzu::agent::emit_guardian_baseline_persist_heartbeat_tags(tags, f.engine->baseline_persist_failures());
+    REQUIRE(tags.count("yuzu.guardian_baseline_persist_failures") == 1);
+    CHECK(std::stoull(tags.at("yuzu.guardian_baseline_persist_failures")) >= 1);
+    recreate_kv_store_table_for_test(f.db_.path); // let the stop() flush succeed quietly
 }
