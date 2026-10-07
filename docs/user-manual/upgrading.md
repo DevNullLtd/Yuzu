@@ -279,11 +279,18 @@ Only case (e) means the key files are gone. Nothing inside the server can rebuil
 `summarize_working_set` moved from a plain `Execution:Read` permission check onto the
 management-group-aware fleet-read gate that `GET /api/v1/executions` already used. This is
 hardening plus an admission change, not a fix for a leak: the old gate only admitted callers
-holding a global grant, and those callers were never filtered, so nobody was shown out-of-scope
-data before. **There is no admission change for a caller with a global `Execution:Read` grant, and
-nothing changes with RBAC off for such a caller. What changes for every caller is the degrade and
-audit behaviour below, plus one new prerequisite.**
+holding a global grant, and those callers were never filtered. An author-run reachability probe
+(not independently adjudicated; the JIT-elevated case was checked by code reading only) found nothing
+served through the old gate that the unconfined `GET /api/v1/executions` would not serve the same
+principal, with RBAC on or off (with RBAC off every non-service caller is unconfined by design)
+(`docs/security-reviews/3526-confinement-reachability-probe-2026-10-05.md`). **There is no
+admission change for a caller with a global `Execution:Read` grant, and nothing changes with RBAC
+off for such a caller. What changes for every caller is the degrade and audit behaviour below,
+plus one new prerequisite.**
 
+- **RBAC off (the shipped default).** With RBAC off, both surfaces are unconfined for every
+  authenticated non-service caller, before and after the move to the fleet-read gate; a service-scoped token is refused
+  with `403`. Confinement on these two surfaces takes effect only with RBAC enforcement on.
 - **Admission prerequisite (applies to every caller on these two surfaces).** The fleet-read gate
   needs both the authorization store and the management-group store open. When the RBAC store is
   not open, every caller except a JIT-elevated non-service session (which returns before any store
@@ -302,55 +309,81 @@ audit behaviour below, plus one new prerequisite.**
   `403` there. Only a caller who holds a GLOBAL `Infrastructure:Read` plus a group-scoped
   `Execution:Read` is newly admitted to the confined execution view, and its narrative carries the
   same projected counts.
-- **Service-scoped API tokens** get the same confined view from `GET /fragments/executions` where
+- **Service-scoped API tokens** get a confined view from `GET /fragments/executions` where
   they got `403`, but only when RBAC enforcement is ON, the `ITServiceOwner` role holds
   `Execution:Read` (the seeded default; see the next item) and the tag store is reachable. With RBAC
   enforcement off the gate still answers `403` ("service-scoped tokens require RBAC to be
   enabled"), and a missing or degraded tag store answers `503` (`retry_after_ms` 5000). In a
-  normal deployment the tag store always exists (the server refuses to boot without it).
-  `summarize_working_set` is unchanged for service-scoped tokens: it stays denied.
-- **`ITServiceOwner` ceiling (applied by the preceding change, not this one).** A service-scoped
-  token is subject to the `ITServiceOwner` authority ceiling on the fleet-read gate, so this change
+  normal deployment the tag store always exists (the server refuses to boot without it). On this
+  fragment a service-scoped token sees only executions that touched an in-scope agent (see "Owner
+  disjunct" below); its own just-dispatched execution stays invisible until an in-scope agent
+  replies. `summarize_working_set` is unchanged for service-scoped tokens: it stays denied.
+- **`ITServiceOwner` ceiling (applied by PR #5546, not by the executions-list move).** A service-scoped
+  token is subject to the `ITServiceOwner` authority ceiling on the fleet-read gate. The executions-list move
   relies on that ceiling but does not add it. Its Breaking effect (`403` from
   `GET /api/v1/enrollment/pending-agents` for a service-scoped token), the retryable `503` for a
   failed ceiling read, the remediation and the audit search are in "Behaviour change:
-  service-scoped tokens and the `ITServiceOwner` ceiling on the fleet-read gate" below.
-- **Degraded store, fragment.** The fragment's own failure notes (tracker or status read failure,
-  unwired gate, empty principal under a confined read) now render an honest operator-visible note
-  at HTTP `200` (`<div class="empty-state" data-degraded="tracker|unavailable">`), because the
-  dashboard drops `4xx`/`5xx` bodies and a `503` left the panel on "Loading..." forever. Detect it
-  with the `data-degraded` attribute; it is never the "No executions yet" text. The gate's own
-  `403`/`503` JSON bodies are unchanged. **Runbook:** a degrade note on the Executions panel means
-  the execution tracker read failed (check `ExecutionTracker` warnings in the server log and
-  PostgreSQL availability). The note does NOT clear on its own: the panel is loaded once, when the
-  Instructions page reveals it (`hx-trigger="revealed"`), so after the store recovers reload the
+  service-scoped tokens, the `ITServiceOwner` ceiling on the fleet-read gate, and
+  `GET /api/v1/upload-grants` (#3526)" below.
+- **Degraded store, fragment.** The fragment's own failure notes now render an honest
+  operator-visible note at HTTP `200` (`<div class="empty-state" data-degraded="tracker|unavailable">`),
+  because the dashboard drops `4xx`/`5xx` bodies and a `503` left the panel on "Loading..." forever.
+  Detect it with the `data-degraded` attribute; it is never the "No executions yet" text. A monitor
+  that treats HTTP `200` as healthy will not see these notes. The gate's own `403`/`503` JSON
+  bodies are unchanged.
+- **Runbook, degrade note on the Executions panel.** `data-degraded="tracker"` means the execution
+  tracker or its agent-status read failed: check `ExecutionTracker` warnings in the server log and
+  PostgreSQL availability. `data-degraded="unavailable"` is a misconfiguration or bug branch (the
+  fleet-read gate or the execution tracker is not wired, or a confined read has an empty
+  principal), not a storage fault: it needs an administrator or a bug report, and a Postgres check
+  will not clear it. Neither note clears on its own: the panel is loaded once, when the Instructions
+  page reveals it (`hx-trigger="revealed"`, no polling), so after the cause is fixed reload the
   Instructions page (or reopen the Execution History section).
+- **Runbook, panel stuck on "Loading...".** That is the gate's own `403`/`503` JSON body being
+  dropped by the dashboard, not a fragment note. Look for: audit rows `auth.fleet_read_required`
+  with `result=denied` (detail `fleet read blocked: management-group store unavailable`, or the
+  ceiling detail from the `ITServiceOwner` section below); `yuzu_http_requests_total{status="503"}`;
+  `yuzu_server_rbac_read_degrade_total`; and a `503` on `/fragments/executions` in the access log.
+  After the store recovers, reload the Instructions page.
 - **Degraded store, MCP.** `summarize_working_set` returns an error carrying `retry_after_ms`
   where it used to say the execution "was not found".
 - **Empty confined page.** A confined caller who sees zero executions gets "No executions visible in
-  your scope." instead of "No executions yet.", because out-of-scope executions may exist. The
+  your scope." instead of "No executions yet.", because out-of-scope executions may exist. A
+  confined caller who did not dispatch an execution sees nothing of it, so possibly this text,
+  until an in-scope agent replies, because the per-agent status rows are written when responses arrive. The
   per-row status badge is still the execution's fleet-wide status while the counters are projected
   to the caller's agents (the same as the REST twin, SSE and the MCP detail view).
-- **Owner disjunct.** A principal's own dispatches are shown even when they fall outside a
-  service-scoped token's service scope (parity with `GET /api/v1/executions` and the detail
-  fragment); the counters are still projected.
+- **Owner disjunct.** Ordinary callers keep it: a principal's own dispatches are shown even when
+  none of their agents replied, with the counters still projected. Service-scoped tokens do NOT get
+  it on `GET /fragments/executions`. **Known limit (#5557):** a service-scoped token's session
+  username is the account that minted it. On `GET /api/v1/executions`, `/{id}`, `/children`, MCP
+  `get_execution_status`, MCP `list_executions`, legacy `/api/executions*` and the detail fragment,
+  a service-scoped token is therefore also shown executions its MINTER dispatched, even outside the
+  service scope (counters projected, but id, definition, status and timing visible). Mint service
+  tokens from an account that dispatches only inside the service scope.
 - **Audit and SIEM.** For `kind=execution`, a CONFINED caller whose id is absent or outside scope
   now produces `action=mcp.summarize_working_set`, `result=denied`, detail
   `not found or outside caller's fleet-read scope: <id>` (the id is neutralised for `k=v` and
-  CR/LF forgery and capped at 128 bytes; the `success` row's id gets the same treatment for EVERY `summarize_working_set` kind, not only `execution`). Only callers newly admitted by this change can produce
+  CR/LF forgery and capped at 128 bytes; the `success` row's id gets the same treatment for EVERY `summarize_working_set` kind, not only `execution`). Only callers newly admitted by the move to the fleet-read gate can produce
   that row (the plain gate admitted only unconfined, global-grant callers, and confined callers got
   `403` before), so an existing rule keyed on `result=success` loses nothing for the callers it
   already saw; a rule keyed on `result=denied` for this action may now see the new callers. An
-  UNCONFINED caller's absent id stays `result=success` (no denial occurred).
+  UNCONFINED caller's absent id stays `result=success` (no denial occurred). With RBAC off every
+  caller is unconfined, so no `denied` row for this action is ever written.
   The `denied` row cannot tell a typo from an out-of-scope probe; that is intentional (no
   existence oracle). The narrative for an absent id is a success-shaped result, unlike
   `get_execution_status`, which returns an error for the same input.
 - **Still unscoped.** `summarize_working_set` with `kind=fleet` or `kind=result_set` returns the
   whole-registry agent count (tracked in #4753, whose checklist, including `kind=fleet` and
-  `get_fleet_posture_fast`, stays open; this change covers only `kind=execution`). The same
+  `get_fleet_posture_fast`, stays open; the executions-list move covers only `kind=execution`). The same
   whole-registry branch is also reached by `kind=execution` or `kind=agent` with an EMPTY id, or
   when the execution tracker is unavailable (not separately tracked). `GET
   /api/v1/execution-statistics/agents` has no per-agent filter (#3526).
+
+**Rollback.** Redeploy the previous binary. The plain `Execution:Read` gate returns, so
+group-scoped-only operators go back to `403` on the fragment. The `visible_agents` filter is a
+read-time parameter with no stored state, so there is nothing to migrate or clean up. Audit rows
+already written with `result=denied` for `mcp.summarize_working_set` remain in the audit store.
 
 ## Behaviour change: service-scoped tokens, the `ITServiceOwner` ceiling on the fleet-read gate, and `GET /api/v1/upload-grants` (#3526)
 

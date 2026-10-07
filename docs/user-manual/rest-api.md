@@ -9981,6 +9981,8 @@ Aggregate response data for a command (counts, summaries).
 
 Export response data in CSV format.
 
+**Audit caveat (#5556).** Legacy `GET /api/responses/*` writes no `result=success` audit row and does not fail closed on audit-persist failure; use `/api/v1/responses` for SIEM evidence of response reads.
+
 **Confined (#1634).** All three readers are gated by `require_fleet_read` (ADR-0017 admit-then-filter) — a management-group-confined operator is admitted and sees only their in-scope agents' rows, real cross-operator isolation rather than the earlier inert per-row filter. `/export` and the catch-all GET push the visible-agent set into the underlying SQL query before `LIMIT`/`OFFSET` (ADR-0017 INV-3), so a confined caller's page reflects only their own visible rows. All three now share ONE gate's failure posture: a **null/unopened response store** returns `503`; an **open but corrupt RBAC store** fails **closed** with `403` (`rbac_enforcement_in_effect` holds, so `require_fleet_read`'s underlying permission check denies rather than falling through to the legacy read path) — for all three readers alike, not the differentiated no-rows-vs-503 split of the pre-migration gate. Scripted/Grafana consumers that start receiving `503`/`403` after an upgrade should check `/readyz` and the server log for `RbacStore` open/migrate errors.
 
 ---

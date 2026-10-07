@@ -264,8 +264,12 @@ gate.
     (canonical; #3525 tracked the same finding and was closed as its duplicate).
 - **Executions list fragment and MCP `summarize_working_set` (#3526, #4753)**: `GET /fragments/executions`
   and `summarize_working_set` `kind=execution` migrated onto `require_fleet_read`/`fleet_read_fn_` as
-  the sole gate on `(Execution, Read)` (hardening plus an admission change, not a fix for a reachable
-  leak; see `docs/auth-architecture.md`'s "Sixth migration"). The fragment pushes the scope into SQL
+  the sole gate on `(Execution, Read)` (hardening plus an admission change; an author-run reachability
+  probe, not independently adjudicated, found no leak through the old gate; see
+  `docs/auth-architecture.md`'s "Sixth migration"). With RBAC off both surfaces are unconfined for every
+  authenticated non-service caller. The fragment suppresses the owner disjunct for service-scoped sessions
+  (a service-scoped token's session username is its minter); the other execution read surfaces still show
+  a minter's executions to a service-scoped token (#5557). The fragment pushes the scope into SQL
   before its LIMIT and bounds the agent-status read to the visible agents; MCP's first gate stays a
   plain `Infrastructure:Read`. **NOT covered, disclosed:** `summarize_working_set` `kind=fleet` and
   `kind=result_set` return the whole-registry agent count from `agents_fn()` (#4753, checklist still

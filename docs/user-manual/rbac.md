@@ -235,14 +235,23 @@ Recommended order for a fresh install:
 > while `summarize_working_set` keeps its plain `Infrastructure:Read` first gate
 > (a group-scoped-only operator still gets `403` there; only a caller with a
 > global `Infrastructure:Read` plus a group-scoped `Execution:Read` is newly
-> admitted). Neither was a reachable leak before, because the flat gate only
-> ever admitted global-grant callers, who are unfiltered anyway. **Exception to
+> admitted). An author-run reachability probe (not independently adjudicated)
+> found no out-of-scope disclosure through the old gate, because the flat gate
+> only ever admitted global-grant callers, who are unfiltered anyway. With RBAC
+> off (the shipped default) both surfaces are unconfined for every authenticated
+> non-service caller, and a service-scoped token gets `403`. A service-scoped
+> token sees on the fragment only executions that touched an in-scope agent: the
+> owner disjunct (a principal's own dispatches) is suppressed for it, because its
+> session username is the account that minted it (the other execution read
+> surfaces still show a minter's executions to a service-scoped token, #5557).
+> **Exception to
 > the degraded-store sentence above:** a degrade on the Executions panel is NOT a
 > `503` the operator sees. The fragment's own failure notes (tracker or status
 > read failure) render at HTTP `200` as a `data-degraded` note, because the
 > dashboard drops `4xx`/`5xx` bodies; the gate's own `403`/`503` JSON bodies
 > (store not open) are unchanged. See `upgrading.md`. The `ITServiceOwner` ceiling for service-scoped
-> tokens is applied by the preceding change (the paragraph above), not by this one.
+> tokens is applied by PR #5546 (the "Service-scoped tokens and `ITServiceOwner`"
+> paragraph above), not by the executions-panel change.
 >
 > **Note (#1634):** the per-agent filter on `query_responses`/`aggregate_responses`/the
 > REST visualization+responses endpoints is, under *normal* RBAC operation, currently
