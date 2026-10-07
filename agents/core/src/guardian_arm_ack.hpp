@@ -5,6 +5,15 @@
  * tested standalone; Unit 6: wired into the live apply_rules()/heartbeat path).
  * See docs/spark-stage2-guardian-consumer-design.md §R5.3.
  *
+ * #5459 (option D): the former K-bound waiver is DELETED. A generation is
+ * acknowledged only when the application is genuinely done (can_advance()); an
+ * outstanding wedge holds it, honestly, for as long as the arm is hung, so the
+ * server's full_sync re-push keeps retrying. The waiver's predicate moved from the
+ * ACK gate (can_advance()) to the RETRY gate (decide_retry()): an identical retry
+ * whose only unresolved items are outstanding wedges (or wedges with a compensating
+ * teardown outstanding, or a wedge whose late success was just adopted and awaits the
+ * next tick's recovery scan) is Suppressed instead of paying a full teardown + re-arm.
+ *
  * GuardianArmAckLedger tracks ONE outstanding "application" - the set of rules
  * a single apply_rules() push accepted for spark arming
  * (GuardianEngine::ReconcileOutcome::Accepted) - so a heartbeat-bounded drain
@@ -27,22 +36,16 @@
  * it every heartbeat, and the generation-hold gate reads can_advance() instead
  * of assuming pending_arms == 0.
  *
- * Deliberately conservative and pre-K-bound at rung 9c PR-2's own original
- * scope: a receipt that resolves to anything other than Committed held its
- * application's generation FOREVER, exactly like the pre-PR-2 synchronous
- * behavior - no wedge marking, no K-bound retry-then-waive. §R5.2's ClaimEnd
- * preserved the finer split a later rung 9c PR needed to implement that
- * (queue-wait expiry vs. dispatched timeout vs. genuine refusal); this
- * ledger did not need it and did not re-derive it here.
- *
- * As implemented (rung 9c PR-5e, #4221, K-bound closeout, decision 1): that
- * FOREVER hold now has exactly one carve-out, scoped narrowly to the Wedged
- * subset ClaimEnd's split makes expressible - see can_advance()'s own doc
- * comment and Application::reapply_count/failed_receipts for the mechanism.
- * A CongestionExpired/Withdrawn/Stopped/plain-Failed receipt, or a latched
- * application-level failure, still holds the generation forever exactly as
- * this paragraph originally described - K is a Wedged-only escape hatch, not
- * a change to that conservative default.
+ * Deliberately conservative: a receipt that resolves to anything other than
+ * Committed holds its application's generation until a genuine recovery (a late
+ * success the runtime adopts) or a fresh successful application replaces it,
+ * exactly like the pre-PR-2 synchronous behavior. There is no escape hatch: rung
+ * 9c PR-5e's K-bound waiver (acknowledge a Wedged-only failure set after K
+ * identical re-applies) was removed by #5459 because acknowledging a still-hung
+ * arm made the server stop re-pushing, stranding the rule if the arm later failed.
+ * §R5.2's ClaimEnd split (queue-wait expiry vs. dispatched timeout vs. genuine
+ * refusal) is now used only by decide_retry(), to tell an outstanding wedge (retry
+ * Suppressed) from a genuine failure (retry Reapplied) - see decide_retry().
  *
  * One current application, never a history (Astra opine review: "New
  * application: stale receipts cannot acknowledge it"). begin_application()
@@ -82,14 +85,19 @@ namespace yuzu::agent {
 /// one brief, allocation-free registry_mu_ check, not KV I/O.
 inline constexpr std::size_t kAckDrainMaxPerTick = 1024;
 
-/// rung 9c PR-5e (#4221, K-bound closeout, decision 1): the number of
-/// identically-re-applied generations (§R5.3's own "three identical same-generation
-/// re-applies") a Wedged-only failure set may be waived after. A single shared
-/// saturating counter per application-sequence - NOT per-rule credit (a rule that only
-/// wedges on the 2nd re-apply can still ride the sequence's existing count to waiver on
-/// the 3rd; see Application::reapply_count's own doc comment) - matching the master
-/// plan's recorded decision and R5.3's literal phrasing exactly.
-inline constexpr std::size_t kReapplyWaiverThreshold = 3;
+/// #5459 (option D): the safety valve on retry suppression. decide_retry() may
+/// Suppress an identical retry on account of an outstanding wedge (or a wedge with a
+/// compensating teardown outstanding) at most this many times per application, then
+/// returns Reapply. A DECISION-count bound, not wall-clock: decide_retry() has one
+/// production caller (apply_rules(), driven by the server's push cadence), so at the
+/// 30 s heartbeat this is about 330 s (275 s at 25 s spacing). A forced Reapply
+/// re-arms every rule in the push (and so reintroduces the #4045 baseline-recapture
+/// exposure for Spark-captured, unpersisted baselines) but does NOT unstick the wedged
+/// claim - an identical re-observation returns the existing claim. It bounds the
+/// dependence on the suppress classification; it is NOT a recovery guarantee against
+/// a classifier that misidentifies a dead claim. Reset only by begin_application()
+/// and retire().
+inline constexpr std::size_t kWedgeSuppressMaxDecisions = 10;
 
 /// Content identity for a push: a rule_id, its enabled flag, enforcement_mode,
 /// version, and its spark/assertion/remediation GuardianSpecBlocks (type +
@@ -136,7 +144,10 @@ public:
     /// map<string,string> spark params). `applied` is the count the caller's
     /// own apply_rules() already computed for this push - stashed so a
     /// Suppress decision (decide_retry(), below) can hand it straight back
-    /// without recomputing anything.
+    /// without recomputing anything. Known limit of the delta-push case (a partial push
+    /// that omits an unresolved rule drops that rule's retry obligation, because this
+    /// replaces the open application wholesale): design doc R5.3 known limits, flip-gate
+    /// AC-11.
     void begin_application(std::uint64_t generation, std::string content_id, bool full_sync,
                            std::size_t applied);
 
@@ -193,19 +204,13 @@ public:
                              std::size_t* failed_out = nullptr);
 
     /// True iff there IS a current application, it has nothing left pending,
-    /// nothing latched, and either nothing resolved to a failure OR (rung 9c
-    /// PR-5e, #4221, K-bound closeout, decision 1) every resolved failure is a
-    /// still-genuinely-outstanding Wedged episode (Application::failed_receipts,
-    /// kept pruned to exactly that set every drain tick - see its own doc
-    /// comment) AND this application-sequence has been identically re-applied
-    /// at least kReapplyWaiverThreshold times (Application::reapply_count). A
-    /// non-Wedged failure (CongestionExpired/Withdrawn/Stopped/plain Failed, or
-    /// a Wedged entry whose eligibility has since settled to false) NEVER
-    /// waives, no matter how high reapply_count climbs - K is scoped to the
-    /// Wedged-only subset, never a generation-wide liveness bound (R5.3's own
-    /// framing). False, not vacuously true, when there is no current
-    /// application at all (nothing to advance FOR is not the same question as
-    /// "may advance").
+    /// nothing latched, and nothing resolved to a (still-counted) failure. #5459
+    /// (option D): there is NO wedge escape any more - an outstanding wedge, a
+    /// compensation-pending wedge, and every ordinary failure all hold the
+    /// generation until a genuine recovery decrements resolved_failed (the runtime
+    /// adopted a late success) or a fresh successful application replaces this one.
+    /// False, not vacuously true, when there is no current application at all
+    /// (nothing to advance FOR is not the same question as "may advance").
     ///
     /// A current application with an EMPTY pending map because add_pending()
     /// was simply never called (every rule this push resolved synchronously -
@@ -233,17 +238,13 @@ public:
     /// caller.
     std::size_t pending_count_for_test() const;
 
-    /// TEST-ONLY: the current application's retained-Wedged-failure count (0 if
-    /// there is no current application) - see Application::failed_receipts and
+    /// TEST-ONLY: the current application's retained outstanding-wedge count
+    /// (eligible or compensation-pending; 0 if there is no current application) -
+    /// see Application::failed_receipts and
     /// drain_locked()'s own arm-recovery scan (rung 9c PR-5d, concern 2). Lets a
     /// test settle on "the recovery scan has cleared every rule it is going to"
     /// without a production accessor. No production caller.
     std::size_t failed_receipt_count_for_test() const;
-
-    /// TEST-ONLY: the current application's reapply_count (0 if there is no current
-    /// application) - rung 9c PR-5e (#4221, K-bound closeout, decision 1). No
-    /// production caller; can_advance() reads Application::reapply_count directly.
-    std::size_t reapply_count_for_test() const;
 
     /// TEST-ONLY: every non-Committed ReceiptStatus this application's receipts
     /// have resolved to via drain_locked() - i.e. the same failure-group values
@@ -299,32 +300,53 @@ public:
     /// Whether an incoming push matching (generation, content_id, full_sync)
     /// against the CURRENT application is a genuine same-generation retry
     /// that can be skipped (Suppress), or must be treated as new work
-    /// (Reapply) - a different generation, changed content under the same
-    /// generation number, or an application that has already seen a failure
-    /// (latched or a resolved receipt). Reapply when there is no current
-    /// application at all - nothing to suppress against - AND, critically
-    /// (Gate 8 doc-currency fix; see the .cpp's own longer comment and
-    /// docs/spark-stage2-guardian-consumer-design.md's R5.3 correction),
-    /// whenever `pending` is EMPTY: this dedup exists only to protect a
-    /// claim that is genuinely still in flight, and Suppressing with nothing
-    /// in flight is what let a failed persist_generation_locked() write go
-    /// unretried forever (sec-1/arch-1). A content_id that is not a real
-    /// 64-hex-char SHA-256 digest (a sentinel, never a real hash) is also
-    /// never trusted as a match, even against an identical sentinel from a
-    /// different push. Never mutates
-    /// state (a query only - `runtime` is read via receipt_status(), which
-    /// takes its own brief registry_mu_ internally); call this AFTER
-    /// drain_locked() so a receipt that resolved this tick is reflected.
+    /// (Reapply). Reapply when there is no current application; when generation,
+    /// content_id or full_sync differ; when either content_id is not a real 64-hex
+    /// SHA-256 digest (a sentinel is never trusted as a match, even against an
+    /// identical sentinel); when the application latched a failure; when any
+    /// counted failure has no retained outstanding-wedge receipt (a genuine
+    /// non-wedge failure, drained or not); and when nothing is outstanding at all
+    /// (an application with no pending receipts and no outstanding wedge - this
+    /// preserves the failed-generation-persist retry, sec-1/arch-1: Suppressing with
+    /// nothing in flight swallowed the one thing apply_rules()'s tail gate still
+    /// needed to do on a repeat push).
+    ///
+    /// #5459 (option D): OUTSTANDING WORK no longer forces Reapply. Every counted failure
+    /// is re-read from `runtime` NOW through the ONE combined accessor
+    /// receipt_recovery_status() (never trusted from the retained map, never assembled from
+    /// two calls) and is outstanding when it is WedgeEligible (the arm is still hung),
+    /// CompensationPending (the late result returned, a compensating teardown is
+    /// outstanding) or Recovered (the late success was ADOPTED after the last drain, so the
+    /// rule just armed and the next drain's recovery scan has yet to clear its
+    /// resolved_failed; tearing it down now would undo the recovery). Only Blocking (the
+    /// claim ended without recovery) forces Reapply. Every pending receipt must be
+    /// Pending/Committed or a live outstanding wedge not yet drained. If so the retry is
+    /// Suppressed up to kWedgeSuppressMaxDecisions times per application (a Recovered
+    /// entry spends the budget like any other Suppress), then Reapply. When a wedged claim
+    /// pops WITHOUT recovery (a late failure, a finished compensation) the live check stops
+    /// holding and the next push is a Reapply, so the rule re-arms. Suppression NEVER
+    /// acknowledges anything: the generation stays held (can_advance() has no wedge
+    /// escape); a Recovered entry is acknowledged only by the next tick's recovery scan
+    /// clearing resolved_failed.
+    ///
+    /// Not const: the Suppress-on-wedge branch increments
+    /// Application::wedge_suppress_count. `runtime` is read via
+    /// receipt_recovery_status() (retained failures) and receipt_status_wedge_aware()
+    /// (pending receipts), each taking its own brief registry_mu_ internally. Call it under
+    /// the same engine lock as drain_locked(). Calling it after drain_locked() is not
+    /// required for correctness: every read of `runtime` is live, so a count a
+    /// drain has not caught up with yet is always resolved by the live re-read (the one
+    /// production caller, GuardianEngine::apply_rules(), does not drain first).
     ///
     /// `runtime` is consulted directly, not just `resolved_failed`, because
     /// drain_locked() is BOUNDED: a receipt past one tick's max_per_tick cap
     /// can sit in `pending` long after it actually resolved (to Failed or
     /// anything else), and Suppress must mean "every pending receipt is
-    /// still genuinely Pending" - not merely "drain_locked hasn't gotten to
-    /// it yet". This scan is what makes that true without drain_locked
-    /// itself needing an unbounded pass first.
-    RetryDecision decide_retry(std::uint64_t generation, const std::string& content_id,
-                               bool full_sync, const GuardianSparkRuntime& runtime) const;
+    /// still genuinely Pending or an outstanding wedge" - not merely
+    /// "drain_locked hasn't gotten to it yet".
+    [[nodiscard]] RetryDecision decide_retry(std::uint64_t generation,
+                                             const std::string& content_id, bool full_sync,
+                                             const GuardianSparkRuntime& runtime);
 
     /// Stop-time: drop the current application without resolving it further.
     /// Its receipts' claims remain the runtime's own problem exactly as
@@ -361,32 +383,27 @@ private:
         /// "Explicit narrowing": docs/spark-stage2-guardian-consumer-design.md's
         /// R5.3 stamp), not a silent drop.
         ///
-        /// rung 9c PR-5e (#4221, K-bound closeout): also re-validated every drain
-        /// tick against GuardianSparkRuntime::receipt_recovery_status() (see that
-        /// accessor's own doc comment) - an entry whose eligibility has since
-        /// settled to false (a Dispatching-window race corrected to a genuine
-        /// Failed/Stopped/AdmissionRejected outcome, or the claim was popped from
-        /// its key's FIFO by a real completion) is dropped from this map WITHOUT
-        /// decrementing resolved_failed: it is still a genuine, counted failure,
-        /// just no longer part of the Wedged-only subset K may waive. This keeps
-        /// `resolved_failed == failed_receipts.size()` a SAFE K-waiver predicate -
-        /// membership here means "currently, genuinely, still-outstanding Wedged",
-        /// never a stale or since-corrected classification.
+        /// #5459 (option D): membership means "currently an OUTSTANDING wedge" -
+        /// either still hung (Eligible) or with a compensating teardown outstanding
+        /// (CompensationPending); an adopted late success (Recovered) is also outstanding
+        /// work until the recovery scan erases it - and is re-validated every drain tick
+        /// against GuardianSparkRuntime::receipt_recovery_status(). An entry that has since
+        /// settled to Blocking (a Dispatching-window race corrected to a genuine
+        /// Failed/Stopped/AdmissionRejected outcome, or the claim was popped from its
+        /// key's FIFO by a real completion nobody adopted) is dropped from this map
+        /// WITHOUT decrementing resolved_failed: it is still a genuine, counted
+        /// failure, just no longer an outstanding wedge. So
+        /// `resolved_failed == failed_receipts.size()` means "every counted failure
+        /// has a retained retry-deferral candidate", a NECESSARY condition for
+        /// decide_retry()'s wedge Suppress - never sufficient (each entry is
+        /// re-read live) and never an acknowledgment gate.
         std::map<std::string, GuardianSparkRuntime::ArmReceipt> failed_receipts;
-        /// rung 9c PR-5e (#4221, K-bound closeout, decision 1): a saturating count
-        /// (capped at kReapplyWaiverThreshold) of how many times THIS EXACT
-        /// application identity - (generation, content_id, full_sync), the same
-        /// comparison decide_retry() already uses - has been established in a row
-        /// via begin_application(). A single shared counter per application-
-        /// SEQUENCE, not per-rule credit: a rule that only wedges on the 2nd
-        /// identical reapply can still ride the sequence's existing count to
-        /// waiver on the 3rd (the master plan's own recorded decision 1). Carried
-        /// forward by begin_application() ONLY on an exact identity match against
-        /// the OUTGOING application; reset to 0 on any distinct generation,
-        /// content_id, full_sync, an invalid (non-SHA-256) digest on either side,
-        /// or when there was no prior application at all. can_advance() is the
-        /// sole production reader.
-        std::size_t reapply_count{0};
+        /// #5459 (option D): how many times decide_retry() has returned Suppress on
+        /// account of an outstanding wedge for THIS application. Bounded by
+        /// kWedgeSuppressMaxDecisions (the safety valve); incremented only on that
+        /// branch; reset only by begin_application()/retire() (this struct is
+        /// replaced wholesale), never by a drain or a sibling's recovery.
+        std::size_t wedge_suppress_count{0};
     };
     std::unique_ptr<Application> current_;
 };

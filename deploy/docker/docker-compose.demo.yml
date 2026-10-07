@@ -30,7 +30,7 @@
 services:
   # ── Tier 1: Yuzu Server (chiselled Ubuntu 26.04) ───────────────────────
   server:
-    image: ${YUZU_REGISTRY:-ghcr.io/devnullltd}/yuzu-server-chisel:${YUZU_VERSION:-0.14.0}
+    image: ${YUZU_REGISTRY:-ghcr.io/devnullltd}/yuzu-server-chisel:${YUZU_VERSION:-0.14.1}
     container_name: yuzu-demo-server
     command:
       - "--listen"
@@ -108,7 +108,7 @@ services:
   # stays so the pinned stack works on either. Same pinned image, run once as
   # root with no network, chowning only the volume root (#5370).
   server-certs-init:
-    image: ${YUZU_REGISTRY:-ghcr.io/devnullltd}/yuzu-server-chisel:${YUZU_VERSION:-0.14.0}
+    image: ${YUZU_REGISTRY:-ghcr.io/devnullltd}/yuzu-server-chisel:${YUZU_VERSION:-0.14.1}
     container_name: yuzu-demo-server-certs-init
     user: "0:0"
     entrypoint: ["/bin/busybox", "chown", "1000:1000", "/etc/yuzu/certs"]
@@ -123,7 +123,7 @@ services:
   # by docker-publish-postgres in release.yml; start-demo.sh --build builds
   # it locally during pre-release bootstrap.
   postgres:
-    image: ${YUZU_REGISTRY:-ghcr.io/devnullltd}/yuzu-postgres:${YUZU_VERSION:-0.14.0}
+    image: ${YUZU_REGISTRY:-ghcr.io/devnullltd}/yuzu-postgres:${YUZU_VERSION:-0.14.1}
     container_name: yuzu-demo-postgres
     environment:
       NO_PROXY: "*"
@@ -156,7 +156,7 @@ services:
 
   # ── Tier 2: Erlang Gateway (chiselled Ubuntu 26.04) ────────────────────
   gateway:
-    image: ${YUZU_REGISTRY:-ghcr.io/devnullltd}/yuzu-gateway-chisel:${YUZU_VERSION:-0.14.0}
+    image: ${YUZU_REGISTRY:-ghcr.io/devnullltd}/yuzu-gateway-chisel:${YUZU_VERSION:-0.14.1}
     container_name: yuzu-demo-gateway
     environment:
       NO_PROXY: "*"
@@ -191,7 +191,7 @@ services:
   # container and the fleet shows N distinct agents, not one. tmpfs also makes
   # every agent ephemeral — a restart yields a clean, identical fleet.
   agent:
-    image: ${YUZU_REGISTRY:-ghcr.io/devnullltd}/yuzu-agent-chisel:${YUZU_VERSION:-0.14.0}
+    image: ${YUZU_REGISTRY:-ghcr.io/devnullltd}/yuzu-agent-chisel:${YUZU_VERSION:-0.14.1}
     command:
       - "--server"
       - "gateway:50051"
