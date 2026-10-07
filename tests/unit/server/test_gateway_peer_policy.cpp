@@ -376,6 +376,10 @@ TEST_CASE("gateway_peer_cert: a passphrase-protected PEM block is refused, never
     // so a regression BLOCKS (and the bounded wait fails the test) rather than failing fast on EOF.
 #ifndef _WIN32
     BlockedStdin stdin_guard;
+    if (!stdin_guard.swapped()) {
+        WARN("stdin is closed, so the blocking-stdin swap was skipped: this run cannot tell a "
+             "refused passphrase prompt from one that was asked and then hit EOF");
+    }
 #endif
     const std::string pem = kEncryptedPem;
     const auto result = run_bounded(
@@ -841,9 +845,14 @@ TEST_CASE("gateway_peer_pinset: the default reader decides from one open and nev
         const auto r = run_bounded([fifo] { return gp::read_file_bounded(fifo, 100).status; },
                                    std::chrono::seconds(10), [fifo] {
                                        // Unblock a reader that did wait: open the write end.
-                                       if (const int fd = ::open(fifo.c_str(), O_WRONLY | O_NONBLOCK);
-                                           fd >= 0)
-                                           ::close(fd);
+                                       // Owned by a scope guard so every path closes it.
+                                       struct FdCloser {
+                                           int fd;
+                                           ~FdCloser() {
+                                               if (fd >= 0)
+                                                   ::close(fd);
+                                           }
+                                       } writer{::open(fifo.c_str(), O_WRONLY | O_NONBLOCK)};
                                    });
         REQUIRE(r.has_value()); // nullopt: the read blocked on the FIFO
         CHECK(*r == St::Unreadable);

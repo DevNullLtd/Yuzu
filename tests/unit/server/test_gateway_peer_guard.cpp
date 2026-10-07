@@ -868,8 +868,10 @@ TEST_CASE("gateway_peer_guard: two sequential channels sharing an LRU session ca
         std::unique_ptr<grpc_ssl_session_cache, SessionCacheDeleter> cache{
             grpc_ssl_session_cache_create_lru(16)};
         REQUIRE(cache != nullptr);
-        // grpc_ssl_session_cache_create_channel_arg supplies the pointer and its vtable for
-        // GRPC_SSL_SESSION_CACHE_ARG; the arg does not take ownership of `cache`.
+        // grpc_ssl_session_cache_create_channel_arg only packages the pointer and its vtable; it
+        // takes no reference. SetPointerWithVtable below calls the vtable's copy, which adds one
+        // reference to the cache that `cache_args` releases when it is destroyed. `cache` keeps
+        // its own reference until the end of this lambda, so each owner releases exactly its own.
         const grpc_arg cache_arg = grpc_ssl_session_cache_create_channel_arg(cache.get());
         REQUIRE(std::string{cache_arg.key} == GRPC_SSL_SESSION_CACHE_ARG);
         grpc::ChannelArguments cache_args;

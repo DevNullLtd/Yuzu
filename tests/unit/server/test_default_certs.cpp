@@ -67,7 +67,7 @@ yuzu::test::PgTestTemplate ca_store_tpl{
 
 struct TempDir {
     std::filesystem::path path;
-    TempDir() : path(yuzu::test::unique_temp_path("defcerts-")) {}
+    TempDir() : path(yuzu::test::unique_temp_path("yuzu_test_defcerts_")) {}
     ~TempDir() {
         std::error_code ec;
         std::filesystem::remove_all(path, ec);
@@ -961,7 +961,7 @@ TEST_CASE("default_certs: returns false (refuse) when the cert dir cannot be cre
     // bootstrap caller turns it into a clean refuse-to-start. (The startup_failed()
     // wiring itself is exercised by the live boot-test; ServerImpl::run starts a
     // real server, so it is not unit-constructible.)
-    const auto file_path = yuzu::test::unique_temp_path("defcerts-not-a-dir-");
+    const auto file_path = yuzu::test::unique_temp_path("yuzu_test_defcerts_not_a_dir_");
     {
         std::ofstream f(file_path);
         f << "this is a file, not a directory";

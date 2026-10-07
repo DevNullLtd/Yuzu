@@ -119,9 +119,11 @@ void GatewayPeerGuardedService::record_denial(grpc::ServerContext* context, Gate
             // The key-less log budget is keyed by the closed reason, so it is bounded by
             // construction and one reason's flood cannot silence another's line.
             if (log_budget_->try_admit(reason_name, reason_name).admitted) {
-                // The peer address is the only attribution an unauthenticated or certificate-less
-                // caller has, so the warning carries it (the IP is shape-validated by
-                // extract_peer_ip; `unknown` when there is none).
+                // This branch serves the three unauthenticated or certificate-less reasons
+                // (null_context, not_authenticated, no_cert) and bad_cert (a transport-authenticated
+                // peer whose certificate does not parse, so there is no key to attribute a row to).
+                // The peer address is the only attribution any of them has, so the warning carries
+                // it (the IP is shape-validated by extract_peer_ip; `unknown` when there is none).
                 std::string peer_ip = context ? extract_peer_ip(context->peer()) : std::string{};
                 if (peer_ip.empty())
                     peer_ip = "unknown";
