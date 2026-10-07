@@ -251,7 +251,7 @@
       },
       "default": 24,
       "definition_id": "agent.content_dist.cleanup",
-      "description": "Remove staged files whose last-write time is older than this many hours, e.g. 24 or 168. Default: 24. A value of 0 or less removes every staged file. Maximum 876000 (100 years), rejected with a 400 above that: measured on Linux with libstdc++, a value of 1500000 or more overflows the cutoff into the future and removes every staged file. Whole numbers only: the server rejects any other form with a 400 (the plugin on its own would silently fall back to 24 on an unparsable value).\n",
+      "description": "Remove staged files whose last-write time is older than this many hours, e.g. 24 or 168. Default: 24. A value of 0 or less removes every staged file. Maximum 876000 (100 years). Values from roughly 1.3 million upward (1500000 for example) can overflow the cutoff arithmetic on Linux/libstdc++ and make the cutoff lie in the future, which removes every staged file. Whole numbers only. Only POST /api/instructions/{id}/execute enforces the maximum and the whole-number rule (a 400 otherwise); MCP execute_instruction, /api/command, schedules and workflows do not validate parameters, and the plugin itself has no clamp (it would silently fall back to 24 on an unparsable value).\n",
       "name": "hours",
       "required": false,
       "type": "int32"

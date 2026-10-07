@@ -75,6 +75,12 @@ std::vector<Row> golden_rows() {
     acc("agent.content_dist.cleanup", {{"hours", 876000}}, "hours at its maximum");
     rej("agent.content_dist.cleanup", {{"hours", 876001}}, "hours one over its maximum");
     rej("agent.content_dist.cleanup", {{"hours", 1500000}}, "hours past the overflow point");
+    // The dashboard sends digit strings; coercion runs before the bound check.
+    acc("agent.content_dist.cleanup", {{"hours", "876000"}}, "hours digit string at its maximum");
+    rej("agent.content_dist.cleanup", {{"hours", "876001"}},
+        "hours digit string one over its maximum");
+    rej("agent.content_dist.cleanup", {{"hours", "1500000"}},
+        "hours digit string past the overflow point");
     acc("agent.content_dist.execute_staged", {{"filename", "a.msi"}, {"expected_hash", kHash64}},
         "execute_staged expected_hash");
     rej("agent.content_dist.execute_staged", {{"filename", "a.msi"}, {"expected_hash", "ABC"}},
