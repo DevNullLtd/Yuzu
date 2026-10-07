@@ -15204,13 +15204,17 @@ TEST_CASE("#4045 R8: a throwing snapshot leaves staging exactly as it was",
     CHECK(rt->snapshot_staged_baselines().size() == 3); // the seam fires once
 }
 
-TEST_CASE("#4045 R9: an allocation failure while staging is a COUNTED drop and the capture is "
-          "NOT committed (the rule re-captures at its next evaluation and stages it then)",
+TEST_CASE("#4045 R9: an allocation failure while staging is a COUNTED drop, the baseline STAYS "
+          "committed (drift is still detected against it) and the next evaluation re-stages the "
+          "ORIGINAL hash",
           "[spark][runtime][baseline]") {
-    // Staging is fallible BEFORE the commit (governance Gate 8 SEC F-1): a capture that could
-    // be neither staged nor persisted must not become the live baseline, or the next full_sync
-    // or restart would re-baseline drifted content as compliant with nothing on record.
-    auto r = std::make_shared<FakeReader>();
+    // Staging is fallible, and a capture that could not be staged must neither be forgotten nor
+    // be allowed to launder later drift. Clearing the baseline on a failed stage (the first
+    // attempt at this) made the NEXT evaluation, often the very change event, capture the
+    // drifted content as the baseline. The baseline therefore stays committed in the live
+    // state, the generation records that it is not staged yet, and every later evaluation
+    // retries staging the committed hash.
+    auto r = std::make_shared<FakeReader>(); // file hash "h"
     auto b = std::make_shared<FakeBackend>();
     auto rt = make_rt(r, b);
     REQUIRE(rt->attach_rule("r1", file_spec("/a"), file_hash_rule("r1"), true));
@@ -15218,23 +15222,41 @@ TEST_CASE("#4045 R9: an allocation failure while staging is a COUNTED drop and t
     rt->evaluate_key(spark_key(file_spec("/a")), EvalReason::Initial);
     CHECK(rt->staged_baseline_count_for_test() == 0); // staging failed...
     CHECK(rt->staged_baseline_drops() == 1);          // ...and it is counted, never silent
-    // The rule's own verdict was still committed (the compliant edge is on the outbox).
-    bool compliant = false;
+    // The rule's own verdict was committed (the compliant edge is on the outbox).
+    int compliant_edges = 0;
     for (const auto& e : drain_all(*rt))
-        compliant = compliant || (e.domain == OutboxDomain::Compliance && e.drift.compliant);
-    CHECK(compliant);
+        if (e.domain == OutboxDomain::Compliance && e.drift.compliant)
+            ++compliant_edges;
+    CHECK(compliant_edges == 1);
 
-    // ...but the BASELINE was not: the next evaluation captures again and this time it stages.
-    // (Before the fix the baseline had been committed, so the capture edge never fired again
-    // and the rule ran on a baseline that was neither staged nor durable.)
+    // The file changes BEFORE anything is staged. The baseline is still "h", so this is DRIFT
+    // against the original capture (RED if the failed stage cleared the baseline: the change is
+    // then re-captured as the baseline and no drift is reported).
+    r->file = read_known(FileSnapshot{.exists = true, .size = 4, .hash = "h2"});
     rt->evaluate_key(spark_key(file_spec("/a")), EvalReason::Event);
+    bool drift_vs_original = false;
+    int further_compliant = 0;
+    for (const auto& e : drain_all(*rt)) {
+        if (e.domain != OutboxDomain::Compliance)
+            continue;
+        if (e.drift.compliant)
+            ++further_compliant;
+        else
+            drift_vs_original = drift_vs_original ||
+                                (e.drift.expected_value == "h" && e.drift.detected_value == "h2");
+    }
+    CHECK(drift_vs_original);
+    CHECK(further_compliant == 0); // the retry never re-emits a compliant edge
+
+    // That same evaluation retried staging, and staged the ORIGINAL hash, not the drifted one.
     {
         const auto again = rt->snapshot_staged_baselines();
         REQUIRE(again.size() == 1);
         CHECK(same_capture(again[0], "r1", "/a", "h"));
     }
     CHECK(rt->staged_baseline_drops() == 1); // the retry staged cleanly: no second drop
-    // And once staged the baseline is committed like any other: no further capture edge.
+
+    // Once staged the retry is finished: a later evaluation stages nothing more.
     rt->erase_staged_baselines_if_unchanged(rt->snapshot_staged_baselines());
     rt->evaluate_key(spark_key(file_spec("/a")), EvalReason::Convergence);
     CHECK(rt->snapshot_staged_baselines().empty());
@@ -15245,6 +15267,91 @@ TEST_CASE("#4045 R9: an allocation failure while staging is a COUNTED drop and t
     const auto got = rt->snapshot_staged_baselines();
     REQUIRE(got.size() == 1);
     CHECK(same_capture(got[0], "r2", "/x", "h1"));
+}
+
+TEST_CASE("#4045 R9b: a rule whose staging keeps failing stays drift-detecting, every failed "
+          "retry is counted, and the first successful retry stages the original hash",
+          "[spark][runtime][baseline]") {
+    auto r = std::make_shared<FakeReader>(); // "h"
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = make_rt(r, b);
+    REQUIRE(rt->attach_rule("r1", file_spec("/a"), file_hash_rule("r1"), true));
+    const auto key = spark_key(file_spec("/a"));
+    rt->fail_next_stage_baseline_for_test(3); // the capture and the next TWO retries all fail
+    rt->evaluate_key(key, EvalReason::Initial);
+    CHECK(rt->staged_baseline_drops() == 1);
+    (void)drain_all(*rt);
+
+    r->file = read_known(FileSnapshot{.exists = true, .size = 4, .hash = "h2"});
+    rt->evaluate_key(key, EvalReason::Event); // retry 1 fails
+    CHECK(rt->staged_baseline_drops() == 2);
+    int drift_edges = 0;
+    for (const auto& e : drain_all(*rt))
+        if (e.domain == OutboxDomain::Compliance && !e.drift.compliant)
+            ++drift_edges;
+    CHECK(drift_edges == 1); // drift against "h", reported while nothing is staged
+
+    r->file = read_known(FileSnapshot{.exists = true, .size = 5, .hash = "h3"});
+    rt->evaluate_key(key, EvalReason::Event); // retry 2 fails
+    CHECK(rt->staged_baseline_drops() == 3);
+    CHECK(rt->staged_baseline_count_for_test() == 0);
+    bool still_vs_original = false;
+    for (const auto& e : drain_all(*rt))
+        still_vs_original = still_vs_original ||
+                            (e.domain == OutboxDomain::Compliance && !e.drift.compliant &&
+                             e.drift.expected_value == "h" && e.drift.detected_value == "h3");
+    CHECK(still_vs_original);
+
+    rt->evaluate_key(key, EvalReason::Convergence); // retry 3 succeeds
+    const auto got = rt->snapshot_staged_baselines();
+    REQUIRE(got.size() == 1);
+    CHECK(same_capture(got[0], "r1", "/a", "h")); // the ORIGINAL, whatever the file holds now
+    CHECK(rt->staged_baseline_drops() == 3);
+}
+
+TEST_CASE("#4045 R9c: a same-id re-attach while the capture is unstaged inherits the original "
+          "hash (staging it first); only a second staging failure falls back to a counted "
+          "re-capture",
+          "[spark][runtime][baseline]") {
+    auto r = std::make_shared<FakeReader>(); // "h"
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = make_rt(r, b);
+    REQUIRE(rt->attach_rule("r1", file_spec("/a"), file_hash_rule("r1"), true));
+    const auto key = spark_key(file_spec("/a"));
+    rt->fail_next_stage_baseline_for_test();
+    rt->evaluate_key(key, EvalReason::Initial); // captured "h", NOT staged
+    REQUIRE(rt->staged_baseline_count_for_test() == 0);
+    (void)drain_all(*rt);
+    r->file = read_known(FileSnapshot{.exists = true, .size = 4, .hash = "h2"});
+
+    // An identical re-push (every policy push re-attaches) must not re-baseline "h2".
+    REQUIRE(rt->attach_rule("r1", file_spec("/a"), file_hash_rule("r1"), true));
+    {
+        const auto got = rt->snapshot_staged_baselines();
+        REQUIRE(got.size() == 1);
+        CHECK(same_capture(got[0], "r1", "/a", "h")); // staged at attach, from the old generation
+    }
+    rt->evaluate_key(key, EvalReason::Initial);
+    bool drift_vs_original = false;
+    for (const auto& e : drain_all(*rt))
+        drift_vs_original = drift_vs_original ||
+                            (e.domain == OutboxDomain::Compliance && !e.drift.compliant &&
+                             e.drift.expected_value == "h" && e.drift.detected_value == "h2");
+    CHECK(drift_vs_original);
+    CHECK(rt->staged_baseline_drops() == 1);
+
+    // Residual, counted: the retry at the re-attach fails too, so the new generation has
+    // nothing to inherit and captures afresh (the same bad_alloc window as the very first
+    // capture; here the drop counter reads 2 for the two failed staging attempts).
+    auto r2 = std::make_shared<FakeReader>();
+    auto b2 = std::make_shared<FakeBackend>();
+    auto rt2 = make_rt(r2, b2);
+    REQUIRE(rt2->attach_rule("r1", file_spec("/a"), file_hash_rule("r1"), true));
+    rt2->fail_next_stage_baseline_for_test(2);
+    rt2->evaluate_key(key, EvalReason::Initial);
+    REQUIRE(rt2->attach_rule("r1", file_spec("/a"), file_hash_rule("r1"), true));
+    CHECK(rt2->staged_baseline_drops() == 2);
+    CHECK(rt2->staged_baseline_count_for_test() == 0);
 }
 
 TEST_CASE("#4045 R10: a failing inherit copy in attach_core leaves the PRIOR generation armed and "

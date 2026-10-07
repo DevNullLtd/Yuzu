@@ -95,9 +95,10 @@
  * next pass, persist_failures() counts the failed pass, the error is logged, and the heartbeat
  * carries it. A refusal by the #4021 overwrite guard is not a failure (first capture wins): it
  * is erased from staging, counted separately in persist_refusals() (NOT in failure_signals()),
- * and the guard's own warning is logged. Other channels counted in failure_signals(): an
- * allocation failure while staging (the runtime then does not commit that capture's baseline,
- * so the rule re-captures at its next evaluation), a retarget that replaced a still-unpersisted
+ * and the guard's own warning is logged. Other channels counted in failure_signals(): each
+ * failed attempt to stage a capture (an allocation failure: the runtime keeps the baseline
+ * live and retries staging at the generation's later evaluations, so the rule keeps detecting
+ * drift against the original capture meanwhile), a retarget that replaced a still-unpersisted
  * capture (that capture is lost), a capture staged with no store, and a throw firewalled
  * around a pass.
  */

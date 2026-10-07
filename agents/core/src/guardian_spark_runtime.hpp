@@ -66,7 +66,10 @@
  * evaluate_key's generation recheck after it). A staged entry leaves staging only AFTER its
  * KV write has returned, so nothing is ever "out" of staging; the engine's persister seed
  * fence (guardian_baseline_persister.hpp) additionally orders a worker pass against a
- * baseline-on-arm rule's KV seed read.
+ * baseline-on-arm rule's KV seed read. A capture that could not be staged (bad_alloc) stays
+ * committed in its generation's eval state, flagged RuleGeneration::baseline_unstaged; the
+ * flag is read and written only under registry_mu_ (evaluate_key's commit retries staging;
+ * attach_core stages the prior generation's committed hash before it reads staging).
  *
  * Rung 3 builds this against FAKE seams (IStateReader, ISparkBackend). The real
  * platform readers are rung 5; the convergence scheduler that also drives
@@ -628,11 +631,11 @@ public:
     /// wins on one path; a different path replaces and is counted). No production caller.
     void stage_baseline_for_test(const std::string& rule_id, const std::string& path,
                                  const std::string& hash);
-    /// TEST-ONLY: make the next stage_baseline_locked allocation-failure path fire once (the
-    /// capture is not staged, so evaluate_key does not commit its baseline, and the failure is
-    /// counted). No production caller.
-    void fail_next_stage_baseline_for_test() noexcept {
-        fail_next_stage_baseline_.store(true, std::memory_order_relaxed);
+    /// TEST-ONLY: make the next `n` stage_baseline_locked calls take the allocation-failure
+    /// path (nothing is staged, each failure is counted, and the generation keeps its baseline
+    /// but remembers it is unstaged). No production caller.
+    void fail_next_stage_baseline_for_test(int n = 1) noexcept {
+        fail_next_stage_baseline_.store(n, std::memory_order_relaxed);
     }
     /// TEST-ONLY: make the next snapshot_staged_baselines() throw bad_alloc before it touches
     /// staging (a throw must leave staging untouched). No production caller.
@@ -648,9 +651,10 @@ public:
     /// True iff at least one capture is staged (registry_mu_ standalone). The persister's
     /// no-store branch uses it to count a capture that has nowhere to go.
     [[nodiscard]] bool has_staged_baselines() const;
-    /// Captures that did not reach staging or were displaced from it: an allocation failure
-    /// while staging (the baseline is then NOT committed and the rule re-captures at its next
-    /// evaluation, so nothing is left live-but-undurable), or a retarget that replaced a
+    /// Staging attempts that failed or displaced a capture: an allocation failure while staging
+    /// (one per failed ATTEMPT: the baseline stays committed and staging is retried at every
+    /// later evaluation of the generation, each failed retry counted again, so a capture that
+    /// eventually stages still leaves its failed attempts here), or a retarget that replaced a
     /// still-unpersisted capture of another path (that capture is gone; legacy loses it on any
     /// failed write too, with no retry). GuardianBaselinePersister reads this
     /// through staged_baseline_drops_source() so the heartbeat getter needs no runtime lock.
@@ -1167,6 +1171,13 @@ private:
         bool emit_compliant_edge{true};
         RuleAssertion assertion;
         RuleEvalState eval;           ///< mutated only under the key's eval_mu (single serialisation domain)
+        /// #4045: this generation's baseline-on-arm capture is committed in `eval` but could NOT
+        /// be staged (an allocation failure, counted). registry_mu_-guarded, like staging itself.
+        /// Runtime-owned on purpose: RuleEvalState is shared evaluator code and must not learn
+        /// about persistence. While set, evaluate_key retries staging the COMMITTED hash on
+        /// every commit and attach_core stages it before a same-path replacement reads staging,
+        /// so the baseline keeps detecting drift meanwhile instead of being re-captured.
+        bool baseline_unstaged{false};
     };
 
     /// M1 item (b) bookkeeping for one rule_id still awaiting its first Known eval.
@@ -2582,16 +2593,18 @@ private:
     /// construction (never reseated) so GuardianBaselinePersister can read it without any lock.
     std::shared_ptr<std::atomic<std::uint64_t>> staged_baseline_drops_ =
         std::make_shared<std::atomic<std::uint64_t>>(0);
-    std::atomic<bool> fail_next_stage_baseline_{false}; ///< TEST-ONLY allocation-failure seam
+    std::atomic<int> fail_next_stage_baseline_{0}; ///< TEST-ONLY allocation-failure seam (count)
     mutable std::atomic<bool> fail_next_snapshot_{false}; ///< TEST-ONLY snapshot-throw seam
     std::atomic<bool> fail_next_inherit_copy_{false};     ///< TEST-ONLY attach_core copy seam
     /// registry_mu_ held. First capture wins on one path; a different path (a retarget)
     /// replaces the unpersisted capture and counts a drop. Never throws, so a throw cannot split
     /// evaluate_key's enqueue from its commit. Returns false iff the capture could NOT be staged
-    /// (an allocation failure, counted as a drop): the caller must then not commit the baseline
-    /// that capture established, or it would be neither staged nor durable.
-    bool stage_baseline_locked(const std::string& rule_id, const std::string& path,
-                               const std::string& hash) noexcept;
+    /// (an allocation failure, counted as a drop). The caller must then NOT forget the capture
+    /// and must not discard the baseline it established (that would let the next evaluation
+    /// re-baseline drifted content): it sets RuleGeneration::baseline_unstaged so the staging is
+    /// retried with the same, committed hash.
+    [[nodiscard]] bool stage_baseline_locked(const std::string& rule_id, const std::string& path,
+                                             const std::string& hash) noexcept;
     std::unique_ptr<SparkKeyRuleIndex> index_;                          // key <-> rule fan-out + refcount
     std::unordered_map<std::string, std::shared_ptr<RuleGeneration>> rules_; // rule_id -> generation
     std::unordered_map<std::string, std::shared_ptr<PerKey>> keys_;          // spark_key -> per-key

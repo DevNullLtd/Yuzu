@@ -7023,12 +7023,14 @@ TEST_CASE("#4045 E23: every term of the heartbeat aggregate is pinned",
 }
 
 // ── #4045 governance fix round 2 ─────────────────────────────────────────────────────────
-TEST_CASE("#4045 E24: a capture that could not be staged is NOT committed: the next evaluation "
-          "captures and stages it, it persists, and the live baseline equals the durable record",
+TEST_CASE("#4045 E24: a capture that could not be staged keeps its baseline: a later change is "
+          "DRIFT against the original, the next evaluation stages the ORIGINAL hash and it persists",
           "[spark][guardian][baseline][reconcile]") {
-    // Gate 8 SEC F-1: an allocation failure while staging used to be counted but the evaluation
-    // still committed the baseline, so the capture was neither staged nor durable and the next
-    // full_sync recaptured drifted content as compliant (no record, no drift).
+    // An allocation failure while staging is counted, but the capture must neither be forgotten
+    // (the baseline would be neither staged nor durable, so a full_sync or restart would
+    // re-baseline drifted content) nor be dropped from the live state (the next evaluation, often
+    // the change event itself, would then capture the drifted content as the baseline and
+    // report it compliant). The baseline stays committed and staging is retried.
     Spark4045Target t;
     SparkReconcileFixture f{3'600'000, std::nullopt, SparkType::File};
     f.engine->drain_worker_for_test()->stop();
@@ -7043,38 +7045,55 @@ TEST_CASE("#4045 E24: a capture that could not be staged is NOT committed: the n
     REQUIRE(yuzu::test::spin_until([&] { return rt->staged_baseline_drops() == 1; }));
     CHECK(rt->staged_baseline_count_for_test() == 0);
     CHECK(f.engine->baseline_persist_failures() == 1); // counted on the heartbeat aggregate
+    std::vector<OutboxEntry> drained; // the worker is parked, so drain the outbox by hand
+    const auto drain_now = [&] {
+        rt->drain([&](const OutboxEntry& e) {
+            drained.push_back(e);
+            return SendResult::Sent;
+        });
+    };
+    const auto drift_vs = [&](const std::string& expected, const std::string& detected) {
+        for (const auto& e : drained)
+            if (e.domain == yuzu::agent::OutboxDomain::Compliance && !e.drift.compliant &&
+                e.drift.expected_value == expected && e.drift.detected_value == detected)
+                return true;
+        return false;
+    };
+    drain_now();
+    int compliant_edges = 0;
+    for (const auto& e : drained)
+        if (e.domain == yuzu::agent::OutboxDomain::Compliance && e.drift.compliant)
+            ++compliant_edges;
+    CHECK(compliant_edges == 1); // the verdict committed even though the capture was not staged
 
-    // Nothing was committed as the baseline, so the next evaluation captures A again and this
-    // time stages it...
+    // The file changes before anything is staged. The live baseline is still A, so this is drift
+    // against A (RED if the failed stage cleared the baseline: B would be captured and reported
+    // compliant, with no drift event at all).
+    Spark4045Target::write(target, "content B, longer");
+    const std::string h_b = hash_of_4045(target);
+    REQUIRE(h_b != h_a);
     eval_initial_4045(*f.engine, target);
+    drain_now();
+    CHECK(drift_vs(h_a, h_b));
+
+    // The same evaluation retried staging with the ORIGINAL hash, and it persists as such.
     CHECK(rt->staged_baseline_count_for_test() == 1);
-    // ...and it persists.
+    CHECK(rt->staged_baseline_drops() == 1); // the retry staged cleanly: no second drop
     const auto out = persist_now_4045(*f.engine);
     CHECK(out.written == 1);
     const auto rec = baseline_record_4045(*f.kv, "r1");
     REQUIRE(rec.has_value());
     CHECK(rec->value("hash", std::string{}) == h_a);
 
-    // The file drifts and a full_sync re-arms: the live baseline is the DURABLE one, so the
-    // drift is reported against A and the record is untouched (no laundering).
-    Spark4045Target::write(target, "content B, longer");
-    const std::string h_b = hash_of_4045(target);
-    REQUIRE(h_b != h_a);
+    // A full_sync re-arm seeds from the record: still drift against A, record untouched.
+    drained.clear();
     f.apply(make_file_hash_rule("r1", target.string()), /*full_sync=*/true);
     eval_initial_4045(*f.engine, target);
-    std::vector<OutboxEntry> drained;
-    const bool drifted = yuzu::test::spin_until([&] {
-        rt->drain([&](const OutboxEntry& e) {
-            drained.push_back(e);
-            return SendResult::Sent;
-        });
-        for (const auto& e : drained)
-            if (e.domain == yuzu::agent::OutboxDomain::Compliance && !e.drift.compliant &&
-                e.drift.expected_value == h_a && e.drift.detected_value == h_b)
-                return true;
-        return false;
+    const bool drifted_again = yuzu::test::spin_until([&] {
+        drain_now();
+        return drift_vs(h_a, h_b);
     });
-    CHECK(drifted);
+    CHECK(drifted_again);
     CHECK(baseline_record_4045(*f.kv, "r1")->value("hash", std::string{}) == h_a);
 }
 
