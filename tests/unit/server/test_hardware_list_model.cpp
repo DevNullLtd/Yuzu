@@ -532,6 +532,7 @@ TEST_CASE("hardware_ci_json: absent identity renders null identity fields, onlin
     CHECK(j["os"].is_null());
     CHECK(j["online"] == false);
     CHECK(j["last_seen"].is_null());
+    CHECK(j["identity_state"] == "absent");
 }
 
 TEST_CASE("hardware_ci_json: ci_state discriminates degraded/absent/found", "[hardware][model][json]") {

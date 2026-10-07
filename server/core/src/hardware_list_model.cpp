@@ -594,7 +594,7 @@ bool apply_roster_read(InventoryDevicesResult& result, const OfflineRosterRead& 
 
 std::expected<std::optional<InventoryDeviceRow>, PresenceReadError>
 offline_identity_row(const OfflineRosterRead& eps, std::string_view agent_id, std::int64_t now_ms,
-                     const std::function<std::string(std::int64_t)>& human_age) {
+                     std::string (*human_age)(std::int64_t)) {
     if (!eps)
         return std::unexpected(eps.error());
     for (const auto& e : *eps) {

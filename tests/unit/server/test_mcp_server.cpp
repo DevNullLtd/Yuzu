@@ -27103,6 +27103,8 @@ TEST_CASE("MCP get_fleet_topology: a failed offline-roster read answers live-onl
     CHECK(payload["offline_roster_degraded"] == true);
     REQUIRE(ts.audit_log.size() == 1);
     CHECK(ts.audit_log[0] == "viz.fleet_topology|success");
+    REQUIRE(ts.audit_details.size() == 1);
+    CHECK(ts.audit_details[0].find("offline_roster_degraded=1") != std::string::npos);
 }
 
 // #5531. Kills: the healthy typed merge through the roster closure being dropped (stale host
@@ -27145,34 +27147,6 @@ TEST_CASE("MCP get_fleet_topology: a healthy offline roster merges the stale hos
     CHECK_FALSE(payload.contains("offline_roster_degraded"));
     REQUIRE(ts.audit_details.size() == 1);
     CHECK(ts.audit_details[0].find("offline_roster_degraded") == std::string::npos);
-}
-
-// #5531. Kills: dropping the ` offline_roster_degraded=1` suffix from the viz.fleet_topology
-// audit detail on a failed roster read.
-TEST_CASE("MCP get_fleet_topology: a failed offline-roster read appends offline_roster_degraded=1 "
-          "to the audit detail",
-          "[mcp][integration][viz]") {
-    std::vector<RawAgentSnapshot> seed{b3_mk_agent("agent-viz-1", "host-viz-1")};
-    FleetTopologyStore store{b3_fixed_fetcher(std::move(seed)), /*nvd=*/nullptr,
-                             /*ttl=*/std::chrono::seconds(60),
-                             /*fetch_deadline=*/std::chrono::milliseconds(50),
-                             /*max_snapshot_bytes=*/0};
-
-    McpTestServer ts;
-    ts.fleet_topology_store_for_test = &store;
-    ts.offline_roster_fn_for_test = [](std::chrono::seconds) {
-        return std::expected<std::vector<yuzu::server::OfflineEndpoint>,
-                             yuzu::server::PresenceReadError>(
-            std::unexpected(yuzu::server::PresenceReadError::DbError));
-    };
-    ts.start();
-
-    auto res = ts.call(
-        R"({"jsonrpc":"2.0","method":"tools/call","id":12,"params":{"name":"get_fleet_topology",)"
-        R"("arguments":{}}})");
-    REQUIRE(res);
-    REQUIRE(ts.audit_details.size() == 1);
-    CHECK(ts.audit_details[0].find("offline_roster_degraded=1") != std::string::npos);
 }
 
 TEST_CASE("MCP get_fleet_topology: kill switch answers before Response:Read is even "

@@ -34,7 +34,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <expected>
-#include <functional>
 #include <optional>
 #include <string>
 #include <utility>
@@ -452,19 +451,6 @@ TEST_CASE("hardware CI fragment: identity_degraded + no record -> roster unreada
     }
 }
 
-// Kills: dropping the `identity_state` arm from hardware_ci_json, or mapping an absent identity
-// (not in the roster, nothing failed) onto "degraded".
-TEST_CASE("hardware_ci_json: identity_state is absent / degraded / found", "[hardware][ui]") {
-    HardwareCiDetail d;
-    d.ci = std::expected<std::optional<DeviceCiRecord>, CiReadError>(std::optional<DeviceCiRecord>{});
-    CHECK(hardware_ci_json(d, 0)["identity_state"].get<std::string>() == "absent");
-    d.identity_degraded = true;
-    CHECK(hardware_ci_json(d, 0)["identity_state"].get<std::string>() == "degraded");
-    d.identity_degraded = false;
-    d.identity = InventoryDeviceRow{};
-    CHECK(hardware_ci_json(d, 0)["identity_state"].get<std::string>() == "found");
-}
-
 // Kills: rendering the KPI strip (all zeros) above the roster-unavailable banner. The marker is
 // the class-use `<div class="hw-kpis">`, not `hw-kpi`, which the inlined CSS rule also contains.
 TEST_CASE("hardware list fragment: a degraded full-form list renders no KPI strip",
@@ -489,7 +475,7 @@ OfflineEndpoint make_offline_ep(const std::string& id, std::int64_t hb_ms) {
     e.last_heartbeat_ms = hb_ms;
     return e;
 }
-const std::function<std::string(std::int64_t)> kAge = [](std::int64_t) { return std::string("aged"); };
+std::string kAge(std::int64_t) { return std::string("aged"); }
 constexpr std::int64_t kDayMs = 24LL * 60 * 60 * 1000;
 } // namespace
 
