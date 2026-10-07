@@ -49,9 +49,10 @@ namespace detail {
     return ev;
 }
 
-/// Writes `ev` through `log` when the audit store is open. When the row is NOT written, because
-/// the store is not open, `log` returned false or `log` threw, a warning names the action and the
-/// cause: a missing audit trail is a log line, never a silent skip.  Returns whether the row was written. Never throws.
+/// Writes `ev` through `log` when the audit store is open. When the row is NOT written (the store
+/// is not open, `log` returned false, or `log` threw), a warning names the action and the cause:
+/// a missing audit trail is a log line, never a silent skip. Returns whether the row was written.
+/// Never throws.
 [[nodiscard]] inline bool write_audit_row_or_warn(bool store_open,
                                                   const std::function<bool(const AuditEvent&)>& log,
                                                   const AuditEvent& ev) noexcept {

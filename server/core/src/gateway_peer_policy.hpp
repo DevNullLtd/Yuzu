@@ -5,8 +5,8 @@
 ///
 /// WHO DECIDES. `decide()` is the single place that answers "may this caller use
 /// the gateway-upstream service". Nothing else reimplements the rule; the guard
-/// (a later change) is the only production caller and applies it before any
-/// request is processed.
+/// (gateway_peer_guard.hpp) is the only production caller and applies it before
+/// any request is processed.
 ///
 /// WHAT IT REQUIRES. All of the following, in this order; a caller is admitted
 /// only if every one holds:

@@ -532,6 +532,8 @@ TEST_CASE("gateway_peer_resolution: zero resolvable pins at boot refuses", "[gat
     CHECK(mentions(boot.error(), "does not exist"));
     CHECK(mentions(boot.error(), "automatic pin")); // names what to restore
     CHECK(mentions(boot.error(), "Refusing to start"));
+    // The loader's clause is closed with a period, so the log reads as two sentences.
+    CHECK(mentions(boot.error(), "does not exist. Refusing to start."));
 }
 
 TEST_CASE("gateway_peer_resolution: a broken explicit source never falls back to the auto-pin",
@@ -578,6 +580,8 @@ TEST_CASE("gateway_peer_resolution: a malformed hex pin is rejected at boot", "[
     REQUIRE_FALSE(boot.has_value());
     CHECK(mentions(boot.error(), "not-a-pi")); // the loader names a truncated prefix of the entry
     CHECK(mentions(boot.error(), "Refusing to start"));
+    CHECK(mentions(boot.error(), "hexadecimal characters (the SHA-256 of the gateway certificate's "
+                                 "SubjectPublicKeyInfo). Refusing to start."));
 }
 
 TEST_CASE("gateway_peer_resolution: one missing file among valid pins still refuses",

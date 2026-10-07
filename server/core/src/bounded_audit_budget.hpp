@@ -117,13 +117,13 @@ public:
         } else {
             // Named overflow buckets are bounded by `max_keys_`; past that, and for a call that
             // names none, the one shared fallback bucket (the empty name) is used.
-            auto it = overflow_.find(overflow_key);
-            if (it == overflow_.end()) {
+            auto ov = overflow_.find(overflow_key);
+            if (ov == overflow_.end()) {
                 const bool may_create = overflow_key.empty() || overflow_.size() < max_keys_;
-                it = overflow_.emplace(std::string{may_create ? overflow_key : std::string_view{}}, 0)
+                ov = overflow_.emplace(std::string{may_create ? overflow_key : std::string_view{}}, 0)
                          .first;
             }
-            slot = &it->second;
+            slot = &ov->second;
         }
         if (*slot >= max_rows_) {
             ++suppressed_total_;

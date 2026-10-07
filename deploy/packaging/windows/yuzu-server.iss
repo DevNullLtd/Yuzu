@@ -39,11 +39,14 @@
 ;                          gateway-upstream port: PEM certificates, or one SHA-256
 ;                          SPKI pin (64 hex characters) per line. Stored as
 ;                          certs\gateway-peer-pin and passed to the service as
-;                          --gateway-peer-pin-file on every install. Not parsed here:
-;                          the server validates it when it starts.
-;   /GATEWAY_PEER_PIN=hex  One SHA-256 SPKI pin, stored in the same file (use the
-;                          FILE form for several, or for a certificate). Give
-;                          either this or /GATEWAY_PEER_PIN_FILE, not both.
+;                          --gateway-peer-pin-file on every install. Setup only checks
+;                          that the file is non-empty and not UTF-16 (no NUL bytes);
+;                          the server parses it when it starts.
+;   /GATEWAY_PEER_PIN=hex  One SHA-256 SPKI pin (exactly 64 hex characters, either
+;                          case), stored in the same file (use the FILE form for
+;                          several, or for a certificate). Give either this or
+;                          /GATEWAY_PEER_PIN_FILE, not both. Either one given
+;                          REPLACES the stored certs\gateway-peer-pin.
 ;                          /GATEWAY with operator gRPC certificates (/GRPC_CERT or
 ;                          /CA_CERT, now or from an earlier install) needs one
 ;                          of them, or Setup refuses. With the generated default
@@ -62,7 +65,9 @@
 ;   /GRPC_KEY=path         PEM private key for agent gRPC
 ;   /CA_CERT=path          PEM CA cert for mTLS agent verification
 ;   /NOHTTPS               Disable HTTPS (dev only)
-;   /NOTLS                 Disable gRPC TLS (dev only)
+;   /NOTLS                 Disable gRPC TLS (dev only). Any /GRPC_CERT, /GRPC_KEY or
+;                          /CA_CERT given with it is ignored and not copied, as in
+;                          the wizard.
 ;   /NOSTART               Do not start service after install
 ;
 ; Exit codes: 0 success; 7 the installation was stopped before any file was
@@ -849,6 +854,14 @@ begin
     R.GrpcCert := GetCmdParam('GRPC_CERT');
     R.GrpcKey := GetCmdParam('GRPC_KEY');
     R.CaCert := GetCmdParam('CA_CERT');
+    // As in the wizard: with gRPC TLS skipped the certificates are ignored by the
+    // service arguments, so they must not be copied into certs\ either.
+    if HasCmdFlag('NOTLS') then
+    begin
+      R.GrpcCert := '';
+      R.GrpcKey := '';
+      R.CaCert := '';
+    end;
   end
   else
   begin
@@ -1499,14 +1512,57 @@ begin
     Result := 'The file given with /' + Param + '= was not found, or is not a plain file: ' + Path;
 end;
 
+// True when S is exactly 64 hexadecimal digits (a SHA-256 SPKI pin), either case.
+function IsSha256Hex(const S: string): Boolean;
+var
+  I, C: Integer;
+begin
+  Result := Length(S) = 64;
+  if Result then
+    for I := 1 to Length(S) do
+    begin
+      C := Ord(S[I]);
+      if not (((C >= 48) and (C <= 57)) or ((C >= 65) and (C <= 70)) or
+              ((C >= 97) and (C <= 102))) then
+        Result := False;
+    end;
+end;
+
+// Cheap checks on a gateway peer pin file: readable, no NUL byte (a UTF-16 file
+// has them), not blank. Deliberately NOT a PEM or hex parser: the full parse
+// stays in the server (gateway_peer_pinset.cpp), which refuses to start on a
+// pin file it cannot use, so a second parser here could only drift from it.
+function PinFileProblem(const Path: string): string;
+var
+  Content: AnsiString;
+  I: Integer;
+begin
+  Result := '';
+  if not LoadStringFromFile(Path, Content) then
+  begin
+    Result := 'The file given with /GATEWAY_PEER_PIN_FILE= could not be read: ' + Path;
+    Exit;
+  end;
+  for I := 1 to Length(Content) do
+    if Ord(Content[I]) = 0 then
+    begin
+      Result := 'The file given with /GATEWAY_PEER_PIN_FILE= contains NUL bytes (is it UTF-16?). ' +
+                'Save it as ASCII or UTF-8 text: ' + Path;
+      Exit;
+    end;
+  if Trim(String(Content)) = '' then
+    Result := 'The file given with /GATEWAY_PEER_PIN_FILE= is empty: ' + Path;
+end;
+
 // The server refuses to start the gateway-upstream service on operator
 // certificates unless a gateway peer pin is configured (a certificate from the
 // operator's CA does not say which holder is the gateway). GetServiceArgs
 // rebuilds the command line from this run's inputs and the files in certs\ on
 // EVERY run, so an upgrade that re-selects gateway mode on an install carrying
 // operator certificates would otherwise install a service that does not boot.
-// Refused here, before anything changes. The pin is not parsed here; the server
-// validates it.
+// Refused here, before anything changes. A /GATEWAY_PEER_PIN value must be 64
+// hex characters and a pin file passes only the cheap checks above; the server
+// does the full validation when it starts.
 function CheckGatewayPeer(const Inp: TInstallInputs): string;
 var
   CertDir: string;
@@ -1517,6 +1573,19 @@ begin
   begin
     Result := 'Give either /GATEWAY_PEER_PIN= or /GATEWAY_PEER_PIN_FILE=, not both.';
     Exit;
+  end;
+  if (Inp.GatewayPeerPin <> '') and not IsSha256Hex(Inp.GatewayPeerPin) then
+  begin
+    Result := '/GATEWAY_PEER_PIN= must be exactly 64 hexadecimal characters (the SHA-256 of the ' +
+              'gateway certificate''s public key); the value given is ' +
+              IntToStr(Length(Inp.GatewayPeerPin)) + ' characters long or contains a character ' +
+              'that is not hexadecimal. For several pins, or a certificate, use /GATEWAY_PEER_PIN_FILE=.';
+    Exit;
+  end;
+  if Inp.GatewayPeerPinFile <> '' then
+  begin
+    Result := PinFileProblem(Inp.GatewayPeerPinFile);
+    if Result <> '' then Exit;
   end;
   if (not GatewayRequested) or GrpcTlsSkipped then Exit;
   CertDir := CertDirPath(DataDirPath);

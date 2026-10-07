@@ -145,8 +145,12 @@ std::expected<BootPins, std::string> build_boot_pins(const ResolutionInputs& in,
     auto loaded = res.auto_pin ? load_boot_pins(no_pins, no_pins, auto_file, reader)
                                : load_boot_pins(in.hex_pins, in.pin_files, auto_file, reader);
     if (!loaded) {
-        std::string msg = "Gateway peer pin configuration is invalid: " + loaded.error() +
-                          " Refusing to start. ";
+        // The loader's messages are clauses with no terminating period; add one so the log reads
+        // as two sentences ("...does not exist. Refusing to start.").
+        std::string cause = loaded.error();
+        if (cause.empty() || cause.back() != '.')
+            cause += '.';
+        std::string msg = "Gateway peer pin configuration is invalid: " + cause + " Refusing to start. ";
         msg += res.auto_pin ? "This is the automatic pin of the default gateway certificate: "
                               "restore the file, or configure an explicit pin (" +
                                   flag(kGatewayPeerPinFlag) + " / " + flag(kGatewayPeerPinFileFlag) + ")."

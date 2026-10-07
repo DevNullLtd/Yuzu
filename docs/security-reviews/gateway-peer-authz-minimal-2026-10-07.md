@@ -24,8 +24,8 @@ mistaken for oversights. It is a decision record, not a design proposal.
   the shell tests). Statements about existing code cite `origin/dev` `70cb9e70e`. A reviewer should
   still check each behavioural claim here against the final code; a claim that disagrees with that
   code is a defect in this record.
-- Nothing here was run: no build, test, promtool, compose, installer or governance run is claimed
-  by this document, and the reconciliation was a reading of the final sources, not a run. The review inputs (a security consult on the reference implementation, two
+- Nothing in the authoring pass was run: no build, test, promtool, compose or governance run is claimed
+  by this document (the later installer runs are recorded under the known limits), and the reconciliation was a reading of the final sources, not a run. The review inputs (a security consult on the reference implementation, two
   independent consults on the minimal design, and a plan review) were read-only analyses of source;
   every finding they report is code-derived, not experimentally reproduced.
 
@@ -127,7 +127,7 @@ its own. The code remains on backup branches; this change does not depend on it.
 | Revocation check on the gateway peer through the CA store | Make revoking a gateway certificate take effect | Serial-scoped revocation has different semantics from pin withdrawal (a certificate reissued over the same key keeps matching its pin), it tied every admitted RPC to the shared Postgres pool, and it needed the certificate-recognition module. Withdrawal is "remove the pin and restart every serving replica", stated plainly in the operator guide. |
 | Erlang reconciliation, parking and refusal retention after status 16 | After a refusal window, repair the placement of sessions whose CONNECTED notice was refused | With no pin reload the server never flips from refuse to accept without a restart. The mechanism itself needed repeated review rounds: a read-only consult of an earlier revision found a state in which a transient replay failure followed by a later success left an unrepaired session with no retained obligation, which later revisions addressed with more retained state. It belongs to the gateway workstream, which owns `gateway/` and is changing it now. |
 | Runtime pin-change audit row, pin gauges, reload alerts, recognition-module reads | Observe the above | The transitions they observe no longer exist. The boot-time acknowledged-insecure row and mode gauge are kept. |
-| Windows installer pin parser and wizard page (about 430 lines of Pascal) | Validate a pin file in the installer | The server validates at start. The installer instead stores the pin where it survives (see below) and does not parse it. |
+| Windows installer pin parser and wizard page (about 430 lines of Pascal) | Validate a pin file in the installer | The server validates at start. The installer instead stores the pin where it survives (see below). It checks only that a `/GATEWAY_PEER_PIN` value is 64 hexadecimal characters and that a pin file exists, is not empty and has no NUL byte; it never parses a pin file. |
 | Agent certificate standing, `--agent-unrecorded-mode`, Subscribe revalidation | A separate threat on the agent path | Separate threat, separate change. |
 
 Nothing under `gateway/`, no `*gateway-sys.config`, and not `docs/user-manual/gateway.md`,
@@ -148,7 +148,7 @@ corrected the first written design in these ways, each of which is part of this 
 4. **Windows installer durability.** The installer rebuilds the service command line from its own
    state on every run (`deploy/packaging/windows/yuzu-server.iss`, `GetServiceArgs`), so a flag
    appended by hand disappears at the next upgrade, and `/GATEWAY` is re-read each run. The change
-   adopts a storage convention without a parser: the pin lives at `certs\gateway-peer-pin`,
+   adopts a storage convention without a pin parser (only cheap checks): the pin lives at `certs\gateway-peer-pin`,
    `--gateway-peer-pin-file` is passed whenever gateway mode is selected, TLS is not skipped and that
    file exists, `/GATEWAY` with `/NOTLS` adds the acknowledgement (and no pin file, which the server
    would refuse together with it), and an install that would start gateway mode on operator gRPC
@@ -198,10 +198,22 @@ immutable pin set that cannot be empty by construction, and boot refuses an empt
   table (`tests/unit/server/test_gateway_peer_policy.cpp`) and by the label and audit-eligibility
   tests, so a wiring fault that made them unreachable or mis-attributed over the wire would not be
   caught by a wire test.
-- **The Windows installer change is not compiled.** `deploy/packaging/windows/yuzu-server.iss` was
-  edited on a Linux host with no Inno Setup compiler. It needs a compile and a silent-install check
-  (`/GATEWAY` with and without `/NOTLS`, with and without a pin, and an upgrade over an install
-  carrying operator certificates) on a Windows host before it is relied on.
+- **Windows installer verification is partial.** `deploy/packaging/windows/yuzu-server.iss` was
+  edited on a Linux host, then compiled with Inno Setup 6.7.3 and silent-installed on a Windows 11
+  test host (8 install cases plus upgrade, refusal and uninstall cases). Not tested: service start
+  under the Windows service manager, because the server binary does not implement the service
+  control protocol (pre-existing; open issue #1835, "Windows server binary has the identical SCM
+  control-protocol defect as #1822 (agent)", which also blocks any Windows server install), and the
+  interactive wizard path. The validation added after those runs (64 hexadecimal characters for
+  `/GATEWAY_PEER_PIN`, cheap checks for a pin file, and clearing the certificate parameters on a
+  silent `/NOTLS`) has not been compiled or run.
+- **Windows installer behaviour to know.** Re-supplying `/GATEWAY_PEER_PIN` or
+  `/GATEWAY_PEER_PIN_FILE` replaces `certs\gateway-peer-pin`; rotation with an overlap needs a
+  multi-entry pin file. When the service fails to start the Windows service manager reports 1053,
+  7000 or 7009 for every cause, so the reason is in `<install>\logs\yuzu-server.log`. The installer
+  fixes the gateway-upstream listen address at `0.0.0.0:50055` and does not emit `--ca-dir`
+  (platform default), so two server services on one host collide. A silent `/NOTLS` clears
+  `/GRPC_CERT`, `/GRPC_KEY` and `/CA_CERT`, as the wizard does.
 - **No pin-file permission or ownership warning.** The earlier implementation warned when a pin file
   was a symbolic link, writable by group or others, or owned by an unexpected user. This one does
   not: the server reads the file once, bounded, and the operator guide tells the administrator to
@@ -265,7 +277,7 @@ Each is a separate decision; none is a prerequisite for this change.
 3. Gateway-side reconciliation after status 16 (`yuzu_gw_upstream.erl`): belongs to the gateway
    workstream; coordinate with its deferred worker-failure retry.
 4. Agent certificate standing, `--agent-unrecorded-mode` and Subscribe revalidation.
-5. Windows installer pin parser and full wizard page; validation stays server-side meanwhile.
+5. Windows installer pin parser and full wizard page; full validation stays server-side meanwhile (the installer only does the cheap checks described above).
 6. Integration rig: run the `--tls` branch with a real pinned gateway leaf instead of the
    acknowledgement, so CI exercises the hop.
 7. Per-gateway scoping of relayed agent identities (#1292).
