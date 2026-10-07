@@ -664,8 +664,8 @@ public:
     /// TEST-ONLY: if set, invoked inside start_local()'s re-arm walk once per cached
     /// enabled rule, immediately BEFORE reconcile_rule_locked() — so a throw from the
     /// hook simulates the failure class the surrounding catch exists for (a legacy
-    /// guard's std::thread ctor throwing std::system_error under thread/handle
-    /// exhaustion), aimed at exactly one rule by rule_id. Deliberately NOT fired from
+    /// guard's std::thread ctor throwing std::system_error on thread-creation
+    /// failure), aimed at exactly one rule by rule_id. Deliberately NOT fired from
     /// inside reconcile_rule_locked() itself, which would also fire on the apply_rules
     /// path this seam is not meant to touch.
     ///

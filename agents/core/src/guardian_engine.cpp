@@ -691,10 +691,11 @@ std::expected<void, std::string> GuardianEngine::start_local() {
     // synchronous variants (a returned Failed or a throw in the walk below) go through
     // note_boot_rearm_failure_locked(), which also latches this application, so the tick's
     // can_advance() clear cannot erase them before the server has been told (a latched
-    // application's only observable effect is can_advance() == false). Contract: if this
-    // begin_application() throws there is no boot application, so the late variant is
-    // invisible (late receipts are dropped by add_pending) and the latch is a no-op; the
-    // synchronous variants are still covered.
+    // application's effect is can_advance() == false: decide_retry() also reads the latch, but
+    // the boot application's empty content_id sentinel returns Reapply before that check).
+    // Contract: if this begin_application() throws there is no boot application, so the late
+    // variant is invisible (late receipts are dropped by add_pending) and the latch is a
+    // no-op; the synchronous variants are still covered.
     //
     // Production order, and what the test fixture now covers: agent.cpp calls
     // wire_spark_engine() BEFORE start_local(), so a real boot CAN re-arm via Spark here and
@@ -793,8 +794,10 @@ std::expected<void, std::string> GuardianEngine::start_local() {
         }
         if (!rule.enabled())
             continue;
-        // Arming a legacy guard spawns a std::thread (guard_{file,registry,systemd}.cpp);
-        // under thread-or-handle exhaustion that ctor throws std::system_error. This
+        // Arming a legacy guard spawns a std::thread (guard_{file,registry,service,systemd}.cpp);
+        // on thread-creation failure that ctor throws std::system_error (each guard opens its
+        // handle/bus BEFORE the thread, and a handle/fd failure there returns false, which
+        // is Inert, #2797). This
         // loop runs OUTSIDE the json try above, and start_local()'s caller does not
         // catch, so an uncaught throw here escapes run() and terminates the agent. Since
         // rung 7.7a re-armed cached guards AFTER the SparkEngine's own boot threads, an
@@ -806,7 +809,7 @@ std::expected<void, std::string> GuardianEngine::start_local() {
                 rearm_fault_hook_for_test_(rule.rule_id());
             // #5513: a returned Failed (a Spark synchronous refusal; the legacy path's
             // returned-false stays Inert, #2797) or a throw below marks the boot re-arm
-            // unresolved; Accepted alone does not (the late variant is the tick's S2).
+            // unresolved; Accepted alone does not (the late variant is handled in the maintenance tick).
             switch (reconcile_rule_locked(rule)) { // either backend
             case ReconcileOutcome::Armed:
                 ++rearmed;
@@ -834,7 +837,7 @@ std::expected<void, std::string> GuardianEngine::start_local() {
             // its OWN allocation internally (SPDLOG_TRY/SPDLOG_LOGGER_CATCH - never rethrows),
             // but the raw string concatenation building degrade_msg runs OUTSIDE that firewall,
             // in a catch block whose entire purpose is to survive exactly the resource-exhaustion
-            // class (thread/handle exhaustion often correlates with memory pressure) that could
+            // class (thread-creation failure often correlates with memory pressure) that could
             // also make this concatenation throw bad_alloc. An uncaught throw here would escape
             // start_local() and terminate the agent - precisely the failure this outer catch
             // exists to prevent. Degrade further on a secondary failure rather than risk that.
@@ -853,11 +856,21 @@ std::expected<void, std::string> GuardianEngine::start_local() {
         } catch (...) {
             // #5513: a non-std::exception throw out of the arm path used to escape start_local()
             // (and run()), terminating the agent; degrade per-rule exactly like the arm above.
-            // A fixed literal: there is no message to build, so nothing here can throw.
+            // The failure is recorded first (noexcept). The message names the rule like the
+            // sibling arm does; log_id_token() allocates, so it is built in its own nested
+            // try/catch and falls back to a fixed literal if that throws.
             note_boot_rearm_failure_locked();
             ++boot_rearm_failed;
-            spdlog::error("Guardian: a rule failed to re-arm (non-standard exception) - NOT "
-                          "enforcing this rule; agent continues with the remaining rules");
+            try {
+                const std::string degrade_msg =
+                    "Guardian: rule '" + log_id_token(rule.rule_id()) +
+                    "' failed to re-arm (non-standard exception) - NOT enforcing this rule; "
+                    "agent continues with the remaining rules";
+                spdlog::error("{}", degrade_msg);
+            } catch (...) {
+                spdlog::error("Guardian: a rule failed to re-arm (non-standard exception) - NOT "
+                              "enforcing this rule; agent continues with the remaining rules");
+            }
         }
     }
 
@@ -1129,23 +1142,23 @@ void GuardianEngine::journal_maintenance_tick() {
                                   &ack_arm_failures_this_tick);
         if (ack_arm_failures_this_tick > 0) {
             arm_failures_.fetch_add(ack_arm_failures_this_tick, std::memory_order_relaxed);
-            // #5513 S2 (the late variant, dormant until prefer_spark_ flips): a receipt of the
+            // #5513 (the late variant, dormant until prefer_spark_ flips): a receipt of the
             // still-open BOOT application drained as a failure, so the boot re-arm did not
             // complete. Guarded by boot_app_open_: a failure on any later application is an
             // ordinary held push and must never report 0. NOT latched here (unlike the
             // synchronous variants): a drained wedge stays retained and recoverable, and a
             // late success adopted by the drain's recovery scan clears resolved_failed and
-            // lets C2 below fire with no push at all.
+            // lets the clear below fire with no push at all.
             if (boot_app_open_)
                 boot_unresolved_ = true;
         }
         if (ack_ledger_->can_advance()) {
-            // #5513 C2: any application that can advance is a clean one, the boot application
+            // #5513: any application that can advance is a clean one, the boot application
             // included (a latched or failed one cannot reach here), so the boot re-arm is
             // resolved. Deliberately NOT guarded by !boot_app_open_ (a late success adopted on
             // the boot application must clear it) and BEFORE the `gen > policy_generation_`
             // check below: that gate never opens for the boot application (its generation IS
-            // policy_generation_), so a clear nested inside it would never fire (TRAP 3).
+            // policy_generation_), so a clear nested inside it would never fire.
             if (boot_unresolved_) {
                 boot_unresolved_ = false;
                 spdlog::info("Guardian: boot re-arm resolved (the ack-drain tick applied cleanly), "
@@ -1796,15 +1809,15 @@ GuardianEngine::apply_rules(const gpb::GuaranteedStatePush& push) {
     // at prefer_spark_=false, not a heartbeat tick. Do not conflate the two in a
     // future edit here or in the log line below.
     //
-    // #5513 C1: a clean application also resolves an unresolved BOOT re-arm. The clear sits
-    // BESIDE the `push.policy_generation() > policy_generation_` gate, never inside it
-    // (TRAP 1): the server's catch-up push for a boot failure carries the generation the agent
+    // #5513: a clean application also resolves an unresolved BOOT re-arm. The clear sits
+    // BESIDE the `push.policy_generation() > policy_generation_` gate, never inside it:
+    // the server's catch-up push for a boot failure carries the generation the agent
     // already holds, so the `>` term is false for exactly the push this clear exists for. It
     // is also tied to a clean application (no failure this call, nothing pending, nothing
     // latched), not to the failed rule re-arming: a catch-up that disables or omits the rule
     // is clean too. When an Accepted arm is still pending here (the Spark path), this does
     // not fire and journal_maintenance_tick()'s can_advance() block clears it once the arm
-    // commits (TRAP 3: that clear is in the tick, not behind its own `>` gate either). The
+    // commits (that clear is in the tick, and is not behind its own `>` gate either). The
     // internal policy_generation_ is never altered by the clear; only the REPORTED value
     // (policy_generation(), which reads 0 while boot_unresolved_) changes.
     const bool clean = reconcile_failures == 0 && ack_ledger_->can_advance();
@@ -2002,8 +2015,11 @@ bool GuardianEngine::boot_rearm_unresolved() const {
 void GuardianEngine::note_boot_rearm_failure_locked() noexcept {
     boot_unresolved_ = true;
     arm_failures_.fetch_add(1, std::memory_order_relaxed);
-    // The boot application's only observable latch effect is can_advance() == false, which is
-    // the one predicate the tick's clear reads (see start_local()'s boot-application comment).
+    // For the boot application the latch's effect is can_advance() == false, the predicate the
+    // tick's clear reads (see start_local()'s boot-application comment). decide_retry() also
+    // reads latched_failure, but the boot application's empty content_id sentinel returns
+    // Reapply before that check is reached. Calls GuardianArmAckLedger::latch_failure(), which
+    // is noexcept: this function is noexcept and runs inside the exhaustion catch.
     // A no-op when begin_application() failed (no current application).
     ack_ledger_->latch_failure();
 }

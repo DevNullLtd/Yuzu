@@ -5800,7 +5800,10 @@ public:
             // applied policy generation on every heartbeat; if it trails the
             // current generation it missed a push (was offline when the push fired,
             // or has just reconnected — sync_with_server is a no-op pull), so
-            // re-push its applicable rules. Reads the generation, never bumps it, so
+            // re-push its applicable rules. An agent also reports generation 0 while
+            // a boot re-arm failure is unresolved (#5513), however current its
+            // persisted generation is; the same full_sync re-push is the catch-up
+            // for that case too. Reads the generation, never bumps it, so
             // catching one lagging agent up does not make the rest of the fleet look
             // stale (the cascade M6's monotonic counter is designed to avoid).
             heartbeat_ingestion_->set_guardian_reconcile_fn(

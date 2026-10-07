@@ -169,7 +169,9 @@ public:
     /// these are orthogonal to any single rule's own arm outcome, so they
     /// cannot be expressed as a receipt. A no-op if there is no current
     /// application.
-    void latch_failure();
+    /// noexcept: GuardianEngine::note_boot_rearm_failure_locked() (noexcept) calls this, so it
+    /// must never throw (the body is a pointer test and a bool store).
+    void latch_failure() noexcept;
 
     /// Expected to be called with the caller's own engine lock held, matching
     /// journal_maintenance_tick()'s own posture - this call does not take any

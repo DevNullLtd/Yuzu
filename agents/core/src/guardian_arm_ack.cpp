@@ -161,7 +161,7 @@ void GuardianArmAckLedger::add_pending(std::string rule_id,
     current_->pending.insert_or_assign(std::move(rule_id), std::move(receipt));
 }
 
-void GuardianArmAckLedger::latch_failure() {
+void GuardianArmAckLedger::latch_failure() noexcept {
     if (current_)
         current_->latched_failure = true;
 }

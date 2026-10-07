@@ -1199,17 +1199,36 @@ flip, with a red-first test each:
     loaded acknowledged generation with an empty `content_id`. A failed boot re-arm is
     resolved (#5513): the agent reports generation 0 with the sparse companion tag
     `yuzu.guardian_boot_rearm_unresolved` until a push applies cleanly, so the server's
-    existing reconcile catches it up, and the persisted generation is never rewritten. The
-    evidence is the 24 `[5513]`/`[boot_rearm]` cases in `test_guardian_engine.cpp` and
-    `test_guardian_engine_spark_reconcile.cpp`, the emitter cases in
-    `test_guardian_journal_heartbeat.cpp` and the server case in `test_heartbeat_ingestion.cpp`:
-    the 24 cases passed on Linux (also under TSan), Windows (MSVC) and macOS, and each of 11
-    deliberate mutations of the production lines turned a matching case red. Two
-    residuals stay open: a legacy guard that returns false at arm (`ReconcileOutcome::Inert`)
-    remains under #2797, and a server whose current generation is 0 does not push. The
+    existing reconcile catches it up, and the persisted generation is never rewritten. A
+    push that omits or disables the failed rule clears the flag too, because it is a clean
+    application; the omission hazard is AC-11 (FU-12, #5547). The evidence is the `[5513]`
+    and `[boot_rearm]` tests in `test_guardian_engine.cpp`,
+    `test_guardian_engine_spark_reconcile.cpp` (its `wire_first` fixture flag and
+    `BootRig5513` run the production boot order) and `test_guardian_journal_heartbeat.cpp`,
+    plus the server case in `test_heartbeat_ingestion.cpp`. The new tests are
+    single-threaded, so the TSan runs were clean but exercise no cross-thread interleaving
+    of the new state; that is not evidence for it. Linux, Windows (MSVC) and macOS runs and
+    the mutation checks were done on the pre-rebase tree; their re-run on the final tree is
+    recorded in the PR. Detection today has three routes and no per-agent metric: the
+    agent log WARN (`N cached rule(s) failed to re-arm at boot`), repeated
+    `guaranteed_state.reconcile` audit rows reading `generation 0 -> N` for one agent id,
+    and the fleet-wide `yuzu_server_guardian_reconciles_total{result="sent"}` rate.
+    Fleet-wide detection of the tag and the alert decision are #5558. A persistently
+    failing rule is re-pushed about every 25-30 s per agent, one audit row per push, with
+    no back-off (#5504 holds the measurement and FU-13, the back-off design). Residuals:
+    a legacy guard that returns false at arm (`ReconcileOutcome::Inert`) is the boot-path
+    analogue of #2797's `apply_rules` defect and is not covered, a server whose current
+    generation is 0 does not push, and the catch-up applies only where a legacy guard
+    actually arms (Windows; Linux with libsystemd and a reachable system bus, Service
+    rules only; macOS legacy guards are stubs, so it does not apply there). The
     Spark-path parts (a boot arm that fails late or is drained as a failure, and the latch
     on the boot application) are dormant while `prefer_spark_` is false and are covered by
-    those tests alone. An acknowledgment persisted by the old waiver is not revoked.
+    those tests alone. Two further dormant-Spark residuals: with `prefer_spark_` true, an
+    `apply_rules` throw after `begin_application()` and before the tail leaves the new
+    application unlatched, so the tick's clear could clear the boot flag early (to be
+    latched on unwind before the flip); and a boot `begin_application()` throw leaves no
+    boot application, so late boot receipts are not tracked (synchronous failures are
+    still caught). An acknowledgment persisted by the old waiver is not revoked.
   - (AC-14) **Content identity (#5512).** A re-observation of a wedged claim matches
     `rule_id` and spec only (the content-identity bug); recorded, not fixed here. Operator
     consequence: a wedged rule edited without changing its spec (its expected value, for

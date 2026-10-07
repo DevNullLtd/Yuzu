@@ -299,9 +299,9 @@ void collect_guardian_spark_health_tags(const Engine& eng, TagMap& tags,
 /// #5513: heartbeat status_tag key for the boot re-arm companion. "1" while the engine's boot
 /// re-arm is unresolved (GuardianEngine::boot_rearm_unresolved()), ABSENT otherwise - sparse by
 /// design, since a 0 here carries no information and dormancy is absence. It explains a reported
-/// yuzu.guardian_generation of 0 (an unresolved boot re-arm, not "never pushed"). A per-heartbeat
-/// wire diagnostic: the health store overwrites status_tags on every heartbeat and no server
-/// reader consumes this key today.
+/// yuzu.guardian_generation of 0 (an unresolved boot re-arm, not "never had a push
+/// acknowledged"). A per-heartbeat wire diagnostic: the health store overwrites status_tags on
+/// every heartbeat and no server reader consumes this key today.
 inline constexpr char kGuardianBootRearmUnresolvedTag[] = "yuzu.guardian_boot_rearm_unresolved";
 
 /// #5513: the ONE emitter for the generation pair, fed from a single
@@ -309,8 +309,8 @@ inline constexpr char kGuardianBootRearmUnresolvedTag[] = "yuzu.guardian_boot_re
 /// across an apply_rules clear. The companion is inserted FIRST: if an insert throws (allocation
 /// failure), the generation tag is then the one dropped, the server skips this tick's reconcile
 /// and the next tick retries - failure stays on the safe side, whereas the reverse order could
-/// ship (0, companion absent), which reads as "never pushed". `yuzu.guardian_generation` is
-/// ALWAYS emitted (decimal string), including 0.
+/// ship (0, companion absent), which reads as "never had a push acknowledged".
+/// `yuzu.guardian_generation` is ALWAYS emitted (decimal string), including 0.
 template <typename TagMap>
 void emit_guardian_generation_heartbeat_tags(TagMap& tags, std::uint64_t reported,
                                              bool boot_rearm_unresolved) {

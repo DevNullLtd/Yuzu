@@ -1429,7 +1429,7 @@ TEST_CASE("GuardianEngine: a health report with contradictory compliance fields 
 // #5513 boot re-arm catch-up (LEGACY path: prefer_spark=false, no Spark wiring)
 //
 // A cached rule whose boot re-arm fails (a legacy guard's std::thread ctor
-// throwing under thread/handle exhaustion is the production-reachable case) used
+// throwing on thread-creation failure is the production-reachable case) used
 // to leave the agent reporting its persisted, already-acknowledged generation, so
 // the server's "agent behind current" reconcile never fired and the rule stayed
 // unenforced until the next restart. start_local() now reports generation 0 while
@@ -1444,8 +1444,12 @@ TEST_CASE("GuardianEngine: a health report with contradictory compliance fields 
 // Rules: a registry-change rule is Inert on Linux/macOS (the legacy guard stub
 // returns false), so a push of it applies and persists on every host with no
 // platform dependency; the hook fires before reconcile_rule_locked, so the rule's
-// arm outcome never matters to what the tests assert. The Spark-wired cases for
-// this issue live in test_guardian_engine_spark_reconcile.cpp.
+// arm outcome never matters to what the tests assert. Every registry rule here is
+// "audit" mode, never "enforce": on Windows the seed phase really arms a
+// RegistryGuard against the fixed, unsalted HKCU\SOFTWARE\YuzuTest\GuardStatusTest
+// key, and enforce mode would create and write that key (a cross-job shared
+// resource on the shared CI runners); audit mode only watches. The Spark-wired
+// cases for this issue live in test_guardian_engine_spark_reconcile.cpp.
 // ===========================================================================
 
 namespace {
@@ -1471,7 +1475,7 @@ struct BootedEngine {
     }
 };
 
-// Models a legacy guard's thread ctor throwing under exhaustion, aimed at one rule.
+// Models a legacy guard's thread ctor throwing on thread-creation failure, aimed at one rule.
 std::function<void(const std::string&)> exhaust_on(std::string target) {
     return [target = std::move(target)](const std::string& rule_id) {
         if (rule_id == target)
@@ -1487,10 +1491,11 @@ gpb::GuaranteedStatePush push_at(std::uint64_t gen, std::vector<gpb::GuaranteedS
     return p;
 }
 
-// r1 + r2: registry rules, Inert on Linux/macOS (see the banner above).
+// r1 + r2: registry rules, Inert on Linux/macOS (see the banner above). "audit" so a
+// Windows run never creates the fixed shared HKCU test key (enforce mode would).
 std::vector<gpb::GuaranteedStateRule> two_registry_rules() {
-    return {GuardianFixture::make_registry_rule("r1", "enforce"),
-            GuardianFixture::make_registry_rule("r2", "enforce")};
+    return {GuardianFixture::make_registry_rule("r1", "audit"),
+            GuardianFixture::make_registry_rule("r2", "audit")};
 }
 
 // Phase 1: a first engine on `path` applies a push at `gen` and goes away, leaving the
@@ -1538,6 +1543,52 @@ TEST_CASE("GuardianEngine #5513: a re-arm that throws at boot reports generation
     const auto cleared = b.engine->generation_report();
     CHECK(cleared.reported == kG);
     CHECK_FALSE(cleared.boot_rearm_unresolved);
+}
+
+TEST_CASE("GuardianEngine #5513: get_status keeps the internal persisted generation while the "
+          "reported one reads 0",
+          "[guardian][engine][boot_rearm]") {
+    // get_status() is the census view and reads the INTERNAL generation (policy_generation_),
+    // deliberately not policy_generation()'s reported value; only the heartbeat-facing accessors
+    // move. Mutation: get_status() switched to the reported value reports 0 here.
+    constexpr std::uint64_t kG = 8;
+    yuzu::test::TempDbFile db{unique_kv_path()};
+    seed_persisted_generation(db.path, kG, two_registry_rules());
+
+    BootedEngine b{db.path};
+    b.start(exhaust_on("r1"));
+    REQUIRE(b.engine->boot_rearm_unresolved());
+    CHECK(b.engine->policy_generation() == 0);
+    CHECK(b.engine->get_status().policy_generation() == kG);
+
+    REQUIRE(b.engine->apply_rules(push_at(kG, two_registry_rules(), /*full_sync=*/true)).has_value());
+    CHECK_FALSE(b.engine->boot_rearm_unresolved());
+    CHECK(b.engine->policy_generation() == kG);
+    CHECK(b.engine->get_status().policy_generation() == kG);
+}
+
+TEST_CASE("GuardianEngine #5513: the push_rules reply text reports the persisted generation "
+          "once the catch-up clears the flag",
+          "[guardian][engine][boot_rearm][dispatch]") {
+    // The reply is built from the REPORTED generation. On the legacy path a push that returns
+    // success is always a clean application, which has already cleared the flag, so the
+    // "generation=0 while unresolved" reply text is reachable only on the dormant Spark Accepted
+    // path and is asserted there (test_guardian_engine_spark_reconcile.cpp). Here: the catch-up's
+    // reply names kG, not 0. Space-anchored like the dispatch test above.
+    constexpr std::uint64_t kG = 42;
+    yuzu::test::TempDbFile db{unique_kv_path()};
+    seed_persisted_generation(db.path, kG, two_registry_rules());
+
+    BootedEngine b{db.path};
+    b.start(exhaust_on("r1"));
+    REQUIRE(b.engine->boot_rearm_unresolved());
+
+    auto p = push_at(kG, two_registry_rules(), /*full_sync=*/true);
+    auto dr = yuzu::agent::guardian_dispatch_push_bytes_for_test(*b.engine, p.SerializeAsString());
+    CHECK(dr.exit_code == 0);
+    CHECK(dr.output.find(" generation=42 ") != std::string::npos);
+    CHECK(dr.output.find(" generation=0 ") == std::string::npos);
+    CHECK_FALSE(b.engine->boot_rearm_unresolved());
 }
 
 TEST_CASE("GuardianEngine #5513: a second restart while unresolved re-derives the state from "
@@ -1608,7 +1659,8 @@ TEST_CASE("GuardianEngine #5513: a catch-up that removes or disables the failed 
     // enforcement gap.
     constexpr std::uint64_t kG = 4;
     yuzu::test::TempDbFile db{unique_kv_path()};
-    seed_persisted_generation(db.path, kG, {GuardianFixture::make_registry_rule("r1", "enforce")});
+    // "audit": see the banner above (no enforce-mode write to the fixed Windows test key).
+    seed_persisted_generation(db.path, kG, {GuardianFixture::make_registry_rule("r1", "audit")});
 
     BootedEngine b{db.path};
     b.start(exhaust_on("r1"));
@@ -1623,6 +1675,8 @@ TEST_CASE("GuardianEngine #5513: a catch-up that removes or disables the failed 
                                           /*full_sync=*/true))
                     .has_value());
         CHECK(b.engine->rule_count() == 1);
+        // Trivially true on every host: the boot hook threw before arming, so r1 was never
+        // armed to begin with. What the section proves is the flag/generation pair below.
         CHECK(b.engine->armed_guard_count() == 0);
         CHECK_FALSE(b.engine->boot_rearm_unresolved());
         CHECK(b.engine->policy_generation() == kG);
@@ -1635,7 +1689,7 @@ TEST_CASE("GuardianEngine #5513: a catch-up that removes or disables the failed 
                                           /*full_sync=*/true))
                     .has_value());
         CHECK(b.engine->rule_count() == 1);
-        CHECK(b.engine->armed_guard_count() == 0);
+        CHECK(b.engine->armed_guard_count() == 0); // trivially true, as in the section above
         CHECK_FALSE(b.engine->boot_rearm_unresolved());
         CHECK(b.engine->policy_generation() == kG);
     }
@@ -1650,9 +1704,9 @@ TEST_CASE("GuardianEngine #5513: stop() is sticky - a start_local() after stop()
     yuzu::test::TempDbFile db{unique_kv_path()};
     seed_persisted_generation(db.path, kG, two_registry_rules());
 
+    std::size_t hook_calls = 0; // declared before the engine that holds the hook
     BootedEngine b{db.path};
     b.engine->stop();
-    std::size_t hook_calls = 0;
     b.engine->set_rearm_fault_hook_for_test([&hook_calls](const std::string&) { ++hook_calls; });
     REQUIRE(b.engine->start_local().has_value()); // returns cleanly, a no-op
 
@@ -1697,7 +1751,10 @@ TEST_CASE("GuardianEngine #5513: a non-std::exception throw at boot is contained
     CHECK(b.engine->rule_count() == 3);
     // Legacy service guards arm only where a system bus is reachable (the existing
     // service-rule tests SKIP otherwise). Where they do, exactly the two rules whose
-    // re-arm did not throw are armed and the poisoned one is not.
+    // re-arm did not throw are armed and the poisoned one is not. On a host without a
+    // system bus (macOS, a bus-less Linux container) `armed` is 0 and this check is
+    // skipped; the continued walk is then carried by the `visited` set above (r3 was
+    // reached after r2 threw), which holds on every host.
     if (const auto armed = b.engine->armed_guard_count(); armed != 0)
         CHECK(armed == 2);
 }

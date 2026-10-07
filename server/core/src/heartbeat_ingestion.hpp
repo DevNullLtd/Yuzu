@@ -82,7 +82,9 @@ public:
     /// carries the `yuzu.guardian_generation` tag, with the agent's applied policy
     /// generation. The server wires this to compare against the current generation
     /// and re-push a lagging agent — the convergence path for an agent that was
-    /// offline at push time or has just reconnected. Optional; unset = no reconcile.
+    /// offline at push time or has just reconnected. An agent also reports
+    /// generation 0 while a boot re-arm failure is unresolved (#5513), so the same
+    /// re-push is its catch-up. Optional; unset = no reconcile.
     using GuardianReconcileFn =
         std::function<void(std::string_view agent_id, std::uint64_t agent_generation)>;
     void set_guardian_reconcile_fn(GuardianReconcileFn fn) {

@@ -1108,7 +1108,7 @@ std::string push_bytes_5513(const std::vector<gpb::GuaranteedStateRule>& rules,
     return p.SerializeAsString();
 }
 
-/// The same injected thread-exhaustion throw the "start_local degrades per-rule" test uses,
+/// The same injected thread-creation-failure throw the "start_local degrades per-rule" test uses,
 /// aimed at exactly one rule by id.
 std::function<void(const std::string&)> rearm_throw_hook_5513(std::string target) {
     return [target = std::move(target)](const std::string& rule_id) {
@@ -1179,9 +1179,16 @@ struct BootRig5513 {
     }
 
     /// Releases every gate FIRST (a parked worker would otherwise outlive the engine that owns
-    /// its claim), then tears down in the fixture's order: engine, then SparkEngine, then KV.
+    /// its claim), waits (bounded) for the released worker to finish, then tears down in the
+    /// fixture's order: engine, then SparkEngine, then KV. The wait is a non-throwing, event-driven
+    /// poll (no REQUIRE/CHECK, nothing that can throw): shutdown() also runs from the destructor,
+    /// possibly during unwind. On timeout it proceeds to the teardown anyway, which is the
+    /// previous behaviour.
     void shutdown() {
         release_gates();
+        if (engine)
+            (void)yuzu::test::spin_until([&] { return engine->active_io_workers() == 0; },
+                                         std::chrono::seconds{10});
         engine.reset();
         if (spark_engine)
             spark_engine->stop();
@@ -1307,6 +1314,72 @@ TEST_CASE("#5513 live (prefer_spark=false): a healthy boot re-arm never holds th
     CHECK_FALSE(r.engine->boot_rearm_unresolved());
 }
 
+TEST_CASE("#5513 live (prefer_spark=false): a catch-up push the KV refuses leaves the flag set and "
+          "the reported generation 0, until a push applies",
+          "[spark][guardian][reconcile][boot][5513]") {
+    // The persistent-failure shape on the production (legacy) path. A legacy re-arm failure at
+    // APPLY time has no deterministic seam (reconcile_rule_locked's legacy branch never returns
+    // Failed; the fault hook fires only in start_local()), so the catch-up is made to fail by a
+    // real KV write failure instead: the rule persist is refused, apply_rules() returns the
+    // error, and the flag must stay set on every refused attempt. Mutation: clearing the flag
+    // before the persist (or on any push, not on a clean application) reports kGen5513 here.
+    BootRig5513 r;
+    r.seed(/*prefer_spark=*/false, /*with_spark=*/false, {make_file_rule("r1")}, kGen5513);
+
+    r.construct(false, false);
+    r.engine->set_rearm_fault_hook_for_test(rearm_throw_hook_5513("r1"));
+    REQUIRE(r.engine->start_local().has_value());
+    REQUIRE(r.engine->boot_rearm_unresolved());
+    CHECK(r.engine->policy_generation() == 0);
+
+    drop_kv_store_table_for_test(r.db_.path);
+    for (int i = 0; i < 2; ++i) {
+        const auto refused = r.push({make_file_rule("r1")}, kGen5513);
+        CHECK(refused.exit_code != 0);
+        CHECK(r.engine->boot_rearm_unresolved());
+        CHECK(r.engine->policy_generation() == 0);
+    }
+
+    recreate_kv_store_table_for_test(r.db_.path);
+    r.push_ok({make_file_rule("r1")}, kGen5513);
+    CHECK_FALSE(r.engine->boot_rearm_unresolved());
+    CHECK(r.engine->policy_generation() == kGen5513);
+}
+
+TEST_CASE("#5513 live (prefer_spark=false): a catch-up whose generation persist fails clears the "
+          "flag but reports the HELD generation, never a newer one",
+          "[spark][guardian][reconcile][boot][5513]") {
+    // The flag clears on a clean APPLICATION; advancing the internal generation is a separate step
+    // that needs the generation write to succeed. An empty delta push writes no rule, so the only
+    // KV write is that generation persist: dropping the table makes exactly it fail. The agent
+    // then reports the generation it really holds (kGen5513), which is BEHIND the pushed
+    // kGen5513 + 1, so the server's reconcile keeps pushing; reporting the pushed value here
+    // would be a false acknowledgment. Once the store is back, the same push persists and
+    // advances, and a restart reads it from disk.
+    BootRig5513 r;
+    r.seed(/*prefer_spark=*/false, /*with_spark=*/false, {make_file_rule("r1")}, kGen5513);
+
+    r.construct(false, false);
+    r.engine->set_rearm_fault_hook_for_test(rearm_throw_hook_5513("r1"));
+    REQUIRE(r.engine->start_local().has_value());
+    REQUIRE(r.engine->boot_rearm_unresolved());
+
+    drop_kv_store_table_for_test(r.db_.path);
+    r.push_ok({}, kGen5513 + 1, /*full_sync=*/false);
+    CHECK_FALSE(r.engine->boot_rearm_unresolved());
+    CHECK(r.engine->policy_generation() == kGen5513); // held, below the server's current
+
+    recreate_kv_store_table_for_test(r.db_.path);
+    r.push_ok({}, kGen5513 + 1, /*full_sync=*/false);
+    CHECK(r.engine->policy_generation() == kGen5513 + 1);
+
+    r.shutdown();
+    r.construct(false, false);
+    REQUIRE(r.engine->start_local().has_value());
+    CHECK(r.engine->policy_generation() == kGen5513 + 1); // durable
+    CHECK_FALSE(r.engine->boot_rearm_unresolved());
+}
+
 TEST_CASE("#5513 dormant (prefer_spark=true): a boot arm that drains as a failure reports 0, and "
           "only the tick clears it once the catch-up arm commits",
           "[spark][guardian][reconcile][boot][5513][dormant]") {
@@ -1338,7 +1411,11 @@ TEST_CASE("#5513 dormant (prefer_spark=true): a boot arm that drains as a failur
 
     // The catch-up arm is held in watch() by the park-all gate (the hang gate is latched open).
     r.mechanism->set_park_all_watches();
-    r.push_ok({make_service_rule("r1")}, kGen5513);
+    const auto pending_reply = r.push({make_service_rule("r1")}, kGen5513);
+    REQUIRE(pending_reply.exit_code == 0);
+    // The push_rules reply text reads the REPORTED generation, so while the flag is set it says 0
+    // (not the persisted kGen5513) even though the push itself was accepted.
+    CHECK(pending_reply.output.find(" generation=0 ") != std::string::npos);
     REQUIRE(yuzu::test::spin_until([&] { return r.mechanism->parked_watch_count() == 1; }));
     CHECK(r.engine->policy_generation() == 0); // the tail cannot clear: the receipt is pending
     CHECK(r.engine->boot_rearm_unresolved());

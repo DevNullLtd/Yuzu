@@ -822,7 +822,8 @@ agent restart gap (the boot
 Application opens at the loaded acknowledged generation with an empty `content_id`;
 a failed boot re-arm, formerly never retried, is resolved by #5513: the agent reports
 generation 0 with the `yuzu.guardian_boot_rearm_unresolved` tag until a push applies
-cleanly, and a legacy guard that returns false at arm stays under #2797); a content-identity gap (an
+cleanly; a legacy guard that returns false at arm is the boot-path analogue of #2797's
+`apply_rules` defect and stays uncovered); a content-identity gap (an
 identical re-observation matches `rule_id` and spec only, #5512); a wedge that is adopted or
 settles before the agent has retained it costs one avoidable Reapply on the next identical
 push: one minted in the Dispatching window is counted in `resolved_failed` but never retained
@@ -1008,8 +1009,8 @@ together in prose but which do not share one signal in code:
   `rules_` currently carry this EXACT (rule_id, generation) incarnation, not
   merely SOME generation of the rule) and, on a match, decrements
   `resolved_failed` and drops the entry - clearing `can_advance()`'s block for
-  that application without ever decrementing the cumulative, fleet-visible
-  `arm_failures_` counter (`failed_out` is untouched on recovery; that counter
+  that application without ever decrementing the cumulative `arm_failures_` counter (read
+  only by tests today, `arm_failure_count()` has no production caller, #4062) (`failed_out` is untouched on recovery; that counter
   answers "how many arm failures have ever happened", a different question
   from "does the current application still have one outstanding").
 
@@ -1167,8 +1168,9 @@ design is mentioned it is named as the earlier design.
   the boot Application opens at the loaded acknowledged generation with an empty
   `content_id`. A failed boot re-arm, formerly never retried, is resolved by #5513 (the
   agent reports generation 0 with the `yuzu.guardian_boot_rearm_unresolved` tag until a
-  push applies cleanly; a legacy guard that returns false at arm stays under #2797, and a
-  server at generation 0 does not push); an acknowledgment
+  push applies cleanly; a legacy guard that returns false at arm is the boot-path analogue
+  of #2797's `apply_rules` defect and stays uncovered, and a server at generation 0 does
+  not push); an acknowledgment
   persisted by the old waiver is not revoked. A never-returning arm holds the
   generation forever (intended). A push whose unresolved set mixes a wedge with a
   congestion or ordinary failure forces a Reapply every time. A delta push
@@ -1399,11 +1401,12 @@ the OS call does. `GuardianEngine::stop()` also retires the ack ledger (Unit 6,
 tick()` already no-ops after `stopped_`, but it also stops watching receipts whose
 claims `begin_stop()` is tearing down; `start_local()` opens a defensive application
 at the already-loaded `policy_generation_` before its own boot re-arm walk, so a
-receipt accepted during that walk is tracked too - not exercised by
-`SparkReconcileFixture` (`test_guardian_engine_spark_reconcile.cpp`), which wires
-`start_local()` BEFORE `wire_spark_engine()` (the reverse of production's
-`agent.cpp` order), so `spark_availability_` is still `Unwired` during its boot
-walk and the walk never reaches the spark path at all in that fixture.
+receipt accepted during that walk is tracked too. `SparkReconcileFixture`
+(`test_guardian_engine_spark_reconcile.cpp`) wires `start_local()` BEFORE
+`wire_spark_engine()` by default (the reverse of production's `agent.cpp` order), so
+`spark_availability_` is still `Unwired` during its boot walk and the walk never reaches
+the spark path in that default; its `wire_first` flag (#5513) and `BootRig5513` select the
+production order, and are the path that exercises a Spark boot arm.
 
 **R5.5 as implemented (rung 9c PR-4; existing mechanics from PR-1/PR-2).**
 `GuardianEngine::reconcile_rule_locked()` selects `GuardianSparkRuntime::attach_rule

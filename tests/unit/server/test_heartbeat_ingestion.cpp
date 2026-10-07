@@ -79,7 +79,7 @@ TEST_CASE("HeartbeatIngestion: reconcile fires on a valid generation tag",
 // numerically against the server's current generation and pushes if behind. The companion tag
 // is not read here and must not change that.
 TEST_CASE("HeartbeatIngestion: a reported generation of \"0\" reaches the reconcile fn (#5513)",
-          "[heartbeat_ingestion][guardian]") {
+          "[heartbeat_ingestion][guardian][5513]") {
     yuzu::MetricsRegistry metrics;
     EventBus bus;
     AgentRegistry registry{bus, metrics};
