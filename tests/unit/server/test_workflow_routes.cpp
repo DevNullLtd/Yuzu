@@ -2668,9 +2668,9 @@ TEST_CASE("instruction execute: an uncompilable stored schema fails closed with 
     const auto body = nlohmann::json::parse(res->body);
     CHECK(body["error"]["message"] == "stored parameter schema for this instruction is invalid");
     CHECK(body["error"]["remediation"] ==
-          "An administrator must delete the definition and import it again with a corrected "
-          "parameter_schema; see \"Replacing a stored parameter schema\" in the Instructions "
-          "documentation.");
+          "An administrator must export the definition, delete it and import it again with a "
+          "corrected parameter_schema; see \"Replacing a stored parameter schema\" in the "
+          "Instructions documentation.");
     CHECK(res->body.find("SECRET") == std::string::npos);
     CHECK(h.dispatch_calls == 0);
     CHECK(h.tracker->query_executions(ExecutionQuery{}).empty());

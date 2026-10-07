@@ -756,7 +756,11 @@ TEST_CASE("instruction_routes: POST import refuses an invalid or over-cap parame
     CHECK(h.audits[0].result == "denied");
     CHECK(h.audits[0].detail.rfind("parameter_schema is not a valid parameter schema:", 0) == 0);
     CHECK(body(bad->body)["audit_emitted"] == true);
-    CHECK_FALSE((*w.store.get_definition("test.route.import.badschema")).has_value());
+    {
+        const auto got = w.store.get_definition("test.route.import.badschema");
+        REQUIRE(got.has_value());
+        CHECK_FALSE(got->has_value());
+    }
 
     auto big = h.sink.Post("/api/instructions/import",
                            envelope("test.route.import.bigschema",
@@ -766,7 +770,11 @@ TEST_CASE("instruction_routes: POST import refuses an invalid or over-cap parame
     REQUIRE(h.audits.size() == 2);
     CHECK(h.audits[1].result == "denied");
     CHECK(h.audits[1].detail == "parameter_schema is larger than the 262144-byte limit");
-    CHECK_FALSE((*w.store.get_definition("test.route.import.bigschema")).has_value());
+    {
+        const auto got = w.store.get_definition("test.route.import.bigschema");
+        REQUIRE(got.has_value());
+        CHECK_FALSE(got->has_value());
+    }
 }
 
 TEST_CASE("instruction_routes: instruction-set create/list/delete, with the documented "

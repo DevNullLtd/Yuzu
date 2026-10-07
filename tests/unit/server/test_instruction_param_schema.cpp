@@ -192,9 +192,10 @@ TEST_CASE("param-schema: a moved-from validator is not absent and never passes",
     const ParamValidator taken = std::move(v);
     CHECK_FALSE(taken.absent());
     CHECK_FALSE(taken.check(json::object()).has_value());
-    // NOLINTNEXTLINE(bugprone-use-after-move): the moved-from contract is what is under test
+    // NOLINTBEGIN(bugprone-use-after-move): the moved-from contract is what is under test
     CHECK_FALSE(v.absent());
     CHECK(v.check(json::object()).has_value());
+    // NOLINTEND(bugprone-use-after-move)
 }
 
 TEST_CASE("param-schema: params must be an object, null reads as empty", "[instr][param-schema]") {
@@ -635,7 +636,8 @@ TEST_CASE("param-schema cache: many threads first-calling one schema all get a v
     ParamValidatorCache cache;
     const std::string s = one_prop(R"({"type":"integer","minimum":1})");
     std::atomic<int> bad{0};
-    // Joins on scope exit, so a failed REQUIRE cannot leave a thread unjoined.
+    // Joins on scope exit: a throw while spawning workers leaves the already-started threads
+    // joinable, and the destructor joins them.
     struct Joiner {
         std::vector<std::thread> ts;
         ~Joiner() {

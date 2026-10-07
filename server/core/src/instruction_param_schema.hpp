@@ -53,8 +53,8 @@
 //     kMaxEnumMembers per enum; a user pattern <= kMaxPatternBytes.
 //   * a pattern compiles under mcp::kPatternMaxMem, has <= kMaxPatternProgramSize RE2
 //     instructions, and one schema's programs sum to <= kMaxSchemaPatternProgramSize (a short
-//     pattern can compile to a large program: `a{1000}` is 7 bytes and 1004 instructions, 33 in
-//     a row reach 33004 and pass the per-pattern cap, and RE2's own budget refuses `\pL{300}x`
+//     pattern can compile to a large program: `a{1000}` is 7 bytes and 1004 instructions, 32 in
+//     a row are 32004 and pass the per-pattern cap, 33 reach 33004 and are refused, and RE2's own budget refuses `\pL{300}x`
 //     outright). The first over-budget pattern ends the pre-compile.
 //   * an integer minimum/maximum satisfies |bound| < kIntegerBoundLimit: the shared validator
 //     compares as doubles, exact only below 2^53.
@@ -117,8 +117,9 @@ prepare_param_validator(std::string_view stored_schema_json);
 // compile it (accepted: there is no single-flight). Failures and absent validators are
 // never cached. If the digest cannot be computed the call compiles without caching.
 // The cache is capped by ENTRY count, not bytes. What it can hold is entries x the patterns in
-// a schema (up to two per property: the property and its `items`) x what one compiled
-// pattern retains, and mcp::kPatternMaxMem bounds only that last factor.
+// a schema (at most one per property, a string's own `pattern` or an array's `items` pattern,
+// so at most kMaxSchemaProperties) x what one compiled pattern retains, and
+// mcp::kPatternMaxMem bounds only that last factor.
 class ParamValidatorCache {
   public:
     using Result =

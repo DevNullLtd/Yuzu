@@ -243,8 +243,9 @@ public:
     /// An EMPTY `def.parameter_schema` keeps the stored column; a non-empty one replaces it
     /// (checked as on create, unless it equals the stored text). A caller that round-trips a
     /// loaded definition through here MUST blank `parameter_schema` first, or it writes the
-    /// loaded copy back: the PUT route and the response-template persist do, and the YAML
-    /// editor builds its definition from YAML, which carries none.
+    /// loaded copy back: the PUT route and the response-template persist blank
+    /// `parameter_schema` on the loaded definition before calling this, and the YAML editor builds
+    /// its definition from the YAML, which carries none.
     std::expected<void, std::string> update_definition(const InstructionDefinition& def);
 
     /// `unexpected("not_found: ...")` when no definition with this id exists; any other

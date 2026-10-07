@@ -2644,10 +2644,10 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                 res.set_content(
                     detail::a4_error(res, "stored parameter schema for this instruction is invalid",
                                      {.remediation =
-                                          "An administrator must delete the definition and "
-                                          "import it again with a corrected parameter_schema; "
-                                          "see \"Replacing a stored parameter schema\" in the "
-                                          "Instructions documentation."}),
+                                          "An administrator must export the definition, delete "
+                                          "it and import it again with a corrected "
+                                          "parameter_schema; see \"Replacing a stored parameter "
+                                          "schema\" in the Instructions documentation."}),
                     "application/json");
                 return;
             }
