@@ -718,7 +718,7 @@ TEST_CASE("software routes: devices table scope arms", "[inventory][route]") {
     {   // A FULL scanned page whose last row is out of scope still carries the sentinel and the
         // next page resumes after the last SCANNED row (a099), never the last visible one (a098):
         // no out-of-scope ROW is rendered; the cursor token itself still names a scanned row
-        // (a known gap, not pinned by this case).
+        // (a known gap; pinned here only as the resume position, not endorsed).
         InvHarness h;
         authz::VisibleSet big{std::unordered_set<std::string>{}};
         for (std::size_t i = 0; i <= swc::kScopePushdownMaxIds; ++i)

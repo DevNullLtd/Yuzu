@@ -590,10 +590,11 @@ place, **Hardware** and **Software**, each its own page:
     tables). A continuation page is tagged `page=continuation`; a degraded read is
     `failure`; a refused caller is `denied`. See [Audit log](audit-log.md).
   - **Degraded or refused.** A store that cannot answer shows an unavailable banner with
-    a Retry button, never an empty table. A malformed filter, or a Load-more token from a
-    different filter set or from before the latest hourly refresh, shows a notice and
-    reads nothing; use the **Clear all filters and reload** link, which drops the stored
-    filters, to restart from the first page.
+    a Retry button, never an empty table. A malformed filter in the URL shows a notice
+    and reads nothing; use the **Clear all filters and reload** link, which drops the
+    stored filters. A Load-more token from a different filter set or from before the
+    latest hourly refresh shows a notice and reads nothing; reload the page to restart
+    from the first page.
   - **Removed routes.** The standalone **Find software** tab and the old Devices-tab
     fragments are gone: `/fragments/inventory/find`, `/fragments/inventory/find/results`,
     `/fragments/inventory/devices` and `/fragments/inventory/device` return `404` for an
