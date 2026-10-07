@@ -7920,3 +7920,50 @@ TEST_CASE("#4045 E42: engine stop() marks its start before joining the worker, s
     CHECK(attempts.load() == 1);
     CHECK(rt->staged_baseline_count_for_test() == 3);
 }
+
+TEST_CASE("#4045 E43: a full_sync push inside the staging-failure window still reports drift "
+          "against the ORIGINAL capture (the withdrawal stages it before the re-arm)",
+          "[spark][guardian][baseline][reconcile]") {
+    // apply_rules(full_sync) withdraws every generation before it re-arms, so attach_core finds
+    // no prior generation to retry from; the withdrawal itself must stage the committed hash.
+    Spark4045Target t;
+    SparkReconcileFixture f{3'600'000, std::nullopt, SparkType::File};
+    f.engine->drain_worker_for_test()->stop();
+    auto* rt = f.engine->spark_runtime_for_test();
+    REQUIRE(rt != nullptr);
+    const fs::path target = t.file();
+    Spark4045Target::write(target, "content A");
+    const std::string h_a = hash_of_4045(target);
+
+    rt->fail_next_stage_baseline_for_test(); // the arm-time capture is not staged
+    f.apply(make_file_hash_rule("r1", target.string()));
+    REQUIRE(yuzu::test::spin_until([&] { return rt->staged_baseline_drops() == 1; }));
+    CHECK(rt->staged_baseline_count_for_test() == 0);
+
+    Spark4045Target::write(target, "content B, longer");
+    const std::string h_b = hash_of_4045(target);
+    REQUIRE(h_b != h_a);
+    std::vector<OutboxEntry> drained;
+    rt->drain([&](const OutboxEntry& e) { // discard what the arm produced
+        return SendResult::Sent;
+    });
+    f.apply(make_file_hash_rule("r1", target.string()), /*full_sync=*/true);
+    eval_initial_4045(*f.engine, target);
+    const bool drifted = yuzu::test::spin_until([&] {
+        rt->drain([&](const OutboxEntry& e) {
+            drained.push_back(e);
+            return SendResult::Sent;
+        });
+        for (const auto& e : drained)
+            if (e.domain == yuzu::agent::OutboxDomain::Compliance && !e.drift.compliant &&
+                e.drift.expected_value == h_a && e.drift.detected_value == h_b)
+                return true;
+        return false;
+    });
+    CHECK(drifted); // RED: the re-armed rule captured B as its baseline and reported compliant
+    const auto out = persist_now_4045(*f.engine);
+    (void)out;
+    const auto rec = baseline_record_4045(*f.kv, "r1");
+    REQUIRE(rec.has_value());
+    CHECK(rec->value("hash", std::string{}) == h_a);
+}

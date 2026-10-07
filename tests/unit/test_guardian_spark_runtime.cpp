@@ -15356,18 +15356,57 @@ TEST_CASE("#4045 R9c: a same-id re-attach while the capture is unstaged inherits
     CHECK(drift_vs_original);
     CHECK(rt->staged_baseline_drops() == 1);
 
-    // Residual, counted: the retry at the re-attach fails too, so the new generation has
-    // nothing to inherit and captures afresh (the same bad_alloc window as the very first
-    // capture; here the drop counter reads 2 for the two failed staging attempts).
+    // Residual, counted: the retry at the re-attach AND the withdrawal's own retry fail too, so
+    // the new generation has nothing to inherit and captures afresh (the same bad_alloc window
+    // as the very first capture; the drop counter reads 3 for the three failed attempts).
     auto r2 = std::make_shared<FakeReader>();
     auto b2 = std::make_shared<FakeBackend>();
     auto rt2 = make_rt(r2, b2);
     REQUIRE(rt2->attach_rule("r1", file_spec("/a"), file_hash_rule("r1"), true));
-    rt2->fail_next_stage_baseline_for_test(2);
+    rt2->fail_next_stage_baseline_for_test(3);
     rt2->evaluate_key(key, EvalReason::Initial);
     REQUIRE(rt2->attach_rule("r1", file_spec("/a"), file_hash_rule("r1"), true));
-    CHECK(rt2->staged_baseline_drops() == 2);
+    CHECK(rt2->staged_baseline_drops() == 3);
     CHECK(rt2->staged_baseline_count_for_test() == 0);
+}
+
+TEST_CASE("#4045 R9d: a withdrawal (detach_all, as a full_sync does, or detach_rule) while the "
+          "capture is unstaged stages the committed hash first, so the re-attached rule still "
+          "inherits the ORIGINAL baseline",
+          "[spark][runtime][baseline]") {
+    // A full_sync push tears every generation down BEFORE it re-arms (nothing is left for
+    // attach_core to retry from), and a delta push that drops a rule withdraws it the same way.
+    for (const bool all : {true, false}) {
+        auto r = std::make_shared<FakeReader>(); // "h"
+        auto b = std::make_shared<FakeBackend>();
+        auto rt = make_rt(r, b);
+        REQUIRE(rt->attach_rule("r1", file_spec("/a"), file_hash_rule("r1"), true));
+        const auto key = spark_key(file_spec("/a"));
+        rt->fail_next_stage_baseline_for_test();
+        rt->evaluate_key(key, EvalReason::Initial); // captured "h", NOT staged
+        REQUIRE(rt->staged_baseline_count_for_test() == 0);
+        (void)drain_all(*rt);
+        r->file = read_known(FileSnapshot{.exists = true, .size = 4, .hash = "h2"});
+
+        if (all)
+            rt->detach_all();
+        else
+            rt->detach_rule("r1");
+        {
+            const auto got = rt->snapshot_staged_baselines();
+            REQUIRE(got.size() == 1);
+            CHECK(same_capture(got[0], "r1", "/a", "h")); // staged by the withdrawal
+        }
+        REQUIRE(rt->attach_rule("r1", file_spec("/a"), file_hash_rule("r1"), true));
+        rt->evaluate_key(key, EvalReason::Initial);
+        bool drift_vs_original = false;
+        for (const auto& e : drain_all(*rt))
+            drift_vs_original = drift_vs_original ||
+                                (e.domain == OutboxDomain::Compliance && !e.drift.compliant &&
+                                 e.drift.expected_value == "h" && e.drift.detected_value == "h2");
+        CHECK(drift_vs_original);
+        CHECK(rt->staged_baseline_drops() == 1);
+    }
 }
 
 TEST_CASE("#4045 R10: a failing inherit copy in attach_core leaves the PRIOR generation armed and "

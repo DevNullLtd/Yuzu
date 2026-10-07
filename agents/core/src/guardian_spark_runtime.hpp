@@ -69,7 +69,8 @@
  * baseline-on-arm rule's KV seed read. A capture that could not be staged (bad_alloc) stays
  * committed in its generation's eval state, flagged RuleGeneration::baseline_unstaged; the
  * flag is read and written only under registry_mu_ (evaluate_key's commit retries staging;
- * attach_core stages the prior generation's committed hash before it reads staging).
+ * attach_core and every withdrawal stage the generation's committed hash before it is replaced
+ * or dropped).
  *
  * Rung 3 builds this against FAKE seams (IStateReader, ISparkBackend). The real
  * platform readers are rung 5; the convergence scheduler that also drives
@@ -1170,7 +1171,9 @@ private:
         bool active{true};            ///< registry_mu_-guarded; uncommitted wedge desire or committed rule state
         bool emit_compliant_edge{true};
         RuleAssertion assertion;
-        RuleEvalState eval;           ///< mutated only under the key's eval_mu (single serialisation domain)
+        RuleEvalState eval;           ///< mutated only under the key's eval_mu (single serialisation domain);
+                                      ///< evaluate_key's COMMIT also holds registry_mu_, so a reader holding
+                                      ///< registry_mu_ alone (attach_core, a withdrawal) never sees it torn
         /// #4045: this generation's baseline-on-arm capture is committed in `eval` but could NOT
         /// be staged (an allocation failure, counted). registry_mu_-guarded, like staging itself.
         /// Runtime-owned on purpose: RuleEvalState is shared evaluator code and must not learn
@@ -2605,6 +2608,14 @@ private:
     /// retried with the same, committed hash.
     [[nodiscard]] bool stage_baseline_locked(const std::string& rule_id, const std::string& path,
                                              const std::string& hash) noexcept;
+    /// registry_mu_ held. A generation about to be dropped (withdrawn by detach_rule, or by
+    /// detach_all as a full_sync does before it re-arms) whose capture is committed but unstaged
+    /// (RuleGeneration::baseline_unstaged) stages its committed hash first, on the path of its
+    /// key's spec, so the replacement generation's staged read still inherits it. Never throws;
+    /// a second staging failure is counted by stage_baseline_locked and the capture is then lost
+    /// to the replacement (the one remaining window).
+    void salvage_unstaged_baseline_locked(const std::string& rule_id, const RuleGeneration& rg,
+                                          const std::optional<std::string>& key) noexcept;
     std::unique_ptr<SparkKeyRuleIndex> index_;                          // key <-> rule fan-out + refcount
     std::unordered_map<std::string, std::shared_ptr<RuleGeneration>> rules_; // rule_id -> generation
     std::unordered_map<std::string, std::shared_ptr<PerKey>> keys_;          // spark_key -> per-key

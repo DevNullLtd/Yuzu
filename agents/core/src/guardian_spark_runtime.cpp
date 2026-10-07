@@ -3071,7 +3071,7 @@ GuardianSparkRuntime::attach_core(const std::string& key, std::string rule_id, S
             std::holds_alternative<FileSparkParams>(spec.params)) {
             if (const auto prior = rules_.find(rule_id);
                 prior != rules_.end() && prior->second->baseline_unstaged &&
-                prior->second->eval.baseline_set) {
+                prior->second->eval.baseline_set) { // eval: registry_mu_ is enough, see its field doc
                 const auto prior_key = index_->key_for_rule(rule_id);
                 const auto pkit = prior_key ? keys_.find(*prior_key) : keys_.end();
                 const auto* prior_file =
@@ -3718,8 +3718,10 @@ GuardianSparkRuntime::withdraw_rule_after_wedge_sweep_locked(
     // kind string, was moved ahead of the mutation above. The inline-type synchronous
     // backend_->disarm is contained too: a throw is counted and keys_ is still erased
     // (containment, not completion: the engine subscription may remain live and unowned).
-    if (known)
+    if (known) {
+        salvage_unstaged_baseline_locked(rule_id, *rit->second, key_opt); // noexcept
         rules_.erase(rule_id);
+    }
     try {
         detach_post_fault_here_for_test(2); // seam: "drop_rule's Key allocation threw"
         std::lock_guard<std::mutex> ob{outbox_mu_};
@@ -4544,6 +4546,22 @@ bool GuardianSparkRuntime::stage_baseline_locked(const std::string& rule_id, con
         staged_baseline_drops_->fetch_add(1, std::memory_order_relaxed);
         return false;
     }
+}
+
+void GuardianSparkRuntime::salvage_unstaged_baseline_locked(
+    const std::string& rule_id, const RuleGeneration& rg,
+    const std::optional<std::string>& key) noexcept {
+    if (!rg.baseline_unstaged || !rg.eval.baseline_set || !key)
+        return;
+    const auto kit = keys_.find(*key); // called before keys_ is erased
+    if (kit == keys_.end())
+        return;
+    const auto* file = std::get_if<FileSparkParams>(&kit->second->spec.params);
+    if (!file)
+        return;
+    // Success or not, stage_baseline_locked counts a failed attempt itself; the flag dies with
+    // the generation, so there is nothing to clear.
+    (void)stage_baseline_locked(rule_id, file->path, rg.eval.baseline_hash);
 }
 
 std::vector<GuardianSparkRuntime::CapturedBaseline>
