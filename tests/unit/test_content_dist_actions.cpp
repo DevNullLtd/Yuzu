@@ -46,6 +46,7 @@
 #include "local_dispatcher.hpp"
 #include "test_helpers.hpp"
 
+#include <chrono>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -178,33 +179,70 @@ TEST_CASE("content_dist plugin: execute_staged reports file-not-staged for a wel
           std::string::npos);
 }
 
-TEST_CASE("content_dist plugin: cleanup clamps a huge hours value instead of wrapping the "
+namespace {
+// Points TMPDIR at `dir` for the scope and restores (or unsets) it on every
+// exit path, including a throw out of the dispatcher.
+struct ScopedTmpdir {
+    bool had_prev = false;
+    std::string prev;
+    explicit ScopedTmpdir(const fs::path& dir) {
+        if (const char* cur = std::getenv("TMPDIR")) {
+            had_prev = true;
+            prev = cur;
+        }
+        ::setenv("TMPDIR", dir.c_str(), 1);
+    }
+    ScopedTmpdir(const ScopedTmpdir&) = delete;
+    ScopedTmpdir& operator=(const ScopedTmpdir&) = delete;
+    ~ScopedTmpdir() {
+        if (had_prev)
+            ::setenv("TMPDIR", prev.c_str(), 1);
+        else
+            ::unsetenv("TMPDIR");
+    }
+};
+} // namespace
+
+TEST_CASE("content_dist plugin: cleanup bounds a huge hours value instead of wrapping the "
           "cutoff into the future",
           "[agent][content_dist][posix_actions]") {
     auto plugin = load_content_dist_plugin();
     REQUIRE(plugin.has_value());
 
-    // Un-init()'d plugin stages under temp_directory_path()/"yuzu-staged";
+    // An un-init()'d plugin stages under temp_directory_path()/"yuzu-staged";
     // point TMPDIR at a private dir so the sweep cannot touch a shared one.
     yuzu::test::TempDir tmp{"yuzu_test_cd_cleanup_"};
     const auto staged = tmp.path / "yuzu-staged";
     fs::create_directories(staged);
-    { std::ofstream{staged / "recent.bin"} << "x"; }
-    const char* old_tmpdir = std::getenv("TMPDIR");
-    const std::string saved = old_tmpdir ? old_tmpdir : "";
-    setenv("TMPDIR", tmp.path.c_str(), 1);
-
+    ScopedTmpdir scoped{tmp.path};
     yuzu::agent::LocalDispatcher dispatcher;
-    std::vector<YuzuParam> params{{"hours", "2000000000"}};
-    auto result = dispatcher.run(plugin->descriptor, "cleanup", params);
 
-    if (old_tmpdir)
-        setenv("TMPDIR", saved.c_str(), 1);
-    else
-        unsetenv("TMPDIR");
-    CHECK(result.rc == 0);
-    CHECK(result.captured.find("removed|0") != std::string::npos);
-    CHECK(fs::exists(staged / "recent.bin"));
+    // Positive control: a file two hours old IS removed by hours=1, so a
+    // sweep that does not reach `staged` (changed staging convention) fails
+    // here instead of leaving the checks below to pass on an empty directory.
+    const auto old_file = staged / "old.bin";
+    { std::ofstream{old_file} << "x"; }
+    fs::last_write_time(old_file, fs::file_time_type::clock::now() - std::chrono::hours(2));
+    {
+        std::vector<YuzuParam> params{{"hours", "1"}};
+        auto result = dispatcher.run(plugin->descriptor, "cleanup", params);
+        REQUIRE(result.rc == 0);
+        REQUIRE(result.captured.find("removed|1") != std::string::npos);
+        REQUIRE_FALSE(fs::exists(old_file));
+    }
+
+    // A fresh file must survive a huge value, whatever its magnitude or sign
+    // handling in the parser: hours=2000000000 once wrapped the cutoff into
+    // the future on libstdc++ and removed everything.
+    const auto recent = staged / "recent.bin";
+    { std::ofstream{recent} << "x"; }
+    for (const char* hours : {"2000000000", "99999999999999999999"}) {
+        std::vector<YuzuParam> params{{"hours", hours}};
+        auto result = dispatcher.run(plugin->descriptor, "cleanup", params);
+        CHECK(result.rc == 0);
+        CHECK(result.captured.find("removed|0") != std::string::npos);
+        CHECK(fs::exists(recent));
+    }
 }
 
 #endif // !_WIN32

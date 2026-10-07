@@ -22,6 +22,7 @@
 #include <yuzu/agent/subprocess_runner.hpp>
 
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <string_view>
@@ -368,10 +369,31 @@ map_execution_result(const yuzu::agent::SubprocessResult& result) {
 /// `now - hours(h)` wraps into the future and removes every staged file.
 inline constexpr int kMaxCleanupHours = 876000;
 
-/// Clamp the parsed cleanup `hours` to `kMaxCleanupHours`. Zero and negative
-/// values (documented "remove every staged file") pass through unchanged.
-[[nodiscard]] constexpr int clamp_cleanup_hours(int hours) noexcept {
-    return hours > kMaxCleanupHours ? kMaxCleanupHours : hours;
+/// Parse cleanup's `hours` text into [0, kMaxCleanupHours]. Follows std::stoi's
+/// prefix rules (leading whitespace, optional sign, digits, trailing text
+/// ignored) but never throws and never wraps: a number of any magnitude
+/// saturates at the maximum, zero and negative values (documented "remove
+/// every staged file") become 0, and text with no leading number (including
+/// empty) yields `fallback`.
+[[nodiscard]] constexpr int parse_cleanup_hours(std::string_view text, int fallback) noexcept {
+    std::size_t i = 0;
+    while (i < text.size() && (text[i] == ' ' || (text[i] >= '\t' && text[i] <= '\r')))
+        ++i;
+    bool negative = false;
+    if (i < text.size() && (text[i] == '+' || text[i] == '-'))
+        negative = text[i++] == '-';
+    if (i >= text.size() || text[i] < '0' || text[i] > '9')
+        return fallback;
+    long long value = 0;
+    for (; i < text.size() && text[i] >= '0' && text[i] <= '9'; ++i) {
+        // Stop growing once the value is far above the maximum: the digit
+        // loop must not overflow on an arbitrarily long number.
+        if (value < 1'000'000'000LL)
+            value = value * 10 + (text[i] - '0');
+    }
+    if (negative)
+        return 0;
+    return value > kMaxCleanupHours ? kMaxCleanupHours : static_cast<int>(value);
 }
 
 } // namespace yuzu::content_dist::exec

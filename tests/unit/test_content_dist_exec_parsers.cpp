@@ -415,25 +415,39 @@ TEST_CASE("build_execution_options keeps exec_verify Linux-only while inherit_pa
     CHECK(win.inherit_parent_env);
 }
 
-// -- clamp_cleanup_hours ----------------------------------------
+// -- parse_cleanup_hours ----------------------------------------
 
-TEST_CASE("clamp_cleanup_hours caps above 876000 and leaves everything else alone",
+TEST_CASE("parse_cleanup_hours saturates, floors at zero and falls back only on non-numbers",
           "[agent][content_dist][exec]") {
-    CHECK(clamp_cleanup_hours(876000) == 876000);
-    CHECK(clamp_cleanup_hours(876001) == 876000);
-    CHECK(clamp_cleanup_hours(INT_MAX) == 876000);
-    CHECK(clamp_cleanup_hours(24) == 24);
-    // Documented "remove every staged file" values must pass through.
-    CHECK(clamp_cleanup_hours(0) == 0);
-    CHECK(clamp_cleanup_hours(-1) == -1);
-    CHECK(clamp_cleanup_hours(INT_MIN) == INT_MIN);
+    CHECK(parse_cleanup_hours("24", 7) == 24);
+    CHECK(parse_cleanup_hours("876000", 7) == 876000);
+    CHECK(parse_cleanup_hours("876001", 7) == 876000);
+    CHECK(parse_cleanup_hours("2147483647", 7) == 876000);
+    // Beyond int range: std::stoi would throw and the old code fell back to 24.
+    CHECK(parse_cleanup_hours("2147483648", 7) == 876000);
+    CHECK(parse_cleanup_hours("99999999999999999999999999", 7) == 876000);
+    // Documented "remove every staged file": zero and negative, any magnitude.
+    CHECK(parse_cleanup_hours("0", 7) == 0);
+    CHECK(parse_cleanup_hours("-1", 7) == 0);
+    CHECK(parse_cleanup_hours("-2147483648", 7) == 0);
+    CHECK(parse_cleanup_hours("-99999999999999999999", 7) == 0);
+    // std::stoi prefix rules are kept.
+    CHECK(parse_cleanup_hours("  +5", 7) == 5);
+    CHECK(parse_cleanup_hours("12abc", 7) == 12);
+    // No leading number, or empty: the fallback.
+    CHECK(parse_cleanup_hours("", 7) == 7);
+    CHECK(parse_cleanup_hours("abc", 7) == 7);
+    CHECK(parse_cleanup_hours("-", 7) == 7);
+    CHECK(parse_cleanup_hours(" ", 7) == 7);
 }
 
-TEST_CASE("a clamped huge cleanup cutoff is not in the future", "[agent][content_dist][exec]") {
-    // Same arithmetic as do_cleanup. Unclamped, 1500000 and 2000000000 hours
+TEST_CASE("a parsed huge or negative cleanup cutoff is never in the future",
+          "[agent][content_dist][exec]") {
+    // Same arithmetic as do_cleanup. Unbounded, 1500000 and 2000000000 hours
     // wrap the cutoff into the future on Linux/libstdc++ (INT_MAX happens to
-    // wrap back into the past, so it is not a reliable discriminator alone).
+    // wrap back into the past, and very negative values wrap the other way).
     const auto now = std::filesystem::file_time_type::clock::now();
-    for (const int hours : {1500000, 2000000000, INT_MAX})
-        CHECK(now - std::chrono::hours(clamp_cleanup_hours(hours)) < now);
+    for (const char* text : {"1500000", "2000000000", "2147483647", "99999999999", "-4000000",
+                             "-2147483648", "0", "-1"})
+        CHECK(now - std::chrono::hours(parse_cleanup_hours(text, 24)) <= now);
 }
