@@ -1477,6 +1477,18 @@ jobs:
           YUZU_SERVER_BIN: build-linux-${{ matrix.compiler }}-${{ matrix.build_type }}/server/core/yuzu-server
         run: bash tests/shell/test_first_admin_bootstrap_refusal.sh
 
+      # Gateway-upstream peer authorization boot decision: with --gateway-upstream enabled the
+      # server must exit non-zero before binding any listener for the refused configurations
+      # (--no-tls without --insecure-gateway-peer, acknowledgement plus a pin, operator certs
+      # with no pin, no client CA, a broken explicit pin source, HTTPS-only defaults) and must
+      # boot for the permitted ones. Not exercisable by the Catch2 suite (which never
+      # constructs ServerImpl); needs the binary and Postgres, like the step above.
+      - name: Gateway peer boot-decision CLI test
+        timeout-minutes: 10
+        env:
+          YUZU_SERVER_BIN: build-linux-${{ matrix.compiler }}-${{ matrix.build_type }}/server/core/yuzu-server
+        run: bash tests/shell/test_gateway_peer_boot_refusal.sh
+
       # Graceful shutdown is not exercisable by the Catch2 suite (which never drives main(), so
       # never installs a signal handler). Nothing in unit, integration or CI failed if it broke
       # completely — and three shutdown defects shipped and were each caught only by a human

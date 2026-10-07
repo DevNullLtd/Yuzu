@@ -600,6 +600,19 @@ of reading as NOT TESTED.
   crypto NIF needs OpenSSL SM4 symbols that Red Hat's OpenSSL lacks. The
   same defect is waiting behind #5143 on rockylinux:9.
 
+**Gateway-upstream peer authorization and the rigs.** The server refuses to start with
+`--gateway-upstream` unless gateway peer authorization is configured or acknowledged as disabled
+(`--insecure-gateway-peer`, or `YUZU_INSECURE_GATEWAY_PEER=1`). The rigs that run the server from
+the build under test pass the flag: `scripts/integration-test.sh` (in both its plaintext and
+`--tls` branches), `scripts/start-UAT.sh`, `scripts/win-start-UAT.sh`, `scripts/start-stack.sh`
+and the locally built full, sanitizer and viz UAT composes. None of them exercises a pinned
+gateway hop, and no workflow under `.github/` invokes `integration-test.sh` (it runs from
+`scripts/run-tests.sh`); running its `--tls` branch with a real pinned gateway leaf is a deferred
+follow-up. The pre-release `integration` job (`scripts/ci/qa-stack.sh`) starts no server itself:
+it runs this checkout's reference-gateway template on the release's published images, so any
+acknowledgement or pin that rig needs belongs in that template (an environment variable, which an
+image older than the flag ignores), not in the script.
+
 ## Self-hosted runner topology
 
 | Runner | Host | Jobs |

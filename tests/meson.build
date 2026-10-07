@@ -1642,6 +1642,8 @@ if build_server
       'unit/server/test_ota_identity_mtls.cpp', # OTA identity audit bound over real mTLS (#416)
       'unit/server/test_gateway_peer_policy.cpp', # gateway-upstream peer authorization: certificate facts, pin set, admission policy
       'unit/server/test_gateway_peer_guard.cpp', # gateway-upstream peer authorization: guard over real mTLS, descriptor sweep, audit budget
+      'unit/server/test_gateway_peer_resolution.cpp', # gateway-upstream peer authorization: boot resolution matrix + boot pin set
+      'unit/server/test_server_gateway_peer_options.cpp', # gateway-upstream peer authorization: CLI/env contract
       'unit/server/test_grpc_tls_policy.cpp', # #4722: TLS 1.2 floor + cipher allow-list over REAL handshakes against the production builders
       'unit/server/test_ota_stalled_write.cpp', # TryCancel unblocks a stalled sync Write (#911 UP-101)
       'unit/server/test_server_ota_options.cpp', # OTA CLI/env contract + gRPC bound derivation (#913/#911)
@@ -3145,6 +3147,21 @@ test('agent OTA/ctx-slot wiring lexical gate (#2182)',
   suite: 'agent',
   timeout: 30,
 )
+
+# Gateway-upstream peer authorization: static lexical gate pinning that server.cpp registers
+# the gateway-upstream service ONLY through GatewayPeerGuardedService (nothing constructs
+# ServerImpl, so no unit test can see the registration site). Carries its own negative-control
+# self-test. No build required, gated only on bash like the OTA gate above. Suite 'docs', like the
+# tier-policy wiring gate below: scripts/ci/assert-suite-cover.py has no bare 'server' entry in its
+# --suite lists, so a no-build gate labelled 'server' fails that check on the Windows legs.
+if _bash_test.found()
+  test('gateway-upstream guard registration lexical gate',
+    _bash_test,
+    args: [files('shell/test_gateway_peer_registration_lexical.sh')],
+    suite: 'docs',
+    timeout: 90,
+  )
+endif
 
 # #4666 PR-2 W3a MI-2: report-only symbol-binding probe over the built exe/core-lib/
 # agent_actions plugin (see the script's own header for what it does and does not prove).

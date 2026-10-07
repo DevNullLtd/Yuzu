@@ -20,8 +20,9 @@
 /// WHAT TO REGISTER. A builder must register THIS object and only this object as the
 /// gateway-upstream service. The guard wraps the SERVICE, so it covers every listener
 /// the shared builder serves it on, including a listener that only requests (does not
-/// require) a client certificate. This change adds the class; the server does not
-/// register it yet.
+/// require) a client certificate. `ServerImpl::setup_gateway_peer_guard` (server.cpp) builds
+/// it and `tests/shell/test_gateway_peer_registration_lexical.sh` pins that it is the only
+/// registration.
 ///
 /// ACKNOWLEDGED MODE. The `AcknowledgedInsecure` constructor builds a guard that
 /// admits every call. It is selected by a constructor, once, at boot; there is no
