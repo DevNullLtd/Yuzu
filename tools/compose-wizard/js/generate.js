@@ -41,13 +41,15 @@ async function generate() {
   }
 
   // C1/N2: the secure gateway↔server topology (mutual-TLS upstream, --cert-group
-  // cert sharing, TLS mgmt listener) depends on server features that live in the
-  // PKI go-live PR (#1314) and are NOT on the current images — emitting them
-  // produces a stack that crash-loops at argv parse (--cert-group) or fails command
-  // forwarding (server dials the mgmt port plaintext). Until that ships, the gateway
-  // is only generated for Plaintext mode. (Tracked: re-enable once #1314 lands.)
+  // cert sharing, TLS mgmt listener) was written against the PKI go-live work
+  // (#1314), which is now merged; the wizard has not been updated to emit that
+  // topology, and a stack generated against an older image could still crash-loop at
+  // argv parse (--cert-group) or fail command forwarding (server dials the mgmt port
+  // plaintext). Until the wizard is reworked for it, the gateway is only generated
+  // for Plaintext mode. For the secure topology use
+  // deploy/docker/docker-compose.reference-gateway.yml.
   if (gateway && tlsMode !== 'plaintext') {
-    alert('Gateway + TLS is not generated yet: the secure gateway↔server wiring depends on server features still in flight (PKI go-live, #1314) that no current image ships, so the stack would not boot. Either pick Plaintext for the gateway, or disable the gateway and use Default/Operator certs for a server-only stack. The Plaintext gateway stack sets YUZU_INSECURE_GATEWAY_PEER=1 on the server, which disables gateway peer authorization (not for production). For a secure gateway today, follow deploy/docker/docker-compose.reference-gateway.yml + gateway/config/sys.config.prod.');
+    alert('Gateway + TLS is not generated yet: the wizard does not generate the secure gateway↔server wiring, so the stack would not boot. Either pick Plaintext for the gateway, or disable the gateway and use Default/Operator certs for a server-only stack. The Plaintext gateway stack sets YUZU_INSECURE_GATEWAY_PEER=1 on the server, which disables gateway peer authorization (not for production). For a secure gateway today, follow deploy/docker/docker-compose.reference-gateway.yml + gateway/config/sys.config.prod.');
     return;
   }
 
@@ -219,7 +221,7 @@ function validateCertSans(raw) {
 
 // Effective (validated) --cert-san set for the auto-generated default certs.
 // Gateway service names aren't added — gateway + TLS isn't generated yet (the
-// secure gateway topology is #1314; see the C1/N2 guard in generate()).
+// secure gateway topology is not emitted by the wizard; see the C1/N2 guard in generate()).
 function effectiveCertSans(c) {
   return validateCertSans(c.certSans || '').sans;
 }

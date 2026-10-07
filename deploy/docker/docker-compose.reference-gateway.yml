@@ -8,23 +8,30 @@
 ##   - agents enrol through the gateway and are issued PER-AGENT mTLS certs
 ##
 ## Cross-container cert sharing (the crux): the three containers run as
-## DIFFERENT non-root uids but share one /etc/yuzu/certs volume. The server is
-## launched with `--cert-group yuzu-pki`, which chgrp's the cert dir (0750) and
-## the gateway's leaf key (0640) to the FIXED gid 2000 `yuzu-pki` group baked
-## into all three images — so the gateway (a different uid) can read its key.
+## DIFFERENT non-root uids; the server and the gateway share one /etc/yuzu/certs
+## volume (the agent gets only the public CA certificate, see "Key custody"). The
+## server is launched with `--cert-group yuzu-pki`, which chgrp's the cert dir
+## (0750) and the gateway's leaf key (0640) to the FIXED gid 2000 `yuzu-pki`
+## group baked into all three images, so the gateway (a different uid) can read
+## its key.
 ## The server/CA/HTTPS private keys stay 0600 owner-only.
 ##
 ## Key custody: the server and gateway containers mount the key-bearing
-## certificate volume; the agent container mounts the `ca-public` volume. A
-## one-shot `ca-export` service copies the public CA certificate (default-ca.pem)
-## into `ca-public`, and the agent mounts that read-only at /etc/yuzu/certs, which
-## is where it auto-discovers its trust anchor. The gateway container sees the whole `certs` volume (a
+## certificate volume, and the one-shot `ca-export` service mounts it a THIRD
+## time, read-only, to copy the public CA certificate (default-ca.pem) into the
+## `ca-public` volume (it runs with the shared gid, so it could read the
+## group-readable gateway key, but it only runs one `install` command and
+## exits). The agent container mounts `ca-public` and never the key-bearing
+## volume, read-only at /etc/yuzu/certs, which is where it auto-discovers its
+## trust anchor. `ca-export` re-runs on every `docker compose up`: after a CA
+## re-root run `docker compose up -d` (not `restart`) so `ca-public` is
+## refreshed (docs/pki-architecture.md, "Operator runbook"). The gateway container sees the whole `certs` volume (a
 ## named volume cannot be narrowed to a file); the server and CA keys stay 0600
 ## and owned by the server's uid.
 ##
 ## The gateway key file is the credential that authorizes a gateway: keep it
 ## readable only by the server and gateway processes, and do not mount it into
-## other containers. This shared-key layout is a reference-rig convenience. A
+## other long-running containers. This shared-key layout is a reference-rig convenience. A
 ## production install should issue a gateway-only certificate whose key is 0600
 ## and owned by the gateway's own user, and pin it explicitly on the server with
 ## --gateway-peer-pin (or --gateway-peer-pin-file) instead of relying on the

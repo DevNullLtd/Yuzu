@@ -83,9 +83,9 @@ with `git show origin/dev:<path>`, never a working-tree `ls`.
 One row per concern — catastrophic-if-violated invariants, routed doc, loading agents. Split across
 four files solely for the per-file ceiling: the first holds platform/product/data/observability
 concerns, the second auth, access-control, and request-admission chokepoints, the third the
-security-posture plugins and the gateway-upstream peer-authorization row (the Wave 8
-split), the fourth Forensics / per-user-software-data concerns (the Wave 10 split). Same
-authority as this file.
+read-only security-posture plugin rows and the gateway-upstream peer-authorization row, the fourth
+Forensics / per-user-software-data concerns (the third and fourth are the Wave 8 and Wave 10
+splits). Same authority as this file.
 
 @.claude/routed-concerns.md
 @.claude/routed-concerns-access-control.md

@@ -36,7 +36,7 @@ valid for a deployment name a client actually dials — e.g. `--cert-san dns:gat
 an agent reaching the gateway by that service name passes SNI hostname verification.
 Changing `--cert-san` does **not** rotate an existing set (the marker fast path returns
 the prior certs). For new SANs to take effect, rename `default-marker.json` in the cert dir aside
-(moving it back undoes this) and restart (the leaves are re-minted under the SAME root), or replace the certs. Never clear
+(moving it back undoes this) and restart (the leaves are re-minted under the SAME root), or replace the certs. Re-minting issues every default leaf with a **new key, the gateway's `default-gateway` leaf included**: the restarted server auto-pins the new gateway key (`docs/user-manual/server-admin.md`, "Gateway upstream peer authorization"), and a running gateway keeps presenting its old certificate until it redials, so it is refused (`not_pinned`) until the gateway is restarted, which should follow the conditional guidance in that runbook (check convergence first; one node at a time). Never clear
 the whole cert dir: it also holds the CA key and the secrets KEK (`secrets-kek-*.key`, #5370).
 (Implementation: `parse_extra_sans` validates the flag/`YUZU_CERT_SAN` values,
 `merge_sans` injects them into every default leaf, `pki::is_valid_ip_literal` does the
@@ -630,9 +630,10 @@ CA already in the system store; it logs a loud warning and is never the default.
 
 **Cross-container cert sharing — `--cert-group`.** A multi-container deploy
 (server + Erlang gateway + agents) runs the three as DIFFERENT non-root uids. The
-server and the gateway share the `/etc/yuzu/certs` volume; the agent
-container mounts the `ca-public` volume (the reference compose's one-shot
-`ca-export` service copies `default-ca.pem` into it). The server creates the cert
+server and the gateway share the `/etc/yuzu/certs` volume (the reference
+compose also mounts it a third time, read-only, into a one-shot `ca-export`
+service); the agent container mounts the `ca-public` volume, into which that
+service copies `default-ca.pem`. The server creates the cert
 dir `0700` and each leaf key `0600` owned by itself, so a different-uid sibling can
 neither traverse the dir nor read its key (the gateway's grpcbox crashes `eacces`). The
 **`--cert-group <name|gid>`** flag (`YUZU_CERT_GROUP`) fixes this at cert-gen
@@ -742,7 +743,13 @@ DACL via `SetNamedSecurityInfoW` is a tracked follow-up shared with
   Postgres substrate (`docs/postgres-store-playbook.md` for connecting) — and removes the on-disk
   `<ca-dir>/default-*.{pem,key}` + `default-marker.json` on every instance, then restarts all of
   them together. This orphans every currently-enrolled agent (their leaves chain to the destroyed
-  root); a full fleet re-enrollment follows, same as a root-key loss. Prefer `POST /ca/import-chain`
+  root); a full fleet re-enrollment follows, same as a root-key loss. On the Docker reference
+  gateway compose, bring the stack up with `docker compose up -d` (not `restart`): the agent mounts
+  the `ca-public` volume that the one-shot `ca-export` service fills, and the compose file's
+  documented refresh path is that service re-running on every `up`. Without it the agent can keep
+  the OLD CA in `ca-public`. The new gateway leaf also has a new key,
+  which the restarted server auto-pins; restart the gateway as well, under the conditional guidance
+  in the gateway peer-authorization runbook. Prefer `POST /ca/import-chain`
   (Subordinate-CA, PR6) when the
   goal is re-keying under a new authority without an enrollment outage. **Not** when the goal is
   to stop trusting a leaf whose revocation was lost: import-chain keeps the issuing key, so that

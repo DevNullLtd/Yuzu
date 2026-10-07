@@ -68,6 +68,11 @@ EnvironmentFile=-/etc/yuzu/yuzu-server.env
 #   - Pin files must be readable by the `yuzu` user. ProtectHome=true and
 #     PrivateTmp=true hide /home and /tmp from the service, so keep them under
 #     /etc/yuzu.
+# Before upgrading a package install that uses your own certificates, check what
+# this unit and /etc/yuzu/yuzu-server.env pass: `systemctl cat yuzu-server | grep -E
+# -- '--cert|--no-tls|--gateway-upstream'`. The RPM restarts the service on upgrade,
+# so a missing pin fails there; the deb only enables it, so the failure shows at the
+# next restart or reboot. systemd stops retrying after the start-limit above.
 # --insecure-gateway-peer is deliberately NOT set here: it disables peer
 # authorization, and this unit is not a plaintext deployment.
 # The yuzu-gateway package's release config (built from gateway/config/sys.config)
