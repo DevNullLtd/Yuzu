@@ -45,9 +45,10 @@ schema. Details: [REST API](rest-api.md), [Instructions](instructions.md#paramet
   (path `/*`, the name is not echoed). Six shipped definitions under-declared what their plugin reads and
   are corrected in this release: `agent.content_dist.cleanup` (`hours`), `agent.content_dist.execute_staged`
   (`expected_hash`), `device.wol.check` (`timeout_ms`), `device.agent_actions.set_log_level` (any letter
-  case, plus the `warning` and `err` aliases the agent accepts), `workflow.config_search_and_replace`
-  (now `path`, `search`, `replacement`, `regex`, `case_sensitive`, `dry_run`, `max_replacements`) and
-  `workflow.version_compliance_check` (now `path`). The two `workflow.*` definitions used to declare
+  case, plus `warning` and `err`, which the agent accepts), `workflow.config_search_and_replace`
+  (declares `path`, `search`, `replacement`, `regex`, `case_sensitive`, `dry_run`, `max_replacements`
+  and the retained `base_dir`) and `workflow.version_compliance_check` (declares `path`, `minimum_version`
+  and `base_dir`). The two `workflow.*` definitions used to declare
   parameter names their plugin never read.
 - **Values outside an enum or a bound.** `enum` is case-sensitive (`"True"` and `"1"` are refused for a
   `true`/`false` enum), and a value above a declared `maximum` (or below a `minimum`) is `400` where a plugin

@@ -976,14 +976,12 @@ InstructionStore::import_definition_json_impl(const std::string& json_str, bool 
     if (parsed.contains("parameter_schema")) {
         def.parameter_schema = parsed.value("parameter_schema", "{}");
         // #2437-class guard: parameter_schema is stored VERBATIM as a
-        // caller-supplied string, with no re-serialization or validation at
-        // write time otherwise - unlike visualization_spec/
-        // response_templates_spec above, nothing here would ever dump() it
-        // at import time. The crash lands later, on the discover-catalog
-        // READ side (discover_routes.cpp), reached by a completely different
-        // caller than whoever imported it. Rejecting the too-deep string
-        // here at write time prevents new poison; discover_routes.cpp's own
-        // guard protects rows already written before this check shipped.
+        // caller-supplied string (no dump() at import time, unlike
+        // visualization_spec/response_templates_spec above), and the
+        // discover-catalog READ side (discover_routes.cpp) parses it later
+        // for a different caller. Bound its JSON depth here, before the
+        // shared write-time schema check runs; discover_routes.cpp's own
+        // guard protects rows written before this check shipped.
         if (mcp::json_exceeds_depth(def.parameter_schema, mcp::kMcpMaxJsonDepth))
             return std::unexpected(std::format(
                 "instruction-import parameter_schema nests too deeply (flatten to at most {} "

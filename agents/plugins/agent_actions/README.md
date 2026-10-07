@@ -52,7 +52,7 @@ None. Both actions execute in-process — no subprocess and no network call on a
 <!-- BEGIN GENERATED: plugin-doc-gen inputs -->
 | Definition | Parameter | Type | Required | Default | Constraints | Description |
 |---|---|---|---|---|---|---|
-| `device.agent_actions.set_log_level` | `level` | string | yes | - | pattern: ^(?i:trace\|debug\|info\|warn\|warning\|err\|error\|critical\|off)$ | The desired spdlog log level, case-insensitive: trace, debug, info, warn, error, critical, or off (e.g. "info", "INFO" and "Info" are all accepted). The agent also accepts the spdlog aliases "warning" and "err", and the pattern admits them. Declared as a case-insensitive pattern rather than an enum because the server's enum check is case-sensitive. |
+| `device.agent_actions.set_log_level` | `level` | string | yes | - | pattern: ^(?i:trace\|debug\|info\|warn\|warning\|err\|error\|critical\|off)$ | The desired spdlog log level, case-insensitive: trace, debug, info, warn, error, critical, or off (e.g. "info", "INFO" and "Info" are all accepted). The agent also accepts "warning" and "err" (spdlog's long and short names), and the pattern admits them. Declared as a case-insensitive pattern rather than an enum because the server's enum check is case-sensitive. |
 <!-- END GENERATED -->
 
 ### Outputs
