@@ -1219,7 +1219,7 @@ flip, with a red-first test each:
     from memory; (3) an allocation failure while staging a capture: the baseline stays
     live (a later change is still drift against it) and staging is retried at every
     later evaluation, so this is a window only until a retry succeeds; it can recapture
-    only if the rule is re-pushed in that window and the attach-time retry also fails,
+    only if the rule is re-pushed in that window (a delta push, or a full_sync, which withdraws every rule first) and the retries at the withdrawal and at the re-attach also fail,
     in which case the new arm captures whatever the file then holds (counted, once per
     failed attempt); (4) the rule's path re-authored while the first capture was still
     unwritten (counted), and an A to B to A re-authoring re-baselines A even with a

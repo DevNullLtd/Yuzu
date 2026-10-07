@@ -2648,7 +2648,10 @@ Guardian ladder must check these.
   dropped after it) and seeds the replacement from it when the path matches; a
   prior generation whose capture could not be staged (an allocation failure,
   `RuleGeneration::baseline_unstaged`) has its committed hash staged first, on the
-  same path, so the lookup finds it.
+  same path, so the lookup finds it; and every withdrawal (`detach_rule`, and
+  `detach_all`, which a full_sync push runs before it re-arms anything, leaving
+  attach_core no prior generation to read) stages it before the generation is
+  dropped (`salvage_unstaged_baseline_locked`).
   (b) `reconcile_rule_locked` holds the persister's `persist_mu_`
   (`hold_seed_fence()`) from a baseline-on-arm rule's seed read to the end of the
   attach. The fence is REQUIRED: an entry leaves staging after its write, so
@@ -2701,7 +2704,7 @@ Guardian ladder must check these.
   slow but succeeding store, or its flush skipped after a slow failure during that
   stop); an allocation failure while staging, which keeps the baseline live and is
   retried, so it is a window only until a retry succeeds (the crash window, or a
-  re-push whose attach-time retry also fails and so captures afresh); a path
+  re-push, delta or full_sync, whose retries at the withdrawal and at the re-attach also fail, so the new arm captures afresh); a path
   re-authored while the first capture was unwritten (counted), and A to B to A
   re-baselines A even with a healthy store, as legacy does, since there is one
   record per rule; the `guardian_persist_baseline` write-anyway on a failed
