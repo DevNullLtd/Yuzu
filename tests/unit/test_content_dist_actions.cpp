@@ -44,6 +44,7 @@
 #include <yuzu/plugin.h>
 
 #include "local_dispatcher.hpp"
+#include "scoped_env.hpp"
 #include "test_helpers.hpp"
 
 #include <chrono>
@@ -179,30 +180,6 @@ TEST_CASE("content_dist plugin: execute_staged reports file-not-staged for a wel
           std::string::npos);
 }
 
-namespace {
-// Points TMPDIR at `dir` for the scope and restores (or unsets) it on every
-// exit path, including a throw out of the dispatcher.
-struct ScopedTmpdir {
-    bool had_prev = false;
-    std::string prev;
-    explicit ScopedTmpdir(const fs::path& dir) {
-        if (const char* cur = std::getenv("TMPDIR")) {
-            had_prev = true;
-            prev = cur;
-        }
-        ::setenv("TMPDIR", dir.c_str(), 1);
-    }
-    ScopedTmpdir(const ScopedTmpdir&) = delete;
-    ScopedTmpdir& operator=(const ScopedTmpdir&) = delete;
-    ~ScopedTmpdir() {
-        if (had_prev)
-            ::setenv("TMPDIR", prev.c_str(), 1);
-        else
-            ::unsetenv("TMPDIR");
-    }
-};
-} // namespace
-
 TEST_CASE("content_dist plugin: cleanup bounds a huge hours value instead of wrapping the "
           "cutoff into the future",
           "[agent][content_dist][posix_actions]") {
@@ -214,7 +191,7 @@ TEST_CASE("content_dist plugin: cleanup bounds a huge hours value instead of wra
     yuzu::test::TempDir tmp{"yuzu_test_cd_cleanup_"};
     const auto staged = tmp.path / "yuzu-staged";
     fs::create_directories(staged);
-    ScopedTmpdir scoped{tmp.path};
+    yuzu::test::ScopedEnv scoped_tmpdir{"TMPDIR", tmp.path.string()};
     yuzu::agent::LocalDispatcher dispatcher;
 
     // Positive control: a file two hours old IS removed by hours=1, so a
