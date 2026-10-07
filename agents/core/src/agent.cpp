@@ -2601,17 +2601,21 @@ public:
                             // generation 0 — so an agent that has never received a
                             // push still converges once rules exist server-side.
                             if (guardian_) {
-                              // The Guardian emit block is four independently contained
-                              // groups (#4472 hardening): a bad_alloc / system_error from a
-                              // guardian accessor or a tag insert must never terminate the
+                              // The Guardian emit block is six independently contained
+                              // groups (#4472 hardening; the hb_guardian_* slot enum above
+                              // is the authoritative list): a bad_alloc / system_error from
+                              // a guardian accessor or a tag insert must never terminate the
                               // heartbeat thread, and one failing group must not silence the
-                              // others. Order matters: A maintenance (each call in its own
-                              // try), B the generation tag (heartbeat_ingestion.cpp reads it
-                              // to decide whether to run the M5 missed-push reconcile, so it
-                              // must survive an A throw), C the older tags, D the newer
-                              // monitor-only gauges LAST so a fault in them cannot drop the
-                              // older signals. A throw skips only the rest of its own group
-                              // for this tick; the next tick retries. Never logs tag text.
+                              // others. Order matters: A1/A2 maintenance and the legacy-sink
+                              // kick (each call in its own try), B the generation tag
+                              // (heartbeat_ingestion.cpp reads it to decide whether to run
+                              // the M5 missed-push reconcile, so it must survive an A
+                              // throw), C the older tags, then the newer monitor-only
+                              // gauges LAST, in order: D the Spark claim-health gauges, D2
+                              // the #4045 baseline-persist aggregate, so a fault in them
+                              // cannot drop the older signals (nor D2 a D). A throw skips
+                              // only the rest of its own group for this tick; the next tick
+                              // retries. Never logs tag text.
                               // None of this has a unit test (no fault-injection seam in the
                               // heartbeat loop, and none was added for it): the log lines
                               // and group boundaries are verified by reading.
@@ -2749,7 +2753,7 @@ public:
                                                       "rest of the older Guardian tags were "
                                                       "skipped this tick)");
                               }
-                              // Group D (LAST): #5404 / #5403 / #4472: the Spark claim-
+                              // Group D (newer gauges): #5404 / #5403 / #4472: the Spark claim-
                               // lifecycle counters, the retained-tombstone count and the two
                               // claim AGE gauges (the pending-Disarm age and the
                               // outstanding-compensation age; absent while nothing is
@@ -2767,14 +2771,19 @@ public:
                                                       "failed (the claim-health tags were "
                                                       "skipped this tick)");
                               }
-                              // Group D2 (LAST, its own try so it can neither drop an older
+                              // Group D2 (after D, its own try so it can neither drop an older
                               // tag nor be dropped by one): #4045, the Spark baseline-persist
                               // aggregate (sparse, 0 omits the tag; every channel is listed on
                               // GuardianEngine::baseline_persist_failures()). Spark path ONLY:
                               // a legacy FileGuard persist failure is logged, not counted, so
                               // an absent tag is NOT evidence that baselines persisted. Not
-                              // gated on prefer_spark_ (0 while Spark is inert). Lock-free
-                              // read: it cannot wait behind apply_rules.
+                              // gated on prefer_spark_ (0 while Spark is inert). This accessor
+                              // takes no lock (the Group B/C accessors above do take mtx_).
+                              // Deleting THIS call site is not caught by any test, same as
+                              // Group D's: the emitter and the accessor are pinned (E10, E15,
+                              // E23 and the doc-scrape test), the call itself is verified by
+                              // reading. Deliberately no source-grep pin: it would break
+                              // out-of-tree and packaged builds that carry no source tree.
                               try {
                                 emit_guardian_baseline_persist_heartbeat_tags(
                                     tags, guardian_->baseline_persist_failures());

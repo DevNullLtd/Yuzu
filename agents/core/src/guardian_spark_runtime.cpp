@@ -3063,8 +3063,11 @@ GuardianSparkRuntime::attach_core(const std::string& key, std::string rule_id, S
             std::holds_alternative<FileSparkParams>(spec.params)) {
             if (const auto sit = staged_baselines_.find(rule_id);
                 sit != staged_baselines_.end() &&
-                sit->second.path == std::get<FileSparkParams>(spec.params).path)
+                sit->second.path == std::get<FileSparkParams>(spec.params).path) {
+                if (fail_next_inherit_copy_.exchange(false, std::memory_order_relaxed))
+                    throw std::bad_alloc{}; // TEST-ONLY seam: the copy below failing
                 inherited_hash = sit->second.hash; // may throw: nothing is mutated yet
+            }
         }
 
         prior_disarm = detach_rule_locked(rule_id);

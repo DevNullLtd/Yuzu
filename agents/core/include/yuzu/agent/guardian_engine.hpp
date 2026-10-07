@@ -315,7 +315,7 @@ public:
 
     /// #4045: cumulative-since-boot count of the channels by which a Spark baseline capture
     /// failed to reach (or may not reach) the #4021 KV record: failed persist passes (one per
-    /// pass: a pass stops at its first failed write), throws firewalled around a pass (engine
+    /// pass, however many of its writes failed), throws firewalled around a pass (engine
     /// and drain worker), captures DROPPED from staging (an allocation failure, or a retarget
     /// that replaced a still-unpersisted capture; GuardianSparkRuntime::staged_baseline_drops),
     /// and passes that found a capture staged with no KV store to write it to. Zero while
@@ -325,8 +325,9 @@ public:
     /// is cumulative, a non-zero value says a failure or loss HAPPENED in this process, not
     /// that one is still open; a failed capture stays staged and is retried (only drops and a
     /// crash lose one), and the rule keeps enforcing on its in-memory baseline meanwhile.
-    /// LOCK-FREE (atomics only, never mtx_): the heartbeat thread calls it and must not wait
-    /// behind a long apply_rules.
+    /// This accessor takes no lock (atomics only, never mtx_). The heartbeat thread's other
+    /// GuardianEngine getters (policy_generation(), journal_stats(), ...) DO take mtx_, so the
+    /// tick as a whole can still wait behind apply_rules; only this read cannot.
     [[nodiscard]] std::uint64_t baseline_persist_failures() const;
     /// #4045: cumulative count of staged captures the #4021 overwrite guard REFUSED to write
     /// because a same-target record already existed (first capture wins). Not a failure and not
@@ -703,6 +704,15 @@ public:
         seed_read_hook_for_test_ = std::move(hook);
     }
 
+    /// TEST-ONLY (#4045): fires inside reconcile_rule_locked, mtx_ HELD and the seed fence still
+    /// held, immediately AFTER attach_rule returns (so after attach_core's staged read) and
+    /// before its result is examined. Pins that the fence spans the attach, not only the seed
+    /// read. Same CONTRACT as set_apply_post_drain_hook_for_test. No production caller.
+    void set_post_attach_hook_for_test(std::function<void(const std::string& rule_id)> hook) {
+        std::lock_guard lock(mtx_);
+        post_attach_hook_for_test_ = std::move(hook);
+    }
+
     /// TEST-ONLY (#4783 Gate 8 re-review): arms legacy_sink_persist_race_hook_for_test_ -
     /// see that member's own doc comment for the exact firing point and its
     /// same-thread-relock CONTRACT. Set-then-use: arm this on the thread that
@@ -915,7 +925,7 @@ private:
     /// the prior capture) and stop() (after the worker join); the third persister caller is
     /// the drain worker. NOT from journal_maintenance_tick: it runs only on a live
     /// connection and could not cover a pre-network boot re-arm.
-    void persist_staged_baselines_locked() noexcept;
+    void persist_staged_baselines_locked(bool at_stop) noexcept;
 
     /// Step 4: arm (or re-arm) the on-box guard for a rule. Reads the rule's
     /// spark type to pick the guard: file-change to FileGuard,
@@ -1141,7 +1151,7 @@ private:
     /// (#2298) prune/page throws are counted on the drain worker instead; journal_stats() sums
     /// both into the single operator-facing guardian_journal_maint_exceptions tag.
     std::atomic<std::uint64_t> journal_maint_exceptions_{0};
-    /// #4045: the persister, published for LOCK-FREE readers (baseline_persist_failures /
+    /// #4045: the persister, published for lock-free readers (baseline_persist_failures /
     /// baseline_persist_refusals). Stored with release by wire_spark_engine (under mtx_) right
     /// after the persister is constructed, never cleared or replaced (wire is once-only and
     /// rollback_spark_wiring_locked leaves the persister alone), and the object lives until
@@ -1152,6 +1162,7 @@ private:
     /// mtx_-guarded; null = no-op.
     std::function<void()> apply_post_drain_hook_for_test_;
     std::function<void(const std::string&)> seed_read_hook_for_test_;
+    std::function<void(const std::string&)> post_attach_hook_for_test_;
     /// TEST-ONLY drain-worker timing overrides (see set_drain_worker_timing_for_test);
     /// 0 / zero-duration means "keep the production default".
     std::uint64_t test_periodic_bound_ms_{0};

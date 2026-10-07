@@ -15246,3 +15246,39 @@ TEST_CASE("#4045 R9: an allocation failure while staging is a COUNTED drop and t
     REQUIRE(got.size() == 1);
     CHECK(same_capture(got[0], "r2", "/x", "h1"));
 }
+
+TEST_CASE("#4045 R10: a failing inherit copy in attach_core leaves the PRIOR generation armed and "
+          "the staged capture intact (the copy happens before the detach)",
+          "[spark][runtime][baseline]") {
+    auto r = std::make_shared<FakeReader>(); // "h"
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = make_rt(r, b);
+    REQUIRE(rt->attach_rule("r1", file_spec("/a"), file_hash_rule("r1"), true));
+    rt->evaluate_key(spark_key(file_spec("/a")), EvalReason::Initial); // captures "h", staged
+    REQUIRE(rt->staged_baseline_count_for_test() == 1);
+    (void)drain_all(*rt);
+
+    // The same-id replace inherits the staged "h"; its copy fails. Nothing was detached yet, so
+    // the throw is a plain early return and the rule is still armed on its OLD generation.
+    rt->fail_next_inherit_copy_for_test();
+    CHECK_THROWS_AS(rt->attach_rule("r1", file_spec("/a"), file_hash_rule("r1"), true),
+                    std::bad_alloc);
+    CHECK(rt->staged_baseline_count_for_test() == 1);
+    CHECK(rt->staged_baseline_drops() == 0);
+    r->file = read_known(FileSnapshot{.exists = true, .size = 4, .hash = "h2"});
+    rt->evaluate_key(spark_key(file_spec("/a")), EvalReason::Event);
+    bool drift_vs_h = false;
+    for (const auto& e : drain_all(*rt))
+        drift_vs_h = drift_vs_h || (e.domain == OutboxDomain::Compliance && !e.drift.compliant &&
+                                    e.drift.expected_value == "h" && e.drift.detected_value == "h2");
+    CHECK(drift_vs_h); // RED if the detach had already run: no live arm would have evaluated
+
+    // The seam fires once: a retry attaches and still inherits the staged capture.
+    REQUIRE(rt->attach_rule("r1", file_spec("/a"), file_hash_rule("r1"), true));
+    rt->evaluate_key(spark_key(file_spec("/a")), EvalReason::Initial);
+    bool drift_again = false;
+    for (const auto& e : drain_all(*rt))
+        drift_again = drift_again || (e.domain == OutboxDomain::Compliance && !e.drift.compliant &&
+                                      e.drift.expected_value == "h" && e.drift.detected_value == "h2");
+    CHECK(drift_again);
+}

@@ -241,9 +241,13 @@ void GuardianOutboxDrainWorker::notify() {
 
 void GuardianOutboxDrainWorker::drain_once() { rt_.drain(send_); }
 
-void GuardianOutboxDrainWorker::persist_staged_baselines_once() {
-    if (maint_.baselines)
-        (void)maint_.baselines->persist_staged(rt_, GuardianBaselinePersister::Trigger::Worker);
+bool GuardianOutboxDrainWorker::persist_staged_baselines_once() {
+    if (!maint_.baselines)
+        return false;
+    return maint_.baselines
+        ->persist_staged(rt_, GuardianBaselinePersister::Trigger::Worker,
+                         [this] { return stop_requested(); })
+        .budget_exhausted;
 }
 
 GuardianSparkRuntime::DrainOutcome GuardianOutboxDrainWorker::drain_bounded() {
@@ -318,6 +322,7 @@ void GuardianOutboxDrainWorker::loop() {
     // it. Nothing here takes the engine mtx_, so running concurrently with the remainder of
     // wire_spark_engine is safe.
     bool skip_wait = true;
+    bool logged_baseline_throw = false; // #4045: log-once latch for the baseline persist firewall
     // #3953 item 3: a LOCAL, not a member (same convention as the timers above) - set
     // after each drain pass, consumed by the wait computation below. Lets loop() poll a
     // stalled-past-kGuardianSendOfferWait send sooner than the full periodic bound,
@@ -528,22 +533,29 @@ void GuardianOutboxDrainWorker::loop() {
         // #4045: persist Spark's staged baseline captures ahead of the drain. Its own firewall
         // and counter (the persister's, not firewalled_drain/journal_maint_exceptions_): a
         // baseline write failing must neither skip this cycle's outbox drain nor blur the
-        // journal and delivery counters. Cheap when nothing is staged (one registry_mu_ take),
-        // and a no-op while the retry backoff after a failed pass has not elapsed: it is
-        // wake-driven, so enqueue churn cannot drive a retry storm, and one pass stops at its
-        // first failed write, so it cannot stall the outbox drain for more than about one KV
-        // busy timeout. A capture's compliant-edge enqueue normally wakes this very cycle, so
-        // the record usually lands within milliseconds; see guardian_baseline_persister.hpp
-        // LATENCY for the honest bound.
+        // journal and delivery counters. Cheap when nothing is staged (one registry_mu_ take, no
+        // allocation) and a no-op while the retry backoff after a failed pass has not elapsed:
+        // it is wake-driven, so enqueue churn cannot drive a retry storm. A pass is budgeted
+        // (tuples, failures, wall), so it stalls the outbox drain for at most its wall budget
+        // plus one in-flight KV write. A pass that ran out of budget with captures still staged
+        // and no failure sets `baselines_more`: the loop then runs again without waiting
+        // (below, after the drain, which would otherwise overwrite skip_wait), so a backlog
+        // larger than one budget drains back to back instead of one pass per wake. A
+        // capture's compliant-edge enqueue normally wakes this very cycle, so the record
+        // usually lands within milliseconds; see guardian_baseline_persister.hpp LATENCY for
+        // the honest bound.
+        bool baselines_more = false;
         try {
-            persist_staged_baselines_once();
+            baselines_more = persist_staged_baselines_once();
         } catch (...) {
             // Nothing is lost (staging is untouched by a throw); count it on the persister's
-            // aggregate and log only the first.
-            const auto n = maint_.baselines ? maint_.baselines->firewalled_exceptions() : 0;
+            // aggregate and log only the first THIS WORKER sees: the latch is local, because the
+            // engine's own firewall shares the counter and must not be able to suppress the
+            // worker's only log line.
             if (maint_.baselines)
                 maint_.baselines->note_firewalled_exception();
-            if (n == 0) {
+            if (!logged_baseline_throw) {
+                logged_baseline_throw = true;
                 try {
                     spdlog::error("Guardian drain worker: baseline persist step threw "
                                   "(firewalled; agent survives, staged captures are retried). "
@@ -553,6 +565,8 @@ void GuardianOutboxDrainWorker::loop() {
             }
         }
         const auto drained = firewalled_drain();
+        if (baselines_more && !stop_requested())
+            skip_wait = true; // staged captures remain and nothing failed: go again now
 
         // #3953 item 3: firewalled like every other read in this bare-thread tail (the
         // item-13 seam below models exactly this class of exposure) - a std::system_error

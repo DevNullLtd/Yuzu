@@ -72,10 +72,14 @@
  * loop, so the record is usually durable within milliseconds of the capture (see the persister's
  * LATENCY note for the honest bound), with no new waker and no dependence on server
  * connectivity (a boot re-arm happens before the network is up; the heartbeat-thread tick
- * cannot cover it). After a failed pass the step backs off (5 s doubling to 60 s) and a pass
- * stops at its first failed write, so it cannot stall the drain for more than about one KV
- * busy timeout. Another KvStore caller on this existing joined thread, alongside the journal;
- * it takes only the persister's leaf persist_mu_, never mtx_.
+ * cannot cover it). After a failed pass the step backs off (5 s doubling to 60 s), and every
+ * pass runs under a budget (tuples, failures, wall; see the persister's BOUNDED PASSES), so it
+ * stalls the drain for at most the wall budget plus one in-flight KV write. A pass that ran
+ * out of budget with captures still staged (no failure) makes the loop run again at once
+ * instead of waiting. The pass also polls this worker's stop flag between tuples, so a pass in
+ * flight when stop() joins it ends after at most one more write. Another KvStore caller on this
+ * existing joined thread, alongside the journal; it takes only the persister's leaf
+ * persist_mu_, never mtx_.
  *
  * THE CENTRAL CONSTRAINT: maintenance must NEVER take the GuardianEngine mtx_.
  * GuardianEngine::stop() holds mtx_ across its whole body AND joins this worker
@@ -309,12 +313,14 @@ public:
     void drain_once();
 
     /// Persist Spark's staged baseline captures (#4045), once, via maint_.baselines (a no-op
-    /// when unset), as a Trigger::Worker pass: it honours the persister's retry backoff.
+    /// when unset), as a Trigger::Worker pass: it honours the persister's retry backoff and
+    /// polls this worker's stop flag between tuples. Returns true iff the pass ran out of
+    /// budget with captures still staged and no failure (the loop then runs again at once).
     /// loop() runs this every cycle before the outbox drain; it is public so a test can drive
     /// it synchronously. NOT firewalled here (loop() firewalls it and counts into the
     /// persister's firewalled_exceptions()). Takes the persister's leaf persist_mu_ and never
     /// GuardianEngine::mtx_.
-    void persist_staged_baselines_once();
+    bool persist_staged_baselines_once();
 
     /// TEST-ONLY: pin the jitter source so offsets are reproducible. Intended before
     /// start(), but it takes sig_->mu regardless: the RNG is worker-thread state guarded by

@@ -639,6 +639,12 @@ public:
     void fail_next_snapshot_for_test() noexcept {
         fail_next_snapshot_.store(true, std::memory_order_relaxed);
     }
+    /// TEST-ONLY: make the next attach_core inherit-the-staged-hash copy throw bad_alloc (the
+    /// copy happens BEFORE the prior generation is detached, so the prior arm must survive).
+    /// No production caller.
+    void fail_next_inherit_copy_for_test() noexcept {
+        fail_next_inherit_copy_.store(true, std::memory_order_relaxed);
+    }
     /// True iff at least one capture is staged (registry_mu_ standalone). The persister's
     /// no-store branch uses it to count a capture that has nowhere to go.
     [[nodiscard]] bool has_staged_baselines() const;
@@ -2578,6 +2584,7 @@ private:
         std::make_shared<std::atomic<std::uint64_t>>(0);
     std::atomic<bool> fail_next_stage_baseline_{false}; ///< TEST-ONLY allocation-failure seam
     mutable std::atomic<bool> fail_next_snapshot_{false}; ///< TEST-ONLY snapshot-throw seam
+    std::atomic<bool> fail_next_inherit_copy_{false};     ///< TEST-ONLY attach_core copy seam
     /// registry_mu_ held. First capture wins on one path; a different path (a retarget)
     /// replaces the unpersisted capture and counts a drop. Never throws, so a throw cannot split
     /// evaluate_key's enqueue from its commit. Returns false iff the capture could NOT be staged
