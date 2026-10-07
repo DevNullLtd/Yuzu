@@ -413,11 +413,14 @@ TEST_CASE("catalogue/versions JSON shaping", "[server][software_catalogue_model]
     v.newest = true;
     CHECK(version_row_json(v, false)["newest"] == true);
     CHECK(version_row_json(v, true)["newest"] == false);
-    auto vr = versions_response_json("git", {v}, true, true);
+    auto vr = versions_response_json("git", {v}, true, true, 1);
     CHECK(vr["truncated"] == true);
     CHECK(vr["newest_omitted"] == true);
     CHECK(vr["count"] == 1);
-    CHECK_FALSE(versions_response_json("git", {v}, false, false).contains("newest_omitted"));
+    CHECK(vr["devices_omitted"] == 1);
+    const auto plain = versions_response_json("git", {v}, false, false, 0);
+    CHECK_FALSE(plain.contains("newest_omitted"));
+    CHECK(plain["devices_omitted"] == 0);
 }
 
 TEST_CASE("titles_csv", "[server][software_catalogue_model]") {
@@ -440,7 +443,7 @@ TEST_CASE("titles_export: cap / truncation / degrade", "[server][software_catalo
     int reads = 0;
     CatalogueReader fake = [&](const SoftwareCatalogQuery& q) -> std::optional<std::vector<SoftwareCatalogRow>> {
         ++reads;
-        REQUIRE(q.limit <= kCatalogReadMax);
+        REQUIRE(q.limit <= kCatalogRowCap);
         std::vector<SoftwareCatalogRow> out;
         for (const auto& r : all) {
             if (q.after && !(r.device_count < q.after->installs ||
@@ -473,16 +476,49 @@ TEST_CASE("titles_export: cap / truncation / degrade", "[server][software_catalo
     CHECK_FALSE(titles_export(failing, {}, 5, false).has_value());
 }
 
+TEST_CASE("titles_export: a walk longer than one store read pages with the keyset cursor",
+          "[server][software_catalogue_model]") {
+    // 4,001 titles with distinct install counts: reads of 2000 + 2000 + 1 (the short one ends it).
+    std::vector<SoftwareCatalogRow> all;
+    for (int i = 0; i < 4001; ++i)
+        all.push_back(row("t" + std::to_string(i), 10000 - i));
+    int reads = 0;
+    CatalogueReader fake = [&](const SoftwareCatalogQuery& q) -> std::optional<std::vector<SoftwareCatalogRow>> {
+        ++reads;
+        REQUIRE(q.limit <= kCatalogRowCap);
+        std::vector<SoftwareCatalogRow> out;
+        for (const auto& r : all) {
+            if (q.after && r.device_count >= q.after->installs)
+                continue; // strictly after the cursor (installs are distinct here)
+            out.push_back(r);
+            if (static_cast<int>(out.size()) == q.limit)
+                break;
+        }
+        return out;
+    };
+    const auto ex = titles_export(fake, {}, kExportCap, false);
+    REQUIRE(ex);
+    CHECK(reads == 3);
+    CHECK(ex->rows == 4001);
+    CHECK_FALSE(ex->truncated);
+    CHECK(std::ranges::count(ex->csv, '\n') == 4002); // header + 4001 rows, none repeated
+    CHECK(ex->csv.find("\nt4000,") != std::string::npos);
+}
+
 namespace {
 
 struct FakeIo {
     std::vector<std::int64_t> gens; // successive refreshed_at readings
     std::size_t gen_i{0};
+    std::size_t meta_nullopt_at{static_cast<std::size_t>(-1)}; // nth meta reading that degrades
+    std::size_t meta_reads{0};
     bool rows_ok{true}, totals_ok{true};
     std::vector<SoftwareCatalogRow> rows;
     int rows_reads{0};
     CatalogueReads io() {
         return {[this]() -> std::optional<CatalogRollupMeta> {
+                    if (meta_reads++ == meta_nullopt_at)
+                        return std::nullopt;
                     CatalogRollupMeta m;
                     m.refreshed_at = gens[std::min(gen_i++, gens.size() - 1)];
                     return m;
@@ -613,6 +649,38 @@ TEST_CASE("read_catalogue_page: cursor and degrade outcomes", "[server][software
     }
 }
 
+TEST_CASE("read_catalogue_page: limit 0 on an empty page yields no cursor and no back() on empty",
+          "[server][software_catalogue_model]") {
+    FakeIo f;
+    f.gens = {10};
+    auto page = read_catalogue_page(f.io(), req(0));
+    REQUIRE(page);
+    CHECK(page->rows.empty());
+    CHECK(page->next_cursor.empty());
+}
+
+TEST_CASE("the second generation read degrades like the first", "[server][software_catalogue_model]") {
+    SECTION("a page") {
+        FakeIo f;
+        f.gens = {10};
+        f.meta_nullopt_at = 1; // the bracketing read after rows + totals
+        f.rows = {row("a", 3)};
+        auto page = read_catalogue_page(f.io(), req(1));
+        REQUIRE_FALSE(page);
+        CHECK_FALSE(page.error());
+        CHECK(f.rows_reads == 1);
+    }
+    SECTION("an export") {
+        auto rq = req(10);
+        rq.format = "csv";
+        FakeIo f;
+        f.gens = {10};
+        f.meta_nullopt_at = 1;
+        f.rows = {row("a", 3)};
+        CHECK_FALSE(read_titles_export(f.io(), rq, false).has_value());
+    }
+}
+
 TEST_CASE("read_titles_export brackets the walk by the generation",
           "[server][software_catalogue_model]") {
     auto rq = req(100);
@@ -637,6 +705,38 @@ TEST_CASE("read_titles_export brackets the walk by the generation",
         twice.rows = {row("a", 3)};
         auto ex = read_titles_export(twice.io(), rq, false);
         CHECK_FALSE(ex);
+    }
+    SECTION("a never-built rollup is `building`: no rows are read, no empty file is produced") {
+        FakeIo f;
+        f.gens = {0};
+        f.rows = {row("a", 3)};
+        auto ex = read_titles_export(f.io(), rq, false);
+        REQUIRE(ex);
+        CHECK(ex->building);
+        CHECK(ex->csv.empty());
+        CHECK(ex->rows == 0);
+        CHECK(f.rows_reads == 0);
+        CHECK(f.meta_reads == 1);
+    }
+    SECTION("the host path reads no meta, so it is never `building`") {
+        FakeIo f;
+        f.gens = {0};
+        f.rows = {row("a", 3)};
+        auto host = rq;
+        host.query.agent_id = "dev-1";
+        auto ex = read_titles_export(f.io(), host, false);
+        REQUIRE(ex);
+        CHECK_FALSE(ex->building);
+        CHECK(f.meta_reads == 0);
+        CHECK(ex->rows == 1);
+    }
+    SECTION("a stable build has building false") {
+        FakeIo f;
+        f.gens = {10};
+        f.rows = {row("a", 3)};
+        auto ex = read_titles_export(f.io(), rq, false);
+        REQUIRE(ex);
+        CHECK_FALSE(ex->building);
     }
     SECTION("a degraded read never yields a partial body") {
         FakeIo f;

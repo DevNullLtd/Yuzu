@@ -46,10 +46,7 @@ constexpr std::chrono::milliseconds kStaleCountAcquireTimeout{250};
 // Hard ceiling on rows a single fleet query will materialise, independent of the
 // caller's `limit`, so the store can never allocate an unbounded result set.
 constexpr int kFleetQueryRowCap = 100000;
-// Hard ceiling on catalogue / version-drill rows, independent of the caller's
-// `limit`. The catalogue is one row per distinct title; the drill is one per
-// distinct version of a title — both bounded sets.
-constexpr int kCatalogRowCap = 2000;
+// kCatalogRowCap (catalogue / version-drill row ceiling) lives in software_inventory_store.hpp.
 // Execution BUDGET (not a guarantee) PER STATEMENT of the BACKGROUND catalogue recompute
 // (refresh_catalog_rollup). It runs off the request path on the SoftwareCatalogRollup
 // thread (the page never waits on it) and overrides the pool's 30s default for that one

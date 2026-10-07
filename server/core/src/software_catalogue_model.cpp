@@ -1,5 +1,7 @@
 #include "software_catalogue_model.hpp"
 
+#include "data_export.hpp"
+#include "software_catalog_rules.hpp"
 #include "utf8_sanitize.hpp"
 
 #include <yuzu/log_token.hpp>
@@ -7,7 +9,12 @@
 #include <algorithm>
 #include <charconv>
 #include <cmath>
+#include <expected>
 #include <format>
+#include <initializer_list>
+#include <iterator>
+#include <optional>
+#include <utility>
 
 namespace yuzu::server::software_catalogue {
 
@@ -460,7 +467,7 @@ nlohmann::json version_row_json(const SoftwareVersionCount& v, bool omit_newest)
 
 nlohmann::json versions_response_json(std::string_view name,
                                       const std::vector<SoftwareVersionCount>& rows, bool truncated,
-                                      bool omit_newest) {
+                                      bool omit_newest, std::int64_t devices_omitted) {
     auto versions = nlohmann::json::array();
     for (const auto& v : rows)
         versions.push_back(version_row_json(v, omit_newest));
@@ -469,6 +476,7 @@ nlohmann::json versions_response_json(std::string_view name,
         {"versions", std::move(versions)},
         {"count", rows.size()},
         {"truncated", truncated},
+        {"devices_omitted", devices_omitted},
     };
     if (omit_newest)
         out["newest_omitted"] = true;
@@ -498,7 +506,7 @@ std::optional<TitlesExport> titles_export(const CatalogueReader& read, SoftwareC
     q.after.reset();
     while (static_cast<std::int64_t>(all.size()) < cap) {
         const std::int64_t want =
-            std::min<std::int64_t>(cap - static_cast<std::int64_t>(all.size()), kCatalogReadMax);
+            std::min<std::int64_t>(cap - static_cast<std::int64_t>(all.size()), kCatalogRowCap);
         q.limit = static_cast<int>(want);
         auto page = read(q);
         if (!page)
@@ -564,7 +572,7 @@ read_catalogue_page(const CatalogueReads& io, const CatalogueRequest& rq) {
                 return std::unexpected(std::nullopt); // a second move: 503
             }
         }
-        if (static_cast<int>(out.rows.size()) == q.limit)
+        if (!out.rows.empty() && static_cast<int>(out.rows.size()) == q.limit)
             out.next_cursor = encode_catalogue_cursor(out.rows.back(), fp, gen);
         return out;
     };
@@ -586,6 +594,9 @@ std::optional<TitlesExport> read_titles_export(const CatalogueReads& io,
             if (!before)
                 break;
             gen = before->refreshed_at;
+            // Never computed: an empty file would read as "no titles". Say so, read nothing.
+            if (gen == 0)
+                return TitlesExport{.building = true};
         }
         auto body = titles_export(io.rows, rq.query, rq.query.limit, omit_newest);
         if (!body)

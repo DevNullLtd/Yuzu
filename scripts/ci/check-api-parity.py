@@ -180,9 +180,9 @@ VERBS = ("Get", "Post", "Put", "Delete", "Patch", "Options")
 #
 # Software catalogue REST routes: get.fragments-inventory-software-versions
 # flips "planned:#2146" -> "twinned" (GET /api/v1/inventory/software/catalogue/versions;
-# REST only, no MCP twin yet) and the title-catalogue row get.fragments-inventory-software
-# is repointed at GET /api/v1/inventory/software/catalogue (already "twinned", count
-# unchanged). The catalogue route's format=csv titles export is REST-only by design: a CSV
+# REST only until the MCP twin lands, #3988) and the title-catalogue row
+# get.fragments-inventory-software is repointed at GET /api/v1/inventory/software/catalogue
+# (already "twinned", count unchanged). The catalogue route's format=csv titles export is REST-only by design: a CSV
 # body is a download for a person or a pipeline, not a structured tool result (MCP workers
 # page the JSON with `cursor`).
 # Measured post-flip at 204 (205 - 1), not hand-picked.

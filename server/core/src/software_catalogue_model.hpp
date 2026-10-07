@@ -2,20 +2,18 @@
 
 /// @file software_catalogue_model.hpp
 /// The ONE pure model behind the software catalogue's REST routes, built to be shared by every
-/// other surface that serves the same data (for example the `/inventory` Software page):
-/// query-parameter parsing, the scope push-down rule, audit targets, opaque keyset cursors, the
-/// generation-skew decision, KPI derivation and the JSON/CSV shaping. No httplib, no MCP, no
-/// libpq - every transport shapes its answer through these functions so the wire shapes cannot
-/// drift (docs/api-twin-recipe.md Rule 1).
+/// other surface that serves the same data (for example the `/software` page):
+/// query-parameter parsing, audit targets, opaque keyset cursors, the generation-skew decision,
+/// KPI derivation and the JSON/CSV shaping. No httplib, no MCP, no libpq - every transport shapes
+/// its answer through these functions so the wire shapes cannot drift (docs/api-twin-recipe.md
+/// Rule 1).
 ///
 /// Cursors are OPAQUE, not authenticated: a well-formed hand-made head cursor is accepted. That
-/// is harmless only because every page is audited (success on EVERY call, continuation pages
-/// tagged `page=continuation`). The catalogue cursor is bound to the filter set AND to the
+/// is harmless only because every served page or file is audited (continuation pages tagged
+/// `page=continuation`). The catalogue cursor is bound to the filter set AND to the
 /// rollup generation (`refreshed_at`, 1 s granularity); a mismatch is a 400, never a silent
 /// restart.
 
-#include "data_export.hpp"
-#include "software_catalog_rules.hpp"
 #include "software_inventory_store.hpp"
 
 #include <nlohmann/json.hpp>
@@ -41,8 +39,6 @@ inline constexpr std::int64_t kExportCap = 10000;
 inline constexpr std::size_t kCursorMaxBytes = 2048; ///< longest cursor token accepted; a longer one is refused
 inline constexpr std::int64_t kStaleWindowSecs = 172800; ///< 48 h
 inline constexpr std::size_t kSourceMaxBytes = 256;
-/// Largest `limit` one `software_catalog` read honours (the store's own hard ceiling).
-inline constexpr std::int64_t kCatalogReadMax = 2000;
 
 inline constexpr std::string_view kTitlesCsvHeader =
     "name,publisher,installs,versions,ecosystems,kinds,newest_version";
@@ -121,9 +117,12 @@ catalogue_response_json(const std::vector<SoftwareCatalogRow>& rows,
                         std::string_view next_cursor, bool omit_newest,
                         std::int64_t devices_omitted);
 [[nodiscard]] nlohmann::json version_row_json(const SoftwareVersionCount& v, bool omit_newest);
+/// `devices_omitted` is 1 when the per-device drill was refused as out of the caller's scope
+/// (an empty list there is not "no installs"), else 0 - the same marker the catalogue carries.
 [[nodiscard]] nlohmann::json versions_response_json(std::string_view name,
                                                     const std::vector<SoftwareVersionCount>& rows,
-                                                    bool truncated, bool omit_newest);
+                                                    bool truncated, bool omit_newest,
+                                                    std::int64_t devices_omitted);
 
 /// Serialise without ever throwing on a stray invalid-UTF-8 byte (replaced with U+FFFD).
 [[nodiscard]] std::string dump_safe(const nlohmann::json& j);
@@ -134,17 +133,20 @@ catalogue_response_json(const std::vector<SoftwareCatalogRow>& rows,
 
 using CatalogueReader =
     std::function<std::optional<std::vector<SoftwareCatalogRow>>(const SoftwareCatalogQuery&)>;
-/// One titles export: the CSV body, whether the cap cut the walk short, and the number of data
-/// rows in it (the audit's `rows=`; a cell holding a newline must not inflate it).
+/// One titles export: the CSV body, whether the walk reached the cap (rows may have been left
+/// behind), the number of data rows in it (the audit's `rows=`; a cell holding a newline must not
+/// inflate it) and `building` - the rollup has never been computed (`refreshed_at == 0`), so there
+/// is no catalogue to export yet and `csv` is empty (set only by read_titles_export).
 struct TitlesExport {
     std::string csv;
     bool truncated{false};
     std::int64_t rows{0};
+    bool building{false};
 };
 
 /// Titles export: loops `read` with the in-process keyset cursor (each read asks for
-/// min(cap - collected, kCatalogReadMax) rows) and returns a TitlesExport (csv, truncated, rows);
-/// `truncated` is set when the cap cut the walk short. nullopt when any read degrades (never a
+/// min(cap - collected, kCatalogRowCap) rows) and returns a TitlesExport (csv, truncated, rows);
+/// `truncated` is set when the walk reached the cap. nullopt when any read degrades (never a
 /// partial body).
 [[nodiscard]] std::optional<TitlesExport> titles_export(const CatalogueReader& read,
                                                         SoftwareCatalogQuery q, std::int64_t cap,
@@ -177,7 +179,9 @@ struct CataloguePage {
 read_catalogue_page(const CatalogueReads& io, const CatalogueRequest& rq);
 
 /// Titles export: the whole walk is bracketed by the generation (restart once, then
-/// degraded = nullopt, never a partial body). `rq.query.limit` is the TOTAL row cap.
+/// degraded = nullopt, never a partial body). `rq.query.limit` is the TOTAL row cap. On the fleet
+/// path a never-computed rollup (`refreshed_at == 0`) returns `building` WITHOUT reading any rows:
+/// an empty file there would read as "no titles", not "not built yet".
 [[nodiscard]] std::optional<TitlesExport>
 read_titles_export(const CatalogueReads& io, const CatalogueRequest& rq, bool omit_newest);
 
