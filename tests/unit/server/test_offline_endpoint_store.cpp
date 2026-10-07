@@ -1,6 +1,7 @@
 // OfflineEndpointStore tests (#1320 PR 3): upsert idempotency, RETURNING
-// mutate-and-return, the stale-within window query, and the empty-pool
-// fail-soft contract. Born-on-Postgres store, schema `endpoint_state`.
+// mutate-and-return, the stale-within window query, and the typed
+// failure contract (StoreUnavailable / DbError, never an empty success).
+// Born-on-Postgres store, schema `endpoint_state`.
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -343,6 +344,33 @@ TEST_CASE("OfflineEndpointStore query_live_ids and query_stale_within report DbE
     REQUIRE(recovered.has_value());
     auto recovered_stale = degraded_store.query_stale_within(std::chrono::hours(1));
     REQUIRE(recovered_stale.has_value());
+}
+
+// #5531. Kills: the no-lease arm of query_stale_within answering an empty
+// success (or skipping the store_unavailable count) when the pool cannot
+// lease a connection in time — the issue's motivating failure. Costs one
+// bounded kQueryAcquireTimeout wait, hence [slow].
+TEST_CASE("OfflineEndpointStore query_stale_within reports StoreUnavailable and counts it when "
+          "the pool is exhausted",
+          "[pg][offline][slow]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, offline_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 1}};
+    REQUIRE(pool.valid());
+    OfflineEndpointStore store{pool};
+    REQUIRE(store.is_open());
+    yuzu::MetricsRegistry metrics;
+    store.set_metrics(&metrics);
+
+    auto held = pool.acquire(); // exhaust the single-connection pool
+    REQUIRE(static_cast<bool>(held));
+
+    auto r = store.query_stale_within(std::chrono::hours(1));
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error() == PresenceReadError::StoreUnavailable);
+    CHECK(metrics
+              .counter("yuzu_server_agent_presence_store_failed_total",
+                       {{"op", "query_stale_within"}, {"reason", "store_unavailable"}})
+              .value() == 1);
 }
 
 TEST_CASE("OfflineEndpointStore query_live_ids reports Truncated past kQueryRowCap, "

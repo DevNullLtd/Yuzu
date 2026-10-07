@@ -164,7 +164,9 @@ public:
     /// means "no rows". `Truncated` is never produced: the read keeps
     /// `LIMIT kQueryRowCap` newest-first and serves the capped set. A failure
     /// is counted on `yuzu_server_agent_presence_store_failed_total`
-    /// (`op=query_stale_within`) and logged at warn once per failed call.
+    /// (`op=query_stale_within`) and logged at warn once per failed call (a
+    /// store that never opened — boot-time migration failure — answers
+    /// `StoreUnavailable` without a count or warn, as `query_live_ids` does).
     [[nodiscard]] std::expected<std::vector<OfflineEndpoint>, PresenceReadError>
     query_stale_within(std::chrono::seconds window);
 

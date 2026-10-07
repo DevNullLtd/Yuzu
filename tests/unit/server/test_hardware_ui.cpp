@@ -33,6 +33,8 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <expected>
+#include <functional>
 #include <optional>
 #include <string>
 #include <utility>
@@ -448,4 +450,110 @@ TEST_CASE("hardware CI fragment: identity_degraded + no record -> roster unreada
         const auto html = render_hardware_ci_fragment("agent-x", d, "", 0, aff);
         CHECK(html.find("Device not found") != std::string::npos);
     }
+}
+
+// Kills: dropping the `identity_state` arm from hardware_ci_json, or mapping an absent identity
+// (not in the roster, nothing failed) onto "degraded".
+TEST_CASE("hardware_ci_json: identity_state is absent / degraded / found", "[hardware][ui]") {
+    HardwareCiDetail d;
+    d.ci = std::expected<std::optional<DeviceCiRecord>, CiReadError>(std::optional<DeviceCiRecord>{});
+    CHECK(hardware_ci_json(d, 0)["identity_state"].get<std::string>() == "absent");
+    d.identity_degraded = true;
+    CHECK(hardware_ci_json(d, 0)["identity_state"].get<std::string>() == "degraded");
+    d.identity_degraded = false;
+    d.identity = InventoryDeviceRow{};
+    CHECK(hardware_ci_json(d, 0)["identity_state"].get<std::string>() == "found");
+}
+
+// Kills: rendering the KPI strip (all zeros) above the roster-unavailable banner. The marker is
+// the class-use `<div class="hw-kpis">`, not `hw-kpi`, which the inlined CSS rule also contains.
+TEST_CASE("hardware list fragment: a degraded full-form list renders no KPI strip",
+          "[hardware][ui]") {
+    const std::string marker = "<div class=\"hw-kpis\">";
+    const auto degraded = render_hardware_list_fragment(HardwareListPage{}, false, true, false);
+    CHECK(degraded.find("Hardware roster unavailable") != std::string::npos);
+    CHECK(degraded.find(marker) == std::string::npos);
+    // Control: the marker is present on a healthy render, so the negative above is not vacuous.
+    const auto healthy = render_hardware_list_fragment(HardwareListPage{}, false, false, false);
+    CHECK(healthy.find(marker) != std::string::npos);
+}
+
+// ── #5531: the pure store-to-bit mappings server.cpp's closures delegate to ───
+
+namespace {
+OfflineEndpoint make_offline_ep(const std::string& id, std::int64_t hb_ms) {
+    OfflineEndpoint e;
+    e.agent_id = id;
+    e.hostname = "host-" + id;
+    e.os = "linux";
+    e.last_heartbeat_ms = hb_ms;
+    return e;
+}
+const std::function<std::string(std::int64_t)> kAge = [](std::int64_t) { return std::string("aged"); };
+constexpr std::int64_t kDayMs = 24LL * 60 * 60 * 1000;
+} // namespace
+
+// Kills: build_hw_roster treating a failed read as an empty roster (no early return, or
+// roster_degraded never set), and a healthy read being flagged degraded.
+TEST_CASE("apply_roster_read: failed read sets every degraded bit; healthy read touches nothing",
+          "[hardware][ui]") {
+    InventoryDevicesResult failed;
+    CHECK_FALSE(apply_roster_read(failed, OfflineRosterRead{std::unexpected(PresenceReadError::DbError)}));
+    CHECK(failed.roster_degraded);
+    CHECK(failed.ci_degraded);
+    CHECK(failed.tags_degraded);
+
+    InventoryDevicesResult healthy;
+    CHECK(apply_roster_read(healthy, OfflineRosterRead{std::vector<OfflineEndpoint>{}}));
+    CHECK_FALSE(healthy.roster_degraded);
+    CHECK_FALSE(healthy.ci_degraded);
+    CHECK_FALSE(healthy.tags_degraded);
+}
+
+// Kills: hw_identity_fn swallowing the read error into an empty optional ("not found").
+TEST_CASE("offline_identity_row: error propagates; hit is offline; miss is nullopt",
+          "[hardware][ui]") {
+    const auto err = offline_identity_row(
+        OfflineRosterRead{std::unexpected(PresenceReadError::StoreUnavailable)}, "a1", 10 * kDayMs, kAge);
+    REQUIRE_FALSE(err.has_value());
+    CHECK(err.error() == PresenceReadError::StoreUnavailable);
+
+    const OfflineRosterRead roster{std::vector<OfflineEndpoint>{make_offline_ep("a1", 9 * kDayMs)}};
+    const auto hit = offline_identity_row(roster, "a1", 10 * kDayMs, kAge);
+    REQUIRE(hit.has_value());
+    REQUIRE(hit->has_value());
+    CHECK((*hit)->hostname == "host-a1");
+    CHECK_FALSE((*hit)->online);
+    CHECK_FALSE((*hit)->stale); // 1 day old
+    CHECK((*hit)->last_seen == "aged");
+
+    const auto old = offline_identity_row(
+        OfflineRosterRead{std::vector<OfflineEndpoint>{make_offline_ep("a1", 0)}}, "a1", 10 * kDayMs, kAge);
+    REQUIRE(old.has_value());
+    CHECK((*old)->stale);
+
+    const auto miss = offline_identity_row(roster, "zzz", 10 * kDayMs, kAge);
+    REQUIRE(miss.has_value());
+    CHECK_FALSE(miss->has_value());
+}
+
+// Kills: hw_ci_detail_fn never setting identity_degraded, or setting it on a clean miss.
+TEST_CASE("apply_identity_read: error degrades; nullopt is absent; row is identity", "[hardware][ui]") {
+    HardwareCiDetail d;
+    apply_identity_read(d, std::unexpected(PresenceReadError::DbError));
+    CHECK(d.identity_degraded);
+    CHECK_FALSE(d.identity.has_value());
+
+    HardwareCiDetail absent;
+    apply_identity_read(absent, std::optional<InventoryDeviceRow>{});
+    CHECK_FALSE(absent.identity_degraded);
+    CHECK_FALSE(absent.identity.has_value());
+
+    HardwareCiDetail found;
+    InventoryDeviceRow row;
+    row.agent_id = "a1";
+    apply_identity_read(found, std::optional<InventoryDeviceRow>{row});
+    CHECK_FALSE(found.identity_degraded);
+    REQUIRE(found.identity.has_value());
+    CHECK(found.identity->agent_id == "a1");
 }

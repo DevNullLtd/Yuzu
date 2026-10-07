@@ -18,9 +18,9 @@ rule). Loaded by `security-guardian` + `docs-writer` during governance.
 
 `get_fleet_topology`/`get_host_topology` (`mcp_server.cpp`) are the MCP twins
 of the REST endpoints below, wired via `McpServer::set_viz_deps()` (passes the
-SAME `fleet_topology_store_`/`offline_endpoint_store_`/`viz_disabled_`
-instances REST's `VizRoutes` registration uses, so the two surfaces cannot
-disagree about cache state). Every invariant in this doc (kill-switch
+SAME `fleet_topology_store_`/`viz_disabled_` instances and the same
+`OfflineEndpointStore` (via an `OfflineRosterFn` closure) REST's `VizRoutes`
+registration uses, so the two surfaces cannot disagree about cache state). Every invariant in this doc (kill-switch
 ordering, the DoS cap, the offline-merge rule) applies identically to both
 surfaces - a change to one that doesn't preserve parity with the other is a
 regression, not a stylistic difference. That equal treatment does not extend

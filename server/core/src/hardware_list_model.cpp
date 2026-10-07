@@ -8,6 +8,7 @@
 #include <charconv>
 #include <limits>
 #include <unordered_set>
+#include <utility>
 
 namespace yuzu::server {
 
@@ -580,6 +581,47 @@ nlohmann::json hardware_ci_json(const HardwareCiDetail& detail, std::int64_t /*n
     out["software_last_seen"] =
         detail.software_last_seen ? nlohmann::json(*detail.software_last_seen) : nullptr;
     return out;
+}
+
+bool apply_roster_read(InventoryDevicesResult& result, const OfflineRosterRead& eps) {
+    if (eps)
+        return true;
+    result.roster_degraded = true; // unread, not empty
+    result.ci_degraded = true;
+    result.tags_degraded = true;
+    return false;
+}
+
+std::expected<std::optional<InventoryDeviceRow>, PresenceReadError>
+offline_identity_row(const OfflineRosterRead& eps, std::string_view agent_id, std::int64_t now_ms,
+                     const std::function<std::string(std::int64_t)>& human_age) {
+    if (!eps)
+        return std::unexpected(eps.error());
+    for (const auto& e : *eps) {
+        if (e.agent_id != agent_id)
+            continue;
+        InventoryDeviceRow r;
+        r.agent_id = e.agent_id;
+        r.hostname = e.hostname;
+        r.os = e.os;
+        r.agent_version = e.agent_version;
+        r.arch = e.arch;
+        r.online = false;
+        const std::int64_t age_ms = now_ms - e.last_heartbeat_ms;
+        r.stale = age_ms > (2LL * 24 * 60 * 60 * 1000);
+        r.last_seen = human_age(age_ms);
+        r.last_seen_ms = e.last_heartbeat_ms;
+        return std::optional<InventoryDeviceRow>{std::move(r)};
+    }
+    return std::optional<InventoryDeviceRow>{};
+}
+
+void apply_identity_read(HardwareCiDetail& detail,
+                         std::expected<std::optional<InventoryDeviceRow>, PresenceReadError> ident) {
+    if (ident)
+        detail.identity = std::move(*ident);
+    else
+        detail.identity_degraded = true;
 }
 
 } // namespace yuzu::server

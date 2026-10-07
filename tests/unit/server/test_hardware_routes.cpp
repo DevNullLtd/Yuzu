@@ -592,6 +592,7 @@ TEST_CASE("route: list fragment — roster read failure renders the roster-unava
     REQUIRE(res->status == 200);
     REQUIRE(contains(res->body, "Hardware roster unavailable"));
     REQUIRE_FALSE(contains(res->body, "<table"));
+    REQUIRE_FALSE(h.audits.empty());
     REQUIRE(h.audits.back() == "inventory.devices|failure");
     REQUIRE(contains(h.audit_details.back(), "roster read failed"));
 
@@ -620,6 +621,7 @@ TEST_CASE("route: GET /api/v1/hardware — roster read failure is 503 with retry
         REQUIRE_FALSE(body.is_discarded());
         REQUIRE(body["error"]["retry_after_ms"].get<int>() == 5000);
         REQUIRE_FALSE(body.contains("data"));
+        REQUIRE_FALSE(h.audits.empty());
         REQUIRE(h.audits.back() == "inventory.devices|failure");
     }
     {
@@ -643,6 +645,7 @@ TEST_CASE("route: CI fragment — identity_degraded with no readable record says
     REQUIRE(res);
     REQUIRE(contains(res->body, "roster unreadable"));
     REQUIRE_FALSE(contains(res->body, "Device not found"));
+    REQUIRE_FALSE(h.audits.empty());
     REQUIRE(h.audits.back() == "inventory.device.ci|failure");
     REQUIRE(contains(h.audit_details.back(), "state=roster unreadable"));
 }
@@ -660,6 +663,7 @@ TEST_CASE("route: CI fragment — identity_degraded with a readable CI record st
     REQUIRE(contains(res->body, "CI-MODEL-5531"));
     REQUIRE_FALSE(contains(res->body, "roster unreadable"));
     REQUIRE_FALSE(contains(res->body, "Device not found"));
+    REQUIRE_FALSE(h.audits.empty());
     REQUIRE(h.audits.back() == "inventory.device.ci|failure");
     REQUIRE(contains(h.audit_details.back(), "state=found identity=roster unreadable"));
 
@@ -681,6 +685,7 @@ TEST_CASE("route: GET /api/v1/hardware/{id} — identity_degraded with nothing e
         auto body = nlohmann::json::parse(res->body, nullptr, false);
         REQUIRE_FALSE(body.is_discarded());
         REQUIRE(body["error"]["retry_after_ms"].get<int>() == 5000);
+        REQUIRE_FALSE(h.audits.empty());
         REQUIRE(h.audits.back() == "inventory.device.ci|failure");
     }
     {
@@ -707,6 +712,7 @@ TEST_CASE("route: GET /api/v1/hardware/{id} — identity_degraded with a readabl
         REQUIRE(body["data"]["identity_state"].get<std::string>() == "degraded");
         REQUIRE(body["data"]["ci_state"].get<std::string>() == "found");
         REQUIRE(body["data"]["hostname"].is_null());
+        REQUIRE_FALSE(h.audits.empty());
         REQUIRE(h.audits.back() == "inventory.device.ci|failure");
         REQUIRE(contains(h.audit_details.back(), "identity=roster unreadable"));
     }
@@ -718,6 +724,7 @@ TEST_CASE("route: GET /api/v1/hardware/{id} — identity_degraded with a readabl
         REQUIRE(res->status == 200);
         auto body = nlohmann::json::parse(res->body);
         REQUIRE(body["data"]["identity_state"].get<std::string>() == "found");
+        REQUIRE_FALSE(h.audits.empty());
         REQUIRE(h.audits.back() == "inventory.device.ci|success");
     }
 }

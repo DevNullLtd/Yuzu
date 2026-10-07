@@ -17484,12 +17484,8 @@ private:
             // point of the device tab: readable when a device is offline). Aged-out hosts
             // beyond the window are withheld so the list doesn't accrete dead hosts forever.
             auto eps = offline_endpoint_store_->query_stale_within(std::chrono::hours(24 * 30));
-            if (!eps) {
-                result.roster_degraded = true; // #5531: unread, not empty — no enrichment
-                result.ci_degraded = true;
-                result.tags_degraded = true;
+            if (!apply_roster_read(result, eps)) // #5531: unread, not empty — no enrichment
                 return result;
-            }
             // currently-connected agents (live registry). all_ids() copies only the ids
             // under the registry lock — NOT to_json_obj()'s full 5-field-per-agent JSON
             // serialisation under the heartbeat/dispatch hot-path mutex (gov perf-S2).
@@ -17637,29 +17633,11 @@ private:
             }
             if (!offline_endpoint_store_)
                 return std::optional<InventoryDeviceRow>{};
-            auto eps = offline_endpoint_store_->query_stale_within(std::chrono::hours(24 * 30));
-            if (!eps)
-                return std::unexpected(eps.error());
+            const auto eps = offline_endpoint_store_->query_stale_within(std::chrono::hours(24 * 30));
             const std::int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                                             std::chrono::system_clock::now().time_since_epoch())
                                             .count();
-            for (const auto& e : *eps) {
-                if (e.agent_id != agent_id)
-                    continue;
-                InventoryDeviceRow r;
-                r.agent_id = e.agent_id;
-                r.hostname = e.hostname;
-                r.os = e.os;
-                r.agent_version = e.agent_version;
-                r.arch = e.arch;
-                r.online = false;
-                const std::int64_t age_ms = now_ms - e.last_heartbeat_ms;
-                r.stale = age_ms > (2LL * 24 * 60 * 60 * 1000);
-                r.last_seen = inv_human_age(age_ms);
-                r.last_seen_ms = e.last_heartbeat_ms;
-                return std::optional<InventoryDeviceRow>{std::move(r)};
-            }
-            return std::optional<InventoryDeviceRow>{};
+            return offline_identity_row(eps, agent_id, now_ms, inv_human_age);
         };
         // The full per-device CI record composition — ONE closure shared verbatim
         // by the dashboard fragment and the REST twin, so the two can never drift
@@ -17668,10 +17646,7 @@ private:
         // one was already wired).
         auto hw_ci_detail_fn = [this, hw_identity_fn](const std::string& agent_id) -> HardwareCiDetail {
             HardwareCiDetail detail;
-            if (auto ident = hw_identity_fn(agent_id))
-                detail.identity = std::move(*ident);
-            else
-                detail.identity_degraded = true;
+            apply_identity_read(detail, hw_identity_fn(agent_id));
             if (auto sess = registry_.get_session(agent_id))
                 detail.agent_version = sess->agent_version; // immutable identity field, lock-free
             detail.ci = device_inventory_store_

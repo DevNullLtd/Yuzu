@@ -19,6 +19,7 @@
 
 #include "device_inventory_store.hpp"    // DeviceCiRecord, CiReadError
 #include "inventory_routes.hpp"          // InventoryDeviceRow
+#include "offline_endpoint_store.hpp"    // OfflineEndpoint, PresenceReadError (stdlib-only header)
 #include "software_inventory_store.hpp"  // SoftwareEntry
 #include "tag_store.hpp"                 // DeviceTag
 
@@ -27,6 +28,7 @@
 #include <array>
 #include <cstdint>
 #include <expected>
+#include <functional>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -153,8 +155,28 @@ inline constexpr std::size_t kHwSoftwareCap = 2000;
 inline constexpr std::array<int, 3> kSyncNowMinAgentVersion{0, 13, 1};
 [[nodiscard]] bool agent_supports_sync_now(std::string_view agent_version) noexcept;
 
-/// `ci_state` in the output is one of "found" | "absent" | "degraded" — never
-/// inferred by the reader from a blank field.
+// ── #5531: the store-to-bit mappings, pure so a revert is visible to a unit test ──
+
+/// One offline-roster read, as `OfflineEndpointStore::query_stale_within` returns it.
+using OfflineRosterRead = std::expected<std::vector<OfflineEndpoint>, PresenceReadError>;
+
+/// Failed read -> `roster_degraded` + `ci_degraded` + `tags_degraded` (no enrichment of an
+/// unknown roster) and returns false; a healthy read touches nothing and returns true.
+bool apply_roster_read(InventoryDevicesResult& result, const OfflineRosterRead& eps);
+
+/// One device's identity from an offline-roster read: the error is propagated (a failed read
+/// is never "not in the roster"); a healthy read yields the matching row (online=false, stale
+/// past 2 days) or nullopt when the agent is absent.
+[[nodiscard]] std::expected<std::optional<InventoryDeviceRow>, PresenceReadError>
+offline_identity_row(const OfflineRosterRead& eps, std::string_view agent_id, std::int64_t now_ms,
+                     const std::function<std::string(std::int64_t)>& human_age);
+
+/// Identity read -> `identity` on success (nullopt = absent), `identity_degraded` on error.
+void apply_identity_read(HardwareCiDetail& detail,
+                         std::expected<std::optional<InventoryDeviceRow>, PresenceReadError> ident);
+
+/// `ci_state` and `identity_state` in the output are each one of "found" |
+/// "absent" | "degraded" — never inferred by the reader from a blank field.
 [[nodiscard]] nlohmann::json hardware_ci_json(const HardwareCiDetail& detail, std::int64_t now_secs);
 
 } // namespace yuzu::server
