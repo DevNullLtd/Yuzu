@@ -11536,14 +11536,21 @@ TEST_CASE("MCP summarize_working_set: tools/list advertises the confinement sema
     ts.start();
     auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/list","id":3})");
     REQUIRE(res);
-    auto body = nlohmann::json::parse(res->body);
+    // Non-throwing accessors only: operator[] with a missing key on a const json aborts the whole
+    // binary (SIGABRT), so a regression that drops a key must fail one CHECK, not kill the run.
+    const auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("result"));
+    REQUIRE(body.at("result").contains("tools"));
     const nlohmann::json* tool = nullptr;
-    for (const auto& t : body["result"]["tools"])
-        if (t["name"] == "summarize_working_set")
+    for (const auto& t : body.at("result").at("tools"))
+        if (t.value("name", std::string{}) == "summarize_working_set")
             tool = &t;
     REQUIRE(tool != nullptr);
-    CHECK((*tool)["inputSchema"]["properties"]["id"]["maxLength"] == 128);
-    const auto desc = (*tool)["description"].get<std::string>();
+    REQUIRE(tool->contains("inputSchema"));
+    REQUIRE(tool->at("inputSchema").contains("properties"));
+    REQUIRE(tool->at("inputSchema").at("properties").contains("id"));
+    CHECK(tool->at("inputSchema").at("properties").at("id").value("maxLength", -1) == 128);
+    const auto desc = tool->value("description", std::string{});
     CHECK(desc.find("confined by management group") != std::string::npos);
     CHECK(desc.find("retry_after_ms") != std::string::npos);
     CHECK(desc.find("unscoped whole-registry") != std::string::npos);

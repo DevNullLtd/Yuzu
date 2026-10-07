@@ -340,6 +340,33 @@ TEST_CASE("fragments/executions real gate: a service-scoped token never sees its
           ListRig::sorted({r.x_bob, r.x_mixed, r.x_bob_own, x_bob_pending}));
 }
 
+// UP-2 at the SQL layer: the owner clear must reach the scope clause that runs BEFORE the page
+// LIMIT (50). If the owner stayed in SQL (only the per-row check cleared), a service-scoped
+// token whose minter dispatched more than a page of out-of-scope executions would have the whole
+// page consumed by those rows, the per-row check would then drop them all, and the older
+// in-scope executions would never be served. The minter's 55 newer rows touch only alice-agent
+// (out of the "printers" scope); the seeded in-scope rows (x_bob, x_mixed) are older.
+TEST_CASE("fragments/executions real gate: a service-scoped token is not starved by a minter's "
+          "page of newer out-of-scope dispatches",
+          "[pg][workflow][executions][list][confinement][authz][service_scope]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::response_execution_authz_tpl);
+    ListRig r{db.dsn()};
+    constexpr int kMinterRows = 55; // > the fragment's 50-row page limit
+    std::vector<std::string> minter_ids;
+    for (int i = 0; i < kMinterRows; ++i) {
+        auto id = r.make("bob", 1735700000 + i, 1); // all newer than the seeded rows
+        r.status(id, "alice-agent", "failure", "SECRET-ALICE-ERR-FLOOD");
+        minter_ids.push_back(id);
+    }
+
+    auto svc = r.get(r.mint("bob", "printers"), /*use_tag_aware_auth=*/true);
+    CHECK(svc.status == 200);
+    CHECK(svc.ids == ListRig::sorted({r.x_bob, r.x_mixed}));
+    for (const auto& id : minter_ids)
+        CHECK(std::find(svc.ids.begin(), svc.ids.end(), id) == svc.ids.end());
+    CHECK_FALSE(has(svc.body, "SECRET-ALICE"));
+}
+
 // Default posture: RBAC ships OFF. With enforcement off every authenticated non-service caller
 // is admitted UNCONFINED (no management-group narrowing, no grant required) and sees the whole
 // fleet's executions; a service-scoped token is refused (it requires RBAC to be enabled). This
