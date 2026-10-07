@@ -2071,7 +2071,7 @@ yuzu_server_rbac_enforcement_toggle_total{transport="mcp",result="failed"} 0
 sum(rate(yuzu_server_rbac_read_degrade_total{reason=~"pool_acquire_timeout|query_error|generation_refresh_failed"}[5m])) by (reason) > 0
 ```
 
-The shipped rule is `YuzuRbacReadDegraded` in `docs/prometheus/yuzu-alerts.yml`. Its per-replica companion, `YuzuRbacBreakerOpen` (`max by (instance) (yuzu_server_rbac_breaker_open) == 1` for 5 minutes, critical), names the replica whose authorization breaker has stayed open: that replica refuses the permission checks that miss its cache and sheds service-token ceiling reads, while decisions already cached there are still served.
+The shipped rule is `YuzuRbacReadDegraded` in `docs/prometheus/yuzu-alerts.yml`. Its per-replica companion, `YuzuRbacBreakerOpen` (`max by (instance) (yuzu_server_rbac_breaker_open) == 1` for 5 minutes, critical), names the replica whose authorization breaker has stayed open: that replica refuses the permission checks that miss its cache and sheds service-token ceiling reads, cached decisions there are served for at most about 5 seconds after the last good refresh, and the refresh shares the breaker, so they are refused too once the alert fires.
 
 A1's enforcement-state changes are covered by the separate, threshold-free `YuzuRbacEnforcementChanged` rule (same file) — see `docs/user-manual/rbac.md` "Enabling RBAC" for the audit-row cross-reference it points at. A direction-aware companion, `YuzuRbacEnforcementDisabled` (warning severity), fires specifically when the gauge transitions to disabled — RBAC ships off by default, so a disable is the security-regression direction and gets louder treatment than a bare "something changed."
 

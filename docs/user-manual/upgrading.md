@@ -273,7 +273,7 @@ Only case (e) means the key files are gone. Nothing inside the server can rebuil
   3. This database cannot be brought back by any supported means. Every start checks each registered KEK and refuses. The one-shot modes `--mfa-reset` and `--break-glass-arm` run after that check, so they stop with the same `kek_unresolvable` error. What is gone: the CA private key, so every agent certificate it issued no longer chains and every agent must enroll again; and every secret sealed under the KEK, including TOTP enrolments, webhook signing secrets and the other secret columns listed in `docs/user-manual/server-admin.md` "Key management (secrets KEK)". Passwords and API tokens are hashed, not sealed, but they live in the same database.
   4. Start a new install. With the bundled Postgres, `docker compose down -v` deletes the Postgres volume along with the others. `down -v` does not reset an external Postgres: that database still registers the lost KEK, so a new install against it fails the same way. Give the new install a new, empty database. Then provision the admin account again, re-enroll your agents, and re-create your configuration.
 
-## Behaviour change: service-scoped tokens, the `ITServiceOwner` ceiling on the fleet-read gate, and `GET /api/v1/upload-grants`
+## Behaviour change: service-scoped tokens, the `ITServiceOwner` ceiling on the fleet-read gate, and `GET /api/v1/upload-grants` (#3526)
 
 Two chokepoints let a service-scoped API token reach more than the `ITServiceOwner` role allows (found
 in a review of the fleet-read gate, #3526). Both now refuse it. This is a tightening for service-scoped tokens only;
@@ -339,6 +339,8 @@ means authorization reads on that replica keep failing. While the breaker is ope
 ceiling reads; cached decisions keep being served for at most about 5 seconds.
 A breaker that closes again within 5 minutes does not page. Load the updated rule file if you maintain
 your own copy of the shipped alerts.
+
+**List-read A4 body.** The A4 body of a service-scoped token's `403` from the list-read gate no longer carries a `permission` field; clients should not read it.
 
 **The sibling gates changed their budget.** `require_permission` and `require_scoped_permission` now
 read the ceiling with the 250 ms authz acquire budget behind that shared breaker. Before, they acquired

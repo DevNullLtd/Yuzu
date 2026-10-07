@@ -561,9 +561,11 @@ groups:
         # replica's authorization reads that miss the permission cache are
         # refused without touching the pool, apart from one probe per ~1 s
         # (kRbacGenerationRefreshMs). The service-token ceiling read
-        # (ITServiceOwner) feeds and is shed by the same breaker. Decisions
-        # already cached on the replica are still served, so this is not
-        # "every caller denied". The gauge is published per replica and only
+        # (ITServiceOwner) feeds and is shed by the same breaker. Cached
+        # decisions are served for at most ~5 s after the last good refresh
+        # (kRbacStaleServeBoundMs); the cache-coherence refresh goes through
+        # the same breaker, so by the time this alert fires cached decisions
+        # are refused as well. The gauge is published per replica and only
         # changes when an authorization read reports its outcome, so a
         # replica that receives no authorization checks keeps its last value.
         # A breaker that half-opens and closes again within five minutes is
@@ -586,9 +588,10 @@ groups:
             replica refuses (fail closed) the operator permission checks that
             miss its permission cache and sheds the service-scoped token
             ceiling reads (a retryable 503), except for about one probe per
-            second; permissions already cached on the replica are still served
-            (bounded by the ~5s stale-serve window if the cache-coherence
-            refresh is also failing). Check Postgres availability and pool
+            second; cached decisions are served for at most ~5s after the last
+            good refresh, and the cache-coherence refresh goes through the
+            same breaker, so expect cached decisions to be refused as well.
+            Check Postgres availability and pool
             saturation (yuzu_pg_*) and the server RbacStore warnings; the
             breaker closes on its own after the next successful read. The
             gauge changes only when an authorization read reports its
