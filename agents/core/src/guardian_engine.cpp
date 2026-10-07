@@ -809,7 +809,8 @@ std::expected<void, std::string> GuardianEngine::start_local() {
                 rearm_fault_hook_for_test_(rule.rule_id());
             // #5513: a returned Failed (a Spark synchronous refusal; the legacy path's
             // returned-false stays Inert, #2797) or a throw below marks the boot re-arm
-            // unresolved; Accepted alone does not (the late variant is handled in the maintenance tick).
+            // unresolved; Accepted alone does not (the late variant is handled in the
+            // maintenance tick).
             switch (reconcile_rule_locked(rule)) { // either backend
             case ReconcileOutcome::Armed:
                 ++rearmed;
@@ -867,6 +868,7 @@ std::expected<void, std::string> GuardianEngine::start_local() {
                     "' failed to re-arm (non-standard exception) - NOT enforcing this rule; "
                     "agent continues with the remaining rules";
                 spdlog::error("{}", degrade_msg);
+                last_rearm_degrade_message_for_test_ = degrade_msg;
             } catch (...) {
                 spdlog::error("Guardian: a rule failed to re-arm (non-standard exception) - NOT "
                               "enforcing this rule; agent continues with the remaining rules");

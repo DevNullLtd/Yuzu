@@ -1536,7 +1536,8 @@ TEST_CASE("GuardianEngine #5513: a re-arm that throws at boot reports generation
     // The catch-up: the SAME generation, so the tail's `push > policy_generation_`
     // advance gate is false. The flag must clear on a clean application regardless of
     // that gate (it sits beside the gate, not inside it).
-    REQUIRE(b.engine->apply_rules(push_at(kG, two_registry_rules(), /*full_sync=*/true)).has_value());
+    REQUIRE(b.engine->apply_rules(push_at(kG, two_registry_rules(), /*full_sync=*/true))
+                .has_value());
     CHECK_FALSE(b.engine->boot_rearm_unresolved());
     CHECK(b.engine->policy_generation() == kG);
     CHECK(b.engine->arm_failure_count() == failures_before + 1); // the clean push added none
@@ -1561,7 +1562,8 @@ TEST_CASE("GuardianEngine #5513: get_status keeps the internal persisted generat
     CHECK(b.engine->policy_generation() == 0);
     CHECK(b.engine->get_status().policy_generation() == kG);
 
-    REQUIRE(b.engine->apply_rules(push_at(kG, two_registry_rules(), /*full_sync=*/true)).has_value());
+    REQUIRE(b.engine->apply_rules(push_at(kG, two_registry_rules(), /*full_sync=*/true))
+                .has_value());
     CHECK_FALSE(b.engine->boot_rearm_unresolved());
     CHECK(b.engine->policy_generation() == kG);
     CHECK(b.engine->get_status().policy_generation() == kG);
@@ -1570,10 +1572,13 @@ TEST_CASE("GuardianEngine #5513: get_status keeps the internal persisted generat
 TEST_CASE("GuardianEngine #5513: the push_rules reply text reports the persisted generation "
           "once the catch-up clears the flag",
           "[guardian][engine][boot_rearm][dispatch]") {
-    // The reply is built from the REPORTED generation. On the legacy path a push that returns
-    // success is always a clean application, which has already cleared the flag, so the
-    // "generation=0 while unresolved" reply text is reachable only on the dormant Spark Accepted
-    // path and is asserted there (test_guardian_engine_spark_reconcile.cpp). Here: the catch-up's
+    // The reply is built from the REPORTED generation. A push that returns success is not
+    // always a clean application: apply_rules counts a rule whose reconcile_rule_locked throws
+    // into reconcile_failures, still returns success, leaves the flag set, and the reply can
+    // then read generation=0 on the legacy path too. No deterministic legacy seam makes that
+    // throw at apply time (the re-arm fault hook fires only in start_local()), so that case is
+    // not pinned here; the Spark Accepted path is asserted in
+    // test_guardian_engine_spark_reconcile.cpp. Here: the catch-up applies cleanly, so its
     // reply names kG, not 0. Space-anchored like the dispatch test above.
     constexpr std::uint64_t kG = 42;
     yuzu::test::TempDbFile db{unique_kv_path()};
@@ -1684,9 +1689,9 @@ TEST_CASE("GuardianEngine #5513: a catch-up that removes or disables the failed 
     SECTION("the full_sync push carries the rule disabled") {
         // A disabled r1 is withdrawn from both backends and never armed.
         REQUIRE(b.engine
-                    ->apply_rules(push_at(kG,
-                                          {GuardianFixture::make_rule("r1", "r1", /*enabled=*/false)},
-                                          /*full_sync=*/true))
+                    ->apply_rules(push_at(
+                        kG, {GuardianFixture::make_rule("r1", "r1", /*enabled=*/false)},
+                        /*full_sync=*/true))
                     .has_value());
         CHECK(b.engine->rule_count() == 1);
         CHECK(b.engine->armed_guard_count() == 0); // trivially true, as in the section above
@@ -1749,6 +1754,10 @@ TEST_CASE("GuardianEngine #5513: a non-std::exception throw at boot is contained
     CHECK(b.engine->policy_generation() == 0);
     CHECK(b.engine->arm_failure_count() == failures_before + 1);
     CHECK(b.engine->rule_count() == 3);
+    // The degrade message names the throwing rule, like the std::exception arm's.
+    const std::string degrade_msg = b.engine->last_rearm_degrade_message_for_test();
+    CHECK(degrade_msg.find("r2") != std::string::npos);
+    CHECK(degrade_msg.find("non-standard exception") != std::string::npos);
     // Legacy service guards arm only where a system bus is reachable (the existing
     // service-rule tests SKIP otherwise). Where they do, exactly the two rules whose
     // re-arm did not throw are armed and the poisoned one is not. On a host without a

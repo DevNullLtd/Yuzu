@@ -240,7 +240,8 @@ TEST_CASE("every documented Guardian heartbeat tag is one the emitter actually e
     // #5513: it now has one (emit_guardian_generation_heartbeat_tags, the heartbeat's own
     // call), so union it with unresolved=true: that also puts the sparse companion
     // yuzu.guardian_boot_rearm_unresolved in the emitted set, since metrics.md documents it.
-    emit_guardian_generation_heartbeat_tags(emitted, /*reported=*/0, /*boot_rearm_unresolved=*/true);
+    emit_guardian_generation_heartbeat_tags(emitted, /*reported=*/0,
+                                            /*boot_rearm_unresolved=*/true);
     REQUIRE(emitted.size() > 10); // the emitters really did populate
 
     std::ifstream in(doc);
@@ -295,5 +296,6 @@ TEST_CASE("generation heartbeat emitter: never-pushed (0, resolved) stays distin
     std::map<std::string, std::string> tags;
     emit_guardian_generation_heartbeat_tags(tags, /*reported=*/0, /*boot_rearm_unresolved=*/false);
     CHECK(tags.at("yuzu.guardian_generation") == "0");
-    CHECK(tags.count(kGuardianBootRearmUnresolvedTag) == 0); // keyed on the flag, not on reported==0
+    // keyed on the flag, not on reported==0
+    CHECK(tags.count(kGuardianBootRearmUnresolvedTag) == 0);
 }

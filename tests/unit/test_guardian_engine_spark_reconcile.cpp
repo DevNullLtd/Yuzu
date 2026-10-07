@@ -34,6 +34,7 @@
 #include <algorithm>
 #include <chrono>
 #include <csignal>
+#include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -971,7 +972,7 @@ TEST_CASE("start_local degrades per-rule when a re-arm throws: the other cached 
           "[spark][guardian][reconcile][boot]") {
     // #2238 item 1 (fixes BLOCKING-2a): guardian_engine.cpp's start_local() catches a
     // std::system_error thrown while re-arming a single cached rule (modelling a legacy
-    // guard's std::thread ctor throwing under thread/handle exhaustion) and continues to
+    // guard's std::thread ctor throwing under thread-creation failure) and continues to
     // the next rule instead of letting the throw escape and terminate the agent. Nothing
     // in production can force that throw deterministically (see the handover's survey of
     // guard_systemd.cpp / guard_file.cpp / guard_registry.cpp), so this drives it via
@@ -1146,7 +1147,8 @@ struct BootRig5513 {
             spark_engine = std::make_unique<SparkEngine>();
             auto mech = std::make_unique<FakeServiceMechanism>();
             mechanism = mech.get();
-            REQUIRE(spark_engine->register_mechanism(SparkType::Service, std::move(mech)).has_value());
+            REQUIRE(spark_engine->register_mechanism(SparkType::Service, std::move(mech))
+                        .has_value());
             if (with_registry_sibling) {
                 auto sib = std::make_unique<FakeServiceMechanism>();
                 sibling_mechanism = sib.get();
@@ -1180,15 +1182,18 @@ struct BootRig5513 {
 
     /// Releases every gate FIRST (a parked worker would otherwise outlive the engine that owns
     /// its claim), waits (bounded) for the released worker to finish, then tears down in the
-    /// fixture's order: engine, then SparkEngine, then KV. The wait is a non-throwing, event-driven
-    /// poll (no REQUIRE/CHECK, nothing that can throw): shutdown() also runs from the destructor,
-    /// possibly during unwind. On timeout it proceeds to the teardown anyway, which is the
-    /// previous behaviour.
+    /// fixture's order: engine, then SparkEngine, then KV. The wait is an event-driven poll with
+    /// no REQUIRE/CHECK (REQUIRE throws, and shutdown() also runs from the destructor, possibly
+    /// during unwind); a timeout is reported on stderr, then teardown proceeds.
     void shutdown() {
         release_gates();
-        if (engine)
-            (void)yuzu::test::spin_until([&] { return engine->active_io_workers() == 0; },
-                                         std::chrono::seconds{10});
+        if (engine &&
+            !yuzu::test::spin_until([&] { return engine->active_io_workers() == 0; },
+                                    std::chrono::seconds{10})) {
+            std::fprintf(stderr,
+                         "BootRig5513::shutdown: workers still alive after the bounded wait; "
+                         "proceeding with teardown anyway\n");
+        }
         engine.reset();
         if (spark_engine)
             spark_engine->stop();
@@ -1236,8 +1241,9 @@ struct BootRig5513 {
 
     /// Phase 1: a throwaway incarnation that persists `rules` at `generation`, settles, and shuts
     /// down. Leaves the KV holding the rules and the acknowledged generation.
-    void seed(bool prefer_spark, bool with_spark, const std::vector<gpb::GuaranteedStateRule>& rules,
-              std::uint64_t generation, bool with_registry_sibling = false) {
+    void seed(bool prefer_spark, bool with_spark,
+              const std::vector<gpb::GuaranteedStateRule>& rules, std::uint64_t generation,
+              bool with_registry_sibling = false) {
         construct(prefer_spark, with_spark, with_registry_sibling);
         if (with_spark)
             wire();
@@ -1322,7 +1328,7 @@ TEST_CASE("#5513 live (prefer_spark=false): a catch-up push the KV refuses leave
     // Failed; the fault hook fires only in start_local()), so the catch-up is made to fail by a
     // real KV write failure instead: the rule persist is refused, apply_rules() returns the
     // error, and the flag must stay set on every refused attempt. Mutation: clearing the flag
-    // before the persist (or on any push, not on a clean application) reports kGen5513 here.
+    // before the persist reports kGen5513 here.
     BootRig5513 r;
     r.seed(/*prefer_spark=*/false, /*with_spark=*/false, {make_file_rule("r1")}, kGen5513);
 
@@ -1897,7 +1903,8 @@ TEST_CASE("#5513 dormant (prefer_spark=true): a post-boot held push never report
     f.mechanism->set_park_all_watches();
     REQUIRE(dispatch(kGen5513 + 1).exit_code == 0);
     REQUIRE(yuzu::test::spin_until([&] { return f.mechanism->parked_watch_count() == 1; }));
-    CHECK(f.engine->policy_generation() == kGen5513); // held: the next generation is not acknowledged
+    // held: the next generation is not acknowledged
+    CHECK(f.engine->policy_generation() == kGen5513);
     f.mechanism->set_late_watch_outcome(FakeServiceMechanism::LateWatchOutcome::Refuse);
     f.mechanism->release_park_all();
     REQUIRE(yuzu::test::spin_until([&] {

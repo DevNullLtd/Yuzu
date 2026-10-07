@@ -1205,18 +1205,19 @@ flip, with a red-first test each:
     and `[boot_rearm]` tests in `test_guardian_engine.cpp`,
     `test_guardian_engine_spark_reconcile.cpp` (its `wire_first` fixture flag and
     `BootRig5513` run the production boot order) and `test_guardian_journal_heartbeat.cpp`,
-    plus the server case in `test_heartbeat_ingestion.cpp`. The new tests are
-    single-threaded, so the TSan runs were clean but exercise no cross-thread interleaving
-    of the new state; that is not evidence for it. Linux, Windows (MSVC) and macOS runs and
-    the mutation checks were done on the pre-rebase tree; their re-run on the final tree is
-    recorded in the PR. Detection today has three routes and no per-agent metric: the
-    agent log WARN (`N cached rule(s) failed to re-arm at boot`), repeated
-    `guaranteed_state.reconcile` audit rows reading `generation 0 -> N` for one agent id,
-    and the fleet-wide `yuzu_server_guardian_reconciles_total{result="sent"}` rate.
-    Fleet-wide detection of the tag and the alert decision are #5558. A persistently
-    failing rule is re-pushed about every 25-30 s per agent, one audit row per push, with
-    no back-off (#5504 holds the measurement and FU-13, the back-off design). Residuals:
-    a legacy guard that returns false at arm (`ReconcileOutcome::Inert`) is the boot-path
+    plus the server case in `test_heartbeat_ingestion.cpp`. The `[5513]` tests passed on
+    Linux (also under a TSan build, which exercises no cross-thread interleaving of the new
+    state, because the new tests drive the engine from a single thread, parked
+    fake-mechanism workers aside), Windows (MSVC) and macOS, and the mutation
+    checks were run when the tests were written. Detection today has three routes and no
+    per-agent metric: the agent log WARN (`N cached rule(s) failed to re-arm at boot`),
+    repeated `guaranteed_state.reconcile` audit rows reading `generation 0 -> N` for one
+    agent id, and the fleet-wide `yuzu_server_guardian_reconciles_total{result="sent"}`
+    rate. Fleet-wide detection of the tag and the alert decision are #5558. A persistently
+    failing rule is re-pushed about every 25-30 s per agent at the default 30 s heartbeat,
+    one audit row per push, with no back-off (the back-off decision in #5504 would also
+    cover this loop). Residuals: a legacy guard that returns false at arm
+    (`ReconcileOutcome::Inert`) is the boot-path
     analogue of #2797's `apply_rules` defect and is not covered, a server whose current
     generation is 0 does not push, and the catch-up applies only where a legacy guard
     actually arms (Windows; Linux with libsystemd and a reachable system bus, Service

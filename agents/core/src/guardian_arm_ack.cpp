@@ -208,8 +208,8 @@ std::size_t GuardianArmAckLedger::drain_locked(GuardianSparkRuntime& runtime,
         case GuardianSparkRuntime::RecoveryStatus::Recovered:
             // Clears THIS application's own resolved_failed contribution only -
             // never failed_out/arm_failures_, which is a cumulative counter (read only by
-            // tests today, not fleet-visible, #4062) and must never decrement (this file's own header
-            // treats "how many arm failures have ever happened" and "can the
+            // tests today, not fleet-visible, #4062) and must never decrement (this file's own
+            // header treats "how many arm failures have ever happened" and "can the
             // CURRENT application's generation advance" as distinct questions;
             // only the latter recovers here).
             if (current_->resolved_failed > 0)

@@ -484,15 +484,16 @@ public:
     [[nodiscard]] std::map<SparkType, std::uint64_t> unsupported_counts_by_type() const;
 
     /// The policy generation REPORTED to the server (the heartbeat's yuzu.guardian_generation
-    /// tag, via generation_report() below, and the `__guard__ push_rules` reply text). Reads 0 while a boot
-    /// re-arm is unresolved (boot_rearm_unresolved(), #5513): a boot re-arm that failed at an
-    /// already-acknowledged generation would otherwise leave the agent reporting that generation
-    /// while the rule is not armed, and the server's heartbeat reconcile only pushes while the
-    /// reported value is BEHIND its current. Only the INTERNAL value (policy_generation_, the
-    /// one persisted under kKeyGen) is monotonically increasing and bumped on a successful
-    /// apply_rules call; this REPORTED value is not monotonic by design (it drops to 0 on an
-    /// unresolved boot re-arm and returns to the internal value when a clean application
-    /// clears it). Persisted across restarts is the internal value only.
+    /// tag, via generation_report() below, and the `__guard__ push_rules` reply text). Reads 0
+    /// while a boot re-arm is unresolved (boot_rearm_unresolved(), #5513): a boot re-arm that
+    /// failed at an already-acknowledged generation would otherwise leave the agent reporting
+    /// that generation while the rule is not armed, and the server's heartbeat reconcile only
+    /// pushes while the reported value is BEHIND its current. Only the INTERNAL value
+    /// (policy_generation_, the one persisted under kKeyGen) is monotonically increasing and
+    /// bumped on a successful apply_rules call; this REPORTED value is not monotonic by
+    /// design (it drops to 0 on an unresolved boot re-arm and returns to the internal value
+    /// when a clean application clears it). Persisted across restarts is the internal value
+    /// only.
     std::uint64_t policy_generation() const;
 
     /// The reported generation and the boot-re-arm flag read under ONE mtx_ acquisition, so a
@@ -873,7 +874,9 @@ private:
     /// failure never reports 0. Under mtx_, no atomics.
     bool boot_app_open_{false};
     std::size_t rule_count_{0};
-    std::atomic<std::uint64_t> arm_failures_{0}; ///< reconcile-throw count (item 3 / Sol B1)
+    /// Cumulative arm-failure count (item 3 / Sol B1): reconcile throws, boot-walk failures and
+    /// drained async arm failures. Not fleet-visible (#4062).
+    std::atomic<std::uint64_t> arm_failures_{0};
 
     /// #5513: the ONE place a boot re-arm failure is recorded, shared by start_local's
     /// returned-Failed arm and both catch arms. mtx_ held. noexcept and allocation-free: it
