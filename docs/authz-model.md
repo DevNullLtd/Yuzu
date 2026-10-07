@@ -127,7 +127,7 @@ live consequence and one forward-wired one**, which the fix below deliberately c
 - **Live (the exploit #1788 actually closes):** a **service-scoped token** reaches this route because
   `require_permission` admits it via the `ITServiceOwner` role's `Execution:Execute` grant —
   independent of the minting principal's own grants (`auth_routes.cpp`
-  `check_role_has_permission("ITServiceOwner", …)`). So before this fix the token dispatched to the
+  `RbacStore::role_permission_allowed_checked("ITServiceOwner", …)` via `authz::service_ceiling_check`). So before this fix the token dispatched to the
   whole fleet through any arm, most directly by naming a foreign-service device in `agent_ids`,
   ignoring the very confinement `require_scoped_permission` enforces per-target on the non-generic
   paths. (Separately, because the minter *may* also hold a global `Execution:Execute` grant, the

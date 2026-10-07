@@ -212,6 +212,8 @@ HTTP status codes follow standard conventions: `200` for success, `201` for reso
 | `permission` | on permission denials | The `"SecurableType:Operation"` the caller was denied (e.g. `"Tag:Write"`) — the §A4 *kPermissionDenied* specialisation. Absent on whole-route admin gates that are not tied to a single securable, and absent on most service-scoped-token confinement denials even where the route IS tied to one — the caller is denied regardless of grant, so naming one would be a false self-remediation claim (`docs/adr/1006-service-scope-default-deny.md`). One documented exception: a confinement denial that fires *after* the route's own permission gate already confirmed the caller holds that exact grant still names it — there `.permission` is informational, not a remediation hint (`.claude/routed-concerns-access-control.md`, "Service-scoped API token confinement" clause 5(a)). `GET /api/v1/inventory/software` no longer illustrates this — its after-gate deny was retired (#3290, provably dead: it fired after `perm_fn`, and the route migrated onto `require_fleet_read` entirely). No live example currently exists: an exhaustive check of every remaining `deny_fleet_wide_service_scoped` call site (20 in `rest_api_v1.cpp`, 5 in `mcp_server.cpp` as of #3290 Phase 2 bucket 1a) found none currently match this exception's shape (`.claude/routed-concerns-access-control.md`, "Service-scoped API token confinement" clause 5) — `deny_service_scoped_schedule` and the one MCP site that did fire after its gate (`get_dex_group_app_perf`) were retired outright, not left as non-matching candidates. The exception clause still governs the next one that appears. |
 | `approval_id` + `status_url` | reserved | The §A4 *kApprovalRequired* specialisation. Reserved for the Phase-2 approval re-dispatch flow; not populated by current denials (an approval-gated operation is denied with `permission` + `remediation` today, because no pollable approval exists yet). `status_url` points at `GET /api/v1/approvals/{id}`. |
 
+**Service-scoped API tokens and `503`.** A service-scoped API token is checked against the `ITServiceOwner` role's permissions (its authority ceiling). On a route that can succeed on a retry, meaning one gated through the fleet-read gate or the scoped-permission gate, a token whose ceiling cannot be read (the permission store is degraded) receives `503` with `retry_after_ms` `5000` and no `permission` field: an outage is not a missing grant, and the request is still refused. On a route behind the plain permission gate a service-scoped token is refused by the default-deny allow-list whatever the ceiling read returns, so no retry hint is given there. A definitive deny, such as the role not holding the permission, is `403` on every gate.
+
 The R2 A4 completion (2026-07) routed the RBAC/tier denial gates (`require_admin`, `require_permission`, and the service-scope denials in the auth layer) and the ~156 legacy `error_json` sites in `rest_api_v1.cpp` through this one envelope. The #1552 sweep PR-1 (2026-09) converted 8 more route files — `auth_routes.cpp` (including its MFA-flow branches), `workflow_routes.cpp`, `webhook_routes.cpp`, `settings_routes.cpp`, `file_retrieval_routes.cpp`, `viz_routes.cpp`, `offload_routes.cpp`, and `sle_routes.cpp` (audited, already compliant via its own local builder) — so it does **not** yet cover literally every path, but the remaining gap is now precisely enumerated rather than open-ended: 7 more route files (`compliance_routes.cpp`, `discovery_routes.cpp`, `command_routes.cpp`, `dashboard_api_routes.cpp`, `notification_routes.cpp`, `schedule_routes.cpp`, `nvd_routes.cpp`, tracked as #1552's PR-2), roughly 86 hand-rolled sites still inline in `server.cpp` itself (not yet decomposed into a `*_routes.cpp` file), and the pre-routing chokepoint's own "no session" 401 (`server.cpp`, `{"error":{"code","message"},"meta"}` with no `correlation_id` — every unauthenticated `/api/v1/*` request hits this before any route's own A4 gate runs; tracked as #2003). Automation crossing surfaces should treat the enrichment fields as present-when-available until all three close.
 
 **Per-principal quota cap (PR 4.4, ADR-1005 class engine principals).** REST traffic from an **engine principal** session (`principal_kind=="engine"`, username `engine:<slug>`) is subject to a per-principal cap enforced at the server's single pre-routing chokepoint — before the request reaches any route handler. Two independent dimensions are checked: an in-flight **concurrency** cap and a per-principal token-bucket **rate** cap (see `docs/user-manual/engine-principals.md` for the operator-facing tuning guide). Exhausting either dimension returns `429` with the standard A4 envelope plus an HTTP `Retry-After` header (whole seconds, rounded up from `retry_after_ms`):
@@ -1769,7 +1771,10 @@ list entirely, not merely hidden from write access.
 > omitting the affected record(s). Only the first cause increments
 > `yuzu_server_quarantine_read_degrade_total` — see
 > `docs/user-manual/upgrading.md` and `docs/user-manual/metrics.md` for the
-> full distinction.
+> full distinction. For a service-scoped API token whose `ITServiceOwner`
+> ceiling cannot be read, the per-record `Security:Read` probe answers `503`,
+> so the whole list fails with `503` rather than silently omitting the
+> record.
 
 **Response:**
 
@@ -5612,7 +5617,7 @@ Audited (`enrollment.auto_approve.view`, non-blocking) — the rule set is auto-
 
 #### `GET /api/v1/enrollment/pending-agents`
 
-**Permission:** `Enrollment:Read` (Administrator only in the default seed)
+**Permission:** `Enrollment:Read` (Administrator only in the default seed). A service-scoped API token is refused `403` (`service-scoped token does not grant Enrollment:Read (the ITServiceOwner role does not hold it)`, no `permission` field), whoever minted it, because the `ITServiceOwner` role does not hold `Enrollment:Read`; use an Administrator-minted non-service token. If the read of the `ITServiceOwner` role itself fails, the route answers a retryable `503` (`retry_after_ms` 5000) instead.
 
 Do not conflate with the unrelated existing MCP tool `list_pending_approvals`, which serves `ApprovalManager`'s maker-checker action-approval queue — a different domain entirely. Audited (`enrollment.pending_agents.view`, non-blocking) — device-identity fingerprint data, a lighter version of the `device_ci` GDPR-personal-data-adjacent class the agent daily-sync framework already flags for serial/UUID/MAC.
 
@@ -6744,7 +6749,7 @@ Results carry a **per-agent scope drop filter** — the `require_fleet_read` gat
 | 400 | `limit` is not a valid integer |
 | 401 | Unauthenticated |
 | 403 | No management-group grant for `Inventory:Read`; or a service-scoped token whose RBAC/ITServiceOwner grant is missing, or whose RBAC enforcement is disabled fleet-wide (a service-scoped token always hard-denies when RBAC is off) |
-| 503 | The gate's own RBAC/tag-store lookup is unavailable or degraded, the software inventory store is unavailable or degraded, or the `require_fleet_read` gate itself is unwired (server misconfiguration) — all A4 envelope with `correlation_id`, `retry_after_ms: 5000` where retryable — **never an empty 200** |
+| 503 | The gate's own RBAC/tag-store lookup is unavailable or degraded (including a failed read of the `ITServiceOwner` ceiling for a service-scoped token), the software inventory store is unavailable or degraded, or the `require_fleet_read` gate itself is unwired (server misconfiguration) — all A4 envelope with `correlation_id`, `retry_after_ms: 5000` where retryable — **never an empty 200** |
 
 On a `503` the store (or the confinement check itself) could not be read; do **not** treat it as "not installed anywhere" (ADR-0016 §7 authoritative reads). A genuine empty result is `200` with `count: 0`.
 
@@ -8192,7 +8197,9 @@ SHA-256 digest.
 
 List upload grants. **Permission:** `UploadGrant:Read`, routed through
 `RbacStore::authorize_list_read` (admit-then-filter — never a bare global
-permission check).
+permission check). A service-scoped API token is refused `403` before any grant is
+read (`service-scoped tokens may not list upload grants`, no `permission` field, audit
+`upload_grant.list.access_denied`), whoever minted it; list with a non-service token.
 
 #### `DELETE /api/v1/upload-grants/{grant_id}`
 

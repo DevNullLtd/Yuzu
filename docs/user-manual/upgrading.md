@@ -273,6 +273,102 @@ Only case (e) means the key files are gone. Nothing inside the server can rebuil
   3. This database cannot be brought back by any supported means. Every start checks each registered KEK and refuses. The one-shot modes `--mfa-reset` and `--break-glass-arm` run after that check, so they stop with the same `kek_unresolvable` error. What is gone: the CA private key, so every agent certificate it issued no longer chains and every agent must enroll again; and every secret sealed under the KEK, including TOTP enrolments, webhook signing secrets and the other secret columns listed in `docs/user-manual/server-admin.md` "Key management (secrets KEK)". Passwords and API tokens are hashed, not sealed, but they live in the same database.
   4. Start a new install. With the bundled Postgres, `docker compose down -v` deletes the Postgres volume along with the others. `down -v` does not reset an external Postgres: that database still registers the lost KEK, so a new install against it fails the same way. Give the new install a new, empty database. Then provision the admin account again, re-enroll your agents, and re-create your configuration.
 
+## Behaviour change: service-scoped tokens, the `ITServiceOwner` ceiling on the fleet-read gate, and `GET /api/v1/upload-grants` (#3526)
+
+Two chokepoints let a service-scoped API token reach more than the `ITServiceOwner` role allows (found
+in a review of the fleet-read gate, #3526). Both now refuse it. This is a tightening for service-scoped tokens only;
+non-service callers, elevated sessions and engine principals are unaffected.
+
+**Breaking for service-scoped tokens, 1: `GET /api/v1/enrollment/pending-agents` now answers `403`.**
+The management-group-aware fleet-read gate (`require_fleet_read`, ADR-0017) did not apply the
+`ITServiceOwner` authority ceiling that `require_permission` applies to a service-scoped token. It now
+does, through one shared helper (`authz::service_ceiling_check`): the token is refused (`403`,
+"service-scoped token does not grant <securable>:<operation> (the ITServiceOwner role does not hold
+it)", no `permission` field, audit `auth.fleet_read_required` / `denied`) unless that role itself holds
+the pair, whatever its minter holds. `ITServiceOwner` does not hold `Enrollment:Read`, so a
+service-scoped token that used to receive a pending-agent view narrowed to its tagged agents now gets
+the `403`. **Remediation:** `Enrollment:Read` is intentionally NOT granted to `ITServiceOwner`; use an
+Administrator-minted non-service token for that route. The cost is that this replaces a confined
+credential with an Administrator-grade one, and there is no narrower option today: `Enrollment:Read` is
+Administrator-only by default and custom-role authoring is not reachable through REST, MCP or the
+dashboard yet.
+
+**Breaking for service-scoped tokens, 2: `GET /api/v1/upload-grants` now answers `403`.** The route's
+only gate evaluated the minter's username, so a service-scoped token inherited its minter's
+`UploadGrant:Read` view (every grant, for a minter holding a global grant). It is now refused before any
+grant is read (`403`, "service-scoped tokens may not list upload grants", no `permission` field, audit
+`upload_grant.list.access_denied`). The MCP tool `list_upload_grants` already refused a service-scoped
+token. **Remediation:** list grants with a non-service token. Non-service sessions are unchanged.
+
+**The ceiling applies wherever a seeded `ITServiceOwner` permission is absent.** With the seeded
+defaults `ITServiceOwner` holds every other pair the fleet-read routes pass, so nothing else changes
+for `Execution`, `Response`, `Inventory`, `Infrastructure`, `Policy`, `GuaranteedState` and
+`Workflow:Read`. No REST, MCP or CLI surface removes a seeded `ITServiceOwner` permission today, and a
+direct database `DELETE` of the row is re-seeded at the next boot unless the pair is recorded in
+`revoked_seed_defaults`, so a refusal on one of those pairs does not arise in a default deployment; the
+rule is the safeguard for a pair removed through `RbacStore::remove_permission` (which records it) and for
+any future surface that narrows the role.
+
+**Failure behaviour.** A FAILED read of the `ITServiceOwner` role's permissions is a retryable `503`
+(`retry_after_ms` 5000, an audit row with detail "RBAC read degraded resolving the ITServiceOwner
+ceiling", and `yuzu_server_rbac_read_degrade_total` increments) rather than `403`, because an outage
+is not a missing grant; it still fails closed. This holds on the fleet-read gate and equally on
+`require_scoped_permission`, which answered `403` for this failure before this change; only a
+definitive deny is `403`. `require_permission` is different: a service-scoped token is refused there by
+the default-deny allow-list whatever the ceiling read returns, so a retry could not succeed, and a
+failed read answers the same default-deny `403` as a healthy one (no `retry_after_ms`, no
+`yuzu_server_rbac_read_degrade_total` increment); only its audit row differs, ending with
+"; ceiling read degraded". The ceiling read goes through the RBAC authz circuit breaker with a 250 ms acquire budget, so a degraded
+store fails quickly and, once the breaker is open, requests are answered without touching the pool; an
+open breaker is counted under the `pool_acquire_timeout` reason. The
+breaker bounds how many requests wait, not how long an already admitted read holds its connection:
+such a read can still wait up to the pool's `lock_timeout` (10 s default) or `statement_timeout`
+(30 s default). On a dark network path (no reply at all) the wait is bounded instead by the pool's
+`tcp_user_timeout` (10 s), which is confirmed on Linux, unconfirmed on Windows and a no-op on macOS, and
+until two failures have returned, up to the pool size (16 by default, `--postgres-pool-size`) of these
+reads can each hold a connection for that long. The breaker is the one operator permission checks use,
+so ceiling-read failures can open it and an open breaker denies operators' cache-miss checks too (fail
+closed). The breaker counts consecutive failures and any successful authz read, a ceiling read
+included, resets the count, so a partial fault that lets the `role_permissions` read succeed while
+other authz reads fail can delay the breaker opening for operators' cache-miss checks.
+
+**New alert: `YuzuRbacBreakerOpen` (critical).** `docs/prometheus/yuzu-alerts.yml` now ships a per-replica
+alert that fires when `yuzu_server_rbac_breaker_open` has stayed at `1` on a replica for 5 minutes. It
+means authorization reads on that replica keep failing. While the breaker is open the replica refuses
+(fail closed) the operator permission checks that miss its permission cache and sheds service-token
+ceiling reads; cached decisions keep being served for at most about 5 seconds.
+A breaker that closes again within 5 minutes does not page. Load the updated rule file if you maintain
+your own copy of the shipped alerts.
+
+**List-read A4 body.** The A4 body of a service-scoped token's `403` from the list-read gate no longer carries a `permission` field; clients should not read it.
+
+**The sibling gates changed their budget.** `require_permission` and `require_scoped_permission` now
+read the ceiling with the 250 ms authz acquire budget behind that shared breaker. Before, they acquired
+with the 2000 ms `kReadTimeout` and were not breaker-gated, but the pool clamps a bounded acquire to
+500 ms when it is already saturated at entry (`PgPool` `saturated_fast_fail`), so on a saturated pool the
+wait was up to about 500 ms, not 2 s (a pool that saturated only after the call entered it was bounded
+by the full 2 s). The change lowers that bound to 250 ms and, once the breaker is open, answers the
+request without a pool touch.
+
+**Rollback.** Downgrading the binary restores the previous behaviour for all of the above. The change
+adds no schema and persists no state.
+
+To find affected callers, search the audit log for `action=auth.fleet_read_required` with
+`result=denied` and a detail containing "ITServiceOwner permission" (definitive deny, `403`) versus
+"RBAC read degraded" (store fault, `503`), for the sibling gate `action=auth.scoped_permission_required`
+with the same two details ("lacks ITServiceOwner permission" for the `403`, "RBAC read degraded" for
+the `503`), and for `action=upload_grant.list.access_denied`. `action=auth.permission_required` never
+carries the "RBAC read degraded" detail: a service token on a route behind the plain permission gate is
+refused by the default-deny allow-list ("default-deny", `403`) whatever the ceiling read returns, and
+during an outage of the `ITServiceOwner` read that row ends with "ceiling read degraded" (a healthy
+default-deny row does not), so rows from `require_permission` routes with that ending mark the outage. For
+`Execution:Read` the affected routes are the executions drawer's
+`/fragments/executions/{id}/detail` fragment, the legacy `GET /api/executions*` routes,
+`GET /api/v1/executions` with its `/{id}`, `/children` and `/api/v1/events` twins, and the MCP tools on
+that gate that service tokens can reach at all. `POST /api/executions/{id}/rerun` and `/cancel` are not
+affected: a service-scoped token is already refused at their first gate, `Execution:Execute`.
+`kServiceScopeGlobalSafe` is not widened.
+
 ## Behaviour change: vuln_scan reports an unreadable config check as UNREADABLE and adds a summary row (#4961)
 
 On Linux, `vuln_scan` (`scan`, `config_scan`) now reports a config file it could not read (`/proc/sys/kernel/randomize_va_space`, `/proc/sys/fs/suid_dumpable`, `/etc/ssh/sshd_config`, `/proc/mounts`) as `UNREADABLE|config|<title>|<path>: <cause>` instead of a HIGH/MEDIUM finding. `summary` always emits a seventh row, `summary|UNREADABLE|<n>`, and an absent `sshd_config` reads INFO "not applicable" with the SSH password row now emitted.
@@ -2098,7 +2194,16 @@ a rollback is genuinely needed.
   probe succeeds (the next attempt after its ~1 s cooldown), it closes
   again automatically and normal service resumes. Watch
   `yuzu_server_rbac_breaker_open` (gauge) and
-  `yuzu_server_rbac_authz_check_seconds` (histogram) after upgrade.
+  `yuzu_server_rbac_authz_check_seconds` (histogram) after upgrade. A
+  companion alert, `YuzuRbacBreakerOpen` (`docs/prometheus/yuzu-alerts.yml`), is
+  added in the current release, not this one: see "Behaviour change:
+  service-scoped tokens, the `ITServiceOwner` ceiling on the fleet-read gate, and
+  `GET /api/v1/upload-grants`" above. It fires, per replica, when the gauge stays
+  at `1` for 5 minutes, and complements `YuzuRbacReadDegraded`, which is a rate
+  summed across replicas by reason.
+  The gauge changes only when an authorization read reports its outcome, so a
+  replica that receives no authorization checks keeps its last value after the
+  database recovers.
 - **If you alert on the raw `generation_refresh_failed` reason label,
   re-baseline after upgrade.** This release splits what was previously a
   single reason into two: `generation_refresh_failed` (still denying —

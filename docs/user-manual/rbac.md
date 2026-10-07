@@ -186,6 +186,46 @@ Recommended order for a fresh install:
 > show zero rows after an upgrade or restart, check for `RbacStore` open/migrate
 > errors first.)
 >
+> **Service-scoped tokens and `ITServiceOwner` (the fleet-read authority ceiling; found while working #3526).**
+> Every fleet-read route applies the `ITServiceOwner` authority ceiling to a service-scoped token, the check
+> `require_permission` already made: the token is refused unless that role itself holds the pair, whatever its
+> minter holds. Non-service callers are unaffected. Effects today:
+>
+> 1. **Breaking:** `ITServiceOwner` does not hold `Enrollment:Read`, so a service-scoped token is refused with
+>    `403` on `GET /api/v1/enrollment/pending-agents` (it used to receive a view narrowed to its tagged agents).
+>    Use an Administrator-minted non-service token for that route. This replaces a confined credential with an
+>    Administrator-grade one, and there is no narrower option today: `Enrollment:Read` is Administrator-only by
+>    default and custom-role authoring is not reachable through REST, MCP or the dashboard yet (see "Custom Roles"
+>    below).
+> 2. **Breaking:** `GET /api/v1/upload-grants` refuses a service-scoped token with `403` (no `permission`
+>    field); it used to return the minter's `UploadGrant:Read` view. Same remedy: list with a non-service token.
+> 3. The ceiling applies wherever a seeded `ITServiceOwner` permission is absent. No REST, MCP or CLI surface
+>    removes a seeded `ITServiceOwner` permission today (narrowing a seeded role's permission set is planned,
+>    see "Custom Roles" below). A direct database `DELETE` of the row is re-seeded at the next boot unless the
+>    pair is recorded in `revoked_seed_defaults`, so a refusal on one of those pairs arises only for a pair
+>    removed through `RbacStore::remove_permission` (which records it) or recorded there by hand; the rule is
+>    the safeguard for that case and for a future authoring surface.
+>
+> A definitive deny is `403`; a FAILED read of the `ITServiceOwner` role's permissions is a
+> retryable `503` (`retry_after_ms` 5000) on the fleet-read gate and on `require_scoped_permission`
+> (an outage is not a missing grant, and the request is still refused). On a route behind the plain
+> permission gate (`require_permission`) a service-scoped token is refused by the default-deny
+> allow-list whatever the ceiling read returns, so a failed read there answers the same `403` as a
+> healthy one, with no retry hint. The ceiling read goes through the
+> RBAC authz circuit breaker with a 250 ms acquire budget, so a degraded store answers quickly and, once
+> the breaker is open, without touching the pool (an open breaker is counted under `pool_acquire_timeout`). It is the same breaker operator permission checks use, so
+> repeated ceiling-read failures can open it and an open breaker denies operators' cache-miss checks too
+> (fail closed). The breaker counts consecutive failures and any successful authz read, a ceiling read
+> included, resets the count, so a partial fault that lets the `role_permissions` read succeed while other
+> authz reads fail can delay the breaker opening for operators' cache-miss checks. A read that is already admitted and holds a connection can still wait up to the pool's
+> `lock_timeout` (10 s default) or `statement_timeout` (30 s default). On a dark network path (no reply at all)
+> the wait is bounded instead by the pool's `tcp_user_timeout` (10 s), which is confirmed on Linux, unconfirmed
+> on Windows and a no-op on macOS; and until two failures have returned, up to the pool size (16 by default,
+> `--postgres-pool-size`) of these reads can each hold a connection for that long. One
+> deferred item remains: the `authorize_list_read` supersede-to-intersect migration for the remaining callers
+> is tracked in `docs/security-reviews/service-scope-phase2-migrations-2026-08.md`, so "every fleet-read
+> route" above does not mean every route that lists per-agent data.
+>
 > **Note (#1634):** the per-agent filter on `query_responses`/`aggregate_responses`/the
 > REST visualization+responses endpoints is, under *normal* RBAC operation, currently
 > **inert** — a holder of global `Response:Read` sees all agents' responses;
@@ -228,7 +268,7 @@ admitted; the floor never overrides a live RBAC grant.)
 | `AccessReview:Read` | The fleet-wide access-review grant export (SOC 2 CC6.2 evidence), `GET /api/v1/access-reviews*`, and the lighter-weight live grant-table listing `GET /api/v1/rbac/roles/assignments` (+ MCP `list_rbac_role_assignments`) — same securable, same sensitivity class, not a management-group-confined view |
 | `UserManagement:Read` | `GET /api/v1/rbac/roles` and the rest of the RBAC role graph |
 | `EnginePrincipal:Read` | The engine-principal inventory and grant graph, `GET /api/v1/engine-principals*` and the `list_engine_principals`/`get_engine_principal`/`list_engine_roles` MCP tools |
-| `Enrollment:Read` (#4031) | Auto-approve enrollment rules and pending-agent visibility, `GET /api/v1/enrollment/auto-approve-rules` and `GET /api/v1/enrollment/pending-agents` |
+| `Enrollment:Read` (#4031) | Auto-approve enrollment rules and pending-agent visibility, `GET /api/v1/enrollment/auto-approve-rules` and `GET /api/v1/enrollment/pending-agents` (service-scoped tokens are refused with `403` on both: the `ITServiceOwner` ceiling does not hold this pair) |
 | `OidcConfig:Read` (#4031) | OIDC SSO configuration status, `GET /api/v1/settings/oidc` |
 | `TlsConfig:Read` (#4028) | TLS settings read-twins, `GET /api/v1/settings/tls` and `GET /api/v1/settings/https` |
 | `PluginSigning:Read` (#4028) | Plugin trust-bundle distribution, `GET /api/v2/agent/plugin-policy` (#4144 — there is deliberately no `/api/v1/settings/plugin-signing` route; the v1 predecessor stayed on `require_admin`) |
@@ -271,7 +311,9 @@ non-admin session to reach authorization topology while RBAC is off:
   and grant `Enrollment:Read` — no built-in non-admin role holds it
   (`Administrator` only; unlike `EnginePrincipal`/`Directory`, `Viewer`
   deliberately does not, since these surfaces gate the fleet's enrollment
-  admission policy).
+  admission policy). A service-scoped token is refused (`403`) on these
+  routes whoever minted it, because `ITServiceOwner` does not hold the pair
+  (the authority ceiling); use an Administrator-minted non-service token.
 - For the OIDC SSO config status read: enable RBAC and grant
   `OidcConfig:Read` — `Administrator`-only for the same reason.
 
