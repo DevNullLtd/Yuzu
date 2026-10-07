@@ -80,6 +80,12 @@ inline constexpr double kTiny = 1e-300;
 inline constexpr double kEps = 1e-15;
 inline constexpr int kBisections = 200;
 
+/// Keeps a Lentz continued-fraction term away from zero.
+inline void floor_tiny(double& v) {
+    if (std::fabs(v) < kTiny)
+        v = kTiny;
+}
+
 /// log(Gamma(n)) for n >= 1 (Stirling series after shifting to n >= 15,
 /// ~1e-15 relative). Replaces the C library log-gamma, which is not thread-safe; every
 /// argument in this header is an integer >= 1.
@@ -126,11 +132,9 @@ inline double regularized_gamma_p(double a, double x, int max_iter = kDexStatsMa
         const double an = -static_cast<double>(i) * (static_cast<double>(i) - a);
         b += 2.0;
         d = an * d + b;
-        if (std::fabs(d) < kTiny)
-            d = kTiny;
+        floor_tiny(d);
         c = b + an / c;
-        if (std::fabs(c) < kTiny)
-            c = kTiny;
+        floor_tiny(c);
         d = 1.0 / d;
         const double del = d * c;
         h *= del;
@@ -147,8 +151,7 @@ inline double beta_fraction(double x, double a, double b, int max_iter) {
     const double qam = a - 1.0;
     double c = 1.0;
     double d = 1.0 - qab * x / qap;
-    if (std::fabs(d) < kTiny)
-        d = kTiny;
+    floor_tiny(d);
     d = 1.0 / d;
     double h = d;
     for (int m = 1; m <= max_iter; ++m) {
@@ -156,20 +159,16 @@ inline double beta_fraction(double x, double a, double b, int max_iter) {
         const double m2 = 2.0 * dm;
         double aa = dm * (b - dm) * x / ((qam + m2) * (a + m2));
         d = 1.0 + aa * d;
-        if (std::fabs(d) < kTiny)
-            d = kTiny;
+        floor_tiny(d);
         c = 1.0 + aa / c;
-        if (std::fabs(c) < kTiny)
-            c = kTiny;
+        floor_tiny(c);
         d = 1.0 / d;
         h *= d * c;
         aa = -(a + dm) * (qab + dm) * x / ((a + m2) * (qap + m2));
         d = 1.0 + aa * d;
-        if (std::fabs(d) < kTiny)
-            d = kTiny;
+        floor_tiny(d);
         c = 1.0 + aa / c;
-        if (std::fabs(c) < kTiny)
-            c = kTiny;
+        floor_tiny(c);
         d = 1.0 / d;
         const double del = d * c;
         h *= del;
@@ -283,19 +282,25 @@ inline Bounds wilson_bounds(double p, double n) {
 
 } // namespace detail
 
-/// A proportion with its 95 percent Wilson interval.
-struct DexProportion {
+/// A point estimate with its 95 percent interval, shared by every statistic
+/// here. `estimate` and `reliable` mean what the producing function's comment
+/// says: dex_proportion (proportion; numerator >= kDexStatsReliableMinEvents),
+/// dex_rate (events per unit of exposure; events >= kDexStatsReliableMinEvents),
+/// dex_rate_ratio (rate A over rate B, +infinity when events_b == 0; BOTH arms
+/// >= kDexStatsReliableMinEvents).
+struct DexInterval {
     double estimate;
     double lower;
     double upper;
-    bool reliable; ///< numerator events >= kDexStatsReliableMinEvents
+    bool reliable;
 };
 
-/// events / trials with a Wilson interval. nullopt iff trials <= 0, events < 0
+/// events / trials with a Wilson interval; `estimate` is the proportion and
+/// `reliable` is events >= kDexStatsReliableMinEvents. nullopt iff trials <= 0, events < 0
 /// or events > trials. events == 0 gives lower exactly 0 and events == trials
 /// gives upper exactly 1. `reliable` is about the numerator the caller counts
 /// (for example crashes), not its complement.
-[[nodiscard]] inline std::optional<DexProportion> dex_proportion(std::int64_t events,
+[[nodiscard]] inline std::optional<DexInterval> dex_proportion(std::int64_t events,
                                                                  std::int64_t trials) {
     if (trials <= 0 || events < 0 || events > trials)
         return std::nullopt;
@@ -308,7 +313,7 @@ struct DexProportion {
         b.upper = 1.0;
     if (!std::isfinite(p) || !std::isfinite(b.lower) || !std::isfinite(b.upper))
         return std::nullopt;
-    return DexProportion{p, b.lower, b.upper, events >= kDexStatsReliableMinEvents};
+    return DexInterval{p, b.lower, b.upper, events >= kDexStatsReliableMinEvents};
 }
 
 /// One-sided 95 percent upper bound on the event probability when zero events
@@ -325,18 +330,11 @@ struct DexProportion {
     return std::min(1.0, 3.0 / static_cast<double>(trials));
 }
 
-/// A rate (events per unit of exposure) with its exact Poisson interval.
-struct DexRate {
-    double rate;
-    double lower;
-    double upper;
-    bool reliable; ///< events >= kDexStatsReliableMinEvents
-};
-
-/// events over `exposure` (the caller's unit, device-days for the views); the
-/// result is per unit of that exposure. nullopt iff events < 0 or exposure is
+/// events over `exposure` (the caller's unit, device-days for the views) with
+/// the exact Poisson interval; `estimate` is events per unit of that exposure
+/// and `reliable` is events >= kDexStatsReliableMinEvents. nullopt iff events < 0 or exposure is
 /// non-finite or <= 0, or the rate overflows a double (never infinity).
-[[nodiscard]] inline std::optional<DexRate> dex_rate(std::int64_t events, double exposure) {
+[[nodiscard]] inline std::optional<DexInterval> dex_rate(std::int64_t events, double exposure) {
     if (events < 0 || !std::isfinite(exposure) || exposure <= 0.0)
         return std::nullopt;
     const double k = static_cast<double>(events);
@@ -347,18 +345,11 @@ struct DexRate {
     const double upper = lam.upper / exposure;
     if (!std::isfinite(rate) || !std::isfinite(lower) || !std::isfinite(upper))
         return std::nullopt;
-    return DexRate{rate, lower, upper, events >= kDexStatsReliableMinEvents};
+    return DexInterval{rate, lower, upper, events >= kDexStatsReliableMinEvents};
 }
 
-/// Rate A over rate B with an interval on the ratio.
-struct DexRateRatio {
-    double ratio;
-    double lower;
-    double upper;
-    bool reliable; ///< both arms >= kDexStatsReliableMinEvents events
-};
-
-/// (events_a / exposure_a) / (events_b / exposure_b). Given the total, events_a
+/// (events_a / exposure_a) / (events_b / exposure_b); `estimate` is that ratio
+/// and `reliable` needs BOTH arms >= kDexStatsReliableMinEvents events. Given the total, events_a
 /// is binomial, so the interval is the exact conditional (Clopper-Pearson)
 /// interval mapped onto the ratio; above kDexStatsExactMaxEvents in either arm
 /// the Wilson interval stands in (within 2e-6 relative at 1e6 balanced events).
@@ -367,7 +358,7 @@ struct DexRateRatio {
 /// or a result is not representable. events_b == 0 with events_a > 0 gives
 /// ratio and upper of +infinity (the data are valid; the lower bound is finite).
 /// A reliable == false ratio is printed as indicative, never hidden.
-[[nodiscard]] inline std::optional<DexRateRatio>
+[[nodiscard]] inline std::optional<DexInterval>
 dex_rate_ratio(std::int64_t events_a, double exposure_a, std::int64_t events_b, double exposure_b) {
     constexpr double kInf = std::numeric_limits<double>::infinity();
     if (events_a < 0 || events_b < 0)
@@ -400,40 +391,32 @@ dex_rate_ratio(std::int64_t events_a, double exposure_a, std::int64_t events_b, 
     const double lower = p_lo / (1.0 - p_lo) * scale;
     const double upper = p_hi >= 1.0 ? kInf : p_hi / (1.0 - p_hi) * scale;
     const bool ok = std::isfinite(lower) && (events_b == 0 || (std::isfinite(ratio) && std::isfinite(upper)));
-    if (!ok || std::isnan(ratio) || std::isnan(upper))
+    if (!ok)
         return std::nullopt;
-    return DexRateRatio{ratio, lower, upper,
+    return DexInterval{ratio, lower, upper,
                         events_a >= kDexStatsReliableMinEvents &&
                             events_b >= kDexStatsReliableMinEvents};
 }
 
-/// A proportion that is withheld below the cohort floor; the counts are always
+/// A statistic that is withheld below the cohort floor; the counts are always
 /// carried.
-struct DexFlooredProportion {
+struct DexFloored {
     std::int64_t events;
     std::int64_t devices;
-    std::optional<DexProportion> stats;
+    std::optional<DexInterval> stats;
 };
 
 /// The floor is on the DEVICE population (the same floor every DEX surface
 /// uses), not on exposure: below kDexCohortFloor devices a count is honest and
 /// a proportion singles people out, so only the count is returned.
-[[nodiscard]] inline DexFlooredProportion dex_floored_proportion(std::int64_t events,
+[[nodiscard]] inline DexFloored dex_floored_proportion(std::int64_t events,
                                                                  std::int64_t devices) {
     return {events, devices,
             devices < kDexCohortFloor ? std::nullopt : dex_proportion(events, devices)};
 }
 
-/// A rate that is withheld below the cohort floor; the counts are always
-/// carried.
-struct DexFlooredRate {
-    std::int64_t events;
-    std::int64_t devices;
-    std::optional<DexRate> stats;
-};
-
 /// As dex_floored_proportion: the floor is on devices, not exposure.
-[[nodiscard]] inline DexFlooredRate dex_floored_rate(std::int64_t events, double exposure,
+[[nodiscard]] inline DexFloored dex_floored_rate(std::int64_t events, double exposure,
                                                      std::int64_t devices) {
     return {events, devices,
             devices < kDexCohortFloor ? std::nullopt : dex_rate(events, exposure)};

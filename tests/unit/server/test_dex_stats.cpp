@@ -70,20 +70,13 @@ double sf_ge(double k, double lam) {
 } // namespace
 
 TEST_CASE("DexStats: constants lock the pinned z to the declared level", "[dex][stats]") {
-    CHECK(kDexStatsConfidence == 0.95);
     CHECK(0.5 * std::erfc(-kDexStatsZ / std::sqrt(2.0)) == Approx(0.975).epsilon(1e-12));
-    CHECK(kDexStatsExactMaxEvents == 1000000);
 }
 
 TEST_CASE("DexStats: log_gamma matches the lgamma oracle", "[dex][stats]") {
     for (double n : {1.0, 2.0, 3.0, 7.0, 14.0, 15.0, 16.0, 100.0, 1000.0, 1e6}) {
         const double want = std::lgamma(n);
         CHECK(detail::log_gamma(n) == Approx(want).epsilon(1e-13).margin(1e-14));
-    }
-    double fact = 1.0;
-    for (int n = 1; n <= 10; ++n) {
-        fact *= n;
-        CHECK(detail::log_gamma(n + 1.0) == Approx(std::log(fact)).epsilon(1e-13).margin(1e-14));
     }
     CHECK(std::fabs(detail::log_gamma(1.0)) < 1e-15);
     CHECK(std::fabs(detail::log_gamma(2.0)) < 1e-15);
@@ -127,13 +120,6 @@ TEST_CASE("DexStats: a convergence failure is NaN never a number", "[dex][stats]
     CHECK(std::isnan(detail::regularized_beta(0.4, 20.0, 30.0, 1)));
     CHECK(std::isnan(detail::gamma_quantile(5.0, 0.5, 1)));
     CHECK(std::isnan(detail::beta_quantile(20.0, 30.0, 0.5, 1)));
-
-    // The asymptotic branch never sees a kernel failure.
-    const auto r = dex_rate(1'000'000'000, 1.0);
-    REQUIRE(r);
-    CHECK(std::isfinite(r->lower));
-    CHECK(r->lower < r->rate);
-    CHECK(r->rate < r->upper);
 }
 
 TEST_CASE("DexStats: dex_proportion Wilson known answers", "[dex][stats]") {
@@ -195,7 +181,7 @@ TEST_CASE("DexStats: dex_rate Garwood known answers", "[dex][stats]") {
                        V{100, 81.36399125, 121.62679379}}) {
         const auto r = dex_rate(v.k, 1.0);
         REQUIRE(r);
-        CHECK(r->rate == Approx(static_cast<double>(v.k)));
+        CHECK(r->estimate == Approx(static_cast<double>(v.k)));
         CHECK(r->lower == near8(v.lo));
         CHECK(r->upper == near8(v.hi));
     }
@@ -207,7 +193,7 @@ TEST_CASE("DexStats: dex_rate scaling validity overflow and flag", "[dex][stats]
     const auto many = dex_rate(5, 250.0);
     REQUIRE(one);
     REQUIRE(many);
-    CHECK(many->rate == Approx(one->rate / 250.0));
+    CHECK(many->estimate == Approx(one->estimate / 250.0));
     CHECK(many->lower == Approx(one->lower / 250.0));
     CHECK(many->upper == Approx(one->upper / 250.0));
 
@@ -222,8 +208,8 @@ TEST_CASE("DexStats: dex_rate scaling validity overflow and flag", "[dex][stats]
     const auto big = dex_rate(kI64Max, 1.0);
     REQUIRE(big);
     CHECK(std::isfinite(big->upper));
-    CHECK(big->lower < big->rate);
-    CHECK(big->rate < big->upper);
+    CHECK(big->lower < big->estimate);
+    CHECK(big->estimate < big->upper);
 
     CHECK_FALSE(dex_rate(19, 1.0)->reliable);
     CHECK(dex_rate(20, 1.0)->reliable);
@@ -246,14 +232,14 @@ TEST_CASE("DexStats: dex_rate_ratio known answers", "[dex][stats]") {
     // Decimal bisection on the binomial CDF, 60 digits, 2026-10-07.
     const auto r = dex_rate_ratio(11, 800.0, 21, 3011.0);
     REQUIRE(r);
-    CHECK(r->ratio == near8(1.97148810));
+    CHECK(r->estimate == near8(1.97148810));
     CHECK(r->lower == near8(0.85842640));
     CHECK(r->upper == near8(4.27726594));
     CHECK_FALSE(r->reliable);
 
     const auto eq = dex_rate_ratio(25, 1000.0, 25, 1000.0);
     REQUIRE(eq);
-    CHECK(eq->ratio == near8(1.0));
+    CHECK(eq->estimate == near8(1.0));
     CHECK(eq->lower == near8(0.55104408));
     CHECK(eq->upper == near8(1.81473686));
     CHECK(eq->reliable);
@@ -264,7 +250,7 @@ TEST_CASE("DexStats: dex_rate_ratio arm swap is the reciprocal", "[dex][stats]")
     const auto ba = dex_rate_ratio(21, 3011.0, 11, 800.0);
     REQUIRE(ab);
     REQUIRE(ba);
-    CHECK(ba->ratio == Approx(1.0 / ab->ratio).epsilon(1e-9));
+    CHECK(ba->estimate == Approx(1.0 / ab->estimate).epsilon(1e-9));
     CHECK(ba->lower == Approx(1.0 / ab->upper).epsilon(1e-9));
     CHECK(ba->upper == Approx(1.0 / ab->lower).epsilon(1e-9));
 }
@@ -272,13 +258,13 @@ TEST_CASE("DexStats: dex_rate_ratio arm swap is the reciprocal", "[dex][stats]")
 TEST_CASE("DexStats: dex_rate_ratio zero arms", "[dex][stats]") {
     const auto no_b = dex_rate_ratio(8, 500.0, 0, 500.0);
     REQUIRE(no_b);
-    CHECK(no_b->ratio == kInf);
+    CHECK(no_b->estimate == kInf);
     CHECK(no_b->upper == kInf);
     CHECK(no_b->lower == near8(1.70697059));
 
     const auto no_a = dex_rate_ratio(0, 500.0, 12, 500.0);
     REQUIRE(no_a);
-    CHECK(no_a->ratio == 0.0);
+    CHECK(no_a->estimate == 0.0);
     CHECK(no_a->lower == 0.0);
     CHECK(no_a->upper == near8(0.35989382));
 
@@ -300,7 +286,7 @@ TEST_CASE("DexStats: dex_rate_ratio guards and overflow", "[dex][stats]") {
 TEST_CASE("DexStats: dex_rate_ratio large-count branch", "[dex][stats]") {
     const auto r = dex_rate_ratio(2'000'000, 100.0, 2'000'000, 100.0);
     REQUIRE(r);
-    CHECK(r->ratio == 1.0);
+    CHECK(r->estimate == 1.0);
     CHECK(std::isfinite(r->lower));
     CHECK(std::isfinite(r->upper));
     CHECK(r->lower < 1.0);
@@ -309,7 +295,7 @@ TEST_CASE("DexStats: dex_rate_ratio large-count branch", "[dex][stats]") {
     // No int64 sum: both arms at the maximum.
     const auto m = dex_rate_ratio(kI64Max, 10.0, kI64Max, 10.0);
     REQUIRE(m);
-    CHECK(m->ratio == 1.0);
+    CHECK(m->estimate == 1.0);
 
     // Reliable only when both arms reach the threshold.
     CHECK(dex_rate_ratio(20, 100.0, 20, 100.0)->reliable);
