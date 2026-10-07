@@ -24,6 +24,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <filesystem>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -394,6 +395,15 @@ inline constexpr int kMaxCleanupHours = 876000;
     if (negative)
         return 0;
     return value > kMaxCleanupHours ? kMaxCleanupHours : static_cast<int>(value);
+}
+
+/// Whether cleanup removes a file: only when its age was actually read and is older than
+/// `cutoff`. last_write_time(ec) returns file_time_type::min() on error, which compares as
+/// older than any cutoff, so a read failure must never count as "old".
+[[nodiscard]] inline bool cleanup_is_stale(const std::error_code& mtime_ec,
+                                           std::filesystem::file_time_type mtime,
+                                           std::filesystem::file_time_type cutoff) noexcept {
+    return !mtime_ec && mtime < cutoff;
 }
 
 } // namespace yuzu::content_dist::exec

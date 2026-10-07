@@ -455,3 +455,15 @@ TEST_CASE("a parsed huge or negative cleanup cutoff is never in the future",
         CHECK_FALSE(in_future);
     }
 }
+
+TEST_CASE("cleanup_is_stale never treats an unreadable age as old", "[agent][content_dist][exec]") {
+    using clock = std::filesystem::file_time_type::clock;
+    const auto cutoff = clock::now();
+    const std::error_code none;
+    const std::error_code denied = std::make_error_code(std::errc::permission_denied);
+    CHECK(cleanup_is_stale(none, cutoff - std::chrono::hours(2), cutoff));
+    CHECK_FALSE(cleanup_is_stale(none, cutoff + std::chrono::hours(2), cutoff));
+    // last_write_time(ec) returns file_time_type::min() on error: must not read as old.
+    CHECK_FALSE(cleanup_is_stale(denied, std::filesystem::file_time_type::min(), cutoff));
+    CHECK_FALSE(cleanup_is_stale(denied, cutoff - std::chrono::hours(2), cutoff));
+}
