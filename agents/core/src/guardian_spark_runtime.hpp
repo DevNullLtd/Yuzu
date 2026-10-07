@@ -584,6 +584,26 @@ public:
     [[nodiscard]] std::uint64_t journal_clock_rejected() const noexcept {
         return journal_clock_rejected_.load(std::memory_order_relaxed);
     }
+
+    // --- #4045: staged baseline captures (Spark's side of the #4021 baseline store) ----------
+    /// One file-hash-equals baseline-on-arm capture, staged for the engine-owned persister.
+    /// `path` is the RAW spark path (the same string the engine's arm-time seed fingerprints).
+    struct CapturedBaseline {
+        std::string rule_id;
+        std::string path;
+        std::string hash;
+    };
+    /// Safety valve on staged_baselines_, not a budget: it bounds the worst-case KV work of
+    /// one persister drain.
+    static constexpr std::size_t kMaxStagedBaselines = 256;
+    /// Swap the staged captures out (a tuple is never handed to two takers). Takes registry_mu_
+    /// standalone; deliberately NOT gated on stopping_ (see the definition).
+    [[nodiscard]] std::vector<CapturedBaseline> take_staged_baselines();
+    /// Return tuples whose persist FAILED. Fires no waker (a failing KV must not spin the drain
+    /// worker). Takes registry_mu_ standalone.
+    void restage_baselines(std::vector<CapturedBaseline> failed);
+    [[nodiscard]] std::size_t staged_baseline_count_for_test() const;
+    [[nodiscard]] std::uint64_t staged_baseline_drops() const noexcept { return 0; } // red-commit stub
     /// Repeat Unknown evaluations whose guard.unhealthy was edge-suppressed (M1): a rule
     /// stuck errored is re-evaluated every convergence tick to catch recovery, but only the
     /// first Unknown of an episode emits a health event. Non-zero means at least one rule is

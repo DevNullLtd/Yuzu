@@ -70,6 +70,7 @@ class GuardianArmAckLedger;
 class ConvergenceScheduler;
 class GuardianOutboxDrainWorker;
 class GuardianLifecycleJournal;
+class GuardianBaselinePersister;
 struct GuardianJournalStats;
 struct GuardianJournalAgeStats;
 struct GuardianArmStats;
@@ -580,6 +581,11 @@ public:
     /// runs. No production caller.
     [[nodiscard]] GuardianOutboxDrainWorker* drain_worker_for_test() {
         return spark_drain_worker_.get();
+    }
+    /// TEST-ONLY (#4045): the engine-owned persister of Spark's staged baseline captures.
+    /// Null until wire_spark_engine runs. No production caller.
+    [[nodiscard]] GuardianBaselinePersister* baseline_persister_for_test() {
+        return baseline_persister_.get();
     }
     [[nodiscard]] ConvergenceScheduler* convergence_scheduler_for_test() {
         return spark_scheduler_.get();
@@ -1159,6 +1165,7 @@ private:
     /// (#2298 governance A4). The declaration order below is still the tidy one, but it is
     /// no longer load-bearing.
     std::shared_ptr<GuardianLifecycleJournal> lifecycle_journal_;
+    std::shared_ptr<GuardianBaselinePersister> baseline_persister_; ///< #4045; borrows kv_
     std::unique_ptr<ConvergenceScheduler> spark_scheduler_;
     std::unique_ptr<GuardianOutboxDrainWorker> spark_drain_worker_;
 };

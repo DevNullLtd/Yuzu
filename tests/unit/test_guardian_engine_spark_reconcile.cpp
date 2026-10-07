@@ -7,9 +7,11 @@
 
 #include <yuzu/agent/guardian_engine.hpp>
 #include <yuzu/agent/kv_store.hpp>
+#include <yuzu/agent/plugin_loader.hpp> // sha256_file (#4045: the expected baseline hashes)
 
 #include "guaranteed_state.pb.h"
 #include "guardian_arm_ack.hpp" // kWedgeSuppressMaxDecisions (#5459: the held-generation valve test)
+#include "guardian_baseline_persister.hpp" // GuardianBaselinePersister (#4045)
 #include "guardian_arm_heartbeat.hpp" // GuardianArmStats complete type (rung 9c PR-3)
 #include "guardian_backend.hpp" // guardian_backend_from_state/label (#2298 F13)
 #include "guardian_convergence_scheduler.hpp" // ConvergenceScheduler (started_for_test, #2238)
@@ -30,6 +32,7 @@
 #include "test_helpers.hpp"
 
 #include <catch2/catch_test_macros.hpp>
+#include <nlohmann/json.hpp> // #4045: the persisted baseline record
 
 #include <algorithm>
 #include <chrono>
@@ -492,6 +495,25 @@ make_file_rule(const std::string& id, bool enabled = true,
     auto* a = r.mutable_assertion();
     a->set_type("file-exists");
     (*a->mutable_params())["path"] = path;
+    return r;
+}
+
+// #4045: file-hash-equals, no authored expected_hash by default (baseline-on-arm). Spark type
+// file-change, so under prefer_spark_=true with a File mechanism registered it arms via Spark.
+gpb::GuaranteedStateRule
+make_file_hash_rule(const std::string& id, const std::string& path,
+                    const std::string& expected_hash = "") {
+    gpb::GuaranteedStateRule r;
+    r.set_rule_id(id);
+    r.set_name(id);
+    r.set_enabled(true);
+    r.set_enforcement_mode("audit");
+    r.mutable_spark()->set_type("file-change");
+    auto* a = r.mutable_assertion();
+    a->set_type("file-hash-equals");
+    (*a->mutable_params())["path"] = path;
+    if (!expected_hash.empty())
+        (*a->mutable_params())["expected_hash"] = expected_hash;
     return r;
 }
 
@@ -5833,3 +5855,400 @@ TEST_CASE("#4685 AC3 (Registry, real mechanism): an already-armed rule undergoin
 }
 
 #endif // _WIN32
+
+// ── #4045 ─────────────────────────────────────────────────────────────────────────────────
+// Spark's baseline-on-arm capture must reach the #4021 KV record. The runtime STAGES the
+// capture edge (test_guardian_spark_runtime.cpp, "#4045 R1-R7"); an engine-owned persister
+// drains it from apply_rules (before any re-arm seeds), stop(), and the drain worker. These
+// drive the real engine + a REAL temp file through the fixture's File-typed fake mechanism
+// (the real File mechanism is Windows-only; GuardianStateReader::read_file is not).
+//
+// Waiting discipline: the persist seam (persist_staged_baselines_once) and evaluate_key make
+// the flow synchronous. The background drain worker may ALSO persist after an enqueue wake
+// (its backstop is pinned to one hour, so only the wake can run it), so every assertion is on
+// END STATE, and failure counts are only ever ">=".
+namespace {
+
+struct Spark4045Target {
+    yuzu::test::TempDir dir{"yuzu_test_4045_"};
+    Spark4045Target() { fs::create_directories(dir.path); }
+    [[nodiscard]] fs::path file(const std::string& name = "target.txt") const {
+        return dir.path / name;
+    }
+    static void write(const fs::path& p, const std::string& content) {
+        std::ofstream o(p, std::ios::binary | std::ios::trunc);
+        o << content;
+        REQUIRE(o.good());
+    }
+};
+
+std::string spark_file_key_4045(const fs::path& p) {
+    return yuzu::agent::spark_key(SparkSpec{SparkType::File, FileSparkParams{p.string()}});
+}
+std::string baseline_fingerprint_4045(const fs::path& p) {
+    return "file-hash-equals|" + p.string(); // guardian_baseline_fingerprint's layout
+}
+void eval_initial_4045(GuardianEngine& e, const fs::path& p) {
+    auto* rt = e.spark_runtime_for_test();
+    REQUIRE(rt != nullptr);
+    rt->evaluate_key(spark_file_key_4045(p), yuzu::agent::EvalReason::Initial);
+}
+void persist_now_4045(GuardianEngine& e) {
+    auto* w = e.drain_worker_for_test();
+    REQUIRE(w != nullptr);
+    w->persist_staged_baselines_once();
+}
+std::vector<OutboxEntry> compliance_4045(SparkReconcileFixture& f, const std::string& rule_id) {
+    std::lock_guard<std::mutex> lk{f.sent_mu};
+    std::vector<OutboxEntry> out;
+    for (const auto& e : f.sent)
+        if (e.domain == yuzu::agent::OutboxDomain::Compliance && e.rule_id == rule_id)
+            out.push_back(e);
+    return out;
+}
+bool has_compliant_4045(SparkReconcileFixture& f, const std::string& rule_id) {
+    for (const auto& e : compliance_4045(f, rule_id))
+        if (e.drift.compliant)
+            return true;
+    return false;
+}
+/// The first NON-compliant (drift) entry for `rule_id`, if one has been sent.
+std::optional<OutboxEntry> first_drift_4045(SparkReconcileFixture& f, const std::string& rule_id) {
+    for (const auto& e : compliance_4045(f, rule_id))
+        if (!e.drift.compliant)
+            return e;
+    return std::nullopt;
+}
+std::optional<nlohmann::json> baseline_record_4045(KvStore& kv, const std::string& rule_id) {
+    auto v = kv.get(GuardianEngine::kv_namespace(), "baseline:" + rule_id);
+    if (!v)
+        return std::nullopt;
+    return nlohmann::json::parse(*v);
+}
+std::string hash_of_4045(const fs::path& p) { return yuzu::agent::sha256_file(p); }
+
+} // namespace
+
+TEST_CASE("#4045 E1: Spark's first capture is persisted and a full_sync re-arm keeps it "
+          "(headline: no laundered compliant)",
+          "[spark][guardian][baseline][reconcile]") {
+    Spark4045Target t; // declared first: outlives the fixture's engine
+    SparkReconcileFixture f{3'600'000, std::nullopt, SparkType::File};
+    const fs::path target = t.file();
+    Spark4045Target::write(target, "content A");
+    const std::string h_a = hash_of_4045(target);
+
+    f.apply(make_file_hash_rule("r1", target.string()));
+    eval_initial_4045(*f.engine, target);
+    REQUIRE(yuzu::test::spin_until([&] { return has_compliant_4045(f, "r1"); }));
+    CHECK(compliance_4045(f, "r1").front().drift.expected_value == h_a);
+
+    persist_now_4045(*f.engine);
+    const auto rec = baseline_record_4045(*f.kv, "r1");
+    REQUIRE(rec.has_value()); // RED today: nothing ever writes Spark's capture
+    CHECK(rec->value("schema", -1) == 1);
+    CHECK(rec->value("fingerprint", std::string{}) == baseline_fingerprint_4045(target));
+    CHECK(rec->value("hash", std::string{}) == h_a);
+
+    // The file drifts, then ANY fleet push re-arms the rule (full_sync teardown + attach).
+    Spark4045Target::write(target, "content B, longer");
+    const std::string h_b = hash_of_4045(target);
+    REQUIRE(h_b != h_a);
+    f.apply(make_file_hash_rule("r1", target.string()), /*full_sync=*/true);
+    eval_initial_4045(*f.engine, target);
+
+    // The re-armed generation is seeded with A, so B is DRIFT, not a re-baselined compliant.
+    REQUIRE(yuzu::test::spin_until([&] { return first_drift_4045(f, "r1").has_value(); }));
+    const auto drift = first_drift_4045(f, "r1");
+    CHECK(drift->drift.expected_value == h_a);
+    CHECK(drift->drift.detected_value == h_b);
+    const auto after = baseline_record_4045(*f.kv, "r1");
+    REQUIRE(after.has_value());
+    CHECK(after->value("hash", std::string{}) == h_a); // the guard never lets drift replace it
+}
+
+TEST_CASE("#4045 E2: the apply_rules drain persists a failed-then-recovered capture BEFORE the "
+          "re-arm seeds",
+          "[spark][guardian][baseline][reconcile]") {
+    Spark4045Target t;
+    SparkReconcileFixture f{3'600'000, std::nullopt, SparkType::File};
+    const fs::path target = t.file();
+    Spark4045Target::write(target, "content A");
+    const std::string h_a = hash_of_4045(target);
+    const auto rule = make_file_hash_rule("r1", target.string());
+
+    f.apply(rule);
+    // AFTER apply() returns (its own rule write needs the table) and BEFORE the first eval:
+    // the capture's persist attempt must fail and restage.
+    drop_kv_store_table_for_test(f.db_.path);
+    eval_initial_4045(*f.engine, target);
+    auto* persister = f.engine->baseline_persister_for_test();
+    REQUIRE(persister != nullptr);
+    // The single enqueue-triggered worker attempt has provably run (backstop is one hour and
+    // restage fires no waker, so nothing else wakes the worker from here on).
+    REQUIRE(yuzu::test::spin_until([&] { return persister->persist_failures() >= 1; }));
+
+    Spark4045Target::write(target, "content B, longer");
+    recreate_kv_store_table_for_test(f.db_.path);
+    // IMMEDIATELY re-arm, with NO seam call: only apply_rules' own pre-teardown drain can
+    // persist A before the seed read. (A second worker cycle landing in the microsecond gap
+    // between the recreate and this call would persist A itself - same end state.)
+    f.apply(rule, /*full_sync=*/true);
+    eval_initial_4045(*f.engine, target);
+
+    REQUIRE(yuzu::test::spin_until([&] { return first_drift_4045(f, "r1").has_value(); }));
+    CHECK(first_drift_4045(f, "r1")->drift.expected_value == h_a);
+    const auto rec = baseline_record_4045(*f.kv, "r1");
+    REQUIRE(rec.has_value());
+    CHECK(rec->value("hash", std::string{}) == h_a);
+}
+
+TEST_CASE("#4045 E3: a failed persist is counted, restaged and retried; success clears it",
+          "[spark][guardian][baseline][reconcile]") {
+    Spark4045Target t;
+    SparkReconcileFixture f{3'600'000, std::nullopt, SparkType::File};
+    const fs::path target = t.file();
+    Spark4045Target::write(target, "content A");
+    const std::string h_a = hash_of_4045(target);
+
+    f.apply(make_file_hash_rule("r1", target.string()));
+    drop_kv_store_table_for_test(f.db_.path);
+    eval_initial_4045(*f.engine, target);
+    persist_now_4045(*f.engine);
+
+    auto* persister = f.engine->baseline_persister_for_test();
+    auto* rt = f.engine->spark_runtime_for_test();
+    REQUIRE(persister != nullptr);
+    REQUIRE(rt != nullptr);
+    REQUIRE(yuzu::test::spin_until([&] { return persister->persist_failures() >= 1; }));
+    // Never silently dropped: the tuple is back in staging (a worker batch may be mid-flight
+    // between its take and restage, hence the bounded wait rather than an immediate check).
+    REQUIRE(yuzu::test::spin_until([&] { return rt->staged_baseline_count_for_test() == 1; }));
+
+    recreate_kv_store_table_for_test(f.db_.path);
+    persist_now_4045(*f.engine);
+    const auto rec = baseline_record_4045(*f.kv, "r1");
+    REQUIRE(rec.has_value());
+    CHECK(rec->value("hash", std::string{}) == h_a);
+    CHECK(yuzu::test::spin_until([&] { return rt->staged_baseline_count_for_test() == 0; }));
+}
+
+TEST_CASE("#4045 E4: a retarget persists the new target's capture over the old record",
+          "[spark][guardian][baseline][reconcile]") {
+    Spark4045Target t;
+    SparkReconcileFixture f{3'600'000, std::nullopt, SparkType::File};
+    const fs::path p1 = t.file("one.txt");
+    const fs::path p2 = t.file("two.txt");
+    Spark4045Target::write(p1, "content A");
+    Spark4045Target::write(p2, "content C, a different target");
+    const std::string h_c = hash_of_4045(p2);
+
+    f.apply(make_file_hash_rule("r1", p1.string()));
+    eval_initial_4045(*f.engine, p1);
+    REQUIRE(yuzu::test::spin_until([&] { return has_compliant_4045(f, "r1"); }));
+    persist_now_4045(*f.engine);
+    const auto first = baseline_record_4045(*f.kv, "r1");
+    REQUIRE(first.has_value()); // RED today: nothing ever writes Spark's capture
+    CHECK(first->value("fingerprint", std::string{}) == baseline_fingerprint_4045(p1));
+
+    // Same rule_id re-authored against a different path (non-full_sync replace): the seed's
+    // fingerprint mismatch means "capture fresh", and that capture replaces the record.
+    f.apply(make_file_hash_rule("r1", p2.string()), /*full_sync=*/false);
+    eval_initial_4045(*f.engine, p2);
+    persist_now_4045(*f.engine);
+
+    REQUIRE(yuzu::test::spin_until([&] {
+        const auto rec = baseline_record_4045(*f.kv, "r1");
+        return rec && rec->value("fingerprint", std::string{}) == baseline_fingerprint_4045(p2);
+    }));
+    const auto rec = baseline_record_4045(*f.kv, "r1");
+    CHECK(rec->value("hash", std::string{}) == h_c);
+    // A fresh capture on the new target is compliant: never a drift against the OLD target.
+    CHECK_FALSE(first_drift_4045(f, "r1").has_value());
+}
+
+TEST_CASE("#4045 E5: the overwrite guard holds on the Spark path (a refusal is not a failure)",
+          "[spark][guardian][baseline][reconcile]") {
+    Spark4045Target t;
+    SparkReconcileFixture f{3'600'000, std::nullopt, SparkType::File};
+    const fs::path target = t.file();
+    Spark4045Target::write(target, "content A");
+
+    f.apply(make_file_hash_rule("r1", target.string())); // Absent record: the capture path
+    drop_kv_store_table_for_test(f.db_.path);
+    eval_initial_4045(*f.engine, target); // capture staged; the worker's attempt fails, restages
+    auto* persister = f.engine->baseline_persister_for_test();
+    auto* rt = f.engine->spark_runtime_for_test();
+    REQUIRE(persister != nullptr);
+    REQUIRE(rt != nullptr);
+    REQUIRE(yuzu::test::spin_until([&] { return persister->persist_failures() >= 1; }));
+
+    // The table returns holding a DIFFERENT well-formed baseline for the same target (as if
+    // the arm-time seed read had failed while a good record existed). Written directly, not
+    // via the guard, so a late worker cycle cannot make this setup itself refuse.
+    recreate_kv_store_table_for_test(f.db_.path);
+    const std::string h_x(64, 'a');
+    nlohmann::json existing;
+    existing["schema"] = 1;
+    existing["fingerprint"] = baseline_fingerprint_4045(target);
+    existing["hash"] = h_x;
+    REQUIRE(f.kv->set(GuardianEngine::kv_namespace(), "baseline:r1", existing.dump()));
+
+    const auto outcome = persister->persist_staged(*rt);
+    CHECK(outcome.written == 0); // the guard refused: first capture on record wins
+    CHECK(outcome.failed == 0);  // ...and a refusal is not a failure (never restaged)
+    const auto rec = baseline_record_4045(*f.kv, "r1");
+    REQUIRE(rec.has_value());
+    CHECK(rec->value("hash", std::string{}) == h_x);
+    CHECK(yuzu::test::spin_until([&] { return rt->staged_baseline_count_for_test() == 0; }));
+}
+
+TEST_CASE("#4045 E6: a production-order restart re-seeds Spark's persisted capture",
+          "[spark][guardian][baseline][reconcile][boot]") {
+    // Two-phase production-order pattern (wire_spark_engine BEFORE start_local) of "a
+    // production-order restart reconstructs unsupported_rules_ from cached KV", inlined on
+    // purpose: no shared production-order fixture is added here.
+    Spark4045Target t;
+    const auto kv_path = unique_kv_path();
+    yuzu::test::TempDbFile db{kv_path};
+    const fs::path target = t.file();
+    Spark4045Target::write(target, "content A");
+    const std::string h_a = hash_of_4045(target);
+    const auto rule = make_file_hash_rule("r1", target.string());
+
+    // Phase 1: arm, capture, persist, shut down.
+    {
+        auto opened = KvStore::open(kv_path);
+        REQUIRE(opened.has_value());
+        KvStore kv{std::move(*opened)};
+        SparkEngine spark_engine;
+        REQUIRE(spark_engine.register_mechanism(SparkType::File,
+                                                std::make_unique<FakeServiceMechanism>())
+                    .has_value());
+        spark_engine.start();
+        GuardianEngine engine{&kv, "agent-test", /*prefer_spark=*/true};
+        REQUIRE(engine.start_local().has_value());
+        engine.wire_spark_engine(&spark_engine, false,
+                                 [](const OutboxEntry&) { return SendResult::Sent; });
+        REQUIRE(engine.spark_availability() == GuardianEngine::SparkAvailability::Available);
+
+        gpb::GuaranteedStatePush p;
+        p.set_full_sync(true);
+        *p.add_rules() = rule;
+        REQUIRE(yuzu::agent::guardian_dispatch_push_bytes_for_test(engine, p.SerializeAsString())
+                    .exit_code == 0);
+        REQUIRE(yuzu::test::spin_until([&] {
+            engine.journal_maintenance_tick();
+            return engine.spark_armed_rule_count() == 1 && engine.ack_pending_count_for_test() == 0 &&
+                   engine.active_io_workers() == 0;
+        }));
+        eval_initial_4045(engine, target);
+        persist_now_4045(engine);
+        engine.stop();
+        spark_engine.stop();
+    }
+
+    // The target drifts while the agent is down.
+    Spark4045Target::write(target, "content B, longer");
+    const std::string h_b = hash_of_4045(target);
+    REQUIRE(h_b != h_a);
+
+    // Phase 2: a fresh boot over the same store, in PRODUCTION order, with no push.
+    std::mutex sent_mu;
+    std::vector<OutboxEntry> sent;
+    auto opened = KvStore::open(kv_path);
+    REQUIRE(opened.has_value());
+    KvStore kv{std::move(*opened)};
+    SparkEngine spark_engine;
+    REQUIRE(spark_engine.register_mechanism(SparkType::File, std::make_unique<FakeServiceMechanism>())
+                .has_value());
+    spark_engine.start();
+    GuardianEngine engine{&kv, "agent-test", /*prefer_spark=*/true};
+    engine.wire_spark_engine(&spark_engine, false, [&](const OutboxEntry& e) {
+        std::lock_guard<std::mutex> lk{sent_mu};
+        sent.push_back(e);
+        return SendResult::Sent;
+    });
+    REQUIRE(engine.spark_availability() == GuardianEngine::SparkAvailability::Available);
+    REQUIRE(engine.start_local().has_value());
+    // The boot arm settles OFF-lock; evaluate_key returns early while the key is not yet armed.
+    REQUIRE(yuzu::test::spin_until([&] {
+        engine.journal_maintenance_tick();
+        return engine.spark_armed_rule_count() == 1 && engine.ack_pending_count_for_test() == 0 &&
+               engine.active_io_workers() == 0;
+    }));
+    eval_initial_4045(engine, target);
+
+    REQUIRE(yuzu::test::spin_until([&] {
+        std::lock_guard<std::mutex> lk{sent_mu};
+        for (const auto& e : sent)
+            if (e.domain == yuzu::agent::OutboxDomain::Compliance && e.rule_id == "r1" &&
+                !e.drift.compliant)
+                return e.drift.expected_value == h_a && e.drift.detected_value == h_b;
+        return false;
+    }));
+    engine.stop();
+    spark_engine.stop();
+}
+
+TEST_CASE("#4045 E7: prefer_spark=false is inert (nothing staged, no record)",
+          "[spark][guardian][baseline][reconcile]") {
+    Spark4045Target t;
+    yuzu::test::TempDbFile db{unique_kv_path()};
+    auto opened = KvStore::open(db.path);
+    REQUIRE(opened.has_value());
+    KvStore kv{std::move(*opened)};
+    SparkEngine spark_engine;
+    REQUIRE(spark_engine.register_mechanism(SparkType::File, std::make_unique<FakeServiceMechanism>())
+                .has_value());
+    spark_engine.start();
+    GuardianEngine engine{&kv, "agent-test", /*prefer_spark=*/false}; // the production default
+    REQUIRE(engine.start_local().has_value());
+    engine.wire_spark_engine(&spark_engine, false,
+                             [](const OutboxEntry&) { return SendResult::Sent; });
+    REQUIRE(engine.spark_availability() == GuardianEngine::SparkAvailability::Available);
+
+    const fs::path target = t.file();
+    Spark4045Target::write(target, "content A");
+    gpb::GuaranteedStatePush p;
+    p.set_full_sync(true);
+    *p.add_rules() = make_file_hash_rule("r1", target.string());
+    REQUIRE(yuzu::agent::guardian_dispatch_push_bytes_for_test(engine, p.SerializeAsString())
+                .exit_code == 0);
+
+    auto* rt = engine.spark_runtime_for_test();
+    REQUIRE(rt != nullptr); // the runtime exists even under prefer_spark=false...
+    eval_initial_4045(engine, target); // ...but no key is armed on it, so this is a no-op
+    CHECK(engine.spark_armed_rule_count() == 0);
+    CHECK(rt->staged_baseline_count_for_test() == 0);
+    CHECK_FALSE(kv.get(GuardianEngine::kv_namespace(), "baseline:r1").has_value());
+
+    engine.stop();
+    spark_engine.stop();
+}
+
+TEST_CASE("#4045 E8: stop() flushes a still-staged capture",
+          "[spark][guardian][baseline][reconcile]") {
+    Spark4045Target t;
+    SparkReconcileFixture f{3'600'000, std::nullopt, SparkType::File};
+    const fs::path target = t.file();
+    Spark4045Target::write(target, "content A");
+    const std::string h_a = hash_of_4045(target);
+
+    f.apply(make_file_hash_rule("r1", target.string()));
+    drop_kv_store_table_for_test(f.db_.path);
+    eval_initial_4045(*f.engine, target); // staged; the worker's attempt fails, restages
+    auto* persister = f.engine->baseline_persister_for_test();
+    auto* rt = f.engine->spark_runtime_for_test();
+    REQUIRE(persister != nullptr);
+    REQUIRE(rt != nullptr);
+    REQUIRE(yuzu::test::spin_until([&] { return persister->persist_failures() >= 1; }));
+
+    recreate_kv_store_table_for_test(f.db_.path);
+    f.engine->stop(); // the final drain runs after the worker is joined and begin_stop()
+
+    const auto rec = baseline_record_4045(*f.kv, "r1");
+    REQUIRE(rec.has_value());
+    CHECK(rec->value("hash", std::string{}) == h_a);
+    CHECK(rt->staged_baseline_count_for_test() == 0);
+}

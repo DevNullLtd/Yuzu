@@ -4439,6 +4439,13 @@ GuardianSparkRuntime::PendingSnapshot GuardianSparkRuntime::snapshot_pending() c
                           journal_stage_dropped_.load(std::memory_order_relaxed)};
 }
 
+// #4045 red-commit stubs: the staging behaviour lands in the next commit.
+std::vector<GuardianSparkRuntime::CapturedBaseline> GuardianSparkRuntime::take_staged_baselines() {
+    return {};
+}
+void GuardianSparkRuntime::restage_baselines(std::vector<CapturedBaseline>) {}
+std::size_t GuardianSparkRuntime::staged_baseline_count_for_test() const { return 0; }
+
 void GuardianSparkRuntime::erase_persisted_prefix(std::size_t n, std::uint64_t drops_at_snapshot) {
     std::lock_guard<std::mutex> ob{outbox_mu_};
     // The prefix must be identified by IDENTITY, not by position (#2345 Gate 8b). The caller

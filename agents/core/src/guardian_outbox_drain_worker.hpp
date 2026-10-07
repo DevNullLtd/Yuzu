@@ -290,6 +290,10 @@ public:
     /// throw, but a bad_alloc on the bare worker thread never terminates the agent).
     void drain_once();
 
+    /// TEST-ONLY (#4045): persist Spark's staged baseline captures synchronously. RED-COMMIT
+    /// STUB: does nothing until the engine change lands.
+    void persist_staged_baselines_once() {}
+
     /// TEST-ONLY: pin the jitter source so offsets are reproducible. Intended before
     /// start(), but it takes sig_->mu regardless: the RNG is worker-thread state guarded by
     /// that mutex, and a doc comment is not a synchronization primitive - a later caller

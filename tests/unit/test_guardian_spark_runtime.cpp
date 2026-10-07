@@ -419,6 +419,15 @@ RuleAssertion file_exists_rule(const std::string& rule_id, bool present = true) 
     a.expect_present = present;
     return a;
 }
+// #4045: a file-hash-equals rule. Empty `expected_hash` = baseline-on-arm (the capture the
+// runtime stages for the engine-owned persister); a non-empty one is an authored hash.
+RuleAssertion file_hash_rule(const std::string& rule_id, const std::string& expected_hash = "") {
+    RuleAssertion a;
+    a.kind = AssertionKind::FileHashEquals;
+    a.rule_id = rule_id;
+    a.expected_hash = expected_hash;
+    return a;
+}
 SparkSpec svc_spec(const std::string& name) {
     return SparkSpec{SparkType::Service, ServiceSparkParams{name}};
 }
@@ -14969,4 +14978,184 @@ TEST_CASE("#4472: the compensation owed instant is compensation_deadline minus "
 
     f.b->release_disarm_hang();
     REQUIRE(yuzu::test::spin_until([&] { return f.rt->claim_queue_depth_for_test(f.key) == 0; }, 10s));
+}
+
+// ── #4045: staged baseline captures ─────────────────────────────────────────────────────────
+// The runtime never touches a KvStore (file header); it STAGES the baseline-on-arm capture
+// edge and the engine-owned persister drains it. These pin the staging rules in isolation.
+
+namespace {
+using CapturedBaseline = GuardianSparkRuntime::CapturedBaseline;
+
+bool same_capture(const CapturedBaseline& c, const std::string& rule, const std::string& path,
+                  const std::string& hash) {
+    return c.rule_id == rule && c.path == path && c.hash == hash;
+}
+} // namespace
+
+TEST_CASE("#4045 R1: a no-expected file-hash rule stages its first capture exactly once",
+          "[spark][runtime][baseline]") {
+    auto r = std::make_shared<FakeReader>(); // file hash "h"
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = make_rt(r, b);
+    const auto key = spark_key(file_spec("/a"));
+    REQUIRE(rt->attach_rule("r1", file_spec("/a"), file_hash_rule("r1"), true));
+
+    rt->evaluate_key(key, EvalReason::Initial);
+    const auto got = rt->take_staged_baselines();
+    REQUIRE(got.size() == 1);
+    CHECK(same_capture(got[0], "r1", "/a", "h"));
+
+    // A taker never sees the same tuple twice, and a committed baseline is not a new edge.
+    rt->evaluate_key(key, EvalReason::Event);
+    CHECK(rt->take_staged_baselines().empty());
+    CHECK(rt->staged_baseline_count_for_test() == 0);
+}
+
+TEST_CASE("#4045 R2: an authored expected_hash stages nothing", "[spark][runtime][baseline]") {
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = make_rt(r, b);
+    const auto key = spark_key(file_spec("/a"));
+    REQUIRE(rt->attach_rule("r1", file_spec("/a"), file_hash_rule("r1", "h"), true));
+
+    rt->evaluate_key(key, EvalReason::Initial);
+    CHECK(rt->staged_baseline_count_for_test() == 0);
+    CHECK(rt->take_staged_baselines().empty());
+}
+
+TEST_CASE("#4045 R3: a capture whose enqueue is rejected is not staged until it commits",
+          "[spark][runtime][baseline]") {
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    GuardianSparkRuntime::Config cfg;
+    cfg.outbox_capacity = 2; // the floor: two drifting rules fill it
+    auto rt = make_rt(r, b, cfg);
+    rt->attach_rule("d1", file_spec("/d1"), file_exists_rule("d1", /*present=*/false), true);
+    rt->attach_rule("d2", file_spec("/d2"), file_exists_rule("d2", /*present=*/false), true);
+    REQUIRE(rt->attach_rule("r1", file_spec("/a"), file_hash_rule("r1"), true));
+    rt->evaluate_key(spark_key(file_spec("/d1")), EvalReason::Initial); // slot 1 (drift)
+    rt->evaluate_key(spark_key(file_spec("/d2")), EvalReason::Initial); // slot 2 (full)
+    REQUIRE(rt->outbox_size() == 2);
+
+    // r1's compliant edge is rejected at the cap: scratch stays uncommitted, so the capture
+    // must NOT be staged (the persisted hash is always one the live state committed).
+    const auto key = spark_key(file_spec("/a"));
+    rt->evaluate_key(key, EvalReason::Initial);
+    REQUIRE(rt->outbox_backpressure_drops() == 1);
+    CHECK(rt->staged_baseline_count_for_test() == 0);
+    CHECK(rt->take_staged_baselines().empty());
+
+    drain_all(*rt); // frees the slots; the retry commits and stages exactly one
+    rt->evaluate_key(key, EvalReason::Convergence);
+    const auto got = rt->take_staged_baselines();
+    REQUIRE(got.size() == 1);
+    CHECK(same_capture(got[0], "r1", "/a", "h"));
+}
+
+TEST_CASE("#4045 R4: a retarget (new path, same rule_id) replaces the staged entry",
+          "[spark][runtime][baseline]") {
+    auto r = std::make_shared<FakeReader>(); // "h"
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = make_rt(r, b);
+    REQUIRE(rt->attach_rule("r1", file_spec("/a"), file_hash_rule("r1"), true));
+    rt->evaluate_key(spark_key(file_spec("/a")), EvalReason::Initial); // captures "h", staged
+
+    // A DIFFERENT path for the same rule_id obsoletes the old target's capture.
+    r->file = read_known(FileSnapshot{.exists = true, .size = 4, .hash = "h3"});
+    REQUIRE(rt->attach_rule("r1", file_spec("/b"), file_hash_rule("r1"), true));
+    rt->evaluate_key(spark_key(file_spec("/b")), EvalReason::Initial);
+    const auto got = rt->take_staged_baselines();
+    REQUIRE(got.size() == 1);
+    CHECK(same_capture(got[0], "r1", "/b", "h3"));
+}
+
+TEST_CASE("#4045 R4b: re-attach on the same path keeps the FIRST capture (first-capture-wins)",
+          "[spark][runtime][baseline]") {
+    auto r = std::make_shared<FakeReader>(); // "h"
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = make_rt(r, b);
+    REQUIRE(rt->attach_rule("r1", file_spec("/a"), file_hash_rule("r1"), true));
+    rt->evaluate_key(spark_key(file_spec("/a")), EvalReason::Initial);
+    r->file = read_known(FileSnapshot{.exists = true, .size = 4, .hash = "h2"});
+    REQUIRE(rt->attach_rule("r1", file_spec("/a"), file_hash_rule("r1"), true));
+    rt->evaluate_key(spark_key(file_spec("/a")), EvalReason::Initial);
+
+    const auto got = rt->take_staged_baselines();
+    REQUIRE(got.size() == 1);
+    CHECK(same_capture(got[0], "r1", "/a", "h")); // NOT "h2"
+}
+
+TEST_CASE("#4045 R5: staging is capped, counts the overflow and never evicts",
+          "[spark][runtime][baseline]") {
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    GuardianSparkRuntime::Config cfg;
+    cfg.outbox_capacity = 4096; // 257 compliant edges must all enqueue
+    auto rt = make_rt(r, b, cfg);
+    constexpr std::size_t kN = GuardianSparkRuntime::kMaxStagedBaselines + 1;
+    for (std::size_t i = 0; i < kN; ++i) {
+        const std::string id = "r" + std::to_string(i);
+        const std::string path = "/p" + std::to_string(i);
+        REQUIRE(rt->attach_rule(id, file_spec(path), file_hash_rule(id), true));
+        rt->evaluate_key(spark_key(file_spec(path)), EvalReason::Initial);
+    }
+    CHECK(rt->staged_baseline_count_for_test() == GuardianSparkRuntime::kMaxStagedBaselines);
+    CHECK(rt->staged_baseline_drops() == 1);
+
+    const auto got = rt->take_staged_baselines();
+    REQUIRE(got.size() == GuardianSparkRuntime::kMaxStagedBaselines);
+    for (const auto& c : got)
+        CHECK(c.rule_id != "r" + std::to_string(kN - 1)); // the overflow, not an earlier entry
+}
+
+TEST_CASE("#4045 R6: restage never clobbers a newer retarget, replaces same-path, fires no waker",
+          "[spark][runtime][baseline]") {
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = make_rt(r, b);
+    std::atomic<int> wakes{0};
+    rt->set_pending_initial_waker([&] { wakes.fetch_add(1); });
+    rt->set_outbox_enqueue_waker([&] { wakes.fetch_add(1); });
+
+    r->file = read_known(FileSnapshot{.exists = true, .size = 4, .hash = "new1"});
+    REQUIRE(rt->attach_rule("s1", file_spec("/a"), file_hash_rule("s1"), true));
+    rt->evaluate_key(spark_key(file_spec("/a")), EvalReason::Initial); // present: s1 /a new1
+    r->file = read_known(FileSnapshot{.exists = true, .size = 4, .hash = "new2"});
+    REQUIRE(rt->attach_rule("s2", file_spec("/b"), file_hash_rule("s2"), true));
+    rt->evaluate_key(spark_key(file_spec("/b")), EvalReason::Initial); // present: s2 /b new2
+    REQUIRE(rt->staged_baseline_count_for_test() == 2);
+    const int wakes_before = wakes.load();
+
+    std::vector<CapturedBaseline> failed;
+    failed.push_back({"s1", "/a", "old1"});    // same path as the present entry: the older wins
+    failed.push_back({"s2", "/other", "old2"}); // different path: the present (retarget) wins
+    failed.push_back({"s3", "/c", "old3"});     // absent: inserted
+    rt->restage_baselines(std::move(failed));
+    CHECK(wakes.load() == wakes_before); // a failing KV must never spin the drain worker
+
+    auto got = rt->take_staged_baselines();
+    std::sort(got.begin(), got.end(),
+              [](const CapturedBaseline& x, const CapturedBaseline& y) { return x.rule_id < y.rule_id; });
+    REQUIRE(got.size() == 3);
+    CHECK(same_capture(got[0], "s1", "/a", "old1"));
+    CHECK(same_capture(got[1], "s2", "/b", "new2"));
+    CHECK(same_capture(got[2], "s3", "/c", "old3"));
+}
+
+TEST_CASE("#4045 R7: take_staged_baselines still drains after begin_stop()",
+          "[spark][runtime][baseline]") {
+    // The engine's stop() flush runs AFTER begin_stop(); a stopping_ early-return in take
+    // would silently empty it.
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = make_rt(r, b);
+    REQUIRE(rt->attach_rule("r1", file_spec("/a"), file_hash_rule("r1"), true));
+    rt->evaluate_key(spark_key(file_spec("/a")), EvalReason::Initial);
+    REQUIRE(rt->staged_baseline_count_for_test() == 1);
+
+    rt->begin_stop();
+    const auto got = rt->take_staged_baselines();
+    REQUIRE(got.size() == 1);
+    CHECK(same_capture(got[0], "r1", "/a", "h"));
 }
