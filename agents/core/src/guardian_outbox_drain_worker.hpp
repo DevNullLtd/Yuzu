@@ -68,11 +68,14 @@
  * BASELINE PERSISTENCE (#4045): the worker is also the always-on, connection-independent
  * caller of the engine-owned GuardianBaselinePersister (guardian_baseline_persister.hpp), which
  * writes Spark's staged baseline-on-arm captures into the #4021 KV record. One firewalled step
- * per cycle, ahead of the outbox drain: a capture's compliant-edge enqueue wakes this loop, so
- * the record is durable within milliseconds of the capture, with no new waker and no dependence
- * on server connectivity (a boot re-arm happens before the network is up; the heartbeat-thread
- * tick cannot cover it). Another KvStore caller on this existing joined thread, alongside the
- * journal; it takes only the persister's leaf persist_mu_, never mtx_.
+ * per cycle, ahead of the outbox drain: a capture's compliant-edge enqueue normally wakes this
+ * loop, so the record is usually durable within milliseconds of the capture (see the persister's
+ * LATENCY note for the honest bound), with no new waker and no dependence on server
+ * connectivity (a boot re-arm happens before the network is up; the heartbeat-thread tick
+ * cannot cover it). After a failed pass the step backs off (5 s doubling to 60 s) and a pass
+ * stops at its first failed write, so it cannot stall the drain for more than about one KV
+ * busy timeout. Another KvStore caller on this existing joined thread, alongside the journal;
+ * it takes only the persister's leaf persist_mu_, never mtx_.
  *
  * THE CENTRAL CONSTRAINT: maintenance must NEVER take the GuardianEngine mtx_.
  * GuardianEngine::stop() holds mtx_ across its whole body AND joins this worker
@@ -306,10 +309,11 @@ public:
     void drain_once();
 
     /// Persist Spark's staged baseline captures (#4045), once, via maint_.baselines (a no-op
-    /// when unset). loop() runs this every cycle before the outbox drain; it is public so a
-    /// test can drive it synchronously. NOT firewalled here (loop() firewalls it and counts
-    /// into baseline_persist_exception_count()). Takes the persister's leaf persist_mu_ and
-    /// never GuardianEngine::mtx_.
+    /// when unset), as a Trigger::Worker pass: it honours the persister's retry backoff.
+    /// loop() runs this every cycle before the outbox drain; it is public so a test can drive
+    /// it synchronously. NOT firewalled here (loop() firewalls it and counts into the
+    /// persister's firewalled_exceptions()). Takes the persister's leaf persist_mu_ and never
+    /// GuardianEngine::mtx_.
     void persist_staged_baselines_once();
 
     /// TEST-ONLY: pin the jitter source so offsets are reproducible. Intended before
@@ -365,15 +369,6 @@ public:
     [[nodiscard]] std::uint64_t journal_maint_exception_count() const noexcept {
         return journal_maint_exceptions_.load(std::memory_order_relaxed);
     }
-    /// Firewalled throws out of the staged-baseline persist step in loop() (#4045; the
-    /// take/restage allocation, per-tuple persist failures are the persister's own count).
-    /// Folded into GuardianEngine::baseline_persist_failures(), NOT into the journal or drain
-    /// counters: a baseline write failing, an audit record at risk and delivery failing are
-    /// three different operator situations.
-    [[nodiscard]] std::uint64_t baseline_persist_exception_count() const noexcept {
-        return baseline_persist_exceptions_.load(std::memory_order_relaxed);
-    }
-
     /// steady_clock ms of the last PAGE maintenance pass that made REPLAY PROGRESS or positively
     /// established there was none, seeded non-zero at start() (flip item 6 / item 14). 0 means
     /// start() has not run - the reader treats that as "no worker", not as an age. The cadence
@@ -541,7 +536,6 @@ private:
     std::function<void()> between_lane_stops_hook_for_test_; ///< test seam; null = no-op, fire-once
     std::atomic<std::uint64_t> drain_exceptions_{0}; ///< firewalled drain-pass throws (item 4 hardening)
     std::atomic<std::uint64_t> journal_maint_exceptions_{0}; ///< firewalled maintenance-pass throws (C0)
-    std::atomic<std::uint64_t> baseline_persist_exceptions_{0}; ///< firewalled baseline-persist throws (#4045)
     /// Success stamps for the staleness gauges (item 6). Seeded at start() (clamped >= 1 so
     /// 0 stays the unambiguous "never started" sentinel even right after boot, where
     /// steady_clock's epoch-relative reading can itself be ~0), stored at the loop's

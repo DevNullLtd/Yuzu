@@ -313,18 +313,26 @@ public:
     /// outbox_backpressure_drops()'s own shape.
     [[nodiscard]] std::uint64_t io_ceiling_rejections() const;
 
-    /// #4045: cumulative count of every channel by which a Spark baseline capture failed to
-    /// reach (or may not reach) the #4021 KV record: failed persist attempts
-    /// (GuardianBaselinePersister::persist_failures), throws firewalled around the staged-baseline
-    /// drain (engine + drain worker), captures DROPPED from staging (the 256-entry cap, an
-    /// allocation failure, or a restage; GuardianSparkRuntime::staged_baseline_drops), and drains
-    /// that found a capture staged with no KV store to write it to
-    /// (GuardianBaselinePersister::no_store_pending). Zero while healthy, quiescent, or inert
-    /// (prefer_spark off). Surfaced SPARSELY as `yuzu.guardian_baseline_persist_failures` via
-    /// emit_guardian_baseline_persist_heartbeat_tags. A non-zero value means a capture is
-    /// currently or was recently unpersisted (or lost): the rule still enforces on its in-memory
-    /// baseline, but a crash or full_sync before a retry recaptures current content.
+    /// #4045: cumulative-since-boot count of the channels by which a Spark baseline capture
+    /// failed to reach (or may not reach) the #4021 KV record: failed persist passes (one per
+    /// pass: a pass stops at its first failed write), throws firewalled around a pass (engine
+    /// and drain worker), captures DROPPED from staging (an allocation failure, or a retarget
+    /// that replaced a still-unpersisted capture; GuardianSparkRuntime::staged_baseline_drops),
+    /// and passes that found a capture staged with no KV store to write it to. Zero while
+    /// healthy, quiescent, or inert (prefer_spark off). Surfaced SPARSELY as
+    /// `yuzu.guardian_baseline_persist_failures` via emit_guardian_baseline_persist_heartbeat_tags.
+    /// Spark path ONLY: a legacy FileGuard persist failure is logged, not counted. Because it
+    /// is cumulative, a non-zero value says a failure or loss HAPPENED in this process, not
+    /// that one is still open; a failed capture stays staged and is retried (only drops and a
+    /// crash lose one), and the rule keeps enforcing on its in-memory baseline meanwhile.
+    /// LOCK-FREE (atomics only, never mtx_): the heartbeat thread calls it and must not wait
+    /// behind a long apply_rules.
     [[nodiscard]] std::uint64_t baseline_persist_failures() const;
+    /// #4045: cumulative count of staged captures the #4021 overwrite guard REFUSED to write
+    /// because a same-target record already existed (first capture wins). Not a failure and not
+    /// part of baseline_persist_failures(); it marks a rule whose live baseline may differ from
+    /// the durable record until its next re-arm. Lock-free. No heartbeat tag.
+    [[nodiscard]] std::uint64_t baseline_persist_refusals() const;
 
     /// Count of repeat-Unknown convergence re-evals whose guard.unhealthy was
     /// edge-suppressed (M1). Surfaced sparsely on the heartbeat as
@@ -902,8 +910,8 @@ private:
     /// engine-owned GuardianBaselinePersister. mtx_ held. Gated EXACTLY like the journal
     /// persist (prefer_spark_ && spark_runtime_ && persister wired), so it is inert at
     /// prefer_spark_=false. FIREWALLED (noexcept): reached from stop(), which the
-    /// destructor calls; a throw is counted in baseline_maint_exceptions_. Called ONLY from
-    /// apply_rules (before any teardown/re-arm, so the new generation's seed read observes
+    /// destructor calls; a throw is counted by the persister (note_firewalled_exception).
+    /// Called ONLY from apply_rules (before any teardown/re-arm, so the new generation's seed read observes
     /// the prior capture) and stop() (after the worker join); the third persister caller is
     /// the drain worker. NOT from journal_maintenance_tick: it runs only on a live
     /// connection and could not cover a pre-network boot re-arm.
@@ -1133,10 +1141,13 @@ private:
     /// (#2298) prune/page throws are counted on the drain worker instead; journal_stats() sums
     /// both into the single operator-facing guardian_journal_maint_exceptions tag.
     std::atomic<std::uint64_t> journal_maint_exceptions_{0};
-    /// #4045: throws out of persist_staged_baselines_locked() (take/restage allocation; the
-    /// per-tuple persist failures are counted by the persister itself). baseline_persist_failures()
-    /// sums it with the persister's and the drain worker's own counts.
-    std::atomic<std::uint64_t> baseline_maint_exceptions_{0};
+    /// #4045: the persister, published for LOCK-FREE readers (baseline_persist_failures /
+    /// baseline_persist_refusals). Stored with release by wire_spark_engine (under mtx_) right
+    /// after the persister is constructed, never cleared or replaced (wire is once-only and
+    /// rollback_spark_wiring_locked leaves the persister alone), and the object lives until
+    /// this engine's destructor, so an acquire load that sees non-null may dereference it for
+    /// as long as the engine is alive. Every other member read still needs mtx_.
+    std::atomic<GuardianBaselinePersister*> baseline_persister_published_{nullptr};
     /// TEST-ONLY (#4045): see set_apply_post_drain_hook_for_test / set_seed_read_hook_for_test.
     /// mtx_-guarded; null = no-op.
     std::function<void()> apply_post_drain_hook_for_test_;

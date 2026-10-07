@@ -243,7 +243,7 @@ void GuardianOutboxDrainWorker::drain_once() { rt_.drain(send_); }
 
 void GuardianOutboxDrainWorker::persist_staged_baselines_once() {
     if (maint_.baselines)
-        (void)maint_.baselines->persist_staged(rt_);
+        (void)maint_.baselines->persist_staged(rt_, GuardianBaselinePersister::Trigger::Worker);
 }
 
 GuardianSparkRuntime::DrainOutcome GuardianOutboxDrainWorker::drain_bounded() {
@@ -526,19 +526,28 @@ void GuardianOutboxDrainWorker::loop() {
         if (stop_requested())
             break;
         // #4045: persist Spark's staged baseline captures ahead of the drain. Its own firewall
-        // and counter (not firewalled_drain/journal_maint_exceptions_): a baseline write
-        // failing must neither skip this cycle's outbox drain nor blur the journal and delivery
-        // counters. Cheap when nothing is staged (one registry_mu_ take). A capture's
-        // compliant-edge enqueue woke this very cycle, so the record lands within milliseconds.
+        // and counter (the persister's, not firewalled_drain/journal_maint_exceptions_): a
+        // baseline write failing must neither skip this cycle's outbox drain nor blur the
+        // journal and delivery counters. Cheap when nothing is staged (one registry_mu_ take),
+        // and a no-op while the retry backoff after a failed pass has not elapsed: it is
+        // wake-driven, so enqueue churn cannot drive a retry storm, and one pass stops at its
+        // first failed write, so it cannot stall the outbox drain for more than about one KV
+        // busy timeout. A capture's compliant-edge enqueue normally wakes this very cycle, so
+        // the record usually lands within milliseconds; see guardian_baseline_persister.hpp
+        // LATENCY for the honest bound.
         try {
             persist_staged_baselines_once();
         } catch (...) {
-            const auto n = baseline_persist_exceptions_.fetch_add(1, std::memory_order_relaxed) + 1;
-            if (n == 1) {
+            // Nothing is lost (staging is untouched by a throw); count it on the persister's
+            // aggregate and log only the first.
+            const auto n = maint_.baselines ? maint_.baselines->firewalled_exceptions() : 0;
+            if (maint_.baselines)
+                maint_.baselines->note_firewalled_exception();
+            if (n == 0) {
                 try {
                     spdlog::error("Guardian drain worker: baseline persist step threw "
-                                  "(firewalled; agent survives, captures retried). Further "
-                                  "occurrences counted only.");
+                                  "(firewalled; agent survives, staged captures are retried). "
+                                  "Further occurrences counted only.");
                 } catch (...) {
                 }
             }

@@ -2428,6 +2428,7 @@ public:
                             kHbGuardianGeneration,
                             kHbGuardianTags,
                             kHbGuardianSparkHealth,
+                            kHbGuardianBaseline,
                             kHbGuardianGroupCount
                         };
                         std::array<std::uint64_t, kHbGuardianGroupCount> hb_guardian_failures{};
@@ -2696,11 +2697,6 @@ public:
                                 // dormant or has simply never hit the ceiling.
                                 emit_guardian_io_ceiling_heartbeat_tags(
                                     tags, guardian_->io_ceiling_rejections());
-                                // #4045: failed Spark baseline-capture persists (sparse, 0 omits
-                                // the tag). Not gated on prefer_spark_: the count is 0 while
-                                // Spark is inert, equally truthful as "never failed".
-                                emit_guardian_baseline_persist_heartbeat_tags(
-                                    tags, guardian_->baseline_persist_failures());
                                 // M1: a rule stuck Unknown re-evals every ~5s; guard.unhealthy is
                                 // edge-emitted, each suppressed repeat is counted (unhealthy_
                                 // suppressed), and each errored_refresh_ms-cadence re-emission is
@@ -2770,6 +2766,22 @@ public:
                                                       "Guardian heartbeat claim-health gauges "
                                                       "failed (the claim-health tags were "
                                                       "skipped this tick)");
+                              }
+                              // Group D2 (LAST, its own try so it can neither drop an older
+                              // tag nor be dropped by one): #4045, the Spark baseline-persist
+                              // aggregate (sparse, 0 omits the tag; every channel is listed on
+                              // GuardianEngine::baseline_persist_failures()). Spark path ONLY:
+                              // a legacy FileGuard persist failure is logged, not counted, so
+                              // an absent tag is NOT evidence that baselines persisted. Not
+                              // gated on prefer_spark_ (0 while Spark is inert). Lock-free
+                              // read: it cannot wait behind apply_rules.
+                              try {
+                                emit_guardian_baseline_persist_heartbeat_tags(
+                                    tags, guardian_->baseline_persist_failures());
+                              } catch (...) {
+                                  hb_guardian_contain(kHbGuardianBaseline,
+                                                      "Guardian heartbeat baseline-persist tag "
+                                                      "failed (the tag was skipped this tick)");
                               }
                             }
 #if defined(_WIN32) || defined(__linux__) || defined(__APPLE__)
