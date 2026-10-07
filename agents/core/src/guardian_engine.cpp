@@ -164,18 +164,19 @@ std::string hex_decode(std::string_view hex) {
 // baseline per rule_id in KvStore so every later arm re-seeds the SAME value
 // instead of recapturing current content.
 //
-// Scope of this fix (deliberate, documented - see #4021 PR description): wired for
-// the LEGACY FileGuard path only (start_guard_for_rule_locked below), the
-// currently-shipped detection backend (prefer_spark_ defaults false - "legacy
-// IGuard remains the sole live detection path"). The SEED lookup below also
-// benefits a rule armed via Spark (reconcile_rule_locked mutates the shared
-// RuleAssertion before the backend fork), so a baseline captured under legacy
-// survives a later flip to Spark. Spark's OWN capture (guardian_rule_eval.cpp /
-// guardian_spark_runtime.cpp) is NOT wired to this store - those files are
-// Spark-workstream-in-flight elsewhere; under prefer_spark_=true a first-ever
-// Spark-side capture is not yet persisted here, so the SAME full_sync-relaunder
-// gap remains for a rule that has NEVER been armed via legacy. Tracked as
-// #4045 rather than a bare prose follow-up (adversarial-review K4/C2-3).
+// Scope: wired for BOTH detection backends (Spark's is live only under prefer_spark_=true). The LEGACY FileGuard persists synchronously from
+// its own worker (start_guard_for_rule_locked below, via on_baseline). Spark's OWN capture
+// (guardian_rule_eval.cpp's baseline-on-arm branch, committed in guardian_spark_runtime.cpp)
+// is persisted by the staging seam (#4045): the runtime holds no KvStore (it is the
+// detach-survival object), so it only STAGES the capture edge and the engine-owned
+// GuardianBaselinePersister, defined below guardian_persist_baseline, drains that staging from
+// apply_rules (before any teardown or re-arm), stop(), and the drain worker. Both paths write
+// the same `baseline:<rule_id>` record through guardian_persist_baseline's overwrite guard, and
+// the SEED lookup in both reconcile paths reads it back, so a baseline captured under either
+// backend survives a full_sync, a restart, and a flip between backends.
+// The crash window between a capture and its (sub-second) persist is accepted: the next boot
+// recaptures current content, the same class as a legacy crash inside the synchronous write.
+// Closes #4045 (adversarial-review K4/C2-3).
 constexpr int kBaselineSchemaVersion = 1;
 
 std::string make_baseline_key(const std::string& rule_id) {
@@ -233,6 +234,11 @@ struct BaselineRecord {
     std::string hash;
 };
 
+/// What guardian_persist_baseline did (#4045). Refused is NOT a failure: the #4021 overwrite
+/// guard kept an existing same-target record (first capture wins), so a caller that retries
+/// failures must not retry it. Failed covers a null store and a kv->set failure.
+enum class BaselinePersistOutcome { Written, Refused, Failed };
+
 /// Gate 2 governance (security-guardian): NOT `_locked` despite the name every
 /// other `*_locked` helper in this file uses for "called under mtx_" - this one
 /// touches only `KvStore` (its own internal mutex) and is called from a guard
@@ -284,8 +290,9 @@ BaselineReadOutcome read_baseline_record(KvStore& kv, const std::string& rule_id
 /// Look up a persisted baseline for `rule_id`, returning it ONLY when the stored
 /// fingerprint matches `fingerprint` (a mismatch is a genuinely different target,
 /// not a failure - the caller captures fresh, same as a rule with no baseline at
-/// all). A read failure or a malformed record is logged and treated as absent
-/// (capture fresh) rather than propagated as an arm failure: the legacy FileGuard
+/// all). Both arm paths seed through this (legacy start_guard_for_rule_locked and Spark
+/// reconcile_rule_locked). A read failure or a malformed record is logged and treated as
+/// absent (capture fresh) rather than propagated as an arm failure: the legacy FileGuard
 /// has no "errored, don't arm" channel for this today (unlike Spark's Unhealthy
 /// verdict), and a KvStore read failure here is the same failure mode every other
 /// KV-backed read in this file already degrades-and-logs on (put_rule_locked's own
@@ -345,10 +352,11 @@ std::optional<std::string> guardian_seed_baseline(KvStore& kv, const std::string
 /// read degrades to "write anyway" — the pre-existing, narrower posture — logged
 /// distinctly, so a KV outage cannot indefinitely wedge a rule out of ever
 /// getting a persisted baseline at all.
-void guardian_persist_baseline(KvStore* kv, const std::string& rule_id,
-                               const std::string& fingerprint, const std::string& hash) {
+BaselinePersistOutcome guardian_persist_baseline(KvStore* kv, const std::string& rule_id,
+                                                 const std::string& fingerprint,
+                                                 const std::string& hash) {
     if (!kv)
-        return;
+        return BaselinePersistOutcome::Failed;
     BaselineRecord existing;
     switch (read_baseline_record(*kv, rule_id, existing)) {
     case BaselineReadOutcome::Ok:
@@ -356,9 +364,10 @@ void guardian_persist_baseline(KvStore* kv, const std::string& rule_id,
             spdlog::warn("Guardian: refusing to overwrite rule '{}''s persisted baseline with a "
                         "fresh capture for the SAME target - a capture attempt only reaches "
                         "here for an already-baselined target via a failed seed lookup "
-                        "(adversarial-review K1/C2-1); keeping the existing record",
+                        "(adversarial-review K1/C2-1), or when a Spark re-arm raced ahead of "
+                        "a still-unpersisted capture (#4045); keeping the existing record",
                         log_id_token(rule_id));
-            return;
+            return BaselinePersistOutcome::Refused;
         }
         break; // different fingerprint - a genuine retarget, write below
     case BaselineReadOutcome::Absent:
@@ -380,7 +389,9 @@ void guardian_persist_baseline(KvStore* kv, const std::string& rule_id,
                      "full_sync or restart will re-capture current content instead of this "
                      "one (#4021)",
                      log_id_token(rule_id));
+        return BaselinePersistOutcome::Failed;
     }
+    return BaselinePersistOutcome::Written;
 }
 
 nlohmann::json block_to_json(const gpb::GuardianSpecBlock& b) {
@@ -605,6 +616,52 @@ bool persist_legacy_sink_loss_ledger(KvStore* kv, const GuardianLegacySinkExecut
 }
 
 } // namespace
+
+/// #4045: drain Spark's staged baseline captures into the #4021 record (declared in
+/// guardian_baseline_persister.hpp; defined here so it can call the anonymous-namespace
+/// fingerprint/persist helpers above without moving them). See the header for ownership,
+/// locking and the closed set of callers.
+GuardianBaselinePersister::Outcome GuardianBaselinePersister::persist_staged(GuardianSparkRuntime& rt) {
+    Outcome out;
+    // No store: nothing can be persisted, and taking would only discard (or, restaged, count a
+    // failure on every worker cycle). Leave the capture staged; the runtime's cap bounds it.
+    if (!kv_)
+        return out;
+    std::lock_guard<std::mutex> lk{persist_mu_};
+    auto taken = rt.take_staged_baselines();
+    if (taken.empty())
+        return out;
+    std::vector<GuardianSparkRuntime::CapturedBaseline> failed;
+    failed.reserve(taken.size());
+    for (auto& t : taken) {
+        BaselinePersistOutcome r = BaselinePersistOutcome::Failed;
+        try {
+            // The fingerprint is built from the RAW spark path, the same string the arm-time
+            // seed fingerprints (reconcile_rule_locked), so seed and persist cannot disagree.
+            r = guardian_persist_baseline(kv_, t.rule_id,
+                                          guardian_baseline_fingerprint("file-hash-equals", t.path),
+                                          t.hash);
+        } catch (...) {
+            // json dump()/string allocation; counted as Failed below, retried next drain.
+        }
+        switch (r) {
+        case BaselinePersistOutcome::Written:
+            ++out.written;
+            break;
+        case BaselinePersistOutcome::Refused:
+            ++out.refused;
+            break;
+        case BaselinePersistOutcome::Failed:
+            ++out.failed;
+            persist_failures_.fetch_add(1, std::memory_order_relaxed);
+            failed.push_back(std::move(t));
+            break;
+        }
+    }
+    if (!failed.empty())
+        rt.restage_baselines(std::move(failed));
+    return out;
+}
 
 GuardianEngine::GuardianEngine(KvStore* kv, std::string agent_id, bool prefer_spark)
     : kv_{kv}, agent_id_{std::move(agent_id)},
@@ -951,6 +1008,11 @@ void GuardianEngine::stop() {
     } catch (...) {
         journal_maint_exceptions_.fetch_add(1, std::memory_order_relaxed);
     }
+    // #4045: flush Spark's staged baseline captures. The drain worker is joined and the runtime
+    // refuses new commits after begin_stop(), so this drain is complete; take_staged_baselines
+    // is deliberately not gated on stopping_ for exactly this call. A capture whose persist is
+    // still failing here is lost to this process (next boot recaptures); it was counted.
+    persist_staged_baselines_locked();
     stopped_ = true;
     started_ = false;
 }
@@ -1026,6 +1088,22 @@ void GuardianEngine::persist_lifecycle_journal_locked(std::size_t max_batches,
         for (const auto& b : batches)
             if (!b.event_ids.empty())
                 spark_runtime_->backfill_batch_provenance(b.key, b.event_ids, b.event_ids.back());
+    }
+}
+
+void GuardianEngine::persist_staged_baselines_locked() noexcept {
+    // mtx_ held. Same gate as the journal persist: nothing is staged unless Spark is the
+    // ACTIVE backend (a key exists only after attach_rule), so this is inert at
+    // prefer_spark_=false, not merely unobservable.
+    if (!prefer_spark_ || !spark_runtime_ || !baseline_persister_)
+        return;
+    try {
+        // Per-tuple persist failures are counted and restaged INSIDE the persister; what can
+        // still throw here is the take/restage allocation. Firewalled for the same reason as
+        // the journal flush: stop() is reached from the implicitly noexcept destructor.
+        (void)baseline_persister_->persist_staged(*spark_runtime_);
+    } catch (...) {
+        baseline_maint_exceptions_.fetch_add(1, std::memory_order_relaxed);
     }
 }
 
@@ -1252,6 +1330,13 @@ std::uint64_t GuardianEngine::io_ceiling_rejections() const {
     return spark_runtime_ ? spark_runtime_->io_ceiling_rejections() : 0;
 }
 
+std::uint64_t GuardianEngine::baseline_persist_failures() const {
+    std::lock_guard lock(mtx_);
+    return baseline_maint_exceptions_.load(std::memory_order_relaxed) +
+           (baseline_persister_ ? baseline_persister_->persist_failures() : 0) +
+           (spark_drain_worker_ ? spark_drain_worker_->baseline_persist_exception_count() : 0);
+}
+
 std::uint64_t GuardianEngine::unhealthy_suppressed() const {
     std::lock_guard lock(mtx_);
     return spark_runtime_ ? spark_runtime_->unhealthy_suppressed() : 0;
@@ -1429,6 +1514,12 @@ GuardianEngine::apply_rules(const gpb::GuaranteedStatePush& push) {
         }
     };
 
+    // #4045: persist Spark's staged baseline captures BEFORE any teardown or re-arm. Every push
+    // (full_sync teardown, same-id replace, the #5459 valve re-applies) re-arms through
+    // reconcile_rule_locked, whose seed read must observe the previous generation's capture;
+    // draining here, under the same mtx_ critical section as that read, makes the ordering
+    // deterministic. Waits for an in-flight worker batch (persister's persist_mu_).
+    persist_staged_baselines_locked();
     std::size_t applied = 0;
     std::size_t reconcile_failures = 0;
     // rung 9c PR-2 Unit 6 (R5.3): rules ACCEPTED this push whose arm has not yet
@@ -2779,6 +2870,7 @@ void GuardianEngine::wire_spark_engine(SparkEngine* engine, bool spark_disabled_
         // The same pointer also drives the worker's journal-maintenance pass (prune + page),
         // relocated off the heartbeat / reconnect threads by C0.
         GuardianMaintenanceConfig maint{.journal = journal};
+        maint.baselines = baseline_persister_; // #4045: the worker is the always-on persister
         maint.jitter = maintenance_jitter_;
         if (test_page_interval_.count() > 0)
             maint.page_interval = test_page_interval_;

@@ -241,6 +241,11 @@ void GuardianOutboxDrainWorker::notify() {
 
 void GuardianOutboxDrainWorker::drain_once() { rt_.drain(send_); }
 
+void GuardianOutboxDrainWorker::persist_staged_baselines_once() {
+    if (maint_.baselines)
+        (void)maint_.baselines->persist_staged(rt_);
+}
+
 GuardianSparkRuntime::DrainOutcome GuardianOutboxDrainWorker::drain_bounded() {
     GuardianSparkRuntime::DrainLimits limits;
     limits.max_entries = maint_.drain_budget;
@@ -520,6 +525,24 @@ void GuardianOutboxDrainWorker::loop() {
 
         if (stop_requested())
             break;
+        // #4045: persist Spark's staged baseline captures ahead of the drain. Its own firewall
+        // and counter (not firewalled_drain/journal_maint_exceptions_): a baseline write
+        // failing must neither skip this cycle's outbox drain nor blur the journal and delivery
+        // counters. Cheap when nothing is staged (one registry_mu_ take). A capture's
+        // compliant-edge enqueue woke this very cycle, so the record lands within milliseconds.
+        try {
+            persist_staged_baselines_once();
+        } catch (...) {
+            const auto n = baseline_persist_exceptions_.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (n == 1) {
+                try {
+                    spdlog::error("Guardian drain worker: baseline persist step threw "
+                                  "(firewalled; agent survives, captures retried). Further "
+                                  "occurrences counted only.");
+                } catch (...) {
+                }
+            }
+        }
         const auto drained = firewalled_drain();
 
         // #3953 item 3: firewalled like every other read in this bare-thread tail (the

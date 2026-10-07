@@ -313,6 +313,15 @@ public:
     /// outbox_backpressure_drops()'s own shape.
     [[nodiscard]] std::uint64_t io_ceiling_rejections() const;
 
+    /// #4045: cumulative failed attempts to persist a Spark baseline capture to the #4021 KV
+    /// record (GuardianBaselinePersister::persist_failures), plus throws firewalled around the
+    /// staged-baseline drain (engine + drain worker). Zero while healthy, quiescent, or inert
+    /// (prefer_spark off). Surfaced SPARSELY as `yuzu.guardian_baseline_persist_failures` via
+    /// emit_guardian_baseline_persist_heartbeat_tags. A non-zero value means a capture is
+    /// currently or was recently unpersisted: the rule still enforces on its in-memory
+    /// baseline, but a crash or full_sync before the retry recaptures current content.
+    [[nodiscard]] std::uint64_t baseline_persist_failures() const;
+
     /// Count of repeat-Unknown convergence re-evals whose guard.unhealthy was
     /// edge-suppressed (M1). Surfaced sparsely on the heartbeat as
     /// `yuzu.guardian_unhealthy_suppressed` so a rule stuck errored is observable
@@ -864,6 +873,17 @@ private:
     /// drain what it was given.
     void persist_lifecycle_journal_locked(std::size_t max_batches, std::size_t max_records);
 
+    /// #4045: drain Spark's staged baseline-on-arm captures into the #4021 KV record via the
+    /// engine-owned GuardianBaselinePersister. mtx_ held. Gated EXACTLY like the journal
+    /// persist (prefer_spark_ && spark_runtime_ && persister wired), so it is inert at
+    /// prefer_spark_=false. FIREWALLED (noexcept): reached from stop(), which the
+    /// destructor calls; a throw is counted in baseline_maint_exceptions_. Called ONLY from
+    /// apply_rules (before any teardown/re-arm, so the new generation's seed read observes
+    /// the prior capture) and stop() (after the worker join); the third persister caller is
+    /// the drain worker. NOT from journal_maintenance_tick: it runs only on a live
+    /// connection and could not cover a pre-network boot re-arm.
+    void persist_staged_baselines_locked() noexcept;
+
     /// Step 4: arm (or re-arm) the on-box guard for a rule. Reads the rule's
     /// spark type to pick the guard: file-change to FileGuard,
     /// service-status-change to ServiceGuard (Windows) or SystemdServiceGuard
@@ -1088,6 +1108,10 @@ private:
     /// (#2298) prune/page throws are counted on the drain worker instead; journal_stats() sums
     /// both into the single operator-facing guardian_journal_maint_exceptions tag.
     std::atomic<std::uint64_t> journal_maint_exceptions_{0};
+    /// #4045: throws out of persist_staged_baselines_locked() (take/restage allocation; the
+    /// per-tuple persist failures are counted by the persister itself). baseline_persist_failures()
+    /// sums it with the persister's and the drain worker's own counts.
+    std::atomic<std::uint64_t> baseline_maint_exceptions_{0};
     /// TEST-ONLY drain-worker timing overrides (see set_drain_worker_timing_for_test);
     /// 0 / zero-duration means "keep the production default".
     std::uint64_t test_periodic_bound_ms_{0};
