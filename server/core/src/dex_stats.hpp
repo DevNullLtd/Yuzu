@@ -283,11 +283,7 @@ inline Bounds wilson_bounds(double p, double n) {
 } // namespace detail
 
 /// A point estimate with its 95 percent interval, shared by every statistic
-/// here. `estimate` and `reliable` mean what the producing function's comment
-/// says: dex_proportion (proportion; numerator >= kDexStatsReliableMinEvents),
-/// dex_rate (events per unit of exposure; events >= kDexStatsReliableMinEvents),
-/// dex_rate_ratio (rate A over rate B, +infinity when events_b == 0; BOTH arms
-/// >= kDexStatsReliableMinEvents).
+/// here; see each function for what `estimate` and `reliable` mean.
 struct DexInterval {
     double estimate;
     double lower;
@@ -296,10 +292,10 @@ struct DexInterval {
 };
 
 /// events / trials with a Wilson interval; `estimate` is the proportion and
-/// `reliable` is events >= kDexStatsReliableMinEvents. nullopt iff trials <= 0, events < 0
-/// or events > trials. events == 0 gives lower exactly 0 and events == trials
-/// gives upper exactly 1. `reliable` is about the numerator the caller counts
-/// (for example crashes), not its complement.
+/// `reliable` is events >= kDexStatsReliableMinEvents, judged on the numerator
+/// the caller counts (crashes, say), never its complement. nullopt iff
+/// trials <= 0, events < 0 or events > trials. events == 0 gives lower exactly
+/// 0 and events == trials gives upper exactly 1.
 [[nodiscard]] inline std::optional<DexInterval> dex_proportion(std::int64_t events,
                                                                  std::int64_t trials) {
     if (trials <= 0 || events < 0 || events > trials)
