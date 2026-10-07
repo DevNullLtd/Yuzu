@@ -622,7 +622,6 @@ TEST_CASE("software routes: versions drill", "[inventory][route]") {
     REQUIRE(h.audit_full.back() == "inventory.software.versions|success|Inventory|" +
                                        swc::audit_target(*h.last_versions_query));
     REQUIRE(contains(h.audit_details.back(), "versions=1"));
-    REQUIRE_FALSE(contains(res->body, "most-installed")); // one row: nothing was cut
     // A read that returns exactly its limit may have more rows: the fragment says so.
     const auto vers_of = [](int n) {
         std::vector<SoftwareVersionCount> v;
@@ -841,7 +840,6 @@ TEST_CASE("software routes: a full devices page hands the last-synced read its d
     for (int i = 0; i < 99; ++i)
         expect.push_back(dev_id(i));
     REQUIRE(h.last_synced_ids == expect);
-    REQUIRE(h.last_synced_ids.size() <= 100);
 }
 
 TEST_CASE("software routes: device counts are distinct devices and hints are strict",

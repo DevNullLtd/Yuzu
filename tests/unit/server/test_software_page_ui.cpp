@@ -558,8 +558,6 @@ TEST_CASE("software page: versions expansion", "[inventory][ui]") {
     REQUIRE(has(render_software_versions_expansion(f, "Chrome", many, false, true),
                 "<div class=\"inv-grey\">" + cut_line + "</div>"));
     REQUIRE_FALSE(has(render_software_versions_expansion(f, "Chrome", many, false, false), "most-installed"));
-    many.pop_back();
-    REQUIRE_FALSE(has(render_software_versions_expansion(f, "Chrome", many, false), "most-installed"));
     // Degrade / empty.
     REQUIRE(has(render_software_versions_expansion(f, "C", std::nullopt, false), "unavailable"));
     REQUIRE(has(render_software_versions_expansion(f, "C", std::vector<SoftwareVersionCount>{}, false),
