@@ -24,6 +24,64 @@ This guide covers upgrading Yuzu components (server, agent, gateway) between ver
 
 **Rule of thumb:** agents and gateway should be the same minor version as the server, or one minor version behind. The server is always upgraded first. Upgrading the server first restarts it while gateways stay connected. A gateway at this version re-registers the sessions the server reports unknown, so a server-only restart recovers without operator action once both sides are upgraded; see [What happens when the server restarts](gateway.md#what-happens-when-the-server-restarts). Behind a gateway that does not yet read that report (which includes the server restart that ships this fix, because the server is upgraded first; restart the gateway after upgrading it, and read the next sentence first), agents can read offline after a server restart (observed on one local rig after a SIGKILL restart; graceful upgrade restarts were not tested), and dispatch worked only for the remaining route lease (up to about 90 s). A gateway restart disconnects every agent that gateway holds, and the agent then has to register again by itself: in a graceful gateway restart test, released v0.13.0 and v0.14.0-rc6 agents with default settings stayed wedged and v0.12.0 never re-registered (bug #2182, fixed by #5183, which is in no release tag yet), while a build with the fix re-registered in 11 to 12 s. Upgrade the agents to a build that includes #5183 before the gateway restart where you have one, or expect to restart the agent service on the released agents behind it; see "Agent dependency" in [What happens when the server restarts](gateway.md#what-happens-when-the-server-restarts).
 
+## Behaviour change: `POST /api/instructions/{id}/execute` now validates `params` against the stored schema
+
+**What changed.** The route checks the request's `params` against the definition's stored
+`parameter_schema` and answers `400` (`invalid params: <path>: <reason>`) when they do not conform. The
+check runs after the permission checks and before the approval gate, so a refused call creates no
+approval ticket, execution row or dispatch. It is strict: a name the schema does not declare, a value of
+the wrong type or outside `enum`, `pattern`, `minimum`/`maximum` or length bounds, a missing required
+parameter, a string containing a NUL, and a non-object `params` are all refused. A definition with no
+stored schema (empty, whitespace or `{}`) is not validated. A stored schema that cannot be prepared makes
+the route answer `500` instead of dispatching. A schema is also checked when it is written:
+`POST /api/instructions/import` refuses an over-limit or invalid `parameter_schema` with a `400`, and a
+bundled definition that fails the same check makes the server refuse to boot (the golden test guards the
+shipped content). Updating a definition (`PUT`, the YAML editor, response templates) keeps its stored
+schema. Details: [REST API](rest-api.md), [Instructions](instructions.md#parameter-validation).
+
+**Who is affected.** Callers that send something the stored schema does not accept:
+
+- **Names the definition does not declare.** They used to ride through to the plugin; they are now `400`
+  (path `/*`, the name is not echoed). Six shipped definitions under-declared what their plugin reads and
+  are corrected in this release: `agent.content_dist.cleanup` (`hours`), `agent.content_dist.execute_staged`
+  (`expected_hash`), `device.wol.check` (`timeout_ms`), `device.agent_actions.set_log_level` (any letter
+  case, plus the `warning` and `err` aliases the agent accepts), `workflow.config_search_and_replace`
+  (now `path`, `search`, `replacement`, `regex`, `case_sensitive`, `dry_run`, `max_replacements`) and
+  `workflow.version_compliance_check` (now `path`). The two `workflow.*` definitions used to declare
+  parameter names their plugin never read.
+- **Values outside an enum or a bound.** `enum` is case-sensitive (`"True"` and `"1"` are refused for a
+  `true`/`false` enum), and a value above a declared `maximum` (or below a `minimum`) is `400` where a plugin
+  may have clamped it (for example `device.agent_logging.get_log` `lines` above 500).
+- **`""` and `null` for optional parameters.** They are values, not omissions: they are refused for an optional
+  integer, `enum` or `pattern` parameter. Omit the key instead.
+
+**Not affected.** The 7 shipped definitions that have no `parameters:` block and so store no schema
+(`windows.app_control.wdac_policy`, `windows.app_control.applocker_policy`,
+`crossplatform.local_security_policy.password_policy`, `...lockout_policy`, `...audit_policy`,
+`...sudoers` and `windows.rdp.status`), definitions saved from YAML or created in the dashboard, and every
+other dispatch surface (workflow steps, schedules, policy remediation, result-set producers, MCP
+`execute_instruction`, `POST /api/command`), which do not validate yet.
+
+**A stored schema is not refreshed by an upgrade.** The bundled reseed inserts a definition only when its id
+is absent (`ON CONFLICT (id) DO NOTHING`), so the six corrections above reach fresh installs only; an existing
+install keeps the old stored schema and keeps refusing the same calls until it is replaced. Comparing the
+parameter declarations at `v0.14.0` with this release, exactly 6 definitions differ in what the server
+enforces (the six above), and 13 more differ only in `description` text and enforce what they did
+(`agent.content_dist.upload_file`, `device.agent_logging.get_log`, `device.event_logs.errors`,
+`device.event_logs.query`, `device.filesystem.find_by_hash`, `device.filesystem.read`,
+`device.filesystem.search`, `device.filesystem.search_dir`, `device.script_exec.bash`,
+`device.script_exec.exec`, `device.script_exec.powershell`, `device.windows_updates.patch_connectivity`,
+`workflow.patch_connectivity_audit`).
+
+**Detecting it.** Each refusal writes an `instruction.execute` audit row with `result=denied` and detail
+`reason=param_schema path=<path>` (or `reason=param_schema_invalid` for the `500`), and increments
+`yuzu_server_instruction_param_rejected_total{route="instruction_execute",reason}`. See
+[Audit log](audit-log.md) and [Metrics](metrics.md).
+
+**Rollback.** No migration and no schema change. Rolling the server back removes the check; rolling forward
+re-applies it. While replicas run different releases the same call can be refused by one and accepted by
+another.
+
 ## Operator note: the software-inventory store migration (v7) is a hard cutover (#5172)
 
 Schema v7 of the software-inventory store adds `package_id` and `source` columns and a row id to

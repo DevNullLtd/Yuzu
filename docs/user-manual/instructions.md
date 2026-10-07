@@ -380,6 +380,45 @@ parameters:
       default: false
 ```
 
+### Parameter validation
+
+`POST /api/instructions/{id}/execute` validates the request's `params` against the definition's stored
+`parameter_schema` before the approval gate, strictly (details and error bodies: [REST API](rest-api.md)).
+A refused call creates no approval ticket, execution row or dispatch. Enforced as declared:
+
+- a name the schema does not declare is refused (path `/*`); a required name without a `default` must
+  be sent; a `default` satisfies `required` but is **not** injected, so the plugin still receives only
+  what you sent;
+- `type`, `enum` (case-sensitive), `pattern` (anchor it: it is a search, not a full match), `minimum`/`maximum`
+  (`int32` also gets the 32-bit range) and `minLength`/`maxLength`;
+- an integer is a JSON integer or a string of digits with an optional leading `-` (`"+5"`, `" 5"`,
+  `"5.0"` and JSON `5.0` are refused); a boolean is `true`/`false` or the strings `"true"`/`"false"`;
+- `null` is never read as an omission: a parameter refuses it (omit the key instead);
+- a string containing a NUL character is refused.
+
+A definition that stores no schema (empty, whitespace or `{}`, which is what the YAML editor stores for a
+definition created there) is not validated. The YAML editor, `PUT /api/instructions/{id}` and
+response-template changes **keep** the stored schema: editing `spec.parameters` in the YAML editor does not
+change what execute enforces.
+
+Limits on a stored schema (a schema over a limit is refused when it is written, and a stored one that is
+over a limit makes execute answer `500`):
+
+| Limit | Value |
+|---|---|
+| schema text | 262144 bytes |
+| properties per schema | 128 |
+| members per `enum` | 256 |
+| `pattern` length | 1024 bytes |
+| compiled pattern size | 32768 RE2 instructions each, 65536 per schema, and RE2's 512 KiB memory budget per pattern |
+| integer `minimum`/`maximum` | magnitude below 2^53 |
+| string matched against a `pattern` | 64 KiB |
+| matching work per request (or per schema, for `default`s) | (bytes + 1) x pattern size, plus one unit per `enum` member compared, up to 16777216 |
+
+`enabled: false` hides a definition from the discovery catalog and stops its schedules (the schedule
+poller records `definition_disabled`), but it does **not** stop `POST /api/instructions/{id}/execute`:
+that route does not read `enabled`.
+
 ---
 
 ## 6. Result Schema and Aggregation
