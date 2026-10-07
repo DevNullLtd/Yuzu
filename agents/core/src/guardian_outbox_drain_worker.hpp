@@ -313,14 +313,19 @@ public:
     void drain_once();
 
     /// Persist Spark's staged baseline captures (#4045), once, via maint_.baselines (a no-op
-    /// when unset), as a Trigger::Worker pass: it honours the persister's retry backoff and
-    /// polls this worker's stop flag between tuples. Returns true iff the pass ran out of
-    /// budget with captures still staged and no failure (the loop then runs again at once).
-    /// loop() runs this every cycle before the outbox drain; it is public so a test can drive
-    /// it synchronously. NOT firewalled here (loop() firewalls it and counts into the
-    /// persister's firewalled_exceptions()). Takes the persister's leaf persist_mu_ and never
-    /// GuardianEngine::mtx_.
-    bool persist_staged_baselines_once();
+    /// when unset), as a Trigger::Worker pass: it honours the persister's retry backoff,
+    /// polls this worker's stop flag between tuples and yields to a fence / apply_rules waiter.
+    /// Returns the pass outcome (a default Outcome when unset): `budget_exhausted` means it
+    /// ran out of budget with captures still staged and no failure (the loop then runs again
+    /// at once), `yielded` that it deferred (the loop re-checks within
+    /// kGuardianSendRecheckInterval, with no wake needed). loop() runs this every cycle before
+    /// the outbox drain; it is public so a test can drive it synchronously. NOT firewalled
+    /// here (loop() firewalls it and counts into the persister's firewalled_exceptions()).
+    /// Takes the persister's leaf persist_mu_ and never GuardianEngine::mtx_.
+    GuardianBaselinePersister::Outcome persist_staged_baselines_once();
+
+    /// TEST-ONLY: true once stop() has been requested (the flag the baseline pass polls).
+    [[nodiscard]] bool stop_requested_for_test() const noexcept { return stop_requested(); }
 
     /// TEST-ONLY: pin the jitter source so offsets are reproducible. Intended before
     /// start(), but it takes sig_->mu regardless: the RNG is worker-thread state guarded by

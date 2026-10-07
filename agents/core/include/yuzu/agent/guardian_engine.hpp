@@ -1242,6 +1242,9 @@ private:
     /// no longer load-bearing.
     std::shared_ptr<GuardianLifecycleJournal> lifecycle_journal_;
     std::shared_ptr<GuardianBaselinePersister> baseline_persister_; ///< #4045; borrows kv_
+    /// #4045: stop()'s final baseline flush has run once (mtx_-guarded): the destructor's second
+    /// stop() must not flush, or log the skip, again.
+    bool baseline_stop_flush_done_{false};
     std::unique_ptr<ConvergenceScheduler> spark_scheduler_;
     std::unique_ptr<GuardianOutboxDrainWorker> spark_drain_worker_;
 };

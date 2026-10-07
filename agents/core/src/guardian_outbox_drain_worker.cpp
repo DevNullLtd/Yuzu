@@ -241,13 +241,11 @@ void GuardianOutboxDrainWorker::notify() {
 
 void GuardianOutboxDrainWorker::drain_once() { rt_.drain(send_); }
 
-bool GuardianOutboxDrainWorker::persist_staged_baselines_once() {
+GuardianBaselinePersister::Outcome GuardianOutboxDrainWorker::persist_staged_baselines_once() {
     if (!maint_.baselines)
-        return false;
-    return maint_.baselines
-        ->persist_staged(rt_, GuardianBaselinePersister::Trigger::Worker,
-                         [this] { return stop_requested(); })
-        .budget_exhausted;
+        return {};
+    return maint_.baselines->persist_staged(rt_, GuardianBaselinePersister::Trigger::Worker,
+                                            [this] { return stop_requested(); });
 }
 
 GuardianSparkRuntime::DrainOutcome GuardianOutboxDrainWorker::drain_bounded() {
@@ -329,6 +327,10 @@ void GuardianOutboxDrainWorker::loop() {
     // without becoming a wake SOURCE itself (no sig_->gen bump, no notify_all) - see the
     // wait computation's own comment for why that distinction is what keeps R4 sound.
     bool send_in_flight_pending = false;
+    // #4045: the baseline pass yielded to an apply_rules or a fence waiter (or deferred while an
+    // apply_rules was in flight). Nothing wakes the worker when that apply finishes, so the wait
+    // is clamped like send_in_flight_pending (a WAIT clamp, not a wake source).
+    bool baseline_recheck_pending = false;
     // Concurrent arm/disarm traffic can refill the window between the end-of-cycle headroom
     // check and the next page pass, so the immediate re-arm could chain indefinitely - each
     // link a full journal scan. The token bucket does NOT bound that: take() is charged only
@@ -402,7 +404,7 @@ void GuardianOutboxDrainWorker::loop() {
             // loop's own cv.wait_for blocks before re-evaluating its own predicate, so R4
             // (whose sink is fully synchronous - offer() never returns nullopt there, so
             // send_in_flight_pending is always false in that test) is untouched.
-            if (send_in_flight_pending)
+            if (send_in_flight_pending || baseline_recheck_pending)
                 wait_ms = (std::min)(wait_ms, kGuardianSendRecheckInterval);
             sig_->cv.wait_for(lk, wait_ms, [this, seen] {
                 return sig_->stopping.load(std::memory_order_acquire) || sig_->gen != seen;
@@ -540,13 +542,19 @@ void GuardianOutboxDrainWorker::loop() {
         // plus one in-flight KV write. A pass that ran out of budget with captures still staged
         // and no failure sets `baselines_more`: the loop then runs again without waiting
         // (below, after the drain, which would otherwise overwrite skip_wait), so a backlog
-        // larger than one budget drains back to back instead of one pass per wake. A
+        // larger than one budget drains back to back instead of one pass per wake. A pass that
+        // yielded (to an apply_rules or a fence waiter) sets `baseline_recheck_pending`, which
+        // only clamps the next wait to kGuardianSendRecheckInterval (nothing wakes this thread
+        // when the apply finishes, and a clamp is not a wake source). A
         // capture's compliant-edge enqueue normally wakes this very cycle, so the record
         // usually lands within milliseconds; see guardian_baseline_persister.hpp LATENCY for
         // the honest bound.
         bool baselines_more = false;
+        baseline_recheck_pending = false;
         try {
-            baselines_more = persist_staged_baselines_once();
+            const auto baseline_pass = persist_staged_baselines_once();
+            baselines_more = baseline_pass.budget_exhausted;
+            baseline_recheck_pending = baseline_pass.yielded;
         } catch (...) {
             // Nothing is lost (staging is untouched by a throw); count it on the persister's
             // aggregate and log only the first THIS WORKER sees: the latch is local, because the
