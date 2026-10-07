@@ -3126,3 +3126,194 @@ tests:
       - expr: 'ALERTS{alertname="YuzuGuardianReadDegraded"}'
         eval_time: 20m
         exp_samples: []
+
+  # -- Gateway-upstream peer authorization (group yuzu-security) -------------
+  #
+  # yuzu_server_gateway_peer_denied_total is pre-seeded to 0 at boot for every
+  # closed rpc x reason pair, so the first real denial is an increase and not a
+  # series that first appears at N. YuzuGatewayPeerDenied pages on the five reasons
+  # about a certificate that reached the guard (bad_cert, no_server_auth_eku,
+  # not_pinned, outside_validity, internal_error). The three reasons with no usable
+  # client certificate (null_context, not_authenticated, no_cert) are deliberately
+  # not alerted: each has its own quiet case below, so a reason added to or dropped
+  # from the rule's regex turns a named case red. YuzuGatewayPeerAuthzDisabledWithTls
+  # fires on authz_mode{mode="insecure_ack_tls"} only.
+
+  # CASE A -- sustained denials of a pinned-gateway candidate fire the warning,
+  # labelled with instance and reason (the rpc label is aggregated away). RED if
+  # the rule lost the by (instance, reason) or the reason regex lost not_pinned.
+  - interval: 1m
+    name: gateway peer denied - authenticated denials fire with the reason label
+    input_series:
+      - series: 'yuzu_server_gateway_peer_denied_total{job="yuzu",instance="s1",rpc="batch_heartbeat",reason="not_pinned",event="security"}'
+        values: "0x5 0+10x30"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGatewayPeerDenied", alertstate="firing"}'
+        eval_time: 15m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGatewayPeerDenied", alertstate="firing", instance="s1", reason="not_pinned", severity="warning"}'
+            value: 1
+      # The posture rule must not fire on a denial series.
+      - expr: 'ALERTS{alertname="YuzuGatewayPeerAuthzDisabledWithTls", alertstate="firing"}'
+        eval_time: 15m
+        exp_samples: []
+
+  # CASE B -- a healthy server (every series pre-seeded at 0, never moving) is quiet,
+  # for each of the five alerted reasons and the three that are not.
+  - interval: 1m
+    name: gateway peer denied - pre-seeded zero series stay quiet
+    input_series:
+      - series: 'yuzu_server_gateway_peer_denied_total{job="yuzu",instance="s1",rpc="proxy_register",reason="bad_cert",event="security"}'
+        values: "0x40"
+      - series: 'yuzu_server_gateway_peer_denied_total{job="yuzu",instance="s1",rpc="proxy_register",reason="no_server_auth_eku",event="security"}'
+        values: "0x40"
+      - series: 'yuzu_server_gateway_peer_denied_total{job="yuzu",instance="s1",rpc="batch_heartbeat",reason="not_pinned",event="security"}'
+        values: "0x40"
+      - series: 'yuzu_server_gateway_peer_denied_total{job="yuzu",instance="s1",rpc="proxy_inventory",reason="outside_validity",event="security"}'
+        values: "0x40"
+      - series: 'yuzu_server_gateway_peer_denied_total{job="yuzu",instance="s1",rpc="notify_stream_status",reason="internal_error",event="security"}'
+        values: "0x40"
+      - series: 'yuzu_server_gateway_peer_denied_total{job="yuzu",instance="s1",rpc="forward_guardian_message",reason="no_cert",event="security"}'
+        values: "0x40"
+      - series: 'yuzu_server_gateway_peer_denied_total{job="yuzu",instance="s1",rpc="proxy_register",reason="not_authenticated",event="security"}'
+        values: "0x40"
+      - series: 'yuzu_server_gateway_peer_denied_total{job="yuzu",instance="s1",rpc="batch_heartbeat",reason="null_context",event="security"}'
+        values: "0x40"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname=~"YuzuGatewayPeer.*", alertstate="firing"}'
+        eval_time: 30m
+        exp_samples: []
+
+  # CASE C -- one denial is pending at 6m (the step lands at t6, so it has not held
+  # for the 1m `for:` yet), fires at 7m, and clears once the [5m] window no longer
+  # holds the step. RED if the rule lost its `for:` (firing at 6m) or were
+  # rate-sustained rather than increase-based (nothing to fire on one step).
+  - interval: 1m
+    name: gateway peer denied - one denial fires then clears
+    input_series:
+      - series: 'yuzu_server_gateway_peer_denied_total{job="yuzu",instance="s1",rpc="proxy_register",reason="outside_validity",event="security"}'
+        values: "0x5 1x30"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGatewayPeerDenied", alertstate="firing"}'
+        eval_time: 6m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuGatewayPeerDenied", alertstate="firing"}'
+        eval_time: 7m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGatewayPeerDenied", alertstate="firing", instance="s1", reason="outside_validity", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuGatewayPeerDenied", alertstate="firing"}'
+        eval_time: 14m
+        exp_samples: []
+
+  # CASE D -- the remaining alerted reasons each fire with their own reason label.
+  # not_pinned and outside_validity are CASE A and C. One series per reason, so a
+  # regex that lost one of the five names it in the failing expectation.
+  - interval: 1m
+    name: gateway peer denied - every remaining alerted reason fires with its own label
+    input_series:
+      - series: 'yuzu_server_gateway_peer_denied_total{job="yuzu",instance="s1",rpc="proxy_register",reason="bad_cert",event="security"}'
+        values: "0x5 0+10x30"
+      - series: 'yuzu_server_gateway_peer_denied_total{job="yuzu",instance="s1",rpc="batch_heartbeat",reason="no_server_auth_eku",event="security"}'
+        values: "0x5 0+10x30"
+      - series: 'yuzu_server_gateway_peer_denied_total{job="yuzu",instance="s1",rpc="proxy_inventory",reason="internal_error",event="security"}'
+        values: "0x5 0+10x30"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGatewayPeerDenied", alertstate="firing"}'
+        eval_time: 15m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGatewayPeerDenied", alertstate="firing", instance="s1", reason="bad_cert", severity="warning"}'
+            value: 1
+          - labels: 'ALERTS{alertname="YuzuGatewayPeerDenied", alertstate="firing", instance="s1", reason="no_server_auth_eku", severity="warning"}'
+            value: 1
+          - labels: 'ALERTS{alertname="YuzuGatewayPeerDenied", alertstate="firing", instance="s1", reason="internal_error", severity="warning"}'
+            value: 1
+
+  # CASE E -- the reasons with no usable client certificate do NOT fire. One case per
+  # reason. A sustained 10 denials a minute is far above any threshold, so the quiet
+  # comes from the reason exclusion and nothing else (an anonymous probe on the
+  # request-not-require agent listener must not page).
+  - interval: 1m
+    name: gateway peer denied - anonymous reason null_context does not fire
+    input_series:
+      - series: 'yuzu_server_gateway_peer_denied_total{job="yuzu",instance="s1",rpc="proxy_register",reason="null_context",event="security"}'
+        values: "0+10x60"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGatewayPeerDenied", alertstate="firing"}'
+        eval_time: 30m
+        exp_samples: []
+
+  - interval: 1m
+    name: gateway peer denied - anonymous reason not_authenticated does not fire
+    input_series:
+      - series: 'yuzu_server_gateway_peer_denied_total{job="yuzu",instance="s1",rpc="proxy_register",reason="not_authenticated",event="security"}'
+        values: "0+10x60"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGatewayPeerDenied", alertstate="firing"}'
+        eval_time: 30m
+        exp_samples: []
+
+  - interval: 1m
+    name: gateway peer denied - anonymous reason no_cert does not fire
+    input_series:
+      - series: 'yuzu_server_gateway_peer_denied_total{job="yuzu",instance="s1",rpc="proxy_register",reason="no_cert",event="security"}'
+        values: "0+10x60"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGatewayPeerDenied", alertstate="firing"}'
+        eval_time: 30m
+        exp_samples: []
+
+  # CASE F -- acknowledged-disabled on a TLS server with a client CA fires after the
+  # 5m `for:`, labelled with the mode. RED if the mode literal changed or the
+  # `== 1` were dropped (a 0 series is present for every runnable mode).
+  - interval: 1m
+    name: gateway peer authz disabled with tls - insecure_ack_tls fires
+    input_series:
+      - series: 'yuzu_server_gateway_peer_authz_mode{job="yuzu",instance="s1",mode="insecure_ack_tls"}'
+        values: "1x40"
+      - series: 'yuzu_server_gateway_peer_authz_mode{job="yuzu",instance="s1",mode="enforce"}'
+        values: "0x40"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGatewayPeerAuthzDisabledWithTls", alertstate="firing"}'
+        eval_time: 10m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGatewayPeerAuthzDisabledWithTls", alertstate="firing", instance="s1", job="yuzu", mode="insecure_ack_tls", severity="warning"}'
+            value: 1
+
+  # CASE G -- every other mode is quiet: insecure_ack (a plaintext rig, by design),
+  # enforce, and disabled each as the one active mode with the others at 0; an
+  # insecure_ack_tls series held at 0.
+  - interval: 1m
+    name: gateway peer authz disabled with tls - other modes stay quiet
+    input_series:
+      - series: 'yuzu_server_gateway_peer_authz_mode{job="yuzu",instance="s1",mode="insecure_ack"}'
+        values: "1x40"
+      - series: 'yuzu_server_gateway_peer_authz_mode{job="yuzu",instance="s1",mode="insecure_ack_tls"}'
+        values: "0x40"
+      - series: 'yuzu_server_gateway_peer_authz_mode{job="yuzu",instance="s1",mode="enforce"}'
+        values: "0x40"
+      - series: 'yuzu_server_gateway_peer_authz_mode{job="yuzu",instance="s2",mode="enforce"}'
+        values: "1x40"
+      - series: 'yuzu_server_gateway_peer_authz_mode{job="yuzu",instance="s2",mode="insecure_ack_tls"}'
+        values: "0x40"
+      - series: 'yuzu_server_gateway_peer_authz_mode{job="yuzu",instance="s3",mode="disabled"}'
+        values: "1x40"
+      - series: 'yuzu_server_gateway_peer_authz_mode{job="yuzu",instance="s3",mode="insecure_ack_tls"}'
+        values: "0x40"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGatewayPeerAuthzDisabledWithTls", alertstate="firing"}'
+        eval_time: 20m
+        exp_samples: []
+
+  # CASE H -- an insecure_ack_tls blip shorter than the 5m `for:` (5 samples at 1,
+  # t6..t10) is still pending when evaluated at 10m, so nothing fires. RED if the
+  # `for:` were shortened below the blip.
+  - interval: 1m
+    name: gateway peer authz disabled with tls - a blip shorter than the for stays quiet
+    input_series:
+      - series: 'yuzu_server_gateway_peer_authz_mode{job="yuzu",instance="s4",mode="insecure_ack_tls"}'
+        values: "0x5 1x4 0x40"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGatewayPeerAuthzDisabledWithTls", alertstate="firing"}'
+        eval_time: 10m
+        exp_samples: []
