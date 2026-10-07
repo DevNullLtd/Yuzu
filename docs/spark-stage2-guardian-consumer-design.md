@@ -796,7 +796,7 @@ apply failure also holds the generation (`can_advance()` needs `resolved_failed 
 `resolved_failed != failed_receipts.size()` check; `check_boot_inert_false_but_watch_refused_stays_failed` in
 `test_guardian_engine_spark_reconcile.cpp` holds `policy_generation() == 0` across
 retries), so corroborate with `yuzu.guardian_arm_failed`/`arm_pending`, the
-compensation age/deadline tags and the agent log before concluding wedge); (2) the server applies no back-off (none is added by #5459; FU-13 in the flip gate), so a held agent
+compensation age/deadline tags and the agent log before concluding wedge); (2) the server applies no back-off (none is added by #5459; FU-13 in the flip gate, tracked on #5504), so a held agent
 costs one `guaranteed_state.reconcile` audit row per push, about one per 30 s
 heartbeat at the default (the push interval is `ceil(25 s / heartbeat) x heartbeat`, so other intervals scale), plus a forced full teardown and
 re-arm about every 330 s from the safety valve (for a pure retained-wedge hold; with a
@@ -817,7 +817,7 @@ because the REST and MCP operator pushes default to `full_sync=false` but carry 
 full OS/scope-filtered deployed inventory, the REST `POST /api/v1/guaranteed-state/push`
 handler in `rest_api_v1.cpp`, the MCP `push_guardian_rules` tool in `mcp_server.cpp` and the
 `guardian_push_fn_` fan-out in `server.cpp`; so the default flag is not itself the hazard,
-a push that omits a still-desired rule is; follow-up FU-12 in the flip gate, to be filed); an
+a push that omits a still-desired rule is; follow-up FU-12 in the flip gate, #5547); an
 agent restart gap (the boot
 Application opens at the loaded acknowledged generation with an empty `content_id`,
 and a failed boot re-arm is never retried, #5513); a content-identity gap (an
@@ -1173,7 +1173,7 @@ design is mentioned it is named as the earlier design.
   rule's retry obligation, so the fresh application can acknowledge while the omitted
   wedged claim has no owning application; pre-existing (the old waiver code did the
   same), dormant, and no current production route emits an omitting delta (see the
-  known-limits list above); follow-up FU-12 in the flip gate (to be filed). Recovery needs a
+  known-limits list above); follow-up FU-12 in the flip gate (#5547). Recovery needs a
   live connection (the maintenance tick runs on the per-connection heartbeat thread).
   Content identity: an identical re-observation
   matches `rule_id` and spec only (#5512): an edit that leaves the watch target the same
