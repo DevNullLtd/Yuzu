@@ -2474,11 +2474,12 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                     "application/json");
             });
 
+    // Prepared `parameter_schema` validators for the execute handler below.
+    auto param_validators = std::make_shared<instr::ParamValidatorCache>();
+
     // -- Single Instruction Execution API --------------------------------------
 
     // POST /api/instructions/:id/execute — dispatch a single instruction definition
-    // Prepared `parameter_schema` validators for the handler below.
-    auto param_validators = std::make_shared<instr::ParamValidatorCache>();
     sink.Post(R"(/api/instructions/([^/]+)/execute)", [auth_fn, perm_fn, audit_fn, emit_fn,
                                                        instruction_store, cmd_dispatch,
                                                        cmd_dispatch_concurrency, caller_fn,
@@ -2617,8 +2618,9 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         // (instruction_param_schema.hpp) BEFORE the approval gate, so a refused call never
         // queues an approval (a ticket does not bind the params), creates an execution row or
         // dispatches. An empty or `{}` schema is not validated. `params` below is untouched:
-        // no default is injected. Responses, logs and audit rows carry only the validator's
-        // path and a fixed reason, never a caller value.
+        // no default is injected. The audit row carries only the validator's path. The response
+        // also carries its reason, which can quote text the schema author wrote (enum members,
+        // bounds) but never a caller-supplied value.
         {
             const auto count_reject = [&](const char* reason) {
                 if (metrics)
@@ -2636,15 +2638,16 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                                                        : validator.error().front());
                 count_reject("schema_invalid");
                 if (audit_fn)
-                    audit_fn(req, "instruction.execute", "denied", "instruction", def_id,
+                    audit_fn(req, "instruction.execute", "failure", "instruction", def_id,
                              "reason=param_schema_invalid");
                 res.status = 500;
                 res.set_content(
                     detail::a4_error(res, "stored parameter schema for this instruction is invalid",
                                      {.remediation =
-                                          "The stored parameter schema is invalid; an "
-                                          "administrator must replace it (see the Instructions "
-                                          "documentation)."}),
+                                          "An administrator must delete the definition and "
+                                          "import it again with a corrected parameter_schema; "
+                                          "see \"Replacing a stored parameter schema\" in the "
+                                          "Instructions documentation."}),
                     "application/json");
                 return;
             }

@@ -61,8 +61,9 @@ namespace yuzu::server::mcp {
 
 // RE2 memory budget (RE2::Options::max_mem) for every `pattern` this compiler builds,
 // in place of RE2's 8 MiB default. RE2 spends about two thirds of it on the compiled
-// program and the rest on lazily built DFA states, so it bounds both the cost of
-// compiling a pattern and what a cached compiled validator can retain after matching.
+// program and the rest on lazily built DFA states, so it bounds the cost of compiling ONE
+// pattern and what that one pattern can retain after matching. It is not an aggregate
+// bound: a schema can hold many patterns and a cache of validators is capped by entry count.
 inline constexpr std::int64_t kPatternMaxMem = 512 * 1024;
 
 namespace detail {

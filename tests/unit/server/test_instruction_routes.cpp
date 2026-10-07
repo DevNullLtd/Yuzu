@@ -30,6 +30,7 @@
 /// stronger evidence that a route still calls the right gate than a regex
 /// over source text would be.
 
+#include "instruction_param_schema.hpp"
 #include "instruction_routes.hpp"
 #include "instruction_schema_test_util.hpp"
 #include "test_route_sink.hpp"
@@ -724,6 +725,50 @@ TEST_CASE("instruction_routes: POST import success/duplicate both audit, unlike 
     CHECK(body(second->body)["audit_emitted"] == true);
 }
 
+TEST_CASE("instruction_routes: POST import refuses an invalid or over-cap parameter_schema with a "
+          "400 and a denied audit row",
+          "[pg][server][routes][instruction_routes]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, route_instr_tpl);
+    PgWired w{db.dsn()};
+    Harness h;
+    h.store = &w.store;
+    h.wire();
+
+    const auto envelope = [](const std::string& id, const std::string& schema) {
+        return json{{"id", id},
+                    {"name", "Schema Gate"},
+                    {"version", "1.0"},
+                    {"type", "question"},
+                    {"plugin", "os_info"},
+                    {"action", "os_name"},
+                    {"parameter_schema", schema}}
+            .dump();
+    };
+
+    auto bad = h.sink.Post(
+        "/api/instructions/import",
+        envelope("test.route.import.badschema",
+                 R"({"type":"object","properties":{"p":{"type":"nosuchtype"}}})"));
+    REQUIRE(bad);
+    CHECK(bad->status == 400);
+    REQUIRE(h.audits.size() == 1);
+    CHECK(h.audits[0].action == "instruction.import");
+    CHECK(h.audits[0].result == "denied");
+    CHECK(h.audits[0].detail.rfind("parameter_schema is not a valid parameter schema:", 0) == 0);
+    CHECK(body(bad->body)["audit_emitted"] == true);
+    CHECK_FALSE((*w.store.get_definition("test.route.import.badschema")).has_value());
+
+    auto big = h.sink.Post("/api/instructions/import",
+                           envelope("test.route.import.bigschema",
+                                    std::string(instr::kMaxParameterSchemaBytes + 1, ' ')));
+    REQUIRE(big);
+    CHECK(big->status == 400);
+    REQUIRE(h.audits.size() == 2);
+    CHECK(h.audits[1].result == "denied");
+    CHECK(h.audits[1].detail == "parameter_schema is larger than the 262144-byte limit");
+    CHECK_FALSE((*w.store.get_definition("test.route.import.bigschema")).has_value());
+}
+
 TEST_CASE("instruction_routes: instruction-set create/list/delete, with the documented "
           "audit ASYMMETRY -- create audits NOTHING, delete audits denial but not success",
           "[pg][server][routes][instruction_routes]") {
@@ -899,7 +944,7 @@ TEST_CASE("instruction_routes: a JSON PUT and a YAML editor save keep the stored
     CHECK(stored() == schema);
 
     // A legacy row past the 256 KiB cap is still editable through both routes.
-    const std::string legacy(262144 + 1, ' ');
+    const std::string legacy(instr::kMaxParameterSchemaBytes + 1, ' ');
     yuzu::server::test::force_parameter_schema(w.pool, id, legacy);
     auto put2 = h.sink.Put("/api/instructions/" + id, json{{"description", "legacy put"}}.dump());
     REQUIRE(put2);

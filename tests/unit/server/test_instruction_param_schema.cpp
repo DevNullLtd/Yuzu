@@ -185,6 +185,18 @@ TEST_CASE("param-schema: declared-empty rejects any param, undeclared reports /*
     CHECK(bad->path == "/*");
 }
 
+TEST_CASE("param-schema: a moved-from validator is not absent and never passes",
+          "[instr][param-schema]") {
+    auto v = build(one_prop(R"({"type":"string"})"));
+    CHECK_FALSE(v.check(json::object()).has_value());  // a live validator passes an empty object
+    const ParamValidator taken = std::move(v);
+    CHECK_FALSE(taken.absent());
+    CHECK_FALSE(taken.check(json::object()).has_value());
+    // NOLINTNEXTLINE(bugprone-use-after-move): the moved-from contract is what is under test
+    CHECK_FALSE(v.absent());
+    CHECK(v.check(json::object()).has_value());
+}
+
 TEST_CASE("param-schema: params must be an object, null reads as empty", "[instr][param-schema]") {
     const auto v = build(R"({"type":"object","properties":{"p":{"type":"string"}},"required":["p"]})");
     for (const json& bad : {json::array(), json("x"), json(5), json(true)}) {
@@ -623,15 +635,23 @@ TEST_CASE("param-schema cache: many threads first-calling one schema all get a v
     ParamValidatorCache cache;
     const std::string s = one_prop(R"({"type":"integer","minimum":1})");
     std::atomic<int> bad{0};
-    std::vector<std::thread> ts;
+    // Joins on scope exit, so a failed REQUIRE cannot leave a thread unjoined.
+    struct Joiner {
+        std::vector<std::thread> ts;
+        ~Joiner() {
+            for (auto& t : ts)
+                if (t.joinable())
+                    t.join();
+        }
+    } pool;
     for (int t = 0; t < 12; ++t)
-        ts.emplace_back([&, t] {
+        pool.ts.emplace_back([&, t] {
             auto r = cache.get(t % 2 ? "x" : "y", s);
             if (!r || (*r)->absent() || (*r)->check(json{{"p", 5}}).has_value() ||
                 !(*r)->check(json{{"p", 0}}).has_value())
                 ++bad;
         });
-    for (auto& t : ts)
+    for (auto& t : pool.ts)
         t.join();
     CHECK(bad == 0);
     CHECK(cache.size() == 2);

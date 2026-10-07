@@ -21,6 +21,7 @@
  *   - 404 path: definition does not exist
  */
 
+#include "instruction_param_schema.hpp"
 #include "instruction_schema_test_util.hpp"
 #include "instruction_store.hpp"
 #include "pg/pg_pool.hpp"
@@ -216,7 +217,7 @@ TEST_CASE("REST templates: POST keeps the definition's stored parameter_schema, 
     auto def_id = h.make_def("procfetch");
     // A legacy row written past the 256 KiB write gate: persisting a template must neither
     // fail on it nor rewrite it.
-    const std::string legacy(262144 + 1, ' ');
+    const std::string legacy(yuzu::server::instr::kMaxParameterSchemaBytes + 1, ' ');
     yuzu::server::test::force_parameter_schema(*h.inst_pool, def_id, legacy);
     auto res = h.sink.Post("/api/v1/definitions/" + def_id + "/response-templates",
                            R"({"name":"keeps schema","columns":["PID"]})");
