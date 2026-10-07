@@ -634,7 +634,12 @@ certificate calls that present the default gateway leaf (admitted by the automat
 the real handler) and the default server leaf (a valid certificate of the same CA that is not the
 pinned one: status 16 with `not_pinned`), and listener-port rows that repeat the certificate pair on
 the dedicated gateway-upstream listener, where a call with no client certificate fails at the TLS
-handshake instead of being answered with status 16. (2) The `docs` suite carries a lexical Python
+handshake instead of being answered with status 16. One further row group covers the second
+deployment shape, operator-supplied certificates (`--cert/--key/--ca-cert` plus
+`--gateway-peer-pin-file` naming the gateway leaf): it generates an operator CA and leaves, asserts
+the enforce boot line carries the gateway leaf's SPKI prefix, and calls the gateway-upstream listener
+presenting the pinned leaf (answered by the real handler), an unpinned serverAuth leaf (status 16,
+`not_pinned`) and a clientAuth-only leaf (status 16, `no_server_auth_eku`). (2) The `docs` suite carries a lexical Python
 gate, `tests/test_gateway_peer_registration_lexical.py` (Meson test "gateway-upstream guard
 registration lexical gate", no build required), which fails if the gateway-upstream service is
 registered other than through the guard. It reads `server.cpp` after removing comments, blanking

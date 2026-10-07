@@ -161,7 +161,7 @@ own. This design does not depend on that one, and nothing from it is claimed as 
 Nothing under `gateway/`, no `*gateway-sys.config`, and not `docs/user-manual/gateway.md`,
 `docs/erlang-gateway-build.md` or `docs/grafana/README.md` is touched, because the gateway workstream
 owns them. Guidance that earlier lived in sys.config comments is in the operator guide. The
-consequence is listed under "Deferred follow-ups": some prose in those reserved files is now stale.
+consequence is listed under "Follow-up work and scenarios not run": some prose in those reserved files is now stale.
 
 ## Corrections adopted from review
 
@@ -398,63 +398,196 @@ in this handshake or restored from a resumed session, and, if not, what binds a 
 current handshake through gRPC's public API. Optional hardening, not implemented: disable session
 ticket issuance on the gateway-upstream listener.
 
-## Deferred follow-ups
+## Follow-up work and scenarios not run
 
-Each is a separate decision; none is a prerequisite for the control.
+Everything in this section is a proposal, not a commitment, and none of it is a prerequisite for the
+control. The section exists so that this record carries the open items itself: no tracker issue
+stands behind most of them, and one should be filed only when someone decides to take an item on.
+The first part lists chaos scenarios that were planned during governance and **have not been run**.
+The second lists product follow-ups. The third names the two items that already have a tracker issue.
 
-1. Pin-file reload with a freshness lifetime (restart-free rotation): only if operators demand it;
-   the earlier, withdrawn design had one, which is not part of this design, so it would need a
-   fresh implementation and review.
-2. Gateway-peer revocation through the CA store: needs the recognition module and a store read on the
-   request path, and semantics that differ from pin withdrawal.
-3. Gateway-side reconciliation after status 16 (`yuzu_gw_upstream.erl`): belongs to the gateway
-   workstream; coordinate with its deferred worker-failure retry.
-4. Agent certificate standing, `--agent-unrecorded-mode` and Subscribe revalidation.
-5. Windows installer pin parser and full wizard page; full validation stays server-side meanwhile (the installer only does the cheap checks described above).
-6. Integration rig: run the `--tls` branch with a real pinned gateway leaf instead of the
-   acknowledgement, so CI exercises the hop.
-7. Per-gateway scoping of relayed agent identities (#1292).
-8. An info alert on unauthenticated probes, and a per-port deny of the gateway-upstream service on the
-   agent port (which would need a second gRPC server): both reduce noise or surface; neither is
-   needed for the control.
-9. Chisel images and an ADR note that the key-bearing volume is never mounted into agents
-   (documentation only).
-10. A connection-age cap on the gateway-upstream listener, or a gateway-side redial on status 16, so
-    that a renewed gateway certificate is picked up without any operator action on the gateway
-    (the expiry cliff under the residual risks). Neither exists.
-11. A `--check-config`-style dry run of the boot resolution, so an upgrade can be checked before the
-    restart. It does not exist; operators check the unit, env file and certificate arguments by
-    hand (see Upgrading).
-12. Prose in the reserved gateway files that could not be edited alongside this control and is now stale. Each
-    is a candidate for a follow-up issue, to be filed only on explicit instruction:
-    - `docs/user-manual/gateway.md`, the hop table near line 892 (says mutual TLS only; the server
-      now also requires a pinned peer or an acknowledgement);
-    - `docs/user-manual/gateway.md` near lines 1038 to 1044 (a bare `--gateway-upstream` example,
-      which now refuses to start on operator certificates or with `--no-tls`);
-    - `docs/user-manual/gateway.md` near lines 1306 to 1309 and the row at line 1102 (both say a gateway
-      restart does not help): true for a server-side outage, false when the cause is on the gateway
-      side, where the gateway must redial to present its current certificate (cause class B of the
-      incident runbook);
-    - `docs/user-manual/gateway.md` near lines 1101 and 1102 (the circuit-breaker rows): they do not
-      say which refusals feed the breaker. A run of status 16 refusals of `ProxyRegister` (a replay
-      registration included) or `ProxyInventory` opens it, because `record_result` in
-      `yuzu_gw_upstream.erl` counts any error result of those two paths. Refused `BatchHeartbeat`,
-      `NotifyStreamStatus` and `ForwardGuardianMessage` calls do not feed it (the same file calls
-      `record_result` on no other path, and `gateway.md` near line 1306 says a heartbeat flush
-      never feeds the breaker), so the breaker can stay closed and `/readyz` can answer 200 while
-      every heartbeat is refused. When it does open on a gateway-side cause, waiting does not
-      close it (the gateway does not redial on status 16), which the "Gateway peer authorization"
-      incident runbook in the operator guide covers;
-    - `gateway/config/sys.config`, comments near lines 12 and 106 (they say only that the port must
-      match `--gateway-upstream`, not that the server must also be given a pin or an
-      acknowledgement);
-    - `gateway/config/sys.config.prod`, comments near lines 109 to 113, and
-      `deploy/docker/reference-gateway-sys.config`, comments near lines 87 to 89 ("replace with
-      operator certs if you bring your own" says nothing about the pin requirement that operator
-      certificates now bring);
-    - `gateway/apps/yuzu_gw/integration_test/yuzu_gw_real_upstream_SUITE.erl`, its header (starts
-      the server with `--no-tls` and without `--insecure-gateway-peer`, which the server now
-      refuses).
+### Chaos scenarios not run
+
+Each scenario below is **NOT RUN**. They are compound scenarios: each combines two or more of the
+residual risks above, and each needs a rig (a compose rig, two server replicas on one Postgres, or a
+Windows host) that this change did not stand up. What a scenario expects to see is read from the
+code, not measured. Where a rig cannot be torn down by deleting its throwaway state, the scenario
+says how to roll it back.
+
+- **Expiry cliff, breaker amplification and a dropped placement notice (NOT RUN).** Inject: on the
+  reference gateway compose rig with a throwaway PKI, issue an operator-certificate gateway leaf
+  valid for about 90 seconds, pin it, register a few stub agents, and let the certificate expire on
+  the open connection. Then issue a renewed leaf over the same key, replace the files, leave the
+  gateway alone for a minute, and finally make the gateway redial. Observe: the `outside_validity`
+  denials, the gateway's circuit state, `/readyz`, the time from renewal to the first admitted call,
+  and agent placement. A pass: the denial alert fires, calls are refused until the redial and not
+  before, after the redial there is exactly one registration replay and no agent is left unplaced,
+  and recovery never needs a server restart. A second check on the same rig: a leaf whose
+  `notBefore` is two minutes in the future should be refused in the TLS handshake with no server
+  counter moving, which would show that the 5-minute allowance before `notBefore` cannot be
+  reached over real TLS. Roll back by deleting the rig's volumes and the throwaway PKI.
+- **Mixed-replica pin skew during a rolling upgrade, with a degraded audit pool (NOT RUN).** Inject:
+  two server replicas on one Postgres, one holding a different pin set so that the gateway sees
+  admission and denial alternately, and a latency proxy in front of one replica's Postgres
+  connection. Run it stepwise for five minutes each: a baseline of about 20 REST mutations per
+  second with its 503 rate recorded; then 70 distinct enrolled leaves calling about 10 times per
+  second each; then 4000 ms of added latency; then connection resets. Observe: the server's thread
+  count, `yuzu_server_gateway_peer_denial_audit_suppressed_total`, the denial audit rows per 10
+  seconds, and how often the gateway logs that the upstream recovered. A pass: denial rows stay
+  near the per-key budget, the REST 503 rate is no worse than the same degraded-Postgres baseline
+  without the denial load, and a replay runs once per completed replay drip. One failure is
+  expected in advance: nothing exposes that the two replicas hold different pin sets (see the
+  product follow-up on pin-set identity). Roll back by removing the proxy, stopping the load and
+  taking the replicas down.
+- **Default-certificate regeneration while a gateway keeps the old key (NOT RUN).** Inject: copy the
+  certificate directory, rename `default-marker.json` aside (or delete `default-gateway.pem`), and
+  bring up the server alone so that it regenerates the default certificates and pins the new
+  gateway key while the running gateway still presents the old one. Observe: the denial counter,
+  the audit row and the alert. A pass: the gateway is denied as `not_pinned` with all three
+  present, the operator guide's runbook names this cause, admission returns once the server and the
+  gateway hold consistent files (the gateway having redialled), and no CA-issued agent leaf is
+  admitted at any point. Roll back by restoring the copied certificate directory.
+- **Silent lockouts at the handshake (NOT RUN end to end).** Inject, one at a time: a gateway with an
+  expired certificate, with a certificate from a different CA, with a certificate lacking
+  `clientAuth`, and a gateway pointed at the agent port instead of the gateway-upstream port.
+  Observe: the server counters and the gateway-side handshake-failure alert. A pass: the agent-port
+  case moves the `not_authenticated` or `no_cert` counters; the first three fail in the TLS
+  handshake, leave every server counter silent (expected, and to be recorded as such), and fire the
+  gateway-side alert. The alert rule itself is covered by a promtool rule test over synthetic
+  series (`tests/prometheus/yuzu-alerts.test.yml`); what has not been run is the same failure on a
+  real gateway.
+- **Breaker recovery lag after a pin is fixed (NOT RUN).** Inject: configure a wrong pin, let five
+  refused calls trip the gateway's circuit breaker, then correct the pin and restart the server
+  alone. Observe: the time to the first admitted call and to delivery of the next stream-status
+  notice. A pass: recovery is bounded by the 300 second breaker cap and that bound is documented,
+  including that `/readyz` answers 503 while the breaker is open.
+- **Alternating admit and deny replicas (NOT RUN).** Inject: a gateway-side test whose mocked
+  upstream call alternates between success and refusal. Observe: how many registration replays one
+  outage triggers. A pass: the count is bounded by the number of completed replay drips and does
+  not grow continuously. This one lives in the gateway tree, which belongs to the gateway
+  workstream.
+- **A one-hour denial stream from a single leaf (NOT RUN).** Inject: one enrolled leaf with a wrong
+  pin calls continuously for an hour at a rate above the per-key audit budget. Observe: the denial
+  audit rows and the suppressed counter. A pass: rows for that key stay at or below 10 per 10
+  seconds (about 3,600 an hour), the suppressed counter rises, and growth of the audit table is
+  bounded.
+- **Pin-file typo crash loop under systemd (NOT RUN).** Inject: a unit whose pin file path or
+  content has a typo, so the server refuses to start on every attempt. Observe: the unit's restart
+  behaviour and the journal. A pass: the start limit stops the loop rather than a hot loop, and the
+  journal names both the flag and the path. Roll back with `systemctl reset-failed` and by removing
+  the unit.
+- **Stale installer pin file after returning to default certificates (NOT RUN).** Inject, on a
+  Windows test host with the installer compiled by Inno Setup: install with an operator pin, then
+  reinstall on the generated default certificates, and separately run the acknowledged mode on
+  default certificates. Observe: whether `certs\gateway-peer-pin` still replaces the automatic pin
+  and what the server logs. A pass: either the stale file is not used, or the server states plainly
+  in its log that the file replaced the automatic pin; and under the acknowledgement the log says
+  that the automatic pin was dropped.
+- **PowerShell 5.1 pin computation (NOT RUN, speculative).** Inject: compute a pin with the
+  PowerShell command the operator guide documents, on Windows PowerShell 5.1, and with `openssl` on
+  the same DER bytes. A pass: the two outputs are identical.
+
+What this change automated instead, because those cases are deterministic and need no cluster: a
+blank pin token, an encrypted PEM pin file, a FIFO as the pin file, a pin set in which no member
+lists `serverAuth`, and anonymous and client-certificate calls against the real server binary live in
+`tests/shell/test_gateway_peer_boot_refusal.sh` and `tests/unit/server/test_gateway_peer_*.cpp`; the
+check that restart advice for the gateway stays conditional lives in
+`tests/test_gateway_peer_restart_advice_lint.py`.
+
+### Product follow-ups
+
+Each outcome below is a proposal. Each is a separate decision.
+
+**Connection lifetime**
+
+- A renewed gateway certificate is picked up without any operator action on the gateway: either a
+  connection-age cap on the gateway-upstream listener, or a gateway-side redial on status 16 (the
+  expiry cliff under the residual risks). Neither exists. The gateway side belongs to the gateway
+  workstream and has to be coordinated with it.
+- After a refusal window, sessions whose CONNECTED notice was refused are repaired without operator
+  action, by gateway-side reconciliation after status 16 (`yuzu_gw_upstream.erl`). It belongs to
+  the gateway workstream, and the withdrawn design that carried one needed repeated review rounds
+  (see "What was left out, and why").
+
+**Operator-visible posture and tooling**
+
+- Replicas that disagree are detectable: the peer-authorization mode and an identity of the pin set
+  (for example a digest) are visible through the settings API and a metric. Today the pin sets of
+  different replicas can be compared only through the pin prefixes in each boot log line.
+- An operator can compute a pin without hand-written shell (a pin-print helper) and can check an
+  upgrade before the restart (a `--check-config`-style dry run of the boot resolution). Neither
+  exists; operators check the unit, the env file and the certificate arguments by hand (see
+  Upgrading).
+- Sustained denial volume is bounded below the worst case of about 5.9 million audit rows per day
+  per replica, by a slower second tier of the per-key budget or by an asynchronous write for the
+  denial audit instead of one on the handler thread.
+- CI exercises the pinned gateway hop: the integration rig runs its `--tls` branch with a real
+  pinned gateway leaf instead of the acknowledgement.
+- An info alert on unauthenticated probes, and a per-port deny of the gateway-upstream service on
+  the agent port (which would need a second gRPC server). Both reduce noise or surface; neither is
+  needed for the control.
+- A Windows installer pin parser and a full wizard page; full validation stays server-side
+  meanwhile, and the installer only does the cheap checks described above.
+
+**Reserved gateway-side documentation**
+
+These files belong to the gateway workstream and could not be edited alongside this control, so
+their prose is now stale. Each is a candidate for a follow-up change, to be made only on explicit
+instruction:
+
+- `docs/user-manual/gateway.md`, the hop table near line 892 (says mutual TLS only; the server
+  now also requires a pinned peer or an acknowledgement);
+- `docs/user-manual/gateway.md` near lines 1038 to 1044 (a bare `--gateway-upstream` example,
+  which now refuses to start on operator certificates or with `--no-tls`);
+- `docs/user-manual/gateway.md` near lines 1306 to 1309 and the row at line 1102 (both say a gateway
+  restart does not help): true for a server-side outage, false when the cause is on the gateway
+  side, where the gateway must redial to present its current certificate (cause class B of the
+  incident runbook);
+- `docs/user-manual/gateway.md` near lines 1101 and 1102 (the circuit-breaker rows): they do not
+  say which refusals feed the breaker. A run of status 16 refusals of `ProxyRegister` (a replay
+  registration included) or `ProxyInventory` opens it, because `record_result` in
+  `yuzu_gw_upstream.erl` counts any error result of those two paths. Refused `BatchHeartbeat`,
+  `NotifyStreamStatus` and `ForwardGuardianMessage` calls do not feed it (the same file calls
+  `record_result` on no other path, and `gateway.md` near line 1306 says a heartbeat flush
+  never feeds the breaker), so the breaker can stay closed and `/readyz` can answer 200 while
+  every heartbeat is refused. When it does open on a gateway-side cause, waiting does not
+  close it (the gateway does not redial on status 16), which the "Gateway peer authorization"
+  incident runbook in the operator guide covers;
+- `gateway/config/sys.config`, comments near lines 12 and 106 (they say only that the port must
+  match `--gateway-upstream`, not that the server must also be given a pin or an
+  acknowledgement);
+- `gateway/config/sys.config.prod`, comments near lines 109 to 113, and
+  `deploy/docker/reference-gateway-sys.config`, comments near lines 87 to 89 ("replace with
+  operator certs if you bring your own" says nothing about the pin requirement that operator
+  certificates now bring);
+- `gateway/apps/yuzu_gw/integration_test/yuzu_gw_real_upstream_SUITE.erl`, its header (starts
+  the server with `--no-tls` and without `--insecure-gateway-peer`, which the server now
+  refuses).
+
+**Mechanisms left out and adjacent work**
+
+Beyond the three groups above, these are the larger decisions the sections above left out or kept
+separate. None is part of this design.
+
+- Pin-file reload with a freshness lifetime (restart-free rotation): only if operators demand it.
+  The withdrawn design had one, which is not part of this design, so it would need a fresh
+  implementation and review.
+- Gateway-peer revocation through the CA store: needs the recognition module, a store read on the
+  request path, and semantics that differ from pin withdrawal.
+- Agent certificate standing, `--agent-unrecorded-mode` and Subscribe revalidation: a separate
+  threat, a separate change.
+- Per-gateway scoping of relayed agent identities (#1292).
+- Chisel images and an architecture decision note that the key-bearing volume is never mounted into
+  agents (documentation only).
+
+### Already tracked elsewhere
+
+- Open issue #1835, "Windows server binary has the identical SCM control-protocol defect as #1822
+  (agent)": the installed Windows service cannot start under the Windows service manager, which is
+  why that path is untested here (see "Provenance and limits of this record").
+- Open issue #4632, "Gateway: MAX_NOTIFY_INFLIGHT (10) is unsized/undocumented and now sits on HA
+  WS-4 4.4's convergence critical path": the gateway-side notify retry and bounding work, owned by
+  the gateway workstream. This record does not depend on it.
 
 ## Where this is enforced
 
