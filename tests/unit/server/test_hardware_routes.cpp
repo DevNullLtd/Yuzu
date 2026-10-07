@@ -21,6 +21,7 @@
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 using namespace yuzu::server;
@@ -56,6 +57,7 @@ struct HwHarness {
     bool allow_fleet_read = true;
     bool allow_scoped_perm = true;      // per-device Inventory:Read (the CI record gate)
     bool allow_guaranteed_state = true; // scoped GuaranteedState:Read probe (DEX/Guardian/Live lenses)
+    authz::VisibleSet scope;            // FleetReadGate scope; nullopt = unfiltered, set = confine to these ids
     bool allow_execute = true;          // scoped Execution:Execute probe (sync affordance/actions)
     bool allow_tag_write = true;        // scoped Tag:Write probe (tag controls)
 
@@ -108,7 +110,7 @@ struct HwHarness {
                 return g; // admitted=false, scope=deny_all() (unused — response already written)
             }
             g.admitted = true;
-            g.scope = std::nullopt; // unfiltered — the only filter under test is the tag/os/status facet
+            g.scope = scope; // default nullopt = unfiltered; a test sets it to exercise confinement
             return g;
         };
         HardwareRoutes::RosterFn roster_fn = [this]() -> InventoryDevicesResult {
@@ -304,6 +306,144 @@ TEST_CASE("route: dex/guardian lenses check scoped GuaranteedState:Read before r
         REQUIRE(contains(denied->body, "GuaranteedState:Read"));
         REQUIRE_FALSE(contains(denied->body, "/fragments/device/" + lens + "?id=agent-1"));
     }
+}
+
+// ───────────────────────── Audit verbs: behavioural-PII tier ───────────────────
+
+TEST_CASE("route: hardware list + CI record emit the inventory.* behavioural-PII verbs",
+          "[hardware][route]") {
+    HwHarness h;
+    h.roster_rows = {make_row("agent-1", "AUDIT-HOST", "windows", true)};
+    h.ci_detail.identity = make_row("agent-1", "AUDIT-HOST", "windows", true);
+    auto has = [&](const std::string& row) {
+        for (auto& a : h.audit_full)
+            if (a == row)
+                return true;
+        return false;
+    };
+
+    REQUIRE(h.sink.Get("/fragments/hardware/list"));
+    REQUIRE(has("inventory.devices|success|Inventory|fleet"));
+
+    // The verb is inventory.device.ci for every lens EXCEPT software.
+    REQUIRE(h.sink.Get("/fragments/hardware/ci?id=agent-1&lens=software"));
+    REQUIRE(has("inventory.device.software|success|Agent|agent-1"));
+    REQUIRE_FALSE(has("inventory.device.ci|success|Agent|agent-1"));
+
+    REQUIRE(h.sink.Get("/fragments/hardware/ci?id=agent-1&lens=tags"));
+    REQUIRE(has("inventory.device.ci|success|Agent|agent-1"));
+
+    // The REST twins emit the same tuples. Clear the capture first so the fragment
+    // calls above cannot satisfy these assertions.
+    h.audit_full.clear();
+    auto rest_list = h.sink.Get("/api/v1/hardware");
+    REQUIRE(rest_list);
+    REQUIRE(rest_list->status == 200);
+    REQUIRE(has("inventory.devices|success|Inventory|fleet"));
+
+    h.audit_full.clear();
+    auto rest_ci = h.sink.Get("/api/v1/hardware/agent-1");
+    REQUIRE(rest_ci);
+    REQUIRE(rest_ci->status == 200);
+    REQUIRE(has("inventory.device.ci|success|Agent|agent-1"));
+}
+
+TEST_CASE("route: hardware list + CI record audit-persist failure — fragments set "
+          "Sec-Audit-Failed; REST fails closed",
+          "[hardware][route]") {
+    HwHarness h;
+    h.roster_rows = {make_row("agent-1", "AUDIT-HOST", "windows", true)};
+    h.ci_detail.identity = make_row("agent-1", "AUDIT-HOST", "windows", true);
+    h.audit_should_fail = true;
+
+    auto frag = h.sink.Get("/fragments/hardware/list");
+    REQUIRE(frag);
+    REQUIRE(frag->status == 200); // set-and-proceed
+    REQUIRE(frag->get_header_value("Sec-Audit-Failed") == "true");
+
+    auto rest = h.sink.Get("/api/v1/hardware");
+    REQUIRE(rest);
+    REQUIRE(rest->status == 503); // fail-closed
+    CHECK(rest->get_header_value("Sec-Audit-Failed") == "true");
+    CHECK_FALSE(contains(rest->body, "AUDIT-HOST")); // nothing served
+
+    auto ci_frag = h.sink.Get("/fragments/hardware/ci?id=agent-1");
+    REQUIRE(ci_frag);
+    REQUIRE(ci_frag->status == 200); // set-and-proceed
+    REQUIRE(ci_frag->get_header_value("Sec-Audit-Failed") == "true");
+
+    auto ci_rest = h.sink.Get("/api/v1/hardware/agent-1");
+    REQUIRE(ci_rest);
+    REQUIRE(ci_rest->status == 503); // fail-closed
+    CHECK(ci_rest->get_header_value("Sec-Audit-Failed") == "true");
+    CHECK_FALSE(contains(ci_rest->body, "AUDIT-HOST")); // nothing served
+}
+
+// ───────────────────────── Gate denial + management-group confinement ──────────
+
+TEST_CASE("route: fleet-read denied — 403; no roster body; no inventory.devices audit row",
+          "[hardware][route]") {
+    HwHarness h;
+    h.roster_rows = {make_row("agent-1", "DENY-HOST", "windows", true)};
+    h.allow_fleet_read = false;
+
+    for (const char* url : {"/fragments/hardware/list", "/api/v1/hardware"}) {
+        auto res = h.sink.Get(url);
+        REQUIRE(res);
+        CHECK(res->status == 403);
+        CHECK_FALSE(contains(res->body, "DENY-HOST"));
+    }
+    for (auto& a : h.audit_full)
+        CHECK_FALSE(a.starts_with("inventory.devices|"));
+}
+
+TEST_CASE("route: per-device Inventory:Read denied — CI record fragment is 403 and unaudited",
+          "[hardware][route]") {
+    HwHarness h;
+    h.ci_detail.identity = make_row("agent-1", "DENY-CI-HOST", "windows", true);
+    h.allow_scoped_perm = false;
+
+    auto res = h.sink.Get("/fragments/hardware/ci?id=agent-1");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    CHECK_FALSE(contains(res->body, "DENY-CI-HOST"));
+    CHECK(h.audit_full.empty());
+}
+
+TEST_CASE("route: management-group scope drops out-of-scope rows (audited) and 404s the REST record",
+          "[hardware][route]") {
+    HwHarness h;
+    h.roster_rows = {make_row("agent-in", "IN-SCOPE-HOST", "windows", true),
+                     make_row("agent-out", "OUT-SCOPE-HOST", "windows", true)};
+    h.ci_detail.identity = make_row("agent-out", "OUT-SCOPE-HOST", "windows", true);
+    h.scope = authz::VisibleSet{std::unordered_set<std::string>{"agent-in"}};
+
+    auto frag = h.sink.Get("/fragments/hardware/list");
+    REQUIRE(frag);
+    CHECK(frag->status == 200);
+    CHECK(contains(frag->body, "IN-SCOPE-HOST"));
+    CHECK_FALSE(contains(frag->body, "OUT-SCOPE-HOST"));
+
+    auto rest = h.sink.Get("/api/v1/hardware");
+    REQUIRE(rest);
+    CHECK(rest->status == 200);
+    CHECK(contains(rest->body, "agent-in"));
+    CHECK_FALSE(contains(rest->body, "agent-out"));
+
+    // Both list reads audit the drop count (one row dropped each).
+    std::size_t omitted_rows = 0;
+    for (auto& d : h.audit_details)
+        if (contains(d, "omitted=1"))
+            ++omitted_rows;
+    CHECK(omitted_rows == 2);
+
+    // Out-of-scope id collapses to the same 404 as a nonexistent one; nothing audited for it.
+    h.audit_full.clear();
+    auto out = h.sink.Get("/api/v1/hardware/agent-out");
+    REQUIRE(out);
+    CHECK(out->status == 404);
+    CHECK_FALSE(contains(out->body, "OUT-SCOPE-HOST"));
+    CHECK(h.audit_full.empty());
 }
 
 // ───────────────────────── REST v1: JSON null-vs-value contract ────────────────

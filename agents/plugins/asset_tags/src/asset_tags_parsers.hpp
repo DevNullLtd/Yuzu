@@ -38,6 +38,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <yuzu/plugin.h> // YuzuResultStatus / YuzuResultCompleteness
 #include <yuzu/string_utils.hpp>
 
 namespace yuzu::asset_tags {
@@ -329,6 +330,50 @@ inline std::optional<int> parse_check_interval(std::string_view s) {
     if (ec != std::errc{} || ptr != last)
         return std::nullopt;
     return std::max(v, kMinCheckIntervalS);
+}
+
+/// Typed result status of one `sync`, decided from the persist outcome.
+struct SyncStatusDecision {
+    YuzuResultStatus status;
+    YuzuResultCompleteness completeness;
+    std::string_view provenance; ///< empty on OK
+};
+
+/// Combined-warning policy. A failed write is PARTIAL (nothing reached disk).
+/// A successful write that carries a warning is FULL but CONSTRAINED; when both
+/// warning flags are set the mode cause (mode_reassert_failed: the file may be
+/// narrower than 0600 and fail the next load) outranks the durability cause
+/// (dir_fsync_failed: one rename may roll back). The flags are the typed fields of the
+/// store's WriteWarning -- never derived from its message text.
+[[nodiscard]] constexpr SyncStatusDecision decide_sync_status(bool persisted,
+                                                              bool mode_reassert_failed,
+                                                              bool dir_fsync_failed) noexcept {
+    if (!persisted)
+        return {YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                "asset_tags:persist_failed"};
+    if (mode_reassert_failed)
+        return {YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_FULL,
+                "asset_tags:persist_mode_reassert_failed"};
+    if (dir_fsync_failed)
+        return {YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_FULL,
+                "asset_tags:persist_dir_unsynced"};
+    return {YUZU_RESULT_STATUS_OK, YUZU_RESULT_COMPLETENESS_FULL, {}};
+}
+
+/// Retained diagnostic for a write warning. The typed cause labels lead, so the
+/// final cap_value truncation can only shorten the free-text detail (a long path
+/// in the first cause can never push the second cause out). Labels come from the
+/// typed flags, never from parsing `message`.
+inline std::string format_write_warning(bool mode_reassert_failed, bool dir_fsync_failed,
+                                        std::string_view message) {
+    std::string out;
+    if (mode_reassert_failed)
+        out += "mode_reassert_failed";
+    if (dir_fsync_failed)
+        out += out.empty() ? "dir_fsync_failed" : "+dir_fsync_failed";
+    out += ": ";
+    out += message;
+    return cap_value(out);
 }
 
 } // namespace yuzu::asset_tags

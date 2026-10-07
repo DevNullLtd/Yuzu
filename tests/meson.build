@@ -242,6 +242,7 @@ agent_test_exe = executable(
     'unit/test_progress_listener.cpp', # #4018 per-test START/END progress log, env-gated
     'unit/test_detached_signature.cpp', # shared detached-CMS verifier (#416/#3807)
     'unit/test_updater_signature.cpp', # OTA signature gate, end to end (#416/#3807)
+    'unit/test_update_signature_mode.cpp', # OTA update-signature mode report + env typo check (#5249)
     'unit/test_plugin_loader.cpp',
     'unit/test_capability_registry_tables.cpp',
     'unit/test_sdk_utilities.cpp',
@@ -249,12 +250,14 @@ agent_test_exe = executable(
     'unit/test_updater.cpp',
     'unit/test_filesystem_read.cpp',
     'unit/test_filesystem_actions.cpp',
+    'unit/test_filesystem_local_dispatcher.cpp', # #4728: real filesystem plugin via LocalDispatcher -- `replace` through the shared atomic write
     'unit/test_confined_fs_rules.cpp',
     'unit/test_confined_fs_walk.cpp',
     'unit/test_confined_fs_posix.cpp',
     'unit/test_confined_fs_win.cpp',
     'unit/test_string_utils.cpp',
     'unit/test_vuln_rules.cpp',
+    'unit/test_vuln_config_checks.cpp', # #4961: pure config-check decisions over injected reads (vuln_scan config_checks.hpp), portable
     'unit/test_metrics.cpp',
     'unit/test_metrics_perf.cpp',
     'unit/test_kv_store.cpp',
@@ -338,6 +341,7 @@ agent_test_exe = executable(
     'unit/test_launchctl_list.cpp',     # A0: shared launchctl-list row parser (agents/shared/launchctl_list.hpp)
     'unit/test_launchd_state.cpp',      # A0 fix round: launchd_state_for (yuzu/agent/launchd_state.hpp)
     'unit/test_wmi_bounded.cpp',        # shared bounded WMI helper (roadmap C-8 extraction); header-only, no separate .cpp to list
+    'unit/test_wmi_error_token.cpp',    # #4895: shared stage-aware WMI token classifier (agents/shared/wmi_error_token.hpp), portable
     'unit/test_installed_apps_registry_utf8.cpp',
     'unit/test_service_binpath.cpp',
     'unit/test_agent_log_options.cpp', # #4666 PR-2: make_log_handoff_options CLI-flags translator
@@ -375,6 +379,8 @@ agent_test_exe = executable(
     'unit/test_subprocess_launch_spec.cpp',   # PR1.2: host-agnostic pure launch-spec tests (run on Windows too)
     'unit/test_capability_descriptor.cpp',    # PR1.1: ABI4 descriptor + plugin->host result seam + declared-vs-observable honesty
     'unit/test_filesystem_macos_sig.cpp',     # #2273/1.14: pure codesign/plutil classifiers
+    'unit/test_filesystem_acl_parsers.cpp',   # filesystem get_acl: pure posix_acl xattr / acl_to_text / Windows ACE-row decoders over real-capture fixtures (+ real-syscall macOS cases under __APPLE__)
+    'unit/test_filesystem_get_acl_dispatcher.cpp',  # filesystem get_acl: real plugin via LocalDispatcher (row order, failure rows, Linux default-ACL-only aggregation)
     'unit/test_event_logs_macos.cpp',         # BR-08: pure `log show` SubprocessResult classifier
     'unit/test_event_logs_parsers.cpp',       # Wave 4 PR4.2: pure Windows event-XML / journal row parse+format helpers
     'unit/test_event_logs_journalctl.cpp',    # Wave 4 PR4.2: pure Linux journalctl-fallback outcome classifier (runs on every host)
@@ -478,6 +484,8 @@ agent_test_exe = executable(
     'unit/test_installed_apps_actions.cpp',   # Wave 4 PR4.3a remediation: real installed_apps.dylib/.so
                                                 # driven end to end via LocalDispatcher (POSIX-only; a
                                                 # no-op TU on Windows via the file's own #ifndef _WIN32 guard)
+    'unit/test_installed_apps_bundle_ids.cpp', # #4710: pure apply_bundle_ids composition + cap/status mapping (every OS)
+    'unit/test_bundle_id_read.cpp',            # #4710: agent-core bounded bundle-id pass driver (portable; the CF reader is injected)
     'unit/test_msi_packages_actions.cpp',     # Wave 4 PR4.3a remediation: real msi_packages.dylib driven
                                                 # end to end via LocalDispatcher (Darwin-only, self-gated)
     'unit/test_installed_apps_macos_enrich.cpp', # Wave 4 PR4.3a gate-1 fix: SecStaticCode signed/unsigned
@@ -537,9 +545,14 @@ agent_test_exe = executable(
     'unit/test_privacy_permissions_local_dispatcher.cpp', # Wave 8 PR8.5: real plugin via LocalDispatcher, unguarded on every OS
     'unit/test_privacy_permissions_macos_internals.cpp',  # TU-inclusion seam over privacy_permissions_macos.cpp, Apple-only body, unguarded TU
     'unit/test_privacy_permissions_win_internals.cpp',    # TU-inclusion seam over privacy_permissions_win.cpp (Windows-only body, empty TU elsewhere)
+    'unit/test_privacy_permissions_win_walk.cpp',  # fake-registry/fake-probe locks over privacy_permissions_win_walk.hpp + privacy_permissions_hive_guard.hpp, pure, every host
     'unit/test_posix_dir_walk.cpp',     # PR #4154 round-8 remediation: shared capped
                                         # directory-walk primitive (agents/shared/posix_dir_walk.hpp)
+    'unit/test_posix_secure_read.cpp',  # shared O_NOFOLLOW dir-open + bounded no-follow file read (agents/shared/posix_secure_read.hpp), POSIX-only bodies
+    'unit/test_sha256.cpp',             # shared in-memory SHA-256 (agents/shared/sha256.hpp), portable
+    'unit/test_email_redaction.cpp',    # shared [redacted-email] helper (agents/shared/email_redaction.hpp), portable
     'unit/test_wire_utf8.cpp',          # shared strict-UTF-8 scrubber (agents/shared/wire_utf8.hpp), portable
+    'unit/test_row_byte_budget.cpp',    # shared row/byte budget (agents/shared/row_byte_budget.hpp), portable
     'unit/test_wall_clock_step.cpp',    # #4503: shared consecutive-sample wall-vs-monotonic clock-step guard (agents/shared/wall_clock_step.hpp), portable
     'unit/test_printing_parsers.cpp',            # Wave 9 PR9.1b
     'unit/test_printing_local_dispatcher.cpp',   # Wave 9 PR9.1b
@@ -564,6 +577,7 @@ agent_test_exe = executable(
     'unit/test_asset_tags_parsers.cpp',   # #232: pure cap/escape/apply_sync/snapshot helpers (asset_tags_parsers.hpp)
     'unit/test_asset_tags_store.cpp',   # #232: atomic state-file lifecycle (asset_tags_store.hpp), TempDir-based
     'unit/test_asset_tags_actions.cpp',   # #232: real asset_tags dylib/.so/.dll via LocalDispatcher, unguarded on every OS
+    'unit/test_tags_plugin.cpp',   # #4728: TU-inclusion seam over tags_plugin.cpp -- save_tags() through the shared atomic write
     'unit/test_asset_tags_sync_lock.cpp', # #232: TU-inclusion seam over asset_tags_plugin.cpp -- sync writes under g_mu (a condition-variable seam, no per-OS body, runs on every OS)
     'unit/test_system_hardening_parsers.cpp',            # Wave 8 PR8.1-b: pure state mappers + errno classifier over REAL CAPTURE fixtures
     'unit/test_system_hardening_win_parsers.cpp',        # Wave 8 PR8.1-b: pure mitigation-registry decoder over the-rig REAL CAPTURE fixtures
@@ -577,7 +591,7 @@ agent_test_exe = executable(
     '../agents/plugins/pkg_inventory/src/pkg_inventory_macos.cpp', # Wave 10 PR10.1-c: run_macos (the slot-guarded entry point execute() calls); self-gated to __APPLE__, empty elsewhere
   ),
   include_directories: [
-    include_directories('../agents/plugins/vuln_scan/src'),  # cve_rules.hpp
+    include_directories('../agents/plugins/vuln_scan/src'),  # cve_rules.hpp, config_checks.hpp
     include_directories('../agents/plugins/netprobe/src'),   # netprobe_stats.hpp (pure helpers)
     include_directories('../agents/plugins/antivirus/src'),  # antivirus_parsers.hpp (pure helpers)
     include_directories('../agents/plugins/firewall/src'),   # firewall_parsers.hpp (pure helpers)
@@ -610,7 +624,7 @@ agent_test_exe = executable(
     include_directories('../agents/plugins/services/src'),      # services_macos_launchd.hpp (P8 test)
     include_directories('../agents/plugins/msi_packages/src'),  # msi_packages_macos.hpp (P8 test)
     include_directories('../agents/plugins/bitlocker/src'),     # bitlocker_macos_apfs.hpp (P8 test); Wave 3: bitlocker_windows_wmi.hpp, bitlocker_linux_parsers.hpp
-    include_directories('../agents/plugins/filesystem/src'),    # filesystem_macos_sig.hpp (#2273/1.14)
+    include_directories('../agents/plugins/filesystem/src'),    # filesystem_macos_sig.hpp (#2273/1.14); filesystem_acl_parsers.hpp (get_acl parser + dispatcher tests)
     include_directories('../agents/plugins/event_logs/src'),    # event_logs_macos.hpp (BR-08)
     include_directories('../agents/plugins/certificates/src'),  # certificates_macos_parsers.hpp (Gate-7 FIX A: pure helpers shared with the plugin)
     include_directories('../agents/plugins/quarantine/src'),    # quarantine_parsers.hpp (Wave 2 WP-F)
@@ -629,6 +643,7 @@ agent_test_exe = executable(
     include_directories('../agents/plugins/software_actions/src'), # software_actions_parsers.hpp (Wave 4 PR4.3b pure parser)
     include_directories('../agents/plugins/filesystem_posture/src'), # filesystem_posture_parsers.hpp / _legs.hpp (Wave 6 PR6.1-b pure headers)
     include_directories('../agents/plugins/asset_tags/src'),     # asset_tags_parsers.hpp / asset_tags_store.hpp (#232)
+    include_directories('../agents/plugins/tags/src'),           # tags_plugin.cpp (TU-inclusion, #4728)
   ],
   # agent_platform_args carries -DYUZU_HAVE_LIBSYSTEMD (Linux + libsystemd found)
   # so Linux real-mechanism Service spark tests can compile-gate on it, exactly
@@ -744,6 +759,7 @@ agent_test_exe = executable(
                 device_identity_plugin_lib,
                 echo_argv_fixture,
                 event_logs_plugin_lib,
+                filesystem_plugin_lib,  # #4728 test_filesystem_local_dispatcher.cpp and the get_acl dispatcher test load the real filesystem plugin by path
                 filesystem_posture_plugin_lib,
                 hardware_plugin_lib,
                 installed_apps_plugin_lib,
@@ -1666,6 +1682,7 @@ if build_server
       'unit/server/test_agent_registry_presence.cpp',
       'unit/server/test_secret_codec.cpp',
       'unit/server/test_software_inventory_store.cpp',
+      'unit/server/test_software_catalog_rules.cpp',
       'unit/server/test_vuln_finding_store.cpp',
       'unit/server/test_vuln_finding_store_adversarial.cpp',
       'unit/server/test_product_normalize.cpp',
@@ -2717,6 +2734,17 @@ test('compose certs volume',
   timeout: 30,
 )
 
+# README Docker Compose quickstart (#5419): the compose the README downloads must
+# pull released images at ${YUZU_VERSION}, persist /etc/yuzu/certs, publish 8443,
+# and take the headless admin seed at the image's --config path. Stdlib only;
+# reuses test_compose_certs_volume.py's volume reader.
+test('readme quickstart compose',
+  _python3_test,
+  args: [files('test_readme_quickstart.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
 # ── Repo hygiene tests ─────────────────────────────────────────────────────
 # Changelog promote --append (#5221): folds post-promotion hotfix fragments
 # into an already-promoted release section. Stdlib only.
@@ -3000,21 +3028,14 @@ test('flake-retry selftest',
 # PR1.2 (ADR-3002 Decision-10a): pure-logic selftest of the lexical spawn gate —
 # a seeded raw-spawn fixture must fail and the sanctioned-runner allowlist case
 # must pass. Wired here so the gate's own matcher is enforced on every platform
-# with bash, mirroring the flake-retry selftest above. Guarded so Windows (no
-# bash) skips cleanly rather than erroring at configure.
+# with bash, mirroring the flake-retry selftest above. The Windows test job's default
+# shell is MSYS2 bash (set in ci.yml), so its Test step runs these bash tests there;
+# `required: false` only lets a bash-less developer host configure cleanly.
 _bash_test = find_program('bash', required: false)
 if _bash_test.found()
   test('plugin-spawn lexical gate selftest',
     _bash_test,
     args: [files('../scripts/ci/check-plugin-spawn-lexical.sh'), '--selftest'],
-    suite: 'docs',
-    timeout: 60,
-  )
-  # docs/plugin-readme-standard.md rule 7 — the README touch rule's own
-  # fixture run (a fake `git` on PATH; no repository, no network).
-  test('plugin readme touch-rule selftest',
-    _bash_test,
-    args: [files('../scripts/ci/check-plugin-readme-touch.sh'), '--selftest'],
     suite: 'docs',
     timeout: 60,
   )
@@ -3027,19 +3048,31 @@ if _bash_test.found()
     suite: 'docs',
     timeout: 120,
   )
-  # #5333: start-UAT.sh kill_stale signals only PIDs it recorded and refuses on
-  # foreign port holders. Sources the script with kill/ps/pgrep/lsof/docker
-  # replaced by functions; spawns and signals nothing. The decoy command line
-  # contains yuzu-agent, as the `meson compile` the old pgrep -f killed did.
-  # Budget: about 1 s on macOS and Linux, but 38-45 s on the Windows runners
-  # and over 60 s when other jobs share the box. 180 s is 4x the slowest clean
-  # Windows run; a real hang still trips it.
-  test('start-UAT.sh kill_stale scoping (#5333)',
-    _bash_test,
-    args: [files('shell/test_start_uat_kill_stale.sh')],
-    suite: 'docs',
-    timeout: 180,
-  )
+  # Registered off Windows only (#5428): both fork hundreds of subshells (about
+  # 1-3 s on macOS/Linux, 28-98 s under MSYS2 on the shared 4-runner Windows box)
+  # and exercise scripts that never run on Windows -- start-UAT.sh is the
+  # macOS/Linux rig (Windows uses scripts/win-start-UAT.sh) and the README
+  # touch rule runs on hosted Ubuntu (docs-lint.yml).
+  if host_machine.system() != 'windows'
+    # docs/plugin-readme-standard.md rule 7 — the README touch rule's own
+    # fixture run (a fake `git` on PATH; no repository, no network).
+    test('plugin readme touch-rule selftest',
+      _bash_test,
+      args: [files('../scripts/ci/check-plugin-readme-touch.sh'), '--selftest'],
+      suite: 'docs',
+      timeout: 60,
+    )
+    # #5333: start-UAT.sh kill_stale signals only PIDs it recorded and refuses on
+    # foreign port holders. Sources the script with kill/ps/pgrep/lsof/docker
+    # replaced by functions; spawns and signals nothing. The decoy command line
+    # contains yuzu-agent, as the `meson compile` the old pgrep -f killed did.
+    test('start-UAT.sh kill_stale scoping (#5333)',
+      _bash_test,
+      args: [files('shell/test_start_uat_kill_stale.sh')],
+      suite: 'docs',
+      timeout: 60,
+    )
+  endif
 endif
 
 # QE-INFO / build-ci B3: tests/shell/test_capability_matrix_gate.sh (PR1.1
@@ -3085,34 +3118,29 @@ if _bash_test.found() and meson.can_run_host_binaries() and build_agent
   )
 endif
 
-# #4666 PR-2 W3a: static lexical gate over main.cpp's log-handoff wiring call sites (the
-# four textual invariants agent_log_wiring.hpp's/log_handoff.hpp's own header banners
-# describe -- see the script's own header). No build required, so gated only on bash
-# being present, same as the other lexical selftests above.
-if _bash_test.found()
-  test('log handoff wiring lexical gate (#4666 PR-2 W3a)',
-    _bash_test,
-    args: [files('shell/test_log_handoff_wiring_lexical.sh')],
-    suite: 'agent',
-    timeout: 60,
-  )
-endif
+# #4666 PR-2 W3a: static lexical gate over main.cpp's and service_win.cpp's log-handoff
+# wiring call sites (see the script's own header). No build required. Python, not bash:
+# one process on every OS instead of a grep/head/tail pipeline per check (#5428). Never
+# raise the budget -- port, split or host-gate instead.
+test('log handoff wiring lexical gate (#4666 PR-2 W3a)',
+  _python3_test,
+  args: [files('test_log_handoff_wiring_lexical.py')],
+  suite: 'agent',
+  timeout: 30,
+)
 
 # #2182: static lexical gate pinning that agent.cpp still CALLS the tested OtaUpdateThread /
 # CtxSlot stop_seen() primitives (no AgentImpl seam exists to test that, #1492) and keeps the
-# flag-then-cancel_ctx() teardown order. Carries its own negative-control self-test. No build
-# required, gated only on bash like the log-handoff gate above.
-if _bash_test.found()
-  test('agent OTA/ctx-slot wiring lexical gate (#2182)',
-    _bash_test,
-    args: [files('shell/test_agent_ota_wiring_lexical.sh')],
-    suite: 'agent',
-    # 90 s (was 60): this script spawns perl/grep per mutation and per invariant, so it is
-    # slow on Windows (17 s on a quiet MSVC box vs 1.4 s on Linux, 2026-10-02) and timed out
-    # at 60.23 s on a busy Windows CI leg (PR #5267) while running beside the agent shards.
-    timeout: 90,
-  )
-endif
+# flag-then-cancel_ctx() teardown order. Carries its own in-memory mutation self-test. No build
+# required. Python, not bash: one process (well under a second on every OS) instead of ~500-750 grep/tr/perl/cmp
+# forks that timed out at 90 s on the Windows CI leg (#5428). Never raise the budget -- port,
+# split or host-gate instead.
+test('agent OTA/ctx-slot wiring lexical gate (#2182)',
+  _python3_test,
+  args: [files('test_agent_ota_wiring_lexical.py')],
+  suite: 'agent',
+  timeout: 30,
+)
 
 # #4666 PR-2 W3a MI-2: report-only symbol-binding probe over the built exe/core-lib/
 # agent_actions plugin (see the script's own header for what it does and does not prove).
@@ -3260,15 +3288,14 @@ test('spark evidence format lockstep (#4665)',
 # #5047: static lexical gate over server.cpp's two TierPolicyFn wiring sites -- both
 # must call AuthRoutes::gateless_tier_policy_fn(), never a re-inlined local lambda (see
 # the script's own header for the clause-5 rationale). No build required, same class as
-# the RBAC cross-schema query-owner seam check above.
-if _bash_test.found()
-  test('tier policy wiring lexical gate (#5047)',
-    _bash_test,
-    args: [files('shell/test_tier_policy_wiring_lexical.sh')],
-    suite: 'docs',
-    timeout: 30,
-  )
-endif
+# the RBAC cross-schema query-owner seam check above. Python, one process (#5428).
+# Never raise the budget -- port, split or host-gate instead.
+test('tier policy wiring lexical gate (#5047)',
+  _python3_test,
+  args: [files('test_tier_policy_wiring_lexical.py')],
+  suite: 'docs',
+  timeout: 30,
+)
 
 # #4665 regression net: a position-aware lexical scanner over the Guardian/Spark
 # subsystem (agents/core/src + server/core/src + common/include, filtered to the

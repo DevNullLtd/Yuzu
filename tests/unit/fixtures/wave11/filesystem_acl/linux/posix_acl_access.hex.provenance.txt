@@ -1,0 +1,9 @@
+File: posix_acl_access.hex -- value of the system.posix_acl_access xattr, bare hex on one line.
+REAL CAPTURE, byte-for-byte. Captured 2026-10-04 in the yuzu-verify:toolchain container
+(Debian 13, kernel 7.0.12-linuxkit, overlayfs; acl + attr installed via apt in a throwaway run).
+Commands:
+  setfacl -m u:1001:rw-,g:1002:r-x /tmp/yuzu_test_acl/f
+  getfattr -n system.posix_acl_access -e hex /tmp/yuzu_test_acl/f
+`getfacl -n` of the same file: user::rw- / user:1001:rw- / group::r-- / group:1002:r-x / mask::rwx / other::r--
+Layout (linux/include/uapi/linux/posix_acl_xattr.h): LE u32 version 2, then 8-byte {u16 tag, u16 perm, u32 id}.
+Redactions: none (uids 1001/1002 are throwaway numeric ids). A file with no ACL has no attribute (ENODATA).

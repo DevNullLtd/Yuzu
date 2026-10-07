@@ -1145,14 +1145,25 @@ described below.
 
 | Metric | Type | Meaning |
 |---|---|---|
-| `yuzu_agent_ota_signature_refused_total{reason}` | counter | An OTA package was refused for a signature reason. `reason` is a closed set: `missing` (no signature, with `--update-require-signature` set), `untrusted` (the signer does not chain to the configured trust bundle, or its leaf lacks the codeSigning EKU, or **the trust bundle itself could not be read** — an unreadable or missing bundle proves nothing, so it is counted as a trust failure rather than a pass, and is the most likely cause if this counter jumps on a host right after a config change), `invalid` (the signature is malformed, or does not cover these bytes). Cumulative for the life of the agent process. |
+| `yuzu_agent_ota_signature_refused_total{reason}` | counter | An OTA package was refused for a signature reason. `reason` is a closed set: `missing` (no signature, with `--update-require-signature` set), `untrusted` (the signer does not chain to the configured trust bundle, or its leaf lacks the codeSigning EKU), `invalid` (the signature is malformed, or does not cover these bytes), `bundle_unreadable` (the agent's own trust bundle is missing, cannot be read, is not a regular file, is larger than 1 MiB, is held open by another process that denies shared reading (Windows), is not valid PEM, or holds no PEM certificate or CRL, so the signature was never checked — still a refusal, since an unreadable bundle proves nothing, but a local configuration fault rather than a signer problem, and the most likely cause if this counter jumps on a host right after a config change or reinstall; counted as `untrusted` before #5249). Cumulative for the life of the agent process. |
 
-**How it reaches you.** The total across all three reasons is carried on the
+**How it reaches you.** The total across all four reasons is carried on the
 agent heartbeat as the status tag `yuzu.ota_signature_refused`, and the server
 derives `yuzu_fleet_ota_signature_refusing_agents` from it. Nothing else reads
 the tag. If you need per-reason detail for a specific endpoint, it is in that
 endpoint's own log — the update path has no status-report RPC, so the reason
 does not travel to the server.
+
+**Which mode an agent is in (#5249).** The heartbeat also carries the status tag
+`yuzu.ota_signature_mode`: `off` (no trust bundle — update binaries are not
+signature-checked at all), `bundle` (bundle set, unsigned packages still
+accepted), or `bundle+require` (unsigned packages refused). It is the mode the
+agent process loaded at startup, which the agent also logs as `OTA update
+signature mode: …`. A refusal counter of 0 does not mean an agent is verifying:
+an `off` agent never refuses anything. The server keeps the tag in its
+in-memory agent-health snapshot with the agent's other heartbeat tags; no fleet
+gauge, REST field or dashboard view reads it yet, so today the per-endpoint
+source of truth is that startup log line.
 
 ## Histogram buckets
 
@@ -1260,14 +1271,17 @@ SSE.
 ## Fleet performance gauges (DEX)
 
 Published on every fleet-health sweep (~15 s). A metric nobody reported is
-**absent**, never zero; values are validated server-side (forged non-finite /
-out-of-range readings are rejected).
+**absent**, never zero (exception: server-owned agent counts such as
+`yuzu_fleet_tar_db_corruption_agents` and `yuzu_fleet_inventory_sync_skipping{source}`
+are published every sweep, 0 included); values are validated server-side (forged
+non-finite / out-of-range readings are rejected).
 
 | Metric | Type | Description |
 |---|---|---|
 | `yuzu_fleet_ota_signature_refusing_agents` | gauge | Endpoints that have refused at least one OTA update for a signature reason **since the agent process last started** (#416/#3807). Derived from the agents' heartbeat tag `yuzu.ota_signature_refused`, whose counter is cumulative and never resets — so read this as "has refused", not "is currently failing": an endpoint that refused once and has since updated cleanly still counts until it restarts, and a restart zeroes one that is still stuck. A RISING value is the actionable signal. This is the only server-side view of the state: the OTA path has no status-report RPC and the agent exposes no `/metrics` endpoint. Counts only endpoints currently reporting heartbeats — an agent that refused and then went offline drops out of the gauge. See [server-admin.md → Signing update binaries](server-admin.md#signing-update-binaries-416). |
 | `yuzu_fleet_tar_db_corruption_agents` | gauge | Agents whose TAR database has **ever** been quarantined as corrupt (#1567) — cumulative per agent since install, so read a **rising** value as the signal, not the absolute number; an agent that recovered still counts. Derived from the heartbeat tag `yuzu.plugin.tar.db_corruption_total`, published by the tar plugin (the agent has no `/metrics` endpoint, so a per-agent counter is not scrapable). Counts only agents currently reporting heartbeats. Example alert: `delta(yuzu_fleet_tar_db_corruption_agents[1h]) > 0` (a gauge, so use `delta`; an agent returning from offline after a quarantine re-raises it once). |
 | `yuzu_fleet_plugin_init_failed{plugin}` | gauge | Agents reporting a plugin that failed init, per plugin name (heartbeat tag `yuzu.plugins_failed`); distinguishes "failed to load" from "not installed". Absent-not-zero: the family is empty when no agent reports a failure. At most 64 named labels per sweep (lexicographically first); the rest are summed under `plugin="other"`. |
+| `yuzu_fleet_inventory_sync_skipping{source}` | gauge | Agents currently reporting heartbeats whose daily-sync `source` skipped its most recent collection cycle(s) (#5332), from the heartbeat tag `yuzu.sync.<source>.skip_streak` (> 0; today only `source="installed_software"`, written by agents that include the skip-visibility change, #5327); the cause is in the agent's own log, and the agent also publishes it as the `yuzu.sync.<source>.last_skip` heartbeat tag (no server page or API returns that tag yet). Published every sweep, 0 included. Counts only agents currently reporting heartbeats. The gauge only counts agents that emit the skip-streak heartbeat tag: an agent that does not emit it (older agents, during a rollout, or in a mixed-version fleet) contributes zero even when its collector is skipping, so a zero gauge does not establish that all collectors are healthy. Correlate with `yuzu_inventory_stale_agents{source="installed_software"}` (see the inventory manual) to tell an online host whose collector is skipping from an offline one, but do not subtract one from the other: they count different populations (live heartbeats vs stored-receipt age). |
 | `yuzu_fleet_perf_reporting` | gauge | Devices contributing at least one perf metric this sweep (the same any-of-three definition the `/dex` Performance tab's Reporting card uses) |
 | `yuzu_fleet_perf_cpu_pct{stat}` | gauge | Fleet CPU busy %, `stat` = `avg` / `p50` / `p90` / `max` |
 | `yuzu_fleet_perf_commit_pct{stat}` | gauge | Fleet memory commit % of limit, same `stat` labels |
