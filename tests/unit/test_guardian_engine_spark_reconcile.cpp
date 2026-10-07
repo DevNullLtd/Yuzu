@@ -5926,15 +5926,6 @@ std::optional<OutboxEntry> first_drift_4045(SparkReconcileFixture& f, const std:
             return e;
     return std::nullopt;
 }
-/// A sent content-drift entry (expected baseline `expected`, observed `detected`).
-bool has_drift_4045(SparkReconcileFixture& f, const std::string& rule_id,
-                    const std::string& expected, const std::string& detected) {
-    for (const auto& e : compliance_4045(f, rule_id))
-        if (!e.drift.compliant && e.drift.expected_value == expected &&
-            e.drift.detected_value == detected)
-            return true;
-    return false;
-}
 std::optional<nlohmann::json> baseline_record_4045(KvStore& kv, const std::string& rule_id) {
     auto v = kv.get(GuardianEngine::kv_namespace(), "baseline:" + rule_id);
     if (!v)

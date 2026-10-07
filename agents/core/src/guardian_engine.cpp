@@ -386,9 +386,9 @@ BaselinePersistOutcome guardian_persist_baseline(KvStore* kv, const std::string&
     j["fingerprint"] = fingerprint;
     j["hash"] = hash;
     if (!kv->set(kKvNamespace, make_baseline_key(rule_id), j.dump())) {
-        spdlog::error("Guardian: failed to persist captured baseline for rule '{}' - a later "
-                     "full_sync or restart will re-capture current content instead of this "
-                     "one (#4021)",
+        spdlog::error("Guardian: failed to persist captured baseline for rule '{}' - unless a "
+                     "retry persists it, a later full_sync or restart will re-capture current "
+                     "content instead of this one (#4021, #4045)",
                      log_id_token(rule_id));
         return BaselinePersistOutcome::Failed;
     }
