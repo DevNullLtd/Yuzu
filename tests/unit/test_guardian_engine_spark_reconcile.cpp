@@ -7284,8 +7284,11 @@ TEST_CASE("#4045 E29: the REAL worker honours the retry backoff: wakes while a f
     // this test can take makes the next worker pass due. (The setter is locked, so it is safe
     // against the live worker; the hour-long periodic backstop means only notify() wakes it.)
     persister->set_backoff_for_test(1h, 1h);
-    stage_n_4045(*rt, 1, "e29");
+    // The failing trigger goes in BEFORE the capture is staged: the worker's boot cycle or an
+    // unrelated wake could otherwise persist the capture between the two and the failed pass
+    // this test waits for would never happen.
     fail_baseline_writes_4045(f.db_.path);
+    stage_n_4045(*rt, 1, "e29");
     worker->notify();
     REQUIRE(yuzu::test::spin_until([&] { return persister->persist_failures() == 1; }));
     for (std::uint64_t i = 1; i <= 5; ++i) {
