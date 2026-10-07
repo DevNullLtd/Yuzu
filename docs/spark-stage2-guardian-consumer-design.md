@@ -714,7 +714,7 @@ rule in the push but does NOT unstick the wedged claim (an identical re-observat
 returns the existing claim); it bounds the dependence on the suppress classification
 and is not a recovery guarantee against a classifier that misidentifies a dead claim.
 Two side effects are accepted and recorded in the flip gate (AC-10, AC-16): re-arming
-every rule can recapture unpersisted Spark-first `FileHashEquals` baselines (#4045), and
+every rule can recapture a Spark-first `FileHashEquals` baseline whose persist is failing (#4045), and
 while a same-type mechanism call is hung, the Disarm of a healthy same-type rule queues
 behind it on `SparkEngine`'s per-type mechanism lock, so that rule is logically
 withdrawn at once and its re-arm may expire as `CongestionExpired`; the same collateral
@@ -802,8 +802,9 @@ heartbeat at the default (the push interval is `ceil(25 s / heartbeat) x heartbe
 re-arm about every 330 s from the safety valve (for a pure retained-wedge hold; with a
 healthy same-type sibling in the push, every push after the first forced one is a full
 teardown and re-arm, AC-16) (re-arm recaptures only
-Spark-first-captured, unpersisted `FileHashEquals` baselines, #4045: persisted
-baselines are re-seeded on every arm); (3) an operator delta push (`full_sync=false`)
+a Spark-first-captured `FileHashEquals` baseline whose persist is failing, #4045:
+`apply_rules` persists staged captures first and persisted baselines are re-seeded on
+every arm); (3) an operator delta push (`full_sync=false`)
 during a hold flips the push identity twice and resets the suppression budget;
 (4) recovery needs a live connection (the maintenance tick runs on the per-connection
 heartbeat thread). Known limits NOT fixed here: a delta push (`full_sync=false`) that
@@ -1182,8 +1183,9 @@ design is mentioned it is named as the earlier design.
   (`can_advance()` ignores content) and the server stops re-pushing, so the stale content
   stays until the next generation. #4045: a forced Reapply re-arms the whole
   push, but persisted baselines are re-seeded on every arm
-  (`guardian_engine.cpp`), so only Spark-first-captured, unpersisted `FileHashEquals`
-  baselines are exposed to a baseline recapture.
+  (`guardian_engine.cpp`) and `apply_rules` first persists any staged capture, so only a
+  Spark-first-captured `FileHashEquals` baseline whose persist is failing is exposed
+  to a baseline recapture.
 
 **Known accepted residual (governance Gate 4/8, rung 9c PR-5d /governance run,
 independently traced and REFUTED as permanent):** a withdraw immediately

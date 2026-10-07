@@ -164,8 +164,9 @@ std::string hex_decode(std::string_view hex) {
 // baseline per rule_id in KvStore so every later arm re-seeds the SAME value
 // instead of recapturing current content.
 //
-// Scope: wired for BOTH detection backends (Spark's is live only under prefer_spark_=true). The LEGACY FileGuard persists synchronously from
-// its own worker (start_guard_for_rule_locked below, via on_baseline). Spark's OWN capture
+// Scope: wired for BOTH detection backends (Spark's is live only under prefer_spark_=true).
+// The LEGACY FileGuard persists synchronously from its own worker
+// (start_guard_for_rule_locked below, via on_baseline). Spark's OWN capture
 // (guardian_rule_eval.cpp's baseline-on-arm branch, committed in guardian_spark_runtime.cpp)
 // is persisted by the staging seam (#4045): the runtime holds no KvStore (it is the
 // detach-survival object), so it only STAGES the capture edge and the engine-owned

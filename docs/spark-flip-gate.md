@@ -141,7 +141,9 @@ All start unchecked. Each gets its evidence link recorded here by PR-6.
         fleet-wide `full_sync` re-arm: any UNRELATED rule mutation anywhere in the fleet can
         silently reclassify a genuinely-still-drifted no-`expected` rule as compliant,
         with no remediation having happened. Filed **#4021** to track the fix; not
-        addressed in this doc-only PR). DGRHP is one of this workstream's designated
+        addressed in this doc-only PR; #4021 later persisted the legacy capture, and the Spark
+        capture is persisted by #4045: the runtime stages it and the engine writes it, so the
+        `prefer_spark` half of this laundering path is closed. DGRHP is one of this workstream's designated
         `prefer_spark` test rigs (§6 step 1's own procedure opens with "confirm ... agent
         running with `prefer_spark` active, spark armed" before any of this applies - the
         "Shipped posture today" row above is about the production default, not these rigs),
@@ -1164,15 +1166,17 @@ flip, with a red-first test each:
     bounds the dependence on the suppress classification (it is not a recovery guarantee
     against a classifier that misidentifies a dead claim). The counter resets only in
     `begin_application()`/`retire()`. Because it re-arms every rule in the push, the forced
-    Reapply (a) can recapture unpersisted Spark-first `FileHashEquals` baselines (#4045,
-    AC-10) and (b) while a same-type mechanism call is hung, can withdraw healthy same-type
+    Reapply (a) can recapture a Spark-first `FileHashEquals` baseline whose persist is
+    failing (#4045, AC-10) and (b) while a same-type mechanism call is hung, can withdraw healthy same-type
     siblings, after which every later push is a Reapply (AC-16). If the budget is already spent when a retained wedge's late success is
     adopted, the next identical push is a forced Reapply of the just-armed rule: one wasted
     teardown, never an acknowledgment.
   - (AC-10) **#4045 baseline relaunder, narrow.** Persisted baselines are re-seeded on
-    every arm (`guardian_engine.cpp`, the arm-time re-seed), so only
-    Spark-first-captured, unpersisted `FileHashEquals` baselines are exposed to a
-    recapture by a forced Reapply.
+    every arm (`guardian_engine.cpp`, the arm-time re-seed), and `apply_rules` first writes
+    any staged, not-yet-persisted Spark capture before it tears down or re-arms anything,
+    so only a Spark-first-captured `FileHashEquals` baseline whose persist is itself
+    failing (a failing local KV store; counted in `yuzu.guardian_baseline_persist_failures`)
+    is exposed to a recapture by a forced Reapply.
   - (AC-11) **An operator delta push (`full_sync=false`) during a hold** changes the push
     identity (and the following full_sync push changes it back), so each is a Reapply and
     the suppression budget restarts. A delta push that OMITS a still-desired unresolved

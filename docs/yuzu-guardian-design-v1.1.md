@@ -2615,10 +2615,23 @@ Guardian ladder must check these.
   being absent from a full_sync. `guardian_persist_baseline` additionally
   refuses to overwrite a well-formed, same-fingerprint record (a write reaching
   that state can only mean a failed seed lookup — adversarial-review K1/C2-1).
-  Spark's own first-ever baseline capture is NOT yet wired to this store
-  (tracked as #4045) — under `prefer_spark_=true` (not the shipping default), a
-  rule never armed via legacy still relaunders on full_sync/restart exactly as
-  before this fix.
+  Spark's own first-ever baseline capture reaches this store through a staging
+  seam (#4045): `GuardianSparkRuntime` is the detach-survival object and NEVER
+  touches a `KvStore`, so it only STAGES the capture edge (rule_id, path, hash;
+  first capture wins, bounded) and the engine-owned `GuardianBaselinePersister`
+  writes it through `guardian_persist_baseline`'s overwrite guard. Invariants:
+  (1) the persister is called from exactly three places: `apply_rules` BEFORE
+  any teardown or re-arm (so the new generation's seed read observes the prior
+  capture, in one `mtx_` section), `stop()` after the worker join, and the
+  outbox drain worker's loop; and NEVER from a drain that runs only on a live
+  connection (`journal_maintenance_tick`), or a boot re-arm that captures before
+  the network is up loses its capture on a crash; (2) a failed write is a
+  deliberate fail-open (the rule keeps its in-memory baseline), restaged and
+  retried, counted, error-logged and exported on the sparse heartbeat tag
+  `yuzu.guardian_baseline_persist_failures`, never silent; (3) the crash
+  window between a capture and its persist is accepted (the next boot
+  recaptures). All of it is inert while `prefer_spark_` is false (the shipping
+  default) and becomes live at the Spark flip.
 - **A guard whose own detection has permanently degraded must never publish
   itself compliant (PR #4748, CT-4).** `FileGuard`'s parent-directory
   (rename-detection) watch permanently disables after repeated teardown

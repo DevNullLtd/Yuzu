@@ -91,8 +91,9 @@ inline constexpr std::size_t kAckDrainMaxPerTick = 1024;
 /// returns Reapply. A DECISION-count bound, not wall-clock: decide_retry() has one
 /// production caller (apply_rules(), driven by the server's push cadence), so at the
 /// 30 s heartbeat this is about 330 s (275 s at 25 s spacing). A forced Reapply
-/// re-arms every rule in the push (and so reintroduces the #4045 baseline-recapture
-/// exposure for Spark-captured, unpersisted baselines) but does NOT unstick the wedged
+/// re-arms every rule in the push (apply_rules persists staged Spark baseline captures
+/// first, #4045, so only a capture whose persist is itself failing is exposed to a
+/// recapture) but does NOT unstick the wedged
 /// claim - an identical re-observation returns the existing claim. It bounds the
 /// dependence on the suppress classification; it is NOT a recovery guarantee against
 /// a classifier that misidentifies a dead claim. Reset only by begin_application()
