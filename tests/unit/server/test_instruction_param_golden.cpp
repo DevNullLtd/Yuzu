@@ -67,6 +67,14 @@ std::vector<Row> golden_rows() {
     acc("agent.content_dist.cleanup", {{"hours", "168"}}, "cleanup hours as a GUI string");
     acc("agent.content_dist.cleanup", {{"filename", "x.msi"}}, "the dead filename stays declared");
     rej("agent.content_dist.cleanup", {{"hours", "soon"}}, "unparsable hours");
+    // 0 and below are documented as "remove everything"; above the maximum the plugin's cutoff
+    // arithmetic overflows into the future on Linux/libstdc++ (1500000 measured) and does the
+    // same by accident.
+    acc("agent.content_dist.cleanup", {{"hours", 0}}, "hours 0 removes everything, as documented");
+    acc("agent.content_dist.cleanup", {{"hours", -1}}, "negative hours, as documented");
+    acc("agent.content_dist.cleanup", {{"hours", 876000}}, "hours at its maximum");
+    rej("agent.content_dist.cleanup", {{"hours", 876001}}, "hours one over its maximum");
+    rej("agent.content_dist.cleanup", {{"hours", 1500000}}, "hours past the overflow point");
     acc("agent.content_dist.execute_staged", {{"filename", "a.msi"}, {"expected_hash", kHash64}},
         "execute_staged expected_hash");
     rej("agent.content_dist.execute_staged", {{"filename", "a.msi"}, {"expected_hash", "ABC"}},
@@ -80,6 +88,8 @@ std::vector<Row> golden_rows() {
     rej("device.agent_actions.set_log_level", {{"level", kNul}}, "embedded NUL");
     acc("device.wol.check", {{"host", "10.0.0.1"}, {"timeout_ms", 1000}}, "wol.check timeout_ms");
     acc("device.wol.check", {{"host", "10.0.0.1"}, {"count", "5"}}, "wol.check count");
+    acc("device.wol.check", {{"host", "10.0.0.1"}, {"timeout_ms", 100}}, "timeout_ms at minimum");
+    acc("device.wol.check", {{"host", "10.0.0.1"}, {"timeout_ms", 5000}}, "timeout_ms at maximum");
     rej("device.wol.check", {{"host", "10.0.0.1"}, {"timeout_ms", 99}}, "timeout_ms below minimum");
     rej("device.wol.check", {{"host", "10.0.0.1"}, {"timeout_ms", 5001}}, "timeout_ms above maximum");
     acc("workflow.config_search_and_replace",
@@ -112,6 +122,7 @@ std::vector<Row> golden_rows() {
     rej("crossplatform.tar.query", {{"type", "bogus"}}, "an unknown type");
 
     // Over-maximum values the plugin used to clamp.
+    acc("device.agent_logging.get_log", {{"lines", 1}}, "get_log at its minimum");
     acc("device.agent_logging.get_log", {{"lines", 500}}, "get_log at its maximum");
     rej("device.agent_logging.get_log", {{"lines", 501}}, "get_log one over");
     rej("device.agent_logging.get_log", {{"lines", 0}}, "get_log below its minimum");

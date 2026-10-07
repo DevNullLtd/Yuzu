@@ -106,7 +106,10 @@
   "how_it_works": "`get_log` resolves the agent log path through a three-tier fallback — explicit `agent.log_file` config, then `agent.data_dir`/`yuzu-agent.log`, then platform default paths — and tails it line-by-line into a bounded deque, clamped to 500 lines. A log path that resolves to nothing is not an error: the action returns rc=0 with `status|empty` and `line_count|0`, while an out-of-range `lines` parameter returns rc=1 with `status|error`. Every `fs::exists` check in the path search deliberately uses the non-throwing `error_code` overload — the throwing form raised `filesystem_error` on `EACCES` and crashed the whole agent process on a macOS host with a restricted log directory.\n\n`get_key_files` walks a fixed list of locations — the agent's own executable path (via an OS-specific self-lookup), its log file, up to three config file names and two data-store file names under `agent.data_dir`, every regular file in `agent.plugin_dir`, and three TLS certificate/key config keys — emitting one `file|<path>|<size>|<mtime>` row per file actually found. A missing file, an unreadable size, or an unreadable mtime is skipped or zeroed rather than failing the whole action.\n\nNeither action shells out or spawns a subprocess; both are native, in-process filesystem/config reads on every OS. This plugin is deliberately not a live log tail or a file-content reader: `get_log` re-reads the whole file on every call rather than streaming, and `get_key_files` reports paths, sizes and mtimes only — never file contents, including for the TLS private key it enumerates.",
   "inputs": [
     {
-      "constraints": null,
+      "constraints": {
+        "maximum": 500,
+        "minimum": 1
+      },
       "default": 50,
       "definition_id": "device.agent_logging.get_log",
       "description": "Number of trailing log lines to return, 1-500 (e.g. 100). Defaults to 50. A value outside 1-500 is rejected with a 400 by POST /api/instructions/{id}/execute. A caller that bypasses that route reaches the plugin, which clamps values above 500 and rejects values below 1 with a status|error result.\n",

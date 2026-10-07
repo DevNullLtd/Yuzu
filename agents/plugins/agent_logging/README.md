@@ -56,7 +56,7 @@ No external binaries, no subprocesses, no network access — both actions are na
 <!-- BEGIN GENERATED: plugin-doc-gen inputs -->
 | Definition | Parameter | Type | Required | Default | Constraints | Description |
 |---|---|---|---|---|---|---|
-| `device.agent_logging.get_log` | `lines` | int32 | no | 50 | - | Number of trailing log lines to return, 1-500 (e.g. 100). Defaults to 50. A value outside 1-500 is rejected with a 400 by POST /api/instructions/{id}/execute. A caller that bypasses that route reaches the plugin, which clamps values above 500 and rejects values below 1 with a status\|error result. |
+| `device.agent_logging.get_log` | `lines` | int32 | no | 50 | minimum 1 · maximum 500 | Number of trailing log lines to return, 1-500 (e.g. 100). Defaults to 50. A value outside 1-500 is rejected with a 400 by POST /api/instructions/{id}/execute. A caller that bypasses that route reaches the plugin, which clamps values above 500 and rejects values below 1 with a status\|error result. |
 <!-- END GENERATED -->
 
 ### Outputs

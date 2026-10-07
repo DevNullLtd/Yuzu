@@ -41,8 +41,9 @@ spec:
           that route reaches the plugin, which clamps values above 500
           and rejects values below 1 with a status|error result.
         default: 50
-        minimum: 1
-        maximum: 500
+        validation:
+          minimum: 1
+          maximum: 500
 
   result:
     columns:

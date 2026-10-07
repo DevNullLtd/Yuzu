@@ -246,10 +246,12 @@
       "type": "string"
     },
     {
-      "constraints": null,
+      "constraints": {
+        "maximum": 876000
+      },
       "default": 24,
       "definition_id": "agent.content_dist.cleanup",
-      "description": "Remove staged files whose last-write time is older than this many hours, e.g. 24 or 168. Default: 24. A value of 0 or less removes every staged file. Whole numbers only: the server rejects any other form with a 400 (the plugin on its own would silently fall back to 24 on an unparsable value).\n",
+      "description": "Remove staged files whose last-write time is older than this many hours, e.g. 24 or 168. Default: 24. A value of 0 or less removes every staged file. Maximum 876000 (100 years), rejected with a 400 above that: measured on Linux with libstdc++, a value of 1500000 or more overflows the cutoff into the future and removes every staged file. Whole numbers only: the server rejects any other form with a 400 (the plugin on its own would silently fall back to 24 on an unparsable value).\n",
       "name": "hours",
       "required": false,
       "type": "int32"
