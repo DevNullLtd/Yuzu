@@ -6263,7 +6263,7 @@ Published (`enabled_only=true`) `InstructionDefinition` catalog — the commands
 }
 ```
 
-`parameter_schema` is a nested JSON Schema **object** (not a string) when the stored value parses as JSON *and* is itself a JSON object; `null` when the stored value fails to parse (the authoring path always stores at least `{}`, so this case needs a non-standard write to reach), or when it parses to something other than an object, e.g. an array or string (only a legacy or non-standard write can store one: create, update and import reject a non-object schema). Same rule `GET /api/v1/discover/plugins` already follows for its inline `parameter_schema`.
+`parameter_schema` is a nested JSON Schema **object** (not a string) when the stored value parses as JSON *and* is itself a JSON object; `null` when the stored value fails to parse (the authoring path always stores at least `{}`, so this case needs a non-standard write to reach), or when it parses to something other than an object, e.g. an array or string (only a legacy or non-standard write can store one: the store refuses a non-object schema, and the only REST route that can supply a `parameter_schema` at all is `POST /api/instructions/import`). Same rule `GET /api/v1/discover/plugins` already follows for its inline `parameter_schema`.
 
 #### `GET /api/v1/discover/routes`
 
@@ -9554,7 +9554,10 @@ send are never modified and no `default` is injected.
   value. No approval ticket, execution row or dispatch is created.
 - **`500`**: the definition's stored schema cannot be prepared, so the call fails closed:
   `error.message` is `stored parameter schema for this instruction is invalid` and `error.remediation`
-  says an administrator must replace it. Nothing is dispatched.
+  says to delete the definition and import it again with a corrected `parameter_schema` (see
+  [Replacing a stored parameter schema](instructions.md#replacing-a-stored-parameter-schema)). Nothing is
+  dispatched. The audit row is `instruction.execute` with `result=failure` and detail
+  `reason=param_schema_invalid`.
 - A definition whose stored schema is empty, whitespace or `{}` declares nothing and is **not
   validated**. This is how a definition saved from the YAML editor behaves.
 

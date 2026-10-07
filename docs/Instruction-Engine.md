@@ -1115,7 +1115,7 @@ InstructionDefinition.spec.execution.action  →  CommandRequest.action
 InstructionDefinition parameter values       →  CommandRequest.parameters (map<string,string>)
 ```
 
-There is no separate "legacy" or "ad-hoc" execution path. Ad-hoc commands sent from the dashboard or API are simply untyped InstructionDefinitions with `additionalProperties: {type: string}` parameter schemas.
+There is no separate "legacy" or "ad-hoc" execution path. Ad-hoc commands sent from the dashboard or API are simply untyped InstructionDefinitions. The definitions the server auto-generates (`legacy.<plugin>.<action>`) declare `additionalProperties: {type: string}` in their YAML source but store `{}` as their `parameter_schema`, so nothing is validated against it.
 
 ### 15.2 Auto-Generation from Plugin Descriptors
 
@@ -1139,7 +1139,7 @@ yuzu-admin generate-definitions --output definitions/
 
 ### 15.3 Schema Inference Roadmap
 
-**ABI v1 (current):** Plugins don't declare their parameter schemas. Auto-generated definitions use open `additionalProperties`.
+**ABI v1 (current):** Plugins don't declare their parameter schemas. Auto-generated definitions declare an open `additionalProperties` in their YAML source and store `{}` as the `parameter_schema`.
 
 **ABI v2 (future):** Add optional `parameter_schema` and `result_schema` fields to `YuzuPluginDescriptor`. Plugins that populate these get fully typed auto-generated definitions. Plugins that don't still get open-schema stubs.
 

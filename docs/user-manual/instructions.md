@@ -333,14 +333,14 @@ Parameters use a JSON Schema subset. The root object describes the input shape; 
 | `datetime` | ISO 8601 timestamp | String | `"2026-03-17T18:20:00Z"` |
 | `guid` | UUID / GUID | String | `"550e8400-e29b-41d4-a716-446655440000"` |
 
-Parameters are transmitted as `map<string, string>` in the `CommandRequest` protobuf message. The server validates values against declared types and constraints before dispatch.
+Parameters are transmitted as `map<string, string>` in the `CommandRequest` protobuf message. `POST /api/instructions/{id}/execute` validates the request's `params` against the declared types and constraints before dispatch (see [Parameter validation](#parameter-validation)); no other dispatch surface does yet.
 
 ### Validation Constraints
 
 | Constraint | Applicable Types | Description |
 |---|---|---|
-| `maxLength` | `string` | Maximum character count. |
-| `minLength` | `string` | Minimum character count. |
+| `maxLength` | `string` | Maximum length in bytes (UTF-8). |
+| `minLength` | `string` | Minimum length in bytes (UTF-8). |
 | `pattern` | `string` | Regex the value must match. |
 | `enum` | `string` | List of allowed values. |
 | `minimum` | `int32`, `int64` | Minimum value (inclusive). |
@@ -418,6 +418,33 @@ over a limit makes execute answer `500`):
 `enabled: false` hides a definition from the discovery catalog and stops its schedules (the schedule
 poller records `definition_disabled`), but it does **not** stop `POST /api/instructions/{id}/execute`:
 that route does not read `enabled`.
+
+### Replacing a stored parameter schema
+
+No route replaces a stored schema in place: `PUT /api/instructions/{id}`, the YAML editor and
+response-template changes keep it, and `POST /api/instructions/import` answers `409` for an id that
+already exists. To replace one (a wrong or legacy schema, a `500` from execute, or a corrected bundled
+definition on an existing install), delete the definition and import it again with a corrected
+`parameter_schema`:
+
+1. `GET /api/instructions/{id}/export` (`InstructionDefinition:Read`) and keep the document. It carries
+   the fields import reads, including `yaml_source`, `instruction_set_id` and
+   `response_templates_spec`, which the delete removes.
+2. Edit its `parameter_schema` (a string holding the schema JSON).
+3. `DELETE /api/instructions/{id}` (`InstructionDefinition:Delete`, audit action `instruction.delete`).
+4. `POST /api/instructions/import` with the edited document (`InstructionDefinition:Write`, audit action
+   `instruction.import`). The schema is checked as it is written, so a bad one is refused with a `400`.
+
+Import refuses an unsigned document unless the server runs with `--allow-unsigned-definitions`; a signed one
+carries `signature` and `publicKey`, an Ed25519 signature over the bytes of `yaml_source`. See
+[REST API](rest-api.md).
+
+- A bundled definition is tombstoned by the delete, so the bundled reseed does not bring the old one back.
+  The signed import path does not consult the tombstone, so the replacement lands, and later boots leave it
+  alone.
+- The delete removes only the definition row. A schedule that references the id has its occurrences skipped
+  and audited as `definition_unknown` until the id exists again.
+- Between steps 3 and 4 the definition does not exist, and a refused import leaves it deleted. Have the corrected (and, unless the unsigned flag is set, signed) document ready before step 3, and do both in one maintenance window.
 
 ---
 
@@ -1050,6 +1077,7 @@ Dispatches the instruction definition to agents. Requires `Execution:Execute` pe
 - `agent_ids` — optional array of specific agent IDs to target.
 - `scope` — optional scope expression (e.g., `group:servers`, `os:windows AND tag:prod`), or `__all__` for every enrolled agent. **Omit both `scope` and `agent_ids`** to broadcast. A *supplied* empty string, a non-string `scope`, an empty `agent_ids`, a non-array `agent_ids`, or a non-string entry is refused with `400` rather than widened to the whole fleet (#2500) — a target the caller named that resolves to nothing is an error, not a request for everything.
 - `params` — key-value parameters to pass to the plugin action. Keys should match the definition's `parameter_schema`.
+  This route checks them against it (see [Parameter validation](#parameter-validation)).
 
 **Response (200):**
 

@@ -146,15 +146,15 @@ Each parameter descriptor supports:
 | `type` | string | Yes | -- | Parameter type. Values: `string`, `boolean`, `int32`, `int64`, `datetime`, `guid`. See [Section 10](#10-parameter-type-system). |
 | `displayName` | string | No | -- | Human-readable label for the dashboard form. |
 | `description` | string | No | `""` | Parameter description. |
-| `default` | varies | No | -- | Default value if not provided. Must match the declared type. |
+| `default` | varies | No | -- | Default value if not provided. Must match the declared type. The server does not inject it into the dispatched parameters; it only satisfies `required` during `POST /api/instructions/{id}/execute` validation. |
 | `validation` | object | No | -- | Validation constraints. See below. Also summarised into the plugin README's Inputs table (Constraints column, e.g. `enum: a, b · minLength 1`) and carried verbatim in the `content/plugin-docs` manifest (`inputs[].constraints`). |
 
 #### `spec.parameters.properties.<name>.validation`
 
 | Field | Type | Applicable Types | Description |
 |---|---|---|---|
-| `maxLength` | integer | `string` | Maximum string length. |
-| `minLength` | integer | `string` | Minimum string length. |
+| `maxLength` | integer | `string` | Maximum string length in bytes (UTF-8). |
+| `minLength` | integer | `string` | Minimum string length in bytes (UTF-8). |
 | `pattern` | string | `string` | Regular expression the value must match. |
 | `enum` | list | `string` | Allowed values. The value must be one of the listed strings. |
 | `minimum` | number | `int32`, `int64` | Minimum numeric value (inclusive). |
@@ -233,7 +233,7 @@ neither controls anything at runtime.
 
 | Field | Type | Required | Default | Description |
 |---|---|---|---|---|
-| `enabled` | boolean | No | `false` | When `true`, this definition was auto-generated from a plugin descriptor. The parameter schema uses `additionalProperties: {type: string}` (open schema). |
+| `enabled` | boolean | No | `false` | When `true`, this definition was auto-generated from a plugin descriptor. The generated YAML source declares `additionalProperties: {type: string}` (open schema), but the stored `parameter_schema` is `{}`, so these definitions are not validated by `POST /api/instructions/{id}/execute`. |
 
 #### `spec.visualization`
 
@@ -1444,8 +1444,8 @@ Parameters are transmitted as `map<string, string>` in the `CommandRequest` prot
 
 | Constraint | Applicable Types | Description |
 |---|---|---|
-| `maxLength` | `string` | Maximum character count. |
-| `minLength` | `string` | Minimum character count. |
+| `maxLength` | `string` | Maximum length in bytes (UTF-8). |
+| `minLength` | `string` | Minimum length in bytes (UTF-8). |
 | `pattern` | `string` | Regular expression the value must match. |
 | `enum` | `string` | List of allowed values. |
 | `minimum` | `int32`, `int64` | Minimum value (inclusive). |

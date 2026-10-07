@@ -65,7 +65,8 @@ other dispatch surface (workflow steps, schedules, policy remediation, result-se
 
 **A stored schema is not refreshed by an upgrade.** The bundled reseed inserts a definition only when its id
 is absent (`ON CONFLICT (id) DO NOTHING`), so the six corrections above reach fresh installs only; an existing
-install keeps the old stored schema and keeps refusing the same calls until it is replaced. Comparing the
+install keeps the old stored schema and keeps refusing the same calls until it is replaced (delete the
+definition and import it again; see [Replacing a stored parameter schema](instructions.md#replacing-a-stored-parameter-schema)). Comparing the
 parameter declarations at `v0.14.0` with this release, exactly 6 definitions differ in what the server
 enforces (the six above), and 13 more differ only in `description` text and enforce what they did
 (`agent.content_dist.upload_file`, `device.agent_logging.get_log`, `device.event_logs.errors`,
@@ -74,14 +75,20 @@ enforces (the six above), and 13 more differ only in `description` text and enfo
 `device.script_exec.exec`, `device.script_exec.powershell`, `device.windows_updates.patch_connectivity`,
 `workflow.patch_connectivity_audit`).
 
-**Detecting it.** Each refusal writes an `instruction.execute` audit row with `result=denied` and detail
-`reason=param_schema path=<path>` (or `reason=param_schema_invalid` for the `500`), and increments
+**Detecting it.** Each refusal writes an `instruction.execute` audit row: `result=denied` with detail
+`reason=param_schema path=<path>` for a `400`, or `result=failure` with `reason=param_schema_invalid` for the
+`500`. Each also increments
 `yuzu_server_instruction_param_rejected_total{route="instruction_execute",reason}`. See
 [Audit log](audit-log.md) and [Metrics](metrics.md).
 
-**Rollback.** No migration and no schema change. Rolling the server back removes the check; rolling forward
-re-applies it. While replicas run different releases the same call can be refused by one and accepted by
-another.
+**Rollback.** No migration and no schema change. Rolling the server back removes the check, and while replicas
+run different releases the same call can be refused by one and accepted by another. A release without the check
+still rewrites a stored schema in one case: a YAML-editor save on the older release writes `{}` over it, because
+that route builds the definition from the YAML alone. The other update routes of the older release (`PUT`,
+response templates) write back the schema they loaded. A definition that was hit this way is not validated, on
+this release or any other, until its schema is replaced (see
+[Replacing a stored parameter schema](instructions.md#replacing-a-stored-parameter-schema)); rolling forward
+does not restore it.
 
 ## Operator note: the software-inventory store migration (v7) is a hard cutover (#5172)
 
@@ -1002,9 +1009,9 @@ the handler.
 
 Both surfaces share one builder (`build_instructions_catalog`) that parses each `InstructionDefinition`'s stored `parameter_schema` text. It previously forwarded any value that parsed as JSON, even a non-object (an array, string, number, or boolean). It now forwards it only when the parsed value is itself a JSON object — a non-object value is reported as `null` instead, matching `GET /api/v1/discover/plugins`' existing behavior for the same field.
 
-**Who this affects:** an operator or integration that authored an `InstructionDefinition` with a non-object `parameter_schema` — reachable via the ordinary `create`/`update`/`import` paths, which don't validate the field's shape on write. No shipped content sets `parameter_schema` to anything but an object or leaves it unset (defaults to `{}`), so this affects only a deliberately or accidentally malformed definition.
+**Who this affects:** an operator or integration that authored an `InstructionDefinition` with a non-object `parameter_schema`, written before the write-time schema check existed, or by a non-standard write (the store now refuses a non-object `parameter_schema`, and `POST /api/instructions/import` is the only REST route that can supply one). No shipped content sets `parameter_schema` to anything but an object or leaves it unset (defaults to `{}`), so this affects only a deliberately or accidentally malformed definition.
 
-**What to do:** if you have such a definition and relied on the old raw-forwarding behavior, re-author `parameter_schema` as a JSON Schema object. No action is required otherwise.
+**What to do:** if you have such a definition and relied on the old raw-forwarding behavior, re-author `parameter_schema` as a JSON Schema object (see [Replacing a stored parameter schema](instructions.md#replacing-a-stored-parameter-schema)). No action is required otherwise.
 
 ## Behaviour change: webhook and offload-target deliveries, and enrollment/execution-failure notifications, now actually fire (#3261)
 
