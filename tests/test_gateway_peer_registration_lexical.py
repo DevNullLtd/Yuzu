@@ -28,18 +28,32 @@ string/char literal contents blanked and whitespace collapsed:
   5. Member order: the declarations of `agent_service_`, `gateway_service_` and
      `gateway_peer_guard_` precede `agent_server_` in server.cpp, in that order (the guard must
      outlive the gRPC server that calls it, and the OTA row's agent_service_/agent_server_ order is
-     untouched). Each is declared exactly once.
-  6. `#include` hygiene: server.cpp includes only headers (.h/.hpp). An included .cpp/.inc file
-     would be text the lexical rules never see; a macro-argument include is refused for the same
-     reason.
-  7. Tree rule: no other C/C++ file under server/ names `ServerBuilder` or any service-registration
-     or listener API (comments stripped), so a registration cannot hide in a helper translation
-     unit that server.cpp passes the builder to. Rule 3 already forbids server.cpp handing the
-     builder out; this rule is the independent check from the other side.
+     untouched). Each is declared exactly once, and all four sit at the SAME brace depth, which is
+     the depth of the body of `class ServerImpl` (a declaration moved into a nested struct would
+     keep the textual order and change the destruction order). Exactly TWO
+     `GatewayPeerGuardedService` constructions exist (the acknowledged-insecure arm and the
+     enforcing arm of the one boot function); a third is a new, unreviewed way to build the guard.
+  6. `#include` hygiene: server.cpp includes only headers (.h/.hpp), spelled `#include` or with
+     the `%:` digraph, and imports (`import "x.cpp";`, `import <x.cpp>;`, a named module) are held to
+     the same rule. An included .cpp/.inc file would be text the lexical rules never see; a
+     macro-argument include is refused for the same reason. The only exemption is a bare
+     `<name>` with no `/` and no extension (a standard-library header such as `<algorithm>`).
+     A line beginning with `#include` inside a raw string literal is data, not a directive, and
+     is not read as one.
+  7. Tree rule: no other C/C++ file under server/ (extensions matched case-insensitively:
+     .c .cc .cpp .cxx .c++ .h .hh .hpp .hxx .inc .ipp .tpp .tcc .inl .ixx .cppm .ino .mm .m) names
+     `ServerBuilder` or any service-registration or listener API (comments stripped), so a
+     registration cannot hide in a helper translation unit that server.cpp passes the builder to.
+     No directory is exempt: there is no `test`/`tests` directory under server/ today, and a
+     blanket exemption would be a place to hide one. Rule 3 already forbids server.cpp handing
+     the builder out; this rule is the independent check from the other side.
 
-Preprocessing the lexer undoes first: backslash-newline splices (a token split across lines) and
-C++14 digit separators (`1'000`), which would otherwise open a bogus character literal that
-swallows a registration up to the next apostrophe.
+Preprocessing the lexer undoes first: a leading UTF-8 byte-order mark (which would stop the first
+line reading as a directive), backslash-newline splices (a token split across lines) and C++14
+digit separators (`1'000`), which would otherwise open a bogus character literal that swallows a
+registration up to the next apostrophe. A raw string literal is recognised only at an identifier
+boundary (`XR"(` is the identifier `XR` followed by an ordinary string, not a raw string), with or
+without an encoding prefix (`u8R"(`, `uR"(`, `UR"(`, `LR"(`).
 
 LEXICAL ONLY. It is not a data-flow analysis. A registration reached through a macro, a generated
 file or a header that is included but not under server/ is outside its reach. The behavioural guarantee is the guard's own tests
@@ -74,7 +88,7 @@ HINT = (" (this gate pins the gateway-upstream registration; if server.cpp was l
 _LEX = re.compile(
     r'//[^\n]*'                       # line comment
     r'|/\*.*?\*/'                     # block comment
-    r'|R"([^()\\\s]{0,16})\(.*?\)\1"'  # raw string literal
+    r'|(?<![A-Za-z0-9_])(?:u8|u|U|L)?R"([^()\\\s]{0,16})\(.*?\)\1"'  # raw string literal (identifier boundary)
     r'|"(?:\\.|[^"\\\n])*"'           # string literal
     r"|'(?:\\.|[^'\\\n])*'",          # char literal (a digit separator pair is harmless here)
     re.S,
@@ -92,6 +106,8 @@ def preprocess(src):
     is the `u8'a'` character-literal prefix (a `8` before the quote, a hex letter after), so an
     apostrophe directly after a standalone `u8` is left alone. Done with a literal scan for the
     apostrophes and a per-apostrophe check, not a whole-file regex, to keep the gate fast."""
+    if src.startswith("\ufeff"):
+        src = src[1:]  # a byte-order mark would stop the first line reading as a directive
     src = src.replace("\\\r\n", "").replace("\\\n", "")
     out, last = [], 0
     for m in re.finditer("'", src):
@@ -111,7 +127,7 @@ def lex(src):
 
     normalised: comments -> one space, string/char literal contents blanked, whitespace collapsed
     (what rules 1-5 and 7 read). comments_stripped: comments -> one space, literals KEPT (what the
-    `#include` scan of rule 6 reads, because an include target is a literal)."""
+    `#include` scan of rule 6 reads, because an include target is a literal; raw strings are blanked)."""
     pre = preprocess(src)
     blank, keep, last = [], [], 0
     for m in _LEX.finditer(pre):
@@ -123,9 +139,15 @@ def lex(src):
         if t.startswith("//") or t.startswith("/*"):
             blank.append(" ")
             keep.append(" ")
-        else:
-            blank.append('""' if t[0] in "\"R" else "''")
+        elif t[0] == "'":
+            blank.append("''")
             keep.append(t)
+        else:
+            blank.append('""')
+            # An ordinary string literal is kept (an include target is one); a raw string literal
+            # is blanked here too, so a `#include` at the start of one of its lines is data and
+            # cannot be read as a directive.
+            keep.append(t if t[0] == '"' else '""')
     tail = pre[last:]
     blank.append(tail)
     keep.append(tail)
@@ -220,18 +242,55 @@ def problems(src):
             if not pos[early] < pos[late]:
                 out.append(f"[member-order] `{early}` must be declared before `{late}` so the gRPC server "
                            "is destroyed before the objects it calls into")
+        # Same brace depth, and that depth is the body of `class ServerImpl`: textual order across a
+        # nested struct or function body says nothing about member destruction order.
+        cls = CLASS_OPEN.search(t)
+        if cls is None:
+            out.append("[member-order] `class ServerImpl ... {` was not found, so the member depth cannot be checked")
+        else:
+            body_depth = brace_depth(t, cls.end() - 1) + 1
+            for name in MEMBER_ORDER:
+                d = brace_depth(t, pos[name])
+                if d != body_depth:
+                    out.append(f"[member-order] `{name}` is at brace depth {d}, not {body_depth} (the body of "
+                               "`class ServerImpl`): a member in a nested scope does not fix the destruction order")
 
-    # Rule 6: only headers are included.
-    for m in re.finditer(r"^[ \t]*#[ \t]*(include|include_next|import)\b([^\n]*)", kept, re.M):
-        arg = m.group(2).strip()
+    # Exactly two constructions of the guard (the acknowledged-insecure arm and the enforcing arm).
+    n_ctor = len(GUARD_CTOR.findall(t))
+    if n_ctor != 2:
+        out.append(f"[guard-construction-count] expected exactly 2 constructions of GatewayPeerGuardedService "
+                   f"(acknowledged-insecure and enforcing), found {n_ctor}: a new construction is a new, "
+                   "unreviewed way to build the guard")
+
+    # Rule 6: only headers are included (`#include`, the `%:` digraph spelling, and C++20 `import`).
+    for m in INCLUDE_RX.finditer(kept):
+        kind = m.group("kind") or "import"
+        arg = (m.group("arg") or m.group("modarg") or "").strip()
         inc = re.match(r'[<"]([^>"]+)[>"]', arg)
         if inc is None:
-            out.append(f"[include-form] `#{m.group(1)} {arg[:40]}`: only `#include <header>` / `\"header\"` is permitted")
-        elif not (inc.group(1).endswith((".h", ".hpp")) or (arg[0] == "<" and "." not in inc.group(1))):
-            # (an extensionless angle-bracket include is a standard-library header: <algorithm>)
-            out.append(f"[include-nonheader] `#include {inc.group(1)}`: an included source file is text this "
+            out.append(f"[include-form] `{kind} {arg[:40]}`: only `#include <header>` / `\"header\"` is permitted")
+        elif not (inc.group(1).endswith((".h", ".hpp"))
+                  or (arg[0] == "<" and "." not in inc.group(1) and "/" not in inc.group(1))):
+            # (a bare extensionless angle-bracket name is a standard-library header: <algorithm>)
+            out.append(f"[include-nonheader] `{kind} {inc.group(1)}`: an included source file is text this "
                        "gate cannot lex as part of the registration site")
     return out
+
+
+def brace_depth(t, pos):
+    """Number of unmatched `{` before offset `pos` of the normalised text (literals are blanked)."""
+    return t.count("{", 0, pos) - t.count("}", 0, pos)
+
+
+CLASS_OPEN = re.compile(r"\bclass ServerImpl\b[^{;]*\{")
+GUARD_CTOR = re.compile(r"\b(?:make_unique|make_shared) ?< ?(?:detail::)?GatewayPeerGuardedService ?>"
+                        r"|\bnew (?:detail::)?GatewayPeerGuardedService\b")
+# `#include` / `%:include` / `# include_next` / `import "x"` / `import <x>` / `import name;`
+# at the start of a line (a C++20 `export import` too).
+INCLUDE_RX = re.compile(
+    r"^[ \t]*(?:(?P<kind>(?:#|%:)[ \t]*(?:include_next|include|import))\b(?P<arg>[^\n]*)"
+    r"|(?:export[ \t]+)?import\b[ \t]*(?P<modarg>[<\"][^>\"]*[>\"]|[A-Za-z_][\w.:]*[ \t]*;|:[\w.]+[ \t]*;))",
+    re.M)
 
 
 # Rule 5 inputs: (name, declaration regex over normalised text) in REQUIRED declaration order.
@@ -247,19 +306,21 @@ MEMBER_ORDER = tuple(n for n, _ in MEMBER_DECLS)
 TREE_TOKENS = re.compile(r"\b(?:ServerBuilder|\w*Register\w*Service\w*|\w*GenericService\w*|"
                          r"AddListeningPort|BuildAndStart)\b")
 TREE_PREFILTER = ("ServerBuilder", "Register", "GenericService", "AddListeningPort", "BuildAndStart")
-TREE_EXTS = (".cpp", ".cc", ".cxx", ".c", ".hpp", ".h", ".hh", ".hxx", ".inc", ".ipp", ".tpp", ".mm")
+# Compared case-insensitively (`.C`, `.H` are C++ / C headers on a case-sensitive filesystem).
+TREE_EXTS = frozenset((".cpp", ".cc", ".cxx", ".c++", ".c", ".hpp", ".h", ".hh", ".hxx", ".h++", ".inc",
+                       ".ipp", ".tpp", ".tcc", ".inl", ".ixx", ".cppm", ".ino", ".mm", ".m"))
 SERVER_TREE = ROOT / "server"
 SERVER_REL = "server/core/src/server.cpp"
 
 
-def tree_sources():
-    """{repo-relative posix path: text} for every C/C++ file under server/ except server.cpp."""
+def tree_sources(tree=SERVER_TREE, base=ROOT):
+    """{repo-relative posix path: text} for every C/C++ file under `tree` except server.cpp."""
     out = {}
-    for f in sorted(SERVER_TREE.rglob("*")):
-        if not f.is_file() or f.suffix not in TREE_EXTS:
+    for f in sorted(tree.rglob("*")):
+        if not f.is_file() or f.suffix.lower() not in TREE_EXTS:
             continue
-        rel = f.relative_to(ROOT).as_posix()
-        if rel == SERVER_REL or "/tests/" in rel or "/test/" in rel:
+        rel = f.relative_to(base).as_posix()
+        if rel == SERVER_REL:
             continue
         out[rel] = f.read_text(encoding="utf-8", errors="replace")
     return out
@@ -356,6 +417,42 @@ MUTATIONS = (
     ("macro-argument include",
      r'(#include "bundled_content\.hpp")', r'\1\n#include GATEWAY_REGISTRATION_HEADER', 0,
      "include-form"),
+    ("an XR\"( identifier-prefixed string is not a raw string (it would hide a registration)",
+     r"(" + _GUARD_LINE + r")",
+     r'\1 const char* xs = XR"(" ; builder.RegisterService(gateway_service_.get()); const char* xe = ")";', 0,
+     "registration-form"),
+    ("a leading byte-order mark does not hide the first line's directive",
+     r"\A", '\ufeff#include "evil_body.cpp"\n', 1, "include-nonheader"),
+    ("digraph include of a source file",
+     r'(#include "bundled_content\.hpp")', r'\1\n%: include "gateway_service_body.cpp"', 0,
+     "include-nonheader"),
+    ("C++20 import of a source file",
+     r'(#include "bundled_content\.hpp")', r'\1\nimport "gateway_service_body.cpp";', 0,
+     "include-nonheader"),
+    ("C++20 import of an angle-bracket source file",
+     r'(#include "bundled_content\.hpp")', r'\1\nimport <gateway_service_body.cpp>;', 0,
+     "include-nonheader"),
+    ("exported import of a source file",
+     r'(#include "bundled_content\.hpp")', r'\1\nexport import "gateway_service_body.cpp";', 0,
+     "include-nonheader"),
+    ("import of a named module",
+     r'(#include "bundled_content\.hpp")', r'\1\nimport gateway.registration;', 0,
+     "include-form"),
+    ("angle include with a path separator is not the standard-library exemption",
+     r'(#include "bundled_content\.hpp")', r'\1\n#include <detail/gateway_body>', 0,
+     "include-nonheader"),
+    ("guard member moved into a nested struct (text order kept, depth changed)",
+     r"std::unique_ptr<detail::GatewayPeerGuardedService> gateway_peer_guard_;",
+     "struct NestedHolder { std::unique_ptr<detail::GatewayPeerGuardedService> gateway_peer_guard_; };", 0,
+     "member-order"),
+    ("a third guard construction",
+     r"(" + _GUARD_LINE + r")",
+     r"\1 auto g3 = std::make_unique<detail::GatewayPeerGuardedService>(*gateway_service_, other_policy);", 0,
+     "guard-construction-count"),
+    ("a guard built with new",
+     r"(" + _GUARD_LINE + r")",
+     r"\1 auto* g3 = new detail::GatewayPeerGuardedService(*gateway_service_, other_policy);", 0,
+     "guard-construction-count"),
 )
 
 # Benign controls: edits that must NOT change the verdict (comments and literals mentioning the
@@ -373,6 +470,15 @@ BENIGN = (
      r'(#include "bundled_content\.hpp")', r'\1\n#  include   <yuzu/extra.hpp>', 0),
     ("commented-out source include",
      r'(#include "bundled_content\.hpp")', r'\1\n// #include "gateway_service_body.cpp"', 0),
+    ("a raw string literal naming the tokens, with and without an encoding prefix",
+     r"(" + _GUARD_LINE + r")",
+     r'\1 const char* r1 = R"(builder.RegisterService(gateway_service_.get()))"; '
+     r'const char* r2 = u8R"x(builder.RegisterAsyncGenericService(&g))x"; const wchar_t* r3 = LR"(ServerBuilder)";', 0),
+    ("a raw string literal with a line-leading #include",
+     r"(" + _GUARD_LINE + r")",
+     '\\1 const char* r4 = R"(\n#include "evil_body.cpp"\n  import <evil_body.cpp>;\n)";', 0),
+    ("a standard-library angle include and a header import",
+     r'(#include "bundled_content\.hpp")', r'\1\n#include <algorithm>\nimport "extra.hpp";', 0),
     ("string literal naming the tokens",
      r"(" + _GUARD_LINE + r")",
      r'\1 spdlog::debug("builder.RegisterService(gateway_service_.get()) is forbidden; // x");', 0),
@@ -434,6 +540,25 @@ class GatewayPeerRegistrationLexical(unittest.TestCase):
                                 f"control '{name}' was not caught: {p}")
         benign = base + "\n// grpc::ServerBuilder b; b.BuildAndStart();\nconst char* k = \"RegisterService\";\n"
         self.assertEqual(tree_problems({victim: benign}), [])
+        # A raw string that merely mentions the tokens is data; one spelled XR"( is not a raw string.
+        self.assertEqual(tree_problems({victim: base + '\nconst char* k = u8R"(b.RegisterService(&x))";\n'}), [])
+        self.assertTrue(tree_problems({victim: base + '\nconst char* a = XR"(" ; b.RegisterService(&x); const char* z = ")";\n'}))
+        self.assertTrue(tree_problems({victim: "\ufeff" + base + "\nvoid f(){ b.AddListeningPort(a, c); }\n"}))
+
+    def test_tree_scan_extensions_and_directories(self):
+        # Every C/C++ spelling is scanned (case-insensitively) and no directory name is exempt.
+        import tempfile
+        exts = (".C", ".c++", ".ixx", ".cppm", ".ino", ".tcc", ".inl", ".H", ".hh", ".hxx", ".cpp", ".hpp")
+        with tempfile.TemporaryDirectory(prefix="yuzu_test_gwreg_") as d:
+            base = Path(d)
+            (base / "core" / "tests").mkdir(parents=True)
+            (base / "core" / "test").mkdir()
+            for i, ext in enumerate(exts):
+                (base / "core" / ("tests" if i % 2 else "test") / f"hidden{i}{ext}").write_text("void f(){}\n")
+            (base / "notes.txt").write_text("x\n")
+            seen = tree_sources(base, base)
+            self.assertEqual(len(seen), len(exts), sorted(seen))
+            self.assertTrue(any("/tests/" in k for k in seen) and any("/test/" in k for k in seen))
 
 
 if __name__ == "__main__":

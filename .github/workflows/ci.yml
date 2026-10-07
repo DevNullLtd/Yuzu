@@ -1484,8 +1484,12 @@ jobs:
       # with no pin, no client CA, a broken explicit pin source, HTTPS-only defaults) and must
       # boot for the permitted ones. It also makes an ANONYMOUS gateway-upstream call (curl, no
       # client certificate) to the real binary: refused (grpc-status 16, denial counter on
-      # /metrics) when enforcing, answered when acknowledged-off. Not exercisable by the Catch2
-      # suite (which never constructs ServerImpl); needs the binary and Postgres, like the step
+      # /metrics) when enforcing, answered when acknowledged-off. With a client certificate it
+      # calls the agent, the dedicated gateway-upstream and the management listeners (the guarded
+      # service answers on all three): the pinned default gateway leaf is admitted, the unpinned
+      # default server leaf is refused as not_pinned with its denial audit row in Postgres, and
+      # no certificate at all fails the handshake on the two strict listeners. Not exercisable by
+      # the Catch2 suite (which never constructs ServerImpl); needs the binary and Postgres, like the step
       # above. YUZU_REQUIRE_PSQL makes a missing `psql` a failure, never a skip: the test creates
       # one database per row through it, and a skipped step would be a green job that never ran
       # (the sibling CLI steps above skip when psql is absent; this one must not).

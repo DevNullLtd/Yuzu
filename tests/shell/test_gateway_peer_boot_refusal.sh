@@ -48,20 +48,34 @@
 # client certificate and calls /yuzu.gateway.v1.GatewayUpstream/BatchHeartbeat with an empty gRPC
 # frame.
 #   G  enforce on default certs: TLS, request-not-require client auth on the agent port; expect
-#      grpc-status 16 and yuzu_server_gateway_peer_denied_total{rpc="batch_heartbeat",
-#      reason="not_authenticated"} >= 1 on /metrics
+#      grpc-status 16, grpc-message "gateway peer not authorized", and
+#      yuzu_server_gateway_peer_denied_total{rpc="batch_heartbeat",reason="not_authenticated"} >= 1
+#      on /metrics
 #   H  acknowledged plaintext (h2c prior knowledge): grpc-status other than 16 (the real handler
 #      answers; an empty BatchHeartbeat is OK) and no denial series incremented
 #   J  acknowledged on TLS defaults: the same, over TLS
 # Client-certificate gateway-upstream calls (row G only, the default-certificate boot; curl
-# --cert/--key/--cacert against the same listener, the certificates and CA taken from the row's
-# own --ca-dir):
+# --cert/--key/--cacert, the certificates and CA taken from the row's own --ca-dir). The service is
+# registered on the one gRPC builder, so it answers on EVERY listener of the server; the same three
+# calls are made on three of them:
+#   agent listener (--listen; client certificate requested, not required, on defaults),
+#   dedicated gateway-upstream listener (--gateway-upstream; strict mTLS on defaults),
+#   management listener (--management; strict mTLS on defaults).
 #   G  presenting the default GATEWAY leaf (the one the automatic pin admits): grpc-status other
 #      than 16 (the real handler answers) and no not_pinned denial
 #   G  presenting the default SERVER leaf (a valid certificate of the same CA that is NOT the
-#      pinned one): grpc-status 16 and yuzu_server_gateway_peer_denied_total{rpc="batch_heartbeat",
-#      reason="not_pinned"} = 1 (reason no_server_auth_eku instead if openssl shows that leaf
-#      lacks serverAuth; today both default leaves carry serverAuth and clientAuth)
+#      pinned one): grpc-status 16, grpc-message "gateway peer not authorized", and
+#      yuzu_server_gateway_peer_denied_total{rpc="batch_heartbeat",reason="not_pinned"} = 3 in
+#      total (one per listener; reason no_server_auth_eku instead if openssl shows that leaf lacks
+#      serverAuth; today both default leaves carry serverAuth and clientAuth)
+#   G  presenting NO certificate to the two strict listeners: the TLS handshake fails (curl exits
+#      non-zero with a TLS-level error, never a connect failure or timeout) and no grpc-status
+#      arrives, so the guard is never reached and no denial is counted for it
+# The denial audit row: the unpinned-leaf calls write a session.gateway_peer_denied row to the
+# row's Postgres audit store (principal gateway-peer:<first 8 hex of that leaf's SPKI>, role
+# unverified_peer, result denied, target batch_heartbeat, detail reason=not_pinned
+# rpc=batch_heartbeat spki=<first 16 hex>), and no other session.gateway_peer_denied row exists
+# (the certificate-less and anonymous callers write none). Bounded poll of about 10 s.
 #
 # Pins are read once at boot: there is no reload and no pin gauge, so no row looks for one.
 #
@@ -266,6 +280,8 @@ start_row() {
   mkdir -p "$TMP/$name"
   echo "$p3" > "$TMP/$name.web"
   echo "$p1" > "$TMP/$name.agent"
+  echo "$p2" > "$TMP/$name.mgmt"
+  echo "$p4" > "$TMP/$name.gwup"
   local tpfx="$TIMEOUT_PFX" stdin_src="/dev/null"
   [ -n "$ROW_STDIN" ] && stdin_src="$ROW_STDIN"
   (
@@ -346,18 +362,26 @@ anon_call() {
     -H 'content-type: application/grpc' -H 'te: trailers' --data-binary @"$TMP/empty.frame" \
     "$2://127.0.0.1:$3/yuzu.gateway.v1.GatewayUpstream/BatchHeartbeat" 2>"$TMP/$1.anon.err" || true
 }
-# cert_call TAG CERT KEY : the same BatchHeartbeat call on controls row G's agent port, presenting
-# a CLIENT certificate and verifying the server against the row's own CA (not -k). Headers land in
-# $TMP/G.TAG.anon, readable by grpc_status_of "G.TAG".
+# cert_call TAG PORT [CERT KEY] : the same BatchHeartbeat call on controls row G's listener at PORT,
+# presenting a CLIENT certificate (or none when CERT is omitted) and verifying the server against
+# the row's own CA (not -k). Headers land in $TMP/G.TAG.anon (readable by grpc_status_of "G.TAG"),
+# curl's stderr in G.TAG.anon.err and its exit code in G.TAG.rc.
 cert_call() {
-  curl --http2 --cacert "$TMP/G/ca/default-ca.pem" --cert "$2" --key "$3" -sS \
-    -D "$TMP/G.$1.anon" -o /dev/null --max-time 15 \
+  local tag="$1" port="$2" rc=0
+  local cc=()
+  [ -n "${3:-}" ] && cc=(--cert "$3" --key "$4")
+  curl --http2 --cacert "$TMP/G/ca/default-ca.pem" ${cc[@]+"${cc[@]}"} -sS \
+    -D "$TMP/G.$tag.anon" -o /dev/null --max-time 15 \
     -H 'content-type: application/grpc' -H 'te: trailers' --data-binary @"$TMP/empty.frame" \
-    "https://127.0.0.1:$(cat "$TMP/G.agent")/yuzu.gateway.v1.GatewayUpstream/BatchHeartbeat" \
-    2>"$TMP/G.$1.anon.err" || true
+    "https://127.0.0.1:$port/yuzu.gateway.v1.GatewayUpstream/BatchHeartbeat" \
+    2>"$TMP/G.$tag.anon.err" || rc=$?
+  echo "$rc" > "$TMP/G.$tag.rc"
 }
 grpc_status_of() { # NAME : the grpc-status the anonymous call received (empty when none)
   grep -i '^grpc-status:' "$TMP/$1.anon" 2>/dev/null | tail -1 | tr -d '\r' | awk '{print $2}' || true
+}
+grpc_message_of() { # NAME : the grpc-message the anonymous call received (empty when none)
+  grep -i '^grpc-message:' "$TMP/$1.anon" 2>/dev/null | tail -1 | tr -d '\r' | sed 's/^[^:]*: *//' || true
 }
 for c in G H J K L M P; do
   if wait_marker "$c" "Gateway upstream listening"; then
@@ -369,8 +393,14 @@ for c in G H J K L M P; do
       if [ "$c" = "G" ]; then
         # The default gateway leaf is the pinned one; the default server leaf is a valid
         # certificate of the same CA that is NOT pinned.
-        cert_call dgw "$TMP/G/ca/default-gateway.pem" "$TMP/G/ca/default-gateway.key"
-        cert_call dsrv "$TMP/G/ca/default-server.pem" "$TMP/G/ca/default-server.key"
+        for lst in agent gwup mgmt; do
+          lport="$(cat "$TMP/G.$lst")"
+          case "$lst" in agent) pfx="" ;; *) pfx="$lst." ;; esac
+          cert_call "${pfx}dgw" "$lport" "$TMP/G/ca/default-gateway.pem" "$TMP/G/ca/default-gateway.key"
+          cert_call "${pfx}dsrv" "$lport" "$TMP/G/ca/default-server.pem" "$TMP/G/ca/default-server.key"
+          # Strict listeners only: with no client certificate the handshake itself must fail.
+          [ "$lst" = "agent" ] || cert_call "${pfx}none" "$lport"
+        done
       fi
     fi
     scrape "$c" > "$TMP/$c.metrics" || true
@@ -578,6 +608,9 @@ anon_row() { # NAME DESCRIPTION WANT(16|not16)
   if [ "$want" = "16" ] && [ "$st" != "16" ]; then
     bad "$desc: expected grpc-status 16 (UNAUTHENTICATED), got $st"; return
   fi
+  if [ "$want" = "16" ] && [ "$(grpc_message_of "$name")" != "gateway peer not authorized" ]; then
+    bad "$desc: grpc-message is '$(grpc_message_of "$name")', want 'gateway peer not authorized'"; return
+  fi
   if [ "$want" = "not16" ] && [ "$st" = "16" ]; then
     bad "$desc: the call was refused (grpc-status 16) but this row expects the real handler to answer"; return
   fi
@@ -596,26 +629,55 @@ if [ "$ANON_OK" = "1" ]; then
        fi ;;
   esac
 fi
-# Client-certificate calls (row G, default certificates): the pinned default gateway leaf is
-# admitted by the automatic pin, the unpinned default server leaf is refused as not_pinned.
-anon_row G.dgw "enforce: the pinned default gateway certificate is admitted (the real handler answers)" not16
-anon_row G.dsrv "enforce: a valid but unpinned certificate (the default server leaf) is refused" 16
+# Client-certificate calls (row G, default certificates), on each listener that serves the guarded
+# service: the pinned default gateway leaf is admitted by the automatic pin, the unpinned default
+# server leaf is refused as not_pinned. The agent listener requests but does not require a client
+# certificate on defaults; the dedicated gateway-upstream and the management listeners are strict.
+anon_row G.dgw "enforce, agent listener: the pinned default gateway certificate is admitted (the real handler answers)" not16
+anon_row G.dsrv "enforce, agent listener: a valid but unpinned certificate (the default server leaf) is refused" 16
+anon_row G.gwup.dgw "enforce, gateway-upstream listener: the pinned default gateway certificate is admitted" not16
+anon_row G.gwup.dsrv "enforce, gateway-upstream listener: a valid but unpinned certificate is refused" 16
+anon_row G.mgmt.dgw "enforce, management listener: the pinned default gateway certificate is admitted" not16
+anon_row G.mgmt.dsrv "enforce, management listener: a valid but unpinned certificate is refused" 16
+handshake_row() { # TAG DESCRIPTION : no client certificate to a strict-mTLS listener fails at the handshake
+  local tag="$1" desc="$2" rc st
+  if [ "$ANON_OK" != "1" ]; then echo "skip - $desc (curl without HTTP/2)"; return; fi
+  rc="$(cat "$TMP/G.$tag.rc" 2>/dev/null || echo missing)"
+  st="$(grpc_status_of "G.$tag")"
+  case "$rc" in
+    0|missing) bad "$desc: curl exited $rc, expected a TLS-level failure"; return ;;
+    6|7|28) bad "$desc: curl exited $rc (no connection or a timeout), not a handshake failure: $(tr '\n' ' ' < "$TMP/G.$tag.anon.err")"; return ;;
+  esac
+  if [ -n "$st" ]; then
+    bad "$desc: a grpc-status ($st) arrived, so the call got past the handshake"; return
+  fi
+  ok "$desc (curl exit $rc, no grpc-status)"
+}
+handshake_row gwup.none "enforce, gateway-upstream listener: no client certificate fails the TLS handshake"
+handshake_row mgmt.none "enforce, management listener: no client certificate fails the TLS handshake"
 if [ "$ANON_OK" = "1" ]; then
-  if openssl x509 -in "$TMP/G/ca/default-server.pem" -noout -ext extendedKeyUsage 2>/dev/null \
-       | grep -q 'TLS Web Server Authentication'; then
+  # Three unpinned-leaf calls (one per listener) reach the guard; the certificate-less ones do not.
+  n_unpinned=3
+  # A failed EKU probe is an explicit FAIL and never silently selects a reason.
+  eku_text="$(openssl x509 -in "$TMP/G/ca/default-server.pem" -noout -text 2>/dev/null || true)"
+  want_reason=""
+  if [ -z "$eku_text" ]; then
+    bad "enforce: openssl could not read the default server certificate to probe its extended key usage"
+  elif printf '%s\n' "$eku_text" | grep -q 'TLS Web Server Authentication'; then
     want_reason="not_pinned"
   else
     want_reason="no_server_auth_eku"
   fi
   for rsn in not_pinned no_server_auth_eku; do
+    [ -n "$want_reason" ] || break
     n="$(grep 'yuzu_server_gateway_peer_denied_total' "$TMP/G.metrics" 2>/dev/null | grep 'rpc="batch_heartbeat"' \
       | grep "reason=\"$rsn\"" | awk '{print $NF}' | head -1 || true)"
     case "$n" in ''|*[!0-9]*) n="missing" ;; esac
     if [ "$rsn" = "$want_reason" ]; then
-      if [ "$n" = "1" ]; then
-        ok "enforce: the unpinned certificate incremented denied_total{rpc=\"batch_heartbeat\",reason=\"$rsn\"} to exactly 1 (the pinned one added none)"
+      if [ "$n" = "$n_unpinned" ]; then
+        ok "enforce: the unpinned certificate on three listeners incremented denied_total{rpc=\"batch_heartbeat\",reason=\"$rsn\"} to exactly $n_unpinned (the pinned one added none)"
       else
-        bad "enforce: denied_total{rpc=\"batch_heartbeat\",reason=\"$rsn\"} is '$n', want exactly 1"
+        bad "enforce: denied_total{rpc=\"batch_heartbeat\",reason=\"$rsn\"} is '$n', want exactly $n_unpinned"
       fi
     elif [ "$n" != "0" ]; then
       bad "enforce: denied_total{rpc=\"batch_heartbeat\",reason=\"$rsn\"} is '$n', want 0"
@@ -655,6 +717,43 @@ audit_row M "an environment acknowledgement writes one boot audit row (mode=inse
 audit_row G "enforce mode writes no boot audit row" 0
 audit_row K "an explicit pin writes no boot audit row" 0
 audit_row L "a false environment acknowledgement writes no boot audit row" 0
+
+# The denial audit row of the unpinned-leaf calls (row G). The calls are made, and the server has
+# written the row, before row G is stopped; the poll is bounded (about 10 s, event-driven: it
+# returns the moment the row is visible) so a slow commit cannot fail the row spuriously.
+denial_audit_row() {
+  local db dsn spki spki8 spki16 want n total i=0
+  if [ "$ANON_OK" != "1" ]; then echo "skip - denial audit row (curl without HTTP/2)"; return; fi
+  db="$(row_db G)"
+  dsn="${dsn_prefix}/${db}${dsn_query}"
+  spki="$(spki_hex "$TMP/G/ca/default-server.pem")"
+  if [ "${#spki}" -ne 64 ]; then bad "denial audit row: could not compute the default server leaf's SPKI hash ('$spki')"; return; fi
+  spki8="${spki:0:8}"; spki16="${spki:0:16}"
+  want="principal = 'gateway-peer:$spki8' AND principal_role = 'unverified_peer' AND result = 'denied' AND target_id = 'batch_heartbeat' AND detail = 'reason=not_pinned rpc=batch_heartbeat spki=$spki16'"
+  n=0
+  while [ $i -lt 100 ]; do
+    n="$(psql "$dsn" -qtAc "SELECT count(*) FROM audit_store.audit_events WHERE action = 'session.gateway_peer_denied' AND $want;" 2>/dev/null || echo err)"
+    case "$n" in ''|*[!0-9]*) ;; *) [ "$n" -ge 1 ] && break ;; esac
+    i=$((i+1)); sleep 0.1
+  done
+  case "$n" in ''|*[!0-9]*) bad "denial audit row: the audit query failed ('$n')"; return ;; esac
+  if [ "$n" -lt 1 ]; then
+    bad "denial audit row: no session.gateway_peer_denied row with principal gateway-peer:$spki8, role unverified_peer, reason=not_pinned"
+    psql "$dsn" -qtAc "SELECT principal || '|' || principal_role || '|' || result || '|' || target_id || '|' || detail FROM audit_store.audit_events WHERE action = 'session.gateway_peer_denied';" >&2 2>/dev/null || true
+    return
+  fi
+  total="$(psql "$dsn" -qtAc "SELECT count(*) FROM audit_store.audit_events WHERE action = 'session.gateway_peer_denied';" 2>/dev/null || echo err)"
+  ok "the unpinned leaf's denial reached the audit store: gateway-peer:$spki8 / unverified_peer / denied ($n row(s) of $total)"
+  # Every denial row is for that one authenticated peer: the anonymous (not_authenticated) and
+  # certificate-less callers, which cost nothing to produce, wrote none.
+  if [ "$n" = "$total" ]; then
+    ok "no other session.gateway_peer_denied row exists (anonymous and certificate-less callers write none)"
+  else
+    bad "denial audit rows other than the unpinned leaf's exist ($total in all, $n matching)"
+    psql "$dsn" -qtAc "SELECT principal || '|' || principal_role || '|' || detail FROM audit_store.audit_events WHERE action = 'session.gateway_peer_denied';" >&2 2>/dev/null || true
+  fi
+}
+denial_audit_row
 
 echo "---- $pass passed, $fail failed ----"
 [ "$fail" -eq 0 ]
