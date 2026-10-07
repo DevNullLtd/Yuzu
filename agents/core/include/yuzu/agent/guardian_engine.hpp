@@ -513,9 +513,9 @@ public:
     /// mtx_.
     [[nodiscard]] bool boot_rearm_unresolved() const;
 
-    /// Cumulative count of reconcile (arm) ATTEMPTS that threw and were firewalled in
-    /// apply_rules, plus failed boot re-arms (start_local's walk, #5513) and arm receipts that
-    /// resolved to a failure in the maintenance tick's drain — a rule that persisted but did
+    /// Cumulative count of reconcile (arm) ATTEMPTS that threw or returned Failed and were
+    /// firewalled in apply_rules (and full_sync sweep/teardown failures), plus failed boot
+    /// re-arms (start_local's walk, #5513) and arm receipts that resolved to a failure in the maintenance tick's drain — a rule that persisted but did
     /// not arm. This counts attempts, NOT distinct rules: one persistently-failing rule
     /// increments it once per push (so it is a rate signal / "a gap is open", not "how many
     /// rules are gapped"). A nonzero value means an enforcement gap is (or was) open on this
@@ -874,8 +874,9 @@ private:
     /// failure never reports 0. Under mtx_, no atomics.
     bool boot_app_open_{false};
     std::size_t rule_count_{0};
-    /// Cumulative arm-failure count (item 3 / Sol B1): reconcile throws, boot-walk failures and
-    /// drained async arm failures. Not fleet-visible (#4062).
+    /// Cumulative arm-failure count (item 3 / Sol B1): reconcile throws and returned-Failed
+    /// arms, full_sync sweep/teardown failures, boot-walk failures and drained async arm
+    /// failures. Not fleet-visible (#4062).
     std::atomic<std::uint64_t> arm_failures_{0};
 
     /// #5513: the ONE place a boot re-arm failure is recorded, shared by start_local's
