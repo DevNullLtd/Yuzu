@@ -525,15 +525,19 @@ place, **Hardware** and **Software**, each its own page:
     row's own click-to-drill-into-**installs-per-version** action — to list every device
     running that title: hostname (linking to its Hardware CI record), version,
     publisher, install date, signature status, ecosystem, and architecture, with its own
-    client-side filter for a popular title with many installs. This inline expansion is
-    server-scoped the same way the old Find results were (per-row management-group
-    drop, 1000-row cap, `inventory.software.query` audit verb) — a short/zero result
-    under a narrow scope is *incomplete*, not *absent*.
+    client-side filter for a popular title with many installs. The expansion carries a
+    per-row management-group drop, a 1000-row cap and the `inventory.software.query`
+    audit verb, but that per-row filter does not narrow the result today: the page sits
+    behind the global `Inventory:Read` gate, so a group-confined operator is denied before
+    the filter runs and a global operator's filter is a no-op. The page says so in its
+    own scope caveat.
 
-  The expansion replaces the standalone **Find software** tab, which is gone from the
-  sub-nav. Its routes, `/fragments/inventory/find` and `/fragments/inventory/find/results`,
-  are still registered for old bookmarks and deep links, but nothing in the UI links to
-  them any more — treat them as a legacy escape hatch, not a supported feature.
+  The expansion replaces the standalone **Find software** tab and the old Devices-tab
+  fragments. Their routes (`/fragments/inventory/find`, `/fragments/inventory/find/results`,
+  `/fragments/inventory/devices`, `/fragments/inventory/device`) were removed and now
+  return `404` for an authenticated caller (an unauthenticated request is redirected to
+  the login page first, like any other dashboard path); `/inventory` itself still
+  redirects (`302`) to `/hardware`.
 
   - The catalogue store now serves exact numbers under filters: **Installs is the exact
     number of distinct devices** carrying the title under any kind/ecosystem/source
@@ -553,8 +557,9 @@ CI and Tags columns layered on top from a best-effort `DeviceInventoryStore`/tag
 read — a *whole-store* degrade there is now its own explicit "CI columns unavailable" /
 "Tags unavailable" banner (an improvement on the old Devices tab, where a
 `DeviceInventoryStore` degrade during the list render was indistinguishable from "not
-yet synced"); the roster read itself being wholly unavailable shows a dedicated "roster
-unavailable" banner rather than an empty table. The **per-device CI record's Overview
+yet synced"); the dedicated "roster unavailable" banner appears only when the roster
+provider is not wired at all — a failed roster read currently renders as an empty table
+(tracked in #5531). The **per-device CI record's Overview
 lens**, by contrast, has always been an authoritative three-state read: found /
 genuinely-not-yet-synced ("no CI record synced yet") / degraded (an explicit "CI record
 unavailable" banner) are never conflated.
