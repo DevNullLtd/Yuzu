@@ -3043,27 +3043,33 @@ GuardianSparkRuntime::attach_core(const std::string& key, std::string rule_id, S
         // both) - the "armed" entry below covers the new one, so ONE outbox-waker
         // firing at the end of this call covers both. A prior generation whose own
         // arm is still claimed is withdrawn in place (Case 0, generalised).
-        prior_disarm = detach_rule_locked(rule_id);
-
-        // #4045: the persist-before-seed fence. A baseline-on-arm file-hash rule (no authored
-        // expected_hash, none seeded from the durable record by the engine) inherits a capture
-        // the PRIOR generation staged. This runs under the same registry_mu_ hold as the
-        // detach just above, and evaluate_key stages only under registry_mu_ after rechecking
-        // that its generation is still the active one, so an old evaluation either staged
-        // before this block (seen here) or is dropped by that recheck after it: no capture can
-        // be staged-but-unseen. The entry stays staged (the persister writes it). Path
-        // mismatch means a retarget, whose capture is fresh by design. Pure map read, no I/O.
+        // #4045: a baseline-on-arm file-hash rule (no authored expected_hash, none seeded from
+        // the durable record by the engine) inherits a capture the PRIOR generation staged.
+        // The hash is COPIED here, BEFORE the detach below, because the copy can throw
+        // (bad_alloc past SSO) and a throw after the detach would leave the rule with no live
+        // arm; here nothing has been mutated yet, so the unwind is a plain early return.
+        // The read runs under the same registry_mu_ hold as the detach, and evaluate_key stages
+        // only under registry_mu_ after rechecking that its generation is still the active
+        // one, so an old evaluation either staged before this hold (seen here) or is dropped by
+        // that recheck after it: no capture can be staged-but-unseen. The entry stays staged
+        // (the persister writes it, then erases it). A path mismatch means a retarget, whose
+        // capture is fresh by design. Pure map read, no I/O. The persister's seed fence (held
+        // by the engine around its KV seed read through this call) covers the other half: an
+        // entry can leave staging between the seed read and this read only after its KV write,
+        // and the fence keeps a worker pass from running in that gap.
+        std::string inherited_hash;
         if (rg->assertion.kind == AssertionKind::FileHashEquals &&
             rg->assertion.expected_hash.empty() &&
             std::holds_alternative<FileSparkParams>(spec.params)) {
             if (const auto sit = staged_baselines_.find(rule_id);
                 sit != staged_baselines_.end() &&
                 sit->second.path == std::get<FileSparkParams>(spec.params).path)
-                rg->assertion.expected_hash = sit->second.hash; // may throw bad_alloc: unwinds
-                                                                // through prior_disarm_rollback
-                                                                // only (the index and claim
-                                                                // rollbacks are armed below)
+                inherited_hash = sit->second.hash; // may throw: nothing is mutated yet
         }
+
+        prior_disarm = detach_rule_locked(rule_id);
+        if (!inherited_hash.empty())
+            rg->assertion.expected_hash = std::move(inherited_hash); // noexcept string move
 
         gen = ++gen_counter_;
         rg->generation = gen;
@@ -4472,63 +4478,71 @@ GuardianSparkRuntime::PendingSnapshot GuardianSparkRuntime::snapshot_pending() c
 }
 
 // #4045: staged baseline captures. The runtime only STAGES (no I/O, no KvStore); the
-// engine-owned GuardianBaselinePersister drains via take/restage (header block above).
+// engine-owned GuardianBaselinePersister drains via snapshot/erase-if-unchanged (header block).
 void GuardianSparkRuntime::stage_baseline_locked(const std::string& rule_id, const std::string& path,
                                                  const std::string& hash) noexcept {
     try {
+        if (fail_next_stage_baseline_.exchange(false, std::memory_order_relaxed))
+            throw std::bad_alloc{}; // TEST-ONLY seam: the allocation-failure path
         const auto it = staged_baselines_.find(rule_id);
         if (it != staged_baselines_.end()) {
             // First capture wins on one path (a re-arm that re-captured drifted content must not
-            // beat the capture on record); a different path is a retarget, whose capture
-            // obsoletes the old target's.
-            if (it->second.path != path)
-                it->second = CapturedBaseline{rule_id, path, hash};
+            // beat the capture on record). A different path is a retarget: its capture
+            // obsoletes the old target's, which was never persisted (it is still staged), so
+            // that capture is lost and counted. Legacy loses its capture on any failed write
+            // too, with no retry; the count keeps this path from being silent.
+            if (it->second.path != path) {
+                CapturedBaseline replacement{rule_id, path, hash};
+                it->second = std::move(replacement);
+                staged_baseline_drops_->fetch_add(1, std::memory_order_relaxed);
+            }
             return;
-        }
-        if (staged_baselines_.size() >= kMaxStagedBaselines) {
-            staged_baseline_drops_.fetch_add(1, std::memory_order_relaxed);
-            return; // never evict an existing (older) capture to make room
         }
         staged_baselines_.emplace(rule_id, CapturedBaseline{rule_id, path, hash});
     } catch (...) { // bad_alloc: a counted drop, never a throw out of the commit section
-        staged_baseline_drops_.fetch_add(1, std::memory_order_relaxed);
+        staged_baseline_drops_->fetch_add(1, std::memory_order_relaxed);
     }
 }
 
-std::vector<GuardianSparkRuntime::CapturedBaseline> GuardianSparkRuntime::take_staged_baselines() {
-    // NOT gated on stopping_: the engine's stop() flush runs after begin_stop().
-    std::lock_guard<std::mutex> lk{registry_mu_};
+std::vector<GuardianSparkRuntime::CapturedBaseline>
+GuardianSparkRuntime::snapshot_staged_baselines() const {
+    // NOT gated on stopping_: the engine's stop() flush runs after begin_stop(). Allocation
+    // happens OUTSIDE the lock where it can (the vector), and the strings are copied under it
+    // WITHOUT mutating staging, so a throw anywhere leaves staging exactly as it was.
+    if (fail_next_snapshot_.exchange(false, std::memory_order_relaxed))
+        throw std::bad_alloc{}; // TEST-ONLY seam: as if the reserve below failed
     std::vector<CapturedBaseline> out;
-    out.reserve(staged_baselines_.size()); // may throw BEFORE anything is moved out
-    for (auto& [rule_id, cap] : staged_baselines_)
-        out.push_back(std::move(cap));     // reserved: cannot throw
-    staged_baselines_.clear();
-    return out;
+    for (;;) {
+        std::size_t want = 0;
+        {
+            std::lock_guard<std::mutex> lk{registry_mu_};
+            want = staged_baselines_.size();
+        }
+        out.reserve(want + 8); // slack: a capture staged between the two holds
+        std::lock_guard<std::mutex> lk{registry_mu_};
+        if (staged_baselines_.size() > out.capacity())
+            continue; // grew past the slack: reserve again, outside the lock
+        out.clear();
+        for (const auto& [rule_id, cap] : staged_baselines_)
+            out.push_back(cap); // within capacity: only the string copies can throw
+        return out;
+    }
 }
 
-void GuardianSparkRuntime::restage_baselines(std::vector<CapturedBaseline> failed) {
-    // No waker, by design (see the header): a failing KV must not spin the drain worker.
+void GuardianSparkRuntime::erase_staged_baselines_if_unchanged(std::span<const CapturedBaseline> done) {
     std::lock_guard<std::mutex> lk{registry_mu_};
-    for (CapturedBaseline& cap : failed) {
-        try {
-            const auto it = staged_baselines_.find(cap.rule_id);
-            if (it != staged_baselines_.end()) {
-                // Same path: the restaged capture is the OLDER one, so it replaces the newer
-                // re-capture. Different path: a later retarget is present and wins.
-                if (it->second.path == cap.path)
-                    it->second = std::move(cap);
-                continue;
-            }
-            if (staged_baselines_.size() >= kMaxStagedBaselines) {
-                staged_baseline_drops_.fetch_add(1, std::memory_order_relaxed);
-                continue;
-            }
-            std::string key = cap.rule_id;
-            staged_baselines_.emplace(std::move(key), std::move(cap));
-        } catch (...) {
-            staged_baseline_drops_.fetch_add(1, std::memory_order_relaxed);
-        }
+    for (const CapturedBaseline& d : done) {
+        const auto it = staged_baselines_.find(d.rule_id);
+        if (it != staged_baselines_.end() && it->second.path == d.path && it->second.hash == d.hash)
+            staged_baselines_.erase(it);
     }
+}
+
+void GuardianSparkRuntime::stage_baseline_for_test(const std::string& rule_id,
+                                                   const std::string& path,
+                                                   const std::string& hash) {
+    std::lock_guard<std::mutex> lk{registry_mu_};
+    stage_baseline_locked(rule_id, path, hash);
 }
 
 std::size_t GuardianSparkRuntime::staged_baseline_count_for_test() const {
