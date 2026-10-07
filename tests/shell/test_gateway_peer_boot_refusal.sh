@@ -77,6 +77,21 @@
 # rpc=batch_heartbeat spki=<first 16 hex>), and no other session.gateway_peer_denied row exists
 # (the certificate-less and anonymous callers write none). Bounded poll of about 10 s.
 #
+# Operator-certificate deployment (row V, the second supported shape): the operator supplies their
+# OWN certificates (--cert/--key/--ca-cert, all from one operator CA made here) plus
+# --gateway-peer-pin-file <the gateway leaf PEM>. Three operator client leaves exist: GW (serverAuth
+# and clientAuth; its PEM is the pin file), OTHER (serverAuth and clientAuth, a different key, NOT
+# pinned) and CLIENTONLY (clientAuth only, not pinned). The boot line must say enforcing with the pin
+# prefix equal to the SPKI hash openssl computes for GW, and no automatic pin is added. Calls on the
+# dedicated gateway-upstream listener (curl --cert/--key/--cacert, the operator CA):
+#   V  presenting GW: grpc-status other than 16 (the real handler answers)
+#   V  presenting OTHER: grpc-status 16, grpc-message "gateway peer not authorized", counted as
+#      reason not_pinned
+#   V  presenting CLIENTONLY: grpc-status 16, counted as reason no_server_auth_eku
+#      (the expected reason of each unpinned leaf is derived from its own extended key usage, as
+#      for row G, so a failed EKU probe is a FAIL)
+#   V  the denied counter is exactly 1 per reason and the admitted GW call added none.
+#
 # Pins are read once at boot: there is no reload and no pin gauge, so no row looks for one.
 #
 # "Before any listener is bound" is asserted by the absence of the log lines the server prints
@@ -210,6 +225,24 @@ chmod 600 "$TMP/boot.cfg"
   printf 'extendedKeyUsage=clientAuth\n' > ext_client.cnf
   openssl x509 -req -in clientonly.csr -CA opca.pem -CAkey opca.key -CAcreateserial -days 2 \
     -extfile ext_client.cnf -out clientonly.pem >/dev/null 2>&1 )
+# Row V: an operator PKI of its own (CA, server leaf, GW, OTHER, CLIENTONLY). Config files via
+# -extfile (portable: no -addext, which LibreSSL lacks).
+( cd "$TMP"
+  openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 2 \
+    -subj "/CN=GwPeerOperatorCA" -keyout opvca.key -out opvca.pem >/dev/null 2>&1
+  printf 'subjectAltName=DNS:localhost,IP:127.0.0.1\nextendedKeyUsage=serverAuth\n' > ext_opv_srv.cnf
+  printf 'extendedKeyUsage=serverAuth,clientAuth\n' > ext_opv_both.cnf
+  printf 'extendedKeyUsage=clientAuth\n' > ext_opv_client.cnf
+  for spec in opvsrv:ext_opv_srv.cnf opvgw:ext_opv_both.cnf opvother:ext_opv_both.cnf \
+              opvconly:ext_opv_client.cnf; do
+    leaf="${spec%%:*}"; ext="${spec#*:}"
+    openssl req -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -subj "/CN=$leaf" \
+      -keyout "$leaf.key" -out "$leaf.csr" >/dev/null 2>&1
+    openssl x509 -req -in "$leaf.csr" -CA opvca.pem -CAkey opvca.key -CAcreateserial -days 2 \
+      -extfile "$ext" -out "$leaf.pem" >/dev/null 2>&1
+    chmod 600 "$leaf.key"
+  done
+  chmod 600 opvca.key )
 # A CERTIFICATE block whose PEM header says the body is passphrase-encrypted (the same shape the
 # unit test uses): OpenSSL asks for a passphrase when it reads one; the body is never decrypted.
 { printf -- '-----BEGIN CERTIFICATE-----\n'
@@ -303,7 +336,7 @@ start_row() {
 }
 
 HEX="$(printf 'a%.0s' $(seq 1 64))"
-alloc_ports 18   # phase 1: rows A B C D E F I G H J K L M N O Q U P
+alloc_ports 19   # phase 1: rows A B C D E F I G H J K L M N O Q U P V
 start_row A "X=1" -- --no-tls
 start_row B "X=1" -- --no-tls --insecure-gateway-peer --gateway-peer-pin "$HEX"
 start_row C "X=1" -- --cert "$TMP/opsrv.pem" --key "$TMP/opsrv.key" --ca-cert "$TMP/opca.pem"
@@ -325,6 +358,9 @@ start_row O "X=1" -- --no-tls --insecure-gateway-peer --gateway-peer-pin ' '
 start_row Q "YUZU_GATEWAY_PEER_PINS=,," --
 start_row U "X=1" -- --gateway-peer-pin-file "$TMP/clientonly.pem"
 start_row P "X=1" -- --gateway-peer-pin-file "$TMP/opsrv.pem"
+# Row V: operator certificates plus the gateway leaf as the pin file (own CA-signed server leaf).
+start_row V "X=1" -- --cert "$TMP/opvsrv.pem" --key "$TMP/opvsrv.key" --ca-cert "$TMP/opvca.pem" \
+  --gateway-peer-pin-file "$TMP/opvgw.pem"
 
 pass=0 fail=0
 ok()   { echo "ok   - $1"; pass=$((pass+1)); }
@@ -377,19 +413,35 @@ cert_call() {
     2>"$TMP/G.$tag.anon.err" || rc=$?
   echo "$rc" > "$TMP/G.$tag.rc"
 }
+# op_call TAG PORT CERT KEY : the BatchHeartbeat call on row V's listener at PORT presenting an
+# OPERATOR client certificate and verifying the server against the operator CA. Headers land in
+# $TMP/V.TAG.anon (readable by grpc_status_of "V.TAG"), curl's stderr in V.TAG.anon.err.
+op_call() {
+  curl --http2 --cacert "$TMP/opvca.pem" --cert "$3" --key "$4" -sS \
+    -D "$TMP/V.$1.anon" -o /dev/null --max-time 15 \
+    -H 'content-type: application/grpc' -H 'te: trailers' --data-binary @"$TMP/empty.frame" \
+    "https://127.0.0.1:$2/yuzu.gateway.v1.GatewayUpstream/BatchHeartbeat" \
+    2>"$TMP/V.$1.anon.err" || true
+}
 grpc_status_of() { # NAME : the grpc-status the anonymous call received (empty when none)
   grep -i '^grpc-status:' "$TMP/$1.anon" 2>/dev/null | tail -1 | tr -d '\r' | awk '{print $2}' || true
 }
 grpc_message_of() { # NAME : the grpc-message the anonymous call received (empty when none)
   grep -i '^grpc-message:' "$TMP/$1.anon" 2>/dev/null | tail -1 | tr -d '\r' | sed 's/^[^:]*: *//' || true
 }
-for c in G H J K L M P; do
+for c in G H J K L M P V; do
   if wait_marker "$c" "Gateway upstream listening"; then
     if [ "$ANON_OK" = "1" ]; then
       case "$c" in
         G|J) anon_call "$c" https "$(cat "$TMP/$c.agent")" ;;
         H)   anon_call "$c" http  "$(cat "$TMP/$c.agent")" ;;
       esac
+      if [ "$c" = "V" ]; then
+        vport="$(cat "$TMP/V.gwup")"
+        op_call opgw "$vport" "$TMP/opvgw.pem" "$TMP/opvgw.key"
+        op_call opother "$vport" "$TMP/opvother.pem" "$TMP/opvother.key"
+        op_call opconly "$vport" "$TMP/opvconly.pem" "$TMP/opvconly.key"
+      fi
       if [ "$c" = "G" ]; then
         # The default gateway leaf is the pinned one; the default server leaf is a valid
         # certificate of the same CA that is NOT pinned.
@@ -543,6 +595,20 @@ else
   bad "row G: the auto-pin boot line does not list the default gateway certificate's SPKI prefix '${PIN_G:0:16}'"
   grep -F "gateway peer authorization" "$TMP/G.log" >&2 || true
 fi
+# Row V: operator certificates + the gateway leaf as the pin file.
+PIN_V="$(spki_hex "$TMP/opvgw.pem")"
+control_row V "operator certs plus the gateway leaf as pin file: boots, enforces 1 pin from 1 pin file" \
+  "enforcing 1 pin(s) from 0 --gateway-peer-pin value(s) and 1 pin file(s)" "Gateway upstream listening"
+if [ "${#PIN_V}" -eq 64 ] && grep -qF "pin prefixes (first 16 hex): ${PIN_V:0:16}" "$TMP/V.log"; then
+  ok "row V: the boot line lists the pin prefix equal to the operator gateway leaf's SPKI hash (${PIN_V:0:16})"
+else
+  bad "row V: the boot line does not list 'pin prefixes (first 16 hex): ${PIN_V:0:16}'"; grep -F "gateway peer authorization" "$TMP/V.log" >&2 || true
+fi
+if grep -qF "pinned automatically" "$TMP/V.log"; then
+  bad "row V: operator certificates must never select the automatic pin"
+else
+  ok "row V: no automatic pin was added on operator certificates"
+fi
 # The disabled-authorization alarm is logged exactly once per boot.
 for c in H J M; do
   n="$(grep -cF "PEER AUTHORIZATION IS DISABLED" "$TMP/$c.log" 2>/dev/null || true)"
@@ -586,6 +652,10 @@ metric_row J "acknowledged mode on a TLS server with a client CA publishes insec
 metric_row K "an explicit pin on default certs publishes enforce" \
   'yuzu_server_gateway_peer_authz_mode{mode="enforce"} 1' \
   'yuzu_server_gateway_peer_authz_mode{mode="insecure_ack"} 0'
+metric_row V "operator certificates plus a pin file publish enforce" \
+  'yuzu_server_gateway_peer_authz_mode{mode="enforce"} 1' \
+  'yuzu_server_gateway_peer_authz_mode{mode="insecure_ack"} 0' \
+  'yuzu_server_gateway_peer_authz_mode{mode="insecure_ack_tls"} 0'
 metric_row L "a false environment acknowledgement publishes enforce" \
   'yuzu_server_gateway_peer_authz_mode{mode="enforce"} 1' \
   'yuzu_server_gateway_peer_authz_mode{mode="insecure_ack"} 0' \
@@ -639,6 +709,39 @@ anon_row G.gwup.dgw "enforce, gateway-upstream listener: the pinned default gate
 anon_row G.gwup.dsrv "enforce, gateway-upstream listener: a valid but unpinned certificate is refused" 16
 anon_row G.mgmt.dgw "enforce, management listener: the pinned default gateway certificate is admitted" not16
 anon_row G.mgmt.dsrv "enforce, management listener: a valid but unpinned certificate is refused" 16
+anon_row V.opgw "operator certs, gateway-upstream listener: the pinned operator gateway leaf is admitted (the real handler answers)" not16
+anon_row V.opother "operator certs, gateway-upstream listener: a valid but unpinned operator leaf is refused" 16
+anon_row V.opconly "operator certs, gateway-upstream listener: a clientAuth-only operator leaf is refused" 16
+if [ "$ANON_OK" = "1" ]; then
+  # The expected reason of each unpinned leaf comes from its own EKU (as for row G); the counts
+  # per reason are then exact, and the admitted GW call added no denial of any reason.
+  want_np=0 want_eku=0 vok=1
+  for leaf in opvother opvconly; do
+    eku_text="$(openssl x509 -in "$TMP/$leaf.pem" -noout -text 2>/dev/null || true)"
+    if [ -z "$eku_text" ]; then
+      bad "row V: openssl could not read $leaf.pem to probe its extended key usage"; vok=0
+    elif printf '%s\n' "$eku_text" | grep -q 'TLS Web Server Authentication'; then
+      want_np=$((want_np + 1))
+    else
+      want_eku=$((want_eku + 1))
+    fi
+  done
+  if [ "$vok" = "1" ]; then
+    for rsn in not_pinned no_server_auth_eku; do
+      n="$(grep 'yuzu_server_gateway_peer_denied_total' "$TMP/V.metrics" 2>/dev/null | grep 'rpc="batch_heartbeat"' \
+        | grep "reason=\"$rsn\"" | awk '{print $NF}' | head -1 || true)"
+      case "$n" in ''|*[!0-9]*) n="missing" ;; esac
+      if [ "$rsn" = "not_pinned" ]; then want="$want_np"; else want="$want_eku"; fi
+      if [ "$n" = "$want" ]; then
+        ok "row V: denied_total{rpc=\"batch_heartbeat\",reason=\"$rsn\"} is exactly $want (the admitted operator gateway leaf added none)"
+      else
+        bad "row V: denied_total{rpc=\"batch_heartbeat\",reason=\"$rsn\"} is '$n', want exactly $want"
+      fi
+    done
+    n_other="$(denied_series V | grep -v -e 'reason="not_pinned"' -e 'reason="no_server_auth_eku"' || true)"
+    if [ -z "$n_other" ]; then ok "row V: no denial of any other reason was counted"; else bad "row V: unexpected denial series: $n_other"; fi
+  fi
+fi
 handshake_row() { # TAG DESCRIPTION : no client certificate to a strict-mTLS listener fails at the handshake
   local tag="$1" desc="$2" rc st
   if [ "$ANON_OK" != "1" ]; then echo "skip - $desc (curl without HTTP/2)"; return; fi
