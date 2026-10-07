@@ -383,8 +383,10 @@ plus one new prerequisite.**
   on this action (tier refusal, permission-gate refusal, service-scoped default-deny) are separate
   and can occur regardless of RBAC state. The same neutralise-and-cap (128 bytes) now applies to
   the id in the `get_execution_status` `denied` rows and the `get_agent_details` `denied` and
-  `failure` rows. A NUL byte in a `summarize_working_set` `kind=execution` id is rejected with an
-  invalid-params error before any lookup.
+  `failure` rows. A NUL byte in a `summarize_working_set` `kind=execution` id or a
+  `get_execution_status` id is rejected with an invalid-params error before any lookup. The
+  degraded-store errors of `get_execution_status` (agent-status read) and `list_executions` now
+  carry `retry_after_ms`, like `summarize_working_set`.
   The `denied` row cannot tell a typo from an out-of-scope probe; that is intentional (no
   existence oracle). The narrative for an absent id is a success-shaped result, unlike
   `get_execution_status`, which returns an error for the same input.

@@ -11544,7 +11544,7 @@ TEST_CASE("MCP get_execution_status: a status-read degrade is an error with a re
 // An id with an embedded NUL reaches the store as a C string truncated at the NUL, so it
 // would resolve the real execution while the audit rows record the full id. It must be
 // rejected as invalid params before any store read, with no audit row of any result.
-TEST_CASE("MCP get_execution_status: an id with an embedded NUL byte is rejected, not "
+TEST_CASE("MCP get_execution_status: an id with an embedded NUL byte is rejected and not "
           "resolved to the truncated real id (#3526)",
           "[pg][mcp][integration][execution][security][4753]") {
     yuzu::test::ExecutionTrackerPg tracker_bundle;

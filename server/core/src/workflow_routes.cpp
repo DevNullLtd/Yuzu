@@ -356,7 +356,9 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                                                     : e.definition_id.substr(0, 12);
                     title = e.definition_id;
                 }
-                memo = def_labels.emplace(e.definition_id, std::pair{std::move(label), std::move(title)})
+                memo = def_labels
+                           .emplace(e.definition_id,
+                                    std::pair{std::move(label), std::move(title)})
                            .first;
             }
             const std::string& def_label = memo->second.first;
