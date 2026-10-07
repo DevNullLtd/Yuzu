@@ -6,6 +6,9 @@
 # baked into the image, not on the application:
 #
 #   Dockerfile.server         bash + /dev/tcp + grep   (apt-installed bash)
+#                             and, for the reference compose's one-shot
+#                             `ca-export` service (not a healthcheck, the same
+#                             kind of image-borne dependency): /bin/sh + install
 #   Dockerfile.gateway        wget --spider            (alpine busybox, on PATH)
 #   Dockerfile.server.chisel  /bin/busybox wget --spider
 #   Dockerfile.gateway.chisel /bin/busybox wget --spider
@@ -119,7 +122,8 @@ usage() {
 usage: $0 <role>=<image> [<role>=<image> ...]
 
 roles:
-  server           requires: bash, /dev/tcp, grep
+  server           requires: bash, /dev/tcp, grep, and /bin/sh with `install`
+                   (the reference compose's `ca-export` service runs this image)
   gateway          requires: wget (busybox applet) supporting --spider
   server-chisel    requires: /bin/busybox with a wget applet supporting --spider
   gateway-chisel   requires: /bin/busybox with a wget applet supporting --spider
@@ -310,6 +314,26 @@ main() {
                     || rc=$?
                 [ "$rc" -eq 0 ] || diagnose "$rc" "$role" "bash" \
                     "its /dev/tcp support (or grep) no longer works."
+                # deploy/docker/docker-compose.reference-gateway.yml's one-shot
+                # `ca-export` service runs THIS image with `/bin/sh -ec` and calls
+                # `install`. It is not a healthcheck, but a base-image change that
+                # drops either one breaks the rig the same silent way (the agent's
+                # `depends_on: ca-export` never completes). The probe checks that
+                # /bin/sh runs and finds `install`; it runs as the image's default
+                # user, whereas ca-export runs as root (0:2000), so it proves
+                # presence and executability, not that user's write access. 127
+                # from the inner test is reported as the tool missing by diagnose.
+                if [ "$rc" -eq 0 ]; then
+                    probe /bin/sh "$image" -c 'command -v install >/dev/null 2>&1 || exit 127' \
+                        || rc=$?
+                    if [ "$rc" -ne 0 ]; then
+                        echo "  NOTE [$role]: this probe is for the reference compose's one-shot ca-export" >&2
+                        echo "        service (/bin/sh -ec + install), not a healthcheck; read 'healthcheck'" >&2
+                        echo "        in the lines below as 'ca-export'." >&2
+                        diagnose "$rc" "$role" "install" \
+                            "the shell ran but could not complete the check."
+                    fi
+                fi
                 ;;
             gateway)
                 # The real healthcheck: `wget --spider -q <url>` off PATH.

@@ -450,6 +450,15 @@ build time and nothing at boot — it breaks only the healthcheck, so Compose pa
 every container `unhealthy` forever and anything with `depends_on: condition:
 service_healthy` never starts, with no application failure to point at.
 
+The `server` role also probes one non-healthcheck dependency of the same image:
+the reference compose's one-shot `ca-export` service
+(`deploy/docker/docker-compose.reference-gateway.yml`) runs the server image with
+`/bin/sh -ec` and calls `install`, so the probe checks that `/bin/sh` runs and
+`install` is on its path, and a base-image change that drops either fails the
+gate instead of leaving the agent's `depends_on: ca-export` waiting forever. It
+runs as the image's default user while `ca-export` runs as root, so it proves
+presence and executability, not that user's write access.
+
 `yuzu-postgres` is published and healthchecked too (`pg_isready` + `psql`), but it
 is `FROM postgres:*` — those tools are the image's whole purpose — so it has no
 role in the gate and `docker-publish-postgres` has no pre-push check. `agent-chisel`

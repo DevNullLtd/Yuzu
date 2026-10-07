@@ -54,6 +54,13 @@
 ;                          /GATEWAY with /NOTLS passes --insecure-gateway-peer
 ;                          (gateway peer authorization disabled; dev only) and
 ;                          no pin file, because the server refuses both together.
+;                          Giving /GATEWAY_PEER_PIN or /GATEWAY_PEER_PIN_FILE
+;                          together with /GATEWAY /NOTLS is REFUSED (exit code 7,
+;                          nothing changed): plaintext has nothing to pin.
+;                          The interactive wizard has no page for a pin. Both pin
+;                          parameters are command-line only, in the wizard and in
+;                          a silent install alike; a PEM certificate file given
+;                          with /GATEWAY_PEER_PIN_FILE= is accepted.
 ;   /OIDC_ISSUER=url       OIDC issuer URL
 ;   /OIDC_CLIENT_ID=id     OIDC client ID
 ;   /OIDC_CLIENT_SECRET=s  OIDC client secret
@@ -88,6 +95,11 @@
 ; THE SETUP LOG RECORDS THE FULL COMMAND LINE, including any /ADMIN_PASS=,
 ; /OPERATOR_PASS=, /POSTGRES_DSN= or /OIDC_CLIENT_SECRET= value. Prefer the
 ; *_FILE parameters, and protect or delete the log.
+;
+; KNOWN ISSUE (#1835, "Windows server binary has the identical SCM control-protocol
+; defect as #1822 (agent)"): this installer registers yuzu-server.exe as the
+; YuzuServer service, and starting that service under the Windows service
+; manager was not tested for this installer because of that issue.
 ;
 ; Secrets are kept in "%ProgramData%\Yuzu Server", locked to Administrators
 ; and SYSTEM; the service's command line (readable by local users) carries
@@ -1562,7 +1574,9 @@ end;
 // operator certificates would otherwise install a service that does not boot.
 // Refused here, before anything changes. A /GATEWAY_PEER_PIN value must be 64
 // hex characters and a pin file passes only the cheap checks above; the server
-// does the full validation when it starts.
+// does the full validation when it starts. A pin parameter given together with
+// /GATEWAY and /NOTLS is refused as well: the service would be started with
+// --insecure-gateway-peer and no pin file, so the pin could never be used.
 function CheckGatewayPeer(const Inp: TInstallInputs): string;
 var
   CertDir: string;
@@ -1587,6 +1601,14 @@ begin
     Result := PinFileProblem(Inp.GatewayPeerPinFile);
     if Result <> '' then Exit;
   end;
+  if GatewayRequested and GrpcTlsSkipped and
+     ((Inp.GatewayPeerPin <> '') or (Inp.GatewayPeerPinFile <> '')) then
+  begin
+    Result := 'Gateway mode with /NOTLS (gRPC TLS skipped) runs without gateway peer authorization, ' +
+              'so a gateway peer pin has nothing to check, and the server refuses to start with both. ' +
+              'Leave out /GATEWAY_PEER_PIN= and /GATEWAY_PEER_PIN_FILE=, or leave out /NOTLS.';
+    Exit;
+  end;
   if (not GatewayRequested) or GrpcTlsSkipped then Exit;
   CertDir := CertDirPath(DataDirPath);
   // What GetServiceArgs will pass: --cert/--key from grpc-cert.pem and grpc-key.pem, --ca-cert from ca-cert.pem.
@@ -1598,9 +1620,11 @@ begin
     Result := 'Gateway mode is selected with operator-supplied gRPC certificates (a gRPC certificate ' +
               'or CA certificate is given, or is kept from an earlier install), and no gateway peer ' +
               'pin is stored. The server refuses to start the gateway-upstream service in that ' +
-              'configuration. Give the pin with /GATEWAY_PEER_PIN_FILE=<file> or ' +
-              '/GATEWAY_PEER_PIN=<64 hex characters> (the SHA-256 of the gateway certificate''s ' +
-              'public key); it is kept in the data directory and used on every later install. ' +
+              'configuration. The pin cannot be entered in the wizard: supply it on the setup command line ' +
+              'with /GATEWAY_PEER_PIN_FILE=<file> (a PEM certificate file of the gateway works, or a ' +
+              'file of 64-hex-character pins) or /GATEWAY_PEER_PIN=<64 hex characters> (the SHA-256 of ' +
+              'the gateway certificate''s public key); it is kept in the data directory and used on ' +
+              'every later install. ' +
               'If no gateway is used, leave /GATEWAY out. For a development rig, /NOTLS together ' +
               'with /GATEWAY disables gateway peer authorization.';
 end;
