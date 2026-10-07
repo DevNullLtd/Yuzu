@@ -7134,6 +7134,21 @@ TEST_CASE("#4045 E25: the pass wall budget stops a run of SLOW but successful wr
     CHECK_FALSE(third.budget_exhausted);
     CHECK(rt->staged_baseline_count_for_test() == 0);
     CHECK(persister->backoff_deferrals_for_test() == 0);
+
+    // A budget-exhausted pass that follows a FAILED one clears the backoff the failure set: it
+    // made progress with no failure, exactly like a pass that drained everything.
+    persister->set_post_write_hook_for_test(nullptr);
+    stage_n_4045(*rt, 6, "e25b", 'b');
+    fail_baseline_writes_4045(f.db_.path);
+    CHECK(persister->persist_staged(*rt, Trig::Forced).failed == 3);
+    CHECK(persister->backoff_for_test() == 5000ms);
+    heal_baseline_writes_4045(f.db_.path);
+    persister->set_budgets_for_test({2, 3, 1h}, {2, 1, 1h});
+    clock.advance(5000); // the backoff has elapsed: a Worker pass is due
+    const auto recovered = persister->persist_staged(*rt, Trig::Worker);
+    CHECK(recovered.written == 2);
+    CHECK(recovered.budget_exhausted);
+    CHECK(persister->backoff_for_test() == 0ms); // RED if an exhausted pass left the backoff set
 }
 
 TEST_CASE("#4045 E26: the tuple budget caps a pass, and the wall budget is wall-time not "
