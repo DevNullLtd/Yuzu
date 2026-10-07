@@ -2620,12 +2620,23 @@ Guardian ladder must check these.
   touches a `KvStore`, so it only STAGES the capture edge (rule_id, path, hash;
   first capture wins, bounded) and the engine-owned `GuardianBaselinePersister`
   writes it through `guardian_persist_baseline`'s overwrite guard. Invariants:
-  (1) the persister is called from exactly three places: `apply_rules` BEFORE
-  any teardown or re-arm (so the new generation's seed read observes the prior
-  capture, in one `mtx_` section), `stop()` after the worker join, and the
-  outbox drain worker's loop; and NEVER from a drain that runs only on a live
-  connection (`journal_maintenance_tick`), or a boot re-arm that captures before
-  the network is up loses its capture on a crash; (2) a failed write is a
+  (1) the persister drains from exactly three places: `apply_rules` BEFORE any
+  teardown or re-arm (so the common case is already durable when the seed is
+  read), `stop()` after the worker join, and the outbox drain worker's loop; and
+  NEVER from a drain that runs only on a live connection
+  (`journal_maintenance_tick`), or a boot re-arm that captures before the network
+  is up loses its capture on a crash. The drain does NOT by itself order an
+  in-flight evaluation of the OLD generation against the replacement's seed (an
+  evaluation can stage its first capture after any drain), so persist-before-seed
+  rests on two further pieces: `reconcile_rule_locked` holds the persister's
+  `persist_mu_` (`hold_seed_fence()`) from a baseline-on-arm rule's seed read to
+  the end of the attach, so no worker batch can be taken-but-unwritten across the
+  read; and `GuardianSparkRuntime::attach_core` reads the staged capture under
+  the SAME `registry_mu_` hold that detaches the prior generation (an old
+  evaluation stages only under `registry_mu_` after rechecking its generation, so
+  it either staged before that hold, and is seen, or is dropped after it) and
+  seeds the replacement from it when the path matches. Do not replace those with
+  a bare earlier drain; (2) a failed write is a
   deliberate fail-open (the rule keeps its in-memory baseline), restaged and
   retried, counted, error-logged and exported on the sparse heartbeat tag
   `yuzu.guardian_baseline_persist_failures`, never silent; (3) the crash

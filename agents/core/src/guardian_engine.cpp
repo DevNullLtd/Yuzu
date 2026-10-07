@@ -1515,12 +1515,15 @@ GuardianEngine::apply_rules(const gpb::GuaranteedStatePush& push) {
         }
     };
 
-    // #4045: persist Spark's staged baseline captures BEFORE any teardown or re-arm. Every push
-    // (full_sync teardown, same-id replace, the #5459 valve re-applies) re-arms through
-    // reconcile_rule_locked, whose seed read must observe the previous generation's capture;
-    // draining here, under the same mtx_ critical section as that read, makes the ordering
-    // deterministic. Waits for an in-flight worker batch (persister's persist_mu_).
+    // #4045: persist Spark's staged baseline captures BEFORE any teardown or re-arm, so the
+    // common case is already durable when reconcile_rule_locked's seed read runs. Waits for an
+    // in-flight worker batch (persister's persist_mu_). This drain alone does NOT order an
+    // in-flight old-generation evaluation against the replacement's seed: such an evaluation
+    // can stage after it. That is closed by reconcile_rule_locked's seed fence plus
+    // GuardianSparkRuntime::attach_core's read of the staged capture under registry_mu_.
     persist_staged_baselines_locked();
+    if (apply_post_drain_hook_for_test_)
+        apply_post_drain_hook_for_test_();
     std::size_t applied = 0;
     std::size_t reconcile_failures = 0;
     // rung 9c PR-2 Unit 6 (R5.3): rules ACCEPTED this push whose arm has not yet
@@ -2559,13 +2562,26 @@ GuardianEngine::reconcile_rule_locked(const gpb::GuaranteedStateRule& rule) {
     // content fresh. This does NOT cover Spark's OWN first-ever capture (see
     // guardian_seed_baseline's doc for the documented scope of this fix) — only
     // seeds a value that ALREADY exists in the durable store.
+    //
+    // #4045 persist-before-seed fence: under Spark, a first-ever capture the previous generation
+    // staged is not in the KV yet when this read runs. The persister's fence is held from here
+    // to the end of this function, so (1) no worker batch can be taken-but-unwritten across
+    // the read (a taken capture is durable by the time the fence is granted, or restaged), and
+    // (2) attach_rule's attach_core, which reads the runtime's staged capture under registry_mu_
+    // in the same hold as the prior generation's detach, then sees any capture an in-flight old
+    // evaluation staged after the engine's drain. Lock order mtx_ -> persist_mu_ -> registry_mu_.
+    std::unique_lock<std::mutex> baseline_fence;
     if (assertion->kind == AssertionKind::FileHashEquals && assertion->expected_hash.empty()) {
+        if (prefer_spark_ && baseline_persister_)
+            baseline_fence = baseline_persister_->hold_seed_fence();
         std::string path;
         if (auto it = rule.assertion().params().find("path"); it != rule.assertion().params().end())
             path = it->second;
         const auto fingerprint = guardian_baseline_fingerprint("file-hash-equals", path);
         if (auto seeded = guardian_seed_baseline(*kv_, rule.rule_id(), fingerprint))
             assertion->expected_hash = *seeded;
+        if (seed_read_hook_for_test_)
+            seed_read_hook_for_test_(rule.rule_id());
     }
 
     // spark_availability_ is set exactly once by wire_spark_engine() and never

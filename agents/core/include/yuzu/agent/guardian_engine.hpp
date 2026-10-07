@@ -670,6 +670,27 @@ public:
         rearm_fault_hook_for_test_ = std::move(hook);
     }
 
+    /// TEST-ONLY (#4045): fires inside apply_rules, with mtx_ HELD, immediately after the
+    /// staged-baseline drain and before any teardown or re-arm. It is the deterministic stand-in
+    /// for "an in-flight evaluation of the OLD generation stages its capture after the drain":
+    /// the body may call runtime methods (spark_runtime_for_test()->evaluate_key) but must not
+    /// re-enter the engine (same-thread std::mutex relock, a silent hang). Null = no-op.
+    /// No production caller.
+    void set_apply_post_drain_hook_for_test(std::function<void()> hook) {
+        std::lock_guard lock(mtx_);
+        apply_post_drain_hook_for_test_ = std::move(hook);
+    }
+
+    /// TEST-ONLY (#4045): fires inside reconcile_rule_locked, with mtx_ HELD and (under
+    /// prefer_spark) the baseline-persister's seed fence held, immediately after a
+    /// baseline-on-arm rule's seed read and before the attach. The deterministic stand-in for
+    /// "an evaluation stages after the seed read but before the attach detaches the old
+    /// generation". Same CONTRACT as set_apply_post_drain_hook_for_test. No production caller.
+    void set_seed_read_hook_for_test(std::function<void(const std::string& rule_id)> hook) {
+        std::lock_guard lock(mtx_);
+        seed_read_hook_for_test_ = std::move(hook);
+    }
+
     /// TEST-ONLY (#4783 Gate 8 re-review): arms legacy_sink_persist_race_hook_for_test_ -
     /// see that member's own doc comment for the exact firing point and its
     /// same-thread-relock CONTRACT. Set-then-use: arm this on the thread that
@@ -1112,6 +1133,10 @@ private:
     /// per-tuple persist failures are counted by the persister itself). baseline_persist_failures()
     /// sums it with the persister's and the drain worker's own counts.
     std::atomic<std::uint64_t> baseline_maint_exceptions_{0};
+    /// TEST-ONLY (#4045): see set_apply_post_drain_hook_for_test / set_seed_read_hook_for_test.
+    /// mtx_-guarded; null = no-op.
+    std::function<void()> apply_post_drain_hook_for_test_;
+    std::function<void(const std::string&)> seed_read_hook_for_test_;
     /// TEST-ONLY drain-worker timing overrides (see set_drain_worker_timing_for_test);
     /// 0 / zero-duration means "keep the production default".
     std::uint64_t test_periodic_bound_ms_{0};

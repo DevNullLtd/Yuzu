@@ -1172,9 +1172,11 @@ flip, with a red-first test each:
     adopted, the next identical push is a forced Reapply of the just-armed rule: one wasted
     teardown, never an acknowledgment.
   - (AC-10) **#4045 baseline relaunder, narrow.** Persisted baselines are re-seeded on
-    every arm (`guardian_engine.cpp`, the arm-time re-seed), and `apply_rules` first writes
+    every arm (`guardian_engine.cpp`, the arm-time re-seed), `apply_rules` first writes
     any staged, not-yet-persisted Spark capture before it tears down or re-arms anything,
-    so only a Spark-first-captured `FileHashEquals` baseline whose persist is itself
+    and a capture an in-flight evaluation stages after that write is seeded from the
+    runtime's staging at attach (`attach_core`, under the same `registry_mu_` hold as the
+    prior generation's detach), so only a Spark-first-captured `FileHashEquals` baseline whose persist is itself
     failing (a failing local KV store; counted in `yuzu.guardian_baseline_persist_failures`)
     is exposed to a recapture by a forced Reapply.
   - (AC-11) **An operator delta push (`full_sync=false`) during a hold** changes the push

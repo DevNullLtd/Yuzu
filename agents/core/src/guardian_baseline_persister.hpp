@@ -17,16 +17,22 @@
  * The runtime is passed per call and never retained.
  *
  * LOCKING: `persist_mu_` is a LEAF. It is held across take -> persist loop -> restage so an
- * engine drain WAITS for an in-flight worker batch (an apply_rules re-arm can never seed while
- * a batch is mid-write). Order: engine mtx_ -> persist_mu_ -> registry_mu_ (take/restage) and
- * persist_mu_ -> KvStore::mu_; the worker takes persist_mu_ -> registry_mu_ and never mtx_.
- * persist_mu_ is never taken under any runtime lock.
+ * engine drain WAITS for an in-flight worker batch. The engine ALSO holds it (hold_seed_fence())
+ * across a baseline-on-arm rule's whole seed step (the KV seed read through attach_rule), so
+ * the worker cannot have a capture taken-but-not-yet-written while the seed is read: at the
+ * seed read every capture is either durable in the KV or still staged for attach_core's
+ * under-registry_mu_ read (see GuardianSparkRuntime::attach_core). Order: engine mtx_ ->
+ * persist_mu_ -> registry_mu_ (take/restage/attach) and persist_mu_ -> KvStore::mu_; the worker
+ * takes persist_mu_ -> registry_mu_ and never mtx_. persist_mu_ is never taken under any
+ * runtime lock.
  *
- * CALLERS (exactly three, and NEVER only from a connection-gated thread, or a pre-network
- * boot re-arm would lose its capture on a crash): GuardianEngine::apply_rules under mtx_
- * BEFORE any teardown or re-arm (the seed read of the new generation must observe the prior
- * generation's capture), GuardianEngine::stop() after the worker join, and the drain worker's
- * loop. Not journal_maintenance_tick: it runs only on a live connection.
+ * CALLERS of persist_staged (exactly three, and NEVER only from a connection-gated thread, or
+ * a pre-network boot re-arm would lose its capture on a crash): GuardianEngine::apply_rules
+ * under mtx_ before any teardown or re-arm (so the common case is already durable when the
+ * seed is read), GuardianEngine::stop() after the worker join, and the drain worker's loop.
+ * Not journal_maintenance_tick: it runs only on a live connection. The drain is NOT what
+ * orders an in-flight evaluation's capture against a replacement's seed (one can stage after
+ * any drain); the fence above and attach_core's staged read do.
  *
  * FAILURE POSTURE: a failed write (kv->set false or a throw) is DELIBERATE fail-OPEN, the rule
  * keeps running on its in-memory baseline, but never silent: the tuple is restaged for the
@@ -68,6 +74,21 @@ public:
     /// Cumulative count of failed persist attempts (a tuple retried N times counts N).
     [[nodiscard]] std::uint64_t persist_failures() const noexcept {
         return persist_failures_.load(std::memory_order_relaxed);
+    }
+
+    /// The persist-before-seed fence: hold persist_mu_ for the lifetime of the returned lock.
+    /// Blocks until any in-flight persist_staged batch has finished, and keeps the next one out.
+    /// Caller: GuardianEngine::reconcile_rule_locked (mtx_ held), around a baseline-on-arm
+    /// rule's seed read and attach. Must never be taken under a runtime lock.
+    [[nodiscard]] std::unique_lock<std::mutex> hold_seed_fence() {
+        return std::unique_lock<std::mutex>{persist_mu_};
+    }
+
+    /// TEST-ONLY: true iff persist_mu_ is currently held. Probes with try_lock, so it must be
+    /// called from a thread that does NOT itself hold the fence. No production caller.
+    [[nodiscard]] bool seed_fence_held_for_test() {
+        std::unique_lock<std::mutex> lk{persist_mu_, std::try_to_lock};
+        return !lk.owns_lock();
     }
 
 private:

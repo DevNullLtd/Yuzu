@@ -3045,6 +3045,24 @@ GuardianSparkRuntime::attach_core(const std::string& key, std::string rule_id, S
         // arm is still claimed is withdrawn in place (Case 0, generalised).
         prior_disarm = detach_rule_locked(rule_id);
 
+        // #4045: the persist-before-seed fence. A baseline-on-arm file-hash rule (no authored
+        // expected_hash, none seeded from the durable record by the engine) inherits a capture
+        // the PRIOR generation staged. This runs under the same registry_mu_ hold as the
+        // detach just above, and evaluate_key stages only under registry_mu_ after rechecking
+        // that its generation is still the active one, so an old evaluation either staged
+        // before this block (seen here) or is dropped by that recheck after it: no capture can
+        // be staged-but-unseen. The entry stays staged (the persister writes it). Path
+        // mismatch means a retarget, whose capture is fresh by design. Pure map read, no I/O.
+        if (rg->assertion.kind == AssertionKind::FileHashEquals &&
+            rg->assertion.expected_hash.empty() &&
+            std::holds_alternative<FileSparkParams>(spec.params)) {
+            if (const auto sit = staged_baselines_.find(rule_id);
+                sit != staged_baselines_.end() &&
+                sit->second.path == std::get<FileSparkParams>(spec.params).path)
+                rg->assertion.expected_hash = sit->second.hash; // may throw bad_alloc: unwinds
+                                                                // through the armed rollbacks
+        }
+
         gen = ++gen_counter_;
         rg->generation = gen;
 

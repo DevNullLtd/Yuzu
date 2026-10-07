@@ -6321,3 +6321,126 @@ TEST_CASE("#4045 E10: a failing baseline persist surfaces on the heartbeat tag",
     CHECK(std::stoull(tags.at("yuzu.guardian_baseline_persist_failures")) >= 1);
     recreate_kv_store_table_for_test(f.db_.path); // let the stop() flush succeed quietly
 }
+
+// ── #4045 adversarial-review fixes ───────────────────────────────────────────────────────
+// C4045-1: persist-before-seed must hold even when an in-flight evaluation of the OLD
+// generation stages its first-ever capture AFTER apply_rules' drain. The two engine seams fire
+// at the exact windows (post-drain; post-seed-read) so the interleaving is deterministic: the
+// hook body runs the old generation's evaluation inline (it is still live), and the file then
+// changes A -> B. Without the fence the replacement finds no record, captures B as compliant
+// and never reports drift; with it the replacement is seeded from the staged A.
+//
+// The drain worker is stopped first so it cannot persist A on its own wake (that would make the
+// KV seed find A and the test pass without the fence).
+namespace {
+
+enum class HookPoint4045 { PostDrain, PostSeedRead };
+
+void run_old_gen_stages_late_4045(bool full_sync, HookPoint4045 where) {
+    Spark4045Target t;
+    SparkReconcileFixture f{3'600'000, std::nullopt, SparkType::File};
+    const fs::path target = t.file(); // ABSENT at the first apply: no capture yet
+    const auto rule = make_file_hash_rule("r1", target.string());
+    f.apply(rule);
+    f.engine->drain_worker_for_test()->stop();
+
+    auto* rt = f.engine->spark_runtime_for_test();
+    auto* persister = f.engine->baseline_persister_for_test();
+    REQUIRE(rt != nullptr);
+    REQUIRE(persister != nullptr);
+    Spark4045Target::write(target, "content A");
+    const std::string h_a = hash_of_4045(target);
+    std::string h_b;
+
+    auto old_generation_stages_then_file_drifts = [&] {
+        eval_initial_4045(*f.engine, target); // the still-live OLD generation reads A and stages it
+        CHECK(rt->staged_baseline_count_for_test() == 1);
+        Spark4045Target::write(target, "content B, longer");
+        h_b = hash_of_4045(target);
+    };
+    if (where == HookPoint4045::PostDrain)
+        f.engine->set_apply_post_drain_hook_for_test(old_generation_stages_then_file_drifts);
+    else
+        f.engine->set_seed_read_hook_for_test(
+            [&](const std::string&) { old_generation_stages_then_file_drifts(); });
+
+    f.apply(rule, full_sync);
+    f.engine->set_apply_post_drain_hook_for_test(nullptr);
+    f.engine->set_seed_read_hook_for_test(nullptr);
+    REQUIRE_FALSE(h_b.empty()); // the hook ran
+    REQUIRE(h_b != h_a);
+    eval_initial_4045(*f.engine, target);
+
+    // The replacement generation must be seeded with A, so B is DRIFT against A.
+    std::vector<OutboxEntry> drained;
+    const bool drifted = yuzu::test::spin_until([&] {
+        rt->drain([&](const OutboxEntry& e) {
+            drained.push_back(e);
+            return SendResult::Sent;
+        });
+        for (const auto& e : drained)
+            if (e.domain == yuzu::agent::OutboxDomain::Compliance && !e.drift.compliant &&
+                e.drift.expected_value == h_a && e.drift.detected_value == h_b)
+                return true;
+        return false;
+    });
+    CHECK(drifted); // RED without the fence: the replacement captured B as compliant
+    for (const auto& e : drained) // and never a compliant edge on B
+        CHECK_FALSE((e.domain == yuzu::agent::OutboxDomain::Compliance && e.drift.compliant &&
+                     e.drift.expected_value == h_b));
+
+    // The durable record is the first capture, A.
+    (void)persister->persist_staged(*rt);
+    const auto rec = baseline_record_4045(*f.kv, "r1");
+    REQUIRE(rec.has_value());
+    CHECK(rec->value("hash", std::string{}) == h_a);
+}
+
+} // namespace
+
+TEST_CASE("#4045 E11: a capture the old generation stages after the apply drain still seeds a "
+          "full_sync re-arm",
+          "[spark][guardian][baseline][reconcile]") {
+    run_old_gen_stages_late_4045(/*full_sync=*/true, HookPoint4045::PostDrain);
+}
+
+TEST_CASE("#4045 E12: a capture the old generation stages after the apply drain still seeds a "
+          "same-id replace",
+          "[spark][guardian][baseline][reconcile]") {
+    run_old_gen_stages_late_4045(/*full_sync=*/false, HookPoint4045::PostDrain);
+}
+
+TEST_CASE("#4045 E13: a capture staged between the seed read and the attach still seeds the "
+          "replacement (the old generation is live until attach_core detaches it)",
+          "[spark][guardian][baseline][reconcile]") {
+    run_old_gen_stages_late_4045(/*full_sync=*/false, HookPoint4045::PostSeedRead);
+}
+
+TEST_CASE("#4045 E14: the persister's seed fence is held across a baseline-on-arm seed read",
+          "[spark][guardian][baseline][reconcile]") {
+    // Pins the worker-mid-batch half of persist-before-seed: a batch the drain worker has TAKEN
+    // but not yet written is invisible to both the KV read and the staged read, so the seed
+    // must not run while one can be in flight. persist_mu_ is the worker's batch lock; the
+    // engine holds it from the seed read to the end of reconcile. Probed from another thread
+    // (try_lock on the owning thread would be undefined) at the post-seed-read hook.
+    Spark4045Target t;
+    SparkReconcileFixture f{3'600'000, std::nullopt, SparkType::File};
+    const fs::path target = t.file();
+    auto* persister = f.engine->baseline_persister_for_test();
+    REQUIRE(persister != nullptr);
+    std::atomic<int> fires{0};
+    std::atomic<bool> held_in_hook{false};
+    f.engine->set_seed_read_hook_for_test([&](const std::string&) {
+        fires.fetch_add(1);
+        std::thread probe([&] { held_in_hook.store(persister->seed_fence_held_for_test()); });
+        probe.join();
+    });
+    f.apply(make_file_hash_rule("r1", target.string()));
+    f.engine->set_seed_read_hook_for_test(nullptr);
+    REQUIRE(fires.load() >= 1);
+    CHECK(held_in_hook.load()); // RED without the fence: persist_mu_ is free at the seed read
+    bool held_after = true;
+    std::thread probe([&] { held_after = persister->seed_fence_held_for_test(); });
+    probe.join();
+    CHECK_FALSE(held_after); // released when reconcile returns (no worker batch is running)
+}

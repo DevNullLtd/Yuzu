@@ -60,7 +60,10 @@
  * take_staged_baselines()/restage_baselines() (#4045) take registry_mu_ STANDALONE: their
  * callers (the engine's GuardianBaselinePersister, under its own leaf persist_mu_) hold no
  * runtime lock, and they never touch outbox_mu_. evaluate_key's capture-edge staging runs
- * inside the commit section it already holds registry_mu_ for.
+ * inside the commit section it already holds registry_mu_ for. attach_core reads
+ * staged_baselines_ under the registry_mu_ hold it already has for the prior generation's
+ * detach (persist-before-seed fence: an old evaluation either staged before that hold or is
+ * rejected by evaluate_key's generation recheck after it).
  *
  * Rung 3 builds this against FAKE seams (IStateReader, ISparkBackend). The real
  * platform readers are rung 5; the convergence scheduler that also drives
@@ -2528,7 +2531,10 @@ private:
     std::function<std::string()> agent_id_fn_;    ///< registry_mu_-guarded; wired by GuardianEngine::wire_spark_engine (#2237)
     /// #4045: baseline-on-arm captures awaiting the engine-owned persister, keyed by rule_id
     /// (registry_mu_-guarded; at most kMaxStagedBaselines entries). Staged by evaluate_key's
-    /// commit section, drained by take_staged_baselines(). See stage_baseline_locked().
+    /// commit section, drained by take_staged_baselines(), and READ (not drained) by
+    /// attach_core under the same registry_mu_ hold as the prior generation's detach, to seed a
+    /// replacement baseline-on-arm generation from a capture not yet durable. See
+    /// stage_baseline_locked().
     std::map<std::string, CapturedBaseline> staged_baselines_;
     std::atomic<std::uint64_t> staged_baseline_drops_{0}; ///< cap / allocation-failure drops
     /// registry_mu_ held. First capture wins on one path; a different path (a retarget)

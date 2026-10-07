@@ -1183,7 +1183,9 @@ design is mentioned it is named as the earlier design.
   (`can_advance()` ignores content) and the server stops re-pushing, so the stale content
   stays until the next generation. #4045: a forced Reapply re-arms the whole
   push, but persisted baselines are re-seeded on every arm
-  (`guardian_engine.cpp`) and `apply_rules` first persists any staged capture, so only a
+  (`guardian_engine.cpp`), `apply_rules` first persists any staged capture, and a capture an
+  in-flight evaluation stages after that drain is seeded from the runtime's staging at attach
+  (`attach_core`, under the same `registry_mu_` hold as the detach), so only a
   Spark-first-captured `FileHashEquals` baseline whose persist is failing is exposed
   to a baseline recapture.
 
