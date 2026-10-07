@@ -44,7 +44,7 @@ A definition can exist standalone (without a set or pack). Sets group definition
 
 - **Substrate, not scripts.** Definitions target stable plugin primitives. OS-specific syscalls stay inside the plugin layer. Content authors never write shell commands.
 - **Everything is an InstructionDefinition.** Ad-hoc commands, scheduled tasks, policy checks, and remediation actions all use the same definition-to-execution-to-response pipeline.
-- **Typed end-to-end.** Parameter schemas validate input before dispatch. Result schemas type output for downstream consumption (ClickHouse, Splunk, CSV export).
+- **Typed end-to-end.** Parameter schemas validate input before dispatch on `POST /api/instructions/{id}/execute` (no other dispatch surface validates yet). Result schemas type output for downstream consumption (ClickHouse, Splunk, CSV export).
 - **Governed execution.** Every state-changing action can require approval. Every execution is audited. Every response is persisted.
 
 ### Two Definition Types
@@ -424,8 +424,8 @@ that route does not read `enabled`.
 No route replaces a stored schema in place: `PUT /api/instructions/{id}`, the YAML editor and
 response-template changes keep it, and `POST /api/instructions/import` answers `409` for an id that
 already exists. To replace one (a wrong or legacy schema, a `500` from execute, or a corrected bundled
-definition on an existing install), delete the definition and import it again with a corrected
-`parameter_schema`:
+definition on an existing install), export the definition, delete it and import it again with a
+corrected `parameter_schema`:
 
 1. `GET /api/instructions/{id}/export` (`InstructionDefinition:Read`) and keep the document. It carries
    the fields import reads, including `yaml_source`, `instruction_set_id` and
@@ -434,7 +434,9 @@ definition on an existing install), delete the definition and import it again wi
 2. Edit its `parameter_schema` (a string holding the schema JSON). Unless the server runs with
    `--allow-unsigned-definitions`, the edited document must also be signed before import, or the import
    answers `400` as unsigned: add a hex `signature` and `publicKey` (an Ed25519 signature over the exact
-   bytes of `yaml_source`, 128 and 64 hex characters).
+   bytes of `yaml_source`, 128 and 64 hex characters). A definition whose `yaml_source` is empty cannot be
+   signed (import answers an error about a signature without `yaml_source`), so only the unsigned flag
+   works for it.
 3. Rehearse the import, because step 5 cannot be rehearsed (an existing id answers `409`) and a refused
    import leaves the definition deleted: `POST /api/instructions/import` the corrected, signed document
    once with a different `id` (import reads `id` from the document and accepts any id that is free), confirm
@@ -453,10 +455,12 @@ publisher authentication. See [REST API](rest-api.md).
   (both run as a non-seed insert), so the replacement lands and later boots leave it alone. The tombstone is
   permanent: a replaced bundled definition never receives later bundled corrections from the reseed.
 - The delete removes only the definition row. A schedule that references the id has its occurrences skipped
-  and audited as `definition_unknown` until the id exists again. Policy check, fix and verify dispatches
-  that name it log `unknown check/fix instruction` and send nothing, `POST /api/workflows/{id}/execute` for
+  and audited as `definition_unknown` until the id exists again. A policy does not name the instruction; its
+  fragment does (`check_instruction`, `fix_instruction` and `post_check_instruction`, which falls back to
+  `check_instruction`). Check, fix and verify dispatches that name a missing id log `unknown check/fix instruction`
+  and send nothing, a remediation then reports `fix dispatch failed (unknown instruction or no agents)`, `POST /api/workflows/{id}/execute` for
   a workflow with a step that names it answers `400` (`references unknown instruction`), and a pending
-  approval keeps its `definition_id` (no foreign key was found). Check policies, stored workflows and
+  approval keeps its `definition_id` (no foreign key was found). Check policy fragments, stored workflows and
   pending approvals for the id before deleting. Other references were not checked.
 - Between steps 4 and 5 the definition does not exist, and a refused import leaves it deleted. Have the corrected (and, unless the unsigned flag is set, signed) document ready and rehearsed before step 4, and do both in one maintenance window.
 

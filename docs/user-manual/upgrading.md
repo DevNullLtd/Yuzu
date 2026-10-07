@@ -52,8 +52,7 @@ schema. Details: [REST API](rest-api.md), [Instructions](instructions.md#paramet
   parameter names their plugin never read.
 - **Values outside an enum or a bound.** `enum` is case-sensitive (`"True"` and `"1"` are refused for a
   `true`/`false` enum), and a value above a declared `maximum` (or below a `minimum`) is `400` where a plugin
-  may have clamped it (for example `device.agent_logging.get_log` `lines` above 500, or
-  `agent.content_dist.cleanup` `hours` above the new maximum of 876000).
+  may have clamped it (for example `device.agent_logging.get_log` `lines` above 500).
 - **`""` and `null` for optional parameters.** They are values, not omissions: they are refused for an optional
   integer, `enum` or `pattern` parameter. Omit the key instead.
 
@@ -67,7 +66,7 @@ other dispatch surface (workflow steps, schedules, policy remediation, result-se
 **A stored schema is not refreshed by an upgrade.** The bundled reseed inserts a definition only when its id
 is absent (`ON CONFLICT (id) DO NOTHING`), so the six corrections above reach fresh installs only; an existing
 install keeps the old stored schema and keeps refusing the same calls until it is replaced (export the
-definition, delete it and import it again; see [Replacing a stored parameter schema](instructions.md#replacing-a-stored-parameter-schema)). Comparing the
+definition, delete it and import it again, signed unless the server allows unsigned definitions; see [Replacing a stored parameter schema](instructions.md#replacing-a-stored-parameter-schema)). Comparing the
 parameter declarations at `v0.14.0` with this release, exactly 6 definitions differ in what the server
 enforces (the six above), and 13 more differ only in `description` text and enforce what they did
 (`agent.content_dist.upload_file`, `device.agent_logging.get_log`, `device.event_logs.errors`,

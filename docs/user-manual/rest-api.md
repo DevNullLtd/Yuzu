@@ -9554,7 +9554,8 @@ send are never modified and no `default` is injected.
   value. No approval ticket, execution row or dispatch is created.
 - **`500`**: the definition's stored schema cannot be prepared, so the call fails closed:
   `error.message` is `stored parameter schema for this instruction is invalid` and `error.remediation`
-  says to export the definition, delete it and import it again with a corrected `parameter_schema` (see
+  says to export the definition, delete it and import it again with a corrected `parameter_schema`
+  (signed, unless the server allows unsigned definitions; see
   [Replacing a stored parameter schema](instructions.md#replacing-a-stored-parameter-schema)). Nothing is
   dispatched. The audit row is `instruction.execute` with `result=failure` and detail
   `reason=param_schema_invalid`.
