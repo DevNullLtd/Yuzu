@@ -922,8 +922,9 @@ private:
     /// prefer_spark_=false. FIREWALLED (noexcept): reached from stop(), which the
     /// destructor calls; a throw is counted by the persister (note_firewalled_exception).
     /// Called ONLY from apply_rules (before any teardown/re-arm, so the new generation's seed read observes
-    /// the prior capture) and stop() (after the worker join); the third persister caller is
-    /// the drain worker. NOT from journal_maintenance_tick: it runs only on a live
+    /// the prior capture; `at_stop` false, Trigger::Forced) and stop() (after the worker join;
+    /// `at_stop` true, Trigger::Stop: tighter budget, skipped after a slow failed pass); the third
+    /// persister caller is the drain worker (Trigger::Worker). NOT from journal_maintenance_tick: it runs only on a live
     /// connection and could not cover a pre-network boot re-arm.
     void persist_staged_baselines_locked(bool at_stop) noexcept;
 

@@ -1188,7 +1188,9 @@ design is mentioned it is named as the earlier design.
   (`attach_core`, under the same `registry_mu_` hold as the detach, with the persister's
   seed fence ordering a worker write against the engine's KV seed read), so only a
   Spark-first-captured `FileHashEquals` baseline that was lost or never written is exposed
-  to a baseline recapture (the enumerated cases are the flip gate's AC-10).
+  to a baseline recapture, and a rule whose arm-time seed read failed while a valid record
+  existed is judged against re-captured content until its next re-arm (the "refused
+  window"; the record is kept). The enumerated cases are the flip gate's AC-10.
 
 **Known accepted residual (governance Gate 4/8, rung 9c PR-5d /governance run,
 independently traced and REFUTED as permanent):** a withdraw immediately

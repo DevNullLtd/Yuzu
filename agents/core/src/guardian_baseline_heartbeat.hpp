@@ -3,9 +3,11 @@
 /// @file guardian_baseline_heartbeat.hpp
 /// Writer side of the Spark baseline-persistence failure signal (#4045): the cumulative count
 /// of the channels by which a Spark baseline-on-arm capture failed to reach the #4021 KV
-/// record (GuardianEngine::baseline_persist_failures()): failed persist passes, firewalled
-/// throws, captures dropped from staging (allocation failure, a retarget over a still-
-/// unpersisted capture) and a capture staged with no store.
+/// record (GuardianEngine::baseline_persist_failures()): failed persist passes (one per pass,
+/// however many of its writes failed), firewalled throws, captures that did not reach staging
+/// or were displaced from it (an allocation failure, after which the rule captures again at
+/// its next evaluation; a retarget over a still-unpersisted capture) and a capture staged
+/// with no store.
 ///
 /// SCOPE, stated plainly: this tag covers the SPARK path only. A legacy FileGuard persist
 /// failure is logged and not counted, so an ABSENT tag is not evidence that baselines
