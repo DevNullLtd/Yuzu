@@ -536,13 +536,17 @@ the CI record's **Installed software** lens — the *authoritative* reads — sh
 explicit **"unavailable"** banner rather than an empty table, because an empty table
 would read as "installed nowhere", the fail-open the authoritative-read contract
 (ADR-0016 §7) forbids. The **Hardware list** itself (hostname/OS/status/last-seen/IP/
-DEX/version) is sourced from the deliberately *fail-soft* endpoint-state store, with the
+DEX/version) is sourced from the endpoint-state store (a failed read is typed, never an empty roster; see below), with the
 CI and Tags columns layered on top from a best-effort `DeviceInventoryStore`/tag-store
 read — a *whole-store* degrade there is now its own explicit "CI columns unavailable" /
 "Tags unavailable" banner (an improvement on the old Devices tab, where a
 `DeviceInventoryStore` degrade during the list render was indistinguishable from "not
-yet synced"); the roster read itself being wholly unavailable shows a dedicated "roster
-unavailable" banner rather than an empty table. The **per-device CI record's Overview
+yet synced"); a FAILED roster read (not only an unwired provider) shows a dedicated
+"roster unavailable" banner rather than an empty table, makes `GET /api/v1/hardware`
+answer `503` with `retry_after_ms`, and audits `result=failure`. The CI record
+distinguishes "not found" (`404`) from "roster unreadable" (`503`, nothing else
+readable) from a record served with a degraded identity (note / `identity_state:
+degraded`). The **per-device CI record's Overview
 lens**, by contrast, has always been an authoritative three-state read: found /
 genuinely-not-yet-synced ("no CI record synced yet") / degraded (an explicit "CI record
 unavailable" banner) are never conflated.

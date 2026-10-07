@@ -1118,7 +1118,7 @@ struct McpTestServer {
     /// viz_kill_switch_for_test defaults to false (feature enabled) so an
     /// opted-in viz test isn't silently 503'd.
     yuzu::server::FleetTopologyStore* fleet_topology_store_for_test{nullptr};
-    yuzu::server::OfflineEndpointStore* offline_endpoint_store_for_test{nullptr};
+    yuzu::server::OfflineRosterFn offline_roster_fn_for_test{};
     std::atomic<bool> viz_kill_switch_for_test{false};
 
     /// ar-S1: optionally wire a GuaranteedStateStore so the DEX read tools
@@ -1631,7 +1631,7 @@ private:
         // #2146 Batch B3: the viz store trio ALSO rides a setter, same
         // pattern as the ones above — wire before the handlers are built.
         if (fleet_topology_store_for_test)
-            mcp.set_viz_deps(fleet_topology_store_for_test, offline_endpoint_store_for_test,
+            mcp.set_viz_deps(fleet_topology_store_for_test, offline_roster_fn_for_test,
                              &viz_kill_switch_for_test);
 
         // 2f: build GET/DELETE handlers FIRST — they copy auth_fn/audit_fn, which
@@ -27069,6 +27069,38 @@ TEST_CASE("MCP get_fleet_topology: reads LIVE FleetTopologyStore snapshot, shari
     REQUIRE(payload["machines"].is_array());
     CHECK(payload["machines"].size() == 2);
 
+    REQUIRE(ts.audit_log.size() == 1);
+    CHECK(ts.audit_log[0] == "viz.fleet_topology|success");
+}
+
+// #5531. Kills: dropping the typed-failure branch (no flag) or hard-failing the tool call.
+TEST_CASE("MCP get_fleet_topology: a failed offline-roster read answers live-only with "
+          "offline_roster_degraded:true",
+          "[mcp][integration][viz]") {
+    std::vector<RawAgentSnapshot> seed{b3_mk_agent("agent-viz-1", "host-viz-1"),
+                                       b3_mk_agent("agent-viz-2", "host-viz-2")};
+    FleetTopologyStore store{b3_fixed_fetcher(std::move(seed)), /*nvd=*/nullptr,
+                             /*ttl=*/std::chrono::seconds(60),
+                             /*fetch_deadline=*/std::chrono::milliseconds(50),
+                             /*max_snapshot_bytes=*/0};
+
+    McpTestServer ts;
+    ts.fleet_topology_store_for_test = &store;
+    ts.offline_roster_fn_for_test = [](std::chrono::seconds) {
+        return std::expected<std::vector<yuzu::server::OfflineEndpoint>,
+                             yuzu::server::PresenceReadError>(
+            std::unexpected(yuzu::server::PresenceReadError::StoreUnavailable));
+    };
+    ts.start();
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":10,"params":{"name":"get_fleet_topology",)"
+        R"("arguments":{}}})");
+    REQUIRE(res);
+    auto payload = operator_surface_payload(res);
+    REQUIRE(payload["machines"].is_array());
+    CHECK(payload["machines"].size() == 2);
+    CHECK(payload["offline_roster_degraded"] == true);
     REQUIRE(ts.audit_log.size() == 1);
     CHECK(ts.audit_log[0] == "viz.fleet_topology|success");
 }

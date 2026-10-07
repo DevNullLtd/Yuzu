@@ -21209,15 +21209,21 @@ McpServer::HandlerFn McpServer::build_handler(
                         metrics->counter("yuzu_viz_cache_miss_total").increment();
                 }
 
-                if (offline_endpoint_store_) {
-                    auto persisted = offline_endpoint_store_->query_stale_within(
+                // #5531: a failed durable read answers live-only + a flag.
+                bool viz_offline_degraded = false;
+                if (offline_roster_fn_) {
+                    auto persisted = offline_roster_fn_(
                         std::chrono::seconds(yuzu::server::VizRoutes::kOfflineStaleWindowSecs));
-                    const auto viz_before = snap->machines.size();
-                    snap = yuzu::server::merge_offline_topology(std::move(snap), persisted);
-                    const auto viz_merged_count = snap->machines.size() - viz_before;
-                    if (viz_merged_count > 0 && metrics)
-                        metrics->counter("yuzu_viz_offline_hosts_total")
-                            .increment(static_cast<double>(viz_merged_count));
+                    if (persisted) {
+                        const auto viz_before = snap->machines.size();
+                        snap = yuzu::server::merge_offline_topology(std::move(snap), *persisted);
+                        const auto viz_merged_count = snap->machines.size() - viz_before;
+                        if (viz_merged_count > 0 && metrics)
+                            metrics->counter("yuzu_viz_offline_hosts_total")
+                                .increment(static_cast<double>(viz_merged_count));
+                    } else {
+                        viz_offline_degraded = true;
+                    }
                 }
 
                 if (static_cast<int>(snap->machines.size()) > machines_max) {
@@ -21239,9 +21245,12 @@ McpServer::HandlerFn McpServer::build_handler(
                 const bool audit_ok = yuzu::server::detail::try_persist_audit(
                     audit_fn, req, "viz.fleet_topology", "success", "FleetTopology", "",
                     "machines=" + std::to_string(snap->machines.size()) +
-                        " include_vuln=" + (include_vuln ? "1" : "0") + " via MCP");
+                        " include_vuln=" + (include_vuln ? "1" : "0") +
+                        (viz_offline_degraded ? " offline_roster_degraded=1" : "") + " via MCP");
                 if (!audit_ok)
                     j["audit_persisted"] = false;
+                if (viz_offline_degraded)
+                    j["offline_roster_degraded"] = true;
                 if (metrics) {
                     const auto viz_elapsed = std::chrono::steady_clock::now() - viz_t_start;
                     metrics->histogram("yuzu_viz_topology_request_seconds")

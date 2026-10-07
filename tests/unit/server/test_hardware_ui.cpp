@@ -416,3 +416,56 @@ TEST_CASE("hardware lens body (overview): General block renders agent identity f
     CHECK(html.find("Agent version: </span>0.14.2") != std::string::npos);
     CHECK(html.find("Architecture: </span>x86_64") != std::string::npos);
 }
+
+// ── #5531: failed roster read is never an empty fleet / "not found" ───────────
+
+// Kills: removing the roster_unavailable branch (banner falls through to an empty table).
+TEST_CASE("hardware list: roster_unavailable renders the banner and no KPI strip/table",
+          "[hardware][ui]") {
+    const auto html = render_hardware_list_fragment(HardwareListPage{}, false, true, false);
+    CHECK(html.find("Hardware roster unavailable") != std::string::npos);
+    CHECK(html.find("<table") == std::string::npos);
+    CHECK(html.find("<div class=\"hw-kpis\">") == std::string::npos);
+}
+
+// Kills: leaving the results_only early return above the roster_unavailable check.
+TEST_CASE("hardware list: roster_unavailable + results_only keeps the #hw-results target and data-url",
+          "[hardware][ui]") {
+    HardwareListPage page;
+    page.query.q = "abc";
+    const auto html = render_hardware_list_fragment(page, false, true, /*results_only=*/true);
+    CHECK(html.rfind("<div id=\"hw-results\" data-url=\"", 0) == 0);
+    CHECK(attr_value(html, "data-url").find("q=abc") != std::string::npos);
+    CHECK(html.find("Hardware roster unavailable") != std::string::npos);
+}
+
+// Kills: collapsing the CI fragment's not-found arms without the identity_degraded split.
+TEST_CASE("hardware CI fragment: identity_degraded + no record -> roster unreadable; "
+          "+ record -> record with identity note; not degraded -> not found",
+          "[hardware][ui]") {
+    HwCiAffordances aff;
+    HardwareCiDetail d;
+    d.ci = std::expected<std::optional<DeviceCiRecord>, CiReadError>(std::optional<DeviceCiRecord>{});
+
+    SECTION("degraded, no record") {
+        d.identity_degraded = true;
+        const auto html = render_hardware_ci_fragment("agent-x", d, "", 0, aff);
+        CHECK(html.find("roster unreadable") != std::string::npos);
+        CHECK(html.find("Device not found") == std::string::npos);
+    }
+    SECTION("degraded, readable record") {
+        d.identity_degraded = true;
+        DeviceCiRecord rec;
+        rec.model = "CI-MODEL-5531";
+        d.ci = std::expected<std::optional<DeviceCiRecord>, CiReadError>(
+            std::optional<DeviceCiRecord>(rec));
+        const auto html = render_hardware_ci_fragment("agent-x", d, "", 0, aff);
+        CHECK(html.find("Device identity unavailable") != std::string::npos);
+        CHECK(html.find("CI-MODEL-5531") != std::string::npos);
+        CHECK(html.find("style=\"margin:0\">agent-x") != std::string::npos);
+    }
+    SECTION("not degraded, no record") {
+        const auto html = render_hardware_ci_fragment("agent-x", d, "", 0, aff);
+        CHECK(html.find("Device not found") != std::string::npos);
+    }
+}

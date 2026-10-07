@@ -62,6 +62,7 @@ struct HwHarness {
     std::vector<InventoryDeviceRow> roster_rows;
     bool roster_ci_degraded = false;
     bool roster_tags_degraded = false;
+    bool roster_degraded = false; // #5531: the durable roster read failed
 
     HardwareCiDetail ci_detail; // configurable per test; default = degraded (the struct's own default)
 
@@ -116,6 +117,7 @@ struct HwHarness {
             out.rows = roster_rows;
             out.ci_degraded = roster_ci_degraded;
             out.tags_degraded = roster_tags_degraded;
+            out.roster_degraded = roster_degraded;
             return out;
         };
         HardwareRoutes::CiDetailFn ci_fn = [this](const std::string&) { return ci_detail; };
@@ -553,4 +555,169 @@ TEST_CASE("route: POST .../sync — audit-store degrade fails CLOSED, no dispatc
     // The whole point of auditing BEFORE dispatch: a degraded audit store must
     // never let the side effect through.
     REQUIRE(h.sync_dispatch_calls == 0);
+}
+
+// ───────────────────────── #5531: failed roster read is never an empty fleet ───
+
+namespace {
+DeviceCiRecord make_ci_rec() {
+    DeviceCiRecord rec;
+    rec.model = "CI-MODEL-5531";
+    rec.serial = "CI-SERIAL-5531";
+    rec.last_seen = 5000;
+    return rec;
+}
+HardwareCiDetail degraded_identity_detail(bool with_ci) {
+    HardwareCiDetail d;
+    d.identity = std::nullopt;
+    d.identity_degraded = true;
+    d.ci = with_ci ? std::expected<std::optional<DeviceCiRecord>, CiReadError>(
+                         std::optional<DeviceCiRecord>(make_ci_rec()))
+                   : std::expected<std::optional<DeviceCiRecord>, CiReadError>(
+                         std::optional<DeviceCiRecord>{});
+    d.software = std::nullopt;
+    d.tags = std::nullopt;
+    return d;
+}
+} // namespace
+
+// Kills: dropping the roster_degraded guard in the list fragment (empty table, no failure audit).
+TEST_CASE("route: list fragment — roster read failure renders the roster-unavailable banner, "
+          "never an empty table, and audits failure",
+          "[hardware][route]") {
+    HwHarness h;
+    h.roster_degraded = true;
+    auto res = h.sink.Get("/fragments/hardware/list?q=abc");
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    REQUIRE(contains(res->body, "Hardware roster unavailable"));
+    REQUIRE_FALSE(contains(res->body, "<table"));
+    REQUIRE(h.audits.back() == "inventory.devices|failure");
+    REQUIRE(contains(h.audit_details.back(), "roster read failed"));
+
+    auto ro = h.sink.Get("/fragments/hardware/list?results_only=1&q=abc");
+    REQUIRE(ro);
+    REQUIRE(ro->body.rfind("<div id=\"hw-results\" data-url=\"", 0) == 0);
+    REQUIRE(contains(ro->body, "q=abc"));
+    REQUIRE(contains(ro->body, "Hardware roster unavailable"));
+
+    // A bad request still precedes the degrade arm.
+    auto bad = h.sink.Get("/fragments/hardware/list?sort=bogus");
+    REQUIRE(bad);
+    REQUIRE(bad->status == 400);
+}
+
+// Kills: dropping the roster_degraded guard in the REST list (200 with an empty data page).
+TEST_CASE("route: GET /api/v1/hardware — roster read failure is 503 with retry_after_ms, no data",
+          "[hardware][route][rest]") {
+    {
+        HwHarness h;
+        h.roster_degraded = true;
+        auto res = h.sink.Get("/api/v1/hardware");
+        REQUIRE(res);
+        REQUIRE(res->status == 503);
+        auto body = nlohmann::json::parse(res->body, nullptr, false);
+        REQUIRE_FALSE(body.is_discarded());
+        REQUIRE(body["error"]["retry_after_ms"].get<int>() == 5000);
+        REQUIRE_FALSE(body.contains("data"));
+        REQUIRE(h.audits.back() == "inventory.devices|failure");
+    }
+    {
+        // Empty is not failed.
+        HwHarness h;
+        auto res = h.sink.Get("/api/v1/hardware");
+        REQUIRE(res);
+        REQUIRE(res->status == 200);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body["pagination"]["total"].get<int>() == 0);
+    }
+}
+
+// Kills: reverting the CI fragment's no_record arm to "Device not found".
+TEST_CASE("route: CI fragment — identity_degraded with no readable record says roster unreadable "
+          "and audits failure",
+          "[hardware][route]") {
+    HwHarness h;
+    h.ci_detail = degraded_identity_detail(false);
+    auto res = h.sink.Get("/fragments/hardware/ci?id=agent-x");
+    REQUIRE(res);
+    REQUIRE(contains(res->body, "roster unreadable"));
+    REQUIRE_FALSE(contains(res->body, "Device not found"));
+    REQUIRE(h.audits.back() == "inventory.device.ci|failure");
+    REQUIRE(contains(h.audit_details.back(), "state=roster unreadable"));
+}
+
+// Kills: widening the degrade arm to a blanket "roster unreadable" (hides a readable CI record),
+// and dropping the result=failure on a degraded identity.
+TEST_CASE("route: CI fragment — identity_degraded with a readable CI record still renders it, "
+          "with the identity note",
+          "[hardware][route]") {
+    HwHarness h;
+    h.ci_detail = degraded_identity_detail(true);
+    auto res = h.sink.Get("/fragments/hardware/ci?id=agent-x");
+    REQUIRE(res);
+    REQUIRE(contains(res->body, "Device identity unavailable"));
+    REQUIRE(contains(res->body, "CI-MODEL-5531"));
+    REQUIRE_FALSE(contains(res->body, "roster unreadable"));
+    REQUIRE_FALSE(contains(res->body, "Device not found"));
+    REQUIRE(h.audits.back() == "inventory.device.ci|failure");
+    REQUIRE(contains(h.audit_details.back(), "state=found identity=roster unreadable"));
+
+    auto sw = h.sink.Get("/fragments/hardware/ci?id=agent-x&lens=software&lens_only=1");
+    REQUIRE(sw);
+    REQUIRE(h.audits.back() == "inventory.device.software|failure");
+}
+
+// Kills: letting truly_absent fall through to the existence 404 when identity_degraded.
+TEST_CASE("route: GET /api/v1/hardware/{id} — identity_degraded with nothing else readable is 503, "
+          "never 404",
+          "[hardware][route][rest]") {
+    {
+        HwHarness h;
+        h.ci_detail = degraded_identity_detail(false);
+        auto res = h.sink.Get("/api/v1/hardware/agent-x");
+        REQUIRE(res);
+        REQUIRE(res->status == 503);
+        auto body = nlohmann::json::parse(res->body, nullptr, false);
+        REQUIRE_FALSE(body.is_discarded());
+        REQUIRE(body["error"]["retry_after_ms"].get<int>() == 5000);
+        REQUIRE(h.audits.back() == "inventory.device.ci|failure");
+    }
+    {
+        HwHarness h;
+        h.ci_detail = degraded_identity_detail(false);
+        h.ci_detail.identity_degraded = false;
+        auto res = h.sink.Get("/api/v1/hardware/agent-x");
+        REQUIRE(res);
+        REQUIRE(res->status == 404);
+    }
+}
+
+// Kills: dropping identity_state from hardware_ci_json / the failure audit on a served degraded record.
+TEST_CASE("route: GET /api/v1/hardware/{id} — identity_degraded with a readable CI record is 200 "
+          "with identity_state=degraded",
+          "[hardware][route][rest]") {
+    {
+        HwHarness h;
+        h.ci_detail = degraded_identity_detail(true);
+        auto res = h.sink.Get("/api/v1/hardware/agent-x");
+        REQUIRE(res);
+        REQUIRE(res->status == 200);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body["data"]["identity_state"].get<std::string>() == "degraded");
+        REQUIRE(body["data"]["ci_state"].get<std::string>() == "found");
+        REQUIRE(body["data"]["hostname"].is_null());
+        REQUIRE(h.audits.back() == "inventory.device.ci|failure");
+        REQUIRE(contains(h.audit_details.back(), "identity=roster unreadable"));
+    }
+    {
+        HwHarness h;
+        h.ci_detail.identity = make_row("agent-x", "HOST-X", "linux", true);
+        auto res = h.sink.Get("/api/v1/hardware/agent-x");
+        REQUIRE(res);
+        REQUIRE(res->status == 200);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body["data"]["identity_state"].get<std::string>() == "found");
+        REQUIRE(h.audits.back() == "inventory.device.ci|success");
+    }
 }

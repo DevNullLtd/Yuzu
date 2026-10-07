@@ -204,6 +204,17 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                           "direction, OS, or status filter.</div>");
             return;
         }
+        if (all.roster_degraded) {
+            // 200, not 5xx: htmx does not swap a failed response, so the banner
+            // would never render. Mirrors the unwired arm above.
+            (void)detail::try_persist_audit(deps_.audit_fn, req, "inventory.devices", "failure",
+                                            "Inventory", "fleet", "hardware roster read failed");
+            HardwareListPage degraded;
+            degraded.query = *normalised;
+            const bool ro = req.has_param("results_only") && req.get_param_value("results_only") == "1";
+            send_html(res, render_hardware_list_fragment(degraded, false, /*roster_unavailable=*/true, ro));
+            return;
+        }
         HardwareListPage page = build_hardware_list_page(std::move(scoped), *normalised);
         // DEX is scored ONLY on the page's rendered rows (device_routes.cpp's own
         // "score only rendered rows" rule) — a GROUP-BY per device is too costly to
@@ -267,9 +278,14 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         std::string verb = "inventory.device.ci";
         std::string state = !detail.ci.has_value() ? "store degraded"
                             : !detail.ci->has_value() ? "absent" : "found";
+        const bool no_record = !detail.identity && (!detail.ci.has_value() || !detail.ci->has_value());
+        if (detail.identity_degraded && no_record)
+            state = "roster unreadable";
+        else if (detail.identity_degraded)
+            state += " identity=roster unreadable";
         if (lens == "software") verb = "inventory.device.software";
         (void)detail::emit_behavioral_audit(
-            deps_.audit_fn, req, res, verb, "success", "Agent", id,
+            deps_.audit_fn, req, res, verb, detail.identity_degraded ? "failure" : "success", "Agent", id,
             "hardware CI lens=" + lens + " state=" + state +
                 (await_since ? " await=" + std::to_string(attempt) : ""));
 
@@ -469,6 +485,15 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                             "application/json");
             return;
         }
+        if (all.roster_degraded) {
+            (void)detail::try_persist_audit(deps_.audit_fn, req, "inventory.devices", "failure",
+                                            "Inventory", "fleet", "hardware roster read failed");
+            res.status = 503;
+            res.set_content(detail::a4_error(res, "hardware roster unavailable",
+                                             {.retry_after_ms = 5000}),
+                            "application/json");
+            return;
+        }
         HardwareListPage page = build_hardware_list_page(std::move(scoped), *normalised);
         if (deps_.dex_score_fn)
             for (auto& row : page.rows)
@@ -531,6 +556,17 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                                   (!detail.ci.has_value() ? false : !detail.ci->has_value()) &&
                                   (!detail.software || detail.software->empty()) &&
                                   (!detail.tags || detail.tags->empty());
+        if (truly_absent && detail.identity_degraded) {
+            // A failed roster read is never a 404 (#5531).
+            (void)detail::try_persist_audit(deps_.audit_fn, req, "inventory.device.ci", "failure",
+                                            "Agent", agent_id,
+                                            "hardware CI record (REST) state=roster unreadable");
+            res.status = 503;
+            res.set_content(detail::a4_error(res, "hardware roster unavailable",
+                                             {.retry_after_ms = 5000}),
+                            "application/json");
+            return;
+        }
         if (truly_absent) {
             res.status = 404;
             res.set_content(detail::a4_error(res, "not found"), "application/json");
@@ -539,8 +575,11 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
 
         std::string state = !detail.ci.has_value() ? "store degraded"
                             : !detail.ci->has_value() ? "absent" : "found";
+        if (detail.identity_degraded)
+            state += " identity=roster unreadable";
         const bool persisted = detail::emit_behavioral_audit(
-            deps_.audit_fn, req, res, "inventory.device.ci", "success", "Agent", agent_id,
+            deps_.audit_fn, req, res, "inventory.device.ci", detail.identity_degraded ? "failure" : "success",
+            "Agent", agent_id,
             "hardware CI record (REST) state=" + state);
         if (!persisted) {
             res.status = 503;

@@ -127,7 +127,10 @@ struct HardwareListPage {
 /// "absent" (ADR-0016 §7): a store failure must never render as "this device has no
 /// software" or "this device has no CI record".
 struct HardwareCiDetail {
-    std::optional<InventoryDeviceRow> identity; // nullopt = not in the last-30d roster
+    std::optional<InventoryDeviceRow> identity; // nullopt = not in the last-30d roster (or see identity_degraded)
+    /// The offline-roster identity fallback FAILED (#5531): identity is nullopt
+    /// but the device may exist.
+    bool identity_degraded{false};
     std::expected<std::optional<DeviceCiRecord>, CiReadError> ci{std::unexpected(CiReadError::kDegraded)};
     std::optional<std::vector<SoftwareEntry>> software; // nullopt = store degraded/unwired
     bool software_truncated{false};                     // capped at kHwSoftwareCap

@@ -55,7 +55,7 @@ const std::vector<pg::PgMigration>& migrations() {
         // teardown can't clobber a newer re-registration's row; `last_seen_at`
         // is a PG-authored (`now()` in-SQL) liveness clock, separate from the
         // pre-existing `last_heartbeat_ms` replica-clock column (which stays
-        // exactly as-is for the viz path — see query_stale_within).
+        // exactly as-is for the roster path — see query_stale_within).
         {3,
          "ALTER TABLE endpoints ADD COLUMN IF NOT EXISTS session_id TEXT NOT NULL DEFAULT '';"
          "ALTER TABLE endpoints ADD COLUMN IF NOT EXISTS last_seen_at TIMESTAMPTZ NOT NULL "
@@ -259,15 +259,17 @@ bool OfflineEndpointStore::remove_if_session(std::string_view agent_id,
     return PQntuples(res.get()) > 0;
 }
 
-std::vector<OfflineEndpoint> OfflineEndpointStore::query_stale_within(std::chrono::seconds window) {
+std::expected<std::vector<OfflineEndpoint>, PresenceReadError>
+OfflineEndpointStore::query_stale_within(std::chrono::seconds window) {
     std::vector<OfflineEndpoint> out;
     if (!open_)
-        return out;
+        return std::unexpected(PresenceReadError::StoreUnavailable);
     auto lease = pool_.try_acquire_for(kQueryAcquireTimeout);
     if (!lease) {
-        spdlog::debug("OfflineEndpointStore: query skipped, no connection in time ({})",
-                      pool_.last_error());
-        return out;
+        spdlog::warn("OfflineEndpointStore: query_stale_within failed, no connection in time ({})",
+                     pool_.last_error());
+        record_presence_store_failure(metrics_, "query_stale_within", /*had_lease=*/false);
+        return std::unexpected(PresenceReadError::StoreUnavailable);
     }
     const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                             std::chrono::system_clock::now().time_since_epoch())
@@ -287,8 +289,10 @@ std::vector<OfflineEndpoint> OfflineEndpointStore::query_stale_within(std::chron
         "LIMIT $2::bigint",
         std::vector<std::string>{std::to_string(since), std::to_string(kQueryRowCap)});
     if (res.status() != PGRES_TUPLES_OK) {
-        spdlog::debug("OfflineEndpointStore: query failed: {}", PQerrorMessage(lease.get()));
-        return out;
+        spdlog::warn("OfflineEndpointStore: query_stale_within failed: {}",
+                     PQerrorMessage(lease.get()));
+        record_presence_store_failure(metrics_, "query_stale_within", /*had_lease=*/true);
+        return std::unexpected(PresenceReadError::DbError);
     }
     const int rows = PQntuples(res.get());
     out.reserve(static_cast<std::size_t>(rows));

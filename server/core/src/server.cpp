@@ -17484,6 +17484,12 @@ private:
             // point of the device tab: readable when a device is offline). Aged-out hosts
             // beyond the window are withheld so the list doesn't accrete dead hosts forever.
             auto eps = offline_endpoint_store_->query_stale_within(std::chrono::hours(24 * 30));
+            if (!eps) {
+                result.roster_degraded = true; // #5531: unread, not empty — no enrichment
+                result.ci_degraded = true;
+                result.tags_degraded = true;
+                return result;
+            }
             // currently-connected agents (live registry). all_ids() copies only the ids
             // under the registry lock — NOT to_json_obj()'s full 5-field-per-agent JSON
             // serialisation under the heartbeat/dispatch hot-path mutex (gov perf-S2).
@@ -17493,7 +17499,7 @@ private:
             const std::int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                                             std::chrono::system_clock::now().time_since_epoch())
                                             .count();
-            for (const auto& e : eps) {
+            for (const auto& e : *eps) {
                 if (visible && !visible->count(e.agent_id))
                     continue; // out of the operator's management scope
                 InventoryDeviceRow r;
@@ -17612,7 +17618,7 @@ private:
         // (#1783-adjacent) — a per-open O(fleet) scan is acceptable for a CI record
         // page (opened far less often than the list re-renders).
         auto hw_identity_fn = [this, inv_human_age](const std::string& agent_id)
-            -> std::optional<InventoryDeviceRow> {
+            -> std::expected<std::optional<InventoryDeviceRow>, PresenceReadError> {
             if (auto sess = registry_.get_session(agent_id)) {
                 InventoryDeviceRow r;
                 r.agent_id = agent_id;
@@ -17630,12 +17636,14 @@ private:
                 return r;
             }
             if (!offline_endpoint_store_)
-                return std::nullopt;
+                return std::optional<InventoryDeviceRow>{};
             auto eps = offline_endpoint_store_->query_stale_within(std::chrono::hours(24 * 30));
+            if (!eps)
+                return std::unexpected(eps.error());
             const std::int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                                             std::chrono::system_clock::now().time_since_epoch())
                                             .count();
-            for (const auto& e : eps) {
+            for (const auto& e : *eps) {
                 if (e.agent_id != agent_id)
                     continue;
                 InventoryDeviceRow r;
@@ -17649,9 +17657,9 @@ private:
                 r.stale = age_ms > (2LL * 24 * 60 * 60 * 1000);
                 r.last_seen = inv_human_age(age_ms);
                 r.last_seen_ms = e.last_heartbeat_ms;
-                return r;
+                return std::optional<InventoryDeviceRow>{std::move(r)};
             }
-            return std::nullopt;
+            return std::optional<InventoryDeviceRow>{};
         };
         // The full per-device CI record composition — ONE closure shared verbatim
         // by the dashboard fragment and the REST twin, so the two can never drift
@@ -17660,7 +17668,10 @@ private:
         // one was already wired).
         auto hw_ci_detail_fn = [this, hw_identity_fn](const std::string& agent_id) -> HardwareCiDetail {
             HardwareCiDetail detail;
-            detail.identity = hw_identity_fn(agent_id);
+            if (auto ident = hw_identity_fn(agent_id))
+                detail.identity = std::move(*ident);
+            else
+                detail.identity_degraded = true;
             if (auto sess = registry_.get_session(agent_id))
                 detail.agent_version = sess->agent_version; // immutable identity field, lock-free
             detail.ci = device_inventory_store_
@@ -17769,8 +17780,11 @@ private:
                 std::unordered_map<std::string, std::string> out;
                 if (!offline_endpoint_store_)
                     return out;
+                // #5531 exception: display-only; a failed read leaves hostnames
+                // unresolved and the page falls back to the agent_id.
                 for (auto& e : offline_endpoint_store_->query_stale_within(
-                         std::chrono::hours(24 * 30)))
+                                   std::chrono::hours(24 * 30))
+                                   .value_or(std::vector<OfflineEndpoint>{}))
                     out.emplace(std::move(e.agent_id), std::move(e.hostname));
                 return out;
             });
@@ -18210,7 +18224,9 @@ private:
         viz_routes_ = std::make_unique<VizRoutes>();
         viz_routes_->register_routes(*web_server_, auth_fn, perm_fn, audit_fn,
                                      fleet_topology_store_.get(), &metrics_, &viz_disabled_,
-                                     offline_endpoint_store_.get());
+                                     offline_endpoint_store_
+                                         ? OfflineRosterFn{[this](std::chrono::seconds w) { return offline_endpoint_store_->query_stale_within(w); }}
+                                         : OfflineRosterFn{});
 
         // DashboardRoutes — /fragments/results, /fragments/results/filter-bar,
         //                   /fragments/create-group-form, /api/dashboard/group-from-results
@@ -20029,7 +20045,10 @@ private:
             // route) before any member destructs, so no handler runs past
             // that join -- same discipline as gateway_route_store_/
             // mgmt_group_store_ etc. (cpp-safety gov finding).
-            mcp_server_->set_viz_deps(fleet_topology_store_.get(), offline_endpoint_store_.get(),
+            mcp_server_->set_viz_deps(fleet_topology_store_.get(),
+                                      offline_endpoint_store_
+                                          ? OfflineRosterFn{[this](std::chrono::seconds w) { return offline_endpoint_store_->query_stale_within(w); }}
+                                          : OfflineRosterFn{},
                                       &viz_disabled_);
             mcp_server_->set_upload_grant_ops(
                 upload_grant_store_.get(),

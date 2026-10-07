@@ -30,9 +30,9 @@
 /// fail-closed posture `member_set_owned` already holds for result-set
 /// membership. `evaluate_scope_local` never calls into presence at all and so
 /// can never fail this way (see its own doc comment). `query_stale_within`
-/// (the viz-only read) is UNCHANGED — it stays fail-soft (empty on error),
-/// since a stale-cube viz render has no dispatch/enforce/target decision
-/// downstream of it.
+/// (the roster read: Hardware list/record, viz, MCP) is typed the same way
+/// (#5531) — a failed read is `std::unexpected`, never an empty roster —
+/// but never produces `Truncated` (its row cap keeps the newest rows).
 ///
 /// Substrate contract (ADR-0008): the store holds a `PgPool&` (not a
 /// `sqlite3*`), runs its schema migration at construction on a pinned lease,
@@ -43,6 +43,7 @@
 #include <chrono>
 #include <cstdint>
 #include <expected>
+#include <functional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -158,9 +159,17 @@ public:
     /// Every endpoint whose last heartbeat is within `window` of now, newest
     /// first. The viz handler renders those NOT currently online as stale
     /// cubes; rows older than `window` are withheld so a long-departed host
-    /// eventually stops cluttering the view. Empty on error (fail-soft: the
-    /// page still renders the live fleet).
-    [[nodiscard]] std::vector<OfflineEndpoint> query_stale_within(std::chrono::seconds window);
+    /// eventually stops cluttering the view. #5531: typed — `std::unexpected`
+    /// (`StoreUnavailable`: no connection in time; `DbError`: the query
+    /// failed) on a failed read, never an empty vector; an empty success
+    /// means "no rows". `Truncated` is never produced: the read keeps
+    /// `LIMIT kQueryRowCap` newest-first and serves the capped set. A failure
+    /// is counted on `yuzu_server_agent_presence_store_failed_total`
+    /// (`op=query_stale_within`) and logged at warn once per failed call.
+    /// Consumers decide: Hardware surfaces show a roster-unavailable banner /
+    /// 503; viz and MCP render live-only with `offline_roster_degraded`.
+    [[nodiscard]] std::expected<std::vector<OfflineEndpoint>, PresenceReadError>
+    query_stale_within(std::chrono::seconds window);
 
     /// HA WS-5: every agent whose `last_seen_at` is within `ttl` of the
     /// DATABASE clock (`now()` in-SQL, never the replica's own
@@ -181,9 +190,8 @@ public:
     /// "confirmed zero presence-only agents" and, under a NOT combinator
     /// elsewhere in the scope expression, would otherwise invert to a
     /// fleet-wide match built on a degraded read the caller never even
-    /// noticed. `query_stale_within` above is UNCHANGED (still fail-soft,
-    /// empty on error) — a stale-cube viz render has no
-    /// dispatch/enforce/target decision downstream of it, unlike this method.
+    /// noticed. `query_stale_within` above is typed the same way (#5531) but
+    /// its consumers are display surfaces, not dispatch decisions.
     [[nodiscard]] std::expected<std::vector<PresenceIdentity>, PresenceReadError>
     query_live_ids(std::chrono::seconds ttl);
 
@@ -206,5 +214,11 @@ private:
     bool open_{false};
     yuzu::MetricsRegistry* metrics_{nullptr};
 };
+
+/// Injected roster read (#5531): lets VizRoutes / McpServer take the typed
+/// `query_stale_within` as a boundary without holding the store. An empty
+/// function means "no durable roster wired" (live-only, legacy behaviour).
+using OfflineRosterFn = std::function<std::expected<std::vector<OfflineEndpoint>, PresenceReadError>(
+    std::chrono::seconds)>;
 
 } // namespace yuzu::server

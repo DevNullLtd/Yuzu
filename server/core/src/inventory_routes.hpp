@@ -125,6 +125,9 @@ struct InventoryDevicesResult {
     /// row's `tags` is then genuinely empty-because-degraded, not empty-because-
     /// no-tags; the Tags column renders an honest note instead of a blank column.
     bool tags_degraded = false;
+    /// True when the durable roster read itself failed (#5531): `rows` is then
+    /// empty-because-unread, never empty-because-no-devices.
+    bool roster_degraded = false;
 };
 
 // ── PURE renderers (implemented in inventory_ui.cpp) ─────────────────────────────

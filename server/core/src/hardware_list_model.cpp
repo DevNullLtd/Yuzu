@@ -528,6 +528,8 @@ nlohmann::json hardware_ci_json(const HardwareCiDetail& detail, std::int64_t /*n
         out["last_seen"] = nullptr;
     }
 
+    out["identity_state"] = detail.identity ? "found" : detail.identity_degraded ? "degraded" : "absent";
+
     if (!detail.ci.has_value()) {
         out["ci"] = nullptr;
         out["ci_state"] = "degraded";

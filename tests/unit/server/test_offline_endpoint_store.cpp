@@ -69,6 +69,13 @@ std::vector<PresenceIdentity> live_ids_ok(OfflineEndpointStore& s, std::chrono::
     return *r;
 }
 
+// #5531: query_stale_within is typed too; unwraps the healthy-path result.
+std::vector<OfflineEndpoint> stale_ok(OfflineEndpointStore& s, std::chrono::seconds window) {
+    auto r = s.query_stale_within(window);
+    REQUIRE(r.has_value());
+    return *r;
+}
+
 } // namespace
 
 TEST_CASE("OfflineEndpointStore migrates and upserts", "[pg][offline]") {
@@ -83,7 +90,7 @@ TEST_CASE("OfflineEndpointStore migrates and upserts", "[pg][offline]") {
 
     SECTION("insert then read back within window") {
         REQUIRE(store.upsert("agent-a", "host-a", "linux", t, 1234));
-        auto rows = store.query_stale_within(std::chrono::hours(1));
+        auto rows = stale_ok(store, std::chrono::hours(1));
         const auto* a = find(rows, "agent-a");
         REQUIRE(a != nullptr);
         CHECK(a->hostname == "host-a");
@@ -95,7 +102,7 @@ TEST_CASE("OfflineEndpointStore migrates and upserts", "[pg][offline]") {
     SECTION("upsert is idempotent on agent_id and overwrites fields") {
         REQUIRE(store.upsert("agent-b", "old-host", "linux", t - 5000, 1));
         REQUIRE(store.upsert("agent-b", "new-host", "windows", t, 2));
-        auto rows = store.query_stale_within(std::chrono::hours(1));
+        auto rows = stale_ok(store, std::chrono::hours(1));
         const auto* b = find(rows, "agent-b");
         REQUIRE(b != nullptr);
         CHECK(b->hostname == "new-host");
@@ -112,21 +119,21 @@ TEST_CASE("OfflineEndpointStore migrates and upserts", "[pg][offline]") {
     SECTION("query_stale_within excludes rows older than the window") {
         REQUIRE(store.upsert("recent", "h1", "linux", t - 1000, 0));     // 1s ago
         REQUIRE(store.upsert("ancient", "h2", "linux", t - 86'400'000, 0)); // ~1 day ago
-        auto rows = store.query_stale_within(std::chrono::seconds(60));
+        auto rows = stale_ok(store, std::chrono::seconds(60));
         CHECK(find(rows, "recent") != nullptr);
         CHECK(find(rows, "ancient") == nullptr);
     }
 
     SECTION("empty agent_id is rejected, no row written") {
         CHECK_FALSE(store.upsert("", "h", "linux", t, 0));
-        auto rows = store.query_stale_within(std::chrono::hours(1));
+        auto rows = stale_ok(store, std::chrono::hours(1));
         CHECK(find(rows, "") == nullptr);
     }
 
     // Round-3 v2 columns (Devices-page merge, item 1): agent_version/arch.
     SECTION("v2 round-trip: agent_version and arch persist") {
         REQUIRE(store.upsert("agent-v2", "host-v2", "windows", t, 0, "1.4.2", "x86_64"));
-        auto rows = store.query_stale_within(std::chrono::hours(1));
+        auto rows = stale_ok(store, std::chrono::hours(1));
         const auto* v = find(rows, "agent-v2");
         REQUIRE(v != nullptr);
         CHECK(v->agent_version == "1.4.2");
@@ -139,7 +146,7 @@ TEST_CASE("OfflineEndpointStore migrates and upserts", "[pg][offline]") {
         // hostname still updates unconditionally, but the last-known
         // version/arch/os must survive (see upsert()'s CASE WHEN doc comment).
         REQUIRE(store.upsert("agent-v2b", "host-v2b-renamed", "", t, 0, "", ""));
-        auto rows = store.query_stale_within(std::chrono::hours(1));
+        auto rows = stale_ok(store, std::chrono::hours(1));
         const auto* v = find(rows, "agent-v2b");
         REQUIRE(v != nullptr);
         CHECK(v->hostname == "host-v2b-renamed"); // unconditional field still updates
@@ -148,7 +155,7 @@ TEST_CASE("OfflineEndpointStore migrates and upserts", "[pg][offline]") {
         CHECK(v->os == "linux");                  // #5294: preserved, not blanked
         // A non-blank os still wins (a genuine OS change).
         REQUIRE(store.upsert("agent-v2b", "host-v2b-renamed", "windows", t, 0, "", ""));
-        rows = store.query_stale_within(std::chrono::hours(1));
+        rows = stale_ok(store, std::chrono::hours(1));
         v = find(rows, "agent-v2b");
         REQUIRE(v != nullptr);
         CHECK(v->os == "windows");
@@ -161,7 +168,7 @@ TEST_CASE("OfflineEndpointStore migrates and upserts", "[pg][offline]") {
         // observable shape a genuinely pre-v2 row would have after the
         // ADD COLUMN migration runs.
         REQUIRE(store.upsert("agent-noversion", "h", "linux", t, 0));
-        auto rows = store.query_stale_within(std::chrono::hours(1));
+        auto rows = stale_ok(store, std::chrono::hours(1));
         const auto* v = find(rows, "agent-noversion");
         REQUIRE(v != nullptr);
         CHECK(v->agent_version.empty());
@@ -277,6 +284,11 @@ TEST_CASE("OfflineEndpointStore reports !is_open on a migration failure", "[pg][
     auto r = store.query_live_ids(std::chrono::hours(1));
     REQUIRE_FALSE(r.has_value());
     CHECK(r.error() == PresenceReadError::StoreUnavailable);
+
+    // #5531: same for the roster read.
+    auto stale = store.query_stale_within(std::chrono::hours(1));
+    REQUIRE_FALSE(stale.has_value());
+    CHECK(stale.error() == PresenceReadError::StoreUnavailable);
 }
 
 // #4981 PR-1 (Finding B1): query_live_ids's typed failure surface. Genuine
@@ -310,6 +322,50 @@ TEST_CASE("OfflineEndpointStore query_live_ids reports DbError on a genuine quer
                 .status() == PGRES_COMMAND_OK);
 
     auto recovered = degraded_store.query_live_ids(std::chrono::hours(1));
+    REQUIRE(recovered.has_value());
+}
+
+// #5531: query_stale_within's typed failure surface — a failed roster read is
+// never an empty vector, and is counted under op=query_stale_within.
+TEST_CASE("OfflineEndpointStore query_stale_within reports DbError on a genuine query failure, "
+          "counts op=query_stale_within, never a silent empty vector",
+          "[pg][offline]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, offline_tpl);
+
+    PgPool short_lock_pool{{.conninfo = db.dsn(), .size = 2, .lock_timeout_ms = 100}};
+    REQUIRE(short_lock_pool.valid());
+    OfflineEndpointStore degraded_store{short_lock_pool};
+    REQUIRE(degraded_store.is_open());
+    yuzu::MetricsRegistry metrics;
+    degraded_store.set_metrics(&metrics);
+
+    yuzu::server::pg::PgConn locker{PQconnectdb(db.dsn().c_str())};
+    REQUIRE(PQstatus(locker.get()) == CONNECTION_OK);
+    REQUIRE(yuzu::server::pg::exec_params(locker.get(), "BEGIN", std::vector<std::string>{})
+                .status() == PGRES_COMMAND_OK);
+    REQUIRE(yuzu::server::pg::exec_params(
+                locker.get(), "LOCK TABLE endpoint_state.endpoints IN ACCESS EXCLUSIVE MODE",
+                std::vector<std::string>{})
+                .status() == PGRES_COMMAND_OK);
+
+    auto degraded = degraded_store.query_stale_within(std::chrono::hours(1));
+    REQUIRE_FALSE(degraded.has_value());
+    CHECK(degraded.error() == PresenceReadError::DbError);
+
+    // Release the lock immediately: it also stalls heartbeat upserts.
+    REQUIRE(yuzu::server::pg::exec_params(locker.get(), "ROLLBACK", std::vector<std::string>{})
+                .status() == PGRES_COMMAND_OK);
+
+    CHECK(metrics
+              .counter("yuzu_server_agent_presence_store_failed_total",
+                       {{"op", "query_stale_within"}, {"reason", "db_error"}})
+              .value() == 1);
+    CHECK(metrics
+              .counter("yuzu_server_agent_presence_store_failed_total",
+                       {{"op", "query_stale_within"}, {"reason", "store_unavailable"}})
+              .value() == 0);
+
+    auto recovered = degraded_store.query_stale_within(std::chrono::hours(1));
     REQUIRE(recovered.has_value());
 }
 
