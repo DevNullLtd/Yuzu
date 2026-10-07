@@ -12,7 +12,8 @@
  * guardian_persist_baseline overwrite guard. Same shape as GuardianLifecycleJournal.
  *
  * OWNERSHIP: `kv_` is BORROWED and may be null (nothing is then persisted and nothing is
- * taken, so a staged capture is not lost to a missing store). The KvStore outlives the engine
+ * taken, so a staged capture is not lost to a missing store; each drain that finds one staged
+ * counts it in no_store_pending() and the first logs once). The KvStore outlives the engine
  * (agent.cpp declares kv_store_ before guardian_), the same proof guard_file.hpp relies on.
  * The runtime is passed per call and never retained.
  *
@@ -76,12 +77,25 @@ public:
         return persist_failures_.load(std::memory_order_relaxed);
     }
 
+    /// Cumulative count of drains that found a capture staged but had no store to write it to
+    /// (kv_ null). The capture stays staged (bounded by the runtime's cap); never silent.
+    [[nodiscard]] std::uint64_t no_store_pending() const noexcept {
+        return no_store_pending_.load(std::memory_order_relaxed);
+    }
+
     /// The persist-before-seed fence: hold persist_mu_ for the lifetime of the returned lock.
     /// Blocks until any in-flight persist_staged batch has finished, and keeps the next one out.
     /// Caller: GuardianEngine::reconcile_rule_locked (mtx_ held), around a baseline-on-arm
     /// rule's seed read and attach. Must never be taken under a runtime lock.
     [[nodiscard]] std::unique_lock<std::mutex> hold_seed_fence() {
         return std::unique_lock<std::mutex>{persist_mu_};
+    }
+
+    /// TEST-ONLY: how many times the one-time "no store" error was logged (0 or 1). Read off
+    /// the object because the agent core is a separate image from the test binary, so a
+    /// captured spdlog logger would not see it. No production caller.
+    [[nodiscard]] std::uint32_t no_store_logs_for_test() const noexcept {
+        return no_store_logs_.load(std::memory_order_relaxed);
     }
 
     /// TEST-ONLY: true iff persist_mu_ is currently held. Probes with try_lock, so it must be
@@ -95,6 +109,8 @@ private:
     KvStore* kv_;
     std::mutex persist_mu_; ///< LEAF, see LOCKING above
     std::atomic<std::uint64_t> persist_failures_{0};
+    std::atomic<std::uint64_t> no_store_pending_{0};
+    std::atomic<std::uint32_t> no_store_logs_{0}; ///< 0 -> 1 latches the one-time "no store" log
 };
 
 } // namespace yuzu::agent

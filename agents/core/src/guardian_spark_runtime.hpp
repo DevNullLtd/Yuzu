@@ -622,7 +622,12 @@ public:
     /// outbox_enqueue_waker_): a failing KV must not spin the drain worker.
     void restage_baselines(std::vector<CapturedBaseline> failed);
     [[nodiscard]] std::size_t staged_baseline_count_for_test() const;
-    /// Captures dropped at the cap (or on an allocation failure while staging). Lock-free.
+    /// True iff at least one capture is staged (registry_mu_ standalone). The persister's
+    /// no-store branch uses it to count a capture that has nowhere to go.
+    [[nodiscard]] bool has_staged_baselines() const;
+    /// Captures dropped at the cap, on an allocation failure while staging, or while restaging
+    /// a failed persist. GuardianEngine::baseline_persist_failures() folds this in, so a
+    /// dropped capture reaches the heartbeat. Lock-free.
     [[nodiscard]] std::uint64_t staged_baseline_drops() const noexcept {
         return staged_baseline_drops_.load(std::memory_order_relaxed);
     }

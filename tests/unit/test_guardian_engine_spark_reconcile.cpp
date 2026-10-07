@@ -6444,3 +6444,58 @@ TEST_CASE("#4045 E14: the persister's seed fence is held across a baseline-on-ar
     probe.join();
     CHECK_FALSE(held_after); // released when reconcile returns (no worker batch is running)
 }
+
+// C4045-2: every staging-loss channel must reach the heartbeat aggregate.
+TEST_CASE("#4045 E15: captures dropped at the staging cap surface on the heartbeat tag",
+          "[spark][guardian][baseline][reconcile]") {
+    SparkReconcileFixture f{3'600'000, std::nullopt, SparkType::File};
+    // Parked first: a worker drain between the inserts would empty the staging and the cap
+    // would never be reached.
+    f.engine->drain_worker_for_test()->stop();
+    auto* rt = f.engine->spark_runtime_for_test();
+    REQUIRE(rt != nullptr);
+    CHECK(f.engine->baseline_persist_failures() == 0);
+
+    const std::size_t cap = yuzu::agent::GuardianSparkRuntime::kMaxStagedBaselines;
+    std::vector<yuzu::agent::GuardianSparkRuntime::CapturedBaseline> many;
+    for (std::size_t i = 0; i < cap + 1; ++i)
+        many.push_back({"cap-rule-" + std::to_string(i), "/yuzu_test_4045_cap/" + std::to_string(i),
+                        std::string(64, 'a')});
+    rt->restage_baselines(std::move(many)); // the runtime's public insert path: cap handling
+    CHECK(rt->staged_baseline_count_for_test() == cap);
+    CHECK(rt->staged_baseline_drops() == 1);
+
+    // No KV write failed and nothing threw: the ONLY signal is the drop, and it must be exported.
+    CHECK(f.engine->baseline_persist_failures() == 1);
+    std::map<std::string, std::string> tags;
+    yuzu::agent::emit_guardian_baseline_persist_heartbeat_tags(tags, f.engine->baseline_persist_failures());
+    REQUIRE(tags.count("yuzu.guardian_baseline_persist_failures") == 1);
+    CHECK(tags.at("yuzu.guardian_baseline_persist_failures") == "1");
+}
+
+TEST_CASE("#4045 E16: a capture staged with no KV store is counted, logged once and kept",
+          "[spark][guardian][baseline][reconcile]") {
+    // A standalone persister over a null store and the fixture's runtime (the engine itself
+    // refuses apply_rules without a store, so the engine-level path cannot stage this).
+    SparkReconcileFixture f{3'600'000, std::nullopt, SparkType::File};
+    f.engine->drain_worker_for_test()->stop();
+    auto* rt = f.engine->spark_runtime_for_test();
+    REQUIRE(rt != nullptr);
+    rt->restage_baselines({{"r1", "/yuzu_test_4045_nostore", std::string(64, 'b')}});
+    REQUIRE(rt->staged_baseline_count_for_test() == 1);
+
+    yuzu::agent::GuardianBaselinePersister no_store{nullptr};
+    CHECK(no_store.no_store_pending() == 0);
+    (void)no_store.persist_staged(*rt);
+    (void)no_store.persist_staged(*rt);
+    (void)no_store.persist_staged(*rt);
+    CHECK(no_store.no_store_pending() == 3);       // counted per drain that finds a capture
+    CHECK(no_store.no_store_logs_for_test() == 1); // ...but logged ONCE
+    CHECK(no_store.persist_failures() == 0);
+    CHECK(rt->staged_baseline_count_for_test() == 1); // never discarded
+
+    // Nothing staged -> nothing counted (a quiescent no-store engine is not an incident).
+    (void)rt->take_staged_baselines();
+    (void)no_store.persist_staged(*rt);
+    CHECK(no_store.no_store_pending() == 3);
+}

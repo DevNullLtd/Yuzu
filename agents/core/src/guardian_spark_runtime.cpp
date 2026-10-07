@@ -4534,6 +4534,11 @@ std::size_t GuardianSparkRuntime::staged_baseline_count_for_test() const {
     return staged_baselines_.size();
 }
 
+bool GuardianSparkRuntime::has_staged_baselines() const {
+    std::lock_guard<std::mutex> lk{registry_mu_};
+    return !staged_baselines_.empty();
+}
+
 void GuardianSparkRuntime::erase_persisted_prefix(std::size_t n, std::uint64_t drops_at_snapshot) {
     std::lock_guard<std::mutex> ob{outbox_mu_};
     // The prefix must be identified by IDENTITY, not by position (#2345 Gate 8b). The caller

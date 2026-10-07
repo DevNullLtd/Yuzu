@@ -1,9 +1,10 @@
 #pragma once
 
 /// @file guardian_baseline_heartbeat.hpp
-/// Writer side of the Spark baseline-persistence failure signal (#4045): the count of failed
-/// attempts to write a Spark baseline-on-arm capture to the #4021 KV record
-/// (GuardianEngine::baseline_persist_failures()).
+/// Writer side of the Spark baseline-persistence failure signal (#4045): the count of every
+/// channel by which a Spark baseline-on-arm capture failed to reach the #4021 KV record
+/// (GuardianEngine::baseline_persist_failures()): failed write attempts, firewalled throws,
+/// captures dropped from staging (cap, allocation, restage) and a capture staged with no store.
 ///
 /// A persist failure is a DELIBERATE fail-open (the rule keeps running on its in-memory
 /// baseline), so it must not be silent. Until the capture is persisted, a crash or full_sync

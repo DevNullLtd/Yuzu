@@ -626,8 +626,20 @@ GuardianBaselinePersister::Outcome GuardianBaselinePersister::persist_staged(Gua
     Outcome out;
     // No store: nothing can be persisted, and taking would only discard (or, restaged, count a
     // failure on every worker cycle). Leave the capture staged; the runtime's cap bounds it.
-    if (!kv_)
+    if (!kv_) {
+        // A capture is staged but can never be written: the rule keeps its in-memory baseline
+        // and the staging stays bounded by the runtime's cap, but the loss window is open, so
+        // count it (folded into the heartbeat aggregate) and log ONCE, not every worker cycle.
+        if (rt.has_staged_baselines()) {
+            no_store_pending_.fetch_add(1, std::memory_order_relaxed);
+            std::uint32_t unlogged = 0;
+            if (no_store_logs_.compare_exchange_strong(unlogged, 1, std::memory_order_relaxed))
+                spdlog::error("Guardian: a Spark baseline capture is staged but there is no KV "
+                              "store to persist it to; it stays staged and is counted on "
+                              "yuzu.guardian_baseline_persist_failures (#4045)");
+        }
         return out;
+    }
     std::lock_guard<std::mutex> lk{persist_mu_};
     auto taken = rt.take_staged_baselines();
     if (taken.empty())
@@ -1334,7 +1346,10 @@ std::uint64_t GuardianEngine::io_ceiling_rejections() const {
 std::uint64_t GuardianEngine::baseline_persist_failures() const {
     std::lock_guard lock(mtx_);
     return baseline_maint_exceptions_.load(std::memory_order_relaxed) +
-           (baseline_persister_ ? baseline_persister_->persist_failures() : 0) +
+           (baseline_persister_ ? baseline_persister_->persist_failures() +
+                                      baseline_persister_->no_store_pending()
+                                : 0) +
+           (spark_runtime_ ? spark_runtime_->staged_baseline_drops() : 0) +
            (spark_drain_worker_ ? spark_drain_worker_->baseline_persist_exception_count() : 0);
 }
 

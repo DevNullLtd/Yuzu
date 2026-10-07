@@ -2639,7 +2639,10 @@ Guardian ladder must check these.
   a bare earlier drain; (2) a failed write is a
   deliberate fail-open (the rule keeps its in-memory baseline), restaged and
   retried, counted, error-logged and exported on the sparse heartbeat tag
-  `yuzu.guardian_baseline_persist_failures`, never silent; (3) the crash
+  `yuzu.guardian_baseline_persist_failures`, never silent; every staging-loss
+  channel feeds the same tag: failed writes, firewalled throws, captures dropped
+  from staging (the 256-entry cap, an allocation failure, a restage), and a
+  capture staged with no KV store (logged once, kept); (3) the crash
   window between a capture and its persist is accepted (the next boot
   recaptures). All of it is inert while `prefer_spark_` is false (the shipping
   default) and becomes live at the Spark flip.

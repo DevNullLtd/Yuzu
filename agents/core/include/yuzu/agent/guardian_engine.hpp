@@ -313,13 +313,17 @@ public:
     /// outbox_backpressure_drops()'s own shape.
     [[nodiscard]] std::uint64_t io_ceiling_rejections() const;
 
-    /// #4045: cumulative failed attempts to persist a Spark baseline capture to the #4021 KV
-    /// record (GuardianBaselinePersister::persist_failures), plus throws firewalled around the
-    /// staged-baseline drain (engine + drain worker). Zero while healthy, quiescent, or inert
+    /// #4045: cumulative count of every channel by which a Spark baseline capture failed to
+    /// reach (or may not reach) the #4021 KV record: failed persist attempts
+    /// (GuardianBaselinePersister::persist_failures), throws firewalled around the staged-baseline
+    /// drain (engine + drain worker), captures DROPPED from staging (the 256-entry cap, an
+    /// allocation failure, or a restage; GuardianSparkRuntime::staged_baseline_drops), and drains
+    /// that found a capture staged with no KV store to write it to
+    /// (GuardianBaselinePersister::no_store_pending). Zero while healthy, quiescent, or inert
     /// (prefer_spark off). Surfaced SPARSELY as `yuzu.guardian_baseline_persist_failures` via
     /// emit_guardian_baseline_persist_heartbeat_tags. A non-zero value means a capture is
-    /// currently or was recently unpersisted: the rule still enforces on its in-memory
-    /// baseline, but a crash or full_sync before the retry recaptures current content.
+    /// currently or was recently unpersisted (or lost): the rule still enforces on its in-memory
+    /// baseline, but a crash or full_sync before a retry recaptures current content.
     [[nodiscard]] std::uint64_t baseline_persist_failures() const;
 
     /// Count of repeat-Unknown convergence re-evals whose guard.unhealthy was
