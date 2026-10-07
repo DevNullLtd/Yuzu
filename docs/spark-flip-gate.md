@@ -1198,33 +1198,44 @@ flip, with a red-first test each:
     adopted, the next identical push is a forced Reapply of the just-armed rule: one wasted
     teardown, never an acknowledgment.
   - (AC-10) **#4045 baseline relaunder, narrow.** Persisted baselines are re-seeded on
-    every arm (`guardian_engine.cpp`, the arm-time re-seed), `apply_rules` first writes
-    any staged, not-yet-persisted Spark capture before it tears down or re-arms anything,
-    and a capture an in-flight evaluation stages after that write is seeded from the
-    runtime's staging at attach (`attach_core`, under the same `registry_mu_` hold as the
-    prior generation's detach, with the persister's seed fence ordering a worker write
-    against the engine's KV seed read). A forced Reapply can therefore still recapture a
-    Spark-first-captured `FileHashEquals` baseline only in these remaining cases: (1) a
-    crash came before the capture landed (the crash window), or a stop came while its write
-    was still failing (a failing local KV store: staged, retried with a worker backoff,
-    error-logged and counted in `yuzu.guardian_baseline_persist_failures`), or stop's final
-    flush was skipped because the pass before it failed slowly; a capture whose write is
-    merely failing is NOT lost to a re-arm, because the new arm inherits the waiting capture
-    from memory; (2) the capture was lost or never written and counted (an allocation
-    failure while staging, which leaves the rule without a baseline until its next
-    evaluation captures whatever the file then holds, or the rule's path re-authored while
-    the first capture was still unwritten; an A to B to A re-authoring
-    re-baselines A even with a healthy store, the same as legacy); (3) the arm-time read of
-    the record failed and the write-time re-check read failed again, so the guard wrote the
-    fresh capture anyway: two failed reads suffice, a transient read fault is enough, not
-    only a sustained outage; (4) a record persisted for a rule later removed stays dormant
-    and re-seeds the rule if it returns on the same path; (5) the refused window: the
-    arm-time read of the record failed while a valid record existed, so the live rule is
-    judged against freshly captured content (possibly already drifted) and reports
-    compliant until its next re-arm or restart; the record stays intact (the overwrite guard
-    refuses the write), and the refusal is counted by an agent-side diagnostic accessor only.
-    The tag covers the Spark path only and is per-agent: see the F14 precondition on a
-    fleet-visible signal.
+    every arm (`guardian_engine.cpp`, the arm-time re-seed), `apply_rules` writes the
+    staged, not-yet-persisted Spark captures within its pass budget before it tears down
+    or re-arms anything (a leftover is handed to the new arm from memory and the worker
+    writes it next), and a capture an in-flight evaluation stages after that write is
+    seeded from the runtime's staging at attach (`attach_core`, under the same
+    `registry_mu_` hold as the prior generation's detach, with the persister's seed fence
+    ordering a worker write against the engine's KV seed read). A forced Reapply can
+    therefore still recapture a Spark-first-captured `FileHashEquals` baseline only in
+    the remaining cases below (the known cases; the same eight are listed in the user
+    manual and design s24): (1) a crash came before the capture landed (the crash
+    window, which includes captures an `apply_rules` pass left for the worker); (2) a
+    stop lost waiting captures: its single allowed write failed (a failing local KV
+    store: staged, retried with a worker backoff, error-logged and counted in
+    `yuzu.guardian_baseline_persist_failures`), or its one second of wall between
+    writes ran out before every capture was written (a slow but succeeding store; logged,
+    not counted), or the flush was skipped because a write that failed slowly ended at or
+    after the start of that stop (logged, not counted); a capture whose write is merely
+    failing is NOT lost to a re-arm, because the new arm inherits the waiting capture
+    from memory; (3) an allocation failure while staging a capture: the baseline stays
+    live (a later change is still drift against it) and staging is retried at every
+    later evaluation, so this is a window only until a retry succeeds; it can recapture
+    only if the rule is re-pushed in that window and the attach-time retry also fails,
+    in which case the new arm captures whatever the file then holds (counted, once per
+    failed attempt); (4) the rule's path re-authored while the first capture was still
+    unwritten (counted), and an A to B to A re-authoring re-baselines A even with a
+    healthy store, the same as legacy; (5) the arm-time read of the record failed and
+    the write-time re-check read failed again, so the guard wrote the fresh capture
+    anyway: two failed reads suffice, a transient read fault is enough, not only a
+    sustained outage; (6) the refused window: the arm-time read of the record failed
+    while a valid record existed, so the live rule is judged against freshly captured
+    content (possibly already drifted) and reports compliant until its next re-arm or
+    restart; the record stays intact (the overwrite guard refuses the write), and the
+    refusal is counted by an agent-side diagnostic accessor only; (7) a record found
+    malformed (bad JSON, an unknown schema number, an invalid hash) is discarded at arm
+    and overwritten at persist, which predates #4045 (#4021) and applies to both paths;
+    (8) a record persisted for a rule later removed stays dormant and re-seeds the rule
+    if it returns on the same path. The tag covers the Spark path only and is per-agent:
+    see the F14 precondition on a fleet-visible signal.
   - (AC-11) **An operator delta push (`full_sync=false`) during a hold** changes the push
     identity (and the following full_sync push changes it back), so each is a Reapply and
     the suppression budget restarts. A delta push that OMITS a still-desired unresolved
@@ -2111,6 +2122,12 @@ since they're hardening ON TOP OF an already-correct #2818 fix, not a defect in 
   fleet signal ships (table row, gauge, alert, pin test; a current "unpersisted captures"
   gauge kept apart from a "captures lost" counter) the agent error log is the only signal.
   Issue to be filed (TODO, no number yet).
+- **Real-File-mechanism run for #4045 (Q4): NOT done.** The operator required one manual
+  `prefer_spark` run on the Windows test box of a baseline-on-arm `file-hash-equals` rule
+  through the real File mechanism (capture, then an agent restart or `full_sync`, then drift
+  reported rather than laundered) BEFORE the #4045 change merges. Not performed as of this
+  entry; section 3a carries the full wording and where to record the outcome. Issue to be
+  filed (TODO, no number yet) if it is not done before merge.
 - Owner: not assigned for any item above.
 - Milestone: pre-PR-5 hardening package (#4051/#4052/#4053) + three pre-PR-5 GATING items
   (guard.errored census recognition; the three sre observability gaps; the

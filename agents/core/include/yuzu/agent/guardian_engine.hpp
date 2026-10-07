@@ -316,23 +316,31 @@ public:
     /// #4045: cumulative-since-boot count of the channels by which a Spark baseline capture
     /// failed to reach (or may not reach) the #4021 KV record: failed persist passes (one per
     /// pass, however many of its writes failed), throws firewalled around a pass (engine
-    /// and drain worker), captures DROPPED from staging (an allocation failure, or a retarget
-    /// that replaced a still-unpersisted capture; GuardianSparkRuntime::staged_baseline_drops),
-    /// and passes that found a capture staged with no KV store to write it to. Zero while
+    /// and drain worker), staging attempts that failed (an allocation failure, once per
+    /// attempt) or displaced a capture (a retarget that replaced a still-unpersisted capture;
+    /// GuardianSparkRuntime::staged_baseline_drops), and passes that found a capture staged
+    /// with no KV store to write it to. A stop-time loss that is not a failed write (the stop
+    /// flush ran out of wall budget, or was skipped after a slow failure) is logged, NOT counted
+    /// here. Zero while
     /// healthy, quiescent, or inert (prefer_spark off). Surfaced SPARSELY as
     /// `yuzu.guardian_baseline_persist_failures` via emit_guardian_baseline_persist_heartbeat_tags.
     /// Spark path ONLY: a legacy FileGuard persist failure is logged, not counted. Because it
     /// is cumulative, a non-zero value says a failure or loss HAPPENED in this process, not
-    /// that one is still open; a failed capture stays staged and is retried (only drops and a
-    /// crash lose one), and the rule keeps enforcing on its in-memory baseline meanwhile.
+    /// that one is still open; a failed capture stays staged and is retried (a crash, a
+    /// displaced capture and the stop-time losses above lose one), and the rule keeps
+    /// enforcing on its in-memory baseline meanwhile.
     /// This accessor takes no lock (atomics only, never mtx_). The heartbeat thread's other
     /// GuardianEngine getters (policy_generation(), journal_stats(), ...) DO take mtx_, so the
     /// tick as a whole can still wait behind apply_rules; only this read cannot.
     [[nodiscard]] std::uint64_t baseline_persist_failures() const;
     /// #4045: cumulative count of staged captures the #4021 overwrite guard REFUSED to write
     /// because a same-target record already existed (first capture wins). Not a failure and not
-    /// part of baseline_persist_failures(); it marks a rule whose live baseline may differ from
-    /// the durable record until its next re-arm. Lock-free. No heartbeat tag.
+    /// part of baseline_persist_failures(). DIAGNOSTIC accessor with no production consumer and
+    /// no heartbeat tag. It is an UPPER BOUND on "the live baseline differs from the durable
+    /// record" and has two causes: a seed read that failed at arm while a valid record existed
+    /// (the rule is judged against re-captured content until its next re-arm; the record is
+    /// intact), and a benign duplicate (an erase threw after a successful write, so the next
+    /// pass re-wrote the same capture and the guard refused it). Lock-free.
     [[nodiscard]] std::uint64_t baseline_persist_refusals() const;
 
     /// Count of repeat-Unknown convergence re-evals whose guard.unhealthy was

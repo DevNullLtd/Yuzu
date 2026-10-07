@@ -165,7 +165,7 @@ This section matters as much as the positive grants — it documents the privile
 
 | Path (Linux) | Path (macOS) | Path (Windows) | Owner | Mode | Purpose |
 |---|---|---|---|---|---|
-| `/var/lib/yuzu-agent/` | `/Library/Application Support/Yuzu/state/` | `C:\ProgramData\Yuzu\state\` | agent | 0750 (see the note below the table) | persistent state: `agent.db`, KV store, `cmd_execution_ids` cache |
+| `/var/lib/yuzu-agent/` | `/Library/Application Support/Yuzu/state/` | `C:\ProgramData\Yuzu\` (the installer registers the service with `--data-dir C:\ProgramData\Yuzu`, so `kv_store.db` sits directly in it; the installer creates no `state` subdirectory) | agent | 0750 (see the note below the table) | persistent state: `agent.db`, KV store, `cmd_execution_ids` cache |
 | `/var/cache/yuzu-agent/` | `/Library/Caches/Yuzu/` | `C:\ProgramData\Yuzu\cache\` | agent | 0750 | regenerable cache; `content_dist.stage` writes downloads here |
 | `/var/log/yuzu-agent/` | `/Library/Logs/Yuzu/` | `C:\ProgramData\Yuzu\logs\` | agent | 0750 | spdlog output (managed by logrotate / Apple ASL / Windows ETW) |
 | `/usr/local/lib/yuzu/plugins/` | `/Library/Application Support/Yuzu/plugins/` | `C:\Program Files\Yuzu\plugins\` (or `C:\ProgramData\Yuzu\plugins\` for dev) | root | 0755 (read-only to agent) | plugin `.so` / `.dylib` / `.dll` loaded at agent startup. **Must NOT be writable by the agent account** |

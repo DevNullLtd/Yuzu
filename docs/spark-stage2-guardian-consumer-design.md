@@ -804,7 +804,8 @@ healthy same-type sibling in the push, every push after the first forced one is 
 teardown and re-arm, AC-16) (re-arm recaptures only
 a Spark-first-captured `FileHashEquals` baseline that was lost or never written, #4045: the
 remaining cases are enumerated in the flip gate's AC-10; `apply_rules` persists staged
-captures first and persisted baselines are re-seeded on every arm); (3) an operator delta push (`full_sync=false`)
+captures within its pass budget first (the remainder is handed to the new arm from memory)
+and persisted baselines are re-seeded on every arm); (3) an operator delta push (`full_sync=false`)
 during a hold flips the push identity twice and resets the suppression budget;
 (4) recovery needs a live connection (the maintenance tick runs on the per-connection
 heartbeat thread). Known limits NOT fixed here: a delta push (`full_sync=false`) that
@@ -1183,14 +1184,15 @@ design is mentioned it is named as the earlier design.
   (`can_advance()` ignores content) and the server stops re-pushing, so the stale content
   stays until the next generation. #4045: a forced Reapply re-arms the whole
   push, but persisted baselines are re-seeded on every arm
-  (`guardian_engine.cpp`), `apply_rules` first persists any staged capture, and a capture an
+  (`guardian_engine.cpp`), `apply_rules` persists staged captures within its pass budget first
+  (a leftover is handed to the new arm from memory), and a capture an
   in-flight evaluation stages after that drain is seeded from the runtime's staging at attach
   (`attach_core`, under the same `registry_mu_` hold as the detach, with the persister's
-  seed fence ordering a worker write against the engine's KV seed read), so only a
-  Spark-first-captured `FileHashEquals` baseline that was lost or never written is exposed
-  to a baseline recapture, and a rule whose arm-time seed read failed while a valid record
+  seed fence ordering a worker write against the engine's KV seed read), so a baseline
+  recapture is exposed only for a Spark-first-captured `FileHashEquals` baseline that was
+  lost or never written, and a rule whose arm-time seed read failed while a valid record
   existed is judged against re-captured content until its next re-arm (the "refused
-  window"; the record is kept). The enumerated cases are the flip gate's AC-10.
+  window"; the record is kept). The known cases (eight) are the flip gate's AC-10.
 
 **Known accepted residual (governance Gate 4/8, rung 9c PR-5d /governance run,
 independently traced and REFUTED as permanent):** a withdraw immediately

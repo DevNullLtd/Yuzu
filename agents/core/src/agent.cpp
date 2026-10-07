@@ -2602,7 +2602,7 @@ public:
                             // push still converges once rules exist server-side.
                             if (guardian_) {
                               // The Guardian emit block is six independently contained
-                              // groups (#4472 hardening; the hb_guardian_* slot enum above
+                              // groups (#4472 hardening; the kHbGuardian* slot enum above
                               // is the authoritative list): a bad_alloc / system_error from
                               // a guardian accessor or a tag insert must never terminate the
                               // heartbeat thread, and one failing group must not silence the
