@@ -1488,6 +1488,9 @@ public:
             metrics_.counter("yuzu_server_dispatch_target_rejected_total",
                              {{"route", route},
                               {"reason", std::string(yuzu::server::kReasonDestructiveUntargeted)}});
+        // Stored `parameter_schema` refusals on the instruction execute route: a separate
+        // family (a validation refusal, not a targeting one), seeded in workflow_routes.cpp.
+        seed_instruction_param_rejected_metrics(metrics_);
         // Wave 7 PR7.2: the Forensics single-target refusal — same routes as
         // its Destructive sibling above, since `evaluate_destructive_targeting`
         // is called generically for any classified capability on all of them

@@ -35,6 +35,12 @@ namespace yuzu::server {
 
 class CommandCapabilityRegistry;
 
+/// Describe `yuzu_server_instruction_param_rejected_total{route,reason}` and pre-seed every
+/// (route, reason) series to 0 so the family exists before the first refusal. Called once at
+/// server start; idempotent. `route` is `instruction_execute` for
+/// `POST /api/instructions/{id}/execute`; `reason` is `shape`, `violation` or `schema_invalid`.
+void seed_instruction_param_rejected_metrics(yuzu::MetricsRegistry& metrics);
+
 /// Workflow, product-pack, execution fragment, and scope-estimate routes.
 /// Extracted from ServerImpl::start_web_server() for god-object decomposition.
 class WorkflowRoutes {

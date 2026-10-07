@@ -31,6 +31,7 @@
 /// over source text would be.
 
 #include "instruction_routes.hpp"
+#include "instruction_schema_test_util.hpp"
 #include "test_route_sink.hpp"
 
 #include "instruction_store.hpp"
@@ -861,6 +862,54 @@ TEST_CASE("instruction_routes: POST yaml save create+update round-trip audits su
     REQUIRE(mismatch);
     CHECK(mismatch->body.find("does not match") != std::string::npos);
     CHECK(h.audits.size() == 2); // unchanged -- the mismatch guard never audits
+}
+
+TEST_CASE("instruction_routes: a JSON PUT and a YAML editor save keep the stored "
+          "parameter_schema, even a legacy one the write gate would refuse",
+          "[pg][server][routes][instruction_routes][param-schema]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, route_instr_tpl);
+    PgWired w{db.dsn()};
+    Harness h;
+    h.store = &w.store;
+    h.wire();
+
+    const std::string yaml =
+        "---\napiVersion: yuzu.io/v1alpha1\nkind: InstructionDefinition\nmetadata:\n  "
+        "id: test.route.schema.keep\n  displayName: Schema Keep\nspec:\n  plugin: "
+        "os_info\n  action: os_name\n  type: question\n  parameters:\n    type: object\n";
+    auto create = h.sink.Post("/api/instructions/yaml", "yaml_source=" + url_encode_form(yaml),
+                              "application/x-www-form-urlencoded");
+    REQUIRE(create);
+    const std::string id = "test.route.schema.keep";
+    auto stored = [&] { return (*w.store.get_definition(id))->parameter_schema; };
+
+    const std::string schema = R"({"type":"object","properties":{"p":{"type":"string"}}})";
+    yuzu::server::test::force_parameter_schema(w.pool, id, schema);
+    auto put = h.sink.Put("/api/instructions/" + id, json{{"description", "via put"}}.dump());
+    REQUIRE(put);
+    CHECK(put->status == 200);
+    CHECK((*w.store.get_definition(id))->description == "via put");
+    CHECK(stored() == schema);
+
+    auto edit = h.sink.Post("/api/instructions/yaml",
+                            "id=" + id + "&yaml_source=" + url_encode_form(yaml),
+                            "application/x-www-form-urlencoded");
+    REQUIRE(edit);
+    CHECK(edit->body.find("Definition updated") != std::string::npos);
+    CHECK(stored() == schema);
+
+    // A legacy row past the 256 KiB cap is still editable through both routes.
+    const std::string legacy(262144 + 1, ' ');
+    yuzu::server::test::force_parameter_schema(w.pool, id, legacy);
+    auto put2 = h.sink.Put("/api/instructions/" + id, json{{"description", "legacy put"}}.dump());
+    REQUIRE(put2);
+    CHECK(put2->status == 200);
+    auto edit2 = h.sink.Post("/api/instructions/yaml",
+                             "id=" + id + "&yaml_source=" + url_encode_form(yaml),
+                             "application/x-www-form-urlencoded");
+    REQUIRE(edit2);
+    CHECK(edit2->body.find("Definition updated") != std::string::npos);
+    CHECK(stored() == legacy);
 }
 
 TEST_CASE("instruction_routes: POST validate-yaml against a real store still needs no "

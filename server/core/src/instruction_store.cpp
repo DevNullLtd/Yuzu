@@ -1,5 +1,6 @@
 #include "instruction_store.hpp"
 #include "instruction_definition_model.hpp" // #4029: export_definition_json delegates to the shared builder
+#include "instruction_param_schema.hpp" // prepare_param_validator: the write-time schema gate
 #include "instruction_yaml.hpp"
 #include "mcp_jsonrpc.hpp" // mcp::json_exceeds_depth / kMcpMaxJsonDepth: shared #2437 depth guard
 #include "reserved_definition_id.hpp" // the ONE reserved-namespace rule (#2442)
@@ -272,6 +273,32 @@ void note_write_degrade(yuzu::MetricsRegistry* metrics, const char* reason) {
             .increment();
 }
 
+// The stored parameter_schema write gate (instruction_param_schema.hpp, LIMITS): refuses a
+// schema over the size cap, and one the execute route could only answer with a 500 (it runs
+// the same stateless prepare_param_validator). Empty / whitespace / `{}` means "no schema"
+// and passes. The message carries at most the first three prepare errors, which name only
+// charset-validated property names and fixed phrases, never a schema value.
+std::optional<std::string> validate_parameter_schema_write(const std::string& parameter_schema) {
+    if (parameter_schema.size() > instr::kMaxParameterSchemaBytes)
+        return std::format("parameter_schema is larger than the {}-byte limit",
+                           instr::kMaxParameterSchemaBytes);
+    try {
+        auto prepared = instr::prepare_param_validator(parameter_schema);
+        if (prepared)
+            return std::nullopt;
+        constexpr std::size_t kShown = 3;
+        std::string msg = "parameter_schema is not a valid parameter schema";
+        const auto& errs = prepared.error();
+        for (std::size_t i = 0; i < errs.size() && i < kShown; ++i)
+            msg += (i == 0 ? ": " : "; ") + errs[i];
+        if (errs.size() > kShown)
+            msg += std::format("; and {} more", errs.size() - kShown);
+        return msg;
+    } catch (...) {
+        return std::string("parameter_schema could not be checked");
+    }
+}
+
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -469,6 +496,9 @@ InstructionStore::validate_and_prepare(InstructionDefinition& def) const {
 
     if (auto err = validate_definition_scope(def.yaml_source))
         return std::unexpected(*err);
+    // Covers create_definition and both JSON imports (signed and trusted).
+    if (auto err = validate_parameter_schema_write(def.parameter_schema))
+        return std::unexpected(*err);
 
     // Explicit ids are operator-controlled (JSON create #402, YAML Save honouring metadata.id,
     // product-pack install). Bound them to a safe charset before they reach HTML fragments,
@@ -637,6 +667,16 @@ std::expected<void, std::string> InstructionStore::update_definition(const Instr
     // be a bypass for the fromResultSet rules.
     if (auto err = validate_definition_scope(def.yaml_source))
         return std::unexpected(*err);
+    // An empty schema keeps the stored column (below), so only a supplied one is checked,
+    // and only when it differs from the stored text: a legacy row that predates the write
+    // gate stays editable.
+    if (!def.parameter_schema.empty()) {
+        if (auto err = validate_parameter_schema_write(def.parameter_schema)) {
+            auto stored = get_definition(def.id);
+            if (!(stored && *stored && (*stored)->parameter_schema == def.parameter_schema))
+                return std::unexpected(*err);
+        }
+    }
 
     // #1398: mirror validate_and_prepare's approval_mode check — this function
     // does not call validate_and_prepare (unlike create_definition), and one
@@ -652,12 +692,18 @@ std::expected<void, std::string> InstructionStore::update_definition(const Instr
             name=$1, version=$2, type=$3, plugin=$4, action=$5, description=$6,
             enabled=$7::boolean, instruction_set_id=$8, gather_ttl_seconds=$9::int,
             response_ttl_days=$10::int, updated_at=$11::bigint,
-            yaml_source=$12, parameter_schema=$13, result_schema=$14, approval_mode=$15,
+            yaml_source=$12,
+            parameter_schema=CASE WHEN $13::text = '' THEN parameter_schema ELSE $13::text END,
+            result_schema=$14, approval_mode=$15,
             concurrency_mode=$16, platforms=$17, min_agent_version=$18, required_plugins=$19,
             readable_payload=$20, visualization_spec=$21, response_templates_spec=$22
         WHERE id=$23 RETURNING id
     )";
-    const std::string ps = def.parameter_schema.empty() ? "{}" : def.parameter_schema;
+    // An EMPTY def.parameter_schema means "keep the stored column" (the SQL above): the YAML
+    // editor builds its definition from YAML, which carries no parameters, so writing '{}'
+    // would wipe a stored schema. Any non-empty value, including `{}`, is written.
+    // Contrast insert_definition_row, where empty means '{}'.
+    const std::string& ps = def.parameter_schema;
     const std::string rs = def.result_schema.empty() ? "{}" : def.result_schema;
     const std::string am = def.approval_mode.empty() ? "auto" : def.approval_mode;
     const std::string cm = def.concurrency_mode.empty() ? "per-device" : def.concurrency_mode;
