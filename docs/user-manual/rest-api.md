@@ -6834,7 +6834,7 @@ Installs per version for one title: distinct devices per version, most-installed
           "count": 2, "truncated": false}, "meta": {"api_version": "v1"}}
 ```
 
-`newest` marks the title's fleet-wide newest version; `truncated` is `true` when the limit was reached. Every call is audited as `inventory.software.versions`. Errors: `400` (missing `name`, repeated parameter), `401`, `403`, `503` (`retry_after_ms: 5000`, never an empty `200`).
+`newest` marks the title's fleet-wide newest version; `truncated` is `true` when the limit was reached. Every call that serves a page is audited as `inventory.software.versions` (`success`); an out-of-scope per-device read writes a `denied` row only, and a `400` or a gate refusal writes none. Errors: `400` (missing `name`, repeated parameter, an over-long value, invalid UTF-8 or a NUL byte), `401`, `403`, `503` (`retry_after_ms: 5000`, never an empty `200`).
 
 ---
 
