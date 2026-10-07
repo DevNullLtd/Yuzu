@@ -193,6 +193,9 @@ function buildReview() {
   if (chk('include-gateway') && tlsMode !== 'plaintext') {
     warnings.push('⛔ Gateway + ' + tlsMode + ' certs can\'t be generated yet (secure gateway wiring is in flight, #1314). Pick Plaintext for the gateway, or disable the gateway for a TLS server-only stack.');
   }
+  if (chk('include-gateway') && tlsMode === 'plaintext') {
+    warnings.push('⚠️ Plaintext gateway: the server sets YUZU_INSECURE_GATEWAY_PEER=1, which acknowledges that gateway peer authorization is disabled. Not for production.');
+  }
   const warnEl = document.getElementById('port-warnings');
   if (warnings.length) {
     warnEl.innerHTML = warnings.join('<br>');

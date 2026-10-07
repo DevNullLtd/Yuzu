@@ -47,7 +47,7 @@ async function generate() {
   // forwarding (server dials the mgmt port plaintext). Until that ships, the gateway
   // is only generated for Plaintext mode. (Tracked: re-enable once #1314 lands.)
   if (gateway && tlsMode !== 'plaintext') {
-    alert('Gateway + TLS is not generated yet: the secure gateway↔server wiring depends on server features still in flight (PKI go-live, #1314) that no current image ships, so the stack would not boot. Either pick Plaintext for the gateway, or disable the gateway and use Default/Operator certs for a server-only stack. For a secure gateway today, follow deploy/docker/docker-compose.reference.yml + gateway/config/sys.config.prod.');
+    alert('Gateway + TLS is not generated yet: the secure gateway↔server wiring depends on server features still in flight (PKI go-live, #1314) that no current image ships, so the stack would not boot. Either pick Plaintext for the gateway, or disable the gateway and use Default/Operator certs for a server-only stack. The Plaintext gateway stack sets YUZU_INSECURE_GATEWAY_PEER=1 on the server, which disables gateway peer authorization (not for production). For a secure gateway today, follow deploy/docker/docker-compose.reference-gateway.yml + gateway/config/sys.config.prod.');
     return;
   }
 
@@ -190,6 +190,8 @@ ${c.gateway ? `
 YUZU_GW_AGENT_PORT=${c.gwAgentPort}
 YUZU_GW_HEALTH_PORT=${c.gwHealthPort}
 YUZU_GW_METRICS_PORT=${c.gwMetricsPort}
+# This stack's server sets YUZU_INSECURE_GATEWAY_PEER=1 (plaintext gateway; gateway
+# peer authorization is disabled). Not for production. See docker-compose.yml.
 # Erlang distribution cookie — the gateway fail-closes on the insecure default.
 # Generated unique per stack; keep it out of git. Rotate with: openssl rand -hex 32
 # (Single ephemeral node? You may instead set YUZU_GW_ALLOW_DEFAULT_COOKIE=1.)
@@ -497,6 +499,19 @@ ${c.tlsMode === 'plaintext'
   y += `    environment:\n`;
   y += `      - YUZU_LOG_LEVEL=info\n`;
   y += `      - YUZU_LOG_FORMAT=json\n`;
+  if (c.gateway && c.tlsMode === 'plaintext') {
+    // The gateway stack is plaintext-only (see the C1/N2 guard in generate()), and
+    // the server refuses to start a plaintext gateway-upstream service unless the
+    // acknowledgement is set. It is an ENVIRONMENT variable, not the
+    // --insecure-gateway-peer flag, because the Version field accepts older image
+    // tags: an older image ignores an unknown environment variable but exits on an
+    // unknown flag. The environment value is bool-parsed on images that know it.
+    y += `      # Plaintext gateway stack: this acknowledges that gateway peer\n`;
+    y += `      # authorization is DISABLED on the gateway-upstream service (:${c.gwUpstreamPort}).\n`;
+    y += `      # Not for production: use TLS + a gateway key pin instead\n`;
+    y += `      # (deploy/docker/docker-compose.reference-gateway.yml).\n`;
+    y += `      - YUZU_INSECURE_GATEWAY_PEER=1\n`;
+  }
   // Postgres substrate DSN (ADR-0006/0008). Consumed via env var, NOT a CLI
   // flag — the server reads YUZU_POSTGRES_DSN from the environment. The DSN
   // carries the APP role password (interpolated from .env), never the

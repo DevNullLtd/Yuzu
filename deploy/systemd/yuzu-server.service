@@ -49,6 +49,32 @@ EnvironmentFile=-/etc/yuzu/yuzu-server.env
 # by older releases are only probed at startup to warn, never read.
 # /var/lib/yuzu matches StateDirectory, WorkingDirectory, and the
 # ReadWritePaths grant below.
+#
+# --gateway-upstream enables the gateway-upstream service. This unit runs with
+# gRPC TLS on (no --no-tls), so :50055 is a strict mutual-TLS listener, and the
+# server requires an AUTHORIZED gateway peer (an SPKI public-key pin) before it
+# starts that service:
+#   - Generated default certificates (no --cert/--key, as shipped): the server
+#     pins its own generated default-gateway.pem automatically. Nothing to set.
+#   - Operator certificates (--cert/--key added, together with --ca-cert): there
+#     is no automatic pin, and the server REFUSES TO START until one is given:
+#     --gateway-peer-pin <64-hex SPKI SHA-256> or --gateway-peer-pin-file <path>
+#     (repeatable), or YUZU_GATEWAY_PEER_PINS / YUZU_GATEWAY_PEER_PIN_FILE in
+#     /etc/yuzu/yuzu-server.env. If you run no gateway, remove the
+#     --gateway-upstream line instead. A package upgrade overwrites this unit
+#     file, so make that change in a drop-in (`systemctl edit yuzu-server`) that
+#     first clears the inherited command with an empty `ExecStart=` line and then
+#     gives the full command line without --gateway-upstream.
+#   - Pin files must be readable by the `yuzu` user. ProtectHome=true and
+#     PrivateTmp=true hide /home and /tmp from the service, so keep them under
+#     /etc/yuzu.
+# --insecure-gateway-peer is deliberately NOT set here: it disables peer
+# authorization, and this unit is not a plaintext deployment.
+# The yuzu-gateway package's release config (built from gateway/config/sys.config)
+# dials :50055 in PLAINTEXT, which this TLS listener does not accept, so as
+# installed the gateway does not connect to this unit. It needs the TLS upstream
+# channel from gateway/config/sys.config.prod, with certificate files that the
+# yuzu-gw user can read.
 ExecStart=/usr/local/bin/yuzu-server \
     --listen 0.0.0.0:50051 \
     --gateway-upstream 0.0.0.0:50055 \

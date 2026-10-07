@@ -372,7 +372,7 @@
           in flight (PKI go-live, #1314) — the wizard would otherwise emit a stack that
           can't boot. With the gateway enabled you must pick <em>Plaintext</em> on the
           Core step (and keep <code>:50051</code> off the public internet). For a secure
-          gateway today, follow <code>deploy/docker/docker-compose.reference.yml</code> +
+          gateway today, follow <code>deploy/docker/docker-compose.reference-gateway.yml</code> +
           <code>gateway/config/sys.config.prod</code>.
         </div>
 
@@ -380,6 +380,9 @@
           <label>
             <input type="checkbox" id="include-gateway"> Include Yuzu Gateway
           </label>
+          <small>The generated plaintext gateway stack sets
+            <code>YUZU_INSECURE_GATEWAY_PEER=1</code> on the server, which acknowledges
+            that gateway peer authorization is disabled. Not for production.</small>
         </div>
 
         <fieldset id="gateway-fields">
