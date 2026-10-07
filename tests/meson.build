@@ -3068,6 +3068,15 @@ if _bash_test.found()
       suite: 'docs',
       timeout: 60,
     )
+    # The yuzu-server package upgrade pre-flight (RPM %pre / deb preinst): runs the
+    # real scriptlet text against synthetic /etc trees under YUZU_PKG_ROOT. No built
+    # binary, no Postgres, no root, no rpm/dpkg tooling.
+    test('server package upgrade gateway-peer warning',
+      _bash_test,
+      args: [files('shell/test_server_package_upgrade_warning.sh')],
+      suite: 'docs',
+      timeout: 60,
+    )
     # #5333: start-UAT.sh kill_stale signals only PIDs it recorded and refuses on
     # foreign port holders. Sources the script with kill/ps/pgrep/lsof/docker
     # replaced by functions; spawns and signals nothing. The decoy command line
