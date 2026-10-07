@@ -838,7 +838,7 @@ std::vector<std::string> GuardianSparkRuntime::invariant_violations_for_test(
     // #4472 tripwire: compensation_finished=true is written in the SAME critical section as
     // the pop (or the dispatch -> Queued double-fault hand-back), so a claim that ever owed a
     // compensation (deadline set) and now reads finished must not still be a Dispatched /
-    // Dispatching head. See is_wedge_k_eligible_locked's invariant comment.
+    // Dispatching head. See wedge_episode_locked's invariant comment.
     //
     // Which writer legs the tripwire test drives: the normal finalize pop, finalize's catch
     // when the claim already carries an outcome (the pop), and the direct-disarm fallback.
@@ -1434,14 +1434,19 @@ void GuardianSparkRuntime::on_arm_complete(const std::string& key,
             // #4472: the compensation-owed marker is written in THIS critical section, on
             // every exit (normal, or an exception unwinding past staging), never in a later
             // acquisition. Between the two a heartbeat drain could read this claim as a
-            // K-eligible wedge with its compensating disarm already owed, and a K-waiver then
-            // acknowledges the generation and discards the server's re-push, the only owner
-            // left to re-arm the rule once the disarm pops the claim. Declared before the
-            // fallible gap_hook copy and every other fallible step below, so it covers all of
-            // them; non-throwing and non-allocating (a claim field write and a clock read),
-            // and destructed before `lk` releases. Reads `compensating` at scope exit: an
-            // adoption reset it, so an adopted claim is never marked, and a later fault with
-            // `compensating` already reset falls to the !published path that sets finished.
+            // still-hung wedge (Eligible) with its compensating disarm already owed, rather
+            // than CompensationPending. Under #5459 decide_retry() and can_advance() treat
+            // the two identically (both outstanding, neither ever acknowledges), so the mark
+            // no longer protects a suppression or acknowledgment decision. It keeps the
+            // Eligible/CompensationPending classification and the readers of
+            // !compensation_finished accurate (the compensation pending-age and deadline
+            // observation, the expiry sweep's "teardown still outstanding" break). Declared
+            // before the fallible gap_hook copy and every other fallible step below, so it
+            // covers all of them; non-throwing and non-allocating (a claim field write and a
+            // clock read), and destructed before `lk` releases. Reads `compensating` at scope
+            // exit: an adoption reset it, so an adopted claim is never marked, and a later
+            // fault with `compensating` already reset falls to the !published path that sets
+            // finished.
             struct CompensationOwedMark {
                 const std::optional<std::uint64_t>& compensating;
                 KeyClaim& claim;
@@ -1867,7 +1872,7 @@ void GuardianSparkRuntime::on_arm_complete(const std::string& key,
         // up-3/up-4 (#4221), #4472: `claim`'s compensation was marked owed (not-yet-
         // finished, with its ONE absolute observation deadline) by CompensationOwedMark
         // in the first critical section above, so no heartbeat drain can read this claim
-        // as a K-eligible wedge between the staging decision and here, and
+        // as an Eligible (hung) wedge between the staging decision and here, and
         // expire_overdue_claims()'s terminal-recovery pass never reaps a head whose
         // compensation is still outstanding. There is deliberately no second marking site.
         const std::uint64_t sub = *compensating;
@@ -2304,42 +2309,46 @@ std::optional<bool> GuardianSparkRuntime::rule_active_for_test(const std::string
     return rit->second->active;
 }
 
-bool GuardianSparkRuntime::is_wedge_k_eligible_locked(
+GuardianSparkRuntime::WedgeEpisode GuardianSparkRuntime::wedge_episode_locked(
     const std::shared_ptr<KeyClaim>& claim) const noexcept {
     if (claim->end != ClaimEnd::WaiterTimedOutDispatched || claim->dispatch != ClaimDispatch::Dispatched)
-        return false;
-    // #4472: K's premise is "the arm is physically stuck". A claim whose late result has
-    // already returned and is in compensating teardown is not that: waiving it
-    // acknowledges the generation, the server stops re-pushing, and the teardown then pops
-    // the claim with no replacement arm, so nothing is left to re-arm the rule. The marker
-    // is compensation_finished, written in on_arm_complete's first critical section; NOT the
-    // CompensationPermit, which is engaged for every in-flight arm (a genuinely hung arm
-    // included) and would disable K for all of them.
+        return WedgeEpisode::NotOutstanding;
+    const auto eit = claims_.find(claim->key);
+    if (eit == claims_.end() || eit->second.fifo.empty() || eit->second.fifo.front() != claim)
+        return WedgeEpisode::NotOutstanding;
+    // #4472: whether the arm is physically stuck (Eligible) or its late result has
+    // returned and a compensating disarm is outstanding (CompensationPending) is told
+    // apart by compensation_finished, written in on_arm_complete's first critical
+    // section; NOT the CompensationPermit, which is engaged for every in-flight arm (a
+    // genuinely hung one included). #5459 (option D): both are OUTSTANDING (the generation
+    // stays held and an identical retry is suppressed), and neither is ever acknowledged -
+    // the former waiver that acknowledged the Eligible case is deleted.
     // INVARIANT (#4472): once a compensation was owed, compensation_finished=true is
     // always written in the SAME registry_mu_ critical section as the pop of that claim (or the
     // dispatch -> Queued double-fault hand-back in finalize_arm_compensation's catch), never
     // alone. So a claim that reads finished here with its teardown behind it is already gone
-    // from the head or no longer Dispatched, and this predicate cannot read "K-eligible" for
-    // a compensated claim. A future writer of compensation_finished=true that is not paired
-    // with the pop breaks that, and with it the ack-ledger waiver path's safety (the
-    // RecoveryStatus::Blocking handling in guardian_arm_ack.cpp depends on it too). Tripwire:
-    // invariant_violations_for_test's compensation clause and the "#4472 tripwire" test.
-    if (!claim->compensation_finished)
-        return false;
-    const auto eit = claims_.find(claim->key);
-    return eit != claims_.end() && !eit->second.fifo.empty() && eit->second.fifo.front() == claim;
+    // from the head or no longer Dispatched, and this cannot read Eligible for a compensated
+    // claim, nor CompensationPending for a claim whose teardown has finished. A future writer
+    // of compensation_finished=true that is not paired with the pop breaks that, and with it
+    // the ack ledger's retry suppression (it would hold a Suppress on a finished claim until
+    // the safety valve). Tripwire: invariant_violations_for_test's compensation clause and
+    // the "#4472 tripwire" test.
+    return claim->compensation_finished ? WedgeEpisode::Eligible : WedgeEpisode::CompensationPending;
 }
 
 GuardianSparkRuntime::WedgeAwareStatus
 GuardianSparkRuntime::receipt_status_wedge_aware(const ArmReceipt& receipt) const {
     if (!receipt.claim)
-        return WedgeAwareStatus{}; // Failed, wedge_eligible=false - nothing to observe
+        return WedgeAwareStatus{}; // Failed, flags false - nothing to observe
     std::lock_guard<std::mutex> lk{registry_mu_};
     const auto& claim = receipt.claim;
     WedgeAwareStatus out;
     out.status = classify_claim_end(claim->end);
-    if (out.status == ReceiptStatus::Wedged)
-        out.wedge_eligible = is_wedge_k_eligible_locked(claim);
+    if (out.status == ReceiptStatus::Wedged) {
+        const auto episode = wedge_episode_locked(claim);
+        out.wedge_eligible = episode == WedgeEpisode::Eligible;
+        out.compensation_pending = episode == WedgeEpisode::CompensationPending;
+    }
     return out;
 }
 
@@ -2354,7 +2363,7 @@ bool GuardianSparkRuntime::receipt_wedge_k_eligible(const ArmReceipt& receipt) c
     if (!receipt.claim)
         return false;
     std::lock_guard<std::mutex> lk{registry_mu_};
-    return is_wedge_k_eligible_locked(receipt.claim);
+    return wedge_episode_locked(receipt.claim) == WedgeEpisode::Eligible;
 }
 
 GuardianSparkRuntime::RecoveryStatus
@@ -2363,11 +2372,18 @@ GuardianSparkRuntime::receipt_recovery_status(const ArmReceipt& receipt) const {
         return RecoveryStatus::Blocking;
     std::lock_guard<std::mutex> lk{registry_mu_};
     const auto& claim = receipt.claim;
-    // Both predicates observe the same instant under this one lock.
+    // Every predicate observes the same instant under this one lock. Recovered keeps
+    // first priority (an adopted claim is never an outstanding wedge).
     if (generation_committed_locked(*claim))
         return RecoveryStatus::Recovered;
-    if (is_wedge_k_eligible_locked(claim))
+    switch (wedge_episode_locked(claim)) {
+    case WedgeEpisode::Eligible:
         return RecoveryStatus::WedgeEligible;
+    case WedgeEpisode::CompensationPending:
+        return RecoveryStatus::CompensationPending;
+    case WedgeEpisode::NotOutstanding:
+        break;
+    }
     return RecoveryStatus::Blocking;
 }
 

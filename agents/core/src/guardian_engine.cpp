@@ -1357,7 +1357,12 @@ GuardianEngine::apply_rules(const gpb::GuaranteedStatePush& push) {
 
     // rung 9c PR-2 Unit 6 (§R5.3 duplicate-retry suppression): the server's 25s
     // full_sync heartbeat retry re-sends an identical push while episodes from the
-    // PRIOR call are still genuinely pending - without this, every such retry would
+    // PRIOR call are still genuinely pending, or are OUTSTANDING WEDGES (a hung arm,
+    // or one whose late result has returned and whose compensating teardown is still
+    // running; #5459 option D - the generation is held, never acknowledged, so this
+    // re-push keeps arriving, and suppressing it is what keeps a held endpoint from
+    // paying a full teardown + re-arm every 25s; bounded by decide_retry()'s safety
+    // valve) - without this, every such retry would
     // re-run the full teardown+re-arm below, withdrawing and re-dispatching a claim
     // that was already correctly in flight (a spurious detach_all() per retry; an
     // arm slower than the retry interval would never converge). content_id is
@@ -1688,10 +1693,18 @@ GuardianEngine::apply_rules(const gpb::GuaranteedStatePush& push) {
     // alongside it): a failed or throwing persist leaves policy_generation_ at its
     // prior value, so the same condition is still true on a repeat push, retrying
     // naturally - "naturally" depends on decide_retry() above never Suppressing a
-    // repeat push while nothing is genuinely pending (governance finding
-    // sec-1/arch-1, fixed in GuardianArmAckLedger::decide_retry() this same round:
-    // an empty `pending` map used to reach a vacuous Suppress and this gate was
-    // never reached again at all on a repeat push). NOTE the asymmetry with
+    // repeat push while nothing is genuinely in flight: nothing pending AND no
+    // outstanding wedge (governance finding sec-1/arch-1, fixed in
+    // GuardianArmAckLedger::decide_retry(): an empty `pending` map used to reach a
+    // vacuous Suppress and this gate was never reached again at all on a repeat push).
+    // An empty `pending` is therefore NOT the only Reapply reason any more, and not
+    // always a Reapply either: since #5459 an application whose only unresolved work
+    // is an outstanding wedge (retained in failed_receipts, pending empty) Suppresses.
+    // That cannot starve this gate: such an application never passes can_advance()
+    // (resolved_failed > 0), so there is no persist to retry until the wedge pops, and
+    // a pop WITHOUT recovery turns the next push into a Reapply (a pop WITH recovery, an
+    // adopted late success, is Suppressed only until the next tick's recovery scan clears
+    // resolved_failed, after which can_advance() passes). NOTE the asymmetry with
     // journal_maintenance_tick()'s own retry (Gate 8, sre): that path is gated
     // `if (stopped_ || !prefer_spark_) return;` and therefore does NOT retry at
     // today's production default - a repeat PUSH is the only live recovery lane

@@ -10070,22 +10070,28 @@ TEST_CASE("rung 9c PR-5c (#4221): the Dispatching-window race no longer misclass
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
     CHECK(rt->expire_overdue_claims() == 1); // only r2 - r1 already compensated and popped.
 
-    // rung 9c PR-5e (#4221, K-bound closeout): this is EXACTLY the unsettled window
-    // receipt_wedge_k_eligible() exists to exclude - receipt_status() already reads
-    // Wedged (checked below, unchanged from before this PR), but r2's own `dispatch`
-    // is still Dispatching (this test's own comment above), not yet Dispatched - a
-    // K-waiver predicate relying on receipt_status() alone would treat this as
-    // K-eligible one tick before dispatch_arm_off_lock's own re-lock corrects it.
+    // rung 9c PR-5e (#4221), reframed by #5459 (option D): this is EXACTLY the unsettled
+    // window the outstanding-wedge classification exists to exclude - receipt_status()
+    // already reads Wedged (checked below, unchanged from before this PR), but r2's own
+    // `dispatch` is still Dispatching (this test's own comment above), not yet Dispatched
+    // - a retry-suppression predicate relying on receipt_status() alone would treat this
+    // as an outstanding wedge one tick before dispatch_arm_off_lock's own re-lock
+    // corrects it. Neither flavour (hung = wedge_eligible, compensating =
+    // compensation_pending) may read true here.
     CHECK(rt->receipt_status(res2->receipt) == GuardianSparkRuntime::ReceiptStatus::Wedged);
     CHECK_FALSE(rt->receipt_wedge_k_eligible(res2->receipt));
+    CHECK_FALSE(rt->receipt_status_wedge_aware(res2->receipt).wedge_eligible);
+    CHECK_FALSE(rt->receipt_status_wedge_aware(res2->receipt).compensation_pending);
+    CHECK(rt->receipt_recovery_status(res2->receipt) ==
+          GuardianSparkRuntime::RecoveryStatus::Blocking);
 
     // Adversarial review finding (Kimi K3 + Codex Sol independently converging,
     // mutation-proven): GuardianArmAckLedger::drain_locked()'s own PRIMARY per-pending
-    // loop must ALSO gate on receipt_wedge_k_eligible() before inserting into
-    // failed_receipts - not just the recovery-scan loop that re-validates EXISTING
-    // entries a tick later. Drive a real ledger drain WHILE r2 sits in this exact
-    // unsettled window (receipt_status() already Wedged, receipt_wedge_k_eligible()
-    // still false) - deleting that insertion-site gate leaves every test in this file
+    // loop must ALSO gate on the outstanding-wedge classification (wedge_eligible ||
+    // compensation_pending) before inserting into failed_receipts - not just the
+    // recovery-scan loop that re-validates EXISTING entries a tick later. Drive a real
+    // ledger drain WHILE r2 sits in this exact unsettled window (receipt_status()
+    // already Wedged, neither flag true yet) - deleting that insertion-site gate leaves every test in this file
     // and in test_guardian_arm_ack.cpp green (proven by mutation during review), since
     // none of them reach this specific window through a real ledger drain. This is
     // that missing regression test.
@@ -10093,7 +10099,7 @@ TEST_CASE("rung 9c PR-5c (#4221): the Dispatching-window race no longer misclass
         GuardianArmAckLedger ledger;
         ledger.begin_application(1, std::string(64, 'r'), false, 1);
         ledger.add_pending("r2", res2->receipt);
-        CHECK(ledger.drain_locked(*rt, 10) == 1); // resolved (Wedged), but NOT K-eligible yet
+        CHECK(ledger.drain_locked(*rt, 10) == 1); // resolved (Wedged), but NOT an outstanding wedge yet
         CHECK(ledger.failed_receipt_count_for_test() == 0); // must NOT be inserted while unsettled
         const auto s = ledger.arm_stats();
         REQUIRE(s.has_value());
@@ -10115,15 +10121,16 @@ TEST_CASE("rung 9c PR-5c (#4221): the Dispatching-window race no longer misclass
         std::chrono::seconds(10)));
     rt->set_io_executor_fail_launch_for_test(false);
 
-    // rung 9c PR-5e (#4221, K-bound closeout): post-correction, receipt_status() has
-    // moved to Failed (checked below, unchanged) - receipt_wedge_k_eligible() must
-    // stay false too, for the OPPOSITE reason now: `dispatch` never reaches
+    // rung 9c PR-5e (#4221): post-correction, receipt_status() has
+    // moved to Failed (checked below, unchanged) - receipt_wedge_k_eligible() (and
+    // compensation_pending) must stay false too, for the OPPOSITE reason now: `dispatch` never reaches
     // Dispatched on this synchronous-admission-failure path (dispatch_arm_off_lock()
     // only ever writes Dispatched on a successful submission), so the strict
     // `dispatch == Dispatched` clause excludes it just as it did in the unsettled
     // window above - the two checks together never produce a false-eligible window
     // on either side of the correction.
     CHECK_FALSE(rt->receipt_wedge_k_eligible(res2->receipt));
+    CHECK_FALSE(rt->receipt_status_wedge_aware(res2->receipt).compensation_pending);
 
     // Pre-fix: fail_all_claims_locked()'s guard could not overwrite the stale
     // WaiterTimedOutDispatched already on r2, so this stayed Wedged even though
@@ -14166,12 +14173,15 @@ TEST_CASE("#5403: single-rule serialized retries behind a hung Disarm keep the k
 }
 
 // ---------------------------------------------------------------------------
-// #4472 post-K stranding repro: a hung arm's late success is COMPENSATED (the rule is withdrawn
-// at that instant, by a full_sync teardown), the same rule is re-attached and re-observes the
-// same retained Wedged claim, and the compensating disarm is still inside the backend when the
-// ack ledger drains. This is not the already-sanctioned "completion ownership survives K" case
-// (a late success that ADOPTS after acknowledgment): here the late success is disarmed before
-// acknowledgment, so acknowledgment is the last thing that could ever re-arm the rule.
+// #4472 stranding repro (re-based on #5459 option D): a hung arm's late success is COMPENSATED
+// (the rule is withdrawn at that instant, by a full_sync teardown), the same rule is re-attached
+// and re-observes the same retained Wedged claim, and the compensating disarm is still inside the
+// backend when the ack ledger drains. Under the deleted K-waiver acknowledgment was the last thing
+// that could ever re-arm the rule; under option D there is no waiver, so the generation stays held
+// and the server's retry arrives. What these cases pin is the ledger/runtime classification that
+// makes that cheap and safe: the compensating wedge is retained (CompensationPending), identical
+// retries are Suppressed while the teardown is outstanding, nothing acknowledges, and once the
+// teardown pops the claim the next retry is a Reapply that arms the rule.
 //
 // Level: a real GuardianSparkRuntime plus a real GuardianArmAckLedger, driven by the test thread
 // in the order GuardianEngine::apply_rules does (begin_application, detach_all, attach_rule,
@@ -14179,11 +14189,12 @@ TEST_CASE("#5403: single-rule serialized retries behind a hung Disarm keep the k
 // cannot park the arm's completion between detach_all and the re-attach (both run inside one
 // apply_rules under mtx_ with no seam between them). What is modelled rather than exercised: the
 // engine persists policy_generation iff can_advance() is true on the heartbeat drain, and the
-// server stops its heartbeat reconcile once the agent reports a generation at or above its own.
+// server re-sends its push iff the agent still reports a generation behind its own.
 // ---------------------------------------------------------------------------
 namespace {
 struct PostK4472Rig {
     using RT = GuardianSparkRuntime;
+    using Retry = GuardianArmAckLedger::RetryDecision;
     std::shared_ptr<FakeReader> r = std::make_shared<FakeReader>();
     std::shared_ptr<FakeBackend> b = std::make_shared<FakeBackend>();
     std::shared_ptr<RT> rt;
@@ -14207,8 +14218,13 @@ struct PostK4472Rig {
                                      std::chrono::seconds(10));
     }
 
+    /// What the ledger answers for the identical push the server would re-send (generation 1,
+    /// the rig's digest, full_sync). Mutates the ledger's suppression budget on a wedge Suppress,
+    /// exactly like the production call.
+    [[nodiscard]] Retry retry() { return ledger.decide_retry(1, digest, /*full_sync=*/true, *rt); }
+
     /// One full_sync application as apply_rules builds it for a single rule: a new identical
-    /// application (reapply_count rises), the teardown, the re-attach.
+    /// application, the teardown, the re-attach.
     /// Strict: this re-attach re-observes a retained Wedged claim (the key is NOT free), so it
     /// can only ever be Accepted; anything else is a regression the caller must see.
     RT::ArmReceipt reapply_attach() {
@@ -14235,8 +14251,9 @@ struct PostK4472Rig {
         return out.receipt;
     }
     /// The first application: the arm hangs inside the backend, passes its (synthetic)
-    /// deadline, and the claim is a retained Wedged head that the ledger records as the sole,
-    /// K-eligible failure.
+    /// deadline, and the claim is a retained Wedged head that the ledger records as the sole
+    /// outstanding-wedge failure. The generation is held (#5459: no waiver), and an identical
+    /// retry is Suppressed because that wedge is outstanding.
     void establish_wedge() {
         b->hang_next_arm.store(true);
         ledger.begin_application(1, digest, /*full_sync=*/true, 1);
@@ -14255,26 +14272,14 @@ struct PostK4472Rig {
         ledger.add_pending("r1", wedge_receipt);
         REQUIRE(ledger.drain_locked(*rt, 10) == 1);
         REQUIRE(ledger.failed_receipt_count_for_test() == 1);
-        REQUIRE_FALSE(ledger.can_advance()); // reapply_count 0
+        REQUIRE_FALSE(ledger.can_advance());
     }
-    /// Re-applies 1 and 2: each re-observes the same retained claim (nothing new is armed).
-    void reapply_twice_while_wedged() {
-        for (std::size_t i = 1; i <= 2; ++i) {
-            const auto rc = reapply_attach();
-            REQUIRE(ledger.reapply_count_for_test() == i);
-            ledger.add_pending("r1", rc);
-            REQUIRE(ledger.drain_locked(*rt, 10) == 1);
-            REQUIRE(ledger.failed_receipt_count_for_test() == 1);
-            REQUIRE_FALSE(ledger.can_advance());
-        }
-    }
-    /// Re-apply 3, up to and including the re-attach: reapply_count reaches the waiver
-    /// threshold; the late success lands after detach_all (rg->active is false, so it is not
-    /// adopted) and its compensating disarm parks inside the backend; the re-attach then
+    /// A further application (a forced Reapply: the safety valve, or changed content) up to and
+    /// including the re-attach: the late success lands after detach_all (rg->active is false, so
+    /// it is not adopted) and its compensating disarm parks inside the backend; the re-attach then
     /// re-observes the same claim.
-    RT::ArmReceipt third_reapply_with_compensation_outstanding() {
+    RT::ArmReceipt reapply_with_compensation_outstanding() {
         ledger.begin_application(1, digest, /*full_sync=*/true, 1);
-        REQUIRE(ledger.reapply_count_for_test() == kReapplyWaiverThreshold);
         rt->detach_all();
         b->hang_next_disarm.store(true);
         b->release_hang(); // the hung arm returns its subscription now
@@ -14295,9 +14300,9 @@ struct PostK4472Rig {
                 ++n;
         return n;
     }
-    /// The server's heartbeat reconcile re-sends the identical push iff the agent still
-    /// reports a generation behind its own (server.cpp), i.e. iff the ledger did not advance.
-    /// A further identical application: same teardown, same re-attach, now against a free key.
+    /// The server's reconcile re-sends the identical push iff the agent still reports a
+    /// generation behind its own (server.cpp), i.e. iff the ledger did not advance. A further
+    /// identical application: same teardown, same re-attach, now against a free key.
     /// The fresh arm may already be committed when attach_rule resumes (completion can precede
     /// its resumption), in which case the outcome is Armed and, exactly as in
     /// GuardianEngine::reconcile_rule_locked, there is no receipt to register with the ledger.
@@ -14309,18 +14314,16 @@ struct PostK4472Rig {
 };
 } // namespace
 
-TEST_CASE("#4472: a compensating disarm still outstanding at the drain must not K-waive the "
-          "generation, and the rule must end armed",
-          "[spark][runtime][liveness][4472]") {
+TEST_CASE("#4472: a compensating disarm still outstanding at the drain is retained, never "
+          "acknowledged, its retries are suppressed, and the rule ends armed once it pops",
+          "[spark][runtime][liveness][4472][5459]") {
     PostK4472Rig f;
     f.establish_wedge();
-    f.reapply_twice_while_wedged();
-    const auto rc = f.third_reapply_with_compensation_outstanding();
+    CHECK(f.retry() == PostK4472Rig::Retry::Suppress); // the plain hung wedge: held, retry suppressed
+    const auto rc = f.reapply_with_compensation_outstanding();
 
-    // Precondition that makes the next assertion meaningful: the receipt still reads Wedged, one
+    // Precondition that makes the next assertions meaningful: the receipt still reads Wedged, one
     // claim is still queued on the key, and its compensating disarm is parked inside the backend.
-    // (Whether receipt_wedge_k_eligible() is true here is the property under test, not a
-    // precondition: a fix may legitimately make it false while the compensation is outstanding.)
     REQUIRE(f.rt->receipt_status(rc) == PostK4472Rig::RT::ReceiptStatus::Wedged);
     REQUIRE(f.rt->claim_queue_depth_for_test(f.key) == 1);
     REQUIRE(f.b->disarm_entries.load() == 1);
@@ -14328,10 +14331,21 @@ TEST_CASE("#4472: a compensating disarm still outstanding at the drain must not 
     f.ledger.add_pending("r1", rc);
     REQUIRE(f.ledger.drain_locked(*f.rt, 10) == 1);
 
-    // (a) The heartbeat drain's acknowledgment decision. can_advance() true here means the engine
-    // persists policy_generation and the server stops re-sending.
-    const bool acknowledged = f.ledger.can_advance();
-    CHECK_FALSE(acknowledged);
+    // The classification: not a hung arm (nothing acknowledges it either way), a compensating
+    // wedge the ledger RETAINS so the held retry stays suppressed.
+    CHECK_FALSE(f.rt->receipt_wedge_k_eligible(rc));
+    CHECK(f.rt->receipt_recovery_status(rc) == PostK4472Rig::RT::RecoveryStatus::CompensationPending);
+    CHECK(f.ledger.failed_receipt_count_for_test() == 1);
+
+    // (a) The acknowledgment decision: false. can_advance() true here would make the engine persist
+    // policy_generation, and the server would stop re-sending.
+    CHECK_FALSE(f.ledger.can_advance());
+    // (b) Held pushes while the teardown is outstanding cost nothing: Suppress, repeatedly.
+    CHECK(f.retry() == PostK4472Rig::Retry::Suppress);
+    CHECK(f.retry() == PostK4472Rig::Retry::Suppress);
+    CHECK_FALSE(f.ledger.can_advance()); // suppression never acknowledges
+    CHECK(f.b->disarm_entries.load() == 1); // and nothing was torn down or re-armed meanwhile
+    CHECK(f.b->arm_entries.load() == 1);
 
     // The compensating disarm completes; finalize_arm_compensation pops the claim.
     f.b->release_disarm_hang();
@@ -14339,31 +14353,36 @@ TEST_CASE("#4472: a compensating disarm still outstanding at the drain must not 
                                    std::chrono::seconds(10)));
     REQUIRE(f.b->disarm_entries.load() == 1);
 
-    // (b) With an acknowledged generation nothing re-sends the rule; with a held one the server's
-    // retry arrives. Either way the rule must end armed, on the backend, not only on a receipt.
-    if (!acknowledged) {
-        // The heal arrives through ONE fresh arm after the pop, not through a leaked second
-        // dispatch while the compensation was outstanding: the delta across the modelled
-        // retry is exactly 1, and the whole run entered the backend arm twice.
-        const int arm_base = f.b->arm_entries.load();
-        f.model_server_retry();
-        REQUIRE(yuzu::test::spin_until([&] { return f.rt->rule_count() == 1; },
-                                       std::chrono::seconds(10)));
-        CHECK(f.b->arm_entries.load() == arm_base + 1);
-        CHECK(f.b->arm_entries.load() == 2);
-    }
+    // The pop ends the outstanding wedge: the very next push is a Reapply, with NO drain in
+    // between (the live read, not the retained map, decides), and again after the drain.
+    CHECK(f.retry() == PostK4472Rig::Retry::Reapply);
+    CHECK_FALSE(f.ledger.can_advance());
+    REQUIRE(f.ledger.drain_locked(*f.rt, 10) == 0);
+    CHECK(f.ledger.failed_receipt_count_for_test() == 0);
+    CHECK(f.retry() == PostK4472Rig::Retry::Reapply);
+    CHECK_FALSE(f.ledger.can_advance());
+
+    // The heal arrives through ONE fresh arm after the pop, not through a leaked second dispatch
+    // while the compensation was outstanding: the delta across the retry is exactly 1, and the
+    // whole run entered the backend arm twice. The rule ends armed, on the backend, not only on a
+    // receipt.
+    const int arm_base = f.b->arm_entries.load();
+    f.model_server_retry();
+    REQUIRE(yuzu::test::spin_until([&] { return f.rt->rule_count() == 1; },
+                                   std::chrono::seconds(10)));
+    CHECK(f.b->arm_entries.load() == arm_base + 1);
+    CHECK(f.b->arm_entries.load() == 2);
     CHECK(f.rt->rule_count() == 1);
     CHECK(f.rt->armed_key_count() == 1);
     CHECK(f.live_subscriptions() == 1);
 }
 
-TEST_CASE("#4472 control: a compensating disarm that finished before the drain is not K-eligible, "
-          "the generation is held, and the retry arms the rule",
-          "[spark][runtime][liveness][4472]") {
+TEST_CASE("#4472 control: a compensating disarm that finished before the drain is no longer an "
+          "outstanding wedge, the generation is held, the retry is a Reapply and arms the rule",
+          "[spark][runtime][liveness][4472][5459]") {
     PostK4472Rig f;
     f.establish_wedge();
-    f.reapply_twice_while_wedged();
-    const auto rc = f.third_reapply_with_compensation_outstanding();
+    const auto rc = f.reapply_with_compensation_outstanding();
 
     // Same sequence, but the compensating disarm completes (and the claim is popped) before the
     // ledger drains.
@@ -14371,13 +14390,14 @@ TEST_CASE("#4472 control: a compensating disarm that finished before the drain i
     REQUIRE(yuzu::test::spin_until([&] { return f.rt->claim_queue_depth_for_test(f.key) == 0; },
                                    std::chrono::seconds(10)));
     CHECK_FALSE(f.rt->receipt_wedge_k_eligible(rc));
+    CHECK_FALSE(f.rt->receipt_status_wedge_aware(rc).compensation_pending);
 
     f.ledger.add_pending("r1", rc);
     REQUIRE(f.ledger.drain_locked(*f.rt, 10) == 1);
-    CHECK(f.ledger.failed_receipt_count_for_test() == 0);
-    const bool acknowledged = f.ledger.can_advance();
-    CHECK_FALSE(acknowledged);
-    REQUIRE_FALSE(acknowledged); // the retry below is only owed (and only modelled) in this case
+    CHECK(f.ledger.failed_receipt_count_for_test() == 0); // popped: not retained
+    CHECK_FALSE(f.ledger.can_advance());
+    // A counted failure with no retained outstanding wedge: the rule must be re-armed.
+    REQUIRE(f.retry() == PostK4472Rig::Retry::Reapply);
 
     f.model_server_retry();
     REQUIRE(yuzu::test::spin_until([&] { return f.rt->rule_count() == 1; },
@@ -14390,9 +14410,11 @@ TEST_CASE("#4472 control: a compensating disarm that finished before the drain i
 // #4472 fix pins. The marker for "a compensating disarm is outstanding" is
 // KeyClaim::compensation_finished, written by on_arm_complete's CompensationOwedMark in the
 // FIRST registry_mu_ critical section (on every exit, including an exception unwinding past
-// staging). is_wedge_k_eligible_locked reads it, so a heartbeat drain can never see the
-// returned-and-being-disarmed claim as a K-eligible wedge. The cases below each park a worker
-// at a different point of that window; none sleeps.
+// staging). wedge_episode_locked reads it, so a heartbeat drain can never see the
+// returned-and-being-disarmed claim as a still-hung (Eligible) wedge: it reads
+// CompensationPending (#5459), which the ledger retains for retry suppression but never
+// acknowledges. The cases below each park a worker at a different point of that window; none
+// sleeps.
 // ---------------------------------------------------------------------------
 
 namespace {
@@ -14405,10 +14427,11 @@ void withdraw_and_return_late_arm(PostK4472Rig& f) {
 } // namespace
 
 TEST_CASE("#4472: a drain parked in the staging-to-continuation gap already sees the compensation "
-          "as owed and the wedge as not K-eligible",
+          "as owed (CompensationPending) and the wedge as not a hung arm",
           "[spark][runtime][liveness][4472]") {
     // Mutation (marking moved back to a second registry_mu_ acquisition after the gap hook):
-    // the worker parks here with the flag still true and receipt_wedge_k_eligible reads TRUE.
+    // the worker parks here with the flag still true and receipt_wedge_k_eligible reads TRUE
+    // (and compensation_pending reads false).
     PostK4472Rig f;
     auto park = std::make_shared<DrainPark>();
     struct Cleanup {
@@ -14417,9 +14440,10 @@ TEST_CASE("#4472: a drain parked in the staging-to-continuation gap already sees
     } cleanup{park.get()};
     f.rt->set_drain_gap_hook_for_test([park] { park->wait(); });
     f.establish_wedge();
-    // Precondition: a genuinely hung arm IS K-eligible, so the assertion below is the fix and
-    // not a K that is disabled altogether.
+    // Precondition: a genuinely hung arm IS an eligible (hung) wedge and not compensation-pending,
+    // so the assertions below are the fix and not a classification that is disabled altogether.
     REQUIRE(f.rt->receipt_wedge_k_eligible(f.wedge_receipt));
+    REQUIRE_FALSE(f.rt->receipt_status_wedge_aware(f.wedge_receipt).compensation_pending);
 
     withdraw_and_return_late_arm(f);
     REQUIRE(yuzu::test::spin_until([&] { return park->entered.load(); }, std::chrono::seconds(10)));
@@ -14428,11 +14452,13 @@ TEST_CASE("#4472: a drain parked in the staging-to-continuation gap already sees
     REQUIRE(f.b->disarm_entries.load() == 0);
 
     CHECK_FALSE(f.rt->receipt_wedge_k_eligible(f.wedge_receipt));
+    // #5459: outstanding (still the Dispatched FIFO front), but a compensating teardown, not a hung arm.
     CHECK(f.rt->receipt_recovery_status(f.wedge_receipt) ==
-          PostK4472Rig::RT::RecoveryStatus::Blocking);
+          PostK4472Rig::RT::RecoveryStatus::CompensationPending);
     CHECK(f.rt->receipt_status_wedge_aware(f.wedge_receipt).status ==
           PostK4472Rig::RT::ReceiptStatus::Wedged);
     CHECK_FALSE(f.rt->receipt_status_wedge_aware(f.wedge_receipt).wedge_eligible);
+    CHECK(f.rt->receipt_status_wedge_aware(f.wedge_receipt).compensation_pending);
     CHECK(f.rt->oldest_outstanding_compensation_age(clk::now()).has_value());
 
     park->release();
@@ -14447,7 +14473,7 @@ TEST_CASE("#4472: an exception unwinding past staging still leaves the compensat
           "owed (the marker is a scope guard, declared before the first fallible step)",
           "[spark][runtime][liveness][4472]") {
     // Mutation (guard declared below fault point 1): the throw unwinds before any guard
-    // exists, the flag stays true, and the parked worker reads K-eligible.
+    // exists, the flag stays true, and the parked worker reads as a hung (eligible) wedge.
     PostK4472Rig f;
     auto park = std::make_shared<DrainPark>();
     struct Cleanup {
@@ -14465,6 +14491,7 @@ TEST_CASE("#4472: an exception unwinding past staging still leaves the compensat
     REQUIRE(f.b->disarm_entries.load() == 0);
 
     CHECK_FALSE(f.rt->receipt_wedge_k_eligible(f.wedge_receipt));
+    CHECK(f.rt->receipt_status_wedge_aware(f.wedge_receipt).compensation_pending);
     const auto age = f.rt->oldest_outstanding_compensation_age(clk::now() + std::chrono::seconds(5));
     REQUIRE(age.has_value());
     CHECK(*age >= std::chrono::seconds(4)); // the deadline was set by the guard, not left unset
@@ -14477,12 +14504,15 @@ TEST_CASE("#4472: an exception unwinding past staging still leaves the compensat
     f.rt->set_drain_gap_hook_for_test({});
 }
 
-TEST_CASE("#4472: a wedge retained in failed_receipts on an earlier drain goes Blocking once its "
-          "compensation starts, with no new application",
-          "[spark][runtime][liveness][4472]") {
-    // The recovery-scan path (receipt_recovery_status) shares the predicate; the supplied repro
-    // only exercises the fresh-pending path. Mutation (predicate clause dropped): the entry
-    // stays WedgeEligible and failed_receipts keeps it.
+TEST_CASE("#4472: a wedge retained in failed_receipts on an earlier drain becomes CompensationPending "
+          "once its compensation starts, stays retained and suppressed, and settles on the pop",
+          "[spark][runtime][liveness][4472][5459]") {
+    // The recovery-scan path (receipt_recovery_status) shares the classification; the supplied
+    // repro only exercises the fresh-pending path. #5459: the entry used to go Blocking here and
+    // be ERASED from failed_receipts (the ledger lost its only handle on the compensating claim,
+    // so every held push paid a full teardown). Mutation (CompensationPending folded back into
+    // Blocking in the recovery loop): the retained count reads 0 below and the held push is a
+    // Reapply instead of a Suppress.
     PostK4472Rig f;
     f.establish_wedge();
     REQUIRE(f.ledger.failed_receipt_count_for_test() == 1);
@@ -14497,23 +14527,34 @@ TEST_CASE("#4472: a wedge retained in failed_receipts on an earlier drain goes B
     // Drain N+1 WITHOUT begin_application.
     REQUIRE(f.ledger.drain_locked(*f.rt, 10) == 0);
     CHECK(f.rt->receipt_recovery_status(f.wedge_receipt) ==
-          PostK4472Rig::RT::RecoveryStatus::Blocking);
-    CHECK(f.ledger.failed_receipt_count_for_test() == 0);
-    CHECK_FALSE(f.ledger.can_advance());
+          PostK4472Rig::RT::RecoveryStatus::CompensationPending);
+    CHECK(f.ledger.failed_receipt_count_for_test() == 1); // still retained
+    CHECK_FALSE(f.ledger.can_advance());                  // and never acknowledged
+    CHECK(f.retry() == PostK4472Rig::Retry::Suppress);
 
     f.b->release_disarm_hang();
     REQUIRE(yuzu::test::spin_until([&] { return f.rt->claim_queue_depth_for_test(f.key) == 0; },
                                    std::chrono::seconds(10)));
+    // The pop settles the entry to Blocking: the push is a Reapply immediately (live read), and the
+    // next drain drops the entry while resolved_failed stays counted, so the generation stays held.
+    CHECK(f.rt->receipt_recovery_status(f.wedge_receipt) ==
+          PostK4472Rig::RT::RecoveryStatus::Blocking);
+    CHECK(f.retry() == PostK4472Rig::Retry::Reapply);
+    REQUIRE(f.ledger.drain_locked(*f.rt, 10) == 0);
+    CHECK(f.ledger.failed_receipt_count_for_test() == 0);
+    CHECK_FALSE(f.ledger.can_advance());
+    CHECK(f.retry() == PostK4472Rig::Retry::Reapply);
 }
 
-TEST_CASE("#4472: a genuinely hung arm stays K-eligible while its compensation permit is "
-          "engaged (the permit is not the marker)",
+TEST_CASE("#4472: a genuinely hung arm stays an eligible (hung) wedge, not CompensationPending, "
+          "while its compensation permit is engaged (the permit is not the marker)",
           "[spark][runtime][liveness][4472]") {
     // Mutation (predicate reads the permit): the permit is engaged for every in-flight arm, so
-    // K would be disabled for plain Wedged arms too.
+    // every plain hung arm would read CompensationPending (and not eligible).
     PostK4472Rig f;
     f.establish_wedge();
     CHECK(f.rt->receipt_wedge_k_eligible(f.wedge_receipt));
+    CHECK_FALSE(f.rt->receipt_status_wedge_aware(f.wedge_receipt).compensation_pending);
     CHECK(f.rt->receipt_recovery_status(f.wedge_receipt) ==
           PostK4472Rig::RT::RecoveryStatus::WedgeEligible);
     CHECK_FALSE(f.rt->oldest_outstanding_compensation_age(clk::now()).has_value());
@@ -14589,6 +14630,7 @@ TEST_CASE("#4472: the direct disarm fallback inside a compensation is covered by
     REQUIRE(f.b->wait_entered_disarm_hang(10s)); // inside direct_disarm_fallback
 
     CHECK_FALSE(f.rt->receipt_wedge_k_eligible(f.wedge_receipt));
+    CHECK(f.rt->receipt_status_wedge_aware(f.wedge_receipt).compensation_pending);
     const auto age = f.rt->oldest_outstanding_compensation_age(clk::now() + 50s);
     REQUIRE(age.has_value());
     CHECK(*age >= 49s);
@@ -14601,8 +14643,7 @@ TEST_CASE("#4472: the direct disarm fallback inside a compensation is covered by
 
 // ---------------------------------------------------------------------------
 // #4472 governance hardening round: tests added after review (latch ordering, begin_stop with
-// a compensation outstanding, the stress case, the reapply_count characterization, the tripwire,
-// the owed-instant identity). Same rigs, same conventions: a synthetic `now` ages claims, nothing
+// a compensation outstanding, the stress case, the tripwire, the owed-instant identity). Same rigs, same conventions: a synthetic `now` ages claims, nothing
 // sleeps to age one, every wait is event-polled.
 // ---------------------------------------------------------------------------
 
@@ -14847,50 +14888,10 @@ TEST_CASE("#4472 stress: accessors, the zero-arg expiry and aged expiry passes r
     CHECK(rt->invariant_violations_for_test(/*allow_orphans=*/true).empty());
 }
 
-TEST_CASE("#4472 characterization (ACCEPTED COST): reapply_count saturated by a compensation "
-          "hold is inherited, so a fresh hung arm after the hold is K-waived at its FIRST drain",
-          "[spark][runtime][liveness][4472][characterization]") {
-    // This pins an accepted cost of the #4472 fix, it does not endorse it as desirable:
-    // begin_application inherits (and saturates) reapply_count for identical content, so the
-    // >=3 held re-applies of a compensation hold spend the K retry budget; a LATER fresh hung
-    // arm on the same content then reaches K with zero retries. Changing the ledger is out of
-    // scope (the ack waiver path is catastrophic-class; the cheapest future fix, not
-    // incrementing reapply_count while the previous application was held by an outstanding
-    // compensation, is to be taken together with #5459). If this test goes red because that
-    // fix landed, update it, do not delete it.
-    using namespace std::chrono_literals;
-    PostK4472Rig f;
-    f.establish_wedge();
-    f.reapply_twice_while_wedged();
-    const auto held = f.third_reapply_with_compensation_outstanding();
-    f.ledger.add_pending("r1", held);
-    REQUIRE(f.ledger.drain_locked(*f.rt, 10) == 1);
-    REQUIRE_FALSE(f.ledger.can_advance()); // the hold: the generation is not acknowledged
-    REQUIRE(f.ledger.reapply_count_for_test() == kReapplyWaiverThreshold);
-
-    f.b->release_disarm_hang(); // the compensation finishes and pops the claim
-    REQUIRE(yuzu::test::spin_until([&] { return f.rt->claim_queue_depth_for_test(f.key) == 0; }, 10s));
-
-    // The next identical application inherits the saturated count (it does not restart at 0).
-    f.ledger.begin_application(1, f.digest, /*full_sync=*/true, 1);
-    CHECK(f.ledger.reapply_count_for_test() == kReapplyWaiverThreshold);
-    f.rt->detach_all();
-    f.b->reset_hang();
-    f.b->hang_next_arm.store(true);
-    const auto fresh = f.attach_r1();
-    REQUIRE(f.b->wait_entered_hang(10s));
-    REQUIRE(f.rt->expire_overdue_claims_at_for_test(clk::now() + 121s) == 1);
-    REQUIRE(f.rt->receipt_status(fresh) == PostK4472Rig::RT::ReceiptStatus::Wedged);
-    f.ledger.add_pending("r1", fresh);
-    REQUIRE(f.ledger.drain_locked(*f.rt, 10) == 1);
-    CHECK(f.rt->receipt_wedge_k_eligible(fresh)); // a genuinely hung arm: K-eligible
-    CHECK(f.ledger.can_advance());                // ... and waived at its FIRST drain, no retries
-}
-
 TEST_CASE("#4472 tripwire: compensation_finished is written with the pop, never alone (normal "
           "finalize, finalize's publish throwing, and the direct-disarm fallback)",
           "[spark][runtime][liveness][4472][tripwire]") {
-    // The invariant (see is_wedge_k_eligible_locked's comment): a claim that owed a
+    // The invariant (see wedge_episode_locked's comment): a claim that owed a
     // compensation and now reads compensation_finished is not still a Dispatched/Dispatching
     // head. invariant_violations_for_test carries the clause; this drives each path that writes
     // finished=true with a pop and checks it holds throughout. The dispatch -> Queued
