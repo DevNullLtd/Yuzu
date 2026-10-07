@@ -1,5 +1,7 @@
 #include "software_catalogue_model.hpp"
 
+#include "utf8_sanitize.hpp"
+
 #include <yuzu/log_token.hpp>
 
 #include <algorithm>
@@ -14,6 +16,14 @@ namespace sc = software_catalog;
 namespace {
 
 constexpr char kSep = '\x1f';
+// Longest accepted `name` (matches the ingest-side field cap, inventory_ingestion.cpp kMaxFieldLen).
+constexpr std::size_t kNameMaxBytes = 1024;
+
+// True for text Postgres can bind: strict UTF-8 and no NUL. Anything else would surface as a
+// store error (SQLSTATE 22021) and be reported as a retryable 503 instead of a caller 400.
+bool valid_text(std::string_view v) {
+    return v.find('\0') == std::string_view::npos && ::yuzu::server::sanitize_utf8_strict(v) == v;
+}
 
 // ── Parameter helpers ────────────────────────────────────────────────────────
 
@@ -181,7 +191,7 @@ std::expected<CatalogueRequest, std::string> parse_catalogue_params(const Params
         return v ? *v : std::string{};
     };
     CatalogueRequest r;
-    r.query.q = sc::clamp_utf8(get("q"), sc::kSearchMaxBytes);
+    std::string q = get("q");
     r.query.kind = get("kind");
     r.query.ecosystem = get("ecosystem");
     r.query.source = get("source");
@@ -192,8 +202,16 @@ std::expected<CatalogueRequest, std::string> parse_catalogue_params(const Params
     const std::string format = get("format");
     if (err)
         return std::unexpected(*err);
-    if (r.query.source.size() > kSourceMaxBytes || r.query.agent_id.size() > kSourceMaxBytes)
-        return std::unexpected("parameter too long");
+    for (const std::string* f : {&q, &r.query.kind, &r.query.ecosystem, &r.query.source,
+                                 &r.query.agent_id, &r.cursor})
+        if (!valid_text(*f))
+            return std::unexpected("invalid parameter encoding");
+    for (const std::string* f : {&r.query.kind, &r.query.ecosystem, &r.query.source,
+                                 &r.query.agent_id})
+        if (f->size() > kSourceMaxBytes)
+            return std::unexpected("parameter too long");
+    // Clamp only validated text: clamp_utf8 over a run of stray continuation bytes returns "".
+    r.query.q = sc::clamp_utf8(q, sc::kSearchMaxBytes);
     if (!versions_min.empty()) {
         const auto n = parse_i64(versions_min);
         if (!n || *n < 0)
@@ -237,7 +255,15 @@ std::expected<VersionsRequest, std::string> parse_versions_params(const Params& 
         return std::unexpected(*err);
     if (r.query.name.empty())
         return std::unexpected("name is required");
-    if (r.query.source.size() > kSourceMaxBytes || r.query.agent_id.size() > kSourceMaxBytes)
+    for (const std::string* f : {&r.query.name, &r.query.kind, &r.query.ecosystem, &r.query.source,
+                                 &r.query.agent_id})
+        if (!valid_text(*f))
+            return std::unexpected("invalid parameter encoding");
+    for (const std::string* f : {&r.query.kind, &r.query.ecosystem, &r.query.source,
+                                 &r.query.agent_id})
+        if (f->size() > kSourceMaxBytes)
+            return std::unexpected("parameter too long");
+    if (r.query.name.size() > kNameMaxBytes)
         return std::unexpected("parameter too long");
     const auto lim = read_limit(limit, kVersionsDefaultLimit, kVersionsMax);
     if (!lim)
@@ -286,6 +312,9 @@ std::string_view cursor_error_message(CursorError e) {
 std::string filter_fingerprint(const SoftwareCatalogQuery& q) {
     std::string s;
     for (const std::string* f : {&q.kind, &q.ecosystem, &q.source, &q.q, &q.agent_id}) {
+        // Length-prefixed so no byte content (incl. the separator) can shift a boundary.
+        s += std::to_string(f->size());
+        s += ':';
         s += *f;
         s += kSep;
     }
@@ -315,7 +344,7 @@ decode_catalogue_cursor(std::string_view token, std::string_view fp, std::int64_
         return std::unexpected(CursorError::kMalformed);
     // installs, then the name verbatim (the name may itself contain the separator).
     const auto sep = payload->find(kSep);
-    if (sep == std::string::npos)
+    if (sep == std::string::npos || !valid_text(std::string_view(*payload).substr(sep + 1)))
         return std::unexpected(CursorError::kMalformed);
     const auto installs = parse_nonneg(std::string_view(*payload).substr(0, sep));
     if (!installs)

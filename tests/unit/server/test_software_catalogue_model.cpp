@@ -117,6 +117,39 @@ TEST_CASE("parse_catalogue_params: defaults / clamps / refusals", "[server][soft
         REQUIRE(r);
         CHECK(r->query.q.size() == 127);
     }
+    SECTION("a q the clamp would empty is a 400, a long valid q clamps non-empty") {
+        // 200 stray continuation bytes: clamp_utf8 walks back to 0 and would run unfiltered.
+        auto bad = parse_catalogue_params(params({{"q", std::string(200, '\x80')}}));
+        REQUIRE_FALSE(bad);
+        CHECK(bad.error() == "invalid parameter encoding");
+        std::string good;
+        while (good.size() < 200)
+            good += "caf\xC3\xA9";
+        auto r = parse_catalogue_params(params({{"q", good}}));
+        REQUIRE(r);
+        CHECK_FALSE(r->query.q.empty());
+        CHECK(r->query.q.size() <= 128);
+    }
+    SECTION("invalid UTF-8 or an embedded NUL is a 400 on every text field") {
+        const std::string nul("a\0b", 3);
+        for (const char* key : {"q", "kind", "ecosystem", "source", "agent_id", "cursor"}) {
+            for (const std::string& bad : {std::string("a\xFF"), nul}) {
+                INFO(key);
+                auto r = parse_catalogue_params(params({{key, bad}}));
+                REQUIRE_FALSE(r);
+                CHECK(r.error() == "invalid parameter encoding");
+            }
+        }
+    }
+    SECTION("kind / ecosystem / source / agent_id are capped at kSourceMaxBytes") {
+        for (const char* key : {"kind", "ecosystem", "source", "agent_id"}) {
+            INFO(key);
+            CHECK(parse_catalogue_params(params({{key, std::string(kSourceMaxBytes, 'a')}})));
+            auto r = parse_catalogue_params(params({{key, std::string(kSourceMaxBytes + 1, 'a')}}));
+            REQUIRE_FALSE(r);
+            CHECK(r.error() == "parameter too long");
+        }
+    }
 }
 
 TEST_CASE("parse_versions_params", "[server][software_catalogue_model]") {
@@ -130,6 +163,32 @@ TEST_CASE("parse_versions_params", "[server][software_catalogue_model]") {
     CHECK(r->query.limit == 200);
     CHECK_FALSE(parse_versions_params(params({{"name", "a"}, {"name", "b"}})));
     CHECK(parse_versions_params(params({{"name", "a"}, {"limit", "9999"}}))->query.limit == 1000);
+}
+
+TEST_CASE("parse_versions_params: encoding and length bounds", "[server][software_catalogue_model]") {
+    const std::string nul("a\0b", 3);
+    for (const char* key : {"name", "kind", "ecosystem", "source", "agent_id"}) {
+        for (const std::string& bad : {std::string("a\xFF"), nul}) {
+            INFO(key);
+            auto r = std::string_view(key) == "name"
+                         ? parse_versions_params(params({{"name", bad}}))
+                         : parse_versions_params(params({{"name", "git"}, {key, bad}}));
+            REQUIRE_FALSE(r);
+            CHECK(r.error() == "invalid parameter encoding");
+        }
+    }
+    for (const char* key : {"kind", "ecosystem", "source", "agent_id"}) {
+        INFO(key);
+        CHECK(parse_versions_params(params({{"name", "git"}, {key, std::string(kSourceMaxBytes, 'a')}})));
+        auto r = parse_versions_params(
+            params({{"name", "git"}, {key, std::string(kSourceMaxBytes + 1, 'a')}}));
+        REQUIRE_FALSE(r);
+        CHECK(r.error() == "parameter too long");
+    }
+    CHECK(parse_versions_params(params({{"name", std::string(1024, 'a')}})));
+    auto r = parse_versions_params(params({{"name", std::string(1025, 'a')}}));
+    REQUIRE_FALSE(r);
+    CHECK(r.error() == "parameter too long");
 }
 
 TEST_CASE("audit_target: fixed field order", "[server][software_catalogue_model]") {
@@ -177,6 +236,14 @@ TEST_CASE("fingerprints are stable and sensitive to every field and blind to pag
     a.limit = 5;
     a.after = SoftwareCatalogCursor{3, "x"};
     CHECK(filter_fingerprint(a) == base);
+
+    // A field value holding the old 0x1F separator cannot shift a boundary between two fields.
+    SoftwareCatalogQuery c1, c2;
+    c1.kind = "a\x1f";
+    c1.ecosystem = "b";
+    c2.kind = "a";
+    c2.ecosystem = "\x1f" "b";
+    CHECK(filter_fingerprint(c1) != filter_fingerprint(c2));
 }
 
 TEST_CASE("catalogue cursor round trip", "[server][software_catalogue_model]") {
@@ -231,6 +298,15 @@ TEST_CASE("catalogue cursor decoder refusals", "[server][software_catalogue_mode
         CHECK(code("c1:" + fp + ":100:" + b64url_of("nosep")) == CursorError::kMalformed);
         CHECK(code("c1:" + fp + ":100:" + b64url_of("abc\x1f" "t")) == CursorError::kMalformed);
         CHECK(code("c1:" + fp + ":100:" + b64url_of("-1\x1f" "t")) == CursorError::kMalformed);
+    }
+    SECTION("a payload name that is not valid UTF-8 or holds a NUL is malformed") {
+        CHECK(code("c1:" + fp + ":100:" + b64url_of(std::string("5\x1f") + "\xFF")) ==
+              CursorError::kMalformed);
+        CHECK(code("c1:" + fp + ":100:" + b64url_of(std::string("5\x1f") + std::string("a\0b", 3))) ==
+              CursorError::kMalformed);
+        // before the filter / generation checks
+        CHECK(code("c1:" + fp + ":999:" + b64url_of(std::string("5\x1f") + "\xFF")) ==
+              CursorError::kMalformed);
     }
     SECTION("filter mismatch and staleness") {
         CHECK(code(good, "ffffffffffffffff") == CursorError::kFilterMismatch);

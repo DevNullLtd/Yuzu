@@ -78,7 +78,8 @@ struct CatHarness {
     std::vector<AuditRecord> audit_log;
     std::shared_ptr<FakeDeviceApi> device_api = std::make_shared<FakeDeviceApi>();
 
-    explicit CatHarness(SoftwareInventoryStore* store, bool wire_fleet_read_fn = true) {
+    explicit CatHarness(SoftwareInventoryStore* store, bool wire_fleet_read_fn = true,
+                        bool wire_device_api = true) {
         auto auth_fn = [this](const httplib::Request&,
                               httplib::Response&) -> std::optional<auth::Session> {
             auth::Session s;
@@ -128,7 +129,8 @@ struct CatHarness {
             /*engine_principal_store=*/nullptr, /*access_review_store=*/nullptr,
             /*auth_db=*/nullptr, /*directory_sync=*/nullptr, /*stream_budget=*/nullptr,
             /*exec_visible_fn=*/{}, /*list_read_fn=*/{}, std::move(fleet_read_fn),
-            /*agents_fn=*/{}, /*response_visible_set_fn=*/{}, /*verify_api=*/{}, device_api,
+            /*agents_fn=*/{}, /*response_visible_set_fn=*/{}, /*verify_api=*/{},
+            wire_device_api ? device_api : nullptr,
             /*dex_api=*/{});
     }
 
@@ -331,6 +333,34 @@ TEST_CASE("catalogue routes: malformed parameters are 400 with a correlation id"
     }
 }
 
+TEST_CASE("catalogue routes: text Postgres cannot bind is a 400, never a retryable 503 or a failure "
+          "audit row",
+          "[pg][rest][software_catalogue][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    SoftwareInventoryStore store{pool};
+    REQUIRE(store.is_open());
+    seed_fixture(store);
+
+    CatHarness h{&store};
+    // A hand-minted cursor whose decoded name is not valid UTF-8 (well-formed otherwise).
+    const std::string forged = "c1:" + swc::filter_fingerprint({}) + ":1:" +
+                               b64url(std::string("5\x1f") + "\xFF");
+    for (const std::string& url : std::vector<std::string>{std::string(kCat) + "?kind=%FF",
+                                                           std::string(kCat) + "?q=%00",
+                                                           std::string(kCat) + "?cursor=" + forged,
+                                                           std::string(kVer) + "?name=%FF"}) {
+        CAPTURE(url);
+        auto r = h.sink.Get(url);
+        REQUIRE(r);
+        CHECK(r->status == 400);
+        CHECK(err_of(r).at("retry_after_ms").is_null()); // a caller fault, not a retryable degrade
+    }
+    CHECK(h.audits("inventory.software.catalog", "failure") == 0);
+    CHECK(h.audits("inventory.software.versions", "failure") == 0);
+}
+
 // ── [pg] reads ───────────────────────────────────────────────────────────────
 
 TEST_CASE("catalogue: fleet read: rows / totals / KPIs / coverage counts",
@@ -364,6 +394,24 @@ TEST_CASE("catalogue: fleet read: rows / totals / KPIs / coverage counts",
     CHECK(k.at("coverage").at("stale") == 0); // wired from the store count, not the null arm
     CHECK_FALSE(k.at("coverage").contains("pct"));
     CHECK(h.audits("inventory.software.catalog", "success") == 1);
+}
+
+TEST_CASE("catalogue: with no DeviceApi wired coverage.connected is null, reporting still counts",
+          "[pg][rest][software_catalogue]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    SoftwareInventoryStore store{pool};
+    REQUIRE(store.is_open());
+    seed_fixture(store);
+
+    CatHarness h{&store, /*wire_fleet_read_fn=*/true, /*wire_device_api=*/false};
+    auto r = h.sink.Get(kCat);
+    REQUIRE(r);
+    CHECK(r->status == 200);
+    const auto cov = data_of(r).at("kpis").at("coverage");
+    CHECK(cov.at("connected").is_null());
+    CHECK(cov.at("reporting") == 3);
 }
 
 TEST_CASE("catalogue: totals cover every row under the filters while the page shows `limit` rows",
@@ -640,6 +688,21 @@ TEST_CASE("catalogue routes: a throwing or failing audit sink serves 200 with au
         CHECK(r->status == 200);
         CHECK(data_of(r).at("audit_persisted") == false);
     }
+
+    // The out-of-scope per-device arms swallow no failed `denied` row either.
+    h.fleet_scope = std::unordered_set<std::string>{"d1"};
+    auto cat = h.sink.Get(std::string(kCat) + "?agent_id=d2");
+    REQUIRE(cat);
+    CHECK(cat->status == 200);
+    CHECK(data_of(cat).at("audit_persisted") == false);
+    auto ver = h.sink.Get(std::string(kVer) + "?name=git&agent_id=d2");
+    REQUIRE(ver);
+    CHECK(ver->status == 200);
+    CHECK(data_of(ver).at("audit_persisted") == false);
+    auto csv = h.sink.Get(std::string(kCat) + "?agent_id=d2&format=csv");
+    REQUIRE(csv);
+    CHECK(csv->status == 200);
+    CHECK(csv->get_header_value("Sec-Audit-Failed") == "true");
 }
 
 TEST_CASE("catalogue: audit target equals audit_target(query) on every call",

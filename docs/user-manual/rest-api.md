@@ -6767,7 +6767,7 @@ The **fleet software title catalogue**: one row per title rolled up across the w
 | `cursor` | string | Opaque `next_cursor` from the previous page |
 | `format` | `json` \| `csv` | `csv` exports the titles (REST-only) |
 
-A repeated parameter, a non-integer `limit`/`versions_min`, an unknown `format`, a cursor over 2048 bytes, or a `cursor` sent with `format=csv` (an export is one whole walk and takes no continuation) is a `400`. An empty `kind`/`ecosystem`/`source` means "no filter", so those values cannot be selected as `''`.
+A repeated parameter, a parameter that is not valid UTF-8 or contains a NUL byte, a `kind`/`ecosystem`/`source`/`agent_id` over 256 bytes, a `name` over 1024 bytes, a non-integer `limit`/`versions_min`, an unknown `format`, a cursor over 2048 bytes, or a `cursor` sent with `format=csv` (an export is one whole walk and takes no continuation) is a `400`. An empty `kind`/`ecosystem`/`source` means "no filter", so those values cannot be selected as `''`.
 
 **Response (200):**
 
@@ -6805,7 +6805,7 @@ A repeated parameter, a non-integer `limit`/`versions_min`, an unknown `format`,
 - **Cursor.** `next_cursor` is non-null when the page is full. It is bound to the filter set **and to the catalogue refresh generation** (`kpis.refreshed_at`, 1-second granularity — two refreshes inside one second share a generation). A malformed cursor, a cursor from a different filter set, or one issued **before the latest refresh** is a `400` (`invalid cursor` / `cursor was issued for a different filter set` / `cursor predates the current catalogue refresh; restart from the first page`) — a client holding a stale cursor restarts from the first page. If a refresh lands *during* a first-page read the server re-reads once; a second move is a `503`.
 - **Per-device view** (`agent_id`): admitted for an in-scope device. For a confined caller `newest_version` is blank and `newest_omitted: true` (the newest version is a fleet-wide fact). A device outside the caller's scope returns an empty page with `devices_omitted: 1` and a `denied` audit row (no oracle on whether the device exists).
 - **Export** (`format=csv`): `text/csv; charset=utf-8`, `Content-Disposition: attachment; filename="software-titles.csv"`, header `name,publisher,installs,versions,ecosystems,kinds,newest_version` (lists `;`-joined). `limit` is the total cap (default and max 10000); `X-Result-Truncated-By-Cap: true` when the cap was reached. Audited as `inventory.software.export` (`rows=` is the number of titles written). **Set-and-proceed:** `Sec-Audit-Failed: true` is set, and the export is still served, when the export audit row did not persist (machine-scope data, not behavioural PII).
-- **Audit.** Every call writes `inventory.software.catalog` `success` — first **and** continuation pages (the latter tagged `page=continuation`) — with detail `titles=N totals=T/I`. `audit_persisted: false` is added when the row could not be persisted.
+- **Audit.** Every call that serves a page writes `inventory.software.catalog` `success` — first **and** continuation pages (the latter tagged `page=continuation`) — with detail `titles=N totals=T/I`. An out-of-scope per-device read writes `denied` only (on `format=csv`, `denied` plus an empty-file `inventory.software.export` `success`). `audit_persisted: false` is added when the row could not be persisted, including the `denied` row.
 
 **Error responses** (A4 envelope with `correlation_id`):
 
