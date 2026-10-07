@@ -30,7 +30,7 @@ What this record claims, and what it does not.
   macOS: the full test binary, 8830 cases (8825 passed, 5 skipped), and `[gateway_peer]`, 104
   cases with 1907 assertions, at an earlier tip. Windows: `[gateway_peer]`, 104 cases with 1909
   assertions. These counts predate the review-fix rounds, which add tests, so re-run before
-  quoting them; the final counts at the shipped tip are in the run record (see the run record).
+  quoting them; the final counts at the shipped tip are recorded in the governance run record committed with this change. [TO BE FILLED BY LEAD: counts]
 - **Installer.** `deploy/packaging/windows/yuzu-server.iss` was edited on a Linux host. It was then
   compiled with Inno Setup 6.7.3 and silent-installed on a Windows 11 test host: about 55
   silent-install cases (including upgrade, refusal and uninstall cases) plus server command-line
@@ -194,16 +194,25 @@ these ways, each of which is part of the design as built:
    side (a pin, an acknowledgement, other server configuration): restart the serving replicas, do
    not restart the gateways first unless the placement check fails, and verify convergence
    (`sum(yuzu_gw_agents_current) - sum(yuzu_agents_connected{job="yuzu-server"})`, summed across all
-   replicas), placement (no rise in the notify error and drop counters, and a command to a sample
-   agent succeeds) as separate checks. **B**, the cause is on the gateway side: restart that gateway
-   node, one at a time, whatever the circuit state, because the gateway must redial to present its
-   current files. **C**, placement loss suspected after a refusal window: restart the gateway node
-   only if A's verification still fails after the timing allowances. Every gateway restart is
-   conditional and carries the agent-side caveat, because `docs/user-manual/gateway.md` ("What
+   replicas), placement (no rise in the raw notify error and drop counters, and a read-only command to a sample
+   agent returns a result) as separate checks. **B**, the cause is on the gateway side: the gateway presents its
+   current files only when it redials, and a server restart or any dropped connection forces a
+   redial, so first check whether it already has (the raw denial counters have stopped rising, no
+   new `spki=` denial lines, and the configured certificate file has the expected SPKI prefix),
+   allow about 2 minutes after the files change for the Erlang ssl PEM cache, and restart that
+   gateway node, one at a time, only if denials continue, whatever the circuit state. A same-key
+   renewal needs no server restart, which is required only when server configuration changed.
+   **C**, placement loss suspected after a refusal window: restart the agent service on the
+   specific unreachable agents (the observed fix in `docs/user-manual/gateway.md`), and restart the
+   gateway node only if many agents behind one node are affected and A's verification still fails
+   after the timing allowances. Every gateway restart is conditional and carries the agent-side
+   caveat, because `docs/user-manual/gateway.md` ("What
    happens when the server restarts") records that a gateway restart leaves released agents wedged
    on agent builds without the #5183 fix (in no release yet). Redialling is inferred from reading
    the grpcbox code (the certificate and key are file paths in the channel's TLS options, and a
-   channel reconnects lazily after its connection process dies) and was not tested. What a refusal
+   channel reconnects lazily after its connection process dies) and was not tested. The certificate
+   cache caveat (a redial can present the previous certificate for about 2 minutes) was measured by
+   a reviewer on OTP 28.4.2 with a stub, not on a Yuzu gateway. What a refusal
    window costs is listed in the operator guide's incident runbook.
 6. **Acknowledgement semantics.** The acknowledgement is contradictory only with EXPLICIT pins, it
    suppresses the automatic pin, and it disables the guard on every port.
@@ -227,9 +236,10 @@ immutable pin set that cannot be empty by construction, and boot refuses an empt
   heartbeats for a session the server already knows trigger no replay. The runbook (see correction
   5 above and the operator guide) has three classes: a server-side cause is fixed by restarting the
   serving replicas, not the gateways, and verified by three separate checks (registration counts
-  summed across all replicas, placement, a sample command); a gateway-side cause needs that
-  gateway node restarted, one at a time, whatever the circuit state; placement loss after a
-  refusal window is the last resort. A gateway restart is itself costly: on agent builds without
+  summed across all replicas, placement, a sample command); a gateway-side cause needs the gateway to redial, which a server restart already forces, so
+  that gateway node is restarted, one at a time, only if denials continue; placement loss after a
+  refusal window is handled first by restarting the agent service on the unreachable agents, and
+  by a gateway restart only as the last resort. A gateway restart is itself costly: on agent builds without
   the #5183 fix (in no release yet) it leaves released agents wedged
   (`docs/user-manual/gateway.md`, "What happens when the server restarts"). What a refusal window
   costs, beyond the unplaced sessions: `ForwardGuardianMessage` frames dropped during the window
@@ -253,9 +263,11 @@ immutable pin set that cannot be empty by construction, and boot refuses an empt
   redials: a gateway redials after its connection drops (for example when the server restarts) and
   reads its certificate and key from the configured files when it does (inferred from reading the
   grpcbox code, not tested). Plan certificate renewal before `notAfter`, inside a maintenance
-  window, together with a gateway redial (a restart of that gateway node, one at a time, only if
-  its agents can take the disconnect: on agents without the #5183 fix (in no release yet) released
-  agents stay wedged afterwards). After `notAfter` the circuit can stay open and waiting does not
+  window; after replacing the files, check whether the gateway already redialled and allow about 2
+  minutes for the Erlang ssl PEM cache (measured on OTP 28.4.2 with a stub, not on a Yuzu
+  gateway), and restart that gateway node, one at a time, only if denials continue and its agents
+  can take the disconnect: on agents without the #5183 fix (in no release yet) released agents stay
+  wedged afterwards. After `notAfter` the circuit can stay open and waiting does not
   help, because the cause is on the gateway side. The handshake applies no validity
   tolerance; the 5-minute allowance before `notBefore` exists only in the per-call check. A
   connection-age cap, or a gateway-side redial on status 16, would close this; neither exists.
@@ -413,6 +425,10 @@ Each is a separate decision; none is a prerequisite for the control.
       now also requires a pinned peer or an acknowledgement);
     - `docs/user-manual/gateway.md` near lines 1038 to 1044 (a bare `--gateway-upstream` example,
       which now refuses to start on operator certificates or with `--no-tls`);
+    - `docs/user-manual/gateway.md` near lines 1306 to 1309 and the row at line 1102 (both say a gateway
+      restart does not help): true for a server-side outage, false when the cause is on the gateway
+      side, where the gateway must redial to present its current certificate (cause class B of the
+      incident runbook);
     - `docs/user-manual/gateway.md` near lines 1101 and 1102 (the circuit-breaker rows): they do not
       say which refusals feed the breaker. A run of status 16 refusals of `ProxyRegister` (a replay
       registration included) or `ProxyInventory` opens it, because `record_result` in
@@ -426,6 +442,10 @@ Each is a separate decision; none is a prerequisite for the control.
     - `gateway/config/sys.config`, comments near lines 12 and 106 (they say only that the port must
       match `--gateway-upstream`, not that the server must also be given a pin or an
       acknowledgement);
+    - `gateway/config/sys.config.prod`, comments near lines 109 to 113, and
+      `deploy/docker/reference-gateway-sys.config`, comments near lines 87 to 89 ("replace with
+      operator certs if you bring your own" says nothing about the pin requirement that operator
+      certificates now bring);
     - `gateway/apps/yuzu_gw/integration_test/yuzu_gw_real_upstream_SUITE.erl`, its header (starts
       the server with `--no-tls` and without `--insecure-gateway-peer`, which the server now
       refuses).

@@ -36,7 +36,7 @@ valid for a deployment name a client actually dials — e.g. `--cert-san dns:gat
 an agent reaching the gateway by that service name passes SNI hostname verification.
 Changing `--cert-san` does **not** rotate an existing set (the marker fast path returns
 the prior certs). For new SANs to take effect, rename `default-marker.json` in the cert dir aside
-(moving it back undoes this) and restart (the leaves are re-minted under the SAME root), or replace the certs. Re-minting issues every default leaf with a **new key, the gateway's `default-gateway` leaf included**: the restarted server auto-pins the new gateway key (`docs/user-manual/server-admin.md`, "Gateway upstream peer authorization"), and a running gateway keeps presenting its old certificate until it redials, so it is refused (`not_pinned`) until it redials: restart that gateway node, one node at a time, only if it has not already redialled and its agents can take the disconnect, because unless the agents run a build with the #5183 fix (in no release yet) released agents stay wedged afterwards (cause class B in that runbook; the circuit state does not decide it). Never clear
+(moving it back undoes this) and restart (the leaves are re-minted under the SAME root), or replace the certs. Re-minting issues every default leaf with a **new key, the gateway's `default-gateway` leaf included**: the restarted server auto-pins the new gateway key (`docs/user-manual/server-admin.md`, "Gateway upstream peer authorization"), and a gateway that dialled before the restart keeps presenting its old certificate until it redials, so it is refused (`not_pinned`) until then. The server restart drops the connection and forces that redial, so first check whether the gateway already presents the new certificate (cause class B in that runbook; the circuit state does not decide it), and restart that gateway node, one node at a time, only if denials continue and its agents can take the disconnect, because unless the agents run a build with the #5183 fix (in no release yet) released agents stay wedged afterwards. Never clear
 the whole cert dir: it also holds the CA key and the secrets KEK (`secrets-kek-*.key`, #5370).
 (Implementation: `parse_extra_sans` validates the flag/`YUZU_CERT_SAN` values,
 `merge_sans` injects them into every default leaf, `pki::is_valid_ip_literal` does the
@@ -431,10 +431,7 @@ own config at boot).
   cross-container/host dialing, either dial the server's hostname and set that service's
   `hostname:` so its SAN matches, or add the dialled name with `--cert-san dns:<name>`
   (shipped — extends every default leaf's SAN).
-- **Leaf rotation** — grpcbox reads the cert/key/CA files at channel *connect* time
-  (lazy), so replacing `default-gateway.{pem,key}` on disk is picked up on the next
-  upstream reconnect; an *established* channel keeps the old cert until it drops, so a
-  `systemctl restart yuzu-gateway` is the deterministic way to force a rotation, only if its agents can take the disconnect: unless the agents run a build with the #5183 fix (in no release yet), released agents stay wedged afterwards (see the gateway peer-authorization runbook in `docs/user-manual/server-admin.md`).
+- **Leaf rotation.** From reading the grpcbox code (not tested), grpcbox reads the cert/key/CA files at channel *connect* time (lazy), so replacing `default-gateway.{pem,key}` on disk is picked up on the next upstream reconnect; an *established* channel keeps the old cert until it drops. A redial can still present the previous certificate for up to about 2 minutes after the files change, because the Erlang ssl PEM cache cleans every 120 s (measured on OTP 28.4.2 with a stub by a reviewer, not on a Yuzu gateway); a node restart clears the cache. A `systemctl restart yuzu-gateway` therefore forces a rotation deterministically, but restart a gateway only if denials continue after the redial window and its agents can take the disconnect: unless the agents run a build with the #5183 fix (in no release yet), released agents stay wedged afterwards (see the gateway peer-authorization runbook in `docs/user-manual/server-admin.md`).
 - **Observability** — an upstream TLS-handshake failure currently surfaces only as the
   generic circuit-breaker open state; a dedicated handshake-failure metric is a tracked
   follow-up. A server-side pin refusal is not a handshake failure: the TLS session
@@ -751,10 +748,10 @@ DACL via `SetNamedSecurityInfoW` is a tracked follow-up shared with
   the agent can keep the OLD CA in `ca-public` (inferred from the compose file, not tested). The
   new gateway leaf also has a new key, which the restarted server auto-pins; a gateway presents
   its new certificate only after it redials (inferred from reading the grpcbox code, not tested),
-  so restart that gateway node, one at a time, only if it has not already redialled and its agents
-  can take the disconnect (unless the agents run a build with the #5183 fix, in no release yet,
-  released agents stay wedged afterwards), as cause class B of the gateway peer-authorization
-  runbook describes. Prefer `POST /ca/import-chain`
+  so check first whether it has already redialled (a server restart forces one), and restart that
+  gateway node, one at a time, only if denials continue and its agents can take the disconnect
+  (unless the agents run a build with the #5183 fix, in no release yet, released agents stay wedged
+  afterwards), as cause class B of the gateway peer-authorization runbook describes. Prefer `POST /ca/import-chain`
   (Subordinate-CA, PR6) when the
   goal is re-keying under a new authority without an enrollment outage. **Not** when the goal is
   to stop trusting a leaf whose revocation was lost: import-chain keeps the issuing key, so that

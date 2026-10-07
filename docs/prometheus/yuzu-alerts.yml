@@ -484,27 +484,39 @@ groups:
             a certificate that expired while the connection was open, a
             certificate without serverAuth). Status 16 is an RPC result, not a
             transport failure, so the gateway does not redial by itself. If the
-            cause was on the server side (a pin or acknowledgement), fix it,
-            restart the serving replicas, and do not restart the gateways first
-            unless the checks below fail, because on agents without the #5183
-            fix (no release carries it yet) a gateway restart leaves released
-            agents wedged; see "What happens when the server restarts" in
-            docs/user-manual/gateway.md. Check three separate things: the
+            cause was on the server side (a pin or acknowledgement), fix it, restart
+            the serving replicas, and do not restart the gateways first unless the
+            checks below fail, because on agents without the #5183 fix (in no
+            release yet) a gateway restart leaves released agents wedged; see "What
+            happens when the server restarts" in docs/user-manual/gateway.md. Only
+            on a gateway that has the #1197 consumer (#5383) does the gateway then
+            recover through its replay path. Check three separate things: the
             registration counts with sum(yuzu_gw_agents_current) -
-            sum(yuzu_agents_connected{job="yuzu-server"}) (summed across all
-            gateway nodes and all replicas; the server gauge also counts direct
-            agents and counts registration, not placement), no rise in
-            yuzu_gw_upstream_rpc_errors_total{rpc_name="notify_stream",code="16"}
-            or yuzu_gw_upstream_notify_dropped_total, and a command to a sample
-            agent that succeeds. Agreeing counts alone do not prove placement.
-            If the cause is on the gateway side (a certificate that expired or
-            was renewed, a rotated key), the gateway must redial to present its
-            current files: restart that gateway node, one at a time, whatever
-            the circuit state, only if its agents can take the disconnect,
-            because unless the agents run a build with the #5183 fix a gateway
-            restart leaves released agents wedged. This alert stays active for
-            about 6 minutes after the last refusal: check that the counter is
-            flat rather than waiting for it to clear. See
+            sum(yuzu_agents_connected{job="yuzu-server"}) (summed across all gateway
+            nodes and all replicas; the server gauge also counts direct agents and
+            counts registration, not placement), no rise in the raw
+            yuzu_gw_upstream_rpc_errors_total{rpc_name="notify_stream",code="16"} or
+            yuzu_gw_upstream_notify_dropped_total, and a read-only command to a
+            sample agent that returns a result (the exact request is in the
+            runbook). Agreeing counts alone do not prove placement. If the cause is
+            on the gateway side (a certificate that expired or was renewed, a
+            rotated key), the gateway presents its current files only when it
+            redials, and a server restart forces a redial, so first check whether it
+            already has: read yuzu_server_gateway_peer_denied_total and
+            yuzu_gw_upstream_rpc_errors_total{code="16"} twice, a minute apart, and
+            see that they have stopped rising, and compute the SPKI prefix of the
+            certificate file the gateway is configured with. A redial can still
+            present the old certificate for about 2 minutes after the files change
+            (Erlang ssl PEM cache; measured on OTP 28.4.2 with a stub, not on a Yuzu
+            gateway). Restart that gateway node, one at a time, only if denials
+            continue and its agents can take the disconnect, because unless the
+            agents run a build with the #5183 fix (in no release yet) a gateway
+            restart leaves released agents wedged. For placement loss after a
+            refusal window, restart the agent service on the unreachable agents (the
+            observed fix), and restart the gateway node only if many agents behind
+            one node are affected and the checks still fail. This alert stays
+            active for about 6 minutes after the last refusal: check that the
+            counter is flat rather than waiting for it to clear. See
             docs/user-manual/server-admin.md "Gateway upstream peer authorization".
           runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/server-admin.md#gateway-upstream-peer-authorization"
 
@@ -630,21 +642,29 @@ groups:
             internal_error: a server-side fault while deciding; check the server
             log. After a server-side cause is fixed and every serving replica
             restarted, do not restart the gateways first unless the checks below
-            fail, because on agents without the #5183 fix (no release carries it
-            yet) a gateway restart leaves released agents wedged; see "What
-            happens when the server restarts" in docs/user-manual/gateway.md.
-            Check three separate things: sum(yuzu_gw_agents_current) -
-            sum(yuzu_agents_connected{job="yuzu-server"}) (all gateway nodes, all
-            replicas; the server gauge also counts direct agents and counts
-            registration, not placement), no rise in
-            yuzu_gw_upstream_rpc_errors_total{rpc_name="notify_stream",code="16"}
-            or yuzu_gw_upstream_notify_dropped_total, and a command to a sample
-            agent that succeeds. If the cause is on the gateway side
-            (outside_validity, or a new certificate key), the gateway must redial:
-            restart that gateway node, one at a time, whatever the circuit
-            state, only if its agents can take the disconnect (the same #5183
-            caveat). The gateway does not retry a refused NotifyStreamStatus. This alert stays active for about 6 minutes after
-            the last denial (the 5-minute increase window plus an evaluation
+            fail, because on agents without the #5183 fix (in no release yet) a
+            gateway restart leaves released agents wedged; see "What happens when
+            the server restarts" in docs/user-manual/gateway.md. Only on a gateway
+            that has the #1197 consumer (#5383) does the gateway then recover
+            through its replay path. Check three separate things:
+            sum(yuzu_gw_agents_current) - sum(yuzu_agents_connected{job="yuzu-server"}) (all gateway nodes, all replicas; the server gauge also counts
+            direct agents and counts registration, not placement), no rise in the
+            raw
+            yuzu_gw_upstream_rpc_errors_total{rpc_name="notify_stream",code="16"} or
+            yuzu_gw_upstream_notify_dropped_total, and a read-only command to a
+            sample agent that returns a result. If the cause is on the gateway side
+            (outside_validity, or a new certificate key), the gateway presents its
+            current files only when it redials, and a server restart forces a
+            redial: first check whether it already has (the raw counters
+            yuzu_server_gateway_peer_denied_total and
+            yuzu_gw_upstream_rpc_errors_total{code="16"} have stopped rising across
+            two reads a minute apart, and the configured certificate file has the
+            expected SPKI prefix), allowing about 2 minutes after the files change
+            for the Erlang ssl PEM cache (measured on OTP 28.4.2 with a stub, not on
+            a Yuzu gateway). Restart that gateway node, one at a time, only if
+            denials continue and its agents can take the disconnect (the same #5183
+            caveat). The gateway does not retry a refused NotifyStreamStatus.
+            This alert stays active for about 6 minutes after the last denial (the 5-minute increase window plus an evaluation
             step): check that yuzu_server_gateway_peer_denied_total is flat
             rather than waiting for the alert to clear. A refusal whose
             certificate key could be computed also writes a
@@ -692,21 +712,32 @@ groups:
             certificate expired or is not yet valid; no_server_auth_eku: the
             gateway certificate lacks serverAuth; bad_cert: it could not be
             parsed; internal_error: check the server log), fix the pin or the
-            certificate, and restart the server replicas so the pins are read
-            again. For a server-side cause do not restart the gateways first
-            unless the checks fail: compare sum(yuzu_gw_agents_current) -
+            certificate, and restart the server replicas if the pin or
+            acknowledgement changed, because pins are read once at boot (a renewal
+            over the same key needs no server restart). For a server-side cause do
+            not restart the gateways first unless the checks fail, because on agents
+            without the #5183 fix (in no release yet) a gateway restart leaves
+            released agents wedged; see "What happens when the server restarts" in
+            docs/user-manual/gateway.md. Compare sum(yuzu_gw_agents_current) -
             sum(yuzu_agents_connected{job="yuzu-server"}) (all gateway nodes, all
             replicas; the server gauge also counts direct agents and counts
-            registration, not placement), check for no rise in
-            yuzu_gw_upstream_rpc_errors_total{rpc_name="notify_stream",code="16"}
-            or yuzu_gw_upstream_notify_dropped_total, and send a command to a
-            sample agent. For a gateway-side cause (outside_validity, a new
-            certificate key) the gateway must redial: restart that gateway node,
-            one at a time, whatever the circuit state, only if its agents can
-            take the disconnect, because unless the agents run a build with the
-            fix #5183 (no release carries it yet) a gateway restart leaves
-            released agents wedged; see "What happens when the server restarts"
-            in docs/user-manual/gateway.md. This alert stays
+            registration, not placement), check for no rise in the raw
+            yuzu_gw_upstream_rpc_errors_total{rpc_name="notify_stream",code="16"} or
+            yuzu_gw_upstream_notify_dropped_total, and send a read-only command to a
+            sample agent and check that it returns a result. For a gateway-side
+            cause (outside_validity, a new certificate key) the gateway presents its
+            current files only when it redials, and a server restart forces a
+            redial: first check whether it already has (the raw counters
+            yuzu_server_gateway_peer_denied_total and
+            yuzu_gw_upstream_rpc_errors_total{code="16"} have stopped rising across
+            two reads a minute apart, and the configured certificate file has the
+            expected SPKI prefix), allowing about 2 minutes after the files change
+            for the Erlang ssl PEM cache (measured on OTP 28.4.2 with a stub, not on
+            a Yuzu gateway). Restart that gateway node, one at a time, only if
+            denials continue and its agents can take the disconnect, because unless
+            the agents run a build with the #5183 fix (in no release yet) a gateway
+            restart leaves released agents wedged.
+            This alert stays
             active for about 6 minutes after the last denial: check that
             yuzu_server_gateway_peer_denied_total{rpc="batch_heartbeat"} is flat
             rather than waiting for it to clear. See

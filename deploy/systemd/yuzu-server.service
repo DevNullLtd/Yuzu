@@ -71,8 +71,14 @@ EnvironmentFile=-/etc/yuzu/yuzu-server.env
 #     PrivateTmp=true hide /home and /tmp from the service, so keep them under
 #     /etc/yuzu.
 # Before upgrading a package install that uses your own certificates, check what
-# this unit and /etc/yuzu/yuzu-server.env pass: `systemctl cat yuzu-server | grep -E
-# -- '--(management-)?(cert|key|ca-cert)|--no-tls|--gateway-upstream'`. The RPM restarts the service on upgrade,
+# this unit (and any drop-in: `systemctl cat` prints both) and
+# /etc/yuzu/yuzu-server.env pass, ignoring comment lines such as this block:
+#   systemctl cat yuzu-server | grep -v '^[[:space:]]*#' | grep -E -- \
+#     '--(management-)?(cert|key|ca-cert)|--no-tls|--gateway-upstream|YUZU_(CERT|KEY|CA_CERT|GATEWAY|INSECURE_GATEWAY)'
+#   grep -v '^[[:space:]]*#' /etc/yuzu/yuzu-server.env | grep -E 'YUZU_(CERT|KEY|CA_CERT|GATEWAY|INSECURE_GATEWAY)'
+# YUZU_CERT, YUZU_KEY and YUZU_CA_CERT are the environment names of --cert, --key
+# and --ca-cert, so an Environment="YUZU_CERT=..." line plus --gateway-upstream
+# refuses to start like the flag does. The RPM restarts the service on upgrade,
 # so a missing pin fails there; the deb only enables it, so the failure shows at the
 # next restart or reboot. systemd stops retrying after the start-limit above.
 # --insecure-gateway-peer is deliberately NOT set here: it disables peer
