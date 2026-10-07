@@ -6,7 +6,7 @@
  *   [pinset]  parse_pin_hex / split_pin_list / parse_pin_file / PinSet / load_boot_pins
  *   [policy]  the decision table, one row per closed DenyReason
  *
- * The wire half (real mTLS, the guard) lands with the guard itself.
+ * The wire half (real mTLS, the guard) is test_gateway_peer_guard.cpp.
  */
 
 #include <catch2/catch_test_macros.hpp>
@@ -21,6 +21,8 @@
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <functional>
+#include <future>
 #include <map>
 #include <memory>
 #include <optional>
@@ -28,7 +30,15 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
+#include <tuple>
 #include <vector>
+
+#ifndef _WIN32
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
 
 #include "gateway_peer_cert.hpp"
 #include "gateway_peer_pinset.hpp"
@@ -184,6 +194,96 @@ struct FakeFs {
     }
 };
 
+/// Runs `fn` on a worker thread and waits up to `limit` for it. Returns its result, or nullopt
+/// if it had not finished (the worker is then detached after one more grace period): a
+/// regression that blocks must FAIL the test, not hang the suite. `on_timeout` runs once after
+/// the limit, to unblock the worker. `fn` must capture by value and must not use Catch macros
+/// (assertions are not made off the test thread).
+template <class Fn>
+auto run_bounded(Fn fn, std::chrono::milliseconds limit,
+                 const std::function<void()>& on_timeout = {}) -> std::optional<decltype(fn())> {
+    using R = decltype(fn());
+    auto promise = std::make_shared<std::promise<R>>();
+    auto future = promise->get_future();
+    std::thread worker([promise, fn = std::move(fn)]() mutable {
+        try {
+            promise->set_value(fn());
+        } catch (...) {
+            promise->set_exception(std::current_exception());
+        }
+    });
+    if (future.wait_for(limit) != std::future_status::ready) {
+        if (on_timeout)
+            on_timeout();
+        if (future.wait_for(std::chrono::seconds(2)) != std::future_status::ready) {
+            worker.detach();
+            return std::nullopt;
+        }
+        worker.join();
+        return std::nullopt;
+    }
+    worker.join();
+    return future.get();
+}
+
+#ifndef _WIN32
+/// Replaces the process's stdin with the read end of a pipe that nothing writes to, so a call
+/// that PROMPTS (reads a passphrase from stdin) blocks instead of failing fast on EOF, which is
+/// what lets a test tell "refused" from "asked". `release()` closes the write end (EOF) to
+/// unblock a reader that did ask. Restores the real stdin on destruction.
+class BlockedStdin {
+public:
+    BlockedStdin() {
+        int fds[2] = {-1, -1};
+        REQUIRE(::pipe(fds) == 0);
+        saved_ = ::dup(0);
+        REQUIRE(saved_ >= 0);
+        REQUIRE(::dup2(fds[0], 0) >= 0);
+        ::close(fds[0]);
+        write_end_ = fds[1];
+    }
+    BlockedStdin(const BlockedStdin&) = delete;
+    BlockedStdin& operator=(const BlockedStdin&) = delete;
+    void release() {
+        if (write_end_ >= 0) {
+            ::close(write_end_);
+            write_end_ = -1;
+        }
+    }
+    ~BlockedStdin() {
+        release();
+        if (saved_ >= 0) {
+            ::dup2(saved_, 0);
+            ::close(saved_);
+        }
+    }
+
+private:
+    int saved_{-1};
+    int write_end_{-1};
+};
+#endif
+
+std::string to_crlf(const std::string& s) {
+    std::string out;
+    for (const char c : s) {
+        if (c == '\n')
+            out += '\r';
+        out += c;
+    }
+    return out;
+}
+
+/// A CERTIFICATE block whose PEM header says its body is passphrase-encrypted. OpenSSL asks for
+/// the passphrase when it reads one; the body is never decrypted (it is 32 zero bytes).
+const std::string kEncryptedPem =
+    "-----BEGIN CERTIFICATE-----\n"
+    "Proc-Type: 4,ENCRYPTED\n"
+    "DEK-Info: AES-128-CBC,00112233445566778899AABBCCDDEEFF\n"
+    "\n" +
+    std::string(43, 'A') + "=\n"
+    "-----END CERTIFICATE-----\n";
+
 std::string repeat_pem(const std::string& pem, std::size_t n) {
     std::string s;
     for (std::size_t i = 0; i < n; ++i)
@@ -244,6 +344,35 @@ TEST_CASE("gateway_peer_cert: failure is nullopt, never a success carrying an em
         CHECK_FALSE(gp::parse_cert_facts(pem).has_value());
     }
     CHECK_FALSE(gp::spki_sha256_hex(static_cast<const x509_st*>(nullptr)).has_value());
+}
+
+TEST_CASE("gateway_peer_cert: a passphrase-protected PEM block is refused, never prompted for",
+          "[gateway_peer][cert]") {
+    // A block with `Proc-Type: 4,ENCRYPTED` makes OpenSSL ask for a passphrase; with no password
+    // callback it prompts on the terminal or stdin and blocks the calling thread. A pin file or a
+    // presented certificate must be refused instead. On POSIX stdin is a pipe nothing writes to,
+    // so a regression BLOCKS (and the bounded wait fails the test) rather than failing fast on EOF.
+#ifndef _WIN32
+    BlockedStdin stdin_guard;
+#endif
+    const std::string pem = kEncryptedPem;
+    const auto result = run_bounded(
+        [pem] {
+            const auto spki = gp::spki_sha256_hex(std::string_view{pem});
+            const auto facts = gp::parse_cert_facts(pem);
+            const auto file = gp::parse_pin_file(pem);
+            return std::make_tuple(spki.has_value(), facts.has_value(), file.state, file.pins.size());
+        },
+        std::chrono::seconds(10), [&] {
+#ifndef _WIN32
+            stdin_guard.release();
+#endif
+        });
+    REQUIRE(result.has_value()); // nullopt: a call blocked waiting for a passphrase
+    CHECK_FALSE(std::get<0>(*result));
+    CHECK_FALSE(std::get<1>(*result));
+    CHECK(std::get<2>(*result) == gp::PinFileState::Malformed);
+    CHECK(std::get<3>(*result) == 0);
 }
 
 TEST_CASE("gateway_peer_cert: EKU facts: serverAuth listed, clientAuth-only, and absent",
@@ -417,8 +546,24 @@ TEST_CASE("gateway_peer_pinset: parse_pin_file, PEM form", "[gateway_peer][pinse
         CHECK(r.pins.size() == 2);
         CHECK(r.pins_without_server_auth == 1);
     }
-    SECTION("BOM and CRLF are tolerated") {
-        CHECK(gp::parse_pin_file("\xEF\xBB\xBF" + gw1.cert_pem).state == S::Loaded);
+    SECTION("a UTF-8 BOM, CRLF line endings, and both together are tolerated") {
+        const std::string crlf = to_crlf(gw1.cert_pem);
+        REQUIRE(crlf.find("\r\n") != std::string::npos);
+        for (const auto& content : {"\xEF\xBB\xBF" + gw1.cert_pem, crlf, "\xEF\xBB\xBF" + crlf,
+                                    crlf + to_crlf(gw2.cert_pem)}) {
+            const auto r = gp::parse_pin_file(content);
+            CHECK(r.state == S::Loaded);
+            CHECK(!r.pins.empty());
+            CHECK(r.pins.front() == p1);
+        }
+        CHECK(gp::parse_pin_file(crlf + to_crlf(gw2.cert_pem)).pins ==
+              (std::vector<std::string>{p1, p2}));
+    }
+    SECTION("a duplicate block that lacks serverAuth is counted once") {
+        const auto r = gp::parse_pin_file(agent.cert_pem + agent.cert_pem);
+        CHECK(r.state == S::Loaded);
+        CHECK(r.pins.size() == 1);
+        CHECK(r.pins_without_server_auth == 1);
     }
     SECTION("duplicate blocks collapse, 32 blocks are the bound, 33 are over it") {
         CHECK(gp::parse_pin_file(repeat_pem(gw1.cert_pem, 32)).pins.size() == 1);
@@ -615,6 +760,155 @@ TEST_CASE("gateway_peer_pinset: the default filesystem reader is bounded and reg
     CHECK_FALSE(gp::load_boot_pins({}, {(dir.path / "absent").string()}, "").has_value());
 }
 
+TEST_CASE("gateway_peer_pinset: the default reader decides from one open and never blocks on a "
+          "non-regular file",
+          "[gateway_peer][pinset][boot]") {
+    yuzu::test::TempDir dir{"yuzu_test_gwpeer_reader_"};
+    std::filesystem::create_directories(dir.path);
+    using St = gp::FileReadResult::Status;
+    const auto write = [&](const char* name, const std::string& content) {
+        const auto p = dir.path / name;
+        std::ofstream(p, std::ios::binary) << content;
+        return p.string();
+    };
+
+    SECTION("the bound is exact: max_bytes is read, one byte more is TooLarge") {
+        const std::string exact = write("exact", std::string(100, 'x'));
+        const auto at = gp::read_file_bounded(exact, 100);
+        CHECK(at.status == St::Ok);
+        CHECK(at.content.size() == 100);
+        CHECK(gp::read_file_bounded(exact, 99).status == St::TooLarge);
+    }
+    SECTION("an empty file is Ok with no content, and a multi-chunk file is returned whole") {
+        const auto empty = gp::read_file_bounded(write("empty", ""), 100);
+        CHECK(empty.status == St::Ok);
+        CHECK(empty.content.empty());
+        std::string big;
+        for (int i = 0; i < 10000; ++i)
+            big += static_cast<char>('a' + (i % 26));
+        const auto r = gp::read_file_bounded(write("big", big), 20000);
+        CHECK(r.status == St::Ok);
+        CHECK(r.content == big);
+    }
+    SECTION("an unbounded max is refused instead of allocating") {
+        CHECK(gp::read_file_bounded(write("any", "x"), std::size_t{1} << 30).status == St::Unreadable);
+    }
+    SECTION("a path component that is a file is Missing, like an absent path") {
+        const std::string f = write("plain", "x");
+        CHECK(gp::read_file_bounded(f + "/child", 100).status == St::Missing);
+    }
+#ifndef _WIN32
+    SECTION("a symlink to a regular file is followed (secret mounts present files that way)") {
+        const std::string target = write("target", pin_n(5) + "\n");
+        const auto link = dir.path / "link";
+        std::filesystem::create_symlink(target, link);
+        const auto r = gp::read_file_bounded(link.string(), gp::kMaxPinFileBytes);
+        CHECK(r.status == St::Ok);
+        CHECK(r.content == pin_n(5) + "\n");
+        // ... and the target is held to the same bound.
+        CHECK(gp::read_file_bounded(link.string(), 3).status == St::TooLarge);
+    }
+    SECTION("a dangling symlink is Missing") {
+        const auto link = dir.path / "dangling";
+        std::filesystem::create_symlink(dir.path / "nowhere", link);
+        CHECK(gp::read_file_bounded(link.string(), 100).status == St::Missing);
+    }
+    SECTION("a FIFO is refused promptly, with no writer to wait for") {
+        const auto fifo = (dir.path / "fifo").string();
+        REQUIRE(::mkfifo(fifo.c_str(), 0600) == 0);
+        const auto r = run_bounded([fifo] { return gp::read_file_bounded(fifo, 100).status; },
+                                   std::chrono::seconds(10), [fifo] {
+                                       // Unblock a reader that did wait: open the write end.
+                                       if (const int fd = ::open(fifo.c_str(), O_WRONLY | O_NONBLOCK);
+                                           fd >= 0)
+                                           ::close(fd);
+                                   });
+        REQUIRE(r.has_value()); // nullopt: the read blocked on the FIFO
+        CHECK(*r == St::Unreadable);
+    }
+    SECTION("a character device is refused, not read") {
+        if (!std::filesystem::exists("/dev/zero"))
+            SKIP("no /dev/zero on this host");
+        CHECK(gp::read_file_bounded("/dev/zero", 100).status == St::Unreadable);
+    }
+#endif
+}
+
+TEST_CASE("gateway_peer_pinset: a supplied hex pin option with no pin in it is an error, not "
+          "'not supplied'",
+          "[gateway_peer][pinset][boot]") {
+    FakeFs fs;
+    const auto ca = gwt::make_ca("Boot CA");
+    fs.put("/auto/default-gateway.pem", gwt::make_gateway_leaf(ca).cert_pem);
+
+    for (const char* blank : {"", " ", " \t ", "\n"}) {
+        INFO("blank value: [" << blank << "]");
+        // Alone, next to a good pin, and with a perfectly good auto-pin file available: never a
+        // silent fall-through to the auto-pin.
+        for (const auto& hex : {std::vector<std::string>{blank},
+                                std::vector<std::string>{pin_n(1), blank}}) {
+            const auto r = gp::load_boot_pins(hex, {}, "/auto/default-gateway.pem", fs.reader());
+            REQUIRE_FALSE(r.has_value());
+            CHECK(r.error() == "gateway peer pin option supplied but contains no pin");
+        }
+    }
+    CHECK(fs.reads.empty()); // refused before any file was read
+}
+
+TEST_CASE("gateway_peer_pinset: the pins-without-serverAuth count is of DISTINCT pins with no "
+          "serverAuth source",
+          "[gateway_peer][pinset][boot]") {
+    FakeFs fs;
+    const auto ca = gwt::make_ca("Boot CA");
+    const auto agent = gwt::make_agent_leaf(ca);
+    const auto gateway = gwt::make_gateway_leaf(ca);
+    const std::string agent_pin = pin_of(agent.cert_pem);
+    fs.put("/pins/agent2x.pem", agent.cert_pem + agent.cert_pem);
+    fs.put("/pins/agent.pem", agent.cert_pem);
+    fs.put("/pins/agent-hex", agent_pin + "\n");
+    fs.put("/pins/gw.pem", gateway.cert_pem);
+
+    SECTION("the same certificate twice, in one file or two, is one pin and one count") {
+        auto r = gp::load_boot_pins({}, {"/pins/agent2x.pem"}, "", fs.reader());
+        REQUIRE(r.has_value());
+        CHECK(r->size() == 1);
+        CHECK(r->pins_without_server_auth() == 1);
+        r = gp::load_boot_pins({}, {"/pins/agent.pem", "/pins/agent2x.pem"}, "", fs.reader());
+        REQUIRE(r.has_value());
+        CHECK(r->size() == 1);
+        CHECK(r->pins_without_server_auth() == 1);
+    }
+    SECTION("a bare hex pin carries no extended key usage, so it is never counted") {
+        const auto r = gp::load_boot_pins({agent_pin}, {}, "", fs.reader());
+        REQUIRE(r.has_value());
+        CHECK(r->pins_without_server_auth() == 0);
+    }
+    SECTION("a key that ANY source supplies as usable is not counted, in either order") {
+        for (const auto& files : {std::vector<std::string>{"/pins/agent.pem", "/pins/agent-hex"},
+                                  std::vector<std::string>{"/pins/agent-hex", "/pins/agent.pem"}}) {
+            const auto r = gp::load_boot_pins({}, files, "", fs.reader());
+            REQUIRE(r.has_value());
+            CHECK(r->size() == 1);
+            CHECK(r->pins_without_server_auth() == 0);
+        }
+        const auto via_hex_pin = gp::load_boot_pins({agent_pin}, {"/pins/agent.pem"}, "", fs.reader());
+        REQUIRE(via_hex_pin.has_value());
+        CHECK(via_hex_pin->pins_without_server_auth() == 0);
+    }
+    SECTION("a mixed set counts only the pin that lacks serverAuth") {
+        const auto r = gp::load_boot_pins({}, {"/pins/agent.pem", "/pins/gw.pem"}, "", fs.reader());
+        REQUIRE(r.has_value());
+        CHECK(r->size() == 2);
+        CHECK(r->pins_without_server_auth() == 1);
+    }
+}
+
+TEST_CASE("gateway_peer_pinset: sorted_pins is stable and complete", "[gateway_peer][pinset]") {
+    const gp::PinSet s{{pin_n(3), pin_n(1), pin_n(2)}};
+    CHECK(s.sorted_pins() == (std::vector<std::string>{pin_n(1), pin_n(2), pin_n(3)}));
+    CHECK(gp::PinSet{}.sorted_pins().empty());
+}
+
 // -- [policy] -------------------------------------------------------------------
 
 TEST_CASE("gateway_peer_policy: the closed reason set and its label literals",
@@ -638,6 +932,10 @@ TEST_CASE("gateway_peer_policy: the closed reason set and its label literals",
         labels.insert(gp::to_label(expected[i].first));
     }
     CHECK(labels.size() == 8);
+    // The sentinel counts the reasons and is itself none of them.
+    CHECK(static_cast<std::size_t>(gp::DenyReason::kCount) == gp::kAllDenyReasons.size());
+    for (const auto r : gp::kAllDenyReasons)
+        CHECK(r != gp::DenyReason::kCount);
     CHECK(gp::kNotBeforeLeeway == std::chrono::minutes(5));
     CHECK_FALSE(gp::Decision{}.allowed);
 }
@@ -651,6 +949,7 @@ TEST_CASE("gateway_peer_policy: decision table, one row per reason and the allow
     const auto future = gwt::make_leaf(ca, "Future Gateway", true, true,
                                        gwt::not_yet_valid_validity());
     const auto renewed = gwt::reissue_same_key(ca, gateway, "Renewed", true, true);
+    const auto any_eku = gwt::make_leaf_with_eku(ca, "Any EKU", "anyExtendedKeyUsage");
     const SysTime now = std::chrono::system_clock::now();
     const SysTime nb9999{seconds{kYear9999NotBeforeEpoch}};
 
@@ -684,6 +983,10 @@ TEST_CASE("gateway_peer_policy: decision table, one row per reason and the allow
          R::NoServerAuthEku},
         {"serverAuth leaf, key not pinned", evidence(gateway.cert_pem),
          pins_of({pin_of(agent.cert_pem)}), now, R::NotPinned},
+        {"clientAuth-only leaf, key NOT pinned: the EKU check comes first", evidence(agent.cert_pem),
+         good, now, R::NoServerAuthEku},
+        {"anyExtendedKeyUsage-only leaf, key pinned: not serverAuth", evidence(any_eku.cert_pem),
+         pins_of({pin_of(any_eku.cert_pem)}), now, R::NoServerAuthEku},
         {"pinned, expired", evidence(expired.cert_pem), pins_of({pin_of(expired.cert_pem)}), now,
          R::OutsideValidity},
         {"pinned, not yet valid", evidence(future.cert_pem), pins_of({pin_of(future.cert_pem)}),
@@ -704,6 +1007,52 @@ TEST_CASE("gateway_peer_policy: decision table, one row per reason and the allow
         }
     }
     CHECK(seen.size() == gp::kAllDenyReasons.size()); // every closed reason has a row
+}
+
+TEST_CASE("gateway_peer_policy: a reason that proves an authenticated certificate holder is "
+          "never produced for anyone else",
+          "[gateway_peer][policy]") {
+    // reason_proves_authenticated_cert_holder() is what lets the guard offer an audit row only to
+    // a caller that is expensive to impersonate. Pin it against decide() itself: sweep every
+    // combination of the evidence and require that a "proving" reason is only ever returned for a
+    // transport-authenticated peer whose certificate parsed.
+    const auto ca = gwt::make_ca("Policy Test CA");
+    const auto gateway = gwt::make_gateway_leaf(ca);
+    const auto agent = gwt::make_agent_leaf(ca);
+    const auto expired = gwt::make_leaf(ca, "Old", true, true, gwt::expired_validity());
+    const SysTime now = std::chrono::system_clock::now();
+    const std::vector<std::shared_ptr<const gp::PinSet>> pin_sets{
+        pins_of({}), pins_of({pin_of(gateway.cert_pem)}),
+        pins_of({pin_of(gateway.cert_pem), pin_of(agent.cert_pem), pin_of(expired.cert_pem)})};
+    const std::vector<std::pair<std::string, bool>> pems{
+        {"", false}, {"garbage", false}, {kBadCertPem, false}, {gateway.cert_pem, true},
+        {agent.cert_pem, true}, {expired.cert_pem, true}};
+
+    std::set<gp::DenyReason> proving_seen;
+    for (const bool ctx : {false, true}) {
+        for (const bool authenticated : {false, true}) {
+            for (const auto& [pem, parses] : pems) {
+                for (const auto& pins : pin_sets) {
+                    const auto d = gp::decide(evidence(pem, authenticated, ctx), *pins, now);
+                    if (d.allowed || !gp::reason_proves_authenticated_cert_holder(d.reason))
+                        continue;
+                    proving_seen.insert(d.reason);
+                    INFO("ctx=" << ctx << " authenticated=" << authenticated
+                                << " reason=" << gp::to_label(d.reason));
+                    CHECK(ctx);
+                    CHECK(authenticated);
+                    CHECK(parses);
+                }
+            }
+        }
+    }
+    // The sweep reaches every proving reason, so the predicate is not vacuously satisfied.
+    CHECK(proving_seen == std::set<gp::DenyReason>{gp::DenyReason::NoServerAuthEku,
+                                                   gp::DenyReason::NotPinned,
+                                                   gp::DenyReason::OutsideValidity});
+    // The predicate's own table: exactly those three.
+    for (const auto r : gp::kAllDenyReasons)
+        CHECK(gp::reason_proves_authenticated_cert_holder(r) == proving_seen.contains(r));
 }
 
 TEST_CASE("gateway_peer_policy: the validity window opens 5 minutes early and closes strictly",

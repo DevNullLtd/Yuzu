@@ -7915,14 +7915,14 @@ public:
     [[nodiscard]] bool setup_gateway_peer_guard() {
         namespace gp = yuzu::server::gateway_peer;
 
-        metrics_.describe("yuzu_server_gateway_peer_authz_mode",
+        metrics_.describe(std::string{gp::kAuthzModeMetric},
                           "Gateway-upstream peer authorization mode: 1 for the active mode "
                           "(enforce; insecure_ack = acknowledged DISABLED on plaintext or without "
                           "a client CA; insecure_ack_tls = acknowledged DISABLED while TLS and a "
                           "client CA are on; disabled = service off)",
                           "gauge");
         for (const auto m : gp::kRunnableAuthzModes)
-            metrics_.gauge("yuzu_server_gateway_peer_authz_mode",
+            metrics_.gauge(std::string{gp::kAuthzModeMetric},
                            {{"mode", std::string{gp::to_label(m)}}})
                 .set(0);
 
@@ -7958,7 +7958,7 @@ public:
             spdlog::warn("gateway peer authorization: {}", w);
 
         const auto set_mode = [this](gp::AuthzMode m) {
-            metrics_.gauge("yuzu_server_gateway_peer_authz_mode",
+            metrics_.gauge(std::string{gp::kAuthzModeMetric},
                            {{"mode", std::string{gp::to_label(m)}}})
                 .set(1);
         };
@@ -8001,13 +8001,11 @@ public:
             spdlog::warn("gateway peer authorization: {}", w);
         if (res.auto_pin) {
             spdlog::info("gateway peer authorization: enforcing; the default gateway certificate "
-                         "({}) is pinned automatically (default gRPC certificates in use)",
-                         res.auto_pin_file);
+                         "({}) is pinned automatically (default gRPC certificates in use); {}",
+                         res.auto_pin_file, gp::format_pin_prefixes(*boot->pins));
         } else {
-            spdlog::info("gateway peer authorization: enforcing {} pin(s) from {} --gateway-peer-pin "
-                         "value(s) and {} pin file(s); pins are fixed until restart",
-                         boot->pins->size(), cfg_.gateway_peer_pins.size(),
-                         cfg_.gateway_peer_pin_files.size());
+            spdlog::info("{}", gp::enforce_boot_line(*boot->pins, cfg_.gateway_peer_pins.size(),
+                                                     cfg_.gateway_peer_pin_files.size()));
         }
 
         detail::GatewayPeerGuardedService::AuditSink audit = [this](const AuditEvent& ev) {
@@ -8241,6 +8239,12 @@ public:
 
         grpc::EnableDefaultHealthCheckService(true);
 
+        // KEEP IN SYNC with `gateway_peer::derive_listener_posture` (gateway_peer_resolution.hpp):
+        // the credential choice below (management override, strict default set, reused operator
+        // credentials) is what that function mirrors to decide whether the gateway-upstream
+        // listener has a client CA and runs on the default set. Changing which credentials the
+        // gateway-upstream listener (`mgmt_creds`) uses without changing the function makes the
+        // boot decision describe a listener that no longer exists.
         std::shared_ptr<grpc::ServerCredentials> agent_creds = grpc::InsecureServerCredentials();
         std::shared_ptr<grpc::ServerCredentials> mgmt_creds = grpc::InsecureServerCredentials();
         if (cfg_.tls_enabled) {

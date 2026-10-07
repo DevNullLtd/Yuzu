@@ -116,6 +116,10 @@ enum class AuthzMode : std::uint8_t {
     Refuse,      ///< do not start
 };
 
+/// The gauge the `mode` label below belongs to: ONE name, used by the server wherever it
+/// describes or sets the gauge.
+inline constexpr std::string_view kAuthzModeMetric = "yuzu_server_gateway_peer_authz_mode";
+
 /// The `mode` label of `yuzu_server_gateway_peer_authz_mode`. `Refuse` has no
 /// series (the process exits); it returns "refused" only so a caller can log it.
 [[nodiscard]] constexpr std::string_view to_label(AuthzMode m) {
@@ -162,10 +166,31 @@ struct BootPins {
 /// Build the boot pin set for an `Enforce` resolution (`load_boot_pins`). The sources are
 /// exactly the explicit ones, or the auto-pin file when `res.auto_pin` (never both, never a
 /// fallback from one to the other). Returns an error string, suitable for the boot log, when a
-/// hex pin or a pin file is malformed, missing or empty, or the union is empty. A set that
-/// contains a PEM-sourced entry without serverAuth gets a warning (the policy will deny that
-/// certificate). `reader` is injectable for tests (null selects the real filesystem reader).
+/// hex pin or a pin file is malformed, missing or empty, a supplied pin option holds no pin at
+/// all (blank), the union is empty, or EVERY pin is known to lack serverAuth (every call would be
+/// denied: the pin is of a CA or an agent-shaped certificate). A set in which only SOME pins lack
+/// serverAuth gets a warning (the policy will deny those certificates). `reader` is injectable
+/// for tests (null selects the real filesystem reader).
 [[nodiscard]] std::expected<BootPins, std::string>
 build_boot_pins(const ResolutionInputs& in, const Resolution& res, const FileReader& reader = {});
+
+/// How many pin prefixes the boot line lists; the rest are summarised as "... and K more".
+inline constexpr std::size_t kBootLogMaxPinPrefixes = 8;
+/// How many leading hex characters of a pin the boot line shows (the same width as the `spki=`
+/// field of a denial log line and audit detail, so the two can be compared by eye).
+inline constexpr std::size_t kBootLogPinPrefixChars = 16;
+
+/// The `pin prefixes (first 16 hex): p1,p2,...` clause of the boot line: the pins sorted, each
+/// cut to `kBootLogPinPrefixChars`, at most `kBootLogMaxPinPrefixes` listed and then
+/// `, ... and K more`. A prefix is half of a public-key hash, not a secret; it exists so an
+/// operator can compare the pins in force with the `spki=` of a denial. Empty set: "none".
+[[nodiscard]] std::string format_pin_prefixes(const PinSet& pins);
+
+/// The one INFO line `ServerImpl` logs when it enforces explicit pins:
+/// `gateway peer authorization: enforcing N pin(s) from A --gateway-peer-pin value(s) and B pin
+/// file(s); pins are fixed until restart; pin prefixes (first 16 hex): ...`. Pure, so a test can
+/// pin the whole string (operators and shell tests match on it).
+[[nodiscard]] std::string enforce_boot_line(const PinSet& pins, std::size_t hex_values,
+                                            std::size_t pin_files);
 
 } // namespace yuzu::server::gateway_peer

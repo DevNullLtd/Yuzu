@@ -15,7 +15,9 @@
  *   [budget]  DenialAuditBudget unit tests
  *
  * What is NOT proven here: the real handlers' behaviour (their own suites) and the production
- * wiring in server.cpp (the guard is not registered by the server yet).
+ * wiring in server.cpp (`setup_gateway_peer_guard` and the single registration site); that is
+ * covered by tests/shell/test_gateway_peer_boot_refusal.sh and
+ * tests/shell/test_gateway_peer_registration_lexical.sh.
  */
 
 #include <catch2/catch_test_macros.hpp>
@@ -65,6 +67,7 @@ namespace det = yuzu::server::detail;
 using yuzu::server::AuditEvent;
 using yuzu::server::DenialAuditBudget;
 using det::GatewayPeerGuardedService;
+using AuditSinkFn = GatewayPeerGuardedService::AuditSink;
 using det::kGatewayPeerDeniedMessage;
 
 namespace {
@@ -654,10 +657,16 @@ TEST_CASE("gateway_peer_guard: a ServerContext with no transport security is den
     CHECK(st.error_message() == std::string{kGatewayPeerDeniedMessage});
     CHECK(h.delegate.total() == 0);
     CHECK(h.denied_total_all() == 1);
-    // Whichever of the two unauthenticated reasons gRPC's empty context maps to, no row is written.
-    CHECK(h.denied("proxy_register", "not_authenticated") +
-              h.denied("proxy_register", "null_context") + h.denied("proxy_register", "no_cert") ==
-          1);
+    // A context that was never attached to a call carries an auth context that is not
+    // authenticated: exactly that one reason fires, and no other series moves.
+    CHECK(h.denied("proxy_register", "not_authenticated") == 1);
+    CHECK(h.denied_reason("not_authenticated") == 1);
+    for (const auto r : gp::kAllDenyReasons) {
+        if (r == gp::DenyReason::NotAuthenticated)
+            continue;
+        INFO("reason " << gp::to_label(r));
+        CHECK(h.denied_reason(std::string{gp::to_label(r)}.c_str()) == 0);
+    }
     CHECK(h.audit.size() == 0);
 }
 
@@ -1007,6 +1016,15 @@ TEST_CASE("gateway_peer_guard: only the four reasons an authenticated holder can
         INFO("reason " << gp::to_label(reason));
         CHECK(det::denial_may_carry_audit_row(reason) == writes);
     }
+    // The audit-eligible set is DERIVED from the policy's one "proves an authenticated holder"
+    // predicate (plus internal_error, which can occur at any stage and so also needs a key), not a
+    // second list: cross-check the literal table above against it, both directions.
+    for (const auto r : gp::kAllDenyReasons) {
+        INFO("reason " << gp::to_label(r));
+        CHECK(det::denial_may_carry_audit_row(r) ==
+              (gp::reason_proves_authenticated_cert_holder(r) ||
+               r == gp::DenyReason::InternalError));
+    }
 }
 
 TEST_CASE("gateway_peer_guard: a denial of a certificate holder writes one row carrying the "
@@ -1051,7 +1069,8 @@ TEST_CASE("gateway_peer_guard: a denial of a certificate holder writes one row c
     CHECK(row.action == "session.gateway_peer_denied");
     CHECK(row.result == "denied");
     CHECK(row.principal == "gateway-peer:" + spki.substr(0, 8));
-    CHECK(row.principal_role == "gateway");
+    // The peer authenticated at TLS but was refused: it is not labelled a gateway.
+    CHECK(row.principal_role == "unverified_peer");
     CHECK(row.principal_class.empty());
     CHECK(row.target_type == "GatewayRpc");
     CHECK(row.target_id == "batch_heartbeat");
@@ -1197,13 +1216,121 @@ TEST_CASE("gateway_peer_guard: key-less denials log through their own bounded bu
               grpc::StatusCode::UNAUTHENTICATED);
     cap.stop();
     const std::string text = cap.text();
-    const std::string needle = "gateway peer denied: rpc=proxy_register reason=null_context";
+    // A null context has no peer address: the line says `unknown` rather than omitting the field.
+    const std::string needle =
+        "gateway peer denied: rpc=proxy_register reason=null_context peer=unknown";
     std::size_t lines = 0;
     for (auto at = text.find(needle); at != std::string::npos; at = text.find(needle, at + 1))
         ++lines;
     CHECK(lines == 2);                                  // bounded
     CHECK(h.denied("proxy_register", "null_context") == 6); // the counter is complete
     CHECK(h.audit.size() == 0);
+}
+
+TEST_CASE("gateway_peer_guard: an anonymous caller's warning carries the peer address",
+          "[gateway_peer][guard][grpc][mtls][audit]") {
+    GuardHarness h;
+    h.start({kUnrelatedPin});
+    auto stub = gw::GatewayUpstream::NewStub(h.channel(h.optional_port, nullptr, h.ca.cert_pem));
+    yuzu::test::LogCapture cap;
+    CHECK(call_rpc(*stub, 1).error_code() == grpc::StatusCode::UNAUTHENTICATED);
+    cap.stop();
+    // The only attribution an unauthenticated caller has is where it connected from.
+    CHECK(cap.text().find("gateway peer denied: rpc=batch_heartbeat reason=not_authenticated "
+                          "peer=127.0.0.1") != std::string::npos);
+}
+
+TEST_CASE("gateway_peer_guard: an internal_error with no computable key writes NO row and counts "
+          "exactly once",
+          "[gateway_peer][guard][audit]") {
+    // A null pin set, and a policy clock that throws, both end as `internal_error` BEFORE any
+    // certificate is parsed, so there is no key to attribute: the counter moves once and the audit
+    // sink (which is wired and would accept the row) is never called.
+    RecordingDelegate delegate;
+    AuditCollector audit;
+    yuzu::MetricsRegistry metrics;
+    const AuditSinkFn sink = [&audit](const AuditEvent& e) { return audit(e); };
+    apb::RegisterRequest req;
+    apb::RegisterResponse resp;
+
+    SECTION("a null pin set") {
+        GatewayPeerGuardedService guard(delegate, gp::GatewayPeerPolicy(nullptr), sink, &metrics);
+        CHECK(guard.ProxyRegister(nullptr, &req, &resp).error_code() ==
+              grpc::StatusCode::UNAUTHENTICATED);
+    }
+    SECTION("a policy clock that throws") {
+        GatewayPeerGuardedService guard(
+            delegate,
+            gp::GatewayPeerPolicy(
+                std::make_shared<const gp::PinSet>(std::vector<std::string>{kUnrelatedPin}),
+                []() -> std::chrono::system_clock::time_point {
+                    throw std::runtime_error("clock");
+                }),
+            sink, &metrics);
+        CHECK(guard.ProxyRegister(nullptr, &req, &resp).error_code() ==
+              grpc::StatusCode::UNAUTHENTICATED);
+    }
+    const double internal =
+        metrics
+            .counter("yuzu_server_gateway_peer_denied_total",
+                     {{"rpc", "proxy_register"}, {"reason", "internal_error"}, {"event", "security"}})
+            .value();
+    CHECK(internal == 1);
+    CHECK(audit.size() == 0);
+    CHECK(delegate.total() == 0);
+}
+
+TEST_CASE("gateway_peer_guard: concurrent denials over the wire keep the counter complete and the "
+          "rows bounded",
+          "[gateway_peer][guard][grpc][mtls][audit][budget][threads]") {
+    // Four threads of keyed denials (one certificate holder, not_pinned) and four of key-less ones
+    // (anonymous), 25 calls each, against one guard. The budget is fixed at 5 rows per key for the
+    // whole run (a constant clock), so the totals are exact: every call is counted, exactly 5 rows
+    // are written, and every other keyed denial is counted as suppressed.
+    constexpr int kThreadsPerKind = 4;
+    constexpr int kCallsPerThread = 25;
+    constexpr int kKeyedCalls = kThreadsPerKind * kCallsPerThread;
+    constexpr std::size_t kRowBudget = 5;
+    auto budget = std::make_shared<DenialAuditBudget>(kRowBudget, 60'000, [] { return 0; });
+    auto log_budget = std::make_shared<DenialAuditBudget>(2, 60'000, [] { return 0; });
+    GuardHarness h(budget, log_budget);
+    const auto holder = gwt::make_gateway_leaf(h.ca, "holder");
+    h.start({kUnrelatedPin});
+    const auto keyed = gw::GatewayUpstream::NewStub(h.channel(h.optional_port, &holder, h.ca.cert_pem));
+    const auto anon = gw::GatewayUpstream::NewStub(h.channel(h.optional_port, nullptr, h.ca.cert_pem));
+
+    std::atomic<int> wrong_status{0};
+    std::vector<std::thread> threads;
+    yuzu::test::ScopeExit join_all([&] {
+        for (auto& th : threads)
+            if (th.joinable())
+                th.join();
+    });
+    const auto worker = [&](gw::GatewayUpstream::Stub* stub) {
+        for (int i = 0; i < kCallsPerThread; ++i) {
+            const auto st = call_rpc(*stub, 1);
+            if (st.error_code() != grpc::StatusCode::UNAUTHENTICATED ||
+                st.error_message() != std::string{kGatewayPeerDeniedMessage})
+                wrong_status.fetch_add(1);
+        }
+    };
+    for (int t = 0; t < kThreadsPerKind; ++t) {
+        threads.emplace_back(worker, keyed.get());
+        threads.emplace_back(worker, anon.get());
+    }
+    for (auto& th : threads)
+        th.join();
+
+    CHECK(wrong_status.load() == 0);
+    CHECK(h.delegate.total() == 0);
+    CHECK(h.denied("batch_heartbeat", "not_pinned") == kKeyedCalls);
+    CHECK(h.denied("batch_heartbeat", "not_authenticated") == kKeyedCalls);
+    CHECK(h.denied_total_all() == 2 * kKeyedCalls); // the counter is complete
+    CHECK(h.audit.size() == kRowBudget);            // rows bounded, and only keyed denials write
+    CHECK(h.suppressed() == kKeyedCalls - kRowBudget);
+    CHECK(budget->suppressed_total() == kKeyedCalls - kRowBudget);
+    CHECK(log_budget->suppressed_total() == kKeyedCalls - 2u); // the anonymous warnings are bounded too
+    // Teardown is the harness destructor: Shutdown with in-flight work finished must not hang.
 }
 
 // -- telemetry can never flip a deny -------------------------------------------------------
@@ -1358,6 +1485,28 @@ TEST_CASE("DenialAuditBudget: keys are budgeted independently", "[gateway_peer][
     CHECK(b.try_admit("not_pinned|a1b2c3d4").admitted);
     CHECK_FALSE(b.try_admit("not_pinned|a1b2c3d4").admitted);
     CHECK(b.try_admit("not_pinned|99999999").admitted); // a different key again
+}
+
+TEST_CASE("DenialAuditBudget: a key is truncated to kAuditMaxKeyBytes before use",
+          "[gateway_peer][budget]") {
+    std::int64_t now_ms = 0;
+    DenialAuditBudget b(1, 10'000, [&] { return now_ms; });
+    const std::string prefix(yuzu::server::kAuditMaxKeyBytes, 'k');
+    // Two keys that differ only AFTER the bound are the same key: the second is refused.
+    CHECK(b.try_admit(prefix + "A").admitted);
+    CHECK_FALSE(b.try_admit(prefix + "B").admitted);
+    CHECK(b.live_keys() == 1);
+    // A key that differs inside the bound is a different key.
+    std::string inside = prefix;
+    inside[yuzu::server::kAuditMaxKeyBytes - 1] = 'z';
+    CHECK(b.try_admit(inside + "A").admitted);
+    CHECK(b.live_keys() == 2);
+    // The overflow key is truncated the same way: a 10 kB name cannot grow the table.
+    DenialAuditBudget tiny(1, 10'000, [&] { return now_ms; }, /*max_keys=*/1);
+    (void)tiny.try_admit("first", "g");
+    for (int i = 0; i < 50; ++i)
+        (void)tiny.try_admit("n" + std::to_string(i), std::string(10'000, 'g') + std::to_string(i));
+    CHECK(tiny.live_keys() <= 3);
 }
 
 TEST_CASE("DenialAuditBudget: distinct keys are bounded, the excess shares one overflow key",

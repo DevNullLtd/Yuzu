@@ -599,18 +599,21 @@ TEST_CASE("gateway_peer_resolution: one missing file among valid pins still refu
     CHECK(mentions(boot.error(), "--gateway-peer-pin")); // names the flags to fix it
 }
 
-TEST_CASE("gateway_peer_resolution: a pin file whose certificate lacks serverAuth boots with a warning",
+TEST_CASE("gateway_peer_resolution: a pin set where only SOME certificates lack serverAuth boots "
+          "with a warning",
           "[gateway_peer][resolution][boot]") {
+    // (A set where EVERY certificate lacks it refuses: see the UP-9 test below.)
     const auto ca = gwt::make_ca("Boot CA");
     const auto agent = gwt::make_agent_leaf(ca);
+    const auto gateway = gwt::make_gateway_leaf(ca);
     Files files;
-    files.content["/etc/yuzu/agent-as-gw.pem"] = agent.cert_pem;
+    files.content["/etc/yuzu/mixed.pem"] = agent.cert_pem + gateway.cert_pem;
     auto in = operator_tls();
-    in.pin_files = {"/etc/yuzu/agent-as-gw.pem"};
+    in.pin_files = {"/etc/yuzu/mixed.pem"};
     const auto res = gp::resolve_gateway_peer_authz(in);
     auto boot = gp::build_boot_pins(in, res, files.reader());
     REQUIRE(boot.has_value());
-    CHECK(boot->pins->size() == 1);
+    CHECK(boot->pins->size() == 2);
     REQUIRE(boot->warnings.size() == 1);
     CHECK(mentions(boot->warnings.front(), "without serverAuth"));
     CHECK(mentions(boot->warnings.front(), "deny"));
@@ -680,6 +683,162 @@ TEST_CASE("gateway_peer_resolution: explicit hex pins boot with no files at all"
     auto boot = gp::build_boot_pins(in, res);
     REQUIRE(boot.has_value());
     CHECK(boot->pins->size() == 2);
+}
+
+TEST_CASE("gateway_peer_resolution: a pin set in which EVERY pin lacks serverAuth refuses",
+          "[gateway_peer][resolution][boot]") {
+    // The policy denies every certificate without serverAuth, even a pinned one, so such a set
+    // would boot a service that can never admit anyone. A CA certificate or an agent-shaped
+    // certificate pinned by mistake is the usual cause.
+    const auto ca = gwt::make_ca("Boot CA");
+    const auto agent = gwt::make_agent_leaf(ca);
+    const auto agent2 = gwt::make_agent_leaf(ca, "agent-2");
+    const auto gateway = gwt::make_gateway_leaf(ca);
+    Files files;
+    files.content["/etc/yuzu/agent.pem"] = agent.cert_pem;
+    files.content["/etc/yuzu/agents.pem"] = agent.cert_pem + agent2.cert_pem;
+    files.content["/etc/yuzu/agent-twice.pem"] = agent.cert_pem + agent.cert_pem;
+    files.content["/etc/yuzu/ca.pem"] = ca.cert_pem;
+    files.content["/etc/yuzu/gw.pem"] = gateway.cert_pem;
+    files.content["/etc/yuzu/agent-hex"] = spki_of(agent.cert_pem) + "\n";
+
+    struct Row {
+        const char* name;
+        std::vector<std::string> hex;
+        std::vector<std::string> pin_files;
+        bool boots;
+        std::size_t warnings;
+    };
+    const std::vector<Row> rows{
+        {"one agent-shaped certificate", {}, {"/etc/yuzu/agent.pem"}, false, 0},
+        {"two agent-shaped certificates in one file", {}, {"/etc/yuzu/agents.pem"}, false, 0},
+        {"the same agent-shaped certificate twice (one pin, not two)", {},
+         {"/etc/yuzu/agent-twice.pem"}, false, 0},
+        {"a CA certificate", {}, {"/etc/yuzu/ca.pem"}, false, 0},
+        {"agent files across two sources", {}, {"/etc/yuzu/agent.pem", "/etc/yuzu/agents.pem"}, false, 0},
+        {"one agent-shaped and one gateway certificate: warns, boots", {},
+         {"/etc/yuzu/agent.pem", "/etc/yuzu/gw.pem"}, true, 1},
+        {"an agent-shaped certificate plus a hex pin (its serverAuth is unknown): warns, boots",
+         {hex_pin('a')}, {"/etc/yuzu/agent.pem"}, true, 1},
+        {"the same key as a PEM without serverAuth and as a bare hex pin: not counted",
+         {}, {"/etc/yuzu/agent.pem", "/etc/yuzu/agent-hex"}, true, 0},
+        {"a gateway certificate alone", {}, {"/etc/yuzu/gw.pem"}, true, 0},
+        {"hex pins only", {hex_pin('a'), hex_pin('b')}, {}, true, 0},
+    };
+    for (const auto& row : rows) {
+        INFO(row.name);
+        auto in = operator_tls();
+        in.hex_pins = row.hex;
+        in.pin_files = row.pin_files;
+        const auto res = gp::resolve_gateway_peer_authz(in);
+        REQUIRE(res.mode == AuthzMode::Enforce);
+        const auto boot = gp::build_boot_pins(in, res, files.reader());
+        CHECK(boot.has_value() == row.boots);
+        if (boot) {
+            CHECK(boot->warnings.size() == row.warnings);
+        } else {
+            CHECK(boot.error() ==
+                  "Gateway peer pin configuration is invalid: every configured gateway peer pin "
+                  "lacks the serverAuth extended key usage, so every call would be denied; pin the "
+                  "gateway's own certificate (not a CA certificate). Refusing to start. Fix the "
+                  "pin source, or supply --gateway-peer-pin <64-hex> or --gateway-peer-pin-file "
+                  "<pem-or-hex-file> (compute the 64-hex pin with: openssl x509 -pubkey -noout -in "
+                  "<gateway.pem> | openssl pkey -pubin -outform DER | openssl dgst -sha256 | awk "
+                  "'{print $NF}').");
+        }
+    }
+
+    SECTION("on the automatic pin too: the default gateway certificate lacking serverAuth refuses") {
+        files.content[kDefaultGw] = agent.cert_pem;
+        const auto in = defaults_tls();
+        const auto res = gp::resolve_gateway_peer_authz(in);
+        REQUIRE(res.auto_pin);
+        const auto boot = gp::build_boot_pins(in, res, files.reader());
+        REQUIRE_FALSE(boot.has_value());
+        CHECK(mentions(boot.error(), "lacks the serverAuth extended key usage"));
+        CHECK(mentions(boot.error(), "automatic pin"));
+    }
+}
+
+TEST_CASE("gateway_peer_resolution: a supplied pin option that holds no pin refuses at boot, on every "
+          "certificate posture",
+          "[gateway_peer][resolution][boot]") {
+    const auto ca = gwt::make_ca("Boot CA");
+    Files files;
+    files.content[kDefaultGw] = gwt::make_gateway_leaf(ca).cert_pem; // a good auto-pin exists
+
+    for (const bool default_creds : {true, false}) {
+        INFO("default gRPC credentials: " << default_creds);
+        auto in = default_creds ? defaults_tls() : operator_tls();
+        in.hex_pins = {""}; // what normalize keeps of `--gateway-peer-pin ""` / `","` / `" "`
+        const auto res = gp::resolve_gateway_peer_authz(in);
+        REQUIRE(res.mode == AuthzMode::Enforce);
+        CHECK_FALSE(res.auto_pin); // never the auto-pin
+        const auto boot = gp::build_boot_pins(in, res, files.reader());
+        REQUIRE_FALSE(boot.has_value());
+        CHECK(mentions(boot.error(), "gateway peer pin option supplied but contains no pin. "
+                                     "Refusing to start."));
+    }
+    SECTION("with the acknowledgement it is the contradiction refusal, still a refusal") {
+        auto in = defaults_tls();
+        in.hex_pins = {""};
+        in.insecure_ack = true;
+        const auto res = gp::resolve_gateway_peer_authz(in);
+        CHECK(res.mode == AuthzMode::Refuse);
+    }
+    SECTION("with the service disabled the pins are ignored with the usual warning") {
+        ResolutionInputs in;
+        in.hex_pins = {""};
+        const auto res = gp::resolve_gateway_peer_authz(in);
+        CHECK(res.mode == AuthzMode::Disabled);
+        CHECK(any_warning_mentions(res, "ignored"));
+    }
+}
+
+TEST_CASE("gateway_peer_resolution: the boot line lists the pins by sorted 16-hex prefix, capped at 8",
+          "[gateway_peer][resolution][boot]") {
+    const auto pin_with = [](unsigned i) {
+        std::string s(64, '0');
+        s[0] = static_cast<char>('a' + static_cast<int>(i)); // a.., so the sort order is the index
+        s[16] = 'f';                                         // beyond the 16-char prefix
+        return s;
+    };
+    const auto prefix_of = [&](unsigned i) { return pin_with(i).substr(0, 16); };
+
+    SECTION("a single pin") {
+        const gp::PinSet one{{pin_with(0)}};
+        CHECK(gp::format_pin_prefixes(one) == "pin prefixes (first 16 hex): " + prefix_of(0));
+        CHECK(gp::enforce_boot_line(one, 1, 0) ==
+              "gateway peer authorization: enforcing 1 pin(s) from 1 --gateway-peer-pin value(s) and "
+              "0 pin file(s); pins are fixed until restart; pin prefixes (first 16 hex): " +
+                  prefix_of(0));
+    }
+    SECTION("sorted regardless of insertion order, and the pin beyond 16 hex is not shown") {
+        const gp::PinSet two{{pin_with(2), pin_with(0)}};
+        const std::string text = gp::format_pin_prefixes(two);
+        CHECK(text == "pin prefixes (first 16 hex): " + prefix_of(0) + "," + prefix_of(2));
+        CHECK_FALSE(mentions(text, pin_with(0)));
+    }
+    SECTION("exactly 8 are all listed; the 9th and 10th become a count") {
+        std::vector<std::string> pins;
+        for (unsigned i = 0; i < 8; ++i)
+            pins.push_back(pin_with(i));
+        std::string expected = "pin prefixes (first 16 hex): ";
+        for (unsigned i = 0; i < 8; ++i)
+            expected += (i ? "," : "") + prefix_of(i);
+        CHECK(gp::format_pin_prefixes(gp::PinSet{pins}) == expected);
+        pins.push_back(pin_with(8));
+        pins.push_back(pin_with(9));
+        CHECK(gp::format_pin_prefixes(gp::PinSet{pins}) == expected + ", ... and 2 more");
+    }
+    SECTION("an empty set says none (it cannot boot, but the formatter must not misbehave)") {
+        CHECK(gp::format_pin_prefixes(gp::PinSet{}) == "pin prefixes (first 16 hex): none");
+    }
+    SECTION("the counts in the line are the supplied ones, not derived") {
+        const gp::PinSet two{{pin_with(0), pin_with(1)}};
+        CHECK(mentions(gp::enforce_boot_line(two, 3, 2),
+                       "enforcing 2 pin(s) from 3 --gateway-peer-pin value(s) and 2 pin file(s); "));
+    }
 }
 
 // -- listener posture ---------------------------------------------------------------------

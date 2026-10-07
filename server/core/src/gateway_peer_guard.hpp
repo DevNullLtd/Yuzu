@@ -48,12 +48,14 @@
 ///     sink ONLY when the peer's SPKI key is computable, that is, only for a TLS-authenticated
 ///     certificate holder, and only for the reasons `no_server_auth_eku`, `not_pinned`,
 ///     `outside_validity` and `internal_error`. Principal `gateway-peer:<first 8 hex of the
-///     peer's own SPKI SHA-256>`, `principal_role` `gateway`, detail
+///     peer's own SPKI SHA-256>`, `principal_role` `unverified_peer` (the peer is
+///     TLS-authenticated but was refused, so it is not labelled a gateway), detail
 ///     `reason=<reason> rpc=<rpc> spki=<first 16 hex>`: hex and closed labels only, never PEM,
 ///     subject names or serials. `principal_class` stays empty (this is not an HTTP session or
 ///     token principal). NO row is written for `null_context`, `not_authenticated`, `no_cert`
 ///     or `bad_cert`: an unauthenticated caller costs nothing to produce, so those denials are
-///     the counter plus a rate-limited warning log only. Rows go through the keyed
+///     the counter plus a rate-limited warning log only (that warning carries `peer=<ip>`, the
+///     only attribution such a caller has). Rows go through the keyed
 ///     `DenialAuditBudget` (key `<reason>|<8 hex of the peer key>`, overflow bucket
 ///     `<reason>|*`); the budget bounds the rows and never gates the refusal;
 ///   * rows the budget refused are counted in
@@ -130,14 +132,15 @@ static_assert(kGatewayUpstreamRpcNames.size() == static_cast<std::size_t>(Gatewa
 }
 
 /// Whether a denial for `reason` may carry an audit row (it additionally needs a computable
-/// SPKI key, so it is a necessary condition only). The four reasons that can only follow from an
-/// authenticated certificate holder: `no_server_auth_eku`, `not_pinned`, `outside_validity`
-/// and `internal_error`. Never true for `null_context`, `not_authenticated`, `no_cert` or
-/// `bad_cert`: those are the counter plus a rate-limited warning line only.
+/// SPKI key, so it is a necessary condition only). Derived from ONE predicate,
+/// `gateway_peer::reason_proves_authenticated_cert_holder` (the reasons reachable only after the
+/// transport authenticated the peer and its certificate parsed: `no_server_auth_eku`,
+/// `not_pinned`, `outside_validity`), plus `internal_error`, which can occur at any stage and
+/// therefore relies on the key requirement. Never true for `null_context`, `not_authenticated`,
+/// `no_cert` or `bad_cert`: those are the counter plus a rate-limited warning line only.
 [[nodiscard]] constexpr bool denial_may_carry_audit_row(gateway_peer::DenyReason r) {
-    using R = gateway_peer::DenyReason;
-    return r == R::NoServerAuthEku || r == R::NotPinned || r == R::OutsideValidity ||
-           r == R::InternalError;
+    return gateway_peer::reason_proves_authenticated_cert_holder(r) ||
+           r == gateway_peer::DenyReason::InternalError;
 }
 
 class GatewayPeerGuardedService final : public ::yuzu::gateway::v1::GatewayUpstream::Service {

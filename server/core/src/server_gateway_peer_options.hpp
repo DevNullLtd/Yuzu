@@ -54,7 +54,7 @@ inline void register_gateway_peer_options(CLI::App& app, Config& cfg) {
         ->envname(std::string{kGatewayPeerPinFileEnv});
     app.add_flag(std::string{kInsecureGatewayPeerFlag}, cfg.insecure_gateway_peer,
                  "Run the gateway-upstream service with peer authorization DISABLED. The only way "
-                 "to use --gateway-upstream with --no-tls, or without pins. Refused together with "
+                 "to use --gateway-upstream with --no-tls, or on operator certificates without a pin. Refused together with "
                  "any --gateway-peer-pin / --gateway-peer-pin-file. Development rigs only.")
         ->envname(std::string{kInsecureGatewayPeerEnv});
 }
@@ -62,10 +62,23 @@ inline void register_gateway_peer_options(CLI::App& app, Config& cfg) {
 /// Flatten comma-separated pin tokens, so every surface reports what the server will actually
 /// use. Call once after parsing. Tokens are NOT validated here (`load_boot_pins` rejects a
 /// malformed one).
+///
+/// A SUPPLIED value that holds no pin at all (`""`, `" "`, `","`, in the command-line or the
+/// environment form) is kept as ONE empty element rather than dropped. Dropping it would turn
+/// "the operator gave a pin option and it is blank" into "no pin option was given", which on the
+/// default certificates silently selects the automatic pin and on operator certificates reports a
+/// missing pin instead of the blank one. An empty element keeps the option marked as supplied, and
+/// `load_boot_pins` refuses it. A blank piece NEXT TO a real pin in the same value (`a,,` or
+/// `a, ,b`) stays harmless: only a value with no pin in it is kept.
 inline void normalize_gateway_peer_options(Config& cfg) {
     std::vector<std::string> flat;
     for (const auto& token : cfg.gateway_peer_pins) {
-        for (auto& part : gateway_peer::split_pin_list(token))
+        auto parts = gateway_peer::split_pin_list(token);
+        if (parts.empty()) {
+            flat.emplace_back(); // supplied, but blank: see above
+            continue;
+        }
+        for (auto& part : parts)
             flat.push_back(std::move(part));
     }
     cfg.gateway_peer_pins = std::move(flat);

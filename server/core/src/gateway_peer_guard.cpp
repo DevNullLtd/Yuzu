@@ -16,9 +16,25 @@ namespace {
 
 constexpr std::string_view kPrincipalPrefix = "gateway-peer:";
 constexpr std::string_view kDeniedTargetType = "GatewayRpc";
-constexpr std::string_view kGatewayRole = "gateway"; // principal_role of an authenticated peer
+// principal_role of a DENIED peer's audit row. The peer authenticated at the TLS layer (its
+// certificate chained to the listener's CA) but was refused by this guard, so it is NOT yet a
+// gateway: labelling it "gateway" would let a role filter or a SIEM rule read a refused caller as
+// an authorized one. The principal stays `gateway-peer:<spki8>`.
+constexpr std::string_view kUnverifiedPeerRole = "unverified_peer";
 constexpr std::size_t kPrincipalSpkiChars = 8;
 constexpr std::size_t kDetailSpkiChars = 16;
+
+/// The refusal every denial returns. Never throws: the message is longer than a small-string
+/// buffer, so building it allocates; if that fails, the fallback is a status that does not
+/// allocate (a copy of the library's static `CANCELLED`, empty message). Either way the caller
+/// gets a non-OK status, never an exception out of the handler.
+grpc::Status denied_status() noexcept {
+    try {
+        return grpc::Status(grpc::StatusCode::UNAUTHENTICATED, std::string{kGatewayPeerDeniedMessage});
+    } catch (...) {
+        return grpc::Status::CANCELLED;
+    }
+}
 
 yuzu::Labels denied_labels(GatewayUpstreamRpc rpc, gateway_peer::DenyReason reason) {
     return {{"rpc", std::string{to_label(rpc)}},
@@ -102,8 +118,16 @@ void GatewayPeerGuardedService::record_denial(grpc::ServerContext* context, Gate
         if (spki_sha256_hex.empty() || !denial_may_carry_audit_row(reason)) {
             // The key-less log budget is keyed by the closed reason, so it is bounded by
             // construction and one reason's flood cannot silence another's line.
-            if (log_budget_->try_admit(reason_name, reason_name).admitted)
-                spdlog::warn("gateway peer denied: rpc={} reason={}", rpc_name, reason_name);
+            if (log_budget_->try_admit(reason_name, reason_name).admitted) {
+                // The peer address is the only attribution an unauthenticated or certificate-less
+                // caller has, so the warning carries it (the IP is shape-validated by
+                // extract_peer_ip; `unknown` when there is none).
+                std::string peer_ip = context ? extract_peer_ip(context->peer()) : std::string{};
+                if (peer_ip.empty())
+                    peer_ip = "unknown";
+                spdlog::warn("gateway peer denied: rpc={} reason={} peer={}", rpc_name, reason_name,
+                             peer_ip);
+            }
             return;
         }
 
@@ -136,7 +160,7 @@ void GatewayPeerGuardedService::record_denial(grpc::ServerContext* context, Gate
         AuditEvent ev;
         // Fields are assigned in AuditEvent declaration order.
         ev.principal = std::string{kPrincipalPrefix} + spki8;
-        ev.principal_role = std::string{kGatewayRole};
+        ev.principal_role = std::string{kUnverifiedPeerRole};
         ev.action = std::string{kGatewayPeerDeniedAuditAction};
         ev.target_type = std::string{kDeniedTargetType};
         ev.target_id = std::string{rpc_name};
@@ -157,14 +181,15 @@ grpc::Status GatewayPeerGuardedService::authorize(grpc::ServerContext* context,
     if (acknowledged_insecure_)
         return grpc::Status::OK; // boot-selected acknowledgement; see the header
     gateway_peer::Decision d; // default-constructed: deny
-    grpc_peer::PeerCertEvidence peer;
+    gateway_peer::PeerEvidence ev;
+    bool peer_authenticated = false;
     try {
-        gateway_peer::PeerEvidence ev;
         ev.context_present = (context != nullptr);
         if (context) {
-            peer = grpc_peer::read_peer_cert_evidence(*context);
+            grpc_peer::PeerCertEvidence peer = grpc_peer::read_peer_cert_evidence(*context);
+            peer_authenticated = peer.authenticated;
             ev.peer_authenticated = peer.authenticated;
-            ev.cert_pem = peer.pem;
+            ev.cert_pem = std::move(peer.pem); // moved, not copied: `ev` is read-only from here
         }
         d = policy_.decide(ev);
     } catch (...) {
@@ -173,21 +198,28 @@ grpc::Status GatewayPeerGuardedService::authorize(grpc::ServerContext* context,
     if (d.allowed)
         return grpc::Status::OK;
 
-    // Attribution: the key of a TLS-authenticated peer whose certificate parsed. The decision
-    // carries it when it got that far; an `internal_error` that precedes or interrupts the parse
-    // is attributed here, on the denial path only. Whether a row is written at all is decided in
-    // record_denial by the reason, so a key computed here never widens what is audited.
-    std::string spki = d.spki_sha256_hex;
-    if (spki.empty() && peer.authenticated && !peer.pem.empty()) {
-        try {
-            spki = gateway_peer::spki_sha256_hex(std::string_view{peer.pem})
-                       .value_or(std::string{});
-        } catch (...) {
-            spki.clear();
+    // Everything below is reporting plus building the refusal. None of it may throw out of the
+    // handler (an allocation failure here would otherwise unwind through gRPC); the refusal
+    // itself was decided above and does not depend on any of it.
+    try {
+        // Attribution: the key of a TLS-authenticated peer whose certificate parsed. The decision
+        // carries it when it got that far; an `internal_error` that precedes or interrupts the
+        // parse is attributed here, on the denial path only. Whether a row is written at all is
+        // decided in record_denial by the reason, so a key computed here never widens what is
+        // audited.
+        std::string spki = d.spki_sha256_hex;
+        if (spki.empty() && peer_authenticated && !ev.cert_pem.empty()) {
+            try {
+                spki = gateway_peer::spki_sha256_hex(std::string_view{ev.cert_pem})
+                           .value_or(std::string{});
+            } catch (...) {
+                spki.clear();
+            }
         }
+        record_denial(context, rpc, d.reason, spki);
+    } catch (...) {
     }
-    record_denial(context, rpc, d.reason, spki);
-    return grpc::Status(grpc::StatusCode::UNAUTHENTICATED, std::string{kGatewayPeerDeniedMessage});
+    return denied_status();
 }
 
 grpc::Status GatewayPeerGuardedService::ProxyRegister(grpc::ServerContext* context,

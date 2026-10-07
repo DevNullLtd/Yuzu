@@ -9,6 +9,10 @@
 
 #include "default_certs.hpp"
 
+#include "gateway_peer_cert.hpp"
+#include "gateway_peer_pinset.hpp"
+#include "gateway_peer_policy.hpp"
+
 #include "ca_store.hpp"
 #include "key_provider.hpp"
 #include "pg/pg_exec.hpp"
@@ -158,6 +162,53 @@ TEST_CASE("default_certs: leaf EKUs match each role (server is also a client —
     const uint32_t https_eku = leaf_eku_flags(set.https_cert);
     REQUIRE((https_eku & XKU_SSL_SERVER) != 0);
     REQUIRE((https_eku & XKU_SSL_CLIENT) == 0);
+}
+
+TEST_CASE("default_certs: the generated gateway leaf is admitted by the automatic pin the server "
+          "derives from it, and nothing else in the set is",
+          "[default_certs][gateway_peer]") {
+    // The boot-time auto-pin (`load_boot_pins` over default-gateway.pem) and the per-call policy
+    // are tested elsewhere against throwaway certificates. This test closes the seam with the REAL
+    // generator: if default_certs.cpp ever issued the gateway leaf without serverAuth, or the
+    // auto-pin read a different file or key, a default-certificate deployment would deny its own
+    // gateway on every call.
+    namespace gp = yuzu::server::gateway_peer;
+    TempDir dir;
+    DefaultCertSet set;
+    REQUIRE(ensure_default_certs(dir.path, "test-host", nullptr, set));
+    const std::string gateway_pem = read_file(set.gateway_cert);
+
+    const auto facts = gp::parse_cert_facts(gateway_pem);
+    REQUIRE(facts.has_value());
+    CHECK(facts->has_server_auth_eku);
+
+    // The auto-pin, loaded through the REAL file reader exactly as the server does.
+    const auto pins = gp::load_boot_pins({}, {}, set.gateway_cert.string());
+    REQUIRE(pins.has_value());
+    CHECK(pins->size() == 1);
+    CHECK(pins->contains(facts->spki_sha256_hex));
+    CHECK(pins->pins_without_server_auth() == 0);
+
+    const gp::GatewayPeerPolicy policy{std::make_shared<const gp::PinSet>(*pins)};
+    const auto decide = [&](const std::string& pem) {
+        gp::PeerEvidence ev;
+        ev.context_present = true;
+        ev.peer_authenticated = true;
+        ev.cert_pem = pem;
+        return policy.decide(ev);
+    };
+    CHECK(decide(gateway_pem).allowed);
+    // The other leaves of the same set chain to the same CA and are valid, but their KEYS are not
+    // the gateway's: the pin is of the gateway key, not of the CA or of "a default leaf".
+    for (const auto& other : {set.server_cert, set.https_cert}) {
+        INFO(other.string());
+        const auto d = decide(read_file(other));
+        CHECK_FALSE(d.allowed);
+        CHECK(d.reason == gp::DenyReason::NotPinned);
+    }
+    // The CA certificate is not a gateway either (no serverAuth is required of a CA, so it is
+    // refused on the EKU or on the pin, whichever is checked first).
+    CHECK_FALSE(decide(read_file(set.ca_cert)).allowed);
 }
 
 TEST_CASE("default_certs: server leaves backdate notBefore by the clock-skew allowance (#1302)",

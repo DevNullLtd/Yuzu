@@ -49,13 +49,22 @@ struct ErrQueueClearer {
     ~ErrQueueClearer() { ERR_clear_error(); }
 };
 
+/// Password callback that always refuses. A PEM block carrying `Proc-Type: 4,ENCRYPTED` makes
+/// OpenSSL ask for a passphrase, and with no callback it prompts on the controlling terminal or
+/// stdin and blocks the booting (or calling) thread. A certificate PEM never needs one, so the
+/// answer is always "no": the read fails and the caller sees a malformed certificate. Returning
+/// -1 (not 0) is the documented "error" answer.
+int refuse_passphrase(char* /*buf*/, int /*size*/, int /*rwflag*/, void* /*userdata*/) {
+    return -1;
+}
+
 X509Ptr load_first_cert(std::string_view pem) {
     if (pem.empty() || pem.size() > kMaxCertPemBytes)
         return nullptr;
     BioPtr bio{BIO_new_mem_buf(pem.data(), static_cast<int>(pem.size()))};
     if (!bio)
         return nullptr;
-    return X509Ptr{PEM_read_bio_X509(bio.get(), nullptr, nullptr, nullptr)};
+    return X509Ptr{PEM_read_bio_X509(bio.get(), nullptr, &refuse_passphrase, nullptr)};
 }
 
 /// Seconds since the epoch of an ASN1_TIME, computed as a difference against an

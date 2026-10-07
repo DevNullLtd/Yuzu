@@ -21,17 +21,18 @@
 ///      an issuer, a subject name or CA membership,
 ///   7. `now` lies inside its validity window (`OutsideValidity`). The window opens
 ///      `kNotBeforeLeeway` BEFORE notBefore (this check's own allowance; a TLS
-///      handshake applies none) and ends strictly at notAfter. Both bounds are
-///      whole seconds and `now` is floored to a second before comparing.
+///      handshake applies none). A call is denied when `now`, floored to a whole
+///      second, is later than notAfter (a call in notAfter's own second is still
+///      admitted). Both certificate bounds are whole seconds.
 ///
 /// FAIL CLOSED. A default-constructed `Decision` is a deny. An empty pin set is an
 /// `InternalError` deny (boot refuses to start with zero pins, so reaching this is
 /// a wiring defect, not an operator state). Any exception while deciding is an
 /// `InternalError` deny.
 ///
-/// REASONS are a CLOSED set of 8. `to_label()` is the stable snake_case string used
-/// as the metric `reason` label; adding a value means adding a label, a test row
-/// and a pre-seeded series in the guard.
+/// REASONS are a CLOSED set of 8 (`DenyReason::kCount` is the sentinel, not a reason).
+/// `to_label()` is the stable snake_case string used as the metric `reason` label; adding a value
+/// means adding a label, a test row and a pre-seeded series in the guard.
 ///
 /// The decision is pure: no I/O, no globals, no clock read (the caller passes
 /// `now`). Nothing here depends on gRPC. There is no revocation check and no pin
@@ -61,6 +62,7 @@ enum class DenyReason : std::uint8_t {
     NotPinned,
     OutsideValidity,
     InternalError,
+    kCount, ///< sentinel: the number of reasons above, never a reason
 };
 
 inline constexpr std::array<DenyReason, 8> kAllDenyReasons{
@@ -68,10 +70,32 @@ inline constexpr std::array<DenyReason, 8> kAllDenyReasons{
     DenyReason::BadCert,          DenyReason::NoServerAuthEku,  DenyReason::NotPinned,
     DenyReason::OutsideValidity,  DenyReason::InternalError,
 };
-// A reason added to the enum without a row here would be missing from every pre-seeded
-// metric series and from the label tests; the enum's last value is InternalError.
-static_assert(kAllDenyReasons.size() == static_cast<std::size_t>(DenyReason::InternalError) + 1,
+// A reason added to the enum without a row here would be missing from every pre-seeded metric
+// series and from the label tests. The size must match the sentinel, and the list must be the
+// enumerators in declaration order (so a reorder or a duplicate fails the build too).
+static_assert(kAllDenyReasons.size() == static_cast<std::size_t>(DenyReason::kCount),
               "kAllDenyReasons must list every DenyReason");
+static_assert(
+    [] {
+        for (std::size_t i = 0; i < kAllDenyReasons.size(); ++i) {
+            if (static_cast<std::size_t>(kAllDenyReasons[i]) != i)
+                return false;
+        }
+        return true;
+    }(),
+    "kAllDenyReasons must list the DenyReason enumerators in declaration order");
+
+/// Whether `r` can only be produced for a TLS-authenticated peer whose certificate parsed: the
+/// three reasons `decide` reaches only after the transport authenticated the peer AND the
+/// certificate parsed. A caller that has not got that far (no context, unauthenticated, no
+/// certificate, an unparseable one) costs nothing to produce, which is what an audit row must
+/// never be offered to. `InternalError` is NOT in this set: it can occur before any parse. A
+/// reason added without a decision here defaults to "not proven authenticated", the direction
+/// that writes fewer rows.
+[[nodiscard]] constexpr bool reason_proves_authenticated_cert_holder(DenyReason r) {
+    return r == DenyReason::NoServerAuthEku || r == DenyReason::NotPinned ||
+           r == DenyReason::OutsideValidity;
+}
 
 [[nodiscard]] constexpr std::string_view to_label(DenyReason r) {
     switch (r) {
@@ -91,6 +115,8 @@ static_assert(kAllDenyReasons.size() == static_cast<std::size_t>(DenyReason::Int
         return "outside_validity";
     case DenyReason::InternalError:
         return "internal_error";
+    case DenyReason::kCount:
+        break;
     }
     return "internal_error";
 }

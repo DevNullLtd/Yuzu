@@ -154,9 +154,13 @@ inline void add_ext(X509* cert, X509* issuer, int nid, const char* value) {
 /// A certificate over `subject_key`'s public half, signed by `issuer_key` (self-signed when
 /// `issuer_cert` is null). Built with raw OpenSSL because the x509_ca engine never signs a CA
 /// certificate or an RSA one. Valid from five minutes ago for `days` days.
+///
+/// `eku_literal`, when non-null, is the extendedKeyUsage extension value verbatim (an OpenSSL
+/// config string such as "anyExtendedKeyUsage") and replaces the `server_auth`/`client_auth`
+/// derived one, for a non-CA certificate.
 inline std::string raw_cert(EVP_PKEY* subject_key, const std::string& cn, X509* issuer_cert,
                             EVP_PKEY* issuer_key, bool ca, bool server_auth, bool client_auth,
-                            int days) {
+                            int days, const char* eku_literal = nullptr) {
     X509U x{X509_new()};
     REQUIRE(x);
     REQUIRE(X509_set_version(x.get(), 2) == 1);
@@ -181,13 +185,17 @@ inline std::string raw_cert(EVP_PKEY* subject_key, const std::string& cn, X509* 
     if (ca) {
         add_ext(x.get(), issuer_for_ctx, NID_basic_constraints, "critical,CA:TRUE");
         add_ext(x.get(), issuer_for_ctx, NID_key_usage, "critical,keyCertSign,cRLSign");
-    } else if (server_auth || client_auth) {
+    } else if (server_auth || client_auth || eku_literal) {
         add_ext(x.get(), issuer_for_ctx, NID_basic_constraints, "CA:FALSE");
         std::string eku;
-        if (server_auth)
-            eku += "serverAuth";
-        if (client_auth)
-            eku += std::string(eku.empty() ? "" : ",") + "clientAuth";
+        if (eku_literal) {
+            eku = eku_literal;
+        } else {
+            if (server_auth)
+                eku += "serverAuth";
+            if (client_auth)
+                eku += std::string(eku.empty() ? "" : ",") + "clientAuth";
+        }
         add_ext(x.get(), issuer_for_ctx, NID_ext_key_usage, eku.c_str());
     }
     REQUIRE(X509_sign(x.get(), issuer_key ? issuer_key : subject_key, EVP_sha256()) > 0);
@@ -214,6 +222,21 @@ inline TestCa make_intermediate(const TestCa& root, const std::string& cn) {
     c.cert_pem = detail::raw_cert(inter_key.get(), cn, root_cert.get(), root_key.get(),
                                   /*ca=*/true, false, false, 5);
     return c;
+}
+
+/// A leaf (a fresh P-256 key, signed by `ca`) whose extendedKeyUsage is exactly `eku`, an OpenSSL
+/// config value such as "anyExtendedKeyUsage". For EKU shapes the x509_ca engine cannot express.
+inline TestLeaf make_leaf_with_eku(const TestCa& ca, const std::string& cn, const char* eku) {
+    TestLeaf l;
+    auto key = pki::generate_private_key(pki::KeyAlgo::EcP256);
+    REQUIRE(key.has_value());
+    l.key_pem = *key;
+    const auto ca_cert = detail::load_x509(ca.cert_pem);
+    const auto ca_key = detail::load_private_key(ca.key_pem);
+    const auto leaf_key = detail::load_private_key(l.key_pem);
+    l.cert_pem = detail::raw_cert(leaf_key.get(), cn, ca_cert.get(), ca_key.get(), /*ca=*/false,
+                                  false, false, 1, eku);
+    return l;
 }
 
 inline pki::Validity expired_validity() {

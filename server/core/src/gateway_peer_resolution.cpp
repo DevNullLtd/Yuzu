@@ -1,5 +1,6 @@
 #include "gateway_peer_resolution.hpp"
 
+#include <algorithm>
 #include <cstdint>
 #include <memory>
 #include <utility>
@@ -144,10 +145,9 @@ std::expected<BootPins, std::string> build_boot_pins(const ResolutionInputs& in,
     // `load_boot_pins` returns an error for an empty union, so a success is never an empty set.
     auto loaded = res.auto_pin ? load_boot_pins(no_pins, no_pins, auto_file, reader)
                                : load_boot_pins(in.hex_pins, in.pin_files, auto_file, reader);
-    if (!loaded) {
-        // The loader's messages are clauses with no terminating period; add one so the log reads
-        // as two sentences ("...does not exist. Refusing to start.").
-        std::string cause = loaded.error();
+    // The loader's messages are clauses with no terminating period; add one so the log reads as
+    // two sentences ("...does not exist. Refusing to start.").
+    const auto refuse = [&res](std::string cause) {
         if (cause.empty() || cause.back() != '.')
             cause += '.';
         std::string msg = "Gateway peer pin configuration is invalid: " + cause + " Refusing to start. ";
@@ -156,7 +156,17 @@ std::expected<BootPins, std::string> build_boot_pins(const ResolutionInputs& in,
                                   flag(kGatewayPeerPinFlag) + " / " + flag(kGatewayPeerPinFileFlag) + ")."
                             : "Fix the pin source, or supply " + pin_flags() + ".";
         return std::unexpected(std::move(msg));
-    }
+    };
+    if (!loaded)
+        return refuse(loaded.error());
+    // A set whose every pin is known to lack serverAuth denies every call (the policy requires
+    // serverAuth even of a pinned certificate): refuse rather than boot a gateway-upstream service
+    // that can never admit anyone. A set with only SOME such pins keeps the warning below, and a
+    // hex-only pin is never counted (it carries no extended key usage to inspect).
+    if (loaded->size() > 0 && loaded->pins_without_server_auth() >= loaded->size())
+        return refuse("every configured gateway peer pin lacks the serverAuth extended key usage, "
+                      "so every call would be denied; pin the gateway's own certificate (not a CA "
+                      "certificate)");
     BootPins out;
     out.pins = std::make_shared<const PinSet>(std::move(*loaded));
     if (out.pins->pins_without_server_auth() > 0)
@@ -164,6 +174,29 @@ std::expected<BootPins, std::string> build_boot_pins(const ResolutionInputs& in,
                                std::to_string(out.pins->pins_without_server_auth()) +
                                " certificate(s) without serverAuth; the policy will deny them.");
     return out;
+}
+
+std::string format_pin_prefixes(const PinSet& pins) {
+    const std::vector<std::string> all = pins.sorted_pins();
+    if (all.empty())
+        return "pin prefixes (first 16 hex): none";
+    std::string out = "pin prefixes (first 16 hex): ";
+    const std::size_t shown = std::min(all.size(), kBootLogMaxPinPrefixes);
+    for (std::size_t i = 0; i < shown; ++i) {
+        if (i > 0)
+            out += ',';
+        out += all[i].substr(0, kBootLogPinPrefixChars);
+    }
+    if (all.size() > shown)
+        out += ", ... and " + std::to_string(all.size() - shown) + " more";
+    return out;
+}
+
+std::string enforce_boot_line(const PinSet& pins, std::size_t hex_values, std::size_t pin_files) {
+    return "gateway peer authorization: enforcing " + std::to_string(pins.size()) + " pin(s) from " +
+           std::to_string(hex_values) + " " + flag(kGatewayPeerPinFlag) + " value(s) and " +
+           std::to_string(pin_files) + " pin file(s); pins are fixed until restart; " +
+           format_pin_prefixes(pins);
 }
 
 } // namespace yuzu::server::gateway_peer
