@@ -3129,7 +3129,9 @@ TEST_CASE("RbacStore: user_rbac_group_names and role_effects_for record "
 // pool-acquire-timeout producers of the unbreakered reads.
 TEST_CASE("RbacStore: every checked read on a store that is not open reports the shared "
           "not-open error text",
-          "[rbac_store][pg]") {
+          "[rbac_store]") {
+    // Deliberately NOT tagged [pg]: the pool is dead and no YUZU_REQUIRE_PG_DB* fixture runs, so
+    // the case needs no database and runs in the non-pg shards with or without a DSN.
     PgPool bad{{.conninfo = "host=127.0.0.1 port=1 dbname=nope user=nope connect_timeout=1",
                 .size = 1}};
     RbacStore broken{bad};
