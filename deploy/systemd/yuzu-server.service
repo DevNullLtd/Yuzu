@@ -56,8 +56,10 @@ EnvironmentFile=-/etc/yuzu/yuzu-server.env
 # starts that service:
 #   - Generated default certificates (no --cert/--key, as shipped): the server
 #     pins its own generated default-gateway.pem automatically. Nothing to set.
-#   - Operator certificates (--cert/--key added, together with --ca-cert): there
-#     is no automatic pin, and the server REFUSES TO START until one is given:
+#   - Operator certificates (--cert/--key added, together with --ca-cert; a
+#     --ca-cert given alone, or any of --management-cert, --management-key and
+#     --management-ca-cert, which exist only as command-line flags, counts too):
+#     there is no automatic pin, and the server REFUSES TO START until one is given:
 #     --gateway-peer-pin <64-hex SPKI SHA-256> or --gateway-peer-pin-file <path>
 #     (repeatable), or YUZU_GATEWAY_PEER_PINS / YUZU_GATEWAY_PEER_PIN_FILE in
 #     /etc/yuzu/yuzu-server.env. If you run no gateway, remove the
@@ -70,7 +72,7 @@ EnvironmentFile=-/etc/yuzu/yuzu-server.env
 #     /etc/yuzu.
 # Before upgrading a package install that uses your own certificates, check what
 # this unit and /etc/yuzu/yuzu-server.env pass: `systemctl cat yuzu-server | grep -E
-# -- '--cert|--no-tls|--gateway-upstream'`. The RPM restarts the service on upgrade,
+# -- '--(management-)?(cert|key|ca-cert)|--no-tls|--gateway-upstream'`. The RPM restarts the service on upgrade,
 # so a missing pin fails there; the deb only enables it, so the failure shows at the
 # next restart or reboot. systemd stops retrying after the start-limit above.
 # --insecure-gateway-peer is deliberately NOT set here: it disables peer

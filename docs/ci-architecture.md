@@ -622,6 +622,24 @@ it runs this checkout's reference-gateway template on the release's published im
 acknowledgement or pin that rig needs belongs in that template (an environment variable, which an
 image older than the flag ignores), not in the script.
 
+**Gateway peer authorization gates.** Four pieces enforce it in CI. (1) The `linux` job in
+`ci.yml` installs the `postgresql-client` apt package (it provides `psql`) and runs the step
+"Gateway peer boot-decision CLI test" (`tests/shell/test_gateway_peer_boot_refusal.sh`) against the
+built server with `YUZU_REQUIRE_PSQL=1`: the test creates one database per row through `psql`, so a
+missing `psql` is a failure under that variable (and under `GITHUB_ACTIONS=true`), never a skip, and
+a skipped step cannot be a green job that never ran. (2) The `docs` suite carries a lexical Python
+gate, `tests/test_gateway_peer_registration_lexical.py` (Meson test "gateway-upstream guard
+registration lexical gate", no build required), which fails if the gateway-upstream service is
+registered other than through the guard. (3) The restart-advice lint
+`tests/test_gateway_peer_restart_advice_lint.py` runs as the "Gateway peer restart-advice lint"
+step of `docs-lint.yml` on every PR (docs-only PRs skip the Meson `docs` suite) and as the Meson
+test "gateway peer restart-advice docs lint": every place that tells an operator to restart a
+gateway after a peer-authorization refusal must carry the `5183` caveat and a conditional marker in
+the same paragraph, and the expiry runbook must say a gateway redial is required. (4) The rigs
+above, which carry the acknowledgement. The decision record,
+[Gateway peer authorization (minimal), 2026-10-07](security-reviews/gateway-peer-authz-minimal-2026-10-07.md),
+states what none of these cover.
+
 ## Self-hosted runner topology
 
 | Runner | Host | Jobs |

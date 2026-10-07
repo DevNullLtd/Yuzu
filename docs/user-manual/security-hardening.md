@@ -139,7 +139,7 @@ the generated default certificates, explicit with `--gateway-peer-pin` /
 `--gateway-peer-pin-file` otherwise), and the server refuses to start without one unless
 `--insecure-gateway-peer` acknowledges a plaintext rig. The check wraps the service, which the
 server registers on the one gRPC server that also listens for agents and management, so it
-applies on every one of those ports; before it, a caller with no certificate could reach the
+applies on every one of those ports; without it, a caller with no certificate could reach the
 service on the agent port of a default-certificate install, and any holder of a CA-issued
 client certificate (an agent leaf included) could reach it on the strict ports. Keep the
 gateway key readable only by the server and gateway processes: the pin authorizes exactly that

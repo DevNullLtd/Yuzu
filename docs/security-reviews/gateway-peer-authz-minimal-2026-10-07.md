@@ -29,19 +29,19 @@ What this record claims, and what it does not.
   server suite, 8824 cases (8821 passed, 3 skipped), at the code before the review-fix round.
   macOS: the full test binary, 8830 cases (8825 passed, 5 skipped), and `[gateway_peer]`, 104
   cases with 1907 assertions, at an earlier tip. Windows: `[gateway_peer]`, 104 cases with 1909
-  assertions. These counts predate the review-fix round, which adds tests, so re-run before
-  quoting them.
+  assertions. These counts predate the review-fix rounds, which add tests, so re-run before
+  quoting them; the final counts at the shipped tip are in the run record (see the run record).
 - **Installer.** `deploy/packaging/windows/yuzu-server.iss` was edited on a Linux host. It was then
   compiled with Inno Setup 6.7.3 and silent-installed on a Windows 11 test host: about 55
   silent-install cases (including upgrade, refusal and uninstall cases) plus server command-line
-  runs, at tip `9a59cfe30`, the installer file being unchanged between that run and the start of
+  runs, at a pre-rebase tip, the installer file being unchanged between that run and the start of
   the review-fix round. The review-fix round then edited the installer (the refusal of `/NOTLS`
   together with a pin, the wizard-path refusal wording, header comments); those edits are not
   covered by those runs. Not tested at all: starting the service under the Windows service
   manager, because the server binary does not implement the service control protocol
   (pre-existing; open issue #1835, "Windows server binary has the identical SCM control-protocol
-  defect as #1822 (agent)", which also blocks any Windows server install), and the interactive
-  wizard path. Install behaviour on macOS and Linux does not apply: the installer is
+  defect as #1822 (agent)", which prevents the installed service from starting under the Windows
+  service manager), and the interactive wizard path. Install behaviour on macOS and Linux does not apply: the installer is
   Windows-only.
 - **Citations.** Statements about existing code cite `origin/dev` at `056f01a20` by symbol. The
   line numbers in "The gap" were read at an earlier base and can be a few lines off (for example
@@ -181,13 +181,29 @@ these ways, each of which is part of the design as built:
 5. **Replace "restart recovers automatically" with a runbook.** The unchanged gateway logs a failed
    `NotifyStreamStatus` and drops it (`gateway/apps/yuzu_gw/src/yuzu_gw_upstream.erl:335-343`), and
    heartbeats for a session the server already knows are acknowledged, so a session whose CONNECTED
-   notice was refused can stay unplaced after authorization is restored. The runbook is: restore the
-   pins or credentials, restart every serving replica, check whether the gateways' connected-agent
-   count has converged with the servers', and restart gateway nodes (one at a time) only if it
-   has not. The restart is conditional because `docs/user-manual/gateway.md` ("What happens when
-   the server restarts") records that a gateway restart leaves released agents wedged on agent builds
-   without the #5183 fix, which is in no release yet, and because a restarted server already
-   reports unknown sessions in its heartbeat replies so the gateway replays them. What a refusal
+   notice was refused can stay unplaced after authorization is restored. The runbook does **not**
+   gate a gateway restart on the circuit state, because a rule of the form "restart the gateway
+   only if the circuit is closed, wait if it is open" cannot be satisfied when the cause is on the
+   gateway side (an expired certificate, a rotated key, a renamed default marker): every status 16
+   on a registration or inventory call counts toward the breaker, the gateway never redials by
+   itself (status 16 is an RPC result), so the circuit stays open and waiting never ends. Nor does
+   it treat agreeing connected-agent counts as proof of recovery: the server's
+   `yuzu_agents_connected` counts registration, while placement is set separately by
+   `NotifyStreamStatus`, so an agent whose CONNECTED notice was refused or dropped is counted but
+   unreachable for commands. The runbook has three cause classes. **A**, the cause was on the server
+   side (a pin, an acknowledgement, other server configuration): restart the serving replicas, do
+   not restart the gateways first unless the placement check fails, and verify convergence
+   (`sum(yuzu_gw_agents_current) - sum(yuzu_agents_connected{job="yuzu-server"})`, summed across all
+   replicas), placement (no rise in the notify error and drop counters, and a command to a sample
+   agent succeeds) as separate checks. **B**, the cause is on the gateway side: restart that gateway
+   node, one at a time, whatever the circuit state, because the gateway must redial to present its
+   current files. **C**, placement loss suspected after a refusal window: restart the gateway node
+   only if A's verification still fails after the timing allowances. Every gateway restart is
+   conditional and carries the agent-side caveat, because `docs/user-manual/gateway.md` ("What
+   happens when the server restarts") records that a gateway restart leaves released agents wedged
+   on agent builds without the #5183 fix (in no release yet). Redialling is inferred from reading
+   the grpcbox code (the certificate and key are file paths in the channel's TLS options, and a
+   channel reconnects lazily after its connection process dies) and was not tested. What a refusal
    window costs is listed in the operator guide's incident runbook.
 6. **Acknowledgement semantics.** The acknowledgement is contradictory only with EXPLICIT pins, it
    suppresses the automatic pin, and it disables the guard on every port.
@@ -206,28 +222,41 @@ immutable pin set that cannot be empty by construction, and boot refuses an empt
 - **No in-band revocation of a gateway key.** Revoking a certificate serial does not remove a key
   pin. A compromised key must be replaced and its pin removed from every replica; a copied key stays
   valid until then.
-- **After a refusal window stream placement may need repair, and the repair is conditional.** A
-  refused `NotifyStreamStatus` is never retried by the unchanged gateway, and heartbeats for a
-  session the server already knows trigger no replay. The runbook is: restart every serving
-  replica with corrected pins, then compare the gateways' connected-agent count
-  (`yuzu_gw_agents_current`) with the servers' (`yuzu_agents_connected`); restart gateway nodes,
-  one at a time, only if agents have not reappeared and the gateway circuit is closed. A gateway
-  restart is itself costly: on agent builds without the #5183 fix (in no release yet) it leaves
-  released agents wedged (`docs/user-manual/gateway.md`, "What happens when the server
-  restarts"). What a refusal window costs, beyond the unplaced sessions: `ForwardGuardianMessage`
-  frames dropped during the window are never replayed; a refused `DISCONNECTED` notice leaves a
-  stale placement; while the gateway's circuit is open its `/readyz` answers 503 and register and
-  inventory calls fail with `INTERNAL` toward agents; and the gateway retries heartbeats every
-  second with a WARN line each time (noise, not a fault). Recovery after the cause is fixed can
-  lag by up to the breaker's backoff cap (300 s by default, per `gateway.md`), and while replicas
-  disagree an admit-on-one, deny-on-another pattern can re-arm a replay. These last two are
-  expected from reading the gateway code; they were not measured.
+- **After a refusal window stream placement may need repair, and the repair depends on where the
+  cause was.** A refused `NotifyStreamStatus` is never retried by the unchanged gateway, and
+  heartbeats for a session the server already knows trigger no replay. The runbook (see correction
+  5 above and the operator guide) has three classes: a server-side cause is fixed by restarting the
+  serving replicas, not the gateways, and verified by three separate checks (registration counts
+  summed across all replicas, placement, a sample command); a gateway-side cause needs that
+  gateway node restarted, one at a time, whatever the circuit state; placement loss after a
+  refusal window is the last resort. A gateway restart is itself costly: on agent builds without
+  the #5183 fix (in no release yet) it leaves released agents wedged
+  (`docs/user-manual/gateway.md`, "What happens when the server restarts"). What a refusal window
+  costs, beyond the unplaced sessions: `ForwardGuardianMessage` frames dropped during the window
+  are never replayed; a refused `DISCONNECTED` notice leaves a stale placement; agent `Register`
+  calls fail with `INTERNAL` from the first refusal, and those refusals feed the gateway's
+  breaker, whose open state turns `/readyz` to 503 and drops stream-status notices; and the
+  gateway retries heartbeats every second with a WARN line each time (noise, not a fault). Only
+  `ProxyRegister` and `ProxyInventory` results feed the breaker, so the breaker can stay closed
+  and `/readyz` can answer 200 while every heartbeat is refused (a window with no registering
+  agents). Timing: the 300 s breaker cap applies only if the breaker opened; the unknown-session
+  verdict needs the agent's heartbeat to appear in a flush (up to one agent heartbeat interval plus
+  one flush); the replay drip is `registration_replay_spacing_ms` (20 ms by default) per agent
+  plus RPC time, so 10,000 agents take at least 200 s; and `yuzu_gw_agents_current` is sampled
+  every 10 s. While replicas disagree an admit-on-one, deny-on-another pattern can re-arm a
+  replay. The timings and the replica pattern are expected from reading the gateway code; they
+  were not measured.
 - **The expiry cliff.** The guard re-checks validity on every call, so a gateway whose long-lived
   HTTP/2 connection outlives its certificate's `notAfter` is refused with `outside_validity` on
   every call from that moment. Status 16 is an RPC result: the gateway does not redial by itself.
   A renewed certificate, over the same key or a new one, is presented only after the gateway
-  redials, so plan certificate renewal together with a gateway reconnect (a gateway restart, under
-  the conditional guidance above) and renew before `notAfter`. The handshake applies no validity
+  redials: a gateway redials after its connection drops (for example when the server restarts) and
+  reads its certificate and key from the configured files when it does (inferred from reading the
+  grpcbox code, not tested). Plan certificate renewal before `notAfter`, inside a maintenance
+  window, together with a gateway redial (a restart of that gateway node, one at a time, only if
+  its agents can take the disconnect: on agents without the #5183 fix (in no release yet) released
+  agents stay wedged afterwards). After `notAfter` the circuit can stay open and waiting does not
+  help, because the cause is on the gateway side. The handshake applies no validity
   tolerance; the 5-minute allowance before `notBefore` exists only in the per-call check. A
   connection-age cap, or a gateway-side redial on status 16, would close this; neither exists.
 - **A handshake-level lockout has no server-side signal.** A gateway whose certificate lacks
@@ -236,10 +265,12 @@ immutable pin set that cannot be empty by construction, and boot refuses an empt
   alert on `yuzu_gw_upstream_tls_handshake_failures_total` covers it once the gateway's metrics
   are scraped.
 - **The denial audit write is synchronous.** It runs on the gRPC handler thread and shares the
-  audit store's connection pool. It is bounded by the per-key budget: on the order of 650 to 700
-  rows per 10-second window per replica in the worst case (64 tracked buckets plus the shared
-  fallback bucket, 10 rows each; a fixed window can admit up to twice that across a window
-  boundary), and 86,400 rows per day from a single leaf and reason (10 rows per 10 seconds). A
+  audit store's connection pool. It is bounded by the per-key budget: the worst case is 680 rows
+  per 10-second window per replica (64 tracked keys times 10 rows is 640, plus one `<reason>|*`
+  overflow bucket of 10 rows for each of the 4 audit-eligible reasons, which is 40), up to 1,360
+  across a fixed-window boundary, and about 5.9 million rows per day per replica if sustained (it
+  needs 64 or more distinct enrolled leaves refused at once). A single leaf produces 86,400 rows
+  per day (10 rows per 10 seconds, 1 row per second). A
   degraded Postgres can hold handler threads for the length of an audit write, which is why the
   budget exists. This is a sustained volume ceiling of the audit trail, not of the counter, which
   is complete.
@@ -288,10 +319,10 @@ immutable pin set that cannot be empty by construction, and boot refuses an empt
   fixes the gateway-upstream listen address at `0.0.0.0:50055` and does not emit `--ca-dir`
   (platform default), so two server services on one host collide. A silent `/NOTLS` clears
   `/GRPC_CERT`, `/GRPC_KEY` and `/CA_CERT`, as the wizard does.
-- **No pin-file permission or ownership warning.** The earlier implementation warned when a pin file
-  was a symbolic link, writable by group or others, or owned by an unexpected user. This one does
-  not: the server reads the file once, bounded, and the operator guide tells the administrator to
-  protect it. Whoever can write the file at boot decides which gateway key is admitted.
+- **No pin-file permission or ownership warning.** The server does not warn when a pin file is
+  writable by group or others or owned by an unexpected user: it reads the file once, bounded, and
+  the operator guide tells the administrator to protect it. Whoever can write the file at boot
+  decides which gateway key is admitted.
 - **TLS session resumption.** See the next section: the question is open and unadjudicated, and no
   external review has occurred.
 - **Acknowledged mode is a deliberate off switch.** It disables the guard on every port and is
@@ -371,8 +402,8 @@ Each is a separate decision; none is a prerequisite for the control.
 9. Chisel images and an ADR note that the key-bearing volume is never mounted into agents
    (documentation only).
 10. A connection-age cap on the gateway-upstream listener, or a gateway-side redial on status 16, so
-    that a renewed gateway certificate is picked up without a gateway restart (the expiry cliff
-    under the residual risks). Neither exists.
+    that a renewed gateway certificate is picked up without any operator action on the gateway
+    (the expiry cliff under the residual risks). Neither exists.
 11. A `--check-config`-style dry run of the boot resolution, so an upgrade can be checked before the
     restart. It does not exist; operators check the unit, env file and certificate arguments by
     hand (see Upgrading).
@@ -383,10 +414,15 @@ Each is a separate decision; none is a prerequisite for the control.
     - `docs/user-manual/gateway.md` near lines 1038 to 1044 (a bare `--gateway-upstream` example,
       which now refuses to start on operator certificates or with `--no-tls`);
     - `docs/user-manual/gateway.md` near lines 1101 and 1102 (the circuit-breaker rows): they do not
-      say that a run of status 16 refusals from peer authorization also opens the breaker (any
-      error result counts as a failure in `yuzu_gw_upstream.erl`, `record_result`), in which case
-      the cause is a pin or credential on the server and the incident runbook in the operator
-      guide applies;
+      say which refusals feed the breaker. A run of status 16 refusals of `ProxyRegister` (a replay
+      registration included) or `ProxyInventory` opens it, because `record_result` in
+      `yuzu_gw_upstream.erl` counts any error result of those two paths. Refused `BatchHeartbeat`,
+      `NotifyStreamStatus` and `ForwardGuardianMessage` calls do not feed it (the same file calls
+      `record_result` on no other path, and `gateway.md` near line 1306 says a heartbeat flush
+      never feeds the breaker), so the breaker can stay closed and `/readyz` can answer 200 while
+      every heartbeat is refused. When it does open on a gateway-side cause, waiting does not
+      close it (the gateway does not redial on status 16), which the "Gateway peer authorization"
+      incident runbook in the operator guide covers;
     - `gateway/config/sys.config`, comments near lines 12 and 106 (they say only that the port must
       match `--gateway-upstream`, not that the server must also be given a pin or an
       acknowledgement);

@@ -24,8 +24,12 @@
 ## exits). The agent container mounts `ca-public` and never the key-bearing
 ## volume, read-only at /etc/yuzu/certs, which is where it auto-discovers its
 ## trust anchor. `ca-export` re-runs on every `docker compose up`: after a CA
-## re-root run `docker compose up -d` (not `restart`) so `ca-public` is
-## refreshed (docs/pki-architecture.md, "Operator runbook"). The gateway container sees the whole `certs` volume (a
+## re-root prefer `docker compose up -d`, which re-runs it after the server is
+## healthy (its `depends_on`), so `ca-public` is refreshed in dependency order
+## (docs/pki-architecture.md, "Operator runbook"). `docker compose restart` also
+## restarts the one-shot container but does not guarantee that order, so it can
+## copy the CA before the server has re-minted it (inferred from this file, not
+## tested). The gateway container sees the whole `certs` volume (a
 ## named volume cannot be narrowed to a file); the server and CA keys stay 0600
 ## and owned by the server's uid.
 ##
