@@ -594,11 +594,11 @@ groups:
             gauge changes only when an authorization read reports its
             outcome, so a replica that receives no authorization checks keeps
             its last value after the database recovers; to confirm the
-            recovery, send that replica any authenticated request that makes
-            a permission check (a second one if the first lands inside the
-            ~1s probe cooldown): each check reads the cache-coherence token
-            from the database at most about once per second, and that read
-            reports the outcome. See
+            recovery, send that replica an authenticated request that makes
+            a permission check; if the first lands inside the ~1 s probe
+            cooldown, send a second a few seconds later. Each check reads
+            the cache-coherence token from the database at most about once
+            per second, and that read reports the outcome. See
             the RbacStore authorization substrate section of
             docs/auth-architecture.md.
 

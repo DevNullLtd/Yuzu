@@ -276,7 +276,7 @@ Only case (e) means the key files are gone. Nothing inside the server can rebuil
 ## Behaviour change: service-scoped tokens, the `ITServiceOwner` ceiling on the fleet-read gate, and `GET /api/v1/upload-grants`
 
 Two chokepoints let a service-scoped API token reach more than the `ITServiceOwner` role allows (found
-while working #3526). Both now refuse it. This is a tightening for service-scoped tokens only;
+in a review of the fleet-read gate, #3526). Both now refuse it. This is a tightening for service-scoped tokens only;
 non-service callers, elevated sessions and engine principals are unaffected.
 
 **Breaking for service-scoped tokens, 1: `GET /api/v1/enrollment/pending-agents` now answers `403`.**
@@ -336,7 +336,7 @@ other authz reads fail can delay the breaker opening for operators' cache-miss c
 alert that fires when `yuzu_server_rbac_breaker_open` has stayed at `1` on a replica for 5 minutes. It
 means authorization reads on that replica keep failing. While the breaker is open the replica refuses
 (fail closed) the operator permission checks that miss its permission cache and sheds service-token
-ceiling reads; decisions already cached there are served only until the stale bound of about 5 seconds.
+ceiling reads; cached decisions keep being served for at most about 5 seconds.
 A breaker that closes again within 5 minutes does not page. Load the updated rule file if you maintain
 your own copy of the shipped alerts.
 
@@ -2176,10 +2176,13 @@ a rollback is genuinely needed.
   probe succeeds (the next attempt after its ~1 s cooldown), it closes
   again automatically and normal service resumes. Watch
   `yuzu_server_rbac_breaker_open` (gauge) and
-  `yuzu_server_rbac_authz_check_seconds` (histogram) after upgrade. The
-  shipped `YuzuRbacBreakerOpen` alert (`docs/prometheus/yuzu-alerts.yml`) fires,
-  per replica, when the gauge stays at `1` for 5 minutes; it complements
-  `YuzuRbacReadDegraded`, which is a rate summed across replicas by reason.
+  `yuzu_server_rbac_authz_check_seconds` (histogram) after upgrade. A
+  companion alert, `YuzuRbacBreakerOpen` (`docs/prometheus/yuzu-alerts.yml`), is
+  added in the current release, not this one: see "Behaviour change:
+  service-scoped tokens, the `ITServiceOwner` ceiling on the fleet-read gate, and
+  `GET /api/v1/upload-grants`" above. It fires, per replica, when the gauge stays
+  at `1` for 5 minutes, and complements `YuzuRbacReadDegraded`, which is a rate
+  summed across replicas by reason.
   The gauge changes only when an authorization read reports its outcome, so a
   replica that receives no authorization checks keeps its last value after the
   database recovers.
