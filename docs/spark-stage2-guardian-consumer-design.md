@@ -714,7 +714,7 @@ rule in the push but does NOT unstick the wedged claim (an identical re-observat
 returns the existing claim); it bounds the dependence on the suppress classification
 and is not a recovery guarantee against a classifier that misidentifies a dead claim.
 Two side effects are accepted and recorded in the flip gate (AC-10, AC-16): re-arming
-every rule can recapture a Spark-first `FileHashEquals` baseline whose persist is failing (#4045), and
+every rule can recapture a Spark-first `FileHashEquals` baseline that was lost or never written (#4045), and
 while a same-type mechanism call is hung, the Disarm of a healthy same-type rule queues
 behind it on `SparkEngine`'s per-type mechanism lock, so that rule is logically
 withdrawn at once and its re-arm may expire as `CongestionExpired`; the same collateral
@@ -802,9 +802,9 @@ heartbeat at the default (the push interval is `ceil(25 s / heartbeat) x heartbe
 re-arm about every 330 s from the safety valve (for a pure retained-wedge hold; with a
 healthy same-type sibling in the push, every push after the first forced one is a full
 teardown and re-arm, AC-16) (re-arm recaptures only
-a Spark-first-captured `FileHashEquals` baseline whose persist is failing, #4045:
-`apply_rules` persists staged captures first and persisted baselines are re-seeded on
-every arm); (3) an operator delta push (`full_sync=false`)
+a Spark-first-captured `FileHashEquals` baseline that was lost or never written, #4045: the
+remaining cases are enumerated in the flip gate's AC-10; `apply_rules` persists staged
+captures first and persisted baselines are re-seeded on every arm); (3) an operator delta push (`full_sync=false`)
 during a hold flips the push identity twice and resets the suppression budget;
 (4) recovery needs a live connection (the maintenance tick runs on the per-connection
 heartbeat thread). Known limits NOT fixed here: a delta push (`full_sync=false`) that
@@ -1185,9 +1185,10 @@ design is mentioned it is named as the earlier design.
   push, but persisted baselines are re-seeded on every arm
   (`guardian_engine.cpp`), `apply_rules` first persists any staged capture, and a capture an
   in-flight evaluation stages after that drain is seeded from the runtime's staging at attach
-  (`attach_core`, under the same `registry_mu_` hold as the detach), so only a
-  Spark-first-captured `FileHashEquals` baseline whose persist is failing is exposed
-  to a baseline recapture.
+  (`attach_core`, under the same `registry_mu_` hold as the detach, with the persister's
+  seed fence ordering a worker write against the engine's KV seed read), so only a
+  Spark-first-captured `FileHashEquals` baseline that was lost or never written is exposed
+  to a baseline recapture (the enumerated cases are the flip gate's AC-10).
 
 **Known accepted residual (governance Gate 4/8, rung 9c PR-5d /governance run,
 independently traced and REFUTED as permanent):** a withdraw immediately

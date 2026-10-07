@@ -389,6 +389,17 @@ here.
 | **Verify at** | `hard_exit.hpp` (`kOrphanDrainGrace`, nonzero-code contract); `main.cpp`'s `on_signal_hard_exit` signal handler and its orphan-worker grace-expiry check in the main shutdown path; `service_win.cpp`'s SCM stop handler; contrast `guard_file.cpp`/`guard_registry.cpp`/`guard_service.cpp`/`guard_systemd.cpp`, each of which `.join()`s its worker thread on `stop()`. |
 | **Epistemic** | verified b16e5836d |
 
+### E3 - Baseline-on-arm capture persistence: legacy writes synchronously at the capture, spark stages and persists later, retries, and counts (#4045)
+
+| | |
+|---|---|
+| **Legacy** | `FileGuard` persists a `file-hash-equals` baseline-on-arm capture SYNCHRONOUSLY from its own worker at the moment of capture (`guard_file.cpp`'s baseline callback into `start_guard_for_rule_locked`'s `on_baseline`, which calls `guardian_persist_baseline`). A failed write is error-logged only: no retry, no counter, no heartbeat tag (the persist outcome is discarded), and the capture is lost for good. The crash window is the write itself. |
+| **Spark** | `GuardianSparkRuntime` never touches a `KvStore`, so it only stages the capture and the engine-owned `GuardianBaselinePersister` writes it through the SAME `guardian_persist_baseline` overwrite guard and record (`baseline:<rule_id>` in `__guardian__`). The write is wake-driven (typically milliseconds after the capture; the worker's 5 s backstop for a capture that produced no wake; a 5 s doubling to 60 s backoff after a failed write; `apply_rules` and `stop()` write regardless), so the crash window is wider than legacy's. A failed write stays staged and is retried, error-logged, and counted in the Spark-only heartbeat tag `yuzu.guardian_baseline_persist_failures`. A capture can also be DROPPED where legacy cannot lose it silently: an allocation failure while staging, or a path re-authored while the first capture was unwritten (counted). |
+| **Why deliberate** | The runtime is the detach-survival object and its header forbids a `KvStore` reference (a queued SparkEngine handler can outlive the engine), so a synchronous write at the capture edge is not available; the staging seam mirrors the lifecycle journal's shape. Retrying is the stronger posture for the same fail-open choice legacy made. |
+| **Operator symptom** | Under spark, a baseline captured just before a crash or agent stop may be missing at the next start (then recaptured from the file's current content), more often than under legacy. A failing local KV store shows as repeated `failed to persist captured baseline` errors and a rising `yuzu.guardian_baseline_persist_failures` on that agent, where legacy shows the error line only and never a tag. An ABSENT tag is not evidence that baselines persisted on a legacy-path agent. |
+| **Verify at** | `agents/core/src/guardian_baseline_persister.hpp` (class comment: snapshot and erase-by-identity, bounded passes, the seed fence, LATENCY); `GuardianBaselinePersister::persist_staged` and `guardian_persist_baseline` in `guardian_engine.cpp`; `guardian_spark_runtime.cpp`'s `stage_baseline_locked`/`snapshot_staged_baselines`/`erase_staged_baselines_if_unchanged` and `attach_core`'s staged-hash inherit; legacy side: `start_guard_for_rule_locked`'s `on_baseline` in `guardian_engine.cpp` and `guard_file.cpp`; `docs/user-manual/guaranteed-state.md` "Spark path (#4045)"; `docs/yuzu-guardian-design-v1.1.md` section 24. |
+| **Epistemic** | verified 3d88dd958 |
+
 ---
 
 ## F. Expected parity (not deltas — listed so an F14 reviewer doesn't misflag these)
@@ -525,6 +536,14 @@ doc just makes sure they're findable rather than rediscovered from scratch.
     `guardian_detached_worker_role.hpp` adds the second role; `abort_if_worker_thread()`
     now checks both predicates and logs a role-specific message, the joined-thread text
     kept verbatim.
+- **#4045 prose that says "inert while `prefer_spark` is off".** The changelog fragment
+  `changelog.d/*-spark-baseline-persistence.fixed.md` ("inert while `prefer_spark` is off,
+  which is every released agent today"), `docs/user-manual/guaranteed-state.md`'s "Spark path
+  (#4045)" paragraph ("off in every released agent today"), `docs/user-manual/metrics.md`'s
+  `yuzu.guardian_baseline_persist_failures` row ("Always `0` (absent) while `prefer_spark` is
+  off") and `docs/yuzu-guardian-design-v1.1.md` section 24 ("inert while `prefer_spark_` is
+  false") are true only at the shipping default and go stale at F14. The persister, its worker
+  step, the seed fence and the staging all go live at once at the flip.
 
 ---
 

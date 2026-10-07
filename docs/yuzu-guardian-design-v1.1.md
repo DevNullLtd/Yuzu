@@ -2618,8 +2618,12 @@ Guardian ladder must check these.
   Spark's own first-ever baseline capture reaches this store through a staging
   seam (#4045): `GuardianSparkRuntime` is the detach-survival object and NEVER
   touches a `KvStore`, so it only STAGES the capture edge (rule_id, path, hash;
-  first capture wins, bounded) and the engine-owned `GuardianBaselinePersister`
-  writes it through `guardian_persist_baseline`'s overwrite guard. Invariants:
+  first capture wins, one entry per rule_id, no cap) and the engine-owned
+  `GuardianBaselinePersister` writes it through `guardian_persist_baseline`'s
+  overwrite guard by snapshot and erase-by-identity: a pass copies staging, writes
+  in order, stops at the FIRST failed write, and erases only the entries whose
+  write returned Written or Refused and that are still identical, so nothing is
+  ever "out" of staging and a throw cannot lose a capture. Invariants:
   (1) the persister drains from exactly three places: `apply_rules` BEFORE any
   teardown or re-arm (so the common case is already durable when the seed is
   read), `stop()` after the worker join, and the outbox drain worker's loop; and
@@ -2628,24 +2632,44 @@ Guardian ladder must check these.
   is up loses its capture on a crash. The drain does NOT by itself order an
   in-flight evaluation of the OLD generation against the replacement's seed (an
   evaluation can stage its first capture after any drain), so persist-before-seed
-  rests on two further pieces: `reconcile_rule_locked` holds the persister's
-  `persist_mu_` (`hold_seed_fence()`) from a baseline-on-arm rule's seed read to
-  the end of the attach, so no worker batch can be taken-but-unwritten across the
-  read; and `GuardianSparkRuntime::attach_core` reads the staged capture under
-  the SAME `registry_mu_` hold that detaches the prior generation (an old
-  evaluation stages only under `registry_mu_` after rechecking its generation, so
-  it either staged before that hold, and is seen, or is dropped after it) and
-  seeds the replacement from it when the path matches. Do not replace those with
-  a bare earlier drain; (2) a failed write is a
-  deliberate fail-open (the rule keeps its in-memory baseline), restaged and
-  retried, counted, error-logged and exported on the sparse heartbeat tag
-  `yuzu.guardian_baseline_persist_failures`, never silent; every staging-loss
-  channel feeds the same tag: failed writes, firewalled throws, captures dropped
-  from staging (the 256-entry cap, an allocation failure, a restage), and a
-  capture staged with no KV store (logged once, kept); (3) the crash
-  window between a capture and its persist is accepted (the next boot
-  recaptures). All of it is inert while `prefer_spark_` is false (the shipping
-  default) and becomes live at the Spark flip.
+  rests on two further pieces. (a) `GuardianSparkRuntime::attach_core` reads the
+  staged capture under the SAME `registry_mu_` hold that detaches the prior
+  generation (an old evaluation stages only under `registry_mu_` after rechecking
+  its generation, so it either staged before that hold, and is seen, or is
+  dropped after it) and seeds the replacement from it when the path matches.
+  (b) `reconcile_rule_locked` holds the persister's `persist_mu_`
+  (`hold_seed_fence()`) from a baseline-on-arm rule's seed read to the end of the
+  attach. The fence is REQUIRED: an entry leaves staging after its write, so
+  without it a worker pass could write and erase a capture between the engine's
+  KV seed read (empty, before the write) and attach_core's staged read (empty,
+  after the erase), and neither read would see it. Do not replace either piece
+  with a bare earlier drain. Lock order `mtx_` -> `persist_mu_` -> `registry_mu_`;
+  the worker takes `persist_mu_` -> `registry_mu_` and never `mtx_`. Because a
+  pass stops at its first failed write and the worker backs off after a failed
+  pass (5 s doubling to 60 s; `apply_rules` and `stop()` ignore the backoff), a
+  wait on `persist_mu_` is bounded by one pass, about one KV busy timeout under a
+  sustained SQLITE_BUSY, not one per staged capture; (2) a failed write is a
+  deliberate fail-open (the rule keeps its in-memory baseline): the capture stays
+  staged and is retried, counted, error-logged, and exported on the sparse
+  heartbeat tag `yuzu.guardian_baseline_persist_failures` (Spark path only,
+  cumulative, readable from the per-agent heartbeat only: no server gauge exists,
+  so the agent error log is the primary signal), never silent. Every loss channel
+  feeds the same tag: failed persist passes, firewalled throws, captures dropped
+  from staging (an allocation failure, or a retarget over a still-unpersisted
+  capture) and a capture staged with no KV store (logged once, kept). The tag is
+  read lock-free, so the heartbeat thread never waits behind `apply_rules`. A
+  write the overwrite guard refuses is counted apart (`baseline_persist_refusals`,
+  no tag) and is not a failure; (3) the remaining residuals, exactly: the crash
+  window between a capture and its persist (and a capture still failing when the
+  agent stops), wider than legacy's synchronous write and wake-driven rather than
+  clocked; a capture discarded and counted (allocation failure, or a path
+  re-authored while the first capture was unwritten; A to B to A re-baselines A
+  even with a healthy store, as legacy does, since there is one record per rule);
+  the `guardian_persist_baseline` write-anyway on a failed re-check read, which two
+  failed reads (a transient read fault, not only a sustained outage) can turn into
+  an overwrite of a good record; and a record persisted for a removed rule stays
+  dormant. All of it is inert while `prefer_spark_` is false (the shipping default)
+  and becomes live at the Spark flip.
 - **A guard whose own detection has permanently degraded must never publish
   itself compliant (PR #4748, CT-4).** `FileGuard`'s parent-directory
   (rename-detection) watch permanently disables after repeated teardown

@@ -141,9 +141,10 @@ All start unchecked. Each gets its evidence link recorded here by PR-6.
         fleet-wide `full_sync` re-arm: any UNRELATED rule mutation anywhere in the fleet can
         silently reclassify a genuinely-still-drifted no-`expected` rule as compliant,
         with no remediation having happened. Filed **#4021** to track the fix; not
-        addressed in this doc-only PR; #4021 later persisted the legacy capture, and the Spark
-        capture is persisted by #4045: the runtime stages it and the engine writes it, so the
-        `prefer_spark` half of this laundering path is closed. DGRHP is one of this workstream's designated
+        addressed in this doc-only PR; #4021 later persisted the legacy capture, and #4045
+        persists the Spark capture (the runtime stages it and the engine writes it), so the
+        `prefer_spark` half of this laundering path is closed for a healthy store, with the
+        residuals enumerated in AC-10 and in the design doc's section 24. DGRHP is one of this workstream's designated
         `prefer_spark` test rigs (§6 step 1's own procedure opens with "confirm ... agent
         running with `prefer_spark` active, spark armed" before any of this applies - the
         "Shipped posture today" row above is about the production default, not these rigs),
@@ -927,6 +928,25 @@ flip, with a red-first test each:
   AC-9 to AC-17 (the safety valve, the known limits and the flip-time documentation sweep).
   The operator-facing note is the
   hold paragraph in `docs/user-manual/guaranteed-state.md`.
+- **F14 precondition (#4045 governance, added 2026-10-07): a fleet-visible persist-failure
+  signal (gauge + alert + pin test), splitting permanent loss from retryable failures.**
+  `yuzu.guardian_baseline_persist_failures` is a per-agent heartbeat status tag only: there
+  is no server table row, gauge, alert rule or pin test for it, it covers the Spark path
+  only (a legacy-path write failure is logged, not counted, so an absent tag is not
+  evidence that baselines persisted), and its aggregate mixes retryable failures with
+  permanent losses and is cumulative since boot. Until a fleet signal ships, the agent's
+  error log (`failed to persist captured baseline`) is the primary operator signal. Before
+  the flip, ship that signal (a server table row with its pin test and an alert; ideally a
+  current "unpersisted captures" gauge kept apart from a "captures lost" counter) or record
+  an explicit risk acceptance in section 5. A server gauge is a deliberate non-goal of the
+  #4045 change itself.
+- **Real-File-mechanism run for #4045 (plan question Q4): NOT done.** The one manual
+  `prefer_spark` run of a baseline-on-arm `file-hash-equals` rule through the real File
+  mechanism (capture, then an agent restart or `full_sync`, then drift reported rather
+  than laundered) has not been performed as of this entry. It is a pre-merge or F14
+  record item; nothing in this document claims it was done, and the unit evidence for
+  #4045 uses the fixture's fake File mechanism on Linux only (Windows and macOS were not
+  compiled for this change).
 - **Decision record: #5459, option D (operator ruling, 2026-10-06).** *What was ruled:* the
   operator (Dave Rae) chose option D in a terminal chat with the coordinating Claude Code
   session; his words, verbatim: "Go with D, have Astra review the suppress condition". The
@@ -1166,8 +1186,8 @@ flip, with a red-first test each:
     bounds the dependence on the suppress classification (it is not a recovery guarantee
     against a classifier that misidentifies a dead claim). The counter resets only in
     `begin_application()`/`retire()`. Because it re-arms every rule in the push, the forced
-    Reapply (a) can recapture a Spark-first `FileHashEquals` baseline whose persist is
-    failing (#4045, AC-10) and (b) while a same-type mechanism call is hung, can withdraw healthy same-type
+    Reapply (a) can recapture a Spark-first `FileHashEquals` baseline that was lost or
+    never written (#4045, AC-10) and (b) while a same-type mechanism call is hung, can withdraw healthy same-type
     siblings, after which every later push is a Reapply (AC-16). If the budget is already spent when a retained wedge's late success is
     adopted, the next identical push is a forced Reapply of the just-armed rule: one wasted
     teardown, never an acknowledgment.
@@ -1176,9 +1196,20 @@ flip, with a red-first test each:
     any staged, not-yet-persisted Spark capture before it tears down or re-arms anything,
     and a capture an in-flight evaluation stages after that write is seeded from the
     runtime's staging at attach (`attach_core`, under the same `registry_mu_` hold as the
-    prior generation's detach), so only a Spark-first-captured `FileHashEquals` baseline whose persist is itself
-    failing (a failing local KV store; counted in `yuzu.guardian_baseline_persist_failures`)
-    is exposed to a recapture by a forced Reapply.
+    prior generation's detach, with the persister's seed fence ordering a worker write
+    against the engine's KV seed read). A forced Reapply can therefore still recapture a
+    Spark-first-captured `FileHashEquals` baseline only in these remaining cases: (1) the
+    capture's write is still failing (a failing local KV store: staged, retried with a
+    worker backoff, error-logged and counted in `yuzu.guardian_baseline_persist_failures`),
+    or a crash or stop came before it landed (the crash window); (2) the capture was
+    discarded and counted (an allocation failure while staging, or the rule's path
+    re-authored while the first capture was still unwritten; an A to B to A re-authoring
+    re-baselines A even with a healthy store, the same as legacy); (3) the arm-time read of
+    the record failed and the write-time re-check read failed again, so the guard wrote the
+    fresh capture anyway: two failed reads suffice, a transient read fault is enough, not
+    only a sustained outage; (4) a record persisted for a rule later removed stays dormant
+    and re-seeds the rule if it returns on the same path. The tag covers the Spark path
+    only and is per-agent: see the F14 precondition on a fleet-visible signal.
   - (AC-11) **An operator delta push (`full_sync=false`) during a hold** changes the push
     identity (and the following full_sync push changes it back), so each is a Reapply and
     the suppression budget restarts. A delta push that OMITS a still-desired unresolved
