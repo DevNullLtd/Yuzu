@@ -1214,8 +1214,8 @@ flip, with a red-first test each:
     repeated `guaranteed_state.reconcile` audit rows reading `generation 0 -> N` for one
     agent id, and the fleet-wide `yuzu_server_guardian_reconciles_total{result="sent"}`
     rate. Fleet-wide detection of the tag and the alert decision are #5558. A persistently
-    failing rule is re-pushed about every 25-30 s per agent at the default 30 s heartbeat,
-    one audit row per push, with no back-off (the back-off decision in #5504 would also
+    failing rule is re-pushed about every 30 s per agent at the default heartbeat (never
+    faster than 25 s), one audit row per push, with no back-off (the back-off decision in #5504 would also
     cover this loop). Residuals: a legacy guard that returns false at arm
     (`ReconcileOutcome::Inert`) is the boot-path
     analogue of #2797's `apply_rules` defect and is not covered, a server whose current
