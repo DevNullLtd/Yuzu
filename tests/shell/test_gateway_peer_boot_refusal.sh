@@ -53,13 +53,22 @@
 #   H  acknowledged plaintext (h2c prior knowledge): grpc-status other than 16 (the real handler
 #      answers; an empty BatchHeartbeat is OK) and no denial series incremented
 #   J  acknowledged on TLS defaults: the same, over TLS
+# Client-certificate gateway-upstream calls (row G only, the default-certificate boot; curl
+# --cert/--key/--cacert against the same listener, the certificates and CA taken from the row's
+# own --ca-dir):
+#   G  presenting the default GATEWAY leaf (the one the automatic pin admits): grpc-status other
+#      than 16 (the real handler answers) and no not_pinned denial
+#   G  presenting the default SERVER leaf (a valid certificate of the same CA that is NOT the
+#      pinned one): grpc-status 16 and yuzu_server_gateway_peer_denied_total{rpc="batch_heartbeat",
+#      reason="not_pinned"} = 1 (reason no_server_auth_eku instead if openssl shows that leaf
+#      lacks serverAuth; today both default leaves carry serverAuth and clientAuth)
 #
 # Pins are read once at boot: there is no reload and no pin gauge, so no row looks for one.
 #
 # "Before any listener is bound" is asserted by the absence of the log lines the server prints
 # only after BuildAndStart ("Yuzu Server listening", "Gateway upstream listening"). Every port
-# the rows pass is a free port picked by the OS in ONE allocation call (distinct by construction);
-# no row uses a default or shared port.
+# the rows of a phase pass is a free port picked by the OS in ONE allocation call made at the start
+# of that phase (distinct by construction); no row uses a default or shared port.
 #
 # Postgres: the server fails closed without it, so this needs YUZU_TEST_POSTGRES_DSN (each row
 # gets its own uniquely named database, dropped on exit). Skip-vs-fail: on a developer box a
@@ -202,21 +211,27 @@ spki_hex() { # PEM-FILE
 # An empty gRPC message frame (flag 0, length 0): a valid request body for BatchHeartbeat.
 printf '\000\000\000\000\000' > "$TMP/empty.frame"
 
-# Every row's ports come from ONE allocation call: the sockets are all held open until the list
-# is printed, so no two rows can be handed the same port (separate per-row calls release their
-# sockets at once and the OS may hand the same number to the next call).
-MAX_ROWS=40
-PORT_POOL=($(python3 -c "
+# A phase's rows get their ports from ONE allocation call: the sockets are all held open until the
+# list is printed, so no two rows of a phase can be handed the same port (separate per-row calls
+# release their sockets at once and the OS may hand the same number to the next call). The pool is
+# allocated at the START of each phase (alloc_ports), not once at script start: phase 2 begins after
+# every phase-1 server has run and exited, long after a script-start allocation released its
+# sockets, and another process may have taken a number in the meantime.
+PORT_POOL=()
+PORT_NEXT=0
+alloc_ports() { # ROWS : allocates 5 ports per row for the next phase
+  PORT_POOL=($(python3 -c "
 import socket, sys
 s = [socket.socket() for _ in range(int(sys.argv[1]))]
 [x.bind(('127.0.0.1', 0)) for x in s]
-print(*[x.getsockname()[1] for x in s])" $((MAX_ROWS * 5))))
-PORT_NEXT=0
+print(*[x.getsockname()[1] for x in s])" $(($1 * 5))))
+  PORT_NEXT=0
+}
 # next_ports sets p1..p5 in THE CALLER'S shell (a command substitution would advance a copy of
 # the counter and hand every row the same ports).
 next_ports() {
   if [ $((PORT_NEXT + 5)) -gt "${#PORT_POOL[@]}" ]; then
-    echo "FAIL: more rows than the port pool allocated ($MAX_ROWS)" >&2; exit 1
+    echo "FAIL: more rows than this phase's port pool allocated (${#PORT_POOL[@]} ports)" >&2; exit 1
   fi
   p1="${PORT_POOL[$PORT_NEXT]}"; p2="${PORT_POOL[$((PORT_NEXT + 1))]}"; p3="${PORT_POOL[$((PORT_NEXT + 2))]}"
   p4="${PORT_POOL[$((PORT_NEXT + 3))]}"; p5="${PORT_POOL[$((PORT_NEXT + 4))]}"
@@ -272,6 +287,7 @@ start_row() {
 }
 
 HEX="$(printf 'a%.0s' $(seq 1 64))"
+alloc_ports 18   # phase 1: rows A B C D E F I G H J K L M N O Q U P
 start_row A "X=1" -- --no-tls
 start_row B "X=1" -- --no-tls --insecure-gateway-peer --gateway-peer-pin "$HEX"
 start_row C "X=1" -- --cert "$TMP/opsrv.pem" --key "$TMP/opsrv.key" --ca-cert "$TMP/opca.pem"
@@ -330,6 +346,16 @@ anon_call() {
     -H 'content-type: application/grpc' -H 'te: trailers' --data-binary @"$TMP/empty.frame" \
     "$2://127.0.0.1:$3/yuzu.gateway.v1.GatewayUpstream/BatchHeartbeat" 2>"$TMP/$1.anon.err" || true
 }
+# cert_call TAG CERT KEY : the same BatchHeartbeat call on controls row G's agent port, presenting
+# a CLIENT certificate and verifying the server against the row's own CA (not -k). Headers land in
+# $TMP/G.TAG.anon, readable by grpc_status_of "G.TAG".
+cert_call() {
+  curl --http2 --cacert "$TMP/G/ca/default-ca.pem" --cert "$2" --key "$3" -sS \
+    -D "$TMP/G.$1.anon" -o /dev/null --max-time 15 \
+    -H 'content-type: application/grpc' -H 'te: trailers' --data-binary @"$TMP/empty.frame" \
+    "https://127.0.0.1:$(cat "$TMP/G.agent")/yuzu.gateway.v1.GatewayUpstream/BatchHeartbeat" \
+    2>"$TMP/G.$1.anon.err" || true
+}
 grpc_status_of() { # NAME : the grpc-status the anonymous call received (empty when none)
   grep -i '^grpc-status:' "$TMP/$1.anon" 2>/dev/null | tail -1 | tr -d '\r' | awk '{print $2}' || true
 }
@@ -340,6 +366,12 @@ for c in G H J K L M P; do
         G|J) anon_call "$c" https "$(cat "$TMP/$c.agent")" ;;
         H)   anon_call "$c" http  "$(cat "$TMP/$c.agent")" ;;
       esac
+      if [ "$c" = "G" ]; then
+        # The default gateway leaf is the pinned one; the default server leaf is a valid
+        # certificate of the same CA that is NOT pinned.
+        cert_call dgw "$TMP/G/ca/default-gateway.pem" "$TMP/G/ca/default-gateway.key"
+        cert_call dsrv "$TMP/G/ca/default-server.pem" "$TMP/G/ca/default-server.key"
+      fi
     fi
     scrape "$c" > "$TMP/$c.metrics" || true
     kill -TERM "$(cat "$TMP/$c.pid")" >/dev/null 2>&1 || true
@@ -370,6 +402,7 @@ wait_refusal() { # NAME : 0 once the row refused or exited, 1 (and killed) if it
   return 1
 }
 PHASE2_ROWS="R W"
+alloc_ports 4    # phase 2: rows R S T W, allocated now that phase 1 has finished
 start_row R "X=1" -- --gateway-peer-pin-file "$TMP/encrypted.pem"
 if command -v mkfifo >/dev/null 2>&1; then
   mkfifo "$TMP/stdin.fifo" "$TMP/pin.fifo"
@@ -546,7 +579,7 @@ anon_row() { # NAME DESCRIPTION WANT(16|not16)
     bad "$desc: expected grpc-status 16 (UNAUTHENTICATED), got $st"; return
   fi
   if [ "$want" = "not16" ] && [ "$st" = "16" ]; then
-    bad "$desc: the anonymous call was refused (grpc-status 16) although authorization is acknowledged-off"; return
+    bad "$desc: the call was refused (grpc-status 16) but this row expects the real handler to answer"; return
   fi
   ok "$desc (grpc-status $st)"
 }
@@ -562,6 +595,32 @@ if [ "$ANON_OK" = "1" ]; then
          bad "enforce: the not_authenticated denial counter did not increment (= $denied_n)"
        fi ;;
   esac
+fi
+# Client-certificate calls (row G, default certificates): the pinned default gateway leaf is
+# admitted by the automatic pin, the unpinned default server leaf is refused as not_pinned.
+anon_row G.dgw "enforce: the pinned default gateway certificate is admitted (the real handler answers)" not16
+anon_row G.dsrv "enforce: a valid but unpinned certificate (the default server leaf) is refused" 16
+if [ "$ANON_OK" = "1" ]; then
+  if openssl x509 -in "$TMP/G/ca/default-server.pem" -noout -ext extendedKeyUsage 2>/dev/null \
+       | grep -q 'TLS Web Server Authentication'; then
+    want_reason="not_pinned"
+  else
+    want_reason="no_server_auth_eku"
+  fi
+  for rsn in not_pinned no_server_auth_eku; do
+    n="$(grep 'yuzu_server_gateway_peer_denied_total' "$TMP/G.metrics" 2>/dev/null | grep 'rpc="batch_heartbeat"' \
+      | grep "reason=\"$rsn\"" | awk '{print $NF}' | head -1 || true)"
+    case "$n" in ''|*[!0-9]*) n="missing" ;; esac
+    if [ "$rsn" = "$want_reason" ]; then
+      if [ "$n" = "1" ]; then
+        ok "enforce: the unpinned certificate incremented denied_total{rpc=\"batch_heartbeat\",reason=\"$rsn\"} to exactly 1 (the pinned one added none)"
+      else
+        bad "enforce: denied_total{rpc=\"batch_heartbeat\",reason=\"$rsn\"} is '$n', want exactly 1"
+      fi
+    elif [ "$n" != "0" ]; then
+      bad "enforce: denied_total{rpc=\"batch_heartbeat\",reason=\"$rsn\"} is '$n', want 0"
+    fi
+  done
 fi
 anon_row H "acknowledged plaintext: the same anonymous call is NOT refused (the real handler answers)" not16
 anon_row J "acknowledged on TLS defaults: the same anonymous call is NOT refused" not16

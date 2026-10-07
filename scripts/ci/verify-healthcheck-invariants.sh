@@ -330,7 +330,9 @@ main() {
                         echo "  NOTE [$role]: this probe is for the reference compose's one-shot ca-export" >&2
                         echo "        service (/bin/sh -ec + install), not a healthcheck; read 'healthcheck'" >&2
                         echo "        in the lines below as 'ca-export'." >&2
-                        diagnose "$rc" "$role" "install" \
+                        # 127 here is either /bin/sh itself or `install` missing (the inner
+                        # `exit 127` above, or docker's own exec failure): name both.
+                        diagnose "$rc" "$role" "/bin/sh or install" \
                             "the shell ran but could not complete the check."
                     fi
                 fi
