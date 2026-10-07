@@ -174,7 +174,7 @@ services:
   # (yuzu-pki) so it can traverse the 0750 cert dir and no capabilities at all.
   # It re-runs on every `up`, so a re-rooted CA is picked up.
   ca-export:
-    image: ghcr.io/devnullltd/yuzu-server:${YUZU_VERSION:-0.14.0}
+    image: ghcr.io/devnullltd/yuzu-server:${YUZU_VERSION:-0.14.1}
     container_name: yuzu-ca-export
     restart: "no"
     user: "0:2000"
