@@ -29,7 +29,11 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdint>
+#include <memory>
+#include <optional>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 using namespace yuzu::server;
@@ -208,12 +212,15 @@ TEST_CASE("fragments/executions real gate: service-scoped token gets a narrowed 
     CHECK_FALSE(has(g.body, "SECRET-ALICE"));
 
     // bob's group scope {bob-agent} intersected with service "scanners" (= {alice-agent}) is
-    // empty: nothing visible but bob's own dispatch.
+    // empty: nothing visible. bob's own dispatch (x_bob_own) is NOT served either: a service
+    // token's session username is its minter, and the owner disjunct is suppressed for it.
     auto b = r.get(r.mint("bob", "scanners"), /*use_tag_aware_auth=*/true);
     CHECK(b.status == 200);
-    CHECK(b.ids == ListRig::sorted({r.x_bob_own}));
+    CHECK(b.ids.empty());
+    CHECK(has(b.body, "No executions visible in your scope."));
     CHECK_FALSE(has(b.body, "SECRET-ALICE-ERR-ONLY"));
     CHECK_FALSE(has(b.body, "SECRET-ALICE-ERR-MIXED"));
+    CHECK_FALSE(has(b.body, "SECRET-ALICE-ERR-OWN"));
 }
 
 TEST_CASE("fragments/executions real gate: a principal with no Execution:Read is refused",
@@ -289,4 +296,103 @@ TEST_CASE("fragments/executions real gate: a degraded ITServiceOwner ceiling rea
     CHECK(has(g.body, "\"retry_after_ms\":5000"));
     CHECK_FALSE(has(g.body, "does not grant"));
     CHECK_FALSE(has(g.body, "SECRET-ALICE"));
+}
+
+// UP-2 (ADR-1006 ceiling): a service-scoped token's session username is its MINTER's identity, so
+// the owner disjunct (dispatched_by == username) would list every execution the minter
+// dispatched, outside the token's service tag scope. The fragment suppresses the owner disjunct
+// for a service-scoped session, in SQL and in the per-row check: the token sees only executions
+// that touched an in-scope agent. Ordinary (non-service) callers keep the owner disjunct.
+TEST_CASE("fragments/executions real gate: a service-scoped token never sees its minter's "
+          "out-of-scope dispatches",
+          "[pg][workflow][executions][list][confinement][authz][service_scope]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::response_execution_authz_tpl);
+    ListRig r{db.dsn()};
+    // bob also dispatched a just-submitted execution no agent has answered yet: invisible to a
+    // service token (no in-scope status row), owner-visible to bob himself.
+    const auto x_bob_pending = r.make("bob", 1735689604, 1);
+
+    // bob's group {bob-agent} intersected with service "printers" (= {bob-agent}) = {bob-agent}.
+    const auto token = r.mint("bob", "printers");
+    auto svc = r.get(token, /*use_tag_aware_auth=*/true);
+    CHECK(svc.status == 200);
+    // (b) in-scope executions are served; (a) the minter's alice-agent-only dispatch and the
+    // pending one are not.
+    CHECK(svc.ids == ListRig::sorted({r.x_bob, r.x_mixed}));
+    CHECK(std::find(svc.ids.begin(), svc.ids.end(), r.x_bob_own) == svc.ids.end());
+    CHECK(std::find(svc.ids.begin(), svc.ids.end(), x_bob_pending) == svc.ids.end());
+    CHECK_FALSE(has(svc.body, "SECRET-ALICE"));
+
+    // (e) Control: the SAME principal without the service narrowing keeps the owner disjunct.
+    auto plain = r.get(r.mint("bob"), /*use_tag_aware_auth=*/true);
+    CHECK(plain.status == 200);
+    CHECK(plain.ids == ListRig::sorted({r.x_bob, r.x_mixed, r.x_bob_own, x_bob_pending}));
+
+    // (c) Revoking Execution:Read from ITServiceOwner mid-test refuses the token outright; no
+    // row (owner-keyed or otherwise) is ever served through it.
+    REQUIRE(r.rig.rbac.remove_permission("ITServiceOwner", "Execution", "Read").has_value());
+    auto revoked = r.get(token, /*use_tag_aware_auth=*/true);
+    CHECK(revoked.status == 403);
+    CHECK(revoked.ids.empty());
+    CHECK_FALSE(has(revoked.body, "data-execution-id"));
+    // The ordinary owner is unaffected.
+    CHECK(r.get(r.mint("bob"), /*use_tag_aware_auth=*/true).ids ==
+          ListRig::sorted({r.x_bob, r.x_mixed, r.x_bob_own, x_bob_pending}));
+}
+
+// Default posture: RBAC ships OFF. With enforcement off every authenticated non-service caller
+// is admitted UNCONFINED (no management-group narrowing, no grant required) and sees the whole
+// fleet's executions; a service-scoped token is refused (it requires RBAC to be enabled). This
+// pins the documented default so a change to it is a loud, deliberate test edit.
+TEST_CASE("fragments/executions real gate: with RBAC off (the default) every authenticated "
+          "caller sees the full fleet and a service token is refused",
+          "[pg][workflow][executions][list][confinement][authz][service_scope]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::response_execution_authz_tpl);
+    ListRig r{db.dsn()};
+    const auto bob_token = r.mint("bob");
+    const auto dave_token = r.mint("dave");
+    const auto gary_token = r.mint("gary");
+    const auto svc_token = r.mint("gary", "printers");
+    // Control (RBAC on, as the rig seeds it): bob is confined, dave refused.
+    CHECK(r.get(bob_token, true).ids == ListRig::sorted({r.x_bob, r.x_mixed, r.x_bob_own}));
+    CHECK(r.get(dave_token, true).status == 403);
+
+    r.rig.rbac.set_rbac_enabled(false);
+    const auto everything = ListRig::sorted({r.x_bob, r.x_mixed, r.x_alice, r.x_bob_own});
+    for (const auto& token : {bob_token, dave_token, gary_token}) {
+        auto got = r.get(token, /*use_tag_aware_auth=*/true);
+        CHECK(got.status == 200);
+        CHECK(got.ids == everything);
+    }
+    auto svc = r.get(svc_token, /*use_tag_aware_auth=*/true);
+    CHECK(svc.status == 403);
+    CHECK(svc.ids.empty());
+}
+
+// The service axis needs a tag read to resolve the token's scope; when the tag store is
+// unreachable the gate answers its own retryable 503 and serves no row, while a non-service
+// caller (who needs no tag read) is unaffected.
+TEST_CASE("fragments/executions real gate: an unreachable tag store is a 503 for a service "
+          "token and serves no rows while an ordinary caller still gets 200",
+          "[pg][workflow][executions][list][confinement][authz][service_scope]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::response_execution_authz_tpl);
+    ListRig r{db.dsn()};
+    const auto svc_token = r.mint("gary", "printers");
+    CHECK(r.get(svc_token, /*use_tag_aware_auth=*/true).status == 200); // control
+
+    {
+        yuzu::server::pg::PgConn conn{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        yuzu::server::pg::PgResult d{PQexec(conn.get(), "DROP TABLE tag_store.tags CASCADE")};
+        REQUIRE(d.ok());
+    }
+    auto svc = r.get(svc_token, /*use_tag_aware_auth=*/true);
+    CHECK(svc.status == 503);
+    CHECK(svc.ids.empty());
+    CHECK(has(svc.body, "\"retry_after_ms\":5000"));
+    CHECK_FALSE(has(svc.body, "data-execution-id"));
+
+    auto gary = r.get(r.mint("gary"), /*use_tag_aware_auth=*/true);
+    CHECK(gary.status == 200);
+    CHECK(gary.ids == ListRig::sorted({r.x_bob, r.x_mixed, r.x_alice, r.x_bob_own}));
 }

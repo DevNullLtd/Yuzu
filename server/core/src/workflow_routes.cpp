@@ -177,11 +177,11 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                                                            httplib::Response& res) {
         // Fragment-local degrade note. Rendered at HTTP 200, NOT 503: the dashboard htmx
         // config (responseHandling `[45]..` swap:false) drops 4xx/5xx bodies, so a 503 here
-        // left the panel on "Loading..." forever (same convention as
-        // dex_routes.cpp /fragments/dex/perf/apps and verify_routes.hpp). The note is
-        // honest (never "No executions yet") and carries data-degraded for machine
-        // detection. The gate's own A4 JSON 403/503 are untouched; only this fragment's
-        // OWN degrade bodies are 200.
+        // left the panel on "Loading..." forever. Only the HTTP-200-for-a-degrade part
+        // follows dex_routes.cpp /fragments/dex/perf/apps and verify_routes.hpp; the
+        // data-degraded attribute itself is new here. The note is honest (never "No
+        // executions yet") and carries data-degraded for machine detection. The gate's own
+        // A4 JSON 403/503 are untouched; only this fragment's OWN degrade bodies are 200.
         auto degraded = [&res](const char* kind, const char* text) {
             res.status = 200;
             res.set_content(std::string("<div class=\"empty-state\" data-degraded=\"") + kind +
@@ -231,6 +231,15 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                                         "Contact an administrator if this persists.");
                 return;
             }
+            // A service-scoped token's session username is its MINTER's identity, so the
+            // owner disjunct (dispatched_by == username) would list every execution the
+            // minter dispatched, outside the token's service tag scope (ADR-1006: the
+            // token must never see more than its tag scope). Suppress the owner disjunct
+            // for such a session, in SQL and in the per-row check below: it sees only
+            // executions that touched an in-scope agent. The other execution surfaces
+            // still carry the minter-keyed disjunct for service tokens (tracked in #5557).
+            if (!session->token_scope_service.empty())
+                username.clear();
             ExecutionListScope s;
             s.owner = username;
             s.visible_agents.assign(gate.scope->begin(), gate.scope->end());

@@ -370,7 +370,10 @@ public:
     /// a confined caller never pulls every agent row of a wide execution). Engaged-empty is
     /// deny-all (zero rows), not unfiltered. Callers that project through
     /// `execution_visible` / `confined_projection` get IDENTICAL results either way, since
-    /// both ignore out-of-scope rows; the filter only bounds the read.
+    /// both ignore out-of-scope rows; the filter only bounds the read. Never use a
+    /// filtered read for a rerun/cancel completeness proof (`admit_confined_mutation`
+    /// needs the COMPLETE cohort). The list has no cap: an oversized array fails as a SQL
+    /// error and surfaces as the existing degrade path (`nullopt`).
     std::optional<std::vector<AgentExecStatus>>
     get_agent_statuses_checked(const std::string& execution_id,
                                const std::optional<std::vector<std::string>>& visible_agents =

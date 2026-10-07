@@ -326,6 +326,14 @@ int param_int32(const nlohmann::json& params, const char* key, int def = 0) {
     return static_cast<int>(param_int(params, key, def));
 }
 
+/// Caller-supplied id as it may appear in an audit `detail` (CWE-117): capped at
+/// 128 bytes (a hostile caller must not bloat the audit row) and neutralised by
+/// `audit_token` (space, '=', ',' and control bytes such as CR/LF cannot forge an
+/// adjacent `k=v` field or split the line). Ordinary ids pass through unchanged.
+std::string audit_caller_id(std::string_view id) {
+    return audit_token(id.substr(0, 128));
+}
+
 // B5 (api-parity #2146) — mirrors rest_api_v1.cpp's file-local
 // `sw_deploy_error_status`/`sw_deploy_client_message` (both `static` there, so
 // TU-invisible here — duplicated rather than shared, same constraint the
@@ -2711,8 +2719,15 @@ static const ToolDef kTools[] = {
      R"j({"type":"object","properties":{"scenario":{"type":"string"},"title":{"type":"string"},"category":{"type":"string"},"classification":{"type":"string"},"expected_first_tool":{"type":"string"},"requires_connector":{"type":"string","description":"Empty when the playbook needs no external connector"},"summary":{"type":"string"},"steps":{"type":"array","items":{"type":"string"}},"safety":{"type":"array","items":{"type":"string"}}},"required":["scenario","title","category","classification","expected_first_tool","requires_connector","summary","steps","safety"]})j"},
     {"summarize_working_set",
      "Summarize an agent/result-set/execution scope into a model-ready narrative with resource "
-     "links and next tools instead of dumping unbounded rows. Summarization only.",
-     R"({"type":"object","properties":{"kind":{"type":"string","enum":["fleet","agent","execution","result_set"],"default":"fleet"},"id":{"type":"string"},"limit":{"type":"integer","default":25,"maximum":100}}})",
+     "links and next tools instead of dumping unbounded rows. Summarization only. "
+     "kind=execution is confined by management group (admit-then-filter via the fleet-read "
+     "gate): counts are computed from only the caller's visible agents, and an execution "
+     "outside the caller's scope reads exactly like a nonexistent one (\"was not found\" "
+     "narrative, not an error). A store degrade returns an error carrying retry_after_ms. "
+     "An id containing a NUL byte is rejected with invalid-params for kind=execution. "
+     "kind=fleet and kind=result_set (and an empty id) return an unscoped whole-registry "
+     "agent count, not narrowed to the caller's scope.",
+     R"({"type":"object","properties":{"kind":{"type":"string","enum":["fleet","agent","execution","result_set"],"default":"fleet"},"id":{"type":"string","maxLength":128},"limit":{"type":"integer","default":25,"maximum":100}}})",
      // #2986: kind/id/limit echo the (possibly-defaulted) input; narrative,
      // resource_links, and recommended_next_tools are always populated
      // (empty id, or the fleet-fallback branch, still produce a narrative).
@@ -8160,7 +8175,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     spdlog::debug("get_agent_details: out-of-scope {} -> not found before lookup",
                                   agent_id);
                     mcp_audit("denied", "agent not found or outside caller's fleet-read scope: " +
-                                            agent_id);
+                                            audit_caller_id(agent_id));
                     res.set_content(
                         error_response(id, kInvalidParams, "Agent not found: " + agent_id),
                         "application/json");
@@ -8171,7 +8186,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     // masking it as a genuine miss (CDX-P2-04/K4). Reached only AFTER
                     // the in_scope deny above, so an out-of-scope caller still gets the
                     // identical not-found denial with zero backing read (#3564 intact).
-                    mcp_audit("failure", agent_id);
+                    mcp_audit("failure", audit_caller_id(agent_id));
                     res.set_content(
                         error_response(id, kInternalError, "device registry unavailable"),
                         "application/json");
@@ -8181,7 +8196,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     device_api->lookup_device(agent_id);
                 if (!result) { // DeviceReadError::kDegraded — id resolved, tag-store read failed
                                 // (in-scope only reaches here)
-                    mcp_audit("failure", agent_id);
+                    mcp_audit("failure", audit_caller_id(agent_id));
                     res.set_content(error_response(id, kInternalError, "Tag store unavailable"),
                                     "application/json");
                     return;
@@ -8189,7 +8204,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 if (!*result) { // genuine miss — identical denial to the out-of-scope case
                     spdlog::debug("get_agent_details: no match for {}", agent_id);
                     mcp_audit("denied", "agent not found or outside caller's fleet-read scope: " +
-                                            agent_id);
+                                            audit_caller_id(agent_id));
                     res.set_content(
                         error_response(id, kInvalidParams, "Agent not found: " + agent_id),
                         "application/json");
@@ -10690,7 +10705,9 @@ McpServer::HandlerFn McpServer::build_handler(
                 if (!exec || !visible) {
                     spdlog::debug("get_execution_status: {} exec_id={}",
                                   exec ? "outside caller fleet-read scope" : "no match", exec_id);
-                    mcp_audit("denied", "not found or outside caller's fleet-read scope: " + exec_id);
+                    mcp_audit("denied",
+                              "not found or outside caller's fleet-read scope: " +
+                                  audit_caller_id(exec_id));
                     res.set_content(
                         error_response(id, kInvalidParams, "Execution not found: " + exec_id),
                         "application/json");
@@ -10968,11 +10985,14 @@ McpServer::HandlerFn McpServer::build_handler(
             // fleet_read_fn_. Execution rows carry no single agent_id (they
             // fan out to many), so per-row visible-agent filtering would need
             // a per-execution agent-status lookup per row — an N+1 pattern
-            // (ADR-0017 INV-10). Until a batched version exists, a confined
-            // caller is restricted to their OWN dispatches (`dispatched_by`
-            // pushed into the SQL WHERE, ExecutionQuery::dispatched_by) —
-            // cheap, provably safe (never another operator's execution), and
-            // consistent with the dispatcher-ownership precedent elsewhere.
+            // (ADR-0017 INV-10). A batched status read exists and is used
+            // below to project the counts, but LIST ADMISSION stays owner-only
+            // (no visible-agent disjunct, unlike REST GET /api/v1/executions):
+            // a confined caller is restricted to their OWN dispatches
+            // (`dispatched_by` pushed into the SQL WHERE,
+            // ExecutionQuery::dispatched_by): cheap, provably safe (never
+            // another operator's execution), and consistent with the
+            // dispatcher-ownership precedent elsewhere.
             if (tool_name == "list_executions") {
                 if (!fleet_read_fn_) {
                     spdlog::error("list_executions: fleet_read_fn_ unwired; failing closed");
@@ -19505,6 +19525,15 @@ McpServer::HandlerFn McpServer::build_handler(
                     kind = "fleet";
                 }
                 const std::string target_id = param_str(args, "id");
+                // A NUL byte would make the store lookup (a C string, truncated at the NUL)
+                // resolve a different id than the audit row records (tokenised full id):
+                // reject it before any store read.
+                if (kind == "execution" && target_id.find('\0') != std::string::npos) {
+                    res.set_content(error_response(id, kInvalidParams,
+                                                   "id must not contain a NUL byte"),
+                                    "application/json");
+                    return;
+                }
                 const int limit = std::clamp(param_int32(args, "limit", 25), 1, 100);
                 JArr links;
                 JArr next;
@@ -19544,8 +19573,10 @@ McpServer::HandlerFn McpServer::build_handler(
                     // ADR-0017) is the SOLE gate on the (Execution, Read) pair
                     // here -- tier + RBAC + management-group/service
                     // confinement in one call, never stacked with a bare
-                    // tier_allows/perm_fn (mirrors get_execution_status
-                    // exactly). The counts below are the caller's confined
+                    // tier_allows/perm_fn (same gate as get_execution_status,
+                    // but a stricter visibility rule and a success-shaped
+                    // "was not found" narrative where that sibling answers an
+                    // error). The counts below are the caller's confined
                     // projection, and a confined-out execution reads EXACTLY
                     // like an absent one (same narrative, denied audit row, no
                     // success row) so existence is not an oracle (#3564).
@@ -19638,12 +19669,12 @@ McpServer::HandlerFn McpServer::build_handler(
                     // Caller-supplied id: neutralised (CRLF / k=v forgery) and capped.
                     mcp_audit("denied",
                               "not found or outside caller's fleet-read scope: " +
-                                  audit_token(std::string_view(target_id).substr(0, 128)));
+                                  audit_caller_id(target_id));
                 else
                     // Caller-supplied id (an unconfined absent id reaches here too):
                     // neutralised (CRLF / k=v forgery) and capped like the denied row above.
                     mcp_audit("success", kind + ":" +
-                                             audit_token(std::string_view(target_id).substr(0, 128)));
+                                             audit_caller_id(target_id));
                 res.set_content(success_response(id, result), "application/json");
                 return;
             }

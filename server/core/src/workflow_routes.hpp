@@ -140,10 +140,11 @@ public:
         AuthFn auth_fn;
         PermFn perm_fn;
         /// #1712 / #3290 Phase 2 — see FleetReadFn's doc comment above.
-        /// Used ONLY by the executions-drawer detail route
-        /// (/fragments/executions/{id}/detail) and the executions LIST
-        /// fragment (/fragments/executions, #3526); every other route in
-        /// this file keeps using `perm_fn` above unchanged.
+        /// Consumed by the executions-drawer detail route
+        /// (/fragments/executions/{id}/detail), the executions LIST
+        /// fragment (/fragments/executions, #3526), /sse/executions/{id} and
+        /// GET /api/workflow-executions/{id}; the remaining routes in this
+        /// file keep using `perm_fn` above unchanged.
         FleetReadFn fleet_read_fn;
         AuditFn audit_fn;
         EmitEventFn emit_fn;

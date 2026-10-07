@@ -1531,6 +1531,37 @@ TEST_CASE("executions list: empty principal under a confined scope fails closed 
     CHECK(served_ids(res->body).empty());
 }
 
+// No tracker wired (a misconfigured call site): the fragment fails closed with the 200
+// degrade note, never the "No executions yet" empty state and never a row. No Postgres needed.
+TEST_CASE("executions list: a null execution tracker renders a 200 degrade note and no rows",
+          "[workflow][executions][list]") {
+    yuzu::server::test::TestRouteSink sink;
+    WorkflowRoutes routes;
+    WorkflowRoutes::Deps d;
+    d.auth_fn = [](const httplib::Request&,
+                   httplib::Response&) -> std::optional<yuzu::server::auth::Session> {
+        yuzu::server::auth::Session s;
+        s.username = "tester";
+        return s;
+    };
+    d.perm_fn = [](const httplib::Request&, httplib::Response&, const std::string&,
+                   const std::string&) { return true; };
+    d.fleet_read_fn = [](const httplib::Request&, httplib::Response&, const std::string&,
+                         const std::string&) -> yuzu::server::authz::FleetReadGate {
+        return {true, VS{std::nullopt}};
+    };
+    d.audit_fn = [](const httplib::Request&, const std::string&, const std::string&,
+                    const std::string&, const std::string&, const std::string&) {};
+    d.execution_tracker = nullptr;
+    routes.register_routes(sink, std::move(d));
+    auto res = sink.Get("/fragments/executions");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(res->body.find("data-degraded=\"unavailable\"") != std::string::npos);
+    CHECK(res->body.find("No executions yet") == std::string::npos);
+    CHECK(res->body.find("data-execution-id") == std::string::npos);
+}
+
 // Unconfined stays on its old shape: when a confined scope happens to cover every agent
 // of every row (and the stored counters agree with the status rows), the confined render
 // is byte-equal to the unconfined render, so the projection only ever changes what it

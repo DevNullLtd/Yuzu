@@ -11528,6 +11528,133 @@ TEST_CASE("MCP summarize_working_set execution: success audit rows are pinned ex
     CHECK(ts.audit_target_types[1] == "mcp_tool");
 }
 
+// A5: the advertised contract states the confinement and degrade semantics and bounds the id.
+TEST_CASE("MCP summarize_working_set: tools/list advertises the confinement semantics and an id "
+          "maxLength (#4753)",
+          "[mcp][integration][4753]") {
+    McpTestServer ts;
+    ts.start();
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/list","id":3})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    const nlohmann::json* tool = nullptr;
+    for (const auto& t : body["result"]["tools"])
+        if (t["name"] == "summarize_working_set")
+            tool = &t;
+    REQUIRE(tool != nullptr);
+    CHECK((*tool)["inputSchema"]["properties"]["id"]["maxLength"] == 128);
+    const auto desc = (*tool)["description"].get<std::string>();
+    CHECK(desc.find("confined by management group") != std::string::npos);
+    CHECK(desc.find("retry_after_ms") != std::string::npos);
+    CHECK(desc.find("unscoped whole-registry") != std::string::npos);
+}
+
+// A NUL byte in a kind=execution id: the store lookup is a C string (truncated at the NUL) while
+// the audit row records the tokenised FULL id, so the two would disagree. The handler rejects it
+// before any store read: the real execution is not resolved and no success row is written.
+TEST_CASE("MCP summarize_working_set execution: an id with a NUL byte is rejected and does not "
+          "resolve the real execution (#4753)",
+          "[pg][mcp][integration][agentic-demo][scope][4753][security]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    yuzu::server::ExecutionTracker& tracker = *tracker_bundle;
+    const auto exec_id = seed_summarize_exec(tracker, "operator", {{"agent-in", "success"}});
+
+    McpTestServer ts;
+    ts.execution_tracker_for_test = &tracker;
+    ts.start("operator");
+
+    // Control: the real id resolves.
+    auto ok = ts.call(summarize_exec_call_body(exec_id));
+    REQUIRE(ok);
+    CHECK(narrative_of(ok->body).find("Execution " + exec_id + " is running") == 0);
+    const auto audit_rows_after_control = ts.audit_log.size();
+
+    nlohmann::json body = {{"jsonrpc", "2.0"},
+                           {"method", "tools/call"},
+                           {"id", 313},
+                           {"params",
+                            {{"name", "summarize_working_set"},
+                             {"arguments",
+                              {{"kind", "execution"}, {"id", exec_id + std::string(1, '\0') + "junk"}}}}}};
+    auto res = ts.call(body.dump());
+    REQUIRE(res);
+    auto parsed = nlohmann::json::parse(res->body);
+    REQUIRE(parsed.contains("error"));
+    CHECK(parsed["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    CHECK_FALSE(parsed.contains("result"));
+    CHECK(res->body.find("is running") == std::string::npos);
+    CHECK(ts.audit_log.size() == audit_rows_after_control); // no success (or any) row
+}
+
+// CWE-117 on the pre-existing sibling sites: the caller-supplied id in a denied audit detail is
+// neutralised (space, '=', ',', CR/LF -> '_') and capped at 128 bytes.
+TEST_CASE("MCP get_execution_status: the denied audit detail neutralises and caps the "
+          "caller-supplied id (CWE-117)",
+          "[pg][mcp][integration][execution][security]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    yuzu::server::ExecutionTracker& tracker = *tracker_bundle;
+    McpTestServer ts;
+    ts.execution_tracker_for_test = &tracker;
+    ts.start("operator");
+    const std::string prefix = "not found or outside caller's fleet-read scope: ";
+    for (const std::string& id :
+         {std::string("a b=c,d\r\ne"), std::string(5000, 'z'), std::string("ordinary-id-7")}) {
+        nlohmann::json body = {{"jsonrpc", "2.0"},
+                               {"method", "tools/call"},
+                               {"id", 724},
+                               {"params",
+                                {{"name", "get_execution_status"},
+                                 {"arguments", {{"execution_id", id}}}}}};
+        auto res = ts.call(body.dump());
+        REQUIRE(res);
+        CHECK(nlohmann::json::parse(res->body).contains("error"));
+    }
+    REQUIRE(ts.audit_details.size() == 3);
+    for (const auto& a : ts.audit_log)
+        CHECK(a == "mcp.get_execution_status|denied");
+    CHECK(ts.audit_details[0] == prefix + "a_b_c_d__e");
+    CHECK(ts.audit_details[1] == prefix + std::string(128, 'z'));
+    CHECK(ts.audit_details[2] == prefix + "ordinary-id-7"); // ordinary ids are unchanged
+}
+
+TEST_CASE("MCP get_agent_details: the denied audit detail neutralises and caps the "
+          "caller-supplied id on both the out-of-scope and the miss path (CWE-117)",
+          "[mcp][auth][security]") {
+    McpTestServer ts;
+    // Caller may see only agent-001: every id below is out of scope (site 1). The default
+    // unconfined gate (second server) reaches the genuine-miss path (site 2).
+    ts.fleet_read_fn_for_test = [](const httplib::Request&, httplib::Response&,
+                                   const std::string&,
+                                   const std::string&) -> yuzu::server::authz::FleetReadGate {
+        return {true, std::unordered_set<std::string>{"agent-001"}};
+    };
+    ts.start();
+    McpTestServer open_ts;
+    open_ts.start();
+
+    const std::string prefix = "agent not found or outside caller's fleet-read scope: ";
+    const std::string hostile = "a b=c,d\r\ne";
+    const std::string long_id(5000, 'z');
+    for (McpTestServer* server : {&ts, &open_ts}) {
+        for (const std::string& id : {hostile, long_id}) {
+            nlohmann::json body = {{"jsonrpc", "2.0"},
+                                   {"method", "tools/call"},
+                                   {"id", 20},
+                                   {"params",
+                                    {{"name", "get_agent_details"},
+                                     {"arguments", {{"agent_id", id}}}}}};
+            auto res = server->call(body.dump());
+            REQUIRE(res);
+            CHECK(nlohmann::json::parse(res->body).contains("error"));
+        }
+        REQUIRE(server->audit_details.size() == 2);
+        for (const auto& a : server->audit_log)
+            CHECK(a == "mcp.get_agent_details|denied");
+        CHECK(server->audit_details[0] == prefix + "a_b_c_d__e");
+        CHECK(server->audit_details[1] == prefix + std::string(128, 'z'));
+    }
+}
+
 // ServiceScopeClass for summarize_working_set stays the default `denied`: kind=agent and
 // kind=fleet have no mechanism on the service-scope axis, and `confined` needs a real
 // downstream mechanism for EVERY kind (routed row clause 3), so migrating kind=execution's
