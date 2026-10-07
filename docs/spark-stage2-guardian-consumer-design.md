@@ -819,8 +819,10 @@ handler in `rest_api_v1.cpp`, the MCP `push_guardian_rules` tool in `mcp_server.
 `guardian_push_fn_` fan-out in `server.cpp`; so the default flag is not itself the hazard,
 a push that omits a still-desired rule is; follow-up FU-12 in the flip gate, #5547); an
 agent restart gap (the boot
-Application opens at the loaded acknowledged generation with an empty `content_id`,
-and a failed boot re-arm is never retried, #5513); a content-identity gap (an
+Application opens at the loaded acknowledged generation with an empty `content_id`;
+a failed boot re-arm, formerly never retried, is resolved by #5513: the agent reports
+generation 0 with the `yuzu.guardian_boot_rearm_unresolved` tag until a push applies
+cleanly, and a legacy guard that returns false at arm stays under #2797); a content-identity gap (an
 identical re-observation matches `rule_id` and spec only, #5512); a wedge that is adopted or
 settles before the agent has retained it costs one avoidable Reapply on the next identical
 push: one minted in the Dispatching window is counted in `resolved_failed` but never retained
@@ -1163,7 +1165,10 @@ design is mentioned it is named as the earlier design.
   `failed_receipts` would remove the cost and is not done here.
 - **Known limits #5459 does NOT fix (record, do not widen scope).** Agent restart gap:
   the boot Application opens at the loaded acknowledged generation with an empty
-  `content_id`, and a failed boot re-arm is never retried (#5513); an acknowledgment
+  `content_id`. A failed boot re-arm, formerly never retried, is resolved by #5513 (the
+  agent reports generation 0 with the `yuzu.guardian_boot_rearm_unresolved` tag until a
+  push applies cleanly; a legacy guard that returns false at arm stays under #2797, and a
+  server at generation 0 does not push); an acknowledgment
   persisted by the old waiver is not revoked. A never-returning arm holds the
   generation forever (intended). A push whose unresolved set mixes a wedge with a
   congestion or ordinary failure forces a Reapply every time. A delta push

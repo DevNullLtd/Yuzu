@@ -196,8 +196,9 @@ public:
     /// receipts THIS call resolved to non-Committed - governance finding UP-3
     /// (Gate 4, unhappy-path): an async arm failure used to update only this
     /// ledger's own internal `resolved_failed` and a local log line, never the
-    /// durable fleet-visible `arm_failures_` counter a synchronous refusal
-    /// already did. The caller (GuardianEngine::journal_maintenance_tick()) folds
+    /// cumulative `arm_failures_` counter a synchronous refusal already did
+    /// (that counter has no production reader today, so it is not fleet-visible;
+    /// tracked by #4062). The caller (GuardianEngine::journal_maintenance_tick()) folds
     /// this into `arm_failures_` itself - the ledger has no engine pointer of its
     /// own and must not gain one.
     std::size_t drain_locked(GuardianSparkRuntime& runtime, std::size_t max_per_tick,

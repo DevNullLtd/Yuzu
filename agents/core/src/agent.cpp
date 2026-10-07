@@ -2652,12 +2652,16 @@ public:
                                                       "Guardian heartbeat legacy-sink kick "
                                                       "failed (the kick was skipped this tick)");
                               }
-                              // Group B: the generation tag, in its own try so it survives a
-                              // group-A throw. What can throw: only the std::mutex lock in
-                              // policy_generation() (std::system_error) or the tag insert.
+                              // Group B: the generation tag (and, #5513, its boot re-arm
+                              // companion), in its own try so it survives a group-A throw.
+                              // generation_report() reads the reported value and the flag under
+                              // ONE engine lock and the emitter writes both from that snapshot
+                              // (companion first). What can throw: only the std::mutex lock in
+                              // generation_report() (std::system_error) or a tag insert.
                               try {
-                                tags["yuzu.guardian_generation"] =
-                                    std::to_string(guardian_->policy_generation());
+                                const auto gen_report = guardian_->generation_report();
+                                emit_guardian_generation_heartbeat_tags(
+                                    tags, gen_report.reported, gen_report.boot_rearm_unresolved);
                               } catch (...) {
                                   hb_guardian_contain(kHbGuardianGeneration,
                                                       "Guardian heartbeat generation tag failed "

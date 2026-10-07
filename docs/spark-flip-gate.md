@@ -1196,8 +1196,20 @@ flip, with a red-first test each:
   - (AC-13) **Recovery needs a live connection and a generation-tracking server.** The
     maintenance tick runs on the per-connection heartbeat thread, and the retry owner is
     the server's `full_sync` re-push. Agent restart gap: the boot Application opens at the
-    loaded acknowledged generation with an empty `content_id`, and a failed boot re-arm is
-    never retried (#5513); an acknowledgment persisted by the old waiver is not revoked.
+    loaded acknowledged generation with an empty `content_id`. A failed boot re-arm is
+    resolved (#5513): the agent reports generation 0 with the sparse companion tag
+    `yuzu.guardian_boot_rearm_unresolved` until a push applies cleanly, so the server's
+    existing reconcile catches it up, and the persisted generation is never rewritten. The
+    evidence is the 24 `[5513]`/`[boot_rearm]` cases in `test_guardian_engine.cpp` and
+    `test_guardian_engine_spark_reconcile.cpp`, the emitter cases in
+    `test_guardian_journal_heartbeat.cpp` and the server case in `test_heartbeat_ingestion.cpp`:
+    the 24 cases passed on Linux (also under TSan), Windows (MSVC) and macOS, and each of 11
+    deliberate mutations of the production lines turned a matching case red. Two
+    residuals stay open: a legacy guard that returns false at arm (`ReconcileOutcome::Inert`)
+    remains under #2797, and a server whose current generation is 0 does not push. The
+    Spark-path parts (a boot arm that fails late or is drained as a failure, and the latch
+    on the boot application) are dormant while `prefer_spark_` is false and are covered by
+    those tests alone. An acknowledgment persisted by the old waiver is not revoked.
   - (AC-14) **Content identity (#5512).** A re-observation of a wedged claim matches
     `rule_id` and spec only (the content-identity bug); recorded, not fixed here. Operator
     consequence: a wedged rule edited without changing its spec (its expected value, for

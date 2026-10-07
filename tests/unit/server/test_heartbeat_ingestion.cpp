@@ -73,6 +73,40 @@ TEST_CASE("HeartbeatIngestion: reconcile fires on a valid generation tag",
     CHECK(cap.generation == 42u);
 }
 
+// #5513 T14: an agent with an unresolved boot re-arm reports generation "0" (plus the sparse
+// companion tag yuzu.guardian_boot_rearm_unresolved). There is deliberately NO zero special
+// case server-side: "0" parses like any value and reaches the reconcile fn, which compares it
+// numerically against the server's current generation and pushes if behind. The companion tag
+// is not read here and must not change that.
+TEST_CASE("HeartbeatIngestion: a reported generation of \"0\" reaches the reconcile fn (#5513)",
+          "[heartbeat_ingestion][guardian]") {
+    yuzu::MetricsRegistry metrics;
+    EventBus bus;
+    AgentRegistry registry{bus, metrics};
+    HeartbeatIngestion ingestion{registry, /*health=*/nullptr, /*fleet_topology=*/nullptr,
+                                 &metrics};
+
+    ReconcileCapture cap;
+    ingestion.set_guardian_reconcile_fn([&](std::string_view aid, std::uint64_t gen) {
+        cap.called = true;
+        cap.agent_id = std::string(aid);
+        cap.generation = gen;
+    });
+
+    SECTION("generation 0 alone") {
+        ingestion.ingest(make_hb("0"), "agent-x", "direct");
+    }
+    SECTION("generation 0 with the boot re-arm companion tag") {
+        auto hb = make_hb("0");
+        (*hb.mutable_status_tags())["yuzu.guardian_boot_rearm_unresolved"] = "1";
+        ingestion.ingest(hb, "agent-x", "direct");
+    }
+
+    REQUIRE(cap.called);
+    CHECK(cap.agent_id == "agent-x");
+    CHECK(cap.generation == 0u);
+}
+
 TEST_CASE("HeartbeatIngestion: reconcile NOT fired on malformed / partial / absent tag",
           "[heartbeat_ingestion][guardian]") {
     yuzu::MetricsRegistry metrics;

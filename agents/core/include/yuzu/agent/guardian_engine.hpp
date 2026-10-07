@@ -483,17 +483,44 @@ public:
     /// mech_unsupported_total heartbeat tag.
     [[nodiscard]] std::map<SparkType, std::uint64_t> unsupported_counts_by_type() const;
 
-    /// Current policy generation — monotonically increasing; bumped on
-    /// every successful apply_rules call. Persisted across restarts.
+    /// The policy generation REPORTED to the server (the heartbeat's yuzu.guardian_generation
+    /// tag, via generation_report() below, and the `__guard__ push_rules` reply text). Reads 0 while a boot
+    /// re-arm is unresolved (boot_rearm_unresolved(), #5513): a boot re-arm that failed at an
+    /// already-acknowledged generation would otherwise leave the agent reporting that generation
+    /// while the rule is not armed, and the server's heartbeat reconcile only pushes while the
+    /// reported value is BEHIND its current. Only the INTERNAL value (policy_generation_, the
+    /// one persisted under kKeyGen) is monotonically increasing and bumped on a successful
+    /// apply_rules call; this REPORTED value is not monotonic by design (it drops to 0 on an
+    /// unresolved boot re-arm and returns to the internal value when a clean application
+    /// clears it). Persisted across restarts is the internal value only.
     std::uint64_t policy_generation() const;
 
+    /// The reported generation and the boot-re-arm flag read under ONE mtx_ acquisition, so a
+    /// heartbeat that ships both tags can never pair a value from before an apply_rules clear
+    /// with a flag from after it (#5513). `reported` is exactly what policy_generation() would
+    /// return at the same instant.
+    struct GenerationReport {
+        std::uint64_t reported{0};
+        bool boot_rearm_unresolved{false};
+    };
+    [[nodiscard]] GenerationReport generation_report() const;
+
+    /// True while a boot re-arm is unresolved (#5513): start_local()'s walk failed to re-arm a
+    /// cached rule (a returned Failed or a throw), or a boot-application receipt later drained
+    /// as a failure, and no clean application has cleared it since. In-memory only: a restart
+    /// rebuilds it from the walk, so the persisted generation is never rewritten for it. Takes
+    /// mtx_.
+    [[nodiscard]] bool boot_rearm_unresolved() const;
+
     /// Cumulative count of reconcile (arm) ATTEMPTS that threw and were firewalled in
-    /// apply_rules — a rule that persisted but did not arm. This counts attempts, NOT
-    /// distinct rules: one persistently-failing rule increments it once per push (so it
-    /// is a rate signal / "a gap is open", not "how many rules are gapped"). A nonzero
-    /// value means an enforcement gap is (or was) open on this endpoint; surfaced via the
-    /// heartbeat by item 9 so a persistent gap stays fleet-visible even after the
-    /// generation later advances past it (rung 7.7b PR-1 item 3 / Sol B1). Lock-free.
+    /// apply_rules, plus failed boot re-arms (start_local's walk, #5513) and arm receipts that
+    /// resolved to a failure in the maintenance tick's drain — a rule that persisted but did
+    /// not arm. This counts attempts, NOT distinct rules: one persistently-failing rule
+    /// increments it once per push (so it is a rate signal / "a gap is open", not "how many
+    /// rules are gapped"). A nonzero value means an enforcement gap is (or was) open on this
+    /// endpoint. NOT surfaced anywhere today: it has no production caller (no heartbeat tag,
+    /// no metric; tracked by #4062), so it is readable only from tests, and must not be cited
+    /// as fleet-visible evidence (rung 7.7b PR-1 item 3 / Sol B1). Lock-free.
     [[nodiscard]] std::uint64_t arm_failure_count() const noexcept {
         return arm_failures_.load(std::memory_order_relaxed);
     }
@@ -568,6 +595,12 @@ public:
     /// is only forward-declared here. Takes mtx_ (matches every other _for_test
     /// accessor that reads engine-owned state). No production caller.
     [[nodiscard]] std::size_t ack_pending_count_for_test() const;
+
+    /// TEST-ONLY: the current application's retained failed-receipt count (see
+    /// GuardianArmAckLedger::failed_receipt_count_for_test) - lets a test assert that a drained
+    /// wedge was RETAINED (kept recoverable) before it releases the late outcome (#5513).
+    /// Defined out-of-line like ack_pending_count_for_test(); takes mtx_. No production caller.
+    [[nodiscard]] std::size_t ack_failed_receipt_count_for_test() const;
 
     /// TEST-ONLY: the spark drain worker / convergence scheduler, for started-state
     /// introspection (#2238, fixes BLOCKING-2b). wire_spark_engine() constructs both
@@ -827,9 +860,28 @@ private:
     bool started_{false};
     bool stopped_{false};
     std::uint64_t policy_generation_{0};
+    /// #5513: true while a boot re-arm is unresolved; policy_generation() and
+    /// generation_report() then report 0 (policy_generation_ itself is never touched, so the
+    /// persisted value and the two `> policy_generation_` advance gates are unchanged). Set by
+    /// note_boot_rearm_failure_locked() (start_local's walk) and by the maintenance tick when a
+    /// receipt of the still-open boot application drains as a failure; cleared by any clean
+    /// application (apply_rules' tail, or the tick's can_advance() block). Under mtx_, no atomics.
+    bool boot_unresolved_{false};
+    /// #5513: true from the boot application's begin_application() succeeding until
+    /// apply_rules' own begin_application() succeeds (which supersedes it) or stop(). Only the
+    /// SET side (boot_unresolved_ from a drained failure) reads it, so an ordinary held push's
+    /// failure never reports 0. Under mtx_, no atomics.
+    bool boot_app_open_{false};
     std::size_t rule_count_{0};
     std::atomic<std::uint64_t> arm_failures_{0}; ///< reconcile-throw count (item 3 / Sol B1)
 
+    /// #5513: the ONE place a boot re-arm failure is recorded, shared by start_local's
+    /// returned-Failed arm and both catch arms. mtx_ held. noexcept and allocation-free: it
+    /// runs inside the exhaustion catch. Sets boot_unresolved_, counts the failure into
+    /// arm_failures_, and latches the boot application (a no-op when begin_application failed:
+    /// no current application) so the tick's can_advance() cannot clear the flag before the
+    /// server's catch-up push has applied cleanly.
+    void note_boot_rearm_failure_locked() noexcept;
     bool put_rule_locked(const yuzu::guardian::v1::GuaranteedStateRule& rule);
     void refresh_count_locked();
     /// Persists `gen` to the policy-generation KV key. Returns kv_->set()'s own
