@@ -55,8 +55,10 @@
 /// null selects the real steady clock. Tests inject a manual clock and a fetch function
 /// that blocks on an event, so nothing sleeps. A clock that moves backwards leaves the
 /// cached entry fresh rather than re-fetching. The clock is called under the internal
-/// mutex and must not call back into the cache. The TTL is measured from when the fetch
-/// STARTED, which is the conservative end of the read's age.
+/// mutex and must not call back into the cache. A success's TTL is measured from when the
+/// fetch STARTED, which is the conservative end of the read's age; an error's `negative_ttl`
+/// is measured from when the fetch FINISHED, so a slow failing read still suppresses the
+/// next attempts for the full window.
 ///
 /// Thread-safe.
 
@@ -169,7 +171,8 @@ public:
 private:
     struct Entry {
         Result result;
-        Clock::time_point at;
+        Clock::time_point at;       // freshness reference (see install())
+        Clock::time_point started;  // when the read began; orders competing installs
     };
 
     bool fresh_locked(const Entry& e, Clock::time_point now) const {
@@ -217,14 +220,18 @@ private:
                 return;
             if (!r.has_value() && !install_errors)
                 return;
-            if (entry_ && started < entry_->at)
+            if (entry_ && started < entry_->started)
                 return;  // an older read finishing last must not overwrite a newer one
             if (r.has_value()) {
                 if (last_served_ && *r < *last_served_)
                     ++regressions_;
                 last_served_ = *r;
             }
-            entry_ = Entry{r, started};
+            // A success ages from when its read STARTED (conservative). An error ages from
+            // when the read FINISHED: a slow failing read (a 2 s lease timeout) would
+            // otherwise be stored already past `negative_ttl` and every heartbeat would
+            // re-run it, defeating the negative cache. `started` alone orders installs.
+            entry_ = Entry{r, r.has_value() ? started : clock_(), started};
         } catch (...) {
             try {
                 std::lock_guard lk(mu_);

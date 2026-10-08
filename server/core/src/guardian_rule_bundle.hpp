@@ -9,8 +9,8 @@
 /// inside the per-rule loop, a `yuzu::scope::parse` of each distinct scope_expr. All of
 /// that depends only on the rule set and the deployed-baseline set, and both are
 /// changed only by operations that bump the policy generation (rule create/update/delete
-/// in the store, plus the explicit baseline deploy/undeploy bumps). So one `Bundle` per
-/// generation is sound, subject to the ordering and max-age rules below.
+/// in the store, plus the explicit bumps on baseline deploy and on delete of a deployed
+/// Baseline). So one `Bundle` per generation is sound, subject to the ordering and max-age rules below.
 ///
 /// WHAT IS NOT MEMOISED, AND MUST NOT BE. Scope MEMBERSHIP of an agent. Tags, custom
 /// properties, session OS and `scopable_tags` change with no generation bump, so a

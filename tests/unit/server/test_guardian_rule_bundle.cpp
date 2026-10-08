@@ -314,11 +314,38 @@ TEST_CASE("GuardianRuleBundleCache: a load that fails after an invalidate does n
 
 TEST_CASE("GuardianRuleBundleCache: a zero negative_ttl disables the negative cache",
           "[guardian][rule_bundle][negative]") {
-    GuardianRuleBundleCache cache({.negative_ttl = 0ms});
+    // The manual clock never advances, so only the `negative_ttl > 0` guard can make the second
+    // call re-run the loader (a real clock would let a removed guard pass on elapsed time).
+    ManualClock clk;
+    GuardianRuleBundleCache cache({.negative_ttl = 0ms}, clk.fn());
     std::atomic<int> calls{0};
     const auto failing = failing_loader(calls);
     CHECK_FALSE(cache.get(1, failing).has_value());
     CHECK_FALSE(cache.get(1, failing).has_value());
+    CHECK(calls.load() == 2);
+}
+
+TEST_CASE("GuardianRuleBundleCache: a slow failing load is remembered from when it finished",
+          "[guardian][rule_bundle][negative]") {
+    // Stamped with the load's start, a failure slower than negative_ttl would be stored
+    // already expired and every following call would re-run the slow loader.
+    ManualClock clk;
+    GuardianRuleBundleCache cache({.negative_ttl = 1s}, clk.fn());
+    std::atomic<int> calls{0};
+    const GuardianRuleBundleCache::LoaderFn slow_failing = [&] {
+        calls.fetch_add(1);
+        clk.advance(3s);  // slower than the negative ttl
+        return std::expected<Bundle, BundleLoadError>(
+            std::unexpected(BundleLoadError{BundleLoadError::Source::rules, "slow failure"}));
+    };
+    REQUIRE_FALSE(cache.get(1, slow_failing).has_value());
+    clk.advance(999ms);  // inside negative_ttl of the COMPLETION
+    auto again = cache.get(1, slow_failing);
+    REQUIRE_FALSE(again.has_value());
+    CHECK(again.error().detail == "slow failure");
+    CHECK(calls.load() == 1);  // the second call did not re-run the loader
+    clk.advance(1ms);
+    CHECK_FALSE(cache.get(1, slow_failing).has_value());
     CHECK(calls.load() == 2);
 }
 
@@ -558,7 +585,8 @@ TEST_CASE("GuardianRuleBundleCache: a loader that throws bad_alloc leaves the ca
 TEST_CASE("GuardianRuleBundleCache: waited reports the time a blocked waiter spent, and zero for the owner and hits",
           "[guardian][rule_bundle][waited]") {
     CountingClock clk;
-    GuardianRuleBundleCache cache({}, clk.fn());
+    // A generous max_wait so a descheduled owner cannot turn the waiter's wait into a timeout.
+    GuardianRuleBundleCache cache({.max_wait = 60'000ms}, clk.fn());
     Event entered, release;
     const GuardianRuleBundleCache::LoaderFn slow = [&] {
         entered.set();

@@ -81,11 +81,12 @@
 ///
 /// A CLAIM IS NEVER RELEASED. An Admit writes the claim and nothing here removes it except
 /// convergence (once at least `min_interval` old) and the sweep. In particular a push that
-/// ends without sending (the agent has no session, or a store read failed) keeps its claim:
-/// an agent that has Registered but not Subscribed heartbeats generation 0 in a loop, and a
-/// "forget the claim when nothing was sent" API would turn every such heartbeat into a fresh
-/// admission and let one credential drain the shared budget. With the claim kept that agent
-/// costs at most one admission per `min_interval`.
+/// ends without sending (the session is gone, or a store read failed) keeps its claim: an
+/// agent heartbeating generation 0 in a loop would, with a "forget the claim when nothing was
+/// sent" API, turn every heartbeat into a fresh admission and let one credential drain the
+/// shared budget. With the claim kept that agent costs at most one admission per
+/// `min_interval`. (A Registered-but-not-yet-Subscribed agent HAS a session, because
+/// `register_agent` installs it at Register: it takes the full push path and the send fails.)
 ///
 /// ALLOCATION FAILURE. `decide()` may throw `std::bad_alloc` while inserting the claim,
 /// after `try_admit()` succeeded. Nothing is leaked; the budget has counted one admission

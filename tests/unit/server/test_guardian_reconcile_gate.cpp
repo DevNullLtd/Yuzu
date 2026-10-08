@@ -724,8 +724,8 @@ TEST_CASE("GuardianReconcileGate: a moved-from Scoped does not release a slot tw
 
 TEST_CASE("GuardianReconcileGate: an Admit whose push never sends keeps its claim",
           "[guardian][reconcile_gate]") {
-    // The no_session path: an agent that Registered but did not Subscribe heartbeats generation
-    // 0 in a loop. The caller is admitted, finds no session, and finishes WITHOUT pushing. The
+    // The no_session path: an agent whose session was removed while heartbeating generation 0 in
+    // a loop. The caller is admitted, finds no session, and finishes WITHOUT pushing. The
     // claim must stay: if the gate forgot it, every such heartbeat would be a fresh admission
     // and one credential could drain the shared budget. (There is deliberately no release API.)
     ManualClock clk;

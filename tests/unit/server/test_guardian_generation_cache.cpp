@@ -566,4 +566,34 @@ TEST_CASE("GuardianGenerationCache: get() racing a throwing flight never hangs",
     leader.join();
     w.join();
     REQUIRE_FALSE(waiter.has_value());
+    CHECK(waiter.error().find("boom") != std::string::npos);
+}
+
+TEST_CASE("GuardianGenerationCache: a slow failing read is negative-cached from its completion",
+          "[guardian][generation_cache]") {
+    // The error ages from when the read FINISHED. Stamped with the read's start, a failure
+    // that took longer than negative_ttl (a 2 s lease timeout against a 1 s TTL) would be
+    // stored already expired and every following get() would re-run the slow read.
+    ManualClock clk;
+    std::atomic<int> calls{0};
+    GuardianGenerationCache c(
+        [&]() -> GuardianGenerationCache::Result {
+            calls.fetch_add(1);
+            clk.advance(3s);  // the read itself outlasts negative_ttl (1 s)
+            return std::unexpected(std::string("lease timeout"));
+        },
+        {}, clk.fn());
+    auto first = c.get();
+    REQUIRE_FALSE(first.has_value());
+    CHECK(calls.load() == 1);
+
+    clk.advance(999ms);  // inside negative_ttl of the COMPLETION
+    auto second = c.get();
+    REQUIRE_FALSE(second.has_value());
+    CHECK(second.error() == "lease timeout");
+    CHECK(calls.load() == 1);  // served from the negative cache, the fetch did not run again
+
+    clk.advance(1ms);  // negative_ttl elapsed since completion
+    (void)c.get();
+    CHECK(calls.load() == 2);
 }
