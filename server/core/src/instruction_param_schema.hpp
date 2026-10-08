@@ -152,10 +152,10 @@ prepare_param_validator(std::string_view stored_schema_json);
 // RETAINED total never exceeds the budget. Peak memory is the retained total plus the validators
 // in flight: one per concurrent request, since there is no single-flight and concurrent first
 // calls for one schema each build their own. An entry over the cap or the budget is rebuilt on
-// every call, a deliberate trade of repeated CPU for a bounded cache (measured once, on one host
-// at -O2: a 128-pattern schema prepared in roughly 0.5 to 1 ms with a trivial `^a$` pattern and
-// about 15 ms with a `[a-zA-Z0-9_.-]{1,64}` pattern). The weights are upper-bound estimates, so the budget
-// bounds the estimate, not a measured resident size.
+// every call, a deliberate trade of repeated CPU for a bounded cache. The CPU cost depends on
+// the patterns: from sub-millisecond for trivial ones to milliseconds for classes like
+// `[a-zA-Z0-9_.-]{1,64}`. The weights are upper-bound estimates, so the budget bounds the
+// estimate, not a measured resident size.
 class ParamValidatorCache {
   public:
     using Result =

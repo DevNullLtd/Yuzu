@@ -647,13 +647,25 @@ TEST_CASE("param-schema cache: many threads first-calling one schema all get a v
                     t.join();
         }
     } pool;
+    // Every worker waits on one gate, released only after all are spawned, so the first calls
+    // overlap instead of finishing one by one as threads start.
+    std::atomic<bool> go{false};
+    // Declared after `pool`, so it runs first on unwind: a throw while spawning must open the
+    // gate or the Joiner would wait on spinning workers forever.
+    struct OpenGate {
+        std::atomic<bool>& g;
+        ~OpenGate() { g.store(true, std::memory_order_release); }
+    } open_gate{go};
     for (int t = 0; t < 12; ++t)
         pool.ts.emplace_back([&, t] {
+            while (!go.load(std::memory_order_acquire))
+                std::this_thread::yield();
             auto r = cache.get(t % 2 ? "x" : "y", s);
             if (!r || (*r)->absent() || (*r)->check(json{{"p", 5}}).has_value() ||
                 !(*r)->check(json{{"p", 0}}).has_value())
                 ++bad;
         });
+    go.store(true, std::memory_order_release);
     for (auto& t : pool.ts)
         t.join();
     CHECK(bad == 0);
@@ -824,17 +836,14 @@ TEST_CASE("param-schema cache: hostile max-pattern schemas are served but never 
     for (const char* id : {"s1", "s2", "s3"})
         REQUIRE(cache.get(id, small).has_value());
 
-    std::size_t admitted = 0;
     for (std::size_t salt = 0; salt < 4; ++salt) {
         auto r = cache.get("hostile-" + std::to_string(salt), hostile_schema(salt));
         REQUIRE(r.has_value());
         CHECK_FALSE((*r)->check(json{{"p1", json::array({"a"})}}).has_value());
         CHECK(cache.bytes() <= kParamValidatorCacheMaxBytes);
-        ++admitted;
     }
     // Each hostile schema weighs 128 patterns' worth (above the per-entry cap), so none is
     // retained and the resident entries are untouched.
-    CHECK(admitted == 4);
     CHECK(cache.size() == 3);
     CHECK(cache.bytes() == 3 * weight_of(small));
 }
