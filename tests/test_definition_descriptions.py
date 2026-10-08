@@ -170,8 +170,9 @@ class Ratchet(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(prefix="yuzu_test_defdesc_")
         self.addCleanup(self.tmp.cleanup)
-        self.dir = Path(self.tmp.name) / "definitions"
-        self.dir.mkdir()
+        self.content = Path(self.tmp.name) / "content"
+        self.dir = self.content / "definitions"
+        self.dir.mkdir(parents=True)
         self.baseline = Path(self.tmp.name) / "baseline.json"
 
     def write_yaml(self, name, text):
@@ -179,7 +180,7 @@ class Ratchet(unittest.TestCase):
 
     def run_main(self, *extra):
         out = run_script(
-            [sys.executable, str(SCRIPT), "--definitions", str(self.dir),
+            [sys.executable, str(SCRIPT), "--content-root", str(self.content),
              "--baseline", str(self.baseline), *extra])
         return out.returncode, out.stdout + out.stderr
 
@@ -314,6 +315,59 @@ class Ratchet(unittest.TestCase):
         self.write_yaml("a.yaml", self.DEFECTIVE + "---\nkind: InstructionSet\nmetadata:\n  id: s\n")
         self.assertEqual(self.run_main("--update-baseline")[0], 0)
         self.assertEqual(self.run_main()[0], 0)
+
+    def test_baseline_that_is_not_an_object_is_a_usage_error(self):
+        self.write_yaml("a.yaml", self.DEFECTIVE)
+        for text in ("[]", '"x"', "null", "[" * 100000):
+            self.baseline.write_text(text, encoding="utf-8")
+            rc, out = self.run_main()
+            self.assertEqual(rc, 2, out)
+            self.assertNotIn("Traceback", out)
+
+    def test_yaml_nested_too_deeply_is_a_usage_error_not_a_traceback(self):
+        self.write_yaml("deep.yaml", "k: " + "[" * 5000 + "]" * 5000 + "\n")
+        rc, out = self.run_main()
+        self.assertEqual(rc, 2, out)
+        self.assertIn("deep.yaml", out)
+        self.assertNotIn("Traceback", out)
+
+    # The walk is the one server/core/scripts/embed_content.py ships: both roots, recursively.
+    def write_at(self, relative, text):
+        path = self.content / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+
+    def test_definition_in_a_nested_directory_is_linted(self):
+        self.baseline.write_text(json.dumps({"baseline": {r: [] for r in M.RULES}}), encoding="utf-8")
+        self.write_at("definitions/vendor/deep/x.yaml", self.DEFECTIVE)
+        rc, out = self.run_main()
+        self.assertEqual(rc, 1, out)
+        self.assertIn("NEW      definition-description: t.bad.one", out)
+
+    def test_definition_in_a_pack_is_linted_and_a_product_pack_document_is_not(self):
+        self.write_yaml("a.yaml", self.DEFECTIVE.replace("t.bad.one", "t.def.one"))
+        self.write_at("packs/sub/p.yaml",
+                      self.DEFECTIVE.replace("t.bad.one", "t.pack.one") +
+                      "---\nkind: ProductPack\nmetadata:\n  id: pk\n  description: short\n")
+        rc, out = self.run_main("--update-baseline")
+        self.assertEqual(rc, 0, out)
+        baseline = json.loads(self.baseline.read_text(encoding="utf-8"))["baseline"]
+        self.assertEqual(baseline["definition-description"], ["t.def.one", "t.pack.one"])
+        self.assertEqual(baseline["tags"], [])  # the ProductPack document is not a definition
+        self.assertEqual(self.run_main()[0], 0)
+
+    def test_no_definition_under_either_root_is_a_usage_error(self):
+        self.write_at("other/x.yaml", self.DEFECTIVE)  # outside definitions/ and packs/
+        self.assertEqual(self.run_main("--update-baseline")[0], 2)
+
+    def test_same_file_name_in_two_directories_gets_distinct_fallback_keys(self):
+        no_id = self.DEFECTIVE.replace("  id: t.bad.one\n", "")
+        self.write_at("definitions/a/x.yaml", no_id)
+        self.write_at("definitions/b/x.yaml", no_id)
+        self.assertEqual(self.run_main("--update-baseline")[0], 0)
+        baseline = json.loads(self.baseline.read_text(encoding="utf-8"))["baseline"]
+        self.assertEqual(baseline["definition-description"],
+                         ["definitions/a/x.yaml#0", "definitions/b/x.yaml#0"])
 
 
 class RepoGate(unittest.TestCase):

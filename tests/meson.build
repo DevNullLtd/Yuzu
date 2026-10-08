@@ -2833,9 +2833,10 @@ test('instructions risk table',
   timeout: 30,
 )
 
-# Description-quality ratchet over content/definitions/*.yaml (scripts/ci/check-definition-
-# descriptions.py): the self-test with seeded defects, plus the real script over the real tree
-# against scripts/ci/definition-descriptions-baseline.json. Hermetic; needs PyYAML.
+# Description-quality ratchet over the shipped definitions (content/definitions and content/packs;
+# scripts/ci/check-definition-descriptions.py): the self-test with seeded defects, plus the real
+# script over the real tree against scripts/ci/definition-descriptions-baseline.json. Hermetic;
+# needs PyYAML.
 test('definition descriptions',
   _python3_test,
   args: [files('test_definition_descriptions.py')],

@@ -2791,10 +2791,10 @@ static const ToolDef kTools[] = {
      "declared parameters; null with a token means none is published "
      "(parameter_schema_not_canonicalisable: execute refuses the definition; "
      "input_schema_budget_exceeded: this schema did not fit the request's schema budget, which "
-     "depends on catalogue order and sizes and is not cured by retrying; parameter_schema is "
-     "still present). A non-null input_schema can still be refused at execute, for any reason "
-     "its validator rejects that canonicalisation does not check (e.g. a regex that does not "
-     "compile). CHAIN: call execute_instruction with the entry's plugin and "
+     "depends on catalogue order (name, then id) and sizes, so retrying does not cure it; "
+     "parameter_schema is still present). A non-null input_schema can still be refused at "
+     "execute, for any reason its validator rejects that canonicalisation does not check (e.g. "
+     "a regex that does not compile). CHAIN: call execute_instruction with the entry's plugin and "
      "action, params shaped by input_schema but sent as strings (\"24\", \"true\": "
      "execute_instruction params are string-valued), and agent_ids or scope. The schema is "
      "enforced only by POST /api/instructions/{id}/execute; execute_instruction looks up no "
@@ -2814,7 +2814,7 @@ static const ToolDef kTools[] = {
      // input_schema is the same kind of document (the canonical form of
      // parameter_schema), typed the same way; input_schema_error is a fixed
      // token or null.
-     R"j({"type":"object","properties":{"version":{"type":"integer"},"description":{"type":"string"},"count":{"type":"integer"},"truncated":{"type":"boolean"},"instructions":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"name":{"type":"string"},"plugin":{"type":"string"},"action":{"type":"string"},"description":{"type":"string"},"parameter_schema":{"type":["object","null"],"description":"Stored definition schema verbatim (YAML-DSL types such as int32) when the stored value parses as JSON AND is itself an object, else null"},"input_schema":{"type":["object","null"],"description":"Canonical JSON Schema the server enforces on POST /api/instructions/{id}/execute; null when the definition declares no schema or none is published (see input_schema_error)"},"input_schema_error":{"type":["string","null"],"description":"Null unless no canonical schema is published for a stored schema: parameter_schema_not_canonicalisable (it cannot be canonicalised) or input_schema_budget_exceeded (the request reached its schema budget)"},"platforms":{"type":"string","description":"Comma-separated OS list, e.g. windows,linux,darwin"},"approval_mode":{"type":"string"}},"required":["id","name","plugin","action","description","parameter_schema","input_schema","input_schema_error","platforms","approval_mode"]}}},"required":["version","description","count","truncated","instructions"]})j"},
+     R"j({"type":"object","properties":{"version":{"type":"integer"},"description":{"type":"string"},"count":{"type":"integer"},"truncated":{"type":"boolean"},"instructions":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"name":{"type":"string"},"plugin":{"type":"string"},"action":{"type":"string"},"description":{"type":"string"},"parameter_schema":{"type":["object","null"],"description":"Stored definition schema verbatim (YAML-DSL types such as int32) when the stored value parses as JSON AND is itself an object, else null"},"input_schema":{"type":["object","null"],"description":"Canonical JSON Schema the server enforces on POST /api/instructions/{id}/execute; null when the definition declares no schema or none is published (see input_schema_error)"},"input_schema_error":{"type":["string","null"],"enum":[null,"parameter_schema_not_canonicalisable","input_schema_budget_exceeded"],"description":"Null unless no canonical schema is published for a stored schema: parameter_schema_not_canonicalisable (it cannot be canonicalised) or input_schema_budget_exceeded (the request reached its schema budget)"},"platforms":{"type":"string","description":"Comma-separated OS list, e.g. windows,linux,darwin"},"approval_mode":{"type":"string"}},"required":["id","name","plugin","action","description","parameter_schema","input_schema","input_schema_error","platforms","approval_mode"]}}},"required":["version","description","count","truncated","instructions"]})j"},
     {"discover_routes",
      "REST route catalog — subset of the same OpenAPI document GET /api/v1/openapi.json "
      "serves. Hand-maintained source, so it can under-report an undocumented route "

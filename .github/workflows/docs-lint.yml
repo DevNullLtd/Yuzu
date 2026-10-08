@@ -267,7 +267,8 @@ jobs:
           git fetch --no-tags --depth=1 origin "$BASE_SHA"
           python3 scripts/assemble-changelog.py --guard "$BASE_SHA"
 
-  # Definition-description lint: shipped content/definitions/*.yaml must carry
+  # Definition-description lint: shipped definitions (content/definitions and
+  # content/packs, as embed_content.py walks them) must carry
   # descriptions an agentic worker can act on (definition, parameters, result
   # columns), ratcheted against scripts/ci/definition-descriptions-baseline.json.
   # Needs PyYAML (the content definitions are YAML), installed hash-pinned from

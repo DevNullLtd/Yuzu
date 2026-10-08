@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""check-definition-descriptions.py - description-quality ratchet over content/definitions/*.yaml.
+"""check-definition-descriptions.py - description-quality ratchet over the shipped definitions.
 
 The description text of a shipped InstructionDefinition is what an agentic worker reads through
 `discover_instructions` / `get_definition` to decide whether and how to run it. Nothing used to
@@ -27,8 +27,14 @@ never runs in CI.
 Entry keys: `<definition id>` for definition-level rules, `<definition id>:<parameter>` and
 `<definition id>:<column>` for the per-item rules.
 
+Which files are linted is deliberately the set server/core/scripts/embed_content.py ships: every
+`*.yaml` found recursively under content/definitions AND content/packs, taking each document whose
+`kind` is `InstructionDefinition` and ignoring every other kind. If embed_content.py's walk
+changes, change `definition_files` below with it, or a shipped definition escapes the ratchet.
+
 Needs PyYAML (the same dependency server/core/scripts/embed_content.py has at build time).
-Exit 0 = clean, 1 = ratchet violation, 2 = usage or parse error.
+Exit 0 = clean, 1 = ratchet violation, 2 = usage or parse error (including a baseline file that
+is not a well-formed baseline and a YAML file that cannot be parsed or nests too deeply to parse).
 """
 from __future__ import annotations
 
@@ -44,7 +50,9 @@ except ImportError:  # pragma: no cover - exercised only on a host without PyYAM
     sys.exit(2)
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_DEFINITIONS = REPO_ROOT / "content" / "definitions"
+DEFAULT_CONTENT_ROOT = REPO_ROOT / "content"
+# The two roots under the content root that embed_content.py walks.
+DEFINITION_ROOTS = ("definitions", "packs")
 DEFAULT_BASELINE = Path(__file__).resolve().parent / "definition-descriptions-baseline.json"
 
 MIN_DEFINITION_DESCRIPTION = 40
@@ -117,27 +125,40 @@ def lint_definition(doc: dict, fallback_id: str) -> tuple[str, dict[str, set[str
     return def_id, failures
 
 
-def lint_tree(definitions_dir: Path) -> tuple[dict[str, set[str]], int]:
+def definition_files(content_root: Path) -> list[Path]:
+    """Every YAML file embed_content.py would walk, in its order (sorted, recursive)."""
+    return sorted(p for sub in DEFINITION_ROOTS for p in (content_root / sub).rglob("*.yaml"))
+
+
+def lint_tree(content_root: Path) -> tuple[dict[str, set[str]], int]:
     """(all failures by rule, number of definitions scanned). Raises ValueError on bad YAML."""
     failures: dict[str, set[str]] = {rule: set() for rule in RULES}
     scanned = 0
-    for path in sorted(definitions_dir.glob("*.yaml")):
+    for path in definition_files(content_root):
+        rel = path.relative_to(content_root).as_posix()
         try:
             docs = list(yaml.safe_load_all(path.read_text(encoding="utf-8")))
         except yaml.YAMLError as exc:
-            raise ValueError(f"{path.name}: not parseable as YAML ({type(exc).__name__})") from exc
+            raise ValueError(f"{rel}: not parseable as YAML ({type(exc).__name__})") from exc
+        except RecursionError as exc:
+            raise ValueError(f"{rel}: not parseable as YAML (nests too deeply)") from exc
         for index, doc in enumerate(docs):
             if not isinstance(doc, dict) or doc.get("kind") != "InstructionDefinition":
                 continue
             scanned += 1
-            _, found = lint_definition(doc, f"{path.name}#{index}")
+            _, found = lint_definition(doc, f"{rel}#{index}")
             for rule, keys in found.items():
                 failures[rule] |= keys
     return failures, scanned
 
 
 def load_baseline(path: Path) -> dict[str, set[str]]:
-    data = json.loads(path.read_text(encoding="utf-8"))
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except RecursionError as exc:
+        raise ValueError(f"{path.name}: not parseable as JSON (nests too deeply)") from exc
+    if not isinstance(data, dict):
+        raise ValueError(f"{path.name}: the top level must be a JSON object")
     raw = data.get("baseline")
     if not isinstance(raw, dict) or set(raw) != set(RULES):
         raise ValueError(f"{path.name}: 'baseline' must have exactly the rules {list(RULES)}")
@@ -177,7 +198,8 @@ def compare(failures: dict[str, set[str]], baseline: dict[str, set[str]]) -> lis
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--definitions", type=Path, default=DEFAULT_DEFINITIONS)
+    parser.add_argument("--content-root", type=Path, default=DEFAULT_CONTENT_ROOT,
+                        help="directory holding definitions/ and packs/ (both walked recursively)")
     parser.add_argument("--baseline", type=Path, default=DEFAULT_BASELINE)
     parser.add_argument("--update-baseline", action="store_true",
                         help="rewrite the baseline from the current tree (run deliberately, never "
@@ -185,13 +207,13 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     try:
-        failures, scanned = lint_tree(args.definitions)
+        failures, scanned = lint_tree(args.content_root)
     except (OSError, ValueError) as exc:
         sys.stderr.write(f"check-definition-descriptions: {exc}\n")
         return 2
     if scanned == 0:
         sys.stderr.write(f"check-definition-descriptions: no InstructionDefinition under "
-                         f"{args.definitions}\n")
+                         f"{args.content_root}\n")
         return 2
 
     if args.update_baseline:

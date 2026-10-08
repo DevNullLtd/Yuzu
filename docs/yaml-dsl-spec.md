@@ -170,7 +170,7 @@ The server's parameter-schema canonicaliser accepts these forms and publishes th
 - `maxLength`, `minLength`, `pattern`, `enum`, `minimum` and `maximum` may be written flat on the property; a flat key beats the same key under `validation`.
 - `hidden: true` is accepted as a no-op hint (no effect on validation; not published). `displayName` is dropped from the published schema.
 
-Shipped definitions under `content/definitions/` must meet the description-lint floors enforced by `scripts/ci/check-definition-descriptions.py`: `metadata.description` of at least 40 characters (and not just the name or id), every parameter description at least 10 characters, every result column described, and `metadata.tags` non-empty. To fix a baselined failure, edit the YAML and delete the fixed entry from `scripts/ci/definition-descriptions-baseline.json`, otherwise the STALE check fails.
+Shipped definitions under `content/definitions/` and `content/packs/` must meet the description-lint floors enforced by `scripts/ci/check-definition-descriptions.py`: `metadata.description` of at least 40 characters (and not just the name or id), every parameter description at least 10 characters, every result column described, and `metadata.tags` non-empty. To fix a baselined failure, edit the YAML and delete the fixed entry from `scripts/ci/definition-descriptions-baseline.json`, otherwise the STALE check fails.
 
 #### `spec.result`
 

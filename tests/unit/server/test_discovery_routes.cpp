@@ -682,6 +682,44 @@ TEST_CASE("discover.instructions: the canonicalisation budget degrades later def
         CHECK(d["input_schema_error"].is_null());
 }
 
+// A definition name is not unique, so the catalogue order (and therefore which definition is the
+// budget casualty) must not depend on the physical row order: ties on name break by id. The two
+// rows are rewritten in the order that puts the HIGHER id first in the heap, so a missing
+// tie-break would charge it first.
+TEST_CASE("discover.instructions: equal names are charged against the budget in id order",
+          "[discovery][instructions][input-schema][budget][pg]") {
+    DiscoverHarness h;
+    const std::string stored = R"({"type":"object","properties":{"p":{"type":"string"}}})";
+    std::vector<std::string> ids;
+    for (int i = 0; i < 2; ++i) {
+        auto id = h.instr->create_definition(make_def("Same Name", /*enabled=*/true, "{}"));
+        REQUIRE(id.has_value());
+        ids.push_back(*id);
+    }
+    const auto lower = *std::min_element(ids.begin(), ids.end());
+    const auto higher = *std::max_element(ids.begin(), ids.end());
+    REQUIRE(lower != higher);
+    // An UPDATE writes a new row version, so the last one rewritten sits last in the heap.
+    yuzu::server::test::force_parameter_schema(*h.rbac_pool, higher, stored);
+    yuzu::server::test::force_parameter_schema(*h.rbac_pool, lower, stored);
+
+    for (int round = 0; round < 20; ++round) {
+        INFO("round " << round);
+        // Room for exactly one of the two schemas.
+        const auto j = nlohmann::json::parse(
+            yuzu::server::build_instructions_catalog(*h.instr, stored.size()).json);
+        std::vector<std::string> order;
+        for (const auto& d : j["instructions"]) {
+            order.push_back(d["id"]);
+            if (d["id"] == lower)
+                CHECK(d["input_schema"].is_object());
+            else if (d["id"] == higher)
+                CHECK(d["input_schema_error"] == "input_schema_budget_exceeded");
+        }
+        CHECK(order == std::vector<std::string>{lower, higher});
+    }
+}
+
 // Rows that cost nothing: a legacy row over kMaxParameterSchemaBytes is rejected by the
 // canonicaliser on its raw length, so it is labelled parameter_schema_not_canonicalisable (not the
 // budget token) and neither is nor charges the budget; the definitions after it are unaffected.

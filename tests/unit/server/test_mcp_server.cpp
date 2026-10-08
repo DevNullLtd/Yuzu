@@ -6954,6 +6954,10 @@ TEST_CASE("MCP: discover_instructions advertises input_schema and chaining guida
     CHECK(item["properties"]["input_schema"]["type"] == nlohmann::json::array({"object", "null"}));
     CHECK(item["properties"]["input_schema_error"]["type"] ==
           nlohmann::json::array({"string", "null"}));
+    // The closed token set (null = no error) is part of the typed contract, not prose.
+    CHECK(item["properties"]["input_schema_error"]["enum"] ==
+          nlohmann::json::array({nullptr, "parameter_schema_not_canonicalisable",
+                                 "input_schema_budget_exceeded"}));
     const auto required = item["required"];
     CHECK(std::find(required.begin(), required.end(), "input_schema") != required.end());
     CHECK(std::find(required.begin(), required.end(), "input_schema_error") != required.end());
