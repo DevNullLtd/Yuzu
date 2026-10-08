@@ -753,11 +753,11 @@ GuardianBaselinePersister::persist_staged(GuardianSparkRuntime& rt, Trigger trig
         // more attempt would spend another busy timeout. A stall that ended before the mark
         // spent none of it, so it is not a reason to skip. (2) This pass could not start within
         // kBaselineStopLatestStart of the mark AND an earlier stage of this stop ran slow, at
-        // least a busy timeout (note_stop_store_trouble): its first write always runs and may
-        // cost a busy timeout, which would end past the grace. Neither elapsed time alone nor
-        // a FAST failure is evidence of a slow store (an apply_rules can hold the engine mutex
-        // that long on a healthy one, and a store that fails fast fails this pass fast too), so
-        // a late start with no slow stage runs.
+        // least kBaselineStopTroubleThreshold, 4.5 s (note_stop_store_trouble): its first write
+        // always runs and may cost a busy timeout, which would end past the grace. Neither
+        // elapsed time alone nor a FAST failure is evidence of a slow store (an apply_rules
+        // can hold the engine mutex that long on a healthy one, and a store that fails fast
+        // fails this pass fast too), so a late start with no slow stage runs.
         const Clock::rep stop_began = stop_began_rep_.load(std::memory_order_relaxed);
         std::optional<StopSkip> why;
         if (stalled_ && stalled_at_ >= stop_began)
@@ -1306,7 +1306,7 @@ void GuardianEngine::stop() {
     //  (1) a write that failed slowly ended at or after the begin_stop() mark taken at the top
     //      of this function (the stall already spent this stop's deadline), or
     //  (2) it would start at or after kBaselineStopLatestStart (15 s) past that mark AND an
-    //      earlier stage of this same stop() ran SLOW, at least a busy timeout (the two journal
+    //      earlier stage of this same stop() ran SLOW, at least 4.5 s (the two journal
     //      flushes, the worker join and the loss-ledger write feed note_stop_store_trouble()):
     //      its first write always runs, and on a BUSY store one write costs a whole 5 s busy
     //      timeout. A fast failure of a stage is not evidence (a BUSY store cannot fail fast).

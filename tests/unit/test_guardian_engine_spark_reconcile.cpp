@@ -8585,7 +8585,7 @@ TEST_CASE("#4045 E48b: metrics.md names the stop-time lines an operator is told 
     }
 }
 
-TEST_CASE("#4045 E53: store trouble is a stage that took a busy timeout, and only with it "
+TEST_CASE("#4045 E53: store trouble is a stage that took 4.5 s or more, and only with it "
           "does a late start skip the Stop pass",
           "[spark][guardian][baseline][reconcile]") {
     using Trig = GuardianBaselinePersister::Trigger;
@@ -8599,13 +8599,32 @@ TEST_CASE("#4045 E53: store trouble is a stage that took a busy timeout, and onl
     FakeClock4045 clock{*persister};
     HookGuard4045 hooks{*f.engine};
 
-    SECTION("stop_stage_end: a stage under a busy timeout is not trouble, one at it is") {
+    SECTION("the threshold is the busy timeout less a 500 ms timer slack") {
+        using namespace std::chrono_literals;
+        static_assert(yuzu::agent::kBaselineStopTroubleSlack == 500ms);
+        CHECK(yuzu::agent::kBaselineStopTroubleThreshold == 4'500ms);
+        CHECK(yuzu::agent::kBaselineStopTroubleThreshold ==
+              yuzu::agent::kKvStoreBusyTimeout - yuzu::agent::kBaselineStopTroubleSlack);
+    }
+    SECTION("stop_stage_end: a stage under the threshold is not trouble, one at it is") {
         auto began = persister->stop_stage_begin();
-        clock.advance(4'999);
+        clock.advance(4'499);
         persister->stop_stage_end(began);
         CHECK_FALSE(persister->stop_store_trouble_for_test());
         began = persister->stop_stage_begin();
+        clock.advance(4'500);
+        persister->stop_stage_end(began);
+        CHECK(persister->stop_store_trouble_for_test());
+    }
+    SECTION("a stage of a whole busy timeout (what a BUSY store costs) is trouble") {
+        const auto began = persister->stop_stage_begin();
         clock.advance(5'000);
+        persister->stop_stage_end(began);
+        CHECK(persister->stop_store_trouble_for_test());
+    }
+    SECTION("a BUSY stage that a coarse timer measured short is still trouble") {
+        const auto began = persister->stop_stage_begin();
+        clock.advance(4'985); // Sleep() granularity of about 15 ms, returned early
         persister->stop_stage_end(began);
         CHECK(persister->stop_store_trouble_for_test());
     }
@@ -8709,7 +8728,7 @@ TEST_CASE("#4045 E54: engine stop() on a HEALTHY store persists the captures alt
         fail_ledger = true;
         expect_skip = false; // RED if a failed stage counted as trouble whatever its duration
     }
-    SECTION("the loss-ledger write SUCCEEDS but takes a busy timeout: skipped") {
+    SECTION("the loss-ledger write SUCCEEDS but takes a busy timeout (5 s): skipped") {
         hold_ms = 10'000;
         slow_stage = "ledger";
         slow_ms = 5'000;
@@ -8722,25 +8741,32 @@ TEST_CASE("#4045 E54: engine stop() on a HEALTHY store persists the captures alt
         slow_ms = 5'000;
         expect_skip = true;
     }
-    SECTION("the second journal flush takes a busy timeout: skipped") {
+    SECTION("the second journal flush takes a busy timeout (5 s): skipped") {
         hold_ms = 10'000;
         slow_stage = "journal_flush_2";
         slow_ms = 5'000;
         expect_skip = true;
     }
-    SECTION("the second journal flush takes just under a busy timeout: not trouble, runs") {
-        hold_ms = 10'001;
+    SECTION("the second journal flush takes exactly the 4.5 s threshold: skipped") {
+        hold_ms = 10'500;
         slow_stage = "journal_flush_2";
-        slow_ms = 4'999;
+        slow_ms = 4'500;
+        expect_skip = true;
+    }
+    SECTION("the second journal flush takes just under the threshold: not trouble, runs") {
+        // 10'501 + 4'499 = 15 s: the pass is late, so only the missing evidence lets it run.
+        hold_ms = 10'501;
+        slow_stage = "journal_flush_2";
+        slow_ms = 4'499;
         expect_skip = false;
     }
-    SECTION("the first journal flush takes a busy timeout: skipped") {
+    SECTION("the first journal flush takes a busy timeout (5 s): skipped") {
         hold_ms = 10'000;
         slow_stage = "journal_flush_1";
         slow_ms = 5'000;
         expect_skip = true;
     }
-    SECTION("the worker join takes a busy timeout: skipped") {
+    SECTION("the worker join takes a busy timeout (5 s): skipped") {
         hold_ms = 10'000;
         slow_stage = "worker_join";
         slow_ms = 5'000;
