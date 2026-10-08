@@ -130,9 +130,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/* \
     && useradd -r -s /usr/sbin/nologin yuzu \
     # Shared cert group (PKI #1289): FIXED gid 2000, identical across the server/
-    # gateway/agent images, so `--cert-group yuzu-pki` lets the gateway/agent
-    # (different uids, sibling containers) read the shared CA + their leaf out of a
-    # shared /etc/yuzu/certs volume. The server user joins it to chgrp the certs.
+    # gateway/agent images, so `--cert-group yuzu-pki` lets the gateway (a
+    # different uid, sibling container) read the CA + its leaf out of a shared
+    # /etc/yuzu/certs volume. Do not mount that key-bearing volume into other
+    # containers. The server user joins the group to chgrp the certs.
     && groupadd -g 2000 yuzu-pki \
     && usermod -aG yuzu-pki yuzu \
     && mkdir -p /var/lib/yuzu /etc/yuzu/certs \
@@ -154,6 +155,6 @@ ENTRYPOINT ["yuzu-server"]
 # a per-install CA + leaves on first boot, serves the dashboard over HTTPS (8443)
 # and the agent/management/gateway-upstream listeners over (m)TLS. For a
 # multi-container deploy sharing /etc/yuzu/certs, add `--cert-group yuzu-pki` so
-# the gateway/agent (different uids) can read the shared certs. Override with
+# the gateway (a different uid) can read its certs. Override with
 # --no-tls/--no-https only for a throwaway dev/demo stack.
 CMD ["--listen", "0.0.0.0:50051", "--web-address", "0.0.0.0", "--web-port", "8080", "--config", "/var/lib/yuzu/yuzu-server.cfg", "--data-dir", "/var/lib/yuzu"]

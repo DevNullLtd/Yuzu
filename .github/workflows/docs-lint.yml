@@ -50,6 +50,13 @@ jobs:
       - name: Issue-lifecycle docs hygiene (CLAUDE.md cap, do-not-close.txt)
         run: python3 tests/test_issue_docs.py
 
+      # Gateway peer authorization incident advice: every 'restart the gateway'
+      # instruction must carry the #5183 caveat and a conditional marker (a
+      # gateway restart can wedge released agents). Docs-only PRs skip the
+      # meson docs suite, so this runs here on every PR as well.
+      - name: Gateway peer restart-advice lint
+        run: python3 -I tests/test_gateway_peer_restart_advice_lint.py
+
       # ADR-0032 sequencing-interlock merge-gate (WS-0). No engine-path code may
       # merge until the unconditional set (a)-(d)+(h) lands. Governance runs from
       # the author's working tree, so a stale branch can silently run the old

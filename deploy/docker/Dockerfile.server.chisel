@@ -131,8 +131,9 @@ RUN set -eux; \
     echo 'yuzu:x:1000:1000:Yuzu Server:/var/lib/yuzu:/usr/sbin/nologin' >> /rootfs/etc/passwd; \
     echo 'yuzu:x:1000:' >> /rootfs/etc/group; \
     # Shared cert group (PKI #1289): FIXED gid 2000 yuzu-pki (member: yuzu),
-    # matching the gateway/agent images, so `--cert-group yuzu-pki` lets a
-    # sibling container read the shared certs out of /etc/yuzu/certs.
+    # matching the gateway/agent images, so `--cert-group yuzu-pki` lets the
+    # gateway container read its certs out of /etc/yuzu/certs. Do not mount that
+    # key-bearing volume into other containers.
     echo 'yuzu-pki:x:2000:yuzu' >> /rootfs/etc/group; \
     printf 'passwd: files\ngroup: files\nhosts: files dns\n' > /rootfs/etc/nsswitch.conf; \
     install -d -m 0755 -o 1000 -g 1000 /rootfs/var/lib/yuzu; \

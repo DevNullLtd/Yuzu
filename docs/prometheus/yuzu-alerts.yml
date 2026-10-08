@@ -449,6 +449,112 @@ groups:
             ADR-2002 §7b and docs/user-manual/gateway.md's Prometheus
             Metrics section.
 
+      # -- Gateway-side signals for the gateway-upstream peer authorization ----
+      # These two are scraped from the GATEWAY (job yuzu-gateway), not the server.
+      # They cover what the server-side counter cannot see: a handshake refused
+      # before the guard runs never reaches the service, so
+      # yuzu_server_gateway_peer_denied_total does not count it. Neither gateway
+      # counter is pre-seeded to 0 (yuzu_gw_telemetry.erl declares them without
+      # initial series), so the first occurrence of a label set is a series that
+      # appears at its first value, and increase() cannot see that one step; the
+      # gateway retries a failing call, so a persistent cause produces further
+      # increments and fires, but a single isolated event can be missed.
+      - alert: YuzuGatewayUpstreamAuthRefused
+        # code="16" is the raw grpc-status trailer (a binary digit string, see
+        # yuzu_gw_upstream.erl do_rpc/4 and yuzu_gw_heartbeat_buffer.erl) for
+        # UNAUTHENTICATED. The gateway-upstream service returns UNAUTHENTICATED
+        # from the peer-authorization guard (gateway_peer_guard.cpp), and that is
+        # the only place in the gateway-upstream code that returns it.
+        expr: |
+          sum by (instance, rpc_name) (increase(yuzu_gw_upstream_rpc_errors_total{code="16"}[5m])) > 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "The server refused this gateway's upstream call as unauthenticated ({{ $labels.rpc_name }} on {{ $labels.instance }})"
+          description: >-
+            {{ $labels.instance }} received gRPC status 16 (UNAUTHENTICATED) on
+            {{ $labels.rpc_name }} for at least 2 minutes. On the gateway-upstream
+            service that is the server's peer-authorization guard refusing this
+            gateway's certificate. Look at the server side for the reason:
+            yuzu_server_gateway_peer_denied_total by reason, or the server log
+            line "gateway peer denied" with the spki= prefix of the key the
+            gateway presented, then follow the YuzuGatewayPeerDenied remedies
+            (a pin that does not match the gateway's current certificate key,
+            a certificate that expired while the connection was open, a
+            certificate without serverAuth). Status 16 is an RPC result, not a
+            transport failure, so the gateway does not redial by itself. If the
+            cause was on the server side (a pin or acknowledgement), fix it, restart
+            the serving replicas, and do not restart the gateways first unless the
+            checks below fail, because on agents without the #5183 fix (in no
+            release yet) a gateway restart leaves released agents wedged; see "What
+            happens when the server restarts" in docs/user-manual/gateway.md. Only
+            on a gateway that has the #1197 consumer (#5383) does the gateway then
+            recover through its replay path. Check three separate things: the
+            registration counts with sum(yuzu_gw_agents_current) -
+            sum(yuzu_agents_connected{job="yuzu-server"}) (summed across all gateway
+            nodes and all replicas; the server gauge also counts direct agents and
+            counts registration, not placement), no rise in the raw
+            yuzu_gw_upstream_rpc_errors_total{rpc_name="notify_stream",code="16"} or
+            yuzu_gw_upstream_notify_dropped_total, and a read-only command to a
+            sample agent that returns a result (the exact request is in the
+            runbook). Agreeing counts alone do not prove placement. If the cause is
+            on the gateway side (a certificate that expired or was renewed, a
+            rotated key), the gateway presents its current files only when it
+            redials, and a server restart forces a redial, so first check whether it
+            already has: read yuzu_server_gateway_peer_denied_total and
+            yuzu_gw_upstream_rpc_errors_total{code="16"} twice, a minute apart, and
+            see that they have stopped rising, and compute the SPKI prefix of the
+            certificate file the gateway is configured with. A redial can still
+            present the old certificate for about 2 minutes after the files change
+            (Erlang ssl PEM cache; measured on OTP 28.4.2 with a stub, not on a Yuzu
+            gateway). Restart that gateway node, one at a time, only if denials
+            continue and its agents can take the disconnect, because unless the
+            agents run a build with the #5183 fix (in no release yet) a gateway
+            restart leaves released agents wedged. For placement loss after a
+            refusal window, restart the agent service on the unreachable agents (the
+            observed fix), and restart the gateway node only if many agents behind
+            one node are affected and the checks still fail. This alert stays
+            active for about 6 minutes after the last refusal: check that the
+            counter is flat rather than waiting for it to clear. See
+            docs/user-manual/server-admin.md "Gateway upstream peer authorization".
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/server-admin.md#gateway-upstream-peer-authorization"
+
+      - alert: YuzuGatewayUpstreamTlsHandshakeFailures
+        # A TLS handshake refused or failed before any RPC: the layer BELOW the
+        # peer pin. Examples are a gateway that cannot verify the server
+        # certificate, a certificate or CA file that is unreadable or rejected by
+        # the TLS options, and a TLS alert from the server. The server's own
+        # gateway-peer counter does not see these (the call never reaches the
+        # service). The `kind` label is the
+        # TLS alert name (for example unknown_ca, certificate_expired) or
+        # bad_tls_options (yuzu_gw_upstream.erl classify_tls_error/1). It is a
+        # warning although the same cause can be a total outage of that gateway
+        # (no call to the server completes).
+        expr: |
+          sum by (instance, kind) (increase(yuzu_gw_upstream_tls_handshake_failures_total[5m])) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Gateway upstream TLS handshake failures on {{ $labels.instance }} (kind={{ $labels.kind }})"
+          description: >-
+            {{ $labels.instance }} has failed TLS handshakes to the server's
+            gateway-upstream listener (kind={{ $labels.kind }}) for at least 5
+            minutes. The handshake fails below the peer-authorization guard, so
+            the server's yuzu_server_gateway_peer_denied_total does not move and
+            the server writes no audit row for it: the gateway-side counter is the
+            signal. Check that the gateway's certificate and key files are
+            readable and not expired, that the gateway trusts the server's CA, and
+            that its client certificate is one the server's TLS configuration
+            accepts. See
+            the gateway log line "TLS handshake failure" for the underlying
+            term, and "Gateway Disconnections" in
+            docs/operations/troubleshooting.md. This alert stays active for about
+            6 minutes after the last failure: check that the counter is flat
+            rather than waiting for it to clear.
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/server-admin.md#gateway-upstream-peer-authorization"
+
   - name: yuzu-security
     rules:
       - alert: YuzuOnBehalfAssertionRejected
@@ -484,6 +590,184 @@ groups:
             up while being unusable) or a deliberate flood. Strip the header at
             the proxy. Diagnose via the throttled [ADR-1005] warn lines.
           runbook_url: "https://docs.yuzu.io/runbooks/onbehalf-rejected"
+
+      # -- Gateway-upstream peer authorization --------------------------------
+      # yuzu_server_gateway_peer_denied_total{rpc,reason,event="security"} counts the
+      # calls the gateway-upstream service refused (every closed rpc x reason pair is
+      # pre-seeded to 0 at boot, so increase() sees the first denial). The reasons
+      # split by what they mean:
+      #   * Reasons that are not anonymous refusals (bad_cert,
+      #     no_server_auth_eku, not_pinned, outside_validity, internal_error):
+      #     YuzuGatewayPeerDenied, a warning. The rule lists them positively, so a
+      #     reason added to the closed set later is NOT alerted until it is added
+      #     here (the promtool cases pin the five).
+      #   * Reasons with no usable client certificate (null_context,
+      #     not_authenticated, no_cert): deliberately NOT alerted. They are what a
+      #     port scan, a health probe or a misdirected client produces on a
+      #     listener that does not require a client certificate, so a rule over them
+      #     would page on background noise. The counter still counts every one, and
+      #     they write a log line but no audit row.
+      # Posture: YuzuGatewayPeerAuthzDisabledWithTls.
+      - alert: YuzuGatewayPeerDenied
+        # A certificate reached the gateway-upstream guard and was refused. On a
+        # deployment whose gateway should be connected this means the gateway
+        # presents a key or certificate the server does not accept: a certificate
+        # replaced with a new KEY without updating the pin, a certificate that
+        # expired while the connection was open, a certificate without serverAuth. The gateway receives gRPC status 16
+        # (UNAUTHENTICATED), a non-transport error: it logs `BatchHeartbeat failed
+        # (N in chunk)` (yuzu_gw_heartbeat_buffer.erl) or `Failed to notify stream
+        # status for <agent>` (yuzu_gw_upstream.erl) and counts the failure in
+        # yuzu_gw_upstream_rpc_errors_total{rpc_name,code="16"}. A refused
+        # NotifyStreamStatus is not retried by the gateway.
+        expr: |
+          sum by (instance, reason) (increase(yuzu_server_gateway_peer_denied_total{reason=~"bad_cert|no_server_auth_eku|not_pinned|outside_validity|internal_error"}[5m])) > 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Gateway-upstream refused a presented certificate on {{ $labels.instance }} (reason={{ $labels.reason }})"
+          description: >-
+            The gateway-upstream service refused a presented certificate with
+            reason={{ $labels.reason }} for at least 1 minute. Remedy by reason.
+            not_pinned: the presented key is not pinned; confirm the key is the
+            gateway you deployed, then add its pin to --gateway-peer-pin or
+            --gateway-peer-pin-file (explicit pins replace the automatic
+            default-certificate pin) and restart the server: pins are read once
+            at boot. no_server_auth_eku: the wrong certificate is presented (the
+            gateway certificate needs serverAuth AND clientAuth). outside_validity:
+            the certificate is expired or not yet valid; renew it before notAfter
+            (a gateway keeps presenting the certificate it loaded when it last
+            dialled, so a renewed certificate reaches the server only after the
+            gateway redials). bad_cert: the certificate could not be parsed.
+            internal_error: a server-side fault while deciding; check the server
+            log. After a server-side cause is fixed and every serving replica
+            restarted, do not restart the gateways first unless the checks below
+            fail, because on agents without the #5183 fix (in no release yet) a
+            gateway restart leaves released agents wedged; see "What happens when
+            the server restarts" in docs/user-manual/gateway.md. Only on a gateway
+            that has the #1197 consumer (#5383) does the gateway then recover
+            through its replay path. Check three separate things:
+            sum(yuzu_gw_agents_current) - sum(yuzu_agents_connected{job="yuzu-server"}) (all gateway nodes, all replicas; the server gauge also counts
+            direct agents and counts registration, not placement), no rise in the
+            raw
+            yuzu_gw_upstream_rpc_errors_total{rpc_name="notify_stream",code="16"} or
+            yuzu_gw_upstream_notify_dropped_total, and a read-only command to a
+            sample agent that returns a result. If the cause is on the gateway side
+            (outside_validity, or a new certificate key), the gateway presents its
+            current files only when it redials, and a server restart forces a
+            redial: first check whether it already has (the raw counters
+            yuzu_server_gateway_peer_denied_total and
+            yuzu_gw_upstream_rpc_errors_total{code="16"} have stopped rising across
+            two reads a minute apart, and the configured certificate file has the
+            expected SPKI prefix), allowing about 2 minutes after the files change
+            for the Erlang ssl PEM cache (measured on OTP 28.4.2 with a stub, not on
+            a Yuzu gateway). Restart that gateway node, one at a time, only if
+            denials continue and its agents can take the disconnect (the same #5183
+            caveat). The gateway does not retry a refused NotifyStreamStatus.
+            This alert stays active for about 6 minutes after the last denial (the 5-minute increase window plus an evaluation
+            step): check that yuzu_server_gateway_peer_denied_total is flat
+            rather than waiting for the alert to clear. A refusal whose
+            certificate key could be computed also writes a
+            session.gateway_peer_denied audit row (a bounded sample; this counter
+            is the complete count). See docs/user-manual/server-admin.md
+            "Gateway upstream peer authorization".
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/server-admin.md#gateway-upstream-peer-authorization"
+
+      - alert: YuzuGatewayPeerDeniedBatchHeartbeat
+        # BatchHeartbeat is the one RPC a gateway sends continuously WHILE AT LEAST
+        # ONE AGENT HEARTBEATS THROUGH IT (the heartbeat buffer flushes on a short
+        # interval and retries a failed chunk; an empty-buffer flush is a no-op, so a
+        # gateway with no agents never emits it), so a certificate-reason denial on
+        # it means the gateway ITSELF is refused, not an occasional stray client:
+        # every call from that gateway fails the same guard, so its registrations
+        # and stream-status notices fail (established agent streams to the gateway
+        # stay up). It is a stricter companion of YuzuGatewayPeerDenied (which fires
+        # at warning on the same series); both are expected to be active together.
+        # The reason list is the same five as YuzuGatewayPeerDenied, and the three
+        # anonymous reasons are deliberately absent for the same reason. `for: 5m`
+        # means a single stray denial (active for about one increase window) does
+        # not page; sustained denials do. Like YuzuGatewayPeerDenied it stays
+        # active for about 6 minutes after the last denial. An operator-side
+        # Alertmanager inhibit rule (source this alert, target
+        # YuzuGatewayPeerDenied, equal: [instance, reason]) pages only on this
+        # one; the gateway-side alerts carry the gateway's instance and cannot
+        # be inhibited that way.
+        expr: |
+          sum by (instance, reason) (increase(yuzu_server_gateway_peer_denied_total{rpc="batch_heartbeat",reason=~"bad_cert|no_server_auth_eku|not_pinned|outside_validity|internal_error"}[5m])) > 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "The gateway itself is refused by the gateway-upstream guard on {{ $labels.instance }} (reason={{ $labels.reason }})"
+          description: >-
+            BatchHeartbeat calls were refused with reason={{ $labels.reason }}
+            for at least 5 minutes on {{ $labels.instance }}. A gateway sends
+            this RPC while at least one agent heartbeats through it, so the
+            gateway itself is being refused: its registrations, inventory and
+            stream-status notifications fail the same check, while established
+            agent streams to the gateway stay up. Find the cause with the
+            YuzuGatewayPeerDenied remedies by reason (not_pinned: the gateway
+            presents a key the server does not pin, for example after a
+            certificate was replaced with a new key; outside_validity: the
+            certificate expired or is not yet valid; no_server_auth_eku: the
+            gateway certificate lacks serverAuth; bad_cert: it could not be
+            parsed; internal_error: check the server log), fix the pin or the
+            certificate, and restart the server replicas if the pin or
+            acknowledgement changed, because pins are read once at boot (a renewal
+            over the same key needs no server restart). For a server-side cause do
+            not restart the gateways first unless the checks fail, because on agents
+            without the #5183 fix (in no release yet) a gateway restart leaves
+            released agents wedged; see "What happens when the server restarts" in
+            docs/user-manual/gateway.md. Compare sum(yuzu_gw_agents_current) -
+            sum(yuzu_agents_connected{job="yuzu-server"}) (all gateway nodes, all
+            replicas; the server gauge also counts direct agents and counts
+            registration, not placement), check for no rise in the raw
+            yuzu_gw_upstream_rpc_errors_total{rpc_name="notify_stream",code="16"} or
+            yuzu_gw_upstream_notify_dropped_total, and send a read-only command to a
+            sample agent and check that it returns a result. For a gateway-side
+            cause (outside_validity, a new certificate key) the gateway presents its
+            current files only when it redials, and a server restart forces a
+            redial: first check whether it already has (the raw counters
+            yuzu_server_gateway_peer_denied_total and
+            yuzu_gw_upstream_rpc_errors_total{code="16"} have stopped rising across
+            two reads a minute apart, and the configured certificate file has the
+            expected SPKI prefix), allowing about 2 minutes after the files change
+            for the Erlang ssl PEM cache (measured on OTP 28.4.2 with a stub, not on
+            a Yuzu gateway). Restart that gateway node, one at a time, only if
+            denials continue and its agents can take the disconnect, because unless
+            the agents run a build with the #5183 fix (in no release yet) a gateway
+            restart leaves released agents wedged.
+            This alert stays
+            active for about 6 minutes after the last denial: check that
+            yuzu_server_gateway_peer_denied_total{rpc="batch_heartbeat"} is flat
+            rather than waiting for it to clear. See
+            docs/user-manual/server-admin.md "Gateway upstream peer authorization".
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/server-admin.md#gateway-upstream-peer-authorization"
+
+      - alert: YuzuGatewayPeerAuthzDisabledWithTls
+        # mode="insecure_ack_tls": --insecure-gateway-peer is in force on a server
+        # that has TLS on AND a client CA, i.e. a production-shaped configuration in
+        # which the operator switched off a control that would have worked. A
+        # plaintext development rig is mode="insecure_ack" and deliberately not
+        # alerted (it runs that mode by design), and neither is mode="enforce".
+        expr: |
+          yuzu_server_gateway_peer_authz_mode{mode="insecure_ack_tls"} == 1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Gateway peer authorization acknowledged-disabled on a TLS server ({{ $labels.instance }})"
+          description: >-
+            --insecure-gateway-peer is set on {{ $labels.instance }}, which has TLS on
+            and a client CA, so a gateway key pin could be enforced. Peer
+            authorization on the gateway-upstream service is disabled on every
+            listener that serves it. Treat this as a time-boxed risk acceptance:
+            record the owner and date, pin the gateway key (--gateway-peer-pin /
+            --gateway-peer-pin-file), remove the flag and restart the server. The
+            boot audit row server.gateway_peer_authz_disabled records when it was
+            started. See docs/user-manual/server-admin.md "Gateway upstream peer
+            authorization".
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/server-admin.md#gateway-upstream-peer-authorization"
 
       - alert: YuzuRbacReadDegraded
         # An authorization read against the PostgreSQL rbac_store (ADR-0041)
