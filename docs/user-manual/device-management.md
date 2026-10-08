@@ -407,7 +407,7 @@ agent.
 > off the data plane — the server never sees the agent's leaf on the
 > gateway→server hop. To decommission a gateway-proxied agent promptly, also
 > disconnect it at the gateway/management layer. Through-gateway cryptographic
-> revocation is planned with the gateway-hop identity work (#5578). See
+> revocation is tracked in #5578 (no committed release). See
 > `docs/auth-architecture.md` "Gateway-proxied agents: revocation scope".
 
 ### Windows Certificate Store Integration

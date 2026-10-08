@@ -42,16 +42,22 @@ QUIC coming, those deferrals point at nothing.
 
 | Capability QUIC was to provide | gRPC-native owner |
 |---|---|
-| Agent's real origin IP at the gateway (`gateway_observed_peer`; #1064, #1172; ADR-0013 residual) #1172. grpcbox already holds the agent's socket (chatterbox `sock:peername/1`) but does not pass the peer to service handlers; the fix is a small vendored accessor alongside the existing grpcbox patches, keeping the `x-forwarded-for` path for proxied deployments. #1172's written scope is XFF-only and must be widened to cover the accessor. The proto field is already transport-agnostic; no wire change. |
-| Cryptographic agent identity and mutual auth across the agent↔gateway hop (PKI R-5/R-6, #1292; gateway half of #1677; the "issued-but-dormant" agent leaf) **#5578** (a separate design ADR), which becomes #1292's dependency in place of #376: TLS-level *optional* client-certificate verification on the gateway's agent listener (`verify_peer` + `fail_if_no_peer_cert=false`, already configurable in the patched grpcbox), plus gateway-forwarded, gateway-attested identity and revocation enforced at the gateway edge. It must not install a grpcbox `auth_fun` on `:50051`, because that rejects every certless peer and breaks agent bootstrap (see the PKI routed concern). It must also handle a *presented-but-invalid* certificate aborting the handshake under `verify_peer` (a stale-leaf agent must not be locked out of re-enrolment), and handlers having no access to the peer certificate today. |
-| TLS 1.3, session resumption, mandatory TLS on every hop (#1293, #660) #4722's five-PR sequence (minimum stays TLS 1.2; #1293 adds 1.3 on the gateway hops). These were previously framed as stepping stones to QUIC; they are now the end state. |
+| Agent's real origin IP at the gateway (`gateway_observed_peer`; #1064, #1172; ADR-0013 residual) | #1172. grpcbox already holds the agent's socket (chatterbox `sock:peername/1`) but does not pass the peer to service handlers; the fix is a small vendored accessor alongside the existing grpcbox patches, keeping the `x-forwarded-for` path for proxied deployments. #1172's written scope is XFF-only and must be widened to cover the accessor. The proto field is already transport-agnostic; no wire change. |
+| Cryptographic agent identity and mutual auth across the agent↔gateway hop (PKI R-5/R-6, #1292; gateway half of #1677; the "issued-but-dormant" agent leaf) | **#5578** (a separate design ADR), which becomes #1292's dependency in place of #376: TLS-level *optional* client-certificate verification on the gateway's agent listener, plus gateway-attested identity and revocation enforced at the gateway edge. Constraints below. |
+| TLS 1.3, session resumption, mandatory TLS on every hop (#1293, #660) | #4722's five-PR sequence (minimum stays TLS 1.2; #1293 adds 1.3 on the gateway hops). These were previously framed as stepping stones to QUIC; they are now the end state. |
 | Retirement of the Windows grpc/abseil static-link workaround (#375, #518) | None. The `triplets/x64-windows.cmake` + `meson.build` hand-wiring is permanent and load-bearing. #518 is re-triaged on its own merits. |
+
+Constraints on the #5578 design:
+
+- It must not install a grpcbox `auth_fun` on `:50051`. An `auth_fun` rejects every certless peer and breaks agent bootstrap fleet-wide (see the PKI routed concern). `verify_peer` + `fail_if_no_peer_cert=false` is already configurable in the patched grpcbox (`grpcbox_pool.erl`).
+- Under `verify_peer`, a certificate that is *presented but invalid* (expired, wrong CA, revoked) aborts the handshake whatever `fail_if_no_peer_cert` says. A stale-leaf agent must not be locked out of re-enrolment.
+- Service handlers cannot read the peer certificate today (only `auth_fun` sees it), so a vendored accessor is needed.
 
 ## Consequences
 
 - The transport-related residuals in the PKI, auth and attack-chain docs stay open, but they are owned and sequenced rather than waiting on a dependency that will never ship.
 - The Windows build keeps its two-half static-link configuration indefinitely. `.claude/agents/build-ci.md`'s #375 history remains required reading.
-- The Alpine/musl agent ambition loses the path the QUIC ADR gave it. That ADR's assessment was that grpc/abseil have no usable musl story in vcpkg (see `docs/per-target-agent-build-pipeline-scope.md` at the `archive/quic-transport` tag; it never reached `dev`). Any future musl agent needs its own decision.
+- The Alpine/musl agent ambition loses the path the QUIC ADR gave it. That ADR's assessment was that grpc/abseil have the worst musl story in vcpkg (see `docs/per-target-agent-build-pipeline-scope.md` at the `archive/quic-transport` tag; it never reached `dev`). Any future musl agent needs its own decision.
 - ECDSA P-256/P-384 for the internal CA (`x509_ca.hpp`) stays. It was chosen with QUIC in mind, but it is equally the right choice for gRPC over TLS 1.2 and 1.3.
 - The account-lockout follow-up UP-2, also parked on "QUIC-era auth work", is re-homed to #5579.
 - A proposal to rewrite the gateway transport (for example Cowboy + gun) is a separate decision. This ADR does not adopt one. The default path is the grpcbox fix backlog (#1172, #1293, #635, #3913, #5175) and grpcbox upgrades.

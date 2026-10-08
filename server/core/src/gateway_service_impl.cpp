@@ -401,10 +401,12 @@ grpc::Status GatewayUpstreamServiceImpl::ProxyRegister(grpc::ServerContext* cont
     // succeeds. The set still assumes the caller on the gateway-upstream
     // listener (:50055) is an authorized gateway. With TLS on, that listener
     // requires a client certificate and GatewayPeerGuardedService enforces an
-    // SPKI-pinned gateway peer (boot refuses an unpinned config); only the
-    // acknowledged --no-tls --insecure-gateway-peer dev mode runs it
-    // plaintext, where an attacker who reaches the port AND knows a valid
-    // enrollment token could still add themselves. Per-gateway agent_id
+    // SPKI-pinned gateway peer (boot refuses an unpinned config). Only the
+    // acknowledged --insecure-gateway-peer dev mode disables pinning:
+    // plaintext under --no-tls; with TLS, any CA-signed peer is admitted
+    // (any peer at all if --insecure-skip-client-verify). In those modes an
+    // attacker who reaches the port AND knows a valid enrollment token could
+    // still add themselves. Per-gateway agent_id
     // scoping/attestation is #1292 (design: #5578, ADR-0066).
 
     // Fast path: agent already enrolled from a prior connection
