@@ -14,9 +14,11 @@
  *
  * Honesty rules:
  *   - std::optional carries ONE meaning: "no statistic can be stated for these
- *     inputs" -- the input is invalid, or the result is not representable as a
- *     finite double. It is never zero. (The single documented infinity is a
- *     rate ratio whose denominator arm saw no events.)
+ *     inputs" -- the input is invalid, the result is not representable as a
+ *     finite double, or (rate ratios only) an arm lies outside the accuracy
+ *     domain; dex_rate has no such ceiling (Wilson-Hilferty to INT64_MAX). It is
+ *     never zero. (The single documented infinity is a rate ratio whose
+ *     denominator arm saw no events.)
  *   - A reliability flag is a label, never suppression: a statistic on fewer
  *     than kDexStatsReliableMinEvents (20) numerator events -- the NCHS
  *     small-count convention -- is still printed, marked indicative.
@@ -31,9 +33,10 @@
  *     relative of the exact ones at the switch (measured 1.6e-11, pinned by test).
  *   - Rate ratios: the exact conditional (Clopper-Pearson) bounds, from the
  *     regularised incomplete beta, for every arm up to kDexRateRatioMaxEvents,
- *     evaluated in double to within 5e-6 relative of the exact rational bounds
- *     (measured worst 2.4e-6 at 1e9 events against 1; about 1e-9 at 1e6 against 1).
- *     Above that limit no ratio is produced.
+ *     evaluated in double to within 2e-5 relative of the exact rational bounds.
+ *     That envelope is libm-dependent: on one libm the worst measured was 1.1e-5,
+ *     at an arm of 1 against about 9.8e8; it is under 4e-6 for arms of 2 or more
+ *     and about 1e-9 at 1e6 against 1. Above that limit no ratio is produced.
  *   - A kernel that cannot converge inside kDexStatsMaxIterations returns NaN,
  *     quantiles propagate it, and every public function that computes a bound
  *     ends with a finiteness check: a statistic is never returned after a
@@ -85,8 +88,8 @@ inline constexpr std::int64_t kDexRateRatioMaxEvents = 1'000'000'000;
 
 /// Iteration cap of the series / continued fractions: 2.2x the worst case
 /// measured over both exact domains (gamma 7,413 at one million events; beta
-/// 22,639 at arms of 1e9 and 3e4). Hitting it is a convergence failure (NaN),
-/// never a result.
+/// about 23,200 near 29,500 against 1e9). Hitting it is a convergence failure
+/// (NaN), never a result.
 inline constexpr int kDexStatsMaxIterations = 50000;
 
 namespace dex_stats_detail {
@@ -95,6 +98,8 @@ namespace dex_stats_detail {
 inline constexpr double kTiny = 1e-300;
 /// Relative convergence tolerance of the series and continued fractions.
 inline constexpr double kEps = 1e-15;
+/// Two-sided alpha of every interval here.
+inline constexpr double kAlpha = 1.0 - kDexStatsConfidence;
 /// Cap on the halvings of a bisection (it normally stops sooner, when `mid`
 /// reaches an end point).
 inline constexpr int kBisections = 200;
@@ -141,11 +146,12 @@ inline double regularized_gamma_p(double a, double x, int max_iter = kDexStatsMa
             term *= x / ap;
             sum += term;
             if (std::fabs(term) < std::fabs(sum) * kEps)
-                return std::min(1.0, sum * prefactor);
+                return (std::min)(1.0, sum * prefactor);
         }
         return kNaN;
     }
-    // Continued fraction for Q(a, x), modified Lentz.
+    // Continued fraction for Q(a, x): modified Lentz (Lentz 1976), the gcf form
+    // of Numerical Recipes.
     double b = x + 1.0 - a;
     double c = 1.0 / kTiny;
     double d = 1.0 / b;
@@ -161,12 +167,14 @@ inline double regularized_gamma_p(double a, double x, int max_iter = kDexStatsMa
         const double del = d * c;
         h *= del;
         if (std::fabs(del - 1.0) < kEps)
-            return std::max(0.0, 1.0 - prefactor * h);
+            return (std::max)(0.0, 1.0 - prefactor * h);
     }
     return kNaN;
 }
 
-/// Continued fraction of the incomplete beta (modified Lentz); NaN on cap.
+/// Continued fraction of the incomplete beta: modified Lentz (Lentz 1976) in the
+/// Numerical Recipes betacf form, whence qab / qap / qam (a + b, a + 1, a - 1),
+/// aa (the even / odd coefficient) and bt. NaN on cap.
 inline double beta_fraction(double x, double a, double b, int max_iter) {
     const double qab = a + b;
     const double qap = a + 1.0;
@@ -212,22 +220,24 @@ inline double regularized_beta(double x, double a, double b,
     if (x > (a + 1.0) / (a + b + 2.0)) {
         const double f = beta_fraction(1.0 - x, b, a, max_iter);
         // std::max / std::min would swallow a NaN, so test it first.
-        return std::isnan(f) ? f : std::max(0.0, 1.0 - bt * f / b);
+        return std::isnan(f) ? f : (std::max)(0.0, 1.0 - bt * f / b);
     }
     const double f = beta_fraction(x, a, b, max_iter);
-    return std::isnan(f) ? f : std::min(1.0, bt * f / a);
+    return std::isnan(f) ? f : (std::min)(1.0, bt * f / a);
 }
 
-/// x with P(a, x) = p, by bisection (monotone, fixed iteration count: bounded
-/// and deterministic cost). NaN if any evaluation fails to converge.
+/// x with P(a, x) = p, by bisection (monotone, iteration cap kBisections: bounded
+/// cost). NaN if any evaluation fails to converge.
 inline double gamma_quantile(double a, double p, int max_iter = kDexStatsMaxIterations) {
     if (p <= 0.0)
         return 0.0;
     double lo = 0.0;
-    double hi = std::max(a, 1.0);
+    double hi = (std::max)(a, 1.0);
     for (int i = 0;; ++i) {
+        if (i > kDoublings)
+            return kNaN;
         const double v = regularized_gamma_p(a, hi, max_iter);
-        if (std::isnan(v) || i > kDoublings)
+        if (std::isnan(v))
             return kNaN;
         if (v >= p)
             break;
@@ -274,9 +284,8 @@ struct Bounds {
 /// Exact (Garwood) Poisson bounds on the mean for k observed events. They equal
 /// chi2(alpha/2; 2k) / 2 and chi2(1 - alpha/2; 2k + 2) / 2.
 inline Bounds poisson_bounds_exact(double k) {
-    constexpr double alpha = 1.0 - kDexStatsConfidence;
-    return {k == 0.0 ? 0.0 : gamma_quantile(k, alpha / 2.0),
-            gamma_quantile(k + 1.0, 1.0 - alpha / 2.0)};
+    return {k == 0.0 ? 0.0 : gamma_quantile(k, kAlpha / 2.0),
+            gamma_quantile(k + 1.0, 1.0 - kAlpha / 2.0)};
 }
 
 /// Wilson-Hilferty approximation of the same bounds: chi2_p(nu) ~
@@ -298,7 +307,7 @@ inline Bounds wilson_bounds(double p, double n) {
     const double denom = 1.0 + z2 / n;
     const double centre = (p + z2 / (2.0 * n)) / denom;
     const double half = kDexStatsZ / denom * std::sqrt(p * (1.0 - p) / n + z2 / (4.0 * n * n));
-    return {std::max(0.0, centre - half), std::min(1.0, centre + half)};
+    return {(std::max)(0.0, centre - half), (std::min)(1.0, centre + half)};
 }
 
 } // namespace dex_stats_detail
@@ -328,6 +337,9 @@ struct DexInterval {
         b.lower = 0.0;
     if (events == trials)
         b.upper = 1.0;
+    // Rounding at huge n can leave the interval a ulp or so off its own estimate.
+    b.lower = (std::min)(b.lower, p);
+    b.upper = (std::max)(b.upper, p);
     if (!std::isfinite(p) || !std::isfinite(b.lower) || !std::isfinite(b.upper))
         return std::nullopt;
     return DexInterval{p, b.lower, b.upper, events >= kDexStatsReliableMinEvents};
@@ -344,7 +356,7 @@ struct DexInterval {
 [[nodiscard]] inline std::optional<double> dex_rule_of_three(std::int64_t trials) {
     if (trials <= 0)
         return std::nullopt;
-    return std::min(1.0, 3.0 / static_cast<double>(trials));
+    return (std::min)(1.0, 3.0 / static_cast<double>(trials));
 }
 
 /// events over `exposure` (the caller's unit, device-days for the views) with
@@ -372,12 +384,16 @@ struct DexInterval {
 /// total, events_a is binomial, so the interval is the exact conditional
 /// (Clopper-Pearson) interval mapped onto the ratio; accuracy and the per-arm
 /// limit are in the file banner.
-/// nullopt iff a count is negative or above kDexRateRatioMaxEvents, an exposure
-/// is non-finite or below kDexRateRatioMinExposure, both counts are zero (no
-/// conditional distribution), or a result is not representable. events_b == 0
+/// nullopt iff a count is negative or above kDexRateRatioMaxEvents (a policy
+/// refusal at the edge of the accuracy domain, not an invalid count; dex_rate has
+/// no such ceiling), an exposure is non-finite or below kDexRateRatioMinExposure,
+/// both counts are zero (no conditional distribution), or a result is not
+/// representable. events_b == 0
 /// with events_a > 0 gives ratio and upper of +infinity (the data are valid; the
 /// lower bound is finite). A reliable == false ratio is printed as indicative,
-/// never hidden.
+/// never hidden. The exposure guard is on exposure, not devices, and there is no
+/// floored ratio helper: a surface applies the device floor to each arm before
+/// calling.
 [[nodiscard]] inline std::optional<DexInterval>
 dex_rate_ratio(std::int64_t events_a, double exposure_a, std::int64_t events_b, double exposure_b) {
     constexpr double kInf = std::numeric_limits<double>::infinity();
@@ -389,13 +405,13 @@ dex_rate_ratio(std::int64_t events_a, double exposure_a, std::int64_t events_b, 
         return std::nullopt;
     if (events_a == 0 && events_b == 0)
         return std::nullopt;
-    constexpr double alpha = 1.0 - kDexStatsConfidence;
+    constexpr double kAlpha = dex_stats_detail::kAlpha;
     const double a = static_cast<double>(events_a);
     const double b = static_cast<double>(events_b);
     const double p_lo =
-        events_a == 0 ? 0.0 : dex_stats_detail::beta_quantile(a, b + 1.0, alpha / 2.0);
+        events_a == 0 ? 0.0 : dex_stats_detail::beta_quantile(a, b + 1.0, kAlpha / 2.0);
     const double p_hi =
-        events_b == 0 ? 1.0 : dex_stats_detail::beta_quantile(a + 1.0, b, 1.0 - alpha / 2.0);
+        events_b == 0 ? 1.0 : dex_stats_detail::beta_quantile(a + 1.0, b, 1.0 - kAlpha / 2.0);
     const double scale = exposure_b / exposure_a;
     const double ratio = events_b == 0 ? kInf : (a / exposure_a) / (b / exposure_b);
     const double lower = p_lo / (1.0 - p_lo) * scale;

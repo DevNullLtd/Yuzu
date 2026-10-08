@@ -116,6 +116,20 @@ TEST_CASE("DexStats: exact and large-count Poisson bounds agree at the switch", 
     REQUIRE(past);
     CHECK(past->lower - at->lower == Approx(1.0).margin(0.01));
     CHECK(past->upper - at->upper == Approx(1.0).margin(0.01));
+
+    // Dispatch boundary, with literal counts so a moved cutoff cannot move the
+    // inputs with it: exact kernels up to one million events, closed forms past
+    // it (exposure 1.0 makes the division the identity, so equality is exact).
+    CHECK(kDexStatsExactMaxEvents == 1'000'000);
+    const auto on_cut = dex_rate(1'000'000, 1.0);
+    const auto over_cut = dex_rate(1'000'001, 1.0);
+    REQUIRE(on_cut);
+    REQUIRE(over_cut);
+    CHECK(on_cut->lower == ex.lower);
+    CHECK(on_cut->upper == ex.upper);
+    const auto lg_over = dex_stats_detail::poisson_bounds_large(1e6 + 1.0);
+    CHECK(over_cut->lower == lg_over.lower);
+    CHECK(over_cut->upper == lg_over.upper);
 }
 
 TEST_CASE("DexStats: a convergence failure is NaN never a number", "[dex][stats]") {
@@ -158,6 +172,13 @@ TEST_CASE("DexStats: dex_proportion edges validity and flag", "[dex][stats]") {
     const auto none = dex_proportion(0, kI64Max);
     REQUIRE(none);
     CHECK(none->lower == 0.0);
+
+    // At this many trials the estimate rounds to 1 while Wilson's upper bound
+    // falls a ulp short; the interval must still contain its estimate.
+    const auto edge = dex_proportion(20'000'000'000'000'000 - 1, 20'000'000'000'000'000);
+    REQUIRE(edge);
+    CHECK(edge->lower <= edge->estimate);
+    CHECK(edge->estimate <= edge->upper);
 }
 
 TEST_CASE("DexStats: rule of three", "[dex][stats]") {
@@ -299,7 +320,10 @@ TEST_CASE("DexStats: dex_rate_ratio one large arm matches the exact bounds", "[d
     // and P(X >= a) = 1 - P(X <= a - 1); for b = 1 or a = 1 the bounds have the
     // closed forms p_U = 0.975^(1/n) and p_L = 1 - 0.975^(1/n). A closed-form
     // Wilson stand-in is 86 percent low on the first row and 600 percent high
-    // on the second, which is what these rows pin.
+    // on the second, which is what these rows pin. The 1e9-arm tolerance of 2e-5
+    // is the header banner's libm-dependent envelope, not this platform's
+    // rounding; the 984,119,250 row sits at the worst point measured on one libm
+    // (its want is the closed form, Decimal at 90 digits).
     struct V {
         std::int64_t a, b;
         bool upper;
@@ -307,9 +331,10 @@ TEST_CASE("DexStats: dex_rate_ratio one large arm matches the exact bounds", "[d
     };
     for (const V& v : {V{1'000'001, 1, true, 39497968.70098762, 1e-7},
                        V{1, 1'000'001, false, 2.5317757669269599e-8, 1e-7},
-                       V{1'000'000'000, 1, true, 39497890244.205102, 5e-6},
-                       V{1, 1'000'000'000, false, 2.5317807959292563e-11, 5e-6},
-                       V{20, 1'000'000'000, false, 1.2216519531752164e-8, 5e-6}}) {
+                       V{1'000'000'000, 1, true, 39497890244.205102, 2e-5},
+                       V{984'119'250, 1, true, 38870634124.328757, 2e-5},
+                       V{1, 1'000'000'000, false, 2.5317807959292563e-11, 2e-5},
+                       V{20, 1'000'000'000, false, 1.2216519531752164e-8, 2e-5}}) {
         const auto r = dex_rate_ratio(v.a, 100.0, v.b, 100.0);
         REQUIRE(r);
         CHECK(r->estimate == Approx(static_cast<double>(v.a) / static_cast<double>(v.b)));
