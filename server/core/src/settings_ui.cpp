@@ -186,7 +186,15 @@ extern const char* const kSettingsHtml =
     .htmx-request.htmx-indicator { display: inline; }
   </style>
 </head>
-<body>
+)HTM"
+    // #5572 CI fix — MSVC's raw-string literal has a hard ~16,380-byte cap
+    // (C2026 "string too big"); the CSS growth here pushed the first chunk
+    // over it. Split here, at the </head>/<body> boundary — already the
+    // idiom this file uses (see every other )HTM"\n R"HTM( pair below).
+    // GCC/Clang have no such limit, so this only shows up on the Windows
+    // CI leg; docs/build-guide.md and
+    // build-and-observability-gotchas-from-pki.md document the pattern.
+    R"HTM(<body>
 
   <nav class="nav-bar">
     <a href="/" class="nav-brand">
