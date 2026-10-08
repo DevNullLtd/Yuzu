@@ -275,16 +275,32 @@ DiscoveryDoc build_instructions_catalog(InstructionStore& instruction_store,
         // schema would take the running total past the budget publishes the budget token instead.
         // null with a null input_schema_error = no schema stored (nothing is enforced); null with
         // a token = no canonical schema is published for this definition.
+        //
+        // Two kinds of row cost nothing against the budget: one that canonicalises to "no schema"
+        // (empty, or `{}` modulo JSON whitespace; the whitespace scan only runs on text of at most
+        // 64 bytes, anything longer is charged), and one over kMaxParameterSchemaBytes, which the
+        // canonicaliser rejects on its raw length before reading it (a legacy row; the write gate
+        // keeps new ones out). Such a row goes straight to the canonicaliser, so it is labelled
+        // parameter_schema_not_canonicalisable and cannot starve the definitions after it.
         json input_schema;
         json input_schema_error;
-        const bool trivially_absent = d.parameter_schema.empty() || d.parameter_schema == "{}";
-        if (!trivially_absent &&
-            d.parameter_schema.size() > canonical_budget_bytes - canonical_bytes) {
+        const std::string& stored = d.parameter_schema;
+        const bool within_cap = stored.size() <= instr::kMaxParameterSchemaBytes;
+        bool trivially_absent = stored.empty() || stored == "{}";
+        if (!trivially_absent && stored.size() <= 64) {
+            std::string compact;
+            for (const char c : stored)
+                if (c != ' ' && c != '\t' && c != '\r' && c != '\n')
+                    compact.push_back(c);
+            trivially_absent = compact.empty() || compact == "{}";
+        }
+        const bool charged = within_cap && !trivially_absent;
+        if (charged && stored.size() > canonical_budget_bytes - canonical_bytes) {
             input_schema_error = "input_schema_budget_exceeded";
         } else {
-            if (!trivially_absent)
-                canonical_bytes += d.parameter_schema.size();
-            if (auto canonical = instr::canonicalise_param_schema(d.parameter_schema)) {
+            if (charged)
+                canonical_bytes += stored.size();
+            if (auto canonical = instr::canonicalise_param_schema(stored)) {
                 if (*canonical)
                     input_schema = std::move(**canonical);
             } else {
@@ -318,9 +334,13 @@ DiscoveryDoc build_instructions_catalog(InstructionStore& instruction_store,
          "shape params with it. It is null when the definition declares no parameters "
          "(input_schema_error is then null), when the stored schema cannot be "
          "canonicalised (input_schema_error is parameter_schema_not_canonicalisable and "
-         "execute refuses it), or when the per-request canonicalisation budget was "
-         "already spent (input_schema_error is input_schema_budget_exceeded; "
-         "parameter_schema is still present)."},
+         "execute refuses it), or when canonicalising this schema would have taken the "
+         "per-request canonicalisation budget over its limit (input_schema_error is "
+         "input_schema_budget_exceeded; the test is per definition, so a smaller later one can "
+         "still get an input_schema, and parameter_schema is still present). A non-null "
+         "input_schema can still be refused at execute, for any reason the execute-side "
+         "validator rejects that canonicalisation does not check (for example a regex that "
+         "does not compile)."},
         {"count", arr.size()},
         {"truncated", defs.size() >= static_cast<std::size_t>(q.limit)},
         {"instructions", std::move(arr)},
@@ -603,6 +623,9 @@ DiscoveryDoc build_plugins_catalog(const yuzu::server::detail::AgentRegistry& ag
          "reports is absent from this list. To dispatch an action, call "
          "execute_instruction / POST /api/command with its "
          "plugin+action; supply the params from parameter_schema where present. "
+         "POST /api/command refuses an approval-gated action for a caller without approval "
+         "(a non-admin caller, or any caller for an always-approval action): dispatch it via "
+         "POST /api/instructions/{id}/execute instead. "
          "Each plugin's docs field is a documentation summary {summary, kind, platforms, "
          "readme, resource} when the plugin has adopted the README standard, else "
          "null; resource names that plugin's own GET /discover/plugin-docs/<name> / "

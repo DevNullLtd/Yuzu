@@ -36,6 +36,18 @@ def _load():
 
 M = _load()
 
+SUBPROCESS_TIMEOUT_S = 120
+
+
+def run_script(argv, **kwargs):
+    """Run the lint script as a child process; a hang fails the test instead of the job."""
+    try:
+        return subprocess.run(argv, capture_output=True, text=True, check=False,
+                              timeout=SUBPROCESS_TIMEOUT_S, **kwargs)
+    except subprocess.TimeoutExpired:
+        raise AssertionError(
+            f"{SCRIPT.name} did not finish within {SUBPROCESS_TIMEOUT_S}s") from None
+
 GOOD_DESCRIPTION = "Lists every running process on the endpoint with its owner and start time."
 
 
@@ -166,10 +178,9 @@ class Ratchet(unittest.TestCase):
         (self.dir / name).write_text(text, encoding="utf-8")
 
     def run_main(self, *extra):
-        out = subprocess.run(
+        out = run_script(
             [sys.executable, str(SCRIPT), "--definitions", str(self.dir),
-             "--baseline", str(self.baseline), *extra],
-            capture_output=True, text=True, check=False)
+             "--baseline", str(self.baseline), *extra])
         return out.returncode, out.stdout + out.stderr
 
     DEFECTIVE = (
@@ -307,8 +318,7 @@ class Ratchet(unittest.TestCase):
 
 class RepoGate(unittest.TestCase):
     def test_shipped_definitions_match_the_baseline(self):
-        out = subprocess.run([sys.executable, str(SCRIPT)], capture_output=True,
-                             text=True, check=False, cwd=str(ROOT))
+        out = run_script([sys.executable, str(SCRIPT)], cwd=str(ROOT))
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
 
 

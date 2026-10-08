@@ -670,11 +670,104 @@ TEST_CASE("discover.instructions: the canonicalisation budget degrades later def
     CHECK(description.find("input_schema_budget_exceeded") != std::string::npos);
     CHECK(description.find("POST /api/instructions/{id}/execute") != std::string::npos);
     CHECK(description.find("/api/v1/instructions/execute") == std::string::npos);
+    // The caveat an agent must meet in-band: a non-null input_schema can still be refused at
+    // execute, and the budget token is a per-definition test (not "already spent").
+    CHECK(description.find("can still be refused at execute") != std::string::npos);
+    CHECK(description.find("per definition") != std::string::npos);
+    CHECK(description.find("already spent") == std::string::npos);
 
     // The default budget publishes all four.
     const auto full = nlohmann::json::parse(yuzu::server::build_instructions_catalog(*h.instr).json);
     for (const auto& d : full["instructions"])
         CHECK(d["input_schema_error"].is_null());
+}
+
+// Rows that cost nothing: a legacy row over kMaxParameterSchemaBytes is rejected by the
+// canonicaliser on its raw length, so it is labelled parameter_schema_not_canonicalisable (not the
+// budget token) and neither is nor charges the budget; the definitions after it are unaffected.
+TEST_CASE("discover.instructions: an over-cap legacy row does not consume the budget",
+          "[discovery][instructions][input-schema][budget][pg]") {
+    namespace instr = yuzu::server::instr;
+    DiscoverHarness h;
+    const std::string stored = R"({"type":"object","properties":{"p":{"type":"string"}}})";
+    const std::string head = R"({"type":"object","x":")";
+    const std::string tail = R"("})";
+    const std::string huge =
+        head + std::string(instr::kMaxParameterSchemaBytes + 1 - head.size() - tail.size(), 'x') +
+        tail;
+    REQUIRE(huge.size() == instr::kMaxParameterSchemaBytes + 1);
+    REQUIRE(nlohmann::json::accept(huge));
+
+    auto huge_id = h.instr->create_definition(make_def("A0 Huge", /*enabled=*/true, "{}"));
+    REQUIRE(huge_id.has_value());
+    yuzu::server::test::force_parameter_schema(*h.rbac_pool, *huge_id, huge);
+    std::vector<std::string> normal;
+    for (const char* name : {"A1", "A2"}) {
+        auto id = h.instr->create_definition(make_def(name, /*enabled=*/true, stored));
+        REQUIRE(id.has_value());
+        normal.push_back(*id);
+    }
+
+    // First: a budget the huge row alone would blow. Second: a budget that would admit the huge row
+    // but then leave room for only one of the two normal rows if it were charged.
+    for (const std::size_t budget :
+         {2 * stored.size(), instr::kMaxParameterSchemaBytes + 1 + stored.size()}) {
+        INFO("budget " << budget);
+        const auto doc = yuzu::server::build_instructions_catalog(*h.instr, budget);
+        const auto j = nlohmann::json::parse(doc.json);
+        int seen_huge = 0, seen_normal = 0;
+        for (const auto& d : j["instructions"]) {
+            if (d["id"] == *huge_id) {
+                ++seen_huge;
+                CHECK(d["input_schema"].is_null());
+                CHECK(d["input_schema_error"] == "parameter_schema_not_canonicalisable");
+            } else if (d["id"] == normal[0] || d["id"] == normal[1]) {
+                ++seen_normal;
+                CHECK(d["input_schema"].is_object());
+                CHECK(d["input_schema_error"].is_null());
+            }
+        }
+        CHECK(seen_huge == 1);
+        CHECK(seen_normal == 2);
+    }
+}
+
+// An empty schema is exempt from the budget however it is spelled: `{}` with JSON whitespace
+// canonicalises to "no schema", so it must read null/null even after the budget is spent.
+TEST_CASE("discover.instructions: whitespace variants of an empty schema are never budget casualties",
+          "[discovery][instructions][input-schema][budget][pg]") {
+    DiscoverHarness h;
+    const std::string stored = R"({"type":"object","properties":{"p":{"type":"string"}}})";
+    auto spend = h.instr->create_definition(make_def("A1", /*enabled=*/true, stored));
+    REQUIRE(spend.has_value());
+    auto over = h.instr->create_definition(make_def("A2", /*enabled=*/true, stored));
+    REQUIRE(over.has_value());
+    std::vector<std::string> empties;
+    for (const auto& [name, text] : std::vector<std::pair<std::string, std::string>>{
+             {"W1", "{ }"}, {"W2", " {}"}, {"W3", "{}\n"}}) {
+        auto id = h.instr->create_definition(make_def(name, /*enabled=*/true, "{}"));
+        REQUIRE(id.has_value());
+        yuzu::server::test::force_parameter_schema(*h.rbac_pool, *id, text);
+        empties.push_back(*id);
+    }
+
+    // Room for exactly one of the two real schemas.
+    const auto j = nlohmann::json::parse(
+        yuzu::server::build_instructions_catalog(*h.instr, stored.size()).json);
+    int seen_empty = 0;
+    for (const auto& d : j["instructions"]) {
+        if (d["id"] == *spend) {
+            CHECK(d["input_schema"].is_object());
+        } else if (d["id"] == *over) {
+            CHECK(d["input_schema_error"] == "input_schema_budget_exceeded");  // the budget IS spent
+        } else if (std::find(empties.begin(), empties.end(), d["id"].get<std::string>()) !=
+                   empties.end()) {
+            ++seen_empty;
+            CHECK(d["input_schema"].is_null());
+            CHECK(d["input_schema_error"].is_null());
+        }
+    }
+    CHECK(seen_empty == 3);
 }
 
 // json-dump-depth-guard fix (#2437-class): parameter_schema is stored
@@ -1010,6 +1103,11 @@ TEST_CASE("discover.plugins: wraps AgentRegistry::help_json with a limitation no
     auto j = nlohmann::json::parse(res->body);
     REQUIRE(j.contains("limitation"));
     CHECK_FALSE(j["limitation"].get<std::string>().empty());
+    // An approval-gated action is refused on POST /api/command for a caller without approval;
+    // the catalogue must send an agent to the governed route.
+    const auto plugins_description = j["description"].get<std::string>();
+    CHECK(plugins_description.find("approval-gated") != std::string::npos);
+    CHECK(plugins_description.find("POST /api/instructions/{id}/execute") != std::string::npos);
     REQUIRE(j.contains("plugins"));
     bool saw_processes = false;
     for (const auto& pl : j["plugins"]) {

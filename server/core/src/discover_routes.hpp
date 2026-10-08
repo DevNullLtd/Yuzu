@@ -101,9 +101,12 @@ inline constexpr std::size_t kDiscoveryCanonicalBudgetBytes = 4 * 1024 * 1024;
 /// Schema the execute route enforces (instr::canonicalise_param_schema, no RE2
 /// compile): null when no schema is stored (`input_schema_error` null), the
 /// stored one cannot be canonicalised (`parameter_schema_not_canonicalisable`),
-/// or `canonical_budget_bytes` of stored schema text were already canonicalised
-/// in this call (`input_schema_budget_exceeded`). The budget is a parameter so a
-/// test can exercise it without thousands of rows.
+/// or canonicalising this one would take the stored schema text canonicalised in
+/// this call past `canonical_budget_bytes` (`input_schema_budget_exceeded`; a
+/// per-definition test, so a smaller later definition can still fit). Rows that
+/// canonicalise to "no schema" and rows over instr::kMaxParameterSchemaBytes are
+/// not charged. The budget is a parameter so a test can exercise it without
+/// thousands of rows.
 /// `instruction_store` must be non-null.
 DiscoveryDoc build_instructions_catalog(
     InstructionStore& instruction_store,

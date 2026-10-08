@@ -6941,11 +6941,11 @@ TEST_CASE("MCP: discover_instructions advertises input_schema and chaining guida
          {"canonical JSON Schema the server enforces", "CHAIN:", "plugin and action",
           "string-valued", "enforced only by POST /api/instructions/{id}/execute",
           "no filter arguments", "count 0", "InstructionDefinition:Read",
-          "input_schema_budget_exceeded", "at 5000 entries"})
+          "input_schema_budget_exceeded", "can still be refused at execute", "at 5000 entries"})
         CHECK(desc.find(needle) != std::string::npos);
     // The execute route is POST /api/instructions/{id}/execute; there is no /api/v1 execute path,
     // and the description makes no cost claim it has not measured.
-    for (const char* banned : {"/api/v1/instructions/execute", "cheap"})
+    for (const char* banned : {"/api/v1/instructions/execute", "cheap", "hit its schema budget"})
         CHECK(desc.find(banned) == std::string::npos);
 
     const auto& item = (*tool)["outputSchema"]["properties"]["instructions"]["items"];
