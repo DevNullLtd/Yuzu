@@ -35,8 +35,9 @@
  *     regularised incomplete beta, for every arm up to kDexRateRatioMaxEvents,
  *     evaluated in double to within 2e-5 relative of the exact rational bounds.
  *     That envelope is libm-dependent: on one libm the worst measured was 1.1e-5,
- *     at an arm of 1 against about 9.8e8; it is under 4e-6 for arms of 2 or more
- *     and about 1e-9 at 1e6 against 1. Above that limit no ratio is produced.
+ *     at an arm of 1 against about 9.8e8; for arms of 2 or more the measured
+ *     worst was 2.8e-6, and about 1e-9 at 1e6 against 1. Another libm may land
+ *     anywhere inside 2e-5. Above that limit no ratio is produced.
  *   - A kernel that cannot converge inside kDexStatsMaxIterations returns NaN,
  *     quantiles propagate it, and every public function that computes a bound
  *     ends with a finiteness check: a statistic is never returned after a
@@ -86,10 +87,10 @@ inline constexpr std::int64_t kDexStatsExactMaxEvents = 1'000'000;
 /// rather than an inaccurate one.
 inline constexpr std::int64_t kDexRateRatioMaxEvents = 1'000'000'000;
 
-/// Iteration cap of the series / continued fractions: 2.2x the worst case
-/// measured over both exact domains (gamma 7,413 at one million events; beta
-/// about 23,200 near 29,500 against 1e9). Hitting it is a convergence failure
-/// (NaN), never a result.
+/// Iteration cap of the series / continued fractions: over 2.1x the measured
+/// peaks over both exact domains (gamma 7,413 at one million events; beta about
+/// 23,200 near 29,500 against 1e9 - a different search lands a few thousand
+/// under that). Hitting it is a convergence failure (NaN), never a result.
 inline constexpr int kDexStatsMaxIterations = 50000;
 
 namespace dex_stats_detail {
@@ -405,13 +406,14 @@ dex_rate_ratio(std::int64_t events_a, double exposure_a, std::int64_t events_b, 
         return std::nullopt;
     if (events_a == 0 && events_b == 0)
         return std::nullopt;
-    constexpr double kAlpha = dex_stats_detail::kAlpha;
     const double a = static_cast<double>(events_a);
     const double b = static_cast<double>(events_b);
-    const double p_lo =
-        events_a == 0 ? 0.0 : dex_stats_detail::beta_quantile(a, b + 1.0, kAlpha / 2.0);
-    const double p_hi =
-        events_b == 0 ? 1.0 : dex_stats_detail::beta_quantile(a + 1.0, b, 1.0 - kAlpha / 2.0);
+    const double p_lo = events_a == 0 ? 0.0
+                                      : dex_stats_detail::beta_quantile(
+                                            a, b + 1.0, dex_stats_detail::kAlpha / 2.0);
+    const double p_hi = events_b == 0 ? 1.0
+                                      : dex_stats_detail::beta_quantile(
+                                            a + 1.0, b, 1.0 - dex_stats_detail::kAlpha / 2.0);
     const double scale = exposure_b / exposure_a;
     const double ratio = events_b == 0 ? kInf : (a / exposure_a) / (b / exposure_b);
     const double lower = p_lo / (1.0 - p_lo) * scale;

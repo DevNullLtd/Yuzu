@@ -119,17 +119,18 @@ TEST_CASE("DexStats: exact and large-count Poisson bounds agree at the switch", 
 
     // Dispatch boundary, with literal counts so a moved cutoff cannot move the
     // inputs with it: exact kernels up to one million events, closed forms past
-    // it (exposure 1.0 makes the division the identity, so equality is exact).
+    // it. The tolerance absorbs rounding differences between the inlined and
+    // direct evaluations; a moved cutoff differs by about 1.5e-11 relative.
     CHECK(kDexStatsExactMaxEvents == 1'000'000);
     const auto on_cut = dex_rate(1'000'000, 1.0);
     const auto over_cut = dex_rate(1'000'001, 1.0);
     REQUIRE(on_cut);
     REQUIRE(over_cut);
-    CHECK(on_cut->lower == ex.lower);
-    CHECK(on_cut->upper == ex.upper);
+    CHECK(on_cut->lower == Approx(ex.lower).epsilon(1e-14));
+    CHECK(on_cut->upper == Approx(ex.upper).epsilon(1e-14));
     const auto lg_over = dex_stats_detail::poisson_bounds_large(1e6 + 1.0);
-    CHECK(over_cut->lower == lg_over.lower);
-    CHECK(over_cut->upper == lg_over.upper);
+    CHECK(over_cut->lower == Approx(lg_over.lower).epsilon(1e-14));
+    CHECK(over_cut->upper == Approx(lg_over.upper).epsilon(1e-14));
 }
 
 TEST_CASE("DexStats: a convergence failure is NaN never a number", "[dex][stats]") {
@@ -358,6 +359,8 @@ TEST_CASE("DexStats: dex_rate_ratio balanced arms above a million events", "[dex
 }
 
 TEST_CASE("DexStats: dex_rate_ratio domain limit", "[dex][stats]") {
+    CHECK(kDexRateRatioMaxEvents == 1'000'000'000);
+
     // Both arms at the limit still produce a statistic that brackets 1.
     const auto edge = dex_rate_ratio(kDexRateRatioMaxEvents, 100.0, kDexRateRatioMaxEvents, 100.0);
     REQUIRE(edge);
