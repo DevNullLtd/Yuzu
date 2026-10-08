@@ -1,0 +1,17 @@
+# Resource Ledger: canonical input schema in discovery + description lint
+
+Covers `c8b77fd8b..HEAD` on `feat/instructions-discovery-canonical-schema-lint`.
+
+The added C++ (production and test) adds no fd, HANDLE, SOCKET, `FILE*`, sqlite/libpq handle (production), OpenSSL object, BCrypt handle, allocated C string, mapped library, temp path, subprocess, thread or callback context, and there is no `new`, `delete`, `malloc` or manual cleanup in it. The Python lint test does create a temp directory and spawn a subprocess; those are listed in their own rows below.
+
+| resource | owner | acquired | released | transfer / failure cleanup |
+|---|---|---|---|---|
+| `canonicalise_param_schema` result: `std::expected<std::optional<nlohmann::json>, std::vector<std::string>>` | by value to the caller (`build_instructions_catalog`, `prepare_param_validator`) | per call | caller scope end | value types only; an early return from the shared anonymous `canonicalise_stored` destroys partial results; no RE2 object is created on the discovery path (`PatternBudget::compile == false`) |
+| `PatternBudget` (stack object in the anonymous helpers) | stack | per call | scope end | gained one `bool`; nothing owned |
+| discovery catalog JSON | `nlohmann::json` built per request and serialised by the existing code path | per request | request end | `input_schema` / `input_schema_error` are plain JSON members added to the existing per-entry object |
+| Python lint (`scripts/ci/check-definition-descriptions.py`) | process-local; reads content/definitions/*.yaml and the baseline JSON | script run | process exit | read-only; `--update-baseline` rewrites only the baseline file (an explicit flag, never in CI) |
+| Python lint test: temp directory (`tests/test_definition_descriptions.py`, `tempfile.TemporaryDirectory(prefix="yuzu_test_defdesc_")`) | the unittest case (`addCleanup`) | per test | test end, on every exit path | holds seeded fixture YAML and a scratch baseline only; the real tree and the real baseline are never written |
+| Python lint test: child process (`subprocess.run([sys.executable, <script>, ...])`) | the test; argv list, no shell, output captured | per case | `run` returns | the child is a plain interpreter (no `-I`: the CI install is a `--user` PyYAML), exit codes asserted; nothing is left running |
+| discovery canonicalisation budget (`kDiscoveryCanonicalBudgetBytes`, `build_instructions_catalog`) | a local `size_t` running total in the catalog builder, one per request | per request | request end | a definition whose schema would exceed the budget publishes `input_schema: null` with the fixed token `input_schema_budget_exceeded` instead of being canonicalised; no allocation is kept across requests |
+| CI steps | GitHub Actions job `definition-descriptions` (its own job; the required `changelog-order` job is unchanged) | job | job end | installs a hash-pinned PyYAML with `pip install --user` (the existing prometheus-rules pattern) |
+| tests | existing fixtures (`force_parameter_schema` lease in `instruction_schema_test_util.hpp`, the PG fixtures behind `YUZU_REQUIRE_PG_DB_TPL`) | per test | per test scope | no raw owning pointers, no threads added |
