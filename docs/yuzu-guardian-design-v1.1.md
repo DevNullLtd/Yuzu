@@ -2670,24 +2670,36 @@ Guardian ladder must check these.
   the journal flush and the loss-ledger write, under the stop budget (no tuple cap, 1
   failure, 1 s of wall between tuples). The pass is skipped in two cases: a write that
   failed slowly (took at least the stop wall budget) ended at or after the `begin_stop()`
-  mark, taken at the very top of `stop()` before it waits for `mtx_` (so a stall that ends
-  while `stop()` is queued behind an `apply_rules` counts as this stop's); or the pass would
-  start `kBaselineStopLatestStart` (15 s, the 20 s grace minus one 5 s KV busy timeout) or
-  more after the mark. A stall that ended before the mark does not skip it. The 20 s
-  `ShutdownDeadlineGuard` (`kShutdownDeadlineGrace`) is armed at `AgentImpl::stop()` entry,
-  so it also covers the DEX, Spark and plugin teardown after `guardian_->stop()`; when it
-  fires, `hard_exit(4)` cuts the rest of the shutdown (a Windows service is restarted by
-  the SCM) and writes no log line. Measured with every KV write truly BUSY (5 s busy
-  timeout), `stop()` entry to exit: idle worker, no journal record pending 10 s (loss
-  ledger 5 + this pass 5); idle worker, a journal record pending 15 s (journal 5 + ledger
-  5 + journal 5, this pass skipped because it would start at 15 s); worker mid-write on a
-  baseline 20 s (this pass skipped); worker mid-write on its other KV traffic (journal
-  sent-markers, which also take `KvStore::mu_`) 23 s to 25 s, past the grace (measured in
-  an earlier review round, before the late-start skip; not re-measured). #4045 adds at
-  most one busy timeout to that (the join waiting for the worker's baseline write, or this
-  pass, never both), and none once the earlier stages have used 15 s; the earlier stages
-  and the worker's other writes are outside its control, and slow SUCCESSFUL writes are not
-  counted at all; (2) a failed write is a
+  mark, taken at the very top of `stop()` before it waits for `mtx_` (and again once it
+  holds `mtx_`, first call wins, for a stop that read the persister pointer just before the
+  wire published it; a stall that ends while `stop()` is queued behind an `apply_rules`
+  counts as this stop's); or the pass would start `kBaselineStopLatestStart` (15 s, the
+  20 s grace minus one 5 s KV busy timeout) or more after the mark AND an earlier stage of
+  this same `stop()` (the two journal flushes, the worker join, the loss-ledger write)
+  failed or took at least a busy timeout (`note_stop_store_trouble`). A late start with no
+  such sign runs: a healthy pass takes about a millisecond, so an `apply_rules` that held
+  `mtx_` for 15 s does not cost the staged captures. A stall that ended before the mark does
+  not skip it. The 20 s `ShutdownDeadlineGuard` (`kShutdownDeadlineGrace`) is armed at
+  `AgentImpl::stop()` entry, so it also covers the DEX, Spark engine and updater stops after
+  `guardian_->stop()`; `run()`'s exit teardown (plugin shutdown, `thread_pool_.reset()`) is
+  under a second, independent 20 s guard. When a guard fires, `hard_exit(4)` cuts the rest
+  of the shutdown (a Windows service is restarted by the SCM) and writes no log line.
+  Measured on this code with every KV write truly BUSY (5 s busy timeout, three staged
+  captures), `stop()` entry to exit: quiet worker, no journal record pending 10.01 s (loss
+  ledger 5 + this pass 5, the pass runs and fails); quiet worker, a journal record pending
+  15.02 s (journal 5 + ledger 5 + journal 5, this pass skipped because it would start at
+  15 s; the 15 s threshold is met with about 15 ms to spare, because each BUSY stage is its
+  5 s sleep plus overhead); worker baseline write in flight, no journal record 10.01 s (this
+  pass skipped by the stall); worker baseline write in flight with a journal record pending
+  20 to 25 s (25.02 s in three runs of one harness, 20.016 to 25.03 s across alignments;
+  this pass skipped by the stall): up to TWO busy timeouts are added, the in-flight write
+  that holds `KvStore::mu_` first, and a second baseline write when the worker's 5 s retry
+  backoff expires just as journal flush 1 ends; worker mid-write on its other KV traffic
+  (journal sent-markers, which also take `KvStore::mu_`) 21.5 to 28.2 s (measured by a
+  review harness on the previous revision; the worker path is unchanged), past the grace.
+  The same trigger already costs 23 s and more without #4045. The earlier stages, the
+  worker's other writes and the worker's retry write are outside its control, and slow
+  SUCCESSFUL writes are not counted at all; (2) a failed write is a
   deliberate fail-open (the rule keeps its in-memory baseline): the capture stays
   staged and is retried, counted, error-logged, and exported on the sparse
   heartbeat tag `yuzu.guardian_baseline_persist_failures` (Spark path only,
@@ -2697,9 +2709,11 @@ Guardian ladder must check these.
   (an allocation failure) or capture displaced from staging (a retarget over a
   still-unpersisted capture) and a capture staged with no KV store (logged once,
   kept). Stop-time losses that are NOT counted: a stop flush that ran out of its wall
-  budget with captures left and one skipped (after a slow failure during that stop,
-  or because it could not start within 15 s), each logged with its own line; the
-  shutdown watchdog leaves neither a count nor a line (exit code 4). A staging failure
+  budget with captures left, one skipped (after a slow failure during that stop, or
+  because it could not start within 15 s after the stop saw store trouble), and a capture
+  that could not be staged again at stop, each logged with its own line (the skips by the
+  persister, the others by the engine); the shutdown watchdog leaves neither a count nor a
+  line (exit code 4). A staging failure
   keeps the baseline committed (a later change is still drift against the original
   capture) and marks the generation
   `baseline_unstaged` (runtime-owned, `registry_mu_`-guarded, never in the shared
@@ -2717,11 +2731,15 @@ Guardian ladder must check these.
   captures (its single allowed write failing, its 1 s wall budget running out, on a
   slow store or on a healthy one holding more than roughly 2,000 to 3,000 captures,
   its flush skipped after a slow failure during that stop or because it could not
-  start within 15 s, or the 20 s shutdown watchdog ending the process mid-stop);
+  start within 15 s after the stop saw store trouble, or the 20 s shutdown watchdog ending
+  the process mid-stop);
   an allocation failure while staging, which keeps the baseline live and is retried
   (evaluation, re-push, withdrawal, stop), so it is a window only until a retry
-  succeeds (the crash window, or a re-push whose retries all fail: a delta push
-  retries twice, a full_sync once, and then the new arm captures afresh); a path
+  succeeds (the crash window, a stop-time retry that also fails (logged), or a re-push
+  whose retries all fail: a delta push retries twice, a full_sync once, and then the new
+  arm captures afresh; the same when a retry succeeds but copying the staged hash back
+  fails, where the saved record keeps the original hash while the live arm is judged
+  against the fresh capture until its next re-arm); a path
   re-authored while the first capture was unwritten (counted), and A to B to A
   re-baselines A even with a healthy store, as legacy does, since there is one
   record per rule; the `guardian_persist_baseline` write-anyway on a failed

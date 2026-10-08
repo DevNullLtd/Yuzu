@@ -1217,7 +1217,8 @@ flip, with a red-first test each:
     written (a slow store, or more than roughly 2,000 to 3,000 waiting captures on a
     healthy one; logged, not counted), or the flush was skipped, either because a write
     that failed slowly ended at or after the start of that stop or because it could not
-    start within 15 s of it (logged, not counted), or the 20 s shutdown watchdog ended the
+    start within 15 s of it after an earlier shutdown step had failed or taken a busy
+    timeout (logged, not counted), or the 20 s shutdown watchdog ended the
     process while the stop was still running (`hard_exit(4)`: the flush and the later
     shutdown steps are cut, a Windows service is restarted by the SCM, and no log line is
     written anywhere, so exit code 4 is the only evidence). A capture whose write is
@@ -1226,12 +1227,16 @@ flip, with a red-first test each:
     capture: the baseline stays live (a later change is still drift against it) and
     staging is retried at every later evaluation, at a re-push, at a withdrawal and once
     more at shutdown before the final flush, so this is a window only until a retry
-    succeeds; a crash or hard kill in it loses the capture (case 1), and a re-push in it
-    (a delta push, which retries twice, or a full_sync, which withdraws every rule first
-    and retries once) recaptures only if every retry also fails, in which case the new arm
-    captures whatever the file then holds (counted, once per failed attempt); (4) the
-    rule's path re-authored while the first capture was still unwritten (counted), and an A to B to A re-authoring re-baselines A even with a
-    healthy store, the same as legacy; (5) the arm-time read of the record failed and
+    succeeds; a crash or hard kill in it loses the capture (case 1), a shutdown whose own
+    retry also fails loses it (logged), and a re-push in it (a delta push, which retries
+    twice, or a full_sync, which withdraws every rule first and retries once) recaptures
+    only if every retry also fails, in which case the new arm captures whatever the file
+    then holds (counted, once per failed attempt); the same happens when a retry succeeds
+    but the copy of the staged hash back fails, where the saved record keeps the original
+    hash while the live arm is judged against the fresh capture until its next re-arm; (4) the
+    rule's path re-authored while the first capture was still unwritten (counted), and an
+    A to B to A re-authoring re-baselines A even with a healthy store, the same as
+    legacy; (5) the arm-time read of the record failed and
     the write-time re-check read failed again, so the guard wrote the fresh capture
     anyway: two failed reads suffice, a transient read fault is enough, not only a
     sustained outage; (6) the refused window: the arm-time read of the record failed
@@ -2138,16 +2143,22 @@ since they're hardening ON TOP OF an already-correct #2818 fix, not a defect in 
   filed (TODO, no number yet) if it is not done before merge.
 - **`GuardianEngine::stop()` has no remaining-deadline wall (#4045): partly addressed, the
   rest recorded here.** `stop()` shares the 20 s `kShutdownDeadlineGrace` (armed at
-  `AgentImpl::stop()` entry, so it also covers the DEX, Spark and plugin teardown after it)
-  with every later shutdown step, and its earlier stages (two journal flushes, the
-  loss-ledger write, the worker join) are under no deadline of their own. #4045 took the
-  stop mark before the engine mutex and skips ITS pass when that pass would start 15 s or
-  more after the stop began. What remains: the pass's first write always runs (the wall is
-  checked between tuples), so one that starts just inside the cutoff can still spend a 5 s
-  busy timeout; the delivery worker's non-baseline KV writes serialise on `KvStore::mu_`
-  and put their own busy timeout in front of every stage (23 s to 25 s, measured in an earlier
-  review round against a store that stays busy, before the late-start skip); and a stop that reaches the watchdog exits with code 4 and writes
-  no log line. A remaining-deadline wall threaded through every stage was considered and
+  `AgentImpl::stop()` entry, so it also covers the DEX, Spark engine and updater stops after
+  it; `run()`'s exit teardown is under a second, independent guard) with every later
+  shutdown step, and its earlier stages (two journal flushes, the loss-ledger write, the
+  worker join) are under no deadline of their own. #4045 took the stop mark before the
+  engine mutex and skips ITS pass when that pass would start 15 s or more after the stop
+  began AND an earlier stage of that stop failed or took a busy timeout (a late start with
+  no such sign runs, because a healthy pass takes about a millisecond). What remains: the
+  pass's first write always runs (the wall is checked between tuples), so one that starts
+  just inside the cutoff can still spend a 5 s busy timeout, and a pass that runs its full
+  1 s wall before the store turns BUSY ends about 6 s after it started; a worker baseline
+  write in flight with a journal record pending measured 20 to 25 s (the in-flight write
+  plus a second write when the worker's 5 s retry backoff ends as journal flush 1 does);
+  the delivery worker's non-baseline KV writes serialise on `KvStore::mu_` and put their
+  own busy timeout in front of every stage (21.5 to 28.2 s, measured by a review harness
+  against a store that stays busy); and a stop that reaches the watchdog exits with code 4
+  and writes no log line. A remaining-deadline wall threaded through every stage was considered and
   not done. Issue to be filed (TODO, no number yet).
 - Owner: not assigned for any item above.
 - Milestone: pre-PR-5 hardening package (#4051/#4052/#4053) + three pre-PR-5 GATING items

@@ -15552,6 +15552,9 @@ TEST_CASE("#4045 R11b: same, with the staging retry failing at attach (re-read p
 }
 TEST_CASE("#4045 R12: a kind-switching re-push with a staged leftover counts no spurious drop",
           "[spark][runtime][baseline]") {
+    // baseline_on_arm_file is three clauses (hash kind, empty authored hash, file params). The
+    // kind and params clauses mask each other for any realistic rule, so this case goes RED
+    // only when both are dropped; the authored-hash clause is pinned by R11 and R11b.
     auto r = std::make_shared<FakeReader>();
     auto b = std::make_shared<FakeBackend>();
     auto rt = make_rt(r, b);
