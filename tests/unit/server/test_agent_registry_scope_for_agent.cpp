@@ -542,6 +542,16 @@ TEST_CASE("evaluate_scope_for_agent: an empty, oversized or NUL-bearing id is ne
 
     const std::string with_nul("agent-000\0x", 11);
     const std::string oversized(257, 'a');
+    // Give each malformed id a REAL linux session. Without one, get_session() is null and the
+    // result is false for the wrong reason, so deleting the id guard would stay green.
+    for (const std::string& id : {std::string{}, oversized, with_nul}) {
+        auto info = make_info(0);
+        info.set_agent_id(id);
+        (void)registry.register_agent(info);
+        const auto sess = registry.get_session(id);
+        REQUIRE(sess != nullptr);
+        REQUIRE(sess->os == "linux");
+    }
     for (const char* text :
          {R"X(ostype == "linux")X", R"X(NOT (ostype == "linux"))X", R"X(NOT (tag:env == "x"))X"}) {
         INFO("scope expression: " << text);

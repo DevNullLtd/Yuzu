@@ -71,10 +71,21 @@
 /// calls, which is bounded by the heartbeat thread count.
 ///
 /// DEBIT. A push is charged `max(elapsed - excluded, min_cost)`. `Scoped::exclude()` removes
-/// time spent waiting on a single-flight load some OTHER thread was doing (that wait is not
-/// this push's cost and would otherwise starve the budget when one slow load has many
-/// waiters). `min_cost` (1 ms) keeps fast-failing degraded pushes from running at the pure
-/// count ceiling and bounds the rate of ABORTED audit rows.
+/// ONLY the time this push spent BLOCKED waiting on a rule-set load that ANOTHER thread was
+/// running (that wait is not this push's cost and would otherwise starve the budget when one
+/// slow load has many waiters). Everything else is charged: the fresh policy-generation read,
+/// the per-agent scope reads, and the push's own rule-set load when it is the thread that
+/// runs it (the loader's `list_rules` can take seconds, and that cost is exactly what the
+/// budget exists to bound). `min_cost` (1 ms) keeps fast-failing degraded pushes from running
+/// at the pure count ceiling and bounds the rate of ABORTED audit rows.
+///
+/// A CLAIM IS NEVER RELEASED. An Admit writes the claim and nothing here removes it except
+/// convergence (once at least `min_interval` old) and the sweep. In particular a push that
+/// ends without sending (the agent has no session, or a store read failed) keeps its claim:
+/// an agent that has Registered but not Subscribed heartbeats generation 0 in a loop, and a
+/// "forget the claim when nothing was sent" API would turn every such heartbeat into a fresh
+/// admission and let one credential drain the shared budget. With the claim kept that agent
+/// costs at most one admission per `min_interval`.
 ///
 /// ALLOCATION FAILURE. `decide()` may throw `std::bad_alloc` while inserting the claim,
 /// after `try_admit()` succeeded. Nothing is leaked; the budget has counted one admission
@@ -115,6 +126,8 @@ class GuardianReconcileGate {
 public:
     using Options = GuardianReconcileGateOptions;
     enum class Decision { Converged, RateLimited, Shed, Admit };
+    /// Why `decide()` returned `Shed` (reported through the optional out-parameter).
+    enum class ShedCause { None, Budget, InFlightCap };
 
     using ClockType = std::chrono::steady_clock;
     /// Null selects `steady_clock::now`.
@@ -166,8 +179,10 @@ public:
         }
         ~Scoped() { finish(); }
 
-        /// Exclude `d` (time spent waiting on a load another thread was running) from the
-        /// debit. Negative values are ignored. A no-op on a moved-from object.
+        /// Exclude `d` from the debit. `d` must be ONLY time this push spent blocked waiting
+        /// on a load another thread was running; time spent doing work itself (including
+        /// running a load) is the push's cost and must not be passed. Negative values are
+        /// ignored. A no-op on a moved-from object.
         void exclude(std::chrono::nanoseconds d) noexcept {
             if (d.count() > 0)
                 excluded_ += d;
@@ -204,11 +219,14 @@ public:
     ///               touches nothing else.
     ///   RateLimited a claim younger than min_interval exists; budget NOT consulted.
     ///   Shed        the in-flight cap or the budget refused; the claim is NOT written, no
-    ///               other state changes.
+    ///               other state changes. `cause`, when given, is set to which one (it is
+    ///               `None` for every other decision).
     ///   Admit       the claim is written (now); the caller must now run the push and debit it
     ///               (`begin_admitted()` / `complete()`).
     [[nodiscard]] Decision decide(const std::string& agent_id, std::uint64_t agent_gen,
-                                  std::uint64_t current) {
+                                  std::uint64_t current, ShedCause* cause = nullptr) {
+        if (cause != nullptr)
+            *cause = ShedCause::None;
         std::lock_guard lk(mu_);
         const auto now = clock_();
         auto it = claims_.find(agent_id);
@@ -222,10 +240,15 @@ public:
             return Decision::RateLimited;
         if (in_flight_.load(std::memory_order_relaxed) >= opts_.max_in_flight) {
             in_flight_shed_.fetch_add(1, std::memory_order_relaxed);
+            if (cause != nullptr)
+                *cause = ShedCause::InFlightCap;
             return Decision::Shed;
         }
-        if (!budget_.try_admit())
+        if (!budget_.try_admit()) {
+            if (cause != nullptr)
+                *cause = ShedCause::Budget;
             return Decision::Shed;
+        }
         if (it != claims_.end())
             it->second = now;  // find() result is still valid: nothing inserted since
         else
@@ -247,13 +270,6 @@ public:
             in_flight_.fetch_sub(1, std::memory_order_relaxed);
             throw;
         }
-    }
-
-    /// Forget `agent_id`'s claim. For an Admit that did not turn into a push (the agent has
-    /// no session): the agent earned no holdoff, so it must not be rate-limited.
-    void release(const std::string& agent_id) {
-        std::lock_guard lk(mu_);
-        claims_.erase(agent_id);
     }
 
     /// Pushes between `begin_admitted()` and the destruction of their `Scoped`.

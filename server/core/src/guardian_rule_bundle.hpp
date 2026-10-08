@@ -43,14 +43,26 @@
 ///   - ONE bundle is held (the most recently loaded). A request for a different
 ///     generation reloads and replaces it, including a LOWER generation (a store reset
 ///     is not hidden).
-///   - A failed load is NOT cached. Every waiter of that load receives the error, and
-///     the next call loads again. The error carries which read degraded so the caller
-///     can take its existing per-source degraded branch and audit wording.
+///   - A failed load is never INSTALLED as the held bundle. Every waiter of that load
+///     receives the error. The error carries which read degraded so the caller can take its
+///     existing per-source degraded branch and audit wording. The failure IS remembered for a
+///     short `negative_ttl` (default 1 s, measured from when the load FINISHED): a call for
+///     the same generation inside that window returns the remembered error without running
+///     the loader, so a store that is failing slowly is probed about once per window instead
+///     of by every admitted push (each probe can cost seconds). One failure slot is kept (a
+///     failure for another generation replaces it), a success clears it, and `invalidate()`
+///     clears it (a load already in flight when `invalidate()` runs does not re-populate it).
+///   - An expired bundle (older than `max_age`) is NEVER served when its reload fails: the
+///     caller gets the error and aborts the reconcile. That is a deliberate trade, fail
+///     closed over stale: serving rules that may be out of date by a failed bump would
+///     enforce a policy the operator has since changed.
 ///   - SINGLE FLIGHT per generation: concurrent `get(g)` calls share one load through a
 ///     `std::shared_future`. Callers asking for a different generation than a running
 ///     load do not wait on it; they load their own. Loads are never run under the cache
 ///     mutex. A waiter blocks for at most `max_wait` and then receives an error (source
 ///     `other`, "timed out waiting for in-flight load"); the loading thread is unaffected.
+///     `get()` can report how long THIS call spent blocked that way (see its `waited`
+///     parameter) so the caller can keep another thread's load out of its own cost.
 ///   - The cache hands out `std::shared_ptr<const Bundle>`. A reload replaces the held
 ///     pointer but cannot invalidate a bundle an in-flight push still holds.
 ///   - A loader that throws is converted to a `BundleLoadError` with source `other`. The
@@ -61,8 +73,11 @@
 ///   - A held bundle older than `max_age` is a miss (see the safety invariant).
 ///
 /// CLOCK INJECTION. `ClockFn` is `std::function<std::chrono::steady_clock::time_point()>`;
-/// null selects the real steady clock. It is called under the internal mutex and must not
-/// call back into the cache. A bundle's age is measured from when its load STARTED. A clock
+/// null selects the real steady clock. It is called under the internal mutex (and, to time a
+/// wait, outside it) and must be thread-safe and not call back into the cache. A bundle's age
+/// is measured from when its load STARTED, the conservative end of the read's age, so a load that
+/// itself takes longer than `max_age` is stale on arrival and is reloaded by the next call
+/// (deliberate: its rows may be that old). Pinned by a test that advances the clock inside the loader. A clock
 /// that moves backwards leaves the bundle fresh. Tests inject a manual clock and a loader
 /// that blocks on an event, so nothing sleeps.
 ///
@@ -72,6 +87,7 @@
 ///
 /// Thread-safe. A `const Bundle` is immutable and may be read from any thread.
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <exception>
@@ -160,6 +176,9 @@ struct GuardianRuleBundleCacheConfig {
     std::chrono::milliseconds max_age{60'000};
     /// Longest a waiter blocks on another thread's in-flight load.
     std::chrono::milliseconds max_wait{5'000};
+    /// How long a FAILED load for a generation is remembered (see the header). Zero
+    /// disables the negative cache.
+    std::chrono::milliseconds negative_ttl{1'000};
 };
 
 class GuardianRuleBundleCache {
@@ -180,15 +199,25 @@ public:
     /// The bundle for exactly `generation`, loading it if the held bundle is for a
     /// different generation or is older than `max_age`. See the header for the ordering
     /// requirement on callers.
-    [[nodiscard]] Result get(std::uint64_t generation, const LoaderFn& loader) {
+    ///
+    /// `waited`, when given, is set to the time THIS call spent blocked waiting on another
+    /// thread's in-flight load: zero for a cache hit, a remembered failure, and for the
+    /// thread that runs the loader itself (its load time is its own cost, not a wait).
+    [[nodiscard]] Result get(std::uint64_t generation, const LoaderFn& loader,
+                             std::chrono::nanoseconds* waited = nullptr) {
+        if (waited != nullptr)
+            *waited = std::chrono::nanoseconds{0};
         std::shared_future<Result> waiting;
         std::shared_ptr<std::promise<Result>> promise;
         Clock::time_point started;
+        std::uint64_t epoch = 0;
         {
             std::lock_guard lk(mu_);
             const auto now = clock_();
             if (held_ && held_->generation == generation && fresh_locked(now))
                 return held_;
+            if (failed_ && failed_->generation == generation && negative_fresh_locked(now))
+                return std::unexpected(failed_->error);
             if (const auto it = inflight_.find(generation); it != inflight_.end()) {
                 waiting = it->second;
             } else {
@@ -196,25 +225,35 @@ public:
                 inflight_.emplace(generation, promise->get_future().share());
                 ++loads_;
                 started = now;
+                epoch = epoch_;
             }
         }
-        if (waiting.valid())
-            return wait_for_flight(waiting);
+        if (waiting.valid()) {
+            const auto t0 = clock_();
+            Result r = wait_for_flight(waiting);
+            if (waited != nullptr)
+                *waited = std::max(std::chrono::duration_cast<std::chrono::nanoseconds>(clock_() - t0),
+                                   std::chrono::nanoseconds{0});
+            return r;
+        }
 
         // The registered flight is completed (erased) unconditionally by the guard.
         FlightGuard flight{*this, generation};
         Result r = run_loader(generation, loader);
-        install(r, started);
+        install(r, generation, started, epoch);
         flight.fulfil(*promise, r);
         return r;
     }
 
-    /// Drop the held bundle (called when the generation was just bumped locally, and by
-    /// tests). A load in flight still completes and installs, and is still stamped with its
-    /// own generation.
+    /// Drop the held bundle and any remembered failure (called when the generation was just
+    /// bumped locally, and by tests). A load in flight still completes and installs its
+    /// bundle, stamped with its own generation; if it FAILS it does not repopulate the
+    /// remembered failure.
     void invalidate() {
         std::lock_guard lk(mu_);
         held_.reset();
+        failed_.reset();
+        ++epoch_;
     }
 
     /// Number of loads started (single-flight waiters and cache hits do not count).
@@ -239,15 +278,35 @@ private:
                cfg_.max_age;
     }
 
+    bool negative_fresh_locked(Clock::time_point now) const {
+        if (now <= failed_->at)
+            return true;  // clock did not advance (or went backwards)
+        return std::chrono::duration_cast<std::chrono::milliseconds>(now - failed_->at) <
+               cfg_.negative_ttl;
+    }
+
     // Never throws: a failure here only means the next get() loads again.
-    void install(const Result& r, Clock::time_point started) noexcept {
+    void install(const Result& r, std::uint64_t generation, Clock::time_point started,
+                 std::uint64_t epoch) noexcept {
         try {
             std::lock_guard lk(mu_);
-            if (r.has_value()) {  // failed loads are never installed
+            if (r.has_value()) {
                 held_ = *r;
                 held_at_ = started;
+                failed_.reset();
+            } else if (epoch == epoch_ && cfg_.negative_ttl.count() > 0) {
+                // A failed load is never the held bundle; it is remembered only so the next
+                // calls in the window do not each re-run a slow, failing loader. Stamped with
+                // the time the load FINISHED, otherwise a load slower than the TTL would
+                // expire its own entry before it was stored.
+                failed_ = Failure{generation, r.error(), clock_()};
             }
         } catch (...) {
+            try {
+                std::lock_guard lk(mu_);
+                failed_.reset();  // do not keep an entry that may be half-assigned
+            } catch (...) {
+            }
         }
     }
 
@@ -327,9 +386,17 @@ private:
         }
     }
 
+    struct Failure {
+        std::uint64_t generation;
+        BundleLoadError error;
+        Clock::time_point at;
+    };
+
     const Config cfg_;
     const ClockFn clock_;
     mutable std::mutex mu_;
+    std::optional<Failure> failed_;
+    std::uint64_t epoch_{0};
     std::shared_ptr<const Bundle> held_;
     Clock::time_point held_at_{};
     std::map<std::uint64_t, std::shared_future<Result>> inflight_;

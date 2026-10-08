@@ -5,8 +5,10 @@
  */
 
 #include "guardian_push_builder.hpp"  // load_reconcile_bundle
+#include "guardian_reconcile_gate.hpp"
 #include "guardian_rule_bundle.hpp"
 
+#include <catch2/catch_approx.hpp>
 #include <catch2/catch_test_macros.hpp>
 
 #include <atomic>
@@ -78,6 +80,41 @@ struct ManualClock {
         return [this] { return now(); };
     }
 };
+
+// A manual clock that counts its reads, so a test can wait until a thread has read it (which
+// proves that thread has reached a known point) without sleeping.
+struct CountingClock {
+    ManualClock base;
+    std::mutex m;
+    std::condition_variable cv;
+    int calls{0};
+    GuardianRuleBundleCache::Clock::time_point now() {
+        GuardianRuleBundleCache::Clock::time_point t;
+        {
+            std::lock_guard lk(m);
+            t = base.now();  // read BEFORE the count is published, so a waiter that sees the
+            ++calls;         // count knows this reading is already fixed
+        }
+        cv.notify_all();
+        return t;
+    }
+    void wait_for_calls(int n) {
+        std::unique_lock lk(m);
+        cv.wait(lk, [&] { return calls >= n; });
+    }
+    GuardianRuleBundleCache::ClockFn fn() {
+        return [this] { return now(); };
+    }
+};
+
+GuardianRuleBundleCache::LoaderFn failing_loader(std::atomic<int>& calls,
+                                                 std::string detail = "store down") {
+    return [&calls, detail = std::move(detail)] {
+        calls.fetch_add(1);
+        return std::expected<Bundle, BundleLoadError>(
+            std::unexpected(BundleLoadError{BundleLoadError::Source::rules, detail}));
+    };
+}
 
 }  // namespace
 
@@ -160,8 +197,10 @@ TEST_CASE("GuardianRuleBundleCache: never serves a bundle for a different genera
     CHECK(calls.load() == 3);
 }
 
-TEST_CASE("GuardianRuleBundleCache: a failed load is not cached", "[guardian][rule_bundle]") {
-    GuardianRuleBundleCache cache;
+TEST_CASE("GuardianRuleBundleCache: a failed load is never held and is retried after the negative ttl",
+          "[guardian][rule_bundle]") {
+    ManualClock clk;
+    GuardianRuleBundleCache cache({.negative_ttl = 1s}, clk.fn());
     std::atomic<int> calls{0};
     const GuardianRuleBundleCache::LoaderFn failing = [&calls] {
         calls.fetch_add(1);
@@ -172,15 +211,115 @@ TEST_CASE("GuardianRuleBundleCache: a failed load is not cached", "[guardian][ru
     REQUIRE_FALSE(r.has_value());
     CHECK(r.error().source == BundleLoadError::Source::deployed);  // source preserved
     CHECK(r.error().detail == "baseline store down");
-    CHECK_FALSE(cache.held_generation().has_value());
+    CHECK_FALSE(cache.held_generation().has_value());  // never installed as the held bundle
+    clk.advance(1s);  // the negative entry has expired
     auto again = cache.get(3, failing);
     CHECK_FALSE(again.has_value());
-    CHECK(calls.load() == 2);  // retried, not served from a negative cache
+    CHECK(calls.load() == 2);  // retried after the ttl
 
+    clk.advance(1s);
     std::atomic<int> ok_calls{0};
     auto ok = cache.get(3, counting_loader(ok_calls, "ok"));
     REQUIRE(ok.has_value());
     CHECK(cache.held_generation() == 3);
+}
+
+TEST_CASE("GuardianRuleBundleCache: a failed load is remembered for negative_ttl without re-running the loader",
+          "[guardian][rule_bundle][negative]") {
+    ManualClock clk;
+    GuardianRuleBundleCache cache({.negative_ttl = 1s}, clk.fn());
+    std::atomic<int> calls{0};
+    const auto failing = failing_loader(calls, "rules down");
+
+    auto first = cache.get(5, failing);
+    REQUIRE_FALSE(first.has_value());
+    CHECK(calls.load() == 1);
+    CHECK(cache.loads() == 1);
+
+    clk.advance(900ms);
+    std::chrono::nanoseconds waited{-1};
+    auto within = cache.get(5, failing, &waited);
+    REQUIRE_FALSE(within.has_value());
+    CHECK(within.error().source == BundleLoadError::Source::rules);  // the SAME error
+    CHECK(within.error().detail == "rules down");
+    CHECK(calls.load() == 1);      // the loader did not run
+    CHECK(cache.loads() == 1);
+    CHECK(waited == 0ns);          // a remembered failure is not a wait
+
+    clk.advance(100ms);  // exactly negative_ttl since the failure: expired
+    CHECK_FALSE(cache.get(5, failing).has_value());
+    CHECK(calls.load() == 2);  // retried
+}
+
+TEST_CASE("GuardianRuleBundleCache: the negative cache is per generation and cleared by success or invalidate",
+          "[guardian][rule_bundle][negative]") {
+    ManualClock clk;
+    GuardianRuleBundleCache cache({.negative_ttl = 10s}, clk.fn());
+    std::atomic<int> fail_calls{0}, ok_calls{0};
+    const auto failing = failing_loader(fail_calls);
+
+    REQUIRE_FALSE(cache.get(1, failing).has_value());
+    REQUIRE(fail_calls.load() == 1);
+
+    SECTION("another generation is unaffected") {
+        auto other = cache.get(2, counting_loader(ok_calls, "two"));
+        REQUIRE(other.has_value());
+        CHECK(ok_calls.load() == 1);
+        CHECK((*other)->generation == 2);
+    }
+    SECTION("invalidate clears the remembered failure") {
+        cache.invalidate();
+        auto r = cache.get(1, counting_loader(ok_calls, "one"));
+        REQUIRE(r.has_value());
+        CHECK(ok_calls.load() == 1);
+    }
+    SECTION("a success clears the remembered failure") {
+        REQUIRE(cache.get(2, counting_loader(ok_calls, "two")).has_value());
+        REQUIRE_FALSE(cache.get(1, failing).has_value());
+        CHECK(fail_calls.load() == 2);  // generation 1 was not answered from the old entry
+    }
+    SECTION("a failure for another generation replaces the single slot") {
+        REQUIRE_FALSE(cache.get(2, failing).has_value());
+        CHECK(fail_calls.load() == 2);
+        REQUIRE_FALSE(cache.get(1, failing).has_value());
+        CHECK(fail_calls.load() == 3);  // generation 1's entry was displaced, so it re-runs
+    }
+}
+
+TEST_CASE("GuardianRuleBundleCache: a load that fails after an invalidate does not repopulate the negative cache",
+          "[guardian][rule_bundle][negative]") {
+    ManualClock clk;
+    GuardianRuleBundleCache cache({.negative_ttl = 10s}, clk.fn());
+    Event entered, release;
+    std::atomic<int> calls{0};
+    const GuardianRuleBundleCache::LoaderFn slow_failing = [&] {
+        calls.fetch_add(1);
+        entered.set();
+        release.wait();
+        return std::expected<Bundle, BundleLoadError>(
+            std::unexpected(BundleLoadError{BundleLoadError::Source::rules, "late failure"}));
+    };
+    std::thread t([&] { (void)cache.get(8, slow_failing); });
+    entered.wait();
+    cache.invalidate();  // the bump landed while the old load was still running
+    release.set();
+    t.join();
+    REQUIRE(calls.load() == 1);
+
+    std::atomic<int> ok_calls{0};
+    auto r = cache.get(8, counting_loader(ok_calls, "after"));
+    REQUIRE(r.has_value());  // not answered from the pre-invalidate failure
+    CHECK(ok_calls.load() == 1);
+}
+
+TEST_CASE("GuardianRuleBundleCache: a zero negative_ttl disables the negative cache",
+          "[guardian][rule_bundle][negative]") {
+    GuardianRuleBundleCache cache({.negative_ttl = 0ms});
+    std::atomic<int> calls{0};
+    const auto failing = failing_loader(calls);
+    CHECK_FALSE(cache.get(1, failing).has_value());
+    CHECK_FALSE(cache.get(1, failing).has_value());
+    CHECK(calls.load() == 2);
 }
 
 TEST_CASE("GuardianRuleBundleCache: a failed load keeps the previously held bundle",
@@ -201,7 +340,7 @@ TEST_CASE("GuardianRuleBundleCache: a failed load keeps the previously held bund
 
 TEST_CASE("GuardianRuleBundleCache: a throwing or missing loader becomes an error",
           "[guardian][rule_bundle]") {
-    GuardianRuleBundleCache cache;
+    GuardianRuleBundleCache cache({.negative_ttl = 0ms});  // retries below must reach the loader
     auto r = cache.get(1, []() -> std::expected<Bundle, BundleLoadError> {
         throw std::runtime_error("kaboom");
     });
@@ -335,6 +474,34 @@ TEST_CASE("GuardianRuleBundleCache: a held bundle older than max_age is reloaded
     CHECK(calls.load() == 2);
 }
 
+TEST_CASE("GuardianRuleBundleCache: max_age is measured from when the load started, not when it finished",
+          "[guardian][rule_bundle]") {
+    ManualClock clk;
+    GuardianRuleBundleCache cache({.max_age = 10s}, clk.fn());
+    std::atomic<int> calls{0};
+    const auto loader_taking = [&](std::chrono::nanoseconds took) {
+        return GuardianRuleBundleCache::LoaderFn{[&calls, &clk, took] {
+            calls.fetch_add(1);
+            clk.advance(took);  // wall time passes INSIDE the load
+            return std::expected<Bundle, BundleLoadError>(make_bundle({rule("x", "")}, {"x"}));
+        }};
+    };
+
+    SECTION("a load that takes less than max_age is served until max_age after it STARTED") {
+        REQUIRE(cache.get(1, loader_taking(6s)).has_value());
+        REQUIRE(cache.get(1, loader_taking(6s)).has_value());  // age 6 s: a hit
+        CHECK(calls.load() == 1);
+        clk.advance(5s);  // 11 s after the start (5 s after it finished)
+        REQUIRE(cache.get(1, loader_taking(0s)).has_value());
+        CHECK(calls.load() == 2);  // already expired, though only 5 s old by the finish time
+    }
+    SECTION("a load slower than max_age is stale on arrival and is reloaded") {
+        REQUIRE(cache.get(1, loader_taking(11s)).has_value());
+        REQUIRE(cache.get(1, loader_taking(11s)).has_value());
+        CHECK(calls.load() == 2);
+    }
+}
+
 TEST_CASE("GuardianRuleBundleCache: an expired bundle is not served when its reload fails",
           "[guardian][rule_bundle]") {
     ManualClock clk;
@@ -378,7 +545,7 @@ TEST_CASE("GuardianRuleBundleCache: a waiter gives up after max_wait while the l
 
 TEST_CASE("GuardianRuleBundleCache: a loader that throws bad_alloc leaves the cache usable",
           "[guardian][rule_bundle]") {
-    GuardianRuleBundleCache cache;
+    GuardianRuleBundleCache cache({.negative_ttl = 0ms});  // the retry below must reach the loader
     auto r = cache.get(1, []() -> std::expected<Bundle, BundleLoadError> { throw std::bad_alloc(); });
     REQUIRE_FALSE(r.has_value());
     CHECK(r.error().source == BundleLoadError::Source::other);
@@ -386,6 +553,66 @@ TEST_CASE("GuardianRuleBundleCache: a loader that throws bad_alloc leaves the ca
     auto ok = cache.get(1, counting_loader(calls, "ok"));  // not waiting on a dead flight
     REQUIRE(ok.has_value());
     CHECK(calls.load() == 1);
+}
+
+TEST_CASE("GuardianRuleBundleCache: waited reports the time a blocked waiter spent, and zero for the owner and hits",
+          "[guardian][rule_bundle][waited]") {
+    CountingClock clk;
+    GuardianRuleBundleCache cache({}, clk.fn());
+    Event entered, release;
+    const GuardianRuleBundleCache::LoaderFn slow = [&] {
+        entered.set();
+        release.wait();
+        clk.base.advance(2s);  // the owner's load takes 2 s of (manual) wall time
+        return std::expected<Bundle, BundleLoadError>(make_bundle({rule("x", "")}, {"x"}));
+    };
+
+    std::chrono::nanoseconds owner_waited{-1};
+    std::thread owner([&] { (void)cache.get(4, slow, &owner_waited); });
+    entered.wait();  // the flight is registered; the owner has read the clock once
+
+    std::chrono::nanoseconds waiter_waited{-1};
+    std::thread waiter([&] { (void)cache.get(4, slow, &waiter_waited); });
+    // Under the lock (read 2) and just before blocking (read 3): the waiter is about to block.
+    clk.wait_for_calls(3);
+    clk.base.advance(3s);  // 3 s pass while the waiter is blocked
+    release.set();
+    owner.join();
+    waiter.join();
+
+    CHECK(owner_waited == 0ns);  // the owner's load time is its own cost, not a wait
+    // Blocked from before the 3 s advance until after the owner's own 2 s of loading.
+    CHECK(waiter_waited == 5s);
+
+    std::chrono::nanoseconds hit_waited{-1};
+    REQUIRE(cache.get(4, slow, &hit_waited).has_value());
+    CHECK(hit_waited == 0ns);
+}
+
+TEST_CASE("GuardianRuleBundleCache: the owner's load time stays in the push's debit, only a wait is excluded",
+          "[guardian][rule_bundle][waited]") {
+    // The server wiring in miniature: a Scoped from the gate, the cache's `waited` excluded.
+    ManualClock clk;
+    GuardianReconcileBudget budget({.budget_ms_per_s = 100.0, .burst_ms = 1000.0, .max_per_s = 1000},
+                                   clk.fn());
+    GuardianReconcileGate gate(budget, clk.fn());
+    GuardianRuleBundleCache cache({}, clk.fn());
+    REQUIRE(budget.balance_ms() == Catch::Approx(1000.0));
+
+    const GuardianRuleBundleCache::LoaderFn slow_load = [&] {
+        clk.advance(200ms);  // list_rules + deployed ids took 200 ms
+        return std::expected<Bundle, BundleLoadError>(make_bundle({rule("x", "")}, {"x"}));
+    };
+    {
+        auto admitted = gate.begin_admitted();
+        std::chrono::nanoseconds waited{0};
+        REQUIRE(cache.get(1, slow_load, &waited).has_value());
+        admitted.exclude(waited);
+        CHECK(waited == 0ns);
+    }
+    // The balance started at the burst cap, so the refill adds nothing; the owner's 200 ms
+    // load was charged in full.
+    CHECK(budget.balance_ms() == Catch::Approx(800.0));
 }
 
 namespace {

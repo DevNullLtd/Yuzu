@@ -35,6 +35,32 @@ struct ManualClock {
     }
 };
 
+// A manual clock that counts its reads, so a test can wait until a thread has read it (which
+// proves that thread has reached a known point) without sleeping.
+struct CountingClock {
+    ManualClock base;
+    std::mutex m;
+    std::condition_variable cv;
+    int calls{0};
+    GuardianGenerationCache::Clock::time_point now() {
+        GuardianGenerationCache::Clock::time_point t;
+        {
+            std::lock_guard lk(m);
+            t = base.now();
+            ++calls;
+        }
+        cv.notify_all();
+        return t;
+    }
+    void wait_for_calls(int n) {
+        std::unique_lock lk(m);
+        cv.wait(lk, [&] { return calls >= n; });
+    }
+    GuardianGenerationCache::ClockFn fn() {
+        return [this] { return now(); };
+    }
+};
+
 // One-shot event.
 class Event {
 public:
@@ -357,8 +383,71 @@ TEST_CASE("GuardianGenerationCache: get_fresh reports a failed read and does not
     auto r = c.get_fresh();
     REQUIRE_FALSE(r.has_value());
     CHECK(r.error() == "store degraded");
-    // The failure is now the cached outcome (negative TTL), not the old success.
-    CHECK_FALSE(c.get().has_value());
+    // The error went to the caller only: a transient failure on an admitted push must not
+    // make every get() report degraded, so the prior good entry is still served, unfetched.
+    auto still = c.get();
+    REQUIRE(still.has_value());
+    CHECK(*still == 5);
+    CHECK(f.calls.load() == 2);  // the initial get and the failed get_fresh; get() hit the cache
+}
+
+TEST_CASE("GuardianGenerationCache: a failed get_fresh installs nothing when the cache is empty",
+          "[guardian][generation_cache]") {
+    ManualClock clk;
+    ScriptedFetch f;
+    GuardianGenerationCache c(f.fn(), {}, clk.fn());
+    f.fail = true;
+    REQUIRE_FALSE(c.get_fresh().has_value());
+    f.fail = false;
+    // No negative entry was left behind, so the very next get() reads the store and succeeds.
+    auto r = c.get();
+    REQUIRE(r.has_value());
+    CHECK(*r == 5);
+    CHECK(f.calls.load() == 2);
+}
+
+TEST_CASE("GuardianGenerationCache: an older read finishing last does not overwrite a newer one",
+          "[guardian][generation_cache]") {
+    ManualClock clk;
+    Event older_entered, release_older;
+    std::atomic<int> calls{0};
+    GuardianGenerationCache c(
+        [&]() -> GuardianGenerationCache::Result {
+            if (calls.fetch_add(1) == 0) {  // the older read: blocks, then reports the LOWER value
+                older_entered.set();
+                release_older.wait();
+                return 7;
+            }
+            return 8;
+        },
+        {}, clk.fn());
+
+    std::uint64_t older = 0;
+    std::thread t([&] { older = c.get_fresh().value(); });
+    older_entered.wait();
+    clk.advance(1s);  // the second read starts strictly later
+    REQUIRE(c.get_fresh().value() == 8);
+    release_older.set();
+    t.join();
+
+    CHECK(older == 7);            // its own caller still gets what it read
+    CHECK(c.get().value() == 8);  // but the cache holds the newer read
+    CHECK(calls.load() == 2);
+    CHECK(c.regressions() == 0);  // the older, lower read is not a store reset
+}
+
+TEST_CASE("GuardianGenerationCache: a newer read that returns a lower value is a store reset",
+          "[guardian][generation_cache]") {
+    ManualClock clk;
+    ScriptedFetch f;
+    GuardianGenerationCache c(f.fn(), {}, clk.fn());
+    f.value = 9;
+    REQUIRE(c.get_fresh().value() == 9);
+    clk.advance(1s);
+    f.value = 4;  // the store was reset
+    REQUIRE(c.get_fresh().value() == 4);
+    CHECK(c.regressions() == 1);
+    CHECK(c.get().value() == 4);  // installed, not hidden
 }
 
 TEST_CASE("GuardianGenerationCache: an invalidate during get_fresh is not undone by it",
@@ -452,7 +541,7 @@ TEST_CASE("GuardianGenerationCache: get() racing a throwing flight never hangs",
           "[guardian][generation_cache]") {
     // A waiter registered on a flight whose fetch throws must wake with an error, not block
     // for max_wait or forever.
-    ManualClock clk;
+    CountingClock clk;
     Event entered, release;
     std::atomic<int> calls{0};
     GuardianGenerationCache c(
@@ -469,6 +558,10 @@ TEST_CASE("GuardianGenerationCache: get() racing a throwing flight never hangs",
     entered.wait();
     GuardianGenerationCache::Result waiter = std::unexpected(std::string("unset"));
     std::thread w([&] { waiter = c.get(); });
+    // get() reads the clock (read 2; the leader's was read 1) in the same critical section in
+    // which it finds the flight registered, and the leader cannot clear the flight without that
+    // lock. So once the read is seen the waiter is on the flight: no race with the release.
+    clk.wait_for_calls(2);
     release.set();
     leader.join();
     w.join();

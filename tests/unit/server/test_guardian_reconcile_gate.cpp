@@ -722,17 +722,68 @@ TEST_CASE("GuardianReconcileGate: a moved-from Scoped does not release a slot tw
     CHECK(gate.in_flight() == 0);
 }
 
-TEST_CASE("GuardianReconcileGate: release erases only that agent's claim",
+TEST_CASE("GuardianReconcileGate: an Admit whose push never sends keeps its claim",
           "[guardian][reconcile_gate]") {
+    // The no_session path: an agent that Registered but did not Subscribe heartbeats generation
+    // 0 in a loop. The caller is admitted, finds no session, and finishes WITHOUT pushing. The
+    // claim must stay: if the gate forgot it, every such heartbeat would be a fresh admission
+    // and one credential could drain the shared budget. (There is deliberately no release API.)
     ManualClock clk;
     GuardianReconcileBudget budget(roomy(), clk.fn());
     GuardianReconcileGate gate(budget, clk.fn());
 
-    REQUIRE(gate.decide("a", kBehind, kCurrent) == Decision::Admit);
-    REQUIRE(gate.decide("b", kBehind, kCurrent) == Decision::Admit);
-    gate.release("a");
-    gate.release("never-seen");  // harmless
+    REQUIRE(gate.decide("ghost", kBehind, kCurrent) == Decision::Admit);
+    {
+        auto admitted = gate.begin_admitted();  // the push runs and ends with nothing sent
+    }
+    const auto admissions = budget.admitted_total();
     CHECK(gate.claims_size() == 1);
-    CHECK(gate.decide("b", kBehind, kCurrent) == Decision::RateLimited);  // untouched
-    CHECK(gate.decide("a", kBehind, kCurrent) == Decision::Admit);        // not rate-limited
+
+    // Within the interval every further heartbeat is rate-limited, however many arrive.
+    for (int i = 0; i < 1000; ++i) {
+        clk.advance(10ms);
+        REQUIRE(gate.decide("ghost", 0, kCurrent) == Decision::RateLimited);
+    }
+    CHECK(budget.admitted_total() == admissions);  // the budget was never consulted again
+
+    clk.advance(25s);  // only after min_interval is the agent admitted again
+    CHECK(gate.decide("ghost", 0, kCurrent) == Decision::Admit);
+    CHECK(budget.admitted_total() == admissions + 1);
+}
+
+TEST_CASE("GuardianReconcileGate: decide reports which cause shed",
+          "[guardian][reconcile_gate]") {
+    using Cause = GuardianReconcileGate::ShedCause;
+    ManualClock clk;
+
+    SECTION("budget exhaustion") {
+        GuardianReconcileBudget budget(small_budget(), clk.fn());
+        GuardianReconcileGate gate(budget, clk.fn());
+        budget.debit(300ms);
+        Cause cause = Cause::InFlightCap;  // proves decide() overwrites it
+        CHECK(gate.decide("a", kBehind, kCurrent, &cause) == Decision::Shed);
+        CHECK(cause == Cause::Budget);
+    }
+    SECTION("in-flight cap") {
+        GuardianReconcileBudget budget(roomy(), clk.fn());
+        GuardianReconcileGate gate(budget, clk.fn(), 25s, {.max_in_flight = 1});
+        REQUIRE(gate.decide("a", kBehind, kCurrent) == Decision::Admit);
+        auto held = gate.begin_admitted();
+        Cause cause = Cause::None;
+        CHECK(gate.decide("b", kBehind, kCurrent, &cause) == Decision::Shed);
+        CHECK(cause == Cause::InFlightCap);
+    }
+    SECTION("any other decision reports None") {
+        GuardianReconcileBudget budget(roomy(), clk.fn());
+        GuardianReconcileGate gate(budget, clk.fn());
+        Cause cause = Cause::Budget;
+        CHECK(gate.decide("a", kBehind, kCurrent, &cause) == Decision::Admit);
+        CHECK(cause == Cause::None);
+        cause = Cause::Budget;
+        CHECK(gate.decide("a", kBehind, kCurrent, &cause) == Decision::RateLimited);
+        CHECK(cause == Cause::None);
+        cause = Cause::Budget;
+        CHECK(gate.decide("a", kCurrent, kCurrent, &cause) == Decision::Converged);
+        CHECK(cause == Cause::None);
+    }
 }

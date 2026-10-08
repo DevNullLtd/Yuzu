@@ -14,15 +14,20 @@
 ///
 /// CONTRACT.
 ///   - `get()` returns the cached result while it is fresh: `ttl` for a success,
-///     `negative_ttl` for an error. A value up to `ttl` old is LOWER than or equal to the
-///     store's, never higher, so it is safe for a "has anything changed" decision (admit,
+///     `negative_ttl` for an error. Assuming a monotonic store, a value up to `ttl` old is
+///     LOWER than or equal to the store's, never higher, so it is safe for a "has anything changed" decision (admit,
 ///     rate-limit, shed, converged) but it is NOT safe to LABEL a push with: the push
 ///     content is read after the label, and a fan-out that already delivered a newer
 ///     generation would then be answered with older content under an older label. A caller
 ///     that is about to send must use `get_fresh()`.
-///   - `get_fresh()` ignores the TTL and any in-flight fetch, reads the store, and installs
-///     the result as the cached outcome (unless an `invalidate()` raced it). It is bounded
-///     by the caller's own admission control, not by single flight.
+///   - `get_fresh()` ignores the TTL and any in-flight fetch and reads the store. A SUCCESS
+///     is installed as the cached outcome (unless an `invalidate()` raced it); an ERROR is
+///     returned to the caller only and never installed, so one transient lease timeout on an
+///     admitted push cannot make every `get()` report degraded for `negative_ttl`. It is
+///     bounded by the caller's own admission control, not by single flight.
+///   - MONOTONIC INSTALL. A result is installed only if its read STARTED no earlier than the
+///     currently held entry's, so a read that started long ago and finishes last cannot
+///     overwrite a newer one (two `get_fresh()` calls, or a `get_fresh()` racing a `get()`).
 ///   - SINGLE FLIGHT. At most one thread runs the fetch at a time. While one is in
 ///     flight, a concurrent caller returns the previously cached SUCCESS (stale by at
 ///     most ttl plus the fetch time) if the last outcome was a success. If there is no
@@ -136,7 +141,7 @@ public:
             epoch = epoch_;
         }
         Result r = run_fetch();
-        install(r, started, epoch);
+        install(r, started, epoch, /*install_errors=*/false);
         return r;
     }
 
@@ -200,13 +205,20 @@ private:
         }
     }
 
-    // Record `r` as the cached outcome unless an invalidate() ran since `epoch`. Never throws:
-    // a failure here only means the next get() fetches again.
-    void install(const Result& r, Clock::time_point started, std::uint64_t epoch) noexcept {
+    // Record `r` as the cached outcome unless an invalidate() ran since `epoch`, or the held
+    // entry came from a read that started later than this one (monotonic install), or `r` is
+    // an error and `install_errors` is false. Never throws: a failure here only means the
+    // next get() fetches again.
+    void install(const Result& r, Clock::time_point started, std::uint64_t epoch,
+                 bool install_errors = true) noexcept {
         try {
             std::lock_guard lk(mu_);
             if (epoch != epoch_)
                 return;
+            if (!r.has_value() && !install_errors)
+                return;
+            if (entry_ && started < entry_->at)
+                return;  // an older read finishing last must not overwrite a newer one
             if (r.has_value()) {
                 if (last_served_ && *r < *last_served_)
                     ++regressions_;
