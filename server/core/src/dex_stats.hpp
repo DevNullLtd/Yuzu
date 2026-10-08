@@ -18,8 +18,8 @@
  *   - std::optional carries ONE meaning: "no statistic can be stated for these
  *     inputs" -- the input is invalid, the result is not representable as a
  *     finite double, or (rate ratios only) an arm lies outside the accuracy
- *     domain; dex_rate has no such ceiling (Wilson-Hilferty to INT64_MAX). It is
- *     never zero. (The single documented infinity is a rate ratio whose
+ *     domain; dex_rate has no such ceiling (Wilson-Hilferty to INT64_MAX).
+ *     nullopt never stands for zero. (The single documented infinity is a rate ratio whose
  *     denominator arm saw no events.)
  *   - A reliability flag is a label, never suppression: a statistic whose
  *     numerator saw fewer than kDexStatsReliableMinEvents (20) events (for a
@@ -31,16 +31,27 @@
  *
  * Consumer duties (this header does not enforce them; a surface must):
  *   - The floor is per cohort. Floor every cohort a surface shows, complements
- *     and nested or overlapping cohorts included: two cohorts that each clear
- *     the floor difference to a remainder below it. dex_proportion, dex_rate and
+ *     and nested or overlapping cohorts included. Flooring each shown cohort is
+ *     not enough: where one cohort contains others (a total and its parts, a
+ *     fleet and a group), the remainder (the total minus the parts shown) is a
+ *     cohort too, and a surface must not show a total with parts whose remainder
+ *     holds 1 to kDexCohortFloor - 1 devices; withhold or merge a part into the
+ *     remainder. The floor applies per cohort AND per time point (every point of
+ *     a trend is floored on its own). `devices` is the number of distinct
+ *     devices that contributed THE events and exposure passed alongside it,
+ *     counted in the same window: a count from another window or population
+ *     passes the floor and misstates the cohort. dex_proportion, dex_rate and
  *     dex_rate_ratio are unfloored primitives; there is no floored ratio helper,
  *     so floor each rate-ratio arm by DEVICES before calling (the ratio's own
  *     guard is on exposure, and one device over ten days passes it).
  *   - `reliable` means "not flagged as small-count", never "precise":
  *     dex_rate(20, 1.0) is [12.2, 30.9]. A ratio with a zero-event denominator
  *     is always unreliable. Print the interval beside the flag, and send an
- *     unbounded upper (+infinity) as null plus a typed flag. A consumer that
- *     only uses the bounds need not gate on `reliable`.
+ *     unbounded upper (+infinity) as null plus a typed flag, and send every
+ *     estimate and bound at full double precision, not through a fixed
+ *     two-decimal formatter such as the REST JObj::add(double) (a rate under
+ *     0.005 prints as 0.00 there). A consumer that only uses the bounds need not
+ *     gate on `reliable`.
  *   - 95 percent coverage assumes independent Poisson events (independent
  *     trials for a proportion). Events clustered on one crash-looping device
  *     make the interval falsely narrow.
@@ -70,11 +81,14 @@
  *     regularised incomplete beta, for every arm up to kDexRateRatioMaxEvents,
  *     evaluated in double to within 2e-5 relative of the exact rational bounds
  *     for a libm whose log is within 1 ulp. The worst measured, 1.1e-5 at an arm
- *     of 1 against about 9.8e8, is deterministic double quantisation of the
- *     conditional proportion near 1, not libm variation (four libms agree to
- *     3e-16; the MSVC runtime is unmeasured). Arms of 2 or more measured 2.8e-6
- *     at worst, and about 1e-9 at 1e6 against 1. Above the limit no ratio is
- *     produced.
+ *     of 1 against about 9.8e8, comes from the conditional proportion sitting
+ *     2.6e-11 from 1, where one ulp is 4e-6 relative in the odds: about 2e-6 is
+ *     rounding it to the nearest double, the rest is the kernel's own 2 to 3 ulp
+ *     error in it, which moves with the libm's log (a 1-ulp change of log gives
+ *     2e-6 here; four libms measured agree to 3e-16; the MSVC runtime is
+ *     unmeasured). Arms of 2 or more measured 2.8e-6 at worst; an arm of 1
+ *     against 1e6 is about 1e-9, the error growing with the large arm. Above the
+ *     limit no ratio is produced.
  *   - A kernel that cannot converge inside kDexStatsMaxIterations returns NaN,
  *     quantiles propagate it, and every public function that computes an
  *     interval ends with a finiteness check: a statistic is never returned
@@ -113,7 +127,7 @@ inline constexpr std::int64_t kDexStatsReliableMinEvents = 20;
 inline constexpr double kDexRateRatioMinExposure = static_cast<double>(kDexCohortFloor);
 
 /// Largest event count dex_rate serves with the exact Poisson kernels. They need
-/// about 7.4 * sqrt(k) iterations (7413 at one million); above it dex_rate uses
+/// about 7.4 * sqrt(k) iterations (7,413 at one million); above it dex_rate uses
 /// closed-form bounds. Rate ratios have their own limit, kDexRateRatioMaxEvents.
 inline constexpr std::int64_t kDexStatsExactMaxEvents = 1'000'000;
 
@@ -128,7 +142,7 @@ inline constexpr std::int64_t kDexRateRatioMaxEvents = 1'000'000'000;
 
 /// Iteration cap of the series / continued fractions: about 2x the measured
 /// peaks over both exact domains (gamma 7,413 at one million events; beta
-/// 22,000-25,700 near 25,000-34,000 against 1e9, moving by a few thousand with
+/// 21,000-25,700 near 25,000-34,000 against 1e9, moving by a few thousand with
 /// the arms and the search path). Hitting it is a convergence failure (NaN),
 /// never a result.
 inline constexpr int kDexStatsMaxIterations = 50000;
@@ -215,7 +229,7 @@ inline double regularized_gamma_p(double a, double x, int max_iter = kDexStatsMa
 
 /// Continued fraction of the incomplete beta: modified Lentz (Lentz 1976) in the
 /// Numerical Recipes betacf form, whence qab / qap / qam (a + b, a + 1, a - 1),
-/// aa (the even / odd coefficient) and bt. NaN on cap.
+/// aa (the even / odd coefficient). NaN on cap.
 inline double beta_fraction(double x, double a, double b, int max_iter) {
     const double qab = a + b;
     const double qap = a + 1.0;
@@ -431,12 +445,11 @@ struct DexInterval {
 /// refusal at the edge of the accuracy domain, not an invalid count; dex_rate has
 /// no such ceiling), an exposure is non-finite or below kDexRateRatioMinExposure,
 /// both counts are zero (no conditional distribution), or a result is not
-/// representable. events_b == 0
-/// with events_a > 0 gives ratio and upper of +infinity (the data are valid; the
-/// lower bound is finite). A reliable == false ratio is printed as indicative,
-/// never hidden. The exposure guard is on exposure, not devices, and there is no
-/// floored ratio helper: a surface applies the device floor to each arm before
-/// calling.
+/// representable. events_b == 0 with events_a > 0 gives ratio and upper of
+/// +infinity (the data are valid; the lower bound is finite). A reliable ==
+/// false ratio is printed as indicative, never hidden. The exposure guard is on
+/// exposure, not devices, and there is no floored ratio helper: a surface
+/// applies the device floor to each arm before calling.
 [[nodiscard]] inline std::optional<DexInterval>
 dex_rate_ratio(std::int64_t events_a, double exposure_a, std::int64_t events_b, double exposure_b) {
     constexpr double kInf = std::numeric_limits<double>::infinity();
@@ -473,6 +486,12 @@ dex_rate_ratio(std::int64_t events_a, double exposure_a, std::int64_t events_b, 
 /// events are the behaviour the floor withholds. `below_floor` says why `stats`
 /// is absent; `stats` absent with `below_floor` false means invalid input or an
 /// unrepresentable result, which a consumer counts as a computation failure.
+/// The floor is checked before the inputs: an invalid pair below the floor, and
+/// devices == 0, report below_floor true and nothing else, so the
+/// computation-failure count in the file banner never includes an invalid pair
+/// below the floor. A surface that also prints a statistic whose helper checks
+/// validity before its floor maps the two withheld reasons onto one vocabulary
+/// itself.
 struct DexFloored {
     std::int64_t devices;
     bool below_floor;

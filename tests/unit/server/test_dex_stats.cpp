@@ -11,8 +11,8 @@
  *  - Intervals match published tables (Newcombe 1998 Table I for Wilson;
  *    Garwood 1936 limits for the exact Poisson interval) AND an independent
  *    high-precision computation (Python Decimal bisection on the exact
- *    Poisson / binomial CDF, 60 digits, 2026-10-07).
- *  - The exact Poisson kernels and the large-count closed forms agree at the
+ *    Poisson / binomial CDF, 60 to 90 digits, stated per case, 2026-10-07).
+ *  - The exact Poisson kernels and the large-count approximations agree at the
  *    switch, rate ratios stay exact (Clopper-Pearson) up to their own limit and
  *    return nothing beyond it, and nothing returns a statistic after a
  *    convergence failure or overflow.
@@ -116,8 +116,8 @@ TEST_CASE("DexStats: exact and large-count Poisson bounds agree at the switch", 
     CHECK(past->upper - at->upper == Approx(1.0).margin(0.01));
 
     // Dispatch boundary, with literal counts so a moved cutoff cannot move the
-    // inputs with it: exact kernels up to one million events, closed forms past
-    // it. The tolerance absorbs rounding differences between the inlined and
+    // inputs with it: exact kernels up to one million events, the approximation
+    // past it. The tolerance absorbs rounding differences between the inlined and
     // direct evaluations; a moved cutoff differs by about 1.5e-11 relative.
     CHECK(kDexStatsExactMaxEvents == 1'000'000);
     const auto on_cut = dex_rate(1'000'000, 1.0);
@@ -266,8 +266,9 @@ TEST_CASE("DexStats: dex_rate bounds satisfy the Poisson tail definition", "[dex
     // Independent of any table: the upper bound leaves alpha/2 in the lower
     // tail P(X <= k) and the lower bound leaves alpha/2 in P(X >= k). The
     // tolerance is 1e-7, not tighter: the oracle's pmf uses std::lgamma, which
-    // at k = 1e6 (lgamma ~ 1.3e7) carries ~1e-9 relative error of its own, so a
-    // tighter bound would test the oracle rather than the kernel.
+    // at k = 1e6 (lgamma about 1.3e7) is only accurate to about 1e-9 absolute, a
+    // few 1e-9 relative in the pmf after exp, so a tighter bound would test the
+    // oracle rather than the kernel.
     for (std::int64_t k : {3, 100000, 1000000}) {
         const auto r = dex_rate(k, 1.0);
         REQUIRE(r);
@@ -339,9 +340,9 @@ TEST_CASE("DexStats: dex_rate_ratio one large arm matches the exact bounds", "[d
     // on the exact binomial CDF, 2026-10-07 (script not committed). A small arm
     // makes the tail a short sum: P(X <= a) = 1 - P(Y <= b - 1) with Y = n - X,
     // and P(X >= a) = 1 - P(X <= a - 1); for b = 1 or a = 1 the bounds have the
-    // closed forms p_U = 0.975^(1/n) and p_L = 1 - 0.975^(1/n). A closed-form
-    // Wilson stand-in is 86 percent low on the first row and 600 percent high
-    // on the second, which is what these rows pin. The 1e9-arm tolerance of 2e-5
+    // closed forms p_U = 0.975^(1/n) and p_L = 1 - 0.975^(1/n). A Wilson
+    // stand-in is 86 percent low on the first row and 600 percent high on the
+    // second, which is what these rows pin. The 1e9-arm tolerance of 2e-5
     // is the header banner's libm-dependent envelope, not this platform's
     // rounding; the 984,119,250 row sits at the worst point measured on one libm
     // (its want is the closed form, Decimal at 90 digits).
@@ -457,10 +458,11 @@ TEST_CASE("DexStats: dex_proportion exact edges do not rest on rounding luck", "
     CHECK(all->lower == near8(0.20654931437723742));
     CHECK(all->upper == 1.0);
     // The formula alone is not exact at the edges for every n and every compiler
-    // (unclamped it gives 2.8e-17 as the lower bound at 0/7 with floating-point
-    // contraction off, 1.4e-17 at 0/14 with it on, and 0.99999999999999989 as the
-    // upper bound at 10/10 or 25/25), yet both edges are exactly 0 and 1. The
-    // range is wide enough to catch the rounding on any contraction setting.
+    // (unclamped it gives a lower bound of a few 1e-17 at 0/7 and 0/14, the last
+    // digits moving with the floating-point contraction setting, and
+    // 0.99999999999999989 as the upper bound at 10/10 or 25/25), yet both edges
+    // are exactly 0 and 1. The range is wide enough to catch the rounding on any
+    // contraction setting.
     for (std::int64_t n = 1; n <= 40; ++n) {
         const auto lo = dex_proportion(0, n);
         const auto hi = dex_proportion(n, n);
@@ -540,6 +542,16 @@ TEST_CASE("DexStats: floored helpers clear the floor on devices alone and refuse
     CHECK(bad_r.below_floor);
     CHECK_FALSE(bad_r.stats);
 
+    // An empty cohort is below the floor, not a failure.
+    const auto empty_p = dex_floored_proportion(0, 0);
+    CHECK(empty_p.devices == 0);
+    CHECK(empty_p.below_floor);
+    CHECK_FALSE(empty_p.stats);
+    const auto empty_r = dex_floored_rate(0, 40.0, 0);
+    CHECK(empty_r.devices == 0);
+    CHECK(empty_r.below_floor);
+    CHECK_FALSE(empty_r.stats);
+
     // A negative device count must not reach the statistic (dex_rate(3, 40.0) is
     // valid) and must not read as "too few devices".
     for (const std::int64_t devices :
@@ -562,12 +574,13 @@ TEST_CASE("DexStats: a quantile does not number past a failed bracket evaluation
     CHECK(std::isnan(dex_stats_detail::gamma_quantile(1.0, 0.975, 1)));
 }
 
-TEST_CASE("DexStats: dex_rate_ratio converges at the slowest in-domain arms", "[dex][stats]") {
-    // 33,837 against 1e9 needs about 21,000 beta iterations in one quantile
-    // evaluation (the committed rows above need under 7,413), so a cap lowered
-    // below that silently turns a valid input into nullopt. Exact conditional
-    // bounds on the odds, equal exposures: Python Decimal (70 digits) bisection on
-    // the binomial CDF over N = 1,000,033,837 trials, 2026-10-07; the swapped
+TEST_CASE("DexStats: dex_rate_ratio converges at a slow large-arm pair", "[dex][stats]") {
+    // 33,837 against 1e9 needs about 21,000 beta iterations in one continued-
+    // fraction evaluation with fused multiply-add (about 200 without; 25,631
+    // against 999,996,012 needs about 25,600), so a cap lowered below that
+    // silently turns a valid input into nullopt. Exact conditional bounds on the
+    // odds, equal exposures: Python Decimal (70 digits) bisection on the
+    // binomial CDF over N = 1,000,033,837 trials, 2026-10-07; the swapped
     // orientation is the reciprocal of the other bound. The 2e-5 is the header's
     // envelope, not this platform's rounding.
     const auto r = dex_rate_ratio(33'837, 100.0, 1'000'000'000, 100.0);
