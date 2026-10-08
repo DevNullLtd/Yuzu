@@ -144,9 +144,10 @@ All start unchecked. Each gets its evidence link recorded here by PR-6.
         addressed in this doc-only PR; #4021 later persisted the legacy capture, and #4045
         persists the Spark capture (the runtime stages it and the engine writes it), so the
         `prefer_spark` half of this laundering path is closed for a healthy store, with the
-        residuals enumerated in AC-10 and in the design doc's section 24. DGRHP is one of this workstream's designated
-        `prefer_spark` test rigs (§6 step 1's own procedure opens with "confirm ... agent
-        running with `prefer_spark` active, spark armed" before any of this applies - the
+        residuals enumerated in AC-10 and in the design doc's section 24. DGRHP is one of
+        this workstream's designated `prefer_spark` test rigs (§6 step 1's own procedure
+        opens with "confirm ... agent running with `prefer_spark` active, spark armed"
+        before any of this applies - the
         "Shipped posture today" row above is about the production default, not these rigs),
         and this is now directly confirmed rather than inferred from the `RIGA-DEBUG` log
         prefix alone (a locally-patched debug line, not present in this repo's source tree,
@@ -1194,10 +1195,11 @@ flip, with a red-first test each:
     against a classifier that misidentifies a dead claim). The counter resets only in
     `begin_application()`/`retire()`. Because it re-arms every rule in the push, the forced
     Reapply (a) can recapture a Spark-first `FileHashEquals` baseline that was lost,
-    never written or overwritten (#4045, AC-10) and (b) while a same-type mechanism call is hung, can withdraw healthy same-type
-    siblings, after which every later push is a Reapply (AC-16). If the budget is already spent when a retained wedge's late success is
-    adopted, the next identical push is a forced Reapply of the just-armed rule: one wasted
-    teardown, never an acknowledgment.
+    never written or overwritten (#4045, AC-10) and (b) while a same-type mechanism call
+    is hung, can withdraw healthy same-type siblings, after which every later push is a
+    Reapply (AC-16). If the budget is already spent when a retained wedge's late success
+    is adopted, the next identical push is a forced Reapply of the just-armed rule: one
+    wasted teardown, never an acknowledgment.
   - (AC-10) **#4045 baseline relaunder, narrow.** Persisted baselines are re-seeded on
     every arm (`guardian_engine.cpp`, the arm-time re-seed), `apply_rules` writes the
     staged, not-yet-persisted Spark captures within its pass budget before it tears down
@@ -1217,8 +1219,9 @@ flip, with a red-first test each:
     written (a slow store, or more than roughly 2,000 to 3,000 waiting captures on a
     healthy one; logged, not counted), or the flush was skipped, either because a write
     that failed slowly ended at or after the start of that stop or because it could not
-    start within 15 s of it after an earlier shutdown step had failed or taken a busy
-    timeout (logged, not counted), or the 20 s shutdown watchdog ended the
+    start within 15 s of it after an earlier shutdown step had run slow, taking a full
+    busy timeout or more (a step that failed quickly is not such a sign; logged, not
+    counted), or the 20 s shutdown watchdog ended the
     process while the stop was still running (`hard_exit(4)`: the flush and the later
     shutdown steps are cut, a Windows service is restarted by the SCM, and no log line is
     written anywhere, so exit code 4 is the only evidence). A capture whose write is
@@ -2148,18 +2151,27 @@ since they're hardening ON TOP OF an already-correct #2818 fix, not a defect in 
   shutdown step, and its earlier stages (two journal flushes, the loss-ledger write, the
   worker join) are under no deadline of their own. #4045 took the stop mark before the
   engine mutex and skips ITS pass when that pass would start 15 s or more after the stop
-  began AND an earlier stage of that stop failed or took a busy timeout (a late start with
-  no such sign runs, because a healthy pass takes about a millisecond). What remains: the
-  pass's first write always runs (the wall is checked between tuples), so one that starts
-  just inside the cutoff can still spend a 5 s busy timeout, and a pass that runs its full
-  1 s wall before the store turns BUSY ends about 6 s after it started; a worker baseline
-  write in flight with a journal record pending measured 20 to 25 s (the in-flight write
-  plus a second write when the worker's 5 s retry backoff ends as journal flush 1 does);
-  the delivery worker's non-baseline KV writes serialise on `KvStore::mu_` and put their
-  own busy timeout in front of every stage (21.5 to 28.2 s, measured by a review harness
-  against a store that stays busy); and a stop that reaches the watchdog exits with code 4
-  and writes no log line. A remaining-deadline wall threaded through every stage was considered and
-  not done. Issue to be filed (TODO, no number yet).
+  began AND an earlier stage of that stop ran slow, at least a busy timeout (a stage that
+  failed quickly is not evidence; a late start with no slow stage runs, because a healthy
+  pass takes well under a millisecond per capture, though it can use its whole 1 s wall
+  plus one write and so run into the watchdog when it starts in the last second). What
+  remains: the pass's first write always runs (the wall is checked between tuples), so one
+  that starts just inside the cutoff can still spend a 5 s busy timeout, and a pass that
+  runs its full 1 s wall before the store turns BUSY ends about 6 s after it started; the
+  evidence is sampled by the earlier stages, so a store that turns BUSY only after them,
+  with the stop already 15 s late, still gets the pass attempted and the watchdog may cut
+  it (a reviewer reproduced 21.0 s; the capture is lost either way and the loss has no log
+  line); a worker baseline write in flight with a journal record pending measured 20 to
+  25 s (the in-flight write plus a second write when the worker's 5 s retry backoff ends
+  as journal flush 1 does); the delivery worker's non-baseline KV writes serialise on
+  `KvStore::mu_` and put their own busy timeout in front of every stage (21.5 to 28.2 s in
+  one review harness with 3 staged captures, 28.82 to 29.04 s in another with 5, against a
+  store that stays busy; arithmetic bound about 30 s); all rows were measured by
+  independent reviewers on the revision before the last one (the BUSY stages are slow under
+  either evidence rule), and the 10.01 s and 15.01 s rows were re-run on the final code
+  (3 staged, two runs each: 10.008 and 10.010 s; 15.011 and 15.014 s); and a stop that
+  reaches the watchdog exits with code 4 and writes no log line. A remaining-deadline wall
+  threaded through every stage was considered and not done. Issue to be filed (TODO, no number yet).
 - Owner: not assigned for any item above.
 - Milestone: pre-PR-5 hardening package (#4051/#4052/#4053) + three pre-PR-5 GATING items
   (guard.errored census recognition; the three sre observability gaps; the

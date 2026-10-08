@@ -111,20 +111,21 @@ namespace gpb = ::yuzu::guardian::v1;
 constexpr const char* kSessionMetadataKey = "x-yuzu-session-id";
 
 // #2233 item 3 ("S+"): ShutdownDeadlineGuard's grace period for both AgentImpl::stop()
-// and run()'s teardown ScopeExit. NOT a measured value — named sub-budgets inside the
-// blocking chain sum to roughly 15-20s (GuardianEngine's two persist_lifecycle_journal_
-// locked calls, each documented as "worst case one KvStore 5s busy timeout"; SparkEngine's
-// kConsumerJoinBudgetMs = 2'000; GuardianEngine::stop()'s own comment lists the timelines
-// measured against a BUSY store, 10 s to 25 s and more with a worker write in flight) but
-// dex_observer_'s drain wait and stop_all_guards_
-// locked()'s per-guard stops have NO named bound at all — so this sits AT that named floor,
-// not comfortably above it (corrected per external review, PR #3737 — the earlier wording
-// overstated the margin), without claiming to be a derived guarantee (matching
-// spark_file.cpp's arm_ancestor deadline comment: state plainly that it's not a wall-clock
-// bound where it isn't one). Also constrained from above: service_win.cpp reports a 30s
-// STOP_PENDING hint to the Windows SCM, so a SINGLE watchdog must stay under that — 20s
-// leaves only a 10s margin, not a comfortable one (matching service_win.cpp's own wording
-// on the same relationship, not "well under").
+// and run()'s teardown ScopeExit. NOT a measured value - the named sub-budgets listed here
+// are only PART of the blocking chain, and they sum to roughly 15-20s (GuardianEngine's two
+// persist_lifecycle_journal_locked calls, each documented as "worst case one KvStore 5s busy
+// timeout"; SparkEngine's kConsumerJoinBudgetMs = 2'000), and the loss-ledger write adds
+// another. #4045 adds the final baseline flush (up to one more busy timeout), and
+// GuardianEngine::stop()'s own comment lists the stop() timelines measured against a BUSY
+// store: 10s to 25s and more with a worker write in flight. dex_observer_'s
+// drain wait and stop_all_guards_locked()'s per-guard stops have NO named bound at all - so
+// this sits AT the named floor, not comfortably above it (corrected per external review, PR
+// #3737 - the earlier wording overstated the margin), without claiming to be a derived
+// guarantee (matching spark_file.cpp's arm_ancestor deadline comment: state plainly that it's
+// not a wall-clock bound where it isn't one). Also constrained from above: service_win.cpp
+// reports a 30s STOP_PENDING hint to the Windows SCM, so a SINGLE watchdog must stay under
+// that - 20s leaves only a 10s margin, not a comfortable one (matching service_win.cpp's own
+// wording on the same relationship, not "well under").
 //
 // TWO watchdogs on the external-trigger path, and their budgets are independent, not
 // shared: run()'s ScopeExit re-calls guardian_->stop() on EVERY exit (comment below),
