@@ -128,6 +128,9 @@
 #include "guaranteed_state_store.hpp"
 #include "baseline_store.hpp"
 #include "guardian_push_builder.hpp"
+#include "guardian_generation_cache.hpp" // #5513 short-TTL generation read
+#include "guardian_reconcile_gate.hpp" // #5513 claim map + admission budget
+#include "guardian_rule_bundle.hpp" // #5513 per-generation rule bundle
 #include "guaranteed_state.pb.h"
 #include "product_pack_store.hpp"
 #include "nvd_sync.hpp"
@@ -351,6 +354,7 @@ template <typename Req> auto yuzu_req_get_file(const Req& req, const std::string
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -5879,48 +5883,161 @@ public:
             // for that case too. Reads the generation, never bumps it, so
             // catching one lagging agent up does not make the rest of the fleet look
             // stale (the cascade M6's monotonic counter is designed to avoid).
+            // #5513: reconcile admission outcomes and duration. The counter family is bounded
+            // (a closed `result` set), so every value is pre-seeded to 0 per
+            // docs/observability-conventions.md; absent()-based alerting then stays meaningful
+            // before the first event of each kind. `shed` is a store-capacity guard and writes NO
+            // audit row (the counter and a once-a-minute log line are its whole signal).
+            metrics_.describe("yuzu_server_guardian_reconciles_total",
+                              "Guardian heartbeat reconcile outcomes by result: sent (re-push "
+                              "dispatched), rate_limited (per-agent 25 s slot), shed (replica "
+                              "admission budget exhausted, nothing sent, no audit row), degraded "
+                              "(a store read failed, re-push aborted), no_session",
+                              "counter");
+            for (auto result : {"sent", "rate_limited", "shed", "degraded", "no_session"})
+                metrics_.counter("yuzu_server_guardian_reconciles_total", {{"result", result}});
+            metrics_.describe("yuzu_server_guardian_reconcile_duration_seconds",
+                              "Wall time of an ADMITTED Guardian heartbeat reconcile (from "
+                              "admission to every exit, including aborted ones); the sizing "
+                              "input for --guardian-reconcile-budget-ms-per-s",
+                              "histogram");
+            yuzu::Histogram* const reconcile_duration = &metrics_.histogram(
+                "yuzu_server_guardian_reconcile_duration_seconds",
+                std::vector<double>{0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.25, 0.5, 1.0,
+                                    2.5, 5.0});
+            {
+                // The values the budget actually enforces (it clamps to its documented bounds).
+                const auto eff = guardian_reconcile_budget_.config();
+                spdlog::info("Guardian reconcile admission (per replica): budget {} ms/s, burst {} "
+                             "ms, max {} admissions/s",
+                             eff.budget_ms_per_s, eff.burst_ms, eff.max_per_s);
+                if (eff.budget_ms_per_s != cfg_.guardian_reconcile_budget_ms_per_s ||
+                    eff.burst_ms != cfg_.guardian_reconcile_burst_ms ||
+                    eff.max_per_s != cfg_.guardian_reconcile_max_per_s)
+                    spdlog::warn("Guardian reconcile admission: a configured value was outside the "
+                                 "supported range and was clamped to the values logged above");
+            }
+
             heartbeat_ingestion_->set_guardian_reconcile_fn(
-                [this](std::string_view agent_id_sv, std::uint64_t agent_gen) {
+                [this, reconcile_duration](std::string_view agent_id_sv,
+                                           std::uint64_t agent_gen) {
                     if (!guaranteed_state_store_)
                         return;
                     // Gate 2 LOW1: a degraded generation read aborts the reconcile
                     // OBSERVABLY (counter) rather than collapsing to 0 — which made
                     // every `agent_gen >= 0` true and silently suppressed reconcile.
-                    const auto current_opt =
-                        guaranteed_state_store_->current_policy_generation();
-                    if (!current_opt) {
+                    // The read goes through guardian_generation_cache_ (#5513): a
+                    // short-TTL single-flight cache whose error arm is the store's
+                    // nullopt, so this early return is unchanged; a failed read is
+                    // negative-cached for a shorter TTL.
+                    const auto current_res = guardian_generation_cache_.get();
+                    if (!current_res) {
                         metrics_
                             .counter("yuzu_server_guardian_reconciles_total",
                                      {{"result", "degraded"}})
                             .increment();
                         return;
                     }
-                    const std::uint64_t current = *current_opt;
-                    if (agent_gen >= current)
-                        return;  // agent already at or ahead of current policy
+                    const std::uint64_t current = *current_res;
                     const std::string agent_id(agent_id_sv);
 
-                    // Per-agent rate limit (#1209 hardening: sec-MED1/perf-S1/S2).
-                    // Claim the slot under the lock BEFORE any work so concurrent
-                    // heartbeats from the same agent can't both reconcile, and a
-                    // stuck/hostile agent can't turn every heartbeat into a registry
-                    // scan. Wall-clock based so it self-heals a re-registered/wiped
-                    // agent after the interval (no generation-keyed dedupe hole).
-                    constexpr auto kGuardianReconcileMinInterval = std::chrono::seconds(25);
-                    const auto reconcile_now = std::chrono::steady_clock::now();
-                    {
-                        std::lock_guard lk(guardian_reconcile_mu_);
-                        auto last = guardian_last_reconcile_.find(agent_id);
-                        if (last != guardian_last_reconcile_.end() &&
-                            (reconcile_now - last->second) < kGuardianReconcileMinInterval) {
-                            metrics_
-                                .counter("yuzu_server_guardian_reconciles_total",
-                                         {{"result", "rate_limited"}})
-                                .increment();
-                            return;
-                        }
-                        guardian_last_reconcile_[agent_id] = reconcile_now;  // claim
+                    // Convergence, per-agent rate limit and replica admission budget, in ONE
+                    // ordered decision under one mutex (guardian_reconcile_gate.hpp; the
+                    // order is the safety invariant). The per-agent claim (#1209 hardening:
+                    // sec-MED1/perf-S1/S2) is taken under the lock BEFORE any work so
+                    // concurrent heartbeats from the same agent can't both reconcile, and a
+                    // stuck/hostile agent can't turn every heartbeat into a registry scan.
+                    // Wall-clock based so it self-heals a re-registered/wiped agent after
+                    // the interval. A SHED never writes the claim, so the agent earns no
+                    // holdoff for a push that never happened.
+                    switch (guardian_reconcile_gate_.decide(agent_id, agent_gen, current)) {
+                    case GuardianReconcileGate::Decision::Converged:
+                        return;  // agent already at or ahead of current policy
+                    case GuardianReconcileGate::Decision::RateLimited:
+                        metrics_
+                            .counter("yuzu_server_guardian_reconciles_total",
+                                     {{"result", "rate_limited"}})
+                            .increment();
+                        return;
+                    case GuardianReconcileGate::Decision::Shed: {
+                        metrics_
+                            .counter("yuzu_server_guardian_reconciles_total",
+                                     {{"result", "shed"}})
+                            .increment();
+                        // NO audit row: shed is a store-capacity guard, not an enforcement
+                        // event (the shed counter is the signal). The log is throttled to
+                        // one line per minute; only the CAS winner logs.
+                        const auto now_rep =
+                            std::chrono::steady_clock::now().time_since_epoch().count();
+                        const auto interval_rep =
+                            std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                                std::chrono::seconds(60))
+                                .count();
+                        auto last_rep = guardian_shed_log_last_.load(std::memory_order_relaxed);
+                        if ((last_rep == kGuardianShedLogNever || now_rep - last_rep >= interval_rep) &&
+                            guardian_shed_log_last_.compare_exchange_strong(
+                                last_rep, now_rep, std::memory_order_relaxed))
+                            spdlog::warn("Guardian heartbeat reconcile: replica admission budget "
+                                         "exhausted, shedding re-pushes (agents retry on their "
+                                         "next heartbeat; {} shed so far; this line is logged at "
+                                         "most once a minute)",
+                                         guardian_reconcile_budget_.shed_total());
+                        return;
                     }
+                    case GuardianReconcileGate::Decision::Admit:
+                        break;
+                    }
+                    // Admitted: from here EVERY exit debits the measured wall time into the
+                    // budget (RAII) and records it in the duration histogram.
+                    auto admitted = guardian_reconcile_gate_.begin_admitted();
+                    struct DurationObserver {
+                        yuzu::Histogram* hist;
+                        std::chrono::steady_clock::time_point start;
+                        ~DurationObserver() {
+                            try {
+                                hist->observe(std::chrono::duration<double>(
+                                                  std::chrono::steady_clock::now() - start)
+                                                  .count());
+                            } catch (...) {
+                                // A destructor must not throw; one lost sample is harmless.
+                            }
+                        }
+                    };
+                    const DurationObserver duration_observer{reconcile_duration,
+                                                             std::chrono::steady_clock::now()};
+
+                    // Counter + durable audit for an aborted (degraded) reconcile. Gate 6
+                    // compliance: an aborted enforcement convergence for a BEHIND agent is a
+                    // security-relevant non-event - SIEM must see it, not just a metric/log
+                    // (the REST push twin audits `denied`; the success re-push below audits
+                    // `success`). Every caller is past the claim and the admission budget, so
+                    // it inherits the same at-most-one-row-per-agent-per-interval dedup as the
+                    // success path, no audit storm. (The earlier generation-unreadable gate is
+                    // pre-dedup and coarse, counter-only there, plus the persistent degraded
+                    // gauge tracked in #2662.)
+                    auto abort_degraded = [&](std::string_view what, const std::string& err) {
+                        metrics_
+                            .counter("yuzu_server_guardian_reconciles_total",
+                                     {{"result", "degraded"}})
+                            .increment();
+                        if (audit_store_ && audit_store_->is_open()) {
+                            AuditEvent ev;
+                            ev.timestamp =
+                                std::chrono::duration_cast<std::chrono::seconds>(
+                                    std::chrono::system_clock::now().time_since_epoch())
+                                    .count();
+                            ev.principal = "system";
+                            ev.action = "guaranteed_state.reconcile";
+                            ev.target_type = "GuaranteedState";
+                            ev.target_id = agent_id;
+                            ev.detail = "heartbeat reconcile ABORTED — " + std::string(what) +
+                                        " (" + err +
+                                        "); agent rules did not converge (generation " +
+                                        std::to_string(agent_gen) + ")";
+                            ev.result = "degraded";
+                            (void)audit_store_->log(ev);
+                        }
+                    };
 
                     auto sess = registry_.get_session(agent_id);
                     if (!sess) {
@@ -5930,120 +6047,122 @@ public:
                             .increment();
                         return;
                     }
-                    // list_rules is now type-distinguishable (ADR-0038 catastrophic-read
-                    // set): a degraded read MUST abort this reconcile rather than fan out
-                    // an empty rule set it cannot distinguish from "no rules configured" —
-                    // that would be a fleet-wide disarm for this agent.
-                    auto rules_result = guaranteed_state_store_->list_rules();
-                    if (!rules_result) {
-                        metrics_
-                            .counter("yuzu_server_guardian_reconciles_total",
-                                     {{"result", "degraded"}})
-                            .increment();
-                        spdlog::warn("Guardian heartbeat reconcile: list_rules degraded ({}) — "
-                                     "aborting re-push for agent_id={}",
-                                     rules_result.error(), agent_id);
-                        // Gate 6 compliance: an aborted enforcement convergence for a
-                        // BEHIND agent is a security-relevant non-event — SIEM must see
-                        // it, not just a metric/log (the REST push twin audits `denied`;
-                        // the success re-push below audits `success`). This site is past
-                        // the per-agent rate-limit claim, so it inherits the same
-                        // at-most-one-row-per-agent-per-interval dedup as the success
-                        // path — no audit storm. (The earlier generation-nullopt gate is
-                        // pre-dedup and coarse — counter-only there, plus the persistent
-                        // degraded gauge tracked in #2662.)
-                        if (audit_store_ && audit_store_->is_open()) {
-                            AuditEvent ev;
-                            ev.timestamp =
-                                std::chrono::duration_cast<std::chrono::seconds>(
-                                    std::chrono::system_clock::now().time_since_epoch())
-                                    .count();
-                            ev.principal = "system";
-                            ev.action = "guaranteed_state.reconcile";
-                            ev.target_type = "GuaranteedState";
-                            ev.target_id = agent_id;
-                            ev.detail = "heartbeat reconcile ABORTED — rule store degraded (" +
-                                        rules_result.error() +
-                                        "); agent rules did not converge (generation " +
-                                        std::to_string(agent_gen) + ")";
-                            ev.result = "degraded";
-                            (void)audit_store_->log(ev);
-                        }
-                        return;
-                    }
-                    // Baseline gate (docs/guardian-baseline-model.md): the rule source
-                    // is the union of member Guards of *deployed* Baselines, so an
+                    // The rule bundle for this generation (#5513), loaded at most once per
+                    // generation per replica. list_rules is type-distinguishable (ADR-0038
+                    // catastrophic-read set): a degraded read MUST abort this reconcile
+                    // rather than fan out an empty rule set it cannot distinguish from "no
+                    // rules configured" - that would be a fleet-wide disarm for this agent.
+                    // Baseline gate (docs/guardian-baseline-model.md): the rule source is the
+                    // union of member Guards of *deployed* Baselines, so an
                     // enabled-but-undeployed Guard is never reconciled onto an agent.
-                    // ADR-0055 catastrophic-read set: a degraded read MUST abort this
-                    // reconcile, never fan out an empty deployed-set it cannot
-                    // distinguish from "nothing deployed" — mirrors the list_rules
-                    // degrade handling immediately above.
-                    auto deployed_result = deployed_member_rule_ids();
-                    if (!deployed_result) {
-                        metrics_
-                            .counter("yuzu_server_guardian_reconciles_total",
-                                     {{"result", "degraded"}})
-                            .increment();
-                        spdlog::warn("Guardian heartbeat reconcile: deployed_member_rule_ids "
-                                     "degraded ({}) — aborting re-push for agent_id={}",
-                                     deployed_result.error(), agent_id);
-                        if (audit_store_ && audit_store_->is_open()) {
-                            AuditEvent ev;
-                            ev.timestamp =
-                                std::chrono::duration_cast<std::chrono::seconds>(
-                                    std::chrono::system_clock::now().time_since_epoch())
-                                    .count();
-                            ev.principal = "system";
-                            ev.action = "guaranteed_state.reconcile";
-                            ev.target_type = "GuaranteedState";
-                            ev.target_id = agent_id;
-                            ev.detail = "heartbeat reconcile ABORTED — baseline store degraded (" +
-                                        deployed_result.error() +
-                                        "); agent rules did not converge (generation " +
-                                        std::to_string(agent_gen) + ")";
-                            ev.result = "degraded";
-                            (void)audit_store_->log(ev);
+                    // ADR-0055 catastrophic-read set: a degraded deployed-set read MUST also
+                    // abort, never fan out an empty deployed-set it cannot distinguish from
+                    // "nothing deployed". A failed load is never cached.
+                    // The generation was read BEFORE this call (guardian_rule_bundle.hpp's
+                    // ordering requirement): rows read inside the loader are at least as new
+                    // as `current`.
+                    const auto bundle_result = guardian_rule_bundle_cache_.get(
+                        current,
+                        [this]() -> std::expected<guardian::Bundle, guardian::BundleLoadError> {
+                            using Source = guardian::BundleLoadError::Source;
+                            auto rules_result = guaranteed_state_store_->list_rules();
+                            if (!rules_result)
+                                return std::unexpected(
+                                    guardian::BundleLoadError{Source::rules, rules_result.error()});
+                            auto deployed_result = deployed_member_rule_ids();
+                            if (!deployed_result)
+                                return std::unexpected(guardian::BundleLoadError{
+                                    Source::deployed, deployed_result.error()});
+                            return guardian::make_bundle(
+                                guardian::filter_deployed_members(*rules_result, *deployed_result),
+                                std::move(*deployed_result));
+                        });
+                    if (!bundle_result) {
+                        const auto& err = bundle_result.error();
+                        switch (err.source) {
+                        case guardian::BundleLoadError::Source::rules:
+                            spdlog::warn("Guardian heartbeat reconcile: list_rules degraded ({}) — "
+                                         "aborting re-push for agent_id={}",
+                                         err.detail, agent_id);
+                            abort_degraded("rule store degraded", err.detail);
+                            break;
+                        case guardian::BundleLoadError::Source::deployed:
+                            spdlog::warn("Guardian heartbeat reconcile: deployed_member_rule_ids "
+                                         "degraded ({}) — aborting re-push for agent_id={}",
+                                         err.detail, agent_id);
+                            abort_degraded("baseline store degraded", err.detail);
+                            break;
+                        case guardian::BundleLoadError::Source::other:
+                            spdlog::warn("Guardian heartbeat reconcile: rule bundle load failed "
+                                         "({}) - aborting re-push for agent_id={}",
+                                         err.detail, agent_id);
+                            abort_degraded("rule bundle load failed", err.detail);
+                            break;
                         }
                         return;
                     }
-                    // Per-agent filtering as the fan-out (M4): only rules that target
-                    // this agent's OS and name it in scope. Cache scope membership
-                    // across rules sharing a scope_expr within this one reconcile.
-                    const auto rules =
-                        guardian::filter_deployed_members(*rules_result, *deployed_result);
+                    const guardian::Bundle& bundle = **bundle_result;
+
+                    // Per-agent filtering as the fan-out (M4): only rules that target this
+                    // agent's OS and name it in scope. Membership is decided PER AGENT with
+                    // evaluate_scope_for_agent (#5513), never by building the fleet's matching-id
+                    // vector, and is NEVER cached across reconciles (tags, properties and
+                    // session attributes change with no generation bump). Cache scope
+                    // membership only across rules sharing a scope_expr within this one
+                    // reconcile.
+                    //
+                    // No rs_store/principal here: this is a LOCAL-ONLY dispatch
+                    // (send_system_reserved), so the evaluator is the evaluate_scope_local
+                    // population (#4981 PR-1 B4): it can NEVER abort for a presence reason, so
+                    // a presence-store blip cannot periodically disarm this scoped rule. A
+                    // scope that did not parse, or an Unresolvable atom (from_result_set:, or
+                    // props.<key> with no store wired), is "not a member": arming nothing is
+                    // the safe direction, as before.
+                    //
+                    // BEHAVIOUR CHANGE (#5513, operator-approved): a StoreDegraded
+                    // evaluation used to collapse through value_or({}) to "not a member",
+                    // which sent a NARROWED full_sync and silently disarmed the rule on this
+                    // agent. It now sets scope_degraded and the reconcile is aborted below
+                    // through the degraded branch (counter, ABORTED audit row, log), sending
+                    // NOTHING; the agent keeps its current rules and is retried.
+                    bool scope_degraded = false;
+                    std::string scope_degraded_detail;
                     std::unordered_map<std::string, bool> scope_member;
                     auto push = guardian::build_agent_push(
-                        rules, sess->os,
+                        bundle.rules, sess->os,
                         [&](const std::string& expr) {
+                            if (scope_degraded)
+                                return false;
                             auto cached = scope_member.find(expr);
                             if (cached != scope_member.end())
                                 return cached->second;
                             bool member = false;
-                            if (auto parsed = yuzu::scope::parse(expr)) {
-                                // No rs_store/principal passed here — this is a
-                                // LOCAL-ONLY dispatch (send_system_reserved), so
-                                // evaluate_scope_local (#4981 PR-1 B4) is the
-                                // correct entry point: it shares evaluate_scope's
-                                // Unresolvable/StoreDegraded abort semantics for
-                                // from_result_set:/props.<key> atoms with no
-                                // store wired (value_or({}) then collapses that
-                                // to "not a member" — arming nothing is the safe
-                                // direction), but can NEVER abort for a presence
-                                // reason, so a presence-store blip cannot
-                                // periodically disarm this scoped rule.
-                                for (const auto& id : registry_.evaluate_scope_local(
-                                         *parsed, tag_store_.get(),
-                                         custom_properties_store_.get())
-                                         .value_or(std::vector<std::string>{}))
-                                    if (id == agent_id) {
-                                        member = true;
-                                        break;
-                                    }
+                            if (const auto* parsed = bundle.find_scope(expr)) {
+                                const auto eval = registry_.evaluate_scope_for_agent(
+                                    agent_id, *parsed, tag_store_.get(),
+                                    custom_properties_store_.get());
+                                if (eval) {
+                                    member = *eval;
+                                } else if (eval.error().kind == ScopeEvalError::Kind::StoreDegraded) {
+                                    scope_degraded = true;
+                                    scope_degraded_detail = to_string(eval.error().kind);
+                                    if (!eval.error().detail.empty())
+                                        scope_degraded_detail += ": " + eval.error().detail;
+                                    return false;
+                                }
+                                // Any other error kind (Unresolvable): not a member.
                             }
                             scope_member.emplace(expr, member);
                             return member;
                         },
                         /*full_sync=*/true, current, &metrics_);
+                    if (scope_degraded) {
+                        spdlog::warn("Guardian heartbeat reconcile: scope evaluation store degraded "
+                                     "({}) - aborting re-push for agent_id={}",
+                                     scope_degraded_detail, agent_id);
+                        abort_degraded("scope store degraded", scope_degraded_detail);
+                        return;  // send NOTHING: a narrowed full_sync would disarm the rule
+                    }
                     // Unique per re-push (random suffix) so a same-generation reconcile
                     // can't collide with the agent's replay-dedup set (hp-F2/cons-S1).
                     const auto command_id =
@@ -9055,6 +9174,17 @@ public:
                 publish_cohort_perf_gauges();
                 // Reap Subscribe streams for agents that missed heartbeats
                 registry_.reap_stale_sessions(cfg_.session_timeout);
+                // #5513: bound the Guardian reconcile per-agent claim map. In-memory,
+                // steady_clock cutoff over no store: a claim older than the 25 s
+                // rate-limit interval can no longer limit anything, so an entry older
+                // than twice that is erased (retention reasoning and the per-call erase
+                // and scan caps are in guardian_reconcile_gate.hpp). Not a retention pass
+                // over durable data, and it adds no thread.
+                try {
+                    (void)guardian_reconcile_gate_.sweep();
+                } catch (const std::exception& e) {
+                    spdlog::warn("Guardian reconcile claim sweep failed: {}", e.what());
+                }
                 // PR3 H-1: tear down any live Subscribe stream whose agent leaf
                 // has since been revoked. The Subscribe establishment gate runs
                 // once; without this sweep a revoked/compromised agent keeps
@@ -21208,16 +21338,46 @@ private:
     // -1 from -2 — both already collapse to "push not wired/failed" there.
     std::function<int(const std::string&, bool)> guardian_push_fn_;
 
-    // Guardian heartbeat-reconcile per-agent rate limit (#1209 hardening:
-    // sec-MED1 / perf-S1 / perf-S2). Without it, a lagging — or hostile, tight-
-    // looping — agent turns EVERY heartbeat into a full reconcile (list_rules +
-    // per-rule registry-mutex scope scan), an asymmetric CPU amplifier. We allow
-    // at most one reconcile re-push per agent per kGuardianReconcileMinInterval;
-    // a genuinely-once-lagging agent still converges on its first heartbeat. Map
-    // is agent_id -> last reconcile time, guarded by its own mutex.
-    std::mutex guardian_reconcile_mu_;
-    std::unordered_map<std::string, std::chrono::steady_clock::time_point>
-        guardian_last_reconcile_;
+    // Guardian heartbeat-reconcile admission (#1209 hardening: sec-MED1 / perf-S1 / perf-S2,
+    // then #5513). Without it, a lagging (or hostile, tight-looping) agent turns EVERY
+    // heartbeat into a full reconcile, an asymmetric CPU amplifier, and at fleet scale a
+    // policy bump makes a large share of the fleet eligible at once. Two bounds, both
+    // decided inside `guardian_reconcile_gate_.decide()` under one mutex (the order is the
+    // safety invariant, see guardian_reconcile_gate.hpp): a per-agent claim (at most one
+    // re-push per agent per 25 s; a genuinely-once-lagging agent still converges on its
+    // first heartbeat) and a per-replica leaky-bucket budget debited by the measured wall
+    // time of each admitted push (`guardian_reconcile_budget_`, the three
+    // --guardian-reconcile-* flags). In memory and per replica: it protects per-replica
+    // resources, so store load is the budget times the replica count.
+    // DECLARATION ORDER IS LOAD-BEARING: the gate holds a reference to the budget, so the
+    // budget is declared first (destroyed last).
+    GuardianReconcileBudget guardian_reconcile_budget_{GuardianReconcileBudgetConfig{
+        .budget_ms_per_s = cfg_.guardian_reconcile_budget_ms_per_s,
+        .burst_ms = cfg_.guardian_reconcile_burst_ms,
+        .max_per_s = cfg_.guardian_reconcile_max_per_s}};
+    GuardianReconcileGate guardian_reconcile_gate_{guardian_reconcile_budget_};
+    // Short-TTL single-flight cache of GuaranteedStateStore::current_policy_generation(),
+    // used ONLY by the heartbeat reconcile lambda (the bump and the REST/MCP push paths read
+    // the store directly). The store's nullopt (an unreadable generation) maps to the cache's
+    // error arm, so the lambda keeps its observable-degrade behaviour. The fetch re-checks
+    // guaranteed_state_store_ at call time because stop() can reset it.
+    GuardianGenerationCache guardian_generation_cache_{[this]() -> GuardianGenerationCache::Result {
+        if (!guaranteed_state_store_)
+            return std::unexpected(std::string("guaranteed-state store not wired"));
+        const auto generation = guaranteed_state_store_->current_policy_generation();
+        if (!generation)
+            return std::unexpected(std::string("current_policy_generation unreadable"));
+        return *generation;
+    }};
+    // Rule bundle (rules after the Baseline gate, the deployed set, and every distinct
+    // scope_expr parsed once) memoised per policy generation. Scope MEMBERSHIP is deliberately
+    // not cached: tags, properties and session attributes change with no generation bump.
+    guardian::GuardianRuleBundleCache guardian_rule_bundle_cache_;
+    // steady_clock tick count of the last shed warning, or kNever. Throttles the shed log to
+    // one line per minute (the shed counter is the signal; the log is a pointer to it).
+    static constexpr std::chrono::steady_clock::rep kGuardianShedLogNever =
+        std::numeric_limits<std::chrono::steady_clock::rep>::min();
+    std::atomic<std::chrono::steady_clock::rep> guardian_shed_log_last_{kGuardianShedLogNever};
 
     // The Baseline gate's input: the union of member-Guard rule_ids across all
     // *deployed* Baselines, sourced from each Baseline's deployed_snapshot (what
