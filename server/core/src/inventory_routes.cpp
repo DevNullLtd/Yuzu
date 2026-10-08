@@ -123,7 +123,7 @@ void InventoryRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermF
                  if (!perm_fn_(req, res, "Inventory", "Read"))
                      return;
                  SoftwareCatalogQuery q;
-                q.q = req.has_param("q") ? req.get_param_value("q") : "";
+                 q.q = req.has_param("q") ? req.get_param_value("q") : "";
                  const auto limit_sw = clamp_limit(req, 200, 2000);
                  if (!limit_sw) {
                      reject_bad_limit(res);
