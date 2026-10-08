@@ -662,6 +662,11 @@ public:
     void fail_next_snapshot_for_test() noexcept {
         fail_next_snapshot_.store(true, std::memory_order_relaxed);
     }
+    /// TEST-ONLY: make the next stage_unstaged_baselines() throw bad_alloc before it takes its
+    /// lock (as if the lock failed). Consumed once. No production caller.
+    void fail_next_unstaged_sweep_for_test() noexcept {
+        fail_next_unstaged_sweep_.store(true, std::memory_order_relaxed);
+    }
     /// TEST-ONLY: make the next attach_core inherit-the-staged-hash copy throw bad_alloc (the
     /// copy happens BEFORE the prior generation is detached, so the prior arm must survive).
     /// No production caller.
@@ -679,8 +684,9 @@ public:
     /// failed write too, with no retry). It also counts the one failure that is not a staging
     /// attempt: attach_core's read-back of a capture that staged successfully, when the copy
     /// of its hash throws (the staged original stays, the live arm captures afresh; no separate
-    /// counter, the effect is the same one the tag already reports). GuardianBaselinePersister reads this
-    /// through staged_baseline_drops_source() so the heartbeat getter needs no runtime lock.
+    /// counter, the effect is the same one the tag already reports). GuardianBaselinePersister
+    /// reads this through staged_baseline_drops_source() so the heartbeat getter needs no
+    /// runtime lock.
     /// A retarget landing in the instant between a capture's write and its erase also counts:
     /// the count is an upper bound on lost captures, never an under-count.
     [[nodiscard]] std::uint64_t staged_baseline_drops() const noexcept {
@@ -1193,9 +1199,10 @@ private:
         bool active{true};            ///< registry_mu_-guarded; uncommitted wedge desire or committed rule state
         bool emit_compliant_edge{true};
         RuleAssertion assertion;
-        RuleEvalState eval;           ///< mutated only under the key's eval_mu (single serialisation domain);
-                                      ///< evaluate_key's COMMIT also holds registry_mu_, so a reader holding
-                                      ///< registry_mu_ alone (attach_core, a withdrawal) never sees it torn
+        /// Mutated only under the key's eval_mu (single serialisation domain); evaluate_key's
+        /// COMMIT also holds registry_mu_, so a reader holding registry_mu_ alone (attach_core, a
+        /// withdrawal) never sees it torn.
+        RuleEvalState eval;
         /// #4045: this generation's baseline-on-arm capture is committed in `eval` but could NOT
         /// be staged (an allocation failure, counted). registry_mu_-guarded, like staging itself.
         /// Runtime-owned on purpose: RuleEvalState is shared evaluator code and must not learn
@@ -2622,6 +2629,7 @@ private:
         std::make_shared<std::atomic<std::uint64_t>>(0);
     std::atomic<int> fail_next_stage_baseline_{0}; ///< TEST-ONLY allocation-failure seam (count)
     mutable std::atomic<bool> fail_next_snapshot_{false}; ///< TEST-ONLY snapshot-throw seam
+    std::atomic<bool> fail_next_unstaged_sweep_{false}; ///< TEST-ONLY sweep-throw seam
     std::atomic<bool> fail_next_inherit_copy_{false};     ///< TEST-ONLY attach_core copy seam
     /// TEST-ONLY: see unstaged_sweep_stopping_for_test().
     std::atomic<int> unstaged_sweep_stopping_for_test_{-1};
@@ -2642,8 +2650,9 @@ private:
     /// lost to the replacement unless a later retry (attach_core's own, or its read-back after
     /// the withdrawal) stages it.
     /// Returns true iff the hash is now staged.
-    [[nodiscard]] bool salvage_unstaged_baseline_locked(const std::string& rule_id, const RuleGeneration& rg,
-                                          const std::optional<std::string>& key) noexcept;
+    [[nodiscard]] bool salvage_unstaged_baseline_locked(
+        const std::string& rule_id, const RuleGeneration& rg,
+        const std::optional<std::string>& key) noexcept;
     std::unique_ptr<SparkKeyRuleIndex> index_;                          // key <-> rule fan-out + refcount
     std::unordered_map<std::string, std::shared_ptr<RuleGeneration>> rules_; // rule_id -> generation
     std::unordered_map<std::string, std::shared_ptr<PerKey>> keys_;          // spark_key -> per-key

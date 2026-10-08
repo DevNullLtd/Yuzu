@@ -61,8 +61,8 @@
 #include <cstdlib>
 #include <charconv>
 #include <chrono>
-#include <format>
 #include <cstdint>
+#include <format>
 #include <set>
 #include <string>
 #include <string_view>
@@ -646,8 +646,19 @@ std::string GuardianBaselinePersister::stop_skip_log_line(StopSkip why) {
         return "Guardian: skipped the final Spark baseline flush at stop because a persist pass "
                "during this stop failed slowly; staged captures are lost to this process (#4045)";
     return "Guardian: skipped the final Spark baseline flush at stop because the shutdown "
-           "deadline was nearly spent before it could start; staged captures are lost to this "
-           "process (#4045)";
+           "deadline was nearly spent before it could start and an earlier stop stage had run "
+           "slow; staged captures are lost to this process (#4045)";
+}
+
+std::string GuardianBaselinePersister::stop_flush_threw_log_line() {
+    return "Guardian: the final Spark baseline flush at stop was cut short by an allocation or "
+           "lock failure; captures it had not written are lost to this process (#4045)";
+}
+
+std::string GuardianBaselinePersister::stop_sweep_threw_log_line() {
+    return "Guardian: staging the committed Spark baseline captures for the final flush at stop "
+           "failed (an allocation or lock failure); captures that were never staged are lost to "
+           "this process (#4045)";
 }
 
 std::string GuardianBaselinePersister::stop_unstaged_log_line(std::size_t unstaged) {
@@ -700,7 +711,8 @@ GuardianBaselinePersister::persist_staged(GuardianSparkRuntime& rt, Trigger trig
     // Forced and Stop passes ignore it.
     const auto due = [&] {
         return trigger != Trigger::Worker ||
-               now().time_since_epoch().count() >= next_attempt_rep_.load(std::memory_order_relaxed);
+               now().time_since_epoch().count() >=
+                   next_attempt_rep_.load(std::memory_order_relaxed);
     };
     if (!due()) {
         backoff_deferrals_.fetch_add(1, std::memory_order_relaxed);
@@ -740,11 +752,12 @@ GuardianBaselinePersister::persist_staged(GuardianSparkRuntime& rt, Trigger trig
         // store burns a busy timeout per write) ended at or after the begin_stop() mark: one
         // more attempt would spend another busy timeout. A stall that ended before the mark
         // spent none of it, so it is not a reason to skip. (2) This pass could not start within
-        // kBaselineStopLatestStart of the mark AND an earlier stage of this stop failed or took
-        // a busy timeout (note_stop_store_trouble): its first write always runs and may cost a
-        // busy timeout, which would end past the grace. Elapsed time alone is not evidence of a
-        // bad store (an apply_rules can hold the engine mutex that long on a healthy one, and a
-        // healthy pass takes about a millisecond), so a late start with no trouble runs.
+        // kBaselineStopLatestStart of the mark AND an earlier stage of this stop ran slow, at
+        // least a busy timeout (note_stop_store_trouble): its first write always runs and may
+        // cost a busy timeout, which would end past the grace. Neither elapsed time alone nor
+        // a FAST failure is evidence of a slow store (an apply_rules can hold the engine mutex
+        // that long on a healthy one, and a store that fails fast fails this pass fast too), so
+        // a late start with no slow stage runs.
         const Clock::rep stop_began = stop_began_rep_.load(std::memory_order_relaxed);
         std::optional<StopSkip> why;
         if (stalled_ && stalled_at_ >= stop_began)
@@ -765,7 +778,8 @@ GuardianBaselinePersister::persist_staged(GuardianSparkRuntime& rt, Trigger trig
             return out;
         }
     }
-    const GuardianBaselinePassBudget& budget = trigger == Trigger::Stop ? stop_budget_ : pass_budget_;
+    const GuardianBaselinePassBudget& budget =
+        trigger == Trigger::Stop ? stop_budget_ : pass_budget_;
 
     // A throw here (allocation or lock) loses nothing: staging has not been touched. It does
     // widen the worker backoff, so a persistent allocation failure cannot re-run on every wake.
@@ -888,7 +902,8 @@ GuardianBaselinePersister::persist_staged(GuardianSparkRuntime& rt, Trigger trig
     // write in the pass took at least the stop wall budget: a SLOW failure (a BUSY store burns a
     // busy timeout per write) is what stop() cannot afford to repeat, whether or not an earlier
     // tuple of the pass succeeded; a fast one (a dropped table, a read-only file) costs nothing
-    // to retry, so stop still tries. `stalled_at_` is when the slow failure ended (see begin_stop()).
+    // to retry, so stop still tries. `stalled_at_` is when the slow failure ended (see
+    // begin_stop()).
     stalled_ = slow_failure;
     if (slow_failure)
         stalled_at_ = slow_failure_at;
@@ -1208,8 +1223,9 @@ void GuardianEngine::stop() {
         spark_scheduler_->stop();
     if (spark_drain_worker_) {
         const auto began = stop_stage_begin_locked();
+        stop_stage_hook_locked("worker_join");
         spark_drain_worker_->stop();
-        note_stop_stage_locked("worker_join", began, /*ok=*/true);
+        stop_stage_end_locked(began);
     }
     stop_all_guards_locked();
     // #4783: stop legacy_sink_executor_ from admitting NEW sends only AFTER the
@@ -1252,13 +1268,12 @@ void GuardianEngine::stop() {
     // escape here must be caught, not left to std::terminate.
     if (kv_) {
         const auto began = stop_stage_begin_locked();
-        bool ledger_ok = false;
+        stop_stage_hook_locked("ledger");
         try {
             std::lock_guard<std::mutex> persist_lk(legacy_sink_persist_mu_);
             const auto snap = legacy_sink_executor_->snapshot();
             if (persist_legacy_sink_loss_ledger(kv_, snap)) {
                 legacy_sink_last_persisted_gen_ = snap.change_gen;
-                ledger_ok = true;
             } else
                 spdlog::warn("Guardian: failed to persist the legacy-sink loss ledger during "
                             "shutdown (change_gen={}) - a restart may see stale (though never "
@@ -1266,7 +1281,7 @@ void GuardianEngine::stop() {
                             snap.change_gen);
         } catch (...) {
         }
-        note_stop_stage_locked("ledger", began, ledger_ok);
+        stop_stage_end_locked(began);
     }
     // F7: stop() is terminal - nothing reconciles again afterward, so there is no
     // re-log/false-transition risk (unlike apply_rules's full_sync, which must sweep
@@ -1291,11 +1306,16 @@ void GuardianEngine::stop() {
     //  (1) a write that failed slowly ended at or after the begin_stop() mark taken at the top
     //      of this function (the stall already spent this stop's deadline), or
     //  (2) it would start at or after kBaselineStopLatestStart (15 s) past that mark AND an
-    //      earlier stage of this same stop() failed or took a busy timeout (the two journal
+    //      earlier stage of this same stop() ran SLOW, at least a busy timeout (the two journal
     //      flushes, the worker join and the loss-ledger write feed note_stop_store_trouble()):
     //      its first write always runs, and on a BUSY store one write costs a whole 5 s busy
-    //      timeout. A late start with no such evidence (an apply_rules that held mtx_ for 15 s
-    //      on a healthy store) runs: a healthy pass takes about a millisecond.
+    //      timeout. A fast failure of a stage is not evidence (a BUSY store cannot fail fast).
+    //      A late start with no slow stage (an apply_rules that held mtx_ for 15 s on a healthy
+    //      store) runs: a healthy pass takes well under a millisecond per capture, but it may
+    //      use its whole 1 s wall plus one write, so a start in the last second of the grace
+    //      can run into the watchdog (a healthy 300-capture pass that started at 19 s ended at
+    //      20.035 s in a measurement with a slow-IO window). Accepted: the alternative is to
+    //      forfeit the captures of a healthy store.
     //
     // Ordering: this flush runs after the journal flush and the loss-ledger write, so it is the
     // one a stall skips; the integrity-relevant flusher yields to the audit-replay one only
@@ -1311,31 +1331,43 @@ void GuardianEngine::stop() {
     // Windows service is restarted by the SCM, and neither hard_exit nor ShutdownDeadlineGuard
     // writes any log line, so exit code 4 is the only evidence.
     //
-    // Measured on this code with real SQLITE_BUSY (a second connection holding BEGIN
-    // IMMEDIATE), 5 s KvStore busy timeout, 3 staged captures, stop() entry to exit:
+    // Measured with real SQLITE_BUSY (a second connection holding BEGIN IMMEDIATE), 5 s KvStore
+    // busy timeout, stop() entry to exit. The 10.01 s and 15.01 s rows were re-run on this
+    // exact code (3 staged captures, two runs each: 10.008 and 10.010 s; 15.011 and 15.014 s).
+    // Every row was also measured by two independent reviewers on the previous revision
+    // (fbc816ac6), which differs only in the evidence rule (a BUSY stage is slow, so it is
+    // evidence under either rule): one with 3 staged captures, one with 5. The other rows
+    // below were NOT re-run on this exact code.
     //   quiet worker, nothing else pending ......... ledger 5 + this pass 5 ........ 10.01 s
     //                                                 (the pass runs and fails)
     //   quiet worker, journal record pending ....... journal 5 + ledger 5 + journal 5
-    //                                                 = 15.02 s, this pass SKIPPED (starts at
-    //                                                 15 s, margin about 15 ms: each BUSY stage
-    //                                                 is its 5 s sleep plus overhead)
-    //   worker baseline write in flight, journal ... 20 s to 25 s (25.02 s in three runs of one
-    //     record pending                              harness, 20.016 s to 25.03 s across
-    //                                                 alignments), this pass skipped by the stall:
-    //                                                 up to TWO busy timeouts are added, the
-    //                                                 in-flight write that holds KvStore::mu_
-    //                                                 first, and a second baseline write when
-    //                                                 the worker's 5 s retry backoff expires
-    //                                                 just as journal flush 1 ends
+    //                                                 = 15.01 s (15.011 to 15.013 s), this pass
+    //                                                 SKIPPED (it would start at 15 s; each BUSY
+    //                                                 stage is its 5 s sleep plus overhead, so
+    //                                                 the threshold is met with about 11 to 13 ms
+    //                                                 to spare)
+    //   worker baseline write in flight, journal ... 20 s to 25 s (20.016 to 25.03 s across
+    //     record pending                              alignments in two harnesses), this pass
+    //                                                 skipped by the stall: up to TWO busy
+    //                                                 timeouts are added, the in-flight write
+    //                                                 that holds KvStore::mu_ first, and a second
+    //                                                 baseline write when the worker's 5 s retry
+    //                                                 backoff expires just as journal flush 1 ends
     //   worker baseline write in flight, no journal  10.01 s, this pass skipped by the stall
     // The last two rows are on the watchdog when they pass 20 s. The worker's OTHER KV writes
-    // (journal sent-markers) take KvStore::mu_ too, so a worker mid sent-marker write puts its
-    // own busy timeout in front of every stage here: measured 21.5 s to 28.2 s with the pass
-    // skipped by the stall, all past the 20 s grace, with or without #4045 (the same trigger
-    // already costs 23 s and more before #4045). What the shared deadline cannot bound: the
-    // journal and ledger stages above, the worker's non-baseline writes, and the worker's retry
-    // write. A Worker pass is deliberately NOT deferred once the mark is taken: a store that
-    // heals mid-stop gets its worker retry, and the Stop pass then runs instead of skipping.
+    // (journal sent-markers) take KvStore::mu_ too, so a worker mid non-baseline write puts its
+    // own busy timeout in front of every stage here: 21.5 s to 28.2 s in one harness (3 staged,
+    // the outbox send path driving the sent-marker write) and 28.82 s to 29.04 s in another (5
+    // staged, one non-baseline worker write in each of three runs), the pass skipped by the
+    // stall; the arithmetic bound is about 30 s (six busy timeouts). All past the 20 s grace.
+    // Without #4045 the same stops take 15 s (journal record pending) or 20 s and more (a worker
+    // sent-marker write in flight). What the shared deadline cannot bound: the journal and
+    // ledger stages above, the worker's non-baseline writes, and the worker's retry write. The
+    // evidence is SAMPLED by those stages: a store that turns BUSY only after them, with the stop
+    // already 15 s late, still lets the Stop pass run and the watchdog may cut it (a reviewer
+    // reproduced 21.0 s; the capture is lost either way and the loss has no log line). A
+    // Worker pass is deliberately NOT deferred once the mark is taken: a store that heals
+    // mid-stop gets its worker retry, and the Stop pass then runs instead of skipping.
     persist_staged_baselines_locked(/*at_stop=*/true);
     stopped_ = true;
     started_ = false;
@@ -1383,9 +1415,7 @@ std::chrono::steady_clock::time_point GuardianEngine::stop_stage_begin_locked() 
                                : std::chrono::steady_clock::time_point{};
 }
 
-void GuardianEngine::note_stop_stage_locked(const char* stage,
-                                           std::chrono::steady_clock::time_point began,
-                                           bool ok) noexcept {
+void GuardianEngine::stop_stage_hook_locked(const char* stage) noexcept {
     if (!baseline_persister_)
         return;
     try {
@@ -1393,22 +1423,26 @@ void GuardianEngine::note_stop_stage_locked(const char* stage,
             stop_stage_hook_for_test_(stage);
     } catch (...) {
     }
-    baseline_persister_->stop_stage_end(began, ok);
+}
+
+void GuardianEngine::stop_stage_end_locked(
+    std::chrono::steady_clock::time_point began) noexcept {
+    if (baseline_persister_)
+        baseline_persister_->stop_stage_end(began);
 }
 
 void GuardianEngine::stop_journal_flush_locked(const char* stage) noexcept {
     const auto began = stop_stage_begin_locked();
-    bool ok = true;
+    stop_stage_hook_locked(stage);
     try {
-        ok = persist_lifecycle_journal_locked(kJournalPersistUnbounded, kJournalPersistUnbounded);
+        persist_lifecycle_journal_locked(kJournalPersistUnbounded, kJournalPersistUnbounded);
     } catch (...) {
         journal_maint_exceptions_.fetch_add(1, std::memory_order_relaxed);
-        ok = false;
     }
-    note_stop_stage_locked(stage, began, ok);
+    stop_stage_end_locked(began);
 }
 
-bool GuardianEngine::persist_lifecycle_journal_locked(std::size_t max_batches,
+void GuardianEngine::persist_lifecycle_journal_locked(std::size_t max_batches,
                                                      std::size_t max_records) {
     // mtx_ held. Gated: no durable journal work unless spark is the ACTIVE backend and
     // the path is wired (rev-4.1 §7 inertness - at prefer_spark_=false a pre-populated
@@ -1417,14 +1451,14 @@ bool GuardianEngine::persist_lifecycle_journal_locked(std::size_t max_batches,
     // PRAGMA synchronous check + a namespace_size() size probe to seed the gauges. Those
     // two boot-time reads are the only thing that touches the store while inert.
     if (!prefer_spark_ || !spark_runtime_ || !lifecycle_journal_)
-        return true;
+        return;
     // The overflow-drop counter comes back FROM the snapshot, read under its lock: the erase
     // below has to identify the prefix it wrote, and a concurrent drop-oldest shifts positions
     // (#2345 Gate 8b).
     const auto snap = spark_runtime_->snapshot_pending();
     const auto& pending = snap.records;
     if (pending.empty())
-        return true;
+        return;
     // snapshot released outbox_mu_; persist() does KV I/O holding NO runtime lock (so the
     // WRITE chain never nests outbox_mu_ under KvStore.mu_); erase re-takes outbox_mu_ for
     // ONLY the prefix persist() durably wrote (circuit-broken on the first failure - the
@@ -1443,7 +1477,6 @@ bool GuardianEngine::persist_lifecycle_journal_locked(std::size_t max_batches,
             if (!b.event_ids.empty())
                 spark_runtime_->backfill_batch_provenance(b.key, b.event_ids, b.event_ids.back());
     }
-    return written >= pending.size();
 }
 
 void GuardianEngine::persist_staged_baselines_locked(bool at_stop) noexcept {
@@ -1469,13 +1502,20 @@ void GuardianEngine::persist_staged_baselines_locked(bool at_stop) noexcept {
                 // The runtime counted each failed attempt, but that count dies with the
                 // process: this line is the only evidence the capture was lost.
                 try {
-                    spdlog::error("{}", GuardianBaselinePersister::stop_unstaged_log_line(unstaged));
+                    spdlog::error("{}",
+                                  GuardianBaselinePersister::stop_unstaged_log_line(unstaged));
                     baseline_stop_unstaged_logs_.fetch_add(1, std::memory_order_relaxed);
                 } catch (...) {
                 }
             }
         } catch (...) {
             baseline_persister_->note_firewalled_exception();
+            // The counter dies with the process: this line is the only evidence of the loss.
+            try {
+                spdlog::error("{}", GuardianBaselinePersister::stop_sweep_threw_log_line());
+                baseline_stop_sweep_threw_logs_.fetch_add(1, std::memory_order_relaxed);
+            } catch (...) {
+            }
         }
     }
     try {
@@ -1496,6 +1536,15 @@ void GuardianEngine::persist_staged_baselines_locked(bool at_stop) noexcept {
         }
     } catch (...) {
         baseline_persister_->note_firewalled_exception();
+        // Only the stop-time throw is a loss (a Forced pass leaves staging untouched and the
+        // next pass retries), and the counter dies with the process: log it.
+        if (at_stop) {
+            try {
+                spdlog::error("{}", GuardianBaselinePersister::stop_flush_threw_log_line());
+                baseline_stop_flush_threw_logs_.fetch_add(1, std::memory_order_relaxed);
+            } catch (...) {
+            }
+        }
     }
 }
 

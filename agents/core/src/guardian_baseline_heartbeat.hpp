@@ -8,10 +8,11 @@
 /// allocation failure, counted once per attempt; the rule keeps its baseline and retries
 /// staging at its next evaluations) or displaced a capture (a retarget over a
 /// still-unpersisted capture) and a capture staged with no store. A stop-time loss that is
-/// not a failed write (the flush ran out of wall budget, was skipped after a slow failure or
-/// a late start that followed store trouble, or a capture could not be staged again at stop)
-/// is logged, not counted, and a stop cut off by the shutdown watchdog leaves not even a log
-/// line (exit code 4).
+/// not a failed write (the flush ran out of wall budget, or was skipped after a slow failure
+/// or a late start that followed a slow stop stage) is logged, not counted. A capture that
+/// could not be staged again at stop is counted (per failed attempt) AND logged, but the
+/// count dies with the exiting process, so the log line is the evidence. A stop cut off by
+/// the shutdown watchdog leaves not even a log line (exit code 4).
 ///
 /// SCOPE, stated plainly: this tag covers the SPARK path only. A legacy FileGuard persist
 /// failure is logged and not counted, so an ABSENT tag is not evidence that baselines

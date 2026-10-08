@@ -3074,7 +3074,7 @@ GuardianSparkRuntime::attach_core(const std::string& key, std::string rule_id, S
         if (baseline_on_arm_file) {
             if (const auto prior = rules_.find(rule_id);
                 prior != rules_.end() && prior->second->baseline_unstaged &&
-                prior->second->eval.baseline_set) { // eval: registry_mu_ is enough, see its field doc
+                prior->second->eval.baseline_set) { // registry_mu_ suffices, see eval's doc
                 const auto prior_key = index_->key_for_rule(rule_id);
                 const auto pkit = prior_key ? keys_.find(*prior_key) : keys_.end();
                 const auto* prior_file =
@@ -4537,7 +4537,8 @@ GuardianSparkRuntime::PendingSnapshot GuardianSparkRuntime::snapshot_pending() c
 
 // #4045: staged baseline captures. The runtime only STAGES (no I/O, no KvStore); the
 // engine-owned GuardianBaselinePersister drains via snapshot/erase-if-unchanged (header block).
-bool GuardianSparkRuntime::stage_baseline_locked(const std::string& rule_id, const std::string& path,
+bool GuardianSparkRuntime::stage_baseline_locked(const std::string& rule_id,
+                                                 const std::string& path,
                                                  const std::string& hash) noexcept {
     try {
         if (fail_next_stage_baseline_.load(std::memory_order_relaxed) > 0) {
@@ -4586,6 +4587,8 @@ bool GuardianSparkRuntime::salvage_unstaged_baseline_locked(
 }
 
 std::size_t GuardianSparkRuntime::stage_unstaged_baselines() {
+    if (fail_next_unstaged_sweep_.exchange(false, std::memory_order_relaxed))
+        throw std::bad_alloc{}; // TEST-ONLY seam: as if the lock below failed
     std::lock_guard<std::mutex> lk{registry_mu_};
     unstaged_sweep_stopping_for_test_.store(stopping_ ? 1 : 0, std::memory_order_relaxed);
     std::size_t still_unstaged = 0;
@@ -4634,7 +4637,8 @@ GuardianSparkRuntime::snapshot_staged_baselines() const {
     }
 }
 
-void GuardianSparkRuntime::erase_staged_baselines_if_unchanged(std::span<const CapturedBaseline> done) {
+void GuardianSparkRuntime::erase_staged_baselines_if_unchanged(
+    std::span<const CapturedBaseline> done) {
     std::lock_guard<std::mutex> lk{registry_mu_};
     for (const CapturedBaseline& d : done) {
         const auto it = staged_baselines_.find(d.rule_id);
