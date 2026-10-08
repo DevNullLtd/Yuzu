@@ -49,12 +49,16 @@
  * - Display and banding. The returned `score` is UNROUNDED. The display
  *   precision is one decimal (kStabilityScoreScale) and the rounding rule is
  *   stability_display_score(): round half away from zero at one decimal on
- *   the computed double (std::round, exact in IEEE arithmetic). Consumers
- *   display stability_display_score(*score) formatted at one decimal, never
- *   printf of the raw double. The band is the band of that DISPLAYED value, so
- *   a page never shows "60.0 poor" or "75.0 fair", and the edges 90 / 75 / 60
- *   apply to the displayed value. Rank-flip ties use the same displayed
- *   value.
+ *   the computed double (an IEEE multiply by 10, then std::round; it can differ
+ *   from printf of the raw double on near-ties). Consumers display
+ *   stability_display_score(*score) formatted at one decimal, never printf of
+ *   the raw double. The band is the band of that DISPLAYED value, so a page
+ *   never shows "60.0 poor" or "75.0 fair", and the edges 90 / 75 / 60 apply to
+ *   the displayed value. Rank-flip ties use the same displayed value. A score
+ *   whose exact value is a half-step (x.x5) may display either neighbouring
+ *   tenth, because the computed double lands on either side of the tie; band
+ *   and display always agree with each other, and two such apps can display
+ *   one tenth apart.
  * - `floor` is the reporting-device minimum: fewer devices withholds the score
  *   as below_floor rather than showing a noisy number. Callers pass
  *   kDexCohortFloor literally; the module enforces whatever floor it is
@@ -78,10 +82,12 @@
  *   good, fair, poor). Renaming one is a contract break. `name` and
  *   `withheld` are always string literals (static storage), never owned,
  *   never freed.
- * - Identity: 100 - sum(points) == score while the weights sum to at most 100
- *   (each term then lies in [0, 1] of its weight, exactly so for N below
- *   2^53). Custom weights summing above 100 can push the TOTAL past 100, which
- *   clamps the score to 0; the rows keep raw points.
+ * - Identity: 100 - sum(points) equals score, to within a few ulp in floating
+ *   point, while the weights sum to at most 100 (each term then lies in [0, 1]
+ *   of its weight). Consumers re-derive the display via
+ *   stability_display_score(*score), never by re-summing rows. Custom weights
+ *   summing above 100 can push the TOTAL past 100, which clamps the score to 0;
+ *   the rows keep raw points.
  *
  * The constants are uncalibrated against real fleet data; recalibration is a
  * constant edit.
@@ -205,12 +211,12 @@ namespace stability_detail {
 [[nodiscard]] inline StabilityScore
 compute_stability_score(const StabilityInputs& in, std::int64_t floor,
                         const StabilityWeights& w = kStabilityWeights) {
-    const std::int64_t N = in.reporting_devices;
-    const std::int64_t A = in.devices_affected;
+    const std::int64_t reporting = in.reporting_devices;
+    const std::int64_t affected = in.devices_affected;
     const std::int64_t crash = in.crash_events;
     const std::int64_t hang = in.hang_events;
 
-    if (N <= 0)
+    if (reporting <= 0)
         return stability_detail::withheld_result("no_population");
     if (!stability_weights_valid(w))
         return stability_detail::withheld_result("invalid_weights");
@@ -218,17 +224,17 @@ compute_stability_score(const StabilityInputs& in, std::int64_t floor,
     // A * cap, so skipping the multiply is exact. After the non-negative checks
     // A - crash cannot overflow.
     const bool cap_checkable =
-        A <= (std::numeric_limits<std::int64_t>::max)() / kStabilityPerDeviceEventCap;
-    if (A < 0 || crash < 0 || hang < 0 || A > N ||
-        (cap_checkable &&
-         (crash > A * kStabilityPerDeviceEventCap || hang > A * kStabilityPerDeviceEventCap)) ||
-        A - crash > hang)
+        affected <= (std::numeric_limits<std::int64_t>::max)() / kStabilityPerDeviceEventCap;
+    if (affected < 0 || crash < 0 || hang < 0 || affected > reporting ||
+        (cap_checkable && (crash > affected * kStabilityPerDeviceEventCap ||
+                           hang > affected * kStabilityPerDeviceEventCap)) ||
+        affected - crash > hang)
         return stability_detail::withheld_result("inconsistent");
-    if (N < floor)
+    if (reporting < floor)
         return stability_detail::withheld_result("below_floor");
 
-    const double n = static_cast<double>(N);
-    const double a = static_cast<double>(A);
+    const double n = static_cast<double>(reporting);
+    const double a = static_cast<double>(affected);
     const double cap = static_cast<double>(kStabilityPerDeviceEventCap);
 
     StabilityScore r;

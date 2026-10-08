@@ -58,11 +58,15 @@ void require_withheld(const StabilityScore& r, const char* why) {
 }
 
 // The floor is a mandatory argument. A concept (not std::is_invocable) so a
-// regression is a red case, not a broken translation unit.
+// regression is a red case, not a broken translation unit. The flip probe
+// passes weights where the floor belongs: it is well-formed only if `floor`
+// stops being the argument right after the apps (removed, or moved behind the
+// defaulted tail).
 template <class In>
 concept ScoreWithoutFloor = requires(const In& i) { compute_stability_score(i); };
 template <class V>
-concept FlipWithoutFloor = requires(const V& v) { stability_rank_flip(v); };
+concept FlipWithoutFloor =
+    requires(const V& v, const StabilityWeights& w) { stability_rank_flip(v, w); };
 } // namespace
 
 TEST_CASE("stability: failing on every device", "[dex][stability]") {
@@ -293,6 +297,17 @@ TEST_CASE("stability: display score rounds half away from zero at one decimal",
     CHECK(stability_display_score(74.94) == 74.9);
     CHECK(stability_display_score(0.0) == 0.0);
     CHECK(stability_display_score(100.0) == 100.0);
+    // Exact ties: 84.25 and 84.45 times 10 are exactly 842.5 and 844.5 in double
+    // arithmetic, so half-away goes up on both; round-half-even would give 84.2
+    // and 84.4.
+    CHECK(stability_display_score(84.25) == 84.3);
+    CHECK(stability_display_score(84.45) == 84.5);
+    // A cohort that really scores 84.25: 100 - 60 * 32/160 - 20 * 150/800
+    // = 100 - 12 - 3.75, every term exact in binary.
+    auto tie = compute_stability_score(mk(160, 32, 150, 0), kFloor);
+    REQUIRE(tie.score.has_value());
+    CHECK(*tie.score == 84.25);
+    CHECK(stability_display_score(*tie.score) == 84.3);
 }
 
 TEST_CASE("stability: band edges are banded on the displayed score", "[dex][stability]") {
@@ -410,6 +425,27 @@ TEST_CASE("stability: rank flip under perturbed weights", "[dex][stability]") {
     CHECK(sf->second == 2);
 
     CHECK_FALSE(stability_rank_flip({x, y}, kFloor, {kNaN, 70, 8, 12}).has_value());
+
+    // "Lowest i, then lowest j" among several reversing pairs. Five comparable
+    // apps at N = 1000 with no hangs. With base weights (60, 20, 8, 12) and
+    // `pert` (10, 70, 8, 12) the score is 100 - 0.06 A - 0.004 crash (base) and
+    // 100 - 0.01 A - 0.014 crash (pert); displayed at one decimal:
+    //   app 0  A=400 crash= 640   base 73.44 -> 73.4   pert 87.04 -> 87.0
+    //   app 1  A=200 crash= 440   base 86.24 -> 86.2   pert 91.84 -> 91.8
+    //   app 2  A=220 crash= 380   base 85.28 -> 85.3   pert 92.48 -> 92.5
+    //   app 3  A=260 crash=1060   base 80.16 -> 80.2   pert 82.56 -> 82.6
+    //   app 4  A=280 crash=1340   base 77.84 -> 77.8   pert 78.44 -> 78.4
+    // Exactly three pairs reverse: (0,3), (0,4) and (1,2). The first has the
+    // lowest i and, among the two with i = 0, the lowest j; (1,2) has a higher i
+    // but a lower j than both, so last-found, j-outer and highest-j orders each
+    // return a different pair.
+    const std::vector<StabilityInputs> five{mk(1000, 400, 640), mk(1000, 200, 440),
+                                            mk(1000, 220, 380), mk(1000, 260, 1060),
+                                            mk(1000, 280, 1340)};
+    auto lex = stability_rank_flip(five, kFloor, pert);
+    REQUIRE(lex.has_value());
+    CHECK(lex->first == 0);
+    CHECK(lex->second == 3);
 }
 
 TEST_CASE("stability: rank flip ties are equal at the display precision", "[dex][stability]") {
