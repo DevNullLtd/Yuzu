@@ -63,7 +63,9 @@ namespace yuzu::server::mcp {
 // in place of RE2's 8 MiB default. RE2 spends about two thirds of it on the compiled
 // program and the rest on lazily built DFA states, so it bounds the cost of compiling ONE
 // pattern and what that one pattern can retain after matching. It is not an aggregate
-// bound: a schema can hold many patterns and a cache of validators is capped by entry count.
+// bound: a schema can hold many patterns. The prepared-validator cache
+// (instruction_param_schema.hpp) weighs each cached validator at kPatternMaxMem per compiled
+// pattern and caps the total in bytes.
 inline constexpr std::int64_t kPatternMaxMem = 512 * 1024;
 
 namespace detail {

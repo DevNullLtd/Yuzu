@@ -7,6 +7,7 @@
  * bound: the debug RE2 these tests link is far slower than release.
  */
 
+#include "bundled_content.hpp"
 #include "instruction_param_schema.hpp"
 
 #include <catch2/catch_test_macros.hpp>
@@ -657,4 +658,205 @@ TEST_CASE("param-schema cache: many threads first-calling one schema all get a v
         t.join();
     CHECK(bad == 0);
     CHECK(cache.size() == 2);
+}
+
+namespace {
+
+using yuzu::server::mcp::kPatternMaxMem;
+
+std::size_t weight_of(const std::string& schema) {
+    return build(schema).estimated_retained_bytes();
+}
+
+// `weight` is the documented formula, term by term.
+std::size_t expected_weight(const std::string& schema, std::size_t props, std::size_t members,
+                            std::size_t patterns) {
+    return kParamValidatorFixedBytes + props * kParamValidatorPerPropertyBytes +
+           members * kParamValidatorPerEnumMemberBytes + schema.size() +
+           patterns * static_cast<std::size_t>(kPatternMaxMem);
+}
+
+// kMaxSchemaProperties array properties, each carrying one `items` pattern: the most patterns
+// a schema may declare. `salt` lengthens one pattern so the text (so the cache key) differs.
+std::string hostile_schema(std::size_t salt) {
+    json props = json::object();
+    for (std::size_t i = 0; i < kMaxSchemaProperties; ++i)
+        props["p" + std::to_string(i)] = {
+            {"type", "array"},
+            {"items", {{"type", "string"}, {"pattern", "^a" + std::string(i == 0 ? salt : 0, 'b') + "$"}}}};
+    return json{{"type", "object"}, {"properties", props}}.dump();
+}
+
+}  // namespace
+
+TEST_CASE("param-schema weight: text plus fixed, per-property, per-enum-member and per-pattern terms",
+          "[instr][param-schema][cache]") {
+    const std::string plain = one_prop(R"({"type":"string"})");
+    CHECK(weight_of(plain) == expected_weight(plain, 1, 0, 0));
+    // A pattern-free schema weighs its text plus small allowances, nowhere near a pattern.
+    CHECK(weight_of(plain) < static_cast<std::size_t>(kPatternMaxMem));
+
+    const std::string enum2 = one_prop(R"({"type":"string","enum":["a","bb"]})");
+    CHECK(weight_of(enum2) == expected_weight(enum2, 1, 2, 0));
+
+    for (std::size_t n : {1u, 3u, 8u}) {
+        const std::string s = many_props(n, "^a$");
+        CHECK(weight_of(s) == expected_weight(s, n, 0, n));
+        CHECK(weight_of(s) >= n * static_cast<std::size_t>(kPatternMaxMem));
+    }
+    // The fixed datetime and guid patterns are compiled per validator, and an array's `items`
+    // pattern counts like a property's own.
+    const std::string fixed = json{{"type", "object"},
+                                   {"properties",
+                                    {{"t", {{"type", "datetime"}}},
+                                     {"g", {{"type", "guid"}}},
+                                     {"a", {{"type", "array"},
+                                            {"items", {{"type", "string"}, {"pattern", "x"}}}}}}}}
+                                  .dump();
+    CHECK(weight_of(fixed) == expected_weight(fixed, 3, 0, 3));
+
+    // Surrounding whitespace is trimmed before the text is measured; absent weighs nothing.
+    CHECK(weight_of("  " + plain + "\n") == expected_weight(plain, 1, 0, 0));
+    CHECK(build("{}").estimated_retained_bytes() == 0);
+    CHECK(build("").estimated_retained_bytes() == 0);
+
+    // The most patterns a schema may declare weighs tens of MiB, never a few KiB.
+    CHECK(weight_of(hostile_schema(0)) >=
+          (kMaxSchemaProperties - 1) * static_cast<std::size_t>(kPatternMaxMem));
+}
+
+TEST_CASE("param-schema cache: eviction is by bytes, least recently used first",
+          "[instr][param-schema][cache]") {
+    const std::string s = one_prop(R"({"type":"string"})");
+    const std::size_t w = weight_of(s);
+    REQUIRE(w > 0);
+
+    ParamValidatorCache cache(kParamValidatorCacheEntries, 2 * w + w / 2);
+    auto a = cache.get("a", s);
+    auto b = cache.get("b", s);
+    REQUIRE((a && b));
+    CHECK(cache.size() == 2);
+    CHECK(cache.bytes() == 2 * w);
+
+    CHECK(cache.get("a", s)->get() == a->get());  // touch a: b is now least recent
+    auto c = cache.get("c", s);                    // 3w > budget: b goes
+    REQUIRE(c.has_value());
+    CHECK(cache.size() == 2);
+    CHECK(cache.bytes() == 2 * w);
+    CHECK(cache.get("a", s)->get() == a->get());  // survived
+    CHECK(cache.get("c", s)->get() == c->get());
+    CHECK(cache.get("b", s)->get() != b->get());  // evicted, rebuilt
+    CHECK(cache.bytes() <= 2 * w + w / 2);
+
+    // A heavier entry evicts the least recent light ones until the total fits again.
+    const std::string two_enum = one_prop(R"({"type":"string","enum":["a","bb"]})");
+    const std::size_t w2 = weight_of(two_enum);
+    REQUIRE(w2 > w);
+    REQUIRE(w + w2 <= 2 * w + w / 2);
+    ParamValidatorCache mixed(kParamValidatorCacheEntries, 2 * w + w / 2);
+    auto ma = mixed.get("a", s);
+    auto mb = mixed.get("b", s);
+    REQUIRE((ma && mb));
+    REQUIRE(mixed.get("c", two_enum).has_value());  // 2w + w2 > budget: only a goes
+    CHECK(mixed.size() == 2);
+    CHECK(mixed.bytes() == w + w2);
+    CHECK(mixed.get("b", s)->get() == mb->get());
+    CHECK(mixed.get("a", s)->get() != ma->get());  // evicted, rebuilt
+}
+
+TEST_CASE("param-schema cache: an entry heavier than the whole budget is returned, not retained",
+          "[instr][param-schema][cache]") {
+    const std::string light = one_prop(R"({"type":"string"})");
+    const std::string heavy = many_props(2, "^a$");  // two patterns
+    const std::size_t w_light = weight_of(light);
+    const std::size_t w_heavy = weight_of(heavy);
+    REQUIRE(w_heavy > 4 * w_light);
+
+    ParamValidatorCache cache(kParamValidatorCacheEntries, 2 * w_light);
+    auto kept = cache.get("light", light);
+    REQUIRE(kept.has_value());
+    REQUIRE(cache.size() == 1);
+
+    auto big = cache.get("heavy", heavy);
+    REQUIRE(big.has_value());
+    CHECK_FALSE((*big)->check(json{{"p0", "a"}, {"p1", "a"}}).has_value());  // fully usable
+    CHECK((*big)->check(json{{"p0", "b"}}).has_value());
+    CHECK(cache.size() == 1);                              // not retained
+    CHECK(cache.bytes() == w_light);                       // nothing was evicted for it
+    CHECK(cache.get("light", light)->get() == kept->get());  // the resident entry survived
+    CHECK(cache.get("heavy", heavy)->get() != big->get());   // asking again rebuilds
+
+    // A budget of exactly the entry's weight retains it; one byte less does not.
+    ParamValidatorCache exact(kParamValidatorCacheEntries, w_light);
+    REQUIRE(exact.get("a", light).has_value());
+    CHECK(exact.size() == 1);
+    ParamValidatorCache under(kParamValidatorCacheEntries, w_light - 1);
+    REQUIRE(under.get("a", light).has_value());
+    CHECK(under.size() == 0);
+    CHECK(under.bytes() == 0);
+    ParamValidatorCache none(kParamValidatorCacheEntries, 0);
+    REQUIRE(none.get("a", light).has_value());
+    CHECK(none.size() == 0);
+}
+
+TEST_CASE("param-schema cache: the entry ceiling is a safety net on top of the byte budget",
+          "[instr][param-schema][cache]") {
+    const std::string s = one_prop(R"({"type":"string"})");
+    const std::size_t w = weight_of(s);
+    ParamValidatorCache cache(2, 1000 * w);  // bytes would allow 1000 entries
+    for (const char* id : {"a", "b", "c", "d"})
+        REQUIRE(cache.get(id, s).has_value());
+    CHECK(cache.size() == 2);
+    CHECK(cache.bytes() == 2 * w);
+    CHECK(kParamValidatorCacheEntries > 128);
+}
+
+TEST_CASE("param-schema cache: hostile max-pattern schemas cannot push the total past the budget",
+          "[instr][param-schema][cache]") {
+    ParamValidatorCache cache;  // the production bounds
+    const std::string small = one_prop(R"({"type":"string"})");
+    for (const char* id : {"s1", "s2", "s3"})
+        REQUIRE(cache.get(id, small).has_value());
+
+    std::size_t admitted = 0;
+    for (std::size_t salt = 0; salt < 4; ++salt) {
+        auto r = cache.get("hostile-" + std::to_string(salt), hostile_schema(salt));
+        REQUIRE(r.has_value());
+        CHECK_FALSE((*r)->check(json{{"p1", json::array({"a"})}}).has_value());
+        CHECK(cache.bytes() <= kParamValidatorCacheMaxBytes);
+        ++admitted;
+    }
+    // Each hostile schema weighs 128 patterns' worth, so they cannot all stay.
+    CHECK(cache.size() < 3 + admitted);
+    CHECK(cache.size() >= 1);
+}
+
+TEST_CASE("param-schema cache: the shipped catalogue fits in half the production budget",
+          "[instr][param-schema][cache]") {
+    ParamValidatorCache cache;
+    std::size_t total = 0;
+    std::size_t cached = 0;
+    std::size_t definitions = 0;
+    for (const auto& raw : yuzu::server::kBundledDefinitions) {
+        const json env = json::parse(raw, nullptr, false);
+        REQUIRE_FALSE(env.is_discarded());
+        ++definitions;
+        if (!env.contains("parameter_schema") || !env["parameter_schema"].is_string())
+            continue;
+        const auto id = env.value("id", std::string{});
+        const auto schema = env["parameter_schema"].get<std::string>();
+        auto r = cache.get(id, schema);
+        REQUIRE(r.has_value());
+        if ((*r)->absent())
+            continue;
+        total += (*r)->estimated_retained_bytes();
+        ++cached;
+    }
+    INFO("definitions=" << definitions << " cached=" << cached << " total=" << total);
+    REQUIRE(cached > 0);
+    CHECK(total <= kParamValidatorCacheMaxBytes / 2);
+    // Nothing was evicted: a catalogue sweep after the first pass would hit every entry.
+    CHECK(cache.size() == cached);
+    CHECK(cache.bytes() == total);
+    CHECK(cached <= kParamValidatorCacheEntries);
 }

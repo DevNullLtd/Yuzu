@@ -23,6 +23,7 @@
 #include "execution_event_bus.hpp"
 #include "stream_budget.hpp"
 #include "execution_tracker.hpp"
+#include "instruction_param_schema.hpp" // ParamValidatorCache (Deps injection)
 #include "instruction_schema_test_util.hpp"
 #include "instruction_store.hpp"
 #include "mcp_jsonrpc.hpp" // mcp::json_exceeds_depth / kMcpMaxJsonDepth
@@ -329,7 +330,10 @@ struct ExecHarness {
                          // failure) without a real WorkflowEngine/Postgres
                          // connection. Same captured-by-value-at-construction
                          // contract as schedule_api_override above.
-                         std::shared_ptr<WorkflowApi> workflow_api_override = {})
+                         std::shared_ptr<WorkflowApi> workflow_api_override = {},
+                         // #5562: the shared parameter_schema validator cache
+                         // ServerImpl owns. Empty = register_routes builds its own.
+                         std::shared_ptr<instr::ParamValidatorCache> param_validators_override = {})
         : stream_budget(budget),
           instr_db(uniq("wf-routes-inst")),
           wf_db(uniq("wf-routes-wf")) {
@@ -525,6 +529,7 @@ struct ExecHarness {
         wf_deps.stream_budget = stream_budget; // ADR-0034 admission (nullptr = unmetered)
         wf_deps.metrics = &metrics;            // #2500 targeting-refusal counter
         wf_deps.capability_registry = &capability_registry; // BR-001 targeting gate
+        wf_deps.param_validators = std::move(param_validators_override);
         routes.register_routes(sink, std::move(wf_deps));
     }
 
@@ -2707,6 +2712,40 @@ TEST_CASE("instruction execute: a definition with no stored schema skips validat
     CHECK(ok->status == 200);
     CHECK(h.last_dispatch_params.size() == 1);  // `n` has a default: it is validated, not injected
     CHECK(h.last_dispatch_params.at("level") == "debug");
+}
+
+TEST_CASE("instruction execute: the validator cache comes from Deps, and a null one falls back "
+          "to a private cache",
+          "[pg][workflow][executions][execute][param-schema]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    constexpr const char* kBad = R"({"agent_ids":["agent-1"],"params":{"level":"SECRET-VALUE"}})";
+
+    auto injected = std::make_shared<instr::ParamValidatorCache>();
+    {
+        ExecHarness h(pool, /*with_bus=*/true, /*budget=*/nullptr, /*wire_exec_visible=*/true,
+                      /*with_workflow_engine=*/false, /*wire_fleet_read_fn=*/true,
+                      /*with_product_pack_store=*/false, /*auth_override=*/{},
+                      /*fleet_read_override=*/{}, /*with_schedule_engine=*/false,
+                      /*schedule_api_override=*/{}, /*workflow_api_override=*/{}, injected);
+        make_schema_def(h, "def-PS7", kLevelSchema);
+        REQUIRE(injected->size() == 0);
+        auto res = h.sink.Post("/api/instructions/def-PS7/execute", kBad);
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        CHECK(injected->size() == 1);  // the route compiled into the cache it was handed
+        CHECK(injected->bytes() > 0);
+    }
+    // No cache wired: the route still validates, through a private fallback cache.
+    {
+        ExecHarness h(pool);
+        make_schema_def(h, "def-PS8", kLevelSchema);
+        auto res = h.sink.Post("/api/instructions/def-PS8/execute", kBad);
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        CHECK(res->body.find("invalid params: /level: ") != std::string::npos);
+        CHECK(injected->size() == 1);  // the earlier harness's cache is not shared implicitly
+    }
 }
 
 TEST_CASE("instruction execute: seeding creates every (route, reason) series at 0",

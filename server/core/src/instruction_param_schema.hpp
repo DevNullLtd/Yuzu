@@ -74,7 +74,19 @@ inline constexpr std::size_t kMaxSchemaPatternProgramSize = 65536;
 inline constexpr std::size_t kMaxPatternMatchedStringBytes = 64 * 1024;
 inline constexpr std::uint64_t kMaxPatternMatchWork = 16ULL * 1024 * 1024;
 inline constexpr std::int64_t kIntegerBoundLimit = 9007199254740992;  // 2^53
-inline constexpr std::size_t kParamValidatorCacheEntries = 128;
+// Cache bounds. The byte budget is the real bound; the entry ceiling only caps the per-entry
+// bookkeeping (key, list node, map node) for validators that weigh almost nothing. The budget is
+// twice what a 128-pattern schema is estimated at (128 x mcp::kPatternMaxMem is 64 MiB), and a
+// test pins the shipped catalogue's total estimate at or below half of it.
+inline constexpr std::size_t kParamValidatorCacheEntries = 4096;
+inline constexpr std::size_t kParamValidatorCacheMaxBytes = 128ULL * 1024 * 1024;
+// Weight terms of ParamValidator::estimated_retained_bytes(), besides the schema text length
+// and one mcp::kPatternMaxMem per compiled pattern: a fixed cost per validator, a cost per
+// declared property, and a cost per enum member (the compiled schema keeps each member as a
+// JSON value, which for a short member costs far more than its text).
+inline constexpr std::size_t kParamValidatorFixedBytes = 4096;
+inline constexpr std::size_t kParamValidatorPerPropertyBytes = 1024;
+inline constexpr std::size_t kParamValidatorPerEnumMemberBytes = 128;
 
 // Immutable, move-only; check() is const and thread-safe. A moved-from validator is
 // neither absent nor usable: check() on it returns a violation, never a pass.
@@ -88,6 +100,13 @@ class ParamValidator {
 
     // True when the stored schema declared nothing (see PRESENCE).
     [[nodiscard]] bool absent() const noexcept;
+
+    // A conservative upper bound, in bytes, of what this validator keeps alive: the fixed,
+    // per-property and per-enum-member allowances above, the schema text length, and
+    // mcp::kPatternMaxMem for EACH compiled RE2 pattern (RE2 caps one pattern's memory there,
+    // including its lazily grown DFA). It is an estimate for cache accounting, not a
+    // measurement. Computed once at prepare time. 0 for an absent or moved-from validator.
+    [[nodiscard]] std::size_t estimated_retained_bytes() const noexcept;
 
     // First violation, or nullopt if `params` conforms. `params` is the caller's value:
     // an object, or null (omitted), read as an empty object; any other JSON type is a
@@ -117,32 +136,45 @@ prepare_param_validator(std::string_view stored_schema_json);
 // Compilation runs OUTSIDE the lock, so concurrent first calls for one schema may each
 // compile it (accepted: there is no single-flight). Failures and absent validators are
 // never cached. If the digest cannot be computed the call compiles without caching.
-// The cache is capped by ENTRY count, not bytes. What it can hold is entries x the patterns in
-// a schema (at most one per property, a string's own `pattern` or an array's `items` pattern,
-// so at most kMaxSchemaProperties) x what one compiled pattern retains, and
-// mcp::kPatternMaxMem bounds only that last factor.
+//
+// The cache is bounded by BYTES. Each entry is weighed by ParamValidator::
+// estimated_retained_bytes() and least-recently-used entries are evicted until the total is at
+// most the byte budget; the entry ceiling is only a safety net on bookkeeping. An entry whose
+// own weight exceeds the whole budget is returned to the caller but not retained, so it never
+// evicts anything. The most a schema can weigh is about kMaxSchemaProperties x
+// mcp::kPatternMaxMem; an entry that fits the budget can still displace older entries, but the
+// total never exceeds the budget. The weights are upper-bound estimates, so the budget bounds
+// the estimate, not a measured resident size.
 class ParamValidatorCache {
   public:
     using Result =
         std::expected<std::shared_ptr<const ParamValidator>, std::vector<std::string>>;
 
-    explicit ParamValidatorCache(std::size_t max_entries = kParamValidatorCacheEntries);
+    // max_entries < 1 is read as 1. max_bytes == 0 retains nothing.
+    explicit ParamValidatorCache(std::size_t max_entries = kParamValidatorCacheEntries,
+                                 std::size_t max_bytes = kParamValidatorCacheMaxBytes);
 
     [[nodiscard]] Result get(const std::string& definition_id, const std::string& stored_schema);
 
     // Entries currently held (for tests).
     [[nodiscard]] std::size_t size() const;
 
+    // Sum of the weights of the entries currently held (for tests).
+    [[nodiscard]] std::size_t bytes() const;
+
   private:
     struct Entry {
         std::string key;
         std::shared_ptr<const ParamValidator> validator;
+        std::size_t weight = 0;
     };
 
     const std::size_t max_entries_;
+    const std::size_t max_bytes_;
     mutable std::mutex mu_;
     std::list<Entry> lru_;  // front = most recently used
     std::unordered_map<std::string, std::list<Entry>::iterator> index_;
+    std::size_t total_bytes_ = 0;  // sum of lru_ weights; guarded by mu_
 };
 
 }  // namespace yuzu::server::instr

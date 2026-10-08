@@ -13,6 +13,7 @@
 #include "custom_properties_store.hpp"
 #include "dispatch_caller.hpp" // PLAN-006: DispatchCaller — the principal threaded to dispatch_fn
 #include "execution_tracker.hpp"
+#include "instruction_param_schema.hpp" // ParamValidatorCache (Deps::param_validators)
 #include "instruction_store.hpp"
 #include "policy_store.hpp"
 #include "product_pack_store.hpp"
@@ -26,6 +27,7 @@
 
 #include <cstddef>
 #include <functional>
+#include <memory>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -234,6 +236,11 @@ public:
         /// that leaves this nullptr is asserting an unwired-classifier
         /// configuration never reached in production.
         const yuzu::server::CommandCapabilityRegistry* capability_registry{nullptr};
+        /// The prepared `parameter_schema` validators for `POST /api/instructions/:id/execute`.
+        /// One cache owned by ServerImpl and shared by every call site, so its byte budget is
+        /// global rather than per route-registration. nullptr = register_routes creates a
+        /// private cache (test harnesses that build Deps by hand).
+        std::shared_ptr<instr::ParamValidatorCache> param_validators;
     };
 
     /// Production overload — wraps `httplib::Server&` in an HttplibRouteSink

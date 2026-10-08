@@ -2474,8 +2474,10 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                     "application/json");
             });
 
-    // Prepared `parameter_schema` validators for the execute handler below.
-    auto param_validators = std::make_shared<instr::ParamValidatorCache>();
+    // Prepared `parameter_schema` validators for the execute handler below: the shared cache
+    // from Deps, or a private one when the caller wired none.
+    auto param_validators = deps.param_validators ? deps.param_validators
+                                                  : std::make_shared<instr::ParamValidatorCache>();
 
     // -- Single Instruction Execution API --------------------------------------
 
