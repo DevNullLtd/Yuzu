@@ -67,6 +67,10 @@ concept ScoreWithoutFloor = requires(const In& i) { compute_stability_score(i); 
 template <class V>
 concept FlipWithoutFloor =
     requires(const V& v, const StabilityWeights& w) { stability_rank_flip(v, w); };
+// The one-argument form: well-formed only if floor, perturbed and base are all
+// defaulted, which the two-argument probe above cannot see.
+template <class V>
+concept FlipWithOnlyApps = requires(const V& v) { stability_rank_flip(v); };
 } // namespace
 
 TEST_CASE("stability: failing on every device", "[dex][stability]") {
@@ -108,6 +112,11 @@ TEST_CASE("stability: cross-field consistency", "[dex][stability]") {
     require_withheld(compute_stability_score(mk(1000, 1, 5, -1), kFloor), "inconsistent");
     // Only the crash < 0 guard catches this one.
     require_withheld(compute_stability_score(mk(1000, 1, -1, 5), kFloor), "inconsistent");
+    // The affected < 0 guard is the only thing that withholds this one; without
+    // it A * cap overflows (signed overflow under UBSan).
+    require_withheld(
+        compute_stability_score(mk(1000, (std::numeric_limits<std::int64_t>::min)(), 0), kFloor),
+        "inconsistent");
     CHECK(compute_stability_score(mk(1000, 10, 50, 50), kFloor).score.has_value());
     require_scored(compute_stability_score(mk(10, 0, 0), kFloor), 100.0,
                    StabilityBand::Excellent);
@@ -154,6 +163,7 @@ TEST_CASE("stability: withheld ladder", "[dex][stability]") {
 TEST_CASE("stability: the floor argument is mandatory and honoured", "[dex][stability]") {
     CHECK_FALSE(ScoreWithoutFloor<StabilityInputs>);
     CHECK_FALSE(FlipWithoutFloor<std::vector<StabilityInputs>>);
+    CHECK_FALSE(FlipWithOnlyApps<std::vector<StabilityInputs>>);
     require_withheld(compute_stability_score(mk(50, 1, 1), 100), "below_floor");
     CHECK(compute_stability_score(mk(50, 1, 1), 50).score.has_value());
     CHECK(compute_stability_score(mk(5, 1, 1), 5).score.has_value());
@@ -181,15 +191,21 @@ TEST_CASE("stability: weight contract", "[dex][stability]") {
     require_withheld(compute_stability_score(mk(0, 0, 0), kFloor, {kNaN, 20, 8, 12}),
                      "no_population");
 
-    double StabilityWeights::*const slots[] = {
-        &StabilityWeights::breadth, &StabilityWeights::crashes, &StabilityWeights::hangs,
-        &StabilityWeights::regression};
-    for (auto slot : slots) {
+    const struct {
+        const char* name;
+        double StabilityWeights::*slot;
+    } slots[] = {{"breadth", &StabilityWeights::breadth},
+                 {"crashes", &StabilityWeights::crashes},
+                 {"hangs", &StabilityWeights::hangs},
+                 {"regression", &StabilityWeights::regression}};
+    for (const auto& [name, slot] : slots) {
         for (double bad : {kNaN, kInf, -kInf, -1.0}) {
+            INFO(name << " = " << bad);
             StabilityWeights bw = kStabilityWeights;
             bw.*slot = bad;
             CHECK_FALSE(stability_weights_valid(bw));
         }
+        INFO(name << " = 0");
         StabilityWeights zw = kStabilityWeights;
         zw.*slot = 0.0;
         CHECK(stability_weights_valid(zw));
@@ -252,7 +268,16 @@ TEST_CASE("stability: regression term", "[dex][stability]") {
     CHECK(f.deductions[3].points == Approx(6.0));
     require_scored(f, 86.8, StabilityBand::Good);
     CHECK(reg(Rr{3.0, 9.0}).deductions[3].points == Approx(12.0));
-    // A previous version with no events gives an open upper bound; lower alone counts.
+    // The regression weight is read from the weights, not fixed at 12:
+    // 100 - (6.0 + 1.2 + 0 + 6 * clamp((3 - 1) / 2)) = 86.8.
+    auto custom = compute_stability_score(mk(1000, 100, 300, 0, Rr{3.0, 9.0}), kFloor,
+                                          StabilityWeights{60, 20, 8, 6});
+    REQUIRE(custom.deductions.size() == 4);
+    CHECK(custom.deductions[3].points == Approx(6.0));
+    require_scored(custom, 86.8, StabilityBand::Good);
+    // A previous version with no events gives an open upper bound; lower alone
+    // counts. The statistics sibling labels such an interval unreliable, and it
+    // is still assessed: the label is for display, never suppression.
     CHECK(reg(Rr{3.0, kInf}).deductions[3].points == Approx(12.0));
 
     for (auto rr : {Rr{5.0, 2.0}, Rr{kNaN, 2.0},
@@ -303,7 +328,9 @@ TEST_CASE("stability: display score rounds half away from zero at one decimal",
     CHECK(stability_display_score(84.25) == 84.3);
     CHECK(stability_display_score(84.45) == 84.5);
     // A cohort that really scores 84.25: 100 - 60 * 32/160 - 20 * 150/800
-    // = 100 - 12 - 3.75, every term exact in binary.
+    // = 100 - 12 - 3.75. The products land on 12.0 and 3.75 exactly (32/160 is
+    // not representable, its product with 60 still rounds to 12.0), so the
+    // score is exactly 84.25.
     auto tie = compute_stability_score(mk(160, 32, 150, 0), kFloor);
     REQUIRE(tie.score.has_value());
     CHECK(*tie.score == 84.25);
@@ -465,4 +492,14 @@ TEST_CASE("stability: rank flip ties are equal at the display precision", "[dex]
     auto f = stability_rank_flip({mk(1000, 300, 300), mk(1000, 200, 1000)}, kFloor,
                                  StabilityWeights{10, 70, 8, 12});
     CHECK(f.has_value());
+    // The narrowest real gap: one display step. Displayed scores, base then
+    // perturbed (weights {10, 70, 8, 12}):
+    //   app 0 (A=110, crash=110)  93.0 -> 97.4   (100 - 6.6 - 0.44, 100 - 1.1 - 1.54)
+    //   app 1 (A=100, crash=220)  93.1 -> 95.9   (100 - 6.0 - 0.88, 100 - 1.0 - 3.08)
+    // 93.0 < 93.1 flips to 97.4 > 95.9, so a tie widened past one step misses it.
+    auto narrow = stability_rank_flip({mk(1000, 110, 110), mk(1000, 100, 220)}, kFloor,
+                                      StabilityWeights{10, 70, 8, 12});
+    REQUIRE(narrow.has_value());
+    CHECK(narrow->first == 0);
+    CHECK(narrow->second == 1);
 }

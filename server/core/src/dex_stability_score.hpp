@@ -40,54 +40,69 @@
  *   ordering check. An unusable interval leaves regression unassessed at 0
  *   points. The caller passes nullopt (never a default
  *   StabilityRateRatioInterval{0, 0}, which is a valid interval scoring 0)
- *   when the interval is unreliable or either arm is below the cohort floor;
- *   `floor` here covers N only.
- * - Bands: excellent >= 90, good >= 75, fair >= 60, else poor. This is the
- *   fleet health-score band (build_dex_health_model, dex_read_model.cpp); the
- *   per-device buckets there (great / fair / poor at 90 / 75) are a different
- *   scale.
+ *   when no interval exists or either arm is below the cohort floor; `floor`
+ *   here covers N only. The statistics sibling's `reliable` flag is a LABEL
+ *   for display, never suppression: an interval on few events is passed as it
+ *   is, because only the lower bound is read and it already carries that
+ *   uncertainty. Every +infinity upper bound the sibling produces is labelled
+ *   unreliable, so suppressing unreliable intervals would make the open upper
+ *   bound unreachable.
+ * - Bands: excellent >= 90, good >= 75, fair >= 60, else poor. These are the
+ *   edges and labels of the fleet health-score band (build_dex_health_model,
+ *   dex_read_model.cpp); the per-device buckets there (great / fair / poor at
+ *   90 / 75) are a different scale. The rule differs: the health page bands
+ *   the RAW double and prints it at zero decimals, while this module bands the
+ *   one-decimal DISPLAY value, so 89.96 reads "good" there and "excellent"
+ *   here. A page must not share one band expression across the two.
  * - Display and banding. The returned `score` is UNROUNDED. The display
  *   precision is one decimal (kStabilityScoreScale) and the rounding rule is
  *   stability_display_score(): round half away from zero at one decimal on
  *   the computed double (an IEEE multiply by 10, then std::round; it can differ
- *   from printf of the raw double on near-ties). Consumers display
- *   stability_display_score(*score) formatted at one decimal, never printf of
- *   the raw double. The band is the band of that DISPLAYED value, so a page
- *   never shows "60.0 poor" or "75.0 fair", and the edges 90 / 75 / 60 apply to
- *   the displayed value. Rank-flip ties use the same displayed value. A score
- *   whose exact value is a half-step (x.x5) may display either neighbouring
- *   tenth, because the computed double lands on either side of the tie; band
- *   and display always agree with each other, and two such apps can display
- *   one tenth apart.
+ *   from printf of the raw double on near-ties). Consumers display and
+ *   serialise stability_display_score(*score) formatted at one decimal, never
+ *   printf of the raw double, and never the raw score beside the band (JSON
+ *   carrying 89.96 with band "excellent" would contradict itself). The band is
+ *   the band of that DISPLAYED value, so a page never shows "60.0 poor" or
+ *   "75.0 fair", and the edges 90 / 75 / 60 apply to the displayed value.
+ *   Rank-flip ties use the same displayed value. A score whose exact value is
+ *   a half-step (x.x5) may display either neighbouring tenth, because the
+ *   computed double lands on either side of the tie; band and display always
+ *   agree with each other, and two such apps can display one tenth apart.
  * - `floor` is the reporting-device minimum: fewer devices withholds the score
- *   as below_floor rather than showing a noisy number. Callers pass
- *   kDexCohortFloor literally; the module enforces whatever floor it is
- *   handed. `reporting_devices` is the distinct devices that reported THIS
- *   application/version in the window, never fleet size.
+ *   as below_floor, so that no small cohort reads as an individual device's
+ *   behaviour. Callers pass kDexCohortFloor literally; the module enforces
+ *   whatever floor it is handed. `reporting_devices` is the distinct devices
+ *   that reported THIS application/version in the window, never fleet size.
  * - Missing or contradictory population data is withheld (score and band
  *   empty, `withheld` names why), never shown as 0 or 100. A missing or
  *   unusable rate_ratio is NOT withheld: the result is scored with an
  *   unassessed regression row at 0 points, which reads identical to a clean
  *   one, so consumers must carry `assessed`.
- * - "inconsistent" covers: a negative count; A > N; crash or hang above
- *   A * cap; crash + hang below A (every affected device has an event).
- * - Score, band and the four deductions are present together exactly when
- *   `withheld` is empty. No withheld result carries N, A or any count, for
- *   every reason. A page that shows a device count may do so for below_floor
- *   only (a count under the floor identifies nobody) and never for
- *   inconsistent, invalid_weights or no_population, which are fault states.
+ * - "no_population" is the ordinary no-data state (N <= 0, including a
+ *   negative N). "inconsistent" covers: a negative A, crash or hang count;
+ *   A > N; crash or hang above A * cap; crash + hang below A (every affected
+ *   device has an event). "inconsistent" and "invalid_weights" are fault
+ *   states.
+ * - In every result of compute_stability_score, score, band and the four
+ *   deductions are present together exactly when `withheld` is empty. No
+ *   withheld result carries N, A or any count, whatever the reason. A page
+ *   that shows a count from its own input may show N, and only N, for
+ *   below_floor (a count under the floor identifies nobody); never A, crash or
+ *   hang counts, which are the individual behaviour the floor withholds, and
+ *   never any count for no_population, inconsistent or invalid_weights.
  * - The string vocabulary is closed and wire-stable: withheld reasons
  *   (no_population, invalid_weights, inconsistent, below_floor), deduction
  *   names (breadth, crashes, hangs, regression) and band labels (excellent,
  *   good, fair, poor). Renaming one is a contract break. `name` and
  *   `withheld` are always string literals (static storage), never owned,
- *   never freed.
+ *   never freed; compare them by content (std::string_view, strcmp), never
+ *   with ==, which compares pointers.
  * - Identity: 100 - sum(points) equals score, to within a few ulp in floating
- *   point, while the weights sum to at most 100 (each term then lies in [0, 1]
- *   of its weight). Consumers re-derive the display via
- *   stability_display_score(*score), never by re-summing rows. Custom weights
- *   summing above 100 can push the TOTAL past 100, which clamps the score to 0;
- *   the rows keep raw points.
+ *   point, while the weights sum to at most 100 (each term lies in [0, 1] of
+ *   its weight for N below 2^53; above that a term can exceed its weight by one
+ *   ulp). Consumers re-derive the display via stability_display_score(*score),
+ *   never by re-summing rows. Custom weights summing above 100 can push the
+ *   TOTAL past 100, which clamps the score to 0; the rows keep raw points.
  *
  * The constants are uncalibrated against real fleet data; recalibration is a
  * constant edit.
@@ -103,7 +118,9 @@
 
 namespace yuzu::server {
 
-/// Defaults are the declared weights (sum 100); the numbers live here once.
+/// Defaults are the declared weights (sum 100); the numbers live here once. A
+/// partial brace-init fills the omitted members from these defaults
+/// (StabilityWeights{0, 0, 0} keeps regression at 12).
 struct StabilityWeights {
     double breadth{60.0};
     double crashes{20.0};
@@ -133,13 +150,17 @@ inline constexpr double kStabilityScoreScale = 10.0;
 }
 
 /// The score as displayed: rounded half away from zero at one decimal.
+/// Domain: s in [0, 100], as returned by compute_stability_score; NaN or a
+/// huge value is not clamped here.
 [[nodiscard]] inline double stability_display_score(double s) {
     return std::round(s * kStabilityScoreScale) / kStabilityScoreScale;
 }
 
 enum class StabilityBand { Excellent, Good, Fair, Poor };
 
-/// Band of the DISPLAYED score (see stability_display_score).
+/// Band of the DISPLAYED score (see stability_display_score). Domain: s in
+/// [0, 100], as returned by compute_stability_score; NaN bands poor and +inf
+/// bands excellent.
 [[nodiscard]] inline StabilityBand stability_band(double score) {
     const double shown = stability_display_score(score);
     if (shown >= kStabilityBandExcellent)
@@ -221,8 +242,8 @@ compute_stability_score(const StabilityInputs& in, std::int64_t floor,
     if (!stability_weights_valid(w))
         return stability_detail::withheld_result("invalid_weights");
     // Overflow-safe: above INT64_MAX / cap every representable count is under
-    // A * cap, so skipping the multiply is exact. After the non-negative checks
-    // A - crash cannot overflow.
+    // affected * cap, so skipping the multiply is exact. After the non-negative
+    // checks affected - crash cannot overflow.
     const bool cap_checkable =
         affected <= (std::numeric_limits<std::int64_t>::max)() / kStabilityPerDeviceEventCap;
     if (affected < 0 || crash < 0 || hang < 0 || affected > reporting ||
@@ -265,13 +286,16 @@ compute_stability_score(const StabilityInputs& in, std::int64_t floor,
     return r;
 }
 
+/// Indices into the `apps` passed to stability_rank_flip: first = i, second = j,
+/// with i < j.
 struct StabilityRankFlip {
     std::size_t first;
     std::size_t second;
 };
 
 /// First pair of applications whose strict order under `base` is strictly
-/// reversed under `perturbed`; "first" is the lowest i, then the lowest j.
+/// reversed under `perturbed`; the pair is the lowest i (first), then the lowest j
+/// (second), with i < j indexing `apps`.
 /// Order is compared on the DISPLAYED scores (stability_display_score), so a
 /// tie is "equal at the display precision" and a flip is a reversal a reader
 /// can see on a page. Apps withheld under either weight set are ignored.
@@ -280,7 +304,7 @@ struct StabilityRankFlip {
 /// stable": it is also the answer for an invalid base or perturbed set, fewer
 /// than two comparable apps, and weight sets that saturate every app to 0 or
 /// 100. Callers that must tell these apart check stability_weights_valid() and
-/// the comparable count first.
+/// count the apps compute_stability_score scores under both sets first.
 ///
 /// Cost: an O(n^2) pair scan, measured at -O2 on arm64 with no flip: 0.9 ms
 /// at n = 1,000, 48 ms at 10,000, 907 ms at 50,000. The caller bounds n before
