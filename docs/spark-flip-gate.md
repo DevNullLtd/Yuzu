@@ -1202,8 +1202,10 @@ flip, with a red-first test each:
     the cause in `wedged_refusals_`.
   - (AC-6) Absence is not healthy: a blocked heartbeat thread gets the agent
     stale-evicted, so the MAX age gauge reads absent exactly when the agent is stuck.
-  - (AC-7) A server restart loses `guardian_last_reconcile_`, so every held agent
-    reconciles on its first heartbeat after the restart.
+  - (AC-7) A server restart loses the in-memory per-agent reconcile claims (the
+    `GuardianReconcileGate` claim map), so every held agent reconciles on its first
+    heartbeat after the restart, subject to the per-replica reconcile admission budget
+    (a push over the budget is shed and retried on the agent's next heartbeat).
   - (AC-8) A forged value up to 1e9 owns a MAX gauge, and one agent can skew an
     unlabelled fleet SUM; nothing consumes these gauges today. An EMPTY tag value is
     skipped before parsing and is not counted in `yuzu_fleet_guardian_health_tag_rejected`; accepted
