@@ -131,12 +131,23 @@ extern const char* const kSettingsHtml =
 
     /* ── Add user form ─────────────────────────────────────── */
     .add-user-form {
-      display: flex; gap: 0.5rem; align-items: flex-end;
+      display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: flex-end;
       margin-top: 1rem; padding-top: 0.75rem;
       border-top: 1px solid var(--border);
     }
+    /* #5572 — the base class had no flex-wrap, so a row with enough fields
+       (the OTA upload form: platform/arch selects + two file inputs +
+       rollout + mandatory + submit, the widest consumer of this class)
+       overflows its container with nowrap and pushes the submit button out
+       of view with no scroll affordance inside a form row. Wrapping is a
+       no-op for every narrower .add-user-form instance that already fits
+       on one line. */
     .add-user-form .mini-field {
       display: flex; flex-direction: column; gap: 0.2rem;
+      min-width: 0;
+    }
+    .add-user-form input[type="file"] {
+      max-width: 180px;
     }
     .add-user-form .mini-field label {
       font-size: 0.65rem; color: var(--mds-color-theme-text-tertiary); font-weight: 600;

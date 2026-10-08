@@ -2289,8 +2289,12 @@ std::string SettingsRoutes::render_updates_fragment() {
             "</div>";
 
     if (!update_registry_) {
+        // OTA is ON by default (opt-out via --no-ota / --update-dir not
+        // writable); there is no --ota-enabled flag to tell the operator to
+        // pass. Reaching here means it was explicitly disabled.
         html += "<span style=\"color:#484f58\">OTA updates are disabled "
-                "(start server with <code>--ota-enabled</code>).</span>";
+                "(remove <code>--no-ota</code> from the server's startup "
+                "flags to enable).</span>";
         return html;
     }
 
