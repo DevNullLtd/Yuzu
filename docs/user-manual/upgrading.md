@@ -277,7 +277,7 @@ with unrestricted read sees what it saw before.
   is a separate decision, not made here.
 - `GET /api/v1/execution-statistics/definitions` and the fleet summary carry no agent identity and
   keep the plain `Execution:Read` gate (the summary's `active_agents` is a fleet-wide count).
-  `GET /fragments/executions` remains an open gap tracked in #3526.
+  `GET /fragments/executions` is not changed by this entry.
 - A negative `since` on `/agents` and `/definitions` is `400` (see the previous section).
 
 During a rolling upgrade, replicas on the old and the new build return different row sets to a
@@ -691,8 +691,9 @@ plus one new prerequisite.**
   whole-registry agent count (tracked in #4753, whose checklist, including `kind=fleet` and
   `get_fleet_posture_fast`, stays open; the executions-list move covers only `kind=execution`). The same
   whole-registry branch is also reached by `kind=execution` or `kind=agent` with an EMPTY id, or
-  when the execution tracker is unavailable (not separately tracked). `GET
-  /api/v1/execution-statistics/agents` has no per-agent filter (#3526).
+  when the execution tracker is unavailable (not separately tracked). (`GET
+  /api/v1/execution-statistics/agents` was listed here and is now confined; see "Breaking:
+  per-agent execution statistics are confined to the caller's scope (#3526)".)
 
 **Rollback.** Redeploy the previous binary. The plain `Execution:Read` gate returns, so
 group-scoped-only operators go back to `403` on the fragment. The `visible_agents` filter is a
