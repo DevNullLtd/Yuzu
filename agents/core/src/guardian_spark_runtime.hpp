@@ -627,6 +627,15 @@ public:
     /// returned Written or Refused: a Failed one stays staged, so a failure never loses it.
     /// Fires NO waker (a failing KV must not spin the drain worker).
     void erase_staged_baselines_if_unchanged(std::span<const CapturedBaseline> done);
+    /// Stage the committed hash of every generation whose capture is committed but could not be
+    /// staged (RuleGeneration::baseline_unstaged: an allocation failure), under registry_mu_.
+    /// GuardianEngine::stop() calls it after the drain worker has joined and before its final
+    /// persist pass: a stop withdraws no rule, so the withdrawal staging would never run and the
+    /// capture would die with the process. Not gated on stopping_ (like snapshot_staged_baselines);
+    /// an entry that cannot be staged again is counted by stage_baseline_locked and the capture is
+    /// then lost to this process. Idempotent: a staged generation's flag is cleared. May throw
+    /// only from the lock itself or a key lookup; the engine firewalls it.
+    void stage_unstaged_baselines();
     [[nodiscard]] std::size_t staged_baseline_count_for_test() const;
     /// TEST-ONLY: stage `rule_id`'s capture through the production staging rule (first capture
     /// wins on one path; a different path replaces and is counted). No production caller.
@@ -2614,7 +2623,8 @@ private:
     /// key's spec, so the replacement generation's staged read still inherits it. Never throws;
     /// a second staging failure is counted by stage_baseline_locked and the capture is then lost
     /// to the replacement (the one remaining window).
-    void salvage_unstaged_baseline_locked(const std::string& rule_id, const RuleGeneration& rg,
+    /// Returns true iff the hash is now staged.
+    bool salvage_unstaged_baseline_locked(const std::string& rule_id, const RuleGeneration& rg,
                                           const std::optional<std::string>& key) noexcept;
     std::unique_ptr<SparkKeyRuleIndex> index_;                          // key <-> rule fan-out + refcount
     std::unordered_map<std::string, std::shared_ptr<RuleGeneration>> rules_; // rule_id -> generation

@@ -1345,6 +1345,16 @@ void GuardianEngine::persist_staged_baselines_locked(bool at_stop) noexcept {
         if (baseline_stop_flush_done_)
             return;
         baseline_stop_flush_done_ = true;
+        // A capture committed in a live generation but never staged (an allocation failure) is
+        // staged now: stop() withdraws no rule, so the withdrawal staging would never run for it
+        // and it would die with the process. The drain worker is joined and the runtime refuses
+        // commits, so nothing races this; a failure here costs only that capture (counted by
+        // the runtime's drop counter) and must not skip the flush of the others.
+        try {
+            spark_runtime_->stage_unstaged_baselines();
+        } catch (...) {
+            baseline_persister_->note_firewalled_exception();
+        }
     }
     try {
         // Per-tuple persist failures are counted INSIDE the persister and the tuple stays

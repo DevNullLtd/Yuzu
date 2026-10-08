@@ -7967,3 +7967,50 @@ TEST_CASE("#4045 E43: a full_sync push inside the staging-failure window still r
     REQUIRE(rec.has_value());
     CHECK(rec->value("hash", std::string{}) == h_a);
 }
+
+TEST_CASE("#4045 E44: a clean stop() stages a capture whose staging failed, so the ORIGINAL "
+          "hash is the one persisted",
+          "[spark][guardian][baseline][reconcile]") {
+    // stop() withdraws no rule, so the withdrawal staging of E43 never runs at a stop: without
+    // a stop-time stage the committed capture dies with the process and the next boot
+    // re-captures whatever the file holds then.
+    Spark4045Target t;
+    SparkReconcileFixture f{3'600'000, std::nullopt, SparkType::File};
+    f.engine->drain_worker_for_test()->stop();
+    auto* rt = f.engine->spark_runtime_for_test();
+    REQUIRE(rt != nullptr);
+    const fs::path target = t.file();
+    Spark4045Target::write(target, "content A");
+    const std::string h_a = hash_of_4045(target);
+
+    SECTION("one staging failure: stop stages the committed hash and flushes it") {
+        rt->fail_next_stage_baseline_for_test(); // the arm-time capture is not staged
+        f.apply(make_file_hash_rule("r1", target.string()));
+        REQUIRE(yuzu::test::spin_until([&] { return rt->staged_baseline_drops() == 1; }));
+        CHECK(rt->staged_baseline_count_for_test() == 0);
+        Spark4045Target::write(target, "content B, longer"); // the file changes before the stop
+        f.engine->stop();
+        const auto rec = baseline_record_4045(*f.kv, "r1");
+        REQUIRE(rec.has_value()); // RED: absent, the capture was never staged at stop
+        CHECK(rec->value("hash", std::string{}) == h_a);
+        CHECK(rt->staged_baseline_count_for_test() == 0);
+        CHECK(rt->staged_baseline_drops() == 1); // the stop-time stage succeeded: no new drop
+    }
+    SECTION("a second staging failure at stop is counted, not thrown, and loses only that capture") {
+        rt->fail_next_stage_baseline_for_test(2); // the arm-time stage and the stop-time one
+        f.apply(make_file_hash_rule("r1", target.string()));
+        REQUIRE(yuzu::test::spin_until([&] { return rt->staged_baseline_drops() == 1; }));
+        f.engine->stop();
+        CHECK(rt->staged_baseline_drops() == 2);
+        CHECK_FALSE(baseline_record_4045(*f.kv, "r1").has_value());
+    }
+    SECTION("a capture that did stage normally is not staged again (no extra drop, one record)") {
+        f.apply(make_file_hash_rule("r1", target.string()));
+        REQUIRE(yuzu::test::spin_until([&] { return rt->staged_baseline_count_for_test() == 1; }));
+        f.engine->stop();
+        CHECK(rt->staged_baseline_drops() == 0);
+        const auto rec = baseline_record_4045(*f.kv, "r1");
+        REQUIRE(rec.has_value());
+        CHECK(rec->value("hash", std::string{}) == h_a);
+    }
+}
