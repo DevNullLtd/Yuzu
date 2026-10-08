@@ -152,6 +152,21 @@ jobs:
       - name: Governance-ledger linter self-test
         run: python3 tests/test_governance_ledger_check_selftest.py
 
+      # Definition-description lint: shipped content/definitions/*.yaml must carry
+      # descriptions an agentic worker can act on (definition, parameters, result
+      # columns), ratcheted against scripts/ci/definition-descriptions-baseline.json.
+      # Needs PyYAML (the content definitions are YAML); installed hash-pinned from
+      # requirements-ci.txt exactly like the prometheus-rules job below. Not run
+      # with -I: the pinned install is `--user`, which isolated mode ignores.
+      - name: Install PyYAML (hash-pinned)
+        run: |
+          python3 -c "import yaml" 2>/dev/null || \
+            python3 -m pip install --user --break-system-packages \
+              --disable-pip-version-check --require-hashes -r requirements-ci.txt
+
+      - name: Definition description lint (ratchet)
+        run: python3 tests/test_definition_descriptions.py
+
       # RBAC doc/seed parity (#480): docs/user-manual/rbac.md's four tables
       # (system roles, securable types, operations, the authorization-topology
       # floor) are hand-maintained copies of arrays in rbac_store.cpp and
